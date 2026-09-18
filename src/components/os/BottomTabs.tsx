@@ -26,12 +26,13 @@ interface BottomTabsProps {
   assets: AssetRow[]
   strategies: StrategyInfo[]
   price: number
+  prices: Record<string, { price: number; dir: number }>
   refreshPositions: () => void
   onError: (m: string) => void
 }
 
 export default function BottomTabs(props: BottomTabsProps) {
-  const { positions, history, alerts, patterns, price, asset, refreshPositions, onError } = props
+  const { positions, history, alerts, patterns, price, prices, asset, refreshPositions, onError } = props
 
   const closePos = async (id: string) => {
     try {
@@ -44,8 +45,12 @@ export default function BottomTabs(props: BottomTabsProps) {
 
   const openPnl = (p: Position) => {
     const dir = p.side === 'call' ? 1 : -1
-    const movePct = ((price - p.entryPrice) / p.entryPrice) * 100 * dir
-    if (p.kind === 'binary') return movePct > 0 ? p.amount * p.payout : movePct < 0 ? -p.amount : 0
+    const now = p.asset === asset ? price : (prices[p.asset]?.price ?? p.entryPrice)
+    const strike = p.strike ?? p.entryPrice
+    const refPrice = p.kind === 'digital' ? strike : p.entryPrice
+    const movePct = ((now - refPrice) / refPrice) * 100 * dir
+    if (p.kind === 'binary' || p.kind === 'turbo' || p.kind === 'digital') return movePct > 0 ? p.amount * p.payout : movePct < 0 ? -p.amount : 0
+    if (p.kind === 'cfd' && p.leverage) return (movePct / 100) * p.amount * p.leverage
     return (movePct / 100) * p.amount
   }
 
@@ -103,7 +108,7 @@ export default function BottomTabs(props: BottomTabsProps) {
                     <Td className={p.side === 'call' ? 'text-emerald-400' : 'text-rose-400'}>{p.side.toUpperCase()}</Td>
                     <Td className="text-[#7c8aa5]">{p.kind}</Td>
                     <Td>{fmtPrice(p.entryPrice, p.asset)}</Td>
-                    <Td className={pnl > 0 ? 'text-emerald-400' : pnl < 0 ? 'text-rose-400' : 'text-[#7c8aa5]'}>{fmtPrice(price, p.asset)}</Td>
+                    <Td className={pnl > 0 ? 'text-emerald-400' : pnl < 0 ? 'text-rose-400' : 'text-[#7c8aa5]'}>{fmtPrice(p.asset === asset ? price : (prices[p.asset]?.price ?? p.entryPrice), p.asset)}</Td>
                     <Td className="text-[#4b5a72]">{ttl !== null ? `${Math.max(0, ttl)}s` : `TP ${p.tp ?? '-'}% / SL ${p.sl ?? '-'}%`}</Td>
                     <Td>{fmtMoney(p.amount)}</Td>
                     <Td className={pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}>

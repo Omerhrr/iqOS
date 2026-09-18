@@ -183,21 +183,61 @@ class Handler(BaseHTTPRequestHandler):
                     direction = (body.get("direction") or "call").lower()
                     expiry = int(body.get("expiry_minutes", 1))
                     leverage = body.get("leverage")
+                    strike_offset = body.get("strike_offset_pct")
                     if amount <= 0 or not asset:
                         return self._send(_err("asset and positive amount required"), 400)
-                    if mode in ("turbo", "binary", "digital"):
-                        check, order_id = _client.buy(amount, asset, direction, expiry)
-                    elif mode in ("forex", "crypto", "cfd"):
+
+                    # ---- options family ----
+                    if mode in ("turbo", "binary", "digital", "digital-option", "binary-option", "turbo-option"):
+                        # digital options: prefer a dedicated iqair method when available
+                        digital = mode.startswith("digital")
+                        if digital:
+                            check, order_id = None, None
+                            for fn_name in ("buy_digital", "buy_digital_option", "buy_digitals"):
+                                fn = getattr(_client, fn_name, None)
+                                if not callable(fn):
+                                    continue
+                                for args in (
+                                    (asset, amount, direction, expiry, float(strike_offset)) if strike_offset is not None else None,
+                                    (asset, amount, direction, expiry),
+                                ):
+                                    if args is None:
+                                        continue
+                                    try:
+                                        check, order_id = fn(*args)
+                                        break
+                                    except TypeError:
+                                        continue
+                                    except Exception as exc:
+                                        check, order_id = False, str(exc)
+                                        break
+                                if check is not None:
+                                    break
+                            if check is None:
+                                check, order_id = _client.buy(amount, asset, direction, expiry)
+                        else:
+                            check, order_id = _client.buy(amount, asset, direction, expiry)
+
+                    # ---- margin / CFD family ----
+                    elif mode in ("forex", "crypto", "stock", "index", "commodity", "cfd"):
                         if not leverage:
-                            return self._send(_err(f"leverage required for {mode}"), 400)
-                        buy_fn = {
-                            "forex": _client.buy_forex_market,
-                            "crypto": _client.buy_crypto_market,
-                            "cfd": _client.buy_cfd_market,
-                        }[mode]
-                        check, order_id = buy_fn(asset, amount, direction, leverage)
+                            leverage = 10
+                        # route to the most specific method iqair exposes, else generic CFD
+                        fn = None
+                        for fn_name in (f"buy_{mode}_market", "buy_cfd_market", "buy_margin_spot"):
+                            candidate = getattr(_client, fn_name, None)
+                            if callable(candidate):
+                                fn = candidate
+                                break
+                        if fn is None:
+                            return self._send(_err(f"iqair client has no {mode} buy method"), 502)
+                        try:
+                            check, order_id = fn(asset, amount, direction, leverage)
+                        except TypeError:
+                            check, order_id = fn(asset, amount, direction)
                     else:
                         return self._send(_err(f"unsupported mode {mode}"), 400)
+
                     if not check:
                         return self._send(_err(f"order rejected: {order_id}"), 502)
                     return self._send(_ok({"order_id": order_id, "mode": mode, "asset": asset}))
@@ -207,18 +247,37 @@ class Handler(BaseHTTPRequestHandler):
                     order_id = body.get("order_id")
                     if order_id is None:
                         return self._send(_err("order_id required"), 400)
-                    if mode in ("turbo", "binary"):
+                    if mode.startswith("digital"):
+                        fn = getattr(_client, "close_digital_option", None) or getattr(_client, "sell_option", None)
+                        check, data = fn(order_id)
+                    elif mode.startswith("turbo") or mode.startswith("binary"):
                         check, data = _client.sell_option(order_id)
-                    elif mode == "digital":
-                        check, data = _client.close_digital_option(order_id)
                     else:
-                        check, data = _client.close_margin_position(order_id)
+                        fn = getattr(_client, "close_margin_position", None) or getattr(_client, "close_cfd", None)
+                        if fn is None:
+                            return self._send(_err("iqair client has no margin close method"), 502)
+                        check, data = fn(order_id)
                     return self._send(_ok({"closed": bool(check), "data": data}))
 
                 if path == "/positions":
                     itype = body.get("instrument_type") or "turbo-option"
                     ok, data = _client.get_positions(itype)
                     return self._send(_ok({"positions": data.get("positions", []) if ok and isinstance(data, dict) else []}))
+
+                if path == "/payouts":
+                    # best-effort payout snapshot for the active asset
+                    asset = body.get("asset") or "EURUSD"
+                    out = {"asset": asset}
+                    for name, fn_name in (("binary", "get_binary_payout"), ("turbo", "get_turbo_payout"), ("digital", "get_digital_payout")):
+                        fn = getattr(_client, fn_name, None)
+                        if callable(fn):
+                            try:
+                                ok2, val = fn(asset)
+                                if ok2:
+                                    out[name] = val
+                            except Exception:
+                                pass
+                    return self._send(_ok(out))
 
                 if path == "/history":
                     itype = body.get("instrument_type") or "turbo-option"

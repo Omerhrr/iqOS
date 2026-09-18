@@ -338,6 +338,7 @@ export function analyze(candles: Candle[], asset: string, tf: Timeframe): Analys
     indicatorSeries: {
       ema20: seriesToLine(ta.ema(c, 20), candles),
       ema50: seriesToLine(ta.ema(c, 50), candles),
+      ema200: seriesToLine(ta.ema(c, 200), candles),
       bbUpper: seriesToLine(ta.bollinger(c, 20, 2).upper, candles),
       bbLower: seriesToLine(ta.bollinger(c, 20, 2).lower, candles),
       supertrend: stTrend.line.reduce<{ time: number; value: number; dir: number }[]>((acc, v, i) => {
@@ -354,6 +355,7 @@ export function analyze(candles: Candle[], asset: string, tf: Timeframe): Analys
     quant,
     srZones: supportResistance(candles, 240),
     signal,
+    registrySize: 101,
   }
 }
 

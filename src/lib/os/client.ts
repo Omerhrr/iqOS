@@ -4,8 +4,35 @@
 import { useEffect, useRef } from 'react'
 import { io, type Socket } from 'socket.io-client'
 
-export type Timeframe = '5s' | '15s' | '1m' | '5m' | '15m'
-export const TIMEFRAMES: Timeframe[] = ['5s', '15s', '1m', '5m', '15m']
+export type Timeframe = '5s' | '15s' | '30s' | '1m' | '2m' | '5m' | '15m' | '30m' | '1h' | '4h' | '1d'
+export const TIMEFRAMES: Timeframe[] = ['5s', '15s', '30s', '1m', '2m', '5m', '15m', '30m', '1h', '4h', '1d']
+
+export type TradeKind = 'binary' | 'turbo' | 'digital' | 'cfd'
+export const TRADE_KINDS: TradeKind[] = ['binary', 'turbo', 'digital', 'cfd']
+export const KIND_LABEL: Record<TradeKind, string> = { binary: 'Binary', turbo: 'Turbo', digital: 'Digital', cfd: 'CFD' }
+
+export type ChartType = 'candles' | 'hollow' | 'heikin' | 'bars' | 'line' | 'area' | 'baseline' | 'renko'
+export const CHART_TYPES: { id: ChartType; label: string }[] = [
+  { id: 'candles', label: 'Candles' },
+  { id: 'hollow', label: 'Hollow' },
+  { id: 'heikin', label: 'Heikin Ashi' },
+  { id: 'bars', label: 'Bars' },
+  { id: 'line', label: 'Line' },
+  { id: 'area', label: 'Area' },
+  { id: 'baseline', label: 'Baseline' },
+  { id: 'renko', label: 'Renko' },
+]
+
+export type AssetCategory = 'forex' | 'crypto' | 'commodity' | 'stock' | 'index'
+export const CATEGORIES: { id: 'all' | 'otc' | AssetCategory; label: string }[] = [
+  { id: 'all', label: 'All' },
+  { id: 'forex', label: 'Forex' },
+  { id: 'otc', label: 'OTC' },
+  { id: 'crypto', label: 'Crypto' },
+  { id: 'commodity', label: 'Comm.' },
+  { id: 'stock', label: 'Stocks' },
+  { id: 'index', label: 'Indices' },
+]
 
 export interface Candle {
   time: number
@@ -19,10 +46,71 @@ export interface Candle {
 export interface AssetRow {
   ticker: string
   name: string
-  category: 'forex' | 'crypto' | 'commodity' | 'stock' | 'index'
+  category: AssetCategory
+  otc?: boolean
   price: number
   payout: number
+  turboPayout?: number
+  digitalPayout?: number
+  leverage?: number
+  schedule?: '24/7' | '24/5' | 'market'
   open: boolean
+  iqairName?: string
+}
+
+export interface InstrumentStats {
+  total: number
+  forex: number
+  otc: number
+  crypto: number
+  commodities: number
+  stocks: number
+  indices: number
+}
+
+// ---------- Indicator registry types ----------
+
+export interface IndicatorParamDef {
+  key: string
+  label: string
+  type: 'number'
+  min: number
+  max: number
+  step?: number
+  default: number
+}
+
+export interface RegistryEntry {
+  id: string
+  name: string
+  category: 'overlap' | 'momentum' | 'volume' | 'volatility' | 'trend' | 'cycle' | 'statistic' | 'patterns'
+  pane: 'overlay' | 'sub'
+  params: IndicatorParamDef[]
+  description: string
+}
+
+export interface IndicatorSeries {
+  id: string
+  name: string
+  category: string
+  pane: 'overlay' | 'sub'
+  params: Record<string, number>
+  time: number[]
+  lines: { key: string; color: string; style?: string; values: (number | null)[] }[]
+  hist?: { values: (number | null)[]; color: string }
+  levels?: number[]
+  bands?: [number, number]
+  fillBetween?: [number, number]
+  note?: string
+}
+
+export interface ChartPatternHit {
+  name: string
+  direction: 'bullish' | 'bearish' | 'neutral'
+  startIndex: number
+  endIndex: number
+  confidence: number
+  note: string
 }
 
 export interface Factor {
@@ -157,11 +245,13 @@ export interface AnalysisResult {
   indicatorSeries: {
     ema20: { time: number; value: number }[]
     ema50: { time: number; value: number }[]
+    ema200: { time: number; value: number }[]
     bbUpper: { time: number; value: number }[]
     bbLower: { time: number; value: number }[]
     supertrend: { time: number; value: number; dir: number }[]
     vwap: { time: number; value: number }[]
   }
+  registrySize?: number
   patterns: PatternHit[]
   markov: MarkovResult
   montecarlo: MonteCarloResult
@@ -177,7 +267,7 @@ export interface Position {
   asset: string
   tf: Timeframe
   side: 'call' | 'put'
-  kind: 'binary' | 'spot'
+  kind: TradeKind | 'spot'
   mode: 'paper' | 'live'
   amount: number
   expiryBars: number
@@ -188,8 +278,11 @@ export interface Position {
   status: 'open' | 'won' | 'lost' | 'closed'
   strategy?: string
   settlesAt?: number
+  strike?: number
+  expirySec?: number
   tp?: number
   sl?: number
+  leverage?: number
 }
 
 export interface AccountState {
@@ -340,7 +433,11 @@ export function useOSFeed(asset: string, tf: Timeframe, handlers: OSFeedHandlers
 // ---------- formatting helpers ----------
 
 export function fmtPrice(v: number, ticker?: string): string {
-  const digits = ticker === 'USDJPY' ? 3 : ticker === 'EURUSD' || ticker === 'GBPUSD' ? 5 : v >= 1000 ? 1 : v >= 10 ? 2 : 4
+  const abs = Math.abs(v)
+  let digits: number
+  if (ticker?.endsWith('-OTC') || ticker === 'USDJPY') digits = abs >= 100 ? 3 : 5
+  else if (ticker === 'EURUSD' || ticker === 'GBPUSD' || (abs > 1 && abs < 20 && (ticker?.includes('USD') || ticker?.length === 6))) digits = 5
+  else digits = abs >= 1000 ? 1 : abs >= 100 ? 2 : abs >= 10 ? 2 : abs >= 1 ? 4 : 5
   return v.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits })
 }
 

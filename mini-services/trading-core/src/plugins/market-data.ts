@@ -11,19 +11,7 @@ import type { KernelContext } from '../kernel'
 import { ALL_TIMEFRAMES, TIMEFRAME_SECONDS } from '../types'
 import type { Plugin } from '../kernel'
 import { gaussLike } from './random'
-
-export const SIM_ASSETS: AssetInfo[] = [
-  { ticker: 'EURUSD', name: 'Euro / US Dollar', category: 'forex', basePrice: 1.0854, pip: 5, volatility: 0.000045, payout: 0.85, open: true },
-  { ticker: 'GBPUSD', name: 'Pound / US Dollar', category: 'forex', basePrice: 1.2662, pip: 5, volatility: 0.000055, payout: 0.84, open: true },
-  { ticker: 'USDJPY', name: 'US Dollar / Yen', category: 'forex', basePrice: 149.52, pip: 3, volatility: 0.00006, payout: 0.85, open: true },
-  { ticker: 'BTCUSD', name: 'Bitcoin / US Dollar', category: 'crypto', basePrice: 64210, pip: 1, volatility: 0.00035, payout: 0.88, open: true },
-  { ticker: 'ETHUSD', name: 'Ethereum / US Dollar', category: 'crypto', basePrice: 3165, pip: 2, volatility: 0.00042, payout: 0.88, open: true },
-  { ticker: 'XAUUSD', name: 'Gold / US Dollar', category: 'commodity', basePrice: 2384.5, pip: 2, volatility: 0.00008, payout: 0.82, open: true },
-  { ticker: 'AAPL', name: 'Apple Inc.', category: 'stock', basePrice: 212.4, pip: 2, volatility: 0.00016, payout: 0.8, open: true },
-  { ticker: 'TSLA', name: 'Tesla Inc.', category: 'stock', basePrice: 245.8, pip: 2, volatility: 0.00030, payout: 0.82, open: true },
-  { ticker: 'NVDA', name: 'NVIDIA Corp.', category: 'stock', basePrice: 126.3, pip: 2, volatility: 0.00028, payout: 0.82, open: true },
-  { ticker: 'SP500', name: 'S&P 500 Index', category: 'index', basePrice: 5638.2, pip: 1, volatility: 0.00006, payout: 0.8, open: true },
-]
+import { UNIVERSE, getInstrument, isInstrumentOpen } from '../universe'
 
 const HISTORY_CANDLES = 760
 const MAX_TICKS = 40000
@@ -37,13 +25,14 @@ export class MarketDataService {
   private ctx!: KernelContext
   mode: MarketMode = 'sim'
   liveUrl = 'http://127.0.0.1:8788'
-  assets: AssetInfo[] = SIM_ASSETS.map((a) => ({ ...a }))
+  assets: AssetInfo[] = UNIVERSE.map((a) => ({ ...a }))
   private prices = new Map<string, number>()
   private regimes = new Map<string, Regime>()
   private ticks = new Map<string, { ts: number; price: number; vol: number }[]>()
   // candle series per asset per tf (aggregated from ticks)
   private candles = new Map<string, Candle>() // key = asset|tf -> current forming candle
   private closed = new Map<string, Candle[]>() // key = asset|tf -> closed candles
+  private seeded = new Set<string>() // assets whose history is materialized
   private timer: ReturnType<typeof setInterval> | null = null
   private liveTimer: ReturnType<typeof setInterval> | null = null
   private lastCandleTs = new Map<string, number>()
@@ -56,13 +45,30 @@ export class MarketDataService {
       this.regimes.set(a.ticker, { drift: (Math.random() - 0.5) * 2e-5, anchor: a.basePrice })
       const zero: { ts: number; price: number; vol: number }[] = []
       this.ticks.set(a.ticker, zero)
-      // seed closed history per timeframe (synthetic but statistically sane)
-      for (const tf of ALL_TIMEFRAMES) {
-        this.closed.set(this.key(a.ticker, tf), this.seedHistory(a, tf))
-      }
     }
+    // lazy seed: only the default active asset boots with full history;
+    // every other asset seeds on first access (memory-friendly with 100+ instruments)
+    this.ensureSeeded(this.activeAsset)
     this.timer = setInterval(() => this.tickAll(), 1000)
-    ctx.log('market-data', `sim engine online: ${this.assets.length} assets, ${ALL_TIMEFRAMES.length} timeframes`)
+    ctx.log('market-data', `universe online: ${this.assets.length} instruments, ${ALL_TIMEFRAMES.length} timeframes (lazy seeding)`)
+  }
+
+  /** Materialize seeded history + sim tracking for an instrument on first use. */
+  ensureSeeded(ticker: string): void {
+    if (this.seeded.has(ticker)) return
+    const a = this.assets.find((x) => x.ticker === ticker)
+    if (!a) return
+    this.seeded.add(ticker)
+    for (const tf of ALL_TIMEFRAMES) {
+      this.closed.set(this.key(ticker, tf), this.seedHistory(a, tf))
+    }
+  }
+
+  refreshSchedules(): void {
+    const now = new Date()
+    for (const a of this.assets) {
+      a.open = isInstrumentOpen(a, now)
+    }
   }
 
   stop(): void {
@@ -109,6 +115,7 @@ export class MarketDataService {
 
   private tickAll(): void {
     const now = Math.floor(Date.now() / 1000)
+    this.refreshSchedules()
     for (const a of this.assets) {
       if (this.mode !== 'sim') break
       const r = this.regimes.get(a.ticker)!
@@ -122,6 +129,8 @@ export class MarketDataService {
       const ret = r.drift + pull + gaussLike() * a.volatility
       const next = Math.max(price * Math.exp(ret), a.basePrice * 0.5)
       this.prices.set(a.ticker, next)
+      // only form candles for materialized assets (UI/strategy touched them)
+      if (!this.seeded.has(a.ticker)) continue
       const tickArr = this.ticks.get(a.ticker)!
       tickArr.push({ ts: now, price: next, vol: Math.round(50 + Math.random() * 300) })
       if (tickArr.length > MAX_TICKS) tickArr.splice(0, tickArr.length - MAX_TICKS)
@@ -237,6 +246,7 @@ export class MarketDataService {
   // ---------- public API ----------
 
   getCandles(asset: string, tf: Timeframe, limit = 400): Candle[] {
+    this.ensureSeeded(asset)
     const k = this.key(asset, tf)
     const closedArr = this.closed.get(k) ?? []
     const forming = this.candles.get(k)
@@ -255,6 +265,21 @@ export class MarketDataService {
   setMode(mode: MarketMode): void {
     if (mode === 'live') throw new Error('use connectLive() to enter live mode')
     this.disconnectLive()
+  }
+
+  /** Payout lookup per trade kind. */
+  payoutFor(ticker: string, kind: 'binary' | 'turbo' | 'digital' | 'cfd'): number {
+    const a = getInstrument(ticker)
+    if (!a) return 0.8
+    if (kind === 'turbo') return a.turboPayout ?? a.payout - 0.02
+    if (kind === 'digital') return a.digitalPayout ?? a.payout + 0.05
+    return a.payout
+  }
+
+  /** Map an OS ticker to the live iqair instrument id. */
+  iqairSymbol(ticker: string): string {
+    const a = getInstrument(ticker)
+    return a?.iqairName ?? ticker
   }
 }
 

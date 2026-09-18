@@ -1,17 +1,28 @@
 // IQAIR//OS - Kernel type system
 // Shared across every plugin: market data, analytics, strategies, execution, agent.
 
-export type Timeframe = '5s' | '15s' | '1m' | '5m' | '15m'
+export type Timeframe = '5s' | '15s' | '30s' | '1m' | '2m' | '5m' | '15m' | '30m' | '1h' | '4h' | '1d'
 
 export const TIMEFRAME_SECONDS: Record<Timeframe, number> = {
   '5s': 5,
   '15s': 15,
+  '30s': 30,
   '1m': 60,
+  '2m': 120,
   '5m': 300,
   '15m': 900,
+  '30m': 1800,
+  '1h': 3600,
+  '4h': 14400,
+  '1d': 86400,
 }
 
-export const ALL_TIMEFRAMES: Timeframe[] = ['5s', '15s', '1m', '5m', '15m']
+export const ALL_TIMEFRAMES: Timeframe[] = ['5s', '15s', '30s', '1m', '2m', '5m', '15m', '30m', '1h', '4h', '1d']
+
+/** Timeframes suitable for options expiry sizing (short TFs). */
+export const OPTION_TFS: Timeframe[] = ['5s', '15s', '30s', '1m', '2m', '5m', '15m']
+/** Timeframes typical for CFD swing charting. */
+export const CFD_TFS: Timeframe[] = ['1m', '5m', '15m', '30m', '1h', '4h', '1d']
 
 export interface Candle {
   time: number // epoch seconds, candle open time
@@ -22,21 +33,45 @@ export interface Candle {
   volume: number
 }
 
+export type AssetCategory = 'forex' | 'crypto' | 'commodity' | 'stock' | 'index'
+
 export interface AssetInfo {
   ticker: string
   name: string
-  category: 'forex' | 'crypto' | 'commodity' | 'stock' | 'index'
+  category: AssetCategory
+  otc?: boolean // OTC weekend variant (24/7, higher payout)
   basePrice: number
   pip: number // price rounding digits
   volatility: number // per-second sigma scale for the sim engine
   payout: number // binary payout, e.g. 0.85 => +85% on win
+  turboPayout?: number
+  digitalPayout?: number
+  leverage?: number // CFD max leverage
+  schedule?: '24/7' | '24/5' | 'market' // market = exchange hours
   open: boolean
+  iqairName?: string // live IQ Option instrument id (defaults to ticker)
 }
 
 export type MarketMode = 'sim' | 'live'
 
 export type Side = 'call' | 'put'
-export type TradeKind = 'binary' | 'spot'
+export type TradeKind = 'binary' | 'turbo' | 'digital' | 'cfd'
+
+/** Trade kinds a given instrument supports. */
+export const CATEGORY_KINDS: Record<AssetCategory, TradeKind[]> = {
+  forex: ['binary', 'turbo', 'digital', 'cfd'],
+  crypto: ['binary', 'turbo', 'digital', 'cfd'],
+  commodity: ['binary', 'turbo', 'digital', 'cfd'],
+  stock: ['binary', 'turbo', 'digital', 'cfd'],
+  index: ['binary', 'turbo', 'digital', 'cfd'],
+}
+
+export const TRADE_KIND_LABEL: Record<TradeKind, string> = {
+  binary: 'Binary',
+  turbo: 'Turbo',
+  digital: 'Digital',
+  cfd: 'CFD',
+}
 export type TradeMode = 'paper' | 'live'
 export type TradeStatus = 'open' | 'won' | 'lost' | 'closed'
 
@@ -62,7 +97,9 @@ export interface Position {
   strategy?: string
   note?: string
   liveOrderId?: string
-  settlesAt?: number // epoch seconds when binary expires
+  settlesAt?: number // epoch seconds when binary/turbo/digital expires
+  strike?: number // digital options strike
+  expirySec?: number // digital expiry in seconds (5m/15m)
 }
 
 export interface AccountState {
@@ -79,6 +116,19 @@ export interface AccountState {
 }
 
 // ---------- Analytics ----------
+
+export type ChartType = 'candles' | 'hollow' | 'heikin' | 'bars' | 'line' | 'area' | 'baseline' | 'renko'
+
+export const CHART_TYPES: { id: ChartType; label: string }[] = [
+  { id: 'candles', label: 'Candles' },
+  { id: 'hollow', label: 'Hollow' },
+  { id: 'heikin', label: 'Heikin Ashi' },
+  { id: 'bars', label: 'Bars' },
+  { id: 'line', label: 'Line' },
+  { id: 'area', label: 'Area' },
+  { id: 'baseline', label: 'Baseline' },
+  { id: 'renko', label: 'Renko' },
+]
 
 export type Direction = 'call' | 'put' | 'none'
 
@@ -214,11 +264,14 @@ export interface AnalysisResult {
   indicatorSeries: {
     ema20: { time: number; value: number }[]
     ema50: { time: number; value: number }[]
+    ema200: { time: number; value: number }[]
     bbUpper: { time: number; value: number }[]
     bbLower: { time: number; value: number }[]
     supertrend: { time: number; value: number; dir: number }[]
     vwap: { time: number; value: number }[]
   }
+  /** Number of indicators available in the full registry (UI display). */
+  registrySize?: number
   patterns: PatternHit[]
   markov: MarkovResult
   montecarlo: MonteCarloResult
@@ -287,6 +340,84 @@ export interface BacktestResult {
     finalEquity: number
     startEquity: number
   }
+}
+
+// ---------- Indicator registry ----------
+
+export type IndicatorCategory =
+  | 'overlap'
+  | 'momentum'
+  | 'volume'
+  | 'volatility'
+  | 'trend'
+  | 'cycle'
+  | 'statistic'
+  | 'patterns'
+
+export interface IndicatorParamDef {
+  key: string
+  label: string
+  type: 'number'
+  min: number
+  max: number
+  step?: number
+  default: number
+}
+
+export interface IndicatorLine {
+  key: string
+  color: string
+  style?: 'solid' | 'dashed' | 'dotted'
+  width?: 1 | 2
+  values: number[]
+}
+
+export interface IndicatorOutput {
+  lines: IndicatorLine[]
+  /** optional histogram series (MACD hist, CMF...) */
+  hist?: { values: number[]; color: 'updown' | string }
+  /** horizontal reference levels (RSI 30/70 ...) */
+  levels?: number[]
+  /** signed +/- bands for oscillators */
+  bands?: [number, number]
+  /** fill area between two line indices (Bollinger, Keltner, Donchian) */
+  fillBetween?: [number, number]
+  note?: string
+}
+
+export interface IndicatorDef {
+  id: string
+  name: string
+  category: IndicatorCategory
+  pane: 'overlay' | 'sub'
+  params: IndicatorParamDef[]
+  description: string
+  compute: (candles: Candle[], params: Record<string, number>) => IndicatorOutput
+}
+
+export interface IndicatorSeriesResponse {
+  id: string
+  name: string
+  category: IndicatorCategory
+  pane: 'overlay' | 'sub'
+  params: Record<string, number>
+  time: number[]
+  lines: { key: string; color: string; style?: string; values: (number | null)[] }[]
+  hist?: { values: (number | null)[]; color: string }[]
+  levels?: number[]
+  bands?: [number, number]
+  fillBetween?: [number, number]
+}
+
+// ---------- Chart patterns ----------
+
+export interface ChartPatternHit {
+  name: string
+  direction: 'bullish' | 'bearish' | 'neutral'
+  startIndex: number
+  endIndex: number
+  confidence: number // 0..1
+  note: string
 }
 
 // ---------- Events ----------

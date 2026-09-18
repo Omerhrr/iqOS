@@ -43,14 +43,57 @@ function trimAnalysis(a: Record<string, unknown>): Record<string, unknown> {
 const TOOLS: ToolSpec[] = [
   {
     name: 'market_overview',
-    description: 'List every tradable asset with live SIM prices, categories, payouts and open status.',
+    description: 'List every tradable asset with live SIM prices, categories, payouts and open status. The full universe spans forex, OTC, crypto, commodities, stocks and indices (110+ instruments).',
     args: '{}',
     run: () => coreGet('/assets'),
   },
   {
+    name: 'list_instruments',
+    description: 'Search the full IQ Option instrument universe by category (forex|otc|crypto|commodity|stock|index|all) and/or free-text query. Returns payouts per trade kind, leverage, schedule and live price.',
+    args: '{"category": "crypto", "q": "btc"}',
+    run: (a) => {
+      const params = new URLSearchParams({ category: String(a.category ?? 'all') })
+      if (a.q) params.set('q', String(a.q))
+      return coreGet(`/instruments?${params.toString()}`)
+    },
+  },
+  {
+    name: 'list_indicators',
+    description: 'List every indicator in the registry (100+): id, name, category (overlap/momentum/trend/volatility/volume/cycle/statistic), pane and tunable params.',
+    args: '{}',
+    run: () => coreGet('/indicators'),
+  },
+  {
+    name: 'indicator_series',
+    description: 'Compute ANY registry indicator on demand and get its full series. Example ids: rsi, macd, ichimoku, supertrend, stochrsi, klinger, hilbert-sine, zscore, aroon, vortex. Params are optional (defaults used).',
+    args: '{"id": "supertrend", "asset": "BTCUSD", "tf": "5m", "params": {"period": 10, "mult": 3}}',
+    run: async (a) => {
+      const params = new URLSearchParams({ id: String(a.id ?? 'rsi'), asset: String(a.asset ?? 'EURUSD'), tf: String(a.tf ?? '1m') })
+      if (a.params && typeof a.params === 'object') {
+        for (const [k, v] of Object.entries(a.params as Record<string, unknown>)) params.set(`p_${k}`, String(v))
+      }
+      const d = (await coreGet(`/indicator?${params.toString()}`)) as { ok: boolean; series?: { lines?: unknown[]; time?: unknown[] } }
+      if (!d.ok) return d
+      const s = d.series!
+      const lines = (s.lines ?? []) as { key: string; color: string; values: (number | null)[] }[]
+      const lastVals: Record<string, number | null> = {}
+      for (const ln of lines) {
+        const tail = [...ln.values].reverse().find((v) => v !== null)
+        lastVals[ln.key] = typeof tail === 'number' ? tail : null
+      }
+      return { ok: true, id: s.id, lastValues: lastVals, points: s.time?.length ?? 0 }
+    },
+  },
+  {
+    name: 'chart_patterns',
+    description: 'Detect structural chart patterns (double top/bottom, head & shoulders, triangles, wedges, flags, ranges) on an asset.',
+    args: '{"asset": "EURUSD", "tf": "15m"}',
+    run: (a) => coreGet(`/chart_patterns?asset=${encodeURIComponent(String(a.asset ?? 'EURUSD'))}&tf=${String(a.tf ?? '15m')}`),
+  },
+  {
     name: 'analyze_market',
-    description: 'Full technical + quantitative analysis of an asset: RSI, MACD, Bollinger, ADX, Stochastic, patterns, Markov chain, Monte Carlo, Hurst, GARCH vol, S/R zones and the composite signal with all factor votes.',
-    args: '{"asset": "EURUSD", "tf": "1m|5m|15m|5s|15s"}',
+    description: 'Full technical + quantitative analysis of an asset: RSI, MACD, Bollinger, ADX, Stochastic, patterns, Markov chain, Monte Carlo, Hurst, GARCH vol, S/R zones and the composite signal with all factor votes. Works for every instrument in the universe (forex, OTC, crypto, commodities, stocks, indices) and every timeframe (5s..1d).',
+    args: '{"asset": "EURUSD", "tf": "1m|2m|5m|15m|30m|1h|4h|1d|5s|15s|30s"}',
     run: async (a) => {
       const asset = String(a.asset ?? 'EURUSD')
       const tf = String(a.tf ?? '1m')
@@ -121,8 +164,8 @@ const TOOLS: ToolSpec[] = [
   },
   {
     name: 'place_trade',
-    description: 'Place a PAPER trade (binary option or spot) through the risk manager. amount is the stake in dollars; expiryBars is the number of candles the binary holds.',
-    args: '{"asset": "EURUSD", "tf": "1m", "side": "call|put", "kind": "binary|spot", "amount": 10, "expiryBars": 1, "strategy": "optional-strategy-id", "note": "why"}',
+    description: 'Place a PAPER trade through the risk manager. Kinds: binary (expiry in bars), turbo (short expiry, min 30s), digital (strike + expiry in seconds), cfd (margin with leverage + TP/SL %). All instruments support all kinds.',
+    args: '{"asset": "EURUSD", "tf": "1m", "side": "call|put", "kind": "binary|turbo|digital|cfd", "amount": 10, "expiryBars": 1, "expirySec": 300, "strikeOffsetPct": 0, "leverage": 10, "tp": 0.4, "sl": 0.25, "strategy": "optional-id", "note": "why"}',
     run: (a) =>
       corePost('/trade', {
         asset: a.asset,
@@ -131,6 +174,11 @@ const TOOLS: ToolSpec[] = [
         kind: a.kind ?? 'binary',
         amount: a.amount ?? 10,
         expiryBars: a.expiryBars ?? 1,
+        expirySec: a.expirySec,
+        strikeOffsetPct: a.strikeOffsetPct,
+        leverage: a.leverage,
+        tp: a.tp,
+        sl: a.sl,
         mode: 'paper',
         strategy: a.strategy,
         note: a.note,
@@ -171,7 +219,8 @@ const TOOLS: ToolSpec[] = [
 const TOOL_LIST_TEXT = TOOLS.map((t) => `- ${t.name}: ${t.description} args: ${t.args}`).join('\n')
 
 const SYSTEM = `You are the IQAIR//OS Copilot - an expert quantitative trading analyst embedded in a trading operating system built on the iqair IQ Option library.
-You can analyze markets (technical indicators, candlestick patterns, Markov chains, Monte Carlo, Hurst exponent, GARCH volatility), run strategies, backtest them, and place PAPER trades through the risk manager.
+You can analyze markets (100+ technical indicators, 35 candlestick + chart patterns, Markov chains, Monte Carlo, Hurst exponent, GARCH volatility), run strategies, backtest them, and place PAPER trades through the risk manager.
+The universe covers 110+ IQ Option instruments across forex, OTC (24/7), crypto, commodities, stocks and indices, with 11 timeframes (5s to 1d) and 4 trade kinds: binary, turbo, digital (strike-based) and CFD (leveraged margin).
 
 Tool protocol - follow it EXACTLY:
 - Respond with ONE JSON object and nothing else. No markdown fences, no prose outside the JSON.

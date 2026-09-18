@@ -78,20 +78,28 @@ export default function MenuBar(props: Props) {
         <select
           value={props.asset}
           onChange={(e) => props.onSelectAsset(e.target.value)}
-          className="h-8 rounded border border-[#1c2739] bg-[#0d1420] px-2 font-mono text-[12px] font-semibold text-cyan-300 outline-none"
+          className="h-8 max-w-56 rounded border border-[#1c2739] bg-[#0d1420] px-2 font-mono text-[12px] font-semibold text-cyan-300 outline-none"
         >
-          {props.assets.map((a) => (
-            <option key={a.ticker} value={a.ticker}>
-              {a.ticker}
-            </option>
-          ))}
+          {(['forex', 'otc', 'crypto', 'commodity', 'stock', 'index'] as const).map((grp) => {
+            const items = props.assets.filter((a) => (grp === 'otc' ? a.otc : !a.otc && a.category === grp))
+            if (!items.length) return null
+            return (
+              <optgroup key={grp} label={grp.toUpperCase()} className="bg-[#0d1420]">
+                {items.map((a) => (
+                  <option key={a.ticker} value={a.ticker}>
+                    {a.ticker}
+                  </option>
+                ))}
+              </optgroup>
+            )
+          })}
         </select>
-        <div className="flex overflow-hidden rounded border border-[#1c2739]">
+        <div className="flex max-w-[360px] overflow-x-auto rounded border border-[#1c2739] scrollbar-none">
           {TIMEFRAMES.map((t) => (
             <button
               key={t}
               onClick={() => props.onSelectTf(t)}
-              className={`px-2 py-1 font-mono text-[10px] transition-colors ${
+              className={`shrink-0 px-2 py-1 font-mono text-[10px] transition-colors ${
                 props.tf === t ? 'bg-cyan-500/15 text-cyan-300' : 'bg-[#0d1420] text-[#4b5a72] hover:text-[#aab6cc]'
               }`}
             >

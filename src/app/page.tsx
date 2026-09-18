@@ -3,12 +3,14 @@
 // IQAIR//OS - main shell
 // Single-page operating system: menu bar, market watch, chart workspace,
 // analytics dock, trade ticket, copilot and the bottom workspace tabs.
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import MenuBar from '@/components/os/MenuBar'
 import MarketWatch from '@/components/os/MarketWatch'
 import ChartPanel from '@/components/os/ChartPanel'
 import IndicatorPanel from '@/components/os/IndicatorPanel'
+import IndicatorPicker from '@/components/os/IndicatorPicker'
+import SubPane from '@/components/os/SubPane'
 import SignalPanel from '@/components/os/SignalPanel'
 import MarkovPanel from '@/components/os/MarkovPanel'
 import QuantPanel from '@/components/os/QuantPanel'
@@ -21,7 +23,10 @@ import type {
   AnalysisResult,
   AssetRow,
   Candle,
+  ChartType,
+  IndicatorSeries,
   Position,
+  RegistryEntry,
   RiskConfig,
   StrategyInfo,
   Timeframe,
@@ -30,11 +35,17 @@ import { osGet, osPost, useOSFeed } from '@/lib/os/client'
 
 const BOOT_MSGS = [
   'mounting kernel plugins…',
-  'market-data: sim engine online',
+  'universe: 115 instruments online (forex · otc · crypto · commodities · stocks · indices)',
+  'registry: 101 indicators · 35 candlestick + chart patterns armed',
   'analytics: markov + montecarlo engines fitted',
-  'execution: paper broker + risk manager armed',
+  'execution: binary · turbo · digital · cfd broker + risk manager ready',
   'IQAIR//OS ready',
 ]
+
+interface ActiveIndicator {
+  id: string
+  params?: Record<string, number>
+}
 
 export default function OSPage() {
   const [assets, setAssets] = useState<AssetRow[]>([])
@@ -51,6 +62,12 @@ export default function OSPage() {
   const [prices, setPrices] = useState<Record<string, { price: number; dir: number }>>({})
   const [bootLine, setBootLine] = useState(0)
   const [connected, setConnected] = useState(false)
+  const [chartType, setChartType] = useState<ChartType>('candles')
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const [registry, setRegistry] = useState<RegistryEntry[]>([])
+  const [activeOverlays, setActiveOverlays] = useState<ActiveIndicator[]>([])
+  const [activeSubs, setActiveSubs] = useState<ActiveIndicator[]>([])
+  const [overlaySeries, setOverlaySeries] = useState<IndicatorSeries[]>([])
   const pricesRef = useRef<Record<string, { price: number; dir: number }>>({})
 
   const pushToast = useCallback((level: AlertRow['level'], message: string) => {
@@ -122,10 +139,44 @@ export default function OSPage() {
     void osGet<{ ok: boolean; strategies: StrategyInfo[] }>('/strategies').then((d) => {
       if (d.ok) setStrategies(d.strategies)
     })
+    void osGet<{ ok: boolean; indicators: RegistryEntry[] }>('/indicators').then((d) => {
+      if (d.ok) setRegistry(d.indicators)
+    })
     void osGet<{ ok: boolean; alerts: AlertRow[] }>('/alerts').then((d) => {
       if (d.ok) setAlerts(d.alerts.slice(0, 40))
     })
   }, [loadAssets, loadAccount, loadPositions])
+
+  // fetch overlay series when overlays/asset/tf change
+  const overlayKey = useMemo(
+    () => activeOverlays.map((o) => `${o.id}:${JSON.stringify(o.params ?? {})}`).join('|'),
+    [activeOverlays]
+  )
+  useEffect(() => {
+    if (!activeOverlays.length) {
+      setOverlaySeries([])
+      return
+    }
+    let cancelled = false
+    void Promise.all(
+      activeOverlays.map(async (o) => {
+        const fetchParams: Record<string, string | number> = { id: o.id, asset, tf }
+        if (o.params) for (const [k, v] of Object.entries(o.params)) fetchParams[`p_${k}`] = v
+        try {
+          const d = await osGet<{ ok: boolean; series: IndicatorSeries }>('/indicator', fetchParams)
+          return d.ok ? d.series : null
+        } catch {
+          return null
+        }
+      })
+    ).then((res) => {
+      if (!cancelled) setOverlaySeries(res.filter((s): s is IndicatorSeries => s !== null))
+    })
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [overlayKey, asset, tf])
 
   // asset/tf switch
   useEffect(() => {
@@ -219,8 +270,30 @@ export default function OSPage() {
 
           {/* CENTER: chart + bottom workspace */}
           <section className="flex min-h-0 flex-col gap-2">
-            <div className="min-h-[320px] flex-[3] lg:min-h-0">
-              <ChartPanel candles={candles} analysis={analysis} price={prices[asset]?.price ?? activeAsset?.price ?? 0} digitsTicker={asset} />
+            <div className="flex min-h-[320px] flex-[3] flex-col gap-1.5 lg:min-h-0">
+              <div className="min-h-[280px] flex-1">
+                <ChartPanel
+                  candles={candles}
+                  analysis={analysis}
+                  price={prices[asset]?.price ?? activeAsset?.price ?? 0}
+                  digitsTicker={asset}
+                  chartType={chartType}
+                  onChartTypeChange={setChartType}
+                  overlays={overlaySeries}
+                  registrySize={registry.length}
+                  onOpenPicker={() => setPickerOpen(true)}
+                />
+              </div>
+              {activeSubs.map((s) => (
+                <SubPane
+                  key={`${s.id}:${JSON.stringify(s.params ?? {})}`}
+                  id={s.id}
+                  asset={asset}
+                  tf={tf}
+                  params={s.params}
+                  onRemove={() => setActiveSubs((prev) => prev.filter((x) => x.id !== s.id))}
+                />
+              ))}
             </div>
             <div className="flex h-[260px] flex-col lg:h-[300px]">
               <div className="grid min-h-0 flex-1 grid-cols-1 gap-2 xl:grid-cols-[1fr_360px]">
@@ -255,6 +328,7 @@ export default function OSPage() {
                 assets={assets}
                 strategies={strategies}
                 price={prices[asset]?.price ?? activeAsset?.price ?? 0}
+                prices={prices}
                 refreshPositions={loadPositions}
                 onError={(m) => pushToast('danger', m)}
               />
@@ -300,6 +374,19 @@ export default function OSPage() {
         </main>
       )}
 
+      {/* indicator registry picker */}
+      <IndicatorPicker
+        open={pickerOpen}
+        onOpenChange={setPickerOpen}
+        registry={registry}
+        activeOverlays={activeOverlays.map((o) => o.id)}
+        activeSubs={activeSubs.map((o) => o.id)}
+        onAddOverlay={(id, params) => setActiveOverlays((prev) => [...prev.filter((o) => o.id !== id), { id, params }])}
+        onAddSub={(id, params) => setActiveSubs((prev) => (prev.some((o) => o.id === id) ? prev : [...prev, { id, params }]))}
+        onRemoveOverlay={(id) => setActiveOverlays((prev) => prev.filter((o) => o.id !== id))}
+        onRemoveSub={(id) => setActiveSubs((prev) => prev.filter((o) => o.id !== id))}
+      />
+
       {/* status bar */}
       <footer className="flex items-center justify-between border-t border-[#1c2739] bg-[#080d16] px-3 py-1 font-mono text-[9px] text-[#4b5a72]">
         <div className="flex items-center gap-3">
@@ -307,8 +394,8 @@ export default function OSPage() {
             <span className={`h-1.5 w-1.5 rounded-full ${connected ? 'bg-emerald-400' : 'bg-rose-500 animate-pulse'}`} />
             kernel :3030 {connected ? 'streaming' : 'reconnecting…'}
           </span>
-          <span>sim engine · {assets.length} assets</span>
-          <span className="hidden sm:inline">markov · montecarlo · hurst · garch · 17 patterns · 10 strategies</span>
+          <span>{assets.length} instruments · {registry.length || 101} indicators · binary/turbo/digital/cfd</span>
+          <span className="hidden sm:inline">markov · montecarlo · hurst · garch · 35 patterns · 10 strategies · 11 tfs</span>
         </div>
         <span className="hidden md:inline">unofficial · practice balance by default · not affiliated with IQ Option</span>
       </footer>

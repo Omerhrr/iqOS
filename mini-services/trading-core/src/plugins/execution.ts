@@ -15,6 +15,7 @@ import type { KernelContext } from '../kernel'
 import { TIMEFRAME_SECONDS } from '../types'
 import type { Plugin } from '../kernel'
 import type { MarketDataService } from './market-data'
+import { getInstrument } from '../universe'
 import { Store } from '../store'
 
 export interface RiskConfig {
@@ -134,6 +135,8 @@ export class ExecutionService {
     kind: TradeKind
     amount: number
     expiryBars?: number
+    expirySec?: number // digital/turbo explicit expiry
+    strikeOffsetPct?: number // digital strike distance from spot
     mode?: 'paper' | 'live'
     tp?: number
     sl?: number
@@ -152,35 +155,86 @@ export class ExecutionService {
     const price = this.market.getPrice(req.asset)
     if (!price) return { ok: false, error: 'no price feed' }
 
-    const expiryBars = req.kind === 'binary' ? Math.max(1, req.expiryBars ?? 1) : 0
+    const kind = req.kind
     const tfSec = TIMEFRAME_SECONDS[req.tf]
-    const position: Position = {
-      id: `pp-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`,
-      tsOpen: this.now(),
-      asset: req.asset,
-      tf: req.tf,
-      side: req.side,
-      kind: req.kind,
-      mode: 'paper',
-      amount: req.amount,
-      expiryBars,
-      entryPrice: price,
-      payout: assetInfo.payout,
-      status: 'open',
-      tp: req.kind === 'spot' ? req.tp : undefined,
-      sl: req.kind === 'spot' ? req.sl : undefined,
-      strategy: req.strategy,
-      note: req.note,
-      settlesAt: req.kind === 'binary' ? this.now() + expiryBars * tfSec : undefined,
+    let position: Position
+
+    if (kind === 'binary' || kind === 'turbo') {
+      const expiryBars = Math.max(1, req.expiryBars ?? 1)
+      // turbo on short TFs settles in whole seconds, minimum 30s
+      const settleSec = kind === 'turbo' ? Math.max(30, expiryBars * tfSec) : expiryBars * tfSec
+      position = {
+        id: `pp-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`,
+        tsOpen: this.now(),
+        asset: req.asset,
+        tf: req.tf,
+        side: req.side,
+        kind,
+        mode: 'paper',
+        amount: req.amount,
+        expiryBars,
+        entryPrice: price,
+        payout: this.market.payoutFor(req.asset, kind),
+        status: 'open',
+        strategy: req.strategy,
+        note: req.note,
+        settlesAt: this.now() + settleSec,
+      }
+    } else if (kind === 'digital') {
+      const expirySec = Math.max(60, req.expirySec ?? 300) // 5m default, 15m common
+      const offsetPct = req.strikeOffsetPct ?? 0
+      const strike = req.side === 'call' ? price * (1 + offsetPct / 100) : price * (1 - offsetPct / 100)
+      position = {
+        id: `pp-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`,
+        tsOpen: this.now(),
+        asset: req.asset,
+        tf: req.tf,
+        side: req.side,
+        kind,
+        mode: 'paper',
+        amount: req.amount,
+        expiryBars: Math.ceil(expirySec / tfSec),
+        entryPrice: price,
+        payout: this.market.payoutFor(req.asset, kind),
+        status: 'open',
+        strike,
+        expirySec,
+        strategy: req.strategy,
+        note: req.note,
+        settlesAt: this.now() + expirySec,
+      }
+    } else {
+      // CFD: margin = amount, notional = margin * leverage, TP/SL on % move of price
+      const leverage = Math.min(Math.max(1, req.leverage ?? assetInfo.leverage ?? 10), assetInfo.leverage ?? 30)
+      position = {
+        id: `pp-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`,
+        tsOpen: this.now(),
+        asset: req.asset,
+        tf: req.tf,
+        side: req.side,
+        kind: 'cfd',
+        mode: 'paper',
+        amount: req.amount,
+        expiryBars: 0,
+        entryPrice: price,
+        leverage,
+        payout: 1,
+        status: 'open',
+        tp: req.tp,
+        sl: req.sl,
+        strategy: req.strategy,
+        note: req.note,
+      }
     }
+
     this.store.insertPosition(position)
-    // reserve stake: deduct immediately, pay back on settlement
+    // reserve stake/margin: deduct immediately, pay back on settlement
     this.store.adjustBalance(-req.amount)
     this.ctx.bus.emit('positionOpened', { position })
     this.ctx.bus.emit('account', { account: this.account() })
     this.ctx.bus.emit('alert', {
       level: 'success',
-      message: `PAPER ${req.kind.toUpperCase()} ${req.side.toUpperCase()} ${req.asset} $${req.amount} @ ${price.toFixed(assetInfo.pip)}`,
+      message: `PAPER ${kind.toUpperCase()} ${req.side.toUpperCase()} ${req.asset} $${req.amount}${kind === 'cfd' ? ` x${position.leverage}` : ''} @ ${price.toFixed(assetInfo.pip)}`,
       ts: this.now(),
     })
     return { ok: true, position }
@@ -192,26 +246,57 @@ export class ExecutionService {
     side: Side
     amount: number
     expiryBars?: number
+    expirySec?: number
+    strikeOffsetPct?: number
     mode?: 'paper' | 'live'
     leverage?: number
+    tp?: number
+    sl?: number
     kind?: TradeKind
   }): Promise<{ ok: boolean; position?: Position; error?: string }> {
     if (!this.liveReady) return { ok: false, error: this.lastLiveError || 'live broker not connected (start the iqair sidecar and connect in Settings)' }
+    const kind: TradeKind = req.kind ?? 'binary'
+    const info = getInstrument(req.asset)
+    const symbol = this.market.iqairSymbol(req.asset)
     const tfSec = TIMEFRAME_SECONDS[req.tf ?? '1m']
-    const expiryMin = Math.max(1, Math.round(((req.expiryBars ?? 1) * tfSec) / 60))
+
+    // options payload (binary/turbo/digital)
+    const expirySec = kind === 'digital' ? Math.max(60, req.expirySec ?? 300) : Math.max(30, (req.expiryBars ?? 1) * tfSec)
+    const expiryMin = Math.max(1, Math.round(expirySec / 60))
+
+    // CFD-style live payload for spot categories
+    const isCfd = kind === 'cfd'
+    const instrumentType = isCfd
+      ? info?.category === 'forex'
+        ? 'forex'
+        : info?.category === 'crypto'
+          ? 'crypto'
+          : info?.category === 'commodity'
+            ? 'commodity'
+            : info?.category === 'index'
+              ? 'index'
+              : 'stock'
+      : kind === 'digital'
+        ? 'digital-option'
+        : kind === 'turbo'
+          ? 'turbo-option'
+          : 'binary-option'
+
     try {
       const res = await fetch(`${this.liveUrl()}/trade`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          asset: req.asset,
+          asset: symbol,
           amount: req.amount,
           direction: req.side === 'call' ? 'call' : 'put',
           expiry_minutes: expiryMin,
-          mode: 'turbo',
+          mode: instrumentType,
+          ...(kind === 'digital' ? { strike_offset_pct: req.strikeOffsetPct ?? 0 } : {}),
+          ...(isCfd ? { leverage: req.leverage ?? info?.leverage ?? 10, tp: req.tp, sl: req.sl } : {}),
         }),
       })
-      const data = (await res.json()) as { ok: boolean; order_id?: number; error?: string }
+      const data = (await res.json()) as { ok: boolean; order_id?: number; error?: string; payout?: number }
       if (!data.ok) return { ok: false, error: data.error ?? 'sidecar rejected trade' }
       const position: Position = {
         id: `lv-${data.order_id}`,
@@ -219,19 +304,24 @@ export class ExecutionService {
         asset: req.asset,
         tf: req.tf ?? '1m',
         side: req.side,
-        kind: 'binary',
+        kind,
         mode: 'live',
         amount: req.amount,
         expiryBars: req.expiryBars ?? 1,
         entryPrice: this.market.getPrice(req.asset),
-        payout: 0.85,
+        payout: kind === 'digital' ? this.market.payoutFor(req.asset, 'digital') : kind === 'turbo' ? this.market.payoutFor(req.asset, 'turbo') : kind === 'cfd' ? 1 : this.market.payoutFor(req.asset, 'binary'),
         status: 'open',
+        leverage: isCfd ? req.leverage ?? info?.leverage ?? 10 : undefined,
+        strike: kind === 'digital' && req.strikeOffsetPct ? this.market.getPrice(req.asset) * (1 + (req.side === 'call' ? req.strikeOffsetPct : -req.strikeOffsetPct) / 100) : undefined,
+        expirySec: kind === 'digital' ? expirySec : undefined,
+        tp: req.tp,
+        sl: req.sl,
         liveOrderId: String(data.order_id),
-        settlesAt: this.now() + expiryMin * 60,
+        settlesAt: isCfd ? undefined : this.now() + expirySec,
       }
       this.store.insertPosition(position)
       this.ctx.bus.emit('positionOpened', { position })
-      this.ctx.bus.emit('alert', { level: 'success', message: `LIVE order ${data.order_id} placed via iqair`, ts: this.now() })
+      this.ctx.bus.emit('alert', { level: 'success', message: `LIVE ${kind.toUpperCase()} order ${data.order_id} placed via iqair`, ts: this.now() })
       return { ok: true, position }
     } catch (err) {
       this.lastLiveError = (err as Error).message
@@ -248,32 +338,55 @@ export class ExecutionService {
   private onCandleClose(asset: string, tf: Timeframe, candle: Candle): void {
     const open = this.store.listPositions('open').filter((p) => p.mode === 'paper' && p.asset === asset && p.tf === tf)
     for (const pos of open) {
-      if (pos.kind === 'binary') {
+      if (pos.kind === 'binary' || pos.kind === 'turbo') {
         if (pos.settlesAt !== undefined && this.now() < pos.settlesAt) continue
         const won = pos.side === 'call' ? candle.close > pos.entryPrice : candle.close < pos.entryPrice
         const draw = candle.close === pos.entryPrice
         const pnl = draw ? 0 : won ? pos.amount * pos.payout : -pos.amount
         this.settle(pos.id, candle.close, draw ? 'won' : won ? 'won' : 'lost', pnl)
-      } else if (pos.kind === 'spot') {
-        this.checkSpot(pos, candle.close, candle.time)
+      } else if (pos.kind === 'digital') {
+        if (pos.settlesAt !== undefined && this.now() < pos.settlesAt) continue
+        const strike = pos.strike ?? pos.entryPrice
+        const won = pos.side === 'call' ? candle.close > strike : candle.close < strike
+        const draw = candle.close === strike
+        const pnl = draw ? 0 : won ? pos.amount * pos.payout : -pos.amount
+        this.settle(pos.id, candle.close, draw ? 'won' : won ? 'won' : 'lost', pnl)
+      } else if (pos.kind === 'spot' || pos.kind === 'cfd') {
+        this.checkMargin(pos, candle.close, candle.time)
       }
     }
   }
 
   private checkSpotStops(asset: string, candle: Candle): void {
-    const open = this.store.listPositions('open').filter((p) => p.mode === 'paper' && p.kind === 'spot' && p.asset === asset)
-    for (const pos of open) this.checkSpot(pos, candle.close, Math.floor(Date.now() / 1000))
+    const open = this.store.listPositions('open').filter((p) => p.mode === 'paper' && (p.kind === 'spot' || p.kind === 'cfd') && p.asset === asset)
+    for (const pos of open) this.checkMargin(pos, candle.close, Math.floor(Date.now() / 1000))
   }
 
-  private checkSpot(pos: Position, price: number, ts: number): void {
-    if (pos.kind !== 'spot') return
+  private checkMargin(pos: Position, price: number, ts: number): void {
+    if (pos.kind !== 'spot' && pos.kind !== 'cfd') return
     const dir = pos.side === 'call' ? 1 : -1
     const movePct = ((price - pos.entryPrice) / pos.entryPrice) * 100 * dir
     const hitTP = pos.tp !== undefined && movePct >= pos.tp
     const hitSL = pos.sl !== undefined && movePct <= -pos.sl
-    if (!hitTP && !hitSL) return
-    const pnl = (price - pos.entryPrice) / pos.entryPrice * pos.amount * dir
-    this.settle(pos.id, price, pnl >= 0 ? 'closed' : 'closed', pnl)
+    if (!hitTP && !hitSL) {
+      // CFD margin call: unrealized loss >= margin => stop out
+      if (pos.kind === 'cfd' && pos.leverage) {
+        const lossPct = (movePct * pos.leverage) / 100 // fraction of margin lost
+        if (lossPct <= -1) {
+          this.settle(pos.id, price, 'closed', -pos.amount)
+          this.ctx.bus.emit('alert', {
+            level: 'danger',
+            message: `MARGIN CALL ${pos.asset}: stop-out at -100% margin`,
+            ts: this.now(),
+          })
+          void ts
+        }
+      }
+      return
+    }
+    const notional = pos.kind === 'cfd' && pos.leverage ? pos.amount * pos.leverage : pos.amount
+    const pnl = ((price - pos.entryPrice) / pos.entryPrice) * notional * dir
+    this.settle(pos.id, price, 'closed', pnl)
     void ts
   }
 
@@ -285,15 +398,21 @@ export class ExecutionService {
       void this.postLive(`/close_trade`, { mode: 'turbo', order_id: Number(pos.liveOrderId) })
     }
     const price = this.market.getPrice(pos.asset)
-    if (pos.kind === 'binary') {
+    const dir = pos.side === 'call' ? 1 : -1
+    if (pos.kind === 'binary' || pos.kind === 'turbo') {
       // early close: settle at current diff (paper simplification)
-      const dir = pos.side === 'call' ? 1 : -1
       const diffPct = ((price - pos.entryPrice) / pos.entryPrice) * dir
       const pnl = diffPct >= 0 ? pos.amount * pos.payout * Math.min(1, diffPct * 200) : -pos.amount * Math.min(1, -diffPct * 200)
       this.settle(id, price, 'closed', pnl)
+    } else if (pos.kind === 'digital') {
+      const strike = pos.strike ?? pos.entryPrice
+      const diffPct = ((price - strike) / strike) * dir
+      const pnl = diffPct >= 0 ? pos.amount * pos.payout * Math.min(1, diffPct * 200) : -pos.amount * Math.min(1, -diffPct * 200)
+      this.settle(id, price, 'closed', pnl)
     } else {
-      const dir = pos.side === 'call' ? 1 : -1
-      const pnl = ((price - pos.entryPrice) / pos.entryPrice) * pos.amount * dir
+      // spot / cfd
+      const notional = pos.kind === 'cfd' && pos.leverage ? pos.amount * pos.leverage : pos.amount
+      const pnl = ((price - pos.entryPrice) / pos.entryPrice) * notional * dir
       this.settle(id, price, 'closed', pnl)
     }
     return { ok: true, position: this.store.getPosition(id) ?? undefined }

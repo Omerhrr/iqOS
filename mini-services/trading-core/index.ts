@@ -10,7 +10,10 @@ import { storePlugin } from './src/plugins/store'
 import { marketDataPlugin, MarketDataService } from './src/plugins/market-data'
 import { analyticsPlugin, AnalyticsService } from './src/plugins/analytics'
 import { executionPlugin, ExecutionService, type RiskConfig } from './src/plugins/execution'
-import type { Timeframe } from './src/types'
+import { ALL_TIMEFRAMES, type Timeframe } from './src/types'
+import { searchInstruments, UNIVERSE_STATS, getInstrument } from './src/universe'
+import { listRegistry, computeIndicator, registrySize, getIndicatorDef } from './src/analytics/registry'
+import { detectChartPatterns } from './src/analytics/chart-patterns'
 
 const PORT = 3030
 
@@ -50,7 +53,7 @@ const httpServer = createServer(async (req, res) => {
   }
   const tf = (name: string | null): Timeframe => {
     const v = (name ?? '1m') as Timeframe
-    return ['5s', '15s', '1m', '5m', '15m'].includes(v) ? v : '1m'
+    return (ALL_TIMEFRAMES as string[]).includes(v) ? v : '1m'
   }
 
   try {
@@ -62,6 +65,61 @@ const httpServer = createServer(async (req, res) => {
       if (path === '/health') return json(200, { ok: true, service: 'trading-core', uptime: process.uptime() })
 
       if (path === '/assets') return json(200, { ok: true, assets: market.listAssets(), mode: market.mode, activeAsset: market.activeAsset })
+
+      if (path === '/instruments') {
+        const cat = (q.get('category') ?? 'all') as 'all' | 'otc' | 'forex' | 'crypto' | 'commodity' | 'stock' | 'index'
+        const search = q.get('q') ?? ''
+        const found = searchInstruments(search, cat)
+        market.refreshSchedules()
+        return json(200, {
+          ok: true,
+          instruments: found.map((a) => ({ ...a, price: market.getPrice(a.ticker) || a.basePrice })),
+          stats: UNIVERSE_STATS,
+        })
+      }
+
+      if (path === '/indicators') {
+        return json(200, { ok: true, indicators: listRegistry(), stats: { total: registrySize() } })
+      }
+
+      if (path === '/indicator') {
+        const id = q.get('id') ?? 'rsi'
+        const def = getIndicatorDef(id)
+        if (!def) return json(404, { ok: false, error: `unknown indicator ${id}` })
+        const asset = q.get('asset') ?? market.activeAsset
+        const timeframe = tf(q.get('tf'))
+        const params: Record<string, number> = {}
+        for (const [k, v] of q.entries()) if (k.startsWith('p_')) params[k.slice(2)] = Number(v)
+        const candles = market.getCandles(asset, timeframe, 400)
+        const res = computeIndicator(id, candles, params)
+        if (!res) return json(404, { ok: false, error: 'compute failed' })
+        const time = candles.map((c) => c.time)
+        const nz = (v: number) => (Number.isFinite(v) ? v : null)
+        return json(200, {
+          ok: true,
+          series: {
+            id: def.id,
+            name: def.name,
+            category: def.category,
+            pane: def.pane,
+            params: Object.fromEntries(def.params.map((pp) => [pp.key, params[pp.key] ?? pp.default])),
+            time,
+            lines: res.output.lines.map((ln) => ({ key: ln.key, color: ln.color, style: ln.style, values: ln.values.map(nz) })),
+            hist: res.output.hist ? { values: res.output.hist.values.map(nz), color: res.output.hist.color } : undefined,
+            levels: res.output.levels,
+            bands: res.output.bands,
+            fillBetween: res.output.fillBetween,
+            note: res.output.note,
+          },
+        })
+      }
+
+      if (path === '/chart_patterns') {
+        const asset = q.get('asset') ?? market.activeAsset
+        const timeframe = tf(q.get('tf'))
+        const candles = market.getCandles(asset, timeframe, 400)
+        return json(200, { ok: true, patterns: detectChartPatterns(candles) })
+      }
 
       if (path === '/candles') {
         const asset = q.get('asset') ?? market.activeAsset
@@ -123,6 +181,7 @@ const httpServer = createServer(async (req, res) => {
         const asset = String(body.asset ?? '')
         if (!market.assets.some((a) => a.ticker === asset)) return json(400, { ok: false, error: `unknown asset ${asset}` })
         market.activeAsset = asset
+        market.ensureSeeded(asset)
         io.emit('ui', { event: 'asset-changed', asset })
         return json(200, { ok: true, activeAsset: asset })
       }
@@ -154,16 +213,23 @@ const httpServer = createServer(async (req, res) => {
       }
 
       if (path === '/trade') {
+        const asset = String(body.asset ?? market.activeAsset)
+        const kind = (body.kind as 'binary' | 'turbo' | 'digital' | 'cfd') ?? 'binary'
+        const inst = getInstrument(asset)
+        if (!inst) return json(400, { ok: false, error: `unknown asset ${asset}` })
         const out = await exec.placeOrder({
-          asset: String(body.asset ?? market.activeAsset),
+          asset,
           tf: tf(String(body.tf ?? '1m') as string),
           side: (body.side as 'call' | 'put') ?? 'call',
-          kind: (body.kind as 'binary' | 'spot') ?? 'binary',
+          kind,
           amount: Number(body.amount ?? 10),
-          expiryBars: body.expiryBars !== undefined ? Number(body.expiryBars) : 1,
+          expiryBars: body.expiryBars !== undefined ? Number(body.expiryBars) : undefined,
+          expirySec: body.expirySec !== undefined ? Number(body.expirySec) : undefined,
+          strikeOffsetPct: body.strikeOffsetPct !== undefined ? Number(body.strikeOffsetPct) : undefined,
           mode: (body.mode as 'paper' | 'live') ?? 'paper',
           tp: body.tp !== undefined ? Number(body.tp) : undefined,
           sl: body.sl !== undefined ? Number(body.sl) : undefined,
+          leverage: body.leverage !== undefined ? Number(body.leverage) : undefined,
           strategy: body.strategy !== undefined ? String(body.strategy) : undefined,
           note: body.note !== undefined ? String(body.note) : undefined,
         })

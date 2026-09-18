@@ -166,8 +166,12 @@ const outsideBar: Detector = (w) => {
   return null
 }
 
-const DETECTORS: Detector[] = [
-  doji,
+let DETECTORS_CACHE: Detector[] | null = null
+const allDetectors = (): Detector[] => {
+  if (!DETECTORS_CACHE) {
+    DETECTORS_CACHE = [
+      ...DETECTORS_EXT,
+      doji,
   hammer,
   invertedHammer,
   shootingStar,
@@ -184,7 +188,10 @@ const DETECTORS: Detector[] = [
   marubozu,
   insideBar,
   outsideBar,
-]
+  ]
+  }
+  return DETECTORS_CACHE
+}
 
 /** Scan the last `lookback` candles; every detector fires on each bar end. */
 export function detectPatterns(candles: Candle[], lookback = 8): PatternHit[] {
@@ -193,7 +200,7 @@ export function detectPatterns(candles: Candle[], lookback = 8): PatternHit[] {
   for (let end = start + 1; end <= candles.length; end++) {
     const window = candles.slice(0, end)
     const barsAgo = candles.length - end
-    for (const fn of DETECTORS) {
+    for (const fn of allDetectors()) {
       try {
         const hit = fn(window)
         if (hit) hits.push({ ...hit, barsAgo })
@@ -225,3 +232,187 @@ export function patternBias(hits: PatternHit[]): number {
   }
   return Math.max(-6, Math.min(6, score))
 }
+
+// ============================================================
+// Phase 2 - extended candlestick library (18 more detectors)
+// ============================================================
+
+const bullishHarami: Detector = (w) => {
+  const c = w[w.length - 1]
+  const p = w[w.length - 2]
+  if (isBear(p) && isBull(c) && c.open >= p.close && c.close <= p.open && body(c) < body(p) * 0.6)
+    return { name: 'Bullish Harami', direction: 'bullish', reliability: 2, barsAgo: 0, note: 'Small bull bar inside big bear bar' }
+  return null
+}
+
+const bearishHarami: Detector = (w) => {
+  const c = w[w.length - 1]
+  const p = w[w.length - 2]
+  if (isBull(p) && isBear(c) && c.open <= p.close && c.close >= p.open && body(c) < body(p) * 0.6)
+    return { name: 'Bearish Harami', direction: 'bearish', reliability: 2, barsAgo: 0, note: 'Small bear bar inside big bull bar' }
+  return null
+}
+
+const haramiCross: Detector = (w) => {
+  const c = w[w.length - 1]
+  const p = w[w.length - 2]
+  if (body(p) > range(p) * 0.7 && body(c) <= range(c) * 0.1 && c.high <= p.high && c.low >= p.low) {
+    const dir: 'bullish' | 'bearish' = isBear(p) ? 'bullish' : 'bearish'
+    return { name: 'Harami Cross', direction: dir, reliability: 2, barsAgo: 0, note: 'Doji inside large body - reversal warning' }
+  }
+  return null
+}
+
+const threeInsideUp: Detector = (w) => {
+  const [p, m, c] = w.slice(-3)
+  if (isBear(p) && isBull(m) && m.open >= p.close && m.close <= p.open && isBull(c) && c.close > p.open)
+    return { name: 'Three Inside Up', direction: 'bullish', reliability: 3, barsAgo: 2, note: 'Harami confirmed by breakout' }
+  return null
+}
+
+const threeInsideDown: Detector = (w) => {
+  const [p, m, c] = w.slice(-3)
+  if (isBull(p) && isBear(m) && m.open <= p.close && m.close >= p.open && isBear(c) && c.close < p.open)
+    return { name: 'Three Inside Down', direction: 'bearish', reliability: 3, barsAgo: 2, note: 'Bear harami confirmed by breakdown' }
+  return null
+}
+
+const threeOutsideUp: Detector = (w) => {
+  const [p, m, c] = w.slice(-3)
+  if (isBear(p) && isBull(m) && m.close >= p.open && m.open <= p.close && isBull(c) && c.close > m.close)
+    return { name: 'Three Outside Up', direction: 'bullish', reliability: 3, barsAgo: 2, note: 'Engulfing + confirmation close' }
+  return null
+}
+
+const threeOutsideDown: Detector = (w) => {
+  const [p, m, c] = w.slice(-3)
+  if (isBull(p) && isBear(m) && m.close <= p.open && m.open >= p.close && isBear(c) && c.close < m.close)
+    return { name: 'Three Outside Down', direction: 'bearish', reliability: 3, barsAgo: 2, note: 'Bear engulfing + confirmation' }
+  return null
+}
+
+const morningDojiStar: Detector = (w) => {
+  const [p, m, c] = w.slice(-3)
+  if (isBear(p) && body(p) > range(p) * 0.6 && body(m) <= range(m) * 0.1 && isBull(c) && c.close > (p.open + p.close) / 2)
+    return { name: 'Morning Doji Star', direction: 'bullish', reliability: 3, barsAgo: 2, note: 'Doji reversal gap - strong bottom' }
+  return null
+}
+
+const eveningDojiStar: Detector = (w) => {
+  const [p, m, c] = w.slice(-3)
+  if (isBull(p) && body(p) > range(p) * 0.6 && body(m) <= range(m) * 0.1 && isBear(c) && c.close < (p.open + p.close) / 2)
+    return { name: 'Evening Doji Star', direction: 'bearish', reliability: 3, barsAgo: 2, note: 'Doji reversal gap - strong top' }
+  return null
+}
+
+const risingThreeMethods: Detector = (w) => {
+  const s = w.slice(-5)
+  if (s.length < 5) return null
+  const [big, a, b, c2, last] = s
+  if (!isBull(big) || body(big) < avgBody(w.slice(-14)) * 1.2) return null
+  const inside = [a, b, c2].every((k) => k.high <= big.high * 1.001 && k.low >= big.low * 0.999)
+  if (inside && isBull(last) && last.close > big.close)
+    return { name: 'Rising Three Methods', direction: 'bullish', reliability: 3, barsAgo: 4, note: 'Bull flag consolidation - continuation' }
+  return null
+}
+
+const fallingThreeMethods: Detector = (w) => {
+  const s = w.slice(-5)
+  if (s.length < 5) return null
+  const [big, a, b, c2, last] = s
+  if (!isBear(big) || body(big) < avgBody(w.slice(-14)) * 1.2) return null
+  const inside = [a, b, c2].every((k) => k.high <= big.high * 1.001 && k.low >= big.low * 0.999)
+  if (inside && isBear(last) && last.close < big.close)
+    return { name: 'Falling Three Methods', direction: 'bearish', reliability: 3, barsAgo: 4, note: 'Bear flag consolidation - continuation' }
+  return null
+}
+
+const homingPigeon: Detector = (w) => {
+  const c = w[w.length - 1]
+  const p = w[w.length - 2]
+  if (isBear(p) && isBull(c) && c.open <= p.close && c.close >= p.open - 1e-9 && c.close <= p.open && body(c) < body(p) * 0.5)
+    return { name: 'Homing Pigeon', direction: 'bullish', reliability: 2, barsAgo: 0, note: 'Small bull inside bear - softening sellers' }
+  return null
+}
+
+const matchingLow: Detector = (w) => {
+  const c = w[w.length - 1]
+  const p = w[w.length - 2]
+  if (isBear(p) && isBear(c) && Math.abs(c.close - p.close) <= range(p) * 0.03 && body(p) > body(c))
+    return { name: 'Matching Low', direction: 'bullish', reliability: 1, barsAgo: 0, note: 'Twin lows - support test' }
+  return null
+}
+
+const stickSandwich: Detector = (w) => {
+  const [a, b, c] = w.slice(-3)
+  if (isBear(a) && isBull(b) && isBear(c) && Math.abs(a.close - c.close) <= range(a) * 0.03)
+    return { name: 'Stick Sandwich', direction: 'bullish', reliability: 2, barsAgo: 2, note: 'Twin bear closes sandwich a bull bar' }
+  return null
+}
+
+const separatingLines: Detector = (w) => {
+  const c = w[w.length - 1]
+  const p = w[w.length - 2]
+  if (isBear(p) && isBull(c) && Math.abs(c.open - p.open) <= range(p) * 0.05)
+    return { name: 'Bullish Separating Lines', direction: 'bullish', reliability: 2, barsAgo: 0, note: 'Same open, opposite close - buyers took over' }
+  if (isBull(p) && isBear(c) && Math.abs(c.open - p.open) <= range(p) * 0.05)
+    return { name: 'Bearish Separating Lines', direction: 'bearish', reliability: 2, barsAgo: 0, note: 'Same open, opposite close - sellers took over' }
+  return null
+}
+
+const abandonedBaby: Detector = (w) => {
+  const [p, m, c] = w.slice(-3)
+  if (isBear(p) && body(m) <= range(m) * 0.1 && m.low > p.high && isBull(c) && c.close > (p.open + p.close) / 2)
+    return { name: 'Abandoned Baby (Bull)', direction: 'bullish', reliability: 3, barsAgo: 2, note: 'Island doji below - rare strong reversal' }
+  if (isBull(p) && body(m) <= range(m) * 0.1 && m.high < p.low && isBear(c) && c.close < (p.open + p.close) / 2)
+    return { name: 'Abandoned Baby (Bear)', direction: 'bearish', reliability: 3, barsAgo: 2, note: 'Island doji above - rare strong reversal' }
+  return null
+}
+
+const kicker: Detector = (w) => {
+  const c = w[w.length - 1]
+  const p = w[w.length - 2]
+  if (isBear(p) && isBull(c) && c.open >= p.open && c.close > p.high && body(c) > body(p))
+    return { name: 'Bullish Kicker', direction: 'bullish', reliability: 3, barsAgo: 0, note: 'Gap-up ignition from bear body' }
+  if (isBull(p) && isBear(c) && c.open <= p.open && c.close < p.low && body(c) > body(p))
+    return { name: 'Bearish Kicker', direction: 'bearish', reliability: 3, barsAgo: 0, note: 'Gap-down collapse from bull body' }
+  return null
+}
+
+const spinningTop: Detector = (w) => {
+  const c = w[w.length - 1]
+  const ab = avgBody(w.slice(-10))
+  if (body(c) <= ab * 0.4 && upperWick(c) >= body(c) && lowerWick(c) >= body(c) && body(c) > range(c) * 0.05)
+    return { name: 'Spinning Top', direction: 'neutral', reliability: 1, barsAgo: 0, note: 'Balanced indecision - pause in trend' }
+  return null
+}
+
+const highWave: Detector = (w) => {
+  const c = w[w.length - 1]
+  const ab = avgBody(w.slice(-10))
+  if (body(c) <= ab * 0.25 && range(c) >= ab * 2.2)
+    return { name: 'High Wave', direction: 'neutral', reliability: 1, barsAgo: 0, note: 'Long wicks tiny body - volatility climax' }
+  return null
+}
+
+const DETECTORS_EXT: Detector[] = [
+  bullishHarami,
+  bearishHarami,
+  haramiCross,
+  threeInsideUp,
+  threeInsideDown,
+  threeOutsideUp,
+  threeOutsideDown,
+  morningDojiStar,
+  eveningDojiStar,
+  risingThreeMethods,
+  fallingThreeMethods,
+  homingPigeon,
+  matchingLow,
+  stickSandwich,
+  separatingLines,
+  abandonedBaby,
+  kicker,
+  spinningTop,
+  highWave,
+]
