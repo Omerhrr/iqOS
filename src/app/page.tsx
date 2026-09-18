@@ -4,6 +4,7 @@
 // Single-page operating system: menu bar, market watch, chart workspace,
 // analytics dock, trade ticket, copilot and the bottom workspace tabs.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels'
 import { toast } from 'sonner'
 import MenuBar from '@/components/os/MenuBar'
 import MarketWatch from '@/components/os/MarketWatch'
@@ -47,6 +48,19 @@ interface ActiveIndicator {
   params?: Record<string, number>
 }
 
+/** Desktop = the resizable 3-dock workspace; below lg the OS stacks into one scrollable column. */
+function useIsDesktop() {
+  const [isDesktop, setIsDesktop] = useState(false)
+  useEffect(() => {
+    const mql = window.matchMedia('(min-width: 1024px)')
+    const onChange = () => setIsDesktop(mql.matches)
+    onChange()
+    mql.addEventListener('change', onChange)
+    return () => mql.removeEventListener('change', onChange)
+  }, [])
+  return isDesktop
+}
+
 export default function OSPage() {
   const [assets, setAssets] = useState<AssetRow[]>([])
   const [asset, setAsset] = useState('EURUSD')
@@ -69,6 +83,7 @@ export default function OSPage() {
   const [activeSubs, setActiveSubs] = useState<ActiveIndicator[]>([])
   const [overlaySeries, setOverlaySeries] = useState<IndicatorSeries[]>([])
   const pricesRef = useRef<Record<string, { price: number; dir: number }>>({})
+  const isDesktop = useIsDesktop()
 
   const pushToast = useCallback((level: AlertRow['level'], message: string) => {
     if (level === 'success') toast.success(message)
@@ -228,16 +243,66 @@ export default function OSPage() {
   const activeAsset = assets.find((a) => a.ticker === asset)
   const patterns = analysis?.patterns ?? []
 
+  const livePrice = prices[asset]?.price ?? activeAsset?.price ?? 0
+
+  // shared chart workspace (chart + sub-panes) - mounted by whichever layout is active
+  const chartWorkspace = (
+    <>
+      <div className="min-h-[280px] flex-1">
+        <ChartPanel candles={candles} analysis={analysis} price={livePrice} digitsTicker={asset} chartType={chartType} overlays={overlaySeries} />
+      </div>
+      {activeSubs.map((s) => (
+        <SubPane
+          key={`${s.id}:${JSON.stringify(s.params ?? {})}`}
+          id={s.id}
+          asset={asset}
+          tf={tf}
+          params={s.params}
+          onRemove={() => setActiveSubs((prev) => prev.filter((x) => x.id !== s.id))}
+        />
+      ))}
+    </>
+  )
+
+  const ticket = (
+    <TradeTicket
+      asset={activeAsset}
+      tf={tf}
+      price={livePrice}
+      account={account}
+      onPlaced={() => void loadPositions()}
+      onError={(m) => pushToast('danger', m)}
+    />
+  )
+
+  const copilot = <Copilot session="default" />
+
+  // slim drag handles: vertical bar for horizontal groups, horizontal bar for vertical groups
+  const vHandle = (
+    <PanelResizeHandle className="group relative h-full w-2 rounded transition-colors hover:bg-cyan-500/10 data-[resize-handle-state=drag]:bg-cyan-500/20">
+      <div className="absolute left-1/2 top-1/2 h-10 w-[3px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-[#1c2739] transition-colors group-hover:bg-cyan-400/70 group-data-[resize-handle-state=drag]:bg-cyan-400" />
+    </PanelResizeHandle>
+  )
+  const hHandle = (
+    <PanelResizeHandle className="group relative h-2 w-full rounded transition-colors hover:bg-cyan-500/10 data-[resize-handle-state=drag]:bg-cyan-500/20">
+      <div className="absolute left-1/2 top-1/2 h-[3px] w-10 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[#1c2739] transition-colors group-hover:bg-cyan-400/70 group-data-[resize-handle-state=drag]:bg-cyan-400" />
+    </PanelResizeHandle>
+  )
+
   return (
     <div className="flex h-screen min-h-screen flex-col overflow-hidden bg-[#070b12] text-[#dbe4f0]">
       <MenuBar
         assets={assets}
         asset={asset}
         tf={tf}
+        chartType={chartType}
+        registrySize={registry.length}
         account={account}
         risk={risk}
         onSelectAsset={handleSelectAsset}
         onSelectTf={setTf}
+        onChartTypeChange={setChartType}
+        onOpenPicker={() => setPickerOpen(true)}
         onRiskChanged={setRisk}
         onAccountChanged={setAccount}
         onError={(m) => pushToast('danger', m)}
@@ -256,121 +321,101 @@ export default function OSPage() {
             </div>
           </div>
         </div>
+      ) : !isDesktop ? (
+        /* ---------- MOBILE / TABLET: single scrollable column ---------- */
+        <main className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-2">
+          <div className="flex h-[340px] shrink-0 flex-col">{chartWorkspace}</div>
+          <div className="h-[420px] shrink-0">
+            <BottomTabs
+              asset={asset}
+              tf={tf}
+              positions={positions}
+              history={history}
+              alerts={alerts}
+              patterns={patterns}
+              assets={assets}
+              strategies={strategies}
+              price={livePrice}
+              prices={prices}
+              refreshPositions={loadPositions}
+              onError={(m) => pushToast('danger', m)}
+            />
+          </div>
+          {analysis && (
+            <>
+              <SignalPanel analysis={analysis} />
+              <MarkovPanel markov={analysis.markov} />
+              <QuantPanel analysis={analysis} />
+            </>
+          )}
+          {ticket}
+          <div className="h-[420px] shrink-0">{copilot}</div>
+        </main>
       ) : (
-        <main className="grid min-h-0 flex-1 grid-cols-1 gap-2 overflow-y-auto p-2 lg:grid-cols-[220px_1fr_320px] lg:overflow-hidden xl:grid-cols-[240px_1fr_360px]">
-          {/* LEFT: watch + indicators */}
-          <aside className="hidden min-h-0 flex-col gap-2 lg:flex">
-            <div className="min-h-0 flex-[3]">
-              <MarketWatch assets={assets} active={asset} prices={prices} onSelect={handleSelectAsset} />
-            </div>
-            <div className="min-h-0 flex-[4]">
-              <IndicatorPanel analysis={analysis} />
-            </div>
-          </aside>
+        /* ---------- DESKTOP: fully resizable 3-dock workspace ---------- */
+        <main className="min-h-0 flex-1 p-2">
+          <PanelGroup direction="horizontal" autoSaveId="iqos:docks" className="h-full">
+            {/* LEFT dock: market watch / indicators */}
+            <Panel defaultSize={17} minSize={11}>
+              <PanelGroup direction="vertical" autoSaveId="iqos:left" className="h-full">
+                <Panel defaultSize={46} minSize={15}>
+                  <div className="mr-0.5 h-full min-h-0">
+                    <MarketWatch assets={assets} active={asset} prices={prices} onSelect={handleSelectAsset} />
+                  </div>
+                </Panel>
+                {hHandle}
+                <Panel defaultSize={54} minSize={20}>
+                  <div className="ml-0.5 h-full min-h-0">
+                    <IndicatorPanel analysis={analysis} />
+                  </div>
+                </Panel>
+              </PanelGroup>
+            </Panel>
 
-          {/* CENTER: chart + bottom workspace */}
-          <section className="flex min-h-0 flex-col gap-2">
-            <div className="flex min-h-[320px] flex-[3] flex-col gap-1.5 lg:min-h-0">
-              <div className="min-h-[280px] flex-1">
-                <ChartPanel
-                  candles={candles}
-                  analysis={analysis}
-                  price={prices[asset]?.price ?? activeAsset?.price ?? 0}
-                  digitsTicker={asset}
-                  chartType={chartType}
-                  onChartTypeChange={setChartType}
-                  overlays={overlaySeries}
-                  registrySize={registry.length}
-                  onOpenPicker={() => setPickerOpen(true)}
-                />
-              </div>
-              {activeSubs.map((s) => (
-                <SubPane
-                  key={`${s.id}:${JSON.stringify(s.params ?? {})}`}
-                  id={s.id}
-                  asset={asset}
-                  tf={tf}
-                  params={s.params}
-                  onRemove={() => setActiveSubs((prev) => prev.filter((x) => x.id !== s.id))}
-                />
-              ))}
-            </div>
-            <div className="flex h-[260px] flex-col lg:h-[300px]">
-              <div className="grid min-h-0 flex-1 grid-cols-1 gap-2 xl:grid-cols-[1fr_360px]">
-                <div className="hidden min-h-0 xl:block">
+            {vHandle}
+
+            {/* CENTER dock: chart + analytics + bottom workspace */}
+            <Panel defaultSize={56} minSize={32}>
+              <div className="flex h-full min-h-0 flex-col gap-2 px-0.5">
+                <div className="flex min-h-0 flex-[3] flex-col gap-1.5">{chartWorkspace}</div>
+                <div className="grid h-[240px] shrink-0 grid-cols-2 grid-rows-[minmax(0,1fr)] gap-2 overflow-hidden">
                   <SignalPanel analysis={analysis} />
-                </div>
-                <div className="hidden min-h-0 xl:block">
                   <MarkovPanel markov={analysis?.markov ?? null} />
                 </div>
+                <div className="h-[250px] shrink-0">
+                  <BottomTabs
+                    asset={asset}
+                    tf={tf}
+                    positions={positions}
+                    history={history}
+                    alerts={alerts}
+                    patterns={patterns}
+                    assets={assets}
+                    strategies={strategies}
+                    price={livePrice}
+                    prices={prices}
+                    refreshPositions={loadPositions}
+                    onError={(m) => pushToast('danger', m)}
+                  />
+                </div>
               </div>
-              <div className="mt-2 hidden justify-center gap-2 xl:hidden">
-                {/* mobile summary strip */}
-                {analysis && (
-                  <div className="flex w-full gap-2 overflow-x-auto font-mono text-[10px]">
-                    <MiniStat label="Signal" value={analysis.signal.direction.toUpperCase()} color={analysis.signal.direction === 'call' ? '#10b981' : analysis.signal.direction === 'put' ? '#f43f5e' : '#eab308'} />
-                    <MiniStat label="Score" value={analysis.signal.score.toFixed(0)} />
-                    <MiniStat label="Markov P(up)" value={`${(analysis.markov.probUp * 100).toFixed(0)}%`} color="#38bdf8" />
-                    <MiniStat label="Regime" value={analysis.markov.regime.toUpperCase()} />
-                    <MiniStat label="Hurst" value={analysis.quant.hurst.toFixed(2)} />
-                  </div>
-                )}
-              </div>
-            </div>
-            <div className="min-h-[220px] flex-[2]">
-              <BottomTabs
-                asset={asset}
-                tf={tf}
-                positions={positions}
-                history={history}
-                alerts={alerts}
-                patterns={patterns}
-                assets={assets}
-                strategies={strategies}
-                price={prices[asset]?.price ?? activeAsset?.price ?? 0}
-                prices={prices}
-                refreshPositions={loadPositions}
-                onError={(m) => pushToast('danger', m)}
-              />
-            </div>
-          </section>
+            </Panel>
 
-          {/* RIGHT: quant + ticket + copilot */}
-          <aside className="hidden min-h-0 flex-col gap-2 overflow-y-auto lg:flex">
-            <TradeTicket
-              asset={activeAsset}
-              tf={tf}
-              price={prices[asset]?.price ?? activeAsset?.price ?? 0}
-              account={account}
-              onPlaced={() => void loadPositions()}
-              onError={(m) => pushToast('danger', m)}
-            />
-            <div className="min-h-[260px]">
-              <Copilot session="default" />
-            </div>
-          </aside>
+            {vHandle}
 
-          {/* mobile-only secondary panels */}
-          <div className="space-y-2 lg:hidden">
-            {analysis && (
-              <>
-                <SignalPanel analysis={analysis} />
-                <MarkovPanel markov={analysis.markov} />
-                <QuantPanel analysis={analysis} />
-              </>
-            )}
-            <TradeTicket
-              asset={activeAsset}
-              tf={tf}
-              price={prices[asset]?.price ?? activeAsset?.price ?? 0}
-              account={account}
-              onPlaced={() => void loadPositions()}
-              onError={(m) => pushToast('danger', m)}
-            />
-            <div className="h-[420px]">
-              <Copilot session="default" />
-            </div>
-          </div>
+            {/* RIGHT dock: trade ticket / copilot */}
+            <Panel defaultSize={27} minSize={16}>
+              <PanelGroup direction="vertical" autoSaveId="iqos:right" className="h-full">
+                <Panel defaultSize={54} minSize={22}>
+                  <div className="ml-0.5 h-full min-h-0 overflow-y-auto">{ticket}</div>
+                </Panel>
+                {hHandle}
+                <Panel defaultSize={46} minSize={22}>
+                  <div className="mt-0.5 h-full min-h-0">{copilot}</div>
+                </Panel>
+              </PanelGroup>
+            </Panel>
+          </PanelGroup>
         </main>
       )}
 
@@ -399,15 +444,6 @@ export default function OSPage() {
         </div>
         <span className="hidden md:inline">unofficial · practice balance by default · not affiliated with IQ Option</span>
       </footer>
-    </div>
-  )
-}
-
-function MiniStat({ label, value, color }: { label: string; value: string; color?: string }) {
-  return (
-    <div className="whitespace-nowrap rounded border border-[#1c2739] bg-[#0b111c] px-2 py-1">
-      <span className="text-[#4b5a72]">{label} </span>
-      <span style={{ color: color ?? '#aab6cc' }}>{value}</span>
     </div>
   )
 }

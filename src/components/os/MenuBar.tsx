@@ -13,17 +13,21 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog'
 import { Switch } from '@/components/ui/switch'
-import type { AccountState, AssetRow, RiskConfig, Timeframe } from '@/lib/os/client'
-import { TIMEFRAMES, fmtClock, fmtMoney, fmtPct, osPost } from '@/lib/os/client'
+import type { AccountState, AssetRow, ChartType, RiskConfig, Timeframe } from '@/lib/os/client'
+import { CHART_TYPES, TIMEFRAMES, fmtClock, fmtMoney, fmtPct, osPost } from '@/lib/os/client'
 
 interface Props {
   assets: AssetRow[]
   asset: string
   tf: Timeframe
+  chartType: ChartType
+  registrySize: number
   account: AccountState | null
   risk: RiskConfig | null
   onSelectAsset: (a: string) => void
   onSelectTf: (t: Timeframe) => void
+  onChartTypeChange: (t: ChartType) => void
+  onOpenPicker: () => void
   onRiskChanged: (r: RiskConfig) => void
   onAccountChanged: (a: AccountState) => void
   onError: (m: string) => void
@@ -107,6 +111,27 @@ export default function MenuBar(props: Props) {
             </button>
           ))}
         </div>
+
+        {/* chart type + indicator registry (moved off the chart canvas) */}
+        <select
+          value={props.chartType}
+          onChange={(e) => props.onChartTypeChange(e.target.value as ChartType)}
+          title="Chart type"
+          className="h-8 rounded border border-[#1c2739] bg-[#0d1420] px-2 font-mono text-[11px] uppercase tracking-wider text-[#aab6cc] outline-none focus:border-cyan-500/50"
+        >
+          {CHART_TYPES.map((t) => (
+            <option key={t.id} value={t.id} className="bg-[#0d1420]">
+              {t.label}
+            </option>
+          ))}
+        </select>
+        <button
+          onClick={props.onOpenPicker}
+          title="Browse the full indicator registry"
+          className="h-8 rounded bg-violet-500/15 px-2.5 text-[10px] font-bold uppercase tracking-wider text-violet-300 ring-1 ring-violet-500/40 transition-colors hover:bg-violet-500/25"
+        >
+          + Indicator ({props.registrySize})
+        </button>
       </div>
 
       <div className="ml-auto flex flex-wrap items-center gap-x-4 gap-y-1">

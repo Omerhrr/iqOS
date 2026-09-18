@@ -18,7 +18,7 @@ import {
 } from 'lightweight-charts'
 import { Button } from '@/components/ui/button'
 import type { AnalysisResult, Candle, ChartType, IndicatorSeries } from '@/lib/os/client'
-import { CHART_TYPES, fmtPrice } from '@/lib/os/client'
+import { fmtPrice } from '@/lib/os/client'
 
 interface ChartPanelProps {
   candles: Candle[]
@@ -26,10 +26,7 @@ interface ChartPanelProps {
   price: number
   digitsTicker: string
   chartType: ChartType
-  onChartTypeChange: (t: ChartType) => void
   overlays: IndicatorSeries[]
-  registrySize: number
-  onOpenPicker: () => void
 }
 
 const UP = '#10b981'
@@ -113,10 +110,7 @@ export default function ChartPanel({
   price,
   digitsTicker,
   chartType,
-  onChartTypeChange,
   overlays,
-  registrySize,
-  onOpenPicker,
 }: ChartPanelProps) {
   const elRef = useRef<HTMLDivElement | null>(null)
   const chartRef = useRef<IChartApi | null>(null)
@@ -307,27 +301,45 @@ export default function ChartPanel({
   const lastCandle = candles[candles.length - 1]
   const lastUp = lastCandle ? lastCandle.close >= lastCandle.open : true
 
+  // zoom controls: scale the visible logical range around its center
+  const zoomBy = (factor: number) => {
+    const ts = chartRef.current?.timeScale()
+    if (!ts) return
+    const r = ts.getVisibleLogicalRange()
+    if (!r) return
+    const center = (r.from + r.to) / 2
+    const half = Math.max(((r.to - r.from) / 2) * factor, 1.5)
+    ts.setVisibleLogicalRange({ from: center - half, to: center + half })
+  }
+  const fitChart = () => {
+    chartRef.current?.timeScale().fitContent()
+    chartRef.current?.timeScale().scrollToRealTime()
+  }
+
   return (
     <div className="relative flex h-full min-h-[320px] flex-col rounded-lg border border-[#1c2739] bg-[#0b111c]">
-      {/* chart type selector */}
-      <div className="absolute left-2 top-2 z-10 flex flex-wrap items-center gap-1">
-        {CHART_TYPES.map((t) => (
-          <button
-            key={t.id}
-            onClick={() => onChartTypeChange(t.id)}
-            className={`rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider transition-colors ${
-              chartType === t.id ? 'bg-cyan-500/15 text-cyan-300 ring-1 ring-cyan-500/40' : 'bg-[#0d1420]/90 text-[#4b5a72] hover:text-[#aab6cc]'
-            }`}
-          >
-            {t.label}
-          </button>
-        ))}
+      {/* zoom controls (left of the price scale) */}
+      <div className="absolute bottom-10 right-[60px] z-10 flex flex-col gap-1">
         <button
-          onClick={onOpenPicker}
-          className="rounded bg-violet-500/15 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-violet-300 ring-1 ring-violet-500/40 transition-colors hover:bg-violet-500/25"
-          title="Browse the full indicator registry"
+          onClick={() => zoomBy(0.7)}
+          title="Zoom in"
+          className="flex h-6 w-6 items-center justify-center rounded border border-[#1c2739] bg-[#0d1420]/90 font-mono text-[13px] font-bold leading-none text-[#7c8aa5] transition-colors hover:border-cyan-500/40 hover:text-cyan-300"
         >
-          + Indicator ({registrySize})
+          +
+        </button>
+        <button
+          onClick={() => zoomBy(1.4)}
+          title="Zoom out"
+          className="flex h-6 w-6 items-center justify-center rounded border border-[#1c2739] bg-[#0d1420]/90 font-mono text-[13px] font-bold leading-none text-[#7c8aa5] transition-colors hover:border-cyan-500/40 hover:text-cyan-300"
+        >
+          −
+        </button>
+        <button
+          onClick={fitChart}
+          title="Fit chart"
+          className="flex h-6 w-6 items-center justify-center rounded border border-[#1c2739] bg-[#0d1420]/90 text-[11px] leading-none text-[#7c8aa5] transition-colors hover:border-cyan-500/40 hover:text-cyan-300"
+        >
+          ⤢
         </button>
       </div>
 
