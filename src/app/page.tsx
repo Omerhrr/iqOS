@@ -245,6 +245,45 @@ export default function OSPage() {
 
   const livePrice = prices[asset]?.price ?? activeAsset?.price ?? 0
 
+  // copilot ui commands - the agent can drive the workspace
+  const applyUiCommand = useCallback(
+    (cmd: string, args?: Record<string, unknown>) => {
+      switch (cmd) {
+        case 'set_asset':
+          if (typeof args?.asset === 'string') handleSelectAsset(args.asset)
+          break
+        case 'set_tf':
+          if (typeof args?.tf === 'string') setTf(args.tf as Timeframe)
+          break
+        case 'set_chart_type':
+          if (typeof args?.chartType === 'string') setChartType(args.chartType as ChartType)
+          break
+        case 'add_indicator': {
+          const id = String(args?.id ?? '')
+          if (!id) break
+          const def = registry.find((r) => r.id === id)
+          const pane = (typeof args?.pane === 'string' ? args.pane : def?.pane) ?? 'overlay'
+          const params = (args?.params as Record<string, number> | undefined) ?? undefined
+          if (pane === 'sub') setActiveSubs((prev) => (prev.some((o) => o.id === id) ? prev : [...prev, { id, params }]))
+          else setActiveOverlays((prev) => [...prev.filter((o) => o.id !== id), { id, params }])
+          break
+        }
+        case 'remove_indicator': {
+          const id = String(args?.id ?? '')
+          if (!id) break
+          setActiveOverlays((prev) => prev.filter((o) => o.id !== id))
+          setActiveSubs((prev) => prev.filter((o) => o.id !== id))
+          break
+        }
+        case 'clear_indicators':
+          setActiveOverlays([])
+          setActiveSubs([])
+          break
+      }
+    },
+    [handleSelectAsset, registry]
+  )
+
   // shared chart workspace (chart + sub-panes) - mounted by whichever layout is active
   const chartWorkspace = (
     <>
@@ -275,7 +314,17 @@ export default function OSPage() {
     />
   )
 
-  const copilot = <Copilot session="default" />
+  const copilot = (
+    <Copilot
+      session="default"
+      asset={asset}
+      tf={tf}
+      chartType={chartType}
+      overlays={activeOverlays.map((o) => o.id)}
+      subs={activeSubs.map((o) => o.id)}
+      onUiCommand={applyUiCommand}
+    />
+  )
 
   // slim drag handles: vertical bar for horizontal groups, horizontal bar for vertical groups
   const vHandle = (

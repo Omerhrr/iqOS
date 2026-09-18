@@ -241,6 +241,12 @@ export class Store {
       .all(sessionId, limit) as unknown as { ts: number; role: string; content: string }[]
   }
 
+  clearChat(sessionId: string): number {
+    const row = this.db.query('SELECT COUNT(*) as n FROM chat_messages WHERE session_id = ?').get(sessionId) as { n: number }
+    this.db.run('DELETE FROM chat_messages WHERE session_id = ?', [sessionId])
+    return row.n ?? 0
+  }
+
   stats(): { trades: number; wins: number; losses: number; netPnl: number } {
     const row = this.db
       .query(

@@ -135,6 +135,44 @@ const httpServer = createServer(async (req, res) => {
         return json(200, { ok: true, analysis: result })
       }
 
+      // rank a category by composite signal strength - the copilot's market scanner
+      if (path === '/scan') {
+        const cat = (q.get('category') ?? 'all') as 'all' | 'otc' | 'forex' | 'crypto' | 'commodity' | 'stock' | 'index'
+        const timeframe = tf(q.get('tf'))
+        const cap = Math.min(Number(q.get('limit') ?? 14), 24)
+        const universe = searchInstruments('', cat)
+          .filter((i) => i.open)
+          .slice(0, cap)
+        const rows: Record<string, unknown>[] = []
+        const CHUNK = 5
+        for (let i = 0; i < universe.length; i += CHUNK) {
+          await Promise.all(
+            universe.slice(i, i + CHUNK).map(async (inst) => {
+              try {
+                const a = analytics.analyze(inst.ticker, timeframe)
+                rows.push({
+                  asset: inst.ticker,
+                  name: inst.name,
+                  category: inst.category,
+                  price: a.signal.price,
+                  score: Math.round(a.signal.score * 10) / 10,
+                  direction: a.signal.direction,
+                  confidence: Math.round(a.signal.confidence),
+                  pUp: Math.round(a.markov.probUp * 1000) / 1000,
+                  regime: a.markov.regime,
+                  rsi: Math.round(a.indicators.rsi * 10) / 10,
+                  hurst: Math.round(a.quant.hurst * 100) / 100,
+                })
+              } catch {
+                // insufficient candles - skip
+              }
+            })
+          )
+        }
+        rows.sort((x, y) => Math.abs(Number(y.score)) - Math.abs(Number(x.score)))
+        return json(200, { ok: true, tf: timeframe, scanned: universe.length, results: rows })
+      }
+
       if (path === '/strategies') return json(200, { ok: true, strategies: analytics.listStrategies() })
 
       if (path === '/signal') {
@@ -285,6 +323,12 @@ const httpServer = createServer(async (req, res) => {
         const store = kernel.context().use<{ saveChat: (s: string, r: string, c: string) => void }>('storeRaw')
         store.saveChat(String(body.session ?? 'default'), String(body.role ?? 'user'), String(body.content ?? ''))
         return json(200, { ok: true })
+      }
+
+      if (path === '/chat_clear') {
+        const store = kernel.context().use<{ clearChat: (s: string) => number }>('storeRaw')
+        const removed = store.clearChat(String(body.session ?? 'default'))
+        return json(200, { ok: true, removed })
       }
     }
 
