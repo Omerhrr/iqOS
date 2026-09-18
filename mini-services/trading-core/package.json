@@ -1,0 +1,16 @@
+{
+  "name": "trading-core",
+  "version": "1.0.0",
+  "private": true,
+  "description": "IQAIR//OS kernel - plugin-based trading engine (REST + socket.io)",
+  "scripts": {
+    "dev": "bun --hot index.ts",
+    "start": "bun index.ts"
+  },
+  "dependencies": {
+    "socket.io": "^4.8.3"
+  },
+  "devDependencies": {
+    "bun-types": "^1.4.2"
+  }
+}
