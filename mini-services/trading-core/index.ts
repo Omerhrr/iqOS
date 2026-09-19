@@ -381,6 +381,20 @@ const httpServer = createServer(async (req, res) => {
     }
 
     if (req.method === 'POST') {
+      // Walk-forward validation of the Kalman/OU edge on one instrument.
+      // Also primes the auto-trader's requireValidation verdict cache.
+      if (path === '/ou_validate') {
+        const mode = kernel.context().use<ModeService>('mode')
+        const asset = String(body.asset ?? market.activeAsset)
+        const tfv = tf(String(body.tf ?? '1m') as string)
+        try {
+          const verdict = await mode.validateOU(asset, tfv)
+          return json(200, { ok: true, verdict })
+        } catch (err) {
+          return json(400, { ok: false, error: (err as Error).message })
+        }
+      }
+
       if (path === '/asset') {
         const asset = String(body.asset ?? '')
         if (!market.assets.some((a) => a.ticker === asset)) return json(400, { ok: false, error: `unknown asset ${asset}` })

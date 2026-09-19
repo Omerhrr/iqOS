@@ -1,9 +1,85 @@
 'use client'
 
 // IQAIR//OS - Quant lab panel: Hurst, vol models, ACF, Monte Carlo fan, S/R zones
-import { useMemo } from 'react'
-import type { AnalysisResult } from '@/lib/os/client'
-import { fmtPrice } from '@/lib/os/client'
+import { useMemo, useState } from 'react'
+import type { AnalysisResult, OUVerdict } from '@/lib/os/client'
+import { fmtPrice, osPost } from '@/lib/os/client'
+
+/** Walk-forward validation of the OU edge on the active instrument (kernel /ou_validate). */
+function OuWalkForward({ asset, tf }: { asset: string; tf: string }) {
+  const [verdict, setVerdict] = useState<OUVerdict | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const run = () => {
+    setBusy(true)
+    setError(null)
+    osPost<{ ok: boolean; verdict?: OUVerdict; error?: string }>('/ou_validate', { asset, tf })
+      .then((d) => {
+        if (d.ok && d.verdict) setVerdict(d.verdict)
+        else setError(d.error ?? 'validation failed')
+      })
+      .catch((e: Error) => setError(e.message.slice(0, 120)))
+      .finally(() => setBusy(false))
+  }
+
+  const badge =
+    verdict === null
+      ? null
+      : verdict.verdict === 'robust'
+        ? { label: 'ROBUST', color: '#10b981', bg: 'rgba(16,185,129,0.12)' }
+        : verdict.verdict === 'weak'
+          ? { label: 'WEAK', color: '#f59e0b', bg: 'rgba(245,158,11,0.12)' }
+          : { label: 'FAILED', color: '#f43f5e', bg: 'rgba(244,63,94,0.12)' }
+
+  return (
+    <div className="mt-2 border-t border-[#1c2739] pt-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="text-[10px] text-[#4b5a72]">
+          walk-forward validation · 3 folds · IS grid → OOS binary settlement
+          {verdict && <span className="text-[#3d4c66]"> · {verdict.elapsedMs}ms</span>}
+        </div>
+        <button
+          type="button"
+          onClick={run}
+          disabled={busy}
+          className="rounded border border-cyan-500/40 bg-cyan-500/10 px-2 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wider text-cyan-300 transition-colors hover:bg-cyan-500/20 disabled:opacity-50"
+        >
+          {busy ? 'validating…' : 'validate edge'}
+        </button>
+      </div>
+      {error && <p className="mt-1 font-mono text-[10px] text-rose-400">{error}</p>}
+      {verdict && badge && (
+        <div className="mt-1.5">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="rounded px-1.5 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wider" style={{ color: badge.color, background: badge.bg }}>
+              {badge.label}
+            </span>
+            <span className="font-mono text-[10px] text-[#aab6cc]">
+              OOS <span className={verdict.oosNet >= 0 ? 'text-emerald-400' : 'text-rose-400'}>{verdict.oosNet >= 0 ? '+' : ''}${verdict.oosNet.toFixed(2)}</span>
+              {' · '}{verdict.winRate.toFixed(0)}% wr · {verdict.totalTrades} trades
+            </span>
+            <span className="font-mono text-[10px] text-[#4b5a72]">
+              IS→OOS {verdict.efficiencyPct.toFixed(0)}% · folds {verdict.foldsProfitable}/{verdict.folds} profitable
+            </span>
+          </div>
+          <p className="mt-1 text-[9px] leading-relaxed text-[#4b5a72]">
+            {verdict.verdict === 'robust'
+              ? 'the edge survives out-of-sample: profitable OOS aggregate, majority of folds profitable, IS gains carry over. Tradeable.'
+              : verdict.verdict === 'weak'
+                ? 'OOS profitable but thin (fold count / efficiency below bar) - size down or raise entry thresholds.'
+                : 'the edge does not survive out-of-sample - in-sample gains were curve-fit. Not tradeable as-is.'}
+            {verdict.bestParams && Object.keys(verdict.bestParams).length > 0 && (
+              <>
+                {' '}· best: {Object.entries(verdict.bestParams).map(([k, v]) => `${k} ${String(v)}`).join(' · ')}
+              </>
+            )}
+          </p>
+        </div>
+      )}
+    </div>
+  )
+}
 
 function MonteFan({ analysis }: { analysis: AnalysisResult }) {
   const svg = useMemo(() => {
@@ -224,6 +300,7 @@ export default function QuantPanel({ analysis }: { analysis: AnalysisResult | nu
             </div>
             <OuZStrip z={ou.zSeries} />
           </div>
+          <OuWalkForward asset={analysis.asset} tf={analysis.tf} />
           <p className="mt-1.5 text-[10px] leading-relaxed text-[#4b5a72]">
             {ou.note} · window {ou.window} bars · the Kalman filter runs the OU drift as its state equation, so the fair-value line anticipates pullback toward θ
             {ou.signal !== 'none' && (ou.signal === 'call' ? ' · stretched below equilibrium favors CALLS' : ' · stretched above equilibrium favors PUTS')}

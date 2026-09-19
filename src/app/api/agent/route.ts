@@ -596,7 +596,7 @@ const TOOLS: ToolSpec[] = [
   },
   {
     name: 'autotrader_configure',
-    description: 'Tune the built-in AUTO-TRADER (the OS acting as its own trader in NO-HUMAN mode): signalSource ("screener" = full composite signals, "kalman-ou" = fade statistically stretched pairs via the Ornstein-Uhlenbeck/Kalman fit, gated by reversion significance + half-life), enabled (bool), tf (signal timeframe), stake, minScore (min |score|), minConfidence (0-100), zEntry (kalman-ou only: |z| in sigmas required to enter, 0.5-4), maxHalfLife (kalman-ou only: skip pairs with slower reversion, bars), direction (both|call|put), maxOpen (concurrent), cooldownSec (per-asset), paceSec (between any two trades), dailyProfitTarget / dailyLossLimit (USD, 0=off). It trades 1-bar binary options.',
+    description: 'Tune the built-in AUTO-TRADER (the OS acting as its own trader in NO-HUMAN mode): signalSource ("screener" = full composite signals, "kalman-ou" = fade statistically stretched pairs via the Ornstein-Uhlenbeck/Kalman fit gated by reversion significance + half-life, "markov" = follow the Markov chain state forecast when decisive and not chop, "momentum" = ADX-confirmed trend continuation), enabled (bool), tf (signal timeframe), stake, minScore (min |score|), minConfidence (0-100), zEntry (kalman-ou only: |z| in sigmas required to enter, 0.5-4), maxHalfLife (kalman-ou only: skip pairs with slower reversion, bars), requireValidation (kalman-ou only: trade only walk-forward-validated pairs), minPUp (markov only: decisive P(up) threshold, 0.5-0.75), minAdx (momentum only: minimum trend strength, 10-45), direction (both|call|put), maxOpen (concurrent), cooldownSec (per-asset), paceSec (between any two trades), dailyProfitTarget / dailyLossLimit (USD, 0=off). It trades 1-bar binary options.',
     args: '{"enabled": true, "tf": "1m", "stake": 10, "minScore": 60, "maxOpen": 3}',
     run: (a) =>
       corePost('/autotrader_config', {
@@ -608,6 +608,9 @@ const TOOLS: ToolSpec[] = [
         ...(a.minConfidence !== undefined ? { minConfidence: Number(a.minConfidence) } : {}),
         ...(a.zEntry !== undefined ? { zEntry: Number(a.zEntry) } : {}),
         ...(a.maxHalfLife !== undefined ? { maxHalfLife: Number(a.maxHalfLife) } : {}),
+        ...(a.requireValidation !== undefined ? { requireValidation: Boolean(a.requireValidation) } : {}),
+        ...(a.minPUp !== undefined ? { minPUp: Number(a.minPUp) } : {}),
+        ...(a.minAdx !== undefined ? { minAdx: Number(a.minAdx) } : {}),
         ...(a.direction !== undefined ? { direction: String(a.direction) } : {}),
         ...(a.maxOpen !== undefined ? { maxOpen: Number(a.maxOpen) } : {}),
         ...(a.cooldownSec !== undefined ? { cooldownSec: Number(a.cooldownSec) } : {}),

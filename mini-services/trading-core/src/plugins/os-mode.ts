@@ -11,6 +11,16 @@
 //      * 'kalman-ou'   - the Kalman/OU mean-reversion edge: fade statistically
 //                        stretched pairs (|z| sigmas from the OU equilibrium)
 //                        gated by reversion significance and a tradeable half-life
+//      * 'markov'      - the Markov chain state forecast: follow the model when it
+//                        assigns a decisive next-move probability and the regime
+//                        is not chop
+//      * 'momentum'    - trend-following on the screener row: ADX-confirmed
+//                        directional pressure with the move's rate-of-change
+//  With 'kalman-ou' + requireValidation, a candidate pair must ALSO pass a
+//  walk-forward validation of the OU strategy (out-of-sample net positive,
+//  majority of folds profitable, decent IS->OOS efficiency) before the
+//  auto-trader trusts the live stretch - validated verdicts are cached per
+//  (asset|tf) for an hour and refreshed lazily.
 // The mode is persisted, so restarts resume the same intent. Sentinel, the
 // watchdog and the base risk manager ALWAYS outrank the mode: flipping to
 // AUTO grants autonomy, never exemption. PANIC drops the OS back to HUMAN.
@@ -20,20 +30,43 @@ import type { Store } from '../store'
 import type { Timeframe } from '../types'
 import type { ScreenerService, ScreenRow } from './screener'
 import type { MarketDataService } from './market-data'
+import { walkForward } from '../strategies/optimize'
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
 
 export type OsMode = 'human' | 'auto'
 
+export type AutoTraderSource = 'screener' | 'kalman-ou' | 'markov' | 'momentum'
+
+/** Walk-forward validation verdict for the OU edge on one (asset, tf). */
+export interface OUVerdict {
+  asset: string
+  tf: Timeframe
+  verdict: 'robust' | 'weak' | 'failed'
+  oosNet: number // aggregate out-of-sample net P&L ($ at $10 stake)
+  isNet: number // aggregate in-sample net P&L
+  winRate: number // OOS win rate %
+  efficiencyPct: number // oosNet / isNet * 100
+  foldsProfitable: number
+  folds: number
+  totalTrades: number // OOS trades
+  bestParams: Record<string, number | string>
+  elapsedMs: number
+  ts: number
+}
+
 export interface AutoTraderConfig {
   enabled: boolean // auto-trader armed (it only ever trades while mode = auto)
-  signalSource: 'screener' | 'kalman-ou' // where entry signals come from
+  signalSource: AutoTraderSource // where entry signals come from
   tf: Timeframe // which screener timeframe to source signals from
   stake: number
-  minScore: number // minimum |score| to act on (composite or OU edge score)
+  minScore: number // minimum |score| to act on (composite or per-source edge score)
   minConfidence: number // minimum signal confidence (0-100)
   zEntry: number // kalman-ou source: |z| (stationary sigmas) required to enter
   maxHalfLife: number // kalman-ou source: skip pairs reverting slower than this (bars)
+  requireValidation: boolean // kalman-ou source: only trade pairs whose walk-forward verdict is robust
+  minPUp: number // markov source: decisive next-up probability (call at >=, put at <= 1-)
+  minAdx: number // momentum source: minimum trend strength (ADX)
   direction: 'both' | 'call' | 'put'
   maxOpen: number // max concurrent auto-trader positions
   cooldownSec: number // per-asset re-entry cooldown
@@ -51,6 +84,9 @@ export const DEFAULT_AUTOTRADER: AutoTraderConfig = {
   minConfidence: 55,
   zEntry: 1.8,
   maxHalfLife: 60,
+  requireValidation: false,
+  minPUp: 0.58,
+  minAdx: 22,
   direction: 'both',
   maxOpen: 3,
   cooldownSec: 180,
@@ -119,13 +155,18 @@ export class ModeService {
         const num = (v: unknown, fb: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fb)
         this.config = {
           enabled: typeof c.enabled === 'boolean' ? c.enabled : DEFAULT_AUTOTRADER.enabled,
-          signalSource: c.signalSource === 'kalman-ou' ? 'kalman-ou' : 'screener',
+          signalSource: (['screener', 'kalman-ou', 'markov', 'momentum'] as const).includes(c.signalSource as AutoTraderSource)
+            ? (c.signalSource as AutoTraderSource)
+            : DEFAULT_AUTOTRADER.signalSource,
           tf: (typeof c.tf === 'string' ? c.tf : DEFAULT_AUTOTRADER.tf) as Timeframe,
           stake: num(c.stake, DEFAULT_AUTOTRADER.stake),
           minScore: num(c.minScore, DEFAULT_AUTOTRADER.minScore),
           minConfidence: num(c.minConfidence, DEFAULT_AUTOTRADER.minConfidence),
           zEntry: num(c.zEntry, DEFAULT_AUTOTRADER.zEntry),
           maxHalfLife: num(c.maxHalfLife, DEFAULT_AUTOTRADER.maxHalfLife),
+          requireValidation: typeof c.requireValidation === 'boolean' ? c.requireValidation : DEFAULT_AUTOTRADER.requireValidation,
+          minPUp: num(c.minPUp, DEFAULT_AUTOTRADER.minPUp),
+          minAdx: num(c.minAdx, DEFAULT_AUTOTRADER.minAdx),
           direction: c.direction === 'call' || c.direction === 'put' ? c.direction : 'both',
           maxOpen: Math.round(num(c.maxOpen, DEFAULT_AUTOTRADER.maxOpen)),
           cooldownSec: Math.round(num(c.cooldownSec, DEFAULT_AUTOTRADER.cooldownSec)),
@@ -277,7 +318,11 @@ export class ModeService {
     const detail =
       this.config.signalSource === 'kalman-ou'
         ? `OU z ${row.ouZ.toFixed(2)}σ · HL ${row.ouHalfLife >= 9999 ? '∞' : row.ouHalfLife.toFixed(0)}b · t ${row.ouTStat.toFixed(1)} · edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)}`
-        : `score ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} regime ${row.regime}`
+        : this.config.signalSource === 'markov'
+          ? `P(up) ${(row.pUp * 100).toFixed(1)}% · regime ${row.regime} · edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)}`
+          : this.config.signalSource === 'momentum'
+            ? `ADX ${row.adx.toFixed(0)} · RSI ${row.rsi.toFixed(0)} · Δ${row.changePct.toFixed(2)}% · edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)}`
+            : `score ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} regime ${row.regime}`
     this.emit(
       'success',
       `[AUTO-TRADER] ${side.toUpperCase()} ${row.asset} ${this.config.tf} $${this.config.stake} binary - ${detail}`
@@ -286,6 +331,8 @@ export class ModeService {
 
   private pickSignal(): ScreenRow | null {
     if (this.config.signalSource === 'kalman-ou') return this.pickOUSignal()
+    if (this.config.signalSource === 'markov') return this.pickMarkovSignal()
+    if (this.config.signalSource === 'momentum') return this.pickMomentumSignal()
     try {
       const screener = this.ctx.use<ScreenerService>('screener')
       const dir = this.config.direction === 'both' ? undefined : this.config.direction
@@ -340,6 +387,16 @@ export class ModeService {
             base.ouZ <= -this.config.zEntry ? 'call' : base.ouZ >= this.config.zEntry ? 'put' : 'none'
           if (dir === 'none') continue
           if (this.config.direction !== 'both' && dir !== this.config.direction) continue
+          if (this.config.requireValidation) {
+            const verdict = this.ouVerdict(asset)
+            if (!verdict) {
+              // no fresh walk-forward verdict yet - validate lazily (bounded:
+              // at most one validation runs at a time) and skip this tick
+              void this.ensureOUValidation(asset)
+              continue
+            }
+            if (verdict.verdict !== 'robust') continue // walk-forward said this edge is not tradeable
+          }
           const az = Math.abs(base.ouZ)
           // same edge-score shape as the kalman-ou-reversion strategy so thresholds feel consistent
           const score = Math.round(clamp(45 + (az - this.config.zEntry) * 20 + Math.min(18, Math.max(0, base.ouTStat) * 3), 42, 95))
@@ -355,6 +412,181 @@ export class ModeService {
       // screener/market not loaded - no signal source
     }
     return null
+  }
+
+  /**
+   * Markov regime source: follow the chain when it assigns a decisive
+   * next-move probability - CALL when P(up) clears the threshold, PUT when it
+   * sits below its mirror - but never against/inside a chop regime, where the
+   * chain's transition matrix degenerates toward coin-flipping.
+   */
+  private pickMarkovSignal(): ScreenRow | null {
+    try {
+      const screener = this.ctx.use<ScreenerService>('screener')
+      const open = this.ctx.use<MarketDataService>('market').assets.filter((a) => a.open).map((a) => a.ticker)
+      const candidates = [...LIQUID_CANDIDATES.filter((a) => open.includes(a)), ...open.filter((a) => !LIQUID_CANDIDATES.includes(a))]
+      for (const asset of candidates) {
+        if (this.assetBlocked(asset)) continue
+        try {
+          const r = screener.evaluate(asset, this.config.tf)
+          if (r.regime === 'chop') continue // the chain has no edge in chop
+          const dir: 'call' | 'put' | 'none' =
+            r.pUp >= this.config.minPUp ? 'call' : r.pUp <= 1 - this.config.minPUp ? 'put' : 'none'
+          if (dir === 'none') continue
+          if (this.config.direction !== 'both' && dir !== this.config.direction) continue
+          const edge = Math.abs(r.pUp - 0.5) * 2 // 0..1 decisiveness of the forecast
+          const score = Math.round(clamp(40 + edge * 60 + (r.regime === 'bull' || r.regime === 'bear' ? 8 : 0), 40, 95))
+          const confidence = Math.round(clamp(36 + edge * 55 + r.adx * 0.35, 35, 95))
+          if (score < this.config.minScore) continue
+          if (confidence < this.config.minConfidence) continue
+          return { ...r, score, confidence, direction: dir }
+        } catch {
+          // thin history for this pair - try the next
+        }
+      }
+    } catch {
+      // screener/market not loaded - no signal source
+    }
+    return null
+  }
+
+  /**
+   * Momentum source: ADX-confirmed trend continuation - CALL when trend
+   * strength clears the ADX gate with a positive rate-of-change and RSI on
+   * the bullish side of mid, PUT mirrored. Skips the extremes where the move
+   * is already statistically exhausted (RSI beyond ~78 / below ~22).
+   */
+  private pickMomentumSignal(): ScreenRow | null {
+    try {
+      const screener = this.ctx.use<ScreenerService>('screener')
+      const open = this.ctx.use<MarketDataService>('market').assets.filter((a) => a.open).map((a) => a.ticker)
+      const candidates = [...LIQUID_CANDIDATES.filter((a) => open.includes(a)), ...open.filter((a) => !LIQUID_CANDIDATES.includes(a))]
+      for (const asset of candidates) {
+        if (this.assetBlocked(asset)) continue
+        try {
+          const r = screener.evaluate(asset, this.config.tf)
+          if (r.adx < this.config.minAdx) continue
+          let dir: 'call' | 'put' | 'none' = 'none'
+          if (r.changePct > 0 && r.rsi >= 52 && r.rsi <= 78) dir = 'call'
+          else if (r.changePct < 0 && r.rsi >= 22 && r.rsi <= 48) dir = 'put'
+          if (dir === 'none') continue
+          if (this.config.direction !== 'both' && dir !== this.config.direction) continue
+          const score = Math.round(clamp(40 + (r.adx - this.config.minAdx) * 1.2 + Math.abs(r.rsi - 50) * 0.8, 40, 95))
+          const confidence = Math.round(clamp(36 + (r.adx - this.config.minAdx) * 0.8 + Math.abs(r.changePct) * 6, 35, 95))
+          if (score < this.config.minScore) continue
+          if (confidence < this.config.minConfidence) continue
+          return { ...r, score, confidence, direction: dir }
+        } catch {
+          // thin history for this pair - try the next
+        }
+      }
+    } catch {
+      // screener/market not loaded - no signal source
+    }
+    return null
+  }
+
+  // ---------- kalman-ou walk-forward validation gate ----------
+
+  static readonly OU_VALIDATION_TTL = 3600 // refresh verdicts hourly
+
+  private ouVerdicts = new Map<string, { ts: number; validating: boolean; verdict: OUVerdict }>()
+  private validatingAsset: string | null = null
+
+  private ouKey(asset: string): string {
+    return `${asset}|${this.config.tf}`
+  }
+
+  /** Fresh (non-expired) walk-forward verdict for the asset, if any. */
+  private ouVerdict(asset: string): OUVerdict | null {
+    const e = this.ouVerdicts.get(this.ouKey(asset))
+    if (!e) return null
+    if (this.now() - e.ts > ModeService.OU_VALIDATION_TTL) return null
+    return e.verdict
+  }
+
+  /**
+   * Lazy background validation - at most one runs at a time so the 10s
+   * auto-trader tick never piles up heavy walk-forward work. The result is
+   * announced on the alert bus so operators see why a pair started/stopped
+   * being tradeable in no-human mode.
+   */
+  private ensureOUValidation(asset: string): void {
+    const key = this.ouKey(asset)
+    const entry = this.ouVerdicts.get(key)
+    if (entry?.validating) return
+    if (this.validatingAsset && this.validatingAsset !== key) return
+    this.validatingAsset = key
+    this.ouVerdicts.set(key, { ts: entry?.ts ?? 0, validating: true, verdict: entry?.verdict ?? ModeService.emptyVerdict(asset) })
+    void this.validateOU(asset, this.config.tf)
+      .then((v) => {
+        this.ouVerdicts.set(key, { ts: this.now(), validating: false, verdict: v })
+        this.emit(
+          v.verdict === 'robust' ? 'info' : 'warn',
+          `[AUTO-TRADER] OU walk-forward ${asset} ${this.config.tf}: ${v.verdict.toUpperCase()} - OOS ${v.oosNet >= 0 ? '+' : ''}$${v.oosNet.toFixed(2)} · ${v.winRate.toFixed(0)}% wr · ${v.foldsProfitable}/${v.folds} folds profitable · efficiency ${v.efficiencyPct.toFixed(0)}%`
+        )
+      })
+      .catch(() => {
+        this.ouVerdicts.delete(key)
+      })
+      .finally(() => {
+        if (this.validatingAsset === key) this.validatingAsset = null
+      })
+  }
+
+  static emptyVerdict(asset: string): OUVerdict {
+    return { asset, tf: '1m', verdict: 'failed', oosNet: 0, isNet: 0, winRate: 0, efficiencyPct: 0, foldsProfitable: 0, folds: 0, totalTrades: 0, bestParams: {}, elapsedMs: 0, ts: 0 }
+  }
+
+  /**
+   * Walk-forward validation of the OU edge on one (asset, tf): grid over the
+   * tradeable OU params per fold, settle the fold winner out-of-sample with
+   * the real binary settlement engine, then grade the aggregate. Robust =
+   * OOS net positive, at least 2/3 folds profitable and >= 25% IS->OOS
+   * efficiency; weak = profitable but not convincing; failed = anything else.
+   */
+  async validateOU(asset: string, tf: Timeframe): Promise<OUVerdict> {
+    const market = this.ctx.use<MarketDataService>('market')
+    const candles = market.getCandlesDeep(asset, tf, 2200)
+    if (candles.length < 700) throw new Error(`not enough history for ${asset} ${tf} (${candles.length} bars)`)
+    const result = walkForward(candles, asset, tf, {
+      strategy: 'kalman-ou-reversion',
+      sweep: {
+        window: { from: 180, to: 300, step: 60 },
+        zEntry: { from: 1.4, to: 2.4, step: 0.2 },
+        maxHalfLife: { from: 30, to: 120, step: 30 },
+      },
+      objective: 'netPnl',
+      minTrades: 5,
+      maxCombos: 80,
+      folds: 3,
+      isRatio: 0.7,
+      payout: 0.85,
+      amount: 10,
+      expiryBars: 1,
+    })
+    const oos = result.oos
+    const verdict: OUVerdict['verdict'] =
+      oos.netPnl > 0 && result.foldsProfitable >= 2 && result.efficiencyPct >= 25 && oos.totalTrades >= 10
+        ? 'robust'
+        : oos.netPnl > 0 && result.foldsProfitable >= 1
+          ? 'weak'
+          : 'failed'
+    return {
+      asset,
+      tf,
+      verdict,
+      oosNet: Math.round(oos.netPnl * 100) / 100,
+      isNet: Math.round(result.isNet * 100) / 100,
+      winRate: Math.round(oos.winRate * 10) / 10,
+      efficiencyPct: Math.round(result.efficiencyPct * 10) / 10,
+      foldsProfitable: result.foldsProfitable,
+      folds: result.folds.length,
+      totalTrades: oos.totalTrades,
+      bestParams: result.bestParams,
+      elapsedMs: result.elapsedMs,
+      ts: this.now(),
+    }
   }
 
   private async place(row: ScreenRow, side: 'call' | 'put'): Promise<{ ok: boolean; error?: string }> {
@@ -380,7 +612,14 @@ export class ModeService {
         amount: this.config.stake,
         expiryBars: 1,
         mode: 'paper',
-        strategy: this.config.signalSource === 'kalman-ou' ? 'kalman-ou-reversion' : 'screener-auto',
+        strategy:
+          this.config.signalSource === 'kalman-ou'
+            ? 'kalman-ou-reversion'
+            : this.config.signalSource === 'markov'
+              ? 'markov-edge'
+              : this.config.signalSource === 'momentum'
+                ? 'supertrend-follow'
+                : 'screener-auto',
         note: AUTOTRADER_NOTE,
       })
     } catch {
@@ -473,13 +712,17 @@ export class ModeService {
 
   configure(patch: Partial<AutoTraderConfig>): { ok: boolean; config: AutoTraderConfig; error?: string } {
     if (patch.enabled !== undefined) this.config.enabled = Boolean(patch.enabled)
-    if (patch.signalSource !== undefined) this.config.signalSource = patch.signalSource === 'kalman-ou' ? 'kalman-ou' : 'screener'
+    if (patch.signalSource !== undefined && (['screener', 'kalman-ou', 'markov', 'momentum'] as const).includes(patch.signalSource as AutoTraderSource))
+      this.config.signalSource = patch.signalSource as AutoTraderSource
     if (patch.tf !== undefined) this.config.tf = String(patch.tf) as Timeframe
     if (patch.stake !== undefined) this.config.stake = clamp(Number(patch.stake) || DEFAULT_AUTOTRADER.stake, 1, 5000)
     if (patch.minScore !== undefined) this.config.minScore = clamp(Number(patch.minScore) || 0, 0, 100)
     if (patch.minConfidence !== undefined) this.config.minConfidence = clamp(Number(patch.minConfidence) || 0, 0, 100)
     if (patch.zEntry !== undefined) this.config.zEntry = clamp(Number(patch.zEntry) || DEFAULT_AUTOTRADER.zEntry, 0.5, 4)
     if (patch.maxHalfLife !== undefined) this.config.maxHalfLife = Math.round(clamp(Number(patch.maxHalfLife) || DEFAULT_AUTOTRADER.maxHalfLife, 5, 999))
+    if (patch.requireValidation !== undefined) this.config.requireValidation = Boolean(patch.requireValidation)
+    if (patch.minPUp !== undefined) this.config.minPUp = clamp(Number(patch.minPUp) || DEFAULT_AUTOTRADER.minPUp, 0.5, 0.75)
+    if (patch.minAdx !== undefined) this.config.minAdx = clamp(Number(patch.minAdx) || DEFAULT_AUTOTRADER.minAdx, 10, 45)
     if (patch.direction !== undefined && ['both', 'call', 'put'].includes(String(patch.direction)))
       this.config.direction = String(patch.direction) as AutoTraderConfig['direction']
     if (patch.maxOpen !== undefined) this.config.maxOpen = Math.round(clamp(Number(patch.maxOpen) || 1, 1, 10))
@@ -489,9 +732,17 @@ export class ModeService {
     if (patch.dailyLossLimit !== undefined) this.config.dailyLossLimit = Math.max(0, Number(patch.dailyLossLimit) || 0)
     this.persist()
     this.rt.lastRejection = undefined
+    const srcDetail =
+      this.config.signalSource === 'kalman-ou'
+        ? ` (z ≥ ${this.config.zEntry}σ · HL ≤ ${this.config.maxHalfLife}b${this.config.requireValidation ? ' · walk-forward validated' : ''})`
+        : this.config.signalSource === 'markov'
+          ? ` (P(up) ≥ ${(this.config.minPUp * 100).toFixed(0)}% / ≤ ${((1 - this.config.minPUp) * 100).toFixed(0)}%)`
+          : this.config.signalSource === 'momentum'
+            ? ` (ADX ≥ ${this.config.minAdx})`
+            : ''
     this.emit(
       'info',
-      `AUTO-TRADER config: ${this.config.enabled ? 'armed' : 'off'} · src ${this.config.signalSource}${this.config.signalSource === 'kalman-ou' ? ` (z ≥ ${this.config.zEntry}σ · HL ≤ ${this.config.maxHalfLife}b)` : ''} · ${this.config.tf} · stake $${this.config.stake} · minScore ${this.config.minScore} · minConf ${this.config.minConfidence} · maxOpen ${this.config.maxOpen} · cooldown ${this.config.cooldownSec}s`
+      `AUTO-TRADER config: ${this.config.enabled ? 'armed' : 'off'} · src ${this.config.signalSource}${srcDetail} · ${this.config.tf} · stake $${this.config.stake} · minScore ${this.config.minScore} · minConf ${this.config.minConfidence} · maxOpen ${this.config.maxOpen} · cooldown ${this.config.cooldownSec}s`
     )
     return { ok: true, config: { ...this.config } }
   }

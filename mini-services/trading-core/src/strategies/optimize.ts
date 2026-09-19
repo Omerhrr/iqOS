@@ -101,6 +101,7 @@ export interface SweepResult {
 // converge quickly. Used to pick the evaluation window and fold sizes.
 function strategyWarmup(id: string): number {
   if (id === 'markov-edge' || id === 'confluence-core') return 560
+  if (id === 'kalman-ou-reversion') return 340 // OU fits need their full estimation window before any signal
   if (id === 'ema-trend') return 180
   return 80
 }
@@ -469,8 +470,13 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
       continue
     }
 
-    // out-of-sample: settle the chosen params with the REAL settlement engine
-    const oosFull = backtest(oosSlice, asset, tf, {
+    // out-of-sample: settle the chosen params with the REAL settlement engine.
+    // Slow-warming strategies (OU fits, Markov chains) cannot produce signals
+    // off a cold 40-bar prefix - extend the slice BACKWARDS over already-seen
+    // history for estimation (no lookahead: trades only fire after the warmup
+    // guard, i.e. strictly inside the true OOS region).
+    const oosWarmup = Math.min(strategyWarmup(strat.id), isStart)
+    const oosFull = backtest(candles.slice(Math.max(0, oosStart - oosWarmup), oosEnd), asset, tf, {
       strategy: strat.id,
       params: bestCombo,
       mode: 'binary',
@@ -478,7 +484,7 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
       amount: opts.amount ?? 10,
       expiryBars: opts.expiryBars ?? 1,
       startEquity: 1000,
-      warmupBars: 40,
+      warmupBars: oosWarmup,
     })
     const oosM: FastMetrics = {
       totalTrades: oosFull.metrics.totalTrades,

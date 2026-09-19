@@ -199,6 +199,22 @@ export interface SRZone {
 }
 
 // Kalman filter + Ornstein-Uhlenbeck mean reversion (mirrors kernel types)
+export interface OUVerdict {
+  asset: string
+  tf: Timeframe
+  verdict: 'robust' | 'weak' | 'failed'
+  oosNet: number
+  isNet: number
+  winRate: number
+  efficiencyPct: number
+  foldsProfitable: number
+  folds: number
+  totalTrades: number
+  bestParams: Record<string, number | string>
+  elapsedMs: number
+  ts: number
+}
+
 export interface KalmanOUResult {
   theta: number // long-run equilibrium level
   phi: number // per-bar persistence e^-kappa
@@ -729,13 +745,16 @@ export type OsMode = 'human' | 'auto'
 
 export interface AutoTraderConfig {
   enabled: boolean
-  signalSource: 'screener' | 'kalman-ou'
+  signalSource: 'screener' | 'kalman-ou' | 'markov' | 'momentum'
   tf: Timeframe
   stake: number
   minScore: number
   minConfidence: number
   zEntry: number
   maxHalfLife: number
+  requireValidation: boolean
+  minPUp: number
+  minAdx: number
   direction: 'both' | 'call' | 'put'
   maxOpen: number
   cooldownSec: number
