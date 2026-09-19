@@ -1,0 +1,639 @@
+     1→     1→// IQAIR//OS - trading-core service
+     2→     2→// Boots the kernel (store -> market-data -> analytics -> execution), then serves
+     3→     3→// REST for every OS operation and socket.io for the real-time event feed.
+     4→     4→// Port 3030. Path '/' is fixed for the Caddy gateway.
+     5→     5→
+     6→     6→import { createServer } from 'http'
+     7→     7→import { Server } from 'socket.io'
+     8→     8→import { Kernel } from './src/kernel'
+     9→     9→import { storePlugin } from './src/plugins/store'
+    10→    10→import { marketDataPlugin, MarketDataService } from './src/plugins/market-data'
+    11→    11→import { analyticsPlugin, AnalyticsService } from './src/plugins/analytics'
+    12→    12→import { executionPlugin, ExecutionService, type RiskConfig } from './src/plugins/execution'
+    13→    13→import { autopilotPlugin, AutopilotService, type BotConfig } from './src/plugins/autopilot'
+    14→    14→import { screenerPlugin, ScreenerService } from './src/plugins/screener'
+    15→    15→import { alertRulesPlugin, AlertRulesService, ALERT_METRICS } from './src/plugins/alert-rules'
+    16→    16→import { sentinelPlugin, SentinelService, type SentinelConfig } from './src/plugins/sentinel'
+    17→    17→import { gridSearch, walkForward, sweepAssets, type Objective } from './src/strategies/optimize'
+    18→    18→import { ALL_TIMEFRAMES, type Timeframe } from './src/types'
+    19→    19→import { searchInstruments, UNIVERSE_STATS, getInstrument } from './src/universe'
+    20→    20→import { listRegistry, computeIndicator, registrySize, getIndicatorDef } from './src/analytics/registry'
+    21→    21→import { detectChartPatterns } from './src/analytics/chart-patterns'
+    22→    22→
+    23→    23→const PORT = 3030
+    24→    24→
+    25→    25→const kernel = new Kernel()
+    26→    26→kernel.register(storePlugin)
+    27→    27→kernel.register(marketDataPlugin)
+    28→    28→kernel.register(analyticsPlugin)
+    29→    29→kernel.register(executionPlugin)
+    30→    30→kernel.register(autopilotPlugin)
+    31→    31→kernel.register(screenerPlugin)
+    32→    32→kernel.register(alertRulesPlugin)
+    33→    33→kernel.register(sentinelPlugin)
+    34→    34→
+    35→    35→const httpServer = createServer(async (req, res) => {
+    36→    36→  res.setHeader('access-control-allow-origin', '*')
+    37→    37→  res.setHeader('access-control-allow-methods', 'GET,POST,OPTIONS')
+    38→    38→  res.setHeader('access-control-allow-headers', 'content-type')
+    39→    39→  if (req.method === 'OPTIONS') {
+    40→    40→    res.writeHead(204)
+    41→    41→    res.end()
+    42→    42→    return
+    43→    43→  }
+    44→    44→
+    45→    45→  const url = new URL(req.url ?? '/', `http://127.0.0.1:${PORT}`)
+    46→    46→  const path = url.pathname
+    47→    47→  const q = url.searchParams
+    48→    48→  let body: Record<string, unknown> = {}
+    49→    49→  if (req.method === 'POST') {
+    50→    50→    const chunks: Uint8Array[] = []
+    51→    51→    for await (const chunk of req) chunks.push(chunk as Uint8Array)
+    52→    52→    try {
+    53→    53→      body = JSON.parse(Buffer.concat(chunks).toString() || '{}') as Record<string, unknown>
+    54→    54→    } catch {
+    55→    55→      body = {}
+    56→    56→    }
+    57→    57→  }
+    58→    58→
+    59→    59→  const json = (code: number, data: unknown) => {
+    60→    60→    res.writeHead(code, { 'content-type': 'application/json' })
+    61→    61→    res.end(JSON.stringify(data))
+    62→    62→  }
+    63→    63→  const tf = (name: string | null): Timeframe => {
+    64→    64→    const v = (name ?? '1m') as Timeframe
+    65→    65→    return (ALL_TIMEFRAMES as string[]).includes(v) ? v : '1m'
+    66→    66→  }
+    67→    67→
+    68→    68→  try {
+    69→    69→    const market = kernel.context().use<MarketDataService>('market')
+    70→    70→    const analytics = kernel.context().use<AnalyticsService>('analytics')
+    71→    71→    const exec = kernel.context().use<ExecutionService>('execution')
+    72→    72→
+    73→    73→    if (req.method === 'GET') {
+    74→    74→      if (path === '/health') return json(200, { ok: true, service: 'trading-core', uptime: process.uptime() })
+    75→    75→
+    76→    76→      if (path === '/assets') return json(200, { ok: true, assets: market.listAssets(), mode: market.mode, activeAsset: market.activeAsset })
+    77→    77→
+    78→    78→      if (path === '/instruments') {
+    79→    79→        const cat = (q.get('category') ?? 'all') as 'all' | 'otc' | 'forex' | 'crypto' | 'commodity' | 'stock' | 'index'
+    80→    80→        const search = q.get('q') ?? ''
+    81→    81→        const found = searchInstruments(search, cat)
+    82→    82→        market.refreshSchedules()
+    83→    83→        return json(200, {
+    84→    84→          ok: true,
+    85→    85→          instruments: found.map((a) => ({ ...a, price: market.getPrice(a.ticker) || a.basePrice })),
+    86→    86→          stats: UNIVERSE_STATS,
+    87→    87→        })
+    88→    88→      }
+    89→    89→
+    90→    90→      if (path === '/indicators') {
+    91→    91→        return json(200, { ok: true, indicators: listRegistry(), stats: { total: registrySize() } })
+    92→    92→      }
+    93→    93→
+    94→    94→      if (path === '/indicator') {
+    95→    95→        const id = q.get('id') ?? 'rsi'
+    96→    96→        const def = getIndicatorDef(id)
+    97→    97→        if (!def) return json(404, { ok: false, error: `unknown indicator ${id}` })
+    98→    98→        const asset = q.get('asset') ?? market.activeAsset
+    99→    99→        const timeframe = tf(q.get('tf'))
+   100→   100→        const params: Record<string, number> = {}
+   101→   101→        for (const [k, v] of q.entries()) if (k.startsWith('p_')) params[k.slice(2)] = Number(v)
+   102→   102→        const candles = market.getCandles(asset, timeframe, 400)
+   103→   103→        const res = computeIndicator(id, candles, params)
+   104→   104→        if (!res) return json(404, { ok: false, error: 'compute failed' })
+   105→   105→        const time = candles.map((c) => c.time)
+   106→   106→        const nz = (v: number) => (Number.isFinite(v) ? v : null)
+   107→   107→        return json(200, {
+   108→   108→          ok: true,
+   109→   109→          series: {
+   110→   110→            id: def.id,
+   111→   111→            name: def.name,
+   112→   112→            category: def.category,
+   113→   113→            pane: def.pane,
+   114→   114→            params: Object.fromEntries(def.params.map((pp) => [pp.key, params[pp.key] ?? pp.default])),
+   115→   115→            time,
+   116→   116→            lines: res.output.lines.map((ln) => ({ key: ln.key, color: ln.color, style: ln.style, values: ln.values.map(nz) })),
+   117→   117→            hist: res.output.hist ? { values: res.output.hist.values.map(nz), color: res.output.hist.color } : undefined,
+   118→   118→            levels: res.output.levels,
+   119→   119→            bands: res.output.bands,
+   120→   120→            fillBetween: res.output.fillBetween,
+   121→   121→            note: res.output.note,
+   122→   122→          },
+   123→   123→        })
+   124→   124→      }
+   125→   125→
+   126→   126→      if (path === '/chart_patterns') {
+   127→   127→        const asset = q.get('asset') ?? market.activeAsset
+   128→   128→        const timeframe = tf(q.get('tf'))
+   129→   129→        const candles = market.getCandles(asset, timeframe, 400)
+   130→   130→        return json(200, { ok: true, patterns: detectChartPatterns(candles) })
+   131→   131→      }
+   132→   132→
+   133→   133→      if (path === '/candles') {
+   134→   134→        const asset = q.get('asset') ?? market.activeAsset
+   135→   135→        const timeframe = tf(q.get('tf'))
+   136→   136→        const limit = Math.min(Number(q.get('limit') ?? 400), 1000)
+   137→   137→        return json(200, { ok: true, asset, tf: timeframe, candles: market.getCandles(asset, timeframe, limit), price: market.getPrice(asset) })
+   138→   138→      }
+   139→   139→
+   140→   140→      if (path === '/analysis') {
+   141→   141→        const asset = q.get('asset') ?? market.activeAsset
+   142→   142→        const timeframe = tf(q.get('tf'))
+   143→   143→        const result = analytics.analyze(asset, timeframe, q.get('force') === '1')
+   144→   144→        return json(200, { ok: true, analysis: result })
+   145→   145→      }
+   146→   146→
+   147→   147→      // rank a category by composite signal strength - the copilot's market scanner
+   148→   148→      if (path === '/scan') {
+   149→   149→        const cat = (q.get('category') ?? 'all') as 'all' | 'otc' | 'forex' | 'crypto' | 'commodity' | 'stock' | 'index'
+   150→   150→        const timeframe = tf(q.get('tf'))
+   151→   151→        const cap = Math.min(Number(q.get('limit') ?? 14), 24)
+   152→   152→        const universe = searchInstruments('', cat)
+   153→   153→          .filter((i) => i.open)
+   154→   154→          .slice(0, cap)
+   155→   155→        const rows: Record<string, unknown>[] = []
+   156→   156→        const CHUNK = 5
+   157→   157→        for (let i = 0; i < universe.length; i += CHUNK) {
+   158→   158→          await Promise.all(
+   159→   159→            universe.slice(i, i + CHUNK).map(async (inst) => {
+   160→   160→              try {
+   161→   161→                const a = analytics.analyze(inst.ticker, timeframe)
+   162→   162→                rows.push({
+   163→   163→                  asset: inst.ticker,
+   164→   164→                  name: inst.name,
+   165→   165→                  category: inst.category,
+   166→   166→                  price: a.signal.price,
+   167→   167→                  score: Math.round(a.signal.score * 10) / 10,
+   168→   168→                  direction: a.signal.direction,
+   169→   169→                  confidence: Math.round(a.signal.confidence),
+   170→   170→                  pUp: Math.round(a.markov.probUp * 1000) / 1000,
+   171→   171→                  regime: a.markov.regime,
+   172→   172→                  rsi: Math.round(a.indicators.rsi * 10) / 10,
+   173→   173→                  hurst: Math.round(a.quant.hurst * 100) / 100,
+   174→   174→                })
+   175→   175→              } catch {
+   176→   176→                // insufficient candles - skip
+   177→   177→              }
+   178→   178→            })
+   179→   179→          )
+   180→   180→        }
+   181→   181→        rows.sort((x, y) => Math.abs(Number(y.score)) - Math.abs(Number(x.score)))
+   182→   182→        return json(200, { ok: true, tf: timeframe, scanned: universe.length, results: rows })
+   183→   183→      }
+   184→   184→
+   185→   185→      if (path === '/strategies') return json(200, { ok: true, strategies: analytics.listStrategies() })
+   186→   186→
+   187→   187→      // ---------- discovery: screener + alert rules ----------
+   188→   188→
+   189→   189→      // ranked opportunity feed across the whole scanned universe
+   190→   190→      if (path === '/screener') {
+   191→   191→        const scr = kernel.context().use<ScreenerService>('screener')
+   192→   192→        const direction = (q.get('direction') ?? 'all') as 'all' | 'call' | 'put'
+   193→   193→        const out = scr.top({
+   194→   194→          tf: q.get('tf') ? tf(q.get('tf')) : undefined,
+   195→   195→          category: q.get('category') ?? 'all',
+   196→   196→          direction: ['all', 'call', 'put'].includes(direction) ? direction : 'all',
+   197→   197→          minScore: Number(q.get('minScore') ?? 0),
+   198→   198→          q: q.get('q') ?? undefined,
+   199→   199→          limit: Math.min(Number(q.get('limit') ?? 40), 200),
+   200→   200→        })
+   201→   201→        return json(200, { ok: true, tf: q.get('tf') ?? 'all', ...out })
+   202→   202→      }
+   203→   203→
+   204→   204→      if (path === '/screener_status') {
+   205→   205→        const scr = kernel.context().use<ScreenerService>('screener')
+   206→   206→        return json(200, { ok: true, status: scr.status(), config: scr.config })
+   207→   207→      }
+   208→   208→
+   209→   209→      if (path === '/alert_metrics') {
+   210→   210→        return json(200, { ok: true, metrics: ALERT_METRICS })
+   211→   211→      }
+   212→   212→
+   213→   213→      if (path === '/alert_rules') {
+   214→   214→        const rules = kernel.context().use<AlertRulesService>('alertrules')
+   215→   215→        return json(200, { ok: true, rules: rules.listRules() })
+   216→   216→      }
+   217→   217→
+   218→   218→      // ---------- sentinel: risk governance ----------
+   219→   219→
+   220→   220→      if (path === '/sentinel') {
+   221→   221→        const sen = kernel.context().use<SentinelService>('sentinel')
+   222→   222→        return json(200, { ok: true, ...sen.status() })
+   223→   223→      }
+   224→   224→
+   225→   225→      if (path === '/risk_events') {
+   226→   226→        const store = kernel.context().use<{ listRiskEvents: (l?: number) => { ts: number; kind: string; message: string }[] }>('storeRaw')
+   227→   227→        return json(200, { ok: true, events: store.listRiskEvents(60) })
+   228→   228→      }
+   229→   229→
+   230→   230→
+   231→   231→      if (path === '/signal') {
+   232→   232→        const asset = q.get('asset') ?? market.activeAsset
+   233→   233→        const timeframe = tf(q.get('tf'))
+   234→   234→        const a = analytics.analyze(asset, timeframe)
+   235→   235→        return json(200, { ok: true, signal: a.signal })
+   236→   236→      }
+   237→   237→
+   238→   238→      if (path === '/positions') {
+   239→   239→        const status = q.get('status') as 'open' | 'closed' | undefined
+   240→   240→        return json(200, { ok: true, positions: store_list(status) })
+   241→   241→      }
+   242→   242→
+   243→   243→      if (path === '/account') {
+   244→   244→        return json(200, { ok: true, account: exec.account(), risk: exec.risk, liveReady: exec.liveReady })
+   245→   245→      }
+   246→   246→
+   247→   247→      if (path === '/history') {
+   248→   248→        const store = kernel.context().use<{ listPositions: (s?: 'open' | 'closed', l?: number) => unknown[] }>('storeRaw')
+   249→   249→        const limit = Math.min(Number(q.get('limit') ?? 100), 500)
+   250→   250→        return json(200, { ok: true, positions: store.listPositions('closed', limit) })
+   251→   251→      }
+   252→   252→
+   253→   253→      if (path === '/alerts') {
+   254→   254→        const store = kernel.context().use<{ listAlerts: (l?: number) => unknown[] }>('storeRaw')
+   255→   255→        return json(200, { ok: true, alerts: store.listAlerts(60) })
+   256→   256→      }
+   257→   257→
+   258→   258→      if (path === '/stats') {
+   259→   259→        const store = kernel.context().use<{ stats: () => unknown }>('storeRaw')
+   260→   260→        return json(200, { ok: true, stats: store.stats() })
+   261→   261→      }
+   262→   262→
+   263→   263→      if (path === '/chat') {
+   264→   264→        const store = kernel.context().use<{ listChat: (s: string, l?: number) => unknown[] }>('storeRaw')
+   265→   265→        const session = q.get('session') ?? 'default'
+   266→   266→        return json(200, { ok: true, messages: store.listChat(session, 60).reverse() })
+   267→   267→      }
+   268→   268→
+   269→   269→      // ---------- autopilot fleet ----------
+   270→   270→
+   271→   271→      if (path === '/bots') {
+   272→   272→        const bots = kernel.context().use<AutopilotService>('autopilot')
+   273→   273→        return json(200, {
+   274→   274→          ok: true,
+   275→   275→          bots: bots.listBots(),
+   276→   276→          running: bots.runningCount(),
+   277→   277→        })
+   278→   278→      }
+   279→   279→
+   280→   280→      if (path === '/journal') {
+   281→   281→        const store = kernel.context().use<{ journal: (p?: string, l?: number) => unknown[]; stats: () => unknown }>('storeRaw')
+   282→   282→        const scope = q.get('scope') ?? 'all' // all | bots
+   283→   283→        const trades = store.journal(scope === 'bots' ? 'bot:' : undefined, 500) as {
+   284→   284→          tsOpen: number
+   285→   285→          tsClose?: number
+   286→   286→          asset: string
+   287→   287→          side: string
+   288→   288→          kind: string
+   289→   289→          strategy?: string
+   290→   290→          amount: number
+   291→   291→          pnl?: number
+   292→   292→          status: string
+   293→   293→        }[]
+   294→   294→        const closed = trades.filter((t) => t.status === 'won' || t.status === 'lost')
+   295→   295→        const wins = closed.filter((t) => t.status === 'won')
+   296→   296→        const losses = closed.filter((t) => t.status === 'lost')
+   297→   297→        const pnls = closed.map((t) => t.pnl ?? 0)
+   298→   298→        const netPnl = pnls.reduce((a, b) => a + b, 0)
+   299→   299→        const grossWin = pnls.filter((p) => p > 0).reduce((a, b) => a + b, 0)
+   300→   300→        const grossLoss = Math.abs(pnls.filter((p) => p < 0).reduce((a, b) => a + b, 0))
+   301→   301→        const group = (keyOf: (t: (typeof closed)[number]) => string) => {
+   302→   302→          const map = new Map<string, { trades: number; wins: number; pnl: number }>()
+   303→   303→          for (const t of closed) {
+   304→   304→            const k = keyOf(t) || 'unassigned'
+   305→   305→            const g = map.get(k) ?? { trades: 0, wins: 0, pnl: 0 }
+   306→   306→            g.trades += 1
+   307→   307→            if (t.status === 'won') g.wins += 1
+   308→   308→            g.pnl += t.pnl ?? 0
+   309→   309→            map.set(k, g)
+   310→   310→          }
+   311→   311→          return [...map.entries()]
+   312→   312→            .map(([key, g]) => ({ key, ...g, winRate: g.trades ? g.wins / g.trades : 0 }))
+   313→   313→            .sort((a, b) => b.pnl - a.pnl)
+   314→   314→        }
+   315→   315→        // chronological equity curve
+   316→   316→        let eq = 0
+   317→   317→        const curve = closed
+   318→   318→          .slice()
+   319→   319→          .reverse()
+   320→   320→          .map((t) => {
+   321→   321→            eq += t.pnl ?? 0
+   322→   322→            return { ts: t.tsClose ?? t.tsOpen, equity: Math.round(eq * 100) / 100 }
+   323→   323→          })
+   324→   324→        return json(200, {
+   325→   325→          ok: true,
+   326→   326→          scope,
+   327→   327→          overall: {
+   328→   328→            trades: closed.length,
+   329→   329→            wins: wins.length,
+   330→   330→            losses: losses.length,
+   331→   331→            winRate: closed.length ? wins.length / closed.length : 0,
+   332→   332→            netPnl: Math.round(netPnl * 100) / 100,
+   333→   333→            profitFactor: grossLoss > 0 ? Math.round((grossWin / grossLoss) * 100) / 100 : grossWin > 0 ? 99 : 0,
+   334→   334→            bestTrade: pnls.length ? Math.round(Math.max(...pnls) * 100) / 100 : 0,
+   335→   335→            worstTrade: pnls.length ? Math.round(Math.min(...pnls) * 100) / 100 : 0,
+   336→   336→            avgWin: wins.length ? Math.round((grossWin / wins.length) * 100) / 100 : 0,
+   337→   337→            avgLoss: losses.length ? Math.round((grossLoss / losses.length) * 100) / 100 : 0,
+   338→   338→          },
+   339→   339→          curve,
+   340→   340→          byStrategy: group((t) => t.strategy ?? ''),
+   341→   341→          byAsset: group((t) => t.asset),
+   342→   342→          byKind: group((t) => t.kind),
+   343→   343→          bySide: group((t) => t.side),
+   344→   344→          recent: trades.slice(-40).reverse(),
+   345→   345→        })
+   346→   346→      }
+   347→   347→    }
+   348→   348→
+   349→   349→    if (req.method === 'POST') {
+   350→   350→      if (path === '/asset') {
+   351→   351→        const asset = String(body.asset ?? '')
+   352→   352→        if (!market.assets.some((a) => a.ticker === asset)) return json(400, { ok: false, error: `unknown asset ${asset}` })
+   353→   353→        market.activeAsset = asset
+   354→   354→        market.ensureSeeded(asset)
+   355→   355→        io.emit('ui', { event: 'asset-changed', asset })
+   356→   356→        return json(200, { ok: true, activeAsset: asset })
+   357→   357→      }
+   358→   358→
+   359→   359→      // ---------- research: optimizer / walk-forward / asset sweep ----------
+   360→   360→
+   361→   361→      if (path === '/optimize') {
+   362→   362→        const out = gridSearch(market.getCandles(String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), 760), String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), {
+   363→   363→          strategy: String(body.strategy ?? 'confluence-core'),
+   364→   364→          sweep: (body.sweep as Record<string, { from: number; to: number; step: number }>) ?? {},
+   365→   365→          objective: (body.objective as Objective) ?? 'netPnl',
+   366→   366→          minTrades: body.minTrades !== undefined ? Number(body.minTrades) : 8,
+   367→   367→          maxCombos: body.maxCombos !== undefined ? Number(body.maxCombos) : 240,
+   368→   368→          top: body.top !== undefined ? Number(body.top) : 20,
+   369→   369→          payout: body.payout !== undefined ? Number(body.payout) : 0.85,
+   370→   370→          amount: body.amount !== undefined ? Number(body.amount) : 10,
+   371→   371→          expiryBars: body.expiryBars !== undefined ? Number(body.expiryBars) : 1,
+   372→   372→          startEquity: body.startEquity !== undefined ? Number(body.startEquity) : 1000,
+   373→   373→        })
+   374→   374→        return json(200, { ok: true, result: out })
+   375→   375→      }
+   376→   376→
+   377→   377→      if (path === '/walkforward') {
+   378→   378→        const out = walkForward(market.getCandles(String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), 760), String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), {
+   379→   379→          strategy: String(body.strategy ?? 'rsi-reversion'),
+   380→   380→          sweep: (body.sweep as Record<string, { from: number; to: number; step: number }>) ?? {},
+   381→   381→          objective: (body.objective as Objective) ?? 'netPnl',
+   382→   382→          minTrades: body.minTrades !== undefined ? Number(body.minTrades) : 6,
+   383→   383→          maxCombos: body.maxCombos !== undefined ? Number(body.maxCombos) : 120,
+   384→   384→          folds: body.folds !== undefined ? Number(body.folds) : 3,
+   385→   385→          isRatio: body.isRatio !== undefined ? Number(body.isRatio) : 0.7,
+   386→   386→          payout: body.payout !== undefined ? Number(body.payout) : 0.85,
+   387→   387→          amount: body.amount !== undefined ? Number(body.amount) : 10,
+   388→   388→          expiryBars: body.expiryBars !== undefined ? Number(body.expiryBars) : 1,
+   389→   389→          startEquity: body.startEquity !== undefined ? Number(body.startEquity) : 1000,
+   390→   390→        })
+   391→   391→        return json(200, { ok: true, result: out })
+   392→   392→      }
+   393→   393→
+   394→   394→      if (path === '/asset_sweep') {
+   395→   395→        const wanted = Array.isArray(body.assets) ? (body.assets as string[]) : null
+   396→   396→        const category = body.category ? String(body.category) : null
+   397→   397→        let pool = market.assets
+   398→   398→        if (wanted && wanted.length) pool = pool.filter((a) => wanted.includes(a.ticker))
+   399→   399→        else if (category && category !== 'all') pool = pool.filter((a) => (category === 'otc' ? a.otc : a.category === category))
+   400→   400→        const openOnly = body.openOnly === undefined ? true : Boolean(body.openOnly)
+   401→   401→        if (openOnly) pool = pool.filter((a) => a.open)
+   402→   402→        const out = sweepAssets(
+   403→   403→          pool.map((a) => ({ ticker: a.ticker, category: a.category, open: a.open, payout: a.payout })),
+   404→   404→          (asset) => market.getCandles(asset, tf(String(body.tf ?? '1m') as string), 760),
+   405→   405→          tf(String(body.tf ?? '1m') as string),
+   406→   406→          {
+   407→   407→            strategy: String(body.strategy ?? 'confluence-core'),
+   408→   408→            params: (body.params as Record<string, number | string>) ?? undefined,
+   409→   409→            objective: (body.objective as Objective) ?? 'netPnl',
+   410→   410→            minTrades: body.minTrades !== undefined ? Number(body.minTrades) : 8,
+   411→   411→            payout: body.payout !== undefined ? Number(body.payout) : 0.85,
+   412→   412→            amount: body.amount !== undefined ? Number(body.amount) : 10,
+   413→   413→            expiryBars: body.expiryBars !== undefined ? Number(body.expiryBars) : 1,
+   414→   414→            startEquity: body.startEquity !== undefined ? Number(body.startEquity) : 1000,
+   415→   415→            maxAssets: body.maxAssets !== undefined ? Number(body.maxAssets) : 40,
+   416→   416→          }
+   417→   417→        )
+   418→   418→        return json(200, { ok: true, result: out })
+   419→   419→      }
+   420→   420→
+   421→   421→      if (path === '/backtest') {
+   422→   422→        const result = analytics.runBacktest(String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), {
+   423→   423→          strategy: String(body.strategy ?? 'confluence-core'),
+   424→   424→          params: (body.params as Record<string, number | string>) ?? undefined,
+   425→   425→          mode: (body.mode as 'binary' | 'spot') ?? 'binary',
+   426→   426→          payout: body.payout !== undefined ? Number(body.payout) : 0.85,
+   427→   427→          amount: body.amount !== undefined ? Number(body.amount) : 10,
+   428→   428→          expiryBars: body.expiryBars !== undefined ? Number(body.expiryBars) : 1,
+   429→   429→          startEquity: body.startEquity !== undefined ? Number(body.startEquity) : 1000,
+   430→   430→          tpPct: body.tpPct !== undefined ? Number(body.tpPct) : 0.4,
+   431→   431→          slPct: body.slPct !== undefined ? Number(body.slPct) : 0.25,
+   432→   432→          maxBars: body.maxBars !== undefined ? Number(body.maxBars) : 24,
+   433→   433→        })
+   434→   434→        return json(200, { ok: true, result })
+   435→   435→      }
+   436→   436→
+   437→   437→      if (path === '/run_strategy') {
+   438→   438→        const out = analytics.runStrategy(
+   439→   439→          String(body.asset ?? market.activeAsset),
+   440→   440→          tf(String(body.tf ?? '1m') as string),
+   441→   441→          String(body.strategy ?? 'confluence-core'),
+   442→   442→          (body.params as Record<string, number | string>) ?? undefined
+   443→   443→        )
+   444→   444→        return json(200, { ok: true, eval: out })
+   445→   445→      }
+   446→   446→
+   447→   447→      if (path === '/trade') {
+   448→   448→        const asset = String(body.asset ?? market.activeAsset)
+   449→   449→        const kind = (body.kind as 'binary' | 'turbo' | 'digital' | 'cfd') ?? 'binary'
+   450→   450→        const inst = getInstrument(asset)
+   451→   451→        if (!inst) return json(400, { ok: false, error: `unknown asset ${asset}` })
+   452→   452→        const out = await exec.placeOrder({
+   453→   453→          asset,
+   454→   454→          tf: tf(String(body.tf ?? '1m') as string),
+   455→   455→          side: (body.side as 'call' | 'put') ?? 'call',
+   456→   456→          kind,
+   457→   457→          amount: Number(body.amount ?? 10),
+   458→   458→          expiryBars: body.expiryBars !== undefined ? Number(body.expiryBars) : undefined,
+   459→   459→          expirySec: body.expirySec !== undefined ? Number(body.expirySec) : undefined,
+   460→   460→          strikeOffsetPct: body.strikeOffsetPct !== undefined ? Number(body.strikeOffsetPct) : undefined,
+   461→   461→          mode: (body.mode as 'paper' | 'live') ?? 'paper',
+   462→   462→          tp: body.tp !== undefined ? Number(body.tp) : undefined,
+   463→   463→          sl: body.sl !== undefined ? Number(body.sl) : undefined,
+   464→   464→          leverage: body.leverage !== undefined ? Number(body.leverage) : undefined,
+   465→   465→          strategy: body.strategy !== undefined ? String(body.strategy) : undefined,
+   466→   466→          note: body.note !== undefined ? String(body.note) : undefined,
+   467→   467→        })
+   468→   468→        return json(200, out)
+   469→   469→      }
+   470→   470→
+   471→   471→      if (path === '/close') {
+   472→   472→        const out = exec.closePosition(String(body.id ?? ''))
+   473→   473→        return json(200, out)
+   474→   474→      }
+   475→   475→
+   476→   476→      if (path === '/kill_switch') {
+   477→   477→        const out = exec.setKillSwitch(Boolean(body.on))
+   478→   478→        return json(200, { ok: true, account: out })
+   479→   479→      }
+   480→   480→
+   481→   481→      if (path === '/risk') {
+   482→   482→        const patch = body as Partial<RiskConfig>
+   483→   483→        const out = exec.setRisk(patch)
+   484→   484→        return json(200, { ok: true, risk: out })
+   485→   485→      }
+   486→   486→
+   487→   487→      if (path === '/reset') {
+   488→   488→        return json(200, { ok: true, account: exec.resetAccount() })
+   489→   489→      }
+   490→   490→
+   491→   491→      if (path === '/live/connect') {
+   492→   492→        const out = await exec.connectLive(
+   493→   493→          String(body.url ?? 'http://127.0.0.1:8788'),
+   494→   494→          String(body.email ?? ''),
+   495→   495→          String(body.password ?? ''),
+   496→   496→          String(body.balanceMode ?? 'PRACTICE')
+   497→   497→        )
+   498→   498→        return json(200, out)
+   499→   499→      }
+   500→   500→
+   501→   501→      if (path === '/live/disconnect') {
+   502→   502→        exec.disconnectLive()
+   503→   503→        return json(200, { ok: true })
+   504→   504→      }
+   505→   505→
+   506→   506→      if (path === '/live/positions') {
+   507→   507→        const out = await exec.livePositions()
+   508→   508→        return json(200, { ok: true, data: out })
+   509→   509→      }
+   510→   510→
+   511→   511→      if (path === '/live/history') {
+   512→   512→        const out = await exec.liveHistory(String(body.instrumentType ?? 'turbo-option'), Number(body.limit ?? 20))
+   513→   513→        return json(200, { ok: true, data: out })
+   514→   514→      }
+   515→   515→
+   516→   516→      if (path === '/chat_save') {
+   517→   517→        const store = kernel.context().use<{ saveChat: (s: string, r: string, c: string) => void }>('storeRaw')
+   518→   518→        store.saveChat(String(body.session ?? 'default'), String(body.role ?? 'user'), String(body.content ?? ''))
+   519→   519→        return json(200, { ok: true })
+   520→   520→      }
+   521→   521→
+   522→   522→      if (path === '/chat_clear') {
+   523→   523→        const store = kernel.context().use<{ clearChat: (s: string) => number }>('storeRaw')
+   524→   524→        const removed = store.clearChat(String(body.session ?? 'default'))
+   525→   525→        return json(200, { ok: true, removed })
+   526→   526→      }
+   527→   527→
+   528→   528→      // ---------- autopilot control ----------
+   529→   529→
+   530→   530→      if (path === '/bot_save') {
+   531→   531→        const bots = kernel.context().use<AutopilotService>('autopilot')
+   532→   532→        return json(200, bots.saveBot(body as Partial<BotConfig>))
+   533→   533→      }
+   534→   534→
+   535→   535→      if (path === '/bot_delete') {
+   536→   536→        const bots = kernel.context().use<AutopilotService>('autopilot')
+   537→   537→        return json(200, bots.deleteBot(String(body.id ?? '')))
+   538→   538→      }
+   539→   539→
+   540→   540→      if (path === '/bot_toggle') {
+   541→   541→        const bots = kernel.context().use<AutopilotService>('autopilot')
+   542→   542→        return json(200, bots.toggleBot(String(body.id ?? ''), body.enabled === undefined ? undefined : Boolean(body.enabled)))
+   543→   543→      }
+   544→   544→
+   545→   545→      // ---------- discovery control ----------
+   546→   546→
+   547→   547→      if (path === '/screener_config') {
+   548→   548→        const scr = kernel.context().use<ScreenerService>('screener')
+   549→   549→        return json(200, scr.configure(body as Parameters<typeof scr.configure>[0]))
+   550→   550→      }
+   551→   551→
+   552→   552→      if (path === '/alert_rule_save') {
+   553→   553→        const rules = kernel.context().use<AlertRulesService>('alertrules')
+   554→   554→        return json(200, rules.saveRule(body as Record<string, never>))
+   555→   555→      }
+   556→   556→
+   557→   557→      if (path === '/alert_rule_toggle') {
+   558→   558→        const rules = kernel.context().use<AlertRulesService>('alertrules')
+   559→   559→        return json(200, rules.toggleRule(String(body.id ?? ''), body.enabled === undefined ? undefined : Boolean(body.enabled)))
+   560→   560→      }
+   561→   561→
+   562→   562→      if (path === '/alert_rule_delete') {
+   563→   563→        const rules = kernel.context().use<AlertRulesService>('alertrules')
+   564→   564→        return json(200, rules.deleteRule(String(body.id ?? '')))
+   565→   565→      }
+   566→   566→
+   567→   567→      // ---------- sentinel control ----------
+   568→   568→
+   569→   569→      if (path === '/sentinel_config') {
+   570→   570→        const sen = kernel.context().use<SentinelService>('sentinel')
+   571→   571→        return json(200, { ok: true, config: sen.configure(body as Partial<SentinelConfig>) })
+   572→   572→      }
+   573→   573→
+   574→   574→      if (path === '/sentinel_ack') {
+   575→   575→        const sen = kernel.context().use<SentinelService>('sentinel')
+   576→   576→        const b = body.breaker === 'daily' || body.breaker === 'drawdown' ? body.breaker : undefined
+   577→   577→        return json(200, sen.ack(b))
+   578→   578→      }
+   579→   579→
+   580→   580→      if (path === '/panic') {
+   581→   581→        const sen = kernel.context().use<SentinelService>('sentinel')
+   582→   582→        return json(200, sen.panic({ killSwitch: Boolean(body.killSwitch) }))
+   583→   583→      }
+   584→   584→    }
+   585→   585→
+   586→   586→    return json(404, { ok: false, error: `no route: ${req.method} ${path}` })
+   587→   587→  } catch (err) {
+   588→   588→    return json(500, { ok: false, error: (err as Error).message })
+   589→   589→  }
+   590→   590→
+   591→   591→  function store_list(status?: 'open' | 'closed'): unknown[] {
+   592→   592→    const store = kernel.context().use<{ listPositions: (s?: 'open' | 'closed', l?: number) => unknown[] }>('storeRaw')
+   593→   593→    return store.listPositions(status, 200)
+   594→   594→  }
+   595→   595→})
+   596→   596→
+   597→   597→const io = new Server(httpServer, {
+   598→   598→  // default path '/socket.io/' so only engine.io requests are claimed;
+   599→   599→  // plain REST requests fall through to the handler above.
+   600→   600→  cors: { origin: '*', methods: ['GET', 'POST'] },
+   601→   601→  pingTimeout: 60000,
+   602→   602→  pingInterval: 25000,
+   603→   603→})
+   604→   604→
+   605→   605→io.on('connection', (socket) => {
+   606→   606→  console.log(`[ws] client connected: ${socket.id}`)
+   607→   607→  socket.on('subscribe', ({ asset, tf }: { asset?: string; tf?: string }) => {
+   608→   608→    for (const room of socket.rooms) {
+   609→   609→      if (room.startsWith('feed:')) socket.leave(room)
+   610→   610→    }
+   611→   611→    socket.join('feed:global')
+   612→   612→    if (asset && tf) socket.join(`feed:${asset}:${tf}`)
+   613→   613→  })
+   614→   614→  socket.on('ping-msg', (data) => socket.emit('pong-msg', data))
+   615→   615→  socket.on('disconnect', () => console.log(`[ws] client gone: ${socket.id}`))
+   616→   616→})
+   617→   617→
+   618→   618→// forward kernel events: candles room-scoped by asset+tf, everything else global
+   619→   619→const ctx = kernel.context()
+   620→   620→ctx.bus.on('tick', (p) => io.to('feed:global').emit('tick', p))
+   621→   621→ctx.bus.on('candle', (p) => io.to(`feed:${p.asset}:${p.tf}`).emit('candle', p))
+   622→   622→ctx.bus.on('positionOpened', (p) => io.to('feed:global').emit('positionOpened', p))
+   623→   623→ctx.bus.on('positionClosed', (p) => io.to('feed:global').emit('positionClosed', p))
+   624→   624→ctx.bus.on('account', (p) => io.to('feed:global').emit('account', p))
+   625→   625→ctx.bus.on('alert', (p) => {
+   626→   626→  const store = ctx.use<{ recordAlert: (l: string, m: string, t: number) => void }>('storeRaw')
+   627→   627→  store.recordAlert(p.level, p.message, p.ts)
+   628→   628→  io.to('feed:global').emit('alert', p)
+   629→   629→})
+   630→   630→
+   631→   631→kernel.start().then(() => {
+   632→   632→  httpServer.listen(PORT, () => {
+   633→   633→    console.log(`[trading-core] IQAIR//OS kernel listening on :${PORT}`)
+   634→   634→  })
+   635→   635→}).catch((err) => {
+   636→   636→  console.error('[trading-core] kernel boot failed:', err)
+   637→   637→  process.exit(1)
+   638→   638→})
+   639→   639→
