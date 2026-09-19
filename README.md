@@ -37,6 +37,13 @@ A trading OS built around the [iqair](https://github.com/Omerhrr/iqair) IQ Optio
 - 10 built-in strategies incl. `markov-edge` (trades the fitted transition matrix) and `confluence-core` (the composite signal itself)
 - Backtester: binary (payout-based) and spot (TP/SL) settlement models — win rate, profit factor, max drawdown, Sharpe, expectancy, equity curve
 
+**Research lab (Backtest Lab → Optimizer / Walk-Forward / Asset Sweep)**
+- **Grid optimizer**: sweep any strategy params (from/to/step per param, cartesian or sampled to a combo cap), rank by objective (net P&L, Sharpe, profit factor, win rate, expectancy) with a min-trades guard, a **robustness heatmap** over the two dominant swept params, and the top-3 finalists **re-verified through the full settlement engine** so their numbers match the single-run lab exactly
+- **Walk-forward validation**: splits history into folds, optimizes params in-sample per fold, then settles the fold winner **out-of-sample with the real binary engine** — OOS net, consistency (profitable folds), IS→OOS efficiency; the honest overfit check before deploying a bot
+- **Asset sweep**: run one strategy/param set across the instrument universe (per category, open-only, capped) and rank where the edge actually holds; click a row to load the asset in the chart
+- **Promote-to-bot**: any optimizer row or walk-forward robust config converts into an autopilot bot in one click (created **disarmed**, with the researched params, stake and expiry pre-filled)
+- Copilot gained the same workflow as tools (`optimize_strategy`, `walkforward`, `asset_sweep`) and is instructed to sweep → optimize → walk-forward → promote before deploying bots
+
 **Discovery layer (screener + alert rules)**
 - **Universe screener**: a background scanner walks every open instrument × configured timeframes (1m/5m/15m by default) with a lightweight snapshot of the composite engine — ranked opportunity feed with signal score, confidence, Markov regime, RSI/ADX/ATR, Hurst, P(up), top candlestick pattern and payout. Rows auto-refresh on candle close (stale invalidation over the event bus), filter by timeframe/category/direction/min-score/symbol, click a row to load the setup into the chart workspace, or hit the bell to convert it into a standing alert
 - **Alert rules**: programmable market watchers persisted in SQLite — price cross (tick-accurate), composite score strength (call/put/either), RSI extremes, ADX trend ignition, ATR% volatility bursts, Markov regime shifts and bullish/bearish candle patterns; per-rule cooldown, one-shot auto-disarm, fire counters, armed/paused state — all surfaced as OS alerts (toast + feed)

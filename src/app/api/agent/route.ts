@@ -300,6 +300,54 @@ const TOOLS: ToolSpec[] = [
         params: a.params,
       }),
   },
+  // ---------- research: optimization lab ----------
+  {
+    name: 'optimize_strategy',
+    description: 'Grid-search a strategy over recent history: sweep numeric params (from/to/step), rank combos by objective (netPnl|sharpe|profitFactor|winRate|expectancy). Top-3 finalists are re-verified by the full settlement engine. Use BEFORE creating a bot: optimize, then bot_create with the winning params. Keep grids tight (<= 240 combos).',
+    args: '{"strategy": "rsi-reversion", "asset": "EURUSD", "tf": "1m", "sweep": {"period": {"from": 7, "to": 21, "step": 2}, "oversold": {"from": 20, "to": 35, "step": 5}}, "objective": "netPnl", "minTrades": 8, "expiryBars": 1}',
+    run: (a) =>
+      corePost('/optimize', {
+        strategy: a.strategy,
+        asset: a.asset,
+        tf: a.tf ?? '1m',
+        sweep: a.sweep ?? {},
+        objective: a.objective ?? 'netPnl',
+        minTrades: a.minTrades ?? 8,
+        expiryBars: a.expiryBars ?? 1,
+      }),
+  },
+  {
+    name: 'walkforward',
+    description: 'Walk-forward validation: splits history into folds, optimizes params in-sample per fold, then settles the winner out-of-sample with the real binary engine. Reports OOS net, consistency (profitable folds) and IS-to-OOS efficiency — the honest edge check before deploying a bot. Pass the same sweep spec as optimize_strategy.',
+    args: '{"strategy": "rsi-reversion", "asset": "EURUSD", "tf": "1m", "sweep": {"period": {"from": 7, "to": 21, "step": 2}}, "folds": 3, "isRatio": 0.7, "objective": "netPnl"}',
+    run: (a) =>
+      corePost('/walkforward', {
+        strategy: a.strategy,
+        asset: a.asset,
+        tf: a.tf ?? '1m',
+        sweep: a.sweep ?? {},
+        objective: a.objective ?? 'netPnl',
+        minTrades: a.minTrades ?? 6,
+        folds: a.folds ?? 3,
+        isRatio: a.isRatio ?? 0.7,
+        expiryBars: a.expiryBars ?? 1,
+      }),
+  },
+  {
+    name: 'asset_sweep',
+    description: 'Run ONE strategy/param set across the whole instrument universe (or a category: forex|otc|crypto|commodity|stock|index) and rank assets by objective. Finds WHERE an edge holds before pinning a bot to an instrument. Rows include per-asset win rate, PF, drawdown and Sharpe.',
+    args: '{"strategy": "ema-trend", "tf": "5m", "category": "crypto", "params": {"fast": 9, "slow": 21, "adx": 22}, "objective": "netPnl", "minTrades": 8, "maxAssets": 40}',
+    run: (a) =>
+      corePost('/asset_sweep', {
+        strategy: a.strategy,
+        tf: a.tf ?? '1m',
+        category: a.category ?? 'all',
+        params: a.params,
+        objective: a.objective ?? 'netPnl',
+        minTrades: a.minTrades ?? 8,
+        maxAssets: a.maxAssets ?? 40,
+      }),
+  },
   // ---------- risk & execution ----------
   {
     name: 'risk_calculator',
@@ -635,6 +683,7 @@ Rules:
 - Use ui_control to set up the workspace when it helps (e.g. add Bollinger + RSI before a detailed read, or switch to the asset you're discussing). Do not undo the user's layout gratuitously.
 - For trade ideas: check multi_timeframe confluence first, size with risk_calculator, then optionally place_trade as PAPER and say so.
 - When the user asks to automate a strategy, deploy a bot with bot_create: pick a sensible strategyId, conservative stake (<=2% of balance), minScore >= 55, and always confirm the config in your final answer. Backtest or run_strategy first when unsure about the edge.
+- RESEARCH WORKFLOW (use it whenever the user wants a validated strategy or asks "is this edge real"): 1) asset_sweep to find WHERE a strategy has an edge, 2) optimize_strategy on the best assets to find strong params, 3) walkforward on the winner - deploy only if OOS net is positive and at least half the folds were profitable, 4) only then bot_create with the validated params (keep the bot DISARMED and tell the user to arm it when ready). Report IS vs OOS numbers honestly - large drops from in-sample to out-of-sample mean overfit.
 - When the user asks to be notified/watch an instrument ("alert me when...", "let me know if..."), create an alert rule with alert_rule_create and confirm the trigger in plain words. NEVER use alert rules to trade - they only notify.
 - NEVER promise profits. Always frame outputs as probabilistic analysis, not certainty.
 - PAPER trades only - you cannot and must not place live trades.

@@ -453,6 +453,97 @@ export interface BacktestResult {
   }
 }
 
+// ---------- research: optimizer / walk-forward / asset sweep ----------
+
+export type ResearchObjective = 'netPnl' | 'sharpe' | 'profitFactor' | 'winRate' | 'expectancy'
+export type SweepSpec = Record<string, { from: number; to: number; step: number }>
+
+export interface FastMetrics {
+  totalTrades: number
+  wins: number
+  winRate: number
+  netPnl: number
+  profitFactor: number
+  maxDrawdownPct: number
+  sharpe: number
+  expectancy: number
+  finalEquity: number
+}
+
+export interface OptRow {
+  params: Record<string, number | string>
+  metrics: FastMetrics
+  score: number
+  rank: number
+  verified: boolean
+}
+
+export interface HeatmapData {
+  xKey: string
+  yKey: string
+  xs: number[]
+  ys: number[]
+  cells: { x: number; y: number; value: number | null; trades: number; winRate: number }[]
+}
+
+export interface GridSearchResult {
+  strategy: string
+  asset: string
+  tf: Timeframe
+  objective: ResearchObjective
+  totalCombos: number
+  evaluated: number
+  skipped: number
+  elapsedMs: number
+  ranked: OptRow[]
+  heatmap: HeatmapData | null
+  best: OptRow | null
+}
+
+export interface WalkForwardFold {
+  fold: number
+  isBars: number
+  oosBars: number
+  bestParams: Record<string, number | string>
+  is: FastMetrics
+  oos: FastMetrics
+}
+
+export interface WalkForwardResult {
+  strategy: string
+  asset: string
+  tf: Timeframe
+  objective: ResearchObjective
+  folds: WalkForwardFold[]
+  oos: FastMetrics
+  isNet: number
+  oosNet: number
+  efficiencyPct: number
+  foldsProfitable: number
+  bestParams: Record<string, number | string>
+  elapsedMs: number
+}
+
+export interface SweepRow {
+  asset: string
+  category: string
+  open: boolean
+  payout: number
+  metrics: FastMetrics
+  score: number
+}
+
+export interface SweepResult {
+  strategy: string
+  tf: Timeframe
+  params: Record<string, number | string>
+  objective: ResearchObjective
+  tested: number
+  skipped: number
+  elapsedMs: number
+  rows: SweepRow[]
+}
+
 export interface AlertRow {
   level: 'info' | 'warn' | 'danger' | 'success'
   message: string

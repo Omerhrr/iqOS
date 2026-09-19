@@ -17,6 +17,7 @@ export interface BacktestOptions {
   tpPct?: number // spot mode take-profit %
   slPct?: number // spot mode stop-loss %
   maxBars?: number // spot mode max holding bars
+  warmupBars?: number // indicator warmup guard (default 220 for ema200-class)
 }
 
 export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: BacktestOptions): BacktestResult {
@@ -32,7 +33,7 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
 
   const trades: BacktestTrade[] = []
   const equityCurve: { time: number; value: number }[] = []
-  const warmup = 220 // ema200 etc. warmup guard
+  const warmup = Math.max(10, Math.min(candles.length - 20, opts.warmupBars ?? 220)) // ema200 etc. warmup guard
   const rets: number[] = []
   let peak = equity
   let maxDD = 0

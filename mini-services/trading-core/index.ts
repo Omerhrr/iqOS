@@ -14,6 +14,7 @@ import { autopilotPlugin, AutopilotService, type BotConfig } from './src/plugins
 import { screenerPlugin, ScreenerService } from './src/plugins/screener'
 import { alertRulesPlugin, AlertRulesService, ALERT_METRICS } from './src/plugins/alert-rules'
 import { sentinelPlugin, SentinelService, type SentinelConfig } from './src/plugins/sentinel'
+import { gridSearch, walkForward, sweepAssets, type Objective } from './src/strategies/optimize'
 import { ALL_TIMEFRAMES, type Timeframe } from './src/types'
 import { searchInstruments, UNIVERSE_STATS, getInstrument } from './src/universe'
 import { listRegistry, computeIndicator, registrySize, getIndicatorDef } from './src/analytics/registry'
@@ -353,6 +354,68 @@ const httpServer = createServer(async (req, res) => {
         market.ensureSeeded(asset)
         io.emit('ui', { event: 'asset-changed', asset })
         return json(200, { ok: true, activeAsset: asset })
+      }
+
+      // ---------- research: optimizer / walk-forward / asset sweep ----------
+
+      if (path === '/optimize') {
+        const out = gridSearch(market.getCandles(String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), 760), String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), {
+          strategy: String(body.strategy ?? 'confluence-core'),
+          sweep: (body.sweep as Record<string, { from: number; to: number; step: number }>) ?? {},
+          objective: (body.objective as Objective) ?? 'netPnl',
+          minTrades: body.minTrades !== undefined ? Number(body.minTrades) : 8,
+          maxCombos: body.maxCombos !== undefined ? Number(body.maxCombos) : 240,
+          top: body.top !== undefined ? Number(body.top) : 20,
+          payout: body.payout !== undefined ? Number(body.payout) : 0.85,
+          amount: body.amount !== undefined ? Number(body.amount) : 10,
+          expiryBars: body.expiryBars !== undefined ? Number(body.expiryBars) : 1,
+          startEquity: body.startEquity !== undefined ? Number(body.startEquity) : 1000,
+        })
+        return json(200, { ok: true, result: out })
+      }
+
+      if (path === '/walkforward') {
+        const out = walkForward(market.getCandles(String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), 760), String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), {
+          strategy: String(body.strategy ?? 'rsi-reversion'),
+          sweep: (body.sweep as Record<string, { from: number; to: number; step: number }>) ?? {},
+          objective: (body.objective as Objective) ?? 'netPnl',
+          minTrades: body.minTrades !== undefined ? Number(body.minTrades) : 6,
+          maxCombos: body.maxCombos !== undefined ? Number(body.maxCombos) : 120,
+          folds: body.folds !== undefined ? Number(body.folds) : 3,
+          isRatio: body.isRatio !== undefined ? Number(body.isRatio) : 0.7,
+          payout: body.payout !== undefined ? Number(body.payout) : 0.85,
+          amount: body.amount !== undefined ? Number(body.amount) : 10,
+          expiryBars: body.expiryBars !== undefined ? Number(body.expiryBars) : 1,
+          startEquity: body.startEquity !== undefined ? Number(body.startEquity) : 1000,
+        })
+        return json(200, { ok: true, result: out })
+      }
+
+      if (path === '/asset_sweep') {
+        const wanted = Array.isArray(body.assets) ? (body.assets as string[]) : null
+        const category = body.category ? String(body.category) : null
+        let pool = market.assets
+        if (wanted && wanted.length) pool = pool.filter((a) => wanted.includes(a.ticker))
+        else if (category && category !== 'all') pool = pool.filter((a) => (category === 'otc' ? a.otc : a.category === category))
+        const openOnly = body.openOnly === undefined ? true : Boolean(body.openOnly)
+        if (openOnly) pool = pool.filter((a) => a.open)
+        const out = sweepAssets(
+          pool.map((a) => ({ ticker: a.ticker, category: a.category, open: a.open, payout: a.payout })),
+          (asset) => market.getCandles(asset, tf(String(body.tf ?? '1m') as string), 760),
+          tf(String(body.tf ?? '1m') as string),
+          {
+            strategy: String(body.strategy ?? 'confluence-core'),
+            params: (body.params as Record<string, number | string>) ?? undefined,
+            objective: (body.objective as Objective) ?? 'netPnl',
+            minTrades: body.minTrades !== undefined ? Number(body.minTrades) : 8,
+            payout: body.payout !== undefined ? Number(body.payout) : 0.85,
+            amount: body.amount !== undefined ? Number(body.amount) : 10,
+            expiryBars: body.expiryBars !== undefined ? Number(body.expiryBars) : 1,
+            startEquity: body.startEquity !== undefined ? Number(body.startEquity) : 1000,
+            maxAssets: body.maxAssets !== undefined ? Number(body.maxAssets) : 40,
+          }
+        )
+        return json(200, { ok: true, result: out })
       }
 
       if (path === '/backtest') {

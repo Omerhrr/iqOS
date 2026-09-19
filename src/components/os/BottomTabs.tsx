@@ -227,9 +227,9 @@ export default function BottomTabs(props: BottomTabsProps) {
         </div>
       </TabsContent>
 
-      {/* BACKTEST */}
+      {/* BACKTEST / RESEARCH LAB */}
       <TabsContent value="backtest" className="mt-0 min-h-0 flex-1 overflow-auto p-3">
-        <BacktestLab asset={asset} strategies={props.strategies} />
+        <BacktestLab asset={asset} strategies={props.strategies} onSelectSetup={props.onSelectSetup} />
       </TabsContent>
 
       {/* STRATEGIES */}
