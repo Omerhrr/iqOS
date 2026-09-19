@@ -12,9 +12,37 @@ import { ALL_TIMEFRAMES, TIMEFRAME_SECONDS } from '../types'
 import type { Plugin } from '../kernel'
 import { gaussLike } from './random'
 import { UNIVERSE, getInstrument, isInstrumentOpen } from '../universe'
+import type { Store } from '../store'
 
 const HISTORY_CANDLES = 760
 const MAX_TICKS = 40000
+const MEM_CAP = 1500 // in-memory closed bars per asset|tf (unchanged memory profile)
+const ARCHIVE_DEEP = 4000 // max bars hydrated/read from the sqlite archive per asset|tf
+const ARCHIVE_CAP = 4000 // archive trim cap per asset|tf (auto-prune)
+const ARCHIVE_FLUSH_MS = 5000 // batched write cadence
+const ARCHIVE_PRUNE_FLUSHES = 60 // ~every 5 minutes
+const GAP_FILL_MAX = 720 // max synthetic gap-fill bars per key on boot (12h of 1m)
+
+/** Deterministic PRNG stream per ticker so the SIM universe tells the SAME story on every boot. */
+function hashSeed(s: string): number {
+  let h = 2166136261 >>> 0
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i)
+    h = Math.imul(h, 16777619)
+  }
+  return h >>> 0
+}
+
+function mulberry32(seed: number): () => number {
+  let a = seed
+  return () => {
+    a |= 0
+    a = (a + 0x6d2b79f5) | 0
+    let t = Math.imul(a ^ (a >>> 15), 1 | a)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
 
 interface Regime {
   drift: number
@@ -35,11 +63,20 @@ export class MarketDataService {
   private seeded = new Set<string>() // assets whose history is materialized
   private timer: ReturnType<typeof setInterval> | null = null
   private liveTimer: ReturnType<typeof setInterval> | null = null
+  private flushTimer: ReturnType<typeof setInterval> | null = null
   private lastCandleTs = new Map<string, number>()
+  private store: Store | null = null
+  private archiveQueue: { asset: string; tf: string; time: number; open: number; high: number; low: number; close: number; volume: number }[] = []
+  private flushCount = 0
   activeAsset = 'EURUSD'
 
   async start(ctx: KernelContext): Promise<void> {
     this.ctx = ctx
+    try {
+      this.store = ctx.use<Store>('storeRaw')
+    } catch {
+      // store not available - archive disabled, pure in-memory mode
+    }
     for (const a of this.assets) {
       this.prices.set(a.ticker, a.basePrice)
       this.regimes.set(a.ticker, { drift: (Math.random() - 0.5) * 2e-5, anchor: a.basePrice })
@@ -50,18 +87,88 @@ export class MarketDataService {
     // every other asset seeds on first access (memory-friendly with 100+ instruments)
     this.ensureSeeded(this.activeAsset)
     this.timer = setInterval(() => this.tickAll(), 1000)
+    if (this.store) {
+      this.flushTimer = setInterval(() => this.flushArchive(), ARCHIVE_FLUSH_MS)
+      ctx.log('market-data', 'candle archive attached - closed bars persist across restarts')
+    }
     ctx.log('market-data', `universe online: ${this.assets.length} instruments, ${ALL_TIMEFRAMES.length} timeframes (lazy seeding)`)
   }
 
-  /** Materialize seeded history + sim tracking for an instrument on first use. */
+  /** Materialize history for an instrument on first use: prehistory + archive + gap-fill. */
   ensureSeeded(ticker: string): void {
     if (this.seeded.has(ticker)) return
     const a = this.assets.find((x) => x.ticker === ticker)
     if (!a) return
     this.seeded.add(ticker)
     for (const tf of ALL_TIMEFRAMES) {
-      this.closed.set(this.key(ticker, tf), this.seedHistory(a, tf))
+      const k = this.key(ticker, tf)
+      let series: Candle[] = []
+      try {
+        if (this.store) series = this.buildSeries(a, tf)
+      } catch {
+        series = []
+      }
+      if (!series.length) {
+        const nowBucket = this.bucketNow(TIMEFRAME_SECONDS[tf])
+        series = this.synthPrehistory(a, tf, HISTORY_CANDLES, nowBucket, a.basePrice, mulberry32(hashSeed(`${a.ticker}|${tf}|seed`)))
+      }
+      this.closed.set(k, series.slice(-MEM_CAP))
     }
+  }
+
+  private bucketNow(tfSec: number): number {
+    const now = Math.floor(Date.now() / 1000)
+    return now - (now % tfSec)
+  }
+
+  /**
+   * Layered series: [deterministic prehistory][archived bars][deterministic gap-fill].
+   * The archive is the real accumulated story; the synthetic parts are pure
+   * functions of (ticker, tf, timestamps) so restarts never rewrite history.
+   */
+  private buildSeries(a: AssetInfo, tf: Timeframe): Candle[] {
+    if (!this.store) return []
+    const tfSec = TIMEFRAME_SECONDS[tf]
+    const arch = this.store.getCandlesArchive(a.ticker, tf, ARCHIVE_DEEP)
+    if (!arch.length) return []
+    const series: Candle[] = [...arch]
+    // bridge downtime with a deterministic forward walk (continuity up to now)
+    const nowBucket = this.bucketNow(tfSec)
+    const last = series[series.length - 1]
+    const gap = Math.floor((nowBucket - last.time) / tfSec) - 1
+    if (gap > 0) {
+      const count = Math.min(gap, GAP_FILL_MAX)
+      series.push(...this.synthForward(a, tf, count, last.time + tfSec, last.close, mulberry32(hashSeed(`${a.ticker}|${tf}|gap`))))
+    }
+    // top up with deterministic prehistory so the seeded window stays >= HISTORY_CANDLES
+    if (series.length < HISTORY_CANDLES) {
+      const need = HISTORY_CANDLES - series.length
+      const pre = this.synthPrehistory(a, tf, need, series[0].time, series[0].open, mulberry32(hashSeed(`${a.ticker}|${tf}|pre`)))
+      series.unshift(...pre)
+    }
+    return series
+  }
+
+  /** Walk forward from (startTs, startPrice) - used for deterministic gap-fill. */
+  private synthForward(asset: AssetInfo, tf: Timeframe, count: number, startTs: number, startPrice: number, rng: () => number): Candle[] {
+    const tfSec = TIMEFRAME_SECONDS[tf]
+    const sigma = asset.volatility * Math.sqrt(tfSec) * (tf === '5s' ? 1.15 : tf === '15s' ? 1.1 : 1)
+    const out: Candle[] = []
+    let price = startPrice
+    let drift = 0
+    for (let i = 0; i < count; i++) {
+      if (rng() < 0.015) drift = (rng() - 0.5) * sigma * 0.9
+      const open = price
+      const ret = drift + (sigma * (rng() + rng() + rng() + rng() - 2)) * 0.87
+      const close = open * Math.exp(ret)
+      const wick = Math.abs(ret) * 1.8 + sigma * 0.6
+      const high = Math.max(open, close) * (1 + wick * rng() * 0.55)
+      const low = Math.min(open, close) * (1 - wick * rng() * 0.55)
+      const volume = Math.round(500 + rng() * 2500 * (1 + Math.abs(ret) / sigma))
+      out.push({ time: startTs + i * tfSec, open, high, low, close, volume })
+      price = close
+    }
+    return out
   }
 
   refreshSchedules(): void {
@@ -74,36 +181,60 @@ export class MarketDataService {
   stop(): void {
     if (this.timer) clearInterval(this.timer)
     if (this.liveTimer) clearInterval(this.liveTimer)
+    if (this.flushTimer) clearInterval(this.flushTimer)
+    this.flushArchive() // final write-back
+  }
+
+  /** Write-behind: flush queued closed candles to the sqlite archive (batched). */
+  private flushArchive(): void {
+    if (!this.store || !this.archiveQueue.length) return
+    const batch = this.archiveQueue.splice(0, this.archiveQueue.length)
+    try {
+      this.store.saveCandles(batch)
+    } catch {
+      // archive write failure must never break the feed
+    }
+    this.flushCount += 1
+    if (this.flushCount % ARCHIVE_PRUNE_FLUSHES === 0) {
+      try {
+        this.store.pruneArchive(ARCHIVE_CAP)
+      } catch {
+        // pruning is best-effort
+      }
+    }
   }
 
   private key(asset: string, tf: Timeframe) {
     return `${asset}|${tf}`
   }
 
-  /** Seed statistically-plausible history ending at basePrice. */
-  private seedHistory(asset: AssetInfo, tf: Timeframe): Candle[] {
+  /**
+   * `count` bars ENDING right before endTs, rescaled to end at endPrice.
+   * Deterministic via the caller's rng stream - the same (ticker, tf) always
+   * tells the same story, so research results are reproducible across restarts.
+   */
+  private synthPrehistory(asset: AssetInfo, tf: Timeframe, count: number, endTs: number, endPrice: number, rng: () => number): Candle[] {
     const tfSec = TIMEFRAME_SECONDS[tf]
     const sigma = asset.volatility * Math.sqrt(tfSec) * (tf === '5s' ? 1.15 : tf === '15s' ? 1.1 : 1)
     const out: Candle[] = []
-    const now = Math.floor(Date.now() / 1000)
-    const t0 = now - (now % tfSec) - HISTORY_CANDLES * tfSec
+    const t0 = endTs - count * tfSec
     let price = asset.basePrice * (1 - asset.volatility * Math.sqrt(tfSec) * 6)
     // walk forward with occasional regime shifts so the data has trend + range phases
     let drift = 0
-    for (let i = 0; i < HISTORY_CANDLES; i++) {
-      if (Math.random() < 0.015) drift = (Math.random() - 0.5) * sigma * 0.9
+    for (let i = 0; i < count; i++) {
+      if (rng() < 0.015) drift = (rng() - 0.5) * sigma * 0.9
       const open = price
-      const ret = drift + (sigma * (Math.random() + Math.random() + Math.random() + Math.random() - 2)) * 0.87
+      const ret = drift + (sigma * (rng() + rng() + rng() + rng() - 2)) * 0.87
       const close = open * Math.exp(ret)
       const wick = Math.abs(ret) * 1.8 + sigma * 0.6
-      const high = Math.max(open, close) * (1 + wick * Math.random() * 0.55)
-      const low = Math.min(open, close) * (1 - wick * Math.random() * 0.55)
-      const volume = Math.round(500 + Math.random() * 2500 * (1 + Math.abs(ret) / sigma))
+      const high = Math.max(open, close) * (1 + wick * rng() * 0.55)
+      const low = Math.min(open, close) * (1 - wick * rng() * 0.55)
+      const volume = Math.round(500 + rng() * 2500 * (1 + Math.abs(ret) / sigma))
       out.push({ time: t0 + i * tfSec, open, high, low, close, volume })
       price = close
     }
-    // rescale so the series ends exactly at basePrice
-    const scale = asset.basePrice / out[out.length - 1].close
+    // rescale so the series ends exactly at endPrice
+    const scale = endPrice / out[out.length - 1].close
     return out.map((c) => ({
       ...c,
       open: c.open * scale,
@@ -148,7 +279,8 @@ export class MarketDataService {
       if (current) {
         const arr = this.closed.get(k)!
         arr.push(current)
-        if (arr.length > 1500) arr.splice(0, arr.length - 1500)
+        if (arr.length > MEM_CAP) arr.splice(0, arr.length - MEM_CAP)
+        this.archiveQueue.push({ asset, tf, time: current.time, open: current.open, high: current.high, low: current.low, close: current.close, volume: current.volume })
         this.ctx.bus.emit('candle', { asset, tf, candle: current, closed: true })
       }
       const fresh: Candle = { time: bucket, open: tick.price, high: tick.price, low: tick.price, close: tick.price, volume: tick.vol }
@@ -252,6 +384,32 @@ export class MarketDataService {
     const forming = this.candles.get(k)
     const all = forming ? [...closedArr, forming] : [...closedArr]
     return all.slice(-limit)
+  }
+
+  /**
+   * DEEP read: archived bars + in-memory tail merged by time (in-memory wins on overlap).
+   * The research lab reads through this so optimizer / walk-forward see the full
+   * accumulated history instead of the seeded window.
+   */
+  getCandlesDeep(asset: string, tf: Timeframe, limit = 2200): Candle[] {
+    const live = this.getCandles(asset, tf, limit)
+    if (!this.store) return live
+    let archived: Candle[] = []
+    try {
+      archived = this.store.getCandlesArchive(asset, tf, limit)
+    } catch {
+      return live
+    }
+    if (!archived.length) return live
+    if (!live.length) return archived.slice(-limit)
+    const liveFirst = live[0].time
+    const archLast = archived[archived.length - 1].time
+    if (archLast < liveFirst) return [...archived, ...live].slice(-limit)
+    // overlap: newest source wins per timestamp
+    const byTime = new Map<number, Candle>()
+    for (const c of archived) byTime.set(c.time, c)
+    for (const c of live) byTime.set(c.time, c)
+    return [...byTime.values()].sort((a, b) => a.time - b.time).slice(-limit)
   }
 
   getPrice(asset: string): number {

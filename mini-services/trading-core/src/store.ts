@@ -3,7 +3,7 @@
 // and the autopilot bot fleet.
 
 import { Database } from 'bun:sqlite'
-import type { AccountState, Position } from './types'
+import type { AccountState, Position, Candle } from './types'
 import type { BotConfig } from './plugins/autopilot'
 import type { AlertRule } from './plugins/alert-rules'
 
@@ -104,6 +104,17 @@ export class Store {
         bot_id TEXT NOT NULL,
         kind TEXT NOT NULL,
         message TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS candles_archive (
+        asset TEXT NOT NULL,
+        tf TEXT NOT NULL,
+        time INTEGER NOT NULL,
+        open REAL NOT NULL,
+        high REAL NOT NULL,
+        low REAL NOT NULL,
+        close REAL NOT NULL,
+        volume INTEGER NOT NULL,
+        PRIMARY KEY (asset, tf, time)
       );
     `)
   }
@@ -447,6 +458,64 @@ export class Store {
     return this.db
       .query('SELECT ts, bot_id, kind, message FROM watchdog_events ORDER BY id DESC LIMIT ?')
       .all(limit) as { ts: number; bot_id: string; kind: string; message: string }[]
+  }
+
+  // ---------- candles archive (deep history) ----------
+
+  /** Batched UPSERT of closed candles. Rows may overlap existing keys - PK dedupes. */
+  saveCandles(rows: { asset: string; tf: string; time: number; open: number; high: number; low: number; close: number; volume: number }[]): void {
+    if (!rows.length) return
+    const stmt = this.db.prepare(
+      'INSERT INTO candles_archive (asset, tf, time, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(asset, tf, time) DO UPDATE SET open = excluded.open, high = excluded.high, low = excluded.low, close = excluded.close, volume = excluded.volume'
+    )
+    const tx = this.db.transaction((batch: typeof rows) => {
+      for (const r of batch) stmt.run(r.asset, r.tf, r.time, r.open, r.high, r.low, r.close, r.volume)
+    })
+    for (let i = 0; i < rows.length; i += 500) tx(rows.slice(i, i + 500))
+  }
+
+  /** Newest `limit` archived candles for one asset|tf, ascending by time. */
+  getCandlesArchive(asset: string, tf: string, limit: number): Candle[] {
+    const rows = this.db
+      .query('SELECT time, open, high, low, close, volume FROM candles_archive WHERE asset = ? AND tf = ? ORDER BY time DESC LIMIT ?')
+      .all(asset, tf, Math.max(1, Math.min(limit, 5000))) as { time: number; open: number; high: number; low: number; close: number; volume: number }[]
+    return rows.reverse().map((r) => ({ time: r.time, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume }))
+  }
+
+  archiveCount(asset: string, tf: string): number {
+    const row = this.db.query('SELECT COUNT(*) n FROM candles_archive WHERE asset = ? AND tf = ?').get(asset, tf) as { n: number }
+    return row.n
+  }
+
+  archiveStats(): {
+    rows: number
+    keys: number
+    top: { asset: string; tf: string; n: number; oldest: number; newest: number }[]
+    perTf: { tf: string; n: number }[]
+  } {
+    const tot = this.db.query('SELECT COUNT(*) n, COUNT(DISTINCT asset || "|" || tf) k FROM candles_archive').get() as { n: number; k: number }
+    const top = this.db
+      .query('SELECT asset, tf, COUNT(*) n, MIN(time) oldest, MAX(time) newest FROM candles_archive GROUP BY asset, tf ORDER BY n DESC LIMIT 12')
+      .all() as { asset: string; tf: string; n: number; oldest: number; newest: number }[]
+    const perTf = this.db.query('SELECT tf, COUNT(*) n FROM candles_archive GROUP BY tf').all() as { tf: string; n: number }[]
+    return { rows: tot.n, keys: tot.k, top, perTf }
+  }
+
+  /** Trim every asset|tf key to its newest `cap` bars. Returns removed rows. */
+  pruneArchive(cap: number): number {
+    const over = this.db
+      .query('SELECT asset, tf, COUNT(*) n FROM candles_archive GROUP BY asset, tf HAVING n > ?')
+      .all(cap) as { asset: string; tf: string; n: number }[]
+    if (!over.length) return 0
+    const del = this.db.prepare(
+      'DELETE FROM candles_archive WHERE asset = ? AND tf = ? AND time <= (SELECT time FROM candles_archive WHERE asset = ? AND tf = ? ORDER BY time DESC LIMIT 1 OFFSET ?)'
+    )
+    const tx = this.db.transaction((batch: typeof over) => {
+      let n = 0
+      for (const k of batch) n += del.run(k.asset, k.tf, k.asset, k.tf, cap - 1).changes
+      return n
+    })
+    return tx(over)
   }
 
   stats(): { trades: number; wins: number; losses: number; netPnl: number } {

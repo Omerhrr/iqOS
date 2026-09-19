@@ -581,6 +581,13 @@ const TOOLS: ToolSpec[] = [
         ...(a.expectedWinRatePct !== undefined ? { expectedWinRatePct: Number(a.expectedWinRatePct) } : {}),
       }),
   },
+  // ---------- archive: deep history ----------
+  {
+    name: 'archive_status',
+    description: 'Candle archive depth: total archived bars, distinct asset|tf keys, the deepest series (rows + time coverage per key) and per-timeframe totals. Research (optimize/walkforward) reads through this archive - check it before heavy validation: long-warmup strategies (markov family) need ~1800+ bars for multi-fold walk-forward, and depth grows while the OS runs.',
+    args: '{}',
+    run: () => coreGet('/archive'),
+  },
   // ---------- OS control (executed client-side) ----------
   {
     name: 'ui_control',
@@ -715,7 +722,7 @@ Rules:
 - Use ui_control to set up the workspace when it helps (e.g. add Bollinger + RSI before a detailed read, or switch to the asset you're discussing). Do not undo the user's layout gratuitously.
 - For trade ideas: check multi_timeframe confluence first, size with risk_calculator, then optionally place_trade as PAPER and say so.
 - When the user asks to automate a strategy, deploy a bot with bot_create: pick a sensible strategyId, conservative stake (<=2% of balance), minScore >= 55, and always confirm the config in your final answer. Backtest or run_strategy first when unsure about the edge.
-- RESEARCH WORKFLOW (use it whenever the user wants a validated strategy or asks "is this edge real"): 1) asset_sweep to find WHERE a strategy has an edge, 2) optimize_strategy on the best assets to find strong params, 3) walkforward on the winner - deploy only if OOS net is positive and at least half the folds were profitable, 4) only then bot_create with the validated params (keep the bot DISARMED and tell the user to arm it when ready). After arming, the watchdog watches the live edge - mention that. Report IS vs OOS numbers honestly - large drops from in-sample to out-of-sample mean overfit.
+- RESEARCH WORKFLOW (use it whenever the user wants a validated strategy or asks "is this edge real"): 1) asset_sweep to find WHERE a strategy has an edge, 2) optimize_strategy on the best assets to find strong params, 3) walkforward on the winner - deploy only if OOS net is positive and at least half the folds were profitable, 4) only then bot_create with the validated params (keep the bot DISARMED and tell the user to arm it when ready). After arming, the watchdog watches the live edge - mention that. Research reads DEEP archived history; archive_status shows how much depth exists per asset - if depth is thin, warn that results may not be significant yet. Report IS vs OOS numbers honestly - large drops from in-sample to out-of-sample mean overfit.
 - When the user asks to be notified/watch an instrument ("alert me when...", "let me know if..."), create an alert rule with alert_rule_create and confirm the trigger in plain words. NEVER use alert rules to trade - they only notify.
 - NEVER promise profits. Always frame outputs as probabilistic analysis, not certainty.
 - PAPER trades only - you cannot and must not place live trades.

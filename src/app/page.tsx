@@ -196,6 +196,18 @@ export default function OSPage() {
     return () => clearInterval(t)
   }, [])
 
+  // archive depth polling - feeds the deep-history chip in the status bar
+  const [archiveBars, setArchiveBars] = useState(0)
+  useEffect(() => {
+    const poll = () =>
+      void osGet<{ ok: boolean; stats: { rows: number } }>('/archive')
+        .then((d) => setArchiveBars(d.ok ? d.stats.rows : 0))
+        .catch(() => setArchiveBars(0))
+    poll()
+    const t = setInterval(poll, 30000)
+    return () => clearInterval(t)
+  }, [])
+
   // initial load
   useEffect(() => {
     void ensureKernel()
@@ -606,6 +618,12 @@ export default function OSPage() {
             <span className="flex items-center gap-1 animate-pulse text-amber-400">
               <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
               watchdog: {watchdogStopped} bot{watchdogStopped === 1 ? '' : 's'} held
+            </span>
+          )}
+          {archiveBars > 0 && (
+            <span className="flex items-center gap-1 text-violet-400">
+              <span className="h-1.5 w-1.5 rounded-full bg-violet-400" />
+              archive: {archiveBars > 1_000_000 ? `${(archiveBars / 1_000_000).toFixed(1)}M` : `${Math.round(archiveBars / 1000)}k`} bars
             </span>
           )}
         </div>

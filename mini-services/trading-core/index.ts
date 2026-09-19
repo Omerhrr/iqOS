@@ -236,6 +236,13 @@ const httpServer = createServer(async (req, res) => {
         return json(200, { ok: true, ...wd.status() })
       }
 
+      // ---------- archive: deep history ----------
+
+      if (path === '/archive') {
+        const store = kernel.context().use<{ archiveStats: () => unknown }>('storeRaw')
+        return json(200, { ok: true, stats: store.archiveStats() })
+      }
+
 
       if (path === '/signal') {
         const asset = q.get('asset') ?? market.activeAsset
@@ -367,8 +374,10 @@ const httpServer = createServer(async (req, res) => {
 
       // ---------- research: optimizer / walk-forward / asset sweep ----------
 
+      // deep reads: archived bars + live tail (up to 2200) so validation sees
+      // the full accumulated history, not just the seeded window
       if (path === '/optimize') {
-        const out = gridSearch(market.getCandles(String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), 760), String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), {
+        const out = gridSearch(market.getCandlesDeep(String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), 2200), String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), {
           strategy: String(body.strategy ?? 'confluence-core'),
           sweep: (body.sweep as Record<string, { from: number; to: number; step: number }>) ?? {},
           objective: (body.objective as Objective) ?? 'netPnl',
@@ -384,7 +393,7 @@ const httpServer = createServer(async (req, res) => {
       }
 
       if (path === '/walkforward') {
-        const out = walkForward(market.getCandles(String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), 760), String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), {
+        const out = walkForward(market.getCandlesDeep(String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), 2200), String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), {
           strategy: String(body.strategy ?? 'rsi-reversion'),
           sweep: (body.sweep as Record<string, { from: number; to: number; step: number }>) ?? {},
           objective: (body.objective as Objective) ?? 'netPnl',
@@ -410,7 +419,7 @@ const httpServer = createServer(async (req, res) => {
         if (openOnly) pool = pool.filter((a) => a.open)
         const out = sweepAssets(
           pool.map((a) => ({ ticker: a.ticker, category: a.category, open: a.open, payout: a.payout })),
-          (asset) => market.getCandles(asset, tf(String(body.tf ?? '1m') as string), 760),
+          (asset) => market.getCandlesDeep(asset, tf(String(body.tf ?? '1m') as string), 1200),
           tf(String(body.tf ?? '1m') as string),
           {
             strategy: String(body.strategy ?? 'confluence-core'),
@@ -606,6 +615,14 @@ const httpServer = createServer(async (req, res) => {
       if (path === '/watchdog_baseline') {
         const wd = kernel.context().use<WatchdogService>('watchdog')
         return json(200, wd.setBaseline(String(body.botId ?? ''), Number(body.expectedWinRatePct ?? 0)))
+      }
+
+      // ---------- archive control ----------
+
+      if (path === '/archive_prune') {
+        const store = kernel.context().use<{ pruneArchive: (cap: number) => number }>('storeRaw')
+        const cap = Math.max(200, Math.min(Number(body.cap ?? 4000), 20000))
+        return json(200, { ok: true, cap, removed: store.pruneArchive(cap) })
       }
     }
 

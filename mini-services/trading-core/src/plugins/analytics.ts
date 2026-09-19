@@ -30,7 +30,8 @@ export class AnalyticsService {
       const hit = this.cache.get(key)
       if (hit) return hit.result
     }
-    const candles = this.market.getCandles(asset, tf, 760)
+    // deep read: prefer archived history so markov/quant stats survive restarts
+    const candles = this.market.getCandlesDeep(asset, tf, 1500)
     if (candles.length < 60) throw new Error(`not enough candles yet for ${asset} ${tf} (${candles.length})`)
     const result = analyze(candles, asset, tf)
     this.cache.set(key, { ts: result.ts, result })
@@ -50,7 +51,8 @@ export class AnalyticsService {
   runStrategy(asset: string, tf: Timeframe, strategyId: string, params?: Record<string, number | string>) {
     const strat = getStrategy(strategyId)
     if (!strat) throw new Error(`unknown strategy ${strategyId}`)
-    const candles = this.market.getCandles(asset, tf, 760)
+    // deep read: long-warmup strategies (markov family) stay usable right after restarts
+    const candles = this.market.getCandlesDeep(asset, tf, 1500)
     if (candles.length < 60) throw new Error('not enough candle history yet')
     const merged = { ...defaultParams(strat), ...(params ?? {}) }
     const ev = strat.evaluate(candles, merged)
@@ -58,7 +60,8 @@ export class AnalyticsService {
   }
 
   runBacktest(asset: string, tf: Timeframe, opts: BacktestOptions) {
-    const candles = this.market.getCandles(asset, tf, 760)
+    // deep read: the backtest lab sees the full accumulated history (up to 2200 bars)
+    const candles = this.market.getCandlesDeep(asset, tf, 2200)
     if (candles.length < 300) throw new Error('not enough candle history for a meaningful backtest')
     return backtest(candles, asset, tf, opts)
   }
