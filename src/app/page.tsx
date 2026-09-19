@@ -41,6 +41,7 @@ const BOOT_MSGS = [
   'registry: 101 indicators · 35 candlestick + chart patterns armed',
   'analytics: markov + montecarlo engines fitted',
   'execution: binary · turbo · digital · cfd broker + risk manager ready',
+  'sentinel: circuit breakers armed · exposure caps · trade throttle',
   'IQAIR//OS ready',
 ]
 
@@ -168,6 +169,18 @@ export default function OSPage() {
     } catch {
       // autopilot endpoints need a kernel with the bot plugin - ignore until then
     }
+  }, [])
+
+  // sentinel status polling - feeds the governance chip in the status bar
+  const [sentinelArmed, setSentinelArmed] = useState(false)
+  useEffect(() => {
+    const poll = () =>
+      void osGet<{ ok: boolean; armed: boolean }>('/sentinel')
+        .then((d) => setSentinelArmed(Boolean(d.ok && d.armed)))
+        .catch(() => setSentinelArmed(false))
+    poll()
+    const t = setInterval(poll, 5000)
+    return () => clearInterval(t)
   }, [])
 
   // initial load
@@ -449,6 +462,7 @@ export default function OSPage() {
               prices={prices}
               refreshPositions={loadPositions}
               refreshBots={loadBots}
+              refreshAccount={loadAccount}
               onSelectSetup={handleSelectSetup}
               onError={(m) => pushToast('danger', m)}
             />
@@ -509,6 +523,7 @@ export default function OSPage() {
                     prices={prices}
                     refreshPositions={loadPositions}
                     refreshBots={loadBots}
+                    refreshAccount={loadAccount}
                     onSelectSetup={handleSelectSetup}
                     onError={(m) => pushToast('danger', m)}
                   />
@@ -566,6 +581,12 @@ export default function OSPage() {
             <span className="flex items-center gap-1 text-cyan-400">
               <span className="h-1.5 w-1.5 rounded-full bg-cyan-400" />
               screener: {screenerLive} pairs live
+            </span>
+          )}
+          {sentinelArmed && (
+            <span className="flex items-center gap-1 animate-pulse text-rose-400">
+              <span className="h-1.5 w-1.5 rounded-full bg-rose-500" />
+              sentinel: breaker tripped
             </span>
           )}
         </div>

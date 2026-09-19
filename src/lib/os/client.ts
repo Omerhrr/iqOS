@@ -307,6 +307,51 @@ export interface RiskConfig {
   cooldownSeconds: number
 }
 
+// ---------- sentinel (risk governance) ----------
+
+export interface SentinelConfig {
+  maxExposurePct: number
+  perAssetCapPct: number
+  maxTradesPerHour: number
+  drawdownHaltPct: number
+  autoKillOnDailyLoss: boolean
+  autoKillOnDrawdown: boolean
+}
+
+export interface SentinelBreaker {
+  id: 'daily' | 'drawdown'
+  label: string
+  tripped: boolean
+  reason: string
+  ts: number | null
+}
+
+export interface RiskEvent {
+  ts: number
+  kind: string
+  message: string
+}
+
+export interface SentinelStatus {
+  armed: boolean
+  killSwitch: boolean
+  balance: number
+  hwm: number
+  dayLoss: number
+  baseDailyLimit: number
+  drawdownPct: number
+  exposure: { total: number; byAsset: Record<string, number> }
+  exposureCap: number
+  perAssetCap: number
+  tradesLastHour: number
+  openPositions: number
+  maxOpenPositions: number
+  maxStake: number
+  config: SentinelConfig
+  breakers: SentinelBreaker[]
+  events: RiskEvent[]
+}
+
 export interface StrategyInfo {
   id: string
   name: string

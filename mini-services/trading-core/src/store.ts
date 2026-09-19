@@ -78,6 +78,17 @@ export class Store {
         created_ts INTEGER NOT NULL,
         updated_ts INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS risk_config (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        config TEXT NOT NULL,
+        hwm REAL NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS risk_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        message TEXT NOT NULL
+      );
     `)
   }
 
@@ -334,6 +345,36 @@ export class Store {
         }
       })
       .filter((x): x is { rule: AlertRule; createdTs: number } => x !== null)
+  }
+
+  // ---------- sentinel (risk governance) ----------
+
+  /** Persisted sentinel config blob (limits + breakers + high-water mark). */
+  getSentinelState(): { config: unknown; hwm: number } | null {
+    const row = this.db.query('SELECT config, hwm FROM risk_config WHERE id = 1').get() as { config: string; hwm: number } | null
+    if (!row) return null
+    try {
+      return { config: JSON.parse(row.config), hwm: row.hwm }
+    } catch {
+      return null
+    }
+  }
+
+  saveSentinelState(config: unknown, hwm: number): void {
+    this.db.run(
+      'INSERT INTO risk_config (id, config, hwm) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET config = excluded.config, hwm = excluded.hwm',
+      [JSON.stringify(config), hwm]
+    )
+  }
+
+  recordRiskEvent(kind: string, message: string, ts: number): void {
+    this.db.run('INSERT INTO risk_events (ts, kind, message) VALUES (?, ?, ?)', [ts, kind, message])
+  }
+
+  listRiskEvents(limit = 50): { ts: number; kind: string; message: string }[] {
+    return this.db
+      .query('SELECT ts, kind, message FROM risk_events ORDER BY id DESC LIMIT ?')
+      .all(limit) as { ts: number; kind: string; message: string }[]
   }
 
   stats(): { trades: number; wins: number; losses: number; netPnl: number } {

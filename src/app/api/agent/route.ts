@@ -468,6 +468,39 @@ const TOOLS: ToolSpec[] = [
     args: '{"id": "rule-abc123"}',
     run: (a) => corePost('/alert_rule_delete', { id: a.id }),
   },
+  // ---------- sentinel: risk governance ----------
+  {
+    name: 'sentinel_status',
+    description: 'Risk governance snapshot: armed state, circuit breakers (daily-loss, drawdown) with trip reasons, balance vs high-water mark, drawdown %, open exposure vs cap, per-asset stakes, trades last hour vs throttle, persisted limits and recent risk events. Check this before placing trades when the user asks about risk.',
+    args: '{}',
+    run: () => coreGet('/sentinel'),
+  },
+  {
+    name: 'sentinel_configure',
+    description: 'Update persisted portfolio risk limits: maxExposurePct (max total open stake as % of balance), perAssetCapPct (max stake on one asset), maxTradesPerHour (trade throttle), drawdownHaltPct (equity drawdown % that trips the breaker), autoKillOnDailyLoss (bool), autoKillOnDrawdown (bool). 0 disables a cap. Limits survive restarts.',
+    args: '{"maxExposurePct": 25, "perAssetCapPct": 10, "maxTradesPerHour": 20, "drawdownHaltPct": 10}',
+    run: (a) =>
+      corePost('/sentinel_config', {
+        ...(a.maxExposurePct !== undefined ? { maxExposurePct: Number(a.maxExposurePct) } : {}),
+        ...(a.perAssetCapPct !== undefined ? { perAssetCapPct: Number(a.perAssetCapPct) } : {}),
+        ...(a.maxTradesPerHour !== undefined ? { maxTradesPerHour: Number(a.maxTradesPerHour) } : {}),
+        ...(a.drawdownHaltPct !== undefined ? { drawdownHaltPct: Number(a.drawdownHaltPct) } : {}),
+        ...(a.autoKillOnDailyLoss !== undefined ? { autoKillOnDailyLoss: Boolean(a.autoKillOnDailyLoss) } : {}),
+        ...(a.autoKillOnDrawdown !== undefined ? { autoKillOnDrawdown: Boolean(a.autoKillOnDrawdown) } : {}),
+      }),
+  },
+  {
+    name: 'panic_close_all',
+    description: 'EMERGENCY ONLY. Closes EVERY open position (paper + live via iqair) and disarms ALL autopilot bots immediately. Pass killSwitch true to also halt all new trading until the user releases it. Use when the user says panic/flatten/close everything/stop the bots or when a violent move demands exiting everything at once.',
+    args: '{"killSwitch": true}',
+    run: (a) => corePost('/panic', { killSwitch: Boolean(a.killSwitch) }),
+  },
+  {
+    name: 'sentinel_ack',
+    description: 'Acknowledge and reset tripped sentinel circuit breakers so trading can resume. Omit breaker to ack all. If the underlying breach (daily loss / drawdown) still holds, the breaker re-trips instantly. Only use after the user agrees to resume.',
+    args: '{"breaker": "drawdown"}',
+    run: (a) => corePost('/sentinel_ack', a.breaker ? { breaker: a.breaker } : {}),
+  },
   // ---------- OS control (executed client-side) ----------
   {
     name: 'ui_control',
@@ -587,7 +620,7 @@ const TOOLS: ToolSpec[] = [
 const TOOL_LIST_TEXT = TOOLS.map((t) => `- ${t.name}: ${t.description} args: ${t.args}`).join('\n')
 
 const SYSTEM_BASE = `You are the IQAIR//OS Copilot - an expert quantitative trading analyst embedded as the AI of a trading operating system built on the iqair IQ Option library.
-You can analyze markets (100+ technical indicators, 35 candlestick + chart patterns, Markov chains, Monte Carlo, Hurst exponent, GARCH volatility), DISCOVER setups with the market-wide screener (screener_scan ranks every instrument x timeframe by signal strength - start there when the user asks "what's moving" or "find setups"), place PAPER trades through the risk manager, deploy and manage AUTONOMOUS autopilot bots (bot_create / bot_toggle / bot_delete / autopilot_status - they trade every qualifying signal automatically under the global risk manager), set standing ALERT RULES that watch instruments and fire OS alerts (alert_rule_create / alert_rule_list / alert_rule_delete - use them when the user wants to be notified, e.g. "tell me when BTC RSI drops below 30"), review the realized trade journal (journal_stats), and control the user's workspace (switch charts, timeframes, add indicators).
+You can analyze markets (100+ technical indicators, 35 candlestick + chart patterns, Markov chains, Monte Carlo, Hurst exponent, GARCH volatility), DISCOVER setups with the market-wide screener (screener_scan ranks every instrument x timeframe by signal strength - start there when the user asks "what's moving" or "find setups"), place PAPER trades through the risk manager, deploy and manage AUTONOMOUS autopilot bots (bot_create / bot_toggle / bot_delete / autopilot_status - they trade every qualifying signal automatically under the global risk manager), set standing ALERT RULES that watch instruments and fire OS alerts (alert_rule_create / alert_rule_list / alert_rule_delete - use them when the user wants to be notified, e.g. "tell me when BTC RSI drops below 30"), review the realized trade journal (journal_stats), control the user's workspace (switch charts, timeframes, add indicators), and govern RISK through the sentinel layer (sentinel_status shows breakers/exposure/drawdown, sentinel_configure tunes portfolio limits, panic_close_all flattens everything, sentinel_ack resets tripped breakers). If a trade or bot order is rejected with a "sentinel:" reason, explain which limit or breaker fired - never suggest workarounds, limits are there to protect the account; resume only when the user explicitly accepts the risk.
 
 Tool protocol - follow it EXACTLY:
 - Respond with ONE JSON object and nothing else. No markdown fences, no prose outside the JSON.

@@ -48,6 +48,19 @@ export class ExecutionService {
     this.ctx = ctx
     this.market = ctx.use<MarketDataService>('market')
     this.store = ctx.use<Store>('store')
+    // restore persisted base risk limits (survive kernel restarts)
+    const saved = this.store.getSentinelState()
+    if (saved && saved.config && typeof saved.config === 'object') {
+      const c = saved.config as Record<string, unknown>
+      const num = (v: unknown, fb: number) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : fb)
+      this.risk = {
+        maxStake: num(c.maxStake, this.risk.maxStake),
+        dailyLossLimit: num(c.dailyLossLimit, this.risk.dailyLossLimit),
+        maxOpenPositions: num(c.maxOpenPositions, this.risk.maxOpenPositions),
+        lossStreakCooldown: num(c.lossStreakCooldown, this.risk.lossStreakCooldown),
+        cooldownSeconds: num(c.cooldownSeconds, this.risk.cooldownSeconds),
+      }
+    }
     // settle binaries + spot TPs/SLs on every closed candle
     this.unsubscribers.push(
       ctx.bus.on('candle', ({ asset, tf, candle, closed }) => {
@@ -90,6 +103,14 @@ export class ExecutionService {
     this.updateDayRollover()
     const acct = this.store.getAccount()
     if (acct.killSwitch) return { ok: false, reason: 'KILL SWITCH engaged - trading disabled' }
+    // sentinel gate: portfolio breakers, exposure caps, trade throttle (paper AND live)
+    try {
+      const sentinel = this.ctx.use<{ preTrade: (a: string, amt: number) => { ok: boolean; reason?: string } }>('sentinel')
+      const s = sentinel.preTrade(asset, amount)
+      if (!s.ok) return { ok: false, reason: s.reason }
+    } catch {
+      // sentinel plugin not loaded - fall back to base risk manager only
+    }
     if (amount <= 0) return { ok: false, reason: 'amount must be positive' }
     if (amount > this.risk.maxStake) return { ok: false, reason: `stake $${amount} exceeds max stake $${this.risk.maxStake}` }
     if (amount > acct.balance) return { ok: false, reason: `insufficient balance ($${acct.balance.toFixed(2)})` }
@@ -111,6 +132,16 @@ export class ExecutionService {
 
   setRisk(patch: Partial<RiskConfig>): RiskConfig {
     this.risk = { ...this.risk, ...patch }
+    // persist so limits survive kernel restarts
+    try {
+      const saved = this.store.getSentinelState()
+      this.store.saveSentinelState(
+        { ...((saved?.config as Record<string, unknown>) ?? {}), ...this.risk },
+        saved?.hwm ?? 0
+      )
+    } catch {
+      // persistence is best-effort
+    }
     this.ctx.bus.emit('alert', { level: 'info', message: 'Risk config updated', ts: this.now() })
     return this.risk
   }

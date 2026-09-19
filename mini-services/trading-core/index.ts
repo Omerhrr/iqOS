@@ -13,6 +13,7 @@ import { executionPlugin, ExecutionService, type RiskConfig } from './src/plugin
 import { autopilotPlugin, AutopilotService, type BotConfig } from './src/plugins/autopilot'
 import { screenerPlugin, ScreenerService } from './src/plugins/screener'
 import { alertRulesPlugin, AlertRulesService, ALERT_METRICS } from './src/plugins/alert-rules'
+import { sentinelPlugin, SentinelService, type SentinelConfig } from './src/plugins/sentinel'
 import { ALL_TIMEFRAMES, type Timeframe } from './src/types'
 import { searchInstruments, UNIVERSE_STATS, getInstrument } from './src/universe'
 import { listRegistry, computeIndicator, registrySize, getIndicatorDef } from './src/analytics/registry'
@@ -28,6 +29,7 @@ kernel.register(executionPlugin)
 kernel.register(autopilotPlugin)
 kernel.register(screenerPlugin)
 kernel.register(alertRulesPlugin)
+kernel.register(sentinelPlugin)
 
 const httpServer = createServer(async (req, res) => {
   res.setHeader('access-control-allow-origin', '*')
@@ -210,6 +212,18 @@ const httpServer = createServer(async (req, res) => {
       if (path === '/alert_rules') {
         const rules = kernel.context().use<AlertRulesService>('alertrules')
         return json(200, { ok: true, rules: rules.listRules() })
+      }
+
+      // ---------- sentinel: risk governance ----------
+
+      if (path === '/sentinel') {
+        const sen = kernel.context().use<SentinelService>('sentinel')
+        return json(200, { ok: true, ...sen.status() })
+      }
+
+      if (path === '/risk_events') {
+        const store = kernel.context().use<{ listRiskEvents: (l?: number) => { ts: number; kind: string; message: string }[] }>('storeRaw')
+        return json(200, { ok: true, events: store.listRiskEvents(60) })
       }
 
 
@@ -485,6 +499,24 @@ const httpServer = createServer(async (req, res) => {
       if (path === '/alert_rule_delete') {
         const rules = kernel.context().use<AlertRulesService>('alertrules')
         return json(200, rules.deleteRule(String(body.id ?? '')))
+      }
+
+      // ---------- sentinel control ----------
+
+      if (path === '/sentinel_config') {
+        const sen = kernel.context().use<SentinelService>('sentinel')
+        return json(200, { ok: true, config: sen.configure(body as Partial<SentinelConfig>) })
+      }
+
+      if (path === '/sentinel_ack') {
+        const sen = kernel.context().use<SentinelService>('sentinel')
+        const b = body.breaker === 'daily' || body.breaker === 'drawdown' ? body.breaker : undefined
+        return json(200, sen.ack(b))
+      }
+
+      if (path === '/panic') {
+        const sen = kernel.context().use<SentinelService>('sentinel')
+        return json(200, sen.panic({ killSwitch: Boolean(body.killSwitch) }))
       }
     }
 

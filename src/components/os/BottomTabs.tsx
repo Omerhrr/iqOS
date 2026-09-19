@@ -20,6 +20,7 @@ import AutopilotPanel from './AutopilotPanel'
 import JournalTab from './JournalTab'
 import ScreenerPanel from './ScreenerPanel'
 import AlertRulesPanel from './AlertRulesPanel'
+import SentinelPanel from './SentinelPanel'
 
 interface BottomTabsProps {
   asset: string
@@ -35,6 +36,7 @@ interface BottomTabsProps {
   prices: Record<string, { price: number; dir: number }>
   refreshPositions: () => void
   refreshBots: () => void
+  refreshAccount: () => void
   onSelectSetup: (asset: string, tf: Timeframe) => void
   onError: (m: string) => void
 }
@@ -71,6 +73,7 @@ export default function BottomTabs(props: BottomTabsProps) {
             ['history', `History (${history.length})`],
             ['screener', 'Screener'],
             ['autopilot', `Autopilot${props.bots.filter((b) => b.bot.enabled).length ? ` (${props.bots.filter((b) => b.bot.enabled).length})` : ''}`],
+            ['sentinel', 'Sentinel'],
             ['journal', 'Journal'],
             ['backtest', 'Backtest Lab'],
             ['strategies', 'Strategy Lab'],
@@ -207,6 +210,13 @@ export default function BottomTabs(props: BottomTabsProps) {
             onChanged={props.refreshBots}
             onError={onError}
           />
+        </div>
+      </TabsContent>
+
+      {/* SENTINEL (risk governance) */}
+      <TabsContent value="sentinel" className="mt-0 min-h-0 flex-1 overflow-hidden">
+        <div className="h-full">
+          <SentinelPanel onError={onError} onAccountChanged={props.refreshAccount} />
         </div>
       </TabsContent>
 
