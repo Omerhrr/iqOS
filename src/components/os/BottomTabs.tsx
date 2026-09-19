@@ -1,6 +1,6 @@
 'use client'
 
-// IQAIR//OS - Bottom workspace: positions blotter / history / backtest lab / strategy lab / patterns / alerts
+// IQAIR//OS - Bottom workspace: positions blotter / history / autopilot / journal / backtest lab / strategy lab / patterns / alerts
 import { useCallback, useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -9,12 +9,15 @@ import type {
   AlertRow,
   AssetRow,
   BacktestResult,
+  BotRow,
   Position,
   StrategyInfo,
   Timeframe,
 } from '@/lib/os/client'
 import { fmtMoney, fmtPct, fmtPrice, fmtTime, osPost } from '@/lib/os/client'
 import BacktestLab from './BacktestLab'
+import AutopilotPanel from './AutopilotPanel'
+import JournalTab from './JournalTab'
 
 interface BottomTabsProps {
   asset: string
@@ -25,9 +28,11 @@ interface BottomTabsProps {
   patterns: Position extends never ? never : import('@/lib/os/client').PatternHit[]
   assets: AssetRow[]
   strategies: StrategyInfo[]
+  bots: BotRow[]
   price: number
   prices: Record<string, { price: number; dir: number }>
   refreshPositions: () => void
+  refreshBots: () => void
   onError: (m: string) => void
 }
 
@@ -61,6 +66,8 @@ export default function BottomTabs(props: BottomTabsProps) {
           [
             ['positions', `Positions (${positions.length})`],
             ['history', `History (${history.length})`],
+            ['autopilot', `Autopilot${props.bots.filter((b) => b.bot.enabled).length ? ` (${props.bots.filter((b) => b.bot.enabled).length})` : ''}`],
+            ['journal', 'Journal'],
             ['backtest', 'Backtest Lab'],
             ['strategies', 'Strategy Lab'],
             ['patterns', `Patterns (${patterns.length})`],
@@ -179,6 +186,26 @@ export default function BottomTabs(props: BottomTabsProps) {
             </tbody>
           </table>
         )}
+      </TabsContent>
+
+      {/* AUTOPILOT */}
+      <TabsContent value="autopilot" className="mt-0 min-h-0 flex-1 overflow-hidden">
+        <div className="h-full">
+          <AutopilotPanel
+            bots={props.bots}
+            assets={props.assets}
+            strategies={props.strategies}
+            onChanged={props.refreshBots}
+            onError={onError}
+          />
+        </div>
+      </TabsContent>
+
+      {/* JOURNAL */}
+      <TabsContent value="journal" className="mt-0 min-h-0 flex-1 overflow-hidden">
+        <div className="h-full">
+          <JournalTab />
+        </div>
       </TabsContent>
 
       {/* BACKTEST */}

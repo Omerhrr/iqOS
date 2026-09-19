@@ -277,6 +277,7 @@ export interface Position {
   pnl?: number
   status: 'open' | 'won' | 'lost' | 'closed'
   strategy?: string
+  note?: string
   settlesAt?: number
   strike?: number
   expirySec?: number
@@ -312,6 +313,75 @@ export interface StrategyInfo {
   description: string
   params: { key: string; label: string; type: 'number' | 'select'; min?: number; max?: number; step?: number; options?: { value: string; label: string }[]; default: number | string }[]
   defaults: Record<string, number | string>
+}
+
+// ---------- autopilot ----------
+
+export interface BotConfig {
+  id: string
+  name: string
+  enabled: boolean
+  watchlist: string[]
+  strategyId: string
+  tf: Timeframe
+  params?: Record<string, number | string>
+  kind: TradeKind
+  stake: number
+  expiryBars: number
+  minScore: number
+  direction: 'both' | 'call' | 'put'
+  regime: 'all' | 'trend' | 'range'
+  maxOpen: number
+  cooldownSec: number
+  dailyProfitTarget?: number
+  dailyLossLimit?: number
+}
+
+export interface BotStats {
+  trades: number
+  wins: number
+  losses: number
+  pnlToday: number
+  pnlTotal: number
+  openCount: number
+  lastTradeTs: number
+  streak: number
+}
+
+export interface BotRow {
+  bot: BotConfig
+  stats: BotStats
+  createdTs: number
+}
+
+export interface JournalGroupRow {
+  key: string
+  trades: number
+  wins: number
+  pnl: number
+  winRate: number
+}
+
+export interface JournalSummary {
+  scope: string
+  overall: {
+    trades: number
+    wins: number
+    losses: number
+    winRate: number
+    netPnl: number
+    profitFactor: number
+    bestTrade: number
+    worstTrade: number
+    avgWin: number
+    avgLoss: number
+  }
+  curve: { ts: number; equity: number }[]
+  byStrategy: JournalGroupRow[]
+  byAsset: JournalGroupRow[]
+  byKind: JournalGroupRow[]
+  bySide: JournalGroupRow[]
+  recent: Position[]
 }
 
 export interface BacktestResult {

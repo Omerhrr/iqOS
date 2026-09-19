@@ -1,8 +1,10 @@
 // IQAIR//OS - Persistence (bun:sqlite)
-// Account, positions/trade journal, risk config, alerts and agent chat sessions.
+// Account, positions/trade journal, risk config, alerts, agent chat sessions
+// and the autopilot bot fleet.
 
 import { Database } from 'bun:sqlite'
 import type { AccountState, Position } from './types'
+import type { BotConfig } from './plugins/autopilot'
 
 export class Store {
   private db: Database
@@ -62,6 +64,12 @@ export class Store {
         role TEXT NOT NULL,
         content TEXT NOT NULL,
         meta TEXT
+      );
+      CREATE TABLE IF NOT EXISTS bots (
+        id TEXT PRIMARY KEY,
+        config TEXT NOT NULL,
+        created_ts INTEGER NOT NULL,
+        updated_ts INTEGER NOT NULL
       );
     `)
   }
@@ -247,6 +255,46 @@ export class Store {
     return row.n ?? 0
   }
 
+  // ---------- autopilot bots ----------
+
+  saveBot(bot: BotConfig): void {
+    const now = Math.floor(Date.now() / 1000)
+    const existing = this.db.query('SELECT created_ts FROM bots WHERE id = ?').get(bot.id) as { created_ts: number } | null
+    this.db.run(
+      'INSERT INTO bots (id, config, created_ts, updated_ts) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET config = excluded.config, updated_ts = excluded.updated_ts',
+      [bot.id, JSON.stringify(bot), existing?.created_ts ?? now, now]
+    )
+  }
+
+  deleteBot(id: string): boolean {
+    const res = this.db.run('DELETE FROM bots WHERE id = ?', [id])
+    return res.changes > 0
+  }
+
+  listBots(): { bot: BotConfig; createdTs: number }[] {
+    const rows = this.db.query('SELECT config, created_ts FROM bots ORDER BY created_ts ASC').all() as {
+      config: string
+      created_ts: number
+    }[]
+    return rows.map((r) => {
+      try {
+        return { bot: JSON.parse(r.config) as BotConfig, createdTs: r.created_ts }
+      } catch {
+        // corrupted row - drop it rather than poison the fleet
+        this.db.run('DELETE FROM bots WHERE config = ?', [r.config])
+        return null
+      }
+    }).filter((x): x is { bot: BotConfig; createdTs: number } => x !== null)
+  }
+
+  /** Journal rows for one bot (positions tagged note = bot:{id}). */
+  botJournal(botId: string, limit = 200): Position[] {
+    const rows = this.db
+      .query("SELECT * FROM positions WHERE note = ? ORDER BY ts_open DESC LIMIT ?")
+      .all(`bot:${botId}`, limit) as Record<string, unknown>[]
+    return rows.map((r) => this.rowToPosition(r))
+  }
+
   stats(): { trades: number; wins: number; losses: number; netPnl: number } {
     const row = this.db
       .query(
@@ -258,5 +306,15 @@ export class Store {
       )
       .get() as { trades: number; wins: number | null; losses: number | null; netPnl: number }
     return { trades: row.trades, wins: row.wins ?? 0, losses: row.losses ?? 0, netPnl: row.netPnl }
+  }
+
+  /** Closed positions with optional note-prefix filter (e.g. 'bot:' for autopilot trades). */
+  journal(notePrefix?: string, limit = 500): Position[] {
+    const rows = (
+      notePrefix
+        ? this.db.query("SELECT * FROM positions WHERE status != 'open' AND note LIKE ? ORDER BY ts_open DESC LIMIT ?").all(`${notePrefix}%`, limit)
+        : this.db.query("SELECT * FROM positions WHERE status != 'open' ORDER BY ts_open DESC LIMIT ?").all(limit)
+    ) as Record<string, unknown>[]
+    return rows.map((r) => this.rowToPosition(r)).reverse()
   }
 }

@@ -10,6 +10,7 @@ import { storePlugin } from './src/plugins/store'
 import { marketDataPlugin, MarketDataService } from './src/plugins/market-data'
 import { analyticsPlugin, AnalyticsService } from './src/plugins/analytics'
 import { executionPlugin, ExecutionService, type RiskConfig } from './src/plugins/execution'
+import { autopilotPlugin, AutopilotService, type BotConfig } from './src/plugins/autopilot'
 import { ALL_TIMEFRAMES, type Timeframe } from './src/types'
 import { searchInstruments, UNIVERSE_STATS, getInstrument } from './src/universe'
 import { listRegistry, computeIndicator, registrySize, getIndicatorDef } from './src/analytics/registry'
@@ -22,6 +23,7 @@ kernel.register(storePlugin)
 kernel.register(marketDataPlugin)
 kernel.register(analyticsPlugin)
 kernel.register(executionPlugin)
+kernel.register(autopilotPlugin)
 
 const httpServer = createServer(async (req, res) => {
   res.setHeader('access-control-allow-origin', '*')
@@ -212,6 +214,85 @@ const httpServer = createServer(async (req, res) => {
         const session = q.get('session') ?? 'default'
         return json(200, { ok: true, messages: store.listChat(session, 60).reverse() })
       }
+
+      // ---------- autopilot fleet ----------
+
+      if (path === '/bots') {
+        const bots = kernel.context().use<AutopilotService>('autopilot')
+        return json(200, {
+          ok: true,
+          bots: bots.listBots(),
+          running: bots.runningCount(),
+        })
+      }
+
+      if (path === '/journal') {
+        const store = kernel.context().use<{ journal: (p?: string, l?: number) => unknown[]; stats: () => unknown }>('storeRaw')
+        const scope = q.get('scope') ?? 'all' // all | bots
+        const trades = store.journal(scope === 'bots' ? 'bot:' : undefined, 500) as {
+          tsOpen: number
+          tsClose?: number
+          asset: string
+          side: string
+          kind: string
+          strategy?: string
+          amount: number
+          pnl?: number
+          status: string
+        }[]
+        const closed = trades.filter((t) => t.status === 'won' || t.status === 'lost')
+        const wins = closed.filter((t) => t.status === 'won')
+        const losses = closed.filter((t) => t.status === 'lost')
+        const pnls = closed.map((t) => t.pnl ?? 0)
+        const netPnl = pnls.reduce((a, b) => a + b, 0)
+        const grossWin = pnls.filter((p) => p > 0).reduce((a, b) => a + b, 0)
+        const grossLoss = Math.abs(pnls.filter((p) => p < 0).reduce((a, b) => a + b, 0))
+        const group = (keyOf: (t: (typeof closed)[number]) => string) => {
+          const map = new Map<string, { trades: number; wins: number; pnl: number }>()
+          for (const t of closed) {
+            const k = keyOf(t) || 'unassigned'
+            const g = map.get(k) ?? { trades: 0, wins: 0, pnl: 0 }
+            g.trades += 1
+            if (t.status === 'won') g.wins += 1
+            g.pnl += t.pnl ?? 0
+            map.set(k, g)
+          }
+          return [...map.entries()]
+            .map(([key, g]) => ({ key, ...g, winRate: g.trades ? g.wins / g.trades : 0 }))
+            .sort((a, b) => b.pnl - a.pnl)
+        }
+        // chronological equity curve
+        let eq = 0
+        const curve = closed
+          .slice()
+          .reverse()
+          .map((t) => {
+            eq += t.pnl ?? 0
+            return { ts: t.tsClose ?? t.tsOpen, equity: Math.round(eq * 100) / 100 }
+          })
+        return json(200, {
+          ok: true,
+          scope,
+          overall: {
+            trades: closed.length,
+            wins: wins.length,
+            losses: losses.length,
+            winRate: closed.length ? wins.length / closed.length : 0,
+            netPnl: Math.round(netPnl * 100) / 100,
+            profitFactor: grossLoss > 0 ? Math.round((grossWin / grossLoss) * 100) / 100 : grossWin > 0 ? 99 : 0,
+            bestTrade: pnls.length ? Math.round(Math.max(...pnls) * 100) / 100 : 0,
+            worstTrade: pnls.length ? Math.round(Math.min(...pnls) * 100) / 100 : 0,
+            avgWin: wins.length ? Math.round((grossWin / wins.length) * 100) / 100 : 0,
+            avgLoss: losses.length ? Math.round((grossLoss / losses.length) * 100) / 100 : 0,
+          },
+          curve,
+          byStrategy: group((t) => t.strategy ?? ''),
+          byAsset: group((t) => t.asset),
+          byKind: group((t) => t.kind),
+          bySide: group((t) => t.side),
+          recent: trades.slice(-40).reverse(),
+        })
+      }
     }
 
     if (req.method === 'POST') {
@@ -329,6 +410,23 @@ const httpServer = createServer(async (req, res) => {
         const store = kernel.context().use<{ clearChat: (s: string) => number }>('storeRaw')
         const removed = store.clearChat(String(body.session ?? 'default'))
         return json(200, { ok: true, removed })
+      }
+
+      // ---------- autopilot control ----------
+
+      if (path === '/bot_save') {
+        const bots = kernel.context().use<AutopilotService>('autopilot')
+        return json(200, bots.saveBot(body as Partial<BotConfig>))
+      }
+
+      if (path === '/bot_delete') {
+        const bots = kernel.context().use<AutopilotService>('autopilot')
+        return json(200, bots.deleteBot(String(body.id ?? '')))
+      }
+
+      if (path === '/bot_toggle') {
+        const bots = kernel.context().use<AutopilotService>('autopilot')
+        return json(200, bots.toggleBot(String(body.id ?? ''), body.enabled === undefined ? undefined : Boolean(body.enabled)))
       }
     }
 

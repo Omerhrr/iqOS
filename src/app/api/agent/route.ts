@@ -390,6 +390,44 @@ const TOOLS: ToolSpec[] = [
     args: '{}',
     run: () => coreGet('/account'),
   },
+  // ---------- autopilot fleet ----------
+  {
+    name: 'autopilot_status',
+    description: 'List every autopilot bot: config (strategy, watchlist, tf, limits) plus live stats (armed, trades today, P&L, streak).',
+    args: '{}',
+    run: () => coreGet('/bots'),
+  },
+  {
+    name: 'bot_create',
+    description: 'Create or update an autopilot bot. Required: watchlist (array of tickers), strategyId (from list_strategies), tf. Optional: name, kind (binary|turbo|digital|cfd), stake, expiryBars, minScore (min |signal score| to trade, default 55), direction (both|call|put), regime (all|trend|range), maxOpen, cooldownSec, dailyProfitTarget, dailyLossLimit, enabled. Bots trade automatically on candle close and are always subject to the global risk manager.',
+    args: '{"name": "EUR Reversion", "watchlist": ["EURUSD", "GBPUSD"], "strategyId": "rsi-reversion", "tf": "1m", "stake": 10, "minScore": 60, "enabled": true}',
+    run: (a) =>
+      corePost('/bot_save', {
+        ...a,
+        stake: a.stake !== undefined ? Number(a.stake) : undefined,
+        minScore: a.minScore !== undefined ? Number(a.minScore) : undefined,
+        maxOpen: a.maxOpen !== undefined ? Number(a.maxOpen) : undefined,
+        cooldownSec: a.cooldownSec !== undefined ? Number(a.cooldownSec) : undefined,
+      }),
+  },
+  {
+    name: 'bot_toggle',
+    description: 'Start or stop an autopilot bot by id. Pass enabled true to arm, false to stop. Omit enabled to flip the current state.',
+    args: '{"id": "bot-abc123", "enabled": true}',
+    run: (a) => corePost('/bot_toggle', { id: a.id, ...(a.enabled === undefined ? {} : { enabled: Boolean(a.enabled) }) }),
+  },
+  {
+    name: 'bot_delete',
+    description: 'Delete an autopilot bot permanently (its trade history stays in the journal).',
+    args: '{"id": "bot-abc123"}',
+    run: (a) => corePost('/bot_delete', { id: a.id }),
+  },
+  {
+    name: 'journal_stats',
+    description: 'Realized performance journal: net P&L, win rate, profit factor, equity curve, grouped by strategy/instrument/kind/side. Pass scope "bots" for autopilot trades only.',
+    args: '{"scope": "bots"}',
+    run: (a) => coreGet(`/journal?scope=${a.scope === 'bots' ? 'bots' : 'all'}`),
+  },
   // ---------- OS control (executed client-side) ----------
   {
     name: 'ui_control',
@@ -509,7 +547,7 @@ const TOOLS: ToolSpec[] = [
 const TOOL_LIST_TEXT = TOOLS.map((t) => `- ${t.name}: ${t.description} args: ${t.args}`).join('\n')
 
 const SYSTEM_BASE = `You are the IQAIR//OS Copilot - an expert quantitative trading analyst embedded as the AI of a trading operating system built on the iqair IQ Option library.
-You can analyze markets (100+ technical indicators, 35 candlestick + chart patterns, Markov chains, Monte Carlo, Hurst exponent, GARCH volatility), scan the whole universe for setups, run strategies, backtest them, place PAPER trades through the risk manager, and control the user's workspace (switch charts, timeframes, add indicators).
+You can analyze markets (100+ technical indicators, 35 candlestick + chart patterns, Markov chains, Monte Carlo, Hurst exponent, GARCH volatility), scan the whole universe for setups, run strategies, backtest them, place PAPER trades through the risk manager, deploy and manage AUTONOMOUS autopilot bots (bot_create / bot_toggle / bot_delete / autopilot_status - they trade every qualifying signal automatically under the global risk manager), review the realized trade journal (journal_stats), and control the user's workspace (switch charts, timeframes, add indicators).
 
 Tool protocol - follow it EXACTLY:
 - Respond with ONE JSON object and nothing else. No markdown fences, no prose outside the JSON.
@@ -523,6 +561,7 @@ Rules:
 - The OS CONTEXT block tells you the user's balance, open positions and what chart they are viewing - reference it naturally ("on your EURUSD 1m chart...") instead of re-fetching what you already know.
 - Use ui_control to set up the workspace when it helps (e.g. add Bollinger + RSI before a detailed read, or switch to the asset you're discussing). Do not undo the user's layout gratuitously.
 - For trade ideas: check multi_timeframe confluence first, size with risk_calculator, then optionally place_trade as PAPER and say so.
+- When the user asks to automate a strategy, deploy a bot with bot_create: pick a sensible strategyId, conservative stake (<=2% of balance), minScore >= 55, and always confirm the config in your final answer. Backtest or run_strategy first when unsure about the edge.
 - NEVER promise profits. Always frame outputs as probabilistic analysis, not certainty.
 - PAPER trades only - you cannot and must not place live trades.
 - If a tool returns {"ok": false, "error": ...}, adapt: fix the args or try a different approach.

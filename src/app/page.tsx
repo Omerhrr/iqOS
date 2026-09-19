@@ -23,6 +23,7 @@ import type {
   AlertRow,
   AnalysisResult,
   AssetRow,
+  BotRow,
   Candle,
   ChartType,
   IndicatorSeries,
@@ -73,6 +74,7 @@ export default function OSPage() {
   const [history, setHistory] = useState<Position[]>([])
   const [alerts, setAlerts] = useState<AlertRow[]>([])
   const [strategies, setStrategies] = useState<StrategyInfo[]>([])
+  const [bots, setBots] = useState<BotRow[]>([])
   const [prices, setPrices] = useState<Record<string, { price: number; dir: number }>>({})
   const [bootLine, setBootLine] = useState(0)
   const [connected, setConnected] = useState(false)
@@ -146,11 +148,21 @@ export default function OSPage() {
     if (h.ok) setHistory(h.positions.slice(0, 60))
   }, [])
 
+  const loadBots = useCallback(async () => {
+    try {
+      const d = await osGet<{ ok: boolean; bots: BotRow[] }>('/bots')
+      if (d.ok) setBots(d.bots)
+    } catch {
+      // autopilot endpoints need a kernel with the bot plugin - ignore until then
+    }
+  }, [])
+
   // initial load
   useEffect(() => {
     void loadAssets()
     void loadAccount()
     void loadPositions()
+    void loadBots()
     void osGet<{ ok: boolean; strategies: StrategyInfo[] }>('/strategies').then((d) => {
       if (d.ok) setStrategies(d.strategies)
     })
@@ -160,7 +172,13 @@ export default function OSPage() {
     void osGet<{ ok: boolean; alerts: AlertRow[] }>('/alerts').then((d) => {
       if (d.ok) setAlerts(d.alerts.slice(0, 40))
     })
-  }, [loadAssets, loadAccount, loadPositions])
+  }, [loadAssets, loadAccount, loadPositions, loadBots])
+
+  // bot fleet polling - keeps armed/P&L stats fresh without socket churn
+  useEffect(() => {
+    const t = setInterval(() => void loadBots(), 6000)
+    return () => clearInterval(t)
+  }, [loadBots])
 
   // fetch overlay series when overlays/asset/tf change
   const overlayKey = useMemo(
@@ -190,7 +208,6 @@ export default function OSPage() {
     return () => {
       cancelled = true
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [overlayKey, asset, tf])
 
   // asset/tf switch
@@ -229,6 +246,7 @@ export default function OSPage() {
     onPositionClosed: (p) => {
       void loadPositions()
       void loadAccount()
+      void loadBots()
       pushToast(p.position.pnl && p.position.pnl >= 0 ? 'success' : 'danger', `${p.position.asset} ${p.position.side} settled ${p.position.pnl && p.position.pnl >= 0 ? '+' : ''}$${(p.position.pnl ?? 0).toFixed(2)}`)
     },
     onAlert: (p) => {
@@ -384,9 +402,11 @@ export default function OSPage() {
               patterns={patterns}
               assets={assets}
               strategies={strategies}
+              bots={bots}
               price={livePrice}
               prices={prices}
               refreshPositions={loadPositions}
+              refreshBots={loadBots}
               onError={(m) => pushToast('danger', m)}
             />
           </div>
@@ -441,9 +461,11 @@ export default function OSPage() {
                     patterns={patterns}
                     assets={assets}
                     strategies={strategies}
+                    bots={bots}
                     price={livePrice}
                     prices={prices}
                     refreshPositions={loadPositions}
+                    refreshBots={loadBots}
                     onError={(m) => pushToast('danger', m)}
                   />
                 </div>
@@ -490,6 +512,12 @@ export default function OSPage() {
           </span>
           <span>{assets.length} instruments · {registry.length || 101} indicators · binary/turbo/digital/cfd</span>
           <span className="hidden sm:inline">markov · montecarlo · hurst · garch · 35 patterns · 10 strategies · 11 tfs</span>
+          {bots.some((b) => b.bot.enabled) && (
+            <span className="flex items-center gap-1 text-emerald-400">
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
+              autopilot: {bots.filter((b) => b.bot.enabled).length} armed
+            </span>
+        )}
         </div>
         <span className="hidden md:inline">unofficial · practice balance by default · not affiliated with IQ Option</span>
       </footer>
