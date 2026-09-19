@@ -694,6 +694,43 @@ export interface ScreenerStatus {
   uptimeSec: number
 }
 
+// ---------- OS mode (human-in-the-loop governor) ----------
+
+export type OsMode = 'human' | 'auto'
+
+export interface AutoTraderConfig {
+  enabled: boolean
+  tf: Timeframe
+  stake: number
+  minScore: number
+  minConfidence: number
+  direction: 'both' | 'call' | 'put'
+  maxOpen: number
+  cooldownSec: number
+  paceSec: number
+  dailyProfitTarget: number
+  dailyLossLimit: number
+}
+
+export interface OsModeStatus {
+  mode: OsMode
+  ts: number
+  reason: string
+  autotrader: {
+    config: AutoTraderConfig
+    trades: number
+    wins: number
+    losses: number
+    pnlToday: number
+    pnlTotal: number
+    openCount: number
+    lastTradeTs: number
+    lastAction?: string
+    lastRejection?: string
+    active: boolean
+  }
+}
+
 // ---------- REST client (direct to core via gateway port param) ----------
 
 const CORE_PORT = 3030

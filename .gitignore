@@ -68,3 +68,4 @@ mini-services/**/data/
 # runtime sqlite wal artifacts
 *.db-shm
 *.db-wal
+tool-results/

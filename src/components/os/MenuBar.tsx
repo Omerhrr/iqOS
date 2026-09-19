@@ -13,7 +13,7 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog'
 import { Switch } from '@/components/ui/switch'
-import type { AccountState, AssetRow, ChartType, RiskConfig, Timeframe } from '@/lib/os/client'
+import type { AccountState, AssetRow, ChartType, OsMode, RiskConfig, Timeframe } from '@/lib/os/client'
 import { CHART_TYPES, TIMEFRAMES, fmtClock, fmtMoney, fmtPct, osPost } from '@/lib/os/client'
 
 interface Props {
@@ -24,10 +24,12 @@ interface Props {
   registrySize: number
   account: AccountState | null
   risk: RiskConfig | null
+  mode: OsMode
   onSelectAsset: (a: string) => void
   onSelectTf: (t: Timeframe) => void
   onChartTypeChange: (t: ChartType) => void
   onOpenPicker: () => void
+  onModeChanged: (m: OsMode) => void
   onRiskChanged: (r: RiskConfig) => void
   onAccountChanged: (a: AccountState) => void
   onError: (m: string) => void
@@ -153,6 +155,9 @@ export default function MenuBar(props: Props) {
           </>
         )}
 
+        {/* operating mode: HUMAN <-> NO-HUMAN-IN-THE-LOOP */}
+        <ModeToggle mode={props.mode} onModeChanged={props.onModeChanged} onError={props.onError} />
+
         {/* kill switch */}
         <Button
           onClick={() => void toggleKill()}
@@ -178,6 +183,98 @@ function Metric({ label, value, cls }: { label: string; value: string; cls: stri
       <div className="text-[8px] uppercase tracking-[0.18em] text-[#4b5a72]">{label}</div>
       <div className={`mt-0.5 font-mono text-[12px] font-bold ${cls}`}>{value}</div>
     </div>
+  )
+}
+
+/** Global OS operating mode: HUMAN-IN-THE-LOOP vs NO-HUMAN-IN-THE-LOOP. */
+function ModeToggle({ mode, onModeChanged, onError }: { mode: OsMode; onModeChanged: (m: OsMode) => void; onError: (m: string) => void }) {
+  const [confirmOpen, setConfirmOpen] = useState(false)
+  const [busy, setBusy] = useState(false)
+
+  const setMode = async (next: OsMode) => {
+    setBusy(true)
+    try {
+      const res = await osPost<{ ok: boolean; mode: OsMode; changed: boolean }>('/mode_set', {
+        mode: next,
+        reason: next === 'auto' ? 'operator enabled no-human mode from the menu bar' : 'operator restored human mode from the menu bar',
+      })
+      if (res.ok) onModeChanged(res.mode)
+      else onError('Mode change rejected by the kernel')
+    } catch (err) {
+      onError((err as Error).message)
+    } finally {
+      setBusy(false)
+      setConfirmOpen(false)
+    }
+  }
+
+  const auto = mode === 'auto'
+
+  return (
+    <>
+      <div className="leading-none">
+        <div className="mb-1 text-center text-[8px] uppercase tracking-[0.18em] text-[#4b5a72]">mode</div>
+        <div
+          className={`flex h-8 overflow-hidden rounded border font-mono text-[9px] font-bold uppercase tracking-wider ${
+            auto ? 'border-amber-500/60' : 'border-cyan-500/40'
+          }`}
+          title={
+            auto
+              ? 'NO-HUMAN-IN-THE-LOOP: the OS trades autonomously (bots + auto-trader). Sentinel still governs every order.'
+              : 'HUMAN-IN-THE-LOOP: every trade needs you. Bot orders are suspended (configs preserved).'
+          }
+        >
+          <button
+            onClick={() => auto && !busy && void setMode('human')}
+            disabled={busy}
+            className={`px-2.5 transition-colors ${
+              !auto ? 'bg-cyan-500/20 text-cyan-200' : 'bg-[#0d1420] text-[#4b5a72] hover:text-[#aab6cc]'
+            }`}
+          >
+            Human
+          </button>
+          <button
+            onClick={() => !auto && !busy && setConfirmOpen(true)}
+            disabled={busy}
+            className={`px-2.5 transition-colors ${
+              auto ? 'animate-pulse bg-amber-500/25 text-amber-200' : 'bg-[#0d1420] text-[#4b5a72] hover:text-amber-300'
+            }`}
+          >
+            No-Human
+          </button>
+        </div>
+      </div>
+
+      {/* entering no-human mode is a deliberate operator action - confirm it */}
+      <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+        <DialogContent className="max-w-md border-amber-500/40 bg-[#0b111c] text-[#dbe4f0]">
+          <DialogHeader>
+            <DialogTitle className="text-[14px] tracking-wider text-amber-300">Enter NO-HUMAN-IN-THE-LOOP mode?</DialogTitle>
+            <DialogDescription className="text-[11px] leading-relaxed text-[#7c8aa5]">
+              The OS will trade autonomously - you confirm nothing:
+            </DialogDescription>
+          </DialogHeader>
+          <ul className="space-y-1.5 text-[11px] leading-relaxed text-[#aab6cc]">
+            <li>· Armed autopilot bots resume immediately (mode gate lifts).</li>
+            <li>· The built-in AUTO-TRADER takes the strongest screener signals on its own (binary, 1-bar expiry, fixed stake).</li>
+            <li>· Sentinel breakers, watchdog health holds and risk limits still govern EVERY order - autonomy, not exemption.</li>
+            <li>· PANIC or toggling back to HUMAN instantly suspends autonomy. Bot configs are preserved either way.</li>
+          </ul>
+          <div className="mt-1 flex justify-end gap-2">
+            <Button variant="outline" className="h-8 border-[#1c2739] px-3 text-[11px] text-[#7c8aa5]" onClick={() => setConfirmOpen(false)}>
+              Stay in HUMAN mode
+            </Button>
+            <Button
+              disabled={busy}
+              onClick={() => void setMode('auto')}
+              className="h-8 bg-amber-500 px-3 text-[11px] font-bold text-black hover:bg-amber-400"
+            >
+              {busy ? 'Switching…' : 'Enter NO-HUMAN mode'}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </>
   )
 }
 

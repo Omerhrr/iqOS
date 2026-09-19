@@ -116,6 +116,13 @@ export class Store {
         volume INTEGER NOT NULL,
         PRIMARY KEY (asset, tf, time)
       );
+      CREATE TABLE IF NOT EXISTS os_mode (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        mode TEXT NOT NULL,
+        reason TEXT,
+        ts INTEGER NOT NULL,
+        config TEXT
+      );
     `)
   }
 
@@ -402,6 +409,33 @@ export class Store {
     return this.db
       .query('SELECT ts, kind, message FROM risk_events ORDER BY id DESC LIMIT ?')
       .all(limit) as { ts: number; kind: string; message: string }[]
+  }
+
+  // ---------- os mode (human-in-the-loop governor) ----------
+
+  /** Persisted OS mode row: mode + last change reason + auto-trader config blob. */
+  getOsMode(): { mode: string; reason: string | null; ts: number; config: unknown } | null {
+    const row = this.db.query('SELECT mode, reason, ts, config FROM os_mode WHERE id = 1').get() as {
+      mode: string
+      reason: string | null
+      ts: number
+      config: string | null
+    } | null
+    if (!row) return null
+    let config: unknown = null
+    try {
+      config = row.config ? JSON.parse(row.config) : null
+    } catch {
+      config = null
+    }
+    return { mode: row.mode, reason: row.reason, ts: row.ts, config }
+  }
+
+  saveOsMode(mode: string, reason: string, ts: number, config: unknown): void {
+    this.db.run(
+      'INSERT INTO os_mode (id, mode, reason, ts, config) VALUES (1, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET mode = excluded.mode, reason = excluded.reason, ts = excluded.ts, config = excluded.config',
+      [mode, reason, ts, config === null ? null : JSON.stringify(config)]
+    )
   }
 
   // ---------- watchdog (strategy health) ----------

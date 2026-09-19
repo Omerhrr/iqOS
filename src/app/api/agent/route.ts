@@ -581,6 +581,38 @@ const TOOLS: ToolSpec[] = [
         ...(a.expectedWinRatePct !== undefined ? { expectedWinRatePct: Number(a.expectedWinRatePct) } : {}),
       }),
   },
+  // ---------- os mode: human-in-the-loop governor ----------
+  {
+    name: 'os_mode_status',
+    description: 'OS operating mode + built-in auto-trader stats. mode "human" = HUMAN-IN-THE-LOOP (bot orders suspended by the mode gate, only the user trades); mode "auto" = NO-HUMAN-IN-THE-LOOP (armed bots trade, auto-trader sources screener signals autonomously). Shows why/when the mode changed and the auto-trader live stats (trades, P&L, open, rejections).',
+    args: '{}',
+    run: () => coreGet('/mode'),
+  },
+  {
+    name: 'os_mode_set',
+    description: 'Switch the OS operating mode. "human" restores the human in the loop (suspends all bot/auto-trader orders instantly - safe, configs preserved). "auto" enters NO-HUMAN-IN-THE-LOOP: ONLY use when the user explicitly asks to enable it - the OS then trades autonomously without the user confirming anything (sentinel/watchdog/risk limits still govern every order).',
+    args: '{"mode": "auto"}',
+    run: (a) => corePost('/mode_set', { mode: String(a.mode ?? 'human') }),
+  },
+  {
+    name: 'autotrader_configure',
+    description: 'Tune the built-in AUTO-TRADER (the OS acting as its own trader in NO-HUMAN mode): enabled (bool), tf (signal timeframe), stake, minScore (min |composite score|), minConfidence (0-100), direction (both|call|put), maxOpen (concurrent), cooldownSec (per-asset), paceSec (between any two trades), dailyProfitTarget / dailyLossLimit (USD, 0=off). It trades 1-bar binary options on the strongest screener signals.',
+    args: '{"enabled": true, "tf": "1m", "stake": 10, "minScore": 60, "maxOpen": 3}',
+    run: (a) =>
+      corePost('/autotrader_config', {
+        ...(a.enabled !== undefined ? { enabled: Boolean(a.enabled) } : {}),
+        ...(a.tf !== undefined ? { tf: String(a.tf) } : {}),
+        ...(a.stake !== undefined ? { stake: Number(a.stake) } : {}),
+        ...(a.minScore !== undefined ? { minScore: Number(a.minScore) } : {}),
+        ...(a.minConfidence !== undefined ? { minConfidence: Number(a.minConfidence) } : {}),
+        ...(a.direction !== undefined ? { direction: String(a.direction) } : {}),
+        ...(a.maxOpen !== undefined ? { maxOpen: Number(a.maxOpen) } : {}),
+        ...(a.cooldownSec !== undefined ? { cooldownSec: Number(a.cooldownSec) } : {}),
+        ...(a.paceSec !== undefined ? { paceSec: Number(a.paceSec) } : {}),
+        ...(a.dailyProfitTarget !== undefined ? { dailyProfitTarget: Number(a.dailyProfitTarget) } : {}),
+        ...(a.dailyLossLimit !== undefined ? { dailyLossLimit: Number(a.dailyLossLimit) } : {}),
+      }),
+  },
   // ---------- archive: deep history ----------
   {
     name: 'archive_status',
@@ -707,7 +739,8 @@ const TOOLS: ToolSpec[] = [
 const TOOL_LIST_TEXT = TOOLS.map((t) => `- ${t.name}: ${t.description} args: ${t.args}`).join('\n')
 
 const SYSTEM_BASE = `You are the IQAIR//OS Copilot - an expert quantitative trading analyst embedded as the AI of a trading operating system built on the iqair IQ Option library.
-You can analyze markets (100+ technical indicators, 35 candlestick + chart patterns, Markov chains, Monte Carlo, Hurst exponent, GARCH volatility), DISCOVER setups with the market-wide screener (screener_scan ranks every instrument x timeframe by signal strength - start there when the user asks "what's moving" or "find setups"), place PAPER trades through the risk manager, deploy and manage AUTONOMOUS autopilot bots (bot_create / bot_toggle / bot_delete / autopilot_status - they trade every qualifying signal automatically under the global risk manager), set standing ALERT RULES that watch instruments and fire OS alerts (alert_rule_create / alert_rule_list / alert_rule_delete - use them when the user wants to be notified, e.g. "tell me when BTC RSI drops below 30"), review the realized trade journal (journal_stats), control the user's workspace (switch charts, timeframes, add indicators), and govern RISK through the sentinel layer (sentinel_status shows breakers/exposure/drawdown, sentinel_configure tunes portfolio limits, panic_close_all flattens everything, sentinel_ack resets tripped breakers), and guard LIVE STRATEGY HEALTH through the watchdog layer (watchdog_status shows each bot's rolling win rate vs its baseline and its escalation level - WATCH alerts, HOLD blocks the bot's orders, DISARMED stopped the bot; watchdog_ack resumes a held bot only when the user agrees, watchdog_configure tunes thresholds). If a bot order is rejected with a "watchdog:" reason, explain that the strategy is degrading vs its baseline - never suggest bypassing it; if a bot is on WATCH, surface the numbers and recommend re-validating with the research workflow. If a trade or bot order is rejected with a "sentinel:" reason, explain which limit or breaker fired - never suggest workarounds, limits are there to protect the account; resume only when the user explicitly accepts the risk.
+You can analyze markets (100+ technical indicators, 35 candlestick + chart patterns, Markov chains, Monte Carlo, Hurst exponent, GARCH volatility), DISCOVER setups with the market-wide screener (screener_scan ranks every instrument x timeframe by signal strength - start there when the user asks "what's moving" or "find setups"), place PAPER trades through the risk manager, deploy and manage AUTONOMOUS autopilot bots (bot_create / bot_toggle / bot_delete / autopilot_status - they trade every qualifying signal automatically under the global risk manager), set standing ALERT RULES that watch instruments and fire OS alerts (alert_rule_create / alert_rule_list / alert_rule_delete - use them when the user wants to be notified, e.g. "tell me when BTC RSI drops below 30"), review the realized trade journal (journal_stats), control the user's workspace (switch charts, timeframes, add indicators), govern RISK through the sentinel layer (sentinel_status shows breakers/exposure/drawdown, sentinel_configure tunes portfolio limits, panic_close_all flattens everything, sentinel_ack resets tripped breakers), and guard LIVE STRATEGY HEALTH through the watchdog layer (watchdog_status shows each bot's rolling win rate vs its baseline and its escalation level - WATCH alerts, HOLD blocks the bot's orders, DISARMED stopped the bot; watchdog_ack resumes a held bot only when the user agrees, watchdog_configure tunes thresholds).
+The OS runs in a global OPERATING MODE (os_mode_status / os_mode_set / autotrader_configure): "human" = HUMAN-IN-THE-LOOP, every trade needs the user and bot orders are suspended by the mode gate (configs preserved); "auto" = NO-HUMAN-IN-THE-LOOP, the OS trades autonomously - armed bots run and the built-in AUTO-TRADER takes the strongest screener signals on its own. NEVER set mode to "auto" unless the user explicitly asks for it ("no human", "autonomous", "let it trade by itself") - entering no-human mode without an explicit request is a hard violation. When a bot order is rejected with a "mode-gate:" reason, explain that the OS is in HUMAN mode and autonomy is suspended by design. If a bot order is rejected with a "watchdog:" reason, explain that the strategy is degrading vs its baseline - never suggest bypassing it; if a bot is on WATCH, surface the numbers and recommend re-validating with the research workflow. If a trade or bot order is rejected with a "sentinel:" reason, explain which limit or breaker fired - never suggest workarounds, limits are there to protect the account; resume only when the user explicitly accepts the risk.
 
 Tool protocol - follow it EXACTLY:
 - Respond with ONE JSON object and nothing else. No markdown fences, no prose outside the JSON.

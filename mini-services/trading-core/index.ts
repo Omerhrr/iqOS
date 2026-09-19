@@ -7,6 +7,7 @@ import { createServer } from 'http'
 import { Server } from 'socket.io'
 import { Kernel } from './src/kernel'
 import { storePlugin } from './src/plugins/store'
+import { osModePlugin, ModeService, type OsMode } from './src/plugins/os-mode'
 import { marketDataPlugin, MarketDataService } from './src/plugins/market-data'
 import { analyticsPlugin, AnalyticsService } from './src/plugins/analytics'
 import { executionPlugin, ExecutionService, type RiskConfig } from './src/plugins/execution'
@@ -25,6 +26,7 @@ const PORT = 3030
 
 const kernel = new Kernel()
 kernel.register(storePlugin)
+kernel.register(osModePlugin)
 kernel.register(marketDataPlugin)
 kernel.register(analyticsPlugin)
 kernel.register(executionPlugin)
@@ -74,6 +76,11 @@ const httpServer = createServer(async (req, res) => {
 
     if (req.method === 'GET') {
       if (path === '/health') return json(200, { ok: true, service: 'trading-core', uptime: process.uptime() })
+
+      if (path === '/mode') {
+        const mode = kernel.context().use<ModeService>('mode')
+        return json(200, { ok: true, ...mode.status() })
+      }
 
       if (path === '/assets') return json(200, { ok: true, assets: market.listAssets(), mode: market.mode, activeAsset: market.activeAsset })
 
@@ -494,6 +501,21 @@ const httpServer = createServer(async (req, res) => {
       if (path === '/kill_switch') {
         const out = exec.setKillSwitch(Boolean(body.on))
         return json(200, { ok: true, account: out })
+      }
+
+      // ---------- os mode control ----------
+
+      if (path === '/mode_set') {
+        const mode = kernel.context().use<ModeService>('mode')
+        const next = String(body.mode ?? '') as OsMode
+        if (next !== 'human' && next !== 'auto') return json(400, { ok: false, error: "mode must be 'human' or 'auto'" })
+        const reason = body.reason !== undefined ? String(body.reason) : undefined
+        return json(200, mode.setMode(next, reason))
+      }
+
+      if (path === '/autotrader_config') {
+        const mode = kernel.context().use<ModeService>('mode')
+        return json(200, mode.configure(body as Record<string, never>))
       }
 
       if (path === '/risk') {

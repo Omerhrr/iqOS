@@ -310,6 +310,13 @@ export class SentinelService {
       // execution not available
     }
     const botsDisarmed = this.disarmAllBots()
+    // PANIC means the human took over - drop the OS back to HUMAN-IN-THE-LOOP
+    try {
+      const mode = this.ctx.use<{ forceHuman: (reason: string) => void }>('mode')
+      mode.forceHuman('panic - operator took control')
+    } catch {
+      // mode plugin not loaded
+    }
     this.event(
       'panic',
       `PANIC executed: ${closed} position${closed === 1 ? '' : 's'} closed, ${failed} failed, ${botsDisarmed} bot${botsDisarmed === 1 ? '' : 's'} disarmed${opts.killSwitch ? ', kill switch ENGAGED' : ''}`,

@@ -27,6 +27,7 @@ import type {
   Candle,
   ChartType,
   IndicatorSeries,
+  OsMode,
   Position,
   RegistryEntry,
   RiskConfig,
@@ -205,6 +206,20 @@ export default function OSPage() {
         .catch(() => setArchiveBars(0))
     poll()
     const t = setInterval(poll, 30000)
+    return () => clearInterval(t)
+  }, [])
+
+  // os mode polling - feeds the menu-bar toggle + the autonomy chip in the status bar
+  const [osMode, setOsMode] = useState<OsMode>('human')
+  useEffect(() => {
+    const poll = () =>
+      void osGet<{ ok: boolean; mode: OsMode }>('/mode')
+        .then((d) => {
+          if (d.ok) setOsMode(d.mode)
+        })
+        .catch(() => {})
+    poll()
+    const t = setInterval(poll, 5000)
     return () => clearInterval(t)
   }, [])
 
@@ -446,10 +461,12 @@ export default function OSPage() {
         registrySize={registry.length}
         account={account}
         risk={risk}
+        mode={osMode}
         onSelectAsset={handleSelectAsset}
         onSelectTf={setTf}
         onChartTypeChange={setChartType}
         onOpenPicker={() => setPickerOpen(true)}
+        onModeChanged={setOsMode}
         onRiskChanged={setRisk}
         onAccountChanged={setAccount}
         onError={(m) => pushToast('danger', m)}
@@ -485,6 +502,7 @@ export default function OSPage() {
               bots={bots}
               price={livePrice}
               prices={prices}
+              mode={osMode}
               refreshPositions={loadPositions}
               refreshBots={loadBots}
               refreshAccount={loadAccount}
@@ -546,6 +564,7 @@ export default function OSPage() {
                     bots={bots}
                     price={livePrice}
                     prices={prices}
+                    mode={osMode}
                     refreshPositions={loadPositions}
                     refreshBots={loadBots}
                     refreshAccount={loadAccount}
@@ -602,6 +621,17 @@ export default function OSPage() {
               autopilot: {bots.filter((b) => b.bot.enabled).length} armed
             </span>
         )}
+          {osMode === 'auto' ? (
+            <span className="flex items-center gap-1 animate-pulse font-bold text-amber-400">
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400" />
+              no-human mode: OS trading autonomously
+            </span>
+          ) : (
+            <span className="flex items-center gap-1 text-cyan-500">
+              <span className="h-1.5 w-1.5 rounded-full bg-cyan-600" />
+              human-in-the-loop
+            </span>
+          )}
           {screenerLive > 0 && (
             <span className="flex items-center gap-1 text-cyan-400">
               <span className="h-1.5 w-1.5 rounded-full bg-cyan-400" />

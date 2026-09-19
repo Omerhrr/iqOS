@@ -602,7 +602,7 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
         <h3 className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">
           <span className={`h-1.5 w-1.5 rounded-full ${busy ? 'animate-pulse bg-cyan-400 shadow-[0_0_6px_#22d3ee]' : 'bg-cyan-400 shadow-[0_0_6px_#22d3ee]'}`} />
           OS Copilot
-          <span className="rounded bg-[#101828] px-1 py-0.5 text-[8px] font-mono tracking-normal text-cyan-400">v2 · 43 tools</span>
+          <span className="rounded bg-[#101828] px-1 py-0.5 text-[8px] font-mono tracking-normal text-cyan-400">v2 · 46 tools</span>
         </h3>
         <div className="flex items-center gap-1">
           <button

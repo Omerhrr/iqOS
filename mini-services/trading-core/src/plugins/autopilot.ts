@@ -237,6 +237,16 @@ export class AutopilotService {
       return this.reject(bot, 'cooldown between trades')
     }
 
+    // mode gate: HUMAN-IN-THE-LOOP suspends bot autonomy (non-destructive -
+    // configs and arm states are preserved, only execution is gated)
+    try {
+      const mode = this.ctx.use<{ gate: (origin: 'bot' | 'auto') => { ok: boolean; reason?: string } }>('mode')
+      const m = mode.gate('bot')
+      if (!m.ok) return this.reject(bot, m.reason ?? 'mode gate hold')
+    } catch {
+      // mode plugin not loaded - gate disabled
+    }
+
     // watchdog gate: strategy-health ladder (WATCH informs, HOLD blocks for a
     // window, DISARMED blocks until an operator acks + re-arms the bot)
     try {

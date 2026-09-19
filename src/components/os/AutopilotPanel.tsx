@@ -19,13 +19,14 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import type { AssetRow, BotConfig, BotRow, StrategyInfo, Timeframe, TradeKind } from '@/lib/os/client'
+import type { AssetRow, BotConfig, BotRow, OsMode, StrategyInfo, Timeframe, TradeKind } from '@/lib/os/client'
 import { KIND_LABEL, TIMEFRAMES, fmtMoney, fmtTime, osPost } from '@/lib/os/client'
 
 interface AutopilotPanelProps {
   bots: BotRow[]
   assets: AssetRow[]
   strategies: StrategyInfo[]
+  mode: OsMode
   onChanged: () => void
   onError: (m: string) => void
 }
@@ -49,7 +50,7 @@ const emptyDraft = (): BotConfig => ({
   dailyLossLimit: 0,
 })
 
-export default function AutopilotPanel({ bots, assets, strategies, onChanged, onError }: AutopilotPanelProps) {
+export default function AutopilotPanel({ bots, assets, strategies, mode, onChanged, onError }: AutopilotPanelProps) {
   const [editorOpen, setEditorOpen] = useState(false)
   const [draft, setDraft] = useState<BotConfig>(emptyDraft())
   const [busy, setBusy] = useState(false)
@@ -122,6 +123,16 @@ export default function AutopilotPanel({ bots, assets, strategies, onChanged, on
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-2 rounded-lg border border-[#1c2739] bg-[#0b111c] p-2.5">
+      {/* mode gate banner - HUMAN mode suspends bot autonomy */}
+      {mode === 'human' && (
+        <div className="flex shrink-0 items-center justify-between gap-2 rounded border border-cyan-500/30 bg-cyan-500/5 px-2.5 py-1.5">
+          <p className="text-[10px] leading-snug text-[#7c8aa5]">
+            <span className="font-bold uppercase tracking-wider text-cyan-300">Human-in-the-loop:</span> bot orders are
+            suspended by the mode gate. Switch the OS to <span className="text-amber-300">NO-HUMAN</span> mode (menu bar) to
+            run autonomy.
+          </p>
+        </div>
+      )}
       {/* header */}
       <div className="flex shrink-0 items-center justify-between">
         <h3 className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">
