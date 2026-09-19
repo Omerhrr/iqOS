@@ -83,10 +83,44 @@ function AcfStrip({ analysis }: { analysis: AnalysisResult }) {
   )
 }
 
+// stretch history: z of price vs the OU equilibrium, ±2σ guides positioned
+// dynamically so the bars and the guide lines share one scale
+function OuZStrip({ z }: { z: (number | null)[] }) {
+  const vals = z.filter((v): v is number => v !== null && Number.isFinite(v))
+  if (vals.length < 5) return null
+  const max = Math.max(2.5, ...vals.map((v) => Math.abs(v)))
+  const guidePct = (2 / max) * 45 // ±2σ offset from the center line, in % of half-height
+  return (
+    <div className="relative flex h-10 items-center gap-[2px]">
+      <div className="absolute left-0 top-1/2 h-px w-full bg-[#1c2739]" />
+      <div className="absolute left-0 w-full border-t border-dashed border-[#2a3a52]" style={{ top: `${50 - guidePct}%` }} />
+      <div className="absolute left-0 w-full border-t border-dashed border-[#2a3a52]" style={{ top: `${50 + guidePct}%` }} />
+      {z.map((v, i) =>
+        v === null || !Number.isFinite(v) ? (
+          <div key={i} className="h-full flex-1" />
+        ) : (
+          <div
+            key={i}
+            className="absolute left-1/2 w-[3px] -translate-x-1/2 rounded-sm"
+            style={{
+              left: `${((i + 0.5) / z.length) * 100}%`,
+              background: Math.abs(v) > 2 ? '#f59e0b' : Math.abs(v) > 1.2 ? '#a78bfa' : '#2a3a52',
+              height: `${(Math.abs(v) / max) * 45}%`,
+              bottom: v >= 0 ? '50%' : undefined,
+              top: v < 0 ? '50%' : undefined,
+            }}
+          />
+        )
+      )}
+    </div>
+  )
+}
+
 export default function QuantPanel({ analysis }: { analysis: AnalysisResult | null }) {
   if (!analysis) return null
   const q = analysis.quant
   const mc = analysis.montecarlo
+  const ou = analysis.kalman
   const hurstColor = q.hurst > 0.58 ? '#10b981' : q.hurst < 0.42 ? '#f59e0b' : '#aab6cc'
 
   return (
@@ -140,6 +174,62 @@ export default function QuantPanel({ analysis }: { analysis: AnalysisResult | nu
           <AcfStrip analysis={analysis} />
         </div>
       </div>
+
+      {ou && (
+        <div className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-3 xl:col-span-2">
+          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">Kalman · Ornstein-Uhlenbeck Mean Reversion</h3>
+            <div className="flex items-center gap-1.5 font-mono text-[9px] uppercase tracking-wider">
+              <span
+                className="rounded px-1.5 py-0.5"
+                style={{
+                  color: ou.meanReverting ? '#10b981' : '#aab6cc',
+                  background: ou.meanReverting ? 'rgba(16,185,129,0.1)' : 'rgba(148,163,184,0.08)',
+                }}
+              >
+                {ou.meanReverting ? 'mean-reverting' : 'trending · OU edge off'}
+              </span>
+              {ou.signal !== 'none' && (
+                <span
+                  className="rounded px-1.5 py-0.5"
+                  style={{
+                    color: ou.signal === 'call' ? '#10b981' : '#f43f5e',
+                    background: ou.signal === 'call' ? 'rgba(16,185,129,0.12)' : 'rgba(244,63,94,0.12)',
+                  }}
+                >
+                  {ou.signal === 'call' ? '▲ call edge' : '▼ put edge'}
+                </span>
+              )}
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 font-mono text-[11px] md:grid-cols-4">
+            <Stat
+              label="Stretch z (price vs θ)"
+              value={ou.z.toFixed(2)}
+              color={Math.abs(ou.z) > 2 ? '#f59e0b' : Math.abs(ou.z) > 1.2 ? '#a78bfa' : '#e2e8f0'}
+              note={ou.state !== 'neutral' ? ou.state.replace('-', ' ') : 'inside ±1.5σ'}
+            />
+            <Stat label="Half-life" value={`${ou.halfLifeBars >= 9999 ? '∞' : ou.halfLifeBars.toFixed(1)} bars`} note={`entry gate: fast enough to revert in-bar`} />
+            <Stat label="κ reversion speed" value={ou.kappa.toFixed(4)} note="per bar" />
+            <Stat label="θ equilibrium" value={fmtPrice(ou.theta, analysis.asset)} note="OU long-run mean" />
+            <Stat label="σ stationary" value={ou.sigmaEq.toExponential(2)} note="typical deviation from θ" />
+            <Stat label="φ persistence" value={ou.phi.toFixed(4)} note={`R² ${ou.r2.toFixed(3)}`} />
+            <Stat label="Reversion t-stat" value={ou.tStat.toFixed(2)} color={ou.tStat >= 1.5 ? '#10b981' : '#aab6cc'} note="≥ 1.5 = significant" />
+            <Stat label="Kalman innov. z" value={ou.innovationZ.toFixed(2)} note="last standardized surprise" />
+          </div>
+          <div className="mt-2 border-t border-[#1c2739] pt-2">
+            <div className="mb-1 flex justify-between text-[10px] text-[#4b5a72]">
+              <span>stretch history (z, last {ou.zSeries.length} bars)</span>
+              <span>dashed = ±2σ</span>
+            </div>
+            <OuZStrip z={ou.zSeries} />
+          </div>
+          <p className="mt-1.5 text-[10px] leading-relaxed text-[#4b5a72]">
+            {ou.note} · window {ou.window} bars · the Kalman filter runs the OU drift as its state equation, so the fair-value line anticipates pullback toward θ
+            {ou.signal !== 'none' && (ou.signal === 'call' ? ' · stretched below equilibrium favors CALLS' : ' · stretched above equilibrium favors PUTS')}
+          </p>
+        </div>
+      )}
 
       <div className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-3 xl:col-span-2">
         <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">Support / Resistance Zones</h3>

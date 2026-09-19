@@ -198,6 +198,29 @@ export interface SRZone {
   strength: number
 }
 
+// Kalman filter + Ornstein-Uhlenbeck mean reversion (mirrors kernel types)
+export interface KalmanOUResult {
+  theta: number // long-run equilibrium level
+  phi: number // per-bar persistence e^-kappa
+  kappa: number // mean-reversion speed per bar
+  sigmaEps: number // AR(1) innovation std
+  sigmaEq: number // stationary std
+  halfLifeBars: number // ln(2)/kappa, 9999 = effectively no reversion
+  r2: number
+  tStat: number // significance of reversion
+  sample: number
+  z: number // (price - theta) / sigma_eq
+  meanReverting: boolean
+  state: 'stretched-below' | 'stretched-above' | 'neutral'
+  signal: 'call' | 'put' | 'none'
+  score: number
+  note: string
+  window: number
+  zMult: number
+  innovationZ: number
+  zSeries: (number | null)[]
+}
+
 export interface IndicatorSnapshot {
   rsi: number
   stochK: number
@@ -256,6 +279,7 @@ export interface AnalysisResult {
   markov: MarkovResult
   montecarlo: MonteCarloResult
   quant: QuantStats
+  kalman: KalmanOUResult
   srZones: SRZone[]
   signal: CompositeSignal
 }

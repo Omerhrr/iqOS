@@ -40,7 +40,7 @@ import { osGet, osPost, useOSFeed } from '@/lib/os/client'
 const BOOT_MSGS = [
   'mounting kernel plugins…',
   'universe: 115 instruments online (forex · otc · crypto · commodities · stocks · indices)',
-  'registry: 101 indicators · 35 candlestick + chart patterns armed',
+  'registry: 103 indicators · 35 candlestick + chart patterns armed',
   'analytics: markov + montecarlo engines fitted',
   'execution: binary · turbo · digital · cfd broker + risk manager ready',
   'sentinel: circuit breakers armed · exposure caps · trade throttle',
@@ -624,8 +624,8 @@ export default function OSPage() {
             <span className={`h-1.5 w-1.5 rounded-full ${connected ? 'bg-emerald-400' : 'bg-rose-500 animate-pulse'}`} />
             kernel :3030 {connected ? 'streaming' : 'reconnecting…'}
           </span>
-          <span>{assets.length} instruments · {registry.length || 101} indicators · binary/turbo/digital/cfd</span>
-          <span className="hidden sm:inline">markov · montecarlo · hurst · garch · 35 patterns · 10 strategies · 11 tfs</span>
+          <span>{assets.length} instruments · {registry.length || 103} indicators · binary/turbo/digital/cfd</span>
+          <span className="hidden sm:inline">markov · montecarlo · hurst · garch · kalman-ou · 35 patterns · 11 strategies · 11 tfs</span>
           {bots.some((b) => b.bot.enabled) && (
             <span className="flex items-center gap-1 text-emerald-400">
               <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />

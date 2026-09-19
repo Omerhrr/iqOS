@@ -6,6 +6,7 @@
 
 import type { Candle, IndicatorDef, IndicatorOutput } from '../types'
 import * as TA from './indicators'
+import * as OU from './kalman'
 
 const isn = TA.isn
 
@@ -664,7 +665,7 @@ const trend: IndicatorDef[] = [
     description: 'ADX trend strength with +DI/-DI direction lines.',
     compute: (c, par) => {
       const a = TA.adx(TA.highs(c), TA.lows(c), TA.closes(c), num(c, par, 'period', 14))
-      return { lines: [line('adx', C.white ?? '#e2e8f0', a.adx, 'solid', 2), line('+di', C.green, a.plusDI), line('-di', C.red, a.minusDI)], levels: [25] }
+      return { lines: [line('adx', '#e2e8f0', a.adx, 'solid', 2), line('+di', C.green, a.plusDI), line('-di', C.red, a.minusDI)], levels: [25] }
     },
   },
   {
@@ -902,6 +903,32 @@ const statistic: IndicatorDef[] = [
       lines: [line('corr', C.yellow, TA.correlation(TA.closes(c), c.map((k) => k.volume), num(c, par, 'period', 20)))],
       bands: [-1, 1], levels: [0],
     }),
+  },
+  {
+    id: 'kalman-ou', name: 'Kalman OU Bands', category: 'statistic', pane: 'overlay',
+    params: [p('window', 'Estimation window', 60, 500, 240), p('k', 'Band σ mult', 1, 3.5, 2, 0.1)],
+    description: 'Ornstein-Uhlenbeck model with a Kalman filter: fair-value estimate, rolling equilibrium θ and θ ± kσ reversion bands.',
+    compute: (c, par) => {
+      const s = OU.ouSeries(c, num(c, par, 'window', 240), num(c, par, 'k', 2), 0.5)
+      return {
+        lines: [
+          line('ou-upper', C.slate, s.upper, 'dashed'),
+          line('ou-lower', C.slate, s.lower, 'dashed'),
+          line('ou-theta', C.violet, s.theta, 'dashed'),
+          line('kalman', C.cyan, s.filtered, 'solid', 2),
+        ],
+        note: 'cyan = Kalman fair value · violet = OU equilibrium θ · grey = θ ± kσ reversion bands',
+      }
+    },
+  },
+  {
+    id: 'kalman-ou-z', name: 'Kalman OU Z', category: 'statistic', pane: 'sub',
+    params: [p('window', 'Estimation window', 60, 500, 240)],
+    description: 'Standardized stretch of price from the OU equilibrium: z = (price - θ)/σ_eq. Beyond ±2σ = stretched.',
+    compute: (c, par) => {
+      const s = OU.ouSeries(c, num(c, par, 'window', 240), 2, 0.5)
+      return { lines: [line('z', C.violet, s.z)], levels: [-2, 0, 2], bands: [-3, 3] }
+    },
   },
 ]
 

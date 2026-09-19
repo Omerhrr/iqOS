@@ -254,6 +254,49 @@ export interface SRZone {
   strength: number // 0..1
 }
 
+// ---------- Kalman filter + Ornstein-Uhlenbeck mean reversion ----------
+
+/** OLS fit of the discretized OU process (an AR(1)) over a rolling window. */
+export interface OUParams {
+  theta: number // long-run equilibrium level the process reverts to
+  phi: number // per-bar persistence e^{-kappa}
+  kappa: number // mean-reversion speed per bar
+  sigmaEps: number // AR(1) innovation std (price units)
+  sigmaEq: number // stationary std: sigma_eps / sqrt(1 - phi^2)
+  halfLifeBars: number // ln(2)/kappa, capped at 9999 (JSON-safe)
+  r2: number // AR(1) regression fit quality
+  tStat: number // significance of reversion: (1 - b)/se(b)
+  sample: number // pairs used in the fit
+}
+
+/** Live OU state for one bar (cheap path used by the screener). */
+export interface OULive extends OUParams {
+  z: number // (price - theta) / sigma_eq
+  meanReverting: boolean
+  state: 'stretched-below' | 'stretched-above' | 'neutral'
+  signal: 'call' | 'put' | 'none'
+  score: number
+  note: string
+}
+
+/** Per-bar OU + Kalman series, full-length and NaN before warmup. */
+export interface OUSeries {
+  filtered: number[] // Kalman fair-value estimate of the latent level
+  theta: number[] // rolling OU equilibrium
+  upper: number[] // theta + zMult * sigma_eq
+  lower: number[] // theta - zMult * sigma_eq
+  z: number[] // stretch of price from theta in stationary sigmas
+  innovationZ: number[] // standardized Kalman innovations
+}
+
+/** Full model output: live state + filter series for the UI. */
+export interface KalmanOUResult extends OULive {
+  window: number
+  zMult: number
+  innovationZ: number // last standardized Kalman innovation
+  zSeries: (number | null)[] // stretch history (last 240 bars)
+}
+
 export interface AnalysisResult {
   asset: string
   tf: Timeframe
@@ -276,6 +319,7 @@ export interface AnalysisResult {
   markov: MarkovResult
   montecarlo: MonteCarloResult
   quant: QuantStats
+  kalman: KalmanOUResult
   srZones: SRZone[]
   signal: CompositeSignal
 }

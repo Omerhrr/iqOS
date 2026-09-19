@@ -10,12 +10,15 @@ import type {
   Factor,
   IndicatorSnapshot,
   MarkovResult,
+  OULive,
   PatternHit,
   QuantStats,
   Timeframe,
 } from '../types'
 import * as ta from './indicators'
 import { detectPatterns, patternBias } from './patterns'
+import { ouKalman, ouState } from './kalman'
+import { registrySize } from './registry'
 import {
   autocorrelation,
   ewmaVol,
@@ -143,7 +146,8 @@ function buildFactors(
   ind: IndicatorSnapshot,
   quant: QuantStats,
   markov: ReturnType<typeof markovChain>,
-  pBias: number
+  pBias: number,
+  ou: OULive
 ): Factor[] {
   const price = candles[candles.length - 1].close
   const factors: Factor[] = []
@@ -262,6 +266,18 @@ function buildFactors(
     note: quant.hurstNote,
   })
   factors.push({
+    name: 'Kalman/OU Stretch',
+    group: 'statistical',
+    value: ou.z,
+    // fade the stretch only when the OU fit says the series actually reverts;
+    // price below equilibrium (z<0) votes CALL, above votes PUT
+    vote: ou.meanReverting ? clamp(-ou.z / 1.8, -1.5, 1.5) : 0,
+    weight: 10,
+    note: ou.meanReverting
+      ? `z ${ou.z.toFixed(2)} vs OU mean · half-life ${ou.halfLifeBars >= 9999 ? '∞' : ou.halfLifeBars.toFixed(0)} bars`
+      : `no reversion edge (t ${ou.tStat.toFixed(1)})`,
+  })
+  factors.push({
     name: 'Pattern Bias',
     group: 'patterns',
     value: pBias,
@@ -281,9 +297,10 @@ export function compositeSignal(
   markov: ReturnType<typeof markovChain>,
   quant: QuantStats,
   ind: IndicatorSnapshot,
-  pBias: number
+  pBias: number,
+  ou: OULive
 ): CompositeSignal {
-  const factors = buildFactors(candles, ind, quant, markov, pBias)
+  const factors = buildFactors(candles, ind, quant, markov, pBias, ou)
   const totalWeight = factors.reduce((a, f) => a + f.weight, 0)
   const raw = factors.reduce((a, f) => a + f.vote * f.weight, 0)
   const score = clamp((raw / (totalWeight * 2)) * 100, -100, 100)
@@ -322,9 +339,10 @@ export function analyze(candles: Candle[], asset: string, tf: Timeframe): Analys
   const ind = snapshot(candles)
   const quant = quantStats(candles)
   const markov = markovChain(c, { lookback: 500 })
+  const kalman = ouKalman(candles)
   const patterns = detectPatterns(candles, 8)
   const pBias = patternBias(patterns)
-  const signal = compositeSignal(candles, asset, tf, markov, quant, ind, pBias)
+  const signal = compositeSignal(candles, asset, tf, markov, quant, ind, pBias, kalman)
   const stTrend = ta.supertrend(h, l, c, 10, 3)
   const mc = monteCarlo(c, { nSims: 1500, horizon: 30, samplePaths: 20 })
   const price = c[c.length - 1]
@@ -356,9 +374,10 @@ export function analyze(candles: Candle[], asset: string, tf: Timeframe): Analys
     markov,
     montecarlo: mc,
     quant,
+    kalman,
     srZones: supportResistance(candles, 240),
     signal,
-    registrySize: 101,
+    registrySize: registrySize(),
   }
 }
 
@@ -393,9 +412,10 @@ export function scanSnapshot(
   const ind = snapshot(candles)
   const quant = quantStats(candles)
   const markov = markovChain(c, { lookback: 500 })
+  const ou = ouState(c, 240) // cheap path: no filter, no series
   const patterns = detectPatterns(candles, 8)
   const pBias = patternBias(patterns)
-  const signal = compositeSignal(candles, asset, tf, markov, quant, ind, pBias)
+  const signal = compositeSignal(candles, asset, tf, markov, quant, ind, pBias, ou)
   const refIdx = Math.max(0, c.length - 25)
   const price = c[c.length - 1]
   const top = patterns.find((p) => p.direction !== 'neutral') ?? patterns[0]

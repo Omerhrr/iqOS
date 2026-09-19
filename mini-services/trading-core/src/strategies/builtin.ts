@@ -5,6 +5,7 @@ import type { StrategyDef } from '../types'
 import * as ta from '../analytics/indicators'
 import { markovChain } from '../analytics/quant'
 import { detectPatterns, patternBias } from '../analytics/patterns'
+import { ouState } from '../analytics/kalman'
 
 const last = (arr: number[]): number => {
   for (let i = arr.length - 1; i >= 0; i--) if (Number.isFinite(arr[i])) return arr[i]
@@ -192,6 +193,31 @@ export const STRATEGIES: StrategyDef[] = [
       if (bias >= min) return { direction: 'call', score: clamp(50 + bias * 8, 40, 92), notes: `Bullish: ${names.join(', ') || '-'}` }
       if (bias <= -min) return { direction: 'put', score: clamp(50 + Math.abs(bias) * 8, 40, 92), notes: `Bearish: ${names.join(', ') || '-'}` }
       return { direction: 'none', score: clamp(bias * 10, -30, 30), notes: `Bias ${bias.toFixed(1)} below threshold` }
+    },
+  },
+  {
+    id: 'kalman-ou-reversion',
+    name: 'Kalman OU Reversion',
+    description: 'Kalman-filtered Ornstein-Uhlenbeck model: CALL when price stretches below the estimated equilibrium, PUT above - gated by reversion significance (t-stat) and a tradeable half-life.',
+    params: [
+      { key: 'window', label: 'Estimation window', type: 'number', min: 60, max: 500, default: 240 },
+      { key: 'zEntry', label: 'Z entry threshold', type: 'number', min: 1, max: 3.5, step: 0.1, default: 1.8 },
+      { key: 'maxHalfLife', label: 'Max half-life (bars)', type: 'number', min: 5, max: 200, default: 60 },
+    ],
+    evaluate: (candles, p) => {
+      const ou = ouState(candles.map((c) => c.close), num(p, 'window', 240))
+      const ze = num(p, 'zEntry', 1.8)
+      const hl = ou.halfLifeBars >= 9999 ? '∞' : ou.halfLifeBars.toFixed(0)
+      if (!ou.meanReverting) {
+        return { direction: 'none', score: 0, notes: `OU: not mean-reverting (t ${ou.tStat.toFixed(1)}, HL ${hl}b)` }
+      }
+      if (ou.halfLifeBars > num(p, 'maxHalfLife', 60)) {
+        return { direction: 'none', score: 0, notes: `OU: half-life ${hl}b exceeds cap · z ${ou.z.toFixed(2)}` }
+      }
+      const score = clamp(45 + (Math.abs(ou.z) - ze) * 20 + Math.min(18, Math.max(0, ou.tStat) * 3), 42, 95)
+      if (ou.z <= -ze) return { direction: 'call', score, notes: `z ${ou.z.toFixed(2)}σ below OU mean · HL ${hl}b · κ ${ou.kappa.toFixed(3)}` }
+      if (ou.z >= ze) return { direction: 'put', score, notes: `z ${ou.z.toFixed(2)}σ above OU mean · HL ${hl}b · κ ${ou.kappa.toFixed(3)}` }
+      return { direction: 'none', score: 0, notes: `z ${ou.z.toFixed(2)} inside ±${ze}σ · HL ${hl}b` }
     },
   },
   {
