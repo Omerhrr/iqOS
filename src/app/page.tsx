@@ -75,6 +75,7 @@ export default function OSPage() {
   const [alerts, setAlerts] = useState<AlertRow[]>([])
   const [strategies, setStrategies] = useState<StrategyInfo[]>([])
   const [bots, setBots] = useState<BotRow[]>([])
+  const [screenerLive, setScreenerLive] = useState(0)
   const [prices, setPrices] = useState<Record<string, { price: number; dir: number }>>({})
   const [bootLine, setBootLine] = useState(0)
   const [connected, setConnected] = useState(false)
@@ -93,6 +94,18 @@ export default function OSPage() {
     else if (level === 'warn') toast.warning(message)
     else toast.message(message)
   }, [])
+
+  // kernel keeper: make sure trading-core is alive (spawns it via the server
+  // if the port is dark) - called on boot and whenever the feed reconnects
+  const ensureKernel = useCallback(async () => {
+    try {
+      const res = await fetch('/api/kernel', { cache: 'no-store' })
+      const d = (await res.json()) as { ok: boolean; kernel?: string }
+      if (!d.ok && d.kernel === 'spawn-failed') pushToast('danger', 'Kernel keeper could not start trading-core on :3030')
+    } catch {
+      /* keeper route unreachable - keep booting anyway */
+    }
+  }, [pushToast])
 
   // boot sequence animation
   useEffect(() => {
@@ -159,6 +172,7 @@ export default function OSPage() {
 
   // initial load
   useEffect(() => {
+    void ensureKernel()
     void loadAssets()
     void loadAccount()
     void loadPositions()
@@ -172,13 +186,31 @@ export default function OSPage() {
     void osGet<{ ok: boolean; alerts: AlertRow[] }>('/alerts').then((d) => {
       if (d.ok) setAlerts(d.alerts.slice(0, 40))
     })
-  }, [loadAssets, loadAccount, loadPositions, loadBots])
+  }, [loadAssets, loadAccount, loadPositions, loadBots, ensureKernel])
+
+  // if the feed stays dark, give the keeper a chance to revive the kernel
+  useEffect(() => {
+    if (connected) return
+    const t = setTimeout(() => void ensureKernel(), 3000)
+    return () => clearTimeout(t)
+  }, [connected, ensureKernel])
 
   // bot fleet polling - keeps armed/P&L stats fresh without socket churn
   useEffect(() => {
     const t = setInterval(() => void loadBots(), 6000)
     return () => clearInterval(t)
   }, [loadBots])
+
+  // screener status polling - feeds the discovery chip in the status bar
+  useEffect(() => {
+    const poll = () =>
+      void osGet<{ ok: boolean; status: { pairs: number } }>('/screener_status')
+        .then((d) => setScreenerLive(d.ok ? d.status.pairs : 0))
+        .catch(() => setScreenerLive(0))
+    poll()
+    const t = setInterval(poll, 10000)
+    return () => clearInterval(t)
+  }, [])
 
   // fetch overlay series when overlays/asset/tf change
   const overlayKey = useMemo(
@@ -221,6 +253,16 @@ export default function OSPage() {
     setAsset(a)
     void osPost('/asset', { asset: a })
   }, [])
+
+  // screener row -> load that setup into the chart workspace
+  const handleSelectSetup = useCallback(
+    (a: string, t: Timeframe) => {
+      setAsset(a)
+      setTf(t)
+      void osPost('/asset', { asset: a })
+    },
+    []
+  )
 
   // realtime feed
   useOSFeed(asset, tf, {
@@ -407,6 +449,7 @@ export default function OSPage() {
               prices={prices}
               refreshPositions={loadPositions}
               refreshBots={loadBots}
+              onSelectSetup={handleSelectSetup}
               onError={(m) => pushToast('danger', m)}
             />
           </div>
@@ -466,6 +509,7 @@ export default function OSPage() {
                     prices={prices}
                     refreshPositions={loadPositions}
                     refreshBots={loadBots}
+                    onSelectSetup={handleSelectSetup}
                     onError={(m) => pushToast('danger', m)}
                   />
                 </div>
@@ -518,6 +562,12 @@ export default function OSPage() {
               autopilot: {bots.filter((b) => b.bot.enabled).length} armed
             </span>
         )}
+          {screenerLive > 0 && (
+            <span className="flex items-center gap-1 text-cyan-400">
+              <span className="h-1.5 w-1.5 rounded-full bg-cyan-400" />
+              screener: {screenerLive} pairs live
+            </span>
+          )}
         </div>
         <span className="hidden md:inline">unofficial · practice balance by default · not affiliated with IQ Option</span>
       </footer>

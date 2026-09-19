@@ -428,6 +428,46 @@ const TOOLS: ToolSpec[] = [
     args: '{"scope": "bots"}',
     run: (a) => coreGet(`/journal?scope=${a.scope === 'bots' ? 'bots' : 'all'}`),
   },
+  // ---------- discovery: screener + alert rules ----------
+  {
+    name: 'screener_scan',
+    description: 'Query the OS screener - a live background scanner that ranks the ENTIRE universe (80+ instruments x multiple timeframes) by composite signal strength. Filters: tf ("1m"|"5m"|"15m"|... omit for all), category (forex|otc|crypto|commodity|stock|index|all), direction (call|put|all), minScore (0-90), q (symbol search), limit. THE tool for "find me the hottest setups right now".',
+    args: '{"direction": "call", "minScore": 50, "tf": "5m", "category": "crypto", "limit": 10}',
+    run: (a) => {
+      const p = new URLSearchParams()
+      if (a.tf) p.set('tf', String(a.tf))
+      if (a.category) p.set('category', String(a.category))
+      if (a.direction) p.set('direction', String(a.direction))
+      if (a.minScore !== undefined) p.set('minScore', String(a.minScore))
+      if (a.q) p.set('q', String(a.q))
+      p.set('limit', String(Math.min(Number(a.limit ?? 12), 50)))
+      return coreGet(`/screener?${p.toString()}`)
+    },
+  },
+  {
+    name: 'screener_status',
+    description: 'Screener health: how many instruments/pairs are being watched, current sweep progress and configuration (timeframes, category).',
+    args: '{}',
+    run: () => coreGet('/screener_status'),
+  },
+  {
+    name: 'alert_rule_create',
+    description: 'Create/update a standing alert rule that watches one instrument and fires an OS alert when triggered. Metrics: price_above/price_below (value = price), score_call/score_put/score_abs (value = min |score| 0-100), rsi_above/rsi_below, adx_above, atr_above, regime (value = bull|bear|range|chop), pattern_bull/pattern_bear (no value). Optional: name, cooldownSec (default 300), oneShot (auto-disarm after first fire), enabled.',
+    args: '{"name": "Gold vol burst", "asset": "XAUUSD", "tf": "5m", "metric": "atr_above", "value": 0.2, "cooldownSec": 600, "oneShot": false}',
+    run: (a) => corePost('/alert_rule_save', a),
+  },
+  {
+    name: 'alert_rule_list',
+    description: 'List all standing alert rules with their armed/paused state and fire counts.',
+    args: '{}',
+    run: () => coreGet('/alert_rules'),
+  },
+  {
+    name: 'alert_rule_delete',
+    description: 'Delete an alert rule by id (see alert_rule_list for ids).',
+    args: '{"id": "rule-abc123"}',
+    run: (a) => corePost('/alert_rule_delete', { id: a.id }),
+  },
   // ---------- OS control (executed client-side) ----------
   {
     name: 'ui_control',
@@ -547,7 +587,7 @@ const TOOLS: ToolSpec[] = [
 const TOOL_LIST_TEXT = TOOLS.map((t) => `- ${t.name}: ${t.description} args: ${t.args}`).join('\n')
 
 const SYSTEM_BASE = `You are the IQAIR//OS Copilot - an expert quantitative trading analyst embedded as the AI of a trading operating system built on the iqair IQ Option library.
-You can analyze markets (100+ technical indicators, 35 candlestick + chart patterns, Markov chains, Monte Carlo, Hurst exponent, GARCH volatility), scan the whole universe for setups, run strategies, backtest them, place PAPER trades through the risk manager, deploy and manage AUTONOMOUS autopilot bots (bot_create / bot_toggle / bot_delete / autopilot_status - they trade every qualifying signal automatically under the global risk manager), review the realized trade journal (journal_stats), and control the user's workspace (switch charts, timeframes, add indicators).
+You can analyze markets (100+ technical indicators, 35 candlestick + chart patterns, Markov chains, Monte Carlo, Hurst exponent, GARCH volatility), DISCOVER setups with the market-wide screener (screener_scan ranks every instrument x timeframe by signal strength - start there when the user asks "what's moving" or "find setups"), place PAPER trades through the risk manager, deploy and manage AUTONOMOUS autopilot bots (bot_create / bot_toggle / bot_delete / autopilot_status - they trade every qualifying signal automatically under the global risk manager), set standing ALERT RULES that watch instruments and fire OS alerts (alert_rule_create / alert_rule_list / alert_rule_delete - use them when the user wants to be notified, e.g. "tell me when BTC RSI drops below 30"), review the realized trade journal (journal_stats), and control the user's workspace (switch charts, timeframes, add indicators).
 
 Tool protocol - follow it EXACTLY:
 - Respond with ONE JSON object and nothing else. No markdown fences, no prose outside the JSON.
@@ -562,6 +602,7 @@ Rules:
 - Use ui_control to set up the workspace when it helps (e.g. add Bollinger + RSI before a detailed read, or switch to the asset you're discussing). Do not undo the user's layout gratuitously.
 - For trade ideas: check multi_timeframe confluence first, size with risk_calculator, then optionally place_trade as PAPER and say so.
 - When the user asks to automate a strategy, deploy a bot with bot_create: pick a sensible strategyId, conservative stake (<=2% of balance), minScore >= 55, and always confirm the config in your final answer. Backtest or run_strategy first when unsure about the edge.
+- When the user asks to be notified/watch an instrument ("alert me when...", "let me know if..."), create an alert rule with alert_rule_create and confirm the trigger in plain words. NEVER use alert rules to trade - they only notify.
 - NEVER promise profits. Always frame outputs as probabilistic analysis, not certainty.
 - PAPER trades only - you cannot and must not place live trades.
 - If a tool returns {"ok": false, "error": ...}, adapt: fix the args or try a different approach.

@@ -6,8 +6,11 @@ import type {
   AnalysisResult,
   Candle,
   CompositeSignal,
+  Direction,
   Factor,
   IndicatorSnapshot,
+  MarkovResult,
+  PatternHit,
   QuantStats,
   Timeframe,
 } from '../types'
@@ -356,6 +359,62 @@ export function analyze(candles: Candle[], asset: string, tf: Timeframe): Analys
     srZones: supportResistance(candles, 240),
     signal,
     registrySize: 101,
+  }
+}
+
+/**
+ * Lightweight per-pair snapshot for the screener / alert rules.
+ * Same factor math as `analyze()` but skips Monte Carlo, indicator series,
+ * S/R zones and the registry path - a full-universe sweep stays in milliseconds
+ * per pair instead of tens of milliseconds.
+ */
+export function scanSnapshot(
+  candles: Candle[],
+  asset: string,
+  tf: Timeframe
+): {
+  asset: string
+  tf: Timeframe
+  ts: number
+  price: number
+  changePct: number
+  score: number
+  direction: Direction
+  confidence: number
+  rsi: number
+  adx: number
+  atrPct: number
+  hurst: number
+  probUp: number
+  regime: MarkovResult['regime']
+  topPattern: { name: string; direction: PatternHit['direction']; reliability: number } | null
+} {
+  const c = candles.map((k) => k.close)
+  const ind = snapshot(candles)
+  const quant = quantStats(candles)
+  const markov = markovChain(c, { lookback: 500 })
+  const patterns = detectPatterns(candles, 8)
+  const pBias = patternBias(patterns)
+  const signal = compositeSignal(candles, asset, tf, markov, quant, ind, pBias)
+  const refIdx = Math.max(0, c.length - 25)
+  const price = c[c.length - 1]
+  const top = patterns.find((p) => p.direction !== 'neutral') ?? patterns[0]
+  return {
+    asset,
+    tf,
+    ts: candles[candles.length - 1].time,
+    price,
+    changePct: c[refIdx] ? ((price - c[refIdx]) / c[refIdx]) * 100 : 0,
+    score: signal.score,
+    direction: signal.direction,
+    confidence: signal.confidence,
+    rsi: ind.rsi,
+    adx: ind.adx,
+    atrPct: ind.atrPct,
+    hurst: quant.hurst,
+    probUp: markov.probUp,
+    regime: markov.regime,
+    topPattern: top ? { name: top.name, direction: top.direction, reliability: top.reliability } : null,
   }
 }
 

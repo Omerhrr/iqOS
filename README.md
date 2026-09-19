@@ -37,6 +37,11 @@ A trading OS built around the [iqair](https://github.com/Omerhrr/iqair) IQ Optio
 - 10 built-in strategies incl. `markov-edge` (trades the fitted transition matrix) and `confluence-core` (the composite signal itself)
 - Backtester: binary (payout-based) and spot (TP/SL) settlement models — win rate, profit factor, max drawdown, Sharpe, expectancy, equity curve
 
+**Discovery layer (screener + alert rules)**
+- **Universe screener**: a background scanner walks every open instrument × configured timeframes (1m/5m/15m by default) with a lightweight snapshot of the composite engine — ranked opportunity feed with signal score, confidence, Markov regime, RSI/ADX/ATR, Hurst, P(up), top candlestick pattern and payout. Rows auto-refresh on candle close (stale invalidation over the event bus), filter by timeframe/category/direction/min-score/symbol, click a row to load the setup into the chart workspace, or hit the bell to convert it into a standing alert
+- **Alert rules**: programmable market watchers persisted in SQLite — price cross (tick-accurate), composite score strength (call/put/either), RSI extremes, ADX trend ignition, ATR% volatility bursts, Markov regime shifts and bullish/bearish candle patterns; per-rule cooldown, one-shot auto-disarm, fire counters, armed/paused state — all surfaced as OS alerts (toast + feed)
+- **Kernel keeper**: the Next.js dev server self-heals the trading-core kernel (`/api/kernel` spawns it detached when :3030 is dark and re-checks on every boot/reconnect)
+
 **Execution & risk**
 - Paper broker with **4 trade kinds** on every instrument: **binary** (expiry in bars), **turbo** (short expiry, min 30s), **digital** (strike from spot ± offset, 5m/15m/30m expiries, ITM/OTM settlement), **CFD** (margin × leverage notional, TP/SL, 100%-margin stop-out)
 - Risk manager: kill switch, daily loss limit, max stake, max concurrent positions, loss-streak cooldown
@@ -47,7 +52,7 @@ A trading OS built around the [iqair](https://github.com/Omerhrr/iqair) IQ Optio
 - Built-in overlays (EMA 20/50/200, Bollinger, Supertrend, VWAP) + any registry indicator as an on-chart overlay or a stacked oscillator sub-pane, added via the indicator library dialog (search, category tabs, param editing)
 
 **AI copilot (harness)**
-- LLM agent with a 19-tool JSON action loop: full analysis, any-registry indicator series, instrument search, chart patterns, Markov matrix, Monte Carlo, backtests, strategy evaluation, paper trades (all 4 kinds), position management — every call traced in the UI
+- LLM agent with a 32-tool JSON action loop: full analysis, any-registry indicator series, instrument search, chart patterns, Markov matrix, Monte Carlo, backtests, strategy evaluation, paper trades (all 4 kinds), position management, screener queries, alert-rule management, autopilot fleet control — every call traced in the UI
 
 ## Repo layout
 
@@ -55,11 +60,12 @@ A trading OS built around the [iqair](https://github.com/Omerhrr/iqair) IQ Optio
 src/                        Next.js 16 OS shell (UI + agent API route)
   app/page.tsx              the OS desktop
   app/api/agent/route.ts    LLM tool-calling harness
+  app/api/kernel/route.ts   kernel keeper (auto-spawn trading-core)
   components/os/            chart, panels, blotter, copilot
   lib/os/client.ts          REST + socket client
 mini-services/trading-core/ the kernel (bun)
   src/kernel.ts             event bus + plugin lifecycle
-  src/plugins/              market-data / analytics / execution / store
+  src/plugins/              market-data / analytics / execution / store / autopilot / screener / alert-rules
   src/universe.ts           full IQ Option instrument catalog (115)
   src/analytics/            indicators / registry / patterns / chart-patterns / quant / engine
   src/strategies/           builtin strategies + backtester

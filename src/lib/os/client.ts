@@ -414,6 +414,79 @@ export interface AlertRow {
   ts: number
 }
 
+// ---------- discovery: screener + alert rules ----------
+
+export type AlertMetric =
+  | 'price_above'
+  | 'price_below'
+  | 'score_call'
+  | 'score_put'
+  | 'score_abs'
+  | 'rsi_above'
+  | 'rsi_below'
+  | 'adx_above'
+  | 'atr_above'
+  | 'regime'
+  | 'pattern_bull'
+  | 'pattern_bear'
+
+export interface AlertMetricDef {
+  metric: AlertMetric
+  label: string
+  needsValue: boolean
+  hint: string
+}
+
+export interface AlertRule {
+  id: string
+  name: string
+  enabled: boolean
+  asset: string
+  tf: Timeframe
+  metric: AlertMetric
+  value?: number
+  note?: string
+  cooldownSec: number
+  oneShot: boolean
+  lastFiredTs?: number
+  fires: number
+}
+
+export interface ScreenRow {
+  asset: string
+  name: string
+  category: AssetCategory
+  otc: boolean
+  tf: Timeframe
+  price: number
+  score: number
+  direction: 'call' | 'put' | 'none'
+  confidence: number
+  pUp: number
+  regime: 'bull' | 'bear' | 'range' | 'chop'
+  rsi: number
+  adx: number
+  atrPct: number
+  hurst: number
+  changePct: number
+  payout: number
+  topPattern: { name: string; direction: string; reliability: number } | null
+  ts: number
+  computedTs: number
+}
+
+export interface ScreenerStatus {
+  pairs: number
+  tfs: Timeframe[]
+  category: string
+  queue: number
+  stale: number
+  instruments: number
+  lastSweepTs: number
+  sweeping: boolean
+  uptimeSec: number
+}
+
 // ---------- REST client (direct to core via gateway port param) ----------
 
 const CORE_PORT = 3030

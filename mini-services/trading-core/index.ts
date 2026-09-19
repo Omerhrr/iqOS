@@ -11,6 +11,8 @@ import { marketDataPlugin, MarketDataService } from './src/plugins/market-data'
 import { analyticsPlugin, AnalyticsService } from './src/plugins/analytics'
 import { executionPlugin, ExecutionService, type RiskConfig } from './src/plugins/execution'
 import { autopilotPlugin, AutopilotService, type BotConfig } from './src/plugins/autopilot'
+import { screenerPlugin, ScreenerService } from './src/plugins/screener'
+import { alertRulesPlugin, AlertRulesService, ALERT_METRICS } from './src/plugins/alert-rules'
 import { ALL_TIMEFRAMES, type Timeframe } from './src/types'
 import { searchInstruments, UNIVERSE_STATS, getInstrument } from './src/universe'
 import { listRegistry, computeIndicator, registrySize, getIndicatorDef } from './src/analytics/registry'
@@ -24,6 +26,8 @@ kernel.register(marketDataPlugin)
 kernel.register(analyticsPlugin)
 kernel.register(executionPlugin)
 kernel.register(autopilotPlugin)
+kernel.register(screenerPlugin)
+kernel.register(alertRulesPlugin)
 
 const httpServer = createServer(async (req, res) => {
   res.setHeader('access-control-allow-origin', '*')
@@ -176,6 +180,38 @@ const httpServer = createServer(async (req, res) => {
       }
 
       if (path === '/strategies') return json(200, { ok: true, strategies: analytics.listStrategies() })
+
+      // ---------- discovery: screener + alert rules ----------
+
+      // ranked opportunity feed across the whole scanned universe
+      if (path === '/screener') {
+        const scr = kernel.context().use<ScreenerService>('screener')
+        const direction = (q.get('direction') ?? 'all') as 'all' | 'call' | 'put'
+        const out = scr.top({
+          tf: q.get('tf') ? tf(q.get('tf')) : undefined,
+          category: q.get('category') ?? 'all',
+          direction: ['all', 'call', 'put'].includes(direction) ? direction : 'all',
+          minScore: Number(q.get('minScore') ?? 0),
+          q: q.get('q') ?? undefined,
+          limit: Math.min(Number(q.get('limit') ?? 40), 200),
+        })
+        return json(200, { ok: true, tf: q.get('tf') ?? 'all', ...out })
+      }
+
+      if (path === '/screener_status') {
+        const scr = kernel.context().use<ScreenerService>('screener')
+        return json(200, { ok: true, status: scr.status(), config: scr.config })
+      }
+
+      if (path === '/alert_metrics') {
+        return json(200, { ok: true, metrics: ALERT_METRICS })
+      }
+
+      if (path === '/alert_rules') {
+        const rules = kernel.context().use<AlertRulesService>('alertrules')
+        return json(200, { ok: true, rules: rules.listRules() })
+      }
+
 
       if (path === '/signal') {
         const asset = q.get('asset') ?? market.activeAsset
@@ -427,6 +463,28 @@ const httpServer = createServer(async (req, res) => {
       if (path === '/bot_toggle') {
         const bots = kernel.context().use<AutopilotService>('autopilot')
         return json(200, bots.toggleBot(String(body.id ?? ''), body.enabled === undefined ? undefined : Boolean(body.enabled)))
+      }
+
+      // ---------- discovery control ----------
+
+      if (path === '/screener_config') {
+        const scr = kernel.context().use<ScreenerService>('screener')
+        return json(200, scr.configure(body as Parameters<typeof scr.configure>[0]))
+      }
+
+      if (path === '/alert_rule_save') {
+        const rules = kernel.context().use<AlertRulesService>('alertrules')
+        return json(200, rules.saveRule(body as Record<string, never>))
+      }
+
+      if (path === '/alert_rule_toggle') {
+        const rules = kernel.context().use<AlertRulesService>('alertrules')
+        return json(200, rules.toggleRule(String(body.id ?? ''), body.enabled === undefined ? undefined : Boolean(body.enabled)))
+      }
+
+      if (path === '/alert_rule_delete') {
+        const rules = kernel.context().use<AlertRulesService>('alertrules')
+        return json(200, rules.deleteRule(String(body.id ?? '')))
       }
     }
 

@@ -5,6 +5,7 @@
 import { Database } from 'bun:sqlite'
 import type { AccountState, Position } from './types'
 import type { BotConfig } from './plugins/autopilot'
+import type { AlertRule } from './plugins/alert-rules'
 
 export class Store {
   private db: Database
@@ -66,6 +67,12 @@ export class Store {
         meta TEXT
       );
       CREATE TABLE IF NOT EXISTS bots (
+        id TEXT PRIMARY KEY,
+        config TEXT NOT NULL,
+        created_ts INTEGER NOT NULL,
+        updated_ts INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS alert_rules (
         id TEXT PRIMARY KEY,
         config TEXT NOT NULL,
         created_ts INTEGER NOT NULL,
@@ -293,6 +300,40 @@ export class Store {
       .query("SELECT * FROM positions WHERE note = ? ORDER BY ts_open DESC LIMIT ?")
       .all(`bot:${botId}`, limit) as Record<string, unknown>[]
     return rows.map((r) => this.rowToPosition(r))
+  }
+
+  // ---------- alert rules ----------
+
+  saveAlertRule(rule: AlertRule): void {
+    const now = Math.floor(Date.now() / 1000)
+    const existing = this.db.query('SELECT created_ts FROM alert_rules WHERE id = ?').get(rule.id) as { created_ts: number } | null
+    this.db.run(
+      'INSERT INTO alert_rules (id, config, created_ts, updated_ts) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET config = excluded.config, updated_ts = excluded.updated_ts',
+      [rule.id, JSON.stringify(rule), existing?.created_ts ?? now, now]
+    )
+  }
+
+  deleteAlertRule(id: string): boolean {
+    const res = this.db.run('DELETE FROM alert_rules WHERE id = ?', [id])
+    return res.changes > 0
+  }
+
+  listAlertRules(): { rule: AlertRule; createdTs: number }[] {
+    const rows = this.db.query('SELECT config, created_ts FROM alert_rules ORDER BY created_ts ASC').all() as {
+      config: string
+      created_ts: number
+    }[]
+    return rows
+      .map((r) => {
+        try {
+          return { rule: JSON.parse(r.config) as AlertRule, createdTs: r.created_ts }
+        } catch {
+          // corrupted row - drop it rather than poison the evaluator
+          this.db.run('DELETE FROM alert_rules WHERE config = ?', [r.config])
+          return null
+        }
+      })
+      .filter((x): x is { rule: AlertRule; createdTs: number } => x !== null)
   }
 
   stats(): { trades: number; wins: number; losses: number; netPnl: number } {

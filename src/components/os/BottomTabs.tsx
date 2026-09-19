@@ -18,6 +18,8 @@ import { fmtMoney, fmtPct, fmtPrice, fmtTime, osPost } from '@/lib/os/client'
 import BacktestLab from './BacktestLab'
 import AutopilotPanel from './AutopilotPanel'
 import JournalTab from './JournalTab'
+import ScreenerPanel from './ScreenerPanel'
+import AlertRulesPanel from './AlertRulesPanel'
 
 interface BottomTabsProps {
   asset: string
@@ -33,6 +35,7 @@ interface BottomTabsProps {
   prices: Record<string, { price: number; dir: number }>
   refreshPositions: () => void
   refreshBots: () => void
+  onSelectSetup: (asset: string, tf: Timeframe) => void
   onError: (m: string) => void
 }
 
@@ -66,6 +69,7 @@ export default function BottomTabs(props: BottomTabsProps) {
           [
             ['positions', `Positions (${positions.length})`],
             ['history', `History (${history.length})`],
+            ['screener', 'Screener'],
             ['autopilot', `Autopilot${props.bots.filter((b) => b.bot.enabled).length ? ` (${props.bots.filter((b) => b.bot.enabled).length})` : ''}`],
             ['journal', 'Journal'],
             ['backtest', 'Backtest Lab'],
@@ -188,6 +192,11 @@ export default function BottomTabs(props: BottomTabsProps) {
         )}
       </TabsContent>
 
+      {/* SCREENER (discovery) */}
+      <TabsContent value="screener" className="mt-0 min-h-0 flex-1 overflow-hidden">
+        <ScreenerPanel onSelectSetup={props.onSelectSetup} onError={onError} />
+      </TabsContent>
+
       {/* AUTOPILOT */}
       <TabsContent value="autopilot" className="mt-0 min-h-0 flex-1 overflow-hidden">
         <div className="h-full">
@@ -262,24 +271,28 @@ export default function BottomTabs(props: BottomTabsProps) {
         </div>
       </TabsContent>
 
-      {/* ALERTS */}
-      <TabsContent value="alerts" className="mt-0 min-h-0 flex-1 overflow-auto">
-        {alerts.length === 0 ? (
-          <Empty text="System alerts will appear here (fills, settlements, risk events)." />
-        ) : (
-          <div className="divide-y divide-[#0d1420]">
-            {alerts.map((a, i) => (
-              <div key={i} className="flex items-center gap-3 px-3 py-1.5 font-mono text-[11px]">
-                <span className="text-[9px] text-[#4b5a72]">{fmtTime(a.ts)}</span>
-                <span
-                  className="h-1.5 w-1.5 rounded-full"
-                  style={{ background: a.level === 'success' ? '#10b981' : a.level === 'danger' ? '#f43f5e' : a.level === 'warn' ? '#f59e0b' : '#38bdf8' }}
-                />
-                <span className="text-[#aab6cc]">{a.message}</span>
-              </div>
-            ))}
-          </div>
-        )}
+      {/* ALERTS: rules manager + system feed */}
+      <TabsContent value="alerts" className="mt-0 flex min-h-0 flex-1 flex-col overflow-hidden">
+        <AlertRulesPanel assets={props.assets} onError={onError} />
+        <div className="min-h-0 flex-1 overflow-auto border-t border-[#141d2e]">
+          <div className="px-3 pt-1.5 font-mono text-[9px] uppercase tracking-wider text-[#3d4d66]">system feed</div>
+          {alerts.length === 0 ? (
+            <Empty text="System alerts will appear here (fills, settlements, rule triggers, risk events)." />
+          ) : (
+            <div className="divide-y divide-[#0d1420]">
+              {alerts.map((a, i) => (
+                <div key={i} className="flex items-center gap-3 px-3 py-1.5 font-mono text-[11px]">
+                  <span className="text-[9px] text-[#4b5a72]">{fmtTime(a.ts)}</span>
+                  <span
+                    className="h-1.5 w-1.5 rounded-full"
+                    style={{ background: a.level === 'success' ? '#10b981' : a.level === 'danger' ? '#f43f5e' : a.level === 'warn' ? '#f59e0b' : '#38bdf8' }}
+                  />
+                  <span className="text-[#aab6cc]">{a.message}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </TabsContent>
     </Tabs>
   )
