@@ -23,7 +23,7 @@ import {
 } from 'lightweight-charts'
 import { Button } from '@/components/ui/button'
 import type { AnalysisResult, Candle, ChartType, IndicatorSeries, Position } from '@/lib/os/client'
-import { fmtPrice } from '@/lib/os/client'
+import { chartPriceFormat, fmtPrice } from '@/lib/os/client'
 
 interface ChartPanelProps {
   candles: Candle[]
@@ -33,6 +33,7 @@ interface ChartPanelProps {
   chartType: ChartType
   overlays: IndicatorSeries[]
   positions?: Position[]
+  settledPositions?: Position[]
 }
 
 type AnyPriceSeries =
@@ -126,13 +127,19 @@ export default function ChartPanel({
   chartType,
   overlays,
   positions,
+  settledPositions,
 }: ChartPanelProps) {
   const elRef = useRef<HTMLDivElement | null>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const priceSeriesRef = useRef<AnyPriceSeries | null>(null)
   const volRef = useRef<ISeriesApi<'Histogram'> | null>(null)
-  const entryLineRefs = useRef<Map<string, { series: AnyPriceSeries; line: IPriceLine; price: number }>>(new Map())
+  const entryLineRefs = useRef<Map<string, { series: AnyPriceSeries; line: IPriceLine; price: number; title: string }>>(new Map())
   const markersRef = useRef<{ series: AnyPriceSeries; api: ISeriesMarkersPluginApi<Time> } | null>(null)
+  const priceFmtKeyRef = useRef<string | null>(null)
+
+  // axis/crosshair/price-line precision follows the asset's quote convention
+  // (the library default of 2 decimals turns 1.10283 into 1.10)
+  const priceFmt = useMemo(() => chartPriceFormat(digitsTicker, price), [digitsTicker, price])
   const overlayRefs = useRef<Map<string, ISeriesApi<'Line'>>>(new Map())
   const builtinRef = useRef<{ ema20?: ISeriesApi<'Line'>; ema50?: ISeriesApi<'Line'>; ema200?: ISeriesApi<'Line'>; bbUp?: ISeriesApi<'Line'>; bbLo?: ISeriesApi<'Line'>; st?: ISeriesApi<'Line'>; vwap?: ISeriesApi<'Line'> }>({})
   const [toggles, setToggles] = useState<OverlayToggles>(DEFAULT_TOGGLES)
@@ -205,6 +212,7 @@ export default function ChartPanel({
         bottomLineColor: DOWN, bottomFillColor1: 'rgba(244,63,94,0.02)', bottomFillColor2: 'rgba(244,63,94,0.28)',
       })
     }
+    price.applyOptions({ priceFormat: priceFmt })
     priceSeriesRef.current = price
 
     // built-in overlay series (fresh per chart)
@@ -254,6 +262,14 @@ export default function ChartPanel({
       }))
     )
   }, [displayCandles, chartType])
+
+  // live precision sync: asset switch or a quote crossing a magnitude band
+  useEffect(() => {
+    const key = `${digitsTicker}:${priceFmt.precision}`
+    if (priceFmtKeyRef.current === key) return
+    priceFmtKeyRef.current = key
+    priceSeriesRef.current?.applyOptions({ priceFormat: priceFmt })
+  }, [priceFmt, digitsTicker])
 
   // built-in overlay data + toggle visibility
   useEffect(() => {
@@ -317,21 +333,50 @@ export default function ChartPanel({
     }
   }, [overlays, chartType])
 
-  // entry markers: one dashed price line per open position on this asset.
-  // Green for CALL, red for PUT, titled with kind + stake. Re-attached after a
-  // chart-type switch (the series is recreated) and removed the moment the
-  // position settles or the operator switches asset. An arrow marker pins the
-  // entry candle itself, so bar-count expiries are readable from the chart.
+  // trade overlay: one dashed price line per open position on this asset
+  // (green CALL / red PUT, titled with kind + stake + expiry countdown) and
+  // markers pinning entries - arrows for open trades, faded arrows + a
+  // settle circle with P&L for the most recent settled trades, so bar-count
+  // expiries and outcomes are readable straight off the chart. Lines re-
+  // attach after chart-type switches and drop when trades settle or the
+  // operator switches asset.
   useEffect(() => {
     const series = priceSeriesRef.current
     if (!series) return
+    const lastT = displayCandles.length ? displayCandles[displayCandles.length - 1].time : 0
+    const snap = (ts: number): UTCTimestamp | null => {
+      let t: number | null = null
+      for (const c of displayCandles) {
+        if (c.time <= ts) t = c.time
+        else break
+      }
+      return t as UTCTimestamp | null
+    }
     const open = (positions ?? []).filter((p) => p.status === 'open' && p.asset === digitsTicker)
     const seen = new Set<string>()
     for (const p of open) {
       seen.add(p.id)
+      const isCall = p.side === 'call'
+      // expiry countdown: bars for binary/turbo (settle on the close of the
+      // expiry bar), seconds for digital, none for CFD
+      let countdown = ''
+      if (p.kind !== 'cfd' && lastT > 0 && tfSec > 0) {
+        if (p.kind === 'digital' && p.expirySec) {
+          countdown = ` · T-${Math.max(0, Math.round(p.tsOpen + p.expirySec - lastT))}s`
+        } else if (p.expiryBars) {
+          const barsSince = Math.max(0, Math.round((lastT - p.tsOpen) / tfSec))
+          countdown = ` · T-${Math.max(0, p.expiryBars - barsSince)}`
+        }
+      }
+      const title = `${isCall ? '▲ CALL' : '▼ PUT'} ${p.kind} $${p.amount}${countdown}`
       const existing = entryLineRefs.current.get(p.id)
-      if (existing && existing.series === series && existing.price === p.entryPrice) continue
+      if (existing && existing.series === series && existing.title === title) continue
       if (existing) {
+        if (existing.series === series && existing.price === p.entryPrice) {
+          existing.line.applyOptions({ title }) // countdown tick - keep the line
+          entryLineRefs.current.set(p.id, { ...existing, title })
+          continue
+        }
         try {
           existing.series.removePriceLine(existing.line)
         } catch {
@@ -339,16 +384,15 @@ export default function ChartPanel({
         }
         entryLineRefs.current.delete(p.id)
       }
-      const isCall = p.side === 'call'
       const line = series.createPriceLine({
         price: p.entryPrice,
         color: isCall ? UP : DOWN,
         lineWidth: 1,
         lineStyle: LineStyle.Dashed,
         axisLabelVisible: true,
-        title: `${isCall ? '▲ CALL' : '▼ PUT'} ${p.kind} $${p.amount}`,
+        title,
       })
-      entryLineRefs.current.set(p.id, { series, line, price: p.entryPrice })
+      entryLineRefs.current.set(p.id, { series, line, price: p.entryPrice, title })
     }
     for (const [key, entry] of entryLineRefs.current) {
       if (!seen.has(key)) {
@@ -361,32 +405,53 @@ export default function ChartPanel({
       }
     }
 
-    // arrow at the entry candle (snapped to the closest rendered bar at/before entry)
     if (!markersRef.current || markersRef.current.series !== series) {
       markersRef.current = { series, api: createSeriesMarkers(series, []) }
     }
-    const markers = open
-      .map((p): SeriesMarker<Time> | null => {
-        let t: number | null = null
-        for (const c of displayCandles) {
-          if (c.time <= p.tsOpen) t = c.time
-          else break
-        }
-        if (t === null) return null
-        const isCall = p.side === 'call'
-        return {
-          time: t as UTCTimestamp,
-          position: isCall ? 'belowBar' : 'aboveBar',
-          color: isCall ? UP : DOWN,
-          shape: isCall ? 'arrowUp' : 'arrowDown',
-          text: `${isCall ? '▲' : '▼'} $${p.amount} ${p.kind}`,
-          size: 1,
-        }
+    const markers: SeriesMarker<Time>[] = []
+    for (const p of open) {
+      const t = snap(p.tsOpen)
+      if (t === null) continue
+      const isCall = p.side === 'call'
+      markers.push({
+        time: t,
+        position: isCall ? 'belowBar' : 'aboveBar',
+        color: isCall ? UP : DOWN,
+        shape: isCall ? 'arrowUp' : 'arrowDown',
+        text: `${isCall ? '▲' : '▼'} $${p.amount} ${p.kind}`,
+        size: 1,
       })
-      .filter((m): m is SeriesMarker<Time> => m !== null)
-      .sort((a, b) => Number(a.time) - Number(b.time))
+    }
+    // settled feed arrives newest-first (ts_open DESC); review window = 30 most recent
+    for (const p of (settledPositions ?? []).filter((q) => q.asset === digitsTicker).slice(0, 30)) {
+      const col = p.pnl === undefined ? '#7c8aa5' : p.pnl > 0 ? UP : p.pnl < 0 ? DOWN : '#7c8aa5'
+      const isCall = p.side === 'call'
+      const entryT = snap(p.tsOpen)
+      if (entryT !== null) {
+        markers.push({
+          time: entryT,
+          position: isCall ? 'belowBar' : 'aboveBar',
+          color: col,
+          shape: isCall ? 'arrowUp' : 'arrowDown',
+          text: `${isCall ? '▲' : '▼'} $${p.amount}`,
+          size: 1,
+        })
+      }
+      const exitT = p.tsClose ? snap(p.tsClose) : null
+      if (exitT !== null) {
+        markers.push({
+          time: exitT,
+          position: isCall ? 'aboveBar' : 'belowBar',
+          color: col,
+          shape: 'circle',
+          text: `■ ${p.pnl === undefined ? '' : `${p.pnl >= 0 ? '+' : '-'}$${Math.abs(p.pnl).toFixed(2)}`}`,
+          size: 1,
+        })
+      }
+    }
+    markers.sort((a, b) => Number(a.time) - Number(b.time))
     markersRef.current.api.setMarkers(markers)
-  }, [positions, digitsTicker, chartType, displayCandles])
+  }, [positions, settledPositions, digitsTicker, chartType, displayCandles, tfSec])
 
   const lastCandle = candles[candles.length - 1]
   const lastUp = lastCandle ? lastCandle.close >= lastCandle.open : true

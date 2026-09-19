@@ -782,13 +782,28 @@ export function useOSFeed(asset: string, tf: Timeframe, handlers: OSFeedHandlers
 
 // ---------- formatting helpers ----------
 
-export function fmtPrice(v: number, ticker?: string): string {
+// Digits for a quote, by instrument convention: 5 for majors quoted ~1.xx,
+// 3 for JPY-style quotes >= 100, scaled for indices/metals/stocks. Shared by
+// the DOM formatter and the chart engine so the axis never disagrees with
+// the footer, watch, or ticket.
+export function priceDigits(v: number, ticker?: string): number {
   const abs = Math.abs(v)
-  let digits: number
-  if (ticker?.endsWith('-OTC') || ticker === 'USDJPY') digits = abs >= 100 ? 3 : 5
-  else if (ticker === 'EURUSD' || ticker === 'GBPUSD' || (abs > 1 && abs < 20 && (ticker?.includes('USD') || ticker?.length === 6))) digits = 5
-  else digits = abs >= 1000 ? 1 : abs >= 100 ? 2 : abs >= 10 ? 2 : abs >= 1 ? 4 : 5
+  if (ticker?.endsWith('-OTC') || ticker === 'USDJPY') return abs >= 100 ? 3 : 5
+  if (ticker === 'EURUSD' || ticker === 'GBPUSD' || (abs > 1 && abs < 20 && (ticker?.includes('USD') || ticker?.length === 6))) return 5
+  return abs >= 1000 ? 1 : abs >= 100 ? 2 : abs >= 10 ? 2 : abs >= 1 ? 4 : 5
+}
+
+export function fmtPrice(v: number, ticker?: string): string {
+  const digits = priceDigits(v, ticker)
   return v.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits })
+}
+
+// lightweight-charts mirror of fmtPrice. The library defaults to 2 decimals,
+// which mangles forex quotes (1.10283 -> 1.10) on the axis, crosshair, and
+// price-line labels - this restores the asset's quote convention there.
+export function chartPriceFormat(ticker: string | undefined, v: number): { type: 'price'; precision: number; minMove: number } {
+  const precision = priceDigits(v, ticker)
+  return { type: 'price', precision, minMove: Math.pow(10, -precision) }
 }
 
 export function fmtMoney(v: number): string {
