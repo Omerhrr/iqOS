@@ -817,7 +817,16 @@ export function useOSFeed(asset: string, tf: Timeframe, handlers: OSFeedHandlers
 
   useEffect(() => {
     const socket = io(`/?XTransformPort=${CORE_PORT}`, {
-      transports: ['websocket', 'polling'],
+      // Polling first, websocket as an opportunistic upgrade. Behind the Next
+      // :3000 proxy the WS upgrade request hangs (rewrites never respond to
+      // it), and engine.io's WS-fail path cannot fall back cleanly: by the
+      // time the 10s open-timeout fires, readyState has left "opening", so
+      // tryAllTransports does not shift to the next transport and every
+      // reconnect retries the hanging websocket forever - the OS stayed on
+      // "reconnecting…". Polling always completes (the 308 redirect is
+      // followed transparently by XHR), then engine.io upgrades to websocket
+      // whenever the path allows it (full WS through the Caddy :81 gateway).
+      transports: ['polling', 'websocket'],
       reconnection: true,
       reconnectionAttempts: 20,
       reconnectionDelay: 1500,

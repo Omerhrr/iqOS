@@ -671,8 +671,13 @@ const httpServer = createServer(async (req, res) => {
 })
 
 const io = new Server(httpServer, {
-  // default path '/socket.io/' so only engine.io requests are claimed;
-  // plain REST requests fall through to the handler above.
+  // engine.io claims the realtime path and plain REST falls through to the
+  // handler above. addTrailingSlash:false makes the path check a slash-less
+  // prefix match, so BOTH '/socket.io/?EIO=4…' and '/socket.io?EIO=4…' are
+  // accepted - proxies that normalize the trailing slash (e.g. Next's
+  // trailing-slash 308 in front of :3000) would otherwise 404 the handshake
+  // and leave the OS feed stuck on "reconnecting…".
+  addTrailingSlash: false,
   cors: { origin: '*', methods: ['GET', 'POST'] },
   pingTimeout: 60000,
   pingInterval: 25000,

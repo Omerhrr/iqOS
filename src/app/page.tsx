@@ -502,6 +502,7 @@ export default function OSPage() {
             <BottomTabs
               asset={asset}
               tf={tf}
+              analysis={analysis}
               positions={positions}
               history={history}
               alerts={alerts}
@@ -565,6 +566,7 @@ export default function OSPage() {
                   <BottomTabs
                     asset={asset}
                     tf={tf}
+                    analysis={analysis}
                     positions={positions}
                     history={history}
                     alerts={alerts}

@@ -7,6 +7,7 @@ import { Input } from '@/components/ui/input'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import type {
   AlertRow,
+  AnalysisResult,
   AssetRow,
   BacktestResult,
   BotRow,
@@ -17,6 +18,7 @@ import type {
 } from '@/lib/os/client'
 import { fmtMoney, fmtPct, fmtPrice, fmtTime, osPost } from '@/lib/os/client'
 import BacktestLab from './BacktestLab'
+import QuantPanel from './QuantPanel'
 import AutopilotPanel from './AutopilotPanel'
 import JournalTab from './JournalTab'
 import ScreenerPanel from './ScreenerPanel'
@@ -27,6 +29,7 @@ import WatchdogPanel from './WatchdogPanel'
 interface BottomTabsProps {
   asset: string
   tf: Timeframe
+  analysis: AnalysisResult | null
   positions: Position[]
   history: Position[]
   alerts: AlertRow[]
@@ -70,7 +73,10 @@ export default function BottomTabs(props: BottomTabsProps) {
 
   return (
     <Tabs defaultValue="positions" className="flex h-full min-h-0 flex-col gap-0">
-      <TabsList className="h-8 w-fit shrink-0 justify-start gap-1 rounded-none border-b border-[#1c2739] bg-transparent p-0">
+      {/* max-w-full + hidden-scrollbar overflow: 12 uppercase tabs exceed the
+          center dock at default sizes - without it the last tabs (Patterns,
+          Alerts, ...) were clipped and unreachable. */}
+      <TabsList className="h-8 w-fit max-w-full shrink-0 justify-start gap-1 overflow-x-auto rounded-none border-b border-[#1c2739] bg-transparent p-0 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
         {(
           [
             ['positions', `Positions (${positions.length})`],
@@ -82,6 +88,7 @@ export default function BottomTabs(props: BottomTabsProps) {
             ['journal', 'Journal'],
             ['backtest', 'Backtest Lab'],
             ['strategies', 'Strategy Lab'],
+            ['quant', 'Quant Lab'],
             ['patterns', `Patterns (${patterns.length})`],
             ['alerts', 'Alerts'],
           ] as [string, string][]
@@ -266,6 +273,15 @@ export default function BottomTabs(props: BottomTabsProps) {
             </div>
           ))}
         </div>
+      </TabsContent>
+
+      {/* QUANT LAB (monte carlo · statistical profile · kalman-ou · s/r) */}
+      <TabsContent value="quant" className="mt-0 min-h-0 flex-1 overflow-auto p-3">
+        {props.analysis ? (
+          <QuantPanel analysis={props.analysis} />
+        ) : (
+          <Empty text="Quant lab populates once the kernel streams analysis for the active instrument." />
+        )}
       </TabsContent>
 
       {/* PATTERNS */}
