@@ -618,10 +618,13 @@ function NumField({ label, value, onChange }: { label: string; value: number; on
 /** Fallback draft before the first /mode poll lands (mirrors kernel defaults). */
 const DEFAULT_AUTOTRADER_UI: AutoTraderConfig = {
   enabled: true,
+  signalSource: 'screener',
   tf: '1m',
   stake: 10,
   minScore: 60,
   minConfidence: 55,
+  zEntry: 1.8,
+  maxHalfLife: 60,
   direction: 'both',
   maxOpen: 3,
   cooldownSec: 180,
@@ -657,7 +660,7 @@ function AutoTraderStrip({
           {state.label}
         </span>
         <span className="font-mono text-[9px] text-[#4b5a72]">
-          {at.config.tf} · ${at.config.stake} · score ≥{at.config.minScore} · max {at.config.maxOpen}
+          {at.config.signalSource === 'kalman-ou' ? `OU·|z|≥${at.config.zEntry}` : `score ≥${at.config.minScore}`} · {at.config.tf} · ${at.config.stake} · max {at.config.maxOpen}
         </span>
         <span className="ml-auto font-mono text-[9px] text-[#4b5a72]">
           {closed}t{wr !== null ? ` · ${wr}% wr` : ''} ·{' '}
@@ -706,8 +709,9 @@ function AutoTraderDialog({
         <DialogHeader>
           <DialogTitle className="text-[14px] tracking-wider">AUTO-TRADER</DialogTitle>
           <DialogDescription className="text-[11px] text-[#7c8aa5]">
-            The OS acting as its own trader: takes the strongest screener signals as 1-bar binary options. Only ever
-            trades while the OS is in NO-HUMAN mode. Sentinel + risk limits still govern every order.
+            The OS acting as its own trader: takes the strongest signals as 1-bar binary options - the full composite
+            screener feed or the Kalman/OU mean-reversion edge. Only ever trades while the OS is in NO-HUMAN mode.
+            Sentinel + risk limits still govern every order.
           </DialogDescription>
         </DialogHeader>
 
@@ -718,6 +722,34 @@ function AutoTraderDialog({
               <div className="text-[9px] text-[#4b5a72]">armed for the next NO-HUMAN session</div>
             </div>
             <Switch checked={d.enabled} onCheckedChange={(v) => p({ enabled: v })} />
+          </div>
+
+          <div className="col-span-2">
+            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Signal source</Label>
+            <div className="flex overflow-hidden rounded border border-[#1c2739]">
+              {(
+                [
+                  ['screener', 'Screener composite'],
+                  ['kalman-ou', 'Kalman-OU mean reversion'],
+                ] as const
+              ).map(([v, label]) => (
+                <button
+                  key={v}
+                  type="button"
+                  onClick={() => p({ signalSource: v })}
+                  className={`flex-1 px-2 py-1.5 font-mono text-[10px] uppercase tracking-wider transition-colors ${
+                    d.signalSource === v ? 'bg-cyan-500/20 text-cyan-300' : 'text-[#4b5a72] hover:text-[#aab6cc]'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+              {d.signalSource === 'kalman-ou'
+                ? 'sweeps the universe with the Ornstein-Uhlenbeck + Kalman fit and fades statistically stretched pairs: CALL when price sits |z|σ below the equilibrium, PUT above - only when reversion is significant and the half-life is tradeable'
+                : 'takes the strongest full-composite screener signals market-wide (trend + momentum + statistical + patterns)'}
+            </p>
           </div>
 
           <div>
@@ -751,6 +783,12 @@ function AutoTraderDialog({
 
           <NumField label="Stake $" value={d.stake} onChange={(v) => p({ stake: v })} />
           <NumField label="Min |score|" value={d.minScore} onChange={(v) => p({ minScore: v })} />
+          {d.signalSource === 'kalman-ou' && (
+            <>
+              <NumField label="OU entry |z| (σ)" value={d.zEntry} onChange={(v) => p({ zEntry: v })} />
+              <NumField label="Max half-life (bars)" value={d.maxHalfLife} onChange={(v) => p({ maxHalfLife: v })} />
+            </>
+          )}
           <NumField label="Min confidence" value={d.minConfidence} onChange={(v) => p({ minConfidence: v })} />
           <NumField label="Max open" value={d.maxOpen} onChange={(v) => p({ maxOpen: v })} />
           <NumField label="Per-asset cooldown s" value={d.cooldownSec} onChange={(v) => p({ cooldownSec: v })} />

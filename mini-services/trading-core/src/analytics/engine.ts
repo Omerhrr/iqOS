@@ -406,6 +406,10 @@ export function scanSnapshot(
   hurst: number
   probUp: number
   regime: MarkovResult['regime']
+  ouZ: number // Kalman/OU stretch: sigmas from the OU equilibrium
+  ouHalfLife: number // OU mean-reversion half-life in bars (9999 = effectively none)
+  ouMeanReverting: boolean // OU fit significance gate (t-stat + tradeable half-life)
+  ouTStat: number // t-stat of the OU reversion fit
   topPattern: { name: string; direction: PatternHit['direction']; reliability: number } | null
 } {
   const c = candles.map((k) => k.close)
@@ -434,6 +438,10 @@ export function scanSnapshot(
     hurst: quant.hurst,
     probUp: markov.probUp,
     regime: markov.regime,
+    ouZ: ou.z,
+    ouHalfLife: ou.halfLifeBars,
+    ouMeanReverting: ou.meanReverting,
+    ouTStat: ou.tStat,
     topPattern: top ? { name: top.name, direction: top.direction, reliability: top.reliability } : null,
   }
 }

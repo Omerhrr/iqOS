@@ -200,6 +200,7 @@ export default function ScreenerPanel({ onSelectSetup, onError }: ScreenerPanelP
                 <Th>ATR%</Th>
                 <Th>Δ24</Th>
                 <Th>Hurst</Th>
+                <Th>OU z</Th>
                 <Th>P(up)</Th>
                 <Th>Pattern</Th>
                 <Th />
@@ -244,6 +245,25 @@ export default function ScreenerPanel({ onSelectSetup, onError }: ScreenerPanelP
                     <Td className="text-[#7c8aa5]">{r.atrPct.toFixed(3)}</Td>
                     <Td className={r.changePct >= 0 ? 'text-emerald-400' : 'text-rose-400'}>{fmtPct(r.changePct, 2)}</Td>
                     <Td className="text-[#7c8aa5]">{r.hurst.toFixed(2)}</Td>
+                    <Td
+                      className={
+                        !r.ouMeanReverting
+                          ? 'text-[#3d4c66]'
+                          : r.ouZ <= -1.8
+                            ? 'text-emerald-400'
+                            : r.ouZ >= 1.8
+                              ? 'text-rose-400'
+                              : 'text-[#aab6cc]'
+                      }
+                      title={
+                        r.ouMeanReverting
+                          ? `Kalman/OU mean-reverting · half-life ${r.ouHalfLife >= 9999 ? '∞' : r.ouHalfLife.toFixed(0)} bars · t ${r.ouTStat.toFixed(1)} · ${r.ouZ.toFixed(2)}σ from equilibrium`
+                          : `no reversion edge (t ${r.ouTStat.toFixed(1)}) - fading this is not advised`
+                      }
+                    >
+                      {r.ouZ >= 0 ? '+' : ''}
+                      {r.ouZ.toFixed(2)}
+                    </Td>
                     <Td className={r.pUp >= 0.55 ? 'text-emerald-400' : r.pUp <= 0.45 ? 'text-rose-400' : 'text-[#7c8aa5]'}>{(r.pUp * 100).toFixed(0)}%</Td>
                     <Td className="max-w-[120px] truncate text-[#7c8aa5]" title={r.topPattern?.name ?? ''}>
                       {r.topPattern ? (

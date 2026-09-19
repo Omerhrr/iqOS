@@ -24,6 +24,10 @@ export interface ScreenRow {
   confidence: number
   pUp: number
   regime: 'bull' | 'bear' | 'range' | 'chop'
+  ouZ: number // Kalman/OU stretch: sigmas from the OU equilibrium
+  ouHalfLife: number // OU mean-reversion half-life in bars (9999 = effectively none)
+  ouMeanReverting: boolean // OU fit significance gate (t-stat + tradeable half-life)
+  ouTStat: number // t-stat of the OU reversion fit
   rsi: number
   adx: number
   atrPct: number
@@ -177,6 +181,10 @@ export class ScreenerService {
       confidence: Math.round(snap.confidence),
       pUp: Math.round(snap.probUp * 1000) / 1000,
       regime: snap.regime,
+      ouZ: Math.round(snap.ouZ * 100) / 100,
+      ouHalfLife: Math.round(snap.ouHalfLife * 10) / 10,
+      ouMeanReverting: snap.ouMeanReverting,
+      ouTStat: Math.round(snap.ouTStat * 100) / 100,
       rsi: Math.round(snap.rsi * 10) / 10,
       adx: Math.round(snap.adx * 10) / 10,
       atrPct: Math.round(snap.atrPct * 1000) / 1000,

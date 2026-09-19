@@ -5,8 +5,12 @@
 //    suspended) and the built-in auto-trader stands down.
 //  - AUTO ("no human in the loop"): the OS trades by itself. Armed autopilot
 //    bots resume, and the built-in AUTO-TRADER - the OS acting as its own
-//    trader - sources the strongest screener signals market-wide and places
-//    fixed-risk binary trades within strict self-imposed limits.
+//    trader - places fixed-risk binary trades within strict self-imposed
+//    limits. The signal SOURCE is configurable:
+//      * 'screener'    - the strongest full-composite screener signals market-wide
+//      * 'kalman-ou'   - the Kalman/OU mean-reversion edge: fade statistically
+//                        stretched pairs (|z| sigmas from the OU equilibrium)
+//                        gated by reversion significance and a tradeable half-life
 // The mode is persisted, so restarts resume the same intent. Sentinel, the
 // watchdog and the base risk manager ALWAYS outrank the mode: flipping to
 // AUTO grants autonomy, never exemption. PANIC drops the OS back to HUMAN.
@@ -15,15 +19,21 @@ import type { Plugin, KernelContext } from '../kernel'
 import type { Store } from '../store'
 import type { Timeframe } from '../types'
 import type { ScreenerService, ScreenRow } from './screener'
+import type { MarketDataService } from './market-data'
+
+const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
 
 export type OsMode = 'human' | 'auto'
 
 export interface AutoTraderConfig {
   enabled: boolean // auto-trader armed (it only ever trades while mode = auto)
+  signalSource: 'screener' | 'kalman-ou' // where entry signals come from
   tf: Timeframe // which screener timeframe to source signals from
   stake: number
-  minScore: number // minimum |composite score| to act on
+  minScore: number // minimum |score| to act on (composite or OU edge score)
   minConfidence: number // minimum signal confidence (0-100)
+  zEntry: number // kalman-ou source: |z| (stationary sigmas) required to enter
+  maxHalfLife: number // kalman-ou source: skip pairs reverting slower than this (bars)
   direction: 'both' | 'call' | 'put'
   maxOpen: number // max concurrent auto-trader positions
   cooldownSec: number // per-asset re-entry cooldown
@@ -34,10 +44,13 @@ export interface AutoTraderConfig {
 
 export const DEFAULT_AUTOTRADER: AutoTraderConfig = {
   enabled: true,
+  signalSource: 'screener',
   tf: '1m',
   stake: 10,
   minScore: 60,
   minConfidence: 55,
+  zEntry: 1.8,
+  maxHalfLife: 60,
   direction: 'both',
   maxOpen: 3,
   cooldownSec: 180,
@@ -106,10 +119,13 @@ export class ModeService {
         const num = (v: unknown, fb: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fb)
         this.config = {
           enabled: typeof c.enabled === 'boolean' ? c.enabled : DEFAULT_AUTOTRADER.enabled,
+          signalSource: c.signalSource === 'kalman-ou' ? 'kalman-ou' : 'screener',
           tf: (typeof c.tf === 'string' ? c.tf : DEFAULT_AUTOTRADER.tf) as Timeframe,
           stake: num(c.stake, DEFAULT_AUTOTRADER.stake),
           minScore: num(c.minScore, DEFAULT_AUTOTRADER.minScore),
           minConfidence: num(c.minConfidence, DEFAULT_AUTOTRADER.minConfidence),
+          zEntry: num(c.zEntry, DEFAULT_AUTOTRADER.zEntry),
+          maxHalfLife: num(c.maxHalfLife, DEFAULT_AUTOTRADER.maxHalfLife),
           direction: c.direction === 'call' || c.direction === 'put' ? c.direction : 'both',
           maxOpen: Math.round(num(c.maxOpen, DEFAULT_AUTOTRADER.maxOpen)),
           cooldownSec: Math.round(num(c.cooldownSec, DEFAULT_AUTOTRADER.cooldownSec)),
@@ -121,7 +137,10 @@ export class ModeService {
     }
     this.rebuildRuntime()
     this.syncTimer()
-    ctx.log('mode', `OS mode: ${this.mode.toUpperCase()} (${this.reason}) - auto-trader ${this.config.enabled ? 'armed' : 'off'}`)
+    ctx.log(
+      'mode',
+      `OS mode: ${this.mode.toUpperCase()} (${this.reason}) - auto-trader ${this.config.enabled ? 'armed' : 'off'} · src ${this.config.signalSource}`
+    )
   }
 
   stop(): void {
@@ -255,13 +274,18 @@ export class ModeService {
     this.rt.openCount += 1
     this.rt.lastRejection = undefined
     this.rt.lastAction = `${side.toUpperCase()} ${row.asset}`
+    const detail =
+      this.config.signalSource === 'kalman-ou'
+        ? `OU z ${row.ouZ.toFixed(2)}σ · HL ${row.ouHalfLife >= 9999 ? '∞' : row.ouHalfLife.toFixed(0)}b · t ${row.ouTStat.toFixed(1)} · edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)}`
+        : `score ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} regime ${row.regime}`
     this.emit(
       'success',
-      `[AUTO-TRADER] ${side.toUpperCase()} ${row.asset} ${this.config.tf} $${this.config.stake} binary - score ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} regime ${row.regime}`
+      `[AUTO-TRADER] ${side.toUpperCase()} ${row.asset} ${this.config.tf} $${this.config.stake} binary - ${detail}`
     )
   }
 
   private pickSignal(): ScreenRow | null {
+    if (this.config.signalSource === 'kalman-ou') return this.pickOUSignal()
     try {
       const screener = this.ctx.use<ScreenerService>('screener')
       const dir = this.config.direction === 'both' ? undefined : this.config.direction
@@ -292,6 +316,47 @@ export class ModeService {
     return null
   }
 
+  /**
+   * Kalman/OU mean-reversion source: sweep the open universe with the cheap
+   * screener path (rows carry the fitted OU state) and fade statistically
+   * stretched pairs - CALL when price sits |z| sigmas BELOW the OU equilibrium,
+   * PUT above - but only when the fit itself says the series actually reverts
+   * (t-stat gate) and fast enough to be tradeable (half-life cap).
+   */
+  private pickOUSignal(): ScreenRow | null {
+    try {
+      const screener = this.ctx.use<ScreenerService>('screener')
+      const market = this.ctx.use<MarketDataService>('market')
+      const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
+      // liquid pairs first so early ticks evaluate the deepest books, then the tail
+      const candidates = [...LIQUID_CANDIDATES.filter((a) => open.includes(a)), ...open.filter((a) => !LIQUID_CANDIDATES.includes(a))]
+      for (const asset of candidates) {
+        if (this.assetBlocked(asset)) continue
+        try {
+          const base = screener.evaluate(asset, this.config.tf) // cached when fresh, recomputed when stale
+          if (!base.ouMeanReverting) continue // fit not significant - fading a random walk is how accounts die
+          if (base.ouHalfLife > this.config.maxHalfLife) continue // reverts too slowly to be tradeable
+          const dir: 'call' | 'put' | 'none' =
+            base.ouZ <= -this.config.zEntry ? 'call' : base.ouZ >= this.config.zEntry ? 'put' : 'none'
+          if (dir === 'none') continue
+          if (this.config.direction !== 'both' && dir !== this.config.direction) continue
+          const az = Math.abs(base.ouZ)
+          // same edge-score shape as the kalman-ou-reversion strategy so thresholds feel consistent
+          const score = Math.round(clamp(45 + (az - this.config.zEntry) * 20 + Math.min(18, Math.max(0, base.ouTStat) * 3), 42, 95))
+          const confidence = Math.round(clamp(40 + (base.ouTStat - 1.5) * 20 + (az - this.config.zEntry) * 8, 35, 95))
+          if (score < this.config.minScore) continue
+          if (confidence < this.config.minConfidence) continue
+          return { ...base, score, confidence, direction: dir }
+        } catch {
+          // thin history for this pair - try the next
+        }
+      }
+    } catch {
+      // screener/market not loaded - no signal source
+    }
+    return null
+  }
+
   private async place(row: ScreenRow, side: 'call' | 'put'): Promise<{ ok: boolean; error?: string }> {
     try {
       const exec = this.ctx.use<{
@@ -315,7 +380,7 @@ export class ModeService {
         amount: this.config.stake,
         expiryBars: 1,
         mode: 'paper',
-        strategy: 'screener-auto',
+        strategy: this.config.signalSource === 'kalman-ou' ? 'kalman-ou-reversion' : 'screener-auto',
         note: AUTOTRADER_NOTE,
       })
     } catch {
@@ -407,12 +472,14 @@ export class ModeService {
   // ---------- config ----------
 
   configure(patch: Partial<AutoTraderConfig>): { ok: boolean; config: AutoTraderConfig; error?: string } {
-    const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
     if (patch.enabled !== undefined) this.config.enabled = Boolean(patch.enabled)
+    if (patch.signalSource !== undefined) this.config.signalSource = patch.signalSource === 'kalman-ou' ? 'kalman-ou' : 'screener'
     if (patch.tf !== undefined) this.config.tf = String(patch.tf) as Timeframe
     if (patch.stake !== undefined) this.config.stake = clamp(Number(patch.stake) || DEFAULT_AUTOTRADER.stake, 1, 5000)
     if (patch.minScore !== undefined) this.config.minScore = clamp(Number(patch.minScore) || 0, 0, 100)
     if (patch.minConfidence !== undefined) this.config.minConfidence = clamp(Number(patch.minConfidence) || 0, 0, 100)
+    if (patch.zEntry !== undefined) this.config.zEntry = clamp(Number(patch.zEntry) || DEFAULT_AUTOTRADER.zEntry, 0.5, 4)
+    if (patch.maxHalfLife !== undefined) this.config.maxHalfLife = Math.round(clamp(Number(patch.maxHalfLife) || DEFAULT_AUTOTRADER.maxHalfLife, 5, 999))
     if (patch.direction !== undefined && ['both', 'call', 'put'].includes(String(patch.direction)))
       this.config.direction = String(patch.direction) as AutoTraderConfig['direction']
     if (patch.maxOpen !== undefined) this.config.maxOpen = Math.round(clamp(Number(patch.maxOpen) || 1, 1, 10))
@@ -424,7 +491,7 @@ export class ModeService {
     this.rt.lastRejection = undefined
     this.emit(
       'info',
-      `AUTO-TRADER config: ${this.config.enabled ? 'armed' : 'off'} · ${this.config.tf} · stake $${this.config.stake} · minScore ${this.config.minScore} · minConf ${this.config.minConfidence} · maxOpen ${this.config.maxOpen} · cooldown ${this.config.cooldownSec}s`
+      `AUTO-TRADER config: ${this.config.enabled ? 'armed' : 'off'} · src ${this.config.signalSource}${this.config.signalSource === 'kalman-ou' ? ` (z ≥ ${this.config.zEntry}σ · HL ≤ ${this.config.maxHalfLife}b)` : ''} · ${this.config.tf} · stake $${this.config.stake} · minScore ${this.config.minScore} · minConf ${this.config.minConfidence} · maxOpen ${this.config.maxOpen} · cooldown ${this.config.cooldownSec}s`
     )
     return { ok: true, config: { ...this.config } }
   }

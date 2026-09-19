@@ -479,7 +479,7 @@ const TOOLS: ToolSpec[] = [
   // ---------- discovery: screener + alert rules ----------
   {
     name: 'screener_scan',
-    description: 'Query the OS screener - a live background scanner that ranks the ENTIRE universe (80+ instruments x multiple timeframes) by composite signal strength. Filters: tf ("1m"|"5m"|"15m"|... omit for all), category (forex|otc|crypto|commodity|stock|index|all), direction (call|put|all), minScore (0-90), q (symbol search), limit. THE tool for "find me the hottest setups right now".',
+    description: 'Query the OS screener - a live background scanner that ranks the ENTIRE universe (80+ instruments x multiple timeframes) by composite signal strength. Filters: tf ("1m"|"5m"|"15m"|... omit for all), category (forex|otc|crypto|commodity|stock|index|all), direction (call|put|all), minScore (0-90), q (symbol search), limit. Every row also carries the Kalman/OU mean-reversion edge: ou_z (sigmas from the OU equilibrium, positive = stretched above), ou_mean_reverting (fit significance), ou_half_life (bars). THE tool for "find me the hottest setups right now".',
     args: '{"direction": "call", "minScore": 50, "tf": "5m", "category": "crypto", "limit": 10}',
     run: (a) => {
       const p = new URLSearchParams()
@@ -596,15 +596,18 @@ const TOOLS: ToolSpec[] = [
   },
   {
     name: 'autotrader_configure',
-    description: 'Tune the built-in AUTO-TRADER (the OS acting as its own trader in NO-HUMAN mode): enabled (bool), tf (signal timeframe), stake, minScore (min |composite score|), minConfidence (0-100), direction (both|call|put), maxOpen (concurrent), cooldownSec (per-asset), paceSec (between any two trades), dailyProfitTarget / dailyLossLimit (USD, 0=off). It trades 1-bar binary options on the strongest screener signals.',
+    description: 'Tune the built-in AUTO-TRADER (the OS acting as its own trader in NO-HUMAN mode): signalSource ("screener" = full composite signals, "kalman-ou" = fade statistically stretched pairs via the Ornstein-Uhlenbeck/Kalman fit, gated by reversion significance + half-life), enabled (bool), tf (signal timeframe), stake, minScore (min |score|), minConfidence (0-100), zEntry (kalman-ou only: |z| in sigmas required to enter, 0.5-4), maxHalfLife (kalman-ou only: skip pairs with slower reversion, bars), direction (both|call|put), maxOpen (concurrent), cooldownSec (per-asset), paceSec (between any two trades), dailyProfitTarget / dailyLossLimit (USD, 0=off). It trades 1-bar binary options.',
     args: '{"enabled": true, "tf": "1m", "stake": 10, "minScore": 60, "maxOpen": 3}',
     run: (a) =>
       corePost('/autotrader_config', {
         ...(a.enabled !== undefined ? { enabled: Boolean(a.enabled) } : {}),
+        ...(a.signalSource !== undefined ? { signalSource: String(a.signalSource) } : {}),
         ...(a.tf !== undefined ? { tf: String(a.tf) } : {}),
         ...(a.stake !== undefined ? { stake: Number(a.stake) } : {}),
         ...(a.minScore !== undefined ? { minScore: Number(a.minScore) } : {}),
         ...(a.minConfidence !== undefined ? { minConfidence: Number(a.minConfidence) } : {}),
+        ...(a.zEntry !== undefined ? { zEntry: Number(a.zEntry) } : {}),
+        ...(a.maxHalfLife !== undefined ? { maxHalfLife: Number(a.maxHalfLife) } : {}),
         ...(a.direction !== undefined ? { direction: String(a.direction) } : {}),
         ...(a.maxOpen !== undefined ? { maxOpen: Number(a.maxOpen) } : {}),
         ...(a.cooldownSec !== undefined ? { cooldownSec: Number(a.cooldownSec) } : {}),

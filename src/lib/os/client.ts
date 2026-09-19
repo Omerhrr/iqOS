@@ -696,6 +696,10 @@ export interface ScreenRow {
   confidence: number
   pUp: number
   regime: 'bull' | 'bear' | 'range' | 'chop'
+  ouZ: number
+  ouHalfLife: number
+  ouMeanReverting: boolean
+  ouTStat: number
   rsi: number
   adx: number
   atrPct: number
@@ -725,10 +729,13 @@ export type OsMode = 'human' | 'auto'
 
 export interface AutoTraderConfig {
   enabled: boolean
+  signalSource: 'screener' | 'kalman-ou'
   tf: Timeframe
   stake: number
   minScore: number
   minConfidence: number
+  zEntry: number
+  maxHalfLife: number
   direction: 'both' | 'call' | 'put'
   maxOpen: number
   cooldownSec: number
