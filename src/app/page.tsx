@@ -42,6 +42,7 @@ const BOOT_MSGS = [
   'analytics: markov + montecarlo engines fitted',
   'execution: binary · turbo · digital · cfd broker + risk manager ready',
   'sentinel: circuit breakers armed · exposure caps · trade throttle',
+  'watchdog: strategy drift guardian watching the bot fleet',
   'IQAIR//OS ready',
 ]
 
@@ -180,6 +181,18 @@ export default function OSPage() {
         .catch(() => setSentinelArmed(false))
     poll()
     const t = setInterval(poll, 5000)
+    return () => clearInterval(t)
+  }, [])
+
+  // watchdog status polling - feeds the strategy-health chip in the status bar
+  const [watchdogStopped, setWatchdogStopped] = useState(0)
+  useEffect(() => {
+    const poll = () =>
+      void osGet<{ ok: boolean; summary: { hold: number; disarmed: number } }>('/watchdog')
+        .then((d) => setWatchdogStopped(d.ok ? d.summary.hold + d.summary.disarmed : 0))
+        .catch(() => setWatchdogStopped(0))
+    poll()
+    const t = setInterval(poll, 10000)
     return () => clearInterval(t)
   }, [])
 
@@ -587,6 +600,12 @@ export default function OSPage() {
             <span className="flex items-center gap-1 animate-pulse text-rose-400">
               <span className="h-1.5 w-1.5 rounded-full bg-rose-500" />
               sentinel: breaker tripped
+            </span>
+          )}
+          {watchdogStopped > 0 && (
+            <span className="flex items-center gap-1 animate-pulse text-amber-400">
+              <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
+              watchdog: {watchdogStopped} bot{watchdogStopped === 1 ? '' : 's'} held
             </span>
           )}
         </div>

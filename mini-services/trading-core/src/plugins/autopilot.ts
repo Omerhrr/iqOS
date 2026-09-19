@@ -167,6 +167,12 @@ export class AutopilotService {
     const ok = this.store.deleteBot(id)
     if (ok) {
       this.runtime.delete(id)
+      try {
+        const wd = this.ctx.use<{ clearBot: (botId: string) => void }>('watchdog')
+        wd.clearBot(id)
+      } catch {
+        // watchdog not loaded
+      }
       this.emit('info', `Bot ${id} deleted`)
     }
     return { ok, error: ok ? undefined : 'bot not found' }
@@ -229,6 +235,16 @@ export class AutopilotService {
     if (rt.openCount >= bot.maxOpen) return this.reject(bot, `max open positions (${bot.maxOpen})`)
     if (bot.cooldownSec > 0 && rt.lastTradeTs > 0 && Math.floor(Date.now() / 1000) - rt.lastTradeTs < bot.cooldownSec) {
       return this.reject(bot, 'cooldown between trades')
+    }
+
+    // watchdog gate: strategy-health ladder (WATCH informs, HOLD blocks for a
+    // window, DISARMED blocks until an operator acks + re-arms the bot)
+    try {
+      const wd = this.ctx.use<{ preTrade: (botId: string) => { ok: boolean; reason?: string } }>('watchdog')
+      const w = wd.preTrade(bot.id)
+      if (!w.ok) return this.reject(bot, w.reason ?? 'watchdog health hold')
+    } catch {
+      // watchdog plugin not loaded - health gating disabled
     }
 
     // strategy evaluation (pure, on closed candles)

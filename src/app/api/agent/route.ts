@@ -549,6 +549,38 @@ const TOOLS: ToolSpec[] = [
     args: '{"breaker": "drawdown"}',
     run: (a) => corePost('/sentinel_ack', a.breaker ? { breaker: a.breaker } : {}),
   },
+  // ---------- watchdog: strategy health ----------
+  {
+    name: 'watchdog_status',
+    description: 'Strategy-health snapshot for the autopilot fleet: per-bot rolling win rate / profit factor / loss streak vs baseline, escalation level (HEALTHY | WATCH | HOLD | DISARMED) with reasons, lifetime P&L vs peak, window P&L, ack counts and the watchdog event feed. Check this when a bot is losing or before/after arming a bot.',
+    args: '{}',
+    run: () => coreGet('/watchdog'),
+  },
+  {
+    name: 'watchdog_ack',
+    description: 'Acknowledge watchdog degradation for one bot (botId) or all bots - resets its health level, clears holds/disarm flags and recalibrates the rolling window. Only use after the user agrees to resume; if the edge is still gone, the watchdog will re-escalate on its own.',
+    args: '{"botId": "bot-abc123"}',
+    run: (a) => corePost('/watchdog_ack', a.botId ? { botId: a.botId } : {}),
+  },
+  {
+    name: 'watchdog_configure',
+    description: 'Tune persisted watchdog thresholds: windowTrades (rolling window), minTrades (before judging), winRateFloorPct (hard floor), winRateDriftPct (points below baseline that degrades), profitFactorFloor (0=off), maxConsecLosses (0=off), graceTrades (before HOLD), holdMinutes (block duration), botDrawdownUsd (0=off), autoDisarm (bool), expectedWinRatePct (fleet default baseline).',
+    args: '{"windowTrades": 30, "minTrades": 10, "winRateFloorPct": 38, "winRateDriftPct": 12, "autoDisarm": true}',
+    run: (a) =>
+      corePost('/watchdog_config', {
+        ...(a.windowTrades !== undefined ? { windowTrades: Number(a.windowTrades) } : {}),
+        ...(a.minTrades !== undefined ? { minTrades: Number(a.minTrades) } : {}),
+        ...(a.winRateFloorPct !== undefined ? { winRateFloorPct: Number(a.winRateFloorPct) } : {}),
+        ...(a.winRateDriftPct !== undefined ? { winRateDriftPct: Number(a.winRateDriftPct) } : {}),
+        ...(a.profitFactorFloor !== undefined ? { profitFactorFloor: Number(a.profitFactorFloor) } : {}),
+        ...(a.maxConsecLosses !== undefined ? { maxConsecLosses: Number(a.maxConsecLosses) } : {}),
+        ...(a.graceTrades !== undefined ? { graceTrades: Number(a.graceTrades) } : {}),
+        ...(a.holdMinutes !== undefined ? { holdMinutes: Number(a.holdMinutes) } : {}),
+        ...(a.botDrawdownUsd !== undefined ? { botDrawdownUsd: Number(a.botDrawdownUsd) } : {}),
+        ...(a.autoDisarm !== undefined ? { autoDisarm: Boolean(a.autoDisarm) } : {}),
+        ...(a.expectedWinRatePct !== undefined ? { expectedWinRatePct: Number(a.expectedWinRatePct) } : {}),
+      }),
+  },
   // ---------- OS control (executed client-side) ----------
   {
     name: 'ui_control',
@@ -668,7 +700,7 @@ const TOOLS: ToolSpec[] = [
 const TOOL_LIST_TEXT = TOOLS.map((t) => `- ${t.name}: ${t.description} args: ${t.args}`).join('\n')
 
 const SYSTEM_BASE = `You are the IQAIR//OS Copilot - an expert quantitative trading analyst embedded as the AI of a trading operating system built on the iqair IQ Option library.
-You can analyze markets (100+ technical indicators, 35 candlestick + chart patterns, Markov chains, Monte Carlo, Hurst exponent, GARCH volatility), DISCOVER setups with the market-wide screener (screener_scan ranks every instrument x timeframe by signal strength - start there when the user asks "what's moving" or "find setups"), place PAPER trades through the risk manager, deploy and manage AUTONOMOUS autopilot bots (bot_create / bot_toggle / bot_delete / autopilot_status - they trade every qualifying signal automatically under the global risk manager), set standing ALERT RULES that watch instruments and fire OS alerts (alert_rule_create / alert_rule_list / alert_rule_delete - use them when the user wants to be notified, e.g. "tell me when BTC RSI drops below 30"), review the realized trade journal (journal_stats), control the user's workspace (switch charts, timeframes, add indicators), and govern RISK through the sentinel layer (sentinel_status shows breakers/exposure/drawdown, sentinel_configure tunes portfolio limits, panic_close_all flattens everything, sentinel_ack resets tripped breakers). If a trade or bot order is rejected with a "sentinel:" reason, explain which limit or breaker fired - never suggest workarounds, limits are there to protect the account; resume only when the user explicitly accepts the risk.
+You can analyze markets (100+ technical indicators, 35 candlestick + chart patterns, Markov chains, Monte Carlo, Hurst exponent, GARCH volatility), DISCOVER setups with the market-wide screener (screener_scan ranks every instrument x timeframe by signal strength - start there when the user asks "what's moving" or "find setups"), place PAPER trades through the risk manager, deploy and manage AUTONOMOUS autopilot bots (bot_create / bot_toggle / bot_delete / autopilot_status - they trade every qualifying signal automatically under the global risk manager), set standing ALERT RULES that watch instruments and fire OS alerts (alert_rule_create / alert_rule_list / alert_rule_delete - use them when the user wants to be notified, e.g. "tell me when BTC RSI drops below 30"), review the realized trade journal (journal_stats), control the user's workspace (switch charts, timeframes, add indicators), and govern RISK through the sentinel layer (sentinel_status shows breakers/exposure/drawdown, sentinel_configure tunes portfolio limits, panic_close_all flattens everything, sentinel_ack resets tripped breakers), and guard LIVE STRATEGY HEALTH through the watchdog layer (watchdog_status shows each bot's rolling win rate vs its baseline and its escalation level - WATCH alerts, HOLD blocks the bot's orders, DISARMED stopped the bot; watchdog_ack resumes a held bot only when the user agrees, watchdog_configure tunes thresholds). If a bot order is rejected with a "watchdog:" reason, explain that the strategy is degrading vs its baseline - never suggest bypassing it; if a bot is on WATCH, surface the numbers and recommend re-validating with the research workflow. If a trade or bot order is rejected with a "sentinel:" reason, explain which limit or breaker fired - never suggest workarounds, limits are there to protect the account; resume only when the user explicitly accepts the risk.
 
 Tool protocol - follow it EXACTLY:
 - Respond with ONE JSON object and nothing else. No markdown fences, no prose outside the JSON.
@@ -683,7 +715,7 @@ Rules:
 - Use ui_control to set up the workspace when it helps (e.g. add Bollinger + RSI before a detailed read, or switch to the asset you're discussing). Do not undo the user's layout gratuitously.
 - For trade ideas: check multi_timeframe confluence first, size with risk_calculator, then optionally place_trade as PAPER and say so.
 - When the user asks to automate a strategy, deploy a bot with bot_create: pick a sensible strategyId, conservative stake (<=2% of balance), minScore >= 55, and always confirm the config in your final answer. Backtest or run_strategy first when unsure about the edge.
-- RESEARCH WORKFLOW (use it whenever the user wants a validated strategy or asks "is this edge real"): 1) asset_sweep to find WHERE a strategy has an edge, 2) optimize_strategy on the best assets to find strong params, 3) walkforward on the winner - deploy only if OOS net is positive and at least half the folds were profitable, 4) only then bot_create with the validated params (keep the bot DISARMED and tell the user to arm it when ready). Report IS vs OOS numbers honestly - large drops from in-sample to out-of-sample mean overfit.
+- RESEARCH WORKFLOW (use it whenever the user wants a validated strategy or asks "is this edge real"): 1) asset_sweep to find WHERE a strategy has an edge, 2) optimize_strategy on the best assets to find strong params, 3) walkforward on the winner - deploy only if OOS net is positive and at least half the folds were profitable, 4) only then bot_create with the validated params (keep the bot DISARMED and tell the user to arm it when ready). After arming, the watchdog watches the live edge - mention that. Report IS vs OOS numbers honestly - large drops from in-sample to out-of-sample mean overfit.
 - When the user asks to be notified/watch an instrument ("alert me when...", "let me know if..."), create an alert rule with alert_rule_create and confirm the trigger in plain words. NEVER use alert rules to trade - they only notify.
 - NEVER promise profits. Always frame outputs as probabilistic analysis, not certainty.
 - PAPER trades only - you cannot and must not place live trades.

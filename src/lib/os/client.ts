@@ -352,6 +352,77 @@ export interface SentinelStatus {
   events: RiskEvent[]
 }
 
+// ---------- watchdog (strategy health) ----------
+
+export interface WatchdogConfig {
+  windowTrades: number
+  minTrades: number
+  winRateFloorPct: number
+  winRateDriftPct: number
+  profitFactorFloor: number
+  maxConsecLosses: number
+  graceTrades: number
+  holdMinutes: number
+  botDrawdownUsd: number
+  autoDisarm: boolean
+  expectedWinRatePct: number
+}
+
+export interface WatchdogMetrics {
+  windowSize: number
+  trades: number
+  wins: number
+  winRatePct: number
+  pf: number
+  netPnl: number
+  consecLosses: number
+  baselinePct: number
+  totalTrades: number
+  totalWins: number
+  cumPnl: number
+  peakPnl: number
+  ddFromPeak: number
+}
+
+export interface WatchdogBotHealth {
+  botId: string
+  name: string
+  strategyId: string
+  tf: string
+  enabled: boolean
+  level: 0 | 1 | 2 | 3
+  levelLabel: 'HEALTHY' | 'WATCH' | 'HOLD' | 'DISARMED'
+  reason: string
+  sinceTs: number
+  holdUntil: number
+  degradedStreak: number
+  acks: number
+  baselineOverridePct: number
+  metrics: WatchdogMetrics
+}
+
+export interface WatchdogEvent {
+  ts: number
+  botId: string
+  kind: string
+  message: string
+}
+
+export interface WatchdogSummary {
+  total: number
+  healthy: number
+  watch: number
+  hold: number
+  disarmed: number
+}
+
+export interface WatchdogStatus {
+  config: WatchdogConfig
+  bots: WatchdogBotHealth[]
+  summary: WatchdogSummary
+  events: WatchdogEvent[]
+}
+
 export interface StrategyInfo {
   id: string
   name: string

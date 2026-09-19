@@ -14,6 +14,7 @@ import { autopilotPlugin, AutopilotService, type BotConfig } from './src/plugins
 import { screenerPlugin, ScreenerService } from './src/plugins/screener'
 import { alertRulesPlugin, AlertRulesService, ALERT_METRICS } from './src/plugins/alert-rules'
 import { sentinelPlugin, SentinelService, type SentinelConfig } from './src/plugins/sentinel'
+import { watchdogPlugin, WatchdogService, type WatchdogConfig } from './src/plugins/watchdog'
 import { gridSearch, walkForward, sweepAssets, type Objective } from './src/strategies/optimize'
 import { ALL_TIMEFRAMES, type Timeframe } from './src/types'
 import { searchInstruments, UNIVERSE_STATS, getInstrument } from './src/universe'
@@ -31,6 +32,7 @@ kernel.register(autopilotPlugin)
 kernel.register(screenerPlugin)
 kernel.register(alertRulesPlugin)
 kernel.register(sentinelPlugin)
+kernel.register(watchdogPlugin)
 
 const httpServer = createServer(async (req, res) => {
   res.setHeader('access-control-allow-origin', '*')
@@ -225,6 +227,13 @@ const httpServer = createServer(async (req, res) => {
       if (path === '/risk_events') {
         const store = kernel.context().use<{ listRiskEvents: (l?: number) => { ts: number; kind: string; message: string }[] }>('storeRaw')
         return json(200, { ok: true, events: store.listRiskEvents(60) })
+      }
+
+      // ---------- watchdog: strategy health ----------
+
+      if (path === '/watchdog') {
+        const wd = kernel.context().use<WatchdogService>('watchdog')
+        return json(200, { ok: true, ...wd.status() })
       }
 
 
@@ -580,6 +589,23 @@ const httpServer = createServer(async (req, res) => {
       if (path === '/panic') {
         const sen = kernel.context().use<SentinelService>('sentinel')
         return json(200, sen.panic({ killSwitch: Boolean(body.killSwitch) }))
+      }
+
+      // ---------- watchdog control ----------
+
+      if (path === '/watchdog_config') {
+        const wd = kernel.context().use<WatchdogService>('watchdog')
+        return json(200, { ok: true, config: wd.configure(body as Partial<WatchdogConfig>) })
+      }
+
+      if (path === '/watchdog_ack') {
+        const wd = kernel.context().use<WatchdogService>('watchdog')
+        return json(200, wd.ack(body.botId ? String(body.botId) : undefined))
+      }
+
+      if (path === '/watchdog_baseline') {
+        const wd = kernel.context().use<WatchdogService>('watchdog')
+        return json(200, wd.setBaseline(String(body.botId ?? ''), Number(body.expectedWinRatePct ?? 0)))
       }
     }
 

@@ -21,6 +21,7 @@ import JournalTab from './JournalTab'
 import ScreenerPanel from './ScreenerPanel'
 import AlertRulesPanel from './AlertRulesPanel'
 import SentinelPanel from './SentinelPanel'
+import WatchdogPanel from './WatchdogPanel'
 
 interface BottomTabsProps {
   asset: string
@@ -74,6 +75,7 @@ export default function BottomTabs(props: BottomTabsProps) {
             ['screener', 'Screener'],
             ['autopilot', `Autopilot${props.bots.filter((b) => b.bot.enabled).length ? ` (${props.bots.filter((b) => b.bot.enabled).length})` : ''}`],
             ['sentinel', 'Sentinel'],
+            ['watchdog', 'Watchdog'],
             ['journal', 'Journal'],
             ['backtest', 'Backtest Lab'],
             ['strategies', 'Strategy Lab'],
@@ -217,6 +219,13 @@ export default function BottomTabs(props: BottomTabsProps) {
       <TabsContent value="sentinel" className="mt-0 min-h-0 flex-1 overflow-hidden">
         <div className="h-full">
           <SentinelPanel onError={onError} onAccountChanged={props.refreshAccount} />
+        </div>
+      </TabsContent>
+
+      {/* WATCHDOG (strategy health) */}
+      <TabsContent value="watchdog" className="mt-0 min-h-0 flex-1 overflow-hidden">
+        <div className="h-full">
+          <WatchdogPanel onError={onError} />
         </div>
       </TabsContent>
 

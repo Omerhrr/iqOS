@@ -89,6 +89,22 @@ export class Store {
         kind TEXT NOT NULL,
         message TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS watchdog_config (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        config TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS watchdog_state (
+        bot_id TEXT PRIMARY KEY,
+        state TEXT NOT NULL,
+        updated_ts INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS watchdog_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        bot_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        message TEXT NOT NULL
+      );
     `)
   }
 
@@ -375,6 +391,62 @@ export class Store {
     return this.db
       .query('SELECT ts, kind, message FROM risk_events ORDER BY id DESC LIMIT ?')
       .all(limit) as { ts: number; kind: string; message: string }[]
+  }
+
+  // ---------- watchdog (strategy health) ----------
+
+  getWatchdogConfig(): unknown | null {
+    const row = this.db.query('SELECT config FROM watchdog_config WHERE id = 1').get() as { config: string } | null
+    if (!row) return null
+    try {
+      return JSON.parse(row.config)
+    } catch {
+      return null
+    }
+  }
+
+  saveWatchdogConfig(config: unknown): void {
+    this.db.run('INSERT INTO watchdog_config (id, config) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET config = excluded.config', [
+      JSON.stringify(config),
+    ])
+  }
+
+  getWatchdogStates(): { botId: string; state: unknown; updatedTs: number }[] {
+    const rows = this.db.query('SELECT bot_id, state, updated_ts FROM watchdog_state').all() as {
+      bot_id: string
+      state: string
+      updated_ts: number
+    }[]
+    return rows.map((r) => {
+      try {
+        return { botId: r.bot_id, state: JSON.parse(r.state), updatedTs: r.updated_ts }
+      } catch {
+        // corrupted row - drop it rather than poison the health engine
+        this.db.run('DELETE FROM watchdog_state WHERE bot_id = ?', [r.bot_id])
+        return null
+      }
+    }).filter((x): x is { botId: string; state: unknown; updatedTs: number } => x !== null)
+  }
+
+  saveWatchdogState(botId: string, state: unknown): void {
+    this.db.run(
+      'INSERT INTO watchdog_state (bot_id, state, updated_ts) VALUES (?, ?, ?) ON CONFLICT(bot_id) DO UPDATE SET state = excluded.state, updated_ts = excluded.updated_ts',
+      [botId, JSON.stringify(state), Math.floor(Date.now() / 1000)]
+    )
+  }
+
+  deleteWatchdogState(botId: string): void {
+    this.db.run('DELETE FROM watchdog_state WHERE bot_id = ?', [botId])
+  }
+
+  recordWatchdogEvent(botId: string, kind: string, message: string, ts: number): void {
+    this.db.run('INSERT INTO watchdog_events (ts, bot_id, kind, message) VALUES (?, ?, ?, ?)', [ts, botId, kind, message])
+  }
+
+  listWatchdogEvents(limit = 50): { ts: number; bot_id: string; kind: string; message: string }[] {
+    return this.db
+      .query('SELECT ts, bot_id, kind, message FROM watchdog_events ORDER BY id DESC LIMIT ?')
+      .all(limit) as { ts: number; bot_id: string; kind: string; message: string }[]
   }
 
   stats(): { trades: number; wins: number; losses: number; netPnl: number } {
