@@ -302,8 +302,8 @@ const httpServer = createServer(async (req, res) => {
 
       if (path === '/journal') {
         const store = kernel.context().use<{ journal: (p?: string, l?: number) => unknown[]; stats: () => unknown }>('storeRaw')
-        const scope = q.get('scope') ?? 'all' // all | bots
-        const trades = store.journal(scope === 'bots' ? 'bot:' : undefined, 500) as {
+        const scope = q.get('scope') ?? 'all' // all | bots | auto | manual
+        let trades: {
           tsOpen: number
           tsClose?: number
           asset: string
@@ -313,7 +313,15 @@ const httpServer = createServer(async (req, res) => {
           amount: number
           pnl?: number
           status: string
+          note?: string
         }[]
+        if (scope === 'bots') trades = store.journal('bot:', 500) as typeof trades
+        else if (scope === 'auto') trades = store.journal('auto:', 500) as typeof trades
+        else if (scope === 'manual')
+          trades = (store.journal(undefined, 800) as typeof trades).filter(
+            (t) => !(t.note ?? '').startsWith('bot:') && !(t.note ?? '').startsWith('auto:')
+          )
+        else trades = store.journal(undefined, 500) as typeof trades
         const closed = trades.filter((t) => t.status === 'won' || t.status === 'lost')
         const wins = closed.filter((t) => t.status === 'won')
         const losses = closed.filter((t) => t.status === 'lost')
@@ -361,6 +369,9 @@ const httpServer = createServer(async (req, res) => {
           },
           curve,
           byStrategy: group((t) => t.strategy ?? ''),
+          byOrigin: group((t) =>
+            (t.note ?? '').startsWith('bot:') ? 'autopilot' : (t.note ?? '').startsWith('auto:') ? 'auto-trader' : 'manual'
+          ),
           byAsset: group((t) => t.asset),
           byKind: group((t) => t.kind),
           bySide: group((t) => t.side),

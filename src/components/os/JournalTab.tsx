@@ -8,7 +8,14 @@ import { useCallback, useEffect, useState } from 'react'
 import type { JournalGroupRow, JournalSummary, Position } from '@/lib/os/client'
 import { fmtMoney, fmtTime, osGet } from '@/lib/os/client'
 
-type Scope = 'all' | 'bots'
+type Scope = 'all' | 'bots' | 'auto' | 'manual'
+
+const SCOPES: { id: Scope; label: string }[] = [
+  { id: 'all', label: 'All trades' },
+  { id: 'bots', label: 'Autopilot' },
+  { id: 'auto', label: 'Auto-trader' },
+  { id: 'manual', label: 'Manual' },
+]
 
 export default function JournalTab() {
   const [scope, setScope] = useState<Scope>('all')
@@ -45,16 +52,16 @@ export default function JournalTab() {
             realized · last 500 closed
           </span>
         </h3>
-        <div className="grid grid-cols-2 gap-0.5 rounded bg-[#101828] p-0.5">
-          {(['all', 'bots'] as Scope[]).map((s) => (
+        <div className="grid grid-cols-4 gap-0.5 rounded bg-[#101828] p-0.5">
+          {SCOPES.map((s) => (
             <button
-              key={s}
-              onClick={() => setScope(s)}
-              className={`rounded px-2.5 py-0.5 text-[9px] font-bold uppercase tracking-wider transition-colors ${
-                scope === s ? 'bg-[#1c2739] text-cyan-300' : 'text-[#4b5a72] hover:text-[#aab6cc]'
+              key={s.id}
+              onClick={() => setScope(s.id)}
+              className={`rounded px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider transition-colors ${
+                scope === s.id ? 'bg-[#1c2739] text-cyan-300' : 'text-[#4b5a72] hover:text-[#aab6cc]'
               }`}
             >
-              {s === 'all' ? 'All trades' : 'Autopilot'}
+              {s.label}
             </button>
           ))}
         </div>
@@ -83,6 +90,7 @@ export default function JournalTab() {
 
           {/* grouped tables */}
           <div className="col-span-2 grid grid-cols-2 gap-2">
+            <GroupTable title="By origin" rows={data?.byOrigin ?? []} />
             <GroupTable title="By strategy" rows={data?.byStrategy ?? []} />
             <GroupTable title="By instrument" rows={data?.byAsset ?? []} />
             <GroupTable title="By instrument type" rows={data?.byKind ?? []} />
@@ -234,6 +242,8 @@ function RecentRow({ p }: { p: Position }) {
       <td className="px-2 py-1 text-[#4b5a72]">
         {p.note?.startsWith('bot:') ? (
           <span className="rounded bg-cyan-500/10 px-1 py-px text-cyan-300">autopilot</span>
+        ) : p.note?.startsWith('auto:') ? (
+          <span className="rounded bg-amber-500/10 px-1 py-px text-amber-300">auto-trader</span>
         ) : (
           p.strategy ?? 'manual'
         )}

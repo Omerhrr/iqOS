@@ -28,6 +28,7 @@ import type {
   ChartType,
   IndicatorSeries,
   OsMode,
+  OsModeStatus,
   Position,
   RegistryEntry,
   RiskConfig,
@@ -209,19 +210,24 @@ export default function OSPage() {
     return () => clearInterval(t)
   }, [])
 
-  // os mode polling - feeds the menu-bar toggle + the autonomy chip in the status bar
-  const [osMode, setOsMode] = useState<OsMode>('human')
-  useEffect(() => {
-    const poll = () =>
-      void osGet<{ ok: boolean; mode: OsMode }>('/mode')
-        .then((d) => {
-          if (d.ok) setOsMode(d.mode)
-        })
-        .catch(() => {})
-    poll()
-    const t = setInterval(poll, 5000)
-    return () => clearInterval(t)
+  // os mode polling - feeds the menu-bar toggle, the autonomy chip in the
+  // status bar and the auto-trader strip in the Autopilot panel
+  const [modeStatus, setModeStatus] = useState<OsModeStatus | null>(null)
+  const loadMode = useCallback(async () => {
+    try {
+      const d = await osGet<{ ok: boolean } & OsModeStatus>('/mode')
+      if (d.ok)
+        setModeStatus({ mode: d.mode, ts: d.ts, reason: d.reason, autotrader: d.autotrader })
+    } catch {
+      /* kernel not up yet */
+    }
   }, [])
+  useEffect(() => {
+    void loadMode()
+    const t = setInterval(() => void loadMode(), 5000)
+    return () => clearInterval(t)
+  }, [loadMode])
+  const osMode: OsMode = modeStatus?.mode ?? 'human'
 
   // initial load
   useEffect(() => {
@@ -466,7 +472,10 @@ export default function OSPage() {
         onSelectTf={setTf}
         onChartTypeChange={setChartType}
         onOpenPicker={() => setPickerOpen(true)}
-        onModeChanged={setOsMode}
+        onModeChanged={(m) => {
+          setModeStatus((s) => (s ? { ...s, mode: m } : s))
+          void loadMode()
+        }}
         onRiskChanged={setRisk}
         onAccountChanged={setAccount}
         onError={(m) => pushToast('danger', m)}
@@ -502,7 +511,8 @@ export default function OSPage() {
               bots={bots}
               price={livePrice}
               prices={prices}
-              mode={osMode}
+              modeStatus={modeStatus}
+              refreshMode={loadMode}
               refreshPositions={loadPositions}
               refreshBots={loadBots}
               refreshAccount={loadAccount}
@@ -564,7 +574,8 @@ export default function OSPage() {
                     bots={bots}
                     price={livePrice}
                     prices={prices}
-                    mode={osMode}
+                    modeStatus={modeStatus}
+                    refreshMode={loadMode}
                     refreshPositions={loadPositions}
                     refreshBots={loadBots}
                     refreshAccount={loadAccount}

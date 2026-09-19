@@ -494,6 +494,7 @@ export interface JournalSummary {
   }
   curve: { ts: number; equity: number }[]
   byStrategy: JournalGroupRow[]
+  byOrigin: JournalGroupRow[]
   byAsset: JournalGroupRow[]
   byKind: JournalGroupRow[]
   bySide: JournalGroupRow[]

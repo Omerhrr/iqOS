@@ -19,14 +19,15 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import type { AssetRow, BotConfig, BotRow, OsMode, StrategyInfo, Timeframe, TradeKind } from '@/lib/os/client'
+import type { AssetRow, AutoTraderConfig, BotConfig, BotRow, OsModeStatus, StrategyInfo, Timeframe, TradeKind } from '@/lib/os/client'
 import { KIND_LABEL, TIMEFRAMES, fmtMoney, fmtTime, osPost } from '@/lib/os/client'
 
 interface AutopilotPanelProps {
   bots: BotRow[]
   assets: AssetRow[]
   strategies: StrategyInfo[]
-  mode: OsMode
+  modeStatus: OsModeStatus | null
+  refreshMode: () => void
   onChanged: () => void
   onError: (m: string) => void
 }
@@ -50,8 +51,10 @@ const emptyDraft = (): BotConfig => ({
   dailyLossLimit: 0,
 })
 
-export default function AutopilotPanel({ bots, assets, strategies, mode, onChanged, onError }: AutopilotPanelProps) {
+export default function AutopilotPanel({ bots, assets, strategies, modeStatus, refreshMode, onChanged, onError }: AutopilotPanelProps) {
+  const mode = modeStatus?.mode ?? 'human'
   const [editorOpen, setEditorOpen] = useState(false)
+  const [atOpen, setAtOpen] = useState(false)
   const [draft, setDraft] = useState<BotConfig>(emptyDraft())
   const [busy, setBusy] = useState(false)
   const [filter, setFilter] = useState('')
@@ -133,6 +136,21 @@ export default function AutopilotPanel({ bots, assets, strategies, mode, onChang
           </p>
         </div>
       )}
+      {/* auto-trader strip - the OS acting as its own trader in NO-HUMAN mode */}
+      {modeStatus && <AutoTraderStrip at={modeStatus.autotrader} mode={mode} onConfigure={() => setAtOpen(true)} />}
+
+      {/* auto-trader config editor (remounts on open so the draft mirrors the kernel) */}
+      <AutoTraderDialog
+        key={String(atOpen)}
+        open={atOpen}
+        onOpenChange={setAtOpen}
+        config={modeStatus?.autotrader.config ?? DEFAULT_AUTOTRADER_UI}
+        onSave={async (cfg) => {
+          await osPost<{ ok: boolean }>('/autotrader_config', cfg)
+          refreshMode()
+        }}
+      />
+
       {/* header */}
       <div className="flex shrink-0 items-center justify-between">
         <h3 className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">
@@ -592,5 +610,176 @@ function NumField({ label, value, onChange }: { label: string; value: number; on
         className="h-8 border-[#1c2739] bg-[#101828] text-right text-[12px] text-[#e2e8f0]"
       />
     </div>
+  )
+}
+
+// ---------- auto-trader strip + config editor ----------
+
+/** Fallback draft before the first /mode poll lands (mirrors kernel defaults). */
+const DEFAULT_AUTOTRADER_UI: AutoTraderConfig = {
+  enabled: true,
+  tf: '1m',
+  stake: 10,
+  minScore: 60,
+  minConfidence: 55,
+  direction: 'both',
+  maxOpen: 3,
+  cooldownSec: 180,
+  paceSec: 45,
+  dailyProfitTarget: 0,
+  dailyLossLimit: 0,
+}
+
+function AutoTraderStrip({
+  at,
+  mode,
+  onConfigure,
+}: {
+  at: OsModeStatus['autotrader']
+  mode: OsModeStatus['mode']
+  onConfigure: () => void
+}) {
+  const state =
+    mode === 'auto' && at.config.enabled
+      ? { label: 'ARMED · trading', cls: 'border-amber-500/50 bg-amber-500/10 text-amber-300', dot: 'animate-pulse bg-amber-400' }
+      : mode === 'auto'
+        ? { label: 'off', cls: 'border-[#1c2739] bg-[#101828] text-[#4b5a72]', dot: 'bg-[#2a3850]' }
+        : { label: 'standby · human mode', cls: 'border-cyan-500/40 bg-cyan-500/10 text-cyan-300', dot: 'bg-cyan-500' }
+  const closed = at.trades
+  const wins = at.wins
+  const wr = closed ? Math.round((wins / closed) * 100) : null
+  return (
+    <div className="shrink-0 rounded border border-[#1c2739] bg-[#0d1420] px-2.5 py-1.5">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span className="text-[9px] font-bold uppercase tracking-[0.18em] text-[#7c8aa5]">auto-trader</span>
+        <span className={`flex items-center gap-1.5 rounded border px-1.5 py-px font-mono text-[8px] font-bold uppercase tracking-wider ${state.cls}`}>
+          <span className={`h-1 w-1 rounded-full ${state.dot}`} />
+          {state.label}
+        </span>
+        <span className="font-mono text-[9px] text-[#4b5a72]">
+          {at.config.tf} · ${at.config.stake} · score ≥{at.config.minScore} · max {at.config.maxOpen}
+        </span>
+        <span className="ml-auto font-mono text-[9px] text-[#4b5a72]">
+          {closed}t{wr !== null ? ` · ${wr}% wr` : ''} ·{' '}
+          <span className={at.pnlToday >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+            {at.pnlToday >= 0 ? '+' : ''}
+            {fmtMoney(at.pnlToday)} today
+          </span>
+          {at.openCount > 0 && <span className="text-[#aab6cc]"> · {at.openCount} open</span>}
+        </span>
+        <Button
+          size="sm"
+          onClick={onConfigure}
+          className="h-5 rounded bg-[#1c2739] px-2 text-[9px] font-bold uppercase tracking-wider text-[#aab6cc] hover:bg-[#243352] hover:text-cyan-300"
+        >
+          Configure
+        </Button>
+      </div>
+      {(at.lastAction || at.lastRejection) && (
+        <p className="mt-0.5 truncate font-mono text-[8px] text-[#3d4c66]">
+          {at.lastAction && <span>last: {at.lastAction}</span>}
+          {at.lastRejection && <span className="text-amber-500/70"> · standing down: {at.lastRejection}</span>}
+        </p>
+      )}
+    </div>
+  )
+}
+
+function AutoTraderDialog({
+  open,
+  onOpenChange,
+  config,
+  onSave,
+}: {
+  open: boolean
+  onOpenChange: (o: boolean) => void
+  config: AutoTraderConfig
+  onSave: (patch: Partial<AutoTraderConfig>) => Promise<void>
+}) {
+  const [d, setD] = useState<AutoTraderConfig>(config)
+  const [busy, setBusy] = useState(false)
+  const p = (patch: Partial<AutoTraderConfig>) => setD((prev) => ({ ...prev, ...patch }))
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-md border-[#1c2739] bg-[#0b111c] text-[#dbe4f0]">
+        <DialogHeader>
+          <DialogTitle className="text-[14px] tracking-wider">AUTO-TRADER</DialogTitle>
+          <DialogDescription className="text-[11px] text-[#7c8aa5]">
+            The OS acting as its own trader: takes the strongest screener signals as 1-bar binary options. Only ever
+            trades while the OS is in NO-HUMAN mode. Sentinel + risk limits still govern every order.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="grid grid-cols-2 gap-2.5">
+          <div className="col-span-2 flex items-center justify-between rounded border border-[#1c2739] bg-[#101828] px-2.5 py-2">
+            <div>
+              <div className="text-[11px] font-semibold text-[#e2e8f0]">Enabled</div>
+              <div className="text-[9px] text-[#4b5a72]">armed for the next NO-HUMAN session</div>
+            </div>
+            <Switch checked={d.enabled} onCheckedChange={(v) => p({ enabled: v })} />
+          </div>
+
+          <div>
+            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Signal timeframe</Label>
+            <select
+              value={d.tf}
+              onChange={(e) => p({ tf: e.target.value as Timeframe })}
+              className="h-8 w-full rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-cyan-300 outline-none"
+            >
+              {TIMEFRAMES.map((t) => (
+                <option key={t} value={t} className="bg-[#0d1420]">
+                  {t}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Direction</Label>
+            <select
+              value={d.direction}
+              onChange={(e) => p({ direction: e.target.value as AutoTraderConfig['direction'] })}
+              className="h-8 w-full rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-cyan-300 outline-none"
+            >
+              {['both', 'call', 'put'].map((v) => (
+                <option key={v} value={v} className="bg-[#0d1420]">
+                  {v}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <NumField label="Stake $" value={d.stake} onChange={(v) => p({ stake: v })} />
+          <NumField label="Min |score|" value={d.minScore} onChange={(v) => p({ minScore: v })} />
+          <NumField label="Min confidence" value={d.minConfidence} onChange={(v) => p({ minConfidence: v })} />
+          <NumField label="Max open" value={d.maxOpen} onChange={(v) => p({ maxOpen: v })} />
+          <NumField label="Per-asset cooldown s" value={d.cooldownSec} onChange={(v) => p({ cooldownSec: v })} />
+          <NumField label="Pace s (between trades)" value={d.paceSec} onChange={(v) => p({ paceSec: v })} />
+          <NumField label="Daily profit target $ (0 off)" value={d.dailyProfitTarget} onChange={(v) => p({ dailyProfitTarget: v })} />
+          <NumField label="Daily loss limit $ (0 off)" value={d.dailyLossLimit} onChange={(v) => p({ dailyLossLimit: v })} />
+        </div>
+
+        <DialogFooter className="mt-1 gap-2">
+          <Button variant="outline" className="h-8 border-[#1c2739] px-3 text-[11px] text-[#7c8aa5]" onClick={() => onOpenChange(false)}>
+            Cancel
+          </Button>
+          <Button
+            disabled={busy}
+            onClick={async () => {
+              setBusy(true)
+              try {
+                await onSave(d)
+                onOpenChange(false)
+              } finally {
+                setBusy(false)
+              }
+            }}
+            className="h-8 bg-cyan-600 px-3 text-[11px] font-bold text-white hover:bg-cyan-500"
+          >
+            {busy ? 'Saving…' : 'Save config'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
