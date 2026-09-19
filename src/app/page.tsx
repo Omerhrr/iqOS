@@ -386,7 +386,7 @@ export default function OSPage() {
   const chartWorkspace = (
     <>
       <div className="min-h-[280px] flex-1">
-        <ChartPanel candles={candles} analysis={analysis} price={livePrice} digitsTicker={asset} chartType={chartType} overlays={overlaySeries} />
+        <ChartPanel candles={candles} analysis={analysis} price={livePrice} digitsTicker={asset} chartType={chartType} overlays={overlaySeries} positions={positions} />
       </div>
       {activeSubs.map((s) => (
         <SubPane

@@ -12,12 +12,17 @@ import {
   LineSeries,
   LineStyle,
   createChart,
+  createSeriesMarkers,
   type IChartApi,
+  type IPriceLine,
   type ISeriesApi,
+  type ISeriesMarkersPluginApi,
+  type SeriesMarker,
+  type Time,
   type UTCTimestamp,
 } from 'lightweight-charts'
 import { Button } from '@/components/ui/button'
-import type { AnalysisResult, Candle, ChartType, IndicatorSeries } from '@/lib/os/client'
+import type { AnalysisResult, Candle, ChartType, IndicatorSeries, Position } from '@/lib/os/client'
 import { fmtPrice } from '@/lib/os/client'
 
 interface ChartPanelProps {
@@ -27,7 +32,16 @@ interface ChartPanelProps {
   digitsTicker: string
   chartType: ChartType
   overlays: IndicatorSeries[]
+  positions?: Position[]
 }
+
+type AnyPriceSeries =
+  | ISeriesApi<'Candlestick'>
+  | ISeriesApi<'Bar'>
+  | ISeriesApi<'Line'>
+  | ISeriesApi<'Area'>
+  | ISeriesApi<'Baseline'>
+  | ISeriesApi<'Histogram'>
 
 const UP = '#10b981'
 const DOWN = '#f43f5e'
@@ -111,11 +125,14 @@ export default function ChartPanel({
   digitsTicker,
   chartType,
   overlays,
+  positions,
 }: ChartPanelProps) {
   const elRef = useRef<HTMLDivElement | null>(null)
   const chartRef = useRef<IChartApi | null>(null)
-  const priceSeriesRef = useRef<ISeriesApi<'Candlestick'> | ISeriesApi<'Bar'> | ISeriesApi<'Line'> | ISeriesApi<'Area'> | ISeriesApi<'Baseline'> | ISeriesApi<'Histogram'> | null>(null)
+  const priceSeriesRef = useRef<AnyPriceSeries | null>(null)
   const volRef = useRef<ISeriesApi<'Histogram'> | null>(null)
+  const entryLineRefs = useRef<Map<string, { series: AnyPriceSeries; line: IPriceLine; price: number }>>(new Map())
+  const markersRef = useRef<{ series: AnyPriceSeries; api: ISeriesMarkersPluginApi<Time> } | null>(null)
   const overlayRefs = useRef<Map<string, ISeriesApi<'Line'>>>(new Map())
   const builtinRef = useRef<{ ema20?: ISeriesApi<'Line'>; ema50?: ISeriesApi<'Line'>; ema200?: ISeriesApi<'Line'>; bbUp?: ISeriesApi<'Line'>; bbLo?: ISeriesApi<'Line'>; st?: ISeriesApi<'Line'>; vwap?: ISeriesApi<'Line'> }>({})
   const [toggles, setToggles] = useState<OverlayToggles>(DEFAULT_TOGGLES)
@@ -210,6 +227,8 @@ export default function ChartPanel({
       volRef.current = null
       builtinRef.current = {}
       overlayRefs.current.clear()
+      entryLineRefs.current.clear()
+      markersRef.current = null
     }
   }, [chartType])
 
@@ -297,6 +316,77 @@ export default function ChartPanel({
       }
     }
   }, [overlays, chartType])
+
+  // entry markers: one dashed price line per open position on this asset.
+  // Green for CALL, red for PUT, titled with kind + stake. Re-attached after a
+  // chart-type switch (the series is recreated) and removed the moment the
+  // position settles or the operator switches asset. An arrow marker pins the
+  // entry candle itself, so bar-count expiries are readable from the chart.
+  useEffect(() => {
+    const series = priceSeriesRef.current
+    if (!series) return
+    const open = (positions ?? []).filter((p) => p.status === 'open' && p.asset === digitsTicker)
+    const seen = new Set<string>()
+    for (const p of open) {
+      seen.add(p.id)
+      const existing = entryLineRefs.current.get(p.id)
+      if (existing && existing.series === series && existing.price === p.entryPrice) continue
+      if (existing) {
+        try {
+          existing.series.removePriceLine(existing.line)
+        } catch {
+          // chart already torn down
+        }
+        entryLineRefs.current.delete(p.id)
+      }
+      const isCall = p.side === 'call'
+      const line = series.createPriceLine({
+        price: p.entryPrice,
+        color: isCall ? UP : DOWN,
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: `${isCall ? '▲ CALL' : '▼ PUT'} ${p.kind} $${p.amount}`,
+      })
+      entryLineRefs.current.set(p.id, { series, line, price: p.entryPrice })
+    }
+    for (const [key, entry] of entryLineRefs.current) {
+      if (!seen.has(key)) {
+        try {
+          entry.series.removePriceLine(entry.line)
+        } catch {
+          // chart already torn down
+        }
+        entryLineRefs.current.delete(key)
+      }
+    }
+
+    // arrow at the entry candle (snapped to the closest rendered bar at/before entry)
+    if (!markersRef.current || markersRef.current.series !== series) {
+      markersRef.current = { series, api: createSeriesMarkers(series, []) }
+    }
+    const markers = open
+      .map((p): SeriesMarker<Time> | null => {
+        let t: number | null = null
+        for (const c of displayCandles) {
+          if (c.time <= p.tsOpen) t = c.time
+          else break
+        }
+        if (t === null) return null
+        const isCall = p.side === 'call'
+        return {
+          time: t as UTCTimestamp,
+          position: isCall ? 'belowBar' : 'aboveBar',
+          color: isCall ? UP : DOWN,
+          shape: isCall ? 'arrowUp' : 'arrowDown',
+          text: `${isCall ? '▲' : '▼'} $${p.amount} ${p.kind}`,
+          size: 1,
+        }
+      })
+      .filter((m): m is SeriesMarker<Time> => m !== null)
+      .sort((a, b) => Number(a.time) - Number(b.time))
+    markersRef.current.api.setMarkers(markers)
+  }, [positions, digitsTicker, chartType, displayCandles])
 
   const lastCandle = candles[candles.length - 1]
   const lastUp = lastCandle ? lastCandle.close >= lastCandle.open : true

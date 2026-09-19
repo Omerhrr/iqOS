@@ -193,7 +193,10 @@ export default function TradeTicket({ asset, tf, price, account, onPlaced, onErr
         </div>
       )}
 
-      {(kind === 'cfd' || kind === 'binary') && kind !== 'turbo' && (
+      {/* TP/SL are CFD-only mechanics. Binary/turbo/digital options are
+          fixed-payout, fixed-expiry contracts: the stake is the risk and the
+          payout is the win - there is nothing to take-profit or stop-out. */}
+      {kind === 'cfd' && (
         <div className="grid grid-cols-2 gap-2 font-mono text-[11px]">
           <div>
             <div className="mb-1 text-[9px] uppercase tracking-wider text-[#4b5a72]">TP %</div>
