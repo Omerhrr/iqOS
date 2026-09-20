@@ -643,7 +643,15 @@ class Handler(BaseHTTPRequestHandler):
                         # response slots (and a KeyError here would push the
                         # lib into its reconnect busy-wait)
                         with lock_guard():
+                            # per-call fetch budget: a big visible window must
+                            # never hold the bus for tens of seconds (that
+                            # starved the 4s active-asset poll into timeouts).
+                            # Tickers left unfetched stay uncached - the next
+                            # UI poll (8s) continues where this one stopped.
+                            budget = time.time() + 3.0
                             for t in missing:
+                                if time.time() > budget:
+                                    break
                                 if OP_code is not None and t not in OP_code.ACTIVES:
                                     continue
                                 try:

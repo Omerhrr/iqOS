@@ -72,6 +72,11 @@ export class MarketDataService {
   private timer: ReturnType<typeof setInterval> | null = null
   private liveTimer: ReturnType<typeof setInterval> | null = null
   private flushTimer: ReturnType<typeof setInterval> | null = null
+  // live-poll cadence control: ticks (/price) every 4s, the heavy 240-bar
+  // candle rebuild only every 60s - it shares the sidecar's single serialized
+  // bus with batch price sweeps and used to make the 4s poll time out
+  private lastCandlePull = 0
+  private lastFeedBarTs = 0 // time of the newest real bar seen (feed freshness)
   private lastCandleTs = new Map<string, number>()
   private store: Store | null = null
   private archiveQueue: { asset: string; tf: string; time: number; open: number; high: number; low: number; close: number; volume: number }[] = []
@@ -217,6 +222,10 @@ export class MarketDataService {
 
   /** Kick an immediate live poll for the active asset (used after /asset switch). */
   refreshActiveLive(): void {
+    // force a candle rebuild for the NEW asset and hold ticks until it lands
+    // (lastFeedBarTs=0) - never seed the new chart from the old asset's state
+    this.lastCandlePull = 0
+    this.lastFeedBarTs = 0
     if (this.mode === 'live') void this.pollLive()
   }
 
@@ -263,6 +272,8 @@ export class MarketDataService {
       if (!data?.connected) return false
       this.liveUrl = url
       this.mode = 'live'
+      this.lastCandlePull = 0
+      this.lastFeedBarTs = 0
       if (this.liveTimer) clearInterval(this.liveTimer)
       this.liveTimer = setInterval(() => void this.pollLive(), 4000)
       void this.pollLive()
@@ -563,13 +574,42 @@ export class MarketDataService {
   private async pollLive(): Promise<void> {
     try {
       const url = `${this.liveUrl.replace(/\/$/, '')}`
-      const [candleRes, priceRes] = await Promise.all([
-        fetch(`${url}/candles?asset=${this.activeAsset}&size=240&tf=60`, { signal: AbortSignal.timeout(12_000) }),
-        fetch(`${url}/price?asset=${this.activeAsset}`, { signal: AbortSignal.timeout(12_000) }),
-      ])
-      const candleData = (await candleRes.json()) as { ok: boolean; candles?: Candle[] }
-      const priceData = (await priceRes.json()) as { ok: boolean; price?: number }
-      if (candleData.ok && candleData.candles?.length) {
+      // Ticks (/price) every 4s; the 240-bar history rebuild only every 60s
+      // (and immediately after connect / asset switch via lastCandlePull).
+      // Pulling both every 4s queued the poll behind batch price sweeps on
+      // the sidecar's serialized bus -> "live feed hiccup: timed out".
+      const wantCandles = Date.now() - this.lastCandlePull > 60_000
+      if (wantCandles) this.lastCandlePull = Date.now()
+      // fire both fetches in parallel, but CONSUME the price first so the
+      // tick lands even while the candle pull is still streaming
+      const candleJson = (wantCandles
+        ? fetch(`${url}/candles?asset=${this.activeAsset}&size=240&tf=60`, { signal: AbortSignal.timeout(15_000) }).then((r) => r.json())
+        : Promise.resolve(null)
+      ).catch(() => null) as Promise<{ ok: boolean; candles?: Candle[] } | null>
+      const priceData = (await (
+        fetch(`${url}/price?asset=${this.activeAsset}`, { signal: AbortSignal.timeout(12_000) })
+          .then((r) => r.json())
+          .catch(() => null)
+      )) as { ok: boolean; price?: number } | null
+      if (priceData?.ok && priceData.price) {
+        const now = Math.floor(Date.now() / 1000)
+        this.prices.set(this.activeAsset, priceData.price)
+        // Market closed (weekend / session gap)? The sidecar's last REAL bar
+        // may be hours old - ticking then would fabricate fake candles at
+        // Friday's price. Freshness is judged from the newest bar seen in the
+        // 60s candle pulls (any open market forms a bar newer than ~2min;
+        // a closed market stays stale between pulls, so no phantom ticks).
+        const fresh = await candleJson
+        const lastC = fresh?.candles?.[fresh.candles.length - 1]
+        if (lastC?.time) this.lastFeedBarTs = Math.max(this.lastFeedBarTs, lastC.time)
+        if (now - this.lastFeedBarTs <= 150) {
+          for (const tf of ALL_TIMEFRAMES) this.applyTick(this.activeAsset, tf, { ts: now, price: priceData.price, vol: 0 })
+        }
+      } else {
+        void (await candleJson) // drain the in-flight candle fetch
+      }
+      const candleData = wantCandles ? await candleJson : null
+      if (candleData?.ok && candleData.candles?.length) {
         for (const tf of ALL_TIMEFRAMES) {
           const agg = this.aggregate(candleData.candles, TIMEFRAME_SECONDS[tf])
           if (agg.length > 10) {
@@ -579,19 +619,6 @@ export class MarketDataService {
         }
         const lastC = candleData.candles[candleData.candles.length - 1]
         this.prices.set(this.activeAsset, lastC.close)
-      }
-      if (priceData.ok && priceData.price) {
-        const now = Math.floor(Date.now() / 1000)
-        this.prices.set(this.activeAsset, priceData.price)
-        // Market closed (weekend / session gap)? The sidecar's last REAL candle
-        // may be hours old. Applying a "now" tick then would fabricate fake
-        // candles at Friday's price and scramble the series order - only tick
-        // when the feed is current.
-        const lastCandle = candleData.candles?.[candleData.candles.length - 1]
-        const feedFresh = !lastCandle || now - lastCandle.time <= 2 * 60
-        if (feedFresh) {
-          for (const tf of ALL_TIMEFRAMES) this.applyTick(this.activeAsset, tf, { ts: now, price: priceData.price, vol: 0 })
-        }
       }
     } catch (err) {
       this.ctx.bus.emit('alert', { level: 'warn', message: `live feed hiccup: ${(err as Error).message}`, ts: Math.floor(Date.now() / 1000) })
