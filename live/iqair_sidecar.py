@@ -21,6 +21,7 @@ switches to REAL unless you ask the sidecar to.
 
 import json
 import threading
+import time
 
 # Self-heal the iqair dependency: sandbox snapshot resets can revert the venv
 # to a state without this package. Install on demand (PyPI: omerhrr/iqair) so
@@ -42,6 +43,13 @@ except ModuleNotFoundError:
         print(f"[sidecar] WARNING: auto-install of iqair failed: {_exc}")
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# Static symbol map (symbol -> numeric active id) used to validate assets and
+# to translate the kernel's symbol strings into ids the broker API expects.
+try:
+    import iqair.constants as OP_code
+except Exception:  # noqa: BLE001
+    OP_code = None
 
 HOST = "127.0.0.1"
 PORT = 8788
@@ -100,26 +108,37 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with _lock:
                 if path == "/balance":
-                    ok, bal = _client.get_balance()
-                    if not ok:
-                        return self._send(_err("balance fetch failed"), 502)
-                    return self._send(_ok({"amount": bal.get("amount"), "mode": bal.get("currency")}))
+                    # iqair 1.0.0: get_balance() returns the amount directly
+                    # (float) and get_balance_mode() reports "PRACTICE"/"REAL".
+                    bal = _client.get_balance()
+                    try:
+                        mode = _client.get_balance_mode()
+                    except Exception:  # noqa: BLE001
+                        mode = None
+                    return self._send(_ok({"amount": bal, "mode": mode}))
 
                 if path == "/assets":
-                    ok, data = _client.get_assets_raw() if hasattr(_client, "get_assets_raw") else (False, None)
-                    if not ok or data is None:
-                        # fall back to the agent tool layer if present
+                    assets = None
+                    try:
                         from iqair.agent import tools as agent_tools
-                        return self._send(_ok({"assets": agent_tools.list_assets(open_only=False).get("assets", [])}))
-                    return self._send(_ok({"assets": data}))
+                        payload = agent_tools.list_assets(open_only=False)
+                        assets = (payload or {}).get("assets")
+                    except Exception:  # noqa: BLE001
+                        assets = None
+                    if not assets and OP_code is not None:
+                        # static universe from the library's symbol table
+                        assets = [{"asset": k} for k in OP_code.ACTIVES.keys()]
+                    return self._send(_ok({"assets": assets or []}))
 
                 if path == "/candles":
                     asset = params.get("asset", "EURUSD")
                     size = int(params.get("size", 300))
                     tf = int(params.get("tf", 60))
-                    ok, data = _client.get_candles(asset, size, tf)
-                    if not ok:
-                        return self._send(_err("candles fetch failed"), 502)
+                    if OP_code is not None and asset not in OP_code.ACTIVES:
+                        return self._send(_err(f"unknown asset {asset}"), 400)
+                    # iqair 1.0.0: get_candles(ACTIVES, interval, count, endtime)
+                    # returns the candle list directly (no ok-wrapper).
+                    data = _client.get_candles(asset, tf, size, int(time.time()))
                     candles = [
                         {
                             "time": int(c.get("from", 0)),
@@ -137,16 +156,28 @@ class Handler(BaseHTTPRequestHandler):
 
                 if path == "/price":
                     asset = params.get("asset", "EURUSD")
-                    ok, data = _client.get_financial_information(asset)
-                    if not ok:
-                        return self._send(_err("price fetch failed"), 502)
+                    if OP_code is not None and asset not in OP_code.ACTIVES:
+                        return self._send(_err(f"unknown asset {asset}"), 400)
+                    active_id = OP_code.ACTIVES.get(asset, asset) if OP_code is not None else asset
+                    # iqair 1.0.0: returns the payload directly (no ok-wrapper)
+                    data = _client.get_financial_information(active_id)
+                    if isinstance(data, list) and data:
+                        data = data[0]
                     price = None
                     try:
                         price = float(data["ask"]["price"])  # mid-ish quote
-                    except Exception:
+                    except Exception:  # noqa: BLE001
                         try:
                             price = float(data.get("price"))
-                        except Exception:
+                        except Exception:  # noqa: BLE001
+                            pass
+                    if price is None:
+                        # last resort: newest streamed candle close
+                        try:
+                            recent = _client.get_candles(asset, 60, 1, int(time.time()))
+                            if recent:
+                                price = float(recent[-1].get("close"))
+                        except Exception:  # noqa: BLE001
                             pass
                     if price is None:
                         return self._send(_err("no price in response"), 502)
@@ -269,15 +300,21 @@ class Handler(BaseHTTPRequestHandler):
                         return self._send(_err("order_id required"), 400)
                     if mode.startswith("digital"):
                         fn = getattr(_client, "close_digital_option", None) or getattr(_client, "sell_option", None)
-                        check, data = fn(order_id)
+                        raw = fn(order_id)
                     elif mode.startswith("turbo") or mode.startswith("binary"):
-                        check, data = _client.sell_option(order_id)
+                        # iqair 1.0.0: sell_option returns the response dict directly
+                        raw = _client.sell_option(order_id)
                     else:
                         fn = getattr(_client, "close_margin_position", None) or getattr(_client, "close_cfd", None)
                         if fn is None:
                             return self._send(_err("iqair client has no margin close method"), 502)
-                        check, data = fn(order_id)
-                    return self._send(_ok({"closed": bool(check), "data": data}))
+                        raw = fn(order_id)
+                    # tolerate both legacy (check, data) tuples and direct payloads
+                    if isinstance(raw, tuple) and len(raw) == 2:
+                        check, data = bool(raw[0]), raw[1]
+                    else:
+                        check, data = bool(raw), raw
+                    return self._send(_ok({"closed": check, "data": data}))
 
                 if path == "/positions":
                     itype = body.get("instrument_type") or "turbo-option"
@@ -302,8 +339,32 @@ class Handler(BaseHTTPRequestHandler):
                 if path == "/history":
                     itype = body.get("instrument_type") or "turbo-option"
                     limit = int(body.get("limit", 20))
-                    ok, data = _client.get_position_history_v2(itype, limit=limit, offset=0)
-                    return self._send(_ok({"history": data if ok else []}))
+                    # iqair 1.0.0 moved position history to the api layer:
+                    # api.get_position_history_v2 is a command factory; the
+                    # websocket response lands in api.position_history_v2.
+                    _client.api.position_history_v2 = None
+                    user_id = None
+                    try:
+                        prof = _client.get_profile()
+                        if isinstance(prof, dict) and prof.get("user_id"):
+                            user_id = int(prof["user_id"])
+                    except Exception:  # noqa: BLE001
+                        user_id = None
+                    if user_id is None:
+                        try:
+                            user_id = int(_client.api.profile.user_id)
+                        except Exception:  # noqa: BLE001
+                            user_id = None
+                    _client.api.get_position_history_v2()(itype, limit, offset=0, user_id=user_id)
+                    deadline = time.time() + 10
+                    while _client.api.position_history_v2 is None and time.time() < deadline:
+                        time.sleep(0.1)
+                    raw = _client.api.position_history_v2
+                    if raw is None:
+                        return self._send(_err("history fetch timed out"), 504)
+                    payload = raw.get("body", raw) if isinstance(raw, dict) else raw
+                    items = payload.get("positions", payload) if isinstance(payload, dict) else payload
+                    return self._send(_ok({"history": items if isinstance(items, list) else []}))
 
             return self._send(_err(f"no POST route {path}"), 404)
         except Exception as exc:  # noqa: BLE001
