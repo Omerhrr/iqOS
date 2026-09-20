@@ -355,8 +355,13 @@ export class MarketDataService {
     if (!current || current.time !== bucket) {
       if (current) {
         const arr = this.closed.get(k)!
-        arr.push(current)
-        if (arr.length > MEM_CAP) arr.splice(0, arr.length - MEM_CAP)
+        // regression guard: never file a candle OLDER than the newest closed
+        // bar (can happen when sim state and live poll momentarily disagree)
+        const lastClosed = arr[arr.length - 1]
+        if (!lastClosed || lastClosed.time < current.time) {
+          arr.push(current)
+          if (arr.length > MEM_CAP) arr.splice(0, arr.length - MEM_CAP)
+        }
         this.archiveQueue.push({ asset, tf, time: current.time, open: current.open, high: current.high, low: current.low, close: current.close, volume: current.volume })
         this.ctx.bus.emit('candle', { asset, tf, candle: current, closed: true })
       }
@@ -475,7 +480,15 @@ export class MarketDataService {
       if (priceData.ok && priceData.price) {
         const now = Math.floor(Date.now() / 1000)
         this.prices.set(this.activeAsset, priceData.price)
-        for (const tf of ALL_TIMEFRAMES) this.applyTick(this.activeAsset, tf, { ts: now, price: priceData.price, vol: 0 })
+        // Market closed (weekend / session gap)? The sidecar's last REAL candle
+        // may be hours old. Applying a "now" tick then would fabricate fake
+        // candles at Friday's price and scramble the series order - only tick
+        // when the feed is current.
+        const lastCandle = candleData.candles?.[candleData.candles.length - 1]
+        const feedFresh = !lastCandle || now - lastCandle.time <= 2 * 60
+        if (feedFresh) {
+          for (const tf of ALL_TIMEFRAMES) this.applyTick(this.activeAsset, tf, { ts: now, price: priceData.price, vol: 0 })
+        }
       }
     } catch (err) {
       this.ctx.bus.emit('alert', { level: 'warn', message: `live feed hiccup: ${(err as Error).message}`, ts: Math.floor(Date.now() / 1000) })
@@ -508,8 +521,18 @@ export class MarketDataService {
     const k = this.key(asset, tf)
     const closedArr = this.closed.get(k) ?? []
     const forming = this.candles.get(k)
-    const all = forming ? [...closedArr, forming] : [...closedArr]
-    return all.slice(-limit)
+    // The sim engine, the live poll and the archive can momentarily disagree
+    // (e.g. right after connecting IQ on a weekend: closed=Friday real bars,
+    // forming=stale Sunday sim bar). The chart asserts ascending time - so
+    // sort + dedupe here; the newest write wins a timestamp collision.
+    const merged = forming ? [...closedArr, forming] : [...closedArr]
+    merged.sort((a, b) => a.time - b.time)
+    const deduped: Candle[] = []
+    for (const c of merged) {
+      if (deduped.length && deduped[deduped.length - 1].time === c.time) deduped[deduped.length - 1] = c
+      else deduped.push(c)
+    }
+    return deduped.slice(-limit)
   }
 
   /**

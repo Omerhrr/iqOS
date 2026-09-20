@@ -342,6 +342,10 @@ export default function OSPage() {
       if (p.asset !== asset || p.tf !== tf) return
       setCandles((prev) => {
         const lastC = prev[prev.length - 1]
+        // ordering guard: the kernel can emit a candle OLDER than what we
+        // already chart (source switch / weekend gap between sim and IQ feed).
+        // The chart asserts ascending time - drop stale events instead.
+        if (lastC && p.candle.time < lastC.time) return prev
         if (lastC && lastC.time === p.candle.time) return [...prev.slice(0, -1), p.candle]
         if (!p.closed) return [...prev.slice(-320), p.candle]
         return [...prev.slice(-319), p.candle]
@@ -486,6 +490,9 @@ export default function OSPage() {
         onSourceChanged={(fresh) => {
           void loadAccount()
           void loadAssets(fresh.source ?? 'paper')
+          // the feed just flipped between sim and IQ - re-pull the chart so
+          // the local candle array matches the new source immediately
+          void loadCandles(asset, tf)
         }}
         onError={(m) => pushToast('danger', m)}
       />
