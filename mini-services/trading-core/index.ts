@@ -600,6 +600,16 @@ const httpServer = createServer(async (req, res) => {
         return json(200, out)
       }
 
+      // Batch watch-list prices (IQ): the web asks for the rows it displays;
+      // the sidecar serves last 1m closes, cached 30s per ticker
+      if (path === '/prices') {
+        const raw = body.tickers
+        const tickers = (Array.isArray(raw) ? raw : []).filter((t) => typeof t === 'string' && t) as string[]
+        if (!exec.accountSource || exec.accountSource !== 'iq') return json(200, { ok: true, prices: {} })
+        const prices = await exec.watchPrices(tickers)
+        return json(200, { ok: true, prices })
+      }
+
       if (path === '/kill_switch') {
         const out = exec.setKillSwitch(Boolean(body.on))
         return json(200, { ok: true, account: out })

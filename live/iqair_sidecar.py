@@ -59,6 +59,8 @@ _client = None  # iqair IQOptionClient, set by /connect
 _assets_cache = None  # (rows, ts) - the ~90s instrument table, 30 min TTL
 _assets_fetching = False  # dedupe concurrent metadata crunches (they run unlocked)
 _asset_ids = {}  # ticker -> numeric active_id, from the account's own metadata
+_digital_ids = {}  # ticker -> numeric active_id, digital-option group only
+_prices_cache = {}  # ticker -> (price, ts) for the /prices batch, 30s TTL
 
 
 def _seed_ids_from_init():
@@ -82,6 +84,22 @@ def _seed_ids_from_init():
         print(f"[sidecar] active_id map ready: {len(_asset_ids)} tickers")
     except Exception as exc:  # noqa: BLE001
         print(f"[sidecar] active_id map deferred (will build lazily): {exc}")
+    # digital underlyings in the same background sweep: one fast round trip,
+    # and it is the ONLY group the metadata-based scan below may miss when
+    # the account has instruments exclusively as digital options
+    try:
+        dig = _client.get_digital_underlying_list_data()
+        for item in (dig or {}).get("underlying", []):
+            t = item.get("underlying")
+            aid = item.get("active_id")
+            if t and aid is not None:
+                try:
+                    _digital_ids[t] = int(aid)
+                except (TypeError, ValueError):
+                    pass
+        print(f"[sidecar] digital id map ready: {len(_digital_ids)} tickers")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[sidecar] digital id map deferred: {exc}")
 
 
 def _resolve_active_id(ticker):
@@ -89,6 +107,11 @@ def _resolve_active_id(ticker):
     the turbo/binary init table on miss, seeded static table last. Returns
     None only when the account truly has no such instrument - NEVER sends a
     null active_id to the broker."""
+    # right after /connect the seed thread may still be in flight - give it
+    # a moment instead of failing the first trade with "not an instrument"
+    deadline = time.time() + 8
+    while not _asset_ids and _client is not None and time.time() < deadline:
+        time.sleep(0.2)
     if ticker in _asset_ids:
         return _asset_ids[ticker]
     if _client is None:
@@ -113,6 +136,56 @@ def _resolve_active_id(ticker):
             _asset_ids[ticker] = v
             return v
     return None
+
+
+def _resolve_digital_id(ticker):
+    """ticker -> active_id for the DIGITAL option group. Cached map first,
+    then one fast live scan of the digital underlying list."""
+    if ticker in _digital_ids:
+        return _digital_ids[ticker]
+    if _client is None:
+        return None
+    try:
+        dig = _client.get_digital_underlying_list_data()
+        for item in (dig or {}).get("underlying", []):
+            t = item.get("underlying")
+            aid = item.get("active_id")
+            if t and aid is not None:
+                try:
+                    _digital_ids[t] = int(aid)
+                except (TypeError, ValueError):
+                    pass
+    except Exception:  # noqa: BLE001
+        pass
+    return _digital_ids.get(ticker)
+
+
+def _buy_digital_spot(amount, ticker, direction, expiry_minutes):
+    """Digital-option spot (ATM) buy through iqair's buy_digital_spot, which
+    resolves a REAL tradable instrument id server-side. iqair's low-level
+    buy_digital() takes a pre-built instrument id + index - calling it with a
+    ticker/direction crashed with int('put') - so it is never used here.
+    Returns (True, order_id) or (False, reason)."""
+    if direction not in ("call", "put"):
+        return False, "direction must be call or put"
+    fn = getattr(_client, "buy_digital_spot", None)
+    if not callable(fn):
+        return False, "iqair client has no buy_digital_spot"
+    try:
+        res = fn(ticker, float(amount), direction, int(max(1, expiry_minutes)), max_wait_sec=25)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[sidecar] digital buy error: {ticker}: {exc}")
+        return False, f"digital buy failed: {exc}"
+    if res == -1:
+        return False, "invalid direction"
+    if isinstance(res, tuple) and len(res) == 2:
+        ok, data = bool(res[0]), res[1]
+        if ok:
+            print(f"[sidecar] digital buy ok: {ticker} x {amount} {direction} {expiry_minutes}m -> order {data}")
+        else:
+            print(f"[sidecar] digital buy rejected: {ticker}: {data}")
+        return ok, data
+    return False, str(res)
 
 
 def _buy_fast(amount, active_id, direction, expiry_minutes):
@@ -187,6 +260,8 @@ class Handler(BaseHTTPRequestHandler):
                         if isinstance(info, dict) and info.get("id") is not None:
                             try:
                                 _asset_ids[ticker] = int(info["id"])
+                                if cat == "digital":
+                                    _digital_ids[ticker] = int(info["id"])
                             except (TypeError, ValueError):
                                 pass
                         rows.append({"ticker": ticker, "category": cat, "is_open": is_open, "payout": pay})
@@ -404,44 +479,41 @@ class Handler(BaseHTTPRequestHandler):
 
                     # ---- options family ----
                     if mode in ("turbo", "binary", "digital", "digital-option", "binary-option", "turbo-option"):
-                        # digital options: prefer a dedicated iqair method when available
-                        digital = mode.startswith("digital")
-                        if digital:
-                            check, order_id = None, None
-                            for fn_name in ("buy_digital", "buy_digital_option", "buy_digitals"):
-                                fn = getattr(_client, fn_name, None)
-                                if not callable(fn):
-                                    continue
-                                for args in (
-                                    (asset, amount, direction, expiry, float(strike_offset)) if strike_offset is not None else None,
-                                    (asset, amount, direction, expiry),
-                                ):
-                                    if args is None:
-                                        continue
-                                    try:
-                                        check, order_id = fn(*args)
-                                        break
-                                    except TypeError:
-                                        continue
-                                    except Exception as exc:
-                                        check, order_id = False, str(exc)
-                                        break
-                                if check is not None:
-                                    break
-                            if check is None:
-                                check, order_id = _client.buy(amount, asset, direction, expiry)
+                        # Resolve the ticker across BOTH option families and
+                        # route to what the account actually offers. IQ splits
+                        # instruments into turbo/binary (buyv3, numeric id)
+                        # and digital (server-resolved instrument contracts);
+                        # an account may carry a ticker in only one of them.
+                        digital_req = mode.startswith("digital")
+                        tb_id = _resolve_active_id(asset)
+                        dig_id = _resolve_digital_id(asset) if digital_req or tb_id is None else None
+                        if digital_req:
+                            if dig_id is not None:
+                                check, order_id = _buy_digital_spot(amount, asset, direction, expiry)
+                            elif tb_id is not None:
+                                # requested digital, account only has turbo/binary
+                                check, order_id = _buy_fast(amount, int(tb_id), direction, expiry)
+                                mode = "turbo"
+                            else:
+                                return self._send(_err(f"{asset} is not a digital/turbo/binary instrument on this IQ account"), 400)
                         else:
-                            # turbo/binary fast path: resolve the numeric
-                            # active_id ONCE (cached account metadata) and send
-                            # buyv3 directly. _client.buy() re-scans the whole
-                            # init table on EVERY order (slow) and falls back
-                            # to a stale 2018 static table that lacks OTC/new
-                            # tickers -> active_id null -> server rejection
-                            # ("OpenOptionRequest.ActiveId is not nullable").
-                            active_id = _resolve_active_id(asset)
-                            if active_id is None:
-                                return self._send(_err(f"{asset} is not a turbo/binary instrument on this IQ account"), 400)
-                            check, order_id = _buy_fast(amount, int(active_id), direction, expiry)
+                            if tb_id is not None:
+                                # turbo/binary fast path: resolve the numeric
+                                # active_id ONCE (cached account metadata) and
+                                # send buyv3 directly. _client.buy() re-scans
+                                # the whole init table on EVERY order (slow)
+                                # and falls back to a stale 2018 static table
+                                # that lacks OTC/new tickers -> active_id null
+                                # -> server rejection ("ActiveId is not nullable")
+                                check, order_id = _buy_fast(amount, int(tb_id), direction, expiry)
+                            elif dig_id is not None:
+                                # requested turbo/binary, account only offers
+                                # this ticker as a digital option (common on
+                                # newer IQ accounts) - route to digital spot
+                                check, order_id = _buy_digital_spot(amount, asset, direction, expiry)
+                                mode = "digital-option"
+                            else:
+                                return self._send(_err(f"{asset} is not a turbo/binary/digital instrument on this IQ account"), 400)
 
                     # ---- margin / CFD family ----
                     elif mode in ("forex", "crypto", "stock", "index", "commodity", "cfd"):
@@ -494,6 +566,42 @@ class Handler(BaseHTTPRequestHandler):
                     itype = body.get("instrument_type") or "turbo-option"
                     ok, data = _client.get_positions(itype)
                     return self._send(_ok({"positions": data.get("positions", []) if ok and isinstance(data, dict) else []}))
+
+                if path == "/prices":
+                    # batch watch-list prices: last 1m candle close per ticker.
+                    # Capped + cached so the UI can poll a visible window of
+                    # rows without flooding the single websocket.
+                    raw = body.get("tickers")
+                    want = [t for t in (raw if isinstance(raw, list) else []) if isinstance(t, str) and t][:40]
+                    if not want:
+                        return self._send(_ok({"prices": {}}))
+                    now = time.time()
+                    prices = {}
+                    missing = []
+                    for t in want:
+                        hit = _prices_cache.get(t)
+                        if hit and now - hit[1] < 30:
+                            prices[t] = hit[0]
+                        else:
+                            missing.append(t)
+                    if missing:
+                        # all iqair calls share the global lock: concurrent
+                        # candle/price requests would clobber the lib's shared
+                        # response slots (and a KeyError here would push the
+                        # lib into its reconnect busy-wait)
+                        with _lock:
+                            for t in missing:
+                                if OP_code is not None and t not in OP_code.ACTIVES:
+                                    continue
+                                try:
+                                    data = _client.get_candles(t, 60, 1, int(time.time()))
+                                    if data and isinstance(data[-1], dict) and data[-1].get("close") is not None:
+                                        p = float(data[-1]["close"])
+                                        _prices_cache[t] = (p, time.time())
+                                        prices[t] = p
+                                except Exception:  # noqa: BLE001
+                                    pass
+                    return self._send(_ok({"prices": prices}))
 
                 if path == "/payouts":
                     # best-effort payout snapshot for the active asset

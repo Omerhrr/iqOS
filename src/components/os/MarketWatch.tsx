@@ -6,7 +6,7 @@
 // -OTC suffix is optional (typing "eurusd otc" pins the OTC variant), partial
 // typing matches via subsequence ("eurjp" -> EURJPY), and a small alias table
 // maps common names to IQ tickers ("aapl"/"apple" -> AAP:US, "gold" -> XAUUSD).
-import { useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { AssetRow } from '@/lib/os/client'
 import { CATEGORIES, fmtPrice } from '@/lib/os/client'
 
@@ -15,7 +15,12 @@ interface Props {
   active: string
   prices: Record<string, { price: number; dir: number }>
   onSelect: (ticker: string) => void
+  /** reports the tickers currently in the viewport so live prices can be fetched for just those rows */
+  onVisibleTickers?: (tickers: string[]) => void
 }
+
+// fixed row height so the visible window can be computed from scrollTop
+const ROW_H = 38
 
 // common names -> IQ ticker fragments (search only, display stays verbatim)
 const IQ_ALIASES: Record<string, string> = {
@@ -70,9 +75,11 @@ function rankAsset(a: AssetRow, rawQuery: string): number | null {
   return best
 }
 
-export default function MarketWatch({ assets, active, prices, onSelect }: Props) {
+export default function MarketWatch({ assets, active, prices, onSelect, onVisibleTickers }: Props) {
   const [cat, setCat] = useState<(typeof CATEGORIES)[number]['id']>('all')
   const [query, setQuery] = useState('')
+  const listRef = useRef<HTMLDivElement | null>(null)
+  const reportTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const filtered = useMemo(() => {
     const ranked: { a: AssetRow; rank: number }[] = []
@@ -88,6 +95,24 @@ export default function MarketWatch({ assets, active, prices, onSelect }: Props)
     if (query.trim()) ranked.sort((x, y) => x.rank - y.rank || x.a.ticker.localeCompare(y.a.ticker))
     return ranked.map((r) => r.a)
   }, [assets, cat, query])
+
+  const reportVisible = useCallback(() => {
+    if (!onVisibleTickers) return
+    const el = listRef.current
+    if (!el) return
+    const start = Math.max(0, Math.floor(el.scrollTop / ROW_H) - 2)
+    const end = Math.min(filtered.length, Math.ceil((el.scrollTop + el.clientHeight) / ROW_H) + 2)
+    const tickers = filtered.slice(start, end).map((a) => a.ticker)
+    if (reportTimer.current) clearTimeout(reportTimer.current)
+    reportTimer.current = setTimeout(() => onVisibleTickers(tickers), 250)
+  }, [filtered, onVisibleTickers])
+
+  useEffect(() => {
+    reportVisible()
+    return () => {
+      if (reportTimer.current) clearTimeout(reportTimer.current)
+    }
+  }, [reportVisible])
 
   const searching = query.trim().length > 0
 
@@ -142,7 +167,11 @@ export default function MarketWatch({ assets, active, prices, onSelect }: Props)
         ))}
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <div
+        ref={listRef}
+        onScroll={reportVisible}
+        className="min-h-0 flex-1 overflow-y-auto"
+      >
         {filtered.map((a) => {
           const p = prices[a.ticker] ?? { price: a.price, dir: 0 }
           const isActive = a.ticker === active
@@ -151,7 +180,7 @@ export default function MarketWatch({ assets, active, prices, onSelect }: Props)
             <button
               key={a.ticker}
               onClick={() => onSelect(a.ticker)}
-              className={`flex w-full items-center justify-between border-l-2 px-3 py-1.5 text-left transition-colors ${
+              className={`flex h-[38px] w-full items-center justify-between border-l-2 px-3 text-left transition-colors ${
                 isActive ? 'border-cyan-400 bg-[#101828]' : 'border-transparent hover:bg-[#0e1626]'
               }`}
             >

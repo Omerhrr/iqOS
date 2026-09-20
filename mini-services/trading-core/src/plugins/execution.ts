@@ -430,7 +430,10 @@ export class ExecutionService {
     if (!pos) return { ok: false, error: 'position not found' }
     if (pos.status !== 'open') return { ok: false, error: 'position already settled' }
     if (pos.mode === 'live') {
-      void this.postLive(`/close_trade`, { mode: 'turbo', order_id: Number(pos.liveOrderId) })
+      // digital positions close through iqair's close_digital_option; the
+      // sidecar picks the method by mode prefix - 'turbo' would call
+      // sell_option on a digital position id and fail
+      void this.postLive(`/close_trade`, { mode: pos.kind === 'digital' ? 'digital-option' : 'turbo', order_id: Number(pos.liveOrderId) })
     }
     const price = this.market.getPrice(pos.asset)
     const dir = pos.side === 'call' ? 1 : -1
@@ -625,6 +628,32 @@ export class ExecutionService {
 
   async liveHistory(instrumentType: string, limit: number): Promise<unknown> {
     return this.postLive('/history', { instrument_type: instrumentType, limit })
+  }
+
+  /**
+   * Batch watch-list prices for IQ instruments: last 1m close per ticker
+   * from the sidecar (capped at 40, sidecar caches 30s per ticker). The web
+   * MarketWatch asks for the rows it is actually displaying.
+   */
+  async watchPrices(tickers: string[]): Promise<Record<string, number>> {
+    if (!this.liveReady || !tickers.length) return {}
+    try {
+      const res = await fetch(`${this.liveUrl().replace(/\/$/, '')}/prices`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ tickers: tickers.slice(0, 40) }),
+        signal: AbortSignal.timeout(25000),
+      })
+      const data = (await res.json()) as { ok?: boolean; prices?: Record<string, unknown> }
+      const out: Record<string, number> = {}
+      for (const [t, p] of Object.entries(data.prices ?? {})) {
+        const v = Number(p)
+        if (Number.isFinite(v) && v > 0) out[t] = v
+      }
+      return out
+    } catch {
+      return {}
+    }
   }
 
   private async postLive(path: string, body: unknown): Promise<Record<string, unknown> | null> {

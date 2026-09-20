@@ -149,6 +149,48 @@ export default function OSPage() {
     return () => clearTimeout(t)
   }, [account?.source, assets.length, loadAssets])
 
+  // IQ watch-list prices: the kernel only ticks the ACTIVE asset, so the
+  // MarketWatch reports the rows it is actually displaying and we batch-fetch
+  // just those (sidecar serves last 1m closes, cached 30s per ticker).
+  const visibleTickersRef = useRef<string[]>([])
+  const watchFetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const fetchWatchPrices = useCallback(async () => {
+    const tickers = visibleTickersRef.current
+    if (!tickers.length) return
+    try {
+      const d = await osPost<{ ok: boolean; prices?: Record<string, number> }>('/prices', { tickers })
+      if (!d.ok || !d.prices) return
+      for (const [t, p] of Object.entries(d.prices)) {
+        const price = Number(p)
+        if (!Number.isFinite(price) || price <= 0) continue
+        const before = pricesRef.current[t]
+        pricesRef.current[t] = { price, dir: before ? Math.sign(price - before.price) : 0 }
+      }
+      setPrices({ ...pricesRef.current })
+    } catch {
+      // kernel busy / offline - the next poll retries
+    }
+  }, [])
+
+  const handleVisibleTickers = useCallback(
+    (tickers: string[]) => {
+      visibleTickersRef.current = tickers
+      // snappy first paint of a new window (scroll / tab / search change)
+      if (watchFetchTimer.current) clearTimeout(watchFetchTimer.current)
+      watchFetchTimer.current = setTimeout(() => void fetchWatchPrices(), 700)
+    },
+    [fetchWatchPrices]
+  )
+
+  useEffect(() => {
+    const t = setInterval(() => void fetchWatchPrices(), 8000)
+    return () => {
+      clearInterval(t)
+      if (watchFetchTimer.current) clearTimeout(watchFetchTimer.current)
+    }
+  }, [fetchWatchPrices])
+
   const loadCandles = useCallback(async (a: string, t: Timeframe) => {
     const d = await osGet<{ ok: boolean; candles: Candle[] }>(`/candles`, { asset: a, tf: t, limit: 320 })
     if (d.ok) setCandles(d.candles)
@@ -572,7 +614,7 @@ export default function OSPage() {
               <PanelGroup direction="vertical" autoSaveId="iqos:left" className="h-full">
                 <Panel defaultSize={46} minSize={15}>
                   <div className="mr-0.5 h-full min-h-0">
-                    <MarketWatch assets={assets} active={asset} prices={prices} onSelect={handleSelectAsset} />
+                    <MarketWatch assets={assets} active={asset} prices={prices} onSelect={handleSelectAsset} onVisibleTickers={handleVisibleTickers} />
                   </div>
                 </Panel>
                 {hHandle}
