@@ -39,6 +39,9 @@ export class ExecutionService {
   private market!: MarketDataService
   private store!: Store
   private unsubscribers: (() => void)[] = []
+  private settleTimer: ReturnType<typeof setInterval> | null = null
+  private balanceTimer: ReturnType<typeof setInterval> | null = null
+  private syncingBalance = false
 
   risk: RiskConfig = { ...DEFAULT_RISK }
   liveReady = false
@@ -72,12 +75,23 @@ export class ExecutionService {
         else this.checkSpotStops(asset, candle)
       })
     )
+    // LIVE option positions: the candle path only settles paper trades - live
+    // binaries/turbos/digitals settle the moment their expiry is due (1s
+    // sweep), then the ledger reconciles with the broker's real balance
+    this.settleTimer = setInterval(() => this.settleLiveDue(), 1000)
+    // keep the displayed IQ balance in tandem with the broker (wins/losses/
+    // stakes book on IQ's side; the OS ledger is only an estimate)
+    this.balanceTimer = setInterval(() => void this.syncLiveBalance(), 15000)
     ctx.log('execution', 'paper broker + risk manager online')
   }
 
   stop(): void {
     for (const u of this.unsubscribers) u()
     this.unsubscribers = []
+    if (this.settleTimer) clearInterval(this.settleTimer)
+    if (this.balanceTimer) clearInterval(this.balanceTimer)
+    this.settleTimer = null
+    this.balanceTimer = null
   }
 
   // ---------- account ----------
@@ -117,11 +131,14 @@ export class ExecutionService {
     }
     if (amount <= 0) return { ok: false, reason: 'amount must be positive' }
     if (amount > this.risk.maxStake) return { ok: false, reason: `stake $${amount} exceeds max stake $${this.risk.maxStake}` }
-    if (amount > acct.balance) return { ok: false, reason: `insufficient balance ($${acct.balance.toFixed(2)})` }
+    // on IQ the broker's balance is the money that matters - gate against it
+    const effBalance = this.accountSource === 'iq' && acct.liveBalance !== null ? acct.liveBalance : acct.balance
+    if (amount > effBalance) return { ok: false, reason: `insufficient balance ($${effBalance.toFixed(2)})` }
     const dayLoss = acct.dayStartBalance - acct.balance
     if (dayLoss >= this.risk.dailyLossLimit)
       return { ok: false, reason: `daily loss limit hit (-$${dayLoss.toFixed(2)} / -$${this.risk.dailyLossLimit})` }
-    const openCount = this.store.listPositions('open').filter((p) => p.mode === 'paper').length
+    const openCount = this.store.listPositions('open').filter((p) => p.mode === 'paper').length +
+      this.store.listPositions('open').filter((p) => p.mode === 'live').length
     if (openCount >= this.risk.maxOpenPositions)
       return { ok: false, reason: `max concurrent positions (${this.risk.maxOpenPositions})` }
     const streakInfo = this.store.lossStreak()
@@ -352,11 +369,13 @@ export class ExecutionService {
         tp: req.tp,
         sl: req.sl,
         liveOrderId: String(data.order_id),
-        settlesAt: isCfd ? undefined : this.now() + expirySec,
+        settlesAt: isCfd ? undefined : this.now() + expiryMin * 60,
       }
       this.store.insertPosition(position)
       this.ctx.bus.emit('positionOpened', { position })
       this.ctx.bus.emit('alert', { level: 'success', message: `LIVE ${kind.toUpperCase()} order ${data.order_id} placed via iqair`, ts: this.now() })
+      // IQ deducts the stake immediately - true up the displayed balance
+      setTimeout(() => void this.syncLiveBalance(), 4000)
       return { ok: true, position }
     } catch (err) {
       this.lastLiveError = (err as Error).message
@@ -459,8 +478,14 @@ export class ExecutionService {
   private settle(id: string, exitPrice: number, status: 'won' | 'lost' | 'closed', pnl: number): void {
     const pos = this.store.settlePosition(id, exitPrice, status, pnl)
     if (!pos) return
-    // stake was deducted at open; balance gets stake + pnl back
-    this.store.adjustBalance(pos.amount + pnl)
+    if (pos.mode === 'paper') {
+      // stake was deducted at open; balance gets stake + pnl back
+      this.store.adjustBalance(pos.amount + pnl)
+    } else {
+      // live: IQ already booked the stake/result on the broker ledger -
+      // never touch the paper balance; pull the REAL figure shortly after
+      setTimeout(() => void this.syncLiveBalance(), 3000)
+    }
     this.ctx.bus.emit('positionClosed', { position: pos })
     this.ctx.bus.emit('account', { account: this.account() })
     this.ctx.bus.emit('alert', {
@@ -468,6 +493,63 @@ export class ExecutionService {
       message: `${pos.asset} ${pos.side.toUpperCase()} ${pos.kind} settled: ${pnl >= 0 ? '+' : '-'}$${Math.abs(pnl).toFixed(2)}`,
       ts: this.now(),
     })
+  }
+
+  /**
+   * 1s sweep: settle open LIVE option positions the moment their expiry is
+   * due - binaries/turbos against entry, digitals against strike, using the
+   * current feed price. The broker's authoritative balance arrives via
+   * syncLiveBalance() a few seconds later.
+   */
+  private settleLiveDue(): void {
+    if (!this.liveReady || this.accountSource !== 'iq') return
+    const now = this.now()
+    const due = this.store
+      .listPositions('open')
+      .filter((p) => p.mode === 'live' && p.settlesAt !== undefined && now >= p.settlesAt)
+    for (const pos of due) {
+      if (pos.kind !== 'binary' && pos.kind !== 'turbo' && pos.kind !== 'digital') continue
+      const price = this.market.getPrice(pos.asset)
+      // feed stalled for this asset - retry next sweep rather than settle wrong
+      if (!price || price <= 0) continue
+      if (pos.kind === 'digital') {
+        const strike = pos.strike ?? pos.entryPrice
+        const draw = price === strike
+        const won = pos.side === 'call' ? price > strike : price < strike
+        const pnl = draw ? 0 : won ? pos.amount * pos.payout : -pos.amount
+        this.settle(pos.id, price, draw ? 'won' : won ? 'won' : 'lost', pnl)
+      } else {
+        const draw = price === pos.entryPrice
+        const won = pos.side === 'call' ? price > pos.entryPrice : price < pos.entryPrice
+        const pnl = draw ? 0 : won ? pos.amount * pos.payout : -pos.amount
+        this.settle(pos.id, price, draw ? 'won' : won ? 'won' : 'lost', pnl)
+      }
+    }
+  }
+
+  /**
+   * Pull the broker's REAL balance from the sidecar into liveBalance and
+   * broadcast it. Runs on a 15s cadence while on IQ, plus right after order
+   * placement and settlement (delayed - IQ needs a moment to book results).
+   */
+  async syncLiveBalance(): Promise<void> {
+    if (!this.liveReady || this.accountSource !== 'iq' || this.syncingBalance) return
+    this.syncingBalance = true
+    try {
+      const bal = await this.getLive('/balance')
+      if (bal && typeof bal.amount === 'number' && Number.isFinite(bal.amount)) {
+        const prev = this.store.getAccount().liveBalance
+        const mode = typeof bal.mode === 'string' ? bal.mode : 'PRACTICE'
+        if (prev !== bal.amount || this.store.getAccount().balanceMode !== mode) {
+          this.store.setLiveBalance(bal.amount, mode)
+          this.ctx.bus.emit('account', { account: this.account() })
+        }
+      }
+    } catch {
+      // sidecar busy - the next tick retries
+    } finally {
+      this.syncingBalance = false
+    }
   }
 
   // ---------- live account ops ----------
