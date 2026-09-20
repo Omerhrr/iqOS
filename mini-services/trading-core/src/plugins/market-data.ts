@@ -538,6 +538,10 @@ export class MarketDataService {
       const res = await fetch(`${url.replace(/\/$/, '')}/connect`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
+        // /connect = login + balance-mode change_balance() on the sidecar -
+        // a chain of slow websocket round-trips (can legitimately take ~40s).
+        // Without a signal here a hung sidecar pinned the kernel request.
+        signal: AbortSignal.timeout(90_000),
         body: JSON.stringify({ email, password, balance_mode: balanceMode }),
       })
       const data = (await res.json()) as { ok: boolean; error?: string }

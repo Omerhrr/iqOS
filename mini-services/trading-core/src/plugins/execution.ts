@@ -650,7 +650,11 @@ export class ExecutionService {
       // stock ticker) - move to a tradeable pair so the feed has data
       this.ensureIQActiveAsset()
       const mode = balanceMode === 'REAL' ? 'REAL' : 'PRACTICE'
-      const switched = await this.postLive('/balance_mode', { mode })
+      // change_balance() is a slow multi-round-trip (profile fetch + two
+      // position-stream resubscribes) and the sidecar serializes it behind
+      // its global lock - 20s aborted REAL switches mid-flight, which made
+      // practice<->real look broken. Give it a real budget.
+      const switched = await this.postLive('/balance_mode', { mode }, 60_000)
       if (switched && switched.ok === false) {
         return { ok: false, error: String(switched.error ?? 'sidecar rejected balance mode') }
       }
@@ -739,12 +743,16 @@ export class ExecutionService {
     }
   }
 
-  private async postLive(path: string, body: unknown): Promise<Record<string, unknown> | null> {
+  private async postLive(path: string, body: unknown, timeoutMs = 20_000): Promise<Record<string, unknown> | null> {
     try {
       const res = await fetch(`${this.liveUrl().replace(/\/$/, '')}${path}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        signal: AbortSignal.timeout(20_000), // never let a hung sidecar call pin kernel fetches
+        // never let a hung sidecar call pin kernel fetches. Callers that hit
+        // legitimately slow IQ round-trips (connect, balance-mode switch -
+        // change_balance() chains multiple websocket messages) pass a
+        // larger budget; the 20s default protects the hot paths.
+        signal: AbortSignal.timeout(timeoutMs),
         body: JSON.stringify(body),
       })
       return (await res.json()) as Record<string, unknown>

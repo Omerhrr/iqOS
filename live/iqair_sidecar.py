@@ -64,6 +64,24 @@ _asset_ids = {}  # ticker -> numeric active_id, from the account's own metadata
 _digital_ids = {}  # ticker -> numeric active_id, digital-option group only
 _prices_cache = {}  # ticker -> (price, ts) for the /prices batch, 30s TTL
 
+# ---- websocket stream price engine ----
+# get_financial_information / get_candles are UNBOUNDED busy-wait round-trips
+# on the shared iqair websocket ('while ...: pass' with no timeout); every
+# /price tick used to ride them under the global lock, so one slow IQ
+# response froze every price in the OS ("the price is not moving at all").
+# Instead: subscribe IQ's candle stream per watched asset and read the
+# in-memory candle table (client.get_realtime_candles) - a pure RAM read,
+# no lock, no round-trip, never blocks.
+_STREAM_SIZE = 5      # 5s candles = freshest streamed close per asset
+_STREAM_MAXDICT = 2   # keep only the newest 2 candles per asset in RAM
+_streamed = set()     # tickers with a LIVE stream subscription
+_seeding = set()      # ticker whose seed thread is in flight (ONE at a time)
+_watch = {}           # ticker -> last-touched ts (reaper expires stale subs)
+_seed_lock = threading.Lock()
+WATCH_TTL = 300.0     # stop streams untouched for 5 min
+WATCH_CAP = 48        # max concurrent subscriptions
+PRICE_WAIT = 2.0      # max lock wait for PRICE paths - polls must never block
+
 # The iqair lib has UNBOUNDED busy-wait loops (get_candles et al spin forever
 # on a half-open websocket - client.py 'while ...: pass' with no timeout).
 # A lib call that never returns while holding the global lock froze the whole
@@ -83,9 +101,9 @@ class SidecarBusy(Exception):
 
 
 @contextlib.contextmanager
-def lock_guard():
+def lock_guard(timeout=None):
     global _held_since
-    if not _lock.acquire(timeout=LOCK_WAIT_TIMEOUT):
+    if not _lock.acquire(timeout=LOCK_WAIT_TIMEOUT if timeout is None else timeout):
         raise SidecarBusy("iqair bus busy - another call is holding the lock")
     _held_since = time.time()
     try:
@@ -107,6 +125,100 @@ def _lock_watchdog():
 
 
 threading.Thread(target=_lock_watchdog, daemon=True).start()
+
+
+# ---------------- stream price engine ----------------
+
+def _stream_price(ticker):
+    """Freshest streamed candle close for ticker, straight from RAM.
+    Returns None when no stream data exists (asset not seeded yet)."""
+    if _client is None:
+        return None
+    try:
+        table = _client.get_realtime_candles(ticker, _STREAM_SIZE)
+        if isinstance(table, dict) and table:
+            c = table[max(table.keys())]
+            for k in ("close", "ask", "price"):
+                v = c.get(k)
+                if v is not None:
+                    f = float(v)
+                    if f > 0:
+                        return f
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _seed_stream(ticker):
+    """Subscribe the websocket candle stream for one asset. The seed does a
+    single get_candles round-trip (history fill) under the lock, so seeds are
+    STRICTLY serialized (one at a time) - a batch of new watch tickers must
+    never monopolize the bus and stall /price //prices again. Tickers whose
+    seed was deferred are retried on the next /price touch poll."""
+    with _seed_lock:
+        if _seeding:  # another seed in flight -> defer, next touch retries
+            return
+        _seeding.add(ticker)
+
+    def _run():
+        try:
+            if _client is None:
+                return
+            with lock_guard():
+                if _client is None:
+                    return
+                _client.start_candles_stream(ticker, _STREAM_SIZE, _STREAM_MAXDICT)
+            _streamed.add(ticker)
+            print(f"[sidecar] stream live: {ticker} (size={_STREAM_SIZE}s)")
+        except SidecarBusy:
+            pass  # bus busy - the next /price touch retries
+        except Exception as exc:  # noqa: BLE001
+            print(f"[sidecar] stream seed failed for {ticker}: {exc}")
+            _streamed.discard(ticker)
+        finally:
+            with _seed_lock:
+                _seeding.discard(ticker)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _touch_watch(ticker):
+    """Mark a ticker as wanted and (re)arm its stream when needed.
+    Called on every /price and /prices touch - cheap by design."""
+    _watch[ticker] = time.time()
+    if ticker not in _streamed and ticker not in _seeding:
+        _seed_stream(ticker)
+
+
+def _watch_reaper():
+    """Stop streams the OS stopped asking about (asset switch, closed watch
+    rows) so websocket subscriptions stay bounded."""
+    while True:
+        time.sleep(60)
+        if _client is None or not _watch:
+            continue
+        now = time.time()
+        stale = [t for t, ts in _watch.items() if now - ts > WATCH_TTL]
+        over = len(_watch) - WATCH_CAP
+        if over > 0:
+            oldest = sorted(_watch.items(), key=lambda kv: kv[1])[:over]
+            stale += [t for t, _ in oldest if t not in stale]
+        for t in stale:
+            _watch.pop(t, None)
+            was_live = t in _streamed
+            _streamed.discard(t)
+            if not was_live:
+                continue
+            try:
+                with lock_guard():
+                    if _client is not None:
+                        _client.stop_candles_stream(t, _STREAM_SIZE)
+                print(f"[sidecar] stream stopped: {t}")
+            except Exception:  # noqa: BLE001
+                pass
+
+
+threading.Thread(target=_watch_reaper, daemon=True).start()
 
 # ---------------- session resume ----------------
 # The iqair lib keeps the authenticated session in a module global
@@ -457,18 +569,63 @@ class Handler(BaseHTTPRequestHandler):
             # /candles or /balance (lock queuing made orders feel dead)
             return self._send(self._assets_payload())
 
-        try:
-            with lock_guard():
-                if path == "/balance":
-                    # iqair 1.0.0: get_balance() returns the amount directly
-                    # (float) and get_balance_mode() reports "PRACTICE"/"REAL".
+        if path == "/price":
+            # STREAM FIRST: the freshest price straight from the websocket
+            # candle table in RAM - no lock, no round-trip, never blocks and
+            # keeps flowing even while /candles or /trade hold the bus. The
+            # locked round-trip fallback below only runs before the stream
+            # has seeded (first ~2s after connect / asset switch).
+            asset = params.get("asset", "EURUSD")
+            if OP_code is not None and asset not in OP_code.ACTIVES:
+                return self._send(_err(f"unknown asset {asset}"), 400)
+            _touch_watch(asset)
+            sp = _stream_price(asset)
+            if sp is not None:
+                return self._send(_ok({"asset": asset, "price": sp, "src": "stream"}))
+            # fallback: get_financial_information round-trip (busy-waits in
+            # the lib). SHORT lock wait - a price poll must never queue
+            # behind a 240-bar candle pull; the kernel retries in 4s.
+            try:
+                with lock_guard(PRICE_WAIT):
+                    active_id = OP_code.ACTIVES.get(asset, asset) if OP_code is not None else asset
+                    # iqair 1.0.0: returns the payload directly (no ok-wrapper)
+                    data = _client.get_financial_information(active_id)
+                    if isinstance(data, list) and data:
+                        data = data[0]
+                    price = None
+                    try:
+                        price = float(data["ask"]["price"])  # mid-ish quote
+                    except Exception:  # noqa: BLE001
+                        try:
+                            price = float(data.get("price"))
+                        except Exception:  # noqa: BLE001
+                            pass
+                    if price is None:
+                        return self._send(_err("no price in response"), 502)
+                    return self._send(_ok({"asset": asset, "price": price, "src": "roundtrip"}))
+            except SidecarBusy:
+                return self._send(_err("iqair bus busy - retry shortly"), 503)
+            except Exception as exc:  # noqa: BLE001
+                return self._send(_err(exc), 500)
+
+        if path == "/balance":
+            # short lock wait: balance is polled on a 15s cadence, missing
+            # one poll is harmless - blocking the bus for it is not
+            try:
+                with lock_guard(PRICE_WAIT):
                     bal = _client.get_balance()
                     try:
                         mode = _client.get_balance_mode()
                     except Exception:  # noqa: BLE001
                         mode = None
                     return self._send(_ok({"amount": bal, "mode": mode}))
+            except SidecarBusy:
+                return self._send(_err("iqair bus busy - retry shortly"), 503)
+            except Exception as exc:  # noqa: BLE001
+                return self._send(_err(exc), 500)
 
+        try:
+            with lock_guard():
                 if path == "/candles":
                     asset = params.get("asset", "EURUSD")
                     size = int(params.get("size", 300))
@@ -492,35 +649,6 @@ class Handler(BaseHTTPRequestHandler):
                     ]
                     candles.sort(key=lambda k: k["time"])
                     return self._send(_ok({"candles": candles}))
-
-                if path == "/price":
-                    asset = params.get("asset", "EURUSD")
-                    if OP_code is not None and asset not in OP_code.ACTIVES:
-                        return self._send(_err(f"unknown asset {asset}"), 400)
-                    active_id = OP_code.ACTIVES.get(asset, asset) if OP_code is not None else asset
-                    # iqair 1.0.0: returns the payload directly (no ok-wrapper)
-                    data = _client.get_financial_information(active_id)
-                    if isinstance(data, list) and data:
-                        data = data[0]
-                    price = None
-                    try:
-                        price = float(data["ask"]["price"])  # mid-ish quote
-                    except Exception:  # noqa: BLE001
-                        try:
-                            price = float(data.get("price"))
-                        except Exception:  # noqa: BLE001
-                            pass
-                    if price is None:
-                        # last resort: newest streamed candle close
-                        try:
-                            recent = _client.get_candles(asset, 60, 1, int(time.time()))
-                            if recent:
-                                price = float(recent[-1].get("close"))
-                        except Exception:  # noqa: BLE001
-                            pass
-                    if price is None:
-                        return self._send(_err("no price in response"), 502)
-                    return self._send(_ok({"asset": asset, "price": price}))
 
             return self._send(_err(f"no GET route {path}"), 404)
         except SidecarBusy:
@@ -570,6 +698,7 @@ class Handler(BaseHTTPRequestHandler):
             mode = str(body.get("mode") or "").upper()
             if mode not in ("PRACTICE", "REAL"):
                 return self._send(_err("mode must be PRACTICE or REAL"), 400)
+            print(f"[sidecar] balance_mode switch requested: -> {mode}")
             try:
                 with lock_guard():
                     # fast path: already in the requested mode? get_balance_mode()
@@ -593,7 +722,69 @@ class Handler(BaseHTTPRequestHandler):
                     print(f"[sidecar] balance mode = {mode} (was {current or 'unknown'})")
                 return self._send(_ok({"balance_mode": mode, "amount": amount}))
             except Exception as exc:  # noqa: BLE001
+                # silent failures here made practice<->real switches look
+                # broken (the UI just saw a timeout) - log them loudly
+                print(f"[sidecar] balance_mode switch to {mode} FAILED: {exc}")
                 return self._send(_err(exc), 500)
+
+        if path == "/prices":
+            # batch watch-list prices - served OUTSIDE the global lock:
+            # stream-first RAM reads + a short-wait round-trip scan only for
+            # tickers whose stream has not seeded yet. A price poll must
+            # never queue behind /candles or /trade (that froze the UI).
+            raw = body.get("tickers")
+            want = [t for t in (raw if isinstance(raw, list) else []) if isinstance(t, str) and t][:40]
+            if not want:
+                return self._send(_ok({"prices": {}}))
+            now = time.time()
+            prices = {}
+            missing = []
+            for t in want:
+                # stream first: RAM read, no lock (also auto-subscribes the
+                # ticker so FUTURE polls are pure memory reads)
+                if OP_code is not None and t in OP_code.ACTIVES:
+                    _touch_watch(t)
+                    sp = _stream_price(t)
+                    if sp is not None:
+                        prices[t] = sp
+                        _prices_cache[t] = (sp, now)
+                        continue
+                hit = _prices_cache.get(t)
+                if hit and now - hit[1] < 30:
+                    prices[t] = hit[0]
+                else:
+                    missing.append(t)
+            if missing:
+                # all iqair calls share the global lock: concurrent
+                # candle/price requests would clobber the lib's shared
+                # response slots (and a KeyError here would push the
+                # lib into its reconnect busy-wait). SHORT wait - a
+                # price poll degrades to partial results instead of
+                # queueing behind a 240-bar candle pull.
+                try:
+                    with lock_guard(PRICE_WAIT):
+                        # per-call fetch budget: a big visible window must
+                        # never hold the bus for tens of seconds (that
+                        # starved the 4s active-asset poll into timeouts).
+                        # Tickers left unfetched stay uncached - the next
+                        # UI poll (8s) continues where this one stopped.
+                        budget = time.time() + 3.0
+                        for t in missing:
+                            if time.time() > budget:
+                                break
+                            if OP_code is not None and t not in OP_code.ACTIVES:
+                                continue
+                            try:
+                                data = _client.get_candles(t, 60, 1, int(time.time()))
+                                if data and isinstance(data[-1], dict) and data[-1].get("close") is not None:
+                                    p = float(data[-1]["close"])
+                                    _prices_cache[t] = (p, time.time())
+                                    prices[t] = p
+                            except Exception:  # noqa: BLE001
+                                pass
+                except SidecarBusy:
+                    pass  # serve the stream/cache hits we already have
+            return self._send(_ok({"prices": prices}))
 
         try:
             with lock_guard():
@@ -704,50 +895,6 @@ class Handler(BaseHTTPRequestHandler):
                     itype = body.get("instrument_type") or "turbo-option"
                     ok, data = _client.get_positions(itype)
                     return self._send(_ok({"positions": data.get("positions", []) if ok and isinstance(data, dict) else []}))
-
-                if path == "/prices":
-                    # batch watch-list prices: last 1m candle close per ticker.
-                    # Capped + cached so the UI can poll a visible window of
-                    # rows without flooding the single websocket.
-                    raw = body.get("tickers")
-                    want = [t for t in (raw if isinstance(raw, list) else []) if isinstance(t, str) and t][:40]
-                    if not want:
-                        return self._send(_ok({"prices": {}}))
-                    now = time.time()
-                    prices = {}
-                    missing = []
-                    for t in want:
-                        hit = _prices_cache.get(t)
-                        if hit and now - hit[1] < 30:
-                            prices[t] = hit[0]
-                        else:
-                            missing.append(t)
-                    if missing:
-                        # all iqair calls share the global lock: concurrent
-                        # candle/price requests would clobber the lib's shared
-                        # response slots (and a KeyError here would push the
-                        # lib into its reconnect busy-wait)
-                        with lock_guard():
-                            # per-call fetch budget: a big visible window must
-                            # never hold the bus for tens of seconds (that
-                            # starved the 4s active-asset poll into timeouts).
-                            # Tickers left unfetched stay uncached - the next
-                            # UI poll (8s) continues where this one stopped.
-                            budget = time.time() + 3.0
-                            for t in missing:
-                                if time.time() > budget:
-                                    break
-                                if OP_code is not None and t not in OP_code.ACTIVES:
-                                    continue
-                                try:
-                                    data = _client.get_candles(t, 60, 1, int(time.time()))
-                                    if data and isinstance(data[-1], dict) and data[-1].get("close") is not None:
-                                        p = float(data[-1]["close"])
-                                        _prices_cache[t] = (p, time.time())
-                                        prices[t] = p
-                                except Exception:  # noqa: BLE001
-                                    pass
-                    return self._send(_ok({"prices": prices}))
 
                 if path == "/payouts":
                     # best-effort payout snapshot for the active asset
