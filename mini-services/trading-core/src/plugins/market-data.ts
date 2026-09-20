@@ -100,6 +100,34 @@ export class MarketDataService {
       ctx.log('market-data', 'candle archive attached - closed bars persist across restarts')
     }
     ctx.log('market-data', `universe online: ${this.assets.length} instruments, ${ALL_TIMEFRAMES.length} timeframes (lazy seeding)`)
+    // Session adoption: the sidecar keeps its authenticated iqair session across
+    // kernel restarts (bun --hot reloads, sandbox resets). If it is still
+    // connected, resume LIVE mode without asking the user to re-type secrets.
+    setTimeout(() => void this.adoptSidecarSession(), 1500)
+  }
+
+  /**
+   * Adopt an already-connected iqair sidecar session: no credentials needed,
+   * the sidecar holds the authenticated websocket. Returns true when LIVE
+   * polling resumed. Safe to call at any time (boot, reconnect, watchdog).
+   */
+  async adoptSidecarSession(url = this.liveUrl): Promise<boolean> {
+    if (this.mode === 'live') return true
+    const base = url.replace(/\/$/, '')
+    try {
+      const res = await fetch(`${base}/health`, { signal: AbortSignal.timeout(2000) })
+      const data = (await res.json()) as { ok?: boolean; connected?: boolean }
+      if (!data?.connected) return false
+      this.liveUrl = url
+      this.mode = 'live'
+      if (this.liveTimer) clearInterval(this.liveTimer)
+      this.liveTimer = setInterval(() => void this.pollLive(), 4000)
+      void this.pollLive()
+      this.ctx.log('market-data', `LIVE resumed - adopted connected iqair sidecar @ ${base}`)
+      return true
+    } catch {
+      return false
+    }
   }
 
   /** Materialize history for an instrument on first use: prehistory + archive + gap-fill. */
@@ -343,6 +371,9 @@ export class MarketDataService {
   }
 
   async connectLive(url: string, email: string, password: string, balanceMode: string): Promise<{ ok: boolean; error?: string }> {
+    // Empty credentials + sidecar already authenticated? Adopt its session
+    // instead of failing - the user should not re-type secrets needlessly.
+    if (!email.trim() && !password.trim() && (await this.adoptSidecarSession(url))) return { ok: true }
     try {
       const res = await fetch(`${url.replace(/\/$/, '')}/connect`, {
         method: 'POST',

@@ -161,6 +161,7 @@ export class Store {
       totalPnl,
       killSwitch: row.kill_switch === 1,
       openPositions: this.listPositions('open').length,
+      liveBalance: row.live_balance,
     }
   }
 

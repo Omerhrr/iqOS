@@ -470,7 +470,7 @@ export class ExecutionService {
     if (res.ok) {
       this.liveReady = true
       this.lastLiveError = ''
-      const bal = await this.postLive('/balance', {})
+      const bal = await this.getLive('/balance')
       if (bal && typeof bal.amount === 'number') {
         this.store.setLiveBalance(bal.amount, typeof bal.mode === 'string' ? bal.mode : balanceMode)
         this.ctx.bus.emit('account', { account: this.account() })
@@ -480,6 +480,25 @@ export class ExecutionService {
       this.lastLiveError = res.error ?? 'connection failed'
     }
     return res
+  }
+
+  /**
+   * Resume live trading after a kernel restart WITHOUT re-entering secrets:
+   * adopt the sidecar's still-authenticated session, then re-sync balance.
+   * Called automatically at boot by the kernel wiring when the sidecar holds
+   * a live session; also safe to call manually.
+   */
+  async adoptLive(url?: string): Promise<{ ok: boolean; error?: string }> {
+    const adopted = url ? await this.market.adoptSidecarSession(url) : await this.market.adoptSidecarSession()
+    if (!adopted) return { ok: false, error: 'no connected sidecar session to adopt' }
+    this.liveReady = true
+    this.lastLiveError = ''
+    const bal = await this.getLive('/balance')
+    if (bal && typeof bal.amount === 'number') {
+      this.store.setLiveBalance(bal.amount, typeof bal.mode === 'string' ? bal.mode : 'PRACTICE')
+      this.ctx.bus.emit('account', { account: this.account() })
+    }
+    return { ok: true }
   }
 
   disconnectLive(): void {
@@ -502,6 +521,16 @@ export class ExecutionService {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
       })
+      return (await res.json()) as Record<string, unknown>
+    } catch {
+      return null
+    }
+  }
+
+  /** GET variant - the sidecar serves read-only endpoints (e.g. /balance) on GET. */
+  private async getLive(path: string): Promise<Record<string, unknown> | null> {
+    try {
+      const res = await fetch(`${this.liveUrl().replace(/\/$/, '')}${path}`, { signal: AbortSignal.timeout(8000) })
       return (await res.json()) as Record<string, unknown>
     } catch {
       return null

@@ -84,6 +84,19 @@ const httpServer = createServer(async (req, res) => {
 
       if (path === '/assets') return json(200, { ok: true, assets: market.listAssets(), mode: market.mode, activeAsset: market.activeAsset })
 
+      if (path === '/live/status') {
+        const account = exec.account()
+        return json(200, {
+          ok: true,
+          mode: market.mode,
+          liveUrl: market.liveUrl,
+          liveReady: exec.liveReady,
+          balance: account.liveBalance ?? account.balance,
+          balanceMode: account.balanceMode,
+          simBalance: account.balance,
+        })
+      }
+
       if (path === '/instruments') {
         const cat = (q.get('category') ?? 'all') as 'all' | 'otc' | 'forex' | 'crypto' | 'commodity' | 'stock' | 'index'
         const search = q.get('q') ?? ''
@@ -568,6 +581,11 @@ const httpServer = createServer(async (req, res) => {
         return json(200, { ok: true })
       }
 
+      if (path === '/live/adopt') {
+        const out = await exec.adoptLive(String(body.url ?? 'http://127.0.0.1:8788'))
+        return json(200, out)
+      }
+
       if (path === '/live/positions') {
         const out = await exec.livePositions()
         return json(200, { ok: true, data: out })
@@ -727,6 +745,15 @@ kernel.start().then(() => {
   httpServer.listen(PORT, () => {
     console.log(`[trading-core] IQAIR//OS kernel listening on :${PORT}`)
   })
+  // Boot-time live resume: if the iqair sidecar still holds an authenticated
+  // session (it survives kernel restarts), adopt it so trading + feed resume
+  // without the user re-entering credentials. Idempotent; no-op in pure sim.
+  setTimeout(() => {
+    const exec = kernel.context().use<ExecutionService>('execution')
+    void exec.adoptLive().then((r) => {
+      if (r.ok) console.log('[trading-core] live session adopted from sidecar at boot')
+    })
+  }, 2000)
 }).catch((err) => {
   console.error('[trading-core] kernel boot failed:', err)
   process.exit(1)

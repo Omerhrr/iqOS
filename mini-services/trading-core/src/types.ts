@@ -113,6 +113,7 @@ export interface AccountState {
   totalPnl: number
   killSwitch: boolean
   openPositions: number
+  liveBalance: number | null
 }
 
 // ---------- Analytics ----------
