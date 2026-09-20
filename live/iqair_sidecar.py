@@ -19,7 +19,9 @@ PRACTICE balance is the default and strongly recommended. The OS never
 switches to REAL unless you ask the sidecar to.
 """
 
+import contextlib
 import json
+import os
 import threading
 import time
 
@@ -61,6 +63,50 @@ _assets_fetching = False  # dedupe concurrent metadata crunches (they run unlock
 _asset_ids = {}  # ticker -> numeric active_id, from the account's own metadata
 _digital_ids = {}  # ticker -> numeric active_id, digital-option group only
 _prices_cache = {}  # ticker -> (price, ts) for the /prices batch, 30s TTL
+
+# The iqair lib has UNBOUNDED busy-wait loops (get_candles et al spin forever
+# on a half-open websocket - client.py 'while ...: pass' with no timeout).
+# A lib call that never returns while holding the global lock froze the whole
+# bus once (489 request threads piled up behind it). Two defenses:
+#   1. lock_guard(): WAITERS get a fast 503 after LOCK_WAIT_TIMEOUT instead of
+#      queueing forever, so one slow call degrades instead of deadlocking.
+#   2. _lock_watchdog(): a holder running longer than LOCK_STUCK_EXIT_SECS is
+#      by definition a hung lib call (legit calls cap at ~40s worst case) -
+#      exit hard and let the keeper respawn a fresh sidecar.
+LOCK_WAIT_TIMEOUT = 15.0
+LOCK_STUCK_EXIT_SECS = 60.0
+_held_since = None  # ts when the current holder acquired _lock
+
+
+class SidecarBusy(Exception):
+    """Raised when the global iqair lock cannot be acquired in time."""
+
+
+@contextlib.contextmanager
+def lock_guard():
+    global _held_since
+    if not _lock.acquire(timeout=LOCK_WAIT_TIMEOUT):
+        raise SidecarBusy("iqair bus busy - another call is holding the lock")
+    _held_since = time.time()
+    try:
+        yield
+    finally:
+        _held_since = None
+        _lock.release()
+
+
+def _lock_watchdog():
+    while True:
+        time.sleep(5)
+        if _lock.locked() and _held_since is not None:
+            held = time.time() - _held_since
+            if held > LOCK_STUCK_EXIT_SECS:
+                print(f"[sidecar] WATCHDOG: iqair call held the bus for {held:.0f}s "
+                      f"(hung lib call, dead websocket) - restarting process")
+                os._exit(1)
+
+
+threading.Thread(target=_lock_watchdog, daemon=True).start()
 
 
 def _seed_ids_from_init():
@@ -272,8 +318,13 @@ class Handler(BaseHTTPRequestHandler):
                         for t, aid in _asset_ids.items():
                             if t not in OP_code.ACTIVES:
                                 OP_code.ACTIVES[t] = aid
-                    with _lock:
-                        _assets_cache = (rows, now)
+                    # non-fatal cache write: if the bus is stuck we still
+                    # return the freshly fetched rows, just uncached
+                    if _lock.acquire(timeout=LOCK_WAIT_TIMEOUT):
+                        try:
+                            _assets_cache = (rows, now)
+                        finally:
+                            _lock.release()
                     print(f"[sidecar] asset table cached: {len(rows)} rows, {len(_asset_ids)} active_ids")
             except Exception as exc:  # noqa: BLE001
                 print(f"[sidecar] asset metadata fetch failed: {exc}")
@@ -325,7 +376,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(self._assets_payload())
 
         try:
-            with _lock:
+            with lock_guard():
                 if path == "/balance":
                     # iqair 1.0.0: get_balance() returns the amount directly
                     # (float) and get_balance_mode() reports "PRACTICE"/"REAL".
@@ -390,6 +441,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(_ok({"asset": asset, "price": price}))
 
             return self._send(_err(f"no GET route {path}"), 404)
+        except SidecarBusy:
+            return self._send(_err("iqair bus busy - retry shortly"), 503)
         except Exception as exc:  # noqa: BLE001
             return self._send(_err(exc), 500)
 
@@ -433,7 +486,7 @@ class Handler(BaseHTTPRequestHandler):
             if mode not in ("PRACTICE", "REAL"):
                 return self._send(_err("mode must be PRACTICE or REAL"), 400)
             try:
-                with _lock:
+                with lock_guard():
                     # fast path: already in the requested mode? get_balance_mode()
                     # is a cheap read, while change_balance() is a slow websocket
                     # round-trip (tens of seconds) - skip it when it is a no-op
@@ -458,7 +511,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(_err(exc), 500)
 
         try:
-            with _lock:
+            with lock_guard():
                 if path == "/disconnect":
                     try:
                         _client.disconnect()
@@ -589,7 +642,7 @@ class Handler(BaseHTTPRequestHandler):
                         # candle/price requests would clobber the lib's shared
                         # response slots (and a KeyError here would push the
                         # lib into its reconnect busy-wait)
-                        with _lock:
+                        with lock_guard():
                             for t in missing:
                                 if OP_code is not None and t not in OP_code.ACTIVES:
                                     continue
@@ -649,6 +702,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(_ok({"history": items if isinstance(items, list) else []}))
 
             return self._send(_err(f"no POST route {path}"), 404)
+        except SidecarBusy:
+            return self._send(_err("iqair bus busy - retry shortly"), 503)
         except Exception as exc:  # noqa: BLE001
             return self._send(_err(exc), 500)
 

@@ -338,6 +338,7 @@ export class ExecutionService {
       const res = await fetch(`${this.liveUrl()}/trade`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
+        signal: AbortSignal.timeout(90_000), // digital resolve + server wait can legitimately take ~40s
         body: JSON.stringify({
           asset: symbol,
           amount: req.amount,
@@ -743,6 +744,7 @@ export class ExecutionService {
       const res = await fetch(`${this.liveUrl().replace(/\/$/, '')}${path}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
+        signal: AbortSignal.timeout(20_000), // never let a hung sidecar call pin kernel fetches
         body: JSON.stringify(body),
       })
       return (await res.json()) as Record<string, unknown>

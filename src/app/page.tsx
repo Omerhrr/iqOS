@@ -70,6 +70,8 @@ export default function OSPage() {
   const [assets, setAssets] = useState<AssetRow[]>([])
   const [asset, setAsset] = useState('EURUSD')
   const [tf, setTf] = useState<Timeframe>('1m')
+  const assetRef = useRef(asset)
+  assetRef.current = asset
   const [candles, setCandles] = useState<Candle[]>([])
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null)
   const [account, setAccount] = useState<AccountState | null>(null)
@@ -162,6 +164,10 @@ export default function OSPage() {
       const d = await osPost<{ ok: boolean; prices?: Record<string, number> }>('/prices', { tickers })
       if (!d.ok || !d.prices) return
       for (const [t, p] of Object.entries(d.prices)) {
+        // the ACTIVE chart asset is ticked by the kernel's 4s live poll -
+        // never let this batch (sidecar-cached up to 30s) overwrite it with
+        // a staler number, which made the chart/watch price appear frozen
+        if (t === assetRef.current) continue
         const price = Number(p)
         if (!Number.isFinite(price) || price <= 0) continue
         const before = pricesRef.current[t]

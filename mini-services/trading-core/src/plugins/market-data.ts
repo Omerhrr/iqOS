@@ -564,8 +564,8 @@ export class MarketDataService {
     try {
       const url = `${this.liveUrl.replace(/\/$/, '')}`
       const [candleRes, priceRes] = await Promise.all([
-        fetch(`${url}/candles?asset=${this.activeAsset}&size=240&tf=60`),
-        fetch(`${url}/price?asset=${this.activeAsset}`),
+        fetch(`${url}/candles?asset=${this.activeAsset}&size=240&tf=60`, { signal: AbortSignal.timeout(12_000) }),
+        fetch(`${url}/price?asset=${this.activeAsset}`, { signal: AbortSignal.timeout(12_000) }),
       ])
       const candleData = (await candleRes.json()) as { ok: boolean; candles?: Candle[] }
       const priceData = (await priceRes.json()) as { ok: boolean; price?: number }
