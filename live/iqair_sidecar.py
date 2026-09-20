@@ -57,6 +57,88 @@ PORT = 8788
 _lock = threading.Lock()
 _client = None  # iqair IQOptionClient, set by /connect
 _assets_cache = None  # (rows, ts) - the ~90s instrument table, 30 min TTL
+_assets_fetching = False  # dedupe concurrent metadata crunches (they run unlocked)
+_asset_ids = {}  # ticker -> numeric active_id, from the account's own metadata
+
+
+def _seed_ids_from_init():
+    """Best-effort build of the ticker -> active_id map from the turbo/binary
+    init table right after connect, so the first trade already resolves fast.
+    Also seeds the library's stale 2018 static ACTIVES table with real ids."""
+    try:
+        data = _client.get_all_init_v2()
+        for option in ("turbo", "binary"):
+            actives = (data or {}).get(option, {}).get("actives", {})
+            for aid, active in actives.items():
+                t = active.get("ticker") or str(active.get("name", "")).split(".")[-1]
+                try:
+                    _asset_ids[t] = int(aid)
+                except (TypeError, ValueError):
+                    pass
+        if OP_code is not None:
+            for t, aid in _asset_ids.items():
+                if t not in OP_code.ACTIVES:
+                    OP_code.ACTIVES[t] = aid
+        print(f"[sidecar] active_id map ready: {len(_asset_ids)} tickers")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[sidecar] active_id map deferred (will build lazily): {exc}")
+
+
+def _resolve_active_id(ticker):
+    """ticker -> IQ numeric active_id. Cached map first, one-shot live scan of
+    the turbo/binary init table on miss, seeded static table last. Returns
+    None only when the account truly has no such instrument - NEVER sends a
+    null active_id to the broker."""
+    if ticker in _asset_ids:
+        return _asset_ids[ticker]
+    if _client is None:
+        return None
+    try:
+        data = _client.get_all_init_v2()
+        for option in ("turbo", "binary"):
+            actives = (data or {}).get(option, {}).get("actives", {})
+            for aid, active in actives.items():
+                t = active.get("ticker") or str(active.get("name", "")).split(".")[-1]
+                try:
+                    _asset_ids[t] = int(aid)
+                except (TypeError, ValueError):
+                    pass
+    except Exception:  # noqa: BLE001
+        pass
+    if ticker in _asset_ids:
+        return _asset_ids[ticker]
+    if OP_code is not None:
+        v = OP_code.ACTIVES.get(ticker)
+        if isinstance(v, int):
+            _asset_ids[ticker] = v
+            return v
+    return None
+
+
+def _buy_fast(amount, active_id, direction, expiry_minutes):
+    """Direct buyv3 order with a pre-resolved active_id: ONE websocket round
+    trip, no per-order init re-scan. Mirrors iqair's _buy_once response wait.
+    Returns (True, order_id) or (False, reason)."""
+    req_id = f"iqos-{int(time.time() * 1000)}"
+    _client.api.buy_multi_option = {}
+    _client.api.buy_successful = None
+    _client.api.buyv3(amount, active_id, direction, expiry_minutes, req_id)
+    deadline = time.time() + 10
+    resp = None
+    while time.time() < deadline:
+        resp = (_client.api.buy_multi_option or {}).get(req_id)
+        if isinstance(resp, dict) and (resp.get("id") is not None or resp.get("message")):
+            break
+        time.sleep(0.15)
+    if not isinstance(resp, dict):
+        print(f"[sidecar] buy timeout: {active_id} x {amount} ({expiry_minutes}m)")
+        return False, "broker did not answer the order in time"
+    if resp.get("id") is None:
+        msg = resp.get("message") or "rejected"
+        print(f"[sidecar] buy rejected: {active_id} x {amount}: {msg}")
+        return False, str(msg)
+    print(f"[sidecar] buy ok: active_id {active_id} x {amount} {direction} {expiry_minutes}m -> order {resp['id']}")
+    return True, resp["id"]
 
 
 def _ok(data=None):
@@ -73,6 +155,61 @@ def _err(msg):
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # quiet
         pass
+
+    def _assets_payload(self):
+        """GET /assets body - built OUTSIDE the global lock. Serves the cached
+        instrument table instantly; on miss fetches the account metadata
+        (up to ~95s) while /trade, /candles and /balance stay responsive.
+        Rows: {ticker, category, is_open, payout}; the fetch also fills the
+        ticker -> active_id map used by the fast trade path."""
+        global _assets_cache, _assets_fetching
+        now = time.time()
+        if _assets_cache and now - _assets_cache[1] < 1800:
+            return _ok({"assets": _assets_cache[0], "live": True, "cached": True})
+        if not _assets_fetching:
+            _assets_fetching = True
+            try:
+                # NOTE: must use OUR client - iqair.agent.tools.get_client()
+                # is a different, unconnected instance.
+                meta = _client.get_asset_metadata()
+                rows = []
+                for cat, entries in (meta or {}).items():
+                    if not isinstance(entries, dict):
+                        continue
+                    for ticker, info in entries.items():
+                        is_open = bool((info or {}).get("is_open", False)) if isinstance(info, dict) else False
+                        pay = None
+                        if isinstance(info, dict) and info.get("payout") is not None:
+                            try:
+                                pay = float(info["payout"])
+                            except (TypeError, ValueError):
+                                pay = None
+                        if isinstance(info, dict) and info.get("id") is not None:
+                            try:
+                                _asset_ids[ticker] = int(info["id"])
+                            except (TypeError, ValueError):
+                                pass
+                        rows.append({"ticker": ticker, "category": cat, "is_open": is_open, "payout": pay})
+                if rows:
+                    # seed the library's stale 2018 static table with real ids:
+                    # fixes /candles + /price validation for OTC/new tickers too
+                    if OP_code is not None:
+                        for t, aid in _asset_ids.items():
+                            if t not in OP_code.ACTIVES:
+                                OP_code.ACTIVES[t] = aid
+                    with _lock:
+                        _assets_cache = (rows, now)
+                    print(f"[sidecar] asset table cached: {len(rows)} rows, {len(_asset_ids)} active_ids")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[sidecar] asset metadata fetch failed: {exc}")
+            finally:
+                _assets_fetching = False
+        if _assets_cache:
+            return _ok({"assets": _assets_cache[0], "live": True, "cached": True})
+        if OP_code is not None:
+            # static universe from the library's symbol table (no payout info)
+            return _ok({"assets": [{"ticker": k, "category": None, "is_open": None, "payout": None} for k in OP_code.ACTIVES.keys()], "live": False})
+        return _ok({"assets": [], "live": False})
 
     def _send(self, obj, code=200):
         raw = json.dumps(obj, default=str).encode()
@@ -101,10 +238,16 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/health":
             connected = _client is not None
-            return self._send(_ok({"connected": connected}))
+            return self._send(_ok({"connected": connected, "assets_mapped": len(_asset_ids)}))
 
         if _client is None:
             return self._send(_err("not connected - POST /connect first"), 400)
+
+        if path == "/assets":
+            # served OUTSIDE the global lock on purpose: the metadata
+            # round-trip can take IQ ~95s and must never block /trade,
+            # /candles or /balance (lock queuing made orders feel dead)
+            return self._send(self._assets_payload())
 
         try:
             with _lock:
@@ -117,51 +260,6 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:  # noqa: BLE001
                         mode = None
                     return self._send(_ok({"amount": bal, "mode": mode}))
-
-                if path == "/assets":
-                    # LIVE metadata from the authenticated session (the account's
-                    # real tradeable assets + is_open, incl. weekend OTC).
-                    # NOTE: must use OUR client - iqair.agent.tools.get_client()
-                    # is a different, unconnected instance.
-                    # The full instrument table takes IQ ~90s to produce - cache
-                    # it here (30 min) so repeat calls answer instantly; the
-                    # kernel also caches, but the FIRST fetch after a sidecar
-                    # start must not re-pay the 90s for every caller.
-                    global _assets_cache
-                    now = time.time()
-                    if _assets_cache and now - _assets_cache[1] < 1800:
-                        return self._send(_ok({"assets": _assets_cache[0], "live": True, "cached": True}))
-                    assets = None
-                    try:
-                        meta = _client.get_asset_metadata()
-                        rows = []
-                        for cat, entries in (meta or {}).items():
-                            if not isinstance(entries, dict):
-                                continue
-                            for ticker, info in entries.items():
-                                # payout: real 0-1 fraction, populated by IQ for
-                                # the turbo/binary groups only (None elsewhere)
-                                pay = None
-                                if isinstance(info, dict) and info.get("payout") is not None:
-                                    try:
-                                        pay = float(info["payout"])
-                                    except (TypeError, ValueError):
-                                        pay = None
-                                rows.append({
-                                    "ticker": ticker,
-                                    "category": cat,
-                                    "is_open": bool((info or {}).get("is_open", False)) if isinstance(info, dict) else False,
-                                    "payout": pay,
-                                })
-                        if rows:
-                            assets = rows
-                            _assets_cache = (rows, now)
-                    except Exception:  # noqa: BLE001
-                        assets = None
-                    if not assets and OP_code is not None:
-                        # static universe from the library's symbol table
-                        assets = [{"ticker": k, "category": None, "is_open": None, "payout": None} for k in OP_code.ACTIVES.keys()]
-                    return self._send(_ok({"assets": assets or [], "live": assets is not None}))
 
                 if path == "/candles":
                     asset = params.get("asset", "EURUSD")
@@ -244,6 +342,9 @@ class Handler(BaseHTTPRequestHandler):
                     print("[sidecar] WARNING: connecting with REAL balance at user request")
                 client.change_balance(mode)
                 _client = client
+                # build the ticker -> active_id map in the background so the
+                # FIRST trade already takes the fast path (connect replies now)
+                threading.Thread(target=_seed_ids_from_init, daemon=True).start()
                 return self._send(_ok({"connected": True, "balance_mode": mode}))
             except Exception as exc:  # noqa: BLE001
                 return self._send(_err(exc), 500)
@@ -330,7 +431,17 @@ class Handler(BaseHTTPRequestHandler):
                             if check is None:
                                 check, order_id = _client.buy(amount, asset, direction, expiry)
                         else:
-                            check, order_id = _client.buy(amount, asset, direction, expiry)
+                            # turbo/binary fast path: resolve the numeric
+                            # active_id ONCE (cached account metadata) and send
+                            # buyv3 directly. _client.buy() re-scans the whole
+                            # init table on EVERY order (slow) and falls back
+                            # to a stale 2018 static table that lacks OTC/new
+                            # tickers -> active_id null -> server rejection
+                            # ("OpenOptionRequest.ActiveId is not nullable").
+                            active_id = _resolve_active_id(asset)
+                            if active_id is None:
+                                return self._send(_err(f"{asset} is not a turbo/binary instrument on this IQ account"), 400)
+                            check, order_id = _buy_fast(amount, int(active_id), direction, expiry)
 
                     # ---- margin / CFD family ----
                     elif mode in ("forex", "crypto", "stock", "index", "commodity", "cfd"):
