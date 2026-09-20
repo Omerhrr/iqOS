@@ -21,6 +21,26 @@ switches to REAL unless you ask the sidecar to.
 
 import json
 import threading
+
+# Self-heal the iqair dependency: sandbox snapshot resets can revert the venv
+# to a state without this package. Install on demand (PyPI: omerhrr/iqair) so
+# a freshly spawned sidecar is always able to serve /connect.
+try:
+    import iqair  # noqa: F401
+except ModuleNotFoundError:
+    import subprocess
+    import sys
+
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", "iqair"],
+            check=True,
+            timeout=180,
+        )
+        print("[sidecar] iqair was missing - installed from PyPI")
+    except Exception as _exc:  # noqa: BLE001
+        print(f"[sidecar] WARNING: auto-install of iqair failed: {_exc}")
+
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST = "127.0.0.1"

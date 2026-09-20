@@ -6,6 +6,8 @@
 // LIVE bridge (iqair): polls the iqair sidecar for candles + prices and merges
 // them into the same (asset, tf) series, so the rest of the OS is broker-agnostic.
 
+import { spawn } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import type { AssetInfo, Candle, MarketMode, Timeframe } from '../types'
 import type { KernelContext } from '../kernel'
 import { ALL_TIMEFRAMES, TIMEFRAME_SECONDS } from '../types'
@@ -53,6 +55,12 @@ export class MarketDataService {
   private ctx!: KernelContext
   mode: MarketMode = 'sim'
   liveUrl = 'http://127.0.0.1:8788'
+  // Sandbox resets kill the sidecar daemon between sessions; the kernel is
+  // environment-supervised and always comes back, so IT owns sidecar revival:
+  // on a failed connect, spawn the sidecar once and retry (see ensureSidecar).
+  private sidecarSpawnTs = 0
+  private connectRetrying = false
+  private static SIDECAR_CMD = ['/home/z/.venv/bin/python3', '/home/z/my-project/live/iqair_sidecar.py']
   assets: AssetInfo[] = UNIVERSE.map((a) => ({ ...a }))
   private prices = new Map<string, number>()
   private regimes = new Map<string, Regime>()
@@ -298,6 +306,42 @@ export class MarketDataService {
 
   // ---------- LIVE bridge (iqair sidecar) ----------
 
+  /**
+   * Ensure the iqair sidecar is answering on `url`. Returns true when /health
+   * responds. If the sidecar is dark and we have not just tried, spawn it
+   * detached (survives kernel restarts; orphaned to init) and give it a
+   * grace period before re-checking.
+   */
+  private async ensureSidecar(url: string): Promise<boolean> {
+    const base = url.replace(/\/$/, '')
+    try {
+      const res = await fetch(`${base}/health`, { signal: AbortSignal.timeout(1500) })
+      if (res.ok) return true
+    } catch { /* dark */ }
+    if (Date.now() - this.sidecarSpawnTs < 30_000) return false
+    this.sidecarSpawnTs = Date.now()
+    const [bin, script] = MarketDataService.SIDECAR_CMD
+    try {
+      if (!existsSync(script)) {
+        this.ctx.log('market-data', `sidecar script missing: ${script}`)
+        return false
+      }
+      const child = spawn(bin, [script], { cwd: '/home/z/my-project/live', detached: true, stdio: 'ignore' })
+      child.unref()
+      this.ctx.log('market-data', 'sidecar dark - spawned live/iqair_sidecar.py')
+    } catch (err) {
+      this.ctx.log('market-data', `sidecar spawn failed: ${(err as Error).message}`)
+      return false
+    }
+    await new Promise((r) => setTimeout(r, 1200))
+    try {
+      const res = await fetch(`${base}/health`, { signal: AbortSignal.timeout(1500) })
+      return res.ok
+    } catch {
+      return false
+    }
+  }
+
   async connectLive(url: string, email: string, password: string, balanceMode: string): Promise<{ ok: boolean; error?: string }> {
     try {
       const res = await fetch(`${url.replace(/\/$/, '')}/connect`, {
@@ -315,6 +359,15 @@ export class MarketDataService {
       this.ctx.log('market-data', `LIVE via iqair sidecar @ ${url}`)
       return { ok: true }
     } catch (err) {
+      // Sidecar dark (sandbox reset / fresh boot)? Spawn it and retry once.
+      if (!this.connectRetrying && (await this.ensureSidecar(url))) {
+        this.connectRetrying = true
+        try {
+          return await this.connectLive(url, email, password, balanceMode)
+        } finally {
+          this.connectRetrying = false
+        }
+      }
       return { ok: false, error: `sidecar unreachable at ${url}: ${(err as Error).message}` }
     }
   }
