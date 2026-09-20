@@ -156,7 +156,11 @@ const INDICES: Row[] = [
   ['IBEX35', 'IBEX 35 Index', 'index', 11612, 1, 0.00009, 0.74, 20, '24/5'],
 ]
 
-// live iqair instrument id mapping for names the broker spells differently
+// live iqair instrument id mapping for names the broker spells differently.
+// OTC pairs are NOT remapped: this account (and the iqair static table) spell
+// them EURUSD-OTC - the legacy EURUSD_otc dialect made every binary/turbo/
+// digital order fail with "is not a digital/turbo/binary instrument". The
+// sidecar additionally aliases both dialects defensively.
 const IQAIR_NAMES: Record<string, string> = {
   UKBrent: 'OIL_BRENT',
   USCrude: 'OIL_WTI',
@@ -166,7 +170,6 @@ const IQAIR_NAMES: Record<string, string> = {
   DJI30: 'DJ30',
   DAX30: 'DAX30',
   E50: 'E50',
-  '-OTC': '_otc',
 }
 
 function build(rows: Row[]): AssetInfo[] {
@@ -186,8 +189,7 @@ function build(rows: Row[]): AssetInfo[] {
       leverage,
       schedule,
       open: schedule === '24/7' ? true : schedule === 'market' ? false : true,
-      iqairName:
-        IQAIR_NAMES[ticker] ?? (ticker.endsWith('-OTC') ? `${ticker.replace('-OTC', '')}_otc` : ticker),
+      iqairName: IQAIR_NAMES[ticker] ?? ticker,
     }
   })
 }

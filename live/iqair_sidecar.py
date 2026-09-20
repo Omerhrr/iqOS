@@ -53,6 +53,29 @@ try:
 except Exception:  # noqa: BLE001
     OP_code = None
 
+# The lib's candle-generated dispatcher reverse-resolves the active_id through
+# the legacy ACTIVES table and indexes its maxdict table with THAT name; a
+# name/size we never subscribed auto-vivifies an empty DICT there and crashes
+# the dispatch loop ("'<' not supported between instances of 'int' and
+# 'dict'") for EVERY streamed candle - e.g. server-side subscriptions that
+# survive a reconnect. Patch it to drop those messages harmlessly instead.
+try:
+    from iqair.ws.client import WebsocketClient as _WsClient
+
+    _orig_dict_queue_add = _WsClient.dict_queue_add
+
+    def _safe_dict_queue_add(self, dic, maxdict, key1, key2, key3, value):
+        if not isinstance(maxdict, int) or maxdict <= 0:
+            return  # candle for a name/size this session never subscribed
+        try:
+            _orig_dict_queue_add(self, dic, maxdict, key1, key2, key3, value)
+        except Exception:  # noqa: BLE001
+            pass  # stream bookkeeping must never kill the dispatch loop
+
+    _WsClient.dict_queue_add = _safe_dict_queue_add
+except Exception:  # noqa: BLE001
+    pass
+
 HOST = "127.0.0.1"
 PORT = 8788
 
@@ -62,7 +85,50 @@ _assets_cache = None  # (rows, ts) - the ~90s instrument table, 30 min TTL
 _assets_fetching = False  # dedupe concurrent metadata crunches (they run unlocked)
 _asset_ids = {}  # ticker -> numeric active_id, from the account's own metadata
 _digital_ids = {}  # ticker -> numeric active_id, digital-option group only
+_asset_norm = {}  # normalized alias key -> account ticker (turbo/binary map)
+_digital_norm = {}  # normalized alias key -> account underlying (digital map)
+_stream_names = {}  # normalized alias key -> name the stream subscribes under
 _prices_cache = {}  # ticker -> (price, ts) for the /prices batch, 30s TTL
+
+
+def _norm_key(ticker):
+    """Case/punctuation-insensitive alias key. IQ renamed OTC instruments
+    across API generations (EURUSD_otc -> EURUSD-OTC) and this OS still
+    speaks both dialects: EURUSD_otc / EURUSD-otc / EURUSD(OTC) / EURUSD OTC
+    all collapse onto one key so every alias resolves to the account name."""
+    t = str(ticker or "").strip().upper()
+    for ch in "()-_ ":
+        t = t.replace(ch, "")
+    if t.endswith("OTC"):
+        return t[:-3] + "-OTC"
+    if t.endswith("OP"):
+        return t[:-2] + "-OP"
+    return t
+
+
+def _reindex_norm():
+    """Rebuild alias indexes after the id maps change (connect seed, lazy
+    scan). setdefault keeps the FIRST account name seen per alias key."""
+    for t in _asset_ids:
+        _asset_norm.setdefault(_norm_key(t), t)
+    for t in _digital_ids:
+        _digital_norm.setdefault(_norm_key(t), t)
+
+
+def _alias_ticker(ticker, table, norm):
+    """Exact match first, then the normalized alias dialect
+    (EURUSD_otc -> EURUSD-OTC). Returns the ACCOUNT-format ticker or None."""
+    if ticker in table:
+        return ticker
+    return norm.get(_norm_key(ticker))
+
+
+def _canonical_ticker(ticker):
+    """Map any ticker dialect to the name THIS account actually uses."""
+    t = _alias_ticker(ticker, _asset_ids, _asset_norm)
+    if t:
+        return t
+    return _alias_ticker(ticker, _digital_ids, _digital_norm)
 
 # ---- websocket stream price engine ----
 # get_financial_information / get_candles are UNBOUNDED busy-wait round-trips
@@ -135,7 +201,10 @@ def _stream_price(ticker):
     if _client is None:
         return None
     try:
-        table = _client.get_realtime_candles(ticker, _STREAM_SIZE)
+        # the dispatch stores candles under the REVERSE-resolved ACTIVES name
+        # (see _seed_stream) - read from that key, not from the raw request
+        name = _stream_names.get(_norm_key(ticker)) or _canonical_ticker(ticker) or ticker
+        table = _client.get_realtime_candles(name, _STREAM_SIZE)
         if isinstance(table, dict) and table:
             c = table[max(table.keys())]
             for k in ("close", "ask", "price"):
@@ -149,16 +218,17 @@ def _stream_price(ticker):
     return None
 
 
-def _seed_stream(ticker):
-    """Subscribe the websocket candle stream for one asset. The seed does a
-    single get_candles round-trip (history fill) under the lock, so seeds are
-    STRICTLY serialized (one at a time) - a batch of new watch tickers must
-    never monopolize the bus and stall /price //prices again. Tickers whose
-    seed was deferred are retried on the next /price touch poll."""
+def _seed_stream(key):
+    """Subscribe the websocket candle stream for one asset (key = normalized
+    alias). The seed does a single get_candles round-trip (history fill) under
+    the lock, so seeds are STRICTLY serialized (one at a time) - a batch of
+    new watch tickers must never monopolize the bus and stall /price
+    //prices again. Tickers whose seed was deferred are retried on the next
+    /price touch poll."""
     with _seed_lock:
         if _seeding:  # another seed in flight -> defer, next touch retries
             return
-        _seeding.add(ticker)
+        _seeding.add(key)
 
     def _run():
         try:
@@ -167,17 +237,33 @@ def _seed_stream(ticker):
             with lock_guard():
                 if _client is None:
                     return
-                _client.start_candles_stream(ticker, _STREAM_SIZE, _STREAM_MAXDICT)
-            _streamed.add(ticker)
-            print(f"[sidecar] stream live: {ticker} (size={_STREAM_SIZE}s)")
+                # Subscribe under the name the lib's candle-generated
+                # dispatcher will file the messages under (first ACTIVES key
+                # with this active_id) - otherwise the data lands in a table
+                # bucket we never read and the readiness flag never flips
+                # (start_candles_one_stream would busy-wait 20s in the lock).
+                stream_name = _canonical_ticker(key) or key
+                if OP_code is not None:
+                    aid = _resolve_active_id(stream_name)
+                    if aid is not None:
+                        try:
+                            rev = next(k for k, v in OP_code.ACTIVES.items() if v == int(aid))
+                            if rev:
+                                stream_name = rev
+                        except StopIteration:
+                            pass
+                _client.start_candles_stream(stream_name, _STREAM_SIZE, _STREAM_MAXDICT)
+            _streamed.add(key)
+            _stream_names[key] = stream_name
+            print(f"[sidecar] stream live: {stream_name} (size={_STREAM_SIZE}s)")
         except SidecarBusy:
             pass  # bus busy - the next /price touch retries
         except Exception as exc:  # noqa: BLE001
-            print(f"[sidecar] stream seed failed for {ticker}: {exc}")
-            _streamed.discard(ticker)
+            print(f"[sidecar] stream seed failed for {key}: {exc}")
+            _streamed.discard(key)
         finally:
             with _seed_lock:
-                _seeding.discard(ticker)
+                _seeding.discard(key)
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -185,9 +271,10 @@ def _seed_stream(ticker):
 def _touch_watch(ticker):
     """Mark a ticker as wanted and (re)arm its stream when needed.
     Called on every /price and /prices touch - cheap by design."""
-    _watch[ticker] = time.time()
-    if ticker not in _streamed and ticker not in _seeding:
-        _seed_stream(ticker)
+    key = _norm_key(ticker)
+    _watch[key] = time.time()
+    if key not in _streamed and key not in _seeding:
+        _seed_stream(key)
 
 
 def _watch_reaper():
@@ -212,7 +299,7 @@ def _watch_reaper():
             try:
                 with lock_guard():
                     if _client is not None:
-                        _client.stop_candles_stream(t, _STREAM_SIZE)
+                        _client.stop_candles_stream(_stream_names.pop(t, t), _STREAM_SIZE)
                 print(f"[sidecar] stream stopped: {t}")
             except Exception:  # noqa: BLE001
                 pass
@@ -340,6 +427,7 @@ def _seed_ids_from_init():
         print(f"[sidecar] digital id map ready: {len(_digital_ids)} tickers")
     except Exception as exc:  # noqa: BLE001
         print(f"[sidecar] digital id map deferred: {exc}")
+    _reindex_norm()
 
 
 def _resolve_active_id(ticker):
@@ -354,6 +442,10 @@ def _resolve_active_id(ticker):
         time.sleep(0.2)
     if ticker in _asset_ids:
         return _asset_ids[ticker]
+    _reindex_norm()
+    canon = _alias_ticker(ticker, _asset_ids, _asset_norm)
+    if canon is not None:
+        return _asset_ids[canon]
     if _client is None:
         return None
     try:
@@ -370,6 +462,10 @@ def _resolve_active_id(ticker):
         pass
     if ticker in _asset_ids:
         return _asset_ids[ticker]
+    _reindex_norm()
+    canon = _alias_ticker(ticker, _asset_ids, _asset_norm)
+    if canon is not None:
+        return _asset_ids[canon]
     if OP_code is not None:
         v = OP_code.ACTIVES.get(ticker)
         if isinstance(v, int):
@@ -397,7 +493,9 @@ def _resolve_digital_id(ticker):
                     pass
     except Exception:  # noqa: BLE001
         pass
-    return _digital_ids.get(ticker)
+    _reindex_norm()
+    canon = _alias_ticker(ticker, _digital_ids, _digital_norm)
+    return _digital_ids[canon] if canon is not None else None
 
 
 def _buy_digital_spot(amount, ticker, direction, expiry_minutes):
@@ -576,10 +674,11 @@ class Handler(BaseHTTPRequestHandler):
             # locked round-trip fallback below only runs before the stream
             # has seeded (first ~2s after connect / asset switch).
             asset = params.get("asset", "EURUSD")
-            if OP_code is not None and asset not in OP_code.ACTIVES:
+            canon = _canonical_ticker(asset) or asset
+            if OP_code is not None and canon not in OP_code.ACTIVES:
                 return self._send(_err(f"unknown asset {asset}"), 400)
-            _touch_watch(asset)
-            sp = _stream_price(asset)
+            _touch_watch(canon)
+            sp = _stream_price(canon)
             if sp is not None:
                 return self._send(_ok({"asset": asset, "price": sp, "src": "stream"}))
             # fallback: get_financial_information round-trip (busy-waits in
@@ -587,7 +686,7 @@ class Handler(BaseHTTPRequestHandler):
             # behind a 240-bar candle pull; the kernel retries in 4s.
             try:
                 with lock_guard(PRICE_WAIT):
-                    active_id = OP_code.ACTIVES.get(asset, asset) if OP_code is not None else asset
+                    active_id = OP_code.ACTIVES.get(canon, canon) if OP_code is not None else canon
                     # iqair 1.0.0: returns the payload directly (no ok-wrapper)
                     data = _client.get_financial_information(active_id)
                     if isinstance(data, list) and data:
@@ -630,11 +729,12 @@ class Handler(BaseHTTPRequestHandler):
                     asset = params.get("asset", "EURUSD")
                     size = int(params.get("size", 300))
                     tf = int(params.get("tf", 60))
-                    if OP_code is not None and asset not in OP_code.ACTIVES:
+                    canon = _canonical_ticker(asset) or asset
+                    if OP_code is not None and canon not in OP_code.ACTIVES:
                         return self._send(_err(f"unknown asset {asset}"), 400)
                     # iqair 1.0.0: get_candles(ACTIVES, interval, count, endtime)
                     # returns the candle list directly (no ok-wrapper).
-                    data = _client.get_candles(asset, tf, size, int(time.time()))
+                    data = _client.get_candles(canon, tf, size, int(time.time()))
                     candles = [
                         {
                             "time": int(c.get("from", 0)),
@@ -742,9 +842,10 @@ class Handler(BaseHTTPRequestHandler):
             for t in want:
                 # stream first: RAM read, no lock (also auto-subscribes the
                 # ticker so FUTURE polls are pure memory reads)
-                if OP_code is not None and t in OP_code.ACTIVES:
-                    _touch_watch(t)
-                    sp = _stream_price(t)
+                canon = _canonical_ticker(t) or t
+                if OP_code is not None and canon in OP_code.ACTIVES:
+                    _touch_watch(canon)
+                    sp = _stream_price(canon)
                     if sp is not None:
                         prices[t] = sp
                         _prices_cache[t] = (sp, now)
@@ -772,10 +873,11 @@ class Handler(BaseHTTPRequestHandler):
                         for t in missing:
                             if time.time() > budget:
                                 break
-                            if OP_code is not None and t not in OP_code.ACTIVES:
+                            canon = _canonical_ticker(t) or t
+                            if OP_code is not None and canon not in OP_code.ACTIVES:
                                 continue
                             try:
-                                data = _client.get_candles(t, 60, 1, int(time.time()))
+                                data = _client.get_candles(canon, 60, 1, int(time.time()))
                                 if data and isinstance(data[-1], dict) and data[-1].get("close") is not None:
                                     p = float(data[-1]["close"])
                                     _prices_cache[t] = (p, time.time())
@@ -816,6 +918,11 @@ class Handler(BaseHTTPRequestHandler):
                         digital_req = mode.startswith("digital")
                         tb_id = _resolve_active_id(asset)
                         dig_id = _resolve_digital_id(asset) if digital_req or tb_id is None else None
+                        # speak the account's dialect for the actual buy calls
+                        # (EURUSD_otc -> EURUSD-OTC etc.) - buy_digital_spot
+                        # matches underlying names server-side and buyv3 needs
+                        # an id resolved from THIS account's tables
+                        asset = _canonical_ticker(asset) or asset
                         if digital_req:
                             if dig_id is not None:
                                 check, order_id = _buy_digital_spot(amount, asset, direction, expiry)
