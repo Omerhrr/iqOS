@@ -91,6 +91,7 @@ const httpServer = createServer(async (req, res) => {
           mode: market.mode,
           liveUrl: market.liveUrl,
           liveReady: exec.liveReady,
+          source: exec.accountSource,
           balance: account.liveBalance ?? account.balance,
           balanceMode: account.balanceMode,
           simBalance: account.balance,
@@ -100,11 +101,17 @@ const httpServer = createServer(async (req, res) => {
       if (path === '/instruments') {
         const cat = (q.get('category') ?? 'all') as 'all' | 'otc' | 'forex' | 'crypto' | 'commodity' | 'stock' | 'index'
         const search = q.get('q') ?? ''
-        const found = searchInstruments(search, cat)
+        const iqOnly = q.get('iq') === '1'
+        if (market.mode === 'live') void market.ensureSidecarAssets()
         market.refreshSchedules()
+        let found = searchInstruments(search, cat)
+        if (iqOnly) {
+          // IQ mode: only instruments the connected account can actually trade
+          found = found.filter((a) => market.isIQAvailable(a.ticker))
+        }
         return json(200, {
           ok: true,
-          instruments: found.map((a) => ({ ...a, price: market.getPrice(a.ticker) || a.basePrice })),
+          instruments: found.map((a) => ({ ...a, price: market.getPrice(a.ticker) || a.basePrice, iq: market.isIQAvailable(a.ticker) })),
           stats: UNIVERSE_STATS,
         })
       }
@@ -280,6 +287,14 @@ const httpServer = createServer(async (req, res) => {
         return json(200, { ok: true, account: exec.account(), risk: exec.risk, liveReady: exec.liveReady })
       }
 
+      if (path === '/account/source') {
+        const source = String(body.source ?? 'paper') === 'iq' ? 'iq' : 'paper'
+        const balanceMode = String(body.balanceMode ?? 'PRACTICE') === 'REAL' ? 'REAL' : 'PRACTICE'
+        const out = await exec.switchSource(source, balanceMode)
+        if (!out.ok) return json(400, { ok: false, error: out.error })
+        return json(200, { ok: true, account: out.account, source })
+      }
+
       if (path === '/history') {
         const store = kernel.context().use<{ listPositions: (s?: 'open' | 'closed', l?: number) => unknown[] }>('storeRaw')
         const limit = Math.min(Number(q.get('limit') ?? 100), 500)
@@ -413,6 +428,7 @@ const httpServer = createServer(async (req, res) => {
         if (!market.assets.some((a) => a.ticker === asset)) return json(400, { ok: false, error: `unknown asset ${asset}` })
         market.activeAsset = asset
         market.ensureSeeded(asset)
+        market.refreshActiveLive() // live mode: pull real candles for the new asset now
         io.emit('ui', { event: 'asset-changed', asset })
         return json(200, { ok: true, activeAsset: asset })
       }
@@ -521,7 +537,9 @@ const httpServer = createServer(async (req, res) => {
           expiryBars: body.expiryBars !== undefined ? Number(body.expiryBars) : undefined,
           expirySec: body.expirySec !== undefined ? Number(body.expirySec) : undefined,
           strikeOffsetPct: body.strikeOffsetPct !== undefined ? Number(body.strikeOffsetPct) : undefined,
-          mode: (body.mode as 'paper' | 'live') ?? 'paper',
+          // account source is the single routing truth: on IQ every order is
+          // live, on paper everything stays simulated - ignore body.mode
+          mode: exec.accountSource === 'iq' ? 'live' : 'paper',
           tp: body.tp !== undefined ? Number(body.tp) : undefined,
           sl: body.sl !== undefined ? Number(body.sl) : undefined,
           leverage: body.leverage !== undefined ? Number(body.leverage) : undefined,

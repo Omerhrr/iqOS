@@ -77,6 +77,46 @@ export class MarketDataService {
   private archiveQueue: { asset: string; tf: string; time: number; open: number; high: number; low: number; close: number; volume: number }[] = []
   private flushCount = 0
   activeAsset = 'EURUSD'
+  // The sidecar's authenticated account decides which instruments are REALly
+  // tradable on IQ right now (incl. weekend OTC). Fetched from /assets.
+  private sidecarAssets: Set<string> | null = null
+  private sidecarAssetsTs = 0
+  private static SIDECAR_ASSETS_TTL = 10 * 60_000
+
+  /** Refresh the IQ tradable-asset set from the sidecar (10 min TTL). */
+  async ensureSidecarAssets(): Promise<Set<string> | null> {
+    if (this.sidecarAssets && Date.now() - this.sidecarAssetsTs < MarketDataService.SIDECAR_ASSETS_TTL) return this.sidecarAssets
+    try {
+      const res = await fetch(`${this.liveUrl.replace(/\/$/, '')}/assets`, { signal: AbortSignal.timeout(6000) })
+      const data = (await res.json()) as { ok?: boolean; assets?: { ticker?: string; asset?: string }[] }
+      const rows = data?.assets ?? []
+      const set = new Set<string>()
+      for (const r of rows) {
+        const t = r.ticker ?? r.asset
+        if (t) set.add(t)
+      }
+      if (set.size) {
+        this.sidecarAssets = set
+        this.sidecarAssetsTs = Date.now()
+      }
+    } catch {
+      // sidecar dark or not connected - keep the previous set
+    }
+    return this.sidecarAssets
+  }
+
+  /** Can this instrument be traded on the connected IQ account right now? */
+  isIQAvailable(ticker: string): boolean {
+    if (!this.sidecarAssets || this.sidecarAssets.size === 0) return true // unknown -> don't hide anything
+    const a = this.assets.find((x) => x.ticker === ticker)
+    const sym = a?.iqairName ?? ticker
+    return this.sidecarAssets.has(sym) || this.sidecarAssets.has(ticker)
+  }
+
+  /** Kick an immediate live poll for the active asset (used after /asset switch). */
+  refreshActiveLive(): void {
+    if (this.mode === 'live') void this.pollLive()
+  }
 
   async start(ctx: KernelContext): Promise<void> {
     this.ctx = ctx
@@ -123,6 +163,7 @@ export class MarketDataService {
       if (this.liveTimer) clearInterval(this.liveTimer)
       this.liveTimer = setInterval(() => void this.pollLive(), 4000)
       void this.pollLive()
+      void this.ensureSidecarAssets()
       this.ctx.log('market-data', `LIVE resumed - adopted connected iqair sidecar @ ${base}`)
       return true
     } catch {
@@ -387,6 +428,7 @@ export class MarketDataService {
       if (this.liveTimer) clearInterval(this.liveTimer)
       this.liveTimer = setInterval(() => void this.pollLive(), 4000)
       void this.pollLive()
+      void this.ensureSidecarAssets()
       this.ctx.log('market-data', `LIVE via iqair sidecar @ ${url}`)
       return { ok: true }
     } catch (err) {
@@ -500,8 +542,8 @@ export class MarketDataService {
     return this.prices.get(asset) ?? 0
   }
 
-  listAssets(): (AssetInfo & { price: number })[] {
-    return this.assets.map((a) => ({ ...a, price: this.prices.get(a.ticker) ?? a.basePrice }))
+  listAssets(): (AssetInfo & { price: number; iq: boolean })[] {
+    return this.assets.map((a) => ({ ...a, price: this.prices.get(a.ticker) ?? a.basePrice, iq: this.isIQAvailable(a.ticker) }))
   }
 
   setMode(mode: MarketMode): void {

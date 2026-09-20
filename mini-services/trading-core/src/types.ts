@@ -114,6 +114,7 @@ export interface AccountState {
   killSwitch: boolean
   openPositions: number
   liveBalance: number | null
+  source: 'paper' | 'iq' // which ledger the OS currently trades on
 }
 
 // ---------- Analytics ----------

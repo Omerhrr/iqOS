@@ -32,6 +32,7 @@ interface Props {
   onModeChanged: (m: OsMode) => void
   onRiskChanged: (r: RiskConfig) => void
   onAccountChanged: (a: AccountState) => void
+  onSourceChanged: (fresh: AccountState) => void
   onError: (m: string) => void
 }
 
@@ -140,9 +141,14 @@ export default function MenuBar(props: Props) {
         {/* account */}
         {account && (
           <>
-            <Metric label="Balance" value={fmtMoney(account.balance)} cls="text-[#e2e8f0]" />
+            <AccountSwitch account={account} onAccountChanged={props.onAccountChanged} onSourceChanged={props.onSourceChanged} onError={props.onError} />
             <Metric
-              label="Day P/L"
+              label={account.source === 'iq' ? `Balance · IQ ${account.balanceMode}` : 'Balance · Paper'}
+              value={fmtMoney(account.source === 'iq' ? account.liveBalance ?? account.balance : account.balance)}
+              cls={account.source === 'iq' ? 'text-emerald-300' : 'text-[#e2e8f0]'}
+            />
+            <Metric
+              label={account.source === 'iq' ? 'IQ Day P/L' : 'Day P/L'}
               value={fmtMoney(account.dayPnl)}
               cls={account.dayPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}
             />
@@ -182,6 +188,78 @@ function Metric({ label, value, cls }: { label: string; value: string; cls: stri
     <div className="leading-none">
       <div className="text-[8px] uppercase tracking-[0.18em] text-[#4b5a72]">{label}</div>
       <div className={`mt-0.5 font-mono text-[12px] font-bold ${cls}`}>{value}</div>
+    </div>
+  )
+}
+
+/**
+ * Account source switch: PAPER ledger vs the live IQ account (PRACTICE / REAL).
+ * The kernel routes every order by this switch - on IQ everything is real.
+ * REAL needs a second confirming click (real money).
+ */
+function AccountSwitch({
+  account,
+  onAccountChanged,
+  onSourceChanged,
+  onError,
+}: {
+  account: AccountState
+  onAccountChanged: (a: AccountState) => void
+  onSourceChanged: (fresh: AccountState) => void
+  onError: (m: string) => void
+}) {
+  const [busy, setBusy] = useState(false)
+  const [realArm, setRealArm] = useState(false)
+  const active: 'paper' | 'practice' | 'real' =
+    account.source === 'iq' ? (account.balanceMode === 'REAL' ? 'real' : 'practice') : 'paper'
+
+  const switchTo = async (source: 'paper' | 'iq', balanceMode = 'PRACTICE') => {
+    setBusy(true)
+    try {
+      const res = await osPost<{ ok: boolean; account?: AccountState; source?: string; error?: string }>('/account/source', { source, balanceMode })
+      if (res.ok && res.account) {
+        onAccountChanged(res.account)
+        onSourceChanged(res.account)
+      } else {
+        onError(res.error ?? 'switch failed')
+      }
+    } catch (err) {
+      onError((err as Error).message)
+    } finally {
+      setBusy(false)
+      setRealArm(false)
+    }
+  }
+
+  const seg = (id: 'paper' | 'practice' | 'real', label: string, onClick: () => void, activeCls: string) => (
+    <button
+      disabled={busy}
+      onClick={onClick}
+      className={`shrink-0 px-2 py-1 font-mono text-[10px] font-bold uppercase tracking-wider transition-colors ${
+        active === id ? activeCls : 'bg-[#0d1420] text-[#4b5a72] hover:text-[#aab6cc]'
+      }`}
+    >
+      {label}
+    </button>
+  )
+
+  return (
+    <div className="flex overflow-hidden rounded border border-[#1c2739]" title="Account source: paper simulation vs live IQ Option account">
+      {seg('paper', 'Paper', () => void switchTo('paper'), 'bg-cyan-500/15 text-cyan-300')}
+      {seg('practice', 'IQ·Prac', () => void switchTo('iq', 'PRACTICE'), 'bg-emerald-500/15 text-emerald-300')}
+      {seg(
+        'real',
+        realArm ? 'Sure?' : 'IQ·Real',
+        () => {
+          if (!realArm) {
+            setRealArm(true)
+            setTimeout(() => setRealArm(false), 4000)
+            return
+          }
+          void switchTo('iq', 'REAL')
+        },
+        'bg-rose-500/20 text-rose-300'
+      )}
     </div>
   )
 }

@@ -42,6 +42,7 @@ export class ExecutionService {
 
   risk: RiskConfig = { ...DEFAULT_RISK }
   liveReady = false
+  accountSource: 'paper' | 'iq' = 'paper'
   private lastLiveError = ''
 
   async start(ctx: KernelContext): Promise<void> {
@@ -79,7 +80,7 @@ export class ExecutionService {
   // ---------- account ----------
 
   account(): AccountState {
-    return this.store.getAccount()
+    return { ...this.store.getAccount(), source: this.accountSource }
   }
 
   resetAccount(): AccountState {
@@ -501,8 +502,49 @@ export class ExecutionService {
     return { ok: true }
   }
 
+  /**
+   * Switch the OS between the paper ledger and the live IQ account.
+   * 'iq' requires an authenticated sidecar session (adopts one if present);
+   * balanceMode switches that SAME session between PRACTICE / REAL.
+   * 'paper' drops back to the sim feed + paper ledger (session kept warm
+   * on the sidecar so switching back needs no re-auth).
+   */
+  async switchSource(source: 'paper' | 'iq', balanceMode = 'PRACTICE'): Promise<{ ok: boolean; account?: AccountState; error?: string }> {
+    if (source === 'iq') {
+      if (this.market.mode !== 'live') {
+        const adopted = await this.market.adoptSidecarSession()
+        if (!adopted) {
+          this.lastLiveError = 'no authenticated iqair session - connect in Settings first'
+          return { ok: false, error: this.lastLiveError }
+        }
+      }
+      const mode = balanceMode === 'REAL' ? 'REAL' : 'PRACTICE'
+      const switched = await this.postLive('/balance_mode', { mode })
+      if (switched && switched.ok === false) {
+        return { ok: false, error: String(switched.error ?? 'sidecar rejected balance mode') }
+      }
+      this.liveReady = true
+      this.lastLiveError = ''
+      const bal = await this.getLive('/balance')
+      if (bal && typeof bal.amount === 'number') {
+        this.store.setLiveBalance(bal.amount, typeof bal.mode === 'string' ? bal.mode : mode)
+      }
+      this.accountSource = 'iq'
+      this.ctx.log('execution', `account source -> IQ (${mode})`)
+    } else {
+      this.accountSource = 'paper'
+      this.liveReady = false
+      this.market.disconnectLive()
+      this.ctx.log('execution', 'account source -> PAPER (sim feed)')
+    }
+    const account = this.account()
+    this.ctx.bus.emit('account', { account })
+    return { ok: true, account }
+  }
+
   disconnectLive(): void {
     this.liveReady = false
+    this.accountSource = 'paper'
     this.market.disconnectLive()
   }
 

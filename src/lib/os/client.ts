@@ -55,6 +55,7 @@ export interface AssetRow {
   leverage?: number
   schedule?: '24/7' | '24/5' | 'market'
   open: boolean
+  iq?: boolean // tradeable on the connected IQ account right now
   iqairName?: string
 }
 
@@ -337,6 +338,8 @@ export interface AccountState {
   totalPnl: number
   killSwitch: boolean
   openPositions: number
+  liveBalance?: number | null
+  source?: 'paper' | 'iq'
 }
 
 export interface RiskConfig {

@@ -118,17 +118,31 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(_ok({"amount": bal, "mode": mode}))
 
                 if path == "/assets":
+                    # LIVE metadata from the authenticated session (the account's
+                    # real tradeable assets + is_open, incl. weekend OTC).
+                    # NOTE: must use OUR client - iqair.agent.tools.get_client()
+                    # is a different, unconnected instance.
                     assets = None
                     try:
-                        from iqair.agent import tools as agent_tools
-                        payload = agent_tools.list_assets(open_only=False)
-                        assets = (payload or {}).get("assets")
+                        meta = _client.get_asset_metadata()
+                        rows = []
+                        for cat, entries in (meta or {}).items():
+                            if not isinstance(entries, dict):
+                                continue
+                            for ticker, info in entries.items():
+                                rows.append({
+                                    "ticker": ticker,
+                                    "category": cat,
+                                    "is_open": bool((info or {}).get("is_open", False)) if isinstance(info, dict) else False,
+                                })
+                        if rows:
+                            assets = rows
                     except Exception:  # noqa: BLE001
                         assets = None
                     if not assets and OP_code is not None:
                         # static universe from the library's symbol table
-                        assets = [{"asset": k} for k in OP_code.ACTIVES.keys()]
-                    return self._send(_ok({"assets": assets or []}))
+                        assets = [{"ticker": k, "category": None, "is_open": None} for k in OP_code.ACTIVES.keys()]
+                    return self._send(_ok({"assets": assets or [], "live": assets is not None}))
 
                 if path == "/candles":
                     asset = params.get("asset", "EURUSD")
@@ -217,6 +231,24 @@ class Handler(BaseHTTPRequestHandler):
 
         if _client is None:
             return self._send(_err("not connected - POST /connect first"), 400)
+
+        if path == "/balance_mode":
+            # switch the SAME authenticated session between PRACTICE / REAL
+            mode = str(body.get("mode") or "").upper()
+            if mode not in ("PRACTICE", "REAL"):
+                return self._send(_err("mode must be PRACTICE or REAL"), 400)
+            try:
+                with _lock:
+                    _client.change_balance(mode)
+                    try:
+                        amount = _client.get_balance()
+                    except Exception:  # noqa: BLE001
+                        amount = None
+                if mode == "REAL":
+                    print("[sidecar] WARNING: session switched to REAL balance")
+                return self._send(_ok({"balance_mode": mode, "amount": amount}))
+            except Exception as exc:  # noqa: BLE001
+                return self._send(_err(exc), 500)
 
         try:
             with _lock:

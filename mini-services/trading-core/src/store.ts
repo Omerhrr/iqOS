@@ -162,6 +162,7 @@ export class Store {
       killSwitch: row.kill_switch === 1,
       openPositions: this.listPositions('open').length,
       liveBalance: row.live_balance,
+      source: 'paper', // overridden by execution.account() when trading on iq
     }
   }
 

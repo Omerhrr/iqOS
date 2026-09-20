@@ -73,6 +73,8 @@ export default function OSPage() {
   const [candles, setCandles] = useState<Candle[]>([])
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null)
   const [account, setAccount] = useState<AccountState | null>(null)
+  const accountRef = useRef<AccountState | null>(null)
+  accountRef.current = account // mirrors state for callbacks that must not re-bind
   const [risk, setRisk] = useState<RiskConfig | null>(null)
   const [positions, setPositions] = useState<Position[]>([])
   const [history, setHistory] = useState<Position[]>([])
@@ -118,11 +120,14 @@ export default function OSPage() {
     return () => clearTimeout(t)
   }, [bootLine])
 
-  const loadAssets = useCallback(async () => {
+  const loadAssets = useCallback(async (sourceOverride?: 'paper' | 'iq') => {
     try {
       const d = await osGet<{ ok: boolean; assets: AssetRow[]; activeAsset: string }>('/assets')
       if (d.ok) {
-        setAssets(d.assets)
+        // IQ mode: only instruments the connected IQ account can actually trade
+        const src = sourceOverride ?? accountRef.current?.source ?? 'paper'
+        const list = src === 'iq' ? d.assets.filter((a) => a.iq !== false) : d.assets
+        setAssets(list)
         setPrices((prev) => {
           const next = { ...prev }
           for (const a of d.assets) next[a.ticker] = next[a.ticker] ?? { price: a.price, dir: 0 }
@@ -478,6 +483,10 @@ export default function OSPage() {
         }}
         onRiskChanged={setRisk}
         onAccountChanged={setAccount}
+        onSourceChanged={(fresh) => {
+          void loadAccount()
+          void loadAssets(fresh.source ?? 'paper')
+        }}
         onError={(m) => pushToast('danger', m)}
       />
 

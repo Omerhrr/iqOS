@@ -251,7 +251,7 @@ export default function ChartPanel({
       vol.setData(displayCandles.map((c) => ({ time: c.time as UTCTimestamp, value: c.volume, color: c.close >= c.open ? 'rgba(16,185,129,0.30)' : 'rgba(244,63,94,0.30)' })))
       return
     }
-    ;(price as ISeriesApi<'Candlestick'>).setData(
+    ;(price as unknown as ISeriesApi<'Candlestick'>).setData(
       displayCandles.map((c) => ({ time: c.time as UTCTimestamp, open: c.open, high: c.high, low: c.low, close: c.close }))
     )
     vol.setData(
@@ -273,23 +273,23 @@ export default function ChartPanel({
 
   // built-in overlay data + toggle visibility
   useEffect(() => {
-    const b = builtinRef.current
-    if (!analysis || !b.ema20 || !chartRef.current) return
+    const { ema20, ema50, ema200, bbUp, bbLo, st, vwap } = builtinRef.current
+    if (!analysis || !ema20 || !ema50 || !ema200 || !bbUp || !bbLo || !st || !vwap || !chartRef.current) return
     const toPts = (arr: { time: number; value: number }[]) => arr.map((p) => ({ time: p.time as UTCTimestamp, value: p.value }))
-    b.ema20.setData(toPts(analysis.indicatorSeries.ema20))
-    b.ema50.setData(toPts(analysis.indicatorSeries.ema50))
-    b.ema200.setData(toPts(analysis.indicatorSeries.ema200))
-    b.bbUp.setData(toPts(analysis.indicatorSeries.bbUpper))
-    b.bbLo.setData(toPts(analysis.indicatorSeries.bbLower))
-    b.st.setData(analysis.indicatorSeries.supertrend.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })))
-    b.vwap.setData(toPts(analysis.indicatorSeries.vwap))
-    b.ema20.applyOptions({ visible: toggles.ema20 })
-    b.ema50.applyOptions({ visible: toggles.ema50 })
-    b.ema200.applyOptions({ visible: toggles.ema200 })
-    b.bbUp.applyOptions({ visible: toggles.bb })
-    b.bbLo.applyOptions({ visible: toggles.bb })
-    b.st.applyOptions({ visible: toggles.supertrend })
-    b.vwap.applyOptions({ visible: toggles.vwap })
+    ema20.setData(toPts(analysis.indicatorSeries.ema20))
+    ema50.setData(toPts(analysis.indicatorSeries.ema50))
+    ema200.setData(toPts(analysis.indicatorSeries.ema200))
+    bbUp.setData(toPts(analysis.indicatorSeries.bbUpper))
+    bbLo.setData(toPts(analysis.indicatorSeries.bbLower))
+    st.setData(analysis.indicatorSeries.supertrend.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })))
+    vwap.setData(toPts(analysis.indicatorSeries.vwap))
+    ema20.applyOptions({ visible: toggles.ema20 })
+    ema50.applyOptions({ visible: toggles.ema50 })
+    ema200.applyOptions({ visible: toggles.ema200 })
+    bbUp.applyOptions({ visible: toggles.bb })
+    bbLo.applyOptions({ visible: toggles.bb })
+    st.applyOptions({ visible: toggles.supertrend })
+    vwap.applyOptions({ visible: toggles.vwap })
   }, [analysis, toggles, chartType])
 
   // registry overlays: create/remove line series on the live chart

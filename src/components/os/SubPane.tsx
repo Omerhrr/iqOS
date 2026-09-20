@@ -20,7 +20,7 @@ const TEXT = '#7c8aa5'
 export default function SubPane({ id, asset, tf, params, onRemove }: Props) {
   const elRef = useRef<HTMLDivElement | null>(null)
   const chartRef = useRef<IChartApi | null>(null)
-  const seriesRef = useRef<ISeriesApi<'Line'> | ISeriesApi<'Histogram'>[]>([])
+  const seriesRef = useRef<(ISeriesApi<'Line'> | ISeriesApi<'Histogram'>)[]>([])
   const [series, setSeries] = useState<IndicatorSeries | null>(null)
   const [error, setError] = useState<string | null>(null)
 
