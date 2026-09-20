@@ -239,13 +239,25 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(_err("mode must be PRACTICE or REAL"), 400)
             try:
                 with _lock:
-                    _client.change_balance(mode)
+                    # fast path: already in the requested mode? get_balance_mode()
+                    # is a cheap read, while change_balance() is a slow websocket
+                    # round-trip (tens of seconds) - skip it when it is a no-op
+                    # so paper -> IQ PRACTICE switches feel instant.
+                    try:
+                        current = _client.get_balance_mode()
+                    except Exception:  # noqa: BLE001
+                        current = None
+                    amount = None
+                    if str(current or "").upper() != mode:
+                        _client.change_balance(mode)
                     try:
                         amount = _client.get_balance()
                     except Exception:  # noqa: BLE001
                         amount = None
                 if mode == "REAL":
                     print("[sidecar] WARNING: session switched to REAL balance")
+                else:
+                    print(f"[sidecar] balance mode = {mode} (was {current or 'unknown'})")
                 return self._send(_ok({"balance_mode": mode, "amount": amount}))
             except Exception as exc:  # noqa: BLE001
                 return self._send(_err(exc), 500)

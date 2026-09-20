@@ -32,7 +32,7 @@ interface Props {
   onModeChanged: (m: OsMode) => void
   onRiskChanged: (r: RiskConfig) => void
   onAccountChanged: (a: AccountState) => void
-  onSourceChanged: (fresh: AccountState) => void
+  onSourceChanged: (fresh: AccountState, kernelActiveAsset?: string) => void
   onError: (m: string) => void
 }
 
@@ -205,7 +205,7 @@ function AccountSwitch({
 }: {
   account: AccountState
   onAccountChanged: (a: AccountState) => void
-  onSourceChanged: (fresh: AccountState) => void
+  onSourceChanged: (fresh: AccountState, kernelActiveAsset?: string) => void
   onError: (m: string) => void
 }) {
   const [busy, setBusy] = useState(false)
@@ -216,10 +216,11 @@ function AccountSwitch({
   const switchTo = async (source: 'paper' | 'iq', balanceMode = 'PRACTICE') => {
     setBusy(true)
     try {
-      const res = await osPost<{ ok: boolean; account?: AccountState; source?: string; error?: string }>('/account/source', { source, balanceMode })
+      const res = await osPost<{ ok: boolean; account?: AccountState; source?: string; activeAsset?: string; error?: string }>('/account/source', { source, balanceMode })
       if (res.ok && res.account) {
         onAccountChanged(res.account)
-        onSourceChanged(res.account)
+        // kernel may have moved the chart asset (current one not tradeable on IQ)
+        onSourceChanged(res.account, res.activeAsset)
       } else {
         onError(res.error ?? 'switch failed')
       }
@@ -235,11 +236,14 @@ function AccountSwitch({
     <button
       disabled={busy}
       onClick={onClick}
+      title={busy ? 'Switching account source - the IQ session sync can take a few seconds' : undefined}
       className={`shrink-0 px-2 py-1 font-mono text-[10px] font-bold uppercase tracking-wider transition-colors ${
         active === id ? activeCls : 'bg-[#0d1420] text-[#4b5a72] hover:text-[#aab6cc]'
-      }`}
+      } ${busy ? 'opacity-60' : ''}`}
     >
-      {label}
+      {/* in-flight marker: the practice/real switch syncs the IQ session and
+          can take a while - the operator must see the click registered */}
+      {busy ? (active === id ? 'Sync' : '·') : label}
     </button>
   )
 

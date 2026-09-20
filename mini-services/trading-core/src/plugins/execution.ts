@@ -49,6 +49,9 @@ export class ExecutionService {
     this.ctx = ctx
     this.market = ctx.use<MarketDataService>('market')
     this.store = ctx.use<Store>('store')
+    // restore the persisted account source FIRST so the boot sequence
+    // (restoreSource) knows which ledger + feed the operator left behind
+    this.accountSource = this.store.getSource()
     // restore persisted base risk limits (survive kernel restarts)
     const saved = this.store.getSentinelState()
     if (saved && saved.config && typeof saved.config === 'object') {
@@ -476,6 +479,10 @@ export class ExecutionService {
         this.store.setLiveBalance(bal.amount, typeof bal.mode === 'string' ? bal.mode : balanceMode)
         this.ctx.bus.emit('account', { account: this.account() })
       }
+      // Session authenticated. The DATA FEED is governed by the account source:
+      // only an operator already trading on IQ gets the live feed immediately.
+      // A paper session is never hijacked by a login (feed stays sim).
+      if (this.accountSource === 'iq') await this.market.adoptSidecarSession(url)
     } else {
       this.liveReady = false
       this.lastLiveError = res.error ?? 'connection failed'
@@ -494,6 +501,10 @@ export class ExecutionService {
     if (!adopted) return { ok: false, error: 'no connected sidecar session to adopt' }
     this.liveReady = true
     this.lastLiveError = ''
+    // adopting a session means resuming IQ trading - make the source match
+    this.accountSource = 'iq'
+    this.store.setSource('iq')
+    this.ensureIQActiveAsset()
     const bal = await this.getLive('/balance')
     if (bal && typeof bal.amount === 'number') {
       this.store.setLiveBalance(bal.amount, typeof bal.mode === 'string' ? bal.mode : 'PRACTICE')
@@ -503,9 +514,40 @@ export class ExecutionService {
   }
 
   /**
+   * Boot-time source restore. The persisted account source decides what the OS
+   * comes back as after a kernel respawn:
+   *   paper -> sim feed, paper ledger. A warm sidecar session is left untouched
+   *            (this is what keeps paper working after credentials were entered).
+   *   iq     -> re-adopt the sidecar session (feed live + IQ ledger). The
+   *            sidecar may still be spawning - retry before giving up, then
+   *            fall back to paper honestly instead of faking a live session.
+   */
+  async restoreSource(): Promise<void> {
+    const persisted = this.store.getSource()
+    if (persisted !== 'iq') {
+      this.ctx.log('execution', 'boot restore: PAPER source - sim feed (warm sidecar session left untouched)')
+      return
+    }
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const r = await this.adoptLive()
+      if (r.ok) {
+        this.ctx.log('execution', 'boot restore: IQ source - sidecar session adopted, feed live')
+        return
+      }
+      await new Promise((res) => setTimeout(res, 5000))
+    }
+    this.accountSource = 'paper'
+    this.store.setSource('paper')
+    this.lastLiveError = 'IQ session lost (sidecar restarted?) - reverted to PAPER, reconnect in Settings'
+    this.ctx.bus.emit('alert', { level: 'danger', message: this.lastLiveError, ts: this.now() })
+    this.ctx.bus.emit('account', { account: this.account() })
+  }
+
+  /**
    * Switch the OS between the paper ledger and the live IQ account.
-   * 'iq' requires an authenticated sidecar session (adopts one if present);
-   * balanceMode switches that SAME session between PRACTICE / REAL.
+   * 'iq' requires an authenticated sidecar session (adopts one if present)
+   * and flips the data feed to IQ; balanceMode switches that SAME session
+   * between PRACTICE / REAL.
    * 'paper' drops back to the sim feed + paper ledger (session kept warm
    * on the sidecar so switching back needs no re-auth).
    */
@@ -518,6 +560,9 @@ export class ExecutionService {
           return { ok: false, error: this.lastLiveError }
         }
       }
+      // the current chart asset may not exist on the IQ account (e.g. a sim
+      // stock ticker) - move to a tradeable pair so the feed has data
+      this.ensureIQActiveAsset()
       const mode = balanceMode === 'REAL' ? 'REAL' : 'PRACTICE'
       const switched = await this.postLive('/balance_mode', { mode })
       if (switched && switched.ok === false) {
@@ -530,12 +575,15 @@ export class ExecutionService {
         this.store.setLiveBalance(bal.amount, typeof bal.mode === 'string' ? bal.mode : mode)
       }
       this.accountSource = 'iq'
-      this.ctx.log('execution', `account source -> IQ (${mode})`)
+      this.store.setSource('iq')
+      this.ctx.log('execution', `account source -> IQ (${mode}) - feed live`)
     } else {
       this.accountSource = 'paper'
-      this.liveReady = false
+      this.store.setSource('paper')
+      // liveReady stays TRUE: the sidecar session is still warm, only the
+      // feed + ledger fall back to paper. Switching back needs no re-auth.
       this.market.disconnectLive()
-      this.ctx.log('execution', 'account source -> PAPER (sim feed)')
+      this.ctx.log('execution', 'account source -> PAPER - sim feed (IQ session kept warm)')
     }
     const account = this.account()
     this.ctx.bus.emit('account', { account })
@@ -545,7 +593,30 @@ export class ExecutionService {
   disconnectLive(): void {
     this.liveReady = false
     this.accountSource = 'paper'
+    this.store.setSource('paper')
     this.market.disconnectLive()
+  }
+
+  /** If the active chart asset is not tradeable on the connected IQ account,
+   * move to the first available IQ pair (prefer liquid forex / crypto, OTC
+   * variants cover weekends). No-op when the sidecar asset set is unknown. */
+  private ensureIQActiveAsset(): void {
+    const cur = this.market.activeAsset
+    if (this.market.isIQAvailable(cur)) return
+    const candidates = ['EURUSD', 'EURUSD-OTC', 'BTCUSD', 'BTCUSD-OTC', 'GBPUSD', 'GBPUSD-OTC']
+    const known = (t: string) => this.market.assets.some((a) => a.ticker === t)
+    const fallback =
+      candidates.find((t) => t !== cur && known(t) && this.market.isIQAvailable(t)) ??
+      this.market.assets.find((a) => a.ticker !== cur && this.market.isIQAvailable(a.ticker))?.ticker
+    if (!fallback) return
+    this.market.activeAsset = fallback
+    this.market.refreshActiveLive()
+    this.ctx.log('execution', `active asset -> ${fallback} (${cur} not tradeable on IQ)`)
+    this.ctx.bus.emit('alert', {
+      level: 'info',
+      message: `Chart moved to ${fallback} - ${cur} is not available on this IQ account`,
+      ts: this.now(),
+    })
   }
 
   async livePositions(): Promise<unknown> {

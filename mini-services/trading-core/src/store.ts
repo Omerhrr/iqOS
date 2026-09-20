@@ -27,7 +27,8 @@ export class Store {
         day_start_balance REAL NOT NULL,
         kill_switch INTEGER NOT NULL DEFAULT 0,
         live_balance REAL,
-        live_mode TEXT
+        live_mode TEXT,
+        source TEXT NOT NULL DEFAULT 'paper'
       );
       CREATE TABLE IF NOT EXISTS positions (
         id TEXT PRIMARY KEY,
@@ -124,6 +125,15 @@ export class Store {
         config TEXT
       );
     `)
+    // column migrations for databases created before the column existed:
+    // CREATE TABLE IF NOT EXISTS is a no-op on an existing table, so the
+    // account source column must be added explicitly (guarded - it throws
+    // when the column is already there).
+    try {
+      this.db.run(`ALTER TABLE account ADD COLUMN source TEXT NOT NULL DEFAULT 'paper'`)
+    } catch {
+      // column already exists - nothing to migrate
+    }
   }
 
   private seedAccount(): void {
@@ -193,6 +203,17 @@ export class Store {
 
   setLiveBalance(amount: number, mode: string): void {
     this.db.run('UPDATE account SET live_balance = ?, live_mode = ? WHERE id = 1', [amount, mode])
+  }
+
+  /** Persisted account source ('paper' | 'iq') - survives kernel restarts so
+   * the boot sequence restores the SAME ledger + feed the operator left on. */
+  getSource(): 'paper' | 'iq' {
+    const row = this.db.query('SELECT source FROM account WHERE id = 1').get() as { source?: string } | null
+    return row?.source === 'iq' ? 'iq' : 'paper'
+  }
+
+  setSource(source: 'paper' | 'iq'): void {
+    this.db.run('UPDATE account SET source = ? WHERE id = 1', [source])
   }
 
   // ---------- positions ----------

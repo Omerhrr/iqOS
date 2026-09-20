@@ -487,12 +487,18 @@ export default function OSPage() {
         }}
         onRiskChanged={setRisk}
         onAccountChanged={setAccount}
-        onSourceChanged={(fresh) => {
+        onSourceChanged={(fresh, kernelActiveAsset) => {
           void loadAccount()
           void loadAssets(fresh.source ?? 'paper')
-          // the feed just flipped between sim and IQ - re-pull the chart so
-          // the local candle array matches the new source immediately
-          void loadCandles(asset, tf)
+          if (kernelActiveAsset && kernelActiveAsset !== asset) {
+            // kernel moved the chart (current asset not tradeable on IQ) -
+            // the asset-state effect re-pulls candles + analysis on its own
+            setAsset(kernelActiveAsset)
+          } else {
+            // the feed just flipped between sim and IQ - re-pull the chart so
+            // the local candle array matches the new source immediately
+            void loadCandles(asset, tf)
+          }
         }}
         onError={(m) => pushToast('danger', m)}
       />

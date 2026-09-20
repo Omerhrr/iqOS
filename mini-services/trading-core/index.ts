@@ -86,14 +86,17 @@ const httpServer = createServer(async (req, res) => {
 
       if (path === '/live/status') {
         const account = exec.account()
+        const onIQ = exec.accountSource === 'iq'
         return json(200, {
           ok: true,
           mode: market.mode,
           liveUrl: market.liveUrl,
           liveReady: exec.liveReady,
           source: exec.accountSource,
-          balance: account.liveBalance ?? account.balance,
-          balanceMode: account.balanceMode,
+          // the balance shown must match the ACTIVE source - paper shows the
+          // paper ledger even when a warm IQ session exists alongside it
+          balance: onIQ ? (account.liveBalance ?? account.balance) : account.balance,
+          balanceMode: onIQ ? account.balanceMode : 'PAPER',
           simBalance: account.balance,
         })
       }
@@ -285,14 +288,6 @@ const httpServer = createServer(async (req, res) => {
 
       if (path === '/account') {
         return json(200, { ok: true, account: exec.account(), risk: exec.risk, liveReady: exec.liveReady })
-      }
-
-      if (path === '/account/source') {
-        const source = String(body.source ?? 'paper') === 'iq' ? 'iq' : 'paper'
-        const balanceMode = String(body.balanceMode ?? 'PRACTICE') === 'REAL' ? 'REAL' : 'PRACTICE'
-        const out = await exec.switchSource(source, balanceMode)
-        if (!out.ok) return json(400, { ok: false, error: out.error })
-        return json(200, { ok: true, account: out.account, source })
       }
 
       if (path === '/history') {
@@ -594,6 +589,18 @@ const httpServer = createServer(async (req, res) => {
         return json(200, out)
       }
 
+      // Account source switch: the single routing truth for ledger, order
+      // routing AND the data feed. POST only (GET /account/source is a 404
+      // by design - a source switch mutates state).
+      if (path === '/account/source') {
+        const source = String(body.source ?? 'paper') === 'iq' ? 'iq' : 'paper'
+        const balanceMode = String(body.balanceMode ?? 'PRACTICE') === 'REAL' ? 'REAL' : 'PRACTICE'
+        const out = await exec.switchSource(source, balanceMode)
+        if (!out.ok) return json(400, { ok: false, error: out.error })
+        // activeAsset may have moved (current chart asset not tradeable on IQ)
+        return json(200, { ok: true, account: out.account, source, activeAsset: market.activeAsset, feedMode: market.mode })
+      }
+
       if (path === '/live/disconnect') {
         exec.disconnectLive()
         return json(200, { ok: true })
@@ -763,13 +770,14 @@ kernel.start().then(() => {
   httpServer.listen(PORT, () => {
     console.log(`[trading-core] IQAIR//OS kernel listening on :${PORT}`)
   })
-  // Boot-time live resume: if the iqair sidecar still holds an authenticated
-  // session (it survives kernel restarts), adopt it so trading + feed resume
-  // without the user re-entering credentials. Idempotent; no-op in pure sim.
+  // Boot-time source restore: the PERSISTED account source decides what the
+  // OS resumes as. Paper stays on the sim feed even when the sidecar holds a
+  // warm session (credentials no longer hijack paper); a persisted IQ source
+  // re-adopts the session without re-entering credentials.
   setTimeout(() => {
     const exec = kernel.context().use<ExecutionService>('execution')
-    void exec.adoptLive().then((r) => {
-      if (r.ok) console.log('[trading-core] live session adopted from sidecar at boot')
+    void exec.restoreSource().then(() => {
+      console.log(`[trading-core] boot source restore done - source=${exec.accountSource} feed=${kernel.context().use<MarketDataService>('market').mode}`)
     })
   }, 2000)
 }).catch((err) => {

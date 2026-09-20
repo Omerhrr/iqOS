@@ -140,10 +140,11 @@ export class MarketDataService {
       ctx.log('market-data', 'candle archive attached - closed bars persist across restarts')
     }
     ctx.log('market-data', `universe online: ${this.assets.length} instruments, ${ALL_TIMEFRAMES.length} timeframes (lazy seeding)`)
-    // Session adoption: the sidecar keeps its authenticated iqair session across
-    // kernel restarts (bun --hot reloads, sandbox resets). If it is still
-    // connected, resume LIVE mode without asking the user to re-type secrets.
-    setTimeout(() => void this.adoptSidecarSession(), 1500)
+    // NOTE: no boot-time session adoption here. The account source (paper vs
+    // IQ) is the single routing truth and lives in the execution plugin - the
+    // feed only goes live when the operator switches to IQ (or the boot
+    // restore finds a persisted IQ source). Otherwise the sim feed would be
+    // hijacked by a warm sidecar session the moment the kernel respawns.
   }
 
   /**
@@ -429,12 +430,12 @@ export class MarketDataService {
       const data = (await res.json()) as { ok: boolean; error?: string }
       if (!data.ok) return { ok: false, error: data.error ?? 'sidecar rejected connection' }
       this.liveUrl = url
-      this.mode = 'live'
-      if (this.liveTimer) clearInterval(this.liveTimer)
-      this.liveTimer = setInterval(() => void this.pollLive(), 4000)
-      void this.pollLive()
+      // NOTE: authentication only - the data feed is NOT switched here.
+      // Logging in credentials must never hijack a running paper session;
+      // the feed goes live exclusively through adoptSidecarSession() when
+      // the account source switch (execution plugin) demands it.
       void this.ensureSidecarAssets()
-      this.ctx.log('market-data', `LIVE via iqair sidecar @ ${url}`)
+      this.ctx.log('market-data', `iqair session authenticated @ ${url} (feed unchanged - governed by account source)`)
       return { ok: true }
     } catch (err) {
       // Sidecar dark (sandbox reset / fresh boot)? Spawn it and retry once.
