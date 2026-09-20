@@ -114,13 +114,34 @@ const httpServer = createServer(async (req, res) => {
       if (path === '/instruments') {
         const cat = (q.get('category') ?? 'all') as 'all' | 'otc' | 'forex' | 'crypto' | 'commodity' | 'stock' | 'index'
         const search = (q.get('q') ?? '').toLowerCase()
+        // IQ-mode search normalizes IQ ticker shapes: dashes, colons, spaces
+        // and underscores are ignored, the -OTC suffix is optional, and a
+        // subsequence match catches partial typing ("eurjp" -> EURJPY-OTC).
+        const norm = (s: string) => s.toLowerCase().replace(/[-_:\s.]/g, '')
+        const subseq = (needle: string, hay: string) => {
+          let i = 0
+          for (const ch of hay) if (ch === needle[i]) i++
+          return i === needle.length
+        }
+        const matchIQ = (a: { ticker: string; name: string; otc: boolean }, raw: string) => {
+          const q = norm(raw)
+          if (!q) return true
+          const wantsOtc = /\botc\b/.test(raw)
+          const base = norm(a.ticker.replace(/-OTC$/, ''))
+          const full = norm(a.ticker)
+          const nameN = norm(a.name)
+          const qBase = norm(raw.replace(/\botc\b/g, ''))
+          if (wantsOtc && !a.otc) return false
+          if (qBase && !(base.startsWith(qBase) || full.startsWith(qBase) || nameN.startsWith(qBase) || base.includes(qBase) || nameN.includes(qBase) || subseq(qBase, base) || subseq(qBase, nameN))) return false
+          return true
+        }
         // IQ mode: the connected account's own instruments ONLY (its own
         // tickers, incl. weekend OTC) - not a filtered sim universe.
         if (exec.accountSource === 'iq' || q.get('iq') === '1') {
           void market.ensureSidecarAssets()
           let rows = market.iqAssetRows()
           if (cat !== 'all') rows = rows.filter((a) => (cat === 'otc' ? a.otc : a.category === cat))
-          if (search) rows = rows.filter((a) => a.ticker.toLowerCase().includes(search) || a.name.toLowerCase().includes(search))
+          if (search) rows = rows.filter((a) => matchIQ(a, search))
           return json(200, { ok: true, instruments: rows, stats: UNIVERSE_STATS })
         }
         market.refreshSchedules()

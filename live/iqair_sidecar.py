@@ -139,10 +139,19 @@ class Handler(BaseHTTPRequestHandler):
                             if not isinstance(entries, dict):
                                 continue
                             for ticker, info in entries.items():
+                                # payout: real 0-1 fraction, populated by IQ for
+                                # the turbo/binary groups only (None elsewhere)
+                                pay = None
+                                if isinstance(info, dict) and info.get("payout") is not None:
+                                    try:
+                                        pay = float(info["payout"])
+                                    except (TypeError, ValueError):
+                                        pay = None
                                 rows.append({
                                     "ticker": ticker,
                                     "category": cat,
                                     "is_open": bool((info or {}).get("is_open", False)) if isinstance(info, dict) else False,
+                                    "payout": pay,
                                 })
                         if rows:
                             assets = rows
@@ -151,7 +160,7 @@ class Handler(BaseHTTPRequestHandler):
                         assets = None
                     if not assets and OP_code is not None:
                         # static universe from the library's symbol table
-                        assets = [{"ticker": k, "category": None, "is_open": None} for k in OP_code.ACTIVES.keys()]
+                        assets = [{"ticker": k, "category": None, "is_open": None, "payout": None} for k in OP_code.ACTIVES.keys()]
                     return self._send(_ok({"assets": assets or [], "live": assets is not None}))
 
                 if path == "/candles":

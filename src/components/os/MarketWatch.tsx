@@ -1,6 +1,11 @@
 'use client'
 
 // IQAIR//OS - Market watch: full instrument universe with category tabs + search
+// The search is tuned for IQ Option ticker shapes: "EURUSD-OTC", "AAP:US",
+// "BTCUSD", "GBPNZD-OTC". Dashes/colons/spaces/underscores are ignored, the
+// -OTC suffix is optional (typing "eurusd otc" pins the OTC variant), partial
+// typing matches via subsequence ("eurjp" -> EURJPY), and a small alias table
+// maps common names to IQ tickers ("aapl"/"apple" -> AAP:US, "gold" -> XAUUSD).
 import { useMemo, useState } from 'react'
 import type { AssetRow } from '@/lib/os/client'
 import { CATEGORIES, fmtPrice } from '@/lib/os/client'
@@ -12,12 +17,57 @@ interface Props {
   onSelect: (ticker: string) => void
 }
 
-const CAT_COLOR: Record<AssetRow['category'], string> = {
-  forex: '#38bdf8',
-  crypto: '#f59e0b',
-  commodity: '#e879f9',
-  stock: '#10b981',
-  index: '#a78bfa',
+// common names -> IQ ticker fragments (search only, display stays verbatim)
+const IQ_ALIASES: Record<string, string> = {
+  aapl: 'AAP', apple: 'AAP',
+  msft: 'MSFT', microsoft: 'MSFT',
+  tsla: 'TSLA', tesla: 'TSLA',
+  amzn: 'AMZN', amazon: 'AMZN',
+  nvda: 'NVDA', nvidia: 'NVDA',
+  googl: 'GOOGL', google: 'GOOGL', alphabet: 'GOOGL',
+  meta: 'META', facebook: 'META',
+  nflx: 'NFLX', netflix: 'NFLX',
+  intel: 'INTC', amd: 'AMD', boeing: 'BA', mcdonalds: 'MCD',
+  gold: 'XAU', xauusd: 'XAU', silver: 'XAG', xagusd: 'XAG',
+  oil: 'OIL', crude: 'OIL', brent: 'BRN', gas: 'NG',
+  btc: 'BTC', bitcoin: 'BTC', eth: 'ETH', ethereum: 'ETH',
+}
+
+const norm = (s: string) => s.toLowerCase().replace(/[-_:\s.]/g, '')
+
+const subseq = (needle: string, hay: string): boolean => {
+  if (!needle) return false
+  let i = 0
+  for (let j = 0; j < hay.length && i < needle.length; j++) if (hay[j] === needle[i]) i++
+  return i === needle.length
+}
+
+/** null = no match; otherwise lower = better (0 exact, 4 subsequence). */
+function rankAsset(a: AssetRow, rawQuery: string): number | null {
+  const q = rawQuery.trim().toLowerCase()
+  if (!q) return 9 // no query: keep list order, filtered out of sorting
+  const wantsOtc = /\botc\b/.test(q)
+  if (wantsOtc && !a.otc) return null
+  const qBase = norm(q.replace(/\botc\b/g, ''))
+  const tokens = new Set<string>()
+  if (qBase) tokens.add(qBase)
+  const alias = IQ_ALIASES[qBase]
+  if (alias) tokens.add(norm(alias))
+  if (!tokens.size) return wantsOtc ? 5 : null
+  const tBase = norm(a.ticker.replace(/-OTC$/, ''))
+  const tFull = norm(a.ticker)
+  const nBase = norm(a.name)
+  let best: number | null = null
+  for (const cand of tokens) {
+    let r: number | null = null
+    if (tBase === cand || tFull === cand) r = 0
+    else if (tBase.startsWith(cand) || tFull.startsWith(cand)) r = 1
+    else if (nBase.startsWith(cand)) r = 2
+    else if (tBase.includes(cand) || tFull.includes(cand) || nBase.includes(cand)) r = 3
+    else if (subseq(cand, tBase) || subseq(cand, nBase)) r = 4
+    if (r !== null && (best === null || r < best)) best = r
+  }
+  return best
 }
 
 export default function MarketWatch({ assets, active, prices, onSelect }: Props) {
@@ -25,16 +75,21 @@ export default function MarketWatch({ assets, active, prices, onSelect }: Props)
   const [query, setQuery] = useState('')
 
   const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase()
-    return assets.filter((a) => {
+    const ranked: { a: AssetRow; rank: number }[] = []
+    for (const a of assets) {
       if (cat !== 'all') {
-        if (cat === 'otc' && !a.otc) return false
-        if (cat !== 'otc' && a.category !== cat) return false
+        if (cat === 'otc' && !a.otc) continue
+        if (cat !== 'otc' && a.category !== cat) continue
       }
-      if (q && !a.ticker.toLowerCase().includes(q) && !a.name.toLowerCase().includes(q)) return false
-      return true
-    })
+      const rank = rankAsset(a, query)
+      if (rank !== null) ranked.push({ a, rank })
+    }
+    // ranked best-match-first only while searching; natural order otherwise
+    if (query.trim()) ranked.sort((x, y) => x.rank - y.rank || x.a.ticker.localeCompare(y.a.ticker))
+    return ranked.map((r) => r.a)
   }, [assets, cat, query])
+
+  const searching = query.trim().length > 0
 
   return (
     <div className="flex h-full flex-col rounded-lg border border-[#1c2739] bg-[#0b111c]">
@@ -45,18 +100,31 @@ export default function MarketWatch({ assets, active, prices, onSelect }: Props)
             <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />
             <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400" />
           </span>
-          {assets.length} SYMBOLS
+          {searching ? `${filtered.length} / ${assets.length} MATCH` : `${assets.length} SYMBOLS`}
         </span>
       </div>
 
-      {/* search */}
+      {/* search - IQ-ticker tuned */}
       <div className="px-2 pt-2">
-        <input
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search 115+ instruments…"
-          className="w-full rounded border border-[#1c2739] bg-[#101828] px-2 py-1.5 font-mono text-[11px] text-[#e2e8f0] placeholder-[#3d4d66] outline-none focus:border-cyan-500/50"
-        />
+        <div className="relative">
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => e.key === 'Escape' && setQuery('')}
+            placeholder="Search… e.g. EURUSD-OTC, AAP:US"
+            spellCheck={false}
+            className="w-full rounded border border-[#1c2739] bg-[#101828] px-2 py-1.5 pr-6 font-mono text-[11px] text-[#e2e8f0] placeholder-[#3d4d66] outline-none focus:border-cyan-500/50"
+          />
+          {searching && (
+            <button
+              onClick={() => setQuery('')}
+              title="clear"
+              className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded px-1 text-[11px] leading-none text-[#4b5a72] hover:text-[#e2e8f0]"
+            >
+              ×
+            </button>
+          )}
+        </div>
       </div>
 
       {/* category tabs */}
@@ -78,6 +146,7 @@ export default function MarketWatch({ assets, active, prices, onSelect }: Props)
         {filtered.map((a) => {
           const p = prices[a.ticker] ?? { price: a.price, dir: 0 }
           const isActive = a.ticker === active
+          const hotPayout = a.payout !== null && a.payout !== undefined && a.payout >= 0.9
           return (
             <button
               key={a.ticker}
@@ -97,8 +166,10 @@ export default function MarketWatch({ assets, active, prices, onSelect }: Props)
                     title={a.open ? 'market open' : 'market closed'}
                   />
                 </div>
-                <div className="truncate text-[9px] text-[#4b5a72]">
-                  {(a.payout * 100).toFixed(0)}%{a.leverage ? ` · 1:${a.leverage}` : ''}
+                <div className={`truncate text-[9px] ${hotPayout ? 'text-emerald-500/80' : 'text-[#4b5a72]'}`}>
+                  {/* REAL per-instrument payout; dash when the account doesn't report one */}
+                  {a.payout !== null && a.payout !== undefined ? `${(a.payout * 100).toFixed(0)}%` : '—'}
+                  {a.leverage ? ` · 1:${a.leverage}` : ''}
                 </div>
               </div>
               <div className={`text-right font-mono text-[11px] ${p.dir > 0 ? 'text-emerald-400' : p.dir < 0 ? 'text-rose-400' : 'text-[#aab6cc]'}`}>

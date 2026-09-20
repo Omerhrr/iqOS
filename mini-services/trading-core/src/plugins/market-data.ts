@@ -79,8 +79,11 @@ export class MarketDataService {
   activeAsset = 'EURUSD'
   // The sidecar's authenticated account decides which instruments exist on IQ
   // right now (incl. weekend OTC). Fetched from GET /assets on the sidecar.
-  private sidecarRows: { ticker: string; category: string; open: boolean }[] = []
+  private sidecarRows: { ticker: string; category: string; open: boolean; payout: number | null }[] = []
   private sidecarAssets: Set<string> | null = null
+  // REAL per-instrument payouts from the IQ account metadata (0-1 fractions;
+  // binary + turbo groups report them, margin/digital groups do not).
+  private sidecarPayouts: Map<string, { binary: number | null; turbo: number | null }> = new Map()
   private sidecarAssetsTs = 0
   private static SIDECAR_ASSETS_TTL = 10 * 60_000
 
@@ -102,34 +105,41 @@ export class MarketDataService {
   private async fetchSidecarAssets(): Promise<Set<string> | null> {
     try {
       const res = await fetch(`${this.liveUrl.replace(/\/$/, '')}/assets`, { signal: AbortSignal.timeout(150_000) })
-      const data = (await res.json()) as { ok?: boolean; assets?: { ticker?: string; asset?: string; category?: string; is_open?: boolean }[] }
+      const data = (await res.json()) as { ok?: boolean; assets?: { ticker?: string; asset?: string; category?: string; is_open?: boolean; payout?: number | null }[] }
       const rows = data?.assets ?? []
       // IQ returns the SAME ticker under several groups (binary/digital/
       // turbo/cfd/forex/crypto). Dedupe by ticker; resolve the category by
       // priority (explicit asset class beats option-type group) and open =
-      // open in ANY group.
+      // open in ANY group. Payouts: the turbo/binary groups carry the real
+      // commission-derived payout - binary wins the primary field, turbo is
+      // kept per kind (null everywhere => payout genuinely unknown).
       const PRIORITY: Record<string, number> = { crypto: 4, forex: 3, cfd: 2 }
-      const byTicker = new Map<string, { ticker: string; category: string; open: boolean; score: number }>()
+      const byTicker = new Map<string, { ticker: string; category: string; open: boolean; score: number; binary: number | null; turbo: number | null }>()
       for (const r of rows) {
         const t = r.ticker ?? r.asset
         if (!t) continue
         const rawCat = String(r.category ?? '').toLowerCase()
         const score = PRIORITY[rawCat] ?? 1
         const open = Boolean(r.is_open)
+        const pay = typeof r.payout === 'number' && Number.isFinite(r.payout) && r.payout > 0 && r.payout <= 1 ? r.payout : null
         const prev = byTicker.get(t)
-        if (!prev) byTicker.set(t, { ticker: t, category: rawCat, open, score })
+        if (!prev) byTicker.set(t, { ticker: t, category: rawCat, open, score, binary: rawCat === 'binary' ? pay : null, turbo: rawCat === 'turbo' ? pay : null })
         else {
           if (score > prev.score) prev.category = rawCat
           prev.open = prev.open || open
           prev.score = Math.max(prev.score, score)
+          if (rawCat === 'binary' && pay !== null) prev.binary = prev.binary === null ? pay : Math.max(prev.binary, pay)
+          if (rawCat === 'turbo' && pay !== null) prev.turbo = prev.turbo === null ? pay : Math.max(prev.turbo, pay)
         }
       }
-      const out = [...byTicker.values()].map((r) => ({ ticker: r.ticker, category: r.category, open: r.open }))
+      const out = [...byTicker.values()].map((r) => ({ ticker: r.ticker, category: r.category, open: r.open, payout: r.binary ?? r.turbo, turbo: r.turbo }))
       if (out.length) {
-        this.sidecarRows = out
+        this.sidecarRows = out.map((r) => ({ ticker: r.ticker, category: r.category, open: r.open, payout: r.payout }))
         this.sidecarAssets = new Set(out.map((r) => r.ticker))
+        this.sidecarPayouts = new Map(out.map((r) => [r.ticker, { binary: r.payout, turbo: r.turbo ?? r.payout }]))
         this.sidecarAssetsTs = Date.now()
-        this.ctx.log('market-data', `IQ asset universe refreshed: ${out.length} instruments (${out.filter((r) => r.open).length} open, ${out.filter((r) => r.ticker.endsWith('-OTC')).length} OTC)`)
+        const withPay = out.filter((r) => r.payout !== null).length
+        this.ctx.log('market-data', `IQ asset universe refreshed: ${out.length} instruments (${out.filter((r) => r.open).length} open, ${out.filter((r) => r.ticker.endsWith('-OTC')).length} OTC, ${withPay} with real payouts)`)
       }
     } catch {
       // sidecar dark / not connected / still crunching - keep the previous set
@@ -176,16 +186,20 @@ export class MarketDataService {
    * (the active one) - rows without a tick carry price 0 and the UI shows a
    * dash until the pair is opened.
    */
-  iqAssetRows(): { ticker: string; name: string; category: 'forex' | 'crypto' | 'commodity' | 'stock' | 'index'; otc: boolean; price: number; payout: number; schedule: '24/7' | undefined; open: boolean; iq: boolean }[] {
+  iqAssetRows(): { ticker: string; name: string; category: 'forex' | 'crypto' | 'commodity' | 'stock' | 'index'; otc: boolean; price: number; payout: number | null; turboPayout?: number | null; schedule: '24/7' | undefined; open: boolean; iq: boolean }[] {
     return this.sidecarRows.map((r) => {
       const otc = r.ticker.endsWith('-OTC')
+      const pay = this.sidecarPayouts.get(r.ticker)
       return {
         ticker: r.ticker,
         name: r.ticker.replace(/-OTC$/, '').replace(/_/g, ' ') + (otc ? ' OTC' : ''),
         category: this.mapIQCategory(r.category, r.ticker),
         otc,
         price: this.prices.get(r.ticker) ?? 0,
-        payout: 0.85,
+        // the account's REAL payout - null when IQ doesn't report one for
+        // this instrument (margin CFDs/stocks have no fixed payout)
+        payout: pay?.binary ?? null,
+        turboPayout: pay?.turbo ?? null,
         schedule: otc ? ('24/7' as const) : undefined,
         open: r.open,
         iq: true,
@@ -663,9 +677,19 @@ export class MarketDataService {
     this.disconnectLive()
   }
 
-  /** Payout lookup per trade kind. */
+  /** Payout lookup per trade kind. IQ-native instruments (and any trade in
+   * live mode) use the account's REAL reported payouts; the sim universe
+   * keeps its own modeled payouts for paper settlement. Digital has no real
+   * IQ figure in iqair 1.0.0 - the binary payout is the honest estimate. */
   payoutFor(ticker: string, kind: 'binary' | 'turbo' | 'digital' | 'cfd'): number {
+    if (kind === 'cfd') return 1
+    const iq = this.sidecarPayouts.get(ticker)
     const a = getInstrument(ticker)
+    if (iq && (!a || this.mode === 'live')) {
+      const base = iq.binary ?? (a ? a.payout : 0.85)
+      if (kind === 'turbo') return iq.turbo ?? base
+      return base // binary + digital (no real digital figure available)
+    }
     if (!a) return 0.8
     if (kind === 'turbo') return a.turboPayout ?? a.payout - 0.02
     if (kind === 'digital') return a.digitalPayout ?? a.payout + 0.05

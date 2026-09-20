@@ -49,9 +49,10 @@ export interface AssetRow {
   category: AssetCategory
   otc?: boolean
   price: number
-  payout: number
-  turboPayout?: number
-  digitalPayout?: number
+  /** real broker payout (0-1) for binary; null = not reported (IQ margin CFDs/stocks, unknown) */
+  payout: number | null
+  turboPayout?: number | null
+  digitalPayout?: number | null
   leverage?: number
   schedule?: '24/7' | '24/5' | 'market'
   open: boolean
