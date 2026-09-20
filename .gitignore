@@ -69,3 +69,4 @@ mini-services/**/data/
 *.db-shm
 *.db-wal
 tool-results/
+live/.iq_session

@@ -108,6 +108,88 @@ def _lock_watchdog():
 
 threading.Thread(target=_lock_watchdog, daemon=True).start()
 
+# ---------------- session resume ----------------
+# The iqair lib keeps the authenticated session in a module global
+# (global_value.SSID) and its connect() takes a FAST ssid path when that slot
+# is pre-filled - no password round-trip. Persisting the ssid lets keeper
+# respawns / watchdog restarts resume transparently instead of demanding a
+# manual re-login. File lives next to the sidecar, chmod 600, never committed.
+SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".iq_session")
+
+try:
+    import iqair.global_value as _gv
+except Exception:  # noqa: BLE001
+    _gv = None
+
+
+def _save_session(email):
+    if _gv is None or not getattr(_gv, "SSID", None):
+        return
+    try:
+        with open(SESSION_FILE, "w") as f:
+            json.dump({"email": email, "ssid": _gv.SSID}, f)
+        os.chmod(SESSION_FILE, 0o600)
+        print("[sidecar] session token saved - future respawns will auto-resume")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[sidecar] session save failed: {exc}")
+
+
+def _try_resume_session():
+    """Boot-time auto-resume: inject the saved ssid into the lib's global slot
+    BEFORE client.connect() so api.connect() sends the ssid over a fresh
+    websocket (fast path, no credentials). Always lands on PRACTICE."""
+    global _client
+    try:
+        with open(SESSION_FILE) as f:
+            saved = json.load(f)
+        ssid = str(saved.get("ssid") or "")
+        if not ssid or _gv is None:
+            return False
+        from iqair.client import IQOptionClient
+
+        _gv.SSID = ssid
+        client = IQOptionClient(str(saved.get("email") or ""), "")
+        check, reason = client.connect()
+        if not check:
+            print(f"[sidecar] session resume failed ({reason}) - manual login required")
+            return False
+        client.change_balance("PRACTICE")
+        _client = client
+        _save_session(str(saved.get("email") or ""))
+        threading.Thread(target=_seed_ids_from_init, daemon=True).start()
+        print("[sidecar] session RESUMED from saved token (no re-login needed)")
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception as exc:  # noqa: BLE001
+        print(f"[sidecar] session resume error: {exc}")
+        return False
+
+
+def _ws_health_monitor():
+    """On a dead websocket every lib call silently pays a FULL re-login
+    inside the lock (20-55s each - that is what made /price time out while
+    /health stayed green). Detect a dead socket proactively and exit hard:
+    the keeper respawns in ~5s and the saved ssid auto-resumes."""
+    dead = 0
+    time.sleep(45)  # let boot resume / first login settle
+    while True:
+        time.sleep(10)
+        if _client is None:
+            dead = 0
+            continue
+        try:
+            alive = bool(_client.check_connect())
+        except Exception:  # noqa: BLE001
+            alive = False
+        dead = dead + 1 if not alive else 0
+        if dead >= 3:
+            print("[sidecar] WATCHDOG: websocket dead ~30s - restarting for auto-resume")
+            os._exit(1)
+
+
+threading.Thread(target=_ws_health_monitor, daemon=True).start()
+
 
 def _seed_ids_from_init():
     """Best-effort build of the ticker -> active_id map from the turbo/binary
@@ -470,6 +552,9 @@ class Handler(BaseHTTPRequestHandler):
                     print("[sidecar] WARNING: connecting with REAL balance at user request")
                 client.change_balance(mode)
                 _client = client
+                # persist the ssid: every future keeper respawn / watchdog
+                # restart resumes from it instead of asking for credentials
+                _save_session(email)
                 # build the ticker -> active_id map in the background so the
                 # FIRST trade already takes the fast path (connect replies now)
                 threading.Thread(target=_seed_ids_from_init, daemon=True).start()
@@ -722,4 +807,8 @@ class Server(ThreadingHTTPServer):
 
 if __name__ == "__main__":
     print(f"[iqair-sidecar] listening on http://{HOST}:{PORT} - POST /connect to start a session")
+    # transparent auto-resume: if a previous session saved its ssid, bring the
+    # client back BEFORE anyone asks - kernel boot-restore / adopt will find a
+    # connected sidecar and the operator never re-enters credentials
+    threading.Thread(target=_try_resume_session, daemon=True).start()
     Server((HOST, PORT), Handler).serve_forever()

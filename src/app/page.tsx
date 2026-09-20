@@ -373,18 +373,49 @@ export default function OSPage() {
 
   const handleSelectAsset = useCallback((a: string) => {
     setAsset(a)
+    // remember the operator's pair across page refreshes (the kernel
+    // restores its own state on boot, the UI restores the selection here)
+    try {
+      localStorage.setItem('iqos.asset', a)
+    } catch {
+      /* private mode - non-fatal */
+    }
     void osPost('/asset', { asset: a })
   }, [])
 
   // screener row -> load that setup into the chart workspace
+  const TF_VALUES = ['5s', '15s', '30s', '1m', '2m', '5m', '15m', '30m', '1h', '4h', '1d'] as const
   const handleSelectSetup = useCallback(
     (a: string, t: Timeframe) => {
       setAsset(a)
       setTf(t)
+      try {
+        localStorage.setItem('iqos.asset', a)
+        localStorage.setItem('iqos.tf', t)
+      } catch {
+        /* private mode - non-fatal */
+      }
       void osPost('/asset', { asset: a })
     },
     []
   )
+
+  // restore the last selected pair/timeframe after a page refresh - without
+  // this every reload snapped back to EURUSD 1m
+  useEffect(() => {
+    try {
+      const savedAsset = localStorage.getItem('iqos.asset')
+      const savedTf = localStorage.getItem('iqos.tf') as Timeframe | null
+      if (savedTf && (TF_VALUES as readonly string[]).includes(savedTf)) setTf(savedTf)
+      if (savedAsset) {
+        setAsset(savedAsset)
+        void osPost('/asset', { asset: savedAsset })
+      }
+    } catch {
+      /* private mode - non-fatal */
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // realtime feed
   useOSFeed(asset, tf, {

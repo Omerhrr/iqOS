@@ -574,11 +574,14 @@ export class MarketDataService {
   private async pollLive(): Promise<void> {
     try {
       const url = `${this.liveUrl.replace(/\/$/, '')}`
-      // Ticks (/price) every 4s; the 240-bar history rebuild only every 60s
-      // (and immediately after connect / asset switch via lastCandlePull).
-      // Pulling both every 4s queued the poll behind batch price sweeps on
-      // the sidecar's serialized bus -> "live feed hiccup: timed out".
-      const wantCandles = Date.now() - this.lastCandlePull > 60_000
+      // Ticks (/price) every 4s; the 240-bar history rebuild every 60s — but
+      // every 8s until the FIRST freshness anchor lands (right after connect
+      // or asset switch) so ticks start as soon as possible instead of after
+      // a whole minute. Pulling both every 4s used to queue the poll behind
+      // batch price sweeps on the sidecar's serialized bus -> "live feed
+      // hiccup: timed out".
+      const candleEvery = this.lastFeedBarTs === 0 ? 8_000 : 60_000
+      const wantCandles = Date.now() - this.lastCandlePull > candleEvery
       if (wantCandles) this.lastCandlePull = Date.now()
       // fire both fetches in parallel, but CONSUME the price first so the
       // tick lands even while the candle pull is still streaming
