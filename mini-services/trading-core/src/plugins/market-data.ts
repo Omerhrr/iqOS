@@ -77,32 +77,120 @@ export class MarketDataService {
   private archiveQueue: { asset: string; tf: string; time: number; open: number; high: number; low: number; close: number; volume: number }[] = []
   private flushCount = 0
   activeAsset = 'EURUSD'
-  // The sidecar's authenticated account decides which instruments are REALly
-  // tradable on IQ right now (incl. weekend OTC). Fetched from /assets.
+  // The sidecar's authenticated account decides which instruments exist on IQ
+  // right now (incl. weekend OTC). Fetched from GET /assets on the sidecar.
+  private sidecarRows: { ticker: string; category: string; open: boolean }[] = []
   private sidecarAssets: Set<string> | null = null
   private sidecarAssetsTs = 0
   private static SIDECAR_ASSETS_TTL = 10 * 60_000
 
-  /** Refresh the IQ tradable-asset set from the sidecar (10 min TTL). */
+  /** Refresh the IQ tradable-asset list from the sidecar (10 min TTL).
+   * NOTE: the sidecar's get_asset_metadata round-trip against IQ is SLOW
+   * (~95s for the full instrument table) - callers must not block on this;
+   * kick it and serve the last cached rows (dedupe prevents stampedes when
+   * /assets, /instruments and the source switch all fire at once). */
+  private sidecarFetch: Promise<Set<string> | null> | null = null
   async ensureSidecarAssets(): Promise<Set<string> | null> {
     if (this.sidecarAssets && Date.now() - this.sidecarAssetsTs < MarketDataService.SIDECAR_ASSETS_TTL) return this.sidecarAssets
+    if (this.sidecarFetch) return this.sidecarFetch
+    this.sidecarFetch = this.fetchSidecarAssets().finally(() => {
+      this.sidecarFetch = null
+    })
+    return this.sidecarFetch
+  }
+
+  private async fetchSidecarAssets(): Promise<Set<string> | null> {
     try {
-      const res = await fetch(`${this.liveUrl.replace(/\/$/, '')}/assets`, { signal: AbortSignal.timeout(6000) })
-      const data = (await res.json()) as { ok?: boolean; assets?: { ticker?: string; asset?: string }[] }
+      const res = await fetch(`${this.liveUrl.replace(/\/$/, '')}/assets`, { signal: AbortSignal.timeout(150_000) })
+      const data = (await res.json()) as { ok?: boolean; assets?: { ticker?: string; asset?: string; category?: string; is_open?: boolean }[] }
       const rows = data?.assets ?? []
-      const set = new Set<string>()
+      // IQ returns the SAME ticker under several groups (binary/digital/
+      // turbo/cfd/forex/crypto). Dedupe by ticker; resolve the category by
+      // priority (explicit asset class beats option-type group) and open =
+      // open in ANY group.
+      const PRIORITY: Record<string, number> = { crypto: 4, forex: 3, cfd: 2 }
+      const byTicker = new Map<string, { ticker: string; category: string; open: boolean; score: number }>()
       for (const r of rows) {
         const t = r.ticker ?? r.asset
-        if (t) set.add(t)
+        if (!t) continue
+        const rawCat = String(r.category ?? '').toLowerCase()
+        const score = PRIORITY[rawCat] ?? 1
+        const open = Boolean(r.is_open)
+        const prev = byTicker.get(t)
+        if (!prev) byTicker.set(t, { ticker: t, category: rawCat, open, score })
+        else {
+          if (score > prev.score) prev.category = rawCat
+          prev.open = prev.open || open
+          prev.score = Math.max(prev.score, score)
+        }
       }
-      if (set.size) {
-        this.sidecarAssets = set
+      const out = [...byTicker.values()].map((r) => ({ ticker: r.ticker, category: r.category, open: r.open }))
+      if (out.length) {
+        this.sidecarRows = out
+        this.sidecarAssets = new Set(out.map((r) => r.ticker))
         this.sidecarAssetsTs = Date.now()
+        this.ctx.log('market-data', `IQ asset universe refreshed: ${out.length} instruments (${out.filter((r) => r.open).length} open, ${out.filter((r) => r.ticker.endsWith('-OTC')).length} OTC)`)
       }
     } catch {
-      // sidecar dark or not connected - keep the previous set
+      // sidecar dark / not connected / still crunching - keep the previous set
     }
     return this.sidecarAssets
+  }
+
+  /** Does this ticker exist on the connected IQ account at all? (membership,
+   * not schedule - a closed-but-existing pair is still an IQ asset.) */
+  isIQAsset(ticker: string): boolean {
+    return this.sidecarAssets?.has(ticker) ?? false
+  }
+
+  /** How many IQ instruments are known right now (0 = metadata not loaded yet). */
+  get iqAssetCount(): number {
+    return this.sidecarAssets?.size ?? 0
+  }
+
+  /** Sidecar category strings + ticker shape -> kernel AssetCategory.
+   * IQ groups option AVAILABILITY (binary/digital/turbo) alongside asset
+   * classes (forex/crypto/cfd) - the option groups carry no class info, so
+   * the ticker shape decides: 6-letter bases are currency pairs, the rest
+   * are single-name instruments (stocks, some funds). */
+  private mapIQCategory(cat: string, ticker: string): 'forex' | 'crypto' | 'commodity' | 'stock' | 'index' {
+    const base = ticker.replace(/-OTC$/, '').toUpperCase()
+    const c = cat.toLowerCase()
+    if (c === 'crypto') return 'crypto'
+    if (c === 'forex') return 'forex'
+    if (c === 'cfd') {
+      if (/^(XAU|XAG|XPT|XPD|OIL|BRENT|WTI|NGAS|COPPER|SILVER)/.test(base)) return 'commodity'
+      if (/SP500|NSDQ|US30|US100|DAX|FTSE|NIKKEI|HSI|ESTX|CAC|IBEX|MIB|ASX|SMI|AEX/.test(base)) return 'index'
+      if (/^[A-Z]{6}$/.test(base)) return 'forex'
+      return 'stock'
+    }
+    // binary / digital / turbo (and anything unknown)
+    if (/^[A-Z]{6}$/.test(base)) return 'forex'
+    return 'stock'
+  }
+
+  /**
+   * THE IQ account's own asset list, built from the authenticated session's
+   * metadata - this is the ONLY universe served in IQ mode; the 115-pair sim
+   * universe never leaks into it. Prices are known only for polled assets
+   * (the active one) - rows without a tick carry price 0 and the UI shows a
+   * dash until the pair is opened.
+   */
+  iqAssetRows(): { ticker: string; name: string; category: 'forex' | 'crypto' | 'commodity' | 'stock' | 'index'; otc: boolean; price: number; payout: number; schedule: '24/7' | undefined; open: boolean; iq: boolean }[] {
+    return this.sidecarRows.map((r) => {
+      const otc = r.ticker.endsWith('-OTC')
+      return {
+        ticker: r.ticker,
+        name: r.ticker.replace(/-OTC$/, '').replace(/_/g, ' ') + (otc ? ' OTC' : ''),
+        category: this.mapIQCategory(r.category, r.ticker),
+        otc,
+        price: this.prices.get(r.ticker) ?? 0,
+        payout: 0.85,
+        schedule: otc ? ('24/7' as const) : undefined,
+        open: r.open,
+        iq: true,
+      }
+    })
   }
 
   /** Can this instrument be traded on the connected IQ account right now? */

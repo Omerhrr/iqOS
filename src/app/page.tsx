@@ -120,14 +120,14 @@ export default function OSPage() {
     return () => clearTimeout(t)
   }, [bootLine])
 
-  const loadAssets = useCallback(async (sourceOverride?: 'paper' | 'iq') => {
+  const loadAssets = useCallback(async () => {
     try {
       const d = await osGet<{ ok: boolean; assets: AssetRow[]; activeAsset: string }>('/assets')
       if (d.ok) {
-        // IQ mode: only instruments the connected IQ account can actually trade
-        const src = sourceOverride ?? accountRef.current?.source ?? 'paper'
-        const list = src === 'iq' ? d.assets.filter((a) => a.iq !== false) : d.assets
-        setAssets(list)
+        // the kernel serves the correct universe per account source:
+        // paper = 115-pair sim universe, IQ = the account's OWN instruments
+        // (no frontend filtering - never mix the two worlds)
+        setAssets(d.assets)
         setPrices((prev) => {
           const next = { ...prev }
           for (const a of d.assets) next[a.ticker] = next[a.ticker] ?? { price: a.price, dir: 0 }
@@ -138,6 +138,16 @@ export default function OSPage() {
       pushToast('danger', 'Cannot reach trading-core on :3030 - is the kernel running?')
     }
   }, [pushToast])
+
+  // IQ mode: the account's instrument table takes IQ ~90s to produce on the
+  // first pull (sidecar metadata round-trip). The kernel serves cached rows
+  // instantly and refreshes in the background - keep re-pulling every 4s
+  // until the table lands, then the normal data flow takes over.
+  useEffect(() => {
+    if (account?.source !== 'iq' || assets.length > 0) return
+    const t = setTimeout(() => void loadAssets(), 4000)
+    return () => clearTimeout(t)
+  }, [account?.source, assets.length, loadAssets])
 
   const loadCandles = useCallback(async (a: string, t: Timeframe) => {
     const d = await osGet<{ ok: boolean; candles: Candle[] }>(`/candles`, { asset: a, tf: t, limit: 320 })
@@ -489,7 +499,7 @@ export default function OSPage() {
         onAccountChanged={setAccount}
         onSourceChanged={(fresh, kernelActiveAsset) => {
           void loadAccount()
-          void loadAssets(fresh.source ?? 'paper')
+          void loadAssets()
           if (kernelActiveAsset && kernelActiveAsset !== asset) {
             // kernel moved the chart (current asset not tradeable on IQ) -
             // the asset-state effect re-pulls candles + analysis on its own

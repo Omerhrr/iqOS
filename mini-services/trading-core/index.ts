@@ -82,7 +82,17 @@ const httpServer = createServer(async (req, res) => {
         return json(200, { ok: true, ...mode.status() })
       }
 
-      if (path === '/assets') return json(200, { ok: true, assets: market.listAssets(), mode: market.mode, activeAsset: market.activeAsset })
+      if (path === '/assets') {
+        // IQ mode serves the IQ ACCOUNT'S OWN asset list from the authenticated
+        // session metadata - the sim universe must never leak into it. The
+        // metadata fetch can take IQ ~90s - kick it in the background and
+        // serve the cached rows (the UI re-polls until the table lands).
+        if (exec.accountSource === 'iq') {
+          void market.ensureSidecarAssets()
+          return json(200, { ok: true, source: 'iq', assets: market.iqAssetRows(), mode: market.mode, activeAsset: market.activeAsset })
+        }
+        return json(200, { ok: true, source: 'paper', assets: market.listAssets(), mode: market.mode, activeAsset: market.activeAsset })
+      }
 
       if (path === '/live/status') {
         const account = exec.account()
@@ -103,15 +113,18 @@ const httpServer = createServer(async (req, res) => {
 
       if (path === '/instruments') {
         const cat = (q.get('category') ?? 'all') as 'all' | 'otc' | 'forex' | 'crypto' | 'commodity' | 'stock' | 'index'
-        const search = q.get('q') ?? ''
-        const iqOnly = q.get('iq') === '1'
-        if (market.mode === 'live') void market.ensureSidecarAssets()
-        market.refreshSchedules()
-        let found = searchInstruments(search, cat)
-        if (iqOnly) {
-          // IQ mode: only instruments the connected account can actually trade
-          found = found.filter((a) => market.isIQAvailable(a.ticker))
+        const search = (q.get('q') ?? '').toLowerCase()
+        // IQ mode: the connected account's own instruments ONLY (its own
+        // tickers, incl. weekend OTC) - not a filtered sim universe.
+        if (exec.accountSource === 'iq' || q.get('iq') === '1') {
+          void market.ensureSidecarAssets()
+          let rows = market.iqAssetRows()
+          if (cat !== 'all') rows = rows.filter((a) => (cat === 'otc' ? a.otc : a.category === cat))
+          if (search) rows = rows.filter((a) => a.ticker.toLowerCase().includes(search) || a.name.toLowerCase().includes(search))
+          return json(200, { ok: true, instruments: rows, stats: UNIVERSE_STATS })
         }
+        market.refreshSchedules()
+        const found = searchInstruments(search, cat)
         return json(200, {
           ok: true,
           instruments: found.map((a) => ({ ...a, price: market.getPrice(a.ticker) || a.basePrice, iq: market.isIQAvailable(a.ticker) })),
@@ -420,6 +433,20 @@ const httpServer = createServer(async (req, res) => {
 
       if (path === '/asset') {
         const asset = String(body.asset ?? '')
+        // IQ mode: the switch target must be an IQ-account instrument; the
+        // sim universe is irrelevant here. No synthetic seeding - pollLive
+        // materializes the real candles on the next tick.
+        if (exec.accountSource === 'iq') {
+          void market.ensureSidecarAssets()
+          // reject only when the IQ instrument table is LOADED and the ticker
+          // is not on it - before the first (slow) metadata fetch everything
+          // is passable, the sidecar validates trades authoritatively anyway
+          if (market.iqAssetCount > 0 && !market.isIQAsset(asset)) return json(400, { ok: false, error: `${asset} is not available on this IQ account` })
+          market.activeAsset = asset
+          market.refreshActiveLive()
+          io.emit('ui', { event: 'asset-changed', asset })
+          return json(200, { ok: true, activeAsset: asset })
+        }
         if (!market.assets.some((a) => a.ticker === asset)) return json(400, { ok: false, error: `unknown asset ${asset}` })
         market.activeAsset = asset
         market.ensureSeeded(asset)
@@ -522,7 +549,10 @@ const httpServer = createServer(async (req, res) => {
         const asset = String(body.asset ?? market.activeAsset)
         const kind = (body.kind as 'binary' | 'turbo' | 'digital' | 'cfd') ?? 'binary'
         const inst = getInstrument(asset)
-        if (!inst) return json(400, { ok: false, error: `unknown asset ${asset}` })
+        // on IQ the account's own instruments are valid even when unknown to
+        // the sim universe (exotics, OTC variants) - the sidecar validates
+        if (!inst && !(exec.accountSource === 'iq' && market.isIQAsset(asset)))
+          return json(400, { ok: false, error: `unknown asset ${asset}` })
         const out = await exec.placeOrder({
           asset,
           tf: tf(String(body.tf ?? '1m') as string),

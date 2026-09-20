@@ -102,7 +102,8 @@ export default function MarketWatch({ assets, active, prices, onSelect }: Props)
                 </div>
               </div>
               <div className={`text-right font-mono text-[11px] ${p.dir > 0 ? 'text-emerald-400' : p.dir < 0 ? 'text-rose-400' : 'text-[#aab6cc]'}`}>
-                {fmtPrice(p.price, a.ticker)}
+                {/* IQ mode: only polled pairs (opened ones) have a live tick */}
+                {p.price > 0 ? fmtPrice(p.price, a.ticker) : '—'}
                 <div className={`text-[8px] ${p.dir > 0 ? 'text-emerald-500' : p.dir < 0 ? 'text-rose-500' : 'text-[#2a3a52]'}`}>
                   {p.dir > 0 ? '▲' : p.dir < 0 ? '▼' : '—'}
                 </div>

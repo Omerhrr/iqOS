@@ -56,6 +56,7 @@ PORT = 8788
 
 _lock = threading.Lock()
 _client = None  # iqair IQOptionClient, set by /connect
+_assets_cache = None  # (rows, ts) - the ~90s instrument table, 30 min TTL
 
 
 def _ok(data=None):
@@ -122,6 +123,14 @@ class Handler(BaseHTTPRequestHandler):
                     # real tradeable assets + is_open, incl. weekend OTC).
                     # NOTE: must use OUR client - iqair.agent.tools.get_client()
                     # is a different, unconnected instance.
+                    # The full instrument table takes IQ ~90s to produce - cache
+                    # it here (30 min) so repeat calls answer instantly; the
+                    # kernel also caches, but the FIRST fetch after a sidecar
+                    # start must not re-pay the 90s for every caller.
+                    global _assets_cache
+                    now = time.time()
+                    if _assets_cache and now - _assets_cache[1] < 1800:
+                        return self._send(_ok({"assets": _assets_cache[0], "live": True, "cached": True}))
                     assets = None
                     try:
                         meta = _client.get_asset_metadata()
@@ -137,6 +146,7 @@ class Handler(BaseHTTPRequestHandler):
                                 })
                         if rows:
                             assets = rows
+                            _assets_cache = (rows, now)
                     except Exception:  # noqa: BLE001
                         assets = None
                     if not assets and OP_code is not None:
