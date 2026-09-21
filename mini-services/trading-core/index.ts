@@ -17,6 +17,7 @@ import { alertRulesPlugin, AlertRulesService, ALERT_METRICS } from './src/plugin
 import { sentinelPlugin, SentinelService, type SentinelConfig } from './src/plugins/sentinel'
 import { watchdogPlugin, WatchdogService, type WatchdogConfig } from './src/plugins/watchdog'
 import { gridSearch, walkForward, sweepAssets, type Objective } from './src/strategies/optimize'
+import { vskMonteCarlo } from './src/analytics/vsk'
 import { ALL_TIMEFRAMES, type Timeframe } from './src/types'
 import { searchInstruments, UNIVERSE_STATS, getInstrument } from './src/universe'
 import { listRegistry, computeIndicator, registrySize, getIndicatorDef } from './src/analytics/registry'
@@ -554,6 +555,54 @@ const httpServer = createServer(async (req, res) => {
           maxBars: body.maxBars !== undefined ? Number(body.maxBars) : 24,
         })
         return json(200, { ok: true, result })
+      }
+
+      if (path === '/vsk_montecarlo') {
+        // Bootstrap Monte Carlo for the VSK Synthesis strategy: backtest the
+        // 4-layer algorithm over deep history, then resample its trade PnL
+        // sequence with replacement sims times -> distribution of final
+        // equity / drawdown / ruin probability + p5/p50/p95 equity fan.
+        try {
+          const asset = String(body.asset ?? market.activeAsset)
+          const tfv = tf(String(body.tf ?? '1m') as string)
+          const startEquity = body.startEquity !== undefined ? Number(body.startEquity) : 1000
+          const bt = analytics.runBacktest(asset, tfv, {
+            strategy: 'vsk-synthesis',
+            params: (body.params as Record<string, number | string>) ?? undefined,
+            mode: 'binary',
+            payout: body.payout !== undefined ? Number(body.payout) : 0.85,
+            amount: body.amount !== undefined ? Number(body.amount) : 10,
+            expiryBars: body.expiryBars !== undefined ? Number(body.expiryBars) : 1,
+            startEquity,
+          })
+          const mc = vskMonteCarlo(
+            bt.trades.map((t) => t.pnl),
+            {
+              sims: body.sims !== undefined ? Number(body.sims) : 2000,
+              startEquity,
+              ruinPct: body.ruinPct !== undefined ? Number(body.ruinPct) : 0.6,
+              seed: body.seed !== undefined ? Number(body.seed) : undefined,
+            }
+          )
+          return json(200, {
+            ok: true,
+            asset,
+            tf: tfv,
+            baseline: {
+              candlesTested: bt.candlesTested,
+              totalTrades: bt.metrics.totalTrades,
+              winRate: bt.metrics.winRate,
+              netPnl: bt.metrics.netPnl,
+              profitFactor: bt.metrics.profitFactor,
+              expectancy: bt.metrics.expectancy,
+              maxDrawdownPct: bt.metrics.maxDrawdownPct,
+              finalEquity: bt.metrics.finalEquity,
+            },
+            monteCarlo: mc,
+          })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
       }
 
       if (path === '/run_strategy') {

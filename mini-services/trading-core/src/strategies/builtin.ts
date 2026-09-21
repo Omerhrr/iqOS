@@ -6,6 +6,7 @@ import * as ta from '../analytics/indicators'
 import { markovChain } from '../analytics/quant'
 import { detectPatterns, patternBias } from '../analytics/patterns'
 import { ouState } from '../analytics/kalman'
+import { vskEvaluate, VSK_DEFAULTS } from '../analytics/vsk'
 
 const last = (arr: number[]): number => {
   for (let i = arr.length - 1; i >= 0; i--) if (Number.isFinite(arr[i])) return arr[i]
@@ -252,6 +253,35 @@ export const STRATEGIES: StrategyDef[] = [
       if (score <= -thr) return { direction: 'put', score, notes: `Composite ${score.toFixed(0)}` }
       return { direction: 'none', score, notes: `Composite ${score.toFixed(0)} below threshold` }
     },
+  },
+  {
+    id: 'vsk-synthesis',
+    name: 'VSK Synthesis (4-Layer)',
+    description:
+      'Layered synthesis: L1 VWAP z-score arms the reversion at the boundary, L2 volatility squeeze blocks runaway trends, L3 Kalman curve confirms the structural turn, L4 PSAR on the FILTERED curve fires the exact flip bar. Entry = all four agree.',
+    params: [
+      { key: 'vwapPeriod', label: 'L1 VWAP window', type: 'number', min: 10, max: 240, default: VSK_DEFAULTS.vwapPeriod },
+      { key: 'zEntry', label: 'L1 z entry', type: 'number', min: 1, max: 4, step: 0.1, default: VSK_DEFAULTS.zEntry },
+      { key: 'armWindow', label: 'L1 arm window (bars)', type: 'number', min: 1, max: 20, default: VSK_DEFAULTS.armWindow },
+      { key: 'widthPctRunaway', label: 'L2 width runaway %', type: 'number', min: 50, max: 100, default: VSK_DEFAULTS.widthPctRunaway },
+      { key: 'slopePctRunaway', label: 'L2 slope runaway %', type: 'number', min: 50, max: 100, default: VSK_DEFAULTS.slopePctRunaway },
+      { key: 'kalmanQ', label: 'L3 Kalman Q', type: 'number', min: 0.001, max: 0.2, step: 0.001, default: VSK_DEFAULTS.kalmanQ },
+      { key: 'kalmanR', label: 'L3 Kalman R', type: 'number', min: 0.1, max: 10, step: 0.1, default: VSK_DEFAULTS.kalmanR },
+      { key: 'sarStep', label: 'L4 SAR step', type: 'number', min: 0.005, max: 0.1, step: 0.005, default: VSK_DEFAULTS.sarStep },
+      { key: 'sarMax', label: 'L4 SAR max AF', type: 'number', min: 0.05, max: 0.5, step: 0.01, default: VSK_DEFAULTS.sarMax },
+    ],
+    evaluate: (candles, p) =>
+      vskEvaluate(candles, {
+        vwapPeriod: num(p, 'vwapPeriod', VSK_DEFAULTS.vwapPeriod),
+        zEntry: num(p, 'zEntry', VSK_DEFAULTS.zEntry),
+        armWindow: num(p, 'armWindow', VSK_DEFAULTS.armWindow),
+        widthPctRunaway: num(p, 'widthPctRunaway', VSK_DEFAULTS.widthPctRunaway),
+        slopePctRunaway: num(p, 'slopePctRunaway', VSK_DEFAULTS.slopePctRunaway),
+        kalmanQ: num(p, 'kalmanQ', VSK_DEFAULTS.kalmanQ),
+        kalmanR: num(p, 'kalmanR', VSK_DEFAULTS.kalmanR),
+        sarStep: num(p, 'sarStep', VSK_DEFAULTS.sarStep),
+        sarMax: num(p, 'sarMax', VSK_DEFAULTS.sarMax),
+      }),
   },
 ]
 

@@ -7,6 +7,7 @@
 import type { Candle, IndicatorDef, IndicatorOutput } from '../types'
 import * as TA from './indicators'
 import * as OU from './kalman'
+import { computeVSK, VSK_DEFAULTS } from './vsk'
 
 const isn = TA.isn
 
@@ -1096,7 +1097,68 @@ const extras2: IndicatorDef[] = [
 
 // ============================ REGISTRY EXPORT ============================
 
-export const REGISTRY: IndicatorDef[] = [...overlap, ...momentum, ...volume, ...volatility, ...trend, ...statistic, ...extras, ...extras2]
+// ============================ VSK SYNTHESIS ============================
+// The 4-layer stack (VWAP Z-Score -> Volatility Squeeze -> Kalman -> PSAR on
+// the filtered curve) exposed as two registry indicators: the overlay draws
+// the live machinery on price, the sub-pane draws the z boundary + kinetic
+// trigger. Both are pure views over analytics/vsk.computeVSK.
+
+const vskIndicators: IndicatorDef[] = [
+  {
+    id: 'vsk', name: 'VSK Synthesis', category: 'trend', pane: 'overlay',
+    params: [
+      p('vwapPeriod', 'VWAP window', 10, 240, VSK_DEFAULTS.vwapPeriod),
+      p('kalmanQ', 'Kalman Q (response)', 0.001, 0.2, VSK_DEFAULTS.kalmanQ, 0.001),
+      p('kalmanR', 'Kalman R (smooth)', 0.1, 10, VSK_DEFAULTS.kalmanR, 0.1),
+      p('sarStep', 'SAR step', 0.005, 0.1, VSK_DEFAULTS.sarStep, 0.005),
+      p('sarMax', 'SAR max AF', 0.05, 0.5, VSK_DEFAULTS.sarMax, 0.01),
+    ],
+    description: 'VSK Synthesis stack: rolling VWAP boundary (L1), Kalman structural curve (L3) and PSAR on the FILTERED curve (L4). Signals fire when the PSAR flips on the curve while z is stretched and the regime is not a runaway trend (see VSK Z-Score & Trigger pane).',
+    compute: (c, par) => {
+      const s = computeVSK(c, {
+        vwapPeriod: num(c, par, 'vwapPeriod', VSK_DEFAULTS.vwapPeriod),
+        kalmanQ: num(c, par, 'kalmanQ', VSK_DEFAULTS.kalmanQ),
+        kalmanR: num(c, par, 'kalmanR', VSK_DEFAULTS.kalmanR),
+        sarStep: num(c, par, 'sarStep', VSK_DEFAULTS.sarStep),
+        sarMax: num(c, par, 'sarMax', VSK_DEFAULTS.sarMax),
+      })
+      return {
+        lines: [
+          line('vwap', C.slate, s.vwap, 'dashed'),
+          line('kalman', C.violet, s.kalman, 'solid', 2),
+          line('sar', C.teal, s.sar, 'dotted'),
+        ],
+        note: `L1 VWAP boundary · L2 squeeze gate · L3 Kalman curve · L4 PSAR trigger`,
+      }
+    },
+  },
+  {
+    id: 'vsk-z', name: 'VSK Z-Score & Trigger', category: 'momentum', pane: 'sub',
+    params: [
+      p('vwapPeriod', 'VWAP window', 10, 240, VSK_DEFAULTS.vwapPeriod),
+      p('zEntry', 'Z entry', 1, 4, VSK_DEFAULTS.zEntry, 0.1),
+    ],
+    description: 'VSK layer view: z-score of price vs rolling VWAP (L1 exhaustion arms the setup), trigger histogram = the final gated VSK signal (+1 call flip / -1 put flip) and width percentile (L2 squeeze gate).',
+    compute: (c, par) => {
+      const s = computeVSK(c, {
+        vwapPeriod: num(c, par, 'vwapPeriod', VSK_DEFAULTS.vwapPeriod),
+        zEntry: num(c, par, 'zEntry', VSK_DEFAULTS.zEntry),
+      })
+      const ze = num(c, par, 'zEntry', VSK_DEFAULTS.zEntry)
+      return {
+        lines: [
+          line('z', C.cyan, s.z),
+          line('widthPct', C.slate, s.widthPct.map((v) => (isn(v) ? v / 25 : NaN)), 'dotted'), // scaled into z-range (~0..4)
+        ],
+        hist: { values: s.signal, color: 'updown' },
+        levels: [-ze, 0, ze],
+        note: 'z vs VWAP · hist = VSK trigger · dotted = BB-width percentile / 25',
+      }
+    },
+  },
+]
+
+export const REGISTRY: IndicatorDef[] = [...overlap, ...momentum, ...volume, ...volatility, ...trend, ...statistic, ...extras, ...extras2, ...vskIndicators]
 
 const REGISTRY_MAP = new Map(REGISTRY.map((d) => [d.id, d]))
 
