@@ -349,6 +349,12 @@ const httpServer = createServer(async (req, res) => {
         return json(200, { ok: true, messages: store.listChat(session, 60).reverse() })
       }
 
+      if (path === '/notes') {
+        const store = kernel.context().use<{ listNotes: (q: string, l?: number) => unknown[] }>('storeRaw')
+        const notes = store.listNotes(q.get('q') ?? '', Number(q.get('limit') ?? 30))
+        return json(200, { ok: true, count: notes.length, notes })
+      }
+
       // ---------- autopilot fleet ----------
 
       if (path === '/bots') {
@@ -792,6 +798,20 @@ const httpServer = createServer(async (req, res) => {
         const store = kernel.context().use<{ clearChat: (s: string) => number }>('storeRaw')
         const removed = store.clearChat(String(body.session ?? 'default'))
         return json(200, { ok: true, removed })
+      }
+
+      if (path === '/notes_save') {
+        const store = kernel.context().use<{ saveNote: (k: string, c: string, t?: string) => { id: number; ts: number } }>('storeRaw')
+        const content = String(body.content ?? '').trim()
+        if (!content) return json(400, { ok: false, error: 'content required' })
+        const saved = store.saveNote(String(body.kind ?? 'note').slice(0, 40), content.slice(0, 2000), body.tags ? String(body.tags).slice(0, 200) : undefined)
+        return json(200, { ok: true, ...saved })
+      }
+
+      if (path === '/notes_delete') {
+        const store = kernel.context().use<{ deleteNote: (id: number) => boolean }>('storeRaw')
+        const removed = store.deleteNote(Number(body.id ?? 0))
+        return json(200, { ok: removed, removed })
       }
 
       // ---------- autopilot control ----------

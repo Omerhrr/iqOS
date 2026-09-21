@@ -67,6 +67,99 @@ function trimAnalysis(a: Record<string, unknown>): Record<string, unknown> {
 
 const CHART_TYPES = ['candles', 'hollow', 'bars', 'line', 'area', 'baseline', 'heikin-ashi', 'renko']
 
+// ---------- shared helpers for the composed power tools ----------
+
+/** Run async tasks with bounded concurrency, preserving input order. */
+async function pool<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length)
+  let next = 0
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    while (next < items.length) {
+      const idx = next++
+      out[idx] = await fn(items[idx])
+    }
+  })
+  await Promise.all(workers)
+  return out
+}
+
+/** Memoized SDK client - web_search reuses one connection across the run. */
+let zaiMemo: Promise<Awaited<ReturnType<typeof ZAI.create>>> | null = null
+function getZAI() {
+  if (!zaiMemo) zaiMemo = ZAI.create()
+  return zaiMemo
+}
+
+const TF_MINUTES: Record<string, number> = {
+  '5s': 1 / 12, '15s': 0.25, '30s': 0.5, '1m': 1, '2m': 2, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1d': 1440,
+}
+
+/** Last finite value of a sparse indicator series (nulls at the warmup head). */
+function lastFinite(values: (number | null)[]): number | null {
+  for (let i = values.length - 1; i >= 0; i--) {
+    const v = values[i]
+    if (v !== null && Number.isFinite(v)) return v
+  }
+  return null
+}
+
+/** Fetch one structural indicator and distill it to {levelKey: lastValue} + note. */
+async function structuralLevels(
+  id: string,
+  asset: string,
+  tf: string,
+  params?: Record<string, unknown>
+): Promise<{ id: string; levels: Record<string, number>; note?: string }> {
+  const qs = new URLSearchParams({ id, asset, tf })
+  for (const [k, v] of Object.entries(params ?? {})) qs.set(`p_${k}`, String(v))
+  const d = (await coreGet(`/indicator?${qs.toString()}`)) as {
+    ok: boolean
+    series?: { lines?: { key: string; values: (number | null)[] }[]; note?: string }
+  }
+  const levels: Record<string, number> = {}
+  for (const ln of d.series?.lines ?? []) {
+    const v = lastFinite(ln.values)
+    if (v !== null) levels[ln.key] = Math.round(v * 1e6) / 1e6
+  }
+  return { id, levels, note: d.series?.note }
+}
+
+/** Pick the nearest named levels above and below a reference price. */
+function nearestLevels(levels: { name: string; price: number }[], price: number) {
+  const pct = (p: number) => Math.round(Math.abs((p - price) / price) * 10000) / 100
+  const above = levels.filter((l) => l.price > price).sort((a, b) => a.price - b.price)[0]
+  const below = levels.filter((l) => l.price < price).sort((a, b) => b.price - a.price)[0]
+  return {
+    nearestAbove: above ? { ...above, distPct: pct(above.price) } : null,
+    nearestBelow: below ? { ...below, distPct: pct(below.price) } : null,
+  }
+}
+
+/** Pearson correlation of two equal-length series. */
+function pearson(a: number[], b: number[]): number {
+  const n = Math.min(a.length, b.length)
+  if (n < 3) return 0
+  let sa = 0, sb = 0
+  for (let i = 0; i < n; i++) { sa += a[i]; sb += b[i] }
+  const ma = sa / n, mb = sb / n
+  let num = 0, da = 0, dbv = 0
+  for (let i = 0; i < n; i++) {
+    const x = a[i] - ma, y = b[i] - mb
+    num += x * y; da += x * x; dbv += y * y
+  }
+  const den = Math.sqrt(da * dbv)
+  return den === 0 ? 0 : Math.round((num / den) * 1000) / 1000
+}
+
+/** Log returns of a close series. */
+function logReturns(closes: number[]): number[] {
+  const out: number[] = []
+  for (let i = 1; i < closes.length; i++) {
+    if (closes[i - 1] > 0 && closes[i] > 0) out.push(Math.log(closes[i] / closes[i - 1]))
+  }
+  return out
+}
+
 const TOOLS: ToolSpec[] = [
   // ---------- market data & registry ----------
   {
@@ -656,6 +749,458 @@ const TOOLS: ToolSpec[] = [
     args: '{}',
     run: () => coreGet('/archive'),
   },
+  // ---------- power tools: web, confluence, planning, memory ----------
+  {
+    name: 'web_search',
+    description: 'Search the LIVE WEB for real-time information: market news, economic calendar events, central-bank decisions, earnings, geopolitical shocks, sentiment. Use when the user asks "why is X moving", "any news on ...", or when a trade thesis needs a fundamental sanity check. Returns ranked results with title, snippet, source and date.',
+    args: '{"query": "gold price fed decision", "num": 6, "recency_days": 3}',
+    run: async (a) => {
+      const query = String(a.query ?? '').trim()
+      if (!query) return { ok: false, error: 'query required' }
+      const num = Math.min(Math.max(Number(a.num ?? 6), 1), 10)
+      const recency = Number(a.recency_days ?? 7)
+      try {
+        const zai = await getZAI()
+        const res = (await zai.functions.invoke('web_search', {
+          query,
+          num,
+          ...(Number.isFinite(recency) && recency > 0 ? { recency_days: recency } : {}),
+        })) as unknown
+        const items = (Array.isArray(res) ? res : []) as { url: string; name: string; snippet: string; host_name: string; date: string }[]
+        if (!items.length) return { ok: true, query, results: [], note: 'no results - try broader keywords' }
+        return {
+          ok: true,
+          query,
+          results: items.slice(0, num).map((r) => ({
+            title: r.name,
+            snippet: (r.snippet ?? '').slice(0, 320),
+            url: r.url,
+            source: r.host_name,
+            date: r.date,
+          })),
+        }
+      } catch (err) {
+        return { ok: false, error: `web_search failed: ${(err as Error).message}` }
+      }
+    },
+  },
+  {
+    name: 'key_levels',
+    description: 'ONE-SHOT structural level map for an asset: classic floor pivots (PP/R1-R3/S1-S3), auto-Fibonacci retracement + extensions, auto S/R trendlines and active fair value gaps - each with the distance in % from current price, plus the single nearest resistance above and support below. THE pre-trade levels snapshot - call it before build_trade_plan or any level-based read.',
+    args: '{"asset": "EURUSD-OTC", "tf": "1m"}',
+    run: async (a) => {
+      const asset = String(a.asset ?? 'EURUSD')
+      const tf = String(a.tf ?? '1m')
+      const [candleRes, pivots, fib, trend, fvg] = await Promise.all([
+        coreGet(`/candles?asset=${encodeURIComponent(asset)}&tf=${tf}&limit=1`) as Promise<{ ok: boolean; candles?: { close: number }[] }>,
+        structuralLevels('pivots', asset, tf).catch(() => null),
+        structuralLevels('fib', asset, tf).catch(() => null),
+        structuralLevels('trendlines', asset, tf).catch(() => null),
+        structuralLevels('fvg', asset, tf).catch(() => null),
+      ])
+      const price = candleRes.candles?.[candleRes.candles.length - 1]?.close
+      if (!price) return { ok: false, error: `no candles for ${asset} ${tf}` }
+      const named: { name: string; price: number }[] = []
+      if (pivots) for (const [k, v] of Object.entries(pivots.levels)) named.push({ name: `pivot.${k}`, price: v })
+      if (fib) for (const [k, v] of Object.entries(fib.levels)) named.push({ name: `fib.${k}`, price: v })
+      if (trend) for (const [k, v] of Object.entries(trend.levels)) named.push({ name: `trend.${k}`, price: v })
+      const gaps: { name: string; range: [number, number] }[] = []
+      if (fvg) {
+        const lv = fvg.levels
+        if (lv.bullTop !== undefined && lv.bullBot !== undefined) gaps.push({ name: 'bull fvg', range: [lv.bullBot, lv.bullTop] })
+        if (lv.bearTop !== undefined && lv.bearBot !== undefined) gaps.push({ name: 'bear fvg', range: [lv.bearBot, lv.bearTop] })
+        for (const [k, v] of Object.entries(lv)) named.push({ name: `fvg.${k}`, price: v })
+      }
+      const near = nearestLevels(named, price)
+      const dist = (p: number) => Math.round(((p - price) / price) * 10000) / 100
+      return {
+        ok: true,
+        asset,
+        tf,
+        price: Math.round(price * 1e6) / 1e6,
+        pivots: pivots?.levels ?? null,
+        fib: fib?.levels ?? null,
+        trendlines: trend ? { levels: trend.levels, state: trend.note } : null,
+        fairValueGaps: gaps.length ? gaps : (fvg ? { note: fvg.note } : null),
+        nearest: near,
+        levelDistancesPct: named.length ? Object.fromEntries(named.map((l) => [l.name, dist(l.price)])) : {},
+      }
+    },
+  },
+  {
+    name: 'confluence_read',
+    description: 'THE SNIPER VERDICT: fuses four independent evidence streams into one confluence score (-100 bearish..+100 bullish) - multi-timeframe signal agreement (5m/15m/1h/4h), the composite signal score on the working timeframe, the Markov chain probability edge and the recent candlestick-pattern bias. Returns the per-factor breakdown so you can explain WHY. Use before any trade recommendation.',
+    args: '{"asset": "EURUSD-OTC", "tf": "1m"}',
+    run: async (a) => {
+      const asset = String(a.asset ?? 'EURUSD')
+      const tf = String(a.tf ?? '1m')
+      const mtfTfs = ['5m', '15m', '1h', '4h']
+      const [analysisRes, ...mtfRows] = await Promise.all([
+        coreGet(`/analysis?asset=${encodeURIComponent(asset)}&tf=${tf}`) as Promise<{ ok: boolean; analysis?: Record<string, unknown> }>,
+        ...mtfTfs.map((t) =>
+          coreGet(`/signal?asset=${encodeURIComponent(asset)}&tf=${t}`) as Promise<{
+            ok: boolean
+            signal?: { direction: string; score: number; confidence: number }
+          }>
+        ),
+      ])
+      if (!analysisRes.ok) return { ok: false, error: 'analysis unavailable' }
+      const an = analysisRes.analysis!
+      const sig = an.signal as { direction: string; score: number; confidence: number }
+      const mk = an.markov as { probUp: number; regime: string }
+      const pats = (an.patterns ?? []) as { direction: string; barAgo?: number }[]
+      const recent = pats.filter((p) => (p.barAgo ?? 0) <= 3)
+      const bull = recent.filter((p) => p.direction === 'bullish').length
+      const bear = recent.filter((p) => p.direction === 'bearish').length
+      const candleNet = Math.max(-3, Math.min(3, bull - bear))
+
+      const mtf = mtfTfs.map((t, i) => ({ tf: t, ...mtfRows[i] }))
+      const okMtf = mtf.filter((r) => r.ok && r.signal)
+      const bullTf = okMtf.filter((r) => r.signal!.direction === 'call').length
+      const bearTf = okMtf.filter((r) => r.signal!.direction === 'put').length
+      const mtfSigned = okMtf.length ? (2 * bullTf - okMtf.length) / okMtf.length : 0 // -1..+1
+
+      const markovSigned = (mk.probUp - 0.5) * 2 * 100 // -100..+100
+      const score = Math.round(0.3 * mtfSigned * 100 + 0.3 * sig.score + 0.2 * markovSigned + 0.1 * (candleNet / 3) * 100)
+      const verdict =
+        score >= 55 ? 'STRONG CALL' : score >= 25 ? 'CALL BIAS' : score <= -55 ? 'STRONG PUT' : score <= -25 ? 'PUT BIAS' : 'NEUTRAL / MIXED'
+      return {
+        ok: true,
+        asset,
+        tf,
+        confluenceScore: score,
+        verdict,
+        factors: {
+          mtf: { agree: `${bullTf} call / ${bearTf} put of ${okMtf.length}`, signed: Math.round(mtfSigned * 100), weight: 0.3, rows: okMtf.map((r) => ({ tf: r.tf, direction: r.signal!.direction, score: Math.round(r.signal!.score) })) },
+          compositeSignal: { score: Math.round(sig.score), direction: sig.direction, confidence: Math.round(sig.confidence), weight: 0.3 },
+          markov: { probUp: Math.round(mk.probUp * 1000) / 1000, regime: mk.regime, signed: Math.round(markovSigned), weight: 0.2 },
+          candlePatterns: { bull, bear, net: candleNet, weight: 0.1 },
+        },
+        note: 'score is additive evidence, not a guarantee - pair with key_levels for invalidation and web_search for news context',
+      }
+    },
+  },
+  {
+    name: 'build_trade_plan',
+    description: 'Build a COMPLETE binary-trade plan: direction (from the live signal or forced side), entry price, suggested expiry in minutes (1 bar of the working tf), stake sized from a % of the paper balance (capped 10%), payout-aware expected value estimate, and the invalidation level = nearest opposing structural level with its distance. Reads the account balance itself. Use AFTER confluence_read/key_levels agree - this turns analysis into an executable plan.',
+    args: '{"asset": "EURUSD-OTC", "tf": "1m", "side": "auto|call|put", "riskPct": 1, "payout": 0.85}',
+    run: async (a) => {
+      const asset = String(a.asset ?? 'EURUSD')
+      const tf = String(a.tf ?? '1m')
+      const riskPct = Math.min(Math.max(Number(a.riskPct ?? 1), 0.1), 10)
+      const payout = Math.min(Math.max(Number(a.payout ?? 0.85), 0.1), 5)
+      const [accRes, sigRes, anRes, levelsRes] = await Promise.all([
+        coreGet('/account') as Promise<{ ok: boolean; account?: { balance: number } }>,
+        coreGet(`/signal?asset=${encodeURIComponent(asset)}&tf=${tf}`) as Promise<{ ok: boolean; signal?: { direction: string; score: number; confidence: number; price: number } }>,
+        coreGet(`/analysis?asset=${encodeURIComponent(asset)}&tf=${tf}`) as Promise<{ ok: boolean; analysis?: { indicators?: { atrPct?: number; adx?: number } } }>,
+        (async () => {
+          try {
+            const [trend, pivots] = await Promise.all([structuralLevels('trendlines', asset, tf), structuralLevels('pivots', asset, tf)])
+            return [...Object.entries(trend.levels).map(([k, v]) => ({ name: `trend.${k}`, price: v })), ...Object.entries(pivots.levels).map(([k, v]) => ({ name: `pivot.${k}`, price: v }))]
+          } catch {
+            return [] as { name: string; price: number }[]
+          }
+        })(),
+      ])
+      const sig = sigRes.signal
+      if (!sigRes.ok || !sig) return { ok: false, error: 'signal unavailable' }
+      const balance = accRes.account?.balance ?? 0
+      let side = String(a.side ?? 'auto').toLowerCase()
+      if (side === 'auto' || side === '') side = sig.direction !== 'none' ? sig.direction : sig.score >= 0 ? 'call' : 'put'
+      if (side !== 'call' && side !== 'put') return { ok: false, error: 'side must be call|put|auto' }
+
+      const price = sig.price
+      const cands = levelsRes
+      const opposing = cands
+        .filter((l) => (side === 'call' ? l.price < price : l.price > price))
+        .sort((x, y) => (side === 'call' ? y.price - x.price : x.price - y.price))[0]
+      const invalidation = opposing
+        ? { level: opposing.name, price: opposing.price, distPct: Math.round((Math.abs(opposing.price - price) / price) * 10000) / 100 }
+        : null
+      const tfMin = TF_MINUTES[tf] ?? 1
+      const winProb = Math.round((0.5 + (sig.confidence / 100) * 0.15) * 1000) / 1000 // honest 50-65% band
+      const evPerUnit = Math.round((winProb * payout - (1 - winProb)) * 1000) / 1000
+      const stake = Math.min(Math.round(balance * (riskPct / 100) * 100) / 100, Math.round(balance * 0.1 * 100) / 100)
+      return {
+        ok: true,
+        plan: {
+          asset,
+          tf,
+          side,
+          entry: Math.round(price * 1e6) / 1e6,
+          expiryMinutes: tfMin < 1 ? Math.round(tfMin * 60) + 's' : Math.round(tfMin) + 'm',
+          expiryBars: 1,
+          stake,
+          stakeBasis: `${riskPct}% of $${balance.toFixed(2)} balance (cap 10%)`,
+          payout,
+          expectedValuePerTrade: { winProbUsed: winProb, evPerDollar: evPerUnit, evUsd: Math.round(evPerUnit * stake * 100) / 100 },
+          invalidation,
+          signalContext: { score: Math.round(sig.score), confidence: Math.round(sig.confidence), atrPct: anRes.analysis?.indicators?.atrPct, adx: anRes.analysis?.indicators?.adx },
+        },
+        checklist: [
+          `MTF confluence checked? (use confluence_read if not)`,
+          invalidation && invalidation.distPct < 0.02 ? 'WARNING: invalidation level is extremely close - consider skipping' : 'invalidation distance acceptable',
+          'news shock risk? (web_search the asset before big size)',
+        ],
+        note: 'PAPER trade plan - place with place_trade only if the user agrees',
+      }
+    },
+  },
+  {
+    name: 'session_clock',
+    description: 'Live trading-session clock: which of Sydney/Tokyo/London/NewYork sessions are open right now (UTC), the London-NY overlap window (peak forex liquidity), minutes until the next open/close event, weekend OTC note and a liquidity advisory for the current moment. Use when timing matters or the user asks about sessions.',
+    args: '{}',
+    run: async () => {
+      const now = new Date()
+      const h = now.getUTCHours() + now.getUTCMinutes() / 60
+      const day = now.getUTCDay() // 0 Sun .. 6 Sat
+      const sessions = [
+        { name: 'Sydney', open: 21, close: 6 },
+        { name: 'Tokyo', open: 0, close: 9 },
+        { name: 'London', open: 7, close: 16 },
+        { name: 'NewYork', open: 12, close: 21 },
+      ]
+      const isOpen = (s: { open: number; close: number }) => (s.open < s.close ? h >= s.open && h < s.close : h >= s.open || h < s.close)
+      const minsUntil = (target: number) => Math.round(((target - h + 24) % 24) * 60)
+      const openNow = sessions.filter((s) => isOpen(s)).map((s) => s.name)
+      const nextEvents = sessions
+        .flatMap((s) => [
+          { session: s.name, event: 'opens', inMinutes: isOpen(s) ? undefined : minsUntil(s.open) },
+          { session: s.name, event: 'closes', inMinutes: isOpen(s) ? minsUntil(s.close) : undefined },
+        ])
+        .filter((e) => e.inMinutes !== undefined)
+        .sort((x, y) => x.inMinutes! - y.inMinutes!)
+      const londonNyOverlap = h >= 12 && h < 16
+      const weekend = day === 6 || (day === 0 && h < 21) || (day === 5 && h >= 21)
+      return {
+        ok: true,
+        utcTime: now.toISOString().slice(0, 16) + 'Z',
+        sessionsUtc: sessions.map((s) => ({ ...s, window: `${String(s.open).padStart(2, '0')}:00-${String(s.close).padStart(2, '0')}:00` })),
+        openNow,
+        londonNyOverlap,
+        nextEvent: nextEvents[0] ?? null,
+        weekend,
+        advisory: weekend
+          ? 'Weekend: regular forex/stock markets closed - OTC instruments trade around the clock; liquidity is thinner and moves can be choppier.'
+          : londonNyOverlap
+            ? 'London-NY overlap: peak forex liquidity and tighter spreads - strongest session for momentum plays, expect clean trends.'
+            : openNow.length
+              ? `${openNow.join(' + ')} active - normal liquidity. London-NY overlap (12:00-16:00 UTC) is the next liquidity peak.`
+              : 'Between sessions: thinnest liquidity of the day - prefer OTC or wait for the next open.',
+      }
+    },
+  },
+  {
+    name: 'regime_playbook',
+    description: 'Classify the current market regime (TRENDING / RANGING / VOLATILE / MIXED) from ADX, Hurst exponent, Markov regime, realized vol and Bollinger width - then return the matching PLAYBOOK: which strategy families and named strategies fit this regime, which to avoid, and the expiry style that suits it. Use when the user asks "what should I trade here" or before recommending a strategy.',
+    args: '{"asset": "EURUSD-OTC", "tf": "1m"}',
+    run: async (a) => {
+      const asset = String(a.asset ?? 'EURUSD')
+      const tf = String(a.tf ?? '1m')
+      const d = (await coreGet(`/analysis?asset=${encodeURIComponent(asset)}&tf=${tf}`)) as {
+        ok: boolean
+        analysis?: {
+          indicators?: { adx?: number; atrPct?: number; bbWidth?: number }
+          quant?: { hurst?: number; garchVol?: number; ewmaVol?: number; hurstNote?: string }
+          markov?: { regime?: string; trendiness?: number }
+        }
+      }
+      if (!d.ok) return d
+      const ind = d.analysis?.indicators ?? {}
+      const q = d.analysis?.quant ?? {}
+      const mk = d.analysis?.markov ?? {}
+      const adx = ind.adx ?? 0
+      const hurst = q.hurst ?? 0.5
+      const volSpike = (q.garchVol ?? 0) > 1.6 * (q.ewmaVol ?? 0)
+      let regime: 'TRENDING' | 'RANGING' | 'VOLATILE' | 'MIXED'
+      if (volSpike) regime = 'VOLATILE'
+      else if (adx >= 25 && hurst > 0.55) regime = 'TRENDING'
+      else if (adx < 20 && hurst < 0.48) regime = 'RANGING'
+      else regime = 'MIXED'
+      const playbooks: Record<string, { fits: string[]; avoid: string[]; strategies: string[]; expiryStyle: string }> = {
+        TRENDING: {
+          fits: ['continuation entries on pullbacks', 'buying dips / selling rips in the trend direction', 'riding the 4-layer synthesis stacks'],
+          avoid: ['fading extremes (rsi-reversion, bb-bounce)', 'tight mean-reversion targets against the trend'],
+          strategies: ['ema-trend', 'supertrend-follow', 'donchian-breakout', 'vsk-synthesis', 'tsk-synthesis'],
+          expiryStyle: '1-2 bars of the working tf; give pullbacks room to resolve in trend direction',
+        },
+        RANGING: {
+          fits: ['fading range extremes', 'entries at band/pivot edges back to the middle'],
+          avoid: ['breakout chasing (donchian, supertrend)', 'trend-riding with tight trailing stops'],
+          strategies: ['rsi-reversion', 'bb-bounce', 'stoch-cross', 'kalman-ou-reversion'],
+          expiryStyle: '1 bar of the working tf; mean-reversion resolves fast at range edges',
+        },
+        VOLATILE: {
+          fits: ['waiting for the vol spike to decay', 'small size, wide invalidation', 'gap-and-go continuation after shocks settle'],
+          avoid: ['tight-stop scalping', 'oversized positions', 'trading the first bars after the spike'],
+          strategies: ['confluence-core (with high minScore)', 'markov-edge (regime-aware)'],
+          expiryStyle: 'stand aside until garchVol/ewmaVol ratio cools below ~1.3, then resume normal style',
+        },
+        MIXED: {
+          fits: ['waiting for clearer regime', 'small-size probe trades with confluence_read >= 25'],
+          avoid: ['heavy size on ambiguous reads'],
+          strategies: ['confluence-core', 'pattern-confluence', 'markov-edge'],
+          expiryStyle: '1 bar, minimum stake until regime resolves',
+        },
+      }
+      return {
+        ok: true,
+        asset,
+        tf,
+        regime,
+        evidence: { adx: Math.round(adx * 10) / 10, hurst: Math.round(hurst * 1000) / 1000, hurstNote: q.hurstNote, markovRegime: mk.regime, garchVsEwma: q.garchVol && q.ewmaVol ? Math.round((q.garchVol / q.ewmaVol) * 100) / 100 : undefined, atrPct: ind.atrPct, bbWidth: ind.bbWidth },
+        playbook: playbooks[regime],
+        note: 'regime is probabilistic - confirm with confluence_read before committing size',
+      }
+    },
+  },
+  {
+    name: 'strategy_tournament',
+    description: 'Run EVERY registered strategy (13 incl. vsk-synthesis/tsk-synthesis) on one asset+tf with default params via the real binary settlement engine, then rank them by netPnl / winRate / profitFactor / sharpe. The "which edge actually fits THIS instrument" answer in one call. Heavy (13 backtests) - follow up with optimize_strategy + walkforward on the winner.',
+    args: '{"asset": "EURUSD-OTC", "tf": "1m", "amount": 10, "expiryBars": 1, "sortBy": "netPnl"}',
+    run: async (a) => {
+      const asset = String(a.asset ?? 'EURUSD-OTC')
+      const tf = String(a.tf ?? '1m')
+      const sortBy = ['netPnl', 'winRatePct', 'profitFactor', 'sharpe', 'expectancy'].includes(String(a.sortBy)) ? String(a.sortBy) : 'netPnl'
+      type Row = {
+        strategy: string
+        trades: number
+        winRatePct: number
+        netPnl: number
+        profitFactor: number
+        maxDdPct: number
+        sharpe: number
+        expectancy: number
+        error?: string
+      }
+      const d = (await coreGet('/strategies')) as { ok: boolean; strategies?: { id: string }[] }
+      const ids = (d.strategies ?? []).map((s) => s.id)
+      if (!ids.length) return { ok: false, error: 'no strategies registered' }
+      const results = await pool(ids, 4, async (id): Promise<Row> => {
+        try {
+          const r = (await corePost('/backtest', {
+            strategy: id,
+            asset,
+            tf,
+            mode: 'binary',
+            amount: Number(a.amount ?? 10),
+            expiryBars: Number(a.expiryBars ?? 1),
+          })) as { ok: boolean; result?: { metrics?: Record<string, number>; candlesTested?: number } }
+          const m = r.result?.metrics
+          if (!r.ok || !m) return { strategy: id, error: 'backtest failed', trades: 0, winRatePct: 0, netPnl: 0, profitFactor: 0, maxDdPct: 0, sharpe: 0, expectancy: 0 }
+          return {
+            strategy: id,
+            trades: m.totalTrades,
+            winRatePct: Math.round(m.winRate * 10) / 10,
+            netPnl: Math.round(m.netPnl * 100) / 100,
+            profitFactor: Math.round(m.profitFactor * 100) / 100,
+            maxDdPct: Math.round(m.maxDrawdownPct * 10) / 10,
+            sharpe: Math.round(m.sharpe * 10) / 10,
+            expectancy: Math.round(m.expectancy * 100) / 100,
+          }
+        } catch {
+          return { strategy: id, error: 'backtest failed', trades: 0, winRatePct: 0, netPnl: 0, profitFactor: 0, maxDdPct: 0, sharpe: 0, expectancy: 0 }
+        }
+      })
+      const sortKey = sortBy as 'netPnl' | 'winRatePct' | 'profitFactor' | 'sharpe' | 'expectancy'
+      const ranked = results
+        .filter((r) => !r.error)
+        .sort((x, y) => y[sortKey] - x[sortKey])
+      return {
+        ok: true,
+        asset,
+        tf,
+        sortBy,
+        tested: ranked.length,
+        ranking: ranked,
+        podium: ranked.slice(0, 3).map((r) => (r as { strategy: string }).strategy),
+        note: 'default params only - optimize_strategy the podium finishers, then walkforward before deploying a bot',
+      }
+    },
+  },
+  {
+    name: 'correlate',
+    description: 'Pearson correlation between two instruments over a lookback window: full-window correlation, the last-50-bar rolling correlation (does the relationship hold NOW?) and a plain-English interpretation (hedge / diversifier / twins). Use for portfolio thinking, confirmation reads (does BTC lead ETH?) and avoiding doubled exposure.',
+    args: '{"assetA": "BTCUSD", "assetB": "ETHUSD", "tf": "5m", "lookback": 200}',
+    run: async (a) => {
+      const A = String(a.assetA ?? '')
+      const B = String(a.assetB ?? '')
+      if (!A || !B) return { ok: false, error: 'assetA and assetB required' }
+      const tf = String(a.tf ?? '5m')
+      const lookback = Math.min(Math.max(Number(a.lookback ?? 200), 50), 500)
+      const [ra, rb] = await Promise.all([
+        coreGet(`/candles?asset=${encodeURIComponent(A)}&tf=${tf}&limit=${lookback + 1}`) as Promise<{ ok: boolean; candles?: { time: number; close: number }[] }>,
+        coreGet(`/candles?asset=${encodeURIComponent(B)}&tf=${tf}&limit=${lookback + 1}`) as Promise<{ ok: boolean; candles?: { time: number; close: number }[] }>,
+      ])
+      if (!ra.ok || !rb.ok) return { ok: false, error: 'candles unavailable' }
+      const bMap = new Map((rb.candles ?? []).map((c) => [c.time, c.close]))
+      const joined: { ca: number; cb: number }[] = []
+      for (const c of ra.candles ?? []) {
+        const cb = bMap.get(c.time)
+        if (cb !== undefined) joined.push({ ca: c.close, cb })
+      }
+      if (joined.length < 60) return { ok: false, error: `only ${joined.length} aligned bars - try a longer tf` }
+      const retsA = logReturns(joined.map((j) => j.ca))
+      const retsB = logReturns(joined.map((j) => j.cb))
+      const full = pearson(retsA, retsB)
+      const rolling = pearson(retsA.slice(-50), retsB.slice(-50))
+      const verdict =
+        Math.abs(rolling) >= 0.7
+          ? rolling > 0
+            ? 'TWINS - they move together; trading both doubles your exposure'
+            : 'NATURAL HEDGE - one moves against the other; pairing them flattens directional risk'
+          : Math.abs(rolling) >= 0.4
+            ? rolling > 0
+              ? 'LOOSE COUSINS - moderate positive link, partial overlap in exposure'
+              : 'WEAK INVERSE - mild negative link, usable as a soft diversifier'
+            : 'STRANGERS - no meaningful link; good diversification pair'
+      return {
+        ok: true,
+        pair: `${A} vs ${B}`,
+        tf,
+        alignedBars: joined.length,
+        correlation: { fullWindow: full, last50Bars: rolling },
+        interpretation: verdict,
+      }
+    },
+  },
+  {
+    name: 'memory_save',
+    description: 'Save a lasting note to your PERSISTENT MEMORY (SQLite, survives restarts, auto-injected into every future conversation). Use for: user preferences ("prefers EURUSD-OTC 1m, payout >= 0.85"), validated setups ("tsk-synthesis walkforward passed on GBPUSD-OTC 5m, OOS +$42"), standing instructions ("never trade Fridays"), post-trade lessons and risk style. kind: preference|setup|lesson|instruction|note. Keep each note ONE crisp sentence. Also save proactively when the user states something they expect you to remember.',
+    args: '{"kind": "preference", "content": "User prefers EURUSD-OTC 1m binary setups", "tags": "binary,forex"}',
+    run: async (a) => {
+      const content = String(a.content ?? '').trim()
+      if (!content) return { ok: false, error: 'content required' }
+      const r = (await corePost('/notes_save', {
+        kind: a.kind ?? 'note',
+        content,
+        tags: a.tags ? String(a.tags) : undefined,
+      })) as { ok: boolean; id?: number; error?: string }
+      return r.ok ? { ok: true, saved: { id: r.id, content } } : r
+    },
+  },
+  {
+    name: 'memory_recall',
+    description: 'Search your persistent memory notes. Pass q to filter by keyword (searches content, kind and tags) or leave empty for the latest notes. Recall before answering "what do you know about my style", "that setup we validated", or when memory could change your recommendation.',
+    args: '{"q": "setup", "limit": 20}',
+    run: (a) => coreGet(`/notes?q=${encodeURIComponent(String(a.q ?? ''))}&limit=${Math.min(Math.max(Number(a.limit ?? 20), 1), 50)}`),
+  },
+  {
+    name: 'memory_forget',
+    description: 'Delete notes from persistent memory: one note by id (find ids with memory_recall), or all=true to wipe everything - wiping requires the user to explicitly confirm in the conversation, so echo their confirmation in your say field.',
+    args: '{"id": 12}  |  {"all": true}',
+    run: async (a) => {
+      if (a.all === true) {
+        const d = (await coreGet('/notes?limit=100')) as { ok: boolean; notes?: { id: number }[] }
+        const ids = (d.notes ?? []).map((n) => n.id)
+        for (const id of ids) await corePost('/notes_delete', { id })
+        return { ok: true, wiped: ids.length }
+      }
+      const id = Number(a.id ?? 0)
+      if (!id) return { ok: false, error: 'pass note id or all=true' }
+      return corePost('/notes_delete', { id })
+    },
+  },
   // ---------- OS control (executed client-side) ----------
   {
     name: 'ui_control',
@@ -781,6 +1326,8 @@ The OS also ships TWO sibling 4-layer SYNTHESIS stacks, both exposed as indicato
 2) TSK SYNTHESIS - the VOLUME-FREE sibling: L1 is a least-squares TRENDLINE z-score (price stretched N sigmas off the fitted trend = deviation channel; needs no volume at all) with the same L2 squeeze / L3 Kalman / L4 PSAR-on-curve layers. Indicators "tsk" / "tsk-z", strategy "tsk-synthesis", stress test tsk_montecarlo.
 All of them work in run_strategy / backtest / optimize_strategy / walkforward / asset_sweep / bot_create. When the user says "the algorithm", "the 4-layer stack", "VSK", "TSK", "trendline version" or asks to stress-test one, use those tools and explain which layer is blocking or firing (the strategy result notes name the layer). Prefer TSK when the user wants volume independence, VSK when volume weighting matters.
 STRUCTURAL chart tools (drawing-tool family, category "structural" in list_indicators): "pivots" (floor pivot points PP/R1-R3/S1-S3, variants classic/fibonacci/camarilla/woodie, session-based), "fib" (auto Fibonacci retracement 0-100% + 1.272/1.618 extensions of the last swing), "trendlines" (auto S/R trendlines from fractal swing pivots), "fvg" (fair value gaps - 3-bar imbalance zones tracked until filled). Add them to the user's chart with ui_control when they ask for pivot points, fibonacci, trendlines or liquidity gaps - e.g. add pivots + fib before a level-based read.
+POWER PIPELINE - your composed analysis stack: "confluence_read" fuses MTF agreement + composite signal + Markov edge + candle bias into one score with a verdict (THE pre-trade check), "key_levels" returns the full structural level map (pivots + fib + trendlines + FVGs) with distances and the nearest S/R, "regime_playbook" classifies TRENDING/RANGING/VOLATILE/MIXED and names the strategies that fit, "build_trade_plan" turns a confirmed direction into an executable plan (entry, expiry, stake sized from balance, payout-aware EV, structural invalidation level), "session_clock" shows which sessions are open and the London-NY overlap, "strategy_tournament" runs ALL 13 strategies on an instrument and ranks them, "correlate" measures the live relationship between two instruments (twins / hedge / strangers), and "web_search" reads the LIVE WEB for news, economic events and the "why" behind moves. Recommended flow for "should I trade X?": regime_playbook -> confluence_read -> key_levels -> web_search (if news could matter) -> build_trade_plan -> place_trade only if the user agrees.
+YOU HAVE PERSISTENT MEMORY: notes you save with memory_save survive restarts and are AUTO-INJECTED into every future conversation (see YOUR PERSISTENT MEMORY in the context). Proactively save user preferences, validated setups, standing instructions ("never trade Fridays") and post-trade lessons; recall with memory_recall before answering style/setup questions; delete outdated ones with memory_forget. When the user says "remember that..." - always memory_save it.
 The OS runs in a global OPERATING MODE (os_mode_status / os_mode_set / autotrader_configure): "human" = HUMAN-IN-THE-LOOP, every trade needs the user and bot orders are suspended by the mode gate (configs preserved); "auto" = NO-HUMAN-IN-THE-LOOP, the OS trades autonomously - armed bots run and the built-in AUTO-TRADER takes the strongest screener signals on its own. NEVER set mode to "auto" unless the user explicitly asks for it ("no human", "autonomous", "let it trade by itself") - entering no-human mode without an explicit request is a hard violation. When a bot order is rejected with a "mode-gate:" reason, explain that the OS is in HUMAN mode and autonomy is suspended by design. If a bot order is rejected with a "watchdog:" reason, explain that the strategy is degrading vs its baseline - never suggest bypassing it; if a bot is on WATCH, surface the numbers and recommend re-validating with the research workflow. If a trade or bot order is rejected with a "sentinel:" reason, explain which limit or breaker fired - never suggest workarounds, limits are there to protect the account; resume only when the user explicitly accepts the risk.
 
 Tool protocol - follow it EXACTLY:
@@ -956,6 +1503,17 @@ async function buildContextBlock(ui: UiContext): Promise<string> {
     .filter(Boolean)
     .join(', ')
   lines.push(`- User is viewing: ${view || 'unknown'}`)
+  // persistent copilot memory - auto-injected so the agent ALWAYS knows what
+  // it has previously learned about this user (preferences, setups, lessons)
+  try {
+    const mem = (await coreGet('/notes?limit=12')) as { ok: boolean; notes?: { id: number; kind: string; content: string }[] }
+    if (mem.ok && mem.notes?.length) {
+      lines.push(`- YOUR PERSISTENT MEMORY (${mem.notes.length} notes, newest first - these survive restarts; update them via memory_save/memory_forget):`)
+      for (const n of mem.notes.slice(0, 12)) lines.push(`  · [${n.kind}] ${n.content}`)
+    }
+  } catch {
+    /* memory is best-effort */
+  }
   return `OS CONTEXT (live, ${new Date().toISOString().slice(0, 16).replace('T', ' ')} UTC):\n${lines.join('\n')}`
 }
 

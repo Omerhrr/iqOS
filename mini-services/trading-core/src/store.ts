@@ -67,6 +67,14 @@ export class Store {
         content TEXT NOT NULL,
         meta TEXT
       );
+      CREATE TABLE IF NOT EXISTS copilot_notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'note',
+        content TEXT NOT NULL,
+        tags TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_copilot_notes_ts ON copilot_notes(ts);
       CREATE TABLE IF NOT EXISTS bots (
         id TEXT PRIMARY KEY,
         config TEXT NOT NULL,
@@ -328,6 +336,36 @@ export class Store {
     const row = this.db.query('SELECT COUNT(*) as n FROM chat_messages WHERE session_id = ?').get(sessionId) as { n: number }
     this.db.run('DELETE FROM chat_messages WHERE session_id = ?', [sessionId])
     return row.n ?? 0
+  }
+
+  // ---------- copilot persistent memory ----------
+
+  saveNote(kind: string, content: string, tags?: string): { id: number; ts: number } {
+    const ts = Math.floor(Date.now() / 1000)
+    const out = this.db
+      .query('INSERT INTO copilot_notes (ts, kind, content, tags) VALUES (?, ?, ?, ?) RETURNING id, ts')
+      .get(ts, kind, content, tags ?? null) as { id: number; ts: number } | null
+    return { id: out?.id ?? 0, ts }
+  }
+
+  listNotes(q: string, limit = 30): { id: number; ts: number; kind: string; content: string; tags: string | null }[] {
+    const lim = Math.min(Math.max(limit, 1), 100)
+    if (q) {
+      const like = `%${q.toLowerCase()}%`
+      return this.db
+        .query(
+          "SELECT id, ts, kind, content, tags FROM copilot_notes WHERE lower(content) LIKE ? OR lower(kind) LIKE ? OR lower(coalesce(tags,'')) LIKE ? ORDER BY id DESC LIMIT ?"
+        )
+        .all(like, like, like, lim) as unknown as { id: number; ts: number; kind: string; content: string; tags: string | null }[]
+    }
+    return this.db
+      .query('SELECT id, ts, kind, content, tags FROM copilot_notes ORDER BY id DESC LIMIT ?')
+      .all(lim) as unknown as { id: number; ts: number; kind: string; content: string; tags: string | null }[]
+  }
+
+  deleteNote(id: number): boolean {
+    const res = this.db.run('DELETE FROM copilot_notes WHERE id = ?', [id])
+    return res.changes > 0
   }
 
   // ---------- autopilot bots ----------
