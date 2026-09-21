@@ -300,10 +300,17 @@ export function compositeSignal(
   pBias: number,
   ou: OULive
 ): CompositeSignal {
-  const factors = buildFactors(candles, ind, quant, markov, pBias, ou)
+  const factors = buildFactors(candles, ind, quant, markov, pBias, ou).map((f) => ({
+    ...f,
+    // NaN votes/values (warming-up markov/hurst/OU) JSON.stringify to null and crash the
+    // web SignalPanel ("Cannot read properties of null (reading 'toFixed')") - ground them
+    value: Number.isFinite(f.value) ? f.value : 0,
+    vote: Number.isFinite(f.vote) ? f.vote : 0,
+  }))
   const totalWeight = factors.reduce((a, f) => a + f.weight, 0)
   const raw = factors.reduce((a, f) => a + f.vote * f.weight, 0)
-  const score = clamp((raw / (totalWeight * 2)) * 100, -100, 100)
+  const scoreRaw = clamp((raw / (totalWeight * 2)) * 100, -100, 100)
+  const score = Number.isFinite(scoreRaw) ? scoreRaw : 0
   const active = factors.filter((f) => Math.abs(f.vote) > 0.15)
   const agreeing = active.filter((f) => Math.sign(f.vote) === Math.sign(score) && score !== 0)
   const confidence =
