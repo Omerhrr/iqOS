@@ -1,7 +1,9 @@
 'use client'
 
-// IQAIR//OS - Chart workspace: 8 chart types + dynamic registry overlays
-import { useEffect, useMemo, useRef, useState } from 'react'
+// IQAIR//OS - Chart workspace: 8 chart types + dynamic registry overlays.
+// No default indicators - the chart starts clean and the operator's picker
+// selection (persisted in localStorage) is the single source of overlays.
+import { useCallback, useEffect, useMemo, useRef } from 'react'
 import {
   AreaSeries,
   BarSeries,
@@ -17,11 +19,11 @@ import {
   type IPriceLine,
   type ISeriesApi,
   type ISeriesMarkersPluginApi,
+  type LineWidth,
   type SeriesMarker,
   type Time,
   type UTCTimestamp,
 } from 'lightweight-charts'
-import { Button } from '@/components/ui/button'
 import type { AnalysisResult, Candle, ChartType, IndicatorSeries, Position } from '@/lib/os/client'
 import { chartPriceFormat, fmtPrice } from '@/lib/os/client'
 
@@ -49,18 +51,17 @@ const DOWN = '#f43f5e'
 const GRID = 'rgba(28,39,57,0.55)'
 const TEXT = '#7c8aa5'
 
-interface OverlayToggles {
-  ema20: boolean
-  ema50: boolean
-  ema200: boolean
-  bb: boolean
-  supertrend: boolean
-  vwap: boolean
-}
-
-const DEFAULT_TOGGLES: OverlayToggles = { ema20: true, ema50: true, ema200: false, bb: false, supertrend: true, vwap: false }
-
 // ---------- transforms ----------
+
+/** Latest candle open time <= ts (renko/heikin display times differ from feed times). */
+function snapToCandle(candles: Candle[], ts: number): UTCTimestamp | null {
+  let t: number | null = null
+  for (const c of candles) {
+    if (c.time <= ts) t = c.time
+    else break
+  }
+  return t as UTCTimestamp | null
+}
 
 function heikinAshi(candles: Candle[]): Candle[] {
   const out: Candle[] = []
@@ -141,8 +142,10 @@ export default function ChartPanel({
   // (the library default of 2 decimals turns 1.10283 into 1.10)
   const priceFmt = useMemo(() => chartPriceFormat(digitsTicker, price), [digitsTicker, price])
   const overlayRefs = useRef<Map<string, ISeriesApi<'Line'>>>(new Map())
-  const builtinRef = useRef<{ ema20?: ISeriesApi<'Line'>; ema50?: ISeriesApi<'Line'>; ema200?: ISeriesApi<'Line'>; bbUp?: ISeriesApi<'Line'>; bbLo?: ISeriesApi<'Line'>; st?: ISeriesApi<'Line'>; vwap?: ISeriesApi<'Line'> }>({})
-  const [toggles, setToggles] = useState<OverlayToggles>(DEFAULT_TOGGLES)
+  // registry indicator markers (fractal arrows) + trade markers merge into ONE
+  // setMarkers payload on the price series - two refs, one plugin
+  const indMarkersRef = useRef<SeriesMarker<Time>[]>([])
+  const tradeMarkersRef = useRef<SeriesMarker<Time>[]>([])
 
   const tfSec = useMemo(() => {
     if (!candles || candles.length < 2) return 60
@@ -215,28 +218,16 @@ export default function ChartPanel({
     price.applyOptions({ priceFormat: priceFmt })
     priceSeriesRef.current = price
 
-    // built-in overlay series (fresh per chart)
-    const mk = (color: string, style: LineStyle = LineStyle.Solid, width: 1 | 2 = 1) =>
-      chart.addSeries(LineSeries, { color, lineWidth: width, lineStyle: style, priceLineVisible: false, lastValueVisible: false })
-    builtinRef.current = {
-      ema20: mk('#38bdf8'),
-      ema50: mk('#f59e0b'),
-      ema200: mk('#c084fc', LineStyle.Solid, 2),
-      bbUp: mk('rgba(148,163,184,0.5)', LineStyle.Dashed),
-      bbLo: mk('rgba(148,163,184,0.5)', LineStyle.Dashed),
-      st: mk('#a78bfa', LineStyle.Solid, 2),
-      vwap: mk('#e879f9'),
-    }
-
     return () => {
       chart.remove()
       chartRef.current = null
       priceSeriesRef.current = null
       volRef.current = null
-      builtinRef.current = {}
       overlayRefs.current.clear()
       entryLineRefs.current.clear()
       markersRef.current = null
+      indMarkersRef.current = []
+      tradeMarkersRef.current = []
     }
   }, [chartType])
 
@@ -271,28 +262,9 @@ export default function ChartPanel({
     priceSeriesRef.current?.applyOptions({ priceFormat: priceFmt })
   }, [priceFmt, digitsTicker])
 
-  // built-in overlay data + toggle visibility
-  useEffect(() => {
-    const { ema20, ema50, ema200, bbUp, bbLo, st, vwap } = builtinRef.current
-    if (!analysis || !ema20 || !ema50 || !ema200 || !bbUp || !bbLo || !st || !vwap || !chartRef.current) return
-    const toPts = (arr: { time: number; value: number }[]) => arr.map((p) => ({ time: p.time as UTCTimestamp, value: p.value }))
-    ema20.setData(toPts(analysis.indicatorSeries.ema20))
-    ema50.setData(toPts(analysis.indicatorSeries.ema50))
-    ema200.setData(toPts(analysis.indicatorSeries.ema200))
-    bbUp.setData(toPts(analysis.indicatorSeries.bbUpper))
-    bbLo.setData(toPts(analysis.indicatorSeries.bbLower))
-    st.setData(analysis.indicatorSeries.supertrend.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })))
-    vwap.setData(toPts(analysis.indicatorSeries.vwap))
-    ema20.applyOptions({ visible: toggles.ema20 })
-    ema50.applyOptions({ visible: toggles.ema50 })
-    ema200.applyOptions({ visible: toggles.ema200 })
-    bbUp.applyOptions({ visible: toggles.bb })
-    bbLo.applyOptions({ visible: toggles.bb })
-    st.applyOptions({ visible: toggles.supertrend })
-    vwap.applyOptions({ visible: toggles.vwap })
-  }, [analysis, toggles, chartType])
-
-  // registry overlays: create/remove line series on the live chart
+  // registry overlays: create/remove line series on the live chart. The
+  // 'dots' style renders traditional point markers (Parabolic SAR) with no
+  // connecting line via the series' point-marker options.
   useEffect(() => {
     const chart = chartRef.current
     if (!chart) return
@@ -303,9 +275,13 @@ export default function ChartPanel({
         seen.add(key)
         let series = overlayRefs.current.get(key)
         if (!series) {
+          const isDots = ln.style === 'dots'
           series = chart.addSeries(LineSeries, {
             color: ln.color,
-            lineWidth: 1,
+            lineWidth: (ln.width ?? 1) as LineWidth,
+            lineVisible: !isDots,
+            pointMarkersVisible: isDots,
+            pointMarkersRadius: isDots ? 1 : undefined,
             lineStyle: lineStyleMap[ln.style ?? 'solid'] ?? LineStyle.Solid,
             priceLineVisible: false,
             lastValueVisible: false,
@@ -333,6 +309,47 @@ export default function ChartPanel({
     }
   }, [overlays, chartType])
 
+  // single markers plugin on the price series; indicator arrows (fractals)
+  // and trade entry/settle markers both feed the same payload
+  const ensureMarkerApi = useCallback(() => {
+    const series = priceSeriesRef.current
+    if (!series) return null
+    if (!markersRef.current || markersRef.current.series !== series) {
+      markersRef.current = { series, api: createSeriesMarkers(series, []) }
+    }
+    return markersRef.current.api
+  }, [])
+
+  const applyMarkers = useCallback(() => {
+    if (!markersRef.current) return
+    const all = [...indMarkersRef.current, ...tradeMarkersRef.current]
+    all.sort((a, b) => Number(a.time) - Number(b.time))
+    markersRef.current.api.setMarkers(all)
+  }, [])
+
+  // registry indicator markers (Williams fractal arrows) - times snap to the
+  // displayed candle grid (heikin/renko remap times), then merge via applyMarkers
+  useEffect(() => {
+    const out: SeriesMarker<Time>[] = []
+    for (const s of overlays) {
+      for (const m of s.markers ?? []) {
+        const t = snapToCandle(displayCandles, m.time)
+        if (t === null) continue
+        out.push({
+          time: t,
+          position: m.position,
+          shape: m.shape,
+          color: m.color,
+          text: m.text,
+          size: m.size ?? 1,
+        })
+      }
+    }
+    indMarkersRef.current = out
+    ensureMarkerApi()
+    applyMarkers()
+  }, [overlays, displayCandles, chartType, ensureMarkerApi, applyMarkers])
+
   // trade overlay: one dashed price line per open position on this asset
   // (green CALL / red PUT, titled with kind + stake + expiry countdown) and
   // markers pinning entries - arrows for open trades, faded arrows + a
@@ -344,14 +361,6 @@ export default function ChartPanel({
     const series = priceSeriesRef.current
     if (!series) return
     const lastT = displayCandles.length ? displayCandles[displayCandles.length - 1].time : 0
-    const snap = (ts: number): UTCTimestamp | null => {
-      let t: number | null = null
-      for (const c of displayCandles) {
-        if (c.time <= ts) t = c.time
-        else break
-      }
-      return t as UTCTimestamp | null
-    }
     const open = (positions ?? []).filter((p) => p.status === 'open' && p.asset === digitsTicker)
     const seen = new Set<string>()
     for (const p of open) {
@@ -405,12 +414,10 @@ export default function ChartPanel({
       }
     }
 
-    if (!markersRef.current || markersRef.current.series !== series) {
-      markersRef.current = { series, api: createSeriesMarkers(series, []) }
-    }
+    ensureMarkerApi()
     const markers: SeriesMarker<Time>[] = []
     for (const p of open) {
-      const t = snap(p.tsOpen)
+      const t = snapToCandle(displayCandles, p.tsOpen)
       if (t === null) continue
       const isCall = p.side === 'call'
       markers.push({
@@ -426,7 +433,7 @@ export default function ChartPanel({
     for (const p of (settledPositions ?? []).filter((q) => q.asset === digitsTicker).slice(0, 30)) {
       const col = p.pnl === undefined ? '#7c8aa5' : p.pnl > 0 ? UP : p.pnl < 0 ? DOWN : '#7c8aa5'
       const isCall = p.side === 'call'
-      const entryT = snap(p.tsOpen)
+      const entryT = snapToCandle(displayCandles, p.tsOpen)
       if (entryT !== null) {
         markers.push({
           time: entryT,
@@ -437,7 +444,7 @@ export default function ChartPanel({
           size: 1,
         })
       }
-      const exitT = p.tsClose ? snap(p.tsClose) : null
+      const exitT = p.tsClose ? snapToCandle(displayCandles, p.tsClose) : null
       if (exitT !== null) {
         markers.push({
           time: exitT,
@@ -449,9 +456,9 @@ export default function ChartPanel({
         })
       }
     }
-    markers.sort((a, b) => Number(a.time) - Number(b.time))
-    markersRef.current.api.setMarkers(markers)
-  }, [positions, settledPositions, digitsTicker, chartType, displayCandles, tfSec])
+    tradeMarkersRef.current = markers
+    applyMarkers()
+  }, [positions, settledPositions, digitsTicker, chartType, displayCandles, tfSec, ensureMarkerApi, applyMarkers])
 
   const lastCandle = candles[candles.length - 1]
   const lastUp = lastCandle ? lastCandle.close >= lastCandle.open : true
@@ -496,34 +503,6 @@ export default function ChartPanel({
         >
           ⤢
         </button>
-      </div>
-
-      {/* built-in overlay toggles */}
-      <div className="absolute right-3 top-2 z-10 flex flex-wrap gap-1">
-        {(
-          [
-            ['ema20', 'EMA20', '#38bdf8'],
-            ['ema50', 'EMA50', '#f59e0b'],
-            ['ema200', 'EMA200', '#c084fc'],
-            ['bb', 'BOLL', '#94a3b8'],
-            ['supertrend', 'ST', '#a78bfa'],
-            ['vwap', 'VWAP', '#e879f9'],
-          ] as [keyof OverlayToggles, string, string][]
-        ).map(([key, label, color]) => (
-          <Button
-            key={key}
-            variant="outline"
-            size="sm"
-            onClick={() => setToggles((t) => ({ ...t, [key]: !t[key] }))}
-            className="h-6 rounded-full border-[#1c2739] bg-[#0d1420] px-2 text-[10px] tracking-wide"
-            style={{
-              color: toggles[key] ? color : '#4b5a72',
-              borderColor: toggles[key] ? `${color}66` : '#1c2739',
-            }}
-          >
-            {label}
-          </Button>
-        ))}
       </div>
 
       <div ref={elRef} className="min-h-0 flex-1" />

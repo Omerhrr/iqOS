@@ -414,13 +414,26 @@ export interface IndicatorParamDef {
 export interface IndicatorLine {
   key: string
   color: string
-  style?: 'solid' | 'dashed' | 'dotted'
+  style?: 'solid' | 'dashed' | 'dotted' | 'dots' // 'dots' = point-markers only, no connecting line (Parabolic SAR)
   width?: 1 | 2
   values: number[]
 }
 
+/** Chart marker pinned to a bar (fractal arrows, swing labels). Rendered by the
+ *  markers plugin on the price series: aboveBar/belowBar relative to the candle. */
+export interface IndicatorMarker {
+  time: number // epoch seconds - must match a candle open time
+  position: 'aboveBar' | 'belowBar'
+  shape: 'arrowUp' | 'arrowDown' | 'circle' | 'square'
+  color: string
+  text?: string
+  size?: number
+}
+
 export interface IndicatorOutput {
   lines: IndicatorLine[]
+  /** bar markers instead of / besides lines (Williams fractal arrows) */
+  markers?: IndicatorMarker[]
   /** optional histogram series (MACD hist, CMF...) */
   hist?: { values: number[]; color: 'updown' | string }
   /** horizontal reference levels (RSI 30/70 ...) */
@@ -449,7 +462,8 @@ export interface IndicatorSeriesResponse {
   pane: 'overlay' | 'sub'
   params: Record<string, number>
   time: number[]
-  lines: { key: string; color: string; style?: string; values: (number | null)[] }[]
+  lines: { key: string; color: string; style?: string; width?: number; values: (number | null)[] }[]
+  markers?: IndicatorMarker[]
   hist?: { values: (number | null)[]; color: string }[]
   levels?: number[]
   bands?: [number, number]

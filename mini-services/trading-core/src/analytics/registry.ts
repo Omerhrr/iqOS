@@ -15,7 +15,7 @@ import {
 
 const isn = TA.isn
 
-const line = (key: string, color: string, values: number[], style?: 'solid' | 'dashed' | 'dotted', width?: 1 | 2): IndicatorOutput['lines'][number] => ({
+const line = (key: string, color: string, values: number[], style?: 'solid' | 'dashed' | 'dotted' | 'dots', width?: 1 | 2): IndicatorOutput['lines'][number] => ({
   key,
   color,
   style,
@@ -722,10 +722,10 @@ const trend: IndicatorDef[] = [
   {
     id: 'psar', name: 'Parabolic SAR', category: 'trend', pane: 'overlay',
     params: [p('step', 'AF Step', 0.005, 0.1, 0.02, 0.005), p('max', 'AF Max', 0.1, 0.5, 0.2, 0.01)],
-    description: 'Parabolic SAR stop-and-reverse dots.',
+    description: 'Parabolic SAR stop-and-reverse dots (traditional point-marker rendering).',
     compute: (c, par) => {
       const sar = TA.parabolicSar(TA.highs(c), TA.lows(c), num(c, par, 'step', 0.02), num(c, par, 'max', 0.2))
-      return { lines: [line('sar', C.yellow, sar)] }
+      return { lines: [line('sar', C.yellow, sar, 'dots')] }
     },
   },
   {
@@ -764,13 +764,25 @@ const trend: IndicatorDef[] = [
   },
   {
     id: 'zigzag', name: 'ZigZag', category: 'trend', pane: 'overlay',
-    params: [p('dev', 'Deviation %', 1, 30, 5, 0.5)],
-    description: 'ZigZag pivots beyond N% deviation.',
+    params: [p('dev', 'Deviation %', 0.02, 30, 0.05, 0.01)],
+    description: 'ZigZag swing pivots beyond N% deviation, straight segments joined between reversals.',
     compute: (c, par) => {
-      const zz = TA.zigzag(TA.closes(c), num(c, par, 'dev', 5))
-      const sparse = new Array<number>(c.length).fill(NaN)
-      for (let i = 0; i < zz.time.length; i++) sparse[zz.time[i]] = zz.value[i]
-      return { lines: [line('zz', C.yellow, sparse, 'solid', 2)] }
+      const zz = TA.zigzag(TA.closes(c), num(c, par, 'dev', 0.05))
+      // sparse pivots + linear interpolation between consecutive pivots:
+      // an isolated point between NaN gaps draws no line segment, so the
+      // classic zigzag look requires every bar between two pivots to carry
+      // the interpolated segment value
+      const zzLine = new Array<number>(c.length).fill(NaN)
+      for (let i = 0; i < zz.time.length; i++) zzLine[zz.time[i]] = zz.value[i]
+      for (let k = 0; k < zz.time.length - 1; k++) {
+        const a = zz.time[k]
+        const b = zz.time[k + 1]
+        const va = zz.value[k]
+        const vb = zz.value[k + 1]
+        if (!Number.isFinite(va) || !Number.isFinite(vb) || b <= a) continue
+        for (let i = a + 1; i < b; i++) zzLine[i] = va + ((vb - va) * (i - a)) / (b - a)
+      }
+      return { lines: [line('zz', C.yellow, zzLine, 'solid', 2)] }
     },
   },
   {
@@ -1018,16 +1030,24 @@ const extras2: IndicatorDef[] = [
     },
   },
   {
-    id: 'fractals', name: 'Williams Fractals', category: 'trend', pane: 'overlay', params: [],
-    description: 'Bill Williams fractal highs/lows - swing markers.',
-    compute: (c) => {
-      const fh = new Array<number>(c.length).fill(NaN)
-      const fl = new Array<number>(c.length).fill(NaN)
-      for (let i = 2; i < c.length - 2; i++) {
-        if (c[i].high >= c[i - 1].high && c[i].high >= c[i - 2].high && c[i].high >= c[i + 1].high && c[i].high >= c[i + 2].high) fh[i] = c[i].high
-        if (c[i].low <= c[i - 1].low && c[i].low <= c[i - 2].low && c[i].low <= c[i + 1].low && c[i].low <= c[i + 2].low) fl[i] = c[i].low
+    id: 'fractals', name: 'Williams Fractals', category: 'trend', pane: 'overlay',
+    params: [p('wing', 'Wing Bars', 2, 6, 2)],
+    description: 'Bill Williams fractal arrows: down-arrow above swing highs, up-arrow below swing lows (confirmed by the right wing - non-repainting).',
+    compute: (c, par) => {
+      const w = Math.max(2, Math.round(num(c, par, 'wing', 2)))
+      const markers: NonNullable<IndicatorOutput['markers']> = []
+      for (let i = w; i < c.length - w; i++) {
+        let isHigh = true
+        let isLow = true
+        for (let j = 1; j <= w; j++) {
+          if (c[i].high < c[i - j].high || c[i].high < c[i + j].high) isHigh = false
+          if (c[i].low > c[i - j].low || c[i].low > c[i + j].low) isLow = false
+          if (!isHigh && !isLow) break
+        }
+        if (isHigh) markers.push({ time: c[i].time, position: 'aboveBar', shape: 'arrowDown', color: C.red, size: 1 })
+        if (isLow) markers.push({ time: c[i].time, position: 'belowBar', shape: 'arrowUp', color: C.green, size: 1 })
       }
-      return { lines: [line('fh', C.red, fh), line('fl', C.green, fl)] }
+      return { lines: [], markers }
     },
   },
   {
@@ -1130,7 +1150,7 @@ const vskIndicators: IndicatorDef[] = [
         lines: [
           line('vwap', C.slate, s.vwap, 'dashed'),
           line('kalman', C.violet, s.kalman, 'solid', 2),
-          line('sar', C.teal, s.sar, 'dotted'),
+          line('sar', C.teal, s.sar, 'dots'),
         ],
         note: `L1 VWAP boundary · L2 squeeze gate · L3 Kalman curve · L4 PSAR trigger`,
       }
@@ -1190,7 +1210,7 @@ const tskIndicators: IndicatorDef[] = [
           line('chanUp', C.slate, chanUp, 'dotted'),
           line('chanDn', C.slate, chanDn, 'dotted'),
           line('kalman', C.violet, s.kalman, 'solid', 2),
-          line('sar', C.teal, s.sar, 'dotted'),
+          line('sar', C.teal, s.sar, 'dots'),
         ],
         note: `L1 trendline ±${ze}σ channel · L2 squeeze gate · L3 Kalman curve · L4 PSAR trigger`,
       }

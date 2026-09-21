@@ -98,7 +98,15 @@ export interface IndicatorSeries {
   pane: 'overlay' | 'sub'
   params: Record<string, number>
   time: number[]
-  lines: { key: string; color: string; style?: string; values: (number | null)[] }[]
+  lines: { key: string; color: string; style?: string; width?: number; values: (number | null)[] }[]
+  markers?: {
+    time: number
+    position: 'aboveBar' | 'belowBar'
+    shape: 'arrowUp' | 'arrowDown' | 'circle' | 'square'
+    color: string
+    text?: string
+    size?: number
+  }[]
   hist?: { values: (number | null)[]; color: string }
   levels?: number[]
   bands?: [number, number]

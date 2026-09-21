@@ -53,6 +53,10 @@ interface ActiveIndicator {
   params?: Record<string, number>
 }
 
+// indicator selection persistence - the chart starts CLEAN (no default
+// overlays) and whatever the operator adds survives a page refresh
+const INDICATOR_STORAGE_KEY = 'iqos.activeIndicators.v1'
+
 /** Desktop = the resizable 3-dock workspace; below lg the OS stacks into one scrollable column. */
 function useIsDesktop() {
   const [isDesktop, setIsDesktop] = useState(false)
@@ -93,6 +97,32 @@ export default function OSPage() {
   const [activeOverlays, setActiveOverlays] = useState<ActiveIndicator[]>([])
   const [activeSubs, setActiveSubs] = useState<ActiveIndicator[]>([])
   const [overlaySeries, setOverlaySeries] = useState<IndicatorSeries[]>([])
+  // localStorage hydration gate: first render matches the server (empty),
+  // the saved selection is restored post-mount, then every change is saved
+  const [indicatorsHydrated, setIndicatorsHydrated] = useState(false)
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(INDICATOR_STORAGE_KEY)
+      if (raw) {
+        const d = JSON.parse(raw) as { overlays?: ActiveIndicator[]; subs?: ActiveIndicator[] }
+        const valid = (a: unknown): a is ActiveIndicator[] =>
+          Array.isArray(a) && a.every((o) => o && typeof o === 'object' && typeof (o as ActiveIndicator).id === 'string')
+        if (valid(d.overlays)) setActiveOverlays(d.overlays)
+        if (valid(d.subs)) setActiveSubs(d.subs)
+      }
+    } catch {
+      /* corrupt storage - start clean */
+    }
+    setIndicatorsHydrated(true)
+  }, [])
+  useEffect(() => {
+    if (!indicatorsHydrated) return
+    try {
+      window.localStorage.setItem(INDICATOR_STORAGE_KEY, JSON.stringify({ overlays: activeOverlays, subs: activeSubs }))
+    } catch {
+      /* storage unavailable (private mode) - selection just won't persist */
+    }
+  }, [indicatorsHydrated, activeOverlays, activeSubs])
   const pricesRef = useRef<Record<string, { price: number; dir: number }>>({})
   const isDesktop = useIsDesktop()
 
