@@ -396,11 +396,92 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
   const [busy, setBusy] = useState(false)
   const [status, setStatus] = useState('')
   const [loaded, setLoaded] = useState(false)
+  const [speaking, setSpeaking] = useState(false)
+  const [autoSpeak, setAutoSpeak] = useState(false)
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const stickRef = useRef(true)
   const abortRef = useRef<AbortController | null>(null)
   const uiRef = useRef(onUiCommand)
   uiRef.current = onUiCommand
+  // voice: singleton audio element + generation counter so a newer speak()
+  // always supersedes an older one
+  const audioRef = useRef<HTMLAudioElement | null>(null)
+  const speakSeqRef = useRef(0)
+  const autoSpeakRef = useRef(false)
+
+  // restore persisted voice preference
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem('iqos.copilot.autoSpeak') === '1'
+      setAutoSpeak(saved)
+      autoSpeakRef.current = saved
+    } catch {
+      /* private mode - default off */
+    }
+  }, [])
+
+  const stopSpeak = useCallback(() => {
+    speakSeqRef.current += 1
+    const a = audioRef.current
+    if (a) {
+      a.pause()
+      a.src = ''
+    }
+    setSpeaking(false)
+  }, [])
+
+  const speak = useCallback(
+    async (text: string) => {
+      const clean = text
+        .replace(/```[\s\S]*?```/g, ' (code block omitted). ')
+        .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+        .replace(/[#*_>`|]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+      if (!clean) return
+      stopSpeak()
+      const seq = ++speakSeqRef.current
+      setSpeaking(true)
+      try {
+        const res = await fetch('/api/tts', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ text: clean }),
+        })
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const blob = await res.blob()
+        if (seq !== speakSeqRef.current) return // superseded while generating
+        const url = URL.createObjectURL(blob)
+        const audio = audioRef.current ?? new Audio()
+        audioRef.current = audio
+        audio.src = url
+        audio.onended = () => {
+          URL.revokeObjectURL(url)
+          setSpeaking(false)
+        }
+        audio.onerror = () => {
+          URL.revokeObjectURL(url)
+          setSpeaking(false)
+        }
+        await audio.play()
+      } catch {
+        if (seq === speakSeqRef.current) setSpeaking(false)
+      }
+    },
+    [stopSpeak]
+  )
+
+  const toggleAutoSpeak = () => {
+    const next = !autoSpeakRef.current
+    autoSpeakRef.current = next
+    setAutoSpeak(next)
+    try {
+      window.localStorage.setItem('iqos.copilot.autoSpeak', next ? '1' : '0')
+    } catch {
+      /* ignore */
+    }
+    if (!next) stopSpeak()
+  }
 
   // restore persisted history
   useEffect(() => {
@@ -532,6 +613,8 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
                 gotFinal = true
                 setStatus('')
                 pushEvent({ kind: 'final', text: String(ev.text ?? '') })
+                // voice mode: speak the answer as soon as it lands
+                if (autoSpeakRef.current && ev.text) void speak(String(ev.text))
                 break
               case 'error':
                 lastError = String(ev.message ?? 'agent error')
@@ -602,9 +685,18 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
         <h3 className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">
           <span className={`h-1.5 w-1.5 rounded-full ${busy ? 'animate-pulse bg-cyan-400 shadow-[0_0_6px_#22d3ee]' : 'bg-cyan-400 shadow-[0_0_6px_#22d3ee]'}`} />
           OS Copilot
-          <span className="rounded bg-[#101828] px-1 py-0.5 text-[8px] font-mono tracking-normal text-cyan-400">v2 · 46 tools</span>
+          <span className="rounded bg-[#101828] px-1 py-0.5 text-[8px] font-mono tracking-normal text-cyan-400">v3 · 60 tools</span>
         </h3>
         <div className="flex items-center gap-1">
+          <button
+            onClick={toggleAutoSpeak}
+            title={autoSpeak ? 'Auto-speak answers ON - click to mute' : 'Auto-speak answers OFF - click to enable voice'}
+            className={`rounded px-1.5 py-0.5 font-mono text-[9px] transition-colors ${
+              autoSpeak ? 'bg-cyan-950/60 text-cyan-300' : 'text-[#4b5a72] hover:bg-[#101828] hover:text-[#aab6cc]'
+            }`}
+          >
+            {speaking ? '◉ speaking…' : autoSpeak ? '🔊 voice on' : '🔇 voice off'}
+          </button>
           <button
             onClick={exportChat}
             disabled={!messages.length}
@@ -684,12 +776,21 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
                         {m.error ? <span className="text-rose-300">{e.text}</span> : <Markdown src={e.text} />}
                       </div>
                       {!m.error && !m.streaming && (
-                        <button
-                          onClick={() => void navigator.clipboard?.writeText(e.text)}
-                          className="absolute -right-1 top-1 hidden rounded bg-[#101828] px-1.5 py-0.5 font-mono text-[8px] text-[#7c8aa5] group-hover:block hover:text-cyan-300"
-                        >
-                          copy
-                        </button>
+                        <div className="absolute -right-1 top-1 hidden gap-1 group-hover:flex">
+                          <button
+                            onClick={() => (speaking ? stopSpeak() : void speak(e.text))}
+                            title={speaking ? 'Stop speaking' : 'Speak this answer'}
+                            className="rounded bg-[#101828] px-1.5 py-0.5 font-mono text-[8px] text-[#7c8aa5] hover:text-cyan-300"
+                          >
+                            {speaking ? '■ stop' : '▶ speak'}
+                          </button>
+                          <button
+                            onClick={() => void navigator.clipboard?.writeText(e.text)}
+                            className="rounded bg-[#101828] px-1.5 py-0.5 font-mono text-[8px] text-[#7c8aa5] hover:text-cyan-300"
+                          >
+                            copy
+                          </button>
+                        </div>
                       )}
                     </div>
                   )

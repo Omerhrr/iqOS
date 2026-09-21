@@ -8,6 +8,7 @@ import { Server } from 'socket.io'
 import { Kernel } from './src/kernel'
 import { storePlugin } from './src/plugins/store'
 import { osModePlugin, ModeService, type OsMode } from './src/plugins/os-mode'
+import { memoryGatePlugin } from './src/plugins/memory-gate'
 import { marketDataPlugin, MarketDataService } from './src/plugins/market-data'
 import { analyticsPlugin, AnalyticsService } from './src/plugins/analytics'
 import { executionPlugin, ExecutionService, type RiskConfig } from './src/plugins/execution'
@@ -29,6 +30,7 @@ const PORT = 3030
 const kernel = new Kernel()
 kernel.register(storePlugin)
 kernel.register(osModePlugin)
+kernel.register(memoryGatePlugin)
 kernel.register(marketDataPlugin)
 kernel.register(analyticsPlugin)
 kernel.register(executionPlugin)
@@ -353,6 +355,11 @@ const httpServer = createServer(async (req, res) => {
         const store = kernel.context().use<{ listNotes: (q: string, l?: number) => unknown[] }>('storeRaw')
         const notes = store.listNotes(q.get('q') ?? '', Number(q.get('limit') ?? 30))
         return json(200, { ok: true, count: notes.length, notes })
+      }
+
+      if (path === '/memory_gate') {
+        const mg = kernel.context().use<{ status: () => unknown }>('memoryGate')
+        return json(200, { ok: true, ...(mg.status() as Record<string, unknown>) })
       }
 
       // ---------- autopilot fleet ----------

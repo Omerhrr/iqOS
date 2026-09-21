@@ -257,6 +257,17 @@ export class AutopilotService {
       // watchdog plugin not loaded - health gating disabled
     }
 
+    // copilot memory gate: standing rules the user told the copilot ("never
+    // trade Fridays", "only trade EURUSD-OTC", "max stake $20"...) hard-block
+    // autonomy - manual trading stays free, rules govern the machines only
+    try {
+      const mg = this.ctx.use<{ check: (asset: string, stake: number) => { ok: boolean; reason?: string } }>('memoryGate')
+      const g = mg.check(asset, bot.stake)
+      if (!g.ok) return this.reject(bot, g.reason ?? 'memory gate hold')
+    } catch {
+      // memory gate plugin not loaded - rule gating disabled
+    }
+
     // strategy evaluation (pure, on closed candles)
     const merged = { ...defaultParams(getStrategy(bot.strategyId)!), ...(bot.params ?? {}) }
     const evalOut = this.analytics.runStrategy(asset, tf, bot.strategyId, merged)

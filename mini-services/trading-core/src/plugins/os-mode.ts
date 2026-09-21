@@ -305,6 +305,17 @@ export class ModeService {
     const row = this.pickSignal()
     if (!row) return this.standDown('no signal meets the auto-trader thresholds yet')
 
+    // copilot memory gate: standing rules from the copilot's persistent memory
+    // ("never trade Fridays", "only trade ...", "max stake $...", rate caps)
+    // bind the OS's own trader too - the user's words outrank the machine
+    try {
+      const mg = this.ctx.use<{ check: (asset: string, stake: number) => { ok: boolean; reason?: string } }>('memoryGate')
+      const g = mg.check(row.asset, this.config.stake)
+      if (!g.ok) return this.standDown(g.reason ?? 'memory gate hold')
+    } catch {
+      // memory gate plugin not loaded - rule gating disabled
+    }
+
     const side = row.direction === 'put' ? 'put' : 'call'
     const out = await this.place(row, side)
     if (!out.ok) return this.standDown(out.error ?? 'order rejected')
