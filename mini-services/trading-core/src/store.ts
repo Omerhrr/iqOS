@@ -239,6 +239,28 @@ export class Store {
     return row ? this.rowToPosition(row) : null
   }
 
+  /**
+   * True-up a live position from the broker's own books (portfolio v4):
+   * expiration_time -> settles_at (IQ aligns expiries to minute boundaries,
+   * our local now+N*60 guess can be off by +-30s) and openPrice ->
+   * entry_price (IQ settles against ITS open quote, not our feed tick).
+   */
+  updateLiveMeta(id: string, patch: { settlesAt?: number; entryPrice?: number }): void {
+    const sets: string[] = []
+    const vals: (number | string)[] = []
+    if (patch.settlesAt !== undefined) {
+      sets.push('settles_at = ?')
+      vals.push(patch.settlesAt)
+    }
+    if (patch.entryPrice !== undefined) {
+      sets.push('entry_price = ?')
+      vals.push(patch.entryPrice)
+    }
+    if (!sets.length) return
+    vals.push(id)
+    this.db.run(`UPDATE positions SET ${sets.join(', ')} WHERE id = ?`, vals)
+  }
+
   listPositions(status?: 'open' | 'closed', limit = 200): Position[] {
     let rows: Record<string, unknown>[]
     if (status === 'open') {

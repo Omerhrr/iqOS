@@ -2,6 +2,8 @@
 // Paper broker (binary + spot settlement driven by candle closes), risk manager
 // (kill switch, daily loss limit, max stake, max open, loss-streak cooldown),
 // and the iqair LIVE adapter that forwards trades to the Python sidecar.
+// Live options settle against the SIDECAR'S OWN EXPIRY QUOTES (candles at the
+// broker's real minute-boundary expiry), never the kernel's cached tick.
 
 import type {
   AccountState,
@@ -42,6 +44,11 @@ export class ExecutionService {
   private settleTimer: ReturnType<typeof setInterval> | null = null
   private balanceTimer: ReturnType<typeof setInterval> | null = null
   private syncingBalance = false
+  // live options currently in their expiry-quote settlement flow (re-entry
+  // guard for the 1s sweep while the async sidecar round-trips are out)
+  private settlingLive = new Set<string>()
+  // sweeps spent trying to fetch an expiry quote per position (backoff ladder)
+  private expiryAttempts = new Map<string, number>()
 
   risk: RiskConfig = { ...DEFAULT_RISK }
   liveReady = false
@@ -351,8 +358,23 @@ export class ExecutionService {
           ...(isCfd ? { leverage: req.leverage ?? info?.leverage ?? 10, tp: req.tp, sl: req.sl } : {}),
         }),
       })
-      const data = (await res.json()) as { ok: boolean; order_id?: number; error?: string; payout?: number }
+      const data = (await res.json()) as {
+        ok: boolean
+        order_id?: number
+        error?: string
+        payout?: number
+        mode?: string
+        expired?: number
+      }
       if (!data.ok) return { ok: false, error: data.error ?? 'sidecar rejected trade' }
+      const orderId = String(data.order_id)
+      // The broker echoes the REAL expiration (minute-boundary aligned) - IQ
+      // may settle up to ~30s either side of our now+N*60 estimate.
+      const nowS = this.now()
+      const echoExp =
+        typeof data.expired === 'number' && data.expired > nowS && data.expired < nowS + 2 * 3600
+          ? Math.floor(data.expired)
+          : undefined
       const position: Position = {
         id: `lv-${data.order_id}`,
         tsOpen: this.now(),
@@ -371,14 +393,21 @@ export class ExecutionService {
         expirySec: kind === 'digital' ? expirySec : undefined,
         tp: req.tp,
         sl: req.sl,
-        liveOrderId: String(data.order_id),
-        settlesAt: isCfd ? undefined : this.now() + expiryMin * 60,
+        liveOrderId: orderId,
+        settlesAt: isCfd ? undefined : echoExp ?? this.now() + expiryMin * 60,
       }
       this.store.insertPosition(position)
       this.ctx.bus.emit('positionOpened', { position })
       this.ctx.bus.emit('alert', { level: 'success', message: `LIVE ${kind.toUpperCase()} order ${data.order_id} placed via iqair`, ts: this.now() })
       // IQ deducts the stake immediately - true up the displayed balance
       setTimeout(() => void this.syncLiveBalance(), 4000)
+      if (!isCfd) {
+        if (echoExp) this.ctx.log('execution', `live ${kind} ${orderId}: broker expiry ${new Date(echoExp * 1000).toISOString()}`)
+        // broker meta reconcile: real expiration_time + openPrice straight
+        // from IQ's portfolio (covers digitals and orders whose echo omitted
+        // `expired`)
+        setTimeout(() => void this.reconcileLiveMeta(position.id, orderId, typeof data.mode === 'string' ? data.mode : ''), 2500)
+      }
       return { ok: true, position }
     } catch (err) {
       this.lastLiveError = (err as Error).message
@@ -463,7 +492,7 @@ export class ExecutionService {
     return { ok: true, position: this.store.getPosition(id) ?? undefined }
   }
 
-  private settle(id: string, exitPrice: number, status: 'won' | 'lost' | 'closed', pnl: number): void {
+  private settle(id: string, exitPrice: number, status: 'won' | 'lost' | 'closed', pnl: number, via = ''): void {
     const pos = this.store.settlePosition(id, exitPrice, status, pnl)
     if (!pos) return
     if (pos.mode === 'paper') {
@@ -476,18 +505,20 @@ export class ExecutionService {
     }
     this.ctx.bus.emit('positionClosed', { position: pos })
     this.ctx.bus.emit('account', { account: this.account() })
+    const priceTxt = Number(exitPrice.toPrecision(6)).toString()
     this.ctx.bus.emit('alert', {
       level: pnl >= 0 ? 'success' : 'danger',
-      message: `${pos.asset} ${pos.side.toUpperCase()} ${pos.kind} settled: ${pnl >= 0 ? '+' : '-'}$${Math.abs(pnl).toFixed(2)}`,
+      message: `${pos.asset} ${pos.side.toUpperCase()} ${pos.kind} settled @ ${priceTxt}${via ? ` (${via})` : ''}: ${pnl >= 0 ? '+' : '-'}$${Math.abs(pnl).toFixed(2)}`,
       ts: this.now(),
     })
   }
 
   /**
    * 1s sweep: settle open option positions (paper AND live) the moment their
-   * expiry is due - binaries/turbos against entry, digitals against strike,
-   * using the current feed price. On IQ the broker's authoritative balance
-   * arrives via syncLiveBalance() a few seconds later.
+   * expiry is due. Paper settles against the sim feed tick; LIVE settles
+   * against the SIDECAR'S OWN EXPIRY QUOTE (see settleLiveExpiry) - never
+   * against this kernel's cached active-asset tick. On IQ the broker's
+   * authoritative balance arrives via syncLiveBalance() a few seconds later.
    */
   private settleDue(): void {
     const now = this.now()
@@ -500,20 +531,166 @@ export class ExecutionService {
           now >= p.settlesAt
       )
     for (const pos of due) {
-      // live positions only settle against the live feed while on IQ
-      if (pos.mode === 'live' && !(this.liveReady && this.accountSource === 'iq')) continue
+      // live positions only settle while on IQ with a warm sidecar session
+      if (pos.mode === 'live') {
+        if (!(this.liveReady && this.accountSource === 'iq')) continue
+        if (this.settlingLive.has(pos.id)) continue
+        this.settlingLive.add(pos.id)
+        void this.settleLiveExpiry(pos)
+        continue
+      }
       // paper positions settle against the sim universe, which only ticks in
       // paper mode - a stale sim price is never a settlement price
-      if (pos.mode === 'paper' && this.market.mode !== 'sim') continue
+      if (this.market.mode !== 'sim') continue
       const price = this.market.getPrice(pos.asset)
       // feed stalled for this asset - retry next sweep rather than settle wrong
       if (!price || price <= 0) continue
-      const strike = pos.kind === 'digital' ? (pos.strike ?? pos.entryPrice) : pos.entryPrice
-      const draw = price === strike
-      const won = pos.side === 'call' ? price > strike : price < strike
-      const pnl = draw ? 0 : won ? pos.amount * pos.payout : -pos.amount
-      this.settle(pos.id, price, draw ? 'won' : won ? 'won' : 'lost', pnl)
+      this.settleExpiry(pos, price, '')
     }
+  }
+
+  /**
+   * Expiry win/loss decision: binary/turbo against entry, digital against
+   * strike, at-the-money refunds the stake. `via` names the price source in
+   * the settlement alert ("iq expiry 1s quote" etc).
+   */
+  private settleExpiry(pos: Position, price: number, via: string): void {
+    const strike = pos.kind === 'digital' ? (pos.strike ?? pos.entryPrice) : pos.entryPrice
+    const draw = price === strike
+    const won = pos.side === 'call' ? price > strike : price < strike
+    const pnl = draw ? 0 : won ? pos.amount * pos.payout : -pos.amount
+    this.settle(pos.id, price, draw ? 'won' : won ? 'won' : 'lost', pnl, via)
+  }
+
+  /**
+   * LIVE options settle against the sidecar's OWN EXPIRY QUOTE: candles
+   * requested with end=<expiry second> give the broker-side price IQ itself
+   * settles on - regardless of which asset the kernel chart is ticking (the
+   * old active-asset tick went stale the moment the operator switched charts).
+   * Ladder per sweep: 1s candle -> 5s candle -> 1m candle at the expiry
+   * second; after a few sweeps the sidecar's live stream price (degraded,
+   * post-expiry); after ~45s the kernel feed as a last resort. Nothing here
+   * ever books a paper-balance move - IQ's ledger is the money.
+   */
+  private async settleLiveExpiry(pos: Position): Promise<void> {
+    const expiresAt = pos.settlesAt ?? this.now()
+    const attempt = (this.expiryAttempts.get(pos.id) ?? 0) + 1
+    this.expiryAttempts.set(pos.id, attempt)
+    const quote = await this.iqExpiryQuote(pos.asset, expiresAt)
+    if (quote) {
+      this.finishLiveExpiry(pos, quote.price, quote.src)
+      return
+    }
+    if (!(this.liveReady && this.accountSource === 'iq')) {
+      // session dropped mid-flight - sweep re-arms when IQ is back
+      this.settlingLive.delete(pos.id)
+      return
+    }
+    if (attempt >= 4) {
+      // degraded: the sidecar's freshest stream quote - still broker-side,
+      // just a few seconds after the expiry second
+      const res = await this.getLive(`/price?asset=${encodeURIComponent(this.market.iqairSymbol(pos.asset))}`)
+      const p = Number(res?.price)
+      if (Number.isFinite(p) && p > 0) {
+        this.finishLiveExpiry(pos, p, 'iq stream (degraded)')
+        return
+      }
+    }
+    if (attempt >= 45) {
+      // last resort: kernel feed tick rather than an eternally open position
+      const p = this.market.getPrice(pos.asset)
+      if (p > 0) this.finishLiveExpiry(pos, p, 'kernel feed (last resort)')
+      else this.settlingLive.delete(pos.id)
+      return
+    }
+    // unresolved - the next 1s sweep retries the ladder
+    this.settlingLive.delete(pos.id)
+  }
+
+  private finishLiveExpiry(pos: Position, price: number, via: string): void {
+    this.settlingLive.delete(pos.id)
+    this.expiryAttempts.delete(pos.id)
+    this.settleExpiry(pos, price, via)
+  }
+
+  /**
+   * The broker-side quote AT an expiry second: candles requested with
+   * end=<expiry+tf> and the newest one whose window CLOSES at/before the
+   * expiry - its close is the last quote before expiry, exactly what IQ
+   * settles against. Tries 1s, 5s, then 1m granularity. Null when the
+   * sidecar has nothing usable yet (expiry candle not frozen yet).
+   */
+  private async iqExpiryQuote(asset: string, atSec: number): Promise<{ price: number; src: string } | null> {
+    const base = this.liveUrl().replace(/\/$/, '')
+    const sym = this.market.iqairSymbol(asset)
+    const tries: Array<{ tf: number; src: string }> = [
+      { tf: 1, src: 'iq expiry 1s quote' },
+      { tf: 5, src: 'iq expiry 5s quote' },
+      { tf: 60, src: 'iq expiry 1m quote' },
+    ]
+    for (const t of tries) {
+      try {
+        const res = await fetch(`${base}/candles?asset=${encodeURIComponent(sym)}&tf=${t.tf}&size=6&end=${atSec + t.tf}`, {
+          signal: AbortSignal.timeout(8000),
+        })
+        const data = (await res.json()) as { ok?: boolean; candles?: Array<{ time: number; to?: number; close: number }> }
+        const rows = (data.candles ?? []).filter((c) => Number.isFinite(c.close) && c.close > 0)
+        // newest candle whose window closed at/before the expiry second
+        const eligible = rows.filter((c) => (c.to ?? c.time + t.tf) <= atSec)
+        if (eligible.length) return { price: eligible[eligible.length - 1].close, src: t.src }
+      } catch {
+        // sidecar busy/down - next granularity, then the next sweep, retries
+      }
+    }
+    return null
+  }
+
+  /**
+   * True-up a just-placed live option against the broker's own books
+   * (portfolio v4 via the sidecar /positions): expiration_time is the REAL
+   * minute-boundary expiry (our now+N*60 estimate can be ~30s off) and
+   * openPrice is the quote IQ will actually settle against. Best-effort -
+   * when the broker list lags or no instrument type matches, local values stand.
+   */
+  private async reconcileLiveMeta(posId: string, orderId: string, modeHint: string): Promise<void> {
+    const types = modeHint.startsWith('digital')
+      ? ['digital-option', 'turbo-option', 'binary-option']
+      : modeHint === 'binary'
+        ? ['binary-option', 'turbo-option']
+        : ['turbo-option', 'binary-option', 'digital-option']
+    for (const itype of types) {
+      const res = await this.postLive('/positions', { instrument_type: itype }, 35_000)
+      if (!res || !Array.isArray(res.positions)) continue
+      const row = (res.positions as Record<string, unknown>[]).find((r) => r && String(r.id) === orderId)
+      if (!row) continue
+      const lower: Record<string, unknown> = {}
+      for (const [k, v] of Object.entries(row)) lower[k.toLowerCase()] = v
+      const num = (...keys: string[]): number | undefined => {
+        for (const k of keys) {
+          const v = Number(lower[k])
+          if (Number.isFinite(v) && v > 0) return v
+        }
+        return undefined
+      }
+      const pos = this.store.getPosition(posId)
+      if (!pos || pos.status !== 'open') return
+      const patch: { settlesAt?: number; entryPrice?: number } = {}
+      const exp = num('expiration_time', 'expired', 'expiration')
+      if (exp && exp > pos.tsOpen && exp < pos.tsOpen + 2 * 3600) patch.settlesAt = Math.floor(exp)
+      const open = num('openprice', 'open_price')
+      // sanity band: a misparsed field must never poison the settlement math
+      // (entryPrice <= 0 = kernel feed never ticked this asset -> the broker
+      // figure is the only real number, take it unconditionally)
+      if (open && (pos.entryPrice <= 0 || Math.abs(open / pos.entryPrice - 1) <= 0.2)) patch.entryPrice = open
+      if (!Object.keys(patch).length) return
+      this.store.updateLiveMeta(posId, patch)
+      this.ctx.log(
+        'execution',
+        `live meta ${orderId} (${itype}): expiry ${patch.settlesAt ? new Date(patch.settlesAt * 1000).toISOString() : 'unchanged'}, open ${patch.entryPrice ?? 'unchanged'}`
+      )
+      return
+    }
+    this.ctx.log('execution', `live meta ${orderId}: broker position not found yet - local expiry/open kept`)
   }
 
   /**

@@ -529,7 +529,9 @@ def _buy_digital_spot(amount, ticker, direction, expiry_minutes):
 def _buy_fast(amount, active_id, direction, expiry_minutes):
     """Direct buyv3 order with a pre-resolved active_id: ONE websocket round
     trip, no per-order init re-scan. Mirrors iqair's _buy_once response wait.
-    Returns (True, order_id) or (False, reason)."""
+    Returns (True, order_id, expired_unix | None) or (False, reason, None).
+    `expired` is the broker-computed expiration echoed in the open-option
+    response (minute-boundary aligned - the REAL settlement second)."""
     req_id = f"iqos-{int(time.time() * 1000)}"
     _client.api.buy_multi_option = {}
     _client.api.buy_successful = None
@@ -543,13 +545,18 @@ def _buy_fast(amount, active_id, direction, expiry_minutes):
         time.sleep(0.15)
     if not isinstance(resp, dict):
         print(f"[sidecar] buy timeout: {active_id} x {amount} ({expiry_minutes}m)")
-        return False, "broker did not answer the order in time"
+        return False, "broker did not answer the order in time", None
     if resp.get("id") is None:
         msg = resp.get("message") or "rejected"
         print(f"[sidecar] buy rejected: {active_id} x {amount}: {msg}")
-        return False, str(msg)
+        return False, str(msg), None
     print(f"[sidecar] buy ok: active_id {active_id} x {amount} {direction} {expiry_minutes}m -> order {resp['id']}")
-    return True, resp["id"]
+    expired = resp.get("expired")
+    try:
+        expired = int(expired) if expired else None
+    except (TypeError, ValueError):
+        expired = None
+    return True, resp["id"], expired
 
 
 def _ok(data=None):
@@ -729,15 +736,22 @@ class Handler(BaseHTTPRequestHandler):
                     asset = params.get("asset", "EURUSD")
                     size = int(params.get("size", 300))
                     tf = int(params.get("tf", 60))
+                    # optional history window: end=<unix sec> returns candles
+                    # ENDING at that second instead of now. This is how the
+                    # kernel fetches EXPIRY QUOTES - the broker's own price at
+                    # an option's expiration moment - for real-world settlement.
+                    end = int(params.get("end", 0))
+                    endtime = end if end > 0 else int(time.time())
                     canon = _canonical_ticker(asset) or asset
                     if OP_code is not None and canon not in OP_code.ACTIVES:
                         return self._send(_err(f"unknown asset {asset}"), 400)
                     # iqair 1.0.0: get_candles(ACTIVES, interval, count, endtime)
                     # returns the candle list directly (no ok-wrapper).
-                    data = _client.get_candles(canon, tf, size, int(time.time()))
+                    data = _client.get_candles(canon, tf, size, endtime)
                     candles = [
                         {
                             "time": int(c.get("from", 0)),
+                            "to": int(c.get("to", c.get("from", 0) + tf)),
                             "open": float(c.get("open", 0)),
                             "high": float(c.get("max", c.get("high", 0))),
                             "low": float(c.get("min", c.get("low", 0))),
@@ -905,6 +919,7 @@ class Handler(BaseHTTPRequestHandler):
                     expiry = int(body.get("expiry_minutes", 1))
                     leverage = body.get("leverage")
                     strike_offset = body.get("strike_offset_pct")
+                    expired = None  # broker echo of the real expiration (options family)
                     if amount <= 0 or not asset:
                         return self._send(_err("asset and positive amount required"), 400)
 
@@ -928,7 +943,7 @@ class Handler(BaseHTTPRequestHandler):
                                 check, order_id = _buy_digital_spot(amount, asset, direction, expiry)
                             elif tb_id is not None:
                                 # requested digital, account only has turbo/binary
-                                check, order_id = _buy_fast(amount, int(tb_id), direction, expiry)
+                                check, order_id, expired = _buy_fast(amount, int(tb_id), direction, expiry)
                                 mode = "turbo"
                             else:
                                 return self._send(_err(f"{asset} is not a digital/turbo/binary instrument on this IQ account"), 400)
@@ -941,7 +956,7 @@ class Handler(BaseHTTPRequestHandler):
                                 # and falls back to a stale 2018 static table
                                 # that lacks OTC/new tickers -> active_id null
                                 # -> server rejection ("ActiveId is not nullable")
-                                check, order_id = _buy_fast(amount, int(tb_id), direction, expiry)
+                                check, order_id, expired = _buy_fast(amount, int(tb_id), direction, expiry)
                             elif dig_id is not None:
                                 # requested turbo/binary, account only offers
                                 # this ticker as a digital option (common on
@@ -973,7 +988,7 @@ class Handler(BaseHTTPRequestHandler):
 
                     if not check:
                         return self._send(_err(f"order rejected: {order_id}"), 502)
-                    return self._send(_ok({"order_id": order_id, "mode": mode, "asset": asset}))
+                    return self._send(_ok({"order_id": order_id, "mode": mode, "asset": asset, "expired": expired}))
 
                 if path == "/close_trade":
                     mode = (body.get("mode") or "turbo").lower()

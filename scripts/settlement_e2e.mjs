@@ -34,7 +34,10 @@ async function runCase(name, trade) {
   const lagVsExpiry = settleWall - pos.settlesAt // when we OBSERVED it closed (poll granularity 1s)
   const acct1 = await get('/account')
   const delta = acct1.account.balance - acct0.account.balance
-  const expectedWin = settled.pnl >= 0 ? pos.amount + settled.pnl : 0
+  // delta is measured from BEFORE the open: the stake was escrowed at open
+  // (-amount) and the settlement credits stake+pnl back -> net win delta is
+  // +pnl (not stake+pnl, which would only hold if measured after the open).
+  const expectedWin = settled.pnl >= 0 ? settled.pnl : 0
   console.log(`[${name}] settled status=${settled.status} exit=${settled.exitPrice?.toFixed(5)} pnl=${settled.pnl?.toFixed(2)} observed lag vs expiry=~${lagVsExpiry}s (poll 1s)`)
   console.log(`[${name}] balance delta=$${delta.toFixed(2)} (stake $${pos.amount}, payout x${pos.payout})`)
   if (lagVsExpiry > 3) throw new Error(`${name}: settled ${lagVsExpiry}s after expiry - sweep too slow`)
