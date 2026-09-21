@@ -68,20 +68,22 @@ export class ExecutionService {
         cooldownSeconds: num(c.cooldownSeconds, this.risk.cooldownSeconds),
       }
     }
-    // settle binaries + spot TPs/SLs on every closed candle
+    // spot/cfd TP-SL + margin checks ride the candle stream
     this.unsubscribers.push(
       ctx.bus.on('candle', ({ asset, tf, candle, closed }) => {
         if (closed) this.onCandleClose(asset, tf, candle)
         else this.checkSpotStops(asset, candle)
       })
     )
-    // LIVE option positions: the candle path only settles paper trades - live
-    // binaries/turbos/digitals settle the moment their expiry is due (1s
-    // sweep), then the ledger reconciles with the broker's real balance
-    this.settleTimer = setInterval(() => this.settleLiveDue(), 1000)
+    // 1s sweep: binary/turbo/digital positions (paper AND live) settle the
+    // moment their expiry is due - no waiting for a candle boundary - then
+    // the ledger reconciles with the broker's real balance on IQ
+    this.settleTimer = setInterval(() => this.settleDue(), 1000)
     // keep the displayed IQ balance in tandem with the broker (wins/losses/
-    // stakes book on IQ's side; the OS ledger is only an estimate)
-    this.balanceTimer = setInterval(() => void this.syncLiveBalance(), 15000)
+    // stakes book on IQ's side; the OS ledger is only an estimate). Runs
+    // whenever a sidecar session is warm - even in paper mode - so the true
+    // figure is always current when you switch sources.
+    this.balanceTimer = setInterval(() => void this.syncLiveBalance(), 10_000)
     ctx.log('execution', 'paper broker + risk manager online')
   }
 
@@ -391,25 +393,10 @@ export class ExecutionService {
   // ---------- settlement ----------
 
   private onCandleClose(asset: string, tf: Timeframe, candle: Candle): void {
-    const open = this.store.listPositions('open').filter((p) => p.mode === 'paper' && p.asset === asset && p.tf === tf)
-    for (const pos of open) {
-      if (pos.kind === 'binary' || pos.kind === 'turbo') {
-        if (pos.settlesAt !== undefined && this.now() < pos.settlesAt) continue
-        const won = pos.side === 'call' ? candle.close > pos.entryPrice : candle.close < pos.entryPrice
-        const draw = candle.close === pos.entryPrice
-        const pnl = draw ? 0 : won ? pos.amount * pos.payout : -pos.amount
-        this.settle(pos.id, candle.close, draw ? 'won' : won ? 'won' : 'lost', pnl)
-      } else if (pos.kind === 'digital') {
-        if (pos.settlesAt !== undefined && this.now() < pos.settlesAt) continue
-        const strike = pos.strike ?? pos.entryPrice
-        const won = pos.side === 'call' ? candle.close > strike : candle.close < strike
-        const draw = candle.close === strike
-        const pnl = draw ? 0 : won ? pos.amount * pos.payout : -pos.amount
-        this.settle(pos.id, candle.close, draw ? 'won' : won ? 'won' : 'lost', pnl)
-      } else if (pos.kind === 'spot' || pos.kind === 'cfd') {
-        this.checkMargin(pos, candle.close, candle.time)
-      }
-    }
+    // binary/turbo/digital settle on the 1s expiry sweep (settleDue) - the
+    // candle boundary is only for spot/cfd exit checks
+    const open = this.store.listPositions('open').filter((p) => p.mode === 'paper' && (p.kind === 'spot' || p.kind === 'cfd') && p.asset === asset && p.tf === tf)
+    for (const pos of open) this.checkMargin(pos, candle.close, candle.time)
   }
 
   private checkSpotStops(asset: string, candle: Candle): void {
@@ -497,44 +484,46 @@ export class ExecutionService {
   }
 
   /**
-   * 1s sweep: settle open LIVE option positions the moment their expiry is
-   * due - binaries/turbos against entry, digitals against strike, using the
-   * current feed price. The broker's authoritative balance arrives via
-   * syncLiveBalance() a few seconds later.
+   * 1s sweep: settle open option positions (paper AND live) the moment their
+   * expiry is due - binaries/turbos against entry, digitals against strike,
+   * using the current feed price. On IQ the broker's authoritative balance
+   * arrives via syncLiveBalance() a few seconds later.
    */
-  private settleLiveDue(): void {
-    if (!this.liveReady || this.accountSource !== 'iq') return
+  private settleDue(): void {
     const now = this.now()
     const due = this.store
       .listPositions('open')
-      .filter((p) => p.mode === 'live' && p.settlesAt !== undefined && now >= p.settlesAt)
+      .filter(
+        (p) =>
+          (p.kind === 'binary' || p.kind === 'turbo' || p.kind === 'digital') &&
+          p.settlesAt !== undefined &&
+          now >= p.settlesAt
+      )
     for (const pos of due) {
-      if (pos.kind !== 'binary' && pos.kind !== 'turbo' && pos.kind !== 'digital') continue
+      // live positions only settle against the live feed while on IQ
+      if (pos.mode === 'live' && !(this.liveReady && this.accountSource === 'iq')) continue
+      // paper positions settle against the sim universe, which only ticks in
+      // paper mode - a stale sim price is never a settlement price
+      if (pos.mode === 'paper' && this.market.mode !== 'sim') continue
       const price = this.market.getPrice(pos.asset)
       // feed stalled for this asset - retry next sweep rather than settle wrong
       if (!price || price <= 0) continue
-      if (pos.kind === 'digital') {
-        const strike = pos.strike ?? pos.entryPrice
-        const draw = price === strike
-        const won = pos.side === 'call' ? price > strike : price < strike
-        const pnl = draw ? 0 : won ? pos.amount * pos.payout : -pos.amount
-        this.settle(pos.id, price, draw ? 'won' : won ? 'won' : 'lost', pnl)
-      } else {
-        const draw = price === pos.entryPrice
-        const won = pos.side === 'call' ? price > pos.entryPrice : price < pos.entryPrice
-        const pnl = draw ? 0 : won ? pos.amount * pos.payout : -pos.amount
-        this.settle(pos.id, price, draw ? 'won' : won ? 'won' : 'lost', pnl)
-      }
+      const strike = pos.kind === 'digital' ? (pos.strike ?? pos.entryPrice) : pos.entryPrice
+      const draw = price === strike
+      const won = pos.side === 'call' ? price > strike : price < strike
+      const pnl = draw ? 0 : won ? pos.amount * pos.payout : -pos.amount
+      this.settle(pos.id, price, draw ? 'won' : won ? 'won' : 'lost', pnl)
     }
   }
 
   /**
    * Pull the broker's REAL balance from the sidecar into liveBalance and
-   * broadcast it. Runs on a 15s cadence while on IQ, plus right after order
-   * placement and settlement (delayed - IQ needs a moment to book results).
+   * broadcast it. Runs on a 10s cadence whenever a sidecar session is warm
+   * (any account source), plus right after order placement and settlement
+   * (delayed - IQ needs a moment to book results).
    */
   async syncLiveBalance(): Promise<void> {
-    if (!this.liveReady || this.accountSource !== 'iq' || this.syncingBalance) return
+    if (!this.liveReady || this.syncingBalance) return
     this.syncingBalance = true
     try {
       const bal = await this.getLive('/balance')
