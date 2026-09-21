@@ -1,10 +1,13 @@
 'use client'
 
-// IQAIR//OS - Copilot v2
-// A streaming agent-harness chat: the LLM drives the OS kernel through a 20-tool
+// IQAIR//OS - Copilot v3
+// A streaming agent-harness chat: the LLM drives the OS kernel through a 60-tool
 // loop, and every step is streamed live (SSE) into a visual timeline. The copilot
 // can also operate the OS itself - switching assets/timeframes/chart types and
 // adding indicators - via ui commands applied by the parent shell.
+// Voice: it speaks its answers (/api/tts) and listens to yours - live dictation
+// via the Web Speech API where available, with a MediaRecorder -> /api/asr
+// fallback (decoded + re-encoded to 16 kHz mono WAV) everywhere else.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
@@ -380,6 +383,91 @@ function safeParse(s: string): unknown {
   }
 }
 
+// ---------------- voice input (STT) helpers ----------------
+
+// Minimal Web Speech API types (not in every TS dom lib).
+type SREvent = { resultIndex: number; results: { length: number; [i: number]: { isFinal: boolean; 0: { transcript: string } } } }
+type SRLive = {
+  lang: string
+  continuous: boolean
+  interimResults: boolean
+  maxAlternatives: number
+  start(): void
+  stop(): void
+  abort(): void
+  onresult: ((e: SREvent) => void) | null
+  onend: (() => void) | null
+  onerror: ((e: { error: string }) => void) | null
+}
+type SRCtor = new () => SRLive
+
+/** Chrome/Edge live recognition, if this browser has it. */
+function speechCtor(): SRCtor | null {
+  if (typeof window === 'undefined') return null
+  const w = window as unknown as { SpeechRecognition?: SRCtor; webkitSpeechRecognition?: SRCtor }
+  return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null
+}
+
+/** Encode mono float samples as a 16-bit PCM WAV buffer. */
+function encodeWav(samples: Float32Array, sampleRate: number): ArrayBuffer {
+  const buf = new ArrayBuffer(44 + samples.length * 2)
+  const v = new DataView(buf)
+  const ws = (off: number, s: string) => {
+    for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i))
+  }
+  ws(0, 'RIFF')
+  v.setUint32(4, 36 + samples.length * 2, true)
+  ws(8, 'WAVE')
+  ws(12, 'fmt ')
+  v.setUint32(16, 16, true)
+  v.setUint16(20, 1, true) // PCM
+  v.setUint16(22, 1, true) // mono
+  v.setUint32(24, sampleRate, true)
+  v.setUint32(28, sampleRate * 2, true)
+  v.setUint16(32, 2, true)
+  v.setUint16(34, 16, true)
+  ws(36, 'data')
+  v.setUint32(40, samples.length * 2, true)
+  let off = 44
+  for (let i = 0; i < samples.length; i++, off += 2) {
+    const s = Math.max(-1, Math.min(1, samples[i]))
+    v.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7fff, true)
+  }
+  return buf
+}
+
+/** Decode any recorded blob (webm/opus, mp4/aac, ogg) -> 16 kHz mono WAV data URL. */
+async function blobToWavDataUrl(blob: Blob): Promise<string> {
+  const Ctx = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+  if (!Ctx) throw new Error('web audio unavailable')
+  let ctx: AudioContext
+  try {
+    ctx = new Ctx({ sampleRate: 16000 })
+  } catch {
+    ctx = new Ctx()
+  }
+  try {
+    const audio = await ctx.decodeAudioData(await blob.arrayBuffer())
+    const chans = audio.numberOfChannels
+    let data = audio.getChannelData(0)
+    if (chans > 1) {
+      const mix = new Float32Array(audio.length)
+      for (let c = 0; c < chans; c++) {
+        const d = audio.getChannelData(c)
+        for (let i = 0; i < d.length; i++) mix[i] += d[i] / chans
+      }
+      data = mix
+    }
+    const wav = encodeWav(data, audio.sampleRate)
+    let bin = ''
+    const bytes = new Uint8Array(wav)
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i])
+    return `data:audio/wav;base64,${btoa(bin)}`
+  } finally {
+    void ctx.close()
+  }
+}
+
 // ---------------- main component ----------------
 
 const QUICK_BASE: { label: string; build: (a: string, tf: string) => string }[] = [
@@ -408,6 +496,45 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const speakSeqRef = useRef(0)
   const autoSpeakRef = useRef(false)
+  // voice input: live recognition OR record->transcribe fallback
+  const [listening, setListening] = useState(false)
+  const [transcribing, setTranscribing] = useState(false)
+  const [voiceHint, setVoiceHint] = useState('')
+  const recogRef = useRef<SRLive | null>(null)
+  const mediaRef = useRef<MediaRecorder | null>(null)
+  const micStreamRef = useRef<MediaStream | null>(null)
+  const listenSeqRef = useRef(0)
+  const busyRef = useRef(false)
+
+  useEffect(() => {
+    busyRef.current = busy
+  }, [busy])
+
+  // transient mic hints auto-dismiss
+  useEffect(() => {
+    if (!voiceHint) return
+    const t = setTimeout(() => setVoiceHint(''), 7000)
+    return () => clearTimeout(t)
+  }, [voiceHint])
+
+  // hard teardown on unmount: kill mic + recognition without sending anything
+  useEffect(
+    () => () => {
+      listenSeqRef.current += 1
+      try {
+        recogRef.current?.abort()
+      } catch {
+        /* not started */
+      }
+      try {
+        mediaRef.current?.stop()
+      } catch {
+        /* not recording */
+      }
+      micStreamRef.current?.getTracks().forEach((t) => t.stop())
+    },
+    []
+  )
 
   // restore persisted voice preference
   useEffect(() => {
@@ -429,6 +556,36 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
     }
     setSpeaking(false)
   }, [])
+
+  // hard-cancel an in-flight voice session without auto-sending anything
+  const cancelListening = () => {
+    listenSeqRef.current += 1
+    if (recogRef.current) {
+      const rec = recogRef.current
+      recogRef.current = null
+      try {
+        rec.onend = null
+        rec.abort()
+      } catch {
+        /* not running */
+      }
+    }
+    if (mediaRef.current) {
+      const mr = mediaRef.current
+      mediaRef.current = null
+      try {
+        mr.stop() // onstop sees a stale generation and discards the audio
+      } catch {
+        /* not recording */
+      }
+    }
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach((t) => t.stop())
+      micStreamRef.current = null
+    }
+    setListening(false)
+    setTranscribing(false)
+  }
 
   const speak = useCallback(
     async (text: string) => {
@@ -483,6 +640,133 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
     if (!next) stopSpeak()
   }
 
+  const startListening = useCallback(async () => {
+    stopSpeak() // barge-in: talking to the mic silences the copilot
+    setVoiceHint('')
+    const gen = ++listenSeqRef.current
+
+    const Ctor = speechCtor()
+    if (Ctor) {
+      // tier 1: live dictation - words appear in the input as you speak,
+      // pause (or tap the mic again) and the transcript auto-sends
+      const rec = new Ctor()
+      rec.lang = navigator.language || 'en-US'
+      rec.continuous = false
+      rec.interimResults = true
+      rec.maxAlternatives = 1
+      let finalText = ''
+      let interimText = ''
+      rec.onresult = (e) => {
+        interimText = ''
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          const r = e.results[i]
+          if (r.isFinal) finalText += `${r[0].transcript} `
+          else interimText += r[0].transcript
+        }
+        setInput((finalText + interimText).trim())
+      }
+      rec.onerror = (e) => {
+        if (gen !== listenSeqRef.current) return
+        if (e.error === 'not-allowed' || e.error === 'service-not-allowed') setVoiceHint('mic blocked - allow microphone access for this site')
+        else if (e.error === 'no-speech') setVoiceHint("didn't catch that - tap the mic and try again")
+        else if (e.error !== 'aborted') setVoiceHint(`voice error: ${e.error}`)
+      }
+      rec.onend = () => {
+        if (gen !== listenSeqRef.current) return
+        recogRef.current = null
+        setListening(false)
+        const text = (finalText || interimText).trim()
+        if (!text) return
+        if (busyRef.current) setInput(text)
+        else void sendRef.current(text)
+      }
+      try {
+        rec.start()
+        recogRef.current = rec
+        setListening(true)
+      } catch {
+        setVoiceHint('could not start the microphone')
+      }
+      return
+    }
+
+    // tier 2 fallback: record, decode to 16 kHz mono WAV, transcribe via /api/asr
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      if (gen !== listenSeqRef.current) {
+        stream.getTracks().forEach((t) => t.stop())
+        return
+      }
+      micStreamRef.current = stream
+      const chunks: Blob[] = []
+      const mr = new MediaRecorder(stream)
+      let capTimer = 0
+      mr.ondataavailable = (e) => {
+        if (e.data.size) chunks.push(e.data)
+      }
+      mr.onstop = async () => {
+        window.clearTimeout(capTimer)
+        stream.getTracks().forEach((t) => t.stop())
+        micStreamRef.current = null
+        mediaRef.current = null
+        if (gen !== listenSeqRef.current || !chunks.length) return
+        setTranscribing(true)
+        setStatus('transcribing…')
+        try {
+          const dataUrl = await blobToWavDataUrl(new Blob(chunks, { type: mr.mimeType || 'audio/webm' }))
+          const res = await fetch('/api/asr', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ audioBase64: dataUrl }),
+          })
+          const d = (await res.json()) as { text?: string; error?: string }
+          if (gen !== listenSeqRef.current) return
+          const text = String(d.text ?? '').trim()
+          if (text) {
+            if (busyRef.current) setInput(text)
+            else void sendRef.current(text)
+          } else setVoiceHint(d.error || "couldn't transcribe that - try again")
+        } catch {
+          if (gen === listenSeqRef.current) setVoiceHint('transcription failed - check your connection')
+        } finally {
+          if (gen === listenSeqRef.current) {
+            setTranscribing(false)
+            setStatus('')
+          }
+        }
+      }
+      mr.start()
+      mediaRef.current = mr
+      setListening(true)
+      capTimer = window.setTimeout(() => {
+        if (mediaRef.current === mr && mr.state !== 'inactive') mr.stop()
+      }, 45000)
+    } catch {
+      setVoiceHint('mic unavailable - allow microphone access or use a supported browser')
+    }
+  }, [stopSpeak])
+
+  const toggleMic = useCallback(() => {
+    if (listening || transcribing) {
+      // second tap = "done talking" - the pending end/stop handler auto-sends
+      if (recogRef.current) {
+        try {
+          recogRef.current.stop()
+        } catch {
+          /* already ending */
+        }
+      } else if (mediaRef.current && mediaRef.current.state !== 'inactive') {
+        try {
+          mediaRef.current.stop()
+        } catch {
+          /* already stopping */
+        }
+      }
+      return
+    }
+    void startListening()
+  }, [listening, transcribing, startListening])
+
   // restore persisted history
   useEffect(() => {
     let cancelled = false
@@ -532,6 +816,8 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
   const send = async (text: string) => {
     const msg = text.trim()
     if (!msg || busy) return
+    stopSpeak() // a new question always interrupts a spoken answer
+    cancelListening() // a manual send also cancels any open dictation
     setInput('')
     setBusy(true)
     setStatus('connecting…')
@@ -654,6 +940,9 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
 
   const stop = () => abortRef.current?.abort()
 
+  const sendRef = useRef(send)
+  sendRef.current = send
+
   const clearChat = async () => {
     if (busy) return
     setMessages([])
@@ -724,14 +1013,32 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
         </div>
       )}
 
+      {/* listening strip */}
+      {listening && !busy && (
+        <div className="flex items-center gap-2 border-b border-[#2a1218] bg-rose-950/20 px-3 py-1 font-mono text-[9px] text-rose-400">
+          <span className="h-1.5 w-1.5 animate-ping rounded-full bg-rose-400" />
+          {transcribing ? 'transcribing…' : 'listening - speak, then pause (or tap the mic) to send'}
+        </div>
+      )}
+
+      {/* mic hint strip */}
+      {voiceHint && (
+        <div className="flex items-center justify-between border-b border-[#2a1218] bg-rose-950/20 px-3 py-1 font-mono text-[9px] text-rose-300">
+          <span>{voiceHint}</span>
+          <button onClick={() => setVoiceHint('')} className="ml-2 shrink-0 text-[#7c8aa5] hover:text-rose-200">
+            dismiss
+          </button>
+        </div>
+      )}
+
       {/* conversation */}
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
         {loaded && messages.length === 0 && (
           <div className="space-y-2">
             <div className="rounded-md border border-[#1c2739] bg-gradient-to-br from-[#0d1420] to-[#0a1220] p-2.5 text-[11px] leading-relaxed text-[#7c8aa5]">
-              <span className="text-cyan-400">Copilot v2</span> is wired into the kernel: full TA + quant analysis, market scanner, strategy
-              backtests, paper execution — and I can drive your workspace (switch charts, timeframes, add indicators). Ask anything, or tap a
-              quick action.
+              <span className="text-cyan-400">Copilot v3</span> is wired into the kernel: full TA + quant analysis, market scanner, strategy
+              backtests, paper execution — and I can drive your workspace (switch charts, timeframes, add indicators). Ask anything, tap a quick
+              action — or hit the mic and just talk to me. I can speak my answers too (🔊 up top).
             </div>
             <div className="grid grid-cols-2 gap-1.5">
               {quick.map((q) => (
@@ -836,10 +1143,23 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
         <Input
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder={busy ? 'copilot is working…' : asset ? `Ask about ${asset} ${tf ?? ''}…` : 'Ask the copilot…'}
+          placeholder={listening ? 'listening…' : busy ? 'copilot is working…' : asset ? `Ask about ${asset} ${tf ?? ''} — or tap the mic` : 'Ask the copilot…'}
           disabled={busy}
           className="h-9 border-[#1c2739] bg-[#101828] text-[12px] text-[#e2e8f0] placeholder:text-[#3d4d66]"
         />
+        <button
+          type="button"
+          onClick={toggleMic}
+          disabled={busy || transcribing}
+          title={listening ? 'Stop & send' : 'Talk to the copilot'}
+          className={`h-9 w-9 shrink-0 rounded-md border text-[13px] leading-none transition-colors disabled:opacity-30 ${
+            listening
+              ? 'animate-pulse border-rose-500/60 bg-rose-950/60 text-rose-300'
+              : 'border-[#1c2739] bg-[#101828] text-[#7c8aa5] hover:border-cyan-500/40 hover:text-cyan-300'
+          }`}
+        >
+          {listening ? '⏺' : '🎙'}
+        </button>
         {busy ? (
           <Button type="button" onClick={stop} className="h-9 bg-rose-700 px-3 text-white hover:bg-rose-600">
             Stop
