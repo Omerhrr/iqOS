@@ -132,6 +132,12 @@ export class Store {
         ts INTEGER NOT NULL,
         config TEXT
       );
+      CREATE TABLE IF NOT EXISTS live_stats (
+        mode TEXT PRIMARY KEY,
+        start_balance REAL NOT NULL,
+        day_key TEXT NOT NULL,
+        day_start REAL NOT NULL
+      );
     `)
     // column migrations for databases created before the column existed:
     // CREATE TABLE IF NOT EXISTS is a no-op on an existing table, so the
@@ -211,6 +217,32 @@ export class Store {
 
   setLiveBalance(amount: number, mode: string): void {
     this.db.run('UPDATE account SET live_balance = ?, live_mode = ? WHERE id = 1', [amount, mode])
+    this.snapshotLiveBalance(mode, amount)
+  }
+
+  /** Per-mode live P/L baselines. IQ practice and real are two different broker
+   * accounts - the paper ledger's start/day balances mean nothing for them.
+   * First balance ever observed for a mode becomes its total-P/L baseline; the
+   * first balance observed on a new day rolls the day-P/L baseline. Idempotent
+   * (writes only on insert or day change) - called on every live sync. */
+  snapshotLiveBalance(mode: string, balance: number): void {
+    const dayKey = new Date().toISOString().slice(0, 10)
+    const row = this.db.query('SELECT day_key FROM live_stats WHERE mode = ?').get(mode) as { day_key: string } | null
+    if (!row) {
+      this.db.run(
+        'INSERT INTO live_stats (mode, start_balance, day_key, day_start) VALUES (?, ?, ?, ?)',
+        [mode, balance, dayKey, balance]
+      )
+    } else if (row.day_key !== dayKey) {
+      this.db.run('UPDATE live_stats SET day_key = ?, day_start = ? WHERE mode = ?', [dayKey, balance, mode])
+    }
+  }
+
+  getLiveStat(mode: string): { startBalance: number; dayKey: string; dayStart: number } | null {
+    const row = this.db
+      .query('SELECT start_balance, day_key, day_start FROM live_stats WHERE mode = ?')
+      .get(mode) as { start_balance: number; day_key: string; day_start: number } | null
+    return row ? { startBalance: row.start_balance, dayKey: row.day_key, dayStart: row.day_start } : null
   }
 
   /** Persisted account source ('paper' | 'iq') - survives kernel restarts so

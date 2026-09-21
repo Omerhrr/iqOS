@@ -106,7 +106,26 @@ export class ExecutionService {
   // ---------- account ----------
 
   account(): AccountState {
-    return { ...this.store.getAccount(), source: this.accountSource }
+    const src = this.accountSource
+    const base = this.store.getAccount()
+    // "Open" must count the positions of the ledger the operator is ON -
+    // paper source should not count stray live positions and vice versa.
+    const openCount = this.store.listPositions('open').filter((p) => (src === 'iq' ? p.mode === 'live' : p.mode === 'paper')).length
+    const out: AccountState = { ...base, source: src, openPositions: openCount }
+    // Live P/L: IQ practice and real are two DIFFERENT broker accounts - the
+    // paper ledger's start/day balances must never surface as their P/L.
+    // Measure against the per-mode broker snapshots taken from the live
+    // balance sync (first-ever balance = total baseline, first of the day =
+    // day baseline). Paper keeps its own ledger numbers untouched.
+    if (src === 'iq' && base.liveBalance !== null && base.liveBalance !== undefined) {
+      const stat = this.store.getLiveStat(base.balanceMode)
+      if (stat) {
+        out.startBalance = stat.startBalance
+        out.dayPnl = base.liveBalance - stat.dayStart
+        out.totalPnl = base.liveBalance - stat.startBalance
+      }
+    }
+    return out
   }
 
   resetAccount(): AccountState {
