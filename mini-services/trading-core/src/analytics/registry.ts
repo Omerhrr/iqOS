@@ -9,6 +9,9 @@ import * as TA from './indicators'
 import * as OU from './kalman'
 import { computeVSK, VSK_DEFAULTS } from './vsk'
 import { computeTSK, TSK_DEFAULTS } from './tsk'
+import {
+  computePivotSeries, computeFibSeries, computeTrendlineSeries, computeFvgSeries,
+} from './structural'
 
 const isn = TA.isn
 
@@ -1219,7 +1222,119 @@ const tskIndicators: IndicatorDef[] = [
   },
 ]
 
-export const REGISTRY: IndicatorDef[] = [...overlap, ...momentum, ...volume, ...volatility, ...trend, ...statistic, ...extras, ...extras2, ...vskIndicators, ...tskIndicators]
+// ============================ STRUCTURAL (drawing tools) ============================
+
+const VARIANT_LABEL = (s: { mode: string; state: string[] }): string => {
+  const st = s.state.length ? s.state[s.state.length - 1] : ''
+  return `pivots (${s.mode}) ${st}`
+}
+
+const structuralIndicators: IndicatorDef[] = [
+  {
+    id: 'pivots', name: 'Pivot Points', category: 'structural', pane: 'overlay',
+    params: [
+      p('variant', 'Variant (0 classic/1 fib/2 camarilla/3 woodie)', 0, 3, 0, 1),
+      p('period', 'Rolling fallback window', 20, 200, 60),
+    ],
+    description: 'Floor pivot points (PP + R1..R3 + S1..S3). Session-based on UTC days (previous day H/L/C anchors today\'s levels, stepping at midnight); falls back to a rolling window when the feed does not span two sessions. Variants: classic, fibonacci, camarilla, woodie.',
+    compute: (c, par) => {
+      const s = computePivotSeries(c, {
+        variant: num(c, par, 'variant', 0),
+        period: num(c, par, 'period', 60),
+      })
+      const v = VARIANT_LABEL(s)
+      return {
+        lines: [
+          line('pp', C.yellow, s.pp, 'solid', 2),
+          line('r1', C.rose, s.r1, 'dashed'),
+          line('r2', C.red, s.r2, 'dashed'),
+          line('r3', C.red, s.r3, 'dotted'),
+          line('s1', C.lime, s.s1, 'dashed'),
+          line('s2', C.green, s.s2, 'dashed'),
+          line('s3', C.green, s.s3, 'dotted'),
+        ],
+        note: v,
+      }
+    },
+  },
+  {
+    id: 'fib', name: 'Auto Fibonacci (Retracement + Extension)', category: 'structural', pane: 'overlay',
+    params: [
+      p('lookback', 'Swing lookback (bars)', 30, 400, 150),
+      p('withExt', 'Draw 1.272/1.618 extensions (0/1)', 0, 1, 1, 1),
+    ],
+    description: 'Auto Fibonacci retracement of the last significant swing inside the lookback (0 / 23.6 / 38.2 / 50 / 61.8 / 78.6 / 100%), direction-aware, plus optional 1.272 / 1.618 extensions projected beyond the swing. Levels re-anchor only when a new swing extreme forms - like a manual drawing.',
+    compute: (c, par) => {
+      const s = computeFibSeries(c, {
+        lookback: num(c, par, 'lookback', 150),
+        withExt: num(c, par, 'withExt', 1),
+      })
+      const st = s.state.length ? s.state[s.state.length - 1] : ''
+      return {
+        lines: [
+          line('fib0', C.slate, s.fib0, 'dashed'),
+          line('fib236', C.slate, s.fib236, 'dotted'),
+          line('fib382', C.orange, s.fib382, 'dashed'),
+          line('fib50', C.yellow, s.fib50, 'dashed'),
+          line('fib618', C.yellow, s.fib618, 'solid'),
+          line('fib786', C.orange, s.fib786, 'dashed'),
+          line('fib100', C.slate, s.fib100, 'dashed'),
+          line('ext1272', C.teal, s.ext1272, 'dotted'),
+          line('ext1618', C.teal, s.ext1618, 'dotted'),
+        ],
+        note: `fib ${st} · solid = 61.8 golden pocket`,
+      }
+    },
+  },
+  {
+    id: 'trendlines', name: 'Auto Trendlines (S/R)', category: 'structural', pane: 'overlay',
+    params: [
+      p('pivotLeft', 'Fractal left flank', 2, 15, 5),
+      p('pivotRight', 'Fractal right flank', 2, 15, 5),
+      p('maxFit', 'Pivots in fit', 2, 5, 3, 1),
+    ],
+    description: 'Auto support/resistance trendlines: fractal swing pivots (non-repainting, confirmed by their right flank), the most recent 2-5 of each kind fitted by least squares and projected to the current bar. Lines re-anchor when a new confirmed pivot forms - a trader redrawing them, automatically.',
+    compute: (c, par) => {
+      const s = computeTrendlineSeries(c, {
+        pivotLeft: num(c, par, 'pivotLeft', 5),
+        pivotRight: num(c, par, 'pivotRight', 5),
+        maxFit: num(c, par, 'maxFit', 3),
+      })
+      const st = s.state.length ? s.state[s.state.length - 1] : ''
+      return {
+        lines: [
+          line('resTrend', C.red, s.resTrend, 'solid', 2),
+          line('supTrend', C.green, s.supTrend, 'solid', 2),
+        ],
+        note: `trendlines ${st}`,
+      }
+    },
+  },
+  {
+    id: 'fvg', name: 'Fair Value Gaps (3-Bar Imbalance)', category: 'structural', pane: 'overlay',
+    params: [
+      p('maxAge', 'Track gap for N bars', 20, 300, 120),
+    ],
+    description: 'ICT-style fair value gaps: a bullish 3-bar imbalance (low above the high two bars back) or bearish (high below the low two bars back) is drawn as a zone and tracked until price CLOSES through its far edge or maxAge bars pass. Shows the newest active gap of each kind.',
+    compute: (c, par) => {
+      const s = computeFvgSeries(c, {
+        maxAge: num(c, par, 'maxAge', 120),
+      })
+      const st = s.state.length ? s.state[s.state.length - 1] : ''
+      return {
+        lines: [
+          line('bullTop', C.green, s.bullTop, 'dotted'),
+          line('bullBot', C.green, s.bullBot, 'dotted'),
+          line('bearTop', C.red, s.bearTop, 'dotted'),
+          line('bearBot', C.red, s.bearBot, 'dotted'),
+        ],
+        note: `fvg ${st}`,
+      }
+    },
+  },
+]
+
+export const REGISTRY: IndicatorDef[] = [...overlap, ...momentum, ...volume, ...volatility, ...trend, ...statistic, ...extras, ...extras2, ...vskIndicators, ...tskIndicators, ...structuralIndicators]
 
 const REGISTRY_MAP = new Map(REGISTRY.map((d) => [d.id, d]))
 

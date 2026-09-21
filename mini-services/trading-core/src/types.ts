@@ -399,6 +399,7 @@ export type IndicatorCategory =
   | 'cycle'
   | 'statistic'
   | 'patterns'
+  | 'structural'
 
 export interface IndicatorParamDef {
   key: string

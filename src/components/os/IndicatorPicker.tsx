@@ -18,7 +18,7 @@ interface Props {
   onRemoveSub: (id: string) => void
 }
 
-const CATS = ['all', 'overlap', 'momentum', 'trend', 'volatility', 'volume', 'cycle', 'statistic'] as const
+const CATS = ['all', 'overlap', 'momentum', 'trend', 'volatility', 'volume', 'cycle', 'statistic', 'structural'] as const
 const CAT_COLOR: Record<string, string> = {
   overlap: '#38bdf8',
   momentum: '#f59e0b',

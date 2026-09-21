@@ -85,7 +85,7 @@ export interface IndicatorParamDef {
 export interface RegistryEntry {
   id: string
   name: string
-  category: 'overlap' | 'momentum' | 'volume' | 'volatility' | 'trend' | 'cycle' | 'statistic' | 'patterns'
+  category: 'overlap' | 'momentum' | 'volume' | 'volatility' | 'trend' | 'cycle' | 'statistic' | 'patterns' | 'structural'
   pane: 'overlay' | 'sub'
   params: IndicatorParamDef[]
   description: string
