@@ -109,7 +109,8 @@ async function main() {
     }
     trail.push(`${t.status} $${t.amount}${t.status === 'won' ? ` +${r2(t.pnl)}` : ''}`)
     if (t.status === 'won') {
-      pot = Math.round((working + (t.pnl ?? t.amount * 0.85)) * 100) / 100
+      const fold = Math.min(t.pnl ?? t.amount * 0.85, t.amount * 0.7) // house rule: payout capped at 70%
+      pot = Math.round((working + fold) * 100) / 100
       rollN += 1
     } else {
       pot = Math.round(Math.max(0, working - t.amount) * 100) / 100

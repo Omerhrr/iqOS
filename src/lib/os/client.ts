@@ -504,9 +504,18 @@ export interface BotConfig {
   dailyProfitTarget?: number
   dailyLossLimit?: number
   /** 'compound': a pot seeded at base (e.g. $1) rolls rollPct% of itself into
-   * every trade; wins fold the payout in, a loss empties it (restart at base). */
-  stakePlan?: { kind: 'fixed' | 'compound'; base: number; rollPct?: number; maxStake?: number }
-  planState?: { pot: number; rollN: number; restarts: number }
+   * every trade; wins fold the payout in (capped at payoutCap%, default+max
+   * 70). stopOnLoss (default true): one loss ENDS the cycle - the bot stands
+   * down until an explicit restart. */
+  stakePlan?: {
+    kind: 'fixed' | 'compound'
+    base: number
+    rollPct?: number
+    maxStake?: number
+    payoutCap?: number
+    stopOnLoss?: boolean
+  }
+  planState?: { pot: number; rollN: number; restarts: number; halted?: boolean }
 }
 
 export interface BotStats {
@@ -521,6 +530,7 @@ export interface BotStats {
   pot: number
   rollN: number
   restarts: number
+  halted: boolean
 }
 
 export interface BotRow {

@@ -32,13 +32,12 @@ export interface BotConfig {
   dailyProfitTarget?: number
   dailyLossLimit?: number
   /** Money-management plan. 'fixed' (default/undefined) always bets `stake`.
-   * 'compound' rolls a pot that starts at `base` (e.g. $1): every win adds the
-   * payout to the pot, every loss empties it and the next trade restarts at
-   * base - the seed stake compounded to the nth win. */
+   * 'compound' rolls a pot that starts at `base` (e.g. $1): every win folds the
+   * payout into the pot - the seed stake compounded to the nth win. */
   stakePlan?: StakePlan
-  /** Persisted roll state (pot/rollN/restarts) - written by the autopilot on
-   * every settle so the compounding streak survives kernel restarts. */
-  planState?: { pot: number; rollN: number; restarts: number }
+  /** Persisted roll state (pot/rollN/restarts/halted) - written by the
+   * autopilot on every settle so the compounding streak survives restarts. */
+  planState?: { pot: number; rollN: number; restarts: number; halted?: boolean }
 }
 
 export interface StakePlan {
@@ -46,6 +45,15 @@ export interface StakePlan {
   base: number // seed stake of each compounding cycle, e.g. 1
   rollPct?: number // % of the pot wagered each trade (default 100 = full roll)
   maxStake?: number // per-trade cap; the global risk manager still outranks
+  /** Hard ceiling on the payout used for compounding (fold-in), as a %.
+   * A broker paying more than the cap gets the excess skimmed to the balance,
+   * never compounded. Clamped to 1..70 - 70% is the house maximum "no matter
+   * what". Default 70. */
+  payoutCap?: number
+  /** Once the cycle takes a loss the sequence ENDS: the bot stands down until
+   * an explicit restart (bot_restart). Default true. false = legacy behaviour
+   * (the pot re-seeds at base and keeps trading). */
+  stopOnLoss?: boolean
 }
 
 export interface BotStats {
@@ -60,6 +68,7 @@ export interface BotStats {
   pot: number // compounding roll (0 = next trade starts a fresh cycle at base)
   rollN: number // wins compounded in the current cycle
   restarts: number // completed cycles (win streaks that ended)
+  halted: boolean // compound stop-on-loss: cycle ended, awaiting restart
 }
 
 export interface BotRow {
@@ -99,6 +108,7 @@ interface RuntimeState {
   pot: number // compounding roll; 0 = fresh cycle at base
   rollN: number
   restarts: number
+  halted: boolean // stop-on-loss: cycle ended, awaiting explicit restart
 }
 
 export class AutopilotService {
@@ -203,6 +213,24 @@ export class AutopilotService {
     return { ok, error: ok ? undefined : 'bot not found' }
   }
 
+  /** Revive a compound bot after a stop-on-loss halt (or proactively re-seed):
+   * clears the halt, zeroes the pot/roll so the next trade bets the seed
+   * again. The cumulative cycle counter is kept. */
+  restartBot(id: string): { ok: boolean; bot?: BotConfig; error?: string } {
+    const found = this.store.listBots().find((b) => b.bot.id === id)
+    if (!found) return { ok: false, error: 'bot not found' }
+    const bot = found.bot
+    if (bot.stakePlan?.kind !== 'compound') return { ok: false, error: 'restart applies to compound bots only' }
+    const rt = this.runtime.get(id) ?? this.buildRuntime(id)
+    rt.halted = false
+    rt.pot = 0
+    rt.rollN = 0
+    rt.lastRejection = undefined
+    this.store.saveBot({ ...bot, planState: { pot: 0, rollN: 0, restarts: rt.restarts } })
+    this.emit('success', `[${bot.name}] compound cycle RESTARTED - next trade seeds $${bot.stakePlan.base}`)
+    return { ok: true, bot: this.store.listBots().find((b) => b.bot.id === id)?.bot }
+  }
+
   toggleBot(id: string, enabled?: boolean): { ok: boolean; bot?: BotConfig; error?: string } {
     const found = this.store.listBots().find((b) => b.bot.id === id)
     if (!found) return { ok: false, error: 'bot not found' }
@@ -248,6 +276,12 @@ export class AutopilotService {
       rt.losses = 0
       rt.pnlToday = 0
       rt.streak = 0
+    }
+
+    // compound stop-on-loss: a cycle that took a loss is DEAD - the bot stands
+    // down (but stays armed/configured) until an explicit bot_restart
+    if (bot.stakePlan?.kind === 'compound' && bot.stakePlan.stopOnLoss !== false && rt.halted) {
+      return this.reject(bot, 'compound cycle ended on a loss - restart to trade again')
     }
 
     // per-bot circuit breakers
@@ -350,6 +384,8 @@ export class AutopilotService {
       base: clampNum(p.base ?? 1, 1, 5000),
       rollPct: p.rollPct !== undefined ? clampNum(p.rollPct, 1, 100) : undefined,
       maxStake: p.maxStake !== undefined ? clampNum(p.maxStake, 1, 5000) : undefined,
+      payoutCap: p.payoutCap !== undefined ? clampNum(p.payoutCap, 1, 70) : undefined,
+      stopOnLoss: p.stopOnLoss !== undefined ? Boolean(p.stopOnLoss) : undefined,
     }
   }
 
@@ -416,16 +452,27 @@ export class AutopilotService {
       const base = bot.stakePlan.base
       const working = rt.pot >= 0.01 ? rt.pot : base
       if (position.status === 'won') {
-        rt.pot = Math.round((working + (position.pnl ?? position.amount * position.payout)) * 100) / 100
+        // payout cap: fold in at most payoutCap% (default+max 70) of the stake
+        // as profit - a broker paying more gets the excess skimmed to the
+        // balance, never compounded into the pot
+        const cap = (bot.stakePlan.payoutCap ?? 70) / 100
+        const fold = Math.min(position.pnl ?? position.amount * position.payout, position.amount * cap)
+        rt.pot = Math.round((working + fold) * 100) / 100
         rt.rollN += 1
       } else if (position.status === 'lost') {
         rt.pot = Math.round(Math.max(0, working - position.amount) * 100) / 100
         if (rt.rollN > 0) rt.restarts += 1 // a winning streak ended
         rt.rollN = 0
+        // stop-on-loss (default): the sequence is over - stand down until an
+        // explicit bot_restart. stopOnLoss:false keeps the legacy re-seed roll.
+        if (bot.stakePlan.stopOnLoss !== false) rt.halted = true
       }
       // survive restarts: persist the roll on the bot record (raw store write
       // - the validating saveBot would emit an alert every settle)
-      this.store.saveBot({ ...bot, planState: { pot: rt.pot, rollN: rt.rollN, restarts: rt.restarts } })
+      this.store.saveBot({
+        ...bot,
+        planState: { pot: rt.pot, rollN: rt.rollN, restarts: rt.restarts, ...(rt.halted ? { halted: true } : {}) },
+      })
     }
   }
 
@@ -448,6 +495,7 @@ export class AutopilotService {
       pot: cfg?.planState?.pot ?? 0,
       rollN: cfg?.planState?.rollN ?? 0,
       restarts: cfg?.planState?.restarts ?? 0,
+      halted: cfg?.planState?.halted ?? false,
     }
     const journal = this.store.botJournal(botId, 400)
     for (const p of journal) {
@@ -501,6 +549,7 @@ export class AutopilotService {
         pot: rt.pot,
         rollN: rt.rollN,
         restarts: rt.restarts,
+        halted: rt.halted,
       }
     }
     const fresh = this.buildRuntime(botId)
@@ -517,6 +566,7 @@ export class AutopilotService {
       pot: fresh.pot,
       rollN: fresh.rollN,
       restarts: fresh.restarts,
+      halted: fresh.halted,
     }
   }
 

@@ -375,10 +375,13 @@ const httpServer = createServer(async (req, res) => {
 
       // Compounding stake schedule (pure math, no state): pot_0 = base, each
       // win multiplies the pot by (1 + rollPct*payout), stake_n = rollPct% of
-      // pot_n. Full roll + 85% payout + $1 => 1, 1.85, 3.42, 6.33, ...
+      // pot_n. PAYOUT IS CAPPED AT 70% no matter what the broker pays - the
+      // engine folds in at most payoutCap of the stake, the excess is skimmed.
       if (path === '/compound_plan') {
+        const PAYOUT_CAP = 0.7
         const base = Math.max(1, Number(q.get('base') ?? 1) || 1)
-        const payout = Math.min(1, Math.max(0.01, Number(q.get('payout') ?? 0.85) || 0.85))
+        const rawPayout = Math.min(1, Math.max(0.01, Number(q.get('payout') ?? PAYOUT_CAP) || PAYOUT_CAP))
+        const payout = Math.min(rawPayout, PAYOUT_CAP) // hard cap: compounding never assumes > 70%
         const rollPct = Math.min(100, Math.max(1, Number(q.get('rollPct') ?? 100) || 100))
         const steps = Math.min(30, Math.max(1, Math.round(Number(q.get('steps') ?? 10) || 10)))
         const maxStake = Number(q.get('maxStake') ?? 0) || undefined
@@ -398,7 +401,20 @@ const httpServer = createServer(async (req, res) => {
           cum += s.stake
           s.lossAt = Math.round(cum * 100) / 100
         }
-        return json(200, { ok: true, base, payout, rollPct, steps, growth: Math.round(growth * 10000) / 10000, schedule, hitCapAt })
+        return json(200, {
+          ok: true,
+          base,
+          payout,
+          rawPayout,
+          payoutCap: PAYOUT_CAP,
+          capped: rawPayout > PAYOUT_CAP,
+          rollPct,
+          steps,
+          growth: Math.round(growth * 10000) / 10000,
+          schedule,
+          hitCapAt,
+          stopOnLoss: true,
+        })
       }
 
       if (path === '/journal') {
@@ -864,6 +880,12 @@ const httpServer = createServer(async (req, res) => {
       if (path === '/bot_toggle') {
         const bots = kernel.context().use<AutopilotService>('autopilot')
         return json(200, bots.toggleBot(String(body.id ?? ''), body.enabled === undefined ? undefined : Boolean(body.enabled)))
+      }
+
+      if (path === '/bot_restart') {
+        // compound stop-on-loss: revive a halted cycle (clears halt, re-seeds pot)
+        const bots = kernel.context().use<AutopilotService>('autopilot')
+        return json(200, bots.restartBot(String(body.id ?? '')))
       }
 
       // ---------- discovery control ----------
