@@ -31,6 +31,21 @@ export interface BotConfig {
   cooldownSec: number
   dailyProfitTarget?: number
   dailyLossLimit?: number
+  /** Money-management plan. 'fixed' (default/undefined) always bets `stake`.
+   * 'compound' rolls a pot that starts at `base` (e.g. $1): every win adds the
+   * payout to the pot, every loss empties it and the next trade restarts at
+   * base - the seed stake compounded to the nth win. */
+  stakePlan?: StakePlan
+  /** Persisted roll state (pot/rollN/restarts) - written by the autopilot on
+   * every settle so the compounding streak survives kernel restarts. */
+  planState?: { pot: number; rollN: number; restarts: number }
+}
+
+export interface StakePlan {
+  kind: 'fixed' | 'compound'
+  base: number // seed stake of each compounding cycle, e.g. 1
+  rollPct?: number // % of the pot wagered each trade (default 100 = full roll)
+  maxStake?: number // per-trade cap; the global risk manager still outranks
 }
 
 export interface BotStats {
@@ -42,6 +57,9 @@ export interface BotStats {
   openCount: number
   lastTradeTs: number
   streak: number // positive = consecutive wins, negative = consecutive losses
+  pot: number // compounding roll (0 = next trade starts a fresh cycle at base)
+  rollN: number // wins compounded in the current cycle
+  restarts: number // completed cycles (win streaks that ended)
 }
 
 export interface BotRow {
@@ -78,6 +96,9 @@ interface RuntimeState {
   lastTradeTs: number
   streak: number
   lastRejection?: string
+  pot: number // compounding roll; 0 = fresh cycle at base
+  rollN: number
+  restarts: number
 }
 
 export class AutopilotService {
@@ -154,7 +175,11 @@ export class AutopilotService {
       cooldownSec: Math.max(0, Math.round(input.cooldownSec ?? existing?.cooldownSec ?? DEFAULT_BOT.cooldownSec)),
       dailyProfitTarget: input.dailyProfitTarget !== undefined ? Number(input.dailyProfitTarget) : existing?.dailyProfitTarget,
       dailyLossLimit: input.dailyLossLimit !== undefined ? Number(input.dailyLossLimit) : existing?.dailyLossLimit,
+      stakePlan: this.parseStakePlan(input.stakePlan, existing?.stakePlan),
     }
+    // a materially different plan invalidates the persisted roll - start clean
+    const planChanged = JSON.stringify(bot.stakePlan ?? null) !== JSON.stringify(existing?.stakePlan ?? null)
+    bot.planState = planChanged ? undefined : input.planState ?? existing?.planState
     if (!bot.watchlist.length) return { ok: false, error: 'watchlist needs at least one valid instrument' }
     if (!getStrategy(bot.strategyId)) return { ok: false, error: `unknown strategy ${bot.strategyId}` }
     this.store.saveBot(bot)
@@ -294,12 +319,13 @@ export class AutopilotService {
     }
 
     // execute - the ExecutionService risk manager is the final gate
+    const bet = this.stakeFor(bot, rt)
     const out = await this.exec.placeOrder({
       asset,
       tf,
       side: wanted,
       kind: bot.kind,
-      amount: bot.stake,
+      amount: bet.amount,
       expiryBars: bot.expiryBars,
       mode: 'paper',
       strategy: bot.strategyId,
@@ -311,7 +337,34 @@ export class AutopilotService {
     rt.trades += 1
     rt.lastTradeTs = Math.floor(Date.now() / 1000)
     rt.lastRejection = undefined
-    this.emit('success', `[${bot.name}] ${wanted.toUpperCase()} ${asset} $${bot.stake} ${bot.kind} @ ${evalOut.price.toFixed(5)} - ${evalOut.notes} (score ${evalOut.score.toFixed(0)})`)
+    const roll = bet.compound ? ` - compound roll x${bet.rollN + 1} (pot $${bet.pot.toFixed(2)})` : ''
+    this.emit('success', `[${bot.name}] ${wanted.toUpperCase()} ${asset} $${bet.amount} ${bot.kind} @ ${evalOut.price.toFixed(5)} - ${evalOut.notes} (score ${evalOut.score.toFixed(0)})${roll}`)
+  }
+
+  /** Normalize an incoming stake plan; undefined (or 'fixed') = classic fixed stake. */
+  private parseStakePlan(raw: unknown, existing?: StakePlan): StakePlan | undefined {
+    const p = (raw ?? existing) as Partial<StakePlan> | undefined
+    if (!p || p.kind !== 'compound') return undefined
+    return {
+      kind: 'compound',
+      base: clampNum(p.base ?? 1, 1, 5000),
+      rollPct: p.rollPct !== undefined ? clampNum(p.rollPct, 1, 100) : undefined,
+      maxStake: p.maxStake !== undefined ? clampNum(p.maxStake, 1, 5000) : undefined,
+    }
+  }
+
+  /** Next stake for a bot: fixed bots always bet bot.stake; compound bots bet
+   * rollPct% of the current pot (pot 0 = fresh cycle at base). Returns the
+   * plan context too so the trade alert can show the roll state. */
+  private stakeFor(bot: BotConfig, rt: RuntimeState): { amount: number; pot: number; rollN: number; compound: boolean } {
+    const plan = bot.stakePlan?.kind === 'compound' ? bot.stakePlan : null
+    if (!plan) return { amount: bot.stake, pot: 0, rollN: 0, compound: false }
+    // dust guard: a pot worth less than a cent is a fresh cycle
+    const pot = rt.pot >= 0.01 ? rt.pot : plan.base
+    const rollPct = plan.rollPct ?? 100
+    const raw = (pot * rollPct) / 100
+    const amount = Math.min(plan.maxStake ?? 5000, Math.max(1, Math.round(raw * 100) / 100))
+    return { amount, pot, rollN: rt.rollN, compound: true }
   }
 
   private reject(bot: BotConfig, reason: string): void {
@@ -353,6 +406,27 @@ export class AutopilotService {
       rt.streak = rt.streak <= 0 ? rt.streak - 1 : -1
       if (sameDay) rt.pnlToday += pnl
     }
+    // compounding roll: a win folds the payout into the pot, a loss burns the
+    // stake out of it (full roll => pot hits 0 => next trade restarts at base)
+    // Round to cents at EVERY fold: stakes are rounded to cents at open, and an
+    // unrounded pot (3.7636) minus a rounded stake (3.76) leaves dust (0.0036)
+    // that never reaches 0 - the cycle would then compound from dust forever.
+    const bot = this.store.listBots().find((b) => b.bot.id === botId)?.bot
+    if (bot?.stakePlan?.kind === 'compound') {
+      const base = bot.stakePlan.base
+      const working = rt.pot >= 0.01 ? rt.pot : base
+      if (position.status === 'won') {
+        rt.pot = Math.round((working + (position.pnl ?? position.amount * position.payout)) * 100) / 100
+        rt.rollN += 1
+      } else if (position.status === 'lost') {
+        rt.pot = Math.round(Math.max(0, working - position.amount) * 100) / 100
+        if (rt.rollN > 0) rt.restarts += 1 // a winning streak ended
+        rt.rollN = 0
+      }
+      // survive restarts: persist the roll on the bot record (raw store write
+      // - the validating saveBot would emit an alert every settle)
+      this.store.saveBot({ ...bot, planState: { pot: rt.pot, rollN: rt.rollN, restarts: rt.restarts } })
+    }
   }
 
   private botIdOf(position: Position): string | null {
@@ -360,6 +434,7 @@ export class AutopilotService {
   }
 
   private buildRuntime(botId: string): RuntimeState {
+    const cfg = this.store.listBots().find((b) => b.bot.id === botId)?.bot
     const rt: RuntimeState = {
       dayKey: new Date().toISOString().slice(0, 10),
       trades: 0,
@@ -370,6 +445,9 @@ export class AutopilotService {
       openCount: 0,
       lastTradeTs: 0,
       streak: 0,
+      pot: cfg?.planState?.pot ?? 0,
+      rollN: cfg?.planState?.rollN ?? 0,
+      restarts: cfg?.planState?.restarts ?? 0,
     }
     const journal = this.store.botJournal(botId, 400)
     for (const p of journal) {
@@ -420,6 +498,9 @@ export class AutopilotService {
         openCount: rt.openCount,
         lastTradeTs: rt.lastTradeTs,
         streak: rt.streak,
+        pot: rt.pot,
+        rollN: rt.rollN,
+        restarts: rt.restarts,
       }
     }
     const fresh = this.buildRuntime(botId)
@@ -433,6 +514,9 @@ export class AutopilotService {
       openCount: fresh.openCount,
       lastTradeTs: fresh.lastTradeTs,
       streak: fresh.streak,
+      pot: fresh.pot,
+      rollN: fresh.rollN,
+      restarts: fresh.restarts,
     }
   }
 

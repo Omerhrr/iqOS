@@ -569,9 +569,23 @@ const TOOLS: ToolSpec[] = [
     run: () => coreGet('/bots'),
   },
   {
+    name: 'compound_plan',
+    description: 'Compute a compounding stake schedule for a seed stake: pot starts at base (e.g. $1), every win multiplies the pot by (1 + rollPct*payout), stake_n = rollPct% of pot_n. Full roll at 85% payout: 1, 1.85, 3.42, 6.33, 11.71... Use it to SHOW the user how far their seed compounds before deploying a compounding bot. Args: base (seed stake, default 1), payout (0-1, default 0.85), steps (default 10), rollPct (default 100), maxStake (optional per-trade cap - response marks hitCapAt).',
+    args: '{"base": 1, "payout": 0.85, "steps": 10, "rollPct": 100}',
+    run: (a) => {
+      const p = new URLSearchParams()
+      if (a.base !== undefined) p.set('base', String(Number(a.base)))
+      if (a.payout !== undefined) p.set('payout', String(Number(a.payout)))
+      if (a.steps !== undefined) p.set('steps', String(Math.round(Number(a.steps))))
+      if (a.rollPct !== undefined) p.set('rollPct', String(Number(a.rollPct)))
+      if (a.maxStake !== undefined) p.set('maxStake', String(Number(a.maxStake)))
+      return coreGet(`/compound_plan?${p.toString()}`)
+    },
+  },
+  {
     name: 'bot_create',
-    description: 'Create or update an autopilot bot. Required: watchlist (array of tickers), strategyId (from list_strategies), tf. Optional: name, kind (binary|turbo|digital|cfd), stake, expiryBars, minScore (min |signal score| to trade, default 55), direction (both|call|put), regime (all|trend|range), maxOpen, cooldownSec, dailyProfitTarget, dailyLossLimit, enabled. Bots trade automatically on candle close and are always subject to the global risk manager.',
-    args: '{"name": "EUR Reversion", "watchlist": ["EURUSD", "GBPUSD"], "strategyId": "rsi-reversion", "tf": "1m", "stake": 10, "minScore": 60, "enabled": true}',
+    description: 'Create or update an autopilot bot. Required: watchlist (array of tickers), strategyId (from list_strategies), tf. Optional: name, kind (binary|turbo|digital|cfd), stake, expiryBars, minScore (min |signal score| to trade, default 55), direction (both|call|put), regime (all|trend|range), maxOpen, cooldownSec, dailyProfitTarget, dailyLossLimit, enabled, stakePlan. COMPOUNDING: pass stakePlan {kind:"compound", base:1, rollPct:100, maxStake:50} to roll a pot - the first trade stakes base, every win folds the payout into the pot, a loss empties it and the next trade restarts at base (set maxOpen:1 for a clean one-trade-at-a-time ladder; stake is then ignored). Show the ladder first with compound_plan. Bots trade automatically on candle close and are always subject to the global risk manager.',
+    args: '{"name": "EUR compound", "watchlist": ["EURUSD"], "strategyId": "rsi-reversion", "tf": "1m", "stakePlan": {"kind": "compound", "base": 1, "maxStake": 50}, "minScore": 60, "maxOpen": 1, "enabled": true}',
     run: (a) =>
       corePost('/bot_save', {
         ...a,
@@ -1350,6 +1364,7 @@ Rules:
 - Use ui_control to set up the workspace when it helps (e.g. add Bollinger + RSI before a detailed read, or switch to the asset you're discussing). Do not undo the user's layout gratuitously. The chart starts CLEAN (no default overlays) and the user's indicator selection PERSISTS across page refreshes - so adding an indicator is safe and durable; classic render forms apply: psar draws as traditional dots, "fractals" as swing arrows (red above highs, green below lows), "zigzag" as connected swing segments.
 - For trade ideas: check multi_timeframe confluence first, size with risk_calculator, then optionally place_trade as PAPER and say so.
 - When the user asks to automate a strategy, deploy a bot with bot_create: pick a sensible strategyId, conservative stake (<=2% of balance), minScore >= 55, and always confirm the config in your final answer. Backtest or run_strategy first when unsure about the edge.
+- COMPOUNDING bots: when the user wants winnings to roll ("let it ride", "compound my $1"), deploy bot_create with stakePlan {kind:"compound", base:<seed>, rollPct:100, maxStake:<cap>} and maxOpen 1. First show the ladder with compound_plan (base x (1+payout)^n) and remind them one loss resets the roll to the seed - that is the deal with compounding.
 - RESEARCH WORKFLOW (use it whenever the user wants a validated strategy or asks "is this edge real"): 1) asset_sweep to find WHERE a strategy has an edge, 2) optimize_strategy on the best assets to find strong params, 3) walkforward on the winner - deploy only if OOS net is positive and at least half the folds were profitable, 4) only then bot_create with the validated params (keep the bot DISARMED and tell the user to arm it when ready). After arming, the watchdog watches the live edge - mention that. Research reads DEEP archived history; archive_status shows how much depth exists per asset - if depth is thin, warn that results may not be significant yet. Report IS vs OOS numbers honestly - large drops from in-sample to out-of-sample mean overfit.
 - When the user asks to be notified/watch an instrument ("alert me when...", "let me know if..."), create an alert rule with alert_rule_create and confirm the trigger in plain words. NEVER use alert rules to trade - they only notify.
 - NEVER promise profits. Always frame outputs as probabilistic analysis, not certainty.

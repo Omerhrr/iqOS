@@ -373,6 +373,34 @@ const httpServer = createServer(async (req, res) => {
         })
       }
 
+      // Compounding stake schedule (pure math, no state): pot_0 = base, each
+      // win multiplies the pot by (1 + rollPct*payout), stake_n = rollPct% of
+      // pot_n. Full roll + 85% payout + $1 => 1, 1.85, 3.42, 6.33, ...
+      if (path === '/compound_plan') {
+        const base = Math.max(1, Number(q.get('base') ?? 1) || 1)
+        const payout = Math.min(1, Math.max(0.01, Number(q.get('payout') ?? 0.85) || 0.85))
+        const rollPct = Math.min(100, Math.max(1, Number(q.get('rollPct') ?? 100) || 100))
+        const steps = Math.min(30, Math.max(1, Math.round(Number(q.get('steps') ?? 10) || 10)))
+        const maxStake = Number(q.get('maxStake') ?? 0) || undefined
+        const growth = 1 + (rollPct * payout) / 100
+        const schedule: { n: number; pot: number; stake: number; lossAt: number }[] = []
+        let hitCapAt: number | undefined
+        for (let n = 0; n < steps; n++) {
+          const pot = base * Math.pow(growth, n)
+          const stake = (pot * rollPct) / 100
+          if (maxStake && stake > maxStake && hitCapAt === undefined) hitCapAt = n
+          schedule.push({ n, pot: Math.round(pot * 100) / 100, stake: Math.round(stake * 100) / 100, lossAt: 0 })
+        }
+        // lossAt: cumulative capital burned if the cycle dies at step n
+        // (every stake 0..n was lost along the way)
+        let cum = 0
+        for (const s of schedule) {
+          cum += s.stake
+          s.lossAt = Math.round(cum * 100) / 100
+        }
+        return json(200, { ok: true, base, payout, rollPct, steps, growth: Math.round(growth * 10000) / 10000, schedule, hitCapAt })
+      }
+
       if (path === '/journal') {
         const store = kernel.context().use<{ journal: (p?: string, l?: number) => unknown[]; stats: () => unknown }>('storeRaw')
         const scope = q.get('scope') ?? 'all' // all | bots | auto | manual

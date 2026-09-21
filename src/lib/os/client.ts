@@ -503,6 +503,10 @@ export interface BotConfig {
   cooldownSec: number
   dailyProfitTarget?: number
   dailyLossLimit?: number
+  /** 'compound': a pot seeded at base (e.g. $1) rolls rollPct% of itself into
+   * every trade; wins fold the payout in, a loss empties it (restart at base). */
+  stakePlan?: { kind: 'fixed' | 'compound'; base: number; rollPct?: number; maxStake?: number }
+  planState?: { pot: number; rollN: number; restarts: number }
 }
 
 export interface BotStats {
@@ -514,6 +518,9 @@ export interface BotStats {
   openCount: number
   lastTradeTs: number
   streak: number
+  pot: number
+  rollN: number
+  restarts: number
 }
 
 export interface BotRow {

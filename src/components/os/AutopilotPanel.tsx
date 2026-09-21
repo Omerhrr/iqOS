@@ -288,13 +288,57 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
             </div>
 
             <div>
-              <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Stake $</Label>
+              <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">
+                {draft.stakePlan?.kind === 'compound' ? 'Seed stake $ (ignored)' : 'Stake $'}
+              </Label>
               <Input
                 value={String(draft.stake)}
                 onChange={(e) => patch({ stake: Number(e.target.value.replace(/[^0-9.]/g, '')) || 0 })}
                 className="h-8 border-[#1c2739] bg-[#101828] text-right text-[12px] text-[#e2e8f0]"
               />
             </div>
+
+            <Segmented
+              label="Stake plan"
+              options={[
+                { v: 'fixed', label: 'Fixed' },
+                { v: 'compound', label: 'Compound' },
+              ]}
+              value={draft.stakePlan?.kind === 'compound' ? 'compound' : 'fixed'}
+              onChange={(v) =>
+                patch({
+                  stakePlan:
+                    v === 'compound'
+                      ? {
+                          kind: 'compound',
+                          base: draft.stakePlan?.base ?? 1,
+                          rollPct: draft.stakePlan?.rollPct ?? 100,
+                          maxStake: draft.stakePlan?.maxStake,
+                        }
+                      : undefined,
+                })
+              }
+            />
+
+            {draft.stakePlan?.kind === 'compound' && (
+              <>
+                <NumField
+                  label="Seed stake $ (each restart)"
+                  value={draft.stakePlan.base}
+                  onChange={(v) => patch({ stakePlan: { kind: 'compound', base: Math.max(1, v), rollPct: draft.stakePlan?.rollPct, maxStake: draft.stakePlan?.maxStake } })}
+                />
+                <NumField
+                  label="Roll % of pot (100 = all-in)"
+                  value={draft.stakePlan.rollPct ?? 100}
+                  onChange={(v) => patch({ stakePlan: { kind: 'compound', base: draft.stakePlan?.base ?? 1, rollPct: Math.min(100, Math.max(1, v)), maxStake: draft.stakePlan?.maxStake } })}
+                />
+                <NumField
+                  label="Max stake cap $ (0 = none)"
+                  value={draft.stakePlan.maxStake ?? 0}
+                  onChange={(v) => patch({ stakePlan: { kind: 'compound', base: draft.stakePlan?.base ?? 1, rollPct: draft.stakePlan?.rollPct, maxStake: v > 0 ? v : undefined } })}
+                />
+              </>
+            )}
 
             <div className="col-span-2">
               <div className="flex items-center justify-between">
@@ -483,7 +527,15 @@ function BotCard({
         <span className="rounded bg-[#101828] px-1 py-px">{bot.tf}</span>
         <span className="rounded bg-[#101828] px-1 py-px">{KIND_LABEL[bot.kind]}</span>
         <span className="rounded bg-[#101828] px-1 py-px">min {bot.minScore}</span>
-        <span className="rounded bg-[#101828] px-1 py-px">${bot.stake}</span>
+        {bot.stakePlan?.kind === 'compound' ? (
+          <span className="rounded bg-violet-500/15 px-1 py-px text-violet-300">
+            compound ${bot.stakePlan.base}
+            {bot.stakePlan.rollPct !== undefined && bot.stakePlan.rollPct !== 100 ? ` · roll ${bot.stakePlan.rollPct}%` : ''}
+            {bot.stakePlan.maxStake ? ` · cap $${bot.stakePlan.maxStake}` : ''}
+          </span>
+        ) : (
+          <span className="rounded bg-[#101828] px-1 py-px">${bot.stake}</span>
+        )}
         {bot.direction !== 'both' && <span className="rounded bg-[#101828] px-1 py-px">{bot.direction} only</span>}
         {bot.regime !== 'all' && <span className="rounded bg-[#101828] px-1 py-px">{bot.regime} regime</span>}
       </div>
@@ -495,6 +547,13 @@ function BotCard({
             today {stats.pnlToday >= 0 ? '+' : ''}{fmtMoney(stats.pnlToday)}
           </span>
           {winRate !== null && <span className="text-[#7c8aa5]">{Math.round(winRate * 100)}% win</span>}
+          {bot.stakePlan?.kind === 'compound' && (
+            <span className="text-violet-300/80">
+              roll x{stats.rollN}
+              {stats.pot > 0 ? ` · pot ${fmtMoney(stats.pot)}` : ' · at seed'}
+              {stats.restarts > 0 ? ` · ${stats.restarts} cycles` : ''}
+            </span>
+          )}
           {stats.streak !== 0 && (
             <span className={stats.streak > 0 ? 'text-emerald-400/70' : 'text-rose-400/70'}>
               {stats.streak > 0 ? `+${stats.streak}` : stats.streak}
