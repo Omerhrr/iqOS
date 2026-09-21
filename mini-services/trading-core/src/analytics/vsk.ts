@@ -156,16 +156,32 @@ function layerVWAP(candles: Candle[], period: number): { vwap: number[]; z: numb
   return { vwap, z }
 }
 
+// Shared layer-engine config views: TSK (the volume-free sibling algorithm)
+// reuses the L2/L3/L4 engines verbatim, so they are typed on the narrow field
+// set they actually consume - VSKParams satisfies both structurally.
+export interface SqueezeCfg {
+  bbPeriod: number
+  bbMult: number
+  kcMult: number
+  pctLookback: number
+  widthPctRunaway: number
+  slopePctRunaway: number
+}
+export interface KalmanCfg {
+  kalmanQ: number
+  kalmanR: number
+}
+
 /**
  * L2 - TTM-style squeeze + BB-width percentile. Squeeze ON = Bollinger bands
  * inside the Keltner envelope (volatility compression). widthPct ranks the
  * current band width against recent history; combined with the Kalman slope
  * rank it detects a RUNAWAY trend (both expanding and steep) which blocks
- * fade entries.
+ * fade entries. SHARED ENGINE (VSK L2 = TSK L2).
  */
-function layerSqueeze(
+export function layerSqueeze(
   candles: Candle[],
-  p: VSKParams,
+  p: SqueezeCfg,
   slope: number[]
 ): { squeezeOn: boolean[]; widthPct: number[]; slopePct: number[]; runaway: boolean[] } {
   const n = candles.length
@@ -213,8 +229,9 @@ function pctRankAbs(xs: number[], i: number, window: number, v: number): number 
  * L3 - two-state (level + slope) Kalman filter, the "structural curve".
  * Q and R are scaled by the rolling price variance so the SAME tuning works
  * on EURUSD (1.14) and BTC (60000). Output: filtered level + slope per bar.
+ * SHARED ENGINE (VSK L3 = TSK L3).
  */
-function layerKalman(candles: Candle[], p: VSKParams): { kalman: number[]; slope: number[]; varScale: number[] } {
+export function layerKalman(candles: Candle[], p: KalmanCfg): { kalman: number[]; slope: number[]; varScale: number[] } {
   const n = candles.length
   const kalman = new Array<number>(n).fill(NaN)
   const slope = new Array<number>(n).fill(NaN)
@@ -282,9 +299,9 @@ function layerKalman(candles: Candle[], p: VSKParams): { kalman: number[]; slope
 /**
  * L4 - Parabolic SAR (Wilder) on the Kalman curve. Feeding the filtered curve
  * as both high and low makes the flip fire the exact bar the STRUCTURE turns,
- * not bars later on noisy raw price.
+ * not bars later on noisy raw price. SHARED ENGINE (VSK L4 = TSK L4).
  */
-function layerSAR(curve: number[], step: number, max: number): { sar: number[]; dir: number[] } {
+export function layerSAR(curve: number[], step: number, max: number): { sar: number[]; dir: number[] } {
   const n = curve.length
   const sar = new Array<number>(n).fill(NaN)
   const dir = new Array<number>(n).fill(0)

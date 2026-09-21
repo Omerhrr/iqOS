@@ -7,6 +7,7 @@ import { markovChain } from '../analytics/quant'
 import { detectPatterns, patternBias } from '../analytics/patterns'
 import { ouState } from '../analytics/kalman'
 import { vskEvaluate, VSK_DEFAULTS } from '../analytics/vsk'
+import { tskEvaluate, TSK_DEFAULTS } from '../analytics/tsk'
 
 const last = (arr: number[]): number => {
   for (let i = arr.length - 1; i >= 0; i--) if (Number.isFinite(arr[i])) return arr[i]
@@ -281,6 +282,35 @@ export const STRATEGIES: StrategyDef[] = [
         kalmanR: num(p, 'kalmanR', VSK_DEFAULTS.kalmanR),
         sarStep: num(p, 'sarStep', VSK_DEFAULTS.sarStep),
         sarMax: num(p, 'sarMax', VSK_DEFAULTS.sarMax),
+      }),
+  },
+  {
+    id: 'tsk-synthesis',
+    name: 'TSK Synthesis (4-Layer, Volume-Free)',
+    description:
+      'VSK\'s volume-free sibling: L1 least-squares TRENDLINE z-score arms the setup when price stretches N sigmas off the fitted trend (deviation channel - no VWAP, no volume), L2 volatility squeeze blocks runaway trends, L3 Kalman curve confirms the structural turn, L4 PSAR on the FILTERED curve fires the exact flip bar. Entry = all four agree.',
+    params: [
+      { key: 'tlPeriod', label: 'L1 trendline window', type: 'number', min: 10, max: 240, default: TSK_DEFAULTS.tlPeriod },
+      { key: 'zEntry', label: 'L1 z entry', type: 'number', min: 1, max: 4, step: 0.1, default: TSK_DEFAULTS.zEntry },
+      { key: 'armWindow', label: 'L1 arm window (bars)', type: 'number', min: 1, max: 40, default: TSK_DEFAULTS.armWindow },
+      { key: 'widthPctRunaway', label: 'L2 width runaway %', type: 'number', min: 50, max: 100, default: TSK_DEFAULTS.widthPctRunaway },
+      { key: 'slopePctRunaway', label: 'L2 slope runaway %', type: 'number', min: 50, max: 100, default: TSK_DEFAULTS.slopePctRunaway },
+      { key: 'kalmanQ', label: 'L3 Kalman Q', type: 'number', min: 0.001, max: 0.2, step: 0.001, default: TSK_DEFAULTS.kalmanQ },
+      { key: 'kalmanR', label: 'L3 Kalman R', type: 'number', min: 0.1, max: 10, step: 0.1, default: TSK_DEFAULTS.kalmanR },
+      { key: 'sarStep', label: 'L4 SAR step', type: 'number', min: 0.005, max: 0.1, step: 0.005, default: TSK_DEFAULTS.sarStep },
+      { key: 'sarMax', label: 'L4 SAR max AF', type: 'number', min: 0.05, max: 0.5, step: 0.01, default: TSK_DEFAULTS.sarMax },
+    ],
+    evaluate: (candles, p) =>
+      tskEvaluate(candles, {
+        tlPeriod: num(p, 'tlPeriod', TSK_DEFAULTS.tlPeriod),
+        zEntry: num(p, 'zEntry', TSK_DEFAULTS.zEntry),
+        armWindow: num(p, 'armWindow', TSK_DEFAULTS.armWindow),
+        widthPctRunaway: num(p, 'widthPctRunaway', TSK_DEFAULTS.widthPctRunaway),
+        slopePctRunaway: num(p, 'slopePctRunaway', TSK_DEFAULTS.slopePctRunaway),
+        kalmanQ: num(p, 'kalmanQ', TSK_DEFAULTS.kalmanQ),
+        kalmanR: num(p, 'kalmanR', TSK_DEFAULTS.kalmanR),
+        sarStep: num(p, 'sarStep', TSK_DEFAULTS.sarStep),
+        sarMax: num(p, 'sarMax', TSK_DEFAULTS.sarMax),
       }),
   },
 ]

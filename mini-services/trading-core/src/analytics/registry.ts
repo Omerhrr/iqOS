@@ -8,6 +8,7 @@ import type { Candle, IndicatorDef, IndicatorOutput } from '../types'
 import * as TA from './indicators'
 import * as OU from './kalman'
 import { computeVSK, VSK_DEFAULTS } from './vsk'
+import { computeTSK, TSK_DEFAULTS } from './tsk'
 
 const isn = TA.isn
 
@@ -1158,7 +1159,67 @@ const vskIndicators: IndicatorDef[] = [
   },
 ]
 
-export const REGISTRY: IndicatorDef[] = [...overlap, ...momentum, ...volume, ...volatility, ...trend, ...statistic, ...extras, ...extras2, ...vskIndicators]
+const tskIndicators: IndicatorDef[] = [
+  {
+    id: 'tsk', name: 'TSK Synthesis', category: 'trend', pane: 'overlay',
+    params: [
+      p('tlPeriod', 'Trendline window', 10, 240, TSK_DEFAULTS.tlPeriod),
+      p('kalmanQ', 'Kalman Q (response)', 0.001, 0.2, TSK_DEFAULTS.kalmanQ, 0.001),
+      p('kalmanR', 'Kalman R (smooth)', 0.1, 10, TSK_DEFAULTS.kalmanR, 0.1),
+      p('sarStep', 'SAR step', 0.005, 0.1, TSK_DEFAULTS.sarStep, 0.005),
+      p('sarMax', 'SAR max AF', 0.05, 0.5, TSK_DEFAULTS.sarMax, 0.01),
+    ],
+    description: 'TSK Synthesis stack (volume-free): least-squares trendline + deviation channel (L1), Kalman structural curve (L3) and PSAR on the FILTERED curve (L4). Signals fire when the PSAR flips on the curve while price is stretched N sigmas off the trendline and the regime is not a runaway trend (see TSK Z-Score & Trigger pane).',
+    compute: (c, par) => {
+      const s = computeTSK(c, {
+        tlPeriod: num(c, par, 'tlPeriod', TSK_DEFAULTS.tlPeriod),
+        kalmanQ: num(c, par, 'kalmanQ', TSK_DEFAULTS.kalmanQ),
+        kalmanR: num(c, par, 'kalmanR', TSK_DEFAULTS.kalmanR),
+        sarStep: num(c, par, 'sarStep', TSK_DEFAULTS.sarStep),
+        sarMax: num(c, par, 'sarMax', TSK_DEFAULTS.sarMax),
+      })
+      const ze = num(c, par, 'zEntry', TSK_DEFAULTS.zEntry)
+      const chanUp = s.trendline.map((t, i) => (isn(t) && isn(s.sigma[i]) ? t + ze * s.sigma[i] : NaN))
+      const chanDn = s.trendline.map((t, i) => (isn(t) && isn(s.sigma[i]) ? t - ze * s.sigma[i] : NaN))
+      return {
+        lines: [
+          line('trendline', C.slate, s.trendline, 'dashed'),
+          line('chanUp', C.slate, chanUp, 'dotted'),
+          line('chanDn', C.slate, chanDn, 'dotted'),
+          line('kalman', C.violet, s.kalman, 'solid', 2),
+          line('sar', C.teal, s.sar, 'dotted'),
+        ],
+        note: `L1 trendline ±${ze}σ channel · L2 squeeze gate · L3 Kalman curve · L4 PSAR trigger`,
+      }
+    },
+  },
+  {
+    id: 'tsk-z', name: 'TSK Z-Score & Trigger', category: 'momentum', pane: 'sub',
+    params: [
+      p('tlPeriod', 'Trendline window', 10, 240, TSK_DEFAULTS.tlPeriod),
+      p('zEntry', 'Z entry', 1, 4, TSK_DEFAULTS.zEntry, 0.1),
+    ],
+    description: 'TSK layer view: z-score of price vs the least-squares trendline (L1 stretch arms the setup), trigger histogram = the final gated TSK signal (+1 call flip / -1 put flip) and width percentile (L2 squeeze gate).',
+    compute: (c, par) => {
+      const s = computeTSK(c, {
+        tlPeriod: num(c, par, 'tlPeriod', TSK_DEFAULTS.tlPeriod),
+        zEntry: num(c, par, 'zEntry', TSK_DEFAULTS.zEntry),
+      })
+      const ze = num(c, par, 'zEntry', TSK_DEFAULTS.zEntry)
+      return {
+        lines: [
+          line('z', C.cyan, s.z),
+          line('widthPct', C.slate, s.widthPct.map((v) => (isn(v) ? v / 25 : NaN)), 'dotted'), // scaled into z-range (~0..4)
+        ],
+        hist: { values: s.signal, color: 'updown' },
+        levels: [-ze, 0, ze],
+        note: 'z vs trendline · hist = TSK trigger · dotted = BB-width percentile / 25',
+      }
+    },
+  },
+]
+
+export const REGISTRY: IndicatorDef[] = [...overlap, ...momentum, ...volume, ...volatility, ...trend, ...statistic, ...extras, ...extras2, ...vskIndicators, ...tskIndicators]
 
 const REGISTRY_MAP = new Map(REGISTRY.map((d) => [d.id, d]))
 
