@@ -588,7 +588,7 @@ const TOOLS: ToolSpec[] = [
   },
   {
     name: 'bot_create',
-    description: 'Create or update an autopilot bot. Required: watchlist (array of tickers), strategyId (from list_strategies), tf. Optional: name, kind (binary|turbo|digital|cfd), stake, expiryBars, expirySec (TIME-based expiry in seconds for digital bots - "15 minute expiry" = kind digital + expirySec 900, independent of tf), session (all|london|newyork|overlap|asia|sydney - only trade inside that UTC window; overlap = London x New York 13:00-17:00 UTC), minScore (min |signal score| to trade, default 55), direction (both|call|put), regime (all|trend|range), maxOpen, cooldownSec, dailyProfitTarget, dailyLossLimit, enabled, stakePlan. COMPOUNDING: pass stakePlan {kind:"compound", base:1, rollPct:100, maxStake:50} to roll a pot - the first trade stakes base, every win folds the payout into the pot. PAYOUT IS CAPPED AT 70% (payoutCap, max 70 - higher broker payouts are skimmed to balance, never compounded). STOP-ON-LOSS (default true): one loss ENDS the cycle - the bot stands down until the user restarts it with bot_restart; pass stopOnLoss:false to keep the legacy re-seed-and-continue roll instead (set maxOpen:1 for a clean one-trade-at-a-time ladder; stake is then ignored). PERIODS: stakePlan.periods (e.g. 7) bounds the cycle - the Nth WIN completes it; onComplete "halt" (default) stands down until bot_restart, "reseed" auto-starts a fresh cycle. DE-RISK: stakePlan.deriskAfter + deriskPct (e.g. 5 + 50) - after that many wins the bot stakes only that % of the pot ("continue with half the 5th-period amount"), so a late loss cannot give back the whole ladder. Show the ladder first with compound_plan (pass the same periods/derisk). Bots trade automatically on candle close and are always subject to the global risk manager.',
+    description: 'Create or update an autopilot bot. Required: watchlist (array of tickers), strategyId (from list_strategies - builtin ids OR AI-learned "custom:*" ids from the Strategy Lab), tf. Optional: name, kind (binary|turbo|digital|cfd), stake, expiryBars, expirySec (TIME-based expiry in seconds for digital bots - "15 minute expiry" = kind digital + expirySec 900, independent of tf), session (all|london|newyork|overlap|asia|sydney - only trade inside that UTC window; overlap = London x New York 13:00-17:00 UTC), minScore (min |signal score| to trade, default 55), direction (both|call|put), regime (all|trend|range), maxOpen, cooldownSec, dailyProfitTarget, dailyLossLimit, enabled, stakePlan. COMPOUNDING: pass stakePlan {kind:"compound", base:1, rollPct:100, maxStake:50} to roll a pot - the first trade stakes base, every win folds the payout into the pot. PAYOUT IS CAPPED AT 70% (payoutCap, max 70 - higher broker payouts are skimmed to balance, never compounded). STOP-ON-LOSS (default true): one loss ENDS the cycle - the bot stands down until the user restarts it with bot_restart; pass stopOnLoss:false to keep the legacy re-seed-and-continue roll instead (set maxOpen:1 for a clean one-trade-at-a-time ladder; stake is then ignored). PERIODS: stakePlan.periods (e.g. 7) bounds the cycle - the Nth WIN completes it; onComplete "halt" (default) stands down until bot_restart, "reseed" auto-starts a fresh cycle. DE-RISK: stakePlan.deriskAfter + deriskPct (e.g. 5 + 50) - after that many wins the bot stakes only that % of the pot ("continue with half the 5th-period amount"), so a late loss cannot give back the whole ladder. Show the ladder first with compound_plan (pass the same periods/derisk). Bots trade automatically on candle close and are always subject to the global risk manager.',
     args: '{"name": "EUR compound 7p", "watchlist": ["EURUSD", "GBPUSD", "USDJPY"], "strategyId": "confluence-core", "tf": "2m", "kind": "digital", "expirySec": 900, "session": "overlap", "stakePlan": {"kind": "compound", "base": 1, "rollPct": 100, "payoutCap": 70, "stopOnLoss": true, "periods": 7, "deriskAfter": 5, "deriskPct": 50, "onComplete": "halt"}, "minScore": 55, "maxOpen": 1, "enabled": true}',
     run: (a) =>
       corePost('/bot_save', {
@@ -616,6 +616,68 @@ const TOOLS: ToolSpec[] = [
     description: 'Delete an autopilot bot permanently (its trade history stays in the journal).',
     args: '{"id": "bot-abc123"}',
     run: (a) => corePost('/bot_delete', { id: a.id }),
+  },
+  // ---------- strategy lab: the AI learning agent ----------
+  {
+    name: 'lab_learn',
+    description:
+      'LEARN A PAIR - run the AI learning agent over one instrument\'s candle history. It mines edge-bearing events across the FULL pattern vocabulary: 30+ candlestick formations, wide-range bar expansions, Heiken Ashi structures (flip / streak / strong bars), line patterns (Donchian breakouts, higher-highs-lows runs) and its own invented indicators (rsi/bbpos/zscore/donchianpos/macdz/slope/streak/wickbias/emasign/hadist/bodypos) - then measures each event\'s win-rate edge vs the horizon, weights the survivors by edge, calibrates a confluence threshold and backtests the composed spec (full sample + an honest HOLDOUT on the last 30%). Returns: signals table (kind, n, winRate, edgePts, weight, selected), the spec (deployable), calibration sweep, backtest + holdout metrics and breakevenWinRate for the payout. Present the numbers honestly (especially holdout vs breakeven). If ok:false, no event cleared the filters - report it and offer different params/pair. Deploy through lab_save + bot_create with strategyId custom:<id>. Args: asset (required), tf (default 1m), bars (default 1200 max 2200), horizon (bars ahead, default 1), minSamples (default 30), minEdge (win-rate pts above 50, default 1.5), maxSignals (default 8), payout (default 0.7 = the compounding cap), name.',
+    args: '{"asset": "EURUSD", "tf": "1m", "bars": 1200, "horizon": 1, "minSamples": 30, "minEdge": 1.5, "maxSignals": 8, "payout": 0.7}',
+    run: (a) =>
+      corePost('/lab_learn', {
+        asset: String(a.asset),
+        ...(a.tf !== undefined ? { tf: String(a.tf) } : {}),
+        ...(a.bars !== undefined ? { bars: Number(a.bars) } : {}),
+        ...(a.horizon !== undefined ? { horizon: Number(a.horizon) } : {}),
+        ...(a.minSamples !== undefined ? { minSamples: Number(a.minSamples) } : {}),
+        ...(a.minEdge !== undefined ? { minEdge: Number(a.minEdge) } : {}),
+        ...(a.maxSignals !== undefined ? { maxSignals: Number(a.maxSignals) } : {}),
+        ...(a.payout !== undefined ? { payout: Number(a.payout) } : {}),
+        ...(a.name !== undefined ? { name: String(a.name) } : {}),
+      }),
+  },
+  {
+    name: 'lab_backtest',
+    description:
+      'Backtest a CUSTOM spec on a pair - either a saved lab id ("custom:...") or an INLINE spec you compose yourself (you are allowed to invent your own combinations: the DSL accepts signals of kind "candle" (name = a library pattern, e.g. "Bullish Engulfing"), "bar" (variant wide-bull|wide-bear, atrK), "ha" (variant flip-up|flip-down|streak-up|streak-down|strong-bull|strong-bear, len), "line" (variant breakout-up|breakout-down|hh-hl|lh-ll, lookback) and "indicator" (ind: rsi|bbpos|zscore|donchianpos|macdz|slope|streak|wickbias|emasign|hadist|bodypos, params {period|fast|slow|mult}, op ">"|"<", threshold)). Every signal: {kind, ..., dir: "call"|"put", weight 1-50} - dir may INVERT the textbook meaning to fade a pattern. Spec: {name, signals[], minScore 5-95, minVotes 1-6, horizon}. Weights vote bull-minus-bear; a trade needs |score| >= minScore AND >= minVotes agreeing signals. Returns full-sample + holdout metrics and the breakeven win rate. Use to iterate on your own ideas BEFORE proposing deployment. Args: id OR spec, asset, tf, payout (default 0.7), amount (default 10), horizon.',
+    args: '{"asset": "EURUSD", "tf": "2m", "payout": 0.7, "spec": {"name": "HA fade", "signals": [{"kind": "ha", "variant": "flip-up", "len": 2, "dir": "put", "weight": 20}, {"kind": "indicator", "ind": "rsi", "params": {"period": 14}, "op": ">", "threshold": 70, "dir": "put", "weight": 20}], "minScore": 45, "minVotes": 2, "horizon": 1}}',
+    run: (a) =>
+      corePost('/lab_backtest', {
+        ...(a.id !== undefined ? { id: String(a.id) } : {}),
+        ...(a.spec !== undefined ? { spec: a.spec } : {}),
+        ...(a.asset !== undefined ? { asset: String(a.asset) } : {}),
+        ...(a.tf !== undefined ? { tf: String(a.tf) } : {}),
+        ...(a.payout !== undefined ? { payout: Number(a.payout) } : {}),
+        ...(a.amount !== undefined ? { amount: Number(a.amount) } : {}),
+        ...(a.horizon !== undefined ? { horizon: Number(a.horizon) } : {}),
+      }),
+  },
+  {
+    name: 'lab_save',
+    description:
+      'Save a lab spec (from lab_learn, or your own invention validated with lab_backtest) into the learned-strategy library - it becomes strategyId "custom:<id>" that bot_create accepts like any builtin. Args: spec (required - pass the spec object verbatim), name (overrides spec.name), id (to overwrite an existing lab strategy), asset, tf, stats (attach the backtest/holdout metrics you got).',
+    args: '{"name": "EURUSD 1m HA reversion", "asset": "EURUSD", "tf": "1m", "spec": {"name": "EURUSD 1m HA reversion", "signals": [{"kind": "ha", "variant": "flip-down", "len": 2, "dir": "put", "weight": 25}], "minScore": 45, "minVotes": 1, "horizon": 1}}',
+    run: (a) =>
+      corePost('/lab_save', {
+        spec: a.spec,
+        ...(a.name !== undefined ? { name: String(a.name) } : {}),
+        ...(a.id !== undefined ? { id: String(a.id) } : {}),
+        ...(a.asset !== undefined ? { asset: String(a.asset) } : {}),
+        ...(a.tf !== undefined ? { tf: String(a.tf) } : {}),
+        ...(a.stats !== undefined ? { stats: a.stats } : {}),
+      }),
+  },
+  {
+    name: 'lab_list',
+    description: 'List the learned-strategy library: id (custom:*), spec summary, asset/tf and the saved backtest/holdout stats. These ids are valid strategyIds for bot_create.',
+    args: '{}',
+    run: () => coreGet('/lab_list'),
+  },
+  {
+    name: 'lab_delete',
+    description: 'Delete a learned strategy from the lab library by id. Bots already configured with it keep running.',
+    args: '{"id": "custom:eurusd-1m-lab"}',
+    run: (a) => corePost('/lab_delete', { id: String(a.id) }),
   },
   {
     name: 'journal_stats',
@@ -1380,6 +1442,7 @@ Rules:
 - TIME EXPIRY: "expiry 15 minutes" (or any minute-based expiry) on a bot = kind "digital" + expirySec (minutes * 60), NOT expiryBars - expiryBars counts candles of the tf (15 min on 2m candles would be 7.5 bars, impossible). Digital settles at the exact timestamp against a strike, both paper and live.
 - DEPLOYMENT CONFIRMATION PROTOCOL (MANDATORY for ANY bot_create that will trade autonomously): when the user describes automation in natural language, DO NOT deploy on the first reply. 1) Parse every clause into its exact config. 2) Reply with a numbered RULE SHEET: strategy + params, watchlist, timeframe, kind + expiry (state WHY digital+expirySec when minutes are involved), no-concurrent rule (maxOpen 1), stake plan (seed, roll %, payout cap 70, stop-on-loss, periods, de-risk), session window in UTC + Lagos time, cooldown, minScore, plus the compound_plan ladder with cycleProfit. 3) Flag anything you had to ASSUME and propose a default. 4) Ask "confirm and I deploy" and WAIT - deploy only after the user explicitly agrees or amends. 5) After deploying: report the bot id, that it is ARMED and trading autonomously, and how to stop/restart it.
 - RESEARCH WORKFLOW (use it whenever the user wants a validated strategy or asks "is this edge real"): 1) asset_sweep to find WHERE a strategy has an edge, 2) optimize_strategy on the best assets to find strong params, 3) walkforward on the winner - deploy only if OOS net is positive and at least half the folds were profitable, 4) only then bot_create with the validated params (keep the bot DISARMED and tell the user to arm it when ready). After arming, the watchdog watches the live edge - mention that. Research reads DEEP archived history; archive_status shows how much depth exists per asset - if depth is thin, warn that results may not be significant yet. Report IS vs OOS numbers honestly - large drops from in-sample to out-of-sample mean overfit.
+- AI LEARNING AGENT (Strategy Lab - "learn this pair", "build your own strategy", "find your own patterns", "make me a new indicator"): you have your own research desk. lab_learn mines a pair's history for edge-bearing events across candlestick patterns, wide-range bar formations, HEIKEN ASHI structures, line breaks and invented indicators, weights the survivors by measured win-rate edge, calibrates a confluence threshold and backtests the composed spec (full sample + holdout on the last 30%). Report the discovery table (n, win rate, edge, weight) and the backtest vs breakevenWinRate HONESTLY - a holdout win rate below breakeven means the edge did not survive, say so. Iterate like a quant: try another horizon (2-3), more bars, a lower minEdge, or a different tf before giving up. You may also INVENT your own spec (lab_backtest accepts inline specs - the tool doc has the full DSL; dir can invert a pattern to fade it) and lab_save the winners. DEPLOY: lab_save the spec, then follow the DEPLOYMENT CONFIRMATION PROTOCOL and bot_create with strategyId "custom:<id>" (learned ids work everywhere builtin ids do - stake plans, compounding, sessions). Learned bots compound too: a $1 seed rolling on a spec the lab just validated is a perfectly normal ask - mirror periods/de-risk into compound_plan as always.
 - When the user asks to be notified/watch an instrument ("alert me when...", "let me know if..."), create an alert rule with alert_rule_create and confirm the trigger in plain words. NEVER use alert rules to trade - they only notify.
 - NEVER promise profits. Always frame outputs as probabilistic analysis, not certainty.
 - PAPER trades only - you cannot and must not place live trades.

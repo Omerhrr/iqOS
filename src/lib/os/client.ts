@@ -552,6 +552,90 @@ export interface BotRow {
   createdTs: number
 }
 
+// ---------- Strategy Lab (AI-learned strategies) ----------
+
+export type LabSignalDef =
+  | { kind: 'candle'; name: string; dir: 'call' | 'put'; weight: number }
+  | { kind: 'bar'; variant: 'wide-bull' | 'wide-bear'; atrK?: number; dir: 'call' | 'put'; weight: number }
+  | {
+      kind: 'ha'
+      variant: 'flip-up' | 'flip-down' | 'streak-up' | 'streak-down' | 'strong-bull' | 'strong-bear'
+      len?: number
+      dir: 'call' | 'put'
+      weight: number
+    }
+  | { kind: 'line'; variant: 'breakout-up' | 'breakout-down' | 'hh-hl' | 'lh-ll'; lookback?: number; dir: 'call' | 'put'; weight: number }
+  | {
+      kind: 'indicator'
+      ind: string
+      params?: Record<string, number>
+      op: '>' | '<'
+      threshold: number
+      dir: 'call' | 'put'
+      weight: number
+    }
+
+export interface LabSpec {
+  name: string
+  description?: string
+  signals: LabSignalDef[]
+  minScore: number
+  minVotes: number
+  horizon: number
+}
+
+export interface LabSignalStat {
+  key: string
+  kind: LabSignalDef['kind']
+  label: string
+  dir: 'call' | 'put'
+  n: number
+  wins: number
+  winRate: number
+  edgePts: number
+  weight: number
+  selected: boolean
+}
+
+export interface LabSimMetrics {
+  trades: number
+  wins: number
+  losses: number
+  winRate: number
+  netPnl: number
+  profitFactor: number
+  maxDrawdown: number
+  expectancy: number
+}
+
+export interface LabLearnResult {
+  ok: boolean
+  asset: string
+  tf: Timeframe
+  candlesTested: number
+  horizon: number
+  minSamples: number
+  minEdge: number
+  breakevenWinRate: number
+  signals: LabSignalStat[]
+  spec: LabSpec | null
+  calibration: { thresholds: { minScore: number; trades: number; winRate: number }[]; chosen: number; votes: number }
+  backtest: LabSimMetrics | null
+  holdout: LabSimMetrics | null
+  note: string
+  error?: string
+}
+
+export interface LabStrategyRow {
+  id: string
+  spec: LabSpec
+  asset: string
+  tf: string
+  stats: { backtest?: LabSimMetrics; holdout?: LabSimMetrics; breakeven?: number } | null
+  createdTs: number
+  updatedTs: number
+}
+
 export interface JournalGroupRow {
   key: string
   trades: number

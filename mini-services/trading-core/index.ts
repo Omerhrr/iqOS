@@ -13,6 +13,7 @@ import { marketDataPlugin, MarketDataService } from './src/plugins/market-data'
 import { analyticsPlugin, AnalyticsService } from './src/plugins/analytics'
 import { executionPlugin, ExecutionService, type RiskConfig } from './src/plugins/execution'
 import { autopilotPlugin, AutopilotService, type BotConfig } from './src/plugins/autopilot'
+import { labPlugin, StrategyLabService } from './src/plugins/lab'
 import { screenerPlugin, ScreenerService } from './src/plugins/screener'
 import { alertRulesPlugin, AlertRulesService, ALERT_METRICS } from './src/plugins/alert-rules'
 import { sentinelPlugin, SentinelService, type SentinelConfig } from './src/plugins/sentinel'
@@ -34,6 +35,7 @@ kernel.register(memoryGatePlugin)
 kernel.register(marketDataPlugin)
 kernel.register(analyticsPlugin)
 kernel.register(executionPlugin)
+kernel.register(labPlugin)
 kernel.register(autopilotPlugin)
 kernel.register(screenerPlugin)
 kernel.register(alertRulesPlugin)
@@ -253,7 +255,31 @@ const httpServer = createServer(async (req, res) => {
         return json(200, { ok: true, tf: timeframe, scanned: universe.length, results: rows })
       }
 
-      if (path === '/strategies') return json(200, { ok: true, strategies: analytics.listStrategies() })
+      if (path === '/strategies')
+        return json(200, {
+          ok: true,
+          strategies: [
+            ...analytics.listStrategies(),
+            // AI-learned specs from the Strategy Lab are first-class strategies
+            ...kernel.context().use<StrategyLabService>('lab').list().map((r) => ({
+              id: r.id,
+              name: `${r.spec.name} (Lab)`,
+              description: `${r.spec.description ?? 'AI-learned strategy'} [${r.asset} ${r.tf}]` +
+                (r.stats?.backtest ? ` backtest ${r.stats.backtest.trades}t @ ${r.stats.backtest.winRate.toFixed(1)}%` : ''),
+              params: [],
+              defaults: {},
+            })),
+          ],
+        })
+
+      if (path === '/lab_list') {
+        return json(200, { ok: true, strategies: kernel.context().use<StrategyLabService>('lab').list() })
+      }
+
+      if (path === '/lab_get') {
+        const row = kernel.context().use<StrategyLabService>('lab').get(q.get('id') ?? '')
+        return row ? json(200, { ok: true, strategy: row }) : json(404, { ok: false, error: 'lab strategy not found' })
+      }
 
       // ---------- discovery: screener + alert rules ----------
 
@@ -735,6 +761,15 @@ const httpServer = createServer(async (req, res) => {
       }
 
       if (path === '/run_strategy') {
+        const strategyId = String(body.strategy ?? 'confluence-core')
+        if (strategyId.startsWith('custom:')) {
+          try {
+            const lab = kernel.context().use<StrategyLabService>('lab')
+            return json(200, { ok: true, eval: lab.runStrategy(String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), strategyId) })
+          } catch (err) {
+            return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+          }
+        }
         const out = analytics.runStrategy(
           String(body.asset ?? market.activeAsset),
           tf(String(body.tf ?? '1m') as string),
@@ -907,6 +942,75 @@ const httpServer = createServer(async (req, res) => {
         // compound stop-on-loss: revive a halted cycle (clears halt, re-seeds pot)
         const bots = kernel.context().use<AutopilotService>('autopilot')
         return json(200, bots.restartBot(String(body.id ?? '')))
+      }
+
+      // ---------- strategy lab (AI learning agent) ----------
+
+      // Mine a pair's history for edge-bearing events across the whole pattern
+      // vocabulary (candlestick / bar / heiken ashi / line / invented
+      // indicators), compose the survivors into a custom spec and backtest it
+      // (full sample + holdout). Deploy via /bot_save with strategyId
+      // "custom:<id>" after /lab_save.
+      if (path === '/lab_learn') {
+        try {
+          const lab = kernel.context().use<StrategyLabService>('lab')
+          const result = lab.learn({
+            asset: String(body.asset ?? market.activeAsset),
+            tf: tf(String(body.tf ?? '1m') as string),
+            bars: body.bars !== undefined ? Number(body.bars) : undefined,
+            horizon: body.horizon !== undefined ? Number(body.horizon) : undefined,
+            minSamples: body.minSamples !== undefined ? Number(body.minSamples) : undefined,
+            minEdge: body.minEdge !== undefined ? Number(body.minEdge) : undefined,
+            maxSignals: body.maxSignals !== undefined ? Number(body.maxSignals) : undefined,
+            payout: body.payout !== undefined ? Number(body.payout) : undefined,
+            amount: body.amount !== undefined ? Number(body.amount) : undefined,
+            name: body.name !== undefined ? String(body.name) : undefined,
+          })
+          return json(200, result)
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      if (path === '/lab_backtest') {
+        try {
+          const lab = kernel.context().use<StrategyLabService>('lab')
+          const result = lab.backtestSpec({
+            spec: body.spec,
+            id: body.id !== undefined ? String(body.id) : undefined,
+            asset: body.asset !== undefined ? String(body.asset) : undefined,
+            tf: body.tf !== undefined ? String(body.tf) : undefined,
+            payout: body.payout !== undefined ? Number(body.payout) : undefined,
+            amount: body.amount !== undefined ? Number(body.amount) : undefined,
+            horizon: body.horizon !== undefined ? Number(body.horizon) : undefined,
+          })
+          return json(200, result)
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      if (path === '/lab_save') {
+        try {
+          const lab = kernel.context().use<StrategyLabService>('lab')
+          return json(200, {
+            ...lab.save({
+              id: body.id !== undefined ? String(body.id) : undefined,
+              name: body.name !== undefined ? String(body.name) : undefined,
+              spec: body.spec,
+              asset: body.asset !== undefined ? String(body.asset) : undefined,
+              tf: body.tf !== undefined ? String(body.tf) : undefined,
+              stats: body.stats,
+            }),
+          })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      if (path === '/lab_delete') {
+        const lab = kernel.context().use<StrategyLabService>('lab')
+        return json(200, lab.remove(String(body.id ?? '')))
       }
 
       // ---------- discovery control ----------

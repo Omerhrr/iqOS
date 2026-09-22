@@ -12,6 +12,7 @@ import type { AnalyticsService } from './analytics'
 import type { ExecutionService } from './execution'
 import { Store } from '../store'
 import { getStrategy, defaultParams } from '../strategies/builtin'
+import type { StrategyLabService } from './lab'
 
 export interface BotConfig {
   id: string
@@ -164,6 +165,19 @@ export class AutopilotService {
   private unsubscribers: (() => void)[] = []
   private runtime = new Map<string, RuntimeState>()
   private evaluating = new Set<string>() // asset|tf pairs currently being processed
+  private lab: StrategyLabService | null = null
+
+  /** Lazy-resolve the Strategy Lab (registered after the core plugins) -
+   * custom:* strategy ids evaluate through it. */
+  private labService(): StrategyLabService | null {
+    if (this.lab) return this.lab
+    try {
+      this.lab = this.ctx.use<StrategyLabService>('lab')
+    } catch {
+      this.lab = null
+    }
+    return this.lab
+  }
 
   async start(ctx: KernelContext): Promise<void> {
     this.ctx = ctx
@@ -240,7 +254,7 @@ export class AutopilotService {
     const planChanged = JSON.stringify(bot.stakePlan ?? null) !== JSON.stringify(existing?.stakePlan ?? null)
     bot.planState = planChanged ? undefined : input.planState ?? existing?.planState
     if (!bot.watchlist.length) return { ok: false, error: 'watchlist needs at least one valid instrument' }
-    if (!getStrategy(bot.strategyId)) return { ok: false, error: `unknown strategy ${bot.strategyId}` }
+    if (!this.isValidStrategy(bot.strategyId)) return { ok: false, error: `unknown strategy ${bot.strategyId}` }
     this.store.saveBot(bot)
     if (!this.runtime.has(id)) this.runtime.set(id, this.buildRuntime(id))
     this.emit(bot.enabled ? 'success' : 'info', `Bot "${bot.name}" saved - ${bot.enabled ? 'ARMED' : 'idle'} (${bot.strategyId} · ${bot.tf} · ${bot.watchlist.join(', ')})`)
@@ -388,9 +402,18 @@ export class AutopilotService {
       // memory gate plugin not loaded - rule gating disabled
     }
 
-    // strategy evaluation (pure, on closed candles)
-    const merged = { ...defaultParams(getStrategy(bot.strategyId)!), ...(bot.params ?? {}) }
-    const evalOut = this.analytics.runStrategy(asset, tf, bot.strategyId, merged)
+    // strategy evaluation (pure, on closed candles) - builtin strategies run
+    // through analytics, AI-learned specs (custom:*) through the lab
+    const isCustom = bot.strategyId.startsWith('custom:')
+    let evalOut: ReturnType<AnalyticsService['runStrategy']>
+    if (isCustom) {
+      const lab = this.labService()
+      if (!lab) return this.reject(bot, 'strategy lab unavailable for custom strategy')
+      evalOut = lab.runStrategy(asset, tf, bot.strategyId)
+    } else {
+      const merged = { ...defaultParams(getStrategy(bot.strategyId)!), ...(bot.params ?? {}) }
+      evalOut = this.analytics.runStrategy(asset, tf, bot.strategyId, merged)
+    }
     if (evalOut.direction === 'none') return
     if (Math.abs(evalOut.score) < bot.minScore) {
       return this.reject(bot, `score ${evalOut.score.toFixed(0)} below min ${bot.minScore}`)
@@ -678,7 +701,17 @@ export class AutopilotService {
   }
 
   private validStrategy(id: string): string {
-    return getStrategy(id) ? id : DEFAULT_BOT.strategyId
+    if (getStrategy(id)) return id
+    // AI-learned strategies from the Strategy Lab (custom:<slug>) are valid
+    // when they exist in the lab library
+    if (id.startsWith('custom:') && this.labService()?.isValidStrategyId(id)) return id
+    return DEFAULT_BOT.strategyId
+  }
+
+  private isValidStrategy(id: string): boolean {
+    if (getStrategy(id)) return true
+    if (id.startsWith('custom:')) return this.labService()?.isValidStrategyId(id) ?? false
+    return false
   }
 }
 

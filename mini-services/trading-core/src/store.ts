@@ -87,6 +87,15 @@ export class Store {
         created_ts INTEGER NOT NULL,
         updated_ts INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS lab_strategies (
+        id TEXT PRIMARY KEY,
+        spec TEXT NOT NULL,
+        asset TEXT NOT NULL,
+        tf TEXT NOT NULL,
+        stats TEXT,
+        created_ts INTEGER NOT NULL,
+        updated_ts INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS risk_config (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         config TEXT NOT NULL,
@@ -460,6 +469,38 @@ export class Store {
       .query("SELECT * FROM positions WHERE note = ? ORDER BY ts_open DESC LIMIT ?")
       .all(`bot:${botId}`, limit) as Record<string, unknown>[]
     return rows.map((r) => this.rowToPosition(r))
+  }
+
+  // ---------- lab strategies (AI-learned custom specs) ----------
+
+  saveLabStrategy(row: { id: string; spec: unknown; asset: string; tf: string; stats?: unknown }): void {
+    const now = Math.floor(Date.now() / 1000)
+    const existing = this.db.query('SELECT created_ts FROM lab_strategies WHERE id = ?').get(row.id) as { created_ts: number } | null
+    this.db.run(
+      'INSERT INTO lab_strategies (id, spec, asset, tf, stats, created_ts, updated_ts) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET spec = excluded.spec, asset = excluded.asset, tf = excluded.tf, stats = excluded.stats, updated_ts = excluded.updated_ts',
+      [row.id, JSON.stringify(row.spec), row.asset, row.tf, row.stats ? JSON.stringify(row.stats) : null, existing?.created_ts ?? now, now]
+    )
+  }
+
+  deleteLabStrategy(id: string): boolean {
+    const res = this.db.run('DELETE FROM lab_strategies WHERE id = ?', [id])
+    return res.changes > 0
+  }
+
+  listLabStrategies(): { id: string; spec: unknown; asset: string; tf: string; stats: unknown; createdTs: number; updatedTs: number }[] {
+    const rows = this.db
+      .query('SELECT id, spec, asset, tf, stats, created_ts, updated_ts FROM lab_strategies ORDER BY updated_ts DESC')
+      .all() as { id: string; spec: string; asset: string; tf: string; stats: string | null; created_ts: number; updated_ts: number }[]
+    return rows
+      .map((r) => {
+        try {
+          return { id: r.id, spec: JSON.parse(r.spec), asset: r.asset, tf: r.tf, stats: r.stats ? JSON.parse(r.stats) : null, createdTs: r.created_ts, updatedTs: r.updated_ts }
+        } catch {
+          this.db.run('DELETE FROM lab_strategies WHERE id = ?', [r.id])
+          return null
+        }
+      })
+      .filter((x): x is { id: string; spec: unknown; asset: string; tf: string; stats: unknown; createdTs: number; updatedTs: number } => x !== null)
   }
 
   // ---------- alert rules ----------

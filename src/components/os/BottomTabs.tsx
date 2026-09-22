@@ -20,6 +20,7 @@ import { fmtMoney, fmtPct, fmtPrice, fmtTime, osPost } from '@/lib/os/client'
 import BacktestLab from './BacktestLab'
 import QuantPanel from './QuantPanel'
 import AutopilotPanel from './AutopilotPanel'
+import AILabPanel from './AILabPanel'
 import JournalTab from './JournalTab'
 import ScreenerPanel from './ScreenerPanel'
 import AlertRulesPanel from './AlertRulesPanel'
@@ -87,6 +88,7 @@ export default function BottomTabs(props: BottomTabsProps) {
             ['watchdog', 'Watchdog'],
             ['journal', 'Journal'],
             ['backtest', 'Backtest Lab'],
+            ['ailab', 'AI Lab'],
             ['strategies', 'Strategy Lab'],
             ['quant', 'Quant Lab'],
             ['patterns', `Patterns (${patterns.length})`],
@@ -251,6 +253,11 @@ export default function BottomTabs(props: BottomTabsProps) {
       {/* BACKTEST / RESEARCH LAB */}
       <TabsContent value="backtest" className="mt-0 min-h-0 flex-1 overflow-auto p-3">
         <BacktestLab asset={asset} strategies={props.strategies} onSelectSetup={props.onSelectSetup} />
+      </TabsContent>
+
+      {/* AI LEARNING LAB (the agent studies a pair and invents its own strategy) */}
+      <TabsContent value="ailab" className="mt-0 min-h-0 flex-1 overflow-auto p-3">
+        <AILabPanel assets={props.assets} onError={onError} refreshBots={props.refreshBots} />
       </TabsContent>
 
       {/* STRATEGIES */}
