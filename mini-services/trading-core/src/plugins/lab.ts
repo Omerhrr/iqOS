@@ -12,8 +12,10 @@ import type { KernelContext, Plugin } from '../kernel'
 import type { MarketDataService } from './market-data'
 import { Store } from '../store'
 import {
+  basisCandles,
   buildCtx,
   evaluateCustom,
+  heikinAshiCandles,
   labelOf,
   normalizeSpec,
   prepareSignal,
@@ -29,12 +31,13 @@ export interface LearnOptions {
   tf: Timeframe
   bars?: number // history to learn from (default 1200, cap 2200)
   horizon?: number // bars ahead the outcome is measured (default 1)
-  minSamples?: number // min occurrences for a signal to qualify (default 40)
+  minSamples?: number // min occurrences for a signal to qualify (default 40, auto-relaxed on thin history)
   minEdge?: number // min win-rate edge vs 50% in points (default 2)
   maxSignals?: number // signals composed into the spec (default 8)
   payout?: number // binary payout used in the backtest (default 0.7 = house cap)
   amount?: number // backtest stake (default 10)
   name?: string // spec name override
+  basis?: 'candles' | 'heikin' // what the signals read: raw OHLC or the Heiken-Ashi transform
 }
 
 export interface SignalStat {
@@ -65,6 +68,7 @@ export interface LearnResult {
   ok: boolean
   asset: string
   tf: Timeframe
+  basis: 'candles' | 'heikin'
   candlesTested: number
   horizon: number
   minSamples: number
@@ -123,18 +127,26 @@ export class StrategyLabService {
     const asset = String(opts.asset ?? this.market.activeAsset).toUpperCase()
     const tf = opts.tf as Timeframe
     const horizon = Math.max(1, Math.min(10, Math.round(opts.horizon ?? 1)))
-    const minSamples = Math.max(10, Math.round(opts.minSamples ?? 40))
+    const minSamplesAsk = Math.max(10, Math.round(opts.minSamples ?? 40))
     const minEdge = Math.max(0.5, Math.min(20, Number(opts.minEdge ?? 2)))
     const maxSignals = Math.max(2, Math.min(12, Math.round(opts.maxSignals ?? 8)))
     const payout = Math.max(0.5, Math.min(0.95, Number(opts.payout ?? 0.7)))
     const amount = Math.max(1, Number(opts.amount ?? 10))
     const bars = Math.max(300, Math.min(2200, Math.round(opts.bars ?? 1200)))
+    const basis: 'candles' | 'heikin' = opts.basis === 'heikin' ? 'heikin' : 'candles'
 
-    const candles = this.market.getCandlesDeep(asset, tf, bars)
-    if (candles.length < 220) throw new Error(`not enough history for ${asset} ${tf} (${candles.length} bars, need 220+)`)
+    const raw = this.market.getCandlesDeep(asset, tf, bars)
+    if (raw.length < 120) throw new Error(`not enough history for ${asset} ${tf} (${raw.length} bars, need 120+)`)
+    // thin history auto-relaxation: a hard sample floor on a short series is
+    // the #1 "the lab is failing" trap - scale the ask down to what the series
+    // can statistically support (never ABOVE the caller's ask)
+    const warm = 30
+    const minSamples = Math.max(10, Math.min(minSamplesAsk, Math.floor((raw.length - warm - horizon) / 6)))
+    // signals read the chosen basis; outcomes/settlement are ALWAYS real prices
+    const candles = basis === 'heikin' ? heikinAshiCandles(raw) : raw
+    const settle = raw.map((c) => c.close)
     const n = candles.length
     const ctx = buildCtx(candles)
-    const warm = 30
 
     // ---- candidates from the parametric vocabulary ----
     const candidates: Candidate[] = CANDIDATE_SIGNALS.map((def) => ({
@@ -168,8 +180,7 @@ export class StrategyLabService {
       })
     }
 
-    // ---- measure edge: did price move in the implied dir `horizon` bars later? ----
-    const close = ctx.close
+    // ---- measure edge: did REAL price move in the implied dir `horizon` bars later? ----
     const stats = new Map<string, { n: number; wins: number }>()
     const end = n - horizon
     for (let i = warm; i < end; i++) {
@@ -177,8 +188,8 @@ export class StrategyLabService {
         if (!c.test(i)) continue
         const s = stats.get(c.key) ?? { n: 0, wins: 0 }
         s.n += 1
-        const up = close[i + horizon] > close[i]
-        const dn = close[i + horizon] < close[i]
+        const up = settle[i + horizon] > settle[i]
+        const dn = settle[i + horizon] < settle[i]
         if (c.dir === 'call' ? up : dn) s.wins += 1
         stats.set(c.key, s)
       }
@@ -226,6 +237,7 @@ export class StrategyLabService {
         ok: false,
         asset,
         tf,
+        basis,
         candlesTested: n,
         horizon,
         minSamples,
@@ -243,7 +255,7 @@ export class StrategyLabService {
     // ---- spec + threshold calibration ----
     const spec: CustomSpec = {
       name: opts.name?.trim() || `${asset} ${tf} Learned`,
-      description: `Learned by the Strategy Lab from ${n} x ${tf} bars of ${asset}: ${selected.length} edge-bearing signals (win-rate edge ${Math.min(...selected.map((s) => s.edgePts))}-${Math.max(...selected.map((s) => s.edgePts))} pts, horizon ${horizon} bar${horizon > 1 ? 's' : ''}).`,
+      description: `Learned by the Strategy Lab from ${n} x ${tf} bars of ${asset}${basis === 'heikin' ? ' on the Heiken-Ashi basis' : ''}: ${selected.length} edge-bearing signals (win-rate edge ${Math.min(...selected.map((s) => s.edgePts))}-${Math.max(...selected.map((s) => s.edgePts))} pts, horizon ${horizon} bar${horizon > 1 ? 's' : ''}).`,
       signals: selected.map((m) => {
         const def = { ...byKey.get(m.key)!.def, weight: m.weight }
         return def
@@ -251,6 +263,7 @@ export class StrategyLabService {
       minScore: 45,
       minVotes: selected.length >= 3 ? 2 : 1,
       horizon,
+      ...(basis === 'heikin' ? { basis: 'heikin' as const } : {}),
     }
 
     const series = scoreSeriesFor(spec, ctx, candleHits)
@@ -268,13 +281,15 @@ export class StrategyLabService {
     spec.minScore = chosen.minScore
 
     // ---- final backtests: full sample + honest holdout (last 30%) ----
-    const backtest = simFromSeries(series, candles, warm, horizon, amount, payout, minVotes, spec.minScore)
-    const holdout = simFromSeries(series, candles, Math.floor(n * 0.7), horizon, amount, payout, minVotes, spec.minScore)
+    // sims settle on REAL prices (raw closes) even for the heikin basis
+    const backtest = simFromSeries(series, raw, warm, horizon, amount, payout, minVotes, spec.minScore)
+    const holdout = simFromSeries(series, raw, Math.floor(n * 0.7), horizon, amount, payout, minVotes, spec.minScore)
 
     return {
       ok: true,
       asset,
       tf,
+      basis,
       candlesTested: n,
       horizon,
       minSamples,
@@ -285,7 +300,7 @@ export class StrategyLabService {
       calibration: { thresholds, chosen: spec.minScore, votes: minVotes },
       backtest,
       holdout,
-      note: `learned ${selected.length}-signal spec "${spec.name}" (minScore ${spec.minScore}, minVotes ${minVotes}); full-sample win rate ${backtest.winRate.toFixed(1)}% vs breakeven ${((1 / (1 + payout)) * 100).toFixed(1)}%, holdout (last 30%) ${holdout.trades} trades @ ${holdout.winRate.toFixed(1)}%`,
+      note: `learned ${selected.length}-signal ${basis === 'heikin' ? 'HEIKIN-ASHI ' : ''}spec "${spec.name}" (minScore ${spec.minScore}, minVotes ${minVotes}); full-sample win rate ${backtest.winRate.toFixed(1)}% vs breakeven ${((1 / (1 + payout)) * 100).toFixed(1)}%, holdout (last 30%) ${holdout.trades} trades @ ${holdout.winRate.toFixed(1)}%`,
     }
   }
 
@@ -305,13 +320,15 @@ export class StrategyLabService {
     const payout = Math.max(0.5, Math.min(0.95, Number(input.payout ?? 0.7)))
     const amount = Math.max(1, Number(input.amount ?? 10))
     const horizon = Math.max(1, Math.min(10, Math.round(input.horizon ?? spec.horizon ?? 1)))
-    const candles = this.market.getCandlesDeep(asset, tfv, 2200)
-    if (candles.length < 220) throw new Error(`not enough history for ${asset} ${tfv} (${candles.length} bars)`)
-    const ctx = buildCtx(candles)
-    const candleHits = scanCandleHits(candles)
+    const raw = this.market.getCandlesDeep(asset, tfv, 2200)
+    if (raw.length < 120) throw new Error(`not enough history for ${asset} ${tfv} (${raw.length} bars, need 120+)`)
+    // signals read the spec's basis; sims settle on REAL prices
+    const basisSeries = basisCandles(spec, raw)
+    const ctx = buildCtx(basisSeries)
+    const candleHits = scanCandleHits(basisSeries)
     const series = scoreSeriesFor(spec, ctx, candleHits)
-    const backtest = simFromSeries(series, candles, 30, horizon, amount, payout, spec.minVotes, spec.minScore)
-    const holdout = simFromSeries(series, candles, Math.floor(candles.length * 0.7), horizon, amount, payout, spec.minVotes, spec.minScore)
+    const backtest = simFromSeries(series, raw, 30, horizon, amount, payout, spec.minVotes, spec.minScore)
+    const holdout = simFromSeries(series, raw, Math.floor(raw.length * 0.7), horizon, amount, payout, spec.minVotes, spec.minScore)
     return {
       ok: true,
       id,

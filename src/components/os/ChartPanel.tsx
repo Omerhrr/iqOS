@@ -479,7 +479,7 @@ export default function ChartPanel({
   }
 
   return (
-    <div className="relative flex h-full min-h-[320px] flex-col rounded-lg border border-[#1c2739] bg-[#0b111c]">
+    <div className="relative flex h-full min-h-0 flex-col rounded-lg border border-[#1c2739] bg-[#0b111c]">
       {/* zoom controls (left of the price scale) */}
       <div className="absolute bottom-10 right-[60px] z-10 flex flex-col gap-1">
         <button

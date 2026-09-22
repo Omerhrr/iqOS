@@ -12,12 +12,14 @@ interface Props {
   tf: Timeframe
   params?: Record<string, number>
   onRemove: () => void
+  /** fill the parent box (resizable desktop stack) instead of the fixed 130px */
+  fill?: boolean
 }
 
 const GRID = 'rgba(28,39,57,0.55)'
 const TEXT = '#7c8aa5'
 
-export default function SubPane({ id, asset, tf, params, onRemove }: Props) {
+export default function SubPane({ id, asset, tf, params, onRemove, fill }: Props) {
   const elRef = useRef<HTMLDivElement | null>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const seriesRef = useRef<(ISeriesApi<'Line'> | ISeriesApi<'Histogram'>)[]>([])
@@ -117,7 +119,7 @@ export default function SubPane({ id, asset, tf, params, onRemove }: Props) {
   const lastVal = lastLine ? lastLine.values[lastLine.values.length - 1] : null
 
   return (
-    <div className="relative flex h-[130px] shrink-0 flex-col rounded-lg border border-[#1c2739] bg-[#0b111c]">
+    <div className={`relative flex shrink-0 flex-col rounded-lg border border-[#1c2739] bg-[#0b111c] ${fill ? 'h-full min-h-0' : 'h-[130px]'}`}>
       <div className="absolute left-2 top-1 z-10 flex items-center gap-2 font-mono text-[9px]">
         <span className="font-semibold uppercase tracking-wider text-[#aab6cc]">{series?.name ?? id}</span>
         {lastVal !== null && Number.isFinite(lastVal) && (

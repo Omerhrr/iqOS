@@ -620,8 +620,19 @@ export class MarketDataService {
         for (const tf of ALL_TIMEFRAMES) {
           const agg = this.aggregate(candleData.candles, TIMEFRAME_SECONDS[tf])
           if (agg.length > 10) {
-            this.closed.set(this.key(this.activeAsset, tf), agg.slice(0, -1))
-            this.candles.set(this.key(this.activeAsset, tf), agg[agg.length - 1])
+            // MERGE, not clobber: the sidecar only serves a short tail (~240
+            // 1m bars, even unauthenticated). Replacing wholesale used to
+            // throw away the seeded prehistory + archived depth for the
+            // active asset every 60s, starving the research lab / backtests
+            // of history. Fresh bars win a timestamp collision, older memory
+            // survives, capped at the usual MEM_CAP.
+            const k = this.key(this.activeAsset, tf)
+            const byTime = new Map<number, Candle>()
+            for (const c of this.closed.get(k) ?? []) byTime.set(c.time, c)
+            for (const c of agg) byTime.set(c.time, c)
+            const merged = [...byTime.values()].sort((a, b) => a.time - b.time)
+            this.closed.set(k, merged.slice(-MEM_CAP))
+            this.candles.set(k, agg[agg.length - 1])
           }
         }
         const lastC = candleData.candles[candleData.candles.length - 1]

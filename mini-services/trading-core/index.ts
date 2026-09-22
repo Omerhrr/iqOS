@@ -965,6 +965,7 @@ const httpServer = createServer(async (req, res) => {
             payout: body.payout !== undefined ? Number(body.payout) : undefined,
             amount: body.amount !== undefined ? Number(body.amount) : undefined,
             name: body.name !== undefined ? String(body.name) : undefined,
+            basis: body.basis !== undefined ? String(body.basis) as 'candles' | 'heikin' : undefined,
           })
           return json(200, result)
         } catch (err) {

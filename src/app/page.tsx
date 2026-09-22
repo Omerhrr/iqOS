@@ -3,7 +3,7 @@
 // IQAIR//OS - main shell
 // Single-page operating system: menu bar, market watch, chart workspace,
 // analytics dock, trade ticket, copilot and the bottom workspace tabs.
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels'
 import { toast } from 'sonner'
 import MenuBar from '@/components/os/MenuBar'
@@ -531,7 +531,21 @@ export default function OSPage() {
     [handleSelectAsset, registry]
   )
 
-  // shared chart workspace (chart + sub-panes) - mounted by whichever layout is active
+  // slim drag handles: vertical bar for horizontal groups, horizontal bar for vertical groups
+  const vHandle = (
+    <PanelResizeHandle className="group relative h-full w-2 rounded transition-colors hover:bg-cyan-500/10 data-[resize-handle-state=drag]:bg-cyan-500/20">
+      <div className="absolute left-1/2 top-1/2 h-10 w-[3px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-[#1c2739] transition-colors group-hover:bg-cyan-400/70 group-data-[resize-handle-state=drag]:bg-cyan-400" />
+    </PanelResizeHandle>
+  )
+  const hHandle = (
+    <PanelResizeHandle className="group relative h-2 w-full rounded transition-colors hover:bg-cyan-500/10 data-[resize-handle-state=drag]:bg-cyan-500/20">
+      <div className="absolute left-1/2 top-1/2 h-[3px] w-10 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[#1c2739] transition-colors group-hover:bg-cyan-400/70 group-data-[resize-handle-state=drag]:bg-cyan-400" />
+    </PanelResizeHandle>
+  )
+
+  // shared chart workspace (chart + sub-panes) - mounted by whichever layout is active.
+  // MOBILE: fixed-height stack (touch resizing is miserable) - main chart flexes,
+  // every sub-pane keeps its 130px.
   const chartWorkspace = (
     <>
       <div className="min-h-[280px] flex-1">
@@ -548,6 +562,29 @@ export default function OSPage() {
         />
       ))}
     </>
+  )
+  // DESKTOP: fully resizable stack - the main chart and EVERY sub-pane are
+  // panels of one vertical group separated by drag handles. Percentages
+  // persist (autoSaveId), so the operator's layout survives reloads and
+  // adding a pane just re-splits the space.
+  const chartStack = (
+    <PanelGroup direction="vertical" autoSaveId="iqos:chartstack" className="min-h-0 flex-1">
+      <Panel defaultSize={58} minSize={20}>
+        <div className="h-full min-h-0">
+          <ChartPanel candles={candles} analysis={analysis} price={livePrice} digitsTicker={asset} chartType={chartType} overlays={overlaySeries} positions={positions} settledPositions={history} />
+        </div>
+      </Panel>
+      {activeSubs.map((s) => (
+        <Fragment key={`${s.id}:${JSON.stringify(s.params ?? {})}`}>
+          {hHandle}
+          <Panel defaultSize={21} minSize={6}>
+            <div className="h-full min-h-0">
+              <SubPane id={s.id} asset={asset} tf={tf} params={s.params} fill onRemove={() => setActiveSubs((prev) => prev.filter((x) => x.id !== s.id))} />
+            </div>
+          </Panel>
+        </Fragment>
+      ))}
+    </PanelGroup>
   )
 
   const ticket = (
@@ -571,18 +608,6 @@ export default function OSPage() {
       subs={activeSubs.map((o) => o.id)}
       onUiCommand={applyUiCommand}
     />
-  )
-
-  // slim drag handles: vertical bar for horizontal groups, horizontal bar for vertical groups
-  const vHandle = (
-    <PanelResizeHandle className="group relative h-full w-2 rounded transition-colors hover:bg-cyan-500/10 data-[resize-handle-state=drag]:bg-cyan-500/20">
-      <div className="absolute left-1/2 top-1/2 h-10 w-[3px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-[#1c2739] transition-colors group-hover:bg-cyan-400/70 group-data-[resize-handle-state=drag]:bg-cyan-400" />
-    </PanelResizeHandle>
-  )
-  const hHandle = (
-    <PanelResizeHandle className="group relative h-2 w-full rounded transition-colors hover:bg-cyan-500/10 data-[resize-handle-state=drag]:bg-cyan-500/20">
-      <div className="absolute left-1/2 top-1/2 h-[3px] w-10 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[#1c2739] transition-colors group-hover:bg-cyan-400/70 group-data-[resize-handle-state=drag]:bg-cyan-400" />
-    </PanelResizeHandle>
   )
 
   return (
@@ -698,7 +723,7 @@ export default function OSPage() {
             {/* CENTER dock: chart + analytics + bottom workspace */}
             <Panel defaultSize={56} minSize={32}>
               <div className="flex h-full min-h-0 flex-col gap-2 px-0.5">
-                <div className="flex min-h-0 flex-[3] flex-col gap-1.5">{chartWorkspace}</div>
+                <div className="flex min-h-0 flex-[3] flex-col">{chartStack}</div>
                 <div className="grid h-[240px] shrink-0 grid-cols-2 grid-rows-[minmax(0,1fr)] gap-2 overflow-hidden">
                   <SignalPanel analysis={analysis} />
                   <MarkovPanel markov={analysis?.markov ?? null} />

@@ -62,6 +62,7 @@ function MetricStrip({ label, m, breakeven }: { label: string; m: LabSimMetrics 
 export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelProps) {
   const [asset, setAsset] = useState('EURUSD')
   const [tf, setTf] = useState<Timeframe>('1m')
+  const [basis, setBasis] = useState<'candles' | 'heikin'>('candles')
   const [bars, setBars] = useState(1200)
   const [horizon, setHorizon] = useState(1)
   const [minSamples, setMinSamples] = useState(30)
@@ -106,9 +107,9 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
     setResult(null)
     setSavedId(null)
     try {
-      const res = await osPost<LabLearnResult>('/lab_learn', { asset, tf, bars, horizon, minSamples, minEdge, maxSignals, payout })
+      const res = await osPost<LabLearnResult>('/lab_learn', { asset, tf, basis, bars, horizon, minSamples, minEdge, maxSignals, payout })
       setResult(res)
-      setSavedName(`${asset} ${tf} Lab`)
+      setSavedName(`${asset} ${tf} Lab${basis === 'heikin' ? ' HA' : ''}`)
     } catch (e) {
       onError((e as Error).message)
     } finally {
@@ -244,6 +245,13 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
               ))}
             </select>
           </label>
+          <label className="flex flex-col gap-0.5">
+            <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">basis</span>
+            <select value={basis} onChange={(e) => setBasis(e.target.value as 'candles' | 'heikin')} className="h-7 rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-[#dbe4f0]" title="what the agent reads: raw candles or the Heiken-Ashi transform - outcomes always settle on real prices">
+              <option value="candles">raw candles</option>
+              <option value="heikin">heiken-ashi</option>
+            </select>
+          </label>
           <NumField label="bars" value={bars} onChange={setBars} w="w-16" />
           <NumField label="horizon" value={horizon} onChange={setHorizon} w="w-12" />
           <NumField label="min n" value={minSamples} onChange={setMinSamples} w="w-14" />
@@ -261,7 +269,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
           </Button>
         </div>
         <p className="mt-2 text-[10px] leading-snug text-[#7c8aa5]">
-          Mines candlestick patterns, wide-range bar formations, Heiken Ashi structures, line breaks (Donchian / HH-HL) and its own invented indicators (RSI, BB %B, z-score, Donchian position, MACD-z, slope, streak, wick bias, EMA spread, HA distance, close position) - then weights the survivors by measured edge and backtests the composition.
+          Mines candlestick patterns, wide-range bar formations, Heiken Ashi structures, line breaks (Donchian / HH-HL) and its own invented indicators (RSI, BB %B, z-score, Donchian position, MACD-z, slope, streak, wick bias, EMA spread, HA distance, close position) - then weights the survivors by measured edge and backtests the composition. The <span className="text-[#aab6cc]">basis</span> switch learns on raw candles OR the Heiken-Ashi view of the same market (like the chart type) - either way outcomes settle on real prices and the deployed bot trades the same basis it learned on. Thin history auto-relaxes the min-samples floor instead of failing.
         </p>
       </div>
 
@@ -270,7 +278,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
         <div className="space-y-2 rounded-lg border border-[#1c2739] bg-[#0b111c] p-3">
           <div className={`rounded border px-2 py-1.5 font-mono text-[11px] ${result.ok ? 'border-emerald-500/30 bg-emerald-500/5 text-emerald-300' : 'border-amber-500/30 bg-amber-500/5 text-amber-300'}`}>{result.note}</div>
           <div className="font-mono text-[10px] text-[#4b5a72]">
-            {result.asset} · {result.tf} · {result.candlesTested} bars · horizon {result.horizon} · min n {result.minSamples} · min edge {result.minEdge}pts
+            {result.asset} · {result.tf} · <span className={result.basis === 'heikin' ? 'text-emerald-300' : ''}>{result.basis === 'heikin' ? 'heiken-ashi basis' : 'raw candle basis'}</span> · {result.candlesTested} bars · horizon {result.horizon} · min n {result.minSamples} · min edge {result.minEdge}pts
           </div>
 
           {/* discovery table */}

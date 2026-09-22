@@ -94,6 +94,10 @@ export interface CustomSpec {
   minVotes: number
   /** bars-ahead horizon the learner validated against (informational) */
   horizon: number
+  /** The candle basis the spec was learned on and trades on: 'candles' (raw,
+   * default) or 'heikin' (every signal reads the Heiken-Ashi transform of the
+   * feed). Outcomes/settlement are ALWAYS measured on real prices either way. */
+  basis?: 'candles' | 'heikin'
 }
 
 // ---------- heiken ashi ----------
@@ -121,6 +125,18 @@ export function heikinAshi(candles: Candle[]): HASeries {
     l[i] = Math.min(k.low, o[i], c[i])
   }
   return { open: o, high: h, low: l, close: c }
+}
+
+/** Heiken-Ashi as a Candle[] (1:1 with the input series - same length, same
+ * timestamps), so any signal family can be evaluated on the HA basis. */
+export function heikinAshiCandles(candles: Candle[]): Candle[] {
+  const ha = heikinAshi(candles)
+  return candles.map((k, i) => ({ time: k.time, open: ha.open[i], high: ha.high[i], low: ha.low[i], close: ha.close[i], volume: k.volume }))
+}
+
+/** The candle series a spec's signals are evaluated on (raw or HA transform). */
+export function basisCandles(spec: Pick<CustomSpec, 'basis'>, candles: Candle[]): Candle[] {
+  return spec.basis === 'heikin' ? heikinAshiCandles(candles) : candles
 }
 
 // ---------- full-series evaluation context ----------
@@ -422,10 +438,12 @@ export function evaluateCustomAt(spec: CustomSpec, ctx: EvalCtx, i = ctx.n - 1):
   return { direction: dir, score, votes, active }
 }
 
-/** Vote the spec's signals on the last closed candle. Pure: candles in, eval out. */
+/** Vote the spec's signals on the last closed candle. Pure: candles in, eval out.
+ * The spec's basis decides what the signals read (raw OHLC or the HA transform);
+ * the caller keeps feeding RAW candles either way. */
 export function evaluateCustom(spec: CustomSpec, candles: Candle[]): CustomEval {
   if (candles.length < 25) return { direction: 'none', score: 0, notes: 'warming up (need >=25 bars)', active: [] }
-  const ctx = buildCtx(candles)
+  const ctx = buildCtx(basisCandles(spec, candles))
   const out = evaluateCustomAt(spec, ctx)
   const names = out.active.filter((a) => a.dir === out.direction).map((a) => `${a.label} (${a.weight})`)
   if (out.direction === 'none') {
@@ -510,6 +528,7 @@ export function normalizeSpec(raw: unknown, fallbackName = 'Learned Strategy'): 
     minScore: clampN(r.minScore, 5, 95, 45),
     minVotes: Math.round(clampN(r.minVotes, 1, 6, 1)),
     horizon: Math.round(clampN(r.horizon, 1, 10, 1)),
+    ...(r.basis === 'heikin' ? { basis: 'heikin' as const } : {}),
   }
 }
 
