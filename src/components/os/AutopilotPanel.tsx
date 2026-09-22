@@ -132,6 +132,11 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
 
   const draftStrategy = strategies.find((s) => s.id === draft.strategyId)
   const patch = (p: Partial<BotConfig>) => setDraft((d) => ({ ...d, ...p }))
+  /** Merge-compound-plan helper: keeps every plan field, overrides `over`. */
+  const plan = (over: Partial<NonNullable<BotConfig['stakePlan']>>): BotConfig['stakePlan'] =>
+    draft.stakePlan?.kind === 'compound'
+      ? { ...draft.stakePlan, ...over }
+      : { kind: 'compound', base: 1, rollPct: 100, payoutCap: 70, stopOnLoss: true, ...over }
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-2 rounded-lg border border-[#1c2739] bg-[#0b111c] p-2.5">
@@ -314,21 +319,7 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
                 { v: 'compound', label: 'Compound' },
               ]}
               value={draft.stakePlan?.kind === 'compound' ? 'compound' : 'fixed'}
-              onChange={(v) =>
-                patch({
-                  stakePlan:
-                    v === 'compound'
-                      ? {
-                          kind: 'compound',
-                          base: draft.stakePlan?.base ?? 1,
-                          rollPct: draft.stakePlan?.rollPct ?? 100,
-                          maxStake: draft.stakePlan?.maxStake,
-                          payoutCap: draft.stakePlan?.payoutCap ?? 70,
-                          stopOnLoss: draft.stakePlan?.stopOnLoss ?? true,
-                        }
-                      : undefined,
-                })
-              }
+              onChange={(v) => patch({ stakePlan: v === 'compound' ? plan({}) : undefined })}
             />
 
             {draft.stakePlan?.kind === 'compound' && (
@@ -336,23 +327,65 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
                 <NumField
                   label="Seed stake $ (each restart)"
                   value={draft.stakePlan.base}
-                  onChange={(v) => patch({ stakePlan: { kind: 'compound', base: Math.max(1, v), rollPct: draft.stakePlan?.rollPct, maxStake: draft.stakePlan?.maxStake, payoutCap: draft.stakePlan?.payoutCap, stopOnLoss: draft.stakePlan?.stopOnLoss } })}
+                  onChange={(v) => patch({ stakePlan: plan({ base: Math.max(1, v) }) })}
                 />
                 <NumField
                   label="Roll % of pot (100 = all-in)"
                   value={draft.stakePlan.rollPct ?? 100}
-                  onChange={(v) => patch({ stakePlan: { kind: 'compound', base: draft.stakePlan?.base ?? 1, rollPct: Math.min(100, Math.max(1, v)), maxStake: draft.stakePlan?.maxStake, payoutCap: draft.stakePlan?.payoutCap, stopOnLoss: draft.stakePlan?.stopOnLoss } })}
+                  onChange={(v) => patch({ stakePlan: plan({ rollPct: Math.min(100, Math.max(1, v)) }) })}
                 />
                 <NumField
                   label="Max stake cap $ (0 = none)"
                   value={draft.stakePlan.maxStake ?? 0}
-                  onChange={(v) => patch({ stakePlan: { kind: 'compound', base: draft.stakePlan?.base ?? 1, rollPct: draft.stakePlan?.rollPct, maxStake: v > 0 ? v : undefined, payoutCap: draft.stakePlan?.payoutCap, stopOnLoss: draft.stakePlan?.stopOnLoss } })}
+                  onChange={(v) => patch({ stakePlan: plan({ maxStake: v > 0 ? v : undefined }) })}
                 />
                 <NumField
                   label="Payout cap % (max 70)"
                   value={draft.stakePlan.payoutCap ?? 70}
-                  onChange={(v) => patch({ stakePlan: { kind: 'compound', base: draft.stakePlan?.base ?? 1, rollPct: draft.stakePlan?.rollPct, maxStake: draft.stakePlan?.maxStake, payoutCap: Math.min(70, Math.max(1, v)), stopOnLoss: draft.stakePlan?.stopOnLoss } })}
+                  onChange={(v) => patch({ stakePlan: plan({ payoutCap: Math.min(70, Math.max(1, v)) }) })}
                 />
+                <NumField
+                  label="Periods (0 = compound until loss)"
+                  value={draft.stakePlan.periods ?? 0}
+                  onChange={(v) =>
+                    patch({
+                      stakePlan: plan({
+                        periods: v > 0 ? Math.round(v) : undefined,
+                        ...(v > 0 ? {} : { onComplete: undefined }),
+                      }),
+                    })
+                  }
+                />
+                <NumField
+                  label="De-risk after roll # (0 = never)"
+                  value={draft.stakePlan.deriskAfter ?? 0}
+                  onChange={(v) =>
+                    patch({
+                      stakePlan: plan({
+                        deriskAfter: v > 0 ? Math.round(v) : undefined,
+                        deriskPct: v > 0 ? (draft.stakePlan?.deriskPct ?? 50) : undefined,
+                      }),
+                    })
+                  }
+                />
+                {(draft.stakePlan.deriskAfter ?? 0) > 0 && (
+                  <NumField
+                    label="De-risk stake % of pot"
+                    value={draft.stakePlan.deriskPct ?? 50}
+                    onChange={(v) => patch({ stakePlan: plan({ deriskPct: Math.min(100, Math.max(1, v)) }) })}
+                  />
+                )}
+                {(draft.stakePlan.periods ?? 0) > 0 && (
+                  <Segmented
+                    label="On complete"
+                    options={[
+                      { v: 'halt', label: 'Stand down' },
+                      { v: 'reseed', label: 'Re-seed' },
+                    ]}
+                    value={draft.stakePlan.onComplete === 'reseed' ? 'reseed' : 'halt'}
+                    onChange={(v) => patch({ stakePlan: plan({ onComplete: v as 'halt' | 'reseed' }) })}
+                  />
+                )}
                 <Segmented
                   label="On loss"
                   options={[
@@ -360,18 +393,7 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
                     { v: 'roll', label: 'Re-seed' },
                   ]}
                   value={draft.stakePlan.stopOnLoss === false ? 'roll' : 'end'}
-                  onChange={(v) =>
-                    patch({
-                      stakePlan: {
-                        kind: 'compound',
-                        base: draft.stakePlan?.base ?? 1,
-                        rollPct: draft.stakePlan?.rollPct,
-                        maxStake: draft.stakePlan?.maxStake,
-                        payoutCap: draft.stakePlan?.payoutCap,
-                        stopOnLoss: v !== 'roll',
-                      },
-                    })
-                  }
+                  onChange={(v) => patch({ stakePlan: plan({ stopOnLoss: v !== 'roll' }) })}
                 />
               </>
             )}
@@ -427,7 +449,29 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
 
             {draft.kind === 'binary' || draft.kind === 'turbo' ? (
               <NumField label="Expiry (bars)" value={draft.expiryBars} onChange={(v) => patch({ expiryBars: v })} />
+            ) : draft.kind === 'digital' ? (
+              <NumField
+                label="Expiry (minutes)"
+                value={(draft.expirySec ?? 300) / 60}
+                onChange={(v) => patch({ expirySec: Math.min(1440, Math.max(1, Math.round(v))) * 60 })}
+              />
             ) : null}
+
+            <div>
+              <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Trading session (UTC)</Label>
+              <select
+                value={draft.session ?? 'all'}
+                onChange={(e) => patch({ session: e.target.value as BotConfig['session'] })}
+                className="h-8 w-full rounded border border-[#1c2739] bg-[#101828] px-2 text-[11px] text-[#e2e8f0] outline-none focus:border-cyan-500/50"
+              >
+                <option value="all">All sessions (24h)</option>
+                <option value="overlap">London × NY overlap</option>
+                <option value="london">London</option>
+                <option value="newyork">New York</option>
+                <option value="asia">Asia</option>
+                <option value="sydney">Sydney</option>
+              </select>
+            </div>
 
             {draftStrategy && draftStrategy.params.length > 0 && (
               <div className="col-span-2 rounded border border-[#1c2739] bg-[#101828] p-2">
@@ -519,6 +563,7 @@ function BotCard({
   const { bot, stats } = row
   const winRate = stats.trades ? stats.wins / stats.trades : null
   const halted = bot.stakePlan?.kind === 'compound' && bot.stakePlan.stopOnLoss !== false && stats.halted
+  const complete = halted && stats.complete
   return (
     <div
       className={`rounded-md border p-2 transition-colors ${
@@ -534,8 +579,12 @@ function BotCard({
           <span className={`h-2 w-2 shrink-0 rounded-full ${halted ? 'bg-amber-400' : bot.enabled ? 'animate-pulse bg-emerald-400' : 'bg-[#2a3850]'}`} />
           <span className="truncate text-[12px] font-bold text-[#e2e8f0]">{bot.name}</span>
           {halted && (
-            <span className="shrink-0 rounded bg-amber-500/15 px-1 py-px text-[8px] font-bold uppercase text-amber-300">
-              cycle ended
+            <span
+              className={`shrink-0 rounded px-1 py-px text-[8px] font-bold uppercase ${
+                complete ? 'bg-emerald-500/15 text-emerald-300' : 'bg-amber-500/15 text-amber-300'
+              }`}
+            >
+              {complete ? 'cycle complete' : 'cycle ended'}
             </span>
           )}
           {stats.openCount > 0 && (
@@ -589,6 +638,8 @@ function BotCard({
             {bot.stakePlan.rollPct !== undefined && bot.stakePlan.rollPct !== 100 ? ` · roll ${bot.stakePlan.rollPct}%` : ''}
             {bot.stakePlan.maxStake ? ` · cap $${bot.stakePlan.maxStake}` : ''}
             {` · pay≤${bot.stakePlan.payoutCap ?? 70}%`}
+            {bot.stakePlan.periods ? ` · ${bot.stakePlan.periods}p` : ''}
+            {bot.stakePlan.deriskAfter ? ` · derisk½@${bot.stakePlan.deriskAfter}` : ''}
             {bot.stakePlan.stopOnLoss === false ? ' · re-seed' : ' · stop on loss'}
           </span>
         ) : (
@@ -596,6 +647,9 @@ function BotCard({
         )}
         {bot.direction !== 'both' && <span className="rounded bg-[#101828] px-1 py-px">{bot.direction} only</span>}
         {bot.regime !== 'all' && <span className="rounded bg-[#101828] px-1 py-px">{bot.regime} regime</span>}
+        {bot.session && bot.session !== 'all' && (
+          <span className="rounded bg-sky-500/15 px-1 py-px text-sky-300">{bot.session} only</span>
+        )}
       </div>
 
       <div className="mt-1 flex items-center justify-between font-mono text-[9px]">

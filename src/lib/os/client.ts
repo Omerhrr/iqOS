@@ -496,6 +496,10 @@ export interface BotConfig {
   kind: TradeKind
   stake: number
   expiryBars: number
+  /** Explicit time expiry in seconds for digital bots (900 = 15 minutes). */
+  expirySec?: number
+  /** Session filter: only trade inside the UTC window. 'overlap' = London x NY. */
+  session?: 'all' | 'london' | 'newyork' | 'overlap' | 'asia' | 'sydney'
   minScore: number
   direction: 'both' | 'call' | 'put'
   regime: 'all' | 'trend' | 'range'
@@ -506,7 +510,10 @@ export interface BotConfig {
   /** 'compound': a pot seeded at base (e.g. $1) rolls rollPct% of itself into
    * every trade; wins fold the payout in (capped at payoutCap%, default+max
    * 70). stopOnLoss (default true): one loss ENDS the cycle - the bot stands
-   * down until an explicit restart. */
+   * down until an explicit restart. periods (e.g. 7): the Nth win COMPLETES
+   * the cycle (halt, or auto re-seed with onComplete 'reseed').
+   * deriskAfter/deriskPct: after that many wins, stake only that % of the pot
+   * (e.g. 50 = half) so a late loss cannot give back the whole ladder. */
   stakePlan?: {
     kind: 'fixed' | 'compound'
     base: number
@@ -514,8 +521,12 @@ export interface BotConfig {
     maxStake?: number
     payoutCap?: number
     stopOnLoss?: boolean
+    periods?: number
+    deriskAfter?: number
+    deriskPct?: number
+    onComplete?: 'halt' | 'reseed'
   }
-  planState?: { pot: number; rollN: number; restarts: number; halted?: boolean }
+  planState?: { pot: number; rollN: number; restarts: number; halted?: boolean; complete?: boolean }
 }
 
 export interface BotStats {
@@ -531,6 +542,8 @@ export interface BotStats {
   rollN: number
   restarts: number
   halted: boolean
+  /** halted because the periods target was reached (win-side completion) */
+  complete: boolean
 }
 
 export interface BotRow {

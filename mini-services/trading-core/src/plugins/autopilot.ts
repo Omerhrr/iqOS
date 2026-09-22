@@ -24,6 +24,13 @@ export interface BotConfig {
   kind: TradeKind
   stake: number
   expiryBars: number
+  /** Explicit time expiry in seconds (e.g. 900 = 15 minutes) for digital
+   * bots - independent of the timeframe, settles at an exact timestamp.
+   * Undefined = kind default (5m for digital). */
+  expirySec?: number
+  /** Trading-session filter: only open trades inside the window (UTC).
+   * 'overlap' = London x New York 13:00-17:00 UTC. Undefined/'all' = 24h. */
+  session?: SessionFilter
   minScore: number
   direction: 'both' | 'call' | 'put'
   regime: 'all' | 'trend' | 'range'
@@ -37,7 +44,7 @@ export interface BotConfig {
   stakePlan?: StakePlan
   /** Persisted roll state (pot/rollN/restarts/halted) - written by the
    * autopilot on every settle so the compounding streak survives restarts. */
-  planState?: { pot: number; rollN: number; restarts: number; halted?: boolean }
+  planState?: { pot: number; rollN: number; restarts: number; halted?: boolean; complete?: boolean }
 }
 
 export interface StakePlan {
@@ -54,6 +61,41 @@ export interface StakePlan {
    * an explicit restart (bot_restart). Default true. false = legacy behaviour
    * (the pot re-seeds at base and keeps trading). */
   stopOnLoss?: boolean
+  /** Compound for N periods (wins) per cycle: the Nth win COMPLETES the cycle
+   * - the bot then halts awaiting a restart (onComplete 'halt', default) or
+   * auto re-seeds a fresh cycle ('reseed'). Undefined = no limit (runs until
+   * a loss). */
+  periods?: number
+  /** De-risk ladder: once `deriskAfter` wins have compounded, later trades
+   * stake only `deriskPct`% of the pot (e.g. 50 = "continue with half the
+   * 5th-period amount"). A derisk-phase loss then burns only that fraction -
+   * everything already won stays banked on the balance. */
+  deriskAfter?: number
+  deriskPct?: number
+  /** What happens when `periods` is reached: 'halt' (default) stands down
+   * until an explicit restart; 'reseed' immediately starts a fresh cycle. */
+  onComplete?: 'halt' | 'reseed'
+}
+
+export type SessionFilter = 'all' | 'london' | 'newyork' | 'overlap' | 'asia' | 'sydney'
+
+/** Trading-session windows in UTC hours (fixed-clock approximation - IQ OTC
+ * feeds trade around the clock, so the window is a discipline gate, not a
+ * market-hours gate). 'overlap' = London x New York, the deep-liquidity hours. */
+export const SESSION_WINDOWS: Record<Exclude<SessionFilter, 'all'>, { start: number; end: number; label: string }> = {
+  london: { start: 8, end: 17, label: 'London 08:00-17:00 UTC' },
+  newyork: { start: 13, end: 22, label: 'New York 13:00-22:00 UTC' },
+  overlap: { start: 13, end: 17, label: 'London x NY overlap 13:00-17:00 UTC' },
+  asia: { start: 0, end: 9, label: 'Asia 00:00-09:00 UTC' },
+  sydney: { start: 21, end: 6, label: 'Sydney 21:00-06:00 UTC' },
+}
+
+/** True when UTC time-of-day is inside the session window (wraps midnight). */
+export function inSession(s: SessionFilter, d: Date = new Date()): boolean {
+  if (s === 'all') return true
+  const w = SESSION_WINDOWS[s]
+  const h = d.getUTCHours() + d.getUTCMinutes() / 60
+  return w.start <= w.end ? h >= w.start && h < w.end : h >= w.start || h < w.end
 }
 
 export interface BotStats {
@@ -69,6 +111,7 @@ export interface BotStats {
   rollN: number // wins compounded in the current cycle
   restarts: number // completed cycles (win streaks that ended)
   halted: boolean // compound stop-on-loss: cycle ended, awaiting restart
+  complete: boolean // halted because the periods target was reached (a WIN, not a loss)
 }
 
 export interface BotRow {
@@ -109,6 +152,7 @@ interface RuntimeState {
   rollN: number
   restarts: number
   halted: boolean // stop-on-loss: cycle ended, awaiting explicit restart
+  complete: boolean // halted on the periods target (win-side completion)
 }
 
 export class AutopilotService {
@@ -185,6 +229,11 @@ export class AutopilotService {
       cooldownSec: Math.max(0, Math.round(input.cooldownSec ?? existing?.cooldownSec ?? DEFAULT_BOT.cooldownSec)),
       dailyProfitTarget: input.dailyProfitTarget !== undefined ? Number(input.dailyProfitTarget) : existing?.dailyProfitTarget,
       dailyLossLimit: input.dailyLossLimit !== undefined ? Number(input.dailyLossLimit) : existing?.dailyLossLimit,
+      expirySec:
+        input.expirySec !== undefined || existing?.expirySec !== undefined
+          ? Math.round(clampNum(input.expirySec ?? existing?.expirySec ?? 300, 60, 86400))
+          : undefined,
+      session: this.validSession(input.session ?? existing?.session),
       stakePlan: this.parseStakePlan(input.stakePlan, existing?.stakePlan),
     }
     // a materially different plan invalidates the persisted roll - start clean
@@ -223,6 +272,7 @@ export class AutopilotService {
     if (bot.stakePlan?.kind !== 'compound') return { ok: false, error: 'restart applies to compound bots only' }
     const rt = this.runtime.get(id) ?? this.buildRuntime(id)
     rt.halted = false
+    rt.complete = false
     rt.pot = 0
     rt.rollN = 0
     rt.lastRejection = undefined
@@ -279,9 +329,20 @@ export class AutopilotService {
     }
 
     // compound stop-on-loss: a cycle that took a loss is DEAD - the bot stands
-    // down (but stays armed/configured) until an explicit bot_restart
+    // down (but stays armed/configured) until an explicit bot_restart. A
+    // periods-completed cycle halts too, but with a win-side message.
     if (bot.stakePlan?.kind === 'compound' && bot.stakePlan.stopOnLoss !== false && rt.halted) {
-      return this.reject(bot, 'compound cycle ended on a loss - restart to trade again')
+      return this.reject(
+        bot,
+        rt.complete
+          ? `compound cycle COMPLETE (${rt.rollN}/${bot.stakePlan.periods ?? '?'} periods banked) - restart for a fresh cycle`
+          : 'compound cycle ended on a loss - restart to trade again',
+      )
+    }
+
+    // session window gate (UTC): outside the window the bot just stands down
+    if (bot.session && bot.session !== 'all' && !inSession(bot.session)) {
+      return this.reject(bot, `outside ${bot.session} session (${SESSION_WINDOWS[bot.session].label})`)
     }
 
     // per-bot circuit breakers
@@ -361,6 +422,7 @@ export class AutopilotService {
       kind: bot.kind,
       amount: bet.amount,
       expiryBars: bot.expiryBars,
+      expirySec: bot.kind === 'digital' ? bot.expirySec : undefined,
       mode: 'paper',
       strategy: bot.strategyId,
       note: `bot:${bot.id}`,
@@ -371,7 +433,10 @@ export class AutopilotService {
     rt.trades += 1
     rt.lastTradeTs = Math.floor(Date.now() / 1000)
     rt.lastRejection = undefined
-    const roll = bet.compound ? ` - compound roll x${bet.rollN + 1} (pot $${bet.pot.toFixed(2)})` : ''
+    const periodsTag = bot.stakePlan?.periods ? `/${bot.stakePlan.periods}` : ''
+    const roll = bet.compound
+      ? ` - compound ${bet.phase} roll x${bet.rollN + 1}${periodsTag} (pot $${bet.pot.toFixed(2)}, stake $${bet.amount.toFixed(2)})`
+      : ''
     this.emit('success', `[${bot.name}] ${wanted.toUpperCase()} ${asset} $${bet.amount} ${bot.kind} @ ${evalOut.price.toFixed(5)} - ${evalOut.notes} (score ${evalOut.score.toFixed(0)})${roll}`)
   }
 
@@ -386,21 +451,34 @@ export class AutopilotService {
       maxStake: p.maxStake !== undefined ? clampNum(p.maxStake, 1, 5000) : undefined,
       payoutCap: p.payoutCap !== undefined ? clampNum(p.payoutCap, 1, 70) : undefined,
       stopOnLoss: p.stopOnLoss !== undefined ? Boolean(p.stopOnLoss) : undefined,
+      periods: p.periods !== undefined ? Math.round(clampNum(p.periods, 1, 1000)) : undefined,
+      deriskAfter: p.deriskAfter !== undefined ? Math.round(clampNum(p.deriskAfter, 1, 999)) : undefined,
+      deriskPct: p.deriskPct !== undefined ? clampNum(p.deriskPct, 1, 100) : undefined,
+      onComplete: p.onComplete === 'reseed' ? 'reseed' : p.onComplete === 'halt' ? 'halt' : undefined,
     }
   }
 
+  /** Whitelist a session filter; anything unknown falls back to 'all'. */
+  private validSession(raw: unknown): SessionFilter | undefined {
+    const s = raw as SessionFilter | undefined
+    if (!s || s === 'all') return undefined
+    return SESSION_WINDOWS[s] ? s : undefined
+  }
+
   /** Next stake for a bot: fixed bots always bet bot.stake; compound bots bet
-   * rollPct% of the current pot (pot 0 = fresh cycle at base). Returns the
-   * plan context too so the trade alert can show the roll state. */
-  private stakeFor(bot: BotConfig, rt: RuntimeState): { amount: number; pot: number; rollN: number; compound: boolean } {
+   * rollPct% of the current pot (pot 0 = fresh cycle at base) - once the de-risk
+   * threshold is crossed they bet deriskPct% instead. Returns the plan context
+   * too so the trade alert can show the roll state and phase. */
+  private stakeFor(bot: BotConfig, rt: RuntimeState): { amount: number; pot: number; rollN: number; compound: boolean; phase: 'compound' | 'derisk' } {
     const plan = bot.stakePlan?.kind === 'compound' ? bot.stakePlan : null
-    if (!plan) return { amount: bot.stake, pot: 0, rollN: 0, compound: false }
+    if (!plan) return { amount: bot.stake, pot: 0, rollN: 0, compound: false, phase: 'compound' }
     // dust guard: a pot worth less than a cent is a fresh cycle
     const pot = rt.pot >= 0.01 ? rt.pot : plan.base
-    const rollPct = plan.rollPct ?? 100
+    const derisk = plan.deriskAfter !== undefined && plan.deriskPct !== undefined && rt.rollN >= plan.deriskAfter
+    const rollPct = derisk ? plan.deriskPct! : (plan.rollPct ?? 100)
     const raw = (pot * rollPct) / 100
     const amount = Math.min(plan.maxStake ?? 5000, Math.max(1, Math.round(raw * 100) / 100))
-    return { amount, pot, rollN: rt.rollN, compound: true }
+    return { amount, pot, rollN: rt.rollN, compound: true, phase: derisk ? 'derisk' : 'compound' }
   }
 
   private reject(bot: BotConfig, reason: string): void {
@@ -459,19 +537,45 @@ export class AutopilotService {
         const fold = Math.min(position.pnl ?? position.amount * position.payout, position.amount * cap)
         rt.pot = Math.round((working + fold) * 100) / 100
         rt.rollN += 1
+        // periods target reached: the cycle is COMPLETE (win-side halt)
+        const periods = bot.stakePlan.periods
+        if (periods && rt.rollN >= periods) {
+          rt.restarts += 1
+          const banked = Math.round((rt.pot - base) * 100) / 100
+          if (bot.stakePlan.onComplete === 'reseed') {
+            rt.pot = 0
+            rt.rollN = 0
+            this.emit('success', `[${bot.name}] compound cycle COMPLETE - ${periods} periods, +$${banked.toFixed(2)} banked - re-seeding $${base}`)
+          } else {
+            rt.halted = true
+            rt.complete = true
+            this.emit('success', `[${bot.name}] compound cycle COMPLETE - ${periods} periods, +$${banked.toFixed(2)} banked - standing down; restart for a fresh cycle`)
+          }
+        }
       } else if (position.status === 'lost') {
         rt.pot = Math.round(Math.max(0, working - position.amount) * 100) / 100
+        const kept = rt.pot
         if (rt.rollN > 0) rt.restarts += 1 // a winning streak ended
         rt.rollN = 0
         // stop-on-loss (default): the sequence is over - stand down until an
         // explicit bot_restart. stopOnLoss:false keeps the legacy re-seed roll.
-        if (bot.stakePlan.stopOnLoss !== false) rt.halted = true
+        if (bot.stakePlan.stopOnLoss !== false) {
+          rt.halted = true
+          rt.complete = false
+          this.emit('warn', `[${bot.name}] compound cycle ENDED on a loss (-$${Math.abs(position.pnl ?? 0).toFixed(2)})${kept >= 0.01 ? ` - $${kept.toFixed(2)} of the pot stays banked on the balance` : ''} - restart to trade again`)
+        }
       }
       // survive restarts: persist the roll on the bot record (raw store write
       // - the validating saveBot would emit an alert every settle)
       this.store.saveBot({
         ...bot,
-        planState: { pot: rt.pot, rollN: rt.rollN, restarts: rt.restarts, ...(rt.halted ? { halted: true } : {}) },
+        planState: {
+          pot: rt.pot,
+          rollN: rt.rollN,
+          restarts: rt.restarts,
+          ...(rt.halted ? { halted: true } : {}),
+          ...(rt.halted && rt.complete ? { complete: true } : {}),
+        },
       })
     }
   }
@@ -496,6 +600,7 @@ export class AutopilotService {
       rollN: cfg?.planState?.rollN ?? 0,
       restarts: cfg?.planState?.restarts ?? 0,
       halted: cfg?.planState?.halted ?? false,
+      complete: cfg?.planState?.complete ?? false,
     }
     const journal = this.store.botJournal(botId, 400)
     for (const p of journal) {
@@ -550,6 +655,7 @@ export class AutopilotService {
         rollN: rt.rollN,
         restarts: rt.restarts,
         halted: rt.halted,
+        complete: rt.complete,
       }
     }
     const fresh = this.buildRuntime(botId)
@@ -567,6 +673,7 @@ export class AutopilotService {
       rollN: fresh.rollN,
       restarts: fresh.restarts,
       halted: fresh.halted,
+      complete: fresh.complete,
     }
   }
 

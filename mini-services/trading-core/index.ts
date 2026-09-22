@@ -377,6 +377,8 @@ const httpServer = createServer(async (req, res) => {
       // win multiplies the pot by (1 + rollPct*payout), stake_n = rollPct% of
       // pot_n. PAYOUT IS CAPPED AT 70% no matter what the broker pays - the
       // engine folds in at most payoutCap of the stake, the excess is skimmed.
+      // Periods bound the cycle (the Nth win completes it); a de-risk phase
+      // (deriskAfter/deriskPct) wagers only a fraction of the pot afterwards.
       if (path === '/compound_plan') {
         const PAYOUT_CAP = 0.7
         const base = Math.max(1, Number(q.get('base') ?? 1) || 1)
@@ -385,14 +387,28 @@ const httpServer = createServer(async (req, res) => {
         const rollPct = Math.min(100, Math.max(1, Number(q.get('rollPct') ?? 100) || 100))
         const steps = Math.min(30, Math.max(1, Math.round(Number(q.get('steps') ?? 10) || 10)))
         const maxStake = Number(q.get('maxStake') ?? 0) || undefined
-        const growth = 1 + (rollPct * payout) / 100
-        const schedule: { n: number; pot: number; stake: number; lossAt: number }[] = []
+        const periods = Math.min(100, Math.max(0, Math.round(Number(q.get('periods') ?? 0) || 0))) || undefined
+        const deriskAfter = Math.min(99, Math.max(0, Math.round(Number(q.get('deriskAfter') ?? 0) || 0))) || undefined
+        const deriskPctRaw = Number(q.get('deriskPct') ?? 0) || 0
+        const deriskPct = deriskPctRaw > 0 ? Math.min(100, Math.max(1, deriskPctRaw)) : undefined
+        const onComplete = q.get('onComplete') === 'reseed' ? 'reseed' : 'halt'
+        const schedule: { n: number; pot: number; stake: number; phase: string; lossAt: number }[] = []
+        let pot = base
         let hitCapAt: number | undefined
+        let cycleProfit: number | undefined
         for (let n = 0; n < steps; n++) {
-          const pot = base * Math.pow(growth, n)
-          const stake = (pot * rollPct) / 100
-          if (maxStake && stake > maxStake && hitCapAt === undefined) hitCapAt = n
-          schedule.push({ n, pot: Math.round(pot * 100) / 100, stake: Math.round(stake * 100) / 100, lossAt: 0 })
+          const derisk = deriskAfter !== undefined && deriskPct !== undefined && n >= deriskAfter
+          const pct = derisk ? deriskPct! : rollPct
+          const stake = Math.min(maxStake ?? Infinity, (pot * pct) / 100)
+          if (maxStake && stake >= maxStake && hitCapAt === undefined) hitCapAt = n
+          schedule.push({ n, pot: Math.round(pot * 100) / 100, stake: Math.round(stake * 100) / 100, phase: derisk ? 'derisk' : 'compound', lossAt: 0 })
+          if (periods && n + 1 >= periods) {
+            // the (n+1)th win completes the cycle - fold it and stop the ladder
+            pot += stake * payout
+            cycleProfit = Math.round((pot - base) * 100) / 100
+            break
+          }
+          pot += stake * payout
         }
         // lossAt: cumulative capital burned if the cycle dies at step n
         // (every stake 0..n was lost along the way)
@@ -409,10 +425,15 @@ const httpServer = createServer(async (req, res) => {
           payoutCap: PAYOUT_CAP,
           capped: rawPayout > PAYOUT_CAP,
           rollPct,
-          steps,
-          growth: Math.round(growth * 10000) / 10000,
+          steps: schedule.length,
+          periods,
+          deriskAfter,
+          deriskPct,
+          onComplete,
+          growth: Math.round((1 + (rollPct * payout) / 100) * 10000) / 10000,
           schedule,
           hitCapAt,
+          cycleProfit,
           stopOnLoss: true,
         })
       }
