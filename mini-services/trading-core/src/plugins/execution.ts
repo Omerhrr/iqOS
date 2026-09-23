@@ -443,17 +443,20 @@ export class ExecutionService {
   private onCandleClose(asset: string, tf: Timeframe, candle: Candle): void {
     // binary/turbo/digital settle on the 1s expiry sweep (settleDue) - the
     // candle boundary is only for spot/cfd exit checks
-    const open = this.store.listPositions('open').filter((p) => p.mode === 'paper' && (p.kind === 'spot' || p.kind === 'cfd') && p.asset === asset && p.tf === tf)
+    const open = this.store.listPositions('open').filter((p) => p.mode === 'paper' && p.kind === 'cfd' && p.asset === asset && p.tf === tf)
     for (const pos of open) this.checkMargin(pos, candle.close, candle.time)
   }
 
   private checkSpotStops(asset: string, candle: Candle): void {
-    const open = this.store.listPositions('open').filter((p) => p.mode === 'paper' && (p.kind === 'spot' || p.kind === 'cfd') && p.asset === asset)
+    const open = this.store.listPositions('open').filter((p) => p.mode === 'paper' && p.kind === 'cfd' && p.asset === asset)
     for (const pos of open) this.checkMargin(pos, candle.close, Math.floor(Date.now() / 1000))
   }
 
   private checkMargin(pos: Position, price: number, ts: number): void {
-    if (pos.kind !== 'spot' && pos.kind !== 'cfd') return
+    // NOTE: only 'cfd' carries TP/SL/margin semantics - TradeKind has no
+    // 'spot' member (binary/turbo/digital all settle by expiry), so the old
+    // `pos.kind === 'spot'` branch here was unreachable dead code.
+    if (pos.kind !== 'cfd') return
     const dir = pos.side === 'call' ? 1 : -1
     const movePct = ((price - pos.entryPrice) / pos.entryPrice) * 100 * dir
     const hitTP = pos.tp !== undefined && movePct >= pos.tp

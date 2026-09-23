@@ -75,12 +75,20 @@ export default function OSPage() {
   const [asset, setAsset] = useState('EURUSD')
   const [tf, setTf] = useState<Timeframe>('1m')
   const assetRef = useRef(asset)
-  assetRef.current = asset
   const [candles, setCandles] = useState<Candle[]>([])
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null)
   const [account, setAccount] = useState<AccountState | null>(null)
   const accountRef = useRef<AccountState | null>(null)
-  accountRef.current = account // mirrors state for callbacks that must not re-bind
+  // mirror state into refs for callbacks that must not re-bind - done in an
+  // effect, not during render, since writing to a ref's .current while
+  // rendering is unsafe under concurrent rendering/StrictMode (a render can
+  // be thrown away or run twice, leaving the ref out of sync with state)
+  useEffect(() => {
+    assetRef.current = asset
+  }, [asset])
+  useEffect(() => {
+    accountRef.current = account
+  }, [account])
   const [risk, setRisk] = useState<RiskConfig | null>(null)
   const [positions, setPositions] = useState<Position[]>([])
   const [history, setHistory] = useState<Position[]>([])
@@ -720,37 +728,51 @@ export default function OSPage() {
 
             {vHandle}
 
-            {/* CENTER dock: chart + analytics + bottom workspace */}
+            {/* CENTER dock: chart + analytics + bottom workspace - all three
+                bands are real resizable panels now (previously the analytics
+                row and BottomTabs were fixed-pixel blocks with no scroll and
+                no handle, so on a short window they'd get silently clipped
+                off the bottom instead of resizing like the left/right docks). */}
             <Panel defaultSize={56} minSize={32}>
-              <div className="flex h-full min-h-0 flex-col gap-2 px-0.5">
-                <div className="flex min-h-0 flex-[3] flex-col">{chartStack}</div>
-                <div className="grid h-[240px] shrink-0 grid-cols-2 grid-rows-[minmax(0,1fr)] gap-2 overflow-hidden">
-                  <SignalPanel analysis={analysis} />
-                  <MarkovPanel markov={analysis?.markov ?? null} />
-                </div>
-                <div className="h-[250px] shrink-0">
-                  <BottomTabs
-                    asset={asset}
-                    tf={tf}
-                    analysis={analysis}
-                    positions={positions}
-                    history={history}
-                    alerts={alerts}
-                    patterns={patterns}
-                    assets={assets}
-                    strategies={strategies}
-                    bots={bots}
-                    price={livePrice}
-                    prices={prices}
-                    modeStatus={modeStatus}
-                    refreshMode={loadMode}
-                    refreshPositions={loadPositions}
-                    refreshBots={loadBots}
-                    refreshAccount={loadAccount}
-                    onSelectSetup={handleSelectSetup}
-                    onError={(m) => pushToast('danger', m)}
-                  />
-                </div>
+              <div className="h-full min-h-0 px-0.5">
+                <PanelGroup direction="vertical" autoSaveId="iqos:center" className="h-full">
+                  <Panel defaultSize={64} minSize={25}>
+                    <div className="flex h-full min-h-0 flex-col">{chartStack}</div>
+                  </Panel>
+                  {hHandle}
+                  <Panel defaultSize={16} minSize={10}>
+                    <div className="grid h-full min-h-0 grid-cols-2 grid-rows-[minmax(0,1fr)] gap-2 overflow-hidden">
+                      <SignalPanel analysis={analysis} />
+                      <MarkovPanel markov={analysis?.markov ?? null} />
+                    </div>
+                  </Panel>
+                  {hHandle}
+                  <Panel defaultSize={20} minSize={12}>
+                    <div className="h-full min-h-0 overflow-hidden">
+                      <BottomTabs
+                        asset={asset}
+                        tf={tf}
+                        analysis={analysis}
+                        positions={positions}
+                        history={history}
+                        alerts={alerts}
+                        patterns={patterns}
+                        assets={assets}
+                        strategies={strategies}
+                        bots={bots}
+                        price={livePrice}
+                        prices={prices}
+                        modeStatus={modeStatus}
+                        refreshMode={loadMode}
+                        refreshPositions={loadPositions}
+                        refreshBots={loadBots}
+                        refreshAccount={loadAccount}
+                        onSelectSetup={handleSelectSetup}
+                        onError={(m) => pushToast('danger', m)}
+                      />
+                    </div>
+                  </Panel>
+                </PanelGroup>
               </div>
             </Panel>
 

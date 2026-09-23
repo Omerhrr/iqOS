@@ -18,6 +18,7 @@ import { Input } from '@/components/ui/input'
 type TimelineItem =
   | { kind: 'say'; text: string }
   | { kind: 'tool'; id: number; tool: string; args?: Record<string, unknown>; status: 'run' | 'ok' | 'err'; ms?: number; preview?: string }
+  | { kind: 'ui'; cmd: string; args?: Record<string, unknown> }
   | { kind: 'final'; text: string }
 
 interface Msg {
@@ -255,7 +256,7 @@ function TradeCard({ p }: { p: Record<string, unknown> }) {
         {p.strike !== undefined && p.strike !== null && <span>strike {Number(p.strike).toPrecision(6)}</span>}
         {p.leverage !== undefined && p.leverage !== null && <span>{Number(p.leverage)}x</span>}
         {p.payout !== undefined && <span>payout {Math.round(Number(p.payout) * 100)}%</span>}
-        {p.settlesAt && <span>expires {new Date(Number(p.settlesAt) * 1000).toLocaleTimeString()}</span>}
+        {p.settlesAt != null && <span>expires {new Date(Number(p.settlesAt) * 1000).toLocaleTimeString()}</span>}
       </div>
       <div className="mt-0.5 text-[9px] uppercase tracking-wider text-[#4b5a72]">paper order routed to kernel · settles automatically</div>
     </div>
@@ -490,7 +491,9 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
   const stickRef = useRef(true)
   const abortRef = useRef<AbortController | null>(null)
   const uiRef = useRef(onUiCommand)
-  uiRef.current = onUiCommand
+  useEffect(() => {
+    uiRef.current = onUiCommand
+  }, [onUiCommand])
   // voice: singleton audio element + generation counter so a newer speak()
   // always supersedes an older one
   const audioRef = useRef<HTMLAudioElement | null>(null)
@@ -892,9 +895,17 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
                   preview: ev.preview ? String(ev.preview) : undefined,
                 })
                 break
-              case 'ui':
-                uiRef.current?.(String(ev.cmd), ev.args as Record<string, unknown> | undefined)
+              case 'ui': {
+                const cmd = String(ev.cmd)
+                const args = ev.args as Record<string, unknown> | undefined
+                uiRef.current?.(cmd, args)
+                // surface a confirmation chip in the timeline - previously
+                // this event only drove the chart/workspace silently, so a
+                // user asking the copilot to "switch to EURUSD" or "add
+                // RSI" saw no acknowledgment at all in the chat
+                pushEvent({ kind: 'ui', cmd, args })
                 break
+              }
               case 'final':
                 gotFinal = true
                 setStatus('')
@@ -1076,6 +1087,7 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
                       </div>
                     )
                   if (e.kind === 'tool') return <ToolCard key={ei} item={e} />
+                  if (e.kind === 'ui') return <UiChipCard key={ei} args={e.args} />
                   // final
                   return (
                     <div key={ei} className="group relative">

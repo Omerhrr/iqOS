@@ -1,6 +1,5 @@
 import { NextResponse } from 'next/server'
 import { spawn, execSync } from 'child_process'
-import { unlinkSync } from 'fs'
 import path from 'path'
 
 // IQAIR//OS - kernel keeper

@@ -114,7 +114,6 @@ export function expandGrid(strat: StrategyDef, sweep: SweepSpec, maxCombos: numb
 } {
   const keys: string[] = []
   const valueLists: number[][] = []
-  const base = defaultParams(strat)
 
   for (const p of strat.params) {
     const spec = sweep[p.key]
