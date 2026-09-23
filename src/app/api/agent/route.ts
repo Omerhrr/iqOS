@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import ZAI from 'z-ai-web-dev-sdk'
+import { chatComplete, enabledProviders, type ChatMessage } from '@/lib/llm'
 
 // IQAIR//OS - Copilot v2: a streaming agent harness.
 // The LLM drives the trading-core kernel through a 20-tool loop and the run is
@@ -83,11 +83,9 @@ async function pool<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>
   return out
 }
 
-/** Memoized SDK client - web_search reuses one connection across the run. */
-let zaiMemo: Promise<Awaited<ReturnType<typeof ZAI.create>>> | null = null
-function getZAI() {
-  if (!zaiMemo) zaiMemo = ZAI.create()
-  return zaiMemo
+/** web_search rides on the Z.ai gateway functions API - other providers skip it. */
+function zaiWebSearchAvailable(): boolean {
+  return enabledProviders().includes('zai')
 }
 
 const TF_MINUTES: Record<string, number> = {
@@ -858,8 +856,15 @@ const TOOLS: ToolSpec[] = [
       if (!query) return { ok: false, error: 'query required' }
       const num = Math.min(Math.max(Number(a.num ?? 6), 1), 10)
       const recency = Number(a.recency_days ?? 7)
+      if (!zaiWebSearchAvailable()) {
+        return {
+          ok: false,
+          error: 'web_search requires the Z.ai provider (USE_ZAI=true) - live web search is a Z.ai gateway function. Skipping fundamental check; reason from market data only.',
+        }
+      }
       try {
-        const zai = await getZAI()
+        const { default: ZAI } = await import('z-ai-web-dev-sdk')
+        const zai = await ZAI.create()
         const res = (await zai.functions.invoke('web_search', {
           query,
           num,
@@ -1465,7 +1470,7 @@ Rules:
 - Final answer format: tight markdown. Open with a 1-2 sentence TL;DR verdict, then a few bullet groups with the actual numbers you observed (RSI, P(up), win rate, confidence). No walls of text, no invented data.`
 
 interface ChatMsg {
-  role: 'assistant' | 'user'
+  role: 'system' | 'assistant' | 'user'
   content: string
 }
 
@@ -1697,21 +1702,22 @@ export async function POST(req: NextRequest) {
           /* first message ever - fine */
         }
 
-        const zai = await ZAI.create()
         const messages: ChatMsg[] = [...recent, { role: 'user', content: userMessage }]
 
         let failedBatches = 0
         for (let iter = 0; iter < 8 && !closed && !req.signal.aborted; iter++) {
           emit({ type: 'status', text: iter === 0 ? 'thinking…' : 'reasoning over results…' })
-          const payloadMessages = [
-            { role: 'assistant', content: SYSTEM },
+          const payloadMessages: ChatMessage[] = [
+            { role: 'system', content: SYSTEM },
             ...messages.map((m) => ({ role: m.role, content: m.content })),
-          ] as any[]
-          const completion = (await Promise.race([
-            zai.chat.completions.create({ messages: payloadMessages, thinking: { type: 'disabled' } }),
-            new Promise<never>((_, rej) => setTimeout(() => rej(new Error('model timeout')), 90_000)),
-          ])) as Awaited<ReturnType<typeof zai.chat.completions.create>>
-          const raw = completion.choices[0]?.message?.content ?? ''
+          ]
+          const completion = await chatComplete({
+            messages: payloadMessages,
+            timeoutMs: 90_000,
+            signal: req.signal,
+          })
+          if (iter === 0) emit({ type: 'status', text: `brain: ${completion.provider}/${completion.model}` })
+          const raw = completion.content
           const actions = extractActions(raw)
 
           if (!actions.length) {
