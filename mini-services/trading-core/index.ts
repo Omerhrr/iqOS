@@ -553,6 +553,24 @@ const httpServer = createServer(async (req, res) => {
         })
         return json(200, { ok: true, ...report })
       }
+
+      // research gate status: one (asset, tf, strategy) verdict, or every
+      // saved verdict when no query params are given (powers the
+      // Autopilot panel's per-instrument gate badges).
+      if (path === '/validation') {
+        const store = kernel.context().use<{
+          latestValidation: (asset: string, tf: string, strategyId: string) => unknown
+          listLatestValidations: () => unknown[]
+        }>('storeRaw')
+        const asset = q.get('asset')
+        const tfParam = q.get('tf')
+        const strategyId = q.get('strategy')
+        if (asset && tfParam && strategyId) {
+          const v = store.latestValidation(asset, tfParam, strategyId)
+          return json(200, { ok: true, validation: v })
+        }
+        return json(200, { ok: true, validations: store.listLatestValidations() })
+      }
     }
 
     if (req.method === 'POST') {

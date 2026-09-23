@@ -26,6 +26,7 @@ import ScreenerPanel from './ScreenerPanel'
 import AlertRulesPanel from './AlertRulesPanel'
 import SentinelPanel from './SentinelPanel'
 import WatchdogPanel from './WatchdogPanel'
+import ResearchPanel from './ResearchPanel'
 
 interface BottomTabsProps {
   asset: string
@@ -86,6 +87,7 @@ export default function BottomTabs(props: BottomTabsProps) {
             ['autopilot', `Autopilot${props.bots.filter((b) => b.bot.enabled).length ? ` (${props.bots.filter((b) => b.bot.enabled).length})` : ''}`],
             ['sentinel', 'Sentinel'],
             ['watchdog', 'Watchdog'],
+            ['research', 'Research'],
             ['journal', 'Journal'],
             ['backtest', 'Backtest Lab'],
             ['ailab', 'AI Lab'],
@@ -240,6 +242,14 @@ export default function BottomTabs(props: BottomTabsProps) {
       <TabsContent value="watchdog" className="mt-0 min-h-0 flex-1 overflow-hidden">
         <div className="h-full">
           <WatchdogPanel onError={onError} />
+        </div>
+      </TabsContent>
+
+      {/* RESEARCH & CALIBRATION (the "can I trust this" panel: calibration
+          buckets + the walk-forward research-gate table) */}
+      <TabsContent value="research" className="mt-0 min-h-0 flex-1 overflow-hidden">
+        <div className="h-full">
+          <ResearchPanel strategies={props.strategies} onError={onError} />
         </div>
       </TabsContent>
 

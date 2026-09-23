@@ -5,7 +5,7 @@
 // watchlist and execute through the broker; the global risk manager
 // (kill switch, daily loss, max stake) always outranks them.
 
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -19,8 +19,23 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import type { AssetRow, AutoTraderConfig, BotConfig, BotRow, OsModeStatus, StrategyInfo, Timeframe, TradeKind } from '@/lib/os/client'
-import { KIND_LABEL, TIMEFRAMES, fmtMoney, fmtTime, osPost } from '@/lib/os/client'
+import type { AssetRow, AutoTraderConfig, BotConfig, BotRow, OsModeStatus, StrategyInfo, Timeframe, TradeKind, ValidationRow } from '@/lib/os/client'
+import { KIND_LABEL, TIMEFRAMES, fmtMoney, fmtTime, osGet, osPost } from '@/lib/os/client'
+
+const GATE_MAX_AGE_SEC = 14 * 24 * 60 * 60
+
+/** Same check the kernel's autopilot.researchGate() runs before arming - re-run
+ * here client-side (against the same /validation table) purely to SHOW the
+ * user why a bot might be blocked, before they even try to start it. */
+function gateStatus(bot: BotConfig, validations: Map<string, ValidationRow>): { ready: boolean; missing: string[] } {
+  const missing: string[] = []
+  for (const asset of bot.watchlist) {
+    const v = validations.get(`${asset}|${bot.tf}|${bot.strategyId}`)
+    const stale = v ? Math.floor(Date.now() / 1000) - v.ts > GATE_MAX_AGE_SEC : false
+    if (!v || v.verdict !== 'robust' || stale) missing.push(asset)
+  }
+  return { ready: missing.length === 0, missing }
+}
 
 interface AutopilotPanelProps {
   bots: BotRow[]
@@ -58,6 +73,27 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
   const [draft, setDraft] = useState<BotConfig>(emptyDraft())
   const [busy, setBusy] = useState(false)
   const [filter, setFilter] = useState('')
+  const [validations, setValidations] = useState<Map<string, ValidationRow>>(new Map())
+
+  useEffect(() => {
+    let alive = true
+    const load = async () => {
+      try {
+        const res = await osGet<{ ok: boolean; validations: ValidationRow[] }>('/validation')
+        if (alive && res.ok) {
+          setValidations(new Map(res.validations.map((v) => [`${v.asset}|${v.tf}|${v.strategyId}`, v])))
+        }
+      } catch {
+        // research-gate status is informational only - a failed fetch just leaves the last known map
+      }
+    }
+    void load()
+    const t = setInterval(() => void load(), 20000)
+    return () => {
+      alive = false
+      clearInterval(t)
+    }
+  }, [])
 
   const fleet = useMemo(() => {
     const running = bots.filter((b) => b.bot.enabled).length
@@ -105,8 +141,9 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
 
   const toggle = async (row: BotRow) => {
     try {
-      await osPost('/bot_toggle', { id: row.bot.id, enabled: !row.bot.enabled })
-      onChanged()
+      const res = await osPost<{ ok: boolean; error?: string }>('/bot_toggle', { id: row.bot.id, enabled: !row.bot.enabled })
+      if (res.ok) onChanged()
+      else onError(res.error ?? 'bot rejected')
     } catch (err) {
       onError((err as Error).message)
     }
@@ -219,7 +256,15 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
           </div>
         )}
         {visible.map((row) => (
-          <BotCard key={row.bot.id} row={row} onToggle={() => toggle(row)} onEdit={() => openEdit(row)} onDelete={() => remove(row)} onRestart={() => restart(row)} />
+          <BotCard
+            key={row.bot.id}
+            row={row}
+            gate={gateStatus(row.bot, validations)}
+            onToggle={() => toggle(row)}
+            onEdit={() => openEdit(row)}
+            onDelete={() => remove(row)}
+            onRestart={() => restart(row)}
+          />
         ))}
         {bots.length > 0 && !visible.length && (
           <p className="py-6 text-center font-mono text-[10px] text-[#4b5a72]">no bots match &quot;{filter}&quot;</p>
@@ -550,12 +595,14 @@ function FleetStat({ label, value, tone }: { label: string; value: string; tone:
 
 function BotCard({
   row,
+  gate,
   onToggle,
   onEdit,
   onDelete,
   onRestart,
 }: {
   row: BotRow
+  gate: { ready: boolean; missing: string[] }
   onToggle: () => void
   onEdit: () => void
   onDelete: () => void
@@ -650,6 +697,14 @@ function BotCard({
         {bot.regime !== 'all' && <span className="rounded bg-[#101828] px-1 py-px">{bot.regime} regime</span>}
         {bot.session && bot.session !== 'all' && (
           <span className="rounded bg-sky-500/15 px-1 py-px text-sky-300">{bot.session} only</span>
+        )}
+        {!bot.enabled && (
+          <span
+            className={`rounded px-1 py-px ${gate.ready ? 'bg-emerald-500/15 text-emerald-300' : 'bg-rose-500/15 text-rose-300'}`}
+            title={gate.ready ? 'every watchlist instrument has a robust, recent walk-forward validation' : `missing/stale robust validation: ${gate.missing.join(', ')}`}
+          >
+            {gate.ready ? 'gate: ready' : `gate: ${gate.missing.length} missing`}
+          </span>
         )}
       </div>
 

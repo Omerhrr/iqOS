@@ -233,7 +233,7 @@ export class AutopilotService {
    * table (POST /walkforward writes one on every run). Returns null when
    * clear to arm, or a `research-gate: ...` reason string when blocked. */
   private researchGate(bot: BotConfig): string | null {
-    const MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000 // 14 days - a stale pass doesn't mean much
+    const MAX_AGE_SEC = 14 * 24 * 60 * 60 // 14 days - a stale pass doesn't mean much. v.ts is UNIX SECONDS (store.ts), not ms.
     for (const asset of bot.watchlist) {
       const v = this.store.latestValidation(asset, bot.tf, bot.strategyId)
       if (!v) {
@@ -242,7 +242,7 @@ export class AutopilotService {
       if (v.verdict !== 'robust') {
         return `research-gate: ${asset} ${bot.tf} ${bot.strategyId}'s latest walk-forward verdict was "${v.verdict}", not robust - re-tune params and re-validate before arming`
       }
-      if (Date.now() - v.ts > MAX_AGE_MS) {
+      if (Math.floor(Date.now() / 1000) - v.ts > MAX_AGE_SEC) {
         return `research-gate: ${asset} ${bot.tf} ${bot.strategyId}'s robust validation is stale (>14d old) - re-run /walkforward before arming`
       }
     }

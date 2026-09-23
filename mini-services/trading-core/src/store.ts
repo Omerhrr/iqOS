@@ -456,19 +456,97 @@ export class Store {
     asset: string,
     tf: string,
     strategyId: string
-  ): { verdict: 'robust' | 'weak' | 'failed'; oosNet: number; winRate: number; foldsProfitable: number; folds: number; ts: number } | null {
+  ): {
+    verdict: 'robust' | 'weak' | 'failed'
+    oosNet: number
+    isNet: number
+    winRate: number
+    efficiencyPct: number
+    foldsProfitable: number
+    folds: number
+    totalTrades: number
+    ts: number
+  } | null {
     const row = this.db
-      .query('SELECT verdict, oos_net, win_rate, folds_profitable, folds, ts FROM validations WHERE asset = ? AND tf = ? AND strategy_id = ? ORDER BY ts DESC LIMIT 1')
-      .get(asset, tf, strategyId) as { verdict: string; oos_net: number; win_rate: number; folds_profitable: number; folds: number; ts: number } | null
+      .query(
+        'SELECT verdict, oos_net, is_net, win_rate, efficiency_pct, folds_profitable, folds, total_trades, ts FROM validations WHERE asset = ? AND tf = ? AND strategy_id = ? ORDER BY ts DESC LIMIT 1'
+      )
+      .get(asset, tf, strategyId) as {
+      verdict: string
+      oos_net: number
+      is_net: number
+      win_rate: number
+      efficiency_pct: number
+      folds_profitable: number
+      folds: number
+      total_trades: number
+      ts: number
+    } | null
     if (!row) return null
     return {
       verdict: row.verdict as 'robust' | 'weak' | 'failed',
       oosNet: row.oos_net,
+      isNet: row.is_net,
       winRate: row.win_rate,
+      efficiencyPct: row.efficiency_pct,
       foldsProfitable: row.folds_profitable,
       folds: row.folds,
+      totalTrades: row.total_trades,
       ts: row.ts,
     }
+  }
+
+  /** All (asset, tf, strategyId) combos with a saved validation - powers the
+   * research-gate status panel without one HTTP round trip per bot instrument. */
+  listLatestValidations(): {
+    asset: string
+    tf: string
+    strategyId: string
+    verdict: 'robust' | 'weak' | 'failed'
+    oosNet: number
+    isNet: number
+    winRate: number
+    efficiencyPct: number
+    foldsProfitable: number
+    folds: number
+    totalTrades: number
+    ts: number
+  }[] {
+    const rows = this.db
+      .query(
+        `SELECT v.asset, v.tf, v.strategy_id, v.verdict, v.oos_net, v.is_net, v.win_rate, v.efficiency_pct, v.folds_profitable, v.folds, v.total_trades, v.ts
+         FROM validations v
+         WHERE v.ts = (SELECT MAX(v2.ts) FROM validations v2 WHERE v2.asset = v.asset AND v2.tf = v.tf AND v2.strategy_id = v.strategy_id)
+         ORDER BY v.ts DESC`
+      )
+      .all() as {
+      asset: string
+      tf: string
+      strategy_id: string
+      verdict: string
+      oos_net: number
+      is_net: number
+      win_rate: number
+      efficiency_pct: number
+      folds_profitable: number
+      folds: number
+      total_trades: number
+      ts: number
+    }[]
+    return rows.map((row) => ({
+      asset: row.asset,
+      tf: row.tf,
+      strategyId: row.strategy_id,
+      verdict: row.verdict as 'robust' | 'weak' | 'failed',
+      oosNet: row.oos_net,
+      isNet: row.is_net,
+      winRate: row.win_rate,
+      efficiencyPct: row.efficiency_pct,
+      foldsProfitable: row.folds_profitable,
+      folds: row.folds,
+      totalTrades: row.total_trades,
+      ts: row.ts,
+    }))
   }
 
   // ---------- alerts / journal ----------

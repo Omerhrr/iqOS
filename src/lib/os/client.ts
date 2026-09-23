@@ -639,6 +639,47 @@ export interface LabStrategyRow {
   updatedTs: number
 }
 
+// ---------- calibration & research gate ----------
+
+export interface CalibrationBucket {
+  rangeLabel: string
+  predictedMid: number
+  n: number
+  wins: number
+  realizedWinRate: number
+}
+
+export interface CalibrationReport {
+  n: number
+  excluded: number
+  byConfidence: CalibrationBucket[]
+  byMarkovProb: CalibrationBucket[]
+  brierConfidence: number | null
+  brierMarkov: number | null
+  note: string
+}
+
+/** One (asset, tf, strategy) walk-forward verdict, as saved by POST
+ * /walkforward and read back by GET /validation - the research gate
+ * bot_create/bot_toggle check before arming a bot. */
+export interface ValidationVerdict {
+  verdict: 'robust' | 'weak' | 'failed'
+  oosNet: number
+  isNet: number
+  winRate: number
+  efficiencyPct: number
+  folds: number
+  foldsProfitable: number
+  totalTrades: number
+  ts: number // unix SECONDS
+}
+
+export interface ValidationRow extends ValidationVerdict {
+  asset: string
+  tf: string
+  strategyId: string
+}
+
 export interface JournalGroupRow {
   key: string
   trades: number
