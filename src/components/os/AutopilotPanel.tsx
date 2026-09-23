@@ -429,6 +429,7 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
                 { v: 'all', label: 'All' },
                 { v: 'trend', label: 'Trend' },
                 { v: 'range', label: 'Range' },
+                { v: 'avoid-volatile', label: 'Avoid volatile' },
               ]}
               value={draft.regime}
               onChange={(v) => patch({ regime: v as BotConfig['regime'] })}

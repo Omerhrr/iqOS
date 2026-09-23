@@ -17,6 +17,7 @@ import type { KernelContext } from '../kernel'
 import { TIMEFRAME_SECONDS } from '../types'
 import type { Plugin } from '../kernel'
 import type { MarketDataService } from './market-data'
+import type { AnalyticsService } from './analytics'
 import { getInstrument } from '../universe'
 import { Store } from '../store'
 
@@ -39,6 +40,7 @@ const DEFAULT_RISK: RiskConfig = {
 export class ExecutionService {
   private ctx!: KernelContext
   private market!: MarketDataService
+  private analytics!: AnalyticsService
   private store!: Store
   private unsubscribers: (() => void)[] = []
   private settleTimer: ReturnType<typeof setInterval> | null = null
@@ -58,6 +60,7 @@ export class ExecutionService {
   async start(ctx: KernelContext): Promise<void> {
     this.ctx = ctx
     this.market = ctx.use<MarketDataService>('market')
+    this.analytics = ctx.use<AnalyticsService>('analytics')
     this.store = ctx.use<Store>('store')
     // restore the persisted account source FIRST so the boot sequence
     // (restoreSource) knows which ledger + feed the operator left behind
@@ -137,6 +140,19 @@ export class ExecutionService {
 
   private now(): number {
     return Math.floor(Date.now() / 1000)
+  }
+
+  /** What the model believed AT THE INSTANT of entry - captured on every
+   * placed trade (paper and live, manual and bot) so calibration can later
+   * check whether "score 72" actually won ~72% of the time. Best-effort:
+   * analysis can throw while a pair is still warming up right after boot. */
+  private snapshotSignal(asset: string, tf: Timeframe): { entryScore?: number; entryConfidence?: number; entryPUp?: number } {
+    try {
+      const a = this.analytics.analyze(asset, tf)
+      return { entryScore: a.signal.score, entryConfidence: a.signal.confidence, entryPUp: a.markov.probUp }
+    } catch {
+      return {}
+    }
   }
 
   private updateDayRollover(): void {
@@ -307,6 +323,7 @@ export class ExecutionService {
       }
     }
 
+    Object.assign(position, this.snapshotSignal(req.asset, req.tf))
     this.store.insertPosition(position)
     // reserve stake/margin: deduct immediately, pay back on settlement
     this.store.adjustBalance(-req.amount)
@@ -415,6 +432,7 @@ export class ExecutionService {
         liveOrderId: orderId,
         settlesAt: isCfd ? undefined : echoExp ?? this.now() + expiryMin * 60,
       }
+      Object.assign(position, this.snapshotSignal(req.asset, req.tf ?? '1m'))
       this.store.insertPosition(position)
       this.ctx.bus.emit('positionOpened', { position })
       this.ctx.bus.emit('alert', { level: 'success', message: `LIVE ${kind.toUpperCase()} order ${data.order_id} placed via iqair`, ts: this.now() })

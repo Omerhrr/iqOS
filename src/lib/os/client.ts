@@ -502,7 +502,7 @@ export interface BotConfig {
   session?: 'all' | 'london' | 'newyork' | 'overlap' | 'asia' | 'sydney'
   minScore: number
   direction: 'both' | 'call' | 'put'
-  regime: 'all' | 'trend' | 'range'
+  regime: 'all' | 'trend' | 'range' | 'avoid-volatile'
   maxOpen: number
   cooldownSec: number
   dailyProfitTarget?: number

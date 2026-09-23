@@ -13,6 +13,7 @@ import type { ExecutionService } from './execution'
 import { Store } from '../store'
 import { getStrategy, defaultParams } from '../strategies/builtin'
 import type { StrategyLabService } from './lab'
+import { classifyRegime } from '../analytics/regime'
 
 export interface BotConfig {
   id: string
@@ -34,7 +35,13 @@ export interface BotConfig {
   session?: SessionFilter
   minScore: number
   direction: 'both' | 'call' | 'put'
-  regime: 'all' | 'trend' | 'range'
+  /** 'trend'/'range' now check the same 4-way TRENDING/RANGING/VOLATILE/MIXED
+   * classification the copilot's regime_playbook tool surfaces (adx + Hurst +
+   * garch-vs-ewma vol), not just the coarser Markov bull/bear/range/chop read
+   * this used to use. 'avoid-volatile' allows any direction but blocks entries
+   * while a vol spike is active (garchVol > 1.6x ewmaVol) - for bots that
+   * don't care about trend vs range but shouldn't trade through a shock. */
+  regime: 'all' | 'trend' | 'range' | 'avoid-volatile'
   maxOpen: number
   cooldownSec: number
   dailyProfitTarget?: number
@@ -219,6 +226,29 @@ export class AutopilotService {
     return this.store.listBots().filter((b) => b.bot.enabled).length
   }
 
+  /** Research gate: every watchlist instrument must have a RECENT robust
+   * walk-forward verdict for this exact (asset, tf, strategyId) before a bot
+   * is allowed to arm - mirrors the kalman-ou auto-trader's requireValidation
+   * check in os-mode.ts, generalized to any strategy via the `validations`
+   * table (POST /walkforward writes one on every run). Returns null when
+   * clear to arm, or a `research-gate: ...` reason string when blocked. */
+  private researchGate(bot: BotConfig): string | null {
+    const MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000 // 14 days - a stale pass doesn't mean much
+    for (const asset of bot.watchlist) {
+      const v = this.store.latestValidation(asset, bot.tf, bot.strategyId)
+      if (!v) {
+        return `research-gate: ${asset} ${bot.tf} ${bot.strategyId} has never been walk-forward validated - run /walkforward for this asset+strategy before arming`
+      }
+      if (v.verdict !== 'robust') {
+        return `research-gate: ${asset} ${bot.tf} ${bot.strategyId}'s latest walk-forward verdict was "${v.verdict}", not robust - re-tune params and re-validate before arming`
+      }
+      if (Date.now() - v.ts > MAX_AGE_MS) {
+        return `research-gate: ${asset} ${bot.tf} ${bot.strategyId}'s robust validation is stale (>14d old) - re-run /walkforward before arming`
+      }
+    }
+    return null
+  }
+
   saveBot(input: Partial<BotConfig>): { ok: boolean; bot?: BotConfig; error?: string } {
     const id = input.id?.trim() || `bot-${Math.random().toString(36).slice(2, 8)}`
     const existing = this.store.listBots().find((b) => b.bot.id === id)?.bot
@@ -255,6 +285,13 @@ export class AutopilotService {
     bot.planState = planChanged ? undefined : input.planState ?? existing?.planState
     if (!bot.watchlist.length) return { ok: false, error: 'watchlist needs at least one valid instrument' }
     if (!this.isValidStrategy(bot.strategyId)) return { ok: false, error: `unknown strategy ${bot.strategyId}` }
+    // research gate: only check when this save is what's arming the bot (new
+    // enable, not every edit to an already-running one) so a stake tweak on a
+    // live bot doesn't get blocked by a validation that's since gone stale.
+    if (bot.enabled && !(existing?.enabled ?? false)) {
+      const gate = this.researchGate(bot)
+      if (gate) return { ok: false, error: gate }
+    }
     this.store.saveBot(bot)
     if (!this.runtime.has(id)) this.runtime.set(id, this.buildRuntime(id))
     this.emit(bot.enabled ? 'success' : 'info', `Bot "${bot.name}" saved - ${bot.enabled ? 'ARMED' : 'idle'} (${bot.strategyId} · ${bot.tf} · ${bot.watchlist.join(', ')})`)
@@ -299,6 +336,10 @@ export class AutopilotService {
     const found = this.store.listBots().find((b) => b.bot.id === id)
     if (!found) return { ok: false, error: 'bot not found' }
     const bot: BotConfig = { ...found.bot, enabled: enabled ?? !found.bot.enabled }
+    if (bot.enabled && !found.bot.enabled) {
+      const gate = this.researchGate(bot)
+      if (gate) return { ok: false, error: gate }
+    }
     this.store.saveBot(bot)
     this.emit(bot.enabled ? 'success' : 'info', `Autopilot "${bot.name}" ${bot.enabled ? 'STARTED' : 'STOPPED'} - watching ${bot.watchlist.join(', ')} on ${bot.tf} (${bot.strategyId})`)
     return { ok: true, bot }
@@ -423,14 +464,16 @@ export class AutopilotService {
       return this.reject(bot, `signal ${wanted} outside allowed direction (${bot.direction})`)
     }
 
-    // regime gate from the cached full analysis
+    // regime gate: same 4-way TRENDING/RANGING/VOLATILE/MIXED classification
+    // as the copilot's regime_playbook tool (classifyRegime), not just the
+    // coarser bull/bear Markov read this used to use.
     if (bot.regime !== 'all') {
       try {
         const a = this.analytics.analyze(asset, tf)
-        const r = a.markov.regime
-        const trending = r === 'bull' || r === 'bear'
-        if (bot.regime === 'trend' && !trending) return this.reject(bot, `regime ${r} not trending`)
-        if (bot.regime === 'range' && trending) return this.reject(bot, `regime ${r} not ranging`)
+        const r = classifyRegime(a)
+        if (bot.regime === 'trend' && r !== 'TRENDING') return this.reject(bot, `regime ${r} not trending`)
+        if (bot.regime === 'range' && r !== 'RANGING') return this.reject(bot, `regime ${r} not ranging`)
+        if (bot.regime === 'avoid-volatile' && r === 'VOLATILE') return this.reject(bot, `regime ${r} - standing aside for the vol spike to decay`)
       } catch {
         return this.reject(bot, 'regime unavailable (thin history)')
       }

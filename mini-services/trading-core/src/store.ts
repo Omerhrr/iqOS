@@ -157,6 +157,48 @@ export class Store {
     } catch {
       // column already exists - nothing to migrate
     }
+    // positions: leverage/tp/sl/strike/expiry_sec were long set on the
+    // in-memory Position at trade time but NEVER had columns here, so every
+    // read-back via listPositions() (which runs on every candle close) came
+    // back with them undefined - CFD margin calls/TP/SL and digital strike
+    // settlement were silently defeated the moment a position round-tripped
+    // through the DB. entry_score/confidence/p_up are new: the model's
+    // belief AT ENTRY, for calibration against what actually happened.
+    for (const stmt of [
+      `ALTER TABLE positions ADD COLUMN leverage REAL`,
+      `ALTER TABLE positions ADD COLUMN tp REAL`,
+      `ALTER TABLE positions ADD COLUMN sl REAL`,
+      `ALTER TABLE positions ADD COLUMN strike REAL`,
+      `ALTER TABLE positions ADD COLUMN expiry_sec INTEGER`,
+      `ALTER TABLE positions ADD COLUMN entry_score REAL`,
+      `ALTER TABLE positions ADD COLUMN entry_confidence REAL`,
+      `ALTER TABLE positions ADD COLUMN entry_p_up REAL`,
+    ]) {
+      try {
+        this.db.run(stmt)
+      } catch {
+        // column already exists - nothing to migrate
+      }
+    }
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS validations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        asset TEXT NOT NULL,
+        tf TEXT NOT NULL,
+        strategy_id TEXT NOT NULL,
+        params TEXT NOT NULL,
+        verdict TEXT NOT NULL,
+        oos_net REAL NOT NULL,
+        is_net REAL NOT NULL,
+        win_rate REAL NOT NULL,
+        efficiency_pct REAL NOT NULL,
+        folds INTEGER NOT NULL,
+        folds_profitable INTEGER NOT NULL,
+        total_trades INTEGER NOT NULL,
+        ts INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_validations_lookup ON validations(asset, tf, strategy_id, ts);
+    `)
   }
 
   private seedAccount(): void {
@@ -269,9 +311,14 @@ export class Store {
 
   insertPosition(p: Position): void {
     this.db.run(
-      `INSERT INTO positions (id, ts_open, asset, tf, side, kind, mode, amount, expiry_bars, entry_price, payout, status, strategy, note, live_order_id, settles_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [p.id, p.tsOpen, p.asset, p.tf, p.side, p.kind, p.mode, p.amount, p.expiryBars, p.entryPrice, p.payout, p.status, p.strategy ?? null, p.note ?? null, p.liveOrderId ?? null, p.settlesAt ?? null]
+      `INSERT INTO positions (id, ts_open, asset, tf, side, kind, mode, amount, expiry_bars, entry_price, payout, status, strategy, note, live_order_id, settles_at, leverage, tp, sl, strike, expiry_sec, entry_score, entry_confidence, entry_p_up)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        p.id, p.tsOpen, p.asset, p.tf, p.side, p.kind, p.mode, p.amount, p.expiryBars, p.entryPrice, p.payout, p.status,
+        p.strategy ?? null, p.note ?? null, p.liveOrderId ?? null, p.settlesAt ?? null,
+        p.leverage ?? null, p.tp ?? null, p.sl ?? null, p.strike ?? null, p.expirySec ?? null,
+        p.entryScore ?? null, p.entryConfidence ?? null, p.entryPUp ?? null,
+      ]
     )
   }
 
@@ -362,6 +409,65 @@ export class Store {
       note: (r.note as string) ?? undefined,
       liveOrderId: (r.live_order_id as string) ?? undefined,
       settlesAt: (r.settles_at as number) ?? undefined,
+      leverage: (r.leverage as number) ?? undefined,
+      tp: (r.tp as number) ?? undefined,
+      sl: (r.sl as number) ?? undefined,
+      strike: (r.strike as number) ?? undefined,
+      expirySec: (r.expiry_sec as number) ?? undefined,
+      entryScore: (r.entry_score as number) ?? undefined,
+      entryConfidence: (r.entry_confidence as number) ?? undefined,
+      entryPUp: (r.entry_p_up as number) ?? undefined,
+    }
+  }
+
+  // ---------- strategy validations (walk-forward research gate) ----------
+
+  /** Record a walk-forward verdict so bot arming can require a recent pass. */
+  saveValidation(v: {
+    asset: string
+    tf: string
+    strategyId: string
+    params: Record<string, number | string>
+    verdict: 'robust' | 'weak' | 'failed'
+    oosNet: number
+    isNet: number
+    winRate: number
+    efficiencyPct: number
+    folds: number
+    foldsProfitable: number
+    totalTrades: number
+  }): void {
+    this.db.run(
+      `INSERT INTO validations (asset, tf, strategy_id, params, verdict, oos_net, is_net, win_rate, efficiency_pct, folds, folds_profitable, total_trades, ts)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        v.asset, v.tf, v.strategyId, JSON.stringify(v.params), v.verdict, v.oosNet, v.isNet, v.winRate,
+        v.efficiencyPct, v.folds, v.foldsProfitable, v.totalTrades, Math.floor(Date.now() / 1000),
+      ]
+    )
+  }
+
+  /** Most recent validation for (asset, tf, strategyId), regardless of age - the
+   * caller decides how stale is too stale. Params are not matched (a strategy
+   * tends to be re-validated with its best-found params, not the exact bot
+   * config) - this checks "has this edge been walk-forward-checked at all",
+   * not "with these exact numbers". */
+  latestValidation(
+    asset: string,
+    tf: string,
+    strategyId: string
+  ): { verdict: 'robust' | 'weak' | 'failed'; oosNet: number; winRate: number; foldsProfitable: number; folds: number; ts: number } | null {
+    const row = this.db
+      .query('SELECT verdict, oos_net, win_rate, folds_profitable, folds, ts FROM validations WHERE asset = ? AND tf = ? AND strategy_id = ? ORDER BY ts DESC LIMIT 1')
+      .get(asset, tf, strategyId) as { verdict: string; oos_net: number; win_rate: number; folds_profitable: number; folds: number; ts: number } | null
+    if (!row) return null
+    return {
+      verdict: row.verdict as 'robust' | 'weak' | 'failed',
+      oosNet: row.oos_net,
+      winRate: row.win_rate,
+      foldsProfitable: row.folds_profitable,
+      folds: row.folds,
+      ts: row.ts,
     }
   }
 

@@ -100,6 +100,15 @@ export interface Position {
   settlesAt?: number // epoch seconds when binary/turbo/digital expires
   strike?: number // digital options strike
   expirySec?: number // digital expiry in seconds (5m/15m)
+  /** Snapshot of what the model believed AT ENTRY - the composite signal's
+   * score/confidence and the Markov P(up), captured the instant the trade
+   * was placed. This is what calibration checks against realized outcome:
+   * did "score 72" actually win ~72% of the time? Undefined for trades
+   * placed before this was added, or when no analysis was available yet
+   * (e.g. still warming up) - calibration simply excludes those rows. */
+  entryScore?: number
+  entryConfidence?: number
+  entryPUp?: number
 }
 
 export interface AccountState {

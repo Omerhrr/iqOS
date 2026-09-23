@@ -25,6 +25,7 @@ import { ALL_TIMEFRAMES, type Timeframe } from './src/types'
 import { searchInstruments, UNIVERSE_STATS, getInstrument } from './src/universe'
 import { listRegistry, computeIndicator, registrySize, getIndicatorDef } from './src/analytics/registry'
 import { detectChartPatterns } from './src/analytics/chart-patterns'
+import { buildCalibrationReport, type CalibrationStoreSlice } from './src/analytics/calibration'
 
 const PORT = 3030
 
@@ -542,6 +543,16 @@ const httpServer = createServer(async (req, res) => {
           recent: trades.slice(-40).reverse(),
         })
       }
+
+      if (path === '/calibration') {
+        const store = kernel.context().use<CalibrationStoreSlice>('storeRaw')
+        const report = buildCalibrationReport(store, {
+          asset: q.get('asset') ?? undefined,
+          strategyId: q.get('strategy') ?? undefined,
+          limit: q.get('limit') ? Number(q.get('limit')) : undefined,
+        })
+        return json(200, { ok: true, ...report })
+      }
     }
 
     if (req.method === 'POST') {
@@ -617,7 +628,54 @@ const httpServer = createServer(async (req, res) => {
           expiryBars: body.expiryBars !== undefined ? Number(body.expiryBars) : 1,
           startEquity: body.startEquity !== undefined ? Number(body.startEquity) : 1000,
         })
-        return json(200, { ok: true, result: out })
+        // Persist the verdict so the research-gate (bot_create/bot_toggle) can
+        // require a recent robust pass before arming a bot on this
+        // (asset, tf, strategy) - same grading rubric as the kalman-ou
+        // auto-trader's requireValidation check in os-mode.ts: robust = OOS
+        // net positive, >=2/3 folds profitable, >=25% IS->OOS efficiency and
+        // enough OOS trades to trust it; weak = profitable but not
+        // convincing; failed = anything else.
+        const verdict: 'robust' | 'weak' | 'failed' =
+          out.oos.netPnl > 0 && out.foldsProfitable >= Math.ceil(out.folds.length * (2 / 3)) && out.efficiencyPct >= 25 && out.oos.totalTrades >= 10
+            ? 'robust'
+            : out.oos.netPnl > 0 && out.foldsProfitable >= 1
+              ? 'weak'
+              : 'failed'
+        try {
+          const vstore = kernel.context().use<{
+            saveValidation: (v: {
+              asset: string
+              tf: string
+              strategyId: string
+              params: Record<string, number | string>
+              verdict: 'robust' | 'weak' | 'failed'
+              oosNet: number
+              isNet: number
+              winRate: number
+              efficiencyPct: number
+              folds: number
+              foldsProfitable: number
+              totalTrades: number
+            }) => void
+          }>('storeRaw')
+          vstore.saveValidation({
+            asset: String(body.asset ?? market.activeAsset),
+            tf: String(body.tf ?? '1m'),
+            strategyId: String(body.strategy ?? 'rsi-reversion'),
+            params: out.bestParams,
+            verdict,
+            oosNet: Math.round(out.oos.netPnl * 100) / 100,
+            isNet: Math.round(out.isNet * 100) / 100,
+            winRate: Math.round(out.oos.winRate * 10) / 10,
+            efficiencyPct: Math.round(out.efficiencyPct * 10) / 10,
+            folds: out.folds.length,
+            foldsProfitable: out.foldsProfitable,
+            totalTrades: out.oos.totalTrades,
+          })
+        } catch (err) {
+          console.error('[research] saveValidation failed:', (err as Error).message)
+        }
+        return json(200, { ok: true, result: out, verdict })
       }
 
       if (path === '/asset_sweep') {

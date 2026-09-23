@@ -313,6 +313,69 @@ export const STRATEGIES: StrategyDef[] = [
         sarMax: num(p, 'sarMax', TSK_DEFAULTS.sarMax),
       }),
   },
+  {
+    id: 'ensemble-vote',
+    name: 'Ensemble (Majority Vote)',
+    description:
+      'Runs several independent strategies on the same candles and only fires when at least `minAgree` of them agree on direction with a per-member score above `voteMinScore` - a higher-precision filter that trades the intersection of independent edges instead of any single one\'s false positives. Score is the average |score| of the agreeing members, scaled down slightly for consensus strength (fewer agreeing members = more shaved off). `members` is a comma-separated list of strategy ids (builtin only - no nested ensembles, no custom: lab strategies); a member id that can\'t be found is skipped and does not count toward the vote.',
+    params: [
+      { key: 'members', label: 'Member strategies (comma-separated ids)', type: 'select', default: 'ema-trend,rsi-reversion,markov-edge' },
+      { key: 'voteMinScore', label: 'Per-member score to count as a vote', type: 'number', min: 0, max: 100, default: 40 },
+      { key: 'minAgree', label: 'Min members that must agree', type: 'number', min: 2, max: 6, default: 2 },
+    ],
+    evaluate: (candles, p) => {
+      const ids = String(p.members ?? '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter((s) => s && s !== 'ensemble-vote')
+      const voteMinScore = num(p, 'voteMinScore', 40)
+      const minAgree = Math.max(2, Math.round(num(p, 'minAgree', 2)))
+      const votes: { id: string; direction: 'call' | 'put'; score: number }[] = []
+      const skipped: string[] = []
+      for (const id of ids) {
+        const strat = STRATEGIES.find((s) => s.id === id)
+        if (!strat) {
+          skipped.push(id)
+          continue
+        }
+        try {
+          const merged: Record<string, number | string> = {}
+          for (const dp of strat.params) merged[dp.key] = dp.default
+          const ev = strat.evaluate(candles, merged)
+          if ((ev.direction === 'call' || ev.direction === 'put') && Math.abs(ev.score) >= voteMinScore) {
+            votes.push({ id, direction: ev.direction, score: Math.abs(ev.score) })
+          }
+        } catch {
+          skipped.push(id)
+        }
+      }
+      const calls = votes.filter((v) => v.direction === 'call')
+      const puts = votes.filter((v) => v.direction === 'put')
+      const skippedNote = skipped.length ? ` (skipped: ${skipped.join(', ')})` : ''
+      const decide = (side: 'call' | 'put', agreeing: typeof calls, otherCount: number) => {
+        if (agreeing.length < minAgree || agreeing.length <= otherCount) return null
+        const avg = agreeing.reduce((a, v) => a + v.score, 0) / agreeing.length
+        // consensus discount: needing only the bare minimum to agree is a
+        // weaker signal than every member piling on - shave up to 15% off
+        // when agreement is right at the minAgree floor.
+        const consensusFactor = 1 - Math.max(0, (ids.length - agreeing.length) / Math.max(1, ids.length)) * 0.15
+        const score = clamp(avg * consensusFactor, 30, 100)
+        return {
+          direction: side,
+          score,
+          notes: `${agreeing.length}/${ids.length - skipped.length} agree ${side.toUpperCase()} (${agreeing.map((v) => v.id).join(', ')})${skippedNote}`,
+        }
+      }
+      return (
+        decide('call', calls, puts.length) ??
+        decide('put', puts, calls.length) ?? {
+          direction: 'none',
+          score: 0,
+          notes: `no ${minAgree}+ consensus - ${calls.length} call vs ${puts.length} put of ${ids.length - skipped.length} usable members${skippedNote}`,
+        }
+      )
+    },
+  },
 ]
 
 export const getStrategy = (id: string): StrategyDef | undefined => STRATEGIES.find((s) => s.id === id)
