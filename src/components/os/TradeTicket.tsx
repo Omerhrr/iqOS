@@ -25,7 +25,7 @@ const DIGITAL_EXPIRIES = [
 export default function TradeTicket({ asset, tf, price, account, onPlaced, onError }: Props) {
   const [kind, setKind] = useState<TradeKind>('binary')
   const [side, setSide] = useState<'call' | 'put' | null>(null)
-  const [amount, setAmount] = useState('25')
+  const [amount, setAmount] = useState('1')
   const [expiryBars, setExpiryBars] = useState('1')
   const [digitalExpiry, setDigitalExpiry] = useState(300)
   const [strikeOffset, setStrikeOffset] = useState('0')
@@ -71,7 +71,7 @@ export default function TradeTicket({ asset, tf, price, account, onPlaced, onErr
     }
   }
 
-  const chips = [10, 25, 50, 100, 250]
+  const chips = [1, 5, 10, 25, 50, 100]
 
   return (
     <div className="flex flex-col gap-3 rounded-lg border border-[#1c2739] bg-[#0b111c] p-3">

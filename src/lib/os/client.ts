@@ -507,6 +507,10 @@ export interface BotConfig {
   cooldownSec: number
   dailyProfitTarget?: number
   dailyLossLimit?: number
+  /** Adaptive confidence gate: only fires setups whose own realized record
+   * (this asset/tf/strategy/side/score-bucket[/regime]) clears the fleet
+   * win-rate floor with statistical confidence. undefined/true = on. */
+  adaptive?: boolean
   /** 'compound': a pot seeded at base (e.g. $1) rolls rollPct% of itself into
    * every trade; wins fold the payout in (capped at payoutCap%, default+max
    * 70). stopOnLoss (default true): one loss ENDS the cycle - the bot stands

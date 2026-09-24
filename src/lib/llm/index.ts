@@ -75,16 +75,36 @@ function isProviderId(v: string): v is ProviderId {
   return (PROVIDER_ORDER as string[]).includes(v)
 }
 
-/** Providers currently switched on via USE_*=true, ordered by LLM_ORDER or default. */
+/** Combine a caller-provided abort signal with a hard timeout - passing only
+ * `signal` would otherwise silently defeat `timeoutMs` (a request tied to a
+ * long-lived SSE stream that never itself aborts could then hang forever on a
+ * slow/dead endpoint). Falls back to timeout-only or signal-only when the
+ * other is absent. */
+function withTimeout(timeoutMs: number, signal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs)
+  if (!signal) return timeout
+  return AbortSignal.any([signal, timeout])
+}
+
+/** Providers currently switched on via USE_*=true, ordered by LLM_ORDER or default.
+ * If NO USE_* flag is set at all (a bare checkout with no .env yet), default to
+ * zai alone - that's how this OS behaved before multi-provider support existed
+ * (zero-config inside the managed sandbox via .z-ai-config), so an empty .env
+ * doesn't silently turn the copilot off. Set USE_ZAI=false explicitly to opt out
+ * without enabling anything else. */
 export function enabledProviders(): ProviderId[] {
-  const flags: Partial<Record<ProviderId, boolean>> = {
-    zai: envBool('USE_ZAI'),
-    deepseek: envBool('USE_DEEPSEEK'),
-    anthropic: envBool('USE_ANTHROPIC'),
-    openai: envBool('USE_OPENAI'),
-    gemini: envBool('USE_GEMINI'),
-    ollama: envBool('USE_OLLAMA'),
+  const flagKeys: Record<ProviderId, string> = {
+    zai: 'USE_ZAI',
+    deepseek: 'USE_DEEPSEEK',
+    anthropic: 'USE_ANTHROPIC',
+    openai: 'USE_OPENAI',
+    gemini: 'USE_GEMINI',
+    ollama: 'USE_OLLAMA',
   }
+  const anySet = PROVIDER_ORDER.some((p) => env(flagKeys[p]) !== '')
+  const flags: Partial<Record<ProviderId, boolean>> = anySet
+    ? { zai: envBool('USE_ZAI'), deepseek: envBool('USE_DEEPSEEK'), anthropic: envBool('USE_ANTHROPIC'), openai: envBool('USE_OPENAI'), gemini: envBool('USE_GEMINI'), ollama: envBool('USE_OLLAMA') }
+    : { zai: true }
   const enabled = PROVIDER_ORDER.filter((p) => flags[p])
   if (enabled.length <= 1) return enabled
   const custom = env('LLM_ORDER').split(',').map((s) => s.trim().toLowerCase()).filter(isProviderId)
@@ -92,13 +112,18 @@ export function enabledProviders(): ProviderId[] {
   return [...custom.filter((p) => enabled.includes(p)), ...enabled.filter((p) => !custom.includes(p))]
 }
 
-/** True when the provider has whatever credential it needs. */
+/** True when the provider has whatever credential it needs. zai is always
+ * "ready" from a config standpoint: with ZAI_API_KEY it goes direct, without
+ * one it falls to the managed SDK (.z-ai-config) - if THAT is also missing,
+ * the actual chatComplete() call fails and chatComplete's own fallback loop
+ * moves on to the next enabled provider, so gating on env flags here would
+ * just mean "enabled but always filtered out" the moment USE_ZAI is implied
+ * rather than explicitly set (the zero-.env default case). */
 function providerReady(p: ProviderId): boolean {
   switch (p) {
     case 'zai':
-      return !!env('ZAI_API_KEY') || envBool('USE_ZAI') // SDK path works with .z-ai-config
     case 'ollama':
-      return true // local server needs no key (base URL still required)
+      return true // ollama: local server needs no key (base URL still required)
     default:
       return !!env(`${p.toUpperCase()}_API_KEY`)
   }
@@ -131,8 +156,11 @@ export function providerStatus(): {
 
 // ---------------------------------------------------------------- transports
 
-/** z-ai-web-dev-sdk (managed gateway) — system prompt rides as leading assistant msg. */
-async function zaiSdkChat(messages: ChatMessage[], timeoutMs: number): Promise<string> {
+/** z-ai-web-dev-sdk (managed gateway) — system prompt rides as leading assistant msg.
+ * The SDK takes no AbortSignal of its own, so an incoming abort only stops US
+ * from waiting on it (the upstream call may still run to completion in the
+ * background) - same limitation as the pre-multi-provider code had. */
+async function zaiSdkChat(messages: ChatMessage[], timeoutMs: number, signal?: AbortSignal): Promise<string> {
   const { default: ZAI } = await import('z-ai-web-dev-sdk')
   const zai = await ZAI.create()
   const payload: ChatMessage[] = messages.map((m) =>
@@ -141,6 +169,7 @@ async function zaiSdkChat(messages: ChatMessage[], timeoutMs: number): Promise<s
   const completion = (await Promise.race([
     zai.chat.completions.create({ messages: payload, thinking: { type: 'disabled' } }),
     new Promise<never>((_, rej) => setTimeout(() => rej(new Error('zai sdk timeout')), timeoutMs)),
+    ...(signal ? [new Promise<never>((_, rej) => signal.addEventListener('abort', () => rej(new Error('aborted')), { once: true }))] : []),
   ])) as { choices?: { message?: { content?: string } }[] }
   const content = completion.choices?.[0]?.message?.content ?? ''
   if (!content) throw new Error('zai sdk returned empty content')
@@ -173,7 +202,7 @@ async function openaiCompatChat(
       ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
     },
     body: JSON.stringify(body),
-    signal: opts.signal ?? AbortSignal.timeout(opts.timeoutMs),
+    signal: withTimeout(opts.timeoutMs, opts.signal),
   })
   if (!res.ok) {
     const text = (await res.text().catch(() => '')).slice(0, 300)
@@ -219,7 +248,7 @@ async function anthropicChat(
       ...(system ? { system } : {}),
       messages: merged,
     }),
-    signal: opts.signal ?? AbortSignal.timeout(opts.timeoutMs),
+    signal: withTimeout(opts.timeoutMs, opts.signal),
   })
   if (!res.ok) {
     const text = (await res.text().catch(() => '')).slice(0, 300)
@@ -244,7 +273,7 @@ async function callProvider(p: ProviderId, opts: ChatOptions): Promise<ChatResul
   if (p === 'zai') {
     content = env('ZAI_API_KEY')
       ? await openaiCompatChat('zai', opts.messages, { timeoutMs, signal: opts.signal })
-      : await zaiSdkChat(opts.messages, timeoutMs)
+      : await zaiSdkChat(opts.messages, timeoutMs, opts.signal)
   } else if (p === 'anthropic') {
     content = await anthropicChat(opts.messages, { ...opts, timeoutMs })
   } else {

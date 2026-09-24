@@ -109,6 +109,12 @@ export interface Position {
   entryScore?: number
   entryConfidence?: number
   entryPUp?: number
+  /** 4-way regime (classifyRegime) AT ENTRY - the adaptive confidence gate's
+   * historical buckets are keyed on this, alongside asset/tf/strategy/side/
+   * score, so "this exact strategy on this exact asset in a TRENDING regime"
+   * can be judged on its OWN realized record, not the strategy's average
+   * across every condition it's ever traded in. */
+  entryRegime?: string
 }
 
 export interface AccountState {

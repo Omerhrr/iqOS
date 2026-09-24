@@ -13,6 +13,24 @@ export function logReturns(closesArr: number[]): number[] {
   return out
 }
 
+/** Pearson correlation of two equal-length series (shorter one wins, aligned
+ * from the start). Used for cross-asset correlation checks (sentinel's
+ * correlation-aware exposure cap, the copilot's `correlate` tool). */
+export function pearson(a: number[], b: number[]): number {
+  const n = Math.min(a.length, b.length)
+  if (n < 3) return 0
+  let sa = 0, sb = 0
+  for (let i = 0; i < n; i++) { sa += a[i]; sb += b[i] }
+  const ma = sa / n, mb = sb / n
+  let num = 0, da = 0, dbv = 0
+  for (let i = 0; i < n; i++) {
+    const x = a[i] - ma, y = b[i] - mb
+    num += x * y; da += x * x; dbv += y * y
+  }
+  const den = Math.sqrt(da * dbv)
+  return den === 0 ? 0 : Math.round((num / den) * 1000) / 1000
+}
+
 export function mean(xs: number[]): number {
   return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0
 }

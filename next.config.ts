@@ -7,6 +7,36 @@ const nextConfig: NextConfig = {
     ignoreBuildErrors: true,
   },
   reactStrictMode: false,
+  // lightningcss (which @tailwindcss/postcss uses under the hood) picks its
+  // native binary at runtime with a dynamic `require(`lightningcss-${platform}
+  // -${arch}-${libc}`)`. Turbopack tries to statically analyze that dynamic
+  // require so it can bundle it, can't fully resolve the template literal,
+  // and substitutes the literal string 'unknown' as the module id - hence
+  // "Cannot find module 'unknown'" even though the real binary package
+  // (verified present: node_modules/lightningcss-linux-x64-gnu, ~9MB .node
+  // file) is installed correctly. serverExternalPackages is Next's escape
+  // hatch for exactly this: these packages are left as plain Node `require`
+  // calls at runtime instead of being traced/bundled by Turbopack.
+  serverExternalPackages: ["lightningcss", "@tailwindcss/node", "@tailwindcss/postcss"],
+  turbopack: {
+    // Without this, Turbopack auto-detects the workspace root by walking UP
+    // looking for lockfiles and lands on C:\Users\USER (there's a stray
+    // package-lock.json there) instead of this project folder. That makes it
+    // file-watch the ENTIRE user profile through WSL's slow /mnt/c/ DrvFs
+    // mount on every change - which is exactly what "Compiling..." hanging
+    // for a long time on any edit looks like, and (worse) it then resolves
+    // package imports like 'tailwindcss' from that wrong root, where they
+    // don't exist.
+    //
+    // NOTE: __dirname here is NOT this file's real folder - next.config.ts
+    // gets loaded through a transpile step that rehomes it a directory up,
+    // which is exactly the bug the first attempt at this fix hit (root
+    // landed on .../desktop instead of .../desktop/iqos, breaking every
+    // import). process.cwd() is reliable instead: `next dev` / `bun run dev`
+    // is always launched FROM the project directory (see package.json's
+    // "dev" script), so cwd at config-load time IS the project root.
+    root: process.cwd(),
+  },
   async rewrites() {
     return {
       // Kernel passthrough: the OS client (src/lib/os/client.ts) calls the
@@ -28,7 +58,7 @@ const nextConfig: NextConfig = {
         {
           source: "/:path*",
           has: [{ type: "query", key: "XTransformPort" }],
-          destination: "http://127.0.0.1:3030/:path*",
+          destination: `${process.env.KERNEL_URL || "http://127.0.0.1:3030"}/:path*`,
         },
       ],
       afterFiles: [],

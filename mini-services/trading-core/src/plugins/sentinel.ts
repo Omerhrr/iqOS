@@ -11,6 +11,8 @@
 import type { Plugin, KernelContext } from '../kernel'
 import type { Store } from '../store'
 import type { Position } from '../types'
+import type { MarketDataService } from './market-data'
+import { logReturns, pearson } from '../analytics/quant'
 
 export interface SentinelConfig {
   maxExposurePct: number // max total open stake as % of balance (0 = off)
@@ -19,6 +21,16 @@ export interface SentinelConfig {
   drawdownHaltPct: number // % drop from high-water mark that trips the breaker (0 = off)
   autoKillOnDailyLoss: boolean // engage kill switch when the daily loss limit is hit
   autoKillOnDrawdown: boolean // engage kill switch when the drawdown breaker trips
+  /** Correlation-aware exposure cap: a basket of 3 highly-correlated pairs is
+   * effectively one leveraged bet, even though each one clears the per-asset
+   * cap on its own. When a new trade's asset is correlated (|r| >= threshold,
+   * on recent log-returns) with any OPEN position, the combined stake across
+   * every correlated position (plus the new trade) is checked against this %
+   * of balance. 0 = off. */
+  correlationCapPct: number
+  /** |Pearson r| on recent 1m log-returns at/above which two assets are
+   * treated as "the same bet" for the correlation cap above. */
+  correlationThreshold: number
 }
 
 export const DEFAULT_SENTINEL: SentinelConfig = {
@@ -28,6 +40,8 @@ export const DEFAULT_SENTINEL: SentinelConfig = {
   drawdownHaltPct: 15,
   autoKillOnDailyLoss: true,
   autoKillOnDrawdown: false,
+  correlationCapPct: 20,
+  correlationThreshold: 0.65,
 }
 
 export interface BreakerState {
@@ -51,11 +65,18 @@ interface AutopilotLike {
 export class SentinelService {
   private ctx!: KernelContext
   private store!: Store
+  private market!: MarketDataService
   private unsubscribers: (() => void)[] = []
 
   config: SentinelConfig = { ...DEFAULT_SENTINEL }
   hwm = 0 // balance high-water mark
   private tradeTs: number[] = [] // rolling window of trade-open timestamps
+  // short-lived cache of pairwise correlations - preTrade runs on every order
+  // and a fresh 200-bar pearson per open asset would otherwise recompute on
+  // every single trade check
+  private corrCache = new Map<string, { r: number; ts: number }>()
+  private static readonly CORR_TTL_SEC = 300
+  private static readonly CORR_BARS = 200
   private breakers: Record<'daily' | 'drawdown', BreakerState> = {
     daily: { id: 'daily', label: 'DAILY LOSS', tripped: false, reason: '', ts: null },
     drawdown: { id: 'drawdown', label: 'DRAWDOWN', tripped: false, reason: '', ts: null },
@@ -64,6 +85,7 @@ export class SentinelService {
   async start(ctx: KernelContext): Promise<void> {
     this.ctx = ctx
     this.store = ctx.use<Store>('store')
+    this.market = ctx.use<MarketDataService>('market')
     this.restore()
 
     this.unsubscribers.push(
@@ -125,6 +147,45 @@ export class SentinelService {
       byAsset[p.asset] = (byAsset[p.asset] ?? 0) + p.amount
     }
     return { total: Math.round(total * 100) / 100, byAsset }
+  }
+
+  /** |Pearson r| of recent 1m log-returns between two assets - the same read
+   * as the copilot's `correlate` tool, cached for CORR_TTL_SEC since preTrade
+   * runs on every order and correlation drifts slowly. */
+  private correlation(a: string, b: string): number {
+    if (a === b) return 1
+    const key = a < b ? `${a}|${b}` : `${b}|${a}`
+    const now = this.now()
+    const cached = this.corrCache.get(key)
+    if (cached && now - cached.ts < SentinelService.CORR_TTL_SEC) return cached.r
+    try {
+      const ca = this.market.getCandles(a, '1m', SentinelService.CORR_BARS)
+      const cb = this.market.getCandles(b, '1m', SentinelService.CORR_BARS)
+      const retsA = logReturns(ca.map((c) => c.close))
+      const retsB = logReturns(cb.map((c) => c.close))
+      const r = Math.abs(pearson(retsA, retsB))
+      this.corrCache.set(key, { r, ts: now })
+      return r
+    } catch {
+      return 0
+    }
+  }
+
+  /** Combined open stake across every position correlated (|r| >= threshold,
+   * same asset always counts) with `asset` - what a new trade on `asset`
+   * would really be adding to, risk-wise, rather than just its own line. */
+  correlatedExposure(asset: string): { total: number; assets: string[] } {
+    const byAsset = this.exposure().byAsset
+    const threshold = this.config.correlationThreshold
+    let total = 0
+    const linked: string[] = []
+    for (const [other, stake] of Object.entries(byAsset)) {
+      if (this.correlation(asset, other) >= threshold) {
+        total += stake
+        if (other !== asset) linked.push(other)
+      }
+    }
+    return { total: Math.round(total * 100) / 100, assets: linked }
   }
 
   tradesLastHour(): number {
@@ -256,6 +317,20 @@ export class SentinelService {
         }
     }
 
+    // correlation-aware exposure cap: a new trade correlated with existing
+    // open positions is really adding to ONE bet, not opening a diversified
+    // new one - cap the combined stake, not just this asset's own line.
+    if (this.config.correlationCapPct > 0 && acct.balance > 0) {
+      const linked = this.correlatedExposure(asset)
+      const cap = (acct.balance * this.config.correlationCapPct) / 100
+      if (linked.total + amount > cap) {
+        return {
+          ok: false,
+          reason: `sentinel: correlation cap - ${asset} is correlated (|r|>=${this.config.correlationThreshold}) with ${linked.assets.length ? linked.assets.join(', ') : 'its own open stake'}; combined stake $${linked.total.toFixed(2)} + $${amount.toFixed(2)} would exceed ${this.config.correlationCapPct}% of balance ($${cap.toFixed(2)})`,
+        }
+      }
+    }
+
     // trade-rate throttle
     if (this.config.maxTradesPerHour > 0 && this.tradesLastHour() >= this.config.maxTradesPerHour) {
       return {
@@ -362,6 +437,7 @@ export class SentinelService {
       exposure: exp,
       exposureCap: this.config.maxExposurePct > 0 ? Math.round(((bal * this.config.maxExposurePct) / 100) * 100) / 100 : 0,
       perAssetCap: this.config.perAssetCapPct > 0 ? Math.round(((bal * this.config.perAssetCapPct) / 100) * 100) / 100 : 0,
+      correlationCap: this.config.correlationCapPct > 0 ? Math.round(((bal * this.config.correlationCapPct) / 100) * 100) / 100 : 0,
       tradesLastHour: this.tradesLastHour(),
       openPositions: this.openPositions().length,
       maxOpenPositions,

@@ -1,0 +1,17 @@
+# Add this block to your EXISTING Caddy container's Caddyfile (the one that
+# already routes your other /opt/ projects). Do not create a separate Caddy
+# instance for iqOS - reuse the one you have.
+#
+# Requirements:
+#   1. iqOS's docker-compose.yml joins the SAME external Docker network your
+#      Caddy container is on (the "caddy" network in docker-compose.yml here
+#      - rename both places to match your actual network name).
+#   2. Cloudflare DNS: add an A record for `iqos` pointing at this server's
+#      public IP (proxied or DNS-only, your call - proxied is fine since
+#      Caddy still terminates real TLS via Cloudflare Origin/Let's Encrypt
+#      depending on how you already have Cloudflare configured for your
+#      other subdomains - match whatever you're already doing).
+
+iqos.rogan.live {
+	reverse_proxy iqos-web:47311
+}

@@ -147,6 +147,10 @@ export class Store {
         day_key TEXT NOT NULL,
         day_start REAL NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS adaptive_config (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        config TEXT NOT NULL
+      );
     `)
     // column migrations for databases created before the column existed:
     // CREATE TABLE IF NOT EXISTS is a no-op on an existing table, so the
@@ -173,6 +177,7 @@ export class Store {
       `ALTER TABLE positions ADD COLUMN entry_score REAL`,
       `ALTER TABLE positions ADD COLUMN entry_confidence REAL`,
       `ALTER TABLE positions ADD COLUMN entry_p_up REAL`,
+      `ALTER TABLE positions ADD COLUMN entry_regime TEXT`,
     ]) {
       try {
         this.db.run(stmt)
@@ -311,13 +316,13 @@ export class Store {
 
   insertPosition(p: Position): void {
     this.db.run(
-      `INSERT INTO positions (id, ts_open, asset, tf, side, kind, mode, amount, expiry_bars, entry_price, payout, status, strategy, note, live_order_id, settles_at, leverage, tp, sl, strike, expiry_sec, entry_score, entry_confidence, entry_p_up)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO positions (id, ts_open, asset, tf, side, kind, mode, amount, expiry_bars, entry_price, payout, status, strategy, note, live_order_id, settles_at, leverage, tp, sl, strike, expiry_sec, entry_score, entry_confidence, entry_p_up, entry_regime)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         p.id, p.tsOpen, p.asset, p.tf, p.side, p.kind, p.mode, p.amount, p.expiryBars, p.entryPrice, p.payout, p.status,
         p.strategy ?? null, p.note ?? null, p.liveOrderId ?? null, p.settlesAt ?? null,
         p.leverage ?? null, p.tp ?? null, p.sl ?? null, p.strike ?? null, p.expirySec ?? null,
-        p.entryScore ?? null, p.entryConfidence ?? null, p.entryPUp ?? null,
+        p.entryScore ?? null, p.entryConfidence ?? null, p.entryPUp ?? null, p.entryRegime ?? null,
       ]
     )
   }
@@ -417,7 +422,58 @@ export class Store {
       entryScore: (r.entry_score as number) ?? undefined,
       entryConfidence: (r.entry_confidence as number) ?? undefined,
       entryPUp: (r.entry_p_up as number) ?? undefined,
+      entryRegime: (r.entry_regime as string) ?? undefined,
     }
+  }
+
+  // ---------- adaptive confidence gate ----------
+
+  /** Realized record for one (asset, tf, strategyId, side[, regime]) bucket,
+   * scoped to entries whose |entryScore| falls in [scoreFloor, scoreFloor +
+   * scoreBucketWidth) - "this exact setup", not the strategy's average
+   * across every score it's ever fired at. regime is optional: pass it to
+   * split the bucket further (a strategy can be a coin-flip in one regime
+   * and genuinely strong in another); omit it to pool across regimes when a
+   * bucket is too thin to judge on regime alone. Only CLOSED (won/lost)
+   * trades count - opens are still undecided. */
+  adaptiveBucketStats(
+    asset: string,
+    tf: string,
+    strategyId: string,
+    side: string,
+    scoreFloor: number,
+    scoreBucketWidth: number,
+    regime?: string
+  ): { trades: number; wins: number } {
+    const params: (string | number)[] = [asset, tf, strategyId, side, scoreFloor, scoreFloor + scoreBucketWidth]
+    let sql = `SELECT COUNT(*) AS n, SUM(CASE WHEN status = 'won' THEN 1 ELSE 0 END) AS w
+       FROM positions
+       WHERE asset = ? AND tf = ? AND strategy = ? AND side = ? AND status IN ('won','lost')
+         AND entry_score IS NOT NULL AND ABS(entry_score) >= ? AND ABS(entry_score) < ?`
+    if (regime) {
+      sql += ' AND entry_regime = ?'
+      params.push(regime)
+    }
+    const row = this.db.query(sql).get(...params) as { n: number; w: number | null } | null
+    return { trades: row?.n ?? 0, wins: row?.w ?? 0 }
+  }
+
+  // ---------- adaptive gate config ----------
+
+  getAdaptiveConfig(): unknown | null {
+    const row = this.db.query('SELECT config FROM adaptive_config WHERE id = 1').get() as { config: string } | null
+    if (!row) return null
+    try {
+      return JSON.parse(row.config)
+    } catch {
+      return null
+    }
+  }
+
+  saveAdaptiveConfig(config: unknown): void {
+    this.db.run('INSERT INTO adaptive_config (id, config) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET config = excluded.config', [
+      JSON.stringify(config),
+    ])
   }
 
   // ---------- strategy validations (walk-forward research gate) ----------

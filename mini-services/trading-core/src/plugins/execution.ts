@@ -20,6 +20,7 @@ import type { MarketDataService } from './market-data'
 import type { AnalyticsService } from './analytics'
 import { getInstrument } from '../universe'
 import { Store } from '../store'
+import { classifyRegime } from '../analytics/regime'
 
 export interface RiskConfig {
   maxStake: number
@@ -146,10 +147,10 @@ export class ExecutionService {
    * placed trade (paper and live, manual and bot) so calibration can later
    * check whether "score 72" actually won ~72% of the time. Best-effort:
    * analysis can throw while a pair is still warming up right after boot. */
-  private snapshotSignal(asset: string, tf: Timeframe): { entryScore?: number; entryConfidence?: number; entryPUp?: number } {
+  private snapshotSignal(asset: string, tf: Timeframe): { entryScore?: number; entryConfidence?: number; entryPUp?: number; entryRegime?: string } {
     try {
       const a = this.analytics.analyze(asset, tf)
-      return { entryScore: a.signal.score, entryConfidence: a.signal.confidence, entryPUp: a.markov.probUp }
+      return { entryScore: a.signal.score, entryConfidence: a.signal.confidence, entryPUp: a.markov.probUp, entryRegime: classifyRegime(a) }
     } catch {
       return {}
     }

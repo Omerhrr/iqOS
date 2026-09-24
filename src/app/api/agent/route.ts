@@ -7,7 +7,7 @@ import { chatComplete, enabledProviders, type ChatMessage } from '@/lib/llm'
 // `ui` events are commands the CLIENT executes (switch chart, timeframe, add
 // indicator overlays...) so the copilot can literally operate the OS for the user.
 
-const CORE = 'http://127.0.0.1:3030'
+const CORE = process.env.KERNEL_URL || 'http://127.0.0.1:3030'
 
 interface ToolSpec {
   name: string

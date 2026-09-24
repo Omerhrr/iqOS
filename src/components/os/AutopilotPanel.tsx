@@ -479,6 +479,20 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
               value={draft.regime}
               onChange={(v) => patch({ regime: v as BotConfig['regime'] })}
             />
+            <Segmented
+              label="Adaptive confidence gate"
+              options={[
+                { v: 'on', label: 'On (recommended)' },
+                { v: 'off', label: 'Off' },
+              ]}
+              value={draft.adaptive === false ? 'off' : 'on'}
+              onChange={(v) => patch({ adaptive: v !== 'off' })}
+            />
+            <p className="-mt-1 text-[9px] leading-relaxed text-[#4b5a72]">
+              Only fires when THIS asset/tf/strategy/side/score-bucket has its own proven settled record (95%
+              confidence floor) - see the Research panel for bucket-by-bucket stats. New setups still trade while
+              they build a track record; only setups with enough history AND a weak record get held back.
+            </p>
 
             <NumField label="Max open positions" value={draft.maxOpen} onChange={(v) => patch({ maxOpen: v })} />
             <NumField label="Cooldown between trades (s)" value={draft.cooldownSec} onChange={(v) => patch({ cooldownSec: v })} />
@@ -695,6 +709,15 @@ function BotCard({
         )}
         {bot.direction !== 'both' && <span className="rounded bg-[#101828] px-1 py-px">{bot.direction} only</span>}
         {bot.regime !== 'all' && <span className="rounded bg-[#101828] px-1 py-px">{bot.regime} regime</span>}
+        {bot.adaptive === false ? (
+          <span className="rounded bg-[#101828] px-1 py-px" title="adaptive confidence gate turned off for this bot">
+            adaptive off
+          </span>
+        ) : (
+          <span className="rounded bg-cyan-500/15 px-1 py-px text-cyan-300" title="only fires setups with a proven settled record for this exact asset/tf/strategy/side/score/regime">
+            adaptive
+          </span>
+        )}
         {bot.session && bot.session !== 'all' && (
           <span className="rounded bg-sky-500/15 px-1 py-px text-sky-300">{bot.session} only</span>
         )}

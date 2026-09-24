@@ -18,6 +18,7 @@ import { screenerPlugin, ScreenerService } from './src/plugins/screener'
 import { alertRulesPlugin, AlertRulesService, ALERT_METRICS } from './src/plugins/alert-rules'
 import { sentinelPlugin, SentinelService, type SentinelConfig } from './src/plugins/sentinel'
 import { watchdogPlugin, WatchdogService, type WatchdogConfig } from './src/plugins/watchdog'
+import { adaptivePlugin, AdaptiveService, type AdaptiveConfig } from './src/plugins/adaptive'
 import { gridSearch, walkForward, sweepAssets, type Objective } from './src/strategies/optimize'
 import { vskMonteCarlo } from './src/analytics/vsk'
 import { tskMonteCarlo } from './src/analytics/tsk'
@@ -27,7 +28,9 @@ import { listRegistry, computeIndicator, registrySize, getIndicatorDef } from '.
 import { detectChartPatterns } from './src/analytics/chart-patterns'
 import { buildCalibrationReport, type CalibrationStoreSlice } from './src/analytics/calibration'
 
-const PORT = 3030
+// Defaults to 3030 for local/Windows dev; the Docker deployment overrides
+// this to an unusual, hard-to-collide-with port via the KERNEL_PORT env var.
+const PORT = Number(process.env.KERNEL_PORT ?? 3030)
 
 const kernel = new Kernel()
 kernel.register(storePlugin)
@@ -42,6 +45,7 @@ kernel.register(screenerPlugin)
 kernel.register(alertRulesPlugin)
 kernel.register(sentinelPlugin)
 kernel.register(watchdogPlugin)
+kernel.register(adaptivePlugin)
 
 const httpServer = createServer(async (req, res) => {
   res.setHeader('access-control-allow-origin', '*')
@@ -330,6 +334,27 @@ const httpServer = createServer(async (req, res) => {
       if (path === '/watchdog') {
         const wd = kernel.context().use<WatchdogService>('watchdog')
         return json(200, { ok: true, ...wd.status() })
+      }
+
+      // ---------- adaptive confidence gate ----------
+
+      if (path === '/adaptive') {
+        const ad = kernel.context().use<AdaptiveService>('adaptive')
+        return json(200, { ok: true, ...ad.status() })
+      }
+
+      // Preview a bucket's realized record without placing anything - lets
+      // the Autopilot panel show "this bot's setup is proven/unproven/failing"
+      // before the operator even arms it.
+      if (path === '/adaptive_bucket') {
+        const ad = kernel.context().use<AdaptiveService>('adaptive')
+        const asset = q.get('asset') ?? market.activeAsset
+        const timeframe = String(q.get('tf') ?? '1m')
+        const strategy = String(q.get('strategy') ?? 'confluence-core')
+        const side = String(q.get('side') ?? 'call')
+        const score = Number(q.get('score') ?? 60)
+        const regime = q.get('regime') ?? undefined
+        return json(200, { ok: true, verdict: ad.check(asset, timeframe, strategy, side, score, regime ?? undefined) })
       }
 
       // ---------- archive: deep history ----------
@@ -1128,6 +1153,13 @@ const httpServer = createServer(async (req, res) => {
       if (path === '/panic') {
         const sen = kernel.context().use<SentinelService>('sentinel')
         return json(200, sen.panic({ killSwitch: Boolean(body.killSwitch) }))
+      }
+
+      // ---------- adaptive gate control ----------
+
+      if (path === '/adaptive_config') {
+        const ad = kernel.context().use<AdaptiveService>('adaptive')
+        return json(200, { ok: true, config: ad.configure(body as Partial<AdaptiveConfig>) })
       }
 
       // ---------- watchdog control ----------

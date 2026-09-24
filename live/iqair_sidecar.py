@@ -76,8 +76,13 @@ try:
 except Exception:  # noqa: BLE001
     pass
 
-HOST = "127.0.0.1"
-PORT = 8788
+# Bind to 127.0.0.1 for local/Windows use (matches the OS's default LIVE-mode
+# URL in Settings). In Docker, override via SIDECAR_HOST=0.0.0.0 so the
+# iqos-web container can reach this one over the internal network - binding
+# to loopback INSIDE a container makes it unreachable from any other
+# container, even on the same Docker network.
+HOST = os.environ.get("SIDECAR_HOST", "127.0.0.1")
+PORT = int(os.environ.get("SIDECAR_PORT", "8788"))
 
 _lock = threading.Lock()
 _client = None  # iqair IQOptionClient, set by /connect

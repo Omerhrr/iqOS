@@ -14,6 +14,7 @@ import { Store } from '../store'
 import { getStrategy, defaultParams } from '../strategies/builtin'
 import type { StrategyLabService } from './lab'
 import { classifyRegime } from '../analytics/regime'
+import { walkForward } from '../strategies/optimize'
 
 export interface BotConfig {
   id: string
@@ -44,6 +45,13 @@ export interface BotConfig {
   regime: 'all' | 'trend' | 'range' | 'avoid-volatile'
   maxOpen: number
   cooldownSec: number
+  /** Adaptive confidence gate: before executing, check this exact
+   * (asset, tf, strategyId, side, score-bucket[, regime]) bucket's OWN
+   * realized win rate (Wilson lower bound) against the fleet floor - trade
+   * only in conditions this bot has PROVEN out for itself. Undefined/true =
+   * on (fleet default from adaptive.configure() still applies); false = this
+   * bot opts out entirely. */
+  adaptive?: boolean
   dailyProfitTarget?: number
   dailyLossLimit?: number
   /** Money-management plan. 'fixed' (default/undefined) always bets `stake`.
@@ -173,6 +181,12 @@ export class AutopilotService {
   private runtime = new Map<string, RuntimeState>()
   private evaluating = new Set<string>() // asset|tf pairs currently being processed
   private lab: StrategyLabService | null = null
+  private revalidateTimer: ReturnType<typeof setInterval> | null = null
+  // walk-forward is CPU-heavy - re-checks are spread across ticks rather than
+  // run all at once for a fleet with many bots/assets
+  private static readonly REVALIDATE_TICK_MS = 15 * 60 * 1000 // 15 min sweep cadence
+  private static readonly REVALIDATE_AFTER_SEC = 6 * 60 * 60 // re-run walk-forward at least this often for any (asset,tf,strategy) an ENABLED bot depends on
+  private static readonly REVALIDATE_MAX_PER_TICK = 2
 
   /** Lazy-resolve the Strategy Lab (registered after the core plugins) -
    * custom:* strategy ids evaluate through it. */
@@ -203,12 +217,20 @@ export class AutopilotService {
       ctx.bus.on('positionOpened', ({ position }) => this.onPositionOpened(position)),
       ctx.bus.on('positionClosed', ({ position }) => this.onPositionClosed(position))
     )
+    // continuous re-validation gate: researchGate only checks AT ARM TIME -
+    // this keeps re-checking the underlying edge on a clock so a strategy
+    // that quietly decayed gets caught even if nobody ever touches the bot
+    // again (watchdog catches live P&L drift; this catches the backtest edge
+    // itself decaying, before or alongside that).
+    this.revalidateTimer = setInterval(() => void this.revalidateSweep(), AutopilotService.REVALIDATE_TICK_MS)
     ctx.log('autopilot', `bot engine online (${this.runtime.size} bots registered)`)
   }
 
   stop(): void {
     for (const u of this.unsubscribers) u()
     this.unsubscribers = []
+    if (this.revalidateTimer) clearInterval(this.revalidateTimer)
+    this.revalidateTimer = null
   }
 
   // ---------- fleet ----------
@@ -249,6 +271,96 @@ export class AutopilotService {
     return null
   }
 
+  /** Sweep every ENABLED bot's watchlist for (asset, tf, strategyId) combos
+   * whose latest validation is missing or older than REVALIDATE_AFTER_SEC,
+   * and re-run walk-forward on up to REVALIDATE_MAX_PER_TICK of them per
+   * tick. custom:* (Strategy Lab) strategies aren't backed by the optimize.ts
+   * grid engine, so they're outside this gate for now - watchdog still
+   * covers their live drift. */
+  private async revalidateSweep(): Promise<void> {
+    const now = Math.floor(Date.now() / 1000)
+    const due = new Map<string, { asset: string; tf: Timeframe; strategyId: string; botIds: string[] }>()
+    for (const { bot } of this.store.listBots()) {
+      if (!bot.enabled || bot.strategyId.startsWith('custom:')) continue
+      for (const asset of bot.watchlist) {
+        const v = this.store.latestValidation(asset, bot.tf, bot.strategyId)
+        if (v && now - v.ts < AutopilotService.REVALIDATE_AFTER_SEC) continue
+        const key = `${asset}|${bot.tf}|${bot.strategyId}`
+        const entry = due.get(key) ?? { asset, tf: bot.tf, strategyId: bot.strategyId, botIds: [] }
+        entry.botIds.push(bot.id)
+        due.set(key, entry)
+      }
+    }
+    if (!due.size) return
+    for (const combo of Array.from(due.values()).slice(0, AutopilotService.REVALIDATE_MAX_PER_TICK)) {
+      try {
+        await this.revalidateOne(combo.asset, combo.tf, combo.strategyId, combo.botIds)
+      } catch (err) {
+        this.ctx.log('autopilot', `re-validation gate: ${combo.asset} ${combo.tf} ${combo.strategyId} failed:`, (err as Error).message)
+      }
+    }
+  }
+
+  /** Re-run the same walk-forward the operator would run by hand (POST
+   * /walkforward) for one (asset, tf, strategyId), save the fresh verdict
+   * with the SAME grading rubric that endpoint uses (so the Research panel
+   * and researchGate both see one consistent history), and auto-disarm every
+   * enabled bot that depends on it the moment a robust edge stops being
+   * robust. */
+  private async revalidateOne(asset: string, tf: Timeframe, strategyId: string, botIds: string[]): Promise<void> {
+    const strat = getStrategy(strategyId)
+    if (!strat) return
+    const candles = this.market.getCandlesDeep(asset, tf, 2200)
+    const out = walkForward(candles, asset, tf, {
+      strategy: strategyId,
+      sweep: {},
+      objective: 'netPnl',
+      minTrades: 6,
+      maxCombos: 4,
+      folds: 3,
+      isRatio: 0.7,
+      payout: 0.85,
+      amount: 10,
+      expiryBars: 1,
+      startEquity: 1000,
+    })
+    const verdict: 'robust' | 'weak' | 'failed' =
+      out.oos.netPnl > 0 && out.foldsProfitable >= Math.ceil(out.folds.length * (2 / 3)) && out.efficiencyPct >= 25 && out.oos.totalTrades >= 10
+        ? 'robust'
+        : out.oos.netPnl > 0 && out.foldsProfitable >= 1
+          ? 'weak'
+          : 'failed'
+    this.store.saveValidation({
+      asset,
+      tf,
+      strategyId,
+      params: out.bestParams,
+      verdict,
+      oosNet: Math.round(out.oos.netPnl * 100) / 100,
+      isNet: Math.round(out.isNet * 100) / 100,
+      winRate: Math.round(out.oos.winRate * 10) / 10,
+      efficiencyPct: Math.round(out.efficiencyPct * 10) / 10,
+      folds: out.folds.length,
+      foldsProfitable: out.foldsProfitable,
+      totalTrades: out.oos.totalTrades,
+    })
+    this.ctx.log(
+      'autopilot',
+      `re-validation gate: ${asset} ${tf} ${strategyId} -> ${verdict} (oos net ${out.oos.netPnl.toFixed(2)}, ${out.foldsProfitable}/${out.folds.length} folds profitable)`
+    )
+    if (verdict === 'robust') return
+    for (const botId of botIds) {
+      const row = this.store.listBots().find((b) => b.bot.id === botId)
+      if (!row?.bot.enabled) continue
+      this.store.saveBot({ ...row.bot, enabled: false })
+      this.runtime.delete(botId) // rebuilt fresh from the journal on next read - clears stale rejection-spam state too
+      this.emit(
+        'danger',
+        `[${row.bot.name}] AUTO-DISARMED by the continuous re-validation gate - ${asset} ${tf} ${strategyId}'s walk-forward decayed to "${verdict}" - re-tune and re-validate (POST /walkforward) before re-arming`
+      )
+    }
+  }
+
   saveBot(input: Partial<BotConfig>): { ok: boolean; bot?: BotConfig; error?: string } {
     const id = input.id?.trim() || `bot-${Math.random().toString(36).slice(2, 8)}`
     const existing = this.store.listBots().find((b) => b.bot.id === id)?.bot
@@ -279,6 +391,7 @@ export class AutopilotService {
           : undefined,
       session: this.validSession(input.session ?? existing?.session),
       stakePlan: this.parseStakePlan(input.stakePlan, existing?.stakePlan),
+      adaptive: input.adaptive !== undefined ? Boolean(input.adaptive) : existing?.adaptive,
     }
     // a materially different plan invalidates the persisted roll - start clean
     const planChanged = JSON.stringify(bot.stakePlan ?? null) !== JSON.stringify(existing?.stakePlan ?? null)
@@ -476,6 +589,29 @@ export class AutopilotService {
         if (bot.regime === 'avoid-volatile' && r === 'VOLATILE') return this.reject(bot, `regime ${r} - standing aside for the vol spike to decay`)
       } catch {
         return this.reject(bot, 'regime unavailable (thin history)')
+      }
+    }
+
+    // adaptive confidence gate: this exact (asset, tf, strategy, side,
+    // score-bucket[, regime]) setup only fires if ITS OWN settled record
+    // (Wilson lower bound, not the raw ratio) clears the fleet floor - see
+    // adaptive.ts for why this is the honest way to chase a higher win rate
+    // instead of a curve-fit backtest number.
+    if (bot.adaptive !== false) {
+      try {
+        const adaptive = this.ctx.use<{ config: { enabled: boolean }; check: (asset: string, tf: string, strategyId: string, side: string, score: number, regime?: string) => { ok: boolean; reason?: string } }>('adaptive')
+        if (adaptive.config.enabled) {
+          let regime: string | undefined
+          try {
+            regime = classifyRegime(this.analytics.analyze(asset, tf))
+          } catch {
+            regime = undefined
+          }
+          const v = adaptive.check(asset, tf, bot.strategyId, wanted, evalOut.score, regime)
+          if (!v.ok) return this.reject(bot, v.reason ?? 'adaptive confidence gate hold')
+        }
+      } catch {
+        // adaptive plugin not loaded - gate disabled
       }
     }
 

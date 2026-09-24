@@ -1,0 +1,10 @@
+node_modules
+mini-services/**/node_modules
+.next
+dev.log
+server.log
+*.log
+.git
+.env
+.env.local
+tsconfig.tsbuildinfo

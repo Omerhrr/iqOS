@@ -11,6 +11,12 @@ import path from 'path'
 // gives the whole system self-healing semantics without a system supervisor.
 
 const CORE_DIR = path.join(process.cwd(), 'mini-services', 'trading-core')
+const KERNEL_URL = process.env.KERNEL_URL || 'http://127.0.0.1:3030'
+// In Docker the kernel runs as its own container, managed by Docker itself
+// (restart policy / healthcheck) - this process must never try to spawn it
+// as a child, since `mini-services/trading-core` won't even exist inside the
+// web container's image. Set KERNEL_MANAGED=false in that compose service.
+const KERNEL_MANAGED = process.env.KERNEL_MANAGED !== 'false'
 
 let spawning = false
 let lastSpawnTs = 0
@@ -19,7 +25,7 @@ async function coreAlive(timeoutMs = 1500): Promise<boolean> {
   try {
     const ctrl = new AbortController()
     const t = setTimeout(() => ctrl.abort(), timeoutMs)
-    const res = await fetch('http://127.0.0.1:3030/health', { signal: ctrl.signal, cache: 'no-store' })
+    const res = await fetch(`${KERNEL_URL}/health`, { signal: ctrl.signal, cache: 'no-store' })
     clearTimeout(t)
     return res.ok
   } catch {
@@ -42,6 +48,11 @@ function resolveBun(): string {
 export async function GET() {
   if (await coreAlive()) {
     return NextResponse.json({ ok: true, kernel: 'running' })
+  }
+  if (!KERNEL_MANAGED) {
+    // Docker deployment: don't spawn, just report status - Docker's own
+    // healthcheck/restart policy on the kernel container handles recovery.
+    return NextResponse.json({ ok: false, kernel: 'unreachable' }, { status: 502 })
   }
   if (spawning || Date.now() - lastSpawnTs < 4000) {
     return NextResponse.json({ ok: false, kernel: 'spawning' }, { status: 202 })

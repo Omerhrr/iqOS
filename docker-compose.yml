@@ -1,0 +1,84 @@
+services:
+  iqos-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: iqos-web
+    restart: unless-stopped
+    environment:
+      - PORT=47311
+      - KERNEL_URL=http://iqos-kernel:47312
+      - KERNEL_MANAGED=false
+      # LLM provider config - copy the flags/keys you use from .env.example
+      - USE_ZAI=${USE_ZAI:-true}
+      - ZAI_API_KEY=${ZAI_API_KEY:-}
+      - USE_DEEPSEEK=${USE_DEEPSEEK:-false}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - USE_ANTHROPIC=${USE_ANTHROPIC:-false}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - USE_OPENAI=${USE_OPENAI:-false}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - USE_GEMINI=${USE_GEMINI:-false}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+    depends_on:
+      - iqos-kernel
+    networks:
+      - iqos-internal
+      - caddy   # external network shared with the existing Caddy container
+    # No ports: published here - Caddy reaches it by service name on the
+    # shared "caddy" network. Uncomment for direct host access while testing:
+    # ports:
+    #   - "127.0.0.1:47311:47311"
+
+  iqos-kernel:
+    build:
+      context: ./mini-services/trading-core
+      dockerfile: Dockerfile
+    container_name: iqos-kernel
+    restart: unless-stopped
+    environment:
+      - KERNEL_PORT=47312
+    volumes:
+      - iqos-kernel-data:/app/data
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:47312/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - iqos-internal
+    # Kernel is not exposed to the internet at all - only iqos-web talks to
+    # it, over the internal network, by service name.
+
+  iqos-sidecar:
+    build:
+      context: ./live
+      dockerfile: Dockerfile
+    container_name: iqos-sidecar
+    restart: unless-stopped
+    environment:
+      - SIDECAR_HOST=0.0.0.0
+      - SIDECAR_PORT=47313
+    volumes:
+      - iqos-sidecar-session:/app
+    networks:
+      - iqos-internal
+    # Optional - only needed for LIVE (IQ Option) mode. Not exposed to the
+    # internet or to iqos-web's other traffic; the kernel reaches it by
+    # service name once you set the sidecar URL in the OS's Settings ->
+    # LIVE mode panel to: http://iqos-sidecar:47313
+    # Comment this whole service out if you never plan to use LIVE mode.
+
+networks:
+  iqos-internal:
+    driver: bridge
+  caddy:
+    external: true
+    # This must match the network name your existing Caddy container is
+    # attached to (check with: docker network ls / docker inspect <caddy>).
+    # If your Caddy setup uses a different name, change it here AND in the
+    # Caddyfile snippet below.
+
+volumes:
+  iqos-kernel-data:
+  iqos-sidecar-session:
