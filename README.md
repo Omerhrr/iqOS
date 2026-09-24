@@ -67,7 +67,7 @@ Windows/WSL dev machine or as three separate Docker containers.
 - Built-in overlays (EMA 20/50/200, Bollinger, Supertrend, VWAP) + any registry indicator as an on-chart overlay or a stacked oscillator sub-pane, added via the indicator library dialog (search, category tabs, param editing)
 
 **AI copilot (harness)**
-- LLM agent with a 32-tool JSON action loop: full analysis, any-registry indicator series, instrument search, chart patterns, Markov matrix, Monte Carlo, backtests, strategy evaluation, paper trades (all 4 kinds), position management, screener queries, alert-rule management, autopilot fleet control — every call traced in the UI
+- LLM agent with a 68-tool JSON action loop covering essentially the whole OS: market analysis, any-registry indicator series, chart/candle patterns, key levels, confluence reads, Markov/Monte Carlo/VSK/TSK models, correlate, session clock, regime playbook, strategy backtests/optimizer/walk-forward/tournament, asset sweep, calibration report, trade plans, paper trades (all 4 kinds), position/account management, autopilot fleet control (bot create/toggle/restart/delete, compound plan, autotrader config), strategy lab (learn/backtest/save/list/delete), journal stats, screener queries, alert-rule management, sentinel + watchdog safety controls (incl. panic-close-all), OS mode, memory gate (save/recall/forget), web search, and direct UI control — every call traced in the UI
 
 ## Repo layout
 
