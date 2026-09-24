@@ -67,7 +67,101 @@ Windows/WSL dev machine or as three separate Docker containers.
 - Built-in overlays (EMA 20/50/200, Bollinger, Supertrend, VWAP) + any registry indicator as an on-chart overlay or a stacked oscillator sub-pane, added via the indicator library dialog (search, category tabs, param editing)
 
 **AI copilot (harness)**
-- LLM agent with a 68-tool JSON action loop covering essentially the whole OS: market analysis, any-registry indicator series, chart/candle patterns, key levels, confluence reads, Markov/Monte Carlo/VSK/TSK models, correlate, session clock, regime playbook, strategy backtests/optimizer/walk-forward/tournament, asset sweep, calibration report, trade plans, paper trades (all 4 kinds), position/account management, autopilot fleet control (bot create/toggle/restart/delete, compound plan, autotrader config), strategy lab (learn/backtest/save/list/delete), journal stats, screener queries, alert-rule management, sentinel + watchdog safety controls (incl. panic-close-all), OS mode, memory gate (save/recall/forget), web search, and direct UI control — every call traced in the UI
+- LLM agent with a 68-tool JSON action loop covering essentially the whole OS — every call traced in the UI. Full list below.
+
+## Copilot tools (68)
+
+All defined in `src/app/api/agent/route.ts`, callable by the LLM in any order it needs, traced live in the copilot UI.
+
+**Market data & analysis**
+- `market_overview` — every tradable asset with live price, category, payouts, open status
+- `list_instruments` — search the instrument universe by category/free text
+- `list_indicators` — browse the 100+ indicator registry
+- `indicator_series` — compute any registry indicator on demand
+- `chart_patterns` — detect structural patterns (double top/bottom, H&S, triangles, wedges, flags, ranges)
+- `candle_patterns` — detect the 35 candlestick patterns + net bias
+- `analyze_market` — full TA + quant analysis of an asset (RSI/MACD/Bollinger/ADX/Markov/Monte Carlo/Hurst/GARCH/S-R + composite signal)
+- `multi_timeframe` — the composite signal across 5m/15m/1h/4h at once
+- `compare_assets` — head-to-head signal/Markov/RSI/Hurst/regime for 2-4 assets
+- `scan_market` — rank a whole category by composite signal strength
+- `key_levels` — pivots, auto-Fib, auto S/R trendlines and active fair value gaps in one shot
+- `confluence_read` — fuses MTF agreement + composite score + Markov edge + candle bias into one -100..+100 verdict
+- `session_clock` — which FX sessions are open now, overlap window, liquidity advisory
+- `regime_playbook` — classifies TRENDING/RANGING/VOLATILE/MIXED and recommends which strategies fit
+- `correlate` — Pearson correlation between two instruments, full-window + rolling
+- `web_search` — live web search for news/events/sentiment behind a move
+
+**Quant models**
+- `markov_chain` — fitted transition matrix, stationary distribution, forecast, entropy, regime
+- `monte_carlo` — GBM simulation: percentile targets, P(up), VaR95/CVaR95
+- `vsk_montecarlo` — bootstrap Monte Carlo robustness check for the VSK Synthesis strategy
+- `tsk_montecarlo` — bootstrap Monte Carlo robustness check for the volume-free TSK Synthesis strategy
+
+**Strategy & research**
+- `list_strategies` — every registered strategy + tunable params
+- `run_strategy` — evaluate one strategy right now for its current call/put/none signal
+- `backtest` — backtest a strategy over recent history (win rate, PF, drawdown, Sharpe, expectancy)
+- `optimize_strategy` — grid-search params, rank by objective, top-3 re-verified by the settlement engine
+- `walkforward` — in-sample optimize / out-of-sample settle per fold — the honest overfit check (persists a required robust-pass gate before a bot can arm)
+- `calibration_report` — checks whether the model's own confidence numbers can be trusted (Brier score + bucketed realized win rate)
+- `asset_sweep` — run one strategy/param set across the whole universe, rank where the edge holds
+- `strategy_tournament` — run all 14 strategies on one asset/tf, rank by net P&L/win rate/PF/Sharpe
+- `build_trade_plan` — turns analysis into an executable plan: direction, entry, expiry, sized stake, EV, invalidation level
+
+**Strategy lab (AI-learned strategies)**
+- `lab_learn` — mines the full pattern vocabulary for edge on one pair, calibrates and backtests + holdouts the composed spec
+- `lab_backtest` — backtest a saved or hand-composed custom spec (full DSL for signals/weights/dir)
+- `lab_save` — save a spec into the learned-strategy library as `custom:<id>` (usable by `bot_create`)
+- `lab_list` — list the learned-strategy library with saved stats
+- `lab_delete` — delete a learned strategy from the library
+
+**Execution & account**
+- `risk_calculator` — position-sizing math (stop-loss-based stake, or breakeven win rate for binaries)
+- `place_trade` — place a paper trade (binary/turbo/digital/CFD)
+- `close_position` — close an open position early by id
+- `positions` — list open paper positions
+- `trade_history` — recent closed trades with P&L
+- `account` — paper account state: balance, day/total P&L, kill switch, risk config
+- `compound_plan` — compute a compounding stake ladder (payout capped 70%, periods, de-risk phase)
+
+**Autopilot fleet**
+- `autopilot_status` — every bot's config + live stats (armed, trades today, P&L, streak)
+- `bot_create` — create/update a bot (strategy, watchlist, tf, session/regime/direction filters, compounding stake plan, stop-on-loss)
+- `bot_toggle` — arm/stop a bot by id
+- `bot_restart` — re-seed a compound bot's cycle after a stop-on-loss halt or completed cycle
+- `bot_delete` — delete a bot permanently (journal history kept)
+- `journal_stats` — realized P&L/win rate/PF from the trade journal, grouped by strategy/instrument/kind/side
+
+**Discovery (screener + alerts)**
+- `screener_scan` — query the live background scanner ranking the whole universe by signal strength
+- `screener_status` — screener health/coverage/config
+- `alert_rule_create` — create a standing alert rule (price/score/RSI/ADX/ATR/regime/pattern triggers)
+- `alert_rule_list` — list alert rules with armed state and fire counts
+- `alert_rule_delete` — delete an alert rule by id
+
+**Safety & governance**
+- `sentinel_status` — portfolio risk snapshot: circuit breakers, drawdown, exposure, throttle, recent risk events
+- `sentinel_configure` — set persisted exposure/per-asset/throttle/drawdown limits
+- `panic_close_all` — emergency: close every position (paper + live) and disarm all bots, optional kill switch
+- `sentinel_ack` — acknowledge and reset tripped circuit breakers
+- `watchdog_status` — per-bot strategy-health snapshot (win rate/PF/streak vs baseline, escalation level)
+- `watchdog_ack` — acknowledge watchdog degradation for one or all bots
+- `watchdog_configure` — tune watchdog thresholds (rolling window, floors, grace, hold duration, auto-disarm)
+- `archive_status` — candle archive depth/coverage that research tools read through
+
+**Autonomy mode**
+- `os_mode_status` — human-in-the-loop vs autonomous mode + auto-trader stats
+- `os_mode_set` — switch between human-gated and fully autonomous trading
+- `autotrader_configure` — tune the built-in auto-trader (signal source, stake, thresholds, pacing)
+
+**Memory**
+- `memory_gate_status` — which standing trading rules are currently hard-enforced on bots/auto-trader
+- `memory_save` — save a lasting preference/setup/lesson/rule note (rule notes hard-gate autonomy)
+- `memory_recall` — search persistent memory notes
+- `memory_forget` — delete one or all memory notes (wipe requires explicit user confirmation)
+
+**UI**
+- `ui_control` — drive the OS interface itself (set asset/timeframe/chart type, add/remove indicators)
 
 ## Repo layout
 
