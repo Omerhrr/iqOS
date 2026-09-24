@@ -6,7 +6,7 @@ A trading OS built around the [iqair](https://github.com/Omerhrr/iqair) IQ Optio
 ┌────────────────────────────  IQAIR//OS  ────────────────────────────┐
 │                                                                     │
 │  Next.js 16 OS shell ── REST + socket.io ──►  trading-core kernel   │
-│  (chart, panels, copilot UI)                  (port 3030, bun)      │
+│  (chart, panels, copilot UI)                  (bun, KERNEL_URL)     │
 │                                                    │                │
 │                     ┌──────────────────────────────┼─────────┐      │
 │                     │  market-data  │  analytics   │ execution│      │
@@ -18,6 +18,13 @@ A trading OS built around the [iqair](https://github.com/Omerhrr/iqair) IQ Optio
 │                      ► your iqair library ►  IQ Option              │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+
+Three independent services: the Next.js **web** shell, the bun **kernel**
+(`trading-core`), and the optional Python **sidecar** (`live/`) used only
+when LIVE (real IQ Option) mode is turned on. They talk to each other over
+HTTP/REST + socket.io using a configurable `KERNEL_URL`/sidecar URL rather
+than anything hardcoded, so the same code runs unmodified on a single
+Windows/WSL dev machine or as three separate Docker containers.
 
 ## Features
 
@@ -47,11 +54,12 @@ A trading OS built around the [iqair](https://github.com/Omerhrr/iqair) IQ Optio
 **Discovery layer (screener + alert rules)**
 - **Universe screener**: a background scanner walks every open instrument × configured timeframes (1m/5m/15m by default) with a lightweight snapshot of the composite engine — ranked opportunity feed with signal score, confidence, Markov regime, RSI/ADX/ATR, Hurst, P(up), top candlestick pattern and payout. Rows auto-refresh on candle close (stale invalidation over the event bus), filter by timeframe/category/direction/min-score/symbol, click a row to load the setup into the chart workspace, or hit the bell to convert it into a standing alert
 - **Alert rules**: programmable market watchers persisted in SQLite — price cross (tick-accurate), composite score strength (call/put/either), RSI extremes, ADX trend ignition, ATR% volatility bursts, Markov regime shifts and bullish/bearish candle patterns; per-rule cooldown, one-shot auto-disarm, fire counters, armed/paused state — all surfaced as OS alerts (toast + feed)
-- **Kernel keeper**: the Next.js dev server self-heals the trading-core kernel (`/api/kernel` spawns it detached when :3030 is dark and re-checks on every boot/reconnect)
+- **Kernel keeper**: in local/dev use, the Next.js server self-heals the trading-core kernel (`/api/kernel` spawns it detached when it's dark and re-checks on every boot/reconnect). Set `KERNEL_MANAGED=false` (the Docker deployment does this) to disable the spawn and just report status — Docker's own restart policy/healthcheck owns recovery there instead.
 
 **Execution & risk**
 - Paper broker with **4 trade kinds** on every instrument: **binary** (expiry in bars), **turbo** (short expiry, min 30s), **digital** (strike from spot ± offset, 5m/15m/30m expiries, ITM/OTM settlement), **CFD** (margin × leverage notional, TP/SL, 100%-margin stop-out)
 - Risk manager: kill switch, daily loss limit, max stake, max concurrent positions, loss-streak cooldown
+- **Adaptive confidence gate**: an optional per-bot meta-strategy layer that gates live/paper execution on the strategy's OWN realized historical record for the exact (asset, timeframe, strategy, side, score-bucket, regime) combination — using the Wilson score lower bound rather than the raw win-rate ratio, so a short lucky streak isn't mistaken for an edge. It only lets a bot fire when its actual track record in that specific bucket clears a configurable confidence threshold; toggled per bot in the Autopilot panel.
 - LIVE adapter: forwards orders to the iqair sidecar — binary/turbo/digital options plus forex/crypto/stock/index/commodity CFDs
 
 **Chart workspace**
@@ -66,28 +74,34 @@ A trading OS built around the [iqair](https://github.com/Omerhrr/iqair) IQ Optio
 ```
 src/                        Next.js 16 OS shell (UI + agent API route)
   app/page.tsx              the OS desktop
-  app/api/agent/route.ts    LLM tool-calling harness
-  app/api/kernel/route.ts   kernel keeper (auto-spawn trading-core)
-  components/os/            chart, panels, blotter, copilot
+  app/api/agent/route.ts    LLM tool-calling harness (talks to KERNEL_URL)
+  app/api/kernel/route.ts   kernel keeper (auto-spawn trading-core, unless KERNEL_MANAGED=false)
+  components/os/            chart, panels, blotter, copilot, autopilot (incl. adaptive gate toggle)
   lib/os/client.ts          REST + socket client
 mini-services/trading-core/ the kernel (bun)
+  Dockerfile                 kernel container image
   src/kernel.ts             event bus + plugin lifecycle
-  src/plugins/              market-data / analytics / execution / store / autopilot / screener / alert-rules
+  src/plugins/              market-data / analytics / execution / store / autopilot / adaptive / screener / alert-rules
   src/universe.ts           full IQ Option instrument catalog (115)
   src/analytics/            indicators / registry / patterns / chart-patterns / quant / engine
   src/strategies/           builtin strategies + backtester
-live/iqair_sidecar.py       Python bridge to your iqair library
-scripts/*-supervisor.sh     self-healing daemons for core + dev server
+live/                       Python bridge to your iqair library
+  iqair_sidecar.py          LIVE trading sidecar (SIDECAR_HOST/SIDECAR_PORT env vars)
+  Dockerfile                 sidecar container image
+scripts/*-supervisor.sh     self-healing daemons for core + dev server (local/dev use)
+Dockerfile                  web app container image
+docker-compose.yml          all three services wired together for VPS deployment
+deploy/                     Caddy reverse-proxy snippet + full deployment README
 ```
 
-## Quickstart
+## Quickstart (local dev)
 
 Requires [bun](https://bun.sh) and Python 3 (for live trading only).
 
 ```bash
 # 1. OS shell (Next.js)
 bun install
-bun run dev                 # http://localhost:3000
+bun run dev                 # http://localhost:3000 (webpack dev bundler - see next.config.ts)
 
 # 2. Kernel (separate terminal)
 cd mini-services/trading-core
@@ -101,7 +115,21 @@ python live/iqair_sidecar.py   # listens on 127.0.0.1:8788
 
 Then in the OS: **⚙ Settings → LIVE broker** → sidecar URL + your IQ Option credentials → **Connect LIVE**.
 
-> In production/sandbox deployments where the browser talks to the services through a gateway, requests carry `?XTransformPort=3030`; the included `Caddyfile` implements that routing. Running locally on one machine you can also hit `:3030` directly.
+> In production/sandbox deployments where the browser talks to the services through a gateway on one host, requests carry `?XTransformPort=3030`; the included `Caddyfile` implements that routing. Running locally on one machine you can also hit `:3030` directly. This gateway is **not** used by the Docker deployment below — there, the browser only ever talks to the web container, which resolves the kernel itself via `KERNEL_URL`.
+
+## Docker deployment (VPS)
+
+The whole stack also runs as three Docker containers — see **`docker-compose.yml`** and **`deploy/README.md`** for the full walkthrough (cloning into `/opt/`, wiring into an existing Caddy-as-a-container reverse proxy, Cloudflare DNS, etc).
+
+```bash
+cp .env.example .env        # fill in your LLM provider key(s)
+docker compose up -d --build
+```
+
+- `iqos-web` (Next.js), `iqos-kernel` (trading-core), `iqos-sidecar` (LIVE bridge, optional — comment it out if you never use LIVE mode)
+- Cross-container calls use `KERNEL_URL=http://iqos-kernel:47312` and, for LIVE mode, sidecar URL `http://iqos-sidecar:47313` — Docker's internal DNS, not `localhost`
+- Deliberately unusual internal ports (`47311`/`47312`/`47313`) so they don't collide with other projects' `3000`/`8080`/etc conventions on a shared host; none of them are published to the internet except through your reverse proxy
+- Kernel SQLite data and the sidecar's persisted broker session each live in their own named Docker volume, so they survive rebuilds/redeploys
 
 ## Safety
 
