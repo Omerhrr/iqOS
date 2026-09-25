@@ -3,6 +3,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # next.config.ts's rewrites() is baked in at build time (see the
+        # Dockerfile's comment on this ARG) - the runtime KERNEL_URL below,
+        # in `environment:`, is a SEPARATE thing that only covers the
+        # server-side API routes evaluated per-request. Both must match.
+        KERNEL_URL: http://iqos-kernel:47312
     container_name: iqos-web
     restart: unless-stopped
     environment:
