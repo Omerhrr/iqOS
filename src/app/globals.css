@@ -1,4 +1,17 @@
 @import "tailwindcss";
+/* Tailwind v4's automatic content detection scans outward from `base`
+   (postcss.config.mjs) for template files, but this can come back with
+   ZERO matches in a Docker build - e.g. it appears to behave differently
+   without a .git directory present (which is excluded from the build
+   context by .dockerignore), producing a syntactically valid CSS file
+   that's just Tailwind's own base/reset layer with no utility classes
+   compiled in at all: a page that "loads" but is completely unstyled with
+   no error anywhere. Declaring @source explicitly makes the scan paths
+   deterministic regardless of environment, .git presence, or auto-detection
+   quirks - the two globs below cover every component/route file that can
+   use Tailwind classes in this project (paths are relative to this file,
+   src/app/globals.css). */
+@source "../**/*.{ts,tsx}";
 @import "tw-animate-css";
 
 @custom-variant dark (&:is(.dark *));
