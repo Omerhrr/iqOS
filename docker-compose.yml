@@ -7,6 +7,14 @@ services:
     restart: unless-stopped
     environment:
       - PORT=47311
+      # Docker auto-sets HOSTNAME to the container's own short ID for every
+      # container. Next's standalone server.js does
+      # `process.env.HOSTNAME || '0.0.0.0'` - since Docker's auto-value is
+      # already set, it never falls through to 0.0.0.0 and instead binds to
+      # whatever that container-id hostname resolves to (one interface, on
+      # one network), making it unreachable from any OTHER Docker network -
+      # e.g. from Caddy's network. Force it explicitly.
+      - HOSTNAME=0.0.0.0
       - KERNEL_URL=http://iqos-kernel:47312
       - KERNEL_MANAGED=false
       # LLM provider config - copy the flags/keys you use from .env.example
@@ -24,7 +32,7 @@ services:
       - iqos-kernel
     networks:
       - iqos-internal
-      - caddy   # external network shared with the existing Caddy container
+      - booklet_booklet   # external network shared with the existing Caddy container
     # No ports: published here - Caddy reaches it by service name on the
     # shared "caddy" network. Uncomment for direct host access while testing:
     # ports:
@@ -72,12 +80,13 @@ services:
 networks:
   iqos-internal:
     driver: bridge
-  caddy:
+  booklet_booklet:
     external: true
     # This must match the network name your existing Caddy container is
     # attached to (check with: docker network ls / docker inspect <caddy>).
-    # If your Caddy setup uses a different name, change it here AND in the
-    # Caddyfile snippet below.
+    # For this deployment it's booklet_booklet (the "booklet" compose
+    # project's default network) - confirmed via
+    # `docker inspect booklet-caddy-1`.
 
 volumes:
   iqos-kernel-data:
