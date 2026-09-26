@@ -12,6 +12,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { FullscreenBackdrop, FullscreenButton } from './FullscreenButton'
 
 // ---------------- types ----------------
 
@@ -485,6 +486,7 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
   const [busy, setBusy] = useState(false)
   const [status, setStatus] = useState('')
   const [loaded, setLoaded] = useState(false)
+  const [full, setFull] = useState(false)
   const [speaking, setSpeaking] = useState(false)
   const [autoSpeak, setAutoSpeak] = useState(false)
   const scrollRef = useRef<HTMLDivElement | null>(null)
@@ -979,7 +981,15 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
   const quick = QUICK_BASE.map((q) => ({ label: q.label, prompt: q.build(asset ?? 'EURUSD', tf ?? '1m') }))
 
   return (
-    <div className="flex h-full flex-col rounded-lg border border-[#1c2739] bg-[#0b111c]">
+    <>
+      {full && <FullscreenBackdrop onClose={() => setFull(false)} />}
+      <div
+        className={
+          full
+            ? 'fixed inset-4 z-50 flex flex-col overflow-hidden rounded-lg border border-[#1c2739] bg-[#0b111c] shadow-2xl'
+            : 'flex h-full flex-col rounded-lg border border-[#1c2739] bg-[#0b111c]'
+        }
+      >
       {/* header */}
       <div className="flex items-center justify-between border-b border-[#1c2739] px-3 py-2">
         <h3 className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">
@@ -988,6 +998,7 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
           <span className="rounded bg-[#101828] px-1 py-0.5 text-[8px] font-mono tracking-normal text-cyan-400">v3 · 60 tools</span>
         </h3>
         <div className="flex items-center gap-1">
+          <FullscreenButton active={full} onToggle={() => setFull((f) => !f)} />
           <button
             onClick={toggleAutoSpeak}
             title={autoSpeak ? 'Auto-speak answers ON - click to mute' : 'Auto-speak answers OFF - click to enable voice'}
@@ -1182,6 +1193,7 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
           </Button>
         )}
       </form>
-    </div>
+      </div>
+    </>
   )
 }
