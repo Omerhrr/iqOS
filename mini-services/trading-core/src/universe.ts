@@ -14,7 +14,7 @@ type Row = [
   vol: number, // per-second sigma for the sim engine
   payout: number, // binary
   leverage: number,
-  schedule: '24/7' | '24/5' | 'market',
+  schedule: '24/7' | '24/5' | 'market' | 'otc-gap',
 ]
 
 // payout helper: turbo runs ~0.02 below binary, digital ~0.05 above (capped 0.97)
@@ -139,6 +139,14 @@ const STOCKS: Row[] = [
   ['IBM', 'IBM Corp.', 'stock', 225.4, 2, 0.00014, 0.76, 10, 'market'],
   ['BAC', 'Bank of America', 'stock', 44.28, 2, 0.00017, 0.75, 10, 'market'],
   ['GS', 'Goldman Sachs', 'stock', 520.4, 2, 0.00016, 0.76, 10, 'market'],
+  ['SNAP', 'Snap Inc.', 'stock', 10.85, 3, 0.00045, 0.78, 5, 'market'],
+  // Weekend/OTC variant. schedule 'otc-gap' means this instrument is open
+  // ONLY while its base ticker's own regular market is closed (nights and
+  // weekends) - see isInstrumentOpen() below, which resolves the sibling
+  // ticker (strips '-OTC') and inverts its open state. Payout bumped over
+  // the base SNAP row the same way forex-OTC payouts are bumped over their
+  // weekday counterparts, to price in weekend/thin-liquidity risk.
+  ['SNAP-OTC', 'Snap Inc. OTC', 'stock', 10.85, 3, 0.00045, 0.86, 5, 'otc-gap'],
 ]
 
 const INDICES: Row[] = [
@@ -188,7 +196,7 @@ function build(rows: Row[]): AssetInfo[] {
       digitalPayout: p.digital,
       leverage,
       schedule,
-      open: schedule === '24/7' ? true : schedule === 'market' ? false : true,
+      open: schedule === '24/7' ? true : schedule === 'market' || schedule === 'otc-gap' ? false : true,
       iqairName: IQAIR_NAMES[ticker] ?? ticker,
     }
   })
@@ -231,6 +239,17 @@ export function isInstrumentOpen(a: AssetInfo, now = new Date()): boolean {
   const day = now.getUTCDay()
   const hour = now.getUTCHours() + now.getUTCMinutes() / 60
   if (a.schedule === '24/5') return day >= 1 && day <= 5
+  if (a.schedule === 'otc-gap') {
+    // Genuinely gap-only OTC instrument: open exactly when its regular-market
+    // sibling (this ticker minus the '-OTC' suffix) is CLOSED - e.g. SNAP-OTC
+    // trades only nights/weekends, while SNAP itself is in session. Falls
+    // back to open=true if the sibling can't be found, so incomplete catalog
+    // metadata never wrongly blocks trading.
+    const siblingTicker = a.ticker.replace(/-OTC$/, '')
+    const sibling = UNIVERSE_MAP.get(siblingTicker)
+    if (!sibling || sibling.ticker === a.ticker) return true
+    return !isInstrumentOpen(sibling, now)
+  }
   // 'market' = US equity session 13:30-20:00 UTC
   return day >= 1 && day <= 5 && hour >= 13.5 && hour < 20
 }

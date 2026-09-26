@@ -47,7 +47,7 @@ export interface AssetInfo {
   turboPayout?: number
   digitalPayout?: number
   leverage?: number // CFD max leverage
-  schedule?: '24/7' | '24/5' | 'market' // market = exchange hours
+  schedule?: '24/7' | '24/5' | 'market' | 'otc-gap' // market = exchange hours; otc-gap = open only while its base ticker's market is closed
   open: boolean
   iqairName?: string // live IQ Option instrument id (defaults to ticker)
 }

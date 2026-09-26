@@ -246,14 +246,14 @@ export default function TradeTicket({ asset, tf, price, account, onPlaced, onErr
 
       <div className="grid grid-cols-2 gap-2">
         <Button
-          disabled={busy || account?.killSwitch}
+          disabled={busy || account?.killSwitch || asset?.open === false}
           onClick={() => place('call')}
           className="h-11 bg-emerald-600 font-bold tracking-wider text-white hover:bg-emerald-500 disabled:opacity-40"
         >
           {side === 'call' ? '…' : kind === 'cfd' ? '▲ BUY' : '▲ HIGHER'}
         </Button>
         <Button
-          disabled={busy || account?.killSwitch}
+          disabled={busy || account?.killSwitch || asset?.open === false}
           onClick={() => place('put')}
           className="h-11 bg-rose-600 font-bold tracking-wider text-white hover:bg-rose-500 disabled:opacity-40"
         >
@@ -263,6 +263,11 @@ export default function TradeTicket({ asset, tf, price, account, onPlaced, onErr
       {account?.killSwitch && (
         <div className="rounded border border-rose-500/40 bg-rose-500/10 px-2 py-1.5 text-center text-[10px] font-bold uppercase tracking-wider text-rose-400">
           Kill switch engaged - trading halted
+        </div>
+      )}
+      {!account?.killSwitch && asset?.open === false && (
+        <div className="rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-center text-[10px] font-bold uppercase tracking-wider text-amber-400">
+          Market closed for {asset.ticker} - trading disabled
         </div>
       )}
       {kind === 'digital' && (

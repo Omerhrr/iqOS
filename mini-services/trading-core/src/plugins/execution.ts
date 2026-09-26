@@ -18,6 +18,7 @@ import { TIMEFRAME_SECONDS } from '../types'
 import type { Plugin } from '../kernel'
 import type { MarketDataService } from './market-data'
 import type { AnalyticsService } from './analytics'
+import { getInstrument, isInstrumentOpen } from '../universe'
 import { getInstrument } from '../universe'
 import { Store } from '../store'
 import { classifyRegime } from '../analytics/regime'
@@ -174,6 +175,9 @@ export class ExecutionService {
     } catch {
       // sentinel plugin not loaded - fall back to base risk manager only
     }
+    const info = getInstrument(asset)
+    if (info && !isInstrumentOpen(info, new Date(this.now() * 1000)))
+      return { ok: false, reason: `market closed for ${asset} - trading disabled` }
     if (amount <= 0) return { ok: false, reason: 'amount must be positive' }
     if (amount > this.risk.maxStake) return { ok: false, reason: `stake $${amount} exceeds max stake $${this.risk.maxStake}` }
     // on IQ the broker's balance is the money that matters - gate against it
@@ -192,7 +196,6 @@ export class ExecutionService {
         ok: false,
         reason: `cooldown active: ${streakInfo.count} consecutive losses - pausing ${this.risk.cooldownSeconds}s`,
       }
-    void asset
     return { ok: true }
   }
 
