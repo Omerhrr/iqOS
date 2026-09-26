@@ -218,6 +218,19 @@ export function getInstrument(ticker: string): AssetInfo | undefined {
   return UNIVERSE_MAP.get(ticker)
 }
 
+/** Add an instrument discovered live from the connected IQ account (see
+ * MarketDataService.fetchSidecarAssets) to the shared catalog, so every
+ * consumer that resolves instruments by ticker - riskCheck, the frontend's
+ * asset lookups, backtests - picks it up automatically without a manual
+ * universe.ts edit. No-op if the ticker is already catalogued (curated or
+ * previously auto-discovered). Returns true if it was newly added. */
+export function registerDynamicInstrument(a: AssetInfo): boolean {
+  if (UNIVERSE_MAP.has(a.ticker)) return false
+  UNIVERSE.push(a)
+  UNIVERSE_MAP.set(a.ticker, a)
+  return true
+}
+
 export function instrumentsByCategory(cat: AssetCategory | 'all' | 'otc'): AssetInfo[] {
   if (cat === 'all') return UNIVERSE
   if (cat === 'otc') return UNIVERSE.filter((a) => a.otc)
@@ -239,6 +252,7 @@ export function isInstrumentOpen(a: AssetInfo, now = new Date()): boolean {
   const day = now.getUTCDay()
   const hour = now.getUTCHours() + now.getUTCMinutes() / 60
   if (a.schedule === '24/5') return day >= 1 && day <= 5
+  if (a.schedule === 'live') return a.open // trust the sidecar's real is_open, not a heuristic
   if (a.schedule === 'otc-gap') {
     // Genuinely gap-only OTC instrument: open exactly when its regular-market
     // sibling (this ticker minus the '-OTC' suffix) is CLOSED - e.g. SNAP-OTC
