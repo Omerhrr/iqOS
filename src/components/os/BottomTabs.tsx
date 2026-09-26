@@ -90,6 +90,9 @@ export default function BottomTabs(props: BottomTabsProps) {
           center dock at default sizes - without it the last tabs (Patterns,
           Alerts, ...) were clipped and unreachable. */}
       <div className="flex items-center gap-1 border-b border-[#1c2739]">
+      <div className="shrink-0 pl-1">
+        <FullscreenButton active={full} onToggle={() => setFull((f) => !f)} />
+      </div>
       <TabsList className="h-8 w-fit max-w-full shrink-0 justify-start gap-1 overflow-x-auto rounded-none border-b-0 bg-transparent p-0 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
         {(
           [
@@ -118,9 +121,6 @@ export default function BottomTabs(props: BottomTabsProps) {
           </TabsTrigger>
         ))}
       </TabsList>
-      <div className="ml-auto pr-1">
-        <FullscreenButton active={full} onToggle={() => setFull((f) => !f)} />
-      </div>
       </div>
 
       {/* POSITIONS */}
