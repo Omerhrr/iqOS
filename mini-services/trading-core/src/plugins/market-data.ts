@@ -13,7 +13,7 @@ import type { KernelContext } from '../kernel'
 import { ALL_TIMEFRAMES, TIMEFRAME_SECONDS } from '../types'
 import type { Plugin } from '../kernel'
 import { gaussLike } from './random'
-import { UNIVERSE, getInstrument, isInstrumentOpen } from '../universe'
+import { UNIVERSE, getInstrument, isInstrumentOpen, registerDynamicInstrument } from '../universe'
 import type { Store } from '../store'
 
 const HISTORY_CANDLES = 760
@@ -145,11 +145,58 @@ export class MarketDataService {
         this.sidecarAssetsTs = Date.now()
         const withPay = out.filter((r) => r.payout !== null).length
         this.ctx.log('market-data', `IQ asset universe refreshed: ${out.length} instruments (${out.filter((r) => r.open).length} open, ${out.filter((r) => r.ticker.endsWith('-OTC')).length} OTC, ${withPay} with real payouts)`)
+        this.syncDynamicInstruments(out)
       }
     } catch {
       // sidecar dark / not connected / still crunching - keep the previous set
     }
     return this.sidecarAssets
+  }
+
+  /** Catalog any IQ-account instrument we've never seen before, so the user
+   * never has to hand-add a pair to universe.ts just because it's tradable
+   * on IQ but wasn't part of our curated 115-row starter list (this is how
+   * SNAP/SNAP-OTC got added manually before this existed). New rows get
+   * schedule 'live' - their open/closed state is trusted straight from IQ's
+   * own is_open flag (kept fresh every refresh cycle) rather than guessed at
+   * with a time-of-day heuristic. Defaults for fields IQ's metadata doesn't
+   * carry (pip size, sim volatility, leverage) are conservative placeholders
+   * good enough for trading/backtesting; they don't affect real order sizing,
+   * which always goes through the sidecar's own price/expiry quotes. */
+  private syncDynamicInstruments(
+    rows: { ticker: string; category: string; open: boolean; payout: number | null; turbo: number | null }[]
+  ): void {
+    let added = 0
+    for (const r of rows) {
+      if (getInstrument(r.ticker)) continue // already curated or already auto-added
+      const otc = r.ticker.endsWith('-OTC')
+      const category = this.mapIQCategory(r.category, r.ticker)
+      const base = r.ticker.replace(/-OTC$/, '').replace(/_/g, ' ')
+      const info: AssetInfo = {
+        ticker: r.ticker,
+        name: base + (otc ? ' OTC' : ''),
+        category,
+        otc,
+        basePrice: this.prices.get(r.ticker) ?? 1,
+        pip: category === 'forex' ? 5 : category === 'crypto' ? 2 : 2,
+        volatility: category === 'crypto' ? 0.0006 : category === 'forex' ? 0.00005 : 0.0002,
+        payout: r.payout ?? 0.8,
+        turboPayout: r.turbo ?? undefined,
+        digitalPayout: undefined,
+        leverage: category === 'forex' ? 30 : 10,
+        schedule: 'live',
+        open: r.open,
+        iqairName: r.ticker,
+      }
+      if (registerDynamicInstrument(info)) {
+        this.assets.push(info)
+        this.prices.set(info.ticker, info.basePrice)
+        this.regimes.set(info.ticker, { drift: (Math.random() - 0.5) * 2e-5, anchor: info.basePrice })
+        this.ticks.set(info.ticker, [])
+        added++
+      }
+    }
+    if (added) this.ctx.log('market-data', `auto-discovered ${added} new IQ instrument(s) not in the curated catalog - added live`)
   }
 
   /** Does this ticker exist on the connected IQ account at all? (membership,
@@ -365,6 +412,11 @@ export class MarketDataService {
   refreshSchedules(): void {
     const now = new Date()
     for (const a of this.assets) {
+      // 'live' (auto-discovered) instruments carry their open state straight
+      // from the sidecar's own is_open field (set/kept fresh in
+      // fetchSidecarAssets) - recomputing it here would just be a worse
+      // heuristic guess at the same fact IQ already told us.
+      if (a.schedule === 'live') continue
       a.open = isInstrumentOpen(a, now)
     }
   }
