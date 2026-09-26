@@ -1,7 +1,9 @@
 'use client'
 
 // IQAIR//OS - Signal confluence panel (composite gauge + factor votes)
+import { useState } from 'react'
 import type { AnalysisResult } from '@/lib/os/client'
+import { FullscreenBackdrop, FullscreenButton } from './FullscreenButton'
 
 function scoreColor(score: number): string {
   if (score >= 22) return '#10b981'
@@ -10,6 +12,7 @@ function scoreColor(score: number): string {
 }
 
 export default function SignalPanel({ analysis }: { analysis: AnalysisResult | null }) {
+  const [full, setFull] = useState(false)
   // kernel may legitimately emit signal:null or null score/confidence (e.g. not enough candles yet)
   const sig = analysis?.signal ?? null
   const score = typeof sig?.score === 'number' && Number.isFinite(sig.score) ? sig.score : null
@@ -19,20 +22,31 @@ export default function SignalPanel({ analysis }: { analysis: AnalysisResult | n
   const pct = (score + 100) / 2 // 0..100
 
   return (
-    <div className="flex h-full flex-col gap-3 rounded-lg border border-[#1c2739] bg-[#0b111c] p-3">
-      <div className="flex items-center justify-between">
-        <h3 className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">Confluence Signal</h3>
-        <span
-          className="rounded px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider"
-          style={{
-            color: scoreColor(score),
-            background: `${scoreColor(score)}1a`,
-            border: `1px solid ${scoreColor(score)}55`,
-          }}
-        >
-          {sig.direction === 'call' ? 'CALL' : sig.direction === 'put' ? 'PUT' : 'NEUTRAL'}
-        </span>
-      </div>
+    <>
+      {full && <FullscreenBackdrop onClose={() => setFull(false)} />}
+      <div
+        className={
+          full
+            ? 'fixed inset-4 z-50 flex flex-col gap-3 overflow-auto rounded-lg border border-[#1c2739] bg-[#0b111c] p-4 shadow-2xl'
+            : 'flex h-full flex-col gap-3 rounded-lg border border-[#1c2739] bg-[#0b111c] p-3'
+        }
+      >
+        <div className="flex items-center justify-between">
+          <h3 className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">Confluence Signal</h3>
+          <div className="flex items-center gap-2">
+            <span
+              className="rounded px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider"
+              style={{
+                color: scoreColor(score),
+                background: `${scoreColor(score)}1a`,
+                border: `1px solid ${scoreColor(score)}55`,
+              }}
+            >
+              {sig.direction === 'call' ? 'CALL' : sig.direction === 'put' ? 'PUT' : 'NEUTRAL'}
+            </span>
+            <FullscreenButton active={full} onToggle={() => setFull((f) => !f)} />
+          </div>
+        </div>
 
       {/* score meter */}
       <div>
@@ -81,7 +95,8 @@ export default function SignalPanel({ analysis }: { analysis: AnalysisResult | n
             </div>
           )
         })}
+        </div>
       </div>
-    </div>
+    </>
   )
 }

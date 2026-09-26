@@ -18,6 +18,7 @@ import type {
   WalkForwardResult,
 } from '@/lib/os/client'
 import { fmtMoney, fmtPct, osPost } from '@/lib/os/client'
+import { FullscreenBackdrop, FullscreenButton } from './FullscreenButton'
 
 type LabTab = 'single' | 'optimizer' | 'walkforward' | 'sweep'
 
@@ -38,32 +39,45 @@ interface Props {
 
 export default function BacktestLab({ asset, strategies, onSelectSetup }: Props) {
   const [tab, setTab] = useState<LabTab>('single')
+  const [full, setFull] = useState(false)
   return (
-    <div className="space-y-3">
-      <div className="flex flex-wrap items-center gap-2">
-        <div className="flex gap-1 rounded-lg border border-[#1c2739] bg-[#0b111c] p-1">
-          {TABS.map((t) => (
-            <button
-              key={t.id}
-              onClick={() => setTab(t.id)}
-              className={`rounded px-3 py-1 text-[11px] font-semibold transition-colors ${
-                tab === t.id ? 'bg-cyan-600/20 text-cyan-300 shadow-[inset_0_0_0_1px_rgba(6,182,212,0.4)]' : 'text-[#7c8aa5] hover:text-[#dbe4f0]'
-              }`}
-            >
-              {t.label}
-            </button>
-          ))}
+    <>
+      {full && <FullscreenBackdrop onClose={() => setFull(false)} />}
+      <div
+        className={
+          full
+            ? 'fixed inset-4 z-50 space-y-3 overflow-auto rounded-lg border border-[#1c2739] bg-[#05080f] p-4 shadow-2xl'
+            : 'space-y-3'
+        }
+      >
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex gap-1 rounded-lg border border-[#1c2739] bg-[#0b111c] p-1">
+            {TABS.map((t) => (
+              <button
+                key={t.id}
+                onClick={() => setTab(t.id)}
+                className={`rounded px-3 py-1 text-[11px] font-semibold transition-colors ${
+                  tab === t.id ? 'bg-cyan-600/20 text-cyan-300 shadow-[inset_0_0_0_1px_rgba(6,182,212,0.4)]' : 'text-[#7c8aa5] hover:text-[#dbe4f0]'
+                }`}
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
+          <span className="font-mono text-[10px] text-[#4b5a72]">
+            research a config here, then promote it to an autopilot bot
+          </span>
+          <div className="ml-auto">
+            <FullscreenButton active={full} onToggle={() => setFull((f) => !f)} />
+          </div>
         </div>
-        <span className="font-mono text-[10px] text-[#4b5a72]">
-          research a config here, then promote it to an autopilot bot
-        </span>
-      </div>
 
-      {tab === 'single' && <SingleTab asset={asset} strategies={strategies} />}
-      {tab === 'optimizer' && <OptimizerTab asset={asset} strategies={strategies} />}
-      {tab === 'walkforward' && <WalkForwardTab asset={asset} strategies={strategies} />}
-      {tab === 'sweep' && <SweepTab asset={asset} strategies={strategies} onSelectSetup={onSelectSetup} />}
-    </div>
+        {tab === 'single' && <SingleTab asset={asset} strategies={strategies} />}
+        {tab === 'optimizer' && <OptimizerTab asset={asset} strategies={strategies} />}
+        {tab === 'walkforward' && <WalkForwardTab asset={asset} strategies={strategies} />}
+        {tab === 'sweep' && <SweepTab asset={asset} strategies={strategies} onSelectSetup={onSelectSetup} />}
+      </div>
+    </>
   )
 }
 
