@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { AssetRow } from '@/lib/os/client'
 import { CATEGORIES, fmtPrice } from '@/lib/os/client'
+import { FullscreenBackdrop, FullscreenButton } from './FullscreenButton'
 
 interface Props {
   assets: AssetRow[]
@@ -78,6 +79,7 @@ function rankAsset(a: AssetRow, rawQuery: string): number | null {
 export default function MarketWatch({ assets, active, prices, onSelect, onVisibleTickers }: Props) {
   const [cat, setCat] = useState<(typeof CATEGORIES)[number]['id']>('all')
   const [query, setQuery] = useState('')
+  const [full, setFull] = useState(false)
   const listRef = useRef<HTMLDivElement | null>(null)
   const reportTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -117,16 +119,27 @@ export default function MarketWatch({ assets, active, prices, onSelect, onVisibl
   const searching = query.trim().length > 0
 
   return (
-    <div className="flex h-full flex-col rounded-lg border border-[#1c2739] bg-[#0b111c]">
+    <>
+      {full && <FullscreenBackdrop onClose={() => setFull(false)} />}
+      <div
+        className={
+          full
+            ? 'fixed inset-4 z-50 flex flex-col overflow-auto rounded-lg border border-[#1c2739] bg-[#0b111c] shadow-2xl'
+            : 'flex h-full flex-col rounded-lg border border-[#1c2739] bg-[#0b111c]'
+        }
+      >
       <div className="flex items-center justify-between border-b border-[#1c2739] px-3 py-2">
         <h3 className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">Market Watch</h3>
-        <span className="flex items-center gap-1 text-[9px] font-mono text-emerald-400">
-          <span className="relative flex h-1.5 w-1.5">
-            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />
-            <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400" />
+        <div className="flex items-center gap-2">
+          <span className="flex items-center gap-1 text-[9px] font-mono text-emerald-400">
+            <span className="relative flex h-1.5 w-1.5">
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />
+              <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400" />
+            </span>
+            {searching ? `${filtered.length} / ${assets.length} MATCH` : `${assets.length} SYMBOLS`}
           </span>
-          {searching ? `${filtered.length} / ${assets.length} MATCH` : `${assets.length} SYMBOLS`}
-        </span>
+          <FullscreenButton active={full} onToggle={() => setFull((f) => !f)} />
+        </div>
       </div>
 
       {/* search - IQ-ticker tuned */}
@@ -215,6 +228,7 @@ export default function MarketWatch({ assets, active, prices, onSelect, onVisibl
           <div className="px-3 py-6 text-center font-mono text-[10px] text-[#3d4d66]">no instruments match “{query}”</div>
         )}
       </div>
-    </div>
+      </div>
+    </>
   )
 }

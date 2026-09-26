@@ -1,8 +1,10 @@
 'use client'
 
 // IQAIR//OS - Indicator readout panel
+import { useState } from 'react'
 import type { AnalysisResult } from '@/lib/os/client'
 import { fmtPrice } from '@/lib/os/client'
+import { FullscreenBackdrop, FullscreenButton } from './FullscreenButton'
 
 interface Row {
   label: string
@@ -17,6 +19,7 @@ function rsiRow(v: number): Row {
 }
 
 export default function IndicatorPanel({ analysis }: { analysis: AnalysisResult | null }) {
+  const [full, setFull] = useState(false)
   if (!analysis) return null
   const i = analysis.indicators
   const rows: Row[] = [
@@ -39,25 +42,37 @@ export default function IndicatorPanel({ analysis }: { analysis: AnalysisResult 
   ]
 
   return (
-    <div className="flex h-full flex-col rounded-lg border border-[#1c2739] bg-[#0b111c] p-3">
-      <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">Indicators</h3>
-      <div className="min-h-0 flex-1 space-y-px overflow-y-auto pr-1">
-        {rows.map((r) => (
-          <div key={r.label} className="flex items-center justify-between rounded px-1 py-1 text-[11px] font-mono hover:bg-[#101828]">
-            <span className="text-[#7c8aa5]">{r.label}</span>
-            <span className="flex items-center gap-1.5">
-              {r.note && <span className="text-[9px] text-[#4b5a72]">{r.note}</span>}
-              <span
-                className={
-                  r.bias === 'up' ? 'text-emerald-400' : r.bias === 'down' ? 'text-rose-400' : 'text-[#aab6cc]'
-                }
-              >
-                {r.value}
+    <>
+      {full && <FullscreenBackdrop onClose={() => setFull(false)} />}
+      <div
+        className={
+          full
+            ? 'fixed inset-4 z-50 flex flex-col overflow-auto rounded-lg border border-[#1c2739] bg-[#0b111c] p-4 shadow-2xl'
+            : 'flex h-full flex-col rounded-lg border border-[#1c2739] bg-[#0b111c] p-3'
+        }
+      >
+        <div className="mb-2 flex items-center justify-between">
+          <h3 className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">Indicators</h3>
+          <FullscreenButton active={full} onToggle={() => setFull((f) => !f)} />
+        </div>
+        <div className="min-h-0 flex-1 space-y-px overflow-y-auto pr-1">
+          {rows.map((r) => (
+            <div key={r.label} className="flex items-center justify-between rounded px-1 py-1 text-[11px] font-mono hover:bg-[#101828]">
+              <span className="text-[#7c8aa5]">{r.label}</span>
+              <span className="flex items-center gap-1.5">
+                {r.note && <span className="text-[9px] text-[#4b5a72]">{r.note}</span>}
+                <span
+                  className={
+                    r.bias === 'up' ? 'text-emerald-400' : r.bias === 'down' ? 'text-rose-400' : 'text-[#aab6cc]'
+                  }
+                >
+                  {r.value}
+                </span>
               </span>
-            </span>
-          </div>
-        ))}
+            </div>
+          ))}
+        </div>
       </div>
-    </div>
+    </>
   )
 }

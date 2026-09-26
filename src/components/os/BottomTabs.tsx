@@ -27,6 +27,7 @@ import AlertRulesPanel from './AlertRulesPanel'
 import SentinelPanel from './SentinelPanel'
 import WatchdogPanel from './WatchdogPanel'
 import ResearchPanel from './ResearchPanel'
+import { FullscreenBackdrop, FullscreenButton } from './FullscreenButton'
 
 interface BottomTabsProps {
   asset: string
@@ -52,6 +53,7 @@ interface BottomTabsProps {
 
 export default function BottomTabs(props: BottomTabsProps) {
   const { positions, history, alerts, patterns, price, prices, asset, refreshPositions, onError } = props
+  const [full, setFull] = useState(false)
 
   const closePos = async (id: string) => {
     try {
@@ -74,11 +76,21 @@ export default function BottomTabs(props: BottomTabsProps) {
   }
 
   return (
-    <Tabs defaultValue="positions" className="flex h-full min-h-0 flex-col gap-0">
+    <>
+      {full && <FullscreenBackdrop onClose={() => setFull(false)} />}
+      <Tabs
+        defaultValue="positions"
+        className={
+          full
+            ? 'fixed inset-4 z-50 flex flex-col gap-0 overflow-auto rounded-lg border border-[#1c2739] bg-[#05080f] p-2 shadow-2xl'
+            : 'flex h-full min-h-0 flex-col gap-0'
+        }
+      >
       {/* max-w-full + hidden-scrollbar overflow: 12 uppercase tabs exceed the
           center dock at default sizes - without it the last tabs (Patterns,
           Alerts, ...) were clipped and unreachable. */}
-      <TabsList className="h-8 w-fit max-w-full shrink-0 justify-start gap-1 overflow-x-auto rounded-none border-b border-[#1c2739] bg-transparent p-0 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+      <div className="flex items-center gap-1 border-b border-[#1c2739]">
+      <TabsList className="h-8 w-fit max-w-full shrink-0 justify-start gap-1 overflow-x-auto rounded-none border-b-0 bg-transparent p-0 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
         {(
           [
             ['positions', `Positions (${positions.length})`],
@@ -106,6 +118,10 @@ export default function BottomTabs(props: BottomTabsProps) {
           </TabsTrigger>
         ))}
       </TabsList>
+      <div className="ml-auto pr-1">
+        <FullscreenButton active={full} onToggle={() => setFull((f) => !f)} />
+      </div>
+      </div>
 
       {/* POSITIONS */}
       <TabsContent value="positions" className="mt-0 min-h-0 flex-1 overflow-auto">
@@ -351,7 +367,8 @@ export default function BottomTabs(props: BottomTabsProps) {
           )}
         </div>
       </TabsContent>
-    </Tabs>
+      </Tabs>
+    </>
   )
 }
 
