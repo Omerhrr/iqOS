@@ -368,7 +368,12 @@ function SettingsDialog(props: Props & { onReset: () => void }) {
     lossStreakCooldown: props.risk?.lossStreakCooldown ?? 4,
     cooldownSeconds: props.risk?.cooldownSeconds ?? 120,
   })
-  const [url, setUrl] = useState('http://127.0.0.1:8788')
+  // Default to the sidecar's Docker service address (see docker-compose.yml)
+  // rather than localhost - the browser talks to iqos-web, which reaches the
+  // sidecar over the shared iqos-internal network by service name, not via
+  // the operator's own machine. Still editable for anyone running the
+  // sidecar bare-metal / on a different host.
+  const [url, setUrl] = useState('http://iqos-sidecar:47313')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [real, setReal] = useState(false)

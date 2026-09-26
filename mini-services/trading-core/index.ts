@@ -955,8 +955,11 @@ const httpServer = createServer(async (req, res) => {
       }
 
       if (path === '/live/connect') {
+        // default: the sidecar's Docker service address (see docker-compose.yml)
+        // - only hit when the caller omits url entirely; the Settings dialog
+        // always sends one now, this is just a safety fallback.
         const out = await exec.connectLive(
-          String(body.url ?? 'http://127.0.0.1:8788'),
+          String(body.url ?? 'http://iqos-sidecar:47313'),
           String(body.email ?? ''),
           String(body.password ?? ''),
           String(body.balanceMode ?? 'PRACTICE')
@@ -982,7 +985,7 @@ const httpServer = createServer(async (req, res) => {
       }
 
       if (path === '/live/adopt') {
-        const out = await exec.adoptLive(String(body.url ?? 'http://127.0.0.1:8788'))
+        const out = await exec.adoptLive(String(body.url ?? 'http://iqos-sidecar:47313'))
         return json(200, out)
       }
 

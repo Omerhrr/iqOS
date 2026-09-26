@@ -54,7 +54,10 @@ interface Regime {
 export class MarketDataService {
   private ctx!: KernelContext
   mode: MarketMode = 'sim'
-  liveUrl = 'http://127.0.0.1:8788'
+  // Docker default (see docker-compose.yml) - overwritten by connectLive()'s
+  // url argument as soon as the operator connects; this is just the value
+  // before any connect ever happens.
+  liveUrl = 'http://iqos-sidecar:47313'
   // Sandbox resets kill the sidecar daemon between sessions; the kernel is
   // environment-supervised and always comes back, so IT owns sidecar revival:
   // on a failed connect, spawn the sidecar once and retry (see ensureSidecar).
