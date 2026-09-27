@@ -393,6 +393,19 @@ export class AutopilotService {
       stakePlan: this.parseStakePlan(input.stakePlan, existing?.stakePlan),
       adaptive: input.adaptive !== undefined ? Boolean(input.adaptive) : existing?.adaptive,
     }
+    // compounding assumes exactly one open position per cycle: stakeFor reads
+    // rt.pot at bet time and onPositionClosed re-derives it at settle time,
+    // with nothing reserving the pot in between. A second concurrent trade -
+    // from maxOpen>1, or from a second watchlist asset firing before the
+    // first settles (the per-candle lock is keyed by asset|tf, not bot id) -
+    // would stake off the same pot the first trade already claimed, and
+    // whichever settles first mutates rt.pot out from under the other,
+    // corrupting the roll. Hard-clamp both knobs rather than let the UI
+    // produce a silently broken compounding cycle.
+    if (bot.stakePlan?.kind === 'compound') {
+      bot.maxOpen = 1
+      bot.watchlist = bot.watchlist.slice(0, 1)
+    }
     // a materially different plan invalidates the persisted roll - start clean
     const planChanged = JSON.stringify(bot.stakePlan ?? null) !== JSON.stringify(existing?.stakePlan ?? null)
     bot.planState = planChanged ? undefined : input.planState ?? existing?.planState
@@ -496,10 +509,15 @@ export class AutopilotService {
       rt.streak = 0
     }
 
-    // compound stop-on-loss: a cycle that took a loss is DEAD - the bot stands
-    // down (but stays armed/configured) until an explicit bot_restart. A
-    // periods-completed cycle halts too, but with a win-side message.
-    if (bot.stakePlan?.kind === 'compound' && bot.stakePlan.stopOnLoss !== false && rt.halted) {
+    // compound halt: a cycle that took a loss (stopOnLoss, default true) or
+    // that hit its periods target with onComplete 'halt' is DEAD - the bot
+    // stands down (but stays armed/configured) until an explicit bot_restart.
+    // rt.halted is only ever set true for one of those two reasons (see
+    // onPositionClosed), so this must NOT be conditioned on stopOnLoss - that
+    // used to gate out the win-side periods-complete halt too whenever
+    // stopOnLoss was false, letting the bot keep compounding right past a
+    // cycle it had already marked complete.
+    if (bot.stakePlan?.kind === 'compound' && rt.halted) {
       return this.reject(
         bot,
         rt.complete
@@ -679,7 +697,11 @@ export class AutopilotService {
     const derisk = plan.deriskAfter !== undefined && plan.deriskPct !== undefined && rt.rollN >= plan.deriskAfter
     const rollPct = derisk ? plan.deriskPct! : (plan.rollPct ?? 100)
     const raw = (pot * rollPct) / 100
-    const amount = Math.min(plan.maxStake ?? 5000, Math.max(1, Math.round(raw * 100) / 100))
+    // never stake more than the pot itself holds - the $1 floor below exists
+    // so a tiny pot still places a valid order, but it must not let a shrunk
+    // pot (legacy stopOnLoss:false reseed, after a loss eats into it) get
+    // over-staked beyond what's actually tracked as compounded capital.
+    const amount = Math.min(plan.maxStake ?? 5000, pot, Math.max(1, Math.round(raw * 100) / 100))
     return { amount, pot, rollN: rt.rollN, compound: true, phase: derisk ? 'derisk' : 'compound' }
   }
 

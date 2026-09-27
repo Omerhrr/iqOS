@@ -326,9 +326,19 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
 
             <div className="col-span-2">
               <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">
-                Watchlist ({draft.watchlist.length}/12)
+                Watchlist ({draft.watchlist.length}/{draft.stakePlan?.kind === 'compound' ? 1 : 12})
               </Label>
-              <WatchlistPicker assets={assets} selected={draft.watchlist} onChange={(w) => patch({ watchlist: w })} />
+              <WatchlistPicker
+                assets={assets}
+                selected={draft.watchlist}
+                onChange={(w) => patch({ watchlist: draft.stakePlan?.kind === 'compound' ? w.slice(-1) : w })}
+              />
+              {draft.stakePlan?.kind === 'compound' && (
+                <p className="mt-1 text-[9px] leading-relaxed text-[#4b5a72]">
+                  Compound bots trade one asset at a time - the pot has no reservation between opening a trade and
+                  settling it, so a second concurrent trade would stake off the same pot and corrupt the roll.
+                </p>
+              )}
             </div>
 
             <div>
@@ -364,7 +374,13 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
                 { v: 'compound', label: 'Compound' },
               ]}
               value={draft.stakePlan?.kind === 'compound' ? 'compound' : 'fixed'}
-              onChange={(v) => patch({ stakePlan: v === 'compound' ? plan({}) : undefined })}
+              onChange={(v) =>
+                patch(
+                  v === 'compound'
+                    ? { stakePlan: plan({}), maxOpen: 1, watchlist: draft.watchlist.slice(-1) }
+                    : { stakePlan: undefined },
+                )
+              }
             />
 
             {draft.stakePlan?.kind === 'compound' && (
@@ -494,7 +510,14 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
               they build a track record; only setups with enough history AND a weak record get held back.
             </p>
 
-            <NumField label="Max open positions" value={draft.maxOpen} onChange={(v) => patch({ maxOpen: v })} />
+            {draft.stakePlan?.kind === 'compound' ? (
+              <div>
+                <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Max open positions (locked)</Label>
+                <Input value="1" disabled className="h-8 border-[#1c2739] bg-[#0b1220] text-right text-[12px] text-[#4b5a72]" />
+              </div>
+            ) : (
+              <NumField label="Max open positions" value={draft.maxOpen} onChange={(v) => patch({ maxOpen: v })} />
+            )}
             <NumField label="Cooldown between trades (s)" value={draft.cooldownSec} onChange={(v) => patch({ cooldownSec: v })} />
             <NumField
               label="Daily profit target $ (0 = off)"
