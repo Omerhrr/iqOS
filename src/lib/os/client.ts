@@ -586,8 +586,8 @@ export interface LabSpec {
   minScore: number
   minVotes: number
   horizon: number
-  /** candle basis the signals read: raw (default) or the Heiken-Ashi transform */
-  basis?: 'candles' | 'heikin'
+  /** candle basis the signals read: raw (default), Heiken-Ashi, or Kalman-smoothed */
+  basis?: 'candles' | 'heikin' | 'kalman'
 }
 
 export interface LabSignalStat {
@@ -623,7 +623,7 @@ export interface LabLearnResult {
   ok: boolean
   asset: string
   tf: Timeframe
-  basis: 'candles' | 'heikin'
+  basis: 'candles' | 'heikin' | 'kalman'
   candlesTested: number
   horizon: number
   minSamples: number

@@ -95,9 +95,12 @@ export interface CustomSpec {
   /** bars-ahead horizon the learner validated against (informational) */
   horizon: number
   /** The candle basis the spec was learned on and trades on: 'candles' (raw,
-   * default) or 'heikin' (every signal reads the Heiken-Ashi transform of the
-   * feed). Outcomes/settlement are ALWAYS measured on real prices either way. */
-  basis?: 'candles' | 'heikin'
+   * default), 'heikin' (every signal reads the Heiken-Ashi transform of the
+   * feed), or 'kalman' (every signal reads a Kalman-smoothed trend series -
+   * denoises intrabar chop, similar in spirit to Heiken-Ashi but a genuinely
+   * different filter). Outcomes/settlement are ALWAYS measured on real
+   * prices either way. */
+  basis?: 'candles' | 'heikin' | 'kalman'
 }
 
 // ---------- heiken ashi ----------
@@ -134,9 +137,59 @@ export function heikinAshiCandles(candles: Candle[]): Candle[] {
   return candles.map((k, i) => ({ time: k.time, open: ha.open[i], high: ha.high[i], low: ha.low[i], close: ha.close[i], volume: k.volume }))
 }
 
-/** The candle series a spec's signals are evaluated on (raw or HA transform). */
+/** Simple scalar Kalman filter over the close price: a random-walk state
+ * model with a fixed process/observation noise ratio, so it smooths from
+ * bar 0 with no long warmup (unlike the OU-fit filter used elsewhere for
+ * mean-reversion estimation - this one is purpose-built as a lightweight,
+ * general-purpose "chart type" for the signal vocabulary, not a statistical
+ * model of the price process). Higher `q` tracks price more closely (less
+ * smoothing); lower `q` filters out more intrabar noise. */
+export function kalmanSmooth(closes: number[], q = 0.05): number[] {
+  const n = closes.length
+  const out = new Array<number>(n)
+  if (n === 0) return out
+  let xh = closes[0]
+  let P = 1
+  const R = 1
+  for (let i = 0; i < n; i++) {
+    if (i > 0) P += q
+    const K = P / (P + R)
+    xh += K * (closes[i] - xh)
+    P *= 1 - K
+    out[i] = xh
+  }
+  return out
+}
+
+/** Kalman-smoothed basis as a Candle[] (1:1 with the input series). Real
+ * high/low are kept (and widened if needed) so wick-based signals still see
+ * genuine market range; only open/close track the smoothed trend, the same
+ * shape of transform as the Heiken-Ashi basis above. */
+export function kalmanCandles(candles: Candle[], q = 0.05): Candle[] {
+  const smoothed = kalmanSmooth(candles.map((k) => k.close), q)
+  const n = candles.length
+  const out: Candle[] = new Array(n)
+  for (let i = 0; i < n; i++) {
+    const k = candles[i]
+    const close = smoothed[i]
+    const open = i === 0 ? k.open : smoothed[i - 1]
+    out[i] = {
+      time: k.time,
+      open,
+      close,
+      high: Math.max(k.high, open, close),
+      low: Math.min(k.low, open, close),
+      volume: k.volume,
+    }
+  }
+  return out
+}
+
+/** The candle series a spec's signals are evaluated on (raw or a transform). */
 export function basisCandles(spec: Pick<CustomSpec, 'basis'>, candles: Candle[]): Candle[] {
-  return spec.basis === 'heikin' ? heikinAshiCandles(candles) : candles
+  if (spec.basis === 'heikin') return heikinAshiCandles(candles)
+  if (spec.basis === 'kalman') return kalmanCandles(candles)
+  return candles
 }
 
 // ---------- full-series evaluation context ----------

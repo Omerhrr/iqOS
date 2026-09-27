@@ -104,7 +104,7 @@ function FoldsStrip({ folds, foldsProfitable, breakeven }: { folds: LabSimMetric
 export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelProps) {
   const [asset, setAsset] = useState('EURUSD')
   const [tf, setTf] = useState<Timeframe>('1m')
-  const [basis, setBasis] = useState<'candles' | 'heikin'>('candles')
+  const [basis, setBasis] = useState<'candles' | 'heikin' | 'kalman'>('candles')
   const [bars, setBars] = useState(1200)
   const [horizon, setHorizon] = useState(1)
   const [minSamples, setMinSamples] = useState(30)
@@ -151,7 +151,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
     try {
       const res = await osPost<LabLearnResult>('/lab_learn', { asset, tf, basis, bars, horizon, minSamples, minEdge, maxSignals, payout })
       setResult(res)
-      setSavedName(`${asset} ${tf} Lab${basis === 'heikin' ? ' HA' : ''}`)
+      setSavedName(`${asset} ${tf} Lab${basis === 'heikin' ? ' HA' : basis === 'kalman' ? ' KAL' : ''}`)
     } catch (e) {
       onError((e as Error).message)
     } finally {
@@ -299,9 +299,10 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
           </label>
           <label className="flex flex-col gap-0.5">
             <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">basis</span>
-            <select value={basis} onChange={(e) => setBasis(e.target.value as 'candles' | 'heikin')} className="h-7 rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-[#dbe4f0]" title="what the agent reads: raw candles or the Heiken-Ashi transform - outcomes always settle on real prices">
+            <select value={basis} onChange={(e) => setBasis(e.target.value as 'candles' | 'heikin' | 'kalman')} className="h-7 rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-[#dbe4f0]" title="what the agent reads: raw candles, the Heiken-Ashi transform, or a Kalman-smoothed trend series - outcomes always settle on real prices">
               <option value="candles">raw candles</option>
               <option value="heikin">heiken-ashi</option>
+              <option value="kalman">kalman-smoothed</option>
             </select>
           </label>
           <NumField label="bars" value={bars} onChange={setBars} w="w-16" />
@@ -326,7 +327,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
           </Button>
         </div>
         <p className="mt-2 text-[10px] leading-snug text-[#7c8aa5]">
-          Mines candlestick patterns, wide-range bar formations, Heiken Ashi structures, line breaks (Donchian / HH-HL) and its own invented indicators (RSI, BB %B, z-score, Donchian position, MACD-z, slope, streak, wick bias, EMA spread, HA distance, close position) - then weights the survivors by measured edge and backtests the composition. The <span className="text-[#aab6cc]">basis</span> switch learns on raw candles OR the Heiken-Ashi view of the same market (like the chart type) - either way outcomes settle on real prices and the deployed bot trades the same basis it learned on. Thin history auto-relaxes the min-samples floor instead of failing.
+          Mines candlestick patterns, wide-range bar formations, Heiken Ashi structures, line breaks (Donchian / HH-HL) and its own invented indicators (RSI, BB %B, z-score, Donchian position, MACD-z, slope, streak, wick bias, EMA spread, HA distance, close position) - then weights the survivors by measured edge and backtests the composition. The <span className="text-[#aab6cc]">basis</span> switch learns on raw candles, the Heiken-Ashi view, OR a Kalman-smoothed trend series (a lightweight filter that tracks price while damping intrabar noise - like trading a de-chopped line rather than the raw candle) - whichever basis, outcomes always settle on real prices and the deployed bot trades the same basis it learned on. Thin history auto-relaxes the min-samples floor instead of failing.
         </p>
       </div>
 
@@ -336,7 +337,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
           <div className={`rounded border px-2 py-1.5 font-mono text-[11px] ${result.ok ? 'border-emerald-500/30 bg-emerald-500/5 text-emerald-300' : 'border-amber-500/30 bg-amber-500/5 text-amber-300'}`}>{result.note}</div>
           <div className="flex flex-wrap items-center gap-2 font-mono text-[10px] text-[#4b5a72]">
             <span>
-              {result.asset} · {result.tf} · <span className={result.basis === 'heikin' ? 'text-emerald-300' : ''}>{result.basis === 'heikin' ? 'heiken-ashi basis' : 'raw candle basis'}</span> · {result.candlesTested} bars · horizon {result.horizon} · min n {result.minSamples} · min edge {result.minEdge}pts
+              {result.asset} · {result.tf} · <span className={result.basis !== 'candles' ? 'text-emerald-300' : ''}>{result.basis === 'heikin' ? 'heiken-ashi basis' : result.basis === 'kalman' ? 'kalman-smoothed basis' : 'raw candle basis'}</span> · {result.candlesTested} bars · horizon {result.horizon} · min n {result.minSamples} · min edge {result.minEdge}pts
             </span>
             <span className={`rounded border px-1.5 py-0.5 text-[9px] uppercase ${REGIME_STYLE[result.regime] ?? REGIME_STYLE.MIXED}`} title="market regime detected over the learned window">
               {result.regime.toLowerCase()}
