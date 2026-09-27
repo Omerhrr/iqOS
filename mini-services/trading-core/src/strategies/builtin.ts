@@ -5,7 +5,7 @@ import type { StrategyDef } from '../types'
 import * as ta from '../analytics/indicators'
 import { markovChain } from '../analytics/quant'
 import { detectPatterns, patternBias } from '../analytics/patterns'
-import { ouState } from '../analytics/kalman'
+import { ouEstimate, ouState } from '../analytics/kalman'
 import { vskEvaluate, VSK_DEFAULTS } from '../analytics/vsk'
 import { tskEvaluate, TSK_DEFAULTS } from '../analytics/tsk'
 
@@ -220,6 +220,133 @@ export const STRATEGIES: StrategyDef[] = [
       if (ou.z <= -ze) return { direction: 'call', score, notes: `z ${ou.z.toFixed(2)}σ below OU mean · HL ${hl}b · κ ${ou.kappa.toFixed(3)}` }
       if (ou.z >= ze) return { direction: 'put', score, notes: `z ${ou.z.toFixed(2)}σ above OU mean · HL ${hl}b · κ ${ou.kappa.toFixed(3)}` }
       return { direction: 'none', score: 0, notes: `z ${ou.z.toFixed(2)} inside ±${ze}σ · HL ${hl}b` }
+    },
+  },
+  {
+    id: 'kalman-ou-breakout',
+    name: 'Kalman OU Breakdown Breakout',
+    description: 'Trades continuation, not reversion: fires only once the OU fit has lost its grip (weak/failed t-stat or a stretched, one-directional run of Kalman innovations) AND price has broken past a wide z-band - betting the reversion mechanism just broke down and a structural move is underway.',
+    params: [
+      { key: 'window', label: 'Estimation window', type: 'number', min: 60, max: 500, default: 240 },
+      { key: 'zBreak', label: 'Breakout z threshold', type: 'number', min: 2, max: 5, step: 0.1, default: 3 },
+      { key: 'runLen', label: 'Innovation run length', type: 'number', min: 2, max: 10, default: 3 },
+    ],
+    evaluate: (candles, p) => {
+      const closesArr = candles.map((c) => c.close)
+      const window = num(p, 'window', 240)
+      const zBreak = num(p, 'zBreak', 3)
+      const runLen = Math.round(num(p, 'runLen', 3))
+      const est = ouEstimate(closesArr, window)
+      const sigmaEq = est.sigmaEq > 1e-12 ? est.sigmaEq : 1
+      const lastPrice = closesArr[closesArr.length - 1]
+      const z = clamp((lastPrice - est.theta) / sigmaEq, -12, 12)
+      if (Math.abs(z) < zBreak) return { direction: 'none', score: 0, notes: `z ${z.toFixed(2)} inside ±${zBreak}σ band - no breakout` }
+      const sigmaEps = est.sigmaEps > 1e-12 ? est.sigmaEps : 1
+      let sameSign = 0
+      for (let k = 0; k < runLen; k++) {
+        const i = closesArr.length - 1 - k
+        if (i < 1) break
+        const predicted = est.theta + est.phi * (closesArr[i - 1] - est.theta)
+        const innov = (closesArr[i] - predicted) / sigmaEps
+        if (Math.sign(innov) === Math.sign(z) && Math.abs(innov) > 0.3) sameSign++
+      }
+      const structurallyBroken = est.tStat < 1.5 || est.halfLifeBars > 250 || sameSign >= Math.max(2, runLen - 1)
+      if (!structurallyBroken) return { direction: 'none', score: 0, notes: `z ${z.toFixed(2)} stretched but reversion (t ${est.tStat.toFixed(1)}) still intact - not a breakout, fade territory instead` }
+      const score = clamp(45 + (Math.abs(z) - zBreak) * 15 + sameSign * 8, 40, 95)
+      const dir = z > 0 ? 'call' : 'put'
+      return { direction: dir, score, notes: `${dir === 'call' ? 'Upside' : 'Downside'} breakout: z ${z.toFixed(2)}σ past ${zBreak}, reversion failed (t ${est.tStat.toFixed(1)}), ${sameSign}/${runLen} innovations confirming` }
+    },
+  },
+  {
+    id: 'kalman-ou-scalp',
+    name: 'Kalman OU Scalp (Fast Half-Life)',
+    description: 'Only trades when the OU half-life is so short the reversion should complete within the option expiry window - the market-making analog: a tight, fast-vibrating equilibrium rather than a slow macro reversion. Fires more often, on smaller stretches, than the standard OU Reversion strategy.',
+    params: [
+      { key: 'window', label: 'Estimation window', type: 'number', min: 30, max: 300, default: 120 },
+      { key: 'zEntry', label: 'Z entry threshold', type: 'number', min: 0.5, max: 2.5, step: 0.1, default: 1.1 },
+      { key: 'maxHalfLife', label: 'Max half-life (bars)', type: 'number', min: 1, max: 20, default: 6 },
+    ],
+    evaluate: (candles, p) => {
+      const ou = ouState(candles.map((c) => c.close), num(p, 'window', 120))
+      const ze = num(p, 'zEntry', 1.1)
+      const maxHL = num(p, 'maxHalfLife', 6)
+      if (!ou.meanReverting) return { direction: 'none', score: 0, notes: `no reversion edge (t ${ou.tStat.toFixed(1)})` }
+      if (ou.halfLifeBars > maxHL) return { direction: 'none', score: 0, notes: `half-life ${ou.halfLifeBars.toFixed(1)}b too slow for a scalp (cap ${maxHL}b)` }
+      if (Math.abs(ou.z) < ze) return { direction: 'none', score: 0, notes: `z ${ou.z.toFixed(2)} inside ±${ze}σ - waiting for the next wobble` }
+      const speedBonus = clamp((maxHL - ou.halfLifeBars) * 6, 0, 30)
+      const score = clamp(48 + (Math.abs(ou.z) - ze) * 14 + speedBonus, 42, 94)
+      if (ou.z <= -ze) return { direction: 'call', score, notes: `fast fade: z ${ou.z.toFixed(2)}σ below μ · HL ${ou.halfLifeBars.toFixed(1)}b (quick round-trip)` }
+      return { direction: 'put', score, notes: `fast fade: z ${ou.z.toFixed(2)}σ above μ · HL ${ou.halfLifeBars.toFixed(1)}b (quick round-trip)` }
+    },
+  },
+  {
+    id: 'kalman-ou-vol-regime',
+    name: 'Kalman Volatility Regime Break',
+    description: "Tracks the OU-fitted process noise (sigma) against its own longer-run baseline: when the current window's noise has compressed well below baseline (an artificial calm the market hasn't priced in) AND price pushes to the edge of its recent range, bets on the expansion breaking in that direction.",
+    params: [
+      { key: 'window', label: 'Fast window', type: 'number', min: 40, max: 200, default: 90 },
+      { key: 'baseWindow', label: 'Baseline window', type: 'number', min: 120, max: 500, default: 300 },
+      { key: 'compressRatio', label: 'Compression ratio', type: 'number', min: 0.3, max: 0.9, step: 0.05, default: 0.6 },
+      { key: 'rangeLookback', label: 'Range lookback', type: 'number', min: 10, max: 60, default: 20 },
+    ],
+    evaluate: (candles, p) => {
+      const closesArr = candles.map((c) => c.close)
+      const highArr = candles.map((c) => c.high)
+      const lowArr = candles.map((c) => c.low)
+      const window = num(p, 'window', 90)
+      const baseWindow = Math.max(window + 20, num(p, 'baseWindow', 300))
+      const ratio = num(p, 'compressRatio', 0.6)
+      const lookback = Math.round(num(p, 'rangeLookback', 20))
+      const fast = ouEstimate(closesArr, window)
+      const base = ouEstimate(closesArr, baseWindow)
+      const baseSigma = base.sigmaEq > 1e-9 ? base.sigmaEq : (fast.sigmaEq || 1)
+      const compression = fast.sigmaEq / baseSigma
+      if (!(compression <= ratio)) return { direction: 'none', score: 0, notes: `sigma ${fast.sigmaEq.toFixed(4)} vs baseline ${baseSigma.toFixed(4)} (ratio ${compression.toFixed(2)}) - no compression` }
+      const dch = ta.donchian(highArr, lowArr, lookback)
+      const upper = dch.upper[dch.upper.length - 1]
+      const lower = dch.lower[dch.lower.length - 1]
+      const lastPrice = closesArr[closesArr.length - 1]
+      const nearTop = upper > lower ? (lastPrice - lower) / (upper - lower) : 0.5
+      const score = clamp(45 + (ratio - compression) * 120, 40, 92)
+      if (nearTop >= 0.9) return { direction: 'call', score, notes: `vol compressed ${(compression * 100).toFixed(0)}% of baseline, pressing the ${lookback}-bar range high - expansion setup` }
+      if (nearTop <= 0.1) return { direction: 'put', score, notes: `vol compressed ${(compression * 100).toFixed(0)}% of baseline, pressing the ${lookback}-bar range low - expansion setup` }
+      return { direction: 'none', score: clamp((0.5 - Math.abs(nearTop - 0.5)) * 20, -20, 20), notes: `vol compressed but price mid-range (${(nearTop * 100).toFixed(0)}%) - no edge yet` }
+    },
+  },
+  {
+    id: 'kalman-ou-adaptive-trend',
+    name: 'Kalman Adaptive Mean Trend',
+    description: 'Re-fits the OU equilibrium on a short rolling window so theta itself becomes an ultra-smooth, lag-light trend line. When that adaptive mean is sloping, only takes mean-reversion dips/rallies IN the direction of the slope (buy dips in an uptrend, sell rallies in a downtrend) instead of fading every stretch blindly.',
+    params: [
+      { key: 'window', label: 'Adaptive window', type: 'number', min: 30, max: 200, default: 80 },
+      { key: 'slopeLookback', label: 'Slope lookback (bars)', type: 'number', min: 5, max: 60, default: 20 },
+      { key: 'minSlopePct', label: 'Min slope % (of price)', type: 'number', min: 0.01, max: 1, step: 0.01, default: 0.05 },
+      { key: 'zEntry', label: 'Z entry threshold', type: 'number', min: 0.5, max: 3, step: 0.1, default: 1.2 },
+    ],
+    evaluate: (candles, p) => {
+      const closesArr = candles.map((c) => c.close)
+      const window = num(p, 'window', 80)
+      const slopeLB = Math.round(num(p, 'slopeLookback', 20))
+      const minSlopePct = num(p, 'minSlopePct', 0.05)
+      const ze = num(p, 'zEntry', 1.2)
+      if (closesArr.length < window + slopeLB + 5) return { direction: 'none', score: 0, notes: 'warming up' }
+      const nowEst = ouEstimate(closesArr, window)
+      const pastEst = ouEstimate(closesArr.slice(0, closesArr.length - slopeLB), window)
+      const lastPrice = closesArr[closesArr.length - 1]
+      const slopePct = ((nowEst.theta - pastEst.theta) / Math.max(1e-9, Math.abs(pastEst.theta))) * 100
+      const sigmaEq = nowEst.sigmaEq > 1e-9 ? nowEst.sigmaEq : 1
+      const z = clamp((lastPrice - nowEst.theta) / sigmaEq, -12, 12)
+      if (Math.abs(slopePct) < minSlopePct) {
+        return { direction: 'none', score: 0, notes: `μ flat (slope ${slopePct.toFixed(3)}%/${slopeLB}b) - no trend bias, sitting out` }
+      }
+      const trendUp = slopePct > 0
+      if (trendUp && z <= -ze) {
+        return { direction: 'call', score: clamp(50 + Math.abs(slopePct) * 20 + (Math.abs(z) - ze) * 10, 45, 94), notes: `μ rising ${slopePct.toFixed(2)}%/${slopeLB}b, dip ${z.toFixed(2)}σ below trend mean - buy the dip` }
+      }
+      if (!trendUp && z >= ze) {
+        return { direction: 'put', score: clamp(50 + Math.abs(slopePct) * 20 + (Math.abs(z) - ze) * 10, 45, 94), notes: `μ falling ${slopePct.toFixed(2)}%/${slopeLB}b, rally ${z.toFixed(2)}σ above trend mean - sell the rally` }
+      }
+      return { direction: 'none', score: 0, notes: `μ ${trendUp ? 'rising' : 'falling'} ${slopePct.toFixed(2)}%/${slopeLB}b but no ${trendUp ? 'dip' : 'rally'} entry yet (z ${z.toFixed(2)})` }
     },
   },
   {

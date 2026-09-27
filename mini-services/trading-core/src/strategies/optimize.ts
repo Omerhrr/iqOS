@@ -116,6 +116,10 @@ export interface SweepResult {
 function strategyWarmup(id: string): number {
   if (id === 'markov-edge' || id === 'confluence-core') return 560
   if (id === 'kalman-ou-reversion') return 340 // OU fits need their full estimation window before any signal
+  if (id === 'kalman-ou-vol-regime') return 360 // needs baseline window + slack for compression comparison
+  if (id === 'kalman-ou-breakout') return 300
+  if (id === 'kalman-ou-adaptive-trend') return 200 // window + slopeLookback + slack
+  if (id === 'kalman-ou-scalp') return 200
   if (id === 'ema-trend') return 180
   return 80
 }
