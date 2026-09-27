@@ -212,6 +212,9 @@ function SingleTab({ asset, strategies }: { asset: string; strategies: StrategyI
   const [amount, setAmount] = useState('10')
   const [expiryBars, setExpiryBars] = useState('1')
   const [startEquity, setStartEquity] = useState('1000')
+  const [spreadPct, setSpreadPct] = useState('0')
+  const [slippagePct, setSlippagePct] = useState('0')
+  const [commissionPct, setCommissionPct] = useState('0')
   const [paramValues, setParamValues] = useState<Record<string, Record<string, string>>>({})
   const [result, setResult] = useState<BacktestResult | null>(null)
   const [busy, setBusy] = useState(false)
@@ -238,6 +241,9 @@ function SingleTab({ asset, strategies }: { asset: string; strategies: StrategyI
         amount: Number(amount),
         expiryBars: Number(expiryBars),
         startEquity: Number(startEquity),
+        spreadPct: Number(spreadPct),
+        slippagePct: Number(slippagePct),
+        commissionPct: Number(commissionPct),
         params,
       })
       if (res.ok && res.result) setResult(res.result)
@@ -304,6 +310,15 @@ function SingleTab({ asset, strategies }: { asset: string; strategies: StrategyI
         <Field label="Start equity $">
           <Input value={startEquity} onChange={(e) => setStartEquity(e.target.value)} className={`${inCls} w-20`} />
         </Field>
+        <Field label="Spread %">
+          <Input value={spreadPct} onChange={(e) => setSpreadPct(e.target.value)} className={`${inCls} w-14`} />
+        </Field>
+        <Field label="Slippage %">
+          <Input value={slippagePct} onChange={(e) => setSlippagePct(e.target.value)} className={`${inCls} w-14`} />
+        </Field>
+        <Field label="Commission %">
+          <Input value={commissionPct} onChange={(e) => setCommissionPct(e.target.value)} className={`${inCls} w-14`} />
+        </Field>
 
         {strategy?.params.map((p) => (
           <Field key={p.key} label={p.label}>
@@ -354,17 +369,25 @@ function SingleTab({ asset, strategies }: { asset: string; strategies: StrategyI
           <div className="grid grid-cols-2 gap-2">
             {(
               [
-                ['Win rate', `${m.winRate.toFixed(1)}%`, m.winRate >= 50 ? 'text-emerald-400' : 'text-rose-400'],
+                [
+                  'Win rate',
+                  `${m.winRate.toFixed(1)}%`,
+                  m.winRate >= 50 ? 'text-emerald-400' : 'text-rose-400',
+                  `95% CI ${m.winRateCiLow.toFixed(0)}–${m.winRateCiHigh.toFixed(0)}%${m.lowSample ? ' · low sample' : ''}`,
+                ],
                 ['Profit factor', m.profitFactor.toFixed(2), m.profitFactor >= 1 ? 'text-emerald-400' : 'text-rose-400'],
                 ['Max drawdown', `${m.maxDrawdownPct.toFixed(1)}%`, 'text-amber-400'],
                 ['Sharpe', m.sharpe.toFixed(2), 'text-[#aab6cc]'],
                 ['Expectancy / trade', fmtMoney(m.expectancy), m.expectancy >= 0 ? 'text-emerald-400' : 'text-rose-400'],
                 ['Final equity', fmtMoney(m.finalEquity), 'text-cyan-300'],
-              ] as [string, string, string][]
-            ).map(([label, value, cls]) => (
+              ] as [string, string, string, string?][]
+            ).map(([label, value, cls, sub]) => (
               <div key={label} className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-2.5">
                 <div className="text-[9px] uppercase tracking-wider text-[#4b5a72]">{label}</div>
                 <div className={`font-mono text-[15px] font-bold ${cls}`}>{value}</div>
+                {sub && (
+                  <div className={`mt-0.5 font-mono text-[9px] ${m.lowSample ? 'text-amber-400' : 'text-[#4b5a72]'}`}>{sub}</div>
+                )}
               </div>
             ))}
           </div>
@@ -387,6 +410,9 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
   const [amount, setAmount] = useState('10')
   const [expiryBars, setExpiryBars] = useState('1')
   const [startEquity, setStartEquity] = useState('1000')
+  const [spreadPct, setSpreadPct] = useState('0')
+  const [slippagePct, setSlippagePct] = useState('0')
+  const [commissionPct, setCommissionPct] = useState('0')
   const [sweepState, setSweepState] = useState<SweepState>({})
   const [result, setResult] = useState<GridSearchResult | null>(null)
   const [selected, setSelected] = useState<OptRow | null>(null)
@@ -416,6 +442,9 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
         amount: Number(amount),
         expiryBars: Number(expiryBars),
         startEquity: Number(startEquity),
+        spreadPct: Number(spreadPct),
+        slippagePct: Number(slippagePct),
+        commissionPct: Number(commissionPct),
       })
       if (res.ok && res.result) {
         setResult(res.result)
@@ -471,6 +500,15 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
         <Field label="Start equity $">
           <Input value={startEquity} onChange={(e) => setStartEquity(e.target.value)} className={`${inCls} w-20`} />
         </Field>
+        <Field label="Spread %">
+          <Input value={spreadPct} onChange={(e) => setSpreadPct(e.target.value)} className={`${inCls} w-14`} />
+        </Field>
+        <Field label="Slippage %">
+          <Input value={slippagePct} onChange={(e) => setSlippagePct(e.target.value)} className={`${inCls} w-14`} />
+        </Field>
+        <Field label="Commission %">
+          <Input value={commissionPct} onChange={(e) => setCommissionPct(e.target.value)} className={`${inCls} w-14`} />
+        </Field>
         <Button onClick={() => void run()} disabled={busy} className="h-8 bg-cyan-600 px-4 text-[11px] font-semibold text-white hover:bg-cyan-500">
           {busy ? 'Searching…' : 'Run Optimizer'}
         </Button>
@@ -523,9 +561,19 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
                         <td className="px-2 py-1.5 text-[#4b5a72]">{r.rank}</td>
                         <td className="max-w-[280px] px-2 py-1.5"><ParamChips params={r.params} /></td>
                         <td className={`px-2 py-1.5 font-bold ${netCls(r.metrics.netPnl)}`}>{fmtMoney(r.metrics.netPnl)}</td>
-                        <td className={`px-2 py-1.5 ${r.metrics.winRate >= 50 ? 'text-emerald-400' : 'text-rose-400'}`}>{r.metrics.winRate.toFixed(0)}%</td>
+                        <td
+                          className={`px-2 py-1.5 ${r.metrics.winRate >= 50 ? 'text-emerald-400' : 'text-rose-400'}`}
+                          title={`95% CI ${r.metrics.winRateCiLow.toFixed(0)}–${r.metrics.winRateCiHigh.toFixed(0)}%`}
+                        >
+                          {r.metrics.winRate.toFixed(0)}%
+                        </td>
                         <td className="px-2 py-1.5 text-[#aab6cc]">{r.metrics.profitFactor.toFixed(2)}</td>
-                        <td className="px-2 py-1.5 text-[#aab6cc]">{r.metrics.totalTrades}</td>
+                        <td className="px-2 py-1.5 text-[#aab6cc]">
+                          {r.metrics.totalTrades}
+                          {r.metrics.lowSample && (
+                            <span className="ml-1 text-amber-400" title="fewer than 30 trades - low statistical confidence">⚠</span>
+                          )}
+                        </td>
                         <td className="px-2 py-1.5 text-amber-400/80">{r.metrics.maxDrawdownPct.toFixed(1)}</td>
                         <td className="px-2 py-1.5 text-[#aab6cc]">{r.metrics.sharpe.toFixed(2)}</td>
                         <td className="px-2 py-1.5" title={r.verified ? 're-verified with the full settlement engine' : 'fast-mode estimate'}>
@@ -576,6 +624,9 @@ function WalkForwardTab({ asset, strategies }: { asset: string; strategies: Stra
   const [minTrades, setMinTrades] = useState('6')
   const [amount, setAmount] = useState('10')
   const [expiryBars, setExpiryBars] = useState('1')
+  const [spreadPct, setSpreadPct] = useState('0')
+  const [slippagePct, setSlippagePct] = useState('0')
+  const [commissionPct, setCommissionPct] = useState('0')
   const [sweepState, setSweepState] = useState<SweepState>({})
   const [result, setResult] = useState<WalkForwardResult | null>(null)
   const [busy, setBusy] = useState(false)
@@ -600,6 +651,9 @@ function WalkForwardTab({ asset, strategies }: { asset: string; strategies: Stra
         isRatio: Number(isRatio),
         amount: Number(amount),
         expiryBars: Number(expiryBars),
+        spreadPct: Number(spreadPct),
+        slippagePct: Number(slippagePct),
+        commissionPct: Number(commissionPct),
       })
       if (res.ok && res.result) setResult(res.result)
       else setError(res.error ?? 'walk-forward failed')
@@ -657,6 +711,15 @@ function WalkForwardTab({ asset, strategies }: { asset: string; strategies: Stra
         <Field label="Expiry bars">
           <Input value={expiryBars} onChange={(e) => setExpiryBars(e.target.value)} className={`${inCls} w-14`} />
         </Field>
+        <Field label="Spread %">
+          <Input value={spreadPct} onChange={(e) => setSpreadPct(e.target.value)} className={`${inCls} w-14`} />
+        </Field>
+        <Field label="Slippage %">
+          <Input value={slippagePct} onChange={(e) => setSlippagePct(e.target.value)} className={`${inCls} w-14`} />
+        </Field>
+        <Field label="Commission %">
+          <Input value={commissionPct} onChange={(e) => setCommissionPct(e.target.value)} className={`${inCls} w-14`} />
+        </Field>
         <Button onClick={() => void run()} disabled={busy} className="h-8 bg-cyan-600 px-4 text-[11px] font-semibold text-white hover:bg-cyan-500">
           {busy ? 'Validating…' : 'Run Walk-Forward'}
         </Button>
@@ -673,15 +736,21 @@ function WalkForwardTab({ asset, strategies }: { asset: string; strategies: Stra
             {(
               [
                 ['OOS net P&L', fmtMoney(result.oosNet), netCls(result.oosNet)],
-                ['OOS win rate', `${oos.winRate.toFixed(1)}%`, oos.winRate >= 50 ? 'text-emerald-400' : 'text-rose-400'],
+                [
+                  'OOS win rate',
+                  `${oos.winRate.toFixed(1)}%`,
+                  oos.winRate >= 50 ? 'text-emerald-400' : 'text-rose-400',
+                  `95% CI ${oos.winRateCiLow.toFixed(0)}–${oos.winRateCiHigh.toFixed(0)}%${oos.lowSample ? ' · low sample' : ''}`,
+                ],
                 ['Consistency', `${result.foldsProfitable}/${result.folds.length} folds`, result.foldsProfitable >= result.folds.length / 2 ? 'text-emerald-400' : 'text-amber-400'],
                 ['OOS efficiency', `${result.efficiencyPct.toFixed(0)}%`, result.efficiencyPct > 0 ? 'text-emerald-400' : 'text-rose-400'],
                 ['OOS trades', String(oos.totalTrades), 'text-[#aab6cc]'],
-              ] as [string, string, string][]
-            ).map(([label, value, cls]) => (
+              ] as [string, string, string, string?][]
+            ).map(([label, value, cls, sub]) => (
               <div key={label} className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-2.5">
                 <div className="text-[9px] uppercase tracking-wider text-[#4b5a72]">{label}</div>
                 <div className={`font-mono text-[15px] font-bold ${cls}`}>{value}</div>
+                {sub && <div className={`mt-0.5 font-mono text-[9px] ${oos.lowSample ? 'text-amber-400' : 'text-[#4b5a72]'}`}>{sub}</div>}
               </div>
             ))}
           </div>
@@ -704,9 +773,19 @@ function WalkForwardTab({ asset, strategies }: { asset: string; strategies: Stra
                     <td className={`px-2 py-1.5 ${netCls(f.is.netPnl)}`}>{fmtMoney(f.is.netPnl)}</td>
                     <td className="px-2 py-1.5 text-[#aab6cc]">{f.oosBars}</td>
                     <td className={`px-2 py-1.5 font-bold ${netCls(f.oos.netPnl)}`}>{fmtMoney(f.oos.netPnl)}</td>
-                    <td className={`px-2 py-1.5 ${f.oos.winRate >= 50 ? 'text-emerald-400' : 'text-rose-400'}`}>{f.oos.winRate.toFixed(0)}%</td>
+                    <td
+                      className={`px-2 py-1.5 ${f.oos.winRate >= 50 ? 'text-emerald-400' : 'text-rose-400'}`}
+                      title={`95% CI ${f.oos.winRateCiLow.toFixed(0)}–${f.oos.winRateCiHigh.toFixed(0)}%`}
+                    >
+                      {f.oos.winRate.toFixed(0)}%
+                    </td>
                     <td className="px-2 py-1.5 text-[#aab6cc]">{f.oos.profitFactor.toFixed(2)}</td>
-                    <td className="px-2 py-1.5 text-[#aab6cc]">{f.oos.totalTrades}</td>
+                    <td className="px-2 py-1.5 text-[#aab6cc]">
+                      {f.oos.totalTrades}
+                      {f.oos.lowSample && (
+                        <span className="ml-1 text-amber-400" title="fewer than 30 trades - low statistical confidence">⚠</span>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -767,7 +846,11 @@ function SweepTab({
   const [openOnly, setOpenOnly] = useState(true)
   const [maxAssets, setMaxAssets] = useState('40')
   const [objective, setObjective] = useState<'netPnl' | 'sharpe' | 'profitFactor' | 'winRate' | 'expectancy'>('netPnl')
-  const [minTrades, setMinTrades] = useState('8')
+  const [minTrades, setMinTrades] = useState('20')
+  const [spreadPct, setSpreadPct] = useState('0')
+  const [slippagePct, setSlippagePct] = useState('0')
+  const [commissionPct, setCommissionPct] = useState('0')
+  const [sharedWindow, setSharedWindow] = useState(true)
   const [paramValues, setParamValues] = useState<Record<string, Record<string, string>>>({})
   const [result, setResult] = useState<SweepResult | null>(null)
   const [busy, setBusy] = useState(false)
@@ -795,6 +878,10 @@ function SweepTab({
         params,
         objective,
         minTrades: Number(minTrades),
+        spreadPct: Number(spreadPct),
+        slippagePct: Number(slippagePct),
+        commissionPct: Number(commissionPct),
+        sharedWindow,
       })
       if (res.ok && res.result) setResult(res.result)
       else setError(res.error ?? 'asset sweep failed')
@@ -856,9 +943,25 @@ function SweepTab({
         <Field label="Min trades">
           <Input value={minTrades} onChange={(e) => setMinTrades(e.target.value)} className={`${inCls} w-14`} />
         </Field>
+        <Field label="Spread %">
+          <Input value={spreadPct} onChange={(e) => setSpreadPct(e.target.value)} className={`${inCls} w-14`} />
+        </Field>
+        <Field label="Slippage %">
+          <Input value={slippagePct} onChange={(e) => setSlippagePct(e.target.value)} className={`${inCls} w-14`} />
+        </Field>
+        <Field label="Commission %">
+          <Input value={commissionPct} onChange={(e) => setCommissionPct(e.target.value)} className={`${inCls} w-14`} />
+        </Field>
         <label className="flex cursor-pointer items-center gap-1.5 pb-1.5 font-mono text-[10px] text-[#7c8aa5]">
           <input type="checkbox" checked={openOnly} onChange={(e) => setOpenOnly(e.target.checked)} className="h-3 w-3 accent-cyan-500" />
           open only
+        </label>
+        <label
+          className="flex cursor-pointer items-center gap-1.5 pb-1.5 font-mono text-[10px] text-[#7c8aa5]"
+          title="Evaluate every asset over the same overlapping calendar window instead of each asset's own most-recent candles"
+        >
+          <input type="checkbox" checked={sharedWindow} onChange={(e) => setSharedWindow(e.target.checked)} className="h-3 w-3 accent-cyan-500" />
+          shared window
         </label>
         <Button onClick={() => void run()} disabled={busy} className="h-8 bg-cyan-600 px-4 text-[11px] font-semibold text-white hover:bg-cyan-500">
           {busy ? 'Sweeping…' : 'Run Sweep'}
@@ -888,6 +991,13 @@ function SweepTab({
             <span className="text-cyan-300">{result.tested}</span> assets tested ·
             <span className="text-amber-400">{result.skipped}</span> skipped ·
             <span>{result.elapsedMs} ms</span>
+            {result.sharedWindow && (
+              <span>
+                shared window {new Date(result.sharedWindow.start * 1000).toLocaleDateString('en-US')}
+                {' → '}
+                {new Date(result.sharedWindow.end * 1000).toLocaleDateString('en-US')}
+              </span>
+            )}
             <span className="ml-auto text-[#4b5a72]">click a row to load it in the chart</span>
           </div>
           <div className="overflow-hidden rounded-lg border border-[#1c2739]">
@@ -910,9 +1020,19 @@ function SweepTab({
                     <td className="px-2 py-1.5 text-[#4b5a72]">{r.category}</td>
                     <td className="px-2 py-1.5 text-[#aab6cc]">{(r.payout * 100).toFixed(0)}%</td>
                     <td className={`px-2 py-1.5 font-bold ${netCls(r.metrics.netPnl)}`}>{fmtMoney(r.metrics.netPnl)}</td>
-                    <td className={`px-2 py-1.5 ${r.metrics.winRate >= 50 ? 'text-emerald-400' : 'text-rose-400'}`}>{r.metrics.winRate.toFixed(0)}%</td>
+                    <td
+                      className={`px-2 py-1.5 ${r.metrics.winRate >= 50 ? 'text-emerald-400' : 'text-rose-400'}`}
+                      title={`95% CI ${r.metrics.winRateCiLow.toFixed(0)}–${r.metrics.winRateCiHigh.toFixed(0)}%`}
+                    >
+                      {r.metrics.winRate.toFixed(0)}%
+                    </td>
                     <td className="px-2 py-1.5 text-[#aab6cc]">{r.metrics.profitFactor.toFixed(2)}</td>
-                    <td className="px-2 py-1.5 text-[#aab6cc]">{r.metrics.totalTrades}</td>
+                    <td className="px-2 py-1.5 text-[#aab6cc]">
+                      {r.metrics.totalTrades}
+                      {r.metrics.lowSample && (
+                        <span className="ml-1 text-amber-400" title="fewer than 30 trades - low statistical confidence">⚠</span>
+                      )}
+                    </td>
                     <td className="px-2 py-1.5 text-amber-400/80">{r.metrics.maxDrawdownPct.toFixed(1)}</td>
                     <td className="px-2 py-1.5 text-[#aab6cc]">{r.metrics.sharpe.toFixed(2)}</td>
                   </tr>

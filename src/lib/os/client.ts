@@ -736,6 +736,9 @@ export interface BacktestResult {
     expectancy: number
     finalEquity: number
     startEquity: number
+    winRateCiLow: number
+    winRateCiHigh: number
+    lowSample: boolean
   }
 }
 
@@ -754,6 +757,9 @@ export interface FastMetrics {
   sharpe: number
   expectancy: number
   finalEquity: number
+  winRateCiLow: number
+  winRateCiHigh: number
+  lowSample: boolean
 }
 
 export interface OptRow {
@@ -828,6 +834,7 @@ export interface SweepResult {
   skipped: number
   elapsedMs: number
   rows: SweepRow[]
+  sharedWindow: { start: number; end: number } | null
 }
 
 export interface AlertRow {
