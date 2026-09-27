@@ -612,7 +612,12 @@ export interface LabSimMetrics {
   profitFactor: number
   maxDrawdown: number
   expectancy: number
+  winRateCiLow: number
+  winRateCiHigh: number
+  lowSample: boolean
 }
+
+export type LabRegime = 'TRENDING' | 'RANGING' | 'VOLATILE' | 'MIXED'
 
 export interface LabLearnResult {
   ok: boolean
@@ -629,6 +634,10 @@ export interface LabLearnResult {
   calibration: { thresholds: { minScore: number; trades: number; winRate: number }[]; chosen: number; votes: number }
   backtest: LabSimMetrics | null
   holdout: LabSimMetrics | null
+  holdoutFolds: LabSimMetrics[]
+  foldsProfitable: number
+  confluenceWeak: boolean
+  regime: LabRegime
   note: string
   error?: string
 }

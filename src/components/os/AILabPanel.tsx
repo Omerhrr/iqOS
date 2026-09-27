@@ -36,10 +36,17 @@ function MetricStrip({ label, m, breakeven }: { label: string; m: LabSimMetrics 
       <div className="text-[9px] uppercase tracking-wider text-[#4b5a72]">{label}</div>
       <div className="mt-1 grid grid-cols-3 gap-x-3 gap-y-1 font-mono text-[11px]">
         <span className="text-[#7c8aa5]">
-          trades <span className="text-[#dbe4f0]">{m.trades}</span>
+          trades{' '}
+          <span className="text-[#dbe4f0]">{m.trades}</span>
+          {m.lowSample && (
+            <span className="ml-1 text-amber-400" title="fewer than 30 trades - low statistical confidence">⚠</span>
+          )}
         </span>
         <span className="text-[#7c8aa5]">
-          win <span className={good ? 'text-emerald-400' : 'text-rose-400'}>{m.winRate.toFixed(1)}%</span>
+          win{' '}
+          <span className={good ? 'text-emerald-400' : 'text-rose-400'} title={`95% CI ${m.winRateCiLow.toFixed(0)}–${m.winRateCiHigh.toFixed(0)}%`}>
+            {m.winRate.toFixed(1)}%
+          </span>
           <span className="text-[10px] text-[#4b5a72]"> / BE {breakeven.toFixed(1)}%</span>
         </span>
         <span className="text-[#7c8aa5]">
@@ -54,6 +61,41 @@ function MetricStrip({ label, m, breakeven }: { label: string; m: LabSimMetrics 
         <span className="text-[#7c8aa5]">
           maxDD <span className="text-rose-400">-{fmtMoney(m.maxDrawdown)}</span>
         </span>
+        <span className="col-span-3 text-[10px] text-[#4b5a72]">
+          95% CI on win rate: {m.winRateCiLow.toFixed(0)}–{m.winRateCiHigh.toFixed(0)}%
+        </span>
+      </div>
+    </div>
+  )
+}
+
+const REGIME_STYLE: Record<string, string> = {
+  TRENDING: 'text-emerald-300 border-emerald-500/40 bg-emerald-500/10',
+  RANGING: 'text-sky-300 border-sky-500/40 bg-sky-500/10',
+  VOLATILE: 'text-amber-300 border-amber-500/40 bg-amber-500/10',
+  MIXED: 'text-[#7c8aa5] border-[#1c2739] bg-[#101828]',
+}
+
+function FoldsStrip({ folds, foldsProfitable, breakeven }: { folds: LabSimMetrics[]; foldsProfitable: number; breakeven: number }) {
+  if (!folds.length) return null
+  return (
+    <div className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-2.5">
+      <div className="flex items-center justify-between">
+        <div className="text-[9px] uppercase tracking-wider text-[#4b5a72]">
+          out-of-sample folds (last 40%, same spec replayed with no re-tuning)
+        </div>
+        <span className={`font-mono text-[10px] font-bold ${foldsProfitable >= Math.ceil(folds.length / 2) ? 'text-emerald-400' : 'text-rose-400'}`}>
+          {foldsProfitable}/{folds.length} profitable
+        </span>
+      </div>
+      <div className="mt-1.5 grid grid-cols-3 gap-1.5">
+        {folds.map((f, i) => (
+          <div key={i} className="rounded border border-[#141d2e] bg-[#0d1420] px-1.5 py-1 font-mono text-[10px]">
+            <div className="text-[8px] uppercase tracking-wider text-[#4b5a72]">fold {i + 1}</div>
+            <div className={f.netPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}>{f.netPnl >= 0 ? '+' : ''}{fmtMoney(f.netPnl)}</div>
+            <div className={f.winRate >= breakeven ? 'text-emerald-400/80' : 'text-rose-400/80'}>{f.winRate.toFixed(0)}% · {f.trades}t</div>
+          </div>
+        ))}
       </div>
     </div>
   )
@@ -180,7 +222,12 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
           kind: 'compound',
           base: seed,
           rollPct: 100,
-          payoutCap: 70,
+          // Match the payout the strategy was actually learned/validated at
+          // (was hardcoded to 70 regardless of the `payout` used for
+          // learning - a strategy validated at 85% payout got deployed with
+          // a compounding plan capped as if it were 70%, understating what
+          // it was proven against).
+          payoutCap: Math.round(payout * 100),
           stopOnLoss: true,
           ...(periods > 0 ? { periods } : {}),
           ...(deriskAfter > 0 && deriskPct > 0 ? { deriskAfter, deriskPct } : {}),
@@ -208,8 +255,13 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
   }
 
   const backtestRow = async (id: string) => {
+    // Use the saved row's OWN asset/tf, not whatever pair the learn form
+    // currently has selected - the library holds strategies learned on
+    // different pairs/timeframes, and re-backtesting against the wrong
+    // instrument silently produced meaningless numbers.
+    const row = library.find((r) => r.id === id)
     try {
-      await osPost('/lab_backtest', { id, asset, tf, payout })
+      await osPost('/lab_backtest', { id, asset: row?.asset ?? asset, tf: row?.tf ?? tf, payout })
       loadLibrary()
     } catch (e) {
       onError((e as Error).message)
@@ -257,11 +309,16 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
           <NumField label="min n" value={minSamples} onChange={setMinSamples} w="w-14" />
           <NumField label="min edge %" value={minEdge} onChange={setMinEdge} step={0.5} w="w-16" />
           <label className="flex flex-col gap-0.5">
-            <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">payout</span>
-            <select value={payout} onChange={(e) => setPayout(Number(e.target.value))} className="h-7 rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-[#dbe4f0]">
-              <option value={0.7}>70% (cap)</option>
-              <option value={0.85}>85%</option>
-            </select>
+            <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]" title="the real payout to validate against - matches whatever this instrument actually pays, not just the two most common tiers">payout %</span>
+            <Input
+              type="number"
+              min={50}
+              max={95}
+              step={1}
+              value={Math.round(payout * 100)}
+              onChange={(e) => setPayout(Math.max(0.5, Math.min(0.95, Number(e.target.value) / 100)))}
+              className="h-7 w-16 border-[#1c2739] bg-[#101828] font-mono text-[11px] text-[#dbe4f0]"
+            />
           </label>
           <NumField label="max signals" value={maxSignals} onChange={setMaxSignals} w="w-12" />
           <Button onClick={() => void learn()} disabled={learning} className="h-7 bg-cyan-600 px-3 text-[10px] font-bold uppercase tracking-wider text-white hover:bg-cyan-500 disabled:opacity-50">
@@ -277,9 +334,19 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
       {result && (
         <div className="space-y-2 rounded-lg border border-[#1c2739] bg-[#0b111c] p-3">
           <div className={`rounded border px-2 py-1.5 font-mono text-[11px] ${result.ok ? 'border-emerald-500/30 bg-emerald-500/5 text-emerald-300' : 'border-amber-500/30 bg-amber-500/5 text-amber-300'}`}>{result.note}</div>
-          <div className="font-mono text-[10px] text-[#4b5a72]">
-            {result.asset} · {result.tf} · <span className={result.basis === 'heikin' ? 'text-emerald-300' : ''}>{result.basis === 'heikin' ? 'heiken-ashi basis' : 'raw candle basis'}</span> · {result.candlesTested} bars · horizon {result.horizon} · min n {result.minSamples} · min edge {result.minEdge}pts
+          <div className="flex flex-wrap items-center gap-2 font-mono text-[10px] text-[#4b5a72]">
+            <span>
+              {result.asset} · {result.tf} · <span className={result.basis === 'heikin' ? 'text-emerald-300' : ''}>{result.basis === 'heikin' ? 'heiken-ashi basis' : 'raw candle basis'}</span> · {result.candlesTested} bars · horizon {result.horizon} · min n {result.minSamples} · min edge {result.minEdge}pts
+            </span>
+            <span className={`rounded border px-1.5 py-0.5 text-[9px] uppercase ${REGIME_STYLE[result.regime] ?? REGIME_STYLE.MIXED}`} title="market regime detected over the learned window">
+              {result.regime.toLowerCase()}
+            </span>
           </div>
+          {result.confluenceWeak && (
+            <div className="rounded border border-amber-500/30 bg-amber-500/5 px-2 py-1.5 font-mono text-[10px] text-amber-300">
+              ⚠ confluence guard degraded: fewer than 3 signals qualified, so minVotes dropped to 1 - a single signal firing alone is enough to trade, not multiple signals agreeing.
+            </div>
+          )}
 
           {/* discovery table */}
           <div className="overflow-x-auto rounded-lg border border-[#141d2e]">
@@ -333,6 +400,8 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
                 <MetricStrip label="backtest - full sample" m={result.backtest} breakeven={result.breakevenWinRate} />
                 <MetricStrip label="backtest - holdout (last 30%, unseen in calibration)" m={result.holdout} breakeven={result.breakevenWinRate} />
               </div>
+
+              <FoldsStrip folds={result.holdoutFolds} foldsProfitable={result.foldsProfitable} breakeven={result.breakevenWinRate} />
 
               <div className="flex flex-wrap items-center gap-2">
                 <Input value={savedName} onChange={(e) => setSavedName(e.target.value)} placeholder="strategy name" className="h-7 w-48 border-[#1c2739] bg-[#101828] font-mono text-[11px] text-[#dbe4f0]" />

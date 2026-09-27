@@ -25,6 +25,8 @@ import {
   type SignalDef,
 } from '../strategies/custom'
 import { detectPatterns } from '../analytics/patterns'
+import { analyze } from '../analytics/engine'
+import { classifyRegime, type Regime } from '../analytics/regime'
 
 export interface LearnOptions {
   asset: string
@@ -62,6 +64,13 @@ export interface SimMetrics {
   profitFactor: number
   maxDrawdown: number
   expectancy: number
+  // Wilson-score 95% confidence interval on winRate, and a flag for when
+  // totalTrades is too small to trust the point estimate - same treatment
+  // given to the Backtest Lab's engines, so a learned pair's numbers carry
+  // the same honesty about sample size.
+  winRateCiLow: number
+  winRateCiHigh: number
+  lowSample: boolean
 }
 
 export interface LearnResult {
@@ -79,6 +88,20 @@ export interface LearnResult {
   calibration: { thresholds: { minScore: number; trades: number; winRate: number }[]; chosen: number; votes: number }
   backtest: SimMetrics | null
   holdout: SimMetrics | null
+  // Sequential out-of-sample folds carved from the last 40% of history (the
+  // single "last 30%" holdout above is one window, and a strategy can get
+  // lucky/unlucky in any one window) - the SAME calibrated spec is replayed
+  // over each fold with no re-tuning, so a low foldsProfitable count is a
+  // real signal that the edge isn't stable across time, not just an artifact
+  // of where the holdout boundary happened to fall.
+  holdoutFolds: SimMetrics[]
+  foldsProfitable: number
+  // true when minVotes had to drop to 1 because fewer than 3 signals
+  // qualified - the ensemble's "confluence guard" (multiple independent
+  // signals agreeing) is degraded to a single signal firing alone, which is
+  // materially weaker evidence and was previously invisible in the UI.
+  confluenceWeak: boolean
+  regime: Regime
   note: string
 }
 
@@ -147,6 +170,16 @@ export class StrategyLabService {
     const settle = raw.map((c) => c.close)
     const n = candles.length
     const ctx = buildCtx(candles)
+    // Regime tag - what kind of market this pair/window actually was
+    // (trending/ranging/volatile/mixed), so a learned edge can be read
+    // alongside the conditions it was learned under rather than in a vacuum.
+    let regime: Regime = 'MIXED'
+    try {
+      regime = classifyRegime(analyze(raw, asset, tf))
+    } catch {
+      // analytics engine needs its own minimum history/indicator warmup;
+      // leave the default tag rather than fail the whole learn() call over it
+    }
 
     // ---- candidates from the parametric vocabulary ----
     const candidates: Candidate[] = CANDIDATE_SIGNALS.map((def) => ({
@@ -248,6 +281,10 @@ export class StrategyLabService {
         calibration: { thresholds: [], chosen: 0, votes: 1 },
         backtest: null,
         holdout: null,
+        holdoutFolds: [],
+        foldsProfitable: 0,
+        confluenceWeak: false,
+        regime,
         note: `no event cleared the filters (n >= ${minSamples}, edge >= ${minEdge}pts over ${n} bars) - nothing to deploy; lower minEdge/minSamples or try another pair/timeframe`,
       }
     }
@@ -285,6 +322,26 @@ export class StrategyLabService {
     const backtest = simFromSeries(series, raw, warm, horizon, amount, payout, minVotes, spec.minScore)
     const holdout = simFromSeries(series, raw, Math.floor(n * 0.7), horizon, amount, payout, minVotes, spec.minScore)
 
+    // ---- holdout folds: 3 sequential OOS windows over the last 40% ----
+    // The single 70/30 split above is one draw of where the boundary falls;
+    // replaying the SAME already-calibrated spec (no re-tuning) over several
+    // sequential windows checks whether the edge holds up across different
+    // stretches of time, not just in whichever window the holdout happened
+    // to land on.
+    const FOLD_COUNT = 3
+    const foldsStart = Math.floor(n * 0.6)
+    const foldSize = Math.floor((n - foldsStart) / FOLD_COUNT)
+    const holdoutFolds: SimMetrics[] = []
+    if (foldSize >= 20) {
+      for (let f = 0; f < FOLD_COUNT; f++) {
+        const foldStart = foldsStart + f * foldSize
+        const foldEnd = f === FOLD_COUNT - 1 ? n : foldStart + foldSize
+        holdoutFolds.push(simFromSeries(series, raw, foldStart, horizon, amount, payout, minVotes, spec.minScore, foldEnd))
+      }
+    }
+    const foldsProfitable = holdoutFolds.filter((f) => f.netPnl > 0).length
+    const confluenceWeak = minVotes < 2
+
     return {
       ok: true,
       asset,
@@ -300,7 +357,11 @@ export class StrategyLabService {
       calibration: { thresholds, chosen: spec.minScore, votes: minVotes },
       backtest,
       holdout,
-      note: `learned ${selected.length}-signal ${basis === 'heikin' ? 'HEIKIN-ASHI ' : ''}spec "${spec.name}" (minScore ${spec.minScore}, minVotes ${minVotes}); full-sample win rate ${backtest.winRate.toFixed(1)}% vs breakeven ${((1 / (1 + payout)) * 100).toFixed(1)}%, holdout (last 30%) ${holdout.trades} trades @ ${holdout.winRate.toFixed(1)}%`,
+      holdoutFolds,
+      foldsProfitable,
+      confluenceWeak,
+      regime,
+      note: `learned ${selected.length}-signal ${basis === 'heikin' ? 'HEIKIN-ASHI ' : ''}spec "${spec.name}" (minScore ${spec.minScore}, minVotes ${minVotes}${confluenceWeak ? ' - confluence guard degraded to a single signal' : ''}); full-sample win rate ${backtest.winRate.toFixed(1)}% vs breakeven ${((1 / (1 + payout)) * 100).toFixed(1)}%, holdout (last 30%) ${holdout.trades} trades @ ${holdout.winRate.toFixed(1)}%, ${foldsProfitable}/${holdoutFolds.length || FOLD_COUNT} OOS folds profitable, regime at learn time: ${regime}`,
     }
   }
 
@@ -502,7 +563,10 @@ function scoreSeriesFor(
   return series
 }
 
-/** Binary-settlement simulation of a precomputed score series. */
+/** Binary-settlement simulation of a precomputed score series. `endIdx`
+ * (default: full series) lets a caller confine the simulation to a
+ * sub-window - e.g. one sequential holdout fold - without recomputing the
+ * score series each time. */
 function simFromSeries(
   series: { score: number; votes: number; dir: Side | 'none' }[],
   candles: Candle[],
@@ -512,6 +576,7 @@ function simFromSeries(
   payout: number,
   minVotes: number,
   minScore: number,
+  endIdx?: number,
 ): SimMetrics {
   let trades = 0
   let wins = 0
@@ -520,7 +585,7 @@ function simFromSeries(
   let grossLoss = 0
   let peak = 0
   let maxDD = 0
-  const end = candles.length - horizon
+  const end = Math.min(endIdx ?? candles.length, candles.length) - horizon
   for (let i = Math.max(startIdx, 30); i < end; i++) {
     const s = series[i]
     if (s.dir === 'none' || Math.abs(s.score) < minScore || s.votes < minVotes) continue
@@ -538,6 +603,7 @@ function simFromSeries(
     if (peak - pnl > maxDD) maxDD = peak - pnl
     i += horizon - 1 // no overlapping trades: skip the settlement window
   }
+  const [ciLow, ciHigh] = wilsonInterval(wins, trades)
   return {
     trades,
     wins,
@@ -547,7 +613,24 @@ function simFromSeries(
     profitFactor: grossLoss === 0 ? (grossWin > 0 ? 99 : 0) : round2(grossWin / grossLoss),
     maxDrawdown: round2(maxDD),
     expectancy: trades ? round2(pnl / trades) : 0,
+    winRateCiLow: ciLow,
+    winRateCiHigh: ciHigh,
+    lowSample: trades < 30,
   }
+}
+
+/** Wilson score 95% confidence interval on a binomial proportion - stays
+ * well-behaved (never leaves [0,100]) at small n or extreme win rates,
+ * unlike the naive normal approximation. */
+function wilsonInterval(wins: number, total: number, z = 1.96): [number, number] {
+  if (total <= 0) return [0, 0]
+  const p = wins / total
+  const denom = 1 + (z * z) / total
+  const center = p + (z * z) / (2 * total)
+  const margin = z * Math.sqrt((p * (1 - p)) / total + (z * z) / (4 * total * total))
+  const low = (center - margin) / denom
+  const high = (center + margin) / denom
+  return [Math.max(0, low * 100), Math.min(100, high * 100)]
 }
 
 // ---------- candidate vocabulary (the lab's invented indicator family) ----------
