@@ -646,13 +646,23 @@ const httpServer = createServer(async (req, res) => {
           strategy: String(body.strategy ?? 'confluence-core'),
           sweep: (body.sweep as Record<string, { from: number; to: number; step: number }>) ?? {},
           objective: (body.objective as Objective) ?? 'netPnl',
-          minTrades: body.minTrades !== undefined ? Number(body.minTrades) : 8,
+          // Raised from 8: 8 trades is far too small a sample to trust a
+          // ranking decision on (see FastMetrics.winRateCiLow/High - at n=8 the
+          // 95% CI on win rate typically spans 40+ points). 20 is a more
+          // defensible professional floor; still fully overridable by the caller.
+          minTrades: body.minTrades !== undefined ? Number(body.minTrades) : 20,
           maxCombos: body.maxCombos !== undefined ? Number(body.maxCombos) : 240,
           top: body.top !== undefined ? Number(body.top) : 20,
           payout: body.payout !== undefined ? Number(body.payout) : 0.85,
           amount: body.amount !== undefined ? Number(body.amount) : 10,
           expiryBars: body.expiryBars !== undefined ? Number(body.expiryBars) : 1,
           startEquity: body.startEquity !== undefined ? Number(body.startEquity) : 1000,
+          // Round-trip cost modeling - all opt-in, 0 by default (unchanged
+          // behavior unless the caller explicitly asks for spread/slippage/
+          // commission to be simulated).
+          spreadPct: body.spreadPct !== undefined ? Number(body.spreadPct) : 0,
+          slippagePct: body.slippagePct !== undefined ? Number(body.slippagePct) : 0,
+          commissionPct: body.commissionPct !== undefined ? Number(body.commissionPct) : 0,
         })
         return json(200, { ok: true, result: out })
       }
@@ -662,7 +672,10 @@ const httpServer = createServer(async (req, res) => {
           strategy: String(body.strategy ?? 'rsi-reversion'),
           sweep: (body.sweep as Record<string, { from: number; to: number; step: number }>) ?? {},
           objective: (body.objective as Objective) ?? 'netPnl',
-          minTrades: body.minTrades !== undefined ? Number(body.minTrades) : 6,
+          // Raised from 6: each walk-forward fold's OOS sample is inherently
+          // small, so 10 is a pragmatic floor between "too few for the fold to
+          // ever pass" and "too few to trust" - still overridable.
+          minTrades: body.minTrades !== undefined ? Number(body.minTrades) : 10,
           maxCombos: body.maxCombos !== undefined ? Number(body.maxCombos) : 120,
           folds: body.folds !== undefined ? Number(body.folds) : 3,
           isRatio: body.isRatio !== undefined ? Number(body.isRatio) : 0.7,
@@ -670,6 +683,9 @@ const httpServer = createServer(async (req, res) => {
           amount: body.amount !== undefined ? Number(body.amount) : 10,
           expiryBars: body.expiryBars !== undefined ? Number(body.expiryBars) : 1,
           startEquity: body.startEquity !== undefined ? Number(body.startEquity) : 1000,
+          spreadPct: body.spreadPct !== undefined ? Number(body.spreadPct) : 0,
+          slippagePct: body.slippagePct !== undefined ? Number(body.slippagePct) : 0,
+          commissionPct: body.commissionPct !== undefined ? Number(body.commissionPct) : 0,
         })
         // Persist the verdict so the research-gate (bot_create/bot_toggle) can
         // require a recent robust pass before arming a bot on this
@@ -737,7 +753,7 @@ const httpServer = createServer(async (req, res) => {
             strategy: String(body.strategy ?? 'confluence-core'),
             params: (body.params as Record<string, number | string>) ?? undefined,
             objective: (body.objective as Objective) ?? 'netPnl',
-            minTrades: body.minTrades !== undefined ? Number(body.minTrades) : 8,
+            minTrades: body.minTrades !== undefined ? Number(body.minTrades) : 20,
             // Leave payout undefined by default so sweepAssets() can fall back to
             // each asset's own real broker payout instead of a flat 0.85 for
             // every instrument. An explicit body.payout still overrides (for an
@@ -747,6 +763,12 @@ const httpServer = createServer(async (req, res) => {
             expiryBars: body.expiryBars !== undefined ? Number(body.expiryBars) : 1,
             startEquity: body.startEquity !== undefined ? Number(body.startEquity) : 1000,
             maxAssets: body.maxAssets !== undefined ? Number(body.maxAssets) : 40,
+            spreadPct: body.spreadPct !== undefined ? Number(body.spreadPct) : 0,
+            slippagePct: body.slippagePct !== undefined ? Number(body.slippagePct) : 0,
+            commissionPct: body.commissionPct !== undefined ? Number(body.commissionPct) : 0,
+            // Same-calendar-window comparison across assets by default; pass
+            // sharedWindow:false to restore each asset's own most-recent-N-candles.
+            sharedWindow: body.sharedWindow === undefined ? true : Boolean(body.sharedWindow),
           }
         )
         return json(200, { ok: true, result: out })
@@ -764,6 +786,9 @@ const httpServer = createServer(async (req, res) => {
           tpPct: body.tpPct !== undefined ? Number(body.tpPct) : 0.4,
           slPct: body.slPct !== undefined ? Number(body.slPct) : 0.25,
           maxBars: body.maxBars !== undefined ? Number(body.maxBars) : 24,
+          spreadPct: body.spreadPct !== undefined ? Number(body.spreadPct) : 0,
+          slippagePct: body.slippagePct !== undefined ? Number(body.slippagePct) : 0,
+          commissionPct: body.commissionPct !== undefined ? Number(body.commissionPct) : 0,
         })
         return json(200, { ok: true, result })
       }

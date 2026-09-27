@@ -20,6 +20,16 @@ export interface FastMetrics {
   sharpe: number
   expectancy: number
   finalEquity: number
+  // Wilson score 95% confidence interval on winRate (percentage points) - a
+  // win rate computed from a handful of trades is not statistically reliable,
+  // and this exposes just how wide the plausible range actually is instead of
+  // presenting a single point estimate as if it were exact.
+  winRateCiLow: number
+  winRateCiHigh: number
+  // true when totalTrades is below a professional statistical-significance
+  // floor (30) - callers/UI should visibly flag results built on this few
+  // trades rather than let them be read as reliable.
+  lowSample: boolean
 }
 
 export interface OptRow {
@@ -94,6 +104,10 @@ export interface SweepResult {
   skipped: number
   elapsedMs: number
   rows: SweepRow[]
+  // The shared calendar window every row was evaluated over (null when
+  // sharedWindow was disabled or no overlap could be computed) - surfaced so
+  // the UI/caller can show exactly what range the ranking is based on.
+  sharedWindow: { start: number; end: number } | null
 }
 
 // ---------- param warmup profile ----------
@@ -106,8 +120,53 @@ function strategyWarmup(id: string): number {
   return 80
 }
 
+// ---------- deterministic PRNG ----------
+// mulberry32: tiny, fast, seedable. Used instead of Math.random() so a grid
+// that gets randomly sampled down to maxCombos is reproducible - re-running
+// the exact same optimize/walk-forward request produces the exact same
+// sampled combos and therefore the exact same result, which matters for
+// professional use (auditability, comparing "before vs after" a code change).
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0
+  return () => {
+    a |= 0
+    a = (a + 0x6d2b79f5) | 0
+    let t = Math.imul(a ^ (a >>> 15), 1 | a)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+function hashSeed(s: string): number {
+  let h = 2166136261
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i)
+    h = Math.imul(h, 16777619)
+  }
+  return h >>> 0
+}
+
+// Wilson score interval - the standard, textbook way to bound a binomial
+// proportion's confidence interval; unlike the naive normal approximation it
+// stays well-behaved (never leaves [0,100]) at small n or extreme win rates.
+function wilsonInterval(wins: number, total: number, z = 1.96): [number, number] {
+  if (total <= 0) return [0, 0]
+  const p = wins / total
+  const denom = 1 + (z * z) / total
+  const center = p + (z * z) / (2 * total)
+  const margin = z * Math.sqrt((p * (1 - p)) / total + (z * z) / (4 * total * total))
+  const low = (center - margin) / denom
+  const high = (center + margin) / denom
+  return [Math.max(0, low * 100), Math.min(100, high * 100)]
+}
+
 // ---------- grid expansion ----------
-export function expandGrid(strat: StrategyDef, sweep: SweepSpec, maxCombos: number): {
+export function expandGrid(
+  strat: StrategyDef,
+  sweep: SweepSpec,
+  maxCombos: number,
+  seed?: number
+): {
   combos: Record<string, number | string>[]
   total: number
   truncated: boolean
@@ -149,12 +208,16 @@ export function expandGrid(strat: StrategyDef, sweep: SweepSpec, maxCombos: numb
     }
     walk(0, {})
   } else {
-    // random sample without replacement when the full grid exceeds the cap
+    // random sample without replacement when the full grid exceeds the cap -
+    // deterministically seeded (defaults to a hash of the strategy id + swept
+    // keys + cap when the caller doesn't supply one) so the same request
+    // reproduces the exact same sampled combos every time.
+    const rng = mulberry32(seed ?? hashSeed(`${strat.id}:${keys.join(',')}:${cap}`))
     const stride = keys.map((_, i) => valueLists[i].length)
     const seen = new Set<string>()
     let guard = cap * 12
     while (combos.length < cap && guard-- > 0) {
-      const pick = stride.map((n) => Math.floor(Math.random() * n))
+      const pick = stride.map((n) => Math.floor(rng() * n))
       const sig = pick.join(',')
       if (seen.has(sig)) continue
       seen.add(sig)
@@ -177,13 +240,33 @@ const emptyMetrics = (): FastMetrics => ({
   sharpe: 0,
   expectancy: 0,
   finalEquity: 0,
+  winRateCiLow: 0,
+  winRateCiHigh: 0,
+  lowSample: true,
 })
+
+const MIN_SAMPLE_FOR_SIGNIFICANCE = 30
 
 export function fastBacktest(
   candles: Candle[],
   strategyId: string,
   params: Record<string, number | string>,
-  opts: { payout?: number; amount?: number; expiryBars?: number; startEquity?: number; warmup?: number } = {}
+  opts: {
+    payout?: number
+    amount?: number
+    expiryBars?: number
+    startEquity?: number
+    warmup?: number
+    // Round-trip cost modeling (all default to 0, i.e. today's zero-cost
+    // behavior is unchanged unless a caller opts in). spreadPct/slippagePct
+    // are applied against the entry price before settlement (matching how a
+    // real binary/spot fill would be worse than the raw mid-price close);
+    // commissionPct is taken off the stake on every trade regardless of
+    // outcome, matching a flat broker/platform fee.
+    spreadPct?: number
+    slippagePct?: number
+    commissionPct?: number
+  } = {}
 ): FastMetrics {
   const strat = getStrategy(strategyId)
   if (!strat) throw new Error(`Unknown strategy: ${strategyId}`)
@@ -193,8 +276,9 @@ export function fastBacktest(
   const warmup = Math.max(20, opts.warmup ?? strategyWarmup(strategyId))
   let equity = opts.startEquity ?? 1000
   const startEquity = equity
+  const costPct = Math.max(0, opts.spreadPct ?? 0) + Math.max(0, opts.slippagePct ?? 0)
+  const commissionPct = Math.max(0, opts.commissionPct ?? 0)
 
-  const window = Math.min(candles.length, Math.max(warmup + 120, 700))
   const trades: BacktestTrade[] = []
   const rets: number[] = []
   let peak = equity
@@ -205,16 +289,29 @@ export function fastBacktest(
 
   const stop = candles.length - expiryBars
   for (let i = warmup; i < stop; i++) {
-    const win = candles.slice(Math.max(0, i - window + 1), i + 1)
+    // Full history up to and including the decision candle - no look-ahead,
+    // and no truncation to a fixed trailing window either. Path-dependent
+    // strategies (markov-edge's chain, kalman-ou's OU fit, confluence-core's
+    // multi-signal state) read further back than a fixed window would allow,
+    // so a windowed evaluation here could silently diverge from what the
+    // full Single-Run engine (backtest.ts) would produce for the exact same
+    // params - which defeated the purpose of "verifying the top-3" against
+    // it. This matches backtest.ts's evalWindow exactly.
+    const win = candles.slice(0, i + 1)
     const ev = strat.evaluate(win, params)
     if (ev.direction === 'none') continue
-    const entry = candles[i].close
+    // Entry price is adjusted for spread/slippage in the unfavorable
+    // direction for the side taken, same as a real fill would be worse than
+    // the raw mid-price close.
+    const rawEntry = candles[i].close
+    const entry = ev.direction === 'call' ? rawEntry * (1 + costPct / 100) : rawEntry * (1 - costPct / 100)
     const exitCandle = candles[i + expiryBars]
     const stake = Math.min(amount, equity)
     if (stake <= 0) break
+    const commission = stake * (commissionPct / 100)
     const won = ev.direction === 'call' ? exitCandle.close > entry : exitCandle.close < entry
     const draw = exitCandle.close === entry
-    const pnl = draw ? 0 : won ? stake * payout : -stake
+    const pnl = (draw ? 0 : won ? stake * payout : -stake) - commission
     equity += pnl
     if (pnl > 0) {
       wins++
@@ -241,6 +338,7 @@ export function fastBacktest(
   const total = trades.length
   const avgTfSec = candles.length > 1 ? candles[candles.length - 1].time - candles[candles.length - 2].time : 60
   const periodsPerYear = (365 * 24 * 3600) / Math.max(1, avgTfSec)
+  const [ciLow, ciHigh] = wilsonInterval(wins, total)
   return {
     totalTrades: total,
     wins,
@@ -251,6 +349,9 @@ export function fastBacktest(
     sharpe: sharpeRatio(rets, periodsPerYear),
     expectancy: total ? (equity - startEquity) / total : 0,
     finalEquity: equity,
+    winRateCiLow: ciLow,
+    winRateCiHigh: ciHigh,
+    lowSample: total < MIN_SAMPLE_FOR_SIGNIFICANCE,
   }
 }
 
@@ -316,15 +417,28 @@ export interface GridSearchOptions {
   amount?: number
   expiryBars?: number
   startEquity?: number
+  // Round-trip cost modeling, all opt-in (default 0 - unchanged behavior
+  // unless the caller sets one). See fastBacktest's opts doc.
+  spreadPct?: number
+  slippagePct?: number
+  commissionPct?: number
 }
 
 export function gridSearch(candles: Candle[], asset: string, tf: Timeframe, opts: GridSearchOptions): GridSearchResult {
   const strat = getStrategy(opts.strategy)
   if (!strat) throw new Error(`Unknown strategy: ${opts.strategy}`)
   const objective = opts.objective ?? 'netPnl'
-  const minTrades = Math.max(1, opts.minTrades ?? 8)
+  const minTrades = Math.max(1, opts.minTrades ?? 20)
   const top = Math.max(1, Math.min(30, opts.top ?? 20))
-  const common = { payout: opts.payout, amount: opts.amount, expiryBars: opts.expiryBars, startEquity: opts.startEquity }
+  const common = {
+    payout: opts.payout,
+    amount: opts.amount,
+    expiryBars: opts.expiryBars,
+    startEquity: opts.startEquity,
+    spreadPct: opts.spreadPct,
+    slippagePct: opts.slippagePct,
+    commissionPct: opts.commissionPct,
+  }
   const sweptKeys = Object.keys(opts.sweep).filter((k) => strat.params.some((p) => p.key === k))
 
   const t0 = Date.now()
@@ -364,7 +478,11 @@ export function gridSearch(candles: Candle[], asset: string, tf: Timeframe, opts
           amount: opts.amount ?? 10,
           expiryBars: opts.expiryBars ?? 1,
           startEquity: opts.startEquity ?? 1000,
+          spreadPct: opts.spreadPct,
+          slippagePct: opts.slippagePct,
+          commissionPct: opts.commissionPct,
         })
+        const [fciLow, fciHigh] = wilsonInterval(full.metrics.wins, full.metrics.totalTrades)
         const fm: FastMetrics = {
           totalTrades: full.metrics.totalTrades,
           wins: full.metrics.wins,
@@ -375,6 +493,9 @@ export function gridSearch(candles: Candle[], asset: string, tf: Timeframe, opts
           sharpe: full.metrics.sharpe,
           expectancy: full.metrics.expectancy,
           finalEquity: full.metrics.finalEquity,
+          winRateCiLow: fciLow,
+          winRateCiHigh: fciHigh,
+          lowSample: full.metrics.totalTrades < MIN_SAMPLE_FOR_SIGNIFICANCE,
         }
         const fs = scoreOf(fm, objective, minTrades)
         if (Number.isFinite(fs)) {
@@ -417,10 +538,18 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
   const strat = getStrategy(opts.strategy)
   if (!strat) throw new Error(`Unknown strategy: ${opts.strategy}`)
   const objective = opts.objective ?? 'netPnl'
-  const minTrades = Math.max(1, opts.minTrades ?? 6)
+  const minTrades = Math.max(1, opts.minTrades ?? 10)
   const folds = Math.max(2, Math.min(5, Math.round(opts.folds ?? 3)))
   const isRatio = Math.max(0.5, Math.min(0.85, opts.isRatio ?? 0.7))
-  const common = { payout: opts.payout, amount: opts.amount, expiryBars: opts.expiryBars, startEquity: opts.startEquity }
+  const common = {
+    payout: opts.payout,
+    amount: opts.amount,
+    expiryBars: opts.expiryBars,
+    startEquity: opts.startEquity,
+    spreadPct: opts.spreadPct,
+    slippagePct: opts.slippagePct,
+    commissionPct: opts.commissionPct,
+  }
   const warmup = strategyWarmup(strat.id)
 
   const t0 = Date.now()
@@ -495,7 +624,11 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
       expiryBars: opts.expiryBars ?? 1,
       startEquity: 1000,
       warmupBars: oosWarmup,
+      spreadPct: opts.spreadPct,
+      slippagePct: opts.slippagePct,
+      commissionPct: opts.commissionPct,
     })
+    const [oosCiLow, oosCiHigh] = wilsonInterval(oosFull.metrics.wins, oosFull.metrics.totalTrades)
     const oosM: FastMetrics = {
       totalTrades: oosFull.metrics.totalTrades,
       wins: oosFull.metrics.wins,
@@ -506,6 +639,9 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
       sharpe: oosFull.metrics.sharpe,
       expectancy: oosFull.metrics.expectancy,
       finalEquity: oosFull.metrics.finalEquity,
+      winRateCiLow: oosCiLow,
+      winRateCiHigh: oosCiHigh,
+      lowSample: oosFull.metrics.totalTrades < MIN_SAMPLE_FOR_SIGNIFICANCE,
     }
     outFolds.push({ fold: f + 1, isBars: isSlice.length, oosBars: oosSlice.length, bestParams: bestCombo, is: bestIsMetrics, oos: oosM })
     oosMetrics.push(oosM)
@@ -529,6 +665,10 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
   agg.winRate = agg.totalTrades ? (agg.wins / agg.totalTrades) * 100 : 0
   agg.expectancy = agg.totalTrades ? agg.netPnl / agg.totalTrades : 0
   agg.maxDrawdownPct = Math.max(0, ...oosMetrics.map((m) => m.maxDrawdownPct))
+  const [aggCiLow, aggCiHigh] = wilsonInterval(agg.wins, agg.totalTrades)
+  agg.winRateCiLow = aggCiLow
+  agg.winRateCiHigh = aggCiHigh
+  agg.lowSample = agg.totalTrades < MIN_SAMPLE_FOR_SIGNIFICANCE
   // Pooled, trade-level aggregate stats instead of averaging each fold's own
   // ratio (averaging Sharpe ratios or profit factors across folds is not
   // statistically valid - a ratio computed over a pooled series is not the
@@ -577,6 +717,16 @@ export interface AssetSweepOptions {
   expiryBars?: number
   startEquity?: number
   maxAssets?: number
+  spreadPct?: number
+  slippagePct?: number
+  commissionPct?: number
+  // When true (default), every asset is evaluated over the SAME overlapping
+  // time window (the intersection of all fetched assets' candle ranges)
+  // instead of each asset's own most-recent N candles - otherwise "rank
+  // fairly" is comparing, say, one asset's Jan-Mar performance against
+  // another's Feb-Apr, which can be a meaningfully different market regime.
+  // Set false to restore the old per-asset "most recent candles" behavior.
+  sharedWindow?: boolean
 }
 
 export interface CandleFetcher {
@@ -592,17 +742,45 @@ export function sweepAssets(
   const strat = getStrategy(opts.strategy)
   if (!strat) throw new Error(`Unknown strategy: ${opts.strategy}`)
   const objective = opts.objective ?? 'netPnl'
-  const minTrades = Math.max(1, opts.minTrades ?? 8)
+  const minTrades = Math.max(1, opts.minTrades ?? 20)
   const base = defaultParams(strat)
   const params = { ...base, ...(opts.params ?? {}) }
   const t0 = Date.now()
   const rows: SweepRow[] = []
   let skipped = 0
   const cap = Math.max(1, Math.min(80, opts.maxAssets ?? 40))
+  const sharedWindow = opts.sharedWindow !== false
+  const picked = assets.slice(0, cap)
 
-  for (const a of assets.slice(0, cap)) {
+  // Pass 1: fetch every asset's candles up front. Needed either way (to build
+  // the shared window below), and keeps a single fetch per asset regardless.
+  const fetched: { a: (typeof picked)[number]; candles: Candle[] }[] = []
+  for (const a of picked) {
     try {
       const candles = fetchCandles(a.ticker)
+      if (candles.length >= 300) fetched.push({ a, candles })
+      else skipped++
+    } catch {
+      skipped++
+    }
+  }
+
+  // Shared time window: intersect every asset's [first, last] candle
+  // timestamp so every asset is judged over the exact same calendar range,
+  // not each asset's own arbitrary "most recent N candles" (which can span a
+  // different market regime per asset otherwise).
+  let winStart = -Infinity
+  let winEnd = Infinity
+  if (sharedWindow) {
+    for (const { candles } of fetched) {
+      winStart = Math.max(winStart, candles[0].time)
+      winEnd = Math.min(winEnd, candles[candles.length - 1].time)
+    }
+  }
+
+  for (const { a, candles: allCandles } of fetched) {
+    try {
+      const candles = sharedWindow && winStart < winEnd ? allCandles.filter((c) => c.time >= winStart && c.time <= winEnd) : allCandles
       if (candles.length < 300) {
         skipped++
         continue
@@ -619,6 +797,9 @@ export function sweepAssets(
         amount: opts.amount,
         expiryBars: opts.expiryBars,
         startEquity: opts.startEquity,
+        spreadPct: opts.spreadPct,
+        slippagePct: opts.slippagePct,
+        commissionPct: opts.commissionPct,
       })
       const score = scoreOf(m, objective, minTrades)
       rows.push({ asset: a.ticker, category: a.category, open: a.open, payout: a.payout, metrics: m, score })
@@ -637,5 +818,6 @@ export function sweepAssets(
     skipped,
     elapsedMs: Date.now() - t0,
     rows,
+    sharedWindow: sharedWindow && winStart < winEnd ? { start: winStart, end: winEnd } : null,
   }
 }

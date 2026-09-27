@@ -18,6 +18,15 @@ export interface BacktestOptions {
   slPct?: number // spot mode stop-loss %
   maxBars?: number // spot mode max holding bars
   warmupBars?: number // indicator warmup guard (default 220 for ema200-class)
+  // Round-trip cost modeling, all opt-in (default 0 - unchanged behavior
+  // unless set). spreadPct/slippagePct move the fill price against the side
+  // taken before settlement; commissionPct is taken off the stake on every
+  // trade regardless of outcome. Mirrors optimize.ts's fastBacktest so the
+  // Single-Run lab and the Optimizer/Walk-Forward/Asset-Sweep labs can be
+  // compared apples-to-apples when cost modeling is turned on.
+  spreadPct?: number
+  slippagePct?: number
+  commissionPct?: number
 }
 
 export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: BacktestOptions): BacktestResult {
@@ -30,6 +39,8 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
   const expiryBars = Math.max(1, opts.expiryBars ?? 1)
   let equity = opts.startEquity ?? 1000
   const startEquity = equity
+  const costPct = Math.max(0, opts.spreadPct ?? 0) + Math.max(0, opts.slippagePct ?? 0)
+  const commissionPct = Math.max(0, opts.commissionPct ?? 0)
 
   const trades: BacktestTrade[] = []
   const equityCurve: { time: number; value: number }[] = []
@@ -44,13 +55,15 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
       const evalWindow = candles.slice(0, i + 1)
       const ev = strat.evaluate(evalWindow, params)
       if (ev.direction === 'none') continue
-      const entry = candles[i].close
+      const rawEntry = candles[i].close
+      const entry = ev.direction === 'call' ? rawEntry * (1 + costPct / 100) : rawEntry * (1 - costPct / 100)
       const exitCandle = candles[i + expiryBars]
       const stake = Math.min(amount, equity)
       if (stake <= 0) break
+      const commission = stake * (commissionPct / 100)
       const won = ev.direction === 'call' ? exitCandle.close > entry : exitCandle.close < entry
       const draw = exitCandle.close === entry
-      const pnl = draw ? 0 : won ? stake * payout : -stake
+      const pnl = (draw ? 0 : won ? stake * payout : -stake) - commission
       equity += pnl
       rets.push(pnl / Math.max(stake, 0.01))
       trades.push({
@@ -86,9 +99,13 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
             : strat.evaluate([...candles.slice(0, i + 1)], params)
         const flipped = evNow.direction !== 'none' && evNow.direction !== open.side
         if (hitTP || hitSL || open.bars >= maxBars || flipped) {
-          const exit = candle.close
+          const rawExit = candle.close
+          // Exit fill also moves against the position (selling into the bid /
+          // buying into the ask), same direction of unfavorability as entry.
+          const exit = open.side === 'call' ? rawExit * (1 - costPct / 100) : rawExit * (1 + costPct / 100)
           const direction = open.side === 'call' ? 1 : -1
-          const pnl = (exit - open.entry) / open.entry * amount * direction
+          const commission = amount * (commissionPct / 100)
+          const pnl = ((exit - open.entry) / open.entry) * amount * direction - commission
           equity += pnl
           rets.push(pnl / Math.max(amount, 0.01))
           trades.push({
