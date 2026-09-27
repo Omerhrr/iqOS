@@ -372,6 +372,20 @@ export default function OSPage() {
     return () => clearInterval(t)
   }, [])
 
+  // Drop stale overlay data the instant asset/tf changes, BEFORE the refetch
+  // below resolves. Without this, ChartPanel briefly renders the OLD asset's
+  // overlay values (wrong price magnitude/timestamps) against the NEW
+  // asset's candles - since overlay lines share the main price scale with
+  // the candlesticks, that stray old-asset data forces the shared scale to
+  // stretch to fit it, squeezing the real candles into a thin strip and
+  // leaving the stale overlay as a disconnected floating zig-zag (most of
+  // its points get filtered out as out-of-range/non-finite). React commits
+  // effects in declaration order, so this one clears state before the
+  // overlay-refetch effect below kicks off its request.
+  useEffect(() => {
+    setOverlaySeries([])
+  }, [asset, tf])
+
   // fetch overlay series when overlays/asset/tf change
   const overlayKey = useMemo(
     () => activeOverlays.map((o) => `${o.id}:${JSON.stringify(o.params ?? {})}`).join('|'),
@@ -551,21 +565,35 @@ export default function OSPage() {
     </PanelResizeHandle>
   )
 
+  // drag-reorder for sub-panes - swap two entries in the activeSubs array.
+  // Shared by both layouts so a reorder made on mobile sticks on desktop too.
+  const reorderSubs = useCallback((from: number, to: number) => {
+    setActiveSubs((prev) => {
+      if (from < 0 || from >= prev.length || to < 0 || to >= prev.length || from === to) return prev
+      const next = [...prev]
+      const [moved] = next.splice(from, 1)
+      next.splice(to, 0, moved)
+      return next
+    })
+  }, [])
+
   // shared chart workspace (chart + sub-panes) - mounted by whichever layout is active.
   // MOBILE: fixed-height stack (touch resizing is miserable) - main chart flexes,
-  // every sub-pane keeps its 130px.
+  // every sub-pane keeps its 130px, but the stacking order is still drag-reorderable.
   const chartWorkspace = (
     <>
       <div className="min-h-[280px] flex-1">
         <ChartPanel candles={candles} analysis={analysis} price={livePrice} digitsTicker={asset} chartType={chartType} overlays={overlaySeries} positions={positions} settledPositions={history} />
       </div>
-      {activeSubs.map((s) => (
+      {activeSubs.map((s, i) => (
         <SubPane
           key={`${s.id}:${JSON.stringify(s.params ?? {})}`}
           id={s.id}
           asset={asset}
           tf={tf}
           params={s.params}
+          dragIndex={activeSubs.length > 1 ? i : undefined}
+          onReorder={activeSubs.length > 1 ? reorderSubs : undefined}
           onRemove={() => setActiveSubs((prev) => prev.filter((x) => x.id !== s.id))}
         />
       ))}
@@ -574,24 +602,39 @@ export default function OSPage() {
   // DESKTOP: fully resizable stack - the main chart and EVERY sub-pane are
   // panels of one vertical group separated by drag handles. Percentages
   // persist (autoSaveId), so the operator's layout survives reloads and
-  // adding a pane just re-splits the space.
+  // adding a pane just re-splits the space. Panels carry a stable `id` (the
+  // indicator key, not array position) so react-resizable-panels keeps each
+  // pane's own saved size attached to it across a drag-reorder instead of
+  // the size sticking to whichever slot used to be at that index.
   const chartStack = (
     <PanelGroup direction="vertical" autoSaveId="iqos:chartstack" className="min-h-0 flex-1">
-      <Panel defaultSize={58} minSize={20}>
+      <Panel id="chart" defaultSize={58} minSize={20}>
         <div className="h-full min-h-0">
           <ChartPanel candles={candles} analysis={analysis} price={livePrice} digitsTicker={asset} chartType={chartType} overlays={overlaySeries} positions={positions} settledPositions={history} />
         </div>
       </Panel>
-      {activeSubs.map((s) => (
-        <Fragment key={`${s.id}:${JSON.stringify(s.params ?? {})}`}>
-          {hHandle}
-          <Panel defaultSize={21} minSize={6}>
-            <div className="h-full min-h-0">
-              <SubPane id={s.id} asset={asset} tf={tf} params={s.params} fill onRemove={() => setActiveSubs((prev) => prev.filter((x) => x.id !== s.id))} />
-            </div>
-          </Panel>
-        </Fragment>
-      ))}
+      {activeSubs.map((s, i) => {
+        const panelKey = `${s.id}:${JSON.stringify(s.params ?? {})}`
+        return (
+          <Fragment key={panelKey}>
+            {hHandle}
+            <Panel id={panelKey} defaultSize={21} minSize={6}>
+              <div className="h-full min-h-0">
+                <SubPane
+                  id={s.id}
+                  asset={asset}
+                  tf={tf}
+                  params={s.params}
+                  fill
+                  dragIndex={activeSubs.length > 1 ? i : undefined}
+                  onReorder={activeSubs.length > 1 ? reorderSubs : undefined}
+                  onRemove={() => setActiveSubs((prev) => prev.filter((x) => x.id !== s.id))}
+                />
+              </div>
+            </Panel>
+          </Fragment>
+        )
+      })}
     </PanelGroup>
   )
 
