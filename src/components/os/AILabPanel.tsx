@@ -28,9 +28,18 @@ const KIND_CHIP: Record<string, string> = {
   indicator: 'text-fuchsia-300 border-fuchsia-500/40 bg-fuchsia-500/10',
 }
 
+// Every field read here beyond the pre-existing core metrics was added
+// alongside a backend deploy - the frontend (iqos-web) and backend
+// (iqos-kernel) are two separately-rebuilt Docker services, so there is
+// always a window where one has redeployed and the other hasn't yet. A
+// response from the not-yet-rebuilt kernel simply omits the new fields
+// (undefined, not null/0), so every access below falls back to a safe
+// default instead of assuming the field exists.
 function MetricStrip({ label, m, breakeven }: { label: string; m: LabSimMetrics | null; breakeven: number }) {
   if (!m) return null
   const good = m.winRate >= breakeven
+  const ciLow = m.winRateCiLow ?? 0
+  const ciHigh = m.winRateCiHigh ?? 0
   return (
     <div className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-2.5">
       <div className="text-[9px] uppercase tracking-wider text-[#4b5a72]">{label}</div>
@@ -44,7 +53,7 @@ function MetricStrip({ label, m, breakeven }: { label: string; m: LabSimMetrics 
         </span>
         <span className="text-[#7c8aa5]">
           win{' '}
-          <span className={good ? 'text-emerald-400' : 'text-rose-400'} title={`95% CI ${m.winRateCiLow.toFixed(0)}–${m.winRateCiHigh.toFixed(0)}%`}>
+          <span className={good ? 'text-emerald-400' : 'text-rose-400'} title={`95% CI ${ciLow.toFixed(0)}–${ciHigh.toFixed(0)}%`}>
             {m.winRate.toFixed(1)}%
           </span>
           <span className="text-[10px] text-[#4b5a72]"> / BE {breakeven.toFixed(1)}%</span>
@@ -62,7 +71,7 @@ function MetricStrip({ label, m, breakeven }: { label: string; m: LabSimMetrics 
           maxDD <span className="text-rose-400">-{fmtMoney(m.maxDrawdown)}</span>
         </span>
         <span className="col-span-3 text-[10px] text-[#4b5a72]">
-          95% CI on win rate: {m.winRateCiLow.toFixed(0)}–{m.winRateCiHigh.toFixed(0)}%
+          95% CI on win rate: {ciLow.toFixed(0)}–{ciHigh.toFixed(0)}%
         </span>
       </div>
     </div>
@@ -76,16 +85,17 @@ const REGIME_STYLE: Record<string, string> = {
   MIXED: 'text-[#7c8aa5] border-[#1c2739] bg-[#101828]',
 }
 
-function FoldsStrip({ folds, foldsProfitable, breakeven }: { folds: LabSimMetrics[]; foldsProfitable: number; breakeven: number }) {
-  if (!folds.length) return null
+function FoldsStrip({ folds, foldsProfitable, breakeven }: { folds: LabSimMetrics[] | undefined; foldsProfitable: number | undefined; breakeven: number }) {
+  if (!folds?.length) return null
+  const done = foldsProfitable ?? 0
   return (
     <div className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-2.5">
       <div className="flex items-center justify-between">
         <div className="text-[9px] uppercase tracking-wider text-[#4b5a72]">
           out-of-sample folds (last 40%, same spec replayed with no re-tuning)
         </div>
-        <span className={`font-mono text-[10px] font-bold ${foldsProfitable >= Math.ceil(folds.length / 2) ? 'text-emerald-400' : 'text-rose-400'}`}>
-          {foldsProfitable}/{folds.length} profitable
+        <span className={`font-mono text-[10px] font-bold ${done >= Math.ceil(folds.length / 2) ? 'text-emerald-400' : 'text-rose-400'}`}>
+          {done}/{folds.length} profitable
         </span>
       </div>
       <div className="mt-1.5 grid grid-cols-3 gap-1.5">
@@ -339,9 +349,11 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
             <span>
               {result.asset} · {result.tf} · <span className={result.basis !== 'candles' ? 'text-emerald-300' : ''}>{result.basis === 'heikin' ? 'heiken-ashi basis' : result.basis === 'kalman' ? 'kalman-smoothed basis' : 'raw candle basis'}</span> · {result.candlesTested} bars · horizon {result.horizon} · min n {result.minSamples} · min edge {result.minEdge}pts
             </span>
-            <span className={`rounded border px-1.5 py-0.5 text-[9px] uppercase ${REGIME_STYLE[result.regime] ?? REGIME_STYLE.MIXED}`} title="market regime detected over the learned window">
-              {result.regime.toLowerCase()}
-            </span>
+            {result.regime && (
+              <span className={`rounded border px-1.5 py-0.5 text-[9px] uppercase ${REGIME_STYLE[result.regime] ?? REGIME_STYLE.MIXED}`} title="market regime detected over the learned window">
+                {result.regime.toLowerCase()}
+              </span>
+            )}
           </div>
           {result.confluenceWeak && (
             <div className="rounded border border-amber-500/30 bg-amber-500/5 px-2 py-1.5 font-mono text-[10px] text-amber-300">

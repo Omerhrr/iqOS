@@ -373,7 +373,11 @@ function SingleTab({ asset, strategies }: { asset: string; strategies: StrategyI
                   'Win rate',
                   `${m.winRate.toFixed(1)}%`,
                   m.winRate >= 50 ? 'text-emerald-400' : 'text-rose-400',
-                  `95% CI ${m.winRateCiLow.toFixed(0)}–${m.winRateCiHigh.toFixed(0)}%${m.lowSample ? ' · low sample' : ''}`,
+                  // Backend fields added alongside iqos-web/iqos-kernel are two
+                  // separately-rebuilt services - a response from a
+                  // not-yet-rebuilt kernel omits these, so default rather than
+                  // crash on undefined.
+                  `95% CI ${(m.winRateCiLow ?? 0).toFixed(0)}–${(m.winRateCiHigh ?? 0).toFixed(0)}%${m.lowSample ? ' · low sample' : ''}`,
                 ],
                 ['Profit factor', m.profitFactor.toFixed(2), m.profitFactor >= 1 ? 'text-emerald-400' : 'text-rose-400'],
                 ['Max drawdown', `${m.maxDrawdownPct.toFixed(1)}%`, 'text-amber-400'],
@@ -563,7 +567,7 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
                         <td className={`px-2 py-1.5 font-bold ${netCls(r.metrics.netPnl)}`}>{fmtMoney(r.metrics.netPnl)}</td>
                         <td
                           className={`px-2 py-1.5 ${r.metrics.winRate >= 50 ? 'text-emerald-400' : 'text-rose-400'}`}
-                          title={`95% CI ${r.metrics.winRateCiLow.toFixed(0)}–${r.metrics.winRateCiHigh.toFixed(0)}%`}
+                          title={`95% CI ${(r.metrics.winRateCiLow ?? 0).toFixed(0)}–${(r.metrics.winRateCiHigh ?? 0).toFixed(0)}%`}
                         >
                           {r.metrics.winRate.toFixed(0)}%
                         </td>
@@ -740,7 +744,7 @@ function WalkForwardTab({ asset, strategies }: { asset: string; strategies: Stra
                   'OOS win rate',
                   `${oos.winRate.toFixed(1)}%`,
                   oos.winRate >= 50 ? 'text-emerald-400' : 'text-rose-400',
-                  `95% CI ${oos.winRateCiLow.toFixed(0)}–${oos.winRateCiHigh.toFixed(0)}%${oos.lowSample ? ' · low sample' : ''}`,
+                  `95% CI ${(oos.winRateCiLow ?? 0).toFixed(0)}–${(oos.winRateCiHigh ?? 0).toFixed(0)}%${oos.lowSample ? ' · low sample' : ''}`,
                 ],
                 ['Consistency', `${result.foldsProfitable}/${result.folds.length} folds`, result.foldsProfitable >= result.folds.length / 2 ? 'text-emerald-400' : 'text-amber-400'],
                 ['OOS efficiency', `${result.efficiencyPct.toFixed(0)}%`, result.efficiencyPct > 0 ? 'text-emerald-400' : 'text-rose-400'],
@@ -775,7 +779,7 @@ function WalkForwardTab({ asset, strategies }: { asset: string; strategies: Stra
                     <td className={`px-2 py-1.5 font-bold ${netCls(f.oos.netPnl)}`}>{fmtMoney(f.oos.netPnl)}</td>
                     <td
                       className={`px-2 py-1.5 ${f.oos.winRate >= 50 ? 'text-emerald-400' : 'text-rose-400'}`}
-                      title={`95% CI ${f.oos.winRateCiLow.toFixed(0)}–${f.oos.winRateCiHigh.toFixed(0)}%`}
+                      title={`95% CI ${(f.oos.winRateCiLow ?? 0).toFixed(0)}–${(f.oos.winRateCiHigh ?? 0).toFixed(0)}%`}
                     >
                       {f.oos.winRate.toFixed(0)}%
                     </td>
@@ -1022,7 +1026,7 @@ function SweepTab({
                     <td className={`px-2 py-1.5 font-bold ${netCls(r.metrics.netPnl)}`}>{fmtMoney(r.metrics.netPnl)}</td>
                     <td
                       className={`px-2 py-1.5 ${r.metrics.winRate >= 50 ? 'text-emerald-400' : 'text-rose-400'}`}
-                      title={`95% CI ${r.metrics.winRateCiLow.toFixed(0)}–${r.metrics.winRateCiHigh.toFixed(0)}%`}
+                      title={`95% CI ${(r.metrics.winRateCiLow ?? 0).toFixed(0)}–${(r.metrics.winRateCiHigh ?? 0).toFixed(0)}%`}
                     >
                       {r.metrics.winRate.toFixed(0)}%
                     </td>
