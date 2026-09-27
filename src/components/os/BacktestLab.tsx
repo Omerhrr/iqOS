@@ -732,10 +732,14 @@ function WalkForwardTab({ asset, strategies }: { asset: string; strategies: Stra
         </span>
       </div>
 
-      {error && <div className="rounded border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-[11px] text-rose-400">{error}</div>}
+      <div className="grid grid-cols-1 gap-3 xl:grid-cols-[300px_1fr]">
+        <SweepGridEditor strategy={strategy} value={sweepState} onChange={setSweepState} />
 
-      {result && oos && (
         <div className="space-y-3">
+          {error && <div className="rounded border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-[11px] text-rose-400">{error}</div>}
+
+          {result && oos && (
+            <>
           <div className="grid grid-cols-2 gap-2 md:grid-cols-5">
             {(
               [
@@ -806,8 +810,10 @@ function WalkForwardTab({ asset, strategies }: { asset: string; strategies: Stra
               onClick={() => setPromote(true)}
             />
           </div>
+            </>
+          )}
         </div>
-      )}
+      </div>
 
       {promote && result && strategy && (
         <PromoteBotDialog
@@ -851,6 +857,8 @@ function SweepTab({
   const [maxAssets, setMaxAssets] = useState('40')
   const [objective, setObjective] = useState<'netPnl' | 'sharpe' | 'profitFactor' | 'winRate' | 'expectancy'>('netPnl')
   const [minTrades, setMinTrades] = useState('20')
+  const [amount, setAmount] = useState('10')
+  const [expiryBars, setExpiryBars] = useState('1')
   const [spreadPct, setSpreadPct] = useState('0')
   const [slippagePct, setSlippagePct] = useState('0')
   const [commissionPct, setCommissionPct] = useState('0')
@@ -882,6 +890,8 @@ function SweepTab({
         params,
         objective,
         minTrades: Number(minTrades),
+        amount: Number(amount),
+        expiryBars: Number(expiryBars),
         spreadPct: Number(spreadPct),
         slippagePct: Number(slippagePct),
         commissionPct: Number(commissionPct),
@@ -931,7 +941,12 @@ function SweepTab({
           </div>
         </Field>
         <Field label="Cap">
-          <select value={maxAssets} onChange={(e) => setMaxAssets(e.target.value)} className={selCls}>
+          <select
+            value={maxAssets}
+            onChange={(e) => setMaxAssets(e.target.value)}
+            className={selCls}
+            title="Maximum number of assets from the selected universe to backtest in this run - a higher cap covers more of the universe but takes longer to run"
+          >
             {['20', '40', '60', '80'].map((n) => (
               <option key={n}>{n}</option>
             ))}
@@ -946,6 +961,12 @@ function SweepTab({
         </Field>
         <Field label="Min trades">
           <Input value={minTrades} onChange={(e) => setMinTrades(e.target.value)} className={`${inCls} w-14`} />
+        </Field>
+        <Field label="Stake $">
+          <Input value={amount} onChange={(e) => setAmount(e.target.value)} className={`${inCls} w-16`} />
+        </Field>
+        <Field label="Expiry bars">
+          <Input value={expiryBars} onChange={(e) => setExpiryBars(e.target.value)} className={`${inCls} w-14`} />
         </Field>
         <Field label="Spread %">
           <Input value={spreadPct} onChange={(e) => setSpreadPct(e.target.value)} className={`${inCls} w-14`} />
