@@ -738,7 +738,11 @@ const httpServer = createServer(async (req, res) => {
             params: (body.params as Record<string, number | string>) ?? undefined,
             objective: (body.objective as Objective) ?? 'netPnl',
             minTrades: body.minTrades !== undefined ? Number(body.minTrades) : 8,
-            payout: body.payout !== undefined ? Number(body.payout) : 0.85,
+            // Leave payout undefined by default so sweepAssets() can fall back to
+            // each asset's own real broker payout instead of a flat 0.85 for
+            // every instrument. An explicit body.payout still overrides (for an
+            // apples-to-apples what-if comparison across assets).
+            payout: body.payout !== undefined ? Number(body.payout) : undefined,
             amount: body.amount !== undefined ? Number(body.amount) : 10,
             expiryBars: body.expiryBars !== undefined ? Number(body.expiryBars) : 1,
             startEquity: body.startEquity !== undefined ? Number(body.startEquity) : 1000,

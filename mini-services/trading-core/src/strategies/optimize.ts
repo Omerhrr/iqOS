@@ -436,6 +436,10 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
   const outFolds: WalkForwardFold[] = []
   let isNet = 0
   const oosMetrics: FastMetrics[] = []
+  // Pooled OOS trade-level data across all folds, used to compute a single
+  // statistically valid aggregate Sharpe and profit factor at the end (see
+  // below) instead of naively averaging each fold's own ratio.
+  const pooledTrades: BacktestTrade[] = []
   let bestFoldScore = -Infinity
   let bestParams: Record<string, number | string> = strat.params.reduce((a, p) => ({ ...a, [p.key]: p.default }), {} as Record<string, number | string>)
 
@@ -452,8 +456,15 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
     let bestScore = -Infinity
     let bestCombo = combos[0] ?? ({} as Record<string, number | string>)
     let bestIsMetrics = emptyMetrics()
+    // In-sample param search must warm up each strategy's own indicators
+    // (markov-edge/confluence-core need 560 bars, kalman-ou-reversion 340,
+    // ema-trend 180) - a flat "60 or 20% of the slice" guard was letting
+    // slow-warming strategies pick "best params" off garbage/uninitialized
+    // signals, since their real warmup requirement is often larger than the
+    // whole IS slice.
+    const isWarmup = Math.min(strategyWarmup(strat.id), Math.floor(isSlice.length * 0.4))
     for (const combo of combos) {
-      const m = fastBacktest(isSlice, strat.id, combo, { ...common, warmup: Math.min(60, Math.floor(isSlice.length * 0.2)), startEquity: 1000 })
+      const m = fastBacktest(isSlice, strat.id, combo, { ...common, warmup: isWarmup, startEquity: 1000 })
       const s = scoreOf(m, objective, minTrades)
       if (Number.isFinite(s) && s > bestScore) {
         bestScore = s
@@ -498,6 +509,7 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
     }
     outFolds.push({ fold: f + 1, isBars: isSlice.length, oosBars: oosSlice.length, bestParams: bestCombo, is: bestIsMetrics, oos: oosM })
     oosMetrics.push(oosM)
+    pooledTrades.push(...oosFull.trades)
     isNet += bestIsMetrics.netPnl
     const oosScore = scoreOf(oosM, objective, 1)
     if (Number.isFinite(oosScore) && oosScore > bestFoldScore) {
@@ -516,11 +528,26 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
   }
   agg.winRate = agg.totalTrades ? (agg.wins / agg.totalTrades) * 100 : 0
   agg.expectancy = agg.totalTrades ? agg.netPnl / agg.totalTrades : 0
-  const grossPos = oosMetrics.reduce((a, m) => a + Math.max(0, m.netPnl), 0)
-  const grossNeg = Math.abs(oosMetrics.reduce((a, m) => a + Math.min(0, m.netPnl), 0))
-  agg.profitFactor = grossNeg > 0 ? grossPos / grossNeg : grossPos > 0 ? 99 : 0
   agg.maxDrawdownPct = Math.max(0, ...oosMetrics.map((m) => m.maxDrawdownPct))
-  agg.sharpe = oosMetrics.length ? oosMetrics.reduce((a, m) => a + m.sharpe, 0) / oosMetrics.length : 0
+  // Pooled, trade-level aggregate stats instead of averaging each fold's own
+  // ratio (averaging Sharpe ratios or profit factors across folds is not
+  // statistically valid - a ratio computed over a pooled series is not the
+  // same as the mean of the per-fold ratios, especially with uneven fold
+  // trade counts). profitFactor above (grossPos/grossNeg) was also fold-net
+  // based rather than true trade-level gross win/gross loss; both are now
+  // recomputed here from every OOS trade across all folds.
+  if (pooledTrades.length) {
+    const avgTfSec = candles.length > 1 ? candles[candles.length - 1].time - candles[candles.length - 2].time : 60
+    const periodsPerYear = (365 * 24 * 3600) / Math.max(1, avgTfSec)
+    const pooledRets = pooledTrades.map((t) => t.pnl / Math.max(t.amount, 0.01))
+    agg.sharpe = sharpeRatio(pooledRets, periodsPerYear)
+    const pooledGrossWin = pooledTrades.filter((t) => t.pnl > 0).reduce((a, t) => a + t.pnl, 0)
+    const pooledGrossLoss = Math.abs(pooledTrades.filter((t) => t.pnl < 0).reduce((a, t) => a + t.pnl, 0))
+    agg.profitFactor = pooledGrossLoss === 0 ? (pooledGrossWin > 0 ? 99 : 0) : pooledGrossWin / pooledGrossLoss
+  } else {
+    agg.sharpe = 0
+    agg.profitFactor = 0
+  }
 
   const foldsProfitable = oosMetrics.filter((m) => m.netPnl > 0).length
   return {
@@ -580,8 +607,15 @@ export function sweepAssets(
         skipped++
         continue
       }
+      // Per-asset real payout by default (each instrument's own broker payout,
+      // as reported live by the connected IQ account or curated in the
+      // catalog) - a single flat payout across every asset made "rank assets
+      // fairly" meaningless, since real payouts vary meaningfully (e.g. 0.75
+      // vs 0.92) between assets/categories. opts.payout, when the caller
+      // explicitly sets it, still overrides for an apples-to-apples what-if
+      // comparison.
       const m = fastBacktest(candles, strat.id, params, {
-        payout: opts.payout,
+        payout: opts.payout ?? (a.payout > 0 ? a.payout : undefined),
         amount: opts.amount,
         expiryBars: opts.expiryBars,
         startEquity: opts.startEquity,
