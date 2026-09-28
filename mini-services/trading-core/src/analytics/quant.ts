@@ -61,7 +61,7 @@ export function kurtosis(xs: number[]): number {
 }
 
 // Deterministic PRNG (mulberry32) so simulations are reproducible per request
-function rng(seed: number): () => number {
+export function rng(seed: number): () => number {
   let a = seed >>> 0
   return () => {
     a |= 0
@@ -72,7 +72,7 @@ function rng(seed: number): () => number {
   }
 }
 
-function gauss(r: () => number): number {
+export function gauss(r: () => number): number {
   let u = 0
   let v = 0
   while (u === 0) u = r()
@@ -178,6 +178,30 @@ export function markovChain(closesArr: number[], opts?: { lookback?: number; kBi
     regime,
     sampleSize: states.length,
   }
+}
+
+/** Generic first-order discrete Markov chain fit over an arbitrary integer
+ * state sequence (values 0..nStates-1) - Laplace-smoothed transition matrix,
+ * the last observed state, and the next-step transition probabilities from
+ * it. `markovChain` above is specialized to price-return states; this is the
+ * reusable core for any other hidden-state model (volatility regimes, order-
+ * flow imbalance, cross-asset correlation regimes, ...) built the same way. */
+export function fitDiscreteMarkov(
+  states: number[],
+  nStates: number
+): { matrix: number[][]; counts: number[][]; lastState: number; nextProbs: number[]; sampleSize: number } {
+  const counts: number[][] = Array.from({ length: nStates }, () => new Array(nStates).fill(0))
+  for (let i = 1; i < states.length; i++) {
+    const a = states[i - 1], b = states[i]
+    if (a >= 0 && a < nStates && b >= 0 && b < nStates) counts[a][b]++
+  }
+  const matrix = counts.map((row) => {
+    const total = row.reduce((a, b) => a + b, 0) + nStates
+    return row.map((c) => (c + 1) / total)
+  })
+  const lastState = states.length ? states[states.length - 1] : Math.floor(nStates / 2)
+  const nextProbs = matrix[lastState].slice()
+  return { matrix, counts, lastState, nextProbs, sampleSize: states.length }
 }
 
 // ---------- Monte Carlo ----------

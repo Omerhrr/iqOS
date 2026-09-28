@@ -120,6 +120,10 @@ function strategyWarmup(id: string): number {
   if (id === 'kalman-ou-breakout') return 300
   if (id === 'kalman-ou-adaptive-trend') return 200 // window + slopeLookback + slack
   if (id === 'kalman-ou-scalp') return 200
+  if (id === 'markov-vol-regime') return 280 // lookback + volWindow + slack
+  if (id === 'markov-flow-imbalance') return 100
+  if (id === 'mc-fairvalue-edge') return 320 // return-sample lookback + slack
+  if (id === 'kalman-mc-reversion-prob') return 260 // OU window + slack
   if (id === 'ema-trend') return 180
   return 80
 }

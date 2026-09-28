@@ -12,7 +12,7 @@ import type { Plugin, KernelContext } from '../kernel'
 import type { Store } from '../store'
 import type { Position } from '../types'
 import type { MarketDataService } from './market-data'
-import { logReturns, pearson } from '../analytics/quant'
+import { logReturns, pearson, fitDiscreteMarkov, rng, gauss } from '../analytics/quant'
 
 export interface SentinelConfig {
   maxExposurePct: number // max total open stake as % of balance (0 = off)
@@ -31,6 +31,39 @@ export interface SentinelConfig {
   /** |Pearson r| on recent 1m log-returns at/above which two assets are
    * treated as "the same bet" for the correlation cap above. */
   correlationThreshold: number
+  /** Correlation-REGIME guard: instead of only reading the instantaneous
+   * correlation, fits a discrete Markov chain over a rolling history of the
+   * portfolio's own average pairwise |r| (Decoupled/Normal/Panic states).
+   * When the chain shows a high transition probability INTO Panic - a
+   * systemic-correlation-convergence event, where "everything drops
+   * together" - the correlation cap is tightened pre-emptively, ahead of the
+   * plain rolling-window read confirming it. This is a real-money analog of
+   * "automatic portfolio rebalancing" - the platform has no inverse/short
+   * instrument to rotate into, so protection here means cutting the
+   * correlated-exposure allowance, not opening a hedge. */
+  correlationRegimeGuard: boolean
+  /** P(next state = Panic) from the current state that trips the tightened
+   * cap below. */
+  correlationPanicThreshold: number
+  /** correlationCapPct is replaced by this (tighter) % while a panic
+   * transition is flagged. */
+  correlationPanicCapPct: number
+  /** Joint Monte Carlo drawdown guard: simulates the OPEN portfolio's assets
+   * together (correlated shocks via Cholesky on their recent covariance, not
+   * independent per-asset draws - a systemic cascade needs the correlation
+   * baked into the simulation itself) and estimates the probability of a
+   * joint peak-to-trough drawdown past mcDrawdownThresholdPct within
+   * mcDrawdownHorizonBars. This is the same "run it forward, act on the
+   * distribution, not a fixed calendar" idea as the correlation-regime
+   * guard, aimed at the portfolio's actual future path instead of its
+   * current correlation reading. */
+  mcDrawdownGuard: boolean
+  mcDrawdownThresholdPct: number
+  mcDrawdownHorizonBars: number
+  mcDrawdownProbTrigger: number
+  /** maxExposurePct is replaced by this (tighter) % while the simulated
+   * breach probability is at/above mcDrawdownProbTrigger. */
+  mcDrawdownCapPct: number
 }
 
 export const DEFAULT_SENTINEL: SentinelConfig = {
@@ -42,6 +75,14 @@ export const DEFAULT_SENTINEL: SentinelConfig = {
   autoKillOnDrawdown: false,
   correlationCapPct: 20,
   correlationThreshold: 0.65,
+  correlationRegimeGuard: true,
+  correlationPanicThreshold: 0.55,
+  correlationPanicCapPct: 10,
+  mcDrawdownGuard: true,
+  mcDrawdownThresholdPct: 12,
+  mcDrawdownHorizonBars: 30,
+  mcDrawdownProbTrigger: 0.15,
+  mcDrawdownCapPct: 12,
 }
 
 export interface BreakerState {
@@ -77,6 +118,20 @@ export class SentinelService {
   private corrCache = new Map<string, { r: number; ts: number }>()
   private static readonly CORR_TTL_SEC = 300
   private static readonly CORR_BARS = 200
+  // rolling history of the portfolio's own average pairwise |r|, sampled once
+  // per evaluate() tick - the observation series the correlation-regime
+  // Markov chain is fit on. Calendar-time samples, not bar-indexed, since
+  // this tracks the PORTFOLIO's correlation state, not one asset's price.
+  private corrRegimeHistory: number[] = []
+  private static readonly CORR_REGIME_MAX_SAMPLES = 200
+  private static readonly CORR_REGIME_MIN_SAMPLES = 20
+  // joint-drawdown MC is the most expensive check here (O(assets^2) for the
+  // covariance/Cholesky build, then nSims*horizon correlated draws) and the
+  // open-position set rarely changes between preTrade calls a second apart -
+  // cache the breach probability briefly rather than re-simulating per order.
+  private mcDrawdownCache: { key: string; prob: number; ts: number } | null = null
+  private static readonly MC_DD_TTL_SEC = 60
+  private static readonly MC_DD_BARS = 300
   private breakers: Record<'daily' | 'drawdown', BreakerState> = {
     daily: { id: 'daily', label: 'DAILY LOSS', tripped: false, reason: '', ts: null },
     drawdown: { id: 'drawdown', label: 'DRAWDOWN', tripped: false, reason: '', ts: null },
@@ -188,6 +243,137 @@ export class SentinelService {
     return { total: Math.round(total * 100) / 100, assets: linked }
   }
 
+  /** One sample of the portfolio's current average pairwise |r| across every
+   * distinct pair of currently-open assets. Needs >=2 distinct assets open
+   * to mean anything; called from evaluate() so it accumulates on the same
+   * cadence as everything else (position lifecycle + account changes). */
+  private sampleCorrelationRegime(): void {
+    const assets = [...new Set(this.openPositions().map((p) => p.asset))]
+    if (assets.length < 2) return
+    let sum = 0, n = 0
+    for (let i = 0; i < assets.length; i++) {
+      for (let j = i + 1; j < assets.length; j++) {
+        sum += this.correlation(assets[i], assets[j])
+        n++
+      }
+    }
+    if (n === 0) return
+    this.corrRegimeHistory.push(sum / n)
+    if (this.corrRegimeHistory.length > SentinelService.CORR_REGIME_MAX_SAMPLES) {
+      this.corrRegimeHistory.shift()
+    }
+  }
+
+  /** Discrete Markov fit over the correlation-regime history: 3 states
+   * (Decoupled/Normal/Panic) classified by z-score against the history's own
+   * mean/stdev - the same adaptive-threshold pattern the price-return chain
+   * uses, applied to the portfolio's correlation level instead. Returns the
+   * current state and P(next = Panic) from it. */
+  correlationRegime(): { state: 'decoupled' | 'normal' | 'panic'; nextPanicProb: number; sample: number } {
+    const hist = this.corrRegimeHistory
+    if (hist.length < SentinelService.CORR_REGIME_MIN_SAMPLES) return { state: 'normal', nextPanicProb: 0, sample: hist.length }
+    const m = hist.reduce((a, b) => a + b, 0) / hist.length
+    const variance = hist.reduce((a, x) => a + (x - m) * (x - m), 0) / Math.max(1, hist.length - 1)
+    const sd = Math.sqrt(variance) || 1e-9
+    const classify = (v: number): number => {
+      const z = (v - m) / sd
+      if (z <= -0.4) return 0 // decoupled
+      if (z >= 0.6) return 2 // panic (correlation converging toward 1)
+      return 1 // normal
+    }
+    const states = hist.map(classify)
+    const chain = fitDiscreteMarkov(states, 3)
+    const labels = ['decoupled', 'normal', 'panic'] as const
+    return { state: labels[chain.lastState], nextPanicProb: chain.nextProbs[2], sample: hist.length }
+  }
+
+  /** Cholesky (lower-triangular) factor of a symmetric covariance matrix, so
+   * independent standard-normal draws can be transformed into correlated
+   * ones: L * z ~ N(0, cov). Ridge-stabilized (tiny diagonal add) so a
+   * near-singular covariance from short/overlapping histories never breaks
+   * the sqrt. Assumes a small matrix (portfolio-sized, not asset-universe). */
+  private cholesky(cov: number[][]): number[][] {
+    const n = cov.length
+    const L = Array.from({ length: n }, () => new Array(n).fill(0))
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j <= i; j++) {
+        let sum = cov[i][j]
+        for (let k = 0; k < j; k++) sum -= L[i][k] * L[j][k]
+        if (i === j) L[i][j] = Math.sqrt(Math.max(sum, 1e-12))
+        else L[i][j] = L[j][j] > 1e-12 ? sum / L[j][j] : 0
+      }
+    }
+    return L
+  }
+
+  /** Probability the OPEN portfolio suffers a joint peak-to-trough drawdown
+   * past `mcDrawdownThresholdPct` within `mcDrawdownHorizonBars` (1m bars) -
+   * simulated with the assets' actual recent covariance (Cholesky-correlated
+   * shocks), not treated as independent. Needs >=2 distinct open assets to
+   * mean anything as a SYSTEMIC read; returns 0 otherwise. Result is cached
+   * briefly since preTrade calls this on every order. */
+  jointDrawdownProbability(): { prob: number; sample: number; assets: string[] } {
+    const byAsset = this.exposure().byAsset
+    const assets = Object.keys(byAsset)
+    if (assets.length < 2) return { prob: 0, sample: 0, assets }
+    const total = assets.reduce((a, x) => a + byAsset[x], 0)
+    if (total <= 0) return { prob: 0, sample: 0, assets }
+    const key = assets.slice().sort().join(',')
+    const now = this.now()
+    if (this.mcDrawdownCache && this.mcDrawdownCache.key === key && now - this.mcDrawdownCache.ts < SentinelService.MC_DD_TTL_SEC) {
+      return { prob: this.mcDrawdownCache.prob, sample: assets.length, assets }
+    }
+    try {
+      const weights = assets.map((a) => byAsset[a] / total)
+      const retSeries = assets.map((a) => logReturns(this.market.getCandles(a, '1m', SentinelService.MC_DD_BARS).map((c) => c.close)))
+      const n = Math.min(...retSeries.map((r) => r.length))
+      if (n < 30) return { prob: 0, sample: n, assets }
+      const aligned = retSeries.map((r) => r.slice(-n))
+      const means = aligned.map((r) => r.reduce((a, b) => a + b, 0) / n)
+      const k = assets.length
+      const cov: number[][] = Array.from({ length: k }, () => new Array(k).fill(0))
+      for (let i = 0; i < k; i++) {
+        for (let j = 0; j < k; j++) {
+          let s = 0
+          for (let t = 0; t < n; t++) s += (aligned[i][t] - means[i]) * (aligned[j][t] - means[j])
+          cov[i][j] = s / Math.max(1, n - 1)
+        }
+      }
+      const L = this.cholesky(cov)
+      const horizon = Math.max(1, Math.round(this.config.mcDrawdownHorizonBars))
+      const threshold = this.config.mcDrawdownThresholdPct / 100
+      const nSims = 1500
+      const seed = (Math.round(total * 1000) ^ (k * 2654435761) ^ n) >>> 0
+      const r = rng(seed || 1)
+      let breaches = 0
+      for (let s = 0; s < nSims; s++) {
+        let value = 1
+        let peak = 1
+        let breached = false
+        for (let t = 0; t < horizon; t++) {
+          const z: number[] = []
+          for (let i = 0; i < k; i++) z.push(gauss(r))
+          let portRet = 0
+          for (let i = 0; i < k; i++) {
+            let shock = means[i]
+            for (let j = 0; j <= i; j++) shock += L[i][j] * z[j]
+            portRet += weights[i] * shock
+          }
+          value *= 1 + portRet
+          if (value > peak) peak = value
+          const dd = (peak - value) / peak
+          if (dd >= threshold) { breached = true; break }
+        }
+        if (breached) breaches++
+      }
+      const prob = breaches / nSims
+      this.mcDrawdownCache = { key, prob, ts: now }
+      return { prob, sample: n, assets }
+    } catch {
+      return { prob: 0, sample: 0, assets }
+    }
+  }
+
   tradesLastHour(): number {
     const cutoff = this.now() - 3600
     this.tradeTs = this.tradeTs.filter((t) => t >= cutoff)
@@ -224,6 +410,7 @@ export class SentinelService {
 
   /** Re-check both breakers against live account metrics; trip/untrip as needed. */
   evaluate(): void {
+    if (this.config.correlationRegimeGuard) this.sampleCorrelationRegime()
     const acct = this.store.getAccount()
     const dayLoss = acct.dayStartBalance - acct.balance
 
@@ -300,12 +487,21 @@ export class SentinelService {
     // exposure caps
     const exp = this.exposure()
     if (this.config.maxExposurePct > 0 && acct.balance > 0) {
-      const cap = (acct.balance * this.config.maxExposurePct) / 100
-      if (exp.total + amount > cap)
+      // joint MC drawdown guard: a high simulated probability of a systemic
+      // cascade tightens the exposure cap pre-emptively - the Monte Carlo
+      // analog of the correlation-regime tightening above, aimed at the
+      // portfolio's actual forward path rather than its current reading.
+      const dd = this.config.mcDrawdownGuard ? this.jointDrawdownProbability() : null
+      const ddTriggered = dd !== null && dd.sample >= 30 && dd.prob >= this.config.mcDrawdownProbTrigger
+      const effExposurePct = ddTriggered ? Math.min(this.config.maxExposurePct, this.config.mcDrawdownCapPct) : this.config.maxExposurePct
+      const cap = (acct.balance * effExposurePct) / 100
+      if (exp.total + amount > cap) {
+        const ddTag = ddTriggered ? ` [MC joint-drawdown guard: P(>=${this.config.mcDrawdownThresholdPct}% dd in ${this.config.mcDrawdownHorizonBars}b) = ${(dd!.prob * 100).toFixed(0)}% - cap tightened to ${effExposurePct}%]` : ''
         return {
           ok: false,
-          reason: `sentinel: exposure cap - open stake $${exp.total.toFixed(2)} + $${amount.toFixed(2)} would exceed ${this.config.maxExposurePct}% of balance ($${cap.toFixed(2)})`,
+          reason: `sentinel: exposure cap - open stake $${exp.total.toFixed(2)} + $${amount.toFixed(2)} would exceed ${effExposurePct}% of balance ($${cap.toFixed(2)})${ddTag}`,
         }
+      }
     }
     if (this.config.perAssetCapPct > 0 && acct.balance > 0) {
       const cap = (acct.balance * this.config.perAssetCapPct) / 100
@@ -321,12 +517,20 @@ export class SentinelService {
     // open positions is really adding to ONE bet, not opening a diversified
     // new one - cap the combined stake, not just this asset's own line.
     if (this.config.correlationCapPct > 0 && acct.balance > 0) {
+      // correlation-regime guard: a high P(next = Panic) tightens the cap
+      // BEFORE the instantaneous |r| read would itself confirm the
+      // convergence - catching the systemic "everything drops together"
+      // transition ahead of a plain rolling-window correlation check.
+      const regime = this.config.correlationRegimeGuard ? this.correlationRegime() : null
+      const panicking = regime !== null && regime.nextPanicProb >= this.config.correlationPanicThreshold
+      const effCapPct = panicking ? Math.min(this.config.correlationCapPct, this.config.correlationPanicCapPct) : this.config.correlationCapPct
       const linked = this.correlatedExposure(asset)
-      const cap = (acct.balance * this.config.correlationCapPct) / 100
+      const cap = (acct.balance * effCapPct) / 100
       if (linked.total + amount > cap) {
+        const panicTag = panicking ? ` [correlation-regime PANIC transition, P=${(regime!.nextPanicProb * 100).toFixed(0)}% - cap tightened to ${effCapPct}%]` : ''
         return {
           ok: false,
-          reason: `sentinel: correlation cap - ${asset} is correlated (|r|>=${this.config.correlationThreshold}) with ${linked.assets.length ? linked.assets.join(', ') : 'its own open stake'}; combined stake $${linked.total.toFixed(2)} + $${amount.toFixed(2)} would exceed ${this.config.correlationCapPct}% of balance ($${cap.toFixed(2)})`,
+          reason: `sentinel: correlation cap - ${asset} is correlated (|r|>=${this.config.correlationThreshold}) with ${linked.assets.length ? linked.assets.join(', ') : 'its own open stake'}; combined stake $${linked.total.toFixed(2)} + $${amount.toFixed(2)} would exceed ${effCapPct}% of balance ($${cap.toFixed(2)})${panicTag}`,
         }
       }
     }
@@ -438,6 +642,8 @@ export class SentinelService {
       exposureCap: this.config.maxExposurePct > 0 ? Math.round(((bal * this.config.maxExposurePct) / 100) * 100) / 100 : 0,
       perAssetCap: this.config.perAssetCapPct > 0 ? Math.round(((bal * this.config.perAssetCapPct) / 100) * 100) / 100 : 0,
       correlationCap: this.config.correlationCapPct > 0 ? Math.round(((bal * this.config.correlationCapPct) / 100) * 100) / 100 : 0,
+      correlationRegime: this.config.correlationRegimeGuard ? this.correlationRegime() : null,
+      jointDrawdown: this.config.mcDrawdownGuard ? this.jointDrawdownProbability() : null,
       tradesLastHour: this.tradesLastHour(),
       openPositions: this.openPositions().length,
       maxOpenPositions,

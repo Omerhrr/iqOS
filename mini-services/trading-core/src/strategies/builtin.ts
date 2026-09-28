@@ -3,7 +3,7 @@
 // a directional eval out. Used by the Strategy Lab, the backtester and the agent.
 import type { StrategyDef } from '../types'
 import * as ta from '../analytics/indicators'
-import { markovChain } from '../analytics/quant'
+import { markovChain, fitDiscreteMarkov, logReturns, stdev, mean, rng, gauss } from '../analytics/quant'
 import { detectPatterns, patternBias } from '../analytics/patterns'
 import { ouEstimate, ouState } from '../analytics/kalman'
 import { vskEvaluate, VSK_DEFAULTS } from '../analytics/vsk'
@@ -117,6 +117,96 @@ export const STRATEGIES: StrategyDef[] = [
       if (m.probUp >= thr) return { direction: 'call', score: clamp((m.probUp - 0.5) * 260, 40, 95), notes: `P(up) ${upPct.toFixed(1)}% - regime ${m.regime}` }
       if (m.probDown >= thr) return { direction: 'put', score: clamp((m.probDown - 0.5) * 260, 40, 95), notes: `P(down) ${dnPct.toFixed(1)}% - regime ${m.regime}` }
       return { direction: 'none', score: 0, notes: `P(up) ${upPct.toFixed(1)}% vs P(down) ${dnPct.toFixed(1)}% - no edge` }
+    },
+  },
+  {
+    id: 'markov-vol-regime',
+    name: 'Markov Volatility Regime',
+    description: "Fits a discrete Markov chain over hidden volatility states (Compressed/Orderly/Toxic) from realized vol, not price direction. No options market here, so 'short premium expecting compression' has no binary-option analog and is skipped (stands aside) - but 'buy cheap gamma right before a Toxic flip' translates directly: when the chain gives a high transition probability OUT of Compressed and INTO Toxic, it fires the breakout direction off the recent range, the same trade a long-gamma option would want.",
+    params: [
+      { key: 'volWindow', label: 'Realized-vol window (bars)', type: 'number', min: 5, max: 40, default: 14 },
+      { key: 'lookback', label: 'Vol-state history (bars)', type: 'number', min: 100, max: 500, default: 240 },
+      { key: 'expansionProb', label: 'P(-> Toxic) trigger', type: 'number', min: 0.3, max: 0.9, step: 0.05, default: 0.55 },
+      { key: 'rangeLookback', label: 'Breakout-direction range', type: 'number', min: 5, max: 40, default: 20 },
+    ],
+    evaluate: (candles, p) => {
+      const volWindow = Math.round(num(p, 'volWindow', 14))
+      const lookback = Math.round(num(p, 'lookback', 240))
+      const expansionProb = num(p, 'expansionProb', 0.55)
+      const rangeLookback = Math.round(num(p, 'rangeLookback', 20))
+      const closesArr = candles.map((c) => c.close)
+      const need = lookback + volWindow + 5
+      if (closesArr.length < need) return { direction: 'none', score: 0, notes: `warming up (need ${need} bars)` }
+      // realized-vol series: rolling stdev of log returns, one reading per bar
+      // over the last `lookback` bars - this IS the "historical volatility"
+      // series the Markov chain is fit on, in place of raw returns.
+      const rets = logReturns(closesArr)
+      const volSeries: number[] = []
+      for (let i = volWindow; i < rets.length; i++) volSeries.push(stdev(rets.slice(i - volWindow, i)))
+      const recent = volSeries.slice(-lookback)
+      const volMean = mean(recent)
+      const volSd = stdev(recent) || 1e-12
+      const classify = (v: number): number => {
+        const z = (v - volMean) / volSd
+        if (z <= -0.4) return 0 // compressed
+        if (z >= 0.6) return 2 // toxic
+        return 1 // orderly
+      }
+      const states = recent.map(classify)
+      const chain = fitDiscreteMarkov(states, 3)
+      const label = ['Compressed', 'Orderly', 'Toxic'][chain.lastState]
+      if (chain.lastState === 0 && chain.nextProbs[2] >= expansionProb) {
+        // expansion imminent: pick the breakout side off the recent range,
+        // the direction a long-gamma bet would actually pay on
+        const dch = ta.donchian(candles.map((c) => c.high), candles.map((c) => c.low), rangeLookback)
+        const upper = dch.upper[dch.upper.length - 1]
+        const lower = dch.lower[dch.lower.length - 1]
+        const lastPrice = closesArr[closesArr.length - 1]
+        const pos = upper > lower ? (lastPrice - lower) / (upper - lower) : 0.5
+        const score = clamp(45 + (chain.nextProbs[2] - expansionProb) * 110, 40, 92)
+        if (pos >= 0.55) return { direction: 'call', score, notes: `Compressed -> Toxic P=${(chain.nextProbs[2] * 100).toFixed(0)}%, pressing range high - vol expansion setup` }
+        if (pos <= 0.45) return { direction: 'put', score, notes: `Compressed -> Toxic P=${(chain.nextProbs[2] * 100).toFixed(0)}%, pressing range low - vol expansion setup` }
+        return { direction: 'none', score: 0, notes: `Toxic flip likely (P=${(chain.nextProbs[2] * 100).toFixed(0)}%) but price mid-range - no side yet` }
+      }
+      if (chain.lastState === 2 && chain.nextProbs[0] >= expansionProb) {
+        return { direction: 'none', score: 0, notes: `Toxic -> Compressed P=${(chain.nextProbs[0] * 100).toFixed(0)}% - a premium-selling setup with no binary-option analog, standing aside` }
+      }
+      return { direction: 'none', score: 0, notes: `regime ${label}, no transition edge (P(Toxic) ${(chain.nextProbs[2] * 100).toFixed(0)}%, P(Compressed) ${(chain.nextProbs[0] * 100).toFixed(0)}%)` }
+    },
+  },
+  {
+    id: 'markov-flow-imbalance',
+    name: 'Markov Flow Imbalance (OHLC proxy)',
+    description: "Approximates order-flow imbalance from OHLC candles (close position within the bar's range, and body-vs-range dominance) since no Level-2 order book feed exists here - true bid/ask depth and cancellation-rate modeling is not possible on this data. Fits a fast discrete Markov chain over 3 imbalance states (Bid-heavy/Balanced/Ask-heavy) on a short lookback and trades continuation the moment the chain shows high persistence toward one side - the closest honest analog to trading a detected order-flow regime, not a substitute for real LOB microstructure.",
+    params: [
+      { key: 'lookback', label: 'Imbalance-state history (bars)', type: 'number', min: 30, max: 200, default: 80 },
+      { key: 'persistProb', label: 'Persistence trigger P(stay)', type: 'number', min: 0.4, max: 0.95, step: 0.05, default: 0.6 },
+    ],
+    evaluate: (candles, p) => {
+      const lookback = Math.round(num(p, 'lookback', 80))
+      const persistProb = num(p, 'persistProb', 0.6)
+      if (candles.length < lookback + 5) return { direction: 'none', score: 0, notes: 'warming up' }
+      const window = candles.slice(-lookback)
+      // imbalance proxy per bar: where close sits in the bar's range, signed
+      // by whether the bar closed up or down - a stand-in for "aggressive
+      // buying/selling pressure" absent real order-book depth.
+      const states = window.map((c) => {
+        const range = c.high - c.low
+        const posInRange = range > 1e-12 ? (c.close - c.low) / range : 0.5
+        if (posInRange >= 0.62) return 2 // ask-heavy / aggressive buying
+        if (posInRange <= 0.38) return 0 // bid-heavy / aggressive selling
+        return 1 // balanced
+      })
+      const chain = fitDiscreteMarkov(states, 3)
+      const last3 = states.slice(-3)
+      const stableRun = last3.every((s) => s === chain.lastState)
+      if (chain.lastState === 2 && chain.nextProbs[2] >= persistProb && stableRun) {
+        return { direction: 'call', score: clamp(42 + (chain.nextProbs[2] - persistProb) * 100, 40, 88), notes: `ask-heavy flow persisting (P(stay) ${(chain.nextProbs[2] * 100).toFixed(0)}%) - proxy imbalance, not real LOB` }
+      }
+      if (chain.lastState === 0 && chain.nextProbs[0] >= persistProb && stableRun) {
+        return { direction: 'put', score: clamp(42 + (chain.nextProbs[0] - persistProb) * 100, 40, 88), notes: `bid-heavy flow persisting (P(stay) ${(chain.nextProbs[0] * 100).toFixed(0)}%) - proxy imbalance, not real LOB` }
+      }
+      return { direction: 'none', score: 0, notes: `flow state ${['bid-heavy', 'balanced', 'ask-heavy'][chain.lastState]}, no persistence edge` }
     },
   },
   {
@@ -347,6 +437,102 @@ export const STRATEGIES: StrategyDef[] = [
         return { direction: 'put', score: clamp(50 + Math.abs(slopePct) * 20 + (Math.abs(z) - ze) * 10, 45, 94), notes: `μ falling ${slopePct.toFixed(2)}%/${slopeLB}b, rally ${z.toFixed(2)}σ above trend mean - sell the rally` }
       }
       return { direction: 'none', score: 0, notes: `μ ${trendUp ? 'rising' : 'falling'} ${slopePct.toFixed(2)}%/${slopeLB}b but no ${trendUp ? 'dip' : 'rally'} entry yet (z ${z.toFixed(2)})` }
+    },
+  },
+  {
+    id: 'mc-fairvalue-edge',
+    name: 'Monte Carlo Fair-Value Edge',
+    description: "The classic quant-arb idea (exotic-option pricing vs a replicated hedge, and vol-arb on the market's implied range probability) adapted honestly to a binary bet: there's no options chain or IV surface on this platform to price against, so instead of pricing an exotic derivative it prices the binary itself. Bootstrap-resamples the asset's own historical return distribution (not a Gaussian assumption - captures real fat tails/skew, the 'path model') to get the TRUE simulated probability the option finishes ITM, and trades only when that beats the broker's payout-implied breakeven probability by a real margin - literally 'the market misprices this, take the statistical edge', just against your own broker's payout instead of an options market.",
+    params: [
+      { key: 'lookback', label: 'Return sample window (bars)', type: 'number', min: 100, max: 500, default: 300 },
+      { key: 'horizon', label: 'Simulation horizon (bars = expiry)', type: 'number', min: 1, max: 20, default: 1 },
+      { key: 'nSims', label: 'Simulated paths', type: 'number', min: 500, max: 5000, default: 2000 },
+      { key: 'payoutPct', label: 'Assumed payout % (match your broker payout)', type: 'number', min: 50, max: 95, default: 85 },
+      { key: 'minEdgePct', label: 'Min edge over breakeven (pts)', type: 'number', min: 1, max: 20, default: 4 },
+    ],
+    evaluate: (candles, p) => {
+      const lookback = Math.round(num(p, 'lookback', 300))
+      const horizon = Math.max(1, Math.round(num(p, 'horizon', 1)))
+      const nSims = Math.min(5000, Math.max(200, Math.round(num(p, 'nSims', 2000))))
+      const payout = num(p, 'payoutPct', 85) / 100
+      const minEdge = num(p, 'minEdgePct', 4) / 100
+      const closesArr = candles.map((c) => c.close)
+      if (closesArr.length < lookback + 5) return { direction: 'none', score: 0, notes: 'warming up' }
+      const rets = logReturns(closesArr.slice(-(lookback + 1)))
+      if (rets.length < 30) return { direction: 'none', score: 0, notes: 'not enough return history to sample' }
+      // deterministic seed from the data itself (not wall-clock) - the same
+      // history always reproduces the same simulated probability, which
+      // matters for backtest/optimizer determinism.
+      const seed = (Math.round(closesArr[closesArr.length - 1] * 1e6) ^ (closesArr.length * 2654435761)) >>> 0
+      const r = rng(seed || 1)
+      const last = closesArr[closesArr.length - 1]
+      let up = 0
+      for (let s = 0; s < nSims; s++) {
+        let price = last
+        for (let t = 0; t < horizon; t++) price *= Math.exp(rets[Math.floor(r() * rets.length)] ?? 0)
+        if (price > last) up++
+      }
+      const probUp = up / nSims
+      const probDown = 1 - probUp
+      // breakeven win probability for a binary paying `payout` on a win and
+      // losing the full stake on a loss: P*payout = (1-P) => P = 1/(1+payout)
+      const breakeven = 1 / (1 + payout)
+      const edgeUp = probUp - breakeven
+      const edgeDown = probDown - breakeven
+      if (edgeUp >= minEdge && edgeUp >= edgeDown) {
+        return { direction: 'call', score: clamp(45 + edgeUp * 300, 40, 94), notes: `MC P(up) ${(probUp * 100).toFixed(1)}% vs breakeven ${(breakeven * 100).toFixed(1)}% (${nSims} bootstrap sims, ${horizon}b horizon) - edge +${(edgeUp * 100).toFixed(1)}pt` }
+      }
+      if (edgeDown >= minEdge) {
+        return { direction: 'put', score: clamp(45 + edgeDown * 300, 40, 94), notes: `MC P(down) ${(probDown * 100).toFixed(1)}% vs breakeven ${(breakeven * 100).toFixed(1)}% (${nSims} bootstrap sims, ${horizon}b horizon) - edge +${(edgeDown * 100).toFixed(1)}pt` }
+      }
+      return { direction: 'none', score: 0, notes: `MC P(up) ${(probUp * 100).toFixed(1)}% vs breakeven ${(breakeven * 100).toFixed(1)}% - no statistical edge` }
+    },
+  },
+  {
+    id: 'kalman-mc-reversion-prob',
+    name: 'Kalman-Monte Carlo Reversion Probability',
+    description: "Smart mean-reversion: instead of a static z-score band (like Kalman OU Reversion), it forward-simulates the FITTED OU process itself thousands of times from the current stretch and measures the actual probability of snapping back to equilibrium within the trade's own horizon - so a big stretch with a fast half-life can outscore a small stretch with a slow one, exactly the failure mode static bands have. No options/greeks on this platform, so this trades the reversion directly instead of a hedged option position.",
+    params: [
+      { key: 'window', label: 'OU estimation window', type: 'number', min: 60, max: 500, default: 240 },
+      { key: 'horizon', label: 'Simulation horizon (bars = expiry)', type: 'number', min: 1, max: 30, default: 4 },
+      { key: 'nSims', label: 'Simulated paths', type: 'number', min: 500, max: 4000, default: 1500 },
+      { key: 'zEntry', label: 'Min current stretch (z)', type: 'number', min: 0.5, max: 3, step: 0.1, default: 1 },
+      { key: 'snapProb', label: 'Min P(reversion within horizon)', type: 'number', min: 0.5, max: 0.98, step: 0.01, default: 0.85 },
+      { key: 'tolerance', label: 'Reversion tolerance (fraction of sigma_eq)', type: 'number', min: 0.1, max: 1, step: 0.05, default: 0.25 },
+    ],
+    evaluate: (candles, p) => {
+      const window = num(p, 'window', 240)
+      const horizon = Math.max(1, Math.round(num(p, 'horizon', 4)))
+      const nSims = Math.min(4000, Math.max(200, Math.round(num(p, 'nSims', 1500))))
+      const ze = num(p, 'zEntry', 1)
+      const snapProb = num(p, 'snapProb', 0.85)
+      const tol = num(p, 'tolerance', 0.25)
+      const closesArr = candles.map((c) => c.close)
+      const ou = ouState(closesArr, window)
+      if (!ou.meanReverting) return { direction: 'none', score: 0, notes: `not mean-reverting (t ${ou.tStat.toFixed(1)})` }
+      if (Math.abs(ou.z) < ze) return { direction: 'none', score: 0, notes: `z ${ou.z.toFixed(2)} below entry stretch ${ze}` }
+      const sigmaEq = ou.sigmaEq > 1e-12 ? ou.sigmaEq : 1
+      const band = tol * sigmaEq
+      const last = closesArr[closesArr.length - 1]
+      const seed = (Math.round(last * 1e6) ^ (closesArr.length * 2654435761) ^ Math.round(ou.phi * 1e6)) >>> 0
+      const r = rng(seed || 1)
+      let reverted = 0
+      for (let s = 0; s < nSims; s++) {
+        let x = last
+        let hit = false
+        for (let t = 0; t < horizon; t++) {
+          x = ou.theta + ou.phi * (x - ou.theta) + ou.sigmaEps * gauss(r)
+          if (Math.abs(x - ou.theta) <= band) { hit = true; break }
+        }
+        if (hit) reverted++
+      }
+      const prob = reverted / nSims
+      if (prob < snapProb) {
+        return { direction: 'none', score: 0, notes: `P(revert in ${horizon}b) ${(prob * 100).toFixed(0)}% below ${(snapProb * 100).toFixed(0)}% - stretch may outlast the trade` }
+      }
+      const score = clamp(50 + (prob - snapProb) * 200 + Math.min(15, ou.tStat * 2), 45, 95)
+      const dir = ou.z < 0 ? 'call' : 'put'
+      return { direction: dir, score, notes: `${dir === 'call' ? 'Below' : 'Above'} μ (z ${ou.z.toFixed(2)}), MC P(revert in ${horizon}b) ${(prob * 100).toFixed(0)}% · HL ${ou.halfLifeBars.toFixed(0)}b` }
     },
   },
   {
