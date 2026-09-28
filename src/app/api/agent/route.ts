@@ -709,7 +709,7 @@ const TOOLS: ToolSpec[] = [
   {
     name: 'lab_learn',
     description:
-      'LEARN A PAIR - run the AI learning agent over one instrument\'s candle history. It mines edge-bearing events across the FULL pattern vocabulary: 30+ candlestick formations, wide-range bar expansions, Heiken Ashi structures (flip / streak / strong bars), line patterns (Donchian breakouts, higher-highs-lows runs) and its own invented indicators (rsi/bbpos/zscore/donchianpos/macdz/slope/streak/wickbias/emasign/hadist/bodypos) - then measures each event\'s win-rate edge vs the horizon, weights the survivors by edge, calibrates a confluence threshold and backtests the composed spec (full sample + an honest HOLDOUT on the last 30%). Args: asset (required), tf (default 1m), basis ("candles" = raw OHLC default, "heikin" = learn on the Heiken-Ashi transform of the same feed - outcomes always settle on real prices; pick heikin when the user thinks in HA / smooth-trend terms), bars (default 1200 max 2200), horizon (bars ahead, default 1), minSamples (default 30; auto-relaxed on thin history), minEdge (win-rate pts above 50, default 1.5), maxSignals (default 8), payout (default 0.7 = the compounding cap), name. Returns: signals table (kind, n, winRate, edgePts, weight, selected), the spec (deployable), calibration sweep, backtest + holdout metrics and breakevenWinRate for the payout. Present the numbers honestly (especially holdout vs breakeven). If ok:false, no event cleared the filters - report it and offer different params/pair. Deploy through lab_save + bot_create with strategyId custom:<id>.',
+      'LEARN A PAIR - run the AI learning agent over one instrument\'s candle history. It mines edge-bearing events across the FULL pattern vocabulary: 30+ candlestick formations, wide-range bar expansions, Heiken Ashi structures (flip / streak / strong bars), line patterns (Donchian breakouts, higher-highs-lows runs) and its own invented indicators (rsi/bbpos/zscore/donchianpos/macdz/slope/streak/wickbias/emasign/hadist/bodypos/psar/fractal, plus the generic madist/osc0100/oscpm100/oscz/trenddist/bandpos/volflow/levels families covering the rest of the TA suite) - then measures each event\'s win-rate edge vs the horizon, weights the survivors by edge, calibrates a confluence threshold and backtests the composed spec (full sample + an honest HOLDOUT on the last 30%). Args: asset (required), tf (default 1m), basis ("candles" = raw OHLC default, "heikin" = learn on the Heiken-Ashi transform of the same feed - outcomes always settle on real prices; pick heikin when the user thinks in HA / smooth-trend terms), bars (default 1200 max 2200), horizon (bars ahead, default 1), minSamples (default 30; auto-relaxed on thin history), minEdge (win-rate pts above 50, default 1.5), maxSignals (default 8), payout (default 0.7 = the compounding cap), name. Returns: signals table (kind, n, winRate, edgePts, weight, selected), the spec (deployable), calibration sweep, backtest + holdout metrics and breakevenWinRate for the payout. Present the numbers honestly (especially holdout vs breakeven). If ok:false, no event cleared the filters - report it and offer different params/pair. Deploy through lab_save + bot_create with strategyId custom:<id>.',
     args: '{"asset": "EURUSD", "tf": "1m", "basis": "candles", "bars": 1200, "horizon": 1, "minSamples": 30, "minEdge": 1.5, "maxSignals": 8, "payout": 0.7}',
     run: (a) =>
       corePost('/lab_learn', {
@@ -728,7 +728,7 @@ const TOOLS: ToolSpec[] = [
   {
     name: 'lab_backtest',
     description:
-      'Backtest a CUSTOM spec on a pair - either a saved lab id ("custom:...") or an INLINE spec you compose yourself (you are allowed to invent your own combinations: the DSL accepts signals of kind "candle" (name = a library pattern, e.g. "Bullish Engulfing"), "bar" (variant wide-bull|wide-bear, atrK), "ha" (variant flip-up|flip-down|streak-up|streak-down|strong-bull|strong-bear, len), "line" (variant breakout-up|breakout-down|hh-hl|lh-ll, lookback) and "indicator" (ind: rsi|bbpos|zscore|donchianpos|macdz|slope|streak|wickbias|emasign|hadist|bodypos, params {period|fast|slow|mult}, op ">"|"<", threshold)). Every signal: {kind, ..., dir: "call"|"put", weight 1-50} - dir may INVERT the textbook meaning to fade a pattern. Spec: {name, signals[], minScore 5-95, minVotes 1-6, horizon}. Weights vote bull-minus-bear; a trade needs |score| >= minScore AND >= minVotes agreeing signals. Returns full-sample + holdout metrics and the breakeven win rate. Use to iterate on your own ideas BEFORE proposing deployment. Args: id OR spec, asset, tf, payout (default 0.7), amount (default 10), horizon.',
+      'Backtest a CUSTOM spec on a pair - either a saved lab id ("custom:...") or an INLINE spec you compose yourself (you are allowed to invent your own combinations: the DSL accepts signals of kind "candle" (name = a library pattern, e.g. "Bullish Engulfing"), "bar" (variant wide-bull|wide-bear, atrK), "ha" (variant flip-up|flip-down|streak-up|streak-down|strong-bull|strong-bear, len), "line" (variant breakout-up|breakout-down|hh-hl|lh-ll, lookback) and "indicator" (ind: rsi|bbpos|zscore|donchianpos|macdz|slope|streak|wickbias|emasign|hadist|bodypos|psar|fractal|madist|osc0100|oscpm100|oscz|trenddist|bandpos|volflow|levels, params {period|fast|slow|mult|afStep|afMax (psar)|left|right (fractal, flank bars each side, default 2)}, type - REQUIRED for the 8 generic families, picks the specific indicator: madist: sma|ema|wma|dema|tema|trima|kama|hma|vwma|zlema|t3|mcginley|linreg|midpoint; osc0100 (native 0-100): stochk|stochd|stochrsik|stochrsid|willr|ultosc|aroonup|aroondown|mfi; oscpm100 (native ~-100..100): cci|cmo|tsi|rvi|aroonosc; oscz (self- or ATR-scaled): roc|mom|ppo|apo|trix|dpo|kst|qstick|awesomeosc|fisher|massindex|natr|histvol|stddev|atrz|hilbert|ulcer; trenddist (signed breakout distance/ATR): supertrend|chandelier|ichimoku; bandpos (0..1 position in band): keltner|envelope; volflow (rolling z-score, except cmf/vwapdist which are natively scaled): obv|ad|cmf|forceindex|eom|nvi|pvi|klinger|chaikinosc|vwapdist; levels (signed distance/ATR to nearest static level): pivot|fib. op ">"|"<", threshold)). Every signal: {kind, ..., dir: "call"|"put", weight 1-50} - dir may INVERT the textbook meaning to fade a pattern. Spec: {name, signals[], minScore 5-95, minVotes 1-6, horizon}. Weights vote bull-minus-bear; a trade needs |score| >= minScore AND >= minVotes agreeing signals. Returns full-sample + holdout metrics and the breakeven win rate. Use to iterate on your own ideas BEFORE proposing deployment. Args: id OR spec, asset, tf, payout (default 0.7), amount (default 10), horizon.',
     args: '{"asset": "EURUSD", "tf": "2m", "payout": 0.7, "spec": {"name": "HA fade", "signals": [{"kind": "ha", "variant": "flip-up", "len": 2, "dir": "put", "weight": 20}, {"kind": "indicator", "ind": "rsi", "params": {"period": 14}, "op": ">", "threshold": 70, "dir": "put", "weight": 20}], "minScore": 45, "minVotes": 2, "horizon": 1}}',
     run: (a) =>
       corePost('/lab_backtest', {
@@ -767,6 +767,90 @@ const TOOLS: ToolSpec[] = [
     description: 'Delete a learned strategy from the lab library by id. Bots already configured with it keep running.',
     args: '{"id": "custom:eurusd-1m-lab"}',
     run: (a) => corePost('/lab_delete', { id: String(a.id) }),
+  },
+  {
+    name: 'create_strategy',
+    description:
+      'BUILD A STRATEGY END-TO-END, ONE CALL - this is what "build me a strategy" / "create your own strategy on X" should call. Two modes: (1) AUTO - pass just name/asset/tf (and optionally basis/bars/horizon/minSamples/minEdge/maxSignals) and it runs the full lab_learn discovery over the FULL indicator/pattern vocabulary (candles, bars, HA, line breaks, and every lab_backtest indicator family - rsi/bbpos/zscore/donchianpos/macdz/slope/streak/wickbias/emasign/hadist/bodypos/psar/fractal/madist(every MA)/osc0100+oscpm100+oscz(every oscillator)/trenddist(supertrend|chandelier|ichimoku)/bandpos(keltner|envelope)/volflow(every volume indicator)/levels(pivot|fib)) - it will find and combine whatever indicators actually carry edge for that pair, you do not need to guess which one. (2) MANUAL - pass signals (the same array lab_backtest accepts) to test YOUR specific idea (e.g. a fractal+PSAR confluence) instead of auto-discovery. Either way it backtests full-sample + an honest HOLDOUT (last 30%), and by default AUTO-SAVES to the lab library (strategyId "custom:<id>", ready for bot_create) ONLY if the holdout win rate clears breakeven by minHoldoutEdge points (default 1.5) on at least minHoldoutTrades trades (default 15) - pass save:false to just validate without saving. Returns {passed, saved, strategyId, spec, backtest, holdout, breakevenWinRate, note}. If passed:false, report the honest numbers and do NOT claim it was deployed - propose a different pair/tf/indicator mix or offer it as an unsaved idea. Args: name (required), asset (required), tf (default 1m), signals (manual mode only), minScore/minVotes/horizon (manual mode, defaults 45/1/1), basis/bars/minSamples/minEdge/maxSignals (auto mode), payout (default 0.7), amount (default 10), minHoldoutEdge (default 1.5), minHoldoutTrades (default 15), save (default true).',
+    args: '{"name": "EURUSD fractal+psar breakout", "asset": "EURUSD", "tf": "2m", "signals": [{"kind": "indicator", "ind": "fractal", "params": {"left": 2, "right": 2}, "op": ">", "threshold": 0.05, "dir": "call", "weight": 20}, {"kind": "indicator", "ind": "psar", "op": ">", "threshold": 0.1, "dir": "call", "weight": 20}], "minScore": 40, "minVotes": 2}',
+    run: async (a) => {
+      const asset = String(a.asset ?? '')
+      const tf = String(a.tf ?? '1m')
+      const name = String(a.name ?? `${asset} ${tf} learned strategy`)
+      const payout = a.payout !== undefined ? Number(a.payout) : 0.7
+      const amount = a.amount !== undefined ? Number(a.amount) : 10
+      const minHoldoutEdge = a.minHoldoutEdge !== undefined ? Number(a.minHoldoutEdge) : 1.5
+      const minHoldoutTrades = a.minHoldoutTrades !== undefined ? Number(a.minHoldoutTrades) : 15
+      if (!asset) return { ok: false, error: 'asset is required' }
+
+      let mode: 'auto' | 'manual'
+      let learned: Record<string, unknown>
+      if (Array.isArray(a.signals) && a.signals.length > 0) {
+        mode = 'manual'
+        const spec = {
+          name,
+          signals: a.signals,
+          minScore: a.minScore !== undefined ? Number(a.minScore) : 45,
+          minVotes: a.minVotes !== undefined ? Number(a.minVotes) : 1,
+          horizon: a.horizon !== undefined ? Number(a.horizon) : 1,
+        }
+        learned = (await corePost('/lab_backtest', { spec, asset, tf, payout, amount, horizon: spec.horizon })) as Record<string, unknown>
+      } else {
+        mode = 'auto'
+        learned = (await corePost('/lab_learn', {
+          asset,
+          tf,
+          name,
+          ...(a.basis !== undefined ? { basis: String(a.basis) } : {}),
+          ...(a.bars !== undefined ? { bars: Number(a.bars) } : {}),
+          ...(a.horizon !== undefined ? { horizon: Number(a.horizon) } : {}),
+          ...(a.minSamples !== undefined ? { minSamples: Number(a.minSamples) } : {}),
+          ...(a.minEdge !== undefined ? { minEdge: Number(a.minEdge) } : {}),
+          ...(a.maxSignals !== undefined ? { maxSignals: Number(a.maxSignals) } : {}),
+          payout,
+          amount,
+        })) as Record<string, unknown>
+      }
+
+      if (!learned.ok) {
+        return { ok: false, mode, passed: false, saved: false, reason: 'no edge found / backtest failed', detail: learned }
+      }
+
+      const spec = learned.spec
+      const backtest = learned.backtest as { trades?: number; winRate?: number; netPnl?: number; profitFactor?: number } | undefined
+      const holdout = learned.holdout as { trades?: number; winRate?: number; netPnl?: number; profitFactor?: number } | null | undefined
+      const breakevenWinRate = Number(learned.breakevenWinRate ?? (1 / (1 + payout)) * 100)
+      const holdoutTrades = holdout?.trades ?? 0
+      const holdoutWinRate = holdout?.winRate ?? -Infinity
+      const passed = !!holdout && holdoutTrades >= minHoldoutTrades && holdoutWinRate >= breakevenWinRate + minHoldoutEdge
+
+      let saved = false
+      let strategyId: string | undefined
+      let saveError: string | undefined
+      if (passed && a.save !== false) {
+        const saveRes = (await corePost('/lab_save', {
+          spec,
+          name,
+          asset,
+          tf,
+          stats: { backtest, holdout, breakeven: breakevenWinRate },
+        })) as { ok?: boolean; id?: string; error?: string }
+        if (saveRes.ok && saveRes.id) {
+          saved = true
+          strategyId = `custom:${saveRes.id}`
+        } else {
+          saveError = saveRes.error ?? 'lab_save did not return an id'
+        }
+      }
+
+      const note = passed
+        ? saved
+          ? `PASSED holdout (${holdoutWinRate.toFixed(1)}% vs breakeven ${breakevenWinRate.toFixed(1)}%, ${holdoutTrades} trades) - saved as ${strategyId}. Deploy with bot_create.`
+          : `PASSED holdout but NOT saved (save:false or lab_save error: ${saveError ?? 'n/a'}) - re-run with save:true or call lab_save yourself.`
+        : `FAILED holdout: ${holdout ? `${holdoutWinRate.toFixed(1)}% over ${holdoutTrades} trades vs breakeven ${breakevenWinRate.toFixed(1)}% (+${minHoldoutEdge} margin required)` : 'no holdout window available'} - not saved. Report this honestly; do not claim deployment.`
+
+      return { ok: true, mode, passed, saved, strategyId, spec, backtest, holdout, breakevenWinRate, holdoutFolds: learned.holdoutFolds, note }
+    },
   },
   {
     name: 'journal_stats',
@@ -1541,7 +1625,9 @@ Rules:
 - TIMEFRAME TOKENS: every candle/analysis store is keyed by the EXACT string "5s"|"15s"|"30s"|"1m"|"2m"|"5m"|"15m"|"30m"|"1h"|"4h"|"1d" - there is no "60m", it's "1h" ("1 hour"/"hourly"/"60 minute" all mean tf "1h"); no "240m", it's "4h"; no "1440m"/"24h"/"daily", it's "1d". A near-miss token isn't an error, it just looks up an empty bucket and comes back "no data" even though that exact market has plenty of history under its real token - if a tool ever says no data for a timeframe the UI clearly shows working, re-check you sent the canonical token before concluding data is missing.
 - DEPLOYMENT CONFIRMATION PROTOCOL (MANDATORY for ANY bot_create that will trade autonomously): when the user describes automation in natural language, DO NOT deploy on the first reply. 1) Parse every clause into its exact config. 2) Reply with a numbered RULE SHEET: strategy + params, watchlist, timeframe, kind + expiry (state WHY digital+expirySec when minutes are involved), no-concurrent rule (maxOpen 1), stake plan (seed, roll %, payout cap 70, stop-on-loss, periods, de-risk), session window in UTC + Lagos time, cooldown, minScore, plus the compound_plan ladder with cycleProfit. 3) Flag anything you had to ASSUME and propose a default. 4) Ask "confirm and I deploy" and WAIT - deploy only after the user explicitly agrees or amends. 5) After deploying: report the bot id, that it is ARMED and trading autonomously, and how to stop/restart it.
 - RESEARCH WORKFLOW (use it whenever the user wants a validated strategy or asks "is this edge real"): 1) asset_sweep to find WHERE a strategy has an edge, 2) optimize_strategy on the best assets to find strong params, 3) walkforward on the winner - deploy only if OOS net is positive and at least half the folds were profitable, 4) only then bot_create with the validated params (keep the bot DISARMED and tell the user to arm it when ready). After arming, the watchdog watches the live edge - mention that. Research reads DEEP archived history; archive_status shows how much depth exists per asset - if depth is thin, warn that results may not be significant yet. Report IS vs OOS numbers honestly - large drops from in-sample to out-of-sample mean overfit.
-- AI LEARNING AGENT (Strategy Lab - "learn this pair", "build your own strategy", "find your own patterns", "make me a new indicator"): you have your own research desk. lab_learn mines a pair's history for edge-bearing events across candlestick patterns, wide-range bar formations, HEIKEN ASHI structures, line breaks and invented indicators, weights the survivors by measured win-rate edge, calibrates a confluence threshold and backtests the composed spec (full sample + holdout on the last 30%). Report the discovery table (n, win rate, edge, weight) and the backtest vs breakevenWinRate HONESTLY - a holdout win rate below breakeven means the edge did not survive, say so. Iterate like a quant: try another horizon (2-3), more bars, a lower minEdge, or a different tf before giving up. You may also INVENT your own spec (lab_backtest accepts inline specs - the tool doc has the full DSL; dir can invert a pattern to fade it) and lab_save the winners. DEPLOY: lab_save the spec, then follow the DEPLOYMENT CONFIRMATION PROTOCOL and bot_create with strategyId "custom:<id>" (learned ids work everywhere builtin ids do - stake plans, compounding, sessions). Learned bots compound too: a $1 seed rolling on a spec the lab just validated is a perfectly normal ask - mirror periods/de-risk into compound_plan as always.
+- AI LEARNING AGENT (Strategy Lab - "learn this pair", "build your own strategy", "find your own patterns", "make me a new indicator", "create a strategy based on <any indicator>"): you have your own research desk, and the DSL now spans the FULL analytics/indicators.ts suite - not just the lab's own 11 invented indicators (rsi/bbpos/zscore/donchianpos/macdz/slope/streak/wickbias/emasign/hadist/bodypos) but also psar, fractal (Williams Fractal), and 8 generic families selected via params.type: madist (every moving-average type: sma/ema/wma/dema/tema/trima/kama/hma/vwma/zlema/t3/mcginley/linreg/midpoint), osc0100 + oscpm100 + oscz (every oscillator: stochastic, stochRSI, williams%R, ultimate osc, aroon, mfi, CCI, CMO, TSI, RVI, ROC, momentum, PPO/APO, TRIX, DPO, KST, qstick, awesome osc, fisher transform, mass index, NATR, hist vol, stddev, Hilbert sine, ulcer index), trenddist (supertrend/chandelier exit/ichimoku cloud), bandpos (keltner/envelope), volflow (OBV/A-D/CMF/force index/EOM/NVI/PVI/klinger/chaikin osc/VWAP distance) and levels (pivot points/fibonacci). So "build a strategy based on X" for almost any named indicator is now something you can actually compose, not just proxy - use the matching ind/type from lab_backtest's tool doc. The only true gaps: correlation/beta (need a second instrument - architecturally out of scope for the single-asset evaluator) and zigzag (repaints, unsafe live).
+  PREFERRED PATH - create_strategy: one tool call that runs discovery (or backtests your own invented signal combo), checks the HOLDOUT honestly against breakeven with a safety margin, and auto-saves to the lab library ONLY if it actually passes - use this instead of manually chaining lab_learn/lab_backtest/lab_save. Manual mode (pass `signals`) is exactly for a request like "create a strategy based on fractal and parabolic sar" - hand it a fractal+psar signal combo directly. If create_strategy reports passed:false, that is the honest answer - report the numbers (holdout vs breakeven) and do not claim deployment; offer to iterate (different tf/asset/horizon/threshold) or hand it back as an unsaved idea.
+  Manual step-by-step path (still available): lab_learn mines a pair's history for edge-bearing events across candlestick patterns, wide-range bar formations, HEIKEN ASHI structures, line breaks and the full indicator vocabulary above, weights the survivors by measured win-rate edge, calibrates a confluence threshold and backtests the composed spec (full sample + holdout on the last 30%). Report the discovery table (n, win rate, edge, weight) and the backtest vs breakevenWinRate HONESTLY - a holdout win rate below breakeven means the edge did not survive, say so. Iterate like a quant: try another horizon (2-3), more bars, a lower minEdge, or a different tf before giving up. You may also INVENT your own spec (lab_backtest accepts inline specs - the tool doc has the full DSL; dir can invert a pattern to fade it) and lab_save the winners. DEPLOY: lab_save the spec, then follow the DEPLOYMENT CONFIRMATION PROTOCOL and bot_create with strategyId "custom:<id>" (learned ids work everywhere builtin ids do - stake plans, compounding, sessions). Learned bots compound too: a $1 seed rolling on a spec the lab just validated is a perfectly normal ask - mirror periods/de-risk into compound_plan as always.
 - When the user asks to be notified/watch an instrument ("alert me when...", "let me know if..."), create an alert rule with alert_rule_create and confirm the trigger in plain words. NEVER use alert rules to trade - they only notify.
 - NEVER promise profits. Always frame outputs as probabilistic analysis, not certainty.
 - PAPER trades only - you cannot and must not place live trades.

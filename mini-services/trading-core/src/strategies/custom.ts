@@ -3,9 +3,18 @@
 // them into a CustomSpec: a portable, inspectable strategy definition the
 // autopilot can trade (strategyId "custom:<id>"). The vocabulary spans the
 // user's ask: candlestick patterns, bar formations, Heiken Ashi patterns,
-// line/structural patterns, and parametric INDICATOR rules (the lab's own
-// invented indicators - rsi/bbpos/zscore/donchianpos/macdz/slope/streak/
-// wickbias/emasign/hadist/bodypos).
+// line/structural patterns, and parametric INDICATOR rules spanning the
+// FULL analytics/indicators.ts suite: the lab's own invented indicators
+// (rsi/bbpos/zscore/donchianpos/macdz/slope/streak/wickbias/emasign/hadist/
+// bodypos), swing/trend primitives (psar/fractal), and eight generic
+// families selected via params.type - madist (every MA type), osc0100 /
+// oscpm100 / oscz (every oscillator), trenddist (supertrend/chandelier/
+// ichimoku), bandpos (keltner/envelope), volflow (every volume indicator)
+// and levels (pivot points/fibonacci). correlation/beta are NOT exposed -
+// they need a second instrument's series, which the single-asset evaluator
+// contract doesn't carry; zigzag is excluded because it repaints (the last
+// swing can move as new bars arrive, unusable for a live, non-repainting
+// signal).
 //
 // Scoring model: every signal carries a weight (1..50, proportional to the
 // measured edge). On each closed bar the active bull and bear signals vote:
@@ -75,7 +84,19 @@ export interface IndicatorSignal {
     | 'emasign' // (emaFast - emaSlow) / ATR, magnitude-carrying
     | 'hadist' // (haClose - haOpen) / ATR
     | 'bodypos' // (close - low) / range
+    | 'psar' // Parabolic SAR trend distance: (close - sar) / ATR - positive above SAR (uptrend), negative below (downtrend)
+    | 'fractal' // Williams Fractal breakout: (close - lastConfirmedFractalHigh)/ATR when breaking above resistance, (close - lastConfirmedFractalLow)/ATR when breaking below support, 0 otherwise
+    // ---- generic families covering the rest of analytics/indicators.ts (selected via params.type) ----
+    | 'madist' // (close - MA)/ATR. params.type: sma|ema|wma|dema|tema|trima|kama|hma|vwma|zlema|t3|mcginley|linreg|midpoint
+    | 'osc0100' // native 0..100 oscillator. params.type: stochk|stochd|willr|ultosc|aroonup|aroondown|mfi
+    | 'oscpm100' // native -100..100-ish oscillator, raw. params.type: cci|cmo|tsi|rvi|aroonosc|stochrsik|stochrsid
+    | 'oscz' // momentum/volatility family, each internally scaled sensibly. params.type: roc|mom|ppo|apo|trix|dpo|kst|qstick|awesomeosc|fisher|massindex|natr|histvol|stddev|atrz|hilbert|ulcer
+    | 'trenddist' // signed trend-line breakout distance/ATR, same shape as psar/fractal. params.type: supertrend|chandelier|ichimoku
+    | 'bandpos' // position inside a band, 0..1. params.type: keltner|envelope
+    | 'volflow' // volume-flow accumulators, rolling z-scored. params.type: obv|ad|cmf|forceindex|eom|nvi|pvi|klinger|chaikinosc|vwapdist
+    | 'levels' // signed distance to nearest static level/ATR. params.type: pivot|fib
   params?: Record<string, number> // period/fast/slow/mult per indicator
+  type?: string // sub-selector for the generic families above (madist/osc0100/oscpm100/oscz/trenddist/bandpos/volflow/levels)
   op: '>' | '<'
   threshold: number
   dir: Side
@@ -206,6 +227,7 @@ export interface EvalCtx {
   haColor: number[] // +1 green / -1 red / 0 flat
   body: number[]
   range: number[]
+  volume: number[]
   hits: Map<string, 'bullish' | 'bearish' | 'neutral'> // candle patterns on the LAST bar only
 }
 
@@ -215,6 +237,7 @@ export function buildCtx(candles: Candle[]): EvalCtx {
   const high = candles.map((k) => k.high)
   const low = candles.map((k) => k.low)
   const open = candles.map((k) => k.open)
+  const volume = candles.map((k) => k.volume ?? 0)
   const atr = ta.atr(high, low, close, 14)
   const ha = heikinAshi(candles)
   const haColor = ha.close.map((v, i) => (v > ha.open[i] ? 1 : v < ha.open[i] ? -1 : 0))
@@ -224,7 +247,20 @@ export function buildCtx(candles: Candle[]): EvalCtx {
   if (n >= 13) {
     for (const hit of detectPatterns(candles, 1)) hits.set(hit.name.toLowerCase(), hit.direction)
   }
-  return { candles, n, close, high, low, open, atr, ha, haColor, body, range, hits }
+  return { candles, n, close, high, low, open, atr, ha, haColor, body, range, volume, hits }
+}
+
+/** ATR-normalized rolling z-score of an arbitrary raw series - used to turn
+ * unbounded accumulator indicators (OBV, A/D line, NVI/PVI, Klinger...) into
+ * a comparable, threshold-able signal without changing their shape. */
+function rollingZ(src: number[], period: number): number[] {
+  // sma/stdDev don't tolerate leading NaN (a warmed-up indicator's own
+  // warmup NaNs would otherwise taint the running sum forever) - smooth
+  // only from the first finite value onward, like indicators.ts's
+  // skipLeadingNaN convention.
+  const smaArr = ta.skipLeadingNaN(src, (s) => ta.sma(s, period))
+  const sd = ta.skipLeadingNaN(src, (s) => ta.stdDev(s, period))
+  return src.map((v, i) => (Number.isFinite(sd[i]) && sd[i] > 1e-12 ? (v - smaArr[i]) / sd[i] : NaN))
 }
 
 // ---------- indicator series (shared: learner + live evaluator) ----------
@@ -311,6 +347,288 @@ export function indicatorSeries(s: IndicatorSignal, ctx: EvalCtx): number[] {
     case 'bodypos': {
       return ctx.candles.map((k, i) => (k.close - k.low) / ctx.range[i])
     }
+    case 'psar': {
+      const sar = ta.parabolicSar(ctx.high, ctx.low, num(p.afStep, 0.02), num(p.afMax, 0.2))
+      return ctx.close.map((v, i) => (ctx.atr[i] > 1e-12 ? (v - sar[i]) / ctx.atr[i] : NaN))
+    }
+    case 'fractal': {
+      // Non-repainting Williams Fractal: a high/low fractal at bar i needs
+      // `left`/`right` flanking bars strictly lower/higher on both sides, so
+      // it can only be confirmed once the right flank has closed (i + right).
+      // The series carries the most recently CONFIRMED fractal level forward
+      // and reports a signed breakout distance vs it (ATR-normalized) - a
+      // real trade only fires once price actually clears a swing point that
+      // was visible without lookahead.
+      const left = Math.max(1, Math.round(num(p.left, 2)))
+      const right = Math.max(1, Math.round(num(p.right, 2)))
+      const n = ctx.n
+      const out: number[] = new Array(n).fill(0)
+      let lastHigh = NaN
+      let lastLow = NaN
+      for (let i = 0; i < n; i++) {
+        // confirm any fractal whose right flank just closed at this bar
+        const c = i - right
+        if (c >= left && c < n - right) {
+          let isHigh = true
+          let isLow = true
+          for (let j = c - left; j <= c + right; j++) {
+            if (j === c) continue
+            if (ctx.high[j] >= ctx.high[c]) isHigh = false
+            if (ctx.low[j] <= ctx.low[c]) isLow = false
+          }
+          if (isHigh) lastHigh = ctx.high[c]
+          if (isLow) lastLow = ctx.low[c]
+        }
+        const atrI = ctx.atr[i]
+        if (!(atrI > 1e-12)) {
+          out[i] = 0
+        } else if (Number.isFinite(lastHigh) && ctx.close[i] > lastHigh) {
+          out[i] = (ctx.close[i] - lastHigh) / atrI
+        } else if (Number.isFinite(lastLow) && ctx.close[i] < lastLow) {
+          out[i] = (ctx.close[i] - lastLow) / atrI
+        } else {
+          out[i] = 0
+        }
+      }
+      return out
+    }
+    case 'madist': {
+      const period = Math.max(2, Math.round(num(p.period, 20)))
+      const type = s.type ?? 'ema'
+      let ma: number[]
+      switch (type) {
+        case 'sma':
+          ma = ta.sma(ctx.close, period)
+          break
+        case 'wma':
+          ma = ta.wma(ctx.close, period)
+          break
+        case 'dema':
+          ma = ta.dema(ctx.close, period)
+          break
+        case 'tema':
+          ma = ta.tema(ctx.close, period)
+          break
+        case 'trima':
+          ma = ta.trima(ctx.close, period)
+          break
+        case 'kama':
+          ma = ta.kama(ctx.close, period, num(p.fast, 2), num(p.slow, 30))
+          break
+        case 'hma':
+          ma = ta.hma(ctx.close, period)
+          break
+        case 'vwma':
+          ma = ta.vwma(ctx.close, ctx.volume, period)
+          break
+        case 'zlema':
+          ma = ta.zlema(ctx.close, period)
+          break
+        case 't3':
+          ma = ta.t3(ctx.close, period, num(p.vf, 0.7))
+          break
+        case 'mcginley':
+          ma = ta.mcginley(ctx.close, period)
+          break
+        case 'linreg':
+          ma = ta.linregLine(ctx.close, period)
+          break
+        case 'midpoint':
+          ma = ta.midpoint(ctx.close, period)
+          break
+        default:
+          ma = ta.ema(ctx.close, period)
+      }
+      return ctx.close.map((v, i) => (ctx.atr[i] > 1e-12 && Number.isFinite(ma[i]) ? (v - ma[i]) / ctx.atr[i] : NaN))
+    }
+    case 'osc0100': {
+      const type = s.type ?? 'stochk'
+      const period = Math.max(2, Math.round(num(p.period, 14)))
+      switch (type) {
+        case 'stochk':
+          return ta.stochastic(ctx.high, ctx.low, ctx.close, period).k
+        case 'stochd':
+          return ta.stochastic(ctx.high, ctx.low, ctx.close, period).d
+        case 'stochrsik':
+          return ta.stochRsi(ctx.close, num(p.rsiPeriod, 14), period).k
+        case 'stochrsid':
+          return ta.stochRsi(ctx.close, num(p.rsiPeriod, 14), period).d
+        case 'willr':
+          return ta.williamsR(ctx.high, ctx.low, ctx.close, period).map((v) => v + 100)
+        case 'ultosc':
+          return ta.ultimateOsc(ctx.high, ctx.low, ctx.close)
+        case 'aroonup':
+          return ta.aroon(ctx.high, ctx.low, period).up
+        case 'aroondown':
+          return ta.aroon(ctx.high, ctx.low, period).down
+        case 'mfi':
+          return ta.mfi(ctx.high, ctx.low, ctx.close, ctx.volume, period)
+        default:
+          return ta.stochastic(ctx.high, ctx.low, ctx.close, period).k
+      }
+    }
+    case 'oscpm100': {
+      const type = s.type ?? 'cci'
+      const period = Math.max(2, Math.round(num(p.period, 20)))
+      switch (type) {
+        case 'cci':
+          return ta.cci(ctx.high, ctx.low, ctx.close, period)
+        case 'cmo':
+          return ta.cmo(ctx.close, period)
+        case 'tsi':
+          return ta.tsi(ctx.close, num(p.long, 25), num(p.short, 13)).tsi
+        case 'rvi':
+          return ta.rvi(ctx.close, ctx.high, ctx.low, period).rvi
+        case 'aroonosc':
+          return ta.aroon(ctx.high, ctx.low, period).osc
+        default:
+          return ta.cci(ctx.high, ctx.low, ctx.close, period)
+      }
+    }
+    case 'oscz': {
+      const type = s.type ?? 'roc'
+      const period = Math.max(2, Math.round(num(p.period, 14)))
+      const atrNorm = (arr: number[]) => arr.map((v, i) => (ctx.atr[i] > 1e-12 && Number.isFinite(v) ? v / ctx.atr[i] : NaN))
+      switch (type) {
+        case 'roc':
+          return ta.roc(ctx.close, period)
+        case 'mom':
+          return atrNorm(ta.mom(ctx.close, period))
+        case 'ppo':
+          return ta.ppo(ctx.close, num(p.fast, 12), num(p.slow, 26)).ppo
+        case 'apo':
+          return atrNorm(ta.apo(ctx.close, num(p.fast, 12), num(p.slow, 26)))
+        case 'trix':
+          return ta.trix(ctx.close, period).trix
+        case 'dpo':
+          return atrNorm(ta.dpo(ctx.close, period))
+        case 'kst':
+          return ta.kst(ctx.close).kst.map((v) => v / 10)
+        case 'qstick':
+          return atrNorm(ta.qstick(ctx.open, ctx.close, period))
+        case 'awesomeosc':
+          return atrNorm(ta.awesomeOsc(ctx.high, ctx.low))
+        case 'fisher':
+          return ta.fisherTransform(ctx.high, ctx.low, period).fisher
+        case 'massindex':
+          return ta.massIndex(ctx.high, ctx.low)
+        case 'natr':
+          return ta.natr(ctx.high, ctx.low, ctx.close, period)
+        case 'histvol':
+          return ta.histVol(ctx.close, period)
+        case 'stddev':
+          return atrNorm(ta.stdDev(ctx.close, period))
+        case 'atrz':
+          return rollingZ(ctx.atr, Math.max(5, period))
+        case 'hilbert': {
+          const h = ta.hilbertSine(ctx.close, num(p.period2, 32))
+          return h.sine.map((v, i) => v - h.lead[i])
+        }
+        case 'ulcer':
+          return ta.ulcerIndex(ctx.close, period)
+        default:
+          return ta.roc(ctx.close, period)
+      }
+    }
+    case 'trenddist': {
+      const type = s.type ?? 'supertrend'
+      if (type === 'supertrend') {
+        const st = ta.supertrend(ctx.high, ctx.low, ctx.close, Math.round(num(p.period, 10)), num(p.mult, 3))
+        return ctx.close.map((v, i) => (ctx.atr[i] > 1e-12 && Number.isFinite(st.line[i]) ? (st.dir[i] * (v - st.line[i])) / ctx.atr[i] : NaN))
+      }
+      if (type === 'chandelier') {
+        const ce = ta.chandelierExit(ctx.high, ctx.low, ctx.close, Math.round(num(p.period, 22)), num(p.mult, 3))
+        return ctx.close.map((v, i) => {
+          const atrI = ctx.atr[i]
+          if (!(atrI > 1e-12)) return NaN
+          if (Number.isFinite(ce.long[i]) && v > ce.long[i]) return (v - ce.long[i]) / atrI
+          if (Number.isFinite(ce.short[i]) && v < ce.short[i]) return (v - ce.short[i]) / atrI
+          return 0
+        })
+      }
+      // ichimoku: signed distance to the nearest cloud edge, 0 while price is inside the cloud
+      const ich = ta.ichimoku(ctx.high, ctx.low, Math.round(num(p.conv, 9)), Math.round(num(p.base, 26)), Math.round(num(p.spanB, 52)))
+      return ctx.close.map((v, i) => {
+        const a = ich.senkouA[i]
+        const b = ich.senkouB[i]
+        if (!Number.isFinite(a) || !Number.isFinite(b) || !(ctx.atr[i] > 1e-12)) return NaN
+        const top = Math.max(a, b)
+        const bot = Math.min(a, b)
+        if (v > top) return (v - top) / ctx.atr[i]
+        if (v < bot) return (v - bot) / ctx.atr[i]
+        return 0
+      })
+    }
+    case 'bandpos': {
+      const type = s.type ?? 'keltner'
+      const period = Math.max(2, Math.round(num(p.period, 20)))
+      const band = type === 'envelope' ? ta.envelope(ctx.close, period, num(p.pct, 2.5)) : ta.keltner(ctx.high, ctx.low, ctx.close, period, num(p.mult, 2))
+      return ctx.close.map((v, i) => {
+        const width = band.upper[i] - band.lower[i]
+        return Number.isFinite(width) && width > 1e-12 ? (v - band.lower[i]) / width : NaN
+      })
+    }
+    case 'volflow': {
+      const type = s.type ?? 'obv'
+      const period = Math.max(2, Math.round(num(p.period, 20)))
+      switch (type) {
+        case 'obv':
+          return rollingZ(ta.obv(ctx.close, ctx.volume), period)
+        case 'ad':
+          return rollingZ(ta.adl(ctx.high, ctx.low, ctx.close, ctx.volume), period)
+        case 'cmf':
+          return ta.cmf(ctx.high, ctx.low, ctx.close, ctx.volume, period)
+        case 'forceindex':
+          return rollingZ(ta.forceIndex(ctx.close, ctx.volume, Math.round(num(p.period, 13))), period)
+        case 'eom':
+          return rollingZ(ta.eom(ctx.high, ctx.low, ctx.volume, period), period)
+        case 'nvi':
+          return rollingZ(ta.nvi(ctx.close, ctx.volume), period)
+        case 'pvi':
+          return rollingZ(ta.pvi(ctx.close, ctx.volume), period)
+        case 'klinger':
+          return rollingZ(ta.klinger(ctx.high, ctx.low, ctx.close, ctx.volume).vf, period)
+        case 'chaikinosc':
+          return rollingZ(ta.chaikinOsc(ctx.high, ctx.low, ctx.close, ctx.volume), period)
+        case 'vwapdist': {
+          const vw = ta.vwap(ctx.candles)
+          return ctx.close.map((v, i) => (ctx.atr[i] > 1e-12 && Number.isFinite(vw[i]) ? (v - vw[i]) / ctx.atr[i] : NaN))
+        }
+        default:
+          return rollingZ(ta.obv(ctx.close, ctx.volume), period)
+      }
+    }
+    case 'levels': {
+      // signed ATR-normalized distance from close to the nearest static
+      // level, recomputed per-bar from ONLY bars up to and including i - no
+      // lookahead (the pivot/fib window looks back from i, never forward).
+      const type = s.type ?? 'pivot'
+      const window = Math.max(5, Math.round(num(p.period, type === 'pivot' ? 20 : 60)))
+      const out: number[] = new Array(ctx.n).fill(NaN)
+      for (let i = window; i < ctx.n; i++) {
+        const slice = ctx.candles.slice(0, i + 1)
+        const atrI = ctx.atr[i]
+        if (!(atrI > 1e-12)) continue
+        let levels: number[]
+        if (type === 'pivot') {
+          const piv = ta.pivotPoints(slice, window)
+          levels = [piv.pp, piv.r1, piv.r2, piv.r3, piv.s1, piv.s2, piv.s3]
+        } else {
+          levels = ta.fibLevels(slice, window).map((l) => l.price)
+        }
+        let nearest = levels[0]
+        let bestDist = Infinity
+        for (const lv of levels) {
+          const d = Math.abs(ctx.close[i] - lv)
+          if (d < bestDist) {
+            bestDist = d
+            nearest = lv
+          }
+        }
+        out[i] = (ctx.close[i] - nearest) / atrI
+      }
+      return out
+    }
   }
 }
 
@@ -342,7 +660,8 @@ export function labelOf(s: SignalDef): string {
     case 'indicator': {
       const p = s.params ?? {}
       const pd = p.period ?? p.fast
-      return `${s.ind}${Number.isFinite(pd) ? `(${pd})` : ''} ${s.op} ${s.threshold}`
+      const tag = s.type ? `:${s.type}` : ''
+      return `${s.ind}${tag}${Number.isFinite(pd) ? `(${pd})` : ''} ${s.op} ${s.threshold}`
     }
   }
 }
@@ -519,7 +838,21 @@ export function evaluateCustom(spec: CustomSpec, candles: Candle[]): CustomEval 
 
 const KNOWN_INDS = new Set([
   'rsi', 'bbpos', 'zscore', 'donchianpos', 'macdz', 'slope', 'streak', 'wickbias', 'emasign', 'hadist', 'bodypos',
+  'psar', 'fractal', 'madist', 'osc0100', 'oscpm100', 'oscz', 'trenddist', 'bandpos', 'volflow', 'levels',
 ])
+// valid params.type values per generic family - inline specs outside this
+// set silently fall back to indicatorSeries' own per-family default rather
+// than being rejected (a wrong `type` string should degrade, not 400).
+const KNOWN_IND_TYPES: Record<string, Set<string>> = {
+  madist: new Set(['sma', 'ema', 'wma', 'dema', 'tema', 'trima', 'kama', 'hma', 'vwma', 'zlema', 't3', 'mcginley', 'linreg', 'midpoint']),
+  osc0100: new Set(['stochk', 'stochd', 'stochrsik', 'stochrsid', 'willr', 'ultosc', 'aroonup', 'aroondown', 'mfi']),
+  oscpm100: new Set(['cci', 'cmo', 'tsi', 'rvi', 'aroonosc']),
+  oscz: new Set(['roc', 'mom', 'ppo', 'apo', 'trix', 'dpo', 'kst', 'qstick', 'awesomeosc', 'fisher', 'massindex', 'natr', 'histvol', 'stddev', 'atrz', 'hilbert', 'ulcer']),
+  trenddist: new Set(['supertrend', 'chandelier', 'ichimoku']),
+  bandpos: new Set(['keltner', 'envelope']),
+  volflow: new Set(['obv', 'ad', 'cmf', 'forceindex', 'eom', 'nvi', 'pvi', 'klinger', 'chaikinosc', 'vwapdist']),
+  levels: new Set(['pivot', 'fib']),
+}
 const KNOWN_HA = new Set(['flip-up', 'flip-down', 'streak-up', 'streak-down', 'strong-bull', 'strong-bear'])
 const KNOWN_LINE = new Set(['breakout-up', 'breakout-down', 'hh-hl', 'lh-ll'])
 const KNOWN_BAR = new Set(['wide-bull', 'wide-bear'])
@@ -562,9 +895,13 @@ export function normalizeSpec(raw: unknown, fallbackName = 'Learned Strategy'): 
         const n = Number(v)
         if (Number.isFinite(n)) params[k] = n
       }
+      const ind = String(o.ind) as IndicatorSignal['ind']
+      const typeSet = KNOWN_IND_TYPES[ind]
+      const type = typeSet && typeSet.has(String(o.type)) ? String(o.type) : undefined
       signals.push({
         kind: 'indicator',
-        ind: String(o.ind) as IndicatorSignal['ind'],
+        ind,
+        ...(type ? { type } : {}),
         params,
         op: o.op,
         threshold: clampN(o.threshold, -1e6, 1e6, 0),

@@ -523,14 +523,14 @@ export function fibLevels(candles: Candle[], lookback = 60): { label: string; pr
 
 export function dema(src: number[], period: number): number[] {
   const e1 = ema(src, period)
-  const e2 = ema(e1, period)
+  const e2 = emaSkipLeadingNaN(e1, period)
   return src.map((_, i) => (isn(e1[i]) && isn(e2[i]) ? 2 * e1[i] - e2[i] : NaN))
 }
 
 export function tema(src: number[], period: number): number[] {
   const e1 = ema(src, period)
-  const e2 = ema(e1, period)
-  const e3 = ema(e2, period)
+  const e2 = emaSkipLeadingNaN(e1, period)
+  const e3 = emaSkipLeadingNaN(e2, period)
   return src.map((_, i) => (isn(e1[i]) && isn(e2[i]) && isn(e3[i]) ? 3 * e1[i] - 3 * e2[i] + e3[i] : NaN))
 }
 
@@ -551,7 +551,7 @@ export function kama(src: number[], period = 10, fast = 2, slow = 30): number[] 
     for (let j = i - period + 1; j <= i; j++) change += Math.abs(src[j] - src[j - 1])
     const er = change === 0 ? 0 : Math.abs(src[i] - src[i - period]) / change
     const sc = Math.pow(er * (fastSC - slowSC) + slowSC, 2)
-    prev = isn(prev) ? src[i] : prev + sc * (src[i] - prev)
+    prev = isn(prev) ? prev + sc * (src[i] - prev) : src[i]
     out[i] = prev
   }
   return out
@@ -585,11 +585,11 @@ export function zlema(src: number[], period: number): number[] {
 
 export function t3(src: number[], period = 5, vf = 0.7): number[] {
   const e1 = ema(src, period)
-  const e2 = ema(e1, period)
-  const e3 = ema(e2, period)
-  const e4 = ema(e3, period)
-  const e5 = ema(e4, period)
-  const e6 = ema(e5, period)
+  const e2 = emaSkipLeadingNaN(e1, period)
+  const e3 = emaSkipLeadingNaN(e2, period)
+  const e4 = emaSkipLeadingNaN(e3, period)
+  const e5 = emaSkipLeadingNaN(e4, period)
+  const e6 = emaSkipLeadingNaN(e5, period)
   const c1 = -(vf * vf * vf)
   const c2 = 3 * vf * vf + 3 * vf * vf * vf
   const c3 = -6 * vf * vf - 3 * vf - 3 * vf * vf * vf
@@ -685,10 +685,34 @@ export function mom(src: number[], period = 10): number[] {
   return src.map((v, i) => (i >= period ? v - src[i - period] : NaN))
 }
 
+/** Run `fn` on a series that may have leading NaNs (sma/ema don't tolerate
+ * NaN inputs mid-series - once one enters a running sum/EMA state it taints
+ * every value after it forever) by running `fn` only on the finite suffix
+ * and padding the NaN prefix back on, same convention as kst/macd's signal
+ * line elsewhere in this file. Use this whenever chaining a second sma/ema
+ * pass over the output of a first (dema/tema/t3/trix/massIndex/tsi and any
+ * rolling stat over an already-smoothed or already-warmed-up series). */
+export function skipLeadingNaN(src: number[], fn: (s: number[]) => number[]): number[] {
+  const firstValid = src.findIndex(isn)
+  const out = new Array<number>(src.length).fill(NaN)
+  if (firstValid < 0) return out
+  const res = fn(src.slice(firstValid))
+  for (let i = 0; i < res.length; i++) out[firstValid + i] = res[i]
+  return out
+}
+
+function emaSkipLeadingNaN(src: number[], period: number): number[] {
+  return skipLeadingNaN(src, (s) => ema(s, period))
+}
+
 export function tsi(src: number[], long = 25, short = 13): { tsi: number[]; signal: number[] } {
+  // True Strength Index: 100 * doubleEMA(momentum) / doubleEMA(|momentum|).
+  // Numerator carries the SIGN (net directional momentum); denominator is
+  // the double-smoothed ABSOLUTE momentum (a magnitude, never sign-crossing
+  // near zero the way a signed denominator would).
   const pc = src.map((v, i) => (i > 0 ? v - src[i - 1] : 0))
-  const num = ema(ema(pc.map(Math.abs), long), short)
-  const den = ema(ema(pc, long), short)
+  const num = emaSkipLeadingNaN(emaSkipLeadingNaN(pc, long), short)
+  const den = emaSkipLeadingNaN(emaSkipLeadingNaN(pc.map(Math.abs), long), short)
   const line = num.map((n, i) => (isn(n) && isn(den[i]) && den[i] !== 0 ? (n / den[i]) * 100 : NaN))
   const firstValid = line.findIndex(isn)
   const sig = firstValid >= 0 ? ema(line.slice(firstValid).filter(isn), 7) : []
@@ -941,7 +965,7 @@ export function chandelierExit(high: number[], low: number[], close: number[], p
 export function massIndex(high: number[], low: number[], period = 9, sumPeriod = 25): number[] {
   const range = high.map((h, i) => h - low[i])
   const e1 = ema(range, period)
-  const e2 = ema(e1, period)
+  const e2 = emaSkipLeadingNaN(e1, period)
   const ratio = e1.map((v, i) => (isn(v) && isn(e2[i]) && e2[i] !== 0 ? v / e2[i] : NaN))
   const out = new Array<number>(high.length).fill(NaN)
   for (let i = sumPeriod - 1; i < high.length; i++) {
@@ -1018,7 +1042,7 @@ export function aroon(high: number[], low: number[], period = 14): { up: number[
 }
 
 export function trix(src: number[], period = 15): { trix: number[]; signal: number[] } {
-  const e3 = ema(ema(ema(src, period), period), period)
+  const e3 = emaSkipLeadingNaN(emaSkipLeadingNaN(ema(src, period), period), period)
   const line = e3.map((v, i) => (isn(v) && i > 0 && e3[i - 1] !== 0 ? ((v - e3[i - 1]) / e3[i - 1]) * 10000 : NaN))
   const firstValid = line.findIndex(isn)
   const sig = firstValid >= 0 ? ema(line.slice(firstValid).filter(isn), 9) : []
