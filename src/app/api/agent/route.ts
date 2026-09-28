@@ -92,6 +92,50 @@ const TF_MINUTES: Record<string, number> = {
   '5s': 1 / 12, '15s': 0.25, '30s': 0.5, '1m': 1, '2m': 2, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1d': 1440,
 }
 
+/** Canonical Timeframe tokens are '5s'|'15s'|'30s'|'1m'|'2m'|'5m'|'15m'|'30m'|
+ * '1h'|'4h'|'1d' - every candle/analysis store is keyed by this exact string,
+ * with no on-demand aggregation at read time. The model has plenty of
+ * in-context examples showing "1m"/"5m"/"2m" but almost none showing the
+ * hour/day tokens, and "60 minute"/"hourly" phrasing invites it to write
+ * "60m"/"1hr"/"hourly" instead of "1h" - which isn't a KeyError anywhere,
+ * it just looks up an empty bucket and comes back "no data" even though the
+ * UI (which only ever sends the canonical token from its own dropdown) sees
+ * the same feed working fine. Normalize the common misspellings here, once,
+ * for every tool call, rather than expecting 30+ tool descriptions to each
+ * spell out the enum and every model turn to get it right unprompted. */
+const TF_ALIASES: Record<string, string> = {
+  '60m': '1h', '60min': '1h', '60 min': '1h', '60minute': '1h', '60minutes': '1h', '1hr': '1h', '1hour': '1h', 'hour': '1h', 'hourly': '1h',
+  '240m': '4h', '4hr': '4h', '4hour': '4h', '4hours': '4h',
+  '1440m': '1d', '24h': '1d', 'day': '1d', 'daily': '1d',
+  '1min': '1m', '1minute': '1m', 'minute': '1m',
+  '2min': '2m', '2minutes': '2m',
+  '5min': '5m', '5minutes': '5m',
+  '15min': '15m', '15minutes': '15m',
+  '30min': '30m', '30minutes': '30m',
+}
+
+function normalizeTf(v: unknown): unknown {
+  if (typeof v !== 'string') return v
+  const key = v.trim().toLowerCase()
+  return TF_ALIASES[key] ?? v
+}
+
+/** Applied to every tool call's args right before dispatch: normalizes any
+ * `tf` field (top-level or nested one level, e.g. inside a bot_create/
+ * indicator payload) so a plausible-but-wrong timeframe token still resolves
+ * to the canonical one the backend actually stores data under. */
+function normalizeToolArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...args }
+  if ('tf' in out) out.tf = normalizeTf(out.tf)
+  for (const k of Object.keys(out)) {
+    const val = out[k]
+    if (val && typeof val === 'object' && !Array.isArray(val) && 'tf' in (val as Record<string, unknown>)) {
+      out[k] = { ...(val as Record<string, unknown>), tf: normalizeTf((val as Record<string, unknown>).tf) }
+    }
+  }
+  return out
+}
+
 /** Last finite value of a sparse indicator series (nulls at the warmup head). */
 function lastFinite(values: (number | null)[]): number | null {
   for (let i = values.length - 1; i >= 0; i--) {
@@ -1487,6 +1531,7 @@ Rules:
 - PERIODS + DE-RISK: "compound for N periods" = stakePlan.periods N - the Nth WIN completes the cycle (bot stands down "cycle complete", restart to run again; onComplete:"reseed" auto-repeats instead). "after the 5th period continue with half" = stakePlan.deriskAfter 5 + deriskPct 50 - from win #6 the bot stakes HALF the pot, so a late loss only burns that half and everything earlier stays banked. Always mirror periods/derisk into the compound_plan ladder you show (pass periods, deriskAfter, deriskPct) - it returns cycleProfit for a perfect run and phase:"derisk" rows.
 - SESSIONS: "trade only the overlap session" / "London only" = bot session field (london 08-17 UTC, newyork 13-22 UTC, overlap = London x NY 13-17 UTC, asia 00-09 UTC, sydney 21-06 UTC). Outside the window the bot stands down with "outside ... session". State the UTC window AND the Lagos (UTC+1) equivalent when proposing it.
 - TIME EXPIRY: "expiry 15 minutes" (or any minute-based expiry) on a bot = kind "digital" + expirySec (minutes * 60), NOT expiryBars - expiryBars counts candles of the tf (15 min on 2m candles would be 7.5 bars, impossible). Digital settles at the exact timestamp against a strike, both paper and live.
+- TIMEFRAME TOKENS: every candle/analysis store is keyed by the EXACT string "5s"|"15s"|"30s"|"1m"|"2m"|"5m"|"15m"|"30m"|"1h"|"4h"|"1d" - there is no "60m", it's "1h" ("1 hour"/"hourly"/"60 minute" all mean tf "1h"); no "240m", it's "4h"; no "1440m"/"24h"/"daily", it's "1d". A near-miss token isn't an error, it just looks up an empty bucket and comes back "no data" even though that exact market has plenty of history under its real token - if a tool ever says no data for a timeframe the UI clearly shows working, re-check you sent the canonical token before concluding data is missing.
 - DEPLOYMENT CONFIRMATION PROTOCOL (MANDATORY for ANY bot_create that will trade autonomously): when the user describes automation in natural language, DO NOT deploy on the first reply. 1) Parse every clause into its exact config. 2) Reply with a numbered RULE SHEET: strategy + params, watchlist, timeframe, kind + expiry (state WHY digital+expirySec when minutes are involved), no-concurrent rule (maxOpen 1), stake plan (seed, roll %, payout cap 70, stop-on-loss, periods, de-risk), session window in UTC + Lagos time, cooldown, minScore, plus the compound_plan ladder with cycleProfit. 3) Flag anything you had to ASSUME and propose a default. 4) Ask "confirm and I deploy" and WAIT - deploy only after the user explicitly agrees or amends. 5) After deploying: report the bot id, that it is ARMED and trading autonomously, and how to stop/restart it.
 - RESEARCH WORKFLOW (use it whenever the user wants a validated strategy or asks "is this edge real"): 1) asset_sweep to find WHERE a strategy has an edge, 2) optimize_strategy on the best assets to find strong params, 3) walkforward on the winner - deploy only if OOS net is positive and at least half the folds were profitable, 4) only then bot_create with the validated params (keep the bot DISARMED and tell the user to arm it when ready). After arming, the watchdog watches the live edge - mention that. Research reads DEEP archived history; archive_status shows how much depth exists per asset - if depth is thin, warn that results may not be significant yet. Report IS vs OOS numbers honestly - large drops from in-sample to out-of-sample mean overfit.
 - AI LEARNING AGENT (Strategy Lab - "learn this pair", "build your own strategy", "find your own patterns", "make me a new indicator"): you have your own research desk. lab_learn mines a pair's history for edge-bearing events across candlestick patterns, wide-range bar formations, HEIKEN ASHI structures, line breaks and invented indicators, weights the survivors by measured win-rate edge, calibrates a confluence threshold and backtests the composed spec (full sample + holdout on the last 30%). Report the discovery table (n, win rate, edge, weight) and the backtest vs breakevenWinRate HONESTLY - a holdout win rate below breakeven means the edge did not survive, say so. Iterate like a quant: try another horizon (2-3), more bars, a lower minEdge, or a different tf before giving up. You may also INVENT your own spec (lab_backtest accepts inline specs - the tool doc has the full DSL; dir can invert a pattern to fade it) and lab_save the winners. DEPLOY: lab_save the spec, then follow the DEPLOYMENT CONFIRMATION PROTOCOL and bot_create with strategyId "custom:<id>" (learned ids work everywhere builtin ids do - stake plans, compounding, sessions). Learned bots compound too: a $1 seed rolling on a spec the lab just validated is a perfectly normal ask - mirror periods/de-risk into compound_plan as always.
@@ -1771,7 +1816,12 @@ export async function POST(req: NextRequest) {
             if (act.say) emit({ type: 'say', text: act.say })
             const tool = TOOLS.find((t) => t.name === act.action)
             const id = trace.length + 1
-            emit({ type: 'tool_start', id, tool: act.action, args: act.args })
+            // normalize tf tokens ("60m"/"1hr"/"hourly" -> "1h") before the
+            // client preview AND the actual dispatch, so what's shown and
+            // what's sent always match - a plausible-but-wrong tf otherwise
+            // silently looks up an empty bucket and comes back "no data".
+            const normArgs = normalizeToolArgs(act.args ?? {})
+            emit({ type: 'tool_start', id, tool: act.action, args: normArgs })
             const t0 = Date.now()
             let result: unknown
             let ok = true
@@ -1780,7 +1830,7 @@ export async function POST(req: NextRequest) {
               ok = false
             } else {
               try {
-                result = await tool.run(act.args ?? {}, { emit, signal: req.signal })
+                result = await tool.run(normArgs, { emit, signal: req.signal })
                 if (result && typeof result === 'object' && 'ok' in (result as Record<string, unknown>)) {
                   ok = Boolean((result as Record<string, unknown>).ok)
                 }
@@ -1790,7 +1840,7 @@ export async function POST(req: NextRequest) {
               }
             }
             const ms = Date.now() - t0
-            trace.push({ tool: act.action, args: act.args, result, say: act.say, ms, ok })
+            trace.push({ tool: act.action, args: normArgs, result, say: act.say, ms, ok })
             // preview feeds both the client card renderers and the expandable raw view
             emit({ type: 'tool_end', id, tool: act.action, ms, ok, preview: previewOf(result, 4000) })
             messages.push({ role: 'assistant', content: JSON.stringify({ action: act.action, say: act.say }) })
