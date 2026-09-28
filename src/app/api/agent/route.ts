@@ -390,9 +390,36 @@ const TOOLS: ToolSpec[] = [
   // ---------- strategies & backtesting ----------
   {
     name: 'list_strategies',
-    description: 'List all registered trading strategies with their tunable parameters.',
+    description: 'List all registered trading strategies (id, name, a short one-line description). The roster has grown well past a small handful, so this returns a COMPACT summary to stay under the tool-result size cap - pass {"id":"<strategy-id>"} to get that one strategy\'s full description and tunable params (type/min/max/default) for configuring it precisely in run_strategy/bot_create.',
     args: '{}',
-    run: () => coreGet('/strategies'),
+    run: async (a) => {
+      const res = (await coreGet('/strategies')) as { ok: boolean; strategies?: { id: string; name: string; description: string; params: { key: string }[] }[]; error?: string }
+      if (!res.ok || !res.strategies) return res
+      if (a.id) {
+        const full = res.strategies.find((s) => s.id === a.id)
+        return full ? { ok: true, strategy: full } : { ok: false, error: `unknown strategy id "${a.id}" - call list_strategies with no args for the full roster of ids` }
+      }
+      // full per-strategy payload (description + param type/min/max/default
+      // for every strategy) blows well past the 4000-char tool-result cap
+      // (feedOf) once the registry passes ~15 entries, silently truncating
+      // the JSON mid-array and dropping whichever strategies sorted after
+      // the cutoff - which is exactly what happened here (kalman-ou-
+      // reversion and others went missing from what the model saw, even
+      // though they were registered the whole time). Keep the default
+      // listing tiny - id/name/a short description, no params - so the
+      // FULL roster of ids always reaches the model regardless of how many
+      // strategies exist; fetch one id's full detail with {"id": ...} only
+      // when actually configuring it.
+      return {
+        ok: true,
+        count: res.strategies.length,
+        strategies: res.strategies.map((s) => ({
+          id: s.id,
+          name: s.name,
+          description: s.description.length > 50 ? s.description.slice(0, 50) + '…' : s.description,
+        })),
+      }
+    },
   },
   {
     name: 'run_strategy',
@@ -1125,25 +1152,25 @@ const TOOLS: ToolSpec[] = [
         TRENDING: {
           fits: ['continuation entries on pullbacks', 'buying dips / selling rips in the trend direction', 'riding the 4-layer synthesis stacks'],
           avoid: ['fading extremes (rsi-reversion, bb-bounce)', 'tight mean-reversion targets against the trend'],
-          strategies: ['ema-trend', 'supertrend-follow', 'donchian-breakout', 'vsk-synthesis', 'tsk-synthesis'],
+          strategies: ['ema-trend', 'supertrend-follow', 'donchian-breakout', 'kalman-ou-adaptive-trend', 'vsk-synthesis', 'tsk-synthesis'],
           expiryStyle: '1-2 bars of the working tf; give pullbacks room to resolve in trend direction',
         },
         RANGING: {
           fits: ['fading range extremes', 'entries at band/pivot edges back to the middle'],
           avoid: ['breakout chasing (donchian, supertrend)', 'trend-riding with tight trailing stops'],
-          strategies: ['rsi-reversion', 'bb-bounce', 'stoch-cross', 'kalman-ou-reversion'],
+          strategies: ['rsi-reversion', 'bb-bounce', 'stoch-cross', 'kalman-ou-reversion', 'kalman-ou-scalp', 'kalman-mc-reversion-prob'],
           expiryStyle: '1 bar of the working tf; mean-reversion resolves fast at range edges',
         },
         VOLATILE: {
           fits: ['waiting for the vol spike to decay', 'small size, wide invalidation', 'gap-and-go continuation after shocks settle'],
           avoid: ['tight-stop scalping', 'oversized positions', 'trading the first bars after the spike'],
-          strategies: ['confluence-core (with high minScore)', 'markov-edge (regime-aware)'],
+          strategies: ['confluence-core (with high minScore)', 'markov-edge (regime-aware)', 'markov-vol-regime', 'kalman-ou-vol-regime', 'kalman-ou-breakout'],
           expiryStyle: 'stand aside until garchVol/ewmaVol ratio cools below ~1.3, then resume normal style',
         },
         MIXED: {
           fits: ['waiting for clearer regime', 'small-size probe trades with confluence_read >= 25'],
           avoid: ['heavy size on ambiguous reads'],
-          strategies: ['confluence-core', 'pattern-confluence', 'markov-edge'],
+          strategies: ['confluence-core', 'pattern-confluence', 'markov-edge', 'mc-fairvalue-edge'],
           expiryStyle: '1 bar, minimum stake until regime resolves',
         },
       }
@@ -1456,7 +1483,7 @@ Rules:
 - Use ui_control to set up the workspace when it helps (e.g. add Bollinger + RSI before a detailed read, or switch to the asset you're discussing). Do not undo the user's layout gratuitously. The chart starts CLEAN (no default overlays) and the user's indicator selection PERSISTS across page refreshes - so adding an indicator is safe and durable; classic render forms apply: psar draws as traditional dots, "fractals" as swing arrows (red above highs, green below lows), "zigzag" as connected swing segments.
 - For trade ideas: check multi_timeframe confluence first, size with risk_calculator, then optionally place_trade as PAPER and say so.
 - When the user asks to automate a strategy, deploy a bot with bot_create: pick a sensible strategyId, conservative stake (<=2% of balance), minScore >= 55, and always confirm the config in your final answer. Backtest or run_strategy first when unsure about the edge.
-- COMPOUNDING bots: when the user wants winnings to roll ("let it ride", "compound my $1"), deploy bot_create with stakePlan {kind:"compound", base:<seed>, rollPct:100, maxStake:<cap>} and maxOpen 1. Compounding is MONEY-MANAGEMENT, not a signal - it wraps ANY of the 13 strategies (rsi-reversion ... tsk-synthesis): pick the strategyId freely, the stakePlan rides on top. First show the ladder with compound_plan - payout is HARD-CAPPED at 70% (a broker paying 85-92% still compounds at 70%, the excess is skimmed to the balance). The default deal: ONE LOSS ENDS THE CYCLE - the bot stands down ("cycle ended") and will not trade again until the user explicitly restarts it (bot_restart / panel Restart button). If the user asks to stop-on-loss or restart a halted bot, that is bot_restart. Warn: the whole cycle risks only the seed, but one loss ends the run.
+- COMPOUNDING bots: when the user wants winnings to roll ("let it ride", "compound my $1"), deploy bot_create with stakePlan {kind:"compound", base:<seed>, rollPct:100, maxStake:<cap>}. Compounding is MONEY-MANAGEMENT, not a signal - it wraps ANY registered strategy (run list_strategies for the live roster and ids - the registry has grown well past the original 13 and now spans multiple Kalman-OU variants, Markov-chain variants, and two Monte Carlo strategies, plus AI-learned custom:* ids): pick the strategyId freely, the stakePlan rides on top. First show the ladder with compound_plan - payout is HARD-CAPPED at 70% (a broker paying 85-92% still compounds at 70%, the excess is skimmed to the balance). The default deal: ONE LOSS ENDS THE CYCLE - the bot stands down ("cycle ended") and will not trade again until the user explicitly restarts it (bot_restart / panel Restart button). If the user asks to stop-on-loss or restart a halted bot, that is bot_restart. Warn: the whole cycle risks only the seed, but one loss ends the run. IMPORTANT: a compound bot is hard-clamped server-side to maxOpen:1 and a single-asset watchlist - the pot has no reservation between placing a trade and settling it, so a second concurrent trade (another watchlist asset, or maxOpen>1) would stake off the same pot and corrupt the roll. If the user wants to compound-trade several assets, that is several separate single-asset compound bots, not one bot with a multi-asset watchlist.
 - PERIODS + DE-RISK: "compound for N periods" = stakePlan.periods N - the Nth WIN completes the cycle (bot stands down "cycle complete", restart to run again; onComplete:"reseed" auto-repeats instead). "after the 5th period continue with half" = stakePlan.deriskAfter 5 + deriskPct 50 - from win #6 the bot stakes HALF the pot, so a late loss only burns that half and everything earlier stays banked. Always mirror periods/derisk into the compound_plan ladder you show (pass periods, deriskAfter, deriskPct) - it returns cycleProfit for a perfect run and phase:"derisk" rows.
 - SESSIONS: "trade only the overlap session" / "London only" = bot session field (london 08-17 UTC, newyork 13-22 UTC, overlap = London x NY 13-17 UTC, asia 00-09 UTC, sydney 21-06 UTC). Outside the window the bot stands down with "outside ... session". State the UTC window AND the Lagos (UTC+1) equivalent when proposing it.
 - TIME EXPIRY: "expiry 15 minutes" (or any minute-based expiry) on a bot = kind "digital" + expirySec (minutes * 60), NOT expiryBars - expiryBars counts candles of the tf (15 min on 2m candles would be 7.5 bars, impossible). Digital settles at the exact timestamp against a strike, both paper and live.
