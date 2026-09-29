@@ -409,7 +409,14 @@ export class StrategyLabService {
     const spec = normalizeSpec(input.spec, input.name ?? 'Learned Strategy')
     if (!spec) throw new Error('invalid spec - no usable signals survived normalization')
     if (input.name) spec.name = String(input.name).slice(0, 60)
-    const id = (input.id?.trim() || `custom:${slugify(spec.name)}`).toLowerCase()
+    // Defensive: `id` is the literal strategyId ("custom:<slug>") returned to
+    // callers - it must carry the "custom:" prefix EXACTLY ONCE. A caller
+    // that already has an id (or a name) containing "custom:" and then
+    // prefixes it again produces "custom:custom:..." - a strategyId that
+    // looks saved but matches nothing in the library (bot_create/lab_get
+    // look up the exact string). Collapse any repeated prefix here so a
+    // mistake upstream can't silently mint an undeployable id.
+    const id = (input.id?.trim() || `custom:${slugify(spec.name)}`).toLowerCase().replace(/^(?:custom:)+/, 'custom:')
     this.store.saveLabStrategy({
       id,
       spec,

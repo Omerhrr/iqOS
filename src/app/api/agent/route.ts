@@ -486,10 +486,12 @@ const TOOLS: ToolSpec[] = [
   },
   {
     name: 'backtest',
-    description: 'Backtest a strategy over recent history. Returns trades, win rate, profit factor, max drawdown, Sharpe, expectancy and the equity curve.',
+    description: 'Backtest a strategy over recent history. strategy and asset are REQUIRED (same discipline as run_strategy - a missing one used to silently default and produce a plausible-looking but wrong-instrument result). Returns trades, win rate, profit factor, max drawdown, Sharpe, expectancy and the equity curve.',
     args: '{"strategy": "rsi-reversion", "asset": "EURUSD", "tf": "1m", "mode": "binary|spot", "amount": 10, "expiryBars": 1, "params": {}}',
-    run: (a) =>
-      corePost('/backtest', {
+    run: (a) => {
+      if (!a.strategy || typeof a.strategy !== 'string') return Promise.resolve({ ok: false, error: 'backtest requires "strategy" (a strategy id from list_strategies)' })
+      if (!a.asset || typeof a.asset !== 'string') return Promise.resolve({ ok: false, error: 'backtest requires "asset" - refusing to silently fall back to whatever asset is active in the UI' })
+      return corePost('/backtest', {
         strategy: a.strategy,
         asset: a.asset,
         tf: a.tf ?? '1m',
@@ -497,15 +499,18 @@ const TOOLS: ToolSpec[] = [
         amount: a.amount ?? 10,
         expiryBars: a.expiryBars ?? 1,
         params: a.params,
-      }),
+      })
+    },
   },
   // ---------- research: optimization lab ----------
   {
     name: 'optimize_strategy',
-    description: 'Grid-search a strategy over recent history: sweep numeric params (from/to/step), rank combos by objective (netPnl|sharpe|profitFactor|winRate|expectancy). Top-3 finalists are re-verified by the full settlement engine. Use BEFORE creating a bot: optimize, then bot_create with the winning params. Keep grids tight (<= 240 combos).',
+    description: 'Grid-search a strategy over recent history: sweep numeric params (from/to/step), rank combos by objective (netPnl|sharpe|profitFactor|winRate|expectancy). Top-3 finalists are re-verified by the full settlement engine. Use BEFORE creating a bot: optimize, then bot_create with the winning params. Keep grids tight (<= 240 combos). strategy and asset are REQUIRED.',
     args: '{"strategy": "rsi-reversion", "asset": "EURUSD", "tf": "1m", "sweep": {"period": {"from": 7, "to": 21, "step": 2}, "oversold": {"from": 20, "to": 35, "step": 5}}, "objective": "netPnl", "minTrades": 8, "expiryBars": 1}',
-    run: (a) =>
-      corePost('/optimize', {
+    run: (a) => {
+      if (!a.strategy || typeof a.strategy !== 'string') return Promise.resolve({ ok: false, error: 'optimize_strategy requires "strategy" (a strategy id from list_strategies)' })
+      if (!a.asset || typeof a.asset !== 'string') return Promise.resolve({ ok: false, error: 'optimize_strategy requires "asset" - refusing to silently fall back to whatever asset is active in the UI' })
+      return corePost('/optimize', {
         strategy: a.strategy,
         asset: a.asset,
         tf: a.tf ?? '1m',
@@ -513,14 +518,17 @@ const TOOLS: ToolSpec[] = [
         objective: a.objective ?? 'netPnl',
         minTrades: a.minTrades ?? 8,
         expiryBars: a.expiryBars ?? 1,
-      }),
+      })
+    },
   },
   {
     name: 'walkforward',
-    description: 'Walk-forward validation: splits history into folds, optimizes params in-sample per fold, then settles the winner out-of-sample with the real binary engine. Reports OOS net, consistency (profitable folds), IS-to-OOS efficiency and a robust/weak/failed verdict — the honest edge check before deploying a bot. The verdict is PERSISTED: a robust pass for this exact asset+tf+strategy is now REQUIRED before bot_create/bot_toggle will arm a bot on it (the research gate), and it goes stale after 14 days. Pass the same sweep spec as optimize_strategy.',
+    description: 'Walk-forward validation: splits history into folds, optimizes params in-sample per fold, then settles the winner out-of-sample with the real binary engine. Reports OOS net, consistency (profitable folds), IS-to-OOS efficiency and a robust/weak/failed verdict — the honest edge check before deploying a bot. The verdict is PERSISTED: a robust pass for this exact asset+tf+strategy is now REQUIRED before bot_create/bot_toggle will arm a bot on it (the research gate), and it goes stale after 14 days. Pass the same sweep spec as optimize_strategy. strategy and asset are REQUIRED.',
     args: '{"strategy": "rsi-reversion", "asset": "EURUSD", "tf": "1m", "sweep": {"period": {"from": 7, "to": 21, "step": 2}}, "folds": 3, "isRatio": 0.7, "objective": "netPnl"}',
-    run: (a) =>
-      corePost('/walkforward', {
+    run: (a) => {
+      if (!a.strategy || typeof a.strategy !== 'string') return Promise.resolve({ ok: false, error: 'walkforward requires "strategy" (a strategy id from list_strategies)' })
+      if (!a.asset || typeof a.asset !== 'string') return Promise.resolve({ ok: false, error: 'walkforward requires "asset" - refusing to silently fall back to whatever asset is active in the UI' })
+      return corePost('/walkforward', {
         strategy: a.strategy,
         asset: a.asset,
         tf: a.tf ?? '1m',
@@ -530,7 +538,8 @@ const TOOLS: ToolSpec[] = [
         folds: a.folds ?? 3,
         isRatio: a.isRatio ?? 0.7,
         expiryBars: a.expiryBars ?? 1,
-      }),
+      })
+    },
   },
   {
     name: 'calibration_report',
@@ -546,10 +555,11 @@ const TOOLS: ToolSpec[] = [
   },
   {
     name: 'asset_sweep',
-    description: 'Run ONE strategy/param set across the whole instrument universe (or a category: forex|otc|crypto|commodity|stock|index) and rank assets by objective. Finds WHERE an edge holds before pinning a bot to an instrument. Rows include per-asset win rate, PF, drawdown and Sharpe.',
+    description: 'Run ONE strategy/param set across the whole instrument universe (or a category: forex|otc|crypto|commodity|stock|index) and rank assets by objective. Finds WHERE an edge holds before pinning a bot to an instrument. Rows include per-asset win rate, PF, drawdown and Sharpe. strategy is REQUIRED.',
     args: '{"strategy": "ema-trend", "tf": "5m", "category": "crypto", "params": {"fast": 9, "slow": 21, "adx": 22}, "objective": "netPnl", "minTrades": 8, "maxAssets": 40}',
-    run: (a) =>
-      corePost('/asset_sweep', {
+    run: (a) => {
+      if (!a.strategy || typeof a.strategy !== 'string') return Promise.resolve({ ok: false, error: 'asset_sweep requires "strategy" (a strategy id from list_strategies)' })
+      return corePost('/asset_sweep', {
         strategy: a.strategy,
         tf: a.tf ?? '1m',
         category: a.category ?? 'all',
@@ -557,7 +567,8 @@ const TOOLS: ToolSpec[] = [
         objective: a.objective ?? 'netPnl',
         minTrades: a.minTrades ?? 8,
         maxAssets: a.maxAssets ?? 40,
-      }),
+      })
+    },
   },
   // ---------- risk & execution ----------
   {
@@ -641,7 +652,7 @@ const TOOLS: ToolSpec[] = [
     name: 'trade_history',
     description: 'Recent closed trades with P&L.',
     args: '{"limit": 20}',
-    run: () => coreGet('/history?limit=30'),
+    run: (a) => coreGet(`/history?limit=${Math.min(Math.max(Math.round(Number(a.limit ?? 20)) || 20, 1), 500)}`),
   },
   {
     name: 'account',
@@ -678,14 +689,31 @@ const TOOLS: ToolSpec[] = [
     name: 'bot_create',
     description: 'Create or update an autopilot bot. Required: watchlist (array of tickers), strategyId (from list_strategies - builtin ids OR AI-learned "custom:*" ids from the Strategy Lab), tf. Optional: name, kind (binary|turbo|digital|cfd), stake, expiryBars, expirySec (TIME-based expiry in seconds for digital bots - "15 minute expiry" = kind digital + expirySec 900, independent of tf), session (all|london|newyork|overlap|asia|sydney - only trade inside that UTC window; overlap = London x New York 13:00-17:00 UTC), minScore (min |signal score| to trade, default 55), direction (both|call|put), regime (all|trend|range|avoid-volatile - trend/range now check the same TRENDING/RANGING/VOLATILE/MIXED classification as regime_playbook, not just Markov bull/bear; avoid-volatile allows any direction but blocks entries during a vol spike), maxOpen, cooldownSec, dailyProfitTarget, dailyLossLimit, enabled, stakePlan. COMPOUNDING: pass stakePlan {kind:"compound", base:1, rollPct:100, maxStake:50} to roll a pot - the first trade stakes base, every win folds the payout into the pot. PAYOUT IS CAPPED AT 70% (payoutCap, max 70 - higher broker payouts are skimmed to balance, never compounded). STOP-ON-LOSS (default true): one loss ENDS the cycle - the bot stands down until the user restarts it with bot_restart; pass stopOnLoss:false to keep the legacy re-seed-and-continue roll instead (set maxOpen:1 for a clean one-trade-at-a-time ladder; stake is then ignored). PERIODS: stakePlan.periods (e.g. 7) bounds the cycle - the Nth WIN completes it; onComplete "halt" (default) stands down until bot_restart, "reseed" auto-starts a fresh cycle. DE-RISK: stakePlan.deriskAfter + deriskPct (e.g. 5 + 50) - after that many wins the bot stakes only that % of the pot ("continue with half the 5th-period amount"), so a late loss cannot give back the whole ladder. Show the ladder first with compound_plan (pass the same periods/derisk). Bots trade automatically on candle close and are always subject to the global risk manager.',
     args: '{"name": "EUR compound 7p", "watchlist": ["EURUSD", "GBPUSD", "USDJPY"], "strategyId": "confluence-core", "tf": "2m", "kind": "digital", "expirySec": 900, "session": "overlap", "stakePlan": {"kind": "compound", "base": 1, "rollPct": 100, "payoutCap": 70, "stopOnLoss": true, "periods": 7, "deriskAfter": 5, "deriskPct": 50, "onComplete": "halt"}, "minScore": 55, "maxOpen": 1, "enabled": true}',
-    run: (a) =>
-      corePost('/bot_save', {
+    run: (a) => {
+      // A bot trades autonomously and repeatedly - a silently-defaulted
+      // watchlist/strategyId/tf (rather than an explicit error) would arm it
+      // on the wrong instrument/strategy with no visible sign anything was
+      // wrong, unlike a one-off analysis call. Require them explicitly,
+      // same discipline as run_strategy/backtest/optimize_strategy.
+      if (!a.id) {
+        if (!Array.isArray(a.watchlist) || a.watchlist.length === 0) {
+          return Promise.resolve({ ok: false, error: 'bot_create requires a non-empty "watchlist" array - refusing to silently default to the active chart asset' })
+        }
+        if (!a.strategyId || typeof a.strategyId !== 'string') {
+          return Promise.resolve({ ok: false, error: 'bot_create requires "strategyId" (from list_strategies, or a "custom:*" lab id)' })
+        }
+        if (!a.tf || typeof a.tf !== 'string') {
+          return Promise.resolve({ ok: false, error: 'bot_create requires "tf"' })
+        }
+      }
+      return corePost('/bot_save', {
         ...a,
         stake: a.stake !== undefined ? Number(a.stake) : undefined,
         minScore: a.minScore !== undefined ? Number(a.minScore) : undefined,
         maxOpen: a.maxOpen !== undefined ? Number(a.maxOpen) : undefined,
         cooldownSec: a.cooldownSec !== undefined ? Number(a.cooldownSec) : undefined,
-      }),
+      })
+    },
   },
   {
     name: 'bot_toggle',
@@ -758,7 +786,7 @@ const TOOLS: ToolSpec[] = [
   },
   {
     name: 'lab_list',
-    description: 'List the learned-strategy library: id (custom:*), spec summary, asset/tf and the saved backtest/holdout stats. These ids are valid strategyIds for bot_create.',
+    description: 'List the learned-strategy library: id (custom:*), spec summary, asset/tf and the saved backtest/holdout stats. These ids are valid strategyIds for bot_create. VERIFICATION: always call this right after lab_save (or trust create_strategy\'s own built-in verification) and confirm the exact id string is present before telling the user a strategy is saved/deployable - an "ok:true" from a save call is not proof of persistence.',
     args: '{}',
     run: () => coreGet('/lab_list'),
   },
@@ -813,7 +841,14 @@ const TOOLS: ToolSpec[] = [
       }
 
       if (!learned.ok) {
-        return { ok: false, mode, passed: false, saved: false, reason: 'no edge found / backtest failed', detail: learned }
+        return {
+          ok: false,
+          mode,
+          passed: false,
+          saved: false,
+          reason: String(learned.error ?? learned.note ?? 'no edge found / backtest failed'),
+          detail: learned,
+        }
       }
 
       const spec = learned.spec
@@ -835,9 +870,23 @@ const TOOLS: ToolSpec[] = [
           tf,
           stats: { backtest, holdout, breakeven: breakevenWinRate },
         })) as { ok?: boolean; id?: string; error?: string }
+        // lab_save's `id` ALREADY carries the "custom:" prefix (it's the
+        // literal strategyId, e.g. "custom:eurusd-otc-fractal-psar-flip") -
+        // do NOT prefix it again here, that's exactly how the doubled
+        // "custom:custom:..." id bug happened. And "ok:true" from the save
+        // call is not proof of persistence - verify against lab_list before
+        // ever reporting saved:true, so a silent write failure never gets
+        // reported as a real deployable strategyId.
         if (saveRes.ok && saveRes.id) {
-          saved = true
-          strategyId = `custom:${saveRes.id}`
+          const idToVerify = saveRes.id
+          const listRes = (await coreGet('/lab_list')) as { ok?: boolean; strategies?: { id?: string }[] }
+          const persisted = !!listRes.ok && Array.isArray(listRes.strategies) && listRes.strategies.some((r) => r.id === idToVerify)
+          if (persisted) {
+            saved = true
+            strategyId = idToVerify
+          } else {
+            saveError = `lab_save returned ok with id "${idToVerify}" but it is NOT present in lab_list - the write did not actually persist`
+          }
         } else {
           saveError = saveRes.error ?? 'lab_save did not return an id'
         }
@@ -845,8 +894,8 @@ const TOOLS: ToolSpec[] = [
 
       const note = passed
         ? saved
-          ? `PASSED holdout (${holdoutWinRate.toFixed(1)}% vs breakeven ${breakevenWinRate.toFixed(1)}%, ${holdoutTrades} trades) - saved as ${strategyId}. Deploy with bot_create.`
-          : `PASSED holdout but NOT saved (save:false or lab_save error: ${saveError ?? 'n/a'}) - re-run with save:true or call lab_save yourself.`
+          ? `PASSED holdout (${holdoutWinRate.toFixed(1)}% vs breakeven ${breakevenWinRate.toFixed(1)}%, ${holdoutTrades} trades) - saved AND VERIFIED PRESENT in lab_list as ${strategyId}. Deploy with bot_create.`
+          : `PASSED holdout but NOT confirmed saved (save:false, or: ${saveError ?? 'n/a'}) - do not claim it is deployable. Re-run with save:true, or lab_save + lab_list yourself to confirm persistence before offering bot_create.`
         : `FAILED holdout: ${holdout ? `${holdoutWinRate.toFixed(1)}% over ${holdoutTrades} trades vs breakeven ${breakevenWinRate.toFixed(1)}% (+${minHoldoutEdge} margin required)` : 'no holdout window available'} - not saved. Report this honestly; do not claim deployment.`
 
       return { ok: true, mode, passed, saved, strategyId, spec, backtest, holdout, breakevenWinRate, holdoutFolds: learned.holdoutFolds, note }
@@ -870,7 +919,7 @@ const TOOLS: ToolSpec[] = [
       if (a.direction) p.set('direction', String(a.direction))
       if (a.minScore !== undefined) p.set('minScore', String(a.minScore))
       if (a.q) p.set('q', String(a.q))
-      p.set('limit', String(Math.min(Number(a.limit ?? 12), 50)))
+      p.set('limit', String(Math.min(Math.max(Math.round(Number(a.limit ?? 12)) || 12, 1), 50)))
       return coreGet(`/screener?${p.toString()}`)
     },
   },
@@ -882,9 +931,21 @@ const TOOLS: ToolSpec[] = [
   },
   {
     name: 'alert_rule_create',
-    description: 'Create/update a standing alert rule that watches one instrument and fires an OS alert when triggered. Metrics: price_above/price_below (value = price), score_call/score_put/score_abs (value = min |score| 0-100), rsi_above/rsi_below, adx_above, atr_above, regime (value = bull|bear|range|chop), pattern_bull/pattern_bear (no value). Optional: name, cooldownSec (default 300), oneShot (auto-disarm after first fire), enabled.',
+    description: 'Create/update a standing alert rule that watches one instrument and fires an OS alert when triggered. Metrics: price_above/price_below (value = price), score_call/score_put/score_abs (value = min |score| 0-100), rsi_above/rsi_below, adx_above, atr_above, regime (value = bull|bear|range|chop), pattern_bull/pattern_bear (no value). asset and metric are REQUIRED. Optional: name, cooldownSec (default 300), oneShot (auto-disarm after first fire), enabled.',
     args: '{"name": "Gold vol burst", "asset": "XAUUSD", "tf": "5m", "metric": "atr_above", "value": 0.2, "cooldownSec": 600, "oneShot": false}',
-    run: (a) => corePost('/alert_rule_save', a),
+    run: (a) => {
+      if (!a.id) {
+        if (!a.asset || typeof a.asset !== 'string') return Promise.resolve({ ok: false, error: 'alert_rule_create requires "asset"' })
+        const KNOWN_METRICS = new Set([
+          'price_above', 'price_below', 'score_call', 'score_put', 'score_abs',
+          'rsi_above', 'rsi_below', 'adx_above', 'atr_above', 'regime', 'pattern_bull', 'pattern_bear',
+        ])
+        if (!a.metric || typeof a.metric !== 'string' || !KNOWN_METRICS.has(a.metric)) {
+          return Promise.resolve({ ok: false, error: `alert_rule_create requires a valid "metric" - one of: ${[...KNOWN_METRICS].join(', ')}` })
+        }
+      }
+      return corePost('/alert_rule_save', a)
+    },
   },
   {
     name: 'alert_rule_list',
@@ -1004,9 +1065,9 @@ const TOOLS: ToolSpec[] = [
   // ---------- archive: deep history ----------
   {
     name: 'archive_status',
-    description: 'Candle archive depth: total archived bars, distinct asset|tf keys, the deepest series (rows + time coverage per key) and per-timeframe totals. Research (optimize/walkforward) reads through this archive - check it before heavy validation: long-warmup strategies (markov family) need ~1800+ bars for multi-fold walk-forward, and depth grows while the OS runs.',
-    args: '{}',
-    run: () => coreGet('/archive'),
+    description: 'Candle archive depth: total archived bars, distinct asset|tf keys, the deepest series (rows + time coverage per key) and per-timeframe totals. Research (optimize/walkforward) reads through this archive - check it before heavy validation: long-warmup strategies (markov family) need ~1800+ bars for multi-fold walk-forward, and depth grows while the OS runs. IMPORTANT: without "asset", the "top" list only shows the BUSIEST 12 asset|tf keys across the ENTIRE archive - a thin/rarely-viewed instrument being absent from it is NOT proof it has zero bars at some timeframe, it just did not make the top 12 globally. To actually answer "does asset X have data at tf Y" (or "why is there no 1m for X"), pass "asset" - this returns assetStats.perTf, a complete per-timeframe breakdown (bars + oldest/newest) for that ONE instrument, with no top-12 cutoff.',
+    args: '{"asset": "AAPL-OTC"}',
+    run: (a) => coreGet(`/archive${a.asset ? `?asset=${encodeURIComponent(String(a.asset))}` : ''}`),
   },
   // ---------- power tools: web, confluence, planning, memory ----------
   {
@@ -1465,8 +1526,15 @@ const TOOLS: ToolSpec[] = [
       if (a.all === true) {
         const d = (await coreGet('/notes?limit=100')) as { ok: boolean; notes?: { id: number }[] }
         const ids = (d.notes ?? []).map((n) => n.id)
-        for (const id of ids) await corePost('/notes_delete', { id })
-        return { ok: true, wiped: ids.length }
+        // Settle every delete independently instead of a sequential
+        // await-in-a-loop: one throw used to abort the whole wipe silently,
+        // leaving an unknown number of notes actually deleted with no way
+        // to tell the user which ones survived.
+        const results = await Promise.allSettled(ids.map((id) => corePost('/notes_delete', { id })))
+        const failedIds = ids.filter((_, i) => results[i].status === 'rejected')
+        return failedIds.length
+          ? { ok: true, wiped: ids.length - failedIds.length, failed: failedIds, note: `${failedIds.length} of ${ids.length} deletes failed - those ids are still present, retry them individually` }
+          : { ok: true, wiped: ids.length }
       }
       const id = Number(a.id ?? 0)
       if (!id) return { ok: false, error: 'pass note id or all=true' }
@@ -1541,7 +1609,13 @@ const TOOLS: ToolSpec[] = [
           ctx.emit({ type: 'ui', cmd: 'set_asset', args: { asset: hit.ticker } })
           applied.push(`asset=${hit.ticker}`)
         } else if (c === 'set_tf') {
-          const tfv = String(args.tf ?? '').trim().toLowerCase()
+          // ui_control has its own tolerant arg-shape layer (val('tf') below
+          // accepts timeframe/set_timeframe/a bare value/to/target key) that
+          // bypasses the dispatch-level normalizeToolArgs() - so a plausible
+          // near-miss token like "1hr"/"60m" needs the SAME TF_ALIASES pass
+          // here, or it silently re-opens the exact bug that fix closed
+          // everywhere else.
+          const tfv = String(normalizeTf(String(args.tf ?? '').trim().toLowerCase())).trim().toLowerCase()
           if (!ALL_TFS.includes(tfv)) return { ok: false, error: `invalid tf "${tfv}" - use ${ALL_TFS.join('|')}` }
           ctx.emit({ type: 'ui', cmd: 'set_tf', args: { tf: tfv } })
           applied.push(`tf=${tfv}`)
@@ -1626,7 +1700,8 @@ Rules:
 - DEPLOYMENT CONFIRMATION PROTOCOL (MANDATORY for ANY bot_create that will trade autonomously): when the user describes automation in natural language, DO NOT deploy on the first reply. 1) Parse every clause into its exact config. 2) Reply with a numbered RULE SHEET: strategy + params, watchlist, timeframe, kind + expiry (state WHY digital+expirySec when minutes are involved), no-concurrent rule (maxOpen 1), stake plan (seed, roll %, payout cap 70, stop-on-loss, periods, de-risk), session window in UTC + Lagos time, cooldown, minScore, plus the compound_plan ladder with cycleProfit. 3) Flag anything you had to ASSUME and propose a default. 4) Ask "confirm and I deploy" and WAIT - deploy only after the user explicitly agrees or amends. 5) After deploying: report the bot id, that it is ARMED and trading autonomously, and how to stop/restart it.
 - RESEARCH WORKFLOW (use it whenever the user wants a validated strategy or asks "is this edge real"): 1) asset_sweep to find WHERE a strategy has an edge, 2) optimize_strategy on the best assets to find strong params, 3) walkforward on the winner - deploy only if OOS net is positive and at least half the folds were profitable, 4) only then bot_create with the validated params (keep the bot DISARMED and tell the user to arm it when ready). After arming, the watchdog watches the live edge - mention that. Research reads DEEP archived history; archive_status shows how much depth exists per asset - if depth is thin, warn that results may not be significant yet. Report IS vs OOS numbers honestly - large drops from in-sample to out-of-sample mean overfit.
 - AI LEARNING AGENT (Strategy Lab - "learn this pair", "build your own strategy", "find your own patterns", "make me a new indicator", "create a strategy based on <any indicator>"): you have your own research desk, and the DSL now spans the FULL analytics/indicators.ts suite - not just the lab's own 11 invented indicators (rsi/bbpos/zscore/donchianpos/macdz/slope/streak/wickbias/emasign/hadist/bodypos) but also psar, fractal (Williams Fractal), and 8 generic families selected via params.type: madist (every moving-average type: sma/ema/wma/dema/tema/trima/kama/hma/vwma/zlema/t3/mcginley/linreg/midpoint), osc0100 + oscpm100 + oscz (every oscillator: stochastic, stochRSI, williams%R, ultimate osc, aroon, mfi, CCI, CMO, TSI, RVI, ROC, momentum, PPO/APO, TRIX, DPO, KST, qstick, awesome osc, fisher transform, mass index, NATR, hist vol, stddev, Hilbert sine, ulcer index), trenddist (supertrend/chandelier exit/ichimoku cloud), bandpos (keltner/envelope), volflow (OBV/A-D/CMF/force index/EOM/NVI/PVI/klinger/chaikin osc/VWAP distance) and levels (pivot points/fibonacci). So "build a strategy based on X" for almost any named indicator is now something you can actually compose, not just proxy - use the matching ind/type from lab_backtest's tool doc. The only true gaps: correlation/beta (need a second instrument - architecturally out of scope for the single-asset evaluator) and zigzag (repaints, unsafe live).
-  PREFERRED PATH - create_strategy: one tool call that runs discovery (or backtests your own invented signal combo), checks the HOLDOUT honestly against breakeven with a safety margin, and auto-saves to the lab library ONLY if it actually passes - use this instead of manually chaining lab_learn/lab_backtest/lab_save. Manual mode (pass "signals") is exactly for a request like "create a strategy based on fractal and parabolic sar" - hand it a fractal+psar signal combo directly. If create_strategy reports passed:false, that is the honest answer - report the numbers (holdout vs breakeven) and do not claim deployment; offer to iterate (different tf/asset/horizon/threshold) or hand it back as an unsaved idea.
+  PREFERRED PATH - create_strategy: one tool call that runs discovery (or backtests your own invented signal combo), checks the HOLDOUT honestly against breakeven with a safety margin, and auto-saves to the lab library ONLY if it actually passes - use this instead of manually chaining lab_learn/lab_backtest/lab_save. Manual mode (pass "signals") is exactly for a request like "create a strategy based on fractal and parabolic sar" - hand it a fractal+psar signal combo directly. If create_strategy reports passed:false, that is the honest answer - report the numbers (holdout vs breakeven) and do not claim deployment; offer to iterate (different tf/asset/horizon/threshold) or hand it back as an unsaved idea. create_strategy's own "strategyId" field is ALREADY the full "custom:<slug>" id (its save step is now self-verified against lab_list before it ever reports saved:true) - quote it EXACTLY, never prepend another "custom:" prefix yourself (that produced the "custom:custom:..." bug - fixed, but don't reintroduce it by hand). Before naming an asset that has no candle history at the tf you asked for (create_strategy/lab_learn will say so plainly, e.g. "no usable candle history") - that is not a bug, check archive_status for that asset to see which tf actually has bars and retry there, or tell the user the instrument has no archived history at that tf yet.
+  TOOL-CALL DISCIPLINE: every tool call you actually emit as an action ALWAYS returns a result to you - success or a caught {ok:false, error} object - there is no such thing as a tool call that returns nothing. If you find yourself about to say "I called X but nothing came back" or "no result comes back", that means you did NOT actually emit that action (you narrated it in prose instead of issuing {"action": "lab_list", ...}) - the fix is to actually call it, not to report silence. Never claim "the tool isn't returning" as if it were a finding; either you have a real result (report it, including error objects verbatim) or you haven't called it yet (call it).
   Manual step-by-step path (still available): lab_learn mines a pair's history for edge-bearing events across candlestick patterns, wide-range bar formations, HEIKEN ASHI structures, line breaks and the full indicator vocabulary above, weights the survivors by measured win-rate edge, calibrates a confluence threshold and backtests the composed spec (full sample + holdout on the last 30%). Report the discovery table (n, win rate, edge, weight) and the backtest vs breakevenWinRate HONESTLY - a holdout win rate below breakeven means the edge did not survive, say so. Iterate like a quant: try another horizon (2-3), more bars, a lower minEdge, or a different tf before giving up. You may also INVENT your own spec (lab_backtest accepts inline specs - the tool doc has the full DSL; dir can invert a pattern to fade it) and lab_save the winners. DEPLOY: lab_save the spec, then follow the DEPLOYMENT CONFIRMATION PROTOCOL and bot_create with strategyId "custom:<id>" (learned ids work everywhere builtin ids do - stake plans, compounding, sessions). Learned bots compound too: a $1 seed rolling on a spec the lab just validated is a perfectly normal ask - mirror periods/de-risk into compound_plan as always.
 - When the user asks to be notified/watch an instrument ("alert me when...", "let me know if..."), create an alert rule with alert_rule_create and confirm the trigger in plain words. NEVER use alert rules to trade - they only notify.
 - NEVER promise profits. Always frame outputs as probabilistic analysis, not certainty.

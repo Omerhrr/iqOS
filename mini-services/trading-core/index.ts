@@ -360,8 +360,18 @@ const httpServer = createServer(async (req, res) => {
       // ---------- archive: deep history ----------
 
       if (path === '/archive') {
-        const store = kernel.context().use<{ archiveStats: () => unknown }>('storeRaw')
-        return json(200, { ok: true, stats: store.archiveStats() })
+        const store = kernel.context().use<{ archiveStats: () => unknown; archiveStatsForAsset: (asset: string) => unknown }>('storeRaw')
+        const asset = q.get('asset')
+        return json(200, {
+          ok: true,
+          stats: store.archiveStats(),
+          // targeted per-asset breakdown - the global `stats.top` above only
+          // lists the busiest 12 asset|tf keys, so a thin instrument can be
+          // entirely absent from it despite having real archived bars at
+          // some timeframe. Pass ?asset= to actually answer "does asset X
+          // have data at tf Y" instead of guessing from the top-12 list.
+          ...(asset ? { assetStats: store.archiveStatsForAsset(asset.toUpperCase()) } : {}),
+        })
       }
 
 

@@ -917,6 +917,19 @@ export class Store {
     return row.n
   }
 
+  /** Per-asset archive depth across EVERY timeframe it has any bars for - the
+   * targeted counterpart to archiveStats()'s global top-12, which only shows
+   * the busiest asset|tf keys overall and silently drops a thin instrument
+   * entirely (missing from that list is NOT proof of zero bars - it just
+   * means it didn't make the top 12 across the whole archive). Use this to
+   * actually answer "does asset X have bars at tf Y" for any instrument. */
+  archiveStatsForAsset(asset: string): { asset: string; perTf: { tf: string; n: number; oldest: number; newest: number }[] } {
+    const rows = this.db
+      .query('SELECT tf, COUNT(*) n, MIN(time) oldest, MAX(time) newest FROM candles_archive WHERE asset = ? GROUP BY tf ORDER BY n DESC')
+      .all(asset) as { tf: string; n: number; oldest: number; newest: number }[]
+    return { asset, perTf: rows }
+  }
+
   archiveStats(): {
     rows: number
     keys: number
