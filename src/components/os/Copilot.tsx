@@ -9,23 +9,33 @@
 // via the Web Speech API where available, with a MediaRecorder -> /api/asr
 // fallback (decoded + re-encoded to 16 kHz mono WAV) everywhere else.
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Slider } from '@/components/ui/slider'
 import { FullscreenBackdrop, FullscreenButton } from './FullscreenButton'
 
 // ---------------- types ----------------
 
-// Generative widgets: the model populates one of these 5 shapes per call
+// Generative widgets: the model populates one of these 6 shapes per call
 // (render_widget tool, server-side) and the client renders a real component
 // instead of a hand-typed markdown table - content and layout choice are the
 // model's, the renderer set is fixed (same split as Gemini's generative UI).
+// "simulator" is the odd one out: instead of a snapshot of numbers the model
+// already has, it's live sliders the USER drags, recomputing math-expression
+// outputs entirely client-side (see evalExpr below) with no round-trip.
 type WidgetSpec =
   | { type: 'stats'; title?: string; items: { label: string; value: string; delta?: string; tone?: 'up' | 'down' | 'neutral' }[] }
   | { type: 'table'; title?: string; columns: string[]; rows: (string | number)[][] }
   | { type: 'bars'; title?: string; unit?: string; items: { label: string; value: number; tone?: 'up' | 'down' | 'neutral' }[] }
   | { type: 'sparkline'; title?: string; series: number[]; tone?: 'up' | 'down' | 'neutral' }
   | { type: 'compare'; title?: string; left: { label: string; stats: { label: string; value: string }[] }; right: { label: string; stats: { label: string; value: string }[] } }
+  | {
+      type: 'simulator'
+      title?: string
+      controls: { key: string; label: string; min: number; max: number; step?: number; default: number; unit?: string }[]
+      outputs: { label: string; expr: string; format?: 'number' | 'percent' | 'currency'; decimals?: number }[]
+    }
 
 type TimelineItem =
   | { kind: 'say'; text: string }
@@ -357,6 +367,121 @@ const toneClass = (tone?: 'up' | 'down' | 'neutral') =>
 const toneBar = (tone?: 'up' | 'down' | 'neutral') =>
   tone === 'up' ? 'bg-emerald-500' : tone === 'down' ? 'bg-rose-500' : 'bg-cyan-500'
 
+/** Tiny recursive-descent evaluator for a simulator output's `expr` - NEVER
+ * eval()/Function() (the model writes these strings, so no code execution
+ * path can be reachable from them no matter what a bad expr contains).
+ * Grammar: expr := term (('+'|'-') term)* ; term := power (('*'|'/') power)* ;
+ * power := unary ('^' power)? ; unary := '-' unary | primary ;
+ * primary := NUMBER | IDENT | '(' expr ')'. IDENT resolves only against the
+ * `vars` map (the simulator's own control values) - an unknown identifier
+ * throws, surfaced as an inline error rather than silently rendering NaN. */
+function evalExpr(expr: string, vars: Record<string, number>): number {
+  const toks = expr.match(/\d+\.?\d*|\.\d+|[a-zA-Z_][a-zA-Z0-9_]*|[+\-*/^()]/g) ?? []
+  let pos = 0
+  const peek = () => toks[pos]
+  const next = () => toks[pos++]
+  const primary = (): number => {
+    const t = next()
+    if (t === undefined) throw new Error('unexpected end of expression')
+    if (t === '(') {
+      const v = expr_()
+      if (next() !== ')') throw new Error('missing )')
+      return v
+    }
+    if (/^\d/.test(t) || t.startsWith('.')) return Number(t)
+    if (/^[a-zA-Z_]/.test(t)) {
+      if (!(t in vars)) throw new Error(`unknown variable "${t}"`)
+      return vars[t]
+    }
+    throw new Error(`unexpected token "${t}"`)
+  }
+  const unary = (): number => (peek() === '-' ? (next(), -unary()) : primary())
+  const power = (): number => {
+    const base = unary()
+    if (peek() === '^') {
+      next()
+      return Math.pow(base, power())
+    }
+    return base
+  }
+  const term = (): number => {
+    let v = power()
+    for (;;) {
+      if (peek() === '*') { next(); v *= power() }
+      else if (peek() === '/') { next(); v /= power() }
+      else return v
+    }
+  }
+  const expr_ = (): number => {
+    let v = term()
+    for (;;) {
+      if (peek() === '+') { next(); v += term() }
+      else if (peek() === '-') { next(); v -= term() }
+      else return v
+    }
+  }
+  const result = expr_()
+  if (pos !== toks.length) throw new Error(`unexpected trailing token "${toks[pos]}"`)
+  return result
+}
+
+function formatOut(v: number, format?: 'number' | 'percent' | 'currency', decimals?: number): string {
+  if (!Number.isFinite(v)) return 'err'
+  const d = decimals ?? 2
+  if (format === 'currency') return `${v < 0 ? '-' : ''}$${Math.abs(v).toFixed(d)}`
+  if (format === 'percent') return `${v.toFixed(d)}%`
+  return v.toFixed(d)
+}
+
+/** The one interactive widget: sliders the user drags, outputs recomputed
+ * live from their current values via evalExpr - no server round-trip. */
+function SimulatorWidget({ spec }: { spec: Extract<WidgetSpec, { type: 'simulator' }> }) {
+  const [values, setValues] = useState<Record<string, number>>(() =>
+    Object.fromEntries(spec.controls.map((c) => [c.key, c.default]))
+  )
+  const results = useMemo(
+    () =>
+      spec.outputs.map((o) => {
+        try {
+          return { ...o, value: formatOut(evalExpr(o.expr, values), o.format, o.decimals), err: false }
+        } catch (e) {
+          return { ...o, value: (e as Error).message, err: true }
+        }
+      }),
+    [spec.outputs, values]
+  )
+  return (
+    <>
+      <WidgetTitle title={spec.title} />
+      <div className="space-y-2.5">
+        {spec.controls.map((c) => (
+          <div key={c.key}>
+            <div className="mb-1 flex items-center justify-between font-mono text-[9px]">
+              <span className="text-[#8a97b3]">{c.label}</span>
+              <span className="text-cyan-300">{values[c.key]}{c.unit ?? ''}</span>
+            </div>
+            <Slider
+              value={[values[c.key]]}
+              min={c.min}
+              max={c.max}
+              step={c.step ?? ((c.max - c.min) / 100 || 1)}
+              onValueChange={([v]) => setValues((prev) => ({ ...prev, [c.key]: v }))}
+            />
+          </div>
+        ))}
+      </div>
+      <div className="mt-2.5 grid grid-cols-2 gap-1 border-t border-[#1c2739] pt-2">
+        {results.map((r, i) => (
+          <div key={i} className="rounded bg-[#0d1420] px-1.5 py-1">
+            <div className="text-[8px] uppercase tracking-wider text-[#4b5a72]">{r.label}</div>
+            <div className={`font-mono text-[11px] ${r.err ? 'text-rose-400' : 'text-[#dbe4f0]'}`}>{r.value}</div>
+          </div>
+        ))}
+      </div>
+    </>
+  )
+}
+
 function WidgetTitle({ title }: { title?: string }) {
   if (!title) return null
   return <div className="mb-1.5 font-mono text-[9px] uppercase tracking-wider text-[#6b7ba0]">{title}</div>
@@ -473,6 +598,7 @@ function WidgetCard({ spec }: { spec: WidgetSpec }) {
           </div>
         </>
       )}
+      {spec.type === 'simulator' && <SimulatorWidget spec={spec} />}
     </div>
   )
 }

@@ -35,8 +35,28 @@ type WidgetSpec =
   | { type: 'bars'; title?: string; unit?: string; items: { label: string; value: number; tone?: 'up' | 'down' | 'neutral' }[] }
   | { type: 'sparkline'; title?: string; series: number[]; tone?: 'up' | 'down' | 'neutral' }
   | { type: 'compare'; title?: string; left: { label: string; stats: { label: string; value: string }[] }; right: { label: string; stats: { label: string; value: string }[] } }
+  | {
+      type: 'simulator'
+      title?: string
+      // sliders the USER drags client-side - every drag recomputes outputs
+      // instantly with no round-trip back to the model, so this is the one
+      // widget that's genuinely interactive rather than a static snapshot.
+      controls: { key: string; label: string; min: number; max: number; step?: number; default: number; unit?: string }[]
+      // each output is a small math expression over the controls' keys
+      // (+ - * / ^ ( ) only - no function calls, no model-supplied code),
+      // evaluated by a tiny recursive-descent parser on the client, never
+      // eval()/Function() - so an interactive widget can't become a code-
+      // injection surface no matter what the model puts in `expr`.
+      outputs: { label: string; expr: string; format?: 'number' | 'percent' | 'currency'; decimals?: number }[]
+    }
 
-const WIDGET_TYPES = new Set(['stats', 'table', 'bars', 'sparkline', 'compare'])
+const WIDGET_TYPES = new Set(['stats', 'table', 'bars', 'sparkline', 'compare', 'simulator'])
+// Expression charset allowed in a simulator output - identifiers (control
+// keys), numbers, and + - * / ^ ( ) . , whitespace only. This is a sanity
+// check for the model (a clear early error instead of a silently-broken
+// widget), NOT the security boundary - the client never eval()s these,
+// it parses them with its own tiny grammar.
+const SIM_EXPR_RE = /^[a-zA-Z0-9_+\-*/^().,\s]+$/
 
 type StreamEvent =
   | { type: 'status'; text: string }
@@ -1091,20 +1111,55 @@ const TOOLS: ToolSpec[] = [
   {
     name: 'render_widget',
     description:
-      'Render a REAL inline UI widget in the chat instead of a hand-typed markdown table - use this whenever you have quantitative results worth SEEING, not just reading: after backtest/walkforward/optimize_strategy/asset_sweep/compound_plan/journal_stats/calibration_report, comparing 2+ assets or strategies, or showing a P&L/equity trend. The user sees an actual rendered component (KPI tiles, a table, bars, a sparkline, or a two-column comparison), not text. Five types, pick the one that fits the shape of what you just found - args are the SAME OBJECT for every call, only the fields relevant to "type" are read: '
+      'Render a REAL inline UI widget in the chat instead of a hand-typed markdown table - use this whenever you have quantitative results worth SEEING, not just reading: after backtest/walkforward/optimize_strategy/asset_sweep/compound_plan/journal_stats/calibration_report, comparing 2+ assets or strategies, or showing a P&L/equity trend. The user sees an actual rendered component (KPI tiles, a table, bars, a sparkline, a two-column comparison, or a LIVE INTERACTIVE simulator), not text. Six types, pick the one that fits the shape of what you just found - args are the SAME OBJECT for every call, only the fields relevant to "type" are read: '
       + '(1) "stats": items[] of {label, value, delta?, tone?: up|down|neutral} - a KPI tile row, e.g. win rate / net P&L / profit factor / drawdown from one backtest. '
       + '(2) "table": columns[] + rows[][] (each row same length as columns) - a ranked list, e.g. asset_sweep or strategy_tournament results. '
       + '(3) "bars": items[] of {label, value, tone?} - a labeled bar comparison, e.g. win rate per strategy/asset, or a compound_plan stake ladder. '
       + '(4) "sparkline": series[] of numbers (chronological) + tone? - a trend line, e.g. an equity curve or a rolling win-rate series. '
       + '(5) "compare": left/right, each {label, stats[] of {label, value}} - head-to-head, e.g. two strategies\' backtests, or full-sample vs holdout. '
-      + 'Always include "title". Call this IN ADDITION TO your normal say/final text (which should stay short - the widget carries the numbers, your words carry the verdict), not instead of it. Never fabricate numbers for a widget - every value must come from a tool result you already have in this conversation.',
+      + '(6) "simulator": controls[] of {key, label, min, max, step?, default, unit?} - SLIDERS the user drags with their mouse, live, client-side, no round-trip back to you - plus outputs[] of {label, expr, format?: number|percent|currency, decimals?} where expr is a MATH FORMULA over the controls\' keys (+ - * / ^ ( ) and numbers ONLY - no function calls, no words other than the control keys) that recomputes instantly on every drag. Use this whenever the user wants to explore "what if" themselves rather than read one fixed number: "let me see how stake affects the ladder", "show me EV as payout changes", "how does win rate change my edge". Example controls for a compounding explorer: [{"key":"base","label":"Seed stake","min":1,"max":100,"default":1,"unit":"$"},{"key":"payout","label":"Payout","min":0.5,"max":0.95,"step":0.01,"default":0.7},{"key":"wins","label":"Consecutive wins","min":0,"max":10,"default":5}], with an output like {"label":"Pot after N wins","expr":"base*(1+payout)^wins","format":"currency","decimals":2}. Every control needs a UNIQUE "key" (used only inside expr, never shown) and every expr must reference ONLY the control keys you defined - a typo or an undefined name makes that output show an error. '
+      + 'Always include "title". Call this IN ADDITION TO your normal say/final text (which should stay short - the widget carries the numbers, your words carry the verdict), not instead of it. Never fabricate numbers for a static widget (stats/table/bars/sparkline/compare) - every value must come from a tool result you already have in this conversation. A "simulator"\'s defaults should still start from a real result you have, but its whole point is that the user then moves it away from that starting point themselves.',
     args: '{"type": "stats", "title": "EURUSD-OTC fractal+PSAR - holdout", "items": [{"label": "Win rate", "value": "68.4%", "tone": "up"}, {"label": "Net P&L", "value": "+$217"}, {"label": "Profit factor", "value": "1.52"}, {"label": "Max DD", "value": "$50"}]}',
     run: (a, ctx) => {
       const type = String(a.type ?? '')
       if (!WIDGET_TYPES.has(type)) return Promise.resolve({ ok: false, error: `render_widget requires "type" to be one of: ${[...WIDGET_TYPES].join(', ')}` })
       let spec: WidgetSpec
       const title = a.title !== undefined ? String(a.title) : undefined
-      if (type === 'stats') {
+      if (type === 'simulator') {
+        const controlsIn = Array.isArray(a.controls) ? a.controls : []
+        const outputsIn = Array.isArray(a.outputs) ? a.outputs : []
+        if (!controlsIn.length) return Promise.resolve({ ok: false, error: 'render_widget type "simulator" requires a non-empty "controls" array of {key, label, min, max, default}' })
+        if (!outputsIn.length) return Promise.resolve({ ok: false, error: 'render_widget type "simulator" requires a non-empty "outputs" array of {label, expr}' })
+        const keys = new Set<string>()
+        const controls = controlsIn.map((c) => {
+          const cc = c as Record<string, unknown>
+          const key = String(cc?.key ?? '').trim()
+          keys.add(key)
+          return {
+            key,
+            label: String(cc?.label ?? key),
+            min: Number(cc?.min ?? 0),
+            max: Number(cc?.max ?? 100),
+            step: cc?.step !== undefined ? Number(cc.step) : undefined,
+            default: Number(cc?.default ?? cc?.min ?? 0),
+            unit: cc?.unit !== undefined ? String(cc.unit) : undefined,
+          }
+        })
+        const badKey = controls.find((c) => !c.key || !/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(c.key) || !(c.min < c.max))
+        if (badKey) return Promise.resolve({ ok: false, error: `simulator control "${badKey.label}" needs a unique identifier-style "key" and min < max` })
+        const outputs = outputsIn.map((o) => {
+          const oo = o as Record<string, unknown>
+          return {
+            label: String(oo?.label ?? ''),
+            expr: String(oo?.expr ?? '').trim(),
+            format: oo?.format as 'number' | 'percent' | 'currency' | undefined,
+            decimals: oo?.decimals !== undefined ? Number(oo.decimals) : undefined,
+          }
+        })
+        const badExpr = outputs.find((o) => !o.expr || !SIM_EXPR_RE.test(o.expr))
+        if (badExpr) return Promise.resolve({ ok: false, error: `simulator output "${badExpr.label}" has an invalid expr - only the control keys (${[...keys].join(', ')}), numbers, and + - * / ^ ( ) are allowed, no function calls or other words` })
+        spec = { type: 'simulator', title, controls, outputs }
+      } else if (type === 'stats') {
         const items = Array.isArray(a.items) ? a.items : []
         if (!items.length) return Promise.resolve({ ok: false, error: 'render_widget type "stats" requires a non-empty "items" array of {label, value}' })
         spec = { type: 'stats', title, items: items.map((it) => ({ label: String((it as Record<string, unknown>)?.label ?? ''), value: String((it as Record<string, unknown>)?.value ?? ''), delta: (it as Record<string, unknown>)?.delta !== undefined ? String((it as Record<string, unknown>).delta) : undefined, tone: (it as Record<string, unknown>)?.tone as 'up' | 'down' | 'neutral' | undefined })) }
@@ -1745,7 +1800,8 @@ All of them work in run_strategy / backtest / optimize_strategy / walkforward / 
 ENSEMBLE (strategy id "ensemble-vote", params: members = comma-separated builtin strategy ids e.g. "ema-trend,rsi-reversion,markov-edge", voteMinScore = per-member score to count as a vote (default 40), minAgree = how many members must agree (default 2)) trades only the INTERSECTION of independent edges: it runs each member strategy on the same candles and only fires when minAgree+ of them agree on direction, scoring the average of the agreeing members' scores with a small consensus discount when agreement is right at the floor. Use it when the user wants higher precision at the cost of fewer signals ("I want fewer but more confident trades", "only trade when multiple things agree") - suggest 2-3 members that capture DIFFERENT signal types (e.g. one trend strategy + one mean-reversion + one Markov/statistical one) rather than near-duplicates, since correlated members defeat the point of voting. Always walkforward-validate the ensemble itself (not just its members individually) before arming a bot on it - member edges can each be real without their intersection being tradeable, and the research gate below enforces this anyway.
 STRUCTURAL chart tools (drawing-tool family, category "structural" in list_indicators): "pivots" (floor pivot points PP/R1-R3/S1-S3, variants classic/fibonacci/camarilla/woodie, session-based), "fib" (auto Fibonacci retracement 0-100% + 1.272/1.618 extensions of the last swing), "trendlines" (auto S/R trendlines from fractal swing pivots), "fvg" (fair value gaps - 3-bar imbalance zones tracked until filled). Add them to the user's chart with ui_control when they ask for pivot points, fibonacci, trendlines or liquidity gaps - e.g. add pivots + fib before a level-based read.
 POWER PIPELINE - your composed analysis stack: "confluence_read" fuses MTF agreement + composite signal + Markov edge + candle bias into one score with a verdict (THE pre-trade check), "key_levels" returns the full structural level map (pivots + fib + trendlines + FVGs) with distances and the nearest S/R, "regime_playbook" classifies TRENDING/RANGING/VOLATILE/MIXED and names the strategies that fit, "build_trade_plan" turns a confirmed direction into an executable plan (entry, expiry, stake sized from balance, payout-aware EV, structural invalidation level), "session_clock" shows which sessions are open and the London-NY overlap, "strategy_tournament" runs the FULL registered strategy roster on an instrument (via list_strategies internally, so it always covers everything - never a stale hardcoded count) and ranks them, "correlate" measures the live relationship between two instruments (twins / hedge / strangers), and "web_search" reads the LIVE WEB for news, economic events and the "why" behind moves. Recommended flow for "should I trade X?": regime_playbook -> confluence_read -> key_levels -> web_search (if news could matter) -> build_trade_plan -> place_trade only if the user agrees.
-GENERATIVE WIDGETS: whenever a tool call hands you real numbers worth seeing rather than reading, follow it with render_widget so the user gets an actual rendered component (KPI tiles / table / bars / sparkline / two-column compare) instead of a markdown table you typed by hand - after backtest/walkforward/optimize_strategy/asset_sweep/compound_plan/journal_stats/calibration_report, whenever you compare 2+ assets or strategies, or whenever you show a P&L/equity/win-rate trend over time. Call it alongside your normal say/final text, never instead of it - the widget carries the numbers, your words carry the read and the verdict. Pick whichever of the 5 types actually fits the shape of the result (the tool doc has all 5 with examples), and never invent a number for it that didn't come from a real tool result in this conversation.
+GENERATIVE WIDGETS: whenever a tool call hands you real numbers worth seeing rather than reading, follow it with render_widget so the user gets an actual rendered component (KPI tiles / table / bars / sparkline / two-column compare / an interactive simulator) instead of a markdown table you typed by hand - after backtest/walkforward/optimize_strategy/asset_sweep/compound_plan/journal_stats/calibration_report, whenever you compare 2+ assets or strategies, or whenever you show a P&L/equity/win-rate trend over time. Call it alongside your normal say/final text, never instead of it - the widget carries the numbers, your words carry the read and the verdict. Pick whichever of the 6 types actually fits (the tool doc has all 6 with examples), and never invent a number for a static widget that didn't come from a real tool result in this conversation.
+INTERACTIVE SIMULATOR WIDGET: the "simulator" type is different from the other 5 - it's not a snapshot, it's sliders the user drags THEMSELVES, live, with every output recomputing instantly and no message sent back to you. Reach for it whenever the user's ask is really "let me explore this" rather than "tell me the number" - "what if I compound $5 instead of $1", "how does the ladder change with payout", "show me how EV moves with stake/win-rate", "let me play with the parameters". Seed the sliders' defaults from a real result you already have (compound_plan, a backtest's win rate, the account balance), then write each output as a plain math expression over the sliders' keys (+ - * / ^ ( ) and numbers only, e.g. "base*(1+payout)^wins" or "amount*(payout*winrate/100-(1-winrate/100))") - no function calls, no words besides the control keys you defined. Do not use it for a one-off static number; that is what "stats" is for.
 YOU HAVE PERSISTENT MEMORY: notes you save with memory_save survive restarts and are AUTO-INJECTED into every future conversation (see YOUR PERSISTENT MEMORY in the context). Proactively save user preferences, validated setups and post-trade lessons; recall with memory_recall before answering style/setup questions; delete outdated ones with memory_forget. When the user says "remember that..." - always memory_save it.
 MEMORY GATE - your rule notes govern the machines: a note saved with kind "rule" in the machine grammar (no-trade-days / asset-whitelist / asset-blacklist / max-stake / max-trades-per-hour) HARD-BLOCKS autopilot bots and the built-in auto-trader before every order (rejections read "memory-gate: ..."); manual trades stay free. So: user states a standing trading instruction -> memory_save it as kind "rule" (plus a natural-language preference note), confirm with memory_gate_status, and tell the user autonomy is now bound by their words. When the user lifts a rule -> memory_recall to find the note id, memory_forget it, re-verify with memory_gate_status. HARD RULE: never CLAIM a rule was added or removed without actually calling the tools and showing the memory_gate_status result - silent claims are forbidden. The gate caches rules for ~30s, so a just-changed rule may briefly show the old state - say so instead of re-claiming. If a bot order is rejected with a "memory-gate:" reason, explain WHICH standing rule fired and offer to remove it with memory_forget if the user wants autonomy back.
 The OS runs in a global OPERATING MODE (os_mode_status / os_mode_set / autotrader_configure): "human" = HUMAN-IN-THE-LOOP, every trade needs the user and bot orders are suspended by the mode gate (configs preserved); "auto" = NO-HUMAN-IN-THE-LOOP, the OS trades autonomously - armed bots run and the built-in AUTO-TRADER takes the strongest screener signals on its own. NEVER set mode to "auto" unless the user explicitly asks for it ("no human", "autonomous", "let it trade by itself") - entering no-human mode without an explicit request is a hard violation. When a bot order is rejected with a "mode-gate:" reason, explain that the OS is in HUMAN mode and autonomy is suspended by design. If a bot order is rejected with a "watchdog:" reason, explain that the strategy is degrading vs its baseline - never suggest bypassing it; if a bot is on WATCH, surface the numbers and recommend re-validating with the research workflow. If a trade or bot order is rejected with a "sentinel:" reason, explain which limit or breaker fired - never suggest workarounds, limits are there to protect the account; resume only when the user explicitly accepts the risk.
