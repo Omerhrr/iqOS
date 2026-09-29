@@ -21,12 +21,30 @@ interface ToolCtx {
   signal: AbortSignal
 }
 
+// ---------------- generative widgets ----------------
+// A small, GENERIC vocabulary of inline UI widgets the model can populate
+// with whatever numbers it just pulled from any tool - not a fixed card
+// hardcoded per tool name. The client renders these as real components
+// (KPI tiles, a table, bars, a sparkline, a two-column comparison) instead
+// of the model hand-formatting a markdown table every time. This is the
+// same shape as Gemini's "generative UI" widgets: the model decides content
+// and layout per-turn, the client supplies a small fixed set of renderers.
+type WidgetSpec =
+  | { type: 'stats'; title?: string; items: { label: string; value: string; delta?: string; tone?: 'up' | 'down' | 'neutral' }[] }
+  | { type: 'table'; title?: string; columns: string[]; rows: (string | number)[][] }
+  | { type: 'bars'; title?: string; unit?: string; items: { label: string; value: number; tone?: 'up' | 'down' | 'neutral' }[] }
+  | { type: 'sparkline'; title?: string; series: number[]; tone?: 'up' | 'down' | 'neutral' }
+  | { type: 'compare'; title?: string; left: { label: string; stats: { label: string; value: string }[] }; right: { label: string; stats: { label: string; value: string }[] } }
+
+const WIDGET_TYPES = new Set(['stats', 'table', 'bars', 'sparkline', 'compare'])
+
 type StreamEvent =
   | { type: 'status'; text: string }
   | { type: 'say'; text: string }
   | { type: 'tool_start'; id: number; tool: string; args?: Record<string, unknown> }
   | { type: 'tool_end'; id: number; tool: string; ms: number; ok: boolean; preview?: string; result?: unknown }
   | { type: 'ui'; cmd: string; args?: Record<string, unknown> }
+  | { type: 'widget'; id: number; spec: WidgetSpec }
   | { type: 'final'; text: string }
   | { type: 'done'; reply: string; trace: TraceEntry[] }
   | { type: 'error'; message: string }
@@ -1069,6 +1087,59 @@ const TOOLS: ToolSpec[] = [
     args: '{"asset": "AAPL-OTC"}',
     run: (a) => coreGet(`/archive${a.asset ? `?asset=${encodeURIComponent(String(a.asset))}` : ''}`),
   },
+  // ---------- generative UI ----------
+  {
+    name: 'render_widget',
+    description:
+      'Render a REAL inline UI widget in the chat instead of a hand-typed markdown table - use this whenever you have quantitative results worth SEEING, not just reading: after backtest/walkforward/optimize_strategy/asset_sweep/compound_plan/journal_stats/calibration_report, comparing 2+ assets or strategies, or showing a P&L/equity trend. The user sees an actual rendered component (KPI tiles, a table, bars, a sparkline, or a two-column comparison), not text. Five types, pick the one that fits the shape of what you just found - args are the SAME OBJECT for every call, only the fields relevant to "type" are read: '
+      + '(1) "stats": items[] of {label, value, delta?, tone?: up|down|neutral} - a KPI tile row, e.g. win rate / net P&L / profit factor / drawdown from one backtest. '
+      + '(2) "table": columns[] + rows[][] (each row same length as columns) - a ranked list, e.g. asset_sweep or strategy_tournament results. '
+      + '(3) "bars": items[] of {label, value, tone?} - a labeled bar comparison, e.g. win rate per strategy/asset, or a compound_plan stake ladder. '
+      + '(4) "sparkline": series[] of numbers (chronological) + tone? - a trend line, e.g. an equity curve or a rolling win-rate series. '
+      + '(5) "compare": left/right, each {label, stats[] of {label, value}} - head-to-head, e.g. two strategies\' backtests, or full-sample vs holdout. '
+      + 'Always include "title". Call this IN ADDITION TO your normal say/final text (which should stay short - the widget carries the numbers, your words carry the verdict), not instead of it. Never fabricate numbers for a widget - every value must come from a tool result you already have in this conversation.',
+    args: '{"type": "stats", "title": "EURUSD-OTC fractal+PSAR - holdout", "items": [{"label": "Win rate", "value": "68.4%", "tone": "up"}, {"label": "Net P&L", "value": "+$217"}, {"label": "Profit factor", "value": "1.52"}, {"label": "Max DD", "value": "$50"}]}',
+    run: (a, ctx) => {
+      const type = String(a.type ?? '')
+      if (!WIDGET_TYPES.has(type)) return Promise.resolve({ ok: false, error: `render_widget requires "type" to be one of: ${[...WIDGET_TYPES].join(', ')}` })
+      let spec: WidgetSpec
+      const title = a.title !== undefined ? String(a.title) : undefined
+      if (type === 'stats') {
+        const items = Array.isArray(a.items) ? a.items : []
+        if (!items.length) return Promise.resolve({ ok: false, error: 'render_widget type "stats" requires a non-empty "items" array of {label, value}' })
+        spec = { type: 'stats', title, items: items.map((it) => ({ label: String((it as Record<string, unknown>)?.label ?? ''), value: String((it as Record<string, unknown>)?.value ?? ''), delta: (it as Record<string, unknown>)?.delta !== undefined ? String((it as Record<string, unknown>).delta) : undefined, tone: (it as Record<string, unknown>)?.tone as 'up' | 'down' | 'neutral' | undefined })) }
+      } else if (type === 'table') {
+        const columns = Array.isArray(a.columns) ? a.columns.map(String) : []
+        const rows = Array.isArray(a.rows) ? (a.rows as unknown[]).filter(Array.isArray) as (string | number)[][] : []
+        if (!columns.length || !rows.length) return Promise.resolve({ ok: false, error: 'render_widget type "table" requires non-empty "columns" and "rows"' })
+        spec = { type: 'table', title, columns, rows: rows.slice(0, 100) }
+      } else if (type === 'bars') {
+        const items = Array.isArray(a.items) ? a.items : []
+        if (!items.length) return Promise.resolve({ ok: false, error: 'render_widget type "bars" requires a non-empty "items" array of {label, value}' })
+        spec = { type: 'bars', title, unit: a.unit !== undefined ? String(a.unit) : undefined, items: items.map((it) => ({ label: String((it as Record<string, unknown>)?.label ?? ''), value: Number((it as Record<string, unknown>)?.value ?? 0), tone: (it as Record<string, unknown>)?.tone as 'up' | 'down' | 'neutral' | undefined })) }
+      } else if (type === 'sparkline') {
+        const series = Array.isArray(a.series) ? a.series.map(Number).filter(Number.isFinite) : []
+        if (series.length < 2) return Promise.resolve({ ok: false, error: 'render_widget type "sparkline" requires "series" with at least 2 numbers' })
+        spec = { type: 'sparkline', title, series: series.slice(-300), tone: a.tone as 'up' | 'down' | 'neutral' | undefined }
+      } else {
+        const left = a.left as Record<string, unknown> | undefined
+        const right = a.right as Record<string, unknown> | undefined
+        if (!left?.label || !right?.label || !Array.isArray(left.stats) || !Array.isArray(right.stats)) {
+          return Promise.resolve({ ok: false, error: 'render_widget type "compare" requires "left" and "right", each {label, stats: [{label, value}]}' })
+        }
+        const side = (s: Record<string, unknown>) => ({
+          label: String(s.label),
+          stats: (s.stats as unknown[]).map((st) => ({ label: String((st as Record<string, unknown>)?.label ?? ''), value: String((st as Record<string, unknown>)?.value ?? '') })),
+        })
+        spec = { type: 'compare', title, left: side(left), right: side(right) }
+      }
+      ctx.emit({ type: 'widget', id: Date.now(), spec })
+      // kept tiny on purpose: the model already has the source numbers from
+      // whichever tool it pulled them from - this result only needs to
+      // confirm the widget rendered, not repeat the payload back into context
+      return Promise.resolve({ ok: true, rendered: type })
+    },
+  },
   // ---------- power tools: web, confluence, planning, memory ----------
   {
     name: 'web_search',
@@ -1674,6 +1745,7 @@ All of them work in run_strategy / backtest / optimize_strategy / walkforward / 
 ENSEMBLE (strategy id "ensemble-vote", params: members = comma-separated builtin strategy ids e.g. "ema-trend,rsi-reversion,markov-edge", voteMinScore = per-member score to count as a vote (default 40), minAgree = how many members must agree (default 2)) trades only the INTERSECTION of independent edges: it runs each member strategy on the same candles and only fires when minAgree+ of them agree on direction, scoring the average of the agreeing members' scores with a small consensus discount when agreement is right at the floor. Use it when the user wants higher precision at the cost of fewer signals ("I want fewer but more confident trades", "only trade when multiple things agree") - suggest 2-3 members that capture DIFFERENT signal types (e.g. one trend strategy + one mean-reversion + one Markov/statistical one) rather than near-duplicates, since correlated members defeat the point of voting. Always walkforward-validate the ensemble itself (not just its members individually) before arming a bot on it - member edges can each be real without their intersection being tradeable, and the research gate below enforces this anyway.
 STRUCTURAL chart tools (drawing-tool family, category "structural" in list_indicators): "pivots" (floor pivot points PP/R1-R3/S1-S3, variants classic/fibonacci/camarilla/woodie, session-based), "fib" (auto Fibonacci retracement 0-100% + 1.272/1.618 extensions of the last swing), "trendlines" (auto S/R trendlines from fractal swing pivots), "fvg" (fair value gaps - 3-bar imbalance zones tracked until filled). Add them to the user's chart with ui_control when they ask for pivot points, fibonacci, trendlines or liquidity gaps - e.g. add pivots + fib before a level-based read.
 POWER PIPELINE - your composed analysis stack: "confluence_read" fuses MTF agreement + composite signal + Markov edge + candle bias into one score with a verdict (THE pre-trade check), "key_levels" returns the full structural level map (pivots + fib + trendlines + FVGs) with distances and the nearest S/R, "regime_playbook" classifies TRENDING/RANGING/VOLATILE/MIXED and names the strategies that fit, "build_trade_plan" turns a confirmed direction into an executable plan (entry, expiry, stake sized from balance, payout-aware EV, structural invalidation level), "session_clock" shows which sessions are open and the London-NY overlap, "strategy_tournament" runs the FULL registered strategy roster on an instrument (via list_strategies internally, so it always covers everything - never a stale hardcoded count) and ranks them, "correlate" measures the live relationship between two instruments (twins / hedge / strangers), and "web_search" reads the LIVE WEB for news, economic events and the "why" behind moves. Recommended flow for "should I trade X?": regime_playbook -> confluence_read -> key_levels -> web_search (if news could matter) -> build_trade_plan -> place_trade only if the user agrees.
+GENERATIVE WIDGETS: whenever a tool call hands you real numbers worth seeing rather than reading, follow it with render_widget so the user gets an actual rendered component (KPI tiles / table / bars / sparkline / two-column compare) instead of a markdown table you typed by hand - after backtest/walkforward/optimize_strategy/asset_sweep/compound_plan/journal_stats/calibration_report, whenever you compare 2+ assets or strategies, or whenever you show a P&L/equity/win-rate trend over time. Call it alongside your normal say/final text, never instead of it - the widget carries the numbers, your words carry the read and the verdict. Pick whichever of the 5 types actually fits the shape of the result (the tool doc has all 5 with examples), and never invent a number for it that didn't come from a real tool result in this conversation.
 YOU HAVE PERSISTENT MEMORY: notes you save with memory_save survive restarts and are AUTO-INJECTED into every future conversation (see YOUR PERSISTENT MEMORY in the context). Proactively save user preferences, validated setups and post-trade lessons; recall with memory_recall before answering style/setup questions; delete outdated ones with memory_forget. When the user says "remember that..." - always memory_save it.
 MEMORY GATE - your rule notes govern the machines: a note saved with kind "rule" in the machine grammar (no-trade-days / asset-whitelist / asset-blacklist / max-stake / max-trades-per-hour) HARD-BLOCKS autopilot bots and the built-in auto-trader before every order (rejections read "memory-gate: ..."); manual trades stay free. So: user states a standing trading instruction -> memory_save it as kind "rule" (plus a natural-language preference note), confirm with memory_gate_status, and tell the user autonomy is now bound by their words. When the user lifts a rule -> memory_recall to find the note id, memory_forget it, re-verify with memory_gate_status. HARD RULE: never CLAIM a rule was added or removed without actually calling the tools and showing the memory_gate_status result - silent claims are forbidden. The gate caches rules for ~30s, so a just-changed rule may briefly show the old state - say so instead of re-claiming. If a bot order is rejected with a "memory-gate:" reason, explain WHICH standing rule fired and offer to remove it with memory_forget if the user wants autonomy back.
 The OS runs in a global OPERATING MODE (os_mode_status / os_mode_set / autotrader_configure): "human" = HUMAN-IN-THE-LOOP, every trade needs the user and bot orders are suspended by the mode gate (configs preserved); "auto" = NO-HUMAN-IN-THE-LOOP, the OS trades autonomously - armed bots run and the built-in AUTO-TRADER takes the strongest screener signals on its own. NEVER set mode to "auto" unless the user explicitly asks for it ("no human", "autonomous", "let it trade by itself") - entering no-human mode without an explicit request is a hard violation. When a bot order is rejected with a "mode-gate:" reason, explain that the OS is in HUMAN mode and autonomy is suspended by design. If a bot order is rejected with a "watchdog:" reason, explain that the strategy is degrading vs its baseline - never suggest bypassing it; if a bot is on WATCH, surface the numbers and recommend re-validating with the research workflow. If a trade or bot order is rejected with a "sentinel:" reason, explain which limit or breaker fired - never suggest workarounds, limits are there to protect the account; resume only when the user explicitly accepts the risk.

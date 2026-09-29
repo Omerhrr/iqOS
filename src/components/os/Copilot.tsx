@@ -16,10 +16,22 @@ import { FullscreenBackdrop, FullscreenButton } from './FullscreenButton'
 
 // ---------------- types ----------------
 
+// Generative widgets: the model populates one of these 5 shapes per call
+// (render_widget tool, server-side) and the client renders a real component
+// instead of a hand-typed markdown table - content and layout choice are the
+// model's, the renderer set is fixed (same split as Gemini's generative UI).
+type WidgetSpec =
+  | { type: 'stats'; title?: string; items: { label: string; value: string; delta?: string; tone?: 'up' | 'down' | 'neutral' }[] }
+  | { type: 'table'; title?: string; columns: string[]; rows: (string | number)[][] }
+  | { type: 'bars'; title?: string; unit?: string; items: { label: string; value: number; tone?: 'up' | 'down' | 'neutral' }[] }
+  | { type: 'sparkline'; title?: string; series: number[]; tone?: 'up' | 'down' | 'neutral' }
+  | { type: 'compare'; title?: string; left: { label: string; stats: { label: string; value: string }[] }; right: { label: string; stats: { label: string; value: string }[] } }
+
 type TimelineItem =
   | { kind: 'say'; text: string }
   | { kind: 'tool'; id: number; tool: string; args?: Record<string, unknown>; status: 'run' | 'ok' | 'err'; ms?: number; preview?: string }
   | { kind: 'ui'; cmd: string; args?: Record<string, unknown> }
+  | { kind: 'widget'; id: number; spec: WidgetSpec }
   | { kind: 'final'; text: string }
 
 interface Msg {
@@ -336,6 +348,131 @@ function UiChipCard({ args }: { args?: Record<string, unknown> }) {
     <div className="inline-flex items-center gap-1.5 rounded-full border border-violet-800/50 bg-violet-950/30 px-2 py-0.5 text-[9px] text-violet-300">
       <span className="h-1 w-1 rounded-full bg-violet-400" />
       {desc}
+    </div>
+  )
+}
+
+const toneClass = (tone?: 'up' | 'down' | 'neutral') =>
+  tone === 'up' ? 'text-emerald-400' : tone === 'down' ? 'text-rose-400' : 'text-[#dbe4f0]'
+const toneBar = (tone?: 'up' | 'down' | 'neutral') =>
+  tone === 'up' ? 'bg-emerald-500' : tone === 'down' ? 'bg-rose-500' : 'bg-cyan-500'
+
+function WidgetTitle({ title }: { title?: string }) {
+  if (!title) return null
+  return <div className="mb-1.5 font-mono text-[9px] uppercase tracking-wider text-[#6b7ba0]">{title}</div>
+}
+
+/** Generative widget renderer: one component, five layouts, all model-driven
+ * content - this is the piece that makes render_widget an actual inline UI
+ * rather than a fancier text block. */
+function WidgetCard({ spec }: { spec: WidgetSpec }) {
+  return (
+    <div className="rounded-md border border-cyan-900/40 bg-[#0a0f18] px-2.5 py-2">
+      {spec.type === 'stats' && (
+        <>
+          <WidgetTitle title={spec.title} />
+          <div className={`grid gap-1 ${(['grid-cols-1', 'grid-cols-2', 'grid-cols-3', 'grid-cols-4'] as const)[Math.min(Math.max(spec.items.length, 1), 4) - 1]}`}>
+            {spec.items.map((it, i) => (
+              <div key={i} className="rounded bg-[#0d1420] px-1.5 py-1">
+                <div className="text-[8px] uppercase tracking-wider text-[#4b5a72]">{it.label}</div>
+                <div className={`font-mono text-[11px] ${toneClass(it.tone)}`}>{it.value}</div>
+                {it.delta && <div className="font-mono text-[8px] text-[#5d6f8c]">{it.delta}</div>}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+      {spec.type === 'table' && (
+        <>
+          <WidgetTitle title={spec.title} />
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse font-mono text-[9px]">
+              <thead>
+                <tr>
+                  {spec.columns.map((c, i) => (
+                    <th key={i} className="border-b border-[#1c2739] px-1.5 py-1 text-left uppercase tracking-wider text-[#4b5a72]">{c}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {spec.rows.map((row, ri) => (
+                  <tr key={ri} className={ri % 2 ? 'bg-[#0d1420]/40' : ''}>
+                    {row.map((cell, ci) => (
+                      <td key={ci} className="px-1.5 py-1 text-[#c4cede]">{String(cell)}</td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+      {spec.type === 'bars' && (() => {
+        const max = Math.max(...spec.items.map((it) => Math.abs(it.value)), 1e-9)
+        return (
+          <>
+            <WidgetTitle title={spec.title} />
+            <div className="space-y-1">
+              {spec.items.map((it, i) => (
+                <div key={i} className="flex items-center gap-2">
+                  <span className="w-20 shrink-0 truncate font-mono text-[9px] text-[#8a97b3]">{it.label}</span>
+                  <div className="h-2.5 flex-1 overflow-hidden rounded-sm bg-[#0d1420]">
+                    <div className={`h-full rounded-sm ${toneBar(it.tone)}`} style={{ width: `${Math.max(2, (Math.abs(it.value) / max) * 100)}%` }} />
+                  </div>
+                  <span className="w-14 shrink-0 text-right font-mono text-[9px] text-[#c4cede]">
+                    {it.value}{spec.unit ?? ''}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </>
+        )
+      })()}
+      {spec.type === 'sparkline' && (() => {
+        const s = spec.series
+        const min = Math.min(...s)
+        const max = Math.max(...s)
+        const span = max - min || 1
+        const w = 280
+        const h = 40
+        const pts = s.map((v, i) => `${(i / (s.length - 1)) * w},${h - ((v - min) / span) * h}`).join(' ')
+        const up = s[s.length - 1] >= s[0]
+        const stroke = spec.tone === 'down' ? '#f43f5e' : spec.tone === 'up' ? '#34d399' : up ? '#34d399' : '#f43f5e'
+        return (
+          <>
+            <WidgetTitle title={spec.title} />
+            <div className="flex items-center justify-between">
+              <svg viewBox={`0 0 ${w} ${h}`} className="h-10 w-full" preserveAspectRatio="none">
+                <polyline points={pts} fill="none" stroke={stroke} strokeWidth={1.5} />
+              </svg>
+            </div>
+            <div className="mt-0.5 flex justify-between font-mono text-[8px] text-[#4b5a72]">
+              <span>{s[0].toFixed(2)}</span>
+              <span className={toneClass(spec.tone ?? (up ? 'up' : 'down'))}>{s[s.length - 1].toFixed(2)}</span>
+            </div>
+          </>
+        )
+      })()}
+      {spec.type === 'compare' && (
+        <>
+          <WidgetTitle title={spec.title} />
+          <div className="grid grid-cols-2 gap-2">
+            {[spec.left, spec.right].map((side, si) => (
+              <div key={si} className={si === 0 ? 'border-r border-[#1c2739] pr-2' : 'pl-1'}>
+                <div className="mb-1 truncate font-mono text-[9px] font-semibold text-[#aab6cc]">{side.label}</div>
+                <div className="space-y-0.5">
+                  {side.stats.map((st, i) => (
+                    <div key={i} className="flex items-center justify-between font-mono text-[9px]">
+                      <span className="text-[#5d6f8c]">{st.label}</span>
+                      <span className="text-[#dbe4f0]">{st.value}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
     </div>
   )
 }
@@ -908,6 +1045,9 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
                 pushEvent({ kind: 'ui', cmd, args })
                 break
               }
+              case 'widget':
+                if (ev.spec) pushEvent({ kind: 'widget', id: Number(ev.id ?? 0), spec: ev.spec as WidgetSpec })
+                break
               case 'final':
                 gotFinal = true
                 setStatus('')
@@ -1099,6 +1239,7 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
                     )
                   if (e.kind === 'tool') return <ToolCard key={ei} item={e} />
                   if (e.kind === 'ui') return <UiChipCard key={ei} args={e.args} />
+                  if (e.kind === 'widget') return <WidgetCard key={ei} spec={e.spec} />
                   // final
                   return (
                     <div key={ei} className="group relative">
