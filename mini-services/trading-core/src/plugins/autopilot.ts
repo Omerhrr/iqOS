@@ -61,6 +61,13 @@ export interface BotConfig {
   /** Persisted roll state (pot/rollN/restarts/halted) - written by the
    * autopilot on every settle so the compounding streak survives restarts. */
   planState?: { pot: number; rollN: number; restarts: number; halted?: boolean; complete?: boolean }
+  /** Set when this bot was armed with `force: true` past a FAILING research
+   * gate (no/stale/non-robust walk-forward verdict) - an explicit, logged
+   * override for a user who has verified the edge themselves, never a
+   * silent bypass. Cleared back to false the moment a save's gate check
+   * actually passes cleanly. Surfaced in bot_list/bot_status so a forced bot
+   * never looks indistinguishable from a validated one. */
+  forcedUnvalidated?: boolean
 }
 
 export interface StakePlan {
@@ -361,7 +368,7 @@ export class AutopilotService {
     }
   }
 
-  saveBot(input: Partial<BotConfig>): { ok: boolean; bot?: BotConfig; error?: string } {
+  saveBot(input: Partial<BotConfig>, opts: { force?: boolean } = {}): { ok: boolean; bot?: BotConfig; error?: string; forced?: boolean } {
     const id = input.id?.trim() || `bot-${Math.random().toString(36).slice(2, 8)}`
     const existing = this.store.listBots().find((b) => b.bot.id === id)?.bot
     const bot: BotConfig = {
@@ -414,14 +421,24 @@ export class AutopilotService {
     // research gate: only check when this save is what's arming the bot (new
     // enable, not every edit to an already-running one) so a stake tweak on a
     // live bot doesn't get blocked by a validation that's since gone stale.
+    let forced = false
     if (bot.enabled && !(existing?.enabled ?? false)) {
       const gate = this.researchGate(bot)
-      if (gate) return { ok: false, error: gate }
+      if (gate) {
+        if (!opts.force) return { ok: false, error: gate }
+        forced = true
+        this.emit('warn', `Bot "${bot.name}" FORCED past research gate - ${gate.replace(/^research-gate: /, '')}. Unvalidated edge, armed on explicit user override.`)
+      }
+      bot.forcedUnvalidated = forced
+    } else if (bot.enabled) {
+      // already-armed bot being re-saved (a stake tweak, say) - leave its
+      // forced flag exactly as it was, don't silently clear or re-derive it.
+      bot.forcedUnvalidated = existing?.forcedUnvalidated ?? false
     }
     this.store.saveBot(bot)
     if (!this.runtime.has(id)) this.runtime.set(id, this.buildRuntime(id))
-    this.emit(bot.enabled ? 'success' : 'info', `Bot "${bot.name}" saved - ${bot.enabled ? 'ARMED' : 'idle'} (${bot.strategyId} · ${bot.tf} · ${bot.watchlist.join(', ')})`)
-    return { ok: true, bot }
+    this.emit(bot.enabled ? 'success' : 'info', `Bot "${bot.name}" saved - ${bot.enabled ? 'ARMED' : 'idle'}${forced ? ' [FORCED, UNVALIDATED]' : ''} (${bot.strategyId} · ${bot.tf} · ${bot.watchlist.join(', ')})`)
+    return { ok: true, bot, forced }
   }
 
   deleteBot(id: string): { ok: boolean; error?: string } {
@@ -458,17 +475,23 @@ export class AutopilotService {
     return { ok: true, bot: this.store.listBots().find((b) => b.bot.id === id)?.bot }
   }
 
-  toggleBot(id: string, enabled?: boolean): { ok: boolean; bot?: BotConfig; error?: string } {
+  toggleBot(id: string, enabled?: boolean, opts: { force?: boolean } = {}): { ok: boolean; bot?: BotConfig; error?: string; forced?: boolean } {
     const found = this.store.listBots().find((b) => b.bot.id === id)
     if (!found) return { ok: false, error: 'bot not found' }
     const bot: BotConfig = { ...found.bot, enabled: enabled ?? !found.bot.enabled }
+    let forced = false
     if (bot.enabled && !found.bot.enabled) {
       const gate = this.researchGate(bot)
-      if (gate) return { ok: false, error: gate }
+      if (gate) {
+        if (!opts.force) return { ok: false, error: gate }
+        forced = true
+        this.emit('warn', `Bot "${bot.name}" FORCED past research gate - ${gate.replace(/^research-gate: /, '')}. Unvalidated edge, armed on explicit user override.`)
+      }
+      bot.forcedUnvalidated = forced
     }
     this.store.saveBot(bot)
-    this.emit(bot.enabled ? 'success' : 'info', `Autopilot "${bot.name}" ${bot.enabled ? 'STARTED' : 'STOPPED'} - watching ${bot.watchlist.join(', ')} on ${bot.tf} (${bot.strategyId})`)
-    return { ok: true, bot }
+    this.emit(bot.enabled ? 'success' : 'info', `Autopilot "${bot.name}" ${bot.enabled ? 'STARTED' : 'STOPPED'}${forced ? ' [FORCED, UNVALIDATED]' : ''} - watching ${bot.watchlist.join(', ')} on ${bot.tf} (${bot.strategyId})`)
+    return { ok: true, bot, forced }
   }
 
   // ---------- trading loop ----------

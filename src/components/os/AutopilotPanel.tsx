@@ -677,6 +677,14 @@ function BotCard({
               {stats.openCount} open
             </span>
           )}
+          {bot.forcedUnvalidated && (
+            <span
+              className="shrink-0 rounded bg-rose-500/15 px-1 py-px text-[8px] font-bold uppercase text-rose-300"
+              title="Armed past a FAILING research gate on an explicit force override - this is not a validated edge, it's the user's deliberate choice to run an unproven strategy."
+            >
+              forced · unvalidated
+            </span>
+          )}
         </div>
         <div className="flex shrink-0 items-center gap-1">
           {halted && (

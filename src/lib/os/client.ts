@@ -531,6 +531,11 @@ export interface BotConfig {
     onComplete?: 'halt' | 'reseed'
   }
   planState?: { pot: number; rollN: number; restarts: number; halted?: boolean; complete?: boolean }
+  /** true when this bot was armed with force:true past a FAILING research
+   * gate (no/stale/non-robust walk-forward verdict) - a deliberate user
+   * override, not a validated edge. Surface this prominently; never let a
+   * forced bot render indistinguishably from one that passed the gate. */
+  forcedUnvalidated?: boolean
 }
 
 export interface BotStats {

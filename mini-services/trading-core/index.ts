@@ -1079,7 +1079,12 @@ const httpServer = createServer(async (req, res) => {
 
       if (path === '/bot_save') {
         const bots = kernel.context().use<AutopilotService>('autopilot')
-        return json(200, bots.saveBot(body as Partial<BotConfig>))
+        // force:true deliberately bypasses the research gate (no/stale/
+        // non-robust walk-forward verdict) for a user who has verified the
+        // edge/data themselves - never a silent bypass, always logged and
+        // persisted on the bot as forcedUnvalidated so it stays visibly
+        // marked everywhere the fleet is listed.
+        return json(200, bots.saveBot(body as Partial<BotConfig>, { force: Boolean(body.force) }))
       }
 
       if (path === '/bot_delete') {
@@ -1089,7 +1094,10 @@ const httpServer = createServer(async (req, res) => {
 
       if (path === '/bot_toggle') {
         const bots = kernel.context().use<AutopilotService>('autopilot')
-        return json(200, bots.toggleBot(String(body.id ?? ''), body.enabled === undefined ? undefined : Boolean(body.enabled)))
+        return json(
+          200,
+          bots.toggleBot(String(body.id ?? ''), body.enabled === undefined ? undefined : Boolean(body.enabled), { force: Boolean(body.force) })
+        )
       }
 
       if (path === '/bot_restart') {
