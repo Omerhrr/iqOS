@@ -457,6 +457,16 @@ export function supportResistance(candles: Candle[], lookback = 240, tolerance =
 export function sharpeRatio(rets: number[], periodsPerYear: number): number {
   const m = mean(rets)
   const s = stdev(rets)
-  if (s === 0) return 0
-  return (m / s) * Math.sqrt(periodsPerYear)
+  // Guard against floating-point noise, not just exact zero: when every
+  // trade's PnL is (near-)identical - e.g. a 100% win rate with a fixed
+  // stake/payout - the TRUE variance is 0, but summing (x - mean)^2 in
+  // floating point can leave `s` as a tiny nonzero residual (1e-12, 1e-13...)
+  // instead of landing exactly on 0. Dividing mean/s against that residual
+  // blows the ratio up to an astronomically large, meaningless number
+  // (seen in the wild as values like 2.6e18). Treat stdev as zero whenever
+  // it's negligible relative to the scale of the returns themselves.
+  const scale = Math.max(Math.abs(m), mean(rets.map(Math.abs)), 1e-9)
+  if (!Number.isFinite(s) || s <= scale * 1e-9) return 0
+  const ratio = (m / s) * Math.sqrt(periodsPerYear)
+  return Number.isFinite(ratio) ? ratio : 0
 }
