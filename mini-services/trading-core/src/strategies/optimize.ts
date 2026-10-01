@@ -93,6 +93,13 @@ export interface SweepRow {
   payout: number
   metrics: FastMetrics
   score: number
+  // % of the candles actually tested that fall inside this asset's REAL
+  // archived bar range (market-data.ts's buildSeries layers deterministic
+  // synthetic prehistory/gap-fill around the real archive, so a thin or
+  // not-yet-live instrument can be backtested almost entirely against the
+  // simulator's own price generator instead of a traded market). null when
+  // no provenance lookup was supplied (caller didn't pass one in).
+  liveDataPct: number | null
 }
 
 export interface SweepResult {
@@ -735,6 +742,13 @@ export interface AssetSweepOptions {
   // another's Feb-Apr, which can be a meaningfully different market regime.
   // Set false to restore the old per-asset "most recent candles" behavior.
   sharedWindow?: boolean
+  // Optional lookup for data provenance: given a ticker, return the
+  // [oldest, newest] timestamp range actually backed by real archived bars
+  // (store.archiveBounds). When supplied, each row gets liveDataPct = the
+  // share of its tested candles whose time falls inside that range - the
+  // rest are deterministic synthetic fill. Omit to skip the check (rows get
+  // liveDataPct: null) rather than silently claiming 100% live.
+  provenance?: (ticker: string) => { oldest: number; newest: number } | null
 }
 
 export interface CandleFetcher {
@@ -810,7 +824,14 @@ export function sweepAssets(
         commissionPct: opts.commissionPct,
       })
       const score = scoreOf(m, objective, minTrades)
-      rows.push({ asset: a.ticker, category: a.category, open: a.open, payout: a.payout, metrics: m, score })
+      let liveDataPct: number | null = null
+      if (opts.provenance) {
+        const bounds = opts.provenance(a.ticker)
+        liveDataPct = bounds
+          ? Math.round((candles.filter((c) => c.time >= bounds.oldest && c.time <= bounds.newest).length / Math.max(candles.length, 1)) * 1000) / 10
+          : 0
+      }
+      rows.push({ asset: a.ticker, category: a.category, open: a.open, payout: a.payout, metrics: m, score, liveDataPct })
     } catch {
       skipped++
     }

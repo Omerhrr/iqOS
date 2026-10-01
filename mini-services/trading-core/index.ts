@@ -755,11 +755,22 @@ const httpServer = createServer(async (req, res) => {
         else if (category && category !== 'all') pool = pool.filter((a) => (category === 'otc' ? a.otc : a.category === category))
         const openOnly = body.openOnly === undefined ? true : Boolean(body.openOnly)
         if (openOnly) pool = pool.filter((a) => a.open)
+        const sweepTf = tf(String(body.tf ?? '1m') as string)
+        const provStore = kernel.context().use<{ archiveBounds: (asset: string, tf: string) => { oldest: number; newest: number; n: number } | null }>('storeRaw')
         const out = sweepAssets(
           pool.map((a) => ({ ticker: a.ticker, category: a.category, open: a.open, payout: a.payout })),
-          (asset) => market.getCandlesDeep(asset, tf(String(body.tf ?? '1m') as string), 1200),
-          tf(String(body.tf ?? '1m') as string),
+          (asset) => market.getCandlesDeep(asset, sweepTf, 1200),
+          sweepTf,
           {
+            // Lets each row report liveDataPct: what share of the candles it
+            // was actually tested on are real archived bars vs the market
+            // simulator's deterministic synthetic fill (see store.archiveBounds
+            // and market-data.ts's buildSeries). A thin/not-yet-live instrument
+            // scoring suspiciously perfect is often just the OU/mean-reversion
+            // strategy re-detecting the simulator's own mean-reverting price
+            // generator rather than a real market edge - this is how that gets
+            // caught instead of silently looking like a validated signal.
+            provenance: (ticker) => provStore.archiveBounds(ticker, sweepTf),
             strategy: String(body.strategy ?? 'confluence-core'),
             params: (body.params as Record<string, number | string>) ?? undefined,
             objective: (body.objective as Objective) ?? 'netPnl',

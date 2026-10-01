@@ -832,6 +832,12 @@ export interface SweepRow {
   payout: number
   metrics: FastMetrics
   score: number
+  // % of tested candles backed by REAL archived bars vs the market
+  // simulator's deterministic synthetic fill (null if the backend didn't
+  // compute it). A thin/not-yet-live instrument scoring too well is often
+  // the strategy re-detecting the simulator's own generative process, not a
+  // real edge - see store.archiveBounds on the kernel side.
+  liveDataPct: number | null
 }
 
 export interface SweepResult {

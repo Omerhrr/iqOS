@@ -1029,7 +1029,7 @@ function SweepTab({
             <table className="w-full font-mono text-[10px]">
               <thead>
                 <tr className="bg-[#101828] text-left text-[#4b5a72]">
-                  {['asset', 'cat', 'payout', 'net', 'win%', 'PF', 'trades', 'DD%', 'Sharpe'].map((h) => (
+                  {['asset', 'cat', 'payout', 'net', 'win%', 'PF', 'trades', 'DD%', 'Sharpe', 'live'].map((h) => (
                     <th key={h} className="px-2 py-1.5 font-medium uppercase tracking-wider">{h}</th>
                   ))}
                 </tr>
@@ -1060,10 +1060,24 @@ function SweepTab({
                     </td>
                     <td className="px-2 py-1.5 text-amber-400/80">{r.metrics.maxDrawdownPct.toFixed(1)}</td>
                     <td className="px-2 py-1.5 text-[#aab6cc]">{r.metrics.sharpe.toFixed(2)}</td>
+                    <td
+                      className={`px-2 py-1.5 font-bold ${
+                        r.liveDataPct === null ? 'text-[#4b5a72]' : r.liveDataPct >= 80 ? 'text-emerald-400' : r.liveDataPct >= 30 ? 'text-amber-400' : 'text-rose-400'
+                      }`}
+                      title={
+                        r.liveDataPct === null
+                          ? 'data provenance not reported'
+                          : r.liveDataPct < 80
+                            ? 'most of this window is deterministic synthetic fill, not real traded bars - a near-perfect win rate here can just be the strategy re-detecting the simulator\'s own mean-reversion generator, not a real edge'
+                            : 'mostly real archived bars'
+                      }
+                    >
+                      {r.liveDataPct === null ? '—' : `${r.liveDataPct.toFixed(0)}%`}
+                    </td>
                   </tr>
                 ))}
                 {!result.rows.length && (
-                  <tr><td colSpan={9} className="px-3 py-4 text-center text-[#4b5a72]">no asset cleared the min-trades guard for this strategy</td></tr>
+                  <tr><td colSpan={10} className="px-3 py-4 text-center text-[#4b5a72]">no asset cleared the min-trades guard for this strategy</td></tr>
                 )}
               </tbody>
             </table>

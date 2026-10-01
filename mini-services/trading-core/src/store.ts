@@ -917,6 +917,21 @@ export class Store {
     return row.n
   }
 
+  /** The [oldest, newest] timestamp window actually backed by REAL archived
+   * bars for one asset|tf, or null if it has none. market-data.ts's
+   * buildSeries() layers [synthetic prehistory][real archive][synthetic
+   * gap-fill] around this range - any candle whose time falls outside
+   * [oldest, newest] is a deterministic synthetic fill, not a real traded
+   * bar. Backtests/sweeps use this to report what fraction of the window
+   * they actually ran against is real market history vs the simulator. */
+  archiveBounds(asset: string, tf: string): { oldest: number; newest: number; n: number } | null {
+    const row = this.db
+      .query('SELECT MIN(time) oldest, MAX(time) newest, COUNT(*) n FROM candles_archive WHERE asset = ? AND tf = ?')
+      .get(asset, tf) as { oldest: number | null; newest: number | null; n: number }
+    if (row.oldest === null || row.newest === null || row.n === 0) return null
+    return { oldest: row.oldest, newest: row.newest, n: row.n }
+  }
+
   /** Per-asset archive depth across EVERY timeframe it has any bars for - the
    * targeted counterpart to archiveStats()'s global top-12, which only shows
    * the busiest asset|tf keys overall and silently drops a thin instrument
