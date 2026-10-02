@@ -20,6 +20,7 @@ import { sentinelPlugin, SentinelService, type SentinelConfig } from './src/plug
 import { watchdogPlugin, WatchdogService, type WatchdogConfig } from './src/plugins/watchdog'
 import { adaptivePlugin, AdaptiveService, type AdaptiveConfig } from './src/plugins/adaptive'
 import { gridSearch, walkForward, sweepAssets, type Objective } from './src/strategies/optimize'
+import type { BacktestOptions } from './src/strategies/backtest'
 import { vskMonteCarlo } from './src/analytics/vsk'
 import { tskMonteCarlo } from './src/analytics/tsk'
 import { ALL_TIMEFRAMES, type Timeframe } from './src/types'
@@ -812,6 +813,14 @@ const httpServer = createServer(async (req, res) => {
           spreadPct: body.spreadPct !== undefined ? Number(body.spreadPct) : 0,
           slippagePct: body.slippagePct !== undefined ? Number(body.slippagePct) : 0,
           commissionPct: body.commissionPct !== undefined ? Number(body.commissionPct) : 0,
+          // Compounding replay (binary mode only) - see backtest.ts's
+          // compoundStakeFor/compoundSettle, which mirror the live
+          // autopilot's stakeFor/onPositionClosed roll math exactly so a
+          // Backtest Lab run and a deployed compound bot agree.
+          stakePlan:
+            body.stakePlan && (body.stakePlan as { kind?: string }).kind === 'compound'
+              ? (body.stakePlan as BacktestOptions['stakePlan'])
+              : undefined,
         })
         return json(200, { ok: true, result })
       }

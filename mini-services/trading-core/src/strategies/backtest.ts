@@ -5,6 +5,7 @@
 import type { BacktestResult, BacktestTrade, Candle, Timeframe } from '../types'
 import { defaultParams, getStrategy } from './builtin'
 import { sharpeRatio } from '../analytics/quant'
+import type { StakePlan } from '../plugins/autopilot'
 
 export interface BacktestOptions {
   strategy: string
@@ -27,6 +28,54 @@ export interface BacktestOptions {
   spreadPct?: number
   slippagePct?: number
   commissionPct?: number
+  // Replay the SAME compounding ladder the live autopilot runs (stakeFor /
+  // onPositionClosed in autopilot.ts) against this backtest's own real
+  // win/loss sequence, instead of a flat `amount` per trade - binary mode
+  // only (compounding is not a concept in spot mode, which already risks a
+  // fixed notional per position). This answers "what would compounding
+  // actually have done on this history", as opposed to compound_plan's
+  // idealized every-trade-wins ladder projection.
+  stakePlan?: StakePlan
+}
+
+/** Mutable compounding-cycle state, mirroring autopilot.ts's RuntimeState
+ * fields (pot/rollN/halted) closely enough to replay the exact same roll
+ * math against a backtest's own trade sequence. */
+interface CompoundCycle {
+  pot: number
+  rollN: number
+  halted: boolean
+}
+
+function compoundStakeFor(plan: StakePlan, cycle: CompoundCycle): number {
+  const pot = cycle.pot >= 0.01 ? cycle.pot : plan.base
+  const derisk = plan.deriskAfter !== undefined && plan.deriskPct !== undefined && cycle.rollN >= plan.deriskAfter
+  const rollPct = derisk ? plan.deriskPct! : (plan.rollPct ?? 100)
+  const raw = (pot * rollPct) / 100
+  return Math.min(plan.maxStake ?? 5000, pot, Math.max(1, Math.round(raw * 100) / 100))
+}
+
+function compoundSettle(plan: StakePlan, cycle: CompoundCycle, won: boolean, stake: number, payout: number): void {
+  const base = plan.base
+  const working = cycle.pot >= 0.01 ? cycle.pot : base
+  if (won) {
+    const cap = (plan.payoutCap ?? 70) / 100
+    const fold = Math.min(stake * payout, stake * cap)
+    cycle.pot = Math.round((working + fold) * 100) / 100
+    cycle.rollN += 1
+    if (plan.periods && cycle.rollN >= plan.periods) {
+      if (plan.onComplete === 'reseed') {
+        cycle.pot = 0
+        cycle.rollN = 0
+      } else {
+        cycle.halted = true
+      }
+    }
+  } else {
+    cycle.pot = Math.round(Math.max(0, working - stake) * 100) / 100
+    cycle.rollN = 0
+    if (plan.stopOnLoss !== false) cycle.halted = true
+  }
 }
 
 export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: BacktestOptions): BacktestResult {
@@ -48,17 +97,32 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
   const rets: number[] = []
   let peak = equity
   let maxDD = 0
+  const compoundPlan = mode === 'binary' && opts.stakePlan?.kind === 'compound' ? opts.stakePlan : null
+  const cycle: CompoundCycle = { pot: 0, rollN: 0, halted: false }
+  let compoundCycles = 0 // how many times stopOnLoss ended a cycle and a fresh one restarted at base
 
   // -------- binary settlement --------
   if (mode === 'binary') {
     for (let i = warmup; i < candles.length - expiryBars; i++) {
+      if (compoundPlan && cycle.halted) {
+        // stopOnLoss (default true) ends a cycle just like the live bot - a
+        // real bot would stand down for the user to bot_restart, but a
+        // backtest has no one to click restart, so it auto-reseeds at base
+        // and keeps walking the history (otherwise one early loss would
+        // silently end the entire backtest after a handful of trades).
+        cycle.pot = 0
+        cycle.rollN = 0
+        cycle.halted = false
+        compoundCycles++
+      }
       const evalWindow = candles.slice(0, i + 1)
       const ev = strat.evaluate(evalWindow, params)
       if (ev.direction === 'none') continue
       const rawEntry = candles[i].close
       const entry = ev.direction === 'call' ? rawEntry * (1 + costPct / 100) : rawEntry * (1 - costPct / 100)
       const exitCandle = candles[i + expiryBars]
-      const stake = Math.min(amount, equity)
+      const rawStake = compoundPlan ? compoundStakeFor(compoundPlan, cycle) : amount
+      const stake = Math.min(rawStake, equity)
       if (stake <= 0) break
       const commission = stake * (commissionPct / 100)
       const won = ev.direction === 'call' ? exitCandle.close > entry : exitCandle.close < entry
@@ -66,6 +130,7 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
       const pnl = (draw ? 0 : won ? stake * payout : -stake) - commission
       equity += pnl
       rets.push(pnl / Math.max(stake, 0.01))
+      if (compoundPlan && !draw) compoundSettle(compoundPlan, cycle, won, stake, payout)
       trades.push({
         ts: exitCandle.time,
         side: ev.direction === 'call' ? 'call' : 'put',
@@ -162,5 +227,6 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
       finalEquity: equity,
       startEquity,
     },
+    ...(compoundPlan ? { compoundCycles } : {}),
   }
 }

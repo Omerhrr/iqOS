@@ -401,6 +401,11 @@ export interface BacktestResult {
     finalEquity: number
     startEquity: number
   }
+  // Set only when a compounding stakePlan was replayed: how many times
+  // stopOnLoss ended a cycle and the backtest auto-reseeded at base to keep
+  // walking the rest of the history (a live bot would instead stand down
+  // for bot_restart - see backtest.ts's compound-cycle loop).
+  compoundCycles?: number
 }
 
 // ---------- Indicator registry ----------

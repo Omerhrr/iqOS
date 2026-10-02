@@ -456,7 +456,23 @@ function SingleTab({ asset, strategies }: { asset: string; strategies: StrategyI
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
 
+  // Compounding ladder - same stakePlan shape bot_create/compound_plan use
+  // (see client.ts's StakePlan), replayed against THIS backtest's own real
+  // win/loss sequence instead of compound_plan's idealized every-win ladder.
+  // Binary mode only, same as the live autopilot.
+  const [compound, setCompound] = useState(false)
+  const [compBase, setCompBase] = useState('1')
+  const [compRollPct, setCompRollPct] = useState('100')
+  const [compMaxStake, setCompMaxStake] = useState('')
+  const [compPayoutCap, setCompPayoutCap] = useState('70')
+  const [compStopOnLoss, setCompStopOnLoss] = useState(true)
+  const [compPeriods, setCompPeriods] = useState('')
+  const [compDeriskAfter, setCompDeriskAfter] = useState('')
+  const [compDeriskPct, setCompDeriskPct] = useState('')
+  const [compOnComplete, setCompOnComplete] = useState<'halt' | 'reseed'>('halt')
+
   const strategy = strategies.find((s) => s.id === strategyId)
+  const compoundActive = compound && mode === 'binary'
 
   const run = async () => {
     setBusy(true)
@@ -469,6 +485,20 @@ function SingleTab({ asset, strategies }: { asset: string; strategies: StrategyI
           params[p.key] = p.type === 'number' ? Number(raw) : raw
         }
       }
+      const stakePlan = compoundActive
+        ? {
+            kind: 'compound' as const,
+            base: Number(compBase) || 1,
+            rollPct: Number(compRollPct) || 100,
+            maxStake: compMaxStake ? Number(compMaxStake) : undefined,
+            payoutCap: Number(compPayoutCap) || 70,
+            stopOnLoss: compStopOnLoss,
+            periods: compPeriods ? Number(compPeriods) : undefined,
+            deriskAfter: compDeriskAfter ? Number(compDeriskAfter) : undefined,
+            deriskPct: compDeriskPct ? Number(compDeriskPct) : undefined,
+            onComplete: compOnComplete,
+          }
+        : undefined
       const res = await osPost<{ ok: boolean; result?: BacktestResult; error?: string }>('/backtest', {
         asset,
         tf,
@@ -481,6 +511,7 @@ function SingleTab({ asset, strategies }: { asset: string; strategies: StrategyI
         slippagePct: Number(slippagePct),
         commissionPct: Number(commissionPct),
         params,
+        stakePlan,
       })
       if (res.ok && res.result) setResult(res.result)
       else setError(res.error ?? 'backtest failed')
@@ -532,7 +563,7 @@ function SingleTab({ asset, strategies }: { asset: string; strategies: StrategyI
           </select>
         </Field>
         <Field label="Stake $">
-          <Input value={amount} onChange={(e) => setAmount(e.target.value)} className={`${inCls} w-16`} />
+          <Input value={amount} onChange={(e) => setAmount(e.target.value)} disabled={compoundActive} className={`${inCls} w-16 ${compoundActive ? 'opacity-40' : ''}`} />
         </Field>
         <Field label="Expiry bars">
           <Input value={expiryBars} onChange={(e) => setExpiryBars(e.target.value)} className={`${inCls} w-14`} />
@@ -548,6 +579,18 @@ function SingleTab({ asset, strategies }: { asset: string; strategies: StrategyI
         </Field>
         <Field label="Commission %">
           <Input value={commissionPct} onChange={(e) => setCommissionPct(e.target.value)} className={`${inCls} w-14`} />
+        </Field>
+        <Field label="Compound">
+          <label className={`flex h-8 items-center gap-1.5 rounded border border-[#1c2739] bg-[#101828] px-2 ${mode !== 'binary' ? 'opacity-40' : ''}`}>
+            <input
+              type="checkbox"
+              checked={compound}
+              disabled={mode !== 'binary'}
+              onChange={(e) => setCompound(e.target.checked)}
+              className="h-3 w-3 accent-cyan-500"
+            />
+            <span className="font-mono text-[10px] text-[#9aa8bd]">{mode !== 'binary' ? 'binary only' : compound ? 'on' : 'off'}</span>
+          </label>
         </Field>
 
         {strategy?.params.map((p) => (
@@ -575,6 +618,52 @@ function SingleTab({ asset, strategies }: { asset: string; strategies: StrategyI
         </span>
       </div>
 
+      {compoundActive && (
+        <div className="flex flex-wrap items-end gap-2 rounded-lg border border-cyan-900/50 bg-cyan-950/10 p-3">
+          <div className="w-full font-mono text-[9px] uppercase tracking-wider text-cyan-400">
+            Compounding ladder - replays the SAME roll math as bot_create's stakePlan against this run&apos;s real win/loss sequence
+          </div>
+          <Field label="Base $">
+            <Input value={compBase} onChange={(e) => setCompBase(e.target.value)} className={`${inCls} w-14`} />
+          </Field>
+          <Field label="Roll %">
+            <Input value={compRollPct} onChange={(e) => setCompRollPct(e.target.value)} className={`${inCls} w-14`} />
+          </Field>
+          <Field label="Max stake $">
+            <Input value={compMaxStake} onChange={(e) => setCompMaxStake(e.target.value)} placeholder="none" className={`${inCls} w-16`} />
+          </Field>
+          <Field label="Payout cap %">
+            <Input value={compPayoutCap} onChange={(e) => setCompPayoutCap(e.target.value)} className={`${inCls} w-14`} />
+          </Field>
+          <Field label="Periods">
+            <Input value={compPeriods} onChange={(e) => setCompPeriods(e.target.value)} placeholder="unlimited" className={`${inCls} w-16`} />
+          </Field>
+          <Field label="De-risk after">
+            <Input value={compDeriskAfter} onChange={(e) => setCompDeriskAfter(e.target.value)} placeholder="off" className={`${inCls} w-14`} />
+          </Field>
+          <Field label="De-risk %">
+            <Input value={compDeriskPct} onChange={(e) => setCompDeriskPct(e.target.value)} placeholder="off" className={`${inCls} w-14`} />
+          </Field>
+          <Field label="On complete">
+            <select value={compOnComplete} onChange={(e) => setCompOnComplete(e.target.value as 'halt' | 'reseed')} className={selCls}>
+              <option value="halt">halt</option>
+              <option value="reseed">reseed</option>
+            </select>
+          </Field>
+          <Field label="Stop on loss">
+            <label className="flex h-8 items-center gap-1.5 rounded border border-[#1c2739] bg-[#101828] px-2">
+              <input
+                type="checkbox"
+                checked={compStopOnLoss}
+                onChange={(e) => setCompStopOnLoss(e.target.checked)}
+                className="h-3 w-3 accent-cyan-500"
+              />
+              <span className="font-mono text-[10px] text-[#9aa8bd]">{compStopOnLoss ? 'on (reseeds the backtest after a loss)' : 'off (legacy re-seed roll)'}</span>
+            </label>
+          </Field>
+        </div>
+      )}
+
       {error && <div className="rounded border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-[11px] text-rose-400">{error}</div>}
 
       {m && equity && (
@@ -593,7 +682,12 @@ function SingleTab({ asset, strategies }: { asset: string; strategies: StrategyI
             </svg>
             <div className="mt-1 flex justify-between font-mono text-[9px] text-[#4b5a72]">
               <span>{new Date(equity.start * 1000).toLocaleTimeString('en-US', { hour12: false })}</span>
-              <span>{result?.candlesTested} candles tested · {m.totalTrades} trades</span>
+              <span>
+                {result?.candlesTested} candles tested · {m.totalTrades} trades
+                {result?.compoundCycles !== undefined && (
+                  <span className="text-cyan-400"> · {result.compoundCycles} compound cycle{result.compoundCycles === 1 ? '' : 's'} reseeded</span>
+                )}
+              </span>
               <span>{new Date(equity.end * 1000).toLocaleTimeString('en-US', { hour12: false })}</span>
             </div>
           </div>

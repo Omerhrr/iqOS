@@ -1886,6 +1886,7 @@ MEMORY GATE - your rule notes govern the machines: a note saved with kind "rule"
 The OS runs in a global OPERATING MODE (os_mode_status / os_mode_set / autotrader_configure): "human" = HUMAN-IN-THE-LOOP, every trade needs the user and bot orders are suspended by the mode gate (configs preserved); "auto" = NO-HUMAN-IN-THE-LOOP, the OS trades autonomously - armed bots run and the built-in AUTO-TRADER takes the strongest screener signals on its own. NEVER set mode to "auto" unless the user explicitly asks for it ("no human", "autonomous", "let it trade by itself") - entering no-human mode without an explicit request is a hard violation. When a bot order is rejected with a "mode-gate:" reason, explain that the OS is in HUMAN mode and autonomy is suspended by design. If a bot order is rejected with a "watchdog:" reason, explain that the strategy is degrading vs its baseline - never suggest bypassing it; if a bot is on WATCH, surface the numbers and recommend re-validating with the research workflow. If a trade or bot order is rejected with a "sentinel:" reason, explain which limit or breaker fired - never suggest workarounds, limits are there to protect the account; resume only when the user explicitly accepts the risk.
 RESEARCH GATE - bot_create/bot_toggle will REFUSE to arm a bot ("research-gate: ..." error) unless EVERY instrument in its watchlist has a RECENT (<=14 days) "robust" walk-forward verdict for that exact asset+tf+strategy - a bot can't go live on an untested edge. When that happens: explain which instrument/strategy combo is missing or stale, then run walkforward for it (same asset/tf/strategy/params the bot would use) and only retry bot_create/bot_toggle once the verdict comes back robust; if it comes back weak or failed, say so plainly and suggest re-tuning params (optimize_strategy) or picking a different asset (asset_sweep) rather than arming anyway. This is a hard gate, same tier as memory-gate/mode-gate/sentinel/watchdog. Use calibration_report to sanity-check whether the model's own confidence/score numbers have been trustworthy on real closed trades (needs 30+ trades with entry snapshots) before leaning on them for position sizing or as a secondary filter.
 FORCING THE GATE - the ONE way around it is bot_create/bot_toggle with force:true, and it exists specifically for a user who says they've verified the edge/data themselves. Never pass force:true pre-emptively or because a gate failure is inconvenient. The sequence is always: run the real check (walkforward/asset_sweep/liveDataPct), report the honest failing result and why, THEN only if the user explicitly says to force it / deploy anyway / proceed despite that - pass force:true. After a forced arm, state plainly that the bot is running UNVALIDATED (forcedUnvalidated:true, visible in autopilot_status) - it is not a validated edge, it is the user's deliberate override, and you should keep calling it that in any later status report on this bot, not quietly drop the caveat after the first message.
+/override (a literal prefix the USER types, stripped before it reaches you - you will instead see an "OVERRIDE MODE IS ACTIVE" directive appended to this system prompt for that one message): this IS the user's explicit "force it / proceed anyway" consent, decided up front, for that single request. In override mode, run the full validation chain the request needs without pausing between steps to ask permission, then go straight to bot_create/bot_toggle - passing force:true automatically if (and only if) the gate actually fails. You still run the real checks and still report the real numbers and verdict - override removes the back-and-forth around confirming each step, it never removes the checks themselves or the honesty about what they found. A request WITHOUT the override directive gets the normal step-by-step confirmation flow - do not treat "force"/"deploy anyway" typed in an ordinary (non-override) message as license to skip showing the failing result first.
 
 Tool protocol - follow it EXACTLY:
 - Respond with ONE JSON object and nothing else. No markdown fences, no prose outside the JSON.
@@ -2109,6 +2110,7 @@ export async function POST(req: NextRequest) {
   let sessionId = 'default'
   let userMessage = ''
   let ui: UiContext = {}
+  let overrideMode = false
   try {
     const body = (await req.json()) as { sessionId?: string; message?: string; ui?: UiContext }
     sessionId = body.sessionId ?? 'default'
@@ -2116,6 +2118,21 @@ export async function POST(req: NextRequest) {
     ui = body.ui ?? {}
     if (!userMessage) {
       return NextResponse.json({ ok: false, error: 'message required' }, { status: 400 })
+    }
+    // "/override" is the user's own explicit, literal pre-authorization to
+    // skip the usual step-by-step "shall I proceed?" confirmation dance for
+    // THIS message only - it does not bypass the research gate's actual
+    // checks, it bypasses the back-and-forth around them. Stripped off
+    // before it reaches the model as the visible message; the directive it
+    // triggers is injected into SYSTEM instead (see overrideMode below) so
+    // it can't be confused with ordinary conversation text or re-triggered
+    // by the model quoting the word back.
+    if (/^\/override\b/i.test(userMessage)) {
+      overrideMode = true
+      userMessage = userMessage.replace(/^\/override\b/i, '').trim()
+      if (!userMessage) {
+        return NextResponse.json({ ok: false, error: '/override needs a prompt after it - e.g. "/override deploy ensemble-vote on GBPJPY-OTC 5m, members pattern-confluence+confluence-full, $10 stake"' }, { status: 400 })
+      }
     }
   } catch (err) {
     return NextResponse.json({ ok: false, error: (err as Error).message }, { status: 400 })
@@ -2138,7 +2155,9 @@ export async function POST(req: NextRequest) {
       try {
         emit({ type: 'status', text: 'loading OS context…' })
         const contextBlock = await buildContextBlock(ui)
-        const SYSTEM = `${SYSTEM_BASE}\n\n${contextBlock}`
+        const OVERRIDE_DIRECTIVE =
+          '\n\nOVERRIDE MODE IS ACTIVE FOR THIS MESSAGE ONLY (the user prefixed it with /override - that literal prefix IS their explicit, pre-authorized instruction, equivalent to them saying "force it / deploy anyway" after seeing a failure, decided BEFORE this turn even started). What override changes: skip the step-by-step "shall I run X? / want me to proceed?" dance entirely for this one request - run every validation call the request actually needs (walkforward/asset_sweep/optimize_strategy as appropriate) back to back in as few turns as possible, then go straight to bot_create/bot_toggle. What override does NOT change: you still run the real checks and still read their real results before arming anything - you are not allowed to skip walkforward and just arm blind. If the research gate passes on what you tested, arm it cleanly (force omitted). If it fails, arm it anyway with force:true (this is exactly the user consent that force requires - /override on this message IS that consent, so do not ask for it again) and say plainly in your final answer that it is forcedUnvalidated and why the gate failed. Either way, your final "say" must state the actual numbers you tested (verdict, OOS trades, net, win rate) - override skips asking permission, it never skips showing what was actually run. If the request is ambiguous (asset/strategy/stake genuinely unspecified with no sane default), make the most reasonable call yourself and say what you assumed rather than stopping to ask - that is also part of what override means.'
+        const SYSTEM = `${SYSTEM_BASE}${overrideMode ? OVERRIDE_DIRECTIVE : ''}\n\n${contextBlock}`
 
         // recent conversation for continuity
         let recent: ChatMsg[] = []
@@ -2154,6 +2173,7 @@ export async function POST(req: NextRequest) {
         const messages: ChatMsg[] = [...recent, { role: 'user', content: userMessage }]
 
         let failedBatches = 0
+        let narrationStalls = 0
         for (let iter = 0; iter < 8 && !closed && !req.signal.aborted; iter++) {
           emit({ type: 'status', text: iter === 0 ? 'thinking…' : 'reasoning over results…' })
           const payloadMessages: ChatMessage[] = [
@@ -2170,6 +2190,26 @@ export async function POST(req: NextRequest) {
           const actions = extractActions(raw)
 
           if (!actions.length) {
+            // The exact failure mode that produced the "I keep saying I'm
+            // calling it but never do" loop: the model narrates intent in
+            // prose ("Running the walkforward now.", "Emitting it now.")
+            // instead of ever emitting the {"action": ...} JSON, and this
+            // branch used to finalize on that prose immediately - reporting
+            // "done" while nothing ran. One bounded corrective retry: if the
+            // text reads like it meant to act (or override mode expects it
+            // to), tell it plainly that nothing ran and demand the real JSON
+            // action, instead of accepting narration as the answer.
+            const looksLikeIntent = /\b(running|emitting|calling|will run|going to run|let me run|i'll run|executing)\b/i.test(raw)
+            if (narrationStalls === 0 && iter < 7 && (looksLikeIntent || overrideMode)) {
+              narrationStalls++
+              messages.push({ role: 'assistant', content: raw })
+              messages.push({
+                role: 'user',
+                content:
+                  'That reply was plain text describing a tool call rather than making one - it contained no {"action": ...} JSON, so nothing actually ran. Stop narrating intent and respond with ONLY the real JSON action object now, nothing before or after it (e.g. {"action":"walkforward","args":{...}}). If you are genuinely finished with nothing left to run, respond with {"action":"final","say":"<your answer>"} instead - but do not claim a result you have not actually gotten from a tool.',
+              })
+              continue
+            }
             const final = salvageSay(raw) || raw || 'I could not produce a structured response - please rephrase.'
             emit({ type: 'final', text: final })
             await persist(sessionId, userMessage, final)

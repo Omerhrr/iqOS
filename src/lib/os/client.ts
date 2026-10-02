@@ -754,6 +754,27 @@ export interface BacktestResult {
     winRateCiHigh: number
     lowSample: boolean
   }
+  // Present only when a compounding stakePlan was sent: how many times a
+  // stopOnLoss cycle ended and the backtest auto-reseeded at base to keep
+  // walking the rest of history (a live bot would instead stand down for
+  // bot_restart).
+  compoundCycles?: number
+}
+
+// Mirrors mini-services/trading-core's autopilot.ts StakePlan - the SAME
+// shape bot_create/compound_plan use, so a config tuned in Backtest Lab can
+// be pasted straight into a bot without translation.
+export interface StakePlan {
+  kind: 'compound'
+  base: number
+  rollPct?: number
+  maxStake?: number
+  payoutCap?: number
+  stopOnLoss?: boolean
+  periods?: number
+  deriskAfter?: number
+  deriskPct?: number
+  onComplete?: 'halt' | 'reseed'
 }
 
 // ---------- research: optimizer / walk-forward / asset sweep ----------
