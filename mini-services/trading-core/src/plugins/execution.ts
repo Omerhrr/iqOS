@@ -354,6 +354,7 @@ export class ExecutionService {
     tp?: number
     sl?: number
     kind?: TradeKind
+    note?: string
   }): Promise<{ ok: boolean; position?: Position; error?: string }> {
     if (!this.liveReady) return { ok: false, error: this.lastLiveError || 'live broker not connected (start the iqair sidecar and connect in Settings)' }
     const kind: TradeKind = req.kind ?? 'binary'
@@ -435,6 +436,21 @@ export class ExecutionService {
         sl: req.sl,
         liveOrderId: orderId,
         settlesAt: isCfd ? undefined : echoExp ?? this.now() + expiryMin * 60,
+        // THE BUG: this Position literal never carried `note` through, unlike
+        // the paper-order branch above (`note: req.note`). Every live trade's
+        // `note` therefore came back as `bot:${bot.id}` ... undefined, so
+        // autopilot's botIdOf() - which keys ONLY off that prefix - could
+        // never match a live position to its bot. onPositionOpened/Closed
+        // both bail out immediately on a null botId, so for every bot that
+        // is actually routed to the real IQ account: the compounding pot
+        // never updates (stuck forever at whatever it was before the live
+        // bug - hence "it keeps trading the same stake, never compounds"),
+        // the cooldown-at-close re-stamp never runs, win/loss/streak/pnl
+        // stats never update, and the research-gate's journal lookups
+        // (which filter positions by `note LIKE 'bot:%'`) silently miss
+        // every live trade too. Threading the note through fixes all of it
+        // at once for live-routed bots.
+        note: req.note,
       }
       Object.assign(position, this.snapshotSignal(req.asset, req.tf ?? '1m'))
       this.store.insertPosition(position)

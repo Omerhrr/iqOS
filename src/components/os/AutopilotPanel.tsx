@@ -570,32 +570,34 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
             {draft.kind === 'binary' || draft.kind === 'turbo' ? (
               <div>
                 <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">
-                  Expiry (minutes, {TF_SECONDS[draft.tf]}s/bar on {draft.tf})
+                  Expiry (seconds, {TF_SECONDS[draft.tf]}s/bar on {draft.tf})
                 </Label>
                 <Input
                   type="number"
-                  min={1}
-                  step={1}
+                  min={TF_SECONDS[draft.tf]}
+                  step={TF_SECONDS[draft.tf]}
                   // Binary/turbo bots settle on BAR COUNT (expiryBars), not
-                  // wall-clock time - there is no minutes field in the stored
-                  // config. This control is the fix for "I don't see where
-                  // to set it manually / it keeps defaulting to 1 minute":
-                  // the raw "expiry (bars)" input made it easy to type "60"
-                  // meaning 60 minutes and actually save 60 BARS (e.g. 60
-                  // hours on a 1h tf) - or conversely to not realize 1 bar on
-                  // a sub-minute tf is nowhere near 1 minute. Typing minutes
-                  // here converts to the nearest whole bar count for the
-                  // CURRENT timeframe and that's what actually gets saved.
-                  value={String(Math.round((draft.expiryBars * TF_SECONDS[draft.tf]) / 60) || '')}
+                  // wall-clock time - there is no seconds field in the stored
+                  // config. A minutes-only control here used to round down to
+                  // 0 (and show blank) on sub-minute timeframes (5s/15s/30s),
+                  // which is exactly what made it look like there was no way
+                  // to set expiry manually on those tf's. Seconds is the only
+                  // unit that works for every timeframe, so this is the one
+                  // field: type a wall-clock duration in seconds and it
+                  // converts to the nearest whole bar count for the CURRENT
+                  // timeframe, which is what actually gets saved.
+                  value={String(draft.expiryBars * TF_SECONDS[draft.tf] || '')}
                   onChange={(e) => {
-                    const mins = Math.max(0, Number(e.target.value.replace(/[^0-9.]/g, '')) || 0)
-                    const bars = Math.max(1, Math.round((mins * 60) / TF_SECONDS[draft.tf]))
+                    const secs = Math.max(0, Number(e.target.value.replace(/[^0-9.]/g, '')) || 0)
+                    const bars = Math.max(1, Math.round(secs / TF_SECONDS[draft.tf]))
                     patch({ expiryBars: bars })
                   }}
                   className="h-8 border-[#1c2739] bg-[#101828] text-right text-[12px] text-[#e2e8f0]"
                 />
                 <div className="mt-0.5 text-[9px] text-[#4b5a72]">
-                  = {draft.expiryBars} bar{draft.expiryBars === 1 ? '' : 's'} on this timeframe - changing the timeframe keeps the bar count, not the minutes, so re-check this after switching tf
+                  = {draft.expiryBars} bar{draft.expiryBars === 1 ? '' : 's'} ({draft.expiryBars * TF_SECONDS[draft.tf]}s
+                  {draft.expiryBars * TF_SECONDS[draft.tf] >= 60 ? ` ≈ ${(draft.expiryBars * TF_SECONDS[draft.tf] / 60).toFixed(1)} min` : ''}) on this
+                  timeframe - changing the timeframe keeps the bar count, not the duration, so re-check this after switching tf
                 </div>
               </div>
             ) : draft.kind === 'digital' ? (
