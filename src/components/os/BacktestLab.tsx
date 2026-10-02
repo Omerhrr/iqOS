@@ -200,6 +200,137 @@ function StrategyPicker({
   )
 }
 
+// A strategy param is "combinable" (type: 'select') when its value is a
+// comma-separated list of other strategy ids rather than a number -
+// currently only ensemble-vote's `members`. These can never be swept as a
+// numeric from/to/step range, so they get their own multi-pick UI instead
+// of the plain numeric Input every other param uses.
+function MembersPicker({
+  strategies,
+  excludeId,
+  value,
+  onChange,
+}: {
+  strategies: StrategyInfo[]
+  excludeId: string
+  value: string
+  onChange: (v: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+
+  const selected = useMemo(() => new Set(value.split(',').map((s) => s.trim()).filter(Boolean)), [value])
+  const options = strategies.filter((s) => s.id !== excludeId)
+
+  useEffect(() => {
+    if (!open) return
+    const onDocClick = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', onDocClick)
+    return () => document.removeEventListener('mousedown', onDocClick)
+  }, [open])
+
+  const toggle = (id: string) => {
+    const next = new Set(selected)
+    if (next.has(id)) next.delete(id)
+    else next.add(id)
+    onChange(Array.from(next).join(','))
+  }
+
+  const summary = selected.size === 0 ? 'none picked' : selected.size === 1 ? [...selected][0] : `${selected.size} members`
+
+  return (
+    <div ref={rootRef} className="relative w-44">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className={`${selCls} flex w-full items-center justify-between text-left ${selected.size === 0 ? 'text-amber-400' : ''}`}
+      >
+        <span className="truncate">{summary}</span>
+        <span className="ml-1 shrink-0 text-[#4b5a72]">▾</span>
+      </button>
+      {open && (
+        <div className="absolute left-0 top-[calc(100%+2px)] z-20 max-h-64 w-64 overflow-auto rounded border border-[#1c2739] bg-[#0b111c] p-1 shadow-lg">
+          {options.map((s) => (
+            <label
+              key={s.id}
+              className="flex cursor-pointer items-center gap-1.5 rounded px-1.5 py-1 font-mono text-[10px] text-[#9aa8bd] hover:bg-[#1c2739]"
+            >
+              <input
+                type="checkbox"
+                checked={selected.has(s.id)}
+                onChange={() => toggle(s.id)}
+                className="h-3 w-3 shrink-0 accent-cyan-500"
+              />
+              <span className="truncate">{s.name}</span>
+            </label>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Renders the right control for a strategy param: the plain numeric Input
+// for everything except a 'select' (combinable-id-list) param, which gets
+// the MembersPicker above instead of a free-text box a user could easily
+// typo into an empty/garbage member list.
+function StrategyParamField({
+  p,
+  strategies,
+  strategyId,
+  value,
+  onChange,
+}: {
+  p: StrategyInfo['params'][number]
+  strategies: StrategyInfo[]
+  strategyId: string
+  value: string
+  onChange: (v: string) => void
+}) {
+  if (p.type === 'select') {
+    return <MembersPicker strategies={strategies} excludeId={strategyId} value={value} onChange={onChange} />
+  }
+  return <Input value={value} onChange={(e) => onChange(e.target.value)} className={`${inCls} w-16 text-cyan-300`} />
+}
+
+// Fixed (non-swept) param controls shown alongside the numeric sweep grid in
+// Optimizer/Walk-Forward - currently just ensemble-vote's `members`, but
+// written generically over every 'select'-type param the chosen strategy has.
+function FixedParamsEditor({
+  strategy,
+  strategies,
+  value,
+  onChange,
+}: {
+  strategy: StrategyInfo | undefined
+  strategies: StrategyInfo[]
+  value: Record<string, string>
+  onChange: (v: Record<string, string>) => void
+}) {
+  const selectParams = strategy?.params.filter((p) => p.type === 'select') ?? []
+  if (!strategy || !selectParams.length) return null
+  return (
+    <div className="space-y-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] p-2">
+      <div className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Fixed params (can&apos;t be swept - applied to every combo)</div>
+      {selectParams.map((p) => (
+        <div key={p.key} className="flex items-center gap-1.5">
+          <span className="w-28 shrink-0 truncate font-mono text-[10px] text-[#7c8aa5]" title={p.label}>
+            {p.label}
+          </span>
+          <MembersPicker
+            strategies={strategies}
+            excludeId={strategy.id}
+            value={value[p.key] ?? String(p.default)}
+            onChange={(v) => onChange({ ...value, [p.key]: v })}
+          />
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function niceStep(lo: number, hi: number): number {
   const raw = (hi - lo) / 6
   if (raw <= 0) return 1
@@ -244,7 +375,7 @@ function SweepGridEditor({
   return (
     <div className="space-y-1 rounded-lg border border-[#1c2739] bg-[#0b111c] p-2">
       <div className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Parameter sweep (check a param to optimize it)</div>
-      {strategy.params.map((p) => {
+      {strategy.params.filter((p) => p.type !== 'select').map((p) => {
         const st = value[p.key]
         const lo = p.min ?? 1
         const hi = p.max ?? 100
@@ -421,15 +552,17 @@ function SingleTab({ asset, strategies }: { asset: string; strategies: StrategyI
 
         {strategy?.params.map((p) => (
           <Field key={p.key} label={p.label}>
-            <Input
+            <StrategyParamField
+              p={p}
+              strategies={strategies}
+              strategyId={strategyId}
               value={paramValues[strategyId]?.[p.key] ?? String(p.default)}
-              onChange={(e) =>
+              onChange={(v) =>
                 setParamValues((pv) => ({
                   ...pv,
-                  [strategyId]: { ...(pv[strategyId] ?? {}), [p.key]: e.target.value },
+                  [strategyId]: { ...(pv[strategyId] ?? {}), [p.key]: v },
                 }))
               }
-              className={`${inCls} w-16 text-cyan-300`}
             />
           </Field>
         ))}
@@ -517,6 +650,7 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
   const [slippagePct, setSlippagePct] = useState('0')
   const [commissionPct, setCommissionPct] = useState('0')
   const [sweepState, setSweepState] = useState<SweepState>({})
+  const [fixedParams, setFixedParams] = useState<Record<string, string>>({})
   const [result, setResult] = useState<GridSearchResult | null>(null)
   const [selected, setSelected] = useState<OptRow | null>(null)
   const [busy, setBusy] = useState(false)
@@ -525,6 +659,11 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
 
   const strategy = strategies.find((s) => s.id === strategyId)
   const { sweep, count, missing } = useMemo(() => buildSweep(strategy, sweepState), [strategy, sweepState])
+  // Params that can't be swept (type 'select', e.g. ensemble-vote's
+  // `members`) still need a way to be pinned to something other than their
+  // registered default - see fixedParams below, sent as the kernel's
+  // "params" (merged under every combo).
+  const selectParams = useMemo(() => strategy?.params.filter((p) => p.type === 'select') ?? [], [strategy])
 
   const run = async () => {
     if (!Object.keys(sweep).length) {
@@ -534,11 +673,13 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
     setBusy(true)
     setError('')
     try {
+      const params = Object.fromEntries(selectParams.map((p) => [p.key, fixedParams[p.key] ?? String(p.default)]))
       const res = await osPost<{ ok: boolean; result?: GridSearchResult; error?: string }>('/optimize', {
         asset,
         tf,
         strategy: strategyId,
         sweep,
+        params,
         objective,
         minTrades: Number(minTrades),
         maxCombos: Number(maxCombos),
@@ -567,7 +708,7 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
           <StrategyPicker
             strategies={strategies}
             value={strategyId}
-            onChange={(id) => { setStrategyId(id); setSweepState({}); setResult(null); setSelected(null) }}
+            onChange={(id) => { setStrategyId(id); setSweepState({}); setFixedParams({}); setResult(null); setSelected(null) }}
           />
         </Field>
         <Field label="Timeframe">
@@ -620,6 +761,7 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
 
       <div className="grid grid-cols-1 gap-3 xl:grid-cols-[300px_1fr]">
         <SweepGridEditor strategy={strategy} value={sweepState} onChange={setSweepState} />
+        <FixedParamsEditor strategy={strategy} strategies={strategies} value={fixedParams} onChange={setFixedParams} />
 
         <div className="space-y-3">
           {error && <div className="rounded border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-[11px] text-rose-400">{error}</div>}
@@ -729,6 +871,7 @@ function WalkForwardTab({ asset, strategies }: { asset: string; strategies: Stra
   const [slippagePct, setSlippagePct] = useState('0')
   const [commissionPct, setCommissionPct] = useState('0')
   const [sweepState, setSweepState] = useState<SweepState>({})
+  const [fixedParams, setFixedParams] = useState<Record<string, string>>({})
   const [result, setResult] = useState<WalkForwardResult | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -736,16 +879,19 @@ function WalkForwardTab({ asset, strategies }: { asset: string; strategies: Stra
 
   const strategy = strategies.find((s) => s.id === strategyId)
   const { sweep, count, missing } = useMemo(() => buildSweep(strategy, sweepState), [strategy, sweepState])
+  const selectParams = useMemo(() => strategy?.params.filter((p) => p.type === 'select') ?? [], [strategy])
 
   const run = async () => {
     setBusy(true)
     setError('')
     try {
+      const params = Object.fromEntries(selectParams.map((p) => [p.key, fixedParams[p.key] ?? String(p.default)]))
       const res = await osPost<{ ok: boolean; result?: WalkForwardResult; error?: string }>('/walkforward', {
         asset,
         tf,
         strategy: strategyId,
         sweep,
+        params,
         objective,
         minTrades: Number(minTrades),
         folds: Number(folds),
@@ -774,7 +920,7 @@ function WalkForwardTab({ asset, strategies }: { asset: string; strategies: Stra
           <StrategyPicker
             strategies={strategies}
             value={strategyId}
-            onChange={(id) => { setStrategyId(id); setSweepState({}); setResult(null) }}
+            onChange={(id) => { setStrategyId(id); setSweepState({}); setFixedParams({}); setResult(null) }}
           />
         </Field>
         <Field label="Timeframe">
@@ -829,6 +975,7 @@ function WalkForwardTab({ asset, strategies }: { asset: string; strategies: Stra
 
       <div className="grid grid-cols-1 gap-3 xl:grid-cols-[300px_1fr]">
         <SweepGridEditor strategy={strategy} value={sweepState} onChange={setSweepState} />
+        <FixedParamsEditor strategy={strategy} strategies={strategies} value={fixedParams} onChange={setFixedParams} />
 
         <div className="space-y-3">
           {error && <div className="rounded border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-[11px] text-rose-400">{error}</div>}
@@ -1083,15 +1230,17 @@ function SweepTab({
 
         {strategy?.params.map((p) => (
           <Field key={p.key} label={p.label}>
-            <Input
+            <StrategyParamField
+              p={p}
+              strategies={strategies}
+              strategyId={strategyId}
               value={paramValues[strategyId]?.[p.key] ?? String(p.default)}
-              onChange={(e) =>
+              onChange={(v) =>
                 setParamValues((pv) => ({
                   ...pv,
-                  [strategyId]: { ...(pv[strategyId] ?? {}), [p.key]: e.target.value },
+                  [strategyId]: { ...(pv[strategyId] ?? {}), [p.key]: v },
                 }))
               }
-              className={`${inCls} w-16 text-cyan-300`}
             />
           </Field>
         ))}
