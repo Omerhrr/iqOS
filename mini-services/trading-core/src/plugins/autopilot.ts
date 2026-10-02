@@ -666,7 +666,15 @@ export class AutopilotService {
       amount: bet.amount,
       expiryBars: bot.expiryBars,
       expirySec: bot.kind === 'digital' ? bot.expirySec : undefined,
-      mode: 'paper',
+      // THE BUG: this used to be hardcoded 'paper' unconditionally, so every
+      // autopilot bot traded the simulated ledger no matter what the account
+      // was actually connected to - a bot could show "armed" and "took a
+      // trade" in the OS while nothing ever reached the real IQ Option
+      // account, because it was never routed there in the first place.
+      // account source is the single routing truth, same as the manual
+      // /trade endpoint in index.ts: on IQ every order is live, on paper
+      // everything stays simulated.
+      mode: this.exec.accountSource === 'iq' ? 'live' : 'paper',
       strategy: bot.strategyId,
       note: `bot:${bot.id}`,
     })

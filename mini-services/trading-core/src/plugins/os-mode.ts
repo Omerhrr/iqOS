@@ -603,6 +603,7 @@ export class ModeService {
   private async place(row: ScreenRow, side: 'call' | 'put'): Promise<{ ok: boolean; error?: string }> {
     try {
       const exec = this.ctx.use<{
+        accountSource: 'paper' | 'iq'
         placeOrder(req: {
           asset: string
           tf: Timeframe
@@ -610,7 +611,7 @@ export class ModeService {
           kind: 'binary'
           amount: number
           expiryBars: number
-          mode: 'paper'
+          mode: 'paper' | 'live'
           strategy: string
           note: string
         }): Promise<{ ok: boolean; error?: string }>
@@ -622,7 +623,12 @@ export class ModeService {
         kind: 'binary',
         amount: this.config.stake,
         expiryBars: 1,
-        mode: 'paper',
+        // THE SAME BUG that was in autopilot.ts: this was hardcoded 'paper'
+        // unconditionally, so the built-in AUTO-mode auto-trader could never
+        // place a real order no matter what the account was connected to.
+        // account source is the single routing truth (same as /trade and
+        // autopilot.ts's bot execution path).
+        mode: exec.accountSource === 'iq' ? 'live' : 'paper',
         strategy:
           this.config.signalSource === 'kalman-ou'
             ? 'kalman-ou-reversion'
