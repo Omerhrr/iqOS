@@ -655,6 +655,7 @@ const httpServer = createServer(async (req, res) => {
         const out = gridSearch(market.getCandlesDeep(String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), 2200), String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), {
           strategy: String(body.strategy ?? 'confluence-core'),
           sweep: (body.sweep as Record<string, { from: number; to: number; step: number }>) ?? {},
+          fixedParams: (body.params as Record<string, number | string>) ?? {},
           objective: (body.objective as Objective) ?? 'netPnl',
           // Raised from 8: 8 trades is far too small a sample to trust a
           // ranking decision on (see FastMetrics.winRateCiLow/High - at n=8 the
@@ -681,6 +682,7 @@ const httpServer = createServer(async (req, res) => {
         const out = walkForward(market.getCandlesDeep(String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), 2200), String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), {
           strategy: String(body.strategy ?? 'rsi-reversion'),
           sweep: (body.sweep as Record<string, { from: number; to: number; step: number }>) ?? {},
+          fixedParams: (body.params as Record<string, number | string>) ?? {},
           objective: (body.objective as Objective) ?? 'netPnl',
           // Raised from 6: each walk-forward fold's OOS sample is inherently
           // small, so 10 is a pragmatic floor between "too few for the fold to

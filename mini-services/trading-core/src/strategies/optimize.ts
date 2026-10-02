@@ -431,6 +431,16 @@ function heatmapFrom(
 export interface GridSearchOptions {
   strategy: string
   sweep: SweepSpec
+  // Non-swept param overrides, merged under every combo as the base before
+  // the swept keys are applied on top. This is the ONLY way to pin a param
+  // the grid isn't sweeping to something other than its registered default -
+  // essential for a non-numeric ("select") param like ensemble-vote's
+  // `members`, which can never be swept via SweepSpec's from/to/step ranges
+  // in the first place (there is nothing numeric to step over a comma-
+  // separated id list). Without this, any param not listed in `sweep`
+  // silently falls back to strat.params default on every combo, with no way
+  // for a caller to override it.
+  fixedParams?: Record<string, number | string>
   objective?: Objective
   minTrades?: number
   maxCombos?: number
@@ -462,9 +472,15 @@ export function gridSearch(candles: Candle[], asset: string, tf: Timeframe, opts
     commissionPct: opts.commissionPct,
   }
   const sweptKeys = Object.keys(opts.sweep).filter((k) => strat.params.some((p) => p.key === k))
+  // Base every combo on the strategy's registered defaults, then let any
+  // explicit fixedParams override those defaults (a fixedParams key that
+  // also happens to be swept is fine - the swept value below still wins for
+  // that specific key since it's spread on last).
+  const fixedBase = { ...defaultParams(strat), ...(opts.fixedParams ?? {}) }
 
   const t0 = Date.now()
-  const { combos, total, truncated } = expandGrid(strat, opts.sweep, opts.maxCombos ?? 240)
+  const { combos: rawCombos, total, truncated } = expandGrid(strat, opts.sweep, opts.maxCombos ?? 240)
+  const combos = rawCombos.map((c) => ({ ...fixedBase, ...c }))
   const valueLists = new Map<string, Set<number>>()
   for (const k of sweptKeys) valueLists.set(k, new Set())
 
@@ -573,6 +589,12 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
     commissionPct: opts.commissionPct,
   }
   const warmup = strategyWarmup(strat.id)
+  // Same fixedParams merge as gridSearch - see that function's comment.
+  // Without this, bestParams below is seeded from raw registered defaults
+  // and a caller's fixedParams (e.g. ensemble-vote's `members`) is silently
+  // dropped on every fold, with the result still REPORTING the unused
+  // default as if it had been evaluated.
+  const fixedBase = { ...defaultParams(strat), ...(opts.fixedParams ?? {}) }
 
   const t0 = Date.now()
   const usable = candles.length - warmup
@@ -582,7 +604,8 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
       `history too short for ${folds} walk-forward folds on ${strat.id} (needs ~${(warmup + 140 * folds).toFixed(0)} candles, have ${candles.length}) — try fewer folds or a faster-warming strategy`
     )
   }
-  const { combos } = expandGrid(strat, opts.sweep, opts.maxCombos ?? 120)
+  const { combos: rawCombos } = expandGrid(strat, opts.sweep, opts.maxCombos ?? 120)
+  const combos = rawCombos.map((c) => ({ ...fixedBase, ...c }))
 
   const outFolds: WalkForwardFold[] = []
   let isNet = 0
@@ -592,7 +615,7 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
   // below) instead of naively averaging each fold's own ratio.
   const pooledTrades: BacktestTrade[] = []
   let bestFoldScore = -Infinity
-  let bestParams: Record<string, number | string> = strat.params.reduce((a, p) => ({ ...a, [p.key]: p.default }), {} as Record<string, number | string>)
+  let bestParams: Record<string, number | string> = { ...fixedBase }
 
   for (let f = 0; f < folds; f++) {
     const isStart = warmup + f * foldSize
