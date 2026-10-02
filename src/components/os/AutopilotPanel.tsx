@@ -24,6 +24,23 @@ import { KIND_LABEL, TIMEFRAMES, fmtMoney, fmtTime, osGet, osPost } from '@/lib/
 
 const GATE_MAX_AGE_SEC = 14 * 24 * 60 * 60
 
+// Seconds per candle, by timeframe - used only to convert "expiry in
+// minutes" into the bar count binary/turbo bots actually store (expiryBars).
+// Mirrors the kernel's own TIMEFRAME_SECONDS table.
+const TF_SECONDS: Record<Timeframe, number> = {
+  '5s': 5,
+  '15s': 15,
+  '30s': 30,
+  '1m': 60,
+  '2m': 120,
+  '5m': 300,
+  '15m': 900,
+  '30m': 1800,
+  '1h': 3600,
+  '4h': 14400,
+  '1d': 86400,
+}
+
 /** Same check the kernel's autopilot.researchGate() runs before arming - re-run
  * here client-side (against the same /validation table) purely to SHOW the
  * user why a bot might be blocked, before they even try to start it. */
@@ -551,7 +568,36 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
             />
 
             {draft.kind === 'binary' || draft.kind === 'turbo' ? (
-              <NumField label="Expiry (bars)" value={draft.expiryBars} onChange={(v) => patch({ expiryBars: v })} />
+              <div>
+                <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">
+                  Expiry (minutes, {TF_SECONDS[draft.tf]}s/bar on {draft.tf})
+                </Label>
+                <Input
+                  type="number"
+                  min={1}
+                  step={1}
+                  // Binary/turbo bots settle on BAR COUNT (expiryBars), not
+                  // wall-clock time - there is no minutes field in the stored
+                  // config. This control is the fix for "I don't see where
+                  // to set it manually / it keeps defaulting to 1 minute":
+                  // the raw "expiry (bars)" input made it easy to type "60"
+                  // meaning 60 minutes and actually save 60 BARS (e.g. 60
+                  // hours on a 1h tf) - or conversely to not realize 1 bar on
+                  // a sub-minute tf is nowhere near 1 minute. Typing minutes
+                  // here converts to the nearest whole bar count for the
+                  // CURRENT timeframe and that's what actually gets saved.
+                  value={String(Math.round((draft.expiryBars * TF_SECONDS[draft.tf]) / 60) || '')}
+                  onChange={(e) => {
+                    const mins = Math.max(0, Number(e.target.value.replace(/[^0-9.]/g, '')) || 0)
+                    const bars = Math.max(1, Math.round((mins * 60) / TF_SECONDS[draft.tf]))
+                    patch({ expiryBars: bars })
+                  }}
+                  className="h-8 border-[#1c2739] bg-[#101828] text-right text-[12px] text-[#e2e8f0]"
+                />
+                <div className="mt-0.5 text-[9px] text-[#4b5a72]">
+                  = {draft.expiryBars} bar{draft.expiryBars === 1 ? '' : 's'} on this timeframe - changing the timeframe keeps the bar count, not the minutes, so re-check this after switching tf
+                </div>
+              </div>
             ) : draft.kind === 'digital' ? (
               <NumField
                 label="Expiry (minutes)"

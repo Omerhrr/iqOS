@@ -763,6 +763,17 @@ export class AutopilotService {
     const rt = this.runtime.get(botId)
     if (!rt) return
     rt.openCount = Math.max(0, rt.openCount - 1)
+    // THE BUG: lastTradeTs was only ever stamped at order PLACEMENT (open),
+    // never refreshed here at settlement. The cooldown gate (execute(),
+    // "cooldownSec > 0 && now - lastTradeTs < cooldownSec") measures from
+    // that open-time stamp - so any trade whose own expiry is longer than
+    // the cooldown (the default 60s cooldown vs even a single 1m-bar 60s
+    // expiry, let alone a 60-bar/60-minute expiry) has already outlived its
+    // own cooldown window before it even closes, and the bot fires again on
+    // the very next candle the instant the position settles. Re-stamping it
+    // here makes the cooldown count from when the trade actually ENDED, not
+    // when it started, which is what "cooldown between trades" means.
+    rt.lastTradeTs = Math.floor(Date.now() / 1000)
     const pnl = position.pnl ?? 0
     rt.pnlTotal += pnl
     const sameDay = rt.dayKey === new Date().toISOString().slice(0, 10)
