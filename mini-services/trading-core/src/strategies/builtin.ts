@@ -3,7 +3,7 @@
 // a directional eval out. Used by the Strategy Lab, the backtester and the agent.
 import type { StrategyDef } from '../types'
 import * as ta from '../analytics/indicators'
-import { markovChain, fitDiscreteMarkov, logReturns, stdev, mean, rng, gauss } from '../analytics/quant'
+import { markovChain, fitDiscreteMarkov, logReturns, stdev, mean, rng, gauss, ewmaVol, garchVol, supportResistance } from '../analytics/quant'
 import { detectPatterns, patternBias } from '../analytics/patterns'
 import { ouEstimate, ouState } from '../analytics/kalman'
 import { vskEvaluate, VSK_DEFAULTS } from '../analytics/vsk'
@@ -709,6 +709,298 @@ export const STRATEGIES: StrategyDef[] = [
           notes: `no ${minAgree}+ consensus - ${calls.length} call vs ${puts.length} put of ${ids.length - skipped.length} usable members${skippedNote}`,
         }
       )
+    },
+  },
+  {
+    id: 'ichimoku-cloud',
+    name: 'Ichimoku Cloud',
+    description:
+      'Classic Ichimoku: CALL when price sits above the cloud (max of senkou A/B) AND tenkan crosses above kijun; PUT the mirror below the cloud. Cloud thickness (relative to price) gates confidence - a razor-thin cloud means the cloud itself has little conviction, so thin-cloud crosses score lower even when the cross is real.',
+    params: [
+      { key: 'conv', label: 'Tenkan period', type: 'number', min: 5, max: 20, default: 9 },
+      { key: 'base', label: 'Kijun period', type: 'number', min: 15, max: 40, default: 26 },
+      { key: 'spanB', label: 'Senkou B period', type: 'number', min: 30, max: 80, default: 52 },
+      { key: 'minCloudPct', label: 'Min cloud thickness %', type: 'number', min: 0, max: 1, step: 0.01, default: 0 },
+    ],
+    evaluate: (candles, p) => {
+      const h = candles.map((k) => k.high)
+      const l = candles.map((k) => k.low)
+      const c = candles.map((k) => k.close)
+      const conv = Math.round(num(p, 'conv', 9))
+      const base = Math.round(num(p, 'base', 26))
+      const spanB = Math.round(num(p, 'spanB', 52))
+      const minCloudPct = num(p, 'minCloudPct', 0)
+      const ich = ta.ichimoku(h, l, conv, base, spanB)
+      const i = c.length - 1
+      const tk = ich.tenkan[i]
+      const kj = ich.kijun[i]
+      const tkPrev = ich.tenkan[i - 1]
+      const kjPrev = ich.kijun[i - 1]
+      const sa = ich.senkouA[i]
+      const sb = ich.senkouB[i]
+      if (![tk, kj, tkPrev, kjPrev, sa, sb].every(Number.isFinite)) {
+        return { direction: 'none', score: 0, notes: 'warming up (cloud/tenkan/kijun not formed yet)' }
+      }
+      const price = c[i]
+      const cloudTop = Math.max(sa, sb)
+      const cloudBot = Math.min(sa, sb)
+      const cloudPct = (cloudTop - cloudBot) / price
+      const aboveCloud = price > cloudTop
+      const belowCloud = price < cloudBot
+      const bullCross = tkPrev <= kjPrev && tk > kj
+      const bearCross = tkPrev >= kjPrev && tk < kj
+      const thinCloud = cloudPct < minCloudPct
+      const baseScore = clamp(55 + Math.abs(tk - kj) / (Math.abs(price) * 0.001 || 1), 50, 90)
+      const score = thinCloud ? clamp(baseScore * 0.6, 35, 60) : baseScore
+      if (aboveCloud && bullCross) return { direction: 'call', score, notes: `above cloud, tenkan/kijun bull cross${thinCloud ? ' (thin cloud - weak)' : ''}` }
+      if (belowCloud && bearCross) return { direction: 'put', score, notes: `below cloud, tenkan/kijun bear cross${thinCloud ? ' (thin cloud - weak)' : ''}` }
+      return {
+        direction: 'none',
+        score: 0,
+        notes: aboveCloud ? 'above cloud, no fresh cross' : belowCloud ? 'below cloud, no fresh cross' : 'price inside the cloud (chop)',
+      }
+    },
+  },
+  {
+    id: 'vwap-reversion',
+    name: 'VWAP Reversion',
+    description:
+      'Fades the stretch of price away from session VWAP: CALL when price is zEntry+ standard deviations below VWAP, PUT when that far above. Same z-score-from-equilibrium shape as Kalman OU Reversion, but against the volume-weighted average price instead of a fitted OU mean - cheaper to compute and a useful cross-check against the OU read on the same instrument. VWAP here runs cumulative over the fetched candle window (no session reset), so treat it as "VWAP of this window" rather than "today\'s session VWAP".',
+    params: [
+      { key: 'window', label: 'Stdev window (bars)', type: 'number', min: 20, max: 300, default: 100 },
+      { key: 'zEntry', label: 'Z entry threshold', type: 'number', min: 1, max: 3.5, step: 0.1, default: 1.5 },
+    ],
+    evaluate: (candles, p) => {
+      const c = candles.map((k) => k.close)
+      const vw = ta.vwap(candles)
+      const window = Math.round(num(p, 'window', 100))
+      const zEntry = num(p, 'zEntry', 1.5)
+      const n = c.length
+      const w = Math.min(window, n - 1)
+      if (w < 10) return { direction: 'none', score: 0, notes: 'warming up' }
+      const dists: number[] = []
+      for (let i = n - w; i < n; i++) dists.push(c[i] - vw[i])
+      const std = stdev(dists)
+      const dist = c[n - 1] - vw[n - 1]
+      if (std <= 1e-9) return { direction: 'none', score: 0, notes: 'no variance vs VWAP yet' }
+      const z = dist / std
+      const score = clamp(45 + (Math.abs(z) - zEntry) * 18, 40, 90)
+      if (z <= -zEntry) return { direction: 'call', score, notes: `z ${z.toFixed(2)}σ below VWAP (${vw[n - 1].toFixed(5)})` }
+      if (z >= zEntry) return { direction: 'put', score, notes: `z ${z.toFixed(2)}σ above VWAP (${vw[n - 1].toFixed(5)})` }
+      return { direction: 'none', score: 0, notes: `z ${z.toFixed(2)} inside ±${zEntry}σ of VWAP` }
+    },
+  },
+  {
+    id: 'keltner-chandelier',
+    name: 'Keltner Breakout + Chandelier',
+    description:
+      'Trend-continuation on a Keltner channel breakout (ATR-scaled, less noisy than Bollinger): CALL on a close above the upper band, PUT below the lower band. Reports the Chandelier Exit line (a trailing ATR stop) in the notes as the invalidation reference for managing the position manually - the binary engine itself is fixed-expiry, so the Chandelier line is informational context here, not an automatic exit.',
+    params: [
+      { key: 'period', label: 'Keltner period', type: 'number', min: 10, max: 40, default: 20 },
+      { key: 'mult', label: 'Keltner ATR mult', type: 'number', min: 1, max: 4, step: 0.1, default: 2 },
+      { key: 'chandPeriod', label: 'Chandelier period', type: 'number', min: 10, max: 40, default: 22 },
+      { key: 'chandMult', label: 'Chandelier ATR mult', type: 'number', min: 1, max: 5, step: 0.1, default: 3 },
+    ],
+    evaluate: (candles, p) => {
+      const h = candles.map((k) => k.high)
+      const l = candles.map((k) => k.low)
+      const c = candles.map((k) => k.close)
+      const period = Math.round(num(p, 'period', 20))
+      const mult = num(p, 'mult', 2)
+      const chandPeriod = Math.round(num(p, 'chandPeriod', 22))
+      const chandMult = num(p, 'chandMult', 3)
+      const kc = ta.keltner(h, l, c, period, mult)
+      const ch = ta.chandelierExit(h, l, c, chandPeriod, chandMult)
+      const i = c.length - 1
+      const upper = kc.upper[i]
+      const lower = kc.lower[i]
+      const atrVal = (upper - lower) / (2 * mult) || 1
+      if (![upper, lower].every(Number.isFinite)) return { direction: 'none', score: 0, notes: 'warming up' }
+      const price = c[i]
+      const beyondUp = (price - upper) / atrVal
+      const beyondDn = (lower - price) / atrVal
+      if (price > upper) {
+        const score = clamp(50 + beyondUp * 25, 45, 90)
+        return { direction: 'call', score, notes: `close beyond Keltner upper (${upper.toFixed(5)}) - chandelier long-stop ${Number.isFinite(ch.long[i]) ? ch.long[i].toFixed(5) : 'n/a'}` }
+      }
+      if (price < lower) {
+        const score = clamp(50 + beyondDn * 25, 45, 90)
+        return { direction: 'put', score, notes: `close beyond Keltner lower (${lower.toFixed(5)}) - chandelier short-stop ${Number.isFinite(ch.short[i]) ? ch.short[i].toFixed(5) : 'n/a'}` }
+      }
+      return { direction: 'none', score: 0, notes: 'inside Keltner channel' }
+    },
+  },
+  {
+    id: 'mtf-alignment',
+    name: 'MTF Alignment',
+    description:
+      'Resamples the SAME candle series into synthetic 5x and 15x bars (e.g. on a 1m feed: the 1m series itself, a synthetic 5m, and a synthetic 15m) and checks EMA(8) vs EMA(21) trend direction on each. Fires only when minAgree of the 3 timeframes agree - this is the multi-timeframe-agreement idea behind confluence_read, pulled out into its own deployable/backtestable strategy. Needs enough history for the 15x resample to have a meaningful EMA(21) - thin history degrades gracefully by treating an unresolvable timeframe as a non-vote, not a crash.',
+    params: [
+      { key: 'minAgree', label: 'Min timeframes agreeing (of 3)', type: 'number', min: 2, max: 3, default: 3 },
+    ],
+    evaluate: (candles, p) => {
+      const minAgree = Math.max(2, Math.round(num(p, 'minAgree', 3)))
+      const resample = (factor: number): { close: number }[] => {
+        if (factor === 1) return candles.map((k) => ({ close: k.close }))
+        const out: { close: number }[] = []
+        for (let i = 0; i + factor <= candles.length; i += factor) {
+          out.push({ close: candles[i + factor - 1].close })
+        }
+        return out
+      }
+      const dirOf = (series: { close: number }[]): 'call' | 'put' | null => {
+        if (series.length < 25) return null
+        const c = series.map((s) => s.close)
+        const fast = last(ta.ema(c, 8))
+        const slow = last(ta.ema(c, 21))
+        if (!Number.isFinite(fast) || !Number.isFinite(slow)) return null
+        return fast > slow ? 'call' : fast < slow ? 'put' : null
+      }
+      const levels = [1, 5, 15]
+      const votes = levels.map((f) => ({ f, dir: dirOf(resample(f)) })).filter((v) => v.dir !== null)
+      const calls = votes.filter((v) => v.dir === 'call').length
+      const puts = votes.filter((v) => v.dir === 'put').length
+      const usable = votes.length
+      const describe = () => votes.map((v) => `${v.f}x:${v.dir}`).join(', ')
+      if (usable === 0) return { direction: 'none', score: 0, notes: 'not enough history to resample any timeframe' }
+      if (calls >= minAgree && calls > puts) {
+        return { direction: 'call', score: clamp(40 + calls * 18, 40, 90), notes: `${calls}/${usable} timeframes bullish (${describe()})` }
+      }
+      if (puts >= minAgree && puts > calls) {
+        return { direction: 'put', score: clamp(40 + puts * 18, 40, 90), notes: `${puts}/${usable} timeframes bearish (${describe()})` }
+      }
+      return { direction: 'none', score: 0, notes: `no ${minAgree}+ agreement (${describe()})` }
+    },
+  },
+  {
+    id: 'vol-squeeze-breakout',
+    name: 'Volatility Squeeze Breakout',
+    description:
+      'Plain Bollinger Band squeeze-then-breakout: flags a squeeze when band width sits in the bottom squeezePct percentile of its own trailing squeezeLookback history, then fires CALL/PUT if price closes beyond the band within armWindow bars of that squeeze. The simpler, single-layer sibling of VSK/TSK\'s squeeze-gate layer - useful as a baseline to check whether VSK/TSK\'s extra Kalman/PSAR machinery is actually earning its keep over this on a given instrument.',
+    params: [
+      { key: 'period', label: 'Bollinger period', type: 'number', min: 10, max: 40, default: 20 },
+      { key: 'mult', label: 'Bollinger mult', type: 'number', min: 1, max: 3, step: 0.1, default: 2 },
+      { key: 'squeezeLookback', label: 'Squeeze lookback (bars)', type: 'number', min: 40, max: 300, default: 100 },
+      { key: 'squeezePct', label: 'Squeeze percentile', type: 'number', min: 5, max: 40, default: 20 },
+      { key: 'armWindow', label: 'Breakout arm window (bars)', type: 'number', min: 1, max: 15, default: 5 },
+    ],
+    evaluate: (candles, p) => {
+      const c = candles.map((k) => k.close)
+      const period = Math.round(num(p, 'period', 20))
+      const mult = num(p, 'mult', 2)
+      const lookback = Math.round(num(p, 'squeezeLookback', 100))
+      const pct = num(p, 'squeezePct', 20)
+      const armWindow = Math.round(num(p, 'armWindow', 5))
+      const bb = ta.bollinger(c, period, mult)
+      const n = c.length
+      if (n < lookback + armWindow + 5) return { direction: 'none', score: 0, notes: 'warming up' }
+      const percentileRank = (idx: number): number => {
+        const start = Math.max(0, idx - lookback)
+        const window = bb.width.slice(start, idx + 1).filter(Number.isFinite)
+        if (window.length < 10) return 1
+        const w = bb.width[idx]
+        if (!Number.isFinite(w)) return 1
+        const below = window.filter((x) => x <= w).length
+        return below / window.length
+      }
+      let wasSqueezed = false
+      let squeezedBarsAgo = -1
+      for (let back = 1; back <= armWindow; back++) {
+        const idx = n - 1 - back
+        if (idx < 0) break
+        if (percentileRank(idx) * 100 <= pct) {
+          wasSqueezed = true
+          squeezedBarsAgo = back
+          break
+        }
+      }
+      const i = n - 1
+      const price = c[i]
+      const upper = bb.upper[i]
+      const lower = bb.lower[i]
+      if (!wasSqueezed) return { direction: 'none', score: 0, notes: `no squeeze in last ${armWindow} bars (width pctile ${(percentileRank(i) * 100).toFixed(0)}%)` }
+      if (price > upper) return { direction: 'call', score: clamp(55 + (armWindow - squeezedBarsAgo) * 4, 50, 88), notes: `squeeze ${squeezedBarsAgo}b ago, breakout above upper band` }
+      if (price < lower) return { direction: 'put', score: clamp(55 + (armWindow - squeezedBarsAgo) * 4, 50, 88), notes: `squeeze ${squeezedBarsAgo}b ago, breakout below lower band` }
+      return { direction: 'none', score: 0, notes: `squeeze ${squeezedBarsAgo}b ago, price still inside bands - waiting for the break` }
+    },
+  },
+  {
+    id: 'liquidity-sweep-reversal',
+    name: 'Liquidity Sweep Reversal',
+    description:
+      'Price-action reversal at a real structural level (the same supportResistance() zones key_levels uses): fires when the CURRENT bar wicks through a nearby support/resistance zone and closes back on the other side of it - a classic stop-hunt/liquidity-grab rejection - rather than any bare candlestick shape. Different animal from Pattern Confluence, which reads candle geometry alone with no concept of WHERE on the chart it happened.',
+    params: [
+      { key: 'lookback', label: 'S/R lookback (bars)', type: 'number', min: 60, max: 400, default: 240 },
+      { key: 'minWickAtr', label: 'Min wick size (x ATR)', type: 'number', min: 0.1, max: 2, step: 0.1, default: 0.3 },
+    ],
+    evaluate: (candles, p) => {
+      const h = candles.map((k) => k.high)
+      const l = candles.map((k) => k.low)
+      const c = candles.map((k) => k.close)
+      const lookback = Math.round(num(p, 'lookback', 240))
+      const minWickAtr = num(p, 'minWickAtr', 0.3)
+      if (candles.length < lookback + 10) return { direction: 'none', score: 0, notes: 'warming up' }
+      const zones = supportResistance(candles, lookback)
+      const atrArr = ta.atr(h, l, c, 14)
+      const i = candles.length - 1
+      const atrVal = atrArr[i] || (c[i] * 0.001)
+      const price = c[i]
+      const supports = zones.filter((z) => z.type === 'support' && z.price <= price * 1.01)
+      const resistances = zones.filter((z) => z.type === 'resistance' && z.price >= price * 0.99)
+      const nearestSupport = supports.sort((a, b) => Math.abs(a.price - price) - Math.abs(b.price - price))[0]
+      const nearestResistance = resistances.sort((a, b) => Math.abs(a.price - price) - Math.abs(b.price - price))[0]
+      if (nearestSupport) {
+        const wick = nearestSupport.price - l[i]
+        if (l[i] < nearestSupport.price && c[i] > nearestSupport.price && wick >= minWickAtr * atrVal) {
+          return {
+            direction: 'call',
+            score: clamp(50 + (wick / atrVal) * 15 + nearestSupport.strength * 20, 45, 92),
+            notes: `swept support ${nearestSupport.price.toFixed(5)} (${nearestSupport.touches} touches), closed back above - rejection`,
+          }
+        }
+      }
+      if (nearestResistance) {
+        const wick = h[i] - nearestResistance.price
+        if (h[i] > nearestResistance.price && c[i] < nearestResistance.price && wick >= minWickAtr * atrVal) {
+          return {
+            direction: 'put',
+            score: clamp(50 + (wick / atrVal) * 15 + nearestResistance.strength * 20, 45, 92),
+            notes: `swept resistance ${nearestResistance.price.toFixed(5)} (${nearestResistance.touches} touches), closed back below - rejection`,
+          }
+        }
+      }
+      return { direction: 'none', score: 0, notes: 'no qualifying sweep this bar' }
+    },
+  },
+  {
+    id: 'garch-vol-expansion',
+    name: 'GARCH Volatility Expansion',
+    description:
+      'The expansion mirror of Kalman Volatility Regime Break (which fades COMPRESSION): fires when realized GARCH(1,1) vol has pushed above its EWMA baseline by expandRatio+ (same ratio convention regime_playbook uses for its VOLATILE classification, default 1.3) and trades WITH the recent momentum direction, on the read that a real vol expansion extends rather than mean-reverts in the short run. Computed over a trailing window, not the full history, to stay responsive to regime changes.',
+    params: [
+      { key: 'window', label: 'Return window (bars)', type: 'number', min: 60, max: 400, default: 300 },
+      { key: 'expandRatio', label: 'Expansion ratio (GARCH/EWMA)', type: 'number', min: 1.1, max: 3, step: 0.05, default: 1.3 },
+      { key: 'momentumLookback', label: 'Momentum lookback (bars)', type: 'number', min: 2, max: 20, default: 5 },
+    ],
+    evaluate: (candles, p) => {
+      const c = candles.map((k) => k.close)
+      const window = Math.round(num(p, 'window', 300))
+      const expandRatio = num(p, 'expandRatio', 1.3)
+      const momLookback = Math.round(num(p, 'momentumLookback', 5))
+      const n = c.length
+      if (n < window + 10) return { direction: 'none', score: 0, notes: 'warming up' }
+      const rets = logReturns(c.slice(n - window))
+      const ewma = ewmaVol(rets)
+      const g = garchVol(rets).vol
+      if (ewma <= 1e-12) return { direction: 'none', score: 0, notes: 'no baseline volatility yet' }
+      const ratio = g / ewma
+      if (ratio < expandRatio) return { direction: 'none', score: 0, notes: `GARCH/EWMA ${ratio.toFixed(2)} below expansion threshold ${expandRatio}` }
+      const momIdx = Math.max(0, n - 1 - momLookback)
+      const momentum = c[n - 1] - c[momIdx]
+      const score = clamp(50 + (ratio - expandRatio) * 40, 45, 90)
+      if (momentum > 0) return { direction: 'call', score, notes: `vol expanding ${ratio.toFixed(2)}x baseline, ${momLookback}b momentum up` }
+      if (momentum < 0) return { direction: 'put', score, notes: `vol expanding ${ratio.toFixed(2)}x baseline, ${momLookback}b momentum down` }
+      return { direction: 'none', score: 0, notes: `vol expanding ${ratio.toFixed(2)}x baseline but momentum flat` }
     },
   },
 ]

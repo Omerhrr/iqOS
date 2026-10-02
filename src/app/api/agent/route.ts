@@ -1475,25 +1475,25 @@ const TOOLS: ToolSpec[] = [
         TRENDING: {
           fits: ['continuation entries on pullbacks', 'buying dips / selling rips in the trend direction', 'riding the 4-layer synthesis stacks'],
           avoid: ['fading extremes (rsi-reversion, bb-bounce)', 'tight mean-reversion targets against the trend'],
-          strategies: ['ema-trend', 'supertrend-follow', 'donchian-breakout', 'kalman-ou-adaptive-trend', 'vsk-synthesis', 'tsk-synthesis'],
+          strategies: ['ema-trend', 'supertrend-follow', 'donchian-breakout', 'kalman-ou-adaptive-trend', 'vsk-synthesis', 'tsk-synthesis', 'ichimoku-cloud', 'keltner-chandelier', 'mtf-alignment'],
           expiryStyle: '1-2 bars of the working tf; give pullbacks room to resolve in trend direction',
         },
         RANGING: {
           fits: ['fading range extremes', 'entries at band/pivot edges back to the middle'],
           avoid: ['breakout chasing (donchian, supertrend)', 'trend-riding with tight trailing stops'],
-          strategies: ['rsi-reversion', 'bb-bounce', 'stoch-cross', 'kalman-ou-reversion', 'kalman-ou-scalp', 'kalman-mc-reversion-prob'],
+          strategies: ['rsi-reversion', 'bb-bounce', 'stoch-cross', 'kalman-ou-reversion', 'kalman-ou-scalp', 'kalman-mc-reversion-prob', 'vwap-reversion', 'liquidity-sweep-reversal'],
           expiryStyle: '1 bar of the working tf; mean-reversion resolves fast at range edges',
         },
         VOLATILE: {
           fits: ['waiting for the vol spike to decay', 'small size, wide invalidation', 'gap-and-go continuation after shocks settle'],
           avoid: ['tight-stop scalping', 'oversized positions', 'trading the first bars after the spike'],
-          strategies: ['confluence-core (with high minScore)', 'markov-edge (regime-aware)', 'markov-vol-regime', 'kalman-ou-vol-regime', 'kalman-ou-breakout'],
+          strategies: ['confluence-core (with high minScore)', 'markov-edge (regime-aware)', 'markov-vol-regime', 'kalman-ou-vol-regime', 'kalman-ou-breakout', 'garch-vol-expansion'],
           expiryStyle: 'stand aside until garchVol/ewmaVol ratio cools below ~1.3, then resume normal style',
         },
         MIXED: {
           fits: ['waiting for clearer regime', 'small-size probe trades with confluence_read >= 25'],
           avoid: ['heavy size on ambiguous reads'],
-          strategies: ['confluence-core', 'pattern-confluence', 'markov-edge', 'mc-fairvalue-edge'],
+          strategies: ['confluence-core', 'confluence-full', 'pattern-confluence', 'markov-edge', 'mc-fairvalue-edge', 'vol-squeeze-breakout'],
           expiryStyle: '1 bar, minimum stake until regime resolves',
         },
       }
@@ -1615,6 +1615,80 @@ const TOOLS: ToolSpec[] = [
         alignedBars: joined.length,
         correlation: { fullWindow: full, last50Bars: rolling },
         interpretation: verdict,
+      }
+    },
+  },
+  {
+    name: 'pairs_divergence',
+    description:
+      'RESEARCH-ONLY (not yet a bot_create-able strategy - every strategy in the registry evaluates ONE asset in isolation; this needs two candle series at once, which the bot-execution loop and backtest engine don\'t plumb through yet). Checks whether two instruments that are NORMALLY correlated have temporarily stretched apart: computes the log-price spread log(A/B), its z-score vs its own rolling mean/stdev, and the rolling Pearson correlation (same calc as "correlate"). Only worth trading the spread when the pair is still meaningfully correlated (|rolling correlation| >= minCorrelation, default 0.5) AND the spread is zEntry+ sigmas stretched - otherwise the "divergence" may just be the relationship breaking down for good, not a reversion setup. When it fires, the idea is a TWO-LEG trade: fade the leg that got relatively expensive (CALL the cheap one / PUT the expensive one) - you\'d place both legs yourself with place_trade/build_trade_plan, there is no single bot for this yet.',
+    args: '{"assetA": "EURUSD", "assetB": "GBPUSD", "tf": "5m", "lookback": 200, "zEntry": 1.8, "minCorrelation": 0.5}',
+    run: async (a) => {
+      const A = String(a.assetA ?? '')
+      const B = String(a.assetB ?? '')
+      if (!A || !B) return { ok: false, error: 'assetA and assetB required' }
+      const tf = String(a.tf ?? '5m')
+      const lookback = Math.min(Math.max(Number(a.lookback ?? 200), 50), 500)
+      const zEntry = Number(a.zEntry ?? 1.8)
+      const minCorrelation = Number(a.minCorrelation ?? 0.5)
+      const [ra, rb] = await Promise.all([
+        coreGet(`/candles?asset=${encodeURIComponent(A)}&tf=${tf}&limit=${lookback + 1}`) as Promise<{ ok: boolean; candles?: { time: number; close: number }[] }>,
+        coreGet(`/candles?asset=${encodeURIComponent(B)}&tf=${tf}&limit=${lookback + 1}`) as Promise<{ ok: boolean; candles?: { time: number; close: number }[] }>,
+      ])
+      if (!ra.ok || !rb.ok) return { ok: false, error: 'candles unavailable' }
+      const bMap = new Map((rb.candles ?? []).map((c) => [c.time, c.close]))
+      const joined: { ca: number; cb: number }[] = []
+      for (const c of ra.candles ?? []) {
+        const cb = bMap.get(c.time)
+        if (cb !== undefined && c.close > 0 && cb > 0) joined.push({ ca: c.close, cb })
+      }
+      if (joined.length < 60) return { ok: false, error: `only ${joined.length} aligned bars - try a longer tf` }
+      const retsA = logReturns(joined.map((j) => j.ca))
+      const retsB = logReturns(joined.map((j) => j.cb))
+      const rolling = pearson(retsA.slice(-50), retsB.slice(-50))
+      const spread = joined.map((j) => Math.log(j.ca / j.cb))
+      const mean = spread.reduce((x, y) => x + y, 0) / spread.length
+      const variance = spread.reduce((x, y) => x + (y - mean) * (y - mean), 0) / Math.max(1, spread.length - 1)
+      const std = Math.sqrt(variance)
+      const lastSpread = spread[spread.length - 1]
+      const z = std > 1e-12 ? (lastSpread - mean) / std : 0
+      const correlated = Math.abs(rolling) >= minCorrelation
+      if (!correlated) {
+        return {
+          ok: true,
+          pair: `${A} vs ${B}`,
+          tf,
+          rollingCorrelation: rolling,
+          spreadZ: z,
+          verdict: `not correlated enough right now (|${rolling.toFixed(2)}| < ${minCorrelation}) - a spread trade here is betting on a relationship that may already be gone, not a reversion`,
+          tradeable: false,
+        }
+      }
+      if (Math.abs(z) < zEntry) {
+        return {
+          ok: true,
+          pair: `${A} vs ${B}`,
+          tf,
+          rollingCorrelation: rolling,
+          spreadZ: z,
+          verdict: `correlated (${rolling.toFixed(2)}) but spread only ${z.toFixed(2)}σ - inside the ±${zEntry}σ entry band`,
+          tradeable: false,
+        }
+      }
+      const expensive = z > 0 ? A : B
+      const cheap = z > 0 ? B : A
+      return {
+        ok: true,
+        pair: `${A} vs ${B}`,
+        tf,
+        rollingCorrelation: rolling,
+        spreadZ: z,
+        verdict: `${expensive} is ${Math.abs(z).toFixed(2)}σ rich vs ${cheap} while still correlated (${rolling.toFixed(2)}) - fade setup: PUT ${expensive} / CALL ${cheap}`,
+        tradeable: true,
+        suggestedLegs: [
+          { asset: expensive, side: 'put' },
+          { asset: cheap, side: 'call' },
+        ],
       }
     },
   },
@@ -1798,9 +1872,10 @@ The OS also ships TWO sibling 4-layer SYNTHESIS stacks, both exposed as indicato
 1) VSK SYNTHESIS - L1 VWAP z-score arms the macro exhaustion boundary (volume-weighted) -> L2 volatility squeeze blocks runaway trends -> L3 Kalman filter isolates the structural curve -> L4 Parabolic SAR on that filtered curve fires the exact momentum-flip bar. Indicators "vsk" / "vsk-z", strategy "vsk-synthesis", stress test vsk_montecarlo.
 2) TSK SYNTHESIS - the VOLUME-FREE sibling: L1 is a least-squares TRENDLINE z-score (price stretched N sigmas off the fitted trend = deviation channel; needs no volume at all) with the same L2 squeeze / L3 Kalman / L4 PSAR-on-curve layers. Indicators "tsk" / "tsk-z", strategy "tsk-synthesis", stress test tsk_montecarlo.
 All of them work in run_strategy / backtest / optimize_strategy / walkforward / asset_sweep / bot_create. When the user says "the algorithm", "the 4-layer stack", "VSK", "TSK", "trendline version" or asks to stress-test one, use those tools and explain which layer is blocking or firing (the strategy result notes name the layer). Prefer TSK when the user wants volume independence, VSK when volume weighting matters.
+SEVEN MORE BUILTIN STRATEGIES (same tools as above): "ichimoku-cloud" (price vs the senkou cloud + tenkan/kijun cross, thin-cloud crosses scored down), "vwap-reversion" (fades the z-score stretch from VWAP - the cheap cross-check against kalman-ou-reversion on the same instrument), "keltner-chandelier" (ATR-scaled channel breakout, reports the Chandelier Exit line as an invalidation reference since the binary engine is fixed-expiry, not trailing-stop), "mtf-alignment" (resamples the SAME feed into synthetic 5x/15x bars and requires minAgree of the 3 EMA(8/21) reads to agree - the confluence_read MTF idea as a deployable strategy), "vol-squeeze-breakout" (plain Bollinger-width squeeze-then-breakout - the simpler single-layer baseline to check whether VSK/TSK's extra Kalman/PSAR machinery earns its keep on a given instrument), "liquidity-sweep-reversal" (fires on a wick through a real supportResistance() zone that closes back inside it - a stop-hunt rejection, unlike Pattern Confluence which has no concept of WHERE on the chart a pattern fired), and "garch-vol-expansion" (the expansion mirror of kalman-ou-vol-regime, which fades compression - this one trades WITH momentum when GARCH/EWMA vol ratio clears 1.3, the same threshold regime_playbook uses for its VOLATILE classification).
 ENSEMBLE (strategy id "ensemble-vote", params: members = comma-separated builtin strategy ids e.g. "ema-trend,rsi-reversion,markov-edge", voteMinScore = per-member score to count as a vote (default 40), minAgree = how many members must agree (default 2)) trades only the INTERSECTION of independent edges: it runs each member strategy on the same candles and only fires when minAgree+ of them agree on direction, scoring the average of the agreeing members' scores with a small consensus discount when agreement is right at the floor. Use it when the user wants higher precision at the cost of fewer signals ("I want fewer but more confident trades", "only trade when multiple things agree") - suggest 2-3 members that capture DIFFERENT signal types (e.g. one trend strategy + one mean-reversion + one Markov/statistical one) rather than near-duplicates, since correlated members defeat the point of voting. Always walkforward-validate the ensemble itself (not just its members individually) before arming a bot on it - member edges can each be real without their intersection being tradeable, and the research gate below enforces this anyway.
 STRUCTURAL chart tools (drawing-tool family, category "structural" in list_indicators): "pivots" (floor pivot points PP/R1-R3/S1-S3, variants classic/fibonacci/camarilla/woodie, session-based), "fib" (auto Fibonacci retracement 0-100% + 1.272/1.618 extensions of the last swing), "trendlines" (auto S/R trendlines from fractal swing pivots), "fvg" (fair value gaps - 3-bar imbalance zones tracked until filled). Add them to the user's chart with ui_control when they ask for pivot points, fibonacci, trendlines or liquidity gaps - e.g. add pivots + fib before a level-based read.
-POWER PIPELINE - your composed analysis stack: "confluence_read" fuses MTF agreement + composite signal + Markov edge + candle bias into one score with a verdict (THE pre-trade check), "key_levels" returns the full structural level map (pivots + fib + trendlines + FVGs) with distances and the nearest S/R, "regime_playbook" classifies TRENDING/RANGING/VOLATILE/MIXED and names the strategies that fit, "build_trade_plan" turns a confirmed direction into an executable plan (entry, expiry, stake sized from balance, payout-aware EV, structural invalidation level), "session_clock" shows which sessions are open and the London-NY overlap, "strategy_tournament" runs the FULL registered strategy roster on an instrument (via list_strategies internally, so it always covers everything - never a stale hardcoded count) and ranks them, "correlate" measures the live relationship between two instruments (twins / hedge / strangers), and "web_search" reads the LIVE WEB for news, economic events and the "why" behind moves. Recommended flow for "should I trade X?": regime_playbook -> confluence_read -> key_levels -> web_search (if news could matter) -> build_trade_plan -> place_trade only if the user agrees.
+POWER PIPELINE - your composed analysis stack: "confluence_read" fuses MTF agreement + composite signal + Markov edge + candle bias into one score with a verdict (THE pre-trade check), "key_levels" returns the full structural level map (pivots + fib + trendlines + FVGs) with distances and the nearest S/R, "regime_playbook" classifies TRENDING/RANGING/VOLATILE/MIXED and names the strategies that fit, "build_trade_plan" turns a confirmed direction into an executable plan (entry, expiry, stake sized from balance, payout-aware EV, structural invalidation level), "session_clock" shows which sessions are open and the London-NY overlap, "strategy_tournament" runs the FULL registered strategy roster on an instrument (via list_strategies internally, so it always covers everything - never a stale hardcoded count) and ranks them, "correlate" measures the live relationship between two instruments (twins / hedge / strangers), "pairs_divergence" checks whether two normally-correlated instruments have temporarily stretched apart enough to fade (research-only - it's a two-leg manual trade, not a bot_create-able strategy yet), and "web_search" reads the LIVE WEB for news, economic events and the "why" behind moves. Recommended flow for "should I trade X?": regime_playbook -> confluence_read -> key_levels -> web_search (if news could matter) -> build_trade_plan -> place_trade only if the user agrees.
 GENERATIVE WIDGETS: whenever a tool call hands you real numbers worth seeing rather than reading, follow it with render_widget so the user gets an actual rendered component (KPI tiles / table / bars / sparkline / two-column compare / an interactive simulator) instead of a markdown table you typed by hand - after backtest/walkforward/optimize_strategy/asset_sweep/compound_plan/journal_stats/calibration_report, whenever you compare 2+ assets or strategies, or whenever you show a P&L/equity/win-rate trend over time. Call it alongside your normal say/final text, never instead of it - the widget carries the numbers, your words carry the read and the verdict. Pick whichever of the 6 types actually fits (the tool doc has all 6 with examples), and never invent a number for a static widget that didn't come from a real tool result in this conversation.
 INTERACTIVE SIMULATOR WIDGET: the "simulator" type is different from the other 5 - it's not a snapshot, it's sliders the user drags THEMSELVES, live, with every output recomputing instantly and no message sent back to you. Reach for it whenever the user's ask is really "let me explore this" rather than "tell me the number" - "what if I compound $5 instead of $1", "how does the ladder change with payout", "show me how EV moves with stake/win-rate", "let me play with the parameters". Seed the sliders' defaults from a real result you already have (compound_plan, a backtest's win rate, the account balance), then write each output as a plain math expression over the sliders' keys (+ - * / ^ ( ) and numbers only, e.g. "base*(1+payout)^wins" or "amount*(payout*winrate/100-(1-winrate/100))") - no function calls, no words besides the control keys you defined. Do not use it for a one-off static number; that is what "stats" is for.
 YOU HAVE PERSISTENT MEMORY: notes you save with memory_save survive restarts and are AUTO-INJECTED into every future conversation (see YOUR PERSISTENT MEMORY in the context). Proactively save user preferences, validated setups and post-trade lessons; recall with memory_recall before answering style/setup questions; delete outdated ones with memory_forget. When the user says "remember that..." - always memory_save it.

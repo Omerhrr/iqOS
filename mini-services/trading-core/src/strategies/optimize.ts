@@ -122,6 +122,13 @@ export interface SweepResult {
 // converge quickly. Used to pick the evaluation window and fold sizes.
 function strategyWarmup(id: string): number {
   if (id === 'markov-edge' || id === 'confluence-core' || id === 'confluence-full') return 560
+  if (id === 'mtf-alignment') return 340 // needs ~25 resampled 15x bars -> 375 raw bars, plus slack
+  if (id === 'garch-vol-expansion') return 320 // window default 300 + slack
+  if (id === 'vol-squeeze-breakout') return 130 // squeezeLookback default 100 + armWindow + slack
+  if (id === 'liquidity-sweep-reversal') return 260 // S/R lookback default 240 + slack
+  if (id === 'vwap-reversion') return 120 // stdev window default 100 + slack
+  if (id === 'ichimoku-cloud') return 80 // spanB default 52 + slack
+  if (id === 'keltner-chandelier') return 60
   if (id === 'kalman-ou-reversion') return 340 // OU fits need their full estimation window before any signal
   if (id === 'kalman-ou-vol-regime') return 360 // needs baseline window + slack for compression comparison
   if (id === 'kalman-ou-breakout') return 300

@@ -2,7 +2,7 @@
 
 // IQAIR//OS - Research Lab: single backtest / grid optimizer / walk-forward / asset sweep
 // + one-click promote of a researched config into an autopilot bot.
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type {
@@ -94,6 +94,111 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 
 const selCls = 'h-8 rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-[#dbe4f0] outline-none'
 const inCls = 'h-8 border-[#1c2739] bg-[#101828] text-right font-mono text-[11px] text-[#dbe4f0]'
+
+function StrategyPicker({
+  strategies,
+  value,
+  onChange,
+  width = 'w-44',
+}: {
+  strategies: StrategyInfo[]
+  value: string
+  onChange: (id: string) => void
+  width?: string
+}) {
+  const [open, setOpen] = useState(false)
+  const [query, setQuery] = useState('')
+  const [highlight, setHighlight] = useState(0)
+  const rootRef = useRef<HTMLDivElement>(null)
+
+  const selected = strategies.find((s) => s.id === value)
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    if (!q) return strategies
+    return strategies.filter((s) => s.name.toLowerCase().includes(q) || s.id.toLowerCase().includes(q))
+  }, [strategies, query])
+
+  useEffect(() => {
+    if (!open) return
+    const onDocClick = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', onDocClick)
+    return () => document.removeEventListener('mousedown', onDocClick)
+  }, [open])
+
+  useEffect(() => {
+    if (open) {
+      setQuery('')
+      setHighlight(0)
+    }
+  }, [open])
+
+  const pick = (id: string) => {
+    onChange(id)
+    setOpen(false)
+  }
+
+  return (
+    <div ref={rootRef} className={`relative ${width}`}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className={`${selCls} flex w-full items-center justify-between text-left`}
+      >
+        <span className="truncate">{selected?.name ?? value}</span>
+        <span className="ml-1 shrink-0 text-[#4b5a72]">▾</span>
+      </button>
+      {open && (
+        <div className="absolute left-0 top-[calc(100%+2px)] z-20 w-64 rounded border border-[#1c2739] bg-[#0b111c] shadow-lg">
+          <input
+            autoFocus
+            value={query}
+            onChange={(e) => {
+              setQuery(e.target.value)
+              setHighlight(0)
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'ArrowDown') {
+                e.preventDefault()
+                setHighlight((h) => Math.min(h + 1, filtered.length - 1))
+              } else if (e.key === 'ArrowUp') {
+                e.preventDefault()
+                setHighlight((h) => Math.max(h - 1, 0))
+              } else if (e.key === 'Enter') {
+                e.preventDefault()
+                if (filtered[highlight]) pick(filtered[highlight].id)
+              } else if (e.key === 'Escape') {
+                setOpen(false)
+              }
+            }}
+            placeholder="Search strategies…"
+            className="w-full border-b border-[#1c2739] bg-[#101828] px-2 py-1.5 font-mono text-[11px] text-[#dbe4f0] outline-none"
+          />
+          <div className="max-h-64 overflow-auto py-1">
+            {filtered.length === 0 && (
+              <div className="px-2 py-1.5 font-mono text-[11px] text-[#4b5a72]">No matches</div>
+            )}
+            {filtered.map((s, i) => (
+              <div
+                key={s.id}
+                onMouseEnter={() => setHighlight(i)}
+                onClick={() => pick(s.id)}
+                className={`cursor-pointer px-2 py-1.5 font-mono text-[11px] ${
+                  i === highlight ? 'bg-[#1c2739] text-[#dbe4f0]' : 'text-[#9aa8bd]'
+                } ${s.id === value ? 'border-l-2 border-cyan-400' : ''}`}
+              >
+                {s.name}
+                <span className="ml-1.5 text-[9px] text-[#4b5a72]">{s.id}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
 
 function niceStep(lo: number, hi: number): number {
   const raw = (hi - lo) / 6
@@ -280,13 +385,7 @@ function SingleTab({ asset, strategies }: { asset: string; strategies: StrategyI
     <div className="space-y-3">
       <div className="flex flex-wrap items-end gap-2 rounded-lg border border-[#1c2739] bg-[#0b111c] p-3">
         <Field label="Strategy">
-          <select value={strategyId} onChange={(e) => setStrategyId(e.target.value)} className={selCls}>
-            {strategies.map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.name}
-              </option>
-            ))}
-          </select>
+          <StrategyPicker strategies={strategies} value={strategyId} onChange={setStrategyId} />
         </Field>
         <Field label="Timeframe">
           <select value={tf} onChange={(e) => setTf(e.target.value as Timeframe)} className={selCls}>
@@ -465,13 +564,11 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
     <div className="space-y-3">
       <div className="flex flex-wrap items-end gap-2 rounded-lg border border-[#1c2739] bg-[#0b111c] p-3">
         <Field label="Strategy">
-          <select value={strategyId} onChange={(e) => { setStrategyId(e.target.value); setSweepState({}); setResult(null); setSelected(null) }} className={selCls}>
-            {strategies.map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.name}
-              </option>
-            ))}
-          </select>
+          <StrategyPicker
+            strategies={strategies}
+            value={strategyId}
+            onChange={(id) => { setStrategyId(id); setSweepState({}); setResult(null); setSelected(null) }}
+          />
         </Field>
         <Field label="Timeframe">
           <select value={tf} onChange={(e) => setTf(e.target.value as Timeframe)} className={selCls}>
@@ -674,13 +771,11 @@ function WalkForwardTab({ asset, strategies }: { asset: string; strategies: Stra
     <div className="space-y-3">
       <div className="flex flex-wrap items-end gap-2 rounded-lg border border-[#1c2739] bg-[#0b111c] p-3">
         <Field label="Strategy">
-          <select value={strategyId} onChange={(e) => { setStrategyId(e.target.value); setSweepState({}); setResult(null) }} className={selCls}>
-            {strategies.map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.name}
-              </option>
-            ))}
-          </select>
+          <StrategyPicker
+            strategies={strategies}
+            value={strategyId}
+            onChange={(id) => { setStrategyId(id); setSweepState({}); setResult(null) }}
+          />
         </Field>
         <Field label="Timeframe">
           <select value={tf} onChange={(e) => setTf(e.target.value as Timeframe)} className={selCls}>
@@ -910,13 +1005,7 @@ function SweepTab({
     <div className="space-y-3">
       <div className="flex flex-wrap items-end gap-2 rounded-lg border border-[#1c2739] bg-[#0b111c] p-3">
         <Field label="Strategy">
-          <select value={strategyId} onChange={(e) => setStrategyId(e.target.value)} className={selCls}>
-            {strategies.map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.name}
-              </option>
-            ))}
-          </select>
+          <StrategyPicker strategies={strategies} value={strategyId} onChange={setStrategyId} />
         </Field>
         <Field label="Timeframe">
           <select value={tf} onChange={(e) => setTf(e.target.value as Timeframe)} className={selCls}>
