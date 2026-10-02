@@ -8,6 +8,7 @@ import { detectPatterns, patternBias } from '../analytics/patterns'
 import { ouEstimate, ouState } from '../analytics/kalman'
 import { vskEvaluate, VSK_DEFAULTS } from '../analytics/vsk'
 import { tskEvaluate, TSK_DEFAULTS } from '../analytics/tsk'
+import { confluenceSignalOnly } from '../analytics/engine'
 
 const last = (arr: number[]): number => {
   for (let i = arr.length - 1; i >= 0; i--) if (Number.isFinite(arr[i])) return arr[i]
@@ -566,6 +567,27 @@ export const STRATEGIES: StrategyDef[] = [
       if (score >= thr) return { direction: 'call', score, notes: `Composite ${score.toFixed(0)} (Markov P(up) ${(m.probUp * 100).toFixed(0)}%)` }
       if (score <= -thr) return { direction: 'put', score, notes: `Composite ${score.toFixed(0)}` }
       return { direction: 'none', score, notes: `Composite ${score.toFixed(0)} below threshold` }
+    },
+  },
+  {
+    id: 'confluence-full',
+    name: 'Confluence Signal (Full Panel)',
+    description:
+      'The EXACT live Confluence Signal panel / confluence_read engine as a backtestable strategy - all 14 weighted factors across trend (EMA stack, ADX/DI, regression slope, Supertrend), momentum (RSI, MACD, Stochastic), mean-reversion (Bollinger %B, Z-Score, Williams %R), statistical (Markov P(up), Hurst, Kalman/OU stretch) and pattern bias, netted into the same -100..100 score and confidence read you see on the panel. This is a strictly bigger model than confluence-core (which only has 6 of these 14 factors and omits Hurst and Kalman/OU entirely) - use this one when you want "does what the panel shows actually hold up as an edge", and confluence-core when you want the lighter/faster approximation.',
+    params: [
+      { key: 'threshold', label: 'Score threshold', type: 'number', min: 10, max: 60, default: 22 },
+      { key: 'minConfidence', label: 'Min confidence %', type: 'number', min: 0, max: 100, default: 0 },
+    ],
+    evaluate: (candles, p) => {
+      const sig = confluenceSignalOnly(candles, 'STRAT', '1m')
+      const thr = num(p, 'threshold', 22)
+      const minConf = num(p, 'minConfidence', 0)
+      if (sig.confidence < minConf) {
+        return { direction: 'none', score: sig.score, notes: `Confluence ${sig.score.toFixed(0)} but confidence ${sig.confidence.toFixed(0)}% below floor ${minConf}%` }
+      }
+      if (sig.score >= thr) return { direction: 'call', score: sig.score, notes: `Confluence ${sig.score.toFixed(0)} · conf ${sig.confidence.toFixed(0)}%` }
+      if (sig.score <= -thr) return { direction: 'put', score: sig.score, notes: `Confluence ${sig.score.toFixed(0)} · conf ${sig.confidence.toFixed(0)}%` }
+      return { direction: 'none', score: sig.score, notes: `Confluence ${sig.score.toFixed(0)} below threshold · conf ${sig.confidence.toFixed(0)}%` }
     },
   },
   {

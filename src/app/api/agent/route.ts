@@ -1283,7 +1283,7 @@ const TOOLS: ToolSpec[] = [
   },
   {
     name: 'confluence_read',
-    description: 'THE SNIPER VERDICT: fuses four independent evidence streams into one confluence score (-100 bearish..+100 bullish) - multi-timeframe signal agreement (5m/15m/1h/4h), the composite signal score on the working timeframe, the Markov chain probability edge and the recent candlestick-pattern bias. Returns the per-factor breakdown so you can explain WHY. Use before any trade recommendation.',
+    description: 'THE SNIPER VERDICT: fuses four independent evidence streams into one confluence score (-100 bearish..+100 bullish) - multi-timeframe signal agreement (5m/15m/1h/4h), the composite signal score on the working timeframe, the Markov chain probability edge and the recent candlestick-pattern bias. Returns the per-factor breakdown so you can explain WHY. Use before any trade recommendation. This reads the SAME 14-factor engine as the Confluence Signal panel. If the user wants that exact read turned into a BACKTESTABLE strategy (for asset_sweep/optimize_strategy/walkforward/bot_create), use strategy id "confluence-full" - it is a strict superset of "confluence-core" (which only has 6 of the 14 factors and omits Hurst and Kalman/OU entirely); pick confluence-full when they ask to validate or trade "the confluence signal"/"the panel" itself, confluence-core for the lighter legacy approximation.',
     args: '{"asset": "EURUSD-OTC", "tf": "1m"}',
     run: async (a) => {
       const asset = String(a.asset ?? 'EURUSD')

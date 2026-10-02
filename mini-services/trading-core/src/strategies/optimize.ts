@@ -121,7 +121,7 @@ export interface SweepResult {
 // Strategies that fit a Markov chain over 500+ bars need long prefixes; the rest
 // converge quickly. Used to pick the evaluation window and fold sizes.
 function strategyWarmup(id: string): number {
-  if (id === 'markov-edge' || id === 'confluence-core') return 560
+  if (id === 'markov-edge' || id === 'confluence-core' || id === 'confluence-full') return 560
   if (id === 'kalman-ou-reversion') return 340 // OU fits need their full estimation window before any signal
   if (id === 'kalman-ou-vol-regime') return 360 // needs baseline window + slack for compression comparison
   if (id === 'kalman-ou-breakout') return 300

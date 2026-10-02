@@ -330,6 +330,28 @@ export function compositeSignal(
   }
 }
 
+/**
+ * The exact Confluence Signal panel/confluence_read math (snapshot + quant
+ * stats + Markov + Kalman/OU + pattern bias -> 14-factor weighted vote),
+ * without the Monte Carlo sim or UI indicator-series arrays analyze() also
+ * builds - those are irrelevant to the score and too expensive to re-run on
+ * every bar of a backtest. This is what the 'confluence-full' strategy
+ * (builtin.ts) evaluates each bar, so a backtest of it reproduces the live
+ * panel's score bar-for-bar - unlike the older 'confluence-core' strategy,
+ * which is a separate, deliberately smaller 6-factor approximation built for
+ * fast iteration and does NOT include Hurst or Kalman/OU at all.
+ */
+export function confluenceSignalOnly(candles: Candle[], asset: string, tf: Timeframe): CompositeSignal {
+  const c = candles.map((k) => k.close)
+  const ind = snapshot(candles)
+  const quant = quantStats(candles)
+  const markov = markovChain(c, { lookback: 500 })
+  const kalman = ouKalman(candles)
+  const patterns = detectPatterns(candles, 8)
+  const pBias = patternBias(patterns)
+  return compositeSignal(candles, asset, tf, markov, quant, ind, pBias, kalman)
+}
+
 const seriesToLine = (arr: number[], candles: Candle[], limit = 240): { time: number; value: number }[] => {
   const out: { time: number; value: number }[] = []
   const start = Math.max(0, arr.length - limit)
