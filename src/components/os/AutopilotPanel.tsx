@@ -74,6 +74,11 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
   const [busy, setBusy] = useState(false)
   const [filter, setFilter] = useState('')
   const [validations, setValidations] = useState<Map<string, ValidationRow>>(new Map())
+  // Set only when the last save was rejected specifically by the research
+  // gate ("research-gate: ..." from bot_save) - shows a "Force save anyway"
+  // button in the editor instead of making the user go ask the copilot to
+  // pass force:true on their behalf for a setting they edited by hand here.
+  const [gateError, setGateError] = useState('')
 
   useEffect(() => {
     let alive = true
@@ -116,22 +121,30 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
 
   const openNew = () => {
     setDraft(emptyDraft())
+    setGateError('')
     setEditorOpen(true)
   }
 
   const openEdit = (row: BotRow) => {
     setDraft({ ...row.bot })
+    setGateError('')
     setEditorOpen(true)
   }
 
-  const save = async () => {
+  const save = async (force = false) => {
     setBusy(true)
+    if (!force) setGateError('')
     try {
-      const res = await osPost<{ ok: boolean; error?: string }>('/bot_save', { ...draft })
+      const res = await osPost<{ ok: boolean; error?: string }>('/bot_save', { ...draft, force })
       if (res.ok) {
         setEditorOpen(false)
+        setGateError('')
         onChanged()
-      } else onError(res.error ?? 'bot rejected')
+      } else {
+        const err = res.error ?? 'bot rejected'
+        if (!force && err.startsWith('research-gate:')) setGateError(err)
+        else onError(err)
+      }
     } catch (err) {
       onError((err as Error).message)
     } finally {
@@ -143,7 +156,14 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
     try {
       const res = await osPost<{ ok: boolean; error?: string }>('/bot_toggle', { id: row.bot.id, enabled: !row.bot.enabled })
       if (res.ok) onChanged()
-      else onError(res.error ?? 'bot rejected')
+      else {
+        const err = res.error ?? 'bot rejected'
+        // same research-gate rejection the editor's Save hits - this quick
+        // list-row toggle has no dialog to show a force button in, so point
+        // the user to the one place that has it rather than silently
+        // refusing with no way forward.
+        onError(err.startsWith('research-gate:') ? `${err} - open the bot's settings and use "Force save anyway" to arm it unvalidated.` : err)
+      }
     } catch (err) {
       onError((err as Error).message)
     }
@@ -591,6 +611,15 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
             </div>
           </div>
 
+          {gateError && (
+            <div className="rounded border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[10px] text-amber-300">
+              {gateError}
+              <div className="mt-1 text-[9px] text-amber-400/80">
+                This instrument/tf/strategy combo has not passed a recent robust walk-forward. Forcing arms it UNVALIDATED - it will show a &quot;forced · unvalidated&quot; badge on the fleet list and should be treated as the user&apos;s deliberate override, not a tested edge.
+              </div>
+            </div>
+          )}
+
           <DialogFooter className="gap-2">
             <Button
               variant="ghost"
@@ -599,13 +628,23 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
             >
               Cancel
             </Button>
-            <Button
-              onClick={save}
-              disabled={busy || !draft.watchlist.length}
-              className="h-8 rounded bg-cyan-500/20 text-[11px] font-bold uppercase tracking-wider text-cyan-200 hover:bg-cyan-500/30"
-            >
-              {busy ? 'Saving…' : draft.id ? 'Save bot' : 'Deploy bot'}
-            </Button>
+            {gateError ? (
+              <Button
+                onClick={() => void save(true)}
+                disabled={busy}
+                className="h-8 rounded bg-amber-500/20 text-[11px] font-bold uppercase tracking-wider text-amber-300 hover:bg-amber-500/30"
+              >
+                {busy ? 'Saving…' : 'Force save anyway (unvalidated)'}
+              </Button>
+            ) : (
+              <Button
+                onClick={() => void save()}
+                disabled={busy || !draft.watchlist.length}
+                className="h-8 rounded bg-cyan-500/20 text-[11px] font-bold uppercase tracking-wider text-cyan-200 hover:bg-cyan-500/30"
+              >
+                {busy ? 'Saving…' : draft.id ? 'Save bot' : 'Deploy bot'}
+              </Button>
+            )}
           </DialogFooter>
         </DialogContent>
       </Dialog>
