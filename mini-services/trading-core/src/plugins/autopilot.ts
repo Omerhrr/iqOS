@@ -61,13 +61,6 @@ export interface BotConfig {
   /** Persisted roll state (pot/rollN/restarts/halted) - written by the
    * autopilot on every settle so the compounding streak survives restarts. */
   planState?: { pot: number; rollN: number; restarts: number; halted?: boolean; complete?: boolean }
-  /** Set when this bot was armed with `force: true` past a FAILING research
-   * gate (no/stale/non-robust walk-forward verdict) - an explicit, logged
-   * override for a user who has verified the edge themselves, never a
-   * silent bypass. Cleared back to false the moment a save's gate check
-   * actually passes cleanly. Surfaced in bot_list/bot_status so a forced bot
-   * never looks indistinguishable from a validated one. */
-  forcedUnvalidated?: boolean
 }
 
 export interface StakePlan {
@@ -368,7 +361,7 @@ export class AutopilotService {
     }
   }
 
-  saveBot(input: Partial<BotConfig>, opts: { force?: boolean } = {}): { ok: boolean; bot?: BotConfig; error?: string; forced?: boolean } {
+  saveBot(input: Partial<BotConfig>): { ok: boolean; bot?: BotConfig; error?: string } {
     const id = input.id?.trim() || `bot-${Math.random().toString(36).slice(2, 8)}`
     const existing = this.store.listBots().find((b) => b.bot.id === id)?.bot
     const bot: BotConfig = {
@@ -400,19 +393,6 @@ export class AutopilotService {
       stakePlan: this.parseStakePlan(input.stakePlan, existing?.stakePlan),
       adaptive: input.adaptive !== undefined ? Boolean(input.adaptive) : existing?.adaptive,
     }
-    // compounding assumes exactly one open position per cycle: stakeFor reads
-    // rt.pot at bet time and onPositionClosed re-derives it at settle time,
-    // with nothing reserving the pot in between. A second concurrent trade -
-    // from maxOpen>1, or from a second watchlist asset firing before the
-    // first settles (the per-candle lock is keyed by asset|tf, not bot id) -
-    // would stake off the same pot the first trade already claimed, and
-    // whichever settles first mutates rt.pot out from under the other,
-    // corrupting the roll. Hard-clamp both knobs rather than let the UI
-    // produce a silently broken compounding cycle.
-    if (bot.stakePlan?.kind === 'compound') {
-      bot.maxOpen = 1
-      bot.watchlist = bot.watchlist.slice(0, 1)
-    }
     // a materially different plan invalidates the persisted roll - start clean
     const planChanged = JSON.stringify(bot.stakePlan ?? null) !== JSON.stringify(existing?.stakePlan ?? null)
     bot.planState = planChanged ? undefined : input.planState ?? existing?.planState
@@ -421,24 +401,14 @@ export class AutopilotService {
     // research gate: only check when this save is what's arming the bot (new
     // enable, not every edit to an already-running one) so a stake tweak on a
     // live bot doesn't get blocked by a validation that's since gone stale.
-    let forced = false
     if (bot.enabled && !(existing?.enabled ?? false)) {
       const gate = this.researchGate(bot)
-      if (gate) {
-        if (!opts.force) return { ok: false, error: gate }
-        forced = true
-        this.emit('warn', `Bot "${bot.name}" FORCED past research gate - ${gate.replace(/^research-gate: /, '')}. Unvalidated edge, armed on explicit user override.`)
-      }
-      bot.forcedUnvalidated = forced
-    } else if (bot.enabled) {
-      // already-armed bot being re-saved (a stake tweak, say) - leave its
-      // forced flag exactly as it was, don't silently clear or re-derive it.
-      bot.forcedUnvalidated = existing?.forcedUnvalidated ?? false
+      if (gate) return { ok: false, error: gate }
     }
     this.store.saveBot(bot)
     if (!this.runtime.has(id)) this.runtime.set(id, this.buildRuntime(id))
-    this.emit(bot.enabled ? 'success' : 'info', `Bot "${bot.name}" saved - ${bot.enabled ? 'ARMED' : 'idle'}${forced ? ' [FORCED, UNVALIDATED]' : ''} (${bot.strategyId} · ${bot.tf} · ${bot.watchlist.join(', ')})`)
-    return { ok: true, bot, forced }
+    this.emit(bot.enabled ? 'success' : 'info', `Bot "${bot.name}" saved - ${bot.enabled ? 'ARMED' : 'idle'} (${bot.strategyId} · ${bot.tf} · ${bot.watchlist.join(', ')})`)
+    return { ok: true, bot }
   }
 
   deleteBot(id: string): { ok: boolean; error?: string } {
@@ -475,23 +445,17 @@ export class AutopilotService {
     return { ok: true, bot: this.store.listBots().find((b) => b.bot.id === id)?.bot }
   }
 
-  toggleBot(id: string, enabled?: boolean, opts: { force?: boolean } = {}): { ok: boolean; bot?: BotConfig; error?: string; forced?: boolean } {
+  toggleBot(id: string, enabled?: boolean): { ok: boolean; bot?: BotConfig; error?: string } {
     const found = this.store.listBots().find((b) => b.bot.id === id)
     if (!found) return { ok: false, error: 'bot not found' }
     const bot: BotConfig = { ...found.bot, enabled: enabled ?? !found.bot.enabled }
-    let forced = false
     if (bot.enabled && !found.bot.enabled) {
       const gate = this.researchGate(bot)
-      if (gate) {
-        if (!opts.force) return { ok: false, error: gate }
-        forced = true
-        this.emit('warn', `Bot "${bot.name}" FORCED past research gate - ${gate.replace(/^research-gate: /, '')}. Unvalidated edge, armed on explicit user override.`)
-      }
-      bot.forcedUnvalidated = forced
+      if (gate) return { ok: false, error: gate }
     }
     this.store.saveBot(bot)
-    this.emit(bot.enabled ? 'success' : 'info', `Autopilot "${bot.name}" ${bot.enabled ? 'STARTED' : 'STOPPED'}${forced ? ' [FORCED, UNVALIDATED]' : ''} - watching ${bot.watchlist.join(', ')} on ${bot.tf} (${bot.strategyId})`)
-    return { ok: true, bot, forced }
+    this.emit(bot.enabled ? 'success' : 'info', `Autopilot "${bot.name}" ${bot.enabled ? 'STARTED' : 'STOPPED'} - watching ${bot.watchlist.join(', ')} on ${bot.tf} (${bot.strategyId})`)
+    return { ok: true, bot }
   }
 
   // ---------- trading loop ----------
@@ -532,15 +496,10 @@ export class AutopilotService {
       rt.streak = 0
     }
 
-    // compound halt: a cycle that took a loss (stopOnLoss, default true) or
-    // that hit its periods target with onComplete 'halt' is DEAD - the bot
-    // stands down (but stays armed/configured) until an explicit bot_restart.
-    // rt.halted is only ever set true for one of those two reasons (see
-    // onPositionClosed), so this must NOT be conditioned on stopOnLoss - that
-    // used to gate out the win-side periods-complete halt too whenever
-    // stopOnLoss was false, letting the bot keep compounding right past a
-    // cycle it had already marked complete.
-    if (bot.stakePlan?.kind === 'compound' && rt.halted) {
+    // compound stop-on-loss: a cycle that took a loss is DEAD - the bot stands
+    // down (but stays armed/configured) until an explicit bot_restart. A
+    // periods-completed cycle halts too, but with a win-side message.
+    if (bot.stakePlan?.kind === 'compound' && bot.stakePlan.stopOnLoss !== false && rt.halted) {
       return this.reject(
         bot,
         rt.complete
@@ -666,15 +625,7 @@ export class AutopilotService {
       amount: bet.amount,
       expiryBars: bot.expiryBars,
       expirySec: bot.kind === 'digital' ? bot.expirySec : undefined,
-      // THE BUG: this used to be hardcoded 'paper' unconditionally, so every
-      // autopilot bot traded the simulated ledger no matter what the account
-      // was actually connected to - a bot could show "armed" and "took a
-      // trade" in the OS while nothing ever reached the real IQ Option
-      // account, because it was never routed there in the first place.
-      // account source is the single routing truth, same as the manual
-      // /trade endpoint in index.ts: on IQ every order is live, on paper
-      // everything stays simulated.
-      mode: this.exec.accountSource === 'iq' ? 'live' : 'paper',
+      mode: 'paper',
       strategy: bot.strategyId,
       note: `bot:${bot.id}`,
     })
@@ -728,11 +679,7 @@ export class AutopilotService {
     const derisk = plan.deriskAfter !== undefined && plan.deriskPct !== undefined && rt.rollN >= plan.deriskAfter
     const rollPct = derisk ? plan.deriskPct! : (plan.rollPct ?? 100)
     const raw = (pot * rollPct) / 100
-    // never stake more than the pot itself holds - the $1 floor below exists
-    // so a tiny pot still places a valid order, but it must not let a shrunk
-    // pot (legacy stopOnLoss:false reseed, after a loss eats into it) get
-    // over-staked beyond what's actually tracked as compounded capital.
-    const amount = Math.min(plan.maxStake ?? 5000, pot, Math.max(1, Math.round(raw * 100) / 100))
+    const amount = Math.min(plan.maxStake ?? 5000, Math.max(1, Math.round(raw * 100) / 100))
     return { amount, pot, rollN: rt.rollN, compound: true, phase: derisk ? 'derisk' : 'compound' }
   }
 
@@ -763,17 +710,6 @@ export class AutopilotService {
     const rt = this.runtime.get(botId)
     if (!rt) return
     rt.openCount = Math.max(0, rt.openCount - 1)
-    // THE BUG: lastTradeTs was only ever stamped at order PLACEMENT (open),
-    // never refreshed here at settlement. The cooldown gate (execute(),
-    // "cooldownSec > 0 && now - lastTradeTs < cooldownSec") measures from
-    // that open-time stamp - so any trade whose own expiry is longer than
-    // the cooldown (the default 60s cooldown vs even a single 1m-bar 60s
-    // expiry, let alone a 60-bar/60-minute expiry) has already outlived its
-    // own cooldown window before it even closes, and the bot fires again on
-    // the very next candle the instant the position settles. Re-stamping it
-    // here makes the cooldown count from when the trade actually ENDED, not
-    // when it started, which is what "cooldown between trades" means.
-    rt.lastTradeTs = Math.floor(Date.now() / 1000)
     const pnl = position.pnl ?? 0
     rt.pnlTotal += pnl
     const sameDay = rt.dayKey === new Date().toISOString().slice(0, 10)
