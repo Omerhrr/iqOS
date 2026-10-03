@@ -12,7 +12,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { AssetRow, LabLearnResult, LabSignalDef, LabSimMetrics, LabSpec, LabStrategyRow, Timeframe, TradeKind } from '@/lib/os/client'
 import { fmtMoney, osGet, osPost } from '@/lib/os/client'
-import { TIMEFRAMES } from '@/lib/os/client'
+import { TIMEFRAMES, TIMEFRAME_SECONDS } from '@/lib/os/client'
 
 type Basis = 'candles' | 'heikin' | 'kalman' | 'typical' | 'smoothed'
 const BASIS_OPTIONS: { value: Basis; label: string }[] = [
@@ -148,6 +148,19 @@ function staleLabel(updatedTs: number): string {
   return `learned ${Math.round(ageSec / 86400)}d ago`
 }
 
+/** Human duration for a horizon-derived expiry in seconds - "60s", "5m", "1h30m". */
+function fmtExpiry(sec: number): string {
+  if (sec < 60) return `${sec}s`
+  if (sec < 3600) {
+    const m = Math.floor(sec / 60)
+    const rem = sec % 60
+    return rem ? `${m}m${rem}s` : `${m}m`
+  }
+  const h = Math.floor(sec / 3600)
+  const m = Math.round((sec % 3600) / 60)
+  return m ? `${h}h${m}m` : `${h}h`
+}
+
 function MetricStrip({ label, m, breakeven }: { label: string; m: LabSimMetrics | null; breakeven: number }) {
   if (!m) return null
   const good = m.winRate >= breakeven
@@ -255,13 +268,12 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
   // even setting aside the research-gate message that surfaced it, since a
   // lab spec's signals/thresholds are tuned to the instrument it was learned
   // against.
-  const [deployFor, setDeployFor] = useState<{ id: string; name: string; asset: string; tf: Timeframe } | null>(null)
+  const [deployFor, setDeployFor] = useState<{ id: string; name: string; asset: string; tf: Timeframe; horizon: number } | null>(null)
   const [deploying, setDeploying] = useState(false)
   // deploy form
   const [botName, setBotName] = useState('')
   const [stake, setStake] = useState(10)
   const [kind, setKind] = useState<TradeKind>('digital')
-  const [expiryMin, setExpiryMin] = useState(15)
   const [maxOpen, setMaxOpen] = useState(1)
   const [cooldownSec, setCooldownSec] = useState(60)
   const [minScore, setMinScore] = useState(0)
@@ -347,7 +359,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
     }
   }
 
-  const openDeploy = async (id: string, name: string, forAsset: string, forTf: Timeframe) => {
+  const openDeploy = async (id: string, name: string, forAsset: string, forTf: Timeframe, forHorizon: number) => {
     let targetId = id
     if (!id && effectiveSpec && result) {
       // deploy straight from a fresh learn: persist first (whatever's checked)
@@ -367,7 +379,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
         return
       }
     }
-    setDeployFor({ id: targetId, name, asset: forAsset, tf: forTf })
+    setDeployFor({ id: targetId, name, asset: forAsset, tf: forTf, horizon: forHorizon })
     setBotName(`${name} Bot`.slice(0, 32))
   }
 
@@ -375,6 +387,15 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
     if (!deployFor) return
     setDeploying(true)
     try {
+      // THE FIX this is part of: expiry used to be a free-typed field on this
+      // form, completely disconnected from the strategy's own `horizon` (the
+      // bars-ahead outcome the learner actually validated against). A spec
+      // learned on "does price move my way 1 bar later" backtested/held-out
+      // numbers that say nothing about a 15-minute settlement - deploying it
+      // with an unrelated expiry silently traded a DIFFERENT bet than the one
+      // that was ever measured. Expiry is now derived straight from the
+      // strategy's horizon and locked - not a user choice.
+      const tfSec = TIMEFRAME_SECONDS[deployFor.tf]
       const body: Record<string, unknown> = {
         name: botName || `${deployFor.name} Bot`,
         watchlist: [deployFor.asset],
@@ -382,7 +403,8 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
         tf: deployFor.tf,
         kind,
         stake,
-        expirySec: kind === 'digital' ? Math.max(1, expiryMin) * 60 : undefined,
+        expiryBars: deployFor.horizon,
+        expirySec: kind === 'digital' ? deployFor.horizon * tfSec : undefined,
         maxOpen,
         cooldownSec,
         minScore,
@@ -640,7 +662,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
                 <Button onClick={() => void saveToLibrary()} disabled={!!savedId || !effectiveSpec} variant="outline" className="h-7 border-[#1c2739] px-3 text-[10px] uppercase tracking-wider text-[#7c8aa5] hover:text-cyan-300 disabled:opacity-40">
                   {savedId ? `saved: ${savedId}` : `save to library (${checkedKeys.size} signals)`}
                 </Button>
-                <Button onClick={() => effectiveSpec && result && void openDeploy('', effectiveSpec.name, result.asset, result.tf)} disabled={!effectiveSpec} className="h-7 bg-emerald-600 px-3 text-[10px] font-bold uppercase tracking-wider text-white hover:bg-emerald-500 disabled:opacity-40">
+                <Button onClick={() => effectiveSpec && result && void openDeploy('', effectiveSpec.name, result.asset, result.tf, effectiveSpec.horizon)} disabled={!effectiveSpec} className="h-7 bg-emerald-600 px-3 text-[10px] font-bold uppercase tracking-wider text-white hover:bg-emerald-500 disabled:opacity-40">
                   deploy as bot
                 </Button>
               </div>
@@ -681,7 +703,17 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
                 ))}
               </select>
             </label>
-            {kind === 'digital' && <NumField label="expiry min" value={expiryMin} onChange={setExpiryMin} w="w-14" />}
+            <label className="flex flex-col gap-0.5">
+              <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]" title="locked to the strategy's own horizon - the bars-ahead outcome it was actually learned/backtested against. Changing it here would trade a different bet than the one the numbers above were measured on.">
+                expiry (locked to horizon)
+              </span>
+              <div
+                className="flex h-7 w-32 items-center rounded border border-[#1c2739] bg-[#0b111c] px-2 font-mono text-[11px] text-amber-300"
+                title={`this strategy was learned/validated on a ${deployFor.horizon}-bar horizon - expiry is derived from that, not freely editable`}
+              >
+                {deployFor.horizon} bar{deployFor.horizon > 1 ? 's' : ''} ({fmtExpiry(deployFor.horizon * TIMEFRAME_SECONDS[deployFor.tf])})
+              </div>
+            </label>
             <NumField label="max open" value={maxOpen} onChange={setMaxOpen} w="w-12" />
             <NumField label="cooldown s" value={cooldownSec} onChange={setCooldownSec} w="w-14" />
             <NumField label="min score" value={minScore} onChange={setMinScore} w="w-14" />
@@ -741,7 +773,10 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
                     </span>
                   </div>
                   <div className="font-mono text-[9px] text-[#4b5a72]">
-                    {r.id} · {r.asset} {r.tf} · {r.spec.signals.length} signals · minScore {r.spec.minScore}
+                    {r.id} · {r.asset} {r.tf} · {r.spec.signals.length} signals · minScore {r.spec.minScore} ·{' '}
+                    <span className="text-amber-300" title="bars-ahead the learner validated this spec against - the deploy expiry is locked to match this, not freely chosen">
+                      horizon {r.spec.horizon}b
+                    </span>
                     {r.stats?.backtest ? ` · backtest ${r.stats.backtest.trades}t @ ${r.stats.backtest.winRate.toFixed(1)}% (PF ${r.stats.backtest.profitFactor.toFixed(2)})` : ''}
                   </div>
                 </div>
@@ -765,7 +800,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
                   >
                     {backtesting === r.id ? 're-backtesting...' : 're-backtest'}
                   </Button>
-                  <Button variant="outline" size="sm" className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5] hover:text-emerald-400" onClick={() => void openDeploy(r.id, r.spec.name, r.asset, r.tf as Timeframe)}>
+                  <Button variant="outline" size="sm" className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5] hover:text-emerald-400" onClick={() => void openDeploy(r.id, r.spec.name, r.asset, r.tf as Timeframe, r.spec.horizon)}>
                     deploy
                   </Button>
                   <Button variant="outline" size="sm" className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5] hover:text-rose-400" onClick={() => void removeLab(r.id)}>

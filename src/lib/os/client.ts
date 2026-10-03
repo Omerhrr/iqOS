@@ -6,6 +6,22 @@ import { io, type Socket } from 'socket.io-client'
 
 export type Timeframe = '5s' | '15s' | '30s' | '1m' | '2m' | '5m' | '15m' | '30m' | '1h' | '4h' | '1d'
 export const TIMEFRAMES: Timeframe[] = ['5s', '15s', '30s', '1m', '2m', '5m', '15m', '30m', '1h', '4h', '1d']
+// Mirrors trading-core's types.ts TIMEFRAME_SECONDS - needed client-side to
+// turn a lab spec's `horizon` (bars-ahead the learner validated against) into
+// an actual expiry duration when deploying it as a bot.
+export const TIMEFRAME_SECONDS: Record<Timeframe, number> = {
+  '5s': 5,
+  '15s': 15,
+  '30s': 30,
+  '1m': 60,
+  '2m': 120,
+  '5m': 300,
+  '15m': 900,
+  '30m': 1800,
+  '1h': 3600,
+  '4h': 14400,
+  '1d': 86400,
+}
 
 export type TradeKind = 'binary' | 'turbo' | 'digital' | 'cfd'
 export const TRADE_KINDS: TradeKind[] = ['binary', 'turbo', 'digital', 'cfd']
