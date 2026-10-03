@@ -19,7 +19,6 @@ import type { Plugin } from '../kernel'
 import type { MarketDataService } from './market-data'
 import type { AnalyticsService } from './analytics'
 import { getInstrument, isInstrumentOpen } from '../universe'
-import { getInstrument } from '../universe'
 import { Store } from '../store'
 import { classifyRegime } from '../analytics/regime'
 
@@ -165,7 +164,15 @@ export class ExecutionService {
 
   riskCheck(asset: string, amount: number): { ok: boolean; reason?: string } {
     this.updateDayRollover()
-    const acct = this.store.getAccount()
+    // THE BUG: this used to be this.store.getAccount() directly, whose
+    // dayStartBalance/balance are the PAPER ledger row - settle() correctly
+    // never touches that row for a live trade (IQ already books the
+    // stake/result on the broker's own ledger), but that also meant dayLoss
+    // below was computed from a number that can never move on live losses.
+    // this.account() is the same data PLUS the live-aware dayPnl override
+    // (see account() above) - reuse it here so the daily loss limit actually
+    // sees real IQ losses once accountSource is 'iq', not just paper ones.
+    const acct = this.account()
     if (acct.killSwitch) return { ok: false, reason: 'KILL SWITCH engaged - trading disabled' }
     // sentinel gate: portfolio breakers, exposure caps, trade throttle (paper AND live)
     try {
@@ -183,11 +190,17 @@ export class ExecutionService {
     // on IQ the broker's balance is the money that matters - gate against it
     const effBalance = this.accountSource === 'iq' && acct.liveBalance !== null ? acct.liveBalance : acct.balance
     if (amount > effBalance) return { ok: false, reason: `insufficient balance ($${effBalance.toFixed(2)})` }
-    const dayLoss = acct.dayStartBalance - acct.balance
+    const dayLoss = -acct.dayPnl
     if (dayLoss >= this.risk.dailyLossLimit)
       return { ok: false, reason: `daily loss limit hit (-$${dayLoss.toFixed(2)} / -$${this.risk.dailyLossLimit})` }
-    const openCount = this.store.listPositions('open').filter((p) => p.mode === 'paper').length +
-      this.store.listPositions('open').filter((p) => p.mode === 'live').length
+    // THE BUG: this used to sum paper-open + live-open and compare the TOTAL
+    // against one shared limit - a stray paper position (leftover from
+    // testing, say) could block a live bot from trading and vice versa.
+    // account()'s own openCount already scopes to the ledger the operator is
+    // ON (see its comment: "paper source should not count stray live
+    // positions and vice versa") - mirror that here so the limit is per
+    // ledger, matching what maxOpenPositions is documented to mean.
+    const openCount = this.store.listPositions('open').filter((p) => (this.accountSource === 'iq' ? p.mode === 'live' : p.mode === 'paper')).length
     if (openCount >= this.risk.maxOpenPositions)
       return { ok: false, reason: `max concurrent positions (${this.risk.maxOpenPositions})` }
     const streakInfo = this.store.lossStreak()
@@ -480,13 +493,23 @@ export class ExecutionService {
 
   private onCandleClose(asset: string, tf: Timeframe, candle: Candle): void {
     // binary/turbo/digital settle on the 1s expiry sweep (settleDue) - the
-    // candle boundary is only for spot/cfd exit checks
-    const open = this.store.listPositions('open').filter((p) => p.mode === 'paper' && p.kind === 'cfd' && p.asset === asset && p.tf === tf)
+    // candle boundary is only for spot/cfd exit checks.
+    // THE BUG: this used to filter p.mode === 'paper' only, so a LIVE cfd
+    // position never got a tp/sl/margin-call check from anywhere - settleDue
+    // only drives expiry-based kinds (binary/turbo/digital), and live cfds
+    // have settlesAt left undefined (no expiry to sweep). A live leveraged
+    // position could therefore sit open indefinitely with no kernel-side
+    // mechanism ever closing it on tp, sl, or a margin call - uncapped
+    // downside bounded only by whatever the broker itself enforces outside
+    // this kernel. Checking live cfds here too (and routing their actual
+    // close through closePosition(), which talks to the sidecar) closes
+    // that gap.
+    const open = this.store.listPositions('open').filter((p) => p.kind === 'cfd' && p.asset === asset && p.tf === tf)
     for (const pos of open) this.checkMargin(pos, candle.close, candle.time)
   }
 
   private checkSpotStops(asset: string, candle: Candle): void {
-    const open = this.store.listPositions('open').filter((p) => p.mode === 'paper' && p.kind === 'cfd' && p.asset === asset)
+    const open = this.store.listPositions('open').filter((p) => p.kind === 'cfd' && p.asset === asset)
     for (const pos of open) this.checkMargin(pos, candle.close, Math.floor(Date.now() / 1000))
   }
 
@@ -504,7 +527,11 @@ export class ExecutionService {
       if (pos.kind === 'cfd' && pos.leverage) {
         const lossPct = (movePct * pos.leverage) / 100 // fraction of margin lost
         if (lossPct <= -1) {
-          this.settle(pos.id, price, 'closed', -pos.amount)
+          // live: actually tell the broker to close it (closePosition's live
+          // branch), not just mutate our own ledger - a paper settle() alone
+          // would mark it closed here while the real IQ position stays open.
+          if (pos.mode === 'live') this.closePosition(pos.id)
+          else this.settle(pos.id, price, 'closed', -pos.amount)
           this.ctx.bus.emit('alert', {
             level: 'danger',
             message: `MARGIN CALL ${pos.asset}: stop-out at -100% margin`,
@@ -515,9 +542,13 @@ export class ExecutionService {
       }
       return
     }
-    const notional = pos.kind === 'cfd' && pos.leverage ? pos.amount * pos.leverage : pos.amount
-    const pnl = ((price - pos.entryPrice) / pos.entryPrice) * notional * dir
-    this.settle(pos.id, price, 'closed', pnl)
+    if (pos.mode === 'live') {
+      this.closePosition(pos.id)
+    } else {
+      const notional = pos.kind === 'cfd' && pos.leverage ? pos.amount * pos.leverage : pos.amount
+      const pnl = ((price - pos.entryPrice) / pos.entryPrice) * notional * dir
+      this.settle(pos.id, price, 'closed', pnl)
+    }
     void ts
   }
 

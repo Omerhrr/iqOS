@@ -96,7 +96,7 @@ export interface BreakerState {
 interface ExecLike {
   closePosition(id: string): unknown
   setKillSwitch(on: boolean): unknown
-  account(): { balance: number; dayStartBalance: number; killSwitch: boolean }
+  account(): { balance: number; dayStartBalance: number; killSwitch: boolean; dayPnl: number; liveBalance: number | null; source: 'paper' | 'iq' }
 }
 interface AutopilotLike {
   listBots(): { bot: { id: string; enabled: boolean } }[]
@@ -167,12 +167,12 @@ export class SentinelService {
   private restore(): void {
     const saved = this.store.getSentinelState()
     if (!saved) {
-      this.hwm = this.store.getAccount().balance
+      this.hwm = this.equityBalance()
       this.persist()
       return
     }
     this.config = { ...DEFAULT_SENTINEL, ...(saved.config as Partial<SentinelConfig>) }
-    const bal = this.store.getAccount().balance
+    const bal = this.equityBalance()
     // high-water mark never goes down with the balance; adopt a higher balance on boot
     this.hwm = Math.max(saved.hwm || 0, bal)
   }
@@ -380,9 +380,38 @@ export class SentinelService {
     return this.tradeTs.length
   }
 
+  // THE BUG: this used to read this.store.getAccount().balance directly -
+  // the PAPER ledger row, which never moves on a live trade (IQ books the
+  // stake/result on its own broker ledger, by design - see execution.ts's
+  // settle()). So once accountSource was 'iq', the HWM just sat wherever the
+  // paper balance happened to be (default $10,000) and this breaker, and the
+  // daily-loss breaker below, could never trip from real equity moves at
+  // all - two of this platform's three stated real-money circuit breakers
+  // were silently inert for live trading. equityBalance()/equityDayLoss()
+  // mirror ExecutionService.account()'s own live-aware computation instead
+  // of re-deriving it here, with the same store fallback if execution isn't
+  // loaded yet (e.g. very early in boot).
+  private equityBalance(): number {
+    try {
+      const a = this.ctx.use<ExecLike>('execution').account()
+      return a.source === 'iq' && a.liveBalance !== null ? a.liveBalance : a.balance
+    } catch {
+      return this.store.getAccount().balance
+    }
+  }
+
+  private equityDayLoss(): number {
+    try {
+      return -this.ctx.use<ExecLike>('execution').account().dayPnl
+    } catch {
+      const acct = this.store.getAccount()
+      return acct.dayStartBalance - acct.balance
+    }
+  }
+
   drawdownPct(): number {
     if (this.hwm <= 0) return 0
-    const dd = ((this.hwm - this.store.getAccount().balance) / this.hwm) * 100
+    const dd = ((this.hwm - this.equityBalance()) / this.hwm) * 100
     return Math.max(0, Math.round(dd * 100) / 100)
   }
 
@@ -391,7 +420,7 @@ export class SentinelService {
   private onTradeOpened(pos: Position): void {
     this.tradeTs.push(this.now())
     // new equity peak -> clear drawdown breaker automatically
-    const bal = this.store.getAccount().balance
+    const bal = this.equityBalance()
     if (bal > this.hwm) {
       this.hwm = bal
       if (this.breakers.drawdown.tripped) {
@@ -411,8 +440,7 @@ export class SentinelService {
   /** Re-check both breakers against live account metrics; trip/untrip as needed. */
   evaluate(): void {
     if (this.config.correlationRegimeGuard) this.sampleCorrelationRegime()
-    const acct = this.store.getAccount()
-    const dayLoss = acct.dayStartBalance - acct.balance
+    const dayLoss = this.equityDayLoss()
 
     // daily-loss breaker (base limit lives in the execution risk manager)
     const dailyLimit = this.baseDailyLimit()
