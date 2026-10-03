@@ -608,6 +608,9 @@ export interface LabSignalStat {
   edgeLB: number
   weight: number
   selected: boolean
+  /** full definition this stat was measured from - lets the UI compose a
+   * spec out of any manually-checked subset, not just the auto-selected one */
+  def: LabSignalDef
 }
 
 export interface LabSimMetrics {

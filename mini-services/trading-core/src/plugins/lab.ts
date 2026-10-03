@@ -63,6 +63,14 @@ export interface SignalStat {
   edgeLB: number
   weight: number
   selected: boolean
+  // Full signal definition this stat was measured from - exposed so a caller
+  // (the AI Lab UI's manual signal checkboxes) can compose a CustomSpec out
+  // of ANY subset of measured candidates, not just the ones the auto-select
+  // step picked. Without this the UI could only ever save/deploy exactly
+  // what the algorithm chose - a signal with a dash in the weight column
+  // (excluded by min-n, min-edge, or the one-per-family rule) had no way
+  // back into a deployed spec even when the user could see it looked good.
+  def: SignalDef
 }
 
 export interface SimMetrics {
@@ -371,6 +379,7 @@ export class StrategyLabService {
         edgeLB: round2(ciLow - 50),
         weight: 0,
         selected: false,
+        def: c.def,
       })
     }
     // THE BUG this replaces: ranking and weighting by raw edgePts let a

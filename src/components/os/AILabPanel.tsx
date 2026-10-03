@@ -10,7 +10,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import type { AssetRow, LabLearnResult, LabSimMetrics, LabStrategyRow, Timeframe, TradeKind } from '@/lib/os/client'
+import type { AssetRow, LabLearnResult, LabSignalDef, LabSimMetrics, LabSpec, LabStrategyRow, Timeframe, TradeKind } from '@/lib/os/client'
 import { fmtMoney, osGet, osPost } from '@/lib/os/client'
 import { TIMEFRAMES } from '@/lib/os/client'
 
@@ -236,6 +236,12 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
   const [maxSignals, setMaxSignals] = useState(8)
   const [learning, setLearning] = useState(false)
   const [result, setResult] = useState<LabLearnResult | null>(null)
+  // Which measured signals (by key) are checked into the deployed spec. Seeded
+  // to whatever the auto-selector picked each time a fresh learn() result
+  // comes back, but the user can tick/untick any row from here on - including
+  // ones the algorithm excluded (thin sample, lost the family slot, etc.) or
+  // unticking ones it kept.
+  const [checkedKeys, setCheckedKeys] = useState<Set<string>>(new Set())
   const [savedName, setSavedName] = useState('')
   const [savedId, setSavedId] = useState<string | null>(null)
   const [library, setLibrary] = useState<LabStrategyRow[]>([])
@@ -267,6 +273,36 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
 
   const tickers = assets.map((a) => a.ticker)
 
+  const toggleSignal = (key: string) => {
+    setCheckedKeys((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+
+  // The spec actually wired up to "save to library" / "deploy as bot" - built
+  // from whichever rows are checked, not from the algorithm's own pick. A
+  // checked row that the auto-selector excluded (dash in the weight column)
+  // gets the same Wilson-haircut weight formula the backend uses for anything
+  // it DID select, so a manually-added thin-sample signal still casts a vote
+  // sized to how trustworthy its edge actually is, not a flat default.
+  const effectiveSpec: LabSpec | null = useMemo(() => {
+    if (!result?.spec) return null
+    const chosen = result.signals.filter((s) => checkedKeys.has(s.key))
+    if (!chosen.length) return null
+    const signals: LabSignalDef[] = chosen.map((s) => ({
+      ...s.def,
+      weight: s.selected ? s.weight : Math.max(6, Math.min(50, Math.round(Math.max(0.5, s.edgeLB) * 4))),
+    })) as LabSignalDef[]
+    return {
+      ...result.spec,
+      signals,
+      minVotes: signals.length >= 3 ? 2 : 1,
+    }
+  }, [result, checkedKeys])
+
   const learn = async () => {
     setLearning(true)
     setResult(null)
@@ -274,6 +310,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
     try {
       const res = await osPost<LabLearnResult>('/lab_learn', { asset, tf, basis, bars, horizon, minSamples, minEdge, maxSignals, payout })
       setResult(res)
+      setCheckedKeys(new Set(res.signals.filter((s) => s.selected).map((s) => s.key)))
       const basisSuffix = { candles: '', heikin: ' HA', kalman: ' KAL', typical: ' TYP', smoothed: ' SMA' }[basis]
       setSavedName(`${asset} ${tf} Lab${basisSuffix}`)
     } catch (e) {
@@ -284,11 +321,11 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
   }
 
   const saveToLibrary = async () => {
-    if (!result?.spec) return
+    if (!effectiveSpec || !result) return
     try {
       const res = await osPost<{ ok: boolean; id: string }>('/lab_save', {
         name: savedName || `${asset} ${tf} Lab`,
-        spec: result.spec,
+        spec: effectiveSpec,
         asset: result.asset,
         tf: result.tf,
         stats: { backtest: result.backtest, holdout: result.holdout, breakeven: result.breakevenWinRate },
@@ -302,12 +339,12 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
 
   const openDeploy = async (id: string, name: string) => {
     let targetId = id
-    if (!id && result?.spec) {
-      // deploy straight from a fresh learn: persist first
+    if (!id && effectiveSpec && result) {
+      // deploy straight from a fresh learn: persist first (whatever's checked)
       try {
         const res = await osPost<{ ok: boolean; id: string }>('/lab_save', {
           name: savedName || `${asset} ${tf} Lab`,
-          spec: result.spec,
+          spec: effectiveSpec,
           asset: result.asset,
           tf: result.tf,
           stats: { backtest: result.backtest, holdout: result.holdout, breakeven: result.breakevenWinRate },
@@ -499,6 +536,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
             <table className="w-full font-mono text-[11px]">
               <thead>
                 <tr className="border-b border-[#141d2e] text-left text-[9px] uppercase tracking-wider text-[#4b5a72]">
+                  <th className="px-2 py-1.5" title="only checked signals are written into the saved/deployed spec">use</th>
                   <th className="px-2 py-1.5">family</th>
                   <th className="px-2 py-1.5">signal</th>
                   <th className="px-2 py-1.5">dir</th>
@@ -509,19 +547,33 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
                 </tr>
               </thead>
               <tbody>
-                {result.signals.map((s) => (
-                  <tr key={s.key} className={`border-b border-[#0d1420] ${s.selected ? 'bg-cyan-500/5' : ''}`}>
-                    <td className="px-2 py-1">
-                      <span className={`rounded border px-1 py-0.5 text-[8px] uppercase ${KIND_CHIP[s.kind] ?? 'text-[#7c8aa5] border-[#1c2739]'}`}>{s.kind}</span>
-                    </td>
-                    <td className="px-2 py-1 text-[#dbe4f0]">{s.label}</td>
-                    <td className={`px-2 py-1 ${s.dir === 'call' ? 'text-emerald-400' : 'text-rose-400'}`}>{s.dir.toUpperCase()}</td>
-                    <td className="px-2 py-1 text-[#7c8aa5]">{s.n}</td>
-                    <td className="px-2 py-1 text-[#dbe4f0]">{s.winRate.toFixed(1)}</td>
-                    <td className={`px-2 py-1 ${s.edgePts >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>{s.edgePts >= 0 ? '+' : ''}{s.edgePts.toFixed(1)}pts</td>
-                    <td className="px-2 py-1 text-cyan-300">{s.selected ? s.weight : '-'}</td>
-                  </tr>
-                ))}
+                {result.signals.map((s) => {
+                  const checked = checkedKeys.has(s.key)
+                  return (
+                    <tr key={s.key} className={`border-b border-[#0d1420] ${checked ? 'bg-cyan-500/5' : ''}`}>
+                      <td className="px-2 py-1">
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => toggleSignal(s.key)}
+                          className="accent-cyan-500"
+                          title={s.selected ? 'auto-selected by the learner' : "not auto-selected (min-n / min-edge / family slot) - check to include it anyway"}
+                        />
+                      </td>
+                      <td className="px-2 py-1">
+                        <span className={`rounded border px-1 py-0.5 text-[8px] uppercase ${KIND_CHIP[s.kind] ?? 'text-[#7c8aa5] border-[#1c2739]'}`}>{s.kind}</span>
+                      </td>
+                      <td className="px-2 py-1 text-[#dbe4f0]">{s.label}</td>
+                      <td className={`px-2 py-1 ${s.dir === 'call' ? 'text-emerald-400' : 'text-rose-400'}`}>{s.dir.toUpperCase()}</td>
+                      <td className="px-2 py-1 text-[#7c8aa5]">{s.n}</td>
+                      <td className="px-2 py-1 text-[#dbe4f0]">{s.winRate.toFixed(1)}</td>
+                      <td className={`px-2 py-1 ${s.edgePts >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>{s.edgePts >= 0 ? '+' : ''}{s.edgePts.toFixed(1)}pts</td>
+                      <td className="px-2 py-1 text-cyan-300">
+                        {checked ? (s.selected ? s.weight : Math.max(6, Math.min(50, Math.round(Math.max(0.5, s.edgeLB) * 4)))) : '-'}
+                      </td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </div>
@@ -533,15 +585,21 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
                   minScore <span className="text-cyan-300">{result.spec.minScore}</span>
                 </span>
                 <span className="rounded border border-[#1c2739] bg-[#101828] px-1.5 py-0.5">
-                  minVotes <span className="text-cyan-300">{result.spec.minVotes}</span>
+                  minVotes <span className="text-cyan-300">{effectiveSpec?.minVotes ?? result.spec.minVotes}</span>
                 </span>
                 <span className="rounded border border-[#1c2739] bg-[#101828] px-1.5 py-0.5">
-                  signals <span className="text-cyan-300">{result.spec.signals.length}</span>
+                  signals checked <span className="text-cyan-300">{checkedKeys.size}</span> / auto-picked {result.spec.signals.length}
                 </span>
                 <span className="rounded border border-[#1c2739] bg-[#101828] px-1.5 py-0.5">
                   threshold sweep: {result.calibration.thresholds.map((t) => `${t.minScore}→${t.trades}t/${t.winRate.toFixed(0)}%`).join(' · ')}
                 </span>
               </div>
+              {checkedKeys.size > 0 && checkedKeys.size !== result.spec.signals.length && (
+                <div className="rounded border border-amber-500/30 bg-amber-500/5 px-2 py-1.5 font-mono text-[10px] text-amber-300">
+                  ⚠ signal selection edited by hand - minScore/calibration below still reflect the learner&apos;s original {result.spec.signals.length}-signal run, not this {checkedKeys.size}-signal mix. Re-learn after saving if you want the threshold/minScore recalibrated against your picks.
+                </div>
+              )}
+
               <div className="grid grid-cols-1 gap-2 lg:grid-cols-2">
                 <MetricStrip label="backtest - full sample" m={result.backtest} breakeven={result.breakevenWinRate} />
                 <MetricStrip label="backtest - holdout (last 30%, unseen in calibration)" m={result.holdout} breakeven={result.breakevenWinRate} />
@@ -551,17 +609,17 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
 
               <div className="flex flex-wrap items-center gap-2">
                 <Input value={savedName} onChange={(e) => setSavedName(e.target.value)} placeholder="strategy name" className="h-7 w-48 border-[#1c2739] bg-[#101828] font-mono text-[11px] text-[#dbe4f0]" />
-                <Button onClick={() => void saveToLibrary()} disabled={!!savedId} variant="outline" className="h-7 border-[#1c2739] px-3 text-[10px] uppercase tracking-wider text-[#7c8aa5] hover:text-cyan-300 disabled:opacity-40">
-                  {savedId ? `saved: ${savedId}` : 'save to library'}
+                <Button onClick={() => void saveToLibrary()} disabled={!!savedId || !effectiveSpec} variant="outline" className="h-7 border-[#1c2739] px-3 text-[10px] uppercase tracking-wider text-[#7c8aa5] hover:text-cyan-300 disabled:opacity-40">
+                  {savedId ? `saved: ${savedId}` : `save to library (${checkedKeys.size} signals)`}
                 </Button>
-                <Button onClick={() => result.spec && void openDeploy('', result.spec.name)} className="h-7 bg-emerald-600 px-3 text-[10px] font-bold uppercase tracking-wider text-white hover:bg-emerald-500">
+                <Button onClick={() => effectiveSpec && void openDeploy('', effectiveSpec.name)} disabled={!effectiveSpec} className="h-7 bg-emerald-600 px-3 text-[10px] font-bold uppercase tracking-wider text-white hover:bg-emerald-500 disabled:opacity-40">
                   deploy as bot
                 </Button>
               </div>
 
               <details className="rounded border border-[#141d2e] bg-[#0d1420] p-2">
-                <summary className="cursor-pointer font-mono text-[10px] uppercase tracking-wider text-[#4b5a72]">spec json (what the agent learned)</summary>
-                <pre className="mt-1 max-h-48 overflow-auto font-mono text-[10px] leading-relaxed text-[#aab6cc]">{JSON.stringify(result.spec, null, 2)}</pre>
+                <summary className="cursor-pointer font-mono text-[10px] uppercase tracking-wider text-[#4b5a72]">spec json (what will be saved/deployed - {checkedKeys.size} checked signals)</summary>
+                <pre className="mt-1 max-h-48 overflow-auto font-mono text-[10px] leading-relaxed text-[#aab6cc]">{JSON.stringify(effectiveSpec, null, 2)}</pre>
               </details>
             </>
           )}
