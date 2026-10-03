@@ -619,8 +619,9 @@ const TOOLS: ToolSpec[] = [
       let balance = Number(a.balance ?? 0)
       const kind = String(a.kind ?? 'cfd')
       if (!balance) {
-        const acc = (await coreGet('/account')) as { ok: boolean; account?: { balance: number } }
-        balance = acc.account?.balance ?? 10000
+        const acc = (await coreGet('/account')) as { ok: boolean; account?: { balance: number; liveBalance: number | null; source: string } }
+        const acct = acc.account
+        balance = acct ? (acct.source === 'iq' ? acct.liveBalance ?? acct.balance : acct.balance) : 10000
       }
       const riskPct = Number(a.riskPct ?? 1)
       const stopPct = Number(a.stopPct ?? 0.3)
@@ -696,7 +697,7 @@ const TOOLS: ToolSpec[] = [
   },
   {
     name: 'account',
-    description: 'Paper account state: balance, day P&L, total P&L, kill switch, risk config.',
+    description: 'Account state for whichever ledger is ACTIVE (source: "paper" or "iq"). On "iq", use liveBalance (not balance - that is the dormant paper ledger) and balanceMode (PRACTICE/REAL); dayPnl/totalPnl are already computed against the correct ledger server-side. On "paper", use balance.',
     args: '{}',
     run: () => coreGet('/account'),
   },
@@ -1346,7 +1347,7 @@ const TOOLS: ToolSpec[] = [
       const riskPct = Math.min(Math.max(Number(a.riskPct ?? 1), 0.1), 10)
       const payout = Math.min(Math.max(Number(a.payout ?? 0.85), 0.1), 5)
       const [accRes, sigRes, anRes, levelsRes] = await Promise.all([
-        coreGet('/account') as Promise<{ ok: boolean; account?: { balance: number } }>,
+        coreGet('/account') as Promise<{ ok: boolean; account?: { balance: number; liveBalance: number | null; source: string } }>,
         coreGet(`/signal?asset=${encodeURIComponent(asset)}&tf=${tf}`) as Promise<{ ok: boolean; signal?: { direction: string; score: number; confidence: number; price: number } }>,
         coreGet(`/analysis?asset=${encodeURIComponent(asset)}&tf=${tf}`) as Promise<{ ok: boolean; analysis?: { indicators?: { atrPct?: number; adx?: number } } }>,
         (async () => {
@@ -1360,7 +1361,8 @@ const TOOLS: ToolSpec[] = [
       ])
       const sig = sigRes.signal
       if (!sigRes.ok || !sig) return { ok: false, error: 'signal unavailable' }
-      const balance = accRes.account?.balance ?? 0
+      const acct = accRes.account
+      const balance = acct ? (acct.source === 'iq' ? acct.liveBalance ?? acct.balance : acct.balance) : 0
       let side = String(a.side ?? 'auto').toLowerCase()
       if (side === 'auto' || side === '') side = sig.direction !== 'none' ? sig.direction : sig.score >= 0 ? 'call' : 'put'
       if (side !== 'call' && side !== 'put') return { ok: false, error: 'side must be call|put|auto' }
@@ -2044,10 +2046,19 @@ interface UiContext {
 async function buildContextBlock(ui: UiContext): Promise<string> {
   const lines: string[] = []
   try {
-    const acc = (await coreGet('/account')) as { ok: boolean; account?: Record<string, number | boolean>; risk?: Record<string, number> }
+    const acc = (await coreGet('/account')) as { ok: boolean; account?: Record<string, number | boolean | string | null>; risk?: Record<string, number> }
     if (acc.ok && acc.account) {
       const a = acc.account
-      lines.push(`- Paper account: balance $${Number(a.balance ?? 0).toFixed(2)}, day P&L $${Number(a.dayPnl ?? 0).toFixed(2)}, total P&L $${Number(a.totalPnl ?? 0).toFixed(2)}, kill switch ${a.killSwitch ? 'ENGAGED' : 'off'}`)
+      // The OS can be on either ledger (source: 'paper' | 'iq') - showing the
+      // paper balance while the user is actually connected to and trading on
+      // IQ (practice or real) is actively misleading, not just mislabeled.
+      // account() on the backend already computes the right balance/P&L for
+      // whichever ledger is active; mirror that choice here instead of
+      // hardcoding the paper fields.
+      const onIQ = a.source === 'iq'
+      const balance = onIQ ? Number(a.liveBalance ?? a.balance ?? 0) : Number(a.balance ?? 0)
+      const label = onIQ ? `Live (IQ ${a.balanceMode ?? 'PRACTICE'})` : 'Paper'
+      lines.push(`- ${label} account: balance $${balance.toFixed(2)}, day P&L $${Number(a.dayPnl ?? 0).toFixed(2)}, total P&L $${Number(a.totalPnl ?? 0).toFixed(2)}, kill switch ${a.killSwitch ? 'ENGAGED' : 'off'}`)
     }
   } catch {
     /* ignore */
