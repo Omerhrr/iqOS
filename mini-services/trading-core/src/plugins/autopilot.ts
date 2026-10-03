@@ -173,6 +173,14 @@ interface RuntimeState {
   restarts: number
   halted: boolean // stop-on-loss: cycle ended, awaiting explicit restart
   complete: boolean // halted on the periods target (win-side completion)
+  /** Edge-trigger de-dup: the direction of the last signal this bot actually
+   * acted on (passed direction-filter). While the strategy keeps reporting
+   * this SAME direction bar after bar, it's treated as the same persisting
+   * signal, not a fresh one, and is ignored - prevents pyramiding into / being
+   * whipsawed by a condition that just happens to stay true for a while. Reset
+   * to null the moment the strategy reports 'none' (or the opposite
+   * direction), which re-arms it for the next occurrence. */
+  lastSignalDir: 'call' | 'put' | null
 }
 
 export class AutopilotService {
@@ -629,7 +637,11 @@ export class AutopilotService {
       const merged = { ...defaultParams(getStrategy(bot.strategyId)!), ...(bot.params ?? {}) }
       evalOut = this.analytics.runStrategy(asset, tf, bot.strategyId, merged)
     }
-    if (evalOut.direction === 'none') return
+    if (evalOut.direction === 'none') {
+      // condition lapsed - re-arm the edge-trigger for whenever it next fires
+      rt.lastSignalDir = null
+      return
+    }
     if (Math.abs(evalOut.score) < bot.minScore) {
       return this.reject(bot, `score ${evalOut.score.toFixed(0)} below min ${bot.minScore}`)
     }
@@ -637,6 +649,17 @@ export class AutopilotService {
     if (bot.direction !== 'both' && bot.direction !== wanted) {
       return this.reject(bot, `signal ${wanted} outside allowed direction (${bot.direction})`)
     }
+
+    // edge-trigger de-dup: only act the FIRST time this direction shows up.
+    // While the condition keeps reporting the same direction bar after bar,
+    // it's the same persisting signal, not a fresh one - skip it until it
+    // either lapses to 'none' or flips to the other direction and comes back.
+    // This is what stands between "one clean entry per setup" and pyramiding
+    // into (or getting whipsawed by) a condition that just stays true a while.
+    if (rt.lastSignalDir === wanted) {
+      return this.reject(bot, `signal ${wanted} still active - waiting for it to clear/flip before retriggering`)
+    }
+    rt.lastSignalDir = wanted
 
     // regime gate: same 4-way TRENDING/RANGING/VOLATILE/MIXED classification
     // as the copilot's regime_playbook tool (classifyRegime), not just the
@@ -864,6 +887,7 @@ export class AutopilotService {
       restarts: cfg?.planState?.restarts ?? 0,
       halted: cfg?.planState?.halted ?? false,
       complete: cfg?.planState?.complete ?? false,
+      lastSignalDir: null,
     }
     const journal = this.store.botJournal(botId, 400)
     for (const p of journal) {
