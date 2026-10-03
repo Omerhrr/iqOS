@@ -103,7 +103,20 @@ export interface IndicatorSignal {
   weight: number
 }
 
-export type SignalDef = CandleSignal | BarSignal | HASignal | LineSignal | IndicatorSignal
+/** Multi-timeframe EMA-trend agreement: resamples this series into synthetic
+ * `factor`x bars (e.g. factor 5 on a 1m feed = synthetic 5m) and fires when
+ * EMA(8) vs EMA(21) on that higher timeframe agrees with `dir` - the same
+ * idea as the standalone mtf-alignment strategy, pulled into the signal
+ * vocabulary so the lab can mine it for edge, combine it with other signal
+ * families, and weight it by measured performance like everything else. */
+export interface MTFSignal {
+  kind: 'mtf'
+  factor: 5 | 15
+  dir: Side
+  weight: number
+}
+
+export type SignalDef = CandleSignal | BarSignal | HASignal | LineSignal | IndicatorSignal | MTFSignal
 
 export interface CustomSpec {
   name: string
@@ -663,6 +676,8 @@ export function labelOf(s: SignalDef): string {
       const tag = s.type ? `:${s.type}` : ''
       return `${s.ind}${tag}${Number.isFinite(pd) ? `(${pd})` : ''} ${s.op} ${s.threshold}`
     }
+    case 'mtf':
+      return `MTF ${s.factor}x Trend ${s.dir === 'call' ? 'Up' : 'Down'}`
   }
 }
 
@@ -678,6 +693,8 @@ export function impliedDir(s: SignalDef): Side {
     case 'line':
       return s.variant.endsWith('up') || s.variant === 'hh-hl' ? 'call' : 'put'
     case 'indicator':
+      return s.dir
+    case 'mtf':
       return s.dir
   }
 }
@@ -770,6 +787,34 @@ export function prepareSignal(s: SignalDef, ctx: EvalCtx): (i: number) => boolea
         const v = series[i]
         if (!Number.isFinite(v)) return false
         return s.op === '>' ? v > s.threshold : v < s.threshold
+      }
+    }
+    case 'mtf': {
+      const factor = s.factor
+      // Resample into non-overlapping `factor`-bar groups and EMA(8)/EMA(21)
+      // each group's close - precomputed once per group rather than per bar
+      // for speed. No lookahead: group g closes at original index
+      // (g+1)*factor-1, so bar i can only ever read the trend of the LAST
+      // group that had fully closed by i, same as the live mtf-alignment
+      // strategy only resampling complete groups.
+      const numGroups = Math.floor(ctx.n / factor)
+      const groupClose: number[] = new Array(numGroups)
+      for (let g = 0; g < numGroups; g++) groupClose[g] = ctx.close[(g + 1) * factor - 1]
+      const fast = ta.ema(groupClose, 8)
+      const slow = ta.ema(groupClose, 21)
+      const up: boolean[] = new Array(numGroups)
+      const dn: boolean[] = new Array(numGroups)
+      for (let g = 0; g < numGroups; g++) {
+        up[g] = Number.isFinite(fast[g]) && Number.isFinite(slow[g]) && fast[g] > slow[g]
+        dn[g] = Number.isFinite(fast[g]) && Number.isFinite(slow[g]) && fast[g] < slow[g]
+      }
+      const align = s.dir === 'call'
+      return (i: number) => {
+        const g = Math.floor((i + 1) / factor) - 1
+        // mirrors the standalone strategy's `series.length < 25` floor -
+        // need enough resampled groups for EMA(21) to mean anything
+        if (g < 25) return false
+        return align ? up[g] : dn[g]
       }
     }
   }
@@ -908,6 +953,8 @@ export function normalizeSpec(raw: unknown, fallbackName = 'Learned Strategy'): 
         dir: dir ?? 'call',
         weight,
       })
+    } else if (o.kind === 'mtf' && (Number(o.factor) === 5 || Number(o.factor) === 15)) {
+      signals.push({ kind: 'mtf', factor: Number(o.factor) as 5 | 15, dir: dir ?? 'call', weight })
     }
   }
   if (!signals.length) return null
@@ -918,7 +965,12 @@ export function normalizeSpec(raw: unknown, fallbackName = 'Learned Strategy'): 
     minScore: clampN(r.minScore, 5, 95, 45),
     minVotes: Math.round(clampN(r.minVotes, 1, 6, 1)),
     horizon: Math.round(clampN(r.horizon, 1, 10, 1)),
-    ...(r.basis === 'heikin' ? { basis: 'heikin' as const } : {}),
+    // THE BUG: this only ever preserved basis:'heikin' on round-trip - a
+    // saved spec learned on the kalman basis silently reverted to raw
+    // candles (basis undefined) the next time it was loaded from storage
+    // and re-normalized, quietly changing what every signal actually reads
+    // without changing a single number in the spec itself.
+    ...(r.basis === 'heikin' || r.basis === 'kalman' ? { basis: r.basis } : {}),
   }
 }
 

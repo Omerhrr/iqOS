@@ -26,6 +26,7 @@ const KIND_CHIP: Record<string, string> = {
   ha: 'text-emerald-300 border-emerald-500/40 bg-emerald-500/10',
   line: 'text-sky-300 border-sky-500/40 bg-sky-500/10',
   indicator: 'text-fuchsia-300 border-fuchsia-500/40 bg-fuchsia-500/10',
+  mtf: 'text-cyan-300 border-cyan-500/40 bg-cyan-500/10',
 }
 
 // Every field read here beyond the pre-existing core metrics was added
@@ -35,6 +36,18 @@ const KIND_CHIP: Record<string, string> = {
 // response from the not-yet-rebuilt kernel simply omits the new fields
 // (undefined, not null/0), so every access below falls back to a safe
 // default instead of assuming the field exists.
+
+/** "learned 3h ago" / "learned 2d ago" - the kernel re-mines a saved spec on
+ * its own every ~6h (see lab.ts's relearnSweep), so this is what tells you
+ * at a glance whether that's actually been happening for a given strategy,
+ * without digging into logs. */
+function staleLabel(updatedTs: number): string {
+  const ageSec = Math.max(0, Math.floor(Date.now() / 1000) - updatedTs)
+  if (ageSec < 3600) return `learned ${Math.max(1, Math.round(ageSec / 60))}m ago`
+  if (ageSec < 86400) return `learned ${Math.round(ageSec / 3600)}h ago`
+  return `learned ${Math.round(ageSec / 86400)}d ago`
+}
+
 function MetricStrip({ label, m, breakeven }: { label: string; m: LabSimMetrics | null; breakeven: number }) {
   if (!m) return null
   const good = m.winRate >= breakeven
@@ -278,6 +291,20 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
     }
   }
 
+  const [relearning, setRelearning] = useState<string | null>(null)
+  const relearnRow = async (id: string) => {
+    setRelearning(id)
+    try {
+      const res = await osPost<{ ok: boolean; decayed?: boolean; error?: string }>('/lab_relearn', { id })
+      if (!res.ok) onError(res.error ?? 're-learn failed')
+      loadLibrary()
+    } catch (e) {
+      onError((e as Error).message)
+    } finally {
+      setRelearning(null)
+    }
+  }
+
   return (
     <div className="space-y-3">
       {/* header + learn form */}
@@ -500,6 +527,14 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
                   <div className="flex items-center gap-2">
                     <span className="truncate font-mono text-[11px] text-[#dbe4f0]">{r.spec.name}</span>
                     <span className="rounded border border-cyan-500/40 bg-cyan-500/10 px-1 py-0.5 font-mono text-[8px] uppercase text-cyan-300">lab</span>
+                    {r.stats?.decayed && (
+                      <span className="rounded border border-rose-500/40 bg-rose-500/10 px-1 py-0.5 font-mono text-[8px] uppercase text-rose-300" title="the auto re-learn sweep found this spec no longer clears its own filters / can't beat breakeven on fresh data - any bot trading it was auto-disarmed">
+                        decayed
+                      </span>
+                    )}
+                    <span className="font-mono text-[8px] text-[#3d4d66]" title={new Date(r.updatedTs * 1000).toLocaleString()}>
+                      {staleLabel(r.updatedTs)}
+                    </span>
                   </div>
                   <div className="font-mono text-[9px] text-[#4b5a72]">
                     {r.id} · {r.asset} {r.tf} · {r.spec.signals.length} signals · minScore {r.spec.minScore}
@@ -507,6 +542,16 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
                   </div>
                 </div>
                 <div className="flex gap-1.5">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={relearning === r.id}
+                    className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5] hover:text-cyan-400 disabled:opacity-40"
+                    onClick={() => void relearnRow(r.id)}
+                    title="re-mine this pair's latest history and refresh this spec's signals/weights/calibration in place"
+                  >
+                    {relearning === r.id ? 're-learning...' : 're-learn now'}
+                  </Button>
                   <Button variant="outline" size="sm" className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5] hover:text-emerald-400" onClick={() => void backtestRow(r.id)}>
                     re-backtest
                   </Button>

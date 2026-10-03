@@ -583,6 +583,7 @@ export type LabSignalDef =
       dir: 'call' | 'put'
       weight: number
     }
+  | { kind: 'mtf'; factor: 5 | 15; dir: 'call' | 'put'; weight: number }
 
 export interface LabSpec {
   name: string
@@ -604,6 +605,7 @@ export interface LabSignalStat {
   wins: number
   winRate: number
   edgePts: number
+  edgeLB: number
   weight: number
   selected: boolean
 }
@@ -652,7 +654,7 @@ export interface LabStrategyRow {
   spec: LabSpec
   asset: string
   tf: string
-  stats: { backtest?: LabSimMetrics; holdout?: LabSimMetrics; breakeven?: number } | null
+  stats: { backtest?: LabSimMetrics; holdout?: LabSimMetrics; breakeven?: number; decayed?: boolean; decayedTs?: number } | null
   createdTs: number
   updatedTs: number
 }

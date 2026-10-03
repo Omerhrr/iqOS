@@ -52,6 +52,12 @@ export interface SignalStat {
   wins: number
   winRate: number // %
   edgePts: number // winRate - 50
+  // Wilson-score 95% CI lower bound on winRate, minus 50 - a "haircut" edge
+  // that discounts small-sample luck (n=41 at a flattering winRate scores
+  // much lower here than n=400 at the same winRate). Selection AND weight
+  // are now based on this, not the raw edgePts above, so the ensemble isn't
+  // dominated by a signal that just got lucky on a thin sample.
+  edgeLB: number
   weight: number
   selected: boolean
 }
@@ -111,7 +117,7 @@ export interface LabRow {
   spec: CustomSpec
   asset: string
   tf: string
-  stats: { backtest?: SimMetrics; holdout?: SimMetrics; breakeven?: number } | null
+  stats: { backtest?: SimMetrics; holdout?: SimMetrics; breakeven?: number; decayed?: boolean; decayedTs?: number } | null
   createdTs: number
   updatedTs: number
 }
@@ -133,16 +139,129 @@ interface Candidate {
   test: (i: number) => boolean
 }
 
+interface AutopilotLike {
+  listBots(): { bot: { id: string; enabled: boolean; strategyId: string; name: string } }[]
+  toggleBot(id: string, enabled?: boolean): unknown
+}
+
 export class StrategyLabService {
   private ctx!: KernelContext
   private store!: Store
   private market!: MarketDataService
+  private relearnTimer: ReturnType<typeof setInterval> | null = null
+  // Spread across ticks rather than relearning every saved spec at once on
+  // the mark - learn() replays the full pattern-mining + holdout-fold
+  // pipeline per call, which is CPU-heavy enough that doing it for every
+  // saved strategy simultaneously would be a real hit.
+  private static readonly RELEARN_TICK_MS = 15 * 60 * 1000 // 15 min sweep cadence
+  private static readonly RELEARN_AFTER_SEC = 6 * 60 * 60 // re-mine a spec at most every 6h
+  private static readonly RELEARN_MAX_PER_TICK = 2
 
   async start(ctx: KernelContext): Promise<void> {
     this.ctx = ctx
     this.store = ctx.use<Store>('store')
     this.market = ctx.use<MarketDataService>('market')
     ctx.log('lab', 'strategy lab online (pattern mining, edge stats, spec synthesis, holdout backtests)')
+    // THE GAP this closes: autopilot's own re-validation sweep explicitly
+    // skips custom:* (Strategy Lab) strategies - "aren't backed by the
+    // optimize.ts grid engine... outside this gate for now" (see
+    // autopilot.ts's revalidateSweep). A learned spec could decay silently
+    // with nothing re-checking its edge the way every optimize.ts-backed
+    // strategy gets re-walk-forwarded automatically. This sweep gives
+    // custom:* specs the same kind of ongoing upkeep, using the lab's own
+    // learn() pipeline instead of optimize.ts's grid search.
+    this.relearnTimer = setInterval(() => void this.relearnSweep(), StrategyLabService.RELEARN_TICK_MS)
+  }
+
+  stop(): void {
+    if (this.relearnTimer) clearInterval(this.relearnTimer)
+    this.relearnTimer = null
+  }
+
+  /** Re-mine up to RELEARN_MAX_PER_TICK saved specs whose last learn is
+   * older than RELEARN_AFTER_SEC. A spec that still clears its own filters
+   * gets its signals/weights/calibration refreshed in place (same id, so
+   * any bot trading it picks up the update with no re-save needed). A spec
+   * that no longer clears them - or whose fresh holdout can't beat breakeven
+   * - is left untouched but flagged "decayed" in its stored stats, and any
+   * enabled bot trading it is auto-disarmed, the same courtesy optimize.ts-
+   * backed strategies already get from the daily re-validation gate. */
+  private async relearnSweep(): Promise<void> {
+    const now = Math.floor(Date.now() / 1000)
+    const due = this.list()
+      .filter((r) => r.asset && r.asset !== 'ANY' && now - r.updatedTs >= StrategyLabService.RELEARN_AFTER_SEC)
+      .slice(0, StrategyLabService.RELEARN_MAX_PER_TICK)
+    for (const row of due) this.relearnRow(row, 'auto-relearned')
+  }
+
+  /** Manual trigger for the "Re-learn now" button - same decay-check/auto-
+   * disarm logic as the scheduled sweep, just bypassing the age gate. */
+  relearnOne(id: string): { ok: boolean; decayed?: boolean; error?: string } {
+    const row = this.get(id.toLowerCase())
+    if (!row) return { ok: false, error: 'lab strategy not found' }
+    if (!row.asset || row.asset === 'ANY') return { ok: false, error: 'strategy has no specific asset to re-learn against' }
+    return this.relearnRow(row, 'manually re-learned')
+  }
+
+  private relearnRow(row: LabRow, verb: 'auto-relearned' | 'manually re-learned'): { ok: boolean; decayed?: boolean; error?: string } {
+    const now = Math.floor(Date.now() / 1000)
+    try {
+      const fresh = this.learn({
+        asset: row.asset,
+        tf: row.tf as Timeframe,
+        basis: row.spec.basis,
+        horizon: row.spec.horizon,
+        name: row.spec.name,
+      })
+      const oldStats = (row.stats ?? {}) as { holdout?: SimMetrics; breakeven?: number }
+      const decayed = !fresh.ok || fresh.holdout === null || fresh.holdout.winRate < fresh.breakevenWinRate || fresh.foldsProfitable === 0
+      if (decayed) {
+        const reason = !fresh.ok
+          ? 'no signal still clears its filters on fresh data'
+          : `fresh holdout ${fresh.holdout!.winRate.toFixed(1)}% vs breakeven ${fresh.breakevenWinRate.toFixed(1)}%, ${fresh.foldsProfitable}/${fresh.holdoutFolds.length || 3} OOS folds profitable`
+        this.ctx.bus.emit('alert', {
+          level: 'danger',
+          message: `[lab] "${row.spec.name}" (${row.id}) looks DECAYED on re-learn - ${reason}. Kept the last-good spec live but disarmed any bot trading it.`,
+          ts: now,
+        })
+        // keep the last-good tradeable spec, just mark it + refresh the
+        // relearn clock so this doesn't retry every single tick
+        this.store.saveLabStrategy({ id: row.id, spec: row.spec, asset: row.asset, tf: row.tf, stats: { ...oldStats, decayed: true, decayedTs: now } })
+        try {
+          const ap = this.ctx.use<AutopilotLike>('autopilot')
+          for (const { bot } of ap.listBots()) {
+            if (bot.enabled && bot.strategyId === row.id) {
+              ap.toggleBot(bot.id, false)
+              this.ctx.bus.emit('alert', { level: 'danger', message: `[lab] bot "${bot.name}" AUTO-DISARMED - its strategy ${row.id} decayed on re-learn`, ts: now })
+            }
+          }
+        } catch {
+          // autopilot not loaded
+        }
+        return { ok: true, decayed: true }
+      }
+      // still earning its keep - refresh the deployed spec in place
+      this.store.saveLabStrategy({
+        id: row.id,
+        spec: fresh.spec,
+        asset: row.asset,
+        tf: row.tf,
+        stats: { backtest: fresh.backtest, holdout: fresh.holdout, breakeven: fresh.breakevenWinRate, decayed: false },
+      })
+      const prevWr = oldStats.holdout?.winRate
+      this.ctx.bus.emit('alert', {
+        level: 'info',
+        message: `[lab] "${row.spec.name}" (${row.id}) ${verb} - holdout ${fresh.holdout!.winRate.toFixed(1)}%${Number.isFinite(prevWr) ? ` (was ${prevWr!.toFixed(1)}%)` : ''}, ${fresh.spec!.signals.length} signals`,
+        ts: now,
+      })
+      return { ok: true, decayed: false }
+    } catch (err) {
+      // a transient data/history issue on one spec shouldn't stop a sweep
+      // from getting to the next one, or crash a manual re-learn request
+      const msg = err instanceof Error ? err.message : String(err)
+      this.ctx.log('lab', `relearn failed for ${row.id}: ${msg}`)
+      return { ok: false, error: msg }
+    }
   }
 
   // ---------- learning pipeline ----------
@@ -235,6 +354,7 @@ export class StrategyLabService {
       const s = stats.get(c.key)
       if (!s || s.n === 0) continue
       const winRate = (s.wins / s.n) * 100
+      const [ciLow] = wilsonInterval(s.wins, s.n)
       measured.push({
         key: c.key,
         kind: c.kind,
@@ -244,11 +364,21 @@ export class StrategyLabService {
         wins: s.wins,
         winRate: round2(winRate),
         edgePts: round2(winRate - 50),
+        edgeLB: round2(ciLow - 50),
         weight: 0,
         selected: false,
       })
     }
-    measured.sort((a, b) => b.edgePts - a.edgePts || b.n - a.n)
+    // THE BUG this replaces: ranking and weighting by raw edgePts let a
+    // small-sample fluke (say n=41, winRate 62%) outrank and outweigh a
+    // signal with a much bigger, more trustworthy sample (n=400, winRate
+    // 58%) just because its POINT ESTIMATE happened to be higher - exactly
+    // the kind of overfit-to-noise the holdout/fold checks downstream are
+    // supposed to catch, but by then the ensemble had already baked the
+    // lucky signal in. Ranking by the Wilson lower bound instead means a
+    // thin sample needs a genuinely large edge to compete with a well-
+    // sampled one at a smaller edge.
+    measured.sort((a, b) => b.edgeLB - a.edgeLB || b.n - a.n)
 
     const byKey = new Map(candidates.map((c) => [c.key, c]))
     const qualifying = measured.filter((m) => m.n >= minSamples && m.edgePts >= minEdge)
@@ -263,7 +393,11 @@ export class StrategyLabService {
     }
     for (const m of selected) {
       m.selected = true
-      m.weight = Math.max(6, Math.min(50, Math.round(m.edgePts * 4)))
+      // weighted by the same haircut-edge used to rank/select above, not the
+      // raw point-estimate edge - a signal that barely cleared minEdge on a
+      // thin sample now gets a proportionally smaller vote than one with the
+      // same raw edge backed by hundreds of occurrences.
+      m.weight = Math.max(6, Math.min(50, Math.round(Math.max(0.5, m.edgeLB) * 4)))
     }
 
     if (!selected.length) {
@@ -490,6 +624,12 @@ function familyOf(s: SignalDef): string {
       return `line:${s.variant.replace(/-(up|down)$/, '')}`
     case 'indicator':
       return `ind:${s.ind}`
+    case 'mtf':
+      // each factor is its own family (5x and 15x are different enough
+      // timeframes that both are worth keeping if they both show edge),
+      // but up/down of the SAME factor count as one family so the ensemble
+      // doesn't select both sides of the identical trend test.
+      return `mtf:${s.factor}`
   }
 }
 
@@ -506,6 +646,8 @@ function candidateKeyOf(s: SignalDef): string {
       return `line:${s.variant}:${s.lookback ?? ''}`
     case 'indicator':
       return `indicator:${s.ind}|${s.op}|${s.threshold}|${JSON.stringify(s.params ?? {})}`
+    case 'mtf':
+      return `mtf:${s.factor}:${s.dir}`
   }
 }
 
@@ -646,6 +788,13 @@ function wilsonInterval(wins: number, total: number, z = 1.96): [number, number]
 /** The parametric candidates the learner sweeps. Each maps 1:1 to a SignalDef
  * the evaluator understands, so a measured candidate IS the deployed math. */
 export const CANDIDATE_SIGNALS: SignalDef[] = [
+  // multi-timeframe EMA-trend agreement (resampled 5x/15x, same idea as the
+  // standalone mtf-alignment strategy) - lets the lab discover whether a
+  // pair's edge actually comes from aligning with the bigger-timeframe trend
+  { kind: 'mtf', factor: 5, dir: 'call', weight: 10 },
+  { kind: 'mtf', factor: 5, dir: 'put', weight: 10 },
+  { kind: 'mtf', factor: 15, dir: 'call', weight: 10 },
+  { kind: 'mtf', factor: 15, dir: 'put', weight: 10 },
   // bar formations
   { kind: 'bar', variant: 'wide-bull', atrK: 1.1, dir: 'call', weight: 10 },
   { kind: 'bar', variant: 'wide-bear', atrK: 1.1, dir: 'put', weight: 10 },
@@ -754,12 +903,22 @@ export const CANDIDATE_SIGNALS: SignalDef[] = [
   { kind: 'indicator', ind: 'levels', type: 'pivot', op: '<', threshold: -0.3, dir: 'put', weight: 10 },
 ]
 
+let labServiceInstance: StrategyLabService | null = null
+
 export const labPlugin: Plugin = {
   name: 'lab',
   start: async (ctx) => {
     const svc = new StrategyLabService()
+    labServiceInstance = svc
     ctx.provide('lab', svc)
     await svc.start(ctx)
   },
-  stop: () => {},
+  // THE BUG this replaces: stop() was a no-op, so the relearn sweep's
+  // setInterval (and any future lab timers) would keep firing against a
+  // torn-down kernel context on a plugin reload/restart instead of being
+  // cleared like every other plugin's timer (autopilot, sentinel) already is.
+  stop: () => {
+    labServiceInstance?.stop()
+    labServiceInstance = null
+  },
 }
