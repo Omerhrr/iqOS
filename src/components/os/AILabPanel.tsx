@@ -1056,6 +1056,15 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
                   <Button variant="outline" size="sm" className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5] hover:text-emerald-400" onClick={() => void openDeploy(r.id, r.spec.name, r.asset, r.tf as Timeframe, r.spec.horizon)}>
                     deploy
                   </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5] hover:text-violet-400"
+                    onClick={() => setExpandedLabId(expanded ? null : r.id)}
+                    title="view this strategy's spec JSON"
+                  >
+                    {expanded ? 'hide json' : 'view json'}
+                  </Button>
                   <Button variant="outline" size="sm" className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5] hover:text-rose-400" onClick={() => void removeLab(r.id)}>
                     delete
                   </Button>
