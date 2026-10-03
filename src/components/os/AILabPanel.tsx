@@ -356,7 +356,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
         spec,
         asset,
         tf,
-        stats: manualBacktest ? { backtest: manualBacktest.backtest, holdout: manualBacktest.holdout, breakeven: manualBacktest.breakevenWinRate } : undefined,
+        stats: { ...(manualBacktest ? { backtest: manualBacktest.backtest, holdout: manualBacktest.holdout, breakeven: manualBacktest.breakevenWinRate } : {}), curated: true },
       })
       setManualSavedId(res.id)
       loadLibrary()
@@ -379,7 +379,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
           spec,
           asset,
           tf,
-          stats: manualBacktest ? { backtest: manualBacktest.backtest, holdout: manualBacktest.holdout, breakeven: manualBacktest.breakevenWinRate } : undefined,
+          stats: { ...(manualBacktest ? { backtest: manualBacktest.backtest, holdout: manualBacktest.holdout, breakeven: manualBacktest.breakevenWinRate } : {}), curated: true },
         })
         id = res.id
         setManualSavedId(res.id)
@@ -477,15 +477,31 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
     }
   }
 
+  // THE BUG this fixes: a strategy saved with the signal checkboxes edited by
+  // hand looked right in the JSON right after saving, but the backend's
+  // auto re-learn sweep (every ~6h) - and the "re-learn now" button - always
+  // called learn() fresh, which RE-MINES the whole candidate pool and
+  // auto-selects a brand-new signal set from scratch. That silently threw
+  // away the manual curation on the very next re-learn, with no warning -
+  // "view json" later showed all the algorithm's picks, not what was
+  // checked. `curated: true` in stats tells relearnRow to refresh this
+  // spec's numbers without ever touching which signals are in it.
+  const isCuratedSelection = (): boolean => {
+    if (!result) return false
+    const autoPicked = new Set(result.signals.filter((s) => s.selected).map((s) => s.key))
+    return checkedKeys.size !== autoPicked.size || Array.from(checkedKeys).some((k) => !autoPicked.has(k))
+  }
+
   const saveToLibrary = async () => {
     if (!effectiveSpec || !result) return
     try {
+      const curated = isCuratedSelection()
       const res = await osPost<{ ok: boolean; id: string }>('/lab_save', {
         name: savedName || `${asset} ${tf} Lab`,
         spec: effectiveSpec,
         asset: result.asset,
         tf: result.tf,
-        stats: { backtest: result.backtest, holdout: result.holdout, breakeven: result.breakevenWinRate },
+        stats: { backtest: result.backtest, holdout: result.holdout, breakeven: result.breakevenWinRate, ...(curated ? { curated: true } : {}) },
       })
       setSavedId(res.id)
       loadLibrary()
@@ -499,12 +515,13 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
     if (!id && effectiveSpec && result) {
       // deploy straight from a fresh learn: persist first (whatever's checked)
       try {
+        const curated = isCuratedSelection()
         const res = await osPost<{ ok: boolean; id: string }>('/lab_save', {
           name: savedName || `${asset} ${tf} Lab`,
           spec: effectiveSpec,
           asset: result.asset,
           tf: result.tf,
-          stats: { backtest: result.backtest, holdout: result.holdout, breakeven: result.breakevenWinRate },
+          stats: { backtest: result.backtest, holdout: result.holdout, breakeven: result.breakevenWinRate, ...(curated ? { curated: true } : {}) },
         })
         targetId = res.id
         setSavedId(res.id)
