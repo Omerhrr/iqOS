@@ -245,7 +245,17 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
   const [savedName, setSavedName] = useState('')
   const [savedId, setSavedId] = useState<string | null>(null)
   const [library, setLibrary] = useState<LabStrategyRow[]>([])
-  const [deployFor, setDeployFor] = useState<{ id: string; name: string } | null>(null)
+  // THE BUG this replaces: deployFor used to carry only {id, name}, and
+  // deploy() built the bot's watchlist/tf from the LEARN FORM's current pair
+  // selector - whatever `asset`/`tf` happened to be showing - instead of the
+  // asset/tf the strategy was actually learned on. Deploying a library row
+  // for one pair while the form's dropdown sat on a different one silently
+  // created a bot watching the WRONG instrument with the right strategy id
+  // (e.g. a bot watching EURUSD trading a NZDUSD-OTC-learned spec) - wrong
+  // even setting aside the research-gate message that surfaced it, since a
+  // lab spec's signals/thresholds are tuned to the instrument it was learned
+  // against.
+  const [deployFor, setDeployFor] = useState<{ id: string; name: string; asset: string; tf: Timeframe } | null>(null)
   const [deploying, setDeploying] = useState(false)
   // deploy form
   const [botName, setBotName] = useState('')
@@ -337,7 +347,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
     }
   }
 
-  const openDeploy = async (id: string, name: string) => {
+  const openDeploy = async (id: string, name: string, forAsset: string, forTf: Timeframe) => {
     let targetId = id
     if (!id && effectiveSpec && result) {
       // deploy straight from a fresh learn: persist first (whatever's checked)
@@ -357,7 +367,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
         return
       }
     }
-    setDeployFor({ id: targetId, name })
+    setDeployFor({ id: targetId, name, asset: forAsset, tf: forTf })
     setBotName(`${name} Bot`.slice(0, 32))
   }
 
@@ -367,9 +377,9 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
     try {
       const body: Record<string, unknown> = {
         name: botName || `${deployFor.name} Bot`,
-        watchlist: [asset],
+        watchlist: [deployFor.asset],
         strategyId: deployFor.id,
-        tf,
+        tf: deployFor.tf,
         kind,
         stake,
         expirySec: kind === 'digital' ? Math.max(1, expiryMin) * 60 : undefined,
@@ -415,17 +425,30 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
     }
   }
 
+  const [backtesting, setBacktesting] = useState<string | null>(null)
   const backtestRow = async (id: string) => {
     // Use the saved row's OWN asset/tf, not whatever pair the learn form
     // currently has selected - the library holds strategies learned on
     // different pairs/timeframes, and re-backtesting against the wrong
     // instrument silently produced meaningless numbers.
     const row = library.find((r) => r.id === id)
+    setBacktesting(id)
     try {
-      await osPost('/lab_backtest', { id, asset: row?.asset ?? asset, tf: row?.tf ?? tf, payout })
+      // THE BUG this replaces: the response was awaited and thrown away, and
+      // the backend never persisted its fresh numbers anywhere either - so
+      // the loadLibrary() reload below always re-read the exact same stale
+      // stats, and the button looked like it did nothing. backtestSpec now
+      // writes the fresh backtest/holdout back onto the saved row itself, so
+      // this reload actually picks up new numbers; still check `ok` so a
+      // real failure (e.g. not enough history) surfaces instead of silently
+      // leaving the old stats in place.
+      const res = await osPost<{ ok: boolean; error?: string }>('/lab_backtest', { id, asset: row?.asset ?? asset, tf: row?.tf ?? tf, payout })
+      if (!res.ok) throw new Error(res.error ?? 're-backtest failed')
       loadLibrary()
     } catch (e) {
       onError((e as Error).message)
+    } finally {
+      setBacktesting(null)
     }
   }
 
@@ -612,7 +635,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
                 <Button onClick={() => void saveToLibrary()} disabled={!!savedId || !effectiveSpec} variant="outline" className="h-7 border-[#1c2739] px-3 text-[10px] uppercase tracking-wider text-[#7c8aa5] hover:text-cyan-300 disabled:opacity-40">
                   {savedId ? `saved: ${savedId}` : `save to library (${checkedKeys.size} signals)`}
                 </Button>
-                <Button onClick={() => effectiveSpec && void openDeploy('', effectiveSpec.name)} disabled={!effectiveSpec} className="h-7 bg-emerald-600 px-3 text-[10px] font-bold uppercase tracking-wider text-white hover:bg-emerald-500 disabled:opacity-40">
+                <Button onClick={() => effectiveSpec && result && void openDeploy('', effectiveSpec.name, result.asset, result.tf)} disabled={!effectiveSpec} className="h-7 bg-emerald-600 px-3 text-[10px] font-bold uppercase tracking-wider text-white hover:bg-emerald-500 disabled:opacity-40">
                   deploy as bot
                 </Button>
               </div>
@@ -630,7 +653,9 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
       {deployFor && (
         <div className="space-y-2 rounded-lg border border-emerald-600/40 bg-emerald-500/5 p-3">
           <div className="flex items-center justify-between">
-            <h4 className="text-[12px] font-semibold text-emerald-300">Deploy &quot;{deployFor.name}&quot; as an autonomous bot</h4>
+            <h4 className="text-[12px] font-semibold text-emerald-300">
+              Deploy &quot;{deployFor.name}&quot; as an autonomous bot <span className="text-[#7c8aa5]">· watching {deployFor.asset} {deployFor.tf}</span>
+            </h4>
             <Button variant="outline" size="sm" className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5]" onClick={() => setDeployFor(null)}>
               cancel
             </Button>
@@ -716,10 +741,16 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
                   >
                     {relearning === r.id ? 're-learning...' : 're-learn now'}
                   </Button>
-                  <Button variant="outline" size="sm" className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5] hover:text-emerald-400" onClick={() => void backtestRow(r.id)}>
-                    re-backtest
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={backtesting === r.id}
+                    className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5] hover:text-emerald-400 disabled:opacity-40"
+                    onClick={() => void backtestRow(r.id)}
+                  >
+                    {backtesting === r.id ? 're-backtesting...' : 're-backtest'}
                   </Button>
-                  <Button variant="outline" size="sm" className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5] hover:text-emerald-400" onClick={() => void openDeploy(r.id, r.spec.name)}>
+                  <Button variant="outline" size="sm" className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5] hover:text-emerald-400" onClick={() => void openDeploy(r.id, r.spec.name, r.asset, r.tf as Timeframe)}>
                     deploy
                   </Button>
                   <Button variant="outline" size="sm" className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5] hover:text-rose-400" onClick={() => void removeLab(r.id)}>
