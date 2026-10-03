@@ -518,9 +518,13 @@ export class StrategyLabService {
   backtestSpec(input: { spec?: unknown; id?: string; asset?: string; tf?: string; payout?: number; amount?: number; horizon?: number }): { ok: boolean; id?: string; asset: string; tf: Timeframe; spec: CustomSpec; backtest: SimMetrics; holdout: SimMetrics; breakevenWinRate: number } {
     let spec = normalizeSpec(input.spec, 'Inline Spec')
     let id: string | undefined
+    let savedRow: LabRow | null = null
     if (!spec && input.id) {
       const row = this.store.listLabStrategies().find((r) => r.id === input.id)
-      if (row) spec = normalizeSpec(row.spec, row.id)
+      if (row) {
+        spec = normalizeSpec(row.spec, row.id)
+        savedRow = { id: row.id, spec: spec!, asset: row.asset, tf: row.tf, stats: row.stats as LabRow['stats'], createdTs: row.createdTs, updatedTs: row.updatedTs }
+      }
       id = input.id
     }
     if (!spec) throw new Error('need a valid spec or a saved lab id')
@@ -538,6 +542,23 @@ export class StrategyLabService {
     const series = scoreSeriesFor(spec, ctx, candleHits)
     const backtest = simFromSeries(series, raw, 30, horizon, amount, payout, spec.minVotes, spec.minScore)
     const holdout = simFromSeries(series, raw, Math.floor(raw.length * 0.7), horizon, amount, payout, spec.minVotes, spec.minScore)
+    const breakevenWinRate = round2((1 / (1 + payout)) * 100)
+    // THE BUG this replaces: this method computed fresh numbers and just
+    // handed them back in the HTTP response - nothing was ever written to the
+    // saved row, so the UI's "re-backtest" button (which posts here, then
+    // reloads the library from the STORE) always showed the exact same old
+    // stats no matter how many times you clicked it. The library is now
+    // updated in place, same as relearnRow does for a full re-learn, so a
+    // plain re-backtest (same signals, fresh numbers) is actually visible.
+    if (savedRow) {
+      this.store.saveLabStrategy({
+        id: savedRow.id,
+        spec,
+        asset: savedRow.asset,
+        tf: savedRow.tf,
+        stats: { ...(savedRow.stats ?? {}), backtest, holdout, breakeven: breakevenWinRate },
+      })
+    }
     return {
       ok: true,
       id,
@@ -546,7 +567,7 @@ export class StrategyLabService {
       spec,
       backtest,
       holdout,
-      breakevenWinRate: round2((1 / (1 + payout)) * 100),
+      breakevenWinRate,
     }
   }
 

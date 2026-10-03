@@ -61,6 +61,10 @@ export interface BotConfig {
   /** Persisted roll state (pot/rollN/restarts/halted) - written by the
    * autopilot on every settle so the compounding streak survives restarts. */
   planState?: { pot: number; rollN: number; restarts: number; halted?: boolean; complete?: boolean }
+  /** Set when this bot was armed with force:true past a failing research
+   * gate - kept visible everywhere the fleet is listed so an unvalidated
+   * edge never quietly looks the same as a validated one. */
+  forcedUnvalidated?: boolean
 }
 
 export interface StakePlan {
@@ -256,6 +260,21 @@ export class AutopilotService {
    * clear to arm, or a `research-gate: ...` reason string when blocked. */
   private researchGate(bot: BotConfig): string | null {
     const MAX_AGE_SEC = 14 * 24 * 60 * 60 // 14 days - a stale pass doesn't mean much. v.ts is UNIX SECONDS (store.ts), not ms.
+    // THE BUG this replaces: the gate below required a `/walkforward` verdict
+    // for EVERY strategyId, but `/walkforward` resolves strategies through
+    // getStrategy() (builtin.ts), which only knows the fixed built-in
+    // registry - it has never heard of a custom:<slug> Strategy Lab spec and
+    // always returns undefined for one. That made this gate literally
+    // unpassable for any lab-learned strategy: "has never been walk-forward
+    // validated" would fire forever, no matter how many times you ran
+    // /walkforward, because that endpoint can't even look the strategy up.
+    // The scheduled re-validation sweep already knew this and exempted
+    // custom:* (see revalidateSweep below); this arm-time gate just hadn't
+    // caught up. Lab strategies DO carry their own validation though - the
+    // same holdout-split + out-of-sample-fold backtest shown in the AI Lab
+    // panel - so check that instead of demanding a verdict that can never
+    // exist.
+    if (bot.strategyId.startsWith('custom:')) return this.labResearchGate(bot)
     for (const asset of bot.watchlist) {
       const v = this.store.latestValidation(asset, bot.tf, bot.strategyId)
       if (!v) {
@@ -267,6 +286,32 @@ export class AutopilotService {
       if (Math.floor(Date.now() / 1000) - v.ts > MAX_AGE_SEC) {
         return `research-gate: ${asset} ${bot.tf} ${bot.strategyId}'s robust validation is stale (>14d old) - re-run /walkforward before arming`
       }
+    }
+    return null
+  }
+
+  /** The custom:* equivalent of researchGate() above: instead of a
+   * /walkforward verdict (which can't be produced for a lab spec at all),
+   * require that the strategy's OWN lab-measured stats actually clear
+   * breakeven on its holdout split and weren't flagged decayed by the lab's
+   * own re-learn sweep. A strategy that's never been through "learn this
+   * pair" at all (no stats saved yet) still blocks - this isn't a free pass,
+   * it's the lab-native version of the same bar. */
+  private labResearchGate(bot: BotConfig): string | null {
+    const lab = this.labService()
+    if (!lab) return `research-gate: ${bot.strategyId} can't be checked - Strategy Lab isn't loaded`
+    const row = lab.get(bot.strategyId)
+    if (!row) return `research-gate: ${bot.strategyId} not found in the Strategy Lab library`
+    const stats = row.stats as { holdout?: { winRate: number; trades: number }; breakeven?: number; decayed?: boolean } | null
+    if (!stats?.holdout) {
+      return `research-gate: ${bot.strategyId} has no saved holdout backtest yet - re-run "learn this pair" (or /lab_backtest) before arming`
+    }
+    if (stats.decayed) {
+      return `research-gate: ${bot.strategyId} was flagged DECAYED by the lab's own re-learn sweep - it no longer clears its own filters on fresh data; re-learn before arming`
+    }
+    const breakeven = stats.breakeven ?? 50
+    if (stats.holdout.winRate < breakeven) {
+      return `research-gate: ${bot.strategyId}'s holdout win rate (${stats.holdout.winRate.toFixed(1)}%) is below its own breakeven (${breakeven.toFixed(1)}%) - re-tune or re-learn before arming`
     }
     return null
   }
@@ -361,7 +406,7 @@ export class AutopilotService {
     }
   }
 
-  saveBot(input: Partial<BotConfig>): { ok: boolean; bot?: BotConfig; error?: string } {
+  saveBot(input: Partial<BotConfig>, opts: { force?: boolean } = {}): { ok: boolean; bot?: BotConfig; error?: string; forced?: boolean } {
     const id = input.id?.trim() || `bot-${Math.random().toString(36).slice(2, 8)}`
     const existing = this.store.listBots().find((b) => b.bot.id === id)?.bot
     const bot: BotConfig = {
@@ -401,14 +446,24 @@ export class AutopilotService {
     // research gate: only check when this save is what's arming the bot (new
     // enable, not every edit to an already-running one) so a stake tweak on a
     // live bot doesn't get blocked by a validation that's since gone stale.
+    let forced = false
     if (bot.enabled && !(existing?.enabled ?? false)) {
       const gate = this.researchGate(bot)
-      if (gate) return { ok: false, error: gate }
+      if (gate) {
+        if (!opts.force) return { ok: false, error: gate }
+        forced = true
+        this.emit('warn', `Bot "${bot.name}" FORCED past research gate - ${gate.replace(/^research-gate: /, '')}. Unvalidated edge, armed on explicit user override.`)
+      }
+      bot.forcedUnvalidated = forced
+    } else if (bot.enabled) {
+      // already-armed bot being re-saved (a stake tweak, say) - keep whatever
+      // forced flag it already had rather than silently clearing it
+      bot.forcedUnvalidated = input.forcedUnvalidated ?? existing?.forcedUnvalidated
     }
     this.store.saveBot(bot)
     if (!this.runtime.has(id)) this.runtime.set(id, this.buildRuntime(id))
     this.emit(bot.enabled ? 'success' : 'info', `Bot "${bot.name}" saved - ${bot.enabled ? 'ARMED' : 'idle'} (${bot.strategyId} · ${bot.tf} · ${bot.watchlist.join(', ')})`)
-    return { ok: true, bot }
+    return { ok: true, bot, forced }
   }
 
   deleteBot(id: string): { ok: boolean; error?: string } {
@@ -445,17 +500,23 @@ export class AutopilotService {
     return { ok: true, bot: this.store.listBots().find((b) => b.bot.id === id)?.bot }
   }
 
-  toggleBot(id: string, enabled?: boolean): { ok: boolean; bot?: BotConfig; error?: string } {
+  toggleBot(id: string, enabled?: boolean, opts: { force?: boolean } = {}): { ok: boolean; bot?: BotConfig; error?: string; forced?: boolean } {
     const found = this.store.listBots().find((b) => b.bot.id === id)
     if (!found) return { ok: false, error: 'bot not found' }
     const bot: BotConfig = { ...found.bot, enabled: enabled ?? !found.bot.enabled }
+    let forced = false
     if (bot.enabled && !found.bot.enabled) {
       const gate = this.researchGate(bot)
-      if (gate) return { ok: false, error: gate }
+      if (gate) {
+        if (!opts.force) return { ok: false, error: gate }
+        forced = true
+        this.emit('warn', `Bot "${bot.name}" FORCED past research gate - ${gate.replace(/^research-gate: /, '')}. Unvalidated edge, armed on explicit user override.`)
+      }
+      bot.forcedUnvalidated = forced
     }
     this.store.saveBot(bot)
     this.emit(bot.enabled ? 'success' : 'info', `Autopilot "${bot.name}" ${bot.enabled ? 'STARTED' : 'STOPPED'} - watching ${bot.watchlist.join(', ')} on ${bot.tf} (${bot.strategyId})`)
-    return { ok: true, bot }
+    return { ok: true, bot, forced }
   }
 
   // ---------- trading loop ----------

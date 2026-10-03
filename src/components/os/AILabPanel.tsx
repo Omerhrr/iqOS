@@ -426,6 +426,11 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
   }
 
   const [backtesting, setBacktesting] = useState<string | null>(null)
+  // Which library row's spec JSON is currently expanded inline - clicking a
+  // strategy's name toggles it, same "view the raw spec" need the fresh-learn
+  // result already has (its own <details> block), just not previously
+  // available once a strategy was saved into the library.
+  const [expandedLabId, setExpandedLabId] = useState<string | null>(null)
   const backtestRow = async (id: string) => {
     // Use the saved row's OWN asset/tf, not whatever pair the learn form
     // currently has selected - the library holds strategies learned on
@@ -710,11 +715,21 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
           <p className="mt-2 text-[11px] text-[#3d4d66]">Nothing learned yet - run &quot;learn this pair&quot; above, or ask the Copilot to study a pair for you.</p>
         ) : (
           <div className="mt-2 space-y-1.5">
-            {library.map((r) => (
-              <div key={r.id} className="flex flex-wrap items-center justify-between gap-2 rounded border border-[#141d2e] bg-[#0d1420] px-2.5 py-1.5">
+            {library.map((r) => {
+              const expanded = expandedLabId === r.id
+              return (
+              <div key={r.id} className="rounded border border-[#141d2e] bg-[#0d1420]">
+              <div className="flex flex-wrap items-center justify-between gap-2 px-2.5 py-1.5">
                 <div className="min-w-0">
                   <div className="flex items-center gap-2">
-                    <span className="truncate font-mono text-[11px] text-[#dbe4f0]">{r.spec.name}</span>
+                    <button
+                      type="button"
+                      onClick={() => setExpandedLabId(expanded ? null : r.id)}
+                      className="truncate font-mono text-[11px] text-[#dbe4f0] hover:text-cyan-300 hover:underline"
+                      title="view this strategy's spec JSON"
+                    >
+                      {r.spec.name}
+                    </button>
                     <span className="rounded border border-cyan-500/40 bg-cyan-500/10 px-1 py-0.5 font-mono text-[8px] uppercase text-cyan-300">lab</span>
                     {r.stats?.decayed && (
                       <span className="rounded border border-rose-500/40 bg-rose-500/10 px-1 py-0.5 font-mono text-[8px] uppercase text-rose-300" title="the auto re-learn sweep found this spec no longer clears its own filters / can't beat breakeven on fresh data - any bot trading it was auto-disarmed">
@@ -758,7 +773,14 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
                   </Button>
                 </div>
               </div>
-            ))}
+              {expanded && (
+                <div className="border-t border-[#141d2e] px-2.5 py-2">
+                  <pre className="max-h-64 overflow-auto font-mono text-[10px] leading-relaxed text-[#aab6cc]">{JSON.stringify(r.spec, null, 2)}</pre>
+                </div>
+              )}
+              </div>
+              )
+            })}
           </div>
         )}
       </div>
