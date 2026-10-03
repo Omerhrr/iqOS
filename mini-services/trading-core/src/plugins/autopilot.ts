@@ -701,6 +701,11 @@ export class AutopilotService {
 
     // execute - the ExecutionService risk manager is the final gate
     const bet = this.stakeFor(bot, rt)
+    // THE BUG: this used to hardcode mode: 'paper' - every bot traded the
+    // paper ledger no matter which ledger the operator was actually on, so a
+    // bot created/armed while connected to a real IQ session silently placed
+    // (and reported) paper trades instead of real ones. Mirror whatever
+    // ledger is actually active, exactly like the manual trade path does.
     const out = await this.exec.placeOrder({
       asset,
       tf,
@@ -709,7 +714,7 @@ export class AutopilotService {
       amount: bet.amount,
       expiryBars: bot.expiryBars,
       expirySec: bot.kind === 'digital' ? bot.expirySec : undefined,
-      mode: 'paper',
+      mode: this.exec.accountSource === 'iq' ? 'live' : 'paper',
       strategy: bot.strategyId,
       note: `bot:${bot.id}`,
     })

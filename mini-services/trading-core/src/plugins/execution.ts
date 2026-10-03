@@ -258,10 +258,15 @@ export class ExecutionService {
     note?: string
   }): Promise<{ ok: boolean; position?: Position; error?: string }> {
     const mode = req.mode ?? 'paper'
-    if (mode === 'live') return this.placeLiveOrder(req)
-
+    // THE BUG: riskCheck() (daily-loss limit, max stake, max concurrent
+    // positions, loss-streak cooldown, sentinel pre-trade, market-hours) used
+    // to run only on this paper path - a live order went straight to the
+    // broker with ZERO governance. That was already reachable from manual
+    // live trades and is now also reachable from any bot once it's on the IQ
+    // ledger, so it has to gate both paths identically.
     const check = this.riskCheck(req.asset, req.amount)
     if (!check.ok) return { ok: false, error: check.reason }
+    if (mode === 'live') return this.placeLiveOrder(req)
 
     const assetInfo = this.market.assets.find((a) => a.ticker === req.asset)
     if (!assetInfo) return { ok: false, error: `unknown asset ${req.asset}` }
