@@ -7,12 +7,112 @@
 // an honest holdout split) and can deploy it straight to the bot fleet - the
 // learned spec becomes a first-class strategyId (custom:<id>) the autopilot
 // trades, compound plans included.
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { AssetRow, LabLearnResult, LabSimMetrics, LabStrategyRow, Timeframe, TradeKind } from '@/lib/os/client'
 import { fmtMoney, osGet, osPost } from '@/lib/os/client'
 import { TIMEFRAMES } from '@/lib/os/client'
+
+type Basis = 'candles' | 'heikin' | 'kalman' | 'typical' | 'smoothed'
+const BASIS_OPTIONS: { value: Basis; label: string }[] = [
+  { value: 'candles', label: 'raw candles' },
+  { value: 'heikin', label: 'heiken-ashi' },
+  { value: 'kalman', label: 'kalman-smoothed' },
+  { value: 'typical', label: 'typical-price (HLC3)' },
+  { value: 'smoothed', label: 'sma-smoothed (3-bar)' },
+]
+
+// Same searchable-combobox pattern as Backtest Lab's StrategyPicker -
+// a plain <select> with 60+ pairs in it meant scrolling through an
+// alphabetical wall to find one; this filters as you type instead.
+function AssetPicker({ tickers, value, onChange }: { tickers: string[]; value: string; onChange: (t: string) => void }) {
+  const [open, setOpen] = useState(false)
+  const [query, setQuery] = useState('')
+  const [highlight, setHighlight] = useState(0)
+  const rootRef = useRef<HTMLDivElement>(null)
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    if (!q) return tickers
+    return tickers.filter((t) => t.toLowerCase().includes(q))
+  }, [tickers, query])
+
+  useEffect(() => {
+    if (!open) return
+    const onDocClick = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', onDocClick)
+    return () => document.removeEventListener('mousedown', onDocClick)
+  }, [open])
+
+  useEffect(() => {
+    if (open) {
+      setQuery('')
+      setHighlight(0)
+    }
+  }, [open])
+
+  const pick = (t: string) => {
+    onChange(t)
+    setOpen(false)
+  }
+
+  return (
+    <div ref={rootRef} className="relative w-28">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex h-7 w-full items-center justify-between rounded border border-[#1c2739] bg-[#101828] px-2 text-left font-mono text-[11px] text-[#dbe4f0]"
+      >
+        <span className="truncate">{value}</span>
+        <span className="ml-1 shrink-0 text-[#4b5a72]">▾</span>
+      </button>
+      {open && (
+        <div className="absolute left-0 top-[calc(100%+2px)] z-20 w-48 rounded border border-[#1c2739] bg-[#0b111c] shadow-lg">
+          <input
+            autoFocus
+            value={query}
+            onChange={(e) => {
+              setQuery(e.target.value)
+              setHighlight(0)
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'ArrowDown') {
+                e.preventDefault()
+                setHighlight((h) => Math.min(h + 1, filtered.length - 1))
+              } else if (e.key === 'ArrowUp') {
+                e.preventDefault()
+                setHighlight((h) => Math.max(h - 1, 0))
+              } else if (e.key === 'Enter') {
+                e.preventDefault()
+                if (filtered[highlight]) pick(filtered[highlight])
+              } else if (e.key === 'Escape') {
+                setOpen(false)
+              }
+            }}
+            placeholder="Search pairs…"
+            className="w-full border-b border-[#1c2739] bg-[#101828] px-2 py-1.5 font-mono text-[11px] text-[#dbe4f0] outline-none"
+          />
+          <div className="max-h-64 overflow-auto py-1">
+            {filtered.length === 0 && <div className="px-2 py-1.5 font-mono text-[11px] text-[#4b5a72]">No matches</div>}
+            {filtered.map((t, i) => (
+              <div
+                key={t}
+                onMouseEnter={() => setHighlight(i)}
+                onClick={() => pick(t)}
+                className={`cursor-pointer px-2 py-1.5 font-mono text-[11px] ${i === highlight ? 'bg-[#1c2739] text-[#dbe4f0]' : 'text-[#9aa8bd]'} ${t === value ? 'border-l-2 border-cyan-400' : ''}`}
+              >
+                {t}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
 
 interface AILabPanelProps {
   assets: AssetRow[]
@@ -127,7 +227,7 @@ function FoldsStrip({ folds, foldsProfitable, breakeven }: { folds: LabSimMetric
 export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelProps) {
   const [asset, setAsset] = useState('EURUSD')
   const [tf, setTf] = useState<Timeframe>('1m')
-  const [basis, setBasis] = useState<'candles' | 'heikin' | 'kalman'>('candles')
+  const [basis, setBasis] = useState<Basis>('candles')
   const [bars, setBars] = useState(1200)
   const [horizon, setHorizon] = useState(1)
   const [minSamples, setMinSamples] = useState(30)
@@ -174,7 +274,8 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
     try {
       const res = await osPost<LabLearnResult>('/lab_learn', { asset, tf, basis, bars, horizon, minSamples, minEdge, maxSignals, payout })
       setResult(res)
-      setSavedName(`${asset} ${tf} Lab${basis === 'heikin' ? ' HA' : basis === 'kalman' ? ' KAL' : ''}`)
+      const basisSuffix = { candles: '', heikin: ' HA', kalman: ' KAL', typical: ' TYP', smoothed: ' SMA' }[basis]
+      setSavedName(`${asset} ${tf} Lab${basisSuffix}`)
     } catch (e) {
       onError((e as Error).message)
     } finally {
@@ -316,13 +417,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
         <div className="mt-2 flex flex-wrap items-end gap-2">
           <label className="flex flex-col gap-0.5">
             <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">pair</span>
-            <select value={asset} onChange={(e) => setAsset(e.target.value)} className="h-7 rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-[#dbe4f0]">
-              {(tickers.length ? tickers : ['EURUSD']).map((t) => (
-                <option key={t} value={t}>
-                  {t}
-                </option>
-              ))}
-            </select>
+            <AssetPicker tickers={tickers.length ? tickers : ['EURUSD']} value={asset} onChange={setAsset} />
           </label>
           <label className="flex flex-col gap-0.5">
             <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">tf</span>
@@ -336,10 +431,17 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
           </label>
           <label className="flex flex-col gap-0.5">
             <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">basis</span>
-            <select value={basis} onChange={(e) => setBasis(e.target.value as 'candles' | 'heikin' | 'kalman')} className="h-7 rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-[#dbe4f0]" title="what the agent reads: raw candles, the Heiken-Ashi transform, or a Kalman-smoothed trend series - outcomes always settle on real prices">
-              <option value="candles">raw candles</option>
-              <option value="heikin">heiken-ashi</option>
-              <option value="kalman">kalman-smoothed</option>
+            <select
+              value={basis}
+              onChange={(e) => setBasis(e.target.value as Basis)}
+              className="h-7 rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-[#dbe4f0]"
+              title="what the agent reads: raw candles, Heiken-Ashi, a Kalman-smoothed trend series, typical-price (HLC3), or a 3-bar SMA smooth - outcomes always settle on real prices"
+            >
+              {BASIS_OPTIONS.map((b) => (
+                <option key={b.value} value={b.value}>
+                  {b.label}
+                </option>
+              ))}
             </select>
           </label>
           <NumField label="bars" value={bars} onChange={setBars} w="w-16" />
@@ -364,7 +466,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
           </Button>
         </div>
         <p className="mt-2 text-[10px] leading-snug text-[#7c8aa5]">
-          Mines candlestick patterns, wide-range bar formations, Heiken Ashi structures, line breaks (Donchian / HH-HL) and its own invented indicators (RSI, BB %B, z-score, Donchian position, MACD-z, slope, streak, wick bias, EMA spread, HA distance, close position) - then weights the survivors by measured edge and backtests the composition. The <span className="text-[#aab6cc]">basis</span> switch learns on raw candles, the Heiken-Ashi view, OR a Kalman-smoothed trend series (a lightweight filter that tracks price while damping intrabar noise - like trading a de-chopped line rather than the raw candle) - whichever basis, outcomes always settle on real prices and the deployed bot trades the same basis it learned on. Thin history auto-relaxes the min-samples floor instead of failing.
+          Mines candlestick patterns, wide-range bar formations, Heiken Ashi structures, line breaks (Donchian / HH-HL), multi-timeframe EMA-trend agreement (resampled 5x/15x) and its own invented indicators (RSI, BB %B, z-score, Donchian position, MACD-z, slope, streak, wick bias, EMA spread, HA distance, close position) - then weights the survivors by their Wilson-score confidence-adjusted edge (not just the raw win rate, so a lucky small sample can&apos;t outrank a well-sampled one) and backtests the composition. The <span className="text-[#aab6cc]">basis</span> switch picks what every signal actually reads: raw candles, Heiken-Ashi, a Kalman-smoothed trend line, typical-price (HLC3, folds the whole bar&apos;s range into one number), or a plain 3-bar SMA smooth - whichever basis, outcomes always settle on real prices and the deployed bot trades the same basis it learned on. Thin history auto-relaxes the min-samples floor instead of failing. Saved strategies are automatically re-learned every ~6h to catch decay (see the library below).
         </p>
       </div>
 
@@ -374,7 +476,11 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
           <div className={`rounded border px-2 py-1.5 font-mono text-[11px] ${result.ok ? 'border-emerald-500/30 bg-emerald-500/5 text-emerald-300' : 'border-amber-500/30 bg-amber-500/5 text-amber-300'}`}>{result.note}</div>
           <div className="flex flex-wrap items-center gap-2 font-mono text-[10px] text-[#4b5a72]">
             <span>
-              {result.asset} · {result.tf} · <span className={result.basis !== 'candles' ? 'text-emerald-300' : ''}>{result.basis === 'heikin' ? 'heiken-ashi basis' : result.basis === 'kalman' ? 'kalman-smoothed basis' : 'raw candle basis'}</span> · {result.candlesTested} bars · horizon {result.horizon} · min n {result.minSamples} · min edge {result.minEdge}pts
+              {result.asset} · {result.tf} ·{' '}
+              <span className={result.basis !== 'candles' ? 'text-emerald-300' : ''}>
+                {BASIS_OPTIONS.find((b) => b.value === result.basis)?.label ?? 'raw candles'} basis
+              </span>{' '}
+              · {result.candlesTested} bars · horizon {result.horizon} · min n {result.minSamples} · min edge {result.minEdge}pts
             </span>
             {result.regime && (
               <span className={`rounded border px-1.5 py-0.5 text-[9px] uppercase ${REGIME_STYLE[result.regime] ?? REGIME_STYLE.MIXED}`} title="market regime detected over the learned window">

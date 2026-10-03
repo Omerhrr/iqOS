@@ -130,12 +130,18 @@ export interface CustomSpec {
   horizon: number
   /** The candle basis the spec was learned on and trades on: 'candles' (raw,
    * default), 'heikin' (every signal reads the Heiken-Ashi transform of the
-   * feed), or 'kalman' (every signal reads a Kalman-smoothed trend series -
+   * feed), 'kalman' (every signal reads a Kalman-smoothed trend series -
    * denoises intrabar chop, similar in spirit to Heiken-Ashi but a genuinely
-   * different filter). Outcomes/settlement are ALWAYS measured on real
-   * prices either way. */
-  basis?: 'candles' | 'heikin' | 'kalman'
+   * different filter), 'typical' (HLC3 typical-price candles - a cheap,
+   * well-known smoothing that folds the whole bar's range into one number
+   * instead of just the close), or 'smoothed' (a 3-bar SMA of price - the
+   * lightest-touch denoise of the set, reacts faster than Kalman/typical but
+   * damps single-bar noise spikes). Outcomes/settlement are ALWAYS measured
+   * on real prices, whichever basis the signals themselves read. */
+  basis?: Basis
 }
+
+export type Basis = 'candles' | 'heikin' | 'kalman' | 'typical' | 'smoothed'
 
 // ---------- heiken ashi ----------
 
@@ -219,10 +225,48 @@ export function kalmanCandles(candles: Candle[], q = 0.05): Candle[] {
   return out
 }
 
+/** Typical-price candles: close -> (H+L+C)/3, a well-known smoothing that
+ * folds the whole bar's range into one number instead of just the close
+ * print. High/low/open are widened/kept the same way kalmanCandles does, so
+ * wick-reading signals still see genuine market range. */
+export function typicalCandles(candles: Candle[]): Candle[] {
+  const n = candles.length
+  const typical = candles.map((k) => (k.high + k.low + k.close) / 3)
+  const out: Candle[] = new Array(n)
+  for (let i = 0; i < n; i++) {
+    const k = candles[i]
+    const close = typical[i]
+    const open = i === 0 ? k.open : typical[i - 1]
+    out[i] = { time: k.time, open, close, high: Math.max(k.high, open, close), low: Math.min(k.low, open, close), volume: k.volume }
+  }
+  return out
+}
+
+/** Lightest-touch basis of the set: a plain 3-bar SMA of the close, nothing
+ * more. Reacts faster to new moves than Kalman or typical-price (shorter
+ * effective lookback), while still damping single-bar noise spikes - a
+ * cheap baseline to check whether the heavier filters are earning their
+ * keep on a given pair. */
+export function smoothedCandles(candles: Candle[], period = 3): Candle[] {
+  const n = candles.length
+  const closes = candles.map((k) => k.close)
+  const sma = ta.sma(closes, period)
+  const out: Candle[] = new Array(n)
+  for (let i = 0; i < n; i++) {
+    const k = candles[i]
+    const close = Number.isFinite(sma[i]) ? sma[i] : k.close
+    const prevClose = i === 0 ? k.open : Number.isFinite(sma[i - 1]) ? sma[i - 1] : closes[i - 1]
+    out[i] = { time: k.time, open: prevClose, close, high: Math.max(k.high, prevClose, close), low: Math.min(k.low, prevClose, close), volume: k.volume }
+  }
+  return out
+}
+
 /** The candle series a spec's signals are evaluated on (raw or a transform). */
 export function basisCandles(spec: Pick<CustomSpec, 'basis'>, candles: Candle[]): Candle[] {
   if (spec.basis === 'heikin') return heikinAshiCandles(candles)
   if (spec.basis === 'kalman') return kalmanCandles(candles)
+  if (spec.basis === 'typical') return typicalCandles(candles)
+  if (spec.basis === 'smoothed') return smoothedCandles(candles)
   return candles
 }
 
@@ -965,12 +1009,12 @@ export function normalizeSpec(raw: unknown, fallbackName = 'Learned Strategy'): 
     minScore: clampN(r.minScore, 5, 95, 45),
     minVotes: Math.round(clampN(r.minVotes, 1, 6, 1)),
     horizon: Math.round(clampN(r.horizon, 1, 10, 1)),
-    // THE BUG: this only ever preserved basis:'heikin' on round-trip - a
-    // saved spec learned on the kalman basis silently reverted to raw
-    // candles (basis undefined) the next time it was loaded from storage
-    // and re-normalized, quietly changing what every signal actually reads
-    // without changing a single number in the spec itself.
-    ...(r.basis === 'heikin' || r.basis === 'kalman' ? { basis: r.basis } : {}),
+    // THE BUG this originally fixed: this only ever preserved basis:'heikin'
+    // on round-trip - a saved spec learned on the kalman basis silently
+    // reverted to raw candles (basis undefined) the next time it was loaded
+    // from storage and re-normalized, quietly changing what every signal
+    // actually reads without changing a single number in the spec itself.
+    ...(r.basis === 'heikin' || r.basis === 'kalman' || r.basis === 'typical' || r.basis === 'smoothed' ? { basis: r.basis } : {}),
   }
 }
 

@@ -17,10 +17,13 @@ import {
   evaluateCustom,
   heikinAshiCandles,
   kalmanCandles,
+  typicalCandles,
+  smoothedCandles,
   labelOf,
   normalizeSpec,
   prepareSignal,
   slugify,
+  type Basis,
   type CustomSpec,
   type EvalCtx,
   type SignalDef,
@@ -40,7 +43,7 @@ export interface LearnOptions {
   payout?: number // binary payout used in the backtest (default 0.7 = house cap)
   amount?: number // backtest stake (default 10)
   name?: string // spec name override
-  basis?: 'candles' | 'heikin' | 'kalman' // what the signals read: raw OHLC, Heiken-Ashi, or Kalman-smoothed
+  basis?: Basis // what the signals read: raw OHLC, Heiken-Ashi, Kalman-smoothed, typical-price, or SMA-smoothed
 }
 
 export interface SignalStat {
@@ -84,7 +87,7 @@ export interface LearnResult {
   ok: boolean
   asset: string
   tf: Timeframe
-  basis: 'candles' | 'heikin' | 'kalman'
+  basis: Basis
   candlesTested: number
   horizon: number
   minSamples: number
@@ -276,7 +279,7 @@ export class StrategyLabService {
     const payout = Math.max(0.5, Math.min(0.95, Number(opts.payout ?? 0.7)))
     const amount = Math.max(1, Number(opts.amount ?? 10))
     const bars = Math.max(300, Math.min(2200, Math.round(opts.bars ?? 1200)))
-    const basis: 'candles' | 'heikin' | 'kalman' = opts.basis === 'heikin' ? 'heikin' : opts.basis === 'kalman' ? 'kalman' : 'candles'
+    const basis: Basis = opts.basis === 'heikin' || opts.basis === 'kalman' || opts.basis === 'typical' || opts.basis === 'smoothed' ? opts.basis : 'candles'
 
     const raw = this.market.getCandlesDeep(asset, tf, bars)
     if (raw.length < 120) throw new Error(`not enough history for ${asset} ${tf} (${raw.length} bars, need 120+)`)
@@ -286,7 +289,8 @@ export class StrategyLabService {
     const warm = 30
     const minSamples = Math.max(10, Math.min(minSamplesAsk, Math.floor((raw.length - warm - horizon) / 6)))
     // signals read the chosen basis; outcomes/settlement are ALWAYS real prices
-    const candles = basis === 'heikin' ? heikinAshiCandles(raw) : basis === 'kalman' ? kalmanCandles(raw) : raw
+    const candles =
+      basis === 'heikin' ? heikinAshiCandles(raw) : basis === 'kalman' ? kalmanCandles(raw) : basis === 'typical' ? typicalCandles(raw) : basis === 'smoothed' ? smoothedCandles(raw) : raw
     const settle = raw.map((c) => c.close)
     const n = candles.length
     const ctx = buildCtx(candles)
@@ -427,7 +431,7 @@ export class StrategyLabService {
     // ---- spec + threshold calibration ----
     const spec: CustomSpec = {
       name: opts.name?.trim() || `${asset} ${tf} Learned`,
-      description: `Learned by the Strategy Lab from ${n} x ${tf} bars of ${asset}${basis === 'heikin' ? ' on the Heiken-Ashi basis' : basis === 'kalman' ? ' on the Kalman-smoothed basis' : ''}: ${selected.length} edge-bearing signals (win-rate edge ${Math.min(...selected.map((s) => s.edgePts))}-${Math.max(...selected.map((s) => s.edgePts))} pts, horizon ${horizon} bar${horizon > 1 ? 's' : ''}).`,
+      description: `Learned by the Strategy Lab from ${n} x ${tf} bars of ${asset}${basis !== 'candles' ? ` on the ${basisLabel(basis)} basis` : ''}: ${selected.length} edge-bearing signals (win-rate edge ${Math.min(...selected.map((s) => s.edgePts))}-${Math.max(...selected.map((s) => s.edgePts))} pts, horizon ${horizon} bar${horizon > 1 ? 's' : ''}).`,
       signals: selected.map((m) => {
         const def = { ...byKey.get(m.key)!.def, weight: m.weight }
         return def
@@ -496,7 +500,7 @@ export class StrategyLabService {
       foldsProfitable,
       confluenceWeak,
       regime,
-      note: `learned ${selected.length}-signal ${basis === 'heikin' ? 'HEIKIN-ASHI ' : basis === 'kalman' ? 'KALMAN-SMOOTHED ' : ''}spec "${spec.name}" (minScore ${spec.minScore}, minVotes ${minVotes}${confluenceWeak ? ' - confluence guard degraded to a single signal' : ''}); full-sample win rate ${backtest.winRate.toFixed(1)}% vs breakeven ${((1 / (1 + payout)) * 100).toFixed(1)}%, holdout (last 30%) ${holdout.trades} trades @ ${holdout.winRate.toFixed(1)}%, ${foldsProfitable}/${holdoutFolds.length || FOLD_COUNT} OOS folds profitable, regime at learn time: ${regime}`,
+      note: `learned ${selected.length}-signal ${basis !== 'candles' ? `${basisLabel(basis).toUpperCase()} ` : ''}spec "${spec.name}" (minScore ${spec.minScore}, minVotes ${minVotes}${confluenceWeak ? ' - confluence guard degraded to a single signal' : ''}); full-sample win rate ${backtest.winRate.toFixed(1)}% vs breakeven ${((1 / (1 + payout)) * 100).toFixed(1)}%, holdout (last 30%) ${holdout.trades} trades @ ${holdout.winRate.toFixed(1)}%, ${foldsProfitable}/${holdoutFolds.length || FOLD_COUNT} OOS folds profitable, regime at learn time: ${regime}`,
     }
   }
 
@@ -669,6 +673,11 @@ function scanCandleHits(candles: Candle[]): CandleHits {
 /** Restore the library's display casing from a lowercased key. */
 function displayName(lower: string): string {
   return lower.replace(/\b\w/g, (c) => c.toUpperCase())
+}
+
+/** Human label for a basis, for descriptions/notes. */
+function basisLabel(basis: Basis): string {
+  return { candles: 'raw candle', heikin: 'Heiken-Ashi', kalman: 'Kalman-smoothed', typical: 'typical-price', smoothed: 'SMA-smoothed' }[basis]
 }
 
 /** Per-bar vote series for a spec, using exactly the live-evaluation math
