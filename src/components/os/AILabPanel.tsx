@@ -12,7 +12,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { AssetRow, LabLearnResult, LabSignalDef, LabSimMetrics, LabSpec, LabStrategyRow, Timeframe, TradeKind } from '@/lib/os/client'
 import { fmtMoney, osGet, osPost } from '@/lib/os/client'
-import { TIMEFRAMES, TIMEFRAME_SECONDS } from '@/lib/os/client'
+import { TIMEFRAMES, TIMEFRAME_SECONDS, SIGNAL_TEMPLATES, labelOfSignal } from '@/lib/os/client'
 
 type Basis = 'candles' | 'heikin' | 'kalman' | 'typical' | 'smoothed'
 const BASIS_OPTIONS: { value: Basis; label: string }[] = [
@@ -258,6 +258,141 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
   const [savedName, setSavedName] = useState('')
   const [savedId, setSavedId] = useState<string | null>(null)
   const [library, setLibrary] = useState<LabStrategyRow[]>([])
+
+  // ---- manual strategy builder: compose a spec by hand from the same
+  // vocabulary the learner mines, instead of only ever getting one out of
+  // "learn this pair". Saved/backtested/deployed through the exact same
+  // endpoints a learned spec uses (normalizeSpec on the backend already
+  // accepts any well-formed SignalDef, learned or hand-built). ----
+  const [manualSignals, setManualSignals] = useState<{ uid: string; def: LabSignalDef }[]>([])
+  const [manualTemplateIdx, setManualTemplateIdx] = useState(0)
+  const [manualIsCandle, setManualIsCandle] = useState(false)
+  const [manualCandleName, setManualCandleName] = useState('')
+  const [manualDir, setManualDir] = useState<'call' | 'put'>(SIGNAL_TEMPLATES[0].dir)
+  const [manualWeight, setManualWeight] = useState(10)
+  const [manualName, setManualName] = useState('')
+  const [manualBasis, setManualBasis] = useState<Basis>('candles')
+  const [manualMinScore, setManualMinScore] = useState(45)
+  const [manualMinVotes, setManualMinVotes] = useState(2)
+  const [manualHorizon, setManualHorizon] = useState(1)
+  const [manualBacktest, setManualBacktest] = useState<{ backtest: LabSimMetrics; holdout: LabSimMetrics; breakevenWinRate: number } | null>(null)
+  const [manualBacktesting, setManualBacktesting] = useState(false)
+  const [manualSavedId, setManualSavedId] = useState<string | null>(null)
+  const [manualSaving, setManualSaving] = useState(false)
+  const [manualDeploying, setManualDeploying] = useState(false)
+
+  const templatesByKind = useMemo(() => {
+    const groups = new Map<string, { idx: number; label: string }[]>()
+    SIGNAL_TEMPLATES.forEach((t, idx) => {
+      const list = groups.get(t.kind) ?? []
+      list.push({ idx, label: labelOfSignal(t) })
+      groups.set(t.kind, list)
+    })
+    return groups
+  }, [])
+
+  // Any change to the spec's actual content invalidates a previous
+  // save/backtest - without this, editing signals after saving left the
+  // "saved: <id>" button permanently disabled while silently pointing at a
+  // DIFFERENT, stale spec than the one now built.
+  useEffect(() => {
+    setManualSavedId(null)
+    setManualBacktest(null)
+  }, [manualSignals, manualMinScore, manualMinVotes, manualHorizon, manualBasis, manualName])
+
+  const addManualSignal = () => {
+    const def: LabSignalDef = manualIsCandle
+      ? { kind: 'candle', name: manualCandleName.trim().slice(0, 40), dir: manualDir, weight: manualWeight }
+      : { ...SIGNAL_TEMPLATES[manualTemplateIdx], dir: manualDir, weight: manualWeight }
+    if (manualIsCandle && !manualCandleName.trim()) {
+      onError('enter a candlestick pattern name (e.g. "Hammer", "Engulfing")')
+      return
+    }
+    setManualSignals((prev) => [...prev, { uid: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, def }])
+    if (manualIsCandle) setManualCandleName('')
+  }
+
+  const removeManualSignal = (uid: string) => setManualSignals((prev) => prev.filter((s) => s.uid !== uid))
+
+  const buildManualSpec = (): LabSpec | null => {
+    if (!manualSignals.length) return null
+    return {
+      name: manualName.trim() || `${asset} ${tf} Manual`,
+      signals: manualSignals.map((s) => s.def),
+      minScore: manualMinScore,
+      minVotes: manualMinVotes,
+      horizon: manualHorizon,
+      ...(manualBasis !== 'candles' ? { basis: manualBasis } : {}),
+    }
+  }
+
+  const backtestManual = async () => {
+    const spec = buildManualSpec()
+    if (!spec) return
+    setManualBacktesting(true)
+    try {
+      const res = await osPost<{ ok: boolean; backtest: LabSimMetrics; holdout: LabSimMetrics; breakevenWinRate: number; error?: string }>('/lab_backtest', {
+        spec,
+        asset,
+        tf,
+        payout,
+      })
+      if (!res.ok) throw new Error(res.error ?? 'backtest failed')
+      setManualBacktest(res)
+    } catch (e) {
+      onError((e as Error).message)
+    } finally {
+      setManualBacktesting(false)
+    }
+  }
+
+  const saveManual = async () => {
+    const spec = buildManualSpec()
+    if (!spec) return
+    setManualSaving(true)
+    try {
+      const res = await osPost<{ ok: boolean; id: string }>('/lab_save', {
+        name: spec.name,
+        spec,
+        asset,
+        tf,
+        stats: manualBacktest ? { backtest: manualBacktest.backtest, holdout: manualBacktest.holdout, breakeven: manualBacktest.breakevenWinRate } : undefined,
+      })
+      setManualSavedId(res.id)
+      loadLibrary()
+    } catch (e) {
+      onError((e as Error).message)
+    } finally {
+      setManualSaving(false)
+    }
+  }
+
+  const deployManual = async () => {
+    const spec = buildManualSpec()
+    if (!spec) return
+    setManualDeploying(true)
+    try {
+      let id = manualSavedId
+      if (!id) {
+        const res = await osPost<{ ok: boolean; id: string }>('/lab_save', {
+          name: spec.name,
+          spec,
+          asset,
+          tf,
+          stats: manualBacktest ? { backtest: manualBacktest.backtest, holdout: manualBacktest.holdout, breakeven: manualBacktest.breakevenWinRate } : undefined,
+        })
+        id = res.id
+        setManualSavedId(res.id)
+        loadLibrary()
+      }
+      await openDeploy(id, spec.name, asset, tf, spec.horizon)
+    } catch (e) {
+      onError((e as Error).message)
+    } finally {
+      setManualDeploying(false)
+    }
+  }
+
   // THE BUG this replaces: deployFor used to carry only {id, name}, and
   // deploy() built the bot's watchlist/tf from the LEARN FORM's current pair
   // selector - whatever `asset`/`tf` happened to be showing - instead of the
@@ -555,6 +690,124 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
         <p className="mt-2 text-[10px] leading-snug text-[#7c8aa5]">
           Mines candlestick patterns, wide-range bar formations, Heiken Ashi structures, line breaks (Donchian / HH-HL), multi-timeframe EMA-trend agreement (resampled 5x/15x) and its own invented indicators (RSI, BB %B, z-score, Donchian position, MACD-z, slope, streak, wick bias, EMA spread, HA distance, close position) - then weights the survivors by their Wilson-score confidence-adjusted edge (not just the raw win rate, so a lucky small sample can&apos;t outrank a well-sampled one) and backtests the composition. The <span className="text-[#aab6cc]">basis</span> switch picks what every signal actually reads: raw candles, Heiken-Ashi, a Kalman-smoothed trend line, typical-price (HLC3, folds the whole bar&apos;s range into one number), or a plain 3-bar SMA smooth - whichever basis, outcomes always settle on real prices and the deployed bot trades the same basis it learned on. Thin history auto-relaxes the min-samples floor instead of failing. Saved strategies are automatically re-learned every ~6h to catch decay (see the library below).
         </p>
+      </div>
+
+      {/* manual strategy builder */}
+      <div className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-3">
+        <div className="flex items-center justify-between">
+          <h3 className="text-[12px] font-semibold uppercase tracking-wider text-violet-300">Build a strategy manually</h3>
+          <span className="font-mono text-[9px] text-[#4b5a72]">pick signals from the same vocabulary the learner mines - no mining required</span>
+        </div>
+        <p className="mt-1 text-[10px] leading-snug text-[#7c8aa5]">
+          Uses the <span className="text-[#aab6cc]">pair/tf/payout</span> selected above. Backtest, save and deploy run through the exact same pipeline a learned spec does - including the horizon-locked expiry on deploy.
+        </p>
+
+        <div className="mt-2 flex flex-wrap items-end gap-2">
+          <label className="flex items-center gap-1.5 font-mono text-[10px] text-[#aab6cc]">
+            <input type="checkbox" checked={manualIsCandle} onChange={(e) => setManualIsCandle(e.target.checked)} className="accent-violet-500" />
+            custom candlestick pattern
+          </label>
+          {manualIsCandle ? (
+            <label className="flex flex-col gap-0.5">
+              <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">pattern name</span>
+              <Input
+                value={manualCandleName}
+                onChange={(e) => setManualCandleName(e.target.value)}
+                placeholder="e.g. Hammer, Engulfing"
+                className="h-7 w-40 border-[#1c2739] bg-[#101828] font-mono text-[11px] text-[#dbe4f0]"
+              />
+            </label>
+          ) : (
+            <label className="flex flex-col gap-0.5">
+              <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">signal template</span>
+              <select
+                value={manualTemplateIdx}
+                onChange={(e) => {
+                  const idx = Number(e.target.value)
+                  setManualTemplateIdx(idx)
+                  setManualDir(SIGNAL_TEMPLATES[idx].dir)
+                }}
+                className="h-7 w-64 rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-[#dbe4f0]"
+              >
+                {Array.from(templatesByKind.entries()).map(([kind, items]) => (
+                  <optgroup key={kind} label={kind.toUpperCase()}>
+                    {items.map(({ idx, label }) => (
+                      <option key={idx} value={idx}>
+                        {label}
+                      </option>
+                    ))}
+                  </optgroup>
+                ))}
+              </select>
+            </label>
+          )}
+          <label className="flex flex-col gap-0.5">
+            <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">dir</span>
+            <select value={manualDir} onChange={(e) => setManualDir(e.target.value as 'call' | 'put')} className="h-7 rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-[#dbe4f0]">
+              <option value="call">CALL</option>
+              <option value="put">PUT</option>
+            </select>
+          </label>
+          <NumField label="weight" value={manualWeight} onChange={setManualWeight} w="w-14" />
+          <Button onClick={addManualSignal} variant="outline" className="h-7 border-violet-500/40 px-3 text-[10px] font-bold uppercase tracking-wider text-violet-300 hover:bg-violet-500/10">
+            + add signal
+          </Button>
+        </div>
+
+        {manualSignals.length > 0 && (
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {manualSignals.map((s) => (
+              <span key={s.uid} className="flex items-center gap-1.5 rounded border border-[#1c2739] bg-[#101828] px-2 py-1 font-mono text-[10px]">
+                <span className={`rounded border px-1 py-0.5 text-[8px] uppercase ${KIND_CHIP[s.def.kind] ?? 'text-[#7c8aa5] border-[#1c2739]'}`}>{s.def.kind}</span>
+                <span className="text-[#dbe4f0]">{labelOfSignal(s.def)}</span>
+                <span className={s.def.dir === 'call' ? 'text-emerald-400' : 'text-rose-400'}>{s.def.dir.toUpperCase()}</span>
+                <span className="text-cyan-300">w{s.def.weight}</span>
+                <button type="button" onClick={() => removeManualSignal(s.uid)} className="text-[#4b5a72] hover:text-rose-400" title="remove">
+                  ✕
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
+
+        <div className="mt-3 flex flex-wrap items-end gap-2">
+          <label className="flex flex-col gap-0.5">
+            <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">name</span>
+            <Input value={manualName} onChange={(e) => setManualName(e.target.value)} placeholder={`${asset} ${tf} Manual`} className="h-7 w-40 border-[#1c2739] bg-[#101828] font-mono text-[11px] text-[#dbe4f0]" />
+          </label>
+          <label className="flex flex-col gap-0.5">
+            <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">basis</span>
+            <select value={manualBasis} onChange={(e) => setManualBasis(e.target.value as Basis)} className="h-7 rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-[#dbe4f0]">
+              {BASIS_OPTIONS.map((b) => (
+                <option key={b.value} value={b.value}>
+                  {b.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <NumField label="minScore" value={manualMinScore} onChange={setManualMinScore} w="w-14" />
+          <NumField label="minVotes" value={manualMinVotes} onChange={setManualMinVotes} w="w-12" />
+          <NumField label="horizon" value={manualHorizon} onChange={setManualHorizon} w="w-12" />
+        </div>
+
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          <Button onClick={() => void backtestManual()} disabled={!manualSignals.length || manualBacktesting} variant="outline" className="h-7 border-[#1c2739] px-3 text-[10px] uppercase tracking-wider text-[#7c8aa5] hover:text-cyan-300 disabled:opacity-40">
+            {manualBacktesting ? 'backtesting...' : `backtest (${asset} ${tf})`}
+          </Button>
+          <Button onClick={() => void saveManual()} disabled={!manualSignals.length || manualSaving || !!manualSavedId} variant="outline" className="h-7 border-[#1c2739] px-3 text-[10px] uppercase tracking-wider text-[#7c8aa5] hover:text-cyan-300 disabled:opacity-40">
+            {manualSavedId ? `saved: ${manualSavedId}` : manualSaving ? 'saving...' : 'save to library'}
+          </Button>
+          <Button onClick={() => void deployManual()} disabled={!manualSignals.length || manualDeploying} className="h-7 bg-emerald-600 px-3 text-[10px] font-bold uppercase tracking-wider text-white hover:bg-emerald-500 disabled:opacity-40">
+            {manualDeploying ? 'deploying...' : 'deploy as bot'}
+          </Button>
+        </div>
+
+        {manualBacktest && (
+          <div className="mt-2 grid grid-cols-1 gap-2 lg:grid-cols-2">
+            <MetricStrip label="backtest - full sample" m={manualBacktest.backtest} breakeven={manualBacktest.breakevenWinRate} />
+            <MetricStrip label="backtest - holdout (last 30%, unseen)" m={manualBacktest.holdout} breakeven={manualBacktest.breakevenWinRate} />
+          </div>
+        )}
       </div>
 
       {/* result */}
