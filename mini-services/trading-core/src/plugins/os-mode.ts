@@ -16,13 +16,13 @@
 //                        is not chop
 //      * 'momentum'    - trend-following on the screener row: ADX-confirmed
 //                        directional pressure with the move's rate-of-change
-//      * 'confluence'  - the EXACT Confluence Signal panel/confluence_read
-//                        14-factor engine (confluenceSignalOnly), read off the
-//                        SAME deep candle history the panel reads (archived +
-//                        live tail, 1500 bars) instead of a shallow 300-bar
-//                        sweep window - that depth, not the OU model (which is
-//                        identical either way), is what makes a panel read
-//                        diverge from a thin one
+//      * 'confluence'  - reads straight from Screener2Service, the dedicated
+//                        market-wide Confluence Signal sweep (screener2.ts) -
+//                        the EXACT 14-factor panel/confluence_read engine on
+//                        the SAME deep candle history the panel reads
+//                        (archived + live tail, 1500 bars), a genuinely
+//                        separate feed from 'screener' above, not derived
+//                        from it
 //  With 'kalman-ou' + requireValidation, a candidate pair must ALSO pass a
 //  walk-forward validation of the OU strategy (out-of-sample net positive,
 //  majority of folds profitable, decent IS->OOS efficiency) before the
@@ -36,9 +36,9 @@ import type { Plugin, KernelContext } from '../kernel'
 import type { Store } from '../store'
 import type { Timeframe } from '../types'
 import type { ScreenerService, ScreenRow } from './screener'
+import type { Screener2Service, ConfluenceRow } from './screener2'
 import type { MarketDataService } from './market-data'
 import { walkForward } from '../strategies/optimize'
-import { confluenceSignalOnly } from '../analytics/engine'
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
 
@@ -398,7 +398,7 @@ export class ModeService {
           : this.config.signalSource === 'momentum'
             ? `ADX ${row.adx.toFixed(0)} · RSI ${row.rsi.toFixed(0)} · Δ${row.changePct.toFixed(2)}% · edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)}`
             : this.config.signalSource === 'confluence'
-              ? `14-factor confluence ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} regime ${row.regime}`
+              ? `14-factor confluence ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`
               : `score ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} regime ${row.regime}`
     this.emit(
       'success',
@@ -571,20 +571,18 @@ export class ModeService {
   }
 
   /**
-   * Confluence source: runs the EXACT 14-factor Confluence Signal panel /
-   * confluence_read engine (confluenceSignalOnly) on each candidate - reading
-   * the SAME deep candle history the panel reads (market.getCandlesDeep(...,
-   * 1500), archived + live tail), not the thin 300-bar window a cheap sweep
-   * uses. That depth is what actually makes a panel read diverge from a
-   * shallow one (EMA200/Markov lookback 500/Hurst/regression all starved on
-   * 300 bars) - the OU model itself is identical either way (ouState/
-   * ouKalman share the same live-state fit, confirmed in kalman.ts). Display
-   * metadata (name/category/payout/etc.) is borrowed from the screener's
-   * cached row - cosmetic only, never feeds the trade decision.
+   * Confluence source: reads straight from Screener2Service - the dedicated
+   * market-wide Confluence Signal sweep (screener2.ts), which runs the EXACT
+   * same engine (confluenceSignalOnly) on the SAME deep candle history
+   * (market.getCandlesDeep(..., 1500), archived + live tail) the single-asset
+   * panel uses. This is a genuinely separate read from 'screener' above - not
+   * derived from it, not borrowing its metadata. evaluate() returns the
+   * sweep's cached row when fresh and recomputes on demand when stale, same
+   * contract as ScreenerService.evaluate().
    */
   private pickConfluenceSignal(): ScreenRow | null {
     try {
-      const screener = this.ctx.use<ScreenerService>('screener')
+      const screener2 = this.ctx.use<Screener2Service>('screener2')
       const market = this.ctx.use<MarketDataService>('market')
       const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
       const restricted = this.config.watchlist.length > 0
@@ -593,25 +591,57 @@ export class ModeService {
       for (const asset of candidates) {
         if (this.assetBlocked(asset)) continue
         try {
-          const candles = market.getCandlesDeep(asset, this.config.tf, 1500)
-          if (candles.length < 60) continue
-          const sig = confluenceSignalOnly(candles, asset, this.config.tf)
-          if (sig.direction === 'none') continue
-          if (this.config.direction !== 'both' && sig.direction !== this.config.direction) continue
-          const score = Math.round(sig.score * 10) / 10
-          const confidence = Math.round(sig.confidence)
-          if (Math.abs(score) < this.config.minScore) continue
-          if (confidence < this.config.minConfidence) continue
-          const base = screener.evaluate(asset, this.config.tf) // display metadata only
-          return { ...base, score, direction: sig.direction, confidence }
+          const row = screener2.evaluate(asset, this.config.tf)
+          if (row.direction === 'none') continue
+          if (this.config.direction !== 'both' && row.direction !== this.config.direction) continue
+          if (Math.abs(row.score) < this.config.minScore) continue
+          if (row.confidence < this.config.minConfidence) continue
+          return ModeService.confluenceToScreenRow(row)
         } catch {
           // thin history for this pair - try the next
         }
       }
     } catch {
-      // screener/market not loaded - no signal source
+      // screener2/market not loaded - no signal source
     }
     return null
+  }
+
+  /**
+   * Adapts a ConfluenceRow (screener2's real factor-based read) into the
+   * ScreenRow shape pickSignal()/place() share across every source - only
+   * asset/tf/price/score/direction/confidence/payout are ever read for
+   * 'confluence' (see the detail string in place()); the screener-specific
+   * scalar fields (rsi/adx/regime/hurst/ouZ/pUp/topPattern) don't apply to
+   * this engine's output and are inert placeholders here, never surfaced.
+   */
+  private static confluenceToScreenRow(row: ConfluenceRow): ScreenRow {
+    return {
+      asset: row.asset,
+      name: row.name,
+      category: row.category,
+      otc: row.otc,
+      tf: row.tf,
+      price: row.price,
+      score: row.score,
+      direction: row.direction,
+      confidence: row.confidence,
+      pUp: 0,
+      regime: 'range',
+      ouZ: 0,
+      ouHalfLife: 0,
+      ouMeanReverting: false,
+      ouTStat: 0,
+      rsi: 0,
+      adx: 0,
+      atrPct: 0,
+      hurst: 0,
+      changePct: 0,
+      payout: row.payout,
+      topPattern: null,
+      ts: row.ts,
+      computedTs: row.computedTs,
+    }
   }
 
   // ---------- kalman-ou walk-forward validation gate ----------
