@@ -1368,8 +1368,7 @@ function AutoTraderDialog({
                     ) : (
                       <p className="col-span-2 mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
                         every member strategy votes CALL/PUT/none on each pair; the majority direction wins (a tie skips the pair) -
-                        trades only when {d.minConfidence}% or more of the {picked.length} members agree, and their average score
-                        still clears Min score below.
+                        trades only when {d.minConfidence}% or more of the {picked.length} members agree.
                       </p>
                     )}
                     {pickMode === 'ensemble' && (
@@ -1381,7 +1380,52 @@ function AutoTraderDialog({
                     )}
                   </>
                 )}
-                <NumField label="Min score" value={d.minScore} onChange={(v) => p({ minScore: v })} />
+                {picked
+                  .map((id) => strategies.find((s) => s.id === id))
+                  .filter((s): s is StrategyInfo => Boolean(s) && s!.params.length > 0)
+                  .map((s) => (
+                    <div key={s.id} className="col-span-2 rounded border border-[#1c2739] bg-[#101828] p-2">
+                      <div className="mb-1.5 text-[9px] uppercase tracking-wider text-[#4b5a72]">{s.name} parameters</div>
+                      <div className="grid grid-cols-2 gap-2">
+                        {s.params.map((prm) => (
+                          <div key={prm.key}>
+                            <div className="mb-0.5 truncate text-[9px] text-[#4b5a72]">{prm.label}</div>
+                            {prm.type === 'select' ? (
+                              <select
+                                value={String(d.strategyParams?.[s.id]?.[prm.key] ?? prm.default)}
+                                onChange={(e) => {
+                                  const next = { ...(d.strategyParams ?? {}) }
+                                  next[s.id] = { ...(next[s.id] ?? {}), [prm.key]: e.target.value }
+                                  p({ strategyParams: next })
+                                }}
+                                className="h-7 w-full rounded border border-[#1c2739] bg-[#0b111c] px-1.5 text-[11px] text-[#e2e8f0] outline-none"
+                              >
+                                {(prm.options ?? []).map((o) => (
+                                  <option key={o.value} value={o.value}>
+                                    {o.label}
+                                  </option>
+                                ))}
+                              </select>
+                            ) : (
+                              <Input
+                                value={String(d.strategyParams?.[s.id]?.[prm.key] ?? prm.default)}
+                                onChange={(e) => {
+                                  const raw = e.target.value.replace(/[^0-9.\-]/g, '')
+                                  const next = { ...(d.strategyParams ?? {}) }
+                                  const forId = { ...(next[s.id] ?? {}) }
+                                  if (raw === '') delete forId[prm.key]
+                                  else forId[prm.key] = Number(raw)
+                                  next[s.id] = forId
+                                  p({ strategyParams: next })
+                                }}
+                                className="h-7 border-[#1c2739] bg-[#0b111c] text-[11px] text-[#e2e8f0]"
+                              />
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
               </div>
             )
           })()}

@@ -1183,6 +1183,9 @@ export interface AutoTraderConfig {
    * settled trades on that exact pair) win rate, falling back to raw score
    * for members still building a record. */
   strategyPickMode?: 'ensemble' | 'best'
+  /** Per-strategy param overrides, keyed by strategy id - same shape as a
+   * bot's own params. Ignored for an AI Lab "custom:<id>" spec. */
+  strategyParams?: Record<string, Record<string, number | string>>
   direction: 'both' | 'call' | 'put'
   maxOpen: number
   cooldownSec: number

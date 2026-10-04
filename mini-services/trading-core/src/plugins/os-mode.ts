@@ -116,6 +116,13 @@ export interface AutoTraderConfig {
    * from; a proven member always outranks an unproven one. No effect with
    * 0-1 ids. */
   strategyPickMode?: 'ensemble' | 'best'
+  /** Per-strategy param overrides, keyed by strategy id - the SAME params a
+   * bot's own BotConfig.params carries for its strategyId. Only builtin
+   * strategies take params (AnalyticsService.runStrategy); an AI Lab
+   * "custom:<id>" spec is fixed and ignores any entry here. Missing keys
+   * fall back to that strategy's own defaultParams(), exactly like a bot
+   * with no params set. */
+  strategyParams?: Record<string, Record<string, number | string>>
   direction: 'both' | 'call' | 'put'
   maxOpen: number // max concurrent auto-trader positions
   cooldownSec: number // per-asset re-entry cooldown
@@ -275,6 +282,7 @@ export class ModeService {
             ? c.strategyIds.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).map((x) => x.trim())
             : undefined,
           strategyPickMode: c.strategyPickMode === 'best' ? 'best' : 'ensemble',
+          strategyParams: ModeService.sanitizeStrategyParams(c.strategyParams),
           direction: c.direction === 'call' || c.direction === 'put' ? c.direction : 'both',
           maxOpen: Math.round(num(c.maxOpen, DEFAULT_AUTOTRADER.maxOpen)),
           cooldownSec: Math.round(num(c.cooldownSec, DEFAULT_AUTOTRADER.cooldownSec)),
@@ -724,6 +732,26 @@ export class ModeService {
     }
   }
 
+  /** Sanitizes a strategyParams patch/restore blob: {id: {key: number|string}},
+   * dropping anything that doesn't match that shape. Same leniency as a
+   * bot's own params - unknown keys are harmless (defaultParams() merge just
+   * ignores them), so this only guards against garbage types, not against
+   * keys a given strategy doesn't define. */
+  private static sanitizeStrategyParams(v: unknown): Record<string, Record<string, number | string>> | undefined {
+    if (!v || typeof v !== 'object') return undefined
+    const out: Record<string, Record<string, number | string>> = {}
+    for (const [id, params] of Object.entries(v as Record<string, unknown>)) {
+      if (!params || typeof params !== 'object') continue
+      const clean: Record<string, number | string> = {}
+      for (const [k, val] of Object.entries(params as Record<string, unknown>)) {
+        if (typeof val === 'number' && Number.isFinite(val)) clean[k] = val
+        else if (typeof val === 'string' && val.trim()) clean[k] = val.trim()
+      }
+      if (Object.keys(clean).length) out[id] = clean
+    }
+    return Object.keys(out).length ? out : undefined
+  }
+
   /** The ids this 'strategy' source currently trades - strategyIds when set
    * (one id = single strategy, 2+ = ensemble), falling back to the legacy
    * lone strategyId for configs saved before strategyIds existed. */
@@ -734,16 +762,19 @@ export class ModeService {
 
   /**
    * Strategy source: evaluates one or more saved strategies (config.strategyIds)
-   * market-wide, on every open candidate - the exact same strategyId/eval path
-   * an autopilot bot uses (autopilot.ts's tradeForBot): a builtin id runs
-   * through AnalyticsService.runStrategy with its own default params, an AI
-   * Lab-learned id ("custom:...") runs through StrategyLabService.runStrategy.
-   * One id = trade it directly, gated only by minScore (no confidence concept
-   * exists at the single-strategy level). Two+ ids = ENSEMBLE: every member
-   * votes call/put/none independently on the same candidate; the majority
-   * direction wins (a tie votes nothing), minConfidence is reused as the
-   * minimum AGREEMENT % the majority must reach, and minScore gates the
-   * average |score| of the agreeing members.
+   * market-wide, on every open candidate - the exact same strategyId/eval/params
+   * path an autopilot bot uses (autopilot.ts's tradeForBot): a builtin id runs
+   * through AnalyticsService.runStrategy with its own defaultParams merged
+   * with any user overrides in config.strategyParams[id], an AI Lab-learned
+   * id ("custom:...") runs through StrategyLabService.runStrategy (fixed
+   * spec, no params). minScore/minConfidence are NOT applied here at all -
+   * neither means anything for "trade exactly this strategy": the strategy's
+   * own evaluate() already decided direction, and there is no shared score
+   * scale across arbitrary strategies to threshold on. One id = trade it
+   * directly. Two+ ids = either an ENSEMBLE (every member votes call/put/
+   * none, majority direction wins, a tie votes nothing, minConfidence is
+   * reused as the minimum AGREEMENT % the majority must reach) or, with
+   * strategyPickMode 'best', an AUTO-LEARN pool (see below).
    */
   private pickStrategySignal(): ScreenRow | null {
     const ids = this.effectiveStrategyIds()
@@ -759,7 +790,11 @@ export class ModeService {
       const specs = ids.map((id) => {
         const isCustom = id.startsWith('custom:')
         const strat = isCustom ? null : getStrategy(id)
-        return { id, isCustom, params: strat ? defaultParams(strat) : undefined, valid: isCustom || Boolean(strat) }
+        // user-configured overrides (same shape as a bot's own params) merged
+        // over that strategy's defaults - never applies to a custom: lab spec,
+        // which is a fixed learned structure with no exposed param schema
+        const params = strat ? { ...defaultParams(strat), ...(this.config.strategyParams?.[id] ?? {}) } : undefined
+        return { id, isCustom, params, valid: isCustom || Boolean(strat) }
       })
       const liveSpecs = specs.filter((s) => s.valid)
       if (!liveSpecs.length) return null // every picked id is unknown/removed - misconfigured
@@ -782,9 +817,12 @@ export class ModeService {
         if (!votes.length) continue
 
         if (liveSpecs.length === 1) {
+          // no minScore gate here - the strategy's own evaluate() already
+          // decided this is a signal (direction !== 'none'); a second,
+          // unrelated 0-100 "edge score" threshold on top of that doesn't
+          // mean anything a user picking ONE specific strategy would expect
           const v = votes[0]
           if (this.config.direction !== 'both' && v.direction !== this.config.direction) continue
-          if (Math.abs(v.score) < this.config.minScore) continue
           return ModeService.strategyEvalToScreenRow(asset, this.config.tf, v.direction, v.score, price, `${v.id} score ${Math.abs(v.score).toFixed(0)}`, undefined, v.id)
         }
 
@@ -817,7 +855,6 @@ export class ModeService {
           }
           if (!best) continue
           if (this.config.direction !== 'both' && best.direction !== this.config.direction) continue
-          if (Math.abs(best.score) < this.config.minScore) continue
           const note = best.proven
             ? `auto-learn: ${best.id} proven best for ${asset} (${best.rank.toFixed(0)}% win rate, 95% floor)`
             : `auto-learn: ${best.id} highest edge for ${asset} (score ${Math.abs(best.score).toFixed(0)}) - still building its own record`
@@ -834,7 +871,6 @@ export class ModeService {
         const agreementPct = Math.round((majority.length / liveSpecs.length) * 100)
         if (agreementPct < this.config.minConfidence) continue
         const avgScore = majority.reduce((a, v) => a + Math.abs(v.score), 0) / majority.length
-        if (avgScore < this.config.minScore) continue
         return ModeService.strategyEvalToScreenRow(
           asset,
           this.config.tf,
@@ -1261,6 +1297,7 @@ export class ModeService {
         ? patch.strategyIds.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).map((x) => x.trim())
         : undefined
     if (patch.strategyPickMode !== undefined) this.config.strategyPickMode = patch.strategyPickMode === 'best' ? 'best' : 'ensemble'
+    if (patch.strategyParams !== undefined) this.config.strategyParams = ModeService.sanitizeStrategyParams(patch.strategyParams)
     if (patch.direction !== undefined && ['both', 'call', 'put'].includes(String(patch.direction)))
       this.config.direction = String(patch.direction) as AutoTraderConfig['direction']
     if (patch.maxOpen !== undefined) this.config.maxOpen = Math.round(clamp(Number(patch.maxOpen) || 1, 1, 10))
