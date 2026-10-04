@@ -96,6 +96,10 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
   // button in the editor instead of making the user go ask the copilot to
   // pass force:true on their behalf for a setting they edited by hand here.
   const [gateError, setGateError] = useState('')
+  // Global research-gate switch (covers BOTH the built-in walk-forward gate
+  // and the AI-Lab holdout gate) - null while unknown on first load.
+  const [gateEnabled, setGateEnabled] = useState<boolean | null>(null)
+  const [gateBusy, setGateBusy] = useState(false)
 
   useEffect(() => {
     let alive = true
@@ -116,6 +120,38 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
       clearInterval(t)
     }
   }, [])
+
+  useEffect(() => {
+    let alive = true
+    osGet<{ ok: boolean; enabled: boolean }>('/research_gate')
+      .then((res) => {
+        if (alive && res.ok) setGateEnabled(res.enabled)
+      })
+      .catch(() => {
+        // leave it null (unknown) rather than guessing
+      })
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  const toggleResearchGate = async () => {
+    if (gateEnabled === null || gateBusy) return
+    const next = !gateEnabled
+    // disabling is the risky direction - make sure this is really what they want
+    if (!next && !window.confirm('Disable the research gate for ALL bots (built-in and AI-Lab)? Bots will be able to arm with NO validation requirement until you turn this back on.')) {
+      return
+    }
+    setGateBusy(true)
+    try {
+      const res = await osPost<{ ok: boolean; enabled: boolean }>('/research_gate_toggle', { enabled: next })
+      if (res.ok) setGateEnabled(res.enabled)
+    } catch (err) {
+      onError((err as Error).message)
+    } finally {
+      setGateBusy(false)
+    }
+  }
 
   const fleet = useMemo(() => {
     const running = bots.filter((b) => b.bot.enabled).length
@@ -250,13 +286,34 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
             {fleet.running}/{bots.length} armed
           </span>
         </h3>
-        <Button
-          size="sm"
-          onClick={openNew}
-          className="h-6 rounded bg-cyan-500/15 px-2.5 text-[10px] font-bold uppercase tracking-wider text-cyan-300 hover:bg-cyan-500/25"
-        >
-          + New Bot
-        </Button>
+        <div className="flex items-center gap-1.5">
+          <Button
+            size="sm"
+            disabled={gateEnabled === null || gateBusy}
+            onClick={toggleResearchGate}
+            title={
+              gateEnabled === null
+                ? 'loading research-gate status…'
+                : gateEnabled
+                  ? 'Research gate is ON - bots must clear a validated edge (built-in walk-forward or AI-Lab holdout) before arming. Click to disable globally.'
+                  : 'Research gate is OFF - ANY bot can arm with no validation requirement. Every bot armed now is tagged forcedUnvalidated. Click to re-enable.'
+            }
+            className={`h-6 rounded px-2.5 text-[10px] font-bold uppercase tracking-wider ${
+              gateEnabled === false
+                ? 'bg-amber-500/15 text-amber-300 hover:bg-amber-500/25'
+                : 'bg-[#101828] text-[#7c8aa5] hover:bg-[#182334]'
+            }`}
+          >
+            Research gate: {gateEnabled === null ? '…' : gateEnabled ? 'ON' : 'OFF'}
+          </Button>
+          <Button
+            size="sm"
+            onClick={openNew}
+            className="h-6 rounded bg-cyan-500/15 px-2.5 text-[10px] font-bold uppercase tracking-wider text-cyan-300 hover:bg-cyan-500/25"
+          >
+            + New Bot
+          </Button>
+        </div>
       </div>
 
       {/* fleet summary */}
