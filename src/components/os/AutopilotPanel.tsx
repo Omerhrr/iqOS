@@ -284,6 +284,7 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
         onOpenChange={setAtOpen}
         config={modeStatus?.autotrader.config ?? DEFAULT_AUTOTRADER_UI}
         assets={assets}
+        strategies={strategies}
         onSave={async (cfg) => {
           await osPost<{ ok: boolean }>('/autotrader_config', cfg)
           refreshMode()
@@ -1116,7 +1117,9 @@ function AutoTraderStrip({
                 ? `MOM·ADX≥${at.config.minAdx}`
                 : at.config.signalSource === 'confluence'
                   ? `CONFLUENCE·14F≥${at.config.minScore}`
-                  : `score ≥${at.config.minScore}`}
+                  : at.config.signalSource === 'strategy'
+                    ? `STRAT·${at.config.strategyId ?? 'none picked'}`
+                    : `score ≥${at.config.minScore}`}
           {' · '}{at.config.tf} ·{' '}
           {at.config.stakePlan ? `compound seed $${at.config.stakePlan.base}` : `$${at.config.stake}`} · max {at.config.maxOpen}
         </span>
@@ -1165,12 +1168,14 @@ function AutoTraderDialog({
   onOpenChange,
   config,
   assets,
+  strategies,
   onSave,
 }: {
   open: boolean
   onOpenChange: (o: boolean) => void
   config: AutoTraderConfig
   assets: AssetRow[]
+  strategies: StrategyInfo[]
   onSave: (patch: Partial<AutoTraderConfig>) => Promise<void>
 }) {
   const [d, setD] = useState<AutoTraderConfig>(config)
@@ -1184,8 +1189,9 @@ function AutoTraderDialog({
           <DialogTitle className="text-[14px] tracking-wider">AUTO-TRADER</DialogTitle>
           <DialogDescription className="text-[11px] text-[#7c8aa5]">
             The OS acting as its own trader: takes the strongest signal as 1-bar binary options - composite screener,
-            Kalman/OU mean reversion, Markov regime forecast, ADX momentum, or the full 14-factor Confluence Signal
-            engine. Only ever trades while the OS is in NO-HUMAN mode. Sentinel + risk limits still govern every order.
+            Kalman/OU mean reversion, Markov regime forecast, ADX momentum, the full 14-factor Confluence Signal
+            engine, or one specific strategy picked from the Strategy Lab / AI Lab catalog. Only ever trades while the
+            OS is in NO-HUMAN mode. Sentinel + risk limits still govern every order.
           </DialogDescription>
         </DialogHeader>
 
@@ -1208,6 +1214,7 @@ function AutoTraderDialog({
                   ['markov', 'Markov'],
                   ['momentum', 'Momentum'],
                   ['confluence', 'Confluence'],
+                  ['strategy', 'Strategy'],
                 ] as const
               ).map(([v, label]) => (
                 <button
@@ -1231,9 +1238,34 @@ function AutoTraderDialog({
                     ? 'trend continuation: CALL when ADX-confirmed strength, a positive rate-of-change and RSI on the bullish side of mid line up, PUT mirrored - skips statistically exhausted extremes'
                     : d.signalSource === 'confluence'
                       ? 'the EXACT 14-factor Confluence Signal panel/confluence_read engine, re-fit bar-fresh on each candidate (full Kalman/OU, not the screener sweep\'s cheaper approximation) - identical read to what the panel/copilot would show for that pair right now'
-                      : 'takes the strongest full-composite screener signals market-wide (trend + momentum + statistical + patterns)'}
+                      : d.signalSource === 'strategy'
+                        ? 'ONE specific strategy picked below, evaluated market-wide on every open pair - the same strategyId an autopilot bot would use (a builtin strategy, or an AI Lab-learned "(Lab)" spec), not pinned to one bot\'s watchlist'
+                        : 'takes the strongest full-composite screener signals market-wide (trend + momentum + statistical + patterns)'}
             </p>
           </div>
+
+          {d.signalSource === 'strategy' && (
+            <div className="col-span-2">
+              <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Strategy</Label>
+              <select
+                value={d.strategyId ?? ''}
+                onChange={(e) => p({ strategyId: e.target.value || undefined })}
+                className="h-8 w-full rounded border border-[#1c2739] bg-[#101828] px-2 text-[11px] text-[#e2e8f0] outline-none focus:border-cyan-500/50"
+              >
+                <option value="">— pick a strategy —</option>
+                {strategies.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name}
+                  </option>
+                ))}
+              </select>
+              <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+                {d.strategyId
+                  ? `trades "${strategies.find((s) => s.id === d.strategyId)?.name ?? d.strategyId}" on every open pair (respecting the watchlist below, if set)`
+                  : 'nothing picked yet - the auto-trader stands aside until a strategy is selected'}
+              </p>
+            </div>
+          )}
 
           <div className="col-span-2">
             <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">

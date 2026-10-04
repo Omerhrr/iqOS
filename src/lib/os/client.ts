@@ -1157,7 +1157,7 @@ export type OsMode = 'human' | 'auto'
 
 export interface AutoTraderConfig {
   enabled: boolean
-  signalSource: 'screener' | 'kalman-ou' | 'markov' | 'momentum' | 'confluence'
+  signalSource: 'screener' | 'kalman-ou' | 'markov' | 'momentum' | 'confluence' | 'strategy'
   tf: Timeframe
   stake: number
   minScore: number
@@ -1167,6 +1167,9 @@ export interface AutoTraderConfig {
   requireValidation: boolean
   minPUp: number
   minAdx: number
+  /** strategy source: id from the combined Strategy Lab catalog (builtin id,
+   * or "custom:<id>" for an AI Lab-learned spec) - same as a bot's strategyId. */
+  strategyId?: string
   direction: 'both' | 'call' | 'put'
   maxOpen: number
   cooldownSec: number

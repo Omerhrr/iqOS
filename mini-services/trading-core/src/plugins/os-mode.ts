@@ -23,6 +23,14 @@
 //                        (archived + live tail, 1500 bars), a genuinely
 //                        separate feed from 'screener' above, not derived
 //                        from it
+//      * 'strategy'    - ONE specific saved strategy, picked by strategyId
+//                        from the combined Strategy Lab catalog (every
+//                        builtin strategy PLUS every AI Lab-learned "custom:"
+//                        spec) - the exact same strategyId an autopilot bot
+//                        would use, evaluated market-wide on every open pair
+//                        (builtin via AnalyticsService.runStrategy, AI Lab
+//                        specs via StrategyLabService.runStrategy) instead of
+//                        being pinned to one bot's watchlist
 //  With 'kalman-ou' + requireValidation, a candidate pair must ALSO pass a
 //  walk-forward validation of the OU strategy (out-of-sample net positive,
 //  majority of folds profitable, decent IS->OOS efficiency) before the
@@ -38,13 +46,16 @@ import type { Timeframe } from '../types'
 import type { ScreenerService, ScreenRow } from './screener'
 import type { Screener2Service, ConfluenceRow } from './screener2'
 import type { MarketDataService } from './market-data'
+import type { AnalyticsService } from './analytics'
+import type { StrategyLabService } from './lab'
 import { walkForward } from '../strategies/optimize'
+import { getStrategy, defaultParams } from '../strategies/builtin'
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
 
 export type OsMode = 'human' | 'auto'
 
-export type AutoTraderSource = 'screener' | 'kalman-ou' | 'markov' | 'momentum' | 'confluence'
+export type AutoTraderSource = 'screener' | 'kalman-ou' | 'markov' | 'momentum' | 'confluence' | 'strategy'
 
 /** Walk-forward validation verdict for the OU edge on one (asset, tf). */
 export interface OUVerdict {
@@ -75,6 +86,11 @@ export interface AutoTraderConfig {
   requireValidation: boolean // kalman-ou source: only trade pairs whose walk-forward verdict is robust
   minPUp: number // markov source: decisive next-up probability (call at >=, put at <= 1-)
   minAdx: number // momentum source: minimum trend strength (ADX)
+  /** strategy source: id from the combined Strategy Lab catalog - a builtin
+   * strategy id (e.g. "ema-cross", "confluence-full") or an AI Lab-learned
+   * spec ("custom:<id>"), exactly like an autopilot bot's strategyId. Unset =
+   * the 'strategy' source has nothing to trade and stands aside. */
+  strategyId?: string
   direction: 'both' | 'call' | 'put'
   maxOpen: number // max concurrent auto-trader positions
   cooldownSec: number // per-asset re-entry cooldown
@@ -204,7 +220,7 @@ export class ModeService {
         const num = (v: unknown, fb: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fb)
         this.config = {
           enabled: typeof c.enabled === 'boolean' ? c.enabled : DEFAULT_AUTOTRADER.enabled,
-          signalSource: (['screener', 'kalman-ou', 'markov', 'momentum', 'confluence'] as const).includes(c.signalSource as AutoTraderSource)
+          signalSource: (['screener', 'kalman-ou', 'markov', 'momentum', 'confluence', 'strategy'] as const).includes(c.signalSource as AutoTraderSource)
             ? (c.signalSource as AutoTraderSource)
             : DEFAULT_AUTOTRADER.signalSource,
           tf: (typeof c.tf === 'string' ? c.tf : DEFAULT_AUTOTRADER.tf) as Timeframe,
@@ -216,6 +232,7 @@ export class ModeService {
           requireValidation: typeof c.requireValidation === 'boolean' ? c.requireValidation : DEFAULT_AUTOTRADER.requireValidation,
           minPUp: num(c.minPUp, DEFAULT_AUTOTRADER.minPUp),
           minAdx: num(c.minAdx, DEFAULT_AUTOTRADER.minAdx),
+          strategyId: typeof c.strategyId === 'string' && c.strategyId.trim() ? c.strategyId.trim() : undefined,
           direction: c.direction === 'call' || c.direction === 'put' ? c.direction : 'both',
           maxOpen: Math.round(num(c.maxOpen, DEFAULT_AUTOTRADER.maxOpen)),
           cooldownSec: Math.round(num(c.cooldownSec, DEFAULT_AUTOTRADER.cooldownSec)),
@@ -399,7 +416,9 @@ export class ModeService {
             ? `ADX ${row.adx.toFixed(0)} · RSI ${row.rsi.toFixed(0)} · Δ${row.changePct.toFixed(2)}% · edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)}`
             : this.config.signalSource === 'confluence'
               ? `14-factor confluence ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`
-              : `score ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} regime ${row.regime}`
+              : this.config.signalSource === 'strategy'
+                ? `${this.config.strategyId ?? 'strategy'} edge ${Math.abs(row.score).toFixed(0)} (${row.direction.toUpperCase()})`
+                : `score ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} regime ${row.regime}`
     this.emit(
       'success',
       `[AUTO-TRADER] ${side.toUpperCase()} ${row.asset} ${this.config.tf} $${this.config.stake} binary - ${detail}`
@@ -411,6 +430,7 @@ export class ModeService {
     if (this.config.signalSource === 'markov') return this.pickMarkovSignal()
     if (this.config.signalSource === 'momentum') return this.pickMomentumSignal()
     if (this.config.signalSource === 'confluence') return this.pickConfluenceSignal()
+    if (this.config.signalSource === 'strategy') return this.pickStrategySignal()
     try {
       const screener = this.ctx.use<ScreenerService>('screener')
       const dir = this.config.direction === 'both' ? undefined : this.config.direction
@@ -644,6 +664,89 @@ export class ModeService {
     }
   }
 
+  /**
+   * Strategy source: evaluates ONE specific saved strategy (config.strategyId)
+   * market-wide, on every open candidate - the exact same strategyId/eval path
+   * an autopilot bot uses (autopilot.ts's tradeForBot): a builtin id runs
+   * through AnalyticsService.runStrategy with its own default params, an AI
+   * Lab-learned id ("custom:...") runs through StrategyLabService.runStrategy.
+   * No confidence concept exists at the single-strategy level (only score),
+   * so minConfidence is not applied here - same as a bot's strategyId gate,
+   * which only checks minScore.
+   */
+  private pickStrategySignal(): ScreenRow | null {
+    const id = this.config.strategyId
+    if (!id) return null // nothing picked yet - source configured but idle
+    const isCustom = id.startsWith('custom:')
+    try {
+      const market = this.ctx.use<MarketDataService>('market')
+      const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
+      const restricted = this.config.watchlist.length > 0
+      const pool = restricted ? this.config.watchlist.filter((a) => open.includes(a)) : open
+      const candidates = [...LIQUID_CANDIDATES.filter((a) => pool.includes(a)), ...pool.filter((a) => !LIQUID_CANDIDATES.includes(a))]
+      const strat = isCustom ? null : getStrategy(id)
+      if (!isCustom && !strat) return null // unknown/removed strategy id - misconfigured
+      const params = strat ? defaultParams(strat) : undefined
+      for (const asset of candidates) {
+        if (this.assetBlocked(asset)) continue
+        try {
+          const ev = isCustom
+            ? this.ctx.use<StrategyLabService>('lab').runStrategy(asset, this.config.tf, id)
+            : this.ctx.use<AnalyticsService>('analytics').runStrategy(asset, this.config.tf, id, params)
+          if (ev.direction === 'none') continue
+          if (this.config.direction !== 'both' && ev.direction !== this.config.direction) continue
+          if (Math.abs(ev.score) < this.config.minScore) continue
+          return ModeService.strategyEvalToScreenRow(asset, this.config.tf, ev.direction, ev.score, ev.price)
+        } catch {
+          // thin history / bad pair for this strategy - try the next
+        }
+      }
+    } catch {
+      // market/analytics/lab not loaded - no signal source
+    }
+    return null
+  }
+
+  /** Adapts a single-strategy eval (direction/score/price, no confidence
+   * concept) into the shared ScreenRow shape - confidence mirrors |score|
+   * since nothing else is available, matching how the strip/detail string
+   * display it. Screener-specific scalars are inert placeholders, as with
+   * confluenceToScreenRow above. */
+  private static strategyEvalToScreenRow(
+    asset: string,
+    tf: Timeframe,
+    direction: 'call' | 'put' | 'none',
+    score: number,
+    price: number
+  ): ScreenRow {
+    return {
+      asset,
+      name: asset,
+      category: 'forex',
+      otc: false,
+      tf,
+      price,
+      score,
+      direction,
+      confidence: Math.round(clamp(Math.abs(score), 0, 100)),
+      pUp: 0,
+      regime: 'range',
+      ouZ: 0,
+      ouHalfLife: 0,
+      ouMeanReverting: false,
+      ouTStat: 0,
+      rsi: 0,
+      adx: 0,
+      atrPct: 0,
+      hurst: 0,
+      changePct: 0,
+      payout: 0,
+      topPattern: null,
+      ts: Math.floor(Date.now() / 1000),
+      computedTs: Math.floor(Date.now() / 1000),
+    }
+  }
+
   // ---------- kalman-ou walk-forward validation gate ----------
 
   static readonly OU_VALIDATION_TTL = 3600 // refresh verdicts hourly
@@ -783,7 +886,11 @@ export class ModeService {
               ? 'markov-edge'
               : this.config.signalSource === 'momentum'
                 ? 'supertrend-follow'
-                : 'screener-auto',
+                : this.config.signalSource === 'confluence'
+                  ? 'confluence-full'
+                  : this.config.signalSource === 'strategy'
+                    ? (this.config.strategyId ?? 'custom-strategy')
+                    : 'screener-auto',
         note: AUTOTRADER_NOTE,
       })
     } catch {
@@ -979,7 +1086,7 @@ export class ModeService {
 
   configure(patch: Partial<AutoTraderConfig>): { ok: boolean; config: AutoTraderConfig; error?: string } {
     if (patch.enabled !== undefined) this.config.enabled = Boolean(patch.enabled)
-    if (patch.signalSource !== undefined && (['screener', 'kalman-ou', 'markov', 'momentum', 'confluence'] as const).includes(patch.signalSource as AutoTraderSource))
+    if (patch.signalSource !== undefined && (['screener', 'kalman-ou', 'markov', 'momentum', 'confluence', 'strategy'] as const).includes(patch.signalSource as AutoTraderSource))
       this.config.signalSource = patch.signalSource as AutoTraderSource
     if (patch.tf !== undefined) this.config.tf = String(patch.tf) as Timeframe
     if (patch.stake !== undefined) this.config.stake = clamp(Number(patch.stake) || DEFAULT_AUTOTRADER.stake, 1, 5000)
@@ -990,6 +1097,8 @@ export class ModeService {
     if (patch.requireValidation !== undefined) this.config.requireValidation = Boolean(patch.requireValidation)
     if (patch.minPUp !== undefined) this.config.minPUp = clamp(Number(patch.minPUp) || DEFAULT_AUTOTRADER.minPUp, 0.5, 0.75)
     if (patch.minAdx !== undefined) this.config.minAdx = clamp(Number(patch.minAdx) || DEFAULT_AUTOTRADER.minAdx, 10, 45)
+    if (patch.strategyId !== undefined)
+      this.config.strategyId = typeof patch.strategyId === 'string' && patch.strategyId.trim() ? patch.strategyId.trim() : undefined
     if (patch.direction !== undefined && ['both', 'call', 'put'].includes(String(patch.direction)))
       this.config.direction = String(patch.direction) as AutoTraderConfig['direction']
     if (patch.maxOpen !== undefined) this.config.maxOpen = Math.round(clamp(Number(patch.maxOpen) || 1, 1, 10))
@@ -1024,7 +1133,9 @@ export class ModeService {
             ? ` (ADX ≥ ${this.config.minAdx})`
             : this.config.signalSource === 'confluence'
               ? ' (full 14-factor panel engine, bar-fresh)'
-              : ''
+              : this.config.signalSource === 'strategy'
+                ? ` (${this.config.strategyId ?? 'no strategy picked'})`
+                : ''
     this.emit(
       'info',
       `AUTO-TRADER config: ${this.config.enabled ? 'armed' : 'off'} · src ${this.config.signalSource}${srcDetail} · ${this.config.tf} · stake $${this.config.stake} · minScore ${this.config.minScore} · minConf ${this.config.minConfidence} · maxOpen ${this.config.maxOpen} · cooldown ${this.config.cooldownSec}s`
