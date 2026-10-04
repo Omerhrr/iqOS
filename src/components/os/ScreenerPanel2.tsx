@@ -1,13 +1,14 @@
 'use client'
 
-// IQAIR//OS - Screener2 panel (DISCOVERY, confluence engine)
-// Identical layout/behavior to ScreenerPanel - same filters, same table, same
-// click-to-chart and bell-to-alert - but every row's score/direction/
-// confidence comes from the full 14-factor Confluence Signal panel/
-// confluence_read engine (confluenceSignalOnly, full Kalman/OU fit) instead
-// of the original Screener's cheaper ouState approximation. Kept as its own
-// tab/panel so both feeds are visible side by side rather than one replacing
-// the other.
+// IQAIR//OS - Screener2 panel (DISCOVERY, Confluence Signal engine)
+// Same filters/table/click-to-chart/bell-to-alert mechanics as ScreenerPanel,
+// but every row is scored with confluenceSignalOnly on the SAME deep candle
+// read (1500 bars, archived + live) the single-asset Confluence Signal panel
+// (SignalPanel.tsx) uses - not the Screener's shallow 300-bar sweep window.
+// The heading and the CALL/PUT badge intentionally reuse SignalPanel's exact
+// title text and scoreColor/badge styling (+/-22 thresholds, same colors) so
+// this reads as "the Confluence Signal panel, market-wide" rather than a
+// Screener reskin - this is a genuinely different engine/signal, not a copy.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -45,6 +46,27 @@ function scoreColor(score: number): string {
   const a = Math.min(1, Math.abs(score) / 80)
   if (score >= 0) return `rgba(16,185,129,${0.15 + a * 0.5})`
   return `rgba(244,63,94,${0.15 + a * 0.5})`
+}
+
+/** Same thresholds/colors as SignalPanel.tsx's scoreColor - the single-asset
+ * Confluence Signal gauge's CALL/PUT/NEUTRAL badge - so a row's badge here
+ * means exactly what it means there. */
+function directionColor(score: number): string {
+  if (score >= 22) return '#10b981'
+  if (score <= -22) return '#f43f5e'
+  return '#eab308'
+}
+
+function DirectionBadge({ direction, score }: { direction: 'call' | 'put' | 'none'; score: number }) {
+  const color = directionColor(score)
+  return (
+    <span
+      className="rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider"
+      style={{ color, background: `${color}1a`, border: `1px solid ${color}55` }}
+    >
+      {direction === 'call' ? 'CALL' : direction === 'put' ? 'PUT' : 'NEUTRAL'}
+    </span>
+  )
 }
 
 export default function ScreenerPanel2({ onSelectSetup, onError }: ScreenerPanel2Props) {
@@ -118,9 +140,7 @@ export default function ScreenerPanel2({ onSelectSetup, onError }: ScreenerPanel
     <div className="flex h-full min-h-0 flex-col">
       {/* controls */}
       <div className="flex flex-wrap items-center gap-1.5 border-b border-[#141d2e] px-2 py-1.5">
-        <span className="rounded border border-violet-500/30 bg-violet-500/10 px-1.5 py-0.5 font-mono text-[8px] font-bold uppercase tracking-wider text-violet-300">
-          confluence
-        </span>
+        <h3 className="whitespace-nowrap text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">Confluence Signal</h3>
         <div className="flex overflow-hidden rounded border border-[#1c2739]">
           {TFS.map((t) => (
             <button
@@ -196,7 +216,8 @@ export default function ScreenerPanel2({ onSelectSetup, onError }: ScreenerPanel
                 <Th>Asset</Th>
                 <Th>Tf</Th>
                 <Th>Price</Th>
-                <Th>Confluence</Th>
+                <Th>Call/Put</Th>
+                <Th>Score</Th>
                 <Th>Conf</Th>
                 <Th>Regime</Th>
                 <Th>RSI</Th>
@@ -227,6 +248,9 @@ export default function ScreenerPanel2({ onSelectSetup, onError }: ScreenerPanel
                     </Td>
                     <Td className="text-[#4b5a72]">{r.tf}</Td>
                     <Td>{fmtPrice(r.price, r.asset)}</Td>
+                    <Td>
+                      <DirectionBadge direction={r.direction} score={r.score} />
+                    </Td>
                     <Td>
                       <div className="flex items-center gap-1.5">
                         <div className="h-1.5 w-14 overflow-hidden rounded-full bg-[#101828]">

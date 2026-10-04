@@ -100,7 +100,7 @@ export default function BottomTabs(props: BottomTabsProps) {
             ['positions', `Positions (${positions.length})`],
             ['history', `History (${history.length})`],
             ['screener', 'Screener'],
-            ['screener2', 'Screener (Confluence)'],
+            ['screener2', 'Confluence Signal'],
             ['autopilot', `Autopilot${props.bots.filter((b) => b.bot.enabled).length ? ` (${props.bots.filter((b) => b.bot.enabled).length})` : ''}`],
             ['sentinel', 'Sentinel'],
             ['watchdog', 'Watchdog'],
