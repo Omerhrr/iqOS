@@ -1198,6 +1198,19 @@ export interface AutoTraderConfig {
   /** 'only' (default when unset) = trade ONLY the watchlist tickers. 'exclude'
    * = trade every open instrument EXCEPT the watchlist tickers - a deny-list. */
   watchlistMode?: 'only' | 'exclude'
+  /** Scales the stake with signal confidence (0.5x-1.5x) instead of a flat
+   * `stake` every trade. Default false. */
+  smartStaking?: boolean
+  /** Blocks opening a new position in a pair correlated with one already
+   * open (same FX-major/metals/crypto group), not just raw maxOpen count.
+   * Default true. */
+  correlationGuard?: boolean
+  /** Benches a (strategy, pair) combo after 3+ consecutive losses, cooldown
+   * growing with streak length. Default true. */
+  streakBreaker?: boolean
+  /** Stands aside on non-OTC pairs during the 21:00-23:00 UTC thin-liquidity
+   * window. Default false. */
+  avoidDeadHours?: boolean
   /** Optional compounding plan - same StakePlan shape as a bot's. undefined =
    * fixed `stake` every trade. */
   stakePlan?: StakePlan

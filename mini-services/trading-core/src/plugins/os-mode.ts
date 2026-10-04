@@ -51,6 +51,7 @@ import type { StrategyLabService } from './lab'
 import type { AdaptiveService } from './adaptive'
 import { walkForward } from '../strategies/optimize'
 import { getStrategy, defaultParams } from '../strategies/builtin'
+import { classifyRegime } from '../analytics/regime'
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
 
@@ -140,6 +141,42 @@ export interface AutoTraderConfig {
    * a deny-list for a pair you've found unreliable or just don't want
    * touched, without having to hand-list every other pair you DO want. */
   watchlistMode?: 'only' | 'exclude'
+  /** Scales the stake with how strong THIS signal is, instead of every
+   * trade risking the same flat `stake`. Uses the same 0-100 confidence
+   * every source already reports on its ScreenRow (raw |score|-derived for
+   * screener/kalman-ou/markov/momentum/confluence, agreement % for an
+   * ensemble, or the proven Wilson win rate for an auto-learn pick) - so it
+   * needs no new signal, just reads the one already computed. Multiplier
+   * ranges 0.5x (at/near the confidence floor) to 1.5x (near-certain reads),
+   * applied on top of a compounding plan's rolled amount too, before that
+   * plan's own maxStake clamp. Default false - opt-in, since it changes bet
+   * sizing, not just entry/exit logic. */
+  smartStaking?: boolean
+  /** Treats correlated pairs as the same bet for concurrency purposes, not
+   * just a raw position count - having 3 "different" open positions that
+   * are actually all EUR-major or all metals isn't the diversification
+   * maxOpen implies. Blocks opening a NEW auto position in a pair that
+   * shares a correlation group (CORRELATION_GROUPS below) with one the
+   * auto-trader already has open. Default true (on) unless explicitly
+   * turned off - this is a pure risk reduction with no tradeoff besides
+   * occasionally standing aside for a pair with no open slot. */
+  correlationGuard?: boolean
+  /** Benches a (strategy, pair) combo after a run of consecutive losses -
+   * independent of the daily $ loss limit, which only trips on aggregate
+   * P&L and can take a while to notice "this one setup stopped working this
+   * week." Bench duration grows with streak length (15min at 3 losses in a
+   * row, doubling per extra loss, capped at 4h) and clears itself once the
+   * cooldown elapses - no manual restart needed, unlike the compounding
+   * stop-on-loss halt. Default true (on) unless explicitly turned off. */
+  streakBreaker?: boolean
+  /** Stands aside on non-OTC pairs during the historically thinnest FX
+   * liquidity window (21:00-23:00 UTC - after NY closes, before Tokyo/Asia
+   * really gets going), where spreads widen and a strategy's daytime edge
+   * is least likely to hold. Never applies to -OTC synthetic tickers, which
+   * trade the same broker-generated walk around the clock and have no real
+   * "session" to avoid. Default false - opt-in, since it's a scheduling
+   * restriction some setups (e.g. a pure OTC watchlist) have no use for. */
+  avoidDeadHours?: boolean
   /** Optional compounding plan - SAME shape and semantics as a bot's
    * stakePlan in autopilot.ts (payoutCap, periods, derisk, stopOnLoss). undefined
    * = fixed `stake` every trade, unchanged behavior. Auto-trader is
@@ -235,6 +272,46 @@ export class ModeService {
    * 10s tick until the asset cache has a chance to catch up. */
   private assetRejectedUntil = new Map<string, number>()
 
+  /** Pairs that tend to move together, for correlationGuard - grouped
+   * loosely by what actually drives them (shared base/quote currency,
+   * shared commodity/metal complex, shared crypto beta), not a computed
+   * correlation coefficient. Good enough to catch "these 3 open positions
+   * are really one bet" without needing a live correlation matrix. OTC
+   * suffixes are stripped before matching, so e.g. EURUSD-OTC still groups
+   * with GBPUSD-OTC. */
+  private static CORRELATION_GROUPS: string[][] = [
+    ['EURUSD', 'GBPUSD', 'EURGBP', 'EURCHF', 'EURJPY', 'EURAUD', 'EURCAD'],
+    ['AUDUSD', 'NZDUSD', 'AUDNZD', 'AUDCAD'],
+    ['USDJPY', 'EURJPY', 'GBPJPY', 'AUDJPY', 'CHFJPY'],
+    ['USDCAD', 'USDCHF'],
+    ['XAUUSD', 'XAGUSD'],
+    ['BTCUSD', 'ETHUSD', 'LTCUSD', 'XRPUSD'],
+  ]
+
+  private static stripOtc(asset: string): string {
+    return asset.endsWith('-OTC') ? asset.slice(0, -4) : asset
+  }
+
+  /** Which correlation group (index into CORRELATION_GROUPS) an asset
+   * belongs to, or null if it's not in any tracked group - an asset with no
+   * known group never blocks or gets blocked by correlationGuard. */
+  private static correlationGroupOf(asset: string): number | null {
+    const bare = ModeService.stripOtc(asset)
+    const idx = ModeService.CORRELATION_GROUPS.findIndex((g) => g.includes(bare))
+    return idx === -1 ? null : idx
+  }
+
+  /** streak-breaker state, keyed "<strategyLabel>|<asset>" (the exact
+   * identity a settled position.strategy + position.asset pair carries) -
+   * independent of the daily runtime (rt), since a losing streak and its
+   * bench should survive a midnight rollover same as everything else that
+   * isn't a daily counter. */
+  private lossStreak = new Map<string, number>()
+  private benchedUntil = new Map<string, number>()
+  private static STREAK_BENCH_THRESHOLD = 3 // consecutive losses before a bench kicks in
+  private static STREAK_BENCH_BASE_SEC = 900 // 15min at exactly the threshold
+  private static STREAK_BENCH_MAX_SEC = 14400 // 4h cap, however long the streak runs
+
   mode: OsMode = 'human'
   ts = Math.floor(Date.now() / 1000)
   reason = 'initial state'
@@ -301,6 +378,10 @@ export class ModeService {
           dailyLossLimit: num(c.dailyLossLimit, 0),
           watchlist: Array.isArray(c.watchlist) ? c.watchlist.filter((x): x is string => typeof x === 'string') : [],
           watchlistMode: c.watchlistMode === 'exclude' ? 'exclude' : 'only',
+          smartStaking: typeof c.smartStaking === 'boolean' ? c.smartStaking : false,
+          correlationGuard: typeof c.correlationGuard === 'boolean' ? c.correlationGuard : true,
+          streakBreaker: typeof c.streakBreaker === 'boolean' ? c.streakBreaker : true,
+          avoidDeadHours: typeof c.avoidDeadHours === 'boolean' ? c.avoidDeadHours : false,
           stakePlan: this.parseStakePlan(c.stakePlan),
           planState: ModeService.isPlanState(c.planState) ? c.planState : undefined,
         }
@@ -448,7 +529,7 @@ export class ModeService {
     // copilot memory gate: standing rules from the copilot's persistent memory
     // ("never trade Fridays", "only trade ...", "max stake $...", rate caps)
     // bind the OS's own trader too - the user's words outrank the machine
-    const bet = this.stakeForAuto()
+    const bet = this.stakeForAuto(row)
     try {
       const mg = this.ctx.use<{ check: (asset: string, stake: number) => { ok: boolean; reason?: string } }>('memoryGate')
       const g = mg.check(row.asset, bet.amount)
@@ -834,6 +915,10 @@ export class ModeService {
         const votes: Array<{ id: string; direction: 'call' | 'put'; score: number }> = []
         let price = 0
         for (const s of liveSpecs) {
+          // streak-breaker: a member on a losing run against THIS exact
+          // pair sits out, but still lets every other member vote/rank -
+          // the bench is per (strategy, pair), never the whole pool
+          if (this.config.streakBreaker !== false && this.isBenched(`${s.id}|${asset}`)) continue
           try {
             const ev = s.isCustom
               ? lab.runStrategy(asset, this.config.tf, s.id)
@@ -871,11 +956,27 @@ export class ModeService {
           // record; once any member clears the adaptive gate's own sample
           // floor, a proven result always outranks an unproven one.
           let best: { id: string; direction: 'call' | 'put'; score: number; rank: number; proven: boolean } | null = null
+          // Regime-aware ranking: execution.ts stamps every settled position
+          // with entry_regime via the SAME classifyRegime() call (its own
+          // snapshotSignal, independent of signalSource) - so a bucket read
+          // that omits regime here would be pooling across what's actually
+          // regime-split data, diluting a member that's e.g. excellent in a
+          // trend but mediocre in chop into one blended, weaker-looking
+          // number. Passing the SAME classification used at write-time is
+          // what makes "best per pair" actually "best per pair AND regime".
+          let regime: string | undefined
+          if (adaptive) {
+            try {
+              regime = classifyRegime(analytics.analyze(asset, this.config.tf))
+            } catch {
+              regime = undefined
+            }
+          }
           for (const v of votes) {
             let rank = Math.abs(v.score)
             let proven = false
             if (adaptive) {
-              const verdict = adaptive.check(asset, this.config.tf, v.id, v.direction, v.score)
+              const verdict = adaptive.check(asset, this.config.tf, v.id, v.direction, v.score, regime)
               if (verdict.trades >= adaptive.config.minSampleSize) {
                 rank = verdict.wilsonLowerPct
                 proven = true
@@ -1161,14 +1262,51 @@ export class ModeService {
     return exclude ? open.filter((a) => !this.config.watchlist.includes(a)) : open.filter((a) => this.config.watchlist.includes(a))
   }
 
-  /** Cooldown + one-auto-position-per-asset + optional watchlist restriction,
-   * applied by every signal picker (all sources funnel through this). */
+  /** The strategy label a non-'strategy' source always trades under - fixed
+   * per signalSource, exactly what place() tags the resulting position with
+   * (see its `strategy:` switch below). Used to look up the streak-breaker
+   * bench for sources where the label doesn't depend on which candidate is
+   * picked. Returns null for 'strategy' (its label varies per member/pair -
+   * handled per-member inside pickStrategySignal instead). */
+  private fixedStrategyLabel(): string | null {
+    switch (this.config.signalSource) {
+      case 'kalman-ou':
+        return 'kalman-ou-reversion'
+      case 'markov':
+        return 'markov-edge'
+      case 'momentum':
+        return 'supertrend-follow'
+      case 'confluence':
+        return 'confluence-full'
+      case 'screener':
+        return 'screener-auto'
+      default:
+        return null
+    }
+  }
+
+  private isBenched(key: string): boolean {
+    return this.now() < (this.benchedUntil.get(key) ?? 0)
+  }
+
+  /** 21:00-23:00 UTC - after New York closes and before Tokyo/Sydney really
+   * get going, historically the thinnest liquidity window for FX majors.
+   * Only ever consulted for non-OTC tickers (see avoidDeadHours's docs). */
+  private isDeadHour(): boolean {
+    const h = new Date(this.now() * 1000).getUTCHours()
+    return h >= 21 && h < 23
+  }
+
+  /** Cooldown + one-auto-position-per-asset + optional watchlist restriction
+   * + correlation guard + streak-breaker bench + dead-hours filter, applied
+   * by every signal picker (all sources funnel through this). */
   private assetBlocked(asset: string): boolean {
     if (this.config.watchlist.length > 0) {
       const inList = this.config.watchlist.includes(asset)
       const exclude = this.config.watchlistMode === 'exclude'
       if (exclude ? inList : !inList) return true
     }
+    if (this.config.avoidDeadHours === true && !asset.endsWith('-OTC') && this.isDeadHour()) return true
     const rejectedUntil = this.assetRejectedUntil.get(asset) ?? 0
     if (this.now() < rejectedUntil) return true
     const last = this.rt.lastAssetTs.get(asset) ?? 0
@@ -1179,7 +1317,28 @@ export class ModeService {
     // again.
     const effectiveCooldown = Math.max(this.config.cooldownSec, ModeService.MIN_ASSET_COOLDOWN_SEC)
     if (this.now() - last < effectiveCooldown) return true
-    return this.hasOpenAutoOn(asset)
+    if (this.hasOpenAutoOn(asset)) return true
+    const label = this.fixedStrategyLabel()
+    if (label && this.config.streakBreaker !== false && this.isBenched(`${label}|${asset}`)) return true
+    if (this.config.correlationGuard !== false && this.correlationBlocked(asset)) return true
+    return false
+  }
+
+  /** True when a DIFFERENT asset the auto-trader already has open shares a
+   * correlation group with this candidate - treating them as one exposure,
+   * not two "diversified" ones. */
+  private correlationBlocked(asset: string): boolean {
+    const group = ModeService.correlationGroupOf(asset)
+    if (group === null) return false
+    try {
+      const openAssets = this.store
+        .listPositions('open', 100)
+        .filter((p) => p.note?.startsWith('auto:') && p.asset !== asset)
+        .map((p) => p.asset)
+      return openAssets.some((a) => ModeService.correlationGroupOf(a) === group)
+    } catch {
+      return false
+    }
   }
 
   private emit(level: 'info' | 'warn' | 'danger' | 'success', message: string): void {
@@ -1251,7 +1410,7 @@ export class ModeService {
     this.rt = rt
   }
 
-  private onPositionClosed(position: { note?: string; pnl?: number; status: string; tsOpen: number; tsClose?: number; amount: number; payout: number }): void {
+  private onPositionClosed(position: { note?: string; pnl?: number; status: string; tsOpen: number; tsClose?: number; amount: number; payout: number; asset?: string; strategy?: string }): void {
     if (!position.note?.startsWith('auto:')) return
     this.rolloverIfNeeded()
     this.rt.openCount = Math.max(0, this.rt.openCount - 1)
@@ -1263,6 +1422,28 @@ export class ModeService {
     } else if (position.status === 'lost') {
       this.rt.losses += 1
       this.rt.pnlToday += pnl
+    }
+
+    // streak-breaker: track consecutive losses per (strategy, pair) - the
+    // exact identity recorded on the position at placement time, so this
+    // works uniformly across every signalSource (a fixed label like
+    // "kalman-ou-reversion", or a specific strategy/ensemble member id).
+    if (position.asset && position.strategy && (position.status === 'won' || position.status === 'lost')) {
+      const key = `${position.strategy}|${position.asset}`
+      if (position.status === 'lost') {
+        const streak = (this.lossStreak.get(key) ?? 0) + 1
+        this.lossStreak.set(key, streak)
+        if (streak >= ModeService.STREAK_BENCH_THRESHOLD) {
+          const benchSec = Math.min(
+            ModeService.STREAK_BENCH_MAX_SEC,
+            ModeService.STREAK_BENCH_BASE_SEC * 2 ** (streak - ModeService.STREAK_BENCH_THRESHOLD)
+          )
+          this.benchedUntil.set(key, this.now() + benchSec)
+          this.emit('warn', `[AUTO-TRADER] streak-breaker: ${key} benched ${Math.round(benchSec / 60)}min after ${streak} losses in a row`)
+        }
+      } else {
+        this.lossStreak.set(key, 0)
+      }
     }
 
     // compounding roll - SAME fold-in/burn math as autopilot.ts's
@@ -1332,14 +1513,32 @@ export class ModeService {
     }
   }
 
-  /** Mirrors autopilot.ts's stakeFor - same compounding math, same dust guard. */
-  private stakeForAuto(): { amount: number; pot: number; rollN: number; compound: boolean; phase: 'compound' | 'derisk' } {
+  /** smartStaking multiplier - reads the SAME 0-100 confidence every source
+   * already puts on its ScreenRow (no new signal needed): raw |score|-
+   * derived for screener/kalman-ou/markov/momentum/confluence, agreement %
+   * for an ensemble, or the proven Wilson win rate for an auto-learn pick.
+   * 70 is treated as "normal" (1.0x, roughly where most sources' own
+   * minConfidence floors sit) - below it tapers down to a 0.5x floor, above
+   * it scales up to a 1.5x cap. Returns 1 (no-op) when smartStaking is off
+   * or there's no row to read yet. */
+  private confidenceMultiplier(row?: ScreenRow): number {
+    if (this.config.smartStaking !== true || !row) return 1
+    return clamp(row.confidence / 70, 0.5, 1.5)
+  }
+
+  /** Mirrors autopilot.ts's stakeFor - same compounding math, same dust
+   * guard - with an optional smartStaking multiplier layered on top of
+   * EITHER the flat stake or the compounding plan's rolled amount, applied
+   * before a compounding plan's own maxStake clamp so that cap still has
+   * the final say. */
+  private stakeForAuto(row?: ScreenRow): { amount: number; pot: number; rollN: number; compound: boolean; phase: 'compound' | 'derisk' } {
+    const mult = this.confidenceMultiplier(row)
     const plan = this.config.stakePlan
-    if (!plan) return { amount: this.config.stake, pot: 0, rollN: 0, compound: false, phase: 'compound' }
+    if (!plan) return { amount: Math.max(1, Math.round(this.config.stake * mult * 100) / 100), pot: 0, rollN: 0, compound: false, phase: 'compound' }
     const pot = this.rt.pot >= 0.01 ? this.rt.pot : plan.base
     const derisk = plan.deriskAfter !== undefined && plan.deriskPct !== undefined && this.rt.rollN >= plan.deriskAfter
     const rollPct = derisk ? plan.deriskPct! : (plan.rollPct ?? 100)
-    const raw = (pot * rollPct) / 100
+    const raw = ((pot * rollPct) / 100) * mult
     const amount = Math.min(plan.maxStake ?? 5000, Math.max(1, Math.round(raw * 100) / 100))
     return { amount, pot, rollN: this.rt.rollN, compound: true, phase: derisk ? 'derisk' : 'compound' }
   }
@@ -1394,6 +1593,10 @@ export class ModeService {
     if (patch.dailyLossLimit !== undefined) this.config.dailyLossLimit = Math.max(0, Number(patch.dailyLossLimit) || 0)
     if (patch.watchlist !== undefined)
       this.config.watchlist = Array.isArray(patch.watchlist) ? patch.watchlist.filter((x): x is string => typeof x === 'string') : []
+    if (patch.smartStaking !== undefined) this.config.smartStaking = Boolean(patch.smartStaking)
+    if (patch.correlationGuard !== undefined) this.config.correlationGuard = Boolean(patch.correlationGuard)
+    if (patch.streakBreaker !== undefined) this.config.streakBreaker = Boolean(patch.streakBreaker)
+    if (patch.avoidDeadHours !== undefined) this.config.avoidDeadHours = Boolean(patch.avoidDeadHours)
     if (patch.watchlistMode !== undefined) this.config.watchlistMode = patch.watchlistMode === 'exclude' ? 'exclude' : 'only'
     if (patch.stakePlan !== undefined) {
       const planChanged = JSON.stringify(this.config.stakePlan ?? null) !== JSON.stringify(patch.stakePlan ?? null)

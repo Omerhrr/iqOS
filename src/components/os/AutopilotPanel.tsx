@@ -1455,6 +1455,40 @@ function AutoTraderDialog({
             </p>
           </div>
 
+          <div className="col-span-2 rounded border border-[#1c2739] bg-[#0b1220] p-2">
+            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Smarts</Label>
+            <div className="mt-1 grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <p className="text-[10px] text-[#c7d2e3]">Confidence-weighted stake</p>
+                  <p className="text-[8px] leading-relaxed text-[#3d4c66]">size up on strong signals, down on weak ones (0.5x-1.5x) instead of a flat stake</p>
+                </div>
+                <Switch checked={d.smartStaking ?? false} onCheckedChange={(v) => p({ smartStaking: v })} />
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <p className="text-[10px] text-[#c7d2e3]">Correlation guard</p>
+                  <p className="text-[8px] leading-relaxed text-[#3d4c66]">won&apos;t open a 2nd position in a pair correlated with one already open</p>
+                </div>
+                <Switch checked={d.correlationGuard ?? true} onCheckedChange={(v) => p({ correlationGuard: v })} />
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <p className="text-[10px] text-[#c7d2e3]">Streak-breaker</p>
+                  <p className="text-[8px] leading-relaxed text-[#3d4c66]">benches a strategy on a pair after 3+ losses in a row, cooldown grows with the streak</p>
+                </div>
+                <Switch checked={d.streakBreaker ?? true} onCheckedChange={(v) => p({ streakBreaker: v })} />
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <p className="text-[10px] text-[#c7d2e3]">Avoid dead hours</p>
+                  <p className="text-[8px] leading-relaxed text-[#3d4c66]">stands aside on non-OTC pairs 21:00-23:00 UTC, the thinnest FX liquidity window</p>
+                </div>
+                <Switch checked={d.avoidDeadHours ?? false} onCheckedChange={(v) => p({ avoidDeadHours: v })} />
+              </div>
+            </div>
+          </div>
+
           <div>
             <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Signal timeframe</Label>
             <select
