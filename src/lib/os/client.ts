@@ -495,7 +495,7 @@ export interface StrategyInfo {
   id: string
   name: string
   description: string
-  params: { key: string; label: string; type: 'number' | 'select'; min?: number; max?: number; step?: number; options?: { value: string; label: string }[]; default: number | string }[]
+  params: { key: string; label: string; type: 'number' | 'select' | 'text'; min?: number; max?: number; step?: number; options?: { value: string; label: string }[]; default: number | string }[]
   defaults: Record<string, number | string>
 }
 

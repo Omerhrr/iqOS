@@ -706,17 +706,47 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
                   {draftStrategy.params.map((p) => (
                     <div key={p.key}>
                       <div className="mb-0.5 truncate text-[9px] text-[#4b5a72]">{p.label}</div>
-                      <Input
-                        value={String(draft.params?.[p.key] ?? p.default)}
-                        onChange={(e) => {
-                          const raw = e.target.value.replace(/[^0-9.\-]/g, '')
-                          const next = { ...(draft.params ?? {}) }
-                          if (raw === '' ) delete next[p.key]
-                          else next[p.key] = Number(raw)
-                          patch({ params: next })
-                        }}
-                        className="h-7 border-[#1c2739] bg-[#0b111c] text-[11px] text-[#e2e8f0]"
-                      />
+                      {p.type === 'select' ? (
+                        <select
+                          value={String(draft.params?.[p.key] ?? p.default)}
+                          onChange={(e) => {
+                            const next = { ...(draft.params ?? {}) }
+                            next[p.key] = e.target.value
+                            patch({ params: next })
+                          }}
+                          className="h-7 w-full rounded border border-[#1c2739] bg-[#0b111c] px-1.5 text-[11px] text-[#e2e8f0] outline-none"
+                        >
+                          {(p.options ?? []).map((o) => (
+                            <option key={o.value} value={o.value}>
+                              {o.label}
+                            </option>
+                          ))}
+                        </select>
+                      ) : p.type === 'text' ? (
+                        <Input
+                          value={String(draft.params?.[p.key] ?? p.default)}
+                          onChange={(e) => {
+                            const next = { ...(draft.params ?? {}) }
+                            if (e.target.value.trim() === '') delete next[p.key]
+                            else next[p.key] = e.target.value
+                            patch({ params: next })
+                          }}
+                          placeholder={String(p.default)}
+                          className="h-7 border-[#1c2739] bg-[#0b111c] text-[11px] text-[#e2e8f0]"
+                        />
+                      ) : (
+                        <Input
+                          value={String(draft.params?.[p.key] ?? p.default)}
+                          onChange={(e) => {
+                            const raw = e.target.value.replace(/[^0-9.\-]/g, '')
+                            const next = { ...(draft.params ?? {}) }
+                            if (raw === '') delete next[p.key]
+                            else next[p.key] = Number(raw)
+                            patch({ params: next })
+                          }}
+                          className="h-7 border-[#1c2739] bg-[#0b111c] text-[11px] text-[#e2e8f0]"
+                        />
+                      )}
                     </div>
                   ))}
                 </div>
@@ -1421,6 +1451,20 @@ function AutoTraderDialog({
                                   </option>
                                 ))}
                               </select>
+                            ) : prm.type === 'text' ? (
+                              <Input
+                                value={String(d.strategyParams?.[s.id]?.[prm.key] ?? prm.default)}
+                                onChange={(e) => {
+                                  const next = { ...(d.strategyParams ?? {}) }
+                                  const forId = { ...(next[s.id] ?? {}) }
+                                  if (e.target.value.trim() === '') delete forId[prm.key]
+                                  else forId[prm.key] = e.target.value
+                                  next[s.id] = forId
+                                  p({ strategyParams: next })
+                                }}
+                                placeholder={String(prm.default)}
+                                className="h-7 border-[#1c2739] bg-[#0b111c] text-[11px] text-[#e2e8f0]"
+                              />
                             ) : (
                               <Input
                                 value={String(d.strategyParams?.[s.id]?.[prm.key] ?? prm.default)}

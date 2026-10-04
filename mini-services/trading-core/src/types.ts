@@ -352,7 +352,7 @@ export interface AnalysisResult {
 export interface StrategyParam {
   key: string
   label: string
-  type: 'number' | 'select'
+  type: 'number' | 'select' | 'text'
   min?: number
   max?: number
   step?: number
