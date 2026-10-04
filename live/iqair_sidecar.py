@@ -1000,17 +1000,31 @@ class Handler(BaseHTTPRequestHandler):
                     # a price quote we compare against strike/entry ourselves.
                     # Walks the same unified portfolio endpoints get_digital_position()
                     # already uses (get_positions() for still-open, then
-                    # get_position_history_v2() once IQ has closed it out),
-                    # matches the row via position_matches_order_id() (handles
-                    # turbo/binary's external_id==order_id as well as digital's
-                    # raw_event.order_ids list), and reports IQ's own pnl - this
-                    # is what "wait for IQ to report back" means: we ask the
-                    # broker what actually happened instead of inferring
-                    # win/loss from a fetched candle/stream price.
-                    order_id = body.get("order_id")
-                    if order_id is None:
+                    # get_position_history_v2() once IQ has closed it out) and
+                    # reports IQ's own pnl - this is what "wait for IQ to
+                    # report back" means: we ask the broker what actually
+                    # happened instead of inferring win/loss from a fetched
+                    # candle/stream price.
+                    #
+                    # Matching and pnl extraction are done HERE, self-contained,
+                    # rather than via iqair's position_matches_order_id()/
+                    # get_pnl() helpers: that first version shipped matched only
+                    # on "external_id", but /positions's own working consumer
+                    # (reconcileLiveMeta in the kernel, matching open orders for
+                    # the expiry/open-price true-up) has always matched on "id"
+                    # instead and works - meaning external_id was the wrong key
+                    # for this account's row shape, so every lookup silently
+                    # came back empty and this endpoint ALWAYS fell through to
+                    # the old price-based ladder, which is exactly the bug this
+                    # endpoint exists to fix. Checking every plausible id field
+                    # with a string-normalized compare (int vs str id drift is
+                    # the other way this kind of match silently fails) removes
+                    # the guesswork, and also sidesteps needing a newer iqair
+                    # version just for those two helper methods to exist at all.
+                    order_id_raw = body.get("order_id")
+                    if order_id_raw is None:
                         return self._send(_err("order_id required"), 400)
-                    order_id = str(order_id)
+                    order_id_str = str(order_id_raw)
                     mode = (body.get("mode") or "turbo").lower()
                     wait = min(float(body.get("max_wait_sec", 6)), 20)
                     types = (
@@ -1020,10 +1034,38 @@ class Handler(BaseHTTPRequestHandler):
                         if mode.startswith("binary")
                         else ["turbo-option", "binary-option", "digital-option"]
                     )
-                    match_fn = getattr(_client, "position_matches_order_id", None)
-                    pnl_fn = getattr(_client, "get_pnl", None)
-                    if match_fn is None or pnl_fn is None:
-                        return self._send(_err("iqair client missing position_matches_order_id/get_pnl - upgrade iqair"), 502)
+
+                    def _row_matches(item):
+                        for key in ("id", "external_id", "position_id", "order_id"):
+                            v = item.get(key)
+                            if v is not None and str(v) == order_id_str:
+                                return True
+                        raw_event = item.get("raw_event") or {}
+                        for value in raw_event.values():
+                            if isinstance(value, dict):
+                                for oid in value.get("order_ids", []) or []:
+                                    if str(oid) == order_id_str:
+                                        return True
+                        return False
+
+                    def _row_outcome(item):
+                        status = item.get("status")
+                        if status == "open":
+                            return {"status": "open"}
+                        pnl = item.get("pnl")
+                        if not isinstance(pnl, (int, float)):
+                            # closed rows sometimes carry close_profit/invest
+                            # instead of a precomputed pnl - derive it the same
+                            # way the (unused) get_pnl() helper would have
+                            invest = item.get("invest")
+                            close_profit = item.get("close_profit")
+                            if isinstance(close_profit, (int, float)) and isinstance(invest, (int, float)):
+                                pnl = close_profit - invest
+                        out = {"status": "closed", "close_reason": item.get("close_reason")}
+                        if isinstance(pnl, (int, float)):
+                            out["pnl"] = pnl
+                        return out
+
                     for itype in types:
                         try:
                             ok, data = _client.get_positions(itype, max_wait_sec=wait)
@@ -1031,20 +1073,22 @@ class Handler(BaseHTTPRequestHandler):
                             ok, data = False, None
                         if ok and isinstance(data, dict):
                             for item in data.get("positions", []) or []:
-                                if match_fn(item, order_id):
-                                    info = pnl_fn(item)
-                                    if info.get("status") == "open":
+                                if _row_matches(item):
+                                    outcome = _row_outcome(item)
+                                    if outcome.get("status") == "open":
                                         return self._send(_ok({"found": True, "status": "open", "instrument_type": itype}))
-                                    return self._send(_ok({"found": True, "status": "closed", "instrument_type": itype, **info}))
+                                    if "pnl" in outcome:
+                                        return self._send(_ok({"found": True, "instrument_type": itype, **outcome}))
                         try:
                             ok2, data2 = _client.get_position_history_v2(itype, 20, 0, max_wait_sec=wait)
                         except Exception:  # noqa: BLE001
                             ok2, data2 = False, None
                         if ok2 and isinstance(data2, dict):
                             for item in data2.get("positions", []) or []:
-                                if match_fn(item, order_id):
-                                    info = pnl_fn(item)
-                                    return self._send(_ok({"found": True, "status": "closed", "instrument_type": itype, **info}))
+                                if _row_matches(item):
+                                    outcome = _row_outcome(item)
+                                    if "pnl" in outcome:
+                                        return self._send(_ok({"found": True, "instrument_type": itype, **outcome}))
                     # not found anywhere yet - caller's ladder decides whether to
                     # keep polling or fall back to a price-based quote
                     return self._send(_ok({"found": False, "status": "unknown"}))
