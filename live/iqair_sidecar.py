@@ -995,6 +995,60 @@ class Handler(BaseHTTPRequestHandler):
                         return self._send(_err(f"order rejected: {order_id}"), 502)
                     return self._send(_ok({"order_id": order_id, "mode": mode, "asset": asset, "expired": expired}))
 
+                if path == "/order_result":
+                    # Authoritative broker-side outcome for a placed order - NOT
+                    # a price quote we compare against strike/entry ourselves.
+                    # Walks the same unified portfolio endpoints get_digital_position()
+                    # already uses (get_positions() for still-open, then
+                    # get_position_history_v2() once IQ has closed it out),
+                    # matches the row via position_matches_order_id() (handles
+                    # turbo/binary's external_id==order_id as well as digital's
+                    # raw_event.order_ids list), and reports IQ's own pnl - this
+                    # is what "wait for IQ to report back" means: we ask the
+                    # broker what actually happened instead of inferring
+                    # win/loss from a fetched candle/stream price.
+                    order_id = body.get("order_id")
+                    if order_id is None:
+                        return self._send(_err("order_id required"), 400)
+                    order_id = str(order_id)
+                    mode = (body.get("mode") or "turbo").lower()
+                    wait = min(float(body.get("max_wait_sec", 6)), 20)
+                    types = (
+                        ["digital-option", "turbo-option", "binary-option"]
+                        if mode.startswith("digital")
+                        else ["binary-option", "turbo-option"]
+                        if mode.startswith("binary")
+                        else ["turbo-option", "binary-option", "digital-option"]
+                    )
+                    match_fn = getattr(_client, "position_matches_order_id", None)
+                    pnl_fn = getattr(_client, "get_pnl", None)
+                    if match_fn is None or pnl_fn is None:
+                        return self._send(_err("iqair client missing position_matches_order_id/get_pnl - upgrade iqair"), 502)
+                    for itype in types:
+                        try:
+                            ok, data = _client.get_positions(itype, max_wait_sec=wait)
+                        except Exception:  # noqa: BLE001
+                            ok, data = False, None
+                        if ok and isinstance(data, dict):
+                            for item in data.get("positions", []) or []:
+                                if match_fn(item, order_id):
+                                    info = pnl_fn(item)
+                                    if info.get("status") == "open":
+                                        return self._send(_ok({"found": True, "status": "open", "instrument_type": itype}))
+                                    return self._send(_ok({"found": True, "status": "closed", "instrument_type": itype, **info}))
+                        try:
+                            ok2, data2 = _client.get_position_history_v2(itype, 20, 0, max_wait_sec=wait)
+                        except Exception:  # noqa: BLE001
+                            ok2, data2 = False, None
+                        if ok2 and isinstance(data2, dict):
+                            for item in data2.get("positions", []) or []:
+                                if match_fn(item, order_id):
+                                    info = pnl_fn(item)
+                                    return self._send(_ok({"found": True, "status": "closed", "instrument_type": itype, **info}))
+                    # not found anywhere yet - caller's ladder decides whether to
+                    # keep polling or fall back to a price-based quote
+                    return self._send(_ok({"found": False, "status": "unknown"}))
+
                 if path == "/close_trade":
                     mode = (body.get("mode") or "turbo").lower()
                     order_id = body.get("order_id")

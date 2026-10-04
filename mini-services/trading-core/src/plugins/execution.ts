@@ -659,19 +659,27 @@ export class ExecutionService {
   }
 
   /**
-   * LIVE options settle against the sidecar's OWN EXPIRY QUOTE: candles
-   * requested with end=<expiry second> give the broker-side price IQ itself
-   * settles on - regardless of which asset the kernel chart is ticking (the
-   * old active-asset tick went stale the moment the operator switched charts).
-   * Ladder per sweep: 1s candle -> 5s candle -> 1m candle at the expiry
-   * second; after a few sweeps the sidecar's live stream price (degraded,
-   * post-expiry); after ~45s the kernel feed as a last resort. Nothing here
-   * ever books a paper-balance move - IQ's ledger is the money.
+   * LIVE options settle against IQ's OWN authoritative order result first -
+   * never a price quote we compute win/loss from ourselves. We ask the
+   * sidecar's /order_result (which walks IQ's own portfolio/history
+   * endpoints and matches our order id - see iqOrderResult()) whether the
+   * broker has already closed this order out, and if so trust ITS pnl sign,
+   * full stop. Only when IQ hasn't reported back yet do we fall back to the
+   * price-quote ladder below (own expiry candle -> degraded stream -> kernel
+   * feed), which stays as a best-effort stand-in while waiting, not as a
+   * substitute for the broker's own result once it's available.
    */
   private async settleLiveExpiry(pos: Position): Promise<void> {
     const expiresAt = pos.settlesAt ?? this.now()
     const attempt = (this.expiryAttempts.get(pos.id) ?? 0) + 1
     this.expiryAttempts.set(pos.id, attempt)
+    if (pos.liveOrderId) {
+      const result = await this.iqOrderResult(pos.liveOrderId, pos.kind)
+      if (result?.found && result.status === 'closed' && Number.isFinite(result.pnl)) {
+        this.finishLiveExpiryFromBroker(pos, result.pnl as number)
+        return
+      }
+    }
     const quote = await this.iqExpiryQuote(pos.asset, expiresAt)
     if (quote) {
       this.finishLiveExpiry(pos, quote.price, quote.src)
@@ -707,6 +715,39 @@ export class ExecutionService {
     this.settlingLive.delete(pos.id)
     this.expiryAttempts.delete(pos.id)
     this.settleExpiry(pos, price, via)
+  }
+
+  /**
+   * Settle directly from IQ's own reported pnl (see iqOrderResult) - no
+   * price/strike comparison at all, because the broker already decided.
+   * draw (pnl === 0, e.g. an at-the-money refund) stays 'won' with $0 pnl,
+   * matching settleExpiry's existing draw convention.
+   */
+  private finishLiveExpiryFromBroker(pos: Position, pnl: number): void {
+    this.settlingLive.delete(pos.id)
+    this.expiryAttempts.delete(pos.id)
+    const status: 'won' | 'lost' = pnl < 0 ? 'lost' : 'won'
+    this.settle(pos.id, pos.entryPrice, status, pnl, 'iq order result (broker-reported)')
+  }
+
+  /**
+   * Ask the sidecar whether IQ has closed this order out yet, and what it
+   * paid - the actual "wait for iq to report back before deciding" check.
+   * Returns null on a sidecar hiccup (caller falls back to the price ladder
+   * for this sweep and just retries next tick); { found: false } means IQ
+   * hasn't settled it yet either.
+   */
+  private async iqOrderResult(
+    liveOrderId: string,
+    kind: Position['kind']
+  ): Promise<{ found: boolean; status?: string; pnl?: number } | null> {
+    const mode = kind === 'digital' ? 'digital' : kind === 'binary' ? 'binary' : 'turbo'
+    const res = await this.postLive('/order_result', { order_id: liveOrderId, mode, max_wait_sec: 6 }, 10_000)
+    if (!res || res.ok === false) return null
+    const found = res.found === true
+    const status = typeof res.status === 'string' ? res.status : undefined
+    const pnl = Number(res.pnl)
+    return { found, status, pnl: Number.isFinite(pnl) ? pnl : undefined }
   }
 
   /**
