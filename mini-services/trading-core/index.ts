@@ -15,6 +15,7 @@ import { executionPlugin, ExecutionService, type RiskConfig } from './src/plugin
 import { autopilotPlugin, AutopilotService, type BotConfig } from './src/plugins/autopilot'
 import { labPlugin, StrategyLabService } from './src/plugins/lab'
 import { screenerPlugin, ScreenerService } from './src/plugins/screener'
+import { screener2Plugin, Screener2Service } from './src/plugins/screener2'
 import { alertRulesPlugin, AlertRulesService, ALERT_METRICS } from './src/plugins/alert-rules'
 import { sentinelPlugin, SentinelService, type SentinelConfig } from './src/plugins/sentinel'
 import { watchdogPlugin, WatchdogService, type WatchdogConfig } from './src/plugins/watchdog'
@@ -43,6 +44,7 @@ kernel.register(executionPlugin)
 kernel.register(labPlugin)
 kernel.register(autopilotPlugin)
 kernel.register(screenerPlugin)
+kernel.register(screener2Plugin)
 kernel.register(alertRulesPlugin)
 kernel.register(sentinelPlugin)
 kernel.register(watchdogPlugin)
@@ -306,6 +308,28 @@ const httpServer = createServer(async (req, res) => {
 
       if (path === '/screener_status') {
         const scr = kernel.context().use<ScreenerService>('screener')
+        return json(200, { ok: true, status: scr.status(), config: scr.config })
+      }
+
+      // same feed, but scored with the full 14-factor confluence engine
+      // (confluenceSignalOnly/full Kalman fit) instead of the screener's
+      // cheaper ouState approximation - see screener2.ts
+      if (path === '/screener2') {
+        const scr = kernel.context().use<Screener2Service>('screener2')
+        const direction = (q.get('direction') ?? 'all') as 'all' | 'call' | 'put'
+        const out = scr.top({
+          tf: q.get('tf') ? tf(q.get('tf')) : undefined,
+          category: q.get('category') ?? 'all',
+          direction: ['all', 'call', 'put'].includes(direction) ? direction : 'all',
+          minScore: Number(q.get('minScore') ?? 0),
+          q: q.get('q') ?? undefined,
+          limit: Math.min(Number(q.get('limit') ?? 40), 200),
+        })
+        return json(200, { ok: true, tf: q.get('tf') ?? 'all', ...out })
+      }
+
+      if (path === '/screener2_status') {
+        const scr = kernel.context().use<Screener2Service>('screener2')
         return json(200, { ok: true, status: scr.status(), config: scr.config })
       }
 
