@@ -40,6 +40,14 @@ export interface ScreenRow {
    * of a single strategy/ensemble fired and what they said). Undefined for
    * every row the original Screener itself produces. */
   note?: string
+  /** Optional override for the execution-record "strategy" attribution
+   * field (see os-mode.ts's 'strategy' auto-trader source) - set when the
+   * generic signalSource-based label would be wrong, e.g. the 'best'
+   * auto-learn pick mode MUST tag the trade with the specific pool member
+   * that actually fired, never a pooled/combined label, or its own
+   * per-strategy win-rate learning (adaptive.ts reads the "strategy"
+   * column) could never build a clean record for that member. */
+  strategyLabel?: string
   ts: number // candle time the row was computed on
   computedTs: number // wall clock when computed
 }

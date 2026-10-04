@@ -1186,7 +1186,13 @@ function AutoTraderStrip({
                   : at.config.signalSource === 'strategy'
                     ? (() => {
                         const ids = at.config.strategyIds?.length ? at.config.strategyIds : at.config.strategyId ? [at.config.strategyId] : []
-                        return ids.length === 0 ? 'STRAT·none picked' : ids.length === 1 ? `STRAT·${ids[0]}` : `ENSEMBLE·${ids.length}≥${at.config.minConfidence}%`
+                        return ids.length === 0
+                          ? 'STRAT·none picked'
+                          : ids.length === 1
+                            ? `STRAT·${ids[0]}`
+                            : at.config.strategyPickMode === 'best'
+                              ? `AUTO-LEARN·${ids.length}`
+                              : `ENSEMBLE·${ids.length}≥${at.config.minConfidence}%`
                       })()
                     : `score ≥${at.config.minScore}`}
           {' · '}{at.config.tf} ·{' '}
@@ -1308,19 +1314,20 @@ function AutoTraderDialog({
                     : d.signalSource === 'confluence'
                       ? 'the EXACT 14-factor Confluence Signal panel/confluence_read engine, re-fit bar-fresh on each candidate (full Kalman/OU, not the screener sweep\'s cheaper approximation) - identical read to what the panel/copilot would show for that pair right now'
                       : d.signalSource === 'strategy'
-                        ? 'one specific strategy picked below, or several combined as an ENSEMBLE (majority vote) - the same strategyId an autopilot bot would use (a builtin strategy, or an AI Lab-learned "(Lab)" spec), not pinned to one bot\'s watchlist'
+                        ? 'one specific strategy picked below, or several combined - as a vote (ENSEMBLE) or an AUTO-LEARN pool that trades whichever member is proven best per pair - the same strategyId an autopilot bot would use (a builtin strategy, or an AI Lab-learned "(Lab)" spec), not pinned to one bot\'s watchlist'
                         : 'takes the strongest full-composite screener signals market-wide (trend + momentum + statistical + patterns)'}
             </p>
           </div>
 
           {d.signalSource === 'strategy' && (() => {
             const picked = d.strategyIds?.length ? d.strategyIds : d.strategyId ? [d.strategyId] : []
-            const isEnsemble = picked.length > 1
+            const isPool = picked.length > 1
+            const pickMode = d.strategyPickMode ?? 'ensemble'
             const only = picked.length === 1 ? strategies.find((s) => s.id === picked[0]) : undefined
             return (
               <div className="col-span-2">
                 <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">
-                  Strategy{isEnsemble ? ` (ensemble of ${picked.length})` : ''} - search to add, pick more than one for an ensemble
+                  Strategy{isPool ? ` (${picked.length} picked)` : ''} - search to add, pick more than one to combine
                 </Label>
                 <StrategyPicker
                   strategies={strategies}
@@ -1337,18 +1344,41 @@ function AutoTraderDialog({
                     {only.description || `trades "${only.name}" on every open pair (respecting the watchlist below, if set)`}
                   </p>
                 )}
-                {isEnsemble && (
+                {isPool && (
                   <>
-                    <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
-                      every member strategy votes CALL/PUT/none on each pair; the majority direction wins (a tie skips the pair) -
-                      this ensemble trades only when {d.minConfidence}% or more of the {picked.length} members agree, and their
-                      average score still clears Min score below.
-                    </p>
-                    <NumField
-                      label="Min agreement % (ensemble)"
-                      value={d.minConfidence}
-                      onChange={(v) => p({ minConfidence: Math.min(100, Math.max(1, v)) })}
+                    <Segmented
+                      label="Combine as"
+                      options={[
+                        { v: 'ensemble', label: 'Ensemble (vote)' },
+                        { v: 'best', label: 'Auto-learn (best per pair)' },
+                      ]}
+                      value={pickMode}
+                      onChange={(v) => p({ strategyPickMode: v as 'ensemble' | 'best' })}
                     />
+                    {pickMode === 'best' ? (
+                      <p className="col-span-2 mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+                        auto-learn: on every pair, each of the {picked.length} picked strategies fires independently and the
+                        auto-trader reads ITS OWN settled-trade record for that exact pair (the same proven-record math the
+                        adaptive gate already uses) - whichever member has the strongest proven win rate there gets traded,
+                        so over time a pair naturally ends up run by whichever of your picks actually works on it. A member
+                        with no record yet on a pair falls back to its raw signal score, so every member keeps getting a
+                        turn until it has something to learn from. Every trade is tagged with the specific member that
+                        fired, never a combined label, so each one builds its own clean per-pair record.
+                      </p>
+                    ) : (
+                      <p className="col-span-2 mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+                        every member strategy votes CALL/PUT/none on each pair; the majority direction wins (a tie skips the pair) -
+                        trades only when {d.minConfidence}% or more of the {picked.length} members agree, and their average score
+                        still clears Min score below.
+                      </p>
+                    )}
+                    {pickMode === 'ensemble' && (
+                      <NumField
+                        label="Min agreement % (ensemble)"
+                        value={d.minConfidence}
+                        onChange={(v) => p({ minConfidence: Math.min(100, Math.max(1, v)) })}
+                      />
+                    )}
                   </>
                 )}
                 <NumField label="Min score" value={d.minScore} onChange={(v) => p({ minScore: v })} />

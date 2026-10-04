@@ -1176,6 +1176,13 @@ export interface AutoTraderConfig {
    * the majority direction wins, and minConfidence is reused as the
    * minimum agreement % the majority must reach. */
   strategyIds?: string[]
+  /** How a 2+-member strategyIds pool combines into one signal per pair.
+   * 'ensemble' (default) - every member votes, majority wins. 'best' - the
+   * OS's own auto-learn: for each candidate pair, trades whichever pool
+   * member has the strongest PROVEN (Wilson-lower-bound, from its own
+   * settled trades on that exact pair) win rate, falling back to raw score
+   * for members still building a record. */
+  strategyPickMode?: 'ensemble' | 'best'
   direction: 'both' | 'call' | 'put'
   maxOpen: number
   cooldownSec: number

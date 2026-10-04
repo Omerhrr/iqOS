@@ -110,6 +110,16 @@ export class MarketDataService {
     return this.sidecarFetch
   }
 
+  /** Force the next ensureSidecarAssets() caller to hit the sidecar instead
+   * of serving the (up to 10 min stale) cached rows - used right after a
+   * live order comes back rejected as "asset not available", which means
+   * our is_open cache is already wrong for that pair and the normal TTL
+   * would otherwise let callers keep trusting it for several more minutes. */
+  forceRefreshSidecarAssets(): void {
+    this.sidecarAssetsTs = 0
+    void this.ensureSidecarAssets()
+  }
+
   private async fetchSidecarAssets(): Promise<Set<string> | null> {
     try {
       const res = await fetch(`${this.liveUrl.replace(/\/$/, '')}/assets`, { signal: AbortSignal.timeout(150_000) })

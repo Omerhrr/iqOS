@@ -48,6 +48,7 @@ import type { Screener2Service, ConfluenceRow } from './screener2'
 import type { MarketDataService } from './market-data'
 import type { AnalyticsService } from './analytics'
 import type { StrategyLabService } from './lab'
+import type { AdaptiveService } from './adaptive'
 import { walkForward } from '../strategies/optimize'
 import { getStrategy, defaultParams } from '../strategies/builtin'
 
@@ -99,8 +100,22 @@ export interface AutoTraderConfig {
    * each candidate, the majority direction wins, and minConfidence doubles
    * as the minimum agreement % (e.g. 60 = at least 60% of the ensemble must
    * agree) required to act - no classic "confidence" exists at the
-   * strategy level, so this is the natural place to put that threshold. */
+   * strategy level, so this is the natural place to put that threshold.
+   * Only used when strategyPickMode is 'ensemble' (the default when unset). */
   strategyIds?: string[]
+  /** How a 2+-member strategyIds pool combines into one signal per pair.
+   * 'ensemble' (default) - every member votes, majority wins (see strategyIds
+   * above). 'best' - the OS's own auto-learn: reads the adaptive gate's
+   * settled-trade record (adaptive.ts - same Wilson-lower-bound win rate math
+   * it already uses to gate bots) for EACH pool member against THIS exact
+   * candidate pair/side/score-bucket, and trades whichever member has the
+   * strongest proven record for that specific pair - a strategy that's
+   * mediocre overall but excellent on e.g. XAUUSD will get picked there and
+   * nowhere else. Members with no settled record yet fall back to raw
+   * |score| so the pool keeps exploring until it has something to learn
+   * from; a proven member always outranks an unproven one. No effect with
+   * 0-1 ids. */
+  strategyPickMode?: 'ensemble' | 'best'
   direction: 'both' | 'call' | 'put'
   maxOpen: number // max concurrent auto-trader positions
   cooldownSec: number // per-asset re-entry cooldown
@@ -190,6 +205,19 @@ export class ModeService {
   private timer: ReturnType<typeof setInterval> | null = null
   private ticking = false
 
+  /** Broker-side "this pair isn't tradable right now" rejections - not a
+   * misconfiguration, just our is_open cache lagging IQ's own schedule
+   * (weekend OTC closures, mid-day suspensions). Matches the sidecar's
+   * `order rejected: Cannot purchase an option (the asset is not available
+   * at the moment).` and the "not a turbo/binary/digital instrument"
+   * account-mismatch rejection. */
+  private static BROKER_UNAVAILABLE_RE = /not available at the moment|is not a (?:turbo\/binary\/digital|digital\/turbo\/binary) instrument/i
+  private static BROKER_UNAVAILABLE_COOLDOWN_SEC = 600
+  /** asset -> unix ts until which pickSignal skips it, set on the rejection
+   * above so the SAME closed pair isn't retried (and re-rejected) on every
+   * 10s tick until the asset cache has a chance to catch up. */
+  private assetRejectedUntil = new Map<string, number>()
+
   mode: OsMode = 'human'
   ts = Math.floor(Date.now() / 1000)
   reason = 'initial state'
@@ -246,6 +274,7 @@ export class ModeService {
           strategyIds: Array.isArray(c.strategyIds)
             ? c.strategyIds.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).map((x) => x.trim())
             : undefined,
+          strategyPickMode: c.strategyPickMode === 'best' ? 'best' : 'ensemble',
           direction: c.direction === 'call' || c.direction === 'put' ? c.direction : 'both',
           maxOpen: Math.round(num(c.maxOpen, DEFAULT_AUTOTRADER.maxOpen)),
           cooldownSec: Math.round(num(c.cooldownSec, DEFAULT_AUTOTRADER.cooldownSec)),
@@ -411,7 +440,25 @@ export class ModeService {
 
     const side = row.direction === 'put' ? 'put' : 'call'
     const out = await this.place(row, side, bet.amount)
-    if (!out.ok) return this.standDown(out.error ?? 'order rejected')
+    if (!out.ok) {
+      const reason = out.error ?? 'order rejected'
+      if (ModeService.BROKER_UNAVAILABLE_RE.test(reason)) {
+        // IQ itself just said this pair isn't tradable right now - our own
+        // open/closed cache (sidecarAssetsTs, up to 10 min stale) is already
+        // wrong for it, and without this the picker just re-selects the
+        // same top-ranked-but-closed pair on the very next 10s tick, so the
+        // SAME rejection repeats "a lot" forever. Take it off the table for
+        // a while and kick a fresh /assets fetch so the cache catches up
+        // sooner than its normal TTL.
+        this.assetRejectedUntil.set(row.asset, this.now() + ModeService.BROKER_UNAVAILABLE_COOLDOWN_SEC)
+        try {
+          this.ctx.use<{ forceRefreshSidecarAssets: () => void }>('market').forceRefreshSidecarAssets()
+        } catch {
+          // market plugin not loaded - cache catches up on its own next cycle
+        }
+      }
+      return this.standDown(reason)
+    }
 
     this.rt.trades += 1
     this.rt.lastTradeTs = this.now()
@@ -738,7 +785,43 @@ export class ModeService {
           const v = votes[0]
           if (this.config.direction !== 'both' && v.direction !== this.config.direction) continue
           if (Math.abs(v.score) < this.config.minScore) continue
-          return ModeService.strategyEvalToScreenRow(asset, this.config.tf, v.direction, v.score, price, `${v.id} score ${Math.abs(v.score).toFixed(0)}`)
+          return ModeService.strategyEvalToScreenRow(asset, this.config.tf, v.direction, v.score, price, `${v.id} score ${Math.abs(v.score).toFixed(0)}`, undefined, v.id)
+        }
+
+        if (this.config.strategyPickMode === 'best') {
+          // auto-learn: rank this tick's firing members by THEIR OWN proven
+          // record for THIS exact pair (adaptive.ts's Wilson-lower-bound
+          // read, read-only here - never gates, only ranks), not a vote.
+          // A member still cold-starting on this pair falls back to raw
+          // |score| so it keeps getting picked often enough to build a
+          // record; once any member clears the adaptive gate's own sample
+          // floor, a proven result always outranks an unproven one.
+          let adaptive: AdaptiveService | null = null
+          try {
+            adaptive = this.ctx.use<AdaptiveService>('adaptive')
+          } catch {
+            adaptive = null
+          }
+          let best: { id: string; direction: 'call' | 'put'; score: number; rank: number; proven: boolean } | null = null
+          for (const v of votes) {
+            let rank = Math.abs(v.score)
+            let proven = false
+            if (adaptive) {
+              const verdict = adaptive.check(asset, this.config.tf, v.id, v.direction, v.score)
+              if (verdict.trades >= adaptive.config.minSampleSize) {
+                rank = verdict.wilsonLowerPct
+                proven = true
+              }
+            }
+            if (!best || (proven && !best.proven) || (proven === best.proven && rank > best.rank)) best = { id: v.id, direction: v.direction, score: v.score, rank, proven }
+          }
+          if (!best) continue
+          if (this.config.direction !== 'both' && best.direction !== this.config.direction) continue
+          if (Math.abs(best.score) < this.config.minScore) continue
+          const note = best.proven
+            ? `auto-learn: ${best.id} proven best for ${asset} (${best.rank.toFixed(0)}% win rate, 95% floor)`
+            : `auto-learn: ${best.id} highest edge for ${asset} (score ${Math.abs(best.score).toFixed(0)}) - still building its own record`
+          return ModeService.strategyEvalToScreenRow(asset, this.config.tf, best.direction, best.score, price, note, best.proven ? Math.round(best.rank) : undefined, best.id)
         }
 
         // ensemble: majority vote, agreement %, average |score| of the agreeing members
@@ -759,7 +842,8 @@ export class ModeService {
           avgScore,
           price,
           `ensemble ${majority.length}/${liveSpecs.length} agree (${majority.map((v) => v.id).join(', ')}) · avg ${avgScore.toFixed(0)}`,
-          agreementPct
+          agreementPct,
+          `ensemble:${majority.map((v) => v.id).join('+')}`
         )
       }
     } catch {
@@ -781,7 +865,8 @@ export class ModeService {
     score: number,
     price: number,
     note?: string,
-    confidenceOverride?: number
+    confidenceOverride?: number,
+    strategyLabel?: string
   ): ScreenRow {
     return {
       asset,
@@ -807,6 +892,7 @@ export class ModeService {
       payout: 0,
       topPattern: null,
       note,
+      strategyLabel,
       ts: Math.floor(Date.now() / 1000),
       computedTs: Math.floor(Date.now() / 1000),
     }
@@ -954,10 +1040,11 @@ export class ModeService {
                 : this.config.signalSource === 'confluence'
                   ? 'confluence-full'
                   : this.config.signalSource === 'strategy'
-                    ? (() => {
+                    ? (row.strategyLabel ??
+                      (() => {
                         const ids = this.effectiveStrategyIds()
                         return ids.length > 1 ? `ensemble:${ids.join('+')}` : ids[0] ?? 'custom-strategy'
-                      })()
+                      })())
                     : 'screener-auto',
         note: AUTOTRADER_NOTE,
       })
@@ -987,6 +1074,8 @@ export class ModeService {
    * applied by every signal picker (all 4 sources funnel through this). */
   private assetBlocked(asset: string): boolean {
     if (this.config.watchlist.length > 0 && !this.config.watchlist.includes(asset)) return true
+    const rejectedUntil = this.assetRejectedUntil.get(asset) ?? 0
+    if (this.now() < rejectedUntil) return true
     const last = this.rt.lastAssetTs.get(asset) ?? 0
     if (this.config.cooldownSec > 0 && this.now() - last < this.config.cooldownSec) return true
     return this.hasOpenAutoOn(asset)
@@ -1171,6 +1260,7 @@ export class ModeService {
       this.config.strategyIds = Array.isArray(patch.strategyIds)
         ? patch.strategyIds.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).map((x) => x.trim())
         : undefined
+    if (patch.strategyPickMode !== undefined) this.config.strategyPickMode = patch.strategyPickMode === 'best' ? 'best' : 'ensemble'
     if (patch.direction !== undefined && ['both', 'call', 'put'].includes(String(patch.direction)))
       this.config.direction = String(patch.direction) as AutoTraderConfig['direction']
     if (patch.maxOpen !== undefined) this.config.maxOpen = Math.round(clamp(Number(patch.maxOpen) || 1, 1, 10))
@@ -1212,7 +1302,9 @@ export class ModeService {
                       ? ' (no strategy picked)'
                       : ids.length === 1
                         ? ` (${ids[0]})`
-                        : ` (ensemble of ${ids.length}: ${ids.join(', ')} · ≥${this.config.minConfidence}% agreement)`
+                        : this.config.strategyPickMode === 'best'
+                          ? ` (auto-learn over ${ids.length}: ${ids.join(', ')} - trades whichever is proven best per pair)`
+                          : ` (ensemble of ${ids.length}: ${ids.join(', ')} · ≥${this.config.minConfidence}% agreement)`
                   })()
                 : ''
     this.emit(
