@@ -1334,11 +1334,26 @@ function AutoTraderDialog({
                   selected={picked}
                   onChange={(ids) => p({ strategyIds: ids, strategyId: ids[0] })}
                 />
-                {picked.length === 0 && (
+                {picked.length === 0 && !d.autoDiscover && (
                   <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
-                    nothing picked yet - the auto-trader stands aside until at least one strategy is selected
+                    nothing picked yet - the auto-trader stands aside until at least one strategy is selected, or turn on
+                    auto-discover below to let it find its own.
                   </p>
                 )}
+                <div className="mt-2 flex items-center justify-between gap-2 rounded border border-[#1c2739] bg-[#0b1220] p-2">
+                  <div>
+                    <p className="text-[10px] text-[#c7d2e3]">Auto-discover (full catalog + AI Lab mining)</p>
+                    <p className="text-[8px] leading-relaxed text-[#3d4c66]">
+                      ranks the ENTIRE builtin strategy catalog and every AI Lab spec per pair, and periodically mines a new AI
+                      Lab spec for pairs that do not have one yet - no manual picks needed, though any picked above are
+                      included too. Heavier: evaluates the full catalog every tick.
+                    </p>
+                  </div>
+                  <Switch
+                    checked={d.autoDiscover ?? false}
+                    onCheckedChange={(v) => p(v ? { autoDiscover: true, strategyPickMode: 'best' } : { autoDiscover: false })}
+                  />
+                </div>
                 {only && (
                   <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
                     {only.description || `trades "${only.name}" on every open pair (respecting the watchlist below, if set)`}

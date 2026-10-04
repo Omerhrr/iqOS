@@ -50,7 +50,7 @@ import type { AnalyticsService } from './analytics'
 import type { StrategyLabService } from './lab'
 import type { AdaptiveService } from './adaptive'
 import { walkForward } from '../strategies/optimize'
-import { getStrategy, defaultParams } from '../strategies/builtin'
+import { getStrategy, defaultParams, STRATEGIES } from '../strategies/builtin'
 import { classifyRegime } from '../analytics/regime'
 import { classifySession } from '../analytics/session'
 
@@ -118,6 +118,21 @@ export interface AutoTraderConfig {
    * from; a proven member always outranks an unproven one. No effect with
    * 0-1 ids. */
   strategyPickMode?: 'ensemble' | 'best'
+  /** Only matters with strategyPickMode 'best'. false (default) = auto-learn
+   * ranks only among the manually-picked strategyIds, as it always has.
+   * true = widens the pool it ranks EVERY tick to the entire builtin
+   * strategy catalog plus every non-decayed AI Lab spec that exists so far,
+   * AND periodically runs the AI Lab's own pattern-mining (learn()) on open
+   * pairs that do not yet have a reasonably fresh learned spec, saving
+   * whatever it finds so it joins the pool too - the auto-trader is no
+   * longer limited to strategies a human handed it; it can discover its
+   * own and then prove, per pair, which one (hand-picked, builtin, or
+   * self-discovered) actually works best there. Real compute cost: every
+   * tick now evaluates the full catalog on every candidate pair, and the
+   * discovery sweep itself is a CPU-heavy mining pass (bounded to at most
+   * one pair per tick, at most once every 6h per pair - see
+   * AUTO_DISCOVER_COOLDOWN_SEC). */
+  autoDiscover?: boolean
   /** Per-strategy param overrides, keyed by strategy id - the SAME params a
    * bot's own BotConfig.params carries for its strategyId. Only builtin
    * strategies take params (AnalyticsService.runStrategy); an AI Lab
@@ -370,6 +385,7 @@ export class ModeService {
             ? c.strategyIds.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).map((x) => x.trim())
             : undefined,
           strategyPickMode: c.strategyPickMode === 'best' ? 'best' : 'ensemble',
+          autoDiscover: typeof c.autoDiscover === 'boolean' ? c.autoDiscover : false,
           strategyParams: ModeService.sanitizeStrategyParams(c.strategyParams),
           direction: c.direction === 'call' || c.direction === 'put' ? c.direction : 'both',
           maxOpen: Math.round(num(c.maxOpen, DEFAULT_AUTOTRADER.maxOpen)),
@@ -501,6 +517,9 @@ export class ModeService {
   private async autoTraderTick(): Promise<void> {
     if (!this.config.enabled) return
     this.rolloverIfNeeded()
+    if (this.config.signalSource === 'strategy' && this.config.strategyPickMode === 'best' && this.config.autoDiscover === true) {
+      this.maybeAutoDiscover()
+    }
 
     // compound stop-on-loss: a cycle that took a loss is DEAD until an
     // explicit restart() - same semantics as a compound bot in autopilot.ts
@@ -870,9 +889,59 @@ export class ModeService {
    * reused as the minimum AGREEMENT % the majority must reach) or, with
    * strategyPickMode 'best', an AUTO-LEARN pool (see below).
    */
+  private static AUTO_DISCOVER_COOLDOWN_SEC = 6 * 3600 // mirrors lab.ts's own RELEARN_AFTER_SEC
+  /** asset -> unix ts of the last auto-discover attempt (success OR
+   * failure) - prevents retrying the same thin-history pair every tick
+   * while still letting a genuinely new spec get mined once the cooldown
+   * clears. */
+  private autoDiscoverAttemptedAt = new Map<string, number>()
+
+  /** Mines AT MOST ONE open candidate pair per tick that does not already
+   * have a reasonably fresh AI Lab spec, via the lab's own learn() pipeline
+   * - the exact same pattern-mining/holdout backtest a human clicking
+   * "Discover" in the AI Lab UI would get, just triggered automatically. A
+   * successful mine is saved (lab.save) so it immediately joins
+   * pickStrategySignal's autoDiscover pool on the very next tick, and the
+   * lab's own relearnSweep (lab.ts) takes over keeping it fresh from there -
+   * this method only ever needs to get a pair its FIRST spec. One pair per
+   * tick because learn() replays the full mining pipeline and is
+   * CPU-heavy enough that doing it for several pairs back-to-back would be
+   * a real hit on the 10s tick cadence. */
+  private maybeAutoDiscover(): void {
+    try {
+      const market = this.ctx.use<MarketDataService>('market')
+      const lab = this.ctx.use<StrategyLabService>('lab')
+      const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
+      const pool = this.candidatePool(open)
+      const existing = lab.list()
+      for (const asset of pool) {
+        const lastAttempt = this.autoDiscoverAttemptedAt.get(asset) ?? 0
+        if (this.now() - lastAttempt < ModeService.AUTO_DISCOVER_COOLDOWN_SEC) continue
+        const hasFresh = existing.some((r) => r.asset === asset && r.tf === this.config.tf && this.now() - r.updatedTs < ModeService.AUTO_DISCOVER_COOLDOWN_SEC)
+        this.autoDiscoverAttemptedAt.set(asset, this.now())
+        if (hasFresh) continue // already has a spec the lab's own relearnSweep keeps current
+        try {
+          const result = lab.learn({ asset, tf: this.config.tf })
+          if (result.ok && result.spec) {
+            lab.save({
+              spec: result.spec,
+              asset,
+              tf: this.config.tf,
+              stats: { backtest: result.backtest ?? undefined, holdout: result.holdout ?? undefined, breakeven: result.breakevenWinRate },
+            })
+            this.emit('info', `[AUTO-TRADER] auto-discover: mined a new strategy for ${asset} ${this.config.tf} - added to the auto-learn pool`)
+          }
+        } catch {
+          // thin history or no signal cleared the lab's own filters this time - retry after the cooldown
+        }
+        break // at most one mining pass per tick
+      }
+    } catch {
+      // market/lab plugin not loaded - auto-discover disabled for this tick
+    }
+  }
+
   private pickStrategySignal(): ScreenRow | null {
-    const ids = this.effectiveStrategyIds()
-    if (!ids.length) return null // nothing picked yet - source configured but idle
     try {
       const market = this.ctx.use<MarketDataService>('market')
       const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
@@ -880,6 +949,23 @@ export class ModeService {
       const candidates = [...LIQUID_CANDIDATES.filter((a) => pool.includes(a)), ...pool.filter((a) => !LIQUID_CANDIDATES.includes(a))]
       const analytics = this.ctx.use<AnalyticsService>('analytics')
       const lab = this.ctx.use<StrategyLabService>('lab')
+      // autoDiscover: instead of ranking only among manually-picked
+      // strategyIds, pull in the ENTIRE builtin catalog plus every
+      // non-decayed AI Lab spec that exists so far - the adaptive gate's own
+      // per-pair ranking (below) is what actually narrows this down, same
+      // as it always has, so widening the pool just gives it more to
+      // discover from instead of only dispatching among a hand-picked few.
+      // A spec trained on one pair still evaluates fine on another (its
+      // signals are generic pattern/indicator thresholds, not asset-
+      // calibrated) - it'll just read as unproven there until its OWN
+      // record builds up on that pair too, same cold-start treatment any
+      // strategy gets on a pair it hasn't traded yet.
+      const manualIds = this.effectiveStrategyIds()
+      const ids =
+        this.config.strategyPickMode === 'best' && this.config.autoDiscover === true
+          ? Array.from(new Set([...manualIds, ...STRATEGIES.map((s) => s.id), ...lab.list().filter((r) => !r.stats?.decayed).map((r) => r.id)]))
+          : manualIds
+      if (!ids.length) return null // nothing picked yet (and autoDiscover is off) - source configured but idle
       const specs = ids.map((id) => {
         const isCustom = id.startsWith('custom:')
         const strat = isCustom ? null : getStrategy(id)
@@ -1589,6 +1675,7 @@ export class ModeService {
         ? patch.strategyIds.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).map((x) => x.trim())
         : undefined
     if (patch.strategyPickMode !== undefined) this.config.strategyPickMode = patch.strategyPickMode === 'best' ? 'best' : 'ensemble'
+    if (patch.autoDiscover !== undefined) this.config.autoDiscover = Boolean(patch.autoDiscover)
     if (patch.strategyParams !== undefined) this.config.strategyParams = ModeService.sanitizeStrategyParams(patch.strategyParams)
     if (patch.direction !== undefined && ['both', 'call', 'put'].includes(String(patch.direction)))
       this.config.direction = String(patch.direction) as AutoTraderConfig['direction']
@@ -1635,6 +1722,8 @@ export class ModeService {
               : this.config.signalSource === 'strategy'
                 ? (() => {
                     const ids = this.effectiveStrategyIds()
+                    if (this.config.strategyPickMode === 'best' && this.config.autoDiscover === true)
+                      return ` (auto-discover ON - ranks the FULL builtin + AI Lab catalog per pair, mining new specs for pairs without one; ${ids.length ? `${ids.length} manually-picked id(s) also included` : 'no manual picks'})`
                     return ids.length === 0
                       ? ' (no strategy picked)'
                       : ids.length === 1

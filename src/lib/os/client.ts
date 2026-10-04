@@ -1183,6 +1183,11 @@ export interface AutoTraderConfig {
    * settled trades on that exact pair) win rate, falling back to raw score
    * for members still building a record. */
   strategyPickMode?: 'ensemble' | 'best'
+  /** Only matters with strategyPickMode 'best'. true = ranks the FULL
+   * builtin + AI Lab catalog per pair (not just manually-picked
+   * strategyIds) and periodically mines new AI Lab specs for pairs without
+   * a fresh one yet. Default false. */
+  autoDiscover?: boolean
   /** Per-strategy param overrides, keyed by strategy id - same shape as a
    * bot's own params. Ignored for an AI Lab "custom:<id>" spec. */
   strategyParams?: Record<string, Record<string, number | string>>
