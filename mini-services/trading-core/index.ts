@@ -607,6 +607,11 @@ const httpServer = createServer(async (req, res) => {
         }
         return json(200, { ok: true, validations: store.listLatestValidations() })
       }
+
+      if (path === '/research_gate') {
+        const bots = kernel.context().use<AutopilotService>('autopilot')
+        return json(200, { ok: true, enabled: bots.getResearchGateEnabled() })
+      }
     }
 
     if (req.method === 'POST') {
@@ -1115,6 +1120,15 @@ const httpServer = createServer(async (req, res) => {
         // compound stop-on-loss: revive a halted cycle (clears halt, re-seeds pot)
         const bots = kernel.context().use<AutopilotService>('autopilot')
         return json(200, bots.restartBot(String(body.id ?? '')))
+      }
+
+      if (path === '/research_gate_toggle') {
+        // Global, persisted, reversible off-switch for BOTH gates (built-in
+        // walk-forward and AI-Lab holdout) - user-requested. Bypassing this
+        // is a deliberate choice, never a default, and every bot armed while
+        // it's off is tagged forcedUnvalidated (see saveBot/toggleBot).
+        const bots = kernel.context().use<AutopilotService>('autopilot')
+        return json(200, bots.setResearchGateEnabled(Boolean(body.enabled)))
       }
 
       // ---------- strategy lab (AI learning agent) ----------

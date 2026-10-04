@@ -132,6 +132,13 @@ export interface BotStats {
   restarts: number // completed cycles (win streaks that ended)
   halted: boolean // compound stop-on-loss: cycle ended, awaiting restart
   complete: boolean // halted because the periods target was reached (a WIN, not a loss)
+  /** Why the bot's last evaluation DIDN'T trade (research gate, session
+   * window, score below floor, cooldown, edge-trigger waiting to retrigger,
+   * etc). undefined only means nothing has been rejected since the runtime
+   * was built (fresh bot, or it just traded) - it is NOT proof the bot is
+   * healthy. This was tracked internally but never surfaced to the API/UI,
+   * which is exactly why "why hasn't my bot traded" had no answer. */
+  lastRejection?: string
 }
 
 export interface BotRow {
@@ -194,6 +201,11 @@ export class AutopilotService {
   private evaluating = new Set<string>() // asset|tf pairs currently being processed
   private lab: StrategyLabService | null = null
   private revalidateTimer: ReturnType<typeof setInterval> | null = null
+  // Global research-gate off-switch, user-requested. Persisted (survives
+  // restarts) in the SAME sentinel-state JSON blob execution.ts's setRisk()
+  // uses, under its own key, so this doesn't need a schema migration. Default
+  // ON - this has to be an explicit opt-out, never a silent default.
+  private researchGateEnabled = true
   // walk-forward is CPU-heavy - re-checks are spread across ticks rather than
   // run all at once for a fleet with many bots/assets
   private static readonly REVALIDATE_TICK_MS = 15 * 60 * 1000 // 15 min sweep cadence
@@ -218,6 +230,16 @@ export class AutopilotService {
     this.market = ctx.use<MarketDataService>('market')
     this.analytics = ctx.use<AnalyticsService>('analytics')
     this.exec = ctx.use<ExecutionService>('execution')
+
+    // restore the persisted research-gate toggle (shares execution.ts's
+    // sentinel-state blob, own key, so a restart doesn't silently re-arm it)
+    try {
+      const saved = this.store.getSentinelState()
+      const cfg = saved?.config as Record<string, unknown> | undefined
+      if (cfg && typeof cfg.researchGateEnabled === 'boolean') this.researchGateEnabled = cfg.researchGateEnabled
+    } catch {
+      // best-effort - default stays ON
+    }
 
     // seed runtime stats from persisted journal so restarts keep their day/total numbers
     for (const { bot } of this.store.listBots()) this.runtime.set(bot.id, this.buildRuntime(bot.id))
@@ -258,6 +280,33 @@ export class AutopilotService {
 
   runningCount(): number {
     return this.store.listBots().filter((b) => b.bot.enabled).length
+  }
+
+  /** Global research-gate off-switch (user-requested, applies to BOTH the
+   * built-in walk-forward gate and the AI-Lab holdout gate). Reversible and
+   * persisted - flip it back on any time. While off, every arm still gets
+   * tagged forcedUnvalidated + logged, so an unvalidated bot never looks
+   * indistinguishable from one that actually passed its gate. */
+  getResearchGateEnabled(): boolean {
+    return this.researchGateEnabled
+  }
+
+  setResearchGateEnabled(enabled: boolean): { ok: true; enabled: boolean } {
+    this.researchGateEnabled = enabled
+    try {
+      const saved = this.store.getSentinelState()
+      const cfg = (saved?.config as Record<string, unknown>) ?? {}
+      this.store.saveSentinelState({ ...cfg, researchGateEnabled: enabled }, saved?.hwm ?? 0)
+    } catch {
+      // persistence best-effort; the in-memory flag still takes effect now
+    }
+    this.emit(
+      enabled ? 'success' : 'danger',
+      enabled
+        ? 'Research gate RE-ENABLED - bots now require a validated edge to arm again.'
+        : 'Research gate DISABLED globally - bots can now arm with NO validation requirement (built-in walk-forward and AI-Lab holdout checks are both bypassed). Every bot armed while this is off is marked forcedUnvalidated.'
+    )
+    return { ok: true, enabled }
   }
 
   /** Research gate: every watchlist instrument must have a RECENT robust
@@ -456,11 +505,14 @@ export class AutopilotService {
     // live bot doesn't get blocked by a validation that's since gone stale.
     let forced = false
     if (bot.enabled && !(existing?.enabled ?? false)) {
-      const gate = this.researchGate(bot)
+      const gate = this.researchGateEnabled ? this.researchGate(bot) : null
       if (gate) {
         if (!opts.force) return { ok: false, error: gate }
         forced = true
         this.emit('warn', `Bot "${bot.name}" FORCED past research gate - ${gate.replace(/^research-gate: /, '')}. Unvalidated edge, armed on explicit user override.`)
+      } else if (!this.researchGateEnabled) {
+        forced = true
+        this.emit('warn', `Bot "${bot.name}" armed with the research gate globally DISABLED - no validation requirement was checked. Unvalidated edge.`)
       }
       bot.forcedUnvalidated = forced
     } else if (bot.enabled) {
@@ -514,11 +566,14 @@ export class AutopilotService {
     const bot: BotConfig = { ...found.bot, enabled: enabled ?? !found.bot.enabled }
     let forced = false
     if (bot.enabled && !found.bot.enabled) {
-      const gate = this.researchGate(bot)
+      const gate = this.researchGateEnabled ? this.researchGate(bot) : null
       if (gate) {
         if (!opts.force) return { ok: false, error: gate }
         forced = true
         this.emit('warn', `Bot "${bot.name}" FORCED past research gate - ${gate.replace(/^research-gate: /, '')}. Unvalidated edge, armed on explicit user override.`)
+      } else if (!this.researchGateEnabled) {
+        forced = true
+        this.emit('warn', `Bot "${bot.name}" armed with the research gate globally DISABLED - no validation requirement was checked. Unvalidated edge.`)
       }
       bot.forcedUnvalidated = forced
     }
@@ -948,6 +1003,7 @@ export class AutopilotService {
         restarts: rt.restarts,
         halted: rt.halted,
         complete: rt.complete,
+        lastRejection: rt.lastRejection,
       }
     }
     const fresh = this.buildRuntime(botId)

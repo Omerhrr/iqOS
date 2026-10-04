@@ -775,6 +775,18 @@ const TOOLS: ToolSpec[] = [
     args: '{"id": "bot-abc123"}',
     run: (a) => corePost('/bot_delete', { id: a.id }),
   },
+  {
+    name: 'research_gate_toggle',
+    description: 'GLOBAL on/off switch for the research gate (covers BOTH the built-in walk-forward gate and the AI-Lab holdout gate). While OFF, every bot - new or re-armed - skips validation entirely and arms with forcedUnvalidated:true, no per-bot force needed. This is a deliberate, explicit user decision because it removes ALL validation requirements fleet-wide, not a casual toggle - only call it when the user has clearly asked to disable/enable the research gate (or "stop blocking my bots", "I don\'t want the validation check"), and always tell them plainly, right after, what state it\'s now in and that any bot armed while it\'s off has not had its edge checked at all.',
+    args: '{"enabled": false}',
+    run: (a) => corePost('/research_gate_toggle', { enabled: Boolean(a.enabled) }),
+  },
+  {
+    name: 'research_gate_status',
+    description: 'Check whether the global research gate is currently enabled or disabled.',
+    args: '{}',
+    run: () => coreGet('/research_gate'),
+  },
   // ---------- strategy lab: the AI learning agent ----------
   {
     name: 'lab_learn',
