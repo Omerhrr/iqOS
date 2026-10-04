@@ -1066,6 +1066,35 @@ class Handler(BaseHTTPRequestHandler):
                             out["pnl"] = pnl
                         return out
 
+                    # THE DRIFT BUG this fixes: get_positions() is IQ's LIVE/
+                    # OPEN-positions stream. A row for an order that just
+                    # crossed its expiry second can show up there with a
+                    # non-"open" status AND a close_profit/pnl already - but
+                    # that number can be a PROVISIONAL, not-yet-final read
+                    # (the backend settling a few seconds behind the stream,
+                    # a requote, an interim snapshot). The code used to treat
+                    # ANY closed-looking row found here as the verdict and
+                    # return immediately, before ever checking
+                    # get_position_history_v2() - the dedicated, immutable,
+                    # SETTLED-trade ledger. If that provisional stream read
+                    # flipped sign moments later once IQ actually finalized
+                    # it, we'd already have reported the wrong result and
+                    # the kernel would settle (and learn from) a win that
+                    # IQ itself later booked as a loss, with nothing ever
+                    # re-checking it.
+                    #
+                    # Fix: get_positions() is now used ONLY to fast-detect a
+                    # genuinely still-open position (status "open" - that
+                    # read is reliable, there is no "provisional open").
+                    # Every CLOSED verdict comes exclusively from
+                    # get_position_history_v2(), IQ's authoritative
+                    # settled-trade record. If a trade has expired but
+                    # history hasn't picked it up yet, this correctly
+                    # reports not-found for it and the kernel's existing
+                    # retry ladder (settleLiveExpiry in execution.ts) keeps
+                    # polling instead of accepting a possibly-wrong number -
+                    # exactly the "wait for IQ to report back" contract this
+                    # endpoint was built for, now actually honored.
                     for itype in types:
                         try:
                             ok, data = _client.get_positions(itype, max_wait_sec=wait)
@@ -1073,12 +1102,8 @@ class Handler(BaseHTTPRequestHandler):
                             ok, data = False, None
                         if ok and isinstance(data, dict):
                             for item in data.get("positions", []) or []:
-                                if _row_matches(item):
-                                    outcome = _row_outcome(item)
-                                    if outcome.get("status") == "open":
-                                        return self._send(_ok({"found": True, "status": "open", "instrument_type": itype}))
-                                    if "pnl" in outcome:
-                                        return self._send(_ok({"found": True, "instrument_type": itype, **outcome}))
+                                if _row_matches(item) and item.get("status") == "open":
+                                    return self._send(_ok({"found": True, "status": "open", "instrument_type": itype}))
                         try:
                             ok2, data2 = _client.get_position_history_v2(itype, 20, 0, max_wait_sec=wait)
                         except Exception:  # noqa: BLE001
