@@ -324,6 +324,11 @@ export class ModeService {
    * isn't a daily counter. */
   private lossStreak = new Map<string, number>()
   private benchedUntil = new Map<string, number>()
+  /** pickStrategySignal's own round-robin cursor into the candidate pool
+   * (NOT shared with the other signal sources, which early-return on the
+   * first qualifying pair and so stay cheap on their own) - see
+   * MAX_TICK_CANDIDATES below for why this exists. */
+  private strategyTickCursor = 0
   private static STREAK_BENCH_THRESHOLD = 3 // consecutive losses before a bench kicks in
   private static STREAK_BENCH_BASE_SEC = 900 // 15min at exactly the threshold
   private static STREAK_BENCH_MAX_SEC = 14400 // 4h cap, however long the streak runs
@@ -889,6 +894,28 @@ export class ModeService {
    * reused as the minimum AGREEMENT % the majority must reach) or, with
    * strategyPickMode 'best', an AUTO-LEARN pool (see below).
    */
+  /** Hard cap on how many pairs pickStrategySignal evaluates in a single
+   * tick. The IQ universe auto-discovers new instruments live (it can and
+   * does jump from ~100 to 270+ open pairs the moment a broker adds a batch)
+   * and this method, unlike the other signal sources, deliberately does NOT
+   * early-return on the first qualifying pair - it scores every candidate so
+   * the best one market-wide wins. Multiply an uncapped candidate list by a
+   * strategy pool that can itself be dozens deep (autoDiscover's full
+   * builtin catalog + every AI Lab spec) and a single 10s tick turns into
+   * thousands of synchronous strategy evaluations - long enough to block
+   * the event loop past the Docker healthcheck's timeout and reset every
+   * other in-flight connection (the proxy's "socket hang up"/ECONNRESET),
+   * which is exactly what an unbounded universe growth spike triggered.
+   * LIQUID_CANDIDATES always get a slot (they're what most configs actually
+   * care about); the remaining budget round-robins through the rest of the
+   * pool via strategyTickCursor so every pair still gets evaluated, just
+   * spread across multiple ticks instead of all at once. */
+  private static MAX_TICK_CANDIDATES = 40
+  /** Hard cap on the AI Lab specs autoDiscover folds into the ranking pool,
+   * most-recently-updated first - lab.list() grows without bound over time
+   * as autoDiscover mines new pairs, and an uncapped pool multiplies the
+   * same way an uncapped candidate list does. */
+  private static MAX_AUTO_DISCOVER_LAB_SPECS = 60
   private static AUTO_DISCOVER_COOLDOWN_SEC = 6 * 3600 // mirrors lab.ts's own RELEARN_AFTER_SEC
   /** asset -> unix ts of the last auto-discover attempt (success OR
    * failure) - prevents retrying the same thin-history pair every tick
@@ -946,7 +973,21 @@ export class ModeService {
       const market = this.ctx.use<MarketDataService>('market')
       const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
       const pool = this.candidatePool(open)
-      const candidates = [...LIQUID_CANDIDATES.filter((a) => pool.includes(a)), ...pool.filter((a) => !LIQUID_CANDIDATES.includes(a))]
+      const allCandidates = [...LIQUID_CANDIDATES.filter((a) => pool.includes(a)), ...pool.filter((a) => !LIQUID_CANDIDATES.includes(a))]
+      // Bounded working set: LIQUID_CANDIDATES always get a slot, the rest of
+      // the budget round-robins through the remaining pool tick-to-tick (see
+      // MAX_TICK_CANDIDATES's comment - this is what keeps a universe spike
+      // from turning one tick into thousands of synchronous evaluations).
+      const liquidSlice = allCandidates.filter((a) => LIQUID_CANDIDATES.includes(a))
+      const rest = allCandidates.filter((a) => !LIQUID_CANDIDATES.includes(a))
+      const restBudget = Math.max(0, ModeService.MAX_TICK_CANDIDATES - liquidSlice.length)
+      let rotated: string[] = []
+      if (rest.length) {
+        const start = this.strategyTickCursor % rest.length
+        rotated = Array.from({ length: Math.min(restBudget, rest.length) }, (_, i) => rest[(start + i) % rest.length])
+        this.strategyTickCursor = (start + rotated.length) % rest.length
+      }
+      const candidates = [...liquidSlice, ...rotated]
       const analytics = this.ctx.use<AnalyticsService>('analytics')
       const lab = this.ctx.use<StrategyLabService>('lab')
       // autoDiscover: instead of ranking only among manually-picked
@@ -960,10 +1001,24 @@ export class ModeService {
       // calibrated) - it'll just read as unproven there until its OWN
       // record builds up on that pair too, same cold-start treatment any
       // strategy gets on a pair it hasn't traded yet.
+      // lab specs are capped (most-recently-updated first) for the same
+      // reason the candidate pool is - autoDiscover's own mining grows
+      // lab.list() without bound over weeks of uptime.
       const manualIds = this.effectiveStrategyIds()
       const ids =
         this.config.strategyPickMode === 'best' && this.config.autoDiscover === true
-          ? Array.from(new Set([...manualIds, ...STRATEGIES.map((s) => s.id), ...lab.list().filter((r) => !r.stats?.decayed).map((r) => r.id)]))
+          ? Array.from(
+              new Set([
+                ...manualIds,
+                ...STRATEGIES.map((s) => s.id),
+                ...lab
+                  .list()
+                  .filter((r) => !r.stats?.decayed)
+                  .sort((a, b) => b.updatedTs - a.updatedTs)
+                  .slice(0, ModeService.MAX_AUTO_DISCOVER_LAB_SPECS)
+                  .map((r) => r.id),
+              ])
+            )
           : manualIds
       if (!ids.length) return null // nothing picked yet (and autoDiscover is off) - source configured but idle
       const specs = ids.map((id) => {
