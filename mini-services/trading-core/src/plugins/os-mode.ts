@@ -130,10 +130,16 @@ export interface AutoTraderConfig {
   dailyProfitTarget: number // 0 = off
   dailyLossLimit: number // 0 = off
   /** Optional pair restriction. Empty/omitted = GLOBAL (every open instrument,
-   * the original behavior, unchanged). Non-empty = only these tickers are
-   * ever considered, for ANY signalSource - same choke point (assetBlocked)
-   * every candidate loop already filters through. */
+   * the original behavior, unchanged). Non-empty = gated by watchlistMode,
+   * for ANY signalSource - same choke point (assetBlocked) every candidate
+   * loop already filters through. */
   watchlist: string[]
+  /** How a non-empty watchlist is applied. 'only' (default when unset) -
+   * trade ONLY these tickers, nothing else (the original, unchanged
+   * behavior). 'exclude' - trade every open instrument EXCEPT these -
+   * a deny-list for a pair you've found unreliable or just don't want
+   * touched, without having to hand-list every other pair you DO want. */
+  watchlistMode?: 'only' | 'exclude'
   /** Optional compounding plan - SAME shape and semantics as a bot's
    * stakePlan in autopilot.ts (payoutCap, periods, derisk, stopOnLoss). undefined
    * = fixed `stake` every trade, unchanged behavior. Auto-trader is
@@ -290,6 +296,7 @@ export class ModeService {
           dailyProfitTarget: num(c.dailyProfitTarget, 0),
           dailyLossLimit: num(c.dailyLossLimit, 0),
           watchlist: Array.isArray(c.watchlist) ? c.watchlist.filter((x): x is string => typeof x === 'string') : [],
+          watchlistMode: c.watchlistMode === 'exclude' ? 'exclude' : 'only',
           stakePlan: this.parseStakePlan(c.stakePlan),
           planState: ModeService.isPlanState(c.planState) ? c.planState : undefined,
         }
@@ -514,9 +521,11 @@ export class ModeService {
         return r
       }
       // sweep still warming (or rows stale) - evaluate liquid pairs directly,
-      // or the operator's own watchlist when one is set (a restricted auto
-      // trader has no business falling back to pairs outside it)
-      for (const asset of restricted ? this.config.watchlist : LIQUID_CANDIDATES) {
+      // run through the SAME watchlist/watchlistMode gate (an 'only' restriction
+      // falls back to exactly its own pairs; an 'exclude' restriction falls
+      // back to the liquid pairs minus whatever's excluded; no restriction
+      // is unchanged LIQUID_CANDIDATES)
+      for (const asset of this.candidatePool(restricted ? [...this.config.watchlist, ...LIQUID_CANDIDATES] : LIQUID_CANDIDATES)) {
         if (this.assetBlocked(asset)) continue
         try {
           const r = screener.evaluate(asset, this.config.tf)
@@ -673,8 +682,7 @@ export class ModeService {
       const screener2 = this.ctx.use<Screener2Service>('screener2')
       const market = this.ctx.use<MarketDataService>('market')
       const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
-      const restricted = this.config.watchlist.length > 0
-      const pool = restricted ? this.config.watchlist.filter((a) => open.includes(a)) : open
+      const pool = this.candidatePool(open)
       const candidates = [...LIQUID_CANDIDATES.filter((a) => pool.includes(a)), ...pool.filter((a) => !LIQUID_CANDIDATES.includes(a))]
       for (const asset of candidates) {
         if (this.assetBlocked(asset)) continue
@@ -782,8 +790,7 @@ export class ModeService {
     try {
       const market = this.ctx.use<MarketDataService>('market')
       const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
-      const restricted = this.config.watchlist.length > 0
-      const pool = restricted ? this.config.watchlist.filter((a) => open.includes(a)) : open
+      const pool = this.candidatePool(open)
       const candidates = [...LIQUID_CANDIDATES.filter((a) => pool.includes(a)), ...pool.filter((a) => !LIQUID_CANDIDATES.includes(a))]
       const analytics = this.ctx.use<AnalyticsService>('analytics')
       const lab = this.ctx.use<StrategyLabService>('lab')
@@ -1106,10 +1113,24 @@ export class ModeService {
     }
   }
 
+  /** The candidate universe after applying watchlist/watchlistMode up front -
+   * 'only' (default) intersects with the watchlist, 'exclude' removes it.
+   * Same semantics assetBlocked enforces per-asset below, applied once so a
+   * candidate loop isn't wasting cycles on assets it can never trade. */
+  private candidatePool(open: string[]): string[] {
+    if (!this.config.watchlist.length) return open
+    const exclude = this.config.watchlistMode === 'exclude'
+    return exclude ? open.filter((a) => !this.config.watchlist.includes(a)) : open.filter((a) => this.config.watchlist.includes(a))
+  }
+
   /** Cooldown + one-auto-position-per-asset + optional watchlist restriction,
-   * applied by every signal picker (all 4 sources funnel through this). */
+   * applied by every signal picker (all sources funnel through this). */
   private assetBlocked(asset: string): boolean {
-    if (this.config.watchlist.length > 0 && !this.config.watchlist.includes(asset)) return true
+    if (this.config.watchlist.length > 0) {
+      const inList = this.config.watchlist.includes(asset)
+      const exclude = this.config.watchlistMode === 'exclude'
+      if (exclude ? inList : !inList) return true
+    }
     const rejectedUntil = this.assetRejectedUntil.get(asset) ?? 0
     if (this.now() < rejectedUntil) return true
     const last = this.rt.lastAssetTs.get(asset) ?? 0
@@ -1307,6 +1328,7 @@ export class ModeService {
     if (patch.dailyLossLimit !== undefined) this.config.dailyLossLimit = Math.max(0, Number(patch.dailyLossLimit) || 0)
     if (patch.watchlist !== undefined)
       this.config.watchlist = Array.isArray(patch.watchlist) ? patch.watchlist.filter((x): x is string => typeof x === 'string') : []
+    if (patch.watchlistMode !== undefined) this.config.watchlistMode = patch.watchlistMode === 'exclude' ? 'exclude' : 'only'
     if (patch.stakePlan !== undefined) {
       const planChanged = JSON.stringify(this.config.stakePlan ?? null) !== JSON.stringify(patch.stakePlan ?? null)
       this.config.stakePlan = this.parseStakePlan(patch.stakePlan, this.config.stakePlan)

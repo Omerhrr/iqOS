@@ -1193,8 +1193,11 @@ export interface AutoTraderConfig {
   dailyProfitTarget: number
   dailyLossLimit: number
   /** Empty = global (every open instrument, any signalSource). Non-empty =
-   * only trade these tickers. */
+   * gated by watchlistMode. */
   watchlist: string[]
+  /** 'only' (default when unset) = trade ONLY the watchlist tickers. 'exclude'
+   * = trade every open instrument EXCEPT the watchlist tickers - a deny-list. */
+  watchlistMode?: 'only' | 'exclude'
   /** Optional compounding plan - same StakePlan shape as a bot's. undefined =
    * fixed `stake` every trade. */
   stakePlan?: StakePlan

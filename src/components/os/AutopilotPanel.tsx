@@ -1435,10 +1435,23 @@ function AutoTraderDialog({
               Pair restriction {d.watchlist.length > 0 ? `(${d.watchlist.length} selected)` : '(GLOBAL - every open instrument)'}
             </Label>
             <WatchlistPicker assets={assets} selected={d.watchlist} onChange={(w) => p({ watchlist: w })} />
+            {d.watchlist.length > 0 && (
+              <Segmented
+                label="Apply as"
+                options={[
+                  { v: 'only', label: 'Only trade these' },
+                  { v: 'exclude', label: 'Never trade these' },
+                ]}
+                value={d.watchlistMode ?? 'only'}
+                onChange={(v) => p({ watchlistMode: v as 'only' | 'exclude' })}
+              />
+            )}
             <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
               {d.watchlist.length > 0
-                ? `restricted to these ${d.watchlist.length} pair(s) only, regardless of signal source - clear the selection to go back to global.`
-                : 'no pairs selected = global: scans every currently-open instrument for the chosen signal source, same as always. Select pairs above to restrict it to just those.'}
+                ? (d.watchlistMode ?? 'only') === 'exclude'
+                  ? `BLOCKED from these ${d.watchlist.length} pair(s) - every other currently-open instrument stays in play for the chosen signal source. Clear the selection to go back to global.`
+                  : `restricted to ONLY these ${d.watchlist.length} pair(s), regardless of signal source. If you meant to keep the auto-trader away from a pair rather than confine it to one, switch "Apply as" to "Never trade these" above. Clear the selection to go back to global.`
+                : 'no pairs selected = global: scans every currently-open instrument for the chosen signal source, same as always. Select pairs above, then choose whether they\'re the ONLY pairs traded or the ones NEVER traded.'}
             </p>
           </div>
 
