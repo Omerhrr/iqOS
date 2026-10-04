@@ -1344,9 +1344,26 @@ export class ModeService {
                           : ` (ensemble of ${ids.length}: ${ids.join(', ')} · ≥${this.config.minConfidence}% agreement)`
                   })()
                 : ''
+    // minScore/minConfidence are meaningless noise on a config line unless
+    // this source actually gates on them - 'strategy' never applies minScore
+    // (in any of single/ensemble/auto-learn mode, per pickStrategySignal),
+    // and only applies minConfidence as the ensemble's "min agreement %"
+    // when 2+ strategyIds are picked AND strategyPickMode is 'ensemble'.
+    // Reporting both unconditionally ("minScore 40 · minConf 55") claimed
+    // thresholds that weren't actually in effect - this says only what's
+    // real for the source that's actually armed.
+    const strategyIdsForLog = this.config.signalSource === 'strategy' ? this.effectiveStrategyIds() : []
+    const showMinScore = this.config.signalSource !== 'strategy'
+    const showMinConf = this.config.signalSource !== 'strategy' || (strategyIdsForLog.length > 1 && this.config.strategyPickMode !== 'best')
+    const thresholds = [
+      showMinScore ? `minScore ${this.config.minScore}` : null,
+      showMinConf ? `minConf ${this.config.minConfidence}` : null,
+    ]
+      .filter(Boolean)
+      .join(' · ')
     this.emit(
       'info',
-      `AUTO-TRADER config: ${this.config.enabled ? 'armed' : 'off'} · src ${this.config.signalSource}${srcDetail} · ${this.config.tf} · stake $${this.config.stake} · minScore ${this.config.minScore} · minConf ${this.config.minConfidence} · maxOpen ${this.config.maxOpen} · cooldown ${this.config.cooldownSec}s`
+      `AUTO-TRADER config: ${this.config.enabled ? 'armed' : 'off'} · src ${this.config.signalSource}${srcDetail} · ${this.config.tf} · stake $${this.config.stake}${thresholds ? ` · ${thresholds}` : ''} · maxOpen ${this.config.maxOpen} · cooldown ${this.config.cooldownSec}s`
     )
     return { ok: true, config: { ...this.config } }
   }
