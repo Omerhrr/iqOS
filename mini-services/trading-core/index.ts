@@ -1231,6 +1231,11 @@ const httpServer = createServer(async (req, res) => {
         return json(200, lab.remove(String(body.id ?? '')))
       }
 
+      if (path === '/lab_delete_all') {
+        const lab = kernel.context().use<StrategyLabService>('lab')
+        return json(200, lab.removeAll())
+      }
+
       if (path === '/lab_relearn') {
         const lab = kernel.context().use<StrategyLabService>('lab')
         return json(200, lab.relearnOne(String(body.id ?? '')))

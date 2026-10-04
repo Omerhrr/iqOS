@@ -690,6 +690,23 @@ export class StrategyLabService {
     return ok ? { ok } : { ok, error: 'lab strategy not found' }
   }
 
+  /** Wipes the whole learned-strategy library - every AI Lab spec, not just
+   * decayed ones. Does NOT touch anything currently referencing a
+   * "custom:<id>" strategy by id (a bot's strategyId, the auto-trader's
+   * strategyIds/autoDiscover pool) - those just start failing their
+   * isValidStrategyId/runStrategy lookups like any other removed id would,
+   * same as deleting one spec at a time already behaves. Caller is
+   * responsible for warning the user about that before calling this. */
+  removeAll(): { ok: true; removed: number } {
+    const removed = this.store.deleteAllLabStrategies()
+    this.ctx.bus.emit('alert', {
+      level: 'info',
+      message: `[lab] learned-strategy library cleared - ${removed} spec(s) removed`,
+      ts: Math.floor(Date.now() / 1000),
+    })
+    return { ok: true, removed }
+  }
+
   // ---------- autopilot integration ----------
 
   isValidStrategyId(id: string): boolean {

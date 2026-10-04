@@ -739,6 +739,15 @@ export class Store {
     return res.changes > 0
   }
 
+  /** Wipes the entire AI Lab-learned strategy library in one shot - the
+   * backing table for the "Delete all" button, not a per-row loop, so it
+   * can't half-fail partway through a large library. Returns how many rows
+   * were actually removed. */
+  deleteAllLabStrategies(): number {
+    const res = this.db.run('DELETE FROM lab_strategies')
+    return res.changes
+  }
+
   listLabStrategies(): { id: string; spec: unknown; asset: string; tf: string; stats: unknown; createdTs: number; updatedTs: number }[] {
     const rows = this.db
       .query('SELECT id, spec, asset, tf, stats, created_ts, updated_ts FROM lab_strategies ORDER BY updated_ts DESC')

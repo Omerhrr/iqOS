@@ -599,6 +599,30 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
     }
   }
 
+  // "Delete all" is destructive and irreversible (every learned spec, not
+  // just decayed ones) - armConfirm requires a second click within a few
+  // seconds instead of firing on the first, same pattern as other
+  // irreversible controls elsewhere in the OS (kill switch etc).
+  const [confirmDeleteAll, setConfirmDeleteAll] = useState(false)
+  const [deletingAll, setDeletingAll] = useState(false)
+  const deleteAllLab = async () => {
+    if (!confirmDeleteAll) {
+      setConfirmDeleteAll(true)
+      setTimeout(() => setConfirmDeleteAll(false), 4000)
+      return
+    }
+    setConfirmDeleteAll(false)
+    setDeletingAll(true)
+    try {
+      await osPost('/lab_delete_all', {})
+      loadLibrary()
+    } catch (e) {
+      onError((e as Error).message)
+    } finally {
+      setDeletingAll(false)
+    }
+  }
+
   const [backtesting, setBacktesting] = useState<string | null>(null)
   // Which library row's spec JSON is currently expanded inline - clicking a
   // strategy's name toggles it, same "view the raw spec" need the fresh-learn
@@ -1011,7 +1035,28 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
       <div className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-3">
         <div className="flex items-center justify-between">
           <h4 className="text-[12px] font-semibold uppercase tracking-wider text-[#aab6cc]">Learned strategy library</h4>
-          <span className="font-mono text-[9px] text-[#4b5a72]">{library.length} saved</span>
+          <div className="flex items-center gap-2">
+            <span className="font-mono text-[9px] text-[#4b5a72]">{library.length} saved</span>
+            {library.length > 0 && (
+              <Button
+                onClick={() => void deleteAllLab()}
+                disabled={deletingAll}
+                variant="outline"
+                title={
+                  confirmDeleteAll
+                    ? 'click again to permanently delete every learned strategy'
+                    : 'delete the entire learned strategy library'
+                }
+                className={`h-6 px-2 text-[9px] uppercase tracking-wider disabled:opacity-40 ${
+                  confirmDeleteAll
+                    ? 'border-rose-500/60 bg-rose-500/15 text-rose-300 hover:bg-rose-500/25'
+                    : 'border-[#1c2739] text-[#4b5a72] hover:text-rose-300'
+                }`}
+              >
+                {deletingAll ? 'deleting...' : confirmDeleteAll ? 'confirm delete all?' : 'delete all'}
+              </Button>
+            )}
+          </div>
         </div>
         {library.length === 0 ? (
           <p className="mt-2 text-[11px] text-[#3d4d66]">Nothing learned yet - run &quot;learn this pair&quot; above, or ask the Copilot to study a pair for you.</p>
