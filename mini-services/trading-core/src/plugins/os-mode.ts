@@ -52,6 +52,7 @@ import type { AdaptiveService } from './adaptive'
 import { walkForward } from '../strategies/optimize'
 import { getStrategy, defaultParams } from '../strategies/builtin'
 import { classifyRegime } from '../analytics/regime'
+import { classifySession } from '../analytics/session'
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
 
@@ -964,19 +965,27 @@ export class ModeService {
           // trend but mediocre in chop into one blended, weaker-looking
           // number. Passing the SAME classification used at write-time is
           // what makes "best per pair" actually "best per pair AND regime".
+          // Session-aware too, same reasoning: execution.ts also stamps
+          // entry_session (classifySession) on every settled trade
+          // regardless of signalSource, so the gate's bucket query is
+          // ALREADY split by session - passing it here is what lets "best
+          // per pair" actually read that split instead of pooling the whole
+          // day's trades together.
           let regime: string | undefined
+          let session: string | undefined
           if (adaptive) {
             try {
               regime = classifyRegime(analytics.analyze(asset, this.config.tf))
             } catch {
               regime = undefined
             }
+            session = classifySession(this.now(), asset)
           }
           for (const v of votes) {
             let rank = Math.abs(v.score)
             let proven = false
             if (adaptive) {
-              const verdict = adaptive.check(asset, this.config.tf, v.id, v.direction, v.score, regime)
+              const verdict = adaptive.check(asset, this.config.tf, v.id, v.direction, v.score, regime, session)
               if (verdict.trades >= adaptive.config.minSampleSize) {
                 rank = verdict.wilsonLowerPct
                 proven = true

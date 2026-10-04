@@ -115,6 +115,12 @@ export interface Position {
    * can be judged on its OWN realized record, not the strategy's average
    * across every condition it's ever traded in. */
   entryRegime?: string
+  /** Trading session (classifySession) AT ENTRY - ASIA/LONDON/OVERLAP/
+   * NEWYORK/OFF by UTC hour. Same purpose as entryRegime: lets the adaptive
+   * gate learn "this setup only actually works during the London/NY
+   * overlap" instead of pooling a strategy's record across every hour of
+   * the day, which behave very differently for real (non-OTC) FX pairs. */
+  entrySession?: string
 }
 
 export interface AccountState {

@@ -14,6 +14,7 @@ import { Store } from '../store'
 import { getStrategy, defaultParams } from '../strategies/builtin'
 import type { StrategyLabService } from './lab'
 import { classifyRegime } from '../analytics/regime'
+import { classifySession } from '../analytics/session'
 import { walkForward } from '../strategies/optimize'
 
 export interface BotConfig {
@@ -732,13 +733,16 @@ export class AutopilotService {
     }
 
     // adaptive confidence gate: this exact (asset, tf, strategy, side,
-    // score-bucket[, regime]) setup only fires if ITS OWN settled record
-    // (Wilson lower bound, not the raw ratio) clears the fleet floor - see
-    // adaptive.ts for why this is the honest way to chase a higher win rate
-    // instead of a curve-fit backtest number.
+    // score-bucket[, regime][, session]) setup only fires if ITS OWN settled
+    // record (Wilson lower bound, not the raw ratio) clears the fleet floor -
+    // see adaptive.ts for why this is the honest way to chase a higher win
+    // rate instead of a curve-fit backtest number.
     if (bot.adaptive !== false) {
       try {
-        const adaptive = this.ctx.use<{ config: { enabled: boolean }; check: (asset: string, tf: string, strategyId: string, side: string, score: number, regime?: string) => { ok: boolean; reason?: string } }>('adaptive')
+        const adaptive = this.ctx.use<{
+          config: { enabled: boolean }
+          check: (asset: string, tf: string, strategyId: string, side: string, score: number, regime?: string, session?: string) => { ok: boolean; reason?: string }
+        }>('adaptive')
         if (adaptive.config.enabled) {
           let regime: string | undefined
           try {
@@ -746,7 +750,8 @@ export class AutopilotService {
           } catch {
             regime = undefined
           }
-          const v = adaptive.check(asset, tf, bot.strategyId, wanted, evalOut.score, regime)
+          const session = classifySession(Math.floor(Date.now() / 1000), asset)
+          const v = adaptive.check(asset, tf, bot.strategyId, wanted, evalOut.score, regime, session)
           if (!v.ok) return this.reject(bot, v.reason ?? 'adaptive confidence gate hold')
         }
       } catch {

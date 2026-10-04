@@ -29,6 +29,7 @@ export interface AdaptiveConfig {
   minWinRateFloorPct: number // Wilson-lower-bound win rate a bucket must clear to keep firing
   scoreBucketWidth: number // |entryScore| granularity (e.g. 10 = scores 70-79.9 share a bucket)
   splitByRegime: boolean // bucket by entryRegime too (thinner buckets, sharper judgment) vs pooled across regimes
+  splitBySession: boolean // bucket by entrySession too (ASIA/LONDON/OVERLAP/NEWYORK/OFF) vs pooled across the whole day
 }
 
 export const DEFAULT_ADAPTIVE: AdaptiveConfig = {
@@ -37,6 +38,7 @@ export const DEFAULT_ADAPTIVE: AdaptiveConfig = {
   minWinRateFloorPct: 62,
   scoreBucketWidth: 10,
   splitByRegime: true,
+  splitBySession: true,
 }
 
 export interface AdaptiveVerdict {
@@ -86,11 +88,12 @@ export class AdaptiveService {
     next.scoreBucketWidth = clamp(next.scoreBucketWidth, 1, 50)
     next.enabled = Boolean(next.enabled)
     next.splitByRegime = Boolean(next.splitByRegime)
+    next.splitBySession = Boolean(next.splitBySession)
     this.config = next
     this.store.saveAdaptiveConfig(this.config)
     this.ctx.bus.emit('alert', {
       level: 'info',
-      message: `Adaptive gate updated: floor ${next.minWinRateFloorPct}% · min n ${next.minSampleSize} · bucket width ${next.scoreBucketWidth}${next.splitByRegime ? ' · split by regime' : ' · pooled across regimes'}${next.enabled ? '' : ' · FLEET DEFAULT OFF'}`,
+      message: `Adaptive gate updated: floor ${next.minWinRateFloorPct}% · min n ${next.minSampleSize} · bucket width ${next.scoreBucketWidth}${next.splitByRegime ? ' · split by regime' : ' · pooled across regimes'}${next.splitBySession ? ' · split by session' : ' · pooled across sessions'}${next.enabled ? '' : ' · FLEET DEFAULT OFF'}`,
       ts: Math.floor(Date.now() / 1000),
     })
     return this.config
@@ -101,14 +104,15 @@ export class AdaptiveService {
    * already writes on every settle, so there's nothing extra to wire up
    * per-trade; the very trade being gated becomes part of the bucket once it
    * settles. */
-  check(asset: string, tf: string, strategyId: string, side: string, score: number, regime?: string): AdaptiveVerdict {
+  check(asset: string, tf: string, strategyId: string, side: string, score: number, regime?: string, session?: string): AdaptiveVerdict {
     const width = this.config.scoreBucketWidth
     const floor = Math.floor(Math.abs(score) / width) * width
     const useRegime = this.config.splitByRegime ? regime : undefined
-    const stats = this.store.adaptiveBucketStats(asset, tf, strategyId, side, floor, width, useRegime)
+    const useSession = this.config.splitBySession ? session : undefined
+    const stats = this.store.adaptiveBucketStats(asset, tf, strategyId, side, floor, width, useRegime, useSession)
     const winRatePct = stats.trades ? Math.round((stats.wins / stats.trades) * 1000) / 10 : 0
     const wilsonLowerPct = Math.round(wilsonLowerBound(stats.wins, stats.trades) * 10) / 10
-    const bucket = `${asset} ${tf} ${strategyId} ${side} score[${floor}-${floor + width}) ${useRegime ?? 'any-regime'}`
+    const bucket = `${asset} ${tf} ${strategyId} ${side} score[${floor}-${floor + width}) ${useRegime ?? 'any-regime'} ${useSession ?? 'any-session'}`
 
     if (stats.trades < this.config.minSampleSize) {
       // not enough evidence to judge this exact setup yet - let it trade so
