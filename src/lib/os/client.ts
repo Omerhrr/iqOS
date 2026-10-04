@@ -1168,8 +1168,14 @@ export interface AutoTraderConfig {
   minPUp: number
   minAdx: number
   /** strategy source: id from the combined Strategy Lab catalog (builtin id,
-   * or "custom:<id>" for an AI Lab-learned spec) - same as a bot's strategyId. */
+   * or "custom:<id>" for an AI Lab-learned spec) - same as a bot's strategyId.
+   * @deprecated superseded by strategyIds; kept for older saved configs. */
   strategyId?: string
+  /** strategy source: one or more ids to trade. One id = that single
+   * strategy (score-gated only). Two+ = an ENSEMBLE - every member votes,
+   * the majority direction wins, and minConfidence is reused as the
+   * minimum agreement % the majority must reach. */
+  strategyIds?: string[]
   direction: 'both' | 'call' | 'put'
   maxOpen: number
   cooldownSec: number

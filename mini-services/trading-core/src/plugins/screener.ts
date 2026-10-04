@@ -35,6 +35,11 @@ export interface ScreenRow {
   changePct: number
   payout: number
   topPattern: { name: string; direction: string; reliability: number } | null
+  /** Optional freeform explanation for sources that don't fit the scalar
+   * columns above (e.g. the 'strategy' auto-trader source: which member(s)
+   * of a single strategy/ensemble fired and what they said). Undefined for
+   * every row the original Screener itself produces. */
+  note?: string
   ts: number // candle time the row was computed on
   computedTs: number // wall clock when computed
 }

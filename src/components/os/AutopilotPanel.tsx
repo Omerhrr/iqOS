@@ -948,6 +948,72 @@ function BotCard({
   )
 }
 
+/** Searchable multi-select for the Strategy auto-trader source. One pick =
+ * trade that single strategy; two or more = an ensemble (every member votes,
+ * majority direction wins). Mirrors WatchlistPicker's search+chip pattern. */
+function StrategyPicker({
+  strategies,
+  selected,
+  onChange,
+}: {
+  strategies: StrategyInfo[]
+  selected: string[]
+  onChange: (ids: string[]) => void
+}) {
+  const [q, setQ] = useState('')
+  const options = useMemo(() => {
+    const query = q.trim().toLowerCase()
+    const list = query
+      ? strategies.filter((s) => s.name.toLowerCase().includes(query) || s.id.toLowerCase().includes(query))
+      : strategies
+    return list.slice(0, 80)
+  }, [strategies, q])
+
+  const toggle = (id: string) => {
+    onChange(selected.includes(id) ? selected.filter((x) => x !== id) : [...selected, id].slice(0, 8))
+  }
+
+  return (
+    <div>
+      {selected.length > 0 && (
+        <div className="mb-1 flex flex-wrap gap-1">
+          {selected.map((id) => (
+            <button
+              key={id}
+              onClick={() => toggle(id)}
+              className="rounded bg-cyan-500/15 px-1.5 py-px text-[9px] text-cyan-300 hover:bg-rose-500/20 hover:text-rose-300"
+            >
+              {strategies.find((s) => s.id === id)?.name ?? id} ×
+            </button>
+          ))}
+        </div>
+      )}
+      <Input
+        value={q}
+        onChange={(e) => setQ(e.target.value)}
+        placeholder="search strategies…"
+        className="h-7 border-[#1c2739] bg-[#0b111c] text-[11px] text-[#e2e8f0] placeholder:text-[#3d4c66]"
+      />
+      <div className="mt-1 flex max-h-28 flex-col gap-0.5 overflow-y-auto">
+        {options.map((s) => (
+          <button
+            key={s.id}
+            onClick={() => toggle(s.id)}
+            className={`rounded px-1.5 py-1 text-left text-[10px] transition-colors ${
+              selected.includes(s.id)
+                ? 'bg-cyan-500/25 text-cyan-200'
+                : 'bg-[#101828] text-[#7c8aa5] hover:bg-[#1c2739] hover:text-[#dbe4f0]'
+            }`}
+          >
+            {s.name}
+          </button>
+        ))}
+        {options.length === 0 && <div className="px-1.5 py-1 text-[9px] text-[#4b5a72]">no strategies match</div>}
+      </div>
+    </div>
+  )
+}
+
 function WatchlistPicker({
   assets,
   selected,
@@ -1118,7 +1184,10 @@ function AutoTraderStrip({
                 : at.config.signalSource === 'confluence'
                   ? `CONFLUENCE·14F≥${at.config.minScore}`
                   : at.config.signalSource === 'strategy'
-                    ? `STRAT·${at.config.strategyId ?? 'none picked'}`
+                    ? (() => {
+                        const ids = at.config.strategyIds?.length ? at.config.strategyIds : at.config.strategyId ? [at.config.strategyId] : []
+                        return ids.length === 0 ? 'STRAT·none picked' : ids.length === 1 ? `STRAT·${ids[0]}` : `ENSEMBLE·${ids.length}≥${at.config.minConfidence}%`
+                      })()
                     : `score ≥${at.config.minScore}`}
           {' · '}{at.config.tf} ·{' '}
           {at.config.stakePlan ? `compound seed $${at.config.stakePlan.base}` : `$${at.config.stake}`} · max {at.config.maxOpen}
@@ -1239,33 +1308,53 @@ function AutoTraderDialog({
                     : d.signalSource === 'confluence'
                       ? 'the EXACT 14-factor Confluence Signal panel/confluence_read engine, re-fit bar-fresh on each candidate (full Kalman/OU, not the screener sweep\'s cheaper approximation) - identical read to what the panel/copilot would show for that pair right now'
                       : d.signalSource === 'strategy'
-                        ? 'ONE specific strategy picked below, evaluated market-wide on every open pair - the same strategyId an autopilot bot would use (a builtin strategy, or an AI Lab-learned "(Lab)" spec), not pinned to one bot\'s watchlist'
+                        ? 'one specific strategy picked below, or several combined as an ENSEMBLE (majority vote) - the same strategyId an autopilot bot would use (a builtin strategy, or an AI Lab-learned "(Lab)" spec), not pinned to one bot\'s watchlist'
                         : 'takes the strongest full-composite screener signals market-wide (trend + momentum + statistical + patterns)'}
             </p>
           </div>
 
-          {d.signalSource === 'strategy' && (
-            <div className="col-span-2">
-              <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Strategy</Label>
-              <select
-                value={d.strategyId ?? ''}
-                onChange={(e) => p({ strategyId: e.target.value || undefined })}
-                className="h-8 w-full rounded border border-[#1c2739] bg-[#101828] px-2 text-[11px] text-[#e2e8f0] outline-none focus:border-cyan-500/50"
-              >
-                <option value="">— pick a strategy —</option>
-                {strategies.map((s) => (
-                  <option key={s.id} value={s.id}>
-                    {s.name}
-                  </option>
-                ))}
-              </select>
-              <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
-                {d.strategyId
-                  ? `trades "${strategies.find((s) => s.id === d.strategyId)?.name ?? d.strategyId}" on every open pair (respecting the watchlist below, if set)`
-                  : 'nothing picked yet - the auto-trader stands aside until a strategy is selected'}
-              </p>
-            </div>
-          )}
+          {d.signalSource === 'strategy' && (() => {
+            const picked = d.strategyIds?.length ? d.strategyIds : d.strategyId ? [d.strategyId] : []
+            const isEnsemble = picked.length > 1
+            const only = picked.length === 1 ? strategies.find((s) => s.id === picked[0]) : undefined
+            return (
+              <div className="col-span-2">
+                <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">
+                  Strategy{isEnsemble ? ` (ensemble of ${picked.length})` : ''} - search to add, pick more than one for an ensemble
+                </Label>
+                <StrategyPicker
+                  strategies={strategies}
+                  selected={picked}
+                  onChange={(ids) => p({ strategyIds: ids, strategyId: ids[0] })}
+                />
+                {picked.length === 0 && (
+                  <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+                    nothing picked yet - the auto-trader stands aside until at least one strategy is selected
+                  </p>
+                )}
+                {only && (
+                  <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+                    {only.description || `trades "${only.name}" on every open pair (respecting the watchlist below, if set)`}
+                  </p>
+                )}
+                {isEnsemble && (
+                  <>
+                    <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+                      every member strategy votes CALL/PUT/none on each pair; the majority direction wins (a tie skips the pair) -
+                      this ensemble trades only when {d.minConfidence}% or more of the {picked.length} members agree, and their
+                      average score still clears Min score below.
+                    </p>
+                    <NumField
+                      label="Min agreement % (ensemble)"
+                      value={d.minConfidence}
+                      onChange={(v) => p({ minConfidence: Math.min(100, Math.max(1, v)) })}
+                    />
+                  </>
+                )}
+                <NumField label="Min score" value={d.minScore} onChange={(v) => p({ minScore: v })} />
+              </div>
+            )
+          })()}
 
           <div className="col-span-2">
             <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">
@@ -1316,7 +1405,7 @@ function AutoTraderDialog({
           ) : (
             <NumField label="Stake $" value={d.stake} onChange={(v) => p({ stake: v })} />
           )}
-          <NumField label="Min |score|" value={d.minScore} onChange={(v) => p({ minScore: v })} />
+          {d.signalSource !== 'strategy' && <NumField label="Min |score|" value={d.minScore} onChange={(v) => p({ minScore: v })} />}
 
           <Segmented
             label="Stake plan"
@@ -1426,7 +1515,7 @@ function AutoTraderDialog({
           {d.signalSource === 'momentum' && (
             <NumField label="Min ADX (trend strength)" value={d.minAdx} onChange={(v) => p({ minAdx: v })} />
           )}
-          <NumField label="Min confidence" value={d.minConfidence} onChange={(v) => p({ minConfidence: v })} />
+          {d.signalSource !== 'strategy' && <NumField label="Min confidence" value={d.minConfidence} onChange={(v) => p({ minConfidence: v })} />}
           <NumField label="Max open" value={d.maxOpen} onChange={(v) => p({ maxOpen: v })} />
           <NumField label="Per-asset cooldown s" value={d.cooldownSec} onChange={(v) => p({ cooldownSec: v })} />
           <NumField label="Pace s (between trades)" value={d.paceSec} onChange={(v) => p({ paceSec: v })} />

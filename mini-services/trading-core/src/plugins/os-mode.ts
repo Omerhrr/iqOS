@@ -89,8 +89,18 @@ export interface AutoTraderConfig {
   /** strategy source: id from the combined Strategy Lab catalog - a builtin
    * strategy id (e.g. "ema-cross", "confluence-full") or an AI Lab-learned
    * spec ("custom:<id>"), exactly like an autopilot bot's strategyId. Unset =
-   * the 'strategy' source has nothing to trade and stands aside. */
+   * the 'strategy' source has nothing to trade and stands aside.
+   * @deprecated superseded by strategyIds (kept for old saved configs - a
+   * lone strategyId is treated as a one-member strategyIds list). */
   strategyId?: string
+  /** strategy source: one or more ids from the combined Strategy Lab catalog.
+   * One id = trade that single strategy, exactly as strategyId always did.
+   * Two or more = an ENSEMBLE: every listed strategy votes call/put/none on
+   * each candidate, the majority direction wins, and minConfidence doubles
+   * as the minimum agreement % (e.g. 60 = at least 60% of the ensemble must
+   * agree) required to act - no classic "confidence" exists at the
+   * strategy level, so this is the natural place to put that threshold. */
+  strategyIds?: string[]
   direction: 'both' | 'call' | 'put'
   maxOpen: number // max concurrent auto-trader positions
   cooldownSec: number // per-asset re-entry cooldown
@@ -233,6 +243,9 @@ export class ModeService {
           minPUp: num(c.minPUp, DEFAULT_AUTOTRADER.minPUp),
           minAdx: num(c.minAdx, DEFAULT_AUTOTRADER.minAdx),
           strategyId: typeof c.strategyId === 'string' && c.strategyId.trim() ? c.strategyId.trim() : undefined,
+          strategyIds: Array.isArray(c.strategyIds)
+            ? c.strategyIds.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).map((x) => x.trim())
+            : undefined,
           direction: c.direction === 'call' || c.direction === 'put' ? c.direction : 'both',
           maxOpen: Math.round(num(c.maxOpen, DEFAULT_AUTOTRADER.maxOpen)),
           cooldownSec: Math.round(num(c.cooldownSec, DEFAULT_AUTOTRADER.cooldownSec)),
@@ -417,7 +430,7 @@ export class ModeService {
             : this.config.signalSource === 'confluence'
               ? `14-factor confluence ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`
               : this.config.signalSource === 'strategy'
-                ? `${this.config.strategyId ?? 'strategy'} edge ${Math.abs(row.score).toFixed(0)} (${row.direction.toUpperCase()})`
+                ? (row.note ?? `${this.effectiveStrategyIds().join('+') || 'strategy'} (${row.direction.toUpperCase()})`)
                 : `score ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} regime ${row.regime}`
     this.emit(
       'success',
@@ -664,42 +677,90 @@ export class ModeService {
     }
   }
 
+  /** The ids this 'strategy' source currently trades - strategyIds when set
+   * (one id = single strategy, 2+ = ensemble), falling back to the legacy
+   * lone strategyId for configs saved before strategyIds existed. */
+  private effectiveStrategyIds(): string[] {
+    if (Array.isArray(this.config.strategyIds) && this.config.strategyIds.length) return this.config.strategyIds
+    return this.config.strategyId ? [this.config.strategyId] : []
+  }
+
   /**
-   * Strategy source: evaluates ONE specific saved strategy (config.strategyId)
+   * Strategy source: evaluates one or more saved strategies (config.strategyIds)
    * market-wide, on every open candidate - the exact same strategyId/eval path
    * an autopilot bot uses (autopilot.ts's tradeForBot): a builtin id runs
    * through AnalyticsService.runStrategy with its own default params, an AI
    * Lab-learned id ("custom:...") runs through StrategyLabService.runStrategy.
-   * No confidence concept exists at the single-strategy level (only score),
-   * so minConfidence is not applied here - same as a bot's strategyId gate,
-   * which only checks minScore.
+   * One id = trade it directly, gated only by minScore (no confidence concept
+   * exists at the single-strategy level). Two+ ids = ENSEMBLE: every member
+   * votes call/put/none independently on the same candidate; the majority
+   * direction wins (a tie votes nothing), minConfidence is reused as the
+   * minimum AGREEMENT % the majority must reach, and minScore gates the
+   * average |score| of the agreeing members.
    */
   private pickStrategySignal(): ScreenRow | null {
-    const id = this.config.strategyId
-    if (!id) return null // nothing picked yet - source configured but idle
-    const isCustom = id.startsWith('custom:')
+    const ids = this.effectiveStrategyIds()
+    if (!ids.length) return null // nothing picked yet - source configured but idle
     try {
       const market = this.ctx.use<MarketDataService>('market')
       const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
       const restricted = this.config.watchlist.length > 0
       const pool = restricted ? this.config.watchlist.filter((a) => open.includes(a)) : open
       const candidates = [...LIQUID_CANDIDATES.filter((a) => pool.includes(a)), ...pool.filter((a) => !LIQUID_CANDIDATES.includes(a))]
-      const strat = isCustom ? null : getStrategy(id)
-      if (!isCustom && !strat) return null // unknown/removed strategy id - misconfigured
-      const params = strat ? defaultParams(strat) : undefined
+      const analytics = this.ctx.use<AnalyticsService>('analytics')
+      const lab = this.ctx.use<StrategyLabService>('lab')
+      const specs = ids.map((id) => {
+        const isCustom = id.startsWith('custom:')
+        const strat = isCustom ? null : getStrategy(id)
+        return { id, isCustom, params: strat ? defaultParams(strat) : undefined, valid: isCustom || Boolean(strat) }
+      })
+      const liveSpecs = specs.filter((s) => s.valid)
+      if (!liveSpecs.length) return null // every picked id is unknown/removed - misconfigured
       for (const asset of candidates) {
         if (this.assetBlocked(asset)) continue
-        try {
-          const ev = isCustom
-            ? this.ctx.use<StrategyLabService>('lab').runStrategy(asset, this.config.tf, id)
-            : this.ctx.use<AnalyticsService>('analytics').runStrategy(asset, this.config.tf, id, params)
-          if (ev.direction === 'none') continue
-          if (this.config.direction !== 'both' && ev.direction !== this.config.direction) continue
-          if (Math.abs(ev.score) < this.config.minScore) continue
-          return ModeService.strategyEvalToScreenRow(asset, this.config.tf, ev.direction, ev.score, ev.price)
-        } catch {
-          // thin history / bad pair for this strategy - try the next
+        const votes: Array<{ id: string; direction: 'call' | 'put'; score: number }> = []
+        let price = 0
+        for (const s of liveSpecs) {
+          try {
+            const ev = s.isCustom
+              ? lab.runStrategy(asset, this.config.tf, s.id)
+              : analytics.runStrategy(asset, this.config.tf, s.id, s.params)
+            if (ev.direction === 'none') continue
+            votes.push({ id: s.id, direction: ev.direction, score: ev.score })
+            price = ev.price
+          } catch {
+            // thin history / bad pair for this member - other members still vote
+          }
         }
+        if (!votes.length) continue
+
+        if (liveSpecs.length === 1) {
+          const v = votes[0]
+          if (this.config.direction !== 'both' && v.direction !== this.config.direction) continue
+          if (Math.abs(v.score) < this.config.minScore) continue
+          return ModeService.strategyEvalToScreenRow(asset, this.config.tf, v.direction, v.score, price, `${v.id} score ${Math.abs(v.score).toFixed(0)}`)
+        }
+
+        // ensemble: majority vote, agreement %, average |score| of the agreeing members
+        const calls = votes.filter((v) => v.direction === 'call')
+        const puts = votes.filter((v) => v.direction === 'put')
+        const majority = calls.length === puts.length ? null : calls.length > puts.length ? calls : puts
+        if (!majority) continue // tied vote - no edge either way
+        const direction = majority[0].direction
+        if (this.config.direction !== 'both' && direction !== this.config.direction) continue
+        const agreementPct = Math.round((majority.length / liveSpecs.length) * 100)
+        if (agreementPct < this.config.minConfidence) continue
+        const avgScore = majority.reduce((a, v) => a + Math.abs(v.score), 0) / majority.length
+        if (avgScore < this.config.minScore) continue
+        return ModeService.strategyEvalToScreenRow(
+          asset,
+          this.config.tf,
+          direction,
+          avgScore,
+          price,
+          `ensemble ${majority.length}/${liveSpecs.length} agree (${majority.map((v) => v.id).join(', ')}) · avg ${avgScore.toFixed(0)}`,
+          agreementPct
+        )
       }
     } catch {
       // market/analytics/lab not loaded - no signal source
@@ -707,17 +768,20 @@ export class ModeService {
     return null
   }
 
-  /** Adapts a single-strategy eval (direction/score/price, no confidence
-   * concept) into the shared ScreenRow shape - confidence mirrors |score|
-   * since nothing else is available, matching how the strip/detail string
-   * display it. Screener-specific scalars are inert placeholders, as with
-   * confluenceToScreenRow above. */
+  /** Adapts a strategy/ensemble eval into the shared ScreenRow shape.
+   * `note` carries the strategy-specific explanation shown in place of a
+   * generic score/confidence (the member id(s) and what they said), and
+   * `confidenceOverride` lets the ensemble path report agreement % instead
+   * of the single-strategy default of mirroring |score|. Screener-specific
+   * scalars are inert placeholders, as with confluenceToScreenRow above. */
   private static strategyEvalToScreenRow(
     asset: string,
     tf: Timeframe,
     direction: 'call' | 'put' | 'none',
     score: number,
-    price: number
+    price: number,
+    note?: string,
+    confidenceOverride?: number
   ): ScreenRow {
     return {
       asset,
@@ -728,7 +792,7 @@ export class ModeService {
       price,
       score,
       direction,
-      confidence: Math.round(clamp(Math.abs(score), 0, 100)),
+      confidence: Math.round(clamp(confidenceOverride ?? Math.abs(score), 0, 100)),
       pUp: 0,
       regime: 'range',
       ouZ: 0,
@@ -742,6 +806,7 @@ export class ModeService {
       changePct: 0,
       payout: 0,
       topPattern: null,
+      note,
       ts: Math.floor(Date.now() / 1000),
       computedTs: Math.floor(Date.now() / 1000),
     }
@@ -889,7 +954,10 @@ export class ModeService {
                 : this.config.signalSource === 'confluence'
                   ? 'confluence-full'
                   : this.config.signalSource === 'strategy'
-                    ? (this.config.strategyId ?? 'custom-strategy')
+                    ? (() => {
+                        const ids = this.effectiveStrategyIds()
+                        return ids.length > 1 ? `ensemble:${ids.join('+')}` : ids[0] ?? 'custom-strategy'
+                      })()
                     : 'screener-auto',
         note: AUTOTRADER_NOTE,
       })
@@ -1099,6 +1167,10 @@ export class ModeService {
     if (patch.minAdx !== undefined) this.config.minAdx = clamp(Number(patch.minAdx) || DEFAULT_AUTOTRADER.minAdx, 10, 45)
     if (patch.strategyId !== undefined)
       this.config.strategyId = typeof patch.strategyId === 'string' && patch.strategyId.trim() ? patch.strategyId.trim() : undefined
+    if (patch.strategyIds !== undefined)
+      this.config.strategyIds = Array.isArray(patch.strategyIds)
+        ? patch.strategyIds.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).map((x) => x.trim())
+        : undefined
     if (patch.direction !== undefined && ['both', 'call', 'put'].includes(String(patch.direction)))
       this.config.direction = String(patch.direction) as AutoTraderConfig['direction']
     if (patch.maxOpen !== undefined) this.config.maxOpen = Math.round(clamp(Number(patch.maxOpen) || 1, 1, 10))
@@ -1134,7 +1206,14 @@ export class ModeService {
             : this.config.signalSource === 'confluence'
               ? ' (full 14-factor panel engine, bar-fresh)'
               : this.config.signalSource === 'strategy'
-                ? ` (${this.config.strategyId ?? 'no strategy picked'})`
+                ? (() => {
+                    const ids = this.effectiveStrategyIds()
+                    return ids.length === 0
+                      ? ' (no strategy picked)'
+                      : ids.length === 1
+                        ? ` (${ids[0]})`
+                        : ` (ensemble of ${ids.length}: ${ids.join(', ')} · ≥${this.config.minConfidence}% agreement)`
+                  })()
                 : ''
     this.emit(
       'info',
