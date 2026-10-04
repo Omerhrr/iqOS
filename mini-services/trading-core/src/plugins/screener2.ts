@@ -1,28 +1,44 @@
-// IQAIR//OS - Screener2 plugin (DISCOVERY layer, confluence engine)
-// Same background-sweep architecture as the Screener plugin (screener.ts),
-// but scores off the SAME deep candle read the Confluence Signal panel/
-// confluence_read use (market.getCandlesDeep(asset, tf, 1500) - archived
-// history merged with the live tail), not the Screener's shallow
-// market.getCandles(asset, tf, 300). That depth difference, not the OU model
-// (ouState/ouKalman actually share the same live-state fit - confirmed in
-// kalman.ts), is what makes the panel's read diverge from the Screener tab:
-// with only 300 bars, EMA200/Markov(lookback 500)/Hurst/regression are all
-// starved relative to what the panel computes on 1500. This plugin exists so
-// the tab you watch reads the pair the same way the panel would right now.
-// Kept as its own plugin/service/endpoint pair (not a mode of the original)
-// so the two feeds, and their independent sweep cadence, never interfere.
+// IQAIR//OS - Screener2 plugin (DISCOVERY layer, Confluence Signal engine)
+// NOT a Screener clone - a market-wide sweep of the SAME engine the
+// single-asset Confluence Signal panel/confluence_read use (confluenceSignalOnly,
+// on the same deep candle read - market.getCandlesDeep(asset, tf, 1500),
+// archived + live tail). A row carries the real CompositeSignal.factors array
+// (EMA Stack, ADX/DI, Regression Slope, Supertrend, RSI, MACD Hist, Stochastic
+// K/D, Bollinger %B, Z-Score, Williams %R, Markov P(up), Hurst Exponent,
+// Kalman/OU Stretch, Pattern Bias) - the exact factor breakdown the panel
+// shows for one pair - not the Screener's derived scalar columns (rsi/adx/
+// regime/hurst/ouZ/pUp as plain numbers, topPattern as a name). The UI is
+// responsible for rendering each row as a shrunk version of the panel's own
+// meter + factor list, not a data-table row.
 
-import type { AssetCategory, Timeframe } from '../types'
+import type { AssetCategory, Factor, Timeframe } from '../types'
 import type { KernelContext, Plugin } from '../kernel'
 import type { MarketDataService } from './market-data'
-import type { ScreenRow } from './screener'
-import { confluenceSignalOnly, scanSnapshot } from '../analytics/engine'
+import { confluenceSignalOnly } from '../analytics/engine'
 import { searchInstruments } from '../universe'
+
+/** One pair's full Confluence Signal read - everything the single-asset panel
+ * shows (meter + factor votes), plus the metadata needed to list/sort/click it. */
+export interface ConfluenceRow {
+  asset: string
+  name: string
+  category: AssetCategory
+  otc: boolean
+  tf: Timeframe
+  price: number
+  score: number // -100..100, same as the panel's meter
+  direction: 'call' | 'put' | 'none'
+  confidence: number // 0..100
+  factors: Factor[] // the exact 14-factor breakdown the panel lists
+  payout: number
+  ts: number // candle time the row was computed on
+  computedTs: number // wall clock when computed
+}
 
 export interface Screener2Config {
   tfs: Timeframe[]
   category: 'all' | AssetCategory | 'otc'
-  batch: number // smaller than screener's default - each pair costs more (full Kalman fit)
+  batch: number // small - each pair re-fits the full engine on 1500 deep candles
   minCandles: number
 }
 
@@ -34,8 +50,9 @@ export const DEFAULT_SCREENER2_CONFIG: Screener2Config = {
 }
 
 /** Deep-read depth, matching AnalyticsService.analyze()'s getCandlesDeep call
- * exactly - this is the actual source of the panel/Screener divergence, not
- * the OU model (see file header). */
+ * exactly - the real source of a "panel vs sweep" divergence is candle depth
+ * (EMA200/Markov lookback 500/Hurst/regression all starved on a shallow
+ * window), not the OU model, which is identical either way. */
 const DEEP_CANDLES = 1500
 
 const VALID_TFS: Timeframe[] = ['5s', '15s', '30s', '1m', '2m', '5m', '15m', '30m', '1h', '4h', '1d']
@@ -45,7 +62,7 @@ export class Screener2Service {
   private ctx!: KernelContext
   private market!: MarketDataService
   config: Screener2Config = { ...DEFAULT_SCREENER2_CONFIG }
-  private rows = new Map<string, ScreenRow>()
+  private rows = new Map<string, ConfluenceRow>()
   private queue: { asset: string; tf: Timeframe }[] = []
   private stale = new Set<string>()
   private timer: ReturnType<typeof setInterval> | null = null
@@ -66,7 +83,7 @@ export class Screener2Service {
     })
 
     this.timer = setInterval(() => this.pump(), 1_200)
-    ctx.log('screener2', `confluence discovery engine online - sweep targets ${this.config.tfs.join('/')} across the full universe`)
+    ctx.log('screener2', `Confluence Signal sweep online - targets ${this.config.tfs.join('/')} across the full universe`)
   }
 
   stop(): void {
@@ -141,41 +158,26 @@ export class Screener2Service {
     }
   }
 
-  /**
-   * Score one pair with the full confluence engine (direction/score/
-   * confidence) on the SAME deep candle read the panel uses - everything else
-   * on the row is scanSnapshot on those same candles, for display only.
-   */
-  private scorePair(asset: string, tf: Timeframe): ScreenRow {
+  /** Score one pair with confluenceSignalOnly on the panel's own deep candle
+   * read - the row IS the panel's CompositeSignal, nothing derived/renamed. */
+  private scorePair(asset: string, tf: Timeframe): ConfluenceRow {
     const candles = this.market.getCandlesDeep(asset, tf, DEEP_CANDLES)
     if (candles.length < this.config.minCandles) throw new Error(`thin history ${asset} ${tf}`)
-    const snap = scanSnapshot(candles, asset, tf)
     const sig = confluenceSignalOnly(candles, asset, tf)
     const inst = this.market.assets.find((a) => a.ticker === asset)
-    const row: ScreenRow = {
+    const row: ConfluenceRow = {
       asset,
       name: inst?.name ?? asset,
       category: inst?.category ?? 'forex',
       otc: inst?.otc ?? false,
       tf,
-      price: snap.price,
+      price: sig.price,
       score: Math.round(sig.score * 10) / 10,
       direction: sig.direction,
       confidence: Math.round(sig.confidence),
-      pUp: Math.round(snap.probUp * 1000) / 1000,
-      regime: snap.regime,
-      ouZ: Math.round(snap.ouZ * 100) / 100,
-      ouHalfLife: Math.round(snap.ouHalfLife * 10) / 10,
-      ouMeanReverting: snap.ouMeanReverting,
-      ouTStat: Math.round(snap.ouTStat * 100) / 100,
-      rsi: Math.round(snap.rsi * 10) / 10,
-      adx: Math.round(snap.adx * 10) / 10,
-      atrPct: Math.round(snap.atrPct * 1000) / 1000,
-      hurst: Math.round(snap.hurst * 100) / 100,
-      changePct: Math.round(snap.changePct * 100) / 100,
+      factors: sig.factors,
       payout: this.market.payoutFor(asset, 'binary'),
-      topPattern: snap.topPattern,
-      ts: snap.ts,
+      ts: sig.ts,
       computedTs: Math.floor(Date.now() / 1000),
     }
     this.rows.set(`${asset}|${tf}`, row)
@@ -185,7 +187,7 @@ export class Screener2Service {
 
   // ---------- public API ----------
 
-  evaluate(asset: string, tf: Timeframe): ScreenRow {
+  evaluate(asset: string, tf: Timeframe): ConfluenceRow {
     const key = `${asset}|${tf}`
     if (!this.stale.has(key)) {
       const cached = this.rows.get(key)
@@ -205,7 +207,7 @@ export class Screener2Service {
     minScore?: number
     q?: string
     limit?: number
-  }): { rows: ScreenRow[]; total: number } {
+  }): { rows: ConfluenceRow[]; total: number } {
     const q = (opts.q ?? '').toLowerCase().trim()
     let rows = [...this.rows.values()]
     if (opts.tf) rows = rows.filter((r) => r.tf === opts.tf)

@@ -1,20 +1,20 @@
 'use client'
 
-// IQAIR//OS - Screener2 panel (DISCOVERY, Confluence Signal engine)
-// Same filters/table/click-to-chart/bell-to-alert mechanics as ScreenerPanel,
-// but every row is scored with confluenceSignalOnly on the SAME deep candle
-// read (1500 bars, archived + live) the single-asset Confluence Signal panel
-// (SignalPanel.tsx) uses - not the Screener's shallow 300-bar sweep window.
-// The heading and the CALL/PUT badge intentionally reuse SignalPanel's exact
-// title text and scoreColor/badge styling (+/-22 thresholds, same colors) so
-// this reads as "the Confluence Signal panel, market-wide" rather than a
-// Screener reskin - this is a genuinely different engine/signal, not a copy.
+// IQAIR//OS - Confluence Signal sweep (market-wide)
+// NOT a Screener reskin. Each pair is its own shrunk copy of the single-asset
+// Confluence Signal gauge (SignalPanel.tsx) - same meter (PUT -100..+100 CALL,
+// score/conf), same CALL/PUT/NEUTRAL badge and colors, and clicking a row
+// expands the EXACT 14-factor breakdown (EMA Stack, ADX/DI, Regression Slope,
+// Supertrend, RSI, MACD Hist, Stochastic K/D, Bollinger %B, Z-Score,
+// Williams %R, Markov P(up), Hurst Exponent, Kalman/OU Stretch, Pattern Bias)
+// with the same per-factor vote bars and notes the panel shows - just for
+// every open pair at once instead of only the active chart's asset.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import type { ScreenRow, ScreenerStatus, Timeframe } from '@/lib/os/client'
-import { fmtPct, fmtPrice, osGet, osPost } from '@/lib/os/client'
+import type { ConfluenceRow, ScreenerStatus, Timeframe } from '@/lib/os/client'
+import { fmtPrice, osGet, osPost } from '@/lib/os/client'
 
 interface ScreenerPanel2Props {
   onSelectSetup: (asset: string, tf: Timeframe) => void
@@ -35,49 +35,24 @@ const CATS: { id: CatFilter; label: string }[] = [
   { id: 'index', label: 'Indices' },
 ]
 
-const REGIME_COLOR: Record<string, string> = {
-  bull: 'text-emerald-400',
-  bear: 'text-rose-400',
-  range: 'text-sky-400',
-  chop: 'text-[#7c8aa5]',
-}
-
+/** Same thresholds/colors as SignalPanel.tsx's scoreColor - a row's CALL/PUT/
+ * NEUTRAL badge here means exactly what it means on the single-asset panel. */
 function scoreColor(score: number): string {
-  const a = Math.min(1, Math.abs(score) / 80)
-  if (score >= 0) return `rgba(16,185,129,${0.15 + a * 0.5})`
-  return `rgba(244,63,94,${0.15 + a * 0.5})`
-}
-
-/** Same thresholds/colors as SignalPanel.tsx's scoreColor - the single-asset
- * Confluence Signal gauge's CALL/PUT/NEUTRAL badge - so a row's badge here
- * means exactly what it means there. */
-function directionColor(score: number): string {
   if (score >= 22) return '#10b981'
   if (score <= -22) return '#f43f5e'
   return '#eab308'
 }
 
-function DirectionBadge({ direction, score }: { direction: 'call' | 'put' | 'none'; score: number }) {
-  const color = directionColor(score)
-  return (
-    <span
-      className="rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider"
-      style={{ color, background: `${color}1a`, border: `1px solid ${color}55` }}
-    >
-      {direction === 'call' ? 'CALL' : direction === 'put' ? 'PUT' : 'NEUTRAL'}
-    </span>
-  )
-}
-
 export default function ScreenerPanel2({ onSelectSetup, onError }: ScreenerPanel2Props) {
-  const [rows, setRows] = useState<ScreenRow[]>([])
+  const [rows, setRows] = useState<ConfluenceRow[]>([])
   const [status, setStatus] = useState<ScreenerStatus | null>(null)
   const [tf, setTf] = useState<Timeframe | 'all'>('all')
   const [cat, setCat] = useState<CatFilter>('all')
   const [dir, setDir] = useState<DirFilter>('all')
   const [minScore, setMinScore] = useState(0)
   const [q, setQ] = useState('')
-  const [limit, setLimit] = useState(60)
+  const [limit, setLimit] = useState(40)
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
   const [flash, setFlash] = useState<Set<string>>(new Set())
   const prevScores = useRef<Map<string, number>>(new Map())
 
@@ -90,7 +65,7 @@ export default function ScreenerPanel2({ onSelectSetup, onError }: ScreenerPanel
       if (minScore > 0) params.minScore = minScore
       if (q.trim()) params.q = q.trim()
       const [d, s] = await Promise.all([
-        osGet<{ ok: boolean; rows: ScreenRow[] }>('/screener2', params),
+        osGet<{ ok: boolean; rows: ConfluenceRow[] }>('/screener2', params),
         osGet<{ ok: boolean; status: ScreenerStatus }>('/screener2_status'),
       ])
       if (d.ok) {
@@ -118,7 +93,15 @@ export default function ScreenerPanel2({ onSelectSetup, onError }: ScreenerPanel
 
   const shown = useMemo(() => rows.slice(0, limit), [rows, limit])
 
-  const quickAlert = async (r: ScreenRow) => {
+  const toggle = (key: string) =>
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+
+  const quickAlert = async (r: ConfluenceRow) => {
     const metric = r.direction === 'call' ? 'score_call' : r.direction === 'put' ? 'score_put' : 'score_abs'
     const value = Math.max(55, Math.ceil(Math.abs(r.score)))
     try {
@@ -203,141 +186,128 @@ export default function ScreenerPanel2({ onSelectSetup, onError }: ScreenerPanel
         </span>
       </div>
 
-      {/* table */}
-      <div className="min-h-0 flex-1 overflow-auto">
+      {/* market-wide gauge list */}
+      <div className="min-h-0 flex-1 space-y-1.5 overflow-auto p-2">
         {shown.length === 0 ? (
           <div className="flex h-full min-h-[100px] items-center justify-center font-mono text-[11px] text-[#3d4d66]">
             {status?.pairs ? 'no setups match the filters' : 'first sweep in progress - ranking the universe…'}
           </div>
         ) : (
-          <table className="w-full font-mono text-[11px]">
-            <thead className="sticky top-0 z-10 bg-[#080d16]">
-              <tr className="border-b border-[#141d2e] text-left text-[9px] uppercase tracking-wider text-[#4b5a72]">
-                <Th>Asset</Th>
-                <Th>Tf</Th>
-                <Th>Price</Th>
-                <Th>Call/Put</Th>
-                <Th>Score</Th>
-                <Th>Conf</Th>
-                <Th>Regime</Th>
-                <Th>RSI</Th>
-                <Th>ADX</Th>
-                <Th>ATR%</Th>
-                <Th>Δ24</Th>
-                <Th>Hurst</Th>
-                <Th>OU z</Th>
-                <Th>P(up)</Th>
-                <Th>Pattern</Th>
-                <Th />
-              </tr>
-            </thead>
-            <tbody>
-              {shown.map((r) => {
-                const key = `${r.asset}|${r.tf}`
-                const hot = flash.has(key)
-                return (
-                  <tr
-                    key={key}
-                    className={`cursor-pointer border-b border-[#0d1420] transition-colors hover:bg-[#101828] ${hot ? 'bg-violet-500/5' : ''}`}
-                    onClick={() => onSelectSetup(r.asset, r.tf)}
-                    title={`${r.name} - click to load chart`}
-                  >
-                    <Td>
-                      <span className="text-[#dbe4f0]">{r.asset}</span>
-                      {r.otc && <span className="ml-1 rounded bg-amber-500/10 px-1 text-[8px] text-amber-400">OTC</span>}
-                    </Td>
-                    <Td className="text-[#4b5a72]">{r.tf}</Td>
-                    <Td>{fmtPrice(r.price, r.asset)}</Td>
-                    <Td>
-                      <DirectionBadge direction={r.direction} score={r.score} />
-                    </Td>
-                    <Td>
-                      <div className="flex items-center gap-1.5">
-                        <div className="h-1.5 w-14 overflow-hidden rounded-full bg-[#101828]">
-                          <div
-                            className="h-full rounded-full"
-                            style={{
-                              width: `${Math.min(100, Math.abs(r.score))}%`,
-                              background: scoreColor(r.score),
-                              marginLeft: r.score < 0 ? `${100 - Math.min(100, Math.abs(r.score))}%` : undefined,
-                            }}
-                          />
+          shown.map((r) => {
+            const key = `${r.asset}|${r.tf}`
+            const hot = flash.has(key)
+            const open = expanded.has(key)
+            const color = scoreColor(r.score)
+            const pct = (r.score + 100) / 2
+            return (
+              <div
+                key={key}
+                className={`rounded border border-[#1c2739] bg-[#0d1420] transition-colors ${hot ? 'ring-1 ring-violet-500/40' : ''}`}
+              >
+                {/* header + meter (shrunk SignalPanel) */}
+                <div className="cursor-pointer px-2.5 py-2" onClick={() => toggle(key)} title="click to expand the factor breakdown">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex min-w-0 items-center gap-1.5">
+                      <span className={`font-mono text-[9px] text-[#4b5a72] transition-transform ${open ? 'rotate-90' : ''}`}>▸</span>
+                      <span className="truncate font-mono text-[12px] font-semibold text-[#dbe4f0]">{r.asset}</span>
+                      {r.otc && <span className="shrink-0 rounded bg-amber-500/10 px-1 text-[8px] text-amber-400">OTC</span>}
+                      <span className="shrink-0 font-mono text-[9px] text-[#4b5a72]">{r.tf}</span>
+                      <span className="shrink-0 font-mono text-[10px] text-[#7c8aa5]">{fmtPrice(r.price, r.asset)}</span>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2">
+                      <span
+                        className="rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider"
+                        style={{ color, background: `${color}1a`, border: `1px solid ${color}55` }}
+                      >
+                        {r.direction === 'call' ? 'CALL' : r.direction === 'put' ? 'PUT' : 'NEUTRAL'}
+                      </span>
+                      <Button
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          void quickAlert(r)
+                        }}
+                        variant="outline"
+                        size="sm"
+                        className="h-5 border-[#1c2739] px-1.5 text-[9px] text-[#7c8aa5] hover:text-violet-300"
+                        title="create an alert rule from this setup"
+                      >
+                        bell
+                      </Button>
+                      <Button
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          onSelectSetup(r.asset, r.tf)
+                        }}
+                        variant="outline"
+                        size="sm"
+                        className="h-5 border-[#1c2739] px-1.5 text-[9px] text-[#7c8aa5] hover:text-violet-300"
+                      >
+                        chart
+                      </Button>
+                    </div>
+                  </div>
+
+                  {/* the exact panel meter, shrunk */}
+                  <div className="mt-1.5">
+                    <div className="relative h-1.5 overflow-hidden rounded-full bg-gradient-to-r from-rose-500/25 via-yellow-500/15 to-emerald-500/25">
+                      <div
+                        className="absolute top-0 h-full w-1 rounded-full bg-white shadow-[0_0_6px_rgba(255,255,255,0.8)] transition-all duration-500"
+                        style={{ left: `calc(${Math.min(99, Math.max(1, pct))}% - 2px)` }}
+                      />
+                    </div>
+                    <div className="mt-0.5 flex justify-between font-mono text-[9px] text-[#4b5a72]">
+                      <span className="text-rose-400">PUT -100</span>
+                      <span style={{ color }} className="font-bold">
+                        score {r.score.toFixed(0)} · conf {r.confidence.toFixed(0)}%
+                      </span>
+                      <span className="text-emerald-400">+100 CALL</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* full factor breakdown - identical rendering to SignalPanel.tsx */}
+                {open && (
+                  <div className="space-y-1.5 border-t border-[#141d2e] px-2.5 py-2">
+                    {r.factors.map((f) => {
+                      const vote = typeof f.vote === 'number' && Number.isFinite(f.vote) ? f.vote : 0
+                      const strength = Math.min(1, Math.abs(vote) / 2)
+                      const fColor = vote > 0.15 ? '#10b981' : vote < -0.15 ? '#f43f5e' : '#4b5a72'
+                      return (
+                        <div key={f.name} className="text-[11px] leading-tight">
+                          <div className="flex items-center justify-between font-mono">
+                            <span className="text-[#aab6cc]">{f.name}</span>
+                            <span style={{ color: fColor }}>
+                              {vote > 0 ? '+' : ''}
+                              {vote.toFixed(1)}
+                            </span>
+                          </div>
+                          <div className="mt-0.5 flex h-1 items-center">
+                            <div className="relative h-1 w-full rounded bg-[#101828]">
+                              <div className="absolute left-1/2 top-0 h-full w-px bg-[#2a3a52]" />
+                              <div
+                                className="absolute top-0 h-full rounded"
+                                style={{
+                                  background: fColor,
+                                  width: `${strength * 50}%`,
+                                  left: vote > 0 ? '50%' : undefined,
+                                  right: vote <= 0 ? '50%' : undefined,
+                                }}
+                              />
+                            </div>
+                          </div>
+                          <div className="mt-0.5 text-[10px] text-[#4b5a72]">{f.note}</div>
                         </div>
-                        <span className={r.score >= 0 ? 'text-emerald-400' : 'text-rose-400'}>{r.score.toFixed(0)}</span>
-                      </div>
-                    </Td>
-                    <Td className="text-[#7c8aa5]">{r.confidence}%</Td>
-                    <Td className={REGIME_COLOR[r.regime]}>{r.regime}</Td>
-                    <Td className={r.rsi >= 70 ? 'text-amber-400' : r.rsi <= 30 ? 'text-sky-400' : 'text-[#7c8aa5]'}>{r.rsi.toFixed(0)}</Td>
-                    <Td className={r.adx >= 25 ? 'text-violet-300' : 'text-[#7c8aa5]'}>{r.adx.toFixed(0)}</Td>
-                    <Td className="text-[#7c8aa5]">{r.atrPct.toFixed(3)}</Td>
-                    <Td className={r.changePct >= 0 ? 'text-emerald-400' : 'text-rose-400'}>{fmtPct(r.changePct, 2)}</Td>
-                    <Td className="text-[#7c8aa5]">{r.hurst.toFixed(2)}</Td>
-                    <Td
-                      className={
-                        !r.ouMeanReverting
-                          ? 'text-[#3d4c66]'
-                          : r.ouZ <= -1.8
-                            ? 'text-emerald-400'
-                            : r.ouZ >= 1.8
-                              ? 'text-rose-400'
-                              : 'text-[#aab6cc]'
-                      }
-                      title={
-                        r.ouMeanReverting
-                          ? `Kalman/OU mean-reverting · half-life ${r.ouHalfLife >= 9999 ? '∞' : r.ouHalfLife.toFixed(0)} bars · t ${r.ouTStat.toFixed(1)} · ${r.ouZ.toFixed(2)}σ from equilibrium`
-                          : `no reversion edge (t ${r.ouTStat.toFixed(1)}) - fading this is not advised`
-                      }
-                    >
-                      {r.ouZ >= 0 ? '+' : ''}
-                      {r.ouZ.toFixed(2)}
-                    </Td>
-                    <Td className={r.pUp >= 0.55 ? 'text-emerald-400' : r.pUp <= 0.45 ? 'text-rose-400' : 'text-[#7c8aa5]'}>{(r.pUp * 100).toFixed(0)}%</Td>
-                    <Td className="max-w-[120px] truncate text-[#7c8aa5]" title={r.topPattern?.name ?? ''}>
-                      {r.topPattern ? (
-                        <span className={r.topPattern.direction === 'bullish' ? 'text-emerald-400' : r.topPattern.direction === 'bearish' ? 'text-rose-400' : ''}>
-                          {r.topPattern.name}
-                        </span>
-                      ) : (
-                        '-'
-                      )}
-                    </Td>
-                    <Td>
-                      <div className="flex items-center gap-1">
-                        <Button
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            void quickAlert(r)
-                          }}
-                          variant="outline"
-                          size="sm"
-                          className="h-5 border-[#1c2739] px-1.5 text-[9px] text-[#7c8aa5] hover:text-violet-300"
-                          title="create an alert rule from this setup"
-                        >
-                          bell
-                        </Button>
-                        <Button
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            onSelectSetup(r.asset, r.tf)
-                          }}
-                          variant="outline"
-                          size="sm"
-                          className="h-5 border-[#1c2739] px-1.5 text-[9px] text-[#7c8aa5] hover:text-violet-300"
-                        >
-                          chart
-                        </Button>
-                      </div>
-                    </Td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+            )
+          })
         )}
         {rows.length > shown.length && (
           <button
-            onClick={() => setLimit((l) => l + 60)}
+            onClick={() => setLimit((l) => l + 40)}
             className="w-full py-1.5 text-center font-mono text-[10px] text-violet-400/70 hover:text-violet-300"
           >
             show more ({rows.length - shown.length} hidden)
@@ -345,16 +315,5 @@ export default function ScreenerPanel2({ onSelectSetup, onError }: ScreenerPanel
         )}
       </div>
     </div>
-  )
-}
-
-function Th({ children }: { children?: React.ReactNode }) {
-  return <th className="px-2 py-1.5">{children}</th>
-}
-function Td({ children, className = '', title }: { children?: React.ReactNode; className?: string; title?: string }) {
-  return (
-    <td className={`px-2 py-1 ${className}`} title={title}>
-      {children}
-    </td>
   )
 }

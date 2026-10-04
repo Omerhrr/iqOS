@@ -1117,6 +1117,28 @@ export interface ScreenRow {
   computedTs: number
 }
 
+/** One pair's full Confluence Signal read, market-wide - the exact
+ * CompositeSignal the single-asset panel (SignalPanel.tsx) shows for one pair
+ * (same `factors` breakdown: EMA Stack, ADX/DI, Supertrend, RSI, Markov P(up),
+ * Hurst, Kalman/OU Stretch, Pattern Bias, etc.), plus list metadata. This is
+ * NOT a ScreenRow - it carries no screener-derived scalars (rsi/adx/regime/
+ * hurst/ouZ/pUp/topPattern), only the real factor votes. */
+export interface ConfluenceRow {
+  asset: string
+  name: string
+  category: AssetCategory
+  otc: boolean
+  tf: Timeframe
+  price: number
+  score: number
+  direction: 'call' | 'put' | 'none'
+  confidence: number
+  factors: Factor[]
+  payout: number
+  ts: number
+  computedTs: number
+}
+
 export interface ScreenerStatus {
   pairs: number
   tfs: Timeframe[]
