@@ -269,6 +269,7 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
         open={atOpen}
         onOpenChange={setAtOpen}
         config={modeStatus?.autotrader.config ?? DEFAULT_AUTOTRADER_UI}
+        assets={assets}
         onSave={async (cfg) => {
           await osPost<{ ok: boolean }>('/autotrader_config', cfg)
           refreshMode()
@@ -1061,6 +1062,7 @@ const DEFAULT_AUTOTRADER_UI: AutoTraderConfig = {
   paceSec: 45,
   dailyProfitTarget: 0,
   dailyLossLimit: 0,
+  watchlist: [],
 }
 
 function AutoTraderStrip({
@@ -1129,11 +1131,13 @@ function AutoTraderDialog({
   open,
   onOpenChange,
   config,
+  assets,
   onSave,
 }: {
   open: boolean
   onOpenChange: (o: boolean) => void
   config: AutoTraderConfig
+  assets: AssetRow[]
   onSave: (patch: Partial<AutoTraderConfig>) => Promise<void>
 }) {
   const [d, setD] = useState<AutoTraderConfig>(config)
@@ -1192,6 +1196,18 @@ function AutoTraderDialog({
                   : d.signalSource === 'momentum'
                     ? 'trend continuation: CALL when ADX-confirmed strength, a positive rate-of-change and RSI on the bullish side of mid line up, PUT mirrored - skips statistically exhausted extremes'
                     : 'takes the strongest full-composite screener signals market-wide (trend + momentum + statistical + patterns)'}
+            </p>
+          </div>
+
+          <div className="col-span-2">
+            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">
+              Pair restriction {d.watchlist.length > 0 ? `(${d.watchlist.length} selected)` : '(GLOBAL - every open instrument)'}
+            </Label>
+            <WatchlistPicker assets={assets} selected={d.watchlist} onChange={(w) => p({ watchlist: w })} />
+            <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+              {d.watchlist.length > 0
+                ? `restricted to these ${d.watchlist.length} pair(s) only, regardless of signal source - clear the selection to go back to global.`
+                : 'no pairs selected = global: scans every currently-open instrument for the chosen signal source, same as always. Select pairs above to restrict it to just those.'}
             </p>
           </div>
 

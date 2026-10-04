@@ -1093,8 +1093,8 @@ const TOOLS: ToolSpec[] = [
   },
   {
     name: 'autotrader_configure',
-    description: 'Tune the built-in AUTO-TRADER (the OS acting as its own trader in NO-HUMAN mode): signalSource ("screener" = full composite signals, "kalman-ou" = fade statistically stretched pairs via the Ornstein-Uhlenbeck/Kalman fit gated by reversion significance + half-life, "markov" = follow the Markov chain state forecast when decisive and not chop, "momentum" = ADX-confirmed trend continuation), enabled (bool), tf (signal timeframe), stake, minScore (min |score|), minConfidence (0-100), zEntry (kalman-ou only: |z| in sigmas required to enter, 0.5-4), maxHalfLife (kalman-ou only: skip pairs with slower reversion, bars), requireValidation (kalman-ou only: trade only walk-forward-validated pairs), minPUp (markov only: decisive P(up) threshold, 0.5-0.75), minAdx (momentum only: minimum trend strength, 10-45), direction (both|call|put), maxOpen (concurrent), cooldownSec (per-asset), paceSec (between any two trades), dailyProfitTarget / dailyLossLimit (USD, 0=off). It trades 1-bar binary options.',
-    args: '{"enabled": true, "tf": "1m", "stake": 10, "minScore": 60, "maxOpen": 3}',
+    description: 'Tune the built-in AUTO-TRADER (the OS acting as its own trader in NO-HUMAN mode): signalSource ("screener" = full composite signals, "kalman-ou" = fade statistically stretched pairs via the Ornstein-Uhlenbeck/Kalman fit gated by reversion significance + half-life, "markov" = follow the Markov chain state forecast when decisive and not chop, "momentum" = ADX-confirmed trend continuation), enabled (bool), tf (signal timeframe), stake, minScore (min |score|), minConfidence (0-100), zEntry (kalman-ou only: |z| in sigmas required to enter, 0.5-4), maxHalfLife (kalman-ou only: skip pairs with slower reversion, bars), requireValidation (kalman-ou only: trade only walk-forward-validated pairs), minPUp (markov only: decisive P(up) threshold, 0.5-0.75), minAdx (momentum only: minimum trend strength, 10-45), direction (both|call|put), maxOpen (concurrent), cooldownSec (per-asset), paceSec (between any two trades), dailyProfitTarget / dailyLossLimit (USD, 0=off), watchlist (array of tickers - OPTIONAL pair restriction that applies to EVERY signalSource identically: empty/omitted = GLOBAL, scans the whole open-instrument universe exactly as before; non-empty = ONLY those tickers are ever considered, nothing else, regardless of which signal source is picked). It trades 1-bar binary options.',
+    args: '{"enabled": true, "tf": "1m", "stake": 10, "minScore": 60, "maxOpen": 3, "watchlist": ["EURUSD-OTC", "GBPUSD-OTC"]}',
     run: (a) =>
       corePost('/autotrader_config', {
         ...(a.enabled !== undefined ? { enabled: Boolean(a.enabled) } : {}),
@@ -1114,6 +1114,7 @@ const TOOLS: ToolSpec[] = [
         ...(a.paceSec !== undefined ? { paceSec: Number(a.paceSec) } : {}),
         ...(a.dailyProfitTarget !== undefined ? { dailyProfitTarget: Number(a.dailyProfitTarget) } : {}),
         ...(a.dailyLossLimit !== undefined ? { dailyLossLimit: Number(a.dailyLossLimit) } : {}),
+        ...(a.watchlist !== undefined ? { watchlist: Array.isArray(a.watchlist) ? a.watchlist.map(String) : [] } : {}),
       }),
   },
   // ---------- archive: deep history ----------

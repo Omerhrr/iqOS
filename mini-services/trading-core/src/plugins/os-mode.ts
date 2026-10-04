@@ -73,6 +73,11 @@ export interface AutoTraderConfig {
   paceSec: number // minimum seconds between any two auto trades
   dailyProfitTarget: number // 0 = off
   dailyLossLimit: number // 0 = off
+  /** Optional pair restriction. Empty/omitted = GLOBAL (every open instrument,
+   * the original behavior, unchanged). Non-empty = only these tickers are
+   * ever considered, for ANY signalSource - same choke point (assetBlocked)
+   * every candidate loop already filters through. */
+  watchlist: string[]
 }
 
 export const DEFAULT_AUTOTRADER: AutoTraderConfig = {
@@ -93,6 +98,7 @@ export const DEFAULT_AUTOTRADER: AutoTraderConfig = {
   paceSec: 45,
   dailyProfitTarget: 0,
   dailyLossLimit: 0,
+  watchlist: [],
 }
 
 const AUTOTRADER_NOTE = 'auto:os-trader'
@@ -173,6 +179,7 @@ export class ModeService {
           paceSec: Math.round(num(c.paceSec, DEFAULT_AUTOTRADER.paceSec)),
           dailyProfitTarget: num(c.dailyProfitTarget, 0),
           dailyLossLimit: num(c.dailyLossLimit, 0),
+          watchlist: Array.isArray(c.watchlist) ? c.watchlist.filter((x): x is string => typeof x === 'string') : [],
         }
       }
     }
@@ -347,15 +354,21 @@ export class ModeService {
     try {
       const screener = this.ctx.use<ScreenerService>('screener')
       const dir = this.config.direction === 'both' ? undefined : this.config.direction
-      const { rows } = screener.top({ tf: this.config.tf, minScore: this.config.minScore, direction: dir, limit: 12 })
+      const restricted = this.config.watchlist.length > 0
+      // a watchlist pair might not make the global top-12 by composite score
+      // alone - widen the ranked window so assetBlocked's own watchlist
+      // filter (not this limit) is what decides inclusion.
+      const { rows } = screener.top({ tf: this.config.tf, minScore: this.config.minScore, direction: dir, limit: restricted ? 500 : 12 })
       for (const r of rows) {
         if (r.direction === 'none') continue
         if (r.confidence < this.config.minConfidence) continue
         if (this.assetBlocked(r.asset)) continue
         return r
       }
-      // sweep still warming (or rows stale) - evaluate liquid pairs directly
-      for (const asset of LIQUID_CANDIDATES) {
+      // sweep still warming (or rows stale) - evaluate liquid pairs directly,
+      // or the operator's own watchlist when one is set (a restricted auto
+      // trader has no business falling back to pairs outside it)
+      for (const asset of restricted ? this.config.watchlist : LIQUID_CANDIDATES) {
         if (this.assetBlocked(asset)) continue
         try {
           const r = screener.evaluate(asset, this.config.tf)
@@ -661,8 +674,10 @@ export class ModeService {
     }
   }
 
-  /** Cooldown + one-auto-position-per-asset, applied by the signal picker. */
+  /** Cooldown + one-auto-position-per-asset + optional watchlist restriction,
+   * applied by every signal picker (all 4 sources funnel through this). */
   private assetBlocked(asset: string): boolean {
+    if (this.config.watchlist.length > 0 && !this.config.watchlist.includes(asset)) return true
     const last = this.rt.lastAssetTs.get(asset) ?? 0
     if (this.config.cooldownSec > 0 && this.now() - last < this.config.cooldownSec) return true
     return this.hasOpenAutoOn(asset)
@@ -747,6 +762,8 @@ export class ModeService {
     if (patch.paceSec !== undefined) this.config.paceSec = Math.round(clamp(Number(patch.paceSec) || 0, 0, 3600))
     if (patch.dailyProfitTarget !== undefined) this.config.dailyProfitTarget = Math.max(0, Number(patch.dailyProfitTarget) || 0)
     if (patch.dailyLossLimit !== undefined) this.config.dailyLossLimit = Math.max(0, Number(patch.dailyLossLimit) || 0)
+    if (patch.watchlist !== undefined)
+      this.config.watchlist = Array.isArray(patch.watchlist) ? patch.watchlist.filter((x): x is string => typeof x === 'string') : []
     this.persist()
     this.rt.lastRejection = undefined
     const srcDetail =

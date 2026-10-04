@@ -1151,6 +1151,9 @@ export interface AutoTraderConfig {
   paceSec: number
   dailyProfitTarget: number
   dailyLossLimit: number
+  /** Empty = global (every open instrument, any signalSource). Non-empty =
+   * only trade these tickers. */
+  watchlist: string[]
 }
 
 export interface OsModeStatus {
