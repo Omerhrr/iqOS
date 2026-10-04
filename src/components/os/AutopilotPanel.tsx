@@ -1179,7 +1179,7 @@ function AutoTraderDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-md border-[#1c2739] bg-[#0b111c] text-[#dbe4f0]">
+      <DialogContent className="max-h-[85vh] max-w-md overflow-y-auto border-[#1c2739] bg-[#0b111c] text-[#dbe4f0]">
         <DialogHeader>
           <DialogTitle className="text-[14px] tracking-wider">AUTO-TRADER</DialogTitle>
           <DialogDescription className="text-[11px] text-[#7c8aa5]">
