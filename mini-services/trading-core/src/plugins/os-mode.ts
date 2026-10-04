@@ -1188,11 +1188,30 @@ export class ModeService {
 
   // ---------- stats (rebuilt from the journal, same pattern as autopilot) ----------
 
+  /**
+   * Midnight (UTC) day boundary - resets ONLY the daily counters (trades,
+   * wins, losses, pnlToday). It used to do that by blindly replacing the
+   * whole runtime with a fresh one, which silently wiped three things that
+   * must survive the boundary:
+   *  - openCount: reset to 0 even though a position opened before midnight
+   *    may still be open after it, letting maxOpen be exceeded until the
+   *    next onPositionClosed/restart happens to fix the count.
+   *  - lastAssetTs: wiped entirely, so a pair traded at 23:59 became
+   *    tradeable again at 00:00 - defeating the per-asset cooldown floor
+   *    (including the 1hr minimum) right at the one moment it matters most.
+   *  - halted/complete/pot/rollN: reset to a fresh, un-halted cycle even
+   *    though a compounding plan with stopOnLoss was deliberately parked
+   *    until an explicit restart() - the day flipping should never be what
+   *    un-halts it.
+   * rebuildRuntime() already does this correctly: it restores halted/
+   * complete/pot/rollN from the persisted planState (the actual source of
+   * truth) and recomputes openCount/lastAssetTs from the store's real open
+   * positions, so delegating to it here keeps everything but the
+   * date-filtered daily stats intact across the boundary.
+   */
   private rolloverIfNeeded(): void {
     const dayKey = new Date().toISOString().slice(0, 10)
-    if (this.rt.dayKey !== dayKey) {
-      this.rt = { ...ModeService.freshRuntime(), pnlTotal: this.rt.pnlTotal, lastAssetTs: new Map() }
-    }
+    if (this.rt.dayKey !== dayKey) this.rebuildRuntime()
   }
 
   private rebuildRuntime(): void {
@@ -1430,9 +1449,13 @@ export class ModeService {
     ]
       .filter(Boolean)
       .join(' · ')
+    // report the ENFORCED cooldown (the 1hr floor always wins), not the raw
+    // saved value - a config saved at e.g. 60s would otherwise claim a
+    // cooldown that assetBlocked() never actually applies
+    const effectiveCooldown = Math.max(this.config.cooldownSec, ModeService.MIN_ASSET_COOLDOWN_SEC)
     this.emit(
       'info',
-      `AUTO-TRADER config: ${this.config.enabled ? 'armed' : 'off'} · src ${this.config.signalSource}${srcDetail} · ${this.config.tf} · stake $${this.config.stake}${thresholds ? ` · ${thresholds}` : ''} · maxOpen ${this.config.maxOpen} · cooldown ${this.config.cooldownSec}s`
+      `AUTO-TRADER config: ${this.config.enabled ? 'armed' : 'off'} · src ${this.config.signalSource}${srcDetail} · ${this.config.tf} · stake $${this.config.stake}${thresholds ? ` · ${thresholds}` : ''} · maxOpen ${this.config.maxOpen} · cooldown ${effectiveCooldown}s`
     )
     return { ok: true, config: { ...this.config } }
   }
