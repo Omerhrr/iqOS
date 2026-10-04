@@ -179,7 +179,7 @@ export const DEFAULT_AUTOTRADER: AutoTraderConfig = {
   minAdx: 22,
   direction: 'both',
   maxOpen: 3,
-  cooldownSec: 180,
+  cooldownSec: 3600, // every pair gets a hard 1hr rest after it trades - see MIN_ASSET_COOLDOWN_SEC
   paceSec: 45,
   dailyProfitTarget: 0,
   dailyLossLimit: 0,
@@ -226,6 +226,10 @@ export class ModeService {
    * account-mismatch rejection. */
   private static BROKER_UNAVAILABLE_RE = /not available at the moment|is not a (?:turbo\/binary\/digital|digital\/turbo\/binary) instrument/i
   private static BROKER_UNAVAILABLE_COOLDOWN_SEC = 600
+  /** Hard floor for the per-asset re-entry cooldown (assetBlocked) - a pair
+   * the auto-trader just traded always sits out at least this long, however
+   * cooldownSec is configured. */
+  private static MIN_ASSET_COOLDOWN_SEC = 3600
   /** asset -> unix ts until which pickSignal skips it, set on the rejection
    * above so the SAME closed pair isn't retried (and re-rejected) on every
    * 10s tick until the asset cache has a chance to catch up. */
@@ -805,6 +809,26 @@ export class ModeService {
       })
       const liveSpecs = specs.filter((s) => s.valid)
       if (!liveSpecs.length) return null // every picked id is unknown/removed - misconfigured
+
+      let adaptive: AdaptiveService | null = null
+      if (liveSpecs.length > 1 && this.config.strategyPickMode === 'best') {
+        try {
+          adaptive = this.ctx.use<AdaptiveService>('adaptive')
+        } catch {
+          adaptive = null
+        }
+      }
+
+      // Evaluate EVERY open/eligible pair this tick and keep the single best
+      // qualifying row across the whole pool - NOT the first candidate in
+      // LIQUID_CANDIDATES order that happens to fire. Returning on first
+      // match meant whichever major (EURUSD, by list order) qualified most
+      // often under a given strategy would win almost every tick, making the
+      // auto-trader look pinned to one pair even with a GLOBAL pair
+      // restriction - there was never a second pair in the running.
+      let bestRow: ScreenRow | null = null
+      let bestMetric = -Infinity
+
       for (const asset of candidates) {
         if (this.assetBlocked(asset)) continue
         const votes: Array<{ id: string; direction: 'call' | 'put'; score: number }> = []
@@ -830,7 +854,12 @@ export class ModeService {
           // mean anything a user picking ONE specific strategy would expect
           const v = votes[0]
           if (this.config.direction !== 'both' && v.direction !== this.config.direction) continue
-          return ModeService.strategyEvalToScreenRow(asset, this.config.tf, v.direction, v.score, price, `${v.id} score ${Math.abs(v.score).toFixed(0)}`, undefined, v.id)
+          const metric = Math.abs(v.score)
+          if (metric > bestMetric) {
+            bestMetric = metric
+            bestRow = ModeService.strategyEvalToScreenRow(asset, this.config.tf, v.direction, v.score, price, `${v.id} score ${Math.abs(v.score).toFixed(0)}`, undefined, v.id)
+          }
+          continue
         }
 
         if (this.config.strategyPickMode === 'best') {
@@ -841,12 +870,6 @@ export class ModeService {
           // |score| so it keeps getting picked often enough to build a
           // record; once any member clears the adaptive gate's own sample
           // floor, a proven result always outranks an unproven one.
-          let adaptive: AdaptiveService | null = null
-          try {
-            adaptive = this.ctx.use<AdaptiveService>('adaptive')
-          } catch {
-            adaptive = null
-          }
           let best: { id: string; direction: 'call' | 'put'; score: number; rank: number; proven: boolean } | null = null
           for (const v of votes) {
             let rank = Math.abs(v.score)
@@ -862,10 +885,18 @@ export class ModeService {
           }
           if (!best) continue
           if (this.config.direction !== 'both' && best.direction !== this.config.direction) continue
-          const note = best.proven
-            ? `auto-learn: ${best.id} proven best for ${asset} (${best.rank.toFixed(0)}% win rate, 95% floor)`
-            : `auto-learn: ${best.id} highest edge for ${asset} (score ${Math.abs(best.score).toFixed(0)}) - still building its own record`
-          return ModeService.strategyEvalToScreenRow(asset, this.config.tf, best.direction, best.score, price, note, best.proven ? Math.round(best.rank) : undefined, best.id)
+          // proven ALWAYS outranks unproven across pairs too, regardless of
+          // raw score magnitude - so a +1_000_000 offset keeps the two tiers
+          // from ever crossing while still ranking within each tier by rank.
+          const metric = best.proven ? 1_000_000 + best.rank : best.rank
+          if (metric > bestMetric) {
+            bestMetric = metric
+            const note = best.proven
+              ? `auto-learn: ${best.id} proven best for ${asset} (${best.rank.toFixed(0)}% win rate, 95% floor)`
+              : `auto-learn: ${best.id} highest edge for ${asset} (score ${Math.abs(best.score).toFixed(0)}) - still building its own record`
+            bestRow = ModeService.strategyEvalToScreenRow(asset, this.config.tf, best.direction, best.score, price, note, best.proven ? Math.round(best.rank) : undefined, best.id)
+          }
+          continue
         }
 
         // ensemble: majority vote, agreement %, average |score| of the agreeing members
@@ -878,17 +909,24 @@ export class ModeService {
         const agreementPct = Math.round((majority.length / liveSpecs.length) * 100)
         if (agreementPct < this.config.minConfidence) continue
         const avgScore = majority.reduce((a, v) => a + Math.abs(v.score), 0) / majority.length
-        return ModeService.strategyEvalToScreenRow(
-          asset,
-          this.config.tf,
-          direction,
-          avgScore,
-          price,
-          `ensemble ${majority.length}/${liveSpecs.length} agree (${majority.map((v) => v.id).join(', ')}) · avg ${avgScore.toFixed(0)}`,
-          agreementPct,
-          `ensemble:${majority.map((v) => v.id).join('+')}`
-        )
+        // rank by agreement % first (coarse, *1000 so it dominates), avg
+        // |score| as the tiebreak among pairs with equal agreement
+        const metric = agreementPct * 1000 + avgScore
+        if (metric > bestMetric) {
+          bestMetric = metric
+          bestRow = ModeService.strategyEvalToScreenRow(
+            asset,
+            this.config.tf,
+            direction,
+            avgScore,
+            price,
+            `ensemble ${majority.length}/${liveSpecs.length} agree (${majority.map((v) => v.id).join(', ')}) · avg ${avgScore.toFixed(0)}`,
+            agreementPct,
+            `ensemble:${majority.map((v) => v.id).join('+')}`
+          )
+        }
       }
+      return bestRow
     } catch {
       // market/analytics/lab not loaded - no signal source
     }
@@ -1134,7 +1172,13 @@ export class ModeService {
     const rejectedUntil = this.assetRejectedUntil.get(asset) ?? 0
     if (this.now() < rejectedUntil) return true
     const last = this.rt.lastAssetTs.get(asset) ?? 0
-    if (this.config.cooldownSec > 0 && this.now() - last < this.config.cooldownSec) return true
+    // Hard floor: a pair the auto-trader just traded is off-limits for a
+    // full hour minimum, no matter what cooldownSec is set to (even if an
+    // older saved config or a future patch tries to shrink it below that) -
+    // every pair it touches gets its own 1hr rest before it can be traded
+    // again.
+    const effectiveCooldown = Math.max(this.config.cooldownSec, ModeService.MIN_ASSET_COOLDOWN_SEC)
+    if (this.now() - last < effectiveCooldown) return true
     return this.hasOpenAutoOn(asset)
   }
 
@@ -1322,7 +1366,10 @@ export class ModeService {
     if (patch.direction !== undefined && ['both', 'call', 'put'].includes(String(patch.direction)))
       this.config.direction = String(patch.direction) as AutoTraderConfig['direction']
     if (patch.maxOpen !== undefined) this.config.maxOpen = Math.round(clamp(Number(patch.maxOpen) || 1, 1, 10))
-    if (patch.cooldownSec !== undefined) this.config.cooldownSec = Math.round(clamp(Number(patch.cooldownSec) || 0, 0, 3600))
+    // Floor stays enforced in assetBlocked() regardless of what's saved here
+    // (MIN_ASSET_COOLDOWN_SEC) - the field itself can still be raised past
+    // 1hr for a longer per-pair rest, just never shrunk below it.
+    if (patch.cooldownSec !== undefined) this.config.cooldownSec = Math.round(clamp(Number(patch.cooldownSec) || 0, 0, 86400))
     if (patch.paceSec !== undefined) this.config.paceSec = Math.round(clamp(Number(patch.paceSec) || 0, 0, 3600))
     if (patch.dailyProfitTarget !== undefined) this.config.dailyProfitTarget = Math.max(0, Number(patch.dailyProfitTarget) || 0)
     if (patch.dailyLossLimit !== undefined) this.config.dailyLossLimit = Math.max(0, Number(patch.dailyLossLimit) || 0)

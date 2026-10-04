@@ -1604,7 +1604,17 @@ function AutoTraderDialog({
           )}
           {d.signalSource !== 'strategy' && <NumField label="Min confidence" value={d.minConfidence} onChange={(v) => p({ minConfidence: v })} />}
           <NumField label="Max open" value={d.maxOpen} onChange={(v) => p({ maxOpen: v })} />
-          <NumField label="Per-asset cooldown s" value={d.cooldownSec} onChange={(v) => p({ cooldownSec: v })} />
+          <div>
+            <NumField
+              label="Per-asset cooldown s (1hr floor - never shorter)"
+              value={d.cooldownSec}
+              onChange={(v) => p({ cooldownSec: v })}
+            />
+            <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+              every pair the auto-trader just traded sits out at least 1 hour (3600s) before it can be traded again,
+              no matter how low this is set - raise it above 3600 for a longer rest, it just can&apos;t go shorter.
+            </p>
+          </div>
           <NumField label="Pace s (between trades)" value={d.paceSec} onChange={(v) => p({ paceSec: v })} />
           <NumField label="Daily profit target $ (0 off)" value={d.dailyProfitTarget} onChange={(v) => p({ dailyProfitTarget: v })} />
           <NumField label="Daily loss limit $ (0 off)" value={d.dailyLossLimit} onChange={(v) => p({ dailyLossLimit: v })} />
