@@ -17,10 +17,12 @@
 //      * 'momentum'    - trend-following on the screener row: ADX-confirmed
 //                        directional pressure with the move's rate-of-change
 //      * 'confluence'  - the EXACT Confluence Signal panel/confluence_read
-//                        14-factor engine (confluenceSignalOnly - full Kalman/OU
-//                        fit, not the screener's cheaper ouState approximation),
-//                        run bar-fresh on the candidate pair itself rather than
-//                        the periodic sweep's cached composite score
+//                        14-factor engine (confluenceSignalOnly), read off the
+//                        SAME deep candle history the panel reads (archived +
+//                        live tail, 1500 bars) instead of a shallow 300-bar
+//                        sweep window - that depth, not the OU model (which is
+//                        identical either way), is what makes a panel read
+//                        diverge from a thin one
 //  With 'kalman-ou' + requireValidation, a candidate pair must ALSO pass a
 //  walk-forward validation of the OU strategy (out-of-sample net positive,
 //  majority of folds profitable, decent IS->OOS efficiency) before the
@@ -570,14 +572,15 @@ export class ModeService {
 
   /**
    * Confluence source: runs the EXACT 14-factor Confluence Signal panel /
-   * confluence_read engine (confluenceSignalOnly) bar-fresh on each candidate -
-   * unlike 'screener' above, which trades off the periodic sweep's cached
-   * composite row (a cheap ouState approximation for the Kalman/OU factor).
-   * This source always re-fits the full Kalman filter, so what the auto-trader
-   * acts on is identical to what the panel/copilot would show the operator for
-   * that pair right now. Display metadata (name/category/payout/etc.) is
-   * borrowed from the screener's cached row - it's cosmetic only and never
-   * feeds the trade decision.
+   * confluence_read engine (confluenceSignalOnly) on each candidate - reading
+   * the SAME deep candle history the panel reads (market.getCandlesDeep(...,
+   * 1500), archived + live tail), not the thin 300-bar window a cheap sweep
+   * uses. That depth is what actually makes a panel read diverge from a
+   * shallow one (EMA200/Markov lookback 500/Hurst/regression all starved on
+   * 300 bars) - the OU model itself is identical either way (ouState/
+   * ouKalman share the same live-state fit, confirmed in kalman.ts). Display
+   * metadata (name/category/payout/etc.) is borrowed from the screener's
+   * cached row - cosmetic only, never feeds the trade decision.
    */
   private pickConfluenceSignal(): ScreenRow | null {
     try {
@@ -590,7 +593,7 @@ export class ModeService {
       for (const asset of candidates) {
         if (this.assetBlocked(asset)) continue
         try {
-          const candles = market.getCandles(asset, this.config.tf, 300)
+          const candles = market.getCandlesDeep(asset, this.config.tf, 1500)
           if (candles.length < 60) continue
           const sig = confluenceSignalOnly(candles, asset, this.config.tf)
           if (sig.direction === 'none') continue

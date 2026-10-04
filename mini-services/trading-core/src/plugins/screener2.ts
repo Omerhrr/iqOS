@@ -1,14 +1,16 @@
 // IQAIR//OS - Screener2 plugin (DISCOVERY layer, confluence engine)
 // Same background-sweep architecture as the Screener plugin (screener.ts),
-// but the score/direction/confidence on every row come from
-// confluenceSignalOnly - the EXACT 14-factor Confluence Signal panel /
-// confluence_read engine (full Kalman/OU fit), not the Screener's cheaper
-// ouState approximation. Display-only fields (rsi/adx/hurst/ouZ/pUp/regime/
-// pattern) are borrowed from the lightweight scanSnapshot on the same
-// candles - identical cost to the main screener for those, so the only extra
-// work per pair is the one confluence re-fit. Kept as its own plugin/service/
-// endpoint pair (not a mode of the original) so the two feeds, and their
-// independent sweep cadence, never interfere with each other.
+// but scores off the SAME deep candle read the Confluence Signal panel/
+// confluence_read use (market.getCandlesDeep(asset, tf, 1500) - archived
+// history merged with the live tail), not the Screener's shallow
+// market.getCandles(asset, tf, 300). That depth difference, not the OU model
+// (ouState/ouKalman actually share the same live-state fit - confirmed in
+// kalman.ts), is what makes the panel's read diverge from the Screener tab:
+// with only 300 bars, EMA200/Markov(lookback 500)/Hurst/regression are all
+// starved relative to what the panel computes on 1500. This plugin exists so
+// the tab you watch reads the pair the same way the panel would right now.
+// Kept as its own plugin/service/endpoint pair (not a mode of the original)
+// so the two feeds, and their independent sweep cadence, never interfere.
 
 import type { AssetCategory, Timeframe } from '../types'
 import type { KernelContext, Plugin } from '../kernel'
@@ -30,6 +32,11 @@ export const DEFAULT_SCREENER2_CONFIG: Screener2Config = {
   batch: 3,
   minCandles: 240,
 }
+
+/** Deep-read depth, matching AnalyticsService.analyze()'s getCandlesDeep call
+ * exactly - this is the actual source of the panel/Screener divergence, not
+ * the OU model (see file header). */
+const DEEP_CANDLES = 1500
 
 const VALID_TFS: Timeframe[] = ['5s', '15s', '30s', '1m', '2m', '5m', '15m', '30m', '1h', '4h', '1d']
 const SWEEP_COOLDOWN_MS = 20_000
@@ -136,12 +143,11 @@ export class Screener2Service {
 
   /**
    * Score one pair with the full confluence engine (direction/score/
-   * confidence) - everything else on the row is the cheap scanSnapshot on the
-   * SAME candles, for display only, exactly as the auto-trader's
-   * pickConfluenceSignal borrows screener metadata.
+   * confidence) on the SAME deep candle read the panel uses - everything else
+   * on the row is scanSnapshot on those same candles, for display only.
    */
   private scorePair(asset: string, tf: Timeframe): ScreenRow {
-    const candles = this.market.getCandles(asset, tf, 300)
+    const candles = this.market.getCandlesDeep(asset, tf, DEEP_CANDLES)
     if (candles.length < this.config.minCandles) throw new Error(`thin history ${asset} ${tf}`)
     const snap = scanSnapshot(candles, asset, tf)
     const sig = confluenceSignalOnly(candles, asset, tf)
