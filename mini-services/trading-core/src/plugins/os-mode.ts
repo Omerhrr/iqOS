@@ -16,6 +16,11 @@
 //                        is not chop
 //      * 'momentum'    - trend-following on the screener row: ADX-confirmed
 //                        directional pressure with the move's rate-of-change
+//      * 'confluence'  - the EXACT Confluence Signal panel/confluence_read
+//                        14-factor engine (confluenceSignalOnly - full Kalman/OU
+//                        fit, not the screener's cheaper ouState approximation),
+//                        run bar-fresh on the candidate pair itself rather than
+//                        the periodic sweep's cached composite score
 //  With 'kalman-ou' + requireValidation, a candidate pair must ALSO pass a
 //  walk-forward validation of the OU strategy (out-of-sample net positive,
 //  majority of folds profitable, decent IS->OOS efficiency) before the
@@ -31,12 +36,13 @@ import type { Timeframe } from '../types'
 import type { ScreenerService, ScreenRow } from './screener'
 import type { MarketDataService } from './market-data'
 import { walkForward } from '../strategies/optimize'
+import { confluenceSignalOnly } from '../analytics/engine'
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
 
 export type OsMode = 'human' | 'auto'
 
-export type AutoTraderSource = 'screener' | 'kalman-ou' | 'markov' | 'momentum'
+export type AutoTraderSource = 'screener' | 'kalman-ou' | 'markov' | 'momentum' | 'confluence'
 
 /** Walk-forward validation verdict for the OU edge on one (asset, tf). */
 export interface OUVerdict {
@@ -78,6 +84,29 @@ export interface AutoTraderConfig {
    * ever considered, for ANY signalSource - same choke point (assetBlocked)
    * every candidate loop already filters through. */
   watchlist: string[]
+  /** Optional compounding plan - SAME shape and semantics as a bot's
+   * stakePlan in autopilot.ts (payoutCap, periods, derisk, stopOnLoss). undefined
+   * = fixed `stake` every trade, unchanged behavior. Auto-trader is
+   * single-asset-at-a-time by construction (maxOpen governs it), which is
+   * exactly the constraint autopilot.ts's compound bots are hard-clamped to -
+   * no extra restriction needed here. */
+  stakePlan?: AutoStakePlan
+  /** Runtime roll state, persisted here (saveOsMode persists the whole config
+   * blob) rather than a separate table - mirrors BotConfig.planState. */
+  planState?: { pot: number; rollN: number; restarts: number; halted: boolean; complete: boolean }
+}
+
+export interface AutoStakePlan {
+  kind: 'compound'
+  base: number
+  rollPct?: number
+  maxStake?: number
+  payoutCap?: number
+  stopOnLoss?: boolean
+  periods?: number
+  deriskAfter?: number
+  deriskPct?: number
+  onComplete?: 'halt' | 'reseed'
 }
 
 export const DEFAULT_AUTOTRADER: AutoTraderConfig = {
@@ -100,6 +129,8 @@ export const DEFAULT_AUTOTRADER: AutoTraderConfig = {
   dailyLossLimit: 0,
   watchlist: [],
 }
+// stakePlan/planState intentionally omitted from DEFAULT_AUTOTRADER above
+// (undefined = fixed-stake, the original unconditional behavior)
 
 const AUTOTRADER_NOTE = 'auto:os-trader'
 /** Liquid fallback evaluated on demand while the full screener sweep warms up. */
@@ -117,6 +148,11 @@ interface AutoRuntime {
   lastAssetTs: Map<string, number>
   lastRejection?: string
   lastAction?: string
+  pot: number // compounding roll; 0 = fresh cycle at base
+  rollN: number
+  restarts: number
+  halted: boolean // stop-on-loss: cycle ended, awaiting explicit restart
+  complete: boolean // halted on the periods target (win-side completion)
 }
 
 export class ModeService {
@@ -143,6 +179,11 @@ export class ModeService {
       openCount: 0,
       lastTradeTs: 0,
       lastAssetTs: new Map(),
+      pot: 0,
+      rollN: 0,
+      restarts: 0,
+      halted: false,
+      complete: false,
     }
   }
 
@@ -161,7 +202,7 @@ export class ModeService {
         const num = (v: unknown, fb: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fb)
         this.config = {
           enabled: typeof c.enabled === 'boolean' ? c.enabled : DEFAULT_AUTOTRADER.enabled,
-          signalSource: (['screener', 'kalman-ou', 'markov', 'momentum'] as const).includes(c.signalSource as AutoTraderSource)
+          signalSource: (['screener', 'kalman-ou', 'markov', 'momentum', 'confluence'] as const).includes(c.signalSource as AutoTraderSource)
             ? (c.signalSource as AutoTraderSource)
             : DEFAULT_AUTOTRADER.signalSource,
           tf: (typeof c.tf === 'string' ? c.tf : DEFAULT_AUTOTRADER.tf) as Timeframe,
@@ -180,6 +221,8 @@ export class ModeService {
           dailyProfitTarget: num(c.dailyProfitTarget, 0),
           dailyLossLimit: num(c.dailyLossLimit, 0),
           watchlist: Array.isArray(c.watchlist) ? c.watchlist.filter((x): x is string => typeof x === 'string') : [],
+          stakePlan: this.parseStakePlan(c.stakePlan),
+          planState: ModeService.isPlanState(c.planState) ? c.planState : undefined,
         }
       }
     }
@@ -297,6 +340,16 @@ export class ModeService {
     if (!this.config.enabled) return
     this.rolloverIfNeeded()
 
+    // compound stop-on-loss: a cycle that took a loss is DEAD until an
+    // explicit restart() - same semantics as a compound bot in autopilot.ts
+    if (this.config.stakePlan?.stopOnLoss !== false && this.rt.halted) {
+      return this.standDown(
+        this.rt.complete
+          ? `compound cycle COMPLETE (${this.rt.rollN}/${this.config.stakePlan?.periods ?? '?'} periods banked) - restart for a fresh cycle`
+          : 'compound cycle ended on a loss - restart to trade again',
+      )
+    }
+
     // self-imposed limits (the global risk manager remains the final gate)
     if (this.config.dailyProfitTarget > 0 && this.rt.pnlToday >= this.config.dailyProfitTarget)
       return this.standDown(`profit target reached (+$${this.rt.pnlToday.toFixed(2)})`)
@@ -315,16 +368,17 @@ export class ModeService {
     // copilot memory gate: standing rules from the copilot's persistent memory
     // ("never trade Fridays", "only trade ...", "max stake $...", rate caps)
     // bind the OS's own trader too - the user's words outrank the machine
+    const bet = this.stakeForAuto()
     try {
       const mg = this.ctx.use<{ check: (asset: string, stake: number) => { ok: boolean; reason?: string } }>('memoryGate')
-      const g = mg.check(row.asset, this.config.stake)
+      const g = mg.check(row.asset, bet.amount)
       if (!g.ok) return this.standDown(g.reason ?? 'memory gate hold')
     } catch {
       // memory gate plugin not loaded - rule gating disabled
     }
 
     const side = row.direction === 'put' ? 'put' : 'call'
-    const out = await this.place(row, side)
+    const out = await this.place(row, side, bet.amount)
     if (!out.ok) return this.standDown(out.error ?? 'order rejected')
 
     this.rt.trades += 1
@@ -332,7 +386,8 @@ export class ModeService {
     this.rt.lastAssetTs.set(row.asset, this.now())
     this.rt.openCount += 1
     this.rt.lastRejection = undefined
-    this.rt.lastAction = `${side.toUpperCase()} ${row.asset}`
+    const rollTag = bet.compound ? ` · ${bet.phase} roll x${bet.rollN + 1}${this.config.stakePlan?.periods ? `/${this.config.stakePlan.periods}` : ''} (pot $${bet.pot.toFixed(2)})` : ''
+    this.rt.lastAction = `${side.toUpperCase()} ${row.asset}${rollTag}`
     const detail =
       this.config.signalSource === 'kalman-ou'
         ? `OU z ${row.ouZ.toFixed(2)}σ · HL ${row.ouHalfLife >= 9999 ? '∞' : row.ouHalfLife.toFixed(0)}b · t ${row.ouTStat.toFixed(1)} · edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)}`
@@ -340,7 +395,9 @@ export class ModeService {
           ? `P(up) ${(row.pUp * 100).toFixed(1)}% · regime ${row.regime} · edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)}`
           : this.config.signalSource === 'momentum'
             ? `ADX ${row.adx.toFixed(0)} · RSI ${row.rsi.toFixed(0)} · Δ${row.changePct.toFixed(2)}% · edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)}`
-            : `score ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} regime ${row.regime}`
+            : this.config.signalSource === 'confluence'
+              ? `14-factor confluence ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} regime ${row.regime}`
+              : `score ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} regime ${row.regime}`
     this.emit(
       'success',
       `[AUTO-TRADER] ${side.toUpperCase()} ${row.asset} ${this.config.tf} $${this.config.stake} binary - ${detail}`
@@ -351,6 +408,7 @@ export class ModeService {
     if (this.config.signalSource === 'kalman-ou') return this.pickOUSignal()
     if (this.config.signalSource === 'markov') return this.pickMarkovSignal()
     if (this.config.signalSource === 'momentum') return this.pickMomentumSignal()
+    if (this.config.signalSource === 'confluence') return this.pickConfluenceSignal()
     try {
       const screener = this.ctx.use<ScreenerService>('screener')
       const dir = this.config.direction === 'both' ? undefined : this.config.direction
@@ -510,6 +568,49 @@ export class ModeService {
     return null
   }
 
+  /**
+   * Confluence source: runs the EXACT 14-factor Confluence Signal panel /
+   * confluence_read engine (confluenceSignalOnly) bar-fresh on each candidate -
+   * unlike 'screener' above, which trades off the periodic sweep's cached
+   * composite row (a cheap ouState approximation for the Kalman/OU factor).
+   * This source always re-fits the full Kalman filter, so what the auto-trader
+   * acts on is identical to what the panel/copilot would show the operator for
+   * that pair right now. Display metadata (name/category/payout/etc.) is
+   * borrowed from the screener's cached row - it's cosmetic only and never
+   * feeds the trade decision.
+   */
+  private pickConfluenceSignal(): ScreenRow | null {
+    try {
+      const screener = this.ctx.use<ScreenerService>('screener')
+      const market = this.ctx.use<MarketDataService>('market')
+      const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
+      const restricted = this.config.watchlist.length > 0
+      const pool = restricted ? this.config.watchlist.filter((a) => open.includes(a)) : open
+      const candidates = [...LIQUID_CANDIDATES.filter((a) => pool.includes(a)), ...pool.filter((a) => !LIQUID_CANDIDATES.includes(a))]
+      for (const asset of candidates) {
+        if (this.assetBlocked(asset)) continue
+        try {
+          const candles = market.getCandles(asset, this.config.tf, 300)
+          if (candles.length < 60) continue
+          const sig = confluenceSignalOnly(candles, asset, this.config.tf)
+          if (sig.direction === 'none') continue
+          if (this.config.direction !== 'both' && sig.direction !== this.config.direction) continue
+          const score = Math.round(sig.score * 10) / 10
+          const confidence = Math.round(sig.confidence)
+          if (Math.abs(score) < this.config.minScore) continue
+          if (confidence < this.config.minConfidence) continue
+          const base = screener.evaluate(asset, this.config.tf) // display metadata only
+          return { ...base, score, direction: sig.direction, confidence }
+        } catch {
+          // thin history for this pair - try the next
+        }
+      }
+    } catch {
+      // screener/market not loaded - no signal source
+    }
+    return null
+  }
+
   // ---------- kalman-ou walk-forward validation gate ----------
 
   static readonly OU_VALIDATION_TTL = 3600 // refresh verdicts hourly
@@ -613,7 +714,7 @@ export class ModeService {
     }
   }
 
-  private async place(row: ScreenRow, side: 'call' | 'put'): Promise<{ ok: boolean; error?: string }> {
+  private async place(row: ScreenRow, side: 'call' | 'put', amount: number): Promise<{ ok: boolean; error?: string }> {
     try {
       const exec = this.ctx.use<{
         accountSource: 'paper' | 'iq'
@@ -634,7 +735,7 @@ export class ModeService {
         tf: this.config.tf,
         side,
         kind: 'binary',
-        amount: this.config.stake,
+        amount,
         expiryBars: 1,
         // THE SAME BUG that was in autopilot.ts: this was hardcoded 'paper'
         // unconditionally, so the built-in AUTO-mode auto-trader could never
@@ -698,6 +799,14 @@ export class ModeService {
 
   private rebuildRuntime(): void {
     const rt = ModeService.freshRuntime()
+    // restore the compounding roll from the persisted config (survives restarts)
+    if (this.config.planState) {
+      rt.pot = this.config.planState.pot
+      rt.rollN = this.config.planState.rollN
+      rt.restarts = this.config.planState.restarts
+      rt.halted = this.config.planState.halted
+      rt.complete = this.config.planState.complete
+    }
     try {
       const closed = this.store.listPositions('closed', 400).filter((p) => p.note?.startsWith('auto:'))
       const open = this.store.listPositions('open', 100).filter((p) => p.note?.startsWith('auto:'))
@@ -725,7 +834,7 @@ export class ModeService {
     this.rt = rt
   }
 
-  private onPositionClosed(position: { note?: string; pnl?: number; status: string; tsOpen: number; tsClose?: number }): void {
+  private onPositionClosed(position: { note?: string; pnl?: number; status: string; tsOpen: number; tsClose?: number; amount: number; payout: number }): void {
     if (!position.note?.startsWith('auto:')) return
     this.rolloverIfNeeded()
     this.rt.openCount = Math.max(0, this.rt.openCount - 1)
@@ -738,13 +847,106 @@ export class ModeService {
       this.rt.losses += 1
       this.rt.pnlToday += pnl
     }
+
+    // compounding roll - SAME fold-in/burn math as autopilot.ts's
+    // onPositionClosed, applied to the auto-trader's own single roll
+    const plan = this.config.stakePlan
+    if (plan) {
+      const base = plan.base
+      const working = this.rt.pot >= 0.01 ? this.rt.pot : base
+      if (position.status === 'won') {
+        const cap = (plan.payoutCap ?? 70) / 100
+        const fold = Math.min(pnl, position.amount * cap)
+        this.rt.pot = Math.round((working + fold) * 100) / 100
+        this.rt.rollN += 1
+        const periods = plan.periods
+        if (periods && this.rt.rollN >= periods) {
+          this.rt.restarts += 1
+          const banked = Math.round((this.rt.pot - base) * 100) / 100
+          if (plan.onComplete === 'reseed') {
+            this.rt.pot = 0
+            this.rt.rollN = 0
+            this.emit('success', `[AUTO-TRADER] compound cycle COMPLETE - ${periods} periods, +$${banked.toFixed(2)} banked - re-seeding $${base}`)
+          } else {
+            this.rt.halted = true
+            this.rt.complete = true
+            this.emit('success', `[AUTO-TRADER] compound cycle COMPLETE - ${periods} periods, +$${banked.toFixed(2)} banked - standing down; restart for a fresh cycle`)
+          }
+        }
+      } else if (position.status === 'lost') {
+        this.rt.pot = Math.round(Math.max(0, working - position.amount) * 100) / 100
+        const kept = this.rt.pot
+        if (this.rt.rollN > 0) this.rt.restarts += 1
+        this.rt.rollN = 0
+        if (plan.stopOnLoss !== false) {
+          this.rt.halted = true
+          this.rt.complete = false
+          this.emit('warn', `[AUTO-TRADER] compound cycle ENDED on a loss (-$${Math.abs(pnl).toFixed(2)})${kept >= 0.01 ? ` - $${kept.toFixed(2)} of the pot stays banked on the balance` : ''} - restart to trade again`)
+        }
+      }
+      this.persistPlanState()
+    }
   }
 
   // ---------- config ----------
 
+  private static isPlanState(v: unknown): v is NonNullable<AutoTraderConfig['planState']> {
+    if (!v || typeof v !== 'object') return false
+    const p = v as Record<string, unknown>
+    return typeof p.pot === 'number' && typeof p.rollN === 'number' && typeof p.restarts === 'number' && typeof p.halted === 'boolean' && typeof p.complete === 'boolean'
+  }
+
+  /** Mirrors autopilot.ts's parseStakePlan - same shape, same clamps. */
+  private parseStakePlan(raw: unknown, existing?: AutoStakePlan): AutoStakePlan | undefined {
+    const p = (raw ?? existing) as Partial<AutoStakePlan> | undefined
+    if (!p || p.kind !== 'compound') return undefined
+    const base = Math.max(1, Number(p.base) || 1)
+    return {
+      kind: 'compound',
+      base,
+      rollPct: p.rollPct !== undefined ? clamp(Number(p.rollPct) || 100, 1, 100) : undefined,
+      maxStake: p.maxStake !== undefined && Number(p.maxStake) > 0 ? Number(p.maxStake) : undefined,
+      payoutCap: p.payoutCap !== undefined ? clamp(Number(p.payoutCap) || 70, 1, 70) : 70,
+      stopOnLoss: p.stopOnLoss !== false,
+      periods: p.periods !== undefined && Number(p.periods) > 0 ? Math.round(Number(p.periods)) : undefined,
+      deriskAfter: p.deriskAfter !== undefined && Number(p.deriskAfter) > 0 ? Math.round(Number(p.deriskAfter)) : undefined,
+      deriskPct: p.deriskAfter !== undefined && Number(p.deriskAfter) > 0 ? clamp(Number(p.deriskPct) || 50, 1, 100) : undefined,
+      onComplete: p.onComplete === 'reseed' ? 'reseed' : 'halt',
+    }
+  }
+
+  /** Mirrors autopilot.ts's stakeFor - same compounding math, same dust guard. */
+  private stakeForAuto(): { amount: number; pot: number; rollN: number; compound: boolean; phase: 'compound' | 'derisk' } {
+    const plan = this.config.stakePlan
+    if (!plan) return { amount: this.config.stake, pot: 0, rollN: 0, compound: false, phase: 'compound' }
+    const pot = this.rt.pot >= 0.01 ? this.rt.pot : plan.base
+    const derisk = plan.deriskAfter !== undefined && plan.deriskPct !== undefined && this.rt.rollN >= plan.deriskAfter
+    const rollPct = derisk ? plan.deriskPct! : (plan.rollPct ?? 100)
+    const raw = (pot * rollPct) / 100
+    const amount = Math.min(plan.maxStake ?? 5000, Math.max(1, Math.round(raw * 100) / 100))
+    return { amount, pot, rollN: this.rt.rollN, compound: true, phase: derisk ? 'derisk' : 'compound' }
+  }
+
+  /** Clears a halted/complete compounding cycle and re-seeds the pot at base. */
+  restart(): { ok: boolean; error?: string } {
+    if (!this.config.stakePlan) return { ok: false, error: 'restart applies to a compounding auto-trader plan only' }
+    this.rt.pot = 0
+    this.rt.rollN = 0
+    this.rt.halted = false
+    this.rt.complete = false
+    this.persistPlanState()
+    this.emit('success', `[AUTO-TRADER] compound cycle RESTARTED - next trade seeds $${this.config.stakePlan.base}`)
+    return { ok: true }
+  }
+
+  private persistPlanState(): void {
+    this.config.planState = { pot: this.rt.pot, rollN: this.rt.rollN, restarts: this.rt.restarts, halted: this.rt.halted, complete: this.rt.complete }
+    this.persist()
+  }
+
   configure(patch: Partial<AutoTraderConfig>): { ok: boolean; config: AutoTraderConfig; error?: string } {
     if (patch.enabled !== undefined) this.config.enabled = Boolean(patch.enabled)
-    if (patch.signalSource !== undefined && (['screener', 'kalman-ou', 'markov', 'momentum'] as const).includes(patch.signalSource as AutoTraderSource))
+    if (patch.signalSource !== undefined && (['screener', 'kalman-ou', 'markov', 'momentum', 'confluence'] as const).includes(patch.signalSource as AutoTraderSource))
       this.config.signalSource = patch.signalSource as AutoTraderSource
     if (patch.tf !== undefined) this.config.tf = String(patch.tf) as Timeframe
     if (patch.stake !== undefined) this.config.stake = clamp(Number(patch.stake) || DEFAULT_AUTOTRADER.stake, 1, 5000)
@@ -764,6 +966,20 @@ export class ModeService {
     if (patch.dailyLossLimit !== undefined) this.config.dailyLossLimit = Math.max(0, Number(patch.dailyLossLimit) || 0)
     if (patch.watchlist !== undefined)
       this.config.watchlist = Array.isArray(patch.watchlist) ? patch.watchlist.filter((x): x is string => typeof x === 'string') : []
+    if (patch.stakePlan !== undefined) {
+      const planChanged = JSON.stringify(this.config.stakePlan ?? null) !== JSON.stringify(patch.stakePlan ?? null)
+      this.config.stakePlan = this.parseStakePlan(patch.stakePlan, this.config.stakePlan)
+      // switching the plan itself (not just tuning a field on the same plan)
+      // starts a fresh roll - an old pot/halt state from a different config
+      // would be meaningless carried into a newly (re)enabled plan
+      if (planChanged) {
+        this.rt.pot = 0
+        this.rt.rollN = 0
+        this.rt.halted = false
+        this.rt.complete = false
+        this.config.planState = { pot: 0, rollN: 0, restarts: this.rt.restarts, halted: false, complete: false }
+      }
+    }
     this.persist()
     this.rt.lastRejection = undefined
     const srcDetail =
@@ -773,7 +989,9 @@ export class ModeService {
           ? ` (P(up) ≥ ${(this.config.minPUp * 100).toFixed(0)}% / ≤ ${((1 - this.config.minPUp) * 100).toFixed(0)}%)`
           : this.config.signalSource === 'momentum'
             ? ` (ADX ≥ ${this.config.minAdx})`
-            : ''
+            : this.config.signalSource === 'confluence'
+              ? ' (full 14-factor panel engine, bar-fresh)'
+              : ''
     this.emit(
       'info',
       `AUTO-TRADER config: ${this.config.enabled ? 'armed' : 'off'} · src ${this.config.signalSource}${srcDetail} · ${this.config.tf} · stake $${this.config.stake} · minScore ${this.config.minScore} · minConf ${this.config.minConfidence} · maxOpen ${this.config.maxOpen} · cooldown ${this.config.cooldownSec}s`

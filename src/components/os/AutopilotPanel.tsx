@@ -261,7 +261,21 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
         </div>
       )}
       {/* auto-trader strip - the OS acting as its own trader in NO-HUMAN mode */}
-      {modeStatus && <AutoTraderStrip at={modeStatus.autotrader} mode={mode} onConfigure={() => setAtOpen(true)} />}
+      {modeStatus && (
+        <AutoTraderStrip
+          at={modeStatus.autotrader}
+          mode={mode}
+          onConfigure={() => setAtOpen(true)}
+          onRestart={async () => {
+            try {
+              await osPost('/autotrader_restart', {})
+              refreshMode()
+            } catch (err) {
+              onError((err as Error).message)
+            }
+          }}
+        />
+      )}
 
       {/* auto-trader config editor (remounts on open so the draft mirrors the kernel) */}
       <AutoTraderDialog
@@ -1069,10 +1083,12 @@ function AutoTraderStrip({
   at,
   mode,
   onConfigure,
+  onRestart,
 }: {
   at: OsModeStatus['autotrader']
   mode: OsModeStatus['mode']
   onConfigure: () => void
+  onRestart: () => void
 }) {
   const state =
     mode === 'auto' && at.config.enabled
@@ -1098,8 +1114,11 @@ function AutoTraderStrip({
               ? `MARKOV·P(up)≥${(at.config.minPUp * 100).toFixed(0)}%`
               : at.config.signalSource === 'momentum'
                 ? `MOM·ADX≥${at.config.minAdx}`
-                : `score ≥${at.config.minScore}`}
-          {' · '}{at.config.tf} · ${at.config.stake} · max {at.config.maxOpen}
+                : at.config.signalSource === 'confluence'
+                  ? `CONFLUENCE·14F≥${at.config.minScore}`
+                  : `score ≥${at.config.minScore}`}
+          {' · '}{at.config.tf} ·{' '}
+          {at.config.stakePlan ? `compound seed $${at.config.stakePlan.base}` : `$${at.config.stake}`} · max {at.config.maxOpen}
         </span>
         <span className="ml-auto font-mono text-[9px] text-[#4b5a72]">
           {closed}t{wr !== null ? ` · ${wr}% wr` : ''} ·{' '}
@@ -1122,6 +1141,20 @@ function AutoTraderStrip({
           {at.lastAction && <span>last: {at.lastAction}</span>}
           {at.lastRejection && <span className="text-amber-500/70"> · standing down: {at.lastRejection}</span>}
         </p>
+      )}
+      {at.config.stakePlan && at.config.planState?.halted && (
+        <div className="mt-1 flex items-center justify-between gap-2 rounded border border-amber-500/30 bg-amber-500/5 px-1.5 py-1">
+          <span className="font-mono text-[8px] text-amber-300">
+            compound cycle {at.config.planState.complete ? 'COMPLETE' : 'ended on a loss'} - standing down until restarted
+          </span>
+          <Button
+            size="sm"
+            onClick={onRestart}
+            className="h-5 shrink-0 rounded bg-amber-500/15 px-2 text-[9px] font-bold uppercase tracking-wider text-amber-300 hover:bg-amber-500/25"
+          >
+            Restart cycle
+          </Button>
+        </div>
       )}
     </div>
   )
@@ -1151,8 +1184,8 @@ function AutoTraderDialog({
           <DialogTitle className="text-[14px] tracking-wider">AUTO-TRADER</DialogTitle>
           <DialogDescription className="text-[11px] text-[#7c8aa5]">
             The OS acting as its own trader: takes the strongest signal as 1-bar binary options - composite screener,
-            Kalman/OU mean reversion, Markov regime forecast or ADX momentum. Only ever trades while the OS is in
-            NO-HUMAN mode. Sentinel + risk limits still govern every order.
+            Kalman/OU mean reversion, Markov regime forecast, ADX momentum, or the full 14-factor Confluence Signal
+            engine. Only ever trades while the OS is in NO-HUMAN mode. Sentinel + risk limits still govern every order.
           </DialogDescription>
         </DialogHeader>
 
@@ -1174,6 +1207,7 @@ function AutoTraderDialog({
                   ['kalman-ou', 'Kalman-OU'],
                   ['markov', 'Markov'],
                   ['momentum', 'Momentum'],
+                  ['confluence', 'Confluence'],
                 ] as const
               ).map(([v, label]) => (
                 <button
@@ -1195,7 +1229,9 @@ function AutoTraderDialog({
                   ? 'follows the Markov chain state forecast: CALL when P(next move up) clears the threshold, PUT below its mirror - skipped entirely in chop regimes where the transition matrix degenerates'
                   : d.signalSource === 'momentum'
                     ? 'trend continuation: CALL when ADX-confirmed strength, a positive rate-of-change and RSI on the bullish side of mid line up, PUT mirrored - skips statistically exhausted extremes'
-                    : 'takes the strongest full-composite screener signals market-wide (trend + momentum + statistical + patterns)'}
+                    : d.signalSource === 'confluence'
+                      ? 'the EXACT 14-factor Confluence Signal panel/confluence_read engine, re-fit bar-fresh on each candidate (full Kalman/OU, not the screener sweep\'s cheaper approximation) - identical read to what the panel/copilot would show for that pair right now'
+                      : 'takes the strongest full-composite screener signals market-wide (trend + momentum + statistical + patterns)'}
             </p>
           </div>
 
@@ -1240,8 +1276,103 @@ function AutoTraderDialog({
             </select>
           </div>
 
-          <NumField label="Stake $" value={d.stake} onChange={(v) => p({ stake: v })} />
+          {d.stakePlan?.kind === 'compound' ? (
+            <div>
+              <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Stake $ (replaced by compound plan)</Label>
+              <Input value={`$${d.stake}`} disabled className="h-8 border-[#1c2739] bg-[#0b1220] text-right text-[12px] text-[#4b5a72]" />
+            </div>
+          ) : (
+            <NumField label="Stake $" value={d.stake} onChange={(v) => p({ stake: v })} />
+          )}
           <NumField label="Min |score|" value={d.minScore} onChange={(v) => p({ minScore: v })} />
+
+          <Segmented
+            label="Stake plan"
+            options={[
+              { v: 'fixed', label: 'Fixed' },
+              { v: 'compound', label: 'Compound' },
+            ]}
+            value={d.stakePlan?.kind === 'compound' ? 'compound' : 'fixed'}
+            onChange={(v) =>
+              p({
+                stakePlan: v === 'compound' ? { kind: 'compound', base: Math.max(1, d.stake), rollPct: 100, payoutCap: 70, stopOnLoss: true } : undefined,
+              })
+            }
+          />
+          {d.stakePlan?.kind === 'compound' && (
+            <>
+              <p className="col-span-2 -mt-1 text-[9px] leading-relaxed text-[#4b5a72]">
+                Same compounding math as a bot&apos;s stake plan - one roll, shared across the whole auto-trader (it only
+                ever holds one position at a time via Max open positions, so there is no cross-asset pot conflict).
+              </p>
+              <NumField
+                label="Seed stake $ (each restart)"
+                value={d.stakePlan.base}
+                onChange={(v) => p({ stakePlan: { ...d.stakePlan!, base: Math.max(1, v) } })}
+              />
+              <NumField
+                label="Roll % of pot (100 = all-in)"
+                value={d.stakePlan.rollPct ?? 100}
+                onChange={(v) => p({ stakePlan: { ...d.stakePlan!, rollPct: Math.min(100, Math.max(1, v)) } })}
+              />
+              <NumField
+                label="Max stake cap $ (0 = none)"
+                value={d.stakePlan.maxStake ?? 0}
+                onChange={(v) => p({ stakePlan: { ...d.stakePlan!, maxStake: v > 0 ? v : undefined } })}
+              />
+              <NumField
+                label="Payout cap % (max 70)"
+                value={d.stakePlan.payoutCap ?? 70}
+                onChange={(v) => p({ stakePlan: { ...d.stakePlan!, payoutCap: Math.min(70, Math.max(1, v)) } })}
+              />
+              <NumField
+                label="Periods (0 = compound until loss)"
+                value={d.stakePlan.periods ?? 0}
+                onChange={(v) =>
+                  p({
+                    stakePlan: { ...d.stakePlan!, periods: v > 0 ? Math.round(v) : undefined, ...(v > 0 ? {} : { onComplete: undefined }) },
+                  })
+                }
+              />
+              <NumField
+                label="De-risk after roll # (0 = never)"
+                value={d.stakePlan.deriskAfter ?? 0}
+                onChange={(v) =>
+                  p({
+                    stakePlan: { ...d.stakePlan!, deriskAfter: v > 0 ? Math.round(v) : undefined, deriskPct: v > 0 ? (d.stakePlan?.deriskPct ?? 50) : undefined },
+                  })
+                }
+              />
+              {(d.stakePlan.deriskAfter ?? 0) > 0 && (
+                <NumField
+                  label="De-risk stake % of pot"
+                  value={d.stakePlan.deriskPct ?? 50}
+                  onChange={(v) => p({ stakePlan: { ...d.stakePlan!, deriskPct: Math.min(100, Math.max(1, v)) } })}
+                />
+              )}
+              {(d.stakePlan.periods ?? 0) > 0 && (
+                <Segmented
+                  label="On complete"
+                  options={[
+                    { v: 'halt', label: 'Stand down' },
+                    { v: 'reseed', label: 'Re-seed' },
+                  ]}
+                  value={d.stakePlan.onComplete === 'reseed' ? 'reseed' : 'halt'}
+                  onChange={(v) => p({ stakePlan: { ...d.stakePlan!, onComplete: v as 'halt' | 'reseed' } })}
+                />
+              )}
+              <Segmented
+                label="On loss"
+                options={[
+                  { v: 'end', label: 'End cycle' },
+                  { v: 'roll', label: 'Re-seed' },
+                ]}
+                value={d.stakePlan.stopOnLoss === false ? 'roll' : 'end'}
+                onChange={(v) => p({ stakePlan: { ...d.stakePlan!, stopOnLoss: v !== 'roll' } })}
+              />
+            </>
+          )}
+
           {d.signalSource === 'kalman-ou' && (
             <>
               <NumField label="OU entry |z| (σ)" value={d.zEntry} onChange={(v) => p({ zEntry: v })} step={0.1} />

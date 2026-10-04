@@ -1010,6 +1010,12 @@ const httpServer = createServer(async (req, res) => {
         return json(200, mode.configure(body as Record<string, never>))
       }
 
+      if (path === '/autotrader_restart') {
+        // compound stop-on-loss: revive a halted auto-trader cycle (clears halt, re-seeds pot)
+        const mode = kernel.context().use<ModeService>('mode')
+        return json(200, mode.restart())
+      }
+
       if (path === '/risk') {
         const patch = body as Partial<RiskConfig>
         const out = exec.setRisk(patch)

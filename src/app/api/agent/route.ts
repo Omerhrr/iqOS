@@ -1093,7 +1093,7 @@ const TOOLS: ToolSpec[] = [
   },
   {
     name: 'autotrader_configure',
-    description: 'Tune the built-in AUTO-TRADER (the OS acting as its own trader in NO-HUMAN mode): signalSource ("screener" = full composite signals, "kalman-ou" = fade statistically stretched pairs via the Ornstein-Uhlenbeck/Kalman fit gated by reversion significance + half-life, "markov" = follow the Markov chain state forecast when decisive and not chop, "momentum" = ADX-confirmed trend continuation), enabled (bool), tf (signal timeframe), stake, minScore (min |score|), minConfidence (0-100), zEntry (kalman-ou only: |z| in sigmas required to enter, 0.5-4), maxHalfLife (kalman-ou only: skip pairs with slower reversion, bars), requireValidation (kalman-ou only: trade only walk-forward-validated pairs), minPUp (markov only: decisive P(up) threshold, 0.5-0.75), minAdx (momentum only: minimum trend strength, 10-45), direction (both|call|put), maxOpen (concurrent), cooldownSec (per-asset), paceSec (between any two trades), dailyProfitTarget / dailyLossLimit (USD, 0=off), watchlist (array of tickers - OPTIONAL pair restriction that applies to EVERY signalSource identically: empty/omitted = GLOBAL, scans the whole open-instrument universe exactly as before; non-empty = ONLY those tickers are ever considered, nothing else, regardless of which signal source is picked). It trades 1-bar binary options.',
+    description: 'Tune the built-in AUTO-TRADER (the OS acting as its own trader in NO-HUMAN mode): signalSource ("screener" = full composite signals off the periodic sweep\'s cached row, "kalman-ou" = fade statistically stretched pairs via the Ornstein-Uhlenbeck/Kalman fit gated by reversion significance + half-life, "markov" = follow the Markov chain state forecast when decisive and not chop, "momentum" = ADX-confirmed trend continuation, "confluence" = the EXACT 14-factor Confluence Signal panel/confluence_read engine re-fit bar-fresh on each candidate pair - same math as "the panel"/"confluence-full", not the screener\'s cheaper cached approximation; pick this when the user wants the auto-trader to act on the actual confluence signal rather than the screener\'s composite score), enabled (bool), tf (signal timeframe), stake, minScore (min |score|), minConfidence (0-100), zEntry (kalman-ou only: |z| in sigmas required to enter, 0.5-4), maxHalfLife (kalman-ou only: skip pairs with slower reversion, bars), requireValidation (kalman-ou only: trade only walk-forward-validated pairs), minPUp (markov only: decisive P(up) threshold, 0.5-0.75), minAdx (momentum only: minimum trend strength, 10-45), direction (both|call|put), maxOpen (concurrent), cooldownSec (per-asset), paceSec (between any two trades), dailyProfitTarget / dailyLossLimit (USD, 0=off), watchlist (array of tickers - OPTIONAL pair restriction that applies to EVERY signalSource identically: empty/omitted = GLOBAL, scans the whole open-instrument universe exactly as before; non-empty = ONLY those tickers are ever considered, nothing else, regardless of which signal source is picked), stakePlan (OPTIONAL compounding plan - SAME shape as a bot\'s: {kind:"compound", base, rollPct, maxStake, payoutCap (capped 70), stopOnLoss (default true - one loss ENDS the cycle, stand down until autotrader_restart), periods, deriskAfter, deriskPct, onComplete:"halt"|"reseed"} - pass stakePlan:null to go back to fixed `stake`. The auto-trader only ever holds one position at a time (maxOpen governs it) so there is no multi-asset pot conflict like a bot\'s watchlist could cause). It trades 1-bar binary options.',
     args: '{"enabled": true, "tf": "1m", "stake": 10, "minScore": 60, "maxOpen": 3, "watchlist": ["EURUSD-OTC", "GBPUSD-OTC"]}',
     run: (a) =>
       corePost('/autotrader_config', {
@@ -1115,7 +1115,14 @@ const TOOLS: ToolSpec[] = [
         ...(a.dailyProfitTarget !== undefined ? { dailyProfitTarget: Number(a.dailyProfitTarget) } : {}),
         ...(a.dailyLossLimit !== undefined ? { dailyLossLimit: Number(a.dailyLossLimit) } : {}),
         ...(a.watchlist !== undefined ? { watchlist: Array.isArray(a.watchlist) ? a.watchlist.map(String) : [] } : {}),
+        ...(a.stakePlan !== undefined ? { stakePlan: a.stakePlan } : {}),
       }),
+  },
+  {
+    name: 'autotrader_restart',
+    description: 'Restart the auto-trader\'s COMPOUND cycle (use after a stop-on-loss halt - "cycle ended on a loss", or after a periods-complete stand-down - "cycle complete"). Clears the halt and re-seeds the pot to base. Only applies when the auto-trader has a compound stakePlan set; ask the user before restarting.',
+    args: '{}',
+    run: () => corePost('/autotrader_restart', {}),
   },
   // ---------- archive: deep history ----------
   {

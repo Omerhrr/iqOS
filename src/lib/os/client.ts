@@ -1135,7 +1135,7 @@ export type OsMode = 'human' | 'auto'
 
 export interface AutoTraderConfig {
   enabled: boolean
-  signalSource: 'screener' | 'kalman-ou' | 'markov' | 'momentum'
+  signalSource: 'screener' | 'kalman-ou' | 'markov' | 'momentum' | 'confluence'
   tf: Timeframe
   stake: number
   minScore: number
@@ -1154,6 +1154,12 @@ export interface AutoTraderConfig {
   /** Empty = global (every open instrument, any signalSource). Non-empty =
    * only trade these tickers. */
   watchlist: string[]
+  /** Optional compounding plan - same StakePlan shape as a bot's. undefined =
+   * fixed `stake` every trade. */
+  stakePlan?: StakePlan
+  /** Server-persisted roll state (read-only from the client - the server
+   * is the only writer; informational for the dialog/strip). */
+  planState?: { pot: number; rollN: number; restarts: number; halted: boolean; complete: boolean }
 }
 
 export interface OsModeStatus {
