@@ -298,6 +298,15 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
   const [manualSavedId, setManualSavedId] = useState<string | null>(null)
   const [manualSaving, setManualSaving] = useState(false)
   const [manualDeploying, setManualDeploying] = useState(false)
+  // Raw-JSON escape hatch: the row-by-row builder above can't express
+  // everything the spec format actually supports (arbitrary signal counts,
+  // fields the UI has no control for yet, specs generated elsewhere and
+  // pasted in) - this lets the spec be edited directly as the JSON it
+  // already is, same shape buildManualSpec() produces and lab_save/
+  // lab_backtest already accept, so nothing new needed server-side.
+  const [manualJsonMode, setManualJsonMode] = useState(false)
+  const [manualJsonText, setManualJsonText] = useState('')
+  const [manualJsonError, setManualJsonError] = useState<string | null>(null)
 
   const templatesByKind = useMemo(() => {
     const groups = new Map<string, { idx: number; label: string }[]>()
@@ -352,6 +361,67 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
       horizon: manualHorizon,
       ...(manualBasis !== 'candles' ? { basis: manualBasis } : {}),
     }
+  }
+
+  /** Enter JSON mode: seed the textarea with the spec exactly as the row
+   * builder currently has it, so switching to JSON never loses work. */
+  const openManualJson = () => {
+    const spec = buildManualSpec() ?? {
+      name: manualName.trim() || `${manualAsset} ${manualTf} Manual`,
+      signals: [],
+      minScore: manualMinScore,
+      minVotes: manualMinVotes,
+      horizon: manualHorizon,
+      ...(manualBasis !== 'candles' ? { basis: manualBasis } : {}),
+    }
+    setManualJsonText(JSON.stringify(spec, null, 2))
+    setManualJsonError(null)
+    setManualJsonMode(true)
+  }
+
+  /** Parse the edited JSON back into the row builder's own state, so
+   * Backtest/Save/Deploy below keep working unchanged on whatever came out
+   * of the editor - this only checks the SHAPE (object, signals is an
+   * array of objects with a "kind"); it does not duplicate trading-core's
+   * own field-level validation (valid ind/variant names, clamped ranges,
+   * etc.) - that still happens server-side in normalizeSpec the moment
+   * Backtest/Save runs, same as it always has, so a signal with a typo'd
+   * field just quietly drops out at that point rather than here. */
+  const applyManualJson = () => {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(manualJsonText)
+    } catch (e) {
+      setManualJsonError(`invalid JSON: ${(e as Error).message}`)
+      return
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      setManualJsonError('must be a JSON object with a "signals" array')
+      return
+    }
+    const obj = parsed as Record<string, unknown>
+    if (!Array.isArray(obj.signals)) {
+      setManualJsonError('"signals" must be an array')
+      return
+    }
+    const bad = obj.signals.findIndex((s) => !s || typeof s !== 'object' || typeof (s as Record<string, unknown>).kind !== 'string')
+    if (bad !== -1) {
+      setManualJsonError(`signals[${bad}] is missing a "kind"`)
+      return
+    }
+    setManualSignals(
+      (obj.signals as Record<string, unknown>[]).map((def, i) => ({
+        uid: `${Date.now()}-${i}-${Math.random().toString(36).slice(2, 6)}`,
+        def: def as LabSignalDef,
+      })),
+    )
+    if (typeof obj.name === 'string') setManualName(obj.name)
+    if (Number.isFinite(obj.minScore)) setManualMinScore(Number(obj.minScore))
+    if (Number.isFinite(obj.minVotes)) setManualMinVotes(Number(obj.minVotes))
+    if (Number.isFinite(obj.horizon)) setManualHorizon(Number(obj.horizon))
+    if (typeof obj.basis === 'string') setManualBasis(obj.basis as Basis)
+    setManualJsonError(null)
+    setManualJsonMode(false)
   }
 
   const backtestManual = async () => {
@@ -869,7 +939,39 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
           <Button onClick={addManualSignal} variant="outline" className="h-7 border-violet-500/40 px-3 text-[10px] font-bold uppercase tracking-wider text-violet-300 hover:bg-violet-500/10">
             + add signal
           </Button>
+          <Button
+            onClick={() => (manualJsonMode ? setManualJsonMode(false) : openManualJson())}
+            variant="outline"
+            className="h-7 border-cyan-500/40 px-3 text-[10px] font-bold uppercase tracking-wider text-cyan-300 hover:bg-cyan-500/10"
+          >
+            {manualJsonMode ? 'back to builder' : '{ } edit as json'}
+          </Button>
         </div>
+
+        {manualJsonMode && (
+          <div className="mt-2 rounded border border-cyan-500/30 bg-[#0b1220] p-2">
+            <p className="mb-1.5 font-mono text-[9px] leading-relaxed text-[#7c8aa5]">
+              Edit the spec directly - same shape Backtest/Save/Deploy already send. Fields the row builder has no control for (or signals pasted from
+              elsewhere) are fine here; anything invalid just gets dropped when you Backtest/Save, same as it always has.
+            </p>
+            <textarea
+              value={manualJsonText}
+              onChange={(e) => setManualJsonText(e.target.value)}
+              rows={14}
+              spellCheck={false}
+              className="w-full resize-y rounded border border-[#1c2739] bg-[#101828] p-2 font-mono text-[11px] text-[#dbe4f0] outline-none"
+            />
+            {manualJsonError && <p className="mt-1 font-mono text-[10px] text-rose-400">{manualJsonError}</p>}
+            <div className="mt-1.5 flex items-center gap-2">
+              <Button onClick={applyManualJson} className="h-7 bg-cyan-600 px-3 text-[10px] font-bold uppercase tracking-wider text-white hover:bg-cyan-500">
+                apply json
+              </Button>
+              <Button onClick={openManualJson} variant="outline" className="h-7 border-[#1c2739] px-3 text-[10px] uppercase tracking-wider text-[#7c8aa5] hover:text-cyan-300">
+                reset from current builder
+              </Button>
+            </div>
+          </div>
+        )}
 
         {manualSignals.length > 0 && (
           <div className="mt-2 flex flex-wrap gap-1.5">
