@@ -609,6 +609,19 @@ export type LabSignalDef =
       weight: number
     }
   | { kind: 'mtf'; factor: 5 | 15; dir: 'call' | 'put'; weight: number }
+  | {
+      /** AND/OR combination of DIFFERENT signal types into one voting unit
+       * - e.g. "Range Sell Zone" AND "Wide Bear Bar" AND "RSI(14) > 70" only
+       * counts when ALL (op:'and') or ANY (op:'or') member signals fire on
+       * the same bar. Mirrors trading-core's GroupSignal. Member dir fields
+       * are each member's own natural direction; the group's own dir/weight
+       * is what actually votes. */
+      kind: 'group'
+      op: 'and' | 'or'
+      signals: LabSignalDef[]
+      dir: 'call' | 'put'
+      weight: number
+    }
 
 /** Port of trading-core's labelOf() (strategies/custom.ts) - same formatting,
  * kept in sync by hand since the two are separate deployables. Used to
@@ -659,6 +672,8 @@ export function labelOfSignal(s: LabSignalDef): string {
     }
     case 'mtf':
       return `MTF ${s.factor}x Trend ${s.dir === 'call' ? 'Up' : 'Down'}`
+    case 'group':
+      return `(${s.signals.map(labelOfSignal).join(s.op === 'and' ? ' AND ' : ' OR ')})`
   }
 }
 

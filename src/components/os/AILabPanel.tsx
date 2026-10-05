@@ -127,6 +127,7 @@ const KIND_CHIP: Record<string, string> = {
   line: 'text-sky-300 border-sky-500/40 bg-sky-500/10',
   indicator: 'text-fuchsia-300 border-fuchsia-500/40 bg-fuchsia-500/10',
   mtf: 'text-cyan-300 border-cyan-500/40 bg-cyan-500/10',
+  group: 'text-orange-300 border-orange-500/40 bg-orange-500/10',
 }
 
 // Every field read here beyond the pre-existing core metrics was added
@@ -275,6 +276,15 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
   const [manualAsset, setManualAsset] = useState(asset)
   const [manualTf, setManualTf] = useState<Timeframe>(tf)
   const [manualSignals, setManualSignals] = useState<{ uid: string; def: LabSignalDef }[]>([])
+  // Which rows are checked for "combine selected -> group" - the direct,
+  // click-driven path to the AND/OR combination feature, so joining "Range
+  // Sell Zone" + "Wide Bear Bar" + "RSI > 70" into one voting unit doesn't
+  // require hand-writing JSON (the JSON editor below remains the escape
+  // hatch for anything this can't express, e.g. editing a group's own
+  // dir/weight or nesting it inside another group).
+  const [manualSelected, setManualSelected] = useState<Set<string>>(new Set())
+  const [manualGroupDir, setManualGroupDir] = useState<'call' | 'put'>('call')
+  const [manualGroupWeight, setManualGroupWeight] = useState(20)
   const [manualTemplateIdx, setManualTemplateIdx] = useState(0)
   const [manualIsCandle, setManualIsCandle] = useState(false)
   const [manualCandleName, setManualCandleName] = useState('')
@@ -349,7 +359,63 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
     if (manualIsCandle) setManualCandleName('')
   }
 
-  const removeManualSignal = (uid: string) => setManualSignals((prev) => prev.filter((s) => s.uid !== uid))
+  const removeManualSignal = (uid: string) => {
+    setManualSignals((prev) => prev.filter((s) => s.uid !== uid))
+    setManualSelected((prev) => {
+      if (!prev.has(uid)) return prev
+      const next = new Set(prev)
+      next.delete(uid)
+      return next
+    })
+  }
+
+  const toggleManualSelected = (uid: string) =>
+    setManualSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(uid)) next.delete(uid)
+      else next.add(uid)
+      return next
+    })
+
+  /** Join the checked rows into one group that votes as a single signal -
+   * the actual feature requested: "Range Sell Zone" AND "Wide Bear Bar" AND
+   * "RSI > 70" should only count when they ALL fire together, not as three
+   * independently-voting rows. Replaces the selected rows in place (at the
+   * position of the first one) with the new group row. */
+  const combineSelected = (op: 'and' | 'or') => {
+    if (manualSelected.size < 2) {
+      onError('select at least 2 signals to combine')
+      return
+    }
+    setManualSignals((prev) => {
+      const firstIdx = prev.findIndex((s) => manualSelected.has(s.uid))
+      if (firstIdx === -1) return prev
+      const members = prev.filter((s) => manualSelected.has(s.uid)).map((s) => s.def)
+      const rest = prev.filter((s) => !manualSelected.has(s.uid))
+      const group: { uid: string; def: LabSignalDef } = {
+        uid: `${Date.now()}-grp-${Math.random().toString(36).slice(2, 6)}`,
+        def: { kind: 'group', op, signals: members, dir: manualGroupDir, weight: manualGroupWeight },
+      }
+      const restBeforeFirst = prev.slice(0, firstIdx).filter((s) => !manualSelected.has(s.uid))
+      const restAfter = rest.slice(restBeforeFirst.length)
+      return [...restBeforeFirst, group, ...restAfter]
+    })
+    setManualSelected(new Set())
+  }
+
+  /** Dissolve a group back into its member rows, each getting a fresh uid -
+   * the undo for combineSelected, and the way to fix/rebuild a group that
+   * came in from a pasted/learned spec without re-typing it from scratch. */
+  const ungroupSignal = (uid: string) => {
+    setManualSignals((prev) => {
+      const idx = prev.findIndex((s) => s.uid === uid)
+      if (idx === -1) return prev
+      const row = prev[idx]
+      if (row.def.kind !== 'group') return prev
+      const members = row.def.signals.map((def, i) => ({ uid: `${Date.now()}-ung-${i}-${Math.random().toString(36).slice(2, 6)}`, def }))
+      return [...prev.slice(0, idx), ...members, ...prev.slice(idx + 1)]
+    })
+  }
 
   const buildManualSpec = (): LabSpec | null => {
     if (!manualSignals.length) return null
@@ -973,19 +1039,85 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
           </div>
         )}
 
+        {manualSignals.length >= 2 && (
+          <div className="mt-2 flex flex-wrap items-end gap-2 rounded border border-orange-500/30 bg-orange-500/5 p-1.5">
+            <span className="font-mono text-[9px] uppercase tracking-wider text-orange-300">
+              check 2+ signals below, then join them as one unit (fires only when they combine):
+            </span>
+            <label className="flex flex-col gap-0.5">
+              <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">group dir</span>
+              <select value={manualGroupDir} onChange={(e) => setManualGroupDir(e.target.value as 'call' | 'put')} className="h-6 rounded border border-[#1c2739] bg-[#101828] px-1.5 font-mono text-[10px] text-[#dbe4f0]">
+                <option value="call">CALL</option>
+                <option value="put">PUT</option>
+              </select>
+            </label>
+            <NumField label="group weight" value={manualGroupWeight} onChange={setManualGroupWeight} w="w-14" />
+            <Button
+              onClick={() => combineSelected('and')}
+              disabled={manualSelected.size < 2}
+              variant="outline"
+              className="h-6 border-orange-500/40 px-2 text-[9px] font-bold uppercase tracking-wider text-orange-300 hover:bg-orange-500/10 disabled:opacity-40"
+            >
+              combine -&gt; AND ({manualSelected.size})
+            </Button>
+            <Button
+              onClick={() => combineSelected('or')}
+              disabled={manualSelected.size < 2}
+              variant="outline"
+              className="h-6 border-orange-500/40 px-2 text-[9px] font-bold uppercase tracking-wider text-orange-300 hover:bg-orange-500/10 disabled:opacity-40"
+            >
+              combine -&gt; OR ({manualSelected.size})
+            </Button>
+            {manualSelected.size > 0 && (
+              <button type="button" onClick={() => setManualSelected(new Set())} className="font-mono text-[9px] text-[#4b5a72] hover:text-cyan-300">
+                clear selection
+              </button>
+            )}
+          </div>
+        )}
+
         {manualSignals.length > 0 && (
           <div className="mt-2 flex flex-wrap gap-1.5">
-            {manualSignals.map((s) => (
-              <span key={s.uid} className="flex items-center gap-1.5 rounded border border-[#1c2739] bg-[#101828] px-2 py-1 font-mono text-[10px]">
-                <span className={`rounded border px-1 py-0.5 text-[8px] uppercase ${KIND_CHIP[s.def.kind] ?? 'text-[#7c8aa5] border-[#1c2739]'}`}>{s.def.kind}</span>
-                <span className="text-[#dbe4f0]">{labelOfSignal(s.def)}</span>
-                <span className={s.def.dir === 'call' ? 'text-emerald-400' : 'text-rose-400'}>{s.def.dir.toUpperCase()}</span>
-                <span className="text-cyan-300">w{s.def.weight}</span>
-                <button type="button" onClick={() => removeManualSignal(s.uid)} className="text-[#4b5a72] hover:text-rose-400" title="remove">
-                  ✕
-                </button>
-              </span>
-            ))}
+            {manualSignals.map((s) => {
+              if (s.def.kind === 'group') {
+                const group = s.def
+                const joiner = group.op === 'and' ? '&' : '|'
+                return (
+                  <span key={s.uid} className="flex items-center gap-1.5 rounded border border-orange-500/40 bg-orange-500/5 px-2 py-1 font-mono text-[10px]">
+                    <input type="checkbox" checked={manualSelected.has(s.uid)} onChange={() => toggleManualSelected(s.uid)} className="accent-orange-500" title="select for combining" />
+                    <span className={`rounded border px-1 py-0.5 text-[8px] uppercase ${KIND_CHIP.group}`}>group:{group.op}</span>
+                    <span className="text-[#dbe4f0]">
+                      {group.signals.map((m, i) => (
+                        <span key={i}>
+                          {i > 0 && <span className="text-orange-400"> {joiner} </span>}
+                          {labelOfSignal(m)}
+                        </span>
+                      ))}
+                    </span>
+                    <span className={group.dir === 'call' ? 'text-emerald-400' : 'text-rose-400'}>{group.dir.toUpperCase()}</span>
+                    <span className="text-cyan-300">w{group.weight}</span>
+                    <button type="button" onClick={() => ungroupSignal(s.uid)} className="text-[#4b5a72] hover:text-orange-300" title="dissolve back into separate rows">
+                      ungroup
+                    </button>
+                    <button type="button" onClick={() => removeManualSignal(s.uid)} className="text-[#4b5a72] hover:text-rose-400" title="remove">
+                      ✕
+                    </button>
+                  </span>
+                )
+              }
+              return (
+                <span key={s.uid} className="flex items-center gap-1.5 rounded border border-[#1c2739] bg-[#101828] px-2 py-1 font-mono text-[10px]">
+                  <input type="checkbox" checked={manualSelected.has(s.uid)} onChange={() => toggleManualSelected(s.uid)} className="accent-orange-500" title="select for combining" />
+                  <span className={`rounded border px-1 py-0.5 text-[8px] uppercase ${KIND_CHIP[s.def.kind] ?? 'text-[#7c8aa5] border-[#1c2739]'}`}>{s.def.kind}</span>
+                  <span className="text-[#dbe4f0]">{labelOfSignal(s.def)}</span>
+                  <span className={s.def.dir === 'call' ? 'text-emerald-400' : 'text-rose-400'}>{s.def.dir.toUpperCase()}</span>
+                  <span className="text-cyan-300">w{s.def.weight}</span>
+                  <button type="button" onClick={() => removeManualSignal(s.uid)} className="text-[#4b5a72] hover:text-rose-400" title="remove">
+                    ✕
+                  </button>
+                </span>
+              )
+            })}
           </div>
         )}
 

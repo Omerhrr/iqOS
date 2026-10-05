@@ -129,7 +129,26 @@ export interface MTFSignal {
   weight: number
 }
 
-export type SignalDef = CandleSignal | BarSignal | HASignal | LineSignal | IndicatorSignal | MTFSignal
+/** AND/OR combination of DIFFERENT signal types into one unit that votes as
+ * a single signal. This is distinct from an IndicatorSignal's 'between'/
+ * 'outside' op (which bands ONE indicator's own value) - a GroupSignal joins
+ * independent signal families (e.g. "Range Sell Zone" AND "Wide Bear Bar"
+ * AND "RSI(14) > 70") so they only count when they ALL (op:'and') or ANY
+ * (op:'or') fire together on the same bar. The group itself carries its own
+ * dir/weight for voting - member signals' own `dir` fields are ignored for
+ * that purpose (only their activity test matters), so a member can be
+ * defined with whatever dir is natural for it standalone. Nesting is
+ * allowed but capped (see normalizeSpec's depth guard) to keep evaluation
+ * bounded and specs readable. */
+export interface GroupSignal {
+  kind: 'group'
+  op: 'and' | 'or'
+  signals: SignalDef[]
+  dir: Side
+  weight: number
+}
+
+export type SignalDef = CandleSignal | BarSignal | HASignal | LineSignal | IndicatorSignal | MTFSignal | GroupSignal
 
 export interface CustomSpec {
   name: string
@@ -780,6 +799,8 @@ export function labelOf(s: SignalDef): string {
     }
     case 'mtf':
       return `MTF ${s.factor}x Trend ${s.dir === 'call' ? 'Up' : 'Down'}`
+    case 'group':
+      return `(${s.signals.map(labelOf).join(s.op === 'and' ? ' AND ' : ' OR ')})`
   }
 }
 
@@ -797,6 +818,8 @@ export function impliedDir(s: SignalDef): Side {
     case 'indicator':
       return s.dir
     case 'mtf':
+      return s.dir
+    case 'group':
       return s.dir
   }
 }
@@ -933,6 +956,14 @@ export function prepareSignal(s: SignalDef, ctx: EvalCtx): (i: number) => boolea
         return align ? up[g] : dn[g]
       }
     }
+    case 'group': {
+      // Member signals each get their own independent prepareSignal test;
+      // the group is active at i iff all (op:'and') or any (op:'or') of
+      // them are. Members may themselves be groups (nesting), bounded by
+      // normalizeSpec's depth cap, not by anything here.
+      const members = s.signals.map((m) => prepareSignal(m, ctx))
+      return s.op === 'and' ? (i: number) => members.every((fn) => fn(i)) : (i: number) => members.some((fn) => fn(i))
+    }
   }
 }
 
@@ -1034,57 +1065,80 @@ const clampN = (v: unknown, lo: number, hi: number, d = lo): number => {
 /** Normalize + validate an arbitrary spec (from disk or the AI): unknown or
  * malformed signals are dropped, numbers clamped, dir defaults to the
  * variant's textbook direction. Returns null when nothing usable remains. */
+/** Validate+normalize ONE raw signal object into a SignalDef, or null if it
+ * doesn't match any known shape. Pulled out of normalizeSpec's old flat loop
+ * so a 'group' signal can recursively validate its own members the exact
+ * same way the top-level list does - depth caps nesting (groups-of-groups)
+ * so evaluation stays bounded and a pathological spec can't recurse forever. */
+function normalizeOneSignal(s: unknown, depth = 0): SignalDef | null {
+  if (!s || typeof s !== 'object') return null
+  const o = s as Record<string, unknown>
+  const weight = clampN(o.weight, 1, 50, 10)
+  const dir = o.dir === 'put' ? 'put' : o.dir === 'call' ? 'call' : undefined
+  if (o.kind === 'candle' && typeof o.name === 'string' && o.name.length <= 40) {
+    return { kind: 'candle', name: o.name, dir: dir ?? 'call', weight }
+  } else if (o.kind === 'bar' && KNOWN_BAR.has(String(o.variant))) {
+    const variant = String(o.variant) as BarSignal['variant']
+    return { kind: 'bar', variant, atrK: clampN(o.atrK, 0.5, 3, 1.1), dir: dir ?? (variant === 'wide-bull' ? 'call' : 'put'), weight }
+  } else if (o.kind === 'ha' && KNOWN_HA.has(String(o.variant))) {
+    const variant = String(o.variant) as HASignal['variant']
+    const dflt: Side = variant.endsWith('up') || variant === 'strong-bull' ? 'call' : 'put'
+    return { kind: 'ha', variant, len: clampN(o.len, 2, 10, variant.startsWith('flip') ? 2 : 3), dir: dir ?? dflt, weight }
+  } else if (o.kind === 'line' && KNOWN_LINE.has(String(o.variant))) {
+    const variant = String(o.variant) as LineSignal['variant']
+    const dflt: Side = variant.endsWith('up') || variant === 'hh-hl' ? 'call' : 'put'
+    return { kind: 'line', variant, lookback: clampN(o.lookback, 2, 100, variant.startsWith('breakout') ? 20 : 3), dir: dir ?? dflt, weight }
+  } else if (o.kind === 'indicator' && KNOWN_INDS.has(String(o.ind)) && (o.op === '>' || o.op === '<' || o.op === 'between' || o.op === 'outside')) {
+    const params: Record<string, number> = {}
+    for (const [k, v] of Object.entries((o.params as Record<string, unknown>) ?? {})) {
+      const n = Number(v)
+      if (Number.isFinite(n)) params[k] = n
+    }
+    const ind = String(o.ind) as IndicatorSignal['ind']
+    const typeSet = KNOWN_IND_TYPES[ind]
+    const type = typeSet && typeSet.has(String(o.type)) ? String(o.type) : undefined
+    const needsBand = o.op === 'between' || o.op === 'outside'
+    return {
+      kind: 'indicator',
+      ind,
+      ...(type ? { type } : {}),
+      params,
+      op: o.op,
+      threshold: clampN(o.threshold, -1e6, 1e6, 0),
+      // a band with no real threshold2 degrades to a single point rather
+      // than being dropped outright - prepareSignal's lo===hi collapses
+      // 'between' to "equals" and 'outside' to "not equals", both well-
+      // defined, so a malformed band still evaluates to something sane.
+      ...(needsBand ? { threshold2: clampN(o.threshold2, -1e6, 1e6, clampN(o.threshold, -1e6, 1e6, 0)) } : {}),
+      dir: dir ?? 'call',
+      weight,
+    }
+  } else if (o.kind === 'mtf' && (Number(o.factor) === 5 || Number(o.factor) === 15)) {
+    return { kind: 'mtf', factor: Number(o.factor) as 5 | 15, dir: dir ?? 'call', weight }
+  } else if (o.kind === 'group' && (o.op === 'and' || o.op === 'or') && depth < 2) {
+    const rawMembers: unknown[] = Array.isArray(o.signals) ? (o.signals as unknown[]) : []
+    const members: SignalDef[] = []
+    for (const m of rawMembers.slice(0, 8)) {
+      const norm = normalizeOneSignal(m, depth + 1)
+      if (norm) members.push(norm)
+    }
+    // a group with fewer than 2 live members isn't actually combining
+    // anything - drop it rather than silently voting as a single bare signal
+    // under a misleading "AND"/"OR" label.
+    if (members.length < 2) return null
+    return { kind: 'group', op: o.op, signals: members, dir: dir ?? 'call', weight }
+  }
+  return null
+}
+
 export function normalizeSpec(raw: unknown, fallbackName = 'Learned Strategy'): CustomSpec | null {
   if (!raw || typeof raw !== 'object') return null
   const r = raw as Partial<CustomSpec>
   const signals: SignalDef[] = []
   const list: unknown[] = Array.isArray(r.signals) ? (r.signals as unknown[]) : []
   for (const s of list.slice(0, 16)) {
-    if (!s || typeof s !== 'object') continue
-    const o = s as Record<string, unknown>
-    const weight = clampN(o.weight, 1, 50, 10)
-    const dir = o.dir === 'put' ? 'put' : o.dir === 'call' ? 'call' : undefined
-    if (o.kind === 'candle' && typeof o.name === 'string' && o.name.length <= 40) {
-      signals.push({ kind: 'candle', name: o.name, dir: dir ?? 'call', weight })
-    } else if (o.kind === 'bar' && KNOWN_BAR.has(String(o.variant))) {
-      const variant = String(o.variant) as BarSignal['variant']
-      signals.push({ kind: 'bar', variant, atrK: clampN(o.atrK, 0.5, 3, 1.1), dir: dir ?? (variant === 'wide-bull' ? 'call' : 'put'), weight })
-    } else if (o.kind === 'ha' && KNOWN_HA.has(String(o.variant))) {
-      const variant = String(o.variant) as HASignal['variant']
-      const dflt: Side = variant.endsWith('up') || variant === 'strong-bull' ? 'call' : 'put'
-      signals.push({ kind: 'ha', variant, len: clampN(o.len, 2, 10, variant.startsWith('flip') ? 2 : 3), dir: dir ?? dflt, weight })
-    } else if (o.kind === 'line' && KNOWN_LINE.has(String(o.variant))) {
-      const variant = String(o.variant) as LineSignal['variant']
-      const dflt: Side = variant.endsWith('up') || variant === 'hh-hl' ? 'call' : 'put'
-      signals.push({ kind: 'line', variant, lookback: clampN(o.lookback, 2, 100, variant.startsWith('breakout') ? 20 : 3), dir: dir ?? dflt, weight })
-    } else if (o.kind === 'indicator' && KNOWN_INDS.has(String(o.ind)) && (o.op === '>' || o.op === '<' || o.op === 'between' || o.op === 'outside')) {
-      const params: Record<string, number> = {}
-      for (const [k, v] of Object.entries((o.params as Record<string, unknown>) ?? {})) {
-        const n = Number(v)
-        if (Number.isFinite(n)) params[k] = n
-      }
-      const ind = String(o.ind) as IndicatorSignal['ind']
-      const typeSet = KNOWN_IND_TYPES[ind]
-      const type = typeSet && typeSet.has(String(o.type)) ? String(o.type) : undefined
-      const needsBand = o.op === 'between' || o.op === 'outside'
-      signals.push({
-        kind: 'indicator',
-        ind,
-        ...(type ? { type } : {}),
-        params,
-        op: o.op,
-        threshold: clampN(o.threshold, -1e6, 1e6, 0),
-        // a band with no real threshold2 degrades to a single point rather
-        // than being dropped outright - prepareSignal's lo===hi collapses
-        // 'between' to "equals" and 'outside' to "not equals", both well-
-        // defined, so a malformed band still evaluates to something sane.
-        ...(needsBand ? { threshold2: clampN(o.threshold2, -1e6, 1e6, clampN(o.threshold, -1e6, 1e6, 0)) } : {}),
-        dir: dir ?? 'call',
-        weight,
-      })
-    } else if (o.kind === 'mtf' && (Number(o.factor) === 5 || Number(o.factor) === 15)) {
-      signals.push({ kind: 'mtf', factor: Number(o.factor) as 5 | 15, dir: dir ?? 'call', weight })
-    }
+    const norm = normalizeOneSignal(s, 0)
+    if (norm) signals.push(norm)
   }
   if (!signals.length) return null
   return {

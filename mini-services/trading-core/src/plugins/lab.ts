@@ -750,6 +750,11 @@ function familyOf(s: SignalDef): string {
       // but up/down of the SAME factor count as one family so the ensemble
       // doesn't select both sides of the identical trend test.
       return `mtf:${s.factor}`
+    case 'group':
+      // groups are hand/AI-authored combinations, not something the miner
+      // itself generates as a candidate - key it by its member families so
+      // two groups combining the same underlying signals still dedupe.
+      return `group:${s.op}:${s.signals.map(familyOf).sort().join('+')}`
   }
 }
 
@@ -768,6 +773,8 @@ function candidateKeyOf(s: SignalDef): string {
       return `indicator:${s.ind}|${s.op}|${s.threshold}|${JSON.stringify(s.params ?? {})}`
     case 'mtf':
       return `mtf:${s.factor}:${s.dir}`
+    case 'group':
+      return `group:${s.op}:${s.dir}:${s.signals.map(candidateKeyOf).join('+')}`
   }
 }
 
