@@ -710,9 +710,22 @@ export class ModeService {
                 : this.config.signalSource === 'strategy'
                   ? (row.note ?? `${this.effectiveStrategyIds().join('+') || 'strategy'} (${row.direction.toUpperCase()})`)
                   : `score ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} regime ${row.regime}`
+      // Surface paper-vs-live right in the success line itself - this is the
+      // one place an operator actually reads "trade placed" and, before this,
+      // had no way to tell from the message alone whether it hit the real IQ
+      // account or the paper ledger. (UI symptom this fixes: "auto trader
+      // took a trade but nothing shows up in IQ Option" - because it was
+      // correctly placed on the paper ledger the whole time, just not labeled.)
+      let modeTag = ''
+      try {
+        const exec = this.ctx.use<{ accountSource: 'paper' | 'iq' }>('execution')
+        modeTag = exec.accountSource === 'iq' ? ' [LIVE]' : ' [PAPER]'
+      } catch {
+        // execution plugin unavailable - already failed above via place(), unreachable in practice
+      }
       this.emit(
         'success',
-        `[AUTO-TRADER] ${side.toUpperCase()} ${row.asset} ${this.config.tf} $${this.config.stake} binary - ${detail}`
+        `[AUTO-TRADER]${modeTag} ${side.toUpperCase()} ${row.asset} ${this.config.tf} $${this.config.stake} binary - ${detail}`
       )
       return
     }
