@@ -137,7 +137,7 @@ function Legend({ label, color, value }: { label: string; color: string; value: 
 // Exported standalone so it can be reused outside the full Order Flow tab
 // (e.g. the Markov/Delta switcher next to Confluence Signal) without pulling
 // in Volume Profile or the tab chrome around it.
-export function DeltaFootprintView({ asset, tf }: OrderFlowPanelProps) {
+export function DeltaFootprintView({ asset, tf, large = false }: OrderFlowPanelProps & { large?: boolean }) {
   const [deltas, setDeltas] = useState<CandleDelta[]>([])
   const [cumulative, setCumulative] = useState<CumulativeDeltaPoint[]>([])
   const [error, setError] = useState<string | null>(null)
@@ -167,8 +167,13 @@ export function DeltaFootprintView({ asset, tf }: OrderFlowPanelProps) {
   const chart = useMemo(() => {
     if (deltas.length === 0) return null
     const W = 600
-    const barH = 90
-    const lineH = 70
+    // in the small Markov/Delta switcher slot these render at fixed small
+    // pixel heights regardless of container size (hand-rolled SVG, not an
+    // external chart lib) - when opened in the fullscreen overlay (`large`)
+    // the viewBox itself grows so bars/line actually render bigger and more
+    // legible, not just the same tiny SVG centered in extra empty space.
+    const barH = large ? 260 : 90
+    const lineH = large ? 200 : 70
     const maxAbsDelta = Math.max(...deltas.map((d) => Math.abs(d.delta)), 1)
     const cumVals = cumulative.map((c) => c.cumulativeDelta)
     let cLo = Math.min(...cumVals, 0)
@@ -200,7 +205,7 @@ export function DeltaFootprintView({ asset, tf }: OrderFlowPanelProps) {
         </div>
         <div className="font-mono text-[9px] text-[#3d4c66]">{chart.n} candles</div>
       </div>
-      <svg viewBox={`0 0 ${chart.W} ${chart.barH}`} className="h-[90px] w-full">
+      <svg viewBox={`0 0 ${chart.W} ${chart.barH}`} className={large ? 'h-[260px] w-full' : 'h-[90px] w-full'}>
         <line x1="0" x2={chart.W} y1={chart.barH / 2} y2={chart.barH / 2} stroke="#1c2739" strokeWidth="1" />
         {deltas.map((d, i) => {
           const h = (Math.abs(d.delta) / chart.maxAbsDelta) * (chart.barH / 2 - 2)
@@ -221,7 +226,7 @@ export function DeltaFootprintView({ asset, tf }: OrderFlowPanelProps) {
         Cumulative Delta
         <ApproxTag title="Running sum of the per-candle approximated delta above - visualizes sustained buying vs selling pressure, not real cumulative order-flow." />
       </div>
-      <svg viewBox={`0 0 ${chart.W} ${chart.lineH}`} className="h-[70px] w-full">
+      <svg viewBox={`0 0 ${chart.W} ${chart.lineH}`} className={large ? 'h-[200px] w-full' : 'h-[70px] w-full'}>
         <path d={chart.linePath} fill="none" stroke="#38bdf8" strokeWidth="1.6" />
       </svg>
       <p className="text-[9px] leading-relaxed text-[#4b5a72]">
