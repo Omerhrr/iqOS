@@ -323,8 +323,17 @@ export class ModeService {
    * (weekend OTC closures, mid-day suspensions). Matches the sidecar's
    * `order rejected: Cannot purchase an option (the asset is not available
    * at the moment).` and the "not a turbo/binary/digital instrument"
-   * account-mismatch rejection. */
-  private static BROKER_UNAVAILABLE_RE = /not available at the moment|is not a (?:turbo\/binary\/digital|digital\/turbo\/binary) instrument/i
+   * account-mismatch rejection, plus the sidecar's `Active %!s(MISSING) not
+   * found.` rejection (a Go fmt bug on the sidecar's side drops the active_id
+   * into that "%!s(MISSING)" placeholder, but the "active ... not found"
+   * shape is stable - this fires when our active_id map is stale/wrong for
+   * an asset, e.g. right after an IQ instrument catalog refresh swaps ids
+   * out from under us). Without matching this one too, assetRejectedUntil
+   * never gets set and the picker re-selects the exact same dead active_id
+   * on every single 10s tick forever - which is exactly what the logs showed:
+   * hundreds of back-to-back "Active ... not found" rejections for the same
+   * handful of active_ids while everything else kept trading fine. */
+  private static BROKER_UNAVAILABLE_RE = /not available at the moment|is not a (?:turbo\/binary\/digital|digital\/turbo\/binary) instrument|active\b[^.]*not found/i
   private static BROKER_UNAVAILABLE_COOLDOWN_SEC = 600
   /** Hard floor for the per-asset re-entry cooldown (assetBlocked) - a pair
    * the auto-trader just traded always sits out at least this long, however
