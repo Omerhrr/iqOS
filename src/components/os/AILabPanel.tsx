@@ -1293,7 +1293,27 @@ export default function AILabPanel({ assets, strategies, onError, refreshBots }:
                     <span className="text-[#7c8aa5]">(score {manualBuiltinPreview.score.toFixed(0)}) - {manualBuiltinPreview.notes}</span>
                     <button
                       type="button"
-                      onClick={() => setManualDir(manualBuiltinPreview.direction === 'put' ? 'put' : 'call')}
+                      onClick={() => {
+                        const dir = manualBuiltinPreview.direction === 'put' ? 'put' : 'call'
+                        setManualDir(dir)
+                        // This only changed the DIR dropdown above, which only
+                        // affects the NEXT "+ add signal" - if this exact
+                        // builtin strategy is ALREADY sitting in the signal
+                        // list below (the common case: you added it, then
+                        // tested live to see which way it's actually
+                        // reading), the dropdown updating was invisible
+                        // against it since the already-added row kept its old
+                        // dir - looking like the button "did nothing". Flip
+                        // every already-added row (and any group-in-progress
+                        // member) using this same strategy id to match too.
+                        const stratId = strategies[manualBuiltinIdx]?.id
+                        if (stratId) {
+                          setManualSignals((prev) =>
+                            prev.map((s) => (s.def.kind === 'builtin' && s.def.id === stratId ? { ...s, def: { ...s.def, dir } } : s))
+                          )
+                          setManualGroupPending((prev) => prev.map((def) => (def.kind === 'builtin' && def.id === stratId ? { ...def, dir } : def)))
+                        }
+                      }}
                       disabled={manualBuiltinPreview.direction === 'none'}
                       className="ml-2 text-[9px] text-lime-300 underline hover:text-lime-200 disabled:cursor-not-allowed disabled:text-[#4b5a72] disabled:no-underline"
                     >
