@@ -266,6 +266,15 @@ export default function OSPage() {
     if (h.ok) setHistory(h.positions.slice(0, 60))
   }, [])
 
+  // positions polling - self-heals the blotter if a positionOpened/
+  // positionClosed socket event is ever missed (reconnect gap, dropped
+  // packet, a code path that settles/opens a position without emitting),
+  // the same defensive cadence sentinel/watchdog/mode already use below
+  useEffect(() => {
+    const t = setInterval(() => void loadPositions(), 5000)
+    return () => clearInterval(t)
+  }, [loadPositions])
+
   const loadBots = useCallback(async () => {
     try {
       const d = await osGet<{ ok: boolean; bots: BotRow[] }>('/bots')
@@ -494,6 +503,12 @@ export default function OSPage() {
       if (p.closed) void loadAnalysis(p.asset, p.tf)
     },
     onAccount: (p) => setAccount(p.account),
+    onPositionOpened: () => {
+      // A position (manual OR autopilot/bot-placed) just opened on the
+      // backend - refresh immediately so it shows up without waiting for
+      // some other position to close first.
+      void loadPositions()
+    },
     onPositionClosed: (p) => {
       void loadPositions()
       void loadAccount()

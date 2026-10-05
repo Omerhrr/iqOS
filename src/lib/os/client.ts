@@ -1382,6 +1382,7 @@ export interface OSFeedHandlers {
   onTick?: (p: { asset: string; price: number; ts: number }) => void
   onCandle?: (p: { asset: string; tf: Timeframe; candle: Candle; closed: boolean }) => void
   onAccount?: (p: { account: AccountState }) => void
+  onPositionOpened?: (p: { position: Position }) => void
   onPositionClosed?: (p: { position: Position }) => void
   onAlert?: (p: AlertRow) => void
   onUi?: (p: { event: string; asset?: string }) => void
@@ -1423,6 +1424,13 @@ export function useOSFeed(asset: string, tf: Timeframe, handlers: OSFeedHandlers
     socket.on('tick', (p) => handlersRef.current.onTick?.(p))
     socket.on('candle', (p) => handlersRef.current.onCandle?.(p))
     socket.on('account', (p) => handlersRef.current.onAccount?.(p))
+    // The backend emits 'positionOpened' for EVERY new position, not just
+    // ones placed through the trade ticket (autopilot/bot-placed live
+    // trades go through this path too, with no local onPlaced callback to
+    // trigger a refresh) - without this listener those positions never
+    // appear in the blotter until some unrelated position happens to close
+    // and onPositionClosed's refresh incidentally picks them up.
+    socket.on('positionOpened', (p) => handlersRef.current.onPositionOpened?.(p))
     socket.on('positionClosed', (p) => handlersRef.current.onPositionClosed?.(p))
     socket.on('alert', (p) => handlersRef.current.onAlert?.(p))
     socket.on('ui', (p) => handlersRef.current.onUi?.(p))

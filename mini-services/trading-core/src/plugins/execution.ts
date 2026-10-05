@@ -666,18 +666,28 @@ export class ExecutionService {
   }
 
   /**
-   * LIVE options settle against IQ's OWN authoritative order result first -
+   * LIVE options settle ONLY against IQ's OWN authoritative order result -
    * never a price quote we compute win/loss from ourselves. We ask the
    * sidecar's /order_result (which walks IQ's own portfolio/history
    * endpoints and matches our order id - see iqOrderResult()) whether the
    * broker has already closed this order out, and if so trust ITS pnl sign,
-   * full stop. Only when IQ hasn't reported back yet do we fall back to the
-   * price-quote ladder below (own expiry candle -> degraded stream -> kernel
-   * feed), which stays as a best-effort stand-in while waiting, not as a
-   * substitute for the broker's own result once it's available.
+   * full stop.
+   *
+   * THE BUG (fake/guessed history): this used to fall back, once IQ hadn't
+   * reported back yet, to a local price-quote ladder (own expiry candle ->
+   * degraded stream quote -> kernel feed "last resort") that GUESSED a
+   * win/loss from a price comparison and wrote that guess to history via
+   * finishLiveExpiry. That guess could - and did - disagree with what IQ
+   * itself later reported, so the trade history for REAL money trades was
+   * sometimes simply wrong. There is now no such path for live trades: if
+   * the broker hasn't confirmed closed (whether it explicitly says "open",
+   * says "not found yet", or the sidecar call itself errors/times out), we
+   * record NOTHING and just retry on the next sweep, indefinitely, until IQ
+   * itself reports the real result. Paper trades are untouched - they have
+   * no real broker to wait for and keep settling via settleExpiry's local
+   * price computation, unchanged.
    */
   private async settleLiveExpiry(pos: Position): Promise<void> {
-    const expiresAt = pos.settlesAt ?? this.now()
     const attempt = (this.expiryAttempts.get(pos.id) ?? 0) + 1
     this.expiryAttempts.set(pos.id, attempt)
     if (pos.liveOrderId) {
@@ -686,60 +696,22 @@ export class ExecutionService {
         this.finishLiveExpiryFromBroker(pos, result.pnl as number)
         return
       }
-      // THE BUG (root cause of "iqos settles before iqoption"): our local
-      // settlesAt is only an ESTIMATE (now+N*60, or a broker echo that can
-      // still be off a beat) - IQ rounds turbo/binary expiry to its own
-      // minute-boundary clock, so a 1m trade placed mid-minute can run up to
-      // ~90s real-world. Once our estimate's clock hit zero, the code below
-      // used to fall straight into the price-quote ladder and settle off a
-      // candle at OUR guessed time regardless of what the broker just said -
-      // including the case right here, where IQ explicitly confirmed the
-      // order is still "open". That is exactly how iqOS could mark a trade
-      // won/lost and log a close time while the real IQ position was still
-      // running. When the broker says open, broker's clock wins: hold off
-      // settling this sweep entirely (no quote fallback, no degraded/last-
-      // resort escalation) and let the next 1s tick re-ask - never guess a
-      // result or a close time while IQ itself says the trade is live.
-      if (result?.found && result.status === 'open') {
-        this.settlingLive.delete(pos.id)
-        return
-      }
+      // Broker explicitly open, not found yet, or the call errored/timed
+      // out (result === null): in every case IQ has not confirmed a close,
+      // so nothing gets written to history. Just wait and re-ask.
     }
-    const quote = await this.iqExpiryQuote(pos.asset, expiresAt)
-    if (quote) {
-      this.finishLiveExpiry(pos, quote.price, quote.src)
-      return
+    // ~2-3 minutes past expected expiry with still no broker confirmation:
+    // purely informational - does not affect settlement, just lets ops know
+    // a position is pending rather than silently stuck.
+    if (attempt === 150 || (attempt > 150 && attempt % 150 === 0)) {
+      const waitedSec = this.now() - (pos.settlesAt ?? this.now())
+      this.lastLiveError = `live ${pos.kind} ${pos.liveOrderId ?? pos.id} on ${pos.asset} still awaiting IQ confirmation ${waitedSec}s past expected expiry - holding, no history recorded yet`
+      this.ctx.log('execution', this.lastLiveError)
     }
-    if (!(this.liveReady && this.accountSource === 'iq')) {
-      // session dropped mid-flight - sweep re-arms when IQ is back
-      this.settlingLive.delete(pos.id)
-      return
-    }
-    if (attempt >= 4) {
-      // degraded: the sidecar's freshest stream quote - still broker-side,
-      // just a few seconds after the expiry second
-      const res = await this.getLive(`/price?asset=${encodeURIComponent(this.market.iqairSymbol(pos.asset))}`)
-      const p = Number(res?.price)
-      if (Number.isFinite(p) && p > 0) {
-        this.finishLiveExpiry(pos, p, 'iq stream (degraded)')
-        return
-      }
-    }
-    if (attempt >= 45) {
-      // last resort: kernel feed tick rather than an eternally open position
-      const p = this.market.getPrice(pos.asset)
-      if (p > 0) this.finishLiveExpiry(pos, p, 'kernel feed (last resort)')
-      else this.settlingLive.delete(pos.id)
-      return
-    }
-    // unresolved - the next 1s sweep retries the ladder
+    // unresolved - the next 1s sweep re-asks the broker. No local guess, no
+    // timeout that forces a settlement: we wait as long as it takes for IQ
+    // to report the real result.
     this.settlingLive.delete(pos.id)
-  }
-
-  private finishLiveExpiry(pos: Position, price: number, via: string): void {
-    this.settlingLive.delete(pos.id)
-    this.expiryAttempts.delete(pos.id)
-    this.settleExpiry(pos, price, via)
   }
 
   /**
@@ -773,38 +745,6 @@ export class ExecutionService {
     const status = typeof res.status === 'string' ? res.status : undefined
     const pnl = Number(res.pnl)
     return { found, status, pnl: Number.isFinite(pnl) ? pnl : undefined }
-  }
-
-  /**
-   * The broker-side quote AT an expiry second: candles requested with
-   * end=<expiry+tf> and the newest one whose window CLOSES at/before the
-   * expiry - its close is the last quote before expiry, exactly what IQ
-   * settles against. Tries 1s, 5s, then 1m granularity. Null when the
-   * sidecar has nothing usable yet (expiry candle not frozen yet).
-   */
-  private async iqExpiryQuote(asset: string, atSec: number): Promise<{ price: number; src: string } | null> {
-    const base = this.liveUrl().replace(/\/$/, '')
-    const sym = this.market.iqairSymbol(asset)
-    const tries: Array<{ tf: number; src: string }> = [
-      { tf: 1, src: 'iq expiry 1s quote' },
-      { tf: 5, src: 'iq expiry 5s quote' },
-      { tf: 60, src: 'iq expiry 1m quote' },
-    ]
-    for (const t of tries) {
-      try {
-        const res = await fetch(`${base}/candles?asset=${encodeURIComponent(sym)}&tf=${t.tf}&size=6&end=${atSec + t.tf}`, {
-          signal: AbortSignal.timeout(8000),
-        })
-        const data = (await res.json()) as { ok?: boolean; candles?: Array<{ time: number; to?: number; close: number }> }
-        const rows = (data.candles ?? []).filter((c) => Number.isFinite(c.close) && c.close > 0)
-        // newest candle whose window closed at/before the expiry second
-        const eligible = rows.filter((c) => (c.to ?? c.time + t.tf) <= atSec)
-        if (eligible.length) return { price: eligible[eligible.length - 1].close, src: t.src }
-      } catch {
-        // sidecar busy/down - next granularity, then the next sweep, retries
-      }
-    }
-    return null
   }
 
   /**
