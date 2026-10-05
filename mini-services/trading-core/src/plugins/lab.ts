@@ -44,6 +44,11 @@ export interface LearnOptions {
   amount?: number // backtest stake (default 10)
   name?: string // spec name override
   basis?: Basis // what the signals read: raw OHLC, Heiken-Ashi, Kalman-smoothed, typical-price, or SMA-smoothed
+  /** Mine AND/OR/AND-AND confluence combos of the best single signals, not
+   * just flat independent-signal voting - see learn()'s "combo mining"
+   * comment. Default true (on); set false for the old singles-only
+   * behavior or to skip the extra compute. */
+  mineCombos?: boolean
 }
 
 export interface SignalStat {
@@ -461,6 +466,118 @@ export class StrategyLabService {
     // thin sample needs a genuinely large edge to compete with a well-
     // sampled one at a smaller edge.
     measured.sort((a, b) => b.edgeLB - a.edgeLB || b.n - a.n)
+
+    // ---- combo mining: AND/OR confluence of the best single signals ----
+    // Up to here, every candidate the learner can select is ONE atomic
+    // signal firing alone - a flat ensemble vote, never "Range Sell Zone
+    // AND Wide Bear Bar" or "RSI oversold OR Donchian breakout" the way the
+    // AI Lab's manual group-builder lets a human construct by hand. Mine
+    // the same shape automatically: take a short per-direction shortlist of
+    // the best-MEASURED singles (one per family, so this isn't just
+    // combining two thresholds of the same indicator), then measure every
+    // 2-member AND, 2-member OR, and 3-member AND combination of them
+    // exactly like a single signal (same win-rate-after-`horizon`-bars
+    // test) and fold the results back into the SAME `measured`/select
+    // pipeline below - a combo competes on its own measured edge, with no
+    // special-casing, and only wins a slot in the final spec if it's
+    // actually better than the atoms it's built from. Bounded to a small
+    // shortlist (not the whole candidate pool) because combo count grows
+    // combinatorially; disable with mineCombos:false for the old flat-only
+    // behavior (or to skip the extra compute on a slow pair/large bar
+    // count).
+    if (opts.mineCombos !== false) {
+      const singleByKey = new Map(candidates.map((c) => [c.key, c]))
+      const COMBO_POOL = 10 // shortlist size per direction
+      const MIN_COMBO_N = Math.max(10, Math.round(minSamples * 0.6)) // a combo fires less often than either member alone - don't bother measuring one whose base rate is already hopeless
+      const comboCandidates: Candidate[] = []
+      for (const dir of ['call', 'put'] as const) {
+        const seenFam = new Set<string>()
+        const pool: Candidate[] = []
+        for (const m of measured) {
+          if (m.dir !== dir) continue
+          const c = singleByKey.get(m.key)
+          if (!c) continue
+          if (seenFam.has(c.family)) continue
+          seenFam.add(c.family)
+          pool.push(c)
+          if (pool.length >= COMBO_POOL) break
+        }
+        for (let i = 0; i < pool.length; i++) {
+          for (let j = i + 1; j < pool.length; j++) {
+            const a = pool[i]
+            const b = pool[j]
+            for (const op of ['and', 'or'] as const) {
+              const def: SignalDef = { kind: 'group', op, signals: [a.def, b.def], dir, weight: 10 }
+              const key = `group:${op}:${[a.key, b.key].sort().join('+')}`
+              comboCandidates.push({
+                key,
+                kind: 'group',
+                label: labelOf(def),
+                dir,
+                family: key,
+                def,
+                test: op === 'and' ? (ii: number) => a.test(ii) && b.test(ii) : (ii: number) => a.test(ii) || b.test(ii),
+              })
+            }
+            // 3-way AND confluence ("multiple ANDs") - skipping a 3-way OR,
+            // which just gets noisier/more overlapping without adding a
+            // genuinely new idea the way stacking a third confirming
+            // condition onto an AND does.
+            for (let k = j + 1; k < pool.length; k++) {
+              const c3 = pool[k]
+              const def3: SignalDef = { kind: 'group', op: 'and', signals: [a.def, b.def, c3.def], dir, weight: 10 }
+              const key3 = `group:and:${[a.key, b.key, c3.key].sort().join('+')}`
+              comboCandidates.push({
+                key: key3,
+                kind: 'group',
+                label: labelOf(def3),
+                dir,
+                family: key3,
+                def: def3,
+                test: (ii: number) => a.test(ii) && b.test(ii) && c3.test(ii),
+              })
+            }
+          }
+        }
+      }
+
+      if (comboCandidates.length) {
+        const comboStats = new Map<string, { n: number; wins: number }>()
+        for (let i = warm; i < end; i++) {
+          for (const c of comboCandidates) {
+            if (!c.test(i)) continue
+            const s = comboStats.get(c.key) ?? { n: 0, wins: 0 }
+            s.n += 1
+            const up = settle[i + horizon] > settle[i]
+            const dn = settle[i + horizon] < settle[i]
+            if (c.dir === 'call' ? up : dn) s.wins += 1
+            comboStats.set(c.key, s)
+          }
+        }
+        for (const c of comboCandidates) {
+          const s = comboStats.get(c.key)
+          if (!s || s.n < MIN_COMBO_N) continue
+          const winRate = (s.wins / s.n) * 100
+          const [ciLow] = wilsonInterval(s.wins, s.n)
+          measured.push({
+            key: c.key,
+            kind: c.kind,
+            label: c.label,
+            dir: c.dir,
+            n: s.n,
+            wins: s.wins,
+            winRate: round2(winRate),
+            edgePts: round2(winRate - 50),
+            edgeLB: round2(ciLow - 50),
+            weight: 0,
+            selected: false,
+            def: c.def,
+          })
+          candidates.push(c) // so byKey below (built from candidates) resolves combo keys too
+        }
+        measured.sort((a, b) => b.edgeLB - a.edgeLB || b.n - a.n)
+      }
+    }
 
     const byKey = new Map(candidates.map((c) => [c.key, c]))
     const qualifying = measured.filter((m) => m.n >= minSamples && m.edgePts >= minEdge)
@@ -1075,6 +1192,20 @@ export const CANDIDATE_SIGNALS: SignalDef[] = [
   { kind: 'indicator', ind: 'rangezone', params: { window: 40, rangeThreshold: 0.35, zoneAtr: 0.4 }, op: '<', threshold: -0.05, dir: 'put', weight: 12 },
   { kind: 'indicator', ind: 'rangezone', params: { window: 60, rangeThreshold: 0.25, zoneAtr: 0.5 }, op: '>', threshold: 0.05, dir: 'call', weight: 12 },
   { kind: 'indicator', ind: 'rangezone', params: { window: 60, rangeThreshold: 0.25, zoneAtr: 0.5 }, op: '<', threshold: -0.05, dir: 'put', weight: 12 },
+  // order flow (CLV-based approximation - see analytics/orderflow.ts; no
+  // real tick/order-book data exists on this platform) - lets the learner
+  // discover whether delta/POC/value-area concepts carry edge on a pair,
+  // same as every other family above.
+  { kind: 'indicator', ind: 'ofdelta', params: { period: 20 }, op: '>', threshold: 1, dir: 'call', weight: 10 },
+  { kind: 'indicator', ind: 'ofdelta', params: { period: 20 }, op: '<', threshold: -1, dir: 'put', weight: 10 },
+  { kind: 'indicator', ind: 'ofcumdelta', params: { lookback: 10, period: 20 }, op: '>', threshold: 1, dir: 'call', weight: 11 },
+  { kind: 'indicator', ind: 'ofcumdelta', params: { lookback: 10, period: 20 }, op: '<', threshold: -1, dir: 'put', weight: 11 },
+  { kind: 'indicator', ind: 'ofcumdelta', params: { lookback: 20, period: 40 }, op: '>', threshold: 1, dir: 'call', weight: 11 },
+  { kind: 'indicator', ind: 'ofcumdelta', params: { lookback: 20, period: 40 }, op: '<', threshold: -1, dir: 'put', weight: 11 },
+  { kind: 'indicator', ind: 'ofpocdist', params: { period: 40 }, op: '<', threshold: -1.2, dir: 'call', weight: 11 },
+  { kind: 'indicator', ind: 'ofpocdist', params: { period: 40 }, op: '>', threshold: 1.2, dir: 'put', weight: 11 },
+  { kind: 'indicator', ind: 'ofvapos', params: { period: 40 }, op: '>', threshold: 1.05, dir: 'call', weight: 11 },
+  { kind: 'indicator', ind: 'ofvapos', params: { period: 40 }, op: '<', threshold: -0.05, dir: 'put', weight: 11 },
 ]
 
 let labServiceInstance: StrategyLabService | null = null

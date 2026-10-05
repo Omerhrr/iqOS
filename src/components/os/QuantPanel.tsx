@@ -1,15 +1,67 @@
 'use client'
 
 // IQAIR//OS - Quant lab panel: Hurst, vol models, ACF, Monte Carlo fan, S/R zones
-import { useMemo, useState } from 'react'
-import type { AnalysisResult, OUVerdict } from '@/lib/os/client'
-import { fmtPrice, osPost } from '@/lib/os/client'
+import { useEffect, useMemo, useState } from 'react'
+import type { AnalysisResult, Factor, OsModeStatus, OUVerdict } from '@/lib/os/client'
+import { fmtPrice, osGet, osPost } from '@/lib/os/client'
 
-/** Walk-forward validation of the OU edge on the active instrument (kernel /ou_validate). */
+/** Small chip showing a factor's live contribution to the composite signal score. */
+function FactorBadge({ factor }: { factor?: Factor }) {
+  if (!factor) return null
+  const active = Math.abs(factor.vote) > 0.15
+  const contribution = factor.vote * factor.weight
+  const dir = !active ? null : contribution > 0 ? 'call' : 'put'
+  const color = dir === 'call' ? '#10b981' : dir === 'put' ? '#f43f5e' : '#5a6a85'
+  const bg = dir === 'call' ? 'rgba(16,185,129,0.12)' : dir === 'put' ? 'rgba(244,63,94,0.12)' : 'rgba(148,163,184,0.08)'
+  const label = dir ? `→ ${dir === 'call' ? 'CALL' : 'PUT'} ${contribution >= 0 ? '+' : ''}${contribution.toFixed(1)}` : 'neutral'
+  return (
+    <span
+      className="ml-1.5 inline-block rounded px-1 py-0.5 align-middle font-mono text-[8px] font-bold uppercase tracking-wide"
+      style={{ color, background: bg }}
+      title={`weight ${factor.weight} · vote ${factor.vote.toFixed(2)} · feeds the live composite signal score`}
+    >
+      {label} · w{factor.weight}
+    </span>
+  )
+}
+
+/** Minutes/hours-ago label for a unix-ms timestamp, e.g. "3m ago". */
+function agoLabel(ts: number): string {
+  const secs = Math.max(0, Math.floor((Date.now() - ts) / 1000))
+  if (secs < 60) return 'just now'
+  const mins = Math.floor(secs / 60)
+  if (mins < 60) return `${mins}m ago`
+  const hrs = Math.floor(mins / 60)
+  return `${hrs}h ago`
+}
+
+/**
+ * Walk-forward validation of the OU edge on the active instrument (kernel
+ * /ou_validate), plus a direct arm/disarm for the auto-trader's
+ * requireValidation gate - so a user doesn't have to separately find it in
+ * Autopilot settings to know (or control) whether this result does anything.
+ */
 function OuWalkForward({ asset, tf }: { asset: string; tf: string }) {
   const [verdict, setVerdict] = useState<OUVerdict | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [requireValidation, setRequireValidation] = useState<boolean | null>(null)
+  const [autoSource, setAutoSource] = useState<string | null>(null)
+  const [toggling, setToggling] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    osGet<{ ok: boolean } & OsModeStatus>('/mode')
+      .then((d) => {
+        if (cancelled || !d.ok) return
+        setRequireValidation(d.autotrader.config.requireValidation)
+        setAutoSource(d.autotrader.config.signalSource)
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   const run = () => {
     setBusy(true)
@@ -21,6 +73,16 @@ function OuWalkForward({ asset, tf }: { asset: string; tf: string }) {
       })
       .catch((e: Error) => setError(e.message.slice(0, 120)))
       .finally(() => setBusy(false))
+  }
+
+  const toggleRequireValidation = () => {
+    if (requireValidation === null || toggling) return
+    const next = !requireValidation
+    setToggling(true)
+    setRequireValidation(next) // optimistic
+    osPost<{ ok: boolean; error?: string }>('/autotrader_config', { requireValidation: next })
+      .catch(() => setRequireValidation(!next))
+      .finally(() => setToggling(false))
   }
 
   const badge =
@@ -37,7 +99,7 @@ function OuWalkForward({ asset, tf }: { asset: string; tf: string }) {
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="text-[10px] text-[#4b5a72]">
           walk-forward validation · 3 folds · IS grid → OOS binary settlement
-          {verdict && <span className="text-[#3d4c66]"> · {verdict.elapsedMs}ms</span>}
+          {verdict && <span className="text-[#3d4c66]"> · {verdict.elapsedMs}ms{verdict.ts ? ` · validated ${agoLabel(verdict.ts)}` : ''}</span>}
         </div>
         <button
           type="button"
@@ -48,6 +110,35 @@ function OuWalkForward({ asset, tf }: { asset: string; tf: string }) {
           {busy ? 'validating…' : 'validate edge'}
         </button>
       </div>
+      <p className="mt-1 text-[8px] leading-snug text-[#4b5a72]">
+        this checks ONE pair's OU edge only - it affects live trading only when the auto-trader's signal source is set to <span className="text-[#7c8aa5]">kalman-ou</span> AND &quot;require walk-forward validation&quot; is armed below. It has no effect on any other signal source or on manual trades.
+      </p>
+      {requireValidation !== null && (
+        <div className="mt-1.5 flex items-center justify-between gap-2 rounded border border-[#1c2739] bg-[#101828] px-2 py-1">
+          <div>
+            <div className="text-[9px] font-semibold text-[#e2e8f0]">
+              Require this validation before auto-trading kalman-ou
+              {autoSource && autoSource !== 'kalman-ou' && (
+                <span className="ml-1 font-normal text-[#f59e0b]">(auto-trader source is currently &quot;{autoSource}&quot; - no effect until switched)</span>
+              )}
+            </div>
+            <div className="text-[8px] text-[#4b5a72]">gates only the kalman-ou auto-trader source · verdicts cache ~1h</div>
+          </div>
+          <button
+            type="button"
+            onClick={toggleRequireValidation}
+            disabled={toggling}
+            className="shrink-0 rounded px-2 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wider transition-colors disabled:opacity-50"
+            style={
+              requireValidation
+                ? { color: '#10b981', background: 'rgba(16,185,129,0.14)', border: '1px solid rgba(16,185,129,0.4)' }
+                : { color: '#aab6cc', background: 'rgba(148,163,184,0.08)', border: '1px solid #1c2739' }
+            }
+          >
+            {requireValidation ? 'armed' : 'off'}
+          </button>
+        </div>
+      )}
       {error && <p className="mt-1 font-mono text-[10px] text-rose-400">{error}</p>}
       {verdict && badge && (
         <div className="mt-1.5">
@@ -199,8 +290,22 @@ export default function QuantPanel({ analysis }: { analysis: AnalysisResult | nu
   const ou = analysis.kalman
   const hurstColor = q.hurst > 0.58 ? '#10b981' : q.hurst < 0.42 ? '#f59e0b' : '#aab6cc'
 
+  const factorByName = new Map(analysis.signal.factors.map((f) => [f.name, f]))
+  const hurstFactor = factorByName.get('Hurst Exponent')
+  const zScoreFactor = factorByName.get('Z-Score (20)')
+  const regressionFactor = factorByName.get('Regression Slope (R2)')
+  const ouFactor = factorByName.get('Kalman/OU Stretch')
+  const linkedCount = [hurstFactor, zScoreFactor, regressionFactor, ouFactor].filter(Boolean).length
+
   return (
     <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+      <div className="xl:col-span-2 text-[10px] text-[#4b5a72]">
+        {linkedCount} of the stats below are live inputs to your composite signal score (currently{' '}
+        <span className={analysis.signal.direction === 'call' ? 'text-emerald-400' : analysis.signal.direction === 'put' ? 'text-rose-400' : 'text-[#aab6cc]'}>
+          {analysis.signal.score.toFixed(0)} · {analysis.signal.direction.toUpperCase()}
+        </span>
+        ) - the chips show each stat&apos;s current weighted vote direction and contribution.
+      </div>
       <div className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-3">
         <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">Monte Carlo · 30 steps · {mc.nSims} paths</h3>
         <MonteFan analysis={analysis} />
@@ -231,15 +336,15 @@ export default function QuantPanel({ analysis }: { analysis: AnalysisResult | nu
       <div className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-3">
         <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">Statistical Profile</h3>
         <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 font-mono text-[11px]">
-          <Stat label="Hurst exponent" value={q.hurst.toFixed(3)} color={hurstColor} note={q.hurstNote} />
+          <Stat label="Hurst exponent" value={q.hurst.toFixed(3)} color={hurstColor} note={q.hurstNote} factor={hurstFactor} />
           <Stat label="Ann. volatility" value={`${q.annualizedVol.toFixed(1)}%`} />
           <Stat label="EWMA vol / bar" value={q.ewmaVol.toFixed(5)} />
           <Stat label="GARCH(1,1) vol" value={q.garchVol.toFixed(5)} />
-          <Stat label="Z-score (20)" value={q.zScore.toFixed(2)} color={Math.abs(q.zScore) > 1.5 ? '#f59e0b' : '#aab6cc'} />
+          <Stat label="Z-score (20)" value={q.zScore.toFixed(2)} color={Math.abs(q.zScore) > 1.5 ? '#f59e0b' : '#aab6cc'} factor={zScoreFactor} />
           <Stat label="Sharpe (ann.)" value={q.sharpe.toFixed(2)} />
           <Stat label="Skew" value={q.skew.toFixed(2)} />
           <Stat label="Excess kurtosis" value={q.kurtosis.toFixed(2)} />
-          <Stat label="Reg. slope R²" value={q.linreg.r2.toFixed(2)} note={`slope ${q.linreg.slope >= 0 ? '+' : ''}${q.linreg.slope.toExponential(1)}`} />
+          <Stat label="Reg. slope R²" value={q.linreg.r2.toFixed(2)} note={`slope ${q.linreg.slope >= 0 ? '+' : ''}${q.linreg.slope.toExponential(1)}`} factor={regressionFactor} />
           <Stat label="Daily vol est." value={`${q.dailyVol.toFixed(2)}%`} />
         </div>
         <div className="mt-2 border-t border-[#1c2739] pt-2">
@@ -284,6 +389,7 @@ export default function QuantPanel({ analysis }: { analysis: AnalysisResult | nu
               value={ou.z.toFixed(2)}
               color={Math.abs(ou.z) > 2 ? '#f59e0b' : Math.abs(ou.z) > 1.2 ? '#a78bfa' : '#e2e8f0'}
               note={ou.state !== 'neutral' ? ou.state.replace('-', ' ') : 'inside ±1.5σ'}
+              factor={ouFactor}
             />
             <Stat label="Half-life" value={`${ou.halfLifeBars >= 9999 ? '∞' : ou.halfLifeBars.toFixed(1)} bars`} note={`entry gate: fast enough to revert in-bar`} />
             <Stat label="κ reversion speed" value={ou.kappa.toFixed(4)} note="per bar" />
@@ -331,11 +437,14 @@ export default function QuantPanel({ analysis }: { analysis: AnalysisResult | nu
   )
 }
 
-function Stat({ label, value, color, note }: { label: string; value: string; color?: string; note?: string }) {
+function Stat({ label, value, color, note, factor }: { label: string; value: string; color?: string; note?: string; factor?: Factor }) {
   return (
     <div>
       <div className="text-[9px] uppercase tracking-wider text-[#4b5a72]">{label}</div>
-      <div style={{ color: color ?? '#e2e8f0' }}>{value}</div>
+      <div>
+        <span style={{ color: color ?? '#e2e8f0' }}>{value}</span>
+        <FactorBadge factor={factor} />
+      </div>
       {note && <div className="text-[8px] text-[#4b5a72]">{note}</div>}
     </div>
   )

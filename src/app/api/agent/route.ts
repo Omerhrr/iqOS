@@ -341,6 +341,59 @@ const TOOLS: ToolSpec[] = [
     },
   },
   {
+    name: 'order_flow',
+    description:
+      'Volume Profile (Point of Control, Value Area High/Low, per-price-bucket volume) and candle-delta / cumulative-delta for an asset+timeframe - the data behind the Order Flow panel. IMPORTANT: this is a CLV (close-location-value) approximation of buy/sell volume split from OHLCV candles, NOT real tick-level order-flow or order-book data - IQ Option exposes no bid/ask-tagged trades. Always frame any read from this as "(approx)". Pass {"metric":"volume_profile"} for POC/VAH/VAL/levels, {"metric":"delta"} for per-candle delta + cumulative delta, or omit metric for both.',
+    args: '{"asset": "EURUSD", "tf": "1m", "metric": "volume_profile|delta|both", "limit": 300, "buckets": 24}',
+    run: async (a) => {
+      const asset = String(a.asset ?? 'EURUSD')
+      const tf = String(a.tf ?? '1m')
+      const limit = Math.max(20, Math.min(2000, Number(a.limit) || 300))
+      const buckets = Math.max(10, Math.min(80, Number(a.buckets) || 24))
+      const metric = String(a.metric ?? 'both')
+      const out: Record<string, unknown> = { ok: true, asset, tf }
+      if (metric === 'volume_profile' || metric === 'both') {
+        const vp = (await coreGet(`/volume_profile?asset=${encodeURIComponent(asset)}&tf=${tf}&limit=${limit}&buckets=${buckets}`)) as {
+          ok: boolean
+          profile?: { poc: number; valueAreaHigh: number; valueAreaLow: number; totalVolume: number; levels: { price: number; volume: number }[] }
+          error?: string
+        }
+        if (vp.ok && vp.profile) {
+          const topLevels = [...vp.profile.levels].sort((x, y) => y.volume - x.volume).slice(0, 5)
+          out.volumeProfile = {
+            poc: vp.profile.poc,
+            valueAreaHigh: vp.profile.valueAreaHigh,
+            valueAreaLow: vp.profile.valueAreaLow,
+            totalVolumeApprox: Math.round(vp.profile.totalVolume),
+            topVolumeLevels: topLevels.map((l) => ({ price: l.price, volumeApprox: Math.round(l.volume) })),
+          }
+        } else {
+          out.volumeProfile = { error: vp.error ?? 'unavailable' }
+        }
+      }
+      if (metric === 'delta' || metric === 'both') {
+        const d = (await coreGet(`/delta?asset=${encodeURIComponent(asset)}&tf=${tf}&limit=${limit}`)) as {
+          ok: boolean
+          deltas?: { time: number; delta: number }[]
+          cumulative?: { time: number; cumulativeDelta: number }[]
+          error?: string
+        }
+        if (d.ok && d.deltas && d.cumulative) {
+          const recent = d.deltas.slice(-10)
+          out.delta = {
+            lastCandleDeltaApprox: Math.round((recent[recent.length - 1]?.delta ?? 0) * 100) / 100,
+            last10SumApprox: Math.round(recent.reduce((s, x) => s + x.delta, 0) * 100) / 100,
+            cumulativeDeltaNowApprox: Math.round((d.cumulative[d.cumulative.length - 1]?.cumulativeDelta ?? 0) * 100) / 100,
+            note: 'CLV-based buy/sell split approximation, not real order-flow',
+          }
+        } else {
+          out.delta = { error: d.error ?? 'unavailable' }
+        }
+      }
+      return out
+    },
+  },
+  {
     name: 'multi_timeframe',
     description: 'Analyze one asset across 4 timeframes (5m, 15m, 1h, 4h) and get each composite signal - the classic MTF confluence read. Use before recommending a trade.',
     args: '{"asset": "BTCUSD"}',
@@ -1917,6 +1970,7 @@ The OS also ships TWO sibling 4-layer SYNTHESIS stacks, both exposed as indicato
 2) TSK SYNTHESIS - the VOLUME-FREE sibling: L1 is a least-squares TRENDLINE z-score (price stretched N sigmas off the fitted trend = deviation channel; needs no volume at all) with the same L2 squeeze / L3 Kalman / L4 PSAR-on-curve layers. Indicators "tsk" / "tsk-z", strategy "tsk-synthesis", stress test tsk_montecarlo.
 All of them work in run_strategy / backtest / optimize_strategy / walkforward / asset_sweep / bot_create. When the user says "the algorithm", "the 4-layer stack", "VSK", "TSK", "trendline version" or asks to stress-test one, use those tools and explain which layer is blocking or firing (the strategy result notes name the layer). Prefer TSK when the user wants volume independence, VSK when volume weighting matters.
 SEVEN MORE BUILTIN STRATEGIES (same tools as above): "ichimoku-cloud" (price vs the senkou cloud + tenkan/kijun cross, thin-cloud crosses scored down), "vwap-reversion" (fades the z-score stretch from VWAP - the cheap cross-check against kalman-ou-reversion on the same instrument), "keltner-chandelier" (ATR-scaled channel breakout, reports the Chandelier Exit line as an invalidation reference since the binary engine is fixed-expiry, not trailing-stop), "mtf-alignment" (resamples the SAME feed into synthetic 5x/15x bars and requires minAgree of the 3 EMA(8/21) reads to agree - the confluence_read MTF idea as a deployable strategy), "vol-squeeze-breakout" (plain Bollinger-width squeeze-then-breakout - the simpler single-layer baseline to check whether VSK/TSK's extra Kalman/PSAR machinery earns its keep on a given instrument), "liquidity-sweep-reversal" (fires on a wick through a real supportResistance() zone that closes back inside it - a stop-hunt rejection, unlike Pattern Confluence which has no concept of WHERE on the chart a pattern fired), and "garch-vol-expansion" (the expansion mirror of kalman-ou-vol-regime, which fades compression - this one trades WITH momentum when GARCH/EWMA vol ratio clears 1.3, the same threshold regime_playbook uses for its VOLATILE classification).
+ORDER FLOW (approx) - use the order_flow tool to pull Volume Profile (Point of Control, Value Area High/Low, per-price-bucket volume) and candle delta / cumulative delta for an asset+timeframe, the same data behind the Order Flow panel on the chart. This is a CLV (close-location-value) approximation of buy/sell volume split from OHLCV candles, NOT real tick-level order-flow or order-book depth - IQ Option exposes no bid/ask-tagged trades, so always caveat any read from it as "(approx)". THREE MORE BUILTIN STRATEGIES use this data: "poc-reversion" (CALL when price has stretched below the recent Point of Control with delta turning positive, PUT the mirror above POC), "value-area-breakout" (CALL/PUT on a close outside the Value Area High/Low, scored up when supporting delta confirms the breakout and down when delta doesn't), and "delta-divergence" (PUT when price makes a new local high but cumulative delta fails to confirm it, CALL the mirror at a new local low) - all three show up in list_strategies/run_strategy/backtest like any other builtin. The AI Lab's signal DSL also gained an order-flow family (ind: "ofdelta"/"ofcumdelta"/"ofpocdist"/"ofvapos", same indicator-signal shape as rsi/zscore/etc.) so lab_learn/create_strategy can discover edge in delta, cumulative-delta slope, POC distance or value-area position automatically alongside every other indicator family.
 ENSEMBLE (strategy id "ensemble-vote", params: members = comma-separated builtin strategy ids e.g. "ema-trend,rsi-reversion,markov-edge", voteMinScore = per-member score to count as a vote (default 40), minAgree = how many members must agree (default 2)) trades only the INTERSECTION of independent edges: it runs each member strategy on the same candles and only fires when minAgree+ of them agree on direction, scoring the average of the agreeing members' scores with a small consensus discount when agreement is right at the floor. Use it when the user wants higher precision at the cost of fewer signals ("I want fewer but more confident trades", "only trade when multiple things agree") - suggest 2-3 members that capture DIFFERENT signal types (e.g. one trend strategy + one mean-reversion + one Markov/statistical one) rather than near-duplicates, since correlated members defeat the point of voting. Always walkforward-validate the ensemble itself (not just its members individually) before arming a bot on it - member edges can each be real without their intersection being tradeable, and the research gate below enforces this anyway.
 CRITICAL - "members" is NOT a sweep key, it's a fixed param: members is a comma-separated id LIST, not a numeric range, so it can never go inside optimize_strategy/walkforward's "sweep" object (sweep only does from/to/step over numbers). To test YOUR chosen members (not the strategy's own default "ema-trend,rsi-reversion,markov-edge"), you MUST pass them in the separate "params" argument, e.g. walkforward with strategy "ensemble-vote" and params {"members":"pattern-confluence,confluence-full","minAgree":2,"voteMinScore":40}. Putting members inside "sweep" or leaving it out of the call entirely silently reverts to the default trio - always re-read the result's bestParams.members back before reporting a verdict, and if it doesn't match what you intended to test, STOP and say so rather than reporting a verdict on a different ensemble than the one discussed.
 STRUCTURAL chart tools (drawing-tool family, category "structural" in list_indicators): "pivots" (floor pivot points PP/R1-R3/S1-S3, variants classic/fibonacci/camarilla/woodie, session-based), "fib" (auto Fibonacci retracement 0-100% + 1.272/1.618 extensions of the last swing), "trendlines" (auto S/R trendlines from fractal swing pivots), "fvg" (fair value gaps - 3-bar imbalance zones tracked until filled). Add them to the user's chart with ui_control when they ask for pivot points, fibonacci, trendlines or liquidity gaps - e.g. add pivots + fib before a level-based read.

@@ -10,6 +10,7 @@ import { vskEvaluate, VSK_DEFAULTS } from '../analytics/vsk'
 import { tskEvaluate, TSK_DEFAULTS } from '../analytics/tsk'
 import { confluenceSignalOnly } from '../analytics/engine'
 import { findPivots } from '../analytics/chart-patterns'
+import { computeCandleDelta, computeCumulativeDelta, computeVolumeProfile } from '../analytics/orderflow'
 
 const last = (arr: number[]): number => {
   for (let i = arr.length - 1; i >= 0; i--) if (Number.isFinite(arr[i])) return arr[i]
@@ -1100,6 +1101,142 @@ export const STRATEGIES: StrategyDef[] = [
         score,
         notes: `downtrend (LH/LL), pullback to ${nearestResistance ? 'resistance' : 'pivot'} ${level.toFixed(5)}${touches ? ` (${touches} touches)` : ''}, rejection confirmed`,
       }
+    },
+  },
+  {
+    id: 'poc-reversion',
+    name: 'POC Reversion (Order Flow, approx)',
+    description:
+      'Volume-profile mean reversion: CALL when price has stretched meaningfully below the recent Point of Control (the high-volume node price tends to gravitate back toward) AND the most recent bars show buy-side delta turning positive (a confirming nudge, not just "far from POC"); PUT is the symmetric case above POC with delta turning negative. Volume profile and buy/sell delta are CLV-based approximations from OHLCV candles (see analytics/orderflow.ts) - IQ Option exposes no real order-book/tick data, so this is NOT institutional order flow, just a candle-level proxy for where volume (approx) has concentrated.',
+    params: [
+      { key: 'profileWindow', label: 'Volume profile window (bars)', type: 'number', min: 20, max: 300, default: 80 },
+      { key: 'buckets', label: 'Profile buckets', type: 'number', min: 10, max: 60, default: 24 },
+      { key: 'minDistAtr', label: 'Min distance from POC (x ATR)', type: 'number', min: 0.3, max: 4, step: 0.1, default: 1 },
+      { key: 'confirmBars', label: 'Delta confirmation window (bars)', type: 'number', min: 1, max: 10, default: 3 },
+    ],
+    evaluate: (candles, p) => {
+      const window = Math.round(num(p, 'profileWindow', 80))
+      const buckets = Math.round(num(p, 'buckets', 24))
+      const minDistAtr = num(p, 'minDistAtr', 1)
+      const confirmBars = Math.round(num(p, 'confirmBars', 3))
+      const n = candles.length
+      if (n < window + 5) return { direction: 'none', score: 0, notes: 'warming up' }
+      const slice = candles.slice(-window)
+      const vp = computeVolumeProfile(slice, { bucketCount: buckets })
+      const h = candles.map((k) => k.high)
+      const l = candles.map((k) => k.low)
+      const c = candles.map((k) => k.close)
+      const atrArr = ta.atr(h, l, c, 14)
+      const i = n - 1
+      const atrVal = atrArr[i] || c[i] * 0.001
+      const price = c[i]
+      const distAtr = (price - vp.poc) / atrVal
+      const confirmDeltas = computeCandleDelta(candles.slice(-confirmBars))
+      const deltaSum = confirmDeltas.reduce((s, d) => s + d.delta, 0)
+      if (distAtr <= -minDistAtr && deltaSum > 0) {
+        const score = clamp(48 + (Math.abs(distAtr) - minDistAtr) * 16, 42, 92)
+        return { direction: 'call', score, notes: `${Math.abs(distAtr).toFixed(2)}x ATR below POC ${vp.poc.toFixed(5)}, delta turning positive (approx)` }
+      }
+      if (distAtr >= minDistAtr && deltaSum < 0) {
+        const score = clamp(48 + (Math.abs(distAtr) - minDistAtr) * 16, 42, 92)
+        return { direction: 'put', score, notes: `${Math.abs(distAtr).toFixed(2)}x ATR above POC ${vp.poc.toFixed(5)}, delta turning negative (approx)` }
+      }
+      return { direction: 'none', score: 0, notes: `${distAtr.toFixed(2)}x ATR from POC ${vp.poc.toFixed(5)} - no qualifying stretch+delta confirmation` }
+    },
+  },
+  {
+    id: 'value-area-breakout',
+    name: 'Value Area Breakout (Order Flow, approx)',
+    description:
+      'Trades a close outside the recent Value Area (the band holding ~70% of volume around the POC): CALL above Value Area High, PUT below Value Area Low. A breakout accompanied by strong supporting delta (buy pressure on a VAH break, sell pressure on a VAL break) scores meaningfully higher than a bare breakout with weak/contrary delta - the order-flow equivalent of "the move has volume behind it". Volume profile and delta are CLV-based approximations (see analytics/orderflow.ts), not real tick/order-book data.',
+    params: [
+      { key: 'profileWindow', label: 'Volume profile window (bars)', type: 'number', min: 20, max: 300, default: 80 },
+      { key: 'buckets', label: 'Profile buckets', type: 'number', min: 10, max: 60, default: 24 },
+      { key: 'confirmBars', label: 'Delta confirmation window (bars)', type: 'number', min: 1, max: 10, default: 3 },
+    ],
+    evaluate: (candles, p) => {
+      const window = Math.round(num(p, 'profileWindow', 80))
+      const buckets = Math.round(num(p, 'buckets', 24))
+      const confirmBars = Math.round(num(p, 'confirmBars', 3))
+      const n = candles.length
+      if (n < window + 5) return { direction: 'none', score: 0, notes: 'warming up' }
+      // profile computed on the window EXCLUDING the live bar, so the
+      // breakout is measured against a profile that doesn't already bake
+      // the breakout bar itself into the value area.
+      const slice = candles.slice(-window - 1, -1)
+      const vp = computeVolumeProfile(slice, { bucketCount: buckets })
+      const c = candles.map((k) => k.close)
+      const price = c[n - 1]
+      const confirmDeltas = computeCandleDelta(candles.slice(-confirmBars))
+      const deltaSum = confirmDeltas.reduce((s, d) => s + d.delta, 0)
+      const totalVol = confirmDeltas.reduce((s, d) => s + d.buyVolume + d.sellVolume, 0) || 1
+      const deltaRatio = deltaSum / totalVol // -1..1, sign/strength of supporting flow
+      if (price > vp.valueAreaHigh) {
+        const bonus = deltaRatio > 0 ? deltaRatio * 35 : deltaRatio * 20 // weaker penalty than bonus strength, but contrary delta still hurts
+        const score = clamp(55 + bonus, 40, 94)
+        return {
+          direction: 'call',
+          score,
+          notes: `closed above VAH ${vp.valueAreaHigh.toFixed(5)}${deltaRatio > 0.1 ? ', supporting buy delta (approx)' : deltaRatio < -0.1 ? ', delta NOT confirming (approx) - weaker' : ''}`,
+        }
+      }
+      if (price < vp.valueAreaLow) {
+        const bonus = deltaRatio < 0 ? -deltaRatio * 35 : -deltaRatio * 20
+        const score = clamp(55 + bonus, 40, 94)
+        return {
+          direction: 'put',
+          score,
+          notes: `closed below VAL ${vp.valueAreaLow.toFixed(5)}${deltaRatio < -0.1 ? ', supporting sell delta (approx)' : deltaRatio > 0.1 ? ', delta NOT confirming (approx) - weaker' : ''}`,
+        }
+      }
+      return { direction: 'none', score: 0, notes: `inside value area [${vp.valueAreaLow.toFixed(5)}, ${vp.valueAreaHigh.toFixed(5)}]` }
+    },
+  },
+  {
+    id: 'delta-divergence',
+    name: 'Delta Divergence (Order Flow, approx)',
+    description:
+      'Classic order-flow divergence, approximated from CLV-based candle delta: PUT when price makes a new local high over the lookback window but cumulative delta does NOT make a new high over the same window (buying pressure failing to confirm the new high - bearish divergence); CALL is the symmetric case (new local low in price, cumulative delta NOT making a new low - selling pressure failing to confirm). This is a candle-level CLV approximation of real tick-level order-flow divergence (see analytics/orderflow.ts) - IQ Option exposes no genuine buy/sell-tagged trade data.',
+    params: [
+      { key: 'lookback', label: 'Divergence lookback (bars)', type: 'number', min: 10, max: 120, default: 30 },
+      { key: 'minGapAtr', label: 'Min price extreme gap (x ATR)', type: 'number', min: 0, max: 2, step: 0.05, default: 0.1 },
+    ],
+    evaluate: (candles, p) => {
+      const lookback = Math.round(num(p, 'lookback', 30))
+      const minGapAtr = num(p, 'minGapAtr', 0.1)
+      const n = candles.length
+      if (n < lookback + 5) return { direction: 'none', score: 0, notes: 'warming up' }
+      const window = candles.slice(-lookback)
+      const deltas = computeCandleDelta(window)
+      const cum = computeCumulativeDelta(deltas)
+      const h = candles.map((k) => k.high)
+      const l = candles.map((k) => k.low)
+      const c = candles.map((k) => k.close)
+      const atrArr = ta.atr(h, l, c, 14)
+      const i = n - 1
+      const atrVal = atrArr[i] || c[i] * 0.001
+      const priceHigh = Math.max(...window.map((k) => k.high))
+      const priceLow = Math.min(...window.map((k) => k.low))
+      const cumMax = Math.max(...cum.map((d) => d.cumulativeDelta))
+      const cumMin = Math.min(...cum.map((d) => d.cumulativeDelta))
+      const lastHigh = window[window.length - 1].high
+      const lastLow = window[window.length - 1].low
+      const lastCum = cum[cum.length - 1].cumulativeDelta
+      const priceAtNewHigh = lastHigh >= priceHigh - 1e-9 && (lastHigh - Math.max(...window.slice(0, -1).map((k) => k.high))) >= minGapAtr * atrVal
+      const priceAtNewLow = lastLow <= priceLow + 1e-9 && (Math.min(...window.slice(0, -1).map((k) => k.low)) - lastLow) >= minGapAtr * atrVal
+      const deltaFailsHigh = lastCum < cumMax - 1e-9
+      const deltaFailsLow = lastCum > cumMin + 1e-9
+      if (priceAtNewHigh && deltaFailsHigh) {
+        const gap = (cumMax - lastCum) / (Math.abs(cumMax) + 1e-9)
+        const score = clamp(50 + gap * 60, 42, 90)
+        return { direction: 'put', score, notes: `new ${lookback}b price high, cumulative delta (approx) failed to confirm - bearish divergence` }
+      }
+      if (priceAtNewLow && deltaFailsLow) {
+        const gap = (lastCum - cumMin) / (Math.abs(cumMin) + 1e-9)
+        const score = clamp(50 + gap * 60, 42, 90)
+        return { direction: 'call', score, notes: `new ${lookback}b price low, cumulative delta (approx) failed to confirm - bullish divergence` }
+      }
+      return { direction: 'none', score: 0, notes: 'no qualifying price/delta divergence this bar' }
     },
   },
 ]

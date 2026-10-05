@@ -31,6 +31,7 @@ import * as ta from '../analytics/indicators'
 import { detectPatterns } from '../analytics/patterns'
 import { trendPullbackSeries, rangeZoneSeries } from '../analytics/structure'
 import { getStrategy, defaultParams } from './builtin'
+import { computeCandleDelta, computeCumulativeDelta, computeVolumeProfile } from '../analytics/orderflow'
 
 // ---------- signal vocabulary ----------
 
@@ -99,6 +100,11 @@ export interface IndicatorSignal {
     | 'bandpos' // position inside a band, 0..1. params.type: keltner|envelope
     | 'volflow' // volume-flow accumulators, rolling z-scored. params.type: obv|ad|cmf|forceindex|eom|nvi|pvi|klinger|chaikinosc|vwapdist
     | 'levels' // signed distance to nearest static level/ATR. params.type: pivot|fib
+    // ---- order-flow (CLV-based approximation - see analytics/orderflow.ts; NOT real tick/order-book data) ----
+    | 'ofdelta' // rolling z-score of per-candle CLV buy/sell delta. params.period (default 20)
+    | 'ofcumdelta' // rolling z-score of cumulative-delta SLOPE (cum[i]-cum[i-lookback]). params.lookback (default 10), params.period (z-score window, default 20)
+    | 'ofpocdist' // (close - rolling Volume Profile POC) / ATR. params.period = profile window in bars (default 40)
+    | 'ofvapos' // (close - rolling Value Area Low) / (VAH - VAL): <0 below VAL, 0..1 inside the value area, >1 above VAH. params.period = profile window in bars (default 40)
   params?: Record<string, number> // period/fast/slow/mult per indicator
   type?: string // sub-selector for the generic families above (madist/osc0100/oscpm100/oscz/trenddist/bandpos/volflow/levels)
   /** '>'/'<' - the original single-threshold comparisons. 'between' - fires
@@ -774,6 +780,44 @@ export function indicatorSeries(s: IndicatorSignal, ctx: EvalCtx): number[] {
       }
       return out
     }
+    case 'ofdelta': {
+      // per-candle CLV-based buy/sell delta (approx), rolling z-scored like
+      // the other unbounded accumulator families above.
+      const period = Math.max(5, Math.round(num(p.period, 20)))
+      const deltas = computeCandleDelta(ctx.candles).map((d) => d.delta)
+      return rollingZ(deltas, period)
+    }
+    case 'ofcumdelta': {
+      // slope of cumulative delta over `lookback` bars, rolling z-scored -
+      // "is buy/sell pressure accelerating" rather than its raw (unbounded,
+      // path-dependent) level.
+      const lookback = Math.max(2, Math.round(num(p.lookback, 10)))
+      const period = Math.max(5, Math.round(num(p.period, 20)))
+      const cum = computeCumulativeDelta(computeCandleDelta(ctx.candles)).map((d) => d.cumulativeDelta)
+      const slope = cum.map((v, i) => (i >= lookback ? v - cum[i - lookback] : NaN))
+      return rollingZ(slope, period)
+    }
+    case 'ofpocdist':
+    case 'ofvapos': {
+      // Rolling volume profile over a trailing `period`-bar window, no
+      // lookahead (window ends at i). Capped bucket count keeps this
+      // affordable at the bar counts the learner/backtester scan.
+      const window = Math.max(10, Math.min(120, Math.round(num(p.period, 40))))
+      const out: number[] = new Array(ctx.n).fill(NaN)
+      for (let i = window; i < ctx.n; i++) {
+        const atrI = ctx.atr[i]
+        if (s.ind === 'ofpocdist' && !(atrI > 1e-12)) continue
+        const slice = ctx.candles.slice(i - window + 1, i + 1)
+        const vp = computeVolumeProfile(slice, { bucketCount: 16 })
+        if (s.ind === 'ofpocdist') {
+          out[i] = (ctx.close[i] - vp.poc) / atrI
+        } else {
+          const span = vp.valueAreaHigh - vp.valueAreaLow
+          out[i] = span > 1e-12 ? (ctx.close[i] - vp.valueAreaLow) / span : NaN
+        }
+      }
+      return out
+    }
   }
 }
 
@@ -809,6 +853,15 @@ export function labelOf(s: SignalDef): string {
       // (this is the exact complaint that led to adding this special case).
       if (s.ind === 'trendpullback') return s.dir === 'call' ? 'Trend Pullback (Bull Continuation)' : 'Trend Pullback (Bear Continuation)'
       if (s.ind === 'rangezone') return s.dir === 'call' ? 'Range Buy Zone' : 'Range Sell Zone'
+      if (s.ind === 'ofdelta' || s.ind === 'ofcumdelta' || s.ind === 'ofpocdist' || s.ind === 'ofvapos') {
+        const name = { ofdelta: 'Delta (approx)', ofcumdelta: 'Cumulative Delta Slope (approx)', ofpocdist: 'POC Distance (approx)', ofvapos: 'Value Area Position (approx)' }[s.ind]
+        if (s.op === 'between' || s.op === 'outside') {
+          const lo = Math.min(s.threshold, s.threshold2 ?? s.threshold)
+          const hi = Math.max(s.threshold, s.threshold2 ?? s.threshold)
+          return `${name} ${s.op} [${lo}, ${hi}]`
+        }
+        return `${name} ${s.op} ${s.threshold}`
+      }
       const p = s.params ?? {}
       const pd = p.period ?? p.fast
       const tag = s.type ? `:${s.type}` : ''
@@ -1086,6 +1139,7 @@ const KNOWN_INDS = new Set([
   // any signal using either one was being silently dropped right here on
   // every save, regardless of everything else working correctly.
   'trendpullback', 'rangezone',
+  'ofdelta', 'ofcumdelta', 'ofpocdist', 'ofvapos',
 ])
 // valid params.type values per generic family - inline specs outside this
 // set silently fall back to indicatorSeries' own per-family default rather

@@ -728,6 +728,24 @@ export function labelOfSignal(s: LabSignalDef, strategies?: StrategyInfo[]): str
       // list full of cryptic "ind op threshold" rows like everything else).
       if (s.ind === 'trendpullback') return s.dir === 'call' ? 'Trend Pullback (Bull Continuation)' : 'Trend Pullback (Bear Continuation)'
       if (s.ind === 'rangezone') return s.dir === 'call' ? 'Range Buy Zone' : 'Range Sell Zone'
+      // order-flow (CLV-based approximation) families - see
+      // trading-core's analytics/orderflow.ts and strategies/custom.ts labelOf()
+      if (s.ind === 'ofdelta' || s.ind === 'ofcumdelta' || s.ind === 'ofpocdist' || s.ind === 'ofvapos') {
+        const ofName = (
+          {
+            ofdelta: 'Delta (approx)',
+            ofcumdelta: 'Cumulative Delta Slope (approx)',
+            ofpocdist: 'POC Distance (approx)',
+            ofvapos: 'Value Area Position (approx)',
+          } as Record<string, string>
+        )[s.ind]
+        if (s.op === 'between' || s.op === 'outside') {
+          const lo = Math.min(s.threshold, s.threshold2 ?? s.threshold)
+          const hi = Math.max(s.threshold, s.threshold2 ?? s.threshold)
+          return `${ofName} ${s.op} [${lo}, ${hi}]`
+        }
+        return `${ofName} ${s.op} ${s.threshold}`
+      }
       const p = s.params ?? {}
       const pd = p.period ?? p.fast
       const tag = s.type ? `:${s.type}` : ''
@@ -862,6 +880,16 @@ export const SIGNAL_TEMPLATES: LabSignalDef[] = [
   { kind: 'indicator', ind: 'volflow', type: 'vwapdist', op: '<', threshold: -0.2, dir: 'put', weight: 10 },
   { kind: 'indicator', ind: 'levels', type: 'pivot', op: '>', threshold: 0.3, dir: 'call', weight: 10 },
   { kind: 'indicator', ind: 'levels', type: 'pivot', op: '<', threshold: -0.3, dir: 'put', weight: 10 },
+  // order flow (CLV-based approximation - see analytics/orderflow.ts; no
+  // real tick/order-book data exists on this platform)
+  { kind: 'indicator', ind: 'ofdelta', params: { period: 20 }, op: '>', threshold: 1, dir: 'call', weight: 10 },
+  { kind: 'indicator', ind: 'ofdelta', params: { period: 20 }, op: '<', threshold: -1, dir: 'put', weight: 10 },
+  { kind: 'indicator', ind: 'ofcumdelta', params: { lookback: 10, period: 20 }, op: '>', threshold: 1, dir: 'call', weight: 10 },
+  { kind: 'indicator', ind: 'ofcumdelta', params: { lookback: 10, period: 20 }, op: '<', threshold: -1, dir: 'put', weight: 10 },
+  { kind: 'indicator', ind: 'ofpocdist', params: { period: 40 }, op: '<', threshold: -1.2, dir: 'call', weight: 10 },
+  { kind: 'indicator', ind: 'ofpocdist', params: { period: 40 }, op: '>', threshold: 1.2, dir: 'put', weight: 10 },
+  { kind: 'indicator', ind: 'ofvapos', params: { period: 40 }, op: '>', threshold: 1.05, dir: 'call', weight: 10 },
+  { kind: 'indicator', ind: 'ofvapos', params: { period: 40 }, op: '<', threshold: -0.05, dir: 'put', weight: 10 },
 ]
 
 export interface LabSpec {
