@@ -434,6 +434,35 @@ export class ExecutionService {
       }
       if (!data.ok) return { ok: false, error: data.error ?? 'sidecar rejected trade' }
       const orderId = String(data.order_id)
+      // THE REROUTE BUG: the sidecar's /trade handler silently reroutes an
+      // options-family order to whichever instrument family the account
+      // actually offers for that ticker (binary/turbo requested but only
+      // available as digital-option on this account, or vice versa - see
+      // iqair_sidecar.py's /trade handler) and echoes the family it ACTUALLY
+      // used back as `data.mode`. We used to ignore that echo and keep
+      // `kind` exactly as requested, so a binary-kind order silently placed
+      // as digital-option kept `pos.kind === 'binary'` forever. Every later
+      // lookup keys off `pos.kind` - settleLiveExpiry's /order_result call
+      // narrows IQ's history search to ["binary-option","turbo-option"],
+      // which never includes "digital-option" - so a rerouted order's
+      // settlement can NEVER be found there no matter how many pages get
+      // checked: the trade genuinely isn't in the itype family being
+      // searched. Symptom: "still awaiting IQ confirmation ...s past
+      // expected expiry - holding, no history recorded yet", forever, for
+      // exactly the instruments (often OTC pairs) an account only carries
+      // on one side of the binary/turbo vs digital split.
+      // Fix: trust the echoed mode for the options family (cfd/forex/etc.
+      // never reroute, so leave those as requested) and settle/close/payout
+      // against the instrument IQ actually opened, not the one we asked for.
+      const effectiveKind: TradeKind = isCfd
+        ? kind
+        : data.mode === 'digital-option'
+          ? 'digital'
+          : data.mode === 'turbo-option' || data.mode === 'turbo'
+            ? 'turbo'
+            : data.mode === 'binary-option' || data.mode === 'binary'
+              ? 'binary'
+              : kind
       // The broker echoes the REAL expiration (minute-boundary aligned) - IQ
       // may settle up to ~30s either side of our now+N*60 estimate.
       const nowS = this.now()
@@ -447,16 +476,16 @@ export class ExecutionService {
         asset: req.asset,
         tf: req.tf ?? '1m',
         side: req.side,
-        kind,
+        kind: effectiveKind,
         mode: 'live',
         amount: req.amount,
         expiryBars: req.expiryBars ?? 1,
         entryPrice: this.market.getPrice(req.asset),
-        payout: kind === 'digital' ? this.market.payoutFor(req.asset, 'digital') : kind === 'turbo' ? this.market.payoutFor(req.asset, 'turbo') : kind === 'cfd' ? 1 : this.market.payoutFor(req.asset, 'binary'),
+        payout: effectiveKind === 'digital' ? this.market.payoutFor(req.asset, 'digital') : effectiveKind === 'turbo' ? this.market.payoutFor(req.asset, 'turbo') : effectiveKind === 'cfd' ? 1 : this.market.payoutFor(req.asset, 'binary'),
         status: 'open',
         leverage: isCfd ? req.leverage ?? info?.leverage ?? 10 : undefined,
-        strike: kind === 'digital' && req.strikeOffsetPct ? this.market.getPrice(req.asset) * (1 + (req.side === 'call' ? req.strikeOffsetPct : -req.strikeOffsetPct) / 100) : undefined,
-        expirySec: kind === 'digital' ? expirySec : undefined,
+        strike: effectiveKind === 'digital' && req.strikeOffsetPct ? this.market.getPrice(req.asset) * (1 + (req.side === 'call' ? req.strikeOffsetPct : -req.strikeOffsetPct) / 100) : undefined,
+        expirySec: effectiveKind === 'digital' ? expirySec : undefined,
         tp: req.tp,
         sl: req.sl,
         liveOrderId: orderId,

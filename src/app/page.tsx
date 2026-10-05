@@ -14,6 +14,7 @@ import IndicatorPicker from '@/components/os/IndicatorPicker'
 import SubPane from '@/components/os/SubPane'
 import SignalPanel from '@/components/os/SignalPanel'
 import MarkovPanel from '@/components/os/MarkovPanel'
+import { DeltaFootprintView } from '@/components/os/OrderFlowPanel'
 import QuantPanel from '@/components/os/QuantPanel'
 import TradeTicket from '@/components/os/TradeTicket'
 import Copilot from '@/components/os/Copilot'
@@ -74,6 +75,10 @@ export default function OSPage() {
   const [assets, setAssets] = useState<AssetRow[]>([])
   const [asset, setAsset] = useState('EURUSD')
   const [tf, setTf] = useState<Timeframe>('1m')
+  // which panel shows in the Markov-Chain slot next to Confluence Signal -
+  // additive toggle, defaults to the existing Markov view so nothing changes
+  // for users who never touch it
+  const [markovSlotView, setMarkovSlotView] = useState<'markov' | 'delta'>('markov')
   const assetRef = useRef(asset)
   const [candles, setCandles] = useState<Candle[]>([])
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null)
@@ -801,7 +806,34 @@ export default function OSPage() {
                   <Panel defaultSize={16} minSize={10}>
                     <div className="grid h-full min-h-0 grid-cols-2 grid-rows-[minmax(0,1fr)] gap-2 overflow-hidden">
                       <SignalPanel analysis={analysis} />
-                      <MarkovPanel markov={analysis?.markov ?? null} />
+                      <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-lg border border-[#1c2739] bg-[#0b111c]">
+                        <div className="flex items-center gap-1 border-b border-[#1c2739] px-2 py-1">
+                          {(
+                            [
+                              ['markov', 'Markov'],
+                              ['delta', 'Delta'],
+                            ] as [typeof markovSlotView, string][]
+                          ).map(([v, label]) => (
+                            <button
+                              key={v}
+                              type="button"
+                              onClick={() => setMarkovSlotView(v)}
+                              className={`rounded px-2 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wider transition-colors ${
+                                markovSlotView === v ? 'bg-cyan-500/15 text-cyan-300' : 'text-[#4b5a72] hover:text-[#aab6cc]'
+                              }`}
+                            >
+                              {label}
+                            </button>
+                          ))}
+                        </div>
+                        <div className="min-h-0 flex-1 overflow-hidden">
+                          {markovSlotView === 'markov' ? (
+                            <MarkovPanel markov={analysis?.markov ?? null} />
+                          ) : (
+                            <DeltaFootprintView asset={asset} tf={tf} />
+                          )}
+                        </div>
+                      </div>
                     </div>
                   </Panel>
                   {hHandle}

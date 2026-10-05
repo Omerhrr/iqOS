@@ -134,7 +134,10 @@ function Legend({ label, color, value }: { label: string; color: string; value: 
   )
 }
 
-function DeltaView({ asset, tf }: OrderFlowPanelProps) {
+// Exported standalone so it can be reused outside the full Order Flow tab
+// (e.g. the Markov/Delta switcher next to Confluence Signal) without pulling
+// in Volume Profile or the tab chrome around it.
+export function DeltaFootprintView({ asset, tf }: OrderFlowPanelProps) {
   const [deltas, setDeltas] = useState<CandleDelta[]>([])
   const [cumulative, setCumulative] = useState<CumulativeDeltaPoint[]>([])
   const [error, setError] = useState<string | null>(null)
@@ -255,7 +258,7 @@ export default function OrderFlowPanel({ asset, tf }: OrderFlowPanelProps) {
         <span className="ml-auto text-[9px] text-[#3d4c66]">{asset} · {tf}</span>
       </div>
       <div className="min-h-0 flex-1 overflow-auto">
-        {view === 'profile' ? <VolumeProfileView asset={asset} tf={tf} /> : <DeltaView asset={asset} tf={tf} />}
+        {view === 'profile' ? <VolumeProfileView asset={asset} tf={tf} /> : <DeltaFootprintView asset={asset} tf={tf} />}
       </div>
     </div>
   )
