@@ -285,6 +285,16 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
   const [manualSelected, setManualSelected] = useState<Set<string>>(new Set())
   const [manualGroupDir, setManualGroupDir] = useState<'call' | 'put'>('call')
   const [manualGroupWeight, setManualGroupWeight] = useState(20)
+  const [manualGroupOp, setManualGroupOp] = useState<'and' | 'or'>('and')
+  // Building a group straight from the template picker - the natural way to
+  // ask for this ("pick Range Sell Zone, then pick Wide Bear Bar, then pick
+  // RSI > 70, make those act as one"): check "combine into group", then
+  // every "+ add signal" appends to this staging list instead of the main
+  // one; "finish group" below folds the staged signals into one group row.
+  // The row-select "combine selected" path further down stays too, for
+  // grouping signals that are already in the list.
+  const [manualGroupBuilding, setManualGroupBuilding] = useState(false)
+  const [manualGroupPending, setManualGroupPending] = useState<LabSignalDef[]>([])
   const [manualTemplateIdx, setManualTemplateIdx] = useState(0)
   const [manualIsCandle, setManualIsCandle] = useState(false)
   const [manualCandleName, setManualCandleName] = useState('')
@@ -355,7 +365,11 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
       onError('enter a candlestick pattern name (e.g. "Hammer", "Engulfing")')
       return
     }
-    setManualSignals((prev) => [...prev, { uid: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, def }])
+    if (manualGroupBuilding) {
+      setManualGroupPending((prev) => [...prev, def])
+    } else {
+      setManualSignals((prev) => [...prev, { uid: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, def }])
+    }
     if (manualIsCandle) setManualCandleName('')
   }
 
@@ -402,6 +416,26 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
     })
     setManualSelected(new Set())
   }
+
+  /** Fold the staged "+ add signal" picks into one group row, appended to
+   * the main list, and exit group-building mode. */
+  const finishGroupBuild = () => {
+    if (manualGroupPending.length < 2) {
+      onError('add at least 2 signals to the group before finishing it')
+      return
+    }
+    const group: LabSignalDef = { kind: 'group', op: manualGroupOp, signals: manualGroupPending, dir: manualGroupDir, weight: manualGroupWeight }
+    setManualSignals((prev) => [...prev, { uid: `${Date.now()}-grp-${Math.random().toString(36).slice(2, 6)}`, def: group }])
+    setManualGroupPending([])
+    setManualGroupBuilding(false)
+  }
+
+  const cancelGroupBuild = () => {
+    setManualGroupPending([])
+    setManualGroupBuilding(false)
+  }
+
+  const removePendingGroupMember = (idx: number) => setManualGroupPending((prev) => prev.filter((_, i) => i !== idx))
 
   /** Dissolve a group back into its member rows, each getting a fresh uid -
    * the undo for combineSelected, and the way to fix/rebuild a group that
@@ -935,6 +969,18 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
             <input type="checkbox" checked={manualIsCandle} onChange={(e) => setManualIsCandle(e.target.checked)} className="accent-violet-500" />
             custom candlestick pattern
           </label>
+          <label className="flex items-center gap-1.5 font-mono text-[10px] text-orange-300">
+            <input
+              type="checkbox"
+              checked={manualGroupBuilding}
+              onChange={(e) => {
+                if (!e.target.checked) cancelGroupBuild()
+                else setManualGroupBuilding(true)
+              }}
+              className="accent-orange-500"
+            />
+            combine into one group (AND/OR)
+          </label>
           {manualIsCandle ? (
             <label className="flex flex-col gap-0.5">
               <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">pattern name</span>
@@ -1002,8 +1048,16 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
             </select>
           </label>
           <NumField label="weight" value={manualWeight} onChange={setManualWeight} w="w-14" />
-          <Button onClick={addManualSignal} variant="outline" className="h-7 border-violet-500/40 px-3 text-[10px] font-bold uppercase tracking-wider text-violet-300 hover:bg-violet-500/10">
-            + add signal
+          <Button
+            onClick={addManualSignal}
+            variant="outline"
+            className={
+              manualGroupBuilding
+                ? 'h-7 border-orange-500/40 px-3 text-[10px] font-bold uppercase tracking-wider text-orange-300 hover:bg-orange-500/10'
+                : 'h-7 border-violet-500/40 px-3 text-[10px] font-bold uppercase tracking-wider text-violet-300 hover:bg-violet-500/10'
+            }
+          >
+            {manualGroupBuilding ? '+ add to group' : '+ add signal'}
           </Button>
           <Button
             onClick={() => (manualJsonMode ? setManualJsonMode(false) : openManualJson())}
@@ -1013,6 +1067,56 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
             {manualJsonMode ? 'back to builder' : '{ } edit as json'}
           </Button>
         </div>
+
+        {manualGroupBuilding && (
+          <div className="mt-2 rounded border border-orange-500/40 bg-orange-500/5 p-2">
+            <p className="mb-1.5 font-mono text-[9px] leading-relaxed text-orange-200">
+              Pick a signal template above and click &quot;+ add to group&quot; for each one you want combined (e.g. Range Sell Zone, then Wide Bear Bar, then
+              RSI &gt; 70) - they&apos;ll only count as one vote when they{' '}
+              {manualGroupOp === 'and' ? 'ALL fire on the same bar' : 'EITHER fires on the same bar'}. Need 2+ before finishing.
+            </p>
+            {manualGroupPending.length > 0 && (
+              <div className="mb-1.5 flex flex-wrap gap-1.5">
+                {manualGroupPending.map((def, i) => (
+                  <span key={i} className="flex items-center gap-1.5 rounded border border-orange-500/30 bg-[#101828] px-2 py-1 font-mono text-[10px]">
+                    <span className={`rounded border px-1 py-0.5 text-[8px] uppercase ${KIND_CHIP[def.kind] ?? 'text-[#7c8aa5] border-[#1c2739]'}`}>{def.kind}</span>
+                    <span className="text-[#dbe4f0]">{labelOfSignal(def)}</span>
+                    <button type="button" onClick={() => removePendingGroupMember(i)} className="text-[#4b5a72] hover:text-rose-400" title="remove">
+                      ✕
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
+            <div className="flex flex-wrap items-end gap-2">
+              <label className="flex flex-col gap-0.5">
+                <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">combine as</span>
+                <select value={manualGroupOp} onChange={(e) => setManualGroupOp(e.target.value as 'and' | 'or')} className="h-6 rounded border border-[#1c2739] bg-[#101828] px-1.5 font-mono text-[10px] text-[#dbe4f0]">
+                  <option value="and">AND - all must fire</option>
+                  <option value="or">OR - any one fires</option>
+                </select>
+              </label>
+              <label className="flex flex-col gap-0.5">
+                <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">group dir</span>
+                <select value={manualGroupDir} onChange={(e) => setManualGroupDir(e.target.value as 'call' | 'put')} className="h-6 rounded border border-[#1c2739] bg-[#101828] px-1.5 font-mono text-[10px] text-[#dbe4f0]">
+                  <option value="call">CALL</option>
+                  <option value="put">PUT</option>
+                </select>
+              </label>
+              <NumField label="group weight" value={manualGroupWeight} onChange={setManualGroupWeight} w="w-14" />
+              <Button
+                onClick={finishGroupBuild}
+                disabled={manualGroupPending.length < 2}
+                className="h-6 bg-orange-600 px-2 text-[9px] font-bold uppercase tracking-wider text-white hover:bg-orange-500 disabled:opacity-40"
+              >
+                finish group ({manualGroupPending.length})
+              </Button>
+              <button type="button" onClick={cancelGroupBuild} className="font-mono text-[9px] text-[#4b5a72] hover:text-rose-400">
+                cancel
+              </button>
+            </div>
+          </div>
+        )}
 
         {manualJsonMode && (
           <div className="mt-2 rounded border border-cyan-500/30 bg-[#0b1220] p-2">
@@ -1042,7 +1146,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
         {manualSignals.length >= 2 && (
           <div className="mt-2 flex flex-wrap items-end gap-2 rounded border border-orange-500/30 bg-orange-500/5 p-1.5">
             <span className="font-mono text-[9px] uppercase tracking-wider text-orange-300">
-              check 2+ signals below, then join them as one unit (fires only when they combine):
+              or: check 2+ signals already added below, then join THOSE as one unit:
             </span>
             <label className="flex flex-col gap-0.5">
               <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">group dir</span>
