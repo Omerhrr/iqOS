@@ -201,6 +201,39 @@ export async function getDelta(asset: string, tf: Timeframe, opts?: { limit?: nu
   return { deltas: d.deltas, cumulative: d.cumulative }
 }
 
+// ---------- candle math (candle blending / candlestick algebra) ----------
+// See trading-core/src/analytics/candlemath.ts for the exact blend rule
+// (Open=first, High=max, Low=min, Close=last) and the pattern-confirmed
+// "smart grouping" heuristic (a group is only reported when blending it
+// reveals a candlestick pattern that the raw, unblended candles don't show).
+
+export interface CandleMathBlend {
+  startIdx: number
+  endIdx: number
+  blended: Candle
+  patterns: string[]
+  rawPatterns: string[]
+}
+
+export interface CandleMathResult {
+  raw: Candle[]
+  blends: CandleMathBlend[]
+}
+
+export async function getCandleMath(
+  asset: string,
+  tf: Timeframe,
+  opts?: { limit?: number; maxGroup?: number },
+): Promise<CandleMathResult> {
+  const d = await osGet<{ ok: boolean; raw: Candle[]; blends: CandleMathBlend[] }>('/candle_math', {
+    asset,
+    tf,
+    limit: opts?.limit,
+    maxGroup: opts?.maxGroup,
+  })
+  return { raw: d.raw, blends: d.blends }
+}
+
 export interface CompositeSignal {
   asset: string
   tf: Timeframe

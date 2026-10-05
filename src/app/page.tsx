@@ -15,6 +15,7 @@ import SubPane from '@/components/os/SubPane'
 import SignalPanel from '@/components/os/SignalPanel'
 import MarkovPanel from '@/components/os/MarkovPanel'
 import { DeltaFootprintView } from '@/components/os/OrderFlowPanel'
+import CandleMathView from '@/components/os/CandleMathView'
 import { FullscreenBackdrop, FullscreenButton } from '@/components/os/FullscreenButton'
 import QuantPanel from '@/components/os/QuantPanel'
 import TradeTicket from '@/components/os/TradeTicket'
@@ -79,10 +80,15 @@ export default function OSPage() {
   // which panel shows in the Markov-Chain slot next to Confluence Signal -
   // additive toggle, defaults to the existing Markov view so nothing changes
   // for users who never touch it
-  const [markovSlotView, setMarkovSlotView] = useState<'markov' | 'delta'>('markov')
+  const [markovSlotView, setMarkovSlotView] = useState<'markov' | 'delta' | 'candlemath'>('markov')
   // the Delta view in that slot is cramped (small grid cell) - lets it zoom
   // into the same fullscreen overlay pattern used by Confluence Signal / Markov Chain
   const [deltaSlotFull, setDeltaSlotFull] = useState(false)
+  // same idea for the Candle Math sub-tab - kept as its own boolean (rather
+  // than generalizing deltaSlotFull into a shared "which sub-tab is full"
+  // flag) so the two fullscreen states stay independent and the existing
+  // Delta wiring above is untouched.
+  const [candleMathSlotFull, setCandleMathSlotFull] = useState(false)
   const assetRef = useRef(asset)
   const [candles, setCandles] = useState<Candle[]>([])
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null)
@@ -811,10 +817,17 @@ export default function OSPage() {
                     <div className="grid h-full min-h-0 grid-cols-2 grid-rows-[minmax(0,1fr)] gap-2 overflow-hidden">
                       <SignalPanel analysis={analysis} />
                       <>
-                        {deltaSlotFull && <FullscreenBackdrop onClose={() => setDeltaSlotFull(false)} />}
+                        {(deltaSlotFull || candleMathSlotFull) && (
+                          <FullscreenBackdrop
+                            onClose={() => {
+                              setDeltaSlotFull(false)
+                              setCandleMathSlotFull(false)
+                            }}
+                          />
+                        )}
                         <div
                           className={
-                            deltaSlotFull
+                            deltaSlotFull || candleMathSlotFull
                               ? 'fixed inset-4 z-50 flex flex-col overflow-hidden rounded-lg border border-[#1c2739] bg-[#0b111c] shadow-2xl'
                               : 'flex h-full min-h-0 flex-col overflow-hidden rounded-lg border border-[#1c2739] bg-[#0b111c]'
                           }
@@ -824,6 +837,7 @@ export default function OSPage() {
                               [
                                 ['markov', 'Markov'],
                                 ['delta', 'Delta'],
+                                ['candlemath', 'Candle Math'],
                               ] as [typeof markovSlotView, string][]
                             ).map(([v, label]) => (
                               <button
@@ -842,12 +856,19 @@ export default function OSPage() {
                                 <FullscreenButton active={deltaSlotFull} onToggle={() => setDeltaSlotFull((f) => !f)} />
                               </div>
                             )}
+                            {markovSlotView === 'candlemath' && (
+                              <div className="ml-auto">
+                                <FullscreenButton active={candleMathSlotFull} onToggle={() => setCandleMathSlotFull((f) => !f)} />
+                              </div>
+                            )}
                           </div>
                           <div className="min-h-0 flex-1 overflow-auto">
                             {markovSlotView === 'markov' ? (
                               <MarkovPanel markov={analysis?.markov ?? null} />
-                            ) : (
+                            ) : markovSlotView === 'delta' ? (
                               <DeltaFootprintView asset={asset} tf={tf} large={deltaSlotFull} />
+                            ) : (
+                              <CandleMathView asset={asset} tf={tf} large={candleMathSlotFull} />
                             )}
                           </div>
                         </div>

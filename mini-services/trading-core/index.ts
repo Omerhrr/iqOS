@@ -30,6 +30,7 @@ import { searchInstruments, UNIVERSE_STATS, getInstrument } from './src/universe
 import { listRegistry, computeIndicator, registrySize, getIndicatorDef } from './src/analytics/registry'
 import { detectChartPatterns } from './src/analytics/chart-patterns'
 import { computeVolumeProfile, computeCandleDelta, computeCumulativeDelta } from './src/analytics/orderflow'
+import { findSmartBlends } from './src/analytics/candlemath'
 import { buildCalibrationReport, type CalibrationStoreSlice } from './src/analytics/calibration'
 
 // Defaults to 3030 for local/Windows dev; the Docker deployment overrides
@@ -256,6 +257,19 @@ const httpServer = createServer(async (req, res) => {
         const deltas = computeCandleDelta(candles)
         const cumulative = computeCumulativeDelta(deltas)
         return json(200, { ok: true, asset, tf: timeframe, approx: true, deltas, cumulative })
+      }
+
+      // Candle Math (candle blending / candlestick algebra) - see
+      // analytics/candlemath.ts header for the exact blend rule and the
+      // pattern-confirmed "smart grouping" heuristic.
+      if (path === '/candle_math') {
+        const asset = q.get('asset') ?? market.activeAsset
+        const timeframe = tf(q.get('tf'))
+        const limit = Math.min(Number(q.get('limit') ?? 200), 1000)
+        const maxGroup = q.get('maxGroup') ? Math.max(2, Math.min(6, Number(q.get('maxGroup')))) : undefined
+        const candles = market.getCandles(asset, timeframe, limit)
+        const blends = findSmartBlends(candles, { maxGroup })
+        return json(200, { ok: true, asset, tf: timeframe, raw: candles, blends })
       }
 
       if (path === '/analysis') {
