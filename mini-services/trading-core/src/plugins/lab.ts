@@ -1026,6 +1026,19 @@ export const CANDIDATE_SIGNALS: SignalDef[] = [
   // static levels
   { kind: 'indicator', ind: 'levels', type: 'pivot', op: '>', threshold: 0.3, dir: 'call', weight: 10 },
   { kind: 'indicator', ind: 'levels', type: 'pivot', op: '<', threshold: -0.3, dir: 'put', weight: 10 },
+  // trending-market pullback (swing HH/HL or LH/LL structure + pullback near
+  // the last confirmed swing point) - learnable per-pair counterpart of the
+  // trend-structure-pullback builtin strategy. Two flank/leg presets so the
+  // learner can pick whichever matches a pair's typical swing size.
+  { kind: 'indicator', ind: 'trendpullback', params: { pivotFlank: 3, pullbackAtr: 0.75, minLegAtr: 2 }, op: '>', threshold: 0.05, dir: 'call', weight: 12 },
+  { kind: 'indicator', ind: 'trendpullback', params: { pivotFlank: 3, pullbackAtr: 0.75, minLegAtr: 2 }, op: '<', threshold: -0.05, dir: 'put', weight: 12 },
+  { kind: 'indicator', ind: 'trendpullback', params: { pivotFlank: 5, pullbackAtr: 1, minLegAtr: 3 }, op: '>', threshold: 0.05, dir: 'call', weight: 12 },
+  { kind: 'indicator', ind: 'trendpullback', params: { pivotFlank: 5, pullbackAtr: 1, minLegAtr: 3 }, op: '<', threshold: -0.05, dir: 'put', weight: 12 },
+  // ranging-market buy zone / sell zone - the sideways-channel counterpart.
+  { kind: 'indicator', ind: 'rangezone', params: { window: 40, rangeThreshold: 0.35, zoneAtr: 0.4 }, op: '>', threshold: 0.05, dir: 'call', weight: 12 },
+  { kind: 'indicator', ind: 'rangezone', params: { window: 40, rangeThreshold: 0.35, zoneAtr: 0.4 }, op: '<', threshold: -0.05, dir: 'put', weight: 12 },
+  { kind: 'indicator', ind: 'rangezone', params: { window: 60, rangeThreshold: 0.25, zoneAtr: 0.5 }, op: '>', threshold: 0.05, dir: 'call', weight: 12 },
+  { kind: 'indicator', ind: 'rangezone', params: { window: 60, rangeThreshold: 0.25, zoneAtr: 0.5 }, op: '<', threshold: -0.05, dir: 'put', weight: 12 },
 ]
 
 let labServiceInstance: StrategyLabService | null = null

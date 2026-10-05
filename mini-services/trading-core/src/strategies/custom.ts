@@ -29,6 +29,7 @@
 import type { Candle, Side, StrategyEval } from '../types'
 import * as ta from '../analytics/indicators'
 import { detectPatterns } from '../analytics/patterns'
+import { trendPullbackSeries, rangeZoneSeries } from '../analytics/structure'
 
 // ---------- signal vocabulary ----------
 
@@ -86,6 +87,8 @@ export interface IndicatorSignal {
     | 'bodypos' // (close - low) / range
     | 'psar' // Parabolic SAR trend distance: (close - sar) / ATR - positive above SAR (uptrend), negative below (downtrend)
     | 'fractal' // Williams Fractal breakout: (close - lastConfirmedFractalHigh)/ATR when breaking above resistance, (close - lastConfirmedFractalLow)/ATR when breaking below support, 0 otherwise
+    | 'trendpullback' // trending-market pullback: signed, nonzero only inside a confirmed HH/HL (bull) or LH/LL (bear) swing structure AND price pulled back near the last confirmed swing point - see analytics/structure.ts
+    | 'rangezone' // ranging-market buy/sell zone: signed, nonzero only while price is drifting sideways in a channel AND near its floor (buy zone, positive) or ceiling (sell zone, negative) - see analytics/structure.ts
     // ---- generic families covering the rest of analytics/indicators.ts (selected via params.type) ----
     | 'madist' // (close - MA)/ATR. params.type: sma|ema|wma|dema|tema|trima|kama|hma|vwma|zlema|t3|mcginley|linreg|midpoint
     | 'osc0100' // native 0..100 oscillator. params.type: stochk|stochd|willr|ultosc|aroonup|aroondown|mfi
@@ -449,6 +452,10 @@ export function indicatorSeries(s: IndicatorSignal, ctx: EvalCtx): number[] {
       }
       return out
     }
+    case 'trendpullback':
+      return trendPullbackSeries(ctx.candles, { pivotFlank: num(p.pivotFlank, 3), pullbackAtr: num(p.pullbackAtr, 0.75), minLegAtr: num(p.minLegAtr, 2) })
+    case 'rangezone':
+      return rangeZoneSeries(ctx.candles, { window: num(p.window, 40), rangeThreshold: num(p.rangeThreshold, 0.35), zoneAtr: num(p.zoneAtr, 0.4) })
     case 'madist': {
       const period = Math.max(2, Math.round(num(p.period, 20)))
       const type = s.type ?? 'ema'
