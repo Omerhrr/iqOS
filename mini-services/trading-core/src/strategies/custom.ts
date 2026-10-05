@@ -465,6 +465,12 @@ export function indicatorSeries(s: IndicatorSignal, ctx: EvalCtx): number[] {
         confirmMinProb: num(p.confirmMinProb, 0.55),
         confirmMinSamples: num(p.confirmMinSamples, 20),
         confirmSims: num(p.confirmSims, 500),
+        // Rolling, recency-weighted analog window (not lifetime-cumulative) -
+        // see analytics/structure.ts's header for why. Shrink confirmMaxPool
+        // and confirmDecayHalfLife together to make the gate react faster to
+        // a pair whose behavior around this setup is actively shifting.
+        confirmMaxPool: num(p.confirmMaxPool, 150),
+        confirmDecayHalfLife: num(p.confirmDecayHalfLife, 75),
       })
     case 'rangezone':
       return rangeZoneSeries(ctx.candles, {
@@ -476,6 +482,8 @@ export function indicatorSeries(s: IndicatorSignal, ctx: EvalCtx): number[] {
         confirmMinProb: num(p.confirmMinProb, 0.55),
         confirmMinSamples: num(p.confirmMinSamples, 20),
         confirmSims: num(p.confirmSims, 500),
+        confirmMaxPool: num(p.confirmMaxPool, 150),
+        confirmDecayHalfLife: num(p.confirmDecayHalfLife, 75),
       })
     case 'madist': {
       const period = Math.max(2, Math.round(num(p.period, 20)))

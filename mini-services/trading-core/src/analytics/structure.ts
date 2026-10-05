@@ -57,27 +57,57 @@ import { rng } from './quant'
 // evidence once its own `horizon`-bars-ahead bar has actually closed, and a
 // bar's episode is registered for future judging AFTER today's confirm
 // decision is made, so nothing ever judges itself.
+//
+// The analog pool is NOT allowed to grow forever: it's a bounded, recency-
+// weighted window rather than a lifetime-cumulative ledger. A cumulative
+// pool has a real failure mode - if a setup worked for its first 300
+// episodes and then the market's behavior around it genuinely shifted, 300
+// old wins keep outvoting the new losses for a long time, so the gate is
+// slow to notice the setup stopped working right when noticing matters
+// most. `confirmMaxPool` hard-caps how many analogs per direction are kept
+// at all (oldest drop off the back, like `confirmedHighs`/`confirmedLows`
+// above), and `confirmDecayHalfLife` additionally WEIGHTS the bootstrap
+// draw itself toward the most recent analogs within that window (an analog
+// `halfLife` episodes old is half as likely to be drawn as the newest one) -
+// so the probability estimate tracks the pair's CURRENT behavior, not its
+// entire history.
 export interface ConfirmParams {
   confirm?: boolean // apply the Monte Carlo analog gate at all (default true)
   confirmHorizon?: number // bars ahead an episode's outcome is measured over (default 5)
   confirmMinProb?: number // bootstrap-estimated P(favorable) an episode's analog pool must clear to keep firing (default 0.55)
   confirmMinSamples?: number // analog pool size below which the gate is a cold-start pass-through (default 20)
   confirmSims?: number // bootstrap resample draws (default 500)
+  confirmMaxPool?: number // hard cap on analogs kept per direction - oldest drop off once exceeded (default 150)
+  confirmDecayHalfLife?: number // recency half-life IN ANALOGS for the bootstrap draw's weighting (default half of confirmMaxPool; 0 = no decay, uniform draw across the window)
+}
+
+function weightedPick(pool: number[], weights: number[], totalWeight: number, draw: number): number {
+  let remaining = draw * totalWeight
+  for (let i = 0; i < pool.length; i++) {
+    remaining -= weights[i]
+    if (remaining <= 0) return pool[i]
+  }
+  return pool[pool.length - 1]
 }
 
 /** Exported for direct testing/reuse - see the module header for the full
  * explanation of what this does and why it's safe (non-repainting, cold
- * start honest, deterministic). */
+ * start honest, deterministic, and recency-aware rather than lifetime-
+ * cumulative). */
 export function applyMonteCarloConfirm(close: number[], raw: number[], p: ConfirmParams): number[] {
   if (p.confirm === false) return raw
   const horizon = Math.max(1, Math.round(p.confirmHorizon ?? 5))
   const minProb = Math.min(0.99, Math.max(0.5, p.confirmMinProb ?? 0.55))
   const minSamples = Math.max(5, Math.round(p.confirmMinSamples ?? 20))
   const nSims = Math.max(50, Math.round(p.confirmSims ?? 500))
+  const maxPool = Math.max(minSamples, Math.round(p.confirmMaxPool ?? 150))
+  const decayHalfLife = p.confirmDecayHalfLife ?? maxPool / 2
   const n = raw.length
   const out = new Array(n).fill(0)
-  // edges[+1]/edges[-1]: realized, direction-normalized log-returns of every
-  // PAST episode of that sign, resolved as soon as its horizon has elapsed.
+  // edges[+1]/edges[-1]: realized, direction-normalized log-returns of the
+  // most recent (at most `maxPool`) PAST episodes of that sign, resolved as
+  // soon as each one's horizon has elapsed - a sliding window, not a
+  // lifetime ledger.
   const bullEdges: number[] = []
   const bearEdges: number[] = []
   const pending: { idx: number; dir: 1 | -1 }[] = []
@@ -90,7 +120,9 @@ export function applyMonteCarloConfirm(close: number[], raw: number[], p: Confir
     while (cursor < pending.length && pending[cursor].idx + horizon <= t) {
       const ep = pending[cursor]
       const edge = ep.dir === 1 ? Math.log(close[ep.idx + horizon] / close[ep.idx]) : Math.log(close[ep.idx] / close[ep.idx + horizon])
-      ;(ep.dir === 1 ? bullEdges : bearEdges).push(edge)
+      const bucket = ep.dir === 1 ? bullEdges : bearEdges
+      bucket.push(edge)
+      if (bucket.length > maxPool) bucket.shift() // oldest analog falls out of the window
       cursor++
     }
     const sig = raw[t]
@@ -101,9 +133,28 @@ export function applyMonteCarloConfirm(close: number[], raw: number[], p: Confir
       out[t] = sig // cold start - not enough analog history to judge yet, pass through honestly
     } else {
       let favCount = 0
-      for (let s = 0; s < nSims; s++) {
-        const edge = pool[Math.floor(r() * pool.length)]
-        if (edge > 0) favCount++
+      if (decayHalfLife > 0) {
+        // recency-weighted bootstrap: the newest analog in the window is the
+        // most likely draw, an analog `decayHalfLife` slots older is half as
+        // likely, so the probability estimate tracks recent behavior rather
+        // than being pulled evenly by everything the window still holds.
+        const weights = new Array(pool.length)
+        let total = 0
+        for (let i = 0; i < pool.length; i++) {
+          const age = pool.length - 1 - i
+          const w = Math.pow(0.5, age / decayHalfLife)
+          weights[i] = w
+          total += w
+        }
+        for (let s = 0; s < nSims; s++) {
+          const edge = weightedPick(pool, weights, total, r())
+          if (edge > 0) favCount++
+        }
+      } else {
+        for (let s = 0; s < nSims; s++) {
+          const edge = pool[Math.floor(r() * pool.length)]
+          if (edge > 0) favCount++
+        }
       }
       const probFav = favCount / nSims
       if (probFav >= minProb) out[t] = sig // confirmed by its own analog history - keep it

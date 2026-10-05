@@ -1171,6 +1171,11 @@ export interface AutoTraderConfig {
   enabled: boolean
   signalSource: 'screener' | 'kalman-ou' | 'markov' | 'momentum' | 'confluence' | 'strategy'
   tf: Timeframe
+  /** The trade's own expiry, as a timeframe - SEPARATE from `tf` (which
+   * candles signals are read from). Unset = old behavior (expiry tracks tf
+   * 1:1, i.e. exactly one bar). Set to decouple them, e.g. read signals on
+   * '1m' but let each trade run '5m' before it settles. */
+  expiryTf?: Timeframe
   stake: number
   minScore: number
   minConfidence: number

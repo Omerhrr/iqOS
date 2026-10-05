@@ -1677,6 +1677,37 @@ function AutoTraderDialog({
             </select>
           </div>
           <div>
+            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Expiry</Label>
+            <select
+              value={d.expiryTf ?? ''}
+              onChange={(e) =>
+                // "Track signal timeframe" writes a CONCRETE value (the
+                // current tf) rather than undefined/null - a bare undefined
+                // field is dropped entirely by JSON.stringify when this
+                // draft gets POSTed, so it would silently fail to clear a
+                // previously-set expiry on save (the same bug pairStrategy
+                // had earlier - fixed there by never emitting null/undefined
+                // either). Setting it equal to tf is exactly equivalent
+                // (1 tf-bar expiry), just always a value that survives.
+                p({ expiryTf: e.target.value ? (e.target.value as Timeframe) : d.tf })
+              }
+              className="h-8 w-full rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-cyan-300 outline-none"
+            >
+              <option value="" className="bg-[#0d1420]">
+                Track signal timeframe ({d.tf})
+              </option>
+              {TIMEFRAMES.map((t) => (
+                <option key={t} value={t} className="bg-[#0d1420]">
+                  {t}
+                </option>
+              ))}
+            </select>
+            <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+              How long each trade actually runs before it settles - separate from the signal timeframe above. Leave as "Track signal timeframe" for the
+              original 1-bar-of-tf behavior.
+            </p>
+          </div>
+          <div>
             <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Direction</Label>
             <select
               value={d.direction}

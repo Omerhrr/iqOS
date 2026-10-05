@@ -43,6 +43,7 @@
 import type { Plugin, KernelContext } from '../kernel'
 import type { Store } from '../store'
 import type { Timeframe } from '../types'
+import { ALL_TIMEFRAMES, TIMEFRAME_SECONDS } from '../types'
 import type { ScreenerService, ScreenRow } from './screener'
 import type { Screener2Service, ConfluenceRow } from './screener2'
 import type { MarketDataService } from './market-data'
@@ -81,6 +82,18 @@ export interface AutoTraderConfig {
   enabled: boolean // auto-trader armed (it only ever trades while mode = auto)
   signalSource: AutoTraderSource // where entry signals come from
   tf: Timeframe // which screener timeframe to source signals from
+  /** The trade's own expiry, as a timeframe - SEPARATE from `tf` (the
+   * timeframe signals are read from). Previously there was no such field:
+   * every auto-trader binary trade silently expired after exactly one bar
+   * of `tf`, so changing the signal timeframe also changed how long every
+   * trade ran, whether that was intended or not. Undefined = old behavior
+   * (expiry tracks `tf` 1:1). Set explicitly to decouple them, e.g. read
+   * signals on '1m' candles but let each trade run for '5m' before it
+   * settles. Converted to whole bars-of-`tf` at placement time
+   * (Math.round(TIMEFRAME_SECONDS[expiryTf] / TIMEFRAME_SECONDS[tf]),
+   * floored at 1) since execution.ts's binary/turbo settlement is still
+   * bar-counted off the signal tf, not a second independent clock. */
+  expiryTf?: Timeframe
   stake: number
   minScore: number // minimum |score| to act on (composite or per-source edge score)
   minConfidence: number // minimum signal confidence (0-100)
@@ -237,6 +250,7 @@ export const DEFAULT_AUTOTRADER: AutoTraderConfig = {
   enabled: true,
   signalSource: 'screener',
   tf: '1m',
+  expiryTf: undefined,
   stake: 10,
   minScore: 60,
   minConfidence: 55,
@@ -392,6 +406,7 @@ export class ModeService {
             ? (c.signalSource as AutoTraderSource)
             : DEFAULT_AUTOTRADER.signalSource,
           tf: (typeof c.tf === 'string' ? c.tf : DEFAULT_AUTOTRADER.tf) as Timeframe,
+          expiryTf: typeof c.expiryTf === 'string' && (ALL_TIMEFRAMES as string[]).includes(c.expiryTf) ? (c.expiryTf as Timeframe) : undefined,
           stake: num(c.stake, DEFAULT_AUTOTRADER.stake),
           minScore: num(c.minScore, DEFAULT_AUTOTRADER.minScore),
           minConfidence: num(c.minConfidence, DEFAULT_AUTOTRADER.minConfidence),
@@ -1407,7 +1422,11 @@ export class ModeService {
         side,
         kind: 'binary',
         amount,
-        expiryBars: 1,
+        // expiryTf unset = the old behavior (expiry tracks the signal tf
+        // 1:1, i.e. exactly 1 bar). Set = however many `tf` bars it takes to
+        // cover that expiry timeframe (min 1) - e.g. signals on '1m' with
+        // expiryTf '5m' settles 5 bars later, not 1.
+        expiryBars: this.config.expiryTf ? Math.max(1, Math.round(TIMEFRAME_SECONDS[this.config.expiryTf] / TIMEFRAME_SECONDS[this.config.tf])) : 1,
         // THE SAME BUG that was in autopilot.ts: this was hardcoded 'paper'
         // unconditionally, so the built-in AUTO-mode auto-trader could never
         // place a real order no matter what the account was connected to.
@@ -1767,6 +1786,11 @@ export class ModeService {
     if (patch.signalSource !== undefined && (['screener', 'kalman-ou', 'markov', 'momentum', 'confluence', 'strategy'] as const).includes(patch.signalSource as AutoTraderSource))
       this.config.signalSource = patch.signalSource as AutoTraderSource
     if (patch.tf !== undefined) this.config.tf = String(patch.tf) as Timeframe
+    // null/empty clears back to "track tf 1:1" (the old, implicit behavior) -
+    // same null-clears-the-field convention pairStrategy/strategyParams use,
+    // since JSON.stringify drops a bare `undefined` from the request body.
+    if (patch.expiryTf !== undefined)
+      this.config.expiryTf = typeof patch.expiryTf === 'string' && (ALL_TIMEFRAMES as string[]).includes(patch.expiryTf) ? (patch.expiryTf as Timeframe) : undefined
     if (patch.stake !== undefined) this.config.stake = clamp(Number(patch.stake) || DEFAULT_AUTOTRADER.stake, 1, 5000)
     if (patch.minScore !== undefined) this.config.minScore = clamp(Number(patch.minScore) || 0, 0, 100)
     if (patch.minConfidence !== undefined) this.config.minConfidence = clamp(Number(patch.minConfidence) || 0, 0, 100)
