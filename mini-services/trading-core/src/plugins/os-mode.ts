@@ -187,6 +187,21 @@ export interface AutoTraderConfig {
    * pairStrategy), rather than silently falling back to the pool. */
   directionStrategy?: { call?: string; put?: string }
   direction: 'both' | 'call' | 'put'
+  /** Instead of locking onto the single highest-ranked qualifying pair every
+   * tick (which, since indicator reads move slowly between 10s ticks, meant
+   * the SAME pair could legitimately out-score the whole pool for minutes
+   * on end and monopolize every trade), collect the top N qualifying
+   * candidates this tick and pick ONE of them at random. 1 (default) = the
+   * original strict-best behavior, unchanged. >1 spreads trades across
+   * whatever's genuinely in the "best range" this tick instead of always
+   * the single top one - the whole pool still gets covered over time
+   * instead of one pair soaking up every slot, while a pair that doesn't
+   * even clear the qualifying bar can never be picked just by bad luck.
+   * Applies to the 'screener' (default) and 'strategy' sources - the two
+   * that already rank/score the whole candidate pool before picking;
+   * kalman-ou/markov/momentum/confluence pick the first pair that clears
+   * their own thresholds in priority order and are unaffected. */
+  pickVariety?: number
   maxOpen: number // max concurrent auto-trader positions
   cooldownSec: number // per-asset re-entry cooldown
   paceSec: number // minimum seconds between any two auto trades
@@ -669,6 +684,25 @@ export class ModeService {
     )
   }
 
+  /** Shared by the 'screener' and 'strategy' sources (the two that already
+   * rank/score the whole candidate pool instead of taking the first hit in
+   * priority order): instead of handing back strictly the single top-metric
+   * row every tick, keep the top `variety` qualifying rows and pick ONE of
+   * them at random. variety=1 (the default) is the original strict-best
+   * behavior - exactly one candidate, nothing to randomize among. `pool`
+   * does not need to be pre-sorted; this sorts it itself. */
+  private pickRandomFromPool(pool: Array<{ row: ScreenRow; metric: number }>, variety: number): ScreenRow | null {
+    if (!pool.length) return null
+    const n = Math.max(1, Math.round(variety) || 1)
+    if (n <= 1 || pool.length === 1) {
+      let best = pool[0]
+      for (const p of pool) if (p.metric > best.metric) best = p
+      return best.row
+    }
+    const top = [...pool].sort((a, b) => b.metric - a.metric).slice(0, n)
+    return top[Math.floor(Math.random() * top.length)].row
+  }
+
   private pickSignal(): ScreenRow | null {
     if (this.config.signalSource === 'kalman-ou') return this.pickOUSignal()
     if (this.config.signalSource === 'markov') return this.pickMarkovSignal()
@@ -683,17 +717,29 @@ export class ModeService {
       // alone - widen the ranked window so assetBlocked's own watchlist
       // filter (not this limit) is what decides inclusion.
       const { rows } = screener.top({ tf: this.config.tf, minScore: this.config.minScore, direction: dir, limit: restricted ? 500 : 12 })
+      const variety = this.config.pickVariety ?? 1
+      // rows is already ranked by |score| then confidence (screener.ts), so
+      // the first `variety` qualifying rows in iteration order ARE the top
+      // `variety` by rank - no separate sort needed here, unlike the pool
+      // collected below.
+      const ranked: Array<{ row: ScreenRow; metric: number }> = []
       for (const r of rows) {
         if (r.direction === 'none') continue
         if (r.confidence < this.config.minConfidence) continue
         if (this.assetBlocked(r.asset)) continue
-        return r
+        ranked.push({ row: r, metric: Math.abs(r.score) * 1000 + r.confidence })
+        if (ranked.length >= Math.max(1, variety)) break
       }
+      if (ranked.length) return this.pickRandomFromPool(ranked, variety)
       // sweep still warming (or rows stale) - evaluate liquid pairs directly,
       // run through the SAME watchlist/watchlistMode gate (an 'only' restriction
       // falls back to exactly its own pairs; an 'exclude' restriction falls
       // back to the liquid pairs minus whatever's excluded; no restriction
-      // is unchanged LIQUID_CANDIDATES)
+      // is unchanged LIQUID_CANDIDATES). Not globally ranked (evaluated
+      // on-demand in priority order), so collect every qualifier instead of
+      // stopping at the first `variety` hits, then let the same top-N random
+      // pick apply.
+      const fallback: Array<{ row: ScreenRow; metric: number }> = []
       for (const asset of this.candidatePool(restricted ? [...this.config.watchlist, ...LIQUID_CANDIDATES] : LIQUID_CANDIDATES)) {
         if (this.assetBlocked(asset)) continue
         try {
@@ -702,11 +748,12 @@ export class ModeService {
           if (Math.abs(r.score) < this.config.minScore) continue
           if (r.confidence < this.config.minConfidence) continue
           if (this.config.direction !== 'both' && r.direction !== this.config.direction) continue
-          return r
+          fallback.push({ row: r, metric: Math.abs(r.score) * 1000 + r.confidence })
         } catch {
           // thin history for this pair - try the next
         }
       }
+      if (fallback.length) return this.pickRandomFromPool(fallback, variety)
     } catch {
       // screener not loaded - no signal source
     }
@@ -1146,15 +1193,18 @@ export class ModeService {
         }
       }
 
-      // Evaluate EVERY open/eligible pair this tick and keep the single best
-      // qualifying row across the whole pool - NOT the first candidate in
-      // LIQUID_CANDIDATES order that happens to fire. Returning on first
+      // Evaluate EVERY open/eligible pair this tick and keep every qualifying
+      // row across the whole pool - NOT just the first candidate in
+      // LIQUID_CANDIDATES order that happens to fire (returning on first
       // match meant whichever major (EURUSD, by list order) qualified most
       // often under a given strategy would win almost every tick, making the
       // auto-trader look pinned to one pair even with a GLOBAL pair
-      // restriction - there was never a second pair in the running.
-      let bestRow: ScreenRow | null = null
-      let bestMetric = -Infinity
+      // restriction - there was never a second pair in the running), and NOT
+      // just the single highest-metric one either - pickVariety picks
+      // randomly among the top N of this pool below instead of always the
+      // strict best, so one pair that happens to out-score the rest for a
+      // while doesn't monopolize every trade.
+      const signalPool: Array<{ row: ScreenRow; metric: number }> = []
 
       for (const asset of candidates) {
         if (this.assetBlocked(asset)) continue
@@ -1222,9 +1272,9 @@ export class ModeService {
           }
           if (!chosen) continue
           const metric = Math.abs(chosen.score)
-          if (metric > bestMetric) {
-            bestMetric = metric
-            bestRow = ModeService.strategyEvalToScreenRow(
+          signalPool.push({
+            metric,
+            row: ModeService.strategyEvalToScreenRow(
               asset,
               this.config.tf,
               chosen.direction,
@@ -1233,8 +1283,8 @@ export class ModeService {
               `direction-pinned: ${chosen.id} (${chosen.direction.toUpperCase()}) on ${asset} (score ${Math.abs(chosen.score).toFixed(0)})`,
               undefined,
               chosen.id
-            )
-          }
+            ),
+          })
           continue
         }
 
@@ -1246,13 +1296,10 @@ export class ModeService {
           const v = votes[0]
           if (this.config.direction !== 'both' && v.direction !== this.config.direction) continue
           const metric = Math.abs(v.score)
-          if (metric > bestMetric) {
-            bestMetric = metric
-            const note = pinnedId
-              ? `pinned: ${v.id} on ${asset} (score ${Math.abs(v.score).toFixed(0)})`
-              : `${v.id} score ${Math.abs(v.score).toFixed(0)}`
-            bestRow = ModeService.strategyEvalToScreenRow(asset, this.config.tf, v.direction, v.score, price, note, undefined, v.id)
-          }
+          const note = pinnedId
+            ? `pinned: ${v.id} on ${asset} (score ${Math.abs(v.score).toFixed(0)})`
+            : `${v.id} score ${Math.abs(v.score).toFixed(0)}`
+          signalPool.push({ metric, row: ModeService.strategyEvalToScreenRow(asset, this.config.tf, v.direction, v.score, price, note, undefined, v.id) })
           continue
         }
 
@@ -1307,13 +1354,13 @@ export class ModeService {
           // raw score magnitude - so a +1_000_000 offset keeps the two tiers
           // from ever crossing while still ranking within each tier by rank.
           const metric = best.proven ? 1_000_000 + best.rank : best.rank
-          if (metric > bestMetric) {
-            bestMetric = metric
-            const note = best.proven
-              ? `auto-learn: ${best.id} proven best for ${asset} (${best.rank.toFixed(0)}% win rate, 95% floor)`
-              : `auto-learn: ${best.id} highest edge for ${asset} (score ${Math.abs(best.score).toFixed(0)}) - still building its own record`
-            bestRow = ModeService.strategyEvalToScreenRow(asset, this.config.tf, best.direction, best.score, price, note, best.proven ? Math.round(best.rank) : undefined, best.id)
-          }
+          const note = best.proven
+            ? `auto-learn: ${best.id} proven best for ${asset} (${best.rank.toFixed(0)}% win rate, 95% floor)`
+            : `auto-learn: ${best.id} highest edge for ${asset} (score ${Math.abs(best.score).toFixed(0)}) - still building its own record`
+          signalPool.push({
+            metric,
+            row: ModeService.strategyEvalToScreenRow(asset, this.config.tf, best.direction, best.score, price, note, best.proven ? Math.round(best.rank) : undefined, best.id),
+          })
           continue
         }
 
@@ -1330,9 +1377,9 @@ export class ModeService {
         // rank by agreement % first (coarse, *1000 so it dominates), avg
         // |score| as the tiebreak among pairs with equal agreement
         const metric = agreementPct * 1000 + avgScore
-        if (metric > bestMetric) {
-          bestMetric = metric
-          bestRow = ModeService.strategyEvalToScreenRow(
+        signalPool.push({
+          metric,
+          row: ModeService.strategyEvalToScreenRow(
             asset,
             this.config.tf,
             direction,
@@ -1341,10 +1388,10 @@ export class ModeService {
             `ensemble ${majority.length}/${assetSpecs.length} agree (${majority.map((v) => v.id).join(', ')}) · avg ${avgScore.toFixed(0)}`,
             agreementPct,
             `ensemble:${majority.map((v) => v.id).join('+')}`
-          )
-        }
+          ),
+        })
       }
-      return bestRow
+      return this.pickRandomFromPool(signalPool, this.config.pickVariety ?? 1)
     } catch {
       // market/analytics/lab not loaded - no signal source
     }
@@ -1912,6 +1959,7 @@ export class ModeService {
     if (patch.directionStrategy !== undefined) this.config.directionStrategy = ModeService.sanitizeDirectionStrategy(patch.directionStrategy)
     if (patch.direction !== undefined && ['both', 'call', 'put'].includes(String(patch.direction)))
       this.config.direction = String(patch.direction) as AutoTraderConfig['direction']
+    if (patch.pickVariety !== undefined) this.config.pickVariety = Math.round(clamp(Number(patch.pickVariety) || 1, 1, 10))
     if (patch.maxOpen !== undefined) this.config.maxOpen = Math.round(clamp(Number(patch.maxOpen) || 1, 1, 10))
     // Floor stays enforced in assetBlocked() regardless of what's saved here
     // (MIN_ASSET_COOLDOWN_SEC) - the field itself can still be raised past

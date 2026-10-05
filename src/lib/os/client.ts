@@ -1285,6 +1285,14 @@ export interface AutoTraderConfig {
    * pair's own pairStrategy pin, if it has one, still wins over this. */
   directionStrategy?: { call?: string; put?: string }
   direction: 'both' | 'call' | 'put'
+  /** Instead of always locking onto the single highest-ranked qualifying
+   * pair every tick, collect the top N qualifying candidates this tick and
+   * pick ONE at random - spreads trades across what's genuinely in the
+   * "best range" instead of one pair (whose score moves slowly between 10s
+   * ticks) monopolizing every slot for minutes on end. 1 (default/unset) =
+   * original strict-best behavior. Only affects the 'screener' and
+   * 'strategy' sources, which already rank/score the whole pool. */
+  pickVariety?: number
   maxOpen: number
   cooldownSec: number
   paceSec: number

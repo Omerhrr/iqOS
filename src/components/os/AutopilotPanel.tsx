@@ -1908,6 +1908,20 @@ function AutoTraderDialog({
             <NumField label="Min ADX (trend strength)" value={d.minAdx} onChange={(v) => p({ minAdx: v })} />
           )}
           {d.signalSource !== 'strategy' && <NumField label="Min confidence" value={d.minConfidence} onChange={(v) => p({ minConfidence: v })} />}
+          {(d.signalSource === 'screener' || d.signalSource === 'strategy') && (
+            <div>
+              <NumField
+                label="Pick variety (top-N, random)"
+                value={d.pickVariety ?? 1}
+                onChange={(v) => p({ pickVariety: Math.round(Math.max(1, Math.min(10, v))) })}
+              />
+              <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+                1 (default) always takes the single highest-ranked qualifying pair every tick. Raise this to randomly
+                pick among the top N qualifying pairs instead - spreads trades across the pool instead of one pair
+                (whose score barely moves between 10s ticks) winning almost every slot.
+              </p>
+            </div>
+          )}
           <NumField label="Max open" value={d.maxOpen} onChange={(v) => p({ maxOpen: v })} />
           <div>
             <NumField
