@@ -1095,25 +1095,78 @@ class Handler(BaseHTTPRequestHandler):
                     # polling instead of accepting a possibly-wrong number -
                     # exactly the "wait for IQ to report back" contract this
                     # endpoint was built for, now actually honored.
+                    # THE LOOKBACK-WINDOW BUG: history was fetched as a single
+                    # page of the 20 most-recent closed positions (limit=20,
+                    # offset=0). On an account trading many bots/orders per
+                    # minute, a position can have more than 20 OTHER trades
+                    # close behind it before we next ask for its result - at
+                    # that point it has scrolled off page 1 forever, so this
+                    # lookup reports {"found": false} every single time even
+                    # though get_position_history_v2() genuinely has the row,
+                    # just on a later page. The kernel sees that as "IQ hasn't
+                    # closed it yet" and polls forever - exactly the "trade
+                    # closed on IQ but stuck open in iqOS" symptom. Paging
+                    # through several pages (newest first) per lookup fixes
+                    # it; stop as soon as a page comes back short, since that
+                    # means we've reached the end of IQ's own history.
+                    history_page_size = 100
+                    history_max_pages = 5  # up to the 500 most-recent closed positions per instrument type
+
+                    # Distinguish "we genuinely asked IQ and it said no" from
+                    # "every lookup call itself failed" (session expired,
+                    # network blip, rate limit). Both used to collapse into
+                    # the same {"found": false}, which looks IDENTICAL to
+                    # "IQ hasn't closed it yet" on the kernel side - a broken
+                    # session could silently stall every pending settlement
+                    # forever while execution.ts just logs "still awaiting
+                    # IQ confirmation" as if everything were normal. Tracking
+                    # whether even one lookup call succeeded lets us report
+                    # a real `error` instead when NONE did.
+                    any_lookup_ok = False
+
+                    def _find_in_history(itype: str):
+                        nonlocal any_lookup_ok
+                        for page in range(history_max_pages):
+                            try:
+                                ok2, data2 = _client.get_position_history_v2(
+                                    itype, history_page_size, page * history_page_size, max_wait_sec=wait
+                                )
+                            except Exception:  # noqa: BLE001
+                                ok2, data2 = False, None
+                            if ok2:
+                                any_lookup_ok = True
+                            if not (ok2 and isinstance(data2, dict)):
+                                break
+                            rows = data2.get("positions", []) or []
+                            for item in rows:
+                                if _row_matches(item):
+                                    outcome = _row_outcome(item)
+                                    if "pnl" in outcome:
+                                        return outcome
+                            if len(rows) < history_page_size:
+                                break  # reached the end of IQ's available history
+                        return None
+
                     for itype in types:
                         try:
                             ok, data = _client.get_positions(itype, max_wait_sec=wait)
                         except Exception:  # noqa: BLE001
                             ok, data = False, None
+                        if ok:
+                            any_lookup_ok = True
                         if ok and isinstance(data, dict):
                             for item in data.get("positions", []) or []:
                                 if _row_matches(item) and item.get("status") == "open":
                                     return self._send(_ok({"found": True, "status": "open", "instrument_type": itype}))
-                        try:
-                            ok2, data2 = _client.get_position_history_v2(itype, 20, 0, max_wait_sec=wait)
-                        except Exception:  # noqa: BLE001
-                            ok2, data2 = False, None
-                        if ok2 and isinstance(data2, dict):
-                            for item in data2.get("positions", []) or []:
-                                if _row_matches(item):
-                                    outcome = _row_outcome(item)
-                                    if "pnl" in outcome:
-                                        return self._send(_ok({"found": True, "instrument_type": itype, **outcome}))
+                        outcome = _find_in_history(itype)
+                        if outcome is not None:
+                            return self._send(_ok({"found": True, "instrument_type": itype, **outcome}))
+                    if not any_lookup_ok:
+                        # every get_positions()/get_position_history_v2() call
+                        # across every instrument type failed outright (likely
+                        # an expired/broken IQ session) - surface that as a
+                        # real error, distinct from a genuine not-found-yet.
+                        return self._send(_ok({"found": False, "status": "unknown", "error": "all broker lookups failed (session/network)"}))
                     # not found anywhere yet - caller's ladder decides whether to
                     # keep polling or fall back to a price-based quote
                     return self._send(_ok({"found": False, "status": "unknown"}))

@@ -696,17 +696,36 @@ export class ExecutionService {
         this.finishLiveExpiryFromBroker(pos, result.pnl as number)
         return
       }
+      // The lookup itself failed (sidecar says every get_positions()/
+      // get_position_history_v2() call errored - typically an expired IQ
+      // session) rather than IQ genuinely saying "not closed yet". This is
+      // NOT the normal waiting path: surface it loudly and immediately
+      // (every attempt, not just every 150th) so a broken session doesn't
+      // masquerade as "position still open" for however long until someone
+      // happens to check the logs. We still never guess a settlement from
+      // it - only flag it more visibly than the normal wait below.
+      if (result?.error) {
+        this.lastLiveError = `live ${pos.kind} ${pos.liveOrderId ?? pos.id} on ${pos.asset}: broker lookup failing (${result.error}) - IQ confirmation cannot be fetched, position held open, not settled`
+        if (attempt === 1 || attempt % 10 === 0) {
+          this.ctx.log('execution', this.lastLiveError)
+          this.ctx.bus.emit('alert', { level: 'warn', message: this.lastLiveError, ts: this.now() })
+        }
+      }
       // Broker explicitly open, not found yet, or the call errored/timed
       // out (result === null): in every case IQ has not confirmed a close,
       // so nothing gets written to history. Just wait and re-ask.
     }
     // ~2-3 minutes past expected expiry with still no broker confirmation:
-    // purely informational - does not affect settlement, just lets ops know
-    // a position is pending rather than silently stuck.
+    // flag the position as stuck (visible to the UI/ops) rather than just a
+    // log line buried in the console - still does not affect settlement.
     if (attempt === 150 || (attempt > 150 && attempt % 150 === 0)) {
       const waitedSec = this.now() - (pos.settlesAt ?? this.now())
       this.lastLiveError = `live ${pos.kind} ${pos.liveOrderId ?? pos.id} on ${pos.asset} still awaiting IQ confirmation ${waitedSec}s past expected expiry - holding, no history recorded yet`
       this.ctx.log('execution', this.lastLiveError)
+      // Surface it as a visible alert (not just a log line) the first time a
+      // position crosses this threshold, so a stuck settlement is noticed
+      // from the existing alerts panel instead of requiring a log dig.
+      this.ctx.bus.emit('alert', { level: 'warn', message: this.lastLiveError, ts: this.now() })
     }
     // unresolved - the next 1s sweep re-asks the broker. No local guess, no
     // timeout that forces a settlement: we wait as long as it takes for IQ
@@ -737,14 +756,22 @@ export class ExecutionService {
   private async iqOrderResult(
     liveOrderId: string,
     kind: Position['kind']
-  ): Promise<{ found: boolean; status?: string; pnl?: number } | null> {
+  ): Promise<{ found: boolean; status?: string; pnl?: number; error?: string } | null> {
     const mode = kind === 'digital' ? 'digital' : kind === 'binary' ? 'binary' : 'turbo'
     const res = await this.postLive('/order_result', { order_id: liveOrderId, mode, max_wait_sec: 6 }, 10_000)
+    // null here means the HTTP call itself failed/timed out (network to the
+    // sidecar, not the broker) - the caller already treats that as "keep
+    // waiting, no guess". `error` below is the OTHER failure mode: the
+    // sidecar answered fine but every get_positions()/get_position_history_v2()
+    // call it made to IQ itself failed (e.g. an expired IQ session) - also
+    // not a genuine "not found yet", so it's threaded through distinctly
+    // rather than collapsed into plain found:false.
     if (!res || res.ok === false) return null
     const found = res.found === true
     const status = typeof res.status === 'string' ? res.status : undefined
     const pnl = Number(res.pnl)
-    return { found, status, pnl: Number.isFinite(pnl) ? pnl : undefined }
+    const error = typeof res.error === 'string' ? res.error : undefined
+    return { found, status, pnl: Number.isFinite(pnl) ? pnl : undefined, error }
   }
 
   /**
