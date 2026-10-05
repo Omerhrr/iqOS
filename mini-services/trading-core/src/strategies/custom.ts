@@ -453,9 +453,30 @@ export function indicatorSeries(s: IndicatorSignal, ctx: EvalCtx): number[] {
       return out
     }
     case 'trendpullback':
-      return trendPullbackSeries(ctx.candles, { pivotFlank: num(p.pivotFlank, 3), pullbackAtr: num(p.pullbackAtr, 0.75), minLegAtr: num(p.minLegAtr, 2) })
+      return trendPullbackSeries(ctx.candles, {
+        pivotFlank: num(p.pivotFlank, 3),
+        pullbackAtr: num(p.pullbackAtr, 0.75),
+        minLegAtr: num(p.minLegAtr, 2),
+        // Monte Carlo analog confirmation (see analytics/structure.ts) - on
+        // by default; set params.confirm: 0 to mine/trade the raw structure
+        // signal unconfirmed. params carries numbers only, so confirm is 0/1.
+        confirm: num(p.confirm, 1) !== 0,
+        confirmHorizon: num(p.confirmHorizon, 5),
+        confirmMinProb: num(p.confirmMinProb, 0.55),
+        confirmMinSamples: num(p.confirmMinSamples, 20),
+        confirmSims: num(p.confirmSims, 500),
+      })
     case 'rangezone':
-      return rangeZoneSeries(ctx.candles, { window: num(p.window, 40), rangeThreshold: num(p.rangeThreshold, 0.35), zoneAtr: num(p.zoneAtr, 0.4) })
+      return rangeZoneSeries(ctx.candles, {
+        window: num(p.window, 40),
+        rangeThreshold: num(p.rangeThreshold, 0.35),
+        zoneAtr: num(p.zoneAtr, 0.4),
+        confirm: num(p.confirm, 1) !== 0,
+        confirmHorizon: num(p.confirmHorizon, 5),
+        confirmMinProb: num(p.confirmMinProb, 0.55),
+        confirmMinSamples: num(p.confirmMinSamples, 20),
+        confirmSims: num(p.confirmSims, 500),
+      })
     case 'madist': {
       const period = Math.max(2, Math.round(num(p.period, 20)))
       const type = s.type ?? 'ema'

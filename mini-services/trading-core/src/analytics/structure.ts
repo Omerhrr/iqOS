@@ -31,8 +31,93 @@
 import type { Candle } from '../types'
 import * as ta from './indicators'
 import { findPivots } from './chart-patterns'
+import { rng } from './quant'
 
-export interface TrendPullbackParams {
+// ---------- Monte Carlo analog confirmation ----------
+//
+// The raw signed series below answer "is price structurally in the pullback
+// / zone right now" - but that alone can't tell a continuation setup from
+// one about to break and reverse (the exact "will it breakout or pullback"
+// question this was built to answer). confirmStructuralSeries adds that
+// judgment WITHOUT a second indicator: every time the raw series goes hot at
+// bar t, it looks at every PAST bar where the same signed setup fired on
+// this same pair, and what actually happened `horizon` bars later each time
+// (a normalized, direction-signed log-return - positive means that episode
+// would have won). That pool of real historical analogs is then Monte Carlo
+// bootstrap-resampled (sampled with replacement, deterministically seeded so
+// the learner and live evaluator agree bit-for-bit on the same history) to
+// estimate the probability this exact setup follows through rather than
+// faking out. Below `minSamples` analogs the gate is honestly a cold start -
+// not enough history to judge yet - so it passes the raw signal through
+// unchanged, same cold-start philosophy as plugins/adaptive.ts's confidence
+// gate; once there's enough evidence, a setup whose own measured analogs
+// don't clear `minProb` gets zeroed out here instead of reaching the vote.
+//
+// Strictly non-repainting: an episode starting at idx only becomes usable
+// evidence once its own `horizon`-bars-ahead bar has actually closed, and a
+// bar's episode is registered for future judging AFTER today's confirm
+// decision is made, so nothing ever judges itself.
+export interface ConfirmParams {
+  confirm?: boolean // apply the Monte Carlo analog gate at all (default true)
+  confirmHorizon?: number // bars ahead an episode's outcome is measured over (default 5)
+  confirmMinProb?: number // bootstrap-estimated P(favorable) an episode's analog pool must clear to keep firing (default 0.55)
+  confirmMinSamples?: number // analog pool size below which the gate is a cold-start pass-through (default 20)
+  confirmSims?: number // bootstrap resample draws (default 500)
+}
+
+/** Exported for direct testing/reuse - see the module header for the full
+ * explanation of what this does and why it's safe (non-repainting, cold
+ * start honest, deterministic). */
+export function applyMonteCarloConfirm(close: number[], raw: number[], p: ConfirmParams): number[] {
+  if (p.confirm === false) return raw
+  const horizon = Math.max(1, Math.round(p.confirmHorizon ?? 5))
+  const minProb = Math.min(0.99, Math.max(0.5, p.confirmMinProb ?? 0.55))
+  const minSamples = Math.max(5, Math.round(p.confirmMinSamples ?? 20))
+  const nSims = Math.max(50, Math.round(p.confirmSims ?? 500))
+  const n = raw.length
+  const out = new Array(n).fill(0)
+  // edges[+1]/edges[-1]: realized, direction-normalized log-returns of every
+  // PAST episode of that sign, resolved as soon as its horizon has elapsed.
+  const bullEdges: number[] = []
+  const bearEdges: number[] = []
+  const pending: { idx: number; dir: 1 | -1 }[] = []
+  let cursor = 0
+  // one deterministic RNG per call - identical input series always yields
+  // the identical confirm decisions, which is what keeps the lab's backtest
+  // and the live evaluator in agreement (custom.ts's consistency contract).
+  const r = rng(0x5eed)
+  for (let t = 0; t < n; t++) {
+    while (cursor < pending.length && pending[cursor].idx + horizon <= t) {
+      const ep = pending[cursor]
+      const edge = ep.dir === 1 ? Math.log(close[ep.idx + horizon] / close[ep.idx]) : Math.log(close[ep.idx] / close[ep.idx + horizon])
+      ;(ep.dir === 1 ? bullEdges : bearEdges).push(edge)
+      cursor++
+    }
+    const sig = raw[t]
+    if (sig === 0) continue
+    const dir: 1 | -1 = sig > 0 ? 1 : -1
+    const pool = dir === 1 ? bullEdges : bearEdges
+    if (pool.length < minSamples) {
+      out[t] = sig // cold start - not enough analog history to judge yet, pass through honestly
+    } else {
+      let favCount = 0
+      for (let s = 0; s < nSims; s++) {
+        const edge = pool[Math.floor(r() * pool.length)]
+        if (edge > 0) favCount++
+      }
+      const probFav = favCount / nSims
+      if (probFav >= minProb) out[t] = sig // confirmed by its own analog history - keep it
+      // else: this exact setup's analogs don't support it right now - discard (out[t] stays 0)
+    }
+    // register today's episode for future bars to judge against, regardless
+    // of today's verdict - the analog pool must reflect every real past
+    // occurrence, not just the ones that happened to pass the gate.
+    if (t + horizon < n) pending.push({ idx: t, dir })
+  }
+  return out
+}
+
+export interface TrendPullbackParams extends ConfirmParams {
   pivotFlank?: number // swing-pivot confirmation flank each side (default 3)
   pullbackAtr?: number // max ATR-distance from the reference swing point still counted "pulled back" (default 0.75)
   minLegAtr?: number // the completed leg (last pivot pair) must span at least this many ATRs, filters noise chop (default 2)
@@ -87,10 +172,10 @@ export function trendPullbackSeries(candles: Candle[], params: TrendPullbackPara
       if (dist >= 0 && dist <= pullbackAtr) out[t] = -(pullbackAtr - dist + 0.01)
     }
   }
-  return out
+  return applyMonteCarloConfirm(close, out, params)
 }
 
-export interface RangeZoneParams {
+export interface RangeZoneParams extends ConfirmParams {
   window?: number // rolling channel lookback, bars BEFORE t (default 40)
   rangeThreshold?: number // max |net drift| / channel width still counted "ranging" (default 0.35)
   zoneAtr?: number // max ATR-distance from a channel edge counted "in the zone" (default 0.4)
@@ -130,5 +215,5 @@ export function rangeZoneSeries(candles: Candle[], params: RangeZoneParams = {})
     if (distFromLow <= zoneAtr) out[t] = zoneAtr - distFromLow + 0.01
     else if (distFromHigh <= zoneAtr) out[t] = -(zoneAtr - distFromHigh + 0.01)
   }
-  return out
+  return applyMonteCarloConfirm(close, out, params)
 }
