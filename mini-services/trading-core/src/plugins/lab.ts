@@ -755,6 +755,10 @@ function familyOf(s: SignalDef): string {
       // itself generates as a candidate - key it by its member families so
       // two groups combining the same underlying signals still dedupe.
       return `group:${s.op}:${s.signals.map(familyOf).sort().join('+')}`
+    case 'builtin':
+      // like groups, a registry-strategy signal is hand-picked (or pasted
+      // in via JSON), not something the miner sweeps on its own.
+      return `builtin:${s.id}`
   }
 }
 
@@ -775,6 +779,8 @@ function candidateKeyOf(s: SignalDef): string {
       return `mtf:${s.factor}:${s.dir}`
     case 'group':
       return `group:${s.op}:${s.dir}:${s.signals.map(candidateKeyOf).join('+')}`
+    case 'builtin':
+      return `builtin:${s.id}:${s.dir}:${JSON.stringify(s.params ?? {})}`
   }
 }
 
@@ -805,18 +811,41 @@ function basisLabel(basis: Basis): string {
 
 /** Per-bar vote series for a spec, using exactly the live-evaluation math
  * (prepareSignal tests + the candle scan for the candlestick family). */
+/** Build a per-bar activity test for one signal, substituting the FULL-SERIES
+ * candle-hit scan for any 'candle' signal instead of custom.ts's own
+ * prepareSignal() - which only ever checks the LAST bar (ctx.hits is "candle
+ * patterns on the LAST bar only", built for live evaluation where that's
+ * exactly what's wanted). Over a backtest's whole history that single-bar
+ * test is false almost everywhere, so without this substitution a candle
+ * signal (and any group containing one) would measure as "basically never
+ * fires" no matter how often the pattern actually occurred historically -
+ * silently wrong backtest numbers, not a signal problem.
+ *
+ * THE BUG this fixes: the substitution used to happen only for TOP-LEVEL
+ * candle signals (a flat .map over spec.signals) - a candle pattern nested
+ * inside a GroupSignal (e.g. "Engulfing" AND "RSI < 30") still got custom.ts's
+ * tail-bar-only test via the group's own prepareSignal() recursing on its
+ * members, so any group with a candle member backtested as if that member
+ * almost never fired, skewing the group's measured win rate/trade count. */
+function buildBacktestTest(s: SignalDef, ctx: EvalCtx, candleHits: CandleHits): (i: number) => boolean {
+  if (s.kind === 'candle') {
+    const name = s.name.toLowerCase()
+    return (i: number) => candleHits[i]?.get(name) === s.dir
+  }
+  if (s.kind === 'group') {
+    const members = s.signals.map((m) => buildBacktestTest(m, ctx, candleHits))
+    return s.op === 'and' ? (i: number) => members.every((fn) => fn(i)) : (i: number) => members.some((fn) => fn(i))
+  }
+  return prepareSignal(s, ctx)
+}
+
 function scoreSeriesFor(
   spec: CustomSpec,
   ctx: EvalCtx,
   candleHits: CandleHits,
 ): { score: number; votes: number; dir: Side | 'none' }[] {
   const n = ctx.n
-  const tests = spec.signals.map((s) => {
-    const base = prepareSignal(s, ctx)
-    if (s.kind !== 'candle') return base
-    const name = s.name.toLowerCase()
-    return (i: number) => candleHits[i]?.get(name) === s.dir
-  })
+  const tests = spec.signals.map((s) => buildBacktestTest(s, ctx, candleHits))
   const series: { score: number; votes: number; dir: Side | 'none' }[] = new Array(n)
   for (let i = 0; i < n; i++) {
     let bullW = 0

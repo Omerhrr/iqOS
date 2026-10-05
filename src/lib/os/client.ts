@@ -622,12 +622,28 @@ export type LabSignalDef =
       dir: 'call' | 'put'
       weight: number
     }
+  | {
+      /** A full builtin strategy (trading-core's STRATEGIES registry - e.g.
+       * "rsi-reversion", "trend-structure-pullback", the Markov/Kalman/MC
+       * ones) used as ONE voting signal instead of traded standalone - lets
+       * it be combined with the rest of the signal vocabulary, including
+       * inside a GroupSignal. `params` are that strategy's own tunable
+       * params (StrategyInfo.params/defaults); omitted keys use the
+       * strategy's own defaults server-side. `dir` is which of the
+       * strategy's own call/put outputs counts as active - its 'none' or
+       * the opposite side never counts. */
+      kind: 'builtin'
+      id: string
+      params?: Record<string, number | string>
+      dir: 'call' | 'put'
+      weight: number
+    }
 
 /** Port of trading-core's labelOf() (strategies/custom.ts) - same formatting,
  * kept in sync by hand since the two are separate deployables. Used to
  * display a human-readable name for both a measured LabSignalStat and a
  * template the user is about to add by hand in the manual strategy builder. */
-export function labelOfSignal(s: LabSignalDef): string {
+export function labelOfSignal(s: LabSignalDef, strategies?: StrategyInfo[]): string {
   switch (s.kind) {
     case 'candle':
       return s.name
@@ -673,7 +689,11 @@ export function labelOfSignal(s: LabSignalDef): string {
     case 'mtf':
       return `MTF ${s.factor}x Trend ${s.dir === 'call' ? 'Up' : 'Down'}`
     case 'group':
-      return `(${s.signals.map(labelOfSignal).join(s.op === 'and' ? ' AND ' : ' OR ')})`
+      return `(${s.signals.map((m) => labelOfSignal(m, strategies)).join(s.op === 'and' ? ' AND ' : ' OR ')})`
+    case 'builtin': {
+      const name = strategies?.find((st) => st.id === s.id)?.name ?? s.id
+      return `${name} (${s.dir === 'call' ? 'CALL' : 'PUT'})`
+    }
   }
 }
 

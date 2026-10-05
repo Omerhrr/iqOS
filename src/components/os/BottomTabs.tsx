@@ -289,7 +289,7 @@ export default function BottomTabs(props: BottomTabsProps) {
 
       {/* AI LEARNING LAB (the agent studies a pair and invents its own strategy) */}
       <TabsContent value="ailab" className="mt-0 min-h-0 flex-1 overflow-auto p-3">
-        <AILabPanel assets={props.assets} onError={onError} refreshBots={props.refreshBots} />
+        <AILabPanel assets={props.assets} strategies={props.strategies} onError={onError} refreshBots={props.refreshBots} />
       </TabsContent>
 
       {/* STRATEGIES */}

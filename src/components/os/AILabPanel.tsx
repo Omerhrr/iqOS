@@ -10,7 +10,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import type { AssetRow, LabLearnResult, LabSignalDef, LabSimMetrics, LabSpec, LabStrategyRow, Timeframe, TradeKind } from '@/lib/os/client'
+import type { AssetRow, LabLearnResult, LabSignalDef, LabSimMetrics, LabSpec, LabStrategyRow, StrategyInfo, Timeframe, TradeKind } from '@/lib/os/client'
 import { fmtMoney, osGet, osPost } from '@/lib/os/client'
 import { TIMEFRAMES, TIMEFRAME_SECONDS, SIGNAL_TEMPLATES, labelOfSignal } from '@/lib/os/client'
 
@@ -116,6 +116,7 @@ function AssetPicker({ tickers, value, onChange }: { tickers: string[]; value: s
 
 interface AILabPanelProps {
   assets: AssetRow[]
+  strategies: StrategyInfo[]
   onError: (m: string) => void
   refreshBots: () => void
 }
@@ -128,6 +129,7 @@ const KIND_CHIP: Record<string, string> = {
   indicator: 'text-fuchsia-300 border-fuchsia-500/40 bg-fuchsia-500/10',
   mtf: 'text-cyan-300 border-cyan-500/40 bg-cyan-500/10',
   group: 'text-orange-300 border-orange-500/40 bg-orange-500/10',
+  builtin: 'text-lime-300 border-lime-500/40 bg-lime-500/10',
 }
 
 // Every field read here beyond the pre-existing core metrics was added
@@ -238,7 +240,7 @@ function FoldsStrip({ folds, foldsProfitable, breakeven }: { folds: LabSimMetric
   )
 }
 
-export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelProps) {
+export default function AILabPanel({ assets, strategies, onError, refreshBots }: AILabPanelProps) {
   const [asset, setAsset] = useState('EURUSD')
   const [tf, setTf] = useState<Timeframe>('1m')
   const [basis, setBasis] = useState<Basis>('candles')
@@ -298,6 +300,30 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
   const [manualTemplateIdx, setManualTemplateIdx] = useState(0)
   const [manualIsCandle, setManualIsCandle] = useState(false)
   const [manualCandleName, setManualCandleName] = useState('')
+  // Pull a FULL builtin strategy (trading-core's STRATEGIES registry - RSI
+  // reversion, MACD cross, the Markov/Kalman/Monte-Carlo ones, trend
+  // structure pullback, all of it) in as one more combinable signal,
+  // alongside the candle/bar/indicator vocabulary above - mutually
+  // exclusive with "custom candlestick pattern" (both override the plain
+  // template dropdown). Params are edited as raw JSON rather than a
+  // per-field form - the registry's param shapes vary too much
+  // strategy-to-strategy to build one generic field UI for all of them, and
+  // this mirrors the "edit as json" escape hatch already used for specs.
+  const [manualIsBuiltin, setManualIsBuiltin] = useState(false)
+  const [manualBuiltinIdx, setManualBuiltinIdx] = useState(0)
+  const [manualBuiltinParamsText, setManualBuiltinParamsText] = useState('{}')
+  const [manualBuiltinParamsError, setManualBuiltinParamsError] = useState<string | null>(null)
+
+  // Seed the params textarea with the selected strategy's own defaults the
+  // moment builtin mode turns on (or once `strategies` finishes loading) -
+  // without this it'd sit on the stale initial '{}' until the user manually
+  // touched the dropdown.
+  useEffect(() => {
+    if (manualIsBuiltin && strategies[manualBuiltinIdx]) {
+      setManualBuiltinParamsText(JSON.stringify(strategies[manualBuiltinIdx].defaults ?? {}, null, 2))
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [manualIsBuiltin, strategies.length])
   const [manualDir, setManualDir] = useState<'call' | 'put'>(SIGNAL_TEMPLATES[0].dir)
   // Editable op/threshold for the selected indicator template - previously
   // a template's op/threshold were baked in and uneditable, so there was no
@@ -348,6 +374,32 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
   }, [manualSignals, manualMinScore, manualMinVotes, manualHorizon, manualBasis, manualName, manualAsset, manualTf])
 
   const addManualSignal = () => {
+    if (manualIsBuiltin) {
+      const strat = strategies[manualBuiltinIdx]
+      if (!strat) {
+        onError('no builtin strategies loaded yet')
+        return
+      }
+      let params: Record<string, number | string> | undefined
+      if (manualBuiltinParamsText.trim() && manualBuiltinParamsText.trim() !== '{}') {
+        try {
+          const parsed = JSON.parse(manualBuiltinParamsText)
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) params = parsed as Record<string, number | string>
+          else {
+            setManualBuiltinParamsError('params must be a JSON object')
+            return
+          }
+        } catch (e) {
+          setManualBuiltinParamsError(`invalid JSON: ${(e as Error).message}`)
+          return
+        }
+      }
+      setManualBuiltinParamsError(null)
+      const def: LabSignalDef = { kind: 'builtin', id: strat.id, ...(params ? { params } : {}), dir: manualDir, weight: manualWeight }
+      if (manualGroupBuilding) setManualGroupPending((prev) => [...prev, def])
+      else setManualSignals((prev) => [...prev, { uid: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, def }])
+      return
+    }
     const template = SIGNAL_TEMPLATES[manualTemplateIdx]
     const def: LabSignalDef = manualIsCandle
       ? { kind: 'candle', name: manualCandleName.trim().slice(0, 40), dir: manualDir, weight: manualWeight }
@@ -966,8 +1018,28 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
 
         <div className="mt-2 flex flex-wrap items-end gap-2">
           <label className="flex items-center gap-1.5 font-mono text-[10px] text-[#aab6cc]">
-            <input type="checkbox" checked={manualIsCandle} onChange={(e) => setManualIsCandle(e.target.checked)} className="accent-violet-500" />
+            <input
+              type="checkbox"
+              checked={manualIsCandle}
+              onChange={(e) => {
+                setManualIsCandle(e.target.checked)
+                if (e.target.checked) setManualIsBuiltin(false)
+              }}
+              className="accent-violet-500"
+            />
             custom candlestick pattern
+          </label>
+          <label className="flex items-center gap-1.5 font-mono text-[10px] text-lime-300">
+            <input
+              type="checkbox"
+              checked={manualIsBuiltin}
+              onChange={(e) => {
+                setManualIsBuiltin(e.target.checked)
+                if (e.target.checked) setManualIsCandle(false)
+              }}
+              className="accent-lime-500"
+            />
+            use builtin strategy
           </label>
           <label className="flex items-center gap-1.5 font-mono text-[10px] text-orange-300">
             <input
@@ -981,7 +1053,27 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
             />
             combine into one group (AND/OR)
           </label>
-          {manualIsCandle ? (
+          {manualIsBuiltin ? (
+            <label className="flex flex-col gap-0.5">
+              <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">builtin strategy</span>
+              <select
+                value={manualBuiltinIdx}
+                onChange={(e) => {
+                  const idx = Number(e.target.value)
+                  setManualBuiltinIdx(idx)
+                  setManualBuiltinParamsText(JSON.stringify(strategies[idx]?.defaults ?? {}, null, 2))
+                  setManualBuiltinParamsError(null)
+                }}
+                className="h-7 w-64 rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-[#dbe4f0]"
+              >
+                {strategies.map((s, idx) => (
+                  <option key={s.id} value={idx}>
+                    {s.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : manualIsCandle ? (
             <label className="flex flex-col gap-0.5">
               <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">pattern name</span>
               <Input
@@ -1021,7 +1113,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
               </select>
             </label>
           )}
-          {!manualIsCandle && SIGNAL_TEMPLATES[manualTemplateIdx].kind === 'indicator' && (
+          {!manualIsCandle && !manualIsBuiltin && SIGNAL_TEMPLATES[manualTemplateIdx].kind === 'indicator' && (
             <>
               <label className="flex flex-col gap-0.5">
                 <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">op</span>
@@ -1068,6 +1160,36 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
           </Button>
         </div>
 
+        {manualIsBuiltin && (
+          <div className="mt-2 rounded border border-lime-500/40 bg-lime-500/5 p-2">
+            <p className="mb-1.5 font-mono text-[9px] leading-relaxed text-lime-200">
+              {strategies[manualBuiltinIdx]?.description ?? 'params for the selected strategy'} - edit as JSON (leave as the loaded defaults, or override any
+              subset of keys; the rest fall back to the strategy&apos;s own defaults).
+            </p>
+            <textarea
+              value={manualBuiltinParamsText}
+              onChange={(e) => {
+                setManualBuiltinParamsText(e.target.value)
+                setManualBuiltinParamsError(null)
+              }}
+              rows={6}
+              spellCheck={false}
+              className="w-full resize-y rounded border border-[#1c2739] bg-[#101828] p-2 font-mono text-[11px] text-[#dbe4f0] outline-none"
+            />
+            {manualBuiltinParamsError && <p className="mt-1 font-mono text-[10px] text-rose-400">{manualBuiltinParamsError}</p>}
+            <button
+              type="button"
+              onClick={() => {
+                setManualBuiltinParamsText(JSON.stringify(strategies[manualBuiltinIdx]?.defaults ?? {}, null, 2))
+                setManualBuiltinParamsError(null)
+              }}
+              className="mt-1 font-mono text-[9px] text-[#4b5a72] hover:text-lime-300"
+            >
+              reset to defaults
+            </button>
+          </div>
+        )}
+
         {manualGroupBuilding && (
           <div className="mt-2 rounded border border-orange-500/40 bg-orange-500/5 p-2">
             <p className="mb-1.5 font-mono text-[9px] leading-relaxed text-orange-200">
@@ -1080,7 +1202,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
                 {manualGroupPending.map((def, i) => (
                   <span key={i} className="flex items-center gap-1.5 rounded border border-orange-500/30 bg-[#101828] px-2 py-1 font-mono text-[10px]">
                     <span className={`rounded border px-1 py-0.5 text-[8px] uppercase ${KIND_CHIP[def.kind] ?? 'text-[#7c8aa5] border-[#1c2739]'}`}>{def.kind}</span>
-                    <span className="text-[#dbe4f0]">{labelOfSignal(def)}</span>
+                    <span className="text-[#dbe4f0]">{labelOfSignal(def, strategies)}</span>
                     <button type="button" onClick={() => removePendingGroupMember(i)} className="text-[#4b5a72] hover:text-rose-400" title="remove">
                       ✕
                     </button>
@@ -1194,7 +1316,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
                       {group.signals.map((m, i) => (
                         <span key={i}>
                           {i > 0 && <span className="text-orange-400"> {joiner} </span>}
-                          {labelOfSignal(m)}
+                          {labelOfSignal(m, strategies)}
                         </span>
                       ))}
                     </span>
@@ -1213,7 +1335,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
                 <span key={s.uid} className="flex items-center gap-1.5 rounded border border-[#1c2739] bg-[#101828] px-2 py-1 font-mono text-[10px]">
                   <input type="checkbox" checked={manualSelected.has(s.uid)} onChange={() => toggleManualSelected(s.uid)} className="accent-orange-500" title="select for combining" />
                   <span className={`rounded border px-1 py-0.5 text-[8px] uppercase ${KIND_CHIP[s.def.kind] ?? 'text-[#7c8aa5] border-[#1c2739]'}`}>{s.def.kind}</span>
-                  <span className="text-[#dbe4f0]">{labelOfSignal(s.def)}</span>
+                  <span className="text-[#dbe4f0]">{labelOfSignal(s.def, strategies)}</span>
                   <span className={s.def.dir === 'call' ? 'text-emerald-400' : 'text-rose-400'}>{s.def.dir.toUpperCase()}</span>
                   <span className="text-cyan-300">w{s.def.weight}</span>
                   <button type="button" onClick={() => removeManualSignal(s.uid)} className="text-[#4b5a72] hover:text-rose-400" title="remove">

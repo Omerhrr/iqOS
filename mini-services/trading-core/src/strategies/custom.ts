@@ -30,6 +30,7 @@ import type { Candle, Side, StrategyEval } from '../types'
 import * as ta from '../analytics/indicators'
 import { detectPatterns } from '../analytics/patterns'
 import { trendPullbackSeries, rangeZoneSeries } from '../analytics/structure'
+import { getStrategy, defaultParams } from './builtin'
 
 // ---------- signal vocabulary ----------
 
@@ -148,7 +149,29 @@ export interface GroupSignal {
   weight: number
 }
 
-export type SignalDef = CandleSignal | BarSignal | HASignal | LineSignal | IndicatorSignal | MTFSignal | GroupSignal
+/** One of the standalone registry strategies (builtin.ts's STRATEGIES, e.g.
+ * "rsi-reversion", "trend-structure-pullback") used as a VOTING SIGNAL
+ * rather than traded on its own - lets the lab/manual builder pull in the
+ * full built-in catalog (including the Markov/Kalman/Monte-Carlo ones) as
+ * one more combinable signal family, same as candle/bar/indicator, so it can
+ * sit inside a GroupSignal alongside them ("Trend Pullback" AND
+ * "RSI Mean Reversion", say). `params` are the strategy's own tunable
+ * params (StrategyDef.params - defaults fill in anything omitted); `dir`
+ * is which of the strategy's own 'call'/'put' outputs counts as this signal
+ * being active (its 'none' output, or the opposite direction, never counts
+ * - exactly like every other signal kind only firing one way). An unknown
+ * `id` (a stale reference, a typo) is simply never active rather than
+ * throwing, matching how an unknown ind/variant degrades elsewhere in this
+ * file. */
+export interface BuiltinSignal {
+  kind: 'builtin'
+  id: string
+  params?: Record<string, number | string>
+  dir: Side
+  weight: number
+}
+
+export type SignalDef = CandleSignal | BarSignal | HASignal | LineSignal | IndicatorSignal | MTFSignal | GroupSignal | BuiltinSignal
 
 export interface CustomSpec {
   name: string
@@ -801,6 +824,12 @@ export function labelOf(s: SignalDef): string {
       return `MTF ${s.factor}x Trend ${s.dir === 'call' ? 'Up' : 'Down'}`
     case 'group':
       return `(${s.signals.map(labelOf).join(s.op === 'and' ? ' AND ' : ' OR ')})`
+    case 'builtin': {
+      const strat = getStrategy(s.id)
+      const name = strat?.name ?? s.id
+      const sideTag = s.dir === 'call' ? 'CALL' : 'PUT'
+      return `${name} (${sideTag})`
+    }
   }
 }
 
@@ -820,6 +849,8 @@ export function impliedDir(s: SignalDef): Side {
     case 'mtf':
       return s.dir
     case 'group':
+      return s.dir
+    case 'builtin':
       return s.dir
   }
 }
@@ -963,6 +994,23 @@ export function prepareSignal(s: SignalDef, ctx: EvalCtx): (i: number) => boolea
       // normalizeSpec's depth cap, not by anything here.
       const members = s.signals.map((m) => prepareSignal(m, ctx))
       return s.op === 'and' ? (i: number) => members.every((fn) => fn(i)) : (i: number) => members.some((fn) => fn(i))
+    }
+    case 'builtin': {
+      const strat = getStrategy(s.id)
+      if (!strat) return () => false
+      const params = { ...defaultParams(strat), ...(s.params ?? {}) }
+      // A registry strategy's own evaluate() is "candles in, last-bar
+      // direction out" - there's no per-bar series version of it (same
+      // model backtest.ts already uses for standalone builtin backtests:
+      // re-slice candles up to i and re-evaluate). Cheap at the signal
+      // counts this DSL allows (16 top-level, 8 per group) but genuinely
+      // O(n) per bar, so this only ever activates for bars that have
+      // enough history for the strategy to warm up.
+      return (i: number) => {
+        if (i < 30) return false
+        const ev = strat.evaluate(ctx.candles.slice(0, i + 1), params)
+        return ev.direction === s.dir
+      }
     }
   }
 }
@@ -1115,6 +1163,13 @@ function normalizeOneSignal(s: unknown, depth = 0): SignalDef | null {
     }
   } else if (o.kind === 'mtf' && (Number(o.factor) === 5 || Number(o.factor) === 15)) {
     return { kind: 'mtf', factor: Number(o.factor) as 5 | 15, dir: dir ?? 'call', weight }
+  } else if (o.kind === 'builtin' && typeof o.id === 'string' && getStrategy(o.id)) {
+    const params: Record<string, number | string> = {}
+    for (const [k, v] of Object.entries((o.params as Record<string, unknown>) ?? {})) {
+      if (typeof v === 'number' && Number.isFinite(v)) params[k] = v
+      else if (typeof v === 'string' && v.length <= 60) params[k] = v
+    }
+    return { kind: 'builtin', id: o.id, ...(Object.keys(params).length ? { params } : {}), dir: dir ?? 'call', weight }
   } else if (o.kind === 'group' && (o.op === 'and' || o.op === 'or') && depth < 2) {
     const rawMembers: unknown[] = Array.isArray(o.signals) ? (o.signals as unknown[]) : []
     const members: SignalDef[] = []
