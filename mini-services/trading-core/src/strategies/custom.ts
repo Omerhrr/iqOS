@@ -100,8 +100,18 @@ export interface IndicatorSignal {
     | 'levels' // signed distance to nearest static level/ATR. params.type: pivot|fib
   params?: Record<string, number> // period/fast/slow/mult per indicator
   type?: string // sub-selector for the generic families above (madist/osc0100/oscpm100/oscz/trenddist/bandpos/volflow/levels)
-  op: '>' | '<'
+  /** '>'/'<' - the original single-threshold comparisons. 'between' - fires
+   * only while the value sits inside [threshold, threshold2] (e.g.
+   * "rangezone > 0.05 AND rangezone < 0.07" - the exact multi-condition case
+   * that wasn't expressible before: the DSL only ever had ONE threshold per
+   * signal, so a band had no way to be written as a single rule and had to
+   * be faked as two separate always-independently-voting signals instead,
+   * which isn't the same thing as a single AND'd condition). 'outside' -
+   * the complement: fires outside [threshold, threshold2] (e.g. "avoid the
+   * dead zone between -0.05 and 0.05"). threshold2 is ignored for '>'/'<'. */
+  op: '>' | '<' | 'between' | 'outside'
   threshold: number
+  threshold2?: number
   dir: Side
   weight: number
 }
@@ -751,10 +761,22 @@ export function labelOf(s: SignalDef): string {
         'lh-ll': 'Lower Highs & Lows',
       }[s.variant]
     case 'indicator': {
+      // trendpullback/rangezone get real names instead of the generic
+      // "ind op threshold" format below - otherwise they're nearly
+      // impossible to spot in a signal list full of cryptic indicator rows
+      // (this is the exact complaint that led to adding this special case).
+      if (s.ind === 'trendpullback') return s.dir === 'call' ? 'Trend Pullback (Bull Continuation)' : 'Trend Pullback (Bear Continuation)'
+      if (s.ind === 'rangezone') return s.dir === 'call' ? 'Range Buy Zone' : 'Range Sell Zone'
       const p = s.params ?? {}
       const pd = p.period ?? p.fast
       const tag = s.type ? `:${s.type}` : ''
-      return `${s.ind}${tag}${Number.isFinite(pd) ? `(${pd})` : ''} ${s.op} ${s.threshold}`
+      const name = `${s.ind}${tag}${Number.isFinite(pd) ? `(${pd})` : ''}`
+      if (s.op === 'between' || s.op === 'outside') {
+        const lo = Math.min(s.threshold, s.threshold2 ?? s.threshold)
+        const hi = Math.max(s.threshold, s.threshold2 ?? s.threshold)
+        return `${name} ${s.op} [${lo}, ${hi}]`
+      }
+      return `${name} ${s.op} ${s.threshold}`
     }
     case 'mtf':
       return `MTF ${s.factor}x Trend ${s.dir === 'call' ? 'Up' : 'Down'}`
@@ -863,10 +885,24 @@ export function prepareSignal(s: SignalDef, ctx: EvalCtx): (i: number) => boolea
     }
     case 'indicator': {
       const series = indicatorSeries(s, ctx)
+      // 'between'/'outside' need a real lo/hi pair regardless of which
+      // threshold the user entered larger - don't make the band's validity
+      // depend on entry order.
+      const lo = Math.min(s.threshold, s.threshold2 ?? s.threshold)
+      const hi = Math.max(s.threshold, s.threshold2 ?? s.threshold)
       return (i: number) => {
         const v = series[i]
         if (!Number.isFinite(v)) return false
-        return s.op === '>' ? v > s.threshold : v < s.threshold
+        switch (s.op) {
+          case '>':
+            return v > s.threshold
+          case '<':
+            return v < s.threshold
+          case 'between':
+            return v >= lo && v <= hi
+          case 'outside':
+            return v < lo || v > hi
+        }
       }
     }
     case 'mtf': {
@@ -964,6 +1000,13 @@ export function evaluateCustom(spec: CustomSpec, candles: Candle[]): CustomEval 
 const KNOWN_INDS = new Set([
   'rsi', 'bbpos', 'zscore', 'donchianpos', 'macdz', 'slope', 'streak', 'wickbias', 'emasign', 'hadist', 'bodypos',
   'psar', 'fractal', 'madist', 'osc0100', 'oscpm100', 'oscz', 'trenddist', 'bandpos', 'volflow', 'levels',
+  // THE BUG: trendpullback/rangezone were wired into the ind type union,
+  // indicatorSeries(), lab.ts's CANDIDATE_SIGNALS and client.ts's templates,
+  // but never added to THIS allow-list - normalizeSpec is what actually
+  // persists a spec (manual builder save, learn() output, disk load), so
+  // any signal using either one was being silently dropped right here on
+  // every save, regardless of everything else working correctly.
+  'trendpullback', 'rangezone',
 ])
 // valid params.type values per generic family - inline specs outside this
 // set silently fall back to indicatorSeries' own per-family default rather
@@ -1014,7 +1057,7 @@ export function normalizeSpec(raw: unknown, fallbackName = 'Learned Strategy'): 
       const variant = String(o.variant) as LineSignal['variant']
       const dflt: Side = variant.endsWith('up') || variant === 'hh-hl' ? 'call' : 'put'
       signals.push({ kind: 'line', variant, lookback: clampN(o.lookback, 2, 100, variant.startsWith('breakout') ? 20 : 3), dir: dir ?? dflt, weight })
-    } else if (o.kind === 'indicator' && KNOWN_INDS.has(String(o.ind)) && (o.op === '>' || o.op === '<')) {
+    } else if (o.kind === 'indicator' && KNOWN_INDS.has(String(o.ind)) && (o.op === '>' || o.op === '<' || o.op === 'between' || o.op === 'outside')) {
       const params: Record<string, number> = {}
       for (const [k, v] of Object.entries((o.params as Record<string, unknown>) ?? {})) {
         const n = Number(v)
@@ -1023,6 +1066,7 @@ export function normalizeSpec(raw: unknown, fallbackName = 'Learned Strategy'): 
       const ind = String(o.ind) as IndicatorSignal['ind']
       const typeSet = KNOWN_IND_TYPES[ind]
       const type = typeSet && typeSet.has(String(o.type)) ? String(o.type) : undefined
+      const needsBand = o.op === 'between' || o.op === 'outside'
       signals.push({
         kind: 'indicator',
         ind,
@@ -1030,6 +1074,11 @@ export function normalizeSpec(raw: unknown, fallbackName = 'Learned Strategy'): 
         params,
         op: o.op,
         threshold: clampN(o.threshold, -1e6, 1e6, 0),
+        // a band with no real threshold2 degrades to a single point rather
+        // than being dropped outright - prepareSignal's lo===hi collapses
+        // 'between' to "equals" and 'outside' to "not equals", both well-
+        // defined, so a malformed band still evaluates to something sane.
+        ...(needsBand ? { threshold2: clampN(o.threshold2, -1e6, 1e6, clampN(o.threshold, -1e6, 1e6, 0)) } : {}),
         dir: dir ?? 'call',
         weight,
       })

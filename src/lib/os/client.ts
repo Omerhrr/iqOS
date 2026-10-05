@@ -598,8 +598,13 @@ export type LabSignalDef =
        * oscpm100/oscz/trenddist/bandpos/volflow/levels) - mirrors
        * trading-core's IndicatorSignal.type, previously missing here. */
       type?: string
-      op: '>' | '<'
+      /** 'between'/'outside' - a band test against [threshold, threshold2],
+       * e.g. "rangezone > 0.05 AND rangezone < 0.07" expressed as ONE rule
+       * (op:'between', threshold:0.05, threshold2:0.07) instead of two
+       * separately-voting signals - mirrors trading-core's IndicatorSignal. */
+      op: '>' | '<' | 'between' | 'outside'
       threshold: number
+      threshold2?: number
       dir: 'call' | 'put'
       weight: number
     }
@@ -636,10 +641,21 @@ export function labelOfSignal(s: LabSignalDef): string {
         }[s.variant] ?? s.variant
       )
     case 'indicator': {
+      // trendpullback/rangezone get real names - see trading-core's labelOf()
+      // for why (otherwise they're nearly impossible to spot in a signal
+      // list full of cryptic "ind op threshold" rows like everything else).
+      if (s.ind === 'trendpullback') return s.dir === 'call' ? 'Trend Pullback (Bull Continuation)' : 'Trend Pullback (Bear Continuation)'
+      if (s.ind === 'rangezone') return s.dir === 'call' ? 'Range Buy Zone' : 'Range Sell Zone'
       const p = s.params ?? {}
       const pd = p.period ?? p.fast
       const tag = s.type ? `:${s.type}` : ''
-      return `${s.ind}${tag}${Number.isFinite(pd) ? `(${pd})` : ''} ${s.op} ${s.threshold}`
+      const name = `${s.ind}${tag}${Number.isFinite(pd) ? `(${pd})` : ''}`
+      if (s.op === 'between' || s.op === 'outside') {
+        const lo = Math.min(s.threshold, s.threshold2 ?? s.threshold)
+        const hi = Math.max(s.threshold, s.threshold2 ?? s.threshold)
+        return `${name} ${s.op} [${lo}, ${hi}]`
+      }
+      return `${name} ${s.op} ${s.threshold}`
     }
     case 'mtf':
       return `MTF ${s.factor}x Trend ${s.dir === 'call' ? 'Up' : 'Down'}`

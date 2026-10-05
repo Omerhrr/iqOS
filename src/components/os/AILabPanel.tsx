@@ -279,6 +279,14 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
   const [manualIsCandle, setManualIsCandle] = useState(false)
   const [manualCandleName, setManualCandleName] = useState('')
   const [manualDir, setManualDir] = useState<'call' | 'put'>(SIGNAL_TEMPLATES[0].dir)
+  // Editable op/threshold for the selected indicator template - previously
+  // a template's op/threshold were baked in and uneditable, so there was no
+  // way to express a banded condition like "rangezone > 0.05 AND
+  // rangezone < 0.07" as ONE rule; 'between'/'outside' plus a live
+  // threshold2 field make that directly buildable here.
+  const [manualOp, setManualOp] = useState<'>' | '<' | 'between' | 'outside'>('>')
+  const [manualThreshold, setManualThreshold] = useState(0)
+  const [manualThreshold2, setManualThreshold2] = useState(0)
   const [manualWeight, setManualWeight] = useState(10)
   const [manualName, setManualName] = useState('')
   const [manualBasis, setManualBasis] = useState<Basis>('candles')
@@ -311,9 +319,19 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
   }, [manualSignals, manualMinScore, manualMinVotes, manualHorizon, manualBasis, manualName, manualAsset, manualTf])
 
   const addManualSignal = () => {
+    const template = SIGNAL_TEMPLATES[manualTemplateIdx]
     const def: LabSignalDef = manualIsCandle
       ? { kind: 'candle', name: manualCandleName.trim().slice(0, 40), dir: manualDir, weight: manualWeight }
-      : { ...SIGNAL_TEMPLATES[manualTemplateIdx], dir: manualDir, weight: manualWeight }
+      : template.kind === 'indicator'
+        ? {
+            ...template,
+            dir: manualDir,
+            weight: manualWeight,
+            op: manualOp,
+            threshold: manualThreshold,
+            ...(manualOp === 'between' || manualOp === 'outside' ? { threshold2: manualThreshold2 } : {}),
+          }
+        : { ...template, dir: manualDir, weight: manualWeight }
     if (manualIsCandle && !manualCandleName.trim()) {
       onError('enter a candlestick pattern name (e.g. "Hammer", "Engulfing")')
       return
@@ -798,8 +816,14 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
                 value={manualTemplateIdx}
                 onChange={(e) => {
                   const idx = Number(e.target.value)
+                  const t = SIGNAL_TEMPLATES[idx]
                   setManualTemplateIdx(idx)
-                  setManualDir(SIGNAL_TEMPLATES[idx].dir)
+                  setManualDir(t.dir)
+                  if (t.kind === 'indicator') {
+                    setManualOp(t.op)
+                    setManualThreshold(t.threshold)
+                    setManualThreshold2(t.threshold2 ?? t.threshold)
+                  }
                 }}
                 className="h-7 w-64 rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-[#dbe4f0]"
               >
@@ -814,6 +838,25 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
                 ))}
               </select>
             </label>
+          )}
+          {!manualIsCandle && SIGNAL_TEMPLATES[manualTemplateIdx].kind === 'indicator' && (
+            <>
+              <label className="flex flex-col gap-0.5">
+                <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">op</span>
+                <select
+                  value={manualOp}
+                  onChange={(e) => setManualOp(e.target.value as '>' | '<' | 'between' | 'outside')}
+                  className="h-7 rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-[#dbe4f0]"
+                >
+                  <option value=">">{'>'}</option>
+                  <option value="<">{'<'}</option>
+                  <option value="between">between (AND)</option>
+                  <option value="outside">outside (AND)</option>
+                </select>
+              </label>
+              <NumField label="threshold" value={manualThreshold} onChange={setManualThreshold} w="w-16" step={0.01} />
+              {(manualOp === 'between' || manualOp === 'outside') && <NumField label="threshold 2" value={manualThreshold2} onChange={setManualThreshold2} w="w-16" step={0.01} />}
+            </>
           )}
           <label className="flex flex-col gap-0.5">
             <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">dir</span>
