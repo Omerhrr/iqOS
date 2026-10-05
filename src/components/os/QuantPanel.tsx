@@ -2,8 +2,8 @@
 
 // IQAIR//OS - Quant lab panel: Hurst, vol models, ACF, Monte Carlo fan, S/R zones
 import { useEffect, useMemo, useState } from 'react'
-import type { AnalysisResult, Factor, OsModeStatus, OUVerdict } from '@/lib/os/client'
-import { fmtPrice, osGet, osPost } from '@/lib/os/client'
+import type { AnalysisResult, Factor, OsModeStatus, OUVerdict, RandomnessAudit } from '@/lib/os/client'
+import { fmtPrice, getRandomnessAudit, osGet, osPost } from '@/lib/os/client'
 
 /** Small chip showing a factor's live contribution to the composite signal score. */
 function FactorBadge({ factor }: { factor?: Factor }) {
@@ -283,6 +283,116 @@ function OuZStrip({ z }: { z: (number | null)[] }) {
   )
 }
 
+/**
+ * Randomness audit: descriptive statistics on the raw price FEED itself -
+ * step size, return volatility/skew/kurtosis, update cadence. This is a
+ * feed-behavior characterization for research/understanding, same genre as
+ * the Hurst/ACF/GARCH stats above it in this panel - it does NOT predict any
+ * specific future value and says nothing about a broker's internal RNG; it
+ * only describes what the observable price series looks like statistically
+ * (is it closer to a pure random walk, or does it show detectable structure
+ * like fat tails or a metronomic update schedule).
+ */
+function RandomnessAuditCard({ asset, tf }: { asset: string; tf: string }) {
+  const [audit, setAudit] = useState<RandomnessAudit | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const run = () => {
+    setBusy(true)
+    setError(null)
+    getRandomnessAudit(asset, tf as never)
+      .then(setAudit)
+      .catch((e: Error) => setError(e.message.slice(0, 120)))
+      .finally(() => setBusy(false))
+  }
+
+  useEffect(() => {
+    setAudit(null)
+    setError(null)
+  }, [asset])
+
+  const kurt = audit?.stepStats.excessKurtosis ?? 0
+  const kurtReadout =
+    audit === null
+      ? null
+      : Math.abs(kurt) < 0.5
+        ? { label: 'returns look roughly normal', color: '#aab6cc' }
+        : kurt > 0
+          ? { label: 'fat tails detected - larger-than-normal moves happen more often than a pure random walk would predict', color: '#f59e0b' }
+          : { label: 'thin tails - extreme moves are rarer than a normal distribution would predict', color: '#38bdf8' }
+
+  const jitter = audit?.intervalStats.jitterStdDevMs ?? 0
+  const meanInt = audit?.intervalStats.meanIntervalMs ?? 0
+  const jitterRatio = meanInt > 0 ? jitter / meanInt : 0
+  const cadenceReadout =
+    audit === null
+      ? null
+      : jitterRatio < 0.15
+        ? { label: 'near-perfectly metronomic timing (suggests a scheduled/timed generator)', color: '#f59e0b' }
+        : { label: 'naturally variable timing', color: '#aab6cc' }
+
+  return (
+    <div className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-3 xl:col-span-2">
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <h3 className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">Randomness Audit · OTC Feed Behavior</h3>
+        <button
+          type="button"
+          onClick={run}
+          disabled={busy}
+          className="rounded border border-cyan-500/40 bg-cyan-500/10 px-2 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wider text-cyan-300 transition-colors hover:bg-cyan-500/20 disabled:opacity-50"
+        >
+          {busy ? 'sampling…' : 'run audit'}
+        </button>
+      </div>
+      <p className="mb-2 text-[9px] leading-relaxed text-[#4b5a72]">
+        Descriptive statistics only - characterizes how this feed empirically moves (step size, return distribution, update cadence), for understanding whether it
+        behaves like a pure random walk or a tuned model with detectable structure. Not a prediction of any future value.
+      </p>
+      {error && <p className="font-mono text-[10px] text-rose-400">{error}</p>}
+      {audit && (
+        <>
+          <div className="mb-2 flex items-center gap-2">
+            <span
+              className="rounded px-1.5 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wider"
+              style={
+                audit.dataSource === 'tick'
+                  ? { color: '#10b981', background: 'rgba(16,185,129,0.12)' }
+                  : { color: '#f59e0b', background: 'rgba(245,158,11,0.12)' }
+              }
+            >
+              {audit.dataSource === 'tick' ? 'real sub-candle ticks' : 'finest candle resolution (5s) - approx'}
+            </span>
+            <span className="font-mono text-[9px] text-[#4b5a72]">n = {audit.stepStats.n} samples</span>
+          </div>
+          <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 font-mono text-[11px] md:grid-cols-4">
+            <Stat label="Avg step size" value={audit.stepStats.meanAbsStep.toExponential(3)} note="mean |price[i] - price[i-1]|" />
+            <Stat label="Std dev of returns" value={audit.stepStats.stdDevReturns.toExponential(3)} note="relative return volatility" />
+            <Stat label="Skewness" value={audit.stepStats.skewness.toFixed(2)} note="0 = symmetric" />
+            <Stat
+              label="Excess kurtosis"
+              value={audit.stepStats.excessKurtosis.toFixed(2)}
+              color={kurtReadout?.color}
+              note="0 = normal-like"
+            />
+            <Stat
+              label="Update frequency"
+              value={audit.intervalStats.updatesPerSecond >= 1 ? `${audit.intervalStats.updatesPerSecond.toFixed(2)}/s` : `${(audit.intervalStats.meanIntervalMs / 1000).toFixed(2)}s/update`}
+              note={`mean interval ${audit.intervalStats.meanIntervalMs.toFixed(0)}ms`}
+            />
+            <Stat label="Timing jitter (σ)" value={`${audit.intervalStats.jitterStdDevMs.toFixed(0)}ms`} color={cadenceReadout?.color} note="std dev of inter-arrival time" />
+          </div>
+          <div className="mt-2 space-y-1 border-t border-[#1c2739] pt-2 text-[10px] leading-relaxed">
+            {kurtReadout && <p style={{ color: kurtReadout.color }}>{kurtReadout.label}</p>}
+            {cadenceReadout && <p style={{ color: cadenceReadout.color }}>{cadenceReadout.label}</p>}
+          </div>
+        </>
+      )}
+      {!audit && !error && <p className="text-[10px] text-[#4b5a72]">Run the audit to sample the live feed and compute these stats.</p>}
+    </div>
+  )
+}
+
 export default function QuantPanel({ analysis }: { analysis: AnalysisResult | null }) {
   if (!analysis) return null
   const q = analysis.quant
@@ -433,6 +543,8 @@ export default function QuantPanel({ analysis }: { analysis: AnalysisResult | nu
           ))}
         </div>
       </div>
+
+      <RandomnessAuditCard asset={analysis.asset} tf={analysis.tf} />
     </div>
   )
 }

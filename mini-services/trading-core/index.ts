@@ -32,6 +32,7 @@ import { detectChartPatterns } from './src/analytics/chart-patterns'
 import { computeVolumeProfile, computeCandleDelta, computeCumulativeDelta } from './src/analytics/orderflow'
 import { findSmartBlends } from './src/analytics/candlemath'
 import { buildCalibrationReport, type CalibrationStoreSlice } from './src/analytics/calibration'
+import { computeStepStats, computeIntervalStats } from './src/analytics/randomness'
 
 // Defaults to 3030 for local/Windows dev; the Docker deployment overrides
 // this to an unusual, hard-to-collide-with port via the KERNEL_PORT env var.
@@ -270,6 +271,20 @@ const httpServer = createServer(async (req, res) => {
         const candles = market.getCandles(asset, timeframe, limit)
         const blends = findSmartBlends(candles, { maxGroup })
         return json(200, { ok: true, asset, tf: timeframe, raw: candles, blends })
+      }
+
+      // Randomness audit: descriptive statistics on the raw price feed
+      // itself (step size, return volatility/skew/kurtosis, update cadence)
+      // - a feed-behavior characterization, not a prediction tool. Uses
+      // real sub-candle ticks when the sidecar's buffer has enough samples,
+      // otherwise falls back to the finest candle resolution ('5s') and
+      // says so via dataSource.
+      if (path === '/randomness_audit') {
+        const asset = q.get('asset') ?? market.activeAsset
+        const { points, dataSource } = await market.getTickSeries(asset)
+        const stepStats = computeStepStats(points)
+        const intervalStats = computeIntervalStats(points)
+        return json(200, { ok: true, asset, dataSource, stepStats, intervalStats })
       }
 
       if (path === '/analysis') {

@@ -778,6 +778,30 @@ export class MarketDataService {
     return this.prices.get(asset) ?? 0
   }
 
+  /**
+   * Randomness-audit price series: real sub-candle ticks from the sidecar's
+   * buffer when LIVE/IQ and the buffer has enough samples, otherwise the
+   * finest candle resolution this OS tracks ('5s'). Always says which one
+   * it used (dataSource) so the UI can label the result honestly instead of
+   * implying raw tick data when it is really candle-close data.
+   */
+  async getTickSeries(asset: string): Promise<{ points: { time: number; price: number }[]; dataSource: 'tick' | 'candle' }> {
+    if (this.mode === 'live') {
+      try {
+        const url = `${this.liveUrl.replace(/\/$/, '')}/tick_stats?asset=${encodeURIComponent(asset)}`
+        const res = await fetch(url, { signal: AbortSignal.timeout(8_000) })
+        const data = (await res.json()) as { ok?: boolean; points?: { time: number; price: number }[] }
+        if (data?.ok && Array.isArray(data.points) && data.points.length >= 20) {
+          return { points: data.points, dataSource: 'tick' }
+        }
+      } catch {
+        // sidecar unreachable / buffer too young - fall through to candles
+      }
+    }
+    const candles = this.getCandles(asset, '5s', 1000)
+    return { points: candles.map((c) => ({ time: c.time, price: c.close })), dataSource: 'candle' }
+  }
+
   listAssets(): (AssetInfo & { price: number; iq: boolean })[] {
     return this.assets.map((a) => ({ ...a, price: this.prices.get(a.ticker) ?? a.basePrice, iq: this.isIQAvailable(a.ticker) }))
   }

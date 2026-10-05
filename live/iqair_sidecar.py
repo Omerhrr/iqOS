@@ -282,6 +282,71 @@ def _touch_watch(ticker):
         _seed_stream(key)
 
 
+# ---------------- randomness-audit tick capture ----------------
+# Pure descriptive-statistics support: a rolling buffer of raw price
+# observations per watched asset, so the OS can characterize an OTC feed's
+# statistical behavior (step size, return volatility/kurtosis, update
+# cadence) instead of guessing from candle closes alone.
+#
+# HONESTY NOTE on what this actually is: IQ Option's public API does not
+# expose a push-based tick/quote websocket we can subscribe to directly -
+# the only sub-candle-boundary signal available is that the in-memory
+# candle table _stream_price() reads from (client.get_realtime_candles) is
+# updated by the lib's own websocket dispatch thread continuously as the
+# broker pushes quotes into the CURRENTLY OPEN candle, not just once per
+# candle boundary. There is no notification when that happens, so the only
+# way to observe it is to poll the RAM table fast enough to catch distinct
+# values. The capture loop below polls every TICK_POLL_SEC and records a
+# new sample only when the observed price actually changes, with the WALL
+# CLOCK TIME WE OBSERVED the change as the timestamp. This is a real
+# capture of the broker's own price changes (not synthesized), but the
+# measured update cadence is upper-bounded by our poll rate - if the feed
+# updates faster than TICK_POLL_SEC, some updates will be coalesced. We
+# poll fast (100ms) specifically so this bound rarely matters in practice,
+# but /tick_stats reports dataSource:"tick" with this caveat documented so
+# the OS can label it honestly rather than imply a raw broker tick stream.
+TICK_POLL_SEC = 0.1
+TICK_BUF_MAX = 1000
+_tick_lock = threading.Lock()
+_tick_buffers = {}  # norm key -> list of (ts_ms, price), oldest first
+
+
+def _tick_capture_loop():
+    while True:
+        time.sleep(TICK_POLL_SEC)
+        if _client is None or not _streamed:
+            continue
+        now_ms = time.time() * 1000.0
+        for key in list(_streamed):
+            try:
+                price = _stream_price(key)
+            except Exception:  # noqa: BLE001
+                price = None
+            if price is None:
+                continue
+            with _tick_lock:
+                buf = _tick_buffers.setdefault(key, [])
+                if not buf or buf[-1][1] != price:
+                    buf.append((now_ms, price))
+                    if len(buf) > TICK_BUF_MAX:
+                        del buf[: len(buf) - TICK_BUF_MAX]
+
+
+threading.Thread(target=_tick_capture_loop, daemon=True).start()
+
+
+def _tick_series_for(asset):
+    """Returns (points, dataSource) for /tick_stats. points is a list of
+    {time (unix seconds, float), price}. Looks up the buffer under the same
+    normalized key the capture loop and the stream engine both use."""
+    canon = _canonical_ticker(asset) or asset
+    key = _norm_key(asset)
+    with _tick_lock:
+        buf = _tick_buffers.get(key) or _tick_buffers.get(_norm_key(canon)) or []
+        points = [{"time": ts / 1000.0, "price": p} for ts, p in buf]
+    return points
+
+
 def _watch_reaper():
     """Stop streams the OS stopped asking about (asset switch, closed watch
     rows) so websocket subscriptions stay bounded."""
@@ -718,6 +783,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(_err("iqair bus busy - retry shortly"), 503)
             except Exception as exc:  # noqa: BLE001
                 return self._send(_err(exc), 500)
+
+        if path == "/tick_stats":
+            # Raw buffered price observations for the randomness-audit tool
+            # (descriptive statistics only - see the capture-loop comment
+            # above for exactly what this does and does not capture).
+            asset = params.get("asset", "EURUSD")
+            canon = _canonical_ticker(asset) or asset
+            if OP_code is not None and canon not in OP_code.ACTIVES:
+                return self._send(_err(f"unknown asset {asset}"), 400)
+            _touch_watch(canon)  # ensure the stream (and capture loop) is running
+            points = _tick_series_for(asset)
+            return self._send(_ok({"asset": asset, "points": points, "pollSec": TICK_POLL_SEC}))
 
         if path == "/balance":
             # short lock wait: balance is polled on a 15s cadence, missing

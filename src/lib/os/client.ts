@@ -201,6 +201,44 @@ export async function getDelta(asset: string, tf: Timeframe, opts?: { limit?: nu
   return { deltas: d.deltas, cumulative: d.cumulative }
 }
 
+// ---------- randomness audit (descriptive feed statistics) ----------
+// Characterizes an OTC feed's empirical behavior - step size, return
+// volatility/skew/kurtosis, update cadence. Purely descriptive: this is
+// NOT a prediction mechanism and says nothing about a broker's internal
+// RNG/seed, just what the observable price series statistically looks
+// like. dataSource is 'tick' (real sub-candle price observations buffered
+// by the sidecar) or 'candle' (finest available candle resolution, '5s') -
+// always label which one was used, same honesty convention as order flow's
+// "(approx)" tagging.
+
+export interface RandomnessStepStats {
+  meanAbsStep: number
+  stdDevReturns: number
+  skewness: number
+  excessKurtosis: number
+  n: number
+}
+
+export interface RandomnessIntervalStats {
+  meanIntervalMs: number
+  medianIntervalMs: number
+  updatesPerSecond: number
+  jitterStdDevMs: number
+  n: number
+}
+
+export interface RandomnessAudit {
+  asset: string
+  dataSource: 'tick' | 'candle'
+  stepStats: RandomnessStepStats
+  intervalStats: RandomnessIntervalStats
+}
+
+export async function getRandomnessAudit(asset: string, tf?: Timeframe): Promise<RandomnessAudit> {
+  const d = await osGet<{ ok: boolean } & RandomnessAudit>('/randomness_audit', { asset, tf })
+  return { asset: d.asset, dataSource: d.dataSource, stepStats: d.stepStats, intervalStats: d.intervalStats }
+}
+
 // ---------- candle math (candle blending / candlestick algebra) ----------
 // See trading-core/src/analytics/candlemath.ts for the exact blend rule
 // (Open=first, High=max, Low=min, Close=last) and the pattern-confirmed
