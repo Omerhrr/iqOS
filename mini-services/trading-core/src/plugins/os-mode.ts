@@ -350,6 +350,13 @@ export class ModeService {
    * handful of active_ids while everything else kept trading fine. */
   private static BROKER_UNAVAILABLE_RE = /not available at the moment|is not a (?:turbo\/binary\/digital|digital\/turbo\/binary) instrument|active\b[^.]*not found/i
   private static BROKER_UNAVAILABLE_COOLDOWN_SEC = 600
+  /** Bound on how many times one tick will re-pick and retry after a
+   * broker-unavailable rejection before giving up and standing down - keeps
+   * a systemic outage (the whole active_id map stale at once) from turning
+   * one tick into an unbounded loop, while still giving the tick a real
+   * chance to work its way down the ranked pool to a pair that's actually
+   * tradable, instead of giving up after exactly one try. */
+  private static MAX_PLACE_ATTEMPTS_PER_TICK = 6
   /** Hard floor for the per-asset re-entry cooldown (assetBlocked) - a pair
    * the auto-trader just traded always sits out at least this long, however
    * cooldownSec is configured. */
@@ -622,66 +629,94 @@ export class ModeService {
 
     // source signals: ranked screener feed first, liquid on-demand eval while the sweep warms up
     // (pickSignal already applies per-asset cooldowns + one-auto-position-per-asset)
-    const row = this.pickSignal()
-    if (!row) return this.standDown('no signal meets the auto-trader thresholds yet')
+    //
+    // A single broker-side "this pair isn't tradable" rejection used to end
+    // the WHOLE tick - stand down, wait out paceSec/the next 10s tick, try
+    // again. That's fine when it's one occasionally-stale pair, but when the
+    // active_id map itself has drifted (e.g. right after an IQ instrument
+    // catalog refresh swaps ids out from under us - the exact symptom in the
+    // logs: "Active ... not found" on pair after pair), standing down after
+    // the FIRST rejection meant the auto-trader could go an entire session
+    // without ever landing a trade, even though plenty of pairs would have
+    // worked fine once the stale one was skipped. So: on a broker-unavailable
+    // rejection, cool that asset down (same as before) and immediately
+    // re-pick and retry IN THE SAME TICK instead of giving up - bounded so a
+    // systemic outage can't spin forever. Any other kind of rejection (risk
+    // manager block, insufficient funds, a real misconfiguration) still
+    // stands down immediately, unchanged - those aren't "try a different
+    // pair" situations.
+    let lastReason = 'no signal meets the auto-trader thresholds yet'
+    let refreshedAssetsThisTick = false
+    for (let attempt = 0; attempt < ModeService.MAX_PLACE_ATTEMPTS_PER_TICK; attempt++) {
+      const row = this.pickSignal()
+      if (!row) break
 
-    // copilot memory gate: standing rules from the copilot's persistent memory
-    // ("never trade Fridays", "only trade ...", "max stake $...", rate caps)
-    // bind the OS's own trader too - the user's words outrank the machine
-    const bet = this.stakeForAuto(row)
-    try {
-      const mg = this.ctx.use<{ check: (asset: string, stake: number) => { ok: boolean; reason?: string } }>('memoryGate')
-      const g = mg.check(row.asset, bet.amount)
-      if (!g.ok) return this.standDown(g.reason ?? 'memory gate hold')
-    } catch {
-      // memory gate plugin not loaded - rule gating disabled
-    }
-
-    const side = row.direction === 'put' ? 'put' : 'call'
-    const out = await this.place(row, side, bet.amount)
-    if (!out.ok) {
-      const reason = out.error ?? 'order rejected'
-      if (ModeService.BROKER_UNAVAILABLE_RE.test(reason)) {
-        // IQ itself just said this pair isn't tradable right now - our own
-        // open/closed cache (sidecarAssetsTs, up to 10 min stale) is already
-        // wrong for it, and without this the picker just re-selects the
-        // same top-ranked-but-closed pair on the very next 10s tick, so the
-        // SAME rejection repeats "a lot" forever. Take it off the table for
-        // a while and kick a fresh /assets fetch so the cache catches up
-        // sooner than its normal TTL.
-        this.assetRejectedUntil.set(row.asset, this.now() + ModeService.BROKER_UNAVAILABLE_COOLDOWN_SEC)
-        try {
-          this.ctx.use<{ forceRefreshSidecarAssets: () => void }>('market').forceRefreshSidecarAssets()
-        } catch {
-          // market plugin not loaded - cache catches up on its own next cycle
-        }
+      // copilot memory gate: standing rules from the copilot's persistent memory
+      // ("never trade Fridays", "only trade ...", "max stake $...", rate caps)
+      // bind the OS's own trader too - the user's words outrank the machine
+      const bet = this.stakeForAuto(row)
+      try {
+        const mg = this.ctx.use<{ check: (asset: string, stake: number) => { ok: boolean; reason?: string } }>('memoryGate')
+        const g = mg.check(row.asset, bet.amount)
+        if (!g.ok) return this.standDown(g.reason ?? 'memory gate hold') // a rule, not a broker hiccup - don't retry a different pair around it
+      } catch {
+        // memory gate plugin not loaded - rule gating disabled
       }
-      return this.standDown(reason)
-    }
 
-    this.rt.trades += 1
-    this.rt.lastTradeTs = this.now()
-    this.rt.lastAssetTs.set(row.asset, this.now())
-    this.rt.openCount += 1
-    this.rt.lastRejection = undefined
-    const rollTag = bet.compound ? ` · ${bet.phase} roll x${bet.rollN + 1}${this.config.stakePlan?.periods ? `/${this.config.stakePlan.periods}` : ''} (pot $${bet.pot.toFixed(2)})` : ''
-    this.rt.lastAction = `${side.toUpperCase()} ${row.asset}${rollTag}`
-    const detail =
-      this.config.signalSource === 'kalman-ou'
-        ? `OU z ${row.ouZ.toFixed(2)}σ · HL ${row.ouHalfLife >= 9999 ? '∞' : row.ouHalfLife.toFixed(0)}b · t ${row.ouTStat.toFixed(1)} · edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)}`
-        : this.config.signalSource === 'markov'
-          ? `P(up) ${(row.pUp * 100).toFixed(1)}% · regime ${row.regime} · edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)}`
-          : this.config.signalSource === 'momentum'
-            ? `ADX ${row.adx.toFixed(0)} · RSI ${row.rsi.toFixed(0)} · Δ${row.changePct.toFixed(2)}% · edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)}`
-            : this.config.signalSource === 'confluence'
-              ? `14-factor confluence ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`
-              : this.config.signalSource === 'strategy'
-                ? (row.note ?? `${this.effectiveStrategyIds().join('+') || 'strategy'} (${row.direction.toUpperCase()})`)
-                : `score ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} regime ${row.regime}`
-    this.emit(
-      'success',
-      `[AUTO-TRADER] ${side.toUpperCase()} ${row.asset} ${this.config.tf} $${this.config.stake} binary - ${detail}`
-    )
+      const side = row.direction === 'put' ? 'put' : 'call'
+      const out = await this.place(row, side, bet.amount)
+      if (!out.ok) {
+        const reason = out.error ?? 'order rejected'
+        lastReason = reason
+        if (ModeService.BROKER_UNAVAILABLE_RE.test(reason)) {
+          // IQ itself just said this pair isn't tradable right now - our own
+          // open/closed cache (sidecarAssetsTs, up to 10 min stale) is already
+          // wrong for it, and without this the picker just re-selects the
+          // same top-ranked-but-closed pair on the very next 10s tick, so the
+          // SAME rejection repeats "a lot" forever. Take it off the table for
+          // a while and kick a fresh /assets fetch so the cache catches up
+          // sooner than its normal TTL (once per tick - no point asking twice
+          // inside the same handful of seconds).
+          this.assetRejectedUntil.set(row.asset, this.now() + ModeService.BROKER_UNAVAILABLE_COOLDOWN_SEC)
+          if (!refreshedAssetsThisTick) {
+            refreshedAssetsThisTick = true
+            try {
+              this.ctx.use<{ forceRefreshSidecarAssets: () => void }>('market').forceRefreshSidecarAssets()
+            } catch {
+              // market plugin not loaded - cache catches up on its own next cycle
+            }
+          }
+          continue // try the next-best candidate right now instead of waiting a full tick
+        }
+        return this.standDown(reason) // not a "pick a different pair" situation - stand down as before
+      }
+
+      this.rt.trades += 1
+      this.rt.lastTradeTs = this.now()
+      this.rt.lastAssetTs.set(row.asset, this.now())
+      this.rt.openCount += 1
+      this.rt.lastRejection = undefined
+      const rollTag = bet.compound ? ` · ${bet.phase} roll x${bet.rollN + 1}${this.config.stakePlan?.periods ? `/${this.config.stakePlan.periods}` : ''} (pot $${bet.pot.toFixed(2)})` : ''
+      this.rt.lastAction = `${side.toUpperCase()} ${row.asset}${rollTag}`
+      const detail =
+        this.config.signalSource === 'kalman-ou'
+          ? `OU z ${row.ouZ.toFixed(2)}σ · HL ${row.ouHalfLife >= 9999 ? '∞' : row.ouHalfLife.toFixed(0)}b · t ${row.ouTStat.toFixed(1)} · edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)}`
+          : this.config.signalSource === 'markov'
+            ? `P(up) ${(row.pUp * 100).toFixed(1)}% · regime ${row.regime} · edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)}`
+            : this.config.signalSource === 'momentum'
+              ? `ADX ${row.adx.toFixed(0)} · RSI ${row.rsi.toFixed(0)} · Δ${row.changePct.toFixed(2)}% · edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)}`
+              : this.config.signalSource === 'confluence'
+                ? `14-factor confluence ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`
+                : this.config.signalSource === 'strategy'
+                  ? (row.note ?? `${this.effectiveStrategyIds().join('+') || 'strategy'} (${row.direction.toUpperCase()})`)
+                  : `score ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} regime ${row.regime}`
+      this.emit(
+        'success',
+        `[AUTO-TRADER] ${side.toUpperCase()} ${row.asset} ${this.config.tf} $${this.config.stake} binary - ${detail}`
+      )
+      return
+    }
+    return this.standDown(lastReason)
   }
 
   /** Shared by the 'screener' and 'strategy' sources (the two that already
