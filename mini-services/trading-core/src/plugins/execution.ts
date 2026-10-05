@@ -686,6 +686,24 @@ export class ExecutionService {
         this.finishLiveExpiryFromBroker(pos, result.pnl as number)
         return
       }
+      // THE BUG (root cause of "iqos settles before iqoption"): our local
+      // settlesAt is only an ESTIMATE (now+N*60, or a broker echo that can
+      // still be off a beat) - IQ rounds turbo/binary expiry to its own
+      // minute-boundary clock, so a 1m trade placed mid-minute can run up to
+      // ~90s real-world. Once our estimate's clock hit zero, the code below
+      // used to fall straight into the price-quote ladder and settle off a
+      // candle at OUR guessed time regardless of what the broker just said -
+      // including the case right here, where IQ explicitly confirmed the
+      // order is still "open". That is exactly how iqOS could mark a trade
+      // won/lost and log a close time while the real IQ position was still
+      // running. When the broker says open, broker's clock wins: hold off
+      // settling this sweep entirely (no quote fallback, no degraded/last-
+      // resort escalation) and let the next 1s tick re-ask - never guess a
+      // result or a close time while IQ itself says the trade is live.
+      if (result?.found && result.status === 'open') {
+        this.settlingLive.delete(pos.id)
+        return
+      }
     }
     const quote = await this.iqExpiryQuote(pos.asset, expiresAt)
     if (quote) {
