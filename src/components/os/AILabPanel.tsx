@@ -313,6 +313,18 @@ export default function AILabPanel({ assets, strategies, onError, refreshBots }:
   const [manualBuiltinIdx, setManualBuiltinIdx] = useState(0)
   const [manualBuiltinParamsText, setManualBuiltinParamsText] = useState('{}')
   const [manualBuiltinParamsError, setManualBuiltinParamsError] = useState<string | null>(null)
+  // A builtin strategy has no fixed "favors call" or "favors put" bias the
+  // way a candle pattern or a bar variant does - most of them (Supertrend
+  // Follow, Pattern Confluence, the Markov/Kalman ones...) genuinely trade
+  // both sides depending on current market state, and the `dir` field below
+  // just picks which of ITS OWN outputs counts as active for the role
+  // you're assigning it in a group. This runs the real strategy live on the
+  // picked pair/tf (same /run_strategy path the backtest lab and autopilot
+  // bots use) so you can actually SEE which way it's reading right now
+  // before deciding whether it belongs in a CALL-side or PUT-side group.
+  const [manualBuiltinPreview, setManualBuiltinPreview] = useState<{ direction: 'call' | 'put' | 'none'; score: number; notes: string } | null>(null)
+  const [manualBuiltinPreviewLoading, setManualBuiltinPreviewLoading] = useState(false)
+  const [manualBuiltinPreviewError, setManualBuiltinPreviewError] = useState<string | null>(null)
 
   // Seed the params textarea with the selected strategy's own defaults the
   // moment builtin mode turns on (or once `strategies` finishes loading) -
@@ -324,6 +336,15 @@ export default function AILabPanel({ assets, strategies, onError, refreshBots }:
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [manualIsBuiltin, strategies.length])
+
+  // A stale preview (from a different strategy/pair/tf) is worse than no
+  // preview - clear it the moment anything the preview depends on changes,
+  // so a leftover "CALL" reading can never be mistaken for this strategy's
+  // current read on the currently-selected pair.
+  useEffect(() => {
+    setManualBuiltinPreview(null)
+    setManualBuiltinPreviewError(null)
+  }, [manualBuiltinIdx, manualAsset, manualTf])
   const [manualDir, setManualDir] = useState<'call' | 'put'>(SIGNAL_TEMPLATES[0].dir)
   // Editable op/threshold for the selected indicator template - previously
   // a template's op/threshold were baked in and uneditable, so there was no
@@ -372,6 +393,46 @@ export default function AILabPanel({ assets, strategies, onError, refreshBots }:
     setManualSavedId(null)
     setManualBacktest(null)
   }, [manualSignals, manualMinScore, manualMinVotes, manualHorizon, manualBasis, manualName, manualAsset, manualTf])
+
+  /** Runs the currently-selected builtin strategy LIVE on manualAsset/manualTf
+   * (same /run_strategy path the backtest lab and autopilot bots use) so the
+   * user can see which way it's actually reading right now, instead of
+   * guessing at a `dir` to assign it when building a group. */
+  const testBuiltinPreview = async () => {
+    const strat = strategies[manualBuiltinIdx]
+    if (!strat) return
+    let params: Record<string, number | string> | undefined
+    if (manualBuiltinParamsText.trim() && manualBuiltinParamsText.trim() !== '{}') {
+      try {
+        const parsed = JSON.parse(manualBuiltinParamsText)
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) params = parsed as Record<string, number | string>
+        else {
+          setManualBuiltinPreviewError('params must be a JSON object')
+          return
+        }
+      } catch (e) {
+        setManualBuiltinPreviewError(`invalid JSON: ${(e as Error).message}`)
+        return
+      }
+    }
+    setManualBuiltinPreviewLoading(true)
+    setManualBuiltinPreviewError(null)
+    try {
+      const res = await osPost<{ ok: boolean; eval?: { direction: 'call' | 'put' | 'none'; score: number; notes: string }; error?: string }>('/run_strategy', {
+        asset: manualAsset,
+        tf: manualTf,
+        strategy: strat.id,
+        params,
+      })
+      if (!res.ok || !res.eval) throw new Error(res.error ?? 'preview failed')
+      setManualBuiltinPreview(res.eval)
+    } catch (e) {
+      setManualBuiltinPreview(null)
+      setManualBuiltinPreviewError((e as Error).message)
+    } finally {
+      setManualBuiltinPreviewLoading(false)
+    }
+  }
 
   const addManualSignal = () => {
     if (manualIsBuiltin) {
@@ -1187,6 +1248,50 @@ export default function AILabPanel({ assets, strategies, onError, refreshBots }:
             >
               reset to defaults
             </button>
+
+            <div className="mt-2 border-t border-lime-500/20 pt-2">
+              <p className="mb-1.5 font-mono text-[9px] leading-relaxed text-lime-200">
+                No fixed call/put bias - most builtin strategies trade either side depending on current conditions. Run it live on {manualAsset} {manualTf}{' '}
+                to see which way it&apos;s reading right now, then set <span className="text-[#aab6cc]">dir</span> below to match (or to the opposite, to
+                fade it).
+              </p>
+              <div className="flex items-center gap-2">
+                <Button
+                  onClick={() => void testBuiltinPreview()}
+                  disabled={manualBuiltinPreviewLoading}
+                  variant="outline"
+                  className="h-6 border-lime-500/40 px-2 text-[9px] font-bold uppercase tracking-wider text-lime-300 hover:bg-lime-500/10 disabled:opacity-40"
+                >
+                  {manualBuiltinPreviewLoading ? 'testing…' : `test live on ${manualAsset}`}
+                </Button>
+                {manualBuiltinPreview && (
+                  <span className="font-mono text-[10px]">
+                    right now:{' '}
+                    <span
+                      className={
+                        manualBuiltinPreview.direction === 'call'
+                          ? 'text-emerald-400'
+                          : manualBuiltinPreview.direction === 'put'
+                            ? 'text-rose-400'
+                            : 'text-[#7c8aa5]'
+                      }
+                    >
+                      {manualBuiltinPreview.direction.toUpperCase()}
+                    </span>{' '}
+                    <span className="text-[#7c8aa5]">(score {manualBuiltinPreview.score.toFixed(0)}) - {manualBuiltinPreview.notes}</span>
+                    <button
+                      type="button"
+                      onClick={() => setManualDir(manualBuiltinPreview.direction === 'put' ? 'put' : 'call')}
+                      disabled={manualBuiltinPreview.direction === 'none'}
+                      className="ml-2 text-[9px] text-lime-300 underline hover:text-lime-200 disabled:cursor-not-allowed disabled:text-[#4b5a72] disabled:no-underline"
+                    >
+                      use this dir
+                    </button>
+                  </span>
+                )}
+              </div>
+              {manualBuiltinPreviewError && <p className="mt-1 font-mono text-[10px] text-rose-400">{manualBuiltinPreviewError}</p>}
+            </div>
           </div>
         )}
 

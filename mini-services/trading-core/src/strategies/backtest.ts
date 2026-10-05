@@ -7,6 +7,41 @@ import { defaultParams, getStrategy } from './builtin'
 import { sharpeRatio } from '../analytics/quant'
 import type { StakePlan } from '../plugins/autopilot'
 
+export interface DirectionMetrics {
+  trades: number
+  wins: number
+  losses: number
+  winRate: number
+  netPnl: number
+  expectancy: number
+}
+
+/** Splits any trade list by side (call/put) - shared by backtest.ts's own
+ * full run AND optimize.ts's fast windowed path (grid search, walk-forward,
+ * asset sweep), so every one of those surfaces reports the exact same
+ * per-direction shape rather than each growing its own slightly-different
+ * copy. A strategy's blended win rate can quietly hide "great on calls, a
+ * coin-flip on puts" (or the reverse) - this is what you need to see before
+ * picking a dir for it in an AI Lab group, and it matters just as much when
+ * comparing optimizer combos, walk-forward folds, or swept assets as it
+ * does on a single run. */
+export function directionBreakdown(trades: BacktestTrade[]): { call: DirectionMetrics; put: DirectionMetrics } {
+  const of = (side: 'call' | 'put'): DirectionMetrics => {
+    const sideTrades = trades.filter((t) => t.side === side)
+    const sideWins = sideTrades.filter((t) => t.status === 'won').length
+    const sidePnl = sideTrades.reduce((a, t) => a + t.pnl, 0)
+    return {
+      trades: sideTrades.length,
+      wins: sideWins,
+      losses: sideTrades.length - sideWins,
+      winRate: sideTrades.length ? (sideWins / sideTrades.length) * 100 : 0,
+      netPnl: sidePnl,
+      expectancy: sideTrades.length ? sidePnl / sideTrades.length : 0,
+    }
+  }
+  return { call: of('call'), put: of('put') }
+}
+
 export interface BacktestOptions {
   strategy: string
   params?: Record<string, number | string>
@@ -204,6 +239,8 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
   const avgTfSec = candles.length > 1 ? candles[candles.length - 1].time - candles[candles.length - 2].time : 60
   const periodsPerYear = (365 * 24 * 3600) / Math.max(1, avgTfSec)
 
+  const byDirection = directionBreakdown(trades)
+
   return {
     strategy: strat.id,
     asset,
@@ -226,6 +263,7 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
       expectancy: trades.length ? (equity - startEquity) / trades.length : 0,
       finalEquity: equity,
       startEquity,
+      byDirection,
     },
     ...(compoundPlan ? { compoundCycles } : {}),
   }

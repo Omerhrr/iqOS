@@ -4,7 +4,7 @@
 // backtester so the numbers the user acts on match the Single-run lab exactly.
 import type { BacktestResult, BacktestTrade, Candle, StrategyDef, Timeframe } from '../types'
 import { defaultParams, getStrategy } from './builtin'
-import { backtest } from './backtest'
+import { backtest, directionBreakdown, type DirectionMetrics } from './backtest'
 import { sharpeRatio } from '../analytics/quant'
 
 export type Objective = 'netPnl' | 'sharpe' | 'profitFactor' | 'winRate' | 'expectancy'
@@ -30,6 +30,10 @@ export interface FastMetrics {
   // floor (30) - callers/UI should visibly flag results built on this few
   // trades rather than let them be read as reliable.
   lowSample: boolean
+  // Same metrics split by call/put (see backtest.ts's directionBreakdown) -
+  // a combo/fold/asset's blended win rate can hide a strategy that's only
+  // actually good on one side.
+  byDirection: { call: DirectionMetrics; put: DirectionMetrics }
 }
 
 export interface OptRow {
@@ -265,7 +269,11 @@ const emptyMetrics = (): FastMetrics => ({
   winRateCiLow: 0,
   winRateCiHigh: 0,
   lowSample: true,
+  byDirection: { call: emptyDirection(), put: emptyDirection() },
 })
+function emptyDirection(): DirectionMetrics {
+  return { trades: 0, wins: 0, losses: 0, winRate: 0, netPnl: 0, expectancy: 0 }
+}
 
 const MIN_SAMPLE_FOR_SIGNIFICANCE = 30
 
@@ -374,6 +382,7 @@ export function fastBacktest(
     winRateCiLow: ciLow,
     winRateCiHigh: ciHigh,
     lowSample: total < MIN_SAMPLE_FOR_SIGNIFICANCE,
+    byDirection: directionBreakdown(trades),
   }
 }
 
@@ -534,6 +543,7 @@ export function gridSearch(candles: Candle[], asset: string, tf: Timeframe, opts
           winRateCiLow: fciLow,
           winRateCiHigh: fciHigh,
           lowSample: full.metrics.totalTrades < MIN_SAMPLE_FOR_SIGNIFICANCE,
+          byDirection: full.metrics.byDirection,
         }
         const fs = scoreOf(fm, objective, minTrades)
         if (Number.isFinite(fs)) {
@@ -687,6 +697,7 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
       winRateCiLow: oosCiLow,
       winRateCiHigh: oosCiHigh,
       lowSample: oosFull.metrics.totalTrades < MIN_SAMPLE_FOR_SIGNIFICANCE,
+      byDirection: oosFull.metrics.byDirection,
     }
     outFolds.push({ fold: f + 1, isBars: isSlice.length, oosBars: oosSlice.length, bestParams: bestCombo, is: bestIsMetrics, oos: oosM })
     oosMetrics.push(oosM)
@@ -729,6 +740,11 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
     const pooledGrossWin = pooledTrades.filter((t) => t.pnl > 0).reduce((a, t) => a + t.pnl, 0)
     const pooledGrossLoss = Math.abs(pooledTrades.filter((t) => t.pnl < 0).reduce((a, t) => a + t.pnl, 0))
     agg.profitFactor = pooledGrossLoss === 0 ? (pooledGrossWin > 0 ? 99 : 0) : pooledGrossWin / pooledGrossLoss
+    // Same "pool the real trades, don't average the per-fold ratio" logic
+    // as sharpe/profitFactor above - a fold-net average of winRate by
+    // direction would be a weaker, less honest number than the true
+    // trade-level split across every OOS trade in every fold.
+    agg.byDirection = directionBreakdown(pooledTrades)
   } else {
     agg.sharpe = 0
     agg.profitFactor = 0

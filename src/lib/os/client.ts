@@ -984,6 +984,14 @@ export interface BacktestResult {
     winRateCiLow: number
     winRateCiHigh: number
     lowSample: boolean
+    /** Same metrics, split by which side the trade actually was - a
+     * strategy's blended win rate can hide one that's genuinely good on
+     * CALLs and a coin-flip (or worse) on PUTs, which matters once it gets
+     * combined into an AI Lab group with a chosen dir. */
+    byDirection: {
+      call: { trades: number; wins: number; losses: number; winRate: number; netPnl: number; expectancy: number }
+      put: { trades: number; wins: number; losses: number; winRate: number; netPnl: number; expectancy: number }
+    }
   }
   // Present only when a compounding stakePlan was sent: how many times a
   // stopOnLoss cycle ended and the backtest auto-reseeded at base to keep
@@ -1026,6 +1034,12 @@ export interface FastMetrics {
   winRateCiLow: number
   winRateCiHigh: number
   lowSample: boolean
+  /** Same metrics split by call/put - a combo/fold/asset's blended win rate
+   * can hide a strategy that's only actually good on one side. */
+  byDirection: {
+    call: { trades: number; wins: number; losses: number; winRate: number; netPnl: number; expectancy: number }
+    put: { trades: number; wins: number; losses: number; winRate: number; netPnl: number; expectancy: number }
+  }
 }
 
 export interface OptRow {

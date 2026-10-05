@@ -406,6 +406,19 @@ export interface BacktestResult {
     expectancy: number
     finalEquity: number
     startEquity: number
+    /** Same metrics, split by which side the trade actually was (trade.side) -
+     * a strategy's blended win rate can hide a lopsided strategy that's
+     * genuinely good on CALLs and a coin-flip (or worse) on PUTs, which
+     * matters a lot once that strategy gets combined with others in a
+     * directional AI Lab group (see custom.ts's GroupSignal/BuiltinSignal) -
+     * you want to know which side it's actually trustworthy on BEFORE
+     * assigning it a dir there, not find out after. Either side can be 0
+     * trades (winRate 0) if the strategy never fired that way over the
+     * tested window. */
+    byDirection: {
+      call: { trades: number; wins: number; losses: number; winRate: number; netPnl: number; expectancy: number }
+      put: { trades: number; wins: number; losses: number; winRate: number; netPnl: number; expectancy: number }
+    }
   }
   // Set only when a compounding stakePlan was replayed: how many times
   // stopOnLoss ended a cycle and the backtest auto-reseeded at base to keep

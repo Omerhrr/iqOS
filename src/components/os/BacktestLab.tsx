@@ -341,6 +341,64 @@ function niceStep(lo: number, hi: number): number {
 
 const netCls = (v: number) => (v > 0 ? 'text-emerald-400' : v < 0 ? 'text-rose-400' : 'text-[#7c8aa5]')
 
+type DirMetrics = { trades: number; wins: number; losses: number; winRate: number; netPnl: number; expectancy: number }
+
+/** Compact call/put win-rate pair for a table cell - "C 62% · P 41%", dashed
+ * out when a side never fired. Used by the Optimizer/Walk-Forward/Sweep
+ * ranked tables so a blended win rate doesn't hide a one-sided strategy. */
+function DirSplitCell({ byDirection }: { byDirection: { call: DirMetrics; put: DirMetrics } }) {
+  const part = (label: string, d: DirMetrics, cls: string) =>
+    d.trades === 0 ? (
+      <span key={label} className="text-[#3a4458]">{label} —</span>
+    ) : (
+      <span key={label} className={d.winRate >= 50 ? cls : 'text-rose-400'}>
+        {label} {d.winRate.toFixed(0)}%
+      </span>
+    )
+  return (
+    <span className="flex items-center gap-1.5 whitespace-nowrap">
+      {part('C', byDirection.call, 'text-emerald-400')}
+      <span className="text-[#2a3448]">·</span>
+      {part('P', byDirection.put, 'text-sky-400')}
+    </span>
+  )
+}
+
+/** Full "Call vs Put" headline block, same spirit as the Single-Run tab's,
+ * for the one most-prominent result in a tool (Optimizer's best, Walk-
+ * Forward's pooled OOS aggregate, Sweep's top-ranked row). */
+function DirSplitBlock({ byDirection }: { byDirection: { call: DirMetrics; put: DirMetrics } }) {
+  return (
+    <div className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-3">
+      <h4 className="mb-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">
+        Call vs Put - which side this result is actually trustworthy on
+      </h4>
+      <div className="grid grid-cols-2 gap-2">
+        {([
+          ['CALL', byDirection.call, 'text-emerald-400'],
+          ['PUT', byDirection.put, 'text-rose-400'],
+        ] as const).map(([label, d, labelCls]) => (
+          <div key={label} className="rounded border border-[#1c2739] bg-[#101828] p-2">
+            <div className={`font-mono text-[10px] font-bold uppercase tracking-wider ${labelCls}`}>{label}</div>
+            {d.trades === 0 ? (
+              <div className="mt-1 font-mono text-[11px] text-[#4b5a72]">never fired this way</div>
+            ) : (
+              <>
+                <div className={`mt-1 font-mono text-[16px] font-bold ${d.winRate >= 50 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                  {d.winRate.toFixed(1)}%
+                </div>
+                <div className="font-mono text-[9px] text-[#4b5a72]">
+                  {d.trades} trade{d.trades === 1 ? '' : 's'} ({d.wins}W/{d.losses}L) · {fmtMoney(d.netPnl)} net · {fmtMoney(d.expectancy)}/trade
+                </div>
+              </>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function ParamChips({ params, cls = 'text-cyan-300' }: { params: Record<string, number | string>; cls?: string }) {
   return (
     <div className="flex flex-wrap gap-1">
@@ -721,6 +779,36 @@ function SingleTab({ asset, strategies }: { asset: string; strategies: StrategyI
               </div>
             ))}
           </div>
+
+          {m.byDirection && (
+            <div className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-3 lg:col-span-2">
+              <h4 className="mb-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">
+                Call vs Put - which side this strategy is actually trustworthy on
+              </h4>
+              <div className="grid grid-cols-2 gap-2">
+                {([
+                  ['CALL', m.byDirection.call, 'text-emerald-400'],
+                  ['PUT', m.byDirection.put, 'text-rose-400'],
+                ] as const).map(([label, d, labelCls]) => (
+                  <div key={label} className="rounded border border-[#1c2739] bg-[#101828] p-2">
+                    <div className={`font-mono text-[10px] font-bold uppercase tracking-wider ${labelCls}`}>{label}</div>
+                    {d.trades === 0 ? (
+                      <div className="mt-1 font-mono text-[11px] text-[#4b5a72]">never fired this way over the tested window</div>
+                    ) : (
+                      <>
+                        <div className={`mt-1 font-mono text-[16px] font-bold ${d.winRate >= 50 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                          {d.winRate.toFixed(1)}%
+                        </div>
+                        <div className="font-mono text-[9px] text-[#4b5a72]">
+                          {d.trades} trade{d.trades === 1 ? '' : 's'} ({d.wins}W/{d.losses}L) · {fmtMoney(d.netPnl)} net · {fmtMoney(d.expectancy)}/trade
+                        </div>
+                      </>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -877,11 +965,13 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
 
               {result.heatmap && <Heatmap hm={result.heatmap} objective={result.objective} />}
 
+              {selected?.metrics.byDirection && <DirSplitBlock byDirection={selected.metrics.byDirection} />}
+
               <div className="overflow-hidden rounded-lg border border-[#1c2739]">
                 <table className="w-full font-mono text-[10px]">
                   <thead>
                     <tr className="bg-[#101828] text-left text-[#4b5a72]">
-                      {['#', 'params', 'net', 'win%', 'PF', 'trades', 'DD%', 'Sharpe', ''].map((h) => (
+                      {['#', 'params', 'net', 'win%', 'C/P', 'PF', 'trades', 'DD%', 'Sharpe', ''].map((h) => (
                         <th key={h} className="px-2 py-1.5 font-medium uppercase tracking-wider">{h}</th>
                       ))}
                     </tr>
@@ -904,6 +994,9 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
                         >
                           {r.metrics.winRate.toFixed(0)}%
                         </td>
+                        <td className="px-2 py-1.5">
+                          {r.metrics.byDirection ? <DirSplitCell byDirection={r.metrics.byDirection} /> : '—'}
+                        </td>
                         <td className="px-2 py-1.5 text-[#aab6cc]">{r.metrics.profitFactor.toFixed(2)}</td>
                         <td className="px-2 py-1.5 text-[#aab6cc]">
                           {r.metrics.totalTrades}
@@ -919,7 +1012,7 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
                       </tr>
                     ))}
                     {!result.ranked.length && (
-                      <tr><td colSpan={9} className="px-3 py-4 text-center text-[#4b5a72]">no combo cleared the min-trades guard — widen the sweep or lower the guard</td></tr>
+                      <tr><td colSpan={10} className="px-3 py-4 text-center text-[#4b5a72]">no combo cleared the min-trades guard — widen the sweep or lower the guard</td></tr>
                     )}
                   </tbody>
                 </table>
@@ -1099,11 +1192,13 @@ function WalkForwardTab({ asset, strategies }: { asset: string; strategies: Stra
             ))}
           </div>
 
+          {oos.byDirection && <DirSplitBlock byDirection={oos.byDirection} />}
+
           <div className="overflow-hidden rounded-lg border border-[#1c2739]">
             <table className="w-full font-mono text-[10px]">
               <thead>
                 <tr className="bg-[#101828] text-left text-[#4b5a72]">
-                  {['fold', 'IS bars', 'best IS params', 'IS net', 'OOS bars', 'OOS net', 'OOS win%', 'OOS PF', 'OOS trades'].map((h) => (
+                  {['fold', 'IS bars', 'best IS params', 'IS net', 'OOS bars', 'OOS net', 'OOS win%', 'OOS C/P', 'OOS PF', 'OOS trades'].map((h) => (
                     <th key={h} className="px-2 py-1.5 font-medium uppercase tracking-wider">{h}</th>
                   ))}
                 </tr>
@@ -1122,6 +1217,9 @@ function WalkForwardTab({ asset, strategies }: { asset: string; strategies: Stra
                       title={`95% CI ${(f.oos.winRateCiLow ?? 0).toFixed(0)}–${(f.oos.winRateCiHigh ?? 0).toFixed(0)}%`}
                     >
                       {f.oos.winRate.toFixed(0)}%
+                    </td>
+                    <td className="px-2 py-1.5">
+                      {f.oos.byDirection ? <DirSplitCell byDirection={f.oos.byDirection} /> : '—'}
                     </td>
                     <td className="px-2 py-1.5 text-[#aab6cc]">{f.oos.profitFactor.toFixed(2)}</td>
                     <td className="px-2 py-1.5 text-[#aab6cc]">
@@ -1357,11 +1455,14 @@ function SweepTab({
             )}
             <span className="ml-auto text-[#4b5a72]">click a row to load it in the chart</span>
           </div>
+
+          {result.rows[0]?.metrics.byDirection && <DirSplitBlock byDirection={result.rows[0].metrics.byDirection} />}
+
           <div className="overflow-hidden rounded-lg border border-[#1c2739]">
             <table className="w-full font-mono text-[10px]">
               <thead>
                 <tr className="bg-[#101828] text-left text-[#4b5a72]">
-                  {['asset', 'cat', 'payout', 'net', 'win%', 'PF', 'trades', 'DD%', 'Sharpe', 'live'].map((h) => (
+                  {['asset', 'cat', 'payout', 'net', 'win%', 'C/P', 'PF', 'trades', 'DD%', 'Sharpe', 'live'].map((h) => (
                     <th key={h} className="px-2 py-1.5 font-medium uppercase tracking-wider">{h}</th>
                   ))}
                 </tr>
@@ -1382,6 +1483,9 @@ function SweepTab({
                       title={`95% CI ${(r.metrics.winRateCiLow ?? 0).toFixed(0)}–${(r.metrics.winRateCiHigh ?? 0).toFixed(0)}%`}
                     >
                       {r.metrics.winRate.toFixed(0)}%
+                    </td>
+                    <td className="px-2 py-1.5">
+                      {r.metrics.byDirection ? <DirSplitCell byDirection={r.metrics.byDirection} /> : '—'}
                     </td>
                     <td className="px-2 py-1.5 text-[#aab6cc]">{r.metrics.profitFactor.toFixed(2)}</td>
                     <td className="px-2 py-1.5 text-[#aab6cc]">
