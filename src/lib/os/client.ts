@@ -706,6 +706,18 @@ export const SIGNAL_TEMPLATES: LabSignalDef[] = [
   { kind: 'indicator', ind: 'fractal', params: { left: 2, right: 2 }, op: '<', threshold: -0.05, dir: 'put', weight: 10 },
   { kind: 'indicator', ind: 'fractal', params: { left: 3, right: 3 }, op: '>', threshold: 0.1, dir: 'call', weight: 10 },
   { kind: 'indicator', ind: 'fractal', params: { left: 3, right: 3 }, op: '<', threshold: -0.1, dir: 'put', weight: 10 },
+  // Trending-market pullback (swing HH/HL or LH/LL structure + pullback near
+  // the last confirmed swing point) and ranging-market buy/sell zone - mirror
+  // trading-core's analytics/structure.ts, added to the Lab's vocabulary so
+  // these can be learned per-pair (not just the fixed builtin strategy).
+  { kind: 'indicator', ind: 'trendpullback', params: { pivotFlank: 3, pullbackAtr: 0.75, minLegAtr: 2 }, op: '>', threshold: 0.05, dir: 'call', weight: 12 },
+  { kind: 'indicator', ind: 'trendpullback', params: { pivotFlank: 3, pullbackAtr: 0.75, minLegAtr: 2 }, op: '<', threshold: -0.05, dir: 'put', weight: 12 },
+  { kind: 'indicator', ind: 'trendpullback', params: { pivotFlank: 5, pullbackAtr: 1, minLegAtr: 3 }, op: '>', threshold: 0.05, dir: 'call', weight: 12 },
+  { kind: 'indicator', ind: 'trendpullback', params: { pivotFlank: 5, pullbackAtr: 1, minLegAtr: 3 }, op: '<', threshold: -0.05, dir: 'put', weight: 12 },
+  { kind: 'indicator', ind: 'rangezone', params: { window: 40, rangeThreshold: 0.35, zoneAtr: 0.4 }, op: '>', threshold: 0.05, dir: 'call', weight: 12 },
+  { kind: 'indicator', ind: 'rangezone', params: { window: 40, rangeThreshold: 0.35, zoneAtr: 0.4 }, op: '<', threshold: -0.05, dir: 'put', weight: 12 },
+  { kind: 'indicator', ind: 'rangezone', params: { window: 60, rangeThreshold: 0.25, zoneAtr: 0.5 }, op: '>', threshold: 0.05, dir: 'call', weight: 12 },
+  { kind: 'indicator', ind: 'rangezone', params: { window: 60, rangeThreshold: 0.25, zoneAtr: 0.5 }, op: '<', threshold: -0.05, dir: 'put', weight: 12 },
   { kind: 'indicator', ind: 'madist', type: 'hma', params: { period: 20 }, op: '>', threshold: 0.2, dir: 'call', weight: 10 },
   { kind: 'indicator', ind: 'madist', type: 'hma', params: { period: 20 }, op: '<', threshold: -0.2, dir: 'put', weight: 10 },
   { kind: 'indicator', ind: 'madist', type: 'kama', params: { period: 10 }, op: '>', threshold: 0.2, dir: 'call', weight: 10 },
