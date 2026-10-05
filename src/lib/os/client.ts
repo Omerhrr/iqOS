@@ -1191,6 +1191,12 @@ export interface AutoTraderConfig {
   /** Per-strategy param overrides, keyed by strategy id - same shape as a
    * bot's own params. Ignored for an AI Lab "custom:<id>" spec. */
   strategyParams?: Record<string, Record<string, number | string>>
+  /** Per-pair strategy pin, keyed by exact ticker - "for THIS pair always
+   * use THIS strategy", bypassing the global strategyIds/ensemble/best pool
+   * entirely for that pair. A pair with no entry here keeps using the
+   * global pool unchanged. If the pinned id no longer resolves, that pair
+   * sits out rather than falling back to the pool. */
+  pairStrategy?: Record<string, string>
   direction: 'both' | 'call' | 'put'
   maxOpen: number
   cooldownSec: number

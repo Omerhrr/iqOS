@@ -1044,6 +1044,114 @@ function StrategyPicker({
   )
 }
 
+/** "For THIS pair always use THIS strategy" - assigns a single strategy id
+ * to a single ticker, bypassing the global strategyIds/ensemble/auto-learn
+ * pool for that pair only. Built for "I studied strategy X in the AI Lab on
+ * EURUSD but want it traded on GBPJPY" - each row here is one pin. */
+function PairStrategyPicker({
+  assets,
+  strategies,
+  value,
+  onChange,
+}: {
+  assets: AssetRow[]
+  strategies: StrategyInfo[]
+  value: Record<string, string> | undefined
+  // Always emits a plain object, even when it ends up empty - {} (not null
+  // or undefined) is what makes "I removed my last pin" actually reach the
+  // server on save: a patch field stays as plain JS undefined until the
+  // dialog's Save posts `d` as JSON, and JSON.stringify DROPS undefined
+  // keys outright, so a cleared-to-undefined field would never even appear
+  // in the saved request body - the backend's own empty-object collapse
+  // (sanitizePairStrategy) is what then turns {} into "no pins" there.
+  onChange: (next: Record<string, string>) => void
+}) {
+  const pins = value ?? {}
+  const pinnedAssets = Object.keys(pins)
+  const [addAsset, setAddAsset] = useState('')
+  const [addStrategy, setAddStrategy] = useState('')
+
+  const addPin = () => {
+    if (!addAsset || !addStrategy) return
+    onChange({ ...pins, [addAsset]: addStrategy })
+    setAddAsset('')
+    setAddStrategy('')
+  }
+  const removePin = (asset: string) => {
+    const next = { ...pins }
+    delete next[asset]
+    onChange(next)
+  }
+
+  return (
+    <div className="mt-2 rounded border border-[#1c2739] bg-[#0b1220] p-2">
+      <p className="text-[10px] text-[#c7d2e3]">Per-pair strategy pins</p>
+      <p className="mt-0.5 text-[8px] leading-relaxed text-[#3d4c66]">
+        Override the pool above for specific pairs - e.g. a strategy you studied on one pair in the AI Lab but want
+        traded on a different one. A pinned pair ignores the global strategy/ensemble/auto-learn pick entirely and
+        runs ONLY the strategy assigned here; if that strategy is later removed, the pair just sits out instead of
+        falling back to the pool.
+      </p>
+      {pinnedAssets.length > 0 && (
+        <div className="mt-2 space-y-1">
+          {pinnedAssets.map((asset) => {
+            const strat = strategies.find((s) => s.id === pins[asset])
+            return (
+              <div key={asset} className="flex items-center justify-between gap-2 rounded border border-[#141d2e] bg-[#0d1420] px-2 py-1">
+                <span className="truncate font-mono text-[10px] text-[#dbe4f0]">
+                  {asset} <span className="text-[#4b5a72]">→</span>{' '}
+                  <span className="text-cyan-300">{strat?.name ?? pins[asset]}</span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => removePin(asset)}
+                  className="shrink-0 rounded px-1.5 py-0.5 text-[9px] text-[#4b5a72] hover:bg-rose-500/20 hover:text-rose-300"
+                >
+                  ×
+                </button>
+              </div>
+            )
+          })}
+        </div>
+      )}
+      <div className="mt-2 flex items-center gap-1.5">
+        <select
+          value={addAsset}
+          onChange={(e) => setAddAsset(e.target.value)}
+          className="h-7 min-w-0 flex-1 rounded border border-[#1c2739] bg-[#0b111c] px-1.5 text-[10px] text-[#e2e8f0] outline-none"
+        >
+          <option value="">pair…</option>
+          {assets.map((a) => (
+            <option key={a.ticker} value={a.ticker}>
+              {a.ticker}
+            </option>
+          ))}
+        </select>
+        <select
+          value={addStrategy}
+          onChange={(e) => setAddStrategy(e.target.value)}
+          className="h-7 min-w-0 flex-1 rounded border border-[#1c2739] bg-[#0b111c] px-1.5 text-[10px] text-[#e2e8f0] outline-none"
+        >
+          <option value="">strategy…</option>
+          {strategies.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.name}
+            </option>
+          ))}
+        </select>
+        <Button
+          onClick={addPin}
+          disabled={!addAsset || !addStrategy}
+          variant="outline"
+          className="h-7 shrink-0 border-[#1c2739] px-2 text-[9px] uppercase tracking-wider text-[#7c8aa5] hover:text-cyan-300 disabled:opacity-40"
+        >
+          pin
+        </Button>
+      </div>
+    </div>
+  )
+}
+
 function WatchlistPicker({
   assets,
   selected,
@@ -1384,6 +1492,12 @@ function AutoTraderDialog({
                     onCheckedChange={(v) => p(v ? { autoDiscover: true, strategyPickMode: 'best' } : { autoDiscover: false })}
                   />
                 </div>
+                <PairStrategyPicker
+                  assets={assets}
+                  strategies={strategies}
+                  value={d.pairStrategy}
+                  onChange={(next) => p({ pairStrategy: next })}
+                />
                 {only && (
                   <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
                     {only.description || `trades "${only.name}" on every open pair (respecting the watchlist below, if set)`}

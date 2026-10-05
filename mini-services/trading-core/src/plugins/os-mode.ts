@@ -140,6 +140,21 @@ export interface AutoTraderConfig {
    * fall back to that strategy's own defaultParams(), exactly like a bot
    * with no params set. */
   strategyParams?: Record<string, Record<string, number | string>>
+  /** Per-pair strategy pin, keyed by exact ticker (e.g. "EURUSD-OTC") -
+   * "for THIS pair always use THIS strategy" instead of letting the global
+   * strategyIds pool/ensemble/autoDiscover logic decide for it. Built for
+   * an AI Lab spec studied on one pair's history but meant to trade a
+   * DIFFERENT one (or several): assign it here and that pair bypasses the
+   * global pool entirely - it runs ONLY this one strategy, exactly like a
+   * single-strategy strategyIds:[id] setup would, just scoped to this pair
+   * instead of every pair. A pair with no entry here keeps using the global
+   * strategyIds/strategyPickMode/autoDiscover behavior unchanged. If the
+   * pinned id is later removed (e.g. the AI Lab library got wiped) that
+   * pair simply sits out - it does NOT silently fall back to the global
+   * pool, since that would quietly undo the whole point of pinning it.
+   * Params for a pinned builtin id still come from strategyParams[id], same
+   * mechanism as any pool member. */
+  pairStrategy?: Record<string, string>
   direction: 'both' | 'call' | 'put'
   maxOpen: number // max concurrent auto-trader positions
   cooldownSec: number // per-asset re-entry cooldown
@@ -392,6 +407,7 @@ export class ModeService {
           strategyPickMode: c.strategyPickMode === 'best' ? 'best' : 'ensemble',
           autoDiscover: typeof c.autoDiscover === 'boolean' ? c.autoDiscover : false,
           strategyParams: ModeService.sanitizeStrategyParams(c.strategyParams),
+          pairStrategy: ModeService.sanitizePairStrategy(c.pairStrategy),
           direction: c.direction === 'call' || c.direction === 'put' ? c.direction : 'both',
           maxOpen: Math.round(num(c.maxOpen, DEFAULT_AUTOTRADER.maxOpen)),
           cooldownSec: Math.round(num(c.cooldownSec, DEFAULT_AUTOTRADER.cooldownSec)),
@@ -870,6 +886,22 @@ export class ModeService {
     return Object.keys(out).length ? out : undefined
   }
 
+  /** Sanitizes the asset -> strategy-id pin map (pairStrategy) - same
+   * "guard against garbage types, not against a bad id" philosophy as
+   * sanitizeStrategyParams above. A pinned id that doesn't resolve to a
+   * real builtin/custom strategy at USE time is handled in
+   * pickStrategySignal (the pair sits out), not here - the id might
+   * reference an AI Lab spec that gets re-added later, so this never
+   * silently drops an entry just because it doesn't resolve right now. */
+  private static sanitizePairStrategy(v: unknown): Record<string, string> | undefined {
+    if (!v || typeof v !== 'object') return undefined
+    const out: Record<string, string> = {}
+    for (const [asset, id] of Object.entries(v as Record<string, unknown>)) {
+      if (typeof asset === 'string' && asset.trim() && typeof id === 'string' && id.trim()) out[asset.trim()] = id.trim()
+    }
+    return Object.keys(out).length ? out : undefined
+  }
+
   /** The ids this 'strategy' source currently trades - strategyIds when set
    * (one id = single strategy, 2+ = ensemble), falling back to the legacy
    * lone strategyId for configs saved before strategyIds existed. */
@@ -1020,18 +1052,28 @@ export class ModeService {
               ])
             )
           : manualIds
-      if (!ids.length) return null // nothing picked yet (and autoDiscover is off) - source configured but idle
-      const specs = ids.map((id) => {
-        const isCustom = id.startsWith('custom:')
-        const strat = isCustom ? null : getStrategy(id)
-        // user-configured overrides (same shape as a bot's own params) merged
-        // over that strategy's defaults - never applies to a custom: lab spec,
-        // which is a fixed learned structure with no exposed param schema
-        const params = strat ? { ...defaultParams(strat), ...(this.config.strategyParams?.[id] ?? {}) } : undefined
-        return { id, isCustom, params, valid: isCustom || Boolean(strat) }
-      })
-      const liveSpecs = specs.filter((s) => s.valid)
-      if (!liveSpecs.length) return null // every picked id is unknown/removed - misconfigured
+      // pairStrategy: "for THIS pair, always use THIS one strategy" - bypasses
+      // the global ids/ensemble/best pool entirely for any asset that has an
+      // entry here. Resolved per-asset inside the loop below via the same
+      // resolveMemberSpecs() helper the global pool uses, so params/validity
+      // checks stay identical either way.
+      const pairStrategyMap = this.config.pairStrategy ?? {}
+      const hasPairOverrides = Object.keys(pairStrategyMap).length > 0
+      if (!ids.length && !hasPairOverrides) return null // nothing picked yet (and autoDiscover/pins are both off) - source configured but idle
+      const resolveMemberSpecs = (memberIds: string[]) =>
+        memberIds
+          .map((id) => {
+            const isCustom = id.startsWith('custom:')
+            const strat = isCustom ? null : getStrategy(id)
+            // user-configured overrides (same shape as a bot's own params) merged
+            // over that strategy's defaults - never applies to a custom: lab spec,
+            // which is a fixed learned structure with no exposed param schema
+            const params = strat ? { ...defaultParams(strat), ...(this.config.strategyParams?.[id] ?? {}) } : undefined
+            return { id, isCustom, params, valid: isCustom || Boolean(strat) }
+          })
+          .filter((s) => s.valid)
+      const liveSpecs = ids.length ? resolveMemberSpecs(ids) : []
+      if (!liveSpecs.length && !hasPairOverrides) return null // every picked id is unknown/removed - misconfigured
 
       let adaptive: AdaptiveService | null = null
       if (liveSpecs.length > 1 && this.config.strategyPickMode === 'best') {
@@ -1054,9 +1096,16 @@ export class ModeService {
 
       for (const asset of candidates) {
         if (this.assetBlocked(asset)) continue
+        // pinned pair: run ONLY the assigned strategy for this asset, never
+        // the global pool - and if the pinned id no longer resolves (e.g.
+        // the AI Lab library got wiped), sit this pair out rather than
+        // quietly falling back to the pool, which would undo the pin.
+        const pinnedId = pairStrategyMap[asset]
+        const assetSpecs = pinnedId ? resolveMemberSpecs([pinnedId]) : liveSpecs
+        if (!assetSpecs.length) continue
         const votes: Array<{ id: string; direction: 'call' | 'put'; score: number }> = []
         let price = 0
-        for (const s of liveSpecs) {
+        for (const s of assetSpecs) {
           // streak-breaker: a member on a losing run against THIS exact
           // pair sits out, but still lets every other member vote/rank -
           // the bench is per (strategy, pair), never the whole pool
@@ -1074,7 +1123,7 @@ export class ModeService {
         }
         if (!votes.length) continue
 
-        if (liveSpecs.length === 1) {
+        if (assetSpecs.length === 1) {
           // no minScore gate here - the strategy's own evaluate() already
           // decided this is a signal (direction !== 'none'); a second,
           // unrelated 0-100 "edge score" threshold on top of that doesn't
@@ -1084,7 +1133,10 @@ export class ModeService {
           const metric = Math.abs(v.score)
           if (metric > bestMetric) {
             bestMetric = metric
-            bestRow = ModeService.strategyEvalToScreenRow(asset, this.config.tf, v.direction, v.score, price, `${v.id} score ${Math.abs(v.score).toFixed(0)}`, undefined, v.id)
+            const note = pinnedId
+              ? `pinned: ${v.id} on ${asset} (score ${Math.abs(v.score).toFixed(0)})`
+              : `${v.id} score ${Math.abs(v.score).toFixed(0)}`
+            bestRow = ModeService.strategyEvalToScreenRow(asset, this.config.tf, v.direction, v.score, price, note, undefined, v.id)
           }
           continue
         }
@@ -1157,7 +1209,7 @@ export class ModeService {
         if (!majority) continue // tied vote - no edge either way
         const direction = majority[0].direction
         if (this.config.direction !== 'both' && direction !== this.config.direction) continue
-        const agreementPct = Math.round((majority.length / liveSpecs.length) * 100)
+        const agreementPct = Math.round((majority.length / assetSpecs.length) * 100)
         if (agreementPct < this.config.minConfidence) continue
         const avgScore = majority.reduce((a, v) => a + Math.abs(v.score), 0) / majority.length
         // rank by agreement % first (coarse, *1000 so it dominates), avg
@@ -1171,7 +1223,7 @@ export class ModeService {
             direction,
             avgScore,
             price,
-            `ensemble ${majority.length}/${liveSpecs.length} agree (${majority.map((v) => v.id).join(', ')}) · avg ${avgScore.toFixed(0)}`,
+            `ensemble ${majority.length}/${assetSpecs.length} agree (${majority.map((v) => v.id).join(', ')}) · avg ${avgScore.toFixed(0)}`,
             agreementPct,
             `ensemble:${majority.map((v) => v.id).join('+')}`
           )
@@ -1732,6 +1784,7 @@ export class ModeService {
     if (patch.strategyPickMode !== undefined) this.config.strategyPickMode = patch.strategyPickMode === 'best' ? 'best' : 'ensemble'
     if (patch.autoDiscover !== undefined) this.config.autoDiscover = Boolean(patch.autoDiscover)
     if (patch.strategyParams !== undefined) this.config.strategyParams = ModeService.sanitizeStrategyParams(patch.strategyParams)
+    if (patch.pairStrategy !== undefined) this.config.pairStrategy = ModeService.sanitizePairStrategy(patch.pairStrategy)
     if (patch.direction !== undefined && ['both', 'call', 'put'].includes(String(patch.direction)))
       this.config.direction = String(patch.direction) as AutoTraderConfig['direction']
     if (patch.maxOpen !== undefined) this.config.maxOpen = Math.round(clamp(Number(patch.maxOpen) || 1, 1, 10))
@@ -1777,15 +1830,21 @@ export class ModeService {
               : this.config.signalSource === 'strategy'
                 ? (() => {
                     const ids = this.effectiveStrategyIds()
+                    const pinCount = Object.keys(this.config.pairStrategy ?? {}).length
+                    const pinNote = pinCount ? `, ${pinCount} pair${pinCount > 1 ? 's' : ''} pinned to their own strategy` : ''
                     if (this.config.strategyPickMode === 'best' && this.config.autoDiscover === true)
-                      return ` (auto-discover ON - ranks the FULL builtin + AI Lab catalog per pair, mining new specs for pairs without one; ${ids.length ? `${ids.length} manually-picked id(s) also included` : 'no manual picks'})`
-                    return ids.length === 0
-                      ? ' (no strategy picked)'
-                      : ids.length === 1
-                        ? ` (${ids[0]})`
-                        : this.config.strategyPickMode === 'best'
-                          ? ` (auto-learn over ${ids.length}: ${ids.join(', ')} - trades whichever is proven best per pair)`
-                          : ` (ensemble of ${ids.length}: ${ids.join(', ')} · ≥${this.config.minConfidence}% agreement)`
+                      return ` (auto-discover ON - ranks the FULL builtin + AI Lab catalog per pair, mining new specs for pairs without one; ${ids.length ? `${ids.length} manually-picked id(s) also included` : 'no manual picks'}${pinNote})`
+                    const body =
+                      ids.length === 0
+                        ? pinCount
+                          ? 'no global strategy picked'
+                          : 'no strategy picked'
+                        : ids.length === 1
+                          ? ids[0]
+                          : this.config.strategyPickMode === 'best'
+                            ? `auto-learn over ${ids.length}: ${ids.join(', ')} - trades whichever is proven best per pair`
+                            : `ensemble of ${ids.length}: ${ids.join(', ')} · ≥${this.config.minConfidence}% agreement`
+                    return ` (${body}${pinNote})`
                   })()
                 : ''
     // minScore/minConfidence are meaningless noise on a config line unless

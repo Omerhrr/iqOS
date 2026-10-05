@@ -264,6 +264,16 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
   // "learn this pair". Saved/backtested/deployed through the exact same
   // endpoints a learned spec uses (normalizeSpec on the backend already
   // accepts any well-formed SignalDef, learned or hand-built). ----
+  // independent pair/tf for this section - a strategy built here is
+  // pair-agnostic (it's not mined from any one pair's history the way
+  // "learn this pair" above is), so backtest/save/deploy get their OWN
+  // selector instead of silently riding the "learn" section's pair/tf. This
+  // used to just reuse the shared `asset`/`tf` state, which meant changing
+  // this card's target pair meant hunting for the picker in a DIFFERENT
+  // card above and easy to miss entirely - in practice everything here kept
+  // running against whatever `asset` happened to default to (EURUSD).
+  const [manualAsset, setManualAsset] = useState(asset)
+  const [manualTf, setManualTf] = useState<Timeframe>(tf)
   const [manualSignals, setManualSignals] = useState<{ uid: string; def: LabSignalDef }[]>([])
   const [manualTemplateIdx, setManualTemplateIdx] = useState(0)
   const [manualIsCandle, setManualIsCandle] = useState(false)
@@ -298,7 +308,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
   useEffect(() => {
     setManualSavedId(null)
     setManualBacktest(null)
-  }, [manualSignals, manualMinScore, manualMinVotes, manualHorizon, manualBasis, manualName])
+  }, [manualSignals, manualMinScore, manualMinVotes, manualHorizon, manualBasis, manualName, manualAsset, manualTf])
 
   const addManualSignal = () => {
     const def: LabSignalDef = manualIsCandle
@@ -317,7 +327,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
   const buildManualSpec = (): LabSpec | null => {
     if (!manualSignals.length) return null
     return {
-      name: manualName.trim() || `${asset} ${tf} Manual`,
+      name: manualName.trim() || `${manualAsset} ${manualTf} Manual`,
       signals: manualSignals.map((s) => s.def),
       minScore: manualMinScore,
       minVotes: manualMinVotes,
@@ -333,8 +343,8 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
     try {
       const res = await osPost<{ ok: boolean; backtest: LabSimMetrics; holdout: LabSimMetrics; breakevenWinRate: number; error?: string }>('/lab_backtest', {
         spec,
-        asset,
-        tf,
+        asset: manualAsset,
+        tf: manualTf,
         payout,
       })
       if (!res.ok) throw new Error(res.error ?? 'backtest failed')
@@ -354,8 +364,8 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
       const res = await osPost<{ ok: boolean; id: string }>('/lab_save', {
         name: spec.name,
         spec,
-        asset,
-        tf,
+        asset: manualAsset,
+        tf: manualTf,
         stats: { ...(manualBacktest ? { backtest: manualBacktest.backtest, holdout: manualBacktest.holdout, breakeven: manualBacktest.breakevenWinRate } : {}), curated: true },
       })
       setManualSavedId(res.id)
@@ -377,15 +387,15 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
         const res = await osPost<{ ok: boolean; id: string }>('/lab_save', {
           name: spec.name,
           spec,
-          asset,
-          tf,
+          asset: manualAsset,
+          tf: manualTf,
           stats: { ...(manualBacktest ? { backtest: manualBacktest.backtest, holdout: manualBacktest.holdout, breakeven: manualBacktest.breakevenWinRate } : {}), curated: true },
         })
         id = res.id
         setManualSavedId(res.id)
         loadLibrary()
       }
-      await openDeploy(id, spec.name, asset, tf, spec.horizon)
+      await openDeploy(id, spec.name, manualAsset, manualTf, spec.horizon)
     } catch (e) {
       onError((e as Error).message)
     } finally {
@@ -740,8 +750,31 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
           <span className="font-mono text-[9px] text-[#4b5a72]">pick signals from the same vocabulary the learner mines - no mining required</span>
         </div>
         <p className="mt-1 text-[10px] leading-snug text-[#7c8aa5]">
-          Uses the <span className="text-[#aab6cc]">pair/tf/payout</span> selected above. Backtest, save and deploy run through the exact same pipeline a learned spec does - including the horizon-locked expiry on deploy.
+          Pick the pair/tf to test this against below - a hand-built strategy isn&apos;t mined from any one pair&apos;s
+          history, so it has its own target here, separate from the &quot;learn this pair&quot; selector above. Backtest,
+          save and deploy run through the exact same pipeline a learned spec does - including the horizon-locked
+          expiry on deploy - using the <span className="text-[#aab6cc]">payout</span> selected above.
         </p>
+        <div className="mt-2 flex flex-wrap items-end gap-2">
+          <label className="flex flex-col gap-0.5">
+            <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">pair</span>
+            <AssetPicker tickers={tickers.length ? tickers : ['EURUSD']} value={manualAsset} onChange={setManualAsset} />
+          </label>
+          <label className="flex flex-col gap-0.5">
+            <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">tf</span>
+            <select
+              value={manualTf}
+              onChange={(e) => setManualTf(e.target.value as Timeframe)}
+              className="h-7 rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-[#dbe4f0]"
+            >
+              {TIMEFRAMES.map((t) => (
+                <option key={t} value={t}>
+                  {t}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
 
         <div className="mt-2 flex flex-wrap items-end gap-2">
           <label className="flex items-center gap-1.5 font-mono text-[10px] text-[#aab6cc]">
@@ -833,7 +866,7 @@ export default function AILabPanel({ assets, onError, refreshBots }: AILabPanelP
 
         <div className="mt-2 flex flex-wrap items-center gap-2">
           <Button onClick={() => void backtestManual()} disabled={!manualSignals.length || manualBacktesting} variant="outline" className="h-7 border-[#1c2739] px-3 text-[10px] uppercase tracking-wider text-[#7c8aa5] hover:text-cyan-300 disabled:opacity-40">
-            {manualBacktesting ? 'backtesting...' : `backtest (${asset} ${tf})`}
+            {manualBacktesting ? 'backtesting...' : `backtest (${manualAsset} ${manualTf})`}
           </Button>
           <Button onClick={() => void saveManual()} disabled={!manualSignals.length || manualSaving || !!manualSavedId} variant="outline" className="h-7 border-[#1c2739] px-3 text-[10px] uppercase tracking-wider text-[#7c8aa5] hover:text-cyan-300 disabled:opacity-40">
             {manualSavedId ? `saved: ${manualSavedId}` : manualSaving ? 'saving...' : 'save to library'}
