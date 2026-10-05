@@ -168,6 +168,24 @@ export interface AutoTraderConfig {
    * Params for a pinned builtin id still come from strategyParams[id], same
    * mechanism as any pool member. */
   pairStrategy?: Record<string, string>
+  /** Direction pin: "for every CALL use THIS strategy, for every PUT use
+   * THIS one" - the direction analog of pairStrategy above, same bypass
+   * model (skips the global strategyIds/ensemble/best pool entirely for
+   * whichever side(s) are set here), just keyed by side instead of pair.
+   * Either key may be set alone (the other side keeps using the global
+   * pool) or both (the pool is bypassed completely). A pair's pairStrategy
+   * pin, if it has one, still wins over this - pinning a PAIR to one
+   * strategy regardless of direction is a narrower, more specific
+   * intent than a global per-direction default. Each tick, both configured
+   * strategies are evaluated independently per candidate; only the CALL
+   * strategy's own 'call' output counts as a call vote and only the PUT
+   * strategy's own 'put' output counts as a put vote (its 'none', or the
+   * "wrong" side, is simply ignored - same one-way-active convention every
+   * other signal kind in this codebase follows) - so the two can never
+   * conflict into a tie the way a true ensemble vote could. If the pinned
+   * id no longer resolves, that side simply never fires (same as
+   * pairStrategy), rather than silently falling back to the pool. */
+  directionStrategy?: { call?: string; put?: string }
   direction: 'both' | 'call' | 'put'
   maxOpen: number // max concurrent auto-trader positions
   cooldownSec: number // per-asset re-entry cooldown
@@ -423,6 +441,7 @@ export class ModeService {
           autoDiscover: typeof c.autoDiscover === 'boolean' ? c.autoDiscover : false,
           strategyParams: ModeService.sanitizeStrategyParams(c.strategyParams),
           pairStrategy: ModeService.sanitizePairStrategy(c.pairStrategy),
+          directionStrategy: ModeService.sanitizeDirectionStrategy(c.directionStrategy),
           direction: c.direction === 'call' || c.direction === 'put' ? c.direction : 'both',
           maxOpen: Math.round(num(c.maxOpen, DEFAULT_AUTOTRADER.maxOpen)),
           cooldownSec: Math.round(num(c.cooldownSec, DEFAULT_AUTOTRADER.cooldownSec)),
@@ -917,6 +936,19 @@ export class ModeService {
     return Object.keys(out).length ? out : undefined
   }
 
+  /** Sanitizes directionStrategy ({call?, put?}) - same "guard the shape,
+   * not the id" philosophy as sanitizePairStrategy; an id that doesn't
+   * resolve at USE time just means that side never fires (handled in
+   * pickStrategySignal), not here. */
+  private static sanitizeDirectionStrategy(v: unknown): { call?: string; put?: string } | undefined {
+    if (!v || typeof v !== 'object') return undefined
+    const o = v as Record<string, unknown>
+    const out: { call?: string; put?: string } = {}
+    if (typeof o.call === 'string' && o.call.trim()) out.call = o.call.trim()
+    if (typeof o.put === 'string' && o.put.trim()) out.put = o.put.trim()
+    return out.call || out.put ? out : undefined
+  }
+
   /** The ids this 'strategy' source currently trades - strategyIds when set
    * (one id = single strategy, 2+ = ensemble), falling back to the legacy
    * lone strategyId for configs saved before strategyIds existed. */
@@ -1074,7 +1106,13 @@ export class ModeService {
       // checks stay identical either way.
       const pairStrategyMap = this.config.pairStrategy ?? {}
       const hasPairOverrides = Object.keys(pairStrategyMap).length > 0
-      if (!ids.length && !hasPairOverrides) return null // nothing picked yet (and autoDiscover/pins are both off) - source configured but idle
+      // directionStrategy: "for every CALL use THIS strategy, for every PUT
+      // use THIS one" - same bypass model as pairStrategy, keyed by side
+      // instead of pair (see the field's own doc comment for the full
+      // precedence/role rules). Resolved once here, applied per-asset below.
+      const dirStrategy = this.config.directionStrategy
+      const hasDirOverrides = Boolean(dirStrategy?.call || dirStrategy?.put)
+      if (!ids.length && !hasPairOverrides && !hasDirOverrides) return null // nothing picked yet (and autoDiscover/pins/direction pins are all off) - source configured but idle
       const resolveMemberSpecs = (memberIds: string[]) =>
         memberIds
           .map((id) => {
@@ -1116,7 +1154,18 @@ export class ModeService {
         // the AI Lab library got wiped), sit this pair out rather than
         // quietly falling back to the pool, which would undo the pin.
         const pinnedId = pairStrategyMap[asset]
-        const assetSpecs = pinnedId ? resolveMemberSpecs([pinnedId]) : liveSpecs
+        // Precedence: a per-pair pin (pairStrategy) always wins - it's the
+        // more specific intent ("regardless of direction, THIS pair always
+        // trades THIS one strategy"). Otherwise, if a per-direction pin
+        // (directionStrategy) is configured for either side, this asset
+        // runs ONLY the assigned call-strategy and/or put-strategy instead
+        // of the global pool - directionPinned tracks that mode so the
+        // votes loop below knows to enforce "a call-slot strategy's vote
+        // only counts if it actually said call" (and the put-slot
+        // symmetrically), which an ordinary ensemble/pool vote never needs.
+        const directionPinned = !pinnedId && hasDirOverrides
+        const dirIds = directionPinned ? Array.from(new Set([dirStrategy!.call, dirStrategy!.put].filter((x): x is string => Boolean(x)))) : []
+        const assetSpecs = pinnedId ? resolveMemberSpecs([pinnedId]) : directionPinned ? resolveMemberSpecs(dirIds) : liveSpecs
         if (!assetSpecs.length) continue
         const votes: Array<{ id: string; direction: 'call' | 'put'; score: number }> = []
         let price = 0
@@ -1130,6 +1179,17 @@ export class ModeService {
               ? lab.runStrategy(asset, this.config.tf, s.id)
               : analytics.runStrategy(asset, this.config.tf, s.id, s.params)
             if (ev.direction === 'none') continue
+            if (directionPinned) {
+              // a strategy assigned to the CALL slot only ever contributes a
+              // call vote (its put/none output is dropped), and symmetrically
+              // for PUT - this is what keeps the two sides from ever
+              // colliding into an accidental tie below, unlike a real
+              // ensemble vote where every member can vote either way.
+              const isCallSlot = dirStrategy!.call === s.id
+              const isPutSlot = dirStrategy!.put === s.id
+              if (isCallSlot && !isPutSlot && ev.direction !== 'call') continue
+              if (isPutSlot && !isCallSlot && ev.direction !== 'put') continue
+            }
             votes.push({ id: s.id, direction: ev.direction, score: ev.score })
             price = ev.price
           } catch {
@@ -1137,6 +1197,37 @@ export class ModeService {
           }
         }
         if (!votes.length) continue
+
+        if (directionPinned) {
+          // Never a majority vote: by construction above, at most one CALL
+          // vote (from the call-slot strategy) and at most one PUT vote
+          // (from the put-slot strategy) can ever be present, so there is
+          // no tie to break in the ordinary sense - just apply the global
+          // direction filter and, in the rare case BOTH sides fired this
+          // same tick (the two assigned strategies disagree), take whichever
+          // read the stronger edge.
+          let chosen: { id: string; direction: 'call' | 'put'; score: number } | null = null
+          for (const v of votes) {
+            if (this.config.direction !== 'both' && v.direction !== this.config.direction) continue
+            if (!chosen || Math.abs(v.score) > Math.abs(chosen.score)) chosen = v
+          }
+          if (!chosen) continue
+          const metric = Math.abs(chosen.score)
+          if (metric > bestMetric) {
+            bestMetric = metric
+            bestRow = ModeService.strategyEvalToScreenRow(
+              asset,
+              this.config.tf,
+              chosen.direction,
+              chosen.score,
+              price,
+              `direction-pinned: ${chosen.id} (${chosen.direction.toUpperCase()}) on ${asset} (score ${Math.abs(chosen.score).toFixed(0)})`,
+              undefined,
+              chosen.id
+            )
+          }
+          continue
+        }
 
         if (assetSpecs.length === 1) {
           // no minScore gate here - the strategy's own evaluate() already
@@ -1809,6 +1900,7 @@ export class ModeService {
     if (patch.autoDiscover !== undefined) this.config.autoDiscover = Boolean(patch.autoDiscover)
     if (patch.strategyParams !== undefined) this.config.strategyParams = ModeService.sanitizeStrategyParams(patch.strategyParams)
     if (patch.pairStrategy !== undefined) this.config.pairStrategy = ModeService.sanitizePairStrategy(patch.pairStrategy)
+    if (patch.directionStrategy !== undefined) this.config.directionStrategy = ModeService.sanitizeDirectionStrategy(patch.directionStrategy)
     if (patch.direction !== undefined && ['both', 'call', 'put'].includes(String(patch.direction)))
       this.config.direction = String(patch.direction) as AutoTraderConfig['direction']
     if (patch.maxOpen !== undefined) this.config.maxOpen = Math.round(clamp(Number(patch.maxOpen) || 1, 1, 10))
@@ -1856,11 +1948,13 @@ export class ModeService {
                     const ids = this.effectiveStrategyIds()
                     const pinCount = Object.keys(this.config.pairStrategy ?? {}).length
                     const pinNote = pinCount ? `, ${pinCount} pair${pinCount > 1 ? 's' : ''} pinned to their own strategy` : ''
+                    const ds = this.config.directionStrategy
+                    const dirNote = ds?.call && ds?.put ? `, CALL→${ds.call} / PUT→${ds.put}` : ds?.call ? `, CALL→${ds.call}` : ds?.put ? `, PUT→${ds.put}` : ''
                     if (this.config.strategyPickMode === 'best' && this.config.autoDiscover === true)
-                      return ` (auto-discover ON - ranks the FULL builtin + AI Lab catalog per pair, mining new specs for pairs without one; ${ids.length ? `${ids.length} manually-picked id(s) also included` : 'no manual picks'}${pinNote})`
+                      return ` (auto-discover ON - ranks the FULL builtin + AI Lab catalog per pair, mining new specs for pairs without one; ${ids.length ? `${ids.length} manually-picked id(s) also included` : 'no manual picks'}${pinNote}${dirNote})`
                     const body =
                       ids.length === 0
-                        ? pinCount
+                        ? pinCount || dirNote
                           ? 'no global strategy picked'
                           : 'no strategy picked'
                         : ids.length === 1
@@ -1868,7 +1962,7 @@ export class ModeService {
                           : this.config.strategyPickMode === 'best'
                             ? `auto-learn over ${ids.length}: ${ids.join(', ')} - trades whichever is proven best per pair`
                             : `ensemble of ${ids.length}: ${ids.join(', ')} · ≥${this.config.minConfidence}% agreement`
-                    return ` (${body}${pinNote})`
+                    return ` (${body}${pinNote}${dirNote})`
                   })()
                 : ''
     // minScore/minConfidence are meaningless noise on a config line unless

@@ -1152,6 +1152,72 @@ function PairStrategyPicker({
   )
 }
 
+/** "For every CALL use THIS strategy, for every PUT use THIS one" - the
+ * direction analog of PairStrategyPicker above: two single-strategy slots
+ * instead of a per-pair map. Either slot can be left on "pool" (the global
+ * strategyIds/ensemble/auto-learn pick keeps deciding that side) or pinned
+ * to one specific strategy, independent of the other slot. */
+function DirectionStrategyPicker({
+  strategies,
+  value,
+  onChange,
+}: {
+  strategies: StrategyInfo[]
+  value: { call?: string; put?: string } | undefined
+  onChange: (next: { call?: string; put?: string }) => void
+}) {
+  const v = value ?? {}
+  const setSlot = (side: 'call' | 'put', id: string) => {
+    const next = { ...v }
+    if (id) next[side] = id
+    else delete next[side]
+    onChange(next)
+  }
+  return (
+    <div className="mt-2 rounded border border-[#1c2739] bg-[#0b1220] p-2">
+      <p className="text-[10px] text-[#c7d2e3]">Per-direction strategy pins</p>
+      <p className="mt-0.5 text-[8px] leading-relaxed text-[#3d4c66]">
+        Override the pool above by side - e.g. one strategy you trust for CALLs, a different one for PUTs. A pinned
+        side ignores the global strategy/ensemble/auto-learn pick entirely and only trades when THAT strategy's own
+        read agrees with the side it&apos;s assigned to; a per-pair pin above still wins over this for any pair it
+        covers. Leave a side on &quot;pool (default)&quot; to keep using the global pick for it.
+      </p>
+      <div className="mt-2 grid grid-cols-2 gap-2">
+        <label className="flex flex-col gap-0.5">
+          <span className="text-[9px] uppercase tracking-wider text-emerald-400">CALL strategy</span>
+          <select
+            value={v.call ?? ''}
+            onChange={(e) => setSlot('call', e.target.value)}
+            className="h-7 rounded border border-[#1c2739] bg-[#0b111c] px-1.5 text-[10px] text-[#e2e8f0] outline-none"
+          >
+            <option value="">pool (default)</option>
+            {strategies.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="flex flex-col gap-0.5">
+          <span className="text-[9px] uppercase tracking-wider text-rose-400">PUT strategy</span>
+          <select
+            value={v.put ?? ''}
+            onChange={(e) => setSlot('put', e.target.value)}
+            className="h-7 rounded border border-[#1c2739] bg-[#0b111c] px-1.5 text-[10px] text-[#e2e8f0] outline-none"
+          >
+            <option value="">pool (default)</option>
+            {strategies.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.name}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+    </div>
+  )
+}
+
 function WatchlistPicker({
   assets,
   selected,
@@ -1498,6 +1564,7 @@ function AutoTraderDialog({
                   value={d.pairStrategy}
                   onChange={(next) => p({ pairStrategy: next })}
                 />
+                <DirectionStrategyPicker strategies={strategies} value={d.directionStrategy} onChange={(next) => p({ directionStrategy: next })} />
                 {only && (
                   <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
                     {only.description || `trades "${only.name}" on every open pair (respecting the watchlist below, if set)`}

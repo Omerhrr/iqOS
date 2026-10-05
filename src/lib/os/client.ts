@@ -1265,6 +1265,11 @@ export interface AutoTraderConfig {
    * global pool unchanged. If the pinned id no longer resolves, that pair
    * sits out rather than falling back to the pool. */
   pairStrategy?: Record<string, string>
+  /** Direction pin: "for every CALL use THIS strategy, for every PUT use
+   * THIS one" - the direction analog of pairStrategy above. Either key may
+   * be set alone (the other side keeps using the global pool) or both. A
+   * pair's own pairStrategy pin, if it has one, still wins over this. */
+  directionStrategy?: { call?: string; put?: string }
   direction: 'both' | 'call' | 'put'
   maxOpen: number
   cooldownSec: number
