@@ -22,6 +22,7 @@ import { watchdogPlugin, WatchdogService, type WatchdogConfig } from './src/plug
 import { adaptivePlugin, AdaptiveService, type AdaptiveConfig } from './src/plugins/adaptive'
 import { gridSearch, walkForward, sweepAssets, type Objective } from './src/strategies/optimize'
 import type { BacktestOptions } from './src/strategies/backtest'
+import { normalizeSpec, type CustomSpec } from './src/strategies/custom'
 import { vskMonteCarlo } from './src/analytics/vsk'
 import { tskMonteCarlo } from './src/analytics/tsk'
 import { ALL_TIMEFRAMES, type Timeframe } from './src/types'
@@ -82,6 +83,23 @@ const httpServer = createServer(async (req, res) => {
     const v = (name ?? '1m') as Timeframe
     return (ALL_TIMEFRAMES as string[]).includes(v) ? v : '1m'
   }
+  // Resolves a "custom:<slug>" AI Lab strategy id to its CustomSpec, the
+  // same lab.get()->normalizeSpec() path StrategyLabService.runStrategy
+  // uses, so the Backtest Lab's Single-Run/Optimizer/Walk-Forward/Asset-
+  // Sweep engines can evaluate a Lab strategy exactly like the live
+  // autopilot does. Returns undefined for a builtin id (nothing to
+  // resolve); throws when a custom: id doesn't resolve, so the caller's
+  // try/catch can turn that into a clean 400 instead of a 500.
+  const resolveCustomSpec = (id: string): CustomSpec | undefined => {
+    if (!id.startsWith('custom:')) return undefined
+    const row = kernel.context().use<StrategyLabService>('lab').get(id)
+    if (!row) throw new Error(`unknown lab strategy ${id}`)
+    const spec = normalizeSpec(row.spec, id)
+    if (!spec) throw new Error(`lab strategy ${id} has no usable signals`)
+    return spec
+  }
+  const directionOf = (b: Record<string, unknown>): 'call' | 'put' | 'both' | undefined =>
+    b.direction === 'call' || b.direction === 'put' || b.direction === 'both' ? b.direction : undefined
 
   try {
     const market = kernel.context().use<MarketDataService>('market')
@@ -682,35 +700,44 @@ const httpServer = createServer(async (req, res) => {
       // deep reads: archived bars + live tail (up to 2200) so validation sees
       // the full accumulated history, not just the seeded window
       if (path === '/optimize') {
-        const out = gridSearch(market.getCandlesDeep(String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), 2200), String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), {
-          strategy: String(body.strategy ?? 'confluence-core'),
-          sweep: (body.sweep as Record<string, { from: number; to: number; step: number }>) ?? {},
-          fixedParams: (body.params as Record<string, number | string>) ?? {},
-          objective: (body.objective as Objective) ?? 'netPnl',
-          // Raised from 8: 8 trades is far too small a sample to trust a
-          // ranking decision on (see FastMetrics.winRateCiLow/High - at n=8 the
-          // 95% CI on win rate typically spans 40+ points). 20 is a more
-          // defensible professional floor; still fully overridable by the caller.
-          minTrades: body.minTrades !== undefined ? Number(body.minTrades) : 20,
-          maxCombos: body.maxCombos !== undefined ? Number(body.maxCombos) : 240,
-          top: body.top !== undefined ? Number(body.top) : 20,
-          payout: body.payout !== undefined ? Number(body.payout) : 0.85,
-          amount: body.amount !== undefined ? Number(body.amount) : 10,
-          expiryBars: body.expiryBars !== undefined ? Number(body.expiryBars) : 1,
-          startEquity: body.startEquity !== undefined ? Number(body.startEquity) : 1000,
-          // Round-trip cost modeling - all opt-in, 0 by default (unchanged
-          // behavior unless the caller explicitly asks for spread/slippage/
-          // commission to be simulated).
-          spreadPct: body.spreadPct !== undefined ? Number(body.spreadPct) : 0,
-          slippagePct: body.slippagePct !== undefined ? Number(body.slippagePct) : 0,
-          commissionPct: body.commissionPct !== undefined ? Number(body.commissionPct) : 0,
-        })
-        return json(200, { ok: true, result: out })
+        try {
+          const strategyId = String(body.strategy ?? 'confluence-core')
+          const out = gridSearch(market.getCandlesDeep(String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), 2200), String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), {
+            strategy: strategyId,
+            sweep: (body.sweep as Record<string, { from: number; to: number; step: number }>) ?? {},
+            fixedParams: (body.params as Record<string, number | string>) ?? {},
+            objective: (body.objective as Objective) ?? 'netPnl',
+            // Raised from 8: 8 trades is far too small a sample to trust a
+            // ranking decision on (see FastMetrics.winRateCiLow/High - at n=8 the
+            // 95% CI on win rate typically spans 40+ points). 20 is a more
+            // defensible professional floor; still fully overridable by the caller.
+            minTrades: body.minTrades !== undefined ? Number(body.minTrades) : 20,
+            maxCombos: body.maxCombos !== undefined ? Number(body.maxCombos) : 240,
+            top: body.top !== undefined ? Number(body.top) : 20,
+            payout: body.payout !== undefined ? Number(body.payout) : 0.85,
+            amount: body.amount !== undefined ? Number(body.amount) : 10,
+            expiryBars: body.expiryBars !== undefined ? Number(body.expiryBars) : 1,
+            startEquity: body.startEquity !== undefined ? Number(body.startEquity) : 1000,
+            // Round-trip cost modeling - all opt-in, 0 by default (unchanged
+            // behavior unless the caller explicitly asks for spread/slippage/
+            // commission to be simulated).
+            spreadPct: body.spreadPct !== undefined ? Number(body.spreadPct) : 0,
+            slippagePct: body.slippagePct !== undefined ? Number(body.slippagePct) : 0,
+            commissionPct: body.commissionPct !== undefined ? Number(body.commissionPct) : 0,
+            customSpec: resolveCustomSpec(strategyId),
+            direction: directionOf(body),
+          })
+          return json(200, { ok: true, result: out })
+        } catch (err) {
+          return json(400, { ok: false, error: (err as Error).message })
+        }
       }
 
       if (path === '/walkforward') {
+        try {
+        const strategyId = String(body.strategy ?? 'rsi-reversion')
         const out = walkForward(market.getCandlesDeep(String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), 2200), String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), {
-          strategy: String(body.strategy ?? 'rsi-reversion'),
+          strategy: strategyId,
           sweep: (body.sweep as Record<string, { from: number; to: number; step: number }>) ?? {},
           fixedParams: (body.params as Record<string, number | string>) ?? {},
           objective: (body.objective as Objective) ?? 'netPnl',
@@ -728,6 +755,8 @@ const httpServer = createServer(async (req, res) => {
           spreadPct: body.spreadPct !== undefined ? Number(body.spreadPct) : 0,
           slippagePct: body.slippagePct !== undefined ? Number(body.slippagePct) : 0,
           commissionPct: body.commissionPct !== undefined ? Number(body.commissionPct) : 0,
+          customSpec: resolveCustomSpec(strategyId),
+          direction: directionOf(body),
         })
         // Persist the verdict so the research-gate (bot_create/bot_toggle) can
         // require a recent robust pass before arming a bot on this
@@ -777,9 +806,13 @@ const httpServer = createServer(async (req, res) => {
           console.error('[research] saveValidation failed:', (err as Error).message)
         }
         return json(200, { ok: true, result: out, verdict })
+        } catch (err) {
+          return json(400, { ok: false, error: (err as Error).message })
+        }
       }
 
       if (path === '/asset_sweep') {
+        try {
         const wanted = Array.isArray(body.assets) ? (body.assets as string[]) : null
         const category = body.category ? String(body.category) : null
         let pool = market.assets
@@ -788,6 +821,7 @@ const httpServer = createServer(async (req, res) => {
         const openOnly = body.openOnly === undefined ? true : Boolean(body.openOnly)
         if (openOnly) pool = pool.filter((a) => a.open)
         const sweepTf = tf(String(body.tf ?? '1m') as string)
+        const sweepStrategyId = String(body.strategy ?? 'confluence-core')
         const provStore = kernel.context().use<{ archiveBounds: (asset: string, tf: string) => { oldest: number; newest: number; n: number } | null }>('storeRaw')
         const out = sweepAssets(
           pool.map((a) => ({ ticker: a.ticker, category: a.category, open: a.open, payout: a.payout })),
@@ -803,7 +837,7 @@ const httpServer = createServer(async (req, res) => {
             // generator rather than a real market edge - this is how that gets
             // caught instead of silently looking like a validated signal.
             provenance: (ticker) => provStore.archiveBounds(ticker, sweepTf),
-            strategy: String(body.strategy ?? 'confluence-core'),
+            strategy: sweepStrategyId,
             params: (body.params as Record<string, number | string>) ?? undefined,
             objective: (body.objective as Objective) ?? 'netPnl',
             minTrades: body.minTrades !== undefined ? Number(body.minTrades) : 20,
@@ -822,14 +856,21 @@ const httpServer = createServer(async (req, res) => {
             // Same-calendar-window comparison across assets by default; pass
             // sharedWindow:false to restore each asset's own most-recent-N-candles.
             sharedWindow: body.sharedWindow === undefined ? true : Boolean(body.sharedWindow),
+            customSpec: resolveCustomSpec(sweepStrategyId),
+            direction: directionOf(body),
           }
         )
         return json(200, { ok: true, result: out })
+        } catch (err) {
+          return json(400, { ok: false, error: (err as Error).message })
+        }
       }
 
       if (path === '/backtest') {
+        try {
+        const backtestStrategyId = String(body.strategy ?? 'confluence-core')
         const result = analytics.runBacktest(String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), {
-          strategy: String(body.strategy ?? 'confluence-core'),
+          strategy: backtestStrategyId,
           params: (body.params as Record<string, number | string>) ?? undefined,
           mode: (body.mode as 'binary' | 'spot') ?? 'binary',
           payout: body.payout !== undefined ? Number(body.payout) : 0.85,
@@ -850,8 +891,13 @@ const httpServer = createServer(async (req, res) => {
             body.stakePlan && (body.stakePlan as { kind?: string }).kind === 'compound'
               ? (body.stakePlan as BacktestOptions['stakePlan'])
               : undefined,
+          customSpec: resolveCustomSpec(backtestStrategyId),
+          direction: directionOf(body),
         })
         return json(200, { ok: true, result })
+        } catch (err) {
+          return json(400, { ok: false, error: (err as Error).message })
+        }
       }
 
       if (path === '/vsk_montecarlo') {
@@ -1183,6 +1229,7 @@ const httpServer = createServer(async (req, res) => {
             amount: body.amount !== undefined ? Number(body.amount) : undefined,
             name: body.name !== undefined ? String(body.name) : undefined,
             basis: body.basis !== undefined ? String(body.basis) as 'candles' | 'heikin' | 'kalman' : undefined,
+            mineCombos: body.mineCombos !== undefined ? Boolean(body.mineCombos) : undefined,
           })
           return json(200, result)
         } catch (err) {

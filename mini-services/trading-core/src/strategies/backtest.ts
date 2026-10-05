@@ -2,10 +2,39 @@
 // Walks a strategy over historical candles. Two settlement models:
 //  - binary: fixed stake, settles at expiryBars close vs entry (win = stake*payout)
 //  - spot:   enters at close, exits on opposite signal / TP / SL / max bars
-import type { BacktestResult, BacktestTrade, Candle, Timeframe } from '../types'
+import type { BacktestResult, BacktestTrade, Candle, StrategyDef, Timeframe } from '../types'
 import { defaultParams, getStrategy } from './builtin'
 import { sharpeRatio } from '../analytics/quant'
 import type { StakePlan } from '../plugins/autopilot'
+import { evaluateCustom, type CustomSpec } from './custom'
+
+/** Resolves a strategy id to a StrategyDef, understanding BOTH the static
+ * builtin registry (builtin.ts's STRATEGIES) and AI Lab-learned "custom:<id>"
+ * specs, which live in the lab plugin's store, not in STRATEGIES. Every
+ * engine entry point (backtest/fastBacktest/gridSearch/walkForward/
+ * sweepAssets) resolves strategies through this one function so a Lab
+ * strategy works identically everywhere a builtin one does, instead of each
+ * engine needing its own "is this a custom: id" branch.
+ *
+ * `customSpec` must be supplied by the caller (resolved from the lab store,
+ * e.g. in index.ts's HTTP handlers) when `id` starts with "custom:" - this
+ * module has no store access of its own. When it's missing for a custom id,
+ * this throws the same "Unknown strategy" error a bad builtin id would,
+ * which the HTTP layer turns into a clean 400 instead of a crash. */
+export function resolveStrategyDef(id: string, customSpec?: CustomSpec): StrategyDef {
+  if (id.startsWith('custom:') && customSpec) {
+    return {
+      id,
+      name: customSpec.name ?? id,
+      description: 'Custom AI Lab strategy',
+      params: [],
+      evaluate: (candles) => evaluateCustom(customSpec, candles),
+    }
+  }
+  const strat = getStrategy(id)
+  if (!strat) throw new Error(`Unknown strategy: ${id}`)
+  return strat
+}
 
 export interface DirectionMetrics {
   trades: number
@@ -71,6 +100,16 @@ export interface BacktestOptions {
   // actually have done on this history", as opposed to compound_plan's
   // idealized every-trade-wins ladder projection.
   stakePlan?: StakePlan
+  // Required when `strategy` is a "custom:<id>" AI Lab strategy id - the
+  // lab store isn't reachable from this module, so the HTTP layer resolves
+  // it and passes the spec through. Ignored for builtin strategy ids.
+  customSpec?: CustomSpec
+  // Manually force which side(s) are taken, instead of the default "take
+  // whatever the strategy signals and report both sides blended". 'call'/
+  // 'put' skip bars where the strategy signals the other direction (as if
+  // that signal were 'none'); 'both' (or unset) preserves current behavior
+  // exactly.
+  direction?: 'call' | 'put' | 'both'
 }
 
 /** Mutable compounding-cycle state, mirroring autopilot.ts's RuntimeState
@@ -114,9 +153,11 @@ function compoundSettle(plan: StakePlan, cycle: CompoundCycle, won: boolean, sta
 }
 
 export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: BacktestOptions): BacktestResult {
-  const strat = getStrategy(opts.strategy)
-  if (!strat) throw new Error(`Unknown strategy: ${opts.strategy}`)
+  const strat = resolveStrategyDef(opts.strategy, opts.customSpec)
   const params = { ...defaultParams(strat), ...(opts.params ?? {}) }
+  const wantDir = opts.direction ?? 'both'
+  const filterDir = <T extends { direction: 'call' | 'put' | 'none' }>(ev: T): T =>
+    wantDir !== 'both' && ev.direction !== 'none' && ev.direction !== wantDir ? ({ ...ev, direction: 'none' } as T) : ev
   const mode = opts.mode ?? 'binary'
   const payout = opts.payout ?? 0.85
   const amount = Math.max(0.01, opts.amount ?? 10)
@@ -151,7 +192,7 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
         compoundCycles++
       }
       const evalWindow = candles.slice(0, i + 1)
-      const ev = strat.evaluate(evalWindow, params)
+      const ev = filterDir(strat.evaluate(evalWindow, params))
       if (ev.direction === 'none') continue
       const rawEntry = candles[i].close
       const entry = ev.direction === 'call' ? rawEntry * (1 + costPct / 100) : rawEntry * (1 - costPct / 100)
@@ -196,7 +237,7 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
         const evNow =
           hitTP || hitSL || open.bars >= maxBars
             ? { direction: 'none' as const, score: 0, notes: '' }
-            : strat.evaluate([...candles.slice(0, i + 1)], params)
+            : filterDir(strat.evaluate([...candles.slice(0, i + 1)], params))
         const flipped = evNow.direction !== 'none' && evNow.direction !== open.side
         if (hitTP || hitSL || open.bars >= maxBars || flipped) {
           const rawExit = candle.close
@@ -225,7 +266,7 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
         }
         continue
       }
-      const ev = strat.evaluate([...candles.slice(0, i + 1)], params)
+      const ev = filterDir(strat.evaluate([...candles.slice(0, i + 1)], params))
       if (ev.direction !== 'none' && equity >= amount) {
         open = { side: ev.direction, entry: candle.close, bars: 0, ts: candle.time }
       }

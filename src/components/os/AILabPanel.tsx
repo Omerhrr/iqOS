@@ -250,6 +250,11 @@ export default function AILabPanel({ assets, strategies, onError, refreshBots }:
   const [minEdge, setMinEdge] = useState(1.5)
   const [payout, setPayout] = useState(0.7)
   const [maxSignals, setMaxSignals] = useState(8)
+  // Mine AND/OR/AND-AND confluence combos of the best single signals, not
+  // just flat independent-signal voting (see lab.ts's learn() "combo
+  // mining" comment) - on by default since this is strictly more of what
+  // the learner can discover, not a different mode.
+  const [mineCombos, setMineCombos] = useState(true)
   const [learning, setLearning] = useState(false)
   const [result, setResult] = useState<LabLearnResult | null>(null)
   // Which measured signals (by key) are checked into the deployed spec. Seeded
@@ -788,7 +793,7 @@ export default function AILabPanel({ assets, strategies, onError, refreshBots }:
     setResult(null)
     setSavedId(null)
     try {
-      const res = await osPost<LabLearnResult>('/lab_learn', { asset, tf, basis, bars, horizon, minSamples, minEdge, maxSignals, payout })
+      const res = await osPost<LabLearnResult>('/lab_learn', { asset, tf, basis, bars, horizon, minSamples, minEdge, maxSignals, payout, mineCombos })
       setResult(res)
       setCheckedKeys(new Set(res.signals.filter((s) => s.selected).map((s) => s.key)))
       const basisSuffix = { candles: '', heikin: ' HA', kalman: ' KAL', typical: ' TYP', smoothed: ' SMA' }[basis]
@@ -1047,12 +1052,16 @@ export default function AILabPanel({ assets, strategies, onError, refreshBots }:
             />
           </label>
           <NumField label="max signals" value={maxSignals} onChange={setMaxSignals} w="w-12" />
+          <label className="flex cursor-pointer items-center gap-1.5 pb-1.5 font-mono text-[10px] text-[#7c8aa5]" title="Also mine AND/OR/AND-AND combinations of the best single signals (e.g. Range Sell Zone AND Wide Bear Bar, or RSI oversold OR Donchian breakout) instead of only flat independent-signal voting - a combo only wins a slot if it measures a better edge than the signals it's built from.">
+            <input type="checkbox" checked={mineCombos} onChange={(e) => setMineCombos(e.target.checked)} className="h-3 w-3 accent-cyan-500" />
+            mix signals (AND/OR combos)
+          </label>
           <Button onClick={() => void learn()} disabled={learning} className="h-7 bg-cyan-600 px-3 text-[10px] font-bold uppercase tracking-wider text-white hover:bg-cyan-500 disabled:opacity-50">
             {learning ? 'mining...' : 'learn this pair'}
           </Button>
         </div>
         <p className="mt-2 text-[10px] leading-snug text-[#7c8aa5]">
-          Mines candlestick patterns, wide-range bar formations, Heiken Ashi structures, line breaks (Donchian / HH-HL), multi-timeframe EMA-trend agreement (resampled 5x/15x) and its own invented indicators (RSI, BB %B, z-score, Donchian position, MACD-z, slope, streak, wick bias, EMA spread, HA distance, close position) - then weights the survivors by their Wilson-score confidence-adjusted edge (not just the raw win rate, so a lucky small sample can&apos;t outrank a well-sampled one) and backtests the composition. The <span className="text-[#aab6cc]">basis</span> switch picks what every signal actually reads: raw candles, Heiken-Ashi, a Kalman-smoothed trend line, typical-price (HLC3, folds the whole bar&apos;s range into one number), or a plain 3-bar SMA smooth - whichever basis, outcomes always settle on real prices and the deployed bot trades the same basis it learned on. Thin history auto-relaxes the min-samples floor instead of failing. Saved strategies are automatically re-learned every ~6h to catch decay (see the library below).
+          Mines candlestick patterns, wide-range bar formations, Heiken Ashi structures, line breaks (Donchian / HH-HL), multi-timeframe EMA-trend agreement (resampled 5x/15x) and its own invented indicators (RSI, BB %B, z-score, Donchian position, MACD-z, slope, streak, wick bias, EMA spread, HA distance, close position){mineCombos ? <>, plus AND/OR/AND-AND combinations of the best of those (confluence, not just single signals voting independently)</> : null} - then weights the survivors by their Wilson-score confidence-adjusted edge (not just the raw win rate, so a lucky small sample can&apos;t outrank a well-sampled one) and backtests the composition. The <span className="text-[#aab6cc]">basis</span> switch picks what every signal actually reads: raw candles, Heiken-Ashi, a Kalman-smoothed trend line, typical-price (HLC3, folds the whole bar&apos;s range into one number), or a plain 3-bar SMA smooth - whichever basis, outcomes always settle on real prices and the deployed bot trades the same basis it learned on. Thin history auto-relaxes the min-samples floor instead of failing. Saved strategies are automatically re-learned every ~6h to catch decay (see the library below).
         </p>
       </div>
 

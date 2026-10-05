@@ -3,8 +3,9 @@
 // autopilot bots trade). Results for the finalists are re-verified through the full
 // backtester so the numbers the user acts on match the Single-run lab exactly.
 import type { BacktestResult, BacktestTrade, Candle, StrategyDef, Timeframe } from '../types'
-import { defaultParams, getStrategy } from './builtin'
-import { backtest, directionBreakdown, type DirectionMetrics } from './backtest'
+import { defaultParams } from './builtin'
+import { backtest, directionBreakdown, resolveStrategyDef, type DirectionMetrics } from './backtest'
+import type { CustomSpec } from './custom'
 import { sharpeRatio } from '../analytics/quant'
 
 export type Objective = 'netPnl' | 'sharpe' | 'profitFactor' | 'winRate' | 'expectancy'
@@ -296,10 +297,18 @@ export function fastBacktest(
     spreadPct?: number
     slippagePct?: number
     commissionPct?: number
+    // See backtest.ts's BacktestOptions.customSpec/direction docs - threaded
+    // through identically here so the Optimizer/Walk-Forward/Asset-Sweep
+    // engines can evaluate AI Lab "custom:" strategies and honor a manually
+    // forced trade direction the same way the Single-Run engine does.
+    customSpec?: CustomSpec
+    direction?: 'call' | 'put' | 'both'
   } = {}
 ): FastMetrics {
-  const strat = getStrategy(strategyId)
-  if (!strat) throw new Error(`Unknown strategy: ${strategyId}`)
+  const strat = resolveStrategyDef(strategyId, opts.customSpec)
+  const wantDir = opts.direction ?? 'both'
+  const filterDir = <T extends { direction: 'call' | 'put' | 'none' }>(ev: T): T =>
+    wantDir !== 'both' && ev.direction !== 'none' && ev.direction !== wantDir ? ({ ...ev, direction: 'none' } as T) : ev
   const payout = opts.payout ?? 0.85
   const amount = Math.max(0.01, opts.amount ?? 10)
   const expiryBars = Math.max(1, opts.expiryBars ?? 1)
@@ -328,7 +337,7 @@ export function fastBacktest(
     // params - which defeated the purpose of "verifying the top-3" against
     // it. This matches backtest.ts's evalWindow exactly.
     const win = candles.slice(0, i + 1)
-    const ev = strat.evaluate(win, params)
+    const ev = filterDir(strat.evaluate(win, params))
     if (ev.direction === 'none') continue
     // Entry price is adjusted for spread/slippage in the unfavorable
     // direction for the side taken, same as a real fill would be worse than
@@ -463,11 +472,16 @@ export interface GridSearchOptions {
   spreadPct?: number
   slippagePct?: number
   commissionPct?: number
+  // See backtest.ts's BacktestOptions docs. A custom spec has no
+  // StrategyParam[] to grid-search over, so when customSpec is set the
+  // param grid is short-circuited to a single point (see below) - there is
+  // nothing to sweep, it's one fixed spec per run.
+  customSpec?: CustomSpec
+  direction?: 'call' | 'put' | 'both'
 }
 
 export function gridSearch(candles: Candle[], asset: string, tf: Timeframe, opts: GridSearchOptions): GridSearchResult {
-  const strat = getStrategy(opts.strategy)
-  if (!strat) throw new Error(`Unknown strategy: ${opts.strategy}`)
+  const strat = resolveStrategyDef(opts.strategy, opts.customSpec)
   const objective = opts.objective ?? 'netPnl'
   const minTrades = Math.max(1, opts.minTrades ?? 20)
   const top = Math.max(1, Math.min(30, opts.top ?? 20))
@@ -479,6 +493,8 @@ export function gridSearch(candles: Candle[], asset: string, tf: Timeframe, opts
     spreadPct: opts.spreadPct,
     slippagePct: opts.slippagePct,
     commissionPct: opts.commissionPct,
+    customSpec: opts.customSpec,
+    direction: opts.direction,
   }
   const sweptKeys = Object.keys(opts.sweep).filter((k) => strat.params.some((p) => p.key === k))
   // Base every combo on the strategy's registered defaults, then let any
@@ -488,7 +504,13 @@ export function gridSearch(candles: Candle[], asset: string, tf: Timeframe, opts
   const fixedBase = { ...defaultParams(strat), ...(opts.fixedParams ?? {}) }
 
   const t0 = Date.now()
-  const { combos: rawCombos, total, truncated } = expandGrid(strat, opts.sweep, opts.maxCombos ?? 240)
+  // A custom AI Lab spec has no params to grid-search - force a single-point
+  // "grid" (one combo: the fixed base, usually {}) instead of expanding over
+  // strat.params (which is [] for a custom strat anyway, so this is mostly
+  // documentation of intent, but it also skips expandGrid's bookkeeping).
+  const { combos: rawCombos, total, truncated } = opts.customSpec
+    ? { combos: [{}], total: 1, truncated: false }
+    : expandGrid(strat, opts.sweep, opts.maxCombos ?? 240)
   const combos = rawCombos.map((c) => ({ ...fixedBase, ...c }))
   const valueLists = new Map<string, Set<number>>()
   for (const k of sweptKeys) valueLists.set(k, new Set())
@@ -528,6 +550,8 @@ export function gridSearch(candles: Candle[], asset: string, tf: Timeframe, opts
           spreadPct: opts.spreadPct,
           slippagePct: opts.slippagePct,
           commissionPct: opts.commissionPct,
+          customSpec: opts.customSpec,
+          direction: opts.direction,
         })
         const [fciLow, fciHigh] = wilsonInterval(full.metrics.wins, full.metrics.totalTrades)
         const fm: FastMetrics = {
@@ -583,8 +607,7 @@ export interface WalkForwardOptions extends GridSearchOptions {
 }
 
 export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opts: WalkForwardOptions): WalkForwardResult {
-  const strat = getStrategy(opts.strategy)
-  if (!strat) throw new Error(`Unknown strategy: ${opts.strategy}`)
+  const strat = resolveStrategyDef(opts.strategy, opts.customSpec)
   const objective = opts.objective ?? 'netPnl'
   const minTrades = Math.max(1, opts.minTrades ?? 10)
   const folds = Math.max(2, Math.min(5, Math.round(opts.folds ?? 3)))
@@ -597,6 +620,8 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
     spreadPct: opts.spreadPct,
     slippagePct: opts.slippagePct,
     commissionPct: opts.commissionPct,
+    customSpec: opts.customSpec,
+    direction: opts.direction,
   }
   const warmup = strategyWarmup(strat.id)
   // Same fixedParams merge as gridSearch - see that function's comment.
@@ -614,7 +639,9 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
       `history too short for ${folds} walk-forward folds on ${strat.id} (needs ~${(warmup + 140 * folds).toFixed(0)} candles, have ${candles.length}) — try fewer folds or a faster-warming strategy`
     )
   }
-  const { combos: rawCombos } = expandGrid(strat, opts.sweep, opts.maxCombos ?? 120)
+  const { combos: rawCombos } = opts.customSpec
+    ? { combos: [{}] }
+    : expandGrid(strat, opts.sweep, opts.maxCombos ?? 120)
   const combos = rawCombos.map((c) => ({ ...fixedBase, ...c }))
 
   const outFolds: WalkForwardFold[] = []
@@ -682,6 +709,8 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
       spreadPct: opts.spreadPct,
       slippagePct: opts.slippagePct,
       commissionPct: opts.commissionPct,
+      customSpec: opts.customSpec,
+      direction: opts.direction,
     })
     const [oosCiLow, oosCiHigh] = wilsonInterval(oosFull.metrics.wins, oosFull.metrics.totalTrades)
     const oosM: FastMetrics = {
@@ -795,6 +824,8 @@ export interface AssetSweepOptions {
   // rest are deterministic synthetic fill. Omit to skip the check (rows get
   // liveDataPct: null) rather than silently claiming 100% live.
   provenance?: (ticker: string) => { oldest: number; newest: number } | null
+  customSpec?: CustomSpec
+  direction?: 'call' | 'put' | 'both'
 }
 
 export interface CandleFetcher {
@@ -807,8 +838,7 @@ export function sweepAssets(
   tf: Timeframe,
   opts: AssetSweepOptions
 ): SweepResult {
-  const strat = getStrategy(opts.strategy)
-  if (!strat) throw new Error(`Unknown strategy: ${opts.strategy}`)
+  const strat = resolveStrategyDef(opts.strategy, opts.customSpec)
   const objective = opts.objective ?? 'netPnl'
   const minTrades = Math.max(1, opts.minTrades ?? 20)
   const base = defaultParams(strat)
@@ -868,6 +898,8 @@ export function sweepAssets(
         spreadPct: opts.spreadPct,
         slippagePct: opts.slippagePct,
         commissionPct: opts.commissionPct,
+        customSpec: opts.customSpec,
+        direction: opts.direction,
       })
       const score = scoreOf(m, objective, minTrades)
       let liveDataPct: number | null = null

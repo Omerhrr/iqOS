@@ -399,6 +399,28 @@ function DirSplitBlock({ byDirection }: { byDirection: { call: DirMetrics; put: 
   )
 }
 
+// Manual override for which side(s) a run takes, instead of always taking
+// both and reporting a blended average (see backtest.ts/optimize.ts's
+// `direction` option). 'both' preserves the original default behavior.
+function DirectionPicker({ value, onChange }: { value: 'both' | 'call' | 'put'; onChange: (v: 'both' | 'call' | 'put') => void }) {
+  return (
+    <div className="flex h-8 overflow-hidden rounded border border-[#1c2739] bg-[#101828]">
+      {(['both', 'call', 'put'] as const).map((d) => (
+        <button
+          key={d}
+          type="button"
+          onClick={() => onChange(d)}
+          className={`px-2 font-mono text-[10px] font-semibold uppercase tracking-wider transition-colors ${
+            value === d ? 'bg-cyan-600/30 text-cyan-300' : 'text-[#7c8aa5] hover:text-[#dbe4f0]'
+          }`}
+        >
+          {d}
+        </button>
+      ))}
+    </div>
+  )
+}
+
 function ParamChips({ params, cls = 'text-cyan-300' }: { params: Record<string, number | string>; cls?: string }) {
   return (
     <div className="flex flex-wrap gap-1">
@@ -509,6 +531,7 @@ function SingleTab({ asset, strategies }: { asset: string; strategies: StrategyI
   const [spreadPct, setSpreadPct] = useState('0')
   const [slippagePct, setSlippagePct] = useState('0')
   const [commissionPct, setCommissionPct] = useState('0')
+  const [direction, setDirection] = useState<'both' | 'call' | 'put'>('both')
   const [paramValues, setParamValues] = useState<Record<string, Record<string, string>>>({})
   const [result, setResult] = useState<BacktestResult | null>(null)
   const [busy, setBusy] = useState(false)
@@ -570,6 +593,7 @@ function SingleTab({ asset, strategies }: { asset: string; strategies: StrategyI
         commissionPct: Number(commissionPct),
         params,
         stakePlan,
+        direction,
       })
       if (res.ok && res.result) setResult(res.result)
       else setError(res.error ?? 'backtest failed')
@@ -649,6 +673,9 @@ function SingleTab({ asset, strategies }: { asset: string; strategies: StrategyI
             />
             <span className="font-mono text-[10px] text-[#9aa8bd]">{mode !== 'binary' ? 'binary only' : compound ? 'on' : 'off'}</span>
           </label>
+        </Field>
+        <Field label="Direction">
+          <DirectionPicker value={direction} onChange={setDirection} />
         </Field>
 
         {strategy?.params.map((p) => (
@@ -839,6 +866,7 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
   const [error, setError] = useState('')
   const [promote, setPromote] = useState(false)
   const [rankBy, setRankBy] = useState<'blended' | 'call' | 'put'>('blended')
+  const [direction, setDirection] = useState<'both' | 'call' | 'put'>('both')
 
   const strategy = strategies.find((s) => s.id === strategyId)
   const { sweep, count, missing } = useMemo(() => buildSweep(strategy, sweepState), [strategy, sweepState])
@@ -868,7 +896,10 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
   }, [result, rankBy])
 
   const run = async () => {
-    if (!Object.keys(sweep).length) {
+    // A custom AI Lab strategy has no StrategyParam[] to sweep (it's one
+    // fixed spec, no params grid) - only require a non-empty sweep for a
+    // builtin strategy that actually has params to check.
+    if (!Object.keys(sweep).length && strategy && strategy.params.length > 0) {
       setError('check at least one parameter to sweep')
       return
     }
@@ -891,6 +922,7 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
         spreadPct: Number(spreadPct),
         slippagePct: Number(slippagePct),
         commissionPct: Number(commissionPct),
+        direction,
       })
       if (res.ok && res.result) {
         setResult(res.result)
@@ -952,6 +984,9 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
         </Field>
         <Field label="Commission %">
           <Input value={commissionPct} onChange={(e) => setCommissionPct(e.target.value)} className={`${inCls} w-14`} />
+        </Field>
+        <Field label="Direction">
+          <DirectionPicker value={direction} onChange={setDirection} />
         </Field>
         <Button onClick={() => void run()} disabled={busy} className="h-8 bg-cyan-600 px-4 text-[11px] font-semibold text-white hover:bg-cyan-500">
           {busy ? 'Searching…' : 'Run Optimizer'}
@@ -1099,6 +1134,7 @@ function WalkForwardTab({ asset, strategies }: { asset: string; strategies: Stra
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [promote, setPromote] = useState(false)
+  const [direction, setDirection] = useState<'both' | 'call' | 'put'>('both')
 
   const strategy = strategies.find((s) => s.id === strategyId)
   const { sweep, count, missing } = useMemo(() => buildSweep(strategy, sweepState), [strategy, sweepState])
@@ -1124,6 +1160,7 @@ function WalkForwardTab({ asset, strategies }: { asset: string; strategies: Stra
         spreadPct: Number(spreadPct),
         slippagePct: Number(slippagePct),
         commissionPct: Number(commissionPct),
+        direction,
       })
       if (res.ok && res.result) setResult(res.result)
       else setError(res.error ?? 'walk-forward failed')
@@ -1187,6 +1224,9 @@ function WalkForwardTab({ asset, strategies }: { asset: string; strategies: Stra
         </Field>
         <Field label="Commission %">
           <Input value={commissionPct} onChange={(e) => setCommissionPct(e.target.value)} className={`${inCls} w-14`} />
+        </Field>
+        <Field label="Direction">
+          <DirectionPicker value={direction} onChange={setDirection} />
         </Field>
         <Button onClick={() => void run()} disabled={busy} className="h-8 bg-cyan-600 px-4 text-[11px] font-semibold text-white hover:bg-cyan-500">
           {busy ? 'Validating…' : 'Run Walk-Forward'}
@@ -1338,6 +1378,7 @@ function SweepTab({
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [rankBy, setRankBy] = useState<'blended' | 'call' | 'put'>('blended')
+  const [direction, setDirection] = useState<'both' | 'call' | 'put'>('both')
 
   const strategy = strategies.find((s) => s.id === strategyId)
 
@@ -1384,6 +1425,7 @@ function SweepTab({
         slippagePct: Number(slippagePct),
         commissionPct: Number(commissionPct),
         sharedWindow,
+        direction,
       })
       if (res.ok && res.result) setResult(res.result)
       else setError(res.error ?? 'asset sweep failed')
@@ -1458,6 +1500,9 @@ function SweepTab({
         </Field>
         <Field label="Commission %">
           <Input value={commissionPct} onChange={(e) => setCommissionPct(e.target.value)} className={`${inCls} w-14`} />
+        </Field>
+        <Field label="Direction">
+          <DirectionPicker value={direction} onChange={setDirection} />
         </Field>
         <label className="flex cursor-pointer items-center gap-1.5 pb-1.5 font-mono text-[10px] text-[#7c8aa5]">
           <input type="checkbox" checked={openOnly} onChange={(e) => setOpenOnly(e.target.checked)} className="h-3 w-3 accent-cyan-500" />
