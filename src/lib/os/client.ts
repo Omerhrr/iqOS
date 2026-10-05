@@ -272,6 +272,94 @@ export async function getCandleMath(
   return { raw: d.raw, blends: d.blends }
 }
 
+// ---------- OTC defense (placebo-test gate for generator-driven markets) ----------
+// OTC charts are machine-generated, so a TA edge claimed on them must prove
+// itself against our OWN calibrated chart generator (see
+// trading-core/src/analytics/synthfeed.ts): the same strategy is run on the
+// real pair AND on K synthetic twins that reproduce the pair's measured
+// statistics with zero learnable structure. edgeZ = how many sigmas the real
+// win rate sits above the placebo mean. Verdicts: 'edge' (real beats the
+// placebo), 'weak' (suggestive), 'no_edge' (indistinguishable from luck),
+// 'inconclusive' (too few real trades).
+
+export type OtcVerdictClass = 'edge' | 'weak' | 'no_edge' | 'inconclusive'
+export type OtcPolicy = 'enforce' | 'warn' | 'off'
+
+export interface OtcConfig {
+  policy: OtcPolicy
+  minEdgeZ: number
+  seriesK: number
+  ttlDays: number
+  minRealTrades: number
+}
+
+export interface OtcDefenseReport {
+  ok: boolean
+  asset: string
+  strategyKey: string
+  tf: string
+  isOtc: boolean
+  verdict: OtcVerdictClass
+  edgeZ: number
+  real: { winRate: number; totalTrades: number; profitFactor: number; expectancy: number; netPnl: number }
+  placebo: { series: number; winRateMean: number; winRateStd: number; winRateP95: number; expectancyMean: number }
+  calibration: { source: 'tick' | 'candle'; n: number; blockLen: number; seedBase: number; meanAbsStep: number; excessKurtosis: number }
+  /** 'live' (real broker feed) or 'sim' (sandbox simulator) - a verdict on sim data reflects the sim's own structure, not a real OTC feed. */
+  dataMode: 'live' | 'sim'
+  config: OtcConfig
+  testedAt: number
+  summary: string
+}
+
+export interface OtcVerdictRow {
+  asset: string
+  strategyKey: string
+  tf: string
+  verdict: OtcVerdictClass
+  edgeZ: number
+  realWinRate: number
+  realTrades: number
+  placeboWrMean: number
+  placeboSeries: number
+  calibrationSource: 'tick' | 'candle'
+  ts: number
+}
+
+export interface OtcStatus {
+  ok: boolean
+  asset: string
+  strategyKey: string
+  isOtc: boolean
+  policy: OtcPolicy
+  verdict: { verdict: OtcVerdictClass; edgeZ: number; realWinRate: number; realTrades: number; placeboWrMean: number; placeboSeries: number; calibrationSource: 'tick' | 'candle'; ts: number } | null
+}
+
+export async function runOtcDefense(input: {
+  asset: string
+  strategyId: string
+  tf?: string
+  k?: number
+  payout?: number
+}): Promise<OtcDefenseReport> {
+  return osPost<OtcDefenseReport>('/otc_defense_run', input)
+}
+
+export async function getOtcStatus(asset: string, strategyKey: string): Promise<OtcStatus> {
+  return osGet<OtcStatus>('/otc_status', { asset, strategy: strategyKey })
+}
+
+export async function getOtcVerdicts(limit = 50): Promise<{ ok: boolean; verdicts: OtcVerdictRow[] }> {
+  return osGet<{ ok: boolean; verdicts: OtcVerdictRow[] }>('/otc_verdicts', { limit })
+}
+
+export async function getOtcConfig(): Promise<{ ok: boolean; config: OtcConfig }> {
+  return osGet<{ ok: boolean; config: OtcConfig }>('/otc_config')
+}
+
+export async function setOtcConfig(patch: Partial<OtcConfig>): Promise<{ ok: boolean; config: OtcConfig }> {
+  return osPost<{ ok: boolean; config: OtcConfig }>('/otc_config', patch)
+}
+
 export interface CompositeSignal {
   asset: string
   tf: Timeframe

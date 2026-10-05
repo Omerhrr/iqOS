@@ -681,6 +681,19 @@ export class AutopilotService {
       // memory gate plugin not loaded - rule gating disabled
     }
 
+    // OTC defense gate: generator-driven charts (synthetic feeds) don't
+    // respect TA - autonomy may only trade an OTC asset with a strategy that
+    // has beaten its own calibrated synthetic placebo (plugins/otcguard.ts).
+    // Cheap persisted-verdict lookup, never computes here. policy 'warn'/
+    // 'off' pass through; humans trading manually are never gated.
+    try {
+      const guard = this.ctx.use<{ check: (target: { asset: string }, strategyKey: string) => { ok: boolean; reason?: string } }>('otcGuard')
+      const g = guard.check({ asset }, bot.strategyId)
+      if (!g.ok) return this.reject(bot, g.reason ?? 'OTC defense gate hold')
+    } catch {
+      // otc guard plugin not loaded - OTC gating disabled
+    }
+
     // strategy evaluation (pure, on closed candles) - builtin strategies run
     // through analytics, AI-learned specs (custom:*) through the lab
     const isCustom = bot.strategyId.startsWith('custom:')

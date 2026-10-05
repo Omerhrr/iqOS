@@ -208,6 +208,28 @@ export class Store {
         ts INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_validations_lookup ON validations(asset, tf, strategy_id, ts);
+      CREATE TABLE IF NOT EXISTS otc_verdicts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        asset TEXT NOT NULL,
+        strategy_key TEXT NOT NULL,
+        tf TEXT NOT NULL,
+        verdict TEXT NOT NULL,
+        edge_z REAL NOT NULL,
+        real_win_rate REAL NOT NULL,
+        real_trades INTEGER NOT NULL,
+        placebo_wr_mean REAL NOT NULL,
+        placebo_wr_std REAL NOT NULL,
+        placebo_series INTEGER NOT NULL,
+        calibration_source TEXT NOT NULL,
+        report TEXT,
+        ts INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_otc_verdicts_lookup ON otc_verdicts(asset, strategy_key, ts);
+      CREATE TABLE IF NOT EXISTS otc_config (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        config TEXT NOT NULL,
+        ts INTEGER NOT NULL
+      );
     `)
   }
 
@@ -615,6 +637,117 @@ export class Store {
       totalTrades: row.total_trades,
       ts: row.ts,
     }))
+  }
+
+  // ---------- OTC defense (placebo verdicts + guard config) ----------
+
+  saveOtcVerdict(v: {
+    asset: string
+    strategyKey: string
+    tf: string
+    verdict: string
+    edgeZ: number
+    realWinRate: number
+    realTrades: number
+    placeboWrMean: number
+    placeboWrStd: number
+    placeboSeries: number
+    calibrationSource: string
+    report: unknown
+  }): void {
+    this.db.run(
+      `INSERT INTO otc_verdicts (asset, strategy_key, tf, verdict, edge_z, real_win_rate, real_trades, placebo_wr_mean, placebo_wr_std, placebo_series, calibration_source, report, ts)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        v.asset, v.strategyKey, v.tf, v.verdict, v.edgeZ, v.realWinRate, v.realTrades,
+        v.placeboWrMean, v.placeboWrStd, v.placeboSeries, v.calibrationSource,
+        JSON.stringify(v.report ?? null), Math.floor(Date.now() / 1000),
+      ],
+    )
+  }
+
+  /** Newest verdict for (asset, strategyKey) within maxAgeSec, or null. */
+  latestOtcVerdict(asset: string, strategyKey: string, maxAgeSec: number): {
+    verdict: string
+    edgeZ: number
+    realWinRate: number
+    realTrades: number
+    placeboWrMean: number
+    placeboWrStd: number
+    placeboSeries: number
+    calibrationSource: string
+    ts: number
+  } | null {
+    const cutoff = Math.floor(Date.now() / 1000) - Math.floor(maxAgeSec)
+    const row = this.db
+      .query(
+        `SELECT verdict, edge_z, real_win_rate, real_trades, placebo_wr_mean, placebo_wr_std, placebo_series, calibration_source, ts
+         FROM otc_verdicts WHERE asset = ? AND strategy_key = ? AND ts >= ?
+         ORDER BY ts DESC LIMIT 1`,
+      )
+      .get(asset, strategyKey, cutoff) as
+      | { verdict: string; edge_z: number; real_win_rate: number; real_trades: number; placebo_wr_mean: number; placebo_wr_std: number; placebo_series: number; calibration_source: string; ts: number }
+      | null
+    if (!row) return null
+    return {
+      verdict: row.verdict,
+      edgeZ: row.edge_z,
+      realWinRate: row.real_win_rate,
+      realTrades: row.real_trades,
+      placeboWrMean: row.placebo_wr_mean,
+      placeboWrStd: row.placebo_wr_std,
+      placeboSeries: row.placebo_series,
+      calibrationSource: row.calibration_source,
+      ts: row.ts,
+    }
+  }
+
+  listOtcVerdicts(limit = 50): { asset: string; strategyKey: string; tf: string; verdict: string; edgeZ: number; realWinRate: number; realTrades: number; placeboWrMean: number; placeboSeries: number; calibrationSource: string; ts: number }[] {
+    const rows = this.db
+      .query(
+        `SELECT asset, strategy_key, tf, verdict, edge_z, real_win_rate, real_trades, placebo_wr_mean, placebo_series, calibration_source, ts
+         FROM otc_verdicts ORDER BY ts DESC LIMIT ?`,
+      )
+      .all(limit) as { asset: string; strategy_key: string; tf: string; verdict: string; edge_z: number; real_win_rate: number; real_trades: number; placebo_wr_mean: number; placebo_series: number; calibration_source: string; ts: number }[]
+    return rows.map((r) => ({
+      asset: r.asset,
+      strategyKey: r.strategy_key,
+      tf: r.tf,
+      verdict: r.verdict,
+      edgeZ: r.edge_z,
+      realWinRate: r.real_win_rate,
+      realTrades: r.real_trades,
+      placeboWrMean: r.placebo_wr_mean,
+      placeboSeries: r.placebo_series,
+      calibrationSource: r.calibration_source,
+      ts: r.ts,
+    }))
+  }
+
+  /** Keep the verdict ledger bounded - called on plugin start. */
+  pruneOtcVerdicts(keep = 500): void {
+    this.db.run(
+      `DELETE FROM otc_verdicts WHERE id NOT IN (SELECT id FROM otc_verdicts ORDER BY ts DESC, id DESC LIMIT ?)`,
+      [keep],
+    )
+  }
+
+  getOtcConfig(): unknown | null {
+    const row = this.db.query('SELECT config FROM otc_config WHERE id = 1').get() as { config: string } | null
+    if (!row) return null
+    try {
+      return JSON.parse(row.config)
+    } catch {
+      return null
+    }
+  }
+
+  saveOtcConfig(config: unknown): void {
+    this.db.run(
+      `INSERT INTO otc_config (id, config, ts) VALUES (1, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET config = excluded.config, ts = excluded.ts`,
+      [JSON.stringify(config), Math.floor(Date.now() / 1000)],
+    )
   }
 
   // ---------- alerts / journal ----------

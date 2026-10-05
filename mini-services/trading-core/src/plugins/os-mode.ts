@@ -350,6 +350,11 @@ export class ModeService {
    * handful of active_ids while everything else kept trading fine. */
   private static BROKER_UNAVAILABLE_RE = /not available at the moment|is not a (?:turbo\/binary\/digital|digital\/turbo\/binary) instrument|active\b[^.]*not found/i
   private static BROKER_UNAVAILABLE_COOLDOWN_SEC = 600
+  // An OTC pair blocked by the placebo defense keeps its verdict until the
+  // TTL expires or a new defense run lands - re-probing every tick would just
+  // spam the same rejection; 30 min is long enough to be quiet, short enough
+  // that a policy flip or a fresh 'edge' verdict is honored promptly.
+  private static OTC_DEFENSE_COOLDOWN_SEC = 1800
   /** Bound on how many times one tick will re-pick and retry after a
    * broker-unavailable rejection before giving up and standing down - keeps
    * a systemic outage (the whole active_id map stale at once) from turning
@@ -661,6 +666,25 @@ export class ModeService {
         if (!g.ok) return this.standDown(g.reason ?? 'memory gate hold') // a rule, not a broker hiccup - don't retry a different pair around it
       } catch {
         // memory gate plugin not loaded - rule gating disabled
+      }
+
+      // OTC defense gate: generator-driven OTC charts don't respect TA. Under
+      // policy 'enforce', an OTC pair may only be auto-traded when its
+      // (asset, signalSource) pair holds a fresh passing placebo verdict
+      // (plugins/otcguard.ts). Unlike the memory gate this is a PAIR-level
+      // problem, not a rule violation - cool the pair down and try the next
+      // signal in the same tick, exactly like the broker-unavailable path
+      // below, so one unverified OTC pair can't stall the whole loop.
+      try {
+        const guard = this.ctx.use<{ check: (target: { asset: string; otc?: boolean }, strategyKey: string) => { ok: boolean; reason?: string } }>('otcGuard')
+        const g = guard.check({ asset: row.asset, otc: row.otc }, String(this.config.signalSource ?? 'confluence'))
+        if (!g.ok) {
+          this.assetRejectedUntil.set(row.asset, this.now() + ModeService.OTC_DEFENSE_COOLDOWN_SEC)
+          lastReason = g.reason ?? 'OTC defense gate hold'
+          continue
+        }
+      } catch {
+        // otc guard plugin not loaded - OTC gating disabled
       }
 
       const side = row.direction === 'put' ? 'put' : 'call'

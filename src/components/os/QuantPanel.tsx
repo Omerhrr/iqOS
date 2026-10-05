@@ -2,8 +2,8 @@
 
 // IQAIR//OS - Quant lab panel: Hurst, vol models, ACF, Monte Carlo fan, S/R zones
 import { useEffect, useMemo, useState } from 'react'
-import type { AnalysisResult, Factor, OsModeStatus, OUVerdict, RandomnessAudit } from '@/lib/os/client'
-import { fmtPrice, getRandomnessAudit, osGet, osPost } from '@/lib/os/client'
+import type { AnalysisResult, Factor, OsModeStatus, OUVerdict, RandomnessAudit, OtcStatus, OtcConfig, OtcDefenseReport, OtcVerdictRow, OtcPolicy } from '@/lib/os/client'
+import { fmtPrice, getRandomnessAudit, getOtcStatus, getOtcVerdicts, getOtcConfig, setOtcConfig, runOtcDefense, osGet, osPost } from '@/lib/os/client'
 
 /** Small chip showing a factor's live contribution to the composite signal score. */
 function FactorBadge({ factor }: { factor?: Factor }) {
@@ -393,6 +393,217 @@ function RandomnessAuditCard({ asset, tf }: { asset: string; tf: string }) {
   )
 }
 
+const VERDICT_STYLE: Record<string, { label: string; color: string; bg: string }> = {
+  edge: { label: 'EDGE', color: '#10b981', bg: 'rgba(16,185,129,0.12)' },
+  weak: { label: 'WEAK', color: '#38bdf8', bg: 'rgba(56,189,248,0.12)' },
+  no_edge: { label: 'NO EDGE', color: '#f59e0b', bg: 'rgba(245,158,11,0.12)' },
+  inconclusive: { label: 'INCONCLUSIVE', color: '#aab6cc', bg: 'rgba(170,182,204,0.12)' },
+}
+
+const POLICY_STYLE: Record<string, { color: string; bg: string }> = {
+  enforce: { color: '#f59e0b', bg: 'rgba(245,158,11,0.12)' },
+  warn: { color: '#38bdf8', bg: 'rgba(56,189,248,0.12)' },
+  off: { color: '#7c8aa5', bg: 'rgba(124,138,165,0.12)' },
+}
+
+/**
+ * OTC Defense - the placebo trial for generator-driven markets. OTC charts
+ * don't respect technical analysis (they're synthesized by the broker), so
+ * before autonomy is allowed to trade one, the strategy must beat its OWN
+ * calibrated synthetic twins: our generator reproduces the pair's measured
+ * statistics with zero learnable structure, and the strategy is run on both.
+ * If real performance sits within the placebo distribution, the "edge" was
+ * luck. Verdicts gate the autopilot/auto-trader under policy 'enforce'.
+ */
+function OtcDefenseCard({ asset, tf }: { asset: string; tf: string }) {
+  const [strategyId, setStrategyId] = useState('confluence-core')
+  const [status, setStatus] = useState<OtcStatus | null>(null)
+  const [config, setConfig] = useState<OtcConfig | null>(null)
+  const [report, setReport] = useState<OtcDefenseReport | null>(null)
+  const [verdicts, setVerdicts] = useState<OtcVerdictRow[]>([])
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const refreshStatus = (s = strategyId) => {
+    getOtcStatus(asset, s)
+      .then(setStatus)
+      .catch(() => setStatus(null))
+    getOtcVerdicts(12)
+      .then((d) => setVerdicts(d.verdicts.filter((v) => v.asset === asset)))
+      .catch(() => setVerdicts([]))
+  }
+
+  useEffect(() => {
+    setReport(null)
+    setError(null)
+    refreshStatus()
+    getOtcConfig()
+      .then((d) => setConfig(d.config))
+      .catch(() => setConfig(null))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [asset, strategyId])
+
+  const run = () => {
+    setBusy(true)
+    setError(null)
+    setReport(null)
+    runOtcDefense({ asset, strategyId, tf })
+      .then((r) => {
+        setReport(r)
+        refreshStatus()
+      })
+      .catch((e: Error) => setError(e.message.slice(0, 140)))
+      .finally(() => setBusy(false))
+  }
+
+  const setPolicy = (policy: OtcPolicy) => {
+    setOtcConfig({ policy })
+      .then((d) => setConfig(d.config))
+      .catch((e: Error) => setError(e.message.slice(0, 120)))
+  }
+
+  const isOtc = status?.isOtc ?? asset.toUpperCase().endsWith('-OTC')
+  const v = report?.verdict ?? status?.verdict?.verdict
+  const vs = v ? VERDICT_STYLE[v] : null
+  const edgeZ = report?.edgeZ ?? status?.verdict?.edgeZ
+  // kernel reports win rates in percentage points already - never ×100
+  const pct = (x: number) => `${x.toFixed(1)}%`
+
+  return (
+    <div className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-3 xl:col-span-2">
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <h3 className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">
+          OTC Defense · Placebo Trial
+          <span className="rounded px-1.5 py-0.5 font-mono text-[8px] font-bold uppercase tracking-wider" style={isOtc ? { color: '#f59e0b', background: 'rgba(245,158,11,0.15)' } : { color: '#7c8aa5', background: 'rgba(124,138,165,0.12)' }}>
+            {isOtc ? 'generator-driven feed' : 'real market'}
+          </span>
+          {config && (
+            <span className="rounded px-1.5 py-0.5 font-mono text-[8px] font-bold uppercase tracking-wider" style={POLICY_STYLE[config.policy]}>
+              policy: {config.policy}
+            </span>
+          )}
+        </h3>
+        <div className="flex items-center gap-1">
+          {config &&
+            (['enforce', 'warn', 'off'] as OtcPolicy[]).map((p) => (
+              <button
+                key={p}
+                type="button"
+                onClick={() => setPolicy(p)}
+                className={`rounded px-1.5 py-0.5 font-mono text-[8px] font-bold uppercase tracking-wider transition-colors ${
+                  config.policy === p ? 'bg-cyan-500/15 text-cyan-300' : 'text-[#4b5a72] hover:text-[#aab6cc]'
+                }`}
+              >
+                {p}
+              </button>
+            ))}
+          <button
+            type="button"
+            onClick={run}
+            disabled={busy}
+            className="ml-1 rounded border border-cyan-500/40 bg-cyan-500/10 px-2 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wider text-cyan-300 transition-colors hover:bg-cyan-500/20 disabled:opacity-50"
+          >
+            {busy ? 'running trial…' : 'run defense'}
+          </button>
+        </div>
+      </div>
+      <p className="mb-2 text-[9px] leading-relaxed text-[#4b5a72]">
+        OTC charts are machine-generated - TA wins there can be pure luck. This trial runs the strategy on the real pair AND on K synthetic twins built by OUR
+        OWN generator, calibrated to this pair&apos;s measured statistics (block-bootstrapped returns + cadence) with zero learnable structure. Real must beat
+        the placebo to count as an edge. Under &apos;enforce&apos;, bots and the auto-trader are blocked on OTC pairs without a fresh passing verdict.
+      </p>
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <input
+          value={strategyId}
+          onChange={(e) => setStrategyId(e.target.value)}
+          spellCheck={false}
+          className="w-44 rounded border border-[#1c2739] bg-[#070b12] px-2 py-1 font-mono text-[10px] text-[#aab6cc] outline-none focus:border-cyan-500/50"
+          placeholder="strategy id or custom:<id>"
+        />
+        <span className="font-mono text-[9px] text-[#4b5a72]">
+          tf {tf} · {config ? `k=${config.seriesK} · minEdgeZ ${config.minEdgeZ}σ · TTL ${config.ttlDays}d` : ''}
+        </span>
+      </div>
+      {error && <p className="font-mono text-[10px] text-rose-400">{error}</p>}
+      {vs && (
+        <div className="mb-2 flex flex-wrap items-center gap-2">
+          <span className="rounded px-2 py-0.5 font-mono text-[10px] font-bold tracking-wider" style={{ color: vs.color, background: vs.bg }}>
+            {vs.label}
+          </span>
+          {typeof edgeZ === 'number' && (
+            <span className="font-mono text-[10px] text-[#aab6cc]">
+              edgeZ {edgeZ >= 0 ? '+' : ''}
+              {edgeZ.toFixed(2)}σ
+            </span>
+          )}
+          {status?.verdict && !report && (
+            <span className="font-mono text-[9px] text-[#4b5a72]">
+              last tested {new Date(status.verdict.ts * 1000).toLocaleString()} · {status.verdict.calibrationSource} calibration
+            </span>
+          )}
+        </div>
+      )}
+      {report && (
+        <>
+          <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 font-mono text-[11px] md:grid-cols-4">
+            <Stat label="Real win rate" value={pct(report.real.winRate)} color={vs?.color} note={`${report.real.totalTrades} trades · PF ${report.real.profitFactor.toFixed(2)}`} />
+            <Stat label="Placebo mean" value={pct(report.placebo.winRateMean)} note={`± ${pct(report.placebo.winRateStd)} across ${report.placebo.series} twins`} />
+            <Stat label="Placebo p95" value={pct(report.placebo.winRateP95)} note="luck's 95th percentile on this feed" />
+            <Stat
+              label="Edge (σ above placebo)"
+              value={`${report.edgeZ >= 0 ? '+' : ''}${report.edgeZ.toFixed(2)}`}
+              color={vs?.color}
+              note={`bar: ${report.config.minEdgeZ}σ`}
+            />
+          </div>
+          <p className="mt-2 border-t border-[#1c2739] pt-2 text-[10px] leading-relaxed" style={{ color: vs?.color ?? '#aab6cc' }}>
+            {report.summary}
+          </p>
+          <p className="mt-1 font-mono text-[9px] text-[#4b5a72]">
+            calibrated on {report.calibration.n} {report.calibration.source === 'tick' ? 'real sub-candle ticks' : 'candle closes'} · meanAbsStep{' '}
+            {report.calibration.meanAbsStep.toExponential(3)} · excess kurtosis {report.calibration.excessKurtosis.toFixed(2)} · seedBase{' '}
+            {report.calibration.seedBase} (reproducible)
+            {report.dataMode === 'sim' && (
+              <span className="ml-1 rounded px-1 py-0.5 font-bold" style={{ color: '#f59e0b', background: 'rgba(245,158,11,0.12)' }}>
+                SIMULATOR DATA - verdict reflects sim structure, re-run on live feed
+              </span>
+            )}
+          </p>
+        </>
+      )}
+      {!report && !v && !error && (
+        <p className="text-[10px] text-[#4b5a72]">
+          {isOtc
+            ? 'No verdict yet for this asset + strategy. Autonomy stays blocked on this feed until a trial passes (or policy is relaxed).'
+            : 'Real-market asset - the OTC gate does not apply here. Run a trial anyway to sanity-check that performance beats calibrated noise.'}
+        </p>
+      )}
+      {verdicts.length > 0 && (
+        <div className="mt-2 border-t border-[#1c2739] pt-2">
+          <p className="mb-1 font-mono text-[8px] font-bold uppercase tracking-wider text-[#4b5a72]">verdict ledger · {asset}</p>
+          <div className="space-y-0.5">
+            {verdicts.slice(0, 5).map((row, i) => {
+              const s = VERDICT_STYLE[row.verdict] ?? VERDICT_STYLE.inconclusive
+              return (
+                <div key={`${row.strategyKey}-${row.ts}-${i}`} className="flex items-center gap-2 font-mono text-[9px]">
+                  <span className="rounded px-1 py-0.5 text-[8px] font-bold" style={{ color: s.color, background: s.bg }}>
+                    {s.label}
+                  </span>
+                  <span className="text-[#aab6cc]">{row.strategyKey}</span>
+                  <span className="text-[#4b5a72]">
+                    {row.tf} · real {pct(row.realWinRate)} vs placebo {pct(row.placeboWrMean)} · {row.edgeZ >= 0 ? '+' : ''}
+                    {row.edgeZ.toFixed(2)}σ · {row.calibrationSource}
+                  </span>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function QuantPanel({ analysis }: { analysis: AnalysisResult | null }) {
   if (!analysis) return null
   const q = analysis.quant
@@ -545,6 +756,7 @@ export default function QuantPanel({ analysis }: { analysis: AnalysisResult | nu
       </div>
 
       <RandomnessAuditCard asset={analysis.asset} tf={analysis.tf} />
+      <OtcDefenseCard asset={analysis.asset} tf={analysis.tf} />
     </div>
   )
 }

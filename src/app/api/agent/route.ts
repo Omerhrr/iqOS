@@ -638,6 +638,31 @@ const TOOLS: ToolSpec[] = [
     },
   },
   {
+    name: 'otc_defense',
+    description: 'THE OTC DEFENSE - placebo-test a strategy against a generator-driven OTC feed. OTC pairs\' charts are machine-generated, so technical analysis has no causal edge there and a good backtest can be pure luck. This runs the strategy on the real pair AND on K synthetic "twin" series produced by our OWN chart generator, calibrated to the pair\'s measured statistics (block-bootstrapped returns + update cadence) with zero learnable structure - then scores real win rate against the placebo distribution: edgeZ = sigmas of real above placebo mean. Verdicts: "edge" (real beats the placebo - performance unlikely to be chance), "weak" (suggestive, under the bar), "no_edge" (indistinguishable from luck - say plainly that TA is NOT supported on this feed), "inconclusive" (too few real trades). Under policy "enforce" the autopilot and the auto-trader are BLOCKED from trading OTC pairs without a fresh passing verdict for that (asset, strategy) pair - if a bot you are asked to arm trades an OTC asset, run this FIRST and respect the verdict. Also use it proactively: whenever the user discusses trading an OTC pair, testing a strategy on OTC data, or asks "is this real or luck", run the defense and report the verdict honestly - never dress up a no_edge as a pass. strategyId accepts builtin ids and AI-Lab "custom:<id>" specs. Omit asset to test the active asset; non-OTC assets are allowed too (a useful luck-vs-skill sanity check).',
+    args: '{"asset": "EURUSD-OTC", "strategyId": "confluence-core", "tf": "1m", "k": 24}',
+    run: (a) => {
+      if (!a.strategyId || typeof a.strategyId !== 'string') return Promise.resolve({ ok: false, error: 'otc_defense requires "strategyId" (a strategy id from list_strategies)' })
+      return corePost('/otc_defense_run', {
+        asset: a.asset,
+        strategyId: a.strategyId,
+        tf: a.tf ?? '1m',
+        k: a.k,
+      })
+    },
+  },
+  {
+    name: 'otc_defense_status',
+    description: 'Read OTC defense state without running a new trial: whether an asset is an OTC (generator-driven) feed, the current guard policy (enforce | warn | off), and the freshest placebo verdict for (asset, strategy) with its edgeZ and age. Use it before arming a bot on an OTC pair, to explain WHY a bot is being held (the autopilot reject reason mentions "OTC defense"), or to check which strategies currently pass on a feed.',
+    args: '{"asset": "EURUSD-OTC", "strategy": "confluence-core"}',
+    run: (a) => {
+      const p = new URLSearchParams()
+      if (a.asset) p.set('asset', String(a.asset))
+      p.set('strategy', String(a.strategy ?? 'confluence-core'))
+      return coreGet(`/otc_status?${p.toString()}`)
+    },
+  },
+  {
     name: 'calibration_report',
     description: 'Checks whether the model\'s own confidence numbers can be trusted: buckets every closed trade that carries an entry-time snapshot (composite score/confidence and Markov P(up), captured the instant the trade was placed) by predicted strength and compares to the REALIZED win rate in that bucket, plus a Brier score (0 = perfect, 0.25 = an honest 50/50 coin flip, higher = overconfident). Use this to answer "can I trust a confidence-72 signal to actually win ~72%?" before leaning on score/confidence for sizing or filtering. Only trades placed after the entry-snapshot feature shipped have data; needs 30+ usable trades to be meaningful. Optionally filter by asset and/or strategy.',
     args: '{"asset": "EURUSD", "strategy": "rsi-reversion", "limit": 2000}',

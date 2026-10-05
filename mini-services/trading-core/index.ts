@@ -20,6 +20,7 @@ import { alertRulesPlugin, AlertRulesService, ALERT_METRICS } from './src/plugin
 import { sentinelPlugin, SentinelService, type SentinelConfig } from './src/plugins/sentinel'
 import { watchdogPlugin, WatchdogService, type WatchdogConfig } from './src/plugins/watchdog'
 import { adaptivePlugin, AdaptiveService, type AdaptiveConfig } from './src/plugins/adaptive'
+import { otcGuardPlugin, OtcGuardService, type OtcDefenseReport } from './src/plugins/otcguard'
 import { gridSearch, walkForward, sweepAssets, type Objective } from './src/strategies/optimize'
 import type { BacktestOptions } from './src/strategies/backtest'
 import { normalizeSpec, type CustomSpec } from './src/strategies/custom'
@@ -53,6 +54,7 @@ kernel.register(alertRulesPlugin)
 kernel.register(sentinelPlugin)
 kernel.register(watchdogPlugin)
 kernel.register(adaptivePlugin)
+kernel.register(otcGuardPlugin)
 
 const httpServer = createServer(async (req, res) => {
   res.setHeader('access-control-allow-origin', '*')
@@ -285,6 +287,24 @@ const httpServer = createServer(async (req, res) => {
         const stepStats = computeStepStats(points)
         const intervalStats = computeIntervalStats(points)
         return json(200, { ok: true, asset, dataSource, stepStats, intervalStats })
+      }
+
+      // ---------- OTC defense: GET reads (run is POST-only) ----------
+      if (path === '/otc_status') {
+        const guard = kernel.context().use<OtcGuardService>('otcGuard')
+        const asset = q.get('asset') ?? market.activeAsset
+        const strategyKey = q.get('strategy') ?? 'confluence-core'
+        return json(200, { ok: true, ...guard.statusFor(asset, strategyKey) })
+      }
+
+      if (path === '/otc_verdicts') {
+        const guard = kernel.context().use<OtcGuardService>('otcGuard')
+        return json(200, { ok: true, verdicts: guard.listVerdicts(Math.min(Number(q.get('limit') ?? 50), 200)) })
+      }
+
+      if (path === '/otc_config') {
+        const guard = kernel.context().use<OtcGuardService>('otcGuard')
+        return json(200, { ok: true, config: guard.getConfig() })
       }
 
       if (path === '/analysis') {
@@ -708,6 +728,41 @@ const httpServer = createServer(async (req, res) => {
     }
 
     if (req.method === 'POST') {
+      // ---------- OTC defense (placebo-test gate for generator-driven markets) ----------
+      // OTC charts are machine-generated; TA "edges" there can be pure luck.
+      // This runs the strategy against K synthetic twins calibrated to the
+      // pair's own measured statistics - if real performance doesn't beat the
+      // placebo distribution, there is no edge to defend. See
+      // plugins/otcguard.ts for verdict/policy semantics.
+      if (path === '/otc_defense_run') {
+        try {
+          const guard = kernel.context().use<OtcGuardService>('otcGuard')
+          const report = await guard.runDefense({
+            asset: body.asset !== undefined ? String(body.asset) : market.activeAsset,
+            strategyId: body.strategyId !== undefined ? String(body.strategyId) : 'confluence-core',
+            tf: body.tf !== undefined ? String(body.tf) : '1m',
+            params: body.params as Record<string, number | string> | undefined,
+            k: body.k !== undefined ? Number(body.k) : undefined,
+            payout: body.payout !== undefined ? Number(body.payout) : undefined,
+            expiryBars: body.expiryBars !== undefined ? Number(body.expiryBars) : undefined,
+            limit: body.limit !== undefined ? Number(body.limit) : undefined,
+            seedBase: body.seedBase !== undefined ? Number(body.seedBase) : undefined,
+          })
+          return json(200, report satisfies OtcDefenseReport)
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      if (path === '/otc_config') {
+        const guard = kernel.context().use<OtcGuardService>('otcGuard')
+        try {
+          return json(200, { ok: true, config: guard.setConfig((body ?? {}) as Record<string, never>) })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
       // Walk-forward validation of the Kalman/OU edge on one instrument.
       // Also primes the auto-trader's requireValidation verdict cache.
       if (path === '/ou_validate') {
