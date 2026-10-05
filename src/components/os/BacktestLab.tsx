@@ -838,6 +838,7 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [promote, setPromote] = useState(false)
+  const [rankBy, setRankBy] = useState<'blended' | 'call' | 'put'>('blended')
 
   const strategy = strategies.find((s) => s.id === strategyId)
   const { sweep, count, missing } = useMemo(() => buildSweep(strategy, sweepState), [strategy, sweepState])
@@ -846,6 +847,25 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
   // registered default - see fixedParams below, sent as the kernel's
   // "params" (merged under every combo).
   const selectParams = useMemo(() => strategy?.params.filter((p) => p.type === 'select') ?? [], [strategy])
+
+  // The server ranks combos by the blended objective - re-sorting here by a
+  // single side's win rate (byDirection is already on every row, no re-run
+  // needed) answers "which combo is actually best for CALLs" / "for PUTs"
+  // rather than just showing the split on whichever row happens to be
+  // selected. Combos that never fired that side sink to the bottom.
+  const rankedRows = useMemo(() => {
+    const rows = result?.ranked ?? []
+    if (rankBy === 'blended' || !rows.length) return rows
+    return [...rows].sort((a, b) => {
+      const da = a.metrics.byDirection?.[rankBy]
+      const db = b.metrics.byDirection?.[rankBy]
+      if (!da || !db) return 0
+      if (da.trades === 0 && db.trades === 0) return 0
+      if (da.trades === 0) return 1
+      if (db.trades === 0) return -1
+      return db.winRate - da.winRate || db.netPnl - da.netPnl
+    })
+  }, [result, rankBy])
 
   const run = async () => {
     if (!Object.keys(sweep).length) {
@@ -967,6 +987,22 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
 
               {selected?.metrics.byDirection && <DirSplitBlock byDirection={selected.metrics.byDirection} />}
 
+              <div className="flex items-center gap-2 font-mono text-[10px] text-[#7c8aa5]">
+                <span className="uppercase tracking-wider text-[#4b5a72]">rank by:</span>
+                {(['blended', 'call', 'put'] as const).map((k) => (
+                  <button
+                    key={k}
+                    onClick={() => setRankBy(k)}
+                    className={`rounded px-2 py-1 transition-colors ${
+                      rankBy === k ? 'bg-cyan-600/20 text-cyan-300 shadow-[inset_0_0_0_1px_rgba(6,182,212,0.4)]' : 'bg-[#101828] hover:text-[#dbe4f0]'
+                    }`}
+                  >
+                    {k === 'blended' ? 'blended (objective)' : `${k} win rate`}
+                  </button>
+                ))}
+                {rankBy !== 'blended' && <span className="text-[#4b5a72]">— best {rankBy} combo sorts to the top; never-fired-that-way combos sink</span>}
+              </div>
+
               <div className="overflow-hidden rounded-lg border border-[#1c2739]">
                 <table className="w-full font-mono text-[10px]">
                   <thead>
@@ -977,7 +1013,7 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
                     </tr>
                   </thead>
                   <tbody>
-                    {result.ranked.map((r) => (
+                    {rankedRows.map((r) => (
                       <tr
                         key={r.rank}
                         onClick={() => setSelected(r)}
@@ -1301,8 +1337,26 @@ function SweepTab({
   const [result, setResult] = useState<SweepResult | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const [rankBy, setRankBy] = useState<'blended' | 'call' | 'put'>('blended')
 
   const strategy = strategies.find((s) => s.id === strategyId)
+
+  // Same idea as the Optimizer's rank-by toggle: which ASSET is actually
+  // best to trade this strategy's calls on vs. its puts, not just the
+  // blended objective the server ranked by.
+  const rankedRows = useMemo(() => {
+    const rows = result?.rows ?? []
+    if (rankBy === 'blended' || !rows.length) return rows
+    return [...rows].sort((a, b) => {
+      const da = a.metrics.byDirection?.[rankBy]
+      const db = b.metrics.byDirection?.[rankBy]
+      if (!da || !db) return 0
+      if (da.trades === 0 && db.trades === 0) return 0
+      if (da.trades === 0) return 1
+      if (db.trades === 0) return -1
+      return db.winRate - da.winRate || db.netPnl - da.netPnl
+    })
+  }, [result, rankBy])
 
   const run = async () => {
     setBusy(true)
@@ -1456,7 +1510,23 @@ function SweepTab({
             <span className="ml-auto text-[#4b5a72]">click a row to load it in the chart</span>
           </div>
 
-          {result.rows[0]?.metrics.byDirection && <DirSplitBlock byDirection={result.rows[0].metrics.byDirection} />}
+          {rankedRows[0]?.metrics.byDirection && <DirSplitBlock byDirection={rankedRows[0].metrics.byDirection} />}
+
+          <div className="flex items-center gap-2 font-mono text-[10px] text-[#7c8aa5]">
+            <span className="uppercase tracking-wider text-[#4b5a72]">rank by:</span>
+            {(['blended', 'call', 'put'] as const).map((k) => (
+              <button
+                key={k}
+                onClick={() => setRankBy(k)}
+                className={`rounded px-2 py-1 transition-colors ${
+                  rankBy === k ? 'bg-cyan-600/20 text-cyan-300 shadow-[inset_0_0_0_1px_rgba(6,182,212,0.4)]' : 'bg-[#101828] hover:text-[#dbe4f0]'
+                }`}
+              >
+                {k === 'blended' ? 'blended (objective)' : `${k} win rate`}
+              </button>
+            ))}
+            {rankBy !== 'blended' && <span className="text-[#4b5a72]">— best {rankBy} asset sorts to the top; never-fired-that-way assets sink</span>}
+          </div>
 
           <div className="overflow-hidden rounded-lg border border-[#1c2739]">
             <table className="w-full font-mono text-[10px]">
@@ -1468,7 +1538,7 @@ function SweepTab({
                 </tr>
               </thead>
               <tbody>
-                {result.rows.slice(0, 30).map((r) => (
+                {rankedRows.slice(0, 30).map((r) => (
                   <tr
                     key={r.asset}
                     onClick={() => onSelectSetup(r.asset, tf)}
