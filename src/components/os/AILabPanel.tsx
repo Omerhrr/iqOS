@@ -564,13 +564,25 @@ export default function AILabPanel({ assets, strategies, onError, refreshBots }:
     })
   }
 
+  /** minVotes counts top-level signal rows that voted THIS bar (a group row
+   * contributes at most one vote regardless of its own AND/OR member count -
+   * scoreSeriesFor iterates spec.signals, one test per top-level row) - so
+   * minVotes can never exceed how many rows exist at all. Left unclamped,
+   * "1 signal row, minVotes 2" (the field's own default) silently backtests
+   * to exactly 0 trades on EVERY pair/timeframe forever, since votes can
+   * never reach 2 - not a data problem, a math one, and nothing in the
+   * result ever says so. Clamping here is the same guard the auto-learn
+   * path already applies for the identical reason (see generate()'s
+   * `signals.length >= 3 ? 2 : 1` and lab.ts's confluenceWeak). */
+  const effectiveManualMinVotes = () => Math.max(1, Math.min(manualMinVotes, manualSignals.length || 1))
+
   const buildManualSpec = (): LabSpec | null => {
     if (!manualSignals.length) return null
     return {
       name: manualName.trim() || `${manualAsset} ${manualTf} Manual`,
       signals: manualSignals.map((s) => s.def),
       minScore: manualMinScore,
-      minVotes: manualMinVotes,
+      minVotes: effectiveManualMinVotes(),
       horizon: manualHorizon,
       ...(manualBasis !== 'candles' ? { basis: manualBasis } : {}),
     }
@@ -1471,6 +1483,12 @@ export default function AILabPanel({ assets, strategies, onError, refreshBots }:
           <NumField label="minVotes" value={manualMinVotes} onChange={setManualMinVotes} w="w-12" />
           <NumField label="horizon" value={manualHorizon} onChange={setManualHorizon} w="w-12" />
         </div>
+        {manualSignals.length > 0 && manualMinVotes > manualSignals.length && (
+          <div className="mt-1 rounded border border-amber-500/30 bg-amber-500/5 px-2 py-1 font-mono text-[9px] text-amber-300">
+            ⚠ minVotes {manualMinVotes} with only {manualSignals.length} signal row{manualSignals.length === 1 ? '' : 's'} added - that can never be reached (each row is at most 1
+            vote), so this would backtest to exactly 0 trades on every pair. Backtest/save/deploy will use minVotes {effectiveManualMinVotes()} instead - add more signal rows or lower minVotes to stop seeing this.
+          </div>
+        )}
 
         <div className="mt-2 flex flex-wrap items-center gap-2">
           <Button onClick={() => void backtestManual()} disabled={!manualSignals.length || manualBacktesting} variant="outline" className="h-7 border-[#1c2739] px-3 text-[10px] uppercase tracking-wider text-[#7c8aa5] hover:text-cyan-300 disabled:opacity-40">
