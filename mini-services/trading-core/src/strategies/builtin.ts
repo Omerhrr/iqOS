@@ -9,6 +9,7 @@ import { ouEstimate, ouState } from '../analytics/kalman'
 import { vskEvaluate, VSK_DEFAULTS } from '../analytics/vsk'
 import { tskEvaluate, TSK_DEFAULTS } from '../analytics/tsk'
 import { confluenceSignalOnly } from '../analytics/engine'
+import { findPivots } from '../analytics/chart-patterns'
 
 const last = (arr: number[]): number => {
   for (let i = arr.length - 1; i >= 0; i--) if (Number.isFinite(arr[i])) return arr[i]
@@ -1001,6 +1002,104 @@ export const STRATEGIES: StrategyDef[] = [
       if (momentum > 0) return { direction: 'call', score, notes: `vol expanding ${ratio.toFixed(2)}x baseline, ${momLookback}b momentum up` }
       if (momentum < 0) return { direction: 'put', score, notes: `vol expanding ${ratio.toFixed(2)}x baseline, ${momLookback}b momentum down` }
       return { direction: 'none', score: 0, notes: `vol expanding ${ratio.toFixed(2)}x baseline but momentum flat` }
+    },
+  },
+  {
+    id: 'trend-structure-pullback',
+    name: 'Trend Structure Pullback',
+    description:
+      'Classic trend-following price action: reads the market\'s own swing structure (fractal swing highs/lows, same pivots the chart-pattern scanner and ZigZag use) to decide whether it is actually trending - Higher Highs + Higher Lows = uptrend, Lower Highs + Lower Lows = downtrend, anything else (a mixed or flat sequence) is treated as no-trade range/chop. Only trades WITH that confirmed trend: in an uptrend it waits for price to pull back into a nearby support zone or the classic floor pivot/S1 (same supportResistance()/pivotPoints() levels key_levels and Liquidity Sweep Reversal use) and only fires once THIS bar actually closes back up off it (a real bounce, not just drifting down toward the level) - the downtrend case is the exact mirror into resistance/pivot/R1. Two guards specifically exist to avoid the reversal risk this was built to dodge: a candidate trend is discarded outright if its last swing leg is too small relative to ATR (noise masquerading as structure), and a trend already in play is invalidated the moment price closes beyond the swing point that defined it (a new low under the last HL in an uptrend, or a new high over the last LH in a downtrend) - that is the earliest objective sign of a reversal, so it stands aside rather than keep buying/selling into one. Never fades a trend and never picks tops/bottoms against it - the opposite read from Liquidity Sweep Reversal, which deliberately fades a level regardless of trend.',
+    params: [
+      { key: 'pivotFlank', label: 'Swing confirmation flank (bars each side)', type: 'number', min: 2, max: 8, default: 3 },
+      { key: 'srLookback', label: 'Support/resistance lookback (bars)', type: 'number', min: 60, max: 400, default: 240 },
+      { key: 'pullbackAtr', label: 'Max pullback distance from level (x ATR)', type: 'number', min: 0.2, max: 2, step: 0.1, default: 0.75 },
+      { key: 'minLegAtr', label: 'Min trend-leg size to count as trending (x ATR)', type: 'number', min: 0.5, max: 6, step: 0.25, default: 2 },
+    ],
+    evaluate: (candles, p) => {
+      const h = candles.map((k) => k.high)
+      const l = candles.map((k) => k.low)
+      const c = candles.map((k) => k.close)
+      const o = candles.map((k) => k.open)
+      const pivotFlank = Math.round(num(p, 'pivotFlank', 3))
+      const srLookback = Math.round(num(p, 'srLookback', 240))
+      const pullbackAtr = num(p, 'pullbackAtr', 0.75)
+      const minLegAtr = num(p, 'minLegAtr', 2)
+      const n = candles.length
+      if (n < Math.max(srLookback, 80) + 10) return { direction: 'none', score: 0, notes: 'warming up' }
+
+      const pivots = findPivots(candles, pivotFlank, pivotFlank)
+      const highs = pivots.filter((pv) => pv.kind === 'H')
+      const lows = pivots.filter((pv) => pv.kind === 'L')
+      if (highs.length < 2 || lows.length < 2) return { direction: 'none', score: 0, notes: 'not enough confirmed swing points yet' }
+
+      const lastHighs = highs.slice(-2)
+      const lastLows = lows.slice(-2)
+      const bullStructure = lastHighs[1].price > lastHighs[0].price && lastLows[1].price > lastLows[0].price
+      const bearStructure = lastHighs[1].price < lastHighs[0].price && lastLows[1].price < lastLows[0].price
+      if (!bullStructure && !bearStructure) return { direction: 'none', score: 0, notes: 'no clean HH/HL or LH/LL sequence - ranging/transitioning' }
+
+      const atrArr = ta.atr(h, l, c, 14)
+      const i = n - 1
+      const atrVal = atrArr[i] || c[i] * 0.001
+      const price = c[i]
+
+      // impulse leg size (earlier swing point of the pair to the later one,
+      // in the trend direction) - filters out a technically-HH/HL sequence
+      // that is really just noise on a flat tape
+      const legSize = bullStructure ? lastHighs[1].price - lastLows[0].price : lastHighs[0].price - lastLows[1].price
+      if (legSize < minLegAtr * atrVal)
+        return { direction: 'none', score: 0, notes: `structure present but leg too small (${(legSize / atrVal).toFixed(1)}x ATR, need ${minLegAtr}x)` }
+
+      // structure break: the trend only stays "clean" while price hasn't
+      // violated the swing point that defines it - closing below the last
+      // confirmed swing low in an uptrend (or above the last swing high in
+      // a downtrend) is the earliest objective sign of a reversal, so this
+      // stands aside instead of buying/selling into one
+      if (bullStructure && price < lastLows[1].price) return { direction: 'none', score: 0, notes: 'uptrend structure broken - price closed below the last swing low' }
+      if (bearStructure && price > lastHighs[1].price) return { direction: 'none', score: 0, notes: 'downtrend structure broken - price closed above the last swing high' }
+
+      const zones = supportResistance(candles, srLookback)
+      const pivLevels = ta.pivotPoints(candles, Math.min(srLookback, 60))
+
+      if (bullStructure) {
+        const supports = zones.filter((z) => z.type === 'support' && z.price <= price * 1.02).sort((a, b) => Math.abs(a.price - price) - Math.abs(b.price - price))
+        const nearestSupport = supports[0]
+        const pivotFloor = [pivLevels.pp, pivLevels.s1].filter((lv) => lv <= price * 1.02).sort((a, b) => Math.abs(a - price) - Math.abs(b - price))[0]
+        const level = nearestSupport ? nearestSupport.price : pivotFloor
+        if (level === undefined) return { direction: 'none', score: 0, notes: 'uptrend intact but no nearby support/pivot to pull back into' }
+        const dist = price - level
+        if (dist < 0 || dist > pullbackAtr * atrVal)
+          return { direction: 'none', score: 0, notes: `uptrend intact, waiting for a pullback (${(dist / atrVal).toFixed(2)}x ATR from ${level.toFixed(5)})` }
+        // bounce confirmation: THIS bar closed green and at/above the prior
+        // close - a real bounce off the level, not just drifting down to it
+        const bouncing = c[i] > o[i] && c[i] >= c[i - 1]
+        if (!bouncing) return { direction: 'none', score: 0, notes: `at support ${level.toFixed(5)}, no bounce confirmation yet this bar` }
+        const touches = nearestSupport?.touches ?? 0
+        const score = clamp(52 + (legSize / atrVal) * 3 + ((pullbackAtr * atrVal - dist) / atrVal) * 10 + touches * 4, 48, 94)
+        return {
+          direction: 'call',
+          score,
+          notes: `uptrend (HH/HL), pullback to ${nearestSupport ? 'support' : 'pivot'} ${level.toFixed(5)}${touches ? ` (${touches} touches)` : ''}, bounce confirmed`,
+        }
+      }
+
+      const resistances = zones.filter((z) => z.type === 'resistance' && z.price >= price * 0.98).sort((a, b) => Math.abs(a.price - price) - Math.abs(b.price - price))
+      const nearestResistance = resistances[0]
+      const pivotCeil = [pivLevels.pp, pivLevels.r1].filter((lv) => lv >= price * 0.98).sort((a, b) => Math.abs(a - price) - Math.abs(b - price))[0]
+      const level = nearestResistance ? nearestResistance.price : pivotCeil
+      if (level === undefined) return { direction: 'none', score: 0, notes: 'downtrend intact but no nearby resistance/pivot to pull back into' }
+      const dist = level - price
+      if (dist < 0 || dist > pullbackAtr * atrVal)
+        return { direction: 'none', score: 0, notes: `downtrend intact, waiting for a pullback (${(dist / atrVal).toFixed(2)}x ATR from ${level.toFixed(5)})` }
+      const bouncing = c[i] < o[i] && c[i] <= c[i - 1]
+      if (!bouncing) return { direction: 'none', score: 0, notes: `at resistance ${level.toFixed(5)}, no rejection confirmation yet this bar` }
+      const touches = nearestResistance?.touches ?? 0
+      const score = clamp(52 + (legSize / atrVal) * 3 + ((pullbackAtr * atrVal - dist) / atrVal) * 10 + touches * 4, 48, 94)
+      return {
+        direction: 'put',
+        score,
+        notes: `downtrend (LH/LL), pullback to ${nearestResistance ? 'resistance' : 'pivot'} ${level.toFixed(5)}${touches ? ` (${touches} touches)` : ''}, rejection confirmed`,
+      }
     },
   },
 ]

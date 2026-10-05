@@ -4,14 +4,17 @@
 
 import type { Candle, ChartPatternHit } from '../types'
 
-interface Pivot {
+export interface Pivot {
   idx: number
   price: number
   kind: 'H' | 'L'
 }
 
-/** Fractal pivots with asymmetric confirmation (2 bars each side). */
-function findPivots(candles: Candle[], left = 3, right = 3): Pivot[] {
+/** Fractal pivots with asymmetric confirmation (2 bars each side) - exported
+ * for reuse by anything that needs raw swing highs/lows, not just chart
+ * pattern detection (e.g. strategies/builtin.ts's trend-structure strategy,
+ * which classifies HH/HL vs LH/LL sequences from the same pivots). */
+export function findPivots(candles: Candle[], left = 3, right = 3): Pivot[] {
   const pivots: Pivot[] = []
   for (let i = left; i < candles.length - right; i++) {
     let isHigh = true
