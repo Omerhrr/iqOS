@@ -29,6 +29,7 @@ import { ALL_TIMEFRAMES, type Timeframe } from './src/types'
 import { searchInstruments, UNIVERSE_STATS, getInstrument } from './src/universe'
 import { listRegistry, computeIndicator, registrySize, getIndicatorDef } from './src/analytics/registry'
 import { detectChartPatterns } from './src/analytics/chart-patterns'
+import { computeVolumeProfile, computeCandleDelta, computeCumulativeDelta } from './src/analytics/orderflow'
 import { buildCalibrationReport, type CalibrationStoreSlice } from './src/analytics/calibration'
 
 // Defaults to 3030 for local/Windows dev; the Docker deployment overrides
@@ -234,6 +235,27 @@ const httpServer = createServer(async (req, res) => {
         const timeframe = tf(q.get('tf'))
         const limit = Math.min(Number(q.get('limit') ?? 400), 1000)
         return json(200, { ok: true, asset, tf: timeframe, candles: market.getCandles(asset, timeframe, limit), price: market.getPrice(asset) })
+      }
+
+      // Order flow approximation (no real bid/ask-tagged trades are available
+      // from IQ Option - see analytics/orderflow.ts header for the method).
+      if (path === '/volume_profile') {
+        const asset = q.get('asset') ?? market.activeAsset
+        const timeframe = tf(q.get('tf'))
+        const limit = Math.min(Number(q.get('limit') ?? 400), 1000)
+        const bucketCount = q.get('buckets') ? Number(q.get('buckets')) : undefined
+        const candles = market.getCandles(asset, timeframe, limit)
+        return json(200, { ok: true, asset, tf: timeframe, approx: true, profile: computeVolumeProfile(candles, { bucketCount }) })
+      }
+
+      if (path === '/delta') {
+        const asset = q.get('asset') ?? market.activeAsset
+        const timeframe = tf(q.get('tf'))
+        const limit = Math.min(Number(q.get('limit') ?? 400), 1000)
+        const candles = market.getCandles(asset, timeframe, limit)
+        const deltas = computeCandleDelta(candles)
+        const cumulative = computeCumulativeDelta(deltas)
+        return json(200, { ok: true, asset, tf: timeframe, approx: true, deltas, cumulative })
       }
 
       if (path === '/analysis') {

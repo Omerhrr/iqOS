@@ -148,6 +148,59 @@ export interface Factor {
   note: string
 }
 
+// ---------- order flow (approximation - see trading-core/src/analytics/orderflow.ts) ----------
+// IQ Option exposes no real bid/ask-tagged trades or order-book depth, so all
+// of this is derived from OHLCV candles via a close-location-value (CLV) proxy.
+// Never present it as real order-flow data in the UI - always label it approx.
+
+export interface VolumeProfileLevel {
+  price: number
+  priceLow: number
+  priceHigh: number
+  volume: number
+  buyVolume: number
+  sellVolume: number
+}
+
+export interface VolumeProfileResult {
+  levels: VolumeProfileLevel[]
+  poc: number
+  valueAreaHigh: number
+  valueAreaLow: number
+  totalVolume: number
+}
+
+export interface CandleDelta {
+  time: number
+  buyVolume: number
+  sellVolume: number
+  delta: number
+}
+
+export interface CumulativeDeltaPoint {
+  time: number
+  cumulativeDelta: number
+}
+
+export async function getVolumeProfile(asset: string, tf: Timeframe, opts?: { limit?: number; buckets?: number }): Promise<VolumeProfileResult> {
+  const d = await osGet<{ ok: boolean; profile: VolumeProfileResult }>('/volume_profile', {
+    asset,
+    tf,
+    limit: opts?.limit,
+    buckets: opts?.buckets,
+  })
+  return d.profile
+}
+
+export async function getDelta(asset: string, tf: Timeframe, opts?: { limit?: number }): Promise<{ deltas: CandleDelta[]; cumulative: CumulativeDeltaPoint[] }> {
+  const d = await osGet<{ ok: boolean; deltas: CandleDelta[]; cumulative: CumulativeDeltaPoint[] }>('/delta', {
+    asset,
+    tf,
+    limit: opts?.limit,
+  })
+  return { deltas: d.deltas, cumulative: d.cumulative }
+}
+
 export interface CompositeSignal {
   asset: string
   tf: Timeframe

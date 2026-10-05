@@ -28,6 +28,7 @@ import AlertRulesPanel from './AlertRulesPanel'
 import SentinelPanel from './SentinelPanel'
 import WatchdogPanel from './WatchdogPanel'
 import ResearchPanel from './ResearchPanel'
+import OrderFlowPanel from './OrderFlowPanel'
 import { FullscreenBackdrop, FullscreenButton } from './FullscreenButton'
 
 interface BottomTabsProps {
@@ -110,6 +111,7 @@ export default function BottomTabs(props: BottomTabsProps) {
             ['ailab', 'AI Lab'],
             ['strategies', 'Strategy Lab'],
             ['quant', 'Quant Lab'],
+            ['orderflow', 'Order Flow'],
             ['patterns', `Patterns (${patterns.length})`],
             ['alerts', 'Alerts'],
           ] as [string, string][]
@@ -321,6 +323,10 @@ export default function BottomTabs(props: BottomTabsProps) {
         ) : (
           <Empty text="Quant lab populates once the kernel streams analysis for the active instrument." />
         )}
+      </TabsContent>
+
+      <TabsContent value="orderflow" className="mt-0 min-h-0 flex-1 overflow-auto">
+        <OrderFlowPanel asset={asset} tf={props.tf} />
       </TabsContent>
 
       {/* PATTERNS */}
