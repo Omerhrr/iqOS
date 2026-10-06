@@ -66,6 +66,22 @@ export interface BotConfig {
    * gate - kept visible everywhere the fleet is listed so an unvalidated
    * edge never quietly looks the same as a validated one. */
   forcedUnvalidated?: boolean
+  /** PAYOUT FLOOR (the EV gate): skip this bot's signals on any pair whose
+   * LIVE payout for the bot's kind is below this percent. The one lever our
+   * own research (Tasks 50-54) says moves expected value: breakeven at
+   * payout p is 1/(1+p) - 54.9% at 82%, 60.6% at 65% - and payouts MOVE per
+   * pair per hour, so a setup worth taking at open can be pure house-edge
+   * by the time the next candle closes. 0/undefined = gate off. Clamped
+   * 0..98 (real IQ payouts top out in the mid-90s). */
+  minPayoutPct?: number
+  /** Self-benching on a losing run: after 3 consecutive losses the bot
+   * benches ITSELF for 15 minutes (doubling per extra loss, capped at 4h),
+   * independent of the watchdog ladder (which needs an operator ack) and
+   * the daily $ limits (which only see aggregate P&L). Clears itself when
+   * the bench expires - a win at any point also clears it. Default off
+   * (bots already have watchdog + adaptive; this is the opt-in stricter
+   * tier, mirroring the auto-trader's streakBreaker). */
+  streakBreaker?: boolean
 }
 
 export interface StakePlan {
@@ -99,6 +115,14 @@ export interface StakePlan {
 }
 
 export type SessionFilter = 'all' | 'london' | 'newyork' | 'overlap' | 'asia' | 'sydney'
+
+/** Streak-breaker bench duration for a run of consecutive losses: 15min at
+ * 3 losses (the threshold), doubling per extra loss, capped at 4h. Pure and
+ * exported so the selftest can pin the exact ladder the bots bench on. */
+export function streakBenchSec(lossStreak: number): number {
+  const n = Math.max(3, Math.round(lossStreak))
+  return Math.min(4 * 60 * 60, 15 * 60 * 2 ** (n - 3))
+}
 
 /** Trading-session windows in UTC hours (fixed-clock approximation - IQ OTC
  * feeds trade around the clock, so the window is a discipline gate, not a
@@ -189,6 +213,12 @@ interface RuntimeState {
    * to null the moment the strategy reports 'none' (or the opposite
    * direction), which re-arms it for the next occurrence. */
   lastSignalDir: 'call' | 'put' | null
+  /** Streak-breaker bench (bot.streakBreaker): epoch seconds until which the
+   * bot refuses to trade after 3+ consecutive losses. In-memory only (same
+   * as the auto-trader's bench map) - a kernel restart clears it, and the
+   * streak itself is rebuilt from the journal, so a restarted bot with a
+   * live loss streak re-benches on its next settled loss, not instantly. */
+  benchedUntil?: number
 }
 
 export class AutopilotService {
@@ -495,6 +525,11 @@ export class AutopilotService {
       session: this.validSession(input.session ?? existing?.session),
       stakePlan: this.parseStakePlan(input.stakePlan, existing?.stakePlan),
       adaptive: input.adaptive !== undefined ? Boolean(input.adaptive) : existing?.adaptive,
+      minPayoutPct:
+        input.minPayoutPct !== undefined || existing?.minPayoutPct !== undefined
+          ? clampNum(input.minPayoutPct ?? existing?.minPayoutPct ?? 0, 0, 98)
+          : undefined,
+      streakBreaker: input.streakBreaker !== undefined ? Boolean(input.streakBreaker) : existing?.streakBreaker,
     }
     // a materially different plan invalidates the persisted roll - start clean
     const planChanged = JSON.stringify(bot.stakePlan ?? null) !== JSON.stringify(existing?.stakePlan ?? null)
@@ -650,6 +685,30 @@ export class AutopilotService {
       return this.reject(bot, 'cooldown between trades')
     }
 
+    // streak-breaker bench: after 3+ consecutive losses the bot benches
+    // itself for a growing window (15min -> doubling -> 4h cap) - it saw the
+    // conditions go sour and stands down without needing an operator ack
+    // (unlike a watchdog DISARM) or an aggregate $ trip (daily loss limit).
+    if (bot.streakBreaker && rt.benchedUntil && Math.floor(Date.now() / 1000) < rt.benchedUntil) {
+      const left = Math.ceil((rt.benchedUntil - Math.floor(Date.now() / 1000)) / 60)
+      return this.reject(bot, `streak-breaker bench: ${left}min left (after ${Math.abs(Math.min(rt.streak, -1))} losses in a row)`)
+    }
+
+    // PAYOUT FLOOR (the EV gate): the one lever our own research says moves
+    // expected value - breakeven at payout p is 1/(1+p), so a signal worth
+    // taking at an 82% payout (BE 54.9%) can be pure house-edge at 65%
+    // (BE 60.6%). Checked per candle-close against the LIVE payout for this
+    // bot's kind. pay <= 0 = payout unknown -> permissive (cold metadata
+    // contract), exactly like the auto-trader's gate. The same number is
+    // reused by the adaptive gate below (payout-aware floor mode).
+    const livePay = this.payoutFor(asset, bot.kind)
+    if ((bot.minPayoutPct ?? 0) > 0 && livePay > 0 && livePay * 100 < bot.minPayoutPct!) {
+      return this.reject(
+        bot,
+        `payout ${(livePay * 100).toFixed(0)}% below the ${bot.minPayoutPct}% floor (breakeven ${(100 / (1 + livePay)).toFixed(1)}% here)`,
+      )
+    }
+
     // mode gate: HUMAN-IN-THE-LOOP suspends bot autonomy (non-destructive -
     // configs and arm states are preserved, only execution is gated)
     try {
@@ -771,7 +830,7 @@ export class AutopilotService {
             regime = undefined
           }
           const session = classifySession(Math.floor(Date.now() / 1000), asset)
-          const v = adaptive.check(asset, tf, bot.strategyId, wanted, evalOut.score, regime, session)
+          const v = adaptive.check(asset, tf, bot.strategyId, wanted, evalOut.score, regime, session, livePay || undefined)
           if (!v.ok) return this.reject(bot, v.reason ?? 'adaptive confidence gate hold')
         }
       } catch {
@@ -822,7 +881,9 @@ export class AutopilotService {
     const roll = bet.compound
       ? ` - compound ${bet.phase} roll x${bet.rollN + 1}${periodsTag} (pot $${bet.pot.toFixed(2)}, stake $${bet.amount.toFixed(2)})`
       : ''
-    this.emit('success', `[${bot.name}] ${wanted.toUpperCase()} ${asset} $${bet.amount} ${bot.kind} @ ${evalOut.price.toFixed(5)} - ${evalOut.notes} (score ${evalOut.score.toFixed(0)})${roll}`)
+    const pay = this.payoutFor(asset, bot.kind)
+    const payTag = pay > 0 ? ` · pay ${(pay * 100).toFixed(0)}% (BE ${(100 / (1 + pay)).toFixed(1)}%)` : ''
+    this.emit('success', `[${bot.name}] ${wanted.toUpperCase()} ${asset} $${bet.amount} ${bot.kind} @ ${evalOut.price.toFixed(5)} - ${evalOut.notes} (score ${evalOut.score.toFixed(0)})${roll}${payTag}`)
   }
 
   /** Normalize an incoming stake plan; undefined (or 'fixed') = classic fixed stake. */
@@ -900,6 +961,7 @@ export class AutopilotService {
       rt.wins += 1
       rt.streak = rt.streak >= 0 ? rt.streak + 1 : 1
       if (sameDay) rt.pnlToday += pnl
+      rt.benchedUntil = undefined // a win ends a losing run - lift the bench
     } else if (position.status === 'lost') {
       rt.losses += 1
       rt.streak = rt.streak <= 0 ? rt.streak - 1 : -1
@@ -910,12 +972,20 @@ export class AutopilotService {
       // limit and profit target never saw them
       rt.pnlToday += pnl
     }
+    // streak-breaker: 3+ consecutive losses bench the bot for a growing
+    // window (15min at 3, doubling per extra loss, 4h cap). rt.streak was
+    // JUST updated above, so a fresh 3rd loss lands here on the same event.
+    const bot = this.store.listBots().find((b) => b.bot.id === botId)?.bot
+    if (bot?.streakBreaker && position.status === 'lost' && rt.streak <= -3) {
+      const benchSec = streakBenchSec(-rt.streak)
+      rt.benchedUntil = Math.floor(Date.now() / 1000) + benchSec
+      this.emit('warn', `[${bot.name}] streak-breaker: benched ${Math.round(benchSec / 60)}min after ${-rt.streak} losses in a row - the setup goes sour, the bot stands down on its own`)
+    }
     // compounding roll: a win folds the payout into the pot, a loss burns the
     // stake out of it (full roll => pot hits 0 => next trade restarts at base)
     // Round to cents at EVERY fold: stakes are rounded to cents at open, and an
     // unrounded pot (3.7636) minus a rounded stake (3.76) leaves dust (0.0036)
     // that never reaches 0 - the cycle would then compound from dust forever.
-    const bot = this.store.listBots().find((b) => b.bot.id === botId)?.bot
     if (bot?.stakePlan?.kind === 'compound') {
       const base = bot.stakePlan.base
       const working = rt.pot >= 0.01 ? rt.pot : base
@@ -972,6 +1042,18 @@ export class AutopilotService {
 
   private botIdOf(position: Position): string | null {
     return position.note?.startsWith('bot:') ? position.note.slice(4) : null
+  }
+
+  /** Live payout for one ticker as a 0-1 fraction, 0 when the market service
+   * can't answer (0 reads as "unknown" to the gates - permissive contract,
+   * same as the auto-trader's payout floor). */
+  private payoutFor(asset: string, kind: TradeKind): number {
+    try {
+      const pay = this.market.payoutFor(asset, kind)
+      return typeof pay === 'number' && Number.isFinite(pay) && pay > 0 ? pay : 0
+    } catch {
+      return 0
+    }
   }
 
   private buildRuntime(botId: string): RuntimeState {

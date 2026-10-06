@@ -264,6 +264,29 @@ export interface AutoTraderConfig {
    * "session" to avoid. Default false - opt-in, since it's a scheduling
    * restriction some setups (e.g. a pure OTC watchlist) have no use for. */
   avoidDeadHours?: boolean
+  /** PAYOUT FLOOR (the EV gate): never place a trade when the pair's LIVE
+   * binary payout is below this percent. This is the one lever our own
+   * research (Task 50-54: no predictive edge exists on synthetic feeds;
+   * breakeven at payout p is 1/(1+p)) says actually moves expected value:
+   * at 82% payout breakeven is 54.9%, at 65% it's 60.6% - a signal that's
+   * worth taking at one payout can be pure house-edge at a lower one, and
+   * payouts MOVE per pair per hour. Enforced per candidate right before
+   * placement (freshest number wins), a rejected pair sits out 10 minutes
+   * so the picker tries the next candidate instead of re-hitting it every
+   * tick. 0 = gate off. Default 70 (DEFAULT_AUTOTRADER) - permissive when
+   * the account hasn't reported a payout yet (metadata cold / sim mode).
+   * Clamped 0..98: 98+ would strand the trader - real IQ payouts top out
+   * in the mid-90s. */
+  minPayoutPct?: number
+  /** Vol-spike gate: 'avoid-volatile' stands a pair down while the SAME
+   * 4-way regime classifier the bots use (classifyRegime: ADX + Hurst +
+   * garch-vs-ewma vol) reads VOLATILE for it - i.e. a vol spike is active
+   * (garchVol > 1.6x ewmaVol). Grounded in the Task 53 contrast study:
+   * REAL feeds carry genuine vol clustering (|r| autocorr ~0.24, 10-sigma),
+   * so the bar right after a spike behaves differently from the calm that
+   * most 1m signal engines were tuned on; synthetic OTC feeds have no vol
+   * memory at all, so there the gate simply never fires. Default 'off'. */
+  volGate?: 'off' | 'avoid-volatile'
   /** Optional compounding plan - SAME shape and semantics as a bot's
    * stakePlan in autopilot.ts (payoutCap, periods, derisk, stopOnLoss). undefined
    * = fixed `stake` every trade, unchanged behavior. Auto-trader is
@@ -310,6 +333,8 @@ export const DEFAULT_AUTOTRADER: AutoTraderConfig = {
   dailyLossLimit: 0,
   watchlist: [],
   marketScope: 'all',
+  minPayoutPct: 70, // the EV gate: never fire below a 70% payout (BE 58.8%)
+  volGate: 'off',
 }
 // stakePlan/planState intentionally omitted from DEFAULT_AUTOTRADER above
 // (undefined = fixed-stake, the original unconditional behavior)
@@ -366,6 +391,14 @@ export class ModeService {
   // spam the same rejection; 30 min is long enough to be quiet, short enough
   // that a policy flip or a fresh 'edge' verdict is honored promptly.
   private static OTC_DEFENSE_COOLDOWN_SEC = 1800
+  /** Payout-floor re-probe cadence: payouts move per pair per hour, so a
+   * pair rejected for paying under the floor gets 10 minutes off (not the
+   * 30-60min the harder gates use) - it may legitimately clear the floor
+   * again on the next quote refresh. */
+  private static PAYOUT_FLOOR_COOLDOWN_SEC = 600
+  /** Vol-gate re-probe cadence: a GARCH-detected spike decays on the scale
+   * of minutes-to-tens-of-minutes; re-check a benched pair every 5. */
+  private static VOL_GATE_COOLDOWN_SEC = 300
   /** Bound on how many times one tick will re-pick and retry after a
    * broker-unavailable rejection before giving up and standing down - keeps
    * a systemic outage (the whole active_id map stale at once) from turning
@@ -502,6 +535,8 @@ export class ModeService {
           correlationGuard: typeof c.correlationGuard === 'boolean' ? c.correlationGuard : true,
           streakBreaker: typeof c.streakBreaker === 'boolean' ? c.streakBreaker : true,
           avoidDeadHours: typeof c.avoidDeadHours === 'boolean' ? c.avoidDeadHours : false,
+          minPayoutPct: clamp(num(c.minPayoutPct, DEFAULT_AUTOTRADER.minPayoutPct ?? 70), 0, 98),
+          volGate: c.volGate === 'avoid-volatile' ? 'avoid-volatile' : 'off',
           stakePlan: this.parseStakePlan(c.stakePlan),
           planState: ModeService.isPlanState(c.planState) ? c.planState : undefined,
         }
@@ -699,6 +734,50 @@ export class ModeService {
         // otc guard plugin not loaded - OTC gating disabled
       }
 
+      // PAYOUT FLOOR (the EV gate): the one lever our own research says moves
+      // expected value. Breakeven at payout p is 1/(1+p) - 54.9% at 82%,
+      // 60.6% at 65% - so a signal worth taking at one payout can be pure
+      // house-edge minutes later at a lower one. Checked HERE (not in
+      // assetBlocked) so the rejection is VISIBLE: the pair is cooled down
+      // like a broker-unavailable pair and the loop moves to the next
+      // candidate, and if nothing qualifies the reason surfaces via
+      // standDown instead of the picker silently skipping forever.
+      // row.payout comes from the screener's payoutFor() (0-1 fraction);
+      // missing/stale rows fall back to a direct read. pay <= 0 = unknown ->
+      // permissive (the same don't-hide-on-cold-metadata contract the
+      // options-capability gate uses).
+      const minPay = (this.config.minPayoutPct ?? 0) / 100
+      if (minPay > 0) {
+        const pay = row.payout > 0 ? row.payout : this.payoutFor(row.asset, 'binary')
+        if (pay > 0 && pay < minPay) {
+          this.assetRejectedUntil.set(row.asset, this.now() + ModeService.PAYOUT_FLOOR_COOLDOWN_SEC)
+          lastReason = `payout ${(pay * 100).toFixed(0)}% below the ${this.config.minPayoutPct}% floor (breakeven ${((100 / (1 + pay))).toFixed(1)}% here) - waiting for a better-paying pair`
+          continue
+        }
+      }
+
+      // VOL-SPIKE GATE: stand a pair down while classifyRegime reads
+      // VOLATILE (garchVol > 1.6x ewmaVol) for it - real feeds carry genuine
+      // vol clustering (Task 53), and the bar right after a spike behaves
+      // differently from the calm most 1m engines are tuned on. Checked
+      // per-candidate here (one analyze per attempt, not per universe row)
+      // with the same visible-rejection + cooldown treatment as the payout
+      // floor. Synthetic OTC feeds have no vol memory, so there the gate
+      // never fires - it costs one cheap analyze and changes nothing.
+      if (this.config.volGate === 'avoid-volatile') {
+        try {
+          const a = this.ctx.use<AnalyticsService>('analytics').analyze(row.asset, this.config.tf)
+          const r = classifyRegime(a)
+          if (r === 'VOLATILE') {
+            this.assetRejectedUntil.set(row.asset, this.now() + ModeService.VOL_GATE_COOLDOWN_SEC)
+            lastReason = `vol gate: ${row.asset} regime VOLATILE (garch > 1.6x ewma) - standing aside for the spike to decay`
+            continue
+          }
+        } catch {
+          // thin history / analytics unavailable - don't block the trade on a diagnostic that couldn't compute
+        }
+      }
+
       const side = row.direction === 'put' ? 'put' : 'call'
       const out = await this.place(row, side, bet.amount)
       if (!out.ok) {
@@ -759,9 +838,11 @@ export class ModeService {
       } catch {
         // execution plugin unavailable - already failed above via place(), unreachable in practice
       }
+      const pay = this.payoutFor(row.asset, 'binary')
+      const payTag = pay > 0 ? ` · pay ${(pay * 100).toFixed(0)}% (BE ${(100 / (1 + pay)).toFixed(1)}%)` : ''
       this.emit(
         'success',
-        `[AUTO-TRADER]${modeTag} ${side.toUpperCase()} ${row.asset} ${this.config.tf} $${this.config.stake} binary - ${detail}`
+        `[AUTO-TRADER]${modeTag} ${side.toUpperCase()} ${row.asset} ${this.config.tf} $${bet.amount.toFixed(2)} binary - ${detail}${payTag}`
       )
       return
     }
@@ -1810,6 +1891,18 @@ export class ModeService {
     return this.now() < (this.benchedUntil.get(key) ?? 0)
   }
 
+  /** Live binary payout for one ticker as a 0-1 fraction, 0 when the market
+   * service can't answer (never invent a number - 0 reads as "unknown" to
+   * every gate that consults this, which is the permissive contract). */
+  private payoutFor(asset: string, kind: 'binary' | 'turbo' | 'digital' | 'cfd'): number {
+    try {
+      const pay = this.ctx.use<MarketDataService>('market').payoutFor(asset, kind)
+      return typeof pay === 'number' && Number.isFinite(pay) && pay > 0 ? pay : 0
+    } catch {
+      return 0
+    }
+  }
+
   /** 21:00-23:00 UTC - after New York closes and before Tokyo/Sydney really
    * get going, historically the thinnest liquidity window for FX majors.
    * Only ever consulted for non-OTC tickers (see avoidDeadHours's docs). */
@@ -2154,6 +2247,8 @@ export class ModeService {
     if (patch.avoidDeadHours !== undefined) this.config.avoidDeadHours = Boolean(patch.avoidDeadHours)
     if (patch.watchlistMode !== undefined) this.config.watchlistMode = patch.watchlistMode === 'exclude' ? 'exclude' : 'only'
     if (patch.marketScope !== undefined) this.config.marketScope = patch.marketScope === 'real' || patch.marketScope === 'otc' ? patch.marketScope : 'all'
+    if (patch.minPayoutPct !== undefined) this.config.minPayoutPct = clamp(Number(patch.minPayoutPct) || 0, 0, 98)
+    if (patch.volGate !== undefined) this.config.volGate = patch.volGate === 'avoid-volatile' ? 'avoid-volatile' : 'off'
     if (patch.stakePlan !== undefined) {
       const planChanged = JSON.stringify(this.config.stakePlan ?? null) !== JSON.stringify(patch.stakePlan ?? null)
       this.config.stakePlan = this.parseStakePlan(patch.stakePlan, this.config.stakePlan)
@@ -2223,9 +2318,11 @@ export class ModeService {
     // cooldown that assetBlocked() never actually applies
     const effectiveCooldown = Math.max(this.config.cooldownSec, ModeService.MIN_ASSET_COOLDOWN_SEC)
     const scopeNote = this.config.marketScope === 'real' ? ' · REAL feeds only' : this.config.marketScope === 'otc' ? ' · OTC feeds only' : ''
+    const payoutNote = (this.config.minPayoutPct ?? 0) > 0 ? ` · payout ≥ ${this.config.minPayoutPct}% (EV gate)` : ''
+    const volNote = this.config.volGate === 'avoid-volatile' ? ' · vol-gate on (no entries in a VOLATILE regime)' : ''
     this.emit(
       'info',
-      `AUTO-TRADER config: ${this.config.enabled ? 'armed' : 'off'} · src ${this.config.signalSource}${srcDetail} · ${this.config.tf} · stake $${this.config.stake}${thresholds ? ` · ${thresholds}` : ''} · maxOpen ${this.config.maxOpen} · cooldown ${effectiveCooldown}s${scopeNote} · binary options only (CFD-only instruments skipped)`
+      `AUTO-TRADER config: ${this.config.enabled ? 'armed' : 'off'} · src ${this.config.signalSource}${srcDetail} · ${this.config.tf} · stake $${this.config.stake}${thresholds ? ` · ${thresholds}` : ''} · maxOpen ${this.config.maxOpen} · cooldown ${effectiveCooldown}s${scopeNote}${payoutNote}${volNote} · binary options only (CFD-only instruments skipped)`
     )
     return { ok: true, config: { ...this.config } }
   }

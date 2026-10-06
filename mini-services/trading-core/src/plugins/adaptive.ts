@@ -30,6 +30,19 @@ export interface AdaptiveConfig {
   scoreBucketWidth: number // |entryScore| granularity (e.g. 10 = scores 70-79.9 share a bucket)
   splitByRegime: boolean // bucket by entryRegime too (thinner buckets, sharper judgment) vs pooled across regimes
   splitBySession: boolean // bucket by entrySession too (ASIA/LONDON/OVERLAP/NEWYORK/OFF) vs pooled across the whole day
+  /** How the win-rate floor is interpreted. 'absolute' (default, the
+   * original behavior) - minWinRateFloorPct is taken literally regardless
+   * of what the pair pays. 'payout-aware' - the required floor is computed
+   * PER TRADE from the pair's live payout: breakeven 1/(1+payout) as a %,
+   * plus marginPct points of cushion. The point: a fixed 62% floor demands
+   * 7 points of edge at an 82% payout (BE 54.9%) but only 1.4 at 65% (BE
+   * 60.6%) - the payout-aware mode keeps the CUSHION constant as payouts
+   * move, which is the quantity that actually decides expected value.
+   * Trades without a known payout fall back to the absolute floor. */
+  floorMode?: 'absolute' | 'payout-aware'
+  /** Cushion over breakeven in 'payout-aware' mode (percentage points the
+   * Wilson lower bound must clear above breakeven). Default 5. */
+  marginPct?: number
 }
 
 export const DEFAULT_ADAPTIVE: AdaptiveConfig = {
@@ -39,6 +52,8 @@ export const DEFAULT_ADAPTIVE: AdaptiveConfig = {
   scoreBucketWidth: 10,
   splitByRegime: true,
   splitBySession: true,
+  floorMode: 'absolute',
+  marginPct: 5,
 }
 
 export interface AdaptiveVerdict {
@@ -89,11 +104,13 @@ export class AdaptiveService {
     next.enabled = Boolean(next.enabled)
     next.splitByRegime = Boolean(next.splitByRegime)
     next.splitBySession = Boolean(next.splitBySession)
+    next.floorMode = next.floorMode === 'payout-aware' ? 'payout-aware' : 'absolute'
+    next.marginPct = clamp(next.marginPct ?? 5, 0, 30)
     this.config = next
     this.store.saveAdaptiveConfig(this.config)
     this.ctx.bus.emit('alert', {
       level: 'info',
-      message: `Adaptive gate updated: floor ${next.minWinRateFloorPct}% · min n ${next.minSampleSize} · bucket width ${next.scoreBucketWidth}${next.splitByRegime ? ' · split by regime' : ' · pooled across regimes'}${next.splitBySession ? ' · split by session' : ' · pooled across sessions'}${next.enabled ? '' : ' · FLEET DEFAULT OFF'}`,
+      message: `Adaptive gate updated: floor ${next.minWinRateFloorPct}%${next.floorMode === 'payout-aware' ? ` as payout-aware +${next.marginPct}pts over breakeven` : ' (absolute)'} · min n ${next.minSampleSize} · bucket width ${next.scoreBucketWidth}${next.splitByRegime ? ' · split by regime' : ' · pooled across regimes'}${next.splitBySession ? ' · split by session' : ' · pooled across sessions'}${next.enabled ? '' : ' · FLEET DEFAULT OFF'}`,
       ts: Math.floor(Date.now() / 1000),
     })
     return this.config
@@ -103,8 +120,10 @@ export class AdaptiveService {
    * place or record trades - it only reads the journal that execution
    * already writes on every settle, so there's nothing extra to wire up
    * per-trade; the very trade being gated becomes part of the bucket once it
-   * settles. */
-  check(asset: string, tf: string, strategyId: string, side: string, score: number, regime?: string, session?: string): AdaptiveVerdict {
+   * settles. `payout` (0-1 fraction, from the caller's live payoutFor read)
+   * activates the payout-aware floor when floorMode is 'payout-aware';
+   * undefined/unknown falls back to the absolute floor. */
+  check(asset: string, tf: string, strategyId: string, side: string, score: number, regime?: string, session?: string, payout?: number): AdaptiveVerdict {
     const width = this.config.scoreBucketWidth
     const floor = Math.floor(Math.abs(score) / width) * width
     const useRegime = this.config.splitByRegime ? regime : undefined
@@ -114,18 +133,30 @@ export class AdaptiveService {
     const wilsonLowerPct = Math.round(wilsonLowerBound(stats.wins, stats.trades) * 10) / 10
     const bucket = `${asset} ${tf} ${strategyId} ${side} score[${floor}-${floor + width}) ${useRegime ?? 'any-regime'} ${useSession ?? 'any-session'}`
 
+    // required floor: absolute (the configured number) or payout-aware
+    // (breakeven 1/(1+p) + cushion). payout in 0..1 only - anything else
+    // (0 = unknown, >= 1 = nonsense) falls back to the absolute floor.
+    const payoutAware =
+      this.config.floorMode === 'payout-aware' && typeof payout === 'number' && payout > 0 && payout < 1
+    const requiredFloor = payoutAware
+      ? Math.min(99, 100 / (1 + payout) + (this.config.marginPct ?? 5))
+      : this.config.minWinRateFloorPct
+    const floorLabel = payoutAware
+      ? `breakeven ${(100 / (1 + payout!)).toFixed(1)}% at pay ${(payout! * 100).toFixed(0)}% + ${this.config.marginPct ?? 5}pts = ${requiredFloor.toFixed(1)}%`
+      : `${this.config.minWinRateFloorPct}% bar`
+
     if (stats.trades < this.config.minSampleSize) {
       // not enough evidence to judge this exact setup yet - let it trade so
       // the bucket has something to be judged ON. This is the ONE place the
       // gate is deliberately permissive.
       return { ok: true, trades: stats.trades, wins: stats.wins, winRatePct, wilsonLowerPct, bucket }
     }
-    if (wilsonLowerPct >= this.config.minWinRateFloorPct) {
+    if (wilsonLowerPct >= requiredFloor) {
       return { ok: true, trades: stats.trades, wins: stats.wins, winRatePct, wilsonLowerPct, bucket }
     }
     return {
       ok: false,
-      reason: `adaptive: "${bucket}" has ${stats.trades} settled trades at ${winRatePct}% win rate (95% floor ${wilsonLowerPct}%) - below the ${this.config.minWinRateFloorPct}% bar, standing aside`,
+      reason: `adaptive: "${bucket}" has ${stats.trades} settled trades at ${winRatePct}% win rate (95% floor ${wilsonLowerPct}%) - below the ${floorLabel}, standing aside`,
       trades: stats.trades,
       wins: stats.wins,
       winRatePct,
