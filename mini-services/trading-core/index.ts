@@ -411,6 +411,72 @@ const httpServer = createServer(async (req, res) => {
             break
           }
         }
+        // FEED AUTHENTICITY - vol-memory fingerprint (Task 53 contrast).
+        // Real markets carry volatility clustering (|r| autocorr ~0.25,
+        // Ljung-Box p ~ 0) and session rhythm; the OTC generator emits IID
+        // steps (|r| acf ~ 0.003-0.007, LB p > 0.3, flat hourly profile).
+        // This detector FIRED on real EURUSD/GBPUSD (LB p~0, runs-z +3.3)
+        // and stayed silent on OTC - a VALIDATED synthetic-feed tell. It is
+        // a descriptive diagnostic, NOT a trade gate (edge verdicts gate);
+        // it tells you what kind of feed you are on, and would instantly
+        // flag a generator upgrade (vol memory appearing where there was
+        // none). Math: LB Q = N(N+2) * sum(rho_k^2/(N-k)), chi2(10) p-value
+        // via Wilson-Hilferty normal approx + Abramowitz-Stegun erf.
+        const absSteps: number[] = []
+        for (let i = 1; i < n; i++) absSteps.push(Math.abs(candles[i].close - candles[i - 1].close))
+        const NA = absSteps.length
+        const mA = absSteps.reduce((s, v) => s + v, 0) / Math.max(1, NA)
+        const dev = absSteps.map((v) => v - mA)
+        const c0 = dev.reduce((s, v) => s + v * v, 0)
+        const rho = (k: number) =>
+          c0 > 0 ? dev.slice(k).reduce((s, v, i) => s + v * dev[i], 0) / c0 : 0
+        const acf1 = rho(1)
+        let Q = 0
+        for (let k = 1; k <= 10; k++) {
+          const rk = rho(k)
+          Q += (rk * rk) / (NA - k)
+        }
+        Q = NA * (NA + 2) * Q
+        const whZ = (Qv: number, k: number) =>
+          (Math.cbrt(Qv / k) - (1 - 2 / (9 * k))) / Math.sqrt(2 / (9 * k))
+        const phi = (x: number) => {
+          const t = 1 / (1 + 0.2316419 * Math.abs(x))
+          const poly =
+            t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))))
+          const cdf = 1 - poly * Math.exp(-x * x / 2) / Math.sqrt(2 * Math.PI)
+          return x >= 0 ? cdf : 1 - cdf
+        }
+        const lbP = Math.max(0, Math.min(1, 1 - phi(whZ(Q, 10))))
+        // hourly |step| profile spread (session rhythm proxy, context only)
+        const byHourVol = new Map<number, { s: number; c: number }>()
+        for (let i = 1; i < n; i++) {
+          const h = Math.floor(candles[i].time / 3600)
+          const b = byHourVol.get(h) ?? { s: 0, c: 0 }
+          b.s += Math.abs(candles[i].close - candles[i - 1].close)
+          b.c++
+          byHourVol.set(h, b)
+        }
+        const hourVols = [...byHourVol.values()].filter((b) => b.c >= 30).map((b) => b.s / b.c)
+        let hourSpread = 0
+        if (hourVols.length >= 8) {
+          const sorted = [...hourVols].sort((a, b) => a - b)
+          const p01 = sorted[Math.floor(sorted.length * 0.01)]
+          const p99 = sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.99))]
+          hourSpread = p01 > 0 ? p99 / p01 : 0
+        }
+        // Verdict rule (calibrated on the Task 53 contrast, n=31k): real
+        // feeds read |r| acf1 0.24+ (10-sigma above zero), OTC pairs read
+        // 0.004-0.028 - inside the +-0.045 noise floor at the kernel's
+        // n~2000 window. LB p is REPORTED but does not gate: the joint
+        // 10-lag test is fragile at n~2000 (marginal 0.02-0.05 pops are
+        // expected noise); the lag-1 acf against the 0.05 floor is the
+        // robust separator at this scale.
+        const authenticity =
+          acf1 >= 0.1 && lbP <= 0.01
+            ? 'real-like'
+            : Math.abs(acf1) <= 0.05
+              ? 'synthetic-like'
+              : 'inconclusive'
         // Drift verdict: DECIDED-side z (flat-aware), rolling agreement +
         // hourly sign consistency. The all-transitions zCC is reported for
         // transparency but deliberately NOT used for the verdict.
@@ -429,6 +495,13 @@ const httpServer = createServer(async (req, res) => {
           rolling500: { upRate: +upRoll.toFixed(4), z: +zRoll.toFixed(2) },
           persistence: { hours: hours.length, negFrac: +negFrac.toFixed(2), posFrac: +posFrac.toFixed(2), consistent },
           lattice: { grid, gridCov: +gridCov.toFixed(4) },
+          authenticity: {
+            absAcf1: +acf1.toFixed(4),
+            ljungBoxP: +lbP.toFixed(4),
+            nAbs: NA,
+            hourSpread: +hourSpread.toFixed(2),
+            verdict: authenticity,
+          },
           drift,
           summary:
             drift === 'drift_down' || drift === 'drift_up'

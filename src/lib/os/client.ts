@@ -379,6 +379,15 @@ export interface OtcForensics {
   rolling500: { upRate: number; z: number }
   persistence: { hours: number; negFrac: number; posFrac: number; consistent: boolean }
   lattice: { grid: number; gridCov: number }
+  /** vol-memory fingerprint (Task 53): real feeds cluster vol (|r| acf ~0.25, LB p~0);
+   *  the OTC generator emits IID steps (acf ~0.00). A validated synthetic-feed tell. */
+  authenticity?: {
+    absAcf1: number
+    ljungBoxP: number
+    nAbs: number
+    hourSpread: number
+    verdict: 'synthetic-like' | 'real-like' | 'inconclusive'
+  }
   drift: 'drift_up' | 'drift_down' | 'suggestive' | 'none'
   dataSource?: 'sidecar' | 'harvest' | 'active-feed'
   summary: string

@@ -456,6 +456,12 @@ function OtcForensicsCard({ asset }: { asset: string }) {
   const ds = drift ? DRIFT_STYLE[drift] : null
   const pct1 = (x: number) => `${(x * 100).toFixed(1)}%`
   const live = drift === 'drift_up' || drift === 'drift_down'
+  const AUTH_STYLE: Record<string, { label: string; color: string; bg: string }> = {
+    'synthetic-like': { label: 'SYNTHETIC-LIKE FEED', color: '#a78bfa', bg: 'rgba(167,139,250,0.12)' },
+    'real-like': { label: 'REAL-LIKE FEED', color: '#38bdf8', bg: 'rgba(56,189,248,0.12)' },
+    inconclusive: { label: 'FEED ?', color: '#aab6cc', bg: 'rgba(170,182,204,0.12)' },
+  }
+  const auth = data?.authenticity ? AUTH_STYLE[data.authenticity.verdict] : null
 
   return (
     <div className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-3 xl:col-span-2">
@@ -465,6 +471,15 @@ function OtcForensicsCard({ asset }: { asset: string }) {
           {ds && (
             <span className="rounded px-1.5 py-0.5 font-mono text-[8px] font-bold uppercase tracking-wider" style={{ color: ds.color, background: ds.bg }}>
               {ds.label}
+            </span>
+          )}
+          {auth && (
+            <span
+              className="rounded px-1.5 py-0.5 font-mono text-[8px] font-bold uppercase tracking-wider"
+              style={{ color: auth.color, background: auth.bg }}
+              title={`|r| autocorr ${data?.authenticity?.absAcf1.toFixed(4)} (real ~0.25, OTC ~0.00) · Ljung-Box p ${data?.authenticity?.ljungBoxP.toFixed(3)} · hourly vol spread ${data?.authenticity?.hourSpread.toFixed(1)}x`}
+            >
+              {auth.label}
             </span>
           )}
         </h3>
@@ -509,6 +524,14 @@ function OtcForensicsCard({ asset }: { asset: string }) {
               value={data.lattice.grid > 0 ? data.lattice.grid.toExponential(0) : '—'}
               note={data.lattice.grid > 0 ? `coverage ${pct1(data.lattice.gridCov)}` : 'no dominant grid'}
             />
+            {data.authenticity && (
+              <Stat
+                label="Vol memory"
+                value={auth?.label.replace(' FEED', '') ?? '—'}
+                color={auth?.color}
+                note={`|r| acf ${data.authenticity.absAcf1.toFixed(4)} · LB p ${data.authenticity.ljungBoxP.toFixed(3)} · real≈0.25, OTC≈0`}
+              />
+            )}
           </div>
           <p className="mt-2 border-t border-[#1c2739] pt-2 text-[10px] leading-relaxed" style={{ color: ds?.color ?? '#aab6cc' }}>
             {data.summary}
@@ -525,7 +548,7 @@ function OtcForensicsCard({ asset }: { asset: string }) {
       )}
       {!data && !error && (
         <p className="text-[10px] text-[#4b5a72]">
-          {isOtc ? 'Probing the feed…' : 'Non-OTC asset - the generator-drift probe only applies to -OTC pairs.'}
+          {isOtc ? 'Probing the feed…' : 'Probing the feed… (non-OTC pairs should read REAL-LIKE here - real markets carry vol memory; the OTC generator does not)'}
         </p>
       )}
     </div>
