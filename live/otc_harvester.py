@@ -28,6 +28,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -44,6 +45,13 @@ CALL_PACE = 0.2            # seconds between sidecar round-trips
 PRICES_INTERVAL = 1.0      # live tick cadence
 CANDLE_INTERVAL = 60.0     # live closed-candle append cadence
 TICK_ROTATE_BYTES = 50 * 1024 * 1024
+TICKSET_CAP = 40          # sidecar WATCH_CAP=48; leave slots for the user's own UI streams
+TICKSET_POLL = 45.0       # /tick_stats delta pull cadence (buffer holds 1000 pts/pair)
+TICKSET_PRIORITY = [
+    "GBPUSD-OTC", "EURUSD-OTC", "USDJPY-OTC", "GBPJPY-OTC", "AUDUSD-OTC",
+    "USDCAD-OTC", "USDCHF-OTC", "NZDUSD-OTC", "EURGBP-OTC", "EURJPY-OTC",
+    "BTCUSD-OTC", "ETHUSD-OTC", "XAUUSD-OTC", "XAGUSD-OTC",
+]
 
 os.makedirs(CANDLE_DIR, exist_ok=True)
 STOP = False
@@ -214,11 +222,20 @@ class Harvester:
                 fout.writelines(fin)
             os.remove(path)
 
-    def live_candle_cycle(self, open_tickers: list[str]) -> None:
-        """Append newly CLOSED 1m candles for open pairs (size=3, cheap)."""
+    def live_candle_cycle(self, open_tickers: list[str], fraction: float = 1.0) -> None:
+        """Append newly CLOSED 1m candles for open pairs (size=3, cheap).
+        `fraction` rotates a window when many pairs are open: /candles takes
+        the sidecar's global lock, and 70 sequential locked calls every
+        minute would starve the UI poll + backfill - so with fraction=1/6
+        every pair is refreshed every ~6 min instead."""
         now = int(time.time())
         bucket = (now // 60) * 60  # current (forming) candle open - skip it
-        for t in open_tickers:
+        tickers = open_tickers
+        if fraction < 1.0 and len(open_tickers) > 1:
+            w = max(1, int(len(open_tickers) * fraction))
+            start = (int(now / 60) * w) % len(open_tickers)
+            tickers = open_tickers[start:start + w]
+        for t in tickers:
             if STOP:
                 break
             path = pair_file(t)
@@ -229,6 +246,87 @@ class Harvester:
             if fresh:
                 self.status["live_candles_written"] += append_candles(path, fresh)
             time.sleep(0.05)
+
+    # ---------------- live worker thread ----------------
+
+    def _pick_tickset(self, open_tickers: list[str]) -> list[str]:
+        """The 100ms-resolution harvest set: priority pairs first, then
+        alphabetical fill up to TICKSET_CAP. Streams are capped by the
+        sidecar (WATCH_CAP 48) so harvesting all 65 open pairs would churn
+        subscriptions; 40 leaves room for the user's own UI streams."""
+        open_set = set(open_tickers)
+        picked = [t for t in TICKSET_PRIORITY if t in open_set]
+        for t in sorted(open_tickers):
+            if len(picked) >= TICKSET_CAP:
+                break
+            if t not in picked:
+                picked.append(t)
+        return picked
+
+    def _harvest_tick_stats(self, tickset: list[str]) -> None:
+        """Pull each pair's 100ms capture-buffer deltas via /tick_stats and
+        append NEW points to the daily 100ms tick archive. Buffer holds up
+        to 1000 points/pair; at 45s pull cadence and ~1-2 changes/s we stay
+        far under the cap, so nothing is lost between pulls."""
+        day = datetime.now(timezone.utc).strftime("%Y%m%d")
+        path = os.path.join(DATA_DIR, f"ticks100ms__{day}.jsonl")
+        added = 0
+        with open(path, "a") as fh:
+            for t in tickset:
+                if STOP:
+                    break
+                d = fetch(f"/tick_stats?asset={urllib.parse.quote(t)}", timeout=10)
+                pts = (d or {}).get("points") or []
+                last = self._last_ts100.get(t, 0.0)
+                fresh = [p for p in pts if float(p.get("time", 0)) > last]
+                if fresh:
+                    for p in fresh:
+                        fh.write(json.dumps({"ts": round(float(p["time"]) * 1000), "t": t,
+                                             "p": float(p["price"])}, separators=(",", ":")) + "\n")
+                    self._last_ts100[t] = float(fresh[-1]["time"])
+                    added += len(fresh)
+                time.sleep(0.05)
+        self.status["ticks100ms_written"] = self.status.get("ticks100ms_written", 0) + added
+
+    def _live_worker(self, live_tickers: list[str]) -> None:
+        """Dedicated capture thread - starts IMMEDIATELY at boot, runs in
+        parallel with the backfill and keeps running after it. Tick data is
+        the scarce resource (sessions end), backfill can wait.
+
+        Two tiers:
+          tickset (<=40): /prices touch every cycle (seeds + keeps streams
+            warm) + /tick_stats delta pull every TICKSET_POLL s -> the
+            100ms-resolution research archive.
+          other open pairs: rotating /candles window only (no streams)."""
+        tickset = self._pick_tickset(live_tickers)
+        others = [t for t in live_tickers if t not in set(tickset)]
+        log(f"live capture thread up: {len(live_tickers)} open pairs (tickset {len(tickset)}, others {len(others)})")
+        self._last_ts100: dict[str, float] = {}
+        last_candle = 0.0
+        last_tickset = 0.0
+        while not STOP:
+            t0 = time.time()
+            try:
+                self.live_tick_cycle(tickset)  # 1s touch keeps streams alive
+            except Exception as exc:  # noqa: BLE001
+                self.status["errors"] += 1
+                log(f"tick cycle error: {exc}")
+            if t0 - last_tickset >= TICKSET_POLL:
+                last_tickset = t0
+                try:
+                    self._harvest_tick_stats(tickset)
+                except Exception as exc:  # noqa: BLE001
+                    self.status["errors"] += 1
+                    log(f"tick_stats harvest error: {exc}")
+            if t0 - last_candle >= CANDLE_INTERVAL:
+                last_candle = t0
+                try:
+                    self.live_candle_cycle(live_tickers, fraction=0.2)
+                except Exception as exc:  # noqa: BLE001
+                    self.status["errors"] += 1
+                    log(f"candle cycle error: {exc}")
+            self.save_status()
+            time.sleep(max(0.5, PRICES_INTERVAL - (time.time() - t0)))
 
     # ---------------- main ----------------
 
@@ -258,6 +356,10 @@ class Harvester:
         log(f"backfill plan: tier1={len(tier1)} pairs @30d, tier2={len(tier2)} pairs @10d")
         self.status["phase"] = "backfill"
 
+        # live capture starts NOW in its own thread - not after the backfill
+        if open_set:
+            threading.Thread(target=self._live_worker, args=(sorted(open_set),), daemon=True).start()
+
         for i, t in enumerate(tier1 + tier2):
             if STOP:
                 break
@@ -268,39 +370,14 @@ class Harvester:
                 total = sum(self.status["backfill_done"].values())
                 log(f"backfill {i + 1}/{len(tier1) + len(tier2)} - {t} +{n} bars (total {total})")
             self.save_status()
-            # INTERLEAVE: live tick/candle capture must not wait for the
-            # whole backfill (weekend OTC sessions are the scarce data)
-            if open_set and (i + 1) % 5 == 0:
-                try:
-                    self.live_tick_cycle(sorted(open_set))
-                except Exception as exc:  # noqa: BLE001
-                    self.status["errors"] += 1
-                    log(f"interleaved tick cycle error: {exc}")
 
         total = sum(self.status["backfill_done"].values())
         log(f"backfill complete: {total} bars across {len(self.status['backfill_done'])} pairs")
         self.status["phase"] = "live"
 
-        last_candle_cycle = 0.0
         while not STOP:
-            loop_start = time.time()
-            live = sorted(open_set) if open_set else []
-            if live:
-                try:
-                    self.live_tick_cycle(live)
-                except Exception as exc:  # noqa: BLE001
-                    self.status["errors"] += 1
-                    log(f"tick cycle error: {exc}")
-                if loop_start - last_candle_cycle >= CANDLE_INTERVAL:
-                    last_candle_cycle = loop_start
-                    try:
-                        self.live_candle_cycle(live)
-                    except Exception as exc:  # noqa: BLE001
-                        self.status["errors"] += 1
-                        log(f"candle cycle error: {exc}")
             self.save_status()
-            dt = time.time() - loop_start
-            time.sleep(max(0.2, PRICES_INTERVAL - dt))
+            time.sleep(5)
         log("harvester stopped cleanly")
 
 

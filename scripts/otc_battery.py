@@ -180,8 +180,8 @@ def rolling_upfrac_std(x: np.ndarray, w: int = 60) -> float:
 
 def digit_chi2(c: np.ndarray) -> dict:
     """Last-decimal digit uniformity at 1e-5 resolution (FX 5-digit) + the
-    inferred price GRID STEP. A generator that quantizes to a coarse grid
-    shows a skewed histogram / a step far above the float resolution."""
+    inferred price GRID STEP via coverage (robust to float dust): the
+    smallest candidate grid g that >=99% of closes sit on."""
     d = np.mod(np.round(c * 1e5).astype(np.int64), 10)
     hist = np.bincount(d, minlength=10)
     n = hist.sum()
@@ -190,15 +190,44 @@ def digit_chi2(c: np.ndarray) -> dict:
     dof = 9
     zh = ((chi2 / dof) ** (1 / 3) - (1 - 2 / (9 * dof))) / math.sqrt(2 / (9 * dof))
     p = 0.5 * math.erfc(zh / math.sqrt(2))
-    # grid step: smallest positive gap between distinct closes (round away
-    # float noise first) - 2e-5 means the generator walks a 1/5-pip lattice
-    u = np.unique(np.round(c, 9))
-    diffs = np.diff(u)
-    pos = diffs[diffs > 0]
-    grid = float(np.min(pos)) if len(pos) else 0.0
+    # dominant grid: the COARSEST candidate covering >=95% of closes
+    # (finest-first always matches a dust-level grid; 0.99 leaves no room
+    # for the off-lattice outliers that are themselves a fingerprint)
+    grid, cov = 0.0, 0.0
+    for g in (1e-3, 5e-4, 2e-4, 1e-4, 5e-5, 2e-5, 1e-5, 5e-6, 2e-6, 1e-6):
+        cov = float(np.mean(np.abs(np.round(c / g) * g - c) < 1e-9))
+        if cov >= 0.95:
+            grid = g
+            break
     even_frac = float((d % 2 == 0).mean())
     return {"chi2": round(chi2, 2), "dof": dof, "p": round(p, 5),
-            "even_frac": round(even_frac, 4), "grid_step": grid, "hist": hist.tolist()}
+            "even_frac": round(even_frac, 4), "grid_step": grid, "grid_cov": round(cov, 4),
+            "hist": hist.tolist()}
+
+
+def drift_daily(c: np.ndarray, t: np.ndarray) -> dict:
+    """THE fair-coin test the permutation nulls CANNOT see: they preserve
+    the empirical return pool, so a persistent drift is calibrated away by
+    construction. This test compares candle direction to 0.5 directly and
+    checks PERSISTENCE (day after day), which is what makes a drift
+    tradeable rather than a one-off crash. Returns per-day binomial z's."""
+    up = (np.diff(c) > 0)
+    day = (t[1:] // 86400).astype(np.int64)
+    days = np.unique(day)
+    rates = np.array([up[day == dd].mean() for dd in days])
+    ns = np.array([int((day == dd).sum()) for dd in days])
+    zs = (rates - 0.5) / math.sqrt(0.25 / ns)
+    n_all = int(up.sum() + (~up).sum())
+    z_all = (up.mean() - 0.5) / math.sqrt(0.25 / n_all)
+    # persistence: fraction of days with |z|>=3, and sign consistency of extremes
+    ext = zs[np.abs(zs) >= 3]
+    return {
+        "days": len(days), "z_all": round(float(z_all), 2),
+        "daily_mean_z": round(float(zs.mean()), 2),
+        "daily_min_rate": round(float(rates.min()), 4), "daily_max_rate": round(float(rates.max()), 4),
+        "n_days_extreme": len(ext),
+        "extreme_sign_consistent": bool(len(ext) >= 5 and (np.all(ext > 0) or np.all(ext < 0))),
+    }
 
 
 # ----------------------------------------------------------- battery ------
@@ -207,7 +236,7 @@ TEST_KEYS = ["up_rate", "dir_ac1", "dir_acmax", "dir_lb", "ret_ac1", "ret_acmax"
              "vol_acmax", "vol_lb", "runs", "cusum", "spec", "ngram"]
 
 
-def battery_for_pair(c: np.ndarray, m: int, seed: int) -> dict:
+def battery_for_pair(c: np.ndarray, m: int, seed: int, t_axis: np.ndarray | None = None) -> dict:
     base = float(c[0])
     r = np.diff(c) / c[:-1]
     x = np.sign(np.diff(c))
@@ -262,11 +291,15 @@ def battery_for_pair(c: np.ndarray, m: int, seed: int) -> dict:
         zb = (real[k] - sb[k].mean()) / (sb[k].std() + 1e-12)
         pi = float((np.sum(si[k] >= real[k]) + 1) / (m + 1))
         pb = float((np.sum(sb[k] >= real[k]) + 1) / (m + 1))
-        tests[k] = {"real": real[k], "z_iid": round(float(zi), 3), "z_blk": round(float(zb), 3),
+        # permutation nulls preserve the return pool EXACTLY for pool-level
+        # stats - when the null has no spread the z is meaningless; report
+        # None so family aggregation skips it instead of flagging artifacts
+        zi_out = round(float(zi), 3) if si[k].std() > 1e-9 else None
+        tests[k] = {"real": real[k], "z_iid": zi_out, "z_blk": round(float(zb), 3),
                     "p_iid": round(pi, 4), "p_blk": round(pb, 4)}
 
     return {"n": int(n), "up_rate": up_rate, "tests": tests,
-            "digits": digit_chi2(c)}
+            "drift": drift_daily(c, t_axis), "digits": digit_chi2(c)}
 
 
 # ------------------------------------------------------------- OOS --------
@@ -312,11 +345,14 @@ def oos_pattern(c: np.ndarray) -> dict:
                 "wr_train": round(best["wr_train"], 4), "diff_train": round(best["diff"], 4),
                 "hits_oos": 0, "survived": False}
     wr_ho = wins / hits
+    base_ho = float((ho_s > 0).mean())  # OOS window's own base rate - the fair comparison
     z = (wr_ho - 0.5) / math.sqrt(0.25 / hits)
     p = 0.5 * math.erfc(z / math.sqrt(2))
+    z_rel = (wr_ho - base_ho) / math.sqrt(max(1e-9, base_ho * (1 - base_ho) / hits))
     return {"found": True, "k": k, "pattern": pat, "n_train": best["n_train"],
             "wr_train": round(best["wr_train"], 4), "diff_train": round(best["diff"], 4),
-            "hits_oos": hits, "wr_oos": round(wr_ho, 4), "z_oos": round(z, 3),
+            "hits_oos": hits, "wr_oos": round(wr_ho, 4), "base_oos": round(base_ho, 4),
+            "z_oos": round(z, 3), "z_rel_oos": round(float(z_rel), 3),
             "p_oos": round(p, 4), "survived": bool(wr_ho > 0.5 and p < 0.05)}
 
 
@@ -423,7 +459,7 @@ def run_once(args) -> None:
         loaded[name] = data
         seed = zlib.crc32(name.encode())  # stable across processes
         t1 = time.time()
-        res = battery_for_pair(data["c"], args.mc, seed)
+        res = battery_for_pair(data["c"], args.mc, seed, t_axis=data["t"])
         res["span_days"] = round((int(data["t"][-1]) - int(data["t"][0])) / 86400, 2)
         res["oos"] = oos_pattern(data["c"])
         report["pairs"][name] = res
@@ -433,7 +469,8 @@ def run_once(args) -> None:
     # family-level aggregation: is any test's z-distribution globally shifted?
     fam = {}
     for k in TEST_KEYS:
-        zs = np.array([p["tests"][k]["z_iid"] for p in report["pairs"].values()], dtype=float)
+        zs = np.array([p["tests"][k]["z_iid"] for p in report["pairs"].values()
+                       if p["tests"][k]["z_iid"] is not None], dtype=float)
         zb = np.array([p["tests"][k]["z_blk"] for p in report["pairs"].values()], dtype=float)
         if len(zs) < 8:
             continue
@@ -456,6 +493,11 @@ def run_once(args) -> None:
     with open(out, "w") as fh:
         json.dump(report, fh, indent=1)
     print(f"\nbattery done: {done} pairs in {time.time() - t0:.0f}s -> {out}")
+    drifts = [(p, res["drift"]) for p, res in report["pairs"].items()]
+    hot = [(p, d) for p, d in drifts if d["n_days_extreme"] >= 5 and d["extreme_sign_consistent"]]
+    print(f"persistent drift regimes (>=5 extreme days, one sign): {len(hot)}/{len(drifts)}")
+    for p, d in hot[:8]:
+        print(f"  {p:22s} z_all {d['z_all']:+.1f}  daily_mean_z {d['daily_mean_z']:+.2f}  extreme days {d['n_days_extreme']}/{d['days']}")
     grids = [(p, res["digits"]["grid_step"], res["digits"]["even_frac"]) for p, res in report["pairs"].items()]
     odd_grids = [g for g in grids if abs(g[1] - 2e-5) > 1e-9 and g[1] > 0]
     print(f"grid-step 2e-5 (1/5 pip): {len(grids) - len(odd_grids)}/{len(grids)} pairs; off-grid: {odd_grids[:6]}")

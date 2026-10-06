@@ -78,7 +78,7 @@ export interface FeedCalibration {
  */
 export function calibrateFromPoints(
   points: PricePoint[],
-  opts?: { blockLen?: number; source?: 'tick' | 'candle' },
+  opts?: { blockLen?: number; source?: 'tick' | 'candle'; driftNeutral?: boolean },
 ): FeedCalibration {
   const returns: number[] = []
   for (let i = 1; i < points.length; i++) {
@@ -90,9 +90,24 @@ export function calibrateFromPoints(
     const dt = (points[i].time - points[i - 1].time) * 1000
     if (dt > 0) intervalsMs.push(dt)
   }
+  // DRIFT-NEUTRAL calibration: subtract the mean return so the placebo
+  // pool carries NO net drift. Why it matters: the default calibration
+  // inherits the pair's own drift, so a drift-following strategy scores
+  // the SAME win rate on the placebo as on the real feed and the trial
+  // reads no_edge even when the drift is real and persistent (it is,
+  // on some OTC feeds - see the forensics battery). With driftNeutral
+  // the placebo is a fair-coin drift-free twin: a drift follower now
+  // has to BEAT luck on a flat feed, which is exactly the question
+  // "is the edge the drift itself?". Run BOTH nulls on any OTC strategy
+  // to see where its money comes from.
+  let pool = returns
+  if (opts?.driftNeutral && returns.length > 1) {
+    const mu = returns.reduce((a, b) => a + b, 0) / returns.length
+    pool = returns.map((r) => r - mu)
+  }
   return {
     p0: points.length ? points[points.length - 1].price : 1,
-    returns,
+    returns: pool,
     intervalsMs,
     blockLen: Math.max(2, Math.min(32, opts?.blockLen ?? 8)),
     source: opts?.source ?? 'candle',
@@ -108,9 +123,9 @@ export function calibrateFromPoints(
  * bootstraps each bar's close-to-close return TOGETHER WITH its wick
  * profile, so synthetic bars keep realistic high/low shape.
  */
-export function calibrateFromCandles(candles: Candle[], opts?: { blockLen?: number }): FeedCalibration {
+export function calibrateFromCandles(candles: Candle[], opts?: { blockLen?: number; driftNeutral?: boolean }): FeedCalibration {
   const points: PricePoint[] = candles.map((c) => ({ time: c.time, price: c.close }))
-  const cal = calibrateFromPoints(points, { blockLen: opts?.blockLen ?? 4, source: 'candle' })
+  const cal = calibrateFromPoints(points, { blockLen: opts?.blockLen ?? 4, source: 'candle', driftNeutral: opts?.driftNeutral })
   return { ...cal, srcCandles: [...candles] }
 }
 

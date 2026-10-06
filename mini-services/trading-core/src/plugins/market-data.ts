@@ -785,6 +785,23 @@ export class MarketDataService {
    * it used (dataSource) so the UI can label the result honestly instead of
    * implying raw tick data when it is really candle-close data.
    */
+  /**
+   * LAZY sidecar pull for assets this kernel process never warmed (e.g.
+   * OTC forensics on an arbitrary pair the UI never opened). One sidecar
+   * /candles round trip, capped at IQ's 1000-per-call. No caching - the
+   * caller paces itself; the sidecar's global lock stays fair.
+   */
+  async fetchSidecarCandles(asset: string, tf: Timeframe, limit: number): Promise<Candle[]> {
+    try {
+      const tfSec = TIMEFRAME_SECONDS[tf] ?? 60
+      const url = `${this.liveUrl.replace(/\/$/, '')}/candles?asset=${encodeURIComponent(asset)}&size=${Math.min(1000, Math.max(100, Math.floor(limit)))}&tf=${tfSec}`
+      const res = await fetch(url, { signal: AbortSignal.timeout(20_000) }).then((r) => r.json()) as { ok?: boolean; candles?: Candle[] }
+      return (res?.candles ?? []).filter((c) => c && Number.isFinite(Number(c.time)) && Number.isFinite(Number(c.close)))
+    } catch {
+      return []
+    }
+  }
+
   async getTickSeries(asset: string): Promise<{ points: { time: number; price: number }[]; dataSource: 'tick' | 'candle' }> {
     if (this.mode === 'live') {
       try {

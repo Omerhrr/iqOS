@@ -307,6 +307,90 @@ const httpServer = createServer(async (req, res) => {
         return json(200, { ok: true, config: guard.getConfig() })
       }
 
+      // OTC FEED FORENSICS - the fair-coin drift probe. The placebo trial
+      // (above) can never see a persistent drift: its synthetic twins
+      // inherit the pair's own return pool, so drift is calibrated away by
+      // construction. This route asks the complementary question directly:
+      // does the candle direction deviate from 50/50, and is that deviation
+      // PERSISTENT (hour after hour)? A drifting OTC feed is the one place
+      // where "predict the next move" has an honest yes answer - and the
+      // drift-follower rule that exploits it needs THIS test + a
+      // drift-neutral placebo run, not TA.
+      if (path === '/otc_forensics') {
+        const asset = q.get('asset') ?? market.activeAsset
+        const tfv = (q.get('tf') ?? '1m') as Timeframe
+        const limit = Math.max(300, Math.min(5000, Number(q.get('limit') ?? 2000)))
+        // FORENSICS MUST READ THE BROKER'S OWN FEED: kernel memory can hold
+        // sim-seeded history for never-watched assets (fresh boot = sim feed
+        // until adoption), which would poison the probe. Sidecar first,
+        // memory only as fallback.
+        let candles = await market.fetchSidecarCandles(asset, tfv, limit)
+        if (candles.length < 300) candles = market.getCandles(asset, tfv, limit)
+        if (candles.length < 300) {
+          return json(400, { ok: false, error: `thin history on ${asset} ${tfv} (${candles.length} candles) - warm the feed first` })
+        }
+        const n = candles.length
+        const upCC = candles.slice(1).filter((c, i) => c.close > candles[i].close).length / (n - 1)
+        const upOC = candles.filter((c) => c.close > c.open).length / n
+        const z = (r: number, m: number) => (r - 0.5) / Math.sqrt(0.25 / m)
+        const zCC = z(upCC, n - 1)
+        const zOC = z(upOC, n)
+        // rolling regime: last 500 candles
+        const roll = candles.slice(-500)
+        const upRoll = roll.slice(1).filter((c, i) => c.close > roll[i].close).length / (roll.length - 1)
+        // hourly persistence: per-hour up-rate z's, sign consistency
+        const byHour = new Map<number, { up: number; n: number }>()
+        for (let i = 1; i < n; i++) {
+          const h = Math.floor(candles[i].time / 3600)
+          const b = byHour.get(h) ?? { up: 0, n: 0 }
+          b.n++
+          if (candles[i].close > candles[i - 1].close) b.up++
+          byHour.set(h, b)
+        }
+        const hours = [...byHour.values()].filter((b) => b.n >= 30)
+        const hz = hours.map((b) => z(b.up / b.n, b.n))
+        // 60-candle hours only give a true 0.41-drift hourly z ~ -1.4, so an
+        // 'extreme hour' bar of 2.0 would never fire - judge persistence by
+        // SIGN CONSISTENCY across hours, not per-hour extremity
+        const negFrac = hz.filter((v) => v < 0).length / Math.max(1, hz.length)
+        const posFrac = 1 - negFrac
+        const consistent = hz.length >= 8 && (negFrac >= 0.6 || posFrac >= 0.6)
+        // dominant price grid: the COARSEST candidate covering >=95% of
+        // closes (finest-first would always match a dust-level grid)
+        let grid = 0
+        let gridCov = 0
+        for (const g of [1e-3, 5e-4, 2e-4, 1e-4, 5e-5, 2e-5, 1e-5, 5e-6, 2e-6, 1e-6]) {
+          const cov = candles.filter((c) => Math.abs(Math.round(c.close / g) * g - c.close) < 1e-9).length / n
+          if (cov >= 0.95) {
+            grid = g
+            gridCov = cov
+            break
+          }
+        }
+        const drift =
+          Math.abs(zCC) >= 4 && Math.sign(upRoll - 0.5) === Math.sign(zCC) && consistent
+            ? zCC < 0 ? 'drift_down' : 'drift_up'
+            : Math.abs(zCC) >= 2.5 ? 'suggestive' : 'none'
+        const breakeven = 100 / 1.82 // worst-case payout 0.82 -> win rate needed
+        return json(200, {
+          ok: true,
+          asset, tf: tfv, n,
+          upRateClose: +upCC.toFixed(4), zClose: +zCC.toFixed(2),
+          upRateOpen: +upOC.toFixed(4), zOpen: +zOC.toFixed(2),
+          rolling500: { upRate: +upRoll.toFixed(4), z: +z(upRoll, roll.length - 1).toFixed(2) },
+          persistence: { hours: hours.length, negFrac: +negFrac.toFixed(2), posFrac: +posFrac.toFixed(2), consistent },
+          lattice: { grid, gridCov: +gridCov.toFixed(4) },
+          drift,
+          summary:
+            drift === 'drift_down' || drift === 'drift_up'
+              ? `PERSISTENT ${drift === 'drift_down' ? 'DOWN' : 'UP'} drift: ${((drift === 'drift_down' ? 1 - upCC : upCC) * 100).toFixed(1)}% of candles settle ${drift === 'drift_down' ? 'down' : 'up'} (z ${zCC.toFixed(1)}), rolling-500 agrees, hourly signs ${Math.max(negFrac, posFrac) * 100 | 0}% consistent. A drift-following rule bets the majority side; needs a DRIFT-NEUTRAL placebo to validate, and a live re-check each session - generator regimes can end without notice.`
+              : drift === 'suggestive'
+                ? `Mild ${zCC < 0 ? 'down' : 'up'} bias (z ${zCC.toFixed(1)}) - not persistent enough to trade; keep monitoring.`
+                : `No fair-coin deviation worth trading: ${(Math.max(upCC, 1 - upCC) * 100).toFixed(1)}% majority side vs ${breakeven.toFixed(1)}% breakeven at 0.82 payout.`,
+          testedAt: Math.floor(Date.now() / 1000),
+        })
+      }
+
       if (path === '/analysis') {
         const asset = q.get('asset') ?? market.activeAsset
         const timeframe = tf(q.get('tf'))
@@ -747,6 +831,7 @@ const httpServer = createServer(async (req, res) => {
             expiryBars: body.expiryBars !== undefined ? Number(body.expiryBars) : undefined,
             limit: body.limit !== undefined ? Number(body.limit) : undefined,
             seedBase: body.seedBase !== undefined ? Number(body.seedBase) : undefined,
+            driftNeutral: body.driftNeutral === undefined ? undefined : !!body.driftNeutral,
           })
           return json(200, report satisfies OtcDefenseReport)
         } catch (err) {

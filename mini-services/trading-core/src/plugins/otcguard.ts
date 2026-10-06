@@ -72,7 +72,7 @@ export interface OtcDefenseReport {
   edgeZ: number
   real: { winRate: number; totalTrades: number; profitFactor: number; expectancy: number; netPnl: number }
   placebo: { series: number; winRateMean: number; winRateStd: number; winRateP95: number; expectancyMean: number }
-  calibration: { source: 'tick' | 'candle'; n: number; blockLen: number; seedBase: number; meanAbsStep: number; excessKurtosis: number }
+  calibration: { source: 'tick' | 'candle'; n: number; blockLen: number; seedBase: number; meanAbsStep: number; excessKurtosis: number; driftNeutral: boolean }
   /** Where the tested candles came from: 'live' (real broker feed) or 'sim'
    *  (the sandbox market simulator). A verdict on sim data says something
    *  about the SIMULATOR's structure, not about any real OTC feed - re-run
@@ -148,6 +148,12 @@ export class OtcGuardService {
     expiryBars?: number
     limit?: number
     seedBase?: number
+    /** Calibrate the placebo on DRIFT-NEUTRAL returns (mean subtracted).
+     *  Default placebo inherits the pair's own drift, so drift-following
+     *  strategies always read no_edge against it. Run the trial BOTH ways:
+     *  default null answers "does the strategy beat its own feed's luck?",
+     *  driftNeutral null answers "is the edge the feed's drift itself?". */
+    driftNeutral?: boolean
   }): Promise<OtcDefenseReport> {
     const market = this.ctx.use<MarketDataService>('market')
     const asset = String(input.asset || market.activeAsset)
@@ -169,7 +175,18 @@ export class OtcGuardService {
     }
 
     // ---- real side ----
-    const realCandles = market.getCandles(asset, tf, limit)
+    // OTC trials MUST read the broker's own feed: kernel memory can hold
+    // sim-seeded history for assets the UI never opened (fresh boot = sim
+    // feed until adoption), which would silently test the SIMULATOR. For
+    // any asset other than the active one, a fresh sidecar pull is the
+    // honest source; memory remains the fallback.
+    let realCandles: Candle[]
+    if (asset !== market.activeAsset) {
+      realCandles = await market.fetchSidecarCandles(asset, tf, Math.min(1000, limit))
+      if (realCandles.length < 120) realCandles = market.getCandles(asset, tf, limit)
+    } else {
+      realCandles = market.getCandles(asset, tf, limit)
+    }
     if (realCandles.length < 120) throw new Error(`thin history on ${asset} ${tf} (${realCandles.length} candles) - warm the feed first`)
     const real = fastBacktest(realCandles, strategyKey, input.params ?? {}, {
       payout,
@@ -199,7 +216,7 @@ export class OtcGuardService {
     let blockLen = 4
     let nPoints = 0 // tick path: points per generated twin (hoisted for the widen-retry)
     if (calSource === 'tick') {
-      calibration = calibrateFromPoints(calPoints, { blockLen: 8, source: 'tick' })
+      calibration = calibrateFromPoints(calPoints, { blockLen: 8, source: 'tick', driftNeutral: input.driftNeutral })
       blockLen = 8
       // points per candle so the aggregated twins match the real bar count
       const perCandle = Math.max(1, Math.round(realCandles.length / Math.max(1, Math.round((calPoints[calPoints.length - 1].time - calPoints[0].time) / tfSec))))
@@ -209,7 +226,7 @@ export class OtcGuardService {
         synthSeries.push(pointsToCandles(pts, tfSec))
       }
     } else {
-      calibration = calibrateFromCandles(realCandles, { blockLen: 8 })
+      calibration = calibrateFromCandles(realCandles, { blockLen: 8, driftNeutral: input.driftNeutral })
       blockLen = 8
       for (let i = 0; i < k; i++) {
         synthSeries.push(generateCandles(calibration, realCandles.length, (seedBase + i * 7919) >>> 0, tfSec))
@@ -303,6 +320,7 @@ export class OtcGuardService {
           : verdict === 'no_edge'
             ? `Real ${pct(real.winRate)} is statistically indistinguishable from the placebo mean ${pct(wrMean)} (+${edgeZ.toFixed(2)} sigma) - on this feed the strategy performs like luck${isOtc ? ', exactly what a generator-driven chart should produce' : ''}. TA claims are not supported here.`
             : `Only ${real.totalTrades} real trades (need ${this.config.minRealTrades}) - no verdict possible yet.`
+    if (input.driftNeutral) summary += ' [DRIFT-NEUTRAL placebo: an edge here means the strategy beats a drift-FREE twin of this feed - on a drifting OTC feed that is the honest test of whether the edge IS the drift]'
     if (market.mode === 'sim') summary += ' [SIMULATOR DATA - this verdict reflects the sim engine\'s own structure, not a real OTC feed; re-run on live data before trusting an "edge"]'
 
     const report: OtcDefenseReport = {
@@ -334,6 +352,7 @@ export class OtcGuardService {
         seedBase,
         meanAbsStep: calibration.stepStats.meanAbsStep,
         excessKurtosis: calibration.stepStats.excessKurtosis,
+        driftNeutral: !!input.driftNeutral,
       },
       dataMode: market.mode,
       config: this.getConfig(),
