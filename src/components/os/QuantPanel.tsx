@@ -459,7 +459,7 @@ function OtcDefenseCard({ asset, tf, strategies }: { asset: string; tf: string; 
         setReport(r)
         refreshStatus()
       })
-      .catch((e: Error) => setError(e.message.slice(0, 140)))
+      .catch((e: Error) => setError(e.message.slice(0, 300)))
       .finally(() => setBusy(false))
   }
 

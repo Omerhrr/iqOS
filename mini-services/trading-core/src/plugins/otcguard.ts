@@ -197,12 +197,13 @@ export class OtcGuardService {
     let calibration
     let synthSeries: Candle[][] = []
     let blockLen = 4
+    let nPoints = 0 // tick path: points per generated twin (hoisted for the widen-retry)
     if (calSource === 'tick') {
       calibration = calibrateFromPoints(calPoints, { blockLen: 8, source: 'tick' })
       blockLen = 8
       // points per candle so the aggregated twins match the real bar count
       const perCandle = Math.max(1, Math.round(realCandles.length / Math.max(1, Math.round((calPoints[calPoints.length - 1].time - calPoints[0].time) / tfSec))))
-      const nPoints = Math.min(8000, realCandles.length * perCandle + perCandle)
+      nPoints = Math.min(8000, realCandles.length * perCandle + perCandle)
       for (let i = 0; i < k; i++) {
         const pts = generatePoints(calibration, nPoints, (seedBase + i * 7919) >>> 0)
         synthSeries.push(pointsToCandles(pts, tfSec))
@@ -216,30 +217,72 @@ export class OtcGuardService {
     }
 
     // ---- placebo side: K synthetic twins, identical strategy ----
-    const winRates: number[] = []
-    const expectancies: number[] = []
-    for (const synthCandles of synthSeries) {
-      if (synthCandles.length < 120) continue
-      try {
-        const m = fastBacktest(synthCandles, strategyKey, input.params ?? {}, {
-          payout,
-          expiryBars: input.expiryBars,
-          customSpec,
-        })
-        if (m.totalTrades > 0) {
-          winRates.push(m.winRate)
-          expectancies.push(m.expectancy)
+    // Strict strategies can legitimately produce 0 trades on most random-walk
+    // twins, and one degenerate twin throwing shouldn't kill the trial - but
+    // BOTH cases used to be silently swallowed into a generic 400. Collect
+    // the failure reasons, widen the placebo panel once (3x twins, fresh
+    // seeds) when it comes up short, and only then fail with a DIAGNOSTIC
+    // message that says what actually happened on the real feed.
+    const collectPlacebo = (series: Candle[][]): { winRates: number[]; expectancies: number[]; zeroTrade: number; errors: string[] } => {
+      const winRates: number[] = []
+      const expectancies: number[] = []
+      let zeroTrade = 0
+      const errors: string[] = []
+      for (const synthCandles of series) {
+        if (synthCandles.length < 120) {
+          zeroTrade++
+          continue
         }
-      } catch {
-        // one degenerate twin shouldn't kill the trial
+        try {
+          const m = fastBacktest(synthCandles, strategyKey, input.params ?? {}, {
+            payout,
+            expiryBars: input.expiryBars,
+            customSpec,
+          })
+          if (m.totalTrades > 0) {
+            winRates.push(m.winRate)
+            expectancies.push(m.expectancy)
+          } else {
+            zeroTrade++
+          }
+        } catch (e) {
+          errors.push(e instanceof Error ? e.message.slice(0, 120) : String(e).slice(0, 120))
+        }
       }
+      return { winRates, expectancies, zeroTrade, errors }
     }
-    if (winRates.length < 4) throw new Error('placebo series produced too few runnable backtests - try a larger k or a warmer feed')
 
-    const wrMean = mean(winRates)
-    const wrStd = Math.max(std(winRates), 0.01) // floor: identical wr on every twin shouldn't zero the z-score
+    let placebo = collectPlacebo(synthSeries)
+    if (placebo.winRates.length < 4) {
+      // widen once: 3x twins with brand-new seeds - a strict strategy or an
+      // unlucky seed batch shouldn't sink the trial when more sampling fixes it
+      const wideK = Math.min(96, k * 3)
+      synthSeries = []
+      for (let i = 0; i < wideK; i++) {
+        const seed = (seedBase + 104729 + i * 7919) >>> 0
+        if (calSource === 'tick') {
+          const pts = generatePoints(calibration, nPoints, seed)
+          synthSeries.push(pointsToCandles(pts, tfSec))
+        } else {
+          synthSeries.push(generateCandles(calibration, realCandles.length, seed, tfSec))
+        }
+      }
+      placebo = collectPlacebo(synthSeries)
+    }
+    if (placebo.winRates.length < 4) {
+      const topError = placebo.errors[0] ? ` first twin error: "${placebo.errors[0]}"${placebo.errors.length > 1 ? ` (+${placebo.errors.length - 1} more)` : ''}` : ''
+      throw new Error(
+        `placebo panel too thin: ${placebo.winRates.length}/${synthSeries.length} twins produced trades ` +
+          `(${placebo.zeroTrade} zero-trade, ${placebo.errors.length} errored${topError}). ` +
+          `Real feed gave ${real.totalTrades} trades over ${realCandles.length} candles - ` +
+          `the strategy is likely too strict for this pair/tf (${tf}); try a lower tf, looser params, or a different strategy`,
+      )
+    }
+
+    const wrMean = mean(placebo.winRates)
+    const wrStd = Math.max(std(placebo.winRates), 0.01) // floor: identical wr on every twin shouldn't zero the z-score
     const edgeZ = (real.winRate - wrMean) / wrStd
-    const sorted = [...winRates].sort((a, b) => a - b)
+    const sorted = [...placebo.winRates].sort((a, b) => a - b)
     const wrP95 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))]
 
     let verdict: OtcVerdict
@@ -254,7 +297,7 @@ export class OtcGuardService {
     const pct = (x: number) => `${x.toFixed(1)}%`
     let summary =
       verdict === 'edge'
-        ? `Real ${pct(real.winRate)} beats the ${winRates.length}-twin placebo (mean ${pct(wrMean)}, p95 ${pct(wrP95)}) by ${edgeZ.toFixed(2)} sigma - performance is unlikely to be pure chance${isOtc ? ', even on this generator-driven feed' : ''}.`
+        ? `Real ${pct(real.winRate)} beats the ${placebo.winRates.length}-twin placebo (mean ${pct(wrMean)}, p95 ${pct(wrP95)}) by ${edgeZ.toFixed(2)} sigma - performance is unlikely to be pure chance${isOtc ? ', even on this generator-driven feed' : ''}.`
         : verdict === 'weak'
           ? `Real ${pct(real.winRate)} vs placebo mean ${pct(wrMean)} (+${edgeZ.toFixed(2)} sigma) - suggestive but under the ${this.config.minEdgeZ}σ 'edge' bar; treat as unproven.`
           : verdict === 'no_edge'
@@ -278,11 +321,11 @@ export class OtcGuardService {
         netPnl: real.netPnl,
       },
       placebo: {
-        series: winRates.length,
+        series: placebo.winRates.length,
         winRateMean: wrMean,
         winRateStd: wrStd,
         winRateP95: wrP95,
-        expectancyMean: mean(expectancies),
+        expectancyMean: mean(placebo.expectancies),
       },
       calibration: {
         source: calSource,
@@ -308,7 +351,7 @@ export class OtcGuardService {
       realTrades: real.totalTrades,
       placeboWrMean: wrMean,
       placeboWrStd: wrStd,
-      placeboSeries: winRates.length,
+      placeboSeries: placebo.winRates.length,
       calibrationSource: calSource,
       report,
     })
