@@ -38,6 +38,7 @@ import type { CustomSpec } from '../strategies/custom'
 import { normalizeSpec } from '../strategies/custom'
 import { fastBacktest } from '../strategies/optimize'
 import { calibrateFromCandles, calibrateFromPoints, generateCandles, generatePoints, pointsToCandles, tfSeconds } from '../analytics/synthfeed'
+import { loadOtcHarvest } from '../analytics/otcHarvest'
 
 export type OtcPolicy = 'enforce' | 'warn' | 'off'
 export type OtcVerdict = 'edge' | 'weak' | 'no_edge' | 'inconclusive'
@@ -78,6 +79,11 @@ export interface OtcDefenseReport {
    *  about the SIMULATOR's structure, not about any real OTC feed - re-run
    *  the defense on live data before trusting an 'edge' verdict. */
   dataMode: 'live' | 'sim'
+  /** Which link of the honest source chain won: 'sidecar' = pulled live from
+   *  the broker session, 'harvest' = the passive archive of REAL recorded
+   *  live feed (otc_harvester.py), 'active-feed' = kernel memory (can be sim
+   *  on a fresh boot for never-watched assets). */
+  dataSource: 'sidecar' | 'harvest' | 'active-feed'
   config: OtcConfig
   testedAt: number
   /** Human-readable one-liner: what the verdict means for this feed. */
@@ -177,17 +183,37 @@ export class OtcGuardService {
     // ---- real side ----
     // OTC trials MUST read the broker's own feed: kernel memory can hold
     // sim-seeded history for assets the UI never opened (fresh boot = sim
-    // feed until adoption), which would silently test the SIMULATOR. For
-    // any asset other than the active one, a fresh sidecar pull is the
-    // honest source; memory remains the fallback.
+    // feed until adoption), which would silently test the SIMULATOR. Source
+    // chain below: live sidecar pull > passive harvest archive (recorded
+    // REAL live feed) > kernel memory last of all.
     let realCandles: Candle[]
+    // Honest source chain, per asset role. The archive (harvest) is a RECORD
+    // of the real live feed, so it outranks kernel memory - memory can be
+    // sim-seeded on a fresh boot for assets the UI never watched.
+    let dataSource: 'sidecar' | 'harvest' | 'active-feed'
     if (asset !== market.activeAsset) {
       realCandles = await market.fetchSidecarCandles(asset, tf, Math.min(1000, limit))
-      if (realCandles.length < 120) realCandles = market.getCandles(asset, tf, limit)
+      dataSource = 'sidecar'
+      if (realCandles.length < 120) {
+        realCandles = loadOtcHarvest(asset, Math.min(2000, limit))
+        dataSource = 'harvest'
+      }
+      if (realCandles.length < 120) {
+        realCandles = market.getCandles(asset, tf, limit)
+        dataSource = 'active-feed'
+      }
     } else {
       realCandles = market.getCandles(asset, tf, limit)
+      dataSource = 'active-feed'
+      if (realCandles.length < 120) {
+        realCandles = loadOtcHarvest(asset, Math.min(2000, limit))
+        dataSource = 'harvest'
+      }
     }
-    if (realCandles.length < 120) throw new Error(`thin history on ${asset} ${tf} (${realCandles.length} candles) - warm the feed first`)
+    if (realCandles.length < 120)
+      throw new Error(
+        `thin history on ${asset} ${tf} (${realCandles.length} candles) - warm the feed first (open the chart, log into IQ, or run the otc harvester)`,
+      )
     const real = fastBacktest(realCandles, strategyKey, input.params ?? {}, {
       payout,
       expiryBars: input.expiryBars,
@@ -321,7 +347,8 @@ export class OtcGuardService {
             ? `Real ${pct(real.winRate)} is statistically indistinguishable from the placebo mean ${pct(wrMean)} (+${edgeZ.toFixed(2)} sigma) - on this feed the strategy performs like luck${isOtc ? ', exactly what a generator-driven chart should produce' : ''}. TA claims are not supported here.`
             : `Only ${real.totalTrades} real trades (need ${this.config.minRealTrades}) - no verdict possible yet.`
     if (input.driftNeutral) summary += ' [DRIFT-NEUTRAL placebo: an edge here means the strategy beats a drift-FREE twin of this feed - on a drifting OTC feed that is the honest test of whether the edge IS the drift]'
-    if (market.mode === 'sim') summary += ' [SIMULATOR DATA - this verdict reflects the sim engine\'s own structure, not a real OTC feed; re-run on live data before trusting an "edge"]'
+    if (dataSource === 'harvest') summary += ` [DATA: passive harvest archive - the recorded REAL live feed, most recent ${realCandles.length} bars]`
+    else if (market.mode === 'sim') summary += ' [SIMULATOR DATA - this verdict reflects the sim engine\'s own structure, not a real OTC feed; re-run on live data before trusting an "edge"]'
 
     const report: OtcDefenseReport = {
       ok: true,
@@ -354,7 +381,8 @@ export class OtcGuardService {
         excessKurtosis: calibration.stepStats.excessKurtosis,
         driftNeutral: !!input.driftNeutral,
       },
-      dataMode: market.mode,
+      dataMode: dataSource === 'sidecar' || dataSource === 'harvest' ? 'live' : market.mode,
+      dataSource,
       config: this.getConfig(),
       testedAt: Math.floor(Date.now() / 1000),
       summary,

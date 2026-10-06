@@ -273,6 +273,34 @@ export const STRATEGIES: StrategyDef[] = [
     },
   },
   {
+    id: 'drift-follower',
+    name: 'OTC Drift Follower',
+    description: 'Adaptive majority-side follower for OTC feeds: counts DECIDED settle direction (up vs down among non-flat transitions - flats are pushes in a binary trade and must not count as wins) over the last K candles and bets the dominant side only when the imbalance clears a binomial z-gate. Zero lookahead and self-disarming. Born from a 30-day / 83-pair audit: flat-heavy feeds (BONK 17.8% flats) make naive up-rate tests read phantom drift, and draw-counted-as-win backtests inflate majority-side win rate from ~41% (honest, LOSING at 0.82 payout) to ~59%. No harvested pair cleared the decided-side gate - this strategy stands down until a real imbalance appears.',
+    params: [
+      { key: 'k', label: 'Rolling window (bars)', type: 'number', min: 20, max: 2000, default: 500 },
+      { key: 'minZ', label: 'Min imbalance z', type: 'number', min: 0.5, max: 5, step: 0.1, default: 2 },
+    ],
+    evaluate: (candles, p) => {
+      const k = Math.max(10, Math.min(num(p, 'k', 500), candles.length - 1))
+      const closes = candles.slice(-k - 1).map((c) => c.close)
+      let up = 0
+      let down = 0
+      for (let i = 1; i < closes.length; i++) {
+        const d = closes[i] - closes[i - 1]
+        if (d > 0) up++
+        else if (d < 0) down++
+      }
+      const n = up + down
+      if (n < 10) return { direction: 'none', score: 0, notes: 'not enough settled bars' }
+      const upShare = up / n
+      const z = (upShare - 0.5) / Math.sqrt(0.25 / n) // binomial z vs fair coin
+      const minZ = num(p, 'minZ', 2)
+      if (z >= minZ) return { direction: 'call', score: clamp(40 + Math.abs(z) * 8, 40, 95), notes: `up ${(upShare * 100).toFixed(1)}% of ${n}, z +${z.toFixed(1)}` }
+      if (z <= -minZ) return { direction: 'put', score: clamp(40 + Math.abs(z) * 8, 40, 95), notes: `down ${((1 - upShare) * 100).toFixed(1)}% of ${n}, z ${z.toFixed(1)}` }
+      return { direction: 'none', score: 0, notes: `up ${(upShare * 100).toFixed(1)}% of ${n}, z ${z.toFixed(1)} < gate ${minZ}` }
+    },
+  },
+  {
     id: 'pattern-confluence',
     name: 'Pattern Confluence',
     description: 'Accumulates candlestick pattern bias over recent bars and trades meaningful clusters.',

@@ -2,8 +2,8 @@
 
 // IQAIR//OS - Quant lab panel: Hurst, vol models, ACF, Monte Carlo fan, S/R zones
 import { useEffect, useMemo, useState } from 'react'
-import type { AnalysisResult, Factor, OsModeStatus, OUVerdict, RandomnessAudit, OtcStatus, OtcConfig, OtcDefenseReport, OtcVerdictRow, OtcPolicy, StrategyInfo, Timeframe } from '@/lib/os/client'
-import { fmtPrice, getRandomnessAudit, getOtcStatus, getOtcVerdicts, getOtcConfig, setOtcConfig, runOtcDefense, osGet, osPost, TIMEFRAMES } from '@/lib/os/client'
+import type { AnalysisResult, Factor, OsModeStatus, OUVerdict, RandomnessAudit, OtcStatus, OtcConfig, OtcDefenseReport, OtcVerdictRow, OtcPolicy, OtcForensics, StrategyInfo, Timeframe } from '@/lib/os/client'
+import { fmtPrice, getRandomnessAudit, getOtcStatus, getOtcVerdicts, getOtcConfig, setOtcConfig, runOtcDefense, getOtcForensics, osGet, osPost, TIMEFRAMES } from '@/lib/os/client'
 import { StrategyPicker } from './BacktestLab'
 
 /** Small chip showing a factor's live contribution to the composite signal score. */
@@ -416,6 +416,122 @@ const POLICY_STYLE: Record<string, { color: string; bg: string }> = {
  * If real performance sits within the placebo distribution, the "edge" was
  * luck. Verdicts gate the autopilot/auto-trader under policy 'enforce'.
  */
+/** Fair-coin drift monitor over the broker's own OTC feed (/otc_forensics).
+ *  Tells the operator whether a drift regime is LIVE right now - the regime
+ *  the drift-follower builtin trades and the defense placebo must account
+ *  for. Regimes die without notice, so this is a monitor, not a signal. */
+function OtcForensicsCard({ asset }: { asset: string }) {
+  const [data, setData] = useState<OtcForensics | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const load = () => {
+    setBusy(true)
+    setError(null)
+    getOtcForensics(asset, '1m', 2000)
+      .then(setData)
+      .catch((e: Error) => {
+        setData(null)
+        setError(e.message.slice(0, 200))
+      })
+      .finally(() => setBusy(false))
+  }
+
+  useEffect(load, [asset])
+  // regime monitor: re-probe every 60s so a dead regime is seen fast
+  useEffect(() => {
+    const iv = setInterval(load, 60_000)
+    return () => clearInterval(iv)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [asset])
+
+  const isOtc = asset.toUpperCase().endsWith('-OTC')
+  const drift = data?.drift
+  const DRIFT_STYLE: Record<string, { label: string; color: string; bg: string }> = {
+    drift_up: { label: 'DRIFT UP', color: '#10b981', bg: 'rgba(16,185,129,0.12)' },
+    drift_down: { label: 'DRIFT DOWN', color: '#f43f5e', bg: 'rgba(244,63,94,0.12)' },
+    suggestive: { label: 'SUGGESTIVE', color: '#f59e0b', bg: 'rgba(245,158,11,0.12)' },
+    none: { label: 'NO DRIFT', color: '#7c8aa5', bg: 'rgba(124,138,165,0.12)' },
+  }
+  const ds = drift ? DRIFT_STYLE[drift] : null
+  const pct1 = (x: number) => `${(x * 100).toFixed(1)}%`
+  const live = drift === 'drift_up' || drift === 'drift_down'
+
+  return (
+    <div className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-3 xl:col-span-2">
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <h3 className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">
+          OTC Forensics · Drift Monitor
+          {ds && (
+            <span className="rounded px-1.5 py-0.5 font-mono text-[8px] font-bold uppercase tracking-wider" style={{ color: ds.color, background: ds.bg }}>
+              {ds.label}
+            </span>
+          )}
+        </h3>
+        <button
+          type="button"
+          onClick={load}
+          disabled={busy}
+          className="rounded border border-cyan-500/40 bg-cyan-500/10 px-2 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wider text-cyan-300 transition-colors hover:bg-cyan-500/20 disabled:opacity-50"
+        >
+          {busy ? 'probing…' : 're-probe'}
+        </button>
+      </div>
+      <p className="mb-2 text-[9px] leading-relaxed text-[#4b5a72]">
+        Fair-coin probe on the broker&apos;s own 1m feed - FLAT-AWARE: candles that close unchanged are pushes in a binary trade (EV 0), so directional drift is
+        measured on DECIDED transitions only. A heavy flat mass (e.g. BONK&apos;s 17.8%) makes a fair coin read as &apos;drift&apos; on the naive all-transitions up-rate -
+        this monitor does not make that mistake. The drift-follower builtin gates on the same decided-side statistic; regimes die without notice - re-probe
+        before every session.
+      </p>
+      {error && <p className="font-mono text-[10px] text-rose-400">{error}</p>}
+      {data && (
+        <>
+          <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 font-mono text-[11px] md:grid-cols-4">
+            <Stat
+              label="Decided split"
+              value={`${((1 - data.decided.upRate) * 100).toFixed(1)}% down`}
+              color={ds?.color}
+              note={`up ${(data.decided.upRate * 100).toFixed(1)}% · z ${data.decided.z >= 0 ? '+' : ''}${data.decided.z.toFixed(2)}σ`}
+            />
+            <Stat
+              label="Flat (push) rate"
+              value={`${(data.flatRate * 100).toFixed(1)}%`}
+              note={`closes that don't move · naive up-rate ${(data.upRateClose * 100).toFixed(1)}%`}
+            />
+            <Stat
+              label="Persistence"
+              value={`${data.persistence.hours}h ${data.persistence.consistent ? 'consistent' : 'mixed'}`}
+              color={data.persistence.consistent ? (live ? ds?.color : undefined) : '#f59e0b'}
+              note={`hourly neg ${pct1(data.persistence.negFrac)} / pos ${pct1(data.persistence.posFrac)}`}
+            />
+            <Stat
+              label="Price lattice"
+              value={data.lattice.grid > 0 ? data.lattice.grid.toExponential(0) : '—'}
+              note={data.lattice.grid > 0 ? `coverage ${pct1(data.lattice.gridCov)}` : 'no dominant grid'}
+            />
+          </div>
+          <p className="mt-2 border-t border-[#1c2739] pt-2 text-[10px] leading-relaxed" style={{ color: ds?.color ?? '#aab6cc' }}>
+            {data.summary}
+          </p>
+          {live && (
+            <p className="mt-1 font-mono text-[9px] text-[#4b5a72]">
+              regime live → try &apos;OTC Drift Follower&apos; in the Placebo Trial below (default null = does it beat its feed&apos;s luck; drift-neutral null = is the edge
+              the drift). Probed {new Date(data.testedAt * 1000).toLocaleTimeString()}
+              {data.dataSource && ` · data: ${data.dataSource === 'harvest' ? 'harvest archive (recorded real feed)' : data.dataSource}`}. Regimes die
+              without notice - re-probe before trading.
+            </p>
+          )}
+        </>
+      )}
+      {!data && !error && (
+        <p className="text-[10px] text-[#4b5a72]">
+          {isOtc ? 'Probing the feed…' : 'Non-OTC asset - the generator-drift probe only applies to -OTC pairs.'}
+        </p>
+      )}
+    </div>
+  )
+}
+
 function OtcDefenseCard({ asset, tf, strategies }: { asset: string; tf: string; strategies: StrategyInfo[] }) {
   const [strategyId, setStrategyId] = useState('confluence-core')
   // trial timeframe - follows the chart's tf by default but the operator can
@@ -577,7 +693,12 @@ function OtcDefenseCard({ asset, tf, strategies }: { asset: string; tf: string; 
             calibrated on {report.calibration.n} {report.calibration.source === 'tick' ? 'real sub-candle ticks' : 'candle closes'} · meanAbsStep{' '}
             {report.calibration.meanAbsStep.toExponential(3)} · excess kurtosis {report.calibration.excessKurtosis.toFixed(2)} · seedBase{' '}
             {report.calibration.seedBase} (reproducible)
-            {report.dataMode === 'sim' && (
+            {report.dataSource === 'harvest' && (
+              <span className="ml-1 rounded px-1 py-0.5 font-bold" style={{ color: '#10b981', background: 'rgba(16,185,129,0.12)' }}>
+                HARVEST ARCHIVE - recorded REAL live feed
+              </span>
+            )}
+            {report.dataMode === 'sim' && report.dataSource !== 'harvest' && (
               <span className="ml-1 rounded px-1 py-0.5 font-bold" style={{ color: '#f59e0b', background: 'rgba(245,158,11,0.12)' }}>
                 SIMULATOR DATA - verdict reflects sim structure, re-run on live feed
               </span>
@@ -770,6 +891,7 @@ export default function QuantPanel({ analysis, strategies = [] }: { analysis: An
       </div>
 
       <RandomnessAuditCard asset={analysis.asset} tf={analysis.tf} />
+      <OtcForensicsCard asset={analysis.asset} />
       <OtcDefenseCard asset={analysis.asset} tf={analysis.tf} strategies={strategies} />
     </div>
   )

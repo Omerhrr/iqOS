@@ -34,6 +34,7 @@ import { computeVolumeProfile, computeCandleDelta, computeCumulativeDelta } from
 import { findSmartBlends } from './src/analytics/candlemath'
 import { buildCalibrationReport, type CalibrationStoreSlice } from './src/analytics/calibration'
 import { computeStepStats, computeIntervalStats } from './src/analytics/randomness'
+import { loadOtcHarvest } from './src/analytics/otcHarvest'
 
 // Defaults to 3030 for local/Windows dev; the Docker deployment overrides
 // this to an unusual, hard-to-collide-with port via the KERNEL_PORT env var.
@@ -322,33 +323,76 @@ const httpServer = createServer(async (req, res) => {
         const limit = Math.max(300, Math.min(5000, Number(q.get('limit') ?? 2000)))
         // FORENSICS MUST READ THE BROKER'S OWN FEED: kernel memory can hold
         // sim-seeded history for never-watched assets (fresh boot = sim feed
-        // until adoption), which would poison the probe. Sidecar first,
-        // memory only as fallback.
+        // until adoption), which would poison the probe. Honest chain:
+        // live sidecar pull > passive harvest archive (recorded REAL live
+        // feed, minutes fresh via the harvester's live thread) > memory.
+        let dataSource: 'sidecar' | 'harvest' | 'active-feed'
         let candles = await market.fetchSidecarCandles(asset, tfv, limit)
-        if (candles.length < 300) candles = market.getCandles(asset, tfv, limit)
+        dataSource = 'sidecar'
         if (candles.length < 300) {
-          return json(400, { ok: false, error: `thin history on ${asset} ${tfv} (${candles.length} candles) - warm the feed first` })
+          candles = loadOtcHarvest(asset, limit)
+          dataSource = 'harvest'
+        }
+        if (candles.length < 300) {
+          candles = market.getCandles(asset, tfv, limit)
+          dataSource = 'active-feed'
+        }
+        if (candles.length < 300) {
+          return json(400, { ok: false, error: `thin history on ${asset} ${tfv} (${candles.length} candles) - warm the feed first (open the chart, log into IQ, or run the otc harvester)` })
         }
         const n = candles.length
-        const upCC = candles.slice(1).filter((c, i) => c.close > candles[i].close).length / (n - 1)
+        // TRANSITION CENSUS - flat-aware by design. An all-transitions up-rate
+        // confounds the FLAT-CANDLE MASS with drift: a feed where 17.8% of
+        // closes don't move (BONKUSD-OTC's 5e-6 grid) and decided moves are a
+        // perfect 50/50 coin still reads "up-rate 41%, z -7" vs the naive
+        // 50% bar. That false drift then flows into the tradeable backtest as
+        // flat=push (EV 0), not a win - the majority side wins only ~41% and
+        // LOSES at 0.82 payout. Directional drift must therefore be measured
+        // on DECIDED transitions only (up vs down among non-flats).
+        let upT = 0
+        let downT = 0
+        let flatT = 0
+        for (let i = 1; i < n; i++) {
+          const d = candles[i].close - candles[i - 1].close
+          if (d > 0) upT++
+          else if (d < 0) downT++
+          else flatT++
+        }
+        const T = n - 1
+        const upCC = upT / T
+        const flatRate = flatT / T
+        const dec = upT + downT
+        const decUp = upT / Math.max(1, dec)
         const upOC = candles.filter((c) => c.close > c.open).length / n
         const z = (r: number, m: number) => (r - 0.5) / Math.sqrt(0.25 / m)
-        const zCC = z(upCC, n - 1)
+        const zCC = z(upCC, T) // all-transitions z - KEPT FOR CONTINUITY ONLY, flat-confounded
+        const zDec = z(decUp, dec) // THE honest directional test
         const zOC = z(upOC, n)
-        // rolling regime: last 500 candles
+        // rolling regime: last 500 candles, decided-only
         const roll = candles.slice(-500)
-        const upRoll = roll.slice(1).filter((c, i) => c.close > roll[i].close).length / (roll.length - 1)
-        // hourly persistence: per-hour up-rate z's, sign consistency
-        const byHour = new Map<number, { up: number; n: number }>()
+        let rollUp = 0
+        let rollDown = 0
+        for (let i = 1; i < roll.length; i++) {
+          const d = roll[i].close - roll[i - 1].close
+          if (d > 0) rollUp++
+          else if (d < 0) rollDown++
+        }
+        const rollDec = rollUp + rollDown
+        const upRoll = rollUp / Math.max(1, rollDec)
+        const zRoll = z(upRoll, Math.max(1, rollDec))
+        // hourly persistence: per-hour DECIDED-side z's, sign consistency
+        const byHour = new Map<number, { up: number; down: number }>()
         for (let i = 1; i < n; i++) {
+          const d = candles[i].close - candles[i - 1].close
+          if (d === 0) continue
           const h = Math.floor(candles[i].time / 3600)
-          const b = byHour.get(h) ?? { up: 0, n: 0 }
-          b.n++
-          if (candles[i].close > candles[i - 1].close) b.up++
+          const b = byHour.get(h) ?? { up: 0, down: 0 }
+          if (d > 0) b.up++
+          else b.down++
           byHour.set(h, b)
         }
-        const hours = [...byHour.values()].filter((b) => b.n >= 30)
-        const hz = hours.map((b) => z(b.up / b.n, b.n))
+        const hours = [...byHour.entries()].filter(([, b]) => b.up + b.down >= 30)
+        const hz = hours.map(([, b]) => z(b.up / (b.up + b.down), b.up + b.down))
         // 60-candle hours only give a true 0.41-drift hourly z ~ -1.4, so an
         // 'extreme hour' bar of 2.0 would never fire - judge persistence by
         // SIGN CONSISTENCY across hours, not per-hour extremity
@@ -367,26 +411,31 @@ const httpServer = createServer(async (req, res) => {
             break
           }
         }
+        // Drift verdict: DECIDED-side z (flat-aware), rolling agreement +
+        // hourly sign consistency. The all-transitions zCC is reported for
+        // transparency but deliberately NOT used for the verdict.
         const drift =
-          Math.abs(zCC) >= 4 && Math.sign(upRoll - 0.5) === Math.sign(zCC) && consistent
-            ? zCC < 0 ? 'drift_down' : 'drift_up'
-            : Math.abs(zCC) >= 2.5 ? 'suggestive' : 'none'
+          Math.abs(zDec) >= 4 && Math.sign(zRoll) === Math.sign(zDec) && consistent
+            ? zDec < 0 ? 'drift_down' : 'drift_up'
+            : Math.abs(zDec) >= 2.5 ? 'suggestive' : 'none'
         const breakeven = 100 / 1.82 // worst-case payout 0.82 -> win rate needed
         return json(200, {
           ok: true,
-          asset, tf: tfv, n,
+          asset, tf: tfv, n, dataSource,
           upRateClose: +upCC.toFixed(4), zClose: +zCC.toFixed(2),
+          flatRate: +flatRate.toFixed(4),
+          decided: { share: +(dec / T).toFixed(4), upRate: +decUp.toFixed(4), z: +zDec.toFixed(2) },
           upRateOpen: +upOC.toFixed(4), zOpen: +zOC.toFixed(2),
-          rolling500: { upRate: +upRoll.toFixed(4), z: +z(upRoll, roll.length - 1).toFixed(2) },
+          rolling500: { upRate: +upRoll.toFixed(4), z: +zRoll.toFixed(2) },
           persistence: { hours: hours.length, negFrac: +negFrac.toFixed(2), posFrac: +posFrac.toFixed(2), consistent },
           lattice: { grid, gridCov: +gridCov.toFixed(4) },
           drift,
           summary:
             drift === 'drift_down' || drift === 'drift_up'
-              ? `PERSISTENT ${drift === 'drift_down' ? 'DOWN' : 'UP'} drift: ${((drift === 'drift_down' ? 1 - upCC : upCC) * 100).toFixed(1)}% of candles settle ${drift === 'drift_down' ? 'down' : 'up'} (z ${zCC.toFixed(1)}), rolling-500 agrees, hourly signs ${Math.max(negFrac, posFrac) * 100 | 0}% consistent. A drift-following rule bets the majority side; needs a DRIFT-NEUTRAL placebo to validate, and a live re-check each session - generator regimes can end without notice.`
+              ? `PERSISTENT ${drift === 'drift_down' ? 'DOWN' : 'UP'} drift on DECIDED moves: ${(decUp * 100).toFixed(1)}% of non-flat transitions settle ${drift === 'drift_down' ? 'down' : 'up'} (z ${zDec.toFixed(1)} over ${dec} decided), rolling-500 agrees, hourly signs ${Math.max(negFrac, posFrac) * 100 | 0}% consistent. Flat mass here is ${(flatRate * 100).toFixed(1)}% - all-transitions up-rate ${(upCC * 100).toFixed(1)}% OVERSTATES the lean. A drift-following rule bets the majority side of DECIDED moves; re-probe each session - generator regimes can end without notice.`
               : drift === 'suggestive'
-                ? `Mild ${zCC < 0 ? 'down' : 'up'} bias (z ${zCC.toFixed(1)}) - not persistent enough to trade; keep monitoring.`
-                : `No fair-coin deviation worth trading: ${(Math.max(upCC, 1 - upCC) * 100).toFixed(1)}% majority side vs ${breakeven.toFixed(1)}% breakeven at 0.82 payout.`,
+                ? `Mild decided-side ${zDec < 0 ? 'down' : 'up'} lean (z ${zDec.toFixed(1)} over ${dec} decided moves) - not persistent enough to trade; keep monitoring. Flat rate ${(flatRate * 100).toFixed(1)}%; all-transitions up-rate ${(upCC * 100).toFixed(1)}% (z ${zCC.toFixed(1)}) is flat-confounded, do not trade on it alone.`
+                : `No flat-aware directional drift: decided moves split ${(decUp * 100).toFixed(1)}/${((1 - decUp) * 100).toFixed(1)} (z ${zDec.toFixed(1)} over ${dec} decided) - the ${breakeven.toFixed(1)}% breakeven at 0.82 payout is out of reach. Flat rate ${(flatRate * 100).toFixed(1)}% explains the raw up-rate ${(upCC * 100).toFixed(1)}%: flats make a fair coin read as drift. ${Math.abs(zCC) >= 2.5 && Math.abs(zDec) < 2.5 ? 'The naive all-transitions test WOULD have flagged this pair - that flag was the flat-mass artifact.' : ''}`,
           testedAt: Math.floor(Date.now() / 1000),
         })
       }

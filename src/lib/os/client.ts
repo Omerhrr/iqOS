@@ -306,6 +306,8 @@ export interface OtcDefenseReport {
   calibration: { source: 'tick' | 'candle'; n: number; blockLen: number; seedBase: number; meanAbsStep: number; excessKurtosis: number }
   /** 'live' (real broker feed) or 'sim' (sandbox simulator) - a verdict on sim data reflects the sim's own structure, not a real OTC feed. */
   dataMode: 'live' | 'sim'
+  /** Which link of the honest source chain won: 'sidecar' = live broker pull, 'harvest' = recorded REAL live archive, 'active-feed' = kernel memory. */
+  dataSource?: 'sidecar' | 'harvest' | 'active-feed'
   config: OtcConfig
   testedAt: number
   summary: string
@@ -358,6 +360,33 @@ export async function getOtcConfig(): Promise<{ ok: boolean; config: OtcConfig }
 
 export async function setOtcConfig(patch: Partial<OtcConfig>): Promise<{ ok: boolean; config: OtcConfig }> {
   return osPost<{ ok: boolean; config: OtcConfig }>('/otc_config', patch)
+}
+
+/** /otc_forensics - fair-coin drift probe over the broker's own OTC feed. */
+export interface OtcForensics {
+  ok: boolean
+  asset: string
+  tf: string
+  n: number
+  upRateClose: number
+  zClose: number
+  /** share of transitions where close == previous close (flat = push in a binary trade) */
+  flatRate: number
+  /** the HONEST directional test: up vs down among NON-FLAT transitions only */
+  decided: { share: number; upRate: number; z: number }
+  upRateOpen: number
+  zOpen: number
+  rolling500: { upRate: number; z: number }
+  persistence: { hours: number; negFrac: number; posFrac: number; consistent: boolean }
+  lattice: { grid: number; gridCov: number }
+  drift: 'drift_up' | 'drift_down' | 'suggestive' | 'none'
+  dataSource?: 'sidecar' | 'harvest' | 'active-feed'
+  summary: string
+  testedAt: number
+}
+
+export async function getOtcForensics(asset: string, tf = '1m', limit = 2000): Promise<OtcForensics> {
+  return osGet<OtcForensics>('/otc_forensics', { asset, tf, limit })
 }
 
 export interface CompositeSignal {
