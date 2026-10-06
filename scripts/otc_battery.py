@@ -208,23 +208,34 @@ def digit_chi2(c: np.ndarray) -> dict:
 def drift_daily(c: np.ndarray, t: np.ndarray) -> dict:
     """THE fair-coin test the permutation nulls CANNOT see: they preserve
     the empirical return pool, so a persistent drift is calibrated away by
-    construction. This test compares candle direction to 0.5 directly and
-    checks PERSISTENCE (day after day), which is what makes a drift
-    tradeable rather than a one-off crash. Returns per-day binomial z's."""
+    construction. Compares candle direction to 0.5 and checks PERSISTENCE
+    (day after day), which is what makes a drift tradeable rather than a
+    one-off crash. DECIDED-only: flat closes (close == prev close) are
+    pushes in a binary trade (EV 0) - counting them in the denominator is
+    the flat-mass artifact that faked "BONK drift" (see Task 51 audit: 17.8%
+    flats turned a 49.6/50.4 fair coin into "up-rate 41%, z -7")."""
     up = (np.diff(c) > 0)
+    dn = (np.diff(c) < 0)
     day = (t[1:] // 86400).astype(np.int64)
     days = np.unique(day)
-    rates = np.array([up[day == dd].mean() for dd in days])
-    ns = np.array([int((day == dd).sum()) for dd in days])
-    zs = (rates - 0.5) / math.sqrt(0.25 / ns)
-    n_all = int(up.sum() + (~up).sum())
-    z_all = (up.mean() - 0.5) / math.sqrt(0.25 / n_all)
+    u = np.array([int((up & (day == dd)).sum()) for dd in days])
+    dnc = np.array([int((dn & (day == dd)).sum()) for dd in days])
+    dec = u + dnc
+    keep = dec >= 30  # a day needs enough decided moves for a meaningful z
+    days, dec = days[keep], dec[keep]
+    rates = u[keep] / dec
+    zs = (rates - 0.5) / np.sqrt(0.25 / dec)
+    n_all = int(dec.sum())
+    p_all = float(u.sum()) / max(1, n_all)
+    z_all = (p_all - 0.5) / math.sqrt(0.25 / n_all)
     # persistence: fraction of days with |z|>=3, and sign consistency of extremes
     ext = zs[np.abs(zs) >= 3]
     return {
-        "days": len(days), "z_all": round(float(z_all), 2),
+        "days": len(days), "decided": n_all, "dec_up_rate": round(p_all, 4),
+        "z_all": round(float(z_all), 2),
         "daily_mean_z": round(float(zs.mean()), 2),
-        "daily_min_rate": round(float(rates.min()), 4), "daily_max_rate": round(float(rates.max()), 4),
+        "daily_min_rate": round(float(rates.min()), 4) if len(rates) else None,
+        "daily_max_rate": round(float(rates.max()), 4) if len(rates) else None,
         "n_days_extreme": len(ext),
         "extreme_sign_consistent": bool(len(ext) >= 5 and (np.all(ext > 0) or np.all(ext < 0))),
     }
