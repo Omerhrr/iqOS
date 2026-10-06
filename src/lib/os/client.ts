@@ -1582,6 +1582,11 @@ export interface AutoTraderConfig {
   /** 'only' (default when unset) = trade ONLY the watchlist tickers. 'exclude'
    * = trade every open instrument EXCEPT the watchlist tickers - a deny-list. */
   watchlistMode?: 'only' | 'exclude'
+  /** Market-scope separation: 'all' (default) = real and -OTC feeds alike,
+   * 'real' = REAL exchange-traded feeds only, 'otc' = broker-generated -OTC
+   * feeds only. Keeps a config built for one feed family from ever firing on
+   * the other. */
+  marketScope?: 'all' | 'real' | 'otc'
   /** Scales the stake with signal confidence (0.5x-1.5x) instead of a flat
    * `stake` every trade. Default false. */
   smartStaking?: boolean

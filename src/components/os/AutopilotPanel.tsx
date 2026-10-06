@@ -980,15 +980,21 @@ function BotCard({
 
 /** Searchable multi-select for the Strategy auto-trader source. One pick =
  * trade that single strategy; two or more = an ensemble (every member votes,
- * majority direction wins). Mirrors WatchlistPicker's search+chip pattern. */
+ * majority direction wins). In `singleSelect` mode (SINGLE in the dialog's
+ * selection-mode control) clicking a strategy REPLACES the pick - the
+ * previously selected one is deselected - so a pool can never accumulate by
+ * accident; POOL mode keeps the toggle-many behavior. Mirrors WatchlistPicker's
+ * search+chip pattern. */
 function StrategyPicker({
   strategies,
   selected,
   onChange,
+  singleSelect = false,
 }: {
   strategies: StrategyInfo[]
   selected: string[]
   onChange: (ids: string[]) => void
+  singleSelect?: boolean
 }) {
   const [q, setQ] = useState('')
   const options = useMemo(() => {
@@ -1000,6 +1006,12 @@ function StrategyPicker({
   }, [strategies, q])
 
   const toggle = (id: string) => {
+    if (singleSelect) {
+      // SINGLE: one strategy at a time - picking one deselects the rest
+      // (clicking the picked one again clears the selection entirely).
+      onChange(selected.includes(id) ? [] : [id])
+      return
+    }
     onChange(selected.includes(id) ? selected.filter((x) => x !== id) : [...selected, id].slice(0, 8))
   }
 
@@ -1021,7 +1033,7 @@ function StrategyPicker({
       <Input
         value={q}
         onChange={(e) => setQ(e.target.value)}
-        placeholder="search strategies…"
+        placeholder={singleSelect ? 'search strategies… (picking one replaces the last)' : 'search strategies…'}
         className="h-7 border-[#1c2739] bg-[#0b111c] text-[11px] text-[#e2e8f0] placeholder:text-[#3d4c66]"
       />
       <div className="mt-1 flex max-h-28 flex-col gap-0.5 overflow-y-auto">
@@ -1047,12 +1059,18 @@ function StrategyPicker({
 /** "For THIS pair always use THIS strategy" - assigns a single strategy id
  * to a single ticker, bypassing the global strategyIds/ensemble/auto-learn
  * pool for that pair only. Built for "I studied strategy X in the AI Lab on
- * EURUSD but want it traded on GBPJPY" - each row here is one pin. */
+ * EURUSD but want it traded on GBPJPY" - each row here is one pin. Every pin
+ * is cross-checked against the rest of the config so a pin that can never
+ * actually trade says so right on the row (outside the pair restriction, or
+ * pointing at an instrument the connected account can't take options on). */
 function PairStrategyPicker({
   assets,
   strategies,
   value,
   onChange,
+  watchlist,
+  watchlistMode,
+  nonOptionTickers,
 }: {
   assets: AssetRow[]
   strategies: StrategyInfo[]
@@ -1065,6 +1083,12 @@ function PairStrategyPicker({
   // in the saved request body - the backend's own empty-object collapse
   // (sanitizePairStrategy) is what then turns {} into "no pins" there.
   onChange: (next: Record<string, string>) => void
+  watchlist: string[]
+  watchlistMode: 'only' | 'exclude'
+  /** Tickers the connected account cannot trade as options (CFD-only) - a
+   * pin on one is dead on arrival since the auto-trader only fires binary
+   * options. Empty in sim mode (everything is options-capable there). */
+  nonOptionTickers: Set<string>
 }) {
   const pins = value ?? {}
   const pinnedAssets = Object.keys(pins)
@@ -1083,6 +1107,17 @@ function PairStrategyPicker({
     onChange(next)
   }
 
+  /** Why this pin can never trade under the CURRENT config, or null. */
+  const pinConflict = (asset: string): string | null => {
+    if (nonOptionTickers.has(asset)) return 'not options-capable on this account (CFD-only) - the auto-trader only fires binary options, so this pin can never trade'
+    if (watchlist.length > 0) {
+      const inList = watchlist.includes(asset)
+      if (watchlistMode === 'only' && !inList) return 'outside the pair restriction below (Only trade these) - this pin is never evaluated'
+      if (watchlistMode === 'exclude' && inList) return 'on the Never-trade list below - this pin is never evaluated'
+    }
+    return null
+  }
+
   return (
     <div className="mt-2 rounded border border-[#1c2739] bg-[#0b1220] p-2">
       <p className="text-[10px] text-[#c7d2e3]">Per-pair strategy pins</p>
@@ -1090,25 +1125,29 @@ function PairStrategyPicker({
         Override the pool above for specific pairs - e.g. a strategy you studied on one pair in the AI Lab but want
         traded on a different one. A pinned pair ignores the global strategy/ensemble/auto-learn pick entirely and
         runs ONLY the strategy assigned here; if that strategy is later removed, the pair just sits out instead of
-        falling back to the pool.
+        falling back to the pool. Pinned pairs must also pass the pair restriction below to trade.
       </p>
       {pinnedAssets.length > 0 && (
         <div className="mt-2 space-y-1">
           {pinnedAssets.map((asset) => {
             const strat = strategies.find((s) => s.id === pins[asset])
+            const conflict = pinConflict(asset)
             return (
-              <div key={asset} className="flex items-center justify-between gap-2 rounded border border-[#141d2e] bg-[#0d1420] px-2 py-1">
-                <span className="truncate font-mono text-[10px] text-[#dbe4f0]">
-                  {asset} <span className="text-[#4b5a72]">→</span>{' '}
-                  <span className="text-cyan-300">{strat?.name ?? pins[asset]}</span>
-                </span>
-                <button
-                  type="button"
-                  onClick={() => removePin(asset)}
-                  className="shrink-0 rounded px-1.5 py-0.5 text-[9px] text-[#4b5a72] hover:bg-rose-500/20 hover:text-rose-300"
-                >
-                  ×
-                </button>
+              <div key={asset} className={`rounded border px-2 py-1 ${conflict ? 'border-amber-500/40 bg-amber-500/5' : 'border-[#141d2e] bg-[#0d1420]'}`}>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="truncate font-mono text-[10px] text-[#dbe4f0]">
+                    {asset} <span className="text-[#4b5a72]">→</span>{' '}
+                    <span className="text-cyan-300">{strat?.name ?? pins[asset]}</span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => removePin(asset)}
+                    className="shrink-0 rounded px-1.5 py-0.5 text-[9px] text-[#4b5a72] hover:bg-rose-500/20 hover:text-rose-300"
+                  >
+                    ×
+                  </button>
+                </div>
+                {conflict && <p className="mt-0.5 text-[8px] leading-snug text-amber-300/80">⚠ {conflict}</p>}
               </div>
             )
           })}
@@ -1124,6 +1163,7 @@ function PairStrategyPicker({
           {assets.map((a) => (
             <option key={a.ticker} value={a.ticker}>
               {a.ticker}
+              {nonOptionTickers.has(a.ticker) ? ' (CFD-only)' : ''}
             </option>
           ))}
         </select>
@@ -1178,9 +1218,10 @@ function DirectionStrategyPicker({
       <p className="text-[10px] text-[#c7d2e3]">Per-direction strategy pins</p>
       <p className="mt-0.5 text-[8px] leading-relaxed text-[#3d4c66]">
         Override the pool above by side - e.g. one strategy you trust for CALLs, a different one for PUTs. A pinned
-        side ignores the global strategy/ensemble/auto-learn pick entirely and only trades when THAT strategy's own
-        read agrees with the side it&apos;s assigned to; a per-pair pin above still wins over this for any pair it
-        covers. Leave a side on &quot;pool (default)&quot; to keep using the global pick for it.
+        side ignores the global strategy/ensemble/auto-learn pick entirely and only trades when THAT strategy&apos;s
+        own read agrees with the side it&apos;s assigned to; a per-pair pin above still wins over this for any pair it
+        covers. A side left on &quot;pool (default)&quot; keeps using the global pick for it - pinning only CALL still
+        lets the pool trade PUTs; clear the pool too if you want calls-only, period.
       </p>
       <div className="mt-2 grid grid-cols-2 gap-2">
         <label className="flex flex-col gap-0.5">
@@ -1222,10 +1263,17 @@ function WatchlistPicker({
   assets,
   selected,
   onChange,
+  nonOptionTickers,
 }: {
   assets: AssetRow[]
   selected: string[]
   onChange: (w: string[]) => void
+  /** Tickers that cannot trade binary/turbo options on the connected account
+   * (CFD-only: payout metadata reports nothing). Rendered dimmed + tagged,
+   * clicks refused - the auto-trader only ever fires binary options, so
+   * picking one would only manufacture guaranteed broker rejections. The
+   * bot editor omits this (bots have a CFD instrument type of their own). */
+  nonOptionTickers?: Set<string>
 }) {
   const [q, setQ] = useState('')
   const options = useMemo(() => {
@@ -1237,6 +1285,7 @@ function WatchlistPicker({
   }, [assets, q])
 
   const toggle = (t: string) => {
+    if (nonOptionTickers?.has(t)) return
     onChange(selected.includes(t) ? selected.filter((x) => x !== t) : [...selected, t].slice(0, 12))
   }
 
@@ -1248,7 +1297,12 @@ function WatchlistPicker({
             <button
               key={t}
               onClick={() => toggle(t)}
-              className="rounded bg-cyan-500/15 px-1.5 py-px font-mono text-[9px] text-cyan-300 hover:bg-rose-500/20 hover:text-rose-300"
+              title={nonOptionTickers?.has(t) ? 'CFD-only on this account - the auto-trader will skip it' : undefined}
+              className={`rounded px-1.5 py-px font-mono text-[9px] ${
+                nonOptionTickers?.has(t)
+                  ? 'bg-amber-500/10 text-amber-300/80 line-through hover:bg-rose-500/20 hover:text-rose-300'
+                  : 'bg-cyan-500/15 text-cyan-300 hover:bg-rose-500/20 hover:text-rose-300'
+              }`}
             >
               {t} ×
             </button>
@@ -1262,19 +1316,26 @@ function WatchlistPicker({
         className="h-7 border-[#1c2739] bg-[#0b111c] text-[11px] text-[#e2e8f0] placeholder:text-[#3d4c66]"
       />
       <div className="mt-1 flex max-h-24 flex-wrap gap-1 overflow-y-auto">
-        {options.map((a) => (
-          <button
-            key={a.ticker}
-            onClick={() => toggle(a.ticker)}
-            className={`rounded px-1.5 py-px font-mono text-[9px] transition-colors ${
-              selected.includes(a.ticker)
-                ? 'bg-cyan-500/25 text-cyan-200'
-                : 'bg-[#101828] text-[#7c8aa5] hover:bg-[#1c2739] hover:text-[#dbe4f0]'
-            }`}
-          >
-            {a.ticker}
-          </button>
-        ))}
+        {options.map((a) => {
+          const locked = nonOptionTickers?.has(a.ticker) ?? false
+          return (
+            <button
+              key={a.ticker}
+              onClick={() => toggle(a.ticker)}
+              title={locked ? 'CFD-only on this account - no binary/turbo options, the auto-trader skips it' : undefined}
+              className={`rounded px-1.5 py-px font-mono text-[9px] transition-colors ${
+                locked
+                  ? 'cursor-not-allowed bg-[#0d1420] text-[#3d4c66]'
+                  : selected.includes(a.ticker)
+                    ? 'bg-cyan-500/25 text-cyan-200'
+                    : 'bg-[#101828] text-[#7c8aa5] hover:bg-[#1c2739] hover:text-[#dbe4f0]'
+              }`}
+            >
+              {a.ticker}
+              {locked && <span className="ml-0.5 text-[7px] uppercase tracking-wider text-amber-400/60">cfd</span>}
+            </button>
+          )
+        })}
       </div>
     </div>
   )
@@ -1348,6 +1409,7 @@ const DEFAULT_AUTOTRADER_UI: AutoTraderConfig = {
   dailyProfitTarget: 0,
   dailyLossLimit: 0,
   watchlist: [],
+  marketScope: 'all',
 }
 
 function AutoTraderStrip({
@@ -1401,6 +1463,18 @@ function AutoTraderStrip({
                     : `score ≥${at.config.minScore}`}
           {' · '}{at.config.tf} ·{' '}
           {at.config.stakePlan ? `compound seed $${at.config.stakePlan.base}` : `$${at.config.stake}`} · max {at.config.maxOpen}
+          {at.config.marketScope === 'real' && <span className="text-emerald-400/80"> · REAL only</span>}
+          {at.config.marketScope === 'otc' && <span className="text-violet-400/80"> · OTC only</span>}
+          {at.config.signalSource === 'strategy' && (() => {
+            const ds = at.config.directionStrategy
+            const pinCount = Object.keys(at.config.pairStrategy ?? {}).length
+            const tags: string[] = []
+            if (ds?.call && ds?.put) tags.push(`CALL→${ds.call}/PUT→${ds.put}`)
+            else if (ds?.call) tags.push(`CALL→${ds.call}`)
+            else if (ds?.put) tags.push(`PUT→${ds.put}`)
+            if (pinCount) tags.push(`${pinCount} pair pin${pinCount > 1 ? 's' : ''}`)
+            return tags.length ? <span className="text-cyan-400/70"> · {tags.join(' · ')}</span> : null
+          })()}
         </span>
         <span className="ml-auto font-mono text-[9px] text-[#4b5a72]">
           {closed}t{wr !== null ? ` · ${wr}% wr` : ''} ·{' '}
@@ -1460,6 +1534,18 @@ function AutoTraderDialog({
   const [d, setD] = useState<AutoTraderConfig>(config)
   const [busy, setBusy] = useState(false)
   const p = (patch: Partial<AutoTraderConfig>) => setD((prev) => ({ ...prev, ...patch }))
+  // SINGLE vs POOL strategy selection. SINGLE = exactly one strategy runs
+  // every non-pinned pair (picking one replaces the last - what the picker
+  // always should have done; the old toggle-many picker silently turned a
+  // second click into an ENSEMBLE vote). POOL = the multi-member ensemble /
+  // auto-learn / auto-discover machinery. Derived once at open from the
+  // saved config (the dialog remounts on open via key={String(atOpen)}).
+  const savedPicks = config.strategyIds?.length ? config.strategyIds : config.strategyId ? [config.strategyId] : []
+  const [selMode, setSelMode] = useState<'single' | 'pool'>(savedPicks.length > 1 || config.autoDiscover ? 'pool' : 'single')
+  // Tickers the connected account can't trade as options (IQ payout metadata
+  // reports no binary/turbo payout = margin CFD-only). Sim-mode rows always
+  // carry a payout, so this stays empty on paper accounts.
+  const nonOptionTickers = useMemo(() => new Set(assets.filter((a) => a.payout === null).map((a) => a.ticker)), [assets])
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -1483,6 +1569,39 @@ function AutoTraderDialog({
             <Switch checked={d.enabled} onCheckedChange={(v) => p({ enabled: v })} />
           </div>
 
+          {/* ---------- MARKET ---------- */}
+          <div className="col-span-2 mt-1 flex items-center gap-2">
+            <span className="text-[9px] font-bold uppercase tracking-[0.18em] text-cyan-400/80">Market</span>
+            <span className="h-px flex-1 bg-[#1c2739]" />
+          </div>
+          <Segmented
+            label="Feed family"
+            options={[
+              { v: 'all', label: 'All' },
+              { v: 'real', label: 'Real only' },
+              { v: 'otc', label: 'OTC only' },
+            ]}
+            value={d.marketScope ?? 'all'}
+            onChange={(v) => p({ marketScope: v as AutoTraderConfig['marketScope'] })}
+          />
+          <div className="self-end text-[8px] leading-relaxed text-[#3d4c66]">
+            {d.marketScope === 'real'
+              ? 'REAL exchange-traded feeds only - every -OTC ticker is skipped. Signals, validations and pins earned on real charts stay on real charts.'
+              : d.marketScope === 'otc'
+                ? 'Broker-generated -OTC feeds only - no real pair can fire. The OTC placebo defense still applies on top.'
+                : 'No separation: real and -OTC pairs both trade. Split them if a config built for one family should never fire on the other.'}
+          </div>
+          <p className="col-span-2 rounded border border-[#1c2739] bg-[#0b1220] px-2 py-1.5 text-[8px] leading-relaxed text-[#3d4c66]">
+            Binary options only, always: the auto-trader fires 1-bar binary trades, so instruments the connected
+            account can&apos;t take options on (margin CFDs - most stocks/indices) are skipped before any evaluation -
+            no more &quot;not a turbo/binary/digital instrument&quot; rejection spam. {nonOptionTickers.size > 0 && `${nonOptionTickers.size} instrument(s) on this account are CFD-only.`}
+          </p>
+
+          {/* ---------- SIGNAL ---------- */}
+          <div className="col-span-2 mt-1 flex items-center gap-2">
+            <span className="text-[9px] font-bold uppercase tracking-[0.18em] text-cyan-400/80">Signal</span>
+            <span className="h-px flex-1 bg-[#1c2739]" />
+          </div>
           <div className="col-span-2">
             <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Signal source</Label>
             <div className="flex overflow-hidden rounded border border-[#1c2739]">
@@ -1523,6 +1642,27 @@ function AutoTraderDialog({
             </p>
           </div>
 
+          {/* source-specific thresholds live with the source that uses them */}
+          {d.signalSource === 'kalman-ou' && (
+            <>
+              <NumField label="OU entry |z| (σ)" value={d.zEntry} onChange={(v) => p({ zEntry: v })} step={0.1} />
+              <NumField label="Max half-life (bars)" value={d.maxHalfLife} onChange={(v) => p({ maxHalfLife: v })} />
+              <div className="col-span-2 flex items-center justify-between rounded border border-[#1c2739] bg-[#101828] px-2.5 py-1.5">
+                <div>
+                  <div className="text-[10px] font-semibold text-[#e2e8f0]">Require walk-forward validation</div>
+                  <div className="text-[8px] leading-snug text-[#4b5a72]">
+                    only trade pairs whose OU edge survives out-of-sample (OOS net +, most folds profitable, ≥25% efficiency) - verdicts cached 1h
+                  </div>
+                </div>
+                <Switch checked={d.requireValidation} onCheckedChange={(v) => p({ requireValidation: v })} />
+              </div>
+            </>
+          )}
+          {d.signalSource === 'markov' && <NumField label="Min P(up) threshold" value={d.minPUp} onChange={(v) => p({ minPUp: v })} step={0.01} />}
+          {d.signalSource === 'momentum' && <NumField label="Min ADX (trend strength)" value={d.minAdx} onChange={(v) => p({ minAdx: v })} />}
+          {d.signalSource !== 'strategy' && <NumField label="Min confidence" value={d.minConfidence} onChange={(v) => p({ minConfidence: v })} />}
+          {d.signalSource !== 'strategy' && <NumField label="Min |score|" value={d.minScore} onChange={(v) => p({ minScore: v })} />}
+
           {d.signalSource === 'strategy' && (() => {
             const picked = d.strategyIds?.length ? d.strategyIds : d.strategyId ? [d.strategyId] : []
             const isPool = picked.length > 1
@@ -1530,20 +1670,52 @@ function AutoTraderDialog({
             const only = picked.length === 1 ? strategies.find((s) => s.id === picked[0]) : undefined
             return (
               <div className="col-span-2">
-                <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">
-                  Strategy{isPool ? ` (${picked.length} picked)` : ''} - search to add, pick more than one to combine
-                </Label>
-                <StrategyPicker
-                  strategies={strategies}
-                  selected={picked}
-                  onChange={(ids) => p({ strategyIds: ids, strategyId: ids[0] })}
+                <Segmented
+                  label="Selection mode"
+                  options={[
+                    { v: 'single', label: 'Single strategy' },
+                    { v: 'pool', label: 'Pool (combine)' },
+                  ]}
+                  value={selMode}
+                  onChange={(v) => {
+                    if (v === 'single') {
+                      // ONE strategy: truncate any pool to the first pick and
+                      // kill auto-discover (it is a pool concept - it would
+                      // silently re-widen a "single" pick to the full catalog)
+                      setSelMode('single')
+                      p({ strategyIds: picked.slice(0, 1), strategyId: picked[0], autoDiscover: false })
+                    } else {
+                      setSelMode('pool')
+                    }
+                  }}
                 />
+                <div className="mt-1.5">
+                  <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">
+                    {selMode === 'single'
+                      ? 'Strategy - picking one deselects the last'
+                      : `Strategy pool${picked.length ? ` (${picked.length} picked)` : ' - search to add, pick 2+ to combine'}`}
+                  </Label>
+                  <StrategyPicker
+                    strategies={strategies}
+                    selected={picked}
+                    singleSelect={selMode === 'single'}
+                    onChange={(ids) => p({ strategyIds: ids, strategyId: ids[0] })}
+                  />
+                </div>
                 {picked.length === 0 && !d.autoDiscover && (
                   <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
-                    nothing picked yet - the auto-trader stands aside until at least one strategy is selected, or turn on
-                    auto-discover below to let it find its own.
+                    {selMode === 'single'
+                      ? 'no strategy picked yet - the auto-trader stands aside until you pick one (pair/direction pins below can still trade on their own).'
+                      : 'nothing picked yet - the auto-trader stands aside until at least one strategy is selected, or turn on auto-discover below to let it find its own.'}
                   </p>
                 )}
+                {selMode === 'single' && picked.length === 1 && (
+                  <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+                    SINGLE: &quot;{strategies.find((s) => s.id === picked[0])?.name ?? picked[0]}&quot; runs every pair the pins below
+                    don&apos;t claim. Switch to Pool to combine several strategies instead.
+                  </p>
+                )}
+                {selMode === 'pool' && (
                 <div className="mt-2 flex items-center justify-between gap-2 rounded border border-[#1c2739] bg-[#0b1220] p-2">
                   <div>
                     <p className="text-[10px] text-[#c7d2e3]">Auto-discover (full catalog + AI Lab mining)</p>
@@ -1558,11 +1730,15 @@ function AutoTraderDialog({
                     onCheckedChange={(v) => p(v ? { autoDiscover: true, strategyPickMode: 'best' } : { autoDiscover: false })}
                   />
                 </div>
+                )}
                 <PairStrategyPicker
                   assets={assets}
                   strategies={strategies}
                   value={d.pairStrategy}
                   onChange={(next) => p({ pairStrategy: next })}
+                  watchlist={d.watchlist}
+                  watchlistMode={d.watchlistMode ?? 'only'}
+                  nonOptionTickers={nonOptionTickers}
                 />
                 <DirectionStrategyPicker strategies={strategies} value={d.directionStrategy} onChange={(next) => p({ directionStrategy: next })} />
                 {only && (
@@ -1670,11 +1846,22 @@ function AutoTraderDialog({
             )
           })()}
 
+          {/* ---------- PAIRS ---------- */}
+          <div className="col-span-2 mt-1 flex items-center gap-2">
+            <span className="text-[9px] font-bold uppercase tracking-[0.18em] text-cyan-400/80">Pairs</span>
+            <span className="h-px flex-1 bg-[#1c2739]" />
+          </div>
           <div className="col-span-2">
             <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">
               Pair restriction {d.watchlist.length > 0 ? `(${d.watchlist.length} selected)` : '(GLOBAL - every open instrument)'}
             </Label>
-            <WatchlistPicker assets={assets} selected={d.watchlist} onChange={(w) => p({ watchlist: w })} />
+            <WatchlistPicker assets={assets} selected={d.watchlist} onChange={(w) => p({ watchlist: w })} nonOptionTickers={nonOptionTickers} />
+            {d.watchlist.some((t) => nonOptionTickers.has(t)) && (
+              <p className="mt-1 rounded border border-amber-500/30 bg-amber-500/5 px-2 py-1 text-[8px] leading-snug text-amber-300/80">
+                ⚠ {d.watchlist.filter((t) => nonOptionTickers.has(t)).length} selected pair(s) are CFD-only on this
+                account - they stay listed (struck through) but the auto-trader will never trade them.
+              </p>
+            )}
             {d.watchlist.length > 0 && (
               <Segmented
                 label="Apply as"
@@ -1695,40 +1882,11 @@ function AutoTraderDialog({
             </p>
           </div>
 
-          <div className="col-span-2 rounded border border-[#1c2739] bg-[#0b1220] p-2">
-            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Smarts</Label>
-            <div className="mt-1 grid grid-cols-1 gap-2 sm:grid-cols-2">
-              <div className="flex items-center justify-between gap-2">
-                <div>
-                  <p className="text-[10px] text-[#c7d2e3]">Confidence-weighted stake</p>
-                  <p className="text-[8px] leading-relaxed text-[#3d4c66]">size up on strong signals, down on weak ones (0.5x-1.5x) instead of a flat stake</p>
-                </div>
-                <Switch checked={d.smartStaking ?? false} onCheckedChange={(v) => p({ smartStaking: v })} />
-              </div>
-              <div className="flex items-center justify-between gap-2">
-                <div>
-                  <p className="text-[10px] text-[#c7d2e3]">Correlation guard</p>
-                  <p className="text-[8px] leading-relaxed text-[#3d4c66]">won&apos;t open a 2nd position in a pair correlated with one already open</p>
-                </div>
-                <Switch checked={d.correlationGuard ?? true} onCheckedChange={(v) => p({ correlationGuard: v })} />
-              </div>
-              <div className="flex items-center justify-between gap-2">
-                <div>
-                  <p className="text-[10px] text-[#c7d2e3]">Streak-breaker</p>
-                  <p className="text-[8px] leading-relaxed text-[#3d4c66]">benches a strategy on a pair after 3+ losses in a row, cooldown grows with the streak</p>
-                </div>
-                <Switch checked={d.streakBreaker ?? true} onCheckedChange={(v) => p({ streakBreaker: v })} />
-              </div>
-              <div className="flex items-center justify-between gap-2">
-                <div>
-                  <p className="text-[10px] text-[#c7d2e3]">Avoid dead hours</p>
-                  <p className="text-[8px] leading-relaxed text-[#3d4c66]">stands aside on non-OTC pairs 21:00-23:00 UTC, the thinnest FX liquidity window</p>
-                </div>
-                <Switch checked={d.avoidDeadHours ?? false} onCheckedChange={(v) => p({ avoidDeadHours: v })} />
-              </div>
-            </div>
+          {/* ---------- EXECUTION ---------- */}
+          <div className="col-span-2 mt-1 flex items-center gap-2">
+            <span className="text-[9px] font-bold uppercase tracking-[0.18em] text-cyan-400/80">Execution</span>
+            <span className="h-px flex-1 bg-[#1c2739]" />
           </div>
-
           <div>
             <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Signal timeframe</Label>
             <select
@@ -1797,7 +1955,6 @@ function AutoTraderDialog({
           ) : (
             <NumField label="Stake $" value={d.stake} onChange={(v) => p({ stake: v })} />
           )}
-          {d.signalSource !== 'strategy' && <NumField label="Min |score|" value={d.minScore} onChange={(v) => p({ minScore: v })} />}
 
           <Segmented
             label="Stake plan"
@@ -1886,28 +2043,11 @@ function AutoTraderDialog({
             </>
           )}
 
-          {d.signalSource === 'kalman-ou' && (
-            <>
-              <NumField label="OU entry |z| (σ)" value={d.zEntry} onChange={(v) => p({ zEntry: v })} step={0.1} />
-              <NumField label="Max half-life (bars)" value={d.maxHalfLife} onChange={(v) => p({ maxHalfLife: v })} />
-              <div className="col-span-2 flex items-center justify-between rounded border border-[#1c2739] bg-[#101828] px-2.5 py-1.5">
-                <div>
-                  <div className="text-[10px] font-semibold text-[#e2e8f0]">Require walk-forward validation</div>
-                  <div className="text-[8px] leading-snug text-[#4b5a72]">
-                    only trade pairs whose OU edge survives out-of-sample (OOS net +, most folds profitable, ≥25% efficiency) - verdicts cached 1h
-                  </div>
-                </div>
-                <Switch checked={d.requireValidation} onCheckedChange={(v) => p({ requireValidation: v })} />
-              </div>
-            </>
-          )}
-          {d.signalSource === 'markov' && (
-            <NumField label="Min P(up) threshold" value={d.minPUp} onChange={(v) => p({ minPUp: v })} step={0.01} />
-          )}
-          {d.signalSource === 'momentum' && (
-            <NumField label="Min ADX (trend strength)" value={d.minAdx} onChange={(v) => p({ minAdx: v })} />
-          )}
-          {d.signalSource !== 'strategy' && <NumField label="Min confidence" value={d.minConfidence} onChange={(v) => p({ minConfidence: v })} />}
+          {/* ---------- PROTECTION ---------- */}
+          <div className="col-span-2 mt-1 flex items-center gap-2">
+            <span className="text-[9px] font-bold uppercase tracking-[0.18em] text-cyan-400/80">Protection</span>
+            <span className="h-px flex-1 bg-[#1c2739]" />
+          </div>
           {(d.signalSource === 'screener' || d.signalSource === 'strategy') && (
             <div>
               <NumField
@@ -1922,6 +2062,39 @@ function AutoTraderDialog({
               </p>
             </div>
           )}
+          <div className="col-span-2 rounded border border-[#1c2739] bg-[#0b1220] p-2">
+            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Smarts</Label>
+            <div className="mt-1 grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <p className="text-[10px] text-[#c7d2e3]">Confidence-weighted stake</p>
+                  <p className="text-[8px] leading-relaxed text-[#3d4c66]">size up on strong signals, down on weak ones (0.5x-1.5x) instead of a flat stake</p>
+                </div>
+                <Switch checked={d.smartStaking ?? false} onCheckedChange={(v) => p({ smartStaking: v })} />
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <p className="text-[10px] text-[#c7d2e3]">Correlation guard</p>
+                  <p className="text-[8px] leading-relaxed text-[#3d4c66]">won&apos;t open a 2nd position in a pair correlated with one already open</p>
+                </div>
+                <Switch checked={d.correlationGuard ?? true} onCheckedChange={(v) => p({ correlationGuard: v })} />
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <p className="text-[10px] text-[#c7d2e3]">Streak-breaker</p>
+                  <p className="text-[8px] leading-relaxed text-[#3d4c66]">benches a strategy on a pair after 3+ losses in a row, cooldown grows with the streak</p>
+                </div>
+                <Switch checked={d.streakBreaker ?? true} onCheckedChange={(v) => p({ streakBreaker: v })} />
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <p className="text-[10px] text-[#c7d2e3]">Avoid dead hours</p>
+                  <p className="text-[8px] leading-relaxed text-[#3d4c66]">stands aside on non-OTC pairs 21:00-23:00 UTC, the thinnest FX liquidity window</p>
+                </div>
+                <Switch checked={d.avoidDeadHours ?? false} onCheckedChange={(v) => p({ avoidDeadHours: v })} />
+              </div>
+            </div>
+          </div>
           <NumField label="Max open" value={d.maxOpen} onChange={(v) => p({ maxOpen: v })} />
           <div>
             <NumField

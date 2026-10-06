@@ -280,6 +280,28 @@ export class MarketDataService {
     return this.sidecarAssets.has(sym) || this.sidecarAssets.has(ticker)
   }
 
+  /**
+   * Can this ticker actually be traded as an OPTION (binary/turbo) on the
+   * connected IQ account? IQ lists every instrument in its metadata, but only
+   * some carry a binary/turbo payout - margin CFDs (stocks, indices, many
+   * commodities) exist purely as CFDs, and an option order on them is always
+   * rejected with "is not a turbo/binary/digital instrument". The honest
+   * signal is the account's own payout map: binary/turbo payout reported =
+   * options-capable, null = CFD-only. Permissive while the metadata hasn't
+   * loaded yet (or in sim mode, where every universe instrument is
+   * options-capable by construction) - same "unknown -> don't hide anything"
+   * contract as isIQAvailable above, so a cold kernel never blind-drops
+   * candidates; the reactive broker-rejection path remains the backstop.
+   */
+  isOptionInstrument(ticker: string): boolean {
+    if (!this.sidecarPayouts || this.sidecarPayouts.size === 0) return true // sim mode / metadata not loaded yet
+    const a = this.assets.find((x) => x.ticker === ticker)
+    const sym = a?.iqairName ?? ticker
+    const pay = this.sidecarPayouts.get(sym) ?? this.sidecarPayouts.get(ticker)
+    // Not on the account at all, or on it with no binary/turbo payout (CFD-only)
+    return !!pay && pay.binary !== null
+  }
+
   /** Kick an immediate live poll for the active asset (used after /asset switch). */
   refreshActiveLive(): void {
     // force a candle rebuild for the NEW asset and hold ticks until it lands

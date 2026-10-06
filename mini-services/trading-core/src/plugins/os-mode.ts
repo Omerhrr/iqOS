@@ -218,6 +218,16 @@ export interface AutoTraderConfig {
    * a deny-list for a pair you've found unreliable or just don't want
    * touched, without having to hand-list every other pair you DO want. */
   watchlistMode?: 'only' | 'exclude'
+  /** Market-scope separation: which FEED FAMILY the auto-trader may touch.
+   * 'all' (default, the original behavior) - real and -OTC pairs alike.
+   * 'real' - REAL exchange-traded feeds only (-OTC tickers excluded):
+   * real microstructure, sessions, liquidity - where TA edges can exist.
+   * 'otc' - broker-generated -OTC feeds only: the generator's own market.
+   * The point is CONFLICT-FREE configs - a strategy validated on real EURUSD
+   * must never silently fire on EURUSD-OTC (a different, synthetic price
+   * series), and vice versa. Enforced in assetBlocked(), so every signal
+   * source, pin and watchlist mode funnels through the same gate. */
+  marketScope?: 'all' | 'real' | 'otc'
   /** Scales the stake with how strong THIS signal is, instead of every
    * trade risking the same flat `stake`. Uses the same 0-100 confidence
    * every source already reports on its ScreenRow (raw |score|-derived for
@@ -299,6 +309,7 @@ export const DEFAULT_AUTOTRADER: AutoTraderConfig = {
   dailyProfitTarget: 0,
   dailyLossLimit: 0,
   watchlist: [],
+  marketScope: 'all',
 }
 // stakePlan/planState intentionally omitted from DEFAULT_AUTOTRADER above
 // (undefined = fixed-stake, the original unconditional behavior)
@@ -486,6 +497,7 @@ export class ModeService {
           dailyLossLimit: num(c.dailyLossLimit, 0),
           watchlist: Array.isArray(c.watchlist) ? c.watchlist.filter((x): x is string => typeof x === 'string') : [],
           watchlistMode: c.watchlistMode === 'exclude' ? 'exclude' : 'only',
+          marketScope: c.marketScope === 'real' || c.marketScope === 'otc' ? c.marketScope : 'all',
           smartStaking: typeof c.smartStaking === 'boolean' ? c.smartStaking : false,
           correlationGuard: typeof c.correlationGuard === 'boolean' ? c.correlationGuard : true,
           streakBreaker: typeof c.streakBreaker === 'boolean' ? c.streakBreaker : true,
@@ -1288,16 +1300,28 @@ export class ModeService {
         // Precedence: a per-pair pin (pairStrategy) always wins - it's the
         // more specific intent ("regardless of direction, THIS pair always
         // trades THIS one strategy"). Otherwise, if a per-direction pin
-        // (directionStrategy) is configured for either side, this asset
-        // runs ONLY the assigned call-strategy and/or put-strategy instead
-        // of the global pool - directionPinned tracks that mode so the
+        // (directionStrategy) is configured, the pinned side(s) run ONLY
+        // their assigned strategy instead of the global pool - while any
+        // side left on "pool (default)" keeps using the global pool, exactly
+        // what the picker's own description promises (THE BUG this fixes:
+        // one pinned side used to bypass the pool for BOTH sides, so the
+        // unpinned side silently went dead - a CALL-only pin silently
+        // disabled every PUT signal). directionPinned tracks the mode so the
         // votes loop below knows to enforce "a call-slot strategy's vote
         // only counts if it actually said call" (and the put-slot
         // symmetrically), which an ordinary ensemble/pool vote never needs.
         const directionPinned = !pinnedId && hasDirOverrides
+        // PARTIAL pins: exactly one side pinned, the other on the pool. The
+        // pool members join the evaluation to own the unpinned side.
+        const partialDirPins = directionPinned && Boolean(dirStrategy!.call) !== Boolean(dirStrategy!.put)
         const dirIds = directionPinned ? Array.from(new Set([dirStrategy!.call, dirStrategy!.put].filter((x): x is string => Boolean(x)))) : []
-        const assetSpecs = pinnedId ? resolveMemberSpecs([pinnedId]) : directionPinned ? resolveMemberSpecs(dirIds) : liveSpecs
+        const assetSpecs = pinnedId
+          ? resolveMemberSpecs([pinnedId])
+          : directionPinned
+            ? resolveMemberSpecs(partialDirPins ? Array.from(new Set([...dirIds, ...ids])) : dirIds)
+            : liveSpecs
         if (!assetSpecs.length) continue
+        const assetOtc = asset.endsWith('-OTC')
         const votes: Array<{ id: string; direction: 'call' | 'put'; score: number }> = []
         let price = 0
         for (const s of assetSpecs) {
@@ -1330,31 +1354,82 @@ export class ModeService {
         if (!votes.length) continue
 
         if (directionPinned) {
-          // Never a majority vote: by construction above, at most one CALL
-          // vote (from the call-slot strategy) and at most one PUT vote
-          // (from the put-slot strategy) can ever be present, so there is
-          // no tie to break in the ordinary sense - just apply the global
-          // direction filter and, in the rare case BOTH sides fired this
-          // same tick (the two assigned strategies disagree), take whichever
-          // read the stronger edge.
-          let chosen: { id: string; direction: 'call' | 'put'; score: number } | null = null
-          for (const v of votes) {
-            if (this.config.direction !== 'both' && v.direction !== this.config.direction) continue
-            if (!chosen || Math.abs(v.score) > Math.abs(chosen.score)) chosen = v
+          // Two pin layouts:
+          //  - BOTH sides pinned: at most one CALL vote (from the call-slot
+          //    strategy) and at most one PUT vote can ever be present, so
+          //    there is no tie to break in the ordinary sense - apply the
+          //    global direction filter and, in the rare case BOTH fired this
+          //    same tick (the two assigned strategies disagree), take
+          //    whichever read has the stronger edge.
+          //  - ONE side pinned (other on "pool (default)"): the pinned side
+          //    fires only from its own strategy; the UNPINNED side falls
+          //    back to the global pool read the same way an unpinned config
+          //    would read it - a single pool member is that side's own read,
+          //    2+ members need a strict majority at the configured min
+          //    agreement %. An empty pool means the unpinned side simply
+          //    cannot fire - nothing is assigned to it. If both sides
+          //    produce a read, the stronger |score| wins.
+          const callSlot = dirStrategy!.call
+          const putSlot = dirStrategy!.put
+          /** Resolve ONE side's read: from its pinned slot when pinned, else
+           * from the pool votes (strict-majority ensemble read). */
+          const sideRead = (
+            side: 'call' | 'put'
+          ): { direction: 'call' | 'put'; id: string; score: number; note: string; confidence?: number } | null => {
+            const slotId = side === 'call' ? callSlot : putSlot
+            if (slotId) {
+              // the votes loop already dropped any slot vote that didn't
+              // match its side, so a found vote IS the side's own read
+              const v = votes.find((x) => x.id === slotId && x.direction === side)
+              return v
+                ? {
+                    direction: side,
+                    id: v.id,
+                    score: v.score,
+                    note: `direction-pinned: ${v.id} (${side.toUpperCase()}) on ${asset} (score ${Math.abs(v.score).toFixed(0)})`,
+                  }
+                : null
+            }
+            // unpinned side - pool fallback (unreachable with both sides pinned)
+            const poolVotes = votes.filter((v) => !dirIds.includes(v.id))
+            if (!poolVotes.length) return null
+            const sideVotes = poolVotes.filter((v) => v.direction === side)
+            if (!sideVotes.length) return null
+            if (poolVotes.length === 1) {
+              const v = sideVotes[0]
+              return { direction: side, id: v.id, score: v.score, note: `pool fallback: ${v.id} (${side.toUpperCase()}) on ${asset} (score ${Math.abs(v.score).toFixed(0)})` }
+            }
+            const agree = sideVotes.length > poolVotes.length - sideVotes.length
+            if (!agree) return null // pool tied or outvoted on this side
+            const agreementPct = Math.round((sideVotes.length / poolVotes.length) * 100)
+            if (agreementPct < this.config.minConfidence) return null
+            const avg = sideVotes.reduce((a, v) => a + Math.abs(v.score), 0) / sideVotes.length
+            const members = sideVotes.map((v) => v.id).join('+')
+            return {
+              direction: side,
+              id: `pool:${members}`,
+              score: avg,
+              confidence: agreementPct,
+              note: `pool fallback: ${members} agree ${side.toUpperCase()} on ${asset} (${agreementPct}% · avg ${avg.toFixed(0)})`,
+            }
           }
+          const callRead = sideRead('call')
+          const putRead = sideRead('put')
+          const chosen = callRead && putRead ? (Math.abs(callRead.score) >= Math.abs(putRead.score) ? callRead : putRead) : (callRead ?? putRead)
           if (!chosen) continue
-          const metric = Math.abs(chosen.score)
+          if (this.config.direction !== 'both' && chosen.direction !== this.config.direction) continue
           signalPool.push({
-            metric,
+            metric: Math.abs(chosen.score),
             row: ModeService.strategyEvalToScreenRow(
               asset,
               this.config.tf,
               chosen.direction,
               chosen.score,
               price,
-              `direction-pinned: ${chosen.id} (${chosen.direction.toUpperCase()}) on ${asset} (score ${Math.abs(chosen.score).toFixed(0)})`,
-              undefined,
-              chosen.id
+              chosen.note,
+              chosen.confidence,
+              chosen.id,
+              assetOtc
             ),
           })
           continue
@@ -1371,7 +1446,7 @@ export class ModeService {
           const note = pinnedId
             ? `pinned: ${v.id} on ${asset} (score ${Math.abs(v.score).toFixed(0)})`
             : `${v.id} score ${Math.abs(v.score).toFixed(0)}`
-          signalPool.push({ metric, row: ModeService.strategyEvalToScreenRow(asset, this.config.tf, v.direction, v.score, price, note, undefined, v.id) })
+          signalPool.push({ metric, row: ModeService.strategyEvalToScreenRow(asset, this.config.tf, v.direction, v.score, price, note, undefined, v.id, assetOtc) })
           continue
         }
 
@@ -1431,7 +1506,7 @@ export class ModeService {
             : `auto-learn: ${best.id} highest edge for ${asset} (score ${Math.abs(best.score).toFixed(0)}) - still building its own record`
           signalPool.push({
             metric,
-            row: ModeService.strategyEvalToScreenRow(asset, this.config.tf, best.direction, best.score, price, note, best.proven ? Math.round(best.rank) : undefined, best.id),
+            row: ModeService.strategyEvalToScreenRow(asset, this.config.tf, best.direction, best.score, price, note, best.proven ? Math.round(best.rank) : undefined, best.id, assetOtc),
           })
           continue
         }
@@ -1459,7 +1534,8 @@ export class ModeService {
             price,
             `ensemble ${majority.length}/${assetSpecs.length} agree (${majority.map((v) => v.id).join(', ')}) · avg ${avgScore.toFixed(0)}`,
             agreementPct,
-            `ensemble:${majority.map((v) => v.id).join('+')}`
+            `ensemble:${majority.map((v) => v.id).join('+')}`,
+            assetOtc
           ),
         })
       }
@@ -1474,8 +1550,12 @@ export class ModeService {
    * `note` carries the strategy-specific explanation shown in place of a
    * generic score/confidence (the member id(s) and what they said), and
    * `confidenceOverride` lets the ensemble path report agreement % instead
-   * of the single-strategy default of mirroring |score|. Screener-specific
-   * scalars are inert placeholders, as with confluenceToScreenRow above. */
+   * of the single-strategy default of mirroring |score|. `otc` is the REAL
+   * feed flag (THE BUG: this used to hardcode false, so every strategy-
+   * sourced signal on a -OTC pair claimed a real feed and silently bypassed
+   * the OTC placebo defense - the one gate that exists precisely because TA
+   * doesn't work on the generator). Screener-specific scalars are inert
+   * placeholders, as with confluenceToScreenRow above. */
   private static strategyEvalToScreenRow(
     asset: string,
     tf: Timeframe,
@@ -1484,13 +1564,14 @@ export class ModeService {
     price: number,
     note?: string,
     confidenceOverride?: number,
-    strategyLabel?: string
+    strategyLabel?: string,
+    otc?: boolean
   ): ScreenRow {
     return {
       asset,
       name: asset,
       category: 'forex',
-      otc: false,
+      otc: otc ?? false,
       tf,
       price,
       score,
@@ -1738,13 +1819,38 @@ export class ModeService {
   }
 
   /** Cooldown + one-auto-position-per-asset + optional watchlist restriction
-   * + correlation guard + streak-breaker bench + dead-hours filter, applied
-   * by every signal picker (all sources funnel through this). */
+   * + market-scope (real vs OTC) + options-capability + correlation guard +
+   * streak-breaker bench + dead-hours filter, applied by every signal picker
+   * (all sources funnel through this). */
   private assetBlocked(asset: string): boolean {
     if (this.config.watchlist.length > 0) {
       const inList = this.config.watchlist.includes(asset)
       const exclude = this.config.watchlistMode === 'exclude'
       if (exclude ? inList : !inList) return true
+    }
+    // MARKET SCOPE: keep the two feed families apart so a config built for
+    // one never fires on the other. Real feeds have sessions/microstructure;
+    // -OTC feeds are the broker's generator - a signal (or a validated edge,
+    // or a pin) earned on one family says nothing about the other. 'real'
+    // excludes every -OTC ticker; 'otc' admits nothing else.
+    if (this.config.marketScope === 'real' && asset.endsWith('-OTC')) return true
+    if (this.config.marketScope === 'otc' && !asset.endsWith('-OTC')) return true
+    // OPTIONS-CAPABILITY: the auto-trader only ever places binary options,
+    // but the candidate universe is every open instrument on the account -
+    // including margin CFDs (stocks, indices, many commodities) that IQ will
+    // only ever answer with "is not a turbo/binary/digital instrument".
+    // Screening those was pure alert noise: evaluate -> signal -> guaranteed
+    // rejection -> 10min cooldown -> repeat on the next tick. Skip them BEFORE
+    // any evaluation using the account's own payout metadata (CFD-only
+    // instruments report no binary/turbo payout). Permissive while metadata
+    // is cold (sim mode / sidecar still answering) - isOptionInstrument's
+    // "unknown -> don't hide anything" contract, with the reactive
+    // broker-rejection path as the backstop.
+    try {
+      const market = this.ctx.use<{ isOptionInstrument: (ticker: string) => boolean }>('market')
+      if (!market.isOptionInstrument(asset)) return true
+    } catch {
+      // market plugin not loaded - capability gating disabled
     }
     if (this.config.avoidDeadHours === true && !asset.endsWith('-OTC') && this.isDeadHour()) return true
     const rejectedUntil = this.assetRejectedUntil.get(asset) ?? 0
@@ -2047,6 +2153,7 @@ export class ModeService {
     if (patch.streakBreaker !== undefined) this.config.streakBreaker = Boolean(patch.streakBreaker)
     if (patch.avoidDeadHours !== undefined) this.config.avoidDeadHours = Boolean(patch.avoidDeadHours)
     if (patch.watchlistMode !== undefined) this.config.watchlistMode = patch.watchlistMode === 'exclude' ? 'exclude' : 'only'
+    if (patch.marketScope !== undefined) this.config.marketScope = patch.marketScope === 'real' || patch.marketScope === 'otc' ? patch.marketScope : 'all'
     if (patch.stakePlan !== undefined) {
       const planChanged = JSON.stringify(this.config.stakePlan ?? null) !== JSON.stringify(patch.stakePlan ?? null)
       this.config.stakePlan = this.parseStakePlan(patch.stakePlan, this.config.stakePlan)
@@ -2115,9 +2222,10 @@ export class ModeService {
     // saved value - a config saved at e.g. 60s would otherwise claim a
     // cooldown that assetBlocked() never actually applies
     const effectiveCooldown = Math.max(this.config.cooldownSec, ModeService.MIN_ASSET_COOLDOWN_SEC)
+    const scopeNote = this.config.marketScope === 'real' ? ' · REAL feeds only' : this.config.marketScope === 'otc' ? ' · OTC feeds only' : ''
     this.emit(
       'info',
-      `AUTO-TRADER config: ${this.config.enabled ? 'armed' : 'off'} · src ${this.config.signalSource}${srcDetail} · ${this.config.tf} · stake $${this.config.stake}${thresholds ? ` · ${thresholds}` : ''} · maxOpen ${this.config.maxOpen} · cooldown ${effectiveCooldown}s`
+      `AUTO-TRADER config: ${this.config.enabled ? 'armed' : 'off'} · src ${this.config.signalSource}${srcDetail} · ${this.config.tf} · stake $${this.config.stake}${thresholds ? ` · ${thresholds}` : ''} · maxOpen ${this.config.maxOpen} · cooldown ${effectiveCooldown}s${scopeNote} · binary options only (CFD-only instruments skipped)`
     )
     return { ok: true, config: { ...this.config } }
   }
