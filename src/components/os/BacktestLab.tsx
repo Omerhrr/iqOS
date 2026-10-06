@@ -95,7 +95,7 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 const selCls = 'h-8 rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-[#dbe4f0] outline-none'
 const inCls = 'h-8 border-[#1c2739] bg-[#101828] text-right font-mono text-[11px] text-[#dbe4f0]'
 
-function StrategyPicker({
+export function StrategyPicker({
   strategies,
   value,
   onChange,

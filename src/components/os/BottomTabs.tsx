@@ -319,7 +319,7 @@ export default function BottomTabs(props: BottomTabsProps) {
       {/* QUANT LAB (monte carlo · statistical profile · kalman-ou · s/r) */}
       <TabsContent value="quant" className="mt-0 min-h-0 flex-1 overflow-auto p-3">
         {props.analysis ? (
-          <QuantPanel analysis={props.analysis} />
+          <QuantPanel analysis={props.analysis} strategies={props.strategies} />
         ) : (
           <Empty text="Quant lab populates once the kernel streams analysis for the active instrument." />
         )}

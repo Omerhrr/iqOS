@@ -772,7 +772,7 @@ export default function OSPage() {
             <>
               <SignalPanel analysis={analysis} />
               <MarkovPanel markov={analysis.markov} />
-              <QuantPanel analysis={analysis} />
+              <QuantPanel analysis={analysis} strategies={strategies} />
             </>
           )}
           {ticket}

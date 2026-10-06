@@ -2,8 +2,9 @@
 
 // IQAIR//OS - Quant lab panel: Hurst, vol models, ACF, Monte Carlo fan, S/R zones
 import { useEffect, useMemo, useState } from 'react'
-import type { AnalysisResult, Factor, OsModeStatus, OUVerdict, RandomnessAudit, OtcStatus, OtcConfig, OtcDefenseReport, OtcVerdictRow, OtcPolicy } from '@/lib/os/client'
-import { fmtPrice, getRandomnessAudit, getOtcStatus, getOtcVerdicts, getOtcConfig, setOtcConfig, runOtcDefense, osGet, osPost } from '@/lib/os/client'
+import type { AnalysisResult, Factor, OsModeStatus, OUVerdict, RandomnessAudit, OtcStatus, OtcConfig, OtcDefenseReport, OtcVerdictRow, OtcPolicy, StrategyInfo, Timeframe } from '@/lib/os/client'
+import { fmtPrice, getRandomnessAudit, getOtcStatus, getOtcVerdicts, getOtcConfig, setOtcConfig, runOtcDefense, osGet, osPost, TIMEFRAMES } from '@/lib/os/client'
+import { StrategyPicker } from './BacktestLab'
 
 /** Small chip showing a factor's live contribution to the composite signal score. */
 function FactorBadge({ factor }: { factor?: Factor }) {
@@ -415,8 +416,14 @@ const POLICY_STYLE: Record<string, { color: string; bg: string }> = {
  * If real performance sits within the placebo distribution, the "edge" was
  * luck. Verdicts gate the autopilot/auto-trader under policy 'enforce'.
  */
-function OtcDefenseCard({ asset, tf }: { asset: string; tf: string }) {
+function OtcDefenseCard({ asset, tf, strategies }: { asset: string; tf: string; strategies: StrategyInfo[] }) {
   const [strategyId, setStrategyId] = useState('confluence-core')
+  // trial timeframe - follows the chart's tf by default but the operator can
+  // pick any timeframe independently (a strategy may only make sense on one tf)
+  const [tfSel, setTfSel] = useState<Timeframe>((TIMEFRAMES as string[]).includes(tf) ? (tf as Timeframe) : '1m')
+  useEffect(() => {
+    if ((TIMEFRAMES as string[]).includes(tf)) setTfSel(tf as Timeframe)
+  }, [tf])
   const [status, setStatus] = useState<OtcStatus | null>(null)
   const [config, setConfig] = useState<OtcConfig | null>(null)
   const [report, setReport] = useState<OtcDefenseReport | null>(null)
@@ -447,7 +454,7 @@ function OtcDefenseCard({ asset, tf }: { asset: string; tf: string }) {
     setBusy(true)
     setError(null)
     setReport(null)
-    runOtcDefense({ asset, strategyId, tf })
+    runOtcDefense({ asset, strategyId, tf: tfSel })
       .then((r) => {
         setReport(r)
         refreshStatus()
@@ -513,15 +520,22 @@ function OtcDefenseCard({ asset, tf }: { asset: string; tf: string }) {
         the placebo to count as an edge. Under &apos;enforce&apos;, bots and the auto-trader are blocked on OTC pairs without a fresh passing verdict.
       </p>
       <div className="mb-2 flex flex-wrap items-center gap-2">
-        <input
-          value={strategyId}
-          onChange={(e) => setStrategyId(e.target.value)}
-          spellCheck={false}
-          className="w-44 rounded border border-[#1c2739] bg-[#070b12] px-2 py-1 font-mono text-[10px] text-[#aab6cc] outline-none focus:border-cyan-500/50"
-          placeholder="strategy id or custom:<id>"
-        />
+        {/* searchable dropdown over builtins + AI Lab specs (custom:<id>) */}
+        <StrategyPicker strategies={strategies} value={strategyId} onChange={setStrategyId} width="w-48" />
+        <select
+          value={tfSel}
+          onChange={(e) => setTfSel(e.target.value as Timeframe)}
+          title="timeframe the trial runs on"
+          className="h-8 rounded border border-[#1c2739] bg-[#101828] px-1.5 font-mono text-[11px] text-[#dbe4f0] outline-none focus:border-cyan-500/50"
+        >
+          {TIMEFRAMES.map((t) => (
+            <option key={t} value={t}>
+              {t}
+            </option>
+          ))}
+        </select>
         <span className="font-mono text-[9px] text-[#4b5a72]">
-          tf {tf} · {config ? `k=${config.seriesK} · minEdgeZ ${config.minEdgeZ}σ · TTL ${config.ttlDays}d` : ''}
+          {config ? `k=${config.seriesK} · minEdgeZ ${config.minEdgeZ}σ · TTL ${config.ttlDays}d` : ''}
         </span>
       </div>
       {error && <p className="font-mono text-[10px] text-rose-400">{error}</p>}
@@ -604,7 +618,7 @@ function OtcDefenseCard({ asset, tf }: { asset: string; tf: string }) {
   )
 }
 
-export default function QuantPanel({ analysis }: { analysis: AnalysisResult | null }) {
+export default function QuantPanel({ analysis, strategies = [] }: { analysis: AnalysisResult | null; strategies?: StrategyInfo[] }) {
   if (!analysis) return null
   const q = analysis.quant
   const mc = analysis.montecarlo
@@ -756,7 +770,7 @@ export default function QuantPanel({ analysis }: { analysis: AnalysisResult | nu
       </div>
 
       <RandomnessAuditCard asset={analysis.asset} tf={analysis.tf} />
-      <OtcDefenseCard asset={analysis.asset} tf={analysis.tf} />
+      <OtcDefenseCard asset={analysis.asset} tf={analysis.tf} strategies={strategies} />
     </div>
   )
 }
