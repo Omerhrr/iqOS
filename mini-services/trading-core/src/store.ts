@@ -364,8 +364,9 @@ export class Store {
    * expiration_time -> settles_at (IQ aligns expiries to minute boundaries,
    * our local now+N*60 guess can be off by +-30s) and openPrice ->
    * entry_price (IQ settles against ITS open quote, not our feed tick).
+   * strike -> strike (digitals: IQ's absolute strike vs our feed-derived one).
    */
-  updateLiveMeta(id: string, patch: { settlesAt?: number; entryPrice?: number }): void {
+  updateLiveMeta(id: string, patch: { settlesAt?: number; entryPrice?: number; strike?: number }): void {
     const sets: string[] = []
     const vals: (number | string)[] = []
     if (patch.settlesAt !== undefined) {
@@ -375,6 +376,10 @@ export class Store {
     if (patch.entryPrice !== undefined) {
       sets.push('entry_price = ?')
       vals.push(patch.entryPrice)
+    }
+    if (patch.strike !== undefined) {
+      sets.push('strike = ?')
+      vals.push(patch.strike)
     }
     if (!sets.length) return
     vals.push(id)
@@ -393,12 +398,16 @@ export class Store {
     return rows.map((r) => this.rowToPosition(r))
   }
 
-  settlePosition(id: string, exitPrice: number, status: string, pnl: number): Position | null {
+  settlePosition(id: string, exitPrice: number, status: string, pnl: number, tsClose?: number): Position | null {
+    // tsClose: the BROKER's close time when we have it (IQ's settled-trade
+    // row) - history must show when IQ actually closed the trade, not when
+    // our poll first noticed. Falls back to our settle moment (paper, manual
+    // closes, or a broker row without a sane close_time).
     this.db.run('UPDATE positions SET status = ?, exit_price = ?, pnl = ?, ts_close = ? WHERE id = ?', [
       status,
       exitPrice,
       pnl,
-      Math.floor(Date.now() / 1000),
+      tsClose ?? Math.floor(Date.now() / 1000),
       id,
     ])
     return this.getPosition(id)

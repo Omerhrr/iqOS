@@ -51,8 +51,14 @@ export class ExecutionService {
   // live options currently in their expiry-quote settlement flow (re-entry
   // guard for the 1s sweep while the async sidecar round-trips are out)
   private settlingLive = new Set<string>()
+  // live options whose EARLY close was requested (the sell may land on IQ
+  // seconds after the POST) - these get polled by the 1s sweep regardless of
+  // their expiry, until the broker itself reports the close
+  private closingLive = new Set<string>()
   // sweeps spent trying to fetch an expiry quote per position (backoff ladder)
   private expiryAttempts = new Map<string, number>()
+  // throttles the "live positions can't settle - IQ session down" warn to 60s
+  private lastLiveGateWarnTs = 0
 
   risk: RiskConfig = { ...DEFAULT_RISK }
   liveReady = false
@@ -432,7 +438,15 @@ export class ExecutionService {
         mode?: string
         expired?: number
       }
-      if (!data.ok) return { ok: false, error: data.error ?? 'sidecar rejected trade' }
+      if (!data.ok || data.order_id === undefined || data.order_id === null) {
+        // THE PHANTOM-ORDER BUG: an ok response without an order_id used to
+        // become a live position with liveOrderId "undefined" (String(undefined))
+        // - unconfirmable with IQ, uncloseable, blocking a maxOpen slot
+        // forever. The order MAY still have landed on the broker, so the
+        // honest answer is to fail the placement and tell the operator to
+        // CHECK THE ACCOUNT - never to auto-retry and risk a double position.
+        return { ok: false, error: data.error ?? 'sidecar accepted the order but returned no order id - CHECK the IQ trades page before sending again (the order may have landed)' }
+      }
       const orderId = String(data.order_id)
       // THE REROUTE BUG: the sidecar's /trade handler silently reroutes an
       // options-family order to whichever instrument family the account
@@ -598,10 +612,32 @@ export class ExecutionService {
     if (!pos) return { ok: false, error: 'position not found' }
     if (pos.status !== 'open') return { ok: false, error: 'position already settled' }
     if (pos.mode === 'live') {
-      // digital positions close through iqair's close_digital_option; the
-      // sidecar picks the method by mode prefix - 'turbo' would call
-      // sell_option on a digital position id and fail
-      void this.postLive(`/close_trade`, { mode: pos.kind === 'digital' ? 'digital-option' : 'turbo', order_id: Number(pos.liveOrderId) })
+      // LIVE OPTIONS (binary/turbo/digital): request the sell from IQ, then
+      // let the BROKER report the actual outcome - never settle locally from
+      // a price guess. THE BUG this replaces: we used to fire /close_trade
+      // fire-and-forget and IMMEDIATELY write history with a made-up pnl
+      // (linear diff heuristic) - so the OS history recorded the trade as
+      // closed (with the wrong P/L) seconds BEFORE IQ processed the early
+      // sell and booked its own (different, partial) refund. That is exactly
+      // "history closes before the actual close on IQ Option". Now: the sell
+      // is awaited, nothing is written until /order_result reports IQ's own
+      // figure (the 1s sweep keeps polling via the closingLive set - early
+      // closes happen BEFORE settlesAt, so the expiry sweep alone would
+      // never pick them up), and a rejected sell surfaces honestly.
+      if (pos.kind === 'binary' || pos.kind === 'turbo' || pos.kind === 'digital') {
+        if (this.settlingLive.has(pos.id) || this.closingLive.has(pos.id)) {
+          return { ok: false, error: 'close already requested - awaiting broker confirmation' }
+        }
+        if (!pos.liveOrderId) return { ok: false, error: 'live position has no broker order id - cannot close' }
+        const modeStr = pos.kind === 'digital' ? 'digital-option' : 'turbo'
+        void this.requestLiveClose(pos, modeStr)
+        return { ok: true, position: this.store.getPosition(id) ?? undefined }
+      }
+      // LIVE CFD/spot: tell the broker (close_margin_position path - the old
+      // code sent mode 'turbo' here, which routed a margin close to
+      // sell_option and failed), then book the exit at our feed price. The
+      // broker-confirm upgrade for cfds lands with /order_result cfd support.
+      void this.postLive('/close_trade', { mode: 'cfd', order_id: Number(pos.liveOrderId) }, 30_000)
     }
     const price = this.market.getPrice(pos.asset)
     const dir = pos.side === 'call' ? 1 : -1
@@ -624,9 +660,43 @@ export class ExecutionService {
     return { ok: true, position: this.store.getPosition(id) ?? undefined }
   }
 
-  private settle(id: string, exitPrice: number, status: 'won' | 'lost' | 'closed', pnl: number, via = ''): void {
-    const pos = this.store.settlePosition(id, exitPrice, status, pnl)
+  /** Ask IQ to early-sell a live option, then hand the position to the broker
+   * confirmation loop. The sell itself is best-effort - every failure path
+   * leaves the position OPEN and says so, because guessing here is exactly
+   * what corrupted the history before. */
+  private async requestLiveClose(pos: Position, modeStr: string): Promise<void> {
+    const res = await this.postLive('/close_trade', { mode: modeStr, order_id: Number(pos.liveOrderId) }, 30_000)
+    if (res && (res.closed === false || res.ok === false)) {
+      const why = typeof res.error === 'string' ? res.error : 'broker did not accept the early close'
+      this.ctx.bus.emit('alert', {
+        level: 'warn',
+        message: `Early close REJECTED by IQ for ${pos.asset} ${pos.liveOrderId}: ${why} - position stays open and settles at expiry`,
+        ts: this.now(),
+      })
+      return
+    }
+    this.closingLive.add(pos.id)
+    const known = res ? '' : ' (sidecar unreachable - will keep polling)'
+    this.ctx.bus.emit('alert', {
+      level: 'info',
+      message: `Early close requested for ${pos.asset} ${pos.side.toUpperCase()} ${pos.kind} ${pos.liveOrderId}${known} - history records IQ's own result only, once the broker confirms`,
+      ts: this.now(),
+    })
+    const fresh = this.store.getPosition(pos.id)
+    if (fresh && fresh.status === 'open') {
+      this.settlingLive.add(fresh.id)
+      void this.settleLiveExpiry(fresh)
+    }
+  }
+
+  private settle(id: string, exitPrice: number, status: 'won' | 'lost' | 'closed', pnl: number, via = '', brokerTsClose?: number): void {
+    const pos = this.store.settlePosition(id, exitPrice, status, pnl, brokerTsClose)
     if (!pos) return
+    // single cleanup funnel: whichever loop was watching this position (expiry
+    // polls, early-close polls, attempt counters) stops here
+    this.settlingLive.delete(id)
+    this.closingLive.delete(id)
+    this.expiryAttempts.delete(id)
     if (pos.mode === 'paper') {
       // stake was deducted at open; balance gets stake + pnl back
       this.store.adjustBalance(pos.amount + pnl)
@@ -654,6 +724,19 @@ export class ExecutionService {
    */
   private settleDue(): void {
     const now = this.now()
+    // EARLY-CLOSE polling: live options whose sell was requested close BEFORE
+    // their expiry second, so the due-list below would never see them. Poll
+    // everything in closingLive every sweep until the broker confirms.
+    for (const id of [...this.closingLive]) {
+      const pos = this.store.getPosition(id)
+      if (!pos || pos.status !== 'open') {
+        this.closingLive.delete(id)
+        continue
+      }
+      if (this.settlingLive.has(id)) continue
+      this.settlingLive.add(id)
+      void this.settleLiveExpiry(pos)
+    }
     const due = this.store
       .listPositions('open')
       .filter(
@@ -665,7 +748,17 @@ export class ExecutionService {
     for (const pos of due) {
       // live positions only settle while on IQ with a warm sidecar session
       if (pos.mode === 'live') {
-        if (!(this.liveReady && this.accountSource === 'iq')) continue
+        if (!(this.liveReady && this.accountSource === 'iq')) {
+          // session down: say so (throttled) instead of silently hanging the
+          // position forever - it blocks bot maxOpen slots while unsettled
+          if (now - this.lastLiveGateWarnTs > 60) {
+            this.lastLiveGateWarnTs = now
+            const msg = `${due.filter((p) => p.mode === 'live').length} live position(s) past expiry can't settle - IQ session is down. Reconnect in Settings; nothing is guessed while offline.`
+            this.ctx.log('execution', msg)
+            this.ctx.bus.emit('alert', { level: 'warn', message: msg, ts: now })
+          }
+          continue
+        }
         if (this.settlingLive.has(pos.id)) continue
         this.settlingLive.add(pos.id)
         void this.settleLiveExpiry(pos)
@@ -719,31 +812,48 @@ export class ExecutionService {
   private async settleLiveExpiry(pos: Position): Promise<void> {
     const attempt = (this.expiryAttempts.get(pos.id) ?? 0) + 1
     this.expiryAttempts.set(pos.id, attempt)
-    if (pos.liveOrderId) {
-      const result = await this.iqOrderResult(pos.liveOrderId, pos.kind)
-      if (result?.found && result.status === 'closed' && Number.isFinite(result.pnl)) {
-        this.finishLiveExpiryFromBroker(pos, result.pnl as number)
+    // SAFETY VALVE: a live position with no broker order id can NEVER be
+    // confirmed by IQ (there is nothing to look up) - after ~5 minutes of
+    // sweeps, close it FLAT (pnl 0, status 'closed') for bookkeeping with a
+    // loud alert, so it stops blocking bot maxOpen slots. This records no
+    // guess about the market - there is literally no broker record to guess
+    // from; the alert tells the operator to reconcile against IQ by hand.
+    if (!pos.liveOrderId || pos.liveOrderId === 'undefined') {
+      if (attempt >= 300) {
+        this.ctx.bus.emit('alert', {
+          level: 'danger',
+          message: `${pos.asset} ${pos.kind} ${pos.id} has NO broker order id - cannot be confirmed with IQ. Settled FLAT ($0) for bookkeeping after 5 min; reconcile manually against the IQ trades page.`,
+          ts: this.now(),
+        })
+        this.settle(pos.id, pos.entryPrice, 'closed', 0, 'no broker order id - closed flat for bookkeeping')
         return
       }
-      // The lookup itself failed (sidecar says every get_positions()/
-      // get_position_history_v2() call errored - typically an expired IQ
-      // session) rather than IQ genuinely saying "not closed yet". This is
-      // NOT the normal waiting path: surface it loudly and immediately
-      // (every attempt, not just every 150th) so a broken session doesn't
-      // masquerade as "position still open" for however long until someone
-      // happens to check the logs. We still never guess a settlement from
-      // it - only flag it more visibly than the normal wait below.
-      if (result?.error) {
-        this.lastLiveError = `live ${pos.kind} ${pos.liveOrderId ?? pos.id} on ${pos.asset}: broker lookup failing (${result.error}) - IQ confirmation cannot be fetched, position held open, not settled`
-        if (attempt === 1 || attempt % 10 === 0) {
-          this.ctx.log('execution', this.lastLiveError)
-          this.ctx.bus.emit('alert', { level: 'warn', message: this.lastLiveError, ts: this.now() })
-        }
-      }
-      // Broker explicitly open, not found yet, or the call errored/timed
-      // out (result === null): in every case IQ has not confirmed a close,
-      // so nothing gets written to history. Just wait and re-ask.
+      this.settlingLive.delete(pos.id)
+      return
     }
+    const result = await this.iqOrderResult(pos.liveOrderId, pos.kind)
+    if (result?.found && result.status === 'closed' && Number.isFinite(result.pnl)) {
+      this.finishLiveExpiryFromBroker(pos, result.pnl as number, result.closePrice, result.closeTime)
+      return
+    }
+    // The lookup itself failed (sidecar says every get_positions()/
+    // get_position_history_v2() call errored - typically an expired IQ
+    // session) rather than IQ genuinely saying "not closed yet". This is
+    // NOT the normal waiting path: surface it loudly and immediately
+    // (every attempt, not just every 150th) so a broken session doesn't
+    // masquerade as "position still open" for however long until someone
+    // happens to check the logs. We still never guess a settlement from
+    // it - only flag it more visibly than the normal wait below.
+    if (result?.error) {
+      this.lastLiveError = `live ${pos.kind} ${pos.liveOrderId ?? pos.id} on ${pos.asset}: broker lookup failing (${result.error}) - IQ confirmation cannot be fetched, position held open, not settled`
+      if (attempt === 1 || attempt % 10 === 0) {
+        this.ctx.log('execution', this.lastLiveError)
+        this.ctx.bus.emit('alert', { level: 'warn', message: this.lastLiveError, ts: this.now() })
+      }
+    }
+    // Broker explicitly open, not found yet, or the call errored/timed
+    // out (result === null): in every case IQ has not confirmed a close,
+    // so nothing gets written to history. Just wait and re-ask.
     // ~2-3 minutes past expected expiry with still no broker confirmation:
     // flag the position as stuck (visible to the UI/ops) rather than just a
     // log line buried in the console - still does not affect settlement.
@@ -767,12 +877,20 @@ export class ExecutionService {
    * price/strike comparison at all, because the broker already decided.
    * draw (pnl === 0, e.g. an at-the-money refund) stays 'won' with $0 pnl,
    * matching settleExpiry's existing draw convention.
+   * closePrice/closeTime come from IQ's settled-trade row when available -
+   * the Exit column used to show the ENTRY price here (we only had pnl),
+   * which is one of the ways OS history looked different from IQ's own.
    */
-  private finishLiveExpiryFromBroker(pos: Position, pnl: number): void {
+  private finishLiveExpiryFromBroker(pos: Position, pnl: number, closePrice?: number, closeTime?: number): void {
     this.settlingLive.delete(pos.id)
     this.expiryAttempts.delete(pos.id)
     const status: 'won' | 'lost' = pnl < 0 ? 'lost' : 'won'
-    this.settle(pos.id, pos.entryPrice, status, pnl, 'iq order result (broker-reported)')
+    const exit = closePrice && closePrice > 0 ? closePrice : pos.entryPrice
+    // broker close time is only taken when it sits in a sane window
+    // (after open, no more than 5 min in the future) - a misparsed field
+    // must never move history backwards
+    const ts = closeTime && closeTime > pos.tsOpen && closeTime <= this.now() + 300 ? Math.floor(closeTime) : undefined
+    this.settle(pos.id, exit, status, pnl, 'iq order result (broker-reported)', ts)
   }
 
   /**
@@ -785,7 +903,10 @@ export class ExecutionService {
   private async iqOrderResult(
     liveOrderId: string,
     kind: Position['kind']
-  ): Promise<{ found: boolean; status?: string; pnl?: number; error?: string } | null> {
+  ): Promise<{ found: boolean; status?: string; pnl?: number; closePrice?: number; closeTime?: number; error?: string } | null> {
+    // CFDs have no options-family history row to match - never mislabel a
+    // cfd lookup as turbo (the old map did exactly that)
+    if (kind === 'cfd') return null
     const mode = kind === 'digital' ? 'digital' : kind === 'binary' ? 'binary' : 'turbo'
     const res = await this.postLive('/order_result', { order_id: liveOrderId, mode, max_wait_sec: 6 }, 10_000)
     // null here means the HTTP call itself failed/timed out (network to the
@@ -799,8 +920,18 @@ export class ExecutionService {
     const found = res.found === true
     const status = typeof res.status === 'string' ? res.status : undefined
     const pnl = Number(res.pnl)
+    const cp = Number(res.close_price)
+    const ct = Number(res.close_time)
     const error = typeof res.error === 'string' ? res.error : undefined
-    return { found, status, pnl: Number.isFinite(pnl) ? pnl : undefined, error }
+    return {
+      found,
+      status,
+      pnl: Number.isFinite(pnl) ? pnl : undefined,
+      closePrice: Number.isFinite(cp) && cp > 0 ? cp : undefined,
+      // IQ reports close_time in unix seconds (float); tolerate ms payloads
+      closeTime: Number.isFinite(ct) && ct > 1e9 ? (ct > 1e12 ? ct / 1000 : ct) : undefined,
+      error,
+    }
   }
 
   /**
@@ -832,7 +963,7 @@ export class ExecutionService {
       }
       const pos = this.store.getPosition(posId)
       if (!pos || pos.status !== 'open') return
-      const patch: { settlesAt?: number; entryPrice?: number } = {}
+      const patch: { settlesAt?: number; entryPrice?: number; strike?: number } = {}
       const exp = num('expiration_time', 'expired', 'expiration')
       if (exp && exp > pos.tsOpen && exp < pos.tsOpen + 2 * 3600) patch.settlesAt = Math.floor(exp)
       const open = num('openprice', 'open_price')
@@ -840,6 +971,11 @@ export class ExecutionService {
       // (entryPrice <= 0 = kernel feed never ticked this asset -> the broker
       // figure is the only real number, take it unconditionally)
       if (open && (pos.entryPrice <= 0 || Math.abs(open / pos.entryPrice - 1) <= 0.2)) patch.entryPrice = open
+      // digitals: IQ's ABSOLUTE strike is what the broker settles against -
+      // ours is derived from our own feed tick at open and can sit a few
+      // ticks away from it. Same 20% sanity band as the entry price.
+      const strike = num('strike_value', 'strike')
+      if (strike && pos.strike && Math.abs(strike / pos.strike - 1) <= 0.2) patch.strike = strike
       if (!Object.keys(patch).length) return
       this.store.updateLiveMeta(posId, patch)
       this.ctx.log(

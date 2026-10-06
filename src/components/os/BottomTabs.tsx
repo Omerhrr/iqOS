@@ -151,6 +151,10 @@ export default function BottomTabs(props: BottomTabsProps) {
               {positions.map((p) => {
                 const pnl = openPnl(p)
                 const ttl = p.settlesAt ? p.settlesAt - Math.floor(Date.now() / 1000) : null
+                // live option whose expiry has passed but IQ hasn't reported the
+                // result yet - the OS deliberately records NOTHING until the
+                // broker confirms, so show that state instead of a fake 0s/0.00
+                const awaitingBroker = p.mode === 'live' && p.kind !== 'cfd' && ttl !== null && ttl <= 0
                 return (
                   <tr key={p.id} className="border-b border-[#0d1420] hover:bg-[#0d1420]">
                     <Td className="text-[#4b5a72]">{fmtTime(p.tsOpen)}</Td>
@@ -159,7 +163,9 @@ export default function BottomTabs(props: BottomTabsProps) {
                     <Td className="text-[#7c8aa5]">{p.kind}</Td>
                     <Td>{fmtPrice(p.entryPrice, p.asset)}</Td>
                     <Td className={pnl > 0 ? 'text-emerald-400' : pnl < 0 ? 'text-rose-400' : 'text-[#7c8aa5]'}>{fmtPrice(p.asset === asset ? price : (prices[p.asset]?.price ?? p.entryPrice), p.asset)}</Td>
-                    <Td className="text-[#4b5a72]">{ttl !== null ? `${Math.max(0, ttl)}s` : `TP ${p.tp ?? '-'}% / SL ${p.sl ?? '-'}%`}</Td>
+                    <Td className={awaitingBroker ? 'animate-pulse text-amber-400' : 'text-[#4b5a72]'}>
+                      {awaitingBroker ? 'awaiting IQ…' : ttl !== null ? `${Math.max(0, ttl)}s` : `TP ${p.tp ?? '-'}% / SL ${p.sl ?? '-'}%`}
+                    </Td>
                     <Td>{fmtMoney(p.amount)}</Td>
                     <Td className={pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
                       {pnl >= 0 ? '+' : ''}

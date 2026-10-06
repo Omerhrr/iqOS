@@ -725,10 +725,17 @@ export class AutopilotService {
     // either lapses to 'none' or flips to the other direction and comes back.
     // This is what stands between "one clean entry per setup" and pyramiding
     // into (or getting whipsawed by) a condition that just stays true a while.
+    // THE BUG: the edge-trigger used to be STAMPED here - before the regime
+    // gate, the adaptive gate and the execution call. A signal blocked by ANY
+    // of those (regime flicker, adaptive hold, risk manager rejection,
+    // balance busy) still consumed the edge: the SAME persisting condition
+    // was then skipped forever as "still active" and the bot needed the
+    // signal to lapse and re-fire before it could ever take it. The stamp now
+    // happens only on actual execution (below), so a transiently-blocked
+    // signal retries on the next candle until it either executes or lapses.
     if (rt.lastSignalDir === wanted) {
       return this.reject(bot, `signal ${wanted} still active - waiting for it to clear/flip before retriggering`)
     }
-    rt.lastSignalDir = wanted
 
     // regime gate: same 4-way TRENDING/RANGING/VOLATILE/MIXED classification
     // as the copilot's regime_playbook tool (classifyRegime), not just the
@@ -774,6 +781,17 @@ export class AutopilotService {
 
     // execute - the ExecutionService risk manager is the final gate
     const bet = this.stakeFor(bot, rt)
+    // COMPOUND OVER-BET GUARD: the stake used to be Math.max(1, raw) - a pot
+    // below the $1 broker minimum (dust left by a derisk phase or a partial
+    // roll) silently bet MORE than the pot, breaking the compounding math
+    // (a loss then burns money the cycle never banked). IQ cannot take a
+    // stake under $1, so the honest move is to stand the cycle down.
+    if (bet.compound && bet.pot >= 0.01 && bet.amount > bet.pot) {
+      return this.reject(
+        bot,
+        `compound pot $${bet.pot.toFixed(2)} is below the $1 broker minimum stake - restart the cycle to re-seed`,
+      )
+    }
     // THE BUG: this used to hardcode mode: 'paper' - every bot traded the
     // paper ledger no matter which ledger the operator was actually on, so a
     // bot created/armed while connected to a real IQ session silently placed
@@ -794,6 +812,9 @@ export class AutopilotService {
 
     if (!out.ok) return this.reject(bot, out.error ?? 'order rejected')
 
+    // edge-trigger stamp happens HERE (execution actually happened) - see
+    // the comment above for why the old pre-gate stamp ate blocked signals
+    rt.lastSignalDir = wanted
     rt.trades += 1
     rt.lastTradeTs = Math.floor(Date.now() / 1000)
     rt.lastRejection = undefined
@@ -883,6 +904,11 @@ export class AutopilotService {
       rt.losses += 1
       rt.streak = rt.streak <= 0 ? rt.streak - 1 : -1
       if (sameDay) rt.pnlToday += pnl
+    } else if (position.status === 'closed' && sameDay) {
+      // manual early exits (status 'closed', any sign) used to vanish from
+      // the bot's DAY pnl while still landing in pnlTotal - the daily loss
+      // limit and profit target never saw them
+      rt.pnlToday += pnl
     }
     // compounding roll: a win folds the payout into the pot, a loss burns the
     // stake out of it (full roll => pot hits 0 => next trade restarts at base)
@@ -983,6 +1009,9 @@ export class AutopilotService {
           rt.pnlToday += pnl
         } else if (p.status === 'lost') {
           rt.losses += 1
+          rt.pnlToday += pnl
+        } else if (p.status === 'closed') {
+          // mirror onPositionClosed: manual early exits count toward the day
           rt.pnlToday += pnl
         }
       }

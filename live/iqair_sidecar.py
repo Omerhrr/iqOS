@@ -1141,6 +1141,26 @@ class Handler(BaseHTTPRequestHandler):
                         out = {"status": "closed", "close_reason": item.get("close_reason")}
                         if isinstance(pnl, (int, float)):
                             out["pnl"] = pnl
+                        # THE FAKE-EXIT BUG: the kernel used to record
+                        # exit_price = entry_price for every broker-settled
+                        # trade (we only forwarded pnl), so the History tab's
+                        # Exit column never matched IQ's own trades page.
+                        # IQ's settled rows carry the settlement quote under
+                        # `close_quote` (confirmed against iqair's own
+                        # Position.from_raw: open -> current_price, closed ->
+                        # close_quote) - pass it through when present; the
+                        # kernel sanity-bands it before use.
+                        for k in ("close_quote", "close_price", "closeprice", "closePrice"):
+                            v = item.get(k)
+                            if isinstance(v, (int, float)) and v > 0:
+                                out["close_price"] = float(v)
+                                break
+                        for k in ("close_time", "closetime", "closeTime"):
+                            v = item.get(k)
+                            if isinstance(v, (int, float)) and v > 1e9:
+                                # unix seconds expected; tolerate ms payloads
+                                out["close_time"] = float(v) / 1000 if v > 1e12 else float(v)
+                                break
                         return out
 
                     # THE DRIFT BUG this fixes: get_positions() is IQ's LIVE/
