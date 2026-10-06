@@ -255,7 +255,12 @@ export function twinSelfTest(candles: Candle[]): TwinSelfTest {
   const c0 = dev.reduce((s, v) => s + v * v, 0)
   const rho = (k: number) => (c0 > 0 ? dev.slice(k).reduce((s, v, i) => s + v * dev[i], 0) / c0 : 0)
   const acf1 = NA > 1 ? rho(1) : 0
-  const verdict = Math.abs(acf1) <= 0.05 ? 'synthetic-like' : acf1 >= 0.1 ? 'real-like' : 'inconclusive'
+  // noise-aware floor: |r| acf1 sampling noise is ~1/sqrt(N); the fixed 0.05
+  // verdict floor matches /otc_forensics at n~2000, but a 500-candle twin
+  // has a +-0.09 floor - without this, healthy small twins read
+  // 'inconclusive' on pure noise
+  const floor = Math.max(0.05, 2.2 / Math.sqrt(Math.max(1, NA)))
+  const verdict = Math.abs(acf1) <= floor ? 'synthetic-like' : acf1 >= floor ? 'real-like' : 'inconclusive'
   return {
     flatRate: +(flat / Math.max(1, T)).toFixed(4),
     decidedShare: +(dec / Math.max(1, T)).toFixed(4),
