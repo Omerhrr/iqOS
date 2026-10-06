@@ -37,6 +37,39 @@ const nextConfig: NextConfig = {
     // "dev" script), so cwd at config-load time IS the project root.
     root: process.cwd(),
   },
+  // DEV WATCHER HYGIENE - fix for the "page keeps rendering and reloading" loop.
+  // In dev the webpack file watcher covers the whole project root. Several
+  // runtime artifacts inside that root change every few seconds:
+  //   dev.log            (tee'd `next dev` stdout - grows on EVERY request,
+  //                       including the preview proxy's ~2.5s health check)
+  //   data/os.db{-wal,-shm} (kernel sqlite writes every ~5s)
+  //   live/*.log         (sidecar stdout)
+  // Each change re-triggered webpack -> "[Fast Refresh] rebuilding" ->
+  // periodic full reloads ("Fast Refresh had to perform a full reload") ->
+  // the browser visibly kept refreshing while idle. Ignoring these paths
+  // (plus the usual caches) breaks the request -> log -> rebuild -> reload
+  // feedback loop. Source files under src/ are untouched, so HMR still
+  // works normally for real edits.
+  webpack: (config, { dev }) => {
+    if (dev) {
+      // Full explicit list (don't merge Next's defaults - Next passes a
+      // RegExp-ish value that webpack's array schema rejects with
+      // "watchOptions.ignored[0] should be a non-empty string").
+      config.watchOptions = {
+        ...(config.watchOptions || {}),
+        ignored: [
+          "**/node_modules/**",
+          "**/.git/**",
+          "**/.next/**",
+          "**/*.log",
+          "**/data/**",
+          "**/live/__pycache__/**",
+          "**/.z-ai-config*",
+        ],
+      };
+    }
+    return config;
+  },
   async rewrites() {
     return {
       // Kernel passthrough: the OS client (src/lib/os/client.ts) calls the
