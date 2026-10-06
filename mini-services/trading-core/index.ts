@@ -35,6 +35,8 @@ import { findSmartBlends } from './src/analytics/candlemath'
 import { buildCalibrationReport, type CalibrationStoreSlice } from './src/analytics/calibration'
 import { computeStepStats, computeIntervalStats } from './src/analytics/randomness'
 import { loadOtcHarvest } from './src/analytics/otcHarvest'
+import { estimateTwinParams, generateOtcTwin } from './src/analytics/otcTwin'
+import { tfSeconds } from './src/analytics/synthfeed'
 
 // Defaults to 3030 for local/Windows dev; the Docker deployment overrides
 // this to an unusual, hard-to-collide-with port via the KERNEL_PORT env var.
@@ -510,6 +512,79 @@ const httpServer = createServer(async (req, res) => {
                 ? `Mild decided-side ${zDec < 0 ? 'down' : 'up'} lean (z ${zDec.toFixed(1)} over ${dec} decided moves) - not persistent enough to trade; keep monitoring. Flat rate ${(flatRate * 100).toFixed(1)}%; all-transitions up-rate ${(upCC * 100).toFixed(1)}% (z ${zCC.toFixed(1)}) is flat-confounded, do not trade on it alone.`
                 : `No flat-aware directional drift: decided moves split ${(decUp * 100).toFixed(1)}/${((1 - decUp) * 100).toFixed(1)} (z ${zDec.toFixed(1)} over ${dec} decided) - the ${breakeven.toFixed(1)}% breakeven at 0.82 payout is out of reach. Flat rate ${(flatRate * 100).toFixed(1)}% explains the raw up-rate ${(upCC * 100).toFixed(1)}%: flats make a fair coin read as drift. ${Math.abs(zCC) >= 2.5 && Math.abs(zDec) < 2.5 ? 'The naive all-transitions test WOULD have flagged this pair - that flag was the flat-mass artifact.' : ''}`,
           testedAt: Math.floor(Date.now() / 1000),
+        })
+      }
+
+      // ---------- OTC TWIN (Task 54): the recovered broker generator, ours ----------
+      // Tasks 52+53 reverse-engineered the OTC engine's statistical spec:
+      // iid near-Gaussian steps, fair-coin signs, per-pair sigma, decimal
+      // lattice, CSPRNG-class ordering, NO vol clustering / session rhythm /
+      // bid-ask bounce. This endpoint IMPLEMENTS that spec, calibrated to the
+      // pair's own feed - the honest "works like them": a stream that is the
+      // same statistical animal as the broker's. Any strategy showing "edge"
+      // on the twin is by definition an artifact; edge on the real feed that
+      // cannot beat this twin's placebo distribution is the same thing. The
+      // twin MUST self-test synthetic-like - if the REAL feed ever stops
+      // reading that way, the broker changed generators and the prediction
+      // case re-opens with new evidence. Full story: src/analytics/otcTwin.ts.
+      if (path === '/otc_twin') {
+        const asset = q.get('asset') ?? market.activeAsset
+        const tfv = (q.get('tf') ?? '1m') as Timeframe
+        const nTwin = Math.max(50, Math.min(5000, Number(q.get('n') ?? 500)))
+        const payout = Math.max(0.1, Math.min(1.5, Number(q.get('payout') ?? 0.82)))
+        // calibrate from the pair's own OTC feed via the SAME honest chain as
+        // forensics (sidecar live > harvest archive > kernel memory)
+        let dataSource: 'sidecar' | 'harvest' | 'active-feed'
+        let src = await market.fetchSidecarCandles(asset, tfv, 2000)
+        dataSource = 'sidecar'
+        if (src.length < 300) {
+          src = loadOtcHarvest(asset, 2000)
+          dataSource = 'harvest'
+        }
+        if (src.length < 300) {
+          src = market.getCandles(asset, tfv, 2000)
+          dataSource = 'active-feed'
+        }
+        if (src.length < 300) {
+          return json(400, { ok: false, error: `thin history on ${asset} ${tfv} (${src.length} candles) - warm the feed first` })
+        }
+        const params = estimateTwinParams(src)
+        if (!params) {
+          return json(400, { ok: false, error: 'could not calibrate twin (degenerate steps or lattice on this pair)' })
+        }
+        // seed=<int> switches to mulberry32 for an AUDITABLE (reproducible)
+        // run; default is CSPRNG-class, matching the broker's security class
+        const seedRaw = q.get('seed')
+        const seed = seedRaw !== null && seedRaw !== '' ? Math.abs(Math.floor(Number(seedRaw))) || 1 : undefined
+        const twin = generateOtcTwin(params, nTwin, tfSeconds(tfv), { seed })
+        // THE payout math that owns this market (no signal can):
+        // breakeven win rate = 1/(1+payout); a fair coin's EV = (payout-1)/2
+        const breakeven = 1 / (1 + payout)
+        const fairEv = (payout - 1) / 2
+        return json(200, {
+          ok: true,
+          asset, tf: tfv,
+          spec: 'iid near-Gaussian steps; fair-coin signs; per-pair sigma; decimal lattice; CSPRNG-class ordering; NO vol clustering / session structure / bid-ask bounce (recovered in Tasks 52+53)',
+          calibration: {
+            dataSource,
+            sourceN: params.sourceN,
+            p0: params.p0,
+            sigmaPerStep: +params.sigmaPerStep.toPrecision(6),
+            lattice: params.lattice,
+            sourceFlatRate: +params.flatRate.toFixed(4),
+            stallProb: +params.stallProb.toFixed(4),
+            meanAbsStep: +params.meanAbsStep.toPrecision(6),
+          },
+          rngMode: twin.rngMode,
+          seed: twin.seed,
+          selfTest: twin.selfTest,
+          twin: twin.candles,
+          evMath: {
+            payout,
+            breakevenWinRate: +breakeven.toFixed(4),
+            fairCoinEvPerUnitStake: +fairEv.toFixed(4),
+            note: `A fair coin wins 50% < ${(breakeven * 100).toFixed(1)}% breakeven at ${payout} payout -> EV ${(fairEv * 100).toFixed(1)}%/trade. On an iid feed no signal exists; the only reliable winner is the payout spread itself (the house).`,
+          },
         })
       }
 
