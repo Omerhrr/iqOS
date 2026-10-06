@@ -620,6 +620,32 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
               they build a track record; only setups with enough history AND a weak record get held back.
             </p>
 
+            <NumField
+              label="Min payout % (0 = off)"
+              value={draft.minPayoutPct ?? 0}
+              onChange={(v) => patch({ minPayoutPct: Math.min(98, Math.max(0, v)) })}
+            />
+            <p className="-mt-1 text-[9px] leading-relaxed text-[#4b5a72]">
+              The EV gate: never fires when the pair&apos;s live payout for this bot&apos;s kind is below the floor.
+              Breakeven = 100/(1+payout): 54.9% at 82%, 60.6% at 65% - payouts move per pair per hour, and a signal
+              worth taking at one payout can be pure house-edge at a lower one. Pairs with unknown payouts still trade.
+            </p>
+
+            <Segmented
+              label="Streak-breaker (self-bench)"
+              options={[
+                { v: 'on', label: 'On' },
+                { v: 'off', label: 'Off' },
+              ]}
+              value={draft.streakBreaker ? 'on' : 'off'}
+              onChange={(v) => patch({ streakBreaker: v === 'on' })}
+            />
+            <p className="-mt-1 text-[9px] leading-relaxed text-[#4b5a72]">
+              After 3 consecutive losses the bot benches ITSELF for 15 minutes, doubling per extra loss (max 4h).
+              Independent of the watchdog (which needs your ack) and the daily $ limits - a losing run ends the
+              bench on its own, and any win lifts it immediately.
+            </p>
+
             {draft.stakePlan?.kind === 'compound' ? (
               <div>
                 <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Max open positions (locked)</Label>
@@ -942,6 +968,16 @@ function BotCard({
         {bot.session && bot.session !== 'all' && (
           <span className="rounded bg-sky-500/15 px-1 py-px text-sky-300">{bot.session} only</span>
         )}
+        {(bot.minPayoutPct ?? 0) > 0 && (
+          <span className="rounded bg-emerald-500/15 px-1 py-px text-emerald-300" title="payout floor - never fires below this live payout (EV gate)">
+            pay≥{bot.minPayoutPct}%
+          </span>
+        )}
+        {bot.streakBreaker && (
+          <span className="rounded bg-amber-500/15 px-1 py-px text-amber-300" title="self-bench after 3+ consecutive losses (15min, doubling, 4h cap)">
+            streak-breaker
+          </span>
+        )}
         {!bot.enabled && (
           <span
             className={`rounded px-1 py-px ${gate.ready ? 'bg-emerald-500/15 text-emerald-300' : 'bg-rose-500/15 text-rose-300'}`}
@@ -974,6 +1010,11 @@ function BotCard({
           {stats.lastTradeTs > 0 && <span className="text-[#3d4c66]">last {fmtTime(stats.lastTradeTs)}</span>}
         </div>
       </div>
+      {stats.lastRejection && (
+        <p className="mt-0.5 truncate font-mono text-[8px] text-amber-500/60" title={stats.lastRejection}>
+          standing down: {stats.lastRejection}
+        </p>
+      )}
     </div>
   )
 }
@@ -1410,6 +1451,8 @@ const DEFAULT_AUTOTRADER_UI: AutoTraderConfig = {
   dailyLossLimit: 0,
   watchlist: [],
   marketScope: 'all',
+  minPayoutPct: 70,
+  volGate: 'off',
 }
 
 function AutoTraderStrip({
@@ -1465,6 +1508,8 @@ function AutoTraderStrip({
           {at.config.stakePlan ? `compound seed $${at.config.stakePlan.base}` : `$${at.config.stake}`} · max {at.config.maxOpen}
           {at.config.marketScope === 'real' && <span className="text-emerald-400/80"> · REAL only</span>}
           {at.config.marketScope === 'otc' && <span className="text-violet-400/80"> · OTC only</span>}
+          {(at.config.minPayoutPct ?? 0) > 0 && <span className="text-emerald-400/80"> · PAY≥{at.config.minPayoutPct}%</span>}
+          {at.config.volGate === 'avoid-volatile' && <span className="text-amber-400/80"> · vol-gate</span>}
           {at.config.signalSource === 'strategy' && (() => {
             const ds = at.config.directionStrategy
             const pinCount = Object.keys(at.config.pairStrategy ?? {}).length
@@ -1947,6 +1992,20 @@ function AutoTraderDialog({
             </select>
           </div>
 
+          <div className="col-span-2 rounded border border-[#1c2739] bg-[#0b1220] px-2 py-2">
+            <NumField
+              label="Min payout % - the EV gate (0 = off)"
+              value={d.minPayoutPct ?? 70}
+              onChange={(v) => p({ minPayoutPct: Math.min(98, Math.max(0, v)) })}
+            />
+            <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+              Never fires when the pair&apos;s LIVE payout is below this floor. Breakeven = 100/(1+payout): 54.9% at
+              82%, 58.8% at 70%, 60.6% at 65% - and payouts move per pair per hour, so a signal worth taking at one
+              payout can be pure house-edge at a lower one. Rejected pairs sit out 10 minutes and the trader moves to
+              the next candidate; unknown payouts (metadata cold / sim) still trade. Kernel default: 70.
+            </p>
+          </div>
+
           {d.stakePlan?.kind === 'compound' ? (
             <div>
               <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Stake $ (replaced by compound plan)</Label>
@@ -2092,6 +2151,16 @@ function AutoTraderDialog({
                   <p className="text-[8px] leading-relaxed text-[#3d4c66]">stands aside on non-OTC pairs 21:00-23:00 UTC, the thinnest FX liquidity window</p>
                 </div>
                 <Switch checked={d.avoidDeadHours ?? false} onCheckedChange={(v) => p({ avoidDeadHours: v })} />
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <p className="text-[10px] text-[#c7d2e3]">Vol-spike gate</p>
+                  <p className="text-[8px] leading-relaxed text-[#3d4c66]">no entries while the regime classifier reads VOLATILE (garch &gt; 1.6x ewma) for that pair</p>
+                </div>
+                <Switch
+                  checked={d.volGate === 'avoid-volatile'}
+                  onCheckedChange={(v) => p({ volGate: v ? 'avoid-volatile' : 'off' })}
+                />
               </div>
             </div>
           </div>

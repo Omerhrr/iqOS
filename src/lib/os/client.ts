@@ -802,6 +802,12 @@ export interface BotConfig {
    * override, not a validated edge. Surface this prominently; never let a
    * forced bot render indistinguishably from one that passed the gate. */
   forcedUnvalidated?: boolean
+  /** PAYOUT FLOOR (the EV gate): skip signals on pairs whose live payout
+   * for this bot's kind is below this percent. 0/undefined = off. */
+  minPayoutPct?: number
+  /** Self-bench after 3+ consecutive losses (15min, doubling per extra
+   * loss, 4h cap; a win clears it). Default off for bots. */
+  streakBreaker?: boolean
 }
 
 export interface BotStats {
@@ -819,6 +825,10 @@ export interface BotStats {
   halted: boolean
   /** halted because the periods target was reached (win-side completion) */
   complete: boolean
+  /** Why the bot's last evaluation DIDN'T trade (score below floor, payout
+   * floor, bench, session window...). undefined = nothing rejected since the
+   * runtime was built - NOT proof the bot is healthy. */
+  lastRejection?: string
 }
 
 export interface BotRow {
@@ -1600,6 +1610,14 @@ export interface AutoTraderConfig {
   /** Stands aside on non-OTC pairs during the 21:00-23:00 UTC thin-liquidity
    * window. Default false. */
   avoidDeadHours?: boolean
+  /** PAYOUT FLOOR (the EV gate): never place a trade when the pair's live
+   * binary payout is below this percent (0 = off, kernel default 70).
+   * Breakeven at payout p is 1/(1+p) - the one lever that provably moves EV. */
+  minPayoutPct?: number
+  /** Vol-spike gate: 'avoid-volatile' stands a pair down while the 4-way
+   * regime classifier reads VOLATILE for it (garchVol > 1.6x ewmaVol).
+   * Default 'off'. */
+  volGate?: 'off' | 'avoid-volatile'
   /** Optional compounding plan - same StakePlan shape as a bot's. undefined =
    * fixed `stake` every trade. */
   stakePlan?: StakePlan
