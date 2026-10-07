@@ -582,6 +582,13 @@ export default function OSPage() {
               line: 'line', area: 'area', baseline: 'baseline',
               renko: 'renko',
               pointfigure: 'pointfigure', pointandfigure: 'pointfigure', pnf: 'pointfigure', pf: 'pointfigure',
+              // Task 63 chart-type engines
+              rangebars: 'rangebars', rangebar: 'rangebars', range: 'rangebars',
+              volumebars: 'volumebars', volumebar: 'volumebars', volume: 'volumebars', constantvolume: 'volumebars', cvb: 'volumebars',
+              footprint: 'footprint', cluster: 'footprint', clusterchart: 'footprint', volumeprint: 'footprint',
+              tpo: 'tpo', marketprofile: 'tpo', timeprice: 'tpo', timepriceopportunity: 'tpo', profile: 'tpo',
+              tickchart: 'tickchart', tick: 'tickchart', ticks: 'tickchart', tickbars: 'tickchart',
+              ivhv: 'ivhv', ivvshv: 'ivhv', ivhvchart: 'ivhv', impliedvolatility: 'ivhv', impliedhistoricalvolatility: 'ivhv',
             }
             setChartType(map[raw] ?? 'candles')
           }
@@ -643,7 +650,7 @@ export default function OSPage() {
   const chartWorkspace = (
     <>
       <div className="min-h-[280px] flex-1">
-        <ChartPanel candles={candles} analysis={analysis} price={livePrice} digitsTicker={asset} chartType={chartType} overlays={overlaySeries} positions={positions} settledPositions={history} />
+        <ChartPanel candles={candles} analysis={analysis} price={livePrice} digitsTicker={asset} chartType={chartType} overlays={overlaySeries} positions={positions} settledPositions={history} tf={tf} />
       </div>
       {activeSubs.map((s, i) => (
         <SubPane
@@ -670,7 +677,7 @@ export default function OSPage() {
     <PanelGroup direction="vertical" autoSaveId="iqos:chartstack" className="min-h-0 flex-1">
       <Panel id="chart" defaultSize={58} minSize={20}>
         <div className="h-full min-h-0">
-          <ChartPanel candles={candles} analysis={analysis} price={livePrice} digitsTicker={asset} chartType={chartType} overlays={overlaySeries} positions={positions} settledPositions={history} />
+          <ChartPanel candles={candles} analysis={analysis} price={livePrice} digitsTicker={asset} chartType={chartType} overlays={overlaySeries} positions={positions} settledPositions={history} tf={tf} />
         </div>
       </Panel>
       {activeSubs.map((s, i) => {

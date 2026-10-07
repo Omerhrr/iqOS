@@ -27,7 +27,12 @@ export type TradeKind = 'binary' | 'turbo' | 'digital' | 'cfd'
 export const TRADE_KINDS: TradeKind[] = ['binary', 'turbo', 'digital', 'cfd']
 export const KIND_LABEL: Record<TradeKind, string> = { binary: 'Binary', turbo: 'Turbo', digital: 'Digital', cfd: 'CFD' }
 
-export type ChartType = 'candles' | 'hollow' | 'heikin' | 'bars' | 'line' | 'area' | 'baseline' | 'renko' | 'pointfigure'
+export type ChartType =
+  | 'candles' | 'hollow' | 'heikin' | 'bars' | 'line' | 'area' | 'baseline'
+  | 'renko' | 'pointfigure'
+  // Task 63 chart-type engines (kernel routes: /rangebars /volumebars
+  // /footprint /tpo /ticks /iv_hv - engines of record in trading-core)
+  | 'rangebars' | 'volumebars' | 'footprint' | 'tpo' | 'tickchart' | 'ivhv'
 export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'candles', label: 'Candles' },
   { id: 'hollow', label: 'Hollow' },
@@ -38,7 +43,27 @@ export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'baseline', label: 'Baseline' },
   { id: 'renko', label: 'Renko' },
   { id: 'pointfigure', label: 'P&F' },
+  { id: 'rangebars', label: 'Range' },
+  { id: 'volumebars', label: 'Vol Bars' },
+  { id: 'footprint', label: 'Footprint' },
+  { id: 'tpo', label: 'TPO' },
+  { id: 'tickchart', label: 'Tick' },
+  { id: 'ivhv', label: 'IV·HV' },
 ]
+
+// kernel route payloads for the Task 63 chart fetches (ChartPanel)
+export interface TickBarRow { time: number; endTime: number; open: number; high: number; low: number; close: number; ticks: number }
+export interface TicksResponse { ok: boolean; dataSource: 'tick' | 'candle'; per: number; note: string; bars: TickBarRow[] }
+export interface IvHvResponse {
+  ok: boolean
+  hv: { time: number; hv: number }[]
+  hvNow: number
+  annualization: string
+  iv: { time: number; payout: number; breakevenPct: number }[]
+  ivSource: 'observed' | 'current' | 'none'
+  ivRule: string
+  realizedUpProbPct: number
+}
 
 export type AssetCategory = 'forex' | 'crypto' | 'commodity' | 'stock' | 'index'
 export const CATEGORIES: { id: 'all' | 'otc' | AssetCategory; label: string }[] = [

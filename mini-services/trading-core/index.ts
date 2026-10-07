@@ -34,6 +34,12 @@ import { computeVolumeProfile, computeCandleDelta, computeCumulativeDelta } from
 import { findSmartBlends } from './src/analytics/candlemath'
 import { renkoBricks } from './src/analytics/renko'
 import { pointFigure } from './src/analytics/pointfigure'
+import { rangeBars } from './src/analytics/rangebars'
+import { volumeBars } from './src/analytics/volumebars'
+import { computeFootprint } from './src/analytics/footprint'
+import { computeTpo } from './src/analytics/tpo'
+import { tickBars } from './src/analytics/tickbars'
+import { hvSeries, ivFromPayout, realizedUpProb } from './src/analytics/ivhv'
 import { buildCalibrationReport, type CalibrationStoreSlice } from './src/analytics/calibration'
 import { computeStepStats, computeIntervalStats } from './src/analytics/randomness'
 import { loadOtcHarvest } from './src/analytics/otcHarvest'
@@ -361,6 +367,198 @@ const httpServer = createServer(async (req, res) => {
           sellSignal: pf.sellSignal,
           count: pf.columns.length,
           columns: pf.columns.slice(-40),
+        })
+      }
+
+      // ---------- Task 63 chart-type engines ----------
+      // Range bars: every bar spans EXACTLY `range` of price (open -> close);
+      // no time axis, no reversal multiplier. Engine of record:
+      // analytics/rangebars.ts. Read-only research surface + chart data.
+      if (path === '/rangebars') {
+        const t = tfStrict(q.get('tf'))
+        if (t === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+        const asset = q.get('asset') ?? market.activeAsset
+        const limit = Math.min(Number(q.get('limit') ?? 400), 1000)
+        const candles = market.getCandles(asset, t, limit, true)
+        const rangeRaw = Number(q.get('range'))
+        const r = rangeBars(candles, {
+          range: Number.isFinite(rangeRaw) && rangeRaw > 0 ? rangeRaw : undefined,
+          atrPeriod: Math.round(Number(q.get('atrPeriod') ?? 14)) || 14,
+          atrMult: Number(q.get('atrMult') ?? 0.5) || 0.5,
+        })
+        return json(200, {
+          ok: true,
+          asset,
+          tf: t,
+          feed: market.mode,
+          closedOnly: true,
+          range: r.range,
+          rangeRule: r.rangeRule,
+          timeRule: r.timeRule,
+          trend: r.trend,
+          streak: r.streak,
+          flips: r.flips,
+          count: r.bars.length,
+          bars: r.bars.slice(-200),
+        })
+      }
+
+      // Constant (equi) volume bars: a bar closes when cumulative volume
+      // first reaches `per`. All-zero-volume windows 400 honestly (post-
+      // restart archives can carry volume 0 - Task 59 finding).
+      if (path === '/volumebars') {
+        const t = tfStrict(q.get('tf'))
+        if (t === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+        const asset = q.get('asset') ?? market.activeAsset
+        const limit = Math.min(Number(q.get('limit') ?? 400), 1000)
+        const candles = market.getCandles(asset, t, limit, true)
+        const perRaw = Number(q.get('per'))
+        const r = volumeBars(candles, { per: Number.isFinite(perRaw) && perRaw > 0 ? perRaw : undefined })
+        if (r.degenerate) {
+          return json(400, { ok: false, error: 'all-zero volume window - constant volume bars are undefined (feed carries no volume; post-restart archives can file volume 0)', volumeSource: r.volumeSource })
+        }
+        return json(200, {
+          ok: true,
+          asset,
+          tf: t,
+          feed: market.mode,
+          closedOnly: true,
+          per: r.per,
+          perRule: r.perRule,
+          timeRule: r.timeRule,
+          volumeSource: r.volumeSource,
+          volumeNote: 'volume (approx) - IQ OTC volume is commonly a tick/sample count, not traded size',
+          count: r.bars.length,
+          bars: r.bars.slice(-160),
+        })
+      }
+
+      // Volume footprint / cluster chart: per-candle price-bin ladder with
+      // CLV buy/sell split - an approximation (no bid/ask feed), every
+      // response says so via `method`.
+      if (path === '/footprint') {
+        const t = tfStrict(q.get('tf'))
+        if (t === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+        const asset = q.get('asset') ?? market.activeAsset
+        const limit = Math.min(Number(q.get('limit') ?? 120), 300)
+        const candles = market.getCandles(asset, t, limit, true)
+        const fp = computeFootprint(candles, {
+          binsPerCandle: Math.round(Number(q.get('bins') ?? 8)) || 8,
+          imbalanceRatio: Number(q.get('imbalance') ?? 3) || 3,
+        })
+        return json(200, {
+          ok: true,
+          asset,
+          tf: t,
+          feed: market.mode,
+          closedOnly: true,
+          binsPerCandle: fp.binsPerCandle,
+          imbalanceRatio: fp.imbalanceRatio,
+          method: fp.method,
+          count: fp.candles.length,
+          candles: fp.candles.slice(-50),
+        })
+      }
+
+      // Market Profile / TPO: single-print-per-period profile over the
+      // window, POC + 70% value area + initial balance.
+      if (path === '/tpo') {
+        const t = tfStrict(q.get('tf'))
+        if (t === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+        const asset = q.get('asset') ?? market.activeAsset
+        const limit = Math.min(Number(q.get('limit') ?? 400), 1000)
+        const candles = market.getCandles(asset, t, limit, true)
+        const prof = computeTpo(candles, {
+          periodSec: Math.round(Number(q.get('periodSec') ?? 1800)) || 1800,
+          binCount: Math.round(Number(q.get('bins') ?? 60)) || 60,
+        })
+        return json(200, {
+          ok: true,
+          asset,
+          tf: t,
+          feed: market.mode,
+          closedOnly: true,
+          periodSec: prof.periodSec,
+          periodRule: prof.periodRule,
+          countRule: prof.countRule,
+          poc: prof.poc,
+          valueAreaHigh: prof.valueAreaHigh,
+          valueAreaLow: prof.valueAreaLow,
+          ibHigh: prof.ibHigh,
+          ibLow: prof.ibLow,
+          totalTpos: prof.totalTpos,
+          bins: prof.bins,
+          periods: prof.periods.slice(-40),
+        })
+      }
+
+      // Tick chart: N price observations per bar. Real sub-candle ticks from
+      // the sidecar's 100ms capture buffer when LIVE and filled enough,
+      // otherwise 5s candle closes as pseudo-ticks - getTickSeries' honest
+      // dataSource contract, surfaced verbatim.
+      if (path === '/ticks') {
+        const asset = q.get('asset') ?? market.activeAsset
+        const perRaw = Number(q.get('per'))
+        const { points, dataSource } = await market.getTickSeries(asset)
+        const r = tickBars(points, { per: Number.isFinite(perRaw) && perRaw >= 2 ? perRaw : undefined, dataSource })
+        return json(200, {
+          ok: true,
+          asset,
+          feed: market.mode,
+          dataSource: r.dataSource,
+          per: r.per,
+          perRule: r.perRule,
+          timeRule: r.timeRule,
+          points: points.length,
+          count: r.bars.length,
+          bars: r.bars.slice(-160),
+          note: r.dataSource === 'candle' ? 'pseudo-ticks = 5s candle closes (no raw tick buffer available) - NOT raw tick data' : 'real broker price changes from the 100ms capture buffer (coalescing bounded by poll rate)',
+        })
+      }
+
+      // IV vs HV: annualized rolling realized vol (real math) against the
+      // payout-implied breakeven probability (the honest IV-ANALOG here - a
+      // true option-market IV is not recoverable from a single ATM payout;
+      // see analytics/ivhv.ts for why the classic inversion has no solution).
+      if (path === '/iv_hv') {
+        const t = tfStrict(q.get('tf'))
+        if (t === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+        const asset = q.get('asset') ?? market.activeAsset
+        const limit = Math.min(Number(q.get('limit') ?? 400), 1000)
+        const candles = market.getCandles(asset, t, limit, true)
+        const hv = hvSeries(candles, { window: Math.round(Number(q.get('window') ?? 20)) || 20 })
+        // observed payout samples (accrues live, resets on restart)
+        const hist = market.getPayoutHistory(asset).slice(-500)
+        const payoutNow = market.payoutFor(asset, 'binary')
+        let ivSeries = hist.map((s) => ({ time: s.t, payout: s.payout, breakevenPct: ivFromPayout(s.payout).breakevenPct }))
+        let ivSource: 'observed' | 'current' | 'none' = 'observed'
+        if (ivSeries.length === 0) {
+          if (Number.isFinite(payoutNow) && payoutNow > 0) {
+            ivSeries = [{ time: Date.now() / 1000, payout: payoutNow, breakevenPct: ivFromPayout(payoutNow).breakevenPct }]
+            ivSource = 'current'
+          } else {
+            ivSource = 'none'
+          }
+        } else {
+          // fold the current quote in when it moved past the last sample
+          const lastP = ivSeries[ivSeries.length - 1].payout
+          if (Number.isFinite(payoutNow) && payoutNow > 0 && Math.abs(payoutNow - lastP) > 1e-9) {
+            ivSeries.push({ time: Date.now() / 1000, payout: payoutNow, breakevenPct: ivFromPayout(payoutNow).breakevenPct })
+          }
+        }
+        return json(200, {
+          ok: true,
+          asset,
+          tf: t,
+          feed: market.mode,
+          closedOnly: true,
+          hv: hv.series,
+          hvNow: hv.hvNow,
+          annualization: hv.annualization,
+          iv: ivSeries,
+          ivSource,
+          ivRule: ivFromPayout(payoutNow).rule,
+          realizedUpProbPct: realizedUpProb(candles, 100),
         })
       }
 

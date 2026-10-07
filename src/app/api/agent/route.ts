@@ -103,7 +103,7 @@ function trimAnalysis(a: Record<string, unknown>): Record<string, unknown> {
   return out
 }
 
-const CHART_TYPES = ['candles', 'hollow', 'bars', 'line', 'area', 'baseline', 'heikin-ashi', 'renko', 'pointfigure']
+const CHART_TYPES = ['candles', 'hollow', 'bars', 'line', 'area', 'baseline', 'heikin-ashi', 'renko', 'pointfigure', 'rangebars', 'volumebars', 'footprint', 'tpo', 'tickchart', 'ivhv']
 
 // ---------- shared helpers for the composed power tools ----------
 
@@ -1867,7 +1867,7 @@ const TOOLS: ToolSpec[] = [
   // ---------- OS control (executed client-side) ----------
   {
     name: 'ui_control',
-    description: `Operate the user's OS interface. ALWAYS pass "cmd" - one of: set_asset (+"asset":"BTCUSD"), set_tf (+"tf":"5m"), set_chart_type (+"chartType":"heikin-ashi"), add_indicator (+"id":"bollinger", optional "params":{...}, "pane":"overlay"|"sub"), remove_indicator (+"id":"macd"), clear_indicators. Use it to set up the workspace for your analysis.`,
+    description: `Operate the user's OS interface. ALWAYS pass "cmd" - one of: set_asset (+"asset":"BTCUSD"), set_tf (+"tf":"5m"), set_chart_type (+"chartType":"heikin-ashi" - candles|hollow|bars|line|area|baseline|heikin-ashi|renko|pointfigure|rangebars|volumebars|footprint|tpo|tickchart|ivhv), add_indicator (+"id":"bollinger", optional "params":{...}, "pane":"overlay"|"sub"), remove_indicator (+"id":"macd"), clear_indicators. Use it to set up the workspace for your analysis.`,
     args: '{"cmd": "set_asset", "asset": "BTCUSD"}  |  {"cmd": "add_indicator", "id": "macd", "pane": "sub"}',
     run: async (aRaw, ctx) => {
       const ALL_TFS = ['5s', '15s', '30s', '1m', '2m', '5m', '15m', '30m', '1h', '4h', '1d']
@@ -1904,6 +1904,12 @@ const TOOLS: ToolSpec[] = [
         heikinashi: 'heikin-ashi', heikin: 'heikin-ashi', ha: 'heikin-ashi',
         renko: 'renko',
         pointfigure: 'pointfigure', pointandfigure: 'pointfigure', pnf: 'pointfigure', pf: 'pointfigure', pandf: 'pointfigure',
+        rangebars: 'rangebars', rangebar: 'rangebars', range: 'rangebars',
+        volumebars: 'volumebars', volumebar: 'volumebars', volume: 'volumebars', constantvolume: 'volumebars', cvb: 'volumebars',
+        footprint: 'footprint', cluster: 'footprint', clusterchart: 'footprint', volumeprint: 'footprint',
+        tpo: 'tpo', marketprofile: 'tpo', timeprice: 'tpo', timepriceopportunity: 'tpo', profile: 'tpo',
+        tickchart: 'tickchart', tick: 'tickchart', ticks: 'tickchart', tickbars: 'tickchart',
+        ivhv: 'ivhv', ivvshv: 'ivhv', ivhvchart: 'ivhv', impliedvolatility: 'ivhv',
       }
       // ---- build command queue (inferred from args when cmd is missing) ----
       const queue: { cmd: string; args: Record<string, unknown> }[] = []

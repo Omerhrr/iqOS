@@ -148,7 +148,7 @@ export interface AccountState {
 
 // ---------- Analytics ----------
 
-export type ChartType = 'candles' | 'hollow' | 'heikin' | 'bars' | 'line' | 'area' | 'baseline' | 'renko'
+export type ChartType = 'candles' | 'hollow' | 'heikin' | 'bars' | 'line' | 'area' | 'baseline' | 'renko' | 'pointfigure' | 'rangebars' | 'volumebars' | 'footprint' | 'tpo' | 'tickchart' | 'ivhv'
 
 export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'candles', label: 'Candles' },
@@ -159,6 +159,13 @@ export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'area', label: 'Area' },
   { id: 'baseline', label: 'Baseline' },
   { id: 'renko', label: 'Renko' },
+  { id: 'pointfigure', label: 'P&F' },
+  { id: 'rangebars', label: 'Range' },
+  { id: 'volumebars', label: 'Vol Bars' },
+  { id: 'footprint', label: 'Footprint' },
+  { id: 'tpo', label: 'TPO' },
+  { id: 'tickchart', label: 'Tick' },
+  { id: 'ivhv', label: 'IV·HV' },
 ]
 
 export type Direction = 'call' | 'put' | 'none'

@@ -105,6 +105,13 @@ export class MarketDataService {
   private sidecarPayouts: Map<string, { binary: number | null; turbo: number | null }> = new Map()
   private sidecarAssetsTs = 0
   private static SIDECAR_ASSETS_TTL = 10 * 60_000
+  // Payout sample history per instrument (for the /iv_hv IV-proxy series):
+  // {t, payout} appended on every metadata refresh that carries a payout,
+  // deduped against the last sample so unchanged quotes do not create
+  // stair-steps. In-memory by design - accrues live, resets on restart
+  // (the /iv_hv response discloses ivSource honestly).
+  private payoutHistory: Map<string, { t: number; payout: number }[]> = new Map()
+  private static PAYOUT_HISTORY_CAP = 2000
 
   /** Refresh the IQ tradable-asset list from the sidecar (10 min TTL).
    * NOTE: the sidecar's get_asset_metadata round-trip against IQ is SLOW
@@ -166,6 +173,18 @@ export class MarketDataService {
         this.sidecarRows = out.map((r) => ({ ticker: r.ticker, category: r.category, open: r.open, payout: r.payout }))
         this.sidecarAssets = new Set(out.map((r) => r.ticker))
         this.sidecarPayouts = new Map(out.map((r) => [r.ticker, { binary: r.payout, turbo: r.turbo ?? r.payout }]))
+        // Task 63: sample the payout curve for the IV-proxy series (dedup:
+        // only when the quote actually moved since the last sample)
+        const nowSec = Date.now() / 1000
+        for (const r of out) {
+          if (r.payout === null || !Number.isFinite(r.payout) || r.payout <= 0) continue
+          const hist = this.payoutHistory.get(r.ticker) ?? []
+          const last = hist[hist.length - 1]
+          if (last && Math.abs(last.payout - r.payout) < 1e-9) continue
+          hist.push({ t: nowSec, payout: r.payout })
+          if (hist.length > MarketDataService.PAYOUT_HISTORY_CAP) hist.splice(0, hist.length - MarketDataService.PAYOUT_HISTORY_CAP)
+          this.payoutHistory.set(r.ticker, hist)
+        }
         this.sidecarAssetsTs = Date.now()
         const withPay = out.filter((r) => r.payout !== null).length
         this.ctx.log('market-data', `IQ asset universe refreshed: ${out.length} instruments (${out.filter((r) => r.open).length} open, ${out.filter((r) => r.ticker.endsWith('-OTC')).length} OTC, ${withPay} with real payouts)`)
@@ -1020,6 +1039,14 @@ export class MarketDataService {
   iqairSymbol(ticker: string): string {
     const a = getInstrument(ticker)
     return a?.iqairName ?? ticker
+  }
+
+  /** Observed payout samples for the /iv_hv IV-proxy series (Task 63).
+   * Accepts either the OS ticker or the iqair symbol. In-memory, accrues
+   * live, resets on kernel restart - callers must disclose that. */
+  getPayoutHistory(ticker: string): { t: number; payout: number }[] {
+    const sym = this.iqairSymbol(ticker)
+    return (sym !== ticker ? this.payoutHistory.get(sym) : undefined) ?? this.payoutHistory.get(ticker) ?? []
   }
 }
 
