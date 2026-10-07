@@ -251,11 +251,20 @@ export class StrategyLabService {
         name: row.spec.name,
       })
       const oldStats = (row.stats ?? {}) as { holdout?: SimMetrics; breakeven?: number }
-      const decayed = !fresh.ok || fresh.holdout === null || fresh.holdout.winRate < fresh.breakevenWinRate || fresh.foldsProfitable === 0
+      // AUDIT FIX (Task 58, P2): foldsProfitable === 0 used to conflate "no
+      // OOS folds could be built (short history)" with "every fold lost" -
+      // healthy specs learned on ~120-173 bars were flagged decayed and their
+      // bots auto-disarmed on every 15-min relearn (the alert even fabricated
+      // a "0/3" denominator). Only judge decay when folds were actually built.
+      const noFoldsBuilt = fresh.holdoutFolds.length === 0
+      const decayed =
+        !fresh.ok || fresh.holdout === null || fresh.holdout.winRate < fresh.breakevenWinRate || (!noFoldsBuilt && fresh.foldsProfitable === 0)
       if (decayed) {
         const reason = !fresh.ok
           ? 'no signal still clears its filters on fresh data'
-          : `fresh holdout ${fresh.holdout!.winRate.toFixed(1)}% vs breakeven ${fresh.breakevenWinRate.toFixed(1)}%, ${fresh.foldsProfitable}/${fresh.holdoutFolds.length || 3} OOS folds profitable`
+          : noFoldsBuilt
+            ? `fresh holdout ${fresh.holdout!.winRate.toFixed(1)}% vs breakeven ${fresh.breakevenWinRate.toFixed(1)}% (history too short to build OOS folds - judged on the holdout only)`
+            : `fresh holdout ${fresh.holdout!.winRate.toFixed(1)}% vs breakeven ${fresh.breakevenWinRate.toFixed(1)}%, ${fresh.foldsProfitable}/${fresh.holdoutFolds.length} OOS folds profitable`
         this.ctx.bus.emit('alert', {
           level: 'danger',
           message: `[lab] "${row.spec.name}" (${row.id}) looks DECAYED on re-learn - ${reason}. Kept the last-good spec live but disarmed any bot trading it.`,
@@ -358,8 +367,12 @@ export class StrategyLabService {
     const minSamplesAsk = Math.max(10, Math.round(opts.minSamples ?? 40))
     const minEdge = Math.max(0.5, Math.min(20, Number(opts.minEdge ?? 2)))
     const maxSignals = Math.max(2, Math.min(12, Math.round(opts.maxSignals ?? 8)))
-    const payout = Math.max(0.5, Math.min(0.95, Number(opts.payout ?? 0.7)))
-    const amount = Math.max(1, Number(opts.amount ?? 10))
+    const payout = Math.max(0.5, Math.min(0.95, Number.isFinite(Number(opts.payout)) ? Number(opts.payout) : 0.7))
+    // AUDIT FIX (Task 58, P2): Math.max(1, NaN) is NaN - a garbage amount
+    // ("abc") used to flow into simFromSeries and produce NaN netPnl /
+    // breakeven, which JSON.stringify turned into null IN THE RESPONSE and
+    // into the persisted lab stats. Garbage falls back to the defaults.
+    const amount = Math.max(1, Number.isFinite(Number(opts.amount)) ? Number(opts.amount) : 10)
     const bars = Math.max(300, Math.min(2200, Math.round(opts.bars ?? 1200)))
     const basis: Basis = opts.basis === 'heikin' || opts.basis === 'kalman' || opts.basis === 'typical' || opts.basis === 'smoothed' ? opts.basis : 'candles'
 

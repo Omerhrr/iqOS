@@ -531,6 +531,7 @@ function SingleTab({ asset, strategies }: { asset: string; strategies: StrategyI
   const [spreadPct, setSpreadPct] = useState('0')
   const [slippagePct, setSlippagePct] = useState('0')
   const [commissionPct, setCommissionPct] = useState('0')
+  const [edgeTrigger, setEdgeTrigger] = useState(false)
   const [direction, setDirection] = useState<'both' | 'call' | 'put'>('both')
   const [paramValues, setParamValues] = useState<Record<string, Record<string, string>>>({})
   const [result, setResult] = useState<BacktestResult | null>(null)
@@ -594,6 +595,7 @@ function SingleTab({ asset, strategies }: { asset: string; strategies: StrategyI
         params,
         stakePlan,
         direction,
+        edgeTrigger,
       })
       if (res.ok && res.result) setResult(res.result)
       else setError(res.error ?? 'backtest failed')
@@ -672,6 +674,17 @@ function SingleTab({ asset, strategies }: { asset: string; strategies: StrategyI
               className="h-3 w-3 accent-cyan-500"
             />
             <span className="font-mono text-[10px] text-[#9aa8bd]">{mode !== 'binary' ? 'binary only' : compound ? 'on' : 'off'}</span>
+          </label>
+        </Field>
+        <Field label="Edge-trigger">
+          <label className={`flex h-8 items-center gap-1.5 rounded border border-[#1c2739] bg-[#101828] px-2`}>
+            <input
+              type="checkbox"
+              checked={edgeTrigger}
+              onChange={(e) => setEdgeTrigger(e.target.checked)}
+              className="h-3 w-3 accent-cyan-500"
+            />
+            <span className="font-mono text-[10px] text-[#9aa8bd]">{edgeTrigger ? 'live-like' : 'every bar'}</span>
           </label>
         </Field>
         <Field label="Direction">
@@ -858,6 +871,7 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
   const [spreadPct, setSpreadPct] = useState('0')
   const [slippagePct, setSlippagePct] = useState('0')
   const [commissionPct, setCommissionPct] = useState('0')
+  const [edgeTrigger, setEdgeTrigger] = useState(false)
   const [sweepState, setSweepState] = useState<SweepState>({})
   const [fixedParams, setFixedParams] = useState<Record<string, string>>({})
   const [result, setResult] = useState<GridSearchResult | null>(null)
@@ -923,6 +937,7 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
         slippagePct: Number(slippagePct),
         commissionPct: Number(commissionPct),
         direction,
+        edgeTrigger,
       })
       if (res.ok && res.result) {
         setResult(res.result)
@@ -984,6 +999,17 @@ function OptimizerTab({ asset, strategies }: { asset: string; strategies: Strate
         </Field>
         <Field label="Commission %">
           <Input value={commissionPct} onChange={(e) => setCommissionPct(e.target.value)} className={`${inCls} w-14`} />
+        </Field>
+        <Field label="Edge-trigger">
+          <label className={`flex h-8 items-center gap-1.5 rounded border border-[#1c2739] bg-[#101828] px-2`}>
+            <input
+              type="checkbox"
+              checked={edgeTrigger}
+              onChange={(e) => setEdgeTrigger(e.target.checked)}
+              className="h-3 w-3 accent-cyan-500"
+            />
+            <span className="font-mono text-[10px] text-[#9aa8bd]">{edgeTrigger ? 'live-like' : 'every bar'}</span>
+          </label>
         </Field>
         <Field label="Direction">
           <DirectionPicker value={direction} onChange={setDirection} />
@@ -1128,6 +1154,7 @@ function WalkForwardTab({ asset, strategies }: { asset: string; strategies: Stra
   const [spreadPct, setSpreadPct] = useState('0')
   const [slippagePct, setSlippagePct] = useState('0')
   const [commissionPct, setCommissionPct] = useState('0')
+  const [edgeTrigger, setEdgeTrigger] = useState(false)
   const [sweepState, setSweepState] = useState<SweepState>({})
   const [fixedParams, setFixedParams] = useState<Record<string, string>>({})
   const [result, setResult] = useState<WalkForwardResult | null>(null)
@@ -1161,6 +1188,7 @@ function WalkForwardTab({ asset, strategies }: { asset: string; strategies: Stra
         slippagePct: Number(slippagePct),
         commissionPct: Number(commissionPct),
         direction,
+        edgeTrigger,
       })
       if (res.ok && res.result) setResult(res.result)
       else setError(res.error ?? 'walk-forward failed')
@@ -1224,6 +1252,17 @@ function WalkForwardTab({ asset, strategies }: { asset: string; strategies: Stra
         </Field>
         <Field label="Commission %">
           <Input value={commissionPct} onChange={(e) => setCommissionPct(e.target.value)} className={`${inCls} w-14`} />
+        </Field>
+        <Field label="Edge-trigger">
+          <label className={`flex h-8 items-center gap-1.5 rounded border border-[#1c2739] bg-[#101828] px-2`}>
+            <input
+              type="checkbox"
+              checked={edgeTrigger}
+              onChange={(e) => setEdgeTrigger(e.target.checked)}
+              className="h-3 w-3 accent-cyan-500"
+            />
+            <span className="font-mono text-[10px] text-[#9aa8bd]">{edgeTrigger ? 'live-like' : 'every bar'}</span>
+          </label>
         </Field>
         <Field label="Direction">
           <DirectionPicker value={direction} onChange={setDirection} />
@@ -1372,6 +1411,7 @@ function SweepTab({
   const [spreadPct, setSpreadPct] = useState('0')
   const [slippagePct, setSlippagePct] = useState('0')
   const [commissionPct, setCommissionPct] = useState('0')
+  const [edgeTrigger, setEdgeTrigger] = useState(false)
   const [sharedWindow, setSharedWindow] = useState(true)
   const [paramValues, setParamValues] = useState<Record<string, Record<string, string>>>({})
   const [result, setResult] = useState<SweepResult | null>(null)
@@ -1426,6 +1466,7 @@ function SweepTab({
         commissionPct: Number(commissionPct),
         sharedWindow,
         direction,
+        edgeTrigger,
       })
       if (res.ok && res.result) setResult(res.result)
       else setError(res.error ?? 'asset sweep failed')
@@ -1500,6 +1541,17 @@ function SweepTab({
         </Field>
         <Field label="Commission %">
           <Input value={commissionPct} onChange={(e) => setCommissionPct(e.target.value)} className={`${inCls} w-14`} />
+        </Field>
+        <Field label="Edge-trigger">
+          <label className={`flex h-8 items-center gap-1.5 rounded border border-[#1c2739] bg-[#101828] px-2`}>
+            <input
+              type="checkbox"
+              checked={edgeTrigger}
+              onChange={(e) => setEdgeTrigger(e.target.checked)}
+              className="h-3 w-3 accent-cyan-500"
+            />
+            <span className="font-mono text-[10px] text-[#9aa8bd]">{edgeTrigger ? 'live-like' : 'every bar'}</span>
+          </label>
         </Field>
         <Field label="Direction">
           <DirectionPicker value={direction} onChange={setDirection} />

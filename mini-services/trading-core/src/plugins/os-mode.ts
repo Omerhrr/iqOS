@@ -503,11 +503,11 @@ export class ModeService {
           signalSource: (['screener', 'kalman-ou', 'markov', 'momentum', 'confluence', 'strategy'] as const).includes(c.signalSource as AutoTraderSource)
             ? (c.signalSource as AutoTraderSource)
             : DEFAULT_AUTOTRADER.signalSource,
-          tf: (typeof c.tf === 'string' ? c.tf : DEFAULT_AUTOTRADER.tf) as Timeframe,
+          tf: (typeof c.tf === 'string' && (ALL_TIMEFRAMES as string[]).includes(c.tf) ? c.tf : DEFAULT_AUTOTRADER.tf) as Timeframe,
           expiryTf: typeof c.expiryTf === 'string' && (ALL_TIMEFRAMES as string[]).includes(c.expiryTf) ? (c.expiryTf as Timeframe) : undefined,
-          stake: num(c.stake, DEFAULT_AUTOTRADER.stake),
-          minScore: num(c.minScore, DEFAULT_AUTOTRADER.minScore),
-          minConfidence: num(c.minConfidence, DEFAULT_AUTOTRADER.minConfidence),
+          stake: clamp(num(c.stake, DEFAULT_AUTOTRADER.stake), 1, 5000),
+          minScore: clamp(num(c.minScore, DEFAULT_AUTOTRADER.minScore), 0, 100),
+          minConfidence: clamp(num(c.minConfidence, DEFAULT_AUTOTRADER.minConfidence), 0, 100),
           zEntry: num(c.zEntry, DEFAULT_AUTOTRADER.zEntry),
           maxHalfLife: num(c.maxHalfLife, DEFAULT_AUTOTRADER.maxHalfLife),
           requireValidation: typeof c.requireValidation === 'boolean' ? c.requireValidation : DEFAULT_AUTOTRADER.requireValidation,
@@ -523,12 +523,14 @@ export class ModeService {
           pairStrategy: ModeService.sanitizePairStrategy(c.pairStrategy),
           directionStrategy: ModeService.sanitizeDirectionStrategy(c.directionStrategy),
           direction: c.direction === 'call' || c.direction === 'put' ? c.direction : 'both',
-          maxOpen: Math.round(num(c.maxOpen, DEFAULT_AUTOTRADER.maxOpen)),
+          maxOpen: clamp(Math.round(num(c.maxOpen, DEFAULT_AUTOTRADER.maxOpen)), 1, 10),
           cooldownSec: Math.round(num(c.cooldownSec, DEFAULT_AUTOTRADER.cooldownSec)),
           paceSec: Math.round(num(c.paceSec, DEFAULT_AUTOTRADER.paceSec)),
           dailyProfitTarget: num(c.dailyProfitTarget, 0),
           dailyLossLimit: num(c.dailyLossLimit, 0),
-          watchlist: Array.isArray(c.watchlist) ? c.watchlist.filter((x): x is string => typeof x === 'string') : [],
+          watchlist: Array.isArray(c.watchlist)
+            ? c.watchlist.filter((x): x is string => typeof x === 'string').map((x) => x.trim().toUpperCase()).filter(Boolean)
+            : [],
           watchlistMode: c.watchlistMode === 'exclude' ? 'exclude' : 'only',
           marketScope: c.marketScope === 'real' || c.marketScope === 'otc' ? c.marketScope : 'all',
           smartStaking: typeof c.smartStaking === 'boolean' ? c.smartStaking : false,
@@ -659,9 +661,14 @@ export class ModeService {
       this.maybeAutoDiscover()
     }
 
-    // compound stop-on-loss: a cycle that took a loss is DEAD until an
-    // explicit restart() - same semantics as a compound bot in autopilot.ts
-    if (this.config.stakePlan?.stopOnLoss !== false && this.rt.halted) {
+    // compound stop-on-loss / completion: a halted or completed cycle is DEAD
+    // until an explicit restart(). AUDIT FIX (Task 58, P2): the old condition
+    // `stopOnLoss !== false && halted` meant a config with stopOnLoss:false +
+    // periods:N + onComplete:'halt' NEVER halted - the full banked pot kept
+    // being wagered and every further win re-tripped "cycle COMPLETE". The
+    // flag is the single source of truth here; stopOnLoss only governs
+    // whether a LOSS halts the cycle, not whether a halt is respected.
+    if (this.rt.halted || this.rt.complete) {
       return this.standDown(
         this.rt.complete
           ? `compound cycle COMPLETE (${this.rt.rollN}/${this.config.stakePlan?.periods ?? '?'} periods banked) - restart for a fresh cycle`
@@ -707,6 +714,16 @@ export class ModeService {
       // ("never trade Fridays", "only trade ...", "max stake $...", rate caps)
       // bind the OS's own trader too - the user's words outrank the machine
       const bet = this.stakeForAuto(row)
+      // Task 58 (P1): port autopilot's compound over-bet guard - with a dust
+      // pot the old stakeForAuto floor bet Math.max(1, ...) i.e. MORE than
+      // the pot, and a loss burned the whole cycle via the silent reseed in
+      // the fold math. The honest move is the same one autopilot makes:
+      // stand the cycle down with the restart hint.
+      if (bet.compound && bet.pot >= 0.01 && bet.amount > bet.pot) {
+        return this.standDown(
+          `compound pot $${bet.pot.toFixed(2)} is below the $1 broker minimum stake - restart the auto-trader cycle to re-seed`,
+        )
+      }
       try {
         const mg = this.ctx.use<{ check: (asset: string, stake: number) => { ok: boolean; reason?: string } }>('memoryGate')
         const g = mg.check(row.asset, bet.amount)
@@ -716,19 +733,33 @@ export class ModeService {
       }
 
       // OTC defense gate: generator-driven OTC charts don't respect TA. Under
-      // policy 'enforce', an OTC pair may only be auto-traded when its
-      // (asset, signalSource) pair holds a fresh passing placebo verdict
-      // (plugins/otcguard.ts). Unlike the memory gate this is a PAIR-level
-      // problem, not a rule violation - cool the pair down and try the next
-      // signal in the same tick, exactly like the broker-unavailable path
-      // below, so one unverified OTC pair can't stall the whole loop.
+      // policy 'enforce', an OTC pair may only be auto-traded when the
+      // strategies that would actually decide for it hold a fresh passing
+      // placebo verdict (plugins/otcguard.ts). AUDIT FIX (Task 58, P2): the
+      // check used to be keyed by signalSource ('screener'/'confluence'/...)
+      // - a key no verdict is ever minted under - so under enforce the
+      // auto-trader could never trade ANY OTC pair even when its configured
+      // strategies had fresh passing verdicts (the autopilot side already
+      // checked the right key). Now every strategy that would be consulted
+      // for THIS asset (pins first, then pool, then fixed sources) must pass;
+      // fixed sources (screener etc.) still fail honestly under enforce -
+      // there is no placebo evidence for a non-strategy signal.
       try {
         const guard = this.ctx.use<{ check: (target: { asset: string; otc?: boolean }, strategyKey: string) => { ok: boolean; reason?: string } }>('otcGuard')
-        const g = guard.check({ asset: row.asset, otc: row.otc }, String(this.config.signalSource ?? 'confluence'))
-        if (!g.ok) {
-          this.assetRejectedUntil.set(row.asset, this.now() + ModeService.OTC_DEFENSE_COOLDOWN_SEC)
-          lastReason = g.reason ?? 'OTC defense gate hold'
-          continue
+        if (row.otc) {
+          let verdict: { ok: boolean; reason?: string } | null = null
+          for (const key of this.otcStrategyKeysFor(row.asset)) {
+            const g = guard.check({ asset: row.asset, otc: row.otc }, key)
+            if (!g.ok) {
+              verdict = g
+              break
+            }
+          }
+          if (verdict) {
+            this.assetRejectedUntil.set(row.asset, this.now() + ModeService.OTC_DEFENSE_COOLDOWN_SEC)
+            lastReason = verdict.reason ?? 'OTC defense gate hold'
+            continue
+          }
         }
       } catch {
         // otc guard plugin not loaded - OTC gating disabled
@@ -748,7 +779,13 @@ export class ModeService {
       // options-capability gate uses).
       const minPay = (this.config.minPayoutPct ?? 0) / 100
       if (minPay > 0) {
-        const pay = row.payout > 0 ? row.payout : this.payoutFor(row.asset, 'binary')
+        // Task 58 (P3): the FRESH read wins - row.payout was frozen when the
+        // screener row was built (payouts re-quote per pair per hour), so a
+        // payout that has since dropped below the floor used to pass on the
+        // stale number (and a stale low number benched a pair that now pays
+        // fine). The stale row value is only a fallback for cold metadata.
+        const freshPay = this.payoutFor(row.asset, 'binary')
+        const pay = freshPay > 0 ? freshPay : row.payout
         if (pay > 0 && pay < minPay) {
           this.assetRejectedUntil.set(row.asset, this.now() + ModeService.PAYOUT_FLOOR_COOLDOWN_SEC)
           lastReason = `payout ${(pay * 100).toFixed(0)}% below the ${this.config.minPayoutPct}% floor (breakeven ${((100 / (1 + pay))).toFixed(1)}% here) - waiting for a better-paying pair`
@@ -764,7 +801,7 @@ export class ModeService {
       // with the same visible-rejection + cooldown treatment as the payout
       // floor. Synthetic OTC feeds have no vol memory, so there the gate
       // never fires - it costs one cheap analyze and changes nothing.
-      if (this.config.volGate === 'avoid-volatile') {
+      if (this.config.volGate === 'avoid-volatile' && !row.otc) {
         try {
           const a = this.ctx.use<AnalyticsService>('analytics').analyze(row.asset, this.config.tf)
           const r = classifyRegime(a)
@@ -1152,7 +1189,9 @@ export class ModeService {
     if (!v || typeof v !== 'object') return undefined
     const out: Record<string, string> = {}
     for (const [asset, id] of Object.entries(v as Record<string, unknown>)) {
-      if (typeof asset === 'string' && asset.trim() && typeof id === 'string' && id.trim()) out[asset.trim()] = id.trim()
+      // Task 58 (P3): keys are uppercased - "eurusd-OTC" silently matched
+      // nothing and the pin was inert while the config alert announced it
+      if (typeof asset === 'string' && asset.trim() && typeof id === 'string' && id.trim()) out[asset.trim().toUpperCase()] = id.trim()
     }
     return Object.keys(out).length ? out : undefined
   }
@@ -1347,7 +1386,7 @@ export class ModeService {
           })
           .filter((s) => s.valid)
       const liveSpecs = ids.length ? resolveMemberSpecs(ids) : []
-      if (!liveSpecs.length && !hasPairOverrides) return null // every picked id is unknown/removed - misconfigured
+      if (!liveSpecs.length && !hasPairOverrides && !hasDirOverrides) return null // every picked id is unknown/removed AND no pins exist - misconfigured (a direction-only config has hasDirOverrides and must reach the per-asset resolution below)
 
       let adaptive: AdaptiveService | null = null
       if (liveSpecs.length > 1 && this.config.strategyPickMode === 'best') {
@@ -1599,7 +1638,12 @@ export class ModeService {
         if (!majority) continue // tied vote - no edge either way
         const direction = majority[0].direction
         if (this.config.direction !== 'both' && direction !== this.config.direction) continue
-        const agreementPct = Math.round((majority.length / assetSpecs.length) * 100)
+        // Task 58 (P3): the denominator is the LIVE voters (members that
+        // actually cast a vote this tick) - benched/errored members used to
+        // dilute the agreement % below minConfidence and silently kill a
+        // unanimous-alive-vote signal. The note now also reports honestly
+        // how many members were counted.
+        const agreementPct = Math.round((majority.length / Math.max(1, votes.length)) * 100)
         if (agreementPct < this.config.minConfidence) continue
         const avgScore = majority.reduce((a, v) => a + Math.abs(v.score), 0) / majority.length
         // rank by agreement % first (coarse, *1000 so it dominates), avg
@@ -1613,7 +1657,7 @@ export class ModeService {
             direction,
             avgScore,
             price,
-            `ensemble ${majority.length}/${assetSpecs.length} agree (${majority.map((v) => v.id).join(', ')}) · avg ${avgScore.toFixed(0)}`,
+            `ensemble ${majority.length}/${votes.length} agree (${majority.map((v) => v.id).join(', ')}) · avg ${avgScore.toFixed(0)}`,
             agreementPct,
             `ensemble:${majority.map((v) => v.id).join('+')}`,
             assetOtc
@@ -1847,7 +1891,7 @@ export class ModeService {
     try {
       const store = this.ctx.use<Store>('store')
       return store
-        .listPositions('open', 100)
+        .listPositions('open', 500)
         .some((p) => p.note?.startsWith('auto:') && p.asset === asset)
     } catch {
       return false
@@ -1885,6 +1929,22 @@ export class ModeService {
       default:
         return null
     }
+  }
+
+  /** Task 58 (P2): the strategy keys whose placebo verdicts gate OTC
+   * auto-trading for ONE asset - mirrors pickStrategySignal's own resolution
+   * order (per-pair pin > direction pins (+pool for the unpinned side) >
+   * configured pool > fixed source). Every key returned must hold a fresh
+   * passing verdict under policy 'enforce'. */
+  private otcStrategyKeysFor(asset: string): string[] {
+    const pinned = this.config.pairStrategy?.[asset]
+    if (pinned) return [pinned]
+    const dir = this.config.directionStrategy
+    const dirIds = dir ? Array.from(new Set([dir.call, dir.put].filter((x): x is string => Boolean(x)))) : []
+    const ids = (this.config.strategyIds ?? []).filter((x) => typeof x === 'string' && x.trim())
+    if (dirIds.length) return Array.from(new Set([...dirIds, ...ids]))
+    if (ids.length) return ids
+    return [String(this.config.signalSource ?? 'confluence')]
   }
 
   private isBenched(key: string): boolean {
@@ -1971,7 +2031,7 @@ export class ModeService {
     if (group === null) return false
     try {
       const openAssets = this.store
-        .listPositions('open', 100)
+        .listPositions('open', 500)
         .filter((p) => p.note?.startsWith('auto:') && p.asset !== asset)
         .map((p) => p.asset)
       return openAssets.some((a) => ModeService.correlationGroupOf(a) === group)
@@ -2024,7 +2084,7 @@ export class ModeService {
     }
     try {
       const closed = this.store.listPositions('closed', 400).filter((p) => p.note?.startsWith('auto:'))
-      const open = this.store.listPositions('open', 100).filter((p) => p.note?.startsWith('auto:'))
+      const open = this.store.listPositions('open', 500).filter((p) => p.note?.startsWith('auto:'))
       rt.openCount = open.length
       for (const p of open) rt.lastAssetTs.set(p.asset, p.tsOpen)
       for (const p of closed) {
@@ -2039,10 +2099,18 @@ export class ModeService {
         } else if (p.status === 'lost') {
           rt.losses += 1
           rt.pnlToday += pnl
+        } else if (p.status === 'closed') {
+          // Task 58 (P1): manual early exits carry real pnl too - the daily
+          // loss limit used to be blind to them (autopilot parity, Task 55)
+          rt.pnlToday += pnl
         }
+        // 'push': neutral refund (pnl 0) - counted in trades, not wins/losses
         rt.lastAssetTs.set(p.asset, Math.max(rt.lastAssetTs.get(p.asset) ?? 0, p.tsOpen))
       }
-      rt.lastTradeTs = closed.reduce((acc, p) => Math.max(acc, p.tsOpen), 0)
+      // Task 58 (P2): the pace clock must ALSO see pre-restart positions that
+      // are still open - a restart used to allow a new trade <1s after the
+      // pre-restart one (paceSec only rebuilt from CLOSED positions)
+      rt.lastTradeTs = [...closed, ...open].reduce((acc, p) => Math.max(acc, p.tsOpen), 0)
     } catch {
       // journal unavailable - start from zero
     }
@@ -2052,7 +2120,16 @@ export class ModeService {
   private onPositionClosed(position: { note?: string; pnl?: number; status: string; tsOpen: number; tsClose?: number; amount: number; payout: number; asset?: string; strategy?: string }): void {
     if (!position.note?.startsWith('auto:')) return
     this.rolloverIfNeeded()
-    this.rt.openCount = Math.max(0, this.rt.openCount - 1)
+    // Task 58 (P2): recount instead of blind decrement - a rollover right
+    // before this event already rebuilt openCount WITHOUT this position, so
+    // the old -1 double-decremented and loosened maxOpen by a slot until the
+    // next rebuild. The query is scoped to auto notes exactly like the
+    // rebuild's own count.
+    try {
+      this.rt.openCount = this.store.listPositions('open', 500).filter((p) => p.note?.startsWith('auto:')).length
+    } catch {
+      this.rt.openCount = Math.max(0, this.rt.openCount - 1)
+    }
     const pnl = position.pnl ?? 0
     this.rt.pnlTotal += pnl
     if (position.status === 'won') {
@@ -2061,27 +2138,41 @@ export class ModeService {
     } else if (position.status === 'lost') {
       this.rt.losses += 1
       this.rt.pnlToday += pnl
+    } else if (position.status === 'closed') {
+      // Task 58 (P1): manual early exits count toward the daily limits too
+      this.rt.pnlToday += pnl
     }
+    // 'push': neutral refund (pnl 0) - no win/loss, nothing to add
 
     // streak-breaker: track consecutive losses per (strategy, pair) - the
     // exact identity recorded on the position at placement time, so this
     // works uniformly across every signalSource (a fixed label like
     // "kalman-ou-reversion", or a specific strategy/ensemble member id).
+    // Task 58 (P3): ensemble/pool labels ("ensemble:a+b") used to be benched
+    // as a WHOLE - a key pickStrategySignal never reads (it checks per
+    // member "${s.id}|${asset}"), so ensemble losing streaks never benched
+    // anything. The streak now propagates to every member that voted.
     if (position.asset && position.strategy && (position.status === 'won' || position.status === 'lost')) {
-      const key = `${position.strategy}|${position.asset}`
-      if (position.status === 'lost') {
-        const streak = (this.lossStreak.get(key) ?? 0) + 1
-        this.lossStreak.set(key, streak)
-        if (streak >= ModeService.STREAK_BENCH_THRESHOLD) {
-          const benchSec = Math.min(
-            ModeService.STREAK_BENCH_MAX_SEC,
-            ModeService.STREAK_BENCH_BASE_SEC * 2 ** (streak - ModeService.STREAK_BENCH_THRESHOLD)
-          )
-          this.benchedUntil.set(key, this.now() + benchSec)
-          this.emit('warn', `[AUTO-TRADER] streak-breaker: ${key} benched ${Math.round(benchSec / 60)}min after ${streak} losses in a row`)
+      const isComposite = position.strategy.startsWith('ensemble:') || position.strategy.startsWith('pool:')
+      const members = isComposite
+        ? position.strategy.slice(position.strategy.indexOf(':') + 1).split('+').map((s) => s.trim()).filter(Boolean)
+        : [position.strategy]
+      for (const memberId of members.length ? members : [position.strategy]) {
+        const key = `${memberId}|${position.asset}`
+        if (position.status === 'lost') {
+          const streak = (this.lossStreak.get(key) ?? 0) + 1
+          this.lossStreak.set(key, streak)
+          if (streak >= ModeService.STREAK_BENCH_THRESHOLD) {
+            const benchSec = Math.min(
+              ModeService.STREAK_BENCH_MAX_SEC,
+              ModeService.STREAK_BENCH_BASE_SEC * 2 ** (streak - ModeService.STREAK_BENCH_THRESHOLD)
+            )
+            this.benchedUntil.set(key, this.now() + benchSec)
+            this.emit('warn', `[AUTO-TRADER] streak-breaker: ${key} benched ${Math.round(benchSec / 60)}min after ${streak} losses in a row`)
+          }
+        } else {
+          this.lossStreak.set(key, 0)
         }
-      } else {
-        this.lossStreak.set(key, 0)
       }
     }
 
@@ -2142,7 +2233,7 @@ export class ModeService {
       kind: 'compound',
       base,
       rollPct: p.rollPct !== undefined ? clamp(Number(p.rollPct) || 100, 1, 100) : undefined,
-      maxStake: p.maxStake !== undefined && Number(p.maxStake) > 0 ? Number(p.maxStake) : undefined,
+      maxStake: p.maxStake !== undefined && Number(p.maxStake) >= 1 ? clamp(Number(p.maxStake), 1, 5000) : undefined,
       payoutCap: p.payoutCap !== undefined ? clamp(Number(p.payoutCap) || 70, 1, 70) : 70,
       stopOnLoss: p.stopOnLoss !== false,
       periods: p.periods !== undefined && Number(p.periods) > 0 ? Math.round(Number(p.periods)) : undefined,
@@ -2200,23 +2291,35 @@ export class ModeService {
   }
 
   configure(patch: Partial<AutoTraderConfig>): { ok: boolean; config: AutoTraderConfig; error?: string } {
+    // AUDIT FIX (Task 58, P2): `Number("abc") || 0` turned garbage into
+    // gate-disabling zeros - minScore 0, minConfidence 0, and worst of all
+    // minPayoutPct 0 = the EV payout gate silently OFF. Non-finite input now
+    // keeps the CURRENT value (fail-closed), matching the restore path.
+    const numCur = (v: unknown, cur: number): number => {
+      const n = Number(v)
+      return Number.isFinite(n) ? n : cur
+    }
     if (patch.enabled !== undefined) this.config.enabled = Boolean(patch.enabled)
     if (patch.signalSource !== undefined && (['screener', 'kalman-ou', 'markov', 'momentum', 'confluence', 'strategy'] as const).includes(patch.signalSource as AutoTraderSource))
       this.config.signalSource = patch.signalSource as AutoTraderSource
-    if (patch.tf !== undefined) this.config.tf = String(patch.tf) as Timeframe
+    // AUDIT FIX (Task 58, P2): tf used to be cast unchecked - a garbage tf
+    // made every picker return nothing (silent "no signal" forever) and
+    // expiryBars math NaN (settlesAt = now + NaN = never settles). Garbage
+    // is ignored, the current tf stays.
+    if (patch.tf !== undefined && typeof patch.tf === 'string' && (ALL_TIMEFRAMES as string[]).includes(patch.tf)) this.config.tf = patch.tf as Timeframe
     // null/empty clears back to "track tf 1:1" (the old, implicit behavior) -
     // same null-clears-the-field convention pairStrategy/strategyParams use,
     // since JSON.stringify drops a bare `undefined` from the request body.
     if (patch.expiryTf !== undefined)
       this.config.expiryTf = typeof patch.expiryTf === 'string' && (ALL_TIMEFRAMES as string[]).includes(patch.expiryTf) ? (patch.expiryTf as Timeframe) : undefined
-    if (patch.stake !== undefined) this.config.stake = clamp(Number(patch.stake) || DEFAULT_AUTOTRADER.stake, 1, 5000)
-    if (patch.minScore !== undefined) this.config.minScore = clamp(Number(patch.minScore) || 0, 0, 100)
-    if (patch.minConfidence !== undefined) this.config.minConfidence = clamp(Number(patch.minConfidence) || 0, 0, 100)
-    if (patch.zEntry !== undefined) this.config.zEntry = clamp(Number(patch.zEntry) || DEFAULT_AUTOTRADER.zEntry, 0.5, 4)
-    if (patch.maxHalfLife !== undefined) this.config.maxHalfLife = Math.round(clamp(Number(patch.maxHalfLife) || DEFAULT_AUTOTRADER.maxHalfLife, 5, 999))
+    if (patch.stake !== undefined) this.config.stake = clamp(numCur(patch.stake, this.config.stake), 1, 5000)
+    if (patch.minScore !== undefined) this.config.minScore = clamp(numCur(patch.minScore, this.config.minScore), 0, 100)
+    if (patch.minConfidence !== undefined) this.config.minConfidence = clamp(numCur(patch.minConfidence, this.config.minConfidence), 0, 100)
+    if (patch.zEntry !== undefined) this.config.zEntry = clamp(numCur(patch.zEntry, this.config.zEntry), 0.5, 4)
+    if (patch.maxHalfLife !== undefined) this.config.maxHalfLife = Math.round(clamp(numCur(patch.maxHalfLife, this.config.maxHalfLife), 5, 999))
     if (patch.requireValidation !== undefined) this.config.requireValidation = Boolean(patch.requireValidation)
-    if (patch.minPUp !== undefined) this.config.minPUp = clamp(Number(patch.minPUp) || DEFAULT_AUTOTRADER.minPUp, 0.5, 0.75)
-    if (patch.minAdx !== undefined) this.config.minAdx = clamp(Number(patch.minAdx) || DEFAULT_AUTOTRADER.minAdx, 10, 45)
+    if (patch.minPUp !== undefined) this.config.minPUp = clamp(numCur(patch.minPUp, this.config.minPUp), 0.5, 0.75)
+    if (patch.minAdx !== undefined) this.config.minAdx = clamp(numCur(patch.minAdx, this.config.minAdx), 10, 45)
     if (patch.strategyId !== undefined)
       this.config.strategyId = typeof patch.strategyId === 'string' && patch.strategyId.trim() ? patch.strategyId.trim() : undefined
     if (patch.strategyIds !== undefined)
@@ -2231,23 +2334,27 @@ export class ModeService {
     if (patch.direction !== undefined && ['both', 'call', 'put'].includes(String(patch.direction)))
       this.config.direction = String(patch.direction) as AutoTraderConfig['direction']
     if (patch.pickVariety !== undefined) this.config.pickVariety = Math.round(clamp(Number(patch.pickVariety) || 1, 1, 10))
-    if (patch.maxOpen !== undefined) this.config.maxOpen = Math.round(clamp(Number(patch.maxOpen) || 1, 1, 10))
+    if (patch.maxOpen !== undefined) this.config.maxOpen = Math.round(clamp(numCur(patch.maxOpen, this.config.maxOpen), 1, 10))
     // Floor stays enforced in assetBlocked() regardless of what's saved here
     // (MIN_ASSET_COOLDOWN_SEC) - the field itself can still be raised past
     // 1hr for a longer per-pair rest, just never shrunk below it.
-    if (patch.cooldownSec !== undefined) this.config.cooldownSec = Math.round(clamp(Number(patch.cooldownSec) || 0, 0, 86400))
-    if (patch.paceSec !== undefined) this.config.paceSec = Math.round(clamp(Number(patch.paceSec) || 0, 0, 3600))
-    if (patch.dailyProfitTarget !== undefined) this.config.dailyProfitTarget = Math.max(0, Number(patch.dailyProfitTarget) || 0)
-    if (patch.dailyLossLimit !== undefined) this.config.dailyLossLimit = Math.max(0, Number(patch.dailyLossLimit) || 0)
+    if (patch.cooldownSec !== undefined) this.config.cooldownSec = Math.round(clamp(numCur(patch.cooldownSec, this.config.cooldownSec), 0, 86400))
+    if (patch.paceSec !== undefined) this.config.paceSec = Math.round(clamp(numCur(patch.paceSec, this.config.paceSec), 0, 3600))
+    if (patch.dailyProfitTarget !== undefined) this.config.dailyProfitTarget = Math.max(0, numCur(patch.dailyProfitTarget, this.config.dailyProfitTarget))
+    if (patch.dailyLossLimit !== undefined) this.config.dailyLossLimit = Math.max(0, numCur(patch.dailyLossLimit, this.config.dailyLossLimit))
     if (patch.watchlist !== undefined)
-      this.config.watchlist = Array.isArray(patch.watchlist) ? patch.watchlist.filter((x): x is string => typeof x === 'string') : []
+      // Task 58 (P3): trim+upper normalize - " eurusd-otc " used to silently
+      // match nothing in 'only' mode while the config alert kept announcing it
+      this.config.watchlist = Array.isArray(patch.watchlist)
+        ? patch.watchlist.filter((x): x is string => typeof x === 'string').map((x) => x.trim().toUpperCase()).filter(Boolean)
+        : []
     if (patch.smartStaking !== undefined) this.config.smartStaking = Boolean(patch.smartStaking)
     if (patch.correlationGuard !== undefined) this.config.correlationGuard = Boolean(patch.correlationGuard)
     if (patch.streakBreaker !== undefined) this.config.streakBreaker = Boolean(patch.streakBreaker)
     if (patch.avoidDeadHours !== undefined) this.config.avoidDeadHours = Boolean(patch.avoidDeadHours)
     if (patch.watchlistMode !== undefined) this.config.watchlistMode = patch.watchlistMode === 'exclude' ? 'exclude' : 'only'
     if (patch.marketScope !== undefined) this.config.marketScope = patch.marketScope === 'real' || patch.marketScope === 'otc' ? patch.marketScope : 'all'
-    if (patch.minPayoutPct !== undefined) this.config.minPayoutPct = clamp(Number(patch.minPayoutPct) || 0, 0, 98)
+    if (patch.minPayoutPct !== undefined) this.config.minPayoutPct = clamp(numCur(patch.minPayoutPct, this.config.minPayoutPct ?? 70), 0, 98)
     if (patch.volGate !== undefined) this.config.volGate = patch.volGate === 'avoid-volatile' ? 'avoid-volatile' : 'off'
     if (patch.stakePlan !== undefined) {
       const planChanged = JSON.stringify(this.config.stakePlan ?? null) !== JSON.stringify(patch.stakePlan ?? null)

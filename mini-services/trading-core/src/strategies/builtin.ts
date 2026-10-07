@@ -110,9 +110,10 @@ export const STRATEGIES: StrategyDef[] = [
       { key: 'threshold', label: 'Edge threshold %', type: 'number', min: 52, max: 70, default: 56 },
     ],
     evaluate: (candles, p) => {
-      if (candles.length < Math.min(num(p, 'lookback', 500) + 2, candles.length)) {
-        if (candles.length < 60) return { direction: 'none', score: 0, notes: 'not enough history' }
-      }
+      // Task 58 (P3): the old guard was a tautology (n < min(lookback+2, n)
+      // is false for every n) so it never ran; markovChain self-limits its
+      // lookback (quant.ts), so the meaningful floor is a history minimum.
+      if (candles.length < 60) return { direction: 'none', score: 0, notes: 'not enough history' }
       const m = markovChain(candles.map((c) => c.close), { lookback: num(p, 'lookback', 500) })
       const thr = num(p, 'threshold', 56) / 100
       const upPct = m.probUp * 100
@@ -588,7 +589,12 @@ export const STRATEGIES: StrategyDef[] = [
       let score = 0
       score += (rsiV > 50 ? 1 : -1) * 12
       score += Math.sign(last(md.hist) || 0) * 12
-      score += clamp((0.5 - (last(bb.percentB) || 0.5)) * 30, -12, 12)
+      // Task 58 (P2): percentB == 0 means price sits EXACTLY on the lower
+      // band - the strongest mean-reversion reading - but `|| 0.5` coerced
+      // that falsy 0 to neutral, killing the signal precisely when it was
+      // strongest (plausible on lattice-quantized OTC prices).
+      const pb = last(bb.percentB)
+      score += Number.isFinite(pb) ? clamp((0.5 - (pb as number)) * 30, -12, 12) : 0
       score += (last(adxRes.plusDI) > last(adxRes.minusDI) ? 1 : -1) * Math.min(14, last(adxRes.adx) || 0) * 0.8
       score += clamp((m.probUp - 0.5) * 90, -20, 20)
       score += clamp(pB * 5, -12, 12)
@@ -1149,7 +1155,11 @@ export const STRATEGIES: StrategyDef[] = [
       const confirmBars = Math.round(num(p, 'confirmBars', 3))
       const n = candles.length
       if (n < window + 5) return { direction: 'none', score: 0, notes: 'warming up' }
-      const slice = candles.slice(-window)
+      // Task 58 (P2): exclude the decision bar from the profile, matching the
+      // sibling value-area-breakout - including it let the decision bar drag
+      // the POC/value area toward itself and biased stretch distances low
+      // exactly on breakout bars.
+      const slice = candles.slice(-window - 1, -1)
       const vp = computeVolumeProfile(slice, { bucketCount: buckets })
       const h = candles.map((k) => k.high)
       const l = candles.map((k) => k.low)

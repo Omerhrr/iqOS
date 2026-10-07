@@ -55,6 +55,9 @@ export class ExecutionService {
   // seconds after the POST) - these get polled by the 1s sweep regardless of
   // their expiry, until the broker itself reports the close
   private closingLive = new Set<string>()
+  private closingCfdLive = new Set<string>() // Task 58: live CFD close re-entrancy guard (CFDs are NOT polled via closingLive - no /order_result support yet)
+  private liveOrdersInFlight = 0 // Task 58: in-flight live placements counted toward maxOpen (TOCTOU fix)
+  private lastCfdFeedWarnTs = 0
   // sweeps spent trying to fetch an expiry quote per position (backoff ladder)
   private expiryAttempts = new Map<string, number>()
   // throttles the "live positions can't settle - IQ session down" warn to 60s
@@ -200,7 +203,14 @@ export class ExecutionService {
       return { ok: false, reason: `market closed for ${asset} - trading disabled` }
     if (amount <= 0) return { ok: false, reason: 'amount must be positive' }
     if (amount > this.risk.maxStake) return { ok: false, reason: `stake $${amount} exceeds max stake $${this.risk.maxStake}` }
-    // on IQ the broker's balance is the money that matters - gate against it
+    // on IQ the broker's balance is the money that matters - gate against it.
+    // AUDIT FIX (Task 58, P3): a cold session (liveBalance never synced) used
+    // to fall back to the PAPER ledger balance and authorize a live stake IQ
+    // would reject (or worse, accept at a size the paper balance suggested).
+    // A live order now needs a REAL live balance read.
+    if (this.accountSource === 'iq' && acct.liveBalance === null) {
+      return { ok: false, reason: 'live balance unknown - reconnect IQ / wait for the balance sync before trading live' }
+    }
     const effBalance = this.accountSource === 'iq' && acct.liveBalance !== null ? acct.liveBalance : acct.balance
     if (amount > effBalance) return { ok: false, reason: `insufficient balance ($${effBalance.toFixed(2)})` }
     const dayLoss = -acct.dayPnl
@@ -213,9 +223,15 @@ export class ExecutionService {
     // ON (see its comment: "paper source should not count stray live
     // positions and vice versa") - mirror that here so the limit is per
     // ledger, matching what maxOpenPositions is documented to mean.
-    const openCount = this.store.listPositions('open').filter((p) => (this.accountSource === 'iq' ? p.mode === 'live' : p.mode === 'paper')).length
+    // AUDIT FIX (Task 58, P2): maxOpen was a TOCTOU on the live path -
+    // riskCheck ran seconds BEFORE the position row was inserted (the /trade
+    // round-trip can take up to 90s), so concurrent placements all counted
+    // the same open list and blew past maxOpenPositions. In-flight live
+    // placements are now counted too.
+    const openCount =
+      this.store.listPositions('open').filter((p) => (this.accountSource === 'iq' ? p.mode === 'live' : p.mode === 'paper')).length + this.liveOrdersInFlight
     if (openCount >= this.risk.maxOpenPositions)
-      return { ok: false, reason: `max concurrent positions (${this.risk.maxOpenPositions})` }
+      return { ok: false, reason: `max concurrent positions (${this.risk.maxOpenPositions}${this.liveOrdersInFlight ? ` + ${this.liveOrdersInFlight} in flight` : ''})` }
     const streakInfo = this.store.lossStreak()
     if (streakInfo.count >= this.risk.lossStreakCooldown && this.now() - streakInfo.lastLossTs < this.risk.cooldownSeconds)
       return {
@@ -415,6 +431,9 @@ export class ExecutionService {
           ? 'turbo-option'
           : 'binary-option'
 
+    // Task 58 (P2): count this placement toward maxOpen while the /trade
+    // round-trip is in flight (see riskCheck's TOCTOU note)
+    this.liveOrdersInFlight++
     try {
       const res = await fetch(`${this.liveUrl()}/trade`, {
         method: 'POST',
@@ -537,6 +556,8 @@ export class ExecutionService {
     } catch (err) {
       this.lastLiveError = (err as Error).message
       return { ok: false, error: `live trade failed: ${this.lastLiveError}` }
+    } finally {
+      this.liveOrdersInFlight--
     }
   }
 
@@ -559,13 +580,38 @@ export class ExecutionService {
     // this kernel. Checking live cfds here too (and routing their actual
     // close through closePosition(), which talks to the sidecar) closes
     // that gap.
-    const open = this.store.listPositions('open').filter((p) => p.kind === 'cfd' && p.asset === asset && p.tf === tf)
+    const open = this.store
+      .listPositions('open')
+      .filter((p) => p.kind === 'cfd' && p.asset === asset && p.tf === tf)
+      .filter((p) => this.cfdFeedTrustworthy(p))
     for (const pos of open) this.checkMargin(pos, candle.close, candle.time)
   }
 
   private checkSpotStops(asset: string, candle: Candle): void {
-    const open = this.store.listPositions('open').filter((p) => p.kind === 'cfd' && p.asset === asset)
+    const open = this.store
+      .listPositions('open')
+      .filter((p) => p.kind === 'cfd' && p.asset === asset)
+      .filter((p) => this.cfdFeedTrustworthy(p))
     for (const pos of open) this.checkMargin(pos, candle.close, Math.floor(Date.now() / 1000))
+  }
+
+  /** AUDIT FIX (Task 58, P0): live CFD TP/SL/margin used to be evaluated
+   * against the ACTIVE FEED with no mode guard - on a paper/fallback feed a
+   * SIM price could fire checkMargin on a REAL IQ position and close it via
+   * the broker. A live CFD is only margin-managed while the operator is on
+   * the IQ ledger with a live feed; otherwise it is explicitly left to the
+   * broker's own server-side stop-out, with a throttled warning so the
+   * unmanaged window is visible instead of silent. */
+  private cfdFeedTrustworthy(pos: Position): boolean {
+    if (pos.mode !== 'live') return true // paper CFDs are sim-native
+    const ok = this.market.mode === 'live' && this.accountSource === 'iq'
+    if (!ok && this.now() - this.lastCfdFeedWarnTs > 60) {
+      this.lastCfdFeedWarnTs = this.now()
+      const msg = `live CFD ${pos.asset} ${pos.liveOrderId ?? pos.id} is NOT being TP/SL-managed right now (feed is ${this.market.mode}, ledger ${this.accountSource}) - IQ's own margin rules still apply server-side; switch the account source back to IQ to resume kernel-side management`
+      this.ctx.log('execution', msg)
+      this.ctx.bus.emit('alert', { level: 'warn', message: msg, ts: this.now() })
+    }
+    return ok
   }
 
   private checkMargin(pos: Position, price: number, ts: number): void {
@@ -633,11 +679,26 @@ export class ExecutionService {
         void this.requestLiveClose(pos, modeStr)
         return { ok: true, position: this.store.getPosition(id) ?? undefined }
       }
-      // LIVE CFD/spot: tell the broker (close_margin_position path - the old
-      // code sent mode 'turbo' here, which routed a margin close to
-      // sell_option and failed), then book the exit at our feed price. The
-      // broker-confirm upgrade for cfds lands with /order_result cfd support.
-      void this.postLive('/close_trade', { mode: 'cfd', order_id: Number(pos.liveOrderId) }, 30_000)
+      // LIVE CFD/spot: AUDIT FIX (Task 58, P1) - the old code fired
+      // /close_trade fire-and-forget (`void this.postLive(...)`) and fell
+      // through to settle the position LOCALLY at the feed price no matter
+      // what the broker said. A rejected/timed-out close left the REAL IQ
+      // margin position open while OS history recorded it closed - real
+      // exposure invisible in the UI. Now: re-entrancy-guarded, awaited, and
+      // the local settle happens ONLY after IQ accepts the close (see
+      // requestLiveCfdClose); a rejected close leaves the position OPEN and
+      // says so loudly. (Full /order_result parity for cfds still awaits
+      // sidecar support - the exit is priced from the live feed after the
+      // broker ACCEPTS, which is documented in the settle note.)
+      if (pos.kind === 'cfd') {
+        if (this.settlingLive.has(pos.id) || this.closingCfdLive.has(pos.id)) {
+          return { ok: false, error: 'close already requested - awaiting broker confirmation' }
+        }
+        if (!pos.liveOrderId) return { ok: false, error: 'live position has no broker order id - cannot close' }
+        this.closingCfdLive.add(pos.id)
+        void this.requestLiveCfdClose(pos)
+        return { ok: true, position: this.store.getPosition(id) ?? undefined }
+      }
     }
     const price = this.market.getPrice(pos.asset)
     const dir = pos.side === 'call' ? 1 : -1
@@ -665,8 +726,14 @@ export class ExecutionService {
    * leaves the position OPEN and says so, because guessing here is exactly
    * what corrupted the history before. */
   private async requestLiveClose(pos: Position, modeStr: string): Promise<void> {
+    // Task 58 (P2): the closingLive flag used to be set only AFTER the await
+    // returned - a second closePosition() call inside the 30s round-trip
+    // passed the guard, fired a SECOND /close_trade, and both completions
+    // raced settleLiveExpiry. The guard now covers the whole round-trip.
+    this.closingLive.add(pos.id)
     const res = await this.postLive('/close_trade', { mode: modeStr, order_id: Number(pos.liveOrderId) }, 30_000)
     if (res && (res.closed === false || res.ok === false)) {
+      this.closingLive.delete(pos.id)
       const why = typeof res.error === 'string' ? res.error : 'broker did not accept the early close'
       this.ctx.bus.emit('alert', {
         level: 'warn',
@@ -689,7 +756,36 @@ export class ExecutionService {
     }
   }
 
-  private settle(id: string, exitPrice: number, status: 'won' | 'lost' | 'closed', pnl: number, via = '', brokerTsClose?: number): void {
+  /** AUDIT FIX (Task 58, P1): awaited live-CFD close - replaces the old
+   * fire-and-forget POST + unconditional local settle. The position is only
+   * settled (at the live feed price, documented approximation until
+   * /order_result grows cfd support) after IQ ACCEPTS close_margin_position;
+   * a rejected/failed close leaves the position open with a loud alert. */
+  private async requestLiveCfdClose(pos: Position): Promise<void> {
+    try {
+      const res = await this.postLive('/close_trade', { mode: 'cfd', order_id: Number(pos.liveOrderId) }, 30_000)
+      if (!res || res.ok === false || res.closed === false) {
+        const why = typeof res?.error === 'string' ? res.error : 'broker did not accept the cfd close'
+        this.ctx.bus.emit('alert', {
+          level: 'warn',
+          message: `CFD close REJECTED by IQ for ${pos.asset} ${pos.liveOrderId}: ${why} - position stays OPEN with real exposure; check the IQ trades page and retry`,
+          ts: this.now(),
+        })
+        return
+      }
+      const fresh = this.store.getPosition(pos.id)
+      if (!fresh || fresh.status !== 'open') return // already settled elsewhere
+      const price = this.market.getPrice(pos.asset)
+      const dir = pos.side === 'call' ? 1 : -1
+      const notional = pos.leverage ? pos.amount * pos.leverage : pos.amount
+      const pnl = price && price > 0 ? ((price - pos.entryPrice) / pos.entryPrice) * notional * dir : 0
+      this.settle(pos.id, price || pos.entryPrice, 'closed', pnl, 'iq cfd close accepted - exit priced from live feed')
+    } finally {
+      this.closingCfdLive.delete(pos.id)
+    }
+  }
+
+  private settle(id: string, exitPrice: number, status: 'won' | 'lost' | 'closed' | 'push', pnl: number, via = '', brokerTsClose?: number): void {
     const pos = this.store.settlePosition(id, exitPrice, status, pnl, brokerTsClose)
     if (!pos) return
     // single cleanup funnel: whichever loop was watching this position (expiry
@@ -784,7 +880,11 @@ export class ExecutionService {
     const draw = price === strike
     const won = pos.side === 'call' ? price > strike : price < strike
     const pnl = draw ? 0 : won ? pos.amount * pos.payout : -pos.amount
-    this.settle(pos.id, price, draw ? 'won' : won ? 'won' : 'lost', pnl, via)
+    // Task 58 (P2): a push (ATM refund) is NOT a win - it used to be recorded
+    // 'won' with pnl 0, inflating every win-rate stat (store.stats, adaptive
+    // buckets, bot records). It now carries its own neutral 'push' status;
+    // the stake comes back either way, so the balance math is unchanged.
+    this.settle(pos.id, price, draw ? 'push' : won ? 'won' : 'lost', pnl, via)
   }
 
   /**
@@ -884,8 +984,14 @@ export class ExecutionService {
   private finishLiveExpiryFromBroker(pos: Position, pnl: number, closePrice?: number, closeTime?: number): void {
     this.settlingLive.delete(pos.id)
     this.expiryAttempts.delete(pos.id)
-    const status: 'won' | 'lost' = pnl < 0 ? 'lost' : 'won'
-    const exit = closePrice && closePrice > 0 ? closePrice : pos.entryPrice
+    // Task 58 (P2): broker-reported pnl === 0 is a REFUND (push), not a win
+    const status: 'won' | 'lost' | 'push' = pnl < 0 ? 'lost' : pnl === 0 ? 'push' : 'won'
+    // AUDIT FIX (Task 58, P3): the broker close_quote used to be accepted on
+    // `> 0` alone - a misparsed field wrote a nonsense Exit price. Options
+    // settle within minutes of entry, so anything outside 2x/0.5x of the
+    // entry is a parse error, not a price.
+    const saneClose = !!closePrice && closePrice > 0 && closePrice <= pos.entryPrice * 2 && closePrice >= pos.entryPrice * 0.5
+    const exit = saneClose ? (closePrice as number) : pos.entryPrice
     // broker close time is only taken when it sits in a sane window
     // (after open, no more than 5 min in the future) - a misparsed field
     // must never move history backwards

@@ -36,7 +36,7 @@ placeholder).
 
 ```bash
 docker compose up -d --build
-docker compose logs -f iqos-kernel   # confirm "kernel listening on :3030"
+docker compose logs -f iqos-kernel   # confirm "kernel listening on :47312 (compose KERNEL_PORT; host-mode keeps the classic :3030)"
 docker compose logs -f iqos-web      # confirm Next.js boot, no /api/kernel 502 loops
 ```
 
@@ -103,7 +103,7 @@ subdomains on this same box.
 library. It's optional - only needed if/when you turn on LIVE mode in
 Settings - and is included in `docker-compose.yml` as `iqos-sidecar`.
 
-- It now binds `0.0.0.0:8788` inside the container (was hardcoded to
+- It now binds `0.0.0.0:47313 (compose SIDECAR_PORT; host-mode keeps the classic :8788)` inside the container (was hardcoded to
   `127.0.0.1`, which would make it unreachable from any other container -
   overridable via `SIDECAR_HOST`/`SIDECAR_PORT` env vars).
 - It's on the internal network only, not published to the host or internet.

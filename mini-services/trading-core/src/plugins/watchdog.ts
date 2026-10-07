@@ -150,6 +150,12 @@ export class WatchdogService {
       try {
         const s = row.state as Partial<BotHealthState>
         if (!s || typeof s !== 'object' || !row.botId) continue
+        // AUDIT FIX (Task 58, P2): the restore used to merge any object blob -
+        // a corrupt (non-array) window passed the check and made
+        // s.window.push throw inside positionClosed later; the bus isolates
+        // the throw but that bot's health tracking silently froze forever.
+        // Shape-validate the fields the engine mutates.
+        if (!Array.isArray(s.window)) continue
         this.states.set(row.botId, { ...freshState(row.botId), ...s, botId: row.botId })
       } catch {
         // skip malformed state

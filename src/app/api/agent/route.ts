@@ -2296,7 +2296,13 @@ export async function POST(req: NextRequest) {
           const history = (await coreGet(`/chat?session=${encodeURIComponent(sessionId)}`)) as { ok: boolean; messages?: { role: string; content: string }[] }
           recent = (history.ok ? history.messages ?? [] : [])
             .slice(-10)
-            .map((m) => ({ role: m.role as 'assistant' | 'user', content: m.content }))
+            .map((m) => ({
+              role: m.role as 'assistant' | 'user',
+              // Task 58 (P3): the last-10 pull was the one unbounded prompt
+              // component - a single pasted 100k-char message rode along on
+              // every later request. Cap each message, keep the tail.
+              content: m.content.length > 4000 ? `…${m.content.slice(-4000)}` : m.content,
+            }))
         } catch {
           /* first message ever - fine */
         }

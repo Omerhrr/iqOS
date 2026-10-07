@@ -27,7 +27,7 @@ import { normalizeSpec, type CustomSpec } from './src/strategies/custom'
 import { vskMonteCarlo } from './src/analytics/vsk'
 import { tskMonteCarlo } from './src/analytics/tsk'
 import { ALL_TIMEFRAMES, type Timeframe } from './src/types'
-import { searchInstruments, UNIVERSE_STATS, getInstrument } from './src/universe'
+import { searchInstruments, universeStats, getInstrument } from './src/universe'
 import { listRegistry, computeIndicator, registrySize, getIndicatorDef } from './src/analytics/registry'
 import { detectChartPatterns } from './src/analytics/chart-patterns'
 import { computeVolumeProfile, computeCandleDelta, computeCumulativeDelta } from './src/analytics/orderflow'
@@ -182,14 +182,14 @@ const httpServer = createServer(async (req, res) => {
           let rows = market.iqAssetRows()
           if (cat !== 'all') rows = rows.filter((a) => (cat === 'otc' ? a.otc : a.category === cat))
           if (search) rows = rows.filter((a) => matchIQ(a, search))
-          return json(200, { ok: true, instruments: rows, stats: UNIVERSE_STATS })
+          return json(200, { ok: true, instruments: rows, stats: universeStats() })
         }
         market.refreshSchedules()
         const found = searchInstruments(search, cat)
         return json(200, {
           ok: true,
           instruments: found.map((a) => ({ ...a, price: market.getPrice(a.ticker) || a.basePrice, iq: market.isIQAvailable(a.ticker) })),
-          stats: UNIVERSE_STATS,
+          stats: universeStats(),
         })
       }
 
@@ -1114,6 +1114,7 @@ const httpServer = createServer(async (req, res) => {
             commissionPct: body.commissionPct !== undefined ? Number(body.commissionPct) : 0,
             customSpec: resolveCustomSpec(strategyId),
             direction: directionOf(body),
+            edgeTrigger: Boolean(body.edgeTrigger),
           })
           return json(200, { ok: true, result: out })
         } catch (err) {
@@ -1145,6 +1146,7 @@ const httpServer = createServer(async (req, res) => {
           commissionPct: body.commissionPct !== undefined ? Number(body.commissionPct) : 0,
           customSpec: resolveCustomSpec(strategyId),
           direction: directionOf(body),
+          edgeTrigger: Boolean(body.edgeTrigger),
         })
         // Persist the verdict so the research-gate (bot_create/bot_toggle) can
         // require a recent robust pass before arming a bot on this
@@ -1246,6 +1248,7 @@ const httpServer = createServer(async (req, res) => {
             sharedWindow: body.sharedWindow === undefined ? true : Boolean(body.sharedWindow),
             customSpec: resolveCustomSpec(sweepStrategyId),
             direction: directionOf(body),
+            edgeTrigger: Boolean(body.edgeTrigger),
           }
         )
         return json(200, { ok: true, result: out })
@@ -1271,6 +1274,7 @@ const httpServer = createServer(async (req, res) => {
           spreadPct: body.spreadPct !== undefined ? Number(body.spreadPct) : 0,
           slippagePct: body.slippagePct !== undefined ? Number(body.slippagePct) : 0,
           commissionPct: body.commissionPct !== undefined ? Number(body.commissionPct) : 0,
+          edgeTrigger: Boolean(body.edgeTrigger),
           // Compounding replay (binary mode only) - see backtest.ts's
           // compoundStakeFor/compoundSettle, which mirror the live
           // autopilot's stakeFor/onPositionClosed roll math exactly so a

@@ -338,8 +338,12 @@ export function autocorrelation(rets: number[], maxLag = 20): number[] {
 
 export function ewmaVol(rets: number[], lambda = 0.94): number {
   if (!rets.length) return 0
-  let v = rets.slice(0, 30).reduce((a, x) => a + x * x, 0) / Math.min(30, rets.length)
-  for (const x of rets) v = lambda * v + (1 - lambda) * x * x
+  // AUDIT FIX (Task 58, P3): the seed window (first 30 returns) used to be
+  // re-filtered by the recursion too - those returns got double-weighted and
+  // biased the variance estimate. Seed, then filter from where the seed ends.
+  const seedN = Math.min(30, rets.length)
+  let v = rets.slice(0, seedN).reduce((a, x) => a + x * x, 0) / seedN
+  for (let i = seedN; i < rets.length; i++) v = lambda * v + (1 - lambda) * rets[i] * rets[i]
   return Math.sqrt(v)
 }
 

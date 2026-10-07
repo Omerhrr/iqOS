@@ -73,8 +73,13 @@ services:
     environment:
       - SIDECAR_HOST=0.0.0.0
       - SIDECAR_PORT=47313
+      - SIDECAR_SESSION_DIR=/app/session
     volumes:
-      - iqos-sidecar-session:/app
+      # Task 58 (P1): this volume used to mount the WHOLE /app workdir - a
+      # first-up volume copy is fine, but any image rebuild then ran the OLD
+      # sidecar code from the volume forever (code updates never deployed).
+      # Persist ONLY the session file directory.
+      - iqos-sidecar-session:/app/session
     networks:
       - iqos-internal
     # Optional - only needed for LIVE (IQ Option) mode. Not exposed to the

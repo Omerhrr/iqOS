@@ -915,6 +915,12 @@ export function prepareSignal(s: SignalDef, ctx: EvalCtx): (i: number) => boolea
     case 'candle': {
       // candle recognition is per-bar (context windows) - handled by the
       // learner via detectPatterns; the live path uses the tail-bar hit map.
+      // CONTRACT NOTE (Task 58 audit): ctx.hits only carries the TAIL bar's
+      // pattern hits, so a candle signal tests true ONLY at i === n-1. Every
+      // current caller satisfies that (backtest + lab re-slice the window per
+      // bar, live evaluates the tail), but a future batch caller holding ONE
+      // ctx over a long series must re-slice per bar too - or candle signals
+      // will silently never fire for it. Do not "optimize away" the re-slice.
       const name = s.name.toLowerCase()
       const align = s.dir === 'call'
       return (i: number) => {
@@ -1014,12 +1020,61 @@ export function prepareSignal(s: SignalDef, ctx: EvalCtx): (i: number) => boolea
     }
     case 'mtf': {
       const factor = s.factor
-      // Resample into non-overlapping `factor`-bar groups and EMA(8)/EMA(21)
-      // each group's close - precomputed once per group rather than per bar
-      // for speed. No lookahead: group g closes at original index
-      // (g+1)*factor-1, so bar i can only ever read the trend of the LAST
-      // group that had fully closed by i, same as the live mtf-alignment
-      // strategy only resampling complete groups.
+      // AUDIT FIX (Task 58, P2): groups were anchored to the WINDOW INDEX
+      // (group g = bars [g*factor, (g+1)*factor) of whatever window was
+      // handed in), so the live sliding window (1500-cap) and the lab
+      // backtest window (2200) disagreed on where every boundary fell - the
+      // same history could produce different HTF votes depending on window
+      // offset. Groups are now anchored to WALL-CLOCK time instead: a group
+      // is [g*P, (g+1)*P) over candle open-time with P = factor * baseTfSec
+      // (baseTf derived from the candles' own time spacing), so any window
+      // containing the same bars computes the same groups. No lookahead:
+      // bar i only ever reads the trend of the last group FULLY closed
+      // before i's own group. Index-anchoring kept only as fallback when
+      // the time spacing is unusable.
+      const deltas: number[] = []
+      for (let k = Math.max(1, ctx.n - 30); k < ctx.n; k++) {
+        const d = ctx.candles[k].time - ctx.candles[k - 1].time
+        if (Number.isFinite(d) && d > 0) deltas.push(d)
+      }
+      deltas.sort((a, b) => a - b)
+      const step = deltas.length ? deltas[Math.floor(deltas.length / 2)] : 0
+      const lastTime = ctx.candles[ctx.n - 1]?.time ?? NaN
+      if (step > 0 && Number.isFinite(lastTime)) {
+        const P = factor * step
+        const firstGroup = Math.floor(ctx.candles[0].time / P)
+        // single pass: compacted group list (absent groups skipped so EMA
+        // never sees NaN), each group's close = last bar inside it, and for
+        // every bar the index of the last group COMPLETE before its group.
+        const ids: number[] = []
+        const closes: number[] = []
+        const completeAtBar = new Array<number>(ctx.n)
+        for (let i = 0; i < ctx.n; i++) {
+          const gid = Math.floor(ctx.candles[i].time / P) - firstGroup
+          if (ids.length === 0 || ids[ids.length - 1] !== gid) {
+            ids.push(gid)
+            closes.push(ctx.close[i])
+          } else {
+            closes[closes.length - 1] = ctx.close[i]
+          }
+          completeAtBar[i] = ids.length - 2 // last fully-closed group index
+        }
+        const fast = ta.ema(closes, 8)
+        const slow = ta.ema(closes, 21)
+        const up: boolean[] = new Array(closes.length)
+        const dn: boolean[] = new Array(closes.length)
+        for (let g = 0; g < closes.length; g++) {
+          up[g] = Number.isFinite(fast[g]) && Number.isFinite(slow[g]) && fast[g] > slow[g]
+          dn[g] = Number.isFinite(fast[g]) && Number.isFinite(slow[g]) && fast[g] < slow[g]
+        }
+        const align = s.dir === 'call'
+        return (i: number) => {
+          const gi = completeAtBar[i] ?? -1
+          if (gi < 0) return false
+          return align ? up[gi] === true : dn[gi] === true
+        }
+      }
+      // fallback: unusable time spacing - legacy index anchoring
       const numGroups = Math.floor(ctx.n / factor)
       const groupClose: number[] = new Array(numGroups)
       for (let g = 0; g < numGroups; g++) groupClose[g] = ctx.close[(g + 1) * factor - 1]
@@ -1177,6 +1232,18 @@ function normalizeOneSignal(s: unknown, depth = 0): SignalDef | null {
   const o = s as Record<string, unknown>
   const weight = clampN(o.weight, 1, 50, 10)
   const dir = o.dir === 'put' ? 'put' : o.dir === 'call' ? 'call' : undefined
+  // AUDIT FIX (Task 58, P0): indicator/builtin params were checked only for
+  // finiteness - a spec saved with params:{period:1e9} passed validation and
+  // every evaluation then ran an O(n*period) indicator loop ON THE EVENT LOOP
+  // (kernel hang; relearnSweep re-picks such specs automatically). Period-like
+  // params (>= 1) are hard-capped at 500, absurd magnitudes at +-1e6; small
+  // float params (multipliers, thresholds) pass through clamped.
+  const clampParam = (n: number): number => {
+    if (!Number.isFinite(n)) return NaN
+    if (Math.abs(n) > 1e6) return Math.sign(n) * 1e6
+    if (n >= 1) return Math.min(500, n)
+    return Math.max(-1e6, Math.min(100, n))
+  }
   if (o.kind === 'candle' && typeof o.name === 'string' && o.name.length <= 40) {
     return { kind: 'candle', name: o.name, dir: dir ?? 'call', weight }
   } else if (o.kind === 'bar' && KNOWN_BAR.has(String(o.variant))) {
@@ -1191,9 +1258,15 @@ function normalizeOneSignal(s: unknown, depth = 0): SignalDef | null {
     const dflt: Side = variant.endsWith('up') || variant === 'hh-hl' ? 'call' : 'put'
     return { kind: 'line', variant, lookback: clampN(o.lookback, 2, 100, variant.startsWith('breakout') ? 20 : 3), dir: dir ?? dflt, weight }
   } else if (o.kind === 'indicator' && KNOWN_INDS.has(String(o.ind)) && (o.op === '>' || o.op === '<' || o.op === 'between' || o.op === 'outside')) {
+    // AUDIT FIX (Task 58, P2): a missing dir used to default to 'call' - an
+    // AI-mined bearish rule (e.g. rsi > 70 meant PUT) was silently persisted
+    // and voted as a CALL at full weight. Indicator rules have no textbook
+    // direction, so an omitted dir now DROPS the signal at save AND load
+    // time (fail loudly, like unknown kinds) instead of failing inverted.
+    if (!dir) return null
     const params: Record<string, number> = {}
     for (const [k, v] of Object.entries((o.params as Record<string, unknown>) ?? {})) {
-      const n = Number(v)
+      const n = clampParam(Number(v))
       if (Number.isFinite(n)) params[k] = n
     }
     const ind = String(o.ind) as IndicatorSignal['ind']
@@ -1212,19 +1285,23 @@ function normalizeOneSignal(s: unknown, depth = 0): SignalDef | null {
       // 'between' to "equals" and 'outside' to "not equals", both well-
       // defined, so a malformed band still evaluates to something sane.
       ...(needsBand ? { threshold2: clampN(o.threshold2, -1e6, 1e6, clampN(o.threshold, -1e6, 1e6, 0)) } : {}),
-      dir: dir ?? 'call',
+      dir,
       weight,
     }
   } else if (o.kind === 'mtf' && (Number(o.factor) === 5 || Number(o.factor) === 15)) {
-    return { kind: 'mtf', factor: Number(o.factor) as 5 | 15, dir: dir ?? 'call', weight }
+    // dir now REQUIRED (see the indicator branch note above)
+    if (!dir) return null
+    return { kind: 'mtf', factor: Number(o.factor) as 5 | 15, dir, weight }
   } else if (o.kind === 'builtin' && typeof o.id === 'string' && getStrategy(o.id)) {
+    if (!dir) return null
     const params: Record<string, number | string> = {}
     for (const [k, v] of Object.entries((o.params as Record<string, unknown>) ?? {})) {
-      if (typeof v === 'number' && Number.isFinite(v)) params[k] = v
+      if (typeof v === 'number' && Number.isFinite(v)) params[k] = clampParam(v)
       else if (typeof v === 'string' && v.length <= 60) params[k] = v
     }
-    return { kind: 'builtin', id: o.id, ...(Object.keys(params).length ? { params } : {}), dir: dir ?? 'call', weight }
+    return { kind: 'builtin', id: o.id, ...(Object.keys(params).length ? { params } : {}), dir, weight }
   } else if (o.kind === 'group' && (o.op === 'and' || o.op === 'or') && depth < 2) {
+    if (!dir) return null
     const rawMembers: unknown[] = Array.isArray(o.signals) ? (o.signals as unknown[]) : []
     const members: SignalDef[] = []
     for (const m of rawMembers.slice(0, 8)) {
@@ -1235,7 +1312,7 @@ function normalizeOneSignal(s: unknown, depth = 0): SignalDef | null {
     // anything - drop it rather than silently voting as a single bare signal
     // under a misleading "AND"/"OR" label.
     if (members.length < 2) return null
-    return { kind: 'group', op: o.op, signals: members, dir: dir ?? 'call', weight }
+    return { kind: 'group', op: o.op, signals: members, dir, weight }
   }
   return null
 }

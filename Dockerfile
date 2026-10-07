@@ -1,10 +1,10 @@
 # iqOS web (Next.js OS shell) - production image
-FROM oven/bun:1 AS deps
+FROM oven/bun:1.3 AS deps
 WORKDIR /app
 COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile
 
-FROM oven/bun:1 AS builder
+FROM oven/bun:1.3 AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
@@ -24,7 +24,7 @@ ENV KERNEL_URL=$KERNEL_URL
 RUN bunx prisma generate || true
 RUN bun run build
 
-FROM oven/bun:1 AS runner
+FROM oven/bun:1.3 AS runner
 WORKDIR /app
 ENV NODE_ENV=production
 # Unusual internal port on purpose - avoids colliding with other /opt/

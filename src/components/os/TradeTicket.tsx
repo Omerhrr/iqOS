@@ -1,11 +1,11 @@
 'use client'
 
 // IQAIR//OS - Trade ticket: Binary / Turbo / Digital / CFD (paper + LIVE via iqair)
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { AccountState, AssetRow, Position, Timeframe, TradeKind } from '@/lib/os/client'
-import { KIND_LABEL, fmtMoney, fmtPrice, osPost } from '@/lib/os/client'
+import { KIND_LABEL, fmtMoney, fmtPrice, osGet, osPost } from '@/lib/os/client'
 
 interface Props {
   asset: AssetRow | undefined
@@ -59,7 +59,9 @@ export default function TradeTicket({ asset, tf, price, account, onPlaced, onErr
         ...(kind === 'binary' || kind === 'turbo' ? { expiryBars: Number(expiryBars) || 1 } : {}),
         ...(kind === 'digital' ? { expirySec: digitalExpiry, strikeOffsetPct: Number(strikeOffset) || 0 } : {}),
         ...(kind === 'cfd' ? { leverage: lev, tp: Number(tp), sl: Number(sl) } : {}),
-        mode: 'paper',
+        // Task 58 (P2): the hardcoded mode:'paper' is GONE - the kernel routes
+        // by the ACCOUNT SOURCE (body.mode is deliberately ignored), so sending
+        // a paper mode on a live session was misleading dead weight.
       })
       if (res.ok && res.position) onPlaced(res.position)
       else onError(res.error ?? 'order rejected')
@@ -73,13 +75,39 @@ export default function TradeTicket({ asset, tf, price, account, onPlaced, onErr
 
   const chips = [1, 5, 10, 25, 50, 100]
 
+  // Task 58 (P2): the badge used to be a static PAPER chip while /trade
+  // routes by the actual account source - on an IQ session the ticket claimed
+  // paper while placing REAL trades. Read the live source.
+  const [ledger, setLedger] = useState<'paper' | 'iq'>('paper')
+  useEffect(() => {
+    let alive = true
+    const read = () =>
+      osGet<AccountState & { source?: 'paper' | 'iq' }>('/account')
+        .then((a) => {
+          if (alive) setLedger(a.source ?? 'paper')
+        })
+        .catch(() => {})
+    void read()
+    const t = setInterval(read, 10_000)
+    return () => {
+      alive = false
+      clearInterval(t)
+    }
+  }, [])
+
   return (
     <div className="flex flex-col gap-3 rounded-lg border border-[#1c2739] bg-[#0b111c] p-3">
       <div className="flex items-center justify-between">
         <h3 className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">Trade Ticket</h3>
         <div className="flex items-center gap-1">
-          <span className="rounded border border-cyan-500/40 bg-cyan-500/10 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-cyan-300">
-            PAPER
+          <span
+            className={
+              ledger === 'iq'
+                ? 'rounded border border-rose-500/40 bg-rose-500/10 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-rose-300'
+                : 'rounded border border-cyan-500/40 bg-cyan-500/10 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-cyan-300'
+            }
+          >
+            {ledger === 'iq' ? 'LIVE · IQ' : 'PAPER'}
           </span>
           {asset && (
             <span className="font-mono text-[9px] text-[#4b5a72]">{asset.open ? 'open' : 'closed'}</span>

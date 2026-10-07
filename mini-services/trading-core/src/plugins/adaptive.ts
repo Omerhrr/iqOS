@@ -89,23 +89,41 @@ export class AdaptiveService {
     this.ctx = ctx
     this.store = ctx.use<Store>('store')
     const saved = this.store.getAdaptiveConfig()
-    if (saved) this.config = { ...DEFAULT_ADAPTIVE, ...(saved as Partial<AdaptiveConfig>) }
+    if (saved) {
+      this.config = { ...DEFAULT_ADAPTIVE, ...(saved as Partial<AdaptiveConfig>) }
+      // AUDIT FIX (Task 58, P2): sanitize on restore too - a persisted NaN
+      // (serialized to null by JSON) must not reach the floor math.
+      for (const k of ['minSampleSize', 'minWinRateFloorPct', 'scoreBucketWidth', 'marginPct'] as const) {
+        const v = Number(this.config[k])
+        if (!Number.isFinite(v)) (this.config[k] as number) = DEFAULT_ADAPTIVE[k]
+      }
+      if (this.config.floorMode !== 'payout-aware') this.config.floorMode = 'absolute'
+    }
     ctx.log('adaptive', `confidence gate online - floor ${this.config.minWinRateFloorPct}% (Wilson lower bound, n>=${this.config.minSampleSize})`)
   }
 
   stop(): void {}
 
   configure(patch: Partial<AdaptiveConfig>): AdaptiveConfig {
-    const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, Math.round(Number(v))))
+    // AUDIT FIX (Task 58, P2): clamp(NaN) used to store NaN - a NaN
+    // marginPct/minWinRateFloorPct made the required floor NaN and every
+    // wilsonLowerPct >= NaN comparison false, bricking the adaptive gate SHUT
+    // fleet-wide until a restart (JSON null healed it by accident).
+    // Non-finite input now falls back to the CURRENT value (fail-closed).
+    const clamp = (v: unknown, lo: number, hi: number, cur: number) => {
+      const n = Math.round(Number(v))
+      if (!Number.isFinite(n)) return Math.min(hi, Math.max(lo, Math.round(Number(cur)) || lo))
+      return Math.min(hi, Math.max(lo, n))
+    }
     const next = { ...this.config, ...patch }
-    next.minSampleSize = clamp(next.minSampleSize, 5, 500)
-    next.minWinRateFloorPct = clamp(next.minWinRateFloorPct, 1, 99)
-    next.scoreBucketWidth = clamp(next.scoreBucketWidth, 1, 50)
+    next.minSampleSize = clamp(next.minSampleSize, 5, 500, this.config.minSampleSize)
+    next.minWinRateFloorPct = clamp(next.minWinRateFloorPct, 1, 99, this.config.minWinRateFloorPct)
+    next.scoreBucketWidth = clamp(next.scoreBucketWidth, 1, 50, this.config.scoreBucketWidth)
     next.enabled = Boolean(next.enabled)
     next.splitByRegime = Boolean(next.splitByRegime)
     next.splitBySession = Boolean(next.splitBySession)
     next.floorMode = next.floorMode === 'payout-aware' ? 'payout-aware' : 'absolute'
-    next.marginPct = clamp(next.marginPct ?? 5, 0, 30)
+    next.marginPct = clamp(next.marginPct ?? 5, 0, 30, this.config.marginPct ?? 5)
     this.config = next
     this.store.saveAdaptiveConfig(this.config)
     this.ctx.bus.emit('alert', {

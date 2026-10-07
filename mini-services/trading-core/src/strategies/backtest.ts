@@ -58,12 +58,16 @@ export function directionBreakdown(trades: BacktestTrade[]): { call: DirectionMe
   const of = (side: 'call' | 'put'): DirectionMetrics => {
     const sideTrades = trades.filter((t) => t.side === side)
     const sideWins = sideTrades.filter((t) => t.status === 'won').length
+    // Task 58 (P1): pushes are no longer "wins with pnl 0" - exclude them
+    // from BOTH wins and losses so the per-direction win rate is the honest
+    // decided-trade rate (they still count in trades/netPnl/expectancy).
+    const sideLosses = sideTrades.filter((t) => t.status === 'lost').length
     const sidePnl = sideTrades.reduce((a, t) => a + t.pnl, 0)
     return {
       trades: sideTrades.length,
       wins: sideWins,
-      losses: sideTrades.length - sideWins,
-      winRate: sideTrades.length ? (sideWins / sideTrades.length) * 100 : 0,
+      losses: sideLosses,
+      winRate: sideWins + sideLosses ? (sideWins / (sideWins + sideLosses)) * 100 : 0,
       netPnl: sidePnl,
       expectancy: sideTrades.length ? sidePnl / sideTrades.length : 0,
     }
@@ -83,6 +87,12 @@ export interface BacktestOptions {
   slPct?: number // spot mode stop-loss %
   maxBars?: number // spot mode max holding bars
   warmupBars?: number // indicator warmup guard (default 220 for ema200-class)
+  // Task 58 (P1): simulate the LIVE bots' edge-trigger - a persisting signal
+  // in the same direction fires ONCE per episode (re-armed only after the
+  // signal lapses or flips), and maxOpen/cooldown throttle further. The
+  // default (false) preserves the historical every-signal-bar accounting;
+  // turn it on for a trade profile a live bot can actually realize.
+  edgeTrigger?: boolean
   // Round-trip cost modeling, all opt-in (default 0 - unchanged behavior
   // unless set). spreadPct/slippagePct move the fill price against the side
   // taken before settlement; commissionPct is taken off the stake on every
@@ -178,6 +188,7 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
   let compoundCycles = 0 // how many times stopOnLoss ended a cycle and a fresh one restarted at base
 
   // -------- binary settlement --------
+  let prevEvalDir: 'call' | 'put' | 'none' = 'none' // Task 58: edge-trigger simulation
   if (mode === 'binary') {
     for (let i = warmup; i < candles.length - expiryBars; i++) {
       if (compoundPlan && cycle.halted) {
@@ -193,6 +204,13 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
       }
       const evalWindow = candles.slice(0, i + 1)
       const ev = filterDir(strat.evaluate(evalWindow, params))
+      // Task 58 (P1): edge-trigger parity with the live bots - a persisting
+      // same-direction signal fires once per episode (lapse/flip re-arms)
+      if (opts.edgeTrigger) {
+        const suppress = ev.direction !== 'none' && ev.direction === prevEvalDir
+        prevEvalDir = ev.direction
+        if (suppress) continue
+      }
       if (ev.direction === 'none') continue
       const rawEntry = candles[i].close
       const entry = ev.direction === 'call' ? rawEntry * (1 + costPct / 100) : rawEntry * (1 - costPct / 100)
@@ -214,7 +232,10 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
         exit: exitCandle.close,
         amount: stake,
         pnl,
-        status: draw ? 'won' : won ? 'won' : 'lost',
+        // Task 58 (P1): a draw is a PUSH (stake refunded, pnl 0) - it used to
+        // be recorded 'won' and inflated winRate (the drift-follower doc's own
+        // measured ~41% -> ~59% inflation on flat-heavy feeds)
+        status: draw ? 'push' : won ? 'won' : 'lost',
       })
       if (equity > peak) peak = equity
       const dd = peak - equity
@@ -274,11 +295,21 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
   }
 
   const wins = trades.filter((t) => t.status === 'won').length
-  const losses = trades.length - wins
+  const losses = trades.filter((t) => t.status === 'lost').length
   const grossWin = trades.filter((t) => t.pnl > 0).reduce((a, t) => a + t.pnl, 0)
   const grossLoss = Math.abs(trades.filter((t) => t.pnl < 0).reduce((a, t) => a + t.pnl, 0))
-  const avgTfSec = candles.length > 1 ? candles[candles.length - 1].time - candles[candles.length - 2].time : 60
-  const periodsPerYear = (365 * 24 * 3600) / Math.max(1, avgTfSec)
+  // Task 58 (P3): Sharpe was annualized on the BAR calendar while `rets` are
+  // PER-TRADE returns - a strategy trading 5% of bars had its Sharpe scaled
+  // up by the full bar calendar. Annualize on the realized trade cadence
+  // instead (mean inter-trade gap), which is what per-trade returns imply.
+  const tsSorted = trades.map((t) => t.ts).sort((a, b) => a - b)
+  let meanGapSec = 0
+  if (tsSorted.length > 1) {
+    let gaps = 0
+    for (let i = 1; i < tsSorted.length; i++) gaps += tsSorted[i] - tsSorted[i - 1]
+    meanGapSec = gaps / (tsSorted.length - 1)
+  }
+  const periodsPerYear = meanGapSec > 0 ? (365 * 24 * 3600) / meanGapSec : 252
 
   const byDirection = directionBreakdown(trades)
 
@@ -295,7 +326,7 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
       totalTrades: trades.length,
       wins,
       losses,
-      winRate: trades.length ? (wins / trades.length) * 100 : 0,
+      winRate: wins + losses ? (wins / (wins + losses)) * 100 : 0,
       netPnl: equity - startEquity,
       profitFactor: grossLoss === 0 ? (grossWin > 0 ? 99 : 0) : grossWin / grossLoss,
       maxDrawdown: maxDD,

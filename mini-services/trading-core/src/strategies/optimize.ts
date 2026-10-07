@@ -303,6 +303,8 @@ export function fastBacktest(
     // forced trade direction the same way the Single-Run engine does.
     customSpec?: CustomSpec
     direction?: 'call' | 'put' | 'both'
+    // Task 58 (P1): edge-trigger simulation (see backtest.ts BacktestOptions)
+    edgeTrigger?: boolean
   } = {}
 ): FastMetrics {
   const strat = resolveStrategyDef(strategyId, opts.customSpec)
@@ -327,6 +329,9 @@ export function fastBacktest(
   let grossLoss = 0
 
   const stop = candles.length - expiryBars
+  // -------- Task 58 (P1): edge-trigger parity + push accounting --------
+  let prevEvalDir: 'call' | 'put' | 'none' = 'none'
+  let losses = 0
   for (let i = warmup; i < stop; i++) {
     // Full history up to and including the decision candle - no look-ahead,
     // and no truncation to a fixed trailing window either. Path-dependent
@@ -338,6 +343,12 @@ export function fastBacktest(
     // it. This matches backtest.ts's evalWindow exactly.
     const win = candles.slice(0, i + 1)
     const ev = filterDir(strat.evaluate(win, params))
+    // Task 58 (P1): edge-trigger parity with the live bots (once per episode)
+    if (opts.edgeTrigger) {
+      const suppress = ev.direction !== 'none' && ev.direction === prevEvalDir
+      prevEvalDir = ev.direction
+      if (suppress) continue
+    }
     if (ev.direction === 'none') continue
     // Entry price is adjusted for spread/slippage in the unfavorable
     // direction for the side taken, same as a real fill would be worse than
@@ -356,6 +367,7 @@ export function fastBacktest(
       wins++
       grossWin += pnl
     } else if (pnl < 0) {
+      losses++
       grossLoss += -pnl
     }
     rets.push(pnl / Math.max(stake, 0.01))
@@ -366,7 +378,7 @@ export function fastBacktest(
       exit: exitCandle.close,
       amount: stake,
       pnl,
-      status: draw ? 'won' : won ? 'won' : 'lost',
+      status: draw ? 'push' : won ? 'won' : 'lost',
     })
     if (equity > peak) peak = equity
     const dd = peak - equity
@@ -375,13 +387,26 @@ export function fastBacktest(
   }
 
   const total = trades.length
-  const avgTfSec = candles.length > 1 ? candles[candles.length - 1].time - candles[candles.length - 2].time : 60
-  const periodsPerYear = (365 * 24 * 3600) / Math.max(1, avgTfSec)
-  const [ciLow, ciHigh] = wilsonInterval(wins, total)
+  // Task 58 (P1): winRate is the DECIDED-trade rate (pushes excluded from
+  // both sides) - the old wins/total counted pushes as losses here while the
+  // full backtester counted them as wins, so the fast score and the
+  // re-verified numbers disagreed on the same history.
+  const decided = wins + losses
+  // Task 58 (P3): annualize Sharpe on the realized trade cadence, not the bar
+  // calendar (per-trade returns imply per-trade frequency)
+  const tsSorted = trades.map((t) => t.ts).sort((a, b) => a - b)
+  let meanGapSec = 0
+  if (tsSorted.length > 1) {
+    let gaps = 0
+    for (let i = 1; i < tsSorted.length; i++) gaps += tsSorted[i] - tsSorted[i - 1]
+    meanGapSec = gaps / (tsSorted.length - 1)
+  }
+  const periodsPerYear = meanGapSec > 0 ? (365 * 24 * 3600) / meanGapSec : 252
+  const [ciLow, ciHigh] = wilsonInterval(wins, Math.max(1, decided))
   return {
     totalTrades: total,
     wins,
-    winRate: total ? (wins / total) * 100 : 0,
+    winRate: decided ? (wins / decided) * 100 : 0,
     netPnl: equity - startEquity,
     profitFactor: grossLoss === 0 ? (grossWin > 0 ? 99 : 0) : grossWin / grossLoss,
     maxDrawdownPct: startEquity > 0 ? (maxDD / startEquity) * 100 : 0,
@@ -478,6 +503,8 @@ export interface GridSearchOptions {
   // nothing to sweep, it's one fixed spec per run.
   customSpec?: CustomSpec
   direction?: 'call' | 'put' | 'both'
+  // Task 58 (P1): edge-trigger simulation, threaded to both engines
+  edgeTrigger?: boolean
 }
 
 export function gridSearch(candles: Candle[], asset: string, tf: Timeframe, opts: GridSearchOptions): GridSearchResult {
@@ -495,6 +522,7 @@ export function gridSearch(candles: Candle[], asset: string, tf: Timeframe, opts
     commissionPct: opts.commissionPct,
     customSpec: opts.customSpec,
     direction: opts.direction,
+    edgeTrigger: opts.edgeTrigger,
   }
   const sweptKeys = Object.keys(opts.sweep).filter((k) => strat.params.some((p) => p.key === k))
   // Base every combo on the strategy's registered defaults, then let any
@@ -547,11 +575,17 @@ export function gridSearch(candles: Candle[], asset: string, tf: Timeframe, opts
           amount: opts.amount ?? 10,
           expiryBars: opts.expiryBars ?? 1,
           startEquity: opts.startEquity ?? 1000,
+          // Task 58 (P3): warmup parity - the selection pass warms up with the
+          // per-strategy profile (fastBacktest's strategyWarmup), the re-verify
+          // used to silently fall back to backtest's 220-bar default, so the
+          // "verified" numbers counted a different trade set than the ranking.
+          warmupBars: strategyWarmup(strat.id),
           spreadPct: opts.spreadPct,
           slippagePct: opts.slippagePct,
           commissionPct: opts.commissionPct,
           customSpec: opts.customSpec,
           direction: opts.direction,
+          edgeTrigger: opts.edgeTrigger,
         })
         const [fciLow, fciHigh] = wilsonInterval(full.metrics.wins, full.metrics.totalTrades)
         const fm: FastMetrics = {
@@ -622,6 +656,7 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
     commissionPct: opts.commissionPct,
     customSpec: opts.customSpec,
     direction: opts.direction,
+    edgeTrigger: opts.edgeTrigger,
   }
   const warmup = strategyWarmup(strat.id)
   // Same fixedParams merge as gridSearch - see that function's comment.
@@ -651,7 +686,13 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
   // statistically valid aggregate Sharpe and profit factor at the end (see
   // below) instead of naively averaging each fold's own ratio.
   const pooledTrades: BacktestTrade[] = []
-  let bestFoldScore = -Infinity
+  // Task 58 (P2): the returned bestParams used to be the combo with the best
+  // OOS (holdout) score - selection ON the holdout, i.e. the exact leakage
+  // walk-forward exists to prevent. The per-fold IS→OOS procedure itself was
+  // honest and the OOS aggregate still is; the single recommended param set
+  // is now the one with the best IN-SAMPLE score across folds (the OOS
+  // aggregate next to it stays the honest "what it did out-of-sample").
+  const isScoreByCombo = new Map<string, { score: number; params: Record<string, number | string> }>()
   let bestParams: Record<string, number | string> = { ...fixedBase }
 
   for (let f = 0; f < folds; f++) {
@@ -732,12 +773,20 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
     oosMetrics.push(oosM)
     pooledTrades.push(...oosFull.trades)
     isNet += bestIsMetrics.netPnl
-    const oosScore = scoreOf(oosM, objective, 1)
-    if (Number.isFinite(oosScore) && oosScore > bestFoldScore) {
-      bestFoldScore = oosScore
-      bestParams = bestCombo
+    const isScore = scoreOf(bestIsMetrics, objective, 1)
+    if (Number.isFinite(isScore)) {
+      const k = JSON.stringify(bestCombo)
+      const prev = isScoreByCombo.get(k)
+      if (!prev || isScore > prev.score) isScoreByCombo.set(k, { score: isScore, params: bestCombo })
     }
   }
+
+  // Task 58 (P2): pick the recommended params by aggregate IS score (never
+  // the OOS score - see the note above). Fallback: the first fold's IS winner.
+  let bestIsPick: { score: number; params: Record<string, number | string> } | null = null
+  for (const v of isScoreByCombo.values()) if (!bestIsPick || v.score > bestIsPick.score) bestIsPick = v
+  if (bestIsPick) bestParams = bestIsPick.params
+  else if (outFolds.length) bestParams = outFolds[0].bestParams
 
   // OOS aggregate (per-fold net summed on equal start equity)
   const agg = emptyMetrics()
@@ -826,6 +875,7 @@ export interface AssetSweepOptions {
   provenance?: (ticker: string) => { oldest: number; newest: number } | null
   customSpec?: CustomSpec
   direction?: 'call' | 'put' | 'both'
+  edgeTrigger?: boolean
 }
 
 export interface CandleFetcher {
@@ -900,6 +950,7 @@ export function sweepAssets(
         commissionPct: opts.commissionPct,
         customSpec: opts.customSpec,
         direction: opts.direction,
+        edgeTrigger: opts.edgeTrigger,
       })
       const score = scoreOf(m, objective, minTrades)
       let liveDataPct: number | null = null

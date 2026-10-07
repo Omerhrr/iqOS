@@ -80,6 +80,7 @@ export class MarketDataService {
   // bus with batch price sweeps and used to make the 4s poll time out
   private lastCandlePull = 0
   private lastFeedBarTs = 0 // time of the newest real bar seen (feed freshness)
+  private pollFailStreak = 0 // consecutive swallowed pollLive failures (Task 58 alert)
   private lastCandleTs = new Map<string, number>()
   private store: Store | null = null
   private archiveQueue: { asset: string; tf: string; time: number; open: number; high: number; low: number; close: number; volume: number }[] = []
@@ -618,9 +619,31 @@ export class MarketDataService {
   }
 
   async connectLive(url: string, email: string, password: string, balanceMode: string): Promise<{ ok: boolean; error?: string }> {
-    // Empty credentials + sidecar already authenticated? Adopt its session
-    // instead of failing - the user should not re-type secrets needlessly.
-    if (!email.trim() && !password.trim() && (await this.adoptSidecarSession(url))) return { ok: true }
+    // AUDIT FIX (Task 58, P1): empty credentials + an already-authenticated
+    // sidecar used to call adoptSidecarSession() HERE - which flipped the
+    // data feed LIVE while the account source stayed 'paper'. The paper
+    // settle gate (`mode !== 'sim'` skip) then never settled due paper
+    // options: they piled up and settled later at a much-later price. That
+    // violated this file's own invariant (see the comment below: the feed
+    // goes live EXCLUSIVELY through adoptSidecarSession() when the account
+    // source switch demands it). An empty-credential connect now only
+    // VERIFIES the sidecar session (health read, no state touched) so the
+    // user isn't forced to re-type secrets; the feed switch stays exactly
+    // where the invariant says it lives.
+    if (!email.trim() && !password.trim()) {
+      const base = url.replace(/\/$/, '')
+      try {
+        const res = await fetch(`${base}/health`, { signal: AbortSignal.timeout(4000) })
+        const data = (await res.json()) as { ok?: boolean; connected?: boolean }
+        if (data?.connected) {
+          this.liveUrl = url // remember the endpoint for the later source-switch adopt
+          return { ok: true }
+        }
+        return { ok: false, error: 'sidecar has no authenticated IQ session - enter your credentials to log in' }
+      } catch {
+        return { ok: false, error: 'sidecar unreachable - cannot verify session' }
+      }
+    }
     try {
       const res = await fetch(`${url.replace(/\/$/, '')}/connect`, {
         method: 'POST',
@@ -685,6 +708,24 @@ export class MarketDataService {
           .then((r) => r.json())
           .catch(() => null)
       )) as { ok: boolean; price?: number } | null
+      // AUDIT FIX (Task 58, P2): both fetches swallowed EVERY error via
+      // `.catch(() => null)` - a dead/busy sidecar silently froze ticks and
+      // candles (the freshness gate then stopped all applyTick, starving the
+      // live CFD margin monitor) and the "live feed hiccup" alert below
+      // never fired because the outer catch only sees non-fetch errors.
+      // Consecutive null polls now surface a throttled alert.
+      if (!priceData) {
+        this.pollFailStreak++
+        if (this.pollFailStreak === 3 || (this.pollFailStreak > 0 && this.pollFailStreak % 30 === 0)) {
+          this.ctx.bus.emit('alert', {
+            level: 'warn',
+            message: `live feed failing: ${this.pollFailStreak} consecutive sidecar polls returned nothing - ticks/candles frozen, TP/SL monitoring starved (sidecar @ ${url})`,
+            ts: Math.floor(Date.now() / 1000),
+          })
+        }
+      } else {
+        this.pollFailStreak = 0
+      }
       if (priceData?.ok && priceData.price) {
         const now = Math.floor(Date.now() / 1000)
         this.prices.set(this.activeAsset, priceData.price)
@@ -856,7 +897,14 @@ export class MarketDataService {
    * IQ figure in iqair 1.0.0 - the binary payout is the honest estimate. */
   payoutFor(ticker: string, kind: 'binary' | 'turbo' | 'digital' | 'cfd'): number {
     if (kind === 'cfd') return 1
-    const iq = this.sidecarPayouts.get(ticker)
+    // AUDIT FIX (Task 58, P2): the lookup used the OS ticker only, so remapped
+    // instruments (UKBrent→OIL_BRENT, USCrude→OIL_WTI, NASDAQ100→NSDQ100,
+    // DJI30→DJ30) never matched sidecarPayouts and always got the sim-modeled
+    // payout - the auto-trader's EV gate judged them on a made-up number even
+    // live. isOptionInstrument/isIQAvailable map through iqairName first;
+    // payoutFor now does too.
+    const sym = this.iqairSymbol(ticker)
+    const iq = (sym !== ticker ? this.sidecarPayouts.get(sym) : undefined) ?? this.sidecarPayouts.get(ticker)
     const a = getInstrument(ticker)
     if (iq && (!a || this.mode === 'live')) {
       const base = iq.binary ?? (a ? a.payout : 0.85)

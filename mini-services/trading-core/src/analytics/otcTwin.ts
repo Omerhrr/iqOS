@@ -260,7 +260,13 @@ export function twinSelfTest(candles: Candle[]): TwinSelfTest {
   // has a +-0.09 floor - without this, healthy small twins read
   // 'inconclusive' on pure noise
   const floor = Math.max(0.05, 2.2 / Math.sqrt(Math.max(1, NA)))
-  const verdict = Math.abs(acf1) <= floor ? 'synthetic-like' : acf1 >= floor ? 'real-like' : 'inconclusive'
+  // Task 58 (P3): the verdict used to gate ONLY on |acf1| - decidedZ (the
+  // fair-coin check) was computed but never gated, so a twin with a biased
+  // sign generator still read "synthetic-like" despite the doc promising the
+  // coin is checked. Both conditions now gate (3.5sigma on the coin z).
+  const zFloor = 3.5
+  const coinOk = Math.abs(z) <= zFloor
+  const verdict = Math.abs(acf1) <= floor && coinOk ? 'synthetic-like' : acf1 >= floor || !coinOk ? 'real-like' : 'inconclusive'
   return {
     flatRate: +(flat / Math.max(1, T)).toFixed(4),
     decidedShare: +(dec / Math.max(1, T)).toFixed(4),

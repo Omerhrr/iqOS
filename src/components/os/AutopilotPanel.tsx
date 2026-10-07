@@ -224,7 +224,9 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
 
   const remove = async (row: BotRow) => {
     try {
-      await osPost('/bot_delete', { id: row.bot.id })
+      // Task 58 (P2): 200-ok:false rejections surfaced instead of swallowed
+      const res = await osPost<{ ok: boolean; error?: string }>('/bot_delete', { id: row.bot.id })
+      if (!res.ok) onError(res.error ?? 'bot delete rejected')
       onChanged()
     } catch (err) {
       onError((err as Error).message)
@@ -233,7 +235,8 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
 
   const restart = async (row: BotRow) => {
     try {
-      await osPost('/bot_restart', { id: row.bot.id })
+      const res = await osPost<{ ok: boolean; error?: string }>('/bot_restart', { id: row.bot.id })
+      if (!res.ok) onError(res.error ?? 'bot restart rejected')
       onChanged()
     } catch (err) {
       onError((err as Error).message)

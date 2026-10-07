@@ -31,8 +31,7 @@ yarn-error.log*
 .pnpm-debug.log*
 
 # env files (can opt-in for committing if needed)
-.env*
-
+.env
 # vercel
 .vercel
 
@@ -49,7 +48,6 @@ dev.out.log
 test
 prompt
 .env
-.env.example
 server.log
 # Skills directory
 /skills/
@@ -71,3 +69,7 @@ mini-services/**/data/
 *.db-wal
 tool-results/
 live/.iq_session
+
+# Task 58: never track bytecode or data snapshots again
+__pycache__/
+*.pyc

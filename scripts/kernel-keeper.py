@@ -24,7 +24,19 @@ BUN = "/usr/local/bin/bun"
 CMD = [BUN, "index.ts"]
 
 
+MAX_LOG_BYTES = 10 * 1024 * 1024  # Task 58: rotate at 10MB, keep one old copy
+
+
+def rotate(path: str) -> None:
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > MAX_LOG_BYTES:
+            os.replace(path, path + ".1")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def log(msg: str) -> None:
+    rotate(LOG)
     line = f"[kernel-keeper {time.strftime('%T')}] {msg}"
     with open(LOG, "a") as f:
         f.write(line + "\n")
@@ -40,16 +52,24 @@ def port_up(port: str) -> bool:
 
 def loop() -> None:
     log("daemon loop started (kernel :3030)")
+    # Task 58: exponential backoff on a crash loop (5s -> 10 -> 20 -> .. 60s
+    # cap) - the old fixed 5s respawn burned CPU + log on a crash loop.
+    backoff = 5.0
     while True:
         try:
+            rotate(KERNEL_LOG)
             if not port_up("3030"):
-                log("starting trading-core kernel on :3030")
+                log("starting trading-core kernel on :3030 (backoff %.0fs)" % backoff)
                 with open(KERNEL_LOG, "a") as kf:
                     subprocess.Popen(
                         CMD, cwd=f"{PROJECT}/mini-services/trading-core",
                         stdout=kf, stderr=subprocess.STDOUT,
                         stdin=subprocess.DEVNULL, start_new_session=True,
                     )
+                time.sleep(backoff)
+                backoff = min(60.0, backoff * 2)
+                continue
+            backoff = 5.0  # kernel healthy - reset
         except Exception as e:  # noqa: BLE001
             log(f"error: {e}")
         time.sleep(5)

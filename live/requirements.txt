@@ -1,2 +1,5 @@
-iqair
-requests
+# Task 58: pinned - the sidecar pip-installs these at import time when
+# missing, so floating specs meant supply-chain drift could change
+# broker-bridge behavior mid-production. Bump deliberately.
+iqair==1.0.0
+requests==2.32.5

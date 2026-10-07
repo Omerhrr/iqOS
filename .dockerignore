@@ -8,3 +8,10 @@ server.log
 .env
 .env.local
 tsconfig.tsbuildinfo
+# Task 58: keep the live DB, broker session, harvest archives and bytecode OUT of build contexts
+mini-services/**/data/
+data/
+live/.iq_session
+**/__pycache__
+*.pyc
+.db*

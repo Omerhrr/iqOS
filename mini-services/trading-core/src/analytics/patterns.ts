@@ -209,16 +209,17 @@ export function detectPatterns(candles: Candle[], lookback = 8): PatternHit[] {
       }
     }
   }
-  // dedupe by name keeping most recent
-  const seen = new Set<string>()
-  const out: PatternHit[] = []
+  // dedupe by name keeping the MOST RECENT occurrence - AUDIT FIX (Task 58,
+  // P2): the old Set-based "first wins" loop kept the OLDEST duplicate
+  // (hits are pushed oldest-first), so a Hammer that re-fired 1 bar ago was
+  // reported/stored with barsAgo=6 and patternBias weighted it at 1/7
+  // instead of 1/2. Order-independent: the smallest barsAgo wins.
+  const byName = new Map<string, PatternHit>()
   for (const h of hits) {
-    if (!seen.has(h.name)) {
-      seen.add(h.name)
-      out.push(h)
-    }
+    const cur = byName.get(h.name)
+    if (!cur || h.barsAgo < cur.barsAgo) byName.set(h.name, h)
   }
-  return out.sort((a, b) => a.barsAgo - b.barsAgo || b.reliability - a.reliability)
+  return [...byName.values()].sort((a, b) => a.barsAgo - b.barsAgo || b.reliability - a.reliability)
 }
 
 /** Net pattern bias: bullish weight minus bearish weight (weighted by recency + reliability). */

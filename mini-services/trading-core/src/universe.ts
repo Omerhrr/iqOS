@@ -268,12 +268,18 @@ export function isInstrumentOpen(a: AssetInfo, now = new Date()): boolean {
   return day >= 1 && day <= 5 && hour >= 13.5 && hour < 20
 }
 
-export const UNIVERSE_STATS = {
-  total: UNIVERSE.length,
-  forex: FX.length + OTC.length,
-  otc: OTC.length,
-  crypto: CRYPTO.length,
-  commodities: COMMODITIES.length,
-  stocks: STOCKS.length,
-  indices: INDICES.length,
+// AUDIT FIX (Task 58, P3): this was frozen at module load - instruments added
+// via registerDynamicInstrument (live sidecar discovery) were never counted
+// and /instruments reported stale totals. Computed on read.
+export function universeStats(): { total: number; forex: number; otc: number; crypto: number; commodities: number; stocks: number; indices: number } {
+  const by = (fn: (a: AssetInfo) => boolean) => UNIVERSE.filter(fn).length
+  return {
+    total: UNIVERSE.length,
+    forex: by((a) => a.category === 'forex'), // includes the -OTC twins (same as the old FX+OTC sum)
+    otc: by((a) => a.otc),
+    crypto: by((a) => a.category === 'crypto'),
+    commodities: by((a) => a.category === 'commodity'),
+    stocks: by((a) => a.category === 'stock'),
+    indices: by((a) => a.category === 'index'),
+  }
 }

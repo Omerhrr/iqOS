@@ -72,7 +72,11 @@ function parseRules(notes: RuleNote[]): { rules: ParsedRules; raw: RuleNote[] } 
         }
       } else if (key === 'max-stake' || key === 'max-stake-usd' || key === 'stake-cap') {
         const n = Number(val.replace(/[^0-9.]/g, ''))
-        if (Number.isFinite(n) && n > 0) rules.maxStake = Math.max(rules.maxStake ?? 0, n)
+        // AUDIT FIX (Task 58, P2): multiple max-stake rules used to resolve to
+        // the MAX (loosest) - a stray "max-stake: 500" note silently raised a
+        // pre-existing "max-stake: 20" cap. A safety gate must fail CLOSED:
+        // the tightest (min) cap wins, same direction as max-trades-per-hour.
+        if (Number.isFinite(n) && n > 0) rules.maxStake = rules.maxStake === null ? n : Math.min(rules.maxStake, n)
       } else if (key === 'max-trades-per-hour' || key === 'trades-per-hour' || key === 'max-trades-hourly') {
         const n = Number(val.replace(/[^0-9]/g, ''))
         if (Number.isFinite(n) && n > 0) rules.maxTradesPerHour = rules.maxTradesPerHour === null ? n : Math.min(rules.maxTradesPerHour, n)
@@ -103,7 +107,12 @@ export class MemoryGateService {
     const now = Date.now()
     if (!force && this.cache && now - this.cache.ts < 30_000) return this.cache
     const store = this.store()
-    const all = store.listNotes('', 200)
+    // AUDIT FIX (Task 58, P2): listNotes used to clamp its own limit at 100, so
+    // asking for 200 silently truncated - a standing rule note pushed past the
+    // newest 100 copilot notes disappeared from parseRules without any signal
+    // and autonomy silently un-gated. Scan the newest 500 (store clamp raised
+    // to match).
+    const all = store.listNotes('', 500)
     const ruleNotes = all.filter((n) => n.kind === 'rule').map((n) => ({ id: n.id, content: n.content }))
     const { rules, raw } = parseRules(ruleNotes)
     this.cache = { ts: now, rules, raw }

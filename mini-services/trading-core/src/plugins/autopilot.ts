@@ -508,7 +508,12 @@ export class AutopilotService {
       strategyId: this.validStrategy(input.strategyId ?? existing?.strategyId ?? DEFAULT_BOT.strategyId),
       tf: (input.tf ?? existing?.tf ?? DEFAULT_BOT.tf) as Timeframe,
       params: input.params && Object.keys(input.params).length ? input.params : existing?.params,
-      kind: (input.kind ?? existing?.kind ?? DEFAULT_BOT.kind) as TradeKind,
+      // Task 58 (P2): kind used to be cast unchecked - a client sending
+      // kind:"binary " (trailing space) or any unknown string passed save and
+      // execution.placeOrder's final else branch treated it as a CFD: margin
+      // deducted, leverage defaulted up to 30x, no expiry. Whitelist it.
+      const rawKind = String(input.kind ?? existing?.kind ?? DEFAULT_BOT.kind).trim()
+      kind: (['binary', 'turbo', 'digital', 'cfd'].includes(rawKind) ? rawKind : DEFAULT_BOT.kind) as TradeKind,
       stake: clampNum(input.stake ?? existing?.stake ?? DEFAULT_BOT.stake, 1, 5000),
       expiryBars: Math.max(1, Math.round(input.expiryBars ?? existing?.expiryBars ?? DEFAULT_BOT.expiryBars)),
       minScore: clampNum(input.minScore ?? existing?.minScore ?? DEFAULT_BOT.minScore, 0, 100),
@@ -540,7 +545,12 @@ export class AutopilotService {
     // enable, not every edit to an already-running one) so a stake tweak on a
     // live bot doesn't get blocked by a validation that's since gone stale.
     let forced = false
-    if (bot.enabled && !(existing?.enabled ?? false)) {
+    // Task 58 (P2): the research gate used to fire only on the ENABLE
+    // transition - an already-armed bot could be re-saved with a brand-new
+    // unvalidated strategyId (and params) and keep trading it with no gate.
+    // A strategy swap on a live bot is re-gated exactly like a fresh arm.
+    const strategyChanged = existing && bot.strategyId !== existing.strategyId
+    if (bot.enabled && (!(existing?.enabled ?? false) || strategyChanged)) {
       const gate = this.researchGateEnabled ? this.researchGate(bot) : null
       if (gate) {
         if (!opts.force) return { ok: false, error: gate }
@@ -731,14 +741,12 @@ export class AutopilotService {
 
     // copilot memory gate: standing rules the user told the copilot ("never
     // trade Fridays", "only trade EURUSD-OTC", "max stake $20"...) hard-block
-    // autonomy - manual trading stays free, rules govern the machines only
-    try {
-      const mg = this.ctx.use<{ check: (asset: string, stake: number) => { ok: boolean; reason?: string } }>('memoryGate')
-      const g = mg.check(asset, bot.stake)
-      if (!g.ok) return this.reject(bot, g.reason ?? 'memory gate hold')
-    } catch {
-      // memory gate plugin not loaded - rule gating disabled
-    }
+    // autonomy - manual trading stays free, rules govern the machines only.
+    // Task 58 (P1): this check MOVED below stakeFor() - it used to run on the
+    // bot's FLAT configured stake ~100 lines before the real bet was computed,
+    // so a compounding bot with a $200 pot sailed through a "max stake $20"
+    // rule and then placed $200. It now gates the ACTUAL bet amount (compound
+    // roll + smart multiplier included), same as os-mode does.
 
     // OTC defense gate: generator-driven charts (synthetic feeds) don't
     // respect TA - autonomy may only trade an OTC asset with a strategy that
@@ -851,6 +859,14 @@ export class AutopilotService {
         `compound pot $${bet.pot.toFixed(2)} is below the $1 broker minimum stake - restart the cycle to re-seed`,
       )
     }
+    // copilot memory gate - NOW on the real bet amount (see the note above)
+    try {
+      const mg = this.ctx.use<{ check: (asset: string, stake: number) => { ok: boolean; reason?: string } }>('memoryGate')
+      const g = mg.check(asset, bet.amount)
+      if (!g.ok) return this.reject(bot, g.reason ?? 'memory gate hold')
+    } catch {
+      // memory gate plugin not loaded - rule gating disabled
+    }
     // THE BUG: this used to hardcode mode: 'paper' - every bot traded the
     // paper ledger no matter which ledger the operator was actually on, so a
     // bot created/armed while connected to a real IQ session silently placed
@@ -956,7 +972,13 @@ export class AutopilotService {
     rt.openCount = Math.max(0, rt.openCount - 1)
     const pnl = position.pnl ?? 0
     rt.pnlTotal += pnl
-    const sameDay = rt.dayKey === new Date().toISOString().slice(0, 10)
+    // Task 58 (P2): the day gate used rt.dayKey, which only rolls inside
+    // tradeForBot - a position settling at 00:05 (before the bot's first
+    // post-midnight evaluation) failed sameDay, then the rollover wiped the
+    // counters: the close was dropped from the daily stats forever. Re-derive
+    // the day from the close time like os-mode's rebuild does.
+    const closeDay = new Date((position.tsClose ?? Math.floor(Date.now() / 1000)) * 1000).toISOString().slice(0, 10)
+    const sameDay = rt.dayKey === closeDay && rt.dayKey === new Date().toISOString().slice(0, 10)
     if (position.status === 'won') {
       rt.wins += 1
       rt.streak = rt.streak >= 0 ? rt.streak + 1 : 1
@@ -972,6 +994,7 @@ export class AutopilotService {
       // limit and profit target never saw them
       rt.pnlToday += pnl
     }
+    // 'push' (Task 58): neutral refund - pnl 0, no win/loss, streak untouched
     // streak-breaker: 3+ consecutive losses bench the bot for a growing
     // window (15min at 3, doubling per extra loss, 4h cap). rt.streak was
     // JUST updated above, so a fresh 3rd loss lands here on the same event.

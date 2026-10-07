@@ -73,7 +73,11 @@ export const TRADE_KIND_LABEL: Record<TradeKind, string> = {
   cfd: 'CFD',
 }
 export type TradeMode = 'paper' | 'live'
-export type TradeStatus = 'open' | 'won' | 'lost' | 'closed'
+// 'push' = at-the-money refund / broker-reported pnl 0 (Task 58): a neutral
+// third outcome. It is NOT a win (win-rate stats must not count it) and NOT a
+// loss (the stake comes back) - stats() and the adaptive buckets exclude it,
+// and lossStreak treats it as neither extending nor breaking a streak.
+export type TradeStatus = 'open' | 'won' | 'lost' | 'closed' | 'push'
 
 export interface Position {
   id: string
@@ -381,7 +385,7 @@ export interface BacktestTrade {
   exit: number
   amount: number
   pnl: number
-  status: 'won' | 'lost'
+  status: 'won' | 'lost' | 'push' // Task 58: pushes are their own neutral outcome, never wins
 }
 
 export interface BacktestResult {

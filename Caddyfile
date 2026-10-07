@@ -3,7 +3,17 @@
 		query XTransformPort=*
 	}
 
+	# Task 58 (P1): the port was client-controlled (unauthenticated open proxy
+	# to any localhost service in host-mode). Only the OS's own ports pass;
+	# anything else gets 403 before the proxy runs.
+	@disallowed_port {
+		not query XTransformPort=3000
+		not query XTransformPort=3030
+		not query XTransformPort=8788
+	}
+
 	handle @transform_port_query {
+		respond @disallowed_port "port not allowed" 403
 		reverse_proxy localhost:{query.XTransformPort} {
 			header_up Host {host}
 			header_up X-Forwarded-For {remote_host}

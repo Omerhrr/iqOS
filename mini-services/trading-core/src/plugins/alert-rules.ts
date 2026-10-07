@@ -8,6 +8,7 @@
 // only notify, they never trade.
 
 import type { Timeframe } from '../types'
+import { ALL_TIMEFRAMES } from '../types'
 import type { KernelContext, Plugin } from '../kernel'
 import type { MarketDataService } from './market-data'
 import type { ScreenerService, ScreenRow } from './screener'
@@ -134,23 +135,36 @@ export class AlertRulesService {
     const def = ALERT_METRICS.find((m) => m.metric === metric)!
     let value: number | undefined = undefined
     if (def.needsValue) {
-      value = Number(input.value ?? existing?.value ?? DEFAULT_RULE.value)
-      if (!Number.isFinite(value)) return { ok: false, error: `${metric} needs a numeric value (${def.hint})` }
-      if (metric === 'regime' && !['bull', 'bear', 'range', 'chop'].includes(String(input.value ?? existing?.value ?? ''))) {
-        return { ok: false, error: 'regime must be one of bull | bear | range | chop' }
+      // AUDIT FIX (Task 58, P1): the numeric coercion ran BEFORE the regime
+      // validation - Number('bull') is NaN, so every regime rule save died
+      // with "regime needs a numeric value" and the advertised metric was
+      // dead. The regime branch now runs FIRST and short-circuits the
+      // numeric check.
+      if (metric === 'regime') {
+        const rv = String(input.value ?? existing?.value ?? '')
+        if (!['bull', 'bear', 'range', 'chop'].includes(rv)) {
+          return { ok: false, error: 'regime must be one of bull | bear | range | chop' }
+        }
+        value = rv as unknown as number
+      } else {
+        value = Number(input.value ?? existing?.value ?? DEFAULT_RULE.value)
+        if (!Number.isFinite(value)) return { ok: false, error: `${metric} needs a numeric value (${def.hint})` }
       }
-      if (metric === 'regime') value = String(input.value ?? existing?.value) as unknown as number
     }
     const rule: AlertRule = {
       id,
       name: (input.name ?? existing?.name ?? `${asset} ${metric}`).trim().slice(0, 40),
       enabled: input.enabled ?? existing?.enabled ?? DEFAULT_RULE.enabled,
       asset,
-      tf: (input.tf ?? existing?.tf ?? DEFAULT_RULE.tf) as Timeframe,
+      tf: (typeof input.tf === 'string' && (ALL_TIMEFRAMES as string[]).includes(input.tf)
+        ? input.tf
+        : existing?.tf ?? DEFAULT_RULE.tf) as Timeframe,
       metric,
       value,
       note: input.note !== undefined ? String(input.note).slice(0, 120) : existing?.note,
-      cooldownSec: Math.max(0, Math.round(Number(input.cooldownSec ?? existing?.cooldownSec ?? DEFAULT_RULE.cooldownSec))),
+      // Task 58 (P2): cooldownSec 0 = fire on EVERY tick while beyond the
+      // level (alert storm, one sqlite INSERT + broadcast per fire) - floor 1s.
+      cooldownSec: Math.max(1, Math.round(Number(input.cooldownSec ?? existing?.cooldownSec ?? DEFAULT_RULE.cooldownSec) || 60)),
       oneShot: input.oneShot ?? existing?.oneShot ?? DEFAULT_RULE.oneShot,
       lastFiredTs: existing?.lastFiredTs,
       fires: existing?.fires ?? 0,
@@ -182,9 +196,22 @@ export class AlertRulesService {
     const target = Number(rule.value)
     if (!Number.isFinite(target) || price <= 0) return
     const hit = rule.metric === 'price_above' ? price >= target : price <= target
-    if (!hit) return
+    // Task 58 (P2): this used to fire on EVERY tick while price was beyond
+    // the level ("crossed above" was really "is above") - a stuck level meant
+    // a per-tick alert storm. Track an armed/disarmed latch per rule: fire
+    // only on the tick that CROSSES, re-arm when price returns to the far
+    // side. (oneShot rules still disarm via fire() as before.)
+    const armed = this.priceArmed.get(rule.id) ?? true
+    if (!hit) {
+      this.priceArmed.set(rule.id, true)
+      return
+    }
+    if (!armed) return
+    this.priceArmed.set(rule.id, false)
     this.fire(rule, `${rule.asset} ${rule.metric === 'price_above' ? 'crossed above' : 'crossed below'} ${fmtLevel(target)} (now ${fmtLevel(price)})`)
   }
+
+  private priceArmed = new Map<string, boolean>()
 
   private onCandleClose(asset: string, tf: Timeframe): void {
     const rules = [...this.runtime.values()].filter(

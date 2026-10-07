@@ -591,7 +591,7 @@ export interface Position {
   exitPrice?: number
   payout: number
   pnl?: number
-  status: 'open' | 'won' | 'lost' | 'closed'
+  status: 'open' | 'won' | 'lost' | 'closed' | 'push'
   strategy?: string
   note?: string
   settlesAt?: number
@@ -1647,7 +1647,7 @@ export interface OsModeStatus {
 
 // ---------- REST client (direct to core via gateway port param) ----------
 
-const CORE_PORT = 3030
+const CORE_PORT = Number((typeof process !== 'undefined' && process.env && (process.env as Record<string, string | undefined>).NEXT_PUBLIC_KERNEL_PORT) || 3030)
 
 function qs(params: Record<string, string | number | undefined>): string {
   const usp = new URLSearchParams()
@@ -1658,10 +1658,25 @@ function qs(params: Record<string, string | number | undefined>): string {
   return usp.toString()
 }
 
+// AUDIT FIX (Task 58, P2): the wrappers used to discard the kernel's error
+// BODY ("GET x failed: 400") - kernel 400s carry rich diagnostics (thin
+// history, lab validation errors, OTC trial breakdowns) that the panels were
+// never shown. Non-2xx now rethrows with the kernel's own message when the
+// body carries one.
+async function errorFrom(res: Response, label: string): Promise<Error> {
+  try {
+    const body = (await res.json()) as { error?: string }
+    if (body?.error) return new Error(body.error)
+  } catch {
+    // body not JSON - fall through to the generic message
+  }
+  return new Error(`${label} failed: ${res.status}`)
+}
+
 export async function osGet<T>(path: string, params: Record<string, string | number | undefined> = {}): Promise<T> {
   const clean = path.replace(/^\/+/, '')
   const res = await fetch(`/${clean}?${qs(params)}`, { cache: 'no-store' })
-  if (!res.ok) throw new Error(`GET ${clean} failed: ${res.status}`)
+  if (!res.ok) throw await errorFrom(res, `GET ${clean}`)
   return res.json() as Promise<T>
 }
 
@@ -1673,7 +1688,7 @@ export async function osPost<T>(path: string, body: unknown = {}): Promise<T> {
     body: JSON.stringify(body),
     cache: 'no-store',
   })
-  if (!res.ok) throw new Error(`POST ${clean} failed: ${res.status}`)
+  if (!res.ok) throw await errorFrom(res, `POST ${clean}`)
   return res.json() as Promise<T>
 }
 

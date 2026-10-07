@@ -63,6 +63,11 @@ export function rsi(src: number[], period = 14): number[] {
   const out = new Array<number>(src.length).fill(NaN)
   let avgGain = 0
   let avgLoss = 0
+  // AUDIT FIX (Task 58, P2): a perfectly flat series (avgGain = avgLoss = 0)
+  // read RSI 100 - "maximally overbought" from zero information - and
+  // rsi-reversion fired a max-score PUT on dead tape (OTC lattice feeds have
+  // long flat stretches). Zero information is the neutral 50.
+  const rsiOf = (g: number, l: number) => (g === 0 && l === 0 ? 50 : l === 0 ? 100 : 100 - 100 / (1 + g / l))
   for (let i = 1; i < src.length; i++) {
     const diff = src[i] - src[i - 1]
     const gain = Math.max(diff, 0)
@@ -70,11 +75,11 @@ export function rsi(src: number[], period = 14): number[] {
     if (i <= period) {
       avgGain += gain / period
       avgLoss += loss / period
-      if (i === period) out[i] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss)
+      if (i === period) out[i] = rsiOf(avgGain, avgLoss)
     } else {
       avgGain = (avgGain * (period - 1) + gain) / period
       avgLoss = (avgLoss * (period - 1) + loss) / period
-      out[i] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss)
+      out[i] = rsiOf(avgGain, avgLoss)
     }
   }
   return out
@@ -116,7 +121,7 @@ export function stochastic(
     }
     raw[i] = hh === ll ? 50 : ((close[i] - ll) / (hh - ll)) * 100
   }
-  const k = sma(raw.map((v) => (isn(v) ? v : 0)), smooth).map((v, i) => (isn(raw[i]) ? v : NaN))
+  const k = smoothValid(raw, smooth)
   const firstValid = k.findIndex(isn)
   const d = new Array<number>(close.length).fill(NaN)
   if (firstValid >= 0) {
@@ -364,9 +369,18 @@ export function ichimoku(
   }
   const tenkan = midRange(conv)
   const kijun = midRange(base)
-  const senkouA = tenkan.map((t, i) => (isn(t) && !isn(t)) || !isn(kijun[i]) ? NaN : (t + kijun[i]) / 2)
-  const senkouB = midRange(spanB)
-  return { tenkan, kijun, senkouA, senkouB }
+  const senkouARaw = tenkan.map((t, i) => (!isn(t) && !isn(kijun[i]) ? (t + kijun[i]) / 2 : NaN))
+  const senkouBRaw = midRange(spanB)
+  // AUDIT FIX (Task 58, P3): textbook Ichimoku plots the cloud 26 bars AHEAD
+  // of its computation point. Consumers read senkou[i] AT bar i (price-vs-
+  // cloud), so the honest non-lookahead construction is the cloud DISPLACED
+  // BACKWARD: senkou[i] = raw[i - 26] - exactly what a trader would see under
+  // price at bar i. The old series was contemporaneous (a different, more
+  // reactive animal than the classic cloud the strategies claim to use), and
+  // the dead `isn(t) && !isn(t)` condition in senkouA never fired.
+  const D = 26
+  const disp = (raw: number[]): number[] => raw.map((_, i) => (i - D >= 0 && isn(raw[i - D]) ? raw[i - D] : NaN))
+  return { tenkan, kijun, senkouA: disp(senkouARaw), senkouB: disp(senkouBRaw) }
 }
 
 // ---------- Volume ----------
@@ -537,7 +551,7 @@ export function tema(src: number[], period: number): number[] {
 export function trima(src: number[], period: number): number[] {
   const half = Math.ceil(period / 2)
   const s1 = sma(src, half)
-  const s2 = sma(s1.map((v) => (isn(v) ? v : 0)), half)
+  const s2 = smoothValid(s1, half)
   return s2.map((v, i) => (isn(s1[i]) ? v : NaN))
 }
 
@@ -564,7 +578,7 @@ export function hma(src: number[], period: number): number[] {
   const w2 = wma(src, period)
   const raw = src.map((_, i) => (isn(w1[i]) && isn(w2[i]) ? 2 * w1[i] - w2[i] : NaN))
   const firstValid = raw.findIndex(isn)
-  const vals = firstValid >= 0 ? wma(raw.slice(firstValid).map((v) => (isn(v) ? v : 0)), sqrtP) : []
+  const vals = firstValid >= 0 ? wma(raw.slice(firstValid), sqrtP) : []
   const out = new Array<number>(src.length).fill(NaN)
   for (let i = 0; i < vals.length; i++) out[firstValid + i] = vals[i]
   return out
@@ -631,7 +645,7 @@ export function stochRsi(src: number[], rsiPeriod = 14, stochPeriod = 14, kSmoot
     }
     raw[i] = hh === ll ? 50 : ((r[i] - ll) / (hh - ll)) * 100
   }
-  const k = smoothInvalid(raw, kSmooth)
+  const k = smoothValid(raw, kSmooth)
   const firstValid = k.findIndex(isn)
   const d = new Array<number>(src.length).fill(NaN)
   if (firstValid >= 0) {
@@ -642,10 +656,18 @@ export function stochRsi(src: number[], rsiPeriod = 14, stochPeriod = 14, kSmoot
   return { k, d }
 }
 
-function smoothInvalid(src: number[], period: number): number[] {
-  const filled = src.map((v) => (isn(v) ? v : 0))
-  const s = sma(filled, period)
-  return s.map((v, i) => (isn(src[i]) ? v : NaN))
+function smoothValid(src: number[], period: number): number[] {
+  // AUDIT FIX (Task 58, P2): the old smoothInvalid zero-filled warmup NaNs
+  // before smoothing, so the first period-1 VALID outputs were diluted
+  // toward 0 (a %K/TRIMA/HMA/KST read "oversold" purely from warmup zeros).
+  // Smooth over the VALID slice instead - warmup bars stay NaN, which every
+  // consumer already treats as not-yet-valid.
+  const firstValid = src.findIndex(isn)
+  const out = new Array<number>(src.length).fill(NaN)
+  if (firstValid < 0) return out
+  const vals = sma(src.slice(firstValid), period)
+  for (let i = 0; i < vals.length; i++) out[firstValid + i] = vals[i]
+  return out
 }
 
 export function ppo(src: number[], fast = 12, slow = 26, signal = 9): { ppo: number[]; signal: number[]; hist: number[] } {
@@ -755,7 +777,7 @@ export function kst(src: number[]): { kst: number[]; signal: number[] } {
       ? r1[i] * 1 + r2[i] * 2 + r3[i] * 3 + r4[i] * 4
       : NaN
   )
-  const line = smoothInvalid(combo, 10)
+  const line = smoothValid(combo, 10)
   const firstValid = line.findIndex(isn)
   const sig = firstValid >= 0 ? sma(line.slice(firstValid).filter(isn), 10) : []
   const signal = new Array<number>(src.length).fill(NaN)

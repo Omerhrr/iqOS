@@ -383,7 +383,11 @@ threading.Thread(target=_watch_reaper, daemon=True).start()
 # is pre-filled - no password round-trip. Persisting the ssid lets keeper
 # respawns / watchdog restarts resume transparently instead of demanding a
 # manual re-login. File lives next to the sidecar, chmod 600, never committed.
-SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".iq_session")
+# Task 58: session dir overridable (docker persists ONLY this dir, not the
+# whole /app workdir - a whole-workdir volume shadowed rebuilt images)
+SESSION_FILE = os.path.join(
+    os.environ.get("SIDECAR_SESSION_DIR") or os.path.dirname(os.path.abspath(__file__)), ".iq_session"
+)
 
 try:
     import iqair.global_value as _gv
@@ -596,7 +600,55 @@ def _buy_digital_spot(amount, ticker, direction, expiry_minutes):
     return False, str(res)
 
 
-def _buy_fast(amount, active_id, direction, expiry_minutes):
+def _reconcile_recent_open(active_id, amount, direction, symbol=None, max_age_sec=120):
+    """Task 58 (P1): best-effort scan of open option positions for a just-placed
+    order matching this buy (instrument, amount, direction, opened within the
+    last 2 minutes). Returns the broker order id or None. Used after a buyv3
+    answer timeout: no ack does NOT mean the order wasn't placed, and a blind
+    retry (each attempt carries a fresh req_id, so there is no idempotency)
+    can DOUBLE the position. Any failure here = None (honest unknown)."""
+    names = {symbol} if symbol else set()
+    try:
+        for t, aid in (_asset_ids or {}).items():
+            if aid == active_id:
+                names.add(t)
+                names.add(t.replace("-OTC", ""))
+    except Exception:  # noqa: BLE001
+        pass
+    now_ms = time.time() * 1000
+    for itype in ("binary-option", "turbo-option", "digital-option"):
+        try:
+            ok, data = _client.get_positions(itype, max_wait_sec=6)
+        except Exception:  # noqa: BLE001
+            continue
+        if not (ok and isinstance(data, dict)):
+            continue
+        for item in data.get("positions", []) or []:
+            try:
+                instr = str(item.get("instrument_id") or "")
+                if names and instr and instr not in names:
+                    continue
+                opened = float(item.get("open_time") or item.get("created") or 0)
+                if opened <= 0:
+                    continue
+                opened_ms = opened if opened > 1e12 else opened * 1000
+                if now_ms - opened_ms > max_age_sec * 1000:
+                    continue
+                inv = float(item.get("invest_sum") or item.get("amount") or item.get("sum") or 0)
+                if amount and inv and abs(inv - float(amount)) > 1e-9:
+                    continue
+                d = str(item.get("direction") or "").lower()
+                if direction and d and d not in (direction.lower(), "buy" if direction == "call" else "sell"):
+                    continue
+                oid = item.get("id") or item.get("external_id") or item.get("position_id")
+                if oid is not None:
+                    return str(oid)
+            except Exception:  # noqa: BLE001
+                continue
+    return None
+
+
+def _buy_fast(amount, active_id, direction, expiry_minutes, symbol=None):
     """Direct buyv3 order with a pre-resolved active_id: ONE websocket round
     trip, no per-order init re-scan. Mirrors iqair's _buy_once response wait.
     Returns (True, order_id, expired_unix | None) or (False, reason, None).
@@ -615,7 +667,16 @@ def _buy_fast(amount, active_id, direction, expiry_minutes):
         time.sleep(0.15)
     if not isinstance(resp, dict):
         print(f"[sidecar] buy timeout: {active_id} x {amount} ({expiry_minutes}m)")
-        return False, "broker did not answer the order in time", None
+        # Task 58 (P1): a timeout is NOT a rejection - the websocket round-trip
+        # may have completed server-side after our 10s wait, and req_id is
+        # unique per attempt so a retry would be a brand-new order (double-
+        # submit risk). Reconcile first: if the order actually landed, return
+        # it as a success; otherwise fail with an explicit DO-NOT-RETRY state.
+        landed = _reconcile_recent_open(active_id, amount, direction, symbol)
+        if landed is not None:
+            print(f"[sidecar] buy timeout RECONCILED: order {landed} landed despite the timeout")
+            return True, landed, None
+        return False, "broker did not answer the order in time - order state UNKNOWN, do NOT blind-retry (check the IQ trades page first)", None
     if resp.get("id") is None:
         msg = resp.get("message") or "rejected"
         print(f"[sidecar] buy rejected: {active_id} x {amount}: {msg}")
@@ -659,7 +720,15 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 # NOTE: must use OUR client - iqair.agent.tools.get_client()
                 # is a different, unconnected instance.
-                meta = _client.get_asset_metadata()
+                # Task 58 (P2): this lib call used to run OUTSIDE the lock -
+                # concurrent iqair calls clobber the lib's shared response
+                # slots (see /prices' own comment), so a metadata fetch racing
+                # a locked /candles//trade could corrupt BOTH responses. The
+                # metadata sweep can take up to ~95s, so it waits with the
+                # standard timeout and the caller's own 1800s cache keeps it
+                # rare.
+                with lock_guard():
+                    meta = _client.get_asset_metadata()
                 rows = []
                 for cat, entries in (meta or {}).items():
                     if not isinstance(entries, dict):
@@ -856,6 +925,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         global _client
+        # Task 58 (P2): CSRF guard - the CORS * header let ANY visited website
+        # POST /connect or /trade against a locally-running sidecar from the
+        # operator's browser. Browser-originated calls ALWAYS carry an Origin
+        # header; server-to-server callers (the kernel, curl) send none. Only
+        # local origins are accepted; everything else is refused before any
+        # handler runs. (Docker deployments are internal-network only anyway.)
+        origin = (self.headers.get("origin") or "").strip().lower()
+        if origin and not origin.startswith(("http://localhost", "http://127.0.0.1", "https://localhost", "https://127.0.0.1")):
+            return self._send(_err("cross-origin browser calls are not accepted - use the kernel API"), 403)
         path = self.path.split("?")[0]
         body = self._body()
 
@@ -1025,7 +1103,7 @@ class Handler(BaseHTTPRequestHandler):
                                 check, order_id = _buy_digital_spot(amount, asset, direction, expiry)
                             elif tb_id is not None:
                                 # requested digital, account only has turbo/binary
-                                check, order_id, expired = _buy_fast(amount, int(tb_id), direction, expiry)
+                                check, order_id, expired = _buy_fast(amount, int(tb_id), direction, expiry, symbol=asset)
                                 mode = "turbo"
                             else:
                                 return self._send(_err(f"{asset} is not a digital/turbo/binary instrument on this IQ account"), 400)
@@ -1038,7 +1116,7 @@ class Handler(BaseHTTPRequestHandler):
                                 # and falls back to a stale 2018 static table
                                 # that lacks OTC/new tickers -> active_id null
                                 # -> server rejection ("ActiveId is not nullable")
-                                check, order_id, expired = _buy_fast(amount, int(tb_id), direction, expiry)
+                                check, order_id, expired = _buy_fast(amount, int(tb_id), direction, expiry, symbol=asset)
                             elif dig_id is not None:
                                 # requested turbo/binary, account only offers
                                 # this ticker as a digital option (common on

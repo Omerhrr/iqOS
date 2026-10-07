@@ -178,7 +178,12 @@ export class ScreenerService {
 
   /** Score one pair and store the row. Throws when history is too thin. */
   private scorePair(asset: string, tf: Timeframe): ScreenRow {
-    const candles = this.market.getCandles(asset, tf, 300)
+    // AUDIT FIX (Task 58, P1): the fetch was hardwired at 300 while configure
+    // accepted minCandles up to 700 - any config in (300, 700] silently
+    // bricked the screener ({ok:true} back, sweep "completes", rows empty
+    // forever). Fetch what the config actually asks for.
+    const need = Math.min(700, Math.max(300, this.config.minCandles))
+    const candles = this.market.getCandles(asset, tf, need)
     if (candles.length < this.config.minCandles) throw new Error(`thin history ${asset} ${tf}`)
     const snap = scanSnapshot(candles, asset, tf)
     const inst = this.market.assets.find((a) => a.ticker === asset)

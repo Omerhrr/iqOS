@@ -403,13 +403,17 @@ export class Store {
     // row) - history must show when IQ actually closed the trade, not when
     // our poll first noticed. Falls back to our settle moment (paper, manual
     // closes, or a broker row without a sane close_time).
-    this.db.run('UPDATE positions SET status = ?, exit_price = ?, pnl = ?, ts_close = ? WHERE id = ?', [
-      status,
-      exitPrice,
-      pnl,
-      tsClose ?? Math.floor(Date.now() / 1000),
-      id,
-    ])
+    // AUDIT FIX (Task 58, P2): the update used to match ANY status - two
+    // concurrent settle paths (double closePosition inside the sell
+    // round-trip, settle + poll race) both wrote the row and both emitted
+    // positionClosed/account/alerts. The guard makes settlement idempotent:
+    // only a still-open position can transition, the loser of the race gets
+    // null and its caller's funnel is a no-op.
+    const res = this.db.run(
+      "UPDATE positions SET status = ?, exit_price = ?, pnl = ?, ts_close = ? WHERE id = ? AND status = 'open'",
+      [status, exitPrice, pnl, tsClose ?? Math.floor(Date.now() / 1000), id]
+    )
+    if (!res.changes) return null
     return this.getPosition(id)
   }
 
@@ -763,6 +767,7 @@ export class Store {
 
   recordAlert(level: string, message: string, ts: number): void {
     this.db.run('INSERT INTO alerts (ts, level, message) VALUES (?, ?, ?)', [ts, level, message])
+    this.pruneEventTables()
   }
 
   listAlerts(limit = 100): { ts: number; level: string; message: string }[] {
@@ -806,7 +811,10 @@ export class Store {
   }
 
   listNotes(q: string, limit = 30): { id: number; ts: number; kind: string; content: string; tags: string | null }[] {
-    const lim = Math.min(Math.max(limit, 1), 100)
+    // AUDIT FIX (Task 58, P2): clamp raised 100 -> 500. The memory gate scans
+    // rule notes and used to silently lose rules past the newest 100 notes
+    // (asked for 200, silently got 100). Callers still pass explicit limits.
+    const lim = Math.min(Math.max(limit, 1), 500)
     if (q) {
       const like = `%${q.toLowerCase()}%`
       return this.db
@@ -962,6 +970,7 @@ export class Store {
 
   recordRiskEvent(kind: string, message: string, ts: number): void {
     this.db.run('INSERT INTO risk_events (ts, kind, message) VALUES (?, ?, ?)', [ts, kind, message])
+    this.pruneEventTables()
   }
 
   listRiskEvents(limit = 50): { ts: number; kind: string; message: string }[] {
@@ -1045,6 +1054,29 @@ export class Store {
 
   recordWatchdogEvent(botId: string, kind: string, message: string, ts: number): void {
     this.db.run('INSERT INTO watchdog_events (ts, bot_id, kind, message) VALUES (?, ?, ?, ?)', [ts, botId, kind, message])
+    this.pruneEventTables()
+  }
+
+  private eventInsertCounter = 0
+
+  /** AUDIT FIX (Task 58, P2): alerts / risk_events / watchdog_events grew
+   * forever (every bus alert INSERTs; watchdog+sentinel events double-write
+   * two tables each; an alert-storm rule could grow them per tick). Keep 14
+   * days + hard row caps, checked on a cheap counter instead of every insert. */
+  private pruneEventTables(): void {
+    this.eventInsertCounter++
+    if (this.eventInsertCounter % 500 !== 0) return
+    const cutoff = Math.floor(Date.now() / 1000) - 14 * 86400
+    try {
+      this.db.run('DELETE FROM alerts WHERE ts < ?', [cutoff])
+      this.db.run('DELETE FROM risk_events WHERE ts < ?', [cutoff])
+      this.db.run('DELETE FROM watchdog_events WHERE ts < ?', [cutoff])
+      this.db.run('DELETE FROM alerts WHERE id NOT IN (SELECT id FROM alerts ORDER BY id DESC LIMIT 50000)')
+      this.db.run('DELETE FROM risk_events WHERE id NOT IN (SELECT id FROM risk_events ORDER BY id DESC LIMIT 20000)')
+      this.db.run('DELETE FROM watchdog_events WHERE id NOT IN (SELECT id FROM watchdog_events ORDER BY id DESC LIMIT 20000)')
+    } catch {
+      // pruning is best-effort housekeeping
+    }
   }
 
   listWatchdogEvents(limit = 50): { ts: number; bot_id: string; kind: string; message: string }[] {

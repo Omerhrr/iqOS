@@ -59,7 +59,10 @@ export default function BottomTabs(props: BottomTabsProps) {
 
   const closePos = async (id: string) => {
     try {
-      await osPost('/close', { id })
+      // Task 58 (P2): 200-with-ok:false rejections ("position already settled")
+      // used to be silently swallowed - surface them like hard failures
+      const res = await osPost<{ ok: boolean; error?: string }>('/close', { id })
+      if (!res.ok) onError(res.error ?? 'close rejected')
       refreshPositions()
     } catch (err) {
       onError((err as Error).message)
@@ -222,8 +225,8 @@ export default function BottomTabs(props: BottomTabsProps) {
                     <span
                       className="rounded px-1.5 py-0.5 text-[9px] font-bold uppercase"
                       style={{
-                        color: p.status === 'won' ? '#10b981' : p.status === 'lost' ? '#f43f5e' : '#7c8aa5',
-                        background: p.status === 'won' ? 'rgba(16,185,129,0.1)' : p.status === 'lost' ? 'rgba(244,63,94,0.1)' : 'transparent',
+                        color: p.status === 'won' ? '#10b981' : p.status === 'lost' ? '#f43f5e' : p.status === 'push' ? '#f59e0b' : '#7c8aa5',
+                        background: p.status === 'won' ? 'rgba(16,185,129,0.1)' : p.status === 'lost' ? 'rgba(244,63,94,0.1)' : p.status === 'push' ? 'rgba(245,158,11,0.1)' : 'transparent',
                       }}
                     >
                       {p.status}

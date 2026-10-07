@@ -4,7 +4,10 @@ const nextConfig: NextConfig = {
   output: "standalone",
   /* config options here */
   typescript: {
-    ignoreBuildErrors: true,
+    // Task 58: type errors are REAL errors for a system placing real
+    // orders - `bunx tsc --noEmit` passes on this tree, so the escape
+    // hatch is off again.
+    ignoreBuildErrors: false,
   },
   reactStrictMode: false,
   // lightningcss (which @tailwindcss/postcss uses under the hood) picks its

@@ -57,7 +57,7 @@ export function detectChartPatterns(candles: Candle[]): ChartPatternHit[] {
         direction: 'bearish',
         startIndex: scanStart + h1.idx,
         endIndex: scanStart + h2.idx,
-        confidence: Math.min(0.95, 0.6 + Math.abs(h1.price - h2.price) * -0 + (last.close < neckline ? 0.25 : 0)),
+        confidence: Math.min(0.95, 0.6 + (last.close < neckline ? 0.25 : 0)),
         note: 'Twin peaks broken the neckline - distribution complete',
       })
     }
@@ -83,7 +83,8 @@ export function detectChartPatterns(candles: Candle[]): ChartPatternHit[] {
 
   // ---- Head & Shoulders ----
   if (highs.length >= 3 && lows.length >= 2) {
-    const ls = lows.filter((l) => l.idx < highs[highs.length - 3].idx || true)
+    // Task 58 (P3): removed the dead `ls` computation (`|| true` made the
+    // filter a no-op and the result was immediately `void`ed)
     const [p1, p2, p3] = highs.slice(-3)
     const shoulderLows = lows.filter((l) => l.idx < p2.idx && l.idx > (p1.idx > 4 ? p1.idx - 20 : 0))
     if (p2.price > p1.price * 1.01 && p2.price > p3.price * 1.01 && tol(p1.price, p3.price, 0.03) && shoulderLows.length >= 2) {
@@ -99,7 +100,6 @@ export function detectChartPatterns(candles: Candle[]): ChartPatternHit[] {
         })
       }
     }
-    void ls
   }
 
   // ---- Inverse H&S ----
