@@ -497,6 +497,11 @@ export class AutopilotService {
   saveBot(input: Partial<BotConfig>, opts: { force?: boolean } = {}): { ok: boolean; bot?: BotConfig; error?: string; forced?: boolean } {
     const id = input.id?.trim() || `bot-${Math.random().toString(36).slice(2, 8)}`
     const existing = this.store.listBots().find((b) => b.bot.id === id)?.bot
+    // Task 58 (P2): kind used to be cast unchecked - a client sending
+    // kind:"binary " (trailing space) or any unknown string passed save and
+    // execution.placeOrder's final else branch treated it as a CFD: margin
+    // deducted, leverage defaulted up to 30x, no expiry. Whitelist it.
+    const rawKind = String(input.kind ?? existing?.kind ?? DEFAULT_BOT.kind).trim()
     const bot: BotConfig = {
       id,
       name: (input.name ?? existing?.name ?? `Bot ${id.slice(-4)}`).trim().slice(0, 32) || 'Bot',
@@ -508,11 +513,6 @@ export class AutopilotService {
       strategyId: this.validStrategy(input.strategyId ?? existing?.strategyId ?? DEFAULT_BOT.strategyId),
       tf: (input.tf ?? existing?.tf ?? DEFAULT_BOT.tf) as Timeframe,
       params: input.params && Object.keys(input.params).length ? input.params : existing?.params,
-      // Task 58 (P2): kind used to be cast unchecked - a client sending
-      // kind:"binary " (trailing space) or any unknown string passed save and
-      // execution.placeOrder's final else branch treated it as a CFD: margin
-      // deducted, leverage defaulted up to 30x, no expiry. Whitelist it.
-      const rawKind = String(input.kind ?? existing?.kind ?? DEFAULT_BOT.kind).trim()
       kind: (['binary', 'turbo', 'digital', 'cfd'].includes(rawKind) ? rawKind : DEFAULT_BOT.kind) as TradeKind,
       stake: clampNum(input.stake ?? existing?.stake ?? DEFAULT_BOT.stake, 1, 5000),
       expiryBars: Math.max(1, Math.round(input.expiryBars ?? existing?.expiryBars ?? DEFAULT_BOT.expiryBars)),
