@@ -13,6 +13,11 @@ import { findPivots } from '../analytics/chart-patterns'
 import { computeCandleDelta, computeCumulativeDelta, computeVolumeProfile } from '../analytics/orderflow'
 import { renkoBricks } from '../analytics/renko'
 import { pointFigure } from '../analytics/pointfigure'
+import { rangeBars } from '../analytics/rangebars'
+import { volumeBars } from '../analytics/volumebars'
+import { computeFootprint } from '../analytics/footprint'
+import { computeTpo } from '../analytics/tpo'
+import { realizedUpProb, ivFromPayout } from '../analytics/ivhv'
 
 const last = (arr: number[]): number => {
   for (let i = arr.length - 1; i >= 0; i--) if (Number.isFinite(arr[i])) return arr[i]
@@ -1341,6 +1346,259 @@ export const STRATEGIES: StrategyDef[] = [
         direction: pat.direction,
         score,
         notes: `${pat.name} (${pf.columns.length} columns, box ${(pf.boxSize * 1e4).toFixed(1)}p, ${pf.reversalBoxes}-box reversal)`,
+      }
+    },
+  },
+  {
+    id: 'range-run',
+    name: 'Range Bar Run',
+    description:
+      'Range-bar continuation: every range bar spans EXACTLY one full range of price travel (ATR-sized, close-chained), so a run of same-direction bars is sustained one-directional pressure measured in distance, not time. CALL while the up-run is young (confirm bars), PUT on a young down-run; stands aside once the run is older than confirm - the entry is the run, not its memory. No renko-style reversal multiplier: either side needs one full range from the running reference.',
+    params: [
+      { key: 'atrPeriod', label: 'ATR period (range sizing)', type: 'number', min: 5, max: 50, default: 14 },
+      { key: 'atrMult', label: 'Range = ATR x', type: 'number', min: 0.1, max: 1, step: 0.05, default: 0.5 },
+      { key: 'confirm', label: 'Confirm bars', type: 'number', min: 1, max: 3, default: 1 },
+    ],
+    evaluate: (candles, p) => {
+      if (candles.length < 40) return { direction: 'none', score: 0, notes: 'warming up (<40 bars)' }
+      const r = rangeBars(candles, { atrPeriod: num(p, 'atrPeriod', 14), atrMult: num(p, 'atrMult', 0.5) })
+      const b = r.bars
+      if (b.length < 4) {
+        return { direction: 'none', score: 0, notes: `only ${b.length} bars @ range ${(r.range * 1e4).toFixed(1)}p - raise atrMult for this tape` }
+      }
+      const lastDir = b[b.length - 1].dir
+      let streak = 0
+      for (let i = b.length - 1; i >= 0 && b[i].dir === lastDir; i--) streak++
+      if (streak > num(p, 'confirm', 1)) {
+        return { direction: 'none', score: 0, notes: `${lastDir > 0 ? 'up' : 'down'} run ${streak} bars old - awaiting next flip` }
+      }
+      const score = clamp(55 + 15 * streak, 55, 90)
+      return {
+        direction: lastDir > 0 ? 'call' : 'put',
+        score,
+        notes: `range run ${lastDir > 0 ? 'UP' : 'DOWN'} x${streak} (${b.length} bars, ${r.flips} flips, range ${(r.range * 1e4).toFixed(1)}p, ${r.rangeRule})`,
+      }
+    },
+  },
+  {
+    id: 'volbars-conviction',
+    name: 'Equal-Volume Conviction',
+    description:
+      'Constant-volume bars normalize activity: every bar folds the same (approx) volume, so a wide BODY on equal activity is directional conviction, not a busy tape. CALL on the last COMPLETED volume bar closing as a dominant-body up bar, PUT the mirror. The still-forming trailing bar is excluded (its OHLC would keep folding forward), auto bar sizing runs on a trailing window so live and backtest agree, and volume is the broker (approx) feed.',
+    params: [
+      { key: 'per', label: 'Volume per bar (0 = auto)', type: 'number', min: 0, max: 1000000000, default: 0 },
+      { key: 'bodyFrac', label: 'Min body fraction of range', type: 'number', min: 0.4, max: 0.95, step: 0.05, default: 0.6 },
+      { key: 'sizingBars', label: 'Trailing window for auto sizing', type: 'number', min: 30, max: 300, default: 100 },
+    ],
+    evaluate: (candles, p) => {
+      if (candles.length < 40) return { direction: 'none', score: 0, notes: 'warming up (<40 bars)' }
+      // auto sizing on a TRAILING window (not the whole growing slice) so the
+      // bar structure is window-offset independent - the property renko/pf
+      // sizing already honors and backtest slice(0, i+1) needs
+      const sizing = Math.max(20, Math.round(num(p, 'sizingBars', 100)))
+      const perParam = num(p, 'per', 0)
+      const autoPer = volumeBars(candles.slice(-sizing), { per: 0 }).per
+      const v = volumeBars(candles, { per: perParam > 0 ? perParam : autoPer })
+      if (v.volumeSource === 'none') {
+        return { direction: 'none', score: 0, notes: 'all-zero volume window - no activity to read (approx feed)' }
+      }
+      if (v.bars.length < 5) {
+        return { direction: 'none', score: 0, notes: `only ${v.bars.length} volume bars - lower per or widen the window` }
+      }
+      // the trailing bar is still forming while its folded volume < per:
+      // conviction is only read on COMPLETED bars
+      let lastBar = v.bars[v.bars.length - 1]
+      if (lastBar.volume < v.per) lastBar = v.bars[v.bars.length - 2]
+      const span = lastBar.high - lastBar.low
+      if (!(span > 0)) {
+        return { direction: 'none', score: 0, notes: 'last completed volume bar has zero range - stand aside' }
+      }
+      const bf = num(p, 'bodyFrac', 0.6)
+      const bodyFrac = Math.abs(lastBar.close - lastBar.open) / span
+      if (bodyFrac < bf) {
+        return { direction: 'none', score: 0, notes: `body ${Math.round(bodyFrac * 100)}% of range < ${Math.round(bf * 100)}% - no conviction on equal volume` }
+      }
+      const dir = lastBar.close > lastBar.open ? 'call' : 'put'
+      const score = clamp(55 + (bodyFrac - bf) * 80, 55, 90)
+      return {
+        direction: dir,
+        score,
+        notes: `volume bar body ${Math.round(bodyFrac * 100)}% of range ${dir === 'call' ? 'UP' : 'DOWN'} (${v.bars.length} bars, ${v.perRule}, volume (approx))`,
+      }
+    },
+  },
+  {
+    id: 'footprint-imbalance',
+    name: 'Footprint Imbalance Stack',
+    description:
+      'Footprint chart read: fires when the last closed candle shows a STACK of imbalanced price bins in one direction (minRows bins where one side carries >= imbalanceRatio x the other at bin resolution) - the classic stacked-imbalance continuation signal. The buy/sell split is the CLV proxy (closes near the high = buy pressure) and volume is the (approx) feed; volume-less candles never fire.',
+    params: [
+      { key: 'binsPerCandle', label: 'Price bins per candle', type: 'number', min: 2, max: 24, default: 8 },
+      { key: 'imbalanceRatio', label: 'Imbalance ratio (x)', type: 'number', min: 1.5, max: 10, step: 0.5, default: 3 },
+      { key: 'minRows', label: 'Min stacked rows', type: 'number', min: 1, max: 12, default: 4 },
+    ],
+    evaluate: (candles, p) => {
+      if (candles.length < 20) return { direction: 'none', score: 0, notes: 'warming up (<20 bars)' }
+      const c = candles[candles.length - 1]
+      const vol = Number.isFinite(c.volume) ? c.volume : 0
+      if (!(vol > 0)) return { direction: 'none', score: 0, notes: 'volume-less candle - no footprint read (approx feed)' }
+      if (!(c.high > c.low)) return { direction: 'none', score: 0, notes: 'zero-range candle - no ladder to read' }
+      const fp = computeFootprint([c], {
+        binsPerCandle: Math.round(num(p, 'binsPerCandle', 8)),
+        imbalanceRatio: num(p, 'imbalanceRatio', 3),
+      })
+      const rows = fp.candles[0].rows
+      const buyRows = rows.filter((r) => r.imbalance === 'buy').length
+      const sellRows = rows.filter((r) => r.imbalance === 'sell').length
+      const minRows = Math.max(1, Math.round(num(p, 'minRows', 4)))
+      if (buyRows < minRows && sellRows < minRows) {
+        return { direction: 'none', score: 0, notes: `${buyRows} buy / ${sellRows} sell imbalanced rows < ${minRows} - no stack` }
+      }
+      if (buyRows >= minRows && sellRows >= minRows && buyRows === sellRows) {
+        return { direction: 'none', score: 0, notes: `${buyRows} buy vs ${sellRows} sell rows - stacks cancel, ambiguous` }
+      }
+      const buy = buyRows > sellRows
+      const rowsN = Math.max(buyRows, sellRows)
+      const score = clamp(55 + (rowsN - minRows) * 6, 55, 92)
+      return {
+        direction: buy ? 'call' : 'put',
+        score,
+        notes: `${rowsN}/${rows.length} bins ${buy ? 'BUY' : 'SELL'} imbalanced >= ${num(p, 'imbalanceRatio', 3)}x (CLV proxy, volume (approx))`,
+      }
+    },
+  },
+  {
+    id: 'tpo-fade',
+    name: 'TPO Balance Fade',
+    description:
+      'Market-profile read: when the recent window shows a BALANCED profile (price rotated through the POC at least minRotations times) and the last close pokes just outside the 70% value area, fade the excursion back toward the POC - the classic balance-day edge. Excursions beyond maxDistAtr read as trend days, not fades, and stand aside; single-print TPO counting on 30-min brackets (per-candle fallback when tf >= bracket).',
+    params: [
+      { key: 'window', label: 'Profile window (candles)', type: 'number', min: 40, max: 400, default: 160 },
+      { key: 'periodSec', label: 'TPO bracket (seconds)', type: 'number', min: 300, max: 86400, step: 300, default: 1800 },
+      { key: 'minRotations', label: 'Min POC rotations', type: 'number', min: 1, max: 10, default: 3 },
+      { key: 'maxDistAtr', label: 'Max excursion (x ATR)', type: 'number', min: 0.5, max: 5, step: 0.25, default: 2 },
+    ],
+    evaluate: (candles, p) => {
+      const win = Math.round(num(p, 'window', 160))
+      const n = candles.length
+      if (n < win + 5) return { direction: 'none', score: 0, notes: 'warming up (<window+5 bars)' }
+      const tpo = computeTpo(candles.slice(-win), { periodSec: num(p, 'periodSec', 1800) })
+      if (tpo.poc === null || tpo.valueAreaHigh === null || tpo.valueAreaLow === null) {
+        return { direction: 'none', score: 0, notes: 'no profile yet' }
+      }
+      // balance detector: strict close crossings of the POC
+      const closes = candles.slice(-win).map((k) => k.close)
+      let side = closes[0] >= (tpo.poc as number) ? 1 : -1
+      let rotations = 0
+      for (let i = 1; i < closes.length; i++) {
+        const s = closes[i] >= (tpo.poc as number) ? 1 : -1
+        if (s !== side) {
+          rotations++
+          side = s
+        }
+      }
+      const minRot = Math.max(1, Math.round(num(p, 'minRotations', 3)))
+      if (rotations < minRot) {
+        return { direction: 'none', score: 0, notes: `${rotations} POC rotations < ${minRot} - trend-day profile, fade stands aside` }
+      }
+      const price = closes[closes.length - 1]
+      const atrArr = ta.atr(candles.map((k) => k.high), candles.map((k) => k.low), candles.map((k) => k.close), 14)
+      const atrVal = Number.isFinite(last(atrArr)) ? (last(atrArr) as number) : price * 0.001
+      const maxDist = num(p, 'maxDistAtr', 2) * atrVal
+      const above = price > tpo.valueAreaHigh
+      const below = price < tpo.valueAreaLow
+      if (!above && !below) {
+        return { direction: 'none', score: 0, notes: `inside value area [${tpo.valueAreaLow.toFixed(5)}, ${tpo.valueAreaHigh.toFixed(5)}] after ${rotations} rotations` }
+      }
+      const dist = above ? price - (tpo.valueAreaHigh as number) : (tpo.valueAreaLow as number) - price
+      if (dist > maxDist) {
+        return { direction: 'none', score: 0, notes: `${(dist / atrVal).toFixed(1)} ATR beyond VA edge > ${num(p, 'maxDistAtr', 2)} - reads as breakout, not fade` }
+      }
+      const prox = 1 - dist / Math.max(maxDist, 1e-9) // 1 = right at the edge, 0 = at maxDist
+      const score = clamp(52 + Math.min(20, (rotations - minRot) * 5) + prox * 15, 45, 90)
+      return {
+        direction: above ? 'put' : 'call',
+        score,
+        notes: `balance fade ${above ? 'PUT' : 'CALL'}: ${rotations} rotations, ${(dist / atrVal).toFixed(2)} ATR beyond ${above ? 'VAH' : 'VAL'}, POC ${(tpo.poc as number).toFixed(5)} (${tpo.periodRule})`,
+      }
+    },
+  },
+  {
+    id: 'tick-regime',
+    name: 'Tick Persistence Regime',
+    description:
+      "Reads the tape's own character (candle closes as pseudo-ticks): the z-score of same-direction consecutive moves vs a fair coin. A PERSISTENT tape (z >= zMin) continues - fire with the last move; an ANTI-persistent tape (z <= -zMin, the bid-ask-bounce microstructure real feeds show) fades - fire against the last move. A fair-coin tape (|z| < zMin) is unpredictable by construction and stands aside - OTC feeds read fair-coin here, which is this strategy honestly refusing to trade them.",
+    params: [
+      { key: 'window', label: 'Move window (diffs)', type: 'number', min: 30, max: 500, default: 120 },
+      { key: 'zMin', label: 'Min |z| vs fair coin', type: 'number', min: 0.5, max: 4, step: 0.25, default: 1.5 },
+    ],
+    evaluate: (candles, p) => {
+      const win = Math.round(num(p, 'window', 120))
+      if (candles.length < win + 2) return { direction: 'none', score: 0, notes: 'warming up (<window+2 bars)' }
+      const cs = candles.slice(-(win + 1)).map((c) => c.close)
+      const diffs: number[] = []
+      for (let i = 1; i < cs.length; i++) {
+        const d = cs[i] - cs[i - 1]
+        if (d !== 0) diffs.push(d)
+      }
+      let pairs = 0
+      let same = 0
+      for (let i = 1; i < diffs.length; i++) {
+        pairs++
+        if (diffs[i] * diffs[i - 1] > 0) same++
+      }
+      const minPairs = Math.max(20, Math.round(win * 0.25))
+      if (pairs < minPairs) {
+        return { direction: 'none', score: 0, notes: `only ${pairs} nonzero move pairs - flat tape, stand aside` }
+      }
+      const pHat = same / pairs
+      const z = (pHat - 0.5) / Math.sqrt(0.25 / pairs)
+      const zMin = num(p, 'zMin', 1.5)
+      if (Math.abs(z) < zMin) {
+        return { direction: 'none', score: 0, notes: `tape reads fair-coin (P(same)=${pHat.toFixed(2)}, z ${z.toFixed(2)}) - unpredictable, standing aside` }
+      }
+      const persistent = z > 0
+      const lastUp = diffs[diffs.length - 1] > 0
+      // persistent: continue the last move; anti-persistent: fade the bounce
+      const wantUp = persistent ? lastUp : !lastUp
+      const score = clamp(55 + Math.abs(z) * 8, 55, 92)
+      return {
+        direction: wantUp ? 'call' : 'put',
+        score,
+        notes: `${persistent ? 'PERSISTENT' : 'ANTI-PERSISTENT'} tape P(same)=${pHat.toFixed(2)} z ${z.toFixed(2)} - ${persistent ? 'continuing' : 'fading'} the last move (pseudo-ticks = candle closes)`,
+      }
+    },
+  },
+  {
+    id: 'ivhv-edge',
+    name: 'Breakeven Probability Edge (IV*HV)',
+    description:
+      "The IV-vs-HV chart's edge view as a strategy: fires when the realized frequency of up-closes over the window clears the payout-implied breakeven probability q = 100/(1+payout) - the disclosed IV proxy - by a margin. CALL when the up-frequency clears it, PUT when the down-frequency does. Payout is a PARAM here (default 0.85); at trade time the live EV gate still applies with the real quote - this strategy makes the statistical case, the gate prices it.",
+    params: [
+      { key: 'window', label: 'Up-frequency window (bars)', type: 'number', min: 20, max: 300, default: 100 },
+      { key: 'payout', label: 'Payout assumption (fraction)', type: 'number', min: 0.5, max: 2, step: 0.05, default: 0.85 },
+      { key: 'margin', label: 'Margin over breakeven (pts)', type: 'number', min: 0, max: 15, step: 0.5, default: 5 },
+    ],
+    evaluate: (candles, p) => {
+      const win = Math.round(num(p, 'window', 100))
+      if (candles.length < win + 2) return { direction: 'none', score: 0, notes: 'warming up (<window+2 bars)' }
+      const iv = ivFromPayout(num(p, 'payout', 0.85))
+      const be = iv.breakevenPct
+      if (!Number.isFinite(be)) return { direction: 'none', score: 0, notes: 'payout param not usable - no breakeven' }
+      const u = realizedUpProb(candles, win) // percent of up closes over the window
+      const margin = num(p, 'margin', 5)
+      const upEdge = u - (be + margin)
+      const downEdge = 100 - u - (be + margin)
+      if (upEdge < 0 && downEdge < 0) {
+        return { direction: 'none', score: 0, notes: `up-freq ${u.toFixed(1)}% / down ${(100 - u).toFixed(1)}% vs breakeven ${be.toFixed(2)}% + ${margin} margin - no side clears it` }
+      }
+      const isCall = upEdge >= downEdge
+      const edge = isCall ? upEdge : downEdge
+      const score = clamp(55 + edge * 2.5, 55, 92)
+      return {
+        direction: isCall ? 'call' : 'put',
+        score,
+        notes: `${isCall ? 'up' : 'down'}-freq ${(isCall ? u : 100 - u).toFixed(1)}% over ${win} bars clears breakeven ${be.toFixed(2)}% (payout ${iv.payout}, IV proxy rule) by ${edge.toFixed(1)} pts - live EV gate still applies`,
       }
     },
   },

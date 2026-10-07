@@ -80,7 +80,12 @@ export function computeFootprint(
 
     const rows: FootprintRow[] = []
     if (span <= 0 || vol <= 0) {
-      // flat or volume-less candle: one row at the price, 50/50 (CLV undefined)
+      // flat or volume-less candle: one row at the price, 50/50 (CLV undefined).
+      // ALWAYS imbalance:null - a volume-less row cannot be imbalanced (with
+      // buy=sell=0 the classic "one side >= ratio x other" comparison is
+      // vacuously true and would read dead tape as a buy stack), and a flat
+      // candle splits 50/50 by definition. Guards the footprint-imbalance
+      // strategy from firing on zero-volume candles.
       rows.push({
         priceLow: lo,
         priceHigh: hi,
