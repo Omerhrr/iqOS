@@ -34,6 +34,7 @@ import { detectPatterns } from '../analytics/patterns'
 import { trendPullbackSeries, rangeZoneSeries } from '../analytics/structure'
 import { getStrategy, defaultParams } from './builtin'
 import { computeCandleDelta, computeCumulativeDelta, computeVolumeProfile } from '../analytics/orderflow'
+import { ticksFor, velocitySeriesFor } from '../analytics/otcfootprint'
 import { renkoBricks, type RenkoResult } from '../analytics/renko'
 import { pointFigure } from '../analytics/pointfigure'
 
@@ -109,6 +110,10 @@ export interface IndicatorSignal {
     | 'ofcumdelta' // rolling z-score of cumulative-delta SLOPE (cum[i]-cum[i-lookback]). params.lookback (default 10), params.period (z-score window, default 20)
     | 'ofpocdist' // (close - rolling Volume Profile POC) / ATR. params.period = profile window in bars (default 40)
     | 'ofvapos' // (close - rolling Value Area Low) / (VAH - VAL): <0 below VAL, 0..1 inside the value area, >1 above VAH. params.period = profile window in bars (default 40)
+    // ---- OTC micro-tick velocity footprint (see analytics/otcfootprint.ts; REAL tick data from the kernel collector, NaN where uncovered) ----
+    | 'otcvdelta' // per-bar tick velocity delta (up-ticks - down-ticks) of the bar's own bucket. params.period (z-score window, default 20)
+    | 'otcvratio' // per-bar tick speed ratio (dnAvgMs/upAvgMs, log2-signed so symmetric around 0). params.period (z-score window, default 20)
+    | 'otcstagn' // per-bar cluster stagnation (POC print count / median row). params.period (z-score window, default 20)
   params?: Record<string, number> // period/fast/slow/mult per indicator
   type?: string // sub-selector for the generic families above (madist/osc0100/oscpm100/oscz/trenddist/bandpos/volflow/levels)
   /** '>'/'<' - the original single-threshold comparisons. 'between' - fires
@@ -397,9 +402,14 @@ export interface EvalCtx {
   range: number[]
   volume: number[]
   hits: Map<string, 'bullish' | 'bearish' | 'neutral'> // candle patterns on the LAST bar only
+  /** Which instrument this context evaluates. The OTC velocity indicator
+   * family reads that asset's micro-tick buffer through it - without an
+   * asset the otcv* series honestly stays NaN (no candle-derived fallback:
+   * tick velocity is the one thing OHLC bars cannot approximate). */
+  asset?: string
 }
 
-export function buildCtx(candles: Candle[]): EvalCtx {
+export function buildCtx(candles: Candle[], asset?: string): EvalCtx {
   const n = candles.length
   const close = candles.map((k) => k.close)
   const high = candles.map((k) => k.high)
@@ -415,7 +425,7 @@ export function buildCtx(candles: Candle[]): EvalCtx {
   if (n >= 13) {
     for (const hit of detectPatterns(candles, 1)) hits.set(hit.name.toLowerCase(), hit.direction)
   }
-  return { candles, n, close, high, low, open, atr, ha, haColor, body, range, volume, hits }
+  return { candles, n, asset, close, high, low, open, atr, ha, haColor, body, range, volume, hits }
 }
 
 /** ATR-normalized rolling z-score of an arbitrary raw series - used to turn
@@ -868,6 +878,22 @@ export function indicatorSeries(s: IndicatorSignal, ctx: EvalCtx): number[] {
       }
       return out
     }
+    case 'otcvdelta':
+    case 'otcvratio':
+    case 'otcstagn': {
+      // OTC micro-tick velocity footprint features (see
+      // analytics/otcfootprint.ts): per-bar tick delta / log speed-ratio /
+      // POC cluster stagnation from the kernel's tick collector, rolling
+      // z-scored like the other unbounded families. Bars outside the tick
+      // buffer's coverage stay NaN - the signal honestly never fires where
+      // no micro-tick data exists (there is no candle-derived fallback:
+      // velocity is the one thing OHLC bars cannot approximate).
+      const period = Math.max(5, Math.round(num(p.period, 20)))
+      const ticks = ctx.asset ? ticksFor(ctx.asset) : []
+      const vel = velocitySeriesFor(ctx.candles, ticks)
+      const raw = s.ind === 'otcvdelta' ? vel.vdelta : s.ind === 'otcvratio' ? vel.vratio : vel.stagn
+      return rollingZ(raw, period)
+    }
   }
 }
 
@@ -905,6 +931,15 @@ export function labelOf(s: SignalDef): string {
       if (s.ind === 'rangezone') return s.dir === 'call' ? 'Range Buy Zone' : 'Range Sell Zone'
       if (s.ind === 'ofdelta' || s.ind === 'ofcumdelta' || s.ind === 'ofpocdist' || s.ind === 'ofvapos') {
         const name = { ofdelta: 'Delta (approx)', ofcumdelta: 'Cumulative Delta Slope (approx)', ofpocdist: 'POC Distance (approx)', ofvapos: 'Value Area Position (approx)' }[s.ind]
+        if (s.op === 'between' || s.op === 'outside') {
+          const lo = Math.min(s.threshold, s.threshold2 ?? s.threshold)
+          const hi = Math.max(s.threshold, s.threshold2 ?? s.threshold)
+          return `${name} ${s.op} [${lo}, ${hi}]`
+        }
+        return `${name} ${s.op} ${s.threshold}`
+      }
+      if (s.ind === 'otcvdelta' || s.ind === 'otcvratio' || s.ind === 'otcstagn') {
+        const name = { otcvdelta: 'OTC Tick Velocity Delta', otcvratio: 'OTC Tick Speed Ratio', otcstagn: 'OTC Cluster Stagnation' }[s.ind]
         if (s.op === 'between' || s.op === 'outside') {
           const lo = Math.min(s.threshold, s.threshold2 ?? s.threshold)
           const hi = Math.max(s.threshold, s.threshold2 ?? s.threshold)
@@ -1252,7 +1287,9 @@ export function prepareSignal(s: SignalDef, ctx: EvalCtx): (i: number) => boolea
       // enough history for the strategy to warm up.
       return (i: number) => {
         if (i < 30) return false
-        const ev = strat.evaluate(ctx.candles.slice(0, i + 1), params)
+        // the asset hint rides along so tick-driven builtins (OTC velocity
+        // footprint) read the right micro-tick buffer per bar
+        const ev = strat.evaluate(ctx.candles.slice(0, i + 1), params, { asset: ctx.asset })
         return ev.direction === s.dir
       }
     }
@@ -1296,10 +1333,11 @@ export function evaluateCustomAt(spec: CustomSpec, ctx: EvalCtx, i = ctx.n - 1):
 
 /** Vote the spec's signals on the last closed candle. Pure: candles in, eval out.
  * The spec's basis decides what the signals read (raw OHLC or the HA transform);
- * the caller keeps feeding RAW candles either way. */
-export function evaluateCustom(spec: CustomSpec, candles: Candle[]): CustomEval {
+ * the caller keeps feeding RAW candles either way. `asset` rides along when
+ * known so tick-driven signals (OTC velocity family) can read their buffer. */
+export function evaluateCustom(spec: CustomSpec, candles: Candle[], asset?: string): CustomEval {
   if (candles.length < 25) return { direction: 'none', score: 0, notes: 'warming up (need >=25 bars)', active: [] }
-  const ctx = buildCtx(basisCandles(spec, candles))
+  const ctx = buildCtx(basisCandles(spec, candles), asset)
   const out = evaluateCustomAt(spec, ctx)
   const names = out.active.filter((a) => a.dir === out.direction).map((a) => `${a.label} (${a.weight})`)
   if (out.direction === 'none') {
@@ -1331,6 +1369,7 @@ const KNOWN_INDS = new Set([
   // every save, regardless of everything else working correctly.
   'trendpullback', 'rangezone',
   'ofdelta', 'ofcumdelta', 'ofpocdist', 'ofvapos',
+  'otcvdelta', 'otcvratio', 'otcstagn',
 ])
 // valid params.type values per generic family - inline specs outside this
 // set silently fall back to indicatorSeries' own per-family default rather

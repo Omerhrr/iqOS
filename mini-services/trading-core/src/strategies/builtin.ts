@@ -11,6 +11,7 @@ import { tskEvaluate, TSK_DEFAULTS } from '../analytics/tsk'
 import { confluenceSignalOnly } from '../analytics/engine'
 import { findPivots } from '../analytics/chart-patterns'
 import { computeCandleDelta, computeCumulativeDelta, computeVolumeProfile } from '../analytics/orderflow'
+import { otcVelocitySignal, ticksFor } from '../analytics/otcfootprint'
 import { renkoBricks } from '../analytics/renko'
 import { pointFigure } from '../analytics/pointfigure'
 import { rangeBars } from '../analytics/rangebars'
@@ -701,7 +702,7 @@ export const STRATEGIES: StrategyDef[] = [
       { key: 'voteMinScore', label: 'Per-member score to count as a vote', type: 'number', min: 0, max: 100, default: 40 },
       { key: 'minAgree', label: 'Min members that must agree', type: 'number', min: 2, max: 6, default: 2 },
     ],
-    evaluate: (candles, p) => {
+    evaluate: (candles, p, hints) => {
       const ids = String(p.members ?? '')
         .split(',')
         .map((s) => s.trim())
@@ -719,7 +720,7 @@ export const STRATEGIES: StrategyDef[] = [
         try {
           const merged: Record<string, number | string> = {}
           for (const dp of strat.params) merged[dp.key] = dp.default
-          const ev = strat.evaluate(candles, merged)
+          const ev = strat.evaluate(candles, merged, hints)
           if ((ev.direction === 'call' || ev.direction === 'put') && Math.abs(ev.score) >= voteMinScore) {
             votes.push({ id, direction: ev.direction, score: Math.abs(ev.score) })
           }
@@ -1600,6 +1601,32 @@ export const STRATEGIES: StrategyDef[] = [
         score,
         notes: `${isCall ? 'up' : 'down'}-freq ${(isCall ? u : 100 - u).toFixed(1)}% over ${win} bars clears breakeven ${be.toFixed(2)}% (payout ${iv.payout}, IV proxy rule) by ${edge.toFixed(1)} pts - live EV gate still applies`,
       }
+    },
+  },
+  {
+    id: 'otc-velocity-divergence',
+    name: 'OTC Velocity Footprint',
+    description:
+      'Micro-tick velocity footprint built for generator-driven OTC feeds - there is no real order book there, so instead of contracts this reads the generator\'s own price-print stream: (1) VELOCITY DELTA divergence - a minute printing heavily positive up-tick count but closing near its low means the script hit a structural ceiling (PUT cue), mirrored for floors (CALL); (2) SPEED-RATIO exhaustion - one side ticking >= 3x faster (avg ms between prints) while failing to convert to range fades the thrust; (3) CLUSTER STAGNATION - a price level taking several times more prints than its neighbors is the script looping there, fade the loop edge. Needs live micro-tick captures for the asset (sim engine 1s ticks or sidecar 100ms) - with no tick history it honestly stands aside.',
+    params: [
+      { key: 'minDelta', label: 'Min |up-down| tick delta', type: 'number', min: 1, max: 20, default: 3 },
+      { key: 'ratioAt', label: 'Speed-ratio exhaustion threshold', type: 'number', min: 1.5, max: 8, step: 0.5, default: 3 },
+      { key: 'stagnationAt', label: 'Stagnation (POC density) threshold', type: 'number', min: 1.5, max: 10, step: 0.5, default: 3 },
+      { key: 'nearEdge', label: 'Close near-edge of range (0-0.45)', type: 'number', min: 0.05, max: 0.45, step: 0.05, default: 0.25 },
+    ],
+    evaluate: (candles, p, hints) => {
+      // tick-driven builtin: needs the asset hint to find its micro-tick
+      // buffer; without it (legacy call sites) it stands aside - never
+      // approximates velocity from candles
+      const asset = hints?.asset
+      if (!asset) return { direction: 'none', score: 0, notes: 'no asset context - tick buffer unavailable' }
+      const out = otcVelocitySignal(ticksFor(asset), {
+        minDelta: num(p, 'minDelta', 3),
+        ratioAt: num(p, 'ratioAt', 3),
+        stagnationAt: num(p, 'stagnationAt', 3),
+        nearEdge: num(p, 'nearEdge', 0.25),
+      })
+      return { direction: out.direction, score: out.score, notes: out.notes }
     },
   },
 ]

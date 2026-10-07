@@ -29,6 +29,7 @@ import SentinelPanel from './SentinelPanel'
 import WatchdogPanel from './WatchdogPanel'
 import ResearchPanel from './ResearchPanel'
 import OrderFlowPanel from './OrderFlowPanel'
+import OtcFootprintPanel from './OtcFootprintPanel'
 import { FullscreenBackdrop, FullscreenButton } from './FullscreenButton'
 
 interface BottomTabsProps {
@@ -117,6 +118,7 @@ export default function BottomTabs(props: BottomTabsProps) {
             ['strategies', 'Strategy Lab'],
             ['quant', 'Quant Lab'],
             ['orderflow', 'Order Flow'],
+            ['otcfootprint', 'OTC Footprint'],
             ['patterns', `Patterns (${patterns.length})`],
             ['alerts', 'Alerts'],
           ] as [string, string][]
@@ -338,6 +340,11 @@ export default function BottomTabs(props: BottomTabsProps) {
 
       <TabsContent value="orderflow" className="mt-0 min-h-0 flex-1 overflow-auto">
         <OrderFlowPanel asset={asset} tf={props.tf} closedTick={closedTick} />
+      </TabsContent>
+
+      {/* OTC MICRO-TICK VELOCITY FOOTPRINT (generator-print speed matrix) */}
+      <TabsContent value="otcfootprint" className="mt-0 min-h-0 flex-1 overflow-hidden">
+        <OtcFootprintPanel asset={asset} />
       </TabsContent>
 
       {/* PATTERNS */}

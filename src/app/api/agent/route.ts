@@ -394,6 +394,61 @@ const TOOLS: ToolSpec[] = [
     },
   },
   {
+    name: 'otc_footprint',
+    description:
+      'OTC Micro-Tick Velocity Footprint - the generator-revealing read for OTC pairs. Measures the feed\'s own price-print stream (there is no real order book there): per-minute velocity delta (up-ticks minus down-ticks), tick speed ratio (avg ms between down vs up prints - >1 means the generator pushes up faster), cluster stagnation (a price level taking disproportionate prints = the script looping there, the OTC POC) and divergence traps (heavy positive delta closing at the low = ceiling cue -> put; mirrored -> call). Returns the window summary signal + the most recent minute buckets with their POC/badges. Requires accumulated micro-tick captures (sim 1s engine or the sidecar 100ms poller in live) - an empty buffer means "warming up", say so.',
+    args: '{"asset": "EURUSD-OTC", "minutes": 30}',
+    run: async (a) => {
+      const asset = String(a.asset ?? 'EURUSD')
+      const minutes = Math.max(1, Math.min(240, Number(a.minutes) || 30))
+      const d = (await coreGet(`/otc_footprint?asset=${encodeURIComponent(asset)}&minutes=${minutes}`)) as {
+        ok: boolean
+        dataSource?: string
+        cadenceMs?: number | null
+        tickSize?: number
+        buckets?: {
+          time: number
+          close: number
+          upTicks: number
+          dnTicks: number
+          velDelta: number
+          speedRatio: number
+          stagnation: number
+          pocPrice: number
+          pocTicks: number
+          closePos: number
+          divergence: string | null
+          exhaustion: string | null
+          nTicks: number
+        }[]
+        summary?: { totalUp: number; totalDn: number; netDelta: number; avgSpeedRatio: number; dominantPoc: number; signal: string; score: number; note: string }
+        error?: string
+      }
+      if (!d.ok) return { ok: false, error: d.error ?? 'footprint unavailable' }
+      const recent = (d.buckets ?? []).filter((b) => b.nTicks > 0).slice(-5)
+      return {
+        ok: true,
+        asset,
+        dataSource: d.dataSource,
+        cadenceMs: d.cadenceMs,
+        summary: d.summary,
+        recentBuckets: recent.map((b) => ({
+          time: b.time,
+          close: b.close,
+          velDelta: b.velDelta,
+          speedRatio: b.speedRatio,
+          stagnation: b.stagnation,
+          poc: b.pocPrice,
+          pocPrints: b.pocTicks,
+          closePosInRange: b.closePos,
+          divergence: b.divergence,
+          exhaustion: b.exhaustion,
+        })),
+        note: 'velocity footprint of the OTC generator print stream - not real order flow; cadence is bounded by the capture rate',
+      }
+    },
+  },
+  {
     name: 'multi_timeframe',
     description: 'Analyze one asset across 4 timeframes (5m, 15m, 1h, 4h) and get each composite signal - the classic MTF confluence read. Use before recommending a trade.',
     args: '{"asset": "BTCUSD"}',

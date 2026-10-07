@@ -389,7 +389,7 @@ export class StrategyLabService {
       basis === 'heikin' ? heikinAshiCandles(raw) : basis === 'kalman' ? kalmanCandles(raw) : basis === 'typical' ? typicalCandles(raw) : basis === 'smoothed' ? smoothedCandles(raw) : raw
     const settle = raw.map((c) => c.close)
     const n = candles.length
-    const ctx = buildCtx(candles)
+    const ctx = buildCtx(candles, asset)
     // Regime tag - what kind of market this pair/window actually was
     // (trending/ranging/volatile/mixed), so a learned edge can be read
     // alongside the conditions it was learned under rather than in a vacuum.
@@ -737,7 +737,7 @@ export class StrategyLabService {
     if (raw.length < 120) throw new Error(`not enough history for ${asset} ${tfv} (${raw.length} bars, need 120+)`)
     // signals read the spec's basis; sims settle on REAL prices
     const basisSeries = basisCandles(spec, raw)
-    const ctx = buildCtx(basisSeries)
+    const ctx = buildCtx(basisSeries, asset)
     const candleHits = scanCandleHits(basisSeries)
     const series = scoreSeriesFor(spec, ctx, candleHits)
     const backtest = simFromSeries(series, raw, 30, horizon, amount, payout, spec.minVotes, spec.minScore)
@@ -852,7 +852,7 @@ export class StrategyLabService {
     if (!spec) throw new Error(`lab strategy ${id} has no usable signals`)
     const candles = this.market.getCandlesDeep(asset, tf, 1500, true) // Task 59: closedOnly
     if (candles.length < 25) throw new Error('not enough candle history yet')
-    const ev = evaluateCustom(spec, candles)
+    const ev = evaluateCustom(spec, candles, asset)
     return { ...ev, asset, tf, strategy: id, price: candles[candles.length - 1].close }
   }
 }
@@ -1251,6 +1251,18 @@ export const CANDIDATE_SIGNALS: SignalDef[] = [
   { kind: 'indicator', ind: 'ofpocdist', params: { period: 40 }, op: '>', threshold: 1.2, dir: 'put', weight: 11 },
   { kind: 'indicator', ind: 'ofvapos', params: { period: 40 }, op: '>', threshold: 1.05, dir: 'call', weight: 11 },
   { kind: 'indicator', ind: 'ofvapos', params: { period: 40 }, op: '<', threshold: -0.05, dir: 'put', weight: 11 },
+  // ---- OTC micro-tick velocity footprint family (see
+  // analytics/otcfootprint.ts) - tick delta / up-down speed ratio / POC
+  // cluster stagnation from the kernel's tick collector, rolling z-scored.
+  // Bars outside the collector's coverage stay NaN, so these candidates
+  // measure honestly on whatever tick history exists (sim: hours; live:
+  // whatever the sidecar capture has accumulated).
+  { kind: 'indicator', ind: 'otcvdelta', params: { period: 20 }, op: '>', threshold: 1, dir: 'call', weight: 11 },
+  { kind: 'indicator', ind: 'otcvdelta', params: { period: 20 }, op: '<', threshold: -1, dir: 'put', weight: 11 },
+  { kind: 'indicator', ind: 'otcvratio', params: { period: 20 }, op: '>', threshold: 1, dir: 'call', weight: 11 },
+  { kind: 'indicator', ind: 'otcvratio', params: { period: 20 }, op: '<', threshold: -1, dir: 'put', weight: 11 },
+  { kind: 'indicator', ind: 'otcstagn', params: { period: 20 }, op: '>', threshold: 1, dir: 'call', weight: 11 },
+  { kind: 'indicator', ind: 'otcstagn', params: { period: 20 }, op: '<', threshold: -1, dir: 'put', weight: 11 },
 ]
 
 let labServiceInstance: StrategyLabService | null = null

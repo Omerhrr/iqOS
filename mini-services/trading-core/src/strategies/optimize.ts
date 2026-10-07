@@ -305,6 +305,9 @@ export function fastBacktest(
     direction?: 'call' | 'put' | 'both'
     // Task 58 (P1): edge-trigger simulation (see backtest.ts BacktestOptions)
     edgeTrigger?: boolean
+    // Evaluation context for tick-driven builtins (OTC velocity footprint) -
+    // lets them read the right micro-tick buffer during optimizer replays.
+    asset?: string
   } = {}
 ): FastMetrics {
   const strat = resolveStrategyDef(strategyId, opts.customSpec)
@@ -342,7 +345,7 @@ export function fastBacktest(
     // params - which defeated the purpose of "verifying the top-3" against
     // it. This matches backtest.ts's evalWindow exactly.
     const win = candles.slice(0, i + 1)
-    const ev = filterDir(strat.evaluate(win, params))
+    const ev = filterDir(strat.evaluate(win, params, { asset: opts.asset }))
     // Task 58 (P1): edge-trigger parity with the live bots (once per episode)
     if (opts.edgeTrigger) {
       const suppress = ev.direction !== 'none' && ev.direction === prevEvalDir
@@ -523,6 +526,7 @@ export function gridSearch(candles: Candle[], asset: string, tf: Timeframe, opts
     customSpec: opts.customSpec,
     direction: opts.direction,
     edgeTrigger: opts.edgeTrigger,
+    asset,
   }
   const sweptKeys = Object.keys(opts.sweep).filter((k) => strat.params.some((p) => p.key === k))
   // Base every combo on the strategy's registered defaults, then let any
@@ -657,6 +661,7 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
     customSpec: opts.customSpec,
     direction: opts.direction,
     edgeTrigger: opts.edgeTrigger,
+    asset,
   }
   const warmup = strategyWarmup(strat.id)
   // Same fixedParams merge as gridSearch - see that function's comment.
@@ -941,6 +946,7 @@ export function sweepAssets(
       // explicitly sets it, still overrides for an apples-to-apples what-if
       // comparison.
       const m = fastBacktest(candles, strat.id, params, {
+        asset: a.ticker,
         payout: opts.payout ?? (a.payout > 0 ? a.payout : undefined),
         amount: opts.amount,
         expiryBars: opts.expiryBars,

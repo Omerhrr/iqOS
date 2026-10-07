@@ -203,7 +203,7 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
         compoundCycles++
       }
       const evalWindow = candles.slice(0, i + 1)
-      const ev = filterDir(strat.evaluate(evalWindow, params))
+      const ev = filterDir(strat.evaluate(evalWindow, params, { asset }))
       // Task 58 (P1): edge-trigger parity with the live bots - a persisting
       // same-direction signal fires once per episode (lapse/flip re-arms)
       if (opts.edgeTrigger) {
@@ -258,7 +258,7 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
         const evNow =
           hitTP || hitSL || open.bars >= maxBars
             ? { direction: 'none' as const, score: 0, notes: '' }
-            : filterDir(strat.evaluate([...candles.slice(0, i + 1)], params))
+            : filterDir(strat.evaluate([...candles.slice(0, i + 1)], params, { asset }))
         const flipped = evNow.direction !== 'none' && evNow.direction !== open.side
         if (hitTP || hitSL || open.bars >= maxBars || flipped) {
           const rawExit = candle.close
@@ -287,7 +287,7 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
         }
         continue
       }
-      const ev = filterDir(strat.evaluate([...candles.slice(0, i + 1)], params))
+      const ev = filterDir(strat.evaluate([...candles.slice(0, i + 1)], params, { asset }))
       if (ev.direction !== 'none' && equity >= amount) {
         open = { side: ev.direction, entry: candle.close, bars: 0, ts: candle.time }
       }

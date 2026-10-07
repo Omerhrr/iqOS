@@ -959,6 +959,18 @@ export class MarketDataService {
     return this.prices.get(asset) ?? 0
   }
 
+  /** Read-only view of the SIM engine's own tick ring buffer (1s cadence,
+   * ~MAX_TICKS deep). The OTC footprint collector lazily backfills its
+   * per-asset micro-tick history from here so a fresh kernel boot doesn't
+   * start the velocity footprint from zero. NOT the live feed - live OTC
+   * ticks come from the sidecar's 100ms capture via getTickSeries(). */
+  recentTicks(asset: string, limit = 60000): { ts: number; price: number }[] {
+    const arr = this.ticks.get(asset)
+    if (!arr || !arr.length) return []
+    return arr.slice(-limit).map((t) => ({ ts: t.ts, price: t.price }))
+  }
+
+
   /**
    * Randomness-audit price series: real sub-candle ticks from the sidecar's
    * buffer when LIVE/IQ and the buffer has enough samples, otherwise the

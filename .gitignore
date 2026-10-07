@@ -73,3 +73,4 @@ live/.iq_session
 # Task 58: never track bytecode or data snapshots again
 __pycache__/
 *.pyc
+.sandbox-backup/

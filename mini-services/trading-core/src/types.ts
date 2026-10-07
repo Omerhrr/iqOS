@@ -381,12 +381,21 @@ export interface StrategyEval {
   notes: string
 }
 
+/** Optional evaluation context some strategies need beyond candles - currently
+ * just the asset id, so tick-driven builtins (OTC velocity footprint) can read
+ * that instrument's micro-tick buffer. Callers that don't know the asset (or
+ * legacy call sites) simply omit it; a tick-driven strategy then honestly
+ * stands aside instead of fabricating data. */
+export interface StrategyHints {
+  asset?: string
+}
+
 export interface StrategyDef {
   id: string
   name: string
   description: string
   params: StrategyParam[]
-  evaluate: (candles: Candle[], params: Record<string, number | string>) => StrategyEval
+  evaluate: (candles: Candle[], params: Record<string, number | string>, hints?: StrategyHints) => StrategyEval
 }
 
 export interface BacktestTrade {

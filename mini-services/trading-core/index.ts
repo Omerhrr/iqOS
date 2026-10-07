@@ -21,6 +21,7 @@ import { sentinelPlugin, SentinelService, type SentinelConfig } from './src/plug
 import { watchdogPlugin, WatchdogService, type WatchdogConfig } from './src/plugins/watchdog'
 import { adaptivePlugin, AdaptiveService, type AdaptiveConfig } from './src/plugins/adaptive'
 import { otcGuardPlugin, OtcGuardService, type OtcDefenseReport } from './src/plugins/otcguard'
+import { otcFootprintPlugin, OtcFootprintService } from './src/plugins/otcfootprint'
 import { gridSearch, walkForward, sweepAssets, type Objective } from './src/strategies/optimize'
 import type { BacktestOptions } from './src/strategies/backtest'
 import { normalizeSpec, type CustomSpec } from './src/strategies/custom'
@@ -66,6 +67,7 @@ kernel.register(sentinelPlugin)
 kernel.register(watchdogPlugin)
 kernel.register(adaptivePlugin)
 kernel.register(otcGuardPlugin)
+kernel.register(otcFootprintPlugin)
 
 const httpServer = createServer(async (req, res) => {
   res.setHeader('access-control-allow-origin', '*')
@@ -872,6 +874,18 @@ const httpServer = createServer(async (req, res) => {
         })
       }
 
+      // OTC Micro-Tick Velocity Footprint: per-minute price-row matrix of
+      // up/down tick speeds, velocity delta, speed ratio, POC cluster
+      // stagnation and the divergence/exhaustion reads. GET for the chart,
+      // POST for copilot/tools.
+      if (path === '/otc_footprint') {
+        const fp = kernel.context().use<OtcFootprintService>('otcFootprint')
+        const asset = q.get('asset') ?? market.activeAsset
+        const minutes = Math.max(1, Math.min(240, Number(q.get('minutes') ?? 30)))
+        const bucketSec = Math.max(5, Math.min(3600, Number(q.get('bucketSec') ?? 60)))
+        return json(200, { ok: true, ...(await fp.footprint(asset, { minutes, bucketSec })) })
+      }
+
       if (path === '/analysis') {
         const t = tfStrict(q.get('tf'))
         if (t === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
@@ -1327,6 +1341,25 @@ const httpServer = createServer(async (req, res) => {
         const guard = kernel.context().use<OtcGuardService>('otcGuard')
         try {
           return json(200, { ok: true, config: guard.setConfig((body ?? {}) as Record<string, never>) })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // POST variant of the velocity footprint read (copilot tools + scripts)
+      if (path === '/otc_footprint') {
+        try {
+          const fp = kernel.context().use<OtcFootprintService>('otcFootprint')
+          return json(200, {
+            ok: true,
+            ...(await fp.footprint(String(body.asset ?? market.activeAsset), {
+              minutes: body.minutes !== undefined ? Math.max(1, Math.min(240, Number(body.minutes))) : undefined,
+              bucketSec: body.bucketSec !== undefined ? Math.max(5, Math.min(3600, Number(body.bucketSec))) : undefined,
+              minDelta: body.minDelta !== undefined ? Number(body.minDelta) : undefined,
+              ratioAt: body.ratioAt !== undefined ? Number(body.ratioAt) : undefined,
+              stagnationAt: body.stagnationAt !== undefined ? Number(body.stagnationAt) : undefined,
+            })),
+          })
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }
@@ -1907,7 +1940,7 @@ const httpServer = createServer(async (req, res) => {
             payout: body.payout !== undefined ? Number(body.payout) : undefined,
             amount: body.amount !== undefined ? Number(body.amount) : undefined,
             name: body.name !== undefined ? String(body.name) : undefined,
-            basis: body.basis !== undefined ? String(body.basis) as 'candles' | 'heikin' | 'kalman' : undefined,
+            basis: body.basis !== undefined ? String(body.basis) as CustomSpec['basis'] : undefined,
             mineCombos: body.mineCombos !== undefined ? Boolean(body.mineCombos) : undefined,
           })
           return json(200, result)

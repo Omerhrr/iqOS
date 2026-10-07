@@ -61,7 +61,7 @@ export class AnalyticsService {
     const candles = this.market.getCandlesDeep(asset, tf, 1500, true)
     if (candles.length < 60) throw new Error('not enough candle history yet')
     const merged = { ...defaultParams(strat), ...(params ?? {}) }
-    const ev = strat.evaluate(candles, merged)
+    const ev = strat.evaluate(candles, merged, { asset })
     return { ...ev, asset, tf, strategy: strategyId, price: candles[candles.length - 1].close }
   }
 

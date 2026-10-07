@@ -218,6 +218,75 @@ export async function getVolumeProfile(asset: string, tf: Timeframe, opts?: { li
   return d.profile
 }
 
+// ---------- OTC micro-tick velocity footprint (see trading-core/src/analytics/otcfootprint.ts) ----------
+// OTC feeds are generator scripts - no order book, no real volume. This chart
+// reads the generator's own price-print stream instead: per price row up/down
+// tick speeds, velocity delta, speed ratio and cluster stagnation (the OTC POC).
+// The source is REAL captured prints (sidecar 100ms live / sim 1s), with the
+// capture cadence labeled honestly on every response.
+
+export interface OtcFootprintRow {
+  price: number
+  up: number
+  dn: number
+  upMs: number
+  dnMs: number
+  upFast: number
+  dnFast: number
+  total: number
+}
+
+export interface OtcFootprintBucket {
+  time: number
+  open: number
+  high: number
+  low: number
+  close: number
+  nTicks: number
+  upTicks: number
+  dnTicks: number
+  upAvgMs: number
+  dnAvgMs: number
+  speedRatio: number
+  velDelta: number
+  rows: OtcFootprintRow[]
+  pocPrice: number
+  pocTicks: number
+  stagnation: number
+  closePos: number
+  divergence: 'put-trap' | 'call-trap' | null
+  exhaustion: 'up' | 'down' | null
+}
+
+export interface OtcFootprintResult {
+  ok: boolean
+  asset: string
+  bucketSec: number
+  tickSize: number
+  dataSource: string
+  cadenceMs: number | null
+  minutes: number
+  buckets: OtcFootprintBucket[]
+  summary: {
+    totalUp: number
+    totalDn: number
+    netDelta: number
+    avgSpeedRatio: number
+    dominantPoc: number
+    signal: 'call' | 'put' | 'none'
+    score: number
+    note: string
+  }
+}
+
+export async function getOtcFootprint(asset: string, opts?: { minutes?: number; bucketSec?: number }): Promise<OtcFootprintResult> {
+  return osGet<OtcFootprintResult>('/otc_footprint', {
+    asset,
+    minutes: opts?.minutes,
+    bucketSec: opts?.bucketSec,
+  })
+}
+
 export async function getDelta(asset: string, tf: Timeframe, opts?: { limit?: number }): Promise<{ deltas: CandleDelta[]; cumulative: CumulativeDeltaPoint[] }> {
   const d = await osGet<{ ok: boolean; deltas: CandleDelta[]; cumulative: CumulativeDeltaPoint[] }>('/delta', {
     asset,
@@ -1007,6 +1076,15 @@ export function labelOfSignal(s: LabSignalDef, strategies?: StrategyInfo[]): str
         }
         return `${ofName} ${s.op} ${s.threshold}`
       }
+      if (s.ind === 'otcvdelta' || s.ind === 'otcvratio' || s.ind === 'otcstagn') {
+        const name = ({ otcvdelta: 'OTC Tick Velocity Delta', otcvratio: 'OTC Tick Speed Ratio', otcstagn: 'OTC Cluster Stagnation' } as Record<string, string>)[s.ind]
+        if (s.op === 'between' || s.op === 'outside') {
+          const lo = Math.min(s.threshold, s.threshold2 ?? s.threshold)
+          const hi = Math.max(s.threshold, s.threshold2 ?? s.threshold)
+          return `${name} ${s.op} [${lo}, ${hi}]`
+        }
+        return `${name} ${s.op} ${s.threshold}`
+      }
       const p = s.params ?? {}
       const pd = p.period ?? p.fast
       const tag = s.type ? `:${s.type}` : ''
@@ -1180,6 +1258,13 @@ export const SIGNAL_TEMPLATES: LabSignalDef[] = [
   { kind: 'indicator', ind: 'ofpocdist', params: { period: 40 }, op: '>', threshold: 1.2, dir: 'put', weight: 10 },
   { kind: 'indicator', ind: 'ofvapos', params: { period: 40 }, op: '>', threshold: 1.05, dir: 'call', weight: 10 },
   { kind: 'indicator', ind: 'ofvapos', params: { period: 40 }, op: '<', threshold: -0.05, dir: 'put', weight: 10 },
+  // OTC micro-tick velocity footprint family (kernel analytics/otcfootprint.ts)
+  { kind: 'indicator', ind: 'otcvdelta', params: { period: 20 }, op: '>', threshold: 1, dir: 'call', weight: 11 },
+  { kind: 'indicator', ind: 'otcvdelta', params: { period: 20 }, op: '<', threshold: -1, dir: 'put', weight: 11 },
+  { kind: 'indicator', ind: 'otcvratio', params: { period: 20 }, op: '>', threshold: 1, dir: 'call', weight: 11 },
+  { kind: 'indicator', ind: 'otcvratio', params: { period: 20 }, op: '<', threshold: -1, dir: 'put', weight: 11 },
+  { kind: 'indicator', ind: 'otcstagn', params: { period: 20 }, op: '>', threshold: 1, dir: 'call', weight: 11 },
+  { kind: 'indicator', ind: 'otcstagn', params: { period: 20 }, op: '<', threshold: -1, dir: 'put', weight: 11 },
 ]
 
 export interface LabSpec {
