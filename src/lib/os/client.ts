@@ -33,6 +33,8 @@ export type ChartType =
   // Task 63 chart-type engines (kernel routes: /rangebars /volumebars
   // /footprint /tpo /ticks /iv_hv - engines of record in trading-core)
   | 'rangebars' | 'volumebars' | 'footprint' | 'tpo' | 'tickchart' | 'ivhv'
+  // OTC micro-tick velocity footprint (kernel route /otc_footprint)
+  | 'otcfootprint'
 export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'candles', label: 'Candles' },
   { id: 'hollow', label: 'Hollow' },
@@ -46,6 +48,7 @@ export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'rangebars', label: 'Range' },
   { id: 'volumebars', label: 'Vol Bars' },
   { id: 'footprint', label: 'Footprint' },
+  { id: 'otcfootprint', label: 'OTC Footprint' },
   { id: 'tpo', label: 'TPO' },
   { id: 'tickchart', label: 'Tick' },
   { id: 'ivhv', label: 'IV·HV' },

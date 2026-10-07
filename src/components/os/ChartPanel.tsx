@@ -24,8 +24,8 @@ import {
   type Time,
   type UTCTimestamp,
 } from 'lightweight-charts'
-import type { AnalysisResult, Candle, ChartType, IndicatorSeries, IvHvResponse, Position, TickBarRow, TicksResponse, Timeframe } from '@/lib/os/client'
-import { chartPriceFormat, fmtPrice, osGet } from '@/lib/os/client'
+import type { AnalysisResult, Candle, ChartType, IndicatorSeries, IvHvResponse, OtcFootprintResult, Position, TickBarRow, TicksResponse, Timeframe } from '@/lib/os/client'
+import { chartPriceFormat, fmtPrice, getOtcFootprint, osGet } from '@/lib/os/client'
 
 interface ChartPanelProps {
   candles: Candle[]
@@ -452,6 +452,7 @@ export default function ChartPanel({
   const [tickBarsState, setTickBarsState] = useState<TickBarRow[]>([])
   const [ticksMeta, setTicksMeta] = useState<{ dataSource: 'tick' | 'candle'; per: number } | null>(null)
   const [ivhvState, setIvhvState] = useState<IvHvResponse | null>(null)
+  const [otcState, setOtcState] = useState<OtcFootprintResult | null>(null)
   const customCanvasRef = useRef<HTMLCanvasElement | null>(null)
   // IV/HV pane line series (created only when chartType === 'ivhv')
   const hvLineRef = useRef<ISeriesApi<'Line'> | null>(null)
@@ -503,6 +504,31 @@ export default function ChartPanel({
       clearInterval(iv)
     }
   }, [chartType, digitsTicker, tf])
+
+  // OTC velocity footprint: kernel micro-tick aggregation (/otc_footprint) -
+  // same engine the OTC Footprint tab and the otcv* lab family read. Poll at
+  // the panel's cadence while the type is active; buckets arrive pre-aggregated
+  // per minute with per-row up/down speeds (up to the capture cadence).
+  useEffect(() => {
+    if (chartType !== 'otcfootprint') return
+    let dead = false
+    const pull = () => {
+      getOtcFootprint(digitsTicker, { minutes: 30, bucketSec: 60 })
+        .then((r) => {
+          if (dead || !r?.ok) return
+          setOtcState(r)
+        })
+        .catch(() => {
+          // keep last good data
+        })
+    }
+    pull()
+    const iv = setInterval(pull, 6000)
+    return () => {
+      dead = true
+      clearInterval(iv)
+    }
+  }, [chartType, digitsTicker])
 
   const displayCandles = useMemo(() => {
     if (chartType === 'heikin') return heikinAshi(candles)
@@ -563,7 +589,7 @@ export default function ChartPanel({
         upColor: UP, downColor: DOWN, borderUpColor: UP, borderDownColor: DOWN, wickUpColor: UP, wickDownColor: DOWN,
         priceLineColor: '#38bdf8',
       })
-    } else if (chartType === 'footprint' || chartType === 'tpo') {
+    } else if (chartType === 'footprint' || chartType === 'tpo' || chartType === 'otcfootprint') {
       // hidden behind the opaque custom canvas - but keeps the series
       // machinery (markers/price lines) alive and the data effect fed with
       // candle-shaped objects (falling through to baseline would crash)
@@ -672,7 +698,7 @@ export default function ChartPanel({
   // These two chart types cannot be candlestick pseudo-series; an opaque
   // canvas overlays the lightweight chart. Redraws on data/type/resize.
   useEffect(() => {
-    if (chartType !== 'footprint' && chartType !== 'tpo') return
+    if (chartType !== 'footprint' && chartType !== 'tpo' && chartType !== 'otcfootprint') return
     const canvas = customCanvasRef.current
     if (!canvas) return
     const parent = canvas.parentElement
@@ -742,6 +768,107 @@ export default function ChartPanel({
         ctx.fillStyle = TEXT
         ctx.textAlign = 'left'
         ctx.fillText('footprint - volume (approx), CLV split - green buy / red sell, cyan box POC, outline imbalance', 8, 12)
+      } else if (chartType === 'otcfootprint') {
+        // OTC velocity footprint: per-minute price-row matrix of the
+        // generator's own print stream - left cell = down-ticks at that level
+        // (count+avg ms), right cell = up-ticks. Reads /otc_footprint (the
+        // kernel's micro-tick buffers), NOT candles - no volume fabrication.
+        const buckets = (otcState?.buckets ?? []).filter((b) => b.nTicks > 0)
+        if (!buckets.length) {
+          ctx.fillStyle = TEXT
+          ctx.textAlign = 'center'
+          ctx.fillText('no micro-tick prints captured yet for this asset', W / 2, H / 2 - 8)
+          ctx.font = '9px var(--font-geist-mono), monospace'
+          ctx.fillText('sim feeds print ~1/s, live OTC via the sidecar 100ms capture - wait a minute or two', W / 2, H / 2 + 8)
+          return
+        }
+        const colW = 64
+        const maxCols = Math.max(3, Math.floor((W - 24) / colW))
+        const vis = buckets.slice(-maxCols)
+        const allRows = vis.flatMap((b) => b.rows)
+        const pLo = allRows.length ? Math.min(...allRows.map((r) => r.price)) : Math.min(...vis.map((b) => b.low))
+        const pHi = allRows.length ? Math.max(...allRows.map((r) => r.price)) : Math.max(...vis.map((b) => b.high))
+        const padT = 30
+        const padB = 28
+        const y = (p: number) => padT + ((pHi - p) / Math.max(pHi - pLo, 1e-12)) * (H - padT - padB)
+        const maxTotal = Math.max(...allRows.map((r) => r.total), 1)
+        // window-dominant POC - dashed amber guide across the whole chart
+        const domPoc = otcState?.summary.dominantPoc ?? 0
+        if (domPoc > 0 && domPoc >= pLo && domPoc <= pHi) {
+          ctx.strokeStyle = 'rgba(245,158,11,0.5)'
+          ctx.setLineDash([4, 3])
+          ctx.beginPath()
+          ctx.moveTo(8, y(domPoc))
+          ctx.lineTo(W - 8, y(domPoc))
+          ctx.stroke()
+          ctx.setLineDash([])
+          ctx.fillStyle = '#f59e0b'
+          ctx.textAlign = 'right'
+          ctx.fillText(`dominant POC ${fmtPrice(domPoc, digitsTicker)}`, W - 10, y(domPoc) - 3)
+        }
+        const halfW = colW / 2 - 6
+        for (let bi = 0; bi < vis.length; bi++) {
+          const b = vis[bi]
+          const cx = 12 + bi * colW + colW / 2
+          // hi-lo skeleton per bucket for orientation
+          ctx.strokeStyle = 'rgba(124,138,165,0.35)'
+          ctx.beginPath()
+          ctx.moveTo(cx, y(b.high))
+          ctx.lineTo(cx, y(b.low))
+          ctx.stroke()
+          if (b.divergence) {
+            ctx.fillStyle = b.divergence === 'put-trap' ? 'rgba(244,63,94,0.95)' : 'rgba(16,185,129,0.95)'
+            ctx.textAlign = 'center'
+            ctx.fillText(b.divergence === 'put-trap' ? 'CEIL TRAP' : 'FLOOR TRAP', cx, padT - 9)
+          } else if (b.exhaustion) {
+            ctx.fillStyle = 'rgba(245,158,11,0.9)'
+            ctx.textAlign = 'center'
+            ctx.fillText(b.exhaustion === 'up' ? 'UP THRUST' : 'DN THRUST', cx, padT - 9)
+          }
+          const rows = [...b.rows].sort((a, c) => c.price - a.price)
+          for (const r of rows) {
+            const ry = y(r.price)
+            const h = 5
+            const dnW = (r.dn / maxTotal) * halfW
+            const upW = (r.up / maxTotal) * halfW
+            if (r.dn > 0) {
+              ctx.fillStyle = 'rgba(244,63,94,0.6)'
+              ctx.fillRect(cx - 2 - dnW, ry - h / 2, dnW, h)
+            }
+            if (r.up > 0) {
+              ctx.fillStyle = 'rgba(16,185,129,0.6)'
+              ctx.fillRect(cx + 2, ry - h / 2, upW, h)
+            }
+            if (r.price === b.pocPrice) {
+              ctx.strokeStyle = 'rgba(245,158,11,0.95)'
+              ctx.strokeRect(cx - 4 - halfW, ry - h / 2 - 1, halfW * 2 + 8, h + 2)
+            }
+            // count+ms labels when the cell is wide enough to hold them
+            ctx.font = '8px var(--font-geist-mono), monospace'
+            ctx.fillStyle = 'rgba(219,228,240,0.85)'
+            if (r.dn > 0 && dnW >= 24) {
+              ctx.textAlign = 'right'
+              ctx.fillText(`${r.dn}·${Math.round(r.dnMs)}`, cx - 4, ry + 2.5)
+            }
+            if (r.up > 0 && upW >= 24) {
+              ctx.textAlign = 'left'
+              ctx.fillText(`${r.up}·${Math.round(r.upMs)}`, cx + 4, ry + 2.5)
+            }
+          }
+          // bucket captions: clock + velocity delta
+          const d = new Date(b.time * 1000)
+          ctx.font = '8px var(--font-geist-mono), monospace'
+          ctx.fillStyle = TEXT
+          ctx.textAlign = 'center'
+          ctx.fillText(`${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`, cx, H - 15)
+          ctx.fillStyle = b.velDelta > 0 ? UP : b.velDelta < 0 ? DOWN : TEXT
+          ctx.fillText(`${b.velDelta >= 0 ? '+' : ''}${b.velDelta}`, cx, H - 5)
+        }
+        ctx.font = '10px var(--font-geist-mono), monospace'
+        ctx.fillStyle = TEXT
+        ctx.textAlign = 'left'
+        const src = otcState ? ` - ${otcState.dataSource}${otcState.cadenceMs !== null ? ` · ${otcState.cadenceMs}ms capture` : ''}` : ''
+        ctx.fillText(`OTC velocity footprint - dn count·ms / up count·ms per row, amber box bucket POC${src}`, 8, 12)
       } else {
         // TPO: left = close path for time orientation, right = profile
         const prof = tpoProfile(candles.slice(-400))
@@ -814,7 +941,7 @@ export default function ChartPanel({
     const ro = new ResizeObserver(draw)
     ro.observe(parent)
     return () => ro.disconnect()
-  }, [chartType, candles, digitsTicker])
+  }, [chartType, candles, digitsTicker, otcState])
 
   // live precision sync: asset switch or a quote crossing a magnitude band
   useEffect(() => {
@@ -1041,10 +1168,14 @@ export default function ChartPanel({
         return ticksMeta ? `tick chart ${ticksMeta.per}/bar - ${ticksMeta.dataSource === 'tick' ? 'real 100ms capture' : 'PSEUDO-TICKS (5s closes), not raw tick data'}` : 'tick chart - loading...'
       case 'ivhv':
         return ivhvState ? `HV ${Number.isFinite(ivhvState.hvNow) ? ivhvState.hvNow.toFixed(1) : '?'}% - IV proxy (${ivhvState.ivSource}): payout breakeven - realized up ${ivhvState.realizedUpProbPct.toFixed(0)}%` : 'IV/HV - loading...'
+      case 'otcfootprint':
+        return otcState
+          ? `OTC velocity footprint - ${otcState.dataSource}${otcState.cadenceMs !== null ? ` · ${otcState.cadenceMs}ms capture` : ''} - reads the generator's prints, not volume`
+          : 'OTC velocity footprint - waiting for tick buffer...'
       default:
         return null
     }
-  }, [chartType, ticksMeta, ivhvState, tpoBadge, digitsTicker])
+  }, [chartType, ticksMeta, ivhvState, tpoBadge, digitsTicker, otcState])
 
   // zoom controls: scale the visible logical range around its center
   const zoomBy = (factor: number) => {
@@ -1094,7 +1225,7 @@ export default function ChartPanel({
           {badge}
         </div>
       )}
-      {(chartType === 'footprint' || chartType === 'tpo') && (
+      {(chartType === 'footprint' || chartType === 'tpo' || chartType === 'otcfootprint') && (
         <div className="absolute inset-x-0 bottom-[30px] top-0 z-[5] bg-[#0b111c]">
           <canvas ref={customCanvasRef} className="block h-full w-full" />
         </div>

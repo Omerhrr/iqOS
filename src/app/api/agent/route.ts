@@ -103,7 +103,7 @@ function trimAnalysis(a: Record<string, unknown>): Record<string, unknown> {
   return out
 }
 
-const CHART_TYPES = ['candles', 'hollow', 'bars', 'line', 'area', 'baseline', 'heikin-ashi', 'renko', 'pointfigure', 'rangebars', 'volumebars', 'footprint', 'tpo', 'tickchart', 'ivhv']
+const CHART_TYPES = ['candles', 'hollow', 'bars', 'line', 'area', 'baseline', 'heikin-ashi', 'renko', 'pointfigure', 'rangebars', 'volumebars', 'footprint', 'otcfootprint', 'tpo', 'tickchart', 'ivhv']
 
 // ---------- shared helpers for the composed power tools ----------
 
@@ -1962,6 +1962,7 @@ const TOOLS: ToolSpec[] = [
         rangebars: 'rangebars', rangebar: 'rangebars', range: 'rangebars',
         volumebars: 'volumebars', volumebar: 'volumebars', volume: 'volumebars', constantvolume: 'volumebars', cvb: 'volumebars',
         footprint: 'footprint', cluster: 'footprint', clusterchart: 'footprint', volumeprint: 'footprint',
+        otcfootprint: 'otcfootprint', otc: 'otcfootprint', otcfp: 'otcfootprint', otcvelocity: 'otcfootprint', velocityfootprint: 'otcfootprint', otcfootprintchart: 'otcfootprint',
         tpo: 'tpo', marketprofile: 'tpo', timeprice: 'tpo', timepriceopportunity: 'tpo', profile: 'tpo',
         tickchart: 'tickchart', tick: 'tickchart', ticks: 'tickchart', tickbars: 'tickchart',
         ivhv: 'ivhv', ivvshv: 'ivhv', ivhvchart: 'ivhv', impliedvolatility: 'ivhv',
