@@ -871,6 +871,34 @@ export type LabSignalDef =
     }
   | { kind: 'mtf'; factor: 5 | 15; dir: 'call' | 'put'; weight: number }
   | {
+      /** Renko brick structure (mirrors trading-core's RenkoSignal - see
+       * analytics/renko.ts). flip-* = trend reversed to this side within the
+       * last `len` bricks (young reversal); streak-* = same-color run has
+       * reached `len` bricks. Sized ATR-trailing per bar like the renko-flip
+       * builtin, or a fixed brickSize when given. */
+      kind: 'renko'
+      variant: 'flip-up' | 'flip-down' | 'streak-up' | 'streak-down'
+      len?: number
+      atrPeriod?: number
+      atrMult?: number
+      brickSize?: number
+      dir: 'call' | 'put'
+      weight: number
+    }
+  | {
+      /** Point & Figure breakout pattern (mirrors trading-core's PFSignal -
+       * see analytics/pointfigure.ts). Fires ONLY on the bar that painted
+       * the breakout box - stale patterns never vote. */
+      kind: 'pf'
+      variant: 'double-top-breakout' | 'double-bottom-breakdown' | 'triple-top-breakout' | 'triple-bottom-breakdown'
+      atrPeriod?: number
+      atrMult?: number
+      boxSize?: number
+      reversalBoxes?: number
+      dir: 'call' | 'put'
+      weight: number
+    }
+  | {
       /** AND/OR combination of DIFFERENT signal types into one voting unit
        * - e.g. "Range Sell Zone" AND "Wide Bear Bar" AND "RSI(14) > 70" only
        * counts when ALL (op:'and') or ANY (op:'or') member signals fire on
@@ -967,6 +995,24 @@ export function labelOfSignal(s: LabSignalDef, strategies?: StrategyInfo[]): str
     }
     case 'mtf':
       return `MTF ${s.factor}x Trend ${s.dir === 'call' ? 'Up' : 'Down'}`
+    case 'renko':
+      return (
+        {
+          'flip-up': 'Renko Flip Up',
+          'flip-down': 'Renko Flip Down',
+          'streak-up': `Renko Streak Up(${s.len ?? 3})`,
+          'streak-down': `Renko Streak Down(${s.len ?? 3})`,
+        }[s.variant] ?? s.variant
+      )
+    case 'pf':
+      return (
+        {
+          'double-top-breakout': 'P&F Double Top Breakout',
+          'double-bottom-breakdown': 'P&F Double Bottom Breakdown',
+          'triple-top-breakout': 'P&F Triple Top Breakout',
+          'triple-bottom-breakdown': 'P&F Triple Bottom Breakdown',
+        }[s.variant] ?? s.variant
+      )
     case 'group':
       return `(${s.signals.map((m) => labelOfSignal(m, strategies)).join(s.op === 'and' ? ' AND ' : ' OR ')})`
     case 'builtin': {
@@ -994,6 +1040,17 @@ export const SIGNAL_TEMPLATES: LabSignalDef[] = [
   { kind: 'ha', variant: 'streak-down', len: 3, dir: 'put', weight: 10 },
   { kind: 'ha', variant: 'strong-bull', dir: 'call', weight: 10 },
   { kind: 'ha', variant: 'strong-bear', dir: 'put', weight: 10 },
+  // renko brick structures + P&F breakout patterns - mirror trading-core's
+  // lab.ts CANDIDATE_SIGNALS additions (see analytics/renko.ts and
+  // analytics/pointfigure.ts for the engines)
+  { kind: 'renko', variant: 'flip-up', len: 2, dir: 'call', weight: 10 },
+  { kind: 'renko', variant: 'flip-down', len: 2, dir: 'put', weight: 10 },
+  { kind: 'renko', variant: 'streak-up', len: 3, dir: 'call', weight: 10 },
+  { kind: 'renko', variant: 'streak-down', len: 3, dir: 'put', weight: 10 },
+  { kind: 'pf', variant: 'double-top-breakout', dir: 'call', weight: 10 },
+  { kind: 'pf', variant: 'double-bottom-breakdown', dir: 'put', weight: 10 },
+  { kind: 'pf', variant: 'triple-top-breakout', dir: 'call', weight: 10 },
+  { kind: 'pf', variant: 'triple-bottom-breakdown', dir: 'put', weight: 10 },
   { kind: 'line', variant: 'breakout-up', lookback: 10, dir: 'call', weight: 10 },
   { kind: 'line', variant: 'breakout-down', lookback: 10, dir: 'put', weight: 10 },
   { kind: 'line', variant: 'breakout-up', lookback: 20, dir: 'call', weight: 10 },

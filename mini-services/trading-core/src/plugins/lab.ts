@@ -1,7 +1,8 @@
 // IQAIR//OS - Strategy Lab plugin (AI learning agent)
 // Mines a pair's candle history for edge-bearing events across the full
 // pattern vocabulary - candlestick formations, bar expansions, Heiken Ashi
-// structures, line/structural breaks and a parametric indicator family - then
+// structures, line/structural breaks, Renko brick flips/streaks, P&F
+// breakout patterns and a parametric indicator family - then
 // composes the survivors into a CustomSpec the autopilot can trade as
 // strategyId "custom:<id>". Every learned strategy is backed by measured
 // stats (samples, win rate, edge) and a binary backtest with an honest
@@ -880,6 +881,16 @@ function familyOf(s: SignalDef): string {
       // but up/down of the SAME factor count as one family so the ensemble
       // doesn't select both sides of the identical trend test.
       return `mtf:${s.factor}`
+    case 'renko':
+      // flip-up/down share one family (both directions of the same "young
+      // reversal" structure), streak-up/down another - mirrors the mtf
+      // convention so the ensemble can't stock both sides of one idea.
+      return `renko:${s.variant.replace(/-(up|down)$/, '')}`
+    case 'pf':
+      // all four breakout patterns are one family - they're rare events
+      // (a handful of occurrences per thousand bars) and one P&F slot in
+      // the ensemble is the right share
+      return 'pf'
     case 'group':
       // groups are hand/AI-authored combinations, not something the miner
       // itself generates as a candidate - key it by its member families so
@@ -907,6 +918,10 @@ function candidateKeyOf(s: SignalDef): string {
       return `indicator:${s.ind}|${s.op}|${s.threshold}|${JSON.stringify(s.params ?? {})}`
     case 'mtf':
       return `mtf:${s.factor}:${s.dir}`
+    case 'renko':
+      return `renko:${s.variant}:${s.len ?? ''}:${s.atrPeriod ?? ''}:${s.atrMult ?? ''}:${s.brickSize ?? ''}`
+    case 'pf':
+      return `pf:${s.variant}:${s.reversalBoxes ?? ''}:${s.atrPeriod ?? ''}:${s.atrMult ?? ''}:${s.boxSize ?? ''}`
     case 'group':
       return `group:${s.op}:${s.dir}:${s.signals.map(candidateKeyOf).join('+')}`
     case 'builtin':
@@ -1096,6 +1111,23 @@ export const CANDIDATE_SIGNALS: SignalDef[] = [
   { kind: 'ha', variant: 'streak-down', len: 3, dir: 'put', weight: 10 },
   { kind: 'ha', variant: 'strong-bull', dir: 'call', weight: 10 },
   { kind: 'ha', variant: 'strong-bear', dir: 'put', weight: 10 },
+  // renko brick structures (see analytics/renko.ts) - flip = young reversal
+  // (trend flipped to this side within the last `len` bricks), streak = a
+  // same-color run of `len` bricks. Sizing is trailing-ATR per bar, the
+  // exact convention the renko-flip builtin trades on, so a learned spec
+  // and the standalone strategy agree bar-for-bar.
+  { kind: 'renko', variant: 'flip-up', len: 2, dir: 'call', weight: 10 },
+  { kind: 'renko', variant: 'flip-down', len: 2, dir: 'put', weight: 10 },
+  { kind: 'renko', variant: 'streak-up', len: 3, dir: 'call', weight: 10 },
+  { kind: 'renko', variant: 'streak-down', len: 3, dir: 'put', weight: 10 },
+  // P&F breakout patterns (see analytics/pointfigure.ts) - fire only on the
+  // bar that painted the breakout box. Rare by construction: minSamples
+  // usually keeps these out of the ensemble unless the tape genuinely
+  // revisits levels, which is exactly when the pattern means something.
+  { kind: 'pf', variant: 'double-top-breakout', dir: 'call', weight: 10 },
+  { kind: 'pf', variant: 'double-bottom-breakdown', dir: 'put', weight: 10 },
+  { kind: 'pf', variant: 'triple-top-breakout', dir: 'call', weight: 10 },
+  { kind: 'pf', variant: 'triple-bottom-breakdown', dir: 'put', weight: 10 },
   // line / structural
   { kind: 'line', variant: 'breakout-up', lookback: 10, dir: 'call', weight: 10 },
   { kind: 'line', variant: 'breakout-down', lookback: 10, dir: 'put', weight: 10 },

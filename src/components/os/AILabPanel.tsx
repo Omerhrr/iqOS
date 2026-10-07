@@ -128,6 +128,8 @@ const KIND_CHIP: Record<string, string> = {
   line: 'text-sky-300 border-sky-500/40 bg-sky-500/10',
   indicator: 'text-fuchsia-300 border-fuchsia-500/40 bg-fuchsia-500/10',
   mtf: 'text-cyan-300 border-cyan-500/40 bg-cyan-500/10',
+  renko: 'text-rose-300 border-rose-500/40 bg-rose-500/10',
+  pf: 'text-teal-300 border-teal-500/40 bg-teal-500/10',
   group: 'text-orange-300 border-orange-500/40 bg-orange-500/10',
   builtin: 'text-lime-300 border-lime-500/40 bg-lime-500/10',
 }
@@ -1061,7 +1063,7 @@ export default function AILabPanel({ assets, strategies, onError, refreshBots }:
           </Button>
         </div>
         <p className="mt-2 text-[10px] leading-snug text-[#7c8aa5]">
-          Mines candlestick patterns, wide-range bar formations, Heiken Ashi structures, line breaks (Donchian / HH-HL), multi-timeframe EMA-trend agreement (resampled 5x/15x) and its own invented indicators (RSI, BB %B, z-score, Donchian position, MACD-z, slope, streak, wick bias, EMA spread, HA distance, close position){mineCombos ? <>, plus AND/OR/AND-AND combinations of the best of those (confluence, not just single signals voting independently)</> : null} - then weights the survivors by their Wilson-score confidence-adjusted edge (not just the raw win rate, so a lucky small sample can&apos;t outrank a well-sampled one) and backtests the composition. The <span className="text-[#aab6cc]">basis</span> switch picks what every signal actually reads: raw candles, Heiken-Ashi, a Kalman-smoothed trend line, typical-price (HLC3, folds the whole bar&apos;s range into one number), or a plain 3-bar SMA smooth - whichever basis, outcomes always settle on real prices and the deployed bot trades the same basis it learned on. Thin history auto-relaxes the min-samples floor instead of failing. Saved strategies are automatically re-learned every ~6h to catch decay (see the library below).
+          Mines candlestick patterns, wide-range bar formations, Heiken Ashi structures, Renko brick flips/streaks, Point &amp; Figure breakout patterns (double/triple top-bottom), line breaks (Donchian / HH-HL), multi-timeframe EMA-trend agreement (resampled 5x/15x) and its own invented indicators (RSI, BB %B, z-score, Donchian position, MACD-z, slope, streak, wick bias, EMA spread, HA distance, close position){mineCombos ? <>, plus AND/OR/AND-AND combinations of the best of those (confluence, not just single signals voting independently)</> : null} - then weights the survivors by their Wilson-score confidence-adjusted edge (not just the raw win rate, so a lucky small sample can&apos;t outrank a well-sampled one) and backtests the composition. The <span className="text-[#aab6cc]">basis</span> switch picks what every signal actually reads: raw candles, Heiken-Ashi, a Kalman-smoothed trend line, typical-price (HLC3, folds the whole bar&apos;s range into one number), or a plain 3-bar SMA smooth - whichever basis, outcomes always settle on real prices and the deployed bot trades the same basis it learned on. Thin history auto-relaxes the min-samples floor instead of failing. Saved strategies are automatically re-learned every ~6h to catch decay (see the library below).
         </p>
       </div>
 

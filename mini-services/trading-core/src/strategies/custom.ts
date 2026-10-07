@@ -3,7 +3,9 @@
 // them into a CustomSpec: a portable, inspectable strategy definition the
 // autopilot can trade (strategyId "custom:<id>"). The vocabulary spans the
 // user's ask: candlestick patterns, bar formations, Heiken Ashi patterns,
-// line/structural patterns, and parametric INDICATOR rules spanning the
+// line/structural patterns, Renko brick structures and Point & Figure
+// breakout patterns (both fed by the kernel's own analytics engines), and
+// parametric INDICATOR rules spanning the
 // FULL analytics/indicators.ts suite: the lab's own invented indicators
 // (rsi/bbpos/zscore/donchianpos/macdz/slope/streak/wickbias/emasign/hadist/
 // bodypos), swing/trend primitives (psar/fractal), and eight generic
@@ -32,6 +34,8 @@ import { detectPatterns } from '../analytics/patterns'
 import { trendPullbackSeries, rangeZoneSeries } from '../analytics/structure'
 import { getStrategy, defaultParams } from './builtin'
 import { computeCandleDelta, computeCumulativeDelta, computeVolumeProfile } from '../analytics/orderflow'
+import { renkoBricks, type RenkoResult } from '../analytics/renko'
+import { pointFigure } from '../analytics/pointfigure'
 
 // ---------- signal vocabulary ----------
 
@@ -136,6 +140,42 @@ export interface MTFSignal {
   weight: number
 }
 
+/** Renko brick structure (see analytics/renko.ts - classic close-based
+ * bricks, 2-brick reversal). Sizing follows the renko-flip builtin's
+ * convention: ATR(atrPeriod) x atrMult of the evaluation window per read
+ * (trailing, past-only), or a fixed explicit brickSize when given.
+ * flip-* fires while the brick trend is `dir` AND young - the flip happened
+ * within the last `len` bricks (at most `len` bars fire per reversal, then
+ * the signal stands aside like the builtin's confirm gate); streak-* fires
+ * while the current same-color run has reached `len` bricks. */
+export interface RenkoSignal {
+  kind: 'renko'
+  variant: 'flip-up' | 'flip-down' | 'streak-up' | 'streak-down'
+  len?: number // flip freshness window / streak minimum (default 2 flip, 3 streak)
+  atrPeriod?: number // ATR period for brick sizing (default 14)
+  atrMult?: number // brick = ATR x (default 0.3)
+  brickSize?: number // explicit fixed brick size - wins over the ATR rule when set
+  dir: Side
+  weight: number
+}
+
+/** Point & Figure breakout pattern (see analytics/pointfigure.ts - classic
+ * high/low boxes on an absolute grid, `reversalBoxes`-box reversal).
+ * Unlike renko states, a P&F breakout is an EVENT: the signal fires only on
+ * the bar that painted the breakout box (pattern.at === that bar's open
+ * time) - stale patterns stand aside, exactly like the pf-breakout builtin.
+ * Double = prior top/bottom cleared once, Triple = twice. */
+export interface PFSignal {
+  kind: 'pf'
+  variant: 'double-top-breakout' | 'double-bottom-breakdown' | 'triple-top-breakout' | 'triple-bottom-breakdown'
+  atrPeriod?: number // ATR period for box sizing (default 14)
+  atrMult?: number // box = ATR x (default 0.5)
+  boxSize?: number // explicit fixed box size - wins over the ATR rule when set
+  reversalBoxes?: number // boxes against the column needed to flip (default 3, 1-10)
+  dir: Side
+  weight: number
+}
+
 /** AND/OR combination of DIFFERENT signal types into one unit that votes as
  * a single signal. This is distinct from an IndicatorSignal's 'between'/
  * 'outside' op (which bands ONE indicator's own value) - a GroupSignal joins
@@ -177,7 +217,17 @@ export interface BuiltinSignal {
   weight: number
 }
 
-export type SignalDef = CandleSignal | BarSignal | HASignal | LineSignal | IndicatorSignal | MTFSignal | GroupSignal | BuiltinSignal
+export type SignalDef =
+  | CandleSignal
+  | BarSignal
+  | HASignal
+  | LineSignal
+  | IndicatorSignal
+  | MTFSignal
+  | RenkoSignal
+  | PFSignal
+  | GroupSignal
+  | BuiltinSignal
 
 export interface CustomSpec {
   name: string
@@ -875,6 +925,20 @@ export function labelOf(s: SignalDef): string {
     }
     case 'mtf':
       return `MTF ${s.factor}x Trend ${s.dir === 'call' ? 'Up' : 'Down'}`
+    case 'renko':
+      return {
+        'flip-up': 'Renko Flip Up',
+        'flip-down': 'Renko Flip Down',
+        'streak-up': `Renko Streak Up(${s.len ?? 3})`,
+        'streak-down': `Renko Streak Down(${s.len ?? 3})`,
+      }[s.variant]
+    case 'pf':
+      return {
+        'double-top-breakout': 'P&F Double Top Breakout',
+        'double-bottom-breakdown': 'P&F Double Bottom Breakdown',
+        'triple-top-breakout': 'P&F Triple Top Breakout',
+        'triple-bottom-breakdown': 'P&F Triple Bottom Breakdown',
+      }[s.variant]
     case 'group':
       return `(${s.signals.map(labelOf).join(s.op === 'and' ? ' AND ' : ' OR ')})`
     case 'builtin': {
@@ -901,6 +965,10 @@ export function impliedDir(s: SignalDef): Side {
       return s.dir
     case 'mtf':
       return s.dir
+    case 'renko':
+      return s.variant.endsWith('up') ? 'call' : 'put'
+    case 'pf':
+      return s.variant.includes('top') ? 'call' : 'put'
     case 'group':
       return s.dir
     case 'builtin':
@@ -1095,6 +1163,74 @@ export function prepareSignal(s: SignalDef, ctx: EvalCtx): (i: number) => boolea
         return align ? up[g] : dn[g]
       }
     }
+    case 'renko': {
+      // Per-index semantics: the renko DRAWN AT bar i - renkoBricks over the
+      // slice [0..i], auto-sized from that slice's trailing ATR (the exact
+      // convention the renko-flip builtin uses per evaluation). The state at
+      // i is therefore a pure function of bars 0..i: no future leak (the
+      // brick size can never depend on bars after i), and backtest/live
+      // parity by construction - the same bars always produce the same
+      // bricks, whichever window they were handed in. Per-index results are
+      // memoized: the learner sweeps every bar once, live only ever asks for
+      // the last one, so this is O(n) total per read, not O(n^2).
+      const variant = s.variant
+      const isFlip = variant.startsWith('flip')
+      const len = Math.max(1, Math.round(num(s.len, isFlip ? 2 : 3)))
+      const opts: { brickSize?: number; atrPeriod?: number; atrMult?: number } = {}
+      if (Number.isFinite(s.brickSize) && (s.brickSize as number) > 0) opts.brickSize = s.brickSize
+      if (Number.isFinite(s.atrPeriod)) opts.atrPeriod = Math.max(2, Math.round(s.atrPeriod as number))
+      if (Number.isFinite(s.atrMult)) opts.atrMult = Math.max(0.05, s.atrMult as number)
+      const memo = new Map<number, RenkoResult | null>()
+      const stateAt = (i: number): RenkoResult | null => {
+        const hit = memo.get(i)
+        if (hit !== undefined) return hit
+        if (i < 0 || i >= ctx.n) return null
+        const r = renkoBricks(ctx.candles.slice(0, i + 1), opts)
+        memo.set(i, r)
+        return r
+      }
+      return (i: number) => {
+        const r = stateAt(i)
+        if (!r || r.trend === 'none') return false
+        // bricks.length > streak: a brick existed BEFORE the current run -
+        // the series seed (first bricks ever, no prior direction) is not a
+        // "flip" and a streak counting from bar 0 is not a learned structure.
+        if (r.bricks.length <= r.streak) return false
+        const up = r.trend === 'up'
+        if (variant === 'flip-up') return up && r.streak <= len
+        if (variant === 'flip-down') return !up && r.streak <= len
+        if (variant === 'streak-up') return up && r.streak >= len
+        return !up && r.streak >= len
+      }
+    }
+    case 'pf': {
+      // Same slice-recompute convention as 'renko': pointFigure over
+      // [0..i] per bar, memoized. The breakout is an event anchored on the
+      // engine's pattern.at (the exact candle that pushed the box past the
+      // prior top/bottom), so the test at i is "this bar painted the
+      // breakout" - stale patterns never fire, matching the pf-breakout
+      // builtin's freshness gate bar-for-bar.
+      const variant = s.variant
+      const wantTop = variant.includes('top')
+      const wantTriple = variant.startsWith('triple')
+      const opts: { boxSize?: number; atrPeriod?: number; atrMult?: number; reversalBoxes?: number } = {}
+      if (Number.isFinite(s.boxSize) && (s.boxSize as number) > 0) opts.boxSize = s.boxSize
+      if (Number.isFinite(s.atrPeriod)) opts.atrPeriod = Math.max(2, Math.round(s.atrPeriod as number))
+      if (Number.isFinite(s.atrMult)) opts.atrMult = Math.max(0.05, s.atrMult as number)
+      if (Number.isFinite(s.reversalBoxes)) opts.reversalBoxes = Math.max(1, Math.min(10, Math.round(s.reversalBoxes as number)))
+      const memo = new Map<number, boolean>()
+      return (i: number) => {
+        if (i < 0 || i >= ctx.n) return false
+        const hit = memo.get(i)
+        if (hit !== undefined) return hit
+        const t = ctx.candles[i].time
+        const r = pointFigure(ctx.candles.slice(0, i + 1), opts)
+        const sig = wantTop ? r.buySignal : r.sellSignal
+        const ok = !!sig && sig.at === t && sig.name.startsWith(wantTriple ? 'Triple' : 'Double')
+        memo.set(i, ok)
+        return ok
+      }
+    }
     case 'group': {
       // Member signals each get their own independent prepareSignal test;
       // the group is active at i iff all (op:'and') or any (op:'or') of
@@ -1212,6 +1348,8 @@ const KNOWN_IND_TYPES: Record<string, Set<string>> = {
 const KNOWN_HA = new Set(['flip-up', 'flip-down', 'streak-up', 'streak-down', 'strong-bull', 'strong-bear'])
 const KNOWN_LINE = new Set(['breakout-up', 'breakout-down', 'hh-hl', 'lh-ll'])
 const KNOWN_BAR = new Set(['wide-bull', 'wide-bear'])
+const KNOWN_RENKO = new Set(['flip-up', 'flip-down', 'streak-up', 'streak-down'])
+const KNOWN_PF = new Set(['double-top-breakout', 'double-bottom-breakdown', 'triple-top-breakout', 'triple-bottom-breakdown'])
 
 const clampN = (v: unknown, lo: number, hi: number, d = lo): number => {
   const n = Number(v)
@@ -1292,6 +1430,38 @@ function normalizeOneSignal(s: unknown, depth = 0): SignalDef | null {
     // dir now REQUIRED (see the indicator branch note above)
     if (!dir) return null
     return { kind: 'mtf', factor: Number(o.factor) as 5 | 15, dir, weight }
+  } else if (o.kind === 'renko' && KNOWN_RENKO.has(String(o.variant))) {
+    const variant = String(o.variant) as RenkoSignal['variant']
+    const dflt: Side = variant.endsWith('up') ? 'call' : 'put'
+    const brickSize = Number(o.brickSize)
+    return {
+      kind: 'renko',
+      variant,
+      len: Math.round(clampN(o.len, 1, 10, variant.startsWith('flip') ? 2 : 3)),
+      atrPeriod: Math.round(clampN(o.atrPeriod, 2, 500, 14)),
+      atrMult: clampN(o.atrMult, 0.05, 5, 0.3),
+      // an explicit size only survives when it's a sane positive price delta
+      // - otherwise the ATR rule (the engine default this DSL documents)
+      // applies, so a garbage brickSize degrades to the adaptive sizing
+      // rather than painting a zero-width grid of bricks
+      ...(Number.isFinite(brickSize) && brickSize > 0 ? { brickSize: Math.min(brickSize, 1e6) } : {}),
+      dir: dir ?? dflt,
+      weight,
+    }
+  } else if (o.kind === 'pf' && KNOWN_PF.has(String(o.variant))) {
+    const variant = String(o.variant) as PFSignal['variant']
+    const dflt: Side = variant.includes('top') ? 'call' : 'put'
+    const boxSize = Number(o.boxSize)
+    return {
+      kind: 'pf',
+      variant,
+      atrPeriod: Math.round(clampN(o.atrPeriod, 2, 500, 14)),
+      atrMult: clampN(o.atrMult, 0.05, 5, 0.5),
+      ...(Number.isFinite(boxSize) && boxSize > 0 ? { boxSize: Math.min(boxSize, 1e6) } : {}),
+      reversalBoxes: Math.round(clampN(o.reversalBoxes, 1, 10, 3)),
+      dir: dir ?? dflt,
+      weight,
+    }
   } else if (o.kind === 'builtin' && typeof o.id === 'string' && getStrategy(o.id)) {
     if (!dir) return null
     const params: Record<string, number | string> = {}
