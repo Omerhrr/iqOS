@@ -27,7 +27,7 @@ export type TradeKind = 'binary' | 'turbo' | 'digital' | 'cfd'
 export const TRADE_KINDS: TradeKind[] = ['binary', 'turbo', 'digital', 'cfd']
 export const KIND_LABEL: Record<TradeKind, string> = { binary: 'Binary', turbo: 'Turbo', digital: 'Digital', cfd: 'CFD' }
 
-export type ChartType = 'candles' | 'hollow' | 'heikin' | 'bars' | 'line' | 'area' | 'baseline' | 'renko'
+export type ChartType = 'candles' | 'hollow' | 'heikin' | 'bars' | 'line' | 'area' | 'baseline' | 'renko' | 'pointfigure'
 export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'candles', label: 'Candles' },
   { id: 'hollow', label: 'Hollow' },
@@ -37,6 +37,7 @@ export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'area', label: 'Area' },
   { id: 'baseline', label: 'Baseline' },
   { id: 'renko', label: 'Renko' },
+  { id: 'pointfigure', label: 'P&F' },
 ]
 
 export type AssetCategory = 'forex' | 'crypto' | 'commodity' | 'stock' | 'index'

@@ -568,9 +568,25 @@ export default function OSPage() {
         case 'set_tf':
           if (typeof args?.tf === 'string') setTf(args.tf as Timeframe)
           break
-        case 'set_chart_type':
-          if (typeof args?.chartType === 'string') setChartType(args.chartType as ChartType)
+        case 'set_chart_type': {
+          // normalize + whitelist: the copilot can send aliases ('heikin-ashi',
+          // 'p&f', 'point-and-figure'...) and an unknown id would otherwise
+          // fall through ChartPanel's branches into the baseline chart
+          if (typeof args?.chartType === 'string') {
+            const raw = args.chartType.toLowerCase().replace(/[^a-z0-9]/g, '')
+            const map: Record<string, ChartType> = {
+              candles: 'candles', candlestick: 'candles', candlesticks: 'candles',
+              hollow: 'hollow', hollowcandle: 'hollow', hollowcandles: 'hollow',
+              heikin: 'heikin', heikinashi: 'heikin', ha: 'heikin',
+              bars: 'bars', ohlc: 'bars', ohlcbars: 'bars',
+              line: 'line', area: 'area', baseline: 'baseline',
+              renko: 'renko',
+              pointfigure: 'pointfigure', pointandfigure: 'pointfigure', pnf: 'pointfigure', pf: 'pointfigure',
+            }
+            setChartType(map[raw] ?? 'candles')
+          }
           break
+        }
         case 'add_indicator': {
           const id = String(args?.id ?? '')
           if (!id) break

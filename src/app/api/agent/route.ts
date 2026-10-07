@@ -103,7 +103,7 @@ function trimAnalysis(a: Record<string, unknown>): Record<string, unknown> {
   return out
 }
 
-const CHART_TYPES = ['candles', 'hollow', 'bars', 'line', 'area', 'baseline', 'heikin-ashi', 'renko']
+const CHART_TYPES = ['candles', 'hollow', 'bars', 'line', 'area', 'baseline', 'heikin-ashi', 'renko', 'pointfigure']
 
 // ---------- shared helpers for the composed power tools ----------
 
@@ -1597,7 +1597,7 @@ const TOOLS: ToolSpec[] = [
         TRENDING: {
           fits: ['continuation entries on pullbacks', 'buying dips / selling rips in the trend direction', 'riding the 4-layer synthesis stacks'],
           avoid: ['fading extremes (rsi-reversion, bb-bounce)', 'tight mean-reversion targets against the trend'],
-          strategies: ['ema-trend', 'supertrend-follow', 'donchian-breakout', 'kalman-ou-adaptive-trend', 'vsk-synthesis', 'tsk-synthesis', 'ichimoku-cloud', 'keltner-chandelier', 'mtf-alignment'],
+          strategies: ['ema-trend', 'supertrend-follow', 'donchian-breakout', 'kalman-ou-adaptive-trend', 'vsk-synthesis', 'tsk-synthesis', 'ichimoku-cloud', 'keltner-chandelier', 'mtf-alignment', 'renko-flip', 'pf-breakout'],
           expiryStyle: '1-2 bars of the working tf; give pullbacks room to resolve in trend direction',
         },
         RANGING: {
@@ -1903,6 +1903,7 @@ const TOOLS: ToolSpec[] = [
         line: 'line', lines: 'line', area: 'area', baseline: 'baseline',
         heikinashi: 'heikin-ashi', heikin: 'heikin-ashi', ha: 'heikin-ashi',
         renko: 'renko',
+        pointfigure: 'pointfigure', pointandfigure: 'pointfigure', pnf: 'pointfigure', pf: 'pointfigure', pandf: 'pointfigure',
       }
       // ---- build command queue (inferred from args when cmd is missing) ----
       const queue: { cmd: string; args: Record<string, unknown> }[] = []

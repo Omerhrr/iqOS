@@ -32,6 +32,8 @@ import { listRegistry, computeIndicator, registrySize, getIndicatorDef } from '.
 import { detectChartPatterns } from './src/analytics/chart-patterns'
 import { computeVolumeProfile, computeCandleDelta, computeCumulativeDelta } from './src/analytics/orderflow'
 import { findSmartBlends } from './src/analytics/candlemath'
+import { renkoBricks } from './src/analytics/renko'
+import { pointFigure } from './src/analytics/pointfigure'
 import { buildCalibrationReport, type CalibrationStoreSlice } from './src/analytics/calibration'
 import { computeStepStats, computeIntervalStats } from './src/analytics/randomness'
 import { loadOtcHarvest } from './src/analytics/otcHarvest'
@@ -293,6 +295,73 @@ const httpServer = createServer(async (req, res) => {
         const candles = market.getCandles(asset, t, limit, true)
         const blends = findSmartBlends(candles, { maxGroup })
         return json(200, { ok: true, asset, tf: t, closedOnly: true, raw: candles, blends })
+      }
+
+      // Renko brick engine (analytics/renko.ts): close-based bricks, ATR-sized
+      // by default, 2-brick reversal, honest completion-candle times. Read-only
+      // research surface for strategies ('renko-flip'), agent tools and the
+      // chart's own client-side render.
+      if (path === '/renko') {
+        const t = tfStrict(q.get('tf'))
+        if (t === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+        const asset = q.get('asset') ?? market.activeAsset
+        const limit = Math.min(Number(q.get('limit') ?? 400), 1000)
+        const candles = market.getCandles(asset, t, limit, true)
+        const brickSizeRaw = Number(q.get('brickSize'))
+        const r = renkoBricks(candles, {
+          brickSize: Number.isFinite(brickSizeRaw) && brickSizeRaw > 0 ? brickSizeRaw : undefined,
+          atrPeriod: Math.round(Number(q.get('atrPeriod') ?? 14)) || 14,
+          atrMult: Number(q.get('atrMult') ?? 0.3) || 0.3,
+        })
+        return json(200, {
+          ok: true,
+          asset,
+          tf: t,
+          feed: market.mode,
+          closedOnly: true,
+          brickSize: r.brickSize,
+          brickRule: r.brickRule,
+          timeRule: r.timeRule,
+          trend: r.trend,
+          streak: r.streak,
+          flips: r.flips,
+          count: r.bricks.length,
+          bricks: r.bricks.slice(-160),
+        })
+      }
+
+      // Point & Figure engine (analytics/pointfigure.ts): high/low box counts,
+      // classic 3-box reversal, double/triple top-bottom breakout detection
+      // with real completion-bar timestamps. Feeds 'pf-breakout' + research.
+      if (path === '/pointfigure') {
+        const t = tfStrict(q.get('tf'))
+        if (t === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+        const asset = q.get('asset') ?? market.activeAsset
+        const limit = Math.min(Number(q.get('limit') ?? 400), 1000)
+        const candles = market.getCandles(asset, t, limit, true)
+        const boxSizeRaw = Number(q.get('boxSize'))
+        const pf = pointFigure(candles, {
+          boxSize: Number.isFinite(boxSizeRaw) && boxSizeRaw > 0 ? boxSizeRaw : undefined,
+          atrPeriod: Math.round(Number(q.get('atrPeriod') ?? 14)) || 14,
+          atrMult: Number(q.get('atrMult') ?? 0.5) || 0.5,
+          reversalBoxes: Math.round(Number(q.get('reversal') ?? 3)) || 3,
+        })
+        return json(200, {
+          ok: true,
+          asset,
+          tf: t,
+          feed: market.mode,
+          closedOnly: true,
+          boxSize: pf.boxSize,
+          boxRule: pf.boxRule,
+          reversalBoxes: pf.reversalBoxes,
+          lastDir: pf.lastDir,
+          pattern: pf.pattern,
+          buySignal: pf.buySignal,
+          sellSignal: pf.sellSignal,
+          count: pf.columns.length,
+          columns: pf.columns.slice(-40),
+        })
       }
 
       // Randomness audit: descriptive statistics on the raw price feed

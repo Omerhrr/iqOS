@@ -91,31 +91,119 @@ function renko(candles: Candle[], tfSec: number): Candle[] {
       Math.abs(window[i].low - window[i - 1].close)
     )
   }
-  const brick = Math.max(trSum / Math.max(window.length - 1, 1) * 0.3, 1e-9)
+  const brick = Math.max((trSum / Math.max(window.length - 1, 1)) * 0.3, 1e-9)
   const bricks: Candle[] = []
   let lastClose = window[0].close
   let refPrice = lastClose
-  const end = window[window.length - 1].time
+  // Task 61: HONEST brick times - a brick's time is the open time of the
+  // candle that COMPLETED it (the moment the brick became knowable), not a
+  // fictional countdown from the last candle. When one candle completes
+  // several bricks, extras stagger +1s (renko bricks have no independent
+  // clock; lightweight-charts needs ascending unique times).
   for (const c of window) {
     refPrice = lastClose
+    let painted = 0
     while (c.close >= refPrice + brick) {
-      const t = end - (bricks.length % 400) * tfSec
-      bricks.push({ time: t, open: refPrice, high: refPrice + brick, low: refPrice, close: refPrice + brick, volume: 0 })
+      bricks.push({ time: c.time + painted, open: refPrice, high: refPrice + brick, low: refPrice, close: refPrice + brick, volume: 0 })
+      painted++
       refPrice += brick
       lastClose = refPrice
     }
     while (c.close <= refPrice - brick) {
-      const t = end - (bricks.length % 400) * tfSec
-      bricks.push({ time: t, open: refPrice, high: refPrice, low: refPrice - brick, close: refPrice - brick, volume: 0 })
+      bricks.push({ time: c.time + painted, open: refPrice, high: refPrice, low: refPrice - brick, close: refPrice - brick, volume: 0 })
+      painted++
       refPrice -= brick
       lastClose = refPrice
     }
   }
-  // ensure strictly increasing times
+  // ascending guard (a candle that painted more bricks than its tf has
+  // seconds could collide with the next candle's open time)
   for (let i = 1; i < bricks.length; i++) {
-    if (bricks[i].time <= bricks[i - 1].time) bricks[i].time = bricks[i - 1].time + tfSec
+    if (bricks[i].time <= bricks[i - 1].time) bricks[i].time = bricks[i - 1].time + 1
   }
   return bricks.slice(-300)
+}
+
+/** Point & Figure boxes rendered as pseudo-candles: X boxes paint as up
+ * candles (open=box bottom, close=box top), O boxes as down candles, so the
+ * classic X/O staircase reads straight off the candlestick series. High/low
+ * based, 3-box reversal, absolute box grid - mirrors the kernel engine of
+ * record (mini-services/trading-core/src/analytics/pointfigure.ts). Brick
+ * times are honest: each box carries the open time of the candle that
+ * painted it (+1s stagger for extra boxes in the same candle). */
+function pointFigureChart(candles: Candle[], tfSec: number): Candle[] {
+  if (candles.length < 10) return []
+  const window = candles.slice(-200)
+  // box size = 50% of average true range of the window
+  let trSum = 0
+  for (let i = 1; i < window.length; i++) {
+    trSum += Math.max(
+      window[i].high - window[i].low,
+      Math.abs(window[i].high - window[i - 1].close),
+      Math.abs(window[i].low - window[i - 1].close)
+    )
+  }
+  const box = Math.max((trSum / Math.max(window.length - 1, 1)) * 0.5, 1e-9)
+  const REVERSAL = 3
+  const cells: Candle[] = []
+  let dir: 'X' | 'O' | null = null
+  let top = 0
+  let bottom = 0
+  const paint = (level: number, d: 'X' | 'O', t: number, seq: number) =>
+    cells.push({
+      time: t + seq,
+      open: d === 'X' ? level : level + box,
+      close: d === 'X' ? level + box : level,
+      high: level + box,
+      low: level,
+      volume: 0,
+    })
+  for (const c of window) {
+    const hi = Math.floor(c.high / box)
+    const lo = Math.floor(c.low / box)
+    let painted = 0
+    if (dir === null) {
+      dir = 'X'
+      top = hi
+      bottom = lo
+      for (let lvl = bottom; lvl <= top; lvl++) paint(lvl, 'X', c.time, painted++)
+      continue
+    }
+    if (dir === 'X') {
+      while (hi > top) {
+        top++
+        paint(top, 'X', c.time, painted++)
+      }
+      if (lo <= top - REVERSAL) {
+        // reversal: new O column starts one box below the X top box
+        const newBottom = Math.min(top - REVERSAL, lo)
+        dir = 'O'
+        const newTop = top - 1
+        for (let lvl = newTop; lvl >= newBottom; lvl--) paint(lvl, 'O', c.time, painted++)
+        top = newTop
+        bottom = newBottom
+      }
+    } else {
+      while (lo < bottom) {
+        bottom--
+        paint(bottom, 'O', c.time, painted++)
+      }
+      if (hi >= bottom + REVERSAL) {
+        const newTop = Math.max(bottom + REVERSAL, hi)
+        dir = 'X'
+        const newBottom = bottom + 1
+        for (let lvl = newBottom; lvl <= newTop; lvl++) paint(lvl, 'X', c.time, painted++)
+        bottom = newBottom
+        top = newTop
+      }
+    }
+  }
+  // ascending guard (same rationale as renko)
+  for (let i = 1; i < cells.length; i++) {
+    if (cells[i].time <= cells[i - 1].time) cells[i].time = cells[i - 1].time + 1
+  }
+  void tfSec
+  return cells.slice(-300)
 }
 
 const lineStyleMap: Record<string, LineStyle> = { solid: LineStyle.Solid, dashed: LineStyle.Dashed, dotted: LineStyle.Dotted }
@@ -155,6 +243,7 @@ export default function ChartPanel({
   const displayCandles = useMemo(() => {
     if (chartType === 'heikin') return heikinAshi(candles)
     if (chartType === 'renko') return renko(candles, tfSec)
+    if (chartType === 'pointfigure') return pointFigureChart(candles, tfSec)
     return candles
   }, [candles, chartType, tfSec])
 
@@ -195,7 +284,7 @@ export default function ChartPanel({
         upColor: 'transparent', downColor: DOWN, borderUpColor: UP, borderDownColor: DOWN, wickUpColor: UP, wickDownColor: DOWN,
         priceLineColor: '#38bdf8',
       })
-    } else if (chartType === 'heikin' || chartType === 'renko') {
+    } else if (chartType === 'heikin' || chartType === 'renko' || chartType === 'pointfigure') {
       price = chart.addSeries(CandlestickSeries, {
         upColor: UP, downColor: DOWN, borderUpColor: UP, borderDownColor: DOWN, wickUpColor: UP, wickDownColor: DOWN,
         priceLineColor: '#38bdf8',

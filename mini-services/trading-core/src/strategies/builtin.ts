@@ -11,6 +11,8 @@ import { tskEvaluate, TSK_DEFAULTS } from '../analytics/tsk'
 import { confluenceSignalOnly } from '../analytics/engine'
 import { findPivots } from '../analytics/chart-patterns'
 import { computeCandleDelta, computeCumulativeDelta, computeVolumeProfile } from '../analytics/orderflow'
+import { renkoBricks } from '../analytics/renko'
+import { pointFigure } from '../analytics/pointfigure'
 
 const last = (arr: number[]): number => {
   for (let i = arr.length - 1; i >= 0; i--) if (Number.isFinite(arr[i])) return arr[i]
@@ -1275,6 +1277,71 @@ export const STRATEGIES: StrategyDef[] = [
         return { direction: 'call', score, notes: `new ${lookback}b price low, cumulative delta (approx) failed to confirm - bullish divergence` }
       }
       return { direction: 'none', score: 0, notes: 'no qualifying price/delta divergence this bar' }
+    },
+  },
+  {
+    id: 'renko-flip',
+    name: 'Renko Brick Flip',
+    description:
+      'Close-based renko with ATR-sized bricks (2-brick reversal rule): CALL on a fresh flip to up bricks, PUT on a fresh flip to down. Fires only while the new trend is young (confirm bricks), then stands aside until the next flip - noise-averaged by construction, no time noise.',
+    params: [
+      { key: 'atrPeriod', label: 'ATR period (brick sizing)', type: 'number', min: 5, max: 50, default: 14 },
+      { key: 'atrMult', label: 'Brick = ATR x', type: 'number', min: 0.1, max: 1, step: 0.05, default: 0.3 },
+      { key: 'confirm', label: 'Confirm bricks', type: 'number', min: 1, max: 3, default: 1 },
+    ],
+    evaluate: (candles, p) => {
+      if (candles.length < 40) return { direction: 'none', score: 0, notes: 'warming up (<40 bars)' }
+      const r = renkoBricks(candles, { atrPeriod: num(p, 'atrPeriod', 14), atrMult: num(p, 'atrMult', 0.3) })
+      const b = r.bricks
+      if (b.length < 4) {
+        return { direction: 'none', score: 0, notes: `only ${b.length} bricks @ box ${(r.brickSize * 1e4).toFixed(1)}p - raise atrMult for this tape` }
+      }
+      const lastDir = b[b.length - 1].dir
+      let streak = 0
+      for (let i = b.length - 1; i >= 0 && b[i].dir === lastDir; i--) streak++
+      if (streak > num(p, 'confirm', 1)) {
+        return { direction: 'none', score: 0, notes: `${lastDir > 0 ? 'up' : 'down'} run ${streak} bricks old - awaiting next flip` }
+      }
+      const score = clamp(55 + 15 * streak, 55, 90)
+      return {
+        direction: lastDir > 0 ? 'call' : 'put',
+        score,
+        notes: `brick flip ${lastDir > 0 ? 'UP' : 'DOWN'} x${streak} (${b.length} bricks, ${r.flips} flips, box ${(r.brickSize * 1e4).toFixed(1)}p)`,
+      }
+    },
+  },
+  {
+    id: 'pf-breakout',
+    name: 'P&F Breakout',
+    description:
+      "Classic high/low point & figure (ATR-sized boxes, 3-box reversal): CALL on a double/triple-top X breakout, PUT on a double/triple-bottom O breakdown. Fires only on the bar that painted the breakout box - stale patterns stand aside.",
+    params: [
+      { key: 'atrPeriod', label: 'ATR period (box sizing)', type: 'number', min: 5, max: 50, default: 14 },
+      { key: 'atrMult', label: 'Box = ATR x', type: 'number', min: 0.1, max: 1, step: 0.05, default: 0.5 },
+      { key: 'reversal', label: 'Reversal boxes', type: 'number', min: 2, max: 5, default: 3 },
+    ],
+    evaluate: (candles, p) => {
+      if (candles.length < 40) return { direction: 'none', score: 0, notes: 'warming up (<40 bars)' }
+      const pf = pointFigure(candles, {
+        atrPeriod: num(p, 'atrPeriod', 14),
+        atrMult: num(p, 'atrMult', 0.5),
+        reversalBoxes: num(p, 'reversal', 3),
+      })
+      if (pf.columns.length < 4) {
+        return { direction: 'none', score: 0, notes: `only ${pf.columns.length} columns @ box ${(pf.boxSize * 1e4).toFixed(1)}p - lower atrMult for this tape` }
+      }
+      const pat = pf.pattern
+      if (!pat) return { direction: 'none', score: 0, notes: `no top/bottom pattern yet (${pf.columns.length} columns)` }
+      if (pat.at !== candles[candles.length - 1].time) {
+        return { direction: 'none', score: 0, notes: `${pat.name} completed on an earlier bar - stale` }
+      }
+      const triple = pat.name.startsWith('Triple')
+      const score = clamp(60 + (triple ? 15 : 0) + (pat.direction === (pf.lastDir === 'X' ? 'call' : 'put') ? 5 : 0), 60, 95)
+      return {
+        direction: pat.direction,
+        score,
+        notes: `${pat.name} (${pf.columns.length} columns, box ${(pf.boxSize * 1e4).toFixed(1)}p, ${pf.reversalBoxes}-box reversal)`,
+      }
     },
   },
 ]
