@@ -450,7 +450,6 @@ export default function ChartPanel({
 
   // ---------- Task 63: fetched chart data + custom-canvas refs ----------
   const [tickBarsState, setTickBarsState] = useState<TickBarRow[]>([])
-  const [ticksMeta, setTicksMeta] = useState<{ dataSource: 'tick' | 'candle'; per: number } | null>(null)
   const [ivhvState, setIvhvState] = useState<IvHvResponse | null>(null)
   const [otcState, setOtcState] = useState<OtcFootprintResult | null>(null)
   const customCanvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -469,10 +468,9 @@ export default function ChartPanel({
         .then((r) => {
           if (dead || !r?.ok) return
           setTickBarsState(r.bars ?? [])
-          setTicksMeta({ dataSource: r.dataSource, per: r.per })
         })
         .catch(() => {
-          // keep last good data; badge shows what it came from
+          // keep last good data
         })
     }
     pull()
@@ -634,7 +632,7 @@ export default function ChartPanel({
         pane?.setStretchFactor(1)
         chart.panes()[0]?.setStretchFactor(3)
       } catch {
-        // pane API unavailable -> ivhv degrades to plain candles + badge
+        // pane API unavailable -> ivhv degrades to plain candles
       }
     }
 
@@ -726,7 +724,7 @@ export default function ChartPanel({
         const highs = clusters.map((c) => c.high)
         const pLo = Math.min(...lows)
         const pHi = Math.max(...highs)
-        const padT = 26
+        const padT = 12
         const padB = 20
         const y = (p: number) => padT + ((pHi - p) / Math.max(pHi - pLo, 1e-12)) * (H - padT - padB)
         const colW = 58
@@ -765,9 +763,6 @@ export default function ChartPanel({
           ctx.fillStyle = cl.delta >= 0 ? UP : DOWN
           ctx.fillText(`${cl.delta >= 0 ? '+' : ''}${Math.round(cl.delta)}`, cx, H - 6)
         }
-        ctx.fillStyle = TEXT
-        ctx.textAlign = 'left'
-        ctx.fillText('footprint - volume (approx), CLV split - green buy / red sell, cyan box POC, outline imbalance', 8, 12)
       } else if (chartType === 'otcfootprint') {
         // OTC velocity footprint: per-minute price-row matrix of the
         // generator's own print stream - left cell = down-ticks at that level
@@ -788,7 +783,7 @@ export default function ChartPanel({
         const allRows = vis.flatMap((b) => b.rows)
         const pLo = allRows.length ? Math.min(...allRows.map((r) => r.price)) : Math.min(...vis.map((b) => b.low))
         const pHi = allRows.length ? Math.max(...allRows.map((r) => r.price)) : Math.max(...vis.map((b) => b.high))
-        const padT = 30
+        const padT = 18
         const padB = 28
         const y = (p: number) => padT + ((pHi - p) / Math.max(pHi - pLo, 1e-12)) * (H - padT - padB)
         const maxTotal = Math.max(...allRows.map((r) => r.total), 1)
@@ -864,18 +859,13 @@ export default function ChartPanel({
           ctx.fillStyle = b.velDelta > 0 ? UP : b.velDelta < 0 ? DOWN : TEXT
           ctx.fillText(`${b.velDelta >= 0 ? '+' : ''}${b.velDelta}`, cx, H - 5)
         }
-        ctx.font = '10px var(--font-geist-mono), monospace'
-        ctx.fillStyle = TEXT
-        ctx.textAlign = 'left'
-        const src = otcState ? ` - ${otcState.dataSource}${otcState.cadenceMs !== null ? ` · ${otcState.cadenceMs}ms capture` : ''}` : ''
-        ctx.fillText(`OTC velocity footprint - dn count·ms / up count·ms per row, amber box bucket POC${src}`, 8, 12)
       } else {
         // TPO: left = close path for time orientation, right = profile
         const prof = tpoProfile(candles.slice(-400))
         if (!prof.bins.length) return
         const pLo = prof.bins[0].priceLow
         const pHi = prof.bins[prof.bins.length - 1].priceHigh
-        const padT = 26
+        const padT = 12
         const padB = 20
         const profileW = Math.min(190, W * 0.32)
         const chartW = W - profileW - 24
@@ -931,9 +921,6 @@ export default function ChartPanel({
           ctx.lineTo(chartW + 30, y(prof.ibLow))
           ctx.stroke()
         }
-        ctx.fillStyle = TEXT
-        ctx.textAlign = 'left'
-        ctx.fillText(`TPO ${prof.periodRule} - VA70 shaded, amber = initial balance, single print/period`, 8, 12)
       }
     }
 
@@ -1152,31 +1139,6 @@ export default function ChartPanel({
   const lastCandle = candles[candles.length - 1]
   const lastUp = lastCandle ? lastCandle.close >= lastCandle.open : true
 
-  // honesty badge per Task 63 chart type - provenance always visible
-  const tpoBadge = useMemo(() => (chartType === 'tpo' && candles.length ? tpoProfile(candles.slice(-400)) : null), [chartType, candles])
-  const badge = useMemo(() => {
-    switch (chartType) {
-      case 'rangebars':
-        return 'range bars - close-chained, ATR(window) x 0.5, wickless by construction'
-      case 'volumebars':
-        return 'volume bars - auto per, volume (approx), real clock'
-      case 'footprint':
-        return 'footprint - volume (approx), CLV buy/sell proxy (no bid/ask feed)'
-      case 'tpo':
-        return tpoBadge ? `TPO ${tpoBadge.periodRule} - POC ${fmtPrice(tpoBadge.poc ?? 0, digitsTicker)} - VA ${fmtPrice(tpoBadge.vaLow ?? 0, digitsTicker)}~${fmtPrice(tpoBadge.vaHigh ?? 0, digitsTicker)}` : 'TPO'
-      case 'tickchart':
-        return ticksMeta ? `tick chart ${ticksMeta.per}/bar - ${ticksMeta.dataSource === 'tick' ? 'real 100ms capture' : 'PSEUDO-TICKS (5s closes), not raw tick data'}` : 'tick chart - loading...'
-      case 'ivhv':
-        return ivhvState ? `HV ${Number.isFinite(ivhvState.hvNow) ? ivhvState.hvNow.toFixed(1) : '?'}% - IV proxy (${ivhvState.ivSource}): payout breakeven - realized up ${ivhvState.realizedUpProbPct.toFixed(0)}%` : 'IV/HV - loading...'
-      case 'otcfootprint':
-        return otcState
-          ? `OTC velocity footprint - ${otcState.dataSource}${otcState.cadenceMs !== null ? ` · ${otcState.cadenceMs}ms capture` : ''} - reads the generator's prints, not volume`
-          : 'OTC velocity footprint - waiting for tick buffer...'
-      default:
-        return null
-    }
-  }, [chartType, ticksMeta, ivhvState, tpoBadge, digitsTicker, otcState])
-
   // zoom controls: scale the visible logical range around its center
   const zoomBy = (factor: number) => {
     const ts = chartRef.current?.timeScale()
@@ -1220,11 +1182,6 @@ export default function ChartPanel({
       </div>
 
       <div ref={elRef} className="min-h-0 flex-1" />
-      {badge && (
-        <div className="absolute right-[64px] top-1.5 z-[6] max-w-[72%] truncate rounded border border-[#1c2739] bg-[#0d1420]/90 px-2 py-0.5 text-[10px] font-mono text-[#7c8aa5]" title={badge}>
-          {badge}
-        </div>
-      )}
       {(chartType === 'footprint' || chartType === 'tpo' || chartType === 'otcfootprint') && (
         <div className="absolute inset-x-0 bottom-[30px] top-0 z-[5] bg-[#0b111c]">
           <canvas ref={customCanvasRef} className="block h-full w-full" />
