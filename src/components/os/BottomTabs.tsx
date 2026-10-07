@@ -34,6 +34,8 @@ import { FullscreenBackdrop, FullscreenButton } from './FullscreenButton'
 interface BottomTabsProps {
   asset: string
   tf: Timeframe
+  /** Task 59: bumps on every closed candle - keeps the order-flow views fresh */
+  closedTick?: number
   analysis: AnalysisResult | null
   positions: Position[]
   history: Position[]
@@ -54,7 +56,7 @@ interface BottomTabsProps {
 }
 
 export default function BottomTabs(props: BottomTabsProps) {
-  const { positions, history, alerts, patterns, price, prices, asset, refreshPositions, onError } = props
+  const { positions, history, alerts, patterns, price, prices, asset, refreshPositions, onError, closedTick } = props
   const [full, setFull] = useState(false)
 
   const closePos = async (id: string) => {
@@ -335,7 +337,7 @@ export default function BottomTabs(props: BottomTabsProps) {
       </TabsContent>
 
       <TabsContent value="orderflow" className="mt-0 min-h-0 flex-1 overflow-auto">
-        <OrderFlowPanel asset={asset} tf={props.tf} />
+        <OrderFlowPanel asset={asset} tf={props.tf} closedTick={closedTick} />
       </TabsContent>
 
       {/* PATTERNS */}

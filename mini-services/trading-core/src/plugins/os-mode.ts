@@ -100,7 +100,7 @@ export interface AutoTraderConfig {
   zEntry: number // kalman-ou source: |z| (stationary sigmas) required to enter
   maxHalfLife: number // kalman-ou source: skip pairs reverting slower than this (bars)
   requireValidation: boolean // kalman-ou source: only trade pairs whose walk-forward verdict is robust
-  minPUp: number // markov source: decisive next-up probability (call at >=, put at <= 1-)
+  minPUp: number // markov source: decisive next-move probability (call when P(up) >=, put when P(down) >=)
   minAdx: number // momentum source: minimum trend strength (ADX)
   /** strategy source: id from the combined Strategy Lab catalog - a builtin
    * strategy id (e.g. "ema-cross", "confluence-full") or an AI Lab-learned
@@ -683,8 +683,11 @@ export class ModeService {
       return this.standDown(`daily loss limit hit (-$${Math.abs(this.rt.pnlToday).toFixed(2)})`)
     if (this.rt.openCount >= this.config.maxOpen)
       return this.standDown(`max open auto positions (${this.rt.openCount}/${this.config.maxOpen})`)
+    // Task 59: this used to be a SILENT return - the trader looked armed but
+    // nothing surfaced why. A STATIC reason (no countdown) keeps the
+    // standDown dedupe from spamming one alert per tick.
     if (this.config.paceSec > 0 && this.rt.lastTradeTs > 0 && this.now() - this.rt.lastTradeTs < this.config.paceSec)
-      return
+      return this.standDown(`pacing: minimum ${this.config.paceSec}s between trades not yet elapsed`)
 
     // source signals: ranked screener feed first, liquid on-demand eval while the sweep warms up
     // (pickSignal already applies per-asset cooldowns + one-auto-position-per-asset)
@@ -1029,11 +1032,17 @@ export class ModeService {
         try {
           const r = screener.evaluate(asset, this.config.tf)
           if (r.regime === 'chop') continue // the chain has no edge in chop
+          // Task 59 (P1): the put trigger was `pUp <= 1 - minPUp` - but in a
+          // 5-state chain 1-pUp = P(down)+P(flat), so a flat-heavy row with
+          // almost no down mass fired PUTs, and with the chain's true neutral
+          // near 0.36 puts triggered at 0.42 while calls needed 0.58
+          // (systematic put bias). Gate each side on ITS OWN probability.
+          const pDown = Number.isFinite(r.pDown) ? r.pDown : 1 - r.pUp // rows always carry pDown; guard legacy rows
           const dir: 'call' | 'put' | 'none' =
-            r.pUp >= this.config.minPUp ? 'call' : r.pUp <= 1 - this.config.minPUp ? 'put' : 'none'
+            r.pUp >= this.config.minPUp ? 'call' : pDown >= this.config.minPUp ? 'put' : 'none'
           if (dir === 'none') continue
           if (this.config.direction !== 'both' && dir !== this.config.direction) continue
-          const edge = Math.abs(r.pUp - 0.5) * 2 // 0..1 decisiveness of the forecast
+          const edge = clamp((dir === 'call' ? r.pUp - 0.5 : pDown - 0.5) * 2, 0, 1) // 0..1 decisiveness of the forecast, symmetric now
           const score = Math.round(clamp(40 + edge * 60 + (r.regime === 'bull' || r.regime === 'bear' ? 8 : 0), 40, 95))
           const confidence = Math.round(clamp(36 + edge * 55 + r.adx * 0.35, 35, 95))
           if (score < this.config.minScore) continue
@@ -1141,6 +1150,7 @@ export class ModeService {
       direction: row.direction,
       confidence: row.confidence,
       pUp: 0,
+      pDown: 0,
       regime: 'range',
       ouZ: 0,
       ouHalfLife: 0,
@@ -1703,6 +1713,7 @@ export class ModeService {
       direction,
       confidence: Math.round(clamp(confidenceOverride ?? Math.abs(score), 0, 100)),
       pUp: 0,
+      pDown: 0,
       regime: 'range',
       ouZ: 0,
       ouHalfLife: 0,
@@ -1783,7 +1794,8 @@ export class ModeService {
    */
   async validateOU(asset: string, tf: Timeframe): Promise<OUVerdict> {
     const market = this.ctx.use<MarketDataService>('market')
-    const candles = market.getCandlesDeep(asset, tf, 2200)
+    // Task 59 (P1): closedOnly - validation must match the backtest engine's input.
+    const candles = market.getCandlesDeep(asset, tf, 2200, true)
     if (candles.length < 700) throw new Error(`not enough history for ${asset} ${tf} (${candles.length} bars)`)
     const result = walkForward(candles, asset, tf, {
       strategy: 'kalman-ou-reversion',
@@ -2376,7 +2388,7 @@ export class ModeService {
       this.config.signalSource === 'kalman-ou'
         ? ` (z ≥ ${this.config.zEntry}σ · HL ≤ ${this.config.maxHalfLife}b${this.config.requireValidation ? ' · walk-forward validated' : ''})`
         : this.config.signalSource === 'markov'
-          ? ` (P(up) ≥ ${(this.config.minPUp * 100).toFixed(0)}% / ≤ ${((1 - this.config.minPUp) * 100).toFixed(0)}%)`
+          ? ` (P(up)/P(down) ≥ ${(this.config.minPUp * 100).toFixed(0)}% - Task 59: put side gates on P(down), not 1-P(up))`
           : this.config.signalSource === 'momentum'
             ? ` (ADX ≥ ${this.config.minAdx})`
             : this.config.signalSource === 'confluence'

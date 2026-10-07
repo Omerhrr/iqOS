@@ -1709,6 +1709,17 @@ export function useOSFeed(asset: string, tf: Timeframe, handlers: OSFeedHandlers
   const socketRef = useRef<Socket | null>(null)
   const handlersRef = useRef(handlers)
 
+  // Task 59 (P2): the socket effect below has [] deps, so its `connect`
+  // handler closes over the FIRST render's asset/tf - on every reconnect it
+  // re-subscribed the mount-time pair, silently freezing the feed for the
+  // pair the user is actually viewing (page-level guards kept data clean,
+  // but the active pair got no live events until re-picked). Route the
+  // reconnect subscribe through a ref of the CURRENT pair.
+  const pairRef = useRef({ asset, tf })
+  useEffect(() => {
+    pairRef.current = { asset, tf }
+  }, [asset, tf])
+
   useEffect(() => {
     handlersRef.current = handlers
   }, [handlers])
@@ -1734,7 +1745,7 @@ export function useOSFeed(asset: string, tf: Timeframe, handlers: OSFeedHandlers
 
     socket.on('connect', () => {
       handlersRef.current.onConnectChange?.(true)
-      socket.emit('subscribe', { asset, tf })
+      socket.emit('subscribe', { asset: pairRef.current.asset, tf: pairRef.current.tf })
     })
     socket.on('disconnect', () => handlersRef.current.onConnectChange?.(false))
     socket.on('tick', (p) => handlersRef.current.onTick?.(p))

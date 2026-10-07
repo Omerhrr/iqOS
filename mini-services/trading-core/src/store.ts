@@ -177,6 +177,8 @@ export class Store {
       `ALTER TABLE positions ADD COLUMN entry_score REAL`,
       `ALTER TABLE positions ADD COLUMN entry_confidence REAL`,
       `ALTER TABLE positions ADD COLUMN entry_p_up REAL`,
+      // Task 59: put-side calibration probability (see types.ts entryPDown)
+      `ALTER TABLE positions ADD COLUMN entry_p_down REAL`,
       `ALTER TABLE positions ADD COLUMN entry_regime TEXT`,
       // entry_session: which trading session (ASIA/LONDON/OVERLAP/NEWYORK/OFF)
       // was active at entry - lets the adaptive gate learn "this setup only
@@ -343,13 +345,13 @@ export class Store {
 
   insertPosition(p: Position): void {
     this.db.run(
-      `INSERT INTO positions (id, ts_open, asset, tf, side, kind, mode, amount, expiry_bars, entry_price, payout, status, strategy, note, live_order_id, settles_at, leverage, tp, sl, strike, expiry_sec, entry_score, entry_confidence, entry_p_up, entry_regime, entry_session)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO positions (id, ts_open, asset, tf, side, kind, mode, amount, expiry_bars, entry_price, payout, status, strategy, note, live_order_id, settles_at, leverage, tp, sl, strike, expiry_sec, entry_score, entry_confidence, entry_p_up, entry_p_down, entry_regime, entry_session)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         p.id, p.tsOpen, p.asset, p.tf, p.side, p.kind, p.mode, p.amount, p.expiryBars, p.entryPrice, p.payout, p.status,
         p.strategy ?? null, p.note ?? null, p.liveOrderId ?? null, p.settlesAt ?? null,
         p.leverage ?? null, p.tp ?? null, p.sl ?? null, p.strike ?? null, p.expirySec ?? null,
-        p.entryScore ?? null, p.entryConfidence ?? null, p.entryPUp ?? null, p.entryRegime ?? null, p.entrySession ?? null,
+        p.entryScore ?? null, p.entryConfidence ?? null, p.entryPUp ?? null, p.entryPDown ?? null, p.entryRegime ?? null, p.entrySession ?? null,
       ]
     )
   }
@@ -462,6 +464,7 @@ export class Store {
       entryScore: (r.entry_score as number) ?? undefined,
       entryConfidence: (r.entry_confidence as number) ?? undefined,
       entryPUp: (r.entry_p_up as number) ?? undefined,
+      entryPDown: (r.entry_p_down as number) ?? undefined,
       entryRegime: (r.entry_regime as string) ?? undefined,
       entrySession: (r.entry_session as string) ?? undefined,
     }

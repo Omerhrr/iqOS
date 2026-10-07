@@ -57,11 +57,14 @@ export default function SignalPanel({ analysis }: { analysis: AnalysisResult | n
           />
         </div>
         <div className="mt-1 flex justify-between text-[10px] font-mono text-[#4b5a72]">
-          <span className="text-rose-400">PUT -100</span>
+          {/* Task 59 (P3): the engine's vote caps make ±100 unreachable
+              (practical max ≈ ±85) - the old labels advertised a scale the
+              score can never reach. */}
+          <span className="text-rose-400">strong PUT</span>
           <span style={{ color: scoreColor(score) }} className="font-bold">
             score {score.toFixed(0)} · conf {confidence.toFixed(0)}%
           </span>
-          <span className="text-emerald-400">+100 CALL</span>
+          <span className="text-emerald-400">strong CALL</span>
         </div>
       </div>
 

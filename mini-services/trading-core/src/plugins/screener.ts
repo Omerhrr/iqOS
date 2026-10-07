@@ -23,6 +23,7 @@ export interface ScreenRow {
   direction: 'call' | 'put' | 'none'
   confidence: number
   pUp: number
+  pDown: number // Task 59: P(next move is down) - put-side gate uses this, NOT 1-pUp (flat mass)
   regime: 'bull' | 'bear' | 'range' | 'chop'
   ouZ: number // Kalman/OU stretch: sigmas from the OU equilibrium
   ouHalfLife: number // OU mean-reversion half-life in bars (9999 = effectively none)
@@ -183,7 +184,9 @@ export class ScreenerService {
     // bricked the screener ({ok:true} back, sweep "completes", rows empty
     // forever). Fetch what the config actually asks for.
     const need = Math.min(700, Math.max(300, this.config.minCandles))
-    const candles = this.market.getCandles(asset, tf, need)
+    // Task 59 (P1): closedOnly - the screener fed the just-opened forming bar
+    // into every snapshot (mid-bar anchor), diverging from backtests and bots.
+    const candles = this.market.getCandles(asset, tf, need, true)
     if (candles.length < this.config.minCandles) throw new Error(`thin history ${asset} ${tf}`)
     const snap = scanSnapshot(candles, asset, tf)
     const inst = this.market.assets.find((a) => a.ticker === asset)
@@ -198,6 +201,7 @@ export class ScreenerService {
       direction: snap.direction,
       confidence: Math.round(snap.confidence),
       pUp: Math.round(snap.probUp * 1000) / 1000,
+      pDown: Math.round(snap.probDown * 1000) / 1000,
       regime: snap.regime,
       ouZ: Math.round(snap.ouZ * 100) / 100,
       ouHalfLife: Math.round(snap.ouHalfLife * 10) / 10,

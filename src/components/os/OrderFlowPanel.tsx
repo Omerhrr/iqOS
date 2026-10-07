@@ -7,8 +7,11 @@
 // depth for any instrument this OS trades. Everything rendered here is a
 // best-effort APPROXIMATION derived from OHLCV candles (close-location-value
 // buy/sell split - see trading-core/src/analytics/orderflow.ts for the exact
-// method). This is a manual-analysis / visualization tool only - it is not
-// wired into strategies, backtests or autopilot.
+// method). Task 59 correction: this IS wired into strategies - the builtin
+// volume-profile family, delta-divergence, and the custom of* signals all read
+// the same approximation (each labeled "(approx)"). The kernel serves
+// CLOSED candles only for these routes (closedOnly: true) - the forming bar
+// is excluded so nothing repaints mid-bar.
 import { useEffect, useMemo, useState } from 'react'
 import type { CandleDelta, CumulativeDeltaPoint, Timeframe, VolumeProfileResult } from '@/lib/os/client'
 import { fmtPrice, getDelta, getVolumeProfile } from '@/lib/os/client'
@@ -16,6 +19,10 @@ import { fmtPrice, getDelta, getVolumeProfile } from '@/lib/os/client'
 interface OrderFlowPanelProps {
   asset: string
   tf: Timeframe
+  /** Increments on every closed candle for the current pair (Task 59) - the
+   * delta/profile views used to fetch ONCE per asset/tf and sit frozen next
+   * to a live chart. */
+  closedTick?: number
 }
 
 function ApproxTag({ title }: { title?: string }) {
@@ -29,7 +36,7 @@ function ApproxTag({ title }: { title?: string }) {
   )
 }
 
-function VolumeProfileView({ asset, tf }: OrderFlowPanelProps) {
+function VolumeProfileView({ asset, tf, closedTick }: OrderFlowPanelProps) {
   const [profile, setProfile] = useState<VolumeProfileResult | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -51,7 +58,7 @@ function VolumeProfileView({ asset, tf }: OrderFlowPanelProps) {
     return () => {
       cancelled = true
     }
-  }, [asset, tf])
+  }, [asset, tf, closedTick])
 
   const chart = useMemo(() => {
     if (!profile || profile.levels.length === 0) return null
@@ -137,7 +144,7 @@ function Legend({ label, color, value }: { label: string; color: string; value: 
 // Exported standalone so it can be reused outside the full Order Flow tab
 // (e.g. the Markov/Delta switcher next to Confluence Signal) without pulling
 // in Volume Profile or the tab chrome around it.
-export function DeltaFootprintView({ asset, tf, large = false }: OrderFlowPanelProps & { large?: boolean }) {
+export function DeltaFootprintView({ asset, tf, large = false, closedTick }: OrderFlowPanelProps & { large?: boolean }) {
   const [deltas, setDeltas] = useState<CandleDelta[]>([])
   const [cumulative, setCumulative] = useState<CumulativeDeltaPoint[]>([])
   const [error, setError] = useState<string | null>(null)
@@ -162,7 +169,7 @@ export function DeltaFootprintView({ asset, tf, large = false }: OrderFlowPanelP
     return () => {
       cancelled = true
     }
-  }, [asset, tf])
+  }, [asset, tf, closedTick])
 
   const chart = useMemo(() => {
     if (deltas.length === 0) return null
@@ -232,13 +239,14 @@ export function DeltaFootprintView({ asset, tf, large = false }: OrderFlowPanelP
       <p className="text-[9px] leading-relaxed text-[#4b5a72]">
         Buy/sell volume per candle is approximated from where price closed within the candle&apos;s high-low range (close-location-value), since
         IQ Option does not provide real bid/ask-tagged trades. Green = net approximated buying pressure, red = net approximated selling
-        pressure. The line below is the running sum of that delta over time.
+        pressure. The line below is the running sum of that delta over the last {chart.n} CLOSED candles - its baseline shifts as the window
+        slides, so read the SLOPE, not the absolute level. The forming candle is excluded (nothing repaints mid-bar); refreshes on every close.
       </p>
     </div>
   )
 }
 
-export default function OrderFlowPanel({ asset, tf }: OrderFlowPanelProps) {
+export default function OrderFlowPanel({ asset, tf, closedTick }: OrderFlowPanelProps) {
   const [view, setView] = useState<'profile' | 'delta'>('profile')
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -263,7 +271,7 @@ export default function OrderFlowPanel({ asset, tf }: OrderFlowPanelProps) {
         <span className="ml-auto text-[9px] text-[#3d4c66]">{asset} · {tf}</span>
       </div>
       <div className="min-h-0 flex-1 overflow-auto">
-        {view === 'profile' ? <VolumeProfileView asset={asset} tf={tf} /> : <DeltaFootprintView asset={asset} tf={tf} />}
+        {view === 'profile' ? <VolumeProfileView asset={asset} tf={tf} closedTick={closedTick} /> : <DeltaFootprintView asset={asset} tf={tf} closedTick={closedTick} />}
       </div>
     </div>
   )

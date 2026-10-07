@@ -91,6 +91,15 @@ const httpServer = createServer(async (req, res) => {
     const v = (name ?? '1m') as Timeframe
     return (ALL_TIMEFRAMES as string[]).includes(v) ? v : '1m'
   }
+  // Task 59 (P3): the lenient tf() silently coerced ANY garbage tf to '1m' -
+  // a typo'd query param returned wrong-timeframe data with HTTP 200. The
+  // strict variant returns null for garbage; read/decision routes 400 on it.
+  const tfStrict = (name: string | null): Timeframe | null => {
+    const v = name ?? '1m'
+    return (ALL_TIMEFRAMES as string[]).includes(v) ? (v as Timeframe) : null
+  }
+  const tfErr = (name: string | null) =>
+    `invalid tf "${name ?? ''}" - expected one of ${ALL_TIMEFRAMES.join(', ')}`
   // Resolves a "custom:<slug>" AI Lab strategy id to its CustomSpec, the
   // same lab.get()->normalizeSpec() path StrategyLabService.runStrategy
   // uses, so the Backtest Lab's Single-Run/Optimizer/Walk-Forward/Asset-
@@ -247,35 +256,43 @@ const httpServer = createServer(async (req, res) => {
       // Order flow approximation (no real bid/ask-tagged trades are available
       // from IQ Option - see analytics/orderflow.ts header for the method).
       if (path === '/volume_profile') {
+        const t = tfStrict(q.get('tf'))
+        if (t === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
         const asset = q.get('asset') ?? market.activeAsset
-        const timeframe = tf(q.get('tf'))
         const limit = Math.min(Number(q.get('limit') ?? 400), 1000)
         const bucketCount = q.get('buckets') ? Number(q.get('buckets')) : undefined
-        const candles = market.getCandles(asset, timeframe, limit)
-        return json(200, { ok: true, asset, tf: timeframe, approx: true, profile: computeVolumeProfile(candles, { bucketCount }) })
+        // Task 59 (P3): closedOnly - the forming bar made the POC/value-area
+        // repaint on every tick.
+        const candles = market.getCandles(asset, t, limit, true)
+        return json(200, { ok: true, asset, tf: t, approx: true, profile: computeVolumeProfile(candles, { bucketCount }) })
       }
 
       if (path === '/delta') {
+        const t = tfStrict(q.get('tf'))
+        if (t === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
         const asset = q.get('asset') ?? market.activeAsset
-        const timeframe = tf(q.get('tf'))
         const limit = Math.min(Number(q.get('limit') ?? 400), 1000)
-        const candles = market.getCandles(asset, timeframe, limit)
+        // Task 59 (P3): closedOnly - the last delta bar used to include the
+        // forming candle and repaint continuously, unmarked.
+        const candles = market.getCandles(asset, t, limit, true)
         const deltas = computeCandleDelta(candles)
         const cumulative = computeCumulativeDelta(deltas)
-        return json(200, { ok: true, asset, tf: timeframe, approx: true, deltas, cumulative })
+        return json(200, { ok: true, asset, tf: t, approx: true, closedOnly: true, deltas, cumulative })
       }
 
       // Candle Math (candle blending / candlestick algebra) - see
       // analytics/candlemath.ts header for the exact blend rule and the
       // pattern-confirmed "smart grouping" heuristic.
       if (path === '/candle_math') {
+        const t = tfStrict(q.get('tf'))
+        if (t === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
         const asset = q.get('asset') ?? market.activeAsset
-        const timeframe = tf(q.get('tf'))
         const limit = Math.min(Number(q.get('limit') ?? 200), 1000)
         const maxGroup = q.get('maxGroup') ? Math.max(2, Math.min(6, Number(q.get('maxGroup')))) : undefined
-        const candles = market.getCandles(asset, timeframe, limit)
+        // Task 59 (P3): closedOnly - blends anchored on the forming bar repaint.
+        const candles = market.getCandles(asset, t, limit, true)
         const blends = findSmartBlends(candles, { maxGroup })
-        return json(200, { ok: true, asset, tf: timeframe, raw: candles, blends })
+        return json(200, { ok: true, asset, tf: t, closedOnly: true, raw: candles, blends })
       }
 
       // Randomness audit: descriptive statistics on the raw price feed
@@ -589,9 +606,10 @@ const httpServer = createServer(async (req, res) => {
       }
 
       if (path === '/analysis') {
+        const t = tfStrict(q.get('tf'))
+        if (t === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
         const asset = q.get('asset') ?? market.activeAsset
-        const timeframe = tf(q.get('tf'))
-        const result = analytics.analyze(asset, timeframe, q.get('force') === '1')
+        const result = analytics.analyze(asset, t, q.get('force') === '1')
         return json(200, { ok: true, analysis: result })
       }
 
@@ -619,6 +637,7 @@ const httpServer = createServer(async (req, res) => {
                   direction: a.signal.direction,
                   confidence: Math.round(a.signal.confidence),
                   pUp: Math.round(a.markov.probUp * 1000) / 1000,
+                  pDown: Math.round(a.markov.probDown * 1000) / 1000,
                   regime: a.markov.regime,
                   rsi: Math.round(a.indicators.rsi * 10) / 10,
                   hurst: Math.round(a.quant.hurst * 100) / 100,
@@ -771,9 +790,10 @@ const httpServer = createServer(async (req, res) => {
 
 
       if (path === '/signal') {
+        const t = tfStrict(q.get('tf'))
+        if (t === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
         const asset = q.get('asset') ?? market.activeAsset
-        const timeframe = tf(q.get('tf'))
-        const a = analytics.analyze(asset, timeframe)
+        const a = analytics.analyze(asset, t)
         return json(200, { ok: true, signal: a.signal })
       }
 

@@ -153,8 +153,13 @@ function buildFactors(
   const factors: Factor[] = []
 
   // --- Trend group ---
+  // Task 59 (P2): ema200 is NaN until 200 closes - `ema50 > NaN` is false,
+  // which silently cast a -1 (bearish) vote on every young instrument. A
+  // not-yet-computed EMA is a NON-vote (0), not a bear vote.
   const emaStack =
-    (ind.ema20 > ind.ema50 ? 1 : -1) + (ind.ema50 > ind.ema200 ? 1 : -1) + (price > ind.ema20 ? 1 : -1)
+    (ind.ema20 > ind.ema50 ? 1 : -1) +
+    (Number.isFinite(ind.ema200) ? (ind.ema50 > ind.ema200 ? 1 : -1) : 0) +
+    (price > ind.ema20 ? 1 : -1)
   factors.push({
     name: 'EMA Stack 20/50/200',
     group: 'trend',
@@ -253,9 +258,14 @@ function buildFactors(
     name: 'Markov P(up)',
     group: 'statistical',
     value: markov.probUp,
-    vote: clamp((markov.probUp - 0.5) * 6, -2, 2),
+    // Task 59 (P2): was (probUp - 0.5) * 6 - but 0.5 is NOT the neutral point
+    // of a 5-state chain (up/down/flat buckets put the RW neutral near 0.36),
+    // so every pair, every bar got a ~-0.8 bearish tilt. Center on the
+    // chain's own up-vs-down balance: exactly 0 when the chain is neutral,
+    // symmetric in both directions.
+    vote: clamp((markov.probUp - markov.probDown) * 2, -2, 2),
     weight: 14,
-    note: `P(up) ${(markov.probUp * 100).toFixed(1)}% - regime ${markov.regime}`,
+    note: `P(up) ${(markov.probUp * 100).toFixed(1)}% / P(down) ${(markov.probDown * 100).toFixed(1)}% - chain ${markov.regime}`,
   })
   factors.push({
     name: 'Hurst Exponent',
@@ -434,6 +444,7 @@ export function scanSnapshot(
   atrPct: number
   hurst: number
   probUp: number
+  probDown: number
   regime: MarkovResult['regime']
   ouZ: number // Kalman/OU stretch: sigmas from the OU equilibrium
   ouHalfLife: number // OU mean-reversion half-life in bars (9999 = effectively none)
@@ -466,6 +477,7 @@ export function scanSnapshot(
     atrPct: ind.atrPct,
     hurst: quant.hurst,
     probUp: markov.probUp,
+    probDown: markov.probDown,
     regime: markov.regime,
     ouZ: ou.z,
     ouHalfLife: ou.halfLifeBars,

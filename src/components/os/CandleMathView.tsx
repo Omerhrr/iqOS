@@ -17,6 +17,9 @@ interface CandleMathViewProps {
   asset: string
   tf: Timeframe
   large?: boolean
+  /** Increments on every closed candle (Task 59) - this view used to fetch
+   * once per asset/tf and go stale next to the live chart. */
+  closedTick?: number
 }
 
 function HeuristicTag() {
@@ -66,7 +69,7 @@ function CandleBar({
   )
 }
 
-export default function CandleMathView({ asset, tf, large = false }: CandleMathViewProps) {
+export default function CandleMathView({ asset, tf, large = false, closedTick }: CandleMathViewProps) {
   const [raw, setRaw] = useState<Candle[]>([])
   const [blends, setBlends] = useState<CandleMathBlend[]>([])
   const [error, setError] = useState<string | null>(null)
@@ -93,12 +96,12 @@ export default function CandleMathView({ asset, tf, large = false }: CandleMathV
     return () => {
       cancelled = true
     }
-  }, [asset, tf])
+  }, [asset, tf, closedTick])
 
   // Only show the tail of the raw series so bars stay legible - the blend
   // finder still ran over the full fetched window.
   const VISIBLE = large ? 90 : 48
-  const visible = useMemo(() => raw.slice(-VISIBLE), [raw])
+  const visible = useMemo(() => raw.slice(-VISIBLE), [raw, VISIBLE])
   const visibleOffset = raw.length - visible.length
 
   const chart = useMemo(() => {

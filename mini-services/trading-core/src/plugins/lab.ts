@@ -376,7 +376,7 @@ export class StrategyLabService {
     const bars = Math.max(300, Math.min(2200, Math.round(opts.bars ?? 1200)))
     const basis: Basis = opts.basis === 'heikin' || opts.basis === 'kalman' || opts.basis === 'typical' || opts.basis === 'smoothed' ? opts.basis : 'candles'
 
-    const raw = this.market.getCandlesDeep(asset, tf, bars)
+    const raw = this.market.getCandlesDeep(asset, tf, bars, true) // Task 59: closedOnly
     if (raw.length < 120) throw new Error(`not enough history for ${asset} ${tf} (${raw.length} bars, need 120+)`)
     // thin history auto-relaxation: a hard sample floor on a short series is
     // the #1 "the lab is failing" trap - scale the ask down to what the series
@@ -732,7 +732,7 @@ export class StrategyLabService {
     const payout = Math.max(0.5, Math.min(0.95, Number(input.payout ?? 0.7)))
     const amount = Math.max(1, Number(input.amount ?? 10))
     const horizon = Math.max(1, Math.min(10, Math.round(input.horizon ?? spec.horizon ?? 1)))
-    const raw = this.market.getCandlesDeep(asset, tfv, 2200)
+    const raw = this.market.getCandlesDeep(asset, tfv, 2200, true) // Task 59: closedOnly
     if (raw.length < 120) throw new Error(`not enough history for ${asset} ${tfv} (${raw.length} bars, need 120+)`)
     // signals read the spec's basis; sims settle on REAL prices
     const basisSeries = basisCandles(spec, raw)
@@ -849,7 +849,7 @@ export class StrategyLabService {
     if (!row) throw new Error(`unknown lab strategy ${id}`)
     const spec = normalizeSpec(row.spec, id)
     if (!spec) throw new Error(`lab strategy ${id} has no usable signals`)
-    const candles = this.market.getCandlesDeep(asset, tf, 1500)
+    const candles = this.market.getCandlesDeep(asset, tf, 1500, true) // Task 59: closedOnly
     if (candles.length < 25) throw new Error('not enough candle history yet')
     const ev = evaluateCustom(spec, candles)
     return { ...ev, asset, tf, strategy: id, price: candles[candles.length - 1].close }

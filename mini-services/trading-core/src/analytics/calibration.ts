@@ -90,7 +90,13 @@ export function buildCalibrationReport(
   const conf = bucketize(usable, (p) => p.entryConfidence ?? 0)
   const markov = bucketize(usable, (p) => {
     const pUp = p.entryPUp ?? 0.5
-    const implied = p.side === 'call' ? pUp : 1 - pUp
+    // Task 59 (P2): a binary put wins only when price goes DOWN - "not up"
+    // (1 - pUp) includes the flat mass, which loses a put. Use the chain's
+    // own P(down) when the row carries it (post-Task-59 snapshots); rows
+    // snapshotted before entryPDown existed keep the old optimistic framing
+    // rather than being dropped.
+    const pDown = p.entryPDown
+    const implied = p.side === 'call' ? pUp : Number.isFinite(pDown) ? (pDown as number) : 1 - pUp
     return implied * 100
   })
 

@@ -199,11 +199,11 @@ export class OtcGuardService {
         dataSource = 'harvest'
       }
       if (realCandles.length < 120) {
-        realCandles = market.getCandles(asset, tf, limit)
+        realCandles = market.getCandles(asset, tf, limit, true) // Task 59: closedOnly
         dataSource = 'active-feed'
       }
     } else {
-      realCandles = market.getCandles(asset, tf, limit)
+      realCandles = market.getCandles(asset, tf, limit, true) // Task 59: closedOnly
       dataSource = 'active-feed'
       if (realCandles.length < 120) {
         realCandles = loadOtcHarvest(asset, Math.min(2000, limit))

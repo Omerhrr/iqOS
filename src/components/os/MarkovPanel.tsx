@@ -27,12 +27,18 @@ function heat(p: number): string {
 
 export default function MarkovPanel({
   markov,
+  asset,
+  tf,
 }: {
   markov: MarkovResult | null;
+  asset?: string;
+  tf?: string;
 }) {
   const [full, setFull] = useState(false);
   if (!markov) return null;
-  const r = REGIME_STYLE[markov.regime];
+  // Task 59 (P3): unguarded lookup - an unexpected regime string from the
+  // kernel crashed the whole card (r.c of undefined). Fall back to range.
+  const r = REGIME_STYLE[markov.regime] ?? REGIME_STYLE.range;
 
   return (
     <>
@@ -49,6 +55,15 @@ export default function MarkovPanel({
             Markov Chain
           </h3>
           <div className="flex items-center gap-2">
+            {/* Task 59 (P3): the card never said WHICH pair/timeframe it was
+                for - a failed fetch used to silently keep the previous
+                pair's matrix on screen. */}
+            {(asset || tf) && (
+              <span className="font-mono text-[9px] text-[#3d4c66]">
+                {asset ? asset : ""}
+                {tf ? ` · ${tf}` : ""}
+              </span>
+            )}
             <span
               className="rounded px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider"
               style={{
@@ -118,7 +133,16 @@ export default function MarkovPanel({
             <span>
               P(next move) from {STATE_LABELS[markov.states[markov.lastState]]}
             </span>
-            <span>n={markov.sampleSize}</span>
+            <span
+              title={
+                markov.sampleSize < 120
+                  ? `Only ${markov.sampleSize} bars in the estimation window - per-row counts are thin; treat every number here as low-confidence`
+                  : `${markov.sampleSize} bars in the estimation window`
+              }
+              style={{ color: markov.sampleSize < 120 ? '#eab308' : undefined }}
+            >
+              n={markov.sampleSize}
+            </span>
           </div>
           {(
             [

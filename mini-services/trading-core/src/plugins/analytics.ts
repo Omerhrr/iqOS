@@ -31,7 +31,11 @@ export class AnalyticsService {
       if (hit) return hit.result
     }
     // deep read: prefer archived history so markov/quant stats survive restarts
-    const candles = this.market.getCandlesDeep(asset, tf, 1500)
+    // Task 59 (P1): closedOnly - the /analysis read used to include the
+    // just-opened 1-tick forming bar, so the card's markov lastState was
+    // almost always the FLAT row and RSI/MACD/BB last values were 1-tick
+    // samples. Backtests evaluate closed bars - live must too.
+    const candles = this.market.getCandlesDeep(asset, tf, 1500, true)
     if (candles.length < 60) throw new Error(`not enough candles yet for ${asset} ${tf} (${candles.length})`)
     const result = analyze(candles, asset, tf)
     this.cache.set(key, { ts: result.ts, result })
@@ -52,7 +56,9 @@ export class AnalyticsService {
     const strat = getStrategy(strategyId)
     if (!strat) throw new Error(`unknown strategy ${strategyId}`)
     // deep read: long-warmup strategies (markov family) stay usable right after restarts
-    const candles = this.market.getCandlesDeep(asset, tf, 1500)
+    // Task 59 (P1): closedOnly - bots must evaluate the same closed-bar
+    // series the backtests do, never the freshly-opened forming bar.
+    const candles = this.market.getCandlesDeep(asset, tf, 1500, true)
     if (candles.length < 60) throw new Error('not enough candle history yet')
     const merged = { ...defaultParams(strat), ...(params ?? {}) }
     const ev = strat.evaluate(candles, merged)
@@ -61,7 +67,8 @@ export class AnalyticsService {
 
   runBacktest(asset: string, tf: Timeframe, opts: BacktestOptions) {
     // deep read: the backtest lab sees the full accumulated history (up to 2200 bars)
-    const candles = this.market.getCandlesDeep(asset, tf, 2200)
+    // Task 59 (P1): closedOnly for the same live-parity reason as runStrategy.
+    const candles = this.market.getCandlesDeep(asset, tf, 2200, true)
     if (candles.length < 300) throw new Error('not enough candle history for a meaningful backtest')
     return backtest(candles, asset, tf, opts)
   }

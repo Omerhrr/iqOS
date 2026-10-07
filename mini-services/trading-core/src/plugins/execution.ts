@@ -157,13 +157,14 @@ export class ExecutionService {
    * placed trade (paper and live, manual and bot) so calibration can later
    * check whether "score 72" actually won ~72% of the time. Best-effort:
    * analysis can throw while a pair is still warming up right after boot. */
-  private snapshotSignal(asset: string, tf: Timeframe): { entryScore?: number; entryConfidence?: number; entryPUp?: number; entryRegime?: string; entrySession?: string } {
+  private snapshotSignal(asset: string, tf: Timeframe): { entryScore?: number; entryConfidence?: number; entryPUp?: number; entryPDown?: number; entryRegime?: string; entrySession?: string } {
     try {
       const a = this.analytics.analyze(asset, tf)
       return {
         entryScore: a.signal.score,
         entryConfidence: a.signal.confidence,
         entryPUp: a.markov.probUp,
+        entryPDown: a.markov.probDown,
         entryRegime: classifyRegime(a),
         entrySession: classifySession(this.now(), asset),
       }

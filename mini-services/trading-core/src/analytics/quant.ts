@@ -142,7 +142,18 @@ export function markovChain(closesArr: number[], opts?: { lookback?: number; kBi
   const probUp = nextStateProbs[3] + nextStateProbs[4]
   const probDown = nextStateProbs[0] + nextStateProbs[1]
   const probFlat = nextStateProbs[2]
-  const expectedReturn = nextStateProbs.reduce((a, p, s) => a + p * stateMean[s], 0)
+  // Task 59 (P3): zero-count states have stateMean 0 by construction, but
+  // their Laplace-smoothed probability mass is nonzero - including it shrank
+  // E[r] toward 0 on short samples. Renormalize over observed states only.
+  let erNum = 0
+  let erDen = 0
+  for (let s = 0; s < 5; s++) {
+    if (stateCount[s] > 0) {
+      erNum += nextStateProbs[s] * stateMean[s]
+      erDen += nextStateProbs[s]
+    }
+  }
+  const expectedReturn = erDen > 0 ? erNum / erDen : 0
 
   const trendiness = Math.max(
     0,

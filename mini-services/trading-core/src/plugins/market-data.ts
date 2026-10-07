@@ -19,6 +19,10 @@ import type { Store } from '../store'
 const HISTORY_CANDLES = 760
 const MAX_TICKS = 40000
 const MEM_CAP = 1500 // in-memory closed bars per asset|tf (unchanged memory profile)
+// Task 59: max assets the live poll keeps warm per cycle (charted + watchlists).
+// The sidecar serializes broker calls - more than this would stretch the 4s
+// poll past the tick cadence. Excess watchlist pairs are skipped (logged hourly).
+const MAX_LIVE_POLL_ASSETS = 8
 const ARCHIVE_DEEP = 4000 // max bars hydrated/read from the sqlite archive per asset|tf
 const ARCHIVE_CAP = 4000 // archive trim cap per asset|tf (auto-prune)
 const ARCHIVE_FLUSH_MS = 5000 // batched write cadence
@@ -81,6 +85,12 @@ export class MarketDataService {
   private lastCandlePull = 0
   private lastFeedBarTs = 0 // time of the newest real bar seen (feed freshness)
   private pollFailStreak = 0 // consecutive swallowed pollLive failures (Task 58 alert)
+  // Task 59 multi-asset live poll state:
+  private pollInFlight = false // re-entrancy guard (poll can outlive the 4s timer)
+  private extraCandlePull = new Map<string, number>() // per-extra-asset 60s candle cadence
+  private lastFeedBarByAsset = new Map<string, number>() // per-asset freshness anchor
+  private archivedUpTo = new Map<string, number>() // incremental real-bar archive watermark
+  private warnedPollCap = 0
   private lastCandleTs = new Map<string, number>()
   private store: Store | null = null
   private archiveQueue: { asset: string; tf: string; time: number; open: number; high: number; low: number; close: number; volume: number }[] = []
@@ -686,6 +696,11 @@ export class MarketDataService {
   }
 
   private async pollLive(): Promise<void> {
+    // Task 59: one poll in flight at a time - the multi-asset loop below can
+    // outlive the 4s timer when the sidecar is slow; overlapping polls would
+    // double-fetch and race the candle merge.
+    if (this.pollInFlight) return
+    this.pollInFlight = true
     try {
       const url = `${this.liveUrl.replace(/\/$/, '')}`
       // Ticks (/price) every 4s; the 240-bar history rebuild every 60s — but
@@ -697,14 +712,68 @@ export class MarketDataService {
       const candleEvery = this.lastFeedBarTs === 0 ? 8_000 : 60_000
       const wantCandles = Date.now() - this.lastCandlePull > candleEvery
       if (wantCandles) this.lastCandlePull = Date.now()
+      // Task 59 (P1-residual): pollLive used to feed ONLY the charted asset -
+      // bots / the auto-trader on any other pair got ZERO candle events, never
+      // evaluated, and could not even produce a rejection (silent death).
+      // Poll the traded set instead: charted asset + enabled bot watchlists +
+      // the auto-trader watchlist, capped to bound sidecar load.
+      const assets = this.livePollAssets()
+      for (const asset of assets) {
+        const extraWantCandles = Date.now() - (this.extraCandlePull.get(asset) ?? 0) > 60_000
+        await this.pollLiveAsset(url, asset, asset === this.activeAsset ? wantCandles : extraWantCandles)
+      }
+    } catch (err) {
+      this.ctx.bus.emit('alert', { level: 'warn', message: `live feed hiccup: ${(err as Error).message}`, ts: Math.floor(Date.now() / 1000) })
+    } finally {
+      this.pollInFlight = false
+    }
+  }
+
+  /**
+   * Assets the live feed must keep warm: the charted asset first, then every
+   * enabled bot's watchlist, then the auto-trader watchlist. Capped at
+   * MAX_LIVE_POLL_ASSETS - the sidecar serializes broker calls, and an
+   * unbounded set would stretch each 4s poll past the tick cadence.
+   */
+  private livePollAssets(): string[] {
+    const out: string[] = []
+    const push = (a: unknown) => {
+      const t = String(a ?? '').trim().toUpperCase()
+      if (t && !out.includes(t)) out.push(t)
+    }
+    push(this.activeAsset)
+    try {
+      for (const b of this.store?.listBots() ?? []) {
+        if (!b?.bot?.enabled) continue
+        for (const a of b.bot.watchlist ?? []) push(a)
+      }
+    } catch {
+      /* store unavailable - the charted asset is still polled */
+    }
+    try {
+      const mode = this.ctx.use<{ config?: { watchlist?: string[] } }>('mode')
+      for (const a of mode?.config?.watchlist ?? []) push(a)
+    } catch {
+      /* mode plugin absent */
+    }
+    if (out.length > MAX_LIVE_POLL_ASSETS && Date.now() - this.warnedPollCap > 3_600_000) {
+      this.warnedPollCap = Date.now()
+      this.ctx.log('market-data', `live poll capped at ${MAX_LIVE_POLL_ASSETS} assets - ${out.length - MAX_LIVE_POLL_ASSETS} watchlist pair(s) beyond the cap get no live candles`)
+    }
+    return out.slice(0, MAX_LIVE_POLL_ASSETS)
+  }
+
+  private async pollLiveAsset(url: string, asset: string, wantCandles: boolean): Promise<void> {
+    try {
+      if (wantCandles) this.extraCandlePull.set(asset, Date.now())
       // fire both fetches in parallel, but CONSUME the price first so the
       // tick lands even while the candle pull is still streaming
       const candleJson = (wantCandles
-        ? fetch(`${url}/candles?asset=${this.activeAsset}&size=240&tf=60`, { signal: AbortSignal.timeout(15_000) }).then((r) => r.json())
+        ? fetch(`${url}/candles?asset=${asset}&size=240&tf=60`, { signal: AbortSignal.timeout(15_000) }).then((r) => r.json())
         : Promise.resolve(null)
       ).catch(() => null) as Promise<{ ok: boolean; candles?: Candle[] } | null>
       const priceData = (await (
-        fetch(`${url}/price?asset=${this.activeAsset}`, { signal: AbortSignal.timeout(12_000) })
+        fetch(`${url}/price?asset=${asset}`, { signal: AbortSignal.timeout(12_000) })
           .then((r) => r.json())
           .catch(() => null)
       )) as { ok: boolean; price?: number } | null
@@ -728,17 +797,23 @@ export class MarketDataService {
       }
       if (priceData?.ok && priceData.price) {
         const now = Math.floor(Date.now() / 1000)
-        this.prices.set(this.activeAsset, priceData.price)
+        this.prices.set(asset, priceData.price)
         // Market closed (weekend / session gap)? The sidecar's last REAL bar
         // may be hours old - ticking then would fabricate fake candles at
         // Friday's price. Freshness is judged from the newest bar seen in the
         // 60s candle pulls (any open market forms a bar newer than ~2min;
         // a closed market stays stale between pulls, so no phantom ticks).
+        // Task 59: per-asset freshness - a watchlist pair whose market is dark
+        // must not tick just because the charted pair's market is open.
         const fresh = await candleJson
         const lastC = fresh?.candles?.[fresh.candles.length - 1]
-        if (lastC?.time) this.lastFeedBarTs = Math.max(this.lastFeedBarTs, lastC.time)
-        if (now - this.lastFeedBarTs <= 150) {
-          for (const tf of ALL_TIMEFRAMES) this.applyTick(this.activeAsset, tf, { ts: now, price: priceData.price, vol: 0 })
+        if (lastC?.time) {
+          this.lastFeedBarByAsset.set(asset, Math.max(this.lastFeedBarByAsset.get(asset) ?? 0, lastC.time))
+          if (asset === this.activeAsset) this.lastFeedBarTs = Math.max(this.lastFeedBarTs, lastC.time)
+        }
+        const feedTs = asset === this.activeAsset ? this.lastFeedBarTs : (this.lastFeedBarByAsset.get(asset) ?? 0)
+        if (feedTs > 0 && now - feedTs <= 150) {
+          for (const tf of ALL_TIMEFRAMES) this.applyTick(asset, tf, { ts: now, price: priceData.price, vol: 0 })
         }
       } else {
         void (await candleJson) // drain the in-flight candle fetch
@@ -754,20 +829,36 @@ export class MarketDataService {
             // active asset every 60s, starving the research lab / backtests
             // of history. Fresh bars win a timestamp collision, older memory
             // survives, capped at the usual MEM_CAP.
-            const k = this.key(this.activeAsset, tf)
+            const k = this.key(asset, tf)
             const byTime = new Map<number, Candle>()
             for (const c of this.closed.get(k) ?? []) byTime.set(c.time, c)
             for (const c of agg) byTime.set(c.time, c)
             const merged = [...byTime.values()].sort((a, b) => a.time - b.time)
             this.closed.set(k, merged.slice(-MEM_CAP))
             this.candles.set(k, agg[agg.length - 1])
+            // Task 59 (P2): archive the real broker bars. The only other
+            // archive writer is applyTick's rollover, which in live mode
+            // files 4s-sampled bars with volume 0 - the archive (and every
+            // post-restart deep read: delta, volume profile, orderflow
+            // strategies) was being poisoned with dead volume. agg's last
+            // element is the broker's FORMING bar - excluded here. The
+            // archive UPSERT (ON CONFLICT DO UPDATE) overwrites the degraded
+            // tick-rolled row for the same timestamp.
+            const lastArchived = this.archivedUpTo.get(k) ?? 0
+            const closedAgg = agg.slice(0, -1).filter((c) => c.time > lastArchived)
+            if (closedAgg.length) {
+              for (const c of closedAgg)
+                this.archiveQueue.push({ asset, tf, time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume })
+              this.archivedUpTo.set(k, closedAgg[closedAgg.length - 1].time)
+            }
           }
         }
         const lastC = candleData.candles[candleData.candles.length - 1]
-        this.prices.set(this.activeAsset, lastC.close)
+        this.prices.set(asset, lastC.close)
       }
-    } catch (err) {
-      this.ctx.bus.emit('alert', { level: 'warn', message: `live feed hiccup: ${(err as Error).message}`, ts: Math.floor(Date.now() / 1000) })
+    } catch {
+      // per-asset failure must not kill the remaining assets' polls; the
+      // pollFailStreak alert above covers systemic sidecar failure
     }
   }
 
@@ -792,11 +883,19 @@ export class MarketDataService {
 
   // ---------- public API ----------
 
-  getCandles(asset: string, tf: Timeframe, limit = 400): Candle[] {
+  /**
+   * closedOnly (Task 59): skip the just-opened forming bar. Decision and
+   * analytics reads (confluence, markov, screener, delta, candle math) MUST
+   * use it - a 1-tick forming bar read as the "last candle" made every live
+   * signal evaluate the freshly-opened bar (markov lastState -> flat ~86% of
+   * the time on 1m) while backtests evaluated closed bars only. The chart
+   * keeps the default (forming bar included) - it renders the live bar.
+   */
+  getCandles(asset: string, tf: Timeframe, limit = 400, closedOnly = false): Candle[] {
     this.ensureSeeded(asset)
     const k = this.key(asset, tf)
     const closedArr = this.closed.get(k) ?? []
-    const forming = this.candles.get(k)
+    const forming = closedOnly ? undefined : this.candles.get(k)
     // The sim engine, the live poll and the archive can momentarily disagree
     // (e.g. right after connecting IQ on a weekend: closed=Friday real bars,
     // forming=stale Sunday sim bar). The chart asserts ascending time - so
@@ -816,8 +915,8 @@ export class MarketDataService {
    * The research lab reads through this so optimizer / walk-forward see the full
    * accumulated history instead of the seeded window.
    */
-  getCandlesDeep(asset: string, tf: Timeframe, limit = 2200): Candle[] {
-    const live = this.getCandles(asset, tf, limit)
+  getCandlesDeep(asset: string, tf: Timeframe, limit = 2200, closedOnly = false): Candle[] {
+    const live = this.getCandles(asset, tf, limit, closedOnly)
     if (!this.store) return live
     let archived: Candle[] = []
     try {

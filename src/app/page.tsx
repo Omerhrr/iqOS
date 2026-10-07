@@ -89,6 +89,13 @@ export default function OSPage() {
   // flag) so the two fullscreen states stay independent and the existing
   // Delta wiring above is untouched.
   const [candleMathSlotFull, setCandleMathSlotFull] = useState(false)
+  // Task 59: bumps on every closed candle for the current pair - the Delta /
+  // Candle-Math / Volume-Profile views subscribe to this to re-fetch instead
+  // of sitting frozen next to the live chart.
+  const [closedTick, setClosedTick] = useState(0)
+  // Task 59: last /analysis fetch failed (thin history, kernel restart) - the
+  // cards keep showing the previous result, so surface that honestly.
+  const [analysisStale, setAnalysisStale] = useState(false)
   const assetRef = useRef(asset)
   const [candles, setCandles] = useState<Candle[]>([])
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null)
@@ -258,9 +265,14 @@ export default function OSPage() {
   const loadAnalysis = useCallback(async (a: string, t: Timeframe) => {
     try {
       const d = await osGet<{ ok: boolean; analysis: AnalysisResult }>(`/analysis`, { asset: a, tf: t })
-      if (d.ok) setAnalysis(d.analysis)
+      if (d.ok) {
+        setAnalysis(d.analysis)
+        setAnalysisStale(false)
+      }
     } catch {
-      // analysis needs more candles - ignore until then
+      // analysis needs more candles - keep the last good result on screen
+      // (Task 59: but SAY so instead of silently showing stale data)
+      setAnalysisStale(true)
     }
   }, [])
 
@@ -490,7 +502,6 @@ export default function OSPage() {
     } catch {
       /* private mode - non-fatal */
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // realtime feed
@@ -515,7 +526,10 @@ export default function OSPage() {
         if (!p.closed) return [...prev.slice(-320), p.candle]
         return [...prev.slice(-319), p.candle]
       })
-      if (p.closed) void loadAnalysis(p.asset, p.tf)
+      if (p.closed) {
+        setClosedTick((t) => t + 1)
+        void loadAnalysis(p.asset, p.tf)
+      }
     },
     onAccount: (p) => setAccount(p.account),
     onPositionOpened: () => {
@@ -760,6 +774,7 @@ export default function OSPage() {
               price={livePrice}
               prices={prices}
               modeStatus={modeStatus}
+              closedTick={closedTick}
               refreshMode={loadMode}
               refreshPositions={loadPositions}
               refreshBots={loadBots}
@@ -771,7 +786,7 @@ export default function OSPage() {
           {analysis && (
             <>
               <SignalPanel analysis={analysis} />
-              <MarkovPanel markov={analysis.markov} />
+              <MarkovPanel markov={analysis.markov} asset={asset} tf={tf} />
               <QuantPanel analysis={analysis} strategies={strategies} />
             </>
           )}
@@ -851,6 +866,14 @@ export default function OSPage() {
                                 {label}
                               </button>
                             ))}
+                            {analysisStale && (
+                              <span
+                                className="ml-2 rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-px font-mono text-[8px] font-bold uppercase tracking-wider text-amber-400"
+                                title="The last /analysis fetch failed (thin history or kernel restart) - the cards below still show the previous result."
+                              >
+                                stale
+                              </span>
+                            )}
                             {markovSlotView === 'delta' && (
                               <div className="ml-auto">
                                 <FullscreenButton active={deltaSlotFull} onToggle={() => setDeltaSlotFull((f) => !f)} />
@@ -864,11 +887,11 @@ export default function OSPage() {
                           </div>
                           <div className="min-h-0 flex-1 overflow-auto">
                             {markovSlotView === 'markov' ? (
-                              <MarkovPanel markov={analysis?.markov ?? null} />
+                              <MarkovPanel markov={analysis?.markov ?? null} asset={asset} tf={tf} />
                             ) : markovSlotView === 'delta' ? (
-                              <DeltaFootprintView asset={asset} tf={tf} large={deltaSlotFull} />
+                              <DeltaFootprintView asset={asset} tf={tf} large={deltaSlotFull} closedTick={closedTick} />
                             ) : (
-                              <CandleMathView asset={asset} tf={tf} large={candleMathSlotFull} />
+                              <CandleMathView asset={asset} tf={tf} large={candleMathSlotFull} closedTick={closedTick} />
                             )}
                           </div>
                         </div>
@@ -892,6 +915,7 @@ export default function OSPage() {
                         price={livePrice}
                         prices={prices}
                         modeStatus={modeStatus}
+                        closedTick={closedTick}
                         refreshMode={loadMode}
                         refreshPositions={loadPositions}
                         refreshBots={loadBots}

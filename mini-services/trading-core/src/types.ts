@@ -113,6 +113,10 @@ export interface Position {
   entryScore?: number
   entryConfidence?: number
   entryPUp?: number
+  /** Task 59: P(next move is down) AT ENTRY - put-side calibration needs the
+   * DOWN mass, not 1-P(up) (which includes flat, and a put does not win on
+   * flat). Undefined for rows snapshotted before this existed. */
+  entryPDown?: number
   /** 4-way regime (classifyRegime) AT ENTRY - the adaptive confidence gate's
    * historical buckets are keyed on this, alongside asset/tf/strategy/side/
    * score, so "this exact strategy on this exact asset in a TRENDING regime"

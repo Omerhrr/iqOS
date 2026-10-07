@@ -95,7 +95,10 @@ export class AdaptiveService {
       // (serialized to null by JSON) must not reach the floor math.
       for (const k of ['minSampleSize', 'minWinRateFloorPct', 'scoreBucketWidth', 'marginPct'] as const) {
         const v = Number(this.config[k])
-        if (!Number.isFinite(v)) (this.config[k] as number) = DEFAULT_ADAPTIVE[k]
+        if (!Number.isFinite(v)) {
+          const d = DEFAULT_ADAPTIVE[k]
+          if (typeof d === 'number' && Number.isFinite(d)) (this.config[k] as number) = d
+        }
       }
       if (this.config.floorMode !== 'payout-aware') this.config.floorMode = 'absolute'
     }

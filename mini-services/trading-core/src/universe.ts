@@ -276,7 +276,7 @@ export function universeStats(): { total: number; forex: number; otc: number; cr
   return {
     total: UNIVERSE.length,
     forex: by((a) => a.category === 'forex'), // includes the -OTC twins (same as the old FX+OTC sum)
-    otc: by((a) => a.otc),
+    otc: by((a) => Boolean(a.otc)),
     crypto: by((a) => a.category === 'crypto'),
     commodities: by((a) => a.category === 'commodity'),
     stocks: by((a) => a.category === 'stock'),

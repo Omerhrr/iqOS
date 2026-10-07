@@ -1,14 +1,12 @@
 // IQAIR//OS - Order flow approximation (Volume Profile / Footprint / Cumulative Delta)
 //
 // IQ Option does not expose real tick-by-tick bid/ask-tagged trades or order-book
-// depth for any instrument class this OS trades. There is no finer-than-candle
-// granularity available anywhere in the pipeline either: the sidecar's live path
-// (iqair_sidecar.py) only ever reads closed OHLCV candles from `get_candles` /
-// the realtime candle stream - it never sees individual ticks, and neither does
-// the SIM engine (market-data.ts aggregates its own synthetic 1s ticks straight
-// into candles and discards them). So everything below is a best-effort,
-// candle-level APPROXIMATION, not real order flow - every surface that renders
-// it must say so.
+// depth for any instrument class this OS trades. (Task 59 correction: the
+// sidecar DOES capture a 100ms quote-change sampling buffer for the
+// randomness audit - /tick_stats - but it has no volume and no bid/ask tags,
+// so a CLV delta over OHLCV remains the only honest order-flow proxy here.)
+// Everything below is a best-effort, candle-level APPROXIMATION, not real
+// order flow - every surface that renders it must say so.
 //
 // Buy/sell split per candle uses the standard close-location-value (CLV) proxy:
 // a candle that closes near its high is treated as mostly buy pressure, a candle
@@ -23,6 +21,9 @@
 // count rather than genuine traded size. Candle.volume is used as-is here
 // (it is the only size signal available at all) but callers/UI must label it
 // "volume (approx)" rather than implying verified traded volume.
+// Task 59 note: this IS wired into strategies - builtin volume-profile family
+// (vp-poc-reversion / vp-value-area-breakout), delta-divergence, and the
+// custom ofdelta/ofcumdelta/ofpocdist/ofvapos signals - all labeled "(approx)".
 import type { Candle } from '../types'
 
 export interface CandleDelta {

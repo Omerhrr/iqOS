@@ -161,7 +161,9 @@ export class Screener2Service {
   /** Score one pair with confluenceSignalOnly on the panel's own deep candle
    * read - the row IS the panel's CompositeSignal, nothing derived/renamed. */
   private scorePair(asset: string, tf: Timeframe): ConfluenceRow {
-    const candles = this.market.getCandlesDeep(asset, tf, DEEP_CANDLES)
+    // Task 59 (P1): closedOnly - same forming-bar fix as AnalyticsService;
+    // the panel's rows must equal what the backtest engine would score.
+    const candles = this.market.getCandlesDeep(asset, tf, DEEP_CANDLES, true)
     if (candles.length < this.config.minCandles) throw new Error(`thin history ${asset} ${tf}`)
     const sig = confluenceSignalOnly(candles, asset, tf)
     const inst = this.market.assets.find((a) => a.ticker === asset)

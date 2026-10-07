@@ -164,6 +164,11 @@ export interface BotStats {
    * healthy. This was tracked internally but never surfaced to the API/UI,
    * which is exactly why "why hasn't my bot traded" had no answer. */
   lastRejection?: string
+  /** Task 59: why the strategy itself reported NO signal on the last closed
+   * bar (e.g. "ADX 12.3 too weak", "warming up"). This is the armed-but-quiet
+   * case - distinct from lastRejection (a signal existed but a gate blocked
+   * it). Without it, a quiet tape looks identical to a broken bot. */
+  quietNote?: string
 }
 
 export interface BotRow {
@@ -200,6 +205,7 @@ interface RuntimeState {
   lastTradeTs: number
   streak: number
   lastRejection?: string
+  quietNote?: string
   pot: number // compounding roll; 0 = fresh cycle at base
   rollN: number
   restarts: number
@@ -443,7 +449,9 @@ export class AutopilotService {
   private async revalidateOne(asset: string, tf: Timeframe, strategyId: string, botIds: string[]): Promise<void> {
     const strat = getStrategy(strategyId)
     if (!strat) return
-    const candles = this.market.getCandlesDeep(asset, tf, 2200)
+    // Task 59 (P1): closedOnly - research-gate walk-forward must grade the
+    // same closed-bar series the bots and backtests see.
+    const candles = this.market.getCandlesDeep(asset, tf, 2200, true)
     const out = walkForward(candles, asset, tf, {
       strategy: strategyId,
       sweep: {},
@@ -643,8 +651,9 @@ export class AutopilotService {
         try {
           await this.tradeForBot(bot, asset, tf)
         } catch (err) {
-          // strategy evaluation can throw on thin history - log quietly
-          this.ctx.log('autopilot', `${bot.name} ${asset} eval failed:`, (err as Error).message)
+          // strategy evaluation can throw on thin history - Task 59: surface
+          // it as a rejection (deduped) instead of a console-only whisper
+          this.reject(bot, `evaluation failed: ${String((err as Error).message).slice(0, 160)}`)
         }
       }
     } finally {
@@ -776,8 +785,12 @@ export class AutopilotService {
     if (evalOut.direction === 'none') {
       // condition lapsed - re-arm the edge-trigger for whenever it next fires
       rt.lastSignalDir = null
+      // Task 59: keep the strategy's own reason ("ADX 12.3 too weak") visible
+      // in stats so an armed-but-quiet bot is distinguishable from a broken one
+      rt.quietNote = evalOut.notes || undefined
       return
     }
+    rt.quietNote = undefined
     if (Math.abs(evalOut.score) < bot.minScore) {
       return this.reject(bot, `score ${evalOut.score.toFixed(0)} below min ${bot.minScore}`)
     }
@@ -828,7 +841,7 @@ export class AutopilotService {
       try {
         const adaptive = this.ctx.use<{
           config: { enabled: boolean }
-          check: (asset: string, tf: string, strategyId: string, side: string, score: number, regime?: string, session?: string) => { ok: boolean; reason?: string }
+          check: (asset: string, tf: string, strategyId: string, side: string, score: number, regime?: string, session?: string, payout?: number) => { ok: boolean; reason?: string }
         }>('adaptive')
         if (adaptive.config.enabled) {
           let regime: string | undefined
@@ -1156,6 +1169,7 @@ export class AutopilotService {
         halted: rt.halted,
         complete: rt.complete,
         lastRejection: rt.lastRejection,
+        quietNote: sameDay ? rt.quietNote : undefined,
       }
     }
     const fresh = this.buildRuntime(botId)
@@ -1174,6 +1188,8 @@ export class AutopilotService {
       restarts: fresh.restarts,
       halted: fresh.halted,
       complete: fresh.complete,
+      lastRejection: fresh.lastRejection,
+      quietNote: fresh.quietNote,
     }
   }
 
