@@ -132,6 +132,7 @@ const KIND_CHIP: Record<string, string> = {
   pf: 'text-teal-300 border-teal-500/40 bg-teal-500/10',
   group: 'text-orange-300 border-orange-500/40 bg-orange-500/10',
   builtin: 'text-lime-300 border-lime-500/40 bg-lime-500/10',
+  engine: 'text-indigo-300 border-indigo-500/40 bg-indigo-500/10',
 }
 
 // Every field read here beyond the pre-existing core metrics was added

@@ -900,6 +900,10 @@ function familyOf(s: SignalDef): string {
       // like groups, a registry-strategy signal is hand-picked (or pasted
       // in via JSON), not something the miner sweeps on its own.
       return `builtin:${s.id}`
+    case 'engine':
+      // both directions of one engine share a family (mirrors mtf/renko):
+      // the ensemble can't stock both sides of the identical chart read.
+      return `engine:${s.engine}`
   }
 }
 
@@ -926,6 +930,8 @@ function candidateKeyOf(s: SignalDef): string {
       return `group:${s.op}:${s.dir}:${s.signals.map(candidateKeyOf).join('+')}`
     case 'builtin':
       return `builtin:${s.id}:${s.dir}:${JSON.stringify(s.params ?? {})}`
+    case 'engine':
+      return `engine:${s.engine}:${s.dir}`
   }
 }
 
@@ -1263,6 +1269,32 @@ export const CANDIDATE_SIGNALS: SignalDef[] = [
   { kind: 'indicator', ind: 'otcvratio', params: { period: 20 }, op: '<', threshold: -1, dir: 'put', weight: 11 },
   { kind: 'indicator', ind: 'otcstagn', params: { period: 20 }, op: '>', threshold: 1, dir: 'call', weight: 11 },
   { kind: 'indicator', ind: 'otcstagn', params: { period: 20 }, op: '<', threshold: -1, dir: 'put', weight: 11 },
+  // ---- chart-engine vote family (the Signal Panel's scanner, fed to the
+  // lab) - each candidate is ONE engine's directional vote replayed bar-by-
+  // bar with the scanner's own 240-candle window, so a measured engine row
+  // and a live panel read agree bar-for-bar. This is the lab half of the
+  // honesty loop: /signals_stats measures the engines LIVE (small samples,
+  // real resolutions); the lab measures the same votes over deep history
+  // with Wilson-CI haircut edges and holdout folds, and survivors become
+  // deployable custom: specs. Honesty rules: the OTC velocity footprint is
+  // NOT here (its tick buffer can't be rebuilt from OHLC - see
+  // MINABLE_ENGINES); the tick engine mines its close-proxy fallback (the
+  // same fallback it reports live when no tick buffer exists); the volume
+  // footprint mines its CLV proxy (what real markets vote with anyway).
+  { kind: 'engine', engine: 'renko', dir: 'call', weight: 10 },
+  { kind: 'engine', engine: 'renko', dir: 'put', weight: 10 },
+  { kind: 'engine', engine: 'pnf', dir: 'call', weight: 10 },
+  { kind: 'engine', engine: 'pnf', dir: 'put', weight: 10 },
+  { kind: 'engine', engine: 'range', dir: 'call', weight: 10 },
+  { kind: 'engine', engine: 'range', dir: 'put', weight: 10 },
+  { kind: 'engine', engine: 'tick', dir: 'call', weight: 10 },
+  { kind: 'engine', engine: 'tick', dir: 'put', weight: 10 },
+  { kind: 'engine', engine: 'footprint', dir: 'call', weight: 10 },
+  { kind: 'engine', engine: 'footprint', dir: 'put', weight: 10 },
+  { kind: 'engine', engine: 'heikin', dir: 'call', weight: 10 },
+  { kind: 'engine', engine: 'heikin', dir: 'put', weight: 10 },
+  { kind: 'engine', engine: 'candle', dir: 'call', weight: 10 },
+  { kind: 'engine', engine: 'candle', dir: 'put', weight: 10 },
 ]
 
 let labServiceInstance: StrategyLabService | null = null

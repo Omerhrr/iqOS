@@ -264,6 +264,39 @@ export function engineVotes(
   return votes
 }
 
+/** The engines the Strategy Lab can mine from candle history alone. The OTC
+ * velocity footprint is deliberately absent: it reads the kernel's live
+ * micro-tick buffer, which OHLC bars cannot approximate (the same honesty
+ * rule that keeps the otcv* indicator series NaN without a tick buffer). */
+export const MINABLE_ENGINES = ['renko', 'pnf', 'range', 'tick', 'footprint', 'heikin', 'candle'] as const
+export type MinableEngineId = (typeof MINABLE_ENGINES)[number]
+
+/** ONE engine's vote over a trailing candle window - the per-bar building
+ * block for the lab's engine-vote family. Each engine re-slices its own
+ * working window internally (renko/pnf/range the last 160, tick 90 closes,
+ * footprint 30, HA 40), so a trailing 240-candle slice reproduces the live
+ * scanner's read bar-for-bar (the scanner feeds getCandlesDeep(...,240)). */
+export function engineVoteSingle(engine: MinableEngineId, candles: Candle[]): ChartEngineVote {
+  switch (engine) {
+    case 'renko':
+      return renkoVote(candles)
+    case 'pnf':
+      return pnfVote(candles)
+    case 'range':
+      return rangeVote(candles)
+    case 'tick':
+      // no real tick buffer exists in history mining - the close-proxy
+      // fallback is the honest reconstruction (the vote's own note says so)
+      return tickVote(candles, null)
+    case 'footprint':
+      return footprintVote(candles)
+    case 'heikin':
+      return haVote(candles)
+    case 'candle':
+      return candleVote(candles)
+  }
+}
+
 /** Combine votes into one signed score. Returns null when the votes do not
  * qualify (no directional weight, or below the strength/agreement floor). */
 export function combineVotes(votes: ChartEngineVote[], opts: { threshold?: number; minAgree?: number } = {}): CombineResult | null {

@@ -1115,6 +1115,20 @@ export type LabSignalDef =
       weight: number
     }
   | {
+      /** One of the Signal Panel's chart-engine votes (mirrors trading-core's
+       * EngineVoteSignal - see analytics/chartsignals.ts MINABLE_ENGINES).
+       * The def fires on bars where that engine's scanner read points the
+       * def's way; the lab mines these over deep history and survivors can
+       * be deployed like any other learned signal. The OTC velocity
+       * footprint is not minable (its tick buffer can't be rebuilt from
+       * OHLC history). No params by design: the vote is the scanner's exact
+       * math on its own 240-candle feed. */
+      kind: 'engine'
+      engine: 'renko' | 'pnf' | 'range' | 'tick' | 'footprint' | 'heikin' | 'candle'
+      dir: 'call' | 'put'
+      weight: number
+    }
+  | {
       /** AND/OR combination of DIFFERENT signal types into one voting unit
        * - e.g. "Range Sell Zone" AND "Wide Bear Bar" AND "RSI(14) > 70" only
        * counts when ALL (op:'and') or ANY (op:'or') member signals fire on
@@ -1238,6 +1252,11 @@ export function labelOfSignal(s: LabSignalDef, strategies?: StrategyInfo[]): str
           'triple-bottom-breakdown': 'P&F Triple Bottom Breakdown',
         }[s.variant] ?? s.variant
       )
+    case 'engine': {
+      // mirrors trading-core's ENGINE_LABEL (analytics/chartsignals.ts)
+      const name = ({ renko: 'Renko', pnf: 'P&F', range: 'Range', tick: 'Tick', footprint: 'Footprint', heikin: 'H/A', candle: 'Candles' } as Record<string, string>)[s.engine] ?? s.engine
+      return `${name} Vote (${s.dir === 'call' ? 'CALL' : 'PUT'})`
+    }
     case 'group':
       return `(${s.signals.map((m) => labelOfSignal(m, strategies)).join(s.op === 'and' ? ' AND ' : ' OR ')})`
     case 'builtin': {
@@ -1276,6 +1295,24 @@ export const SIGNAL_TEMPLATES: LabSignalDef[] = [
   { kind: 'pf', variant: 'double-bottom-breakdown', dir: 'put', weight: 10 },
   { kind: 'pf', variant: 'triple-top-breakout', dir: 'call', weight: 10 },
   { kind: 'pf', variant: 'triple-bottom-breakdown', dir: 'put', weight: 10 },
+  // chart-engine votes - the Signal Panel's scanners as one minable signal
+  // each (mirrors trading-core's lab.ts CANDIDATE_SIGNALS engine family; no
+  // params by design - the vote IS the scanner's exact math). The OTC
+  // velocity footprint can't be rebuilt from history and is absent.
+  { kind: 'engine', engine: 'renko', dir: 'call', weight: 10 },
+  { kind: 'engine', engine: 'renko', dir: 'put', weight: 10 },
+  { kind: 'engine', engine: 'pnf', dir: 'call', weight: 10 },
+  { kind: 'engine', engine: 'pnf', dir: 'put', weight: 10 },
+  { kind: 'engine', engine: 'range', dir: 'call', weight: 10 },
+  { kind: 'engine', engine: 'range', dir: 'put', weight: 10 },
+  { kind: 'engine', engine: 'tick', dir: 'call', weight: 10 },
+  { kind: 'engine', engine: 'tick', dir: 'put', weight: 10 },
+  { kind: 'engine', engine: 'footprint', dir: 'call', weight: 10 },
+  { kind: 'engine', engine: 'footprint', dir: 'put', weight: 10 },
+  { kind: 'engine', engine: 'heikin', dir: 'call', weight: 10 },
+  { kind: 'engine', engine: 'heikin', dir: 'put', weight: 10 },
+  { kind: 'engine', engine: 'candle', dir: 'call', weight: 10 },
+  { kind: 'engine', engine: 'candle', dir: 'put', weight: 10 },
   { kind: 'line', variant: 'breakout-up', lookback: 10, dir: 'call', weight: 10 },
   { kind: 'line', variant: 'breakout-down', lookback: 10, dir: 'put', weight: 10 },
   { kind: 'line', variant: 'breakout-up', lookback: 20, dir: 'call', weight: 10 },

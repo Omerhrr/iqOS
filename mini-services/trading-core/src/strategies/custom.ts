@@ -37,6 +37,7 @@ import { computeCandleDelta, computeCumulativeDelta, computeVolumeProfile } from
 import { ticksFor, velocitySeriesFor } from '../analytics/otcfootprint'
 import { renkoBricks, type RenkoResult } from '../analytics/renko'
 import { pointFigure } from '../analytics/pointfigure'
+import { engineVoteSingle, MINABLE_ENGINES, ENGINE_LABEL, type MinableEngineId } from '../analytics/chartsignals'
 
 // ---------- signal vocabulary ----------
 
@@ -222,6 +223,21 @@ export interface BuiltinSignal {
   weight: number
 }
 
+export interface EngineVoteSignal {
+  kind: 'engine'
+  /** One of the candle-reconstructible chart engines (see
+   * analytics/chartsignals.ts MINABLE_ENGINES). The OTC velocity footprint is
+   * not minable: it reads the live micro-tick buffer, which OHLC history
+   * cannot approximate. */
+  engine: MinableEngineId
+  // no tunable params: the vote is the EXACT math the Signal Panel's scanner
+  // runs (trailing 240-candle window, the scanner's own feed), so a learned
+  // engine signal and a live panel read agree bar-for-bar. Params here would
+  // silently diverge the lab's measurement from what the panel shows.
+  dir: Side
+  weight: number
+}
+
 export type SignalDef =
   | CandleSignal
   | BarSignal
@@ -233,6 +249,7 @@ export type SignalDef =
   | PFSignal
   | GroupSignal
   | BuiltinSignal
+  | EngineVoteSignal
 
 export interface CustomSpec {
   name: string
@@ -976,6 +993,8 @@ export function labelOf(s: SignalDef): string {
       }[s.variant]
     case 'group':
       return `(${s.signals.map(labelOf).join(s.op === 'and' ? ' AND ' : ' OR ')})`
+    case 'engine':
+      return `${ENGINE_LABEL[s.engine]} Vote (${s.dir === 'call' ? 'CALL' : 'PUT'})`
     case 'builtin': {
       const strat = getStrategy(s.id)
       const name = strat?.name ?? s.id
@@ -1007,6 +1026,11 @@ export function impliedDir(s: SignalDef): Side {
     case 'group':
       return s.dir
     case 'builtin':
+      return s.dir
+    case 'engine':
+      // a chart-engine vote has no textbook direction of its own - the
+      // def's dir IS the read (call = engine voted up), same rule as
+      // indicator/builtin rules
       return s.dir
   }
 }
@@ -1293,6 +1317,31 @@ export function prepareSignal(s: SignalDef, ctx: EvalCtx): (i: number) => boolea
         return ev.direction === s.dir
       }
     }
+    case 'engine': {
+      // The Signal Panel's chart-engine vote, replayed bar-by-bar over
+      // history. Window semantics are the SCANNER's, not the renko/pf
+      // full-slice convention: the live scanner feeds getCandlesDeep(...,240)
+      // closed candles and the engines re-slice their own working windows
+      // internally, so the faithful per-bar replay is a trailing 240-candle
+      // slice ending at i (floor 40 = buildChartSignal's thin-history guard,
+      // below which the live scanner honestly stands aside too). Lazy
+      // per-index memo, same shape as the renko/pf cases: the learner asks
+      // every bar exactly once, live evaluation only ever asks for the tail.
+      const want = s.dir === 'call' ? 1 : -1
+      const memo = new Map<number, boolean>()
+      const voteAt = (i: number): boolean => {
+        const hit = memo.get(i)
+        if (hit !== undefined) return hit
+        let ok = false
+        if (i >= 39 && i < ctx.n) {
+          const win = ctx.candles.slice(Math.max(0, i + 1 - 240), i + 1)
+          ok = engineVoteSingle(s.engine, win).dir === want
+        }
+        memo.set(i, ok)
+        return ok
+      }
+      return voteAt
+    }
   }
 }
 
@@ -1389,6 +1438,7 @@ const KNOWN_LINE = new Set(['breakout-up', 'breakout-down', 'hh-hl', 'lh-ll'])
 const KNOWN_BAR = new Set(['wide-bull', 'wide-bear'])
 const KNOWN_RENKO = new Set(['flip-up', 'flip-down', 'streak-up', 'streak-down'])
 const KNOWN_PF = new Set(['double-top-breakout', 'double-bottom-breakdown', 'triple-top-breakout', 'triple-bottom-breakdown'])
+const KNOWN_MINABLE = new Set<string>(MINABLE_ENGINES)
 
 const clampN = (v: unknown, lo: number, hi: number, d = lo): number => {
   const n = Number(v)
@@ -1501,6 +1551,12 @@ function normalizeOneSignal(s: unknown, depth = 0): SignalDef | null {
       dir: dir ?? dflt,
       weight,
     }
+  } else if (o.kind === 'engine' && KNOWN_MINABLE.has(String(o.engine))) {
+    // dir REQUIRED (same rule as indicator/mtf/builtin): a chart-engine vote
+    // has no textbook direction of its own, so an omitted dir would be
+    // ambiguous rather than inferable - drop it loudly instead.
+    if (!dir) return null
+    return { kind: 'engine', engine: String(o.engine) as MinableEngineId, dir, weight }
   } else if (o.kind === 'builtin' && typeof o.id === 'string' && getStrategy(o.id)) {
     if (!dir) return null
     const params: Record<string, number | string> = {}
