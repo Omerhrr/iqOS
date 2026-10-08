@@ -948,6 +948,15 @@ const httpServer = createServer(async (req, res) => {
         return json(200, await kernel.context().use<ChartSignalsService>('chartSignals').scan(kind, top, tfv))
       }
 
+      // Outcome stats for the chart signals: every qualifying read is
+      // resolved at its own suggested expiry (CFD plans on first sampled
+      // TP/SL touch within a 15-min horizon) - win rates per kind, per
+      // engine and real-vs-OTC, so the panel shows what the charts
+      // actually delivered, not just what they claim.
+      if (path === '/signals_stats') {
+        return json(200, { ok: true, ...kernel.context().use<ChartSignalsService>('chartSignals').stats(), ts: Date.now() })
+      }
+
       if (path === '/strategies')
         return json(200, {
           ok: true,

@@ -356,6 +356,59 @@ export async function getChartSignals(kind: 'option' | 'cfd', top = 5): Promise<
   return osGet<ChartSignalsResponse>('/signals', { kind, top })
 }
 
+// ---- chart-signal outcome stats (Task 64-c: the honesty loop) ------------
+
+export type SignalOutcomeId = 'win' | 'loss' | 'flat' | 'timeout'
+
+export interface ResolvedSignalOutcome {
+  id: string
+  kind: 'option' | 'cfd'
+  asset: string
+  otc: boolean
+  direction: 'call' | 'put'
+  entry: number
+  exit: number
+  expirySec: number
+  ts: number
+  resolvedAt: number
+  movePct: number
+  outcome: SignalOutcomeId
+  touched: 'tp' | 'sl' | null
+  maxFavPct: number
+  maxAdvPct: number
+  score: number
+  strength: number
+  agree: number
+  total: number
+  engines: { engine: ChartEngineId; dir: 1 | -1; hit: boolean }[]
+}
+
+export interface SignalEngineStat {
+  engine: ChartEngineId
+  votes: number
+  hits: number
+  winRate: number | null
+}
+
+export interface SignalKindStats {
+  recorded: number
+  pending: number
+  resolved: number
+  wins: number
+  losses: number
+  flats: number
+  timeouts: number
+  winRate: number | null
+  avgMovePct: number
+  engines: SignalEngineStat[]
+  byMarket: { real: { wins: number; losses: number; winRate: number | null }; otc: { wins: number; losses: number; winRate: number | null } }
+  recent: ResolvedSignalOutcome[]
+}
+
+export async function getSignalStats(): Promise<{ ok: boolean; option: SignalKindStats; cfd: SignalKindStats; ts: number }> {
+  return osGet<{ ok: boolean; option: SignalKindStats; cfd: SignalKindStats; ts: number }>('/signals_stats')
+}
+
 export async function getDelta(asset: string, tf: Timeframe, opts?: { limit?: number }): Promise<{ deltas: CandleDelta[]; cumulative: CumulativeDeltaPoint[] }> {
   const d = await osGet<{ ok: boolean; deltas: CandleDelta[]; cumulative: CumulativeDeltaPoint[] }>('/delta', {
     asset,

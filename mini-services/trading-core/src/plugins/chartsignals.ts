@@ -4,11 +4,18 @@
 // a stale read disappears instead of lingering. Real-market assets vote with
 // the volume footprint (CLV proxy), OTC assets with the micro-tick velocity
 // footprint - the same engines their charts render.
+// Task 64-c: every qualifying read also becomes a tracked outcome - the
+// scanner resolves it at its own suggested expiry (CFD plans on first
+// sampled TP/SL touch within a 15-min horizon), so the panel can show what
+// the chart engines actually delivered, per engine and per market type.
 
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import type { KernelContext, Plugin } from '../kernel'
 import type { Candle, Timeframe } from '../types'
 import { searchInstruments } from '../universe'
 import { buildChartSignal, type ChartSignal, type OtcFpRead } from '../analytics/chartsignals'
+import { SignalOutcomeTracker, type ResolvedOutcome } from '../analytics/signaloutcomes'
 import type { MarketDataService } from './market-data'
 import type { OtcFootprintService } from './otcfootprint'
 
@@ -29,6 +36,8 @@ export interface ChartScanResult {
 const UNIVERSE_CAP = 18 // bounded sidecar/analytics load per scan
 const CACHE_MS = 12_000 // one scan serves rapid panel polls
 const SIGNAL_TTL_SEC = 150 // a signal that old is no longer "relevant"
+const SWEEP_MS = 5_000 // outcome sampling / resolution cadence
+const FLUSH_MS = 10_000 // debounced outcomes persistence
 
 export class ChartSignalsService {
   private ctx!: KernelContext
@@ -36,6 +45,10 @@ export class ChartSignalsService {
   private otcFp: OtcFootprintService | null = null
   private cache = new Map<SignalKind, { ts: number; result: ChartScanResult }>()
   private scanning = new Map<SignalKind, Promise<ChartScanResult>>()
+  private tracker = new SignalOutcomeTracker()
+  private sweepTimer: ReturnType<typeof setInterval> | null = null
+  private flushTimer: ReturnType<typeof setInterval> | null = null
+  private outcomesPath = join(process.cwd(), 'data', 'chartsignals_outcomes.json')
 
   async start(ctx: KernelContext): Promise<void> {
     this.ctx = ctx
@@ -45,7 +58,47 @@ export class ChartSignalsService {
     } catch {
       this.otcFp = null // footprint engine absent - OTC votes read 0 honestly
     }
-    ctx.log('chart-signals', 'chart-type signal scanner online (renko/pnf/range/tick/footprint|otcfootprint/heikin/candle)')
+    this.loadOutcomes()
+    // outcome sweep: sample pending reads, resolve the matured ones
+    this.sweepTimer = setInterval(() => {
+      try {
+        const resolved = this.tracker.tick(Date.now(), (a) => this.market.getPrice(a))
+        if (resolved.length) {
+          ctx.log('chart-signals', `resolved ${resolved.length} signal outcome(s) (${resolved.map((r) => `${r.asset} ${r.outcome}`).join(', ')})`)
+        }
+      } catch {
+        /* the honesty loop never breaks scanning */
+      }
+    }, SWEEP_MS)
+    // debounced persistence: outcomes survive kernel restarts
+    this.flushTimer = setInterval(() => {
+      if (!this.tracker.needsFlush) return
+      try {
+        mkdirSync(join(process.cwd(), 'data'), { recursive: true })
+        writeFileSync(this.outcomesPath, JSON.stringify({ savedAt: Date.now(), ...this.tracker.state() }))
+        this.tracker.markFlushed()
+      } catch {
+        /* persistence is best-effort */
+      }
+    }, FLUSH_MS)
+    ctx.log('chart-signals', 'chart-type signal scanner online (renko/pnf/range/tick/footprint|otcfootprint/heikin/candle) + outcome tracking')
+  }
+
+  private loadOutcomes(): void {
+    try {
+      const raw = JSON.parse(readFileSync(this.outcomesPath, 'utf8')) as { resolved?: ResolvedOutcome[] }
+      this.tracker = new SignalOutcomeTracker(raw.resolved ?? [])
+      if (raw.resolved?.length) {
+        this.ctx.log('chart-signals', `restored ${raw.resolved.length} tracked signal outcomes from data/`)
+      }
+    } catch {
+      /* no file yet - start clean */
+    }
+  }
+
+  /** Outcome stats for the panel's hit-rate view. */
+  stats() {
+    return this.tracker.stats()
   }
 
   private async otcReadAsync(ticker: string): Promise<OtcFpRead | null> {
@@ -107,8 +160,8 @@ export class ChartSignalsService {
     }
 
     signals.sort((a, b) => b.strength - a.strength || b.agree - a.agree)
-    // NOTE: the full qualified list is cached; `top` is applied at read time
-    // in scan() so different top params can share one scan.
+    // the full qualified list is cached; `top` is applied at read time in
+    // scan() so different top params can share one scan.
     const result: ChartScanResult = {
       ok: true,
       kind,
@@ -119,6 +172,13 @@ export class ChartSignalsService {
       signals,
       ts: Date.now(),
       scanMs: Date.now() - t0,
+    }
+    // every qualifying read enters the honesty loop (deduped per
+    // kind+asset+direction while pending)
+    try {
+      this.tracker.record(kind, signals, result.ts)
+    } catch {
+      /* tracking never breaks the scan */
     }
     return result
   }
