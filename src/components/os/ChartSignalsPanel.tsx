@@ -5,8 +5,10 @@
 // candlestick math) vote on EVERY open instrument in the kernel (no top-N
 // cut - the full qualifying list comes back, sorted by strength); this panel
 // renders them all, filterable by market: All / Real / OTC - click OTC to
-// see only the over-the-counter pairs' reads. Option tab = direction +
-// suggested expiry; CFD tab = the same read with entry / SL / TP levels.
+// see only the over-the-counter pairs' reads - plus an asset search and
+// per-class chips (FX / Crypto / Comm / Stocks / Idx) that compose with the
+// market filter, so a 100+ read scan stays navigable. Option tab = direction
+// + suggested expiry; CFD tab = the same read with entry / SL / TP levels.
 // Signals carry a kernel-side TTL - stale reads disappear instead of
 // lingering (the list is recomputed every scan, never cached client-side).
 // Task 64-b: each card carries a take action - the read loads straight
@@ -24,6 +26,7 @@ interface ChartSignalsPanelProps {
 
 type Tab = 'option' | 'cfd'
 type Mkt = 'all' | 'real' | 'otc'
+type Cat = 'all' | 'forex' | 'crypto' | 'commodity' | 'stock' | 'index'
 
 function outcomeColor(o: string): string {
   return o === 'win' ? 'text-emerald-300' : o === 'loss' ? 'text-rose-300' : o === 'timeout' ? 'text-amber-300' : 'text-[#4b5a72]'
@@ -275,6 +278,8 @@ function SignalCard({ s, now, tab, onSelectAsset, onTake }: { s: ChartSignal; no
 export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: ChartSignalsPanelProps) {
   const [tab, setTab] = useState<Tab>('option')
   const [mkt, setMkt] = useState<Mkt>('all')
+  const [cat, setCat] = useState<Cat>('all')
+  const [query, setQuery] = useState('')
   const [data, setData] = useState<ChartSignalsResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -325,8 +330,16 @@ export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: Ch
     return () => clearInterval(iv)
   }, [])
 
-  const signals = (data?.signals ?? []).filter((s) => s.validUntil > now).filter((s) => (mkt === 'all' ? true : mkt === 'otc' ? s.otc : !s.otc))
+  const live = (data?.signals ?? []).filter((s) => s.validUntil > now)
+  const needle = query.trim().toLowerCase()
+  const signals = live
+    .filter((s) => (mkt === 'all' ? true : mkt === 'otc' ? s.otc : !s.otc))
+    .filter((s) => (cat === 'all' ? true : s.category === cat))
+    .filter((s) => (!needle ? true : s.asset.toLowerCase().includes(needle) || s.name.toLowerCase().includes(needle)))
   const otcLive = data?.otcQualifying ?? 0
+  // per-class live counts - computed from the unfiltered live list so the
+  // chips stay honest no matter what the other filters are doing
+  const catCount = (c: Cat) => (c === 'all' ? live.length : live.filter((s) => s.category === c).length)
 
   return (
     <div className="flex h-full min-h-0 flex-col rounded-lg border border-[#1c2739] bg-[#0b111c]">
@@ -432,6 +445,64 @@ export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: Ch
         </button>
       </div>
 
+      {/* search + per-class chips - only meaningful on the signals view; the
+          chips show live qualifying counts per class so empty classes are
+          visible before clicking them */}
+      {view === 'signals' && (
+        <div className="flex items-center gap-1 border-b border-[#1c2739] px-2 py-1">
+          <div className="relative min-w-0 flex-1">
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => e.key === 'Escape' && setQuery('')}
+              placeholder="search… e.g. EURUSD-OTC, gold"
+              spellCheck={false}
+              className="w-full rounded border border-[#1c2739] bg-[#101828] px-2 py-1 pr-6 font-mono text-[10px] text-[#e2e8f0] placeholder-[#3d4d66] outline-none focus:border-cyan-500/50"
+            />
+            {query && (
+              <button
+                type="button"
+                onClick={() => setQuery('')}
+                title="clear search"
+                className="absolute right-1 top-1/2 -translate-y-1/2 rounded px-1 font-mono text-[10px] text-[#4b5a72] hover:text-rose-300"
+              >
+                ×
+              </button>
+            )}
+          </div>
+          {(
+            [
+              ['all', 'All', 'every asset class'],
+              ['forex', 'FX', 'currency pairs (incl. their OTC twins)'],
+              ['crypto', 'Crypto', 'crypto pairs - 24/7 real markets'],
+              ['commodity', 'Comm', 'metals, energy, agriculture'],
+              ['stock', 'Stocks', 'single-name equities'],
+              ['index', 'Idx', 'index CFDs'],
+            ] as [Cat, string, string][]
+          ).map(([c, label, why]) => {
+            const n = catCount(c)
+            return (
+              <button
+                key={c}
+                type="button"
+                onClick={() => setCat(c)}
+                className={`shrink-0 rounded px-1.5 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wider transition-colors ${
+                  cat === c
+                    ? 'bg-cyan-500/15 text-cyan-300'
+                    : n > 0
+                      ? 'text-[#7c8aa5] hover:text-[#aab6cc]'
+                      : 'text-[#3d4d66]'
+                }`}
+                title={`${why} · ${n} live read${n === 1 ? '' : 's'} in class`}
+              >
+                {label}
+                {n > 0 && ` ${n}`}
+              </button>
+            )
+          })}
+        </div>
+      )}
+
       <div className="min-h-0 flex-1 space-y-1.5 overflow-auto p-2">
         {view === 'stats' ? (
           <StatsView st={stats?.[tab] ?? null} tab={tab} now={now} />
@@ -440,13 +511,22 @@ export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: Ch
             {error && <div className="p-2 text-[10px] text-rose-400">{error}</div>}
             {!error && signals.length === 0 && (
               <div className="p-2 text-[10px] leading-relaxed text-[#4b5a72]">
-                {data
-                  ? mkt === 'otc'
-                    ? `No qualifying OTC reads right now - ${data.otcScanned ?? 0} OTC instruments scanned, ${data.otcConsidered ?? 0} had enough history, none reached the 7-engine confluence floor (strength >= 35, >= 3 engines agreeing). The OTC velocity footprint needs a warm tick buffer - it stays honest and votes 0 while cold.`
-                    : mkt === 'real'
-                      ? `No qualifying real-market reads right now - ${data.considered - (data.otcConsidered ?? 0)} real instruments had enough history, none reached the 7-engine confluence floor (strength >= 35, >= 3 engines agreeing). Fresh reads appear here automatically.`
-                      : `${data.qualifying > 0 ? `${data.qualifying} reads just expired - rescanning` : `No qualifying reads right now - ${data.considered} of ${data.scanned} scanned instruments had enough history, none reached the 7-engine confluence floor (strength >= 35, >= 3 engines agreeing)`}. Fresh reads appear here automatically.`
-                  : 'Scanning the market with the chart engines (renko, P&F, range, tick, footprint, Heikin Ashi, candles)...'}
+                {data ? (
+                  live.length > 0 ? (
+                    // reads exist but the current search / class / market filter
+                    // carved the list to zero - tell the operator which dial to
+                    // loosen instead of implying the engines went quiet
+                    `No reads match the current filter - ${live.length} live read${live.length === 1 ? '' : 's'}${mkt !== 'all' ? ` · market ${mkt.toUpperCase()}` : ''}${cat !== 'all' ? ` · class ${cat}` : ''}${needle ? ` · search "${query.trim()}"` : ''}. Clear the search or switch the class / market chips.`
+                  ) : mkt === 'otc' ? (
+                    `No qualifying OTC reads right now - ${data.otcScanned ?? 0} OTC instruments scanned, ${data.otcConsidered ?? 0} had enough history, none reached the 7-engine confluence floor (strength >= 35, >= 3 engines agreeing). The OTC velocity footprint needs a warm tick buffer - it stays honest and votes 0 while cold.`
+                  ) : mkt === 'real' ? (
+                    `No qualifying real-market reads right now - ${data.considered - (data.otcConsidered ?? 0)} real instruments had enough history, none reached the 7-engine confluence floor (strength >= 35, >= 3 engines agreeing). Fresh reads appear here automatically.`
+                  ) : (
+                    `${data.qualifying > 0 ? `${data.qualifying} reads just expired - rescanning` : `No qualifying reads right now - ${data.considered} of ${data.scanned} scanned instruments had enough history, none reached the 7-engine confluence floor (strength >= 35, >= 3 engines agreeing)`}. Fresh reads appear here automatically.`
+                  )
+                ) : (
+                  'Scanning the market with the chart engines (renko, P&F, range, tick, footprint, Heikin Ashi, candles)...'
+                )}
               </div>
             )}
             {signals.map((s) => (
@@ -457,7 +537,7 @@ export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: Ch
                 {tab === 'option'
                   ? 'Direction + suggested expiry from chart-type confluence. Real pairs read the volume footprint (CLV proxy), OTC pairs the micro-tick velocity footprint.'
                   : 'Same chart-engine read, expressed as a CFD plan: entry at last close, stop beyond the recent swing (ATR floor), target at >= 1.5R.'}
-                {' '}Every qualifying read is shown (strongest first) - All / Real / OTC filters the market, click a card to open that asset on the chart, take loads it into the trade ticket.
+                {' '}Every qualifying read is shown (strongest first) - All / Real / OTC + class chips + search narrow the list, click a card to open that asset on the chart, take loads it into the trade ticket.
               </p>
             )}
           </>
