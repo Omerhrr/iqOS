@@ -347,13 +347,21 @@ export interface ChartSignalsResponse {
   scanned: number
   considered: number
   qualifying: number
+  /** Open instruments found this pass - scanned should equal it. */
+  universe?: number
+  /** OTC coverage of the same pass (panel's OTC filter view). */
+  otcScanned?: number
+  otcConsidered?: number
+  otcQualifying?: number
   signals: ChartSignal[]
   ts: number
   scanMs: number
 }
 
-export async function getChartSignals(kind: 'option' | 'cfd', top = 5): Promise<ChartSignalsResponse> {
-  return osGet<ChartSignalsResponse>('/signals', { kind, top })
+/** Full scan by default (no top param) - the panel renders every qualifying
+ * read; pass a positive `top` to get a short list (kernel clamps at 200). */
+export async function getChartSignals(kind: 'option' | 'cfd', top?: number): Promise<ChartSignalsResponse> {
+  return osGet<ChartSignalsResponse>('/signals', top && top > 0 ? { kind, top } : { kind })
 }
 
 // ---- chart-signal outcome stats (Task 64-c: the honesty loop) ------------

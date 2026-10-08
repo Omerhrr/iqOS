@@ -1,9 +1,12 @@
 // Chart-signals scanner: runs the chart-type engine votes across the whole
-// open instrument universe and keeps only the top-N strongest confluence
-// reads. The Signal Panel (web) polls /signals; each signal carries a TTL so
-// a stale read disappears instead of lingering. Real-market assets vote with
-// the volume footprint (CLV proxy), OTC assets with the micro-tick velocity
-// footprint - the same engines their charts render.
+// open instrument universe - no top-N cut here, every qualifying read comes
+// back and the caller applies any limit it wants (`top` on /signals; the
+// Signal Panel (web) takes them all). Each signal carries a TTL so a stale
+// read disappears instead of lingering. Real-market assets vote with the
+// volume footprint (CLV proxy), OTC assets with the micro-tick velocity
+// footprint - the same engines their charts render. OTC pairs are always
+// part of the pass (they used to be crowded out by a universe cap - now the
+// response reports per-market coverage so the panel can prove it).
 // Task 64-c: every qualifying read also becomes a tracked outcome - the
 // scanner resolves it at its own suggested expiry (CFD plans on first
 // sampled TP/SL touch within a 15-min horizon), so the panel can show what
@@ -13,7 +16,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { KernelContext, Plugin } from '../kernel'
 import type { Candle, Timeframe } from '../types'
-import { searchInstruments } from '../universe'
+import { isInstrumentOpen, searchInstruments } from '../universe'
 import { buildChartSignal, type ChartSignal, type OtcFpRead } from '../analytics/chartsignals'
 import { SignalOutcomeTracker, type ResolvedOutcome } from '../analytics/signaloutcomes'
 import type { MarketDataService } from './market-data'
@@ -28,12 +31,20 @@ export interface ChartScanResult {
   scanned: number
   considered: number
   qualifying: number
+  /** Open instruments found this pass - scanned should equal it (nothing
+   * left behind); if the hard safety cap ever bites, scanned < universe. */
+  universe: number
+  /** OTC coverage of the same pass - the panel's OTC filter shows exactly
+   * these instruments, so the counts keep the split honest. */
+  otcScanned: number
+  otcConsidered: number
+  otcQualifying: number
   signals: ChartSignal[]
   ts: number
   scanMs: number
 }
 
-const UNIVERSE_CAP = 18 // bounded sidecar/analytics load per scan
+const UNIVERSE_HARD_CAP = 200 // safety valve for pathological sidecar catalogs
 const CACHE_MS = 12_000 // one scan serves rapid panel polls
 const SIGNAL_TTL_SEC = 150 // a signal that old is no longer "relevant"
 const SWEEP_MS = 5_000 // outcome sampling / resolution cadence
@@ -119,22 +130,29 @@ export class ChartSignalsService {
     }
   }
 
-  private async scanOnce(kind: SignalKind, top: number, tf: Timeframe): Promise<ChartScanResult> {
+  private async scanOnce(kind: SignalKind, tf: Timeframe): Promise<ChartScanResult> {
     const t0 = Date.now()
     const active = this.market.activeAsset
+    // Session-aware open set: curated 'market'/'otc-gap' rows carry a static
+    // open=false at boot, so the time-of-day check rescues them when their
+    // session is actually running (stocks during US hours, SNAP-OTC at
+    // night). Live-discovered rows trust the sidecar's own is_open.
     const universe = searchInstruments('', 'all')
-      .filter((i) => i.open)
+      .filter((i) => i.open || isInstrumentOpen(i))
       .sort((a, b) => (a.ticker === active ? -1 : b.ticker === active ? 1 : 0))
-      .slice(0, UNIVERSE_CAP)
+      .slice(0, UNIVERSE_HARD_CAP)
 
     let scanned = 0
     let considered = 0
+    let otcScanned = 0
+    let otcConsidered = 0
     const signals: ChartSignal[] = []
     const CHUNK = 4
     for (let i = 0; i < universe.length; i += CHUNK) {
       await Promise.all(
         universe.slice(i, i + CHUNK).map(async (info) => {
           scanned++
+          if (info.otc) otcScanned++
           let candles: Candle[] = []
           try {
             candles = this.market.getCandlesDeep(info.ticker, tf, 240, true)
@@ -143,6 +161,7 @@ export class ChartSignalsService {
           }
           if (candles.length < 40) return // thin history - no honest read
           considered++
+          if (info.otc) otcConsidered++
           const realTicks = info.otc
             ? null
             : this.market
@@ -169,6 +188,10 @@ export class ChartSignalsService {
       scanned,
       considered,
       qualifying: signals.length,
+      universe: universe.length,
+      otcScanned,
+      otcConsidered,
+      otcQualifying: signals.filter((s) => s.otc).length,
       signals,
       ts: Date.now(),
       scanMs: Date.now() - t0,
@@ -184,7 +207,8 @@ export class ChartSignalsService {
   }
 
   /** Fresh scan (cached for CACHE_MS), stale entries dropped + `top`
-   * applied at read time so cache hits honor the caller's limit. */
+   * applied at read time so cache hits honor the caller's limit. top<=0
+   * (the default) means no cut - every qualifying read comes back. */
   async scan(kind: SignalKind, top: number, tf: Timeframe): Promise<ChartScanResult> {
     const cached = this.cache.get(kind)
     const now = Date.now()
@@ -193,7 +217,7 @@ export class ChartSignalsService {
     }
     const inflight = this.scanning.get(kind)
     if (inflight) return this.sliceTop(this.filterFresh(await inflight, now), top)
-    const p = this.scanOnce(kind, top, tf).then((r) => {
+    const p = this.scanOnce(kind, tf).then((r) => {
       this.cache.set(kind, { ts: r.ts, result: r })
       this.scanning.delete(kind)
       return r
@@ -203,8 +227,13 @@ export class ChartSignalsService {
   }
 
   private sliceTop(r: ChartScanResult, top: number): ChartScanResult {
-    if (r.signals.length <= top) return r
-    return { ...r, signals: r.signals.slice(0, top) }
+    if (top <= 0 || r.signals.length <= top) return r
+    const signals = r.signals.slice(0, top)
+    return {
+      ...r,
+      signals,
+      otcQualifying: signals.filter((s) => s.otc).length,
+    }
   }
 
   private filterFresh(r: ChartScanResult, now: number): ChartScanResult {

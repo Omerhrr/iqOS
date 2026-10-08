@@ -2,8 +2,10 @@
 
 // IQAIR//OS - Chart Signals sidebar. The chart-type engines (renko, P&F,
 // range bars, tick bars, footprint / OTC velocity footprint, Heikin Ashi,
-// candlestick math) vote on every open instrument in the kernel; this panel
-// renders the top-5 strongest confluence reads. Option tab = direction +
+// candlestick math) vote on EVERY open instrument in the kernel (no top-N
+// cut - the full qualifying list comes back, sorted by strength); this panel
+// renders them all, filterable by market: All / Real / OTC - click OTC to
+// see only the over-the-counter pairs' reads. Option tab = direction +
 // suggested expiry; CFD tab = the same read with entry / SL / TP levels.
 // Signals carry a kernel-side TTL - stale reads disappear instead of
 // lingering (the list is recomputed every scan, never cached client-side).
@@ -21,6 +23,7 @@ interface ChartSignalsPanelProps {
 }
 
 type Tab = 'option' | 'cfd'
+type Mkt = 'all' | 'real' | 'otc'
 
 function outcomeColor(o: string): string {
   return o === 'win' ? 'text-emerald-300' : o === 'loss' ? 'text-rose-300' : o === 'timeout' ? 'text-amber-300' : 'text-[#4b5a72]'
@@ -271,6 +274,7 @@ function SignalCard({ s, now, tab, onSelectAsset, onTake }: { s: ChartSignal; no
 
 export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: ChartSignalsPanelProps) {
   const [tab, setTab] = useState<Tab>('option')
+  const [mkt, setMkt] = useState<Mkt>('all')
   const [data, setData] = useState<ChartSignalsResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -281,7 +285,8 @@ export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: Ch
   const load = useCallback(
     (opts?: { quiet?: boolean }) => {
       if (!opts?.quiet) setBusy(true)
-      getChartSignals(tab, 5)
+      // no top cut - every qualifying read from the full open-universe scan
+      getChartSignals(tab)
         .then((d) => {
           if (d?.ok) {
             setData(d)
@@ -320,7 +325,8 @@ export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: Ch
     return () => clearInterval(iv)
   }, [])
 
-  const signals = (data?.signals ?? []).filter((s) => s.validUntil > now)
+  const signals = (data?.signals ?? []).filter((s) => s.validUntil > now).filter((s) => (mkt === 'all' ? true : mkt === 'otc' ? s.otc : !s.otc))
+  const otcLive = data?.otcQualifying ?? 0
 
   return (
     <div className="flex h-full min-h-0 flex-col rounded-lg border border-[#1c2739] bg-[#0b111c]">
@@ -343,9 +349,46 @@ export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: Ch
             {label}
           </button>
         ))}
+        <span className="mx-0.5 h-3 w-px bg-[#1c2739]" />
+        {(
+          [
+            ['all', 'All'],
+            ['real', 'Real'],
+            ['otc', 'OTC'],
+          ] as [Mkt, string][]
+        ).map(([m, label]) => (
+          <button
+            key={m}
+            type="button"
+            onClick={() => setMkt(m)}
+            className={`rounded px-1.5 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wider transition-colors ${
+              mkt === m
+                ? m === 'otc'
+                  ? 'bg-amber-500/15 text-amber-300'
+                  : 'bg-cyan-500/15 text-cyan-300'
+                : m === 'otc' && otcLive > 0
+                  ? 'text-amber-400/70 hover:text-amber-300'
+                  : 'text-[#4b5a72] hover:text-[#aab6cc]'
+            }`}
+            title={
+              m === 'otc'
+                ? 'show only the over-the-counter pairs\' reads (micro-tick velocity footprint)'
+                : m === 'real'
+                  ? 'show only real-market instruments (volume footprint)'
+                  : 'show every qualifying read - real and OTC together'
+            }
+          >
+            {label}
+            {m === 'otc' && otcLive > 0 && ` ${otcLive}`}
+          </button>
+        ))}
         {data && (
-          <span className="ml-auto font-mono text-[8px] text-[#4b5a72]" title="instruments scanned per pass · scan duration">
-            {data.scanned} scanned · {data.scanMs}ms
+          <span
+            className="ml-auto font-mono text-[8px] text-[#4b5a72]"
+            title="instruments scanned per pass / open instruments found · considered (enough history) · qualifying reads live now · scan duration"
+          >
+            {data.scanned}
+            {data.universe ? `/${data.universe}` : ''} scanned · {data.considered} hist · {data.qualifying} live · {data.scanMs}ms
           </span>
         )}
         {(() => {
@@ -398,7 +441,11 @@ export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: Ch
             {!error && signals.length === 0 && (
               <div className="p-2 text-[10px] leading-relaxed text-[#4b5a72]">
                 {data
-                  ? `No qualifying reads right now - ${data.considered} instruments had enough history, none reached the 7-engine confluence floor (strength >= 35, >= 3 engines agreeing). Fresh reads appear here automatically.`
+                  ? mkt === 'otc'
+                    ? `No qualifying OTC reads right now - ${data.otcScanned ?? 0} OTC instruments scanned, ${data.otcConsidered ?? 0} had enough history, none reached the 7-engine confluence floor (strength >= 35, >= 3 engines agreeing). The OTC velocity footprint needs a warm tick buffer - it stays honest and votes 0 while cold.`
+                    : mkt === 'real'
+                      ? `No qualifying real-market reads right now - ${data.considered - (data.otcConsidered ?? 0)} real instruments had enough history, none reached the 7-engine confluence floor (strength >= 35, >= 3 engines agreeing). Fresh reads appear here automatically.`
+                      : `${data.qualifying > 0 ? `${data.qualifying} reads just expired - rescanning` : `No qualifying reads right now - ${data.considered} of ${data.scanned} scanned instruments had enough history, none reached the 7-engine confluence floor (strength >= 35, >= 3 engines agreeing)`}. Fresh reads appear here automatically.`
                   : 'Scanning the market with the chart engines (renko, P&F, range, tick, footprint, Heikin Ashi, candles)...'}
               </div>
             )}
@@ -410,7 +457,7 @@ export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: Ch
                 {tab === 'option'
                   ? 'Direction + suggested expiry from chart-type confluence. Real pairs read the volume footprint (CLV proxy), OTC pairs the micro-tick velocity footprint.'
                   : 'Same chart-engine read, expressed as a CFD plan: entry at last close, stop beyond the recent swing (ATR floor), target at >= 1.5R.'}
-                {' '}Click a card to open that asset on the chart - take loads it into the trade ticket.
+                {' '}Every qualifying read is shown (strongest first) - All / Real / OTC filters the market, click a card to open that asset on the chart, take loads it into the trade ticket.
               </p>
             )}
           </>

@@ -1046,12 +1046,15 @@ const httpServer = createServer(async (req, res) => {
 
       // Chart-signal scanner: the chart-type engines (renko / P&F / range /
       // tick / footprint-or-otcfootprint / Heikin Ashi / candlestick math)
-      // vote per open instrument; only the top-N strongest confluence reads
-      // come back, each with a TTL so stale reads disappear. kind=option adds
-      // a suggested expiry; kind=cfd adds entry/SL/TP levels.
+      // vote per open instrument; every qualifying read comes back (the
+      // whole open universe is scanned - no cap), each with a TTL so stale
+      // reads disappear. `top` is an optional read-time cut for callers that
+      // want a short list; default is all. kind=option adds a suggested
+      // expiry; kind=cfd adds entry/SL/TP levels.
       if (path === '/signals') {
         const kind = q.get('kind') === 'cfd' ? 'cfd' : 'option'
-        const top = Math.max(1, Math.min(Number(q.get('top') ?? 5), 10))
+        const topRaw = Number(q.get('top') ?? 0)
+        const top = Number.isFinite(topRaw) ? Math.max(0, Math.min(Math.floor(topRaw), 200)) : 0
         const tfv = tfStrict(q.get('tf'))
         if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
         return json(200, await kernel.context().use<ChartSignalsService>('chartSignals').scan(kind, top, tfv))

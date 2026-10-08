@@ -31,8 +31,12 @@ const get = async (path) => {
 console.log(`chart-signals e2e vs ${BASE}`)
 
 // warm a spread of assets so the scanner has closed history (fresh kernels
-// only materialize candles for touched pairs)
-const warm = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDCAD', 'USDCHF', 'EURCHF', 'NZDUSD', 'USDCAD', 'EURUSD-OTC', 'GBPUSD-OTC']
+// only materialize candles for touched pairs) - includes OTC + crypto so the
+// OTC leg of the scan has history to vote on
+const warm = [
+  'EURUSD', 'GBPUSD', 'USDJPY', 'AUDCAD', 'USDCHF', 'EURCHF', 'NZDUSD', 'USDCAD',
+  'EURUSD-OTC', 'GBPUSD-OTC', 'USDJPY-OTC', 'AUDCAD-OTC', 'EURGBP-OTC', 'BTCUSD', 'ETHUSD', 'SOLUSD',
+]
 for (const a of warm) await get(`/candles?asset=${a}&tf=60&size=240`)
 await new Promise((r) => setTimeout(r, 1500))
 
@@ -41,7 +45,7 @@ const o1 = await get('/signals?kind=option&top=5')
 ok('option 200 + ok', o1.status === 200 && o1.body.ok === true)
 ok('kind/tf echo', o1.body.kind === 'option' && o1.body.tf === '1m')
 ok('scanned >= 8', (o1.body.scanned ?? 0) >= 8, `scanned=${o1.body.scanned}`)
-ok('signals <= 5', Array.isArray(o1.body.signals) && o1.body.signals.length <= 5)
+ok('signals <= 5 (top still respected)', Array.isArray(o1.body.signals) && o1.body.signals.length <= 5)
 ok('has qualifying signals', o1.body.signals.length >= 1, JSON.stringify(o1.body).slice(0, 200))
 
 const s = o1.body.signals[0] ?? null
@@ -67,6 +71,19 @@ ok('sorted by strength desc', sorted)
 const o2 = await get('/signals?kind=option&top=2')
 ok('top=2 respected', o2.body.signals?.length <= 2)
 
+// ---------- full-universe scan: no top cut, OTC included ----------
+// default (no top) returns EVERY qualifying read - the old cap chopped the
+// list at 5/10 and the universe at 18 instruments; the whole open set is
+// scanned now and the response reports coverage (incl. the OTC split).
+const full = await get('/signals?kind=option')
+ok('full 200 + ok', full.status === 200 && full.body.ok === true)
+ok('universe reported', Number.isFinite(full.body.universe) && full.body.universe >= 8, `universe=${full.body.universe}`)
+ok('nothing left behind (scanned === universe)', full.body.scanned === full.body.universe, `scanned=${full.body.scanned} universe=${full.body.universe}`)
+ok('no top cut: all qualifying reads returned', full.body.signals?.length === full.body.qualifying, `signals=${full.body.signals?.length} qualifying=${full.body.qualifying}`)
+ok('OTC assets scanned (>= 2)', (full.body.otcScanned ?? 0) >= 2, `otcScanned=${full.body.otcScanned}`)
+ok('otcQualifying matches the otc cards actually returned', (full.body.otcQualifying ?? -1) === (full.body.signals?.filter((s) => s.otc).length ?? -1), `otcQualifying=${full.body.otcQualifying} otcCards=${full.body.signals?.filter((s) => s.otc).length}`)
+ok('otc chips on otc signals', full.body.signals?.every((s) => typeof s.otc === 'boolean'))
+
 // ---------- cfd kind: level sanity ----------
 const c1 = await get('/signals?kind=cfd&top=5')
 ok('cfd 200 + ok', c1.status === 200 && c1.body.ok === true && c1.body.kind === 'cfd')
@@ -87,7 +104,7 @@ ok('12s cache serves the same scan', a.body.ts === b.body.ts)
 const bad = await get('/signals?kind=option&tf=bogus')
 ok('garbage tf rejected', bad.status === 400 && bad.body.ok === false)
 const clamp = await get('/signals?kind=option&top=99')
-ok('top clamped to 10', clamp.body.signals?.length <= 10)
+ok('top=99 still a clean cut', clamp.body.signals?.length <= 99)
 
 console.log(`\n${pass} checks passed, ${fail} failed`)
 process.exit(fail ? 1 : 0)
