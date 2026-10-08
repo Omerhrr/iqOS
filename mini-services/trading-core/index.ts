@@ -3,7 +3,10 @@
 // REST for every OS operation and socket.io for the real-time event feed.
 // Port 3030. Path '/' is fixed for the Caddy gateway.
 
-import { createServer } from 'http'
+import { createServer, type IncomingMessage } from 'http'
+import { createHash, timingSafeEqual } from 'crypto'
+import { appendFileSync, mkdirSync } from 'node:fs'
+import { join } from 'node:path'
 import { Server } from 'socket.io'
 import { Kernel } from './src/kernel'
 import { storePlugin } from './src/plugins/store'
@@ -24,11 +27,13 @@ import { otcGuardPlugin, OtcGuardService, type OtcDefenseReport } from './src/pl
 import { otcFootprintPlugin, OtcFootprintService } from './src/plugins/otcfootprint'
 import { chartSignalsPlugin, ChartSignalsService } from './src/plugins/chartsignals'
 import { gridSearch, walkForward, sweepAssets, type Objective } from './src/strategies/optimize'
+import { backtest } from './src/strategies/backtest'
 import type { BacktestOptions } from './src/strategies/backtest'
 import { normalizeSpec, type CustomSpec } from './src/strategies/custom'
+import { MINABLE_ENGINES, ENGINE_LABEL, type ChartEngineId } from './src/analytics/chartsignals'
 import { vskMonteCarlo } from './src/analytics/vsk'
 import { tskMonteCarlo } from './src/analytics/tsk'
-import { ALL_TIMEFRAMES, type Timeframe } from './src/types'
+import { ALL_TIMEFRAMES, type Candle, type Timeframe } from './src/types'
 import { searchInstruments, universeStats, getInstrument } from './src/universe'
 import { listRegistry, computeIndicator, registrySize, getIndicatorDef } from './src/analytics/registry'
 import { detectChartPatterns } from './src/analytics/chart-patterns'
@@ -51,6 +56,80 @@ import { tfSeconds } from './src/analytics/synthfeed'
 // Defaults to 3030 for local/Windows dev; the Docker deployment overrides
 // this to an unusual, hard-to-collide-with port via the KERNEL_PORT env var.
 const PORT = Number(process.env.KERNEL_PORT ?? 3030)
+
+// ---------- P0 security baseline (token auth + rate limit + audit) ----------
+// KERNEL_TOKEN: when set, every REST route (except /health liveness and the
+// /socket.io feed transport) requires the token via the x-kernel-token
+// header, an "Authorization: Bearer <token>" header, or a ?token= query
+// param. Comparison is timing-safe (sha256 digests). Unset = open, which is
+// the local/dev posture; the Docker deployment sets the token on BOTH the
+// kernel and web containers (web injects it server-side - the browser never
+// sees it). The remaining P0 tail (web auth / Telegram / backups) is tracked
+// in deploy/README.md.
+const KERNEL_TOKEN = (process.env.KERNEL_TOKEN ?? '').trim()
+const RATE_CAPACITY = 240 // burst bucket per client IP
+const RATE_REFILL_PER_SEC = 4 // sustained ~240 req/min per IP
+const RATE_MAX_IPS = 1000 // bound the bucket map under address churn
+const buckets = new Map<string, { tokens: number; ts: number }>()
+
+function rateLimit(ip: string): { ok: boolean; retryAfter: number } {
+  const now = Date.now()
+  const b = buckets.get(ip) ?? { tokens: RATE_CAPACITY, ts: now }
+  b.tokens = Math.min(RATE_CAPACITY, b.tokens + ((now - b.ts) / 1000) * RATE_REFILL_PER_SEC)
+  b.ts = now
+  if (b.tokens < 1) {
+    buckets.set(ip, b)
+    return { ok: false, retryAfter: Math.max(1, Math.ceil((1 - b.tokens) / RATE_REFILL_PER_SEC)) }
+  }
+  b.tokens -= 1
+  buckets.set(ip, b)
+  if (buckets.size > RATE_MAX_IPS) {
+    for (const [k, v] of buckets) if (v.ts < now - 600_000) buckets.delete(k)
+    while (buckets.size > RATE_MAX_IPS) {
+      const oldest = [...buckets.entries()].sort((a, c) => a[1].ts - c[1].ts)[0]
+      buckets.delete(oldest[0])
+    }
+  }
+  return { ok: true, retryAfter: 0 }
+}
+
+function tokenOk(req: IncomingMessage, url: URL): boolean {
+  const bearer = /^Bearer\s+(.+)$/i.exec(String(req.headers.authorization ?? ''))
+  const given =
+    String(req.headers['x-kernel-token'] ?? '').trim() ||
+    (bearer ? bearer[1].trim() : '') ||
+    (url.searchParams.get('token') ?? '').trim()
+  if (!given) return false
+  const a = createHash('sha256').update(given).digest()
+  const b = createHash('sha256').update(KERNEL_TOKEN).digest()
+  return timingSafeEqual(a, b)
+}
+
+// Append-only audit trail: every state-changing (POST) call plus every 401 /
+// 429 rejection lands in data/audit.jsonl. Query strings are stripped (the
+// ?token= fallback must never be logged) and bodies are NEVER written (the
+// live-mode login route's body carries broker credentials).
+const AUDIT_PATH = join(process.cwd(), 'data', 'audit.jsonl')
+function auditLine(row: Record<string, unknown>): void {
+  try {
+    mkdirSync(join(process.cwd(), 'data'), { recursive: true })
+    appendFileSync(AUDIT_PATH, JSON.stringify(row) + '\n')
+  } catch {
+    /* audit is best-effort - it must never break the request path */
+  }
+}
+
+/** Wilson 95% score interval on a proportion, in percent. Same math the lab
+ * uses for its SignalStat CI, kept local so the research route doesn't reach
+ * into the lab plugin's internals. */
+function wilsonPct(wins: number, total: number, z = 1.96): [number, number] {
+  if (total <= 0) return [0, 100]
+  const p = wins / total
+  const denom = 1 + (z * z) / total
+  const center = p + (z * z) / (2 * total)
+  const margin = z * Math.sqrt((p * (1 - p)) / total + (z * z) / (4 * total * total))
+  return [Math.max(0, ((center - margin) / denom) * 100), Math.min(100, ((center + margin) / denom) * 100)]
+}
 
 const kernel = new Kernel()
 kernel.register(storePlugin)
@@ -84,6 +163,35 @@ const httpServer = createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', `http://127.0.0.1:${PORT}`)
   const path = url.pathname
   const q = url.searchParams
+
+  // ---- P0 security gate: rate limit -> token auth, BEFORE any body read ----
+  const t0 = Date.now()
+  const xff = String(req.headers['x-forwarded-for'] ?? '')
+  const ip = xff.split(',')[0].trim() || req.socket.remoteAddress || 'unknown'
+  // audit watcher: POSTs are state-changing, 401/429 are the security
+  // rejections - everything else is a read and stays out of the trail
+  let status = 0
+  res.on('finish', () => {
+    if (req.method !== 'POST' && status !== 401 && status !== 429) return
+    auditLine({ ts: new Date().toISOString(), ip, m: req.method, path, status, ms: Date.now() - t0 })
+  })
+  const limited = rateLimit(ip)
+  if (!limited.ok) {
+    status = 429
+    res.writeHead(429, { 'content-type': 'application/json', 'retry-after': String(limited.retryAfter) })
+    res.end(JSON.stringify({ ok: false, error: 'rate limited', retryAfter: limited.retryAfter }))
+    return
+  }
+  if (KERNEL_TOKEN && path !== '/health' && !path.startsWith('/socket.io') && !tokenOk(req, url)) {
+    status = 401
+    res.writeHead(401, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({
+      ok: false,
+      error: 'unauthorized - missing or invalid kernel token (x-kernel-token header, Bearer auth, or ?token=)',
+    }))
+    return
+  }
+
   let body: Record<string, unknown> = {}
   if (req.method === 'POST') {
     const chunks: Uint8Array[] = []
@@ -96,6 +204,7 @@ const httpServer = createServer(async (req, res) => {
   }
 
   const json = (code: number, data: unknown) => {
+    status = code
     res.writeHead(code, { 'content-type': 'application/json' })
     res.end(JSON.stringify(data))
   }
@@ -955,6 +1064,242 @@ const httpServer = createServer(async (req, res) => {
       // actually delivered, not just what they claim.
       if (path === '/signals_stats') {
         return json(200, { ok: true, ...kernel.context().use<ChartSignalsService>('chartSignals').stats(), ts: Date.now() })
+      }
+
+      // Engine-edge research: "which chart engines actually carry an edge?"
+      // merges BOTH feedback loops in one read -
+      //   (1) the live honesty loop (64-c): every Signal-Panel read is
+      //       resolved at its own expiry and attributed per engine, so the
+      //       live column shows what the charts actually delivered;
+      //   (2) the lab loop (64-d): every minable engine vote replayed as an
+      //       ad-hoc EngineVoteSignal spec through the lab's own binary
+      //       settlement engine (backtest()) over each selected asset's
+      //       trailing candles, pooled per engine+direction and scored with
+      //       a Wilson 95% interval against the payout breakeven.
+      // Verdicts: edge (Wilson LB clears breakeven by +2pts on >= minN
+      // trades) / watch (winRate above breakeven, LB not there yet) / thin
+      // (n < minN) / coinflip / fade (Wilson UB BELOW breakeven - the engine
+      // is confidently worse than a coin, so the INVERTED vote is a research
+      // candidate). otcfootprint appears live-only: its tick buffer cannot
+      // be rebuilt from OHLC history, so the lab loop can never mine it.
+      if (path === '/engines_edge') {
+        const tfv = tfStrict(q.get('tf'))
+        if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+        const win = Math.max(240, Math.min(Number(q.get('window') ?? 420) || 420, 600))
+        const expBars = Math.max(1, Math.min(Number(q.get('expiryBars') ?? 1) || 1, 5))
+        const payout = Math.max(0.5, Math.min(Number(q.get('payout') ?? 0.85) || 0.85, 0.98))
+        const minN = Math.max(10, Math.min(Number(q.get('minN') ?? 30) || 30, 200))
+        const breakeven = 100 / (1 + payout)
+
+        // asset selection: requested tickers (capped 6) or active-first open set (3)
+        const wanted = (q.get('assets') ?? '')
+          .split(',')
+          .map((s) => s.trim().toUpperCase())
+          .filter(Boolean)
+          .slice(0, 6)
+        const open = searchInstruments('', 'all').filter((i) => i.open)
+        const active = market.activeAsset
+        let picks = wanted.map((t) => open.find((i) => i.ticker === t)).filter((i): i is (typeof open)[number] => !!i)
+        if (!picks.length) {
+          picks = [...open]
+            .sort((a, b) => (a.ticker === active ? -1 : b.ticker === active ? 1 : 0))
+            .slice(0, 3)
+        }
+
+        // (1) live honesty loop - per engine, per kind
+        interface LiveEngineStat { votes: number; hits: number; winRate: number | null }
+        interface LiveEngineRow { option?: LiveEngineStat; cfd?: LiveEngineStat }
+        const liveStats = kernel.context().use<ChartSignalsService>('chartSignals').stats()
+        const liveOf = new Map<string, LiveEngineRow>()
+        for (const kind of ['option', 'cfd'] as const) {
+          for (const e of liveStats[kind].engines) {
+            const row = liveOf.get(e.engine) ?? {}
+            row[kind] = { votes: e.votes, hits: e.hits, winRate: e.winRate }
+            liveOf.set(e.engine, row)
+          }
+        }
+
+        // (2) lab loop - engine votes through the lab's settlement engine
+        interface HistRow { asset: string; n: number; wins: number; winRate: number; netPnl: number; pf: number }
+        interface DirAgg { n: number; wins: number; rows: HistRow[] }
+        const hist = new Map<ChartEngineId, { call: DirAgg; put: DirAgg }>()
+        for (const engine of MINABLE_ENGINES) {
+          hist.set(engine, { call: { n: 0, wins: 0, rows: [] }, put: { n: 0, wins: 0, rows: [] } })
+        }
+        for (const info of picks) {
+          let candles: Candle[] = []
+          try {
+            candles = market.getCandlesDeep(info.ticker, tfv, win, true)
+          } catch {
+            continue
+          }
+          if (candles.length < 80) continue // thin history - no honest walk
+          for (const engine of MINABLE_ENGINES) {
+            for (const dir of ['call', 'put'] as const) {
+              const spec: CustomSpec = {
+                name: `research:${engine}:${dir}`,
+                signals: [{ kind: 'engine', engine, dir, weight: 1 }],
+                minScore: 0,
+                minVotes: 1,
+                horizon: expBars,
+              }
+              try {
+                const r = backtest(candles, info.ticker, tfv, {
+                  strategy: 'custom:research-engine-vote',
+                  customSpec: spec,
+                  mode: 'binary',
+                  payout,
+                  expiryBars: expBars,
+                  amount: 10,
+                  warmupBars: 60, // engines self-gate at their own 40-candle floor
+                })
+                const m = r.metrics
+                if (m.totalTrades > 0) {
+                  const agg = hist.get(engine)![dir]
+                  agg.n += m.totalTrades
+                  agg.wins += m.wins
+                  agg.rows.push({
+                    asset: info.ticker,
+                    n: m.totalTrades,
+                    wins: m.wins,
+                    winRate: Math.round(m.winRate * 10) / 10,
+                    netPnl: Math.round(m.netPnl * 100) / 100,
+                    pf: Math.round(m.profitFactor * 100) / 100,
+                  })
+                }
+              } catch {
+                /* one engine failing never blanks the report */
+              }
+            }
+          }
+        }
+
+        interface DirOut {
+          dir: 'call' | 'put'
+          n: number
+          wins: number
+          winRate: number | null
+          edgeLB: number | null
+          assets: HistRow[]
+        }
+        interface EngineOut {
+          engine: ChartEngineId | string
+          label: string
+          verdict: string
+          n: number
+          winRate: number | null
+          wilsonLB: number | null
+          wilsonUB: number | null
+          edgeLB: number | null
+          live: LiveEngineRow
+          byDir: DirOut[]
+        }
+        const enginesOut: EngineOut[] = [...hist.entries()].map(([engine, agg]) => {
+          const decided = agg.call.n + agg.put.n
+          const wins = agg.call.wins + agg.put.wins
+          const [lb, ub] = wilsonPct(wins, decided)
+          const byDir: DirOut[] = (['call', 'put'] as const).map((d) => {
+            const a = agg[d]
+            const [dlb] = wilsonPct(a.wins, a.n)
+            return {
+              dir: d,
+              n: a.n,
+              wins: a.wins,
+              winRate: a.n ? Math.round((a.wins / a.n) * 1000) / 10 : null,
+              edgeLB: a.n ? Math.round((dlb - breakeven) * 10) / 10 : null,
+              assets: [...a.rows].sort((x, y) => y.n - x.n).slice(0, 3),
+            }
+          })
+          let verdict: string
+          if (!decided) verdict = 'no-data'
+          else if (decided < minN) verdict = 'thin'
+          else if (lb >= breakeven + 2) verdict = 'edge'
+          else if (ub <= breakeven - 2) verdict = 'fade'
+          else if (wins / decided > breakeven / 100) verdict = 'watch'
+          else verdict = 'coinflip'
+          return {
+            engine,
+            label: ENGINE_LABEL[engine],
+            verdict,
+            n: decided,
+            winRate: decided ? Math.round((wins / decided) * 1000) / 10 : null,
+            wilsonLB: decided ? Math.round(lb * 10) / 10 : null,
+            wilsonUB: decided ? Math.round(ub * 10) / 10 : null,
+            edgeLB: decided ? Math.round((lb - breakeven) * 10) / 10 : null,
+            live: liveOf.get(engine) ?? {},
+            byDir,
+          }
+        })
+        // live loop knows the OTC velocity footprint even though OHLC
+        // history can never mine it - surface it as a live-only row
+        for (const [engine, lv] of liveOf) {
+          if (hist.has(engine as ChartEngineId)) continue
+          enginesOut.push({
+            engine,
+            label: ENGINE_LABEL[engine as ChartEngineId] ?? engine,
+            verdict: 'live-only',
+            n: 0,
+            winRate: null,
+            wilsonLB: null,
+            wilsonUB: null,
+            edgeLB: null,
+            live: lv,
+            byDir: [],
+          })
+        }
+        enginesOut.sort((a, b) => (b.edgeLB ?? -99) - (a.edgeLB ?? -99))
+
+        // deployed knowledge: learned engine specs already in the lab store
+        const labSpecs = kernel
+          .context()
+          .use<StrategyLabService>('lab')
+          .list()
+          .filter((row) => row.spec?.signals?.some((s) => s.kind === 'engine'))
+          .map((row) => ({
+            id: row.id,
+            name: row.spec.name,
+            asset: row.asset,
+            tf: row.tf,
+            trades: row.stats?.backtest?.trades ?? 0,
+            winRate: row.stats?.backtest ? Math.round(row.stats.backtest.winRate * 10) / 10 : null,
+            ciLow: row.stats?.backtest ? Math.round(row.stats.backtest.winRateCiLow * 10) / 10 : null,
+            decayed: row.stats?.decayed ?? false,
+          }))
+          .sort((a, b) => b.trades - a.trades)
+          .slice(0, 8)
+
+        return json(200, {
+          ok: true,
+          tf: tfv,
+          window: win,
+          expiryBars: expBars,
+          payout,
+          breakevenWinRate: Math.round(breakeven * 100) / 100,
+          minN,
+          assets: picks.map((p) => p.ticker),
+          engines: enginesOut,
+          liveKinds: {
+            option: {
+              resolved: liveStats.option.resolved,
+              wins: liveStats.option.wins,
+              losses: liveStats.option.losses,
+              winRate: liveStats.option.winRate,
+              pending: liveStats.option.pending,
+            },
+            cfd: {
+              resolved: liveStats.cfd.resolved,
+              wins: liveStats.cfd.wins,
+              losses: liveStats.cfd.losses,
+              winRate: liveStats.cfd.winRate,
+              timeouts: liveStats.cfd.timeouts,
+              pending: liveStats.cfd.pending,
+            },
+          },
+          labSpecs,
+          note:
+            'verdicts: edge = Wilson LB clears the payout breakeven by +2pts on >= minN trades; watch = winRate above breakeven, LB unproven; thin = n < minN; coinflip; fade = Wilson UB BELOW breakeven (inversion candidate). history = engine votes replayed through the lab binary settlement engine over trailing candles per engine x direction; live = the Signal Panel honesty loop',
+          ts: Date.now(),
+        })
       }
 
       if (path === '/strategies')
@@ -2150,6 +2495,9 @@ ctx.bus.on('alert', (p) => {
 kernel.start().then(() => {
   httpServer.listen(PORT, () => {
     console.log(`[trading-core] IQAIR//OS kernel listening on :${PORT}`)
+    console.log(
+      `[trading-core] P0 security: token auth ${KERNEL_TOKEN ? 'ON (REST requires the kernel token)' : 'OFF - open REST surface, set KERNEL_TOKEN to lock down'} | rate limit ${RATE_CAPACITY} burst / ${RATE_REFILL_PER_SEC}/s per IP | audit -> data/audit.jsonl`
+    )
   })
   // Boot-time source restore: the PERSISTED account source decides what the
   // OS resumes as. Paper stays on the sim feed even when the sidecar holds a

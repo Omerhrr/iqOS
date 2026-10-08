@@ -409,6 +409,65 @@ export async function getSignalStats(): Promise<{ ok: boolean; option: SignalKin
   return osGet<{ ok: boolean; option: SignalKindStats; cfd: SignalKindStats; ts: number }>('/signals_stats')
 }
 
+// ---- engine-edge research (both loops merged: honesty + lab) -------------
+// Kernel route /engines_edge: per chart engine, the live honesty loop's real
+// resolved reads AND a deep-history lab measurement (engine votes replayed
+// through the binary settlement engine, Wilson interval vs payout breakeven),
+// pooled into edge / watch / thin / coinflip / fade verdicts.
+
+export interface EngineEdgeLiveStat {
+  votes: number
+  hits: number
+  winRate: number | null
+}
+
+export interface EngineEdgeDirRow {
+  dir: 'call' | 'put'
+  n: number
+  wins: number
+  winRate: number | null
+  edgeLB: number | null
+  assets: { asset: string; n: number; wins: number; winRate: number; netPnl: number; pf: number }[]
+}
+
+export interface EngineEdgeEngine {
+  engine: string
+  label: string
+  verdict: 'edge' | 'watch' | 'thin' | 'coinflip' | 'fade' | 'live-only' | 'no-data'
+  n: number
+  winRate: number | null
+  wilsonLB: number | null
+  wilsonUB: number | null
+  edgeLB: number | null
+  live: { option?: EngineEdgeLiveStat; cfd?: EngineEdgeLiveStat }
+  byDir: EngineEdgeDirRow[]
+}
+
+export interface EnginesEdgeResponse {
+  ok: boolean
+  tf: Timeframe
+  window: number
+  expiryBars: number
+  payout: number
+  breakevenWinRate: number
+  minN: number
+  assets: string[]
+  engines: EngineEdgeEngine[]
+  liveKinds: {
+    option: { resolved: number; wins: number; losses: number; winRate: number | null; pending: number }
+    cfd: { resolved: number; wins: number; losses: number; winRate: number | null; timeouts: number; pending: number }
+  }
+  labSpecs: { id: string; name: string; asset: string; tf: string; trades: number; winRate: number | null; ciLow: number | null; decayed: boolean }[]
+  note: string
+  ts: number
+}
+
+export async function getEnginesEdge(
+  params: { tf?: string; assets?: string; window?: number; expiryBars?: number; payout?: number; minN?: number } = {}
+): Promise<EnginesEdgeResponse> {
+  return osGet<EnginesEdgeResponse>('/engines_edge', params as Record<string, string | number | undefined>)
+}
+
 export async function getDelta(asset: string, tf: Timeframe, opts?: { limit?: number }): Promise<{ deltas: CandleDelta[]; cumulative: CumulativeDeltaPoint[] }> {
   const d = await osGet<{ ok: boolean; deltas: CandleDelta[]; cumulative: CumulativeDeltaPoint[] }>('/delta', {
     asset,

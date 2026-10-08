@@ -9,6 +9,15 @@ import { chatComplete, enabledProviders, type ChatMessage } from '@/lib/llm'
 
 const CORE = process.env.KERNEL_URL || 'http://127.0.0.1:3030'
 
+// P0 security: the kernel rejects unauthenticated REST when KERNEL_TOKEN is
+// set - every server-side kernel call from the copilot loop carries it. This
+// runs in the Node runtime, so the token is read fresh per request (unlike
+// middleware.ts, which bakes it at build time for the rewrite path).
+function kernelHeaders(): Record<string, string> {
+  const t = process.env.KERNEL_TOKEN
+  return t ? { 'x-kernel-token': t } : {}
+}
+
 interface ToolSpec {
   name: string
   description: string
@@ -79,14 +88,14 @@ interface TraceEntry {
 }
 
 async function coreGet(path: string): Promise<unknown> {
-  const res = await fetch(`${CORE}${path}`, { cache: 'no-store' })
+  const res = await fetch(`${CORE}${path}`, { headers: kernelHeaders(), cache: 'no-store' })
   return res.json()
 }
 
 async function corePost(path: string, body: unknown): Promise<unknown> {
   const res = await fetch(`${CORE}${path}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...kernelHeaders() },
     body: JSON.stringify(body ?? {}),
     cache: 'no-store',
   })
@@ -987,6 +996,25 @@ const TOOLS: ToolSpec[] = [
     description: 'Delete a learned strategy from the lab library by id. Bots already configured with it keep running.',
     args: '{"id": "custom:eurusd-1m-lab"}',
     run: (a) => corePost('/lab_delete', { id: String(a.id) }),
+  },
+  {
+    name: 'engines_edge',
+    description:
+      'Research "WHICH CHART ENGINES CARRY EDGE" in ONE call - merges BOTH feedback loops the OS runs on the chart engines: (1) the live Signal-Panel honesty loop (every panel read is resolved at its own expiry on real prices and attributed per engine - renko / P&F / range / tick / footprint / Heikin Ashi / candle math, real + OTC markets, option and CFD kinds) and (2) the deep-history lab loop (each engine vote replayed as a lab EngineVoteSignal through the REAL binary settlement engine over each selected asset\'s trailing candles, pooled per engine+direction, scored with a Wilson 95% interval against the payout breakeven). One row per engine: verdict (edge = Wilson LB clears breakeven by +2pts on >= minN trades; watch = winRate above breakeven but LB unproven; thin = n < minN; coinflip; fade = Wilson UB BELOW breakeven - the engine is confidently WORSE than a coin, so testing the INVERTED vote is a legitimate research follow-up; live-only = OTC velocity footprint, which history cannot mine), n, winRate, wilsonLB/UB, edgeLB, per-direction breakdowns with the top assets each side fired on, the live per-kind columns, the payout breakeven, and labSpecs (engine specs already learned in the Strategy Lab with their backtest records). THE tool for "which engines carry edge", "is renko actually working", "what should I stop trusting", "what\'s actually working". ALWAYS say the sample sizes out loud in your verdict (a 56% win rate on n=18 is noise, not edge). Follow up on edge/watch rows with backtest / optimize_strategy / walkforward / lab_learn on the top assets; treat fade rows as inversion candidates to TEST, not as confirmed trades.',
+    args: '{ "tf": "1m", "assets": "EURUSD-OTC,BTCUSD", "window": 420, "expiryBars": 1, "payout": 0.85, "minN": 30 } (all optional - default tf 1m, active asset + top open assets, max 6 tickers)',
+    run: async (a) => {
+      const qs = new URLSearchParams()
+      const put = (k: string, v: unknown) => {
+        if (v !== undefined && v !== null && v !== '') qs.set(k, String(v))
+      }
+      put('tf', normalizeTf(a.tf))
+      put('assets', a.assets)
+      put('window', a.window)
+      put('expiryBars', a.expiryBars)
+      put('payout', a.payout)
+      put('minN', a.minN)
+      return coreGet(`/engines_edge${qs.toString() ? `?${qs}` : ''}`)
+    },
   },
   {
     name: 'create_strategy',
@@ -2060,6 +2088,7 @@ All of them work in run_strategy / backtest / optimize_strategy / walkforward / 
 SEVEN MORE BUILTIN STRATEGIES (same tools as above): "ichimoku-cloud" (price vs the senkou cloud + tenkan/kijun cross, thin-cloud crosses scored down), "vwap-reversion" (fades the z-score stretch from VWAP - the cheap cross-check against kalman-ou-reversion on the same instrument), "keltner-chandelier" (ATR-scaled channel breakout, reports the Chandelier Exit line as an invalidation reference since the binary engine is fixed-expiry, not trailing-stop), "mtf-alignment" (resamples the SAME feed into synthetic 5x/15x bars and requires minAgree of the 3 EMA(8/21) reads to agree - the confluence_read MTF idea as a deployable strategy), "vol-squeeze-breakout" (plain Bollinger-width squeeze-then-breakout - the simpler single-layer baseline to check whether VSK/TSK's extra Kalman/PSAR machinery earns its keep on a given instrument), "liquidity-sweep-reversal" (fires on a wick through a real supportResistance() zone that closes back inside it - a stop-hunt rejection, unlike Pattern Confluence which has no concept of WHERE on the chart a pattern fired), and "garch-vol-expansion" (the expansion mirror of kalman-ou-vol-regime, which fades compression - this one trades WITH momentum when GARCH/EWMA vol ratio clears 1.3, the same threshold regime_playbook uses for its VOLATILE classification).
 ORDER FLOW (approx) - use the order_flow tool to pull Volume Profile (Point of Control, Value Area High/Low, per-price-bucket volume) and candle delta / cumulative delta for an asset+timeframe, the same data behind the Order Flow panel on the chart. This is a CLV (close-location-value) approximation of buy/sell volume split from OHLCV candles, NOT real tick-level order-flow or order-book depth - IQ Option exposes no bid/ask-tagged trades, so always caveat any read from it as "(approx)". THREE MORE BUILTIN STRATEGIES use this data: "poc-reversion" (CALL when price has stretched below the recent Point of Control with delta turning positive, PUT the mirror above POC), "value-area-breakout" (CALL/PUT on a close outside the Value Area High/Low, scored up when supporting delta confirms the breakout and down when delta doesn't), and "delta-divergence" (PUT when price makes a new local high but cumulative delta fails to confirm it, CALL the mirror at a new local low) - all three show up in list_strategies/run_strategy/backtest like any other builtin. The AI Lab's signal DSL also gained an order-flow family (ind: "ofdelta"/"ofcumdelta"/"ofpocdist"/"ofvapos", same indicator-signal shape as rsi/zscore/etc.) so lab_learn/create_strategy can discover edge in delta, cumulative-delta slope, POC distance or value-area position automatically alongside every other indicator family.
 SIX CHART-TYPE STRATEGIES (the chart engines as tradeable builtins, all in list_strategies/run_strategy/backtest like any other): "range-run" (range-bar continuation - every range bar spans exactly one full ATR-sized range of travel, so a young run of same-direction bars is sustained pressure measured in distance, not time; fires while the run is young, stands aside once older than confirm - the no-reversal-multiplier sibling of renko-flip), "volbars-conviction" (constant-volume bars normalize activity, so a dominant BODY on equal (approx) volume is directional conviction, not a busy tape; reads only COMPLETED bars, the forming trailing bar is excluded), "footprint-imbalance" (the footprint chart's stacked-imbalance read: fires when the last candle shows minRows price bins where one side carries >= imbalanceRatio x the other - CLV proxy, volume-less candles never fire), "tpo-fade" (market-profile balance-day fade: only when price rotated through the POC minRotations times (balance) and the close pokes just outside the 70% value area, fade back toward POC; far excursions read as trend days and stand aside - the deliberate OPPOSITE of value-area-breakout, which trades the breakout), "tick-regime" (reads the tape's own character from candle closes as pseudo-ticks: P(same-direction consecutive move) with a binomial z vs the fair coin - persistent tapes continue the last move, anti-persistent tapes (real-feed bid-ask bounce) fade it, and a FAIR-COIN tape (|z| < zMin) stands aside by construction, which is how this strategy honestly refuses OTC feeds), and "ivhv-edge" (the IV-vs-HV chart's edge view: fires when the realized up-close frequency over the window clears the payout-implied breakeven q = 100/(1+payout) - the disclosed IV proxy - by a margin; payout is a PARAM, the live EV gate still applies at trade time). regime_playbook routes them: range-run/volbars-conviction/footprint-imbalance for TRENDING, tpo-fade for RANGING, ivhv-edge for VOLATILE, tick-regime for MIXED.
+ENGINE EDGE RESEARCH - the engines_edge tool answers "which chart engines actually carry edge" by merging BOTH feedback loops the OS keeps on the chart engines: the live Signal-Panel honesty loop (real resolved reads per engine, option + CFD kinds) and the deep-history lab loop (engine votes replayed through the binary settlement engine, Wilson interval vs the payout breakeven). Verdicts: edge / watch / thin / coinflip / fade - a "fade" verdict means the engine is confidently WORSE than breakeven and the INVERTED vote is a research candidate to test, not a confirmed trade. Call engines_edge when the user asks "is renko any good", "which signals should I trust", "what's actually working" - and always report the sample sizes alongside any verdict (a 56% win rate on n=18 is noise, not edge).
 ENSEMBLE (strategy id "ensemble-vote", params: members = comma-separated builtin strategy ids e.g. "ema-trend,rsi-reversion,markov-edge", voteMinScore = per-member score to count as a vote (default 40), minAgree = how many members must agree (default 2)) trades only the INTERSECTION of independent edges: it runs each member strategy on the same candles and only fires when minAgree+ of them agree on direction, scoring the average of the agreeing members' scores with a small consensus discount when agreement is right at the floor. Use it when the user wants higher precision at the cost of fewer signals ("I want fewer but more confident trades", "only trade when multiple things agree") - suggest 2-3 members that capture DIFFERENT signal types (e.g. one trend strategy + one mean-reversion + one Markov/statistical one) rather than near-duplicates, since correlated members defeat the point of voting. Always walkforward-validate the ensemble itself (not just its members individually) before arming a bot on it - member edges can each be real without their intersection being tradeable, and the research gate below enforces this anyway.
 CRITICAL - "members" is NOT a sweep key, it's a fixed param: members is a comma-separated id LIST, not a numeric range, so it can never go inside optimize_strategy/walkforward's "sweep" object (sweep only does from/to/step over numbers). To test YOUR chosen members (not the strategy's own default "ema-trend,rsi-reversion,markov-edge"), you MUST pass them in the separate "params" argument, e.g. walkforward with strategy "ensemble-vote" and params {"members":"pattern-confluence,confluence-full","minAgree":2,"voteMinScore":40}. Putting members inside "sweep" or leaving it out of the call entirely silently reverts to the default trio - always re-read the result's bestParams.members back before reporting a verdict, and if it doesn't match what you intended to test, STOP and say so rather than reporting a verdict on a different ensemble than the one discussed.
 STRUCTURAL chart tools (drawing-tool family, category "structural" in list_indicators): "pivots" (floor pivot points PP/R1-R3/S1-S3, variants classic/fibonacci/camarilla/woodie, session-based), "fib" (auto Fibonacci retracement 0-100% + 1.272/1.618 extensions of the last swing), "trendlines" (auto S/R trendlines from fractal swing pivots), "fvg" (fair value gaps - 3-bar imbalance zones tracked until filled). Add them to the user's chart with ui_control when they ask for pivot points, fibonacci, trendlines or liquidity gaps - e.g. add pivots + fib before a level-based read.

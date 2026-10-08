@@ -6,6 +6,9 @@
 // sanity (SL/TP on the right side, RR floor), TTL freshness, cache, sorting
 // and the strict tf gate. Read-only - the scanner touches no kernel state.
 const BASE = process.env.IQAIR_OS_URL ?? 'http://localhost:3030'
+// P0: kernels started with KERNEL_TOKEN reject unauthenticated REST - send
+// the token from env when the target kernel has one.
+const TOKEN = (process.env.KERNEL_TOKEN ?? '').trim()
 let pass = 0
 let fail = 0
 const ok = (name, cond, detail = '') => {
@@ -18,7 +21,10 @@ const ok = (name, cond, detail = '') => {
   }
 }
 const get = async (path) => {
-  const r = await fetch(`${BASE}${path}`, { signal: AbortSignal.timeout(60_000) })
+  const r = await fetch(`${BASE}${path}`, {
+    headers: TOKEN ? { 'x-kernel-token': TOKEN } : {},
+    signal: AbortSignal.timeout(60_000),
+  })
   return { status: r.status, body: await r.json().catch(() => ({})) }
 }
 

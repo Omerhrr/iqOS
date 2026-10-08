@@ -25,7 +25,11 @@ async function coreAlive(timeoutMs = 1500): Promise<boolean> {
   try {
     const ctrl = new AbortController()
     const t = setTimeout(() => ctrl.abort(), timeoutMs)
-    const res = await fetch(`${KERNEL_URL}/health`, { signal: ctrl.signal, cache: 'no-store' })
+    // P0: /health is token-exempt on the kernel, but sending the header when
+    // the env has one keeps this probe correct if the exemption ever narrows.
+    const headers: Record<string, string> = {}
+    if (process.env.KERNEL_TOKEN) headers['x-kernel-token'] = process.env.KERNEL_TOKEN
+    const res = await fetch(`${KERNEL_URL}/health`, { signal: ctrl.signal, cache: 'no-store', headers })
     clearTimeout(t)
     return res.ok
   } catch {

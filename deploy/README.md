@@ -97,6 +97,46 @@ subdomains on this same box.
   the named volume `iqos-kernel-data`, independent of container
   rebuilds/redeploys.
 
+## P0 security baseline (KERNEL_TOKEN)
+
+The kernel ships with a P0 security baseline: token auth, per-IP rate
+limiting and an append-only audit trail.
+
+1. **Generate a token** on the VDS and put it in `.env` (repo root - compose
+   interpolates it into both containers automatically):
+   ```bash
+   echo "KERNEL_TOKEN=$(openssl rand -hex 24)" >> .env
+   docker compose up -d --build   # the web image bakes it at build time
+   ```
+2. **What gets enforced** once `KERNEL_TOKEN` is set:
+   - Kernel: every REST route except `/health` and the `/socket.io/` feed
+     requires the token (`x-kernel-token` header, `Authorization: Bearer`, or
+     `?token=` for quick scripts). Wrong/missing token = 401.
+   - Web: the token never reaches the browser. The agent/keeper API routes
+     read it from runtime env; `src/middleware.ts` injects it into the
+     browser's `?XTransformPort=` rewrite path. NOTE: middleware inlines the
+     token at BUILD time (same as the kernel URL), so rotating the token
+     means `docker compose up -d --build` again.
+   - Rate limit: per-IP token bucket, 240 burst / 4 req-s per IP, `429` with
+     `retry-after` above that.
+   - Audit: every state-changing (POST) call plus every 401/429 lands in the
+     kernel's `data/audit.jsonl` (query strings stripped so `?token=` is
+     never logged; bodies are never logged either - the live-mode login body
+     carries broker credentials).
+3. **Remaining P0 tail** (tracked, deliberately not in this pass):
+   - Web auth: put the OS behind Caddy basic auth on the VDS - one block in
+     your existing Caddyfile:
+     ```
+     iqos.rogan.live {
+             basic_auth {
+                     rogan <bcrypt-hash-from-caddy-hash-password>
+             }
+             reverse_proxy iqos-web:47311
+     }
+     ```
+   - Telegram alert bridge (needs a bot token from you).
+   - Consistent SQLite snapshot backups of the kernel's data volume.
+
 ## LIVE mode (IQ Option) - the `live/` sidecar
 
 `live/iqair_sidecar.py` bridges the kernel to IQ Option via the `iqair`

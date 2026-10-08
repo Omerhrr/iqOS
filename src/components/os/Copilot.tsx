@@ -740,6 +740,7 @@ const QUICK_BASE: { label: string; build: (a: string, tf: string) => string }[] 
   { label: 'MTF confluence', build: (a) => `Run a multi-timeframe confluence check on ${a} (5m/15m/1h/4h). Where do the timeframes agree or fight each other?` },
   { label: 'Scan for setups', build: () => `Scan the whole market on 5m and show me the strongest bullish and bearish setups right now. Pick the top candidate and explain why.` },
   { label: 'Find my edge', build: (a, tf) => `Which strategy backtests best on ${a} ${tf} right now? Test the top 2-3 and compare win rate and profit factor.` },
+  { label: 'Which engines carry edge', build: () => `Run engines_edge research: which chart engines (renko, P&F, range, tick, footprint, Heikin Ashi, candle math) actually carry an edge right now? Give me the verdicts with sample sizes and what you'd trade, watch, or fade.` },
   { label: 'Set up my chart', build: (a) => `Set up my ${a} chart for analysis: add Bollinger Bands, Supertrend and a MACD sub-pane, switch to candles, then explain what each is telling me.` },
 ]
 

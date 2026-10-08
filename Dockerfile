@@ -18,6 +18,14 @@ COPY . .
 # build arg, so `next build` bakes in the real kernel service address.
 ARG KERNEL_URL=http://127.0.0.1:3030
 ENV KERNEL_URL=$KERNEL_URL
+# P0: middleware.ts injects the kernel token into the browser's
+# ?XTransformPort= rewrite path (rewrites can't set request headers;
+# middleware can). Middleware inlines process.env at BUILD time - same story
+# as KERNEL_URL above - so the token must be present here as a build arg.
+# Rotating the token means rebuilding this image (docker-compose.yml passes
+# it through from .env automatically).
+ARG KERNEL_TOKEN=
+ENV KERNEL_TOKEN=$KERNEL_TOKEN
 # Prisma client generation is a no-op for the actual trading features (dead
 # scaffold from the starter template) but `next build` may still touch it if
 # any route imports @prisma/client, so keep it cheap and non-fatal.
