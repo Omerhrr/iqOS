@@ -7,8 +7,12 @@
 // renders them all, filterable by market: All / Real / OTC - click OTC to
 // see only the over-the-counter pairs' reads - plus an asset search and
 // per-class chips (FX / Crypto / Comm / Stocks / Idx) that compose with the
-// market filter, so a 100+ read scan stays navigable. Option tab = direction
-// + suggested expiry; CFD tab = the same read with entry / SL / TP levels.
+// market filter, so a 100+ read scan stays navigable. A sort toggle picks
+// strongest-first (kernel order) or freshest-first (a client-side first-seen
+// ledger - reads that just appeared or flipped direction lead), and a
+// minimum-strength slider hides reads below a confluence floor of your
+// choosing (kernel floor is 35). Option tab = direction + suggested expiry;
+// CFD tab = the same read with entry / SL / TP levels.
 // Signals carry a kernel-side TTL - stale reads disappear instead of
 // lingering (the list is recomputed every scan, never cached client-side).
 // Task 64-b: each card carries a take action - the read loads straight
@@ -27,6 +31,12 @@ interface ChartSignalsPanelProps {
 type Tab = 'option' | 'cfd'
 type Mkt = 'all' | 'real' | 'otc'
 type Cat = 'all' | 'forex' | 'crypto' | 'commodity' | 'stock' | 'index'
+type Sort = 'strength' | 'fresh'
+
+/** identity of a read across kernel rescans: same asset + same direction =
+ * the same read (its ts is re-stamped every scan, so kernel ts can't order
+ * freshness - the first-seen ledger below tracks when WE first observed it). */
+const seenKey = (s: ChartSignal) => `${s.asset}|${s.direction}`
 
 function outcomeColor(o: string): string {
   return o === 'win' ? 'text-emerald-300' : o === 'loss' ? 'text-rose-300' : o === 'timeout' ? 'text-amber-300' : 'text-[#4b5a72]'
@@ -280,6 +290,13 @@ export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: Ch
   const [mkt, setMkt] = useState<Mkt>('all')
   const [cat, setCat] = useState<Cat>('all')
   const [query, setQuery] = useState('')
+  const [sort, setSort] = useState<Sort>('strength')
+  const [minStrength, setMinStrength] = useState(35)
+  // first-seen ledger for freshest-first sorting - bounded to the live set by
+  // pruning on every arrival (a read that drops out and later re-qualifies is
+  // genuinely fresh again, so resetting its entry is honest). Kept as state
+  // (copy-on-write in the poll callback), never mutated during render.
+  const [firstSeen, setFirstSeen] = useState<Map<string, number>>(() => new Map())
   const [data, setData] = useState<ChartSignalsResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -294,6 +311,28 @@ export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: Ch
       getChartSignals(tab)
         .then((d) => {
           if (d?.ok) {
+            // ledger update: record first observation for new (asset,
+            // direction) reads, prune keys that left the scan - set-if-absent
+            // keeps surviving reads' original arrival time across rescans
+            const t = Date.now()
+            const nowKeys = new Set(d.signals.map(seenKey))
+            setFirstSeen((prev) => {
+              let next: Map<string, number> | null = null
+              for (const s of d.signals) {
+                const k = seenKey(s)
+                if (!prev.has(k)) {
+                  if (!next) next = new Map(prev)
+                  next.set(k, t)
+                }
+              }
+              for (const k of prev.keys()) {
+                if (!nowKeys.has(k)) {
+                  if (!next) next = new Map(prev)
+                  next.delete(k)
+                }
+              }
+              return next ?? prev
+            })
             setData(d)
             setError(null)
           }
@@ -332,10 +371,17 @@ export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: Ch
 
   const live = (data?.signals ?? []).filter((s) => s.validUntil > now)
   const needle = query.trim().toLowerCase()
+  const firstSeenOf = (s: ChartSignal) => firstSeen.get(seenKey(s)) ?? s.ts
   const signals = live
     .filter((s) => (mkt === 'all' ? true : mkt === 'otc' ? s.otc : !s.otc))
     .filter((s) => (cat === 'all' ? true : s.category === cat))
     .filter((s) => (!needle ? true : s.asset.toLowerCase().includes(needle) || s.name.toLowerCase().includes(needle)))
+    .filter((s) => s.strength >= minStrength)
+    .sort((a, b) =>
+      sort === 'strength'
+        ? b.strength - a.strength || b.agree - a.agree
+        : firstSeenOf(b) - firstSeenOf(a) || b.strength - a.strength,
+    )
   const otcLive = data?.otcQualifying ?? 0
   // per-class live counts - computed from the unfiltered live list so the
   // chips stay honest no matter what the other filters are doing
@@ -503,6 +549,58 @@ export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: Ch
         </div>
       )}
 
+      {/* sort + strength gate - the two dials that shape order and depth;
+          both are read-side only (the kernel floor stays 35, >= 3 engines) */}
+      {view === 'signals' && (
+        <div className="flex items-center gap-2 border-b border-[#1c2739] px-2 py-1">
+          <div className="flex shrink-0 overflow-hidden rounded border border-[#1c2739]" role="group" aria-label="sort order">
+            {(
+              [
+                ['strength', 'strongest', 'sort by 7-engine confluence strength - the strongest read leads (kernel order)'],
+                ['fresh', 'freshest', 'sort by first observation - reads that just appeared or flipped direction lead; surviving reads keep their spot across rescans'],
+              ] as [Sort, string, string][]
+            ).map(([v, label, why]) => (
+              <button
+                key={v}
+                type="button"
+                onClick={() => setSort(v)}
+                title={why}
+                className={`px-1.5 py-0.5 font-mono text-[8.5px] font-bold uppercase tracking-wider transition-colors ${
+                  sort === v ? 'bg-cyan-500/15 text-cyan-300' : 'text-[#4b5a72] hover:text-[#aab6cc]'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {minStrength > 35 && (
+            <span
+              className="font-mono text-[8px] text-[#4b5a72]"
+              title="reads passing every current filter - lower the strength gate to widen the list"
+            >
+              {signals.length} shown
+            </span>
+          )}
+          <label
+            className="ml-auto flex shrink-0 items-center gap-1.5"
+            title="hide reads below this confluence strength - the kernel floor is 35 (needs >= 3 engines agreeing), drag right to only see high-conviction reads"
+          >
+            <span className="font-mono text-[8px] uppercase tracking-wider text-[#4b5a72]">min str</span>
+            <input
+              type="range"
+              min={35}
+              max={100}
+              step={5}
+              value={minStrength}
+              onChange={(e) => setMinStrength(Number(e.target.value))}
+              aria-label="minimum strength"
+              className="h-1 w-20 cursor-pointer accent-cyan-500"
+            />
+            <span className="w-5 text-right font-mono text-[9px] tabular-nums text-[#aab6cc]">{minStrength}</span>
+          </label>
+        </div>
+      )}
+
       <div className="min-h-0 flex-1 space-y-1.5 overflow-auto p-2">
         {view === 'stats' ? (
           <StatsView st={stats?.[tab] ?? null} tab={tab} now={now} />
@@ -516,7 +614,7 @@ export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: Ch
                     // reads exist but the current search / class / market filter
                     // carved the list to zero - tell the operator which dial to
                     // loosen instead of implying the engines went quiet
-                    `No reads match the current filter - ${live.length} live read${live.length === 1 ? '' : 's'}${mkt !== 'all' ? ` · market ${mkt.toUpperCase()}` : ''}${cat !== 'all' ? ` · class ${cat}` : ''}${needle ? ` · search "${query.trim()}"` : ''}. Clear the search or switch the class / market chips.`
+                    `No reads match the current filter - ${live.length} live read${live.length === 1 ? '' : 's'}${mkt !== 'all' ? ` · market ${mkt.toUpperCase()}` : ''}${cat !== 'all' ? ` · class ${cat}` : ''}${needle ? ` · search "${query.trim()}"` : ''}${minStrength > 35 ? ` · strength ≥ ${minStrength}` : ''}. Clear the search, lower the strength gate, or switch the class / market chips.`
                   ) : mkt === 'otc' ? (
                     `No qualifying OTC reads right now - ${data.otcScanned ?? 0} OTC instruments scanned, ${data.otcConsidered ?? 0} had enough history, none reached the 7-engine confluence floor (strength >= 35, >= 3 engines agreeing). The OTC velocity footprint needs a warm tick buffer - it stays honest and votes 0 while cold.`
                   ) : mkt === 'real' ? (
@@ -537,7 +635,7 @@ export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: Ch
                 {tab === 'option'
                   ? 'Direction + suggested expiry from chart-type confluence. Real pairs read the volume footprint (CLV proxy), OTC pairs the micro-tick velocity footprint.'
                   : 'Same chart-engine read, expressed as a CFD plan: entry at last close, stop beyond the recent swing (ATR floor), target at >= 1.5R.'}
-                {' '}Every qualifying read is shown (strongest first) - All / Real / OTC + class chips + search narrow the list, click a card to open that asset on the chart, take loads it into the trade ticket.
+                {' '}Every qualifying read is shown - the sort toggle picks strongest-first or freshest-first and the min-strength slider hides weak reads (kernel floor 35) - All / Real / OTC + class chips + search narrow the list, click a card to open that asset on the chart, take loads it into the trade ticket.
               </p>
             )}
           </>
