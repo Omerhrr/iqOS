@@ -955,6 +955,26 @@ export class MarketDataService {
     return [...byTime.values()].sort((a, b) => a.time - b.time).slice(-limit)
   }
 
+  /**
+   * Lookback read for the same-time-yesterday scanner: like getCandlesDeep,
+   * but when the accumulated series is shallower than `limit` bars the front
+   * is extended with the deterministic prehistory walk (the same generator
+   * ensureSeeded uses - pure function of ticker|tf, so restarts never rewrite
+   * the story), ending exactly at the series' oldest bar. READ-ONLY: nothing
+   * is retained or archived. Lets a fresh boot answer "what happened here
+   * 24h ago" without first aging a day, while the caller counts real store
+   * bars separately to keep the synthetic part visible.
+   */
+  getCandlesLookback(asset: string, tf: Timeframe, limit: number): Candle[] {
+    const base = this.getCandlesDeep(asset, tf, limit, true)
+    if (!base.length || base.length >= limit) return base
+    const a = this.assets.find((x) => x.ticker === asset)
+    if (!a) return base
+    const need = limit - base.length
+    const pre = this.synthPrehistory(a, tf, need, base[0].time, base[0].open, mulberry32(hashSeed(`${asset}|${tf}|deep`)))
+    return [...pre, ...base]
+  }
+
   getPrice(asset: string): number {
     return this.prices.get(asset) ?? 0
   }

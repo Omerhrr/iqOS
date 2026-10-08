@@ -428,6 +428,71 @@ export async function getSignalStats(tf?: Timeframe): Promise<{ ok: boolean; opt
   )
 }
 
+// ---- same-time-yesterday scanner (Task: "what did the market do at this
+// time yesterday?") ----------------------------------------------------------
+// Kernel route /yesterday: per open instrument, the story of the window that
+// started exactly 24h ago - price at the moment, the window's net move /
+// range / run-up / drawdown, where price has gone since, the session the
+// market was in, and coverage honesty (bars found vs expected, how many came
+// from the kernel's own store vs deterministic prehistory).
+
+export type YdayDir = 'up' | 'down' | 'none'
+export type YdaySession = 'ASIA' | 'LONDON' | 'OVERLAP' | 'NEWYORK' | 'OFF' | 'OTC'
+
+export interface YesterdayRow {
+  asset: string
+  name: string
+  category: AssetCategory
+  otc: boolean
+  /** epoch seconds of the bar that was forming exactly 24h ago (window start) */
+  thenTs: number
+  /** price at that moment (open of the bar containing T-24h) */
+  thenPrice: number
+  /** price right now */
+  nowPrice: number
+  /** (now - then) / then, % - where the market has gone since that moment */
+  sincePct: number
+  /** net move over the window that started at that moment, % */
+  movePct: number
+  dir: YdayDir
+  /** high-low travel across the window, % of thenPrice */
+  rangePct: number
+  /** best excursion above thenPrice inside the window, % */
+  runUpPct: number
+  /** deepest excursion below thenPrice inside the window, % */
+  drawdownPct: number
+  /** window bars present vs expected - coverage is displayed, never implied */
+  barsFound: number
+  barsExpected: number
+  /** of the bars found, how many came from the kernel's store (accumulated history) */
+  archived: number
+  /** session the market was in at that moment yesterday */
+  session: YdaySession
+}
+
+export interface YesterdayResponse {
+  ok: boolean
+  tf: Timeframe
+  /** effective forward window in minutes (snapped to whole bars of the tf) */
+  windowMin: number
+  /** feed behind the scan: 'sim' = deterministic sim engine, 'live' = broker feed */
+  mode: 'sim' | 'live'
+  scanned: number
+  considered: number
+  skipped: number
+  rows: YesterdayRow[]
+  ts: number
+  scanMs: number
+}
+
+/** Same-time-yesterday scan. `tf` = the chart's active timeframe - the
+ * lookback runs on those candles (the kernel refuses timeframes whose
+ * 24h+window lookback cannot fit the 4000-bar archive depth). `windowMin`
+ * is the forward window replayed after T-24h (5..240, default 60). */
+export async function getYesterday(tf: Timeframe, windowMin = 60): Promise<YesterdayResponse> {
+  return osGet<YesterdayResponse>('/yesterday', { tf, window: windowMin })
+}
+
 // ---- engine-edge research (both loops merged: honesty + lab) -------------
 // Kernel route /engines_edge: per chart engine, the live honesty loop's real
 // resolved reads AND a deep-history lab measurement (engine votes replayed

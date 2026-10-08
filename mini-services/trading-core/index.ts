@@ -26,6 +26,7 @@ import { adaptivePlugin, AdaptiveService, type AdaptiveConfig } from './src/plug
 import { otcGuardPlugin, OtcGuardService, type OtcDefenseReport } from './src/plugins/otcguard'
 import { otcFootprintPlugin, OtcFootprintService } from './src/plugins/otcfootprint'
 import { chartSignalsPlugin, ChartSignalsService } from './src/plugins/chartsignals'
+import { yesterdayPlugin, YesterdayService } from './src/plugins/yesterday'
 import { gridSearch, walkForward, sweepAssets, type Objective } from './src/strategies/optimize'
 import { backtest } from './src/strategies/backtest'
 import type { BacktestOptions } from './src/strategies/backtest'
@@ -149,6 +150,7 @@ kernel.register(adaptivePlugin)
 kernel.register(otcGuardPlugin)
 kernel.register(otcFootprintPlugin)
 kernel.register(chartSignalsPlugin)
+kernel.register(yesterdayPlugin)
 
 const httpServer = createServer(async (req, res) => {
   res.setHeader('access-control-allow-origin', '*')
@@ -1058,6 +1060,30 @@ const httpServer = createServer(async (req, res) => {
         const tfv = tfStrict(q.get('tf'))
         if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
         return json(200, await kernel.context().use<ChartSignalsService>('chartSignals').scan(kind, top, tfv))
+      }
+
+      // Same-time-yesterday scanner: for every open instrument, what was the
+      // market doing EXACTLY 24h ago - and in the window right after? Each
+      // row carries the price at that moment, the forward window's net move /
+      // range / run-up / drawdown, where price has gone since, the session
+      // the market was in, and window coverage (bars found vs expected, and
+      // how many came from the store) so a thin or synthetic "yesterday" is
+      // visible instead of silently mistaken for a remembered one. tf respects
+      // the chart's timeframe (same rule as /signals); the cache is per
+      // tf:window - the T-24h target crawls, so 60s serves rapid panel polls.
+      if (path === '/yesterday') {
+        const tfv = tfStrict(q.get('tf'))
+        if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+        const winRaw = Number(q.get('window') ?? 60)
+        const windowMin = Number.isFinite(winRaw) ? Math.max(5, Math.min(Math.round(winRaw), 240)) : 60
+        const plan = YesterdayService.plan(tfv, windowMin)
+        if (!plan.ok) {
+          return json(400, {
+            ok: false,
+            error: `tf "${tfv}" cannot reach 24h back within the ${plan.needed}-bar lookback limit (4000-bar archive depth) - use 30s or coarser`,
+          })
+        }
+        return json(200, await kernel.context().use<YesterdayService>('yesterday').scan(tfv, windowMin))
       }
 
       // Outcome stats for the chart signals: every qualifying read is
