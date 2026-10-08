@@ -22,6 +22,7 @@ import { watchdogPlugin, WatchdogService, type WatchdogConfig } from './src/plug
 import { adaptivePlugin, AdaptiveService, type AdaptiveConfig } from './src/plugins/adaptive'
 import { otcGuardPlugin, OtcGuardService, type OtcDefenseReport } from './src/plugins/otcguard'
 import { otcFootprintPlugin, OtcFootprintService } from './src/plugins/otcfootprint'
+import { chartSignalsPlugin, ChartSignalsService } from './src/plugins/chartsignals'
 import { gridSearch, walkForward, sweepAssets, type Objective } from './src/strategies/optimize'
 import type { BacktestOptions } from './src/strategies/backtest'
 import { normalizeSpec, type CustomSpec } from './src/strategies/custom'
@@ -68,6 +69,7 @@ kernel.register(watchdogPlugin)
 kernel.register(adaptivePlugin)
 kernel.register(otcGuardPlugin)
 kernel.register(otcFootprintPlugin)
+kernel.register(chartSignalsPlugin)
 
 const httpServer = createServer(async (req, res) => {
   res.setHeader('access-control-allow-origin', '*')
@@ -931,6 +933,19 @@ const httpServer = createServer(async (req, res) => {
         }
         rows.sort((x, y) => Math.abs(Number(y.score)) - Math.abs(Number(x.score)))
         return json(200, { ok: true, tf: timeframe, scanned: universe.length, results: rows })
+      }
+
+      // Chart-signal scanner: the chart-type engines (renko / P&F / range /
+      // tick / footprint-or-otcfootprint / Heikin Ashi / candlestick math)
+      // vote per open instrument; only the top-N strongest confluence reads
+      // come back, each with a TTL so stale reads disappear. kind=option adds
+      // a suggested expiry; kind=cfd adds entry/SL/TP levels.
+      if (path === '/signals') {
+        const kind = q.get('kind') === 'cfd' ? 'cfd' : 'option'
+        const top = Math.max(1, Math.min(Number(q.get('top') ?? 5), 10))
+        const tfv = tfStrict(q.get('tf'))
+        if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+        return json(200, await kernel.context().use<ChartSignalsService>('chartSignals').scan(kind, top, tfv))
       }
 
       if (path === '/strategies')

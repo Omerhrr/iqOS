@@ -13,6 +13,7 @@ import IndicatorPanel from '@/components/os/IndicatorPanel'
 import IndicatorPicker from '@/components/os/IndicatorPicker'
 import SubPane from '@/components/os/SubPane'
 import SignalPanel from '@/components/os/SignalPanel'
+import ChartSignalsPanel from '@/components/os/ChartSignalsPanel'
 import MarkovPanel from '@/components/os/MarkovPanel'
 import { DeltaFootprintView } from '@/components/os/OrderFlowPanel'
 import CandleMathView from '@/components/os/CandleMathView'
@@ -123,6 +124,7 @@ export default function OSPage() {
   const [connected, setConnected] = useState(false)
   const [chartType, setChartType] = useState<ChartType>('candles')
   const [pickerOpen, setPickerOpen] = useState(false)
+  const [signalsOpen, setSignalsOpen] = useState(false)
   const [registry, setRegistry] = useState<RegistryEntry[]>([])
   const [activeOverlays, setActiveOverlays] = useState<ActiveIndicator[]>([])
   const [activeSubs, setActiveSubs] = useState<ActiveIndicator[]>([])
@@ -821,21 +823,42 @@ export default function OSPage() {
         /* ---------- DESKTOP: fully resizable 3-dock workspace ---------- */
         <main className="min-h-0 flex-1 p-2">
           <PanelGroup direction="horizontal" autoSaveId="iqos:docks" className="h-full">
-            {/* LEFT dock: market watch / indicators */}
+            {/* LEFT dock: chart-signals sidebar (toggle) / market watch /
+                indicators. Open = the signals panel covers both lower panels;
+                closed = the slim open strip sits above the market watch and
+                everything is laid out exactly as before. */}
             <Panel defaultSize={17} minSize={11}>
-              <PanelGroup direction="vertical" autoSaveId="iqos:left" className="h-full">
-                <Panel defaultSize={46} minSize={15}>
-                  <div className="mr-0.5 h-full min-h-0">
-                    <MarketWatch assets={assets} active={asset} prices={prices} onSelect={handleSelectAsset} onVisibleTickers={handleVisibleTickers} />
-                  </div>
-                </Panel>
-                {hHandle}
-                <Panel defaultSize={54} minSize={20}>
-                  <div className="ml-0.5 h-full min-h-0">
-                    <IndicatorPanel analysis={analysis} />
-                  </div>
-                </Panel>
-              </PanelGroup>
+              {signalsOpen ? (
+                <div className="mr-0.5 h-full min-h-0">
+                  <ChartSignalsPanel onClose={() => setSignalsOpen(false)} onSelectAsset={handleSelectAsset} />
+                </div>
+              ) : (
+                <PanelGroup direction="vertical" autoSaveId="iqos:left" className="h-full">
+                  <Panel defaultSize={46} minSize={15}>
+                    <div className="mr-0.5 flex h-full min-h-0 flex-col">
+                      <button
+                        type="button"
+                        onClick={() => setSignalsOpen(true)}
+                        title="open the chart-signals sidebar - covers market watch + indicators while open"
+                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-cyan-500/40 hover:text-cyan-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-cyan-400" />
+                        Chart Signals
+                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
+                      </button>
+                      <div className="min-h-0 flex-1">
+                        <MarketWatch assets={assets} active={asset} prices={prices} onSelect={handleSelectAsset} onVisibleTickers={handleVisibleTickers} />
+                      </div>
+                    </div>
+                  </Panel>
+                  {hHandle}
+                  <Panel defaultSize={54} minSize={20}>
+                    <div className="ml-0.5 h-full min-h-0">
+                      <IndicatorPanel analysis={analysis} />
+                    </div>
+                  </Panel>
+                </PanelGroup>
+              )}
             </Panel>
 
             {vHandle}

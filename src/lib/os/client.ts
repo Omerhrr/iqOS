@@ -290,6 +290,72 @@ export async function getOtcFootprint(asset: string, opts?: { minutes?: number; 
   })
 }
 
+// ---------- chart-signal scanner (Signal Panel) ----------
+
+export type ChartEngineId = 'renko' | 'pnf' | 'range' | 'tick' | 'footprint' | 'otcfootprint' | 'heikin' | 'candle'
+
+export const CHART_ENGINE_LABEL: Record<ChartEngineId, string> = {
+  renko: 'RNK',
+  pnf: 'P&F',
+  range: 'RNG',
+  tick: 'TCK',
+  footprint: 'FP',
+  otcfootprint: 'OTC FP',
+  heikin: 'H/A',
+  candle: 'CND',
+}
+
+export interface ChartEngineVote {
+  engine: ChartEngineId
+  dir: 1 | -1 | 0
+  weight: number
+  note: string
+}
+
+export interface CfdLevels {
+  entry: number
+  sl: number
+  tp: number
+  slDist: number
+  tpDist: number
+  rr: number
+}
+
+export interface ChartSignal {
+  asset: string
+  name: string
+  category: string
+  otc: boolean
+  price: number
+  direction: 'call' | 'put'
+  score: number
+  strength: number
+  agree: number
+  total: number
+  expirySec: number
+  votes: ChartEngineVote[]
+  cfd: CfdLevels | null
+  ts: number
+  validUntil: number
+  dataSource: string
+}
+
+export interface ChartSignalsResponse {
+  ok: boolean
+  kind: 'option' | 'cfd'
+  tf: string
+  scanned: number
+  considered: number
+  qualifying: number
+  signals: ChartSignal[]
+  ts: number
+  scanMs: number
+}
+
+export async function getChartSignals(kind: 'option' | 'cfd', top = 5): Promise<ChartSignalsResponse> {
+  return osGet<ChartSignalsResponse>('/signals', { kind, top })
+}
+
 export async function getDelta(asset: string, tf: Timeframe, opts?: { limit?: number }): Promise<{ deltas: CandleDelta[]; cumulative: CumulativeDeltaPoint[] }> {
   const d = await osGet<{ ok: boolean; deltas: CandleDelta[]; cumulative: CumulativeDeltaPoint[] }>('/delta', {
     asset,
