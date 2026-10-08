@@ -21,6 +21,7 @@
 // plugin's job (state() / load()).
 
 import type { ChartEngineId, ChartSignal } from './chartsignals'
+import type { Timeframe } from '../types'
 
 export type SignalKind = 'option' | 'cfd'
 export type SignalOutcome = 'win' | 'loss' | 'flat' | 'timeout'
@@ -28,6 +29,7 @@ export type SignalOutcome = 'win' | 'loss' | 'flat' | 'timeout'
 export interface PendingOutcome {
   id: string
   kind: SignalKind
+  tf: Timeframe
   asset: string
   otc: boolean
   direction: 'call' | 'put'
@@ -51,6 +53,7 @@ export interface PendingOutcome {
 export interface ResolvedOutcome {
   id: string
   kind: SignalKind
+  tf: Timeframe
   asset: string
   otc: boolean
   direction: 'call' | 'put'
@@ -109,33 +112,40 @@ let seq = 0
 export class SignalOutcomeTracker {
   private pending = new Map<string, PendingOutcome>()
   private resolved: ResolvedOutcome[] = []
-  private recordedTotal = { option: 0, cfd: 0 }
+  // recorded counts keyed kind:tf - the hit-rate view reads one timeframe's
+  // column at a time, so a blended total would quietly dilute every rate
+  private recordedTotal = new Map<string, number>()
   private dirty = false
 
   constructor(restored?: ResolvedOutcome[]) {
     if (restored?.length) {
-      // boot restore: keep newest-last order, cap to the ring size
-      this.resolved = restored.slice(-MAX_RESOLVED).map((r) => ({ ...r }))
+      // boot restore: keep newest-last order, cap to the ring size; rows from
+      // before tf attribution are 1m reads by definition (the panel never
+      // sent a tf before the scan followed the chart)
+      this.resolved = restored.slice(-MAX_RESOLVED).map((r) => ({ ...r, tf: r.tf ?? '1m' }))
       for (const r of this.resolved) {
-        this.recordedTotal[r.kind]++
+        const k = `${r.kind}:${r.tf}`
+        this.recordedTotal.set(k, (this.recordedTotal.get(k) ?? 0) + 1)
         if (r.ts > seq) seq = r.ts
       }
     }
   }
 
-  /** Record qualifying signals from one scan. Same kind+asset+direction
+  /** Record qualifying signals from one scan. Same kind+tf+asset+direction
    * while still pending counts ONCE (the first qualification is the read
-   * event; re-scans every 12s must not inflate the sample). */
-  record(kind: SignalKind, signals: ChartSignal[], now: number): number {
+   * event; re-scans every 12s must not inflate the sample). Reads on
+   * different timeframes are different reads and track separately. */
+  record(kind: SignalKind, tf: Timeframe, signals: ChartSignal[], now: number): number {
     let added = 0
     for (const s of signals) {
-      const key = `${kind}:${s.asset}:${s.direction}`
+      const key = `${kind}:${tf}:${s.asset}:${s.direction}`
       if (this.pending.has(key)) continue
       const dir = s.direction === 'call' ? 1 : -1
       const cfd = kind === 'cfd' && s.cfd ? { sl: s.cfd.sl, tp: s.cfd.tp } : null
       const pending: PendingOutcome = {
         id: `sig-${now}-${++seq}`,
         kind,
+        tf,
         asset: s.asset,
         otc: s.otc,
         direction: s.direction,
@@ -152,19 +162,23 @@ export class SignalOutcomeTracker {
           .map((v) => ({ engine: v.engine, dir: v.dir as 1 | -1 })),
         sl: cfd?.sl ?? null,
         tp: cfd?.tp ?? null,
-        horizonAt: s.ts + (kind === 'cfd' ? CFD_HORIZON_SEC : s.expirySec) * 1000,
+        // the CFD plan outlives the read's TTL; on higher timeframes the
+        // levels (ATR on those candles) are wider, so the horizon grows with
+        // the plan's own suggested expiry (3x, 15-min floor - 1m unchanged)
+        horizonAt: s.ts + (kind === 'cfd' ? Math.max(CFD_HORIZON_SEC, s.expirySec * 3) : s.expirySec) * 1000,
         samples: [],
         maxFavPct: 0,
         maxAdvPct: 0,
       }
       this.pending.set(key, pending)
-      this.recordedTotal[kind]++
+      const rk = `${kind}:${tf}`
+      this.recordedTotal.set(rk, (this.recordedTotal.get(rk) ?? 0) + 1)
       added++
     }
     // bound: drop oldest pending when the map overflows (pathological only)
     while (this.pending.size > MAX_PENDING) {
       const oldest = [...this.pending.values()].sort((a, b) => a.resolveAt - b.resolveAt)[0]
-      this.pending.delete(`${oldest.kind}:${oldest.asset}:${oldest.direction}`)
+      this.pending.delete(`${oldest.kind}:${oldest.tf}:${oldest.asset}:${oldest.direction}`)
     }
     if (added > 0) this.dirty = true
     return added
@@ -220,6 +234,7 @@ export class SignalOutcomeTracker {
     const r: ResolvedOutcome = {
       id: p.id,
       kind: p.kind,
+      tf: p.tf,
       asset: p.asset,
       otc: p.otc,
       direction: p.direction,
@@ -248,13 +263,15 @@ export class SignalOutcomeTracker {
     return r
   }
 
-  /** Aggregate per-kind stats for the panel's hit-rate view. */
-  stats(): { option: KindStats; cfd: KindStats } {
-    return { option: this.kindStats('option'), cfd: this.kindStats('cfd') }
+  /** Aggregate per-kind stats for the panel's hit-rate view. `tf` filters
+   * to one timeframe's reads (the panel passes the chart's tf); omitted =
+   * all timeframes blended (research reads the whole loop). */
+  stats(tf?: Timeframe): { option: KindStats; cfd: KindStats } {
+    return { option: this.kindStats('option', tf), cfd: this.kindStats('cfd', tf) }
   }
 
-  private kindStats(kind: SignalKind): KindStats {
-    const rows = this.resolved.filter((r) => r.kind === kind)
+  private kindStats(kind: SignalKind, tf?: Timeframe): KindStats {
+    const rows = this.resolved.filter((r) => r.kind === kind && (tf === undefined || r.tf === tf))
     const wins = rows.filter((r) => r.outcome === 'win').length
     const losses = rows.filter((r) => r.outcome === 'loss').length
     const flats = rows.filter((r) => r.outcome === 'flat').length
@@ -278,9 +295,15 @@ export class SignalOutcomeTracker {
       const w = sub.filter((r) => r.outcome === 'win').length
       return { wins: w, losses: sub.length - w, winRate: sub.length ? Math.round((w / sub.length) * 1000) / 10 : null }
     }
+    const recordedKey = (k: SignalKind): number => {
+      if (tf !== undefined) return this.recordedTotal.get(`${k}:${tf}`) ?? 0
+      let sum = 0
+      for (const [key, n] of this.recordedTotal) if (key.startsWith(`${k}:`)) sum += n
+      return sum
+    }
     return {
-      recorded: this.recordedTotal[kind],
-      pending: [...this.pending.values()].filter((p) => p.kind === kind).length,
+      recorded: recordedKey(kind),
+      pending: [...this.pending.values()].filter((p) => p.kind === kind && (tf === undefined || p.tf === tf)).length,
       resolved: rows.length,
       wins,
       losses,

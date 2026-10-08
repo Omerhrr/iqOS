@@ -343,7 +343,9 @@ export interface ChartSignal {
 export interface ChartSignalsResponse {
   ok: boolean
   kind: 'option' | 'cfd'
-  tf: string
+  /** timeframe the scan actually ran on - the panel shows this so the
+   * operator always knows which candles the reads were computed on */
+  tf: Timeframe
   scanned: number
   considered: number
   qualifying: number
@@ -359,9 +361,13 @@ export interface ChartSignalsResponse {
 }
 
 /** Full scan by default (no top param) - the panel renders every qualifying
- * read; pass a positive `top` to get a short list (kernel clamps at 200). */
-export async function getChartSignals(kind: 'option' | 'cfd', top?: number): Promise<ChartSignalsResponse> {
-  return osGet<ChartSignalsResponse>('/signals', top && top > 0 ? { kind, top } : { kind })
+ * read; pass a positive `top` to get a short list (kernel clamps at 200).
+ * `tf` is the chart's active timeframe - the scan runs on those candles. */
+export async function getChartSignals(kind: 'option' | 'cfd', tf: Timeframe, top?: number): Promise<ChartSignalsResponse> {
+  return osGet<ChartSignalsResponse>(
+    '/signals',
+    top && top > 0 ? { kind, tf, top } : { kind, tf },
+  )
 }
 
 // ---- chart-signal outcome stats (Task 64-c: the honesty loop) ------------
@@ -413,8 +419,13 @@ export interface SignalKindStats {
   recent: ResolvedSignalOutcome[]
 }
 
-export async function getSignalStats(): Promise<{ ok: boolean; option: SignalKindStats; cfd: SignalKindStats; ts: number }> {
-  return osGet<{ ok: boolean; option: SignalKindStats; cfd: SignalKindStats; ts: number }>('/signals_stats')
+/** Outcome stats - `tf` scores only reads computed on that timeframe's
+ * candles (the honesty loop attributes per tf); omitted = all blended. */
+export async function getSignalStats(tf?: Timeframe): Promise<{ ok: boolean; option: SignalKindStats; cfd: SignalKindStats; ts: number }> {
+  return osGet<{ ok: boolean; option: SignalKindStats; cfd: SignalKindStats; ts: number }>(
+    '/signals_stats',
+    tf ? { tf } : {},
+  )
 }
 
 // ---- engine-edge research (both loops merged: honesty + lab) -------------

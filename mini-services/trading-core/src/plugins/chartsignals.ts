@@ -16,6 +16,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { KernelContext, Plugin } from '../kernel'
 import type { Candle, Timeframe } from '../types'
+import { TIMEFRAME_SECONDS } from '../types'
 import { isInstrumentOpen, searchInstruments } from '../universe'
 import { buildChartSignal, type ChartSignal, type OtcFpRead } from '../analytics/chartsignals'
 import { SignalOutcomeTracker, type ResolvedOutcome } from '../analytics/signaloutcomes'
@@ -54,8 +55,10 @@ export class ChartSignalsService {
   private ctx!: KernelContext
   private market!: MarketDataService
   private otcFp: OtcFootprintService | null = null
-  private cache = new Map<SignalKind, { ts: number; result: ChartScanResult }>()
-  private scanning = new Map<SignalKind, Promise<ChartScanResult>>()
+  // keyed by kind:tf - the panel follows the chart's timeframe, so M1 and M5
+  // scans must live side by side without one leaking into the other's cache
+  private cache = new Map<string, { ts: number; result: ChartScanResult }>()
+  private scanning = new Map<string, Promise<ChartScanResult>>()
   private tracker = new SignalOutcomeTracker()
   private sweepTimer: ReturnType<typeof setInterval> | null = null
   private flushTimer: ReturnType<typeof setInterval> | null = null
@@ -107,9 +110,10 @@ export class ChartSignalsService {
     }
   }
 
-  /** Outcome stats for the panel's hit-rate view. */
-  stats() {
-    return this.tracker.stats()
+  /** Outcome stats for the panel's hit-rate view. tf filters to one
+   * timeframe's reads; omitted = all timeframes blended. */
+  stats(tf?: Timeframe) {
+    return this.tracker.stats(tf)
   }
 
   private async otcReadAsync(ticker: string): Promise<OtcFpRead | null> {
@@ -132,6 +136,11 @@ export class ChartSignalsService {
 
   private async scanOnce(kind: SignalKind, tf: Timeframe): Promise<ChartScanResult> {
     const t0 = Date.now()
+    // reads live on the scanned timeframe: a structural read on M15 needs
+    // more runway than an M1 blip - TTL and suggested expiry scale with the
+    // bar size (1m keeps the historical 150s / 60..300s behavior exactly)
+    const tfSec = TIMEFRAME_SECONDS[tf]
+    const ttlSec = tfSec <= 60 ? SIGNAL_TTL_SEC : Math.min(Math.max(tfSec * 5, 300), 3600)
     const active = this.market.activeAsset
     // Session-aware open set: curated 'market'/'otc-gap' rows carry a static
     // open=false at boot, so the time-of-day check rescues them when their
@@ -171,7 +180,7 @@ export class ChartSignalsService {
           const sig = buildChartSignal(
             { ticker: info.ticker, name: info.name, category: info.category, otc: !!info.otc, pip: info.pip },
             candles,
-            { realTicks, otcRead, now: Date.now(), ttlSec: SIGNAL_TTL_SEC }
+            { realTicks, otcRead, now: Date.now(), ttlSec, tfSec }
           )
           if (sig) signals.push(sig)
         })
@@ -197,32 +206,34 @@ export class ChartSignalsService {
       scanMs: Date.now() - t0,
     }
     // every qualifying read enters the honesty loop (deduped per
-    // kind+asset+direction while pending)
+    // kind+tf+asset+direction while pending - reads on different timeframes
+    // are different reads)
     try {
-      this.tracker.record(kind, signals, result.ts)
+      this.tracker.record(kind, tf, signals, result.ts)
     } catch {
       /* tracking never breaks the scan */
     }
     return result
   }
 
-  /** Fresh scan (cached for CACHE_MS), stale entries dropped + `top`
-   * applied at read time so cache hits honor the caller's limit. top<=0
-   * (the default) means no cut - every qualifying read comes back. */
+  /** Fresh scan (cached per kind:tf for CACHE_MS), stale entries dropped +
+   * `top` applied at read time so cache hits honor the caller's limit.
+   * top<=0 (the default) means no cut - every qualifying read comes back. */
   async scan(kind: SignalKind, top: number, tf: Timeframe): Promise<ChartScanResult> {
-    const cached = this.cache.get(kind)
+    const key = `${kind}:${tf}`
+    const cached = this.cache.get(key)
     const now = Date.now()
     if (cached && now - cached.ts < CACHE_MS) {
       return this.sliceTop(this.filterFresh(cached.result, now), top)
     }
-    const inflight = this.scanning.get(kind)
+    const inflight = this.scanning.get(key)
     if (inflight) return this.sliceTop(this.filterFresh(await inflight, now), top)
     const p = this.scanOnce(kind, tf).then((r) => {
-      this.cache.set(kind, { ts: r.ts, result: r })
-      this.scanning.delete(kind)
+      this.cache.set(key, { ts: r.ts, result: r })
+      this.scanning.delete(key)
       return r
     })
-    this.scanning.set(kind, p)
+    this.scanning.set(key, p)
     return this.sliceTop(this.filterFresh(await p, now), top)
   }
 

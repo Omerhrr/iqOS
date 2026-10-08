@@ -889,7 +889,7 @@ export default function OSPage() {
             <Panel defaultSize={17} minSize={11}>
               {signalsOpen ? (
                 <div className="mr-0.5 h-full min-h-0">
-                  <ChartSignalsPanel onClose={() => setSignalsOpen(false)} onSelectAsset={handleSelectAsset} onTake={handleTakeSignal} />
+                  <ChartSignalsPanel onClose={() => setSignalsOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onTake={handleTakeSignal} />
                 </div>
               ) : (
                 <PanelGroup direction="vertical" autoSaveId="iqos:left" className="h-full">

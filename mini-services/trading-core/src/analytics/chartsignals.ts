@@ -360,11 +360,14 @@ export function cfdLevelsFor(candles: Candle[], direction: 'call' | 'put', pipDi
 }
 
 /** Full per-asset signal build. Returns null when the chart engines do not
- * qualify (thin history, no confluence) - the caller honestly drops it. */
+ * qualify (thin history, no confluence) - the caller honestly drops it.
+ * tfSec scales the read's wall-clock semantics to the scanned timeframe:
+ * suggested expiry converts the 1m-calibrated bar cadence into that
+ * timeframe's seconds (1m = default keeps 60..300s exactly). */
 export function buildChartSignal(
   info: { ticker: string; name: string; category: string; otc: boolean; pip: number },
   candles: Candle[],
-  opts: { realTicks?: TickPoint[] | null; otcRead?: OtcFpRead | null; now?: number; ttlSec?: number; threshold?: number; minAgree?: number }
+  opts: { realTicks?: TickPoint[] | null; otcRead?: OtcFpRead | null; now?: number; ttlSec?: number; threshold?: number; minAgree?: number; tfSec?: number }
 ): ChartSignal | null {
   if (candles.length < 40) return null
   const votes = engineVotes(candles, { otc: info.otc, realTicks: opts.realTicks, otcRead: opts.otcRead })
@@ -372,6 +375,14 @@ export function buildChartSignal(
   if (!combined) return null
   const now = opts.now ?? Date.now()
   const last = candles[candles.length - 1]
+  const tfSec = opts.tfSec ?? 60
+  // expiry floor follows the timeframe too - a 5s chart can honestly suggest
+  // a 5s expiry; the 1800s cap mirrors the longest platform expiry
+  const expiryFloor = Math.min(60, tfSec)
+  const expirySec = Math.min(
+    Math.max(Math.round((expirySecFor(votes, combined.strength) * tfSec) / 60), expiryFloor),
+    1800,
+  )
   return {
     asset: info.ticker,
     name: info.name,
@@ -383,7 +394,7 @@ export function buildChartSignal(
     strength: combined.strength,
     agree: combined.agree,
     total: combined.total,
-    expirySec: expirySecFor(votes, combined.strength),
+    expirySec,
     votes,
     cfd: cfdLevelsFor(candles, combined.direction, info.pip),
     ts: now,

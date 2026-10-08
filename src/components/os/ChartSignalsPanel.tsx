@@ -11,19 +11,25 @@
 // strongest-first (kernel order) or freshest-first (a client-side first-seen
 // ledger - reads that just appeared or flipped direction lead), and a
 // minimum-strength slider hides reads below a confluence floor of your
-// choosing (kernel floor is 35). Option tab = direction + suggested expiry;
-// CFD tab = the same read with entry / SL / TP levels.
+// choosing (kernel floor is 35). The scan runs on the CHART's active
+// timeframe (the tf chip shows which candles the reads were computed on;
+// TTL and suggested expiry scale with it), and the hit-rate view scores the
+// same timeframe's resolved reads. Option tab = direction + suggested
+// expiry; CFD tab = the same read with entry / SL / TP levels.
 // Signals carry a kernel-side TTL - stale reads disappear instead of
 // lingering (the list is recomputed every scan, never cached client-side).
 // Task 64-b: each card carries a take action - the read loads straight
 // into the trade ticket (kind + expiry, or entry/SL/TP as move-%), the
 // operator still presses the side button to actually place the order.
 import { useCallback, useEffect, useState } from 'react'
-import type { ChartSignal, ChartSignalsResponse, SignalKindStats } from '@/lib/os/client'
+import type { ChartSignal, ChartSignalsResponse, SignalKindStats, Timeframe } from '@/lib/os/client'
 import { CHART_ENGINE_LABEL, fmtPrice, getChartSignals, getSignalStats } from '@/lib/os/client'
 
 interface ChartSignalsPanelProps {
   onClose: () => void
+  /** the chart's active timeframe - the scan and the hit-rate view both
+   * follow it, so reads always speak the same language as the candles */
+  tf: Timeframe
   onSelectAsset?: (asset: string) => void
   onTake?: (signal: ChartSignal, tab: Tab) => void
 }
@@ -42,7 +48,7 @@ function outcomeColor(o: string): string {
   return o === 'win' ? 'text-emerald-300' : o === 'loss' ? 'text-rose-300' : o === 'timeout' ? 'text-amber-300' : 'text-[#4b5a72]'
 }
 
-function StatsView({ st, tab, now }: { st: SignalKindStats | null; tab: Tab; now: number }) {
+function StatsView({ st, tab, now, tf }: { st: SignalKindStats | null; tab: Tab; now: number; tf: Timeframe }) {
   if (!st) {
     return (
       <div className="p-2 text-[10px] leading-relaxed text-[#4b5a72]">
@@ -60,7 +66,7 @@ function StatsView({ st, tab, now }: { st: SignalKindStats | null; tab: Tab; now
             {st.winRate === null ? '—' : `${st.winRate}%`}
           </span>
           <span className="font-mono text-[9px] text-[#7c8aa5]">
-            {tab === 'option' ? 'expiry hit rate' : 'TP-first hit rate'} · {st.wins}W / {st.losses}L
+            {tab === 'option' ? 'expiry hit rate' : 'TP-first hit rate'} · {tf} · {st.wins}W / {st.losses}L
           </span>
         </div>
         <div className="mt-1 font-mono text-[8.5px] leading-relaxed text-[#4b5a72]">
@@ -285,7 +291,7 @@ function SignalCard({ s, now, tab, onSelectAsset, onTake }: { s: ChartSignal; no
   )
 }
 
-export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: ChartSignalsPanelProps) {
+export default function ChartSignalsPanel({ onClose, tf, onSelectAsset, onTake }: ChartSignalsPanelProps) {
   const [tab, setTab] = useState<Tab>('option')
   const [mkt, setMkt] = useState<Mkt>('all')
   const [cat, setCat] = useState<Cat>('all')
@@ -307,8 +313,9 @@ export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: Ch
   const load = useCallback(
     (opts?: { quiet?: boolean }) => {
       if (!opts?.quiet) setBusy(true)
-      // no top cut - every qualifying read from the full open-universe scan
-      getChartSignals(tab)
+      // no top cut - every qualifying read from the full open-universe scan,
+      // computed on the chart's timeframe (kernel caches per kind:tf)
+      getChartSignals(tab, tf)
         .then((d) => {
           if (d?.ok) {
             // ledger update: record first observation for new (asset,
@@ -340,7 +347,7 @@ export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: Ch
         .catch((e: Error) => setError(e.message.slice(0, 180)))
         .finally(() => setBusy(false))
     },
-    [tab],
+    [tab, tf],
   )
 
   useEffect(() => {
@@ -356,10 +363,12 @@ export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: Ch
   }, [])
 
   // outcome stats poll - the honesty loop resolves on the kernel's 5s sweep,
-  // a 30s refresh here is plenty (and cheap: aggregates only)
+  // a 30s refresh here is plenty (and cheap: aggregates only). Filtered to
+  // the chart's timeframe so the hit-rate view scores the same candles the
+  // signal cards were computed on; a tf switch refetches immediately.
   useEffect(() => {
     const pull = () =>
-      getSignalStats()
+      getSignalStats(tf)
         .then((s) => {
           if (s?.ok) setStats({ option: s.option, cfd: s.cfd })
         })
@@ -367,7 +376,13 @@ export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: Ch
     void pull()
     const iv = setInterval(pull, 30_000)
     return () => clearInterval(iv)
-  }, [])
+  }, [tf])
+
+  // a tf switch means a different scan - reads observed on the old timeframe
+  // don't carry their freshness over (the kernel attributes outcomes per tf)
+  useEffect(() => {
+    setFirstSeen(new Map())
+  }, [tf])
 
   const live = (data?.signals ?? []).filter((s) => s.validUntil > now)
   const needle = query.trim().toLowerCase()
@@ -391,6 +406,12 @@ export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: Ch
     <div className="flex h-full min-h-0 flex-col rounded-lg border border-[#1c2739] bg-[#0b111c]">
       <div className="flex flex-wrap items-center gap-1 border-b border-[#1c2739] px-2 py-1.5">
         <span className="text-[10px] font-bold uppercase tracking-wider text-cyan-300">Chart Signals</span>
+        <span
+          className="rounded border border-cyan-500/40 bg-cyan-500/10 px-1 py-px font-mono text-[8px] font-bold uppercase text-cyan-300"
+          title="every read on this panel is computed on the chart's current timeframe - switch the chart's tf and the scan follows (TTL + suggested expiry scale with it)"
+        >
+          {data?.tf ?? tf}
+        </span>
         {(
           [
             ['option', 'Option'],
@@ -603,7 +624,7 @@ export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: Ch
 
       <div className="min-h-0 flex-1 space-y-1.5 overflow-auto p-2">
         {view === 'stats' ? (
-          <StatsView st={stats?.[tab] ?? null} tab={tab} now={now} />
+          <StatsView st={stats?.[tab] ?? null} tab={tab} now={now} tf={tf} />
         ) : (
           <>
             {error && <div className="p-2 text-[10px] text-rose-400">{error}</div>}

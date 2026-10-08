@@ -1066,7 +1066,17 @@ const httpServer = createServer(async (req, res) => {
       // engine and real-vs-OTC, so the panel shows what the charts
       // actually delivered, not just what they claim.
       if (path === '/signals_stats') {
-        return json(200, { ok: true, ...kernel.context().use<ChartSignalsService>('chartSignals').stats(), ts: Date.now() })
+        // optional tf filter - the panel passes the chart's timeframe so the
+        // hit-rate view scores reads computed on THOSE candles; no tf = all
+        // timeframes blended (research reads the whole loop)
+        const tfq = q.get('tf')
+        let tfFilter: Timeframe | undefined
+        if (tfq !== null) {
+          const v = tfStrict(tfq)
+          if (v === null) return json(400, { ok: false, error: tfErr(tfq) })
+          tfFilter = v
+        }
+        return json(200, { ok: true, ...kernel.context().use<ChartSignalsService>('chartSignals').stats(tfFilter), ts: Date.now() })
       }
 
       // Engine-edge research: "which chart engines actually carry an edge?"

@@ -5,6 +5,8 @@
 // engine sets (footprint for real pairs, otcfootprint for OTC), CFD level
 // sanity (SL/TP on the right side, RR floor), TTL freshness, cache, sorting
 // and the strict tf gate. Read-only - the scanner touches no kernel state.
+// TF respect: the scan runs on the requested timeframe, per-kind:tf caches
+// never leak into each other, and TTL/expiry scale with the bar size.
 const BASE = process.env.IQAIR_OS_URL ?? 'http://localhost:3030'
 // P0: kernels started with KERNEL_TOKEN reject unauthenticated REST - send
 // the token from env when the target kernel has one.
@@ -105,6 +107,28 @@ const bad = await get('/signals?kind=option&tf=bogus')
 ok('garbage tf rejected', bad.status === 400 && bad.body.ok === false)
 const clamp = await get('/signals?kind=option&top=99')
 ok('top=99 still a clean cut', clamp.body.signals?.length <= 99)
+
+// ---------- tf respect: scan follows the requested timeframe ----------
+// the panel sends the chart's tf; the kernel must scan those candles (not
+// silently default to 1m) and keep kind:tf caches separate - with the old
+// kind-only cache key the second call below came back mislabeled with the
+// first call's tf
+const m5 = await get('/signals?kind=option&tf=5m&top=5')
+ok('5m scan 200 + tf echo', m5.status === 200 && m5.body.ok === true && m5.body.tf === '5m', `tf=${m5.body.tf}`)
+const m1back = await get('/signals?kind=option&tf=1m&top=5')
+ok('1m after 5m still reports 1m (no cross-tf cache leak)', m1back.body.tf === '1m', `tf=${m1back.body.tf}`)
+ok('per-tf caches are distinct scans', m5.body.ts !== m1back.body.ts, `5m ts=${m5.body.ts} 1m ts=${m1back.body.ts}`)
+const s5 = m5.body.signals?.[0] ?? null
+if (s5) {
+  // 5m bars: suggested expiry scales x5 (300..1500s, cap 1800) and the read
+  // lives ~5 bars (ttl 1500s) - an M5 structural read must not die in 2.5 min
+  ok('5m expiry scaled (>= 300s, <= 1800s)', s5.expirySec >= 300 && s5.expirySec <= 1800, `expirySec=${s5.expirySec}`)
+  ok('5m TTL scaled (~1500s)', s5.validUntil - s5.ts >= 1499_000 && s5.validUntil - s5.ts <= 1501_000, `ttl=${Math.round((s5.validUntil - s5.ts) / 1000)}s`)
+}
+const st5 = await get('/signals_stats?tf=5m')
+ok('stats accept tf filter', st5.status === 200 && st5.body.ok === true)
+const stBad = await get('/signals_stats?tf=bogus')
+ok('stats reject garbage tf', stBad.status === 400)
 
 console.log(`\n${pass} checks passed, ${fail} failed`)
 process.exit(fail ? 1 : 0)
