@@ -28,7 +28,16 @@
 // from the strip, and the depth itself is bounded by the same 4000-bar
 // lookback the scan already pulls: finer candles remember fewer days, so
 // deeper chips disable with the tf says so instead of 400-ing.
-import { useCallback, useEffect, useState } from 'react'
+//
+// Two aggregate views close the loop. The RHYME-BY-CLASS strip averages each
+// class's echo scores (compared rows only - no-echo rows are excluded, not
+// scored zero), so "are OTC pairs rhyming today?" is one glance instead of
+// mental math over 10 rows. And clicking an ECHO CHIP jumps the chart onto
+// the script itself: the page deep-loads the asset's full day of candles
+// (kernel /candles deep=1 - archive + live tail, never synthetic filler) and
+// scrolls the time scale onto yesterday's lead-in plus the forward replay
+// window. The scroll applies once per click, only after the deep bars land.
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { Timeframe, YesterdayRow } from '@/lib/os/client'
 import { TIMEFRAME_SECONDS, fmtPrice, getYesterday } from '@/lib/os/client'
 
@@ -37,6 +46,10 @@ interface YesterdayPanelProps {
   /** the chart's active timeframe - the 24h lookback replays on these candles */
   tf: Timeframe
   onSelectAsset?: (asset: string) => void
+  /** echo-chip click-through: the page deep-loads the asset's day of candles
+   * and scrolls the chart onto yesterday's lead-in + the forward replay window.
+   * Receives the kernel-snapped effective window (whole tf bars). */
+  onFocusWindow?: (r: YesterdayRow, effWindowMin: number) => void
 }
 
 type Mkt = 'all' | 'real' | 'otc'
@@ -118,8 +131,10 @@ function ShapeBar({ r }: { r: YesterdayRow }) {
 
 /** The rhyme badge: is today's lead-in echoing yesterday's? Color carries
  * the verdict (emerald rhymes / amber partial / rose diverges), the tooltip
- * quotes the score's three parts. */
-function EchoChip({ e }: { e: NonNullable<YesterdayRow['echo']> }) {
+ * quotes the score's three parts. Clicking jumps the chart onto the script:
+ * yesterday's lead-in plus the forward replay window (the page deep-loads a
+ * day of bars first, so the story actually has history behind it). */
+function EchoChip({ e, onJump }: { e: NonNullable<YesterdayRow['echo']>; onJump?: () => void }) {
   const cls =
     e.rhyme >= RHYME_OK
       ? 'bg-emerald-500/15 text-emerald-300'
@@ -129,16 +144,21 @@ function EchoChip({ e }: { e: NonNullable<YesterdayRow['echo']> }) {
   const glyph = e.rhyme >= RHYME_OK ? '⟳' : e.rhyme >= RHYME_BAD ? '≈' : '✗'
   const word = e.rhyme >= RHYME_OK ? 'rhymes' : e.rhyme >= RHYME_BAD ? 'partial' : 'diverges'
   return (
-    <span
-      className={`rounded px-1.5 py-px font-mono text-[10px] font-bold ${cls}`}
-      title={`echo rhyme ${e.rhyme}/100 (${word}) - direction agreement 50 pts (yesterday ${e.dirAgree}), today's move vs yesterday's measured against yesterday's own travel 30 pts, travel ratio 20 pts. Lead-in windows end at the same wall-clock moment: yesterday's at the anchor, today's within one bar of now.`}
+    <button
+      type="button"
+      onClick={(ev) => {
+        ev.stopPropagation()
+        onJump?.()
+      }}
+      className={`cursor-pointer rounded px-1.5 py-px font-mono text-[10px] font-bold transition hover:brightness-150 ${cls}`}
+      title={`echo rhyme ${e.rhyme}/100 (${word}) - direction agreement 50 pts (yesterday ${e.dirAgree}), today's move vs yesterday's measured against yesterday's own travel 30 pts, travel ratio 20 pts. Lead-in windows end at the same wall-clock moment: yesterday's at the anchor, today's within one bar of now. Click: the chart loads this asset's full day of bars and scrolls onto yesterday's lead-in + the forward replay window.`}
     >
       {glyph} {e.rhyme}
-    </span>
+    </button>
   )
 }
 
-function RowCard({ r, onSelectAsset, windowMin }: { r: YesterdayRow; onSelectAsset?: (a: string) => void; windowMin: number }) {
+function RowCard({ r, onSelectAsset, onFocusWindow, windowMin }: { r: YesterdayRow; onSelectAsset?: (a: string) => void; onFocusWindow?: (r: YesterdayRow, effWindowMin: number) => void; windowMin: number }) {
   const thenClock = new Date(r.thenTs * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   const cov = r.barsExpected > 0 ? Math.round((r.barsFound / r.barsExpected) * 100) : 0
   const partial = cov < 100
@@ -185,7 +205,7 @@ function RowCard({ r, onSelectAsset, windowMin }: { r: YesterdayRow; onSelectAss
           className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 font-mono text-[9px]"
           title={`lead-in comparison, yesterday vs today: travel ${r.echo.ydayRangePct.toFixed(2)}% then, ${r.echo.todayRangePct.toFixed(2)}% now (${r.echo.todayBarsFound}/${r.barsExpected} bars on today's side)`}
         >
-          <EchoChip e={r.echo} />
+          <EchoChip e={r.echo} onJump={onFocusWindow ? () => onFocusWindow(r, windowMin) : undefined} />
           <span className="text-[#4b5a72]">yday</span>
           <span className={r.echo.ydayMovePct >= 0 ? 'text-emerald-300/70' : 'text-rose-300/70'}>
             {r.echo.ydayMovePct >= 0 ? '+' : ''}{r.echo.ydayMovePct.toFixed(2)}%
@@ -268,7 +288,7 @@ function PriorStrip({ r }: { r: YesterdayRow }) {
   )
 }
 
-export default function YesterdayPanel({ onClose, tf, onSelectAsset }: YesterdayPanelProps) {
+export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWindow }: YesterdayPanelProps) {
   const [windowMin, setWindowMin] = useState(60)
   const [days, setDays] = useState(1)
   const [mkt, setMkt] = useState<Mkt>('all')
@@ -346,6 +366,29 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset }: Yesterday
   const rhymeLive = (data?.rows ?? []).filter((r) => (r.echo?.rhyme ?? -1) >= RHYME_OK).length
   const catCount = (c: Cat) => (c === 'all' ? (data?.rows ?? []).length : (data?.rows ?? []).filter((r) => r.category === c).length)
   const ageSec = data ? Math.max(0, Math.round((now - data.ts) / 1000)) : 0
+
+  // per-class rhyme averages - "are OTC pairs rhyming today?" at a glance.
+  // Averages run ONLY over rows carrying an echo (the honest denominator);
+  // the OTC entry answers over the otc flag (mostly the -OTC fx twins), the
+  // others over r.category. The strip always reads the FULL scan - it is a
+  // readout, and its click just sets the filters above.
+  const classRhyme = useMemo(() => {
+    const rowsAll = data?.rows ?? []
+    const build = (pick: (r: YesterdayRow) => boolean) => {
+      const sub = rowsAll.filter(pick)
+      const es = sub.flatMap((r) => (r.echo ? [r.echo.rhyme] : []))
+      const avg = es.length ? Math.round(es.reduce((s, x) => s + x, 0) / es.length) : null
+      return { rows: sub.length, compared: es.length, ok: es.filter((x) => x >= RHYME_OK).length, bad: es.filter((x) => x < RHYME_BAD).length, avg }
+    }
+    return [
+      { key: 'otc' as const, label: 'OTC', why: 'over-the-counter pairs (the -OTC twins)', agg: build((r) => r.otc) },
+      { key: 'forex' as const, label: 'FX', why: 'currency pairs (incl. their OTC twins)', agg: build((r) => r.category === 'forex') },
+      { key: 'crypto' as const, label: 'Crypto', why: 'crypto pairs - 24/7 real markets', agg: build((r) => r.category === 'crypto') },
+      { key: 'commodity' as const, label: 'Comm', why: 'metals, energy, agriculture', agg: build((r) => r.category === 'commodity') },
+      { key: 'stock' as const, label: 'Stocks', why: 'single-name equities', agg: build((r) => r.category === 'stock') },
+      { key: 'index' as const, label: 'Idx', why: 'index CFDs', agg: build((r) => r.category === 'index') },
+    ]
+  }, [data])
 
   return (
     <div className="flex h-full min-h-0 flex-col rounded-lg border border-[#1c2739] bg-[#0b111c]">
@@ -578,6 +621,58 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset }: Yesterday
         </div>
       </div>
 
+      {/* rhyme by class - the portfolio-level answer to "is today repeating
+          yesterday's script" per asset class, not just per pair */}
+      {data && data.rows.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1 border-b border-[#1c2739] px-2 py-1">
+          <span
+            className="mr-0.5 font-mono text-[8.5px] uppercase tracking-wider text-[#3d4d66]"
+            title="average echo rhyme per asset class, over the rows that carry a comparison (rows without an echo are excluded, not scored zero) - click a class to filter the list to it"
+          >
+            rhyme by class
+          </span>
+          {classRhyme.map(({ key, label, why, agg }) => {
+            const color =
+              agg.avg == null
+                ? 'text-[#3d4d66]'
+                : agg.avg >= RHYME_OK
+                  ? 'text-emerald-300'
+                  : agg.avg >= RHYME_BAD
+                    ? 'text-amber-300'
+                    : 'text-rose-300'
+            const click = () => {
+              if (key === 'otc') {
+                setMkt('otc')
+                setCat('all')
+              } else {
+                setCat(key)
+              }
+            }
+            return (
+              <button
+                key={key}
+                type="button"
+                onClick={click}
+                className="shrink-0 rounded px-1 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wider transition-colors hover:bg-[#141d2e]"
+                title={
+                  agg.avg == null
+                    ? `${why} - none of the ${agg.rows} row${agg.rows === 1 ? '' : 's'} in class carries an echo (lead-ins under half covered)`
+                    : `${why} - average echo rhyme ${agg.avg}/100 across ${agg.compared} of ${agg.rows} row${agg.rows === 1 ? '' : 's'} in class (${agg.ok} rhyming ${RHYME_OK}+, ${agg.bad} diverging under ${RHYME_BAD}); the rest have no comparison. Click to filter.`
+                }
+              >
+                <span className="text-[#4b5a72]">{label}</span>{' '}
+                <span className={color}>{agg.avg == null ? '—' : agg.avg}</span>
+                {agg.compared > 0 && (
+                  <span className="ml-0.5 text-[8.5px] text-[#3d4d66]">
+                    {agg.ok}/{agg.compared}
+                  </span>
+                )}
+              </button>
+            )
+          })}
+        </div>
+      )}
+
       <div className="min-h-0 flex-1 space-y-1.5 overflow-auto p-2">
         {error && <div className="p-2 text-[10px] text-rose-400">{error}</div>}
         {!error && !tfSupported && (
@@ -599,11 +694,11 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset }: Yesterday
           </div>
         )}
         {rows.map((r) => (
-          <RowCard key={r.asset} r={r} onSelectAsset={onSelectAsset} windowMin={data?.windowMin ?? windowMin} />
+          <RowCard key={r.asset} r={r} onSelectAsset={onSelectAsset} onFocusWindow={onFocusWindow} windowMin={data?.windowMin ?? windowMin} />
         ))}
         {data && data.rows.length > 0 && (
           <p className="px-1 pt-1 text-[8.5px] leading-relaxed text-[#3d4d66]">
-            Each row is the window that started at the bar forming exactly 24h ago, on the chart's timeframe. dir counts as up/down only when the net move exceeds 10% of the window's own travel. "arch" = bars from the kernel's accumulated store (broker bars in live mode), "seeded" = the feed's deterministic prehistory - never mistake a seeded yesterday for a remembered one. echo compares the lead-in windows ending at this same time of day (yesterday's ended at the anchor, today's within one bar of now): rhyme = direction 50 + move-vs-travel 30 + travel ratio 20, 70+ reads as "repeating the script", under 40 as "going its own way". The day chips walk the same window further back - the "at this hour" strip shows each remembered day with its own coverage, and days the series cannot cover are absent, not flat. Click a card to open that asset on the chart.
+            Each row is the window that started at the bar forming exactly 24h ago, on the chart's timeframe. dir counts as up/down only when the net move exceeds 10% of the window's own travel. "arch" = bars from the kernel's accumulated store (broker bars in live mode), "seeded" = the feed's deterministic prehistory - never mistake a seeded yesterday for a remembered one. echo compares the lead-in windows ending at this same time of day (yesterday's ended at the anchor, today's within one bar of now): rhyme = direction 50 + move-vs-travel 30 + travel ratio 20, 70+ reads as "repeating the script", under 40 as "going its own way". The rhyme-by-class strip averages each class's echo scores (compared rows only) - "are OTC pairs rhyming today?" is one glance away. Click a card to open that asset on the chart; click an echo chip to go further - the chart deep-loads the asset's full day of candles and scrolls onto yesterday's lead-in plus the forward replay window (edges the feed never remembered show as a gap, not filler). The day chips walk the same window further back - the "at this hour" strip shows each remembered day with its own coverage, and days the series cannot cover are absent, not flat.
           </p>
         )}
       </div>

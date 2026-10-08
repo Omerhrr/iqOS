@@ -3,10 +3,12 @@
 // Verifies /yesterday against the live kernel: response shape, the T-24h
 // anchor (window starts at the bar forming exactly 24h ago), row sanity
 // (move/range/excursions/coverage/provenance), direction classification,
-// the echo (lead-in comparison yesterday vs today: rhyme bounds, dirAgree
+// (echo lead-in comparison yesterday vs today: rhyme bounds, dirAgree
 // consistency with the move signs, coverage-when-present), the days param
 // (same-hour history strips: prior-day sanity + anchors, clamp, depth gate),
-// sorting by |move|, the window param (clamp + quantization), tf respect (per-tf
+// the /candles deep=1 read the echo click-through feeds on (archive depth,
+// deeper-than-plain reach, ascending bars, live tail, clamp), sorting by
+// |move|, the window param (clamp + quantization), tf respect (per-tf
 // caches, no cross-tf leak), the archive-depth gate (5s/15s refused with a
 // clear 400) and the strict tf gate. Read-only.
 const BASE = process.env.IQAIR_OS_URL ?? 'http://localhost:3030'
@@ -168,6 +170,25 @@ const fast15 = await get('/yesterday?tf=15s')
 ok('15s refused too', fast15.status === 400)
 const h4 = await get('/yesterday?tf=4h&window=60')
 ok('4h window snaps up to one bar (240m) and answers', h4.status === 200 && h4.body.windowMin === 240, `windowMin=${h4.body.windowMin} status=${h4.status}`)
+
+// ---------- /candles deep read (the echo click-through's chart feed) ----------
+// deep=1 serves the accumulated archive + live tail (getCandlesDeep) up to
+// the 4000-bar archive depth - the page uses it to put a full day + the
+// replay window of REAL remembered bars behind the click-through scroll.
+const plainC = await get('/candles?asset=BTCUSD&tf=1m&limit=320')
+const deepC = await get('/candles?asset=BTCUSD&tf=1m&limit=1600&deep=1')
+ok('deep read 200 + ok', deepC.status === 200 && deepC.body.ok === true, JSON.stringify(deepC.body).slice(0, 160))
+ok('deep echoes deep:true + asset/tf', deepC.body.deep === true && deepC.body.asset === 'BTCUSD' && deepC.body.tf === '1m', `deep=${deepC.body.deep} tf=${deepC.body.tf}`)
+ok('plain read does not claim deep', plainC.status === 200 && plainC.body.deep === undefined)
+const dp = deepC.body.candles ?? []
+const pp = plainC.body.candles ?? []
+ok('deep supplies materially more bars than the plain chart feed', dp.length > pp.length, `deep=${dp.length} plain=${pp.length}`)
+ok('deep reaches further back than the plain feed', dp.length > 0 && pp.length > 0 && dp[0].time < pp[0].time, `deep first=${dp[0]?.time} plain first=${pp[0]?.time}`)
+ok('deep bars ascend with positive prices', dp.every((c, i) => i === 0 || c.time > dp[i - 1].time) && dp.every((c) => c.open > 0 && c.high > 0 && c.low > 0 && c.close > 0))
+const nowSec = Math.floor(Date.now() / 1000)
+ok('deep tail touches the live edge', dp.length > 0 && dp[dp.length - 1].time >= nowSec - 120, `last=${dp[dp.length - 1]?.time} now=${nowSec}`)
+const clamped = await get('/candles?asset=BTCUSD&tf=1m&limit=99999&deep=1')
+ok('deep clamps at the 4000-bar archive depth', clamped.status === 200 && (clamped.body.candles ?? []).length <= 4000, `len=${(clamped.body.candles ?? []).length}`)
 
 console.log(`\n${pass} passed, ${fail} failed`)
 process.exit(fail > 0 ? 1 : 0)

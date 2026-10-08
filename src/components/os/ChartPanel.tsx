@@ -38,6 +38,10 @@ interface ChartPanelProps {
   settledPositions?: Position[]
   /** Chart timeframe (drives kernel fetches for tick/IV-HV charts). */
   tf?: Timeframe
+  /** Yesterday-echo click-through: epoch-seconds window the time scale jumps
+   * onto once the matching (deep-loaded) candles land. Applies ONCE per
+   * nonce - later data updates never yank the operator's viewport. */
+  focus?: { from: number; to: number; nonce: number } | null
 }
 
 type AnyPriceSeries =
@@ -425,6 +429,7 @@ export default function ChartPanel({
   positions,
   settledPositions,
   tf,
+  focus,
 }: ChartPanelProps) {
   const elRef = useRef<HTMLDivElement | null>(null)
   const chartRef = useRef<IChartApi | null>(null)
@@ -672,6 +677,31 @@ export default function ChartPanel({
         color: c.close >= c.open ? 'rgba(16,185,129,0.30)' : 'rgba(244,63,94,0.30)',
       }))
     )
+  }, [displayCandles, chartType])
+
+  // ---------- yesterday-echo click-through ----------
+  // The panel asks the page for a deep candle load + a scroll onto the replay
+  // window. The range applies only once the matching candles actually land
+  // (the deep fetch resolves after the focus prop arrives), then it is
+  // consumed - so later data updates never yank the operator's viewport.
+  // Declared AFTER the data effect: same-commit ordering puts the scroll
+  // behind the setData that gives it something to scroll onto.
+  const pendingFocusRef = useRef<{ from: number; to: number; nonce: number } | null>(null)
+  useEffect(() => {
+    pendingFocusRef.current = focus ?? null
+  }, [focus])
+  useEffect(() => {
+    const f = pendingFocusRef.current
+    if (!f || displayCandles.length === 0 || !chartRef.current) return
+    const ts = chartRef.current.timeScale()
+    if (!ts) return
+    pendingFocusRef.current = null
+    try {
+      ts.setVisibleRange({ from: Math.floor(f.from) as UTCTimestamp, to: Math.ceil(f.to) as UTCTimestamp })
+    } catch {
+      // range outside the remembered data (fresh boot, thin archive) - the
+      // zoom/fit controls still work from wherever it lands
+    }
   }, [displayCandles, chartType])
 
   // IV vs HV pane data (fetched from /iv_hv; kernel = engine of record).

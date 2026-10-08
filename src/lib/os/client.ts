@@ -428,6 +428,28 @@ export async function getSignalStats(tf?: Timeframe): Promise<{ ok: boolean; opt
   )
 }
 
+// ---- chart candles ----------------------------------------------------------
+// Kernel route /candles: the chart's feed. `deep` reads the kernel's
+// accumulated archive + live tail (getCandlesDeep) instead of the live series
+// alone - the Yesterday panel's echo click-through uses it to pull a full day
+// plus the replay window of bars so the T-24h story is actually on the chart.
+// Plain reads clamp at 1000 bars; deep reads may reach the archive's own
+// 4000-bar depth. Bars the feed never remembered come back absent (a gap on
+// the chart), never as synthetic filler.
+
+export async function getCandles(
+  asset: string,
+  tf: Timeframe,
+  opts?: { limit?: number; deep?: boolean },
+): Promise<{ ok: boolean; asset: string; tf: Timeframe; candles: Candle[]; price: number; deep?: boolean }> {
+  return osGet('/candles', {
+    asset,
+    tf,
+    ...(opts?.limit != null ? { limit: opts.limit } : {}),
+    ...(opts?.deep ? { deep: 1 } : {}),
+  })
+}
+
 // ---- same-time-yesterday scanner (Task: "what did the market do at this
 // time yesterday?") ----------------------------------------------------------
 // Kernel route /yesterday: per open instrument, the story of the window that

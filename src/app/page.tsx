@@ -40,7 +40,7 @@ import type {
   StrategyInfo,
   Timeframe,
 } from '@/lib/os/client'
-import { osGet, osPost, TIMEFRAME_SECONDS, useOSFeed } from '@/lib/os/client'
+import { getCandles, osGet, osPost, TIMEFRAME_SECONDS, useOSFeed } from '@/lib/os/client'
 import type { ChartSignal } from '@/lib/os/client'
 
 const BOOT_MSGS = [
@@ -265,8 +265,26 @@ export default function OSPage() {
     }
   }, [fetchWatchPrices])
 
+  // Yesterday-echo click-through focus: the target asset, the epoch-seconds
+  // window to scroll onto, and a nonce (one deep load + one scroll per click).
+  // focusRef mirrors the state so loadCandles reads it without stale closures,
+  // and so the asset switch the jump itself triggers keeps the focus alive.
+  type YdayFocus = { asset: string; from: number; to: number; nonce: number }
+  const [focus, setFocus] = useState<YdayFocus | null>(null)
+  const focusRef = useRef<YdayFocus | null>(null)
+
   const loadCandles = useCallback(async (a: string, t: Timeframe) => {
-    const d = await osGet<{ ok: boolean; candles: Candle[] }>(`/candles`, { asset: a, tf: t, limit: 320 })
+    // an active focus for THIS asset asks for the deep read: enough bars to
+    // cover the window plus context, so the T-24h story is really on the chart
+    const f = focusRef.current
+    if (f && f.asset === a) {
+      const tfSec = TIMEFRAME_SECONDS[t] ?? 60
+      const need = Math.min(4000, Math.max(320, Math.ceil((Date.now() / 1000 - f.from) / tfSec) + 8))
+      const d = await getCandles(a, t, { limit: need, deep: true })
+      if (d.ok) setCandles(d.candles)
+      return
+    }
+    const d = await getCandles(a, t, { limit: 320 })
     if (d.ok) setCandles(d.candles)
   }, [])
 
@@ -468,6 +486,12 @@ export default function OSPage() {
   }, [asset, tf, loadCandles, loadAnalysis])
 
   const handleSelectAsset = useCallback((a: string) => {
+    // a manual switch away from a yesterday-focus target drops the focus (the
+    // deep bars stay until the next reload; re-clicking the chip re-jumps)
+    if (focusRef.current && focusRef.current.asset !== a) {
+      focusRef.current = null
+      setFocus(null)
+    }
     setAsset(a)
     // remember the operator's pair across page refreshes (the kernel
     // restores its own state on boot, the UI restores the selection here)
@@ -478,6 +502,26 @@ export default function OSPage() {
     }
     void osPost('/asset', { asset: a })
   }, [])
+
+  // Yesterday panel echo chip: deep-load this asset's candles (so the window
+  // has remembered bars behind it) and scroll the chart onto yesterday's
+  // lead-in plus the forward replay window - the script the rhyme score is
+  // about, visible at a glance. focusRef is set BEFORE the asset switch so
+  // handleSelectAsset's clear-check sees the new focus as the target.
+  const handleFocusYesterday = useCallback(
+    (r: { asset: string; thenTs: number }, effWindowMin: number) => {
+      const span = Math.max(60, effWindowMin * 60)
+      const margin = Math.round(span * 0.1)
+      const from = r.thenTs - span - margin
+      const to = r.thenTs + span + margin
+      const f: YdayFocus = { asset: r.asset, from, to, nonce: Date.now() }
+      focusRef.current = f
+      setFocus(f)
+      if (r.asset !== asset) handleSelectAsset(r.asset)
+      else void loadCandles(r.asset, tf)
+    },
+    [asset, tf, handleSelectAsset, loadCandles],
+  )
 
   // screener row -> load that setup into the chart workspace
   const TF_VALUES = ['5s', '15s', '30s', '1m', '2m', '5m', '15m', '30m', '1h', '4h', '1d'] as const
@@ -716,7 +760,7 @@ export default function OSPage() {
   const chartWorkspace = (
     <>
       <div className="min-h-[280px] flex-1">
-        <ChartPanel candles={candles} analysis={analysis} price={livePrice} digitsTicker={asset} chartType={chartType} overlays={overlaySeries} positions={positions} settledPositions={history} tf={tf} />
+        <ChartPanel candles={candles} analysis={analysis} price={livePrice} digitsTicker={asset} chartType={chartType} overlays={overlaySeries} positions={positions} settledPositions={history} tf={tf} focus={focus} />
       </div>
       {activeSubs.map((s, i) => (
         <SubPane
@@ -743,7 +787,7 @@ export default function OSPage() {
     <PanelGroup direction="vertical" autoSaveId="iqos:chartstack" className="min-h-0 flex-1">
       <Panel id="chart" defaultSize={58} minSize={20}>
         <div className="h-full min-h-0">
-          <ChartPanel candles={candles} analysis={analysis} price={livePrice} digitsTicker={asset} chartType={chartType} overlays={overlaySeries} positions={positions} settledPositions={history} tf={tf} />
+          <ChartPanel candles={candles} analysis={analysis} price={livePrice} digitsTicker={asset} chartType={chartType} overlays={overlaySeries} positions={positions} settledPositions={history} tf={tf} focus={focus} />
         </div>
       </Panel>
       {activeSubs.map((s, i) => {
@@ -895,7 +939,7 @@ export default function OSPage() {
               {signalsOpen || ydayOpen ? (
                 <div className="mr-0.5 h-full min-h-0">
                   {ydayOpen ? (
-                    <YesterdayPanel onClose={() => setYdayOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
+                    <YesterdayPanel onClose={() => setYdayOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onFocusWindow={handleFocusYesterday} />
                   ) : (
                     <ChartSignalsPanel onClose={() => setSignalsOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onTake={handleTakeSignal} />
                   )}

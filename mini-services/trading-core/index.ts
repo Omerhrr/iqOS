@@ -372,8 +372,17 @@ const httpServer = createServer(async (req, res) => {
       if (path === '/candles') {
         const asset = q.get('asset') ?? market.activeAsset
         const timeframe = tf(q.get('tf'))
-        const limit = Math.min(Number(q.get('limit') ?? 400), 1000)
-        return json(200, { ok: true, asset, tf: timeframe, candles: market.getCandles(asset, timeframe, limit), price: market.getPrice(asset) })
+        // deep=1: the kernel's accumulated archive + live tail (getCandlesDeep)
+        // instead of the live series alone - the Yesterday panel's echo
+        // click-through asks for a day + the replay window of bars so the
+        // T-24h story actually has remembered history behind it on the chart.
+        // Plain reads keep the 1000 clamp; deep reads may reach the archive's
+        // own 4000-bar depth. Bars the feed never remembered are absent - the
+        // chart shows a gap there, never synthetic filler.
+        const deep = q.get('deep') === '1'
+        const limit = Math.min(Number(q.get('limit') ?? 400), deep ? 4000 : 1000)
+        const candles = deep ? market.getCandlesDeep(asset, timeframe, limit) : market.getCandles(asset, timeframe, limit)
+        return json(200, { ok: true, asset, tf: timeframe, candles, price: market.getPrice(asset), ...(deep ? { deep: true } : {}) })
       }
 
       // Order flow approximation (no real bid/ask-tagged trades are available
