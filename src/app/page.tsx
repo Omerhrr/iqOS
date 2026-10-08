@@ -19,7 +19,7 @@ import { DeltaFootprintView } from '@/components/os/OrderFlowPanel'
 import CandleMathView from '@/components/os/CandleMathView'
 import { FullscreenBackdrop, FullscreenButton } from '@/components/os/FullscreenButton'
 import QuantPanel from '@/components/os/QuantPanel'
-import TradeTicket from '@/components/os/TradeTicket'
+import TradeTicket, { type TicketPrefill } from '@/components/os/TradeTicket'
 import Copilot from '@/components/os/Copilot'
 import BottomTabs from '@/components/os/BottomTabs'
 import type {
@@ -39,7 +39,8 @@ import type {
   StrategyInfo,
   Timeframe,
 } from '@/lib/os/client'
-import { osGet, osPost, useOSFeed } from '@/lib/os/client'
+import { osGet, osPost, TIMEFRAME_SECONDS, useOSFeed } from '@/lib/os/client'
+import type { ChartSignal } from '@/lib/os/client'
 
 const BOOT_MSGS = [
   'mounting kernel plugins…',
@@ -475,6 +476,63 @@ export default function OSPage() {
 
   // screener row -> load that setup into the chart workspace
   const TF_VALUES = ['5s', '15s', '30s', '1m', '2m', '5m', '15m', '30m', '1h', '4h', '1d'] as const
+
+  // Task 64-b: take a chart signal -> load it into the trade ticket. The
+  // asset switches, the ticket kind/expiry (option) or TP/SL move-% (CFD)
+  // pre-fill, the voted side gets the ring - placing the order stays a
+  // deliberate operator click, never an auto-fire.
+  const [ticketPrefill, setTicketPrefill] = useState<TicketPrefill | null>(null)
+  const prefillNonce = useRef(0)
+  const handleTakeSignal = useCallback(
+    (s: ChartSignal, tab: 'option' | 'cfd') => {
+      handleSelectAsset(s.asset)
+      const tfSec = TIMEFRAME_SECONDS[tf] ?? 60
+      let kind: TicketPrefill['kind'] = 'turbo'
+      let expiryBars: number | undefined
+      let digitalExpirySec: number | undefined
+      let tpPct: number | undefined
+      let slPct: number | undefined
+      let note = ''
+      if (tab === 'option') {
+        const sec = Math.max(30, Math.round(s.expirySec))
+        if (tfSec <= 60) {
+          // turbo settles in whole seconds at max(30, bars * tfSec)
+          kind = 'turbo'
+          expiryBars = Math.max(1, Math.round(sec / tfSec))
+          note = `settle ~${Math.max(30, expiryBars * tfSec)}s`
+        } else {
+          // digital takes any sec >= 60 - keep the exact read, the ticket
+          // shows it as a live custom chip when it is off the presets
+          kind = 'digital'
+          digitalExpirySec = Math.max(60, Math.round(sec / 60) * 60)
+          note = `expiry ${Math.round(digitalExpirySec / 60)}m`
+        }
+      } else if (s.cfd) {
+        // ticket TP/SL are direction-adjusted price-move percentages
+        // (movePct = (price - entry) / entry * 100 * dir in the kernel)
+        kind = 'cfd'
+        const risk = Math.abs(s.cfd.entry - s.cfd.sl)
+        const reward = Math.abs(s.cfd.tp - s.cfd.entry)
+        tpPct = Math.max(0.05, Math.round((reward / s.cfd.entry) * 10000) / 100)
+        slPct = Math.max(0.05, Math.round((risk / s.cfd.entry) * 10000) / 100)
+        note = `RR ${(reward / Math.max(risk, 1e-9)).toFixed(2)}`
+      } else {
+        return
+      }
+      prefillNonce.current += 1
+      setTicketPrefill({
+        nonce: prefillNonce.current,
+        kind,
+        side: s.direction,
+        expiryBars,
+        digitalExpirySec,
+        tpPct,
+        slPct,
+        source: `${s.asset} ${s.direction === 'call' ? '▲' : '▼'} ${s.agree}/${s.total} engines · ${note}`,
+      })
+    },
+    [handleSelectAsset, tf],
+  )
   const handleSelectSetup = useCallback(
     (a: string, t: Timeframe) => {
       setAsset(a)
@@ -714,6 +772,7 @@ export default function OSPage() {
       tf={tf}
       price={livePrice}
       account={account}
+      prefill={ticketPrefill}
       onPlaced={() => void loadPositions()}
       onError={(m) => pushToast('danger', m)}
     />
@@ -830,7 +889,7 @@ export default function OSPage() {
             <Panel defaultSize={17} minSize={11}>
               {signalsOpen ? (
                 <div className="mr-0.5 h-full min-h-0">
-                  <ChartSignalsPanel onClose={() => setSignalsOpen(false)} onSelectAsset={handleSelectAsset} />
+                  <ChartSignalsPanel onClose={() => setSignalsOpen(false)} onSelectAsset={handleSelectAsset} onTake={handleTakeSignal} />
                 </div>
               ) : (
                 <PanelGroup direction="vertical" autoSaveId="iqos:left" className="h-full">

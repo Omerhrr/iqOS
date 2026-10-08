@@ -7,6 +7,9 @@
 // suggested expiry; CFD tab = the same read with entry / SL / TP levels.
 // Signals carry a kernel-side TTL - stale reads disappear instead of
 // lingering (the list is recomputed every scan, never cached client-side).
+// Task 64-b: each card carries a take action - the read loads straight
+// into the trade ticket (kind + expiry, or entry/SL/TP as move-%), the
+// operator still presses the side button to actually place the order.
 import { useCallback, useEffect, useState } from 'react'
 import type { ChartSignal, ChartSignalsResponse } from '@/lib/os/client'
 import { CHART_ENGINE_LABEL, fmtPrice, getChartSignals } from '@/lib/os/client'
@@ -14,9 +17,17 @@ import { CHART_ENGINE_LABEL, fmtPrice, getChartSignals } from '@/lib/os/client'
 interface ChartSignalsPanelProps {
   onClose: () => void
   onSelectAsset?: (asset: string) => void
+  onTake?: (signal: ChartSignal, tab: Tab) => void
 }
 
 type Tab = 'option' | 'cfd'
+
+function rrOf(s: ChartSignal): number | null {
+  if (!s.cfd) return null
+  const risk = Math.abs(s.cfd.entry - s.cfd.sl)
+  const reward = Math.abs(s.cfd.tp - s.cfd.entry)
+  return risk > 0 ? reward / risk : null
+}
 
 function dirChip(direction: 'call' | 'put') {
   const call = direction === 'call'
@@ -67,18 +78,23 @@ function EngineChips({ s }: { s: ChartSignal }) {
   )
 }
 
-function SignalCard({ s, now, tab, onSelectAsset }: { s: ChartSignal; now: number; tab: Tab; onSelectAsset?: (a: string) => void }) {
+function SignalCard({ s, now, tab, onSelectAsset, onTake }: { s: ChartSignal; now: number; tab: Tab; onSelectAsset?: (a: string) => void; onTake?: (sig: ChartSignal, t: Tab) => void }) {
   const ageSec = Math.max(0, Math.round((now - s.ts) / 1000))
   const remainSec = Math.round((s.validUntil - now) / 1000)
   // fade as the read approaches its TTL - gone entirely once expired
   const opacity = remainSec <= 0 ? 0 : remainSec < 45 ? 0.35 + (remainSec / 45) * 0.65 : 1
   const expiryMin = Math.round(s.expirySec / 60)
+  const rr = rrOf(s)
   return (
-    <button
-      type="button"
+    <div
+      role="button"
+      tabIndex={0}
       onClick={() => onSelectAsset?.(s.asset)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') onSelectAsset?.(s.asset)
+      }}
       style={{ opacity }}
-      className="w-full rounded-lg border border-[#1c2739] bg-[#0b111c] p-2 text-left transition-opacity hover:border-cyan-500/40"
+      className="w-full cursor-pointer rounded-lg border border-[#1c2739] bg-[#0b111c] p-2 text-left transition-opacity hover:border-cyan-500/40"
       title={`open ${s.asset} on the chart - valid ${remainSec}s more`}
     >
       <div className="flex flex-wrap items-center gap-1.5">
@@ -101,31 +117,62 @@ function SignalCard({ s, now, tab, onSelectAsset }: { s: ChartSignal; now: numbe
             ~{expiryMin}m expiry
           </span>
           <span className="font-mono text-[9px] text-[#7c8aa5]">strength {s.strength}</span>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation()
+              onTake?.(s, 'option')
+            }}
+            className="ml-auto rounded border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-px font-mono text-[8px] font-bold uppercase tracking-wider text-emerald-300 transition-colors hover:bg-emerald-500/25"
+            title="load this read into the trade ticket - kind + expiry pre-filled, you press the side button"
+          >
+            take →
+          </button>
         </div>
       ) : (
-        <div className="mt-1.5 grid grid-cols-3 gap-1 font-mono text-[9px]">
-          <div>
-            <div className="text-[8px] uppercase text-[#4b5a72]">entry</div>
-            <div className="text-[#dbe4f0]">{fmtPrice(s.cfd?.entry ?? s.price, s.asset)}</div>
+        <>
+          <div className="mt-1.5 grid grid-cols-3 gap-1 font-mono text-[9px]">
+            <div>
+              <div className="text-[8px] uppercase text-[#4b5a72]">entry</div>
+              <div className="text-[#dbe4f0]">{fmtPrice(s.cfd?.entry ?? s.price, s.asset)}</div>
+            </div>
+            <div>
+              <div className="text-[8px] uppercase text-[#4b5a72]">stop</div>
+              <div className="text-rose-300">{fmtPrice(s.cfd?.sl ?? 0, s.asset)}</div>
+            </div>
+            <div>
+              <div className="text-[8px] uppercase text-[#4b5a72]">target</div>
+              <div className="text-emerald-300">{fmtPrice(s.cfd?.tp ?? 0, s.asset)}</div>
+            </div>
           </div>
-          <div>
-            <div className="text-[8px] uppercase text-[#4b5a72]">stop</div>
-            <div className="text-rose-300">{fmtPrice(s.cfd?.sl ?? 0, s.asset)}</div>
+          <div className="mt-1.5 flex items-center gap-1.5">
+            {rr !== null && (
+              <span className="rounded border border-[#1c2739] px-1 py-px font-mono text-[8px] text-[#7c8aa5]" title="reward / risk of the plan - floor is 1.5 by construction">
+                RR {rr.toFixed(2)}
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation()
+                onTake?.(s, 'cfd')
+              }}
+              className="ml-auto rounded border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-px font-mono text-[8px] font-bold uppercase tracking-wider text-emerald-300 transition-colors hover:bg-emerald-500/25"
+              title="load the plan into the CFD ticket - TP/SL arrive as move-% levels, you press the side button"
+            >
+              take plan →
+            </button>
           </div>
-          <div>
-            <div className="text-[8px] uppercase text-[#4b5a72]">target</div>
-            <div className="text-emerald-300">{fmtPrice(s.cfd?.tp ?? 0, s.asset)}</div>
-          </div>
-        </div>
+        </>
       )}
       <div className="mt-1.5">
         <EngineChips s={s} />
       </div>
-    </button>
+    </div>
   )
 }
 
-export default function ChartSignalsPanel({ onClose, onSelectAsset }: ChartSignalsPanelProps) {
+export default function ChartSignalsPanel({ onClose, onSelectAsset, onTake }: ChartSignalsPanelProps) {
   const [tab, setTab] = useState<Tab>('option')
   const [data, setData] = useState<ChartSignalsResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -208,14 +255,14 @@ export default function ChartSignalsPanel({ onClose, onSelectAsset }: ChartSigna
           </div>
         )}
         {signals.map((s) => (
-          <SignalCard key={`${s.asset}-${s.ts}`} s={s} now={now} tab={tab} onSelectAsset={onSelectAsset} />
+          <SignalCard key={`${s.asset}-${s.ts}`} s={s} now={now} tab={tab} onSelectAsset={onSelectAsset} onTake={onTake} />
         ))}
         {data && data.signals.length > 0 && (
           <p className="px-1 pt-1 text-[8.5px] leading-relaxed text-[#3d4d66]">
             {tab === 'option'
               ? 'Direction + suggested expiry from chart-type confluence. Real pairs read the volume footprint (CLV proxy), OTC pairs the micro-tick velocity footprint.'
               : 'Same chart-engine read, expressed as a CFD plan: entry at last close, stop beyond the recent swing (ATR floor), target at >= 1.5R.'}
-            {' '}Click a card to open that asset on the chart.
+            {' '}Click a card to open that asset on the chart - take loads it into the trade ticket.
           </p>
         )}
       </div>

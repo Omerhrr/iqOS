@@ -7,11 +7,26 @@ import { Input } from '@/components/ui/input'
 import type { AccountState, AssetRow, Position, Timeframe, TradeKind } from '@/lib/os/client'
 import { KIND_LABEL, fmtMoney, fmtPrice, osGet, osPost } from '@/lib/os/client'
 
+// Task 64-b: a chart-signal can load the ticket - kind, expiry and CFD
+// levels arrive pre-filled, the voted side is highlighted. The money action
+// stays deliberate: nothing is ever placed without the operator's click.
+export interface TicketPrefill {
+  nonce: number
+  kind: TradeKind
+  side: 'call' | 'put'
+  expiryBars?: number
+  digitalExpirySec?: number
+  tpPct?: number
+  slPct?: number
+  source: string
+}
+
 interface Props {
   asset: AssetRow | undefined
   tf: Timeframe
   price: number
   account: AccountState | null
+  prefill?: TicketPrefill | null
   onPlaced: (p: Position) => void
   onError: (msg: string) => void
 }
@@ -22,7 +37,7 @@ const DIGITAL_EXPIRIES = [
   { sec: 1800, label: '30m' },
 ]
 
-export default function TradeTicket({ asset, tf, price, account, onPlaced, onError }: Props) {
+export default function TradeTicket({ asset, tf, price, account, prefill, onPlaced, onError }: Props) {
   const [kind, setKind] = useState<TradeKind>('binary')
   const [side, setSide] = useState<'call' | 'put' | null>(null)
   const [amount, setAmount] = useState('1')
@@ -33,6 +48,19 @@ export default function TradeTicket({ asset, tf, price, account, onPlaced, onErr
   const [tp, setTp] = useState('0.4')
   const [sl, setSl] = useState('0.25')
   const [busy, setBusy] = useState(false)
+  const [fromSignal, setFromSignal] = useState<{ label: string; side: 'call' | 'put' } | null>(null)
+
+  // signal -> ticket: re-applies on every nonce bump (re-taking the same
+  // signal re-fires it), keeps the source strip up until dismissed
+  useEffect(() => {
+    if (!prefill) return
+    setKind(prefill.kind)
+    if (prefill.expiryBars !== undefined) setExpiryBars(String(prefill.expiryBars))
+    if (prefill.digitalExpirySec !== undefined) setDigitalExpiry(prefill.digitalExpirySec)
+    if (prefill.tpPct !== undefined) setTp(String(prefill.tpPct))
+    if (prefill.slPct !== undefined) setSl(String(prefill.slPct))
+    setFromSignal({ label: prefill.source, side: prefill.side })
+  }, [prefill?.nonce])
 
   const amt = Math.max(0, Number(amount) || 0)
   const payout =
@@ -180,6 +208,24 @@ export default function TradeTicket({ asset, tf, price, account, onPlaced, onErr
                 </button>
               ))}
             </div>
+            {/* a signal can load an off-chip digital expiry (kernel accepts any
+                sec >= 60) - show it as a live custom chip instead of silently
+                snapping the plan back to the nearest preset */}
+            {!DIGITAL_EXPIRIES.some((d) => d.sec === digitalExpiry) && (
+              <div className="mt-1 flex items-center gap-1">
+                <span className="rounded border border-violet-500/50 bg-violet-500/10 px-2 py-0.5 font-mono text-[10px] text-violet-300">
+                  {digitalExpiry % 60 === 0 ? `${digitalExpiry / 60}m` : `${digitalExpiry}s`} · from signal
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setDigitalExpiry(300)}
+                  className="font-mono text-[8px] uppercase text-[#4b5a72] hover:text-rose-300"
+                  title="drop the signal expiry, back to 5m"
+                >
+                  reset
+                </button>
+              </div>
+            )}
           </div>
         )}
 
@@ -272,18 +318,41 @@ export default function TradeTicket({ asset, tf, price, account, onPlaced, onErr
         <span className="text-rose-400">risk -{fmtMoney(riskAmt)}</span>
       </div>
 
+      {fromSignal && (
+        <div className="flex items-center gap-1.5 rounded border border-cyan-500/30 bg-cyan-500/5 px-2 py-1">
+          <span className="font-mono text-[8px] font-bold uppercase tracking-wider text-cyan-300">signal → ticket</span>
+          <span className="truncate font-mono text-[9px] text-[#aab6cc]" title={fromSignal.label}>
+            {fromSignal.label}
+          </span>
+          <button
+            type="button"
+            onClick={() => setFromSignal(null)}
+            className="ml-auto flex h-4 w-4 shrink-0 items-center justify-center rounded font-mono text-[10px] text-[#4b5a72] hover:text-rose-300"
+            title="dismiss the signal source note (fields stay as loaded)"
+          >
+            ×
+          </button>
+        </div>
+      )}
+
       <div className="grid grid-cols-2 gap-2">
         <Button
           disabled={busy || account?.killSwitch || asset?.open === false}
           onClick={() => place('call')}
-          className="h-11 bg-emerald-600 font-bold tracking-wider text-white hover:bg-emerald-500 disabled:opacity-40"
+          className={`h-11 bg-emerald-600 font-bold tracking-wider text-white hover:bg-emerald-500 disabled:opacity-40 ${
+            fromSignal?.side === 'call' ? 'ring-2 ring-emerald-400/70' : ''
+          }`}
+          title={fromSignal?.side === 'call' ? 'the chart engines vote this side - press to place' : undefined}
         >
           {side === 'call' ? '…' : kind === 'cfd' ? '▲ BUY' : '▲ HIGHER'}
         </Button>
         <Button
           disabled={busy || account?.killSwitch || asset?.open === false}
           onClick={() => place('put')}
-          className="h-11 bg-rose-600 font-bold tracking-wider text-white hover:bg-rose-500 disabled:opacity-40"
+          className={`h-11 bg-rose-600 font-bold tracking-wider text-white hover:bg-rose-500 disabled:opacity-40 ${
+            fromSignal?.side === 'put' ? 'ring-2 ring-rose-400/70' : ''
+          }`}
+          title={fromSignal?.side === 'put' ? 'the chart engines vote this side - press to place' : undefined}
         >
           {side === 'put' ? '…' : kind === 'cfd' ? '▼ SELL' : '▼ LOWER'}
         </Button>
