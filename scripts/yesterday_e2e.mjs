@@ -3,9 +3,11 @@
 // Verifies /yesterday against the live kernel: response shape, the T-24h
 // anchor (window starts at the bar forming exactly 24h ago), row sanity
 // (move/range/excursions/coverage/provenance), direction classification,
-// sorting by |move|, the window param (clamp + quantization), tf respect
-// (per-tf caches, echo, no cross-tf leak), the archive-depth gate (5s/15s
-// refused with a clear 400) and the strict tf gate. Read-only.
+// the echo (lead-in comparison yesterday vs today: rhyme bounds, dirAgree
+// consistency with the move signs, coverage-when-present), sorting by
+// |move|, the window param (clamp + quantization), tf respect (per-tf
+// caches, no cross-tf leak), the archive-depth gate (5s/15s refused with a
+// clear 400) and the strict tf gate. Read-only.
 const BASE = process.env.IQAIR_OS_URL ?? 'http://localhost:3030'
 const TOKEN = (process.env.KERNEL_TOKEN ?? '').trim()
 let pass = 0
@@ -75,6 +77,35 @@ ok('all rows well-formed', rows.every((r) =>
   r.archived >= 0 && r.archived <= r.barsFound &&
   ['ASIA', 'LONDON', 'OVERLAP', 'NEWYORK', 'OFF', 'OTC'].includes(r.session),
 ))
+
+// ---------- echo: the lead-in comparison, yesterday vs today ----------
+// rhyme 0..100, dirAgree enum, today's side bounded; dirAgree must agree
+// with the two moves' signs under the same 10%-of-own-travel rule the row
+// itself uses. A warmed sim series covers both lead-in windows, so most
+// rows carry an echo - a missing echo is honest (thin side), not an error.
+const flat = (m, rg) => Math.abs(m) <= rg * 0.1 + 0.001
+ok('all echoes well-formed', rows.every((r) =>
+  r.echo === null || r.echo === undefined ||
+  (Number.isFinite(r.echo.rhyme) && r.echo.rhyme >= 0 && r.echo.rhyme <= 100 &&
+    ['same', 'partial', 'opposite'].includes(r.echo.dirAgree) &&
+    Number.isFinite(r.echo.ydayMovePct) && Number.isFinite(r.echo.ydayRangePct) && r.echo.ydayRangePct >= 0 &&
+    Number.isFinite(r.echo.todayMovePct) && Number.isFinite(r.echo.todayRangePct) && r.echo.todayRangePct >= 0 &&
+    Number.isFinite(r.echo.todayBarsFound) && r.echo.todayBarsFound >= 1 && r.echo.todayBarsFound <= r.barsExpected),
+))
+const withEcho = rows.filter((r) => r.echo)
+ok('dirAgree consistent with the moves', withEcho.every((r) => {
+  const e = r.echo
+  const fy = flat(e.ydayMovePct, e.ydayRangePct)
+  const ft = flat(e.todayMovePct, e.todayRangePct)
+  if (e.dirAgree === 'same') return (fy && ft) || (!fy && !ft && e.ydayMovePct > 0 === e.todayMovePct > 0)
+  if (e.dirAgree === 'opposite') return !fy && !ft && e.ydayMovePct > 0 !== e.todayMovePct > 0
+  return fy !== ft
+}))
+ok('echo present on most rows (warmed sim covers both lead-ins)', withEcho.length >= Math.floor(rows.length * 0.8), `echo=${withEcho.length}/${rows.length}`)
+if (r0 && r0.echo) {
+  ok('echo rhyme inside 0..100', r0.echo.rhyme >= 0 && r0.echo.rhyme <= 100, `rhyme=${r0.echo.rhyme}`)
+  ok('echo today side bounded by the window', r0.echo.todayBarsFound >= Math.max(1, Math.floor(r0.barsExpected * 0.5)) && r0.echo.todayBarsFound <= r0.barsExpected, `today=${r0.echo.todayBarsFound}/${r0.barsExpected}`)
+}
 ok('sorted by |move| desc', rows.every((x, i, arr) => i === 0 || Math.abs(arr[i - 1].movePct) >= Math.abs(x.movePct)))
 ok('OTC rows present (OTC universe warmed)', rows.some((r) => r.otc), `otcRows=${rows.filter((r) => r.otc).length}`)
 ok('warmed majors covered', ['EURUSD', 'BTCUSD', 'EURUSD-OTC'].every((a) => rows.some((r) => r.asset === a)), `rows=${rows.length}`)

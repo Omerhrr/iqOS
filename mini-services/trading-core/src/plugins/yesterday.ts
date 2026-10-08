@@ -8,10 +8,15 @@
 // price has gone since, session context and window coverage. Rows sort by
 // |move| - the biggest "yesterday at this hour" stories lead.
 //
+// Each row also carries the ECHO: the lead-in window ending at the same
+// wall-clock moment, yesterday vs today, scored 0..100 for rhyme - is today
+// repeating yesterday's script? That doubles the lookback (24h + 2x window
+// instead of 24h + window) so both lead-in windows are in the series.
+//
 // tf respect (same rule as /signals): the caller names the timeframe, the
 // lookback runs on those candles, and the cache is keyed per tf:window so a
 // 1m story and a 5m story never bleed into each other. Timeframes whose
-// 24h + window lookback cannot fit the 4000-bar archive depth (5s / 15s)
+// 24h + 2x window lookback cannot fit the 4000-bar archive depth (5s / 15s)
 // are refused with a clear 400 instead of silently answering from a
 // fraction of the day. The result is cached 60s - a T-24h target crawls
 // forward one second per second, so rapid panel polls share one scan.
@@ -66,11 +71,12 @@ export class YesterdayService {
   }
 
   /** Quantized request plan: window snapped to whole bars of the tf (>= 1
-   * bar), plus whether the 24h + window lookback fits the archive depth. */
+   * bar), plus whether the 24h + 2x window lookback (the echo's lead-in
+   * windows reach a window before the anchor) fits the archive depth. */
   static plan(tf: Timeframe, windowMin: number): { windowSec: number; windowMin: number; ok: boolean; needed: number } {
     const tfSec = TIMEFRAME_SECONDS[tf]
     const windowSec = Math.max(1, Math.floor((Math.max(1, windowMin) * 60) / tfSec)) * tfSec
-    const needed = Math.ceil((DAY_SEC + windowSec) / tfSec) + 2
+    const needed = Math.ceil((DAY_SEC + 2 * windowSec) / tfSec) + 2
     return { windowSec, windowMin: Math.round(windowSec / 60), ok: needed <= MAX_LOOKBACK_BARS, needed }
   }
 
@@ -117,7 +123,7 @@ export class YesterdayService {
       .filter((i) => i.open || isInstrumentOpen(i))
       .sort((a, b) => (a.ticker === active ? -1 : b.ticker === active ? 1 : 0))
       .slice(0, UNIVERSE_HARD_CAP)
-    const limit = Math.min(MAX_LOOKBACK_BARS, Math.ceil((DAY_SEC + plan.windowSec) / tfSec) + 2)
+    const limit = Math.min(MAX_LOOKBACK_BARS, Math.ceil((DAY_SEC + 2 * plan.windowSec) / tfSec) + 2)
 
     let scanned = 0
     const rows: YesterdayRow[] = []

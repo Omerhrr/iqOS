@@ -439,6 +439,26 @@ export async function getSignalStats(tf?: Timeframe): Promise<{ ok: boolean; opt
 export type YdayDir = 'up' | 'down' | 'none'
 export type YdaySession = 'ASIA' | 'LONDON' | 'OVERLAP' | 'NEWYORK' | 'OFF' | 'OTC'
 
+/** The window leading INTO the moment (same length as the replay window),
+ * yesterday vs today - "is today repeating yesterday's lead-in?". Kernel
+ * sends null when either side is under half covered (dark session, asset
+ * never warmed); optional on the wire so an older kernel still parses. */
+export interface YesterdayEcho {
+  /** net move over the lead-in window, yesterday (%) */
+  ydayMovePct: number
+  /** high-low travel over the lead-in window, yesterday (%) */
+  ydayRangePct: number
+  /** same wall-clock lead-in window, today (%) */
+  todayMovePct: number
+  todayRangePct: number
+  /** bars present on today's side of the comparison */
+  todayBarsFound: number
+  /** 'same' = both pushed the same way (or both flat), 'opposite' = pushed against each other, 'partial' = one went nowhere */
+  dirAgree: 'same' | 'partial' | 'opposite'
+  /** 0..100 - direction agreement (50) + move magnitude vs yesterday's own travel (30) + travel ratio (20) */
+  rhyme: number
+}
+
 export interface YesterdayRow {
   asset: string
   name: string
@@ -468,6 +488,8 @@ export interface YesterdayRow {
   archived: number
   /** session the market was in at that moment yesterday */
   session: YdaySession
+  /** lead-in comparison, yesterday vs today (see YesterdayEcho); null/absent = either side under half covered */
+  echo?: YesterdayEcho | null
 }
 
 export interface YesterdayResponse {
@@ -487,8 +509,9 @@ export interface YesterdayResponse {
 
 /** Same-time-yesterday scan. `tf` = the chart's active timeframe - the
  * lookback runs on those candles (the kernel refuses timeframes whose
- * 24h+window lookback cannot fit the 4000-bar archive depth). `windowMin`
- * is the forward window replayed after T-24h (5..240, default 60). */
+ * 24h + 2x window lookback cannot fit the 4000-bar archive depth). `windowMin`
+ * is the forward window replayed after T-24h (5..240, default 60); every row
+ * also carries the echo lead-in comparison where coverage allows. */
 export async function getYesterday(tf: Timeframe, windowMin = 60): Promise<YesterdayResponse> {
   return osGet<YesterdayResponse>('/yesterday', { tf, window: windowMin })
 }

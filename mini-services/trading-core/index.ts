@@ -1066,9 +1066,11 @@ const httpServer = createServer(async (req, res) => {
       // market doing EXACTLY 24h ago - and in the window right after? Each
       // row carries the price at that moment, the forward window's net move /
       // range / run-up / drawdown, where price has gone since, the session
-      // the market was in, and window coverage (bars found vs expected, and
-      // how many came from the store) so a thin or synthetic "yesterday" is
-      // visible instead of silently mistaken for a remembered one. tf respects
+      // the market was in, window coverage (bars found vs expected, and how many
+      // came from the store) so a thin or synthetic "yesterday" is visible
+      // instead of silently mistaken for a remembered one, and the ECHO - the
+      // lead-in window ending at the same wall-clock moment, yesterday vs
+      // today, scored 0..100 for rhyme. tf respects
       // the chart's timeframe (same rule as /signals); the cache is per
       // tf:window - the T-24h target crawls, so 60s serves rapid panel polls.
       if (path === '/yesterday') {
@@ -1080,7 +1082,7 @@ const httpServer = createServer(async (req, res) => {
         if (!plan.ok) {
           return json(400, {
             ok: false,
-            error: `tf "${tfv}" cannot reach 24h back within the ${plan.needed}-bar lookback limit (4000-bar archive depth) - use 30s or coarser`,
+            error: `tf "${tfv}" cannot reach 24h + the replay window back within the ${plan.needed}-bar lookback limit (4000-bar archive depth) - use 30s or coarser`,
           })
         }
         return json(200, await kernel.context().use<YesterdayService>('yesterday').scan(tfv, windowMin))

@@ -14,6 +14,13 @@
 // deterministic prehistory) ride on every row, and rows whose window is
 // under half covered are dropped kernel-side instead of reporting a move
 // computed from a fraction of the story.
+//
+// The ECHO line answers the follow-up: is TODAY repeating yesterday's
+// script? Both sides are the lead-in window ending at the same wall-clock
+// moment - yesterday's ended exactly at the anchor, today's within one bar
+// of now - scored 0..100 for rhyme (direction 50 + move-vs-travel 30 +
+// travel ratio 20). Rows without an echo had a side under half covered -
+// no comparison instead of a fake one.
 import { useCallback, useEffect, useState } from 'react'
 import type { Timeframe, YesterdayRow } from '@/lib/os/client'
 import { TIMEFRAME_SECONDS, fmtPrice, getYesterday } from '@/lib/os/client'
@@ -27,8 +34,14 @@ interface YesterdayPanelProps {
 
 type Mkt = 'all' | 'real' | 'otc'
 type Cat = 'all' | 'forex' | 'crypto' | 'commodity' | 'stock' | 'index'
-type Sort = 'move' | 'since' | 'range'
+type Sort = 'move' | 'since' | 'range' | 'rhyme'
 type DirFilter = 'all' | 'up' | 'down' | 'none'
+type EchoF = 'all' | 'rhymes' | 'diverges'
+
+/** rhyme thresholds - a row scores 0..100; >=70 reads as "repeating the script",
+ * <40 as "going its own way"; in between is partial rhyme. */
+const RHYME_OK = 70
+const RHYME_BAD = 40
 
 const WINDOWS: [number, string][] = [
   [15, '15m'],
@@ -79,6 +92,28 @@ function ShapeBar({ r }: { r: YesterdayRow }) {
   )
 }
 
+/** The rhyme badge: is today's lead-in echoing yesterday's? Color carries
+ * the verdict (emerald rhymes / amber partial / rose diverges), the tooltip
+ * quotes the score's three parts. */
+function EchoChip({ e }: { e: NonNullable<YesterdayRow['echo']> }) {
+  const cls =
+    e.rhyme >= RHYME_OK
+      ? 'bg-emerald-500/15 text-emerald-300'
+      : e.rhyme >= RHYME_BAD
+        ? 'bg-amber-500/15 text-amber-300'
+        : 'bg-rose-500/15 text-rose-300'
+  const glyph = e.rhyme >= RHYME_OK ? '⟳' : e.rhyme >= RHYME_BAD ? '≈' : '✗'
+  const word = e.rhyme >= RHYME_OK ? 'rhymes' : e.rhyme >= RHYME_BAD ? 'partial' : 'diverges'
+  return (
+    <span
+      className={`rounded px-1.5 py-px font-mono text-[10px] font-bold ${cls}`}
+      title={`echo rhyme ${e.rhyme}/100 (${word}) - direction agreement 50 pts (yesterday ${e.dirAgree}), today's move vs yesterday's measured against yesterday's own travel 30 pts, travel ratio 20 pts. Lead-in windows end at the same wall-clock moment: yesterday's at the anchor, today's within one bar of now.`}
+    >
+      {glyph} {e.rhyme}
+    </span>
+  )
+}
+
 function RowCard({ r, onSelectAsset, windowMin }: { r: YesterdayRow; onSelectAsset?: (a: string) => void; windowMin: number }) {
   const thenClock = new Date(r.thenTs * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   const cov = r.barsExpected > 0 ? Math.round((r.barsFound / r.barsExpected) * 100) : 0
@@ -121,6 +156,27 @@ function RowCard({ r, onSelectAsset, windowMin }: { r: YesterdayRow; onSelectAss
       <div className="mt-1.5">
         <ShapeBar r={r} />
       </div>
+      {r.echo ? (
+        <div
+          className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 font-mono text-[9px]"
+          title={`lead-in comparison, yesterday vs today: travel ${r.echo.ydayRangePct.toFixed(2)}% then, ${r.echo.todayRangePct.toFixed(2)}% now (${r.echo.todayBarsFound}/${r.barsExpected} bars on today's side)`}
+        >
+          <EchoChip e={r.echo} />
+          <span className="text-[#4b5a72]">yday</span>
+          <span className={r.echo.ydayMovePct >= 0 ? 'text-emerald-300/70' : 'text-rose-300/70'}>
+            {r.echo.ydayMovePct >= 0 ? '+' : ''}{r.echo.ydayMovePct.toFixed(2)}%
+          </span>
+          <span className="text-[#3d4d66]">vs</span>
+          <span className="text-[#4b5a72]">today</span>
+          <span className={r.echo.todayMovePct >= 0 ? 'text-emerald-300/70' : 'text-rose-300/70'}>
+            {r.echo.todayMovePct >= 0 ? '+' : ''}{r.echo.todayMovePct.toFixed(2)}%
+          </span>
+        </div>
+      ) : (
+        <div className="mt-1.5 font-mono text-[9px] text-[#3d4d66]" title="no echo: yesterday's or today's lead-in window is under half covered (dark session / asset never warmed) - no comparison instead of a fake one">
+          echo —
+        </div>
+      )}
       <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 font-mono text-[9px]">
         <span
           className={r.dir === 'up' ? 'text-emerald-300' : r.dir === 'down' ? 'text-rose-300' : 'text-[#7c8aa5]'}
@@ -161,6 +217,7 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset }: Yesterday
   const [mkt, setMkt] = useState<Mkt>('all')
   const [cat, setCat] = useState<Cat>('all')
   const [dirF, setDirF] = useState<DirFilter>('all')
+  const [echoF, setEchoF] = useState<EchoF>('all')
   const [sort, setSort] = useState<Sort>('move')
   const [query, setQuery] = useState('')
   const [data, setData] = useState<Awaited<ReturnType<typeof getYesterday>> | null>(null)
@@ -207,15 +264,25 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset }: Yesterday
     .filter((r) => (mkt === 'all' ? true : mkt === 'otc' ? r.otc : !r.otc))
     .filter((r) => (cat === 'all' ? true : r.category === cat))
     .filter((r) => (dirF === 'all' ? true : r.dir === dirF))
+    .filter((r) =>
+      echoF === 'all'
+        ? true
+        : echoF === 'rhymes'
+          ? (r.echo?.rhyme ?? -1) >= RHYME_OK
+          : r.echo != null && r.echo.rhyme < RHYME_BAD,
+    )
     .filter((r) => (!needle ? true : r.asset.toLowerCase().includes(needle) || r.name.toLowerCase().includes(needle)))
     .sort((a, b) =>
       sort === 'move'
         ? Math.abs(b.movePct) - Math.abs(a.movePct)
         : sort === 'since'
           ? Math.abs(b.sincePct) - Math.abs(a.sincePct)
-          : b.rangePct - a.rangePct,
+          : sort === 'rhyme'
+            ? (b.echo?.rhyme ?? -1) - (a.echo?.rhyme ?? -1) || Math.abs(b.movePct) - Math.abs(a.movePct)
+            : b.rangePct - a.rangePct,
     )
   const otcLive = (data?.rows ?? []).filter((r) => r.otc).length
+  const rhymeLive = (data?.rows ?? []).filter((r) => (r.echo?.rhyme ?? -1) >= RHYME_OK).length
   const catCount = (c: Cat) => (c === 'all' ? (data?.rows ?? []).length : (data?.rows ?? []).filter((r) => r.category === c).length)
   const ageSec = data ? Math.max(0, Math.round((now - data.ts) / 1000)) : 0
 
@@ -349,8 +416,8 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset }: Yesterday
         })}
       </div>
 
-      {/* direction filter + sort - "show me what pumped at this hour" */}
-      <div className="flex items-center gap-2 border-b border-[#1c2739] px-2 py-1">
+      {/* direction + echo filter + sort - "show me what pumped at this hour, and where today repeats it" */}
+      <div className="flex flex-wrap items-center gap-2 border-b border-[#1c2739] px-2 py-1">
         <div className="flex shrink-0 overflow-hidden rounded border border-[#1c2739]" role="group" aria-label="direction filter">
           {(
             [
@@ -373,11 +440,39 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset }: Yesterday
             </button>
           ))}
         </div>
+        <div className="flex shrink-0 overflow-hidden rounded border border-[#1c2739]" role="group" aria-label="echo filter">
+          {(
+            [
+              ['all', 'all', 'every row - rhyming, diverging and rows with no comparison'],
+              ['rhymes', `rhymes${rhymeLive > 0 ? ` ${rhymeLive}` : ''}`, `only rows scoring ${RHYME_OK}+ - today is tracing yesterday's lead-in`],
+              ['diverges', 'diverge', `only rows scoring under ${RHYME_BAD} - today is going its own way`],
+            ] as [EchoF, string, string][]
+          ).map(([v, label, why]) => (
+            <button
+              key={v}
+              type="button"
+              onClick={() => setEchoF(v)}
+              title={why}
+              className={`px-1.5 py-0.5 font-mono text-[8.5px] font-bold uppercase tracking-wider transition-colors ${
+                echoF === v
+                  ? v === 'rhymes'
+                    ? 'bg-emerald-500/15 text-emerald-300'
+                    : v === 'diverges'
+                      ? 'bg-rose-500/15 text-rose-300'
+                      : 'bg-violet-500/15 text-violet-300'
+                  : 'text-[#4b5a72] hover:text-[#aab6cc]'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
         <div className="flex shrink-0 overflow-hidden rounded border border-[#1c2739]" role="group" aria-label="sort order">
           {(
             [
               ['move', 'move', 'biggest yesterday-window move first (kernel order)'],
               ['since', 'since', 'biggest 24h drift first - where the market has gone since that moment'],
+              ['rhyme', 'rhyme', 'best echo rhyme first - where today is repeating yesterday\'s lead-in (rows without a comparison sink)'],
               ['range', 'range', 'widest high-low travel in the window first - the most restless hours'],
             ] as [Sort, string, string][]
           ).map(([v, label, why]) => (
@@ -407,7 +502,7 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset }: Yesterday
           <div className="p-2 text-[10px] leading-relaxed text-[#4b5a72]">
             {data ? (
               (data.rows ?? []).length > 0 ? (
-                `No rows match the current filter - ${data.rows.length} row${data.rows.length === 1 ? '' : 's'} scanned${mkt !== 'all' ? ` · market ${mkt.toUpperCase()}` : ''}${cat !== 'all' ? ` · class ${cat}` : ''}${dirF !== 'all' ? ` · direction ${dirF}` : ''}${needle ? ` · search "${query.trim()}"` : ''}. Clear the search or loosen the chips.`
+                `No rows match the current filter - ${data.rows.length} row${data.rows.length === 1 ? '' : 's'} scanned${mkt !== 'all' ? ` · market ${mkt.toUpperCase()}` : ''}${cat !== 'all' ? ` · class ${cat}` : ''}${dirF !== 'all' ? ` · direction ${dirF}` : ''}${echoF !== 'all' ? ` · echo ${echoF}` : ''}${needle ? ` · search "${query.trim()}"` : ''}. Clear the search or loosen the chips.`
               ) : (
                 `${data.scanned} instruments scanned, none had enough window history - the T-24h story needs the series to reach back a full day (bars accumulate while the OS runs; the feed's deterministic prehistory fills the front once it does). Rows appear here automatically.`
               )
@@ -421,7 +516,7 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset }: Yesterday
         ))}
         {data && data.rows.length > 0 && (
           <p className="px-1 pt-1 text-[8.5px] leading-relaxed text-[#3d4d66]">
-            Each row is the window that started at the bar forming exactly 24h ago, on the chart's timeframe. dir counts as up/down only when the net move exceeds 10% of the window's own travel. "arch" = bars from the kernel's accumulated store (broker bars in live mode), "seeded" = the feed's deterministic prehistory - never mistake a seeded yesterday for a remembered one. Click a card to open that asset on the chart.
+            Each row is the window that started at the bar forming exactly 24h ago, on the chart's timeframe. dir counts as up/down only when the net move exceeds 10% of the window's own travel. "arch" = bars from the kernel's accumulated store (broker bars in live mode), "seeded" = the feed's deterministic prehistory - never mistake a seeded yesterday for a remembered one. echo compares the lead-in windows ending at this same time of day (yesterday's ended at the anchor, today's within one bar of now): rhyme = direction 50 + move-vs-travel 30 + travel ratio 20, 70+ reads as "repeating the script", under 40 as "going its own way". Click a card to open that asset on the chart.
           </p>
         )}
       </div>
