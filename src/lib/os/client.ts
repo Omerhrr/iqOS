@@ -439,6 +439,25 @@ export async function getSignalStats(tf?: Timeframe): Promise<{ ok: boolean; opt
 export type YdayDir = 'up' | 'down' | 'none'
 export type YdaySession = 'ASIA' | 'LONDON' | 'OVERLAP' | 'NEWYORK' | 'OFF' | 'OTC'
 
+/** One remembered day BEFORE yesterday (T-48h, T-72h, ...): the same forward
+ * window. Days whose coverage failed the >= half gate are ABSENT - gaps are
+ * information. Optional on the wire so an older kernel still parses. */
+export interface YdayPrior {
+  /** how many days back (2 = T-48h, 3 = T-72h, ...) */
+  back: number
+  /** epoch seconds of the bar that was forming at that moment (window start) */
+  thenTs: number
+  /** net move over the window, % */
+  movePct: number
+  dir: YdayDir
+  /** high-low travel across the window, % */
+  rangePct: number
+  barsFound: number
+  barsExpected: number
+  /** session the market was in at that moment */
+  session: YdaySession
+}
+
 /** The window leading INTO the moment (same length as the replay window),
  * yesterday vs today - "is today repeating yesterday's lead-in?". Kernel
  * sends null when either side is under half covered (dark session, asset
@@ -490,6 +509,8 @@ export interface YesterdayRow {
   session: YdaySession
   /** lead-in comparison, yesterday vs today (see YesterdayEcho); null/absent = either side under half covered */
   echo?: YesterdayEcho | null
+  /** deeper same-hour history, most recent first (back = 2, 3, ...); empty unless the scan asked for more than one day */
+  prior?: YdayPrior[]
 }
 
 export interface YesterdayResponse {
@@ -497,6 +518,8 @@ export interface YesterdayResponse {
   tf: Timeframe
   /** effective forward window in minutes (snapped to whole bars of the tf) */
   windowMin: number
+  /** requested day depth (1 = yesterday only; rows carry `prior` beyond that) */
+  days?: number
   /** feed behind the scan: 'sim' = deterministic sim engine, 'live' = broker feed */
   mode: 'sim' | 'live'
   scanned: number
@@ -510,10 +533,12 @@ export interface YesterdayResponse {
 /** Same-time-yesterday scan. `tf` = the chart's active timeframe - the
  * lookback runs on those candles (the kernel refuses timeframes whose
  * 24h + 2x window lookback cannot fit the 4000-bar archive depth). `windowMin`
- * is the forward window replayed after T-24h (5..240, default 60); every row
- * also carries the echo lead-in comparison where coverage allows. */
-export async function getYesterday(tf: Timeframe, windowMin = 60): Promise<YesterdayResponse> {
-  return osGet<YesterdayResponse>('/yesterday', { tf, window: windowMin })
+ * is the forward window replayed after T-24h (5..240, default 60); `days`
+ * (1..7, default 1) walks the same window back over more days - every row
+ * then carries `prior`, and finer tfs fit fewer days. Every row also carries
+ * the echo lead-in comparison where coverage allows. */
+export async function getYesterday(tf: Timeframe, windowMin = 60, days = 1): Promise<YesterdayResponse> {
+  return osGet<YesterdayResponse>('/yesterday', { tf, window: windowMin, days })
 }
 
 // ---- engine-edge research (both loops merged: honesty + lab) -------------

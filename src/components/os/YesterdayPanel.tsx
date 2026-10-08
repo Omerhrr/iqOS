@@ -21,6 +21,13 @@
 // of now - scored 0..100 for rhyme (direction 50 + move-vs-travel 30 +
 // travel ratio 20). Rows without an echo had a side under half covered -
 // no comparison instead of a fake one.
+//
+// The day-depth chips walk the SAME window further back (T-48h ... T-168h):
+// each row grows a strip of remembered days - how this exact hour behaved
+// across the week ("4d: 3/5 up"). Days the series cannot cover are absent
+// from the strip, and the depth itself is bounded by the same 4000-bar
+// lookback the scan already pulls: finer candles remember fewer days, so
+// deeper chips disable with the tf says so instead of 400-ing.
 import { useCallback, useEffect, useState } from 'react'
 import type { Timeframe, YesterdayRow } from '@/lib/os/client'
 import { TIMEFRAME_SECONDS, fmtPrice, getYesterday } from '@/lib/os/client'
@@ -49,6 +56,23 @@ const WINDOWS: [number, string][] = [
   [60, '1h'],
   [120, '2h'],
 ]
+
+const DAY_CHIPS: [number, string][] = [
+  [1, '1d'],
+  [2, '2d'],
+  [3, '3d'],
+  [5, '5d'],
+  [7, '7d'],
+]
+
+/** Mirrors the kernel's depth gate: needed = ceil((86400*days + 2*window)/tf)
+ * + 2 must fit the 4000-bar lookback, so the deepest reachable day depth is
+ * floor(((4000-2)*tf - 2*window) / 86400) - the panel disables what the
+ * kernel would refuse instead of round-tripping a 400. */
+function maxDaysFor(tf: Timeframe, windowMin: number): number {
+  const tfSec = TIMEFRAME_SECONDS[tf]
+  return Math.max(1, Math.floor(((4000 - 2) * tfSec - 2 * windowMin * 60) / 86_400))
+}
 
 const SESSION_LABEL: Record<YesterdayRow['session'], string> = {
   ASIA: 'Asia',
@@ -208,12 +232,45 @@ function RowCard({ r, onSelectAsset, windowMin }: { r: YesterdayRow; onSelectAss
           {r.archived > 0 ? `${r.archived} arch` : 'seeded'}
         </span>
       </div>
+      {r.prior && r.prior.length > 0 && <PriorStrip r={r} />}
+    </div>
+  )
+}
+
+/** The same-hour history strip: how this exact hour behaved across the
+ * remembered days before yesterday. Gaps are absent days (dark market /
+ * series does not reach), not flat days - the count includes yesterday's
+ * replay window so "3/4 up" reads as a week-level seasonality stat. */
+function PriorStrip({ r }: { r: YesterdayRow }) {
+  const prior = r.prior ?? []
+  if (prior.length === 0) return null
+  const days = prior.length + 1
+  const ups = prior.filter((p) => p.dir === 'up').length + (r.dir === 'up' ? 1 : 0)
+  return (
+    <div className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 font-mono text-[9px]">
+      <span className="text-[#3d4d66]">at this hour</span>
+      {prior.map((p) => (
+        <span
+          key={p.back}
+          className={p.dir === 'up' ? 'text-emerald-300/80' : p.dir === 'down' ? 'text-rose-300/80' : 'text-[#7c8aa5]'}
+          title={`${p.back}d ago, the ${p.barsFound}/${p.barsExpected}-bar window from ${new Date(p.thenTs * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}: ${p.movePct >= 0 ? '+' : ''}${p.movePct.toFixed(2)}% move, ${p.rangePct.toFixed(2)}% travel, session ${p.session}`}
+        >
+          {p.back}d {p.dir === 'up' ? '\u25b2' : p.dir === 'down' ? '\u25bc' : '\u2014'}{Math.abs(p.movePct).toFixed(2)}
+        </span>
+      ))}
+      <span
+        className="ml-auto text-[#4b5a72]"
+        title={`of the last ${days} days at this hour (yesterday's replay included), ${ups} opened a window that closed up`}
+      >
+        {ups}/{days} up
+      </span>
     </div>
   )
 }
 
 export default function YesterdayPanel({ onClose, tf, onSelectAsset }: YesterdayPanelProps) {
   const [windowMin, setWindowMin] = useState(60)
+  const [days, setDays] = useState(1)
   const [mkt, setMkt] = useState<Mkt>('all')
   const [cat, setCat] = useState<Cat>('all')
   const [dirF, setDirF] = useState<DirFilter>('all')
@@ -228,12 +285,16 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset }: Yesterday
   // the 24h lookback cannot fit the archive depth below 30s candles - say so
   // instead of round-tripping a 400 the operator can't act on
   const tfSupported = TIMEFRAME_SECONDS[tf] >= 30
+  // depth the current tf:window combination can honestly reach - the panel
+  // clamps silently when the window widens and highlights the snapped chip
+  const maxDays = maxDaysFor(tf, windowMin)
+  const effDays = Math.min(days, maxDays)
 
   const load = useCallback(
     (opts?: { quiet?: boolean }) => {
       if (!tfSupported) return
       if (!opts?.quiet) setBusy(true)
-      getYesterday(tf, windowMin)
+      getYesterday(tf, windowMin, effDays)
         .then((d) => {
           if (d?.ok) {
             setData(d)
@@ -243,7 +304,7 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset }: Yesterday
         .catch((e: Error) => setError(e.message.slice(0, 180)))
         .finally(() => setBusy(false))
     },
-    [tf, windowMin, tfSupported],
+    [tf, windowMin, effDays, tfSupported],
   )
 
   useEffect(() => {
@@ -322,6 +383,32 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset }: Yesterday
             {label}
           </button>
         ))}
+        <span className="mx-0.5 h-3 w-px bg-[#1c2739]" />
+        {DAY_CHIPS.map(([d, label]) => {
+          const reachable = d <= maxDays
+          return (
+            <button
+              key={d}
+              type="button"
+              onClick={() => reachable && setDays(d)}
+              disabled={!reachable}
+              className={`rounded px-1.5 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wider transition-colors ${
+                effDays === d
+                  ? 'bg-violet-500/15 text-violet-300'
+                  : reachable
+                    ? 'text-[#4b5a72] hover:text-[#aab6cc]'
+                    : 'cursor-not-allowed text-[#2a3648]'
+              }`}
+              title={
+                reachable
+                  ? `walk the same window back over the last ${d} day${d === 1 ? '' : 's'} - each row grows a same-hour history strip (T-24h ... T-${24 * d}h)`
+                  : `${d} days of ${tf} candles plus the replay window cannot fit the 4000-bar lookback - coarsen the tf or shrink the window`
+              }
+            >
+              {label}
+            </button>
+          )
+        })}
         {data && (
           <span
             className="ml-auto font-mono text-[8px] text-[#4b5a72]"
@@ -502,7 +589,7 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset }: Yesterday
           <div className="p-2 text-[10px] leading-relaxed text-[#4b5a72]">
             {data ? (
               (data.rows ?? []).length > 0 ? (
-                `No rows match the current filter - ${data.rows.length} row${data.rows.length === 1 ? '' : 's'} scanned${mkt !== 'all' ? ` · market ${mkt.toUpperCase()}` : ''}${cat !== 'all' ? ` · class ${cat}` : ''}${dirF !== 'all' ? ` · direction ${dirF}` : ''}${echoF !== 'all' ? ` · echo ${echoF}` : ''}${needle ? ` · search "${query.trim()}"` : ''}. Clear the search or loosen the chips.`
+                `No rows match the current filter - ${data.rows.length} row${data.rows.length === 1 ? '' : 's'} scanned${mkt !== 'all' ? ` · market ${mkt.toUpperCase()}` : ''}${cat !== 'all' ? ` · class ${cat}` : ''}${dirF !== 'all' ? ` · direction ${dirF}` : ''}${echoF !== 'all' ? ` · echo ${echoF}` : ''}${effDays > 1 ? ` · depth ${effDays}d` : ''}${needle ? ` · search "${query.trim()}"` : ''}. Clear the search or loosen the chips.`
               ) : (
                 `${data.scanned} instruments scanned, none had enough window history - the T-24h story needs the series to reach back a full day (bars accumulate while the OS runs; the feed's deterministic prehistory fills the front once it does). Rows appear here automatically.`
               )
@@ -516,7 +603,7 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset }: Yesterday
         ))}
         {data && data.rows.length > 0 && (
           <p className="px-1 pt-1 text-[8.5px] leading-relaxed text-[#3d4d66]">
-            Each row is the window that started at the bar forming exactly 24h ago, on the chart's timeframe. dir counts as up/down only when the net move exceeds 10% of the window's own travel. "arch" = bars from the kernel's accumulated store (broker bars in live mode), "seeded" = the feed's deterministic prehistory - never mistake a seeded yesterday for a remembered one. echo compares the lead-in windows ending at this same time of day (yesterday's ended at the anchor, today's within one bar of now): rhyme = direction 50 + move-vs-travel 30 + travel ratio 20, 70+ reads as "repeating the script", under 40 as "going its own way". Click a card to open that asset on the chart.
+            Each row is the window that started at the bar forming exactly 24h ago, on the chart's timeframe. dir counts as up/down only when the net move exceeds 10% of the window's own travel. "arch" = bars from the kernel's accumulated store (broker bars in live mode), "seeded" = the feed's deterministic prehistory - never mistake a seeded yesterday for a remembered one. echo compares the lead-in windows ending at this same time of day (yesterday's ended at the anchor, today's within one bar of now): rhyme = direction 50 + move-vs-travel 30 + travel ratio 20, 70+ reads as "repeating the script", under 40 as "going its own way". The day chips walk the same window further back - the "at this hour" strip shows each remembered day with its own coverage, and days the series cannot cover are absent, not flat. Click a card to open that asset on the chart.
           </p>
         )}
       </div>

@@ -17,6 +17,13 @@
 // to yesterday's measured against yesterday's own travel (30, scale-free),
 // and how close today's travel is to yesterday's (20).
 //
+// The PRIOR days extend the same question past yesterday: the window that
+// started at T-48h, T-72h, ... per row, gated by the same coverage rule.
+// A day the series cannot honestly cover is ABSENT from the strip (a gap,
+// labeled by how far back it is) - never a thin move dressed up as a story.
+// Depth is bounded by the same lookback the row already pulls, so finer
+// candles remember fewer days: the archive-depth gate refuses the rest.
+//
 // Honesty rules this module enforces:
 // - the story is built ONLY from bars actually present in the series; a row
 //   whose window coverage is under half of the expected bars is dropped
@@ -59,6 +66,26 @@ export interface YesterdayEcho {
   rhyme: number
 }
 
+/** One remembered day BEFORE yesterday: the same forward window starting at
+ * T-24h*back. Only days whose coverage passes the same >= half gate are
+ * reported - gaps in the strip mean the market was dark or the series does
+ * not reach, which is information, not an error. */
+export interface PriorDay {
+  /** how many days back (2 = T-48h, 3 = T-72h, ...) */
+  back: number
+  /** epoch seconds of the bar that was forming at that moment (window start) */
+  thenTs: number
+  /** net move over the window, % */
+  movePct: number
+  dir: YdayDir
+  /** high-low travel across the window, % */
+  rangePct: number
+  barsFound: number
+  barsExpected: number
+  /** session the market was in at that moment */
+  session: Session
+}
+
 export interface YesterdayRow {
   asset: string
   name: string
@@ -90,6 +117,8 @@ export interface YesterdayRow {
   session: Session
   /** lead-in comparison, yesterday vs today - see YesterdayEcho */
   echo: YesterdayEcho | null
+  /** deeper same-hour history, most recent first (back = 2, 3, ...); empty unless the scan asked for more than one day */
+  prior: PriorDay[]
 }
 
 export interface YesterdayInfo {
@@ -110,6 +139,9 @@ export interface YesterdayOpts {
   nowPrice: number
   /** archived (store-backed) bars inside the window - provenance label */
   archived: number
+  /** how many day-anchors to walk past yesterday (0 = none; the scanner
+   * passes days-1). Each prior day needs its own window in the series. */
+  priorDays?: number
 }
 
 const DAY_SEC = 86_400
@@ -164,6 +196,36 @@ function rhymeScore(sy: WinStats, st: WinStats): { rhyme: number; dirAgree: Yest
   }
   const rhyme = Math.max(0, Math.min(100, Math.round(dirPts + magPts + volPts)))
   return { rhyme, dirAgree }
+}
+
+/** One remembered day before yesterday, or null when the series does not
+ * honestly cover that window (same >= half gate as the main row). `back`
+ * counts whole days: 2 = T-48h, 3 = T-72h. Shares windowStats and the dir
+ * rule with the main row so a "down" in the strip means exactly what a
+ * "down" on the row means. */
+export function buildPriorDay(
+  info: YesterdayInfo,
+  candles: Candle[],
+  opts: { nowSec: number; windowSec: number; tfSec: number; back: number },
+): PriorDay | null {
+  const target = opts.nowSec - DAY_SEC * opts.back
+  const t0 = target - (target % opts.tfSec)
+  const win = candles.filter((c) => c.time >= t0 && c.time < t0 + opts.windowSec)
+  const barsExpected = Math.round(opts.windowSec / opts.tfSec)
+  const minBars = Math.max(1, Math.floor(barsExpected * 0.5))
+  if (win.length < minBars) return null
+  const st = windowStats(win)
+  if (!st) return null
+  return {
+    back: opts.back,
+    thenTs: t0,
+    movePct: r4(st.movePct),
+    dir: st.dir,
+    rangePct: r4(st.rangePct),
+    barsFound: win.length,
+    barsExpected,
+    session: classifySession(t0, info.ticker),
+  }
 }
 
 /**
@@ -227,6 +289,14 @@ export function buildYesterdayRow(info: YesterdayInfo, candles: Candle[], opts: 
     }
   }
 
+  // PRIOR days: T-48h, T-72h, ... same window, same gates. Absent days are
+  // honest gaps (market dark / series does not reach), never thin moves.
+  const prior: PriorDay[] = []
+  for (let back = 2; back <= 1 + (opts.priorDays ?? 0); back++) {
+    const d = buildPriorDay(info, candles, { nowSec: opts.nowSec, windowSec: opts.windowSec, tfSec: opts.tfSec, back })
+    if (d) prior.push(d)
+  }
+
   return {
     asset: info.ticker,
     name: info.name,
@@ -246,5 +316,6 @@ export function buildYesterdayRow(info: YesterdayInfo, candles: Candle[], opts: 
     archived: Math.min(opts.archived, win.length),
     session: classifySession(t0, info.ticker),
     echo,
+    prior,
   }
 }

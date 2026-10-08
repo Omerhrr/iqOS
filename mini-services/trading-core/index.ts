@@ -1078,14 +1078,16 @@ const httpServer = createServer(async (req, res) => {
         if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
         const winRaw = Number(q.get('window') ?? 60)
         const windowMin = Number.isFinite(winRaw) ? Math.max(5, Math.min(Math.round(winRaw), 240)) : 60
-        const plan = YesterdayService.plan(tfv, windowMin)
+        const daysRaw = Number(q.get('days') ?? 1)
+        const days = Number.isFinite(daysRaw) ? Math.max(1, Math.min(7, Math.round(daysRaw))) : 1
+        const plan = YesterdayService.plan(tfv, windowMin, days)
         if (!plan.ok) {
           return json(400, {
             ok: false,
-            error: `tf "${tfv}" cannot reach 24h + the replay window back within the ${plan.needed}-bar lookback limit (4000-bar archive depth) - use 30s or coarser`,
+            error: `tf "${tfv}" at ${days}d depth cannot reach ${days * 24}h + the replay window back within the ${plan.needed}-bar lookback limit (4000-bar archive depth) - coarsen the tf or shallow the depth`,
           })
         }
-        return json(200, await kernel.context().use<YesterdayService>('yesterday').scan(tfv, windowMin))
+        return json(200, await kernel.context().use<YesterdayService>('yesterday').scan(tfv, windowMin, days))
       }
 
       // Outcome stats for the chart signals: every qualifying read is

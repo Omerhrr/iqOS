@@ -13,6 +13,13 @@
 // repeating yesterday's script? That doubles the lookback (24h + 2x window
 // instead of 24h + window) so both lead-in windows are in the series.
 //
+// The scan can also walk DEEPER days (days param, 1..7): every row then
+// carries the same window starting at T-48h, T-72h, ... - same-hour history
+// per instrument. Depth shares the row's single lookback pull, so the
+// archive-depth gate (4000 bars) bounds the whole combination: a 5m chart
+// reaches a week back, a 1m chart only two days - finer candles remember
+// fewer days, and the gate says so instead of answering from a fraction.
+//
 // tf respect (same rule as /signals): the caller names the timeframe, the
 // lookback runs on those candles, and the cache is keyed per tf:window so a
 // 1m story and a 5m story never bleed into each other. Timeframes whose
@@ -39,6 +46,8 @@ export interface YesterdayResult {
   tf: Timeframe
   /** effective forward window in minutes (snapped to whole bars of the tf) */
   windowMin: number
+  /** requested day depth (1 = yesterday only; rows carry `prior` beyond that) */
+  days: number
   /** feed behind the scan: 'sim' = deterministic sim engine, 'live' = broker feed */
   mode: 'sim' | 'live'
   scanned: number
@@ -55,7 +64,7 @@ export class YesterdayService {
   private ctx!: KernelContext
   private market!: MarketDataService
   private store: Store | null = null
-  // keyed tf:windowSec - a 1m/60min story and a 5m/60min story live side by side
+  // keyed tf:windowSec:days - a 1m/60min/3day story lives beside its siblings
   private cache = new Map<string, { ts: number; result: YesterdayResult }>()
   private inflight = new Map<string, Promise<YesterdayResult>>()
 
@@ -71,25 +80,27 @@ export class YesterdayService {
   }
 
   /** Quantized request plan: window snapped to whole bars of the tf (>= 1
-   * bar), plus whether the 24h + 2x window lookback (the echo's lead-in
-   * windows reach a window before the anchor) fits the archive depth. */
-  static plan(tf: Timeframe, windowMin: number): { windowSec: number; windowMin: number; ok: boolean; needed: number } {
+   * bar), plus whether the days*24h + 2x window lookback (the echo's lead-in
+   * windows reach a window before the newest anchor; prior days stack whole
+   * days on top) fits the archive depth. */
+  static plan(tf: Timeframe, windowMin: number, days = 1): { windowSec: number; windowMin: number; ok: boolean; needed: number } {
     const tfSec = TIMEFRAME_SECONDS[tf]
     const windowSec = Math.max(1, Math.floor((Math.max(1, windowMin) * 60) / tfSec)) * tfSec
-    const needed = Math.ceil((DAY_SEC + 2 * windowSec) / tfSec) + 2
+    const needed = Math.ceil((DAY_SEC * Math.max(1, days) + 2 * windowSec) / tfSec) + 2
     return { windowSec, windowMin: Math.round(windowSec / 60), ok: needed <= MAX_LOOKBACK_BARS, needed }
   }
 
-  /** Fresh scan (cached per tf:windowSec for CACHE_MS), inflight-deduped. */
-  async scan(tf: Timeframe, windowMin: number): Promise<YesterdayResult> {
-    const plan = YesterdayService.plan(tf, windowMin)
-    const key = `${tf}:${plan.windowSec}`
+  /** Fresh scan (cached per tf:windowSec:days for CACHE_MS), inflight-deduped. */
+  async scan(tf: Timeframe, windowMin: number, days = 1): Promise<YesterdayResult> {
+    const nDays = Math.max(1, Math.min(7, Math.round(Number.isFinite(days) ? days : 1)))
+    const plan = YesterdayService.plan(tf, windowMin, nDays)
+    const key = `${tf}:${plan.windowSec}:${nDays}`
     const cached = this.cache.get(key)
     const now = Date.now()
     if (cached && now - cached.ts < CACHE_MS) return cached.result
     const running = this.inflight.get(key)
     if (running) return running
-    const p = this.scanOnce(tf, plan).then((r) => {
+    const p = this.scanOnce(tf, plan, nDays).then((r) => {
       this.cache.set(key, { ts: r.ts, result: r })
       this.inflight.delete(key)
       return r
@@ -111,7 +122,7 @@ export class YesterdayService {
     }
   }
 
-  private async scanOnce(tf: Timeframe, plan: { windowSec: number; windowMin: number }): Promise<YesterdayResult> {
+  private async scanOnce(tf: Timeframe, plan: { windowSec: number; windowMin: number }, days: number): Promise<YesterdayResult> {
     const t0wall = Date.now()
     const tfSec = TIMEFRAME_SECONDS[tf]
     const nowSec = Math.floor(Date.now() / 1000)
@@ -123,7 +134,7 @@ export class YesterdayService {
       .filter((i) => i.open || isInstrumentOpen(i))
       .sort((a, b) => (a.ticker === active ? -1 : b.ticker === active ? 1 : 0))
       .slice(0, UNIVERSE_HARD_CAP)
-    const limit = Math.min(MAX_LOOKBACK_BARS, Math.ceil((DAY_SEC + 2 * plan.windowSec) / tfSec) + 2)
+    const limit = Math.min(MAX_LOOKBACK_BARS, Math.ceil((DAY_SEC * days + 2 * plan.windowSec) / tfSec) + 2)
 
     let scanned = 0
     const rows: YesterdayRow[] = []
@@ -149,7 +160,7 @@ export class YesterdayService {
           const row = buildYesterdayRow(
             { ticker: info.ticker, name: info.name, category: info.category, otc: !!info.otc },
             candles,
-            { nowSec, windowSec: plan.windowSec, tfSec, nowPrice, archived },
+            { nowSec, windowSec: plan.windowSec, tfSec, nowPrice, archived, priorDays: days - 1 },
           )
           if (row) rows.push(row)
         }),
@@ -161,6 +172,7 @@ export class YesterdayService {
       ok: true,
       tf,
       windowMin: plan.windowMin,
+      days,
       mode: this.market.mode,
       scanned,
       considered: rows.length,

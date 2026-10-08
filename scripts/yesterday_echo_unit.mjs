@@ -7,7 +7,7 @@
 //   - variant B: today lead-in FALLS -0.40%             -> opposite, rhyme 20
 //   - variant C: thin today side (under half covered)   -> echo null
 // Run: bun scripts/yesterday_echo_unit.mjs
-import { buildYesterdayRow } from '../mini-services/trading-core/src/analytics/yesterday'
+import { buildPriorDay, buildYesterdayRow } from '../mini-services/trading-core/src/analytics/yesterday'
 
 let pass = 0
 let fail = 0
@@ -101,6 +101,34 @@ if (row) {
   const rowD = buildYesterdayRow(info, [...flatY, ...flatFwd, ...flatT, ...tail], opts)
   const eD = rowD?.echo
   ok('variant D flat/flat rhyme 100 + same', eD?.rhyme === 100 && eD?.dirAgree === 'same', JSON.stringify(eD))
+
+  // ---- prior days: the same window at T-48h, T-72h, ... ----
+  // sparse series: an ENGINEERED T-48h window (-0.60% move, 1.00% travel)
+  // plus the variant-A pieces; T-72h and T-96h are intentionally ABSENT so
+  // the gap-honesty rule can be asserted. back counts from NOW: nowSec =
+  // t0 + DAY + 30, so T-48h buckets to t0 - DAY (not t0 - 2*DAY).
+  const prior2Win = run(t0 - DAY, WIN / TF, base, -0.6, 1.0)
+  const sparse = [...prior2Win, ...ydayLead, ...ydayFwd, ...todayLead, ...tail].sort((a, b) => a.time - b.time)
+  const pd = buildPriorDay(info, sparse, { nowSec, windowSec: WIN, tfSec: TF, back: 2 })
+  ok('prior day T-48h built', pd !== null)
+  if (pd) {
+    ok('prior day back/anchor correct', pd.back === 2 && pd.thenTs === t0 - DAY, `back=${pd.back} thenTs=${pd.thenTs} expected=${t0 - DAY}`)
+    ok('prior day move reproduced', Math.abs(pd.movePct - -0.6) < 0.01, `got ${pd.movePct}`)
+    ok('prior day travel reproduced', Math.abs(pd.rangePct - 1.0) < 0.05, `got ${pd.rangePct}`)
+    ok('prior day dir down', pd.dir === 'down', `got ${pd.dir}`)
+    ok('prior day coverage full', pd.barsFound === 60 && pd.barsExpected === 60, `${pd.barsFound}/${pd.barsExpected}`)
+  }
+  // through the row: priorDays 1 -> exactly the T-48h day; 3 -> still only
+  // that one (T-72h/T-96h absent = honest gaps, never thin fills)
+  const rowP1 = buildYesterdayRow(info, sparse, { ...opts, priorDays: 1 })
+  ok('row.prior has the remembered day', rowP1?.prior.length === 1 && rowP1.prior[0].back === 2, JSON.stringify(rowP1?.prior))
+  const rowP3 = buildYesterdayRow(info, sparse, { ...opts, priorDays: 3 })
+  ok('row.prior skips uncovered days', rowP3?.prior.length === 1, `got ${rowP3?.prior.length} (backs ${rowP3?.prior.map((p) => p.back).join(',')})`)
+  // a thin T-48h window (20 of 60 bars) is dropped by the same >= half gate
+  const thinPrior = buildPriorDay(info, [...prior2Win.slice(0, 20)], { nowSec, windowSec: WIN, tfSec: TF, back: 2 })
+  ok('thin prior day dropped', thinPrior === null, JSON.stringify(thinPrior))
+  // days=1 default: rows carry an empty prior
+  ok('default row.prior empty', Array.isArray(row?.prior) && row.prior.length === 0, JSON.stringify(row?.prior))
 }
 
 console.log(`\n${pass} passed, ${fail} failed`)

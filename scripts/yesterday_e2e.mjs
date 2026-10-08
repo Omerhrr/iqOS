@@ -4,8 +4,9 @@
 // anchor (window starts at the bar forming exactly 24h ago), row sanity
 // (move/range/excursions/coverage/provenance), direction classification,
 // the echo (lead-in comparison yesterday vs today: rhyme bounds, dirAgree
-// consistency with the move signs, coverage-when-present), sorting by
-// |move|, the window param (clamp + quantization), tf respect (per-tf
+// consistency with the move signs, coverage-when-present), the days param
+// (same-hour history strips: prior-day sanity + anchors, clamp, depth gate),
+// sorting by |move|, the window param (clamp + quantization), tf respect (per-tf
 // caches, no cross-tf leak), the archive-depth gate (5s/15s refused with a
 // clear 400) and the strict tf gate. Read-only.
 const BASE = process.env.IQAIR_OS_URL ?? 'http://localhost:3030'
@@ -109,6 +110,37 @@ if (r0 && r0.echo) {
 ok('sorted by |move| desc', rows.every((x, i, arr) => i === 0 || Math.abs(arr[i - 1].movePct) >= Math.abs(x.movePct)))
 ok('OTC rows present (OTC universe warmed)', rows.some((r) => r.otc), `otcRows=${rows.filter((r) => r.otc).length}`)
 ok('warmed majors covered', ['EURUSD', 'BTCUSD', 'EURUSD-OTC'].every((a) => rows.some((r) => r.asset === a)), `rows=${rows.length}`)
+
+// ---------- days param: same-hour history past yesterday ----------
+// default depth is 1 - rows carry an EMPTY prior, the response echoes days
+ok('days defaults to 1 + prior empty', d.body.days === 1 && rows.every((r) => Array.isArray(r.prior) && r.prior.length === 0), `days=${d.body.days}`)
+// 5m reaches a week back: ask 3 days, prior days are anchored at T-24h*back
+const d3 = await get('/yesterday?tf=5m&days=3')
+const d3rows = d3.body.rows ?? []
+ok('days=3 echoes 3', d3.status === 200 && d3.body.days === 3, `status=${d3.status} days=${d3.body.days}`)
+ok('prior well-formed', d3rows.every((r) => (r.prior ?? []).every((p) =>
+  [2, 3].includes(p.back) && Number.isFinite(p.thenTs) && p.thenTs > 0 &&
+  Number.isFinite(p.movePct) && ['up', 'down', 'none'].includes(p.dir) &&
+  Number.isFinite(p.rangePct) && p.rangePct >= 0 &&
+  p.barsFound >= Math.max(1, Math.floor(p.barsExpected * 0.5)) && p.barsFound <= p.barsExpected &&
+  ['ASIA', 'LONDON', 'OVERLAP', 'NEWYORK', 'OFF', 'OTC'].includes(p.session),
+)))
+const d3withPrior = d3rows.filter((r) => (r.prior ?? []).length > 0)
+ok('warmed rows carry prior days', d3withPrior.length >= Math.floor(d3rows.length * 0.8), `prior=${d3withPrior.length}/${d3rows.length}`)
+if (d3withPrior.length > 0) {
+  const p0 = d3withPrior[0].prior[0]
+  const tgt2 = Math.floor(d3.body.ts / 1000) - 2 * 86_400
+  const exp2 = tgt2 - (tgt2 % 300)
+  ok('prior day anchored at T-48h (5m buckets)', Math.abs(p0.thenTs - exp2) <= 300, `thenTs=${p0.thenTs} expected~${exp2}`)
+}
+ok('gaps allowed but backs only 2..3', d3rows.every((r) => (r.prior ?? []).every((p, i, arr) => p.back >= 2 && p.back <= 3 && (i === 0 || arr[i - 1].back < p.back))))
+// clamp: 99 -> 7 (5m fits a week), depth gate: 1m + 3d needs 4442 bars > 4000
+const d7 = await get('/yesterday?tf=5m&days=99')
+ok('days clamped to 7', d7.status === 200 && d7.body.days === 7, `days=${d7.body.days}`)
+const tooDeep = await get('/yesterday?tf=1m&days=3')
+ok('1m days=3 refused by the depth gate', tooDeep.status === 400 && /depth|reach/.test(tooDeep.body.error ?? ''), JSON.stringify(tooDeep.body).slice(0, 160))
+const d2m1 = await get('/yesterday?tf=1m&days=2')
+ok('1m days=2 fits and answers', d2m1.status === 200 && d2m1.body.days === 2 && (d2m1.body.rows ?? []).every((r) => (r.prior ?? []).length <= 1), `status=${d2m1.status}`)
 
 // ---------- cache + window param ----------
 const [c1, c2] = await Promise.all([get('/yesterday?tf=1m'), get('/yesterday?tf=1m')])
