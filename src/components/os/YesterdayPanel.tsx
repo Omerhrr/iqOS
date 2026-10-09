@@ -44,6 +44,13 @@
 // same coverage gates), the strip tags each day with its score, and the
 // aggregate counts days scoring 70+ among the compared ones (yesterday's own
 // echo included). No-echo days are excluded, never scored zero.
+//
+// The rhyme-by-class strip carries the same question one level up: each
+// chip's main number averages yesterday's echo per class, and (once the scan
+// walks deeper than 1d) the ⟳ number beside it averages every echoed
+// day-observation in class (yesterday's echo + each remembered prior day's,
+// same exclusion rule) - "are OTC pairs rhyming with the whole week?" is a
+// glance, not math over a week of rows.
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { Timeframe, YesterdayRow } from '@/lib/os/client'
 import { TIMEFRAME_SECONDS, fmtPrice, getYesterday } from '@/lib/os/client'
@@ -385,6 +392,10 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
             ? (b.echo?.rhyme ?? -1) - (a.echo?.rhyme ?? -1) || Math.abs(b.movePct) - Math.abs(a.movePct)
             : b.rangePct - a.rangePct,
     )
+  // the week numbers only mean something once the scan actually carries prior
+  // echoes (a day chip beyond 1d, on a kernel that computes them) - at 1d they
+  // would be pure duplicates of the yesterday averages, so they stay hidden
+  const weekLive = (data?.rows ?? []).some((r) => (r.prior ?? []).some((p) => p.echo != null))
   const otcLive = (data?.rows ?? []).filter((r) => r.otc).length
   const rhymeLive = (data?.rows ?? []).filter((r) => (r.echo?.rhyme ?? -1) >= RHYME_OK).length
   const catCount = (c: Cat) => (c === 'all' ? (data?.rows ?? []).length : (data?.rows ?? []).filter((r) => r.category === c).length)
@@ -393,15 +404,34 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
   // per-class rhyme averages - "are OTC pairs rhyming today?" at a glance.
   // Averages run ONLY over rows carrying an echo (the honest denominator);
   // the OTC entry answers over the otc flag (mostly the -OTC fx twins), the
-  // others over r.category. The strip always reads the FULL scan - it is a
-  // readout, and its click just sets the filters above.
+  // others over r.category. The week average (wkAvg) runs the same arithmetic
+  // over EVERY echoed day-observation in class - the row's own echo plus each
+  // remembered prior day's, same inclusion rule as the row's "N/M rhyme"
+  // (yesterday included, no-echo days excluded, never zeroed) - so "are OTC
+  // pairs rhyming with the whole week?" is the glance next to it. The strip
+  // always reads the FULL scan - it is a readout, and its click just sets the
+  // filters above.
   const classRhyme = useMemo(() => {
     const rowsAll = data?.rows ?? []
     const build = (pick: (r: YesterdayRow) => boolean) => {
       const sub = rowsAll.filter(pick)
       const es = sub.flatMap((r) => (r.echo ? [r.echo.rhyme] : []))
       const avg = es.length ? Math.round(es.reduce((s, x) => s + x, 0) / es.length) : null
-      return { rows: sub.length, compared: es.length, ok: es.filter((x) => x >= RHYME_OK).length, bad: es.filter((x) => x < RHYME_BAD).length, avg }
+      const wk = sub.flatMap((r) => [
+        ...(r.echo ? [r.echo.rhyme] : []),
+        ...(r.prior ?? []).flatMap((p) => (p.echo ? [p.echo.rhyme] : [])),
+      ])
+      const wkAvg = wk.length ? Math.round(wk.reduce((s, x) => s + x, 0) / wk.length) : null
+      return {
+        rows: sub.length,
+        compared: es.length,
+        ok: es.filter((x) => x >= RHYME_OK).length,
+        bad: es.filter((x) => x < RHYME_BAD).length,
+        avg,
+        wkObs: wk.length,
+        wkRhymed: wk.filter((x) => x >= RHYME_OK).length,
+        wkAvg,
+      }
     }
     return [
       { key: 'otc' as const, label: 'OTC', why: 'over-the-counter pairs (the -OTC twins)', agg: build((r) => r.otc) },
@@ -650,7 +680,11 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
         <div className="flex flex-wrap items-center gap-1 border-b border-[#1c2739] px-2 py-1">
           <span
             className="mr-0.5 font-mono text-[8.5px] uppercase tracking-wider text-[#3d4d66]"
-            title="average echo rhyme per asset class, over the rows that carry a comparison (rows without an echo are excluded, not scored zero) - click a class to filter the list to it"
+            title={`average echo rhyme per asset class, over the rows that carry a comparison (rows without an echo are excluded, not scored zero)${
+              weekLive
+                ? " - each chip's ⟳ number averages the same rhyme over every echoed day-observation of the week in class (yesterday's echo + each remembered prior day's)"
+                : ' - pick a deeper day chip (beyond 1d) and each chip grows a ⟳ week rhyme over every echoed day-observation in class'
+            } - click a class to filter the list to it`}
           >
             rhyme by class
           </span>
@@ -663,6 +697,14 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
                   : agg.avg >= RHYME_BAD
                     ? 'text-amber-300'
                     : 'text-rose-300'
+            const wkColor =
+              agg.wkAvg == null
+                ? 'text-[#3d4d66]'
+                : agg.wkAvg >= RHYME_OK
+                  ? 'text-emerald-300/80'
+                  : agg.wkAvg >= RHYME_BAD
+                    ? 'text-amber-300/80'
+                    : 'text-rose-300/80'
             const click = () => {
               if (key === 'otc') {
                 setMkt('otc')
@@ -680,7 +722,7 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
                 title={
                   agg.avg == null
                     ? `${why} - none of the ${agg.rows} row${agg.rows === 1 ? '' : 's'} in class carries an echo (lead-ins under half covered)`
-                    : `${why} - average echo rhyme ${agg.avg}/100 across ${agg.compared} of ${agg.rows} row${agg.rows === 1 ? '' : 's'} in class (${agg.ok} rhyming ${RHYME_OK}+, ${agg.bad} diverging under ${RHYME_BAD}); the rest have no comparison. Click to filter.`
+                    : `${why} - average echo rhyme ${agg.avg}/100 across ${agg.compared} of ${agg.rows} row${agg.rows === 1 ? '' : 's'} in class (${agg.ok} rhyming ${RHYME_OK}+, ${agg.bad} diverging under ${RHYME_BAD}); the rest have no comparison.${weekLive ? ' The ⟳ number is the week rhyme (hover it).' : ''} Click to filter.`
                 }
               >
                 <span className="text-[#4b5a72]">{label}</span>{' '}
@@ -688,6 +730,15 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
                 {agg.compared > 0 && (
                   <span className="ml-0.5 text-[8.5px] text-[#3d4d66]">
                     {agg.ok}/{agg.compared}
+                  </span>
+                )}
+                {weekLive && agg.wkAvg != null && (
+                  <span
+                    className={`ml-1 ${wkColor}`}
+                    title={`week rhyme: average ${agg.wkAvg}/100 across ${agg.wkObs} echoed day-observation${agg.wkObs === 1 ? '' : 's'} in class - yesterday's echo + each remembered prior day's (${agg.wkRhymed} scored ${RHYME_OK}+). Same exclusion rule as the row aggregate: no-echo days are left out, not scored zero.${agg.wkObs === agg.compared ? ' No remembered prior days in this class yet - the week here is yesterday only.' : ''}`}
+                  >
+                    {'\u27f3'}
+                    {agg.wkAvg}
                   </span>
                 )}
               </button>
@@ -721,7 +772,7 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
         ))}
         {data && data.rows.length > 0 && (
           <p className="px-1 pt-1 text-[8.5px] leading-relaxed text-[#3d4d66]">
-            Each row is the window that started at the bar forming exactly 24h ago, on the chart's timeframe. dir counts as up/down only when the net move exceeds 10% of the window's own travel. "arch" = bars from the kernel's accumulated store (broker bars in live mode), "seeded" = the feed's deterministic prehistory - never mistake a seeded yesterday for a remembered one. echo compares the lead-in windows ending at this same time of day (yesterday's ended at the anchor, today's within one bar of now): rhyme = direction 50 + move-vs-travel 30 + travel ratio 20, 70+ reads as "repeating the script", under 40 as "going its own way". The rhyme-by-class strip averages each class's echo scores (compared rows only) - "are OTC pairs rhyming today?" is one glance away. Click a card to open that asset on the chart; click an echo chip to go further - the chart deep-loads the asset's full day of candles and scrolls onto yesterday's lead-in plus the forward replay window (edges the feed never remembered show as a gap, not filler). The day chips walk the same window further back - the "at this hour" strip shows each remembered day with its own coverage (days the series cannot cover are absent, not flat), each day's rhyme tag scores today's lead-in against THAT day's lead-in, and the "N/M rhyme" aggregate counts the days today actually rhymed with (70+), compared days only.
+            Each row is the window that started at the bar forming exactly 24h ago, on the chart's timeframe. dir counts as up/down only when the net move exceeds 10% of the window's own travel. "arch" = bars from the kernel's accumulated store (broker bars in live mode), "seeded" = the feed's deterministic prehistory - never mistake a seeded yesterday for a remembered one. echo compares the lead-in windows ending at this same time of day (yesterday's ended at the anchor, today's within one bar of now): rhyme = direction 50 + move-vs-travel 30 + travel ratio 20, 70+ reads as "repeating the script", under 40 as "going its own way". The rhyme-by-class strip averages each class's echo scores (compared rows only) - "are OTC pairs rhyming today?" is one glance away, and once the scan walks deeper than 1d each chip grows a ⟳ week number averaging every echoed day-observation in class - "are they rhyming with the whole week, or only with yesterday?". Click a card to open that asset on the chart; click an echo chip to go further - the chart deep-loads the asset's full day of candles and scrolls onto yesterday's lead-in plus the forward replay window (edges the feed never remembered show as a gap, not filler). The day chips walk the same window further back - the "at this hour" strip shows each remembered day with its own coverage (days the series cannot cover are absent, not flat), each day's rhyme tag scores today's lead-in against THAT day's lead-in, and the "N/M rhyme" aggregate counts the days today actually rhymed with (70+), compared days only.
           </p>
         )}
       </div>
