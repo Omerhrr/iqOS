@@ -25,6 +25,10 @@
 //   - watchlist export (Task 16): every live row carries the complete
 //     field set the text snapshot reads (the serializer itself is locked
 //     by the unit suite against the real module)
+//   - off-hours caveat (Task 17): the rows whose qualified best session is
+//     the OFF bucket - exactly the rows the panel underlines and the
+//     snapshot marks off* - their OFF average really is the maximum, and
+//     the firing count on the live universe is logged for eyeballing
 // Read-only.
 const BASE = process.env.IQAIR_OS_URL ?? 'http://localhost:3030'
 const TOKEN = (process.env.KERNEL_TOKEN ?? '').trim()
@@ -314,6 +318,27 @@ ok('export: every profiled row carries the fields the snapshot reads', prows.eve
   (r.prior ?? []).every((p) => p.echo == null || (Number.isFinite(p.echo.rhyme) && typeof p.echo.quiet === 'boolean')) &&
   (r.profile ?? []).every((s) => ['ASIA', 'LONDON', 'OVERLAP', 'NEWYORK', 'OFF', 'OTC'].includes(s.session) && (s.avg === null || (s.avg >= 0 && s.avg <= 100))),
 ), JSON.stringify(prows.find((r) => r.echo == null || (r.profile ?? []).length === 0)))
+
+// ---- off-hours caveat (Task 17): the OFF bucket reads with a discount ----
+// An off-hours average is real (quiet pairs are already excluded) but it was
+// scored at hours OUTSIDE the named sessions, where the books are thin - so
+// the panel underlines it and the snapshot marks such a peak off*. The
+// marker rule itself is locked by the unit suite against the real
+// src/lib/os/watchlist.ts; this pins the WIRE side it keys on: the rows the
+// rule would fire on (qualified best session = OFF, 2+ non-quiet obs) have
+// an OFF average that truly is their maximum - no false positives on
+// clock-session peaks - and the firing count is the "how often does the
+// caveat actually matter" reading on the live universe.
+const offMarked = prows.filter((r) => {
+  const q = (r.profile ?? []).filter((s) => s.obs - s.quiet >= 2 && s.avg != null)
+  return q.length > 0 && q.reduce((a, b) => (b.avg > a.avg ? b : a)).session === 'OFF'
+})
+ok('off-hours: a marked row\'s OFF best really is its maximum (no false positives)', offMarked.every((r) => {
+  const offAvg = (r.profile ?? []).find((s) => s.session === 'OFF' && s.obs - s.quiet >= 2)?.avg
+  const others = (r.profile ?? []).filter((s) => s.obs - s.quiet >= 2 && s.avg != null && s.session !== 'OFF')
+  return offAvg != null && peakKey(r).best === offAvg && others.every((s) => offAvg >= s.avg)
+}), JSON.stringify(offMarked.slice(0, 3).map((r) => r.asset)))
+console.log(`  off-hours peaks: ${offMarked.length}/${prows.length} rows - the dotted-underline caveat fires${offMarked.length ? ': ' + offMarked.map((r) => r.asset).join(' ') : ' on none right now'}`)
 
 console.log(`\n${pass} passed, ${fail} failed`)
 process.exit(fail ? 1 : 0)

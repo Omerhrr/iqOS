@@ -13,9 +13,10 @@
 //     -OTC collapse, quiet exclusion, row-path wiring
 //   - watchlist snapshot: the ranking comparators (rhyme/week/peak orders,
 //     quiet exclusion, sink sentinels) and the serializer (header fields,
-//     cap, conditional columns, quiet marker, peak/spread cell, exact
-//     round-trip of the row numbers) against src/lib/os/watchlist.ts - the
-//     REAL shipped module, imported straight from the web tree
+//     cap, conditional columns, quiet marker, peak/spread cell, off-hours
+//     off* marker, exact round-trip of the row numbers) against
+//     src/lib/os/watchlist.ts - the REAL shipped module, imported straight
+//     from the web tree
 // Run: bun scripts/yesterday_echo_unit.mjs
 import { buildPriorDay, buildSessionProfile, buildYesterdayRow } from '../mini-services/trading-core/src/analytics/yesterday'
 import { cmpBySort, buildWatchlist, fmtWatchlistTs } from '../src/lib/os/watchlist'
@@ -298,6 +299,32 @@ ok('watchlist: full scan says so in the header (no top-N truncation)', snapBare.
 const snapEmpty = buildWatchlist({ rows: [], sort: 'week', tsMs: TS, topN: 10 })
 ok('watchlist: empty view is honest (no rows - loosen the filters)', snapEmpty.includes('no rows - loosen the filters'), snapEmpty.split('\n')[1])
 ok('watchlist: serializer deterministic (same input -> same text)', buildWatchlist({ rows: WROWS, sort: 'week', tsMs: TS, topN: 5 }) === snapWeek)
+
+// ---- OFF-HOURS MARKER (Task 17): the session-level cousin of the quiet q ----
+// An OFF-bucket peak is real (quiet pairs are already excluded) but it was
+// scored at hours OUTSIDE the named sessions - thin books, small travel - so
+// the snapshot marks it off* inline and the legend spells the caveat out.
+// The marker must fire ONLY when OFF is the best session: a clock-session or
+// OTC day-wide peak stays clean.
+const FFF = wr('FFF', 0.7, { rhyme: 60, quiet: false }, [], [
+  { session: 'OFF', obs: 4, quiet: 0, avg: 74 },
+  { session: 'OVERLAP', obs: 3, quiet: 0, avg: 54 },
+  { session: 'ASIA', obs: 2, quiet: 0, avg: 50 },
+])
+const snapOff = buildWatchlist({ rows: [FFF], sort: 'peak', tsMs: TS, topN: 5 })
+ok('watchlist: OFF-bucket peak marked off* in the peak cell (off* 74 Δ24)', snapOff.split('\n')[2].includes('off* 74 Δ24'), snapOff.split('\n')[2])
+ok('watchlist: the legend spells the off* caveat out', snapOff.split('\n').at(-1).includes('* off-hours peak (thin books, weight it)'), snapOff.split('\n').at(-1))
+const snapLon = buildWatchlist({ rows: [WROWS[0]], sort: 'peak', tsMs: TS, topN: 5 })
+ok('watchlist: a clock-session peak carries no marker', snapLon.split('\n')[2].includes('L/N 80 Δ20') && !snapLon.split('\n')[2].includes('*'), snapLon.split('\n')[2])
+const snapOtc = buildWatchlist({ rows: [wr('GGG', 1.0, { rhyme: 50, quiet: false }, [], [{ session: 'OTC', obs: 5, quiet: 0, avg: 61 }])], sort: 'peak', tsMs: TS, topN: 5 })
+ok('watchlist: an OTC day-wide peak carries no marker either', snapOtc.split('\n')[2].includes('OTC 61') && !snapOtc.split('\n')[2].includes('*'), snapOtc.split('\n')[2])
+// OFF qualifies but is NOT the best -> the marker must not fire
+const HHH = wr('HHH', 0.8, { rhyme: 55, quiet: false }, [], [
+  { session: 'OFF', obs: 4, quiet: 0, avg: 74 },
+  { session: 'OVERLAP', obs: 3, quiet: 0, avg: 80 },
+])
+const snapMixed = buildWatchlist({ rows: [HHH], sort: 'peak', tsMs: TS, topN: 5 })
+ok('watchlist: marker only when OFF IS the best (L/N 80 stays clean)', snapMixed.split('\n')[2].includes('L/N 80 Δ6') && !snapMixed.split('\n')[2].includes('*'), snapMixed.split('\n')[2])
 
 console.log(`\n${pass} passed, ${fail} failed`)
 process.exit(fail > 0 ? 1 : 0)

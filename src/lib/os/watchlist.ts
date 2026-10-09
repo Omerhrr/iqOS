@@ -129,6 +129,13 @@ const SESSION_SHORT: Record<WatchSession, string> = {
   OTC: 'OTC',
 }
 
+/** marker after a peak session whose best bucket is OFF - the rhyme was
+ * scored at hours OUTSIDE the named sessions, where the books are thin and
+ * the travel small. Real (quiet pairs are already excluded from the
+ * averages) but not the same kind of evidence as a London peak, so the
+ * snapshot says so inline and the legend spells it out. */
+const OFF_MARK = '*'
+
 /** scan time as a UTC label for the snapshot header - the scan rides a
  * moving T-24h anchor, so the timestamp is part of the snapshot's meaning */
 export function fmtWatchlistTs(ms: number): string {
@@ -137,7 +144,7 @@ export function fmtWatchlistTs(ms: number): string {
   return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())} UTC`
 }
 
-const LEGEND = `legend: rhyme = dir 50 + move-vs-travel 30 + travel ratio 20 · ${RHYME_OK}+ rhymes, <${RHYME_BAD} diverges · q quiet (both lead-ins flat, out of aggregates) · week rhymed/kept + avg over non-quiet days · peak best session (2+ non-quiet obs) · Δ best-worst spread · move = yesterday's replay window`
+const LEGEND = `legend: rhyme = dir 50 + move-vs-travel 30 + travel ratio 20 · ${RHYME_OK}+ rhymes, <${RHYME_BAD} diverges · q quiet (both lead-ins flat, out of aggregates) · week rhymed/kept + avg over non-quiet days · peak best session (2+ non-quiet obs) · Δ best-worst spread · * off-hours peak (thin books, weight it) · move = yesterday's replay window`
 
 /** Serialize the current view into a shareable text snapshot. The rows come
  * in ALREADY filtered (market/class/direction/echo/search - the operator
@@ -145,7 +152,9 @@ const LEGEND = `legend: rhyme = dir 50 + move-vs-travel 30 + travel ratio 20 · 
  * comparators the panel sorts by, then capped at topN. Conditional columns
  * mirror the panel's live rules: the week aggregate appears only when a
  * remembered prior echo exists on some exported row (at 1d it would restate
- * the echo column), the peak column only when a profile is on the wire. */
+ * the echo column), the peak column only when a profile is on the wire. A
+ * peak whose best session is OFF carries the off* marker - same caveat the
+ * panel draws as a dotted underline under its off-hours averages. */
 export function buildWatchlist(opts: {
   rows: WatchRow[]
   sort: WatchSort
@@ -180,7 +189,7 @@ export function buildWatchlist(opts: {
     if (quals.length === 0) return '—'
     const best = quals.reduce((a, b) => (b.avg! > a.avg! ? b : a))
     const spread = quals.length > 1 ? Math.max(...quals.map((s) => s.avg!)) - Math.min(...quals.map((s) => s.avg!)) : 0
-    return `${SESSION_SHORT[best.session]} ${best.avg}${quals.length > 1 ? ` Δ${spread}` : ''}`
+    return `${SESSION_SHORT[best.session]}${best.session === 'OFF' ? OFF_MARK : ''} ${best.avg}${quals.length > 1 ? ` Δ${spread}` : ''}`
   }
   const moveCell = (r: WatchRow): string => `${r.movePct >= 0 ? '+' : ''}${r.movePct.toFixed(2)}%`
 
