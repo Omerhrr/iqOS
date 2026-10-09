@@ -133,8 +133,15 @@ const SESSION_SHORT: Record<WatchSession, string> = {
  * scored at hours OUTSIDE the named sessions, where the books are thin and
  * the travel small. Real (quiet pairs are already excluded from the
  * averages) but not the same kind of evidence as a London peak, so the
- * snapshot says so inline and the legend spells it out. */
+ * snapshot says so inline and the legend spells it out. The script sub-line
+ * marks every MEASURED off-hours cell the same way, mirroring the panel's
+ * dotted underline. */
 const OFF_MARK = '*'
+
+/** the canonical session order of a script line - the wire already ships
+ * buckets in this order, but the serializer orders them itself so the text
+ * is deterministic even against a hand-built profile */
+const SESSION_ORDER: WatchSession[] = ['ASIA', 'LONDON', 'OVERLAP', 'NEWYORK', 'OFF', 'OTC']
 
 /** scan time as a UTC label for the snapshot header - the scan rides a
  * moving T-24h anchor, so the timestamp is part of the snapshot's meaning */
@@ -144,7 +151,7 @@ export function fmtWatchlistTs(ms: number): string {
   return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())} UTC`
 }
 
-const LEGEND = `legend: rhyme = dir 50 + move-vs-travel 30 + travel ratio 20 · ${RHYME_OK}+ rhymes, <${RHYME_BAD} diverges · q quiet (both lead-ins flat, out of aggregates) · week rhymed/kept + avg over non-quiet days · peak best session (2+ non-quiet obs) · Δ best-worst spread · * off-hours peak (thin books, weight it) · move = yesterday's replay window`
+const LEGEND = `legend: rhyme = dir 50 + move-vs-travel 30 + travel ratio 20 · ${RHYME_OK}+ rhymes, <${RHYME_BAD} diverges · q quiet (both lead-ins flat, out of aggregates) · week rhymed/kept + avg over non-quiet days · peak best session (2+ non-quiet obs) · Δ best-worst spread · * off-hours (thin books, weight it) · move = yesterday's replay window`
 
 /** Serialize the current view into a shareable text snapshot. The rows come
  * in ALREADY filtered (market/class/direction/echo/search - the operator
@@ -154,7 +161,11 @@ const LEGEND = `legend: rhyme = dir 50 + move-vs-travel 30 + travel ratio 20 · 
  * remembered prior echo exists on some exported row (at 1d it would restate
  * the echo column), the peak column only when a profile is on the wire. A
  * peak whose best session is OFF carries the off* marker - same caveat the
- * panel draws as a dotted underline under its off-hours averages. */
+ * panel draws as a dotted underline under its off-hours averages. Every row
+ * with a measured profile also grows an indented "script" sub-line - its
+ * full session averages in canonical order, measured sessions only (obs 0
+ * skipped, all-quiet reads —), off-hours cells marked off* - so the SHAPE
+ * of the script travels with the watchlist, not just the peak cell. */
 export function buildWatchlist(opts: {
   rows: WatchRow[]
   sort: WatchSort
@@ -192,6 +203,17 @@ export function buildWatchlist(opts: {
     return `${SESSION_SHORT[best.session]}${best.session === 'OFF' ? OFF_MARK : ''} ${best.avg}${quals.length > 1 ? ` Δ${spread}` : ''}`
   }
   const moveCell = (r: WatchRow): string => `${r.movePct >= 0 ? '+' : ''}${r.movePct.toFixed(2)}%`
+  // the script sub-line: the row's full session profile, one indented line
+  // under the data row - the peak cell names the best session, this carries
+  // the whole shape (flat vs spiky, where else it rhymes). Measured sessions
+  // only, canonical order, off-hours cells marked off* like the panel's
+  // dotted underline; a row without a measured profile adds no line.
+  const scriptLine = (r: WatchRow): string | null => {
+    const measured = (r.profile ?? []).filter((s) => s.obs > 0)
+    if (measured.length === 0) return null
+    measured.sort((a, b) => SESSION_ORDER.indexOf(a.session) - SESSION_ORDER.indexOf(b.session))
+    return `      script  ${measured.map((s) => `${SESSION_SHORT[s.session]}${s.session === 'OFF' ? OFF_MARK : ''} ${s.avg ?? '—'}`).join('  ')}`
+  }
 
   const body = sorted.map((r) => ({
     asset: r.asset,
@@ -211,9 +233,12 @@ export function buildWatchlist(opts: {
   ]
   const widths = cols.map((col) => Math.max(col.head.length, ...body.map((c) => col.cell(c).length)))
   const keyRow = `  #  ${'asset'.padEnd(assetW)}  ${cols.map((col, i) => col.head.padStart(widths[i])).join('  ')}`
-  const dataRows = body.map(
-    (c, i) =>
-      `${String(i + 1).padStart(2)}  ${c.asset.padEnd(assetW)}  ${cols.map((col, j) => col.cell(c).padStart(widths[j])).join('  ')}`,
+  const dataRows = body.flatMap(
+    (c, i) => {
+      const line = `${String(i + 1).padStart(2)}  ${c.asset.padEnd(assetW)}  ${cols.map((col, j) => col.cell(c).padStart(widths[j])).join('  ')}`
+      const sub = scriptLine(sorted[i])
+      return sub ? [line, sub] : [line]
+    },
   )
   return [title, keyRow, ...dataRows, LEGEND].join('\n')
 }

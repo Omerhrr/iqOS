@@ -14,9 +14,9 @@
 //   - watchlist snapshot: the ranking comparators (rhyme/week/peak orders,
 //     quiet exclusion, sink sentinels) and the serializer (header fields,
 //     cap, conditional columns, quiet marker, peak/spread cell, off-hours
-//     off* marker, exact round-trip of the row numbers) against
-//     src/lib/os/watchlist.ts - the REAL shipped module, imported straight
-//     from the web tree
+//     off* marker, per-row script sub-lines, exact round-trip of the row
+//     numbers) against src/lib/os/watchlist.ts - the REAL shipped module,
+//     imported straight from the web tree
 // Run: bun scripts/yesterday_echo_unit.mjs
 import { buildPriorDay, buildSessionProfile, buildYesterdayRow } from '../mini-services/trading-core/src/analytics/yesterday'
 import { cmpBySort, buildWatchlist, fmtWatchlistTs } from '../src/lib/os/watchlist'
@@ -280,14 +280,19 @@ const TS = 1_699_920_000_000 // 2023-11-14T00:00:00Z
 ok('watchlist: fmtWatchlistTs renders a UTC label', fmtWatchlistTs(TS) === '2023-11-14 00:00 UTC', `got ${fmtWatchlistTs(TS)}`)
 const snap = buildWatchlist({ rows: WROWS, sort: 'peak', tsMs: TS, topN: 3, mktLabel: 'all markets', catLabel: 'all classes' })
 const snapLines = snap.split('\n')
-ok('watchlist: snapshot is title + key row + topN data rows + legend', snapLines.length === 3 + 3, `lines=${snapLines.length}`)
+// AAA + BBB carry a measured profile (one script sub-line each), DDD does not
+ok('watchlist: snapshot is title + key row + data rows (+ script sub-lines) + legend', snapLines.length === 3 + 3 + 2, `lines=${snapLines.length}`)
 ok('watchlist: header carries the scan time, sort, filters and count', snapLines[0].includes('2023-11-14 00:00 UTC') && snapLines[0].includes('sort peak') && snapLines[0].includes('all markets') && snapLines[0].includes('all classes') && snapLines[0].includes('top 3 of 5'), snapLines[0])
-ok('watchlist: cap respected - the top-3 text holds exactly AAA/BBB/DDD', snapLines[2].includes('AAA') && snapLines[3].includes('BBB') && snapLines[4].includes('DDD'), snapLines.slice(2, 5).join(' | '))
-ok('watchlist: quiet echo marked q in the echo cell', snapLines[4].includes('100q'), snapLines[4])
+ok('watchlist: cap respected - the top-3 text holds exactly AAA/BBB/DDD', snapLines[2].includes('AAA') && snapLines[4].includes('BBB') && snapLines[6].includes('DDD'), snapLines.slice(2, 7).join(' | '))
+ok('watchlist: quiet echo marked q in the echo cell', snapLines[6].includes('100q'), snapLines[6])
 ok('watchlist: peak cell is session + best + spread (AAA L/N 80 Δ20)', snapLines[2].includes('L/N 80 Δ20'), snapLines[2])
-ok('watchlist: single qualified session renders without a spread tag', snapLines[3].includes('L/N 60') && !snapLines[3].includes('Δ'), snapLines[3])
-ok('watchlist: row without a profile renders an honest — peak cell', snapLines[4].includes('—'), snapLines[4])
-ok('watchlist: move cell signed to two decimals', snapLines[2].includes('+1.20%') && snapLines[3].includes('+3.00%'), `${snapLines[2]} | ${snapLines[3]}`)
+ok('watchlist: single qualified session renders without a spread tag', snapLines[4].includes('L/N 60') && !snapLines[4].includes('Δ'), snapLines[4])
+ok('watchlist: row without a profile renders an honest — peak cell', snapLines[6].includes('—'), snapLines[6])
+ok('watchlist: move cell signed to two decimals', snapLines[2].includes('+1.20%') && snapLines[4].includes('+3.00%'), `${snapLines[2]} | ${snapLines[4]}`)
+// ---- script sub-lines (Task 18): the shape travels with the paste ----
+ok('watchlist: AAA sub-line is indented, canonical-ordered (wire ships OVERLAP first, text says Asia before L/N)', snapLines[3].startsWith('      script  ') && snapLines[3].indexOf('Asia 60') !== -1 && snapLines[3].indexOf('Asia 60') < snapLines[3].indexOf('L/N 80'), snapLines[3])
+ok('watchlist: BBB sub-line is measured-only (no empty session pairs)', snapLines[5].includes('L/N 60') && !snapLines[5].includes('Asia') && !snapLines[5].includes('off') && !snapLines[5].includes('OTC'), snapLines[5])
+ok('watchlist: dark/no-profile rows add no sub-line (DDD line has none)', !snapLines[6].includes('script'), snapLines[6])
 const snapWeek = buildWatchlist({ rows: WROWS, sort: 'week', tsMs: TS, topN: 5 })
 const wLine = snapWeek.split('\n')[2]
 ok('watchlist: week cell is rhymed/kept + avg over non-quiet days (AAA 2/3 70)', wLine.includes('2/3 70'), wLine)
@@ -313,18 +318,28 @@ const FFF = wr('FFF', 0.7, { rhyme: 60, quiet: false }, [], [
 ])
 const snapOff = buildWatchlist({ rows: [FFF], sort: 'peak', tsMs: TS, topN: 5 })
 ok('watchlist: OFF-bucket peak marked off* in the peak cell (off* 74 Δ24)', snapOff.split('\n')[2].includes('off* 74 Δ24'), snapOff.split('\n')[2])
-ok('watchlist: the legend spells the off* caveat out', snapOff.split('\n').at(-1).includes('* off-hours peak (thin books, weight it)'), snapOff.split('\n').at(-1))
+ok('watchlist: FFF sub-line marks the measured OFF cell too (Asia 50  L/N 54  off* 74)', snapOff.split('\n')[3].includes('Asia 50  L/N 54  off* 74'), snapOff.split('\n')[3])
+ok('watchlist: the legend spells the off* caveat out', snapOff.split('\n').at(-1).includes('* off-hours (thin books, weight it)'), snapOff.split('\n').at(-1))
 const snapLon = buildWatchlist({ rows: [WROWS[0]], sort: 'peak', tsMs: TS, topN: 5 })
 ok('watchlist: a clock-session peak carries no marker', snapLon.split('\n')[2].includes('L/N 80 Δ20') && !snapLon.split('\n')[2].includes('*'), snapLon.split('\n')[2])
-const snapOtc = buildWatchlist({ rows: [wr('GGG', 1.0, { rhyme: 50, quiet: false }, [], [{ session: 'OTC', obs: 5, quiet: 0, avg: 61 }])], sort: 'peak', tsMs: TS, topN: 5 })
-ok('watchlist: an OTC day-wide peak carries no marker either', snapOtc.split('\n')[2].includes('OTC 61') && !snapOtc.split('\n')[2].includes('*'), snapOtc.split('\n')[2])
-// OFF qualifies but is NOT the best -> the marker must not fire
+// OFF qualifies but is NOT the best -> the marker must not fire on the peak cell
 const HHH = wr('HHH', 0.8, { rhyme: 55, quiet: false }, [], [
   { session: 'OFF', obs: 4, quiet: 0, avg: 74 },
   { session: 'OVERLAP', obs: 3, quiet: 0, avg: 80 },
 ])
 const snapMixed = buildWatchlist({ rows: [HHH], sort: 'peak', tsMs: TS, topN: 5 })
 ok('watchlist: marker only when OFF IS the best (L/N 80 stays clean)', snapMixed.split('\n')[2].includes('L/N 80 Δ6') && !snapMixed.split('\n')[2].includes('*'), snapMixed.split('\n')[2])
+ok('watchlist: HHH sub-line marks OFF measured even when L/N is the peak', snapMixed.split('\n')[3].includes('L/N 80') && snapMixed.split('\n')[3].includes('off* 74'), snapMixed.split('\n')[3])
+// OTC day-wide + all-quiet buckets in the sub-line
+const snapOtc = buildWatchlist({ rows: [wr('GGG', 1.0, { rhyme: 50, quiet: false }, [], [{ session: 'OTC', obs: 5, quiet: 0, avg: 61 }])], sort: 'peak', tsMs: TS, topN: 5 })
+ok('watchlist: an OTC day-wide peak carries no marker either', snapOtc.split('\n')[2].includes('OTC 61') && !snapOtc.split('\n')[2].includes('*'), snapOtc.split('\n')[2])
+ok('watchlist: OTC sub-line renders the day-wide bucket', snapOtc.split('\n')[3].trim() === 'script  OTC 61', snapOtc.split('\n')[3])
+const III = wr('III', 0.4, { rhyme: 45, quiet: false }, [], [
+  { session: 'ASIA', obs: 3, quiet: 3, avg: null },
+  { session: 'LONDON', obs: 2, quiet: 0, avg: 66 },
+])
+const snapQuiet = buildWatchlist({ rows: [III], sort: 'peak', tsMs: TS, topN: 5 })
+ok('watchlist: an all-quiet measured bucket reads — in the sub-line (Lon 66, Asia —)', snapQuiet.split('\n')[3].includes('Asia —') && snapQuiet.split('\n')[3].includes('Lon 66'), snapQuiet.split('\n')[3])
 
 console.log(`\n${pass} passed, ${fail} failed`)
 process.exit(fail > 0 ? 1 : 0)
