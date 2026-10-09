@@ -17,9 +17,15 @@
 //     off* marker, per-row script sub-lines, exact round-trip of the row
 //     numbers) against src/lib/os/watchlist.ts - the REAL shipped module,
 //     imported straight from the web tree
+//   - snapshot roundtrip: parseWatchlist reads the shape back out of the
+//     serializer's own text (selection + sort + scope, never the numbers),
+//     refuses non-snapshots and empty ones with a reason, keeps script
+//     sub-lines / key row / legend from leaking in as rows, dedupes by
+//     best rank, ranks by the written index and degrades honestly on a
+//     trimmed or hand-edited header
 // Run: bun scripts/yesterday_echo_unit.mjs
 import { buildPriorDay, buildSessionProfile, buildYesterdayRow } from '../mini-services/trading-core/src/analytics/yesterday'
-import { cmpBySort, buildWatchlist, fmtWatchlistTs } from '../src/lib/os/watchlist'
+import { cmpBySort, buildWatchlist, parseWatchlist, fmtWatchlistTs } from '../src/lib/os/watchlist'
 
 let pass = 0
 let fail = 0
@@ -340,6 +346,51 @@ const III = wr('III', 0.4, { rhyme: 45, quiet: false }, [], [
 ])
 const snapQuiet = buildWatchlist({ rows: [III], sort: 'peak', tsMs: TS, topN: 5 })
 ok('watchlist: an all-quiet measured bucket reads — in the sub-line (Lon 66, Asia —)', snapQuiet.split('\n')[3].includes('Asia —') && snapQuiet.split('\n')[3].includes('Lon 66'), snapQuiet.split('\n')[3])
+
+// ---- SNAPSHOT ROUNDTRIP (Task 19): parseWatchlist reads the shape back ----
+// The roundtrip law: parse(buildWatchlist(x)) restores the SELECTION + the
+// SORT + the SCOPE labels and counts, never the numbers - every cell the
+// serializer wrote is data the parser must skip. These checks run the
+// parser against the snapshots BUILT above, so serializer and parser are
+// locked to each other, not to parallel mirrors.
+const rt = parseWatchlist(snap)
+ok('roundtrip: the top-3 peak snapshot parses back ok', rt.ok, JSON.stringify(rt))
+if (rt.ok) {
+  ok('roundtrip: assets are the snapshot\'s ranked rows in rank order', JSON.stringify(rt.wl.assets) === JSON.stringify(['AAA', 'BBB', 'DDD']), `got ${rt.wl.assets.join(',')}`)
+  ok('roundtrip: sort + ts label ride the header', rt.wl.sort === 'peak' && rt.wl.tsLabel === '2023-11-14 00:00 UTC', `sort=${rt.wl.sort} ts=${rt.wl.tsLabel}`)
+  ok('roundtrip: scope labels + top-of counts ride the header', rt.wl.mktLabel === 'all markets' && rt.wl.catLabel === 'all classes' && rt.wl.total === 5 && rt.wl.ranked === 3, JSON.stringify(rt.wl))
+}
+const rtWeek = parseWatchlist(snapWeek)
+ok('roundtrip: the full week snapshot parses back (N rows variant, not top-of)', rtWeek.ok && rtWeek.wl.assets.join(',') === 'AAA,BBB,EEE,DDD,CCC' && rtWeek.wl.sort === 'week' && rtWeek.wl.total === 5 && rtWeek.wl.ranked === 5, JSON.stringify(rtWeek.ok ? rtWeek.wl : rtWeek))
+ok('roundtrip: serializer defaults surface as the scope labels', rtWeek.ok && rtWeek.wl.mktLabel === 'all markets' && rtWeek.wl.catLabel === 'all classes', JSON.stringify(rtWeek.ok ? [rtWeek.wl.mktLabel, rtWeek.wl.catLabel] : rtWeek))
+ok('roundtrip: script sub-lines, key row and legend never leak in as rows', rtWeek.ok && rtWeek.wl.assets.every((a) => !['script', 'asset', 'Asia', 'Lon', 'L/N', 'NY', 'off', 'OTC', 'legend:'].includes(a)), `got ${rtWeek.ok ? rtWeek.wl.assets.join(',') : '-'}`)
+const rtBare = parseWatchlist(snapBare)
+ok('roundtrip: the 1-row snapshot parses (singular "1 row" count)', rtBare.ok && rtBare.wl.assets.join(',') === 'EEE' && rtBare.wl.sort === 'rhyme' && rtBare.wl.total === 1 && rtBare.wl.ranked === 1, JSON.stringify(rtBare.ok ? rtBare.wl : rtBare))
+ok('roundtrip: an empty snapshot is refused with a reason', !parseWatchlist(snapEmpty).ok && parseWatchlist(snapEmpty).why.includes('no ranked rows'), JSON.stringify(parseWatchlist(snapEmpty)))
+ok('roundtrip: non-snapshot text is refused (no title tag)', !parseWatchlist('hello world\n1  AAA  90').ok && parseWatchlist('hello world\n1  AAA  90').why.includes('not an iqOS'), JSON.stringify(parseWatchlist('hello world')))
+const snapReal = buildWatchlist({ rows: [WROWS[0]], sort: 'move', tsMs: TS, mktLabel: 'REAL', catLabel: 'forex' })
+const rtReal = parseWatchlist(snapReal)
+ok('roundtrip: custom scope labels travel verbatim (REAL / forex, sort move)', rtReal.ok && rtReal.wl.mktLabel === 'REAL' && rtReal.wl.catLabel === 'forex' && rtReal.wl.sort === 'move', JSON.stringify(rtReal.ok ? [rtReal.wl.mktLabel, rtReal.wl.catLabel, rtReal.wl.sort] : rtReal))
+const snapSince = buildWatchlist({ rows: [WROWS[0]], sort: 'since', tsMs: TS })
+const snapRange = buildWatchlist({ rows: [WROWS[0]], sort: 'range', tsMs: TS })
+ok('roundtrip: the since/range sorts parse back too (all six kinds pass)', parseWatchlist(snapSince).ok && parseWatchlist(snapSince).wl.sort === 'since' && parseWatchlist(snapRange).ok && parseWatchlist(snapRange).wl.sort === 'range', `${parseWatchlist(snapSince).ok ? parseWatchlist(snapSince).wl.sort : 'x'}/${parseWatchlist(snapRange).ok ? parseWatchlist(snapRange).wl.sort : 'x'}`)
+ok('roundtrip: a bogus sort in the header degrades to null, not a guess', parseWatchlist(snap.replace('sort peak', 'sort bogus')).ok && parseWatchlist(snap.replace('sort peak', 'sort bogus')).wl.sort === null, JSON.stringify(parseWatchlist(snap.replace('sort peak', 'sort bogus')).ok ? parseWatchlist(snap.replace('sort peak', 'sort bogus')).wl.sort : '-'))
+const trimmed = ['iqOS yesterday watchlist · sort week', '  1  AAA   90  2/3 70  L/N 80 Δ20  +1.20%'].join('\n')
+const rtTrim = parseWatchlist(trimmed)
+ok('roundtrip: a hand-trimmed header degrades honestly (nulls, not guesses)', rtTrim.ok && rtTrim.wl.sort === 'week' && rtTrim.wl.tsLabel === null && rtTrim.wl.mktLabel === null && rtTrim.wl.catLabel === null && rtTrim.wl.total === null && rtTrim.wl.ranked === 1, JSON.stringify(rtTrim.ok ? rtTrim.wl : rtTrim))
+ok('roundtrip: a title-only snapshot (no ranked lines) is refused', !parseWatchlist('iqOS yesterday watchlist · 2023-11-14 00:00 UTC · sort week · all markets · all classes · 0 rows').ok, JSON.stringify(parseWatchlist('iqOS yesterday watchlist · 0 rows')))
+const dupText = `${snapWeek}\n  9  AAA   90  2/3 70  L/N 80 Δ20  +1.20%`
+const rtDup = parseWatchlist(dupText)
+ok('roundtrip: a duplicate line keeps the best rank and does not double-count', rtDup.ok && rtDup.wl.ranked === 5 && rtDup.wl.assets[0] === 'AAA', `ranked=${rtDup.ok ? rtDup.wl.ranked : '-'} first=${rtDup.ok ? rtDup.wl.assets[0] : '-'}`)
+const shuffled = [
+  'iqOS yesterday watchlist · 2023-11-14 00:00 UTC · sort move · all markets · all classes · 2 rows',
+  '  #  asset   echo  move',
+  '   2  EURUSD-OTC   50  +0.50%',
+  '   1  JJJ   80  +0.80%',
+  'legend: rhyme = dir 50 + move-vs-travel 30',
+].join('\n')
+ok('roundtrip: ranks reorder the assets even in a hand-shuffled paste', parseWatchlist(shuffled).ok && JSON.stringify(parseWatchlist(shuffled).wl.assets) === JSON.stringify(['JJJ', 'EURUSD-OTC']), `got ${parseWatchlist(shuffled).ok ? parseWatchlist(shuffled).wl.assets.join(',') : '-'}`)
+ok('roundtrip: a -OTC ticker with hyphens parses as one asset', parseWatchlist(shuffled).ok && parseWatchlist(shuffled).wl.assets.includes('EURUSD-OTC'), JSON.stringify(parseWatchlist(shuffled).ok ? parseWatchlist(shuffled).wl.assets : '-'))
 
 console.log(`\n${pass} passed, ${fail} failed`)
 process.exit(fail > 0 ? 1 : 0)

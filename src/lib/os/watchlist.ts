@@ -1,8 +1,11 @@
 // IQAIR//OS - the yesterday watchlist: the ranking comparators behind the
-// panel's week/peak sorts plus the serializer that turns the current view
-// into a shareable text snapshot. ONE module on purpose: the panel sorts by
-// the very comparators that order the exported text, so the snapshot can
-// never disagree with the list on screen. Zero imports (structural row
+// panel's week/peak sorts, the serializer that turns the current view into
+// a shareable text snapshot, and the parser that reads a pasted snapshot
+// back into its view-shape. ONE module on purpose: the panel sorts by
+// the very comparators that order the exported text, and the parser reads
+// only what the serializer writes - so the snapshot can never disagree
+// with the list on screen and the roundtrip can never drift on one side
+// alone. Zero imports (structural row
 // types - anything shaped like the wire rows works), which keeps it
 // bundleable for the panel and directly testable under bun.
 
@@ -241,4 +244,86 @@ export function buildWatchlist(opts: {
     },
   )
   return [title, keyRow, ...dataRows, LEGEND].join('\n')
+}
+
+const TITLE_TAG = 'iqOS yesterday watchlist'
+const SORT_KINDS: readonly string[] = ['move', 'since', 'range', 'rhyme', 'week', 'peak']
+const COUNT_SEG = /^(top \d+ of \d+|\d+ rows?)$/
+
+/** What a pasted snapshot parses into - the view's SHAPE, never the
+ * numbers: the selection (ranked assets), the sort and the scope labels,
+ * plus the header's scan-time label and top-of counts for honest display.
+ * The receiver's panel re-reads every number from its own scan. */
+export interface WatchlistParse {
+  /** the snapshot's ranked assets, deduped (best rank kept), in rank order */
+  assets: string[]
+  /** the header's sort - null when absent or not one of the six kinds */
+  sort: WatchSort | null
+  /** the scan-time label exactly as the header carried it (display-only) */
+  tsLabel: string | null
+  /** market / class labels from the header - display-only: the selection IS
+   * the shared filter, the receiver's own chips stay untouched */
+  mktLabel: string | null
+  catLabel: string | null
+  /** the scan denominator of a "top N of M" header (null on a full view) */
+  total: number | null
+  /** unique ranked pairs the snapshot carries */
+  ranked: number
+}
+
+export type WatchlistParseResult =
+  | { ok: true; wl: WatchlistParse }
+  | { ok: false; why: string }
+
+/** Read a pasted watchlist back into its view-shape - the other half of
+ * buildWatchlist, living in the SAME module on purpose: the parser reads
+ * only what the serializer writes, so the format can never drift on one
+ * side alone. From the title it takes the scan-time label, the sort (only
+ * the six real kinds pass) and the scope segments between the sort and the
+ * count; from the body, lines shaped `NN  ASSET  ...` - the key row (#)
+ * and the indented script sub-lines carry no leading rank digits and the
+ * legend doesn't start with one, so nothing else can leak in as a row.
+ * Duplicates keep their best (lowest) rank; ranks reorder the assets, so
+ * even a hand-reordered paste ranks by what the text says. A trimmed or
+ * hand-edited header degrades honestly (nulls, not guesses); a text with
+ * no title or no ranked rows is refused with a reason. */
+export function parseWatchlist(text: string): WatchlistParseResult {
+  const lines = text.split('\n').map((l) => l.replace(/\s+$/, ''))
+  const title = lines.find((l) => l.includes(TITLE_TAG))
+  if (!title) return { ok: false, why: 'not an iqOS yesterday watchlist snapshot' }
+  const segs = title.split('·').map((s) => s.trim())
+  const iSort = segs.findIndex((s) => /^sort \S+$/.test(s))
+  const iCount = segs.findIndex((s) => COUNT_SEG.test(s))
+  const sortSeg = iSort >= 0 ? segs[iSort].slice(5) : null
+  const sort = sortSeg != null && SORT_KINDS.includes(sortSeg) ? (sortSeg as WatchSort) : null
+  const topM = iCount >= 0 ? segs[iCount].match(/^top (\d+) of (\d+)$/) : null
+  const rowsM = iCount >= 0 ? segs[iCount].match(/^(\d+) rows?$/) : null
+  const total = topM ? Number(topM[2]) : rowsM ? Number(rowsM[1]) : null
+  // the scope labels sit between the sort and the count segments - the
+  // serializer always writes both (defaulting to all markets / all classes)
+  const mktLabel = iSort >= 0 && iCount > iSort + 1 && segs[iSort + 1] ? segs[iSort + 1] : null
+  const catLabel = iSort >= 0 && iCount > iSort + 2 && segs[iSort + 2] ? segs[iSort + 2] : null
+  const tsM = title.match(/\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC/)
+  const best = new Map<string, number>()
+  for (const l of lines) {
+    const m = l.match(/^\s{0,3}(\d{1,3})\s{2}(\S+)(?:\s{2}|\s*$)/)
+    if (!m) continue
+    const idx = Number(m[1])
+    const prev = best.get(m[2])
+    if (prev === undefined || idx < prev) best.set(m[2], idx)
+  }
+  const assets = [...best.entries()].sort((a, b) => a[1] - b[1]).map(([a]) => a)
+  if (assets.length === 0) return { ok: false, why: 'the snapshot carries no ranked rows' }
+  return {
+    ok: true,
+    wl: {
+      assets,
+      sort,
+      tsLabel: tsM ? tsM[0] : null,
+      mktLabel,
+      catLabel,
+      total,
+      ranked: assets.length,
+    },
+  }
 }

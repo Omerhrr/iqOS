@@ -118,10 +118,24 @@
 // comparators and the serializer live in src/lib/os/watchlist.ts, and the
 // list on screen sorts by the very same code - the snapshot can never
 // disagree with the list.
+//
+// The loop closes through the PASTE button: a snapshot pasted back parses
+// into its view-shape (parseWatchlist lives in the same module that
+// serialized it, so the format can never drift on one side only) and rides
+// as a LENS over this panel's own scan. What travels is the selection (the
+// ranked assets) and the sort; every number re-reads from the receiver's
+// own data - a shared watchlist compares scripts, not numbers, and nothing
+// on screen can be stale. The lens pauses the filter chips (the selection
+// IS the shared filter), re-ranks the found pairs by the snapshot's sort
+// with the same not-live fallback the live chips use, counts pairs this
+// scan cannot see as skipped - never invented - and the scan params
+// (window, depth, by-session) stay live so the receiver can feed the lens
+// a deeper story. "back to live view" (or a class-chip click) drops the
+// lens and the chips come back exactly as they were left.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Timeframe, YesterdayRow, YdaySession } from '@/lib/os/client'
 import { TIMEFRAME_SECONDS, fmtPrice, getYesterday } from '@/lib/os/client'
-import { RHYME_OK, RHYME_BAD, cmpBySort, buildWatchlist, type WatchSort } from '@/lib/os/watchlist'
+import { RHYME_OK, RHYME_BAD, cmpBySort, buildWatchlist, parseWatchlist, type WatchSort, type WatchlistParse } from '@/lib/os/watchlist'
 
 interface YesterdayPanelProps {
   onClose: () => void
@@ -504,6 +518,12 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
   const [now, setNow] = useState(() => Date.now())
   const [copied, setCopied] = useState(false)
   const copyTimer = useRef<number | null>(null)
+  // the paste-import lens: a parsed snapshot (selection + sort + scope),
+  // the paste box toggle and its in-progress text/error
+  const [imported, setImported] = useState<WatchlistParse | null>(null)
+  const [pasteOpen, setPasteOpen] = useState(false)
+  const [pasteText, setPasteText] = useState('')
+  const [pasteErr, setPasteErr] = useState<string | null>(null)
 
   // the 24h lookback cannot fit the archive depth below 30s candles - say so
   // instead of round-tripping a 400 the operator can't act on
@@ -573,24 +593,68 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
     if (!weekLive && sort === 'week') setSort('rhyme')
     if (!profLive && sort === 'peak') setSort('rhyme')
   }, [weekLive, profLive, sort])
+
+  // the roundtrip lens (Task 19): a pasted snapshot contributes only its
+  // SHAPE - the ranked assets and the sort. The rows below re-match the
+  // assets against THIS scan on every poll (exact wire name first, then
+  // case-insensitive for a hand-typed paste), pairs the scan cannot see are
+  // counted as skipped and never invented, and the found rows re-rank by
+  // the snapshot's sort - falling back to the yesterday rhyme when this
+  // scan cannot feed it (week without priors, peak without profiles), the
+  // same fallback the live chips use. The lens list and the copy button
+  // share `viewRows`, so a re-exported snapshot can never disagree with
+  // what is on screen.
+  const importedRows = useMemo(() => {
+    if (!imported) return null
+    const all = data?.rows ?? []
+    const exact = new Map(all.map((r) => [r.asset, r]))
+    const fold = new Map(all.map((r) => [r.asset.toLowerCase(), r]))
+    const seen = new Set<string>()
+    const out: YesterdayRow[] = []
+    for (const a of imported.assets) {
+      const r = exact.get(a) ?? fold.get(a.toLowerCase())
+      if (r && !seen.has(r.asset)) {
+        seen.add(r.asset)
+        out.push(r)
+      }
+    }
+    return out
+  }, [imported, data])
+  let impSort: Sort | null = null
+  if (imported) {
+    const s = imported.sort
+    impSort = !s || (s === 'week' && !weekLive) || (s === 'peak' && !profLive) ? 'rhyme' : s
+  }
+  const viewRows = importedRows ? [...importedRows].sort(cmpBySort(impSort!)) : rows
+  const lensMissing = imported ? imported.ranked - viewRows.length : 0
   const otcLive = (data?.rows ?? []).filter((r) => r.otc).length
   const rhymeLive = (data?.rows ?? []).filter((r) => (r.echo?.rhyme ?? -1) >= RHYME_OK).length
   const catCount = (c: Cat) => (c === 'all' ? (data?.rows ?? []).length : (data?.rows ?? []).filter((r) => r.category === c).length)
   const ageSec = data ? Math.max(0, Math.round((now - data.ts) / 1000)) : 0
 
-  // the watchlist leaving the panel: serialize the CURRENT view (same
-  // filters, same sort) into a shareable text snapshot and copy it. The
-  // ordering comes from the very comparators the list on screen sorts by
+  // the watchlist leaving the panel: serialize the CURRENT view (the lens
+  // re-exports the imported selection through the same code - the snapshot's
+  // scope labels ride back out) into a shareable text snapshot and copy it.
+  // The ordering comes from the very comparators the list on screen sorts by
   // (src/lib/os/watchlist.ts) - the snapshot can never disagree with the
-  // list. Clipboard API first, textarea fallback for non-secure contexts.
+  // list, live or lensed. Clipboard API first, textarea fallback for
+  // non-secure contexts.
   const copyWatchlist = () => {
-    if (!data || rows.length === 0) return
+    if (!data || viewRows.length === 0) return
     const text = buildWatchlist({
-      rows,
-      sort,
+      rows: viewRows,
+      sort: imported ? impSort! : sort,
       tsMs: data.ts,
-      mktLabel: mkt === 'all' ? 'all markets' : mkt.toUpperCase(),
-      catLabel: cat === 'all' ? 'all classes' : cat,
+      mktLabel: imported
+        ? imported.mktLabel ?? 'all markets'
+        : mkt === 'all'
+          ? 'all markets'
+          : mkt.toUpperCase(),
+      catLabel: imported
+        ? imported.catLabel ?? 'all classes'
+        : cat === 'all'
+          ? 'all classes'
+          : cat,
     })
     const flash = () => {
       if (copyTimer.current != null) window.clearTimeout(copyTimer.current)
@@ -615,6 +679,25 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
     }
     if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).then(flash, fallback)
     else fallback()
+  }
+
+  // paste-import: parse the text, ride the lens on success, surface the
+  // parser's honest refusal inline (not an iqOS snapshot / no ranked rows)
+  const doImport = () => {
+    const res = parseWatchlist(pasteText)
+    if (!res.ok) {
+      setPasteErr(res.why)
+      return
+    }
+    setImported(res.wl)
+    setPasteOpen(false)
+    setPasteText('')
+    setPasteErr(null)
+  }
+  // drop the lens - the filter chips come back exactly as they were left
+  const exitImported = () => {
+    setImported(null)
+    setPasteErr(null)
   }
 
   // per-class rhyme averages - "are OTC pairs rhyming today?" at a glance.
@@ -776,7 +859,11 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
         </button>
       </div>
 
-      {/* search + market/class filters - same composition as the signals panel */}
+      {/* search + market/class filters - same composition as the signals
+          panel. Paused (hidden) while a pasted watchlist lens is on: the
+          snapshot's selection IS the shared filter, and the banner below
+          displays its scope. */}
+      {!imported && (
       <div className="flex items-center gap-1 border-b border-[#1c2739] px-2 py-1">
         <div className="relative min-w-0 flex-1">
           <input
@@ -851,9 +938,14 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
           )
         })}
       </div>
+      )}
 
-      {/* direction + echo filter + sort - "show me what pumped at this hour, and where today repeats it" */}
+      {/* direction + echo filter + sort - "show me what pumped at this hour, and where today repeats it".
+          The three chips pause (hidden) while a pasted watchlist lens is on -
+          the snapshot's own sort re-ranks the selection instead. */}
       <div className="flex flex-wrap items-center gap-2 border-b border-[#1c2739] px-2 py-1">
+        {!imported && (
+        <>
         <div className="flex shrink-0 overflow-hidden rounded border border-[#1c2739]" role="group" aria-label="direction filter">
           {(
             [
@@ -935,6 +1027,8 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
             )
           })}
         </div>
+        </>
+        )}
         <button
           type="button"
           onClick={() => setProfOn((v) => !v)}
@@ -948,19 +1042,116 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
         <button
           type="button"
           onClick={copyWatchlist}
-          disabled={!data || rows.length === 0}
+          disabled={!data || viewRows.length === 0}
           className={`shrink-0 rounded border px-1.5 py-0.5 font-mono text-[8.5px] font-bold uppercase tracking-wider transition-colors ${
             copied
               ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
-              : !data || rows.length === 0
+              : !data || viewRows.length === 0
                 ? 'cursor-not-allowed border-[#1c2739] text-[#2a3648]'
                 : 'border-[#1c2739] text-[#4b5a72] hover:text-[#aab6cc]'
           }`}
-          title="copy the current view as a shareable text watchlist - the same filters and the same sort, top 10 rows, one line each (echo rhyme, week aggregate rhymed/kept + avg, peak session with its spread, window move) under a header recording the scan time, the sort and the filters. Rows with a measured profile grow an indented script sub-line (the full session averages - the shape travels, not just the peak). Quiet echoes are marked q and excluded from the aggregates exactly as on screen; off-hours cells are marked off* (the legend spells the caveat out)."
+          title="copy the current view as a shareable text watchlist - the same filters and the same sort, top 10 rows, one line each (echo rhyme, week aggregate rhymed/kept + avg, peak session with its spread, window move) under a header recording the scan time, the sort and the filters. Rows with a measured profile grow an indented script sub-line (the full session averages - the shape travels, not just the peak). Quiet echoes are marked q and excluded from the aggregates exactly as on screen; off-hours cells are marked off* (the legend spells the caveat out). While an imported lens is on, the copy re-serializes the lensed selection through the same code - the snapshot's scope rides back out. The paste button takes a snapshot in: same pairs, same sort, numbers re-read from the receiving panel's own scan."
         >
           {copied ? 'copied' : 'copy'}
         </button>
+        <button
+          type="button"
+          onClick={() => setPasteOpen((v) => !v)}
+          className={`shrink-0 rounded border px-1.5 py-0.5 font-mono text-[8.5px] font-bold uppercase tracking-wider transition-colors ${
+            pasteOpen
+              ? 'border-violet-500/40 bg-violet-500/15 text-violet-300'
+              : 'border-[#1c2739] text-[#4b5a72] hover:text-[#aab6cc]'
+          }`}
+          title="paste a copied watchlist back in - the snapshot's ranked pairs and its sort ride again as a lens over THIS scan: every number re-reads from the panel's own data (a shared watchlist compares scripts, not numbers), pairs missing from the current scan are counted as skipped, never invented. The filter chips pause while the lens is on; the scan params (window, depth, by session) stay live. 'back to live view' drops the lens."
+        >
+          paste
+        </button>
       </div>
+
+      {/* paste-import box - takes a snapshot text back in */}
+      {pasteOpen && (
+        <div className="border-b border-[#1c2739] px-2 py-1.5">
+          <textarea
+            value={pasteText}
+            onChange={(e) => {
+              setPasteText(e.target.value)
+              setPasteErr(null)
+            }}
+            onKeyDown={(e) => e.key === 'Escape' && setPasteOpen(false)}
+            rows={5}
+            spellCheck={false}
+            placeholder="paste an iqOS yesterday watchlist here - the copy button's text, header through legend. Extra lines are fine: the parser reads the title and the ranked rows, nothing else."
+            className="w-full resize-y rounded border border-[#1c2739] bg-[#101828] p-1.5 font-mono text-[9px] leading-relaxed text-[#e2e8f0] placeholder-[#3d4d66] outline-none focus:border-violet-500/50"
+          />
+          <div className="mt-1 flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={doImport}
+              disabled={!pasteText.trim()}
+              className={`rounded border px-1.5 py-0.5 font-mono text-[8.5px] font-bold uppercase tracking-wider transition-colors ${
+                pasteText.trim()
+                  ? 'border-violet-500/40 text-violet-300 hover:bg-violet-500/10'
+                  : 'cursor-not-allowed border-[#1c2739] text-[#2a3648]'
+              }`}
+              title="parse the pasted text - the header's sort and the ranked pairs become a lens over the current scan"
+            >
+              import
+            </button>
+            <button
+              type="button"
+              onClick={() => setPasteOpen(false)}
+              className="rounded border border-[#1c2739] px-1.5 py-0.5 font-mono text-[8.5px] font-bold uppercase tracking-wider text-[#7c8aa5] hover:text-rose-300"
+            >
+              cancel
+            </button>
+            {pasteErr && <span className="text-[9px] text-rose-400">{pasteErr}</span>}
+          </div>
+        </div>
+      )}
+
+      {/* imported watchlist lens - the pasted snapshot's shape riding over
+          this scan: selection + sort travel, numbers re-read locally */}
+      {imported && (
+        <div className="flex flex-wrap items-center gap-1.5 border-b border-violet-500/20 bg-violet-500/5 px-2 py-1" role="status" aria-label="imported watchlist">
+          <span
+            className="rounded border border-violet-500/40 bg-violet-500/10 px-1 py-px font-mono text-[8px] font-bold uppercase text-violet-300"
+            title="a pasted snapshot rides as a lens: the SELECTION and the SORT travel, every number re-reads from this panel's own scan - the paste carries no numbers, so nothing here can be stale. Filter chips are paused (the selection IS the shared filter); the scan params above stay live and the found set re-matches on every poll."
+          >
+            imported
+          </span>
+          <span
+            className="font-mono text-[9px] text-[#aab6cc]"
+            title={
+              imported.sort && imported.sort !== impSort
+                ? `the snapshot was ranked by ${imported.sort}, which this scan cannot feed (week needs prior days, peak needs the by-session profile) - the lens re-ranks by the yesterday rhyme instead, the same fallback the live chips use`
+                : `the lens re-ranks the found pairs by the snapshot's ${impSort} sort - the same comparator the live list uses, so a re-export can never disagree with what is on screen`
+            }
+          >
+            {imported.tsLabel ?? 'scan ?'} · sort {impSort}
+            {imported.sort && imported.sort !== impSort ? ` (snapshot asked ${imported.sort})` : ''} · {imported.mktLabel ?? 'all markets'} · {imported.catLabel ?? 'all classes'}
+          </span>
+          <span className="font-mono text-[9px] text-[#4b5a72]">
+            {viewRows.length}/{imported.ranked} pairs in this scan
+            {imported.total != null ? ` · snapshot top ${imported.ranked} of ${imported.total}` : ''}
+          </span>
+          {lensMissing > 0 && (
+            <span
+              className="font-mono text-[9px] text-amber-300/80"
+              title="pairs the current scan doesn't cover (universe, market or timeframe differs) are skipped - a lens never invents a row"
+            >
+              {lensMissing} skipped
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={exitImported}
+            className="ml-auto shrink-0 rounded border border-[#1c2739] px-1.5 py-0.5 font-mono text-[8.5px] font-bold uppercase tracking-wider text-[#7c8aa5] hover:border-rose-500/40 hover:text-rose-300"
+            title="drop the lens - the filter chips and the live sort come back exactly as you left them"
+          >
+            back to live view
+          </button>
+        </div>
+      )}
 
       {/* rhyme by class - the portfolio-level answer to "is today repeating
           yesterday's script" per asset class, not just per pair */}
@@ -994,6 +1185,9 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
                     ? 'text-amber-300/80'
                     : 'text-rose-300/80'
             const click = () => {
+              // a filter affordance: in lens mode it drops the lens first -
+              // the clicked class filter then applies to the live view
+              exitImported()
               if (key === 'otc') {
                 setMkt('otc')
                 setCat('all')
@@ -1050,6 +1244,9 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
           {classScript.map(({ key, label, why, rows, cells }) => {
             if (!cells.some((c) => c.obs > 0)) return null
             const click = () => {
+              // a filter affordance: in lens mode it drops the lens first -
+              // the clicked class filter then applies to the live view
+              exitImported()
               if (key === 'otc') {
                 setMkt('otc')
                 setCat('all')
@@ -1099,9 +1296,11 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
             The 24h lookback cannot fit the archive depth on {tf} candles (a day of {tf} bars is far beyond the 4000-bar history) - switch the chart to 30s or coarser and the panel follows.
           </div>
         )}
-        {!error && tfSupported && rows.length === 0 && (
+        {!error && tfSupported && viewRows.length === 0 && (
           <div className="p-2 text-[10px] leading-relaxed text-[#4b5a72]">
-            {data ? (
+            {imported ? (
+              `None of the snapshot's ${imported.ranked} pair${imported.ranked === 1 ? '' : 's'} is in this scan - the universe, market or timeframe that produced them differs. The lens invents no rows; back to live view restores your chips.`
+            ) : data ? (
               (data.rows ?? []).length > 0 ? (
                 `No rows match the current filter - ${data.rows.length} row${data.rows.length === 1 ? '' : 's'} scanned${mkt !== 'all' ? ` · market ${mkt.toUpperCase()}` : ''}${cat !== 'all' ? ` · class ${cat}` : ''}${dirF !== 'all' ? ` · direction ${dirF}` : ''}${echoF !== 'all' ? ` · echo ${echoF}` : ''}${effDays > 1 ? ` · depth ${effDays}d` : ''}${needle ? ` · search "${query.trim()}"` : ''}. Clear the search or loosen the chips.`
               ) : (
@@ -1112,12 +1311,12 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
             )}
           </div>
         )}
-        {rows.map((r) => (
+        {viewRows.map((r) => (
           <RowCard key={r.asset} r={r} onSelectAsset={onSelectAsset} onFocusWindow={onFocusWindow} windowMin={data?.windowMin ?? windowMin} />
         ))}
         {data && data.rows.length > 0 && (
           <p className="px-1 pt-1 text-[8.5px] leading-relaxed text-[#3d4d66]">
-            Each row is the window that started at the bar forming exactly 24h ago, on the chart's timeframe. dir counts as up/down only when the net move exceeds 10% of the window's own travel. "arch" = bars from the kernel's accumulated store (broker bars in live mode), "seeded" = the feed's deterministic prehistory - never mistake a seeded yesterday for a remembered one. echo compares the lead-in windows ending at this same time of day (yesterday's ended at the anchor, today's within one bar of now): rhyme = direction 50 + move-vs-travel 30 + travel ratio 20, 70+ reads as "repeating the script", under 40 as "going its own way"; a rhyme between two FLAT lead-ins (net move under 10% of travel on both sides) is marked "quiet" - real but trivial, excluded from every aggregate. The rhyme-by-class strip averages each class's echo scores (compared rows only) - "are OTC pairs rhyming today?" is one glance away, and once the scan walks deeper than 1d each chip grows a ⟳ week number averaging every non-quiet echoed day-observation in class - "are they rhyming with the whole week, or only with yesterday?". Click a card to open that asset on the chart; click an echo chip to go further - the chart deep-loads the asset's full day of candles and scrolls onto yesterday's lead-in plus the forward replay window (edges the feed never remembered show as a gap, not filler). The day chips walk the same window further back - the "at this hour" strip shows each remembered day with its own coverage (days the series cannot cover are absent, not flat), each day's rhyme tag scores today's lead-in against THAT day's lead-in, and the "N/M rhyme" aggregate counts the days today actually rhymed with (70+, non-quiet comparisons) among the compared ones. The week sort orders the list by exactly that count - the strongest week rhymes float to the top (average rhyme breaking ties, biggest window move after that, quiet rhymes not counting), turning the panel into a best-echoes watchlist. The "by session" toggle goes one question deeper: the kernel re-scores the same adjacent-day lead-in echo at every hour of the day and averages it per trading session, so each row grows a "script" line - rhymes in London but not off-hours, or the reverse - with quiet echoes excluded from the averages and -OTC pairs collapsed into one day-wide bucket (they have no sessions). With the toggle on, the rhyme-by-class strip gains a sibling: script by class - each class's session averages folded across its rows (weighted by observations, quiet excluded), the OTC column separating the synthetic twins' day-wide script from the clock-bound classes'. The peak sort turns the script into a watchlist: the pair whose BEST session (2+ non-quiet observations) rhymes hardest floats to the top, the spread between best and worst qualified session breaking ties - and the script line marks the peak session bold beside a spread tag, so "trade it only where it rhymes" reads without the sort. Off-hours averages sit under a dotted underline (script line and class strip alike): those hours are outside the named sessions, where the books are thin - the rhyme is real, quiet pairs are already excluded, but weight it accordingly; the copy button marks such a peak off* in the snapshot and the legend spells it out. The copy button serializes exactly what you see - the same filters and sort, the top 10 rows as a text snapshot (echo rhyme, week aggregate, peak session, window move) headed by the scan time, the sort and the filters - and every row with a measured profile grows an indented script sub-line carrying its full session averages, so the shape of the script travels with the paste, not just the peak - ready to paste anywhere.
+            Each row is the window that started at the bar forming exactly 24h ago, on the chart's timeframe. dir counts as up/down only when the net move exceeds 10% of the window's own travel. "arch" = bars from the kernel's accumulated store (broker bars in live mode), "seeded" = the feed's deterministic prehistory - never mistake a seeded yesterday for a remembered one. echo compares the lead-in windows ending at this same time of day (yesterday's ended at the anchor, today's within one bar of now): rhyme = direction 50 + move-vs-travel 30 + travel ratio 20, 70+ reads as "repeating the script", under 40 as "going its own way"; a rhyme between two FLAT lead-ins (net move under 10% of travel on both sides) is marked "quiet" - real but trivial, excluded from every aggregate. The rhyme-by-class strip averages each class's echo scores (compared rows only) - "are OTC pairs rhyming today?" is one glance away, and once the scan walks deeper than 1d each chip grows a ⟳ week number averaging every non-quiet echoed day-observation in class - "are they rhyming with the whole week, or only with yesterday?". Click a card to open that asset on the chart; click an echo chip to go further - the chart deep-loads the asset's full day of candles and scrolls onto yesterday's lead-in plus the forward replay window (edges the feed never remembered show as a gap, not filler). The day chips walk the same window further back - the "at this hour" strip shows each remembered day with its own coverage (days the series cannot cover are absent, not flat), each day's rhyme tag scores today's lead-in against THAT day's lead-in, and the "N/M rhyme" aggregate counts the days today actually rhymed with (70+, non-quiet comparisons) among the compared ones. The week sort orders the list by exactly that count - the strongest week rhymes float to the top (average rhyme breaking ties, biggest window move after that, quiet rhymes not counting), turning the panel into a best-echoes watchlist. The "by session" toggle goes one question deeper: the kernel re-scores the same adjacent-day lead-in echo at every hour of the day and averages it per trading session, so each row grows a "script" line - rhymes in London but not off-hours, or the reverse - with quiet echoes excluded from the averages and -OTC pairs collapsed into one day-wide bucket (they have no sessions). With the toggle on, the rhyme-by-class strip gains a sibling: script by class - each class's session averages folded across its rows (weighted by observations, quiet excluded), the OTC column separating the synthetic twins' day-wide script from the clock-bound classes'. The peak sort turns the script into a watchlist: the pair whose BEST session (2+ non-quiet observations) rhymes hardest floats to the top, the spread between best and worst qualified session breaking ties - and the script line marks the peak session bold beside a spread tag, so "trade it only where it rhymes" reads without the sort. Off-hours averages sit under a dotted underline (script line and class strip alike): those hours are outside the named sessions, where the books are thin - the rhyme is real, quiet pairs are already excluded, but weight it accordingly; the copy button marks such a peak off* in the snapshot and the legend spells it out. The copy button serializes exactly what you see - the same filters and sort, the top 10 rows as a text snapshot (echo rhyme, week aggregate, peak session, window move) headed by the scan time, the sort and the filters - and every row with a measured profile grows an indented script sub-line carrying its full session averages, so the shape of the script travels with the paste, not just the peak - ready to paste anywhere. The paste button closes the loop the copy opens: paste a snapshot back and its ranked pairs plus its sort ride again as a LENS over your own scan - the selection and the sort travel, every number re-reads from local data (a shared watchlist compares scripts, not numbers), pairs the local scan cannot see are counted as skipped rather than invented, the filter chips pause while the lens is on, and "back to live view" (or a class-chip click) hands control straight back.
           </p>
         )}
       </div>
