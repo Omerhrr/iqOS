@@ -461,6 +461,15 @@ export async function getCandles(
 export type YdayDir = 'up' | 'down' | 'none'
 export type YdaySession = 'ASIA' | 'LONDON' | 'OVERLAP' | 'NEWYORK' | 'OFF' | 'OTC'
 
+/** The per-prior-day echo: today's lead-in vs THAT day's lead-in, same
+ * three-part rhyme score as the row echo. Kernel sends null when either side
+ * is under half covered; optional on the wire so an older kernel still parses. */
+export interface YdayPriorEcho {
+  /** 0..100 - direction agreement (50) + move magnitude vs this day's own travel (30) + travel ratio (20) */
+  rhyme: number
+  dirAgree: 'same' | 'partial' | 'opposite'
+}
+
 /** One remembered day BEFORE yesterday (T-48h, T-72h, ...): the same forward
  * window. Days whose coverage failed the >= half gate are ABSENT - gaps are
  * information. Optional on the wire so an older kernel still parses. */
@@ -478,6 +487,9 @@ export interface YdayPrior {
   barsExpected: number
   /** session the market was in at that moment */
   session: YdaySession
+  /** today's lead-in vs this day's lead-in ("does today rhyme with the whole
+   * week at this hour?"); null/absent = either side under half covered */
+  echo?: YdayPriorEcho | null
 }
 
 /** The window leading INTO the moment (same length as the replay window),

@@ -129,6 +129,36 @@ if (row) {
   ok('thin prior day dropped', thinPrior === null, JSON.stringify(thinPrior))
   // days=1 default: rows carry an empty prior
   ok('default row.prior empty', Array.isArray(row?.prior) && row.prior.length === 0, JSON.stringify(row?.prior))
+
+  // ---- prior-day ECHO: today's lead-in vs THAT day's lead-in ----
+  // In `sparse` the T-48h FORWARD window is covered but its LEAD-IN
+  // ([t0-DAY-WIN, t0-DAY)) is absent -> PriorDay present, echo null (a
+  // missing comparison is honest, not an error).
+  const pdSparse = buildPriorDay(info, sparse, { nowSec, windowSec: WIN, tfSec: TF, back: 2, todayLeadIn: null })
+  ok('sparse prior built without today lead-in', pdSparse !== null && pdSparse.echo === null, JSON.stringify(pdSparse?.echo))
+  // engineered T-48h lead-ins compared against TODAY's lead-in (+0.40%, 0.80%):
+  //   identical lead-in -> dir 50 + mag 30 + vol 20 = 100, 'same'
+  //   opposite (-0.40%, same travel) -> 0 + 30*(1-0.8/0.8) + 20 = 20, 'opposite'
+  //   thin prior lead-in (18 of 60 bars) -> echo null, forward window still fine
+  const todayStats = { movePct: 0.4, rangePct: 0.8, dir: 'up' }
+  const priorLeadUp = run(t0 - DAY - WIN, WIN / TF, base, 0.4, 0.8)
+  const priorLeadDown = run(t0 - DAY - WIN, WIN / TF, base, -0.4, 0.8)
+  const prior2Fwd = run(t0 - DAY, WIN / TF, base, 0.01, 0.02)
+  const pdUp = buildPriorDay(info, [...priorLeadUp, ...prior2Fwd, ...sparse].sort((a, b) => a.time - b.time), { nowSec, windowSec: WIN, tfSec: TF, back: 2, todayLeadIn: { stats: todayStats, barsFound: 60 } })
+  ok('prior echo 100 on identical lead-ins', pdUp?.echo?.rhyme === 100 && pdUp?.echo?.dirAgree === 'same', JSON.stringify(pdUp?.echo))
+  const pdDown = buildPriorDay(info, [...priorLeadDown, ...prior2Fwd, ...sparse].sort((a, b) => a.time - b.time), { nowSec, windowSec: WIN, tfSec: TF, back: 2, todayLeadIn: { stats: todayStats, barsFound: 60 } })
+  ok('prior echo 20 on opposite-dir same-travel', pdDown?.echo?.rhyme === 20 && pdDown?.echo?.dirAgree === 'opposite', JSON.stringify(pdDown?.echo))
+  const pdThin = buildPriorDay(info, [...priorLeadUp.slice(0, 18), ...prior2Fwd, ...sparse].sort((a, b) => a.time - b.time), { nowSec, windowSec: WIN, tfSec: TF, back: 2, todayLeadIn: { stats: todayStats, barsFound: 60 } })
+  ok('prior echo null when the prior lead-in is thin', pdThin !== null && pdThin.echo === null, JSON.stringify(pdThin?.echo))
+  // through the row: priorDays=1 wires today's lead-in automatically - the
+  // remembered day carries its echo; with TODAY's side thin (variant C), the
+  // prior echo is null too (today is the weak side in every comparison)
+  const rowPriorEcho = buildYesterdayRow(info, [...priorLeadUp, ...prior2Fwd, ...sparse].sort((a, b) => a.time - b.time), { ...opts, priorDays: 1 })
+  ok('row path: prior echo wired from today lead-in', rowPriorEcho?.prior[0]?.echo?.rhyme === 100 && rowPriorEcho?.prior[0]?.echo?.dirAgree === 'same', JSON.stringify(rowPriorEcho?.prior[0]?.echo))
+  ok('row path: prior anchor is exactly t0 - DAY', rowPriorEcho?.prior[0]?.thenTs === t0 - DAY, `thenTs=${rowPriorEcho?.prior[0]?.thenTs} expected=${t0 - DAY}`)
+  const seriesThinToday = [...ydayLead, ...ydayFwd, ...thin, ...tail]
+  const rowThinToday = buildYesterdayRow(info, [...priorLeadUp, ...prior2Fwd, ...seriesThinToday].sort((a, b) => a.time - b.time), { ...opts, priorDays: 1 })
+  ok('thin today side silences the prior echo too', rowThinToday?.prior[0]?.echo === null, JSON.stringify(rowThinToday?.prior[0]?.echo))
 }
 
 console.log(`\n${pass} passed, ${fail} failed`)

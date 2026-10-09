@@ -21,8 +21,13 @@
 // started at T-48h, T-72h, ... per row, gated by the same coverage rule.
 // A day the series cannot honestly cover is ABSENT from the strip (a gap,
 // labeled by how far back it is) - never a thin move dressed up as a story.
-// Depth is bounded by the same lookback the row already pulls, so finer
-// candles remember fewer days: the archive-depth gate refuses the rest.
+// Each remembered day also carries its own ECHO: today's lead-in vs THAT
+// day's lead-in - "does today rhyme with the whole week at this hour?" - so
+// the strip can show whether the rhyme held across the week or only matched
+// yesterday. Depth is bounded by the same lookback the row already pulls
+// (days*24h + 2x window covers every prior lead-in with a window of slack),
+// so finer candles remember fewer days: the archive-depth gate refuses the
+// rest.
 //
 // Honesty rules this module enforces:
 // - the story is built ONLY from bars actually present in the series; a row
@@ -66,6 +71,16 @@ export interface YesterdayEcho {
   rhyme: number
 }
 
+/** The per-prior-day echo: today's lead-in vs THAT day's lead-in, scored
+ * with the same rhymeScore as the main echo. null when either side is under
+ * half covered. Small by design - the moves already live on the PriorDay. */
+export interface PriorEcho {
+  /** 0..100 - same three-part score as YesterdayEcho (direction 50 + move
+   * delta vs this day's own travel 30 + travel ratio 20) */
+  rhyme: number
+  dirAgree: YesterdayEcho['dirAgree']
+}
+
 /** One remembered day BEFORE yesterday: the same forward window starting at
  * T-24h*back. Only days whose coverage passes the same >= half gate are
  * reported - gaps in the strip mean the market was dark or the series does
@@ -84,6 +99,9 @@ export interface PriorDay {
   barsExpected: number
   /** session the market was in at that moment */
   session: Session
+  /** today's lead-in vs this day's lead-in (see PriorEcho); null = either
+   * side under half covered - no comparison instead of a fake one */
+  echo: PriorEcho | null
 }
 
 export interface YesterdayRow {
@@ -202,11 +220,13 @@ function rhymeScore(sy: WinStats, st: WinStats): { rhyme: number; dirAgree: Yest
  * honestly cover that window (same >= half gate as the main row). `back`
  * counts whole days: 2 = T-48h, 3 = T-72h. Shares windowStats and the dir
  * rule with the main row so a "down" in the strip means exactly what a
- * "down" on the row means. */
+ * "down" on the row means. When `todayLeadIn` is supplied (today's side of
+ * the comparison, covered) the day also carries its own echo: today's
+ * lead-in vs this day's lead-in, scored with the same rhymeScore. */
 export function buildPriorDay(
   info: YesterdayInfo,
   candles: Candle[],
-  opts: { nowSec: number; windowSec: number; tfSec: number; back: number },
+  opts: { nowSec: number; windowSec: number; tfSec: number; back: number; todayLeadIn?: { stats: WinStats; barsFound: number } | null },
 ): PriorDay | null {
   const target = opts.nowSec - DAY_SEC * opts.back
   const t0 = target - (target % opts.tfSec)
@@ -216,6 +236,21 @@ export function buildPriorDay(
   if (win.length < minBars) return null
   const st = windowStats(win)
   if (!st) return null
+  // PRIOR ECHO: the lead-in window ending exactly at this day's anchor - the
+  // wall-clock twin of the lead-in the main echo compares against. Both sides
+  // must clear the same coverage gate; rhymeScore(older, today) keeps the
+  // argument order of the main echo (older day = the reference side).
+  let echo: PriorEcho | null = null
+  if (opts.todayLeadIn) {
+    const backP = candles.filter((c) => c.time >= t0 - opts.windowSec && c.time < t0)
+    if (backP.length >= minBars) {
+      const sy = windowStats(backP)
+      if (sy) {
+        const { rhyme, dirAgree } = rhymeScore(sy, opts.todayLeadIn.stats)
+        echo = { rhyme, dirAgree }
+      }
+    }
+  }
   return {
     back: opts.back,
     thenTs: t0,
@@ -225,6 +260,7 @@ export function buildPriorDay(
     barsFound: win.length,
     barsExpected,
     session: classifySession(t0, info.ticker),
+    echo,
   }
 }
 
@@ -268,20 +304,23 @@ export function buildYesterdayRow(info: YesterdayInfo, candles: Candle[], opts: 
   // yesterday's ends exactly at the anchor, today's at anchor + 24h which is
   // always <= now (the anchor bucket never lands after the scan moment).
   // Either side under half covered -> no comparison rather than a fake one.
+  // Today's side is computed once and shared with the prior-day echoes (every
+  // one of them compares against the SAME today lead-in).
   let echo: YesterdayEcho | null = null
   const backY = candles.filter((c) => c.time >= t0 - opts.windowSec && c.time < t0)
   const todayEnd = t0 + DAY_SEC
   const backT = candles.filter((c) => c.time >= todayEnd - opts.windowSec && c.time < todayEnd)
-  if (backY.length >= minBars && backT.length >= minBars) {
+  const todayStats = windowStats(backT)
+  const todayLeadIn = todayStats && backT.length >= minBars ? { stats: todayStats, barsFound: backT.length } : null
+  if (backY.length >= minBars && todayLeadIn) {
     const sy = windowStats(backY)
-    const st = windowStats(backT)
-    if (sy && st) {
-      const { rhyme, dirAgree } = rhymeScore(sy, st)
+    if (sy) {
+      const { rhyme, dirAgree } = rhymeScore(sy, todayStats!)
       echo = {
         ydayMovePct: r4(sy.movePct),
         ydayRangePct: r4(sy.rangePct),
-        todayMovePct: r4(st.movePct),
-        todayRangePct: r4(st.rangePct),
+        todayMovePct: r4(todayStats!.movePct),
+        todayRangePct: r4(todayStats!.rangePct),
         todayBarsFound: backT.length,
         dirAgree,
         rhyme,
@@ -291,9 +330,11 @@ export function buildYesterdayRow(info: YesterdayInfo, candles: Candle[], opts: 
 
   // PRIOR days: T-48h, T-72h, ... same window, same gates. Absent days are
   // honest gaps (market dark / series does not reach), never thin moves.
+  // Each covered day also carries its echo vs today's lead-in when today's
+  // side is itself covered.
   const prior: PriorDay[] = []
   for (let back = 2; back <= 1 + (opts.priorDays ?? 0); back++) {
-    const d = buildPriorDay(info, candles, { nowSec: opts.nowSec, windowSec: opts.windowSec, tfSec: opts.tfSec, back })
+    const d = buildPriorDay(info, candles, { nowSec: opts.nowSec, windowSec: opts.windowSec, tfSec: opts.tfSec, back, todayLeadIn })
     if (d) prior.push(d)
   }
 

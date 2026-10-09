@@ -82,7 +82,8 @@ export class YesterdayService {
   /** Quantized request plan: window snapped to whole bars of the tf (>= 1
    * bar), plus whether the days*24h + 2x window lookback (the echo's lead-in
    * windows reach a window before the newest anchor; prior days stack whole
-   * days on top) fits the archive depth. */
+   * days on top, and each prior day's OWN echo needs its lead-in - one window
+   * of slack, already in the bound) fits the archive depth. */
   static plan(tf: Timeframe, windowMin: number, days = 1): { windowSec: number; windowMin: number; ok: boolean; needed: number } {
     const tfSec = TIMEFRAME_SECONDS[tf]
     const windowSec = Math.max(1, Math.floor((Math.max(1, windowMin) * 60) / tfSec)) * tfSec

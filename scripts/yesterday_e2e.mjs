@@ -136,6 +136,25 @@ if (d3withPrior.length > 0) {
   ok('prior day anchored at T-48h (5m buckets)', Math.abs(p0.thenTs - exp2) <= 300, `thenTs=${p0.thenTs} expected~${exp2}`)
 }
 ok('gaps allowed but backs only 2..3', d3rows.every((r) => (r.prior ?? []).every((p, i, arr) => p.back >= 2 && p.back <= 3 && (i === 0 || arr[i - 1].back < p.back))))
+
+// prior-day echo: today's lead-in vs THAT day's lead-in - well-formed when
+// present, absent (null) is honest, and present on the warmed sim universe
+// whose prehistory covers the prior lead-ins
+ok('prior echoes well-formed when present', d3rows.every((r) => (r.prior ?? []).every((p) =>
+  p.echo === null || p.echo === undefined ||
+  (Number.isInteger(p.echo.rhyme) && p.echo.rhyme >= 0 && p.echo.rhyme <= 100 &&
+    ['same', 'partial', 'opposite'].includes(p.echo.dirAgree)),
+)))
+const d3priorEntries = d3rows.flatMap((r) => r.prior ?? [])
+const d3priorEchoed = d3priorEntries.filter((p) => p.echo != null)
+ok('prior echoes present on most remembered days (sim prehistory covers)', d3priorEntries.length > 0 && d3priorEchoed.length >= Math.floor(d3priorEntries.length * 0.7), `echoed=${d3priorEchoed.length}/${d3priorEntries.length}`)
+// rhyme arithmetic bounds by dirAgree: same = 50 dir pts + 0..50 -> >=50,
+// opposite = 0 dir pts + <=30 + <=20 -> <=50, partial = 25 + 0..50 -> 25..75
+ok('prior rhyme arithmetic consistent with dirAgree', d3priorEchoed.every((p) =>
+  (p.echo.dirAgree === 'same' ? p.echo.rhyme >= 50 : true) &&
+  (p.echo.dirAgree === 'opposite' ? p.echo.rhyme <= 50 : true) &&
+  (p.echo.dirAgree === 'partial' ? p.echo.rhyme >= 25 && p.echo.rhyme <= 75 : true),
+))
 // clamp: 99 -> 7 (5m fits a week), depth gate: 1m + 3d needs 4442 bars > 4000
 const d7 = await get('/yesterday?tf=5m&days=99')
 ok('days clamped to 7', d7.status === 200 && d7.body.days === 7, `days=${d7.body.days}`)
@@ -143,6 +162,7 @@ const tooDeep = await get('/yesterday?tf=1m&days=3')
 ok('1m days=3 refused by the depth gate', tooDeep.status === 400 && /depth|reach/.test(tooDeep.body.error ?? ''), JSON.stringify(tooDeep.body).slice(0, 160))
 const d2m1 = await get('/yesterday?tf=1m&days=2')
 ok('1m days=2 fits and answers', d2m1.status === 200 && d2m1.body.days === 2 && (d2m1.body.rows ?? []).every((r) => (r.prior ?? []).length <= 1), `status=${d2m1.status}`)
+ok('1m days=2 prior echoes bounded', (d2m1.body.rows ?? []).every((r) => (r.prior ?? []).every((p) => p.echo == null || (p.echo.rhyme >= 0 && p.echo.rhyme <= 100))))
 
 // ---------- cache + window param ----------
 const [c1, c2] = await Promise.all([get('/yesterday?tf=1m'), get('/yesterday?tf=1m')])

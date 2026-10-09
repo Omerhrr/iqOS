@@ -37,6 +37,13 @@
 // (kernel /candles deep=1 - archive + live tail, never synthetic filler) and
 // scrolls the time scale onto yesterday's lead-in plus the forward replay
 // window. The scroll applies once per click, only after the deep bars land.
+//
+// The WEEK-RHYME aggregate ("at this hour ... ⟳ 2/3 rhyme") asks whether the
+// rhyme held across the week or only matched yesterday: every remembered day
+// carries its own echo (today's lead-in vs THAT day's lead-in, kernel-side,
+// same coverage gates), the strip tags each day with its score, and the
+// aggregate counts days scoring 70+ among the compared ones (yesterday's own
+// echo included). No-echo days are excluded, never scored zero.
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { Timeframe, YesterdayRow } from '@/lib/os/client'
 import { TIMEFRAME_SECONDS, fmtPrice, getYesterday } from '@/lib/os/client'
@@ -260,12 +267,18 @@ function RowCard({ r, onSelectAsset, onFocusWindow, windowMin }: { r: YesterdayR
 /** The same-hour history strip: how this exact hour behaved across the
  * remembered days before yesterday. Gaps are absent days (dark market /
  * series does not reach), not flat days - the count includes yesterday's
- * replay window so "3/4 up" reads as a week-level seasonality stat. */
+ * replay window so "3/4 up" reads as a week-level seasonality stat. Each
+ * remembered day also carries its own rhyme tag (today's lead-in vs THAT
+ * day's lead-in), and the aggregate "N/M rhyme" says whether the rhyme held
+ * across the week or only matched yesterday - compared days only, never
+ * zero-filled. */
 function PriorStrip({ r }: { r: YesterdayRow }) {
   const prior = r.prior ?? []
   if (prior.length === 0) return null
   const days = prior.length + 1
   const ups = prior.filter((p) => p.dir === 'up').length + (r.dir === 'up' ? 1 : 0)
+  const echoes = [r.echo?.rhyme, ...prior.map((p) => p.echo?.rhyme)].filter((x): x is number => x != null)
+  const rhymed = echoes.filter((x) => x >= RHYME_OK).length
   return (
     <div className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 font-mono text-[9px]">
       <span className="text-[#3d4d66]">at this hour</span>
@@ -273,17 +286,27 @@ function PriorStrip({ r }: { r: YesterdayRow }) {
         <span
           key={p.back}
           className={p.dir === 'up' ? 'text-emerald-300/80' : p.dir === 'down' ? 'text-rose-300/80' : 'text-[#7c8aa5]'}
-          title={`${p.back}d ago, the ${p.barsFound}/${p.barsExpected}-bar window from ${new Date(p.thenTs * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}: ${p.movePct >= 0 ? '+' : ''}${p.movePct.toFixed(2)}% move, ${p.rangePct.toFixed(2)}% travel, session ${p.session}`}
+          title={`${p.back}d ago, the ${p.barsFound}/${p.barsExpected}-bar window from ${new Date(p.thenTs * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}: ${p.movePct >= 0 ? '+' : ''}${p.movePct.toFixed(2)}% move, ${p.rangePct.toFixed(2)}% travel, session ${p.session}${p.echo ? ` - today's lead-in vs this day's: rhyme ${p.echo.rhyme}/100 (${p.echo.dirAgree})` : ' - no echo (a side under half covered)'}`}
         >
           {p.back}d {p.dir === 'up' ? '\u25b2' : p.dir === 'down' ? '\u25bc' : '\u2014'}{Math.abs(p.movePct).toFixed(2)}
+          {p.echo && (
+            <span className={`ml-1 ${p.echo.rhyme >= RHYME_OK ? 'text-emerald-300' : p.echo.rhyme >= RHYME_BAD ? 'text-amber-300' : 'text-rose-300'}`}>
+              {p.echo.rhyme >= RHYME_OK ? '\u27f3' : p.echo.rhyme >= RHYME_BAD ? '\u2248' : '\u2717'}{p.echo.rhyme}
+            </span>
+          )}
         </span>
       ))}
-      <span
-        className="ml-auto text-[#4b5a72]"
-        title={`of the last ${days} days at this hour (yesterday's replay included), ${ups} opened a window that closed up`}
-      >
+      <span className="ml-auto text-[#4b5a72]" title={`of the last ${days} days at this hour (yesterday's replay included), ${ups} opened a window that closed up`}>
         {ups}/{days} up
       </span>
+      {echoes.length > 0 && (
+        <span
+          className={rhymed > 0 ? 'text-emerald-300/80' : 'text-[#4b5a72]'}
+          title={`today's lead-in rhymed (score ${RHYME_OK}+) with ${rhymed} of the ${echoes.length} remembered day${echoes.length === 1 ? '' : 's'} at this hour (yesterday included). Days without a comparison are excluded, not scored zero - so "0/3" can still mean every side was dark.`}
+        >
+          {'\u27f3'} {rhymed}/{echoes.length} rhyme
+        </span>
+      )}
     </div>
   )
 }
@@ -698,7 +721,7 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
         ))}
         {data && data.rows.length > 0 && (
           <p className="px-1 pt-1 text-[8.5px] leading-relaxed text-[#3d4d66]">
-            Each row is the window that started at the bar forming exactly 24h ago, on the chart's timeframe. dir counts as up/down only when the net move exceeds 10% of the window's own travel. "arch" = bars from the kernel's accumulated store (broker bars in live mode), "seeded" = the feed's deterministic prehistory - never mistake a seeded yesterday for a remembered one. echo compares the lead-in windows ending at this same time of day (yesterday's ended at the anchor, today's within one bar of now): rhyme = direction 50 + move-vs-travel 30 + travel ratio 20, 70+ reads as "repeating the script", under 40 as "going its own way". The rhyme-by-class strip averages each class's echo scores (compared rows only) - "are OTC pairs rhyming today?" is one glance away. Click a card to open that asset on the chart; click an echo chip to go further - the chart deep-loads the asset's full day of candles and scrolls onto yesterday's lead-in plus the forward replay window (edges the feed never remembered show as a gap, not filler). The day chips walk the same window further back - the "at this hour" strip shows each remembered day with its own coverage, and days the series cannot cover are absent, not flat.
+            Each row is the window that started at the bar forming exactly 24h ago, on the chart's timeframe. dir counts as up/down only when the net move exceeds 10% of the window's own travel. "arch" = bars from the kernel's accumulated store (broker bars in live mode), "seeded" = the feed's deterministic prehistory - never mistake a seeded yesterday for a remembered one. echo compares the lead-in windows ending at this same time of day (yesterday's ended at the anchor, today's within one bar of now): rhyme = direction 50 + move-vs-travel 30 + travel ratio 20, 70+ reads as "repeating the script", under 40 as "going its own way". The rhyme-by-class strip averages each class's echo scores (compared rows only) - "are OTC pairs rhyming today?" is one glance away. Click a card to open that asset on the chart; click an echo chip to go further - the chart deep-loads the asset's full day of candles and scrolls onto yesterday's lead-in plus the forward replay window (edges the feed never remembered show as a gap, not filler). The day chips walk the same window further back - the "at this hour" strip shows each remembered day with its own coverage (days the series cannot cover are absent, not flat), each day's rhyme tag scores today's lead-in against THAT day's lead-in, and the "N/M rhyme" aggregate counts the days today actually rhymed with (70+), compared days only.
           </p>
         )}
       </div>
