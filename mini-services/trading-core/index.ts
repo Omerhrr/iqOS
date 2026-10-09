@@ -1079,9 +1079,13 @@ const httpServer = createServer(async (req, res) => {
       // came from the store) so a thin or synthetic "yesterday" is visible
       // instead of silently mistaken for a remembered one, and the ECHO - the
       // lead-in window ending at the same wall-clock moment, yesterday vs
-      // today, scored 0..100 for rhyme. tf respects
+      // today, scored 0..100 for rhyme. profile=1 adds the SESSION PROFILE:
+      // the same adjacent-day lead-in echo scored at every hour of the day,
+      // aggregated per session per row ("does the script differ ASIA vs
+      // LONDON vs NY?"). tf respects
       // the chart's timeframe (same rule as /signals); the cache is per
-      // tf:window - the T-24h target crawls, so 60s serves rapid panel polls.
+      // tf:window:days:profile - the T-24h target crawls, so 60s serves
+      // rapid panel polls.
       if (path === '/yesterday') {
         const tfv = tfStrict(q.get('tf'))
         if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
@@ -1089,6 +1093,7 @@ const httpServer = createServer(async (req, res) => {
         const windowMin = Number.isFinite(winRaw) ? Math.max(5, Math.min(Math.round(winRaw), 240)) : 60
         const daysRaw = Number(q.get('days') ?? 1)
         const days = Number.isFinite(daysRaw) ? Math.max(1, Math.min(7, Math.round(daysRaw))) : 1
+        const profile = q.get('profile') === '1'
         const plan = YesterdayService.plan(tfv, windowMin, days)
         if (!plan.ok) {
           return json(400, {
@@ -1096,7 +1101,7 @@ const httpServer = createServer(async (req, res) => {
             error: `tf "${tfv}" at ${days}d depth cannot reach ${days * 24}h + the replay window back within the ${plan.needed}-bar lookback limit (4000-bar archive depth) - coarsen the tf or shallow the depth`,
           })
         }
-        return json(200, await kernel.context().use<YesterdayService>('yesterday').scan(tfv, windowMin, days))
+        return json(200, await kernel.context().use<YesterdayService>('yesterday').scan(tfv, windowMin, days, profile))
       }
 
       // Outcome stats for the chart signals: every qualifying read is

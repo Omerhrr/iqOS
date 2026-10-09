@@ -7,8 +7,12 @@
 //   - variant B: today lead-in FALLS -0.40%             -> opposite, rhyme 20
 //   - variant C: thin today side (under half covered)   -> echo null
 //   - quiet: dead-flat / near-flat both sides           -> quiet true, aggregates' problem
+//   - session profile: the SAME adjacent-day lead-in echo scored at every
+//     hour of the day (engineered lead-ins at known UTC hours) -> per-session
+//     buckets (obs/quiet/avg), future today-side skip, dark-session zeros,
+//     -OTC collapse, quiet exclusion, row-path wiring
 // Run: bun scripts/yesterday_echo_unit.mjs
-import { buildPriorDay, buildYesterdayRow } from '../mini-services/trading-core/src/analytics/yesterday'
+import { buildPriorDay, buildSessionProfile, buildYesterdayRow } from '../mini-services/trading-core/src/analytics/yesterday'
 
 let pass = 0
 let fail = 0
@@ -182,6 +186,55 @@ if (row) {
   const rowThinToday = buildYesterdayRow(info, [...priorLeadUp, ...prior2Fwd, ...seriesThinToday].sort((a, b) => a.time - b.time), { ...opts, priorDays: 1 })
   ok('thin today side silences the prior echo too', rowThinToday?.prior[0]?.echo === null, JSON.stringify(rowThinToday?.prior[0]?.echo))
 }
+
+// ---- SESSION PROFILE: the same adjacent-day lead-in echo at every hour ----
+// Engineered lead-ins at known UTC hours (MID = a real UTC midnight, 60s-
+// aligned so every h:00 anchor is exact):
+//   h13 today  [M+12h,M+13h)  up   +0.40% / 0.80% travel
+//   h13 yday   [M-12h,M-11h)  up   +0.40% / 0.80%
+//   h13 T-2    [M-36h,M-35h)  down -0.40% / 0.80%
+//   h15 yday   [M-10h,M-09h)  up   +0.40% / 0.80%
+//   h15 T-2    [M-34h,M-33h)  up   +0.40% / 0.80%
+// now = 14:00:30 UTC -> h13's today side has elapsed, h15's has NOT
+// (future): expected pairs = h13 d1 (100 same) + h13 d2 (20 opposite) +
+// h15 d2-only (100 same) -> OVERLAP obs 3, avg round((100+20+100)/3) = 73.
+// The future today-side skip is what keeps h15 at ONE pair (obs 3, not 4).
+// Every other session: obs 0 / avg null - honest zeros, not absent slots.
+// A -OTC ticker has no sessions: one day-wide OTC bucket, same pairs.
+const MID = 1_699_920_000 // 2023-11-14T00:00:00Z
+const nowP = MID + 14 * 3_600 + 30
+const pOpts = { nowSec: nowP, windowSec: WIN, tfSec: TF, days: 2 }
+const profSeries = [
+  run(MID + 12 * 3_600, WIN / TF, base, 0.4, 0.8),  // today h13 lead-in
+  run(MID - 12 * 3_600, WIN / TF, base, 0.4, 0.8),  // yesterday h13 lead-in
+  run(MID - 36 * 3_600, WIN / TF, base, -0.4, 0.8), // T-2 h13 lead-in
+  run(MID - 10 * 3_600, WIN / TF, base, 0.4, 0.8),  // yesterday h15 lead-in
+  run(MID - 34 * 3_600, WIN / TF, base, 0.4, 0.8),  // T-2 h15 lead-in
+].flat().sort((a, b) => a.time - b.time)
+const prof = buildSessionProfile(info, profSeries, pOpts)
+ok('profile: five ordered session buckets on a real ticker', prof.length === 5 && prof.map((s) => s.session).join(',') === 'ASIA,LONDON,OVERLAP,NEWYORK,OFF', JSON.stringify(prof))
+const ov = prof.find((s) => s.session === 'OVERLAP')
+ok('profile: OVERLAP obs 3 (h13 d1+d2, h15 d2 - future today-side skipped)', ov?.obs === 3, JSON.stringify(ov))
+ok('profile: OVERLAP avg 73, none quiet', ov?.avg === 73 && ov?.quiet === 0, JSON.stringify(ov))
+ok('profile: dark sessions honest zeros (ASIA / OFF)', prof.find((s) => s.session === 'ASIA')?.obs === 0 && prof.find((s) => s.session === 'ASIA')?.avg === null && prof.find((s) => s.session === 'OFF')?.obs === 0, JSON.stringify(prof))
+const profOtc = buildSessionProfile({ ...info, ticker: 'TEST-OTC', otc: true }, profSeries, pOpts)
+ok('profile: -OTC ticker collapses to one OTC bucket (same pairs)', profOtc.length === 1 && profOtc[0].session === 'OTC' && profOtc[0].obs === 3 && profOtc[0].avg === 73, JSON.stringify(profOtc))
+// quiet exclusion: the h15 pair both FLAT -> quiet, kept out of the average
+const profQuietSeries = [
+  run(MID + 12 * 3_600, WIN / TF, base, 0.4, 0.8),
+  run(MID - 12 * 3_600, WIN / TF, base, 0.4, 0.8),
+  run(MID - 36 * 3_600, WIN / TF, base, -0.4, 0.8),
+  run(MID - 10 * 3_600, WIN / TF, base, 0, 0.02),   // yesterday h15 lead-in flat
+  run(MID - 34 * 3_600, WIN / TF, base, 0, 0.02),   // T-2 h15 lead-in flat
+].flat().sort((a, b) => a.time - b.time)
+const ovQ = buildSessionProfile(info, profQuietSeries, pOpts).find((s) => s.session === 'OVERLAP')
+ok('profile: quiet pair counted in obs, excluded from avg (3 obs, 1 quiet, avg 60)', ovQ?.obs === 3 && ovQ?.quiet === 1 && ovQ?.avg === 60, JSON.stringify(ovQ))
+// row path: opts.profile wires the same arithmetic (days = priorDays + 1);
+// absent unless requested
+const rowProf = buildYesterdayRow(info, profSeries, { nowSec: nowP, windowSec: WIN, tfSec: TF, nowPrice: base * 1.004, archived: 0, priorDays: 1, profile: true })
+ok('row path: profile wired == direct buildSessionProfile', JSON.stringify(rowProf?.profile) === JSON.stringify(prof), JSON.stringify(rowProf?.profile))
+const rowNoProf = buildYesterdayRow(info, profSeries, { nowSec: nowP, windowSec: WIN, tfSec: TF, nowPrice: base * 1.004, archived: 0, priorDays: 1 })
+ok('row path: profile absent when not requested', rowNoProf?.profile === undefined, JSON.stringify(rowNoProf?.profile))
 
 console.log(`\n${pass} passed, ${fail} failed`)
 process.exit(fail > 0 ? 1 : 0)

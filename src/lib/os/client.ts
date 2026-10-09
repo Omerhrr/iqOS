@@ -521,6 +521,22 @@ export interface YesterdayEcho {
   quiet?: boolean
 }
 
+/** One session bucket of the row's per-session rhyme profile: the SAME
+ * adjacent-day lead-in echo scored at every hour of the day (kernel-side,
+ * from the candles the scan already pulled), aggregated per session. Quiet
+ * echoes (both lead-ins flat) count in obs but are excluded from avg - same
+ * rule as every other aggregate. -OTC tickers get one day-wide 'OTC' bucket
+ * (they have no sessions). Optional on the wire so an older kernel parses. */
+export interface YdaySessionRhyme {
+  session: YdaySession
+  /** adjacent-day lead-in echoes scored in this session's hours */
+  obs: number
+  /** of those, both lead-ins flat (trivial agreement - kept out of avg) */
+  quiet: number
+  /** mean rhyme of the non-quiet echoes, 0..100; null when none survived */
+  avg: number | null
+}
+
 export interface YesterdayRow {
   asset: string
   name: string
@@ -554,6 +570,10 @@ export interface YesterdayRow {
   echo?: YesterdayEcho | null
   /** deeper same-hour history, most recent first (back = 2, 3, ...); empty unless the scan asked for more than one day */
   prior?: YdayPrior[]
+  /** per-session rhyme profile (see YdaySessionRhyme) - present only when the
+   * scan asked for it (profile=1); five ordered session buckets on real rows,
+   * one OTC bucket on -OTC rows */
+  profile?: YdaySessionRhyme[]
 }
 
 export interface YesterdayResponse {
@@ -579,9 +599,11 @@ export interface YesterdayResponse {
  * is the forward window replayed after T-24h (5..240, default 60); `days`
  * (1..7, default 1) walks the same window back over more days - every row
  * then carries `prior`, and finer tfs fit fewer days. Every row also carries
- * the echo lead-in comparison where coverage allows. */
-export async function getYesterday(tf: Timeframe, windowMin = 60, days = 1): Promise<YesterdayResponse> {
-  return osGet<YesterdayResponse>('/yesterday', { tf, window: windowMin, days })
+ * the echo lead-in comparison where coverage allows. `profile` (opt-in) adds
+ * each row's per-session rhyme profile - the same echo scored at every hour
+ * of the day, so "does the script differ ASIA vs LONDON vs NY?" is one line. */
+export async function getYesterday(tf: Timeframe, windowMin = 60, days = 1, profile = false): Promise<YesterdayResponse> {
+  return osGet<YesterdayResponse>('/yesterday', { tf, window: windowMin, days, ...(profile ? { profile: 1 } : {}) })
 }
 
 // ---- engine-edge research (both loops merged: honesty + lab) -------------

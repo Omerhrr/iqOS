@@ -6,7 +6,10 @@
 // (echo lead-in comparison yesterday vs today: rhyme bounds, dirAgree
 // consistency with the move signs, coverage-when-present), the days param
 // (same-hour history strips: prior-day sanity + anchors, clamp, depth gate),
-// the /candles deep=1 read the echo click-through feeds on (archive depth,
+// the session profile (profile=1: five ordered session buckets on real rows,
+// one OTC bucket on -OTC rows, obs bounded by hours-in-session x days,
+// quiet-exclusion arithmetic, separate cache key), the /candles deep=1 read
+// the echo click-through feeds on (archive depth,
 // deeper-than-plain reach, ascending bars, live tail, clamp), sorting by
 // |move|, the window param (clamp + quantization), tf respect (per-tf
 // caches, no cross-tf leak), the archive-depth gate (5s/15s refused with a
@@ -179,6 +182,36 @@ ok('prior rhyme arithmetic consistent with dirAgree', d3priorEchoed.every((p) =>
   (p.echo.dirAgree === 'opposite' ? p.echo.rhyme <= 50 : true) &&
   (p.echo.dirAgree === 'partial' ? p.echo.rhyme >= 25 && p.echo.rhyme <= 75 : true),
 ))
+
+// ---------- session profile (profile=1): the script by session ----------
+// The same adjacent-day lead-in echo scored at EVERY hour of the day,
+// aggregated per session: five ORDERED buckets on real rows (ASIA..OFF,
+// obs 0 / avg null when a session had nothing scorable), one day-wide OTC
+// bucket on -OTC rows (they have no sessions). Per session: quiet <= obs,
+// avg null iff every pair was quiet, obs bounded by hours-in-session x
+// days (each hour contributes at most `days` adjacent-day pairs). The
+// flag is part of the cache key - the profile scan lives beside its
+// plain sibling, never contaminating it.
+const SESH = ['ASIA', 'LONDON', 'OVERLAP', 'NEWYORK', 'OFF']
+const HRS = { ASIA: 7, LONDON: 6, OVERLAP: 3, NEWYORK: 5, OFF: 3, OTC: 24 }
+const dprof = await get('/yesterday?tf=5m&days=3&profile=1')
+const prows = dprof.body.rows ?? []
+ok('profile=1: 200 + rows', dprof.status === 200 && dprof.body.ok === true && prows.length >= 1, `status=${dprof.status} rows=${prows.length}`)
+ok('profile: five ordered session buckets on real rows', prows.filter((r) => !r.otc).every((r) => Array.isArray(r.profile) && r.profile.length === 5 && r.profile.every((s, i) => s.session === SESH[i])), JSON.stringify(prows.find((r) => !r.otc)?.profile))
+ok('profile: OTC rows collapse to one OTC bucket', prows.filter((r) => r.otc).every((r) => Array.isArray(r.profile) && r.profile.length === 1 && r.profile[0].session === 'OTC'), JSON.stringify(prows.find((r) => r.otc)?.profile))
+ok('profile: obs/quiet/avg arithmetic sane', prows.every((r) => (r.profile ?? []).every((s) =>
+  Number.isInteger(s.obs) && s.obs >= 0 && Number.isInteger(s.quiet) && s.quiet >= 0 && s.quiet <= s.obs &&
+  (s.avg === null ? s.obs - s.quiet === 0 : (s.obs - s.quiet > 0 && Number.isInteger(s.avg) && s.avg >= 0 && s.avg <= 100))),
+))
+ok('profile: obs bounded by hours-in-session x days', prows.every((r) => (r.profile ?? []).every((s) => s.obs <= (HRS[s.session] ?? 24) * 3)), JSON.stringify(prows.find((r) => !r.otc)?.profile?.map((s) => `${s.session}:${s.obs}`)))
+const scripted = prows.filter((r) => (r.profile ?? []).some((s) => s.obs > 0))
+ok('profile: measured rows exist on the warmed universe', scripted.length > 0, `scripted=${scripted.length}/${prows.length}`)
+ok('profile: absent without the flag (plain 3d scan)', (d3.body.rows ?? []).every((r) => r.profile === undefined))
+const dp2 = await get('/yesterday?tf=5m&days=3&profile=1')
+ok('profile scan cached separately (60s, same key)', dp2.body.ts === dprof.body.ts, `dprof.ts=${dprof.body.ts} dp2.ts=${dp2.body.ts}`)
+const spSample = scripted.find((r) => !r.otc) ?? scripted[0]
+if (spSample) console.log(`  sample ${spSample.asset} script: ${spSample.profile.map((s) => `${s.session}:${s.avg ?? '--'}(${s.obs}${s.quiet ? `-${s.quiet}q` : ''})`).join(' ')}`)
+console.log(`      profiled rows: ${scripted.length}/${prows.length}`)
 // clamp: 99 -> 7 (5m fits a week), depth gate: 1m + 3d needs 4442 bars > 4000
 const d7 = await get('/yesterday?tf=5m&days=99')
 ok('days clamped to 7', d7.status === 200 && d7.body.days === 7, `days=${d7.body.days}`)

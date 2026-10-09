@@ -46,6 +46,20 @@
 // - a rhyme between two FLAT lead-ins is real but trivial (both sides did
 //   nothing - the direction points are awarded for free), so the echo carries
 //   `quiet` and the panel marks it and keeps it out of every aggregate.
+//
+// The SESSION PROFILE answers the question one echo cannot: does the script
+// DIFFER by time of day? The main echo compares lead-ins at ONE wall-clock
+// hour (now's hour) - every scan shares that hour, so a session tag on it is
+// a constant, not an answer. The profile re-scores the SAME adjacent-day
+// lead-in comparison at EVERY hour of the day (yesterday's h:00 lead-in vs
+// today's when elapsed, then T-2 vs T-1, T-3 vs T-2, ... - adjacent days,
+// never day-vs-week), from the candles the scan ALREADY pulled: no extra
+// lookback, pairs the series cannot cover are absent (fewer observations),
+// never approximated. Each pair lands in the session of its hour via
+// classifySession, each session reports obs / quiet / the mean rhyme of its
+// non-quiet echoes - so "EURUSD rhymes in London and diverges off-hours" is
+// a per-row fact instead of folklore. -OTC tickers have no sessions (see
+// analytics/session.ts): every pair lands in one day-wide OTC bucket.
 
 import { classifySession, type Session } from './session'
 import type { AssetCategory, Candle } from '../types'
@@ -90,6 +104,22 @@ export interface PriorEcho {
   /** both lead-ins flat (see YesterdayEcho.quiet) - trivial agreement,
    * excluded from the panel's aggregates */
   quiet: boolean
+}
+
+/** One session bucket of the per-session rhyme profile: the adjacent-day
+ * lead-in comparison scored at this session's hours across the loaded days,
+ * aggregated. QUIET echoes (both lead-ins flat - trivial agreement) count in
+ * obs but are excluded from avg, same rule as every other aggregate. */
+export interface SessionRhyme {
+  /** the session every scored pair's hour belongs to (one 'OTC' bucket for
+   * -OTC tickers - they have no sessions, see analytics/session.ts) */
+  session: Session
+  /** adjacent-day lead-in echoes scored in this session's hours */
+  obs: number
+  /** of those, both lead-ins flat (real but trivial - kept out of avg) */
+  quiet: number
+  /** mean rhyme of the non-quiet echoes, 0..100; null when none survived */
+  avg: number | null
 }
 
 /** One remembered day BEFORE yesterday: the same forward window starting at
@@ -148,6 +178,11 @@ export interface YesterdayRow {
   echo: YesterdayEcho | null
   /** deeper same-hour history, most recent first (back = 2, 3, ...); empty unless the scan asked for more than one day */
   prior: PriorDay[]
+  /** per-session rhyme profile - the same adjacent-day lead-in echo scored at
+   * EVERY hour of the day, aggregated per session (see SessionRhyme). Absent
+   * unless the scan asked for it (profile=1): it costs days*24 lead-in
+   * evaluations per row, all from the candles the scan already pulled. */
+  profile?: SessionRhyme[]
 }
 
 export interface YesterdayInfo {
@@ -171,6 +206,9 @@ export interface YesterdayOpts {
   /** how many day-anchors to walk past yesterday (0 = none; the scanner
    * passes days-1). Each prior day needs its own window in the series. */
   priorDays?: number
+  /** also score the per-session rhyme profile (see SessionRhyme) - pairs per
+   * hour are bounded by the same loaded series; nothing extra is fetched */
+  profile?: boolean
 }
 
 const DAY_SEC = 86_400
@@ -201,6 +239,28 @@ function windowStats(win: Candle[]): WinStats | null {
   const eps = rangePct * 0.1
   const dir: YdayDir = movePct > eps ? 'up' : movePct < -eps ? 'down' : 'none'
   return { movePct, rangePct, dir }
+}
+
+/** Candles in [start, end) by binary search - the same set `filter` would
+ * return over an ascending series, without walking the whole array. The
+ * profile slices ~days*24 windows per row, so the lookup pays for itself. */
+function winSlice(candles: Candle[], start: number, end: number): Candle[] {
+  let lo = 0
+  const n = candles.length
+  let hi = n
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (candles[mid].time < start) lo = mid + 1
+    else hi = mid
+  }
+  const from = lo
+  hi = n
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (candles[mid].time < end) lo = mid + 1
+    else hi = mid
+  }
+  return candles.slice(from, lo)
 }
 
 /** The rhyme score's three parts, kept explicit so the panel tooltip can
@@ -280,6 +340,66 @@ export function buildPriorDay(
     session: classifySession(t0, info.ticker),
     echo,
   }
+}
+
+/**
+ * The per-session rhyme profile: for EVERY hour h of the day, score the
+ * adjacent-day lead-in echoes ending at h:00 - today vs yesterday (when
+ * today's h:00 has elapsed), yesterday vs T-2, ... up to `days` pairs - and
+ * aggregate the pairs per session (classifySession of the hour; one 'OTC'
+ * bucket for -OTC tickers). Same rhymeScore, same >= half coverage gate per
+ * lead-in side, same orientation (older side = the reference, like every
+ * echo here). Windows come from the series the scan already pulled - a pair
+ * whose side is under half covered is skipped (fewer obs), never guessed.
+ * Buckets come back in fixed session order, obs 0 / avg null when a session
+ * had nothing scorable - honest zeros, not absent sessions.
+ */
+export function buildSessionProfile(
+  info: YesterdayInfo,
+  candles: Candle[],
+  opts: { nowSec: number; windowSec: number; tfSec: number; days: number },
+): SessionRhyme[] {
+  const days = Math.max(1, Math.floor(opts.days))
+  const barsExpected = Math.round(opts.windowSec / opts.tfSec)
+  const minBars = Math.max(1, Math.floor(barsExpected * 0.5))
+  const midnight = opts.nowSec - (opts.nowSec % DAY_SEC)
+  // per hour: lead-in stats keyed by how many days back the END sits
+  // (0 = today h:00, 1 = yesterday, ...); pair d = stats[d] vs stats[d - 1]
+  const tally = new Map<Session, { obs: number; quiet: number; sum: number }>()
+  for (let h = 0; h < 24; h++) {
+    // the bar bucket at h:00 today (bar opens are tf-aligned, same snap as
+    // every anchor here) - today's side only exists once its window is past
+    const end0 = midnight + h * 3_600
+    const e0 = end0 - (end0 % opts.tfSec)
+    const stats: (WinStats | null)[] = []
+    for (let j = 0; j <= days; j++) {
+      const end = e0 - DAY_SEC * j
+      const win = winSlice(candles, end - opts.windowSec, end)
+      stats.push(win.length >= minBars ? windowStats(win) : null)
+    }
+    for (let d = 1; d <= days; d++) {
+      const sy = stats[d]
+      const st = stats[d - 1]
+      if (!sy || !st) continue
+      const { rhyme, quiet } = rhymeScore(sy, st)
+      const session = classifySession(e0, info.ticker)
+      const t = tally.get(session) ?? { obs: 0, quiet: 0, sum: 0 }
+      t.obs++
+      if (quiet) t.quiet++
+      else t.sum += rhyme
+      tally.set(session, t)
+    }
+  }
+  // fixed session order - real assets get the five clock sessions (obs 0 /
+  // avg null when dark), -OTC tickers collapse into the single OTC bucket
+  const order: Session[] = info.ticker.endsWith('-OTC')
+    ? ['OTC']
+    : ['ASIA', 'LONDON', 'OVERLAP', 'NEWYORK', 'OFF']
+  return order.map((session) => {
+    const t = tally.get(session)
+    const kept = t ? t.obs - t.quiet : 0
+    return { session, obs: t?.obs ?? 0, quiet: t?.quiet ?? 0, avg: kept > 0 ? Math.round(t!.sum / kept) : null }
+  })
 }
 
 /**
@@ -377,5 +497,8 @@ export function buildYesterdayRow(info: YesterdayInfo, candles: Candle[], opts: 
     session: classifySession(t0, info.ticker),
     echo,
     prior,
+    // the profile re-uses the SAME loaded series - days*24 extra lead-in
+    // reads per row, no fetch; absent unless the scan asked for it
+    ...(opts.profile ? { profile: buildSessionProfile(info, candles, { nowSec: opts.nowSec, windowSec: opts.windowSec, tfSec: opts.tfSec, days: (opts.priorDays ?? 0) + 1 }) } : {}),
   }
 }

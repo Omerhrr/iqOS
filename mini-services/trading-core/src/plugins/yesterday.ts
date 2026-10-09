@@ -27,6 +27,14 @@
 // are refused with a clear 400 instead of silently answering from a
 // fraction of the day. The result is cached 60s - a T-24h target crawls
 // forward one second per second, so rapid panel polls share one scan.
+//
+// The optional SESSION PROFILE (profile=1) adds a per-row breakdown of the
+// rhyme by time of day: the same adjacent-day lead-in echo scored at every
+// hour of the day, aggregated per trading session (analytics/yesterday's
+// buildSessionProfile). It costs days*24 extra lead-in reads per row but
+// fetches nothing - the pairs come from the candles the scan already pulled.
+// The flag is part of the cache key, so a profile scan and its plain
+// sibling live beside each other instead of contaminating one another.
 
 import type { KernelContext, Plugin } from '../kernel'
 import type { Candle, Timeframe } from '../types'
@@ -91,17 +99,17 @@ export class YesterdayService {
     return { windowSec, windowMin: Math.round(windowSec / 60), ok: needed <= MAX_LOOKBACK_BARS, needed }
   }
 
-  /** Fresh scan (cached per tf:windowSec:days for CACHE_MS), inflight-deduped. */
-  async scan(tf: Timeframe, windowMin: number, days = 1): Promise<YesterdayResult> {
+  /** Fresh scan (cached per tf:windowSec:days:profile, inflight-deduped). */
+  async scan(tf: Timeframe, windowMin: number, days = 1, profile = false): Promise<YesterdayResult> {
     const nDays = Math.max(1, Math.min(7, Math.round(Number.isFinite(days) ? days : 1)))
     const plan = YesterdayService.plan(tf, windowMin, nDays)
-    const key = `${tf}:${plan.windowSec}:${nDays}`
+    const key = `${tf}:${plan.windowSec}:${nDays}:${profile ? 1 : 0}`
     const cached = this.cache.get(key)
     const now = Date.now()
     if (cached && now - cached.ts < CACHE_MS) return cached.result
     const running = this.inflight.get(key)
     if (running) return running
-    const p = this.scanOnce(tf, plan, nDays).then((r) => {
+    const p = this.scanOnce(tf, plan, nDays, profile).then((r) => {
       this.cache.set(key, { ts: r.ts, result: r })
       this.inflight.delete(key)
       return r
@@ -123,7 +131,7 @@ export class YesterdayService {
     }
   }
 
-  private async scanOnce(tf: Timeframe, plan: { windowSec: number; windowMin: number }, days: number): Promise<YesterdayResult> {
+  private async scanOnce(tf: Timeframe, plan: { windowSec: number; windowMin: number }, days: number, profile: boolean): Promise<YesterdayResult> {
     const t0wall = Date.now()
     const tfSec = TIMEFRAME_SECONDS[tf]
     const nowSec = Math.floor(Date.now() / 1000)
@@ -161,7 +169,7 @@ export class YesterdayService {
           const row = buildYesterdayRow(
             { ticker: info.ticker, name: info.name, category: info.category, otc: !!info.otc },
             candles,
-            { nowSec, windowSec: plan.windowSec, tfSec, nowPrice, archived, priorDays: days - 1 },
+            { nowSec, windowSec: plan.windowSec, tfSec, nowPrice, archived, priorDays: days - 1, profile },
           )
           if (row) rows.push(row)
         }),

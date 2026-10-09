@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Class-strip week-rhyme smoke (Task 10) + week-sort metric smoke (Task 11)
-// + quiet-exclusion smoke (Task 12) companions to yesterday_e2e. The
+// + quiet-exclusion smoke (Task 12) + session-profile smoke (Task 13)
+// companions to yesterday_e2e. The
 // per-class week average and the week sort key are computed WEB-side from
 // the wire; this locks the arithmetic the YesterdayPanel performs:
 //   - weekLive must be false at days=1 (no priors -> week numbers stay hidden)
@@ -9,6 +10,9 @@
 //     wkAvg within [min, max] of the observations and 0..100
 //   - wkAvg recomputed independently (sum/len, rounded) matches exactly
 //   - observations the PriorStrip would use are the same data source
+//   - session profile (profile=1): five ordered session buckets on real
+//     rows / one OTC bucket on -OTC rows, quiet <= obs, avg null iff every
+//     pair was quiet, obs bounded by hours-in-session x days
 // Read-only.
 const BASE = process.env.IQAIR_OS_URL ?? 'http://localhost:3030'
 const TOKEN = (process.env.KERNEL_TOKEN ?? '').trim()
@@ -161,6 +165,33 @@ ok('week sort: quiet-only row sinks with the no-observation row', ranked[3].asse
 // top-3 sample of the would-be watchlist for eyeballing
 const top3 = [...rows].sort((a, b) => wKey(b)[0] - wKey(a)[0] || wKey(b)[1] - wKey(a)[1] || Math.abs(b.movePct) - Math.abs(a.movePct)).slice(0, 3)
 for (const t of top3) console.log(`  watchlist ${t.asset}: rhymed ${wKey(t)[0]}/${wObs(t).length} avg ${Math.round(wKey(t)[1])}`)
+
+// ---- session profile (Task 13): the script-by-session aggregates ----
+// Kernel-side arithmetic, but the panel renders exactly these buckets, so
+// the wire contract is locked here: five ORDERED session buckets on real
+// rows (ASIA..OFF - obs 0 / avg null is an honest empty session, not an
+// absent one), one day-wide OTC bucket on -OTC rows (they have no
+// sessions), quiet <= obs per bucket, avg present iff at least one
+// non-quiet pair survived, and obs bounded by hours-in-session x days
+// (each hour contributes at most `days` adjacent-day lead-in pairs).
+const SESH = ['ASIA', 'LONDON', 'OVERLAP', 'NEWYORK', 'OFF']
+const HRS = { ASIA: 7, LONDON: 6, OVERLAP: 3, NEWYORK: 5, OFF: 3, OTC: 24 }
+const dprof = await get('/yesterday?tf=5m&days=3&profile=1')
+const prows = dprof.body.rows ?? []
+ok('profile: 200 + rows', dprof.status === 200 && dprof.body.ok === true && prows.length >= 1, `rows=${prows.length}`)
+ok('profile: five ordered buckets on real rows, one OTC bucket on -OTC', prows.every((r) => r.otc
+  ? (r.profile ?? []).length === 1 && r.profile[0].session === 'OTC'
+  : (r.profile ?? []).length === 5 && r.profile.every((s, i) => s.session === SESH[i])),
+)
+ok('profile: quiet <= obs, avg null iff all quiet, avg 0..100', prows.every((r) => (r.profile ?? []).every((s) =>
+  s.quiet >= 0 && s.quiet <= s.obs && (s.avg === null ? s.obs - s.quiet === 0 : (s.obs - s.quiet > 0 && s.avg >= 0 && s.avg <= 100))),
+))
+ok('profile: obs bounded by hours-in-session x days', prows.every((r) => (r.profile ?? []).every((s) => s.obs <= (HRS[s.session] ?? 24) * 3)))
+ok('profile: per-row obs sums bounded by 24h x days', prows.every((r) => (r.profile ?? []).reduce((n, s) => n + s.obs, 0) <= 24 * 3))
+const scripted = prows.filter((r) => (r.profile ?? []).some((s) => s.obs > 0))
+ok('profile: measured rows exist (warmed universe)', scripted.length > 0, `scripted=${scripted.length}/${prows.length}`)
+const sp = scripted.find((r) => !r.otc) ?? scripted[0]
+if (sp) console.log(`  sample ${sp.asset} script: ${(sp.profile ?? []).map((s) => `${s.session}:${s.avg ?? '--'}(${s.obs}${s.quiet ? `-${s.quiet}q` : ''})`).join(' ')}`)
 
 console.log(`\n${pass} passed, ${fail} failed`)
 process.exit(fail ? 1 : 0)
