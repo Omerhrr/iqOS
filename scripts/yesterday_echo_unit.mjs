@@ -10,7 +10,10 @@
 //   - session profile: the SAME adjacent-day lead-in echo scored at every
 //     hour of the day (engineered lead-ins at known UTC hours) -> per-session
 //     buckets (obs/quiet/avg), future today-side skip, dark-session zeros,
-//     -OTC collapse, quiet exclusion, row-path wiring
+//     -OTC collapse, quiet exclusion, row-path wiring, and the HOURS each
+//     bucket's average is fed by (SessionRhyme.hours - non-quiet slots only,
+//     dark sessions empty) plus the fmtHours run-length form the panel's
+//     tooltips spell them out with
 //   - watchlist snapshot: the ranking comparators (rhyme/week/peak orders,
 //     quiet exclusion, sink sentinels) and the serializer (header fields,
 //     cap, conditional columns, quiet marker, peak/spread cell, off-hours
@@ -25,7 +28,7 @@
 //     trimmed or hand-edited header
 // Run: bun scripts/yesterday_echo_unit.mjs
 import { buildPriorDay, buildSessionProfile, buildYesterdayRow } from '../mini-services/trading-core/src/analytics/yesterday'
-import { cmpBySort, buildWatchlist, parseWatchlist, fmtWatchlistTs } from '../src/lib/os/watchlist'
+import { cmpBySort, buildWatchlist, parseWatchlist, fmtWatchlistTs, fmtHours } from '../src/lib/os/watchlist'
 
 let pass = 0
 let fail = 0
@@ -246,6 +249,31 @@ const profQuietSeries = [
 const ovQ = buildSessionProfile(info, profQuietSeries, pOpts).find((s) => s.session === 'OVERLAP')
 ok('profile: quiet pair counted in obs, excluded from avg (3 obs, 1 quiet, avg 60)', ovQ?.obs === 3 && ovQ?.quiet === 1 && ovQ?.avg === 60, JSON.stringify(ovQ))
 ok('profile: sum follows the exclusion (kept 100+20 = 120, quiet pair not totalled)', ovQ?.sum === 120, JSON.stringify(ovQ))
+// HOURS (Task 20): each bucket names the distinct UTC hours whose NON-quiet
+// pairs fed avg - the question a peak cell asks. Engineered slots: h13 (two
+// non-quiet pairs) + h15 (one) -> OVERLAP hours [13,15]; the quiet variant's
+// h15 pair is quiet, so its hours shrink to [13] while obs stays 3 - the
+// listed hours are exactly what the average rests on. Dark sessions: []
+// (honest zero, like obs 0 / avg null). -OTC: same pairs, day-wide bucket.
+ok('profile hours: OVERLAP names 13 and 15 (every non-quiet slot)', JSON.stringify(ov?.hours) === '[13,15]', JSON.stringify(ov?.hours))
+ok('profile hours: quiet pair\'s hour drops out (obs stays 3, hours [13])', JSON.stringify(ovQ?.hours) === '[13]', JSON.stringify(ovQ?.hours))
+ok('profile hours: dark sessions carry the honest empty array', JSON.stringify(prof.find((s) => s.session === 'ASIA')?.hours) === '[]' && JSON.stringify(prof.find((s) => s.session === 'OFF')?.hours) === '[]', JSON.stringify(prof.map((s) => [s.session, s.hours])))
+ok('profile hours: -OTC day-wide bucket carries the same hours', JSON.stringify(profOtc[0]?.hours) === '[13,15]', JSON.stringify(profOtc[0]?.hours))
+// the row path was checked with JSON.stringify equality on the whole
+// profile - it now covers the hours arrays too (same objects both sides)
+
+// ---- fmtHours (Task 20): the tooltip's run-length form, locked exactly ----
+// Lives in watchlist.ts beside the serializer so the panel and the unit share
+// one formatter: consecutive hours collapse to HH-HH, the rest comma-separate,
+// everything zero-padded, sorted + deduped defensively, empty -> "none".
+ok('fmtHours: empty reads "none"', fmtHours([]) === 'none', JSON.stringify(fmtHours([])))
+ok('fmtHours: a lone hour zero-pads (7 -> "07")', fmtHours([7]) === '07', JSON.stringify(fmtHours([7])))
+ok('fmtHours: a consecutive run collapses (9-12)', fmtHours([9, 10, 11, 12]) === '09-12', JSON.stringify(fmtHours([9, 10, 11, 12])))
+ok('fmtHours: a gap stays comma-separated (13, 15)', fmtHours([13, 15]) === '13, 15', JSON.stringify(fmtHours([13, 15])))
+ok('fmtHours: the full day is one range (00-23)', fmtHours(Array.from({ length: 24 }, (_, i) => i)) === '00-23', JSON.stringify(fmtHours(Array.from({ length: 24 }, (_, i) => i))))
+ok('fmtHours: midnight cannot join an evening run (00, 22-23)', fmtHours([0, 22, 23]) === '00, 22-23', JSON.stringify(fmtHours([0, 22, 23])))
+ok('fmtHours: the OFF bucket\'s whole window is one run (21-23)', fmtHours([21, 22, 23]) === '21-23', JSON.stringify(fmtHours([21, 22, 23])))
+ok('fmtHours: unsorted + duplicated input sorts and dedupes defensively', fmtHours([15, 13, 13]) === '13, 15', JSON.stringify(fmtHours([15, 13, 13])))
 // row path: opts.profile wires the same arithmetic (days = priorDays + 1);
 // absent unless requested
 const rowProf = buildYesterdayRow(info, profSeries, { nowSec: nowP, windowSec: WIN, tfSec: TF, nowPrice: base * 1.004, archived: 0, priorDays: 1, profile: true })

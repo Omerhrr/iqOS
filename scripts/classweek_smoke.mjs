@@ -190,8 +190,17 @@ for (const t of top3) console.log(`  watchlist ${t.asset}: rhymed ${wKey(t)[0]}/
 // sessions), quiet <= obs per bucket, avg present iff at least one
 // non-quiet pair survived, and obs bounded by hours-in-session x days
 // (each hour contributes at most `days` adjacent-day lead-in pairs).
+// Task 20 adds the HOURS: every bucket names the distinct UTC hours whose
+// non-quiet pairs fed avg - ascending ints 0..23, no dupes, non-empty iff
+// avg is non-null, bounded by the non-quiet pair count AND the session's
+// own hour count, and every listed hour really classifies into the bucket's
+// session (the classifySession UTC boundaries, mirrored below).
 const SESH = ['ASIA', 'LONDON', 'OVERLAP', 'NEWYORK', 'OFF']
-const HRS = { ASIA: 7, LONDON: 6, OVERLAP: 3, NEWYORK: 5, OFF: 3, OTC: 24 }
+// hours-in-session per classifySession's UTC boundaries: ASIA 0-7 (8),
+// LONDON 8-12 (5), OVERLAP 13-15 (3), NEWYORK 16-20 (5), OFF 21-23 (3).
+// (An earlier draft said 7/6 - off by one on both; fixed with Task 20.)
+const HRS = { ASIA: 8, LONDON: 5, OVERLAP: 3, NEWYORK: 5, OFF: 3, OTC: 24 }
+const sessOf = (h) => (h < 8 ? 'ASIA' : h < 13 ? 'LONDON' : h < 16 ? 'OVERLAP' : h < 21 ? 'NEWYORK' : 'OFF')
 const dprof = await get('/yesterday?tf=5m&days=3&profile=1')
 const prows = dprof.body.rows ?? []
 ok('profile: 200 + rows', dprof.status === 200 && dprof.body.ok === true && prows.length >= 1, `rows=${prows.length}`)
@@ -204,10 +213,20 @@ ok('profile: quiet <= obs, avg null iff all quiet, avg 0..100', prows.every((r) 
 ))
 ok('profile: obs bounded by hours-in-session x days', prows.every((r) => (r.profile ?? []).every((s) => s.obs <= (HRS[s.session] ?? 24) * 3)))
 ok('profile: per-row obs sums bounded by 24h x days', prows.every((r) => (r.profile ?? []).reduce((n, s) => n + s.obs, 0) <= 24 * 3))
+// hours (Task 20): the distinct UTC hours behind each bucket's average
+ok('profile hours: arrays of distinct ascending UTC ints, non-empty iff avg', prows.every((r) => (r.profile ?? []).every((s) =>
+  Array.isArray(s.hours) && s.hours.every((h, i) => Number.isInteger(h) && h >= 0 && h <= 23 && (i === 0 || h > s.hours[i - 1])) && (s.hours.length > 0) === (s.avg !== null),
+)), JSON.stringify(prows.find((r) => !r.otc)?.profile?.map((s) => `${s.session}:${s.avg ?? '--'}h${s.hours.length}`)))
+ok('profile hours: bounded by non-quiet pairs and by the session\'s own hours', prows.every((r) => (r.profile ?? []).every((s) =>
+  s.hours.length <= s.obs - s.quiet && s.hours.length <= (HRS[s.session] ?? 24),
+)))
+ok('profile hours: every listed hour classifies into the bucket\'s session', prows.every((r) => (r.profile ?? []).every((s) =>
+  s.session === 'OTC' || s.hours.every((h) => sessOf(h) === s.session),
+)), JSON.stringify(prows.find((r) => !r.otc)?.profile?.map((s) => `${s.session}:[${s.hours.join(',')}]`)))
 const scripted = prows.filter((r) => (r.profile ?? []).some((s) => s.obs > 0))
 ok('profile: measured rows exist (warmed universe)', scripted.length > 0, `scripted=${scripted.length}/${prows.length}`)
 const sp = scripted.find((r) => !r.otc) ?? scripted[0]
-if (sp) console.log(`  sample ${sp.asset} script: ${(sp.profile ?? []).map((s) => `${s.session}:${s.avg ?? '--'}(${s.obs}${s.quiet ? `-${s.quiet}q` : ''})`).join(' ')}`)
+if (sp) console.log(`  sample ${sp.asset} script: ${(sp.profile ?? []).map((s) => `${s.session}:${s.avg ?? '--'}(${s.obs}${s.quiet ? `-${s.quiet}q` : ''})[h${s.hours.join(',') || '-'}]`).join(' ')}`)
 
 // ---- script by class (Task 14): the class-level fold the panel renders ----
 // The panel folds each class's row profiles per session: obs/quiet sum

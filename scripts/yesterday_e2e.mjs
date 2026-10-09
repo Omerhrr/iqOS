@@ -194,8 +194,17 @@ ok('prior rhyme arithmetic consistent with dirAgree', d3priorEchoed.every((p) =>
 // (`sum`) so clients can fold exact higher-level aggregates (per class)
 // without averaging rounded averages. The flag is part of the cache key -
 // the profile scan lives beside its plain sibling, never contaminating it.
+// Task 20 adds the HOURS: every bucket names the distinct UTC hours whose
+// non-quiet pairs fed avg - ascending ints 0..23, no dupes, non-empty iff
+// avg is non-null, bounded by the non-quiet pair count AND the session's
+// own hour count, and every listed hour really classifies into the bucket's
+// session (the classifySession UTC boundaries, mirrored below).
 const SESH = ['ASIA', 'LONDON', 'OVERLAP', 'NEWYORK', 'OFF']
-const HRS = { ASIA: 7, LONDON: 6, OVERLAP: 3, NEWYORK: 5, OFF: 3, OTC: 24 }
+// hours-in-session per classifySession's UTC boundaries: ASIA 0-7 (8),
+// LONDON 8-12 (5), OVERLAP 13-15 (3), NEWYORK 16-20 (5), OFF 21-23 (3).
+// (An earlier draft said 7/6 - off by one on both; fixed with Task 20.)
+const HRS = { ASIA: 8, LONDON: 5, OVERLAP: 3, NEWYORK: 5, OFF: 3, OTC: 24 }
+const sessOf = (h) => (h < 8 ? 'ASIA' : h < 13 ? 'LONDON' : h < 16 ? 'OVERLAP' : h < 21 ? 'NEWYORK' : 'OFF')
 const dprof = await get('/yesterday?tf=5m&days=3&profile=1')
 const prows = dprof.body.rows ?? []
 ok('profile=1: 200 + rows', dprof.status === 200 && dprof.body.ok === true && prows.length >= 1, `status=${dprof.status} rows=${prows.length}`)
@@ -214,13 +223,23 @@ ok('profile: sum is the exact non-quiet total (round(sum/kept) == avg, 0 when al
   const kept = s.obs - s.quiet
   return Number.isInteger(s.sum) && s.sum >= 0 && (s.avg === null ? kept === 0 && s.sum === 0 : kept > 0 && Math.round(s.sum / kept) === s.avg)
 })), JSON.stringify(prows.find((r) => !r.otc)?.profile?.[0]))
+// hours (Task 20): the distinct UTC hours behind each bucket's average
+ok('profile hours: arrays of distinct ascending UTC ints, non-empty iff avg', prows.every((r) => (r.profile ?? []).every((s) =>
+  Array.isArray(s.hours) && s.hours.every((h, i) => Number.isInteger(h) && h >= 0 && h <= 23 && (i === 0 || h > s.hours[i - 1])) && (s.hours.length > 0) === (s.avg !== null),
+)), JSON.stringify(prows.find((r) => !r.otc)?.profile?.map((s) => `${s.session}:${s.avg ?? '--'}h${s.hours.length}`)))
+ok('profile hours: bounded by non-quiet pairs and by the session\'s own hours', prows.every((r) => (r.profile ?? []).every((s) =>
+  s.hours.length <= s.obs - s.quiet && s.hours.length <= (HRS[s.session] ?? 24),
+)))
+ok('profile hours: every listed hour classifies into the bucket\'s session', prows.every((r) => (r.profile ?? []).every((s) =>
+  s.session === 'OTC' || s.hours.every((h) => sessOf(h) === s.session),
+)), JSON.stringify(prows.find((r) => !r.otc)?.profile?.map((s) => `${s.session}:[${s.hours.join(',')}]`)))
 const scripted = prows.filter((r) => (r.profile ?? []).some((s) => s.obs > 0))
 ok('profile: measured rows exist on the warmed universe', scripted.length > 0, `scripted=${scripted.length}/${prows.length}`)
 ok('profile: absent without the flag (plain 3d scan)', (d3.body.rows ?? []).every((r) => r.profile === undefined))
 const dp2 = await get('/yesterday?tf=5m&days=3&profile=1')
 ok('profile scan cached separately (60s, same key)', dp2.body.ts === dprof.body.ts, `dprof.ts=${dprof.body.ts} dp2.ts=${dp2.body.ts}`)
 const spSample = scripted.find((r) => !r.otc) ?? scripted[0]
-if (spSample) console.log(`  sample ${spSample.asset} script: ${spSample.profile.map((s) => `${s.session}:${s.avg ?? '--'}(${s.obs}${s.quiet ? `-${s.quiet}q` : ''} +${s.sum})`).join(' ')}`)
+if (spSample) console.log(`  sample ${spSample.asset} script: ${spSample.profile.map((s) => `${s.session}:${s.avg ?? '--'}(${s.obs}${s.quiet ? `-${s.quiet}q` : ''} +${s.sum})[h${s.hours.join(',') || '-'}]`).join(' ')}`)
 console.log(`      profiled rows: ${scripted.length}/${prows.length}`)
 // clamp: 99 -> 7 (5m fits a week), depth gate: 1m + 3d needs 4442 bars > 4000
 const d7 = await get('/yesterday?tf=5m&days=99')

@@ -141,6 +141,36 @@ const SESSION_SHORT: Record<WatchSession, string> = {
  * dotted underline. */
 const OFF_MARK = '*'
 
+/** Compact run-length form of a bucket's contributing hours, for the
+ * panel's session tooltips: consecutive hours collapse into ranges, the
+ * rest stay comma-separated, everything zero-padded, sorted defensively
+ * (dedup included). `[9,10,11,12]` -> "09-12", `[13,15]` -> "13, 15",
+ * `[7]` -> "07", the full day -> "00-23", nothing -> "none". The kernel
+ * ships the hours behind each session average (SessionRhyme.hours); the
+ * tooltip's sentence is "the average is fed by echoes at 09-12 UTC" - which
+ * is exactly the question a peak cell asks: WHICH hours is this peak made
+ * of. Lives here so the bun unit can lock the exact strings beside the
+ * serializer it shares the module with. */
+export function fmtHours(hours: number[]): string {
+  const hs = [...new Set(hours)].sort((a, b) => a - b)
+  if (hs.length === 0) return 'none'
+  const p = (h: number) => String(h).padStart(2, '0')
+  const parts: string[] = []
+  let start = hs[0]
+  let prev = hs[0]
+  for (let i = 1; i <= hs.length; i++) {
+    const cur = hs[i]
+    if (cur === prev + 1) {
+      prev = cur
+      continue
+    }
+    parts.push(start === prev ? p(start) : `${p(start)}-${p(prev)}`)
+    start = cur
+    prev = cur
+  }
+  return parts.join(', ')
+}
+
 /** the canonical session order of a script line - the wire already ships
  * buckets in this order, but the serializer orders them itself so the text
  * is deterministic even against a hand-built profile */

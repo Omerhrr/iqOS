@@ -107,6 +107,16 @@
 // spells it out). The ranking itself is untouched - the caveat travels with
 // the number, it does not rewrite it.
 //
+// Every MEASURED script cell (and its class-strip fold) also names its
+// hours: the kernel ships, per bucket, the distinct UTC hours whose
+// non-quiet pairs fed the average (SessionRhyme.hours), and the tooltip
+// spells them out - "the average is fed by echoes at 13-15 UTC". The
+// question a peak cell always begged (WHICH hours is this peak made of?)
+// now answers itself; quiet pairs' hours are not listed (they feed obs,
+// never the average), so the listed hours are exactly what the number
+// rests on. Display-only: the snapshot's script sub-line stays averages
+// only, the hours ride the tooltips.
+//
 // The watchlist leaves the panel through the COPY button: the current view
 // (same filters, same sort) serialized into a shareable text snapshot - top
 // 10 rows, one line each (echo rhyme, week aggregate, peak session + spread,
@@ -135,7 +145,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Timeframe, YesterdayRow, YdaySession } from '@/lib/os/client'
 import { TIMEFRAME_SECONDS, fmtPrice, getYesterday } from '@/lib/os/client'
-import { RHYME_OK, RHYME_BAD, cmpBySort, buildWatchlist, parseWatchlist, type WatchSort, type WatchlistParse } from '@/lib/os/watchlist'
+import { RHYME_OK, RHYME_BAD, cmpBySort, buildWatchlist, parseWatchlist, fmtHours, type WatchSort, type WatchlistParse } from '@/lib/os/watchlist'
 
 interface YesterdayPanelProps {
   onClose: () => void
@@ -444,10 +454,12 @@ function PriorStrip({ r }: { r: YesterdayRow }) {
  * a single lucky hour is not a script) is marked bold at full color, and a
  * spread tag (best minus worst qualified) says how much the script differs
  * by time of day: near 0 the script is session-independent, a wide spread
- * means trade the pair only where it rhymes. OFF-HOURS averages (the OFF
- * bucket, obs > 0) sit under a dotted underline with the caveat in the
- * tooltip - real rhymes at hours where the books are thin, weight them
- * accordingly. */
+ * means trade the pair only where it rhymes. Every measured cell's tooltip
+ * names the UTC hours its average is fed by (fmtHours run-length form) -
+ * the peak cell's "which hours is this made of?" answers itself. OFF-HOURS
+ * averages (the OFF bucket, obs > 0) sit under a dotted underline with the
+ * caveat in the tooltip - real rhymes at hours where the books are thin,
+ * weight them accordingly. */
 function SessionScript({ prof }: { prof: NonNullable<YesterdayRow['profile']> }) {
   if (!prof.some((s) => s.obs > 0)) return null
   const quals = prof.filter((s) => s.obs - s.quiet >= 2 && s.avg != null)
@@ -458,7 +470,7 @@ function SessionScript({ prof }: { prof: NonNullable<YesterdayRow['profile']> })
     <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 font-mono text-[9px]">
       <span
         className="text-[#3d4d66]"
-        title="the same lead-in echo scored at EVERY hour of the day, averaged per trading session - does this pair's script differ ASIA vs LONDON vs NY? Quiet echoes (both lead-ins flat) are excluded from the averages; hours the series cannot cover are fewer observations, never zeros. The bold value is the peak session (2+ non-quiet observations required) and the spread tag is how far the worst qualified session sits below it."
+        title={`the same lead-in echo scored at EVERY hour of the day, averaged per trading session - does this pair's script differ ASIA vs LONDON vs NY? Quiet echoes (both lead-ins flat) are excluded from the averages; hours the series cannot cover are fewer observations, never zeros. Each measured cell's tooltip names the exact UTC hours its average is fed by. The bold value is the peak session (2+ non-quiet observations required) and the spread tag is how far the worst qualified session sits below it.`}
       >
         script
       </span>
@@ -483,7 +495,7 @@ function SessionScript({ prof }: { prof: NonNullable<YesterdayRow['profile']> })
           <span
             key={s.session}
             className={`${color}${isPeak ? ' font-bold' : ''}${offHours ? ' underline decoration-dotted decoration-[#4b5a72] underline-offset-2' : ''}`}
-            title={`${SESSION_LABEL[s.session]}: average rhyme ${s.avg ?? '—'}/100 across ${s.obs} adjacent-day lead-in echo${s.obs === 1 ? '' : 's'} scored at this session's hours (quiet excluded: ${s.quiet}${s.obs - s.quiet === s.obs && s.obs > 0 ? ' - every pair here was two flat hours' : ''}). Same rhyme score as the echo chip: direction 50 + move-vs-travel 30 + travel ratio 20.${isPeak ? ' PEAK of the script - the best average among sessions with at least two non-quiet observations.' : ''}${offHours ? ' OFF-HOURS CAVEAT: these hours sit outside the named sessions, where the books are thin and moves are small - the rhyme is real (quiet pairs are already excluded) but weight it accordingly.' : ''}`}
+            title={`${SESSION_LABEL[s.session]}: average rhyme ${s.avg ?? '—'}/100 across ${s.obs} adjacent-day lead-in echo${s.obs === 1 ? '' : 's'} scored at this session's hours (quiet excluded: ${s.quiet}${s.obs - s.quiet === s.obs && s.obs > 0 ? ' - every pair here was two flat hours' : ''}).${s.hours?.length ? ` The average is fed by echoes at ${fmtHours(s.hours)} UTC - the hours this number is actually made of${isPeak ? ', i.e. what the peak rests on' : ''}.` : ''} Same rhyme score as the echo chip: direction 50 + move-vs-travel 30 + travel ratio 20.${isPeak ? ' PEAK of the script - the best average among sessions with at least two non-quiet observations.' : ''}${offHours ? ' OFF-HOURS CAVEAT: these hours sit outside the named sessions, where the books are thin and moves are small - the rhyme is real (quiet pairs are already excluded) but weight it accordingly.' : ''}`}
           >
             {SESSION_LABEL[s.session]} {s.avg ?? '—'}
           </span>
@@ -756,23 +768,27 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
     if (!profOn) return []
     const rowsAll = data?.rows ?? []
     const fold = (pick: (r: YesterdayRow) => boolean) => {
-      const per = new Map<YdaySession, { obs: number; quiet: number; sum: number; kept: number }>()
+      const per = new Map<YdaySession, { obs: number; quiet: number; sum: number; kept: number; hrs: Set<number> }>()
       for (const r of rowsAll.filter(pick)) {
         for (const s of r.profile ?? []) {
           const kept = s.obs - s.quiet
-          const t = per.get(s.session) ?? { obs: 0, quiet: 0, sum: 0, kept: 0 }
+          const t = per.get(s.session) ?? { obs: 0, quiet: 0, sum: 0, kept: 0, hrs: new Set<number>() }
           t.obs += s.obs
           t.quiet += s.quiet
           if (kept > 0) {
             t.sum += s.sum ?? (s.avg ?? 0) * kept
             t.kept += kept
+            // the union of the rows' contributing hours - any row's non-quiet
+            // echo at an hour feeds the class average, so the class tooltip
+            // names the union (the same fmtHours run-length form)
+            for (const h of s.hours ?? []) t.hrs.add(h)
           }
           per.set(s.session, t)
         }
       }
       return SCRIPT_COLS.filter(({ session }) => per.has(session)).map(({ session }) => {
         const t = per.get(session)!
-        return { session, obs: t.obs, quiet: t.quiet, avg: t.kept > 0 ? Math.round(t.sum / t.kept) : null }
+        return { session, obs: t.obs, quiet: t.quiet, avg: t.kept > 0 ? Math.round(t.sum / t.kept) : null, hours: [...t.hrs].sort((a, b) => a - b) }
       })
     }
     return CLASS_DEFS.map(({ key, label, why, pick }) => ({ key, label, why, rows: rowsAll.filter(pick).length, cells: fold(pick) }))
@@ -1035,7 +1051,7 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
           className={`shrink-0 rounded border px-1.5 py-0.5 font-mono text-[8.5px] font-bold uppercase tracking-wider transition-colors ${
             profOn ? 'border-violet-500/40 bg-violet-500/15 text-violet-300' : 'border-[#1c2739] text-[#4b5a72] hover:text-[#aab6cc]'
           }`}
-          title="score the same lead-in echo at EVERY hour of the day and average it per trading session - does this pair's script differ ASIA vs LONDON vs NY? Each row grows a 'script' line (Asia / London / Lon-NY / NY / off-hours averages, quiet echoes excluded from the averages). -OTC pairs have no sessions - one day-wide OTC bucket. The kernel computes it from the candles the scan already pulls; the scan just reads more windows. The rhyme-by-class strip grows a matching 'script by class' readout - each class's averages folded across its rows."
+          title="score the same lead-in echo at EVERY hour of the day and average it per trading session - does this pair's script differ ASIA vs LONDON vs NY? Each row grows a 'script' line (Asia / London / Lon-NY / NY / off-hours averages, quiet echoes excluded from the averages) and every measured cell's tooltip names the exact UTC hours its average is fed by - which hours the peak rests on reads without leaving the panel. -OTC pairs have no sessions - one day-wide OTC bucket. The kernel computes it from the candles the scan already pulls; the scan just reads more windows. The rhyme-by-class strip grows a matching 'script by class' readout - each class's averages folded across its rows."
         >
           by session
         </button>
@@ -1277,7 +1293,7 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
                     <span
                       key={c.session}
                       className={`ml-1.5 ${color}${offHours ? ' underline decoration-dotted decoration-[#4b5a72] underline-offset-2' : ''}`}
-                      title={`${SESSION_LABEL[c.session]}${c.session === 'OTC' ? ' (day-wide bucket - -OTC pairs have no sessions, see analytics/session.ts)' : ''}: average rhyme ${c.avg ?? '—'}/100 across ${c.obs} adjacent-day lead-in echo${c.obs === 1 ? '' : 's'} in the class's rows at this session's hours (quiet excluded: ${c.quiet}; weighted by each row's observations). Same score as the echo chip: direction 50 + move-vs-travel 30 + travel ratio 20.${offHours ? ' OFF-HOURS CAVEAT: these hours sit outside the named sessions, where the books are thin - the rhyme is real but weight it accordingly.' : ''}`}
+                      title={`${SESSION_LABEL[c.session]}${c.session === 'OTC' ? ' (day-wide bucket - -OTC pairs have no sessions, see analytics/session.ts)' : ''}: average rhyme ${c.avg ?? '—'}/100 across ${c.obs} adjacent-day lead-in echo${c.obs === 1 ? '' : 's'} in the class's rows at this session's hours (quiet excluded: ${c.quiet}; weighted by each row's observations).${c.hours.length ? ` The average is fed by echoes at ${fmtHours(c.hours)} UTC - the union of every row's contributing hours.` : ''} Same score as the echo chip: direction 50 + move-vs-travel 30 + travel ratio 20.${offHours ? ' OFF-HOURS CAVEAT: these hours sit outside the named sessions, where the books are thin - the rhyme is real but weight it accordingly.' : ''}`}
                     >
                       {SCRIPT_COLS.find((s) => s.session === c.session)?.short ?? c.session} {c.avg ?? '—'}
                     </span>
@@ -1316,7 +1332,7 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
         ))}
         {data && data.rows.length > 0 && (
           <p className="px-1 pt-1 text-[8.5px] leading-relaxed text-[#3d4d66]">
-            Each row is the window that started at the bar forming exactly 24h ago, on the chart's timeframe. dir counts as up/down only when the net move exceeds 10% of the window's own travel. "arch" = bars from the kernel's accumulated store (broker bars in live mode), "seeded" = the feed's deterministic prehistory - never mistake a seeded yesterday for a remembered one. echo compares the lead-in windows ending at this same time of day (yesterday's ended at the anchor, today's within one bar of now): rhyme = direction 50 + move-vs-travel 30 + travel ratio 20, 70+ reads as "repeating the script", under 40 as "going its own way"; a rhyme between two FLAT lead-ins (net move under 10% of travel on both sides) is marked "quiet" - real but trivial, excluded from every aggregate. The rhyme-by-class strip averages each class's echo scores (compared rows only) - "are OTC pairs rhyming today?" is one glance away, and once the scan walks deeper than 1d each chip grows a ⟳ week number averaging every non-quiet echoed day-observation in class - "are they rhyming with the whole week, or only with yesterday?". Click a card to open that asset on the chart; click an echo chip to go further - the chart deep-loads the asset's full day of candles and scrolls onto yesterday's lead-in plus the forward replay window (edges the feed never remembered show as a gap, not filler). The day chips walk the same window further back - the "at this hour" strip shows each remembered day with its own coverage (days the series cannot cover are absent, not flat), each day's rhyme tag scores today's lead-in against THAT day's lead-in, and the "N/M rhyme" aggregate counts the days today actually rhymed with (70+, non-quiet comparisons) among the compared ones. The week sort orders the list by exactly that count - the strongest week rhymes float to the top (average rhyme breaking ties, biggest window move after that, quiet rhymes not counting), turning the panel into a best-echoes watchlist. The "by session" toggle goes one question deeper: the kernel re-scores the same adjacent-day lead-in echo at every hour of the day and averages it per trading session, so each row grows a "script" line - rhymes in London but not off-hours, or the reverse - with quiet echoes excluded from the averages and -OTC pairs collapsed into one day-wide bucket (they have no sessions). With the toggle on, the rhyme-by-class strip gains a sibling: script by class - each class's session averages folded across its rows (weighted by observations, quiet excluded), the OTC column separating the synthetic twins' day-wide script from the clock-bound classes'. The peak sort turns the script into a watchlist: the pair whose BEST session (2+ non-quiet observations) rhymes hardest floats to the top, the spread between best and worst qualified session breaking ties - and the script line marks the peak session bold beside a spread tag, so "trade it only where it rhymes" reads without the sort. Off-hours averages sit under a dotted underline (script line and class strip alike): those hours are outside the named sessions, where the books are thin - the rhyme is real, quiet pairs are already excluded, but weight it accordingly; the copy button marks such a peak off* in the snapshot and the legend spells it out. The copy button serializes exactly what you see - the same filters and sort, the top 10 rows as a text snapshot (echo rhyme, week aggregate, peak session, window move) headed by the scan time, the sort and the filters - and every row with a measured profile grows an indented script sub-line carrying its full session averages, so the shape of the script travels with the paste, not just the peak - ready to paste anywhere. The paste button closes the loop the copy opens: paste a snapshot back and its ranked pairs plus its sort ride again as a LENS over your own scan - the selection and the sort travel, every number re-reads from local data (a shared watchlist compares scripts, not numbers), pairs the local scan cannot see are counted as skipped rather than invented, the filter chips pause while the lens is on, and "back to live view" (or a class-chip click) hands control straight back.
+            Each row is the window that started at the bar forming exactly 24h ago, on the chart's timeframe. dir counts as up/down only when the net move exceeds 10% of the window's own travel. "arch" = bars from the kernel's accumulated store (broker bars in live mode), "seeded" = the feed's deterministic prehistory - never mistake a seeded yesterday for a remembered one. echo compares the lead-in windows ending at this same time of day (yesterday's ended at the anchor, today's within one bar of now): rhyme = direction 50 + move-vs-travel 30 + travel ratio 20, 70+ reads as "repeating the script", under 40 as "going its own way"; a rhyme between two FLAT lead-ins (net move under 10% of travel on both sides) is marked "quiet" - real but trivial, excluded from every aggregate. The rhyme-by-class strip averages each class's echo scores (compared rows only) - "are OTC pairs rhyming today?" is one glance away, and once the scan walks deeper than 1d each chip grows a ⟳ week number averaging every non-quiet echoed day-observation in class - "are they rhyming with the whole week, or only with yesterday?". Click a card to open that asset on the chart; click an echo chip to go further - the chart deep-loads the asset's full day of candles and scrolls onto yesterday's lead-in plus the forward replay window (edges the feed never remembered show as a gap, not filler). The day chips walk the same window further back - the "at this hour" strip shows each remembered day with its own coverage (days the series cannot cover are absent, not flat), each day's rhyme tag scores today's lead-in against THAT day's lead-in, and the "N/M rhyme" aggregate counts the days today actually rhymed with (70+, non-quiet comparisons) among the compared ones. The week sort orders the list by exactly that count - the strongest week rhymes float to the top (average rhyme breaking ties, biggest window move after that, quiet rhymes not counting), turning the panel into a best-echoes watchlist. The "by session" toggle goes one question deeper: the kernel re-scores the same adjacent-day lead-in echo at every hour of the day and averages it per trading session, so each row grows a "script" line - rhymes in London but not off-hours, or the reverse - with quiet echoes excluded from the averages and -OTC pairs collapsed into one day-wide bucket (they have no sessions), and every measured cell's tooltip names the exact UTC hours its average is fed by - the peak cell's "which hours is this made of?" answers itself (quiet pairs' hours are not listed: they feed obs, never the average). With the toggle on, the rhyme-by-class strip gains a sibling: script by class - each class's session averages folded across its rows (weighted by observations, quiet excluded), the OTC column separating the synthetic twins' day-wide script from the clock-bound classes'. The peak sort turns the script into a watchlist: the pair whose BEST session (2+ non-quiet observations) rhymes hardest floats to the top, the spread between best and worst qualified session breaking ties - and the script line marks the peak session bold beside a spread tag, so "trade it only where it rhymes" reads without the sort. Off-hours averages sit under a dotted underline (script line and class strip alike): those hours are outside the named sessions, where the books are thin - the rhyme is real, quiet pairs are already excluded, but weight it accordingly; the copy button marks such a peak off* in the snapshot and the legend spells it out. The copy button serializes exactly what you see - the same filters and sort, the top 10 rows as a text snapshot (echo rhyme, week aggregate, peak session, window move) headed by the scan time, the sort and the filters - and every row with a measured profile grows an indented script sub-line carrying its full session averages, so the shape of the script travels with the paste, not just the peak - ready to paste anywhere. The paste button closes the loop the copy opens: paste a snapshot back and its ranked pairs plus its sort ride again as a LENS over your own scan - the selection and the sort travel, every number re-reads from local data (a shared watchlist compares scripts, not numbers), pairs the local scan cannot see are counted as skipped rather than invented, the filter chips pause while the lens is on, and "back to live view" (or a class-chip click) hands control straight back.
           </p>
         )}
       </div>

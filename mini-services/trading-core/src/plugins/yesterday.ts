@@ -33,7 +33,10 @@
 // hour of the day, aggregated per trading session (analytics/yesterday's
 // buildSessionProfile). It costs days*24 extra lead-in reads per row but
 // fetches nothing - the pairs come from the candles the scan already pulled.
-// The flag is part of the cache key, so a profile scan and its plain
+// Each bucket also names the distinct UTC hours whose non-quiet pairs fed
+// its average (SessionRhyme.hours) - the panel spells them out in the
+// script cells' tooltips ("which hours is this peak made of?"). The flag is
+// part of the cache key, so a profile scan and its plain
 // sibling live beside each other instead of contaminating one another.
 
 import type { KernelContext, Plugin } from '../kernel'

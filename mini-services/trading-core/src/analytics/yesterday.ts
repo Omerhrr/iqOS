@@ -128,6 +128,15 @@ export interface SessionRhyme {
   sum: number
   /** mean rhyme of the non-quiet echoes, 0..100; null when none survived */
   avg: number | null
+  /** the DISTINCT UTC hours of day whose non-quiet pairs fed avg, ascending
+   * (a tf above 1h snaps the h:00 end back to its bar bucket, so the hour is
+   * always the one classifySession actually scored, never the nominal loop
+   * hour). Empty when avg is null - quiet pairs feed obs but no average, so
+   * their hours are not listed. The panel names these hours in every
+   * measured cell's tooltip ("the average is fed by echoes at 13-15 UTC"),
+   * which is exactly the question a peak cell asks: WHICH hours is this
+   * peak actually made of. */
+  hours: number[]
 }
 
 /** One remembered day BEFORE yesterday: the same forward window starting at
@@ -372,13 +381,19 @@ export function buildSessionProfile(
   const minBars = Math.max(1, Math.floor(barsExpected * 0.5))
   const midnight = opts.nowSec - (opts.nowSec % DAY_SEC)
   // per hour: lead-in stats keyed by how many days back the END sits
-  // (0 = today h:00, 1 = yesterday, ...); pair d = stats[d] vs stats[d - 1]
-  const tally = new Map<Session, { obs: number; quiet: number; sum: number }>()
+  // (0 = today h:00, 1 = yesterday, ...); pair d = stats[d] vs stats[d - 1].
+  // hrs remembers which UTC hours fed a NON-QUIET pair into the bucket (the
+  // hours behind avg - see SessionRhyme.hours).
+  const tally = new Map<Session, { obs: number; quiet: number; sum: number; hrs: Set<number> }>()
   for (let h = 0; h < 24; h++) {
     // the bar bucket at h:00 today (bar opens are tf-aligned, same snap as
     // every anchor here) - today's side only exists once its window is past
     const end0 = midnight + h * 3_600
     const e0 = end0 - (end0 % opts.tfSec)
+    // the hour the pairs at this slot are scored at - e0's own hour, the
+    // same input classifySession sees, so a coarse tf that snaps the end
+    // back across the hour boundary stays self-consistent
+    const endH = new Date(e0 * 1000).getUTCHours()
     const stats: (WinStats | null)[] = []
     for (let j = 0; j <= days; j++) {
       const end = e0 - DAY_SEC * j
@@ -391,10 +406,13 @@ export function buildSessionProfile(
       if (!sy || !st) continue
       const { rhyme, quiet } = rhymeScore(sy, st)
       const session = classifySession(e0, info.ticker)
-      const t = tally.get(session) ?? { obs: 0, quiet: 0, sum: 0 }
+      const t = tally.get(session) ?? { obs: 0, quiet: 0, sum: 0, hrs: new Set<number>() }
       t.obs++
       if (quiet) t.quiet++
-      else t.sum += rhyme
+      else {
+        t.sum += rhyme
+        t.hrs.add(endH)
+      }
       tally.set(session, t)
     }
   }
@@ -412,6 +430,9 @@ export function buildSessionProfile(
       quiet: t?.quiet ?? 0,
       sum: t?.sum ?? 0,
       avg: kept > 0 ? Math.round(t!.sum / kept) : null,
+      // ascending distinct hours of the non-quiet pairs - empty when nothing
+      // survived (honest zero, matching the obs 0 / avg null slots)
+      hours: t ? [...t.hrs].sort((a, b) => a - b) : [],
     }
   })
 }

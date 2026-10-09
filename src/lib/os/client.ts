@@ -540,6 +540,12 @@ export interface YdaySessionRhyme {
   sum?: number
   /** mean rhyme of the non-quiet echoes, 0..100; null when none survived */
   avg: number | null
+  /** the distinct UTC hours whose NON-quiet pairs fed avg, ascending - the
+   * hours a peak (or any measured cell) is actually made of, named in the
+   * cell's tooltip. Empty when avg is null (quiet pairs feed obs, not the
+   * average). Optional so an older kernel parses; the panel just omits the
+   * hours clause then. */
+  hours?: number[]
 }
 
 export interface YesterdayRow {
