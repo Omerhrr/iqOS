@@ -6,6 +6,7 @@
 //   - today lead-in    rises +0.40% with 0.80% travel  -> same dir, same mag
 //   - variant B: today lead-in FALLS -0.40%             -> opposite, rhyme 20
 //   - variant C: thin today side (under half covered)   -> echo null
+//   - quiet: dead-flat / near-flat both sides           -> quiet true, aggregates' problem
 // Run: bun scripts/yesterday_echo_unit.mjs
 import { buildPriorDay, buildYesterdayRow } from '../mini-services/trading-core/src/analytics/yesterday'
 
@@ -73,6 +74,7 @@ if (row) {
     ok('today lead-in move reproduced', Math.abs(e.todayMovePct - 0.4) < 0.01, `got ${e.todayMovePct}`)
     ok('dirAgree same (both up, same magnitude)', e.dirAgree === 'same', `got ${e.dirAgree}`)
     ok('rhyme 100 when the lead-ins match', e.rhyme === 100, `got ${e.rhyme}`)
+    ok('not quiet (both lead-ins directional)', e.quiet === false, `got ${e.quiet}`)
   }
 
   // variant B: today's lead-in falls -0.40% with the same travel -> opposite
@@ -85,6 +87,7 @@ if (row) {
     ok('variant B dirAgree opposite', eB.dirAgree === 'opposite', `got ${eB.dirAgree}`)
     // dir 0 + mag 30*(1-0.8/0.8)=0 + vol 20 -> 20
     ok('variant B rhyme 20 (opposite dir, same travel)', eB.rhyme === 20, `got ${eB.rhyme}`)
+    ok('variant B not quiet (both directional)', eB.quiet === false, `got ${eB.quiet}`)
   }
 
   // variant C: today's lead-in 70% missing (18 of 60 bars < half) -> echo null
@@ -101,6 +104,18 @@ if (row) {
   const rowD = buildYesterdayRow(info, [...flatY, ...flatFwd, ...flatT, ...tail], opts)
   const eD = rowD?.echo
   ok('variant D flat/flat rhyme 100 + same', eD?.rhyme === 100 && eD?.dirAgree === 'same', JSON.stringify(eD))
+  ok('variant D QUIET (dead-flat both sides)', eD?.quiet === true, `got ${eD?.quiet}`)
+
+  // variant E: NEAR-flat both sides (tiny but nonzero travel, |move| under
+  // 10% of it) -> dir 'none' on both sides -> quiet, same, rhyme 50..100
+  // (dir points are free; the ratio parts stay high on two matching dead
+  // windows). The exact case the quiet flag exists for: 90-from-flat.
+  const nearY = run(t0 - WIN, WIN / TF, base, 0.001, 0.02)
+  const nearT = run(t0 + DAY - WIN, WIN / TF, base, -0.0005, 0.02)
+  const rowE = buildYesterdayRow(info, [...nearY, ...flatFwd, ...nearT, ...tail], opts)
+  const eE = rowE?.echo
+  ok('variant E near-flat both sides -> quiet + same', eE?.quiet === true && eE?.dirAgree === 'same', JSON.stringify(eE))
+  ok('variant E quiet rhyme within 50..100', eE != null && eE.rhyme >= 50 && eE.rhyme <= 100, `got ${eE?.rhyme}`)
 
   // ---- prior days: the same window at T-48h, T-72h, ... ----
   // sparse series: an ENGINEERED T-48h window (-0.60% move, 1.00% travel)
@@ -146,6 +161,12 @@ if (row) {
   const prior2Fwd = run(t0 - DAY, WIN / TF, base, 0.01, 0.02)
   const pdUp = buildPriorDay(info, [...priorLeadUp, ...prior2Fwd, ...sparse].sort((a, b) => a.time - b.time), { nowSec, windowSec: WIN, tfSec: TF, back: 2, todayLeadIn: { stats: todayStats, barsFound: 60 } })
   ok('prior echo 100 on identical lead-ins', pdUp?.echo?.rhyme === 100 && pdUp?.echo?.dirAgree === 'same', JSON.stringify(pdUp?.echo))
+  ok('prior echo not quiet on directional lead-ins', pdUp?.echo?.quiet === false, JSON.stringify(pdUp?.echo))
+  // flat prior lead-in vs flat today side -> quiet: trivial agreement
+  const priorLeadFlat = run(t0 - DAY - WIN, WIN / TF, base, 0, 0.02)
+  const todayNoneStats = { movePct: 0, rangePct: 0.02, dir: 'none' }
+  const pdFlat = buildPriorDay(info, [...priorLeadFlat, ...prior2Fwd, ...sparse].sort((a, b) => a.time - b.time), { nowSec, windowSec: WIN, tfSec: TF, back: 2, todayLeadIn: { stats: todayNoneStats, barsFound: 60 } })
+  ok('prior echo QUIET on flat/flat lead-ins', pdFlat?.echo?.quiet === true && pdFlat?.echo?.dirAgree === 'same', JSON.stringify(pdFlat?.echo))
   const pdDown = buildPriorDay(info, [...priorLeadDown, ...prior2Fwd, ...sparse].sort((a, b) => a.time - b.time), { nowSec, windowSec: WIN, tfSec: TF, back: 2, todayLeadIn: { stats: todayStats, barsFound: 60 } })
   ok('prior echo 20 on opposite-dir same-travel', pdDown?.echo?.rhyme === 20 && pdDown?.echo?.dirAgree === 'opposite', JSON.stringify(pdDown?.echo))
   const pdThin = buildPriorDay(info, [...priorLeadUp.slice(0, 18), ...prior2Fwd, ...sparse].sort((a, b) => a.time - b.time), { nowSec, windowSec: WIN, tfSec: TF, back: 2, todayLeadIn: { stats: todayStats, barsFound: 60 } })
@@ -155,6 +176,7 @@ if (row) {
   // prior echo is null too (today is the weak side in every comparison)
   const rowPriorEcho = buildYesterdayRow(info, [...priorLeadUp, ...prior2Fwd, ...sparse].sort((a, b) => a.time - b.time), { ...opts, priorDays: 1 })
   ok('row path: prior echo wired from today lead-in', rowPriorEcho?.prior[0]?.echo?.rhyme === 100 && rowPriorEcho?.prior[0]?.echo?.dirAgree === 'same', JSON.stringify(rowPriorEcho?.prior[0]?.echo))
+  ok('row path: prior echo quiet flag boolean', typeof rowPriorEcho?.prior[0]?.echo?.quiet === 'boolean', JSON.stringify(rowPriorEcho?.prior[0]?.echo))
   ok('row path: prior anchor is exactly t0 - DAY', rowPriorEcho?.prior[0]?.thenTs === t0 - DAY, `thenTs=${rowPriorEcho?.prior[0]?.thenTs} expected=${t0 - DAY}`)
   const seriesThinToday = [...ydayLead, ...ydayFwd, ...thin, ...tail]
   const rowThinToday = buildYesterdayRow(info, [...priorLeadUp, ...prior2Fwd, ...seriesThinToday].sort((a, b) => a.time - b.time), { ...opts, priorDays: 1 })

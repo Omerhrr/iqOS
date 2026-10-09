@@ -43,6 +43,9 @@
 // - dir is scale-invariant: a window counts as directional only when its net
 //   move exceeds 10% of its own high-low travel - a 0.05% drift inside a
 //   0.6% chop is flat, no matter the asset class.
+// - a rhyme between two FLAT lead-ins is real but trivial (both sides did
+//   nothing - the direction points are awarded for free), so the echo carries
+//   `quiet` and the panel marks it and keeps it out of every aggregate.
 
 import { classifySession, type Session } from './session'
 import type { AssetCategory, Candle } from '../types'
@@ -69,6 +72,11 @@ export interface YesterdayEcho {
   /** 0..100 - direction agreement (50) + move magnitude vs yesterday's own
    * travel (30) + travel ratio (20). >=70 rhymes, <40 diverges. */
   rhyme: number
+  /** both lead-ins were FLAT (|move| under 10% of the window's own travel on
+   * both sides): the agreement is real but trivial - two dead hours rhyme
+   * perfectly and mean nothing. Aggregates exclude quiet echoes; the panel
+   * marks them instead of letting 90-from-flat masquerade as a strong echo. */
+  quiet: boolean
 }
 
 /** The per-prior-day echo: today's lead-in vs THAT day's lead-in, scored
@@ -79,6 +87,9 @@ export interface PriorEcho {
    * delta vs this day's own travel 30 + travel ratio 20) */
   rhyme: number
   dirAgree: YesterdayEcho['dirAgree']
+  /** both lead-ins flat (see YesterdayEcho.quiet) - trivial agreement,
+   * excluded from the panel's aggregates */
+  quiet: boolean
 }
 
 /** One remembered day BEFORE yesterday: the same forward window starting at
@@ -195,8 +206,14 @@ function windowStats(win: Candle[]): WinStats | null {
 /** The rhyme score's three parts, kept explicit so the panel tooltip can
  * quote them: direction (50), move delta in units of yesterday's travel
  * (30, scale-free), travel ratio (20). Dead-flat on both sides agrees
- * perfectly; yesterday flat + today moving disagrees. */
-function rhymeScore(sy: WinStats, st: WinStats): { rhyme: number; dirAgree: YesterdayEcho['dirAgree'] } {
+ * perfectly; yesterday flat + today moving disagrees.
+ *
+ * QUIET: when BOTH lead-ins are flat by the module's own scale-invariant
+ * rule (|move| under 10% of the window's own travel - the same rule that
+ * sets dir), the agreement is real but trivial - two dead hours "rhyme"
+ * at 50+ points of direction alone. The flag rides the score so the panel
+ * can mark it and keep it out of every aggregate. */
+function rhymeScore(sy: WinStats, st: WinStats): { rhyme: number; dirAgree: YesterdayEcho['dirAgree']; quiet: boolean } {
   const dirAgree: YesterdayEcho['dirAgree'] =
     sy.dir === st.dir ? 'same' : sy.dir === 'none' || st.dir === 'none' ? 'partial' : 'opposite'
   const dirPts = dirAgree === 'same' ? 50 : dirAgree === 'partial' ? 25 : 0
@@ -213,7 +230,8 @@ function rhymeScore(sy: WinStats, st: WinStats): { rhyme: number; dirAgree: Yest
     volPts = 20 * Math.max(0, 1 - Math.abs(1 - st.rangePct / sy.rangePct))
   }
   const rhyme = Math.max(0, Math.min(100, Math.round(dirPts + magPts + volPts)))
-  return { rhyme, dirAgree }
+  const quiet = sy.dir === 'none' && st.dir === 'none'
+  return { rhyme, dirAgree, quiet }
 }
 
 /** One remembered day before yesterday, or null when the series does not
@@ -246,8 +264,8 @@ export function buildPriorDay(
     if (backP.length >= minBars) {
       const sy = windowStats(backP)
       if (sy) {
-        const { rhyme, dirAgree } = rhymeScore(sy, opts.todayLeadIn.stats)
-        echo = { rhyme, dirAgree }
+        const { rhyme, dirAgree, quiet } = rhymeScore(sy, opts.todayLeadIn.stats)
+        echo = { rhyme, dirAgree, quiet }
       }
     }
   }
@@ -315,7 +333,7 @@ export function buildYesterdayRow(info: YesterdayInfo, candles: Candle[], opts: 
   if (backY.length >= minBars && todayLeadIn) {
     const sy = windowStats(backY)
     if (sy) {
-      const { rhyme, dirAgree } = rhymeScore(sy, todayStats!)
+      const { rhyme, dirAgree, quiet } = rhymeScore(sy, todayStats!)
       echo = {
         ydayMovePct: r4(sy.movePct),
         ydayRangePct: r4(sy.rangePct),
@@ -324,6 +342,7 @@ export function buildYesterdayRow(info: YesterdayInfo, candles: Candle[], opts: 
         todayBarsFound: backT.length,
         dirAgree,
         rhyme,
+        quiet,
       }
     }
   }

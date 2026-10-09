@@ -105,6 +105,24 @@ ok('dirAgree consistent with the moves', withEcho.every((r) => {
   return fy !== ft
 }))
 ok('echo present on most rows (warmed sim covers both lead-ins)', withEcho.length >= Math.floor(rows.length * 0.8), `echo=${withEcho.length}/${rows.length}`)
+// QUIET flag: both lead-ins flat by the module's 10%-of-own-travel rule ->
+// the agreement is real but trivial. On the wire the flag must be a boolean,
+// imply dirAgree 'same' + rhyme >= 50 (free direction points), and agree
+// with the lead-in moves/travels the main echo carries (prior echoes have
+// no lead-in numbers on the wire, so the arithmetic check is main-only).
+ok('quiet flag well-formed + consistent (main echo)', withEcho.every((r) => {
+  const e = r.echo
+  if (typeof e.quiet !== 'boolean') return false
+  if (!e.quiet) return true
+  return e.dirAgree === 'same' && e.rhyme >= 50 &&
+    flat(e.ydayMovePct, e.ydayRangePct) && flat(e.todayMovePct, e.todayRangePct)
+}))
+ok('non-quiet echoes have a real mover on one side', withEcho.every((r) => {
+  const e = r.echo
+  if (e.quiet) return true
+  return Math.abs(e.ydayMovePct) > e.ydayRangePct * 0.1 - 0.001 || Math.abs(e.todayMovePct) > e.todayRangePct * 0.1 - 0.001
+}))
+console.log(`      quiet echoes: ${withEcho.filter((r) => r.echo.quiet).length}/${withEcho.length}`)
 if (r0 && r0.echo) {
   ok('echo rhyme inside 0..100', r0.echo.rhyme >= 0 && r0.echo.rhyme <= 100, `rhyme=${r0.echo.rhyme}`)
   ok('echo today side bounded by the window', r0.echo.todayBarsFound >= Math.max(1, Math.floor(r0.barsExpected * 0.5)) && r0.echo.todayBarsFound <= r0.barsExpected, `today=${r0.echo.todayBarsFound}/${r0.barsExpected}`)
@@ -148,6 +166,12 @@ ok('prior echoes well-formed when present', d3rows.every((r) => (r.prior ?? []).
 const d3priorEntries = d3rows.flatMap((r) => r.prior ?? [])
 const d3priorEchoed = d3priorEntries.filter((p) => p.echo != null)
 ok('prior echoes present on most remembered days (sim prehistory covers)', d3priorEntries.length > 0 && d3priorEchoed.length >= Math.floor(d3priorEntries.length * 0.7), `echoed=${d3priorEchoed.length}/${d3priorEntries.length}`)
+ok('prior echoes: quiet well-formed, implies same + rhyme >= 50', d3priorEchoed.every((p) => {
+  if (typeof p.echo.quiet !== 'boolean') return false
+  if (!p.echo.quiet) return true
+  return p.echo.dirAgree === 'same' && p.echo.rhyme >= 50
+}))
+console.log(`      quiet prior echoes: ${d3priorEchoed.filter((p) => p.echo.quiet).length}/${d3priorEchoed.length}`)
 // rhyme arithmetic bounds by dirAgree: same = 50 dir pts + 0..50 -> >=50,
 // opposite = 0 dir pts + <=30 + <=20 -> <=50, partial = 25 + 0..50 -> 25..75
 ok('prior rhyme arithmetic consistent with dirAgree', d3priorEchoed.every((p) =>

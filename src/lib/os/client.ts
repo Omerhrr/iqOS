@@ -468,6 +468,10 @@ export interface YdayPriorEcho {
   /** 0..100 - direction agreement (50) + move magnitude vs this day's own travel (30) + travel ratio (20) */
   rhyme: number
   dirAgree: 'same' | 'partial' | 'opposite'
+  /** both lead-ins flat (|move| < 10% of travel either side) - a real but
+   * trivial agreement; the panel marks it and keeps it out of the aggregates.
+   * Optional on the wire so an older kernel still parses. */
+  quiet?: boolean
 }
 
 /** One remembered day BEFORE yesterday (T-48h, T-72h, ...): the same forward
@@ -510,6 +514,11 @@ export interface YesterdayEcho {
   dirAgree: 'same' | 'partial' | 'opposite'
   /** 0..100 - direction agreement (50) + move magnitude vs yesterday's own travel (30) + travel ratio (20) */
   rhyme: number
+  /** both lead-ins flat (|move| < 10% of travel either side) - a real but
+   * trivial agreement (two dead hours rhyme perfectly); the panel marks it
+   * and keeps it out of the aggregates. Optional on the wire so an older
+   * kernel still parses. */
+  quiet?: boolean
 }
 
 export interface YesterdayRow {

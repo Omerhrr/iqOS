@@ -57,6 +57,14 @@
 // first, the average rhyme across those observations breaking ties, biggest
 // window move after that. It disables at 1d, where the week would just be
 // yesterday again (and falls back to the rhyme order if the depth drops).
+//
+// The QUIET flag guards all of it against one false signal: two FLAT
+// lead-ins agree trivially (direction points for free), so a pair of dead
+// hours can score 90+ while meaning nothing. The kernel marks such echoes
+// (both sides flat by the same 10%-of-own-travel rule that sets dir), the
+// panel dims them and tags them "quiet", and every aggregate - the row's
+// N/M count, the class averages, the week averages, the week sort -
+// excludes them with the exclusion counts in the tooltips.
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { Timeframe, YesterdayRow } from '@/lib/os/client'
 import { TIMEFRAME_SECONDS, fmtPrice, getYesterday } from '@/lib/os/client'
@@ -110,12 +118,16 @@ function maxDaysFor(tf: Timeframe, windowMin: number): number {
 /** Week-rhyme ranking for the "week" sort - the best-echoes watchlist order:
  * rows rhyming (70+) with the MOST remembered days at this hour first
  * (yesterday's echo included, no-echo days excluded - the same observations
- * the PriorStrip's "N/M rhyme" counts), the average rhyme across those
- * observations breaking ties, biggest yesterday-window move after that.
- * Rows without any comparison sink to the bottom (-1 average). */
+ * the PriorStrip's "N/M rhyme" counts, QUIET rhymes excluded too - a rhyme
+ * between two flat lead-ins is real but trivial), the average rhyme across
+ * those observations breaking ties, biggest yesterday-window move after
+ * that. Rows without any non-quiet comparison sink to the bottom (-1
+ * average). */
 function weekRhymeCmp(a: YesterdayRow, b: YesterdayRow): number {
-  const obs = (r: YesterdayRow) =>
-    [r.echo?.rhyme, ...(r.prior ?? []).map((p) => p.echo?.rhyme)].filter((x): x is number => x != null)
+  const obs = (r: YesterdayRow): number[] => [
+    ...(r.echo && r.echo.quiet !== true ? [r.echo.rhyme] : []),
+    ...(r.prior ?? []).flatMap((p) => (p.echo && p.echo.quiet !== true ? [p.echo.rhyme] : [])),
+  ]
   const ea = obs(a)
   const eb = obs(b)
   const ra = ea.filter((x) => x >= RHYME_OK).length
@@ -171,10 +183,14 @@ function ShapeBar({ r }: { r: YesterdayRow }) {
 
 /** The rhyme badge: is today's lead-in echoing yesterday's? Color carries
  * the verdict (emerald rhymes / amber partial / rose diverges), the tooltip
- * quotes the score's three parts. Clicking jumps the chart onto the script:
- * yesterday's lead-in plus the forward replay window (the page deep-loads a
- * day of bars first, so the story actually has history behind it). */
+ * quotes the score's three parts. QUIET rhymes (both lead-ins flat - two
+ * dead hours agreeing trivially) are dimmed and marked, so a 90-from-flat
+ * never masquerades as a strong echo. Clicking jumps the chart onto the
+ * script: yesterday's lead-in plus the forward replay window (the page
+ * deep-loads a day of bars first, so the story actually has history behind
+ * it). */
 function EchoChip({ e, onJump }: { e: NonNullable<YesterdayRow['echo']>; onJump?: () => void }) {
+  const q = e.quiet === true
   const cls =
     e.rhyme >= RHYME_OK
       ? 'bg-emerald-500/15 text-emerald-300'
@@ -190,10 +206,11 @@ function EchoChip({ e, onJump }: { e: NonNullable<YesterdayRow['echo']>; onJump?
         ev.stopPropagation()
         onJump?.()
       }}
-      className={`cursor-pointer rounded px-1.5 py-px font-mono text-[10px] font-bold transition hover:brightness-150 ${cls}`}
-      title={`echo rhyme ${e.rhyme}/100 (${word}) - direction agreement 50 pts (yesterday ${e.dirAgree}), today's move vs yesterday's measured against yesterday's own travel 30 pts, travel ratio 20 pts. Lead-in windows end at the same wall-clock moment: yesterday's at the anchor, today's within one bar of now. Click: the chart loads this asset's full day of bars and scrolls onto yesterday's lead-in + the forward replay window.`}
+      className={`cursor-pointer rounded px-1.5 py-px font-mono text-[10px] font-bold transition hover:brightness-150 ${cls}${q ? ' opacity-70' : ''}`}
+      title={`echo rhyme ${e.rhyme}/100 (${word}) - direction agreement 50 pts (yesterday ${e.dirAgree}), today's move vs yesterday's measured against yesterday's own travel 30 pts, travel ratio 20 pts.${q ? ' QUIET: both lead-ins flat (net move under 10% of travel on both sides) - the agreement is real but trivial (two dead hours), so aggregates do not count it.' : ''} Lead-in windows end at the same wall-clock moment: yesterday's at the anchor, today's within one bar of now. Click: the chart loads this asset's full day of bars and scrolls onto yesterday's lead-in + the forward replay window.`}
     >
       {glyph} {e.rhyme}
+      {q && <span className="ml-1 font-normal text-[8.5px] opacity-80">quiet</span>}
     </button>
   )
 }
@@ -304,14 +321,23 @@ function RowCard({ r, onSelectAsset, onFocusWindow, windowMin }: { r: YesterdayR
  * remembered day also carries its own rhyme tag (today's lead-in vs THAT
  * day's lead-in), and the aggregate "N/M rhyme" says whether the rhyme held
  * across the week or only matched yesterday - compared days only, never
- * zero-filled. */
+ * zero-filled. QUIET rhymes (both lead-ins flat - trivial agreement) are
+ * marked on the day tags and excluded from the aggregate, with the
+ * exclusion count in its tooltip. */
 function PriorStrip({ r }: { r: YesterdayRow }) {
   const prior = r.prior ?? []
   if (prior.length === 0) return null
   const days = prior.length + 1
   const ups = prior.filter((p) => p.dir === 'up').length + (r.dir === 'up' ? 1 : 0)
-  const echoes = [r.echo?.rhyme, ...prior.map((p) => p.echo?.rhyme)].filter((x): x is number => x != null)
-  const rhymed = echoes.filter((x) => x >= RHYME_OK).length
+  // every echoed day-observation with its quiet flag - the aggregate ranks
+  // only non-quiet rhymes (a rhyme between two flat hours is real but trivial)
+  const obs = [
+    ...(r.echo ? [{ v: r.echo.rhyme, q: r.echo.quiet === true }] : []),
+    ...(r.prior ?? []).flatMap((p) => (p.echo ? [{ v: p.echo.rhyme, q: p.echo.quiet === true }] : [])),
+  ]
+  const kept = obs.filter((o) => !o.q)
+  const quietN = obs.length - kept.length
+  const rhymed = kept.filter((o) => o.v >= RHYME_OK).length
   return (
     <div className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 font-mono text-[9px]">
       <span className="text-[#3d4d66]">at this hour</span>
@@ -319,12 +345,13 @@ function PriorStrip({ r }: { r: YesterdayRow }) {
         <span
           key={p.back}
           className={p.dir === 'up' ? 'text-emerald-300/80' : p.dir === 'down' ? 'text-rose-300/80' : 'text-[#7c8aa5]'}
-          title={`${p.back}d ago, the ${p.barsFound}/${p.barsExpected}-bar window from ${new Date(p.thenTs * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}: ${p.movePct >= 0 ? '+' : ''}${p.movePct.toFixed(2)}% move, ${p.rangePct.toFixed(2)}% travel, session ${p.session}${p.echo ? ` - today's lead-in vs this day's: rhyme ${p.echo.rhyme}/100 (${p.echo.dirAgree})` : ' - no echo (a side under half covered)'}`}
+          title={`${p.back}d ago, the ${p.barsFound}/${p.barsExpected}-bar window from ${new Date(p.thenTs * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}: ${p.movePct >= 0 ? '+' : ''}${p.movePct.toFixed(2)}% move, ${p.rangePct.toFixed(2)}% travel, session ${p.session}${p.echo ? ` - today's lead-in vs this day's: rhyme ${p.echo.rhyme}/100 (${p.echo.dirAgree})${p.echo.quiet === true ? ' - QUIET, both lead-ins flat (trivial agreement, excluded from aggregates)' : ''}` : ' - no echo (a side under half covered)'}`}
         >
           {p.back}d {p.dir === 'up' ? '\u25b2' : p.dir === 'down' ? '\u25bc' : '\u2014'}{Math.abs(p.movePct).toFixed(2)}
           {p.echo && (
-            <span className={`ml-1 ${p.echo.rhyme >= RHYME_OK ? 'text-emerald-300' : p.echo.rhyme >= RHYME_BAD ? 'text-amber-300' : 'text-rose-300'}`}>
+            <span className={`ml-1 ${p.echo.rhyme >= RHYME_OK ? 'text-emerald-300' : p.echo.rhyme >= RHYME_BAD ? 'text-amber-300' : 'text-rose-300'}${p.echo.quiet === true ? ' opacity-70' : ''}`}>
               {p.echo.rhyme >= RHYME_OK ? '\u27f3' : p.echo.rhyme >= RHYME_BAD ? '\u2248' : '\u2717'}{p.echo.rhyme}
+              {p.echo.quiet === true && <span className="font-normal opacity-80">q</span>}
             </span>
           )}
         </span>
@@ -332,12 +359,12 @@ function PriorStrip({ r }: { r: YesterdayRow }) {
       <span className="ml-auto text-[#4b5a72]" title={`of the last ${days} days at this hour (yesterday's replay included), ${ups} opened a window that closed up`}>
         {ups}/{days} up
       </span>
-      {echoes.length > 0 && (
+      {kept.length > 0 && (
         <span
           className={rhymed > 0 ? 'text-emerald-300/80' : 'text-[#4b5a72]'}
-          title={`today's lead-in rhymed (score ${RHYME_OK}+) with ${rhymed} of the ${echoes.length} remembered day${echoes.length === 1 ? '' : 's'} at this hour (yesterday included). Days without a comparison are excluded, not scored zero - so "0/3" can still mean every side was dark.`}
+          title={`today's lead-in rhymed (score ${RHYME_OK}+) with ${rhymed} of the ${kept.length} remembered day${kept.length === 1 ? '' : 's'} at this hour (yesterday included, non-quiet comparisons only). Days without a comparison are excluded, not scored zero - so "0/3" can still mean every side was dark.${quietN > 0 ? ` ${quietN} quiet rhym${quietN === 1 ? 'e is' : 'es are'} excluded (both lead-ins flat - the agreement was trivial).` : ''}`}
         >
-          {'\u27f3'} {rhymed}/{echoes.length} rhyme
+          {'\u27f3'} {rhymed}/{kept.length} rhyme
         </span>
       )}
     </div>
@@ -436,35 +463,41 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
   const ageSec = data ? Math.max(0, Math.round((now - data.ts) / 1000)) : 0
 
   // per-class rhyme averages - "are OTC pairs rhyming today?" at a glance.
-  // Averages run ONLY over rows carrying an echo (the honest denominator);
-  // the OTC entry answers over the otc flag (mostly the -OTC fx twins), the
-  // others over r.category. The week average (wkAvg) runs the same arithmetic
-  // over EVERY echoed day-observation in class - the row's own echo plus each
-  // remembered prior day's, same inclusion rule as the row's "N/M rhyme"
-  // (yesterday included, no-echo days excluded, never zeroed) - so "are OTC
-  // pairs rhyming with the whole week?" is the glance next to it. The strip
-  // always reads the FULL scan - it is a readout, and its click just sets the
-  // filters above.
+  // Averages run ONLY over rows carrying a NON-QUIET echo (the honest
+  // denominator; a rhyme between two flat lead-ins is real but trivial and
+  // would inflate the average - quiet echoes are excluded and counted for
+  // the tooltips); the OTC entry answers over the otc flag (mostly the -OTC
+  // fx twins), the others over r.category. The week average (wkAvg) runs the
+  // same arithmetic over EVERY non-quiet echoed day-observation in class -
+  // the row's own echo plus each remembered prior day's, same inclusion rule
+  // as the row's "N/M rhyme" (yesterday included, no-echo days excluded,
+  // never zeroed) - so "are OTC pairs rhyming with the whole week?" is the
+  // glance next to it. The strip always reads the FULL scan - it is a
+  // readout, and its click just sets the filters above.
   const classRhyme = useMemo(() => {
     const rowsAll = data?.rows ?? []
     const build = (pick: (r: YesterdayRow) => boolean) => {
       const sub = rowsAll.filter(pick)
-      const es = sub.flatMap((r) => (r.echo ? [r.echo.rhyme] : []))
+      const es = sub.flatMap((r) => (r.echo && r.echo.quiet !== true ? [r.echo.rhyme] : []))
       const avg = es.length ? Math.round(es.reduce((s, x) => s + x, 0) / es.length) : null
       const wk = sub.flatMap((r) => [
-        ...(r.echo ? [r.echo.rhyme] : []),
-        ...(r.prior ?? []).flatMap((p) => (p.echo ? [p.echo.rhyme] : [])),
+        ...(r.echo && r.echo.quiet !== true ? [r.echo.rhyme] : []),
+        ...(r.prior ?? []).flatMap((p) => (p.echo && p.echo.quiet !== true ? [p.echo.rhyme] : [])),
       ])
       const wkAvg = wk.length ? Math.round(wk.reduce((s, x) => s + x, 0) / wk.length) : null
+      const mainQuiet = sub.filter((r) => r.echo?.quiet === true).length
+      const wkQuiet = sub.reduce((n, r) => n + (r.echo?.quiet === true ? 1 : 0) + (r.prior ?? []).filter((p) => p.echo?.quiet === true).length, 0)
       return {
         rows: sub.length,
         compared: es.length,
         ok: es.filter((x) => x >= RHYME_OK).length,
         bad: es.filter((x) => x < RHYME_BAD).length,
         avg,
+        mainQuiet,
         wkObs: wk.length,
         wkRhymed: wk.filter((x) => x >= RHYME_OK).length,
         wkAvg,
+        wkQuiet,
       }
     }
     return [
@@ -661,7 +694,7 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
           {(
             [
               ['all', 'all', 'every row - rhyming, diverging and rows with no comparison'],
-              ['rhymes', `rhymes${rhymeLive > 0 ? ` ${rhymeLive}` : ''}`, `only rows scoring ${RHYME_OK}+ - today is tracing yesterday's lead-in`],
+              ['rhymes', `rhymes${rhymeLive > 0 ? ` ${rhymeLive}` : ''}`, `only rows scoring ${RHYME_OK}+ - today is tracing yesterday's lead-in (quiet rhymes still count here - the filter reads the score, the aggregates mark them)`],
               ['diverges', 'diverge', `only rows scoring under ${RHYME_BAD} - today is going its own way`],
             ] as [EchoF, string, string][]
           ).map(([v, label, why]) => (
@@ -690,7 +723,7 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
               ['move', 'move', 'biggest yesterday-window move first (kernel order)'],
               ['since', 'since', 'biggest 24h drift first - where the market has gone since that moment'],
               ['rhyme', 'rhyme', 'best echo rhyme first - where today is repeating yesterday\'s lead-in (rows without a comparison sink)'],
-              ['week', 'week', "best echoes of the week first - rows rhyming (70+) with the most remembered days at this hour, average rhyme breaking ties (rows without any comparison sink)"],
+              ['week', 'week', "best echoes of the week first - rows rhyming (70+) with the most remembered days at this hour, average rhyme breaking ties (rows without any non-quiet comparison sink - quiet rhymes, both lead-ins flat, don't count)"],
               ['range', 'range', 'widest high-low travel in the window first - the most restless hours'],
             ] as [Sort, string, string][]
           ).map(([v, label, why]) => {
@@ -764,8 +797,8 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
                 className="shrink-0 rounded px-1 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wider transition-colors hover:bg-[#141d2e]"
                 title={
                   agg.avg == null
-                    ? `${why} - none of the ${agg.rows} row${agg.rows === 1 ? '' : 's'} in class carries an echo (lead-ins under half covered)`
-                    : `${why} - average echo rhyme ${agg.avg}/100 across ${agg.compared} of ${agg.rows} row${agg.rows === 1 ? '' : 's'} in class (${agg.ok} rhyming ${RHYME_OK}+, ${agg.bad} diverging under ${RHYME_BAD}); the rest have no comparison.${weekLive ? ' The ⟳ number is the week rhyme (hover it).' : ''} Click to filter.`
+                    ? `${why} - none of the ${agg.rows} row${agg.rows === 1 ? '' : 's'} in class carries a non-quiet echo${agg.mainQuiet > 0 ? ` (${agg.mainQuiet} quiet: both lead-ins flat, trivial agreement)` : ' (lead-ins under half covered)'}`
+                    : `${why} - average echo rhyme ${agg.avg}/100 across ${agg.compared} of ${agg.rows} row${agg.rows === 1 ? '' : 's'} in class (${agg.ok} rhyming ${RHYME_OK}+, ${agg.bad} diverging under ${RHYME_BAD}; the rest have no comparison${agg.mainQuiet > 0 ? `; ${agg.mainQuiet} quiet rhym${agg.mainQuiet === 1 ? 'e' : 's'} excluded - both lead-ins flat` : ''}).${weekLive ? ' The ⟳ number is the week rhyme (hover it).' : ''} Click to filter.`
                 }
               >
                 <span className="text-[#4b5a72]">{label}</span>{' '}
@@ -778,7 +811,7 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
                 {weekLive && agg.wkAvg != null && (
                   <span
                     className={`ml-1 ${wkColor}`}
-                    title={`week rhyme: average ${agg.wkAvg}/100 across ${agg.wkObs} echoed day-observation${agg.wkObs === 1 ? '' : 's'} in class - yesterday's echo + each remembered prior day's (${agg.wkRhymed} scored ${RHYME_OK}+). Same exclusion rule as the row aggregate: no-echo days are left out, not scored zero.${agg.wkObs === agg.compared ? ' No remembered prior days in this class yet - the week here is yesterday only.' : ''}`}
+                    title={`week rhyme: average ${agg.wkAvg}/100 across ${agg.wkObs} non-quiet echoed day-observation${agg.wkObs === 1 ? '' : 's'} in class - yesterday's echo + each remembered prior day's (${agg.wkRhymed} scored ${RHYME_OK}+). Same exclusion rule as the row aggregate: no-echo days are left out, not scored zero, and quiet rhymes (both lead-ins flat) are excluded too${agg.wkQuiet > 0 ? ` - ${agg.wkQuiet} quiet here` : ''}.${agg.wkObs === agg.compared ? ' No remembered prior days in this class yet - the week here is yesterday only.' : ''}`}
                   >
                     {'\u27f3'}
                     {agg.wkAvg}
@@ -815,7 +848,7 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
         ))}
         {data && data.rows.length > 0 && (
           <p className="px-1 pt-1 text-[8.5px] leading-relaxed text-[#3d4d66]">
-            Each row is the window that started at the bar forming exactly 24h ago, on the chart's timeframe. dir counts as up/down only when the net move exceeds 10% of the window's own travel. "arch" = bars from the kernel's accumulated store (broker bars in live mode), "seeded" = the feed's deterministic prehistory - never mistake a seeded yesterday for a remembered one. echo compares the lead-in windows ending at this same time of day (yesterday's ended at the anchor, today's within one bar of now): rhyme = direction 50 + move-vs-travel 30 + travel ratio 20, 70+ reads as "repeating the script", under 40 as "going its own way". The rhyme-by-class strip averages each class's echo scores (compared rows only) - "are OTC pairs rhyming today?" is one glance away, and once the scan walks deeper than 1d each chip grows a ⟳ week number averaging every echoed day-observation in class - "are they rhyming with the whole week, or only with yesterday?". Click a card to open that asset on the chart; click an echo chip to go further - the chart deep-loads the asset's full day of candles and scrolls onto yesterday's lead-in plus the forward replay window (edges the feed never remembered show as a gap, not filler). The day chips walk the same window further back - the "at this hour" strip shows each remembered day with its own coverage (days the series cannot cover are absent, not flat), each day's rhyme tag scores today's lead-in against THAT day's lead-in, and the "N/M rhyme" aggregate counts the days today actually rhymed with (70+), compared days only. The week sort orders the list by exactly that count - the strongest week rhymes float to the top (average rhyme breaking ties, biggest window move after that), turning the panel into a best-echoes watchlist.
+            Each row is the window that started at the bar forming exactly 24h ago, on the chart's timeframe. dir counts as up/down only when the net move exceeds 10% of the window's own travel. "arch" = bars from the kernel's accumulated store (broker bars in live mode), "seeded" = the feed's deterministic prehistory - never mistake a seeded yesterday for a remembered one. echo compares the lead-in windows ending at this same time of day (yesterday's ended at the anchor, today's within one bar of now): rhyme = direction 50 + move-vs-travel 30 + travel ratio 20, 70+ reads as "repeating the script", under 40 as "going its own way"; a rhyme between two FLAT lead-ins (net move under 10% of travel on both sides) is marked "quiet" - real but trivial, excluded from every aggregate. The rhyme-by-class strip averages each class's echo scores (compared rows only) - "are OTC pairs rhyming today?" is one glance away, and once the scan walks deeper than 1d each chip grows a ⟳ week number averaging every non-quiet echoed day-observation in class - "are they rhyming with the whole week, or only with yesterday?". Click a card to open that asset on the chart; click an echo chip to go further - the chart deep-loads the asset's full day of candles and scrolls onto yesterday's lead-in plus the forward replay window (edges the feed never remembered show as a gap, not filler). The day chips walk the same window further back - the "at this hour" strip shows each remembered day with its own coverage (days the series cannot cover are absent, not flat), each day's rhyme tag scores today's lead-in against THAT day's lead-in, and the "N/M rhyme" aggregate counts the days today actually rhymed with (70+, non-quiet comparisons) among the compared ones. The week sort orders the list by exactly that count - the strongest week rhymes float to the top (average rhyme breaking ties, biggest window move after that, quiet rhymes not counting), turning the panel into a best-echoes watchlist.
           </p>
         )}
       </div>
