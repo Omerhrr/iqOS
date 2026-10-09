@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// Class-strip week-rhyme smoke (Task 10 companion to yesterday_e2e).
-// The per-class week average is computed WEB-side from the wire; this locks
-// the arithmetic the YesterdayPanel classRhyme memo performs:
+// Class-strip week-rhyme smoke (Task 10) + week-sort metric smoke (Task 11)
+// companions to yesterday_e2e. The per-class week average and the week sort
+// key are computed WEB-side from the wire; this locks the arithmetic the
+// YesterdayPanel performs:
 //   - weekLive must be false at days=1 (no priors -> week numbers stay hidden)
 //   - weekLive must be true at days=3 (priors carry echoes)
 //   - per class: wkObs == own echoes + prior echoes, wkRhymed <= wkObs,
@@ -100,6 +101,36 @@ if (sample) {
 } else {
   ok('sample row exists (echoed row with a prior echo)', false, 'no row qualified')
 }
+
+// ---- week sort (Task 11): the best-echoes watchlist order ----
+// Mirrors the panel's weekRhymeCmp KEY: [days rhymed 70+, avg rhyme, -1 when
+// no observations]. The comparator itself is client-side; these checks pin
+// its semantics against the wire: content, bounds, the sink sentinel, and
+// the ranking rule on a synthetic case (consistency beats strength).
+const wObs = (r) => [r.echo?.rhyme, ...(r.prior ?? []).map((p) => p.echo?.rhyme)].filter((x) => x != null)
+const wKey = (r) => {
+  const e = wObs(r)
+  return [e.filter((x) => x >= 70).length, e.length ? e.reduce((s, x) => s + x, 0) / e.length : -1]
+}
+const sinks = rows.filter((r) => wObs(r).length === 0)
+ok('week sort: rows with zero observations key to [0, -1]', sinks.every((r) => wKey(r)[0] === 0 && wKey(r)[1] === -1), `sinks=${sinks.length}`)
+ok('week sort: rhymed count <= observations for every row', rows.every((r) => wKey(r)[0] <= wObs(r).length))
+const rhymers = rows.filter((r) => wKey(r)[0] > 0)
+ok('week sort: watchlist has rhyming rows at 3d', rhymers.length > 0, `rhymers=${rhymers.length}`)
+// ranking rule on synthetic rows: rhymed days dominate, avg breaks ties,
+// a no-observation row sinks below any rhyming row
+const synth = [
+  { asset: 'A', echo: { rhyme: 95 }, prior: [{ echo: { rhyme: 90 } }] },
+  { asset: 'B', echo: { rhyme: 99 }, prior: [{ echo: { rhyme: 30 } }] },
+  { asset: 'C', echo: null, prior: [] },
+]
+const ranked = [...synth].sort((a, b) => wKey(b)[0] - wKey(a)[0] || wKey(b)[1] - wKey(a)[1])
+ok('week sort: 2 rhyming days outrank 1 (consistency beats strength)', ranked[0].asset === 'A', `top=${ranked[0].asset}`)
+ok('week sort: higher avg breaks rhymed-count ties', ranked[1].asset === 'B', `second=${ranked[1].asset}`)
+ok('week sort: no-observation row sinks', ranked[2].asset === 'C', `last=${ranked[2].asset}`)
+// top-3 sample of the would-be watchlist for eyeballing
+const top3 = [...rows].sort((a, b) => wKey(b)[0] - wKey(a)[0] || wKey(b)[1] - wKey(a)[1] || Math.abs(b.movePct) - Math.abs(a.movePct)).slice(0, 3)
+for (const t of top3) console.log(`  watchlist ${t.asset}: rhymed ${wKey(t)[0]}/${wObs(t).length} avg ${Math.round(wKey(t)[1])}`)
 
 console.log(`\n${pass} passed, ${fail} failed`)
 process.exit(fail ? 1 : 0)

@@ -51,6 +51,12 @@
 // day-observation in class (yesterday's echo + each remembered prior day's,
 // same exclusion rule) - "are OTC pairs rhyming with the whole week?" is a
 // glance, not math over a week of rows.
+//
+// The WEEK sort closes the loop: it turns the list into a best-echoes
+// watchlist - rows rhyming (70+) with the most remembered days at this hour
+// first, the average rhyme across those observations breaking ties, biggest
+// window move after that. It disables at 1d, where the week would just be
+// yesterday again (and falls back to the rhyme order if the depth drops).
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { Timeframe, YesterdayRow } from '@/lib/os/client'
 import { TIMEFRAME_SECONDS, fmtPrice, getYesterday } from '@/lib/os/client'
@@ -68,7 +74,7 @@ interface YesterdayPanelProps {
 
 type Mkt = 'all' | 'real' | 'otc'
 type Cat = 'all' | 'forex' | 'crypto' | 'commodity' | 'stock' | 'index'
-type Sort = 'move' | 'since' | 'range' | 'rhyme'
+type Sort = 'move' | 'since' | 'range' | 'rhyme' | 'week'
 type DirFilter = 'all' | 'up' | 'down' | 'none'
 type EchoF = 'all' | 'rhymes' | 'diverges'
 
@@ -99,6 +105,26 @@ const DAY_CHIPS: [number, string][] = [
 function maxDaysFor(tf: Timeframe, windowMin: number): number {
   const tfSec = TIMEFRAME_SECONDS[tf]
   return Math.max(1, Math.floor(((4000 - 2) * tfSec - 2 * windowMin * 60) / 86_400))
+}
+
+/** Week-rhyme ranking for the "week" sort - the best-echoes watchlist order:
+ * rows rhyming (70+) with the MOST remembered days at this hour first
+ * (yesterday's echo included, no-echo days excluded - the same observations
+ * the PriorStrip's "N/M rhyme" counts), the average rhyme across those
+ * observations breaking ties, biggest yesterday-window move after that.
+ * Rows without any comparison sink to the bottom (-1 average). */
+function weekRhymeCmp(a: YesterdayRow, b: YesterdayRow): number {
+  const obs = (r: YesterdayRow) =>
+    [r.echo?.rhyme, ...(r.prior ?? []).map((p) => p.echo?.rhyme)].filter((x): x is number => x != null)
+  const ea = obs(a)
+  const eb = obs(b)
+  const ra = ea.filter((x) => x >= RHYME_OK).length
+  const rb = eb.filter((x) => x >= RHYME_OK).length
+  if (ra !== rb) return rb - ra
+  const aa = ea.length ? ea.reduce((s, x) => s + x, 0) / ea.length : -1
+  const ab = eb.length ? eb.reduce((s, x) => s + x, 0) / eb.length : -1
+  if (ab !== aa) return ab - aa
+  return Math.abs(b.movePct) - Math.abs(a.movePct)
 }
 
 const SESSION_LABEL: Record<YesterdayRow['session'], string> = {
@@ -390,12 +416,20 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
           ? Math.abs(b.sincePct) - Math.abs(a.sincePct)
           : sort === 'rhyme'
             ? (b.echo?.rhyme ?? -1) - (a.echo?.rhyme ?? -1) || Math.abs(b.movePct) - Math.abs(a.movePct)
-            : b.rangePct - a.rangePct,
+            : sort === 'week'
+              ? weekRhymeCmp(a, b)
+              : b.rangePct - a.rangePct,
     )
   // the week numbers only mean something once the scan actually carries prior
   // echoes (a day chip beyond 1d, on a kernel that computes them) - at 1d they
   // would be pure duplicates of the yesterday averages, so they stay hidden
   const weekLive = (data?.rows ?? []).some((r) => (r.prior ?? []).some((p) => p.echo != null))
+  // the week sort needs prior echoes - if the depth drops back to 1d while it
+  // is selected, fall back to the yesterday-rhyme order instead of leaving a
+  // disabled chip selected
+  useEffect(() => {
+    if (!weekLive && sort === 'week') setSort('rhyme')
+  }, [weekLive, sort])
   const otcLive = (data?.rows ?? []).filter((r) => r.otc).length
   const rhymeLive = (data?.rows ?? []).filter((r) => (r.echo?.rhyme ?? -1) >= RHYME_OK).length
   const catCount = (c: Cat) => (c === 'all' ? (data?.rows ?? []).length : (data?.rows ?? []).filter((r) => r.category === c).length)
@@ -656,21 +690,30 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
               ['move', 'move', 'biggest yesterday-window move first (kernel order)'],
               ['since', 'since', 'biggest 24h drift first - where the market has gone since that moment'],
               ['rhyme', 'rhyme', 'best echo rhyme first - where today is repeating yesterday\'s lead-in (rows without a comparison sink)'],
+              ['week', 'week', "best echoes of the week first - rows rhyming (70+) with the most remembered days at this hour, average rhyme breaking ties (rows without any comparison sink)"],
               ['range', 'range', 'widest high-low travel in the window first - the most restless hours'],
             ] as [Sort, string, string][]
-          ).map(([v, label, why]) => (
-            <button
-              key={v}
-              type="button"
-              onClick={() => setSort(v)}
-              title={why}
-              className={`px-1.5 py-0.5 font-mono text-[8.5px] font-bold uppercase tracking-wider transition-colors ${
-                sort === v ? 'bg-violet-500/15 text-violet-300' : 'text-[#4b5a72] hover:text-[#aab6cc]'
-              }`}
-            >
-              {label}
-            </button>
-          ))}
+          ).map(([v, label, why]) => {
+            const dimmed = v === 'week' && !weekLive
+            return (
+              <button
+                key={v}
+                type="button"
+                onClick={() => !dimmed && setSort(v)}
+                disabled={dimmed}
+                title={dimmed ? `${why} - pick a day chip beyond 1d first (the week order needs the prior-day echoes)` : why}
+                className={`px-1.5 py-0.5 font-mono text-[8.5px] font-bold uppercase tracking-wider transition-colors ${
+                  sort === v
+                    ? 'bg-violet-500/15 text-violet-300'
+                    : dimmed
+                      ? 'cursor-not-allowed text-[#2a3648]'
+                      : 'text-[#4b5a72] hover:text-[#aab6cc]'
+                }`}
+              >
+                {label}
+              </button>
+            )
+          })}
         </div>
       </div>
 
@@ -772,7 +815,7 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
         ))}
         {data && data.rows.length > 0 && (
           <p className="px-1 pt-1 text-[8.5px] leading-relaxed text-[#3d4d66]">
-            Each row is the window that started at the bar forming exactly 24h ago, on the chart's timeframe. dir counts as up/down only when the net move exceeds 10% of the window's own travel. "arch" = bars from the kernel's accumulated store (broker bars in live mode), "seeded" = the feed's deterministic prehistory - never mistake a seeded yesterday for a remembered one. echo compares the lead-in windows ending at this same time of day (yesterday's ended at the anchor, today's within one bar of now): rhyme = direction 50 + move-vs-travel 30 + travel ratio 20, 70+ reads as "repeating the script", under 40 as "going its own way". The rhyme-by-class strip averages each class's echo scores (compared rows only) - "are OTC pairs rhyming today?" is one glance away, and once the scan walks deeper than 1d each chip grows a ⟳ week number averaging every echoed day-observation in class - "are they rhyming with the whole week, or only with yesterday?". Click a card to open that asset on the chart; click an echo chip to go further - the chart deep-loads the asset's full day of candles and scrolls onto yesterday's lead-in plus the forward replay window (edges the feed never remembered show as a gap, not filler). The day chips walk the same window further back - the "at this hour" strip shows each remembered day with its own coverage (days the series cannot cover are absent, not flat), each day's rhyme tag scores today's lead-in against THAT day's lead-in, and the "N/M rhyme" aggregate counts the days today actually rhymed with (70+), compared days only.
+            Each row is the window that started at the bar forming exactly 24h ago, on the chart's timeframe. dir counts as up/down only when the net move exceeds 10% of the window's own travel. "arch" = bars from the kernel's accumulated store (broker bars in live mode), "seeded" = the feed's deterministic prehistory - never mistake a seeded yesterday for a remembered one. echo compares the lead-in windows ending at this same time of day (yesterday's ended at the anchor, today's within one bar of now): rhyme = direction 50 + move-vs-travel 30 + travel ratio 20, 70+ reads as "repeating the script", under 40 as "going its own way". The rhyme-by-class strip averages each class's echo scores (compared rows only) - "are OTC pairs rhyming today?" is one glance away, and once the scan walks deeper than 1d each chip grows a ⟳ week number averaging every echoed day-observation in class - "are they rhyming with the whole week, or only with yesterday?". Click a card to open that asset on the chart; click an echo chip to go further - the chart deep-loads the asset's full day of candles and scrolls onto yesterday's lead-in plus the forward replay window (edges the feed never remembered show as a gap, not filler). The day chips walk the same window further back - the "at this hour" strip shows each remembered day with its own coverage (days the series cannot cover are absent, not flat), each day's rhyme tag scores today's lead-in against THAT day's lead-in, and the "N/M rhyme" aggregate counts the days today actually rhymed with (70+), compared days only. The week sort orders the list by exactly that count - the strongest week rhymes float to the top (average rhyme breaking ties, biggest window move after that), turning the panel into a best-echoes watchlist.
           </p>
         )}
       </div>
