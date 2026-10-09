@@ -216,9 +216,12 @@ ok('profile: five ordered session buckets on a real ticker', prof.length === 5 &
 const ov = prof.find((s) => s.session === 'OVERLAP')
 ok('profile: OVERLAP obs 3 (h13 d1+d2, h15 d2 - future today-side skipped)', ov?.obs === 3, JSON.stringify(ov))
 ok('profile: OVERLAP avg 73, none quiet', ov?.avg === 73 && ov?.quiet === 0, JSON.stringify(ov))
+ok('profile: bucket sum is the exact non-quiet total (100+20+100 = 220)', ov?.sum === 220 && Number.isInteger(ov?.sum), JSON.stringify(ov))
 ok('profile: dark sessions honest zeros (ASIA / OFF)', prof.find((s) => s.session === 'ASIA')?.obs === 0 && prof.find((s) => s.session === 'ASIA')?.avg === null && prof.find((s) => s.session === 'OFF')?.obs === 0, JSON.stringify(prof))
+ok('profile: dark sessions sum to 0 too (nothing non-quiet to total)', prof.find((s) => s.session === 'ASIA')?.sum === 0 && prof.find((s) => s.session === 'OFF')?.sum === 0, JSON.stringify(prof))
 const profOtc = buildSessionProfile({ ...info, ticker: 'TEST-OTC', otc: true }, profSeries, pOpts)
 ok('profile: -OTC ticker collapses to one OTC bucket (same pairs)', profOtc.length === 1 && profOtc[0].session === 'OTC' && profOtc[0].obs === 3 && profOtc[0].avg === 73, JSON.stringify(profOtc))
+ok('profile: OTC bucket carries the same exact sum (220)', profOtc[0]?.sum === 220, JSON.stringify(profOtc))
 // quiet exclusion: the h15 pair both FLAT -> quiet, kept out of the average
 const profQuietSeries = [
   run(MID + 12 * 3_600, WIN / TF, base, 0.4, 0.8),
@@ -229,6 +232,7 @@ const profQuietSeries = [
 ].flat().sort((a, b) => a.time - b.time)
 const ovQ = buildSessionProfile(info, profQuietSeries, pOpts).find((s) => s.session === 'OVERLAP')
 ok('profile: quiet pair counted in obs, excluded from avg (3 obs, 1 quiet, avg 60)', ovQ?.obs === 3 && ovQ?.quiet === 1 && ovQ?.avg === 60, JSON.stringify(ovQ))
+ok('profile: sum follows the exclusion (kept 100+20 = 120, quiet pair not totalled)', ovQ?.sum === 120, JSON.stringify(ovQ))
 // row path: opts.profile wires the same arithmetic (days = priorDays + 1);
 // absent unless requested
 const rowProf = buildYesterdayRow(info, profSeries, { nowSec: nowP, windowSec: WIN, tfSec: TF, nowPrice: base * 1.004, archived: 0, priorDays: 1, profile: true })

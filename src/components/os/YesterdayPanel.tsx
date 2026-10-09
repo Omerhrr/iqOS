@@ -78,8 +78,16 @@
 // echoes excluded from the averages and counted in the tooltip. -OTC pairs
 // have no sessions - one day-wide OTC bucket instead. Hours a series cannot
 // cover are fewer observations, never zeros.
+//
+// The SCRIPT BY CLASS strip (visible with the toggle on) folds the profile
+// one level up: each class's row profiles summed per session - obs and
+// quiet across rows, the kernel's unrounded rhyme total behind the average
+// - so "does the class script differ by session, and does the OTC day-wide
+// bucket look like a clock-bound class's?" is a glance. Clock-session
+// columns come only from a class's real rows, the OTC column only from its
+// -OTC twins; classes with nothing scorable are skipped, not zeroed.
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { Timeframe, YesterdayRow } from '@/lib/os/client'
+import type { Timeframe, YesterdayRow, YdaySession } from '@/lib/os/client'
 import { TIMEFRAME_SECONDS, fmtPrice, getYesterday } from '@/lib/os/client'
 
 interface YesterdayPanelProps {
@@ -160,6 +168,29 @@ const SESSION_LABEL: Record<YesterdayRow['session'], string> = {
   OFF: 'off-hours',
   OTC: 'OTC',
 }
+
+/** column order + short heads for the script-by-class strip: the five clock
+ * sessions first (real rows only), the day-wide OTC bucket last (the -OTC
+ * twins' - it is not a session, it is the absence of one). */
+const SCRIPT_COLS: { session: YdaySession; short: string }[] = [
+  { session: 'ASIA', short: 'Asia' },
+  { session: 'LONDON', short: 'Lon' },
+  { session: 'OVERLAP', short: 'L/N' },
+  { session: 'NEWYORK', short: 'NY' },
+  { session: 'OFF', short: 'off' },
+  { session: 'OTC', short: 'OTC' },
+]
+
+/** the class taxonomy both strips share - OTC answers over the otc flag
+ * (mostly the -OTC fx twins), the others over r.category. */
+const CLASS_DEFS: { key: 'otc' | 'forex' | 'crypto' | 'commodity' | 'stock' | 'index'; label: string; why: string; pick: (r: YesterdayRow) => boolean }[] = [
+  { key: 'otc', label: 'OTC', why: 'over-the-counter pairs (the -OTC twins)', pick: (r) => r.otc },
+  { key: 'forex', label: 'FX', why: 'currency pairs (incl. their OTC twins)', pick: (r) => r.category === 'forex' },
+  { key: 'crypto', label: 'Crypto', why: 'crypto pairs - 24/7 real markets', pick: (r) => r.category === 'crypto' },
+  { key: 'commodity', label: 'Comm', why: 'metals, energy, agriculture', pick: (r) => r.category === 'commodity' },
+  { key: 'stock', label: 'Stocks', why: 'single-name equities', pick: (r) => r.category === 'stock' },
+  { key: 'index', label: 'Idx', why: 'index CFDs', pick: (r) => r.category === 'index' },
+]
 
 function DirChip({ dir }: { dir: YesterdayRow['dir'] }) {
   const map = {
@@ -554,15 +585,46 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
         wkQuiet,
       }
     }
-    return [
-      { key: 'otc' as const, label: 'OTC', why: 'over-the-counter pairs (the -OTC twins)', agg: build((r) => r.otc) },
-      { key: 'forex' as const, label: 'FX', why: 'currency pairs (incl. their OTC twins)', agg: build((r) => r.category === 'forex') },
-      { key: 'crypto' as const, label: 'Crypto', why: 'crypto pairs - 24/7 real markets', agg: build((r) => r.category === 'crypto') },
-      { key: 'commodity' as const, label: 'Comm', why: 'metals, energy, agriculture', agg: build((r) => r.category === 'commodity') },
-      { key: 'stock' as const, label: 'Stocks', why: 'single-name equities', agg: build((r) => r.category === 'stock') },
-      { key: 'index' as const, label: 'Idx', why: 'index CFDs', agg: build((r) => r.category === 'index') },
-    ]
+    return CLASS_DEFS.map(({ key, label, why, pick }) => ({ key, label, why, agg: build(pick) }))
   }, [data])
+
+  // the session profile one level up - the class strip's averages broken out
+  // by session ("does the OTC day-wide script look like FX's London one?").
+  // Folds each class's row profiles per session: obs and quiet sum across
+  // rows and the rhyme total sums too (the kernel's unrounded bucket sum;
+  // the avg x kept fallback keeps the fold honest against an older kernel),
+  // so the class average is round(totalSum / totalKept) - a weighted mean of
+  // the rows' echoes, never an average of rounded averages. Clock sessions
+  // come only from the class's real rows (every real row carries all five
+  // buckets, obs 0 when a session had nothing scorable), the OTC bucket only
+  // from its -OTC twins; a session absent from the fold means the class has
+  // no rows of that kind at all.
+  const classScript = useMemo(() => {
+    if (!profOn) return []
+    const rowsAll = data?.rows ?? []
+    const fold = (pick: (r: YesterdayRow) => boolean) => {
+      const per = new Map<YdaySession, { obs: number; quiet: number; sum: number; kept: number }>()
+      for (const r of rowsAll.filter(pick)) {
+        for (const s of r.profile ?? []) {
+          const kept = s.obs - s.quiet
+          const t = per.get(s.session) ?? { obs: 0, quiet: 0, sum: 0, kept: 0 }
+          t.obs += s.obs
+          t.quiet += s.quiet
+          if (kept > 0) {
+            t.sum += s.sum ?? (s.avg ?? 0) * kept
+            t.kept += kept
+          }
+          per.set(s.session, t)
+        }
+      }
+      return SCRIPT_COLS.filter(({ session }) => per.has(session)).map(({ session }) => {
+        const t = per.get(session)!
+        return { session, obs: t.obs, quiet: t.quiet, avg: t.kept > 0 ? Math.round(t.sum / t.kept) : null }
+      })
+    }
+    return CLASS_DEFS.map(({ key, label, why, pick }) => ({ key, label, why, rows: rowsAll.filter(pick).length, cells: fold(pick) }))
+  }, [profOn, data])
+  const scriptLive = classScript.some((c) => c.cells.some((s) => s.obs > 0))
 
   return (
     <div className="flex h-full min-h-0 flex-col rounded-lg border border-[#1c2739] bg-[#0b111c]">
@@ -808,7 +870,7 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
           className={`shrink-0 rounded border px-1.5 py-0.5 font-mono text-[8.5px] font-bold uppercase tracking-wider transition-colors ${
             profOn ? 'border-violet-500/40 bg-violet-500/15 text-violet-300' : 'border-[#1c2739] text-[#4b5a72] hover:text-[#aab6cc]'
           }`}
-          title="score the same lead-in echo at EVERY hour of the day and average it per trading session - does this pair's script differ ASIA vs LONDON vs NY? Each row grows a 'script' line (Asia / London / Lon-NY / NY / off-hours averages, quiet echoes excluded from the averages). -OTC pairs have no sessions - one day-wide OTC bucket. The kernel computes it from the candles the scan already pulls; the scan just reads more windows."
+          title="score the same lead-in echo at EVERY hour of the day and average it per trading session - does this pair's script differ ASIA vs LONDON vs NY? Each row grows a 'script' line (Asia / London / Lon-NY / NY / off-hours averages, quiet echoes excluded from the averages). -OTC pairs have no sessions - one day-wide OTC bucket. The kernel computes it from the candles the scan already pulls; the scan just reads more windows. The rhyme-by-class strip grows a matching 'script by class' readout - each class's averages folded across its rows."
         >
           by session
         </button>
@@ -887,6 +949,62 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
         </div>
       )}
 
+      {/* script by class - the session profile one level up: does the CLASS
+          script differ by session, and does the OTC day-wide bucket look like
+          a clock-bound class's? Same fold-the-wire arithmetic as the strip
+          above, one more dimension. */}
+      {profOn && scriptLive && data && data.rows.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1 border-b border-[#1c2739] px-2 py-1">
+          <span
+            className="mr-0.5 font-mono text-[8.5px] uppercase tracking-wider text-[#3d4d66]"
+            title="the session profile one level up: each class's row profiles folded per session (obs summed across rows, quiet echoes excluded, the class average weighted by each row's observations). Clock sessions come only from the class's real rows; the OTC column only from its -OTC twins (one day-wide bucket). Click a class to filter the list to it."
+          >
+            script by class
+          </span>
+          {classScript.map(({ key, label, why, rows, cells }) => {
+            if (!cells.some((c) => c.obs > 0)) return null
+            const click = () => {
+              if (key === 'otc') {
+                setMkt('otc')
+                setCat('all')
+              } else {
+                setCat(key)
+              }
+            }
+            return (
+              <button
+                key={key}
+                type="button"
+                onClick={click}
+                className="shrink-0 rounded px-1 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wider transition-colors hover:bg-[#141d2e]"
+                title={`${why} - the session profile folded over all ${rows} row${rows === 1 ? '' : 's'} in class: does this class's script differ ASIA vs LONDON vs NY? Quiet echoes (both lead-ins flat) are excluded from the averages, which are weighted by each row's observations. Click to filter.`}
+              >
+                <span className="text-[#4b5a72]">{label}</span>
+                {cells.map((c) => {
+                  const color =
+                    c.avg == null
+                      ? 'text-[#2a3648]'
+                      : c.avg >= RHYME_OK
+                        ? 'text-emerald-300/80'
+                        : c.avg >= RHYME_BAD
+                          ? 'text-amber-300/80'
+                          : 'text-rose-300/80'
+                  return (
+                    <span
+                      key={c.session}
+                      className={`ml-1.5 ${color}`}
+                      title={`${SESSION_LABEL[c.session]}${c.session === 'OTC' ? ' (day-wide bucket - -OTC pairs have no sessions, see analytics/session.ts)' : ''}: average rhyme ${c.avg ?? '—'}/100 across ${c.obs} adjacent-day lead-in echo${c.obs === 1 ? '' : 's'} in the class's rows at this session's hours (quiet excluded: ${c.quiet}; weighted by each row's observations). Same score as the echo chip: direction 50 + move-vs-travel 30 + travel ratio 20.`}
+                    >
+                      {SCRIPT_COLS.find((s) => s.session === c.session)?.short ?? c.session} {c.avg ?? '—'}
+                    </span>
+                  )
+                })}
+              </button>
+            )
+          })}
+        </div>
+      )}
+
       <div className="min-h-0 flex-1 space-y-1.5 overflow-auto p-2">
         {error && <div className="p-2 text-[10px] text-rose-400">{error}</div>}
         {!error && !tfSupported && (
@@ -912,7 +1030,7 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
         ))}
         {data && data.rows.length > 0 && (
           <p className="px-1 pt-1 text-[8.5px] leading-relaxed text-[#3d4d66]">
-            Each row is the window that started at the bar forming exactly 24h ago, on the chart's timeframe. dir counts as up/down only when the net move exceeds 10% of the window's own travel. "arch" = bars from the kernel's accumulated store (broker bars in live mode), "seeded" = the feed's deterministic prehistory - never mistake a seeded yesterday for a remembered one. echo compares the lead-in windows ending at this same time of day (yesterday's ended at the anchor, today's within one bar of now): rhyme = direction 50 + move-vs-travel 30 + travel ratio 20, 70+ reads as "repeating the script", under 40 as "going its own way"; a rhyme between two FLAT lead-ins (net move under 10% of travel on both sides) is marked "quiet" - real but trivial, excluded from every aggregate. The rhyme-by-class strip averages each class's echo scores (compared rows only) - "are OTC pairs rhyming today?" is one glance away, and once the scan walks deeper than 1d each chip grows a ⟳ week number averaging every non-quiet echoed day-observation in class - "are they rhyming with the whole week, or only with yesterday?". Click a card to open that asset on the chart; click an echo chip to go further - the chart deep-loads the asset's full day of candles and scrolls onto yesterday's lead-in plus the forward replay window (edges the feed never remembered show as a gap, not filler). The day chips walk the same window further back - the "at this hour" strip shows each remembered day with its own coverage (days the series cannot cover are absent, not flat), each day's rhyme tag scores today's lead-in against THAT day's lead-in, and the "N/M rhyme" aggregate counts the days today actually rhymed with (70+, non-quiet comparisons) among the compared ones. The week sort orders the list by exactly that count - the strongest week rhymes float to the top (average rhyme breaking ties, biggest window move after that, quiet rhymes not counting), turning the panel into a best-echoes watchlist. The "by session" toggle goes one question deeper: the kernel re-scores the same adjacent-day lead-in echo at every hour of the day and averages it per trading session, so each row grows a "script" line - rhymes in London but not off-hours, or the reverse - with quiet echoes excluded from the averages and -OTC pairs collapsed into one day-wide bucket (they have no sessions).
+            Each row is the window that started at the bar forming exactly 24h ago, on the chart's timeframe. dir counts as up/down only when the net move exceeds 10% of the window's own travel. "arch" = bars from the kernel's accumulated store (broker bars in live mode), "seeded" = the feed's deterministic prehistory - never mistake a seeded yesterday for a remembered one. echo compares the lead-in windows ending at this same time of day (yesterday's ended at the anchor, today's within one bar of now): rhyme = direction 50 + move-vs-travel 30 + travel ratio 20, 70+ reads as "repeating the script", under 40 as "going its own way"; a rhyme between two FLAT lead-ins (net move under 10% of travel on both sides) is marked "quiet" - real but trivial, excluded from every aggregate. The rhyme-by-class strip averages each class's echo scores (compared rows only) - "are OTC pairs rhyming today?" is one glance away, and once the scan walks deeper than 1d each chip grows a ⟳ week number averaging every non-quiet echoed day-observation in class - "are they rhyming with the whole week, or only with yesterday?". Click a card to open that asset on the chart; click an echo chip to go further - the chart deep-loads the asset's full day of candles and scrolls onto yesterday's lead-in plus the forward replay window (edges the feed never remembered show as a gap, not filler). The day chips walk the same window further back - the "at this hour" strip shows each remembered day with its own coverage (days the series cannot cover are absent, not flat), each day's rhyme tag scores today's lead-in against THAT day's lead-in, and the "N/M rhyme" aggregate counts the days today actually rhymed with (70+, non-quiet comparisons) among the compared ones. The week sort orders the list by exactly that count - the strongest week rhymes float to the top (average rhyme breaking ties, biggest window move after that, quiet rhymes not counting), turning the panel into a best-echoes watchlist. The "by session" toggle goes one question deeper: the kernel re-scores the same adjacent-day lead-in echo at every hour of the day and averages it per trading session, so each row grows a "script" line - rhymes in London but not off-hours, or the reverse - with quiet echoes excluded from the averages and -OTC pairs collapsed into one day-wide bucket (they have no sessions). With the toggle on, the rhyme-by-class strip gains a sibling: script by class - each class's session averages folded across its rows (weighted by observations, quiet excluded), the OTC column separating the synthetic twins' day-wide script from the clock-bound classes'.
           </p>
         )}
       </div>

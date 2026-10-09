@@ -189,9 +189,11 @@ ok('prior rhyme arithmetic consistent with dirAgree', d3priorEchoed.every((p) =>
 // obs 0 / avg null when a session had nothing scorable), one day-wide OTC
 // bucket on -OTC rows (they have no sessions). Per session: quiet <= obs,
 // avg null iff every pair was quiet, obs bounded by hours-in-session x
-// days (each hour contributes at most `days` adjacent-day pairs). The
-// flag is part of the cache key - the profile scan lives beside its
-// plain sibling, never contaminating it.
+// days (each hour contributes at most `days` adjacent-day pairs). Each
+// bucket also carries the UNROUNDED rhyme total of its non-quiet echoes
+// (`sum`) so clients can fold exact higher-level aggregates (per class)
+// without averaging rounded averages. The flag is part of the cache key -
+// the profile scan lives beside its plain sibling, never contaminating it.
 const SESH = ['ASIA', 'LONDON', 'OVERLAP', 'NEWYORK', 'OFF']
 const HRS = { ASIA: 7, LONDON: 6, OVERLAP: 3, NEWYORK: 5, OFF: 3, OTC: 24 }
 const dprof = await get('/yesterday?tf=5m&days=3&profile=1')
@@ -204,13 +206,21 @@ ok('profile: obs/quiet/avg arithmetic sane', prows.every((r) => (r.profile ?? []
   (s.avg === null ? s.obs - s.quiet === 0 : (s.obs - s.quiet > 0 && Number.isInteger(s.avg) && s.avg >= 0 && s.avg <= 100))),
 ))
 ok('profile: obs bounded by hours-in-session x days', prows.every((r) => (r.profile ?? []).every((s) => s.obs <= (HRS[s.session] ?? 24) * 3)), JSON.stringify(prows.find((r) => !r.otc)?.profile?.map((s) => `${s.session}:${s.obs}`)))
+// sum: the exact non-quiet numerator behind avg - integer, never negative,
+// 0 exactly when every pair was quiet, and round(sum/kept) must reproduce
+// avg EXACTLY (the panel folds classes from sum; rounding drift there would
+// compound across rows)
+ok('profile: sum is the exact non-quiet total (round(sum/kept) == avg, 0 when all quiet)', prows.every((r) => (r.profile ?? []).every((s) => {
+  const kept = s.obs - s.quiet
+  return Number.isInteger(s.sum) && s.sum >= 0 && (s.avg === null ? kept === 0 && s.sum === 0 : kept > 0 && Math.round(s.sum / kept) === s.avg)
+})), JSON.stringify(prows.find((r) => !r.otc)?.profile?.[0]))
 const scripted = prows.filter((r) => (r.profile ?? []).some((s) => s.obs > 0))
 ok('profile: measured rows exist on the warmed universe', scripted.length > 0, `scripted=${scripted.length}/${prows.length}`)
 ok('profile: absent without the flag (plain 3d scan)', (d3.body.rows ?? []).every((r) => r.profile === undefined))
 const dp2 = await get('/yesterday?tf=5m&days=3&profile=1')
 ok('profile scan cached separately (60s, same key)', dp2.body.ts === dprof.body.ts, `dprof.ts=${dprof.body.ts} dp2.ts=${dp2.body.ts}`)
 const spSample = scripted.find((r) => !r.otc) ?? scripted[0]
-if (spSample) console.log(`  sample ${spSample.asset} script: ${spSample.profile.map((s) => `${s.session}:${s.avg ?? '--'}(${s.obs}${s.quiet ? `-${s.quiet}q` : ''})`).join(' ')}`)
+if (spSample) console.log(`  sample ${spSample.asset} script: ${spSample.profile.map((s) => `${s.session}:${s.avg ?? '--'}(${s.obs}${s.quiet ? `-${s.quiet}q` : ''} +${s.sum})`).join(' ')}`)
 console.log(`      profiled rows: ${scripted.length}/${prows.length}`)
 // clamp: 99 -> 7 (5m fits a week), depth gate: 1m + 3d needs 4442 bars > 4000
 const d7 = await get('/yesterday?tf=5m&days=99')

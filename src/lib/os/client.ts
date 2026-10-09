@@ -533,6 +533,11 @@ export interface YdaySessionRhyme {
   obs: number
   /** of those, both lead-ins flat (trivial agreement - kept out of avg) */
   quiet: number
+  /** total rhyme of the non-quiet echoes in this bucket (the unrounded
+   * numerator behind avg) - folding many rows per class from sum stays exact
+   * instead of averaging rounded averages. Optional so an older kernel
+   * parses; the panel falls back to avg x (obs - quiet) when absent. */
+  sum?: number
   /** mean rhyme of the non-quiet echoes, 0..100; null when none survived */
   avg: number | null
 }

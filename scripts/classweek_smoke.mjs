@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // Class-strip week-rhyme smoke (Task 10) + week-sort metric smoke (Task 11)
 // + quiet-exclusion smoke (Task 12) + session-profile smoke (Task 13)
-// companions to yesterday_e2e. The
-// per-class week average and the week sort key are computed WEB-side from
-// the wire; this locks the arithmetic the YesterdayPanel performs:
+// + script-by-class fold smoke (Task 14) - companions to yesterday_e2e. The
+// per-class week average, the week sort key and the per-class session fold
+// are computed WEB-side from the wire; this locks the arithmetic the
+// YesterdayPanel performs:
 //   - weekLive must be false at days=1 (no priors -> week numbers stay hidden)
 //   - weekLive must be true at days=3 (priors carry echoes)
 //   - per class: wkObs == own echoes + prior echoes, wkRhymed <= wkObs,
@@ -13,6 +14,11 @@
 //   - session profile (profile=1): five ordered session buckets on real
 //     rows / one OTC bucket on -OTC rows, quiet <= obs, avg null iff every
 //     pair was quiet, obs bounded by hours-in-session x days
+//   - script by class: each class's row profiles folded per session -
+//     clock obs from real rows only, OTC obs from the -OTC twins only,
+//     avg null iff no non-quiet observations, class avg within the range
+//     of its contributing row averages (weighted mean), and every class's
+//     OTC obs bounded by the OTC class's (twins are a subset of OTC)
 // Read-only.
 const BASE = process.env.IQAIR_OS_URL ?? 'http://localhost:3030'
 const TOKEN = (process.env.KERNEL_TOKEN ?? '').trim()
@@ -192,6 +198,62 @@ const scripted = prows.filter((r) => (r.profile ?? []).some((s) => s.obs > 0))
 ok('profile: measured rows exist (warmed universe)', scripted.length > 0, `scripted=${scripted.length}/${prows.length}`)
 const sp = scripted.find((r) => !r.otc) ?? scripted[0]
 if (sp) console.log(`  sample ${sp.asset} script: ${(sp.profile ?? []).map((s) => `${s.session}:${s.avg ?? '--'}(${s.obs}${s.quiet ? `-${s.quiet}q` : ''})`).join(' ')}`)
+
+// ---- script by class (Task 14): the class-level fold the panel renders ----
+// The panel folds each class's row profiles per session: obs/quiet sum
+// across rows, the buckets' unrounded `sum` totals too, and the class
+// average is round(totalSum / totalKept) - weighted by observations, never
+// an average of rounded averages. These checks pin that arithmetic against
+// the wire: the real/OTC partition, the fold's null/kept contract, the
+// weighted-mean property, and the cross-chip subset bound.
+const ALLSESS = ['ASIA', 'LONDON', 'OVERLAP', 'NEWYORK', 'OFF', 'OTC']
+const foldClass = (rs, session) => {
+  const buckets = rs.flatMap((r) => (r.profile ?? []).filter((s) => s.session === session))
+  const obs = buckets.reduce((n, s) => n + s.obs, 0)
+  const quiet = buckets.reduce((n, s) => n + s.quiet, 0)
+  const sum = buckets.reduce((n, s) => n + (s.sum ?? 0), 0)
+  const kept = obs - quiet
+  return { obs, quiet, kept, sum, avg: kept > 0 ? Math.round(sum / kept) : null, avgs: buckets.filter((s) => s.obs - s.quiet > 0).map((s) => s.avg) }
+}
+const FCLASSES = [
+  ['OTC', (r) => r.otc],
+  ['FX', (r) => r.category === 'forex'],
+  ['Crypto', (r) => r.category === 'crypto'],
+  ['Stocks', (r) => r.category === 'stock'],
+]
+const measured = FCLASSES.some(([, pick]) => ALLSESS.some((s) => foldClass(prows.filter(pick), s).obs > 0))
+ok('script by class: measured classes exist (profiled universe)', measured)
+const otcClassObs = foldClass(prows.filter((r) => r.otc), 'OTC').obs
+for (const [label, pick] of FCLASSES) {
+  const rs = prows.filter(pick)
+  if (rs.length === 0) {
+    ok(`${label} script: no rows in class (honest skip)`, true)
+    continue
+  }
+  // structure: fold each class's rows independently by kind - a clock
+  // session's obs must come only from the class's REAL rows (an -OTC row
+  // carries no clock buckets), the OTC bucket's only from its twins
+  const kindObs = (otcKind, s) =>
+    rs.filter((r) => (otcKind ? r.otc : !r.otc)).flatMap((r) => (r.profile ?? []).filter((b) => b.session === s)).reduce((n, b) => n + b.obs, 0)
+  ok(`${label} script: clock obs from real rows, OTC obs from twins`, ALLSESS.every((s) => foldClass(rs, s).obs === (s === 'OTC' ? kindObs(true, 'OTC') : kindObs(false, s))), `obs=${ALLSESS.map((s) => `${s[0]}:${foldClass(rs, s).obs}`).join(' ')}`)
+  // the fold's null/kept contract per session: avg null exactly when no
+  // non-quiet observation survived (and the total is 0 there too)
+  const nulls = ALLSESS.map((s) => foldClass(rs, s)).filter((f) => f.kept === 0)
+  const nonNulls = ALLSESS.map((s) => foldClass(rs, s)).filter((f) => f.kept > 0)
+  ok(`${label} script: avg null iff no non-quiet observations`, nulls.every((f) => f.avg === null && f.sum === 0) && nonNulls.every((f) => f.avg !== null), `kept0=${nulls.length} scored=${nonNulls.length}`)
+  if (nonNulls.length > 0) {
+    // weighted-mean property: the class average is an observation-weighted
+    // mean of the contributing row averages, so it must sit inside their
+    // range (rounding cannot escape it - the bounds are integers)
+    ok(`${label} script: class avg within contributing row avg range`, nonNulls.every((f) => f.avg >= Math.min(...f.avgs) && f.avg <= Math.max(...f.avgs)), `avgs=${nonNulls.map((f) => f.avg).join(',')}`)
+  }
+  // cross-chip bound: the OTC column of any class aggregates a subset of
+  // the rows the OTC class chip aggregates (its twins are OTC rows too)
+  if (label !== 'OTC') ok(`${label} script: OTC obs <= the OTC class's (twins are a subset)`, foldClass(rs, 'OTC').obs <= otcClassObs, `class=${foldClass(rs, 'OTC').obs} otc=${otcClassObs}`)
+  if (label === 'OTC' || label === 'FX') {
+    console.log(`  script ${label}: ${ALLSESS.map((s) => { const f = foldClass(rs, s); return f.obs > 0 ? `${s}:${f.avg ?? '--'}(${f.obs}${f.quiet ? `-${f.quiet}q` : ''})` : null }).filter(Boolean).join(' ')}`)
+  }
+}
 
 console.log(`\n${pass} passed, ${fail} failed`)
 process.exit(fail ? 1 : 0)

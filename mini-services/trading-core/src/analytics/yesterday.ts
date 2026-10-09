@@ -59,7 +59,10 @@
 // classifySession, each session reports obs / quiet / the mean rhyme of its
 // non-quiet echoes - so "EURUSD rhymes in London and diverges off-hours" is
 // a per-row fact instead of folklore. -OTC tickers have no sessions (see
-// analytics/session.ts): every pair lands in one day-wide OTC bucket.
+// analytics/session.ts): every pair lands in one day-wide OTC bucket. Each
+// bucket also carries the UNROUNDED rhyme total of its non-quiet echoes, so
+// clients can fold exact higher-level aggregates (a whole asset class, say)
+// from many rows without inheriting per-row rounding.
 
 import { classifySession, type Session } from './session'
 import type { AssetCategory, Candle } from '../types'
@@ -118,6 +121,11 @@ export interface SessionRhyme {
   obs: number
   /** of those, both lead-ins flat (real but trivial - kept out of avg) */
   quiet: number
+  /** total rhyme of the NON-QUIET echoes in this bucket (0 when none) - the
+   * unrounded numerator behind avg, so a client folding many rows into one
+   * aggregate (per class, per market) gets round(sum/kept) exact, never an
+   * average of rounded averages */
+  sum: number
   /** mean rhyme of the non-quiet echoes, 0..100; null when none survived */
   avg: number | null
 }
@@ -398,7 +406,13 @@ export function buildSessionProfile(
   return order.map((session) => {
     const t = tally.get(session)
     const kept = t ? t.obs - t.quiet : 0
-    return { session, obs: t?.obs ?? 0, quiet: t?.quiet ?? 0, avg: kept > 0 ? Math.round(t!.sum / kept) : null }
+    return {
+      session,
+      obs: t?.obs ?? 0,
+      quiet: t?.quiet ?? 0,
+      sum: t?.sum ?? 0,
+      avg: kept > 0 ? Math.round(t!.sum / kept) : null,
+    }
   })
 }
 
