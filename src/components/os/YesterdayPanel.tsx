@@ -96,9 +96,18 @@
 // session sink. The script line marks the peak session bold and grows a
 // spread tag (Δ best-worst); the sort needs the "by session" toggle and
 // falls back to the rhyme order if it is switched off mid-selection.
-import { useCallback, useEffect, useMemo, useState } from 'react'
+//
+// The watchlist leaves the panel through the COPY button: the current view
+// (same filters, same sort) serialized into a shareable text snapshot - top
+// 10 rows, one line each (echo rhyme, week aggregate, peak session + spread,
+// window move) under a header recording the scan time, the sort and the
+// filters. The comparators and the serializer live in
+// src/lib/os/watchlist.ts, and the list on screen sorts by the very same
+// code - the snapshot can never disagree with the list.
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Timeframe, YesterdayRow, YdaySession } from '@/lib/os/client'
 import { TIMEFRAME_SECONDS, fmtPrice, getYesterday } from '@/lib/os/client'
+import { RHYME_OK, RHYME_BAD, cmpBySort, buildWatchlist, type WatchSort } from '@/lib/os/watchlist'
 
 interface YesterdayPanelProps {
   onClose: () => void
@@ -113,14 +122,9 @@ interface YesterdayPanelProps {
 
 type Mkt = 'all' | 'real' | 'otc'
 type Cat = 'all' | 'forex' | 'crypto' | 'commodity' | 'stock' | 'index'
-type Sort = 'move' | 'since' | 'range' | 'rhyme' | 'week' | 'peak'
+type Sort = WatchSort
 type DirFilter = 'all' | 'up' | 'down' | 'none'
 type EchoF = 'all' | 'rhymes' | 'diverges'
-
-/** rhyme thresholds - a row scores 0..100; >=70 reads as "repeating the script",
- * <40 as "going its own way"; in between is partial rhyme. */
-const RHYME_OK = 70
-const RHYME_BAD = 40
 
 const WINDOWS: [number, string][] = [
   [15, '15m'],
@@ -144,54 +148,6 @@ const DAY_CHIPS: [number, string][] = [
 function maxDaysFor(tf: Timeframe, windowMin: number): number {
   const tfSec = TIMEFRAME_SECONDS[tf]
   return Math.max(1, Math.floor(((4000 - 2) * tfSec - 2 * windowMin * 60) / 86_400))
-}
-
-/** Week-rhyme ranking for the "week" sort - the best-echoes watchlist order:
- * rows rhyming (70+) with the MOST remembered days at this hour first
- * (yesterday's echo included, no-echo days excluded - the same observations
- * the PriorStrip's "N/M rhyme" counts, QUIET rhymes excluded too - a rhyme
- * between two flat lead-ins is real but trivial), the average rhyme across
- * those observations breaking ties, biggest yesterday-window move after
- * that. Rows without any non-quiet comparison sink to the bottom (-1
- * average). */
-function weekRhymeCmp(a: YesterdayRow, b: YesterdayRow): number {
-  const obs = (r: YesterdayRow): number[] => [
-    ...(r.echo && r.echo.quiet !== true ? [r.echo.rhyme] : []),
-    ...(r.prior ?? []).flatMap((p) => (p.echo && p.echo.quiet !== true ? [p.echo.rhyme] : [])),
-  ]
-  const ea = obs(a)
-  const eb = obs(b)
-  const ra = ea.filter((x) => x >= RHYME_OK).length
-  const rb = eb.filter((x) => x >= RHYME_OK).length
-  if (ra !== rb) return rb - ra
-  const aa = ea.length ? ea.reduce((s, x) => s + x, 0) / ea.length : -1
-  const ab = eb.length ? eb.reduce((s, x) => s + x, 0) / eb.length : -1
-  if (ab !== aa) return ab - aa
-  return Math.abs(b.movePct) - Math.abs(a.movePct)
-}
-
-/** The session-peak key for the "peak" sort - trade the pair where its
- * script rhymes: the BEST session average among sessions with at least TWO
- * non-quiet observations (a single lucky hour is not a script; quiet echoes
- * are already excluded from the kernel's averages), the spread between best
- * and worst QUALIFIED session breaking ties (a wide spread means the script
- * really differs by time of day, so the peak is worth trading), biggest
- * window move after that. Rows without a qualified session key to -1 and
- * sink; an -OTC row's single day-wide bucket is its own best session with a
- * spread of 0. */
-function peakKey(r: YesterdayRow): { best: number; spread: number } {
-  const quals = (r.profile ?? []).filter((s) => s.obs - s.quiet >= 2 && s.avg != null).map((s) => s.avg!)
-  const best = quals.length ? Math.max(...quals) : -1
-  const spread = quals.length > 1 ? Math.max(...quals) - Math.min(...quals) : 0
-  return { best, spread }
-}
-
-function peakRhymeCmp(a: YesterdayRow, b: YesterdayRow): number {
-  const ka = peakKey(a)
-  const kb = peakKey(b)
-  if (kb.best !== ka.best) return kb.best - ka.best
-  if (kb.spread !== ka.spread) return kb.spread - ka.spread
-  return Math.abs(b.movePct) - Math.abs(a.movePct)
 }
 
 const SESSION_LABEL: Record<YesterdayRow['session'], string> = {
@@ -528,6 +484,8 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [now, setNow] = useState(() => Date.now())
+  const [copied, setCopied] = useState(false)
+  const copyTimer = useRef<number | null>(null)
 
   // the 24h lookback cannot fit the archive depth below 30s candles - say so
   // instead of round-tripping a 400 the operator can't act on
@@ -580,19 +538,7 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
           : r.echo != null && r.echo.rhyme < RHYME_BAD,
     )
     .filter((r) => (!needle ? true : r.asset.toLowerCase().includes(needle) || r.name.toLowerCase().includes(needle)))
-    .sort((a, b) =>
-      sort === 'move'
-        ? Math.abs(b.movePct) - Math.abs(a.movePct)
-        : sort === 'since'
-          ? Math.abs(b.sincePct) - Math.abs(a.sincePct)
-          : sort === 'rhyme'
-            ? (b.echo?.rhyme ?? -1) - (a.echo?.rhyme ?? -1) || Math.abs(b.movePct) - Math.abs(a.movePct)
-            : sort === 'week'
-              ? weekRhymeCmp(a, b)
-              : sort === 'peak'
-                ? peakRhymeCmp(a, b)
-                : b.rangePct - a.rangePct,
-    )
+    .sort(cmpBySort(sort))
   // the week numbers only mean something once the scan actually carries prior
   // echoes (a day chip beyond 1d, on a kernel that computes them) - at 1d they
   // would be pure duplicates of the yesterday averages, so they stay hidden
@@ -613,6 +559,45 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
   const rhymeLive = (data?.rows ?? []).filter((r) => (r.echo?.rhyme ?? -1) >= RHYME_OK).length
   const catCount = (c: Cat) => (c === 'all' ? (data?.rows ?? []).length : (data?.rows ?? []).filter((r) => r.category === c).length)
   const ageSec = data ? Math.max(0, Math.round((now - data.ts) / 1000)) : 0
+
+  // the watchlist leaving the panel: serialize the CURRENT view (same
+  // filters, same sort) into a shareable text snapshot and copy it. The
+  // ordering comes from the very comparators the list on screen sorts by
+  // (src/lib/os/watchlist.ts) - the snapshot can never disagree with the
+  // list. Clipboard API first, textarea fallback for non-secure contexts.
+  const copyWatchlist = () => {
+    if (!data || rows.length === 0) return
+    const text = buildWatchlist({
+      rows,
+      sort,
+      tsMs: data.ts,
+      mktLabel: mkt === 'all' ? 'all markets' : mkt.toUpperCase(),
+      catLabel: cat === 'all' ? 'all classes' : cat,
+    })
+    const flash = () => {
+      if (copyTimer.current != null) window.clearTimeout(copyTimer.current)
+      setCopied(true)
+      copyTimer.current = window.setTimeout(() => setCopied(false), 1500)
+    }
+    const fallback = () => {
+      const ta = document.createElement('textarea')
+      ta.value = text
+      ta.style.position = 'fixed'
+      ta.style.opacity = '0'
+      document.body.appendChild(ta)
+      ta.select()
+      try {
+        document.execCommand('copy')
+      } catch {
+        // clipboard unavailable - nothing else to try; still flash so the
+        // operator knows the click landed
+      }
+      document.body.removeChild(ta)
+      flash()
+    }
+    if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).then(flash, fallback)
+    else fallback()
+  }
 
   // per-class rhyme averages - "are OTC pairs rhyming today?" at a glance.
   // Averages run ONLY over rows carrying a NON-QUIET echo (the honest
@@ -942,6 +927,21 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
         >
           by session
         </button>
+        <button
+          type="button"
+          onClick={copyWatchlist}
+          disabled={!data || rows.length === 0}
+          className={`shrink-0 rounded border px-1.5 py-0.5 font-mono text-[8.5px] font-bold uppercase tracking-wider transition-colors ${
+            copied
+              ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
+              : !data || rows.length === 0
+                ? 'cursor-not-allowed border-[#1c2739] text-[#2a3648]'
+                : 'border-[#1c2739] text-[#4b5a72] hover:text-[#aab6cc]'
+          }`}
+          title="copy the current view as a shareable text watchlist - the same filters and the same sort, top 10 rows, one line each (echo rhyme, week aggregate rhymed/kept + avg, peak session with its spread, window move) under a header recording the scan time, the sort and the filters. Quiet echoes are marked q and excluded from the aggregates exactly as on screen."
+        >
+          {copied ? 'copied' : 'copy'}
+        </button>
       </div>
 
       {/* rhyme by class - the portfolio-level answer to "is today repeating
@@ -1098,7 +1098,7 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
         ))}
         {data && data.rows.length > 0 && (
           <p className="px-1 pt-1 text-[8.5px] leading-relaxed text-[#3d4d66]">
-            Each row is the window that started at the bar forming exactly 24h ago, on the chart's timeframe. dir counts as up/down only when the net move exceeds 10% of the window's own travel. "arch" = bars from the kernel's accumulated store (broker bars in live mode), "seeded" = the feed's deterministic prehistory - never mistake a seeded yesterday for a remembered one. echo compares the lead-in windows ending at this same time of day (yesterday's ended at the anchor, today's within one bar of now): rhyme = direction 50 + move-vs-travel 30 + travel ratio 20, 70+ reads as "repeating the script", under 40 as "going its own way"; a rhyme between two FLAT lead-ins (net move under 10% of travel on both sides) is marked "quiet" - real but trivial, excluded from every aggregate. The rhyme-by-class strip averages each class's echo scores (compared rows only) - "are OTC pairs rhyming today?" is one glance away, and once the scan walks deeper than 1d each chip grows a ⟳ week number averaging every non-quiet echoed day-observation in class - "are they rhyming with the whole week, or only with yesterday?". Click a card to open that asset on the chart; click an echo chip to go further - the chart deep-loads the asset's full day of candles and scrolls onto yesterday's lead-in plus the forward replay window (edges the feed never remembered show as a gap, not filler). The day chips walk the same window further back - the "at this hour" strip shows each remembered day with its own coverage (days the series cannot cover are absent, not flat), each day's rhyme tag scores today's lead-in against THAT day's lead-in, and the "N/M rhyme" aggregate counts the days today actually rhymed with (70+, non-quiet comparisons) among the compared ones. The week sort orders the list by exactly that count - the strongest week rhymes float to the top (average rhyme breaking ties, biggest window move after that, quiet rhymes not counting), turning the panel into a best-echoes watchlist. The "by session" toggle goes one question deeper: the kernel re-scores the same adjacent-day lead-in echo at every hour of the day and averages it per trading session, so each row grows a "script" line - rhymes in London but not off-hours, or the reverse - with quiet echoes excluded from the averages and -OTC pairs collapsed into one day-wide bucket (they have no sessions). With the toggle on, the rhyme-by-class strip gains a sibling: script by class - each class's session averages folded across its rows (weighted by observations, quiet excluded), the OTC column separating the synthetic twins' day-wide script from the clock-bound classes'. The peak sort turns the script into a watchlist: the pair whose BEST session (2+ non-quiet observations) rhymes hardest floats to the top, the spread between best and worst qualified session breaking ties - and the script line marks the peak session bold beside a spread tag, so "trade it only where it rhymes" reads without the sort.
+            Each row is the window that started at the bar forming exactly 24h ago, on the chart's timeframe. dir counts as up/down only when the net move exceeds 10% of the window's own travel. "arch" = bars from the kernel's accumulated store (broker bars in live mode), "seeded" = the feed's deterministic prehistory - never mistake a seeded yesterday for a remembered one. echo compares the lead-in windows ending at this same time of day (yesterday's ended at the anchor, today's within one bar of now): rhyme = direction 50 + move-vs-travel 30 + travel ratio 20, 70+ reads as "repeating the script", under 40 as "going its own way"; a rhyme between two FLAT lead-ins (net move under 10% of travel on both sides) is marked "quiet" - real but trivial, excluded from every aggregate. The rhyme-by-class strip averages each class's echo scores (compared rows only) - "are OTC pairs rhyming today?" is one glance away, and once the scan walks deeper than 1d each chip grows a ⟳ week number averaging every non-quiet echoed day-observation in class - "are they rhyming with the whole week, or only with yesterday?". Click a card to open that asset on the chart; click an echo chip to go further - the chart deep-loads the asset's full day of candles and scrolls onto yesterday's lead-in plus the forward replay window (edges the feed never remembered show as a gap, not filler). The day chips walk the same window further back - the "at this hour" strip shows each remembered day with its own coverage (days the series cannot cover are absent, not flat), each day's rhyme tag scores today's lead-in against THAT day's lead-in, and the "N/M rhyme" aggregate counts the days today actually rhymed with (70+, non-quiet comparisons) among the compared ones. The week sort orders the list by exactly that count - the strongest week rhymes float to the top (average rhyme breaking ties, biggest window move after that, quiet rhymes not counting), turning the panel into a best-echoes watchlist. The "by session" toggle goes one question deeper: the kernel re-scores the same adjacent-day lead-in echo at every hour of the day and averages it per trading session, so each row grows a "script" line - rhymes in London but not off-hours, or the reverse - with quiet echoes excluded from the averages and -OTC pairs collapsed into one day-wide bucket (they have no sessions). With the toggle on, the rhyme-by-class strip gains a sibling: script by class - each class's session averages folded across its rows (weighted by observations, quiet excluded), the OTC column separating the synthetic twins' day-wide script from the clock-bound classes'. The peak sort turns the script into a watchlist: the pair whose BEST session (2+ non-quiet observations) rhymes hardest floats to the top, the spread between best and worst qualified session breaking ties - and the script line marks the peak session bold beside a spread tag, so "trade it only where it rhymes" reads without the sort. The copy button serializes exactly what you see - the same filters and sort, the top 10 rows as a text snapshot (echo rhyme, week aggregate, peak session, window move) headed by the scan time, the sort and the filters - ready to paste anywhere.
           </p>
         )}
       </div>

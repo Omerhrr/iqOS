@@ -11,8 +11,14 @@
 //     hour of the day (engineered lead-ins at known UTC hours) -> per-session
 //     buckets (obs/quiet/avg), future today-side skip, dark-session zeros,
 //     -OTC collapse, quiet exclusion, row-path wiring
+//   - watchlist snapshot: the ranking comparators (rhyme/week/peak orders,
+//     quiet exclusion, sink sentinels) and the serializer (header fields,
+//     cap, conditional columns, quiet marker, peak/spread cell, exact
+//     round-trip of the row numbers) against src/lib/os/watchlist.ts - the
+//     REAL shipped module, imported straight from the web tree
 // Run: bun scripts/yesterday_echo_unit.mjs
 import { buildPriorDay, buildSessionProfile, buildYesterdayRow } from '../mini-services/trading-core/src/analytics/yesterday'
+import { cmpBySort, buildWatchlist, fmtWatchlistTs } from '../src/lib/os/watchlist'
 
 let pass = 0
 let fail = 0
@@ -239,6 +245,59 @@ const rowProf = buildYesterdayRow(info, profSeries, { nowSec: nowP, windowSec: W
 ok('row path: profile wired == direct buildSessionProfile', JSON.stringify(rowProf?.profile) === JSON.stringify(prof), JSON.stringify(rowProf?.profile))
 const rowNoProf = buildYesterdayRow(info, profSeries, { nowSec: nowP, windowSec: WIN, tfSec: TF, nowPrice: base * 1.004, archived: 0, priorDays: 1 })
 ok('row path: profile absent when not requested', rowNoProf?.profile === undefined, JSON.stringify(rowNoProf?.profile))
+
+// ---- WATCHLIST SNAPSHOT (Task 16): the exported text + the ranking it rides ----
+// The panel sorts by and serializes through src/lib/os/watchlist.ts; bun
+// imports that module directly, so these checks lock the REAL shipped code
+// (not a mirror): the three watchlist orders with their quiet exclusion and
+// sink sentinels, and the snapshot's layout - header fields, topN cap,
+// conditional week/peak columns, the quiet marker, and every cell matching
+// the row it came from.
+const wr = (asset, movePct, echo, prior, profile) => ({ asset, movePct, sincePct: 0, rangePct: 1, echo, prior, profile })
+const WROWS = [
+  // AAA: week kept [90,80,40] -> rhymed 2, avg 70; peak L/N 80 vs Asia 60 (spread 20)
+  wr('AAA', 1.2, { rhyme: 90, quiet: false }, [{ echo: { rhyme: 80, quiet: false } }, { echo: { rhyme: 40, quiet: false } }], [{ session: 'OVERLAP', obs: 6, quiet: 0, avg: 80 }, { session: 'ASIA', obs: 4, quiet: 1, avg: 60 }]),
+  // BBB: week kept [95,20] -> rhymed 1, avg 58; peak single qualified session (no spread)
+  wr('BBB', 3.0, { rhyme: 95, quiet: false }, [{ echo: { rhyme: 20, quiet: false } }], [{ session: 'OVERLAP', obs: 6, quiet: 0, avg: 60 }]),
+  // CCC: no echo anywhere, dark profile -> sinks in week AND peak
+  wr('CCC', 0.5, null, [], [{ session: 'ASIA', obs: 0, quiet: 0, avg: null }]),
+  // DDD: every echo quiet -> week kept 0 (-1 sink); no profile at all
+  wr('DDD', 2.0, { rhyme: 100, quiet: true }, [{ echo: { rhyme: 90, quiet: true } }], null),
+  // EEE: one non-quiet echo, no priors, no profile
+  wr('EEE', 0.9, { rhyme: 55, quiet: false }, [], null),
+]
+const byWeek = [...WROWS].sort(cmpBySort('week')).map((r) => r.asset)
+ok('watchlist: week order - rhymed days first, avg breaks ties, sinks last', JSON.stringify(byWeek) === JSON.stringify(['AAA', 'BBB', 'EEE', 'DDD', 'CCC']), `got ${byWeek.join(',')}`)
+ok('watchlist: week order - all-quiet row keys to -1, sinks beside the no-echo row, |move| breaks', cmpBySort('week')(WROWS[3], WROWS[2]) < 0, `DDD vs CCC cmp=${cmpBySort('week')(WROWS[3], WROWS[2])}`)
+const byPeak = [...WROWS].sort(cmpBySort('peak')).map((r) => r.asset)
+ok('watchlist: peak order - best session wins, spread/|move| place the rest', JSON.stringify(byPeak) === JSON.stringify(['AAA', 'BBB', 'DDD', 'EEE', 'CCC']), `got ${byPeak.join(',')}`)
+const rhymeSorted = [...WROWS].sort(cmpBySort('rhyme')).map((r) => r.asset)
+ok('watchlist: rhyme order exact - the sort reads the score (quiet 100 included), nulls sink by |move|', JSON.stringify(rhymeSorted) === JSON.stringify(['DDD', 'BBB', 'AAA', 'EEE', 'CCC']), `got ${rhymeSorted.join(',')}`)
+ok('watchlist: move order uses |move| - BBB 3.0 first, CCC 0.5 last', JSON.stringify([...WROWS].sort(cmpBySort('move')).map((r) => r.asset)) === JSON.stringify(['BBB', 'DDD', 'AAA', 'EEE', 'CCC']), `got ${[...WROWS].sort(cmpBySort('move')).map((r) => r.asset).join(',')}`)
+
+const TS = 1_699_920_000_000 // 2023-11-14T00:00:00Z
+ok('watchlist: fmtWatchlistTs renders a UTC label', fmtWatchlistTs(TS) === '2023-11-14 00:00 UTC', `got ${fmtWatchlistTs(TS)}`)
+const snap = buildWatchlist({ rows: WROWS, sort: 'peak', tsMs: TS, topN: 3, mktLabel: 'all markets', catLabel: 'all classes' })
+const snapLines = snap.split('\n')
+ok('watchlist: snapshot is title + key row + topN data rows + legend', snapLines.length === 3 + 3, `lines=${snapLines.length}`)
+ok('watchlist: header carries the scan time, sort, filters and count', snapLines[0].includes('2023-11-14 00:00 UTC') && snapLines[0].includes('sort peak') && snapLines[0].includes('all markets') && snapLines[0].includes('all classes') && snapLines[0].includes('top 3 of 5'), snapLines[0])
+ok('watchlist: cap respected - the top-3 text holds exactly AAA/BBB/DDD', snapLines[2].includes('AAA') && snapLines[3].includes('BBB') && snapLines[4].includes('DDD'), snapLines.slice(2, 5).join(' | '))
+ok('watchlist: quiet echo marked q in the echo cell', snapLines[4].includes('100q'), snapLines[4])
+ok('watchlist: peak cell is session + best + spread (AAA L/N 80 Δ20)', snapLines[2].includes('L/N 80 Δ20'), snapLines[2])
+ok('watchlist: single qualified session renders without a spread tag', snapLines[3].includes('L/N 60') && !snapLines[3].includes('Δ'), snapLines[3])
+ok('watchlist: row without a profile renders an honest — peak cell', snapLines[4].includes('—'), snapLines[4])
+ok('watchlist: move cell signed to two decimals', snapLines[2].includes('+1.20%') && snapLines[3].includes('+3.00%'), `${snapLines[2]} | ${snapLines[3]}`)
+const snapWeek = buildWatchlist({ rows: WROWS, sort: 'week', tsMs: TS, topN: 5 })
+const wLine = snapWeek.split('\n')[2]
+ok('watchlist: week cell is rhymed/kept + avg over non-quiet days (AAA 2/3 70)', wLine.includes('2/3 70'), wLine)
+ok('watchlist: quiet-only and no-echo rows render a — week cell', snapWeek.split('\n').some((l) => l.includes('DDD') && l.includes('—')) && snapWeek.split('\n').some((l) => l.includes('CCC') && l.includes('—')), snapWeek)
+const snapBare = buildWatchlist({ rows: [WROWS[4]], sort: 'rhyme', tsMs: TS, topN: 10 })
+ok('watchlist: week column omitted when no exported row has a prior echo', !snapBare.split('\n')[1].includes('week'), snapBare.split('\n')[1])
+ok('watchlist: peak column omitted when no exported row has a profile', !snapBare.split('\n')[1].includes('peak'), snapBare.split('\n')[1])
+ok('watchlist: full scan says so in the header (no top-N truncation)', snapBare.split('\n')[0].includes('1 row'), snapBare.split('\n')[0])
+const snapEmpty = buildWatchlist({ rows: [], sort: 'week', tsMs: TS, topN: 10 })
+ok('watchlist: empty view is honest (no rows - loosen the filters)', snapEmpty.includes('no rows - loosen the filters'), snapEmpty.split('\n')[1])
+ok('watchlist: serializer deterministic (same input -> same text)', buildWatchlist({ rows: WROWS, sort: 'week', tsMs: TS, topN: 5 }) === snapWeek)
 
 console.log(`\n${pass} passed, ${fail} failed`)
 process.exit(fail > 0 ? 1 : 0)

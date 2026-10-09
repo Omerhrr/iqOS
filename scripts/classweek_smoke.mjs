@@ -22,6 +22,9 @@
 //   - peak sort: best session average among sessions with 2+ non-quiet
 //     observations, spread (best - worst qualified) as tie-break, no
 //     qualified session -> -1 (sink); OTC's single bucket spreads 0
+//   - watchlist export (Task 16): every live row carries the complete
+//     field set the text snapshot reads (the serializer itself is locked
+//     by the unit suite against the real module)
 // Read-only.
 const BASE = process.env.IQAIR_OS_URL ?? 'http://localhost:3030'
 const TOKEN = (process.env.KERNEL_TOKEN ?? '').trim()
@@ -297,6 +300,20 @@ for (const t of ptop) {
   const peakSess = (t.profile ?? []).filter((s) => s.obs - s.quiet >= 2 && s.avg === k.best)[0]
   console.log(`  peak ${t.asset}: ${peakSess ? peakSess.session : '?'} ${k.best} spread ${k.spread}`)
 }
+
+// ---- watchlist export (Task 16): the fields the snapshot reads ----
+// The serializer + comparators are locked by the unit suite against the
+// real src/lib/os/watchlist.ts module (bun imports it directly); this pins
+// the WIRE side once, consolidated: every live row carries the complete
+// field set the export reads (asset, move, echo rhyme+quiet, prior echoes,
+// profile buckets) - if the kernel ever drops one, the snapshot degrades
+// silently, so the input contract is locked here instead of hoped for.
+ok('export: every profiled row carries the fields the snapshot reads', prows.every((r) =>
+  typeof r.asset === 'string' && r.asset.length > 0 && Number.isFinite(r.movePct) &&
+  (r.echo == null || (Number.isFinite(r.echo.rhyme) && typeof r.echo.quiet === 'boolean')) &&
+  (r.prior ?? []).every((p) => p.echo == null || (Number.isFinite(p.echo.rhyme) && typeof p.echo.quiet === 'boolean')) &&
+  (r.profile ?? []).every((s) => ['ASIA', 'LONDON', 'OVERLAP', 'NEWYORK', 'OFF', 'OTC'].includes(s.session) && (s.avg === null || (s.avg >= 0 && s.avg <= 100))),
+), JSON.stringify(prows.find((r) => r.echo == null || (r.profile ?? []).length === 0)))
 
 console.log(`\n${pass} passed, ${fail} failed`)
 process.exit(fail ? 1 : 0)
