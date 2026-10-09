@@ -19,6 +19,9 @@
 //     avg null iff no non-quiet observations, class avg within the range
 //     of its contributing row averages (weighted mean), and every class's
 //     OTC obs bounded by the OTC class's (twins are a subset of OTC)
+//   - peak sort: best session average among sessions with 2+ non-quiet
+//     observations, spread (best - worst qualified) as tie-break, no
+//     qualified session -> -1 (sink); OTC's single bucket spreads 0
 // Read-only.
 const BASE = process.env.IQAIR_OS_URL ?? 'http://localhost:3030'
 const TOKEN = (process.env.KERNEL_TOKEN ?? '').trim()
@@ -253,6 +256,46 @@ for (const [label, pick] of FCLASSES) {
   if (label === 'OTC' || label === 'FX') {
     console.log(`  script ${label}: ${ALLSESS.map((s) => { const f = foldClass(rs, s); return f.obs > 0 ? `${s}:${f.avg ?? '--'}(${f.obs}${f.quiet ? `-${f.quiet}q` : ''})` : null }).filter(Boolean).join(' ')}`)
   }
+}
+
+// ---- peak sort (Task 15): trade the pair where its script rhymes ----
+// The panel's peakKey is WEB-side from the wire: best session average among
+// sessions with at least TWO non-quiet observations (one lucky hour is not
+// a script; quiet echoes are already excluded from the kernel's averages),
+// the spread best-minus-worst-qualified breaking ties, rows without a
+// qualified session keying to -1 and sinking. An -OTC row's single day-wide
+// bucket is its own best session with spread 0. These checks pin the key's
+// semantics against the wire and the ranking rule on synthetic rows.
+const peakKey = (r) => {
+  const quals = (r.profile ?? []).filter((s) => s.obs - s.quiet >= 2 && s.avg != null).map((s) => s.avg)
+  return { best: quals.length ? Math.max(...quals) : -1, spread: quals.length > 1 ? Math.max(...quals) - Math.min(...quals) : 0, n: quals.length }
+}
+ok('peak: best is 0..100 or -1 (no qualified session)', prows.every((r) => { const k = peakKey(r); return k.best === -1 || (k.best >= 0 && k.best <= 100) }))
+ok('peak: spread >= 0, and 0 whenever fewer than two sessions qualify', prows.every((r) => { const k = peakKey(r); return k.spread >= 0 && (k.n >= 2 || k.spread === 0) }))
+ok('peak: -1 really means no qualified session on the wire', prows.every((r) => peakKey(r).best !== -1 || !(r.profile ?? []).some((s) => s.obs - s.quiet >= 2 && s.avg != null)))
+ok('peak: best dominates every qualified session average', prows.every((r) => { const q = (r.profile ?? []).filter((s) => s.obs - s.quiet >= 2 && s.avg != null).map((s) => s.avg); return q.length === 0 || peakKey(r).best === Math.max(...q) }))
+ok('peak: -OTC rows have a single bucket so their spread is 0', prows.filter((r) => r.otc).every((r) => peakKey(r).spread === 0 && (peakKey(r).best === -1 || peakKey(r).best === (r.profile ?? []).find((s) => s.obs - s.quiet >= 2)?.avg)), `otc=${prows.filter((r) => r.otc).length}`)
+// ranking rule on synthetic rows: best average dominates, a wider spread
+// breaks best-ties (the peak of a session-structured script is worth more),
+// and rows with nothing qualified sink below every qualified row
+const psynth = [
+  { asset: 'C', movePct: 0.1, profile: [{ session: 'ASIA', obs: 6, quiet: 0, avg: 90 }, { session: 'LONDON', obs: 6, quiet: 0, avg: 60 }] },
+  { asset: 'A', movePct: 0.1, profile: [{ session: 'ASIA', obs: 6, quiet: 0, avg: 80 }, { session: 'LONDON', obs: 6, quiet: 0, avg: 40 }] },
+  { asset: 'B', movePct: 0.1, profile: [{ session: 'ASIA', obs: 6, quiet: 0, avg: 80 }, { session: 'LONDON', obs: 6, quiet: 0, avg: 70 }] },
+  { asset: 'D', movePct: 5.0, profile: [{ session: 'ASIA', obs: 1, quiet: 0, avg: 95 }, { session: 'LONDON', obs: 2, quiet: 2, avg: null }] },
+  { asset: 'E', movePct: 0.1, profile: [{ session: 'ASIA', obs: 0, quiet: 0, avg: null }] },
+]
+const pranked = [...psynth].sort((a, b) => peakKey(b).best - peakKey(a).best || peakKey(b).spread - peakKey(a).spread || Math.abs(b.movePct) - Math.abs(a.movePct))
+ok('peak: highest best-session average wins', pranked[0].asset === 'C', `top=${pranked[0].asset}`)
+ok('peak: wider spread breaks best-ties (session structure matters)', pranked[1].asset === 'A' && pranked[2].asset === 'B', `2nd=${pranked[1].asset} 3rd=${pranked[2].asset}`)
+ok('peak: one lucky hour (kept 1) does not qualify - row sinks', pranked[3].asset === 'D' && peakKey(psynth[3]).best === -1, `4th=${pranked[3].asset} best=${peakKey(psynth[3]).best}`)
+ok('peak: all-quiet/nothing-measured sinks with the unqualified', pranked[4].asset === 'E' && peakKey(psynth[4]).best === -1, `last=${pranked[4].asset}`)
+// top-3 of the would-be peak watchlist for eyeballing
+const ptop = [...prows].sort((a, b) => peakKey(b).best - peakKey(a).best || peakKey(b).spread - peakKey(a).spread || Math.abs(b.movePct) - Math.abs(a.movePct)).slice(0, 3)
+for (const t of ptop) {
+  const k = peakKey(t)
+  const peakSess = (t.profile ?? []).filter((s) => s.obs - s.quiet >= 2 && s.avg === k.best)[0]
+  console.log(`  peak ${t.asset}: ${peakSess ? peakSess.session : '?'} ${k.best} spread ${k.spread}`)
 }
 
 console.log(`\n${pass} passed, ${fail} failed`)
