@@ -248,6 +248,17 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
     const slPct = opts.slPct ?? 0.25
     const maxBars = opts.maxBars ?? 24
     let open: { side: 'call' | 'put'; entry: number; bars: number; ts: number } | null = null
+    // edgeTrigger spot parity (same semantics the live bots run): the
+    // direction of the last entry this episode. While the condition keeps
+    // reporting the same direction, re-entry after a TP/SL/maxBars exit is
+    // the SAME persisting signal, not a fresh one - it stays suppressed
+    // until the condition lapses (evaluates 'none') or flips. Binary mode
+    // has had this since Task 58; spot mode silently re-entered a condition
+    // that never stopped being true, which live bots CANNOT do (their
+    // lastSignalDir stamp survives the position close until a real lapse) -
+    // the gap made 'live-like' spot results look better than anything the
+    // bots could actually deliver.
+    let lastEntryDir: 'call' | 'put' | 'none' = 'none'
     for (let i = warmup; i < candles.length; i++) {
       const candle = candles[i]
       if (open) {
@@ -284,12 +295,33 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
           if (dd > maxDD) maxDD = dd
           equityCurve.push({ time: candle.time, value: equity })
           open = null
+          // a flip consumed this episode's opposite-side freshness: the new
+          // side may enter as its own fresh edge (bot parity - a flipped
+          // direction always passes the bot's edge-trigger). A forced-'none'
+          // exit bar is NOT a real lapse, so lastEntryDir survives TP/SL/
+          // maxBars exits untouched and still suppresses the same side.
+          if (flipped && opts.edgeTrigger) lastEntryDir = 'none'
+          continue
         }
+        // real eval on a non-exit bar: a genuine lapse while holding re-arms
+        // the edge-trigger exactly like the bot's 'none' branch does
+        if (opts.edgeTrigger && evNow.direction === 'none') lastEntryDir = 'none'
         continue
       }
       const ev = filterDir(strat.evaluate([...candles.slice(0, i + 1)], params, { asset }))
+      if (opts.edgeTrigger) {
+        // a genuine lapse while flat re-arms the edge-trigger exactly like
+        // the bot's 'none' branch does - without this, a condition that
+        // lapsed and re-fired while flat stayed suppressed forever
+        if (ev.direction === 'none') {
+          lastEntryDir = 'none'
+        } else if (ev.direction === lastEntryDir) {
+          continue // same persisting condition - not a fresh edge
+        }
+      }
       if (ev.direction !== 'none' && equity >= amount) {
         open = { side: ev.direction, entry: candle.close, bars: 0, ts: candle.time }
+        if (opts.edgeTrigger) lastEntryDir = ev.direction
       }
     }
   }

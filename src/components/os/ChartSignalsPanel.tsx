@@ -198,12 +198,19 @@ function EngineChips({ s }: { s: ChartSignal }) {
 }
 
 function SignalCard({ s, now, tab, onSelectAsset, onTake }: { s: ChartSignal; now: number; tab: Tab; onSelectAsset?: (a: string) => void; onTake?: (sig: ChartSignal, t: Tab) => void }) {
-  const ageSec = Math.max(0, Math.round((now - s.ts) / 1000))
+  // age anchored to the BAR that fed the read (kernel truth), not the scan
+  // time - a read computed late against old candles shows its real age
+  const ageSec = s.ageSec ?? Math.max(0, Math.round((now - s.ts) / 1000))
   const remainSec = Math.round((s.validUntil - now) / 1000)
   // fade as the read approaches its TTL - gone entirely once expired
   const opacity = remainSec <= 0 ? 0 : remainSec < 45 ? 0.35 + (remainSec / 45) * 0.65 : 1
   const expiryMin = Math.round(s.expirySec / 60)
   const rr = rrOf(s)
+  // spell age: how long this condition has been continuously qualifying
+  // (kernel firstSeenTs), falling back to the bar age when absent
+  const spellSec = s.firstSeenTs ? Math.max(0, Math.round((now - s.firstSeenTs) / 1000)) : ageSec
+  const spellMin = Math.floor(spellSec / 60)
+  const spellLabel = spellMin >= 1 ? `${spellMin}m` : `${spellSec}s`
   return (
     <div
       role="button"
@@ -222,9 +229,36 @@ function SignalCard({ s, now, tab, onSelectAsset, onTake }: { s: ChartSignal; no
         {s.otc && (
           <span className="rounded border border-amber-500/40 bg-amber-500/10 px-1 py-px font-mono text-[8px] font-bold uppercase text-amber-400">otc</span>
         )}
+        {s.phase === 'entered' ? (
+          <span
+            className="rounded border border-emerald-500/40 bg-emerald-500/10 px-1 py-px font-mono text-[8px] font-bold uppercase text-emerald-300"
+            title="JUST became true - first qualifying scan for this read. Bots and the auto-trader only act on reads like this one."
+          >
+            new
+          </span>
+        ) : s.phase === 'flip' ? (
+          <span
+            className="rounded border border-cyan-500/40 bg-cyan-500/10 px-1 py-px font-mono text-[8px] font-bold uppercase text-cyan-300"
+            title="flipped sides since the last scan - a fresh edge on the new direction"
+          >
+            flip
+          </span>
+        ) : s.phase === 'held' && s.backfilled ? (
+          <span
+            className="rounded border border-[#1c2739] px-1 py-px font-mono text-[8px] text-[#7c8aa5]"
+            title="already qualifying when the scanner booted - its true age is unknowable, so it is never presented as fresh"
+          >
+            ~held
+          </span>
+        ) : s.phase === 'held' ? (
+          <span className="font-mono text-[8px] text-[#4b5a72]" title="already qualifying before this scan - the condition has been true for a while (spell age shown right)">
+            held
+          </span>
+        ) : null}
         <span className="font-mono text-[9px] text-[#4b5a72]">{fmtPrice(s.price, s.asset)}</span>
         <span className="ml-auto font-mono text-[9px] text-[#7c8aa5]">
           {s.agree}/{s.total} · {ageSec}s
+          {s.phase === 'held' && ` · held ${spellLabel}`}
         </span>
       </div>
       <div className="mt-1.5">
@@ -386,7 +420,10 @@ export default function ChartSignalsPanel({ onClose, tf, onSelectAsset, onTake }
 
   const live = (data?.signals ?? []).filter((s) => s.validUntil > now)
   const needle = query.trim().toLowerCase()
-  const firstSeenOf = (s: ChartSignal) => firstSeen.get(seenKey(s)) ?? s.ts
+  // freshest-first: the kernel's spell-start truth when it reports one
+  // (survives panel reloads, knows about boot backfill), the local ledger
+  // otherwise (older kernel or a read that predates the poll)
+  const firstSeenOf = (s: ChartSignal) => s.firstSeenTs ?? firstSeen.get(seenKey(s)) ?? s.ts
   const signals = live
     .filter((s) => (mkt === 'all' ? true : mkt === 'otc' ? s.otc : !s.otc))
     .filter((s) => (cat === 'all' ? true : s.category === cat))
@@ -465,10 +502,16 @@ export default function ChartSignalsPanel({ onClose, tf, onSelectAsset, onTake }
         {data && (
           <span
             className="ml-auto font-mono text-[8px] text-[#4b5a72]"
-            title="instruments scanned per pass / open instruments found · considered (enough history) · qualifying reads live now · scan duration"
+            title="instruments scanned per pass / open instruments found · considered (enough history) · qualifying reads live now · fresh edges this scan · scan duration"
           >
             {data.scanned}
-            {data.universe ? `/${data.universe}` : ''} scanned · {data.considered} hist · {data.qualifying} live · {data.scanMs}ms
+            {data.universe ? `/${data.universe}` : ''} scanned · {data.considered} hist · {data.qualifying} live
+            {typeof data.freshEdges === 'number' && data.freshEdges > 0 && (
+              <span className="ml-1 font-bold text-emerald-400" title="reads whose condition JUST became true or flipped this scan - the only ones bots and the auto-trader act on">
+                · {data.freshEdges} fresh
+              </span>
+            )}
+            {' '}· {data.scanMs}ms
           </span>
         )}
         {(() => {
@@ -656,7 +699,7 @@ export default function ChartSignalsPanel({ onClose, tf, onSelectAsset, onTake }
                 {tab === 'option'
                   ? 'Direction + suggested expiry from chart-type confluence. Real pairs read the volume footprint (CLV proxy), OTC pairs the micro-tick velocity footprint.'
                   : 'Same chart-engine read, expressed as a CFD plan: entry at last close, stop beyond the recent swing (ATR floor), target at >= 1.5R.'}
-                {' '}Every qualifying read is shown - the sort toggle picks strongest-first or freshest-first and the min-strength slider hides weak reads (kernel floor 35) - All / Real / OTC + class chips + search narrow the list, click a card to open that asset on the chart, take loads it into the trade ticket.
+                {' '}<span className="text-emerald-500/70">new</span> = condition just became true, <span className="text-cyan-500/70">flip</span> = sides flipped since the last scan, <span className="text-[#7c8aa5]">held</span> = already true for a while (spell age shown, bots + auto-trader skip it) - ages anchor to the closed bar that fed the read, not the scan. Take loads it into the trade ticket, click a card to open the chart.
               </p>
             )}
           </>

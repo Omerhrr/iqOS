@@ -9,6 +9,15 @@
 // assets vote with the micro-tick velocity footprint instead (no order book
 // exists there, so print speed replaces volume). Everything reads only
 // CLOSED candles - the forming minute never votes.
+//
+// Freshness + edge semantics: every signal carries barTs (the last closed
+// bar that fed the votes) and ageSec (seconds since that bar closed), and
+// its TTL is anchored to the BAR END, not the scan time - a read computed
+// late against an old bar honestly lives shorter. The scanner plugin diffs
+// each scan against the previous one (diffEdges below) so every read also
+// knows whether its condition JUST became true (entered/flip) or has been
+// true for a while (held) - the level-vs-edge distinction the operator
+// actually trades on.
 
 import type { Candle } from '../types'
 import { renkoAtr, renkoBricks } from './renko'
@@ -67,6 +76,82 @@ export interface ChartSignal {
   ts: number
   validUntil: number
   dataSource: string
+  /** Epoch seconds (candle-open time) of the last CLOSED candle that fed
+   * the votes - the freshness anchor. staleness = now - (barTs + tfSec). */
+  barTs: number
+  /** Seconds since that bar closed (>= 0). A read built right after a bar
+   * close is young no matter when you poll it; a read built against a stale
+   * feed shows its true age. */
+  ageSec: number
+  /** Edge phase vs the previous scan (set by the scanner's registry diff,
+   * not by the math here): 'entered' = first qualifying scan for this read,
+   * 'flip' = same asset flipped sides since the last scan, 'held' = already
+   * qualifying before. Only entered/flip are actionable-fresh; held reads
+   * have been true for a while. */
+  phase?: 'entered' | 'held' | 'flip'
+  /** Epoch ms when this read first qualified in its current spell (bar time
+   * for backfilled reads, scan time for observed ones). */
+  firstSeenTs?: number
+  /** True when this read was already qualifying at the scanner's first scan
+   * after boot - its true age is unknowable, so it is deliberately NOT
+   * presented as fresh. */
+  backfilled?: boolean
+}
+
+/** Registry state for one asset's qualifying read (per kind+tf). */
+export interface EdgeState {
+  dir: 'call' | 'put'
+  firstSeenTs: number
+  backfilled: boolean
+}
+
+export interface EdgedSignalMeta {
+  phase: 'entered' | 'held' | 'flip'
+  firstSeenTs: number
+  backfilled: boolean
+}
+
+/** Diff one scan's qualifying reads against the registry for this kind+tf
+ * and classify the transition. PURE except for the registry update (the
+ * registry IS the memory of what qualified before - pass a scoped per-combo
+ * map). Boot semantics: an empty registry means the scanner just started and
+ * cannot know how long the current reads have been true, so every first-scan
+ * read is 'held' + backfilled with firstSeen anchored at its own barTs -
+ * never presented as fresh. A read that flips sides is a REAL fresh edge
+ * even after backfill (both sides were observed). Reads that stop qualifying
+ * are dropped from the registry - their next appearance is a fresh entry. */
+export function diffEdges(
+  registry: Map<string, EdgeState>,
+  signals: Array<{ asset: string; direction: 'call' | 'put'; barTs: number }>,
+  now: number
+): Map<string, EdgedSignalMeta> {
+  const firstScan = registry.size === 0
+  const out = new Map<string, EdgedSignalMeta>()
+  for (const s of signals) {
+    const prev = registry.get(s.asset)
+    if (!prev) {
+      const meta: EdgedSignalMeta = firstScan
+        ? { phase: 'held', firstSeenTs: s.barTs * 1000, backfilled: true }
+        : { phase: 'entered', firstSeenTs: now, backfilled: false }
+      out.set(s.asset, meta)
+      registry.set(s.asset, { dir: s.direction, firstSeenTs: meta.firstSeenTs, backfilled: meta.backfilled })
+      continue
+    }
+    if (prev.dir !== s.direction) {
+      // observed flip - both sides were seen, so this edge is real regardless
+      // of any boot backfill
+      out.set(s.asset, { phase: 'flip', firstSeenTs: now, backfilled: false })
+      registry.set(s.asset, { dir: s.direction, firstSeenTs: now, backfilled: false })
+    } else {
+      out.set(s.asset, { phase: 'held', firstSeenTs: prev.firstSeenTs, backfilled: prev.backfilled })
+    }
+  }
+  // lapse: drop every asset that no longer qualifies so its next appearance
+  // classifies as a fresh entry
+  for (const asset of [...registry.keys()]) {
+    if (!signals.some((s) => s.asset === asset)) registry.delete(asset)
+  }
+  return out
 }
 
 export interface CombineResult {
@@ -376,6 +461,11 @@ export function buildChartSignal(
   const now = opts.now ?? Date.now()
   const last = candles[candles.length - 1]
   const tfSec = opts.tfSec ?? 60
+  // freshness anchor: the last CLOSED bar's end, not the scan time - the
+  // honest age of the read is how far the data is behind, and its TTL runs
+  // from the bar, so a late scan against old candles lives shorter
+  const barEndMs = (last.time + tfSec) * 1000
+  const ageSec = Math.max(0, Math.round((now - barEndMs) / 1000))
   // expiry floor follows the timeframe too - a 5s chart can honestly suggest
   // a 5s expiry; the 1800s cap mirrors the longest platform expiry
   const expiryFloor = Math.min(60, tfSec)
@@ -398,7 +488,9 @@ export function buildChartSignal(
     votes,
     cfd: cfdLevelsFor(candles, combined.direction, info.pip),
     ts: now,
-    validUntil: now + (opts.ttlSec ?? 150) * 1000,
+    validUntil: barEndMs + (opts.ttlSec ?? 150) * 1000,
     dataSource: `chart-engines:${info.otc ? 'renko,pnf,range,tick,otcfootprint,heikin,candle' : 'renko,pnf,range,tick,footprint,heikin,candle'}`,
+    barTs: last.time,
+    ageSec,
   }
 }

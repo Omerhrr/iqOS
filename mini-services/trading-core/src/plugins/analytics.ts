@@ -8,6 +8,7 @@ import type { MarketDataService } from './market-data'
 import { analyze } from '../analytics/engine'
 import { backtest, type BacktestOptions } from '../strategies/backtest'
 import { STRATEGIES, getStrategy, defaultParams } from '../strategies/builtin'
+import { evalWithEdge } from '../analytics/edge'
 
 export class AnalyticsService {
   private ctx!: KernelContext
@@ -61,8 +62,11 @@ export class AnalyticsService {
     const candles = this.market.getCandlesDeep(asset, tf, 1500, true)
     if (candles.length < 60) throw new Error('not enough candle history yet')
     const merged = { ...defaultParams(strat), ...(params ?? {}) }
-    const ev = strat.evaluate(candles, merged, { asset })
-    return { ...ev, asset, tf, strategy: strategyId, price: candles[candles.length - 1].close }
+    // Edge wrapper: the evaluate stays pure/level-shaped; the transition vs
+    // the previous closed bar is classified here so every consumer (bots,
+    // auto-trader, panels) can gate on "just became true" vs "already true".
+    const ev = evalWithEdge((cs) => strat.evaluate(cs, merged, { asset }), candles, { asset })
+    return { ...ev, asset, tf, strategy: strategyId, price: candles[candles.length - 1].close, barTs: candles[candles.length - 1].time }
   }
 
   runBacktest(asset: string, tf: Timeframe, opts: BacktestOptions) {

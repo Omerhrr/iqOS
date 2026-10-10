@@ -465,6 +465,15 @@ export class ModeService {
   reason = 'initial state'
   config: AutoTraderConfig = { ...DEFAULT_AUTOTRADER }
   private rt: AutoRuntime = ModeService.freshRuntime()
+  /** Edge memory for the screener source: (asset:dir) pairs that were ALREADY
+   * qualifying when autonomy armed. The screener's qualifying feed is the
+   * complete universe for its source, so each tick refreshes this set's
+   * honesty: keys that lapse out of the feed are removed (their next
+   * appearance is a genuine fresh edge), keys that persist keep blocking.
+   * Without it the first tick after arming would happily trade whatever had
+   * been sitting in the top-12 for the last hour - the exact "condition that
+   * already true" failure mode. */
+  private autoEdgeBackfill = new Set<string>()
 
   static freshRuntime(): AutoRuntime {
     return {
@@ -632,11 +641,33 @@ export class ModeService {
     const wantRunning = this.mode === 'auto'
     if (wantRunning && !this.timer) {
       this.timer = setInterval(() => void this.tick(), 10_000)
+      this.armAutoEdgeBackfill()
       void this.tick() // act immediately on entry
     } else if (!wantRunning && this.timer) {
       clearInterval(this.timer)
       this.timer = null
       this.rt.lastRejection = undefined
+    }
+  }
+
+  /** Snapshot the screener's CURRENTLY qualifying (asset,dir) pairs into the
+   * backfill set - everything in it is treated as an already-true condition
+   * until it is observed lapsing. Cheap (one screener.top call), best-effort
+   * (a cold screener just backfills less; cooldowns still apply). */
+  private armAutoEdgeBackfill(): void {
+    this.autoEdgeBackfill.clear()
+    try {
+      const screener = this.ctx.use<ScreenerService>('screener')
+      const { rows } = screener.top({ tf: this.config.tf, limit: 500 })
+      for (const r of rows) {
+        if (r.direction === 'none') continue
+        this.autoEdgeBackfill.add(`${r.asset}:${r.direction}`)
+      }
+      if (this.autoEdgeBackfill.size) {
+        this.ctx.log('os-mode', `[auto-trader] edge backfill: ${this.autoEdgeBackfill.size} pair-direction(s) already qualifying at arm - waiting for fresh edges`)
+      }
+    } catch {
+      // screener not loaded / still warming - nothing to backfill yet
     }
   }
 
@@ -922,6 +953,18 @@ export class ModeService {
       // alone - widen the ranked window so assetBlocked's own watchlist
       // filter (not this limit) is what decides inclusion.
       const { rows } = screener.top({ tf: this.config.tf, minScore: this.config.minScore, direction: dir, limit: restricted ? 500 : 12 })
+      // Edge memory upkeep (screener source): this row list IS the complete
+      // qualifying universe for the tick, so an absence is a real lapse -
+      // drop any backfilled key that is no longer qualifying so its next
+      // appearance can trade as the fresh edge it then is.
+      const qualifyingNow = new Set<string>()
+      for (const r of rows) {
+        if (r.direction === 'none') continue
+        qualifyingNow.add(`${r.asset}:${r.direction}`)
+      }
+      for (const key of [...this.autoEdgeBackfill]) {
+        if (!qualifyingNow.has(key)) this.autoEdgeBackfill.delete(key)
+      }
       const variety = this.config.pickVariety ?? 1
       // rows is already ranked by |score| then confidence (screener.ts), so
       // the first `variety` qualifying rows in iteration order ARE the top
@@ -930,6 +973,10 @@ export class ModeService {
       const ranked: Array<{ row: ScreenRow; metric: number }> = []
       for (const r of rows) {
         if (r.direction === 'none') continue
+        // already qualifying at arm and never lapsed since - the stale
+        // middle of a condition, not a fresh edge. Lapse handling above
+        // re-arms it honestly.
+        if (this.autoEdgeBackfill.has(`${r.asset}:${r.direction}`)) continue
         if (r.confidence < this.config.minConfidence) continue
         if (this.assetBlocked(r.asset)) continue
         ranked.push({ row: r, metric: Math.abs(r.score) * 1000 + r.confidence })
@@ -950,6 +997,10 @@ export class ModeService {
         try {
           const r = screener.evaluate(asset, this.config.tf)
           if (r.direction === 'none') continue
+          // same edge memory as the ranked path - an on-demand read of a
+          // pair that was already qualifying at arm is just as stale
+          const edgeKey = `${asset}:${r.direction}`
+          if (this.autoEdgeBackfill.has(edgeKey)) continue
           if (Math.abs(r.score) < this.config.minScore) continue
           if (r.confidence < this.config.minConfidence) continue
           if (this.config.direction !== 'both' && r.direction !== this.config.direction) continue
@@ -1464,6 +1515,12 @@ export class ModeService {
               ? lab.runStrategy(asset, this.config.tf, s.id)
               : analytics.runStrategy(asset, this.config.tf, s.id, s.params)
             if (ev.direction === 'none') continue
+            // fresh-edge gate: a vote whose condition has been true since
+            // before this bar is the stale middle of a move. Only reads that
+            // JUST became true (entered) or flipped get a vote - the same
+            // rule the bots' edge-trigger enforces, applied at the source
+            // instead of after the pick.
+            if (ev.phase === 'held') continue
             if (directionPinned) {
               // a strategy assigned to the CALL slot only ever contributes a
               // call vote (its put/none output is dropped), and symmetrically
@@ -2311,7 +2368,13 @@ export class ModeService {
       const n = Number(v)
       return Number.isFinite(n) ? n : cur
     }
-    if (patch.enabled !== undefined) this.config.enabled = Boolean(patch.enabled)
+    if (patch.enabled !== undefined) {
+      const was = this.config.enabled
+      this.config.enabled = Boolean(patch.enabled)
+      // (re)enabling the trader while autonomy is already live is an arm
+      // moment too - whatever qualifies NOW predates this arm
+      if (this.config.enabled && !was && this.mode === 'auto') this.armAutoEdgeBackfill()
+    }
     if (patch.signalSource !== undefined && (['screener', 'kalman-ou', 'markov', 'momentum', 'confluence', 'strategy'] as const).includes(patch.signalSource as AutoTraderSource))
       this.config.signalSource = patch.signalSource as AutoTraderSource
     // AUDIT FIX (Task 58, P2): tf used to be cast unchecked - a garbage tf

@@ -217,8 +217,13 @@ interface RuntimeState {
    * signal, not a fresh one, and is ignored - prevents pyramiding into / being
    * whipsawed by a condition that just happens to stay true for a while. Reset
    * to null the moment the strategy reports 'none' (or the opposite
-   * direction), which re-arms it for the next occurrence. */
-  lastSignalDir: 'call' | 'put' | null
+   * direction), which re-arms it for the next occurrence.
+   * undefined = the bot has not evaluated anything since it was (re)armed or
+   * the kernel restarted - the FIRST evaluation backfills this field WITHOUT
+   * trading, because whatever the strategy reports then was already true
+   * before the bot existed; acting on it would be trading a stale condition.
+   * Only a genuine lapse (none) or a fresh edge after that produces an entry. */
+  lastSignalDir: 'call' | 'put' | null | undefined
   /** Streak-breaker bench (bot.streakBreaker): epoch seconds until which the
    * bot refuses to trade after 3+ consecutive losses. In-memory only (same
    * as the auto-trader's bench map) - a kernel restart clears it, and the
@@ -799,6 +804,20 @@ export class AutopilotService {
       return this.reject(bot, `signal ${wanted} outside allowed direction (${bot.direction})`)
     }
 
+    // ARM-TIME BACKFILL: the first evaluation after (re)arm or a kernel
+    // restart only tells us the condition is ALREADY true - not when it
+    // became true. Trading it would be entering the stale middle of a move
+    // (the exact "we capture the condition when it has already happened"
+    // failure mode), so the observed direction is stamped here WITHOUT an
+    // order: the bot now treats it as the persisting signal it is and waits
+    // for a lapse (none) or a flip to see a genuinely fresh edge. A restart
+    // used to re-fire every persisting condition as if fresh - the classic
+    // stale-burst this backfill kills.
+    if (rt.lastSignalDir === undefined) {
+      rt.lastSignalDir = wanted
+      return this.reject(bot, `condition ${wanted} already true at arm (age ${evalOut.ageBars ?? '?'} bars) - waiting for a fresh edge`)
+    }
+
     // edge-trigger de-dup: only act the FIRST time this direction shows up.
     // While the condition keeps reporting the same direction bar after bar,
     // it's the same persisting signal, not a fresh one - skip it until it
@@ -1109,7 +1128,10 @@ export class AutopilotService {
       restarts: cfg?.planState?.restarts ?? 0,
       halted: cfg?.planState?.halted ?? false,
       complete: cfg?.planState?.complete ?? false,
-      lastSignalDir: null,
+      // undefined, not null: a fresh runtime hasn't evaluated anything yet,
+      // so the first candle close backfills the edge-trigger (arm-time
+      // backfill) instead of trading an already-true condition
+      lastSignalDir: undefined,
     }
     const journal = this.store.botJournal(botId, 400)
     for (const p of journal) {

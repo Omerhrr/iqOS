@@ -379,6 +379,19 @@ export interface StrategyEval {
   direction: Direction
   score: number // -100..100
   notes: string
+  /** Edge phase vs the previous CLOSED bar (edge.ts): 'entered' = the
+   * condition just became true, 'held' = already true on the prior bar
+   * (stale), 'flip' = prior bar pointed the opposite way. Absent when
+   * direction is 'none'. Consumers that must only act on fresh conditions
+   * (bots, the auto-trader) gate on phase !== 'held'. */
+  phase?: 'entered' | 'held' | 'flip'
+  /** Consecutive closed bars the condition has held (1 = just entered),
+   * capped at 20+ - the honest age of a level read. */
+  ageBars?: number
+  /** Epoch seconds (candle-open time) of the last CLOSED bar that fed this
+   * eval - the freshness anchor: consumers compute staleness against this,
+   * never against when the eval happened to run. */
+  barTs?: number
 }
 
 /** Optional evaluation context some strategies need beyond candles - currently

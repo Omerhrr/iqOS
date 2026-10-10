@@ -338,6 +338,18 @@ export interface ChartSignal {
   ts: number
   validUntil: number
   dataSource: string
+  /** Epoch seconds (candle-open time) of the last CLOSED bar that fed the votes. */
+  barTs?: number
+  /** Seconds since that bar closed - the honest age of the read. */
+  ageSec?: number
+  /** Edge phase vs the previous scan: entered/flip = just became true,
+   * held = already qualifying before (stale-ish). */
+  phase?: 'entered' | 'held' | 'flip'
+  /** Epoch ms when this read first qualified in its current spell. */
+  firstSeenTs?: number
+  /** Already qualifying at the scanner's first post-boot scan - true age
+   * unknowable, never presented as fresh. */
+  backfilled?: boolean
 }
 
 export interface ChartSignalsResponse {
@@ -355,6 +367,8 @@ export interface ChartSignalsResponse {
   otcScanned?: number
   otcConsidered?: number
   otcQualifying?: number
+  /** Reads whose condition JUST became true or flipped this scan. */
+  freshEdges?: number
   signals: ChartSignal[]
   ts: number
   scanMs: number

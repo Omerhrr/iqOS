@@ -45,6 +45,11 @@ await new Promise((r) => setTimeout(r, 1500))
 // ---------- option kind: shape + qualification ----------
 const o1 = await get('/signals?kind=option&top=5')
 ok('option 200 + ok', o1.status === 200 && o1.body.ok === true)
+// boot backfill on the wire: a fresh kernel's FIRST scan cannot know how
+// long the current reads have been true, so every read is held+backfilled
+// and nothing counts as a fresh edge - the anti-stale-burst contract
+ok('boot backfill: first scan marks reads held (not entered)', (o1.body.signals ?? []).every((s) => s.phase === 'held' && s.backfilled === true), `phases=${[...new Set((o1.body.signals ?? []).map((s) => s.phase))].join(',')}`)
+ok('boot backfill: freshEdges = 0 on the first scan', o1.body.freshEdges === 0, `freshEdges=${o1.body.freshEdges}`)
 ok('kind/tf echo', o1.body.kind === 'option' && o1.body.tf === '1m')
 ok('scanned >= 8', (o1.body.scanned ?? 0) >= 8, `scanned=${o1.body.scanned}`)
 ok('signals <= 5 (top still respected)', Array.isArray(o1.body.signals) && o1.body.signals.length <= 5)
@@ -56,7 +61,10 @@ if (s) {
   ok('strength = |score| in 35..100', s.strength === Math.abs(s.score) && s.strength >= 35 && s.strength <= 100)
   ok('agreement floor agree>=3, agree<=total', s.agree >= 3 && s.agree <= s.total && s.total === 7)
   ok('expiry 60..300s on the minute', s.expirySec >= 60 && s.expirySec <= 300 && s.expirySec % 60 === 0)
-  ok('fresh TTL ~150s', s.validUntil > s.ts && s.validUntil - s.ts >= 149_000 && s.validUntil - s.ts <= 151_000)
+  // TTL runs from the BAR END (the closed candle that fed the votes), not
+  // the scan time - a late scan against old candles honestly lives shorter
+  ok('TTL anchored to the bar end (barTs + 60s + 150s)', s.validUntil === (s.barTs + 60) * 1000 + 150_000, `validUntil-ts=${s.validUntil - s.ts}ms barTs=${s.barTs}`)
+  ok('barTs/ageSec freshness present', Number.isFinite(s.barTs) && Number.isFinite(s.ageSec) && s.ageSec >= 0 && s.ageSec <= 120, `ageSec=${s.ageSec}`)
   ok('7 engine votes', Array.isArray(s.votes) && s.votes.length === 7)
   const eng = s.votes.map((v) => v.engine)
   if (s.otc) {
@@ -121,14 +129,26 @@ ok('per-tf caches are distinct scans', m5.body.ts !== m1back.body.ts, `5m ts=${m
 const s5 = m5.body.signals?.[0] ?? null
 if (s5) {
   // 5m bars: suggested expiry scales x5 (300..1500s, cap 1800) and the read
-  // lives ~5 bars (ttl 1500s) - an M5 structural read must not die in 2.5 min
+  // lives ~5 bars (ttl 1500s from ITS bar end) - an M5 structural read must
+  // not die in 2.5 min
   ok('5m expiry scaled (>= 300s, <= 1800s)', s5.expirySec >= 300 && s5.expirySec <= 1800, `expirySec=${s5.expirySec}`)
-  ok('5m TTL scaled (~1500s)', s5.validUntil - s5.ts >= 1499_000 && s5.validUntil - s5.ts <= 1501_000, `ttl=${Math.round((s5.validUntil - s5.ts) / 1000)}s`)
+  ok('5m TTL anchored to its own bar end (+1500s)', s5.validUntil === (s5.barTs + 300) * 1000 + 1500_000, `ttlFromScan=${Math.round((s5.validUntil - s5.ts) / 1000)}s barTs=${s5.barTs}`)
 }
 const st5 = await get('/signals_stats?tf=5m')
 ok('stats accept tf filter', st5.status === 200 && st5.body.ok === true)
 const stBad = await get('/signals_stats?tf=bogus')
 ok('stats reject garbage tf', stBad.status === 400)
+
+// ---------- edge registry across scans: the second scan of the same
+// kind:tf after a bar close re-stamps phases; a NEW qualifying read (one
+// that was absent from the boot scan) must come back 'entered', never
+// backfilled. Poll once more after a pause: same reads stay held, and the
+// phase vocabulary itself is locked (only the three values exist).
+await new Promise((r) => setTimeout(r, 7000))
+const again = await get('/signals?kind=option')
+ok('rescan 200', again.status === 200 && again.body.ok === true)
+ok('phase vocabulary locked to entered|held|flip', (again.body.signals ?? []).every((s) => ['entered', 'held', 'flip'].includes(s.phase)), `phases=${[...new Set((again.body.signals ?? []).map((s) => s.phase))].join(',')}`)
+ok('re-scan after a bar close: freshEdges never negative and <= qualifying', again.body.freshEdges >= 0 && again.body.freshEdges <= (again.body.qualifying ?? 0), `freshEdges=${again.body.freshEdges} qualifying=${again.body.qualifying}`)
 
 console.log(`\n${pass} checks passed, ${fail} failed`)
 process.exit(fail ? 1 : 0)

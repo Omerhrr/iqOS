@@ -32,6 +32,7 @@ import {
 import { detectPatterns } from '../analytics/patterns'
 import { analyze } from '../analytics/engine'
 import { classifyRegime, type Regime } from '../analytics/regime'
+import { evalWithEdge } from '../analytics/edge'
 
 export interface LearnOptions {
   asset: string
@@ -852,8 +853,11 @@ export class StrategyLabService {
     if (!spec) throw new Error(`lab strategy ${id} has no usable signals`)
     const candles = this.market.getCandlesDeep(asset, tf, 1500, true) // Task 59: closedOnly
     if (candles.length < 25) throw new Error('not enough candle history yet')
-    const ev = evaluateCustom(spec, candles, asset)
-    return { ...ev, asset, tf, strategy: id, price: candles[candles.length - 1].close }
+    // Edge wrapper (same as builtin runStrategy): learned specs stay pure
+    // level reads; the transition vs the previous closed bar rides along so
+    // bots/the auto-trader gate on fresh edges, not on stale ones.
+    const ev = evalWithEdge((cs) => evaluateCustom(spec, cs, asset), candles)
+    return { ...ev, asset, tf, strategy: id, price: candles[candles.length - 1].close, barTs: candles[candles.length - 1].time }
   }
 }
 

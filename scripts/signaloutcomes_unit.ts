@@ -42,13 +42,13 @@ const priceOf = (a) => prices[a] ?? 0
 // --- 1. option resolution: win / loss / flat --------------------------------
 {
   const t = new SignalOutcomeTracker()
-  const added = t.record('option', [
+  const added = t.record('option', '1m', [
     optSignal('EURUSD', 'call', 1.1, 60, T0),      // rises -> win
     optSignal('GBPUSD', 'put', 1.26, 60, T0),      // falls -> put wins
     optSignal('USDJPY', 'call', 150.0, 60, T0),    // exactly flat -> flat
   ], T0)
   ok(added === 3, 'record: 3 pending added')
-  ok(t.record('option', [optSignal('EURUSD', 'call', 1.1, 60, T0)], T0 + 5000) === 0, 'dedup: same kind+asset+dir while pending')
+  ok(t.record('option', '1m', [optSignal('EURUSD', 'call', 1.1, 60, T0)], T0 + 5000) === 0, 'dedup: same kind+asset+dir while pending')
 
   prices.EURUSD = 1.1 // pre-expiry sample, unchanged yet
   let r = t.tick(T0 + 30_000, priceOf)
@@ -81,7 +81,7 @@ const priceOf = (a) => prices[a] ?? 0
 // --- 2. option loss + engine miss -------------------------------------------
 {
   const t = new SignalOutcomeTracker()
-  t.record('option', [optSignal('AUDUSD', 'call', 0.66, 60, T0)], T0)
+  t.record('option', '1m', [optSignal('AUDUSD', 'call', 0.66, 60, T0)], T0)
   prices.AUDUSD = 0.659 // -0.15%
   const [r] = t.tick(T0 + 61_000, priceOf)
   ok(r.outcome === 'loss' && r.movePct < 0, 'losing call resolved')
@@ -94,7 +94,7 @@ const priceOf = (a) => prices[a] ?? 0
 {
   const t = new SignalOutcomeTracker()
   const entry = 1.2
-  t.record('cfd', [cfdSignal('USDCAD', 'call', entry, T0)], T0)
+  t.record('cfd', '1m', [cfdSignal('USDCAD', 'call', entry, T0)], T0)
   prices.USDCAD = entry * 1.0205 // above tp (entry*1.02)
   const [r] = t.tick(T0 + 60_000, priceOf)
   ok(!!r, 'cfd resolves on touch')
@@ -108,7 +108,7 @@ const priceOf = (a) => prices[a] ?? 0
 {
   const t = new SignalOutcomeTracker()
   const entry = 100
-  t.record('cfd', [
+  t.record('cfd', '1m', [
     cfdSignal('X1', 'call', entry, T0),
     { ...cfdSignal('X2', 'put', entry, T0) },
   ], T0)
@@ -131,7 +131,7 @@ const priceOf = (a) => prices[a] ?? 0
 // --- 5. unknown price -> skip, never resolve bogus ---------------------------
 {
   const t = new SignalOutcomeTracker()
-  t.record('option', [optSignal('COLD', 'call', 5, 60, T0)], T0)
+  t.record('option', '1m', [optSignal('COLD', 'call', 5, 60, T0)], T0)
   let r = t.tick(T0 + 120_000, priceOf) // COLD has no price
   ok(r.length === 1 && r[0].outcome === 'flat' && r[0].exit === 0, 'no feed at expiry -> honest flat, exit 0')
 }
@@ -139,7 +139,7 @@ const priceOf = (a) => prices[a] ?? 0
 // --- 6. persistence round-trip -------------------------------------------------
 {
   const t = new SignalOutcomeTracker()
-  t.record('option', [optSignal('EURUSD', 'call', 1.1, 60, T0)], T0)
+  t.record('option', '1m', [optSignal('EURUSD', 'call', 1.1, 60, T0)], T0)
   prices.EURUSD = 1.105
   t.tick(T0 + 61_000, priceOf)
   const blob = JSON.parse(JSON.stringify(t.state()))

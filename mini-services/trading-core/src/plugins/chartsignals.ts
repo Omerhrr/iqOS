@@ -2,15 +2,28 @@
 // open instrument universe - no top-N cut here, every qualifying read comes
 // back and the caller applies any limit it wants (`top` on /signals; the
 // Signal Panel (web) takes them all). Each signal carries a TTL so a stale
-// read disappears instead of lingering. Real-market assets vote with the
-// volume footprint (CLV proxy), OTC assets with the micro-tick velocity
-// footprint - the same engines their charts render. OTC pairs are always
-// part of the pass (they used to be crowded out by a universe cap - now the
-// response reports per-market coverage so the panel can prove it).
+// read disappears instead of lingering - anchored to the BAR that fed it, so
+// a late scan against old candles honestly lives shorter. Real-market assets
+// vote with the volume footprint (CLV proxy), OTC assets with the micro-tick
+// velocity footprint - the same engines their charts render. OTC pairs are
+// always part of the pass (they used to be crowded out by a universe cap -
+// now the response reports per-market coverage so the panel can prove it).
 // Task 64-c: every qualifying read also becomes a tracked outcome - the
 // scanner resolves it at its own suggested expiry (CFD plans on first
 // sampled TP/SL touch within a 15-min horizon), so the panel can show what
 // the chart engines actually delivered, per engine and per market type.
+// Edge registry: the scanner used to be pure PULL (scan only when a panel
+// polls, emit whatever is currently true) - a read that had been true for
+// forty bars looked identical to one that flipped two bars ago, and with no
+// panel open nothing was evaluated at all. Now every scan diffs against the
+// previous scan's qualifying set (diffEdges) and stamps entered/held/flip +
+// firstSeenTs on each read, and the scanner subscribes to bar-close events:
+// since votes only read CLOSED candles, a bar close is the only moment the
+// answer can change - so recently-requested kind:tf combos are rescanned
+// within ~1.5s of it, proactively, no panel poll required. Boot backfill:
+// the first scan after a restart marks every read held+backfilled - a fresh
+// boot cannot know how long a condition has been true, so nothing looks
+// fresh just because the kernel came up.
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -18,7 +31,7 @@ import type { KernelContext, Plugin } from '../kernel'
 import type { Candle, Timeframe } from '../types'
 import { TIMEFRAME_SECONDS } from '../types'
 import { isInstrumentOpen, searchInstruments } from '../universe'
-import { buildChartSignal, type ChartSignal, type OtcFpRead } from '../analytics/chartsignals'
+import { buildChartSignal, diffEdges, type ChartSignal, type EdgeState, type OtcFpRead } from '../analytics/chartsignals'
 import { SignalOutcomeTracker, type ResolvedOutcome } from '../analytics/signaloutcomes'
 import type { MarketDataService } from './market-data'
 import type { OtcFootprintService } from './otcfootprint'
@@ -40,6 +53,9 @@ export interface ChartScanResult {
   otcScanned: number
   otcConsidered: number
   otcQualifying: number
+  /** Reads whose condition JUST became true or flipped this scan (phase
+   * entered|flip) - the fresh-edge count the panel's NEW badges summarize. */
+  freshEdges: number
   signals: ChartSignal[]
   ts: number
   scanMs: number
@@ -50,6 +66,13 @@ const CACHE_MS = 12_000 // one scan serves rapid panel polls
 const SIGNAL_TTL_SEC = 150 // a signal that old is no longer "relevant"
 const SWEEP_MS = 5_000 // outcome sampling / resolution cadence
 const FLUSH_MS = 10_000 // debounced outcomes persistence
+/** How long after its last consumer request a kind:tf combo stays proactive:
+ * bar-close rescans only run for combos someone actually reads - scanning
+ * everything forever would burn CPU for panels nobody has open. */
+const ACTIVE_MS = 15 * 60_000
+/** Debounce for bar-close-triggered rescans: many candle events land in a
+ * burst (one per asset); one rescan per combo after the burst settles. */
+const RESCAN_DEBOUNCE_MS = 1_500
 
 export class ChartSignalsService {
   private ctx!: KernelContext
@@ -63,6 +86,15 @@ export class ChartSignalsService {
   private sweepTimer: ReturnType<typeof setInterval> | null = null
   private flushTimer: ReturnType<typeof setInterval> | null = null
   private outcomesPath = join(process.cwd(), 'data', 'chartsignals_outcomes.json')
+  // per kind:tf registry of what qualified on the previous scan - the memory
+  // that turns level reads into entered/held/flip transitions
+  private edges = new Map<string, Map<string, EdgeState>>()
+  // kind:tf -> last consumer-request ts; only recently-requested combos get
+  // proactive bar-close rescans (nothing scans for panels nobody opens)
+  private activeCombos = new Map<string, number>()
+  private dirtyCombos = new Set<string>()
+  private rescanTimer: ReturnType<typeof setTimeout> | null = null
+  private draining = false
 
   async start(ctx: KernelContext): Promise<void> {
     this.ctx = ctx
@@ -96,6 +128,55 @@ export class ChartSignalsService {
       }
     }, FLUSH_MS)
     ctx.log('chart-signals', 'chart-type signal scanner online (renko/pnf/range/tick/footprint|otcfootprint/heikin/candle) + outcome tracking')
+    // bar-close proactive rescans: votes read only CLOSED candles, so a bar
+    // close is the only moment a read can change - recently-requested
+    // kind:tf combos are marked dirty and rescanned after the burst settles.
+    // This is what makes "we caught it when it happened" true: the scan
+    // happens ~1.5s after the bar closes whether or not any panel polls.
+    ctx.bus.on('candle', ({ tf, closed }) => {
+      if (!closed) return
+      for (const kind of ['option', 'cfd'] as SignalKind[]) {
+        const combo = `${kind}:${tf}`
+        if (this.activeCombos.has(combo)) this.dirtyCombos.add(combo)
+      }
+      this.scheduleRescan()
+    })
+  }
+
+  /** Debounced drain of dirty combos - one rescan per combo per bar-close
+   * burst, sequential so a slow scan never piles up behind itself. */
+  private scheduleRescan(): void {
+    if (this.rescanTimer) return
+    this.rescanTimer = setTimeout(() => {
+      this.rescanTimer = null
+      void this.drainRescans()
+    }, RESCAN_DEBOUNCE_MS)
+  }
+
+  private async drainRescans(): Promise<void> {
+    if (this.draining) return
+    this.draining = true
+    try {
+      const now = Date.now()
+      const combos = [...this.dirtyCombos]
+      this.dirtyCombos.clear()
+      for (const combo of combos) {
+        const lastRequested = this.activeCombos.get(combo)
+        if (lastRequested === undefined || now - lastRequested > ACTIVE_MS) continue // consumer went away
+        const [kind, tf] = combo.split(':') as [SignalKind, Timeframe]
+        try {
+          // full scan (updates cache + registry + outcomes); panel polls
+          // read it from the cache with zero extra work
+          await this.scanOnce(kind, tf)
+        } catch {
+          /* a failed proactive scan waits for the next bar like before */
+        }
+      }
+    } finally {
+      this.draining = false
+      // more closes landed while draining - run another pass
+      if (this.dirtyCombos.size) this.scheduleRescan()
+    }
   }
 
   private loadOutcomes(): void {
@@ -188,6 +269,29 @@ export class ChartSignalsService {
     }
 
     signals.sort((a, b) => b.strength - a.strength || b.agree - a.agree)
+    // edge diff: stamp entered/held/flip + firstSeenTs on every read against
+    // what qualified on the previous scan of this kind:tf (boot backfill:
+    // the first scan marks everything held+backfilled - nothing looks fresh
+    // just because the kernel restarted)
+    const comboKey = `${kind}:${tf}`
+    let registry = this.edges.get(comboKey)
+    if (!registry) {
+      registry = new Map()
+      this.edges.set(comboKey, registry)
+    }
+    const nowMs = Date.now()
+    const edgeMeta = diffEdges(
+      registry,
+      signals.map((s) => ({ asset: s.asset, direction: s.direction, barTs: s.barTs })),
+      nowMs,
+    )
+    for (const s of signals) {
+      const meta = edgeMeta.get(s.asset)
+      if (!meta) continue
+      s.phase = meta.phase
+      s.firstSeenTs = meta.firstSeenTs
+      s.backfilled = meta.backfilled
+    }
     // the full qualified list is cached; `top` is applied at read time in
     // scan() so different top params can share one scan.
     const result: ChartScanResult = {
@@ -201,6 +305,7 @@ export class ChartSignalsService {
       otcScanned,
       otcConsidered,
       otcQualifying: signals.filter((s) => s.otc).length,
+      freshEdges: signals.filter((s) => s.phase === 'entered' || s.phase === 'flip').length,
       signals,
       ts: Date.now(),
       scanMs: Date.now() - t0,
@@ -218,8 +323,11 @@ export class ChartSignalsService {
 
   /** Fresh scan (cached per kind:tf for CACHE_MS), stale entries dropped +
    * `top` applied at read time so cache hits honor the caller's limit.
-   * top<=0 (the default) means no cut - every qualifying read comes back. */
+   * top<=0 (the default) means no cut - every qualifying read comes back.
+   * Every request also marks the kind:tf combo active, which arms proactive
+   * bar-close rescans for ACTIVE_MS - the scanner stops being pull-only. */
   async scan(kind: SignalKind, top: number, tf: Timeframe): Promise<ChartScanResult> {
+    this.activeCombos.set(`${kind}:${tf}`, Date.now())
     const key = `${kind}:${tf}`
     const cached = this.cache.get(key)
     const now = Date.now()
