@@ -57,6 +57,14 @@ import { classifySession } from '../analytics/session'
 import { SweepEdgeMemory } from '../analytics/edge'
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
+/** NaN-safe comparison for trade gates. Thin-history screener rows can carry
+ * NaN indicator values, and EVERY comparison against NaN is false - so a
+ * `value < threshold` skip gate PASSES garbage exactly when the data is
+ * unusable (observed live: a NaN-adx row was recorded as a held edge via the
+ * arm backfill snapshot; a picker gate of the form `adx < minAdx` would have
+ * let the same row trade). These fail closed: a non-finite value never
+ * qualifies, never trades. */
+const finGte = (v: number, floor: number): boolean => Number.isFinite(v) && v >= floor
 
 export type OsMode = 'human' | 'auto'
 
@@ -1013,7 +1021,9 @@ export class ModeService {
         // middle of a condition, not a fresh edge. Lapse handling above
         // re-arms it honestly.
         if (this.autoEdgeBackfill.has(`${r.asset}:${r.direction}`)) continue
-        if (r.confidence < this.config.minConfidence) continue
+        // fail-closed: top() filters NaN scores itself, but confidence could
+        // still be NaN on a garbage row - never qualify one
+        if (!finGte(r.confidence, this.config.minConfidence)) continue
         if (this.assetBlocked(r.asset)) continue
         ranked.push({ row: r, metric: Math.abs(r.score) * 1000 + r.confidence })
         if (ranked.length >= Math.max(1, variety)) break
@@ -1037,8 +1047,9 @@ export class ModeService {
           // pair that was already qualifying at arm is just as stale
           const edgeKey = `${asset}:${r.direction}`
           if (this.autoEdgeBackfill.has(edgeKey)) continue
-          if (Math.abs(r.score) < this.config.minScore) continue
-          if (r.confidence < this.config.minConfidence) continue
+          // fail-closed gates (raw evaluate - thin history can yield NaN)
+          if (!finGte(Math.abs(r.score), this.config.minScore)) continue
+          if (!finGte(r.confidence, this.config.minConfidence)) continue
           if (this.config.direction !== 'both' && r.direction !== this.config.direction) continue
           fallback.push({ row: r, metric: Math.abs(r.score) * 1000 + r.confidence })
         } catch {
@@ -1095,7 +1106,9 @@ export class ModeService {
           const base = screener.evaluate(asset, this.config.tf) // cached when fresh, recomputed when stale
           rec(asset) // the row was read - this sweep observed the asset
           if (!base.ouMeanReverting) continue // fit not significant - fading a random walk is how accounts die
-          if (base.ouHalfLife > this.config.maxHalfLife) continue // reverts too slowly to be tradeable
+          // NaN half-life would PASS `> maxHalfLife` (NaN comparisons are
+          // false) - require a real, finite half-life to fade against
+          if (!finGte(base.ouHalfLife, 0) || base.ouHalfLife > this.config.maxHalfLife) continue // reverts too slowly to be tradeable
           const dir: 'call' | 'put' | 'none' =
             base.ouZ <= -this.config.zEntry ? 'call' : base.ouZ >= this.config.zEntry ? 'put' : 'none'
           if (dir === 'none') continue
@@ -1114,8 +1127,10 @@ export class ModeService {
           // same edge-score shape as the kalman-ou-reversion strategy so thresholds feel consistent
           const score = Math.round(clamp(45 + (az - this.config.zEntry) * 20 + Math.min(18, Math.max(0, base.ouTStat) * 3), 42, 95))
           const confidence = Math.round(clamp(40 + (base.ouTStat - 1.5) * 20 + (az - this.config.zEntry) * 8, 35, 95))
-          if (score < this.config.minScore) continue
-          if (confidence < this.config.minConfidence) continue
+          // fail-closed gates: a NaN score/confidence (a NaN input slipped
+          // into the formula) must never qualify the pair
+          if (!finGte(score, this.config.minScore)) continue
+          if (!finGte(confidence, this.config.minConfidence)) continue
           // every config gate passed - the tradeable condition is TRUE right
           // now. The edge memory decides whether it JUST became true ('trade')
           // or was already qualifying last sweep ('skip' -> keep sweeping for
@@ -1179,8 +1194,9 @@ export class ModeService {
           const edge = clamp((dir === 'call' ? r.pUp - 0.5 : pDown - 0.5) * 2, 0, 1) // 0..1 decisiveness of the forecast, symmetric now
           const score = Math.round(clamp(40 + edge * 60 + (r.regime === 'bull' || r.regime === 'bear' ? 8 : 0), 40, 95))
           const confidence = Math.round(clamp(36 + edge * 55 + r.adx * 0.35, 35, 95))
-          if (score < this.config.minScore) continue
-          if (confidence < this.config.minConfidence) continue
+          // fail-closed gates (NaN adx feeds confidence here - never qualify)
+          if (!finGte(score, this.config.minScore)) continue
+          if (!finGte(confidence, this.config.minConfidence)) continue
           const key = SweepEdgeMemory.key(asset, dir)
           rec(asset, key)
           if (this.sweepEdge.gate(key) === 'trade')
@@ -1224,7 +1240,10 @@ export class ModeService {
         try {
           const r = screener.evaluate(asset, this.config.tf)
           rec(asset)
-          if (r.adx < this.config.minAdx) continue
+          // fail-closed: `NaN < minAdx` is false, so a thin-history row with
+          // NaN adx would PASS this gate (its backfill-origin hold was
+          // observed live at the default bar) - require a real ADX value
+          if (!finGte(r.adx, this.config.minAdx)) continue
           let dir: 'call' | 'put' | 'none' = 'none'
           if (r.changePct > 0 && r.rsi >= 52 && r.rsi <= 78) dir = 'call'
           else if (r.changePct < 0 && r.rsi >= 22 && r.rsi <= 48) dir = 'put'
@@ -1232,8 +1251,9 @@ export class ModeService {
           if (this.config.direction !== 'both' && dir !== this.config.direction) continue
           const score = Math.round(clamp(40 + (r.adx - this.config.minAdx) * 1.2 + Math.abs(r.rsi - 50) * 0.8, 40, 95))
           const confidence = Math.round(clamp(36 + (r.adx - this.config.minAdx) * 0.8 + Math.abs(r.changePct) * 6, 35, 95))
-          if (score < this.config.minScore) continue
-          if (confidence < this.config.minConfidence) continue
+          // fail-closed gates: NaN score/confidence never qualifies
+          if (!finGte(score, this.config.minScore)) continue
+          if (!finGte(confidence, this.config.minConfidence)) continue
           const key = SweepEdgeMemory.key(asset, dir)
           rec(asset, key)
           if (this.sweepEdge.gate(key) === 'trade')
@@ -1283,8 +1303,9 @@ export class ModeService {
           rec(asset)
           if (row.direction === 'none') continue
           if (this.config.direction !== 'both' && row.direction !== this.config.direction) continue
-          if (Math.abs(row.score) < this.config.minScore) continue
-          if (row.confidence < this.config.minConfidence) continue
+          // fail-closed gates: a NaN composite row must never qualify
+          if (!finGte(Math.abs(row.score), this.config.minScore)) continue
+          if (!finGte(row.confidence, this.config.minConfidence)) continue
           const key = SweepEdgeMemory.key(asset, row.direction)
           rec(asset, key)
           if (this.sweepEdge.gate(key) === 'trade')
