@@ -76,3 +76,111 @@ export function evalWithEdge(
   }
   return { ...cur, phase, ageBars: Math.min(age, MAX_AGE_BARS + 1) }
 }
+
+/**
+ * Cross-tick edge memory for the auto-trader's PRIORITY-ORDER sweep sources
+ * (kalman-ou / markov / momentum / confluence). The screener and strategy
+ * sources don't need this class: screener rows arrive as a complete per-tick
+ * universe (so an absence is a real lapse, diffable in place) and strategy
+ * votes already carry phase from evalWithEdge. The four sweep sources pick
+ * the FIRST qualifying pair in priority order and early-return - the only
+ * way to know whether a qualifier JUST crossed its threshold or has been
+ * sitting there for an hour is to remember what qualified last sweep.
+ *
+ * Contract (mirrors the screener source's autoEdgeBackfill + the bots'
+ * arm-time backfill, same vocabulary: backfill / held / fresh / lapse):
+ * - The FIRST sweep after an arm, a restart or a source switch is COLD:
+ *   every qualifier it meets is recorded and skipped, so arming can never
+ *   trade the stale middle of an already-true condition. An empty sweep
+ *   (market closed, plugins missing) leaves the backfill armed - no fake
+ *   "nothing qualified" clean slate.
+ * - gate() returns 'trade' for a qualifier the memory has never seen (a
+ *   fresh edge) and 'skip' for one it has (held). A flip - the same pair's
+ *   OPPOSITE side arriving - is by construction unseen, so it trades, like
+ *   diffEdges treats an observed direction change as the freshest event.
+ *   The caller stamps the key only when the trade actually EXECUTES: a pick
+ *   a transient rejection blocked stays fresh and retries until it places
+ *   or the condition lapses (retry-until-executed, same as the bots).
+ * - endSweep() upkeep: a key whose asset was evaluated this sweep but no
+ *   longer qualifies has OBSERVABLY lapsed - drop it, so its next
+ *   appearance trades as the fresh edge it then is. An asset that wasn't
+ *   evaluated (early return on a fresher pick, thin history throw, cooldown
+ *   skip) keeps its keys - no observation, no lapse verdict.
+ */
+export class SweepEdgeMemory {
+  private source = ''
+  private cold = true
+  private memory = new Set<string>()
+
+  /** Key shape: `${asset}:${dir}` - tickers never contain ':', dir is
+   * call|put, so the asset round-trips through the last ':'. */
+  static key(asset: string, dir: string): string {
+    return `${asset}:${dir}`
+  }
+
+  static assetOf(key: string): string {
+    return key.slice(0, key.lastIndexOf(':'))
+  }
+
+  /** True while the next sweep still owes the arm-time backfill. */
+  get armedCold(): boolean {
+    return this.cold
+  }
+
+  get size(): number {
+    return this.memory.size
+  }
+
+  has(key: string): boolean {
+    return this.memory.has(key)
+  }
+
+  /** Start a sweep for `source`. A source switch re-colds: the new source's
+   * qualifiers are a different universe - trading on the old source's memory
+   * would mislabel its held/edge verdicts. */
+  beginSweep(source: string): void {
+    if (source !== this.source) {
+      this.source = source
+      this.cold = true
+      this.memory.clear()
+    }
+  }
+
+  /** Classify a FULLY-gated qualifier (all config thresholds already passed).
+   * Pure: 'trade' rows are NOT recorded here - stamp() on execution does. */
+  gate(key: string): 'trade' | 'skip' {
+    if (this.cold || this.memory.has(key)) return 'skip'
+    return 'trade'
+  }
+
+  /** Sweep upkeep. An empty evaluated set means nothing was observed (cold
+   * screener, closed market) - no pruning, and the cold backfill stays armed.
+   * A cold sweep with observations IS the backfill: fold the observed
+   * qualifying set in and stand down. Otherwise prune keys whose asset was
+   * evaluated but no longer qualifies (an observable lapse). */
+  endSweep(evaluated: Set<string>, qualifying: Set<string>): void {
+    if (evaluated.size === 0) return
+    if (this.cold) {
+      for (const key of qualifying) this.memory.add(key)
+      this.cold = false
+      return
+    }
+    for (const key of [...this.memory]) {
+      if (qualifying.has(key)) continue
+      if (evaluated.has(SweepEdgeMemory.assetOf(key))) this.memory.delete(key)
+    }
+  }
+
+  /** The trade actually placed - the edge is consumed: the condition counts
+   * as held for this source from here until it observably lapses, so a
+   * per-asset cooldown expiring can never re-enter the stale middle. */
+  stamp(key: string): void {
+    this.memory.add(key)
+  }
+
+  /** (Re)arm: whatever qualifies on the next sweep predates this arm. */
+  rearm(): void {
+    this.cold = true
+    this.memory.clear()
+  }
+}

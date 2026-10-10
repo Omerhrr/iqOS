@@ -9,7 +9,7 @@
 //     not the scan time, and ageSec measures real data lag
 //   - spot backtest edgeTrigger parity: a persisting condition re-enters
 //     only after a real lapse/flip (bot semantics), not after every exit
-import { edgePhase, evalWithEdge, MAX_AGE_BARS } from '../mini-services/trading-core/src/analytics/edge'
+import { edgePhase, evalWithEdge, MAX_AGE_BARS, SweepEdgeMemory } from '../mini-services/trading-core/src/analytics/edge'
 import { buildChartSignal, diffEdges, type EdgeState } from '../mini-services/trading-core/src/analytics/chartsignals'
 import { backtest } from '../mini-services/trading-core/src/strategies/backtest'
 import type { Candle } from '../mini-services/trading-core/src/types'
@@ -166,6 +166,70 @@ function ok(cond, name) {
   // binary mode keeps its own Task-58 semantics: same episode discipline
   const bin = backtest(candles, 'FIX', '1m', { ...base, mode: 'binary', edgeTrigger: true, expiryBars: 1, payout: 0.85 })
   ok(bin.trades.length === 2, `binary edgeTrigger: same episode count (got ${bin.trades.length}, want 2)`)
+}
+
+// ---------- SweepEdgeMemory: the auto-trader sweep sources' edge memory ----------
+{
+  console.log('sweep edge memory (kalman-ou/markov/momentum/confluence)')
+  const key = (a: string, d: string) => SweepEdgeMemory.key(a, d)
+
+  // key shape round-trips OTC tickers (asset never contains ':')
+  ok(SweepEdgeMemory.assetOf(key('EURUSD-OTC', 'call')) === 'EURUSD-OTC', 'assetOf round-trips an OTC ticker')
+
+  // cold backfill: the first sweep after arm records qualifiers WITHOUT trading
+  const m = new SweepEdgeMemory()
+  ok(m.armedCold, 'fresh memory starts cold (restart = arm moment)')
+  m.beginSweep('kalman-ou')
+  ok(m.gate(key('EURUSD', 'call')) === 'skip', 'cold sweep: an unseen qualifier is skipped, not traded')
+  ok(m.gate(key('GBPUSD', 'put')) === 'skip', 'cold sweep: every qualifier is skipped')
+  // the harness drives endSweep with what the sweep observed
+  m.endSweep(new Set(['EURUSD', 'GBPUSD', 'XAUUSD']), new Set([key('EURUSD', 'call'), key('GBPUSD', 'put')]))
+  ok(!m.armedCold, 'a sweep with observations ends the cold backfill')
+  ok(m.size === 2 && m.has(key('EURUSD', 'call')) && m.has(key('GBPUSD', 'put')), 'backfill folded exactly the observed qualifiers')
+  ok(m.gate(key('XAUUSD', 'call')) === 'trade', 'post-backfill: an unseen qualifier is a fresh edge')
+
+  // empty sweep (market closed / plugins missing) leaves the backfill armed
+  const m2 = new SweepEdgeMemory()
+  m2.beginSweep('markov')
+  m2.endSweep(new Set(), new Set())
+  ok(m2.armedCold, 'an empty sweep does NOT fake a clean backfill - cold survives')
+
+  // held vs fresh after the backfill: a condition that qualified during the
+  // COLD sweep was already true at arm (backfilled - never fresh); a pair the
+  // sweep never saw before is a genuine edge
+  m2.endSweep(new Set(['EURUSD']), new Set([key('EURUSD', 'call')])) // the cold backfill sweep itself
+  ok(m2.gate(key('EURUSD', 'call')) === 'skip', 'backfilled at the cold sweep: already true at arm, reads held')
+
+  // ...but a pick that never placed stays fresh (retry-until-executed):
+  // gate never mutates - only stamp() (the execution) consumes an edge
+  ok(m2.gate(key('GBPUSD', 'put')) === 'trade', 'unseen qualifier = fresh edge')
+  ok(m2.gate(key('GBPUSD', 'put')) === 'trade', 'rejected pick: still trade next tick - retry preserved')
+
+  // flip: the pair's OPPOSITE side is unseen by construction -> fresh
+  ok(m2.gate(key('EURUSD', 'put')) === 'trade', 'held call + arriving put = flip, trades')
+
+  // lapse upkeep: an evaluated asset that stopped qualifying loses its key...
+  m2.stamp(key('EURUSD', 'put')) // ...and the flip executed - the put side is now held
+  m2.endSweep(new Set(['EURUSD', 'GBPUSD']), new Set([key('EURUSD', 'put')]))
+  ok(!m2.has(key('EURUSD', 'call')) && !m2.has(key('GBPUSD', 'put')), 'observed lapse drops the keys (evaluated, not qualifying)')
+  ok(m2.gate(key('EURUSD', 'call')) === 'trade', 're-qualifying after a real lapse = fresh edge again')
+  ok(m2.gate(key('EURUSD', 'put')) === 'skip', 'the executed, still-qualifying side stays held')
+
+  // ...while an UNOBSERVED asset keeps its key (no observation, no lapse verdict)
+  m2.stamp(key('USDJPY', 'call'))
+  m2.endSweep(new Set(['EURUSD']), new Set([key('EURUSD', 'call')]))
+  ok(m2.has(key('USDJPY', 'call')), 'asset not evaluated this sweep: its edge survives')
+
+  // source switch re-colds: a different source qualifies a different universe
+  m2.beginSweep('momentum')
+  ok(m2.armedCold && m2.size === 0, 'source switch: cold backfill re-arms, old memory dropped')
+
+  // rearm (arm/enable moment) behaves the same even on the SAME source
+  const m3 = new SweepEdgeMemory()
+  m3.beginSweep('confluence')
+  m3.endSweep(new Set(['EURUSD']), new Set([key('EURUSD', 'call')]))
+  m3.rearm()
+  ok(m3.armedCold && m3.size === 0, 'rearm: cold + cleared - whatever qualifies next predates the arm')
 }
 
 console.log(`\n${pass} checks passed, ${fail} failed`)

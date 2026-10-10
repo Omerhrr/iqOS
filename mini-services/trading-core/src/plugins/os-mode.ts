@@ -54,6 +54,7 @@ import { walkForward } from '../strategies/optimize'
 import { getStrategy, defaultParams, STRATEGIES } from '../strategies/builtin'
 import { classifyRegime } from '../analytics/regime'
 import { classifySession } from '../analytics/session'
+import { SweepEdgeMemory } from '../analytics/edge'
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
 
@@ -475,6 +476,14 @@ export class ModeService {
    * already true" failure mode. */
   private autoEdgeBackfill = new Set<string>()
 
+  /** Same edge memory for the four PRIORITY-ORDER sweep sources
+   * (kalman-ou/markov/momentum/confluence): they early-return the first
+   * qualifying pair, so there is no complete per-tick universe to diff -
+   * "has this condition been true for a while?" is remembered across ticks
+   * per (asset, direction) instead. Cold backfill on arm/restart/source
+   * switch, stamp on execution, lapse pruning per observed sweep. */
+  private sweepEdge = new SweepEdgeMemory()
+
   static freshRuntime(): AutoRuntime {
     return {
       dayKey: new Date().toISOString().slice(0, 10),
@@ -653,9 +662,12 @@ export class ModeService {
   /** Snapshot the screener's CURRENTLY qualifying (asset,dir) pairs into the
    * backfill set - everything in it is treated as an already-true condition
    * until it is observed lapsing. Cheap (one screener.top call), best-effort
-   * (a cold screener just backfills less; cooldowns still apply). */
+   * (a cold screener just backfills less; cooldowns still apply). The four
+   * sweep sources backfill differently - their sweepEdge memory re-colds so
+   * the first sweep after this arm records what qualifies WITHOUT trading. */
   private armAutoEdgeBackfill(): void {
     this.autoEdgeBackfill.clear()
+    this.sweepEdge.rearm()
     try {
       const screener = this.ctx.use<ScreenerService>('screener')
       const { rows } = screener.top({ tf: this.config.tf, limit: 500 })
@@ -877,6 +889,17 @@ export class ModeService {
         return this.standDown(reason) // not a "pick a different pair" situation - stand down as before
       }
 
+      // Edge stamp ON EXECUTION, never on pick: a fresh edge that a transient
+      // rejection blocked stays fresh and is re-picked next tick (the retry
+      // loop above), but once a trade actually places the edge is consumed -
+      // the still-true condition reads as held from here on, so cooldown
+      // expiry can never re-enter the stale middle. The screener source's
+      // memory is autoEdgeBackfill (lapse-pruned in pickSignal), the sweep
+      // sources' is sweepEdge (pruned in edgeSweep); the strategy source
+      // needs no stamp - its votes already carry phase (entered/flip only).
+      const edgeKey = `${row.asset}:${row.direction}`
+      if (this.config.signalSource === 'screener') this.autoEdgeBackfill.add(edgeKey)
+      else if (this.config.signalSource !== 'strategy') this.sweepEdge.stamp(edgeKey)
       this.rt.trades += 1
       this.rt.lastTradeTs = this.now()
       this.rt.lastAssetTs.set(row.asset, this.now())
@@ -1016,6 +1039,28 @@ export class ModeService {
     return null
   }
 
+  /** Shared sweep harness for the four priority-order sources: wraps the
+   * picker body with the sweepEdge memory so a qualifier only trades when it
+   * is FRESH (just crossed its gates), never when it has been sitting there
+   * since before the last arm/execution. The `rec` callback must be called
+   * once per successfully-read row - with the key when the row fully
+   * qualifies under the config gates; a throw (thin history) or a skipped
+   * asset records nothing, and unobserved assets never get a lapse verdict. */
+  private edgeSweep(
+    source: Exclude<AutoTraderSource, 'screener' | 'strategy'>,
+    body: (rec: (asset: string, key?: string) => void) => ScreenRow | null,
+  ): ScreenRow | null {
+    this.sweepEdge.beginSweep(source)
+    const evaluated = new Set<string>()
+    const qualifying = new Set<string>()
+    const pick = body((asset, key) => {
+      evaluated.add(asset)
+      if (key) qualifying.add(key)
+    })
+    this.sweepEdge.endSweep(evaluated, qualifying)
+    return pick
+  }
+
   /**
    * Kalman/OU mean-reversion source: sweep the open universe with the cheap
    * screener path (rows carry the fitted OU state) and fade statistically
@@ -1024,6 +1069,7 @@ export class ModeService {
    * (t-stat gate) and fast enough to be tradeable (half-life cap).
    */
   private pickOUSignal(): ScreenRow | null {
+    return this.edgeSweep('kalman-ou', (rec) => {
     try {
       const screener = this.ctx.use<ScreenerService>('screener')
       const market = this.ctx.use<MarketDataService>('market')
@@ -1034,6 +1080,7 @@ export class ModeService {
         if (this.assetBlocked(asset)) continue
         try {
           const base = screener.evaluate(asset, this.config.tf) // cached when fresh, recomputed when stale
+          rec(asset) // the row was read - this sweep observed the asset
           if (!base.ouMeanReverting) continue // fit not significant - fading a random walk is how accounts die
           if (base.ouHalfLife > this.config.maxHalfLife) continue // reverts too slowly to be tradeable
           const dir: 'call' | 'put' | 'none' =
@@ -1056,15 +1103,23 @@ export class ModeService {
           const confidence = Math.round(clamp(40 + (base.ouTStat - 1.5) * 20 + (az - this.config.zEntry) * 8, 35, 95))
           if (score < this.config.minScore) continue
           if (confidence < this.config.minConfidence) continue
-          return { ...base, score, confidence, direction: dir }
+          // every config gate passed - the tradeable condition is TRUE right
+          // now. The edge memory decides whether it JUST became true ('trade')
+          // or was already qualifying last sweep ('skip' -> keep sweeping for
+          // a fresher edge deeper in the priority order).
+          const key = SweepEdgeMemory.key(asset, dir)
+          rec(asset, key)
+          if (this.sweepEdge.gate(key) === 'trade') return { ...base, score, confidence, direction: dir }
         } catch {
-          // thin history for this pair - try the next
+          // thin history for this pair - try the next (unobserved: its
+          // remembered edges, if any, survive)
         }
       }
     } catch {
       // screener/market not loaded - no signal source
     }
     return null
+    })
   }
 
   /**
@@ -1074,6 +1129,7 @@ export class ModeService {
    * chain's transition matrix degenerates toward coin-flipping.
    */
   private pickMarkovSignal(): ScreenRow | null {
+    return this.edgeSweep('markov', (rec) => {
     try {
       const screener = this.ctx.use<ScreenerService>('screener')
       const open = this.ctx.use<MarketDataService>('market').assets.filter((a) => a.open).map((a) => a.ticker)
@@ -1082,6 +1138,7 @@ export class ModeService {
         if (this.assetBlocked(asset)) continue
         try {
           const r = screener.evaluate(asset, this.config.tf)
+          rec(asset)
           if (r.regime === 'chop') continue // the chain has no edge in chop
           // Task 59 (P1): the put trigger was `pUp <= 1 - minPUp` - but in a
           // 5-state chain 1-pUp = P(down)+P(flat), so a flat-heavy row with
@@ -1098,7 +1155,9 @@ export class ModeService {
           const confidence = Math.round(clamp(36 + edge * 55 + r.adx * 0.35, 35, 95))
           if (score < this.config.minScore) continue
           if (confidence < this.config.minConfidence) continue
-          return { ...r, score, confidence, direction: dir }
+          const key = SweepEdgeMemory.key(asset, dir)
+          rec(asset, key)
+          if (this.sweepEdge.gate(key) === 'trade') return { ...r, score, confidence, direction: dir }
         } catch {
           // thin history for this pair - try the next
         }
@@ -1107,6 +1166,7 @@ export class ModeService {
       // screener/market not loaded - no signal source
     }
     return null
+    })
   }
 
   /**
@@ -1116,6 +1176,7 @@ export class ModeService {
    * is already statistically exhausted (RSI beyond ~78 / below ~22).
    */
   private pickMomentumSignal(): ScreenRow | null {
+    return this.edgeSweep('momentum', (rec) => {
     try {
       const screener = this.ctx.use<ScreenerService>('screener')
       const open = this.ctx.use<MarketDataService>('market').assets.filter((a) => a.open).map((a) => a.ticker)
@@ -1124,6 +1185,7 @@ export class ModeService {
         if (this.assetBlocked(asset)) continue
         try {
           const r = screener.evaluate(asset, this.config.tf)
+          rec(asset)
           if (r.adx < this.config.minAdx) continue
           let dir: 'call' | 'put' | 'none' = 'none'
           if (r.changePct > 0 && r.rsi >= 52 && r.rsi <= 78) dir = 'call'
@@ -1134,7 +1196,9 @@ export class ModeService {
           const confidence = Math.round(clamp(36 + (r.adx - this.config.minAdx) * 0.8 + Math.abs(r.changePct) * 6, 35, 95))
           if (score < this.config.minScore) continue
           if (confidence < this.config.minConfidence) continue
-          return { ...r, score, confidence, direction: dir }
+          const key = SweepEdgeMemory.key(asset, dir)
+          rec(asset, key)
+          if (this.sweepEdge.gate(key) === 'trade') return { ...r, score, confidence, direction: dir }
         } catch {
           // thin history for this pair - try the next
         }
@@ -1143,6 +1207,7 @@ export class ModeService {
       // screener/market not loaded - no signal source
     }
     return null
+    })
   }
 
   /**
@@ -1156,6 +1221,7 @@ export class ModeService {
    * contract as ScreenerService.evaluate().
    */
   private pickConfluenceSignal(): ScreenRow | null {
+    return this.edgeSweep('confluence', (rec) => {
     try {
       const screener2 = this.ctx.use<Screener2Service>('screener2')
       const market = this.ctx.use<MarketDataService>('market')
@@ -1166,11 +1232,14 @@ export class ModeService {
         if (this.assetBlocked(asset)) continue
         try {
           const row = screener2.evaluate(asset, this.config.tf)
+          rec(asset)
           if (row.direction === 'none') continue
           if (this.config.direction !== 'both' && row.direction !== this.config.direction) continue
           if (Math.abs(row.score) < this.config.minScore) continue
           if (row.confidence < this.config.minConfidence) continue
-          return ModeService.confluenceToScreenRow(row)
+          const key = SweepEdgeMemory.key(asset, row.direction)
+          rec(asset, key)
+          if (this.sweepEdge.gate(key) === 'trade') return ModeService.confluenceToScreenRow(row)
         } catch {
           // thin history for this pair - try the next
         }
@@ -1179,6 +1248,7 @@ export class ModeService {
       // screener2/market not loaded - no signal source
     }
     return null
+    })
   }
 
   /**
