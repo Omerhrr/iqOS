@@ -117,6 +117,19 @@
 // rests on. Display-only: the snapshot's script sub-line stays averages
 // only, the hours ride the tooltips.
 //
+// The VERDICT joins the two halves the panel always showed side by side but
+// never read together: the echo says whether today is repeating yesterday's
+// script, the forward replay says what that script did NEXT - the verdict
+// says both at once. A row TRACES A SCRIPT WORTH REPEATING ("repeat up
+// +0.42%") when its echo rhymes (70+, non-quiet) AND yesterday's window
+// after that moment was directional; a rhyme over a flat script (or a quiet
+// one) is HOLLOW - confirmed but nothing to repeat; 40..69 HALF-TRACES
+// (unconfirmed); under 40 DIVERGES. The chip rides the forward-stats line,
+// and the verdict sort orders by exactly that: tradeable first, hollow,
+// partial, quiet (deliberately below partial - two dead hours trace
+// nothing), diverge, no comparison sinking - the list becomes the watchlist
+// of scripts worth repeating, not just the strongest echoes.
+//
 // The watchlist leaves the panel through the COPY button: the current view
 // (same filters, same sort) serialized into a shareable text snapshot - top
 // 10 rows, one line each (echo rhyme, week aggregate, peak session + spread,
@@ -145,7 +158,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Timeframe, YesterdayRow, YdaySession } from '@/lib/os/client'
 import { TIMEFRAME_SECONDS, fmtPrice, getYesterday } from '@/lib/os/client'
-import { RHYME_OK, RHYME_BAD, cmpBySort, buildWatchlist, parseWatchlist, fmtHours, type WatchSort, type WatchlistParse } from '@/lib/os/watchlist'
+import { RHYME_OK, RHYME_BAD, cmpBySort, buildWatchlist, parseWatchlist, fmtHours, verdictOf, type WatchSort, type WatchlistParse } from '@/lib/os/watchlist'
 
 interface YesterdayPanelProps {
   onClose: () => void
@@ -287,6 +300,50 @@ function EchoChip({ e, onJump }: { e: NonNullable<YesterdayRow['echo']>; onJump?
   )
 }
 
+/** The verdict chip: the echo joined with the forward window - the panel's
+ * actionable read. Both halves already ride the row; neither alone is the
+ * trade: a 90-rhyme over a flat forward window is a confirmed repeat of a
+ * script that went nowhere (hollow), a directional window under a 50-rhyme
+ * is a story today is NOT telling (diverge). Labels/colors mirror the echo
+ * chip's own scale: emerald trade, amber hollow/partial, rose diverge.
+ * Display-only - every input is already on the wire, the verdict is a read,
+ * never a new number. */
+function VerdictChip({ r, windowMin }: { r: YesterdayRow; windowMin: number }) {
+  const v = verdictOf(r)
+  if (!v) return null
+  const mv = `${r.movePct >= 0 ? '+' : ''}${r.movePct.toFixed(2)}%`
+  const spec = {
+    trade: {
+      cls: 'bg-emerald-500/15 text-emerald-300',
+      word: `repeat ${r.dir === 'down' ? 'down' : 'up'} ${mv}`,
+      why: `VERDICT: today's lead-in rhymes with yesterday's (${r.echo!.rhyme}/100, non-quiet) AND yesterday's window after this moment was directional (${mv} ${r.dir}). If the script keeps holding, the next ${windowMin}m repeats it - this pair is tracing a script worth repeating. The verdict sort ranks these first (rhyme, then the size of the move to repeat).`,
+    },
+    hollow: {
+      cls: 'bg-amber-500/15 text-amber-300',
+      word: 'nothing to repeat',
+      why:
+        r.echo!.quiet === true
+          ? `VERDICT: the rhyme is real but trivial - both lead-ins were flat (quiet), so the agreement carries no script to repeat regardless of the score (${r.echo!.rhyme}/100).`
+          : `VERDICT: today rhymes with yesterday's lead-in (${r.echo!.rhyme}/100) but the script went nowhere - yesterday's window after this moment was flat (net move under 10% of its own travel). Confirmed repeat of nothing.`,
+    },
+    partial: {
+      cls: 'bg-amber-500/15 text-amber-300',
+      word: 'half-traced',
+      why: `VERDICT: today half-traces yesterday's script (${r.echo!.rhyme}/100, between 40 and 70) - unconfirmed. The forward window (${mv}) is context, not (yet) a repeat; watch the rhyme climb past 70.`,
+    },
+    diverge: {
+      cls: 'bg-rose-500/15 text-rose-300',
+      word: 'own way',
+      why: `VERDICT: today goes its own way (${r.echo!.rhyme}/100, under 40) - yesterday's forward window (${mv} ${r.dir}) is not this story.`,
+    },
+  }[v]
+  return (
+    <span className={`rounded px-1 py-px font-mono text-[9px] font-bold uppercase tracking-wide ${spec.cls}`} title={spec.why}>
+      {'\u25b8'} {spec.word}
+    </span>
+  )
+}
+
 function RowCard({ r, onSelectAsset, onFocusWindow, windowMin }: { r: YesterdayRow; onSelectAsset?: (a: string) => void; onFocusWindow?: (r: YesterdayRow, effWindowMin: number) => void; windowMin: number }) {
   const thenClock = new Date(r.thenTs * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   const cov = r.barsExpected > 0 ? Math.round((r.barsFound / r.barsExpected) * 100) : 0
@@ -351,6 +408,7 @@ function RowCard({ r, onSelectAsset, onFocusWindow, windowMin }: { r: YesterdayR
         </div>
       )}
       <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 font-mono text-[9px]">
+        <VerdictChip r={r} windowMin={windowMin} />
         <span
           className={r.dir === 'up' ? 'text-emerald-300' : r.dir === 'down' ? 'text-rose-300' : 'text-[#7c8aa5]'}
           title="net move over the window that started at that moment yesterday"
@@ -1019,6 +1077,7 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
               ['rhyme', 'rhyme', 'best echo rhyme first - where today is repeating yesterday\'s lead-in (rows without a comparison sink)'],
               ['week', 'week', "best echoes of the week first - rows rhyming (70+) with the most remembered days at this hour, average rhyme breaking ties (rows without any non-quiet comparison sink - quiet rhymes, both lead-ins flat, don't count)"],
               ['peak', 'peak', "trade the pair where its script rhymes - best session average first (sessions need 2+ non-quiet observations to qualify: one lucky hour is not a script), the spread between best and worst qualified session breaking ties (a wide spread means the script really differs by time of day), biggest window move after that (rows without a qualified session sink)"],
+              ['verdict', 'verdict', "trade the pair whose repeating script actually went somewhere - rows whose echo rhymes (70+, non-quiet) AND whose yesterday window was directional first (best rhyme, the move to repeat breaking ties), then rhymes over a flat script (confirmed, nothing to repeat), then partial (40-69, unconfirmed), then quiet rhymes (both lead-ins flat - two dead hours trace nothing, below partial no matter the score), then diverging (under 40); rows with no comparison sink"],
               ['range', 'range', 'widest high-low travel in the window first - the most restless hours'],
             ] as [Sort, string, string][]
           ).map(([v, label, why]) => {
@@ -1332,7 +1391,7 @@ export default function YesterdayPanel({ onClose, tf, onSelectAsset, onFocusWind
         ))}
         {data && data.rows.length > 0 && (
           <p className="px-1 pt-1 text-[8.5px] leading-relaxed text-[#3d4d66]">
-            Each row is the window that started at the bar forming exactly 24h ago, on the chart's timeframe. dir counts as up/down only when the net move exceeds 10% of the window's own travel. "arch" = bars from the kernel's accumulated store (broker bars in live mode), "seeded" = the feed's deterministic prehistory - never mistake a seeded yesterday for a remembered one. echo compares the lead-in windows ending at this same time of day (yesterday's ended at the anchor, today's within one bar of now): rhyme = direction 50 + move-vs-travel 30 + travel ratio 20, 70+ reads as "repeating the script", under 40 as "going its own way"; a rhyme between two FLAT lead-ins (net move under 10% of travel on both sides) is marked "quiet" - real but trivial, excluded from every aggregate. The rhyme-by-class strip averages each class's echo scores (compared rows only) - "are OTC pairs rhyming today?" is one glance away, and once the scan walks deeper than 1d each chip grows a ⟳ week number averaging every non-quiet echoed day-observation in class - "are they rhyming with the whole week, or only with yesterday?". Click a card to open that asset on the chart; click an echo chip to go further - the chart deep-loads the asset's full day of candles and scrolls onto yesterday's lead-in plus the forward replay window (edges the feed never remembered show as a gap, not filler). The day chips walk the same window further back - the "at this hour" strip shows each remembered day with its own coverage (days the series cannot cover are absent, not flat), each day's rhyme tag scores today's lead-in against THAT day's lead-in, and the "N/M rhyme" aggregate counts the days today actually rhymed with (70+, non-quiet comparisons) among the compared ones. The week sort orders the list by exactly that count - the strongest week rhymes float to the top (average rhyme breaking ties, biggest window move after that, quiet rhymes not counting), turning the panel into a best-echoes watchlist. The "by session" toggle goes one question deeper: the kernel re-scores the same adjacent-day lead-in echo at every hour of the day and averages it per trading session, so each row grows a "script" line - rhymes in London but not off-hours, or the reverse - with quiet echoes excluded from the averages and -OTC pairs collapsed into one day-wide bucket (they have no sessions), and every measured cell's tooltip names the exact UTC hours its average is fed by - the peak cell's "which hours is this made of?" answers itself (quiet pairs' hours are not listed: they feed obs, never the average). With the toggle on, the rhyme-by-class strip gains a sibling: script by class - each class's session averages folded across its rows (weighted by observations, quiet excluded), the OTC column separating the synthetic twins' day-wide script from the clock-bound classes'. The peak sort turns the script into a watchlist: the pair whose BEST session (2+ non-quiet observations) rhymes hardest floats to the top, the spread between best and worst qualified session breaking ties - and the script line marks the peak session bold beside a spread tag, so "trade it only where it rhymes" reads without the sort. Off-hours averages sit under a dotted underline (script line and class strip alike): those hours are outside the named sessions, where the books are thin - the rhyme is real, quiet pairs are already excluded, but weight it accordingly; the copy button marks such a peak off* in the snapshot and the legend spells it out. The copy button serializes exactly what you see - the same filters and sort, the top 10 rows as a text snapshot (echo rhyme, week aggregate, peak session, window move) headed by the scan time, the sort and the filters - and every row with a measured profile grows an indented script sub-line carrying its full session averages, so the shape of the script travels with the paste, not just the peak - ready to paste anywhere. The paste button closes the loop the copy opens: paste a snapshot back and its ranked pairs plus its sort ride again as a LENS over your own scan - the selection and the sort travel, every number re-reads from local data (a shared watchlist compares scripts, not numbers), pairs the local scan cannot see are counted as skipped rather than invented, the filter chips pause while the lens is on, and "back to live view" (or a class-chip click) hands control straight back.
+            Each row is the window that started at the bar forming exactly 24h ago, on the chart's timeframe. dir counts as up/down only when the net move exceeds 10% of the window's own travel. "arch" = bars from the kernel's accumulated store (broker bars in live mode), "seeded" = the feed's deterministic prehistory - never mistake a seeded yesterday for a remembered one. echo compares the lead-in windows ending at this same time of day (yesterday's ended at the anchor, today's within one bar of now): rhyme = direction 50 + move-vs-travel 30 + travel ratio 20, 70+ reads as "repeating the script", under 40 as "going its own way"; a rhyme between two FLAT lead-ins (net move under 10% of travel on both sides) is marked "quiet" - real but trivial, excluded from every aggregate. The rhyme-by-class strip averages each class's echo scores (compared rows only) - "are OTC pairs rhyming today?" is one glance away, and once the scan walks deeper than 1d each chip grows a ⟳ week number averaging every non-quiet echoed day-observation in class - "are they rhyming with the whole week, or only with yesterday?". Click a card to open that asset on the chart; click an echo chip to go further - the chart deep-loads the asset's full day of candles and scrolls onto yesterday's lead-in plus the forward replay window (edges the feed never remembered show as a gap, not filler). The day chips walk the same window further back - the "at this hour" strip shows each remembered day with its own coverage (days the series cannot cover are absent, not flat), each day's rhyme tag scores today's lead-in against THAT day's lead-in, and the "N/M rhyme" aggregate counts the days today actually rhymed with (70+, non-quiet comparisons) among the compared ones. The week sort orders the list by exactly that count - the strongest week rhymes float to the top (average rhyme breaking ties, biggest window move after that, quiet rhymes not counting), turning the panel into a best-echoes watchlist. The "by session" toggle goes one question deeper: the kernel re-scores the same adjacent-day lead-in echo at every hour of the day and averages it per trading session, so each row grows a "script" line - rhymes in London but not off-hours, or the reverse - with quiet echoes excluded from the averages and -OTC pairs collapsed into one day-wide bucket (they have no sessions), and every measured cell's tooltip names the exact UTC hours its average is fed by - the peak cell's "which hours is this made of?" answers itself (quiet pairs' hours are not listed: they feed obs, never the average). With the toggle on, the rhyme-by-class strip gains a sibling: script by class - each class's session averages folded across its rows (weighted by observations, quiet excluded), the OTC column separating the synthetic twins' day-wide script from the clock-bound classes'. The peak sort turns the script into a watchlist: the pair whose BEST session (2+ non-quiet observations) rhymes hardest floats to the top, the spread between best and worst qualified session breaking ties - and the script line marks the peak session bold beside a spread tag, so "trade it only where it rhymes" reads without the sort. Off-hours averages sit under a dotted underline (script line and class strip alike): those hours are outside the named sessions, where the books are thin - the rhyme is real, quiet pairs are already excluded, but weight it accordingly; the copy button marks such a peak off* in the snapshot and the legend spells it out. The copy button serializes exactly what you see - the same filters and sort, the top 10 rows as a text snapshot (echo rhyme, week aggregate, peak session, window move) headed by the scan time, the sort and the filters - and every row with a measured profile grows an indented script sub-line carrying its full session averages, so the shape of the script travels with the paste, not just the peak - ready to paste anywhere. The paste button closes the loop the copy opens: paste a snapshot back and its ranked pairs plus its sort ride again as a LENS over your own scan - the selection and the sort travel, every number re-reads from local data (a shared watchlist compares scripts, not numbers), pairs the local scan cannot see are counted as skipped rather than invented, the filter chips pause while the lens is on, and "back to live view" (or a class-chip click) hands control straight back. The verdict chip is the join the two headline lines always begged for: the echo line says whether today is repeating yesterday's script, the forward-stats line says what that script did next - the chip reads both together (▸ repeat up +0.42% = traced AND worth repeating; ▸ nothing to repeat = a confirmed rhyme over a flat script, or a quiet one; ▸ half-traced = 40-69, unconfirmed; ▸ own way = diverging), and the verdict sort orders the list by exactly that - tradeable rows first (rhyme, then the size of the move to repeat), hollow, partial, then quiet (two dead hours trace nothing, below partial no matter the score), diverge after, no comparison sinking - so the strongest echoes that actually lead somewhere float and the 90-from-flat crowd sinks with them.
           </p>
         )}
       </div>

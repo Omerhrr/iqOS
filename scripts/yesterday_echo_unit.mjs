@@ -26,9 +26,12 @@
 //     sub-lines / key row / legend from leaking in as rows, dedupes by
 //     best rank, ranks by the written index and degrades honestly on a
 //     trimmed or hand-edited header
+//   - verdict: the echo joined with the forward window (trade / hollow /
+//     partial / diverge classification, the six-level verdict sort with
+//     quiet deliberately below partial, and the verdict roundtrip)
 // Run: bun scripts/yesterday_echo_unit.mjs
 import { buildPriorDay, buildSessionProfile, buildYesterdayRow } from '../mini-services/trading-core/src/analytics/yesterday'
-import { cmpBySort, buildWatchlist, parseWatchlist, fmtWatchlistTs, fmtHours } from '../src/lib/os/watchlist'
+import { cmpBySort, buildWatchlist, parseWatchlist, fmtWatchlistTs, fmtHours, verdictOf, verdictRank } from '../src/lib/os/watchlist'
 
 let pass = 0
 let fail = 0
@@ -312,6 +315,44 @@ ok('watchlist: move order uses |move| - BBB 3.0 first, CCC 0.5 last', JSON.strin
 
 const TS = 1_699_920_000_000 // 2023-11-14T00:00:00Z
 ok('watchlist: fmtWatchlistTs renders a UTC label', fmtWatchlistTs(TS) === '2023-11-14 00:00 UTC', `got ${fmtWatchlistTs(TS)}`)
+
+// ---- VERDICT (Task 20): the echo joined with the forward window ----
+// The panel's actionable read: a rhyme is only worth something when the
+// script it repeats actually went somewhere. verdictOf classifies,
+// verdictRank orders - quiet deliberately BELOW partial (two dead hours
+// trace nothing, no matter the score). Dedicated fixtures carry `dir` (the
+// WROWS above predate the field and stay legal without it - a missing dir
+// reads hollow, never trade).
+const vr = (asset, movePct, echo, dir, prior = [], profile = null) => ({ ...wr(asset, movePct, echo, prior, profile), dir })
+const vTradeUp = vr('T1', 0.42, { rhyme: 82, quiet: false }, 'up')
+const vTradeDown = vr('T3', 0.55, { rhyme: 71, quiet: false }, 'down')
+const vHollowFlat = vr('H1', 0.05, { rhyme: 90, quiet: false }, 'none')
+const vHollowQuiet = vr('H2', 0.7, { rhyme: 100, quiet: true }, 'up')
+const vNoDir = { ...wr('ND', 0.42, { rhyme: 82, quiet: false }, [], null) } // no dir field
+const vPartial = vr('P1', 0.6, { rhyme: 55, quiet: false }, 'up')
+const vDiverge = vr('D1', 0.8, { rhyme: 30, quiet: false }, 'down')
+const vNone = wr('N1', 1.5, null, [], null)
+ok('verdict: trade = rhyme 70+ non-quiet AND a directional script (up)', verdictOf(vTradeUp) === 'trade', JSON.stringify(verdictOf(vTradeUp)))
+ok('verdict: trade reads the down direction too', verdictOf(vTradeDown) === 'trade', JSON.stringify(verdictOf(vTradeDown)))
+ok('verdict: hollow = confirmed rhyme over a flat script (nothing to repeat)', verdictOf(vHollowFlat) === 'hollow', JSON.stringify(verdictOf(vHollowFlat)))
+ok('verdict: quiet dominates - a trivial agreement is hollow even with a directional script', verdictOf(vHollowQuiet) === 'hollow', JSON.stringify(verdictOf(vHollowQuiet)))
+ok('verdict: a row without dir reads hollow, never trade (missing evidence is not a repeatable move)', verdictOf(vNoDir) === 'hollow', JSON.stringify(verdictOf(vNoDir)))
+ok('verdict: partial = 40..69, unconfirmed trace', verdictOf(vPartial) === 'partial', JSON.stringify(verdictOf(vPartial)))
+ok('verdict: diverge = under 40, going its own way', verdictOf(vDiverge) === 'diverge', JSON.stringify(verdictOf(vDiverge)))
+ok('verdict: no echo = null (no comparison instead of a fake one)', verdictOf(vNone) === null, JSON.stringify(verdictOf(vNone)))
+const VROWS = [vTradeUp, vTradeDown, vHollowFlat, vHollowQuiet, vPartial, vDiverge, vNone]
+ok('verdict: rank levels - trade 0, hollow-real 1, partial 2, quiet 3, diverge 4, no echo 5', JSON.stringify(VROWS.map(verdictRank)) === JSON.stringify([0, 0, 1, 3, 2, 4, 5]), JSON.stringify(VROWS.map(verdictRank)))
+const byVerdict = [...VROWS].sort(cmpBySort('verdict')).map((r) => r.asset)
+ok('verdict: order exact - tradeable first (rhyme desc), hollow-real, partial, quiet BELOW partial, diverge, no-echo sinks', JSON.stringify(byVerdict) === JSON.stringify(['T1', 'T3', 'H1', 'P1', 'H2', 'D1', 'N1']), `got ${byVerdict.join(',')}`)
+ok('verdict: within trade, rhyme leads - the 82/+0.42 pair above the 75/+0.90 one (the move to repeat only breaks ties)', cmpBySort('verdict')({ ...vr('X', 0.9, { rhyme: 75, quiet: false }, 'up') }, { ...vr('Y', 0.4, { rhyme: 82, quiet: false }, 'up') }) > 0, `cmp=${cmpBySort('verdict')({ ...vr('X', 0.9, { rhyme: 75, quiet: false }, 'up') }, { ...vr('Y', 0.4, { rhyme: 82, quiet: false }, 'up') })}`)
+ok('verdict: within a level, the move to repeat breaks rhyme ties', cmpBySort('verdict')({ ...vr('X', 0.1, { rhyme: 82, quiet: false }, 'up') }, { ...vr('Y', 0.9, { rhyme: 82, quiet: false }, 'up') }) > 0, `cmp=${cmpBySort('verdict')({ ...vr('X', 0.1, { rhyme: 82, quiet: false }, 'up') }, { ...vr('Y', 0.9, { rhyme: 82, quiet: false }, 'up') })}`)
+ok('verdict: a quiet 100 can never outrank a real 55 - the masquerade rule holds in the sort too', cmpBySort('verdict')(vHollowQuiet, vPartial) > 0, `cmp=${cmpBySort('verdict')(vHollowQuiet, vPartial)}`)
+const snapVerdict = buildWatchlist({ rows: VROWS, sort: 'verdict', tsMs: TS, topN: 10 })
+ok('verdict: the snapshot header carries sort verdict', snapVerdict.split('\n')[0].includes('sort verdict'), snapVerdict.split('\n')[0])
+const rtVerdict = parseWatchlist(snapVerdict)
+ok('verdict: roundtrip parses the verdict sort back (all seven kinds pass)', rtVerdict.ok && rtVerdict.wl.sort === 'verdict' && rtVerdict.wl.ranked === 7, JSON.stringify(rtVerdict.ok ? rtVerdict.wl : rtVerdict))
+ok('verdict: the receiver re-ranks the pasted selection through the same comparator', rtVerdict.ok && JSON.stringify(rtVerdict.wl.assets) === JSON.stringify(byVerdict), `got ${rtVerdict.ok ? rtVerdict.wl.assets.join(',') : '-'}`)
+
 const snap = buildWatchlist({ rows: WROWS, sort: 'peak', tsMs: TS, topN: 3, mktLabel: 'all markets', catLabel: 'all classes' })
 const snapLines = snap.split('\n')
 // AAA + BBB carry a measured profile (one script sub-line each), DDD does not

@@ -42,13 +42,19 @@ export interface WatchRow {
   movePct: number
   sincePct: number
   rangePct: number
+  /** the FORWARD window's direction (yesterday's replay) - the second input
+   * of the verdict: a rhyme is only worth something when the script it
+   * repeats actually went somewhere. Optional so hand-built rows stay legal;
+   * a row without dir reads hollow, never trade (missing evidence is never
+   * mistaken for a repeatable move). */
+  dir?: 'up' | 'down' | 'none'
   otc?: boolean
   echo?: WatchEcho | null
   prior?: WatchPrior[] | null
   profile?: WatchBucket[] | null
 }
 
-export type WatchSort = 'move' | 'since' | 'range' | 'rhyme' | 'week' | 'peak'
+export type WatchSort = 'move' | 'since' | 'range' | 'rhyme' | 'week' | 'peak' | 'verdict'
 
 /** every non-quiet echo observation of the row: yesterday's own echo plus
  * each remembered prior day's. The week aggregate ranks only these - a
@@ -104,6 +110,62 @@ export function peakRhymeCmp(a: WatchRow, b: WatchRow): number {
   return Math.abs(b.movePct) - Math.abs(a.movePct)
 }
 
+/** The VERDICT: the echo (is today repeating yesterday's script?) joined
+ * with the forward replay (what did that script do NEXT?). Both numbers
+ * already ride every row; neither alone is the trade:
+ * - `trade`   - today TRACES yesterday's lead-in (rhyme 70+, non-quiet) and
+ *               yesterday's window after that moment was DIRECTIONAL: if the
+ *               script keeps holding, the next window repeats it. The
+ *               panel's actionable read.
+ * - `hollow`  - a confirmed rhyme with nothing to repeat: yesterday's
+ *               forward window was flat, or the echo itself is quiet (both
+ *               lead-ins flat - the agreement is real but trivial, same
+ *               exclusion every aggregate applies). The rhyme is the
+ *               headline; the script under it went nowhere.
+ * - `partial` - rhyme 40..69: today half-traces the script. Unconfirmed -
+ *               the forward window is context, not a repeat (yet).
+ * - `diverge` - rhyme under 40: today goes its own way; yesterday's
+ *               forward window is not this story.
+ * null = no echo (no comparison instead of a fake one). All four labels
+ * mirror the echo chip's own colors: emerald / amber / amber / rose. */
+export type VerdictKind = 'trade' | 'hollow' | 'partial' | 'diverge'
+
+export function verdictOf(r: WatchRow): VerdictKind | null {
+  const e = r.echo
+  if (!e) return null
+  if (e.quiet === true) return 'hollow'
+  if (e.rhyme >= RHYME_OK) return r.dir === 'up' || r.dir === 'down' ? 'trade' : 'hollow'
+  if (e.rhyme < RHYME_BAD) return 'diverge'
+  return 'partial'
+}
+
+/** Ranking for the "verdict" sort - trade the pair whose repeating script
+ * actually went somewhere. Six levels, quiet sank deliberately:
+ * 0 tradeable (rhyme 70+ non-quiet + directional script), 1 hollow-real (a
+ * confirmed rhyme over a flat script), 2 partial (unconfirmed trace),
+ * 3 QUIET (the trivial-agreement class - both lead-ins flat, two dead hours
+ * trace nothing, so it ranks BELOW partial no matter the score: the same
+ * "never let 90-from-flat masquerade as a strong echo" rule every other
+ * aggregate here applies), 4 diverging, 5 no comparison (sinks last).
+ * Within every level: rhyme desc, the size of the move to repeat breaking
+ * ties - the same headline order the plain rhyme sort uses. */
+export function verdictRank(r: WatchRow): number {
+  const v = verdictOf(r)
+  if (v == null) return 5
+  if (v === 'hollow') return r.echo?.quiet === true ? 3 : 1
+  return v === 'trade' ? 0 : v === 'partial' ? 2 : 4
+}
+
+export function verdictRhymeCmp(a: WatchRow, b: WatchRow): number {
+  const ra = verdictRank(a)
+  const rb = verdictRank(b)
+  if (ra !== rb) return ra - rb
+  const ea = a.echo?.rhyme ?? -1
+  const eb = b.echo?.rhyme ?? -1
+  if (eb !== ea) return eb - ea
+  return Math.abs(b.movePct) - Math.abs(a.movePct)
+}
+
 /** the comparator behind every sort chip - the single ordering the list on
  * screen and the exported snapshot both follow. */
 export function cmpBySort(mode: WatchSort): (a: WatchRow, b: WatchRow) => number {
@@ -120,6 +182,8 @@ export function cmpBySort(mode: WatchSort): (a: WatchRow, b: WatchRow) => number
       return weekRhymeCmp
     case 'peak':
       return peakRhymeCmp
+    case 'verdict':
+      return verdictRhymeCmp
   }
 }
 
@@ -184,7 +248,7 @@ export function fmtWatchlistTs(ms: number): string {
   return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())} UTC`
 }
 
-const LEGEND = `legend: rhyme = dir 50 + move-vs-travel 30 + travel ratio 20 · ${RHYME_OK}+ rhymes, <${RHYME_BAD} diverges · q quiet (both lead-ins flat, out of aggregates) · week rhymed/kept + avg over non-quiet days · peak best session (2+ non-quiet obs) · Δ best-worst spread · * off-hours (thin books, weight it) · move = yesterday's replay window`
+const LEGEND = `legend: rhyme = dir 50 + move-vs-travel 30 + travel ratio 20 · ${RHYME_OK}+ rhymes, <${RHYME_BAD} diverges · q quiet (both lead-ins flat, out of aggregates) · week rhymed/kept + avg over non-quiet days · peak best session (2+ non-quiet obs) · Δ best-worst spread · * off-hours (thin books, weight it) · move = yesterday's replay window · verdict sort = rhyme joined with the forward window (traced + somewhere to go first, hollow / partial / quiet / diverge after, no echo sinks)`
 
 /** Serialize the current view into a shareable text snapshot. The rows come
  * in ALREADY filtered (market/class/direction/echo/search - the operator
@@ -277,7 +341,7 @@ export function buildWatchlist(opts: {
 }
 
 const TITLE_TAG = 'iqOS yesterday watchlist'
-const SORT_KINDS: readonly string[] = ['move', 'since', 'range', 'rhyme', 'week', 'peak']
+const SORT_KINDS: readonly string[] = ['move', 'since', 'range', 'rhyme', 'week', 'peak', 'verdict']
 const COUNT_SEG = /^(top \d+ of \d+|\d+ rows?)$/
 
 /** What a pasted snapshot parses into - the view's SHAPE, never the
@@ -287,7 +351,7 @@ const COUNT_SEG = /^(top \d+ of \d+|\d+ rows?)$/
 export interface WatchlistParse {
   /** the snapshot's ranked assets, deduped (best rank kept), in rank order */
   assets: string[]
-  /** the header's sort - null when absent or not one of the six kinds */
+  /** the header's sort - null when absent or not one of the seven kinds */
   sort: WatchSort | null
   /** the scan-time label exactly as the header carried it (display-only) */
   tsLabel: string | null
@@ -309,7 +373,7 @@ export type WatchlistParseResult =
  * buildWatchlist, living in the SAME module on purpose: the parser reads
  * only what the serializer writes, so the format can never drift on one
  * side alone. From the title it takes the scan-time label, the sort (only
- * the six real kinds pass) and the scope segments between the sort and the
+ * the seven real kinds pass) and the scope segments between the sort and the
  * count; from the body, lines shaped `NN  ASSET  ...` - the key row (#)
  * and the indented script sub-lines carry no leading rank digits and the
  * legend doesn't start with one, so nothing else can leak in as a row.
