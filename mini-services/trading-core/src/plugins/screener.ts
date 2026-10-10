@@ -189,6 +189,33 @@ export class ScreenerService {
     const candles = this.market.getCandles(asset, tf, need, true)
     if (candles.length < this.config.minCandles) throw new Error(`thin history ${asset} ${tf}`)
     const snap = scanSnapshot(candles, asset, tf)
+    // Layer-2 NaN hardening (layer 1 = finGte gates in os-mode.ts, 312a459):
+    // a feed glitch on the FRESHEST candle (NaN/Inf close) leaves the indicator
+    // arrays rescuable (last() walks back to finite readings) but poisons the
+    // direct tail reads - probe-verified: price/atrPct/changePct go non-finite
+    // while score/confidence stay finite, so a tradeable-looking row with a NaN
+    // price can reach the pickers, the arm backfill and the alerts. Fail closed
+    // at the source: a row whose tradeable core is not fully finite is not a
+    // row - throw and let the next sweep retry (every consumer already treats a
+    // throw as "skip this pair"). Neutral-but-valid rows (flat tape reads RSI
+    // 50, ADX 0) stay finite and pass - the guard rejects garbage, not quiet.
+    const core: [string, number][] = [
+      ['price', snap.price],
+      ['score', snap.score],
+      ['confidence', snap.confidence],
+      ['pUp', snap.probUp],
+      ['pDown', snap.probDown],
+      ['rsi', snap.rsi],
+      ['adx', snap.adx],
+      ['atrPct', snap.atrPct],
+      ['hurst', snap.hurst],
+      ['changePct', snap.changePct],
+      ['ouZ', snap.ouZ],
+      ['ouHalfLife', snap.ouHalfLife],
+      ['ouTStat', snap.ouTStat],
+    ]
+    const bad = core.filter(([, v]) => !Number.isFinite(v)).map(([k]) => k)
+    if (bad.length) throw new Error(`non-finite core ${asset} ${tf}: ${bad.join(', ')}`)
     const inst = this.market.assets.find((a) => a.ticker === asset)
     const row: ScreenRow = {
       asset,

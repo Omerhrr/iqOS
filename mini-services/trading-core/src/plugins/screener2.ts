@@ -166,6 +166,17 @@ export class Screener2Service {
     const candles = this.market.getCandlesDeep(asset, tf, DEEP_CANDLES, true)
     if (candles.length < this.config.minCandles) throw new Error(`thin history ${asset} ${tf}`)
     const sig = confluenceSignalOnly(candles, asset, tf)
+    // Layer-2 NaN hardening (see screener.ts scorePair): the deep read rescues
+    // the indicator arrays but a glitched tail candle still leaves sig.price
+    // (and anything derived from it) non-finite while score/confidence stay
+    // finite - never emit such a row; the next sweep retries.
+    for (const [k, v] of [
+      ['price', sig.price],
+      ['score', sig.score],
+      ['confidence', sig.confidence],
+    ] as const) {
+      if (!Number.isFinite(v)) throw new Error(`non-finite core ${asset} ${tf}: ${k}`)
+    }
     const inst = this.market.assets.find((a) => a.ticker === asset)
     const row: ConfluenceRow = {
       asset,
