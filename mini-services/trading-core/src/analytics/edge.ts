@@ -110,7 +110,11 @@ export function evalWithEdge(
 export class SweepEdgeMemory {
   private source = ''
   private cold = true
-  private memory = new Set<string>()
+  /** key -> when it became held and why. origin 'backfill' = already true at
+   * an arm (or first sight after one), 'executed' = a trade actually placed
+   * on it. The ts is the CALLER's clock (kernel epoch seconds) so the class
+   * stays deterministic and testable. */
+  private memory = new Map<string, { origin: 'backfill' | 'executed'; ts: number }>()
 
   /** Key shape: `${asset}:${dir}` - tickers never contain ':', dir is
    * call|put, so the asset round-trips through the last ':'. */
@@ -133,6 +137,24 @@ export class SweepEdgeMemory {
 
   has(key: string): boolean {
     return this.memory.has(key)
+  }
+
+  /** Operator-facing state: the active source, whether the backfill is still
+   * owed, and every held edge with its origin and hold-start (newest first). */
+  describe(): {
+    source: string
+    cold: boolean
+    held: Array<{ asset: string; dir: string; origin: 'backfill' | 'executed'; since: number }>
+  } {
+    const held = [...this.memory.entries()]
+      .map(([key, e]) => ({
+        asset: SweepEdgeMemory.assetOf(key),
+        dir: key.slice(key.lastIndexOf(':') + 1),
+        origin: e.origin,
+        since: e.ts,
+      }))
+      .sort((a, b) => b.since - a.since)
+    return { source: this.source, cold: this.cold, held }
   }
 
   /** Start a sweep for `source`. A source switch re-colds: the new source's
@@ -158,14 +180,14 @@ export class SweepEdgeMemory {
    * A cold sweep with observations IS the backfill: fold the observed
    * qualifying set in and stand down. Otherwise prune keys whose asset was
    * evaluated but no longer qualifies (an observable lapse). */
-  endSweep(evaluated: Set<string>, qualifying: Set<string>): void {
+  endSweep(evaluated: Set<string>, qualifying: Set<string>, ts = 0): void {
     if (evaluated.size === 0) return
     if (this.cold) {
-      for (const key of qualifying) this.memory.add(key)
+      for (const key of qualifying) this.memory.set(key, { origin: 'backfill', ts })
       this.cold = false
       return
     }
-    for (const key of [...this.memory]) {
+    for (const key of [...this.memory.keys()]) {
       if (qualifying.has(key)) continue
       if (evaluated.has(SweepEdgeMemory.assetOf(key))) this.memory.delete(key)
     }
@@ -174,8 +196,8 @@ export class SweepEdgeMemory {
   /** The trade actually placed - the edge is consumed: the condition counts
    * as held for this source from here until it observably lapses, so a
    * per-asset cooldown expiring can never re-enter the stale middle. */
-  stamp(key: string): void {
-    this.memory.add(key)
+  stamp(key: string, ts = 0): void {
+    this.memory.set(key, { origin: 'executed', ts })
   }
 
   /** (Re)arm: whatever qualifies on the next sweep predates this arm. */

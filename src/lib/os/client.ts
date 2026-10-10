@@ -2250,6 +2250,17 @@ export interface OsModeStatus {
     lastAction?: string
     lastRejection?: string
     active: boolean
+    /** Edge memory of the ACTIVE signal source (kernel epoch-SECOND stamps):
+     * the already-true conditions the trader is refusing to act on. cold = the
+     * first sweep after an arm hasn't run yet (it records, never trades).
+     * held/screenerHeld rows carry when the hold started and why (backfilled at
+     * arm vs consumed by an executed trade). 'strategy' keeps no memory. */
+    edges?: {
+      source: string
+      cold: boolean
+      held: Array<{ asset: string; dir: string; origin: 'backfill' | 'executed'; since: number }>
+      screenerHeld: Array<{ asset: string; dir: string; origin: 'backfill' | 'executed'; since: number }>
+    }
   }
 }
 

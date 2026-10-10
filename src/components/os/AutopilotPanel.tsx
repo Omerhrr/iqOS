@@ -1546,6 +1546,11 @@ function AutoTraderStrip({
           {at.lastRejection && <span className="text-amber-500/70"> · standing down: {at.lastRejection}</span>}
         </p>
       )}
+      {/* edge-memory row: the already-true conditions this source is refusing
+          to act on. The operator-facing half of "act on conditions that JUST
+          became true" - what is held, since when, and why (armed into it vs
+          consumed by an executed trade). */}
+      {at.active && at.edges && <EdgeMemoryRow edges={at.edges} nowSec={Date.now() / 1000} />}
       {at.config.stakePlan && at.config.planState?.halted && (
         <div className="mt-1 flex items-center justify-between gap-2 rounded border border-amber-500/30 bg-amber-500/5 px-1.5 py-1">
           <span className="font-mono text-[8px] text-amber-300">
@@ -1559,6 +1564,87 @@ function AutoTraderStrip({
             Restart cycle
           </Button>
         </div>
+      )}
+    </div>
+  )
+}
+
+/** The auto-trader's edge memory, operator-facing: the already-true
+ * conditions this source is refusing to trade, since when, and whether the
+ * hold came from arming into them (backfill) or from consuming them with an
+ * executed trade. 'strategy' keeps no memory - its votes are phase-gated at
+ * the eval itself (entered/flip only), so there is nothing to list. */
+function EdgeMemoryRow({
+  edges,
+  nowSec,
+}: {
+  edges: NonNullable<OsModeStatus['autotrader']['edges']>
+  nowSec: number
+}) {
+  const age = (since: number) => {
+    const s = Math.max(0, Math.round(nowSec - since))
+    if (s < 90) return `${s}s`
+    const m = Math.round(s / 60)
+    if (m < 90) return `${m}m`
+    return `${Math.round(m / 60)}h`
+  }
+  if (edges.source === 'strategy') {
+    return (
+      <p className="mt-0.5 font-mono text-[8px] text-[#3d4c66]">
+        <span className="font-bold uppercase tracking-wider text-[#4b5a72]">edges</span> · votes phase-gated at the eval
+        (entered/flip only) · no hold memory
+      </p>
+    )
+  }
+  const rows = edges.source === 'screener' ? edges.screenerHeld : edges.held
+  return (
+    <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 font-mono text-[8px]">
+      <span className="font-bold uppercase tracking-wider text-[#4b5a72]">edges</span>
+      {edges.cold ? (
+        <span
+          className="rounded border border-amber-500/40 bg-amber-500/10 px-1 py-px text-amber-300"
+          title="first sweep after arming hasn't run yet - it records what already qualifies and trades none of it"
+        >
+          backfilling · first sweep records, never trades
+        </span>
+      ) : rows.length === 0 ? (
+        <span
+          className="text-[#4b5a72]"
+          title="nothing is held - the next condition to cross this source's gates can trade immediately"
+        >
+          no held edges · fresh qualifiers can trade
+        </span>
+      ) : (
+        <>
+          {rows.slice(0, 6).map((h) => (
+            <span
+              key={`${h.asset}:${h.dir}`}
+              className={`rounded border px-1 py-px ${
+                h.origin === 'executed'
+                  ? 'border-emerald-500/30 bg-emerald-500/5 text-emerald-300/90'
+                  : 'border-[#1c2739] bg-[#101828] text-[#7c8aa5]'
+              }`}
+              title={
+                h.origin === 'executed'
+                  ? `${h.asset} ${h.dir}: a placed trade consumed this edge - held until the condition lapses (cooldown expiry cannot re-enter it)`
+                  : `${h.asset} ${h.dir}: already qualifying when the trader armed - held until it lapses, then it trades as a fresh edge`
+              }
+            >
+              {h.asset} {h.dir === 'call' ? '▲' : '▼'} {h.origin === 'executed' ? 'exec' : 'arm'} {age(h.since)}
+            </span>
+          ))}
+          {rows.length > 6 && (
+            <span
+              className="text-[#4b5a72]"
+              title={rows
+                .slice(6)
+                .map((h) => `${h.asset} ${h.dir} ${h.origin === 'executed' ? 'exec' : 'arm'} ${age(h.since)}`)
+                .join(', ')}
+            >
+              +{rows.length - 6} more
+            </span>
+          )}
+        </>
       )}
     </div>
   )

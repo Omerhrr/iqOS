@@ -467,14 +467,15 @@ export class ModeService {
   config: AutoTraderConfig = { ...DEFAULT_AUTOTRADER }
   private rt: AutoRuntime = ModeService.freshRuntime()
   /** Edge memory for the screener source: (asset:dir) pairs that were ALREADY
-   * qualifying when autonomy armed. The screener's qualifying feed is the
-   * complete universe for its source, so each tick refreshes this set's
-   * honesty: keys that lapse out of the feed are removed (their next
-   * appearance is a genuine fresh edge), keys that persist keep blocking.
-   * Without it the first tick after arming would happily trade whatever had
-   * been sitting in the top-12 for the last hour - the exact "condition that
-   * already true" failure mode. */
-  private autoEdgeBackfill = new Set<string>()
+   * qualifying when autonomy armed (value = arm-time, kernel epoch seconds)
+   * or that a placed trade consumed (value = execution time). The screener's
+   * qualifying feed is the complete universe for its source, so each tick
+   * refreshes this map's honesty: keys that lapse out of the feed are removed
+   * (their next appearance is a genuine fresh edge), keys that persist keep
+   * blocking. Without it the first tick after arming would happily trade
+   * whatever had been sitting in the top-12 for the last hour - the exact
+   * "condition that already true" failure mode. */
+  private autoEdgeBackfill = new Map<string, { since: number; origin: 'backfill' | 'executed' }>()
 
   /** Same edge memory for the four PRIORITY-ORDER sweep sources
    * (kalman-ou/markov/momentum/confluence): they early-return the first
@@ -673,7 +674,7 @@ export class ModeService {
       const { rows } = screener.top({ tf: this.config.tf, limit: 500 })
       for (const r of rows) {
         if (r.direction === 'none') continue
-        this.autoEdgeBackfill.add(`${r.asset}:${r.direction}`)
+        this.autoEdgeBackfill.set(`${r.asset}:${r.direction}`, { since: this.now(), origin: 'backfill' })
       }
       if (this.autoEdgeBackfill.size) {
         this.ctx.log('os-mode', `[auto-trader] edge backfill: ${this.autoEdgeBackfill.size} pair-direction(s) already qualifying at arm - waiting for fresh edges`)
@@ -898,8 +899,8 @@ export class ModeService {
       // sources' is sweepEdge (pruned in edgeSweep); the strategy source
       // needs no stamp - its votes already carry phase (entered/flip only).
       const edgeKey = `${row.asset}:${row.direction}`
-      if (this.config.signalSource === 'screener') this.autoEdgeBackfill.add(edgeKey)
-      else if (this.config.signalSource !== 'strategy') this.sweepEdge.stamp(edgeKey)
+      if (this.config.signalSource === 'screener') this.autoEdgeBackfill.set(edgeKey, { since: this.now(), origin: 'executed' })
+      else if (this.config.signalSource !== 'strategy') this.sweepEdge.stamp(edgeKey, this.now())
       this.rt.trades += 1
       this.rt.lastTradeTs = this.now()
       this.rt.lastAssetTs.set(row.asset, this.now())
@@ -985,7 +986,7 @@ export class ModeService {
         if (r.direction === 'none') continue
         qualifyingNow.add(`${r.asset}:${r.direction}`)
       }
-      for (const key of [...this.autoEdgeBackfill]) {
+      for (const key of [...this.autoEdgeBackfill.keys()]) {
         if (!qualifyingNow.has(key)) this.autoEdgeBackfill.delete(key)
       }
       const variety = this.config.pickVariety ?? 1
@@ -1057,7 +1058,7 @@ export class ModeService {
       evaluated.add(asset)
       if (key) qualifying.add(key)
     })
-    this.sweepEdge.endSweep(evaluated, qualifying)
+    this.sweepEdge.endSweep(evaluated, qualifying, this.now())
     return pick
   }
 
@@ -2595,8 +2596,24 @@ export class ModeService {
       lastAction?: string
       lastRejection?: string
       active: boolean
+      /** Edge-memory state for the ACTIVE signal source - what the operator
+       * needs to answer "why isn't it trading / what is it waiting for": the
+       * held (already-true) edges it is refusing to act on, each with when the
+       * hold started and why (backfilled at arm vs consumed by an executed
+       * trade). 'strategy' keeps no memory (its votes are phase-gated at the
+       * eval), so held/screenerHeld come back empty for it. since = kernel
+       * epoch SECONDS. Capped at 60 rows per list. */
+      edges: {
+        source: AutoTraderSource
+        cold: boolean
+        held: Array<{ asset: string; dir: string; origin: 'backfill' | 'executed'; since: number }>
+        screenerHeld: Array<{ asset: string; dir: string; origin: 'backfill' | 'executed'; since: number }>
+      }
     }
   } {
+    const sweepDesc = this.sweepEdge.describe()
+    const isSweepSource = ['kalman-ou', 'markov', 'momentum', 'confluence'].includes(this.config.signalSource)
+    const isScreener = this.config.signalSource === 'screener'
     return {
       mode: this.mode,
       ts: this.ts,
@@ -2613,6 +2630,22 @@ export class ModeService {
         lastAction: this.rt.lastAction,
         lastRejection: this.rt.lastRejection,
         active: this.mode === 'auto' && this.config.enabled,
+        edges: {
+          source: this.config.signalSource,
+          cold: isSweepSource && sweepDesc.cold,
+          held: isSweepSource ? sweepDesc.held.slice(0, 60) : [],
+          screenerHeld: isScreener
+            ? [...this.autoEdgeBackfill.entries()]
+                .map(([key, e]) => ({
+                  asset: key.slice(0, key.lastIndexOf(':')),
+                  dir: key.slice(key.lastIndexOf(':') + 1),
+                  origin: e.origin,
+                  since: e.since,
+                }))
+                .sort((a, b) => b.since - a.since)
+                .slice(0, 60)
+            : [],
+        },
       },
     }
   }

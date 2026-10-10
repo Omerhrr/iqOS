@@ -227,9 +227,23 @@ function ok(cond, name) {
   // rearm (arm/enable moment) behaves the same even on the SAME source
   const m3 = new SweepEdgeMemory()
   m3.beginSweep('confluence')
-  m3.endSweep(new Set(['EURUSD']), new Set([key('EURUSD', 'call')]))
+  m3.endSweep(new Set(['EURUSD']), new Set([key('EURUSD', 'call')]), 1000)
   m3.rearm()
   ok(m3.armedCold && m3.size === 0, 'rearm: cold + cleared - whatever qualifies next predates the arm')
+
+  // describe(): the operator view - origin (backfill vs executed) + hold-start
+  const m4 = new SweepEdgeMemory()
+  const d0 = m4.describe()
+  ok(d0.cold && d0.held.length === 0, 'describe on a fresh memory: cold, nothing held')
+  m4.beginSweep('kalman-ou')
+  m4.endSweep(new Set(['EURUSD', 'GBPUSD']), new Set([key('EURUSD', 'call'), key('GBPUSD', 'put')]), 1500)
+  const d1 = m4.describe()
+  ok(d1.source === 'kalman-ou' && !d1.cold, 'describe names the source and ends cold')
+  ok(d1.held.length === 2 && d1.held.every((h) => h.origin === 'backfill' && h.since === 1500), 'cold-sweep qualifiers are backfilled with the sweep clock')
+  m4.stamp(key('XAUUSD', 'call'), 1600)
+  const d2 = m4.describe()
+  ok(d2.held[0].asset === 'XAUUSD' && d2.held[0].origin === 'executed' && d2.held[0].since === 1600, 'executed edge sorts newest with its own origin')
+  ok(d2.held.every((h) => h.asset && (h.dir === 'call' || h.dir === 'put')), 'describe rows carry asset + direction split from the key')
 }
 
 console.log(`\n${pass} checks passed, ${fail} failed`)
