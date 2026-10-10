@@ -50,6 +50,28 @@ function mulberry32(seed: number): () => number {
   }
 }
 
+/** Glitch filter for candle INGESTION and archive reads (the NaN defense's
+ * outermost layer - the screener's finGte gates and NaN-core row rejection
+ * are the inner ones). A bar whose OHLC carries a non-finite or non-positive
+ * value is not a bar: a glitched freshest candle poisons the direct tail
+ * reads downstream (probe-verified: scanSnapshot's price/atrPct/changePct
+ * go NaN while score/confidence stay finite), survives the sqlite archive
+ * across restarts, and shows the user literal NaN/null on panels and charts.
+ * volume 0 is VALID (live tick-rolled bars carry it) - only negative volume
+ * is garbage. Shape policing (high>=low etc.) is deliberately NOT done:
+ * real feeds can sample the extremes at odd moments and the NaN class is
+ * the one that matters. */
+export function validCandle(c: Candle): boolean {
+  return (
+    Number.isFinite(c.time) &&
+    Number.isFinite(c.open) && c.open > 0 &&
+    Number.isFinite(c.high) && c.high > 0 &&
+    Number.isFinite(c.low) && c.low > 0 &&
+    Number.isFinite(c.close) && c.close > 0 &&
+    Number.isFinite(c.volume) && c.volume >= 0
+  )
+}
+
 interface Regime {
   drift: number
   anchor: number
@@ -92,6 +114,11 @@ export class MarketDataService {
   private archivedUpTo = new Map<string, number>() // incremental real-bar archive watermark
   private warnedPollCap = 0
   private lastCandleTs = new Map<string, number>()
+  // glitch-guard accounting (ingestion filter): dropped ticks/bars so feed
+  // corruption is visible in the kernel log instead of silently becoming
+  // NaN panels. Throttled to one line per minute.
+  private glitchDrops = 0
+  private lastGlitchLogTs = 0
   private store: Store | null = null
   private archiveQueue: { asset: string; tf: string; time: number; open: number; high: number; low: number; close: number; volume: number }[] = []
   private flushCount = 0
@@ -432,7 +459,10 @@ export class MarketDataService {
   private buildSeries(a: AssetInfo, tf: Timeframe): Candle[] {
     if (!this.store) return []
     const tfSec = TIMEFRAME_SECONDS[tf]
-    const arch = this.store.getCandlesArchive(a.ticker, tf, ARCHIVE_DEEP)
+    // glitch guard on the read side: rows archived before the ingestion filter
+    // existed must not re-enter the series (and through gap-fill anchoring,
+    // not shape the synthetic continuation either)
+    const arch = this.store.getCandlesArchive(a.ticker, tf, ARCHIVE_DEEP).filter((c) => c && validCandle(c))
     if (!arch.length) return []
     const series: Candle[] = [...arch]
     // bridge downtime with a deterministic forward walk (continuity up to now)
@@ -579,6 +609,15 @@ export class MarketDataService {
   }
 
   private applyTick(asset: string, tf: Timeframe, tick: { ts: number; price: number; vol: number }): void {
+    // ingestion guard: the tick is the single funnel every timeframe's candle
+    // forms through - a non-finite/non-positive price here poisons the forming
+    // bar (high/low/close) for ALL timeframes at once. Sim ticks are finite by
+    // construction; the live /price poll is truthy-guarded only, so Inf/neg
+    // used to slip through. volume NaN would ride the accumulation the same way.
+    if (!Number.isFinite(tick.ts) || !Number.isFinite(tick.price) || tick.price <= 0 || !Number.isFinite(tick.vol)) {
+      this.dropGlitch(asset, 'ticks', 1)
+      return
+    }
     const tfSec = TIMEFRAME_SECONDS[tf]
     const bucket = tick.ts - (tick.ts % tfSec)
     const k = this.key(asset, tf)
@@ -607,6 +646,18 @@ export class MarketDataService {
       this.ctx.bus.emit('candle', { asset, tf, candle: current, closed: false })
     }
     this.lastCandleTs.set(k, bucket)
+  }
+
+  /** Count + throttled-log one glitch-drop event (ingestion filter). The
+   * kernel log is the operator surface - a silent drop would just be a
+   * mysteriously missing bar, a logged one is a diagnosable feed. */
+  private dropGlitch(asset: string, what: string, n: number): void {
+    this.glitchDrops += n
+    const now = Date.now()
+    if (now - this.lastGlitchLogTs >= 60_000) {
+      this.lastGlitchLogTs = now
+      this.ctx.log('market-data', `glitch guard: dropped ${n} non-finite ${what} for ${asset} (total ${this.glitchDrops})`)
+    }
   }
 
   // ---------- LIVE bridge (iqair sidecar) ----------
@@ -814,7 +865,7 @@ export class MarketDataService {
       } else {
         this.pollFailStreak = 0
       }
-      if (priceData?.ok && priceData.price) {
+      if (priceData?.ok && typeof priceData.price === 'number' && Number.isFinite(priceData.price) && priceData.price > 0) {
         const now = Math.floor(Date.now() / 1000)
         this.prices.set(asset, priceData.price)
         // Market closed (weekend / session gap)? The sidecar's last REAL bar
@@ -839,41 +890,50 @@ export class MarketDataService {
       }
       const candleData = wantCandles ? await candleJson : null
       if (candleData?.ok && candleData.candles?.length) {
-        for (const tf of ALL_TIMEFRAMES) {
-          const agg = this.aggregate(candleData.candles, TIMEFRAME_SECONDS[tf])
-          if (agg.length > 10) {
-            // MERGE, not clobber: the sidecar only serves a short tail (~240
-            // 1m bars, even unauthenticated). Replacing wholesale used to
-            // throw away the seeded prehistory + archived depth for the
-            // active asset every 60s, starving the research lab / backtests
-            // of history. Fresh bars win a timestamp collision, older memory
-            // survives, capped at the usual MEM_CAP.
-            const k = this.key(asset, tf)
-            const byTime = new Map<number, Candle>()
-            for (const c of this.closed.get(k) ?? []) byTime.set(c.time, c)
-            for (const c of agg) byTime.set(c.time, c)
-            const merged = [...byTime.values()].sort((a, b) => a.time - b.time)
-            this.closed.set(k, merged.slice(-MEM_CAP))
-            this.candles.set(k, agg[agg.length - 1])
-            // Task 59 (P2): archive the real broker bars. The only other
-            // archive writer is applyTick's rollover, which in live mode
-            // files 4s-sampled bars with volume 0 - the archive (and every
-            // post-restart deep read: delta, volume profile, orderflow
-            // strategies) was being poisoned with dead volume. agg's last
-            // element is the broker's FORMING bar - excluded here. The
-            // archive UPSERT (ON CONFLICT DO UPDATE) overwrites the degraded
-            // tick-rolled row for the same timestamp.
-            const lastArchived = this.archivedUpTo.get(k) ?? 0
-            const closedAgg = agg.slice(0, -1).filter((c) => c.time > lastArchived)
-            if (closedAgg.length) {
-              for (const c of closedAgg)
-                this.archiveQueue.push({ asset, tf, time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume })
-              this.archivedUpTo.set(k, closedAgg[closedAgg.length - 1].time)
+        // ingestion guard (see validCandle): sidecar bars merge wholesale AND
+        // get archived here - an unfiltered glitched bar would poison the
+        // closed series, the persistent archive AND prices.set's quote, then
+        // come back on every restart via the archive hydration reads.
+        const clean = candleData.candles.filter((c) => c && validCandle(c))
+        const dropped = candleData.candles.length - clean.length
+        if (dropped > 0) this.dropGlitch(asset, 'sidecar candles', dropped)
+        if (clean.length) {
+          for (const tf of ALL_TIMEFRAMES) {
+            const agg = this.aggregate(clean, TIMEFRAME_SECONDS[tf])
+            if (agg.length > 10) {
+              // MERGE, not clobber: the sidecar only serves a short tail (~240
+              // 1m bars, even unauthenticated). Replacing wholesale used to
+              // throw away the seeded prehistory + archived depth for the
+              // active asset every 60s, starving the research lab / backtests
+              // of history. Fresh bars win a timestamp collision, older memory
+              // survives, capped at the usual MEM_CAP.
+              const k = this.key(asset, tf)
+              const byTime = new Map<number, Candle>()
+              for (const c of this.closed.get(k) ?? []) byTime.set(c.time, c)
+              for (const c of agg) byTime.set(c.time, c)
+              const merged = [...byTime.values()].sort((a, b) => a.time - b.time)
+              this.closed.set(k, merged.slice(-MEM_CAP))
+              this.candles.set(k, agg[agg.length - 1])
+              // Task 59 (P2): archive the real broker bars. The only other
+              // archive writer is applyTick's rollover, which in live mode
+              // files 4s-sampled bars with volume 0 - the archive (and every
+              // post-restart deep read: delta, volume profile, orderflow
+              // strategies) was being poisoned with dead volume. agg's last
+              // element is the broker's FORMING bar - excluded here. The
+              // archive UPSERT (ON CONFLICT DO UPDATE) overwrites the degraded
+              // tick-rolled row for the same timestamp.
+              const lastArchived = this.archivedUpTo.get(k) ?? 0
+              const closedAgg = agg.slice(0, -1).filter((c) => c.time > lastArchived)
+              if (closedAgg.length) {
+                for (const c of closedAgg)
+                  this.archiveQueue.push({ asset, tf, time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume })
+                this.archivedUpTo.set(k, closedAgg[closedAgg.length - 1].time)
+              }
             }
           }
+          const lastC = clean[clean.length - 1]
+          this.prices.set(asset, lastC.close)
         }
-        const lastC = candleData.candles[candleData.candles.length - 1]
-        this.prices.set(asset, lastC.close)
       }
     } catch {
       // per-asset failure must not kill the remaining assets' polls; the
@@ -939,7 +999,9 @@ export class MarketDataService {
     if (!this.store) return live
     let archived: Candle[] = []
     try {
-      archived = this.store.getCandlesArchive(asset, tf, limit)
+      // read-side glitch guard (see buildSeries): the research lab, screener2's
+      // deep read and the backtests all come through here
+      archived = this.store.getCandlesArchive(asset, tf, limit).filter((c) => c && validCandle(c))
     } catch {
       return live
     }
@@ -1009,7 +1071,7 @@ export class MarketDataService {
       const tfSec = TIMEFRAME_SECONDS[tf] ?? 60
       const url = `${this.liveUrl.replace(/\/$/, '')}/candles?asset=${encodeURIComponent(asset)}&size=${Math.min(1000, Math.max(100, Math.floor(limit)))}&tf=${tfSec}`
       const res = await fetch(url, { signal: AbortSignal.timeout(20_000) }).then((r) => r.json()) as { ok?: boolean; candles?: Candle[] }
-      return (res?.candles ?? []).filter((c) => c && Number.isFinite(Number(c.time)) && Number.isFinite(Number(c.close)))
+      return (res?.candles ?? []).filter((c) => c && validCandle(c))
     } catch {
       return []
     }

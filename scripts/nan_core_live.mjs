@@ -27,10 +27,11 @@ const waitSweep = async () => {
   for (let i = 0; i < 60; i++) {
     await new Promise((r) => setTimeout(r, 3000))
     try {
-      // NOTE: `sweeping` never settles on a live feed (candle closes keep
-      // re-queuing stale pairs) - wait for a meaningful pairs count only.
+      // NOTE: the payload is nested ({ok, status:{pairs, sweeping, ...}}) and
+      // `sweeping` never settles on a live feed (stale rescans requeue
+      // continuously) - wait on the nested pairs count only.
       const st = await (await fetch(`${BASE}/screener_status`)).json()
-      if (st.pairs > 100) return st
+      if ((st.status?.pairs ?? st.pairs ?? 0) > 100) return st.status ?? st
     } catch { /* kernel warming */ }
   }
   return null

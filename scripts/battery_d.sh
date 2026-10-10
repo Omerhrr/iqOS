@@ -32,6 +32,8 @@ echo "--- memory_gate_selftest (bun, in-process)"
 bun scripts/memory_gate_selftest.ts 2>&1 | tail -2 || rc=1
 echo "--- nan_core_unit (bun, in-process)"
 bun scripts/nan_core_unit.ts 2>&1 | tail -1 || rc=1
+echo "--- nan_ingest_unit (bun, in-process)"
+bun scripts/nan_ingest_unit.ts 2>&1 | tail -1 || rc=1
 echo "--- yesterday_e2e (node, HTTP)"
 node scripts/yesterday_e2e.mjs 2>&1 | tail -3 || rc=1
 echo "--- classweek_smoke (node, HTTP)"
