@@ -1542,7 +1542,9 @@ function AutoTraderStrip({
       </div>
       {(at.lastAction || at.lastRejection) && (
         <p className="mt-0.5 truncate font-mono text-[8px] text-[#3d4c66]">
-          {at.lastAction && <span>last: {at.lastAction}</span>}
+          {/* title carries the full line - the fresh-edge "why now" suffix
+              makes it longer than the truncated strip row can show */}
+          {at.lastAction && <span title={at.lastAction}>last: {at.lastAction}</span>}
           {at.lastRejection && <span className="text-amber-500/70"> · standing down: {at.lastRejection}</span>}
         </p>
       )}

@@ -341,6 +341,12 @@ export const DEFAULT_AUTOTRADER: AutoTraderConfig = {
 // (undefined = fixed-stake, the original unconditional behavior)
 
 const AUTOTRADER_NOTE = 'auto:os-trader'
+/** The four sweep-based auto-trader signal sources - the ones whose fresh-edge
+ * discipline is enforced by SweepEdgeMemory (the screener source instead keeps
+ * autoEdgeBackfill; 'strategy' phase-gates its votes at the eval). Only these
+ * sources can guarantee every placed trade is a FRESH edge, so only their
+ * alerts carry the "why now" crossing note the pickers attach. */
+const SWEEP_SOURCES: readonly string[] = ['kalman-ou', 'markov', 'momentum', 'confluence']
 /** Liquid fallback evaluated on demand while the full screener sweep warms up. */
 const LIQUID_CANDIDATES = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'XAUUSD', 'BTCUSD']
 
@@ -907,7 +913,13 @@ export class ModeService {
       this.rt.openCount += 1
       this.rt.lastRejection = undefined
       const rollTag = bet.compound ? ` · ${bet.phase} roll x${bet.rollN + 1}${this.config.stakePlan?.periods ? `/${this.config.stakePlan.periods}` : ''} (pot $${bet.pot.toFixed(2)})` : ''
-      this.rt.lastAction = `${side.toUpperCase()} ${row.asset}${rollTag}`
+      // The four sweep sources only ever reach this block on a FRESH edge
+      // (the picker's gate() === 'trade' branch), and each picker attaches a
+      // note naming the gate that JUST crossed - surface it in the strip's
+      // `last:` state row and in the alert, so the operator reads why the
+      // pair qualifies NOW, not just raw indicator values.
+      const why = SWEEP_SOURCES.includes(this.config.signalSource) && row.note ? row.note : ''
+      this.rt.lastAction = `${side.toUpperCase()} ${row.asset}${rollTag}${why ? ` · ${why}` : ''}`
       const detail =
         this.config.signalSource === 'kalman-ou'
           ? `OU z ${row.ouZ.toFixed(2)}σ · HL ${row.ouHalfLife >= 9999 ? '∞' : row.ouHalfLife.toFixed(0)}b · t ${row.ouTStat.toFixed(1)} · edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)}`
@@ -937,7 +949,7 @@ export class ModeService {
       const payTag = pay > 0 ? ` · pay ${(pay * 100).toFixed(0)}% (BE ${(100 / (1 + pay)).toFixed(1)}%)` : ''
       this.emit(
         'success',
-        `[AUTO-TRADER]${modeTag} ${side.toUpperCase()} ${row.asset} ${this.config.tf} $${bet.amount.toFixed(2)} binary - ${detail}${payTag}`
+        `[AUTO-TRADER]${modeTag} ${side.toUpperCase()} ${row.asset} ${this.config.tf} $${bet.amount.toFixed(2)} binary - ${detail}${why ? ` · fresh edge: ${why}` : ''}${payTag}`
       )
       return
     }
@@ -1110,7 +1122,20 @@ export class ModeService {
           // a fresher edge deeper in the priority order).
           const key = SweepEdgeMemory.key(asset, dir)
           rec(asset, key)
-          if (this.sweepEdge.gate(key) === 'trade') return { ...base, score, confidence, direction: dir }
+          if (this.sweepEdge.gate(key) === 'trade')
+            return {
+              ...base,
+              score,
+              confidence,
+              direction: dir,
+              // why NOW: the stretch just crossed the entry bar - the one
+              // bar-fresh gate this source's qualifying tuple hangs on (the
+              // OU fit and half-life gates are quasi-static by comparison)
+              note:
+                dir === 'call'
+                  ? `z ${base.ouZ.toFixed(2)} crossed below the ${(-this.config.zEntry).toFixed(2)} entry`
+                  : `z ${base.ouZ.toFixed(2)} crossed above the +${this.config.zEntry.toFixed(2)} entry`,
+            }
         } catch {
           // thin history for this pair - try the next (unobserved: its
           // remembered edges, if any, survive)
@@ -1158,7 +1183,19 @@ export class ModeService {
           if (confidence < this.config.minConfidence) continue
           const key = SweepEdgeMemory.key(asset, dir)
           rec(asset, key)
-          if (this.sweepEdge.gate(key) === 'trade') return { ...r, score, confidence, direction: dir }
+          if (this.sweepEdge.gate(key) === 'trade')
+            return {
+              ...r,
+              score,
+              confidence,
+              direction: dir,
+              // why NOW: the decisive side probability just cleared its bar
+              // (each side gated on ITS own probability - Task 59)
+              note:
+                dir === 'call'
+                  ? `P(up) ${(r.pUp * 100).toFixed(0)}% crossed the ${(this.config.minPUp * 100).toFixed(0)}% bar`
+                  : `P(down) ${(pDown * 100).toFixed(0)}% crossed the ${(this.config.minPUp * 100).toFixed(0)}% bar`,
+            }
         } catch {
           // thin history for this pair - try the next
         }
@@ -1199,7 +1236,17 @@ export class ModeService {
           if (confidence < this.config.minConfidence) continue
           const key = SweepEdgeMemory.key(asset, dir)
           rec(asset, key)
-          if (this.sweepEdge.gate(key) === 'trade') return { ...r, score, confidence, direction: dir }
+          if (this.sweepEdge.gate(key) === 'trade')
+            return {
+              ...r,
+              score,
+              confidence,
+              direction: dir,
+              // why NOW: trend strength just cleared the ADX bar with the
+              // directional trigger intact - either leg failing means the
+              // tuple never qualified, so this is the crossing that made it
+              note: `ADX ${r.adx.toFixed(0)} crossed the ${this.config.minAdx} bar · RSI ${r.rsi.toFixed(0)} in the ${dir === 'call' ? 'bull' : 'bear'} band`,
+            }
         } catch {
           // thin history for this pair - try the next
         }
@@ -1240,7 +1287,13 @@ export class ModeService {
           if (row.confidence < this.config.minConfidence) continue
           const key = SweepEdgeMemory.key(asset, row.direction)
           rec(asset, key)
-          if (this.sweepEdge.gate(key) === 'trade') return ModeService.confluenceToScreenRow(row)
+          if (this.sweepEdge.gate(key) === 'trade')
+            return {
+              ...ModeService.confluenceToScreenRow(row),
+              // why NOW: the 14-factor composite just crossed the score bar
+              // in this direction - the composite IS the trigger here
+              note: `composite ${Math.abs(row.score).toFixed(0)} crossed the ${this.config.minScore} factor-score bar`,
+            }
         } catch {
           // thin history for this pair - try the next
         }
@@ -2612,7 +2665,7 @@ export class ModeService {
     }
   } {
     const sweepDesc = this.sweepEdge.describe()
-    const isSweepSource = ['kalman-ou', 'markov', 'momentum', 'confluence'].includes(this.config.signalSource)
+    const isSweepSource = SWEEP_SOURCES.includes(this.config.signalSource)
     const isScreener = this.config.signalSource === 'screener'
     return {
       mode: this.mode,
