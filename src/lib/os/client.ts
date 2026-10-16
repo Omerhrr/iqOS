@@ -639,6 +639,37 @@ export async function getVolArbScan(tf: Timeframe): Promise<VolArbScanResponse> 
   return osGet<VolArbScanResponse>('/volarb_scan', { tf })
 }
 
+// ---- Triangulation Arbitrage (synthetic vs actual cross-rate) -----------
+
+export interface TriangulationScanRow {
+  currencies: string
+  legAB: string
+  legBC: string
+  cross: string
+  price: number
+  synthetic: number
+  deltaPct: number
+  z: number
+  n: number
+  otc: boolean
+  open: boolean
+  direction: 'call' | 'put' | null
+  qualifies: boolean
+}
+
+export interface TriangulationScanResponse {
+  ok: boolean
+  tf: Timeframe
+  scanned: number
+  qualifying: number
+  rows: TriangulationScanRow[]
+  ts: number
+}
+
+export async function getTriangulationScan(tf: Timeframe): Promise<TriangulationScanResponse> {
+  return osGet<TriangulationScanResponse>('/triangulation_scan', { tf })
+}
+
 // ---- chart-signal outcome stats (Task 64-c: the honesty loop) ------------
 
 export type SignalOutcomeId = 'win' | 'loss' | 'flat' | 'timeout'

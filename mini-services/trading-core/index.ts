@@ -35,6 +35,7 @@ import { leadersFor, LEADLAG_GROUPS } from './src/analytics/leadlag'
 import { distillChartSignals, DISTILL_DEFAULT_WINDOW } from './src/analytics/chartsignalsdistill'
 import { fitCointegration, COINTEGRATION_WINDOW, COINTEGRATION_MIN_R2, COINTEGRATION_MIN_TSTAT, COINTEGRATION_MAX_HALFLIFE } from './src/analytics/cointegration'
 import { computeVolArb, VOLARB_DEFAULT_WINDOW } from './src/analytics/volarb'
+import { findTriangles, fitTriangulation, TRIANGULATION_WINDOW, TRIANGULATION_Z_ENTRY, type TriangleCandidate } from './src/analytics/triangulation'
 import { normalizeSpec, type CustomSpec } from './src/strategies/custom'
 import { MINABLE_ENGINES, ENGINE_LABEL, type ChartEngineId } from './src/analytics/chartsignals'
 import { vskMonteCarlo } from './src/analytics/vsk'
@@ -354,6 +355,85 @@ function scanVolArb(market: MarketDataService, tfv: Timeframe): VolArbScanRow[] 
   }
   rows.sort((x, y) => Math.abs(y.ratio - 1) - Math.abs(x.ratio - 1))
   volarbScanCache.set(tfv, { ts: Date.now(), rows })
+  return rows
+}
+
+interface TriangulationScanRow {
+  currencies: string
+  legAB: string
+  legBC: string
+  cross: string
+  price: number
+  synthetic: number
+  deltaPct: number
+  z: number
+  n: number
+  otc: boolean
+  open: boolean
+  direction: 'call' | 'put' | null
+  /** |z| clears TRIANGULATION_Z_ENTRY - this is the basis divergence actually
+   * being unusual against its own recent history, not just nonzero (the
+   * basis is essentially never exactly 0 bar-to-bar). */
+  qualifies: boolean
+}
+const triangulationScanCache = new Map<Timeframe, { ts: number; rows: TriangulationScanRow[] }>()
+// triangle roster only depends on which FX tickers exist, not on price - safe
+// to compute once and reuse across every scan/tf
+let triangleCandidates: TriangleCandidate[] | null = null
+
+function scanTriangulation(market: MarketDataService, tfv: Timeframe): TriangulationScanRow[] {
+  const cached = triangulationScanCache.get(tfv)
+  if (cached && Date.now() - cached.ts < SCAN_CACHE_MS) return cached.rows
+  if (!triangleCandidates) {
+    triangleCandidates = findTriangles(market.assets.filter((a) => a.category === 'forex').map((a) => a.ticker))
+  }
+  const byTicker = new Map(market.assets.map((a) => [a.ticker, a]))
+  const closeCache = new Map<string, number[] | null>()
+  const getCloses = (ticker: string): number[] | null => {
+    let c = closeCache.get(ticker)
+    if (c === undefined) {
+      const inst = byTicker.get(ticker)
+      try {
+        c = inst?.open ? market.getCandlesDeep(ticker, tfv, Math.max(300, TRIANGULATION_WINDOW + 50), true).map((cd) => cd.close) : null
+      } catch {
+        c = null
+      }
+      closeCache.set(ticker, c)
+    }
+    return c
+  }
+  const rows: TriangulationScanRow[] = []
+  for (const tri of triangleCandidates) {
+    const abCloses = getCloses(tri.legAB.ticker)
+    const bcCloses = getCloses(tri.legBC.ticker)
+    const acCloses = getCloses(tri.cross.ticker)
+    if (!abCloses || !bcCloses || !acCloses) continue
+    try {
+      const fit = fitTriangulation(abCloses, bcCloses, acCloses, tri.legAB.invert, tri.legBC.invert, tri.cross.invert, TRIANGULATION_WINDOW)
+      if (!fit) continue
+      const crossInfo = byTicker.get(tri.cross.ticker)
+      const qualifies = Math.abs(fit.z) >= TRIANGULATION_Z_ENTRY
+      rows.push({
+        currencies: tri.currencies.join('/'),
+        legAB: tri.legAB.ticker,
+        legBC: tri.legBC.ticker,
+        cross: tri.cross.ticker,
+        price: fit.actual,
+        synthetic: fit.synthetic,
+        deltaPct: fit.deltaPct,
+        z: fit.z,
+        n: fit.n,
+        otc: !!crossInfo?.otc,
+        open: !!crossInfo?.open,
+        direction: fit.z >= TRIANGULATION_Z_ENTRY ? 'put' : fit.z <= -TRIANGULATION_Z_ENTRY ? 'call' : null,
+        qualifies,
+      })
+    } catch {
+      /* one bad triangle never breaks the scan */
+    }
+  }
+  rows.sort((x, y) => Number(y.qualifies) - Number(x.qualifies) || Math.abs(y.z) - Math.abs(x.z))
+  triangulationScanCache.set(tfv, { ts: Date.now(), rows })
   return rows
 }
 
@@ -1702,6 +1782,21 @@ const httpServer = createServer(async (req, res) => {
           if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
           const rows = scanVolArb(market, tfv)
           return json(200, { ok: true, tf: tfv, scanned: rows.length, rows, ts: Date.now() })
+        } catch (err) {
+          return json(400, { ok: false, error: (err as Error).message })
+        }
+      }
+
+      // Triangulation Arbitrage scan: every closed FX triangle (A/B, B/C,
+      // A/C) in the universe, synthetic-vs-actual cross-rate delta, ranked
+      // by how unusual that basis is against its own recent history. See
+      // analytics/triangulation.ts.
+      if (path === '/triangulation_scan') {
+        try {
+          const tfv = tfStrict(q.get('tf'))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const rows = scanTriangulation(market, tfv)
+          return json(200, { ok: true, tf: tfv, scanned: rows.length, qualifying: rows.filter((r) => r.qualifies).length, rows, ts: Date.now() })
         } catch (err) {
           return json(400, { ok: false, error: (err as Error).message })
         }

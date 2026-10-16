@@ -19,6 +19,7 @@ import LeadLagPanel from '@/components/os/LeadLagPanel'
 import ChartSignalsDistillPanel from '@/components/os/ChartSignalsDistillPanel'
 import CointegrationPanel from '@/components/os/CointegrationPanel'
 import VolatilityArbPanel from '@/components/os/VolatilityArbPanel'
+import TriangulationPanel from '@/components/os/TriangulationPanel'
 import MarkovPanel from '@/components/os/MarkovPanel'
 import { DeltaFootprintView } from '@/components/os/OrderFlowPanel'
 import CandleMathView from '@/components/os/CandleMathView'
@@ -141,6 +142,7 @@ export default function OSPage() {
   const [distillOpen, setDistillOpen] = useState(false)
   const [cointegrationOpen, setCointegrationOpen] = useState(false)
   const [volarbOpen, setVolarbOpen] = useState(false)
+  const [triangulationOpen, setTriangulationOpen] = useState(false)
   const [registry, setRegistry] = useState<RegistryEntry[]>([])
   const [activeOverlays, setActiveOverlays] = useState<ActiveIndicator[]>([])
   const [activeSubs, setActiveSubs] = useState<ActiveIndicator[]>([])
@@ -946,7 +948,7 @@ export default function OSPage() {
                 closed = the slim open strip sits above the market watch and
                 everything is laid out exactly as before. */}
             <Panel defaultSize={17} minSize={11}>
-              {signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen ? (
+              {signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen ? (
                 <div className="mr-0.5 h-full min-h-0">
                   {ydayOpen ? (
                     <YesterdayPanel onClose={() => setYdayOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onFocusWindow={handleFocusYesterday} />
@@ -958,6 +960,8 @@ export default function OSPage() {
                     <CointegrationPanel onClose={() => setCointegrationOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
                   ) : volarbOpen ? (
                     <VolatilityArbPanel onClose={() => setVolarbOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
+                  ) : triangulationOpen ? (
+                    <TriangulationPanel onClose={() => setTriangulationOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
                   ) : (
                     <ChartSignalsPanel onClose={() => setSignalsOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onTake={handleTakeSignal} />
                   )}
@@ -1032,6 +1036,16 @@ export default function OSPage() {
                       >
                         <span className="h-1.5 w-1.5 rounded-full bg-sky-400" />
                         Vol Arb
+                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setTriangulationOpen(true)}
+                        title="open the triangulation arbitrage panel - every FX triangle's synthetic-vs-actual cross-rate delta"
+                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-teal-500/40 hover:text-teal-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-teal-400" />
+                        Triangulation
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
                       </div>
