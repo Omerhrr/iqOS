@@ -502,6 +502,58 @@ export async function getChartSignalsDistill(
   })
 }
 
+// ---- Cointegration (Engle-Granger pairs) ---------------------------------
+
+export interface CointegrationFit {
+  beta: number
+  alpha: number
+  r2: number
+  theta: number
+  sigmaEq: number
+  tStat: number
+  halfLifeBars: number
+  z: number
+  n: number
+}
+
+export interface CointegrationResponse {
+  ok: boolean
+  asset: string
+  tf: Timeframe
+  leader: string | null
+  price: number | null
+  result: CointegrationFit | null
+  direction: 'call' | 'put' | null
+  ts: number
+}
+
+export async function getCointegration(asset: string, tf: Timeframe, window?: number): Promise<CointegrationResponse> {
+  return osGet<CointegrationResponse>('/cointegration', { asset, tf, ...(window !== undefined ? { window } : {}) })
+}
+
+// ---- Volatility Arb (close-vol vs range-vol) -----------------------------
+
+export interface VolArbResult {
+  closeVol: number
+  rangeVol: number
+  ratio: number
+  momentum: number
+  lastBarDir: -1 | 0 | 1
+}
+
+export interface VolArbResponse {
+  ok: boolean
+  asset: string
+  tf: Timeframe
+  price: number | null
+  result: VolArbResult | null
+  ts: number
+}
+
+export async function getVolArb(asset: string, tf: Timeframe, window?: number): Promise<VolArbResponse> {
+  return osGet<VolArbResponse>('/volarb', { asset, tf, ...(window !== undefined ? { window } : {}) })
+}
+
 // ---- chart-signal outcome stats (Task 64-c: the honesty loop) ------------
 
 export type SignalOutcomeId = 'win' | 'loss' | 'flat' | 'timeout'

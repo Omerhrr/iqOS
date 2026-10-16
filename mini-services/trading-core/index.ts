@@ -33,6 +33,8 @@ import { backtest } from './src/strategies/backtest'
 import type { BacktestOptions } from './src/strategies/backtest'
 import { leadersFor } from './src/analytics/leadlag'
 import { distillChartSignals } from './src/analytics/chartsignalsdistill'
+import { fitCointegration, COINTEGRATION_WINDOW } from './src/analytics/cointegration'
+import { computeVolArb, VOLARB_DEFAULT_WINDOW } from './src/analytics/volarb'
 import { normalizeSpec, type CustomSpec } from './src/strategies/custom'
 import { MINABLE_ENGINES, ENGINE_LABEL, type ChartEngineId } from './src/analytics/chartsignals'
 import { vskMonteCarlo } from './src/analytics/vsk'
@@ -2402,6 +2404,62 @@ const httpServer = createServer(async (req, res) => {
           direction: directionOf(body),
         })
         return json(200, { ok: true, result })
+        } catch (err) {
+          return json(400, { ok: false, error: (err as Error).message })
+        }
+      }
+
+      // Cointegration (pairs): panel-facing twin of the cointegration-pairs
+      // strategy - fetches this asset's group leader (same leadersFor() lookup
+      // as /optimize's leaderCandles injection) and runs the Engle-Granger
+      // beta/spread OU fit (analytics/cointegration.ts) for display.
+      if (path === '/cointegration') {
+        try {
+          const cAsset = String(q.get('asset') ?? market.activeAsset)
+          const cTfv = tfStrict(q.get('tf'))
+          if (cTfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const cWindow = q.get('window') !== null ? Number(q.get('window')) : COINTEGRATION_WINDOW
+          const cLeaders = leadersFor(cAsset)
+          if (cLeaders.length === 0) {
+            return json(200, { ok: true, asset: cAsset, tf: cTfv, leader: null, result: null, direction: null, ts: Date.now() })
+          }
+          const leader = cLeaders[0]
+          const cCandles = market.getCandlesDeep(cAsset, cTfv, Math.max(600, cWindow + 50), true)
+          const leaderCandles = market.getCandlesDeep(leader, cTfv, Math.max(600, cWindow + 50), true)
+          const fit = fitCointegration(leaderCandles.map((c) => c.close), cCandles.map((c) => c.close), cWindow)
+          return json(200, {
+            ok: true,
+            asset: cAsset,
+            tf: cTfv,
+            leader,
+            price: cCandles[cCandles.length - 1]?.close ?? null,
+            result: fit,
+            direction: fit ? (fit.z <= -1.5 ? 'call' : fit.z >= 1.5 ? 'put' : null) : null,
+            ts: Date.now(),
+          })
+        } catch (err) {
+          return json(400, { ok: false, error: (err as Error).message })
+        }
+      }
+
+      // Volatility Arb: panel-facing twin of the volatility-arb strategy -
+      // close-to-close EWMA vol vs Parkinson range vol for this asset/tf.
+      if (path === '/volarb') {
+        try {
+          const vAsset = String(q.get('asset') ?? market.activeAsset)
+          const vTfv = tfStrict(q.get('tf'))
+          if (vTfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const vWindow = q.get('window') !== null ? Number(q.get('window')) : VOLARB_DEFAULT_WINDOW
+          const vCandles = market.getCandlesDeep(vAsset, vTfv, Math.max(300, vWindow + 50), true)
+          const out = computeVolArb(vCandles, vWindow)
+          return json(200, {
+            ok: true,
+            asset: vAsset,
+            tf: vTfv,
+            price: vCandles[vCandles.length - 1]?.close ?? null,
+            result: out,
+            ts: Date.now(),
+          })
         } catch (err) {
           return json(400, { ok: false, error: (err as Error).message })
         }

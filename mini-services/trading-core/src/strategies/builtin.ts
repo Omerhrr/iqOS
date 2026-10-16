@@ -22,6 +22,8 @@ import { realizedUpProb, ivFromPayout } from '../analytics/ivhv'
 import { engineVotes, combineVotes } from '../analytics/chartsignals'
 import { fitLeadLag, projectLeadLagSignal } from '../analytics/leadlag'
 import { distillChartSignals, DISTILL_DEFAULT_WINDOW } from '../analytics/chartsignalsdistill'
+import { fitCointegration, COINTEGRATION_WINDOW, COINTEGRATION_MIN_R2, COINTEGRATION_MIN_TSTAT, COINTEGRATION_MAX_HALFLIFE } from '../analytics/cointegration'
+import { computeVolArb, VOLARB_DEFAULT_WINDOW } from '../analytics/volarb'
 
 const last = (arr: number[]): number => {
   for (let i = arr.length - 1; i >= 0; i--) if (Number.isFinite(arr[i])) return arr[i]
@@ -1720,6 +1722,78 @@ export const STRATEGIES: StrategyDef[] = [
         score: clamp(Math.abs(out.filtered), 0, 100),
         notes: `Kalman-distilled vote ${out.filtered.toFixed(0)} (raw ${out.rawScore.toFixed(0)}, θ ${out.theta.toFixed(0)}, z ${out.z.toFixed(2)}, n=${out.n})`,
       }
+    },
+  },
+  {
+    id: 'cointegration-pairs',
+    name: 'Cointegration Pairs (Engle-Granger)',
+    description:
+      'Classic pairs trading, the OTHER half of intermarket analysis besides lead-lag: instead of a returns correlation (lead-lag-echo), this tests whether this asset\'s group leader and this asset share a stable long-run PRICE-LEVEL relationship - an OLS hedge ratio (beta) whose implied spread is itself mean-reverting (Engle-Granger, OU-fitted via analytics/cointegration.ts). Trades the spread reverting: CALL when this asset is cheap relative to the fitted leader relationship, PUT when rich. Reuses lead-lag\'s leader groups and leaderCandles hint, so it is only backtestable for assets that are an actual tracked follower (see analytics/leadlag.ts) - everything else honestly stands aside.',
+    params: [
+      { key: 'window', label: 'Beta/spread fit window (bars)', type: 'number', min: 60, max: 400, default: COINTEGRATION_WINDOW },
+      { key: 'minR2', label: 'Min beta fit quality (R²)', type: 'number', min: 0.1, max: 0.95, step: 0.05, default: COINTEGRATION_MIN_R2 },
+      { key: 'minTStat', label: 'Min spread reversion t-stat', type: 'number', min: 0.5, max: 5, step: 0.1, default: COINTEGRATION_MIN_TSTAT },
+      { key: 'maxHalfLife', label: 'Max spread half-life (bars)', type: 'number', min: 5, max: 200, default: COINTEGRATION_MAX_HALFLIFE },
+      { key: 'zEntry', label: 'Z entry threshold', type: 'number', min: 0.5, max: 4, step: 0.1, default: 1.5 },
+    ],
+    evaluate: (candles, p, hints) => {
+      const leaderCloses = hints?.leaderCandles
+      if (!leaderCloses || leaderCloses.length < 60 || candles.length < 60) {
+        return { direction: 'none', score: 0, notes: 'no leader history for this asset - not a tracked lead-lag/cointegration follower, or not enough bars yet' }
+      }
+      const fit = fitCointegration(leaderCloses.map((c) => c.close), candles.map((c) => c.close), num(p, 'window', COINTEGRATION_WINDOW))
+      if (!fit) return { direction: 'none', score: 0, notes: 'not enough overlapping history for the beta/spread fit' }
+      if (fit.r2 < num(p, 'minR2', COINTEGRATION_MIN_R2)) {
+        return { direction: 'none', score: 0, notes: `hedge-ratio fit R² ${fit.r2.toFixed(2)} too weak - not a reliable pair right now` }
+      }
+      if (fit.tStat < num(p, 'minTStat', COINTEGRATION_MIN_TSTAT)) {
+        return { direction: 'none', score: 0, notes: `spread not mean-reverting enough (t ${fit.tStat.toFixed(1)}) - beta fit OK but no cointegration edge` }
+      }
+      if (fit.halfLifeBars > num(p, 'maxHalfLife', COINTEGRATION_MAX_HALFLIFE)) {
+        return { direction: 'none', score: 0, notes: `spread half-life ${fit.halfLifeBars.toFixed(0)}b too slow to trade` }
+      }
+      const zEntry = num(p, 'zEntry', 1.5)
+      if (Math.abs(fit.z) < zEntry) {
+        return { direction: 'none', score: 0, notes: `spread z ${fit.z.toFixed(2)} inside ±${zEntry} - pair fairly priced right now` }
+      }
+      const dir = fit.z <= -zEntry ? 'call' : 'put'
+      const score = clamp(45 + (Math.abs(fit.z) - zEntry) * 18 + fit.r2 * 15, 40, 95)
+      return {
+        direction: dir,
+        score,
+        notes: `spread z ${fit.z.toFixed(2)} (β ${fit.beta.toFixed(3)}, R² ${fit.r2.toFixed(2)}, HL ${fit.halfLifeBars.toFixed(0)}b) - ${dir === 'call' ? 'cheap' : 'rich'} vs fitted leader relationship`,
+      }
+    },
+  },
+  {
+    id: 'volatility-arb',
+    name: 'Volatility Arb (Close-vs-Range)',
+    description:
+      'No options chain/IV surface exists on this platform (same honest limitation as mc-fairvalue-edge/ivhv-edge), so this arbs the two realized-vol estimators the raw OHLC feed DOES support instead: plain close-to-close EWMA vol vs the Parkinson high-low RANGE estimator (analytics/volarb.ts). When range vol dominates close vol, bars are wicking hard without net displacement - faded as exhaustion/failed-breakout microstructure. When close vol dominates range vol, price is grinding a steady net move without correspondingly wide bars - traded as continuation of that unusually orderly drift.',
+    params: [
+      { key: 'window', label: 'Vol estimation window (bars)', type: 'number', min: 20, max: 120, default: VOLARB_DEFAULT_WINDOW },
+      { key: 'ratioHigh', label: 'Range/close ratio - fade threshold', type: 'number', min: 1.1, max: 4, step: 0.1, default: 1.6 },
+      { key: 'ratioLow', label: 'Range/close ratio - continuation threshold', type: 'number', min: 0.1, max: 0.9, step: 0.05, default: 0.6 },
+    ],
+    evaluate: (candles, p) => {
+      if (candles.length < 30) return { direction: 'none', score: 0, notes: 'thin history - no honest read' }
+      const out = computeVolArb(candles, num(p, 'window', VOLARB_DEFAULT_WINDOW))
+      if (!out) return { direction: 'none', score: 0, notes: 'not enough history for the vol-arb read' }
+      const ratioHigh = num(p, 'ratioHigh', 1.6)
+      const ratioLow = num(p, 'ratioLow', 0.6)
+      if (out.ratio >= ratioHigh) {
+        if (out.lastBarDir === 0) return { direction: 'none', score: 0, notes: `range vol ${out.ratio.toFixed(2)}x close vol but last bar was a doji - no direction to fade` }
+        const dir = out.lastBarDir > 0 ? 'put' : 'call'
+        const score = clamp(45 + (out.ratio - ratioHigh) * 30, 40, 90)
+        return { direction: dir, score, notes: `range vol ${out.ratio.toFixed(2)}x close vol - wicking without follow-through, fading last bar's ${out.lastBarDir > 0 ? 'up' : 'down'} close` }
+      }
+      if (out.ratio <= ratioLow) {
+        if (out.momentum === 0) return { direction: 'none', score: 0, notes: `close vol dominant (ratio ${out.ratio.toFixed(2)}) but no net momentum to continue` }
+        const dir = out.momentum > 0 ? 'call' : 'put'
+        const score = clamp(45 + (ratioLow - out.ratio) * 40, 40, 90)
+        return { direction: dir, score, notes: `close vol ${(1 / Math.max(out.ratio, 1e-6)).toFixed(2)}x range vol - steady grind, continuing the ${dir === 'call' ? 'up' : 'down'} drift` }
+      }
+      return { direction: 'none', score: 0, notes: `range/close vol ratio ${out.ratio.toFixed(2)} - the two estimators agree, no arb edge` }
     },
   },
 ]
