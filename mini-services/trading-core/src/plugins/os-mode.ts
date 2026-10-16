@@ -42,11 +42,12 @@
 
 import type { Plugin, KernelContext } from '../kernel'
 import type { Store } from '../store'
-import type { Timeframe } from '../types'
+import type { AssetCategory, Timeframe } from '../types'
 import { ALL_TIMEFRAMES, TIMEFRAME_SECONDS } from '../types'
 import type { ScreenerService, ScreenRow } from './screener'
 import type { Screener2Service, ConfluenceRow } from './screener2'
 import type { MarketDataService } from './market-data'
+import type { ChartSignalsService, ChartScanResult } from './chartsignals'
 import type { AnalyticsService } from './analytics'
 import type { StrategyLabService } from './lab'
 import type { AdaptiveService } from './adaptive'
@@ -68,7 +69,7 @@ const finGte = (v: number, floor: number): boolean => Number.isFinite(v) && v >=
 
 export type OsMode = 'human' | 'auto'
 
-export type AutoTraderSource = 'screener' | 'kalman-ou' | 'markov' | 'momentum' | 'confluence' | 'strategy'
+export type AutoTraderSource = 'screener' | 'kalman-ou' | 'markov' | 'momentum' | 'confluence' | 'strategy' | 'chartsignals'
 
 /** Walk-forward validation verdict for the OU edge on one (asset, tf). */
 export interface OUVerdict {
@@ -354,7 +355,15 @@ const AUTOTRADER_NOTE = 'auto:os-trader'
  * autoEdgeBackfill; 'strategy' phase-gates its votes at the eval). Only these
  * sources can guarantee every placed trade is a FRESH edge, so only their
  * alerts carry the "why now" crossing note the pickers attach. */
-const SWEEP_SOURCES: readonly string[] = ['kalman-ou', 'markov', 'momentum', 'confluence']
+const SWEEP_SOURCES: readonly string[] = ['kalman-ou', 'markov', 'momentum', 'confluence', 'chartsignals']
+/** combineVotes' own qualifying floor is minAgree=3 (analytics/chartsignals.ts
+ * default) - every signal chartsignals.ts hands back already cleared that
+ * bar. Correlated engines (renko/range/P&F all read the same bar swings) can
+ * inflate `agree` without truly independent confirmation though, so this
+ * auto-trader source requires one MORE than the scanner's own floor before a
+ * candidate is pushed into the signal pool at all - extra margin against
+ * that known correlation, not a correction of it (future work). */
+const CHARTSIGNALS_MIN_AGREE = 4
 /** Liquid fallback evaluated on demand while the full screener sweep warms up. */
 const LIQUID_CANDIDATES = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'XAUUSD', 'BTCUSD']
 
@@ -533,7 +542,7 @@ export class ModeService {
         const num = (v: unknown, fb: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fb)
         this.config = {
           enabled: typeof c.enabled === 'boolean' ? c.enabled : DEFAULT_AUTOTRADER.enabled,
-          signalSource: (['screener', 'kalman-ou', 'markov', 'momentum', 'confluence', 'strategy'] as const).includes(c.signalSource as AutoTraderSource)
+          signalSource: (['screener', 'kalman-ou', 'markov', 'momentum', 'confluence', 'strategy', 'chartsignals'] as const).includes(c.signalSource as AutoTraderSource)
             ? (c.signalSource as AutoTraderSource)
             : DEFAULT_AUTOTRADER.signalSource,
           tf: (typeof c.tf === 'string' && (ALL_TIMEFRAMES as string[]).includes(c.tf) ? c.tf : DEFAULT_AUTOTRADER.tf) as Timeframe,
@@ -937,7 +946,9 @@ export class ModeService {
               ? `ADX ${row.adx.toFixed(0)} · RSI ${row.rsi.toFixed(0)} · Δ${row.changePct.toFixed(2)}% · edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)}`
               : this.config.signalSource === 'confluence'
                 ? `14-factor confluence ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`
-                : this.config.signalSource === 'strategy'
+                : this.config.signalSource === 'chartsignals'
+                  ? (row.note ?? `chart-signals vote ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`)
+                  : this.config.signalSource === 'strategy'
                   ? (row.note ?? `${this.effectiveStrategyIds().join('+') || 'strategy'} (${row.direction.toUpperCase()})`)
                   : `score ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} regime ${row.regime}`
       // Surface paper-vs-live right in the success line itself - this is the
@@ -988,6 +999,7 @@ export class ModeService {
     if (this.config.signalSource === 'markov') return this.pickMarkovSignal()
     if (this.config.signalSource === 'momentum') return this.pickMomentumSignal()
     if (this.config.signalSource === 'confluence') return this.pickConfluenceSignal()
+    if (this.config.signalSource === 'chartsignals') return this.pickChartSignalsSignal()
     if (this.config.signalSource === 'strategy') return this.pickStrategySignal()
     try {
       const screener = this.ctx.use<ScreenerService>('screener')
@@ -1323,6 +1335,85 @@ export class ModeService {
       // screener2/market not loaded - no signal source
     }
     return null
+    })
+  }
+
+  /**
+   * Chart-signals source: the chart-type scanner's own vote engine
+   * (plugins/chartsignals.ts - renko/P&F/range/tick/footprint|otcfootprint/
+   * heikin/candle votes combined by analytics/chartsignals.ts combineVotes
+   * into one signed score+direction). Same optional-plugin-access pattern as
+   * otcGuard/execution elsewhere in this file: chartSignals is read via
+   * ctx.use wrapped in try/catch, so a kernel without the plugin loaded just
+   * yields no signal, never a crash. Uses peek() (a synchronous cache read,
+   * since pickSignal() runs once per tick with no await) rather than scan()
+   * - the scanner already proactively rescans on bar close for any kind:tf
+   * combo a consumer has recently asked for, so peek() warms its own cache
+   * within one or two ticks and the picker never blocks on it.
+   */
+  private pickChartSignalsSignal(): ScreenRow | null {
+    return this.edgeSweep('chartsignals', (rec) => {
+      try {
+        const chartSignals = this.ctx.use<ChartSignalsService>('chartSignals')
+        const market = this.ctx.use<MarketDataService>('market')
+        const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
+        const pool = this.candidatePool(open)
+        const scan: ChartScanResult | null = chartSignals.peek('option', this.config.tf)
+        if (!scan) return null // cache cold - a background scan just started, try again next tick
+        const byAsset = new Map(scan.signals.map((s) => [s.asset, s]))
+        const candidates = [...LIQUID_CANDIDATES.filter((a) => pool.includes(a)), ...pool.filter((a) => !LIQUID_CANDIDATES.includes(a))]
+        for (const asset of candidates) {
+          if (this.assetBlocked(asset)) continue
+          const s = byAsset.get(asset)
+          if (!s) continue // no qualifying vote for this asset this scan
+          rec(asset)
+          // correlated-vote safety margin (see CHARTSIGNALS_MIN_AGREE) - above
+          // and beyond combineVotes' own minAgree floor every s already cleared
+          if (!finGte(s.agree, CHARTSIGNALS_MIN_AGREE)) continue
+          if (this.config.direction !== 'both' && s.direction !== this.config.direction) continue
+          const score = Math.round(clamp(s.strength, 0, 100)) * (s.direction === 'call' ? 1 : -1)
+          const confidence = Math.round(clamp(40 + s.strength * 0.5 + (s.agree - CHARTSIGNALS_MIN_AGREE) * 6, 35, 95))
+          // fail-closed gates: a NaN score/confidence must never qualify
+          if (!finGte(Math.abs(score), this.config.minScore)) continue
+          if (!finGte(confidence, this.config.minConfidence)) continue
+          const key = SweepEdgeMemory.key(asset, s.direction)
+          rec(asset, key)
+          if (this.sweepEdge.gate(key) === 'trade')
+            return {
+              asset,
+              name: s.name,
+              category: s.category as AssetCategory,
+              otc: s.otc,
+              tf: this.config.tf,
+              price: s.price,
+              score,
+              direction: s.direction,
+              confidence,
+              pUp: 0,
+              pDown: 0,
+              regime: 'range',
+              ouZ: 0,
+              ouHalfLife: 0,
+              ouMeanReverting: false,
+              ouTStat: 0,
+              rsi: 0,
+              adx: 0,
+              atrPct: 0,
+              hurst: 0,
+              changePct: 0,
+              payout: this.payoutFor(asset, 'binary'),
+              topPattern: null,
+              ts: s.ts,
+              computedTs: s.ts,
+              // why NOW: the vote engine's agreement just crossed this
+              // source's safety-margin bar for this candidate
+              note: `${s.agree}/${s.total} chart engines agree (${s.direction.toUpperCase()}), strength ${s.strength.toFixed(0)}`,
+            }
+        }
+      } catch {
+        // chartSignals/market not loaded - no signal source
+      }
+      return null
     })
   }
 
@@ -2081,13 +2172,15 @@ export class ModeService {
                 ? 'supertrend-follow'
                 : this.config.signalSource === 'confluence'
                   ? 'confluence-full'
-                  : this.config.signalSource === 'strategy'
-                    ? (row.strategyLabel ??
-                      (() => {
-                        const ids = this.effectiveStrategyIds()
-                        return ids.length > 1 ? `ensemble:${ids.join('+')}` : ids[0] ?? 'custom-strategy'
-                      })())
-                    : 'screener-auto',
+                  : this.config.signalSource === 'chartsignals'
+                    ? 'chartsignals-vote'
+                    : this.config.signalSource === 'strategy'
+                      ? (row.strategyLabel ??
+                        (() => {
+                          const ids = this.effectiveStrategyIds()
+                          return ids.length > 1 ? `ensemble:${ids.join('+')}` : ids[0] ?? 'custom-strategy'
+                        })())
+                      : 'screener-auto',
         note: AUTOTRADER_NOTE,
       })
     } catch {
@@ -2138,6 +2231,8 @@ export class ModeService {
         return 'supertrend-follow'
       case 'confluence':
         return 'confluence-full'
+      case 'chartsignals':
+        return 'chartsignals-vote'
       case 'screener':
         return 'screener-auto'
       default:
@@ -2520,7 +2615,7 @@ export class ModeService {
       // moment too - whatever qualifies NOW predates this arm
       if (this.config.enabled && !was && this.mode === 'auto') this.armAutoEdgeBackfill()
     }
-    if (patch.signalSource !== undefined && (['screener', 'kalman-ou', 'markov', 'momentum', 'confluence', 'strategy'] as const).includes(patch.signalSource as AutoTraderSource))
+    if (patch.signalSource !== undefined && (['screener', 'kalman-ou', 'markov', 'momentum', 'confluence', 'strategy', 'chartsignals'] as const).includes(patch.signalSource as AutoTraderSource))
       this.config.signalSource = patch.signalSource as AutoTraderSource
     // AUDIT FIX (Task 58, P2): tf used to be cast unchecked - a garbage tf
     // made every picker return nothing (silent "no signal" forever) and
@@ -2601,7 +2696,9 @@ export class ModeService {
             ? ` (ADX ≥ ${this.config.minAdx})`
             : this.config.signalSource === 'confluence'
               ? ' (full 14-factor panel engine, bar-fresh)'
-              : this.config.signalSource === 'strategy'
+              : this.config.signalSource === 'chartsignals'
+                ? ` (chart-type vote engine, agree ≥ ${CHARTSIGNALS_MIN_AGREE}/7)`
+                : this.config.signalSource === 'strategy'
                 ? (() => {
                     const ids = this.effectiveStrategyIds()
                     const pinCount = Object.keys(this.config.pairStrategy ?? {}).length

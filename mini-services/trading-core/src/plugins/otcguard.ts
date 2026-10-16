@@ -456,7 +456,7 @@ function mean(xs: number[]): number {
 function std(xs: number[]): number {
   if (xs.length < 2) return 0
   const m = mean(xs)
-  return Math.sqrt(xs.reduce((a, b) => a + (b - m) ** 2, 0) / xs.length)
+  return Math.sqrt(xs.reduce((a, b) => a + (b - m) ** 2, 0) / (xs.length - 1))
 }
 
 export const otcGuardPlugin: Plugin = {

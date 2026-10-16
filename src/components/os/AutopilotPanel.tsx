@@ -19,8 +19,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import type { AssetRow, AutoTraderConfig, BotConfig, BotRow, OsModeStatus, StrategyInfo, Timeframe, TradeKind, ValidationRow } from '@/lib/os/client'
-import { KIND_LABEL, TIMEFRAMES, fmtMoney, fmtTime, osGet, osPost } from '@/lib/os/client'
+import type { AssetRow, AutoTraderConfig, BotConfig, BotRow, OsModeStatus, OtcConfig, OtcPolicy, StrategyInfo, Timeframe, TradeKind, ValidationRow } from '@/lib/os/client'
+import { KIND_LABEL, TIMEFRAMES, fmtMoney, fmtTime, getOtcConfig, osGet, osPost, setOtcConfig } from '@/lib/os/client'
 
 const GATE_MAX_AGE_SEC = 14 * 24 * 60 * 60
 
@@ -1495,18 +1495,20 @@ function AutoTraderStrip({
                 ? `MOM·ADX≥${at.config.minAdx}`
                 : at.config.signalSource === 'confluence'
                   ? `CONFLUENCE·14F≥${at.config.minScore}`
-                  : at.config.signalSource === 'strategy'
-                    ? (() => {
-                        const ids = at.config.strategyIds?.length ? at.config.strategyIds : at.config.strategyId ? [at.config.strategyId] : []
-                        return ids.length === 0
-                          ? 'STRAT·none picked'
-                          : ids.length === 1
-                            ? `STRAT·${ids[0]}`
-                            : at.config.strategyPickMode === 'best'
-                              ? `AUTO-LEARN·${ids.length}`
-                              : `ENSEMBLE·${ids.length}≥${at.config.minConfidence}%`
-                      })()
-                    : `score ≥${at.config.minScore}`}
+                  : at.config.signalSource === 'chartsignals'
+                    ? `CHART-SIG·agree≥4`
+                    : at.config.signalSource === 'strategy'
+                      ? (() => {
+                          const ids = at.config.strategyIds?.length ? at.config.strategyIds : at.config.strategyId ? [at.config.strategyId] : []
+                          return ids.length === 0
+                            ? 'STRAT·none picked'
+                            : ids.length === 1
+                              ? `STRAT·${ids[0]}`
+                              : at.config.strategyPickMode === 'best'
+                                ? `AUTO-LEARN·${ids.length}`
+                                : `ENSEMBLE·${ids.length}≥${at.config.minConfidence}%`
+                        })()
+                      : `score ≥${at.config.minScore}`}
           {' · '}{at.config.tf} ·{' '}
           {at.config.stakePlan ? `compound seed $${at.config.stakePlan.base}` : `$${at.config.stake}`} · max {at.config.maxOpen}
           {at.config.marketScope === 'real' && <span className="text-emerald-400/80"> · REAL only</span>}
@@ -1670,6 +1672,37 @@ function AutoTraderDialog({
   const [d, setD] = useState<AutoTraderConfig>(config)
   const [busy, setBusy] = useState(false)
   const p = (patch: Partial<AutoTraderConfig>) => setD((prev) => ({ ...prev, ...patch }))
+  // OTC Guard policy: a separate backend config (plugins/otcguard.ts), not
+  // part of AutoTraderConfig - same "fetch on mount, save immediately on
+  // change" convention as the panel's research-gate toggle above (an
+  // independent global switch, not something batched into "Save config").
+  const [otc, setOtc] = useState<OtcConfig | null>(null)
+  const [otcBusy, setOtcBusy] = useState(false)
+  useEffect(() => {
+    let alive = true
+    getOtcConfig()
+      .then((res) => {
+        if (alive && res.ok) setOtc(res.config)
+      })
+      .catch(() => {
+        // OTC guard status is informational only - leave it null (unknown)
+      })
+    return () => {
+      alive = false
+    }
+  }, [])
+  const setOtcPolicy = async (policy: OtcPolicy) => {
+    if (!otc || otcBusy || otc.policy === policy) return
+    setOtcBusy(true)
+    try {
+      const res = await setOtcConfig({ policy })
+      if (res.ok) setOtc(res.config)
+    } catch {
+      // leave the last known policy showing rather than guessing
+    } finally {
+      setOtcBusy(false)
+    }
+  }
   // SINGLE vs POOL strategy selection. SINGLE = exactly one strategy runs
   // every non-pinned pair (picking one replaces the last - what the picker
   // always should have done; the old toggle-many picker silently turned a
@@ -1733,6 +1766,45 @@ function AutoTraderDialog({
             no more &quot;not a turbo/binary/digital instrument&quot; rejection spam. {nonOptionTickers.size > 0 && `${nonOptionTickers.size} instrument(s) on this account are CFD-only.`}
           </p>
 
+          {/* ---------- OTC GUARD ---------- */}
+          <div className="col-span-2 mt-1 flex items-center gap-2">
+            <span className="text-[9px] font-bold uppercase tracking-[0.18em] text-violet-400/80">OTC Guard</span>
+            <span className="h-px flex-1 bg-[#1c2739]" />
+          </div>
+          <div className="col-span-2">
+            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Policy</Label>
+            <div className="flex overflow-hidden rounded border border-[#1c2739]">
+              {(
+                [
+                  ['enforce', 'Enforce'],
+                  ['warn', 'Warn'],
+                  ['off', 'Off'],
+                ] as const
+              ).map(([v, label]) => (
+                <button
+                  key={v}
+                  type="button"
+                  disabled={!otc || otcBusy}
+                  onClick={() => setOtcPolicy(v)}
+                  className={`flex-1 px-1.5 py-1.5 font-mono text-[10px] uppercase tracking-wider transition-colors disabled:opacity-50 ${
+                    otc?.policy === v ? 'bg-violet-500/20 text-violet-300' : 'text-[#4b5a72] hover:text-[#aab6cc]'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+              {otc === null
+                ? 'loading OTC guard status…'
+                : otc.policy === 'enforce'
+                  ? 'Enforce blocks trades on OTC pairs the guard can\'t confirm have real edge over a synthetic placebo (run /otc_defense_run, or let the copilot run it) - the strictest, safest setting.'
+                  : otc.policy === 'warn'
+                    ? 'Warn logs a placebo-test warning on every OTC trade but still lets it through - visibility without the block.'
+                    : 'Off disables the OTC placebo check entirely - OTC pairs trade on raw TA signals with no defense against generator-driven noise.'}
+            </p>
+          </div>
+
           {/* ---------- SIGNAL ---------- */}
           <div className="col-span-2 mt-1 flex items-center gap-2">
             <span className="text-[9px] font-bold uppercase tracking-[0.18em] text-cyan-400/80">Signal</span>
@@ -1748,6 +1820,7 @@ function AutoTraderDialog({
                   ['markov', 'Markov'],
                   ['momentum', 'Momentum'],
                   ['confluence', 'Confluence'],
+                  ['chartsignals', 'Chart-signals'],
                   ['strategy', 'Strategy'],
                 ] as const
               ).map(([v, label]) => (
@@ -1772,7 +1845,9 @@ function AutoTraderDialog({
                     ? 'trend continuation: CALL when ADX-confirmed strength, a positive rate-of-change and RSI on the bullish side of mid line up, PUT mirrored - skips statistically exhausted extremes'
                     : d.signalSource === 'confluence'
                       ? 'the EXACT 14-factor Confluence Signal panel/confluence_read engine, re-fit bar-fresh on each candidate (full Kalman/OU, not the screener sweep\'s cheaper approximation) - identical read to what the panel/copilot would show for that pair right now'
-                      : d.signalSource === 'strategy'
+                      : d.signalSource === 'chartsignals'
+                        ? 'the chart-type vote engine (renko/point-and-figure/range/tick/footprint/Heikin-Ashi/candle) that also feeds the Signal Panel - CALL/PUT follows whichever side a qualifying majority of those engines agree on, with a stricter agreement floor than the panel\'s own (≥4 of 7 engines, not just 3) since several of them read the same bar swings and can agree for correlated, not independent, reasons'
+                        : d.signalSource === 'strategy'
                         ? 'one specific strategy picked below, or several combined - as a vote (ENSEMBLE) or an AUTO-LEARN pool that trades whichever member is proven best per pair - the same strategyId an autopilot bot would use (a builtin strategy, or an AI Lab-learned "(Lab)" spec), not pinned to one bot\'s watchlist'
                         : 'takes the strongest full-composite screener signals market-wide (trend + momentum + statistical + patterns)'}
             </p>

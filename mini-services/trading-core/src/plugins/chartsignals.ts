@@ -345,6 +345,31 @@ export class ChartSignalsService {
     return this.sliceTop(this.filterFresh(await p, now), top)
   }
 
+  /** Synchronous cache peek for callers that can't await a scan (the
+   * auto-trader's pickSignal() runs once per tick, synchronously, across
+   * every signal source). Returns the last completed scan for kind:tf when
+   * it's still within CACHE_MS, and kicks off a background scan (same
+   * dedup as scan() via `scanning`) when the cache is missing or stale -
+   * never blocking the caller; the NEXT tick sees the fresh result once it
+   * lands. Marks the combo active exactly like scan() so the proactive
+   * bar-close rescan stays armed for it. */
+  peek(kind: SignalKind, tf: Timeframe): ChartScanResult | null {
+    this.activeCombos.set(`${kind}:${tf}`, Date.now())
+    const key = `${kind}:${tf}`
+    const now = Date.now()
+    const cached = this.cache.get(key)
+    const fresh = cached && now - cached.ts < CACHE_MS ? this.filterFresh(cached.result, now) : null
+    if ((!cached || now - cached.ts >= CACHE_MS) && !this.scanning.has(key)) {
+      const p = this.scanOnce(kind, tf).then((r) => {
+        this.cache.set(key, { ts: r.ts, result: r })
+        this.scanning.delete(key)
+        return r
+      })
+      this.scanning.set(key, p)
+    }
+    return fresh
+  }
+
   private sliceTop(r: ChartScanResult, top: number): ChartScanResult {
     if (top <= 0 || r.signals.length <= top) return r
     const signals = r.signals.slice(0, top)
