@@ -860,6 +860,100 @@ export async function setOtcConfig(patch: Partial<OtcConfig>): Promise<{ ok: boo
   return osPost<{ ok: boolean; config: OtcConfig }>('/otc_config', patch)
 }
 
+// ---------- tradeability: single combined readout ----------
+
+export interface TradeabilityResult {
+  ok: boolean
+  asset: string
+  tf: Timeframe
+  strategy: string | null
+  verdict: 'favorable' | 'caution' | 'avoid' | 'inconclusive'
+  score: number
+  reason: string
+  structure: {
+    state: 'detected' | 'none'
+    hurst: number
+    hurstNote: string
+    acfMaxAbs: number
+    acfSignificance: number
+    markovRegime: string
+    markovEntropy: number
+    markovTrendiness: number
+  }
+  randomness: {
+    state: 'normal' | 'fat_tailed' | 'unknown'
+    excessKurtosis: number
+    stdDevReturns: number
+    meanAbsStep: number
+    n: number
+    dataSource: 'tick' | 'candle'
+  }
+  guard: {
+    state: 'edge' | 'weak' | 'no_edge' | 'inconclusive' | 'not_tested' | 'skipped'
+    isOtc: boolean
+    strategy: string | null
+    detail: {
+      ok: boolean
+      asset: string
+      strategyKey: string
+      isOtc: boolean
+      policy: OtcPolicy
+      verdict: { verdict: OtcVerdictClass; edgeZ: number; realWinRate: number; realTrades: number; placeboWrMean: number; placeboSeries: number; calibrationSource: 'tick' | 'candle'; ts: number } | null
+    } | null
+  }
+}
+
+export async function getTradeability(asset: string, tf: Timeframe, strategy?: string | null): Promise<TradeabilityResult> {
+  return osGet<TradeabilityResult>('/tradeability', { asset, tf, strategy: strategy ?? undefined })
+}
+
+// ---------- soak report: supervised paper-trading diagnostics ----------
+
+export interface SoakReport {
+  ok: boolean
+  sinceMs: number
+  sinceTs: number
+  generatedAt: number
+  alertsInWindow: number
+  trades: {
+    dataAvailable: boolean
+    total: number
+    nonAutoTraderPositions: number
+    byMode: { paper: number; live: number }
+    byOutcome: { won: number; lost: number; push: number; open: number; closed: number }
+    bySource: Record<string, number>
+  }
+  settlement: {
+    dataAvailable: boolean
+    stillAwaitingIqConfirmationCount: number
+    recentStillAwaiting: AlertRow[]
+    stuckOpenPositions: { id: string; asset: string; settlesAt?: number; secondsPastExpiry: number }[]
+    noBrokerOrderIdSettledCount: number
+    iqSessionLostCount: number
+    brokerLookupFailingCount: number
+    errorAlertCount: number
+  }
+  otcGuard: {
+    dataAvailable: boolean
+    policy: OtcPolicy
+    blockedCount: number
+    consultedCount: number | null
+    consultedCountAvailable: boolean
+    consultedCountNote: string
+    verdictRunsInWindow: number
+    verdictsByResult: { robust: number; weak: number; failed: number }
+  }
+  chartsignals:
+    | { dataAvailable: true; tradeCount: number; samples: number; avgAgree: number; avgTotal: number; avgAgreePct: number }
+    | { dataAvailable: false; tradeCount: number; note: string }
+  standdowns: { reason: string; count: number }[]
+}
+
+/** sinceMs: how far back to summarize (default 24h). */
+export async function getSoakReport(sinceMs = 24 * 60 * 60 * 1000): Promise<SoakReport> {
+  return osGet<SoakReport>('/soak_report', { sinceMs })
+}
+
 /** /otc_forensics - fair-coin drift probe over the broker's own OTC feed. */
 export interface OtcForensics {
   ok: boolean
@@ -2130,7 +2224,7 @@ export type OsMode = 'human' | 'auto'
 
 export interface AutoTraderConfig {
   enabled: boolean
-  signalSource: 'screener' | 'kalman-ou' | 'markov' | 'momentum' | 'confluence' | 'strategy' | 'chartsignals'
+  signalSource: 'screener' | 'kalman-ou' | 'markov' | 'momentum' | 'confluence' | 'strategy' | 'chartsignals' | 'leadlag'
   tf: Timeframe
   /** The trade's own expiry, as a timeframe - SEPARATE from `tf` (which
    * candles signals are read from). Unset = old behavior (expiry tracks tf

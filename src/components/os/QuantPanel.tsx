@@ -2,8 +2,8 @@
 
 // IQAIR//OS - Quant lab panel: Hurst, vol models, ACF, Monte Carlo fan, S/R zones
 import { useEffect, useMemo, useState } from 'react'
-import type { AnalysisResult, Factor, OsModeStatus, OUVerdict, RandomnessAudit, OtcStatus, OtcConfig, OtcDefenseReport, OtcVerdictRow, OtcPolicy, OtcForensics, StrategyInfo, Timeframe } from '@/lib/os/client'
-import { fmtPrice, getRandomnessAudit, getOtcStatus, getOtcVerdicts, getOtcConfig, setOtcConfig, runOtcDefense, getOtcForensics, osGet, osPost, TIMEFRAMES } from '@/lib/os/client'
+import type { AnalysisResult, Factor, OsModeStatus, OUVerdict, RandomnessAudit, OtcStatus, OtcConfig, OtcDefenseReport, OtcVerdictRow, OtcPolicy, OtcForensics, StrategyInfo, Timeframe, TradeabilityResult } from '@/lib/os/client'
+import { fmtPrice, getRandomnessAudit, getOtcStatus, getOtcVerdicts, getOtcConfig, setOtcConfig, runOtcDefense, getOtcForensics, getTradeability, osGet, osPost, TIMEFRAMES } from '@/lib/os/client'
 import { StrategyPicker } from './BacktestLab'
 
 /** Small chip showing a factor's live contribution to the composite signal score. */
@@ -294,6 +294,107 @@ function OuZStrip({ z }: { z: (number | null)[] }) {
  * (is it closer to a pure random walk, or does it show detectable structure
  * like fat tails or a metronomic update schedule).
  */
+const TRADEABILITY_STYLE: Record<string, { label: string; color: string; bg: string }> = {
+  favorable: { label: 'FAVORABLE', color: '#10b981', bg: 'rgba(16,185,129,0.14)' },
+  caution: { label: 'CAUTION', color: '#f59e0b', bg: 'rgba(245,158,11,0.14)' },
+  avoid: { label: 'AVOID', color: '#f43f5e', bg: 'rgba(244,63,94,0.14)' },
+  inconclusive: { label: 'INCONCLUSIVE', color: '#aab6cc', bg: 'rgba(170,182,204,0.14)' },
+}
+
+/** Small colored dot for a component's categorical read (green/amber/red/gray). */
+function Dot({ color }: { color: string }) {
+  return <span className="mr-1.5 inline-block h-1.5 w-1.5 rounded-full align-middle" style={{ background: color }} />
+}
+
+/**
+ * Tradeability - the single combined "is this worth trading right now"
+ * readout. Synthesizes Quant Lab's structure stats, the randomness audit
+ * (OTC feed fingerprint), and any cached OTC Guard verdict into one verdict,
+ * so the user doesn't have to check three panels and combine the signals
+ * themselves. Purely a summary - the detailed panels below stay as-is.
+ */
+function TradeabilityCard({ asset, tf }: { asset: string; tf: string }) {
+  const [data, setData] = useState<TradeabilityResult | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    setData(null)
+    setError(null)
+    getTradeability(asset, tf as never, 'confluence-core')
+      .then(setData)
+      .catch((e: Error) => setError(e.message.slice(0, 160)))
+  }, [asset, tf])
+
+  const style = data ? TRADEABILITY_STYLE[data.verdict] ?? TRADEABILITY_STYLE.inconclusive : null
+
+  const structureColor = data?.structure.state === 'detected' ? '#10b981' : '#aab6cc'
+  const structureLabel = data?.structure.state === 'detected' ? 'structure detected' : 'no structure (random-walk)'
+
+  const randomnessColor =
+    data?.randomness.state === 'fat_tailed' ? '#f59e0b' : data?.randomness.state === 'unknown' ? '#aab6cc' : '#10b981'
+  const randomnessLabel =
+    data?.randomness.state === 'fat_tailed' ? 'fat-tailed returns' : data?.randomness.state === 'unknown' ? 'not enough tick data' : 'normal-ish returns'
+
+  const guardColor =
+    data?.guard.state === 'edge'
+      ? '#10b981'
+      : data?.guard.state === 'no_edge'
+        ? '#f43f5e'
+        : data?.guard.state === 'weak'
+          ? '#38bdf8'
+          : '#aab6cc'
+  const guardLabel =
+    data?.guard.state === 'edge'
+      ? 'edge verified'
+      : data?.guard.state === 'weak'
+        ? 'weak edge'
+        : data?.guard.state === 'no_edge'
+          ? 'no edge'
+          : data?.guard.state === 'skipped'
+            ? 'not applicable (not OTC)'
+            : 'not yet tested' // inconclusive / not_tested - honest, never a fabricated edge
+
+  return (
+    <div className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-3 xl:col-span-2">
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <h3 className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">Tradeability · Combined Readout</h3>
+        {style && (
+          <span
+            className="rounded px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-wider"
+            style={{ color: style.color, background: style.bg }}
+          >
+            {style.label} · {data!.score.toFixed(0)}
+          </span>
+        )}
+      </div>
+      {error && <p className="font-mono text-[10px] text-rose-400">{error}</p>}
+      {!data && !error && <p className="text-[10px] text-[#4b5a72]">Loading combined readout…</p>}
+      {data && (
+        <>
+          <p className="mb-2 text-[10px] leading-relaxed text-[#aab6cc]">{data.reason}</p>
+          <div className="grid grid-cols-1 gap-1 font-mono text-[10px] sm:grid-cols-3">
+            <div className="flex items-center" title={`Hurst ${data.structure.hurst.toFixed(2)} · Markov entropy ${data.structure.markovEntropy.toFixed(2)}`}>
+              <Dot color={structureColor} />
+              <span className="text-[#7c8aa5]">structure:</span>&nbsp;
+              <span style={{ color: structureColor }}>{structureLabel}</span>
+            </div>
+            <div className="flex items-center" title={`excess kurtosis ${data.randomness.excessKurtosis.toFixed(2)} · n=${data.randomness.n}`}>
+              <Dot color={randomnessColor} />
+              <span className="text-[#7c8aa5]">randomness:</span>&nbsp;
+              <span style={{ color: randomnessColor }}>{randomnessLabel}</span>
+            </div>
+            <div className="flex items-center" title={data.guard.detail?.verdict ? `edgeZ ${data.guard.detail.verdict.edgeZ.toFixed(2)}` : 'no cached OTC Guard verdict'}>
+              <Dot color={guardColor} />
+              <span className="text-[#7c8aa5]">guard:</span>&nbsp;
+              <span style={{ color: guardColor }}>{guardLabel}</span>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
 function RandomnessAuditCard({ asset, tf }: { asset: string; tf: string }) {
   const [audit, setAudit] = useState<RandomnessAudit | null>(null)
   const [busy, setBusy] = useState(false)
@@ -778,6 +879,7 @@ export default function QuantPanel({ analysis, strategies = [] }: { analysis: An
 
   return (
     <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+      <TradeabilityCard asset={analysis.asset} tf={analysis.tf} />
       <div className="xl:col-span-2 text-[10px] text-[#4b5a72]">
         {linkedCount} of the stats below are live inputs to your composite signal score (currently{' '}
         <span className={analysis.signal.direction === 'call' ? 'text-emerald-400' : analysis.signal.direction === 'put' ? 'text-rose-400' : 'text-[#aab6cc]'}>

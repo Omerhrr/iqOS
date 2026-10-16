@@ -30,6 +30,7 @@ import WatchdogPanel from './WatchdogPanel'
 import ResearchPanel from './ResearchPanel'
 import OrderFlowPanel from './OrderFlowPanel'
 import OtcFootprintPanel from './OtcFootprintPanel'
+import DiagnosticsPanel from './DiagnosticsPanel'
 import { FullscreenBackdrop, FullscreenButton } from './FullscreenButton'
 
 interface BottomTabsProps {
@@ -121,6 +122,7 @@ export default function BottomTabs(props: BottomTabsProps) {
             ['otcfootprint', 'OTC Footprint'],
             ['patterns', `Patterns (${patterns.length})`],
             ['alerts', 'Alerts'],
+            ['diagnostics', 'Diagnostics'],
           ] as [string, string][]
         ).map(([v, label]) => (
           <TabsTrigger
@@ -396,6 +398,13 @@ export default function BottomTabs(props: BottomTabsProps) {
             </div>
           )}
         </div>
+      </TabsContent>
+
+      {/* DIAGNOSTICS / SOAK TEST: a single-glance "did the auto-trader run
+          cleanly" report, built from persisted positions/alerts/otc_verdicts -
+          for judging an unattended paper-trading soak run after the fact. */}
+      <TabsContent value="diagnostics" className="mt-0 min-h-0 flex-1 overflow-hidden">
+        <DiagnosticsPanel onError={onError} />
       </TabsContent>
       </Tabs>
     </>

@@ -56,6 +56,7 @@ import { getStrategy, defaultParams, STRATEGIES } from '../strategies/builtin'
 import { classifyRegime } from '../analytics/regime'
 import { classifySession } from '../analytics/session'
 import { SweepEdgeMemory } from '../analytics/edge'
+import { fitLeadLag, projectLeadLagSignal } from '../analytics/leadlag'
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
 /** NaN-safe comparison for trade gates. Thin-history screener rows can carry
@@ -69,7 +70,7 @@ const finGte = (v: number, floor: number): boolean => Number.isFinite(v) && v >=
 
 export type OsMode = 'human' | 'auto'
 
-export type AutoTraderSource = 'screener' | 'kalman-ou' | 'markov' | 'momentum' | 'confluence' | 'strategy' | 'chartsignals'
+export type AutoTraderSource = 'screener' | 'kalman-ou' | 'markov' | 'momentum' | 'confluence' | 'strategy' | 'chartsignals' | 'leadlag'
 
 /** Walk-forward validation verdict for the OU edge on one (asset, tf). */
 export interface OUVerdict {
@@ -355,17 +356,48 @@ const AUTOTRADER_NOTE = 'auto:os-trader'
  * autoEdgeBackfill; 'strategy' phase-gates its votes at the eval). Only these
  * sources can guarantee every placed trade is a FRESH edge, so only their
  * alerts carry the "why now" crossing note the pickers attach. */
-const SWEEP_SOURCES: readonly string[] = ['kalman-ou', 'markov', 'momentum', 'confluence', 'chartsignals']
-/** combineVotes' own qualifying floor is minAgree=3 (analytics/chartsignals.ts
- * default) - every signal chartsignals.ts hands back already cleared that
- * bar. Correlated engines (renko/range/P&F all read the same bar swings) can
- * inflate `agree` without truly independent confirmation though, so this
- * auto-trader source requires one MORE than the scanner's own floor before a
- * candidate is pushed into the signal pool at all - extra margin against
- * that known correlation, not a correction of it (future work). */
-const CHARTSIGNALS_MIN_AGREE = 4
+const SWEEP_SOURCES: readonly string[] = ['kalman-ou', 'markov', 'momentum', 'confluence', 'chartsignals', 'leadlag']
+/** analytics/chartsignals.ts combineVotes() now groups the 7 raw chart
+ * engines into 5 independent-METHODOLOGY families before counting `agree`
+ * - renko/range/P&F (all "price crossed N ATR-thresholds" read three ways)
+ * collapse into ONE price-threshold family vote, so they can only ever
+ * contribute a single "agree" between them instead of three. combineVotes'
+ * own qualifying floor is minAgree=2 of 5 families (~40%) - every signal
+ * chartsignals.ts hands back already cleared that bar. This auto-trader
+ * source keeps the same "+1 above the scanner's own floor" safety margin
+ * that existed before the family fix (the margin was never a correction of
+ * the correlation, the family grouping is - this is just extra headroom on
+ * top): 2 + 1 = 3 of 5 families (~57%), which reproduces the original
+ * 4-of-7 (~57%) intent on the new family-counted scale rather than the old
+ * raw-engine scale. (Previously: minAgree=3/7 default + 1 margin = 4/7,
+ * before the price-threshold trio was collapsed into one family.) */
+const CHARTSIGNALS_MIN_AGREE = 3
 /** Liquid fallback evaluated on demand while the full screener sweep warms up. */
 const LIQUID_CANDIDATES = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'XAUUSD', 'BTCUSD']
+
+/** Secondary pairs the lead-lag source will fit EUR/USD's rolling
+ * cross-correlation against: USD-crosses (share the quote currency, so
+ * typically move in sync with or opposite EUR/USD depending on dollar
+ * direction) and EUR-crosses (share the base currency, so move with
+ * EUR/USD when EUR itself - not USD - is the driver). OTC variants are
+ * included automatically: assetBlocked/candidatePool operate on whatever
+ * is actually open, and ModeService.stripOtc-style matching isn't needed
+ * here since the leader is always the non-OTC 'EURUSD' feed - only the
+ * follower side can be an '-OTC' ticker. */
+const LEADLAG_FOLLOWERS = ['GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'EURGBP', 'EURJPY', 'EURCHF']
+/** Below this |correlation| at the fitted lag, the relationship is too
+ * weak to trade on - require a moderately strong rolling fit, not just
+ * "whichever lag happened to score highest among weak noise". */
+const LEADLAG_MIN_ABS_CORRELATION = 0.35
+/** Below this |z|, the leader's "trigger" move isn't unusual enough to be
+ * treated as the kind of macro shock lead-lag trading is meant to catch -
+ * ordinary chop shouldn't fire a signal just because the fit says *some*
+ * lag correlates. */
+const LEADLAG_MIN_TRIGGER_Z = 1.0
+/** Bars of EUR/USD + follower history fetched per fit - generous enough
+ * for the rolling-correlation search (maxLag up to 10) and the trigger's
+ * own 60-bar z-score window to both have real sample sizes. */
+const LEADLAG_LOOKBACK_BARS = 240
 
 interface AutoRuntime {
   dayKey: string
@@ -542,7 +574,7 @@ export class ModeService {
         const num = (v: unknown, fb: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fb)
         this.config = {
           enabled: typeof c.enabled === 'boolean' ? c.enabled : DEFAULT_AUTOTRADER.enabled,
-          signalSource: (['screener', 'kalman-ou', 'markov', 'momentum', 'confluence', 'strategy', 'chartsignals'] as const).includes(c.signalSource as AutoTraderSource)
+          signalSource: (['screener', 'kalman-ou', 'markov', 'momentum', 'confluence', 'strategy', 'chartsignals', 'leadlag'] as const).includes(c.signalSource as AutoTraderSource)
             ? (c.signalSource as AutoTraderSource)
             : DEFAULT_AUTOTRADER.signalSource,
           tf: (typeof c.tf === 'string' && (ALL_TIMEFRAMES as string[]).includes(c.tf) ? c.tf : DEFAULT_AUTOTRADER.tf) as Timeframe,
@@ -948,7 +980,9 @@ export class ModeService {
                 ? `14-factor confluence ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`
                 : this.config.signalSource === 'chartsignals'
                   ? (row.note ?? `chart-signals vote ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`)
-                  : this.config.signalSource === 'strategy'
+                  : this.config.signalSource === 'leadlag'
+                    ? (row.note ?? `EUR/USD lead-lag ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`)
+                    : this.config.signalSource === 'strategy'
                   ? (row.note ?? `${this.effectiveStrategyIds().join('+') || 'strategy'} (${row.direction.toUpperCase()})`)
                   : `score ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} regime ${row.regime}`
       // Surface paper-vs-live right in the success line itself - this is the
@@ -1000,6 +1034,7 @@ export class ModeService {
     if (this.config.signalSource === 'momentum') return this.pickMomentumSignal()
     if (this.config.signalSource === 'confluence') return this.pickConfluenceSignal()
     if (this.config.signalSource === 'chartsignals') return this.pickChartSignalsSignal()
+    if (this.config.signalSource === 'leadlag') return this.pickLeadLagSignal()
     if (this.config.signalSource === 'strategy') return this.pickStrategySignal()
     try {
       const screener = this.ctx.use<ScreenerService>('screener')
@@ -1407,11 +1442,104 @@ export class ModeService {
               computedTs: s.ts,
               // why NOW: the vote engine's agreement just crossed this
               // source's safety-margin bar for this candidate
-              note: `${s.agree}/${s.total} chart engines agree (${s.direction.toUpperCase()}), strength ${s.strength.toFixed(0)}`,
+              note: `${s.agree}/${s.total} independent chart methodologies agree (${s.direction.toUpperCase()}), strength ${s.strength.toFixed(0)}`,
             }
         }
       } catch {
         // chartSignals/market not loaded - no signal source
+      }
+      return null
+    })
+  }
+
+  /**
+   * EUR/USD lead-lag source: intermarket analysis, not technical analysis
+   * on the follower itself. For each candidate in LEADLAG_FOLLOWERS, fits a
+   * rolling cross-correlation between EUR/USD's returns and the follower's
+   * returns across lags 0..10 bars (analytics/leadlag.ts fitLeadLag), picks
+   * whichever lag correlates strongest, and - only when that fit is strong
+   * enough (LEADLAG_MIN_ABS_CORRELATION) AND EUR/USD's own move at that lag
+   * offset back was itself unusual (LEADLAG_MIN_TRIGGER_Z) - projects the
+   * same (or, for a negative fit, opposite) direction onto the follower
+   * right now. A weak or merely-average EUR/USD wiggle never fires a
+   * signal here, by design: the whole premise is "a macro shock in the
+   * world's most liquid pair ripples outward", not "these two series are
+   * generally correlated".
+   */
+  private pickLeadLagSignal(): ScreenRow | null {
+    return this.edgeSweep('leadlag', (rec) => {
+      try {
+        const market = this.ctx.use<MarketDataService>('market')
+        const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
+        if (!open.includes('EURUSD')) return null // leader itself not tradeable right now - nothing to lead with
+        const leaderCandles = market.getCandles('EURUSD', this.config.tf, LEADLAG_LOOKBACK_BARS, true)
+        if (leaderCandles.length < 30) return null // too little leader history to fit any lag honestly
+        const leaderCloses = leaderCandles.map((c) => c.close)
+        const pool = this.candidatePool(open)
+        const candidates = LEADLAG_FOLLOWERS.filter((a) => pool.includes(a))
+        for (const asset of candidates) {
+          if (this.assetBlocked(asset)) continue
+          try {
+            const followerCandles = market.getCandles(asset, this.config.tf, LEADLAG_LOOKBACK_BARS, true)
+            rec(asset)
+            if (followerCandles.length < 30) continue // thin history for this follower - try the next
+            const followerCloses = followerCandles.map((c) => c.close)
+            const fit = fitLeadLag(leaderCloses, followerCloses, 10)
+            if (fit.n < 10) continue // not enough overlapping bars at the winning lag to trust it
+            if (!finGte(Math.abs(fit.correlation), LEADLAG_MIN_ABS_CORRELATION)) continue
+            const signal = projectLeadLagSignal(fit, leaderCloses)
+            if (!signal) continue
+            if (!finGte(Math.abs(signal.triggerZ), LEADLAG_MIN_TRIGGER_Z)) continue
+            const dir = signal.direction
+            if (this.config.direction !== 'both' && dir !== this.config.direction) continue
+            const corrStrength = clamp(Math.abs(fit.correlation), 0, 1)
+            const zStrength = clamp(Math.abs(signal.triggerZ) / 4, 0, 1) // z=4 treated as maxed-out "very unusual"
+            const score = Math.round(clamp(corrStrength * 100, 0, 100)) * (dir === 'call' ? 1 : -1)
+            const confidence = Math.round(clamp(35 + corrStrength * 35 + zStrength * 25, 35, 95))
+            if (!finGte(Math.abs(score), this.config.minScore)) continue
+            if (!finGte(confidence, this.config.minConfidence)) continue
+            const key = SweepEdgeMemory.key(asset, dir)
+            rec(asset, key)
+            if (this.sweepEdge.gate(key) === 'trade') {
+              const inst = market.assets.find((a) => a.ticker === asset)
+              return {
+                asset,
+                name: inst?.name ?? asset,
+                category: (inst?.category ?? 'forex') as AssetCategory,
+                otc: inst?.otc ?? asset.endsWith('-OTC'),
+                tf: this.config.tf,
+                price: followerCandles[followerCandles.length - 1]?.close ?? 0,
+                score,
+                direction: dir,
+                confidence,
+                pUp: 0,
+                pDown: 0,
+                regime: 'range',
+                ouZ: 0,
+                ouHalfLife: 0,
+                ouMeanReverting: false,
+                ouTStat: 0,
+                rsi: 0,
+                adx: 0,
+                atrPct: 0,
+                hurst: 0,
+                changePct: 0,
+                payout: this.payoutFor(asset, 'binary'),
+                topPattern: null,
+                ts: this.now(),
+                computedTs: this.now(),
+                // why NOW: EUR/USD's own move (the trigger) was unusual enough,
+                // and the fitted lag/correlation says this follower should
+                // echo it in this direction - both bars just cleared, together
+                note: `EURUSD moved ${(signal.triggerReturn * 100).toFixed(2)}% (z ${signal.triggerZ.toFixed(1)}) ${fit.lag} bar${fit.lag === 1 ? '' : 's'} ago · corr ${fit.correlation.toFixed(2)} at lag ${fit.lag} → ${dir.toUpperCase()}`,
+              }
+            }
+          } catch {
+            // thin history/candle fetch failed for this follower - try the next
+          }
+        }
+      } catch {
+        // market service not loaded - no signal source
       }
       return null
     })
@@ -2174,7 +2302,9 @@ export class ModeService {
                   ? 'confluence-full'
                   : this.config.signalSource === 'chartsignals'
                     ? 'chartsignals-vote'
-                    : this.config.signalSource === 'strategy'
+                    : this.config.signalSource === 'leadlag'
+                      ? 'eurusd-leadlag'
+                      : this.config.signalSource === 'strategy'
                       ? (row.strategyLabel ??
                         (() => {
                           const ids = this.effectiveStrategyIds()
@@ -2233,6 +2363,8 @@ export class ModeService {
         return 'confluence-full'
       case 'chartsignals':
         return 'chartsignals-vote'
+      case 'leadlag':
+        return 'eurusd-leadlag'
       case 'screener':
         return 'screener-auto'
       default:
@@ -2615,7 +2747,7 @@ export class ModeService {
       // moment too - whatever qualifies NOW predates this arm
       if (this.config.enabled && !was && this.mode === 'auto') this.armAutoEdgeBackfill()
     }
-    if (patch.signalSource !== undefined && (['screener', 'kalman-ou', 'markov', 'momentum', 'confluence', 'strategy', 'chartsignals'] as const).includes(patch.signalSource as AutoTraderSource))
+    if (patch.signalSource !== undefined && (['screener', 'kalman-ou', 'markov', 'momentum', 'confluence', 'strategy', 'chartsignals', 'leadlag'] as const).includes(patch.signalSource as AutoTraderSource))
       this.config.signalSource = patch.signalSource as AutoTraderSource
     // AUDIT FIX (Task 58, P2): tf used to be cast unchecked - a garbage tf
     // made every picker return nothing (silent "no signal" forever) and
@@ -2697,7 +2829,9 @@ export class ModeService {
             : this.config.signalSource === 'confluence'
               ? ' (full 14-factor panel engine, bar-fresh)'
               : this.config.signalSource === 'chartsignals'
-                ? ` (chart-type vote engine, agree ≥ ${CHARTSIGNALS_MIN_AGREE}/7)`
+                ? ` (chart-type vote engine, agree ≥ ${CHARTSIGNALS_MIN_AGREE}/5 families)`
+                : this.config.signalSource === 'leadlag'
+                ? ` (EUR/USD rolling cross-correlation, |corr| ≥ ${LEADLAG_MIN_ABS_CORRELATION}, trigger |z| ≥ ${LEADLAG_MIN_TRIGGER_Z})`
                 : this.config.signalSource === 'strategy'
                 ? (() => {
                     const ids = this.effectiveStrategyIds()

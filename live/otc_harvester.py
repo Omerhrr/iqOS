@@ -47,6 +47,30 @@ CANDLE_INTERVAL = 60.0     # live closed-candle append cadence
 TICK_ROTATE_BYTES = 50 * 1024 * 1024
 TICKSET_CAP = 40          # sidecar WATCH_CAP=48; leave slots for the user's own UI streams
 TICKSET_POLL = 45.0       # /tick_stats delta pull cadence (buffer holds 1000 pts/pair)
+
+# -- retention / rotation for the two previously-unbounded stores --------
+#
+# Per-pair 1m candle JSONL (candles_1m__<ASSET>.jsonl): the OTC Guard's
+# placebo calibration (otcHarvest.loadOtcHarvest, capped at limit=2000
+# candles ~= 33h lookback) only ever reads the TAIL of the current file and
+# already falls back to a full re-read whenever the file shrinks (its own
+# "rotation/truncate" comment), so gzip-rotating this file the same way the
+# tick CSV already does is compatible with the only consumer without any
+# TS-side change. We rotate on size OR age so a quiet pair's file still gets
+# rotated eventually even if it never hits the byte threshold.
+CANDLE_ROTATE_BYTES = 25 * 1024 * 1024   # same convention as TICK_ROTATE_BYTES, smaller since there are
+                                          # dozens of these files running concurrently (one per pair)
+CANDLE_ROTATE_AGE_SEC = 30 * 86400       # force a rotation at least monthly regardless of size
+
+# 100ms tick archive (ticks100ms__<day>.jsonl): raw tick-timing data for the
+# randomness-audit / microstructure feature. Far higher volume than candles
+# and has a much shorter useful shelf life - "current microstructure" audits
+# don't need data from months ago. Unlike the candle files we DELETE old
+# daily archives outright (no calibration consumer reads them), gated on a
+# retention window rather than size. Bump this up if the audit ever needs a
+# longer lookback than this default.
+TICK100MS_RETENTION_DAYS = 21
+CLEANUP_INTERVAL = 3600.0                # run the retention sweep hourly, not on every tick
 TICKSET_PRIORITY = [
     "GBPUSD-OTC", "EURUSD-OTC", "USDJPY-OTC", "GBPJPY-OTC", "AUDUSD-OTC",
     "USDCAD-OTC", "USDCHF-OTC", "NZDUSD-OTC", "EURGBP-OTC", "EURJPY-OTC",
@@ -129,6 +153,34 @@ def append_candles(path: str, candles: list[dict]) -> int:
                 "l": c["low"], "c": c["close"], "v": c.get("volume", 0),
             }, separators=(",", ":")) + "\n")
     return len(candles)
+
+
+def rotate_file_if_due(path: str, max_bytes: int, max_age_sec: float | None = None) -> bool:
+    """Gzip-rotate `path` to `<path>.<unix_ts>.gz` and start it fresh, same
+    pattern as the existing tick-CSV rotation in live_tick_cycle. Only ever
+    called right after this process's own append to `path` completes (never
+    on a file another process/thread might be mid-write to), and the gzip +
+    remove happen back-to-back with no window where data is lost: worst case
+    on a crash between them is a harmless leftover .gz-less original."""
+    try:
+        if not os.path.exists(path):
+            return False
+        size = os.path.getsize(path)
+        if size == 0:
+            return False
+        due_size = size > max_bytes
+        due_age = max_age_sec is not None and (time.time() - os.path.getmtime(path)) >= max_age_sec
+        if not (due_size or due_age):
+            return False
+        import gzip
+        stamp = int(time.time())
+        with open(path, "rb") as fin, gzip.open(path + f".{stamp}.gz", "wb") as fout:
+            fout.writelines(fin)
+        os.remove(path)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log(f"rotate FAILED {path}: {exc}")
+        return False
 
 
 class Harvester:
@@ -245,7 +297,42 @@ class Harvester:
             fresh = [c for c in cs if last < int(c["time"]) < bucket]
             if fresh:
                 self.status["live_candles_written"] += append_candles(path, fresh)
+                if rotate_file_if_due(path, CANDLE_ROTATE_BYTES, CANDLE_ROTATE_AGE_SEC):
+                    log(f"rotated candle archive for {t}")
             time.sleep(0.05)
+
+    # ---------------- retention / cleanup ----------------
+
+    def cleanup_ticks100ms_retention(self) -> None:
+        """Delete daily 100ms tick archives older than
+        TICK100MS_RETENTION_DAYS. Only ever considers files named for a day
+        strictly before TODAY (UTC) - today's `ticks100ms__<today>.jsonl` is
+        the file _harvest_tick_stats is actively appending to in this same
+        process and is never touched here, regardless of age or size."""
+        today = datetime.now(timezone.utc).strftime("%Y%m%d")
+        cutoff = time.time() - TICK100MS_RETENTION_DAYS * 86400
+        removed = []
+        try:
+            names = os.listdir(DATA_DIR)
+        except Exception as exc:  # noqa: BLE001
+            log(f"ticks100ms retention scan FAILED: {exc}")
+            return
+        for name in names:
+            if not name.startswith("ticks100ms__") or not name.endswith(".jsonl"):
+                continue
+            day = name[len("ticks100ms__"):-len(".jsonl")]
+            if day >= today:
+                continue  # today's (or, defensively, any "future") file - never touch
+            path = os.path.join(DATA_DIR, name)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+                    removed.append(name)
+            except Exception as exc:  # noqa: BLE001
+                log(f"ticks100ms retention skip {name}: {exc}")
+        if removed:
+            log(f"ticks100ms retention: removed {len(removed)} archive(s) older than "
+                f"{TICK100MS_RETENTION_DAYS}d: {', '.join(removed)}")
 
     # ---------------- live worker thread ----------------
 
@@ -304,6 +391,7 @@ class Harvester:
         self._last_ts100: dict[str, float] = {}
         last_candle = 0.0
         last_tickset = 0.0
+        last_cleanup = 0.0
         while not STOP:
             t0 = time.time()
             try:
@@ -325,6 +413,13 @@ class Harvester:
                 except Exception as exc:  # noqa: BLE001
                     self.status["errors"] += 1
                     log(f"candle cycle error: {exc}")
+            if t0 - last_cleanup >= CLEANUP_INTERVAL:
+                last_cleanup = t0
+                try:
+                    self.cleanup_ticks100ms_retention()
+                except Exception as exc:  # noqa: BLE001
+                    self.status["errors"] += 1
+                    log(f"ticks100ms retention error: {exc}")
             self.save_status()
             time.sleep(max(0.5, PRICES_INTERVAL - (time.time() - t0)))
 

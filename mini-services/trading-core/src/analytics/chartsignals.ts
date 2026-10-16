@@ -382,16 +382,71 @@ export function engineVoteSingle(engine: MinableEngineId, candles: Candle[]): Ch
   }
 }
 
-/** Combine votes into one signed score. Returns null when the votes do not
- * qualify (no directional weight, or below the strength/agreement floor). */
+/** Engines that are really the SAME underlying construct computed three
+ * different ways - renko, range bars and point & figure all just reduce to
+ * "price crossed N ATR-thresholds", read off different brick/box
+ * constructions of the same closes. In a trending market they fire together
+ * almost by definition, so counting each of the three as its own
+ * independent "agree" overstates confluence. Every other engine is a
+ * genuinely distinct methodology (pattern recognition, smoothed-candle
+ * trend, tick-cadence, volume/delta) and stands as its own one-member
+ * family. */
+const PRICE_THRESHOLD_FAMILY: ChartEngineId[] = ['renko', 'range', 'pnf']
+
+/** Collapse the price-threshold trio into ONE family vote before combining.
+ * Family direction is the majority among the three (2-of-3 must agree on a
+ * non-zero direction; a clean 3-way split, a tied 1-1 with one abstaining,
+ * or no quorum votes neutral - this family then simply does not vote rather
+ * than forcing a side). Family weight is the MEAN weight of the engines that
+ * sided with the majority (not the sum - summing would just re-introduce
+ * the same triple-counting this fix removes, and taking the strongest
+ * single engine would throw away the fact that 2 vs 3 agreeing engines is a
+ * genuinely different conviction level within the family). */
+function priceThresholdFamilyVote(votes: ChartEngineVote[]): ChartEngineVote {
+  const members = votes.filter((v) => PRICE_THRESHOLD_FAMILY.includes(v.engine))
+  const pos = members.filter((v) => v.dir === 1)
+  const neg = members.filter((v) => v.dir === -1)
+  const majority = pos.length > neg.length ? pos : neg.length > pos.length ? neg : null
+  if (!majority || majority.length < 2) {
+    return { engine: 'renko', dir: 0, weight: 0, note: 'price-threshold family split/no quorum' }
+  }
+  const dir = majority === pos ? 1 : -1
+  const weight = majority.reduce((s, v) => s + v.weight, 0) / majority.length
+  const names = majority.map((v) => ENGINE_LABEL[v.engine]).join('+')
+  return {
+    engine: 'renko', // family vote is reported under the trio's first member
+    dir: dir as 1 | -1,
+    weight,
+    note: `price-threshold family: ${majority.length}/3 agree (${names})`,
+  }
+}
+
+/** Group the 7 raw engine votes into independent-methodology FAMILIES before
+ * combining, so correlated engines can only ever contribute ONE "agree"
+ * between them. Today that is just the price-threshold trio (renko/range/
+ * P&F -> 1 family vote); tick, candle, Heikin Ashi and footprint/otcfootprint
+ * are each already a distinct methodology and pass through as their own
+ * one-member family. Net effect: 7 raw votes -> 5 family votes. */
+export function familyVotes(votes: ChartEngineVote[]): ChartEngineVote[] {
+  const rest = votes.filter((v) => !PRICE_THRESHOLD_FAMILY.includes(v.engine))
+  return [priceThresholdFamilyVote(votes), ...rest]
+}
+
+/** Combine votes into one signed score. Groups correlated engines into
+ * independent-methodology families first (see familyVotes) so `agree`
+ * counts distinct confirmations, not the same construct computed three
+ * ways. Returns null when the votes do not qualify (no directional weight,
+ * or below the strength/agreement floor). `total` is the family count
+ * (5 today), not the raw engine count (7). */
 export function combineVotes(votes: ChartEngineVote[], opts: { threshold?: number; minAgree?: number } = {}): CombineResult | null {
   const threshold = opts.threshold ?? 35
-  const minAgree = opts.minAgree ?? 3
+  const minAgree = opts.minAgree ?? 2
+  const families = familyVotes(votes)
   let pos = 0
   let neg = 0
   let agreePos = 0
   let agreeNeg = 0
-  for (const v of votes) {
+  for (const v of families) {
     if (v.dir === 1) {
       pos += v.weight
       agreePos++
@@ -407,7 +462,7 @@ export function combineVotes(votes: ChartEngineVote[], opts: { threshold?: numbe
   const agree = direction === 'call' ? agreePos : agreeNeg
   const strength = Math.abs(score)
   if (strength < threshold || agree < minAgree) return null
-  return { score, strength, direction, agree, total: votes.length }
+  return { score, strength, direction, agree, total: families.length }
 }
 
 /** Suggested option expiry: stronger confluence gets a little more room, the

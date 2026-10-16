@@ -164,7 +164,7 @@ function dirChip(direction: 'call' | 'put') {
 function StrengthBar({ s }: { s: ChartSignal }) {
   const pos = s.direction === 'call'
   return (
-    <div className="h-1 w-full overflow-hidden rounded bg-[#101828]" title={`net score ${s.score} (${s.agree}/${s.total} engines agree)`}>
+    <div className="h-1 w-full overflow-hidden rounded bg-[#101828]" title={`net score ${s.score} (${s.agree}/${s.total} independent methodologies agree - renko/range/P&F count as one family)`}>
       <div className={`h-full ${pos ? 'bg-emerald-500' : 'bg-rose-500'}`} style={{ width: `${Math.max(6, s.strength)}%` }} />
     </div>
   )
@@ -647,7 +647,7 @@ export default function ChartSignalsPanel({ onClose, tf, onSelectAsset, onTake }
           )}
           <label
             className="ml-auto flex shrink-0 items-center gap-1.5"
-            title="hide reads below this confluence strength - the kernel floor is 35 (needs >= 3 engines agreeing), drag right to only see high-conviction reads"
+            title="hide reads below this confluence strength - the kernel floor is 35 (needs >= 2 independent methodologies agreeing - renko/range/P&F count as one), drag right to only see high-conviction reads"
           >
             <span className="font-mono text-[8px] uppercase tracking-wider text-[#4b5a72]">min str</span>
             <input
@@ -680,11 +680,11 @@ export default function ChartSignalsPanel({ onClose, tf, onSelectAsset, onTake }
                     // loosen instead of implying the engines went quiet
                     `No reads match the current filter - ${live.length} live read${live.length === 1 ? '' : 's'}${mkt !== 'all' ? ` · market ${mkt.toUpperCase()}` : ''}${cat !== 'all' ? ` · class ${cat}` : ''}${needle ? ` · search "${query.trim()}"` : ''}${minStrength > 35 ? ` · strength ≥ ${minStrength}` : ''}. Clear the search, lower the strength gate, or switch the class / market chips.`
                   ) : mkt === 'otc' ? (
-                    `No qualifying OTC reads right now - ${data.otcScanned ?? 0} OTC instruments scanned, ${data.otcConsidered ?? 0} had enough history, none reached the 7-engine confluence floor (strength >= 35, >= 3 engines agreeing). The OTC velocity footprint needs a warm tick buffer - it stays honest and votes 0 while cold.`
+                    `No qualifying OTC reads right now - ${data.otcScanned ?? 0} OTC instruments scanned, ${data.otcConsidered ?? 0} had enough history, none reached the 5-methodology confluence floor (strength >= 35, >= 2 independent methodologies agreeing). The OTC velocity footprint needs a warm tick buffer - it stays honest and votes 0 while cold.`
                   ) : mkt === 'real' ? (
-                    `No qualifying real-market reads right now - ${data.considered - (data.otcConsidered ?? 0)} real instruments had enough history, none reached the 7-engine confluence floor (strength >= 35, >= 3 engines agreeing). Fresh reads appear here automatically.`
+                    `No qualifying real-market reads right now - ${data.considered - (data.otcConsidered ?? 0)} real instruments had enough history, none reached the 5-methodology confluence floor (strength >= 35, >= 2 independent methodologies agreeing). Fresh reads appear here automatically.`
                   ) : (
-                    `${data.qualifying > 0 ? `${data.qualifying} reads just expired - rescanning` : `No qualifying reads right now - ${data.considered} of ${data.scanned} scanned instruments had enough history, none reached the 7-engine confluence floor (strength >= 35, >= 3 engines agreeing)`}. Fresh reads appear here automatically.`
+                    `${data.qualifying > 0 ? `${data.qualifying} reads just expired - rescanning` : `No qualifying reads right now - ${data.considered} of ${data.scanned} scanned instruments had enough history, none reached the 5-methodology confluence floor (strength >= 35, >= 2 independent methodologies agreeing)`}. Fresh reads appear here automatically.`
                   )
                 ) : (
                   'Scanning the market with the chart engines (renko, P&F, range, tick, footprint, Heikin Ashi, candles)...'

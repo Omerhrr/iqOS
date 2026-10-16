@@ -400,6 +400,17 @@ export class Store {
     return rows.map((r) => this.rowToPosition(r))
   }
 
+  /** Soak-report support: every position OPENED at or after sinceTs (open or
+   *  closed), oldest-filter irrelevant - ordered newest first, capped so a
+   *  very long window can't blow memory. Includes open (not-yet-settled)
+   *  rows so the soak report can flag ones still pending past their expiry. */
+  listPositionsSince(sinceTs: number, limit = 5000): Position[] {
+    const rows = this.db
+      .query('SELECT * FROM positions WHERE ts_open >= ? ORDER BY ts_open DESC LIMIT ?')
+      .all(sinceTs, limit) as Record<string, unknown>[]
+    return rows.map((r) => this.rowToPosition(r))
+  }
+
   settlePosition(id: string, exitPrice: number, status: string, pnl: number, tsClose?: number): Position | null {
     // tsClose: the BROKER's close time when we have it (IQ's settled-trade
     // row) - history must show when IQ actually closed the trade, not when
@@ -740,6 +751,16 @@ export class Store {
     }))
   }
 
+  /** Soak-report support: OTC verdicts (walk-forward placebo tests, written
+   *  by /otc_defense_run - NOT every check() consult, which isn't persisted
+   *  anywhere) recorded at or after sinceTs, oldest first. */
+  listOtcVerdictsSince(sinceTs: number, limit = 5000): { asset: string; strategyKey: string; verdict: string; ts: number }[] {
+    const rows = this.db
+      .query(`SELECT asset, strategy_key, verdict, ts FROM otc_verdicts WHERE ts >= ? ORDER BY ts ASC LIMIT ?`)
+      .all(sinceTs, limit) as { asset: string; strategy_key: string; verdict: string; ts: number }[]
+    return rows.map((r) => ({ asset: r.asset, strategyKey: r.strategy_key, verdict: r.verdict, ts: r.ts }))
+  }
+
   /** Keep the verdict ledger bounded - called on plugin start. */
   pruneOtcVerdicts(keep = 500): void {
     this.db.run(
@@ -777,6 +798,16 @@ export class Store {
     return this.db
       .query('SELECT ts, level, message FROM alerts ORDER BY ts DESC LIMIT ?')
       .all(limit) as { ts: number; level: string; message: string }[]
+  }
+
+  /** Soak-report support: every alert at or after sinceTs, oldest first (so
+   *  frequency counts and "repeats N times in a row" reasoning reads
+   *  chronologically). Capped - a long window with a repeating error could
+   *  otherwise return tens of thousands of near-identical rows. */
+  listAlertsSince(sinceTs: number, limit = 20000): { ts: number; level: string; message: string }[] {
+    return this.db
+      .query('SELECT ts, level, message FROM alerts WHERE ts >= ? ORDER BY ts ASC LIMIT ?')
+      .all(sinceTs, limit) as { ts: number; level: string; message: string }[]
   }
 
   // ---------- agent chat ----------

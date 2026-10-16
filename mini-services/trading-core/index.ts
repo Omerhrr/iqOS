@@ -34,7 +34,7 @@ import { normalizeSpec, type CustomSpec } from './src/strategies/custom'
 import { MINABLE_ENGINES, ENGINE_LABEL, type ChartEngineId } from './src/analytics/chartsignals'
 import { vskMonteCarlo } from './src/analytics/vsk'
 import { tskMonteCarlo } from './src/analytics/tsk'
-import { ALL_TIMEFRAMES, type Candle, type Timeframe } from './src/types'
+import { ALL_TIMEFRAMES, type Candle, type Timeframe, type Position } from './src/types'
 import { searchInstruments, universeStats, getInstrument } from './src/universe'
 import { listRegistry, computeIndicator, registrySize, getIndicatorDef } from './src/analytics/registry'
 import { detectChartPatterns } from './src/analytics/chart-patterns'
@@ -718,6 +718,145 @@ const httpServer = createServer(async (req, res) => {
         return json(200, { ok: true, config: guard.getConfig() })
       }
 
+      // ---------- soak report: a supervised paper-trading run health summary ----------
+      // Built entirely from data the app ALREADY persists (positions, alerts,
+      // otc_verdicts) - no separate event-capture plumbing. Alerts are the
+      // one place that already carries structured-enough text for standdown
+      // reasons, settlement-stall warnings and the chartsignals family
+      // agree/total detail (see os-mode.ts's standDown()/emit() and
+      // execution.ts's lastLiveError) - rather than add a second logging path,
+      // this just parses those known message shapes. Anything genuinely not
+      // tracked anywhere (e.g. total otcGuard.check() CONSULTS, as opposed to
+      // the ones that blocked and therefore stood down - a logged event) is
+      // reported with dataAvailable:false instead of a fabricated zero.
+      if (path === '/soak_report') {
+        const store = kernel.context().use<{
+          listPositionsSince: (sinceTs: number, limit?: number) => Position[]
+          listAlertsSince: (sinceTs: number, limit?: number) => { ts: number; level: string; message: string }[]
+          listOtcVerdictsSince: (sinceTs: number, limit?: number) => { asset: string; strategyKey: string; verdict: string; ts: number }[]
+        }>('storeRaw')
+        const guard = kernel.context().use<OtcGuardService>('otcGuard')
+
+        const sinceMs = Math.max(0, Number(q.get('sinceMs') ?? 24 * 60 * 60 * 1000))
+        const nowMs = Date.now()
+        const sinceTs = Math.floor((nowMs - sinceMs) / 1000)
+        const nowTs = Math.floor(nowMs / 1000)
+
+        const positions = store.listPositionsSince(sinceTs)
+        const alerts = store.listAlertsSince(sinceTs)
+        const otcVerdicts = store.listOtcVerdictsSince(sinceTs)
+
+        // ---- trade counts ----
+        const AUTOTRADER_NOTE = 'auto:os-trader'
+        const autoPositions = positions.filter((p) => p.note === AUTOTRADER_NOTE)
+        const byMode = { paper: 0, live: 0 }
+        const byOutcome = { won: 0, lost: 0, push: 0, open: 0, closed: 0 }
+        const bySource: Record<string, number> = {}
+        for (const p of autoPositions) {
+          if (p.mode === 'live') byMode.live++
+          else byMode.paper++
+          const st = p.status as 'open' | 'won' | 'lost' | 'push' | 'closed'
+          if (byOutcome[st] !== undefined) byOutcome[st]++
+          const key = p.strategy || 'unknown'
+          bySource[key] = (bySource[key] ?? 0) + 1
+        }
+
+        // ---- settlement health ----
+        const stillAwaiting = alerts.filter((a) => a.message.includes('still awaiting IQ confirmation'))
+        const noOrderIdSettled = alerts.filter((a) => a.message.includes('NO broker order id'))
+        const sessionLost = alerts.filter((a) => a.message.includes('IQ session lost'))
+        const brokerLookupFailing = alerts.filter((a) => a.message.includes('broker lookup failing'))
+        const errorAlerts = alerts.filter((a) => a.level === 'warn' || a.level === 'danger')
+        // positions still open well past their expected settlesAt right now
+        // (a "stuck" symptom worth flagging even if no alert fired yet this tick)
+        const STALE_OPEN_SEC = 180
+        const stuckOpen = positions.filter(
+          (p) => p.status === 'open' && p.settlesAt !== undefined && nowTs - p.settlesAt > STALE_OPEN_SEC,
+        )
+
+        // ---- OTC guard activity ----
+        const otcBlocked = alerts.filter((a) => a.message.includes('OTC defense:'))
+        const verdictsByResult = { robust: 0, weak: 0, failed: 0 }
+        for (const v of otcVerdicts) {
+          if (v.verdict === 'robust' || v.verdict === 'weak' || v.verdict === 'failed') verdictsByResult[v.verdict]++
+        }
+
+        // ---- chartsignals activity ----
+        const chartTrades = autoPositions.filter((p) => p.strategy === 'chartsignals-vote')
+        const familyMatches: { agree: number; total: number }[] = []
+        const familyRe = /(\d+)\/(\d+) independent chart methodologies agree/g
+        for (const a of alerts) {
+          let m: RegExpExecArray | null
+          familyRe.lastIndex = 0
+          while ((m = familyRe.exec(a.message))) familyMatches.push({ agree: Number(m[1]), total: Number(m[2]) })
+        }
+        const chartsignals =
+          familyMatches.length > 0
+            ? {
+                dataAvailable: true,
+                tradeCount: chartTrades.length,
+                samples: familyMatches.length,
+                avgAgree: Math.round((familyMatches.reduce((s, f) => s + f.agree, 0) / familyMatches.length) * 10) / 10,
+                avgTotal: Math.round((familyMatches.reduce((s, f) => s + f.total, 0) / familyMatches.length) * 10) / 10,
+                avgAgreePct:
+                  Math.round(
+                    (familyMatches.reduce((s, f) => s + f.agree / f.total, 0) / familyMatches.length) * 1000,
+                  ) / 10,
+              }
+            : { dataAvailable: false, tradeCount: chartTrades.length, note: 'no chartsignals-sourced trades fired in this window yet' }
+
+        // ---- standdown reason frequency ----
+        const standDownRe = /\[AUTO-TRADER\] standing down: (.+)$/
+        const standDownCounts = new Map<string, number>()
+        for (const a of alerts) {
+          const m = standDownRe.exec(a.message)
+          if (!m) continue
+          const reason = m[1].trim()
+          standDownCounts.set(reason, (standDownCounts.get(reason) ?? 0) + 1)
+        }
+        const standdowns = [...standDownCounts.entries()]
+          .map(([reason, count]) => ({ reason, count }))
+          .sort((a, b) => b.count - a.count)
+
+        return json(200, {
+          ok: true,
+          sinceMs,
+          sinceTs,
+          generatedAt: nowMs,
+          alertsInWindow: alerts.length,
+          trades: {
+            dataAvailable: true,
+            total: autoPositions.length,
+            nonAutoTraderPositions: positions.length - autoPositions.length,
+            byMode,
+            byOutcome,
+            bySource,
+          },
+          settlement: {
+            dataAvailable: true,
+            stillAwaitingIqConfirmationCount: stillAwaiting.length,
+            recentStillAwaiting: stillAwaiting.slice(-10).reverse(),
+            stuckOpenPositions: stuckOpen.map((p) => ({ id: p.id, asset: p.asset, settlesAt: p.settlesAt, secondsPastExpiry: nowTs - (p.settlesAt ?? nowTs) })),
+            noBrokerOrderIdSettledCount: noOrderIdSettled.length,
+            iqSessionLostCount: sessionLost.length,
+            brokerLookupFailingCount: brokerLookupFailing.length,
+            errorAlertCount: errorAlerts.length,
+          },
+          otcGuard: {
+            dataAvailable: true,
+            policy: guard.getConfig().policy,
+            blockedCount: otcBlocked.length,
+            consultedCount: null,
+            consultedCountAvailable: false,
+            consultedCountNote: 'otcGuard.check() does not currently persist every consult - only its blocks (which stand the auto-trader down, logged above) and full walk-forward verdict runs are recorded',
+            verdictRunsInWindow: otcVerdicts.length,
+            verdictsByResult,
+          },
+          chartsignals,
+          standdowns,
+        })
+      }
+
       // OTC FEED FORENSICS - the fair-coin drift probe. The placebo trial
       // (above) can never see a persistent drift: its synthetic twins
       // inherit the pair's own return pool, so drift is calibrated away by
@@ -1014,6 +1153,134 @@ const httpServer = createServer(async (req, res) => {
         const asset = q.get('asset') ?? market.activeAsset
         const result = analytics.analyze(asset, t, q.get('force') === '1')
         return json(200, { ok: true, analysis: result })
+      }
+
+      // ---------- Tradeability: the single combined readout ----------
+      // Pulls together the three separate "is this worth trading" checks
+      // (Quant Lab structure stats, the randomness/tick-stats audit, OTC
+      // Guard's placebo verdict) into one plain verdict + score, instead of
+      // making the user mentally combine three panels. Entirely read-only:
+      // reuses already-cached/cheap-to-recompute results, never triggers a
+      // fresh harvester run or a synchronous placebo backtest.
+      if (path === '/tradeability') {
+        const t = tfStrict(q.get('tf'))
+        if (t === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+        const asset = q.get('asset') ?? market.activeAsset
+        const strategyKey = q.get('strategy') || null
+
+        const result = analytics.analyze(asset, t) // cached - no forced recompute
+        const { points, dataSource: tickDataSource } = await market.getTickSeries(asset)
+        const stepStats = computeStepStats(points)
+
+        // --- 1. Structure (Hurst / ACF / Markov) -----------------------
+        // Same thresholds engine.ts already uses for hurstNote (>0.58
+        // persistent, <0.42 anti-persistent) - "detected" means the series
+        // reads as something other than a pure random walk by AT LEAST ONE
+        // of the three independent structure tests:
+        //   - Hurst outside [0.42, 0.58] (persistent/anti-persistent)
+        //   - any ACF lag exceeding its own significance band
+        //   - Markov next-state entropy meaningfully below 1.0 (max-entropy
+        //     = indistinguishable from a coin flip; <0.9 = detectably skewed)
+        const hurstDetected = result.quant.hurst > 0.58 || result.quant.hurst < 0.42
+        const acfMaxAbs = result.quant.acf.reduce((m, v) => Math.max(m, Math.abs(v)), 0)
+        const acfDetected = acfMaxAbs > result.quant.acfSignificance
+        const markovDetected = result.markov.entropy < 0.9
+        const structureDetected = hurstDetected || acfDetected || markovDetected
+        const structureState: 'detected' | 'none' = structureDetected ? 'detected' : 'none'
+
+        // --- 2. Randomness audit (step/return distribution) ------------
+        // excessKurtosis ~0 reads as normal-ish; >1 is the standard
+        // "notably fat-tailed" cutoff. Too few ticks to say anything honest
+        // -> 'unknown', never silently labeled 'normal'.
+        const randomnessState: 'normal' | 'fat_tailed' | 'unknown' =
+          stepStats.n < 20 ? 'unknown' : stepStats.excessKurtosis > 1 ? 'fat_tailed' : 'normal'
+
+        // --- 3. OTC Guard verdict (cached/read-only lookup only) --------
+        const guard = kernel.context().use<OtcGuardService>('otcGuard')
+        const isOtc = guard.isOtc(asset)
+        type GuardState = 'edge' | 'weak' | 'no_edge' | 'inconclusive' | 'not_tested' | 'skipped'
+        let guardState: GuardState = 'skipped'
+        let guardDetail: ReturnType<OtcGuardService['statusFor']> | null = null
+        if (strategyKey && isOtc) {
+          guardDetail = guard.statusFor(asset, strategyKey)
+          guardState = guardDetail.verdict ? (guardDetail.verdict.verdict as GuardState) : 'not_tested'
+        } else if (strategyKey && !isOtc) {
+          guardState = 'skipped' // real instrument - guard doesn't apply, TA is the intended tool
+        }
+
+        // --- Decision table (categorical, no ML blend) ------------------
+        // Evaluated top-down, first match wins:
+        //   1. guard === 'edge'               -> favorable (verified real edge)
+        //   2. guard === 'no_edge'            -> avoid     (indistinguishable from placebo luck)
+        //   3. guard === 'weak'                -> caution   (suggestive, unconfirmed)
+        //   4. guard has no confirmed read (inconclusive / not_tested / skipped):
+        //      4a. randomness === 'unknown'                        -> inconclusive (not enough tick data)
+        //      4b. structure=detected  & randomness=normal         -> favorable
+        //      4c. structure=detected  & randomness=fat_tailed     -> caution
+        //      4d. structure=none      & randomness=fat_tailed     -> caution
+        //      4e. structure=none      & randomness=normal         -> avoid (pure noise, nothing to trade)
+        let verdict: 'favorable' | 'caution' | 'avoid' | 'inconclusive'
+        let score: number
+        let reason: string
+        if (guardState === 'edge') {
+          verdict = 'favorable'; score = 90
+          reason = `OTC Guard verified a real edge for ${strategyKey} on ${asset} vs its synthetic placebo twins.`
+        } else if (guardState === 'no_edge') {
+          verdict = 'avoid'; score = 10
+          reason = `OTC Guard found ${strategyKey}'s performance on ${asset} indistinguishable from the synthetic placebo - avoid regardless of structure/randomness readings.`
+        } else if (guardState === 'weak') {
+          verdict = 'caution'; score = 50
+          reason = `OTC Guard shows a suggestive but unconfirmed edge for ${strategyKey} on ${asset} - treat cautiously.`
+        } else if (randomnessState === 'unknown') {
+          verdict = 'inconclusive'; score = 50
+          reason = `Not enough tick data yet to read ${asset}'s return distribution - structure/guard alone can't settle this.`
+        } else if (structureState === 'detected' && randomnessState === 'normal') {
+          verdict = 'favorable'; score = 75
+          reason = `${asset} shows detectable structure (Hurst/ACF/Markov) with a well-behaved return distribution, but no OTC Guard confirmation yet${strategyKey ? ' for ' + strategyKey : ''}.`
+        } else if (structureState === 'detected' && randomnessState === 'fat_tailed') {
+          verdict = 'caution'; score = 55
+          reason = `${asset} shows detectable structure but a fat-tailed return distribution raises execution risk, and there's no OTC Guard confirmation${strategyKey ? ' for ' + strategyKey : ''}.`
+        } else if (structureState === 'none' && randomnessState === 'fat_tailed') {
+          verdict = 'caution'; score = 40
+          reason = `${asset} shows no detectable structure and a fat-tailed/irregular return distribution - likely generator noise; treat cautiously.`
+        } else {
+          verdict = 'avoid'; score = 15
+          reason = `${asset} shows no detectable structure (Hurst/ACF/Markov all read as random-walk) and a normal return distribution - pure noise, nothing to trade here.`
+        }
+
+        return json(200, {
+          ok: true,
+          asset,
+          tf: t,
+          strategy: strategyKey,
+          verdict,
+          score,
+          reason,
+          structure: {
+            state: structureState,
+            hurst: result.quant.hurst,
+            hurstNote: result.quant.hurstNote,
+            acfMaxAbs,
+            acfSignificance: result.quant.acfSignificance,
+            markovRegime: result.markov.regime,
+            markovEntropy: result.markov.entropy,
+            markovTrendiness: result.markov.trendiness,
+          },
+          randomness: {
+            state: randomnessState,
+            excessKurtosis: stepStats.excessKurtosis,
+            stdDevReturns: stepStats.stdDevReturns,
+            meanAbsStep: stepStats.meanAbsStep,
+            n: stepStats.n,
+            dataSource: tickDataSource,
+          },
+          guard: {
+            state: guardState,
+            isOtc,
+            strategy: strategyKey,
+            detail: guardDetail,
+          },
+        })
       }
 
       // rank a category by composite signal strength - the copilot's market scanner
