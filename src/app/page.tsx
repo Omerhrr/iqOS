@@ -953,11 +953,11 @@ export default function OSPage() {
                   ) : leadlagOpen ? (
                     <LeadLagPanel onClose={() => setLeadlagOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
                   ) : distillOpen ? (
-                    <ChartSignalsDistillPanel onClose={() => setDistillOpen(false)} asset={asset} tf={tf} />
+                    <ChartSignalsDistillPanel onClose={() => setDistillOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
                   ) : cointegrationOpen ? (
-                    <CointegrationPanel onClose={() => setCointegrationOpen(false)} asset={asset} tf={tf} />
+                    <CointegrationPanel onClose={() => setCointegrationOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
                   ) : volarbOpen ? (
-                    <VolatilityArbPanel onClose={() => setVolarbOpen(false)} asset={asset} tf={tf} />
+                    <VolatilityArbPanel onClose={() => setVolarbOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
                   ) : (
                     <ChartSignalsPanel onClose={() => setSignalsOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onTake={handleTakeSignal} />
                   )}

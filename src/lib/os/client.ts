@@ -502,6 +502,32 @@ export async function getChartSignalsDistill(
   })
 }
 
+export interface DistillScanRow {
+  asset: string
+  name: string
+  category: string
+  otc: boolean
+  open: boolean
+  price: number
+  filtered: number
+  z: number
+  rawScore: number
+  tStat: number
+  direction: 'call' | 'put' | null
+}
+
+export interface DistillScanResponse {
+  ok: boolean
+  tf: Timeframe
+  scanned: number
+  rows: DistillScanRow[]
+  ts: number
+}
+
+export async function getDistillScan(tf: Timeframe): Promise<DistillScanResponse> {
+  return osGet<DistillScanResponse>('/distill_scan', { tf })
+}
+
 // ---- Cointegration (Engle-Granger pairs) ---------------------------------
 
 export interface CointegrationFit {
@@ -531,6 +557,37 @@ export async function getCointegration(asset: string, tf: Timeframe, window?: nu
   return osGet<CointegrationResponse>('/cointegration', { asset, tf, ...(window !== undefined ? { window } : {}) })
 }
 
+export interface CointegrationScanRow {
+  leader: string
+  asset: string
+  name: string
+  category: string
+  otc: boolean
+  open: boolean
+  price: number
+  beta: number
+  r2: number
+  z: number
+  tStat: number
+  halfLifeBars: number
+  n: number
+  direction: 'call' | 'put' | null
+  qualifies: boolean
+}
+
+export interface CointegrationScanResponse {
+  ok: boolean
+  tf: Timeframe
+  scanned: number
+  qualifying: number
+  rows: CointegrationScanRow[]
+  ts: number
+}
+
+export async function getCointegrationScan(tf: Timeframe): Promise<CointegrationScanResponse> {
+  return osGet<CointegrationScanResponse>('/cointegration_scan', { tf })
+}
+
 // ---- Volatility Arb (close-vol vs range-vol) -----------------------------
 
 export interface VolArbResult {
@@ -552,6 +609,34 @@ export interface VolArbResponse {
 
 export async function getVolArb(asset: string, tf: Timeframe, window?: number): Promise<VolArbResponse> {
   return osGet<VolArbResponse>('/volarb', { asset, tf, ...(window !== undefined ? { window } : {}) })
+}
+
+export interface VolArbScanRow {
+  asset: string
+  name: string
+  category: string
+  otc: boolean
+  open: boolean
+  price: number
+  closeVol: number
+  rangeVol: number
+  ratio: number
+  momentum: number
+  lastBarDir: -1 | 0 | 1
+  direction: 'call' | 'put' | null
+  regime: 'fade' | 'continue' | 'balanced'
+}
+
+export interface VolArbScanResponse {
+  ok: boolean
+  tf: Timeframe
+  scanned: number
+  rows: VolArbScanRow[]
+  ts: number
+}
+
+export async function getVolArbScan(tf: Timeframe): Promise<VolArbScanResponse> {
+  return osGet<VolArbScanResponse>('/volarb_scan', { tf })
 }
 
 // ---- chart-signal outcome stats (Task 64-c: the honesty loop) ------------

@@ -31,9 +31,9 @@ import { yesterdayPlugin, YesterdayService } from './src/plugins/yesterday'
 import { gridSearch, walkForward, sweepAssets, type Objective } from './src/strategies/optimize'
 import { backtest } from './src/strategies/backtest'
 import type { BacktestOptions } from './src/strategies/backtest'
-import { leadersFor } from './src/analytics/leadlag'
-import { distillChartSignals } from './src/analytics/chartsignalsdistill'
-import { fitCointegration, COINTEGRATION_WINDOW } from './src/analytics/cointegration'
+import { leadersFor, LEADLAG_GROUPS } from './src/analytics/leadlag'
+import { distillChartSignals, DISTILL_DEFAULT_WINDOW } from './src/analytics/chartsignalsdistill'
+import { fitCointegration, COINTEGRATION_WINDOW, COINTEGRATION_MIN_R2, COINTEGRATION_MIN_TSTAT, COINTEGRATION_MAX_HALFLIFE } from './src/analytics/cointegration'
 import { computeVolArb, VOLARB_DEFAULT_WINDOW } from './src/analytics/volarb'
 import { normalizeSpec, type CustomSpec } from './src/strategies/custom'
 import { MINABLE_ENGINES, ENGINE_LABEL, type ChartEngineId } from './src/analytics/chartsignals'
@@ -157,6 +157,205 @@ kernel.register(otcFootprintPlugin)
 kernel.register(chartSignalsPlugin)
 kernel.register(leadLagScanPlugin)
 kernel.register(yesterdayPlugin)
+
+// ---------- Full-universe scanners for Distill / Cointegration / Vol Arb ----------
+// These three started as single-asset-only panels (read whatever's on the
+// chart right now). That's fine for "what does this read say about THIS
+// pair" but it's not what Chart Signals or Lead-Lag do - those scan the
+// WHOLE tracked universe every poll so the panel is a list of candidates,
+// not a single number. Lighter-weight than leadlagscan.ts/chartsignals.ts
+// on purpose: no outcome tracking, no bar-close-triggered rescans, no
+// persistence - just a plain per-tf cache so a panel polling every ~10-15s
+// doesn't force a full rescan on every request. If these earn an honesty
+// loop later, promote them into real plugins the way lead-lag was.
+const SCAN_CACHE_MS = 15_000
+
+interface DistillScanRow {
+  asset: string
+  name: string
+  category: string
+  otc: boolean
+  open: boolean
+  price: number
+  filtered: number
+  z: number
+  rawScore: number
+  tStat: number
+  direction: 'call' | 'put' | null
+}
+const distillScanCache = new Map<Timeframe, { ts: number; rows: DistillScanRow[] }>()
+
+function scanDistill(market: MarketDataService, tfv: Timeframe): DistillScanRow[] {
+  const cached = distillScanCache.get(tfv)
+  if (cached && Date.now() - cached.ts < SCAN_CACHE_MS) return cached.rows
+  const rows: DistillScanRow[] = []
+  for (const a of market.assets) {
+    if (!a.open) continue
+    try {
+      const candles = market.getCandlesDeep(a.ticker, tfv, 1500, true)
+      if (candles.length < DISTILL_DEFAULT_WINDOW + 10) continue
+      const out = distillChartSignals(candles, { otc: !!a.otc })
+      if (!out) continue
+      rows.push({
+        asset: a.ticker,
+        name: a.name,
+        category: a.category,
+        otc: !!a.otc,
+        open: a.open,
+        price: candles[candles.length - 1]?.close ?? 0,
+        filtered: out.filtered,
+        z: out.z,
+        rawScore: out.rawScore,
+        tStat: out.tStat,
+        direction: Math.abs(out.filtered) >= 1e-9 ? (out.filtered > 0 ? 'call' : 'put') : null,
+      })
+    } catch {
+      /* one bad asset never breaks the scan */
+    }
+  }
+  rows.sort((x, y) => Math.abs(y.filtered) - Math.abs(x.filtered))
+  distillScanCache.set(tfv, { ts: Date.now(), rows })
+  return rows
+}
+
+interface CointegrationScanRow {
+  leader: string
+  asset: string
+  name: string
+  category: string
+  otc: boolean
+  open: boolean
+  price: number
+  beta: number
+  r2: number
+  z: number
+  tStat: number
+  halfLifeBars: number
+  n: number
+  direction: 'call' | 'put' | null
+  /** clears the SAME gates the cointegration-pairs strategy itself requires
+   * (minR2/minTStat/maxHalfLife) plus a |z| >= 1.5 entry - i.e. this is what
+   * the strategy would actually act on right now, not just a plausible fit. */
+  qualifies: boolean
+}
+const cointegrationScanCache = new Map<Timeframe, { ts: number; rows: CointegrationScanRow[] }>()
+
+function scanCointegration(market: MarketDataService, tfv: Timeframe): CointegrationScanRow[] {
+  const cached = cointegrationScanCache.get(tfv)
+  if (cached && Date.now() - cached.ts < SCAN_CACHE_MS) return cached.rows
+  const rows: CointegrationScanRow[] = []
+  const byTicker = new Map(market.assets.map((a) => [a.ticker, a]))
+  const leaderCloseCache = new Map<string, number[] | null>()
+  for (const group of LEADLAG_GROUPS) {
+    const leaderInfo = byTicker.get(group.leader)
+    let leaderCloses = leaderCloseCache.get(group.leader)
+    if (leaderCloses === undefined) {
+      try {
+        leaderCloses =
+          leaderInfo?.open ? market.getCandlesDeep(group.leader, tfv, Math.max(600, COINTEGRATION_WINDOW + 50), true).map((c) => c.close) : null
+      } catch {
+        leaderCloses = null
+      }
+      leaderCloseCache.set(group.leader, leaderCloses)
+    }
+    if (!leaderCloses || leaderCloses.length < 30) continue
+    for (const asset of group.followers) {
+      const inst = byTicker.get(asset)
+      if (!inst?.open) continue
+      try {
+        const candles = market.getCandlesDeep(asset, tfv, Math.max(600, COINTEGRATION_WINDOW + 50), true)
+        if (candles.length < 30) continue
+        const fit = fitCointegration(leaderCloses, candles.map((c) => c.close), COINTEGRATION_WINDOW)
+        if (!fit) continue
+        const qualifies = fit.r2 >= COINTEGRATION_MIN_R2 && fit.tStat >= COINTEGRATION_MIN_TSTAT && fit.halfLifeBars <= COINTEGRATION_MAX_HALFLIFE && Math.abs(fit.z) >= 1.5
+        rows.push({
+          leader: group.leader,
+          asset,
+          name: inst.name,
+          category: inst.category,
+          otc: !!inst.otc,
+          open: inst.open,
+          price: candles[candles.length - 1]?.close ?? 0,
+          beta: fit.beta,
+          r2: fit.r2,
+          z: fit.z,
+          tStat: fit.tStat,
+          halfLifeBars: fit.halfLifeBars,
+          n: fit.n,
+          direction: fit.z <= -1.5 ? 'call' : fit.z >= 1.5 ? 'put' : null,
+          qualifies,
+        })
+      } catch {
+        /* one bad pair never breaks the scan */
+      }
+    }
+  }
+  rows.sort((x, y) => Number(y.qualifies) - Number(x.qualifies) || Math.abs(y.z) - Math.abs(x.z))
+  cointegrationScanCache.set(tfv, { ts: Date.now(), rows })
+  return rows
+}
+
+interface VolArbScanRow {
+  asset: string
+  name: string
+  category: string
+  otc: boolean
+  open: boolean
+  price: number
+  closeVol: number
+  rangeVol: number
+  ratio: number
+  momentum: number
+  lastBarDir: -1 | 0 | 1
+  direction: 'call' | 'put' | null
+  regime: 'fade' | 'continue' | 'balanced'
+}
+const volarbScanCache = new Map<Timeframe, { ts: number; rows: VolArbScanRow[] }>()
+// same ratioHigh/ratioLow convention as the volatility-arb strategy's own
+// defaults in builtin.ts and VolatilityArbPanel.tsx's local constants
+const VOLARB_SCAN_RATIO_HIGH = 1.6
+const VOLARB_SCAN_RATIO_LOW = 0.6
+
+function scanVolArb(market: MarketDataService, tfv: Timeframe): VolArbScanRow[] {
+  const cached = volarbScanCache.get(tfv)
+  if (cached && Date.now() - cached.ts < SCAN_CACHE_MS) return cached.rows
+  const rows: VolArbScanRow[] = []
+  for (const a of market.assets) {
+    if (!a.open) continue
+    try {
+      const candles = market.getCandlesDeep(a.ticker, tfv, Math.max(300, VOLARB_DEFAULT_WINDOW + 50), true)
+      const out = computeVolArb(candles, VOLARB_DEFAULT_WINDOW)
+      if (!out) continue
+      const direction: 'call' | 'put' | null =
+        out.ratio >= VOLARB_SCAN_RATIO_HIGH && out.lastBarDir !== 0
+          ? out.lastBarDir > 0 ? 'put' : 'call'
+          : out.ratio <= VOLARB_SCAN_RATIO_LOW && out.momentum !== 0
+            ? out.momentum > 0 ? 'call' : 'put'
+            : null
+      const regime: VolArbScanRow['regime'] = out.ratio >= VOLARB_SCAN_RATIO_HIGH ? 'fade' : out.ratio <= VOLARB_SCAN_RATIO_LOW ? 'continue' : 'balanced'
+      rows.push({
+        asset: a.ticker,
+        name: a.name,
+        category: a.category,
+        otc: !!a.otc,
+        open: a.open,
+        price: candles[candles.length - 1]?.close ?? 0,
+        closeVol: out.closeVol,
+        rangeVol: out.rangeVol,
+        ratio: out.ratio,
+        momentum: out.momentum,
+        lastBarDir: out.lastBarDir,
+        direction,
+        regime,
+      })
+    } catch {
+      /* one bad asset never breaks the scan */
+    }
+  }
+  rows.sort((x, y) => Math.abs(y.ratio - 1) - Math.abs(x.ratio - 1))
+  volarbScanCache.set(tfv, { ts: Date.now(), rows })
+  return rows
+}
 
 const httpServer = createServer(async (req, res) => {
   res.setHeader('access-control-allow-origin', '*')
@@ -1409,6 +1608,21 @@ const httpServer = createServer(async (req, res) => {
         }
       }
 
+      // Distill scan: the full-universe twin of /distill - same Kalman-OU
+      // smoothed vote read, but for every open instrument at once (cached
+      // SCAN_CACHE_MS), so the sidebar can list candidates the way Chart
+      // Signals/Lead-Lag do instead of only reading the active chart's pair.
+      if (path === '/distill_scan') {
+        try {
+          const tfv = tfStrict(q.get('tf'))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const rows = scanDistill(market, tfv)
+          return json(200, { ok: true, tf: tfv, scanned: rows.length, rows, ts: Date.now() })
+        } catch (err) {
+          return json(400, { ok: false, error: (err as Error).message })
+        }
+      }
+
       // Cointegration (pairs): panel-facing twin of the cointegration-pairs
       // strategy - fetches this asset's group leader (same leadersFor() lookup
       // as /optimize's leaderCandles injection) and runs the Engle-Granger
@@ -1442,6 +1656,21 @@ const httpServer = createServer(async (req, res) => {
         }
       }
 
+      // Cointegration scan: the full-universe twin of /cointegration - every
+      // leader/follower pair in LEADLAG_GROUPS (same roster lead-lag scans),
+      // Engle-Granger-fit and ranked, `qualifies` marking exactly what the
+      // cointegration-pairs strategy itself would act on right now.
+      if (path === '/cointegration_scan') {
+        try {
+          const tfv = tfStrict(q.get('tf'))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const rows = scanCointegration(market, tfv)
+          return json(200, { ok: true, tf: tfv, scanned: rows.length, qualifying: rows.filter((r) => r.qualifies).length, rows, ts: Date.now() })
+        } catch (err) {
+          return json(400, { ok: false, error: (err as Error).message })
+        }
+      }
+
       // Volatility Arb: panel-facing twin of the volatility-arb strategy -
       // close-to-close EWMA vol vs Parkinson range vol for this asset/tf.
       if (path === '/volarb') {
@@ -1460,6 +1689,19 @@ const httpServer = createServer(async (req, res) => {
             result: out,
             ts: Date.now(),
           })
+        } catch (err) {
+          return json(400, { ok: false, error: (err as Error).message })
+        }
+      }
+
+      // Volatility Arb scan: the full-universe twin of /volarb - every open
+      // instrument's close-vs-range vol ratio, ranked by how extreme it is.
+      if (path === '/volarb_scan') {
+        try {
+          const tfv = tfStrict(q.get('tf'))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const rows = scanVolArb(market, tfv)
+          return json(200, { ok: true, tf: tfv, scanned: rows.length, rows, ts: Date.now() })
         } catch (err) {
           return json(400, { ok: false, error: (err as Error).message })
         }
