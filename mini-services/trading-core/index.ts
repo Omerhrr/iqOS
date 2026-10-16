@@ -32,6 +32,7 @@ import { gridSearch, walkForward, sweepAssets, type Objective } from './src/stra
 import { backtest } from './src/strategies/backtest'
 import type { BacktestOptions } from './src/strategies/backtest'
 import { leadersFor } from './src/analytics/leadlag'
+import { distillChartSignals } from './src/analytics/chartsignalsdistill'
 import { normalizeSpec, type CustomSpec } from './src/strategies/custom'
 import { MINABLE_ENGINES, ENGINE_LABEL, type ChartEngineId } from './src/analytics/chartsignals'
 import { vskMonteCarlo } from './src/analytics/vsk'
@@ -1366,6 +1367,44 @@ const httpServer = createServer(async (req, res) => {
           tfFilter = v
         }
         return json(200, { ok: true, ...kernel.context().use<LeadLagScanService>('leadLagScan').stats(tfFilter), ts: Date.now() })
+      }
+
+      // Chart Signals Distill: the Kalman-OU-smoothed read of the combined
+      // chart-engine vote for ONE asset/tf (analytics/chartsignalsdistill.ts)
+      // - panel-facing, computed on demand (no scan cache/service, unlike the
+      // full-universe chart-signals scanner - this only ever evaluates the
+      // single currently-viewed asset, so the per-call cost of its own
+      // window-sized engineVotes() loop is bounded and cheap enough to just
+      // run fresh on every poll).
+      if (path === '/distill') {
+        try {
+          const dAsset = String(q.get('asset') ?? market.activeAsset)
+          const dTfv = tfStrict(q.get('tf'))
+          if (dTfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const dWindow = q.get('window') !== null ? Number(q.get('window')) : undefined
+          const dThreshold = q.get('threshold') !== null ? Number(q.get('threshold')) : undefined
+          const dMinAgree = q.get('minAgree') !== null ? Number(q.get('minAgree')) : undefined
+          const dCandles = market.getCandlesDeep(dAsset, dTfv, 1500, true)
+          const assetInfo = market.assets.find((a) => a.ticker === dAsset)
+          const out = distillChartSignals(dCandles, {
+            window: dWindow,
+            threshold: dThreshold,
+            minAgree: dMinAgree,
+            otc: !!assetInfo?.otc,
+          })
+          if (!out) return json(200, { ok: true, asset: dAsset, tf: dTfv, result: null, price: dCandles[dCandles.length - 1]?.close ?? null, ts: Date.now() })
+          return json(200, {
+            ok: true,
+            asset: dAsset,
+            tf: dTfv,
+            price: dCandles[dCandles.length - 1]?.close ?? null,
+            result: out,
+            direction: Math.abs(out.filtered) >= 1e-9 ? (out.filtered > 0 ? 'call' : 'put') : null,
+            ts: Date.now(),
+          })
+        } catch (err) {
+          return json(400, { ok: false, error: (err as Error).message })
+        }
       }
 
       // Same-time-yesterday scanner: for every open instrument, what was the

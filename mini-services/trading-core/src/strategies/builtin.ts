@@ -21,6 +21,7 @@ import { computeTpo } from '../analytics/tpo'
 import { realizedUpProb, ivFromPayout } from '../analytics/ivhv'
 import { engineVotes, combineVotes } from '../analytics/chartsignals'
 import { fitLeadLag, projectLeadLagSignal } from '../analytics/leadlag'
+import { distillChartSignals, DISTILL_DEFAULT_WINDOW } from '../analytics/chartsignalsdistill'
 
 const last = (arr: number[]): number => {
   for (let i = arr.length - 1; i >= 0; i--) if (Number.isFinite(arr[i])) return arr[i]
@@ -1685,6 +1686,39 @@ export const STRATEGIES: StrategyDef[] = [
         direction: signal.direction,
         score: Math.round(corrStrength * 100),
         notes: `leader moved ${(signal.triggerReturn * 100).toFixed(2)}% (z ${signal.triggerZ.toFixed(1)}) ${fit.lag} bar${fit.lag === 1 ? '' : 's'} ago · corr ${fit.correlation.toFixed(2)} at lag ${fit.lag}`,
+      }
+    },
+  },
+  {
+    id: 'chartsignals-distill',
+    name: 'Chart Signals Distill (Kalman-OU)',
+    description:
+      'A decluttered version of Chart Signals Vote: builds a short rolling series of the raw combined-engine vote score (one reading per bar) and runs it through an Ornstein-Uhlenbeck fit + Kalman forward pass (analytics/chartsignalsdistill.ts) - the same "filter out the noise, keep the persistent signal" idea kalman-ou-reversion applies to price, applied here to the vote score itself instead. Trades only when the FILTERED (distilled) score clears its own threshold, which is typically a stricter, steadier bar than the raw vote (single-bar family flip-flops get smoothed away). Slower than Chart Signals Vote - it reruns the vote engine once per bar in its window.',
+    params: [
+      { key: 'window', label: 'Score-series window (bars)', type: 'number', min: 12, max: 40, default: DISTILL_DEFAULT_WINDOW },
+      { key: 'threshold', label: 'Min combined strength (0-100, per-bar vote)', type: 'number', min: 10, max: 90, step: 5, default: 35 },
+      { key: 'minAgree', label: 'Min families agreeing (of 5, per-bar vote)', type: 'number', min: 2, max: 5, default: 2 },
+      { key: 'distillThreshold', label: 'Min |decluttered score| to trade', type: 'number', min: 5, max: 90, step: 5, default: 25 },
+    ],
+    evaluate: (candles, p) => {
+      if (candles.length < 60) return { direction: 'none', score: 0, notes: 'thin history - no honest read' }
+      const out = distillChartSignals(candles, {
+        window: num(p, 'window', DISTILL_DEFAULT_WINDOW),
+        threshold: num(p, 'threshold', 35),
+        minAgree: num(p, 'minAgree', 2),
+        otc: false,
+        realTicks: null,
+      })
+      if (!out) return { direction: 'none', score: 0, notes: 'not enough history for the distill fit' }
+      const distillThr = num(p, 'distillThreshold', 25)
+      if (Math.abs(out.filtered) < distillThr) {
+        return { direction: 'none', score: 0, notes: `decluttered score ${out.filtered.toFixed(0)} below ${distillThr} (raw ${out.rawScore.toFixed(0)})` }
+      }
+      const dir = out.filtered > 0 ? 'call' : 'put'
+      return {
+        direction: dir,
+        score: clamp(Math.abs(out.filtered), 0, 100),
+        notes: `Kalman-distilled vote ${out.filtered.toFixed(0)} (raw ${out.rawScore.toFixed(0)}, θ ${out.theta.toFixed(0)}, z ${out.z.toFixed(2)}, n=${out.n})`,
       }
     },
   },

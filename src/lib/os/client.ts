@@ -466,6 +466,42 @@ export async function getLeadLagStats(tf?: Timeframe): Promise<LeadLagStats> {
   return osGet<LeadLagStats>('/leadlag_stats', tf ? { tf } : {})
 }
 
+// ---- Chart Signals Distill (Kalman-OU-smoothed combined vote) -----------
+
+export interface ChartSignalsDistillResult {
+  filtered: number
+  theta: number
+  z: number
+  tStat: number
+  sigmaEq: number
+  rawScore: number
+  n: number
+}
+
+export interface ChartSignalsDistillResponse {
+  ok: boolean
+  asset: string
+  tf: Timeframe
+  price: number | null
+  result: ChartSignalsDistillResult | null
+  direction: 'call' | 'put' | null
+  ts: number
+}
+
+export async function getChartSignalsDistill(
+  asset: string,
+  tf: Timeframe,
+  opts?: { window?: number; threshold?: number; minAgree?: number }
+): Promise<ChartSignalsDistillResponse> {
+  return osGet<ChartSignalsDistillResponse>('/distill', {
+    asset,
+    tf,
+    ...(opts?.window !== undefined ? { window: opts.window } : {}),
+    ...(opts?.threshold !== undefined ? { threshold: opts.threshold } : {}),
+    ...(opts?.minAgree !== undefined ? { minAgree: opts.minAgree } : {}),
+  })
+}
+
 // ---- chart-signal outcome stats (Task 64-c: the honesty loop) ------------
 
 export type SignalOutcomeId = 'win' | 'loss' | 'flat' | 'timeout'

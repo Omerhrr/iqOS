@@ -16,6 +16,7 @@ import SignalPanel from '@/components/os/SignalPanel'
 import ChartSignalsPanel from '@/components/os/ChartSignalsPanel'
 import YesterdayPanel from '@/components/os/YesterdayPanel'
 import LeadLagPanel from '@/components/os/LeadLagPanel'
+import ChartSignalsDistillPanel from '@/components/os/ChartSignalsDistillPanel'
 import MarkovPanel from '@/components/os/MarkovPanel'
 import { DeltaFootprintView } from '@/components/os/OrderFlowPanel'
 import CandleMathView from '@/components/os/CandleMathView'
@@ -128,11 +129,13 @@ export default function OSPage() {
   const [chartType, setChartType] = useState<ChartType>('candles')
   const [pickerOpen, setPickerOpen] = useState(false)
   const [signalsOpen, setSignalsOpen] = useState(false)
-  // left dock has three sidebar modes now: the chart-signals scanner, the
-  // same-time-yesterday replay, and the lead-lag correlation scanner - one
-  // open at a time, the open strip shows all three buttons when none is
+  // left dock has four sidebar modes now: the chart-signals scanner, the
+  // same-time-yesterday replay, the lead-lag correlation scanner, and the
+  // chart-signals distill (Kalman-OU-smoothed vote) panel - one open at a
+  // time, the open strip shows all four buttons when none is
   const [ydayOpen, setYdayOpen] = useState(false)
   const [leadlagOpen, setLeadlagOpen] = useState(false)
+  const [distillOpen, setDistillOpen] = useState(false)
   const [registry, setRegistry] = useState<RegistryEntry[]>([])
   const [activeOverlays, setActiveOverlays] = useState<ActiveIndicator[]>([])
   const [activeSubs, setActiveSubs] = useState<ActiveIndicator[]>([])
@@ -938,12 +941,14 @@ export default function OSPage() {
                 closed = the slim open strip sits above the market watch and
                 everything is laid out exactly as before. */}
             <Panel defaultSize={17} minSize={11}>
-              {signalsOpen || ydayOpen || leadlagOpen ? (
+              {signalsOpen || ydayOpen || leadlagOpen || distillOpen ? (
                 <div className="mr-0.5 h-full min-h-0">
                   {ydayOpen ? (
                     <YesterdayPanel onClose={() => setYdayOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onFocusWindow={handleFocusYesterday} />
                   ) : leadlagOpen ? (
                     <LeadLagPanel onClose={() => setLeadlagOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
+                  ) : distillOpen ? (
+                    <ChartSignalsDistillPanel onClose={() => setDistillOpen(false)} asset={asset} tf={tf} />
                   ) : (
                     <ChartSignalsPanel onClose={() => setSignalsOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onTake={handleTakeSignal} />
                   )}
@@ -980,6 +985,16 @@ export default function OSPage() {
                       >
                         <span className="h-1.5 w-1.5 rounded-full bg-cyan-400" />
                         Lead-Lag
+                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setDistillOpen(true)}
+                        title="open the chart-signals distill panel - Kalman-OU-smoothed read of the combined chart-engine vote for the active instrument"
+                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-amber-500/40 hover:text-amber-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
+                        Chart Distill
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
                       <div className="min-h-0 flex-1">
