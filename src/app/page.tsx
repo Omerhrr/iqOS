@@ -966,6 +966,14 @@ export default function OSPage() {
                 <PanelGroup direction="vertical" autoSaveId="iqos:left" className="h-full">
                   <Panel defaultSize={46} minSize={15}>
                     <div className="mr-0.5 flex h-full min-h-0 flex-col">
+                      {/* the open-strip buttons live in their own shrinkable,
+                          scrollable sub-container (not "shrink-0" on the
+                          whole group) so dragging the hHandle below this
+                          panel can squeeze Market Watch all the way down to
+                          nothing - and grow it to cover Indicators above -
+                          exactly like Indicators resizes against it, instead
+                          of the fixed button stack blocking the drag range. */}
+                      <div className="min-h-0 shrink overflow-y-auto">
                       <button
                         type="button"
                         onClick={() => setSignalsOpen(true)}
@@ -1026,6 +1034,7 @@ export default function OSPage() {
                         Vol Arb
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
+                      </div>
                       <div className="min-h-0 flex-1">
                         <MarketWatch assets={assets} active={asset} prices={prices} onSelect={handleSelectAsset} onVisibleTickers={handleVisibleTickers} />
                       </div>
