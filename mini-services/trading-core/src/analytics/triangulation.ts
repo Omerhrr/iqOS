@@ -91,6 +91,67 @@ export function findTriangles(tickers: string[]): TriangleCandidate[] {
   return out
 }
 
+/** Given ONE specific ticker (the real, as-traded cross pair - e.g. EURJPY,
+ * base EUR/quote JPY, exactly as IQ Option names it) and the full FX ticker
+ * universe, finds a shared "middle" currency M such that base/M and M/quote
+ * both trade, and returns the two legs ORIENTED so that
+ * `legAB_price * legBC_price` lands directly in the cross ticker's own
+ * base/quote units - no further inversion needed by the caller, unlike
+ * TriangleCandidate (which orients everything to the alphabetical a/b/c
+ * ordering findTriangles uses for the scan panel's own bookkeeping). Used to
+ * thread a second/third series into a strategy backtest via
+ * StrategyHints.leaderCandles/leaderCandles2, where the hint must already be
+ * directly comparable to the asset's own candles. */
+export function legsForCross(
+  ticker: string,
+  tickers: string[],
+): { legAB: { ticker: string; invert: boolean }; legBC: { ticker: string; invert: boolean }; middle: string } | null {
+  const self = parseFxTicker(ticker)
+  if (!self) return null
+  const legs = tickers.map(parseFxTicker).filter((x): x is FxLeg => x !== null)
+  const pairIndex = new Map<string, FxLeg>()
+  for (const l of legs) {
+    const key = [l.base, l.quote].sort().join('|')
+    const existing = pairIndex.get(key)
+    if (!existing || (existing.ticker.endsWith('-OTC') && !l.ticker.endsWith('-OTC'))) pairIndex.set(key, l)
+  }
+  const currencies = new Set<string>()
+  for (const l of legs) {
+    currencies.add(l.base)
+    currencies.add(l.quote)
+  }
+  for (const m of currencies) {
+    if (m === self.base || m === self.quote) continue
+    const ab = pairIndex.get([self.base, m].sort().join('|'))
+    const bc = pairIndex.get([m, self.quote].sort().join('|'))
+    if (!ab || !bc) continue
+    // ab oriented to read "base per m"; bc oriented to read "m per quote" -
+    // multiplying the two lands in "base per quote", the cross's own units.
+    if (ab.ticker === ticker || bc.ticker === ticker) continue // degenerate (shouldn't happen - ab/bc are always the OTHER two pairs)
+    return {
+      legAB: { ticker: ab.ticker, invert: ab.base !== self.base },
+      legBC: { ticker: bc.ticker, invert: bc.base !== m },
+      middle: m,
+    }
+  }
+  return null
+}
+
+/** Applies an orientation flip (1/price) to a candle series, OHLC-consistent
+ * (inverting a positive series reverses high/low order). Only `close` feeds
+ * fitTriangulation's math, but open/high/low are flipped too so the series
+ * stays a well-formed Candle[] for any caller that inspects them. */
+export function orientCandles(candles: Candle[], invert: boolean): Candle[] {
+  if (!invert) return candles
+  return candles.map((c) => ({
+    ...c,
+    open: 1 / c.open,
+    close: 1 / c.close,
+    high: 1 / c.low,
+    low: 1 / c.high,
+  }))
+}
+
 export interface TriangulationFit {
   synthetic: number
   actual: number

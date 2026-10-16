@@ -670,6 +670,41 @@ export async function getTriangulationScan(tf: Timeframe): Promise<Triangulation
   return osGet<TriangulationScanResponse>('/triangulation_scan', { tf })
 }
 
+// ---- ADX/DI + Pattern Bias composite -------------------------------------
+
+export interface AdxPatternBiasScanRow {
+  asset: string
+  name: string
+  category: string
+  otc: boolean
+  open: boolean
+  price: number
+  adx: number
+  plusDI: number
+  minusDI: number
+  trending: boolean
+  patternBias: number
+  topPattern: string | null
+  topPatternBarsAgo: number | null
+  agree: boolean
+  composite: number
+  direction: 'call' | 'put' | null
+  qualifies: boolean
+}
+
+export interface AdxPatternBiasScanResponse {
+  ok: boolean
+  tf: Timeframe
+  scanned: number
+  qualifying: number
+  rows: AdxPatternBiasScanRow[]
+  ts: number
+}
+
+export async function getAdxPatternBiasScan(tf: Timeframe): Promise<AdxPatternBiasScanResponse> {
+  return osGet<AdxPatternBiasScanResponse>('/adx_pattern_bias_scan', { tf })
+}
+
 // ---- chart-signal outcome stats (Task 64-c: the honesty loop) ------------
 
 export type SignalOutcomeId = 'win' | 'loss' | 'flat' | 'timeout'

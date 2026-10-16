@@ -20,6 +20,7 @@ import ChartSignalsDistillPanel from '@/components/os/ChartSignalsDistillPanel'
 import CointegrationPanel from '@/components/os/CointegrationPanel'
 import VolatilityArbPanel from '@/components/os/VolatilityArbPanel'
 import TriangulationPanel from '@/components/os/TriangulationPanel'
+import AdxPatternBiasPanel from '@/components/os/AdxPatternBiasPanel'
 import MarkovPanel from '@/components/os/MarkovPanel'
 import { DeltaFootprintView } from '@/components/os/OrderFlowPanel'
 import CandleMathView from '@/components/os/CandleMathView'
@@ -143,6 +144,7 @@ export default function OSPage() {
   const [cointegrationOpen, setCointegrationOpen] = useState(false)
   const [volarbOpen, setVolarbOpen] = useState(false)
   const [triangulationOpen, setTriangulationOpen] = useState(false)
+  const [adxPatternBiasOpen, setAdxPatternBiasOpen] = useState(false)
   const [registry, setRegistry] = useState<RegistryEntry[]>([])
   const [activeOverlays, setActiveOverlays] = useState<ActiveIndicator[]>([])
   const [activeSubs, setActiveSubs] = useState<ActiveIndicator[]>([])
@@ -948,7 +950,7 @@ export default function OSPage() {
                 closed = the slim open strip sits above the market watch and
                 everything is laid out exactly as before. */}
             <Panel defaultSize={17} minSize={11}>
-              {signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen ? (
+              {signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen ? (
                 <div className="mr-0.5 h-full min-h-0">
                   {ydayOpen ? (
                     <YesterdayPanel onClose={() => setYdayOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onFocusWindow={handleFocusYesterday} />
@@ -962,6 +964,8 @@ export default function OSPage() {
                     <VolatilityArbPanel onClose={() => setVolarbOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
                   ) : triangulationOpen ? (
                     <TriangulationPanel onClose={() => setTriangulationOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
+                  ) : adxPatternBiasOpen ? (
+                    <AdxPatternBiasPanel onClose={() => setAdxPatternBiasOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
                   ) : (
                     <ChartSignalsPanel onClose={() => setSignalsOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onTake={handleTakeSignal} />
                   )}
@@ -1046,6 +1050,16 @@ export default function OSPage() {
                       >
                         <span className="h-1.5 w-1.5 rounded-full bg-teal-400" />
                         Triangulation
+                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setAdxPatternBiasOpen(true)}
+                        title="open the ADX/DI + pattern bias panel - trend strength/direction combined with recent candlestick pattern bias"
+                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-violet-500/40 hover:text-violet-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-violet-400" />
+                        ADX/DI + Pattern
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
                       </div>

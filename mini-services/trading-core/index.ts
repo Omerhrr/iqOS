@@ -35,7 +35,8 @@ import { leadersFor, LEADLAG_GROUPS } from './src/analytics/leadlag'
 import { distillChartSignals, DISTILL_DEFAULT_WINDOW } from './src/analytics/chartsignalsdistill'
 import { fitCointegration, COINTEGRATION_WINDOW, COINTEGRATION_MIN_R2, COINTEGRATION_MIN_TSTAT, COINTEGRATION_MAX_HALFLIFE } from './src/analytics/cointegration'
 import { computeVolArb, VOLARB_DEFAULT_WINDOW } from './src/analytics/volarb'
-import { findTriangles, fitTriangulation, TRIANGULATION_WINDOW, TRIANGULATION_Z_ENTRY, type TriangleCandidate } from './src/analytics/triangulation'
+import { findTriangles, fitTriangulation, legsForCross, orientCandles, TRIANGULATION_WINDOW, TRIANGULATION_Z_ENTRY, type TriangleCandidate } from './src/analytics/triangulation'
+import { fitAdxPatternBias } from './src/analytics/adxpatternbias'
 import { normalizeSpec, type CustomSpec } from './src/strategies/custom'
 import { MINABLE_ENGINES, ENGINE_LABEL, type ChartEngineId } from './src/analytics/chartsignals'
 import { vskMonteCarlo } from './src/analytics/vsk'
@@ -434,6 +435,66 @@ function scanTriangulation(market: MarketDataService, tfv: Timeframe): Triangula
   }
   rows.sort((x, y) => Number(y.qualifies) - Number(x.qualifies) || Math.abs(y.z) - Math.abs(x.z))
   triangulationScanCache.set(tfv, { ts: Date.now(), rows })
+  return rows
+}
+
+interface AdxPatternBiasScanRow {
+  asset: string
+  name: string
+  category: string
+  otc: boolean
+  open: boolean
+  price: number
+  adx: number
+  plusDI: number
+  minusDI: number
+  trending: boolean
+  patternBias: number
+  topPattern: string | null
+  topPatternBarsAgo: number | null
+  agree: boolean
+  composite: number
+  direction: 'call' | 'put' | null
+  qualifies: boolean
+}
+const adxPatternBiasScanCache = new Map<Timeframe, { ts: number; rows: AdxPatternBiasScanRow[] }>()
+
+function scanAdxPatternBias(market: MarketDataService, tfv: Timeframe): AdxPatternBiasScanRow[] {
+  const cached = adxPatternBiasScanCache.get(tfv)
+  if (cached && Date.now() - cached.ts < SCAN_CACHE_MS) return cached.rows
+  const rows: AdxPatternBiasScanRow[] = []
+  for (const a of market.assets) {
+    if (!a.open) continue
+    try {
+      const candles = market.getCandlesDeep(a.ticker, tfv, 400, true)
+      const fit = fitAdxPatternBias(candles)
+      if (!fit) continue
+      const direction: 'call' | 'put' | null = fit.qualifies ? (fit.direction === 'bullish' ? 'call' : fit.direction === 'bearish' ? 'put' : null) : null
+      rows.push({
+        asset: a.ticker,
+        name: a.name,
+        category: a.category,
+        otc: !!a.otc,
+        open: a.open,
+        price: candles[candles.length - 1]?.close ?? 0,
+        adx: fit.adx,
+        plusDI: fit.plusDI,
+        minusDI: fit.minusDI,
+        trending: fit.trending,
+        patternBias: fit.patternBias,
+        topPattern: fit.topPattern,
+        topPatternBarsAgo: fit.topPatternBarsAgo,
+        agree: fit.agree,
+        composite: fit.composite,
+        direction,
+        qualifies: fit.qualifies,
+      })
+    } catch {
+      /* one bad asset never breaks the scan */
+    }
+  }
+  rows.sort((x, y) => Number(y.qualifies) - Number(x.qualifies) || Math.abs(y.composite) - Math.abs(x.composite))
+  adxPatternBiasScanCache.set(tfv, { ts: Date.now(), rows })
   return rows
 }
 
@@ -1802,6 +1863,21 @@ const httpServer = createServer(async (req, res) => {
         }
       }
 
+      // ADX/DI + Pattern Bias scan: every open instrument's trend
+      // strength/direction (ADX/+DI/-DI, analytics/indicators.ts) combined
+      // with its recent candlestick pattern bias (analytics/patterns.ts)
+      // into one agreement-gated composite. See analytics/adxpatternbias.ts.
+      if (path === '/adx_pattern_bias_scan') {
+        try {
+          const tfv = tfStrict(q.get('tf'))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const rows = scanAdxPatternBias(market, tfv)
+          return json(200, { ok: true, tf: tfv, scanned: rows.length, qualifying: rows.filter((r) => r.qualifies).length, rows, ts: Date.now() })
+        } catch (err) {
+          return json(400, { ok: false, error: (err as Error).message })
+        }
+      }
+
       // Same-time-yesterday scanner: for every open instrument, what was the
       // market doing EXACTLY 24h ago - and in the window right after? Each
       // row carries the price at that moment, the forward window's net move /
@@ -2573,19 +2649,39 @@ const httpServer = createServer(async (req, res) => {
           // Lead-lag-style strategies (leadlag-echo) need the group leader's
           // own candles, index-aligned with optCandles - see
           // analytics/leadlag.ts leadersFor and gridSearch's leaderCandles doc.
+          // Triangulation-arb instead needs its two FX triangle legs - see
+          // analytics/triangulation.ts legsForCross.
           let optLeaderCandles: Candle[] | undefined
-          const optLeaders = leadersFor(optAsset)
-          if (optLeaders.length > 0) {
+          let optLeaderCandles2: Candle[] | undefined
+          if (strategyId === 'triangulation-arb') {
             try {
-              const lc = market.getCandlesDeep(optLeaders[0], optTf, 2200)
-              if (lc.length === optCandles.length) optLeaderCandles = lc
+              const legs = legsForCross(optAsset, market.assets.filter((a) => a.category === 'forex').map((a) => a.ticker))
+              if (legs) {
+                const abRaw = market.getCandlesDeep(legs.legAB.ticker, optTf, 2200)
+                const bcRaw = market.getCandlesDeep(legs.legBC.ticker, optTf, 2200)
+                if (abRaw.length === optCandles.length && bcRaw.length === optCandles.length) {
+                  optLeaderCandles = orientCandles(abRaw, legs.legAB.invert)
+                  optLeaderCandles2 = orientCandles(bcRaw, legs.legBC.invert)
+                }
+              }
             } catch {
-              /* leader history unavailable - leadlag-echo honestly stands aside */
+              /* triangle leg history unavailable - triangulation-arb honestly stands aside */
+            }
+          } else {
+            const optLeaders = leadersFor(optAsset)
+            if (optLeaders.length > 0) {
+              try {
+                const lc = market.getCandlesDeep(optLeaders[0], optTf, 2200)
+                if (lc.length === optCandles.length) optLeaderCandles = lc
+              } catch {
+                /* leader history unavailable - leadlag-echo honestly stands aside */
+              }
             }
           }
           const out = gridSearch(optCandles, optAsset, optTf, {
             strategy: strategyId,
             leaderCandles: optLeaderCandles,
+            leaderCandles2: optLeaderCandles2,
             sweep: (body.sweep as Record<string, { from: number; to: number; step: number }>) ?? {},
             fixedParams: (body.params as Record<string, number | string>) ?? {},
             objective: (body.objective as Objective) ?? 'netPnl',
@@ -2624,19 +2720,38 @@ const httpServer = createServer(async (req, res) => {
         const wfCandles = market.getCandlesDeep(wfAsset, wfTf, 2200)
         // Lead-lag-style strategies (leadlag-echo) need the group leader's own
         // candles, index-aligned with wfCandles - same lookup as /optimize.
+        // Triangulation-arb instead needs its two FX triangle legs.
         let wfLeaderCandles: Candle[] | undefined
-        const wfLeaders = leadersFor(wfAsset)
-        if (wfLeaders.length > 0) {
+        let wfLeaderCandles2: Candle[] | undefined
+        if (strategyId === 'triangulation-arb') {
           try {
-            const lc = market.getCandlesDeep(wfLeaders[0], wfTf, 2200)
-            if (lc.length === wfCandles.length) wfLeaderCandles = lc
+            const legs = legsForCross(wfAsset, market.assets.filter((a) => a.category === 'forex').map((a) => a.ticker))
+            if (legs) {
+              const abRaw = market.getCandlesDeep(legs.legAB.ticker, wfTf, 2200)
+              const bcRaw = market.getCandlesDeep(legs.legBC.ticker, wfTf, 2200)
+              if (abRaw.length === wfCandles.length && bcRaw.length === wfCandles.length) {
+                wfLeaderCandles = orientCandles(abRaw, legs.legAB.invert)
+                wfLeaderCandles2 = orientCandles(bcRaw, legs.legBC.invert)
+              }
+            }
           } catch {
-            /* leader history unavailable - leadlag-echo honestly stands aside */
+            /* triangle leg history unavailable - triangulation-arb honestly stands aside */
+          }
+        } else {
+          const wfLeaders = leadersFor(wfAsset)
+          if (wfLeaders.length > 0) {
+            try {
+              const lc = market.getCandlesDeep(wfLeaders[0], wfTf, 2200)
+              if (lc.length === wfCandles.length) wfLeaderCandles = lc
+            } catch {
+              /* leader history unavailable - leadlag-echo honestly stands aside */
+            }
           }
         }
         const out = walkForward(wfCandles, wfAsset, wfTf, {
           strategy: strategyId,
           leaderCandles: wfLeaderCandles,
+          leaderCandles2: wfLeaderCandles2,
           sweep: (body.sweep as Record<string, { from: number; to: number; step: number }>) ?? {},
           fixedParams: (body.params as Record<string, number | string>) ?? {},
           objective: (body.objective as Objective) ?? 'netPnl',
@@ -2759,6 +2874,9 @@ const httpServer = createServer(async (req, res) => {
             customSpec: resolveCustomSpec(sweepStrategyId),
             direction: directionOf(body),
             edgeTrigger: Boolean(body.edgeTrigger),
+            // triangulation-arb only: the full FX universe so legsForCross can
+            // find a triangle leg pair outside the swept rows themselves.
+            allForexTickers: sweepStrategyId === 'triangulation-arb' ? market.assets.filter((a) => a.category === 'forex').map((a) => a.ticker) : undefined,
           }
         )
         return json(200, { ok: true, result: out })

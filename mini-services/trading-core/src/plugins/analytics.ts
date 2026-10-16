@@ -10,6 +10,7 @@ import { backtest, type BacktestOptions } from '../strategies/backtest'
 import { STRATEGIES, getStrategy, defaultParams } from '../strategies/builtin'
 import { evalWithEdge } from '../analytics/edge'
 import { leadersFor } from '../analytics/leadlag'
+import { legsForCross, orientCandles } from '../analytics/triangulation'
 
 export class AnalyticsService {
   private ctx!: KernelContext
@@ -81,17 +82,52 @@ export class AnalyticsService {
     // when `asset` is actually a known follower (leadersFor returns [] for
     // everything else, including leaders themselves) - every other
     // strategy id just ignores the unused opts.leaderCandles passthrough.
-    const leaders = leadersFor(asset)
     let leaderCandles: typeof candles | undefined
-    if (leaders.length > 0) {
+    let leaderCandles2: typeof candles | undefined
+    if (opts.strategy === 'triangulation-arb') {
+      // Triangulation's two auxiliary legs: only meaningful when `asset` is
+      // itself the cross side of a known FX triangle (legsForCross finds a
+      // shared "middle" currency), fetched here (not inside builtin.ts,
+      // which has no market access) and pre-oriented so they multiply
+      // straight into the cross's own units - evaluate() never flips them.
+      // Gated on the strategy id so it never collides with the lead-lag
+      // leaderCandles slot below (same field name, different meaning).
       try {
-        const lc = this.market.getCandlesDeep(leaders[0], tf, 2200, true)
-        if (lc.length >= 300) leaderCandles = lc
+        const legs = legsForCross(asset, this.market.assets.filter((a) => a.category === 'forex').map((a) => a.ticker))
+        if (legs) {
+          const abRaw = this.market.getCandlesDeep(legs.legAB.ticker, tf, 2200, true)
+          const bcRaw = this.market.getCandlesDeep(legs.legBC.ticker, tf, 2200, true)
+          if (abRaw.length === candles.length && bcRaw.length === candles.length) {
+            leaderCandles = orientCandles(abRaw, legs.legAB.invert)
+            leaderCandles2 = orientCandles(bcRaw, legs.legBC.invert)
+          }
+        }
       } catch {
-        /* leader history unavailable - the strategy honestly stands aside */
+        /* triangle leg history unavailable - triangulation-arb honestly stands aside */
+      }
+    } else {
+      // Lead-lag-style strategies need a SECOND series: the group leader's
+      // own candles, same tf, fetched here (not inside backtest.ts, which
+      // has no market access) and threaded through as leaderCandles. Only
+      // matters when `asset` is actually a known follower (leadersFor
+      // returns [] for everything else, including leaders themselves) -
+      // every other strategy id just ignores the unused opts.leaderCandles
+      // passthrough.
+      const leaders = leadersFor(asset)
+      if (leaders.length > 0) {
+        try {
+          const lc = this.market.getCandlesDeep(leaders[0], tf, 2200, true)
+          if (lc.length >= 300) leaderCandles = lc
+        } catch {
+          /* leader history unavailable - the strategy honestly stands aside */
+        }
       }
     }
-    return backtest(candles, asset, tf, { ...opts, leaderCandles: leaderCandles ?? opts.leaderCandles })
+    return backtest(candles, asset, tf, {
+      ...opts,
+      leaderCandles: leaderCandles ?? opts.leaderCandles,
+      leaderCandles2: leaderCandles2 ?? opts.leaderCandles2,
+    })
   }
 
   private log(..._args: unknown[]) {

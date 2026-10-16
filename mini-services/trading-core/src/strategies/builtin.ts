@@ -24,6 +24,8 @@ import { fitLeadLag, projectLeadLagSignal } from '../analytics/leadlag'
 import { distillChartSignals, DISTILL_DEFAULT_WINDOW } from '../analytics/chartsignalsdistill'
 import { fitCointegration, COINTEGRATION_WINDOW, COINTEGRATION_MIN_R2, COINTEGRATION_MIN_TSTAT, COINTEGRATION_MAX_HALFLIFE } from '../analytics/cointegration'
 import { computeVolArb, VOLARB_DEFAULT_WINDOW } from '../analytics/volarb'
+import { fitTriangulation, TRIANGULATION_WINDOW, TRIANGULATION_MIN_WINDOW, TRIANGULATION_Z_ENTRY } from '../analytics/triangulation'
+import { fitAdxPatternBias, ADX_TREND_THRESHOLD, COMPOSITE_QUALIFY } from '../analytics/adxpatternbias'
 
 const last = (arr: number[]): number => {
   for (let i = arr.length - 1; i >= 0; i--) if (Number.isFinite(arr[i])) return arr[i]
@@ -1794,6 +1796,74 @@ export const STRATEGIES: StrategyDef[] = [
         return { direction: dir, score, notes: `close vol ${(1 / Math.max(out.ratio, 1e-6)).toFixed(2)}x range vol - steady grind, continuing the ${dir === 'call' ? 'up' : 'down'} drift` }
       }
       return { direction: 'none', score: 0, notes: `range/close vol ratio ${out.ratio.toFixed(2)} - the two estimators agree, no arb edge` }
+    },
+  },
+  {
+    id: 'triangulation-arb',
+    name: 'Triangulation Arbitrage (Cross-Rate Delta)',
+    description:
+      'Three-leg FX triangle: trades the gap between this asset\'s ACTUAL price and its SYNTHETIC price (the product of the two other legs chained through their shared currency - e.g. EUR/JPY vs EUR/USD x USD/JPY, analytics/triangulation.ts). Only backtestable for an asset that is actually the cross side of a known FX triangle (needs two auxiliary leg series - see StrategyHints.leaderCandles/leaderCandles2) - everything else honestly stands aside, the same way lead-lag/cointegration do for a non-follower asset.',
+    params: [
+      { key: 'window', label: 'Basis z-score window (bars)', type: 'number', min: 30, max: 300, default: TRIANGULATION_WINDOW },
+      { key: 'zEntry', label: 'Z entry threshold', type: 'number', min: 0.5, max: 4, step: 0.1, default: TRIANGULATION_Z_ENTRY },
+    ],
+    evaluate: (candles, p, hints) => {
+      const abCloses = hints?.leaderCandles?.map((c) => c.close)
+      const bcCloses = hints?.leaderCandles2?.map((c) => c.close)
+      if (!abCloses || !bcCloses || abCloses.length < TRIANGULATION_MIN_WINDOW || bcCloses.length < TRIANGULATION_MIN_WINDOW || candles.length < TRIANGULATION_MIN_WINDOW) {
+        return { direction: 'none', score: 0, notes: 'no triangle legs for this asset - not the cross side of a known FX triangle, or not enough bars yet' }
+      }
+      const acCloses = candles.map((c) => c.close)
+      const window = num(p, 'window', TRIANGULATION_WINDOW)
+      // leg series are pre-oriented (plugins/analytics.ts's legsForCross +
+      // orientCandles) to already multiply straight into the cross's own
+      // units, so every invert flag here is false - no further flipping.
+      const fit = fitTriangulation(abCloses, bcCloses, acCloses, false, false, false, window)
+      if (!fit) return { direction: 'none', score: 0, notes: 'not enough overlapping history for the basis fit' }
+      const zEntry = num(p, 'zEntry', TRIANGULATION_Z_ENTRY)
+      if (Math.abs(fit.z) < zEntry) {
+        return { direction: 'none', score: 0, notes: `basis z ${fit.z.toFixed(2)} inside ±${zEntry} - synthetic and actual agree right now` }
+      }
+      const dir = fit.z >= zEntry ? 'put' : 'call'
+      const score = clamp(45 + (Math.abs(fit.z) - zEntry) * 20, 40, 90)
+      return {
+        direction: dir,
+        score,
+        notes: `actual ${dir === 'put' ? 'rich' : 'cheap'} vs synthetic (Δ ${fit.deltaPct.toFixed(4)}%, z ${fit.z.toFixed(2)}, n=${fit.n})`,
+      }
+    },
+  },
+  {
+    id: 'adx-pattern-bias',
+    name: 'ADX/DI + Pattern Bias',
+    description:
+      'Combines two already-live reads instead of inventing new math: ADX/+DI/-DI (analytics/indicators.ts - trend strength/direction) and the net candlestick pattern bias (analytics/patterns.ts - recency+reliability weighted vote across recent pattern hits). Trades only when the two AGREE on direction and the combined composite clears its own threshold (analytics/adxpatternbias.ts) - a strong trend fighting a fresh reversal candle gets pulled back toward 0 instead of just winning on size, and a single pattern hit with no trend behind it is filtered out as noise.',
+    params: [
+      { key: 'adxThreshold', label: 'Min ADX to count as trending', type: 'number', min: 10, max: 50, default: ADX_TREND_THRESHOLD },
+      { key: 'lookback', label: 'Pattern scan lookback (bars)', type: 'number', min: 3, max: 20, default: 8 },
+      { key: 'qualify', label: 'Min |composite| to trade (0-10)', type: 'number', min: 1, max: 10, step: 0.5, default: COMPOSITE_QUALIFY },
+    ],
+    evaluate: (candles, p) => {
+      const fit = fitAdxPatternBias(candles, 14, num(p, 'lookback', 8))
+      if (!fit) return { direction: 'none', score: 0, notes: 'thin history - not enough bars for ADX + pattern bias' }
+      if (!fit.agree) {
+        return {
+          direction: 'none',
+          score: 0,
+          notes: `ADX/DI (${fit.adxDirection}) and pattern bias (${fit.patternDirection}, ${fit.patternBias >= 0 ? '+' : ''}${fit.patternBias.toFixed(1)}) disagree or one is flat`,
+        }
+      }
+      const qualify = num(p, 'qualify', COMPOSITE_QUALIFY)
+      if (Math.abs(fit.composite) < qualify) {
+        return { direction: 'none', score: 0, notes: `composite ${fit.composite.toFixed(1)} agrees (${fit.direction}) but too weak to clear ${qualify}` }
+      }
+      const dir = fit.direction === 'bullish' ? 'call' : 'put'
+      const score = clamp(40 + Math.abs(fit.composite) * 5, 40, 95)
+      return {
+        direction: dir,
+        score,
+        notes: `ADX ${fit.adx.toFixed(1)} (+DI ${fit.plusDI.toFixed(1)}/-DI ${fit.minusDI.toFixed(1)}) agrees with pattern bias ${fit.patternBias >= 0 ? '+' : ''}${fit.patternBias.toFixed(1)}${fit.topPattern ? ` (${fit.topPattern})` : ''} - composite ${fit.composite.toFixed(1)}`,
+      }
     },
   },
 ]

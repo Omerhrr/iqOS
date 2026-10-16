@@ -8,6 +8,7 @@ import { backtest, directionBreakdown, resolveStrategyDef, type DirectionMetrics
 import type { CustomSpec } from './custom'
 import { sharpeRatio } from '../analytics/quant'
 import { leadersFor } from '../analytics/leadlag'
+import { legsForCross, orientCandles } from '../analytics/triangulation'
 
 export type Objective = 'netPnl' | 'sharpe' | 'profitFactor' | 'winRate' | 'expectancy'
 export type SweepSpec = Record<string, { from: number; to: number; step: number }>
@@ -317,6 +318,9 @@ export function fastBacktest(
     // responsible for slicing their own leaderCandles input to match
     // whatever `candles` they pass in here.
     leaderCandles?: Candle[]
+    // triangulation-arb's second leg (B/C) - same alignment contract as
+    // leaderCandles above, which carries leg A/B for that strategy.
+    leaderCandles2?: Candle[]
   } = {}
 ): FastMetrics {
   const strat = resolveStrategyDef(strategyId, opts.customSpec)
@@ -336,7 +340,12 @@ export function fastBacktest(
   // length as `candles`, otherwise a lead-lag strategy honestly gets no
   // leaderCandles rather than reading a misaligned bar.
   const alignedLeader = opts.leaderCandles && opts.leaderCandles.length === candles.length ? opts.leaderCandles : undefined
-  const hintsAt = (i: number) => (alignedLeader ? { asset: opts.asset, leaderCandles: alignedLeader.slice(0, i + 1) } : { asset: opts.asset })
+  const alignedLeader2 = opts.leaderCandles2 && opts.leaderCandles2.length === candles.length ? opts.leaderCandles2 : undefined
+  const hintsAt = (i: number) => ({
+    asset: opts.asset,
+    ...(alignedLeader ? { leaderCandles: alignedLeader.slice(0, i + 1) } : {}),
+    ...(alignedLeader2 ? { leaderCandles2: alignedLeader2.slice(0, i + 1) } : {}),
+  })
 
   const trades: BacktestTrade[] = []
   const rets: number[] = []
@@ -530,6 +539,9 @@ export interface GridSearchOptions {
   // analytics/leadlag.ts's leadersFor(asset) and fetches it the same way).
   // Absent for every strategy that doesn't need a second asset's history.
   leaderCandles?: Candle[]
+  // triangulation-arb's second leg (B/C) - same alignment contract as
+  // leaderCandles above, which carries leg A/B for that strategy.
+  leaderCandles2?: Candle[]
 }
 
 export function gridSearch(candles: Candle[], asset: string, tf: Timeframe, opts: GridSearchOptions): GridSearchResult {
@@ -541,6 +553,7 @@ export function gridSearch(candles: Candle[], asset: string, tf: Timeframe, opts
   // array this function received (see fastBacktest's alignedLeader doc) -
   // a length mismatch means a lead-lag strategy honestly stands aside.
   const leaderCandles = opts.leaderCandles && opts.leaderCandles.length === candles.length ? opts.leaderCandles : undefined
+  const leaderCandles2 = opts.leaderCandles2 && opts.leaderCandles2.length === candles.length ? opts.leaderCandles2 : undefined
   const common = {
     payout: opts.payout,
     amount: opts.amount,
@@ -554,6 +567,7 @@ export function gridSearch(candles: Candle[], asset: string, tf: Timeframe, opts
     edgeTrigger: opts.edgeTrigger,
     asset,
     leaderCandles,
+    leaderCandles2,
   }
   const sweptKeys = Object.keys(opts.sweep).filter((k) => strat.params.some((p) => p.key === k))
   // Base every combo on the strategy's registered defaults, then let any
@@ -618,6 +632,7 @@ export function gridSearch(candles: Candle[], asset: string, tf: Timeframe, opts
           direction: opts.direction,
           edgeTrigger: opts.edgeTrigger,
           leaderCandles,
+          leaderCandles2,
         })
         const [fciLow, fciHigh] = wilsonInterval(full.metrics.wins, full.metrics.totalTrades)
         const fm: FastMetrics = {
@@ -681,6 +696,7 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
   // Index-aligned with the full `candles` array (see gridSearch's identical
   // guard) - sliced per-fold below to match each fold's isSlice/oosSlice.
   const leaderCandles = opts.leaderCandles && opts.leaderCandles.length === candles.length ? opts.leaderCandles : undefined
+  const leaderCandles2 = opts.leaderCandles2 && opts.leaderCandles2.length === candles.length ? opts.leaderCandles2 : undefined
   const common = {
     payout: opts.payout,
     amount: opts.amount,
@@ -756,8 +772,9 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
     // full `candles`, so fastBacktest's own alignedLeader check (candles vs
     // leaderCandles length) passes and index i means the same bar in both.
     const isLeaderSlice = leaderCandles ? leaderCandles.slice(isStart, isStart + isBars) : undefined
+    const isLeaderSlice2 = leaderCandles2 ? leaderCandles2.slice(isStart, isStart + isBars) : undefined
     for (const combo of combos) {
-      const m = fastBacktest(isSlice, strat.id, combo, { ...common, warmup: isWarmup, startEquity: 1000, leaderCandles: isLeaderSlice })
+      const m = fastBacktest(isSlice, strat.id, combo, { ...common, warmup: isWarmup, startEquity: 1000, leaderCandles: isLeaderSlice, leaderCandles2: isLeaderSlice2 })
       const s = scoreOf(m, objective, minTrades)
       if (Number.isFinite(s) && s > bestScore) {
         bestScore = s
@@ -783,6 +800,7 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
     // Same alignment as the IS leader slice above, over the OOS window
     // (including its own warmup prefix, matching the main candles slice).
     const oosLeaderSlice = leaderCandles ? leaderCandles.slice(oosSliceStart, oosEnd) : undefined
+    const oosLeaderSlice2 = leaderCandles2 ? leaderCandles2.slice(oosSliceStart, oosEnd) : undefined
     const oosFull = backtest(candles.slice(oosSliceStart, oosEnd), asset, tf, {
       strategy: strat.id,
       params: bestCombo,
@@ -798,6 +816,7 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
       customSpec: opts.customSpec,
       direction: opts.direction,
       leaderCandles: oosLeaderSlice,
+      leaderCandles2: oosLeaderSlice2,
     })
     const [oosCiLow, oosCiHigh] = wilsonInterval(oosFull.metrics.wins, oosFull.metrics.totalTrades)
     const oosM: FastMetrics = {
@@ -922,6 +941,12 @@ export interface AssetSweepOptions {
   customSpec?: CustomSpec
   direction?: 'call' | 'put' | 'both'
   edgeTrigger?: boolean
+  // triangulation-arb only: the FULL FX ticker universe (not just the
+  // assets being swept) so legsForCross can find a triangle leg pair that
+  // isn't itself one of the rows being tested. Omit for every other
+  // strategy, and omit here too if the caller has no forex universe handy -
+  // triangulation-arb then honestly stands aside on every row.
+  allForexTickers?: string[]
 }
 
 export interface CandleFetcher {
@@ -986,14 +1011,33 @@ export function sweepAssets(
       // leader, and a fetch/alignment failure here only costs that one row
       // the lead-lag read - every other strategy ignores the unused option.
       let leaderCandles: Candle[] | undefined
-      const leaders = leadersFor(a.ticker)
-      if (leaders.length > 0) {
+      let leaderCandles2: Candle[] | undefined
+      if (strat.id === 'triangulation-arb') {
         try {
-          const rawLeader = fetchCandles(leaders[0])
-          const leaderFiltered = sharedWindow && winStart < winEnd ? rawLeader.filter((c) => c.time >= winStart && c.time <= winEnd) : rawLeader
-          if (leaderFiltered.length === candles.length) leaderCandles = leaderFiltered
+          const legs = legsForCross(a.ticker, opts.allForexTickers ?? [])
+          if (legs) {
+            const abFiltered0 = fetchCandles(legs.legAB.ticker)
+            const bcFiltered0 = fetchCandles(legs.legBC.ticker)
+            const abFiltered = sharedWindow && winStart < winEnd ? abFiltered0.filter((c) => c.time >= winStart && c.time <= winEnd) : abFiltered0
+            const bcFiltered = sharedWindow && winStart < winEnd ? bcFiltered0.filter((c) => c.time >= winStart && c.time <= winEnd) : bcFiltered0
+            if (abFiltered.length === candles.length && bcFiltered.length === candles.length) {
+              leaderCandles = orientCandles(abFiltered, legs.legAB.invert)
+              leaderCandles2 = orientCandles(bcFiltered, legs.legBC.invert)
+            }
+          }
         } catch {
-          /* leader history unavailable for this row - strategy stands aside */
+          /* triangle leg history unavailable for this row - strategy stands aside */
+        }
+      } else {
+        const leaders = leadersFor(a.ticker)
+        if (leaders.length > 0) {
+          try {
+            const rawLeader = fetchCandles(leaders[0])
+            const leaderFiltered = sharedWindow && winStart < winEnd ? rawLeader.filter((c) => c.time >= winStart && c.time <= winEnd) : rawLeader
+            if (leaderFiltered.length === candles.length) leaderCandles = leaderFiltered
+          } catch {
+            /* leader history unavailable for this row - strategy stands aside */
+          }
         }
       }
       // Per-asset real payout by default (each instrument's own broker payout,
@@ -1016,6 +1060,7 @@ export function sweepAssets(
         direction: opts.direction,
         edgeTrigger: opts.edgeTrigger,
         leaderCandles,
+        leaderCandles2,
       })
       const score = scoreOf(m, objective, minTrades)
       let liveDataPct: number | null = null

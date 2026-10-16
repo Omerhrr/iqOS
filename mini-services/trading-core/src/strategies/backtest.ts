@@ -121,6 +121,9 @@ export interface BacktestOptions {
   // `candles` array at every bar and passed through StrategyHints -
   // absent for every strategy that doesn't need a second asset's history.
   leaderCandles?: Candle[]
+  // triangulation-arb's second leg (B/C) - same alignment rule as
+  // leaderCandles above, which carries leg A/B for that strategy.
+  leaderCandles2?: Candle[]
   // Manually force which side(s) are taken, instead of the default "take
   // whatever the strategy signals and report both sides blended". 'call'/
   // 'put' skip bars where the strategy signals the other direction (as if
@@ -186,7 +189,11 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
   // hints at bar i: leaderCandles sliced to the SAME point in history as
   // the main evalWindow, so a lead-lag strategy never sees the leader's
   // future relative to where the follower backtest currently stands.
-  const hintsAt = (i: number) => (opts.leaderCandles ? { asset, leaderCandles: opts.leaderCandles.slice(0, i + 1) } : { asset })
+  const hintsAt = (i: number) => ({
+    asset,
+    ...(opts.leaderCandles ? { leaderCandles: opts.leaderCandles.slice(0, i + 1) } : {}),
+    ...(opts.leaderCandles2 ? { leaderCandles2: opts.leaderCandles2.slice(0, i + 1) } : {}),
+  })
 
   const trades: BacktestTrade[] = []
   const equityCurve: { time: number; value: number }[] = []

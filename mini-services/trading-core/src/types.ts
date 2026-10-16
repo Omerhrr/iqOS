@@ -411,6 +411,14 @@ export interface StrategyHints {
    * when this is missing, the same way tick-driven builtins stand aside
    * without `asset`. */
   leaderCandles?: Candle[]
+  /** For the triangulation-arb strategy only: a SECOND auxiliary series,
+   * same bar-for-bar alignment rule as leaderCandles. Triangulation needs
+   * two extra legs (A/B and B/C) to chain into a synthetic cross alongside
+   * the asset's own candles (the actual cross, A/C) - leaderCandles carries
+   * leg A/B, this carries leg B/C. Absent whenever the asset isn't the
+   * cross side of a known FX triangle, or either leg's history couldn't be
+   * fetched - the strategy stands aside honestly rather than guess. */
+  leaderCandles2?: Candle[]
 }
 
 export interface StrategyDef {
