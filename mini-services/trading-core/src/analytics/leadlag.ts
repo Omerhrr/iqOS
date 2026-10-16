@@ -17,6 +17,50 @@
 // relationship is stationary forever (hence recomputing on a rolling
 // window rather than caching a fixed lag/correlation indefinitely).
 
+/** Lead-lag groups: each entry is one "liquidity/macro leader" instrument
+ * plus the secondary instruments it plausibly transmits a shock into.
+ * Lives here (not in os-mode.ts, where it originated) because it's data
+ * every layer needs: the live auto-trader picker (os-mode.ts), the panel
+ * scanner (plugins/leadlagscan.ts), AND the backtest engine (which needs
+ * to know which leader to fetch a SECOND candle series for, given just a
+ * follower asset id) - putting it in this plugin-free analytics module
+ * means strategies/backtest.ts can import it without risking a cycle back
+ * through plugins/os-mode.ts (which itself imports strategies/optimize.ts,
+ * which imports strategies/backtest.ts). See os-mode.ts's original comment
+ * for the per-group rationale (EURUSD/XAUUSD/BTCUSD/oil). */
+export const LEADLAG_GROUPS: { leader: string; followers: string[] }[] = [
+  { leader: 'EURUSD', followers: ['GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'EURGBP', 'EURJPY', 'EURCHF'] },
+  { leader: 'XAUUSD', followers: ['XAGUSD', 'XPTUSD', 'XPDUSD'] },
+  {
+    leader: 'BTCUSD',
+    followers: [
+      'ETHUSD', 'SOLUSD', 'XRPUSD', 'BNBUSD', 'ADAUSD', 'DOGEUSD', 'LTCUSD', 'BCHUSD',
+      'DOTUSD', 'AVAXUSD', 'LINKUSD', 'TRXUSD', 'XLMUSD', 'ETCUSD', 'ATOMUSD', 'NEOUSD', 'UNIUSD',
+    ],
+  },
+  { leader: 'USCrude', followers: ['USDCAD', 'CADJPY', 'CADCHF'] },
+  { leader: 'UKBrent', followers: ['USDCAD', 'CADJPY', 'CADCHF'] },
+]
+/** Below this |correlation| at the fitted lag, the relationship is too weak
+ * to trade on. */
+export const LEADLAG_MIN_ABS_CORRELATION = 0.35
+/** Below this |z|, the leader's "trigger" move isn't unusual enough to be
+ * treated as the kind of macro shock lead-lag trading is meant to catch. */
+export const LEADLAG_MIN_TRIGGER_Z = 1.0
+/** Bars of leader + follower history fetched per live fit (the backtest
+ * engine uses whatever history it's given instead - this constant is for
+ * the live picker/panel scanner's own candle fetch size). */
+export const LEADLAG_LOOKBACK_BARS = 240
+
+/** Reverse lookup: given a FOLLOWER asset, which leader(s) is it tracked
+ * against? A follower that appears in more than one group (none currently
+ * do) returns every leader - the caller picks which one to backtest
+ * against, or tries each. Returns [] for an asset that's a leader itself
+ * or isn't in any group. */
+export function leadersFor(asset: string): string[] {
+  return LEADLAG_GROUPS.filter((g) => g.followers.includes(asset)).map((g) => g.leader)
+}
+
 export interface LeadLagFit {
   /** best-fit lag in bars: how many bars AFTER the leader moves, the
    * follower's matching move tends to show up. 0 = contemporaneous. */

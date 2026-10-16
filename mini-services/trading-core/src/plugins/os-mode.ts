@@ -56,7 +56,7 @@ import { getStrategy, defaultParams, STRATEGIES } from '../strategies/builtin'
 import { classifyRegime } from '../analytics/regime'
 import { classifySession } from '../analytics/session'
 import { SweepEdgeMemory } from '../analytics/edge'
-import { fitLeadLag, projectLeadLagSignal } from '../analytics/leadlag'
+import { fitLeadLag, projectLeadLagSignal, LEADLAG_GROUPS, LEADLAG_MIN_ABS_CORRELATION, LEADLAG_MIN_TRIGGER_Z, LEADLAG_LOOKBACK_BARS } from '../analytics/leadlag'
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
 /** NaN-safe comparison for trade gates. Thin-history screener rows can carry
@@ -375,56 +375,14 @@ const CHARTSIGNALS_MIN_AGREE = 3
 /** Liquid fallback evaluated on demand while the full screener sweep warms up. */
 const LIQUID_CANDIDATES = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'XAUUSD', 'BTCUSD']
 
-/** Lead-lag groups: each entry is one "liquidity/macro leader" instrument
- * plus the secondary instruments it plausibly transmits a shock into, with
- * some real transmission mechanism behind the pairing (not just "these
- * happened to correlate in a backtest"):
- *  - EURUSD -> major USD/EUR crosses: the single most liquid FX pair, so a
- *    macro shock lands here first and ripples into less-liquid crosses
- *    that share its base or quote currency.
- *  - XAUUSD -> XAGUSD/XPTUSD/XPDUSD: gold is the deepest, most-watched
- *    precious metal - a risk-off/real-yield move shows up there first and
- *    the thinner metals (silver especially) tend to catch up a bit after.
- *  - BTCUSD -> the rest of the crypto majors/alts: Bitcoin is crypto's own
- *    liquidity/sentiment leader; alts echo its directional moves, often
- *    amplified, with a short lag.
- *  - USCrude / UKBrent -> CAD crosses: Canada's terms-of-trade are oil-
- *    linked, so a sharp crude move reprices CAD pairs a little after the
- *    fact. Two separate leader entries (WTI and Brent) rather than one
- *    merged series, since they can briefly diverge (e.g. transport/spread
- *    shocks) and each is worth fitting on its own.
- * Every leader/follower pair is refit independently (own lag, own
- * correlation) by pickLeadLagSignal - this list only says what's WORTH
- * testing, the fit itself decides whether a given pairing is currently
- * strong enough to trade on. OTC variants of a follower are picked up
- * automatically (whatever's open), since matching only needs to strip the
- * follower side, never the leader. */
-export const LEADLAG_GROUPS: { leader: string; followers: string[] }[] = [
-  { leader: 'EURUSD', followers: ['GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'EURGBP', 'EURJPY', 'EURCHF'] },
-  { leader: 'XAUUSD', followers: ['XAGUSD', 'XPTUSD', 'XPDUSD'] },
-  {
-    leader: 'BTCUSD',
-    followers: [
-      'ETHUSD', 'SOLUSD', 'XRPUSD', 'BNBUSD', 'ADAUSD', 'DOGEUSD', 'LTCUSD', 'BCHUSD',
-      'DOTUSD', 'AVAXUSD', 'LINKUSD', 'TRXUSD', 'XLMUSD', 'ETCUSD', 'ATOMUSD', 'NEOUSD', 'UNIUSD',
-    ],
-  },
-  { leader: 'USCrude', followers: ['USDCAD', 'CADJPY', 'CADCHF'] },
-  { leader: 'UKBrent', followers: ['USDCAD', 'CADJPY', 'CADCHF'] },
-]
-/** Below this |correlation| at the fitted lag, the relationship is too
- * weak to trade on - require a moderately strong rolling fit, not just
- * "whichever lag happened to score highest among weak noise". */
-export const LEADLAG_MIN_ABS_CORRELATION = 0.35
-/** Below this |z|, the leader's "trigger" move isn't unusual enough to be
- * treated as the kind of macro shock lead-lag trading is meant to catch -
- * ordinary chop shouldn't fire a signal just because the fit says *some*
- * lag correlates. */
-export const LEADLAG_MIN_TRIGGER_Z = 1.0
-/** Bars of leader + follower history fetched per fit - generous enough
- * for the rolling-correlation search (maxLag up to 10) and the trigger's
- * own 60-bar z-score window to both have real sample sizes. */
-export const LEADLAG_LOOKBACK_BARS = 240
+// LEADLAG_GROUPS/LEADLAG_MIN_ABS_CORRELATION/LEADLAG_MIN_TRIGGER_Z/
+// LEADLAG_LOOKBACK_BARS moved to analytics/leadlag.ts (imported above) -
+// that's a plugin-free module strategies/backtest.ts can also depend on
+// without risking an import cycle back through this file (os-mode.ts
+// already imports strategies/optimize.ts, which imports
+// strategies/backtest.ts). Re-exported here so leadlagscan.ts and any
+// other existing importer of these names from os-mode.ts keeps working.
+export { LEADLAG_GROUPS, LEADLAG_MIN_ABS_CORRELATION, LEADLAG_MIN_TRIGGER_Z, LEADLAG_LOOKBACK_BARS } from '../analytics/leadlag'
 
 interface AutoRuntime {
   dayKey: string

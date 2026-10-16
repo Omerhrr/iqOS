@@ -114,6 +114,13 @@ export interface BacktestOptions {
   // lab store isn't reachable from this module, so the HTTP layer resolves
   // it and passes the spec through. Ignored for builtin strategy ids.
   customSpec?: CustomSpec
+  // For a lead-lag-style strategy only: the group leader's full candle
+  // series (same tf, fetched by the caller - plugins/analytics.ts's
+  // runBacktest looks up the leader via analytics/leadlag.ts's
+  // leadersFor(asset) and fetches it). Sliced in lockstep with the main
+  // `candles` array at every bar and passed through StrategyHints -
+  // absent for every strategy that doesn't need a second asset's history.
+  leaderCandles?: Candle[]
   // Manually force which side(s) are taken, instead of the default "take
   // whatever the strategy signals and report both sides blended". 'call'/
   // 'put' skip bars where the strategy signals the other direction (as if
@@ -176,6 +183,10 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
   const startEquity = equity
   const costPct = Math.max(0, opts.spreadPct ?? 0) + Math.max(0, opts.slippagePct ?? 0)
   const commissionPct = Math.max(0, opts.commissionPct ?? 0)
+  // hints at bar i: leaderCandles sliced to the SAME point in history as
+  // the main evalWindow, so a lead-lag strategy never sees the leader's
+  // future relative to where the follower backtest currently stands.
+  const hintsAt = (i: number) => (opts.leaderCandles ? { asset, leaderCandles: opts.leaderCandles.slice(0, i + 1) } : { asset })
 
   const trades: BacktestTrade[] = []
   const equityCurve: { time: number; value: number }[] = []
@@ -203,7 +214,7 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
         compoundCycles++
       }
       const evalWindow = candles.slice(0, i + 1)
-      const ev = filterDir(strat.evaluate(evalWindow, params, { asset }))
+      const ev = filterDir(strat.evaluate(evalWindow, params, hintsAt(i)))
       // Task 58 (P1): edge-trigger parity with the live bots - a persisting
       // same-direction signal fires once per episode (lapse/flip re-arms)
       if (opts.edgeTrigger) {
@@ -269,7 +280,7 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
         const evNow =
           hitTP || hitSL || open.bars >= maxBars
             ? { direction: 'none' as const, score: 0, notes: '' }
-            : filterDir(strat.evaluate([...candles.slice(0, i + 1)], params, { asset }))
+            : filterDir(strat.evaluate([...candles.slice(0, i + 1)], params, hintsAt(i)))
         const flipped = evNow.direction !== 'none' && evNow.direction !== open.side
         if (hitTP || hitSL || open.bars >= maxBars || flipped) {
           const rawExit = candle.close
@@ -308,7 +319,7 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
         if (opts.edgeTrigger && evNow.direction === 'none') lastEntryDir = 'none'
         continue
       }
-      const ev = filterDir(strat.evaluate([...candles.slice(0, i + 1)], params, { asset }))
+      const ev = filterDir(strat.evaluate([...candles.slice(0, i + 1)], params, hintsAt(i)))
       if (opts.edgeTrigger) {
         // a genuine lapse while flat re-arms the edge-trigger exactly like
         // the bot's 'none' branch does - without this, a condition that

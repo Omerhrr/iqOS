@@ -9,6 +9,7 @@ import { analyze } from '../analytics/engine'
 import { backtest, type BacktestOptions } from '../strategies/backtest'
 import { STRATEGIES, getStrategy, defaultParams } from '../strategies/builtin'
 import { evalWithEdge } from '../analytics/edge'
+import { leadersFor } from '../analytics/leadlag'
 
 export class AnalyticsService {
   private ctx!: KernelContext
@@ -74,7 +75,23 @@ export class AnalyticsService {
     // Task 59 (P1): closedOnly for the same live-parity reason as runStrategy.
     const candles = this.market.getCandlesDeep(asset, tf, 2200, true)
     if (candles.length < 300) throw new Error('not enough candle history for a meaningful backtest')
-    return backtest(candles, asset, tf, opts)
+    // Lead-lag-style strategies need a SECOND series: the group leader's own
+    // candles, same tf, fetched here (not inside backtest.ts, which has no
+    // market access) and threaded through as leaderCandles. Only matters
+    // when `asset` is actually a known follower (leadersFor returns [] for
+    // everything else, including leaders themselves) - every other
+    // strategy id just ignores the unused opts.leaderCandles passthrough.
+    const leaders = leadersFor(asset)
+    let leaderCandles: typeof candles | undefined
+    if (leaders.length > 0) {
+      try {
+        const lc = this.market.getCandlesDeep(leaders[0], tf, 2200, true)
+        if (lc.length >= 300) leaderCandles = lc
+      } catch {
+        /* leader history unavailable - the strategy honestly stands aside */
+      }
+    }
+    return backtest(candles, asset, tf, { ...opts, leaderCandles: leaderCandles ?? opts.leaderCandles })
   }
 
   private log(..._args: unknown[]) {

@@ -19,6 +19,8 @@ import { volumeBars } from '../analytics/volumebars'
 import { computeFootprint } from '../analytics/footprint'
 import { computeTpo } from '../analytics/tpo'
 import { realizedUpProb, ivFromPayout } from '../analytics/ivhv'
+import { engineVotes, combineVotes } from '../analytics/chartsignals'
+import { fitLeadLag, projectLeadLagSignal } from '../analytics/leadlag'
 
 const last = (arr: number[]): number => {
   for (let i = arr.length - 1; i >= 0; i--) if (Number.isFinite(arr[i])) return arr[i]
@@ -1627,6 +1629,63 @@ export const STRATEGIES: StrategyDef[] = [
         nearEdge: num(p, 'nearEdge', 0.25),
       })
       return { direction: out.direction, score: out.score, notes: out.notes }
+    },
+  },
+  {
+    id: 'chartsignals-vote',
+    name: 'Chart Signals Vote',
+    description:
+      'Combined chart-engine vote (renko / point-and-figure / range bars / tick bars / footprint / Heikin-Ashi / candlestick patterns), grouped into 5 independent families since renko/range/P&F are the same ATR-threshold signal computed 3 ways - the same vote engine the live Chart Signals panel and auto-trader source use. Needs a qualifying majority of families to agree (minAgree) and enough combined strength (threshold) before it reads a direction at all.',
+    params: [
+      { key: 'threshold', label: 'Min combined strength (0-100)', type: 'number', min: 10, max: 90, step: 5, default: 35 },
+      { key: 'minAgree', label: 'Min families agreeing (of 5)', type: 'number', min: 2, max: 5, default: 2 },
+    ],
+    evaluate: (candles, p) => {
+      if (candles.length < 40) return { direction: 'none', score: 0, notes: 'thin history - no honest read' }
+      // offline/backtest context: no live tick buffer or OTC footprint feed
+      // exists here, so otc:false + realTicks:null - tickVote's own
+      // close-proxy fallback (same one the AI Lab's per-engine mining uses)
+      // is the honest reconstruction, exactly like engineVoteSingle('tick', ...).
+      const votes = engineVotes(candles, { otc: false, realTicks: null })
+      const combined = combineVotes(votes, { threshold: num(p, 'threshold', 35), minAgree: num(p, 'minAgree', 2) })
+      if (!combined) return { direction: 'none', score: 0, notes: 'no qualifying family agreement' }
+      return {
+        direction: combined.direction,
+        score: combined.score,
+        notes: `${combined.agree}/${combined.total} families agree (${combined.direction.toUpperCase()}), strength ${combined.strength.toFixed(0)}`,
+      }
+    },
+  },
+  {
+    id: 'leadlag-echo',
+    name: 'Lead-Lag Echo',
+    description:
+      'Intermarket analysis, not technical analysis on the asset itself: fits a rolling cross-correlation between this asset\'s group leader (EUR/USD for major crosses, Gold for other metals, Bitcoin for crypto alts, WTI/Brent for CAD pairs - see analytics/leadlag.ts LEADLAG_GROUPS) and this asset\'s own returns across lags 0-10 bars, then reads a direction only when the winning lag correlates strongly AND the leader\'s own trigger move at that lag was itself unusual. Only backtestable for assets that are an actual lead-lag follower - everything else honestly stands aside (not every asset has a leader).',
+    params: [
+      { key: 'minAbsCorrelation', label: 'Min |correlation| at best lag', type: 'number', min: 0.1, max: 0.9, step: 0.05, default: 0.35 },
+      { key: 'minTriggerZ', label: 'Min |leader trigger z|', type: 'number', min: 0.25, max: 4, step: 0.25, default: 1 },
+      { key: 'maxLag', label: 'Max lag searched (bars)', type: 'number', min: 1, max: 20, default: 10 },
+    ],
+    evaluate: (candles, p, hints) => {
+      const leaderCloses = hints?.leaderCandles
+      if (!leaderCloses || leaderCloses.length < 30 || candles.length < 30) {
+        return { direction: 'none', score: 0, notes: 'no leader history for this asset - not a tracked lead-lag follower, or not enough bars yet' }
+      }
+      const fit = fitLeadLag(leaderCloses.map((c) => c.close), candles.map((c) => c.close), num(p, 'maxLag', 10))
+      if (fit.n < 10) return { direction: 'none', score: 0, notes: 'not enough overlapping bars at the winning lag' }
+      if (Math.abs(fit.correlation) < num(p, 'minAbsCorrelation', 0.35)) {
+        return { direction: 'none', score: 0, notes: `correlation ${fit.correlation.toFixed(2)} at lag ${fit.lag} too weak` }
+      }
+      const signal = projectLeadLagSignal(fit, leaderCloses.map((c) => c.close))
+      if (!signal || Math.abs(signal.triggerZ) < num(p, 'minTriggerZ', 1)) {
+        return { direction: 'none', score: 0, notes: signal ? `trigger z ${signal.triggerZ.toFixed(1)} too unremarkable` : 'no trigger to project' }
+      }
+      const corrStrength = clamp(Math.abs(fit.correlation), 0, 1)
+      return {
+        direction: signal.direction,
+        score: Math.round(corrStrength * 100),
+        notes: `leader moved ${(signal.triggerReturn * 100).toFixed(2)}% (z ${signal.triggerZ.toFixed(1)}) ${fit.lag} bar${fit.lag === 1 ? '' : 's'} ago · corr ${fit.correlation.toFixed(2)} at lag ${fit.lag}`,
+      }
     },
   },
 ]

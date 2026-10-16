@@ -401,6 +401,16 @@ export interface StrategyEval {
  * stands aside instead of fabricating data. */
 export interface StrategyHints {
   asset?: string
+  /** For a lead-lag-style strategy only: the GROUP LEADER's candles,
+   * aligned bar-for-bar with the `candles` the strategy is otherwise being
+   * evaluated on (same slice length/position - index i in both arrays is
+   * "as of the same point in the backtest"). Absent for every other
+   * strategy, and absent here too if the asset being tested isn't a known
+   * lead-lag follower or the leader's own history couldn't be fetched - a
+   * leader-dependent strategy must stand aside honestly rather than guess
+   * when this is missing, the same way tick-driven builtins stand aside
+   * without `asset`. */
+  leaderCandles?: Candle[]
 }
 
 export interface StrategyDef {
