@@ -189,8 +189,9 @@ export default function TriangulationPanel({
             Synthetic cross = leg A/B x leg B/C, chained through the shared currency. Δ is how far the real cross pair sits
             from that synthetic value right now; z is how unusual that gap is against its own recent rolling history (the
             basis is expected to oscillate near 0, not drift). <span className="text-teal-400/80">qualifies</span> marks the
-            triangles worth a look. Not yet backtestable in the Lab - it needs three simultaneous legs, which the
-            single-leader hint the other cross-asset strategies use doesn&apos;t carry. Click a card to open the cross pair.
+            triangles worth a look. Backtestable in the Lab as &quot;Triangulation Arbitrage&quot; - the Single-Run/Optimizer/
+            Walk-Forward/Asset-Sweep engines fetch both other legs for you when this asset is the cross side of a known
+            triangle. Click a card to open the cross pair.
           </p>
         )}
         {loading && <div className="px-1 font-mono text-[8px] text-[#3d4d66]">refreshing…</div>}
