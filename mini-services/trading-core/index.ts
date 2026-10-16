@@ -31,6 +31,7 @@ import { yesterdayPlugin, YesterdayService } from './src/plugins/yesterday'
 import { gridSearch, walkForward, sweepAssets, type Objective } from './src/strategies/optimize'
 import { backtest } from './src/strategies/backtest'
 import type { BacktestOptions } from './src/strategies/backtest'
+import { leadersFor } from './src/analytics/leadlag'
 import { normalizeSpec, type CustomSpec } from './src/strategies/custom'
 import { MINABLE_ENGINES, ENGINE_LABEL, type ChartEngineId } from './src/analytics/chartsignals'
 import { vskMonteCarlo } from './src/analytics/vsk'
@@ -2132,8 +2133,25 @@ const httpServer = createServer(async (req, res) => {
       if (path === '/optimize') {
         try {
           const strategyId = String(body.strategy ?? 'confluence-core')
-          const out = gridSearch(market.getCandlesDeep(String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), 2200), String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), {
+          const optAsset = String(body.asset ?? market.activeAsset)
+          const optTf = tf(String(body.tf ?? '1m') as string)
+          const optCandles = market.getCandlesDeep(optAsset, optTf, 2200)
+          // Lead-lag-style strategies (leadlag-echo) need the group leader's
+          // own candles, index-aligned with optCandles - see
+          // analytics/leadlag.ts leadersFor and gridSearch's leaderCandles doc.
+          let optLeaderCandles: Candle[] | undefined
+          const optLeaders = leadersFor(optAsset)
+          if (optLeaders.length > 0) {
+            try {
+              const lc = market.getCandlesDeep(optLeaders[0], optTf, 2200)
+              if (lc.length === optCandles.length) optLeaderCandles = lc
+            } catch {
+              /* leader history unavailable - leadlag-echo honestly stands aside */
+            }
+          }
+          const out = gridSearch(optCandles, optAsset, optTf, {
             strategy: strategyId,
+            leaderCandles: optLeaderCandles,
             sweep: (body.sweep as Record<string, { from: number; to: number; step: number }>) ?? {},
             fixedParams: (body.params as Record<string, number | string>) ?? {},
             objective: (body.objective as Objective) ?? 'netPnl',
@@ -2167,8 +2185,24 @@ const httpServer = createServer(async (req, res) => {
       if (path === '/walkforward') {
         try {
         const strategyId = String(body.strategy ?? 'rsi-reversion')
-        const out = walkForward(market.getCandlesDeep(String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), 2200), String(body.asset ?? market.activeAsset), tf(String(body.tf ?? '1m') as string), {
+        const wfAsset = String(body.asset ?? market.activeAsset)
+        const wfTf = tf(String(body.tf ?? '1m') as string)
+        const wfCandles = market.getCandlesDeep(wfAsset, wfTf, 2200)
+        // Lead-lag-style strategies (leadlag-echo) need the group leader's own
+        // candles, index-aligned with wfCandles - same lookup as /optimize.
+        let wfLeaderCandles: Candle[] | undefined
+        const wfLeaders = leadersFor(wfAsset)
+        if (wfLeaders.length > 0) {
+          try {
+            const lc = market.getCandlesDeep(wfLeaders[0], wfTf, 2200)
+            if (lc.length === wfCandles.length) wfLeaderCandles = lc
+          } catch {
+            /* leader history unavailable - leadlag-echo honestly stands aside */
+          }
+        }
+        const out = walkForward(wfCandles, wfAsset, wfTf, {
           strategy: strategyId,
+          leaderCandles: wfLeaderCandles,
           sweep: (body.sweep as Record<string, { from: number; to: number; step: number }>) ?? {},
           fixedParams: (body.params as Record<string, number | string>) ?? {},
           objective: (body.objective as Objective) ?? 'netPnl',

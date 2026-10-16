@@ -7,6 +7,7 @@ import { defaultParams } from './builtin'
 import { backtest, directionBreakdown, resolveStrategyDef, type DirectionMetrics } from './backtest'
 import type { CustomSpec } from './custom'
 import { sharpeRatio } from '../analytics/quant'
+import { leadersFor } from '../analytics/leadlag'
 
 export type Objective = 'netPnl' | 'sharpe' | 'profitFactor' | 'winRate' | 'expectancy'
 export type SweepSpec = Record<string, { from: number; to: number; step: number }>
@@ -308,6 +309,14 @@ export function fastBacktest(
     // Evaluation context for tick-driven builtins (OTC velocity footprint) -
     // lets them read the right micro-tick buffer during optimizer replays.
     asset?: string
+    // For a lead-lag-style strategy only: the group leader's candles, index-
+    // aligned 1:1 with the `candles` array THIS call receives (which may
+    // already be a fold's isSlice/oosSlice, not the full history - see
+    // backtest.ts's BacktestOptions.leaderCandles doc for the general
+    // contract). Callers (gridSearch/walkForward/sweepAssets below) are
+    // responsible for slicing their own leaderCandles input to match
+    // whatever `candles` they pass in here.
+    leaderCandles?: Candle[]
   } = {}
 ): FastMetrics {
   const strat = resolveStrategyDef(strategyId, opts.customSpec)
@@ -322,6 +331,12 @@ export function fastBacktest(
   const startEquity = equity
   const costPct = Math.max(0, opts.spreadPct ?? 0) + Math.max(0, opts.slippagePct ?? 0)
   const commissionPct = Math.max(0, opts.commissionPct ?? 0)
+  // Index-aligned with THIS call's `candles` array (see opts.leaderCandles
+  // doc above) - only used when the caller's leaderCandles is the same
+  // length as `candles`, otherwise a lead-lag strategy honestly gets no
+  // leaderCandles rather than reading a misaligned bar.
+  const alignedLeader = opts.leaderCandles && opts.leaderCandles.length === candles.length ? opts.leaderCandles : undefined
+  const hintsAt = (i: number) => (alignedLeader ? { asset: opts.asset, leaderCandles: alignedLeader.slice(0, i + 1) } : { asset: opts.asset })
 
   const trades: BacktestTrade[] = []
   const rets: number[] = []
@@ -345,7 +360,7 @@ export function fastBacktest(
     // params - which defeated the purpose of "verifying the top-3" against
     // it. This matches backtest.ts's evalWindow exactly.
     const win = candles.slice(0, i + 1)
-    const ev = filterDir(strat.evaluate(win, params, { asset: opts.asset }))
+    const ev = filterDir(strat.evaluate(win, params, hintsAt(i)))
     // Task 58 (P1): edge-trigger parity with the live bots (once per episode)
     if (opts.edgeTrigger) {
       const suppress = ev.direction !== 'none' && ev.direction === prevEvalDir
@@ -508,6 +523,13 @@ export interface GridSearchOptions {
   direction?: 'call' | 'put' | 'both'
   // Task 58 (P1): edge-trigger simulation, threaded to both engines
   edgeTrigger?: boolean
+  // For a lead-lag-style strategy only: the group leader's FULL candle
+  // series, index-aligned 1:1 with the `candles` array passed to
+  // gridSearch/walkForward (same tf, same length - the caller, e.g.
+  // index.ts's /optimize and /walkforward handlers, looks up the leader via
+  // analytics/leadlag.ts's leadersFor(asset) and fetches it the same way).
+  // Absent for every strategy that doesn't need a second asset's history.
+  leaderCandles?: Candle[]
 }
 
 export function gridSearch(candles: Candle[], asset: string, tf: Timeframe, opts: GridSearchOptions): GridSearchResult {
@@ -515,6 +537,10 @@ export function gridSearch(candles: Candle[], asset: string, tf: Timeframe, opts
   const objective = opts.objective ?? 'netPnl'
   const minTrades = Math.max(1, opts.minTrades ?? 20)
   const top = Math.max(1, Math.min(30, opts.top ?? 20))
+  // Only trust leaderCandles when it's index-aligned with the full `candles`
+  // array this function received (see fastBacktest's alignedLeader doc) -
+  // a length mismatch means a lead-lag strategy honestly stands aside.
+  const leaderCandles = opts.leaderCandles && opts.leaderCandles.length === candles.length ? opts.leaderCandles : undefined
   const common = {
     payout: opts.payout,
     amount: opts.amount,
@@ -527,6 +553,7 @@ export function gridSearch(candles: Candle[], asset: string, tf: Timeframe, opts
     direction: opts.direction,
     edgeTrigger: opts.edgeTrigger,
     asset,
+    leaderCandles,
   }
   const sweptKeys = Object.keys(opts.sweep).filter((k) => strat.params.some((p) => p.key === k))
   // Base every combo on the strategy's registered defaults, then let any
@@ -590,6 +617,7 @@ export function gridSearch(candles: Candle[], asset: string, tf: Timeframe, opts
           customSpec: opts.customSpec,
           direction: opts.direction,
           edgeTrigger: opts.edgeTrigger,
+          leaderCandles,
         })
         const [fciLow, fciHigh] = wilsonInterval(full.metrics.wins, full.metrics.totalTrades)
         const fm: FastMetrics = {
@@ -650,6 +678,9 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
   const minTrades = Math.max(1, opts.minTrades ?? 10)
   const folds = Math.max(2, Math.min(5, Math.round(opts.folds ?? 3)))
   const isRatio = Math.max(0.5, Math.min(0.85, opts.isRatio ?? 0.7))
+  // Index-aligned with the full `candles` array (see gridSearch's identical
+  // guard) - sliced per-fold below to match each fold's isSlice/oosSlice.
+  const leaderCandles = opts.leaderCandles && opts.leaderCandles.length === candles.length ? opts.leaderCandles : undefined
   const common = {
     payout: opts.payout,
     amount: opts.amount,
@@ -720,8 +751,13 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
     // signals, since their real warmup requirement is often larger than the
     // whole IS slice.
     const isWarmup = Math.min(strategyWarmup(strat.id), Math.floor(isSlice.length * 0.4))
+    // Leader slice for THIS fold's IS window - sliced from the full,
+    // index-aligned leaderCandles the same way isSlice is sliced from the
+    // full `candles`, so fastBacktest's own alignedLeader check (candles vs
+    // leaderCandles length) passes and index i means the same bar in both.
+    const isLeaderSlice = leaderCandles ? leaderCandles.slice(isStart, isStart + isBars) : undefined
     for (const combo of combos) {
-      const m = fastBacktest(isSlice, strat.id, combo, { ...common, warmup: isWarmup, startEquity: 1000 })
+      const m = fastBacktest(isSlice, strat.id, combo, { ...common, warmup: isWarmup, startEquity: 1000, leaderCandles: isLeaderSlice })
       const s = scoreOf(m, objective, minTrades)
       if (Number.isFinite(s) && s > bestScore) {
         bestScore = s
@@ -743,7 +779,11 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
     // history for estimation (no lookahead: trades only fire after the warmup
     // guard, i.e. strictly inside the true OOS region).
     const oosWarmup = Math.min(strategyWarmup(strat.id), isStart)
-    const oosFull = backtest(candles.slice(Math.max(0, oosStart - oosWarmup), oosEnd), asset, tf, {
+    const oosSliceStart = Math.max(0, oosStart - oosWarmup)
+    // Same alignment as the IS leader slice above, over the OOS window
+    // (including its own warmup prefix, matching the main candles slice).
+    const oosLeaderSlice = leaderCandles ? leaderCandles.slice(oosSliceStart, oosEnd) : undefined
+    const oosFull = backtest(candles.slice(oosSliceStart, oosEnd), asset, tf, {
       strategy: strat.id,
       params: bestCombo,
       mode: 'binary',
@@ -757,6 +797,7 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
       commissionPct: opts.commissionPct,
       customSpec: opts.customSpec,
       direction: opts.direction,
+      leaderCandles: oosLeaderSlice,
     })
     const [oosCiLow, oosCiHigh] = wilsonInterval(oosFull.metrics.wins, oosFull.metrics.totalTrades)
     const oosM: FastMetrics = {
@@ -938,6 +979,23 @@ export function sweepAssets(
         skipped++
         continue
       }
+      // Lead-lag-style strategies (leadlag-echo) need the group leader's own
+      // candles for THIS asset, filtered to the exact same window as
+      // `candles` above so the two arrays stay index-aligned bar-for-bar.
+      // Fetched per-row (not in the Pass 1 loop) since not every asset has a
+      // leader, and a fetch/alignment failure here only costs that one row
+      // the lead-lag read - every other strategy ignores the unused option.
+      let leaderCandles: Candle[] | undefined
+      const leaders = leadersFor(a.ticker)
+      if (leaders.length > 0) {
+        try {
+          const rawLeader = fetchCandles(leaders[0])
+          const leaderFiltered = sharedWindow && winStart < winEnd ? rawLeader.filter((c) => c.time >= winStart && c.time <= winEnd) : rawLeader
+          if (leaderFiltered.length === candles.length) leaderCandles = leaderFiltered
+        } catch {
+          /* leader history unavailable for this row - strategy stands aside */
+        }
+      }
       // Per-asset real payout by default (each instrument's own broker payout,
       // as reported live by the connected IQ account or curated in the
       // catalog) - a single flat payout across every asset made "rank assets
@@ -957,6 +1015,7 @@ export function sweepAssets(
         customSpec: opts.customSpec,
         direction: opts.direction,
         edgeTrigger: opts.edgeTrigger,
+        leaderCandles,
       })
       const score = scoreOf(m, objective, minTrades)
       let liveDataPct: number | null = null
