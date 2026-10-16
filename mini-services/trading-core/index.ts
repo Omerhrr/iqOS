@@ -26,6 +26,7 @@ import { adaptivePlugin, AdaptiveService, type AdaptiveConfig } from './src/plug
 import { otcGuardPlugin, OtcGuardService, type OtcDefenseReport } from './src/plugins/otcguard'
 import { otcFootprintPlugin, OtcFootprintService } from './src/plugins/otcfootprint'
 import { chartSignalsPlugin, ChartSignalsService } from './src/plugins/chartsignals'
+import { leadLagScanPlugin, LeadLagScanService } from './src/plugins/leadlagscan'
 import { yesterdayPlugin, YesterdayService } from './src/plugins/yesterday'
 import { gridSearch, walkForward, sweepAssets, type Objective } from './src/strategies/optimize'
 import { backtest } from './src/strategies/backtest'
@@ -150,6 +151,7 @@ kernel.register(adaptivePlugin)
 kernel.register(otcGuardPlugin)
 kernel.register(otcFootprintPlugin)
 kernel.register(chartSignalsPlugin)
+kernel.register(leadLagScanPlugin)
 kernel.register(yesterdayPlugin)
 
 const httpServer = createServer(async (req, res) => {
@@ -1336,6 +1338,17 @@ const httpServer = createServer(async (req, res) => {
         const tfv = tfStrict(q.get('tf'))
         if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
         return json(200, await kernel.context().use<ChartSignalsService>('chartSignals').scan(kind, top, tfv))
+      }
+
+      // Lead-lag scanner: the panel-facing twin of os-mode.ts's
+      // pickLeadLagSignal() - same leader groups (EURUSD/XAUUSD/BTCUSD/oil),
+      // same fit (analytics/leadlag.ts), but returns EVERY leader/follower
+      // pair (not just ones clearing the auto-trader's gates), each flagged
+      // `qualifies` so the panel can show the full correlation picture.
+      if (path === '/leadlag') {
+        const tfv = tfStrict(q.get('tf'))
+        if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+        return json(200, kernel.context().use<LeadLagScanService>('leadLagScan').scan(tfv))
       }
 
       // Same-time-yesterday scanner: for every open instrument, what was the

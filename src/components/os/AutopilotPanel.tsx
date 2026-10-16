@@ -1498,7 +1498,7 @@ function AutoTraderStrip({
                   : at.config.signalSource === 'chartsignals'
                     ? `CHART-SIG·agree≥4`
                     : at.config.signalSource === 'leadlag'
-                      ? `LEAD-LAG·EURUSD·corr≥0.35`
+                      ? `LEAD-LAG·4 groups·corr≥0.35`
                       : at.config.signalSource === 'strategy'
                       ? (() => {
                           const ids = at.config.strategyIds?.length ? at.config.strategyIds : at.config.strategyId ? [at.config.strategyId] : []
@@ -1851,7 +1851,7 @@ function AutoTraderDialog({
                       : d.signalSource === 'chartsignals'
                         ? 'the chart-type vote engine (renko/point-and-figure/range/tick/footprint/Heikin-Ashi/candle) that also feeds the Signal Panel - CALL/PUT follows whichever side a qualifying majority of those engines agree on, with a stricter agreement floor than the panel\'s own (≥4 of 7 engines, not just 3) since several of them read the same bar swings and can agree for correlated, not independent, reasons'
                         : d.signalSource === 'leadlag'
-                          ? 'intermarket, not technical: fits a rolling cross-correlation between EUR/USD\'s returns and a secondary pair\'s returns across lags 0-10 bars, then fires only when EUR/USD\'s own move at the winning lag is both strongly correlated (|corr|≥0.35) AND itself unusual (|z|≥1) - the "macro shock ripples outward" read, with no signal on ordinary chop'
+                          ? 'intermarket, not technical: sweeps 4 liquidity/macro leader groups (EURUSD→major crosses, XAUUSD→silver/platinum/palladium, BTCUSD→crypto alts, oil→CAD pairs), fitting a rolling cross-correlation between each leader\'s returns and its followers\' returns across lags 0-10 bars, then firing only when the winning lag is both strongly correlated (|corr|≥0.35) AND the leader\'s own move there is itself unusual (|z|≥1) - the "shock ripples outward from the group leader" read, with no signal on ordinary chop'
                           : d.signalSource === 'strategy'
                         ? 'one specific strategy picked below, or several combined - as a vote (ENSEMBLE) or an AUTO-LEARN pool that trades whichever member is proven best per pair - the same strategyId an autopilot bot would use (a builtin strategy, or an AI Lab-learned "(Lab)" spec), not pinned to one bot\'s watchlist'
                         : 'takes the strongest full-composite screener signals market-wide (trend + momentum + statistical + patterns)'}

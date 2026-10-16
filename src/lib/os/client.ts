@@ -384,6 +384,45 @@ export async function getChartSignals(kind: 'option' | 'cfd', tf: Timeframe, top
   )
 }
 
+// ---- lead-lag correlation scanner (panel-facing twin of the auto-trader's
+// pickLeadLagSignal) ---------------------------------------------------
+
+export interface LeadLagRow {
+  leader: string
+  asset: string
+  name: string
+  category: AssetCategory
+  otc: boolean
+  open: boolean
+  price: number
+  lag: number
+  correlation: number
+  lagsTested: number
+  n: number
+  triggerReturn: number
+  triggerZ: number
+  direction: 'call' | 'put' | null
+  /** true iff this pair currently clears the same gates the auto-trader's
+   * lead-lag source requires - exactly what it would act on right now. */
+  qualifies: boolean
+  ts: number
+}
+
+export interface LeadLagScanResult {
+  ok: boolean
+  tf: Timeframe
+  groups: { leader: string; open: boolean; followers: number }[]
+  scanned: number
+  qualifying: number
+  rows: LeadLagRow[]
+  ts: number
+  scanMs: number
+}
+
+export async function getLeadLag(tf: Timeframe): Promise<LeadLagScanResult> {
+  return osGet<LeadLagScanResult>('/leadlag', { tf })
+}
+
 // ---- chart-signal outcome stats (Task 64-c: the honesty loop) ------------
 
 export type SignalOutcomeId = 'win' | 'loss' | 'flat' | 'timeout'

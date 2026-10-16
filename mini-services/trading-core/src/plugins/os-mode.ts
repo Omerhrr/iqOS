@@ -375,29 +375,56 @@ const CHARTSIGNALS_MIN_AGREE = 3
 /** Liquid fallback evaluated on demand while the full screener sweep warms up. */
 const LIQUID_CANDIDATES = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'XAUUSD', 'BTCUSD']
 
-/** Secondary pairs the lead-lag source will fit EUR/USD's rolling
- * cross-correlation against: USD-crosses (share the quote currency, so
- * typically move in sync with or opposite EUR/USD depending on dollar
- * direction) and EUR-crosses (share the base currency, so move with
- * EUR/USD when EUR itself - not USD - is the driver). OTC variants are
- * included automatically: assetBlocked/candidatePool operate on whatever
- * is actually open, and ModeService.stripOtc-style matching isn't needed
- * here since the leader is always the non-OTC 'EURUSD' feed - only the
- * follower side can be an '-OTC' ticker. */
-const LEADLAG_FOLLOWERS = ['GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'EURGBP', 'EURJPY', 'EURCHF']
+/** Lead-lag groups: each entry is one "liquidity/macro leader" instrument
+ * plus the secondary instruments it plausibly transmits a shock into, with
+ * some real transmission mechanism behind the pairing (not just "these
+ * happened to correlate in a backtest"):
+ *  - EURUSD -> major USD/EUR crosses: the single most liquid FX pair, so a
+ *    macro shock lands here first and ripples into less-liquid crosses
+ *    that share its base or quote currency.
+ *  - XAUUSD -> XAGUSD/XPTUSD/XPDUSD: gold is the deepest, most-watched
+ *    precious metal - a risk-off/real-yield move shows up there first and
+ *    the thinner metals (silver especially) tend to catch up a bit after.
+ *  - BTCUSD -> the rest of the crypto majors/alts: Bitcoin is crypto's own
+ *    liquidity/sentiment leader; alts echo its directional moves, often
+ *    amplified, with a short lag.
+ *  - USCrude / UKBrent -> CAD crosses: Canada's terms-of-trade are oil-
+ *    linked, so a sharp crude move reprices CAD pairs a little after the
+ *    fact. Two separate leader entries (WTI and Brent) rather than one
+ *    merged series, since they can briefly diverge (e.g. transport/spread
+ *    shocks) and each is worth fitting on its own.
+ * Every leader/follower pair is refit independently (own lag, own
+ * correlation) by pickLeadLagSignal - this list only says what's WORTH
+ * testing, the fit itself decides whether a given pairing is currently
+ * strong enough to trade on. OTC variants of a follower are picked up
+ * automatically (whatever's open), since matching only needs to strip the
+ * follower side, never the leader. */
+export const LEADLAG_GROUPS: { leader: string; followers: string[] }[] = [
+  { leader: 'EURUSD', followers: ['GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'EURGBP', 'EURJPY', 'EURCHF'] },
+  { leader: 'XAUUSD', followers: ['XAGUSD', 'XPTUSD', 'XPDUSD'] },
+  {
+    leader: 'BTCUSD',
+    followers: [
+      'ETHUSD', 'SOLUSD', 'XRPUSD', 'BNBUSD', 'ADAUSD', 'DOGEUSD', 'LTCUSD', 'BCHUSD',
+      'DOTUSD', 'AVAXUSD', 'LINKUSD', 'TRXUSD', 'XLMUSD', 'ETCUSD', 'ATOMUSD', 'NEOUSD', 'UNIUSD',
+    ],
+  },
+  { leader: 'USCrude', followers: ['USDCAD', 'CADJPY', 'CADCHF'] },
+  { leader: 'UKBrent', followers: ['USDCAD', 'CADJPY', 'CADCHF'] },
+]
 /** Below this |correlation| at the fitted lag, the relationship is too
  * weak to trade on - require a moderately strong rolling fit, not just
  * "whichever lag happened to score highest among weak noise". */
-const LEADLAG_MIN_ABS_CORRELATION = 0.35
+export const LEADLAG_MIN_ABS_CORRELATION = 0.35
 /** Below this |z|, the leader's "trigger" move isn't unusual enough to be
  * treated as the kind of macro shock lead-lag trading is meant to catch -
  * ordinary chop shouldn't fire a signal just because the fit says *some*
  * lag correlates. */
-const LEADLAG_MIN_TRIGGER_Z = 1.0
-/** Bars of EUR/USD + follower history fetched per fit - generous enough
+export const LEADLAG_MIN_TRIGGER_Z = 1.0
+/** Bars of leader + follower history fetched per fit - generous enough
  * for the rolling-correlation search (maxLag up to 10) and the trigger's
  * own 60-bar z-score window to both have real sample sizes. */
-const LEADLAG_LOOKBACK_BARS = 240
+export const LEADLAG_LOOKBACK_BARS = 240
 
 interface AutoRuntime {
   dayKey: string
@@ -1453,89 +1480,107 @@ export class ModeService {
   }
 
   /**
-   * EUR/USD lead-lag source: intermarket analysis, not technical analysis
-   * on the follower itself. For each candidate in LEADLAG_FOLLOWERS, fits a
-   * rolling cross-correlation between EUR/USD's returns and the follower's
-   * returns across lags 0..10 bars (analytics/leadlag.ts fitLeadLag), picks
+   * Lead-lag source: intermarket analysis, not technical analysis on the
+   * follower itself. Walks every leader group in LEADLAG_GROUPS (EURUSD ->
+   * major crosses, XAUUSD -> other metals, BTCUSD -> alts, USCrude/UKBrent
+   * -> CAD pairs); for each group's followers, fits a rolling cross-
+   * correlation between the LEADER's returns and the follower's returns
+   * across lags 0..10 bars (analytics/leadlag.ts fitLeadLag), picks
    * whichever lag correlates strongest, and - only when that fit is strong
-   * enough (LEADLAG_MIN_ABS_CORRELATION) AND EUR/USD's own move at that lag
-   * offset back was itself unusual (LEADLAG_MIN_TRIGGER_Z) - projects the
-   * same (or, for a negative fit, opposite) direction onto the follower
-   * right now. A weak or merely-average EUR/USD wiggle never fires a
-   * signal here, by design: the whole premise is "a macro shock in the
-   * world's most liquid pair ripples outward", not "these two series are
-   * generally correlated".
+   * enough (LEADLAG_MIN_ABS_CORRELATION) AND the leader's own move at that
+   * lag offset back was itself unusual (LEADLAG_MIN_TRIGGER_Z) - projects
+   * the same (or, for a negative fit, opposite) direction onto the
+   * follower right now. A weak or merely-average leader wiggle never fires
+   * a signal here, by design: the whole premise is "a shock in the group's
+   * liquidity/macro leader ripples outward", not "these two series are
+   * generally correlated". Groups are tried in LEADLAG_GROUPS order, and
+   * within a group followers are tried in listed order - the first
+   * candidate whose fit clears every gate AND whose sweep-edge key is a
+   * fresh edge wins; a leader with no tradeable feed right now, or one
+   * whose fit never clears, simply falls through to the next group.
    */
   private pickLeadLagSignal(): ScreenRow | null {
     return this.edgeSweep('leadlag', (rec) => {
       try {
         const market = this.ctx.use<MarketDataService>('market')
         const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
-        if (!open.includes('EURUSD')) return null // leader itself not tradeable right now - nothing to lead with
-        const leaderCandles = market.getCandles('EURUSD', this.config.tf, LEADLAG_LOOKBACK_BARS, true)
-        if (leaderCandles.length < 30) return null // too little leader history to fit any lag honestly
-        const leaderCloses = leaderCandles.map((c) => c.close)
         const pool = this.candidatePool(open)
-        const candidates = LEADLAG_FOLLOWERS.filter((a) => pool.includes(a))
-        for (const asset of candidates) {
-          if (this.assetBlocked(asset)) continue
-          try {
-            const followerCandles = market.getCandles(asset, this.config.tf, LEADLAG_LOOKBACK_BARS, true)
-            rec(asset)
-            if (followerCandles.length < 30) continue // thin history for this follower - try the next
-            const followerCloses = followerCandles.map((c) => c.close)
-            const fit = fitLeadLag(leaderCloses, followerCloses, 10)
-            if (fit.n < 10) continue // not enough overlapping bars at the winning lag to trust it
-            if (!finGte(Math.abs(fit.correlation), LEADLAG_MIN_ABS_CORRELATION)) continue
-            const signal = projectLeadLagSignal(fit, leaderCloses)
-            if (!signal) continue
-            if (!finGte(Math.abs(signal.triggerZ), LEADLAG_MIN_TRIGGER_Z)) continue
-            const dir = signal.direction
-            if (this.config.direction !== 'both' && dir !== this.config.direction) continue
-            const corrStrength = clamp(Math.abs(fit.correlation), 0, 1)
-            const zStrength = clamp(Math.abs(signal.triggerZ) / 4, 0, 1) // z=4 treated as maxed-out "very unusual"
-            const score = Math.round(clamp(corrStrength * 100, 0, 100)) * (dir === 'call' ? 1 : -1)
-            const confidence = Math.round(clamp(35 + corrStrength * 35 + zStrength * 25, 35, 95))
-            if (!finGte(Math.abs(score), this.config.minScore)) continue
-            if (!finGte(confidence, this.config.minConfidence)) continue
-            const key = SweepEdgeMemory.key(asset, dir)
-            rec(asset, key)
-            if (this.sweepEdge.gate(key) === 'trade') {
-              const inst = market.assets.find((a) => a.ticker === asset)
-              return {
-                asset,
-                name: inst?.name ?? asset,
-                category: (inst?.category ?? 'forex') as AssetCategory,
-                otc: inst?.otc ?? asset.endsWith('-OTC'),
-                tf: this.config.tf,
-                price: followerCandles[followerCandles.length - 1]?.close ?? 0,
-                score,
-                direction: dir,
-                confidence,
-                pUp: 0,
-                pDown: 0,
-                regime: 'range',
-                ouZ: 0,
-                ouHalfLife: 0,
-                ouMeanReverting: false,
-                ouTStat: 0,
-                rsi: 0,
-                adx: 0,
-                atrPct: 0,
-                hurst: 0,
-                changePct: 0,
-                payout: this.payoutFor(asset, 'binary'),
-                topPattern: null,
-                ts: this.now(),
-                computedTs: this.now(),
-                // why NOW: EUR/USD's own move (the trigger) was unusual enough,
-                // and the fitted lag/correlation says this follower should
-                // echo it in this direction - both bars just cleared, together
-                note: `EURUSD moved ${(signal.triggerReturn * 100).toFixed(2)}% (z ${signal.triggerZ.toFixed(1)}) ${fit.lag} bar${fit.lag === 1 ? '' : 's'} ago · corr ${fit.correlation.toFixed(2)} at lag ${fit.lag} → ${dir.toUpperCase()}`,
-              }
+        const leaderCloseCache = new Map<string, number[] | null>()
+        for (const group of LEADLAG_GROUPS) {
+          if (!open.includes(group.leader)) continue // leader itself not tradeable right now - nothing to lead with
+          let leaderCloses = leaderCloseCache.get(group.leader)
+          if (leaderCloses === undefined) {
+            try {
+              const leaderCandles = market.getCandles(group.leader, this.config.tf, LEADLAG_LOOKBACK_BARS, true)
+              leaderCloses = leaderCandles.length >= 30 ? leaderCandles.map((c) => c.close) : null
+            } catch {
+              leaderCloses = null
             }
-          } catch {
-            // thin history/candle fetch failed for this follower - try the next
+            leaderCloseCache.set(group.leader, leaderCloses)
+          }
+          if (!leaderCloses) continue // too little leader history to fit any lag honestly
+          const candidates = group.followers.filter((a) => pool.includes(a) && a !== group.leader)
+          for (const asset of candidates) {
+            if (this.assetBlocked(asset)) continue
+            try {
+              const followerCandles = market.getCandles(asset, this.config.tf, LEADLAG_LOOKBACK_BARS, true)
+              rec(asset)
+              if (followerCandles.length < 30) continue // thin history for this follower - try the next
+              const followerCloses = followerCandles.map((c) => c.close)
+              const fit = fitLeadLag(leaderCloses, followerCloses, 10)
+              if (fit.n < 10) continue // not enough overlapping bars at the winning lag to trust it
+              if (!finGte(Math.abs(fit.correlation), LEADLAG_MIN_ABS_CORRELATION)) continue
+              const signal = projectLeadLagSignal(fit, leaderCloses)
+              if (!signal) continue
+              if (!finGte(Math.abs(signal.triggerZ), LEADLAG_MIN_TRIGGER_Z)) continue
+              const dir = signal.direction
+              if (this.config.direction !== 'both' && dir !== this.config.direction) continue
+              const corrStrength = clamp(Math.abs(fit.correlation), 0, 1)
+              const zStrength = clamp(Math.abs(signal.triggerZ) / 4, 0, 1) // z=4 treated as maxed-out "very unusual"
+              const score = Math.round(clamp(corrStrength * 100, 0, 100)) * (dir === 'call' ? 1 : -1)
+              const confidence = Math.round(clamp(35 + corrStrength * 35 + zStrength * 25, 35, 95))
+              if (!finGte(Math.abs(score), this.config.minScore)) continue
+              if (!finGte(confidence, this.config.minConfidence)) continue
+              const key = SweepEdgeMemory.key(asset, dir)
+              rec(asset, key)
+              if (this.sweepEdge.gate(key) === 'trade') {
+                const inst = market.assets.find((a) => a.ticker === asset)
+                return {
+                  asset,
+                  name: inst?.name ?? asset,
+                  category: (inst?.category ?? 'forex') as AssetCategory,
+                  otc: inst?.otc ?? asset.endsWith('-OTC'),
+                  tf: this.config.tf,
+                  price: followerCandles[followerCandles.length - 1]?.close ?? 0,
+                  score,
+                  direction: dir,
+                  confidence,
+                  pUp: 0,
+                  pDown: 0,
+                  regime: 'range',
+                  ouZ: 0,
+                  ouHalfLife: 0,
+                  ouMeanReverting: false,
+                  ouTStat: 0,
+                  rsi: 0,
+                  adx: 0,
+                  atrPct: 0,
+                  hurst: 0,
+                  changePct: 0,
+                  payout: this.payoutFor(asset, 'binary'),
+                  topPattern: null,
+                  ts: this.now(),
+                  computedTs: this.now(),
+                  // why NOW: the leader's own move (the trigger) was unusual
+                  // enough, and the fitted lag/correlation says this
+                  // follower should echo it in this direction - both bars
+                  // just cleared, together
+                  note: `${group.leader} moved ${(signal.triggerReturn * 100).toFixed(2)}% (z ${signal.triggerZ.toFixed(1)}) ${fit.lag} bar${fit.lag === 1 ? '' : 's'} ago · corr ${fit.correlation.toFixed(2)} at lag ${fit.lag} → ${dir.toUpperCase()}`,
+                }
+              }
+            } catch {
+              // thin history/candle fetch failed for this follower - try the next
+            }
           }
         }
       } catch {
@@ -2831,7 +2876,7 @@ export class ModeService {
               : this.config.signalSource === 'chartsignals'
                 ? ` (chart-type vote engine, agree ≥ ${CHARTSIGNALS_MIN_AGREE}/5 families)`
                 : this.config.signalSource === 'leadlag'
-                ? ` (EUR/USD rolling cross-correlation, |corr| ≥ ${LEADLAG_MIN_ABS_CORRELATION}, trigger |z| ≥ ${LEADLAG_MIN_TRIGGER_Z})`
+                ? ` (intermarket lead-lag across ${LEADLAG_GROUPS.length} leader groups - EURUSD/XAUUSD/BTCUSD/oil, |corr| ≥ ${LEADLAG_MIN_ABS_CORRELATION}, trigger |z| ≥ ${LEADLAG_MIN_TRIGGER_Z})`
                 : this.config.signalSource === 'strategy'
                 ? (() => {
                     const ids = this.effectiveStrategyIds()
