@@ -964,7 +964,7 @@ export default function OSPage() {
                 </div>
               ) : (
                 <PanelGroup direction="vertical" autoSaveId="iqos:left" className="h-full">
-                  <Panel defaultSize={46} minSize={15}>
+                  <Panel defaultSize={46} minSize={4}>
                     <div className="mr-0.5 flex h-full min-h-0 flex-col">
                       {/* the open-strip buttons live in their own shrinkable,
                           scrollable sub-container (not "shrink-0" on the
@@ -1041,7 +1041,7 @@ export default function OSPage() {
                     </div>
                   </Panel>
                   {hHandle}
-                  <Panel defaultSize={54} minSize={20}>
+                  <Panel defaultSize={54} minSize={4}>
                     <div className="ml-0.5 h-full min-h-0">
                       <IndicatorPanel analysis={analysis} />
                     </div>
