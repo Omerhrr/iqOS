@@ -1351,6 +1351,22 @@ const httpServer = createServer(async (req, res) => {
         return json(200, kernel.context().use<LeadLagScanService>('leadLagScan').scan(tfv))
       }
 
+      // Lead-lag outcome stats (the honesty loop for the lead-lag scanner):
+      // every row that qualified became a pending claim, resolved against
+      // the follower's actual price at a horizon set by the fitted lag -
+      // this is what tells you whether lead-lag is actually paying off, per
+      // leader group, rather than just whether the fit looks plausible.
+      if (path === '/leadlag_stats') {
+        const tfq = q.get('tf')
+        let tfFilter: Timeframe | undefined
+        if (tfq !== null) {
+          const v = tfStrict(tfq)
+          if (v === null) return json(400, { ok: false, error: tfErr(tfq) })
+          tfFilter = v
+        }
+        return json(200, { ok: true, ...kernel.context().use<LeadLagScanService>('leadLagScan').stats(tfFilter), ts: Date.now() })
+      }
+
       // Same-time-yesterday scanner: for every open instrument, what was the
       // market doing EXACTLY 24h ago - and in the window right after? Each
       // row carries the price at that moment, the forward window's net move /

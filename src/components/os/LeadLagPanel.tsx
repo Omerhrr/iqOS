@@ -12,13 +12,16 @@
 // that clear the SAME thresholds the auto-trader's lead-lag source itself
 // requires (|corr| >= 0.35, |triggerZ| >= 1), so this is a read of what
 // the auto-trader would act on right now, not a separate, looser read.
-// The scan runs on the chart's active timeframe (same convention as
-// Chart Signals) and is cheap enough to just recompute every poll - no
-// edge/outcome tracking here, this is a correlation picture, not a
-// win-rate-tracked signal engine.
+// The scan runs on the chart's active timeframe (same convention as Chart
+// Signals). Every row that qualifies also enters an honesty loop (mirrored
+// off chart-signals' Task 64-c tracker, scoped down since lead-lag has no
+// engine roster or CFD plan): the follower's price at a horizon set by the
+// fitted lag decides win/loss/flat, aggregated per leader group in the
+// hit-rate view - this is what actually answers "is this better than
+// watching indicators" with numbers, not just a plausible-looking fit.
 import { useCallback, useEffect, useState } from 'react'
-import type { LeadLagRow, LeadLagScanResult, Timeframe } from '@/lib/os/client'
-import { fmtPrice, getLeadLag } from '@/lib/os/client'
+import type { LeadLagRow, LeadLagScanResult, LeadLagStats, Timeframe } from '@/lib/os/client'
+import { fmtPrice, getLeadLag, getLeadLagStats } from '@/lib/os/client'
 
 interface LeadLagPanelProps {
   onClose: () => void
@@ -43,6 +46,8 @@ function dirChip(direction: 'call' | 'put' | null) {
     </span>
   )
 }
+
+const POLL_MS = 15_000
 
 function CorrelationBar({ r }: { r: LeadLagRow }) {
   const pos = r.correlation >= 0
@@ -113,6 +118,89 @@ function LeadLagCard({ r, onSelectAsset }: { r: LeadLagRow; onSelectAsset?: (a: 
   )
 }
 
+function outcomeColor(o: string): string {
+  return o === 'win' ? 'text-emerald-300' : o === 'loss' ? 'text-rose-300' : 'text-amber-300'
+}
+
+function StatsView({ st, tf }: { st: LeadLagStats | null; tf: Timeframe }) {
+  if (!st || (st.wins + st.losses + st.flats === 0 && st.pending === 0)) {
+    return (
+      <div className="p-2 text-[10px] leading-relaxed text-[#4b5a72]">
+        No outcome data yet - every qualifying pair becomes a pending claim, resolved against the follower's actual price at a horizon set by the fitted lag. Give it a few minutes of scanning (longer on higher timeframes, since the horizon scales with the lag).
+      </div>
+    )
+  }
+  const decided = st.wins + st.losses
+  return (
+    <div className="space-y-2">
+      <div className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-2">
+        <div className="flex items-baseline gap-2">
+          <span className={`font-mono text-[18px] font-bold ${st.winRate === null ? 'text-[#4b5a72]' : st.winRate >= 55 ? 'text-emerald-300' : st.winRate >= 45 ? 'text-cyan-300' : 'text-rose-300'}`}>
+            {st.winRate === null ? '—' : `${st.winRate}%`}
+          </span>
+          <span className="font-mono text-[9px] text-[#7c8aa5]">
+            follower-echoed hit rate · {tf} · {st.wins}W / {st.losses}L
+          </span>
+        </div>
+        <div className="mt-1 font-mono text-[8.5px] leading-relaxed text-[#4b5a72]">
+          {st.flats > 0 && <>{st.flats} flat · </>}
+          avg move {st.avgMovePct.toFixed(3)}% · {st.pending} pending · {st.recorded} recorded
+        </div>
+      </div>
+
+      <div className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-2">
+        <div className="mb-1.5 text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5]">per-leader hit rate</div>
+        {st.byLeader.length === 0 ? (
+          <div className="text-[9px] text-[#4b5a72]">no resolved reads yet</div>
+        ) : (
+          <div className="space-y-1">
+            {st.byLeader.map((l) => {
+              const dec = l.wins + l.losses
+              return (
+                <div key={l.leader} className="flex items-center gap-1.5" title={`${l.wins}W / ${l.losses}L / ${l.flats} flat · ${l.pending} pending`}>
+                  <span className="w-16 shrink-0 font-mono text-[8.5px] text-[#aab6cc]">{l.leader}</span>
+                  <div className="h-1.5 flex-1 overflow-hidden rounded bg-[#101828]">
+                    {dec > 0 && (
+                      <div
+                        className={`h-full ${(l.winRate ?? 0) >= 55 ? 'bg-emerald-500' : (l.winRate ?? 0) >= 45 ? 'bg-cyan-500' : 'bg-rose-500'}`}
+                        style={{ width: `${Math.max(3, l.winRate ?? 0)}%` }}
+                      />
+                    )}
+                  </div>
+                  <span className="w-20 shrink-0 text-right font-mono text-[8.5px] text-[#7c8aa5]">
+                    {l.winRate === null ? '—' : `${l.winRate}%`} · {dec}d · {l.pending}p
+                  </span>
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </div>
+
+      <div className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-2">
+        <div className="mb-1 text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5]">recent reads</div>
+        <div className="space-y-0.5">
+          {st.recent.slice(0, 8).map((r) => (
+            <div key={r.id} className="flex items-center gap-1.5 font-mono text-[8.5px]">
+              {dirChip(r.direction)}
+              <span className="text-[#aab6cc]">{r.leader}→{r.asset}</span>
+              {r.otc && <span className="text-[8px] font-bold uppercase text-amber-400">otc</span>}
+              <span className={`ml-auto ${outcomeColor(r.outcome)}`}>
+                {r.outcome} {r.movePct >= 0 ? '+' : ''}{r.movePct.toFixed(3)}%
+              </span>
+            </div>
+          ))}
+          {st.recent.length === 0 && <div className="text-[9px] text-[#4b5a72]">nothing resolved yet</div>}
+        </div>
+      </div>
+
+      <p className="px-1 text-[8.5px] leading-relaxed text-[#3d4d66]">
+        A claim wins when the follower's price moved the predicted direction by the resolution horizon (the fitted lag's worth of bars, floored at 1 minute, capped at 30). Flat moves hit nothing and stay out of the rate. Decay here - a leader whose win rate drops over time - is exactly the "relationship stopped holding" signal to watch for.
+      </p>
+    </div>
+  )
+}
+
 export default function LeadLagPanel({ onClose, tf, onSelectAsset }: LeadLagPanelProps) {
   const [groupFilter, setGroupFilter] = useState<GroupFilter>('all')
   const [onlyQualifying, setOnlyQualifying] = useState(false)
@@ -120,6 +208,8 @@ export default function LeadLagPanel({ onClose, tf, onSelectAsset }: LeadLagPane
   const [data, setData] = useState<LeadLagScanResult | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [stats, setStats] = useState<LeadLagStats | null>(null)
+  const [view, setView] = useState<'rows' | 'stats'>('rows')
 
   const load = useCallback(
     (opts?: { quiet?: boolean }) => {
@@ -139,9 +229,24 @@ export default function LeadLagPanel({ onClose, tf, onSelectAsset }: LeadLagPane
 
   useEffect(() => {
     load()
-    const iv = setInterval(() => load({ quiet: true }), 15_000)
+    const iv = setInterval(() => load({ quiet: true }), POLL_MS)
     return () => clearInterval(iv)
   }, [load])
+
+  // outcome stats poll - the honesty loop resolves on the kernel's 5s sweep,
+  // a 30s refresh here is plenty (aggregates only). Filtered to the chart's
+  // tf so the hit-rate view scores the same candles the rows were fit on.
+  useEffect(() => {
+    const pull = () =>
+      getLeadLagStats(tf)
+        .then((s) => {
+          if (s?.ok) setStats(s)
+        })
+        .catch(() => {})
+    void pull()
+    const iv = setInterval(pull, 30_000)
+    return () => clearInterval(iv)
+  }, [tf])
 
   const needle = query.trim().toLowerCase()
   const rows = (data?.rows ?? [])
@@ -171,6 +276,36 @@ export default function LeadLagPanel({ onClose, tf, onSelectAsset }: LeadLagPane
             {' '}· {data.scanMs}ms
           </span>
         )}
+        {(() => {
+          const decided = stats ? stats.wins + stats.losses : 0
+          if (!stats || (!decided && !stats.pending)) return null
+          return (
+            <span
+              className={`ml-1 rounded border px-1 py-px font-mono text-[8px] font-bold ${
+                stats.winRate === null
+                  ? 'border-[#1c2739] text-[#4b5a72]'
+                  : stats.winRate >= 55
+                    ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                    : stats.winRate >= 45
+                      ? 'border-cyan-500/40 bg-cyan-500/10 text-cyan-300'
+                      : 'border-rose-500/40 bg-rose-500/10 text-rose-300'
+              }`}
+              title={`resolved claims: ${stats.wins}W / ${stats.losses}L${stats.flats ? ` / ${stats.flats} flat` : ''} · ${stats.pending} pending now`}
+            >
+              {stats.winRate === null ? `0/${decided}` : `${stats.winRate}%`} · {decided}
+            </span>
+          )
+        })()}
+        <button
+          type="button"
+          onClick={() => setView((v) => (v === 'stats' ? 'rows' : 'stats'))}
+          className={`ml-1 flex h-5 items-center rounded border px-1.5 font-mono text-[8px] font-bold uppercase tracking-wider transition-colors ${
+            view === 'stats' ? 'border-cyan-500/50 bg-cyan-500/10 text-cyan-300' : 'border-[#1c2739] text-[#7c8aa5] hover:text-cyan-300'
+          }`}
+          title="what the lead-lag fits actually delivered - win rates per leader group"
+        >
+          hit-rate
+        </button>
         <button
           type="button"
           onClick={onClose}
@@ -181,6 +316,7 @@ export default function LeadLagPanel({ onClose, tf, onSelectAsset }: LeadLagPane
         </button>
       </div>
 
+      {view === 'rows' && (
       <div className="flex items-center gap-1 border-b border-[#1c2739] px-2 py-1">
         <div className="relative min-w-0 flex-1">
           <input
@@ -229,7 +365,9 @@ export default function LeadLagPanel({ onClose, tf, onSelectAsset }: LeadLagPane
           </button>
         ))}
       </div>
+      )}
 
+      {view === 'rows' && (
       <div className="flex items-center gap-2 border-b border-[#1c2739] px-2 py-1">
         <label className="flex shrink-0 items-center gap-1.5 font-mono text-[8.5px] uppercase tracking-wider text-[#7c8aa5]" title="hide every pair that doesn't currently clear the auto-trader's own correlation + trigger-z thresholds">
           <input type="checkbox" checked={onlyQualifying} onChange={(e) => setOnlyQualifying(e.target.checked)} className="accent-cyan-500" />
@@ -237,8 +375,13 @@ export default function LeadLagPanel({ onClose, tf, onSelectAsset }: LeadLagPane
         </label>
         <span className="ml-auto font-mono text-[8px] text-[#4b5a72]">{rows.length} shown</span>
       </div>
+      )}
 
       <div className="min-h-0 flex-1 space-y-1.5 overflow-auto p-2">
+        {view === 'stats' ? (
+          <StatsView st={stats} tf={tf} />
+        ) : (
+          <>
         {error && <div className="p-2 text-[10px] text-rose-400">{error}</div>}
         {!error && rows.length === 0 && (
           <div className="p-2 text-[10px] leading-relaxed text-[#4b5a72]">
@@ -256,8 +399,10 @@ export default function LeadLagPanel({ onClose, tf, onSelectAsset }: LeadLagPane
         ))}
         {data && data.rows.length > 0 && (
           <p className="px-1 pt-1 text-[8.5px] leading-relaxed text-[#3d4d66]">
-            Each row refits its own best lag (0-10 bars) and correlation between the group leader's returns and this follower's returns, every {Math.round(15)}s. <span className="text-emerald-500/70">qualifies</span> marks exactly the pairs strong AND unusual enough for the auto-trader's lead-lag source to act on right now - everything else is shown for context, not as a trade signal. Click a card to open the chart.
+            Each row refits its own best lag (0-10 bars) and correlation between the group leader's returns and this follower's returns, every {Math.round(POLL_MS / 1000)}s. <span className="text-emerald-500/70">qualifies</span> marks exactly the pairs strong AND unusual enough for the auto-trader's lead-lag source to act on right now - everything else is shown for context, not as a trade signal. Click a card to open the chart.
           </p>
+        )}
+          </>
         )}
       </div>
     </div>

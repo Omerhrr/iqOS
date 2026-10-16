@@ -505,13 +505,24 @@ export class ModeService {
    * are really one bet" without needing a live correlation matrix. OTC
    * suffixes are stripped before matching, so e.g. EURUSD-OTC still groups
    * with GBPUSD-OTC. */
+  // Task: lead-lag (LEADLAG_GROUPS below) argues several of these followers
+  // are driven by one leader's shock - but until this list said so too,
+  // correlationGuard treated e.g. an open XAUUSD position and a fresh
+  // XPTUSD signal as two "diversified" bets instead of one. Metals, the
+  // full crypto roster, and the oil-linked CAD crosses were widened to
+  // match LEADLAG_GROUPS' followers so the two systems agree on what
+  // counts as "really one exposure" - not a coincidence, lead-lag is
+  // explicitly betting that these move together.
   private static CORRELATION_GROUPS: string[][] = [
     ['EURUSD', 'GBPUSD', 'EURGBP', 'EURCHF', 'EURJPY', 'EURAUD', 'EURCAD'],
     ['AUDUSD', 'NZDUSD', 'AUDNZD', 'AUDCAD'],
     ['USDJPY', 'EURJPY', 'GBPJPY', 'AUDJPY', 'CHFJPY'],
-    ['USDCAD', 'USDCHF'],
-    ['XAUUSD', 'XAGUSD'],
-    ['BTCUSD', 'ETHUSD', 'LTCUSD', 'XRPUSD'],
+    ['USDCAD', 'USDCHF', 'CADJPY', 'CADCHF'],
+    ['XAUUSD', 'XAGUSD', 'XPTUSD', 'XPDUSD'],
+    [
+      'BTCUSD', 'ETHUSD', 'SOLUSD', 'XRPUSD', 'BNBUSD', 'ADAUSD', 'DOGEUSD', 'LTCUSD', 'BCHUSD',
+      'DOTUSD', 'AVAXUSD', 'LINKUSD', 'TRXUSD', 'XLMUSD', 'ETCUSD', 'ATOMUSD', 'NEOUSD', 'UNIUSD',
+    ],
   ]
 
   private static stripOtc(asset: string): string {

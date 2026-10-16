@@ -423,6 +423,49 @@ export async function getLeadLag(tf: Timeframe): Promise<LeadLagScanResult> {
   return osGet<LeadLagScanResult>('/leadlag', { tf })
 }
 
+export interface LeadLagLeaderStats {
+  leader: string
+  wins: number
+  losses: number
+  flats: number
+  winRate: number | null
+  pending: number
+}
+
+export interface LeadLagStats {
+  ok: boolean
+  wins: number
+  losses: number
+  flats: number
+  winRate: number | null
+  pending: number
+  recorded: number
+  avgMovePct: number
+  byLeader: LeadLagLeaderStats[]
+  recent: {
+    id: string
+    leader: string
+    asset: string
+    tf: Timeframe
+    otc: boolean
+    direction: 'call' | 'put'
+    entry: number
+    exit: number
+    movePct: number
+    outcome: 'win' | 'loss' | 'flat'
+    correlation: number
+    lag: number
+    triggerZ: number
+    ts: number
+    resolvedAt: number
+  }[]
+  ts: number
+}
+
+export async function getLeadLagStats(tf?: Timeframe): Promise<LeadLagStats> {
+  return osGet<LeadLagStats>('/leadlag_stats', tf ? { tf } : {})
+}
+
 // ---- chart-signal outcome stats (Task 64-c: the honesty loop) ------------
 
 export type SignalOutcomeId = 'win' | 'loss' | 'flat' | 'timeout'
