@@ -1813,7 +1813,9 @@ function AutoTraderDialog({
           </div>
           <div className="col-span-2">
             <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Signal source</Label>
-            <div className="flex overflow-hidden rounded border border-[#1c2739]">
+            <div
+              className="flex gap-px overflow-x-auto rounded border border-[#1c2739] [scrollbar-color:#2a3850_#0b111c] [scrollbar-width:thin] [&::-webkit-scrollbar]:h-1.5 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-[#2a3850] [&::-webkit-scrollbar-track]:bg-[#0b111c]"
+            >
               {(
                 [
                   ['chartsignals', 'Chart-signals'],
@@ -1829,7 +1831,7 @@ function AutoTraderDialog({
                   key={v}
                   type="button"
                   onClick={() => p({ signalSource: v })}
-                  className={`flex-1 px-1.5 py-1.5 font-mono text-[10px] uppercase tracking-wider transition-colors ${
+                  className={`shrink-0 whitespace-nowrap px-2.5 py-1.5 font-mono text-[10px] uppercase tracking-wider transition-colors ${
                     d.signalSource === v ? 'bg-cyan-500/20 text-cyan-300' : 'text-[#4b5a72] hover:text-[#aab6cc]'
                   }`}
                 >
