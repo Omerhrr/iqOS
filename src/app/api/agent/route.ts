@@ -9,6 +9,15 @@ import { chatComplete, enabledProviders, type ChatMessage } from '@/lib/llm'
 
 const CORE = process.env.KERNEL_URL || 'http://127.0.0.1:3030'
 
+// P0 security: the kernel rejects unauthenticated REST when KERNEL_TOKEN is
+// set - every server-side kernel call from the copilot loop carries it. This
+// runs in the Node runtime, so the token is read fresh per request (unlike
+// middleware.ts, which bakes it at build time for the rewrite path).
+function kernelHeaders(): Record<string, string> {
+  const t = process.env.KERNEL_TOKEN
+  return t ? { 'x-kernel-token': t } : {}
+}
+
 interface ToolSpec {
   name: string
   description: string
@@ -79,14 +88,14 @@ interface TraceEntry {
 }
 
 async function coreGet(path: string): Promise<unknown> {
-  const res = await fetch(`${CORE}${path}`, { cache: 'no-store' })
+  const res = await fetch(`${CORE}${path}`, { headers: kernelHeaders(), cache: 'no-store' })
   return res.json()
 }
 
 async function corePost(path: string, body: unknown): Promise<unknown> {
   const res = await fetch(`${CORE}${path}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...kernelHeaders() },
     body: JSON.stringify(body ?? {}),
     cache: 'no-store',
   })
@@ -103,7 +112,7 @@ function trimAnalysis(a: Record<string, unknown>): Record<string, unknown> {
   return out
 }
 
-const CHART_TYPES = ['candles', 'hollow', 'bars', 'line', 'area', 'baseline', 'heikin-ashi', 'renko']
+const CHART_TYPES = ['candles', 'hollow', 'bars', 'line', 'area', 'baseline', 'heikin-ashi', 'renko', 'pointfigure', 'rangebars', 'volumebars', 'footprint', 'otcfootprint', 'tpo', 'tickchart', 'ivhv']
 
 // ---------- shared helpers for the composed power tools ----------
 
@@ -341,6 +350,114 @@ const TOOLS: ToolSpec[] = [
     },
   },
   {
+    name: 'order_flow',
+    description:
+      'Volume Profile (Point of Control, Value Area High/Low, per-price-bucket volume) and candle-delta / cumulative-delta for an asset+timeframe - the data behind the Order Flow panel. IMPORTANT: this is a CLV (close-location-value) approximation of buy/sell volume split from OHLCV candles, NOT real tick-level order-flow or order-book data - IQ Option exposes no bid/ask-tagged trades. Always frame any read from this as "(approx)". Pass {"metric":"volume_profile"} for POC/VAH/VAL/levels, {"metric":"delta"} for per-candle delta + cumulative delta, or omit metric for both.',
+    args: '{"asset": "EURUSD", "tf": "1m", "metric": "volume_profile|delta|both", "limit": 300, "buckets": 24}',
+    run: async (a) => {
+      const asset = String(a.asset ?? 'EURUSD')
+      const tf = String(a.tf ?? '1m')
+      const limit = Math.max(20, Math.min(2000, Number(a.limit) || 300))
+      const buckets = Math.max(10, Math.min(80, Number(a.buckets) || 24))
+      const metric = String(a.metric ?? 'both')
+      const out: Record<string, unknown> = { ok: true, asset, tf }
+      if (metric === 'volume_profile' || metric === 'both') {
+        const vp = (await coreGet(`/volume_profile?asset=${encodeURIComponent(asset)}&tf=${tf}&limit=${limit}&buckets=${buckets}`)) as {
+          ok: boolean
+          profile?: { poc: number; valueAreaHigh: number; valueAreaLow: number; totalVolume: number; levels: { price: number; volume: number }[] }
+          error?: string
+        }
+        if (vp.ok && vp.profile) {
+          const topLevels = [...vp.profile.levels].sort((x, y) => y.volume - x.volume).slice(0, 5)
+          out.volumeProfile = {
+            poc: vp.profile.poc,
+            valueAreaHigh: vp.profile.valueAreaHigh,
+            valueAreaLow: vp.profile.valueAreaLow,
+            totalVolumeApprox: Math.round(vp.profile.totalVolume),
+            topVolumeLevels: topLevels.map((l) => ({ price: l.price, volumeApprox: Math.round(l.volume) })),
+          }
+        } else {
+          out.volumeProfile = { error: vp.error ?? 'unavailable' }
+        }
+      }
+      if (metric === 'delta' || metric === 'both') {
+        const d = (await coreGet(`/delta?asset=${encodeURIComponent(asset)}&tf=${tf}&limit=${limit}`)) as {
+          ok: boolean
+          deltas?: { time: number; delta: number }[]
+          cumulative?: { time: number; cumulativeDelta: number }[]
+          error?: string
+        }
+        if (d.ok && d.deltas && d.cumulative) {
+          const recent = d.deltas.slice(-10)
+          out.delta = {
+            lastCandleDeltaApprox: Math.round((recent[recent.length - 1]?.delta ?? 0) * 100) / 100,
+            last10SumApprox: Math.round(recent.reduce((s, x) => s + x.delta, 0) * 100) / 100,
+            cumulativeDeltaNowApprox: Math.round((d.cumulative[d.cumulative.length - 1]?.cumulativeDelta ?? 0) * 100) / 100,
+            note: 'CLV-based buy/sell split approximation, not real order-flow',
+          }
+        } else {
+          out.delta = { error: d.error ?? 'unavailable' }
+        }
+      }
+      return out
+    },
+  },
+  {
+    name: 'otc_footprint',
+    description:
+      'OTC Micro-Tick Velocity Footprint - the generator-revealing read for OTC pairs. Measures the feed\'s own price-print stream (there is no real order book there): per-minute velocity delta (up-ticks minus down-ticks), tick speed ratio (avg ms between down vs up prints - >1 means the generator pushes up faster), cluster stagnation (a price level taking disproportionate prints = the script looping there, the OTC POC) and divergence traps (heavy positive delta closing at the low = ceiling cue -> put; mirrored -> call). Returns the window summary signal + the most recent minute buckets with their POC/badges. Requires accumulated micro-tick captures (sim 1s engine or the sidecar 100ms poller in live) - an empty buffer means "warming up", say so.',
+    args: '{"asset": "EURUSD-OTC", "minutes": 30}',
+    run: async (a) => {
+      const asset = String(a.asset ?? 'EURUSD')
+      const minutes = Math.max(1, Math.min(240, Number(a.minutes) || 30))
+      const d = (await coreGet(`/otc_footprint?asset=${encodeURIComponent(asset)}&minutes=${minutes}`)) as {
+        ok: boolean
+        dataSource?: string
+        cadenceMs?: number | null
+        tickSize?: number
+        buckets?: {
+          time: number
+          close: number
+          upTicks: number
+          dnTicks: number
+          velDelta: number
+          speedRatio: number
+          stagnation: number
+          pocPrice: number
+          pocTicks: number
+          closePos: number
+          divergence: string | null
+          exhaustion: string | null
+          nTicks: number
+        }[]
+        summary?: { totalUp: number; totalDn: number; netDelta: number; avgSpeedRatio: number; dominantPoc: number; signal: string; score: number; note: string }
+        error?: string
+      }
+      if (!d.ok) return { ok: false, error: d.error ?? 'footprint unavailable' }
+      const recent = (d.buckets ?? []).filter((b) => b.nTicks > 0).slice(-5)
+      return {
+        ok: true,
+        asset,
+        dataSource: d.dataSource,
+        cadenceMs: d.cadenceMs,
+        summary: d.summary,
+        recentBuckets: recent.map((b) => ({
+          time: b.time,
+          close: b.close,
+          velDelta: b.velDelta,
+          speedRatio: b.speedRatio,
+          stagnation: b.stagnation,
+          poc: b.pocPrice,
+          pocPrints: b.pocTicks,
+          closePosInRange: b.closePos,
+          divergence: b.divergence,
+          exhaustion: b.exhaustion,
+        })),
+        note: 'velocity footprint of the OTC generator print stream - not real order flow; cadence is bounded by the capture rate',
+      }
+    },
+  },
+  {
     name: 'multi_timeframe',
     description: 'Analyze one asset across 4 timeframes (5m, 15m, 1h, 4h) and get each composite signal - the classic MTF confluence read. Use before recommending a trade.',
     args: '{"asset": "BTCUSD"}',
@@ -408,6 +525,42 @@ const TOOLS: ToolSpec[] = [
     description: 'Scan a whole category (forex|otc|crypto|commodity|stock|index|all) and rank instruments by composite signal strength. Returns the hottest bullish + bearish setups.',
     args: '{"category": "crypto", "tf": "5m"}',
     run: (a) => coreGet(`/scan?category=${encodeURIComponent(String(a.category ?? 'all'))}&tf=${String(a.tf ?? '1m')}&limit=14`),
+  },
+  {
+    name: 'distill_scan',
+    description: 'Full-universe Chart Distill scan: the smoothed multi-engine vote for every open instrument at once, ranked by signal strength - the sidebar-wide version of a single Chart Distill read.',
+    args: '{"tf": "5m"}',
+    run: (a) => coreGet(`/distill_scan?tf=${String(a.tf ?? '1m')}`),
+  },
+  {
+    name: 'cointegration_scan',
+    description: 'Full-universe Cointegration Pairs scan: every leader/follower pair in the roster, Engle-Granger-fit and ranked, with `qualifies` marking exactly what the cointegration-pairs strategy would act on right now.',
+    args: '{"tf": "5m"}',
+    run: (a) => coreGet(`/cointegration_scan?tf=${String(a.tf ?? '1m')}`),
+  },
+  {
+    name: 'volarb_scan',
+    description: "Full-universe Volatility Arb scan: every open instrument's close-vs-range volatility ratio, ranked by how extreme it is right now.",
+    args: '{"tf": "5m"}',
+    run: (a) => coreGet(`/volarb_scan?tf=${String(a.tf ?? '1m')}`),
+  },
+  {
+    name: 'triangulation_scan',
+    description: 'Full-universe FX Triangulation scan: every triangle (A/B, B/C, A/C) in the universe, synthetic-vs-actual cross-rate delta, ranked by how unusual that basis is against its own recent history, with `qualifies` marking actionable crosses.',
+    args: '{"tf": "5m"}',
+    run: (a) => coreGet(`/triangulation_scan?tf=${String(a.tf ?? '1m')}`),
+  },
+  {
+    name: 'adx_pattern_bias_scan',
+    description: 'Full-universe ADX/DI + Pattern Bias scan: trend strength/direction (ADX/+DI/-DI) combined with recent candlestick pattern bias into one agreement-gated composite, for every open instrument, with `qualifies` marking actionable setups.',
+    args: '{"tf": "5m"}',
+    run: (a) => coreGet(`/adx_pattern_bias_scan?tf=${String(a.tf ?? '1m')}`),
+  },
+  {
+    name: 'shock_pressure_scan',
+    description: 'Full-universe Shock + Pressure scan: an ATR-normalized shock ratio on the latest bar combined with net buy/sell pressure built up over the prior few bars into one agreement-gated composite, for every open instrument, with `qualifies` marking actionable setups.',
+    args: '{"tf": "5m"}',
+    run: (a) => coreGet(`/shock_pressure_scan?tf=${String(a.tf ?? '1m')}`),
   },
   {
     name: 'markov_chain',
@@ -524,8 +677,8 @@ const TOOLS: ToolSpec[] = [
   },
   {
     name: 'backtest',
-    description: 'Backtest a strategy over recent history. strategy and asset are REQUIRED (same discipline as run_strategy - a missing one used to silently default and produce a plausible-looking but wrong-instrument result). Returns trades, win rate, profit factor, max drawdown, Sharpe, expectancy and the equity curve.',
-    args: '{"strategy": "rsi-reversion", "asset": "EURUSD", "tf": "1m", "mode": "binary|spot", "amount": 10, "expiryBars": 1, "params": {}}',
+    description: 'Backtest a strategy over recent history. strategy and asset are REQUIRED (same discipline as run_strategy - a missing one used to silently default and produce a plausible-looking but wrong-instrument result). Returns trades, win rate, profit factor, max drawdown, Sharpe, expectancy and the equity curve, PLUS a "byDirection" breakdown ({call:{...}, put:{...}}) of those same stats split by trade side - check it before calling a strategy direction-agnostic. Optional "direction" (both|call|put, default both, same meaning as bot_create/autopilot_configure\'s direction) filters the backtest itself to only CALL-side or PUT-side entries, instead of just reading the blended byDirection split - use it when the user wants to know how the strategy performs trading ONE side only. strategy accepts any id from list_strategies, including an AI-Lab "custom:<id>" spec, exactly like a builtin id.',
+    args: '{"strategy": "rsi-reversion", "asset": "EURUSD", "tf": "1m", "mode": "binary|spot", "amount": 10, "expiryBars": 1, "direction": "both", "params": {}}',
     run: (a) => {
       if (!a.strategy || typeof a.strategy !== 'string') return Promise.resolve({ ok: false, error: 'backtest requires "strategy" (a strategy id from list_strategies)' })
       if (!a.asset || typeof a.asset !== 'string') return Promise.resolve({ ok: false, error: 'backtest requires "asset" - refusing to silently fall back to whatever asset is active in the UI' })
@@ -536,6 +689,7 @@ const TOOLS: ToolSpec[] = [
         mode: a.mode ?? 'binary',
         amount: a.amount ?? 10,
         expiryBars: a.expiryBars ?? 1,
+        direction: a.direction,
         params: a.params,
       })
     },
@@ -543,8 +697,8 @@ const TOOLS: ToolSpec[] = [
   // ---------- research: optimization lab ----------
   {
     name: 'optimize_strategy',
-    description: 'Grid-search a strategy over recent history: sweep numeric params (from/to/step), rank combos by objective (netPnl|sharpe|profitFactor|winRate|expectancy). Top-3 finalists are re-verified by the full settlement engine. Use BEFORE creating a bot: optimize, then bot_create with the winning params. Keep grids tight (<= 240 combos). strategy and asset are REQUIRED. Optional "params": fixed non-swept overrides merged in UNDER every combo (sweep keys still win if the same key appears in both) - this is the ONLY way to pin a param the grid isn\'t sweeping to something other than its registered default, and it is REQUIRED for any non-numeric ("select"-type) param since SweepSpec can only step a numeric from/to/step range. Right now ensemble-vote\'s "members" (a comma-separated strategy-id list) is the one param in the whole registry that needs this - pass params:{"members":"id-a,id-b"} or it silently falls back to the strategy\'s default member list.',
-    args: '{"strategy": "rsi-reversion", "asset": "EURUSD", "tf": "1m", "sweep": {"period": {"from": 7, "to": 21, "step": 2}, "oversold": {"from": 20, "to": 35, "step": 5}}, "params": {}, "objective": "netPnl", "minTrades": 8, "expiryBars": 1}',
+    description: 'Grid-search a strategy over recent history: sweep numeric params (from/to/step), rank combos by objective (netPnl|sharpe|profitFactor|winRate|expectancy). Top-3 finalists are re-verified by the full settlement engine. Use BEFORE creating a bot: optimize, then bot_create with the winning params. Keep grids tight (<= 240 combos). strategy and asset are REQUIRED. Optional "params": fixed non-swept overrides merged in UNDER every combo (sweep keys still win if the same key appears in both) - this is the ONLY way to pin a param the grid isn\'t sweeping to something other than its registered default, and it is REQUIRED for any non-numeric ("select"-type) param since SweepSpec can only step a numeric from/to/step range. Right now ensemble-vote\'s "members" (a comma-separated strategy-id list) is the one param in the whole registry that needs this - pass params:{"members":"id-a,id-b"} or it silently falls back to the strategy\'s default member list. Optional "direction" (both|call|put, default both, same meaning as bot_create/autopilot_configure\'s direction) restricts the grid search itself to one trade side. Every combo\'s result also carries a "byDirection" ({call:{...}, put:{...}}) stats split - check it before recommending a direction-agnostic deployment of the winning combo. strategy accepts any id from list_strategies, including an AI-Lab "custom:<id>" spec, exactly like a builtin id.',
+    args: '{"strategy": "rsi-reversion", "asset": "EURUSD", "tf": "1m", "sweep": {"period": {"from": 7, "to": 21, "step": 2}, "oversold": {"from": 20, "to": 35, "step": 5}}, "params": {}, "objective": "netPnl", "minTrades": 8, "expiryBars": 1, "direction": "both"}',
     run: (a) => {
       if (!a.strategy || typeof a.strategy !== 'string') return Promise.resolve({ ok: false, error: 'optimize_strategy requires "strategy" (a strategy id from list_strategies)' })
       if (!a.asset || typeof a.asset !== 'string') return Promise.resolve({ ok: false, error: 'optimize_strategy requires "asset" - refusing to silently fall back to whatever asset is active in the UI' })
@@ -557,13 +711,14 @@ const TOOLS: ToolSpec[] = [
         objective: a.objective ?? 'netPnl',
         minTrades: a.minTrades ?? 8,
         expiryBars: a.expiryBars ?? 1,
+        direction: a.direction,
       })
     },
   },
   {
     name: 'walkforward',
-    description: 'Walk-forward validation: splits history into folds, optimizes params in-sample per fold, then settles the winner out-of-sample with the real binary engine. Reports OOS net, consistency (profitable folds), IS-to-OOS efficiency and a robust/weak/failed verdict — the honest edge check before deploying a bot. The verdict is PERSISTED: a robust pass for this exact asset+tf+strategy is now REQUIRED before bot_create/bot_toggle will arm a bot on it (the research gate), and it goes stale after 14 days. Pass the same sweep spec as optimize_strategy. strategy and asset are REQUIRED. Optional "params": fixed non-swept overrides, same meaning and same ensemble-vote "members" use case as optimize_strategy\'s "params" - without it, a param you are not sweeping silently uses its registered default on every fold, and the result\'s bestParams will misleadingly SHOW that default even though it was never actually evaluated.',
-    args: '{"strategy": "rsi-reversion", "asset": "EURUSD", "tf": "1m", "sweep": {"period": {"from": 7, "to": 21, "step": 2}}, "params": {}, "folds": 3, "isRatio": 0.7, "objective": "netPnl"}',
+    description: 'Walk-forward validation: splits history into folds, optimizes params in-sample per fold, then settles the winner out-of-sample with the real binary engine. Reports OOS net, consistency (profitable folds), IS-to-OOS efficiency and a robust/weak/failed verdict — the honest edge check before deploying a bot. The verdict is PERSISTED: a robust pass for this exact asset+tf+strategy is now REQUIRED before bot_create/bot_toggle will arm a bot on it (the research gate), and it goes stale after 14 days. Pass the same sweep spec as optimize_strategy. strategy and asset are REQUIRED. Optional "params": fixed non-swept overrides, same meaning and same ensemble-vote "members" use case as optimize_strategy\'s "params" - without it, a param you are not sweeping silently uses its registered default on every fold, and the result\'s bestParams will misleadingly SHOW that default even though it was never actually evaluated. Optional "direction" (both|call|put, default both, same meaning as bot_create/autopilot_configure\'s direction) restricts validation to one trade side. The OOS result also carries a "byDirection" ({call:{...}, put:{...}}) stats split - check it before recommending a direction-agnostic deployment. strategy accepts any id from list_strategies, including an AI-Lab "custom:<id>" spec, exactly like a builtin id.',
+    args: '{"strategy": "rsi-reversion", "asset": "EURUSD", "tf": "1m", "sweep": {"period": {"from": 7, "to": 21, "step": 2}}, "params": {}, "folds": 3, "isRatio": 0.7, "objective": "netPnl", "direction": "both"}',
     run: (a) => {
       if (!a.strategy || typeof a.strategy !== 'string') return Promise.resolve({ ok: false, error: 'walkforward requires "strategy" (a strategy id from list_strategies)' })
       if (!a.asset || typeof a.asset !== 'string') return Promise.resolve({ ok: false, error: 'walkforward requires "asset" - refusing to silently fall back to whatever asset is active in the UI' })
@@ -578,7 +733,33 @@ const TOOLS: ToolSpec[] = [
         folds: a.folds ?? 3,
         isRatio: a.isRatio ?? 0.7,
         expiryBars: a.expiryBars ?? 1,
+        direction: a.direction,
       })
+    },
+  },
+  {
+    name: 'otc_defense',
+    description: 'THE OTC DEFENSE - placebo-test a strategy against a generator-driven OTC feed. OTC pairs\' charts are machine-generated, so technical analysis has no causal edge there and a good backtest can be pure luck. This runs the strategy on the real pair AND on K synthetic "twin" series produced by our OWN chart generator, calibrated to the pair\'s measured statistics (block-bootstrapped returns + update cadence) with zero learnable structure - then scores real win rate against the placebo distribution: edgeZ = sigmas of real above placebo mean. Verdicts: "edge" (real beats the placebo - performance unlikely to be chance), "weak" (suggestive, under the bar), "no_edge" (indistinguishable from luck - say plainly that TA is NOT supported on this feed), "inconclusive" (too few real trades). Under policy "enforce" the autopilot and the auto-trader are BLOCKED from trading OTC pairs without a fresh passing verdict for that (asset, strategy) pair - if a bot you are asked to arm trades an OTC asset, run this FIRST and respect the verdict. Also use it proactively: whenever the user discusses trading an OTC pair, testing a strategy on OTC data, or asks "is this real or luck", run the defense and report the verdict honestly - never dress up a no_edge as a pass. strategyId accepts builtin ids and AI-Lab "custom:<id>" specs. Omit asset to test the active asset; non-OTC assets are allowed too (a useful luck-vs-skill sanity check).',
+    args: '{"asset": "EURUSD-OTC", "strategyId": "confluence-core", "tf": "1m", "k": 24}',
+    run: (a) => {
+      if (!a.strategyId || typeof a.strategyId !== 'string') return Promise.resolve({ ok: false, error: 'otc_defense requires "strategyId" (a strategy id from list_strategies)' })
+      return corePost('/otc_defense_run', {
+        asset: a.asset,
+        strategyId: a.strategyId,
+        tf: a.tf ?? '1m',
+        k: a.k,
+      })
+    },
+  },
+  {
+    name: 'otc_defense_status',
+    description: 'Read OTC defense state without running a new trial: whether an asset is an OTC (generator-driven) feed, the current guard policy (enforce | warn | off), and the freshest placebo verdict for (asset, strategy) with its edgeZ and age. Use it before arming a bot on an OTC pair, to explain WHY a bot is being held (the autopilot reject reason mentions "OTC defense"), or to check which strategies currently pass on a feed.',
+    args: '{"asset": "EURUSD-OTC", "strategy": "confluence-core"}',
+    run: (a) => {
+      const p = new URLSearchParams()
+      if (a.asset) p.set('asset', String(a.asset))
+      p.set('strategy', String(a.strategy ?? 'confluence-core'))
+      return coreGet(`/otc_status?${p.toString()}`)
     },
   },
   {
@@ -595,8 +776,8 @@ const TOOLS: ToolSpec[] = [
   },
   {
     name: 'asset_sweep',
-    description: 'Run ONE strategy/param set across the whole instrument universe (or a category: forex|otc|crypto|commodity|stock|index) and rank assets by objective. Finds WHERE an edge holds before pinning a bot to an instrument. Rows include per-asset win rate, PF, drawdown, Sharpe and liveDataPct. strategy is REQUIRED. liveDataPct is the % of the tested window backed by REAL archived bars vs the market simulator\'s deterministic synthetic fill (null if not computed) - a thin or not-yet-live instrument can score a suspiciously perfect win rate purely because kalman-ou-reversion (or any mean-reversion strategy) is re-detecting the simulator\'s OWN built-in mean-reversion pull toward its regime anchor, not a real market edge. ALWAYS check liveDataPct before reporting a row as a real finding: below ~80% treat the result as unproven synthetic-data noise and say so plainly rather than recommending it; a near-100% win rate paired with low liveDataPct is the single strongest tell that this is the simulator grading its own exam, not an edge.',
-    args: '{"strategy": "ema-trend", "tf": "5m", "category": "crypto", "params": {"fast": 9, "slow": 21, "adx": 22}, "objective": "netPnl", "minTrades": 8, "maxAssets": 40}',
+    description: 'Run ONE strategy/param set across the whole instrument universe (or a category: forex|otc|crypto|commodity|stock|index) and rank assets by objective. Finds WHERE an edge holds before pinning a bot to an instrument. Rows include per-asset win rate, PF, drawdown, Sharpe and liveDataPct. strategy is REQUIRED. liveDataPct is the % of the tested window backed by REAL archived bars vs the market simulator\'s deterministic synthetic fill (null if not computed) - a thin or not-yet-live instrument can score a suspiciously perfect win rate purely because kalman-ou-reversion (or any mean-reversion strategy) is re-detecting the simulator\'s OWN built-in mean-reversion pull toward its regime anchor, not a real market edge. ALWAYS check liveDataPct before reporting a row as a real finding: below ~80% treat the result as unproven synthetic-data noise and say so plainly rather than recommending it; a near-100% win rate paired with low liveDataPct is the single strongest tell that this is the simulator grading its own exam, not an edge. Optional "direction" (both|call|put, default both, same meaning as bot_create/autopilot_configure\'s direction) restricts every row to one trade side. Each row also carries a "byDirection" ({call:{...}, put:{...}}) stats split - check it before recommending a direction-agnostic deployment on the winning asset. strategy accepts any id from list_strategies, including an AI-Lab "custom:<id>" spec, exactly like a builtin id.',
+    args: '{"strategy": "ema-trend", "tf": "5m", "category": "crypto", "params": {"fast": 9, "slow": 21, "adx": 22}, "objective": "netPnl", "minTrades": 8, "maxAssets": 40, "direction": "both"}',
     run: (a) => {
       if (!a.strategy || typeof a.strategy !== 'string') return Promise.resolve({ ok: false, error: 'asset_sweep requires "strategy" (a strategy id from list_strategies)' })
       return corePost('/asset_sweep', {
@@ -607,6 +788,7 @@ const TOOLS: ToolSpec[] = [
         objective: a.objective ?? 'netPnl',
         minTrades: a.minTrades ?? 8,
         maxAssets: a.maxAssets ?? 40,
+        direction: a.direction,
       })
     },
   },
@@ -791,8 +973,8 @@ const TOOLS: ToolSpec[] = [
   {
     name: 'lab_learn',
     description:
-      'LEARN A PAIR - run the AI learning agent over one instrument\'s candle history. It mines edge-bearing events across the FULL pattern vocabulary: 30+ candlestick formations, wide-range bar expansions, Heiken Ashi structures (flip / streak / strong bars), line patterns (Donchian breakouts, higher-highs-lows runs) and its own invented indicators (rsi/bbpos/zscore/donchianpos/macdz/slope/streak/wickbias/emasign/hadist/bodypos/psar/fractal, plus the generic madist/osc0100/oscpm100/oscz/trenddist/bandpos/volflow/levels families covering the rest of the TA suite) - then measures each event\'s win-rate edge vs the horizon, weights the survivors by edge, calibrates a confluence threshold and backtests the composed spec (full sample + an honest HOLDOUT on the last 30%). Args: asset (required), tf (default 1m), basis ("candles" = raw OHLC default, "heikin" = learn on the Heiken-Ashi transform of the same feed - outcomes always settle on real prices; pick heikin when the user thinks in HA / smooth-trend terms), bars (default 1200 max 2200), horizon (bars ahead, default 1), minSamples (default 30; auto-relaxed on thin history), minEdge (win-rate pts above 50, default 1.5), maxSignals (default 8), payout (default 0.7 = the compounding cap), name. Returns: signals table (kind, n, winRate, edgePts, weight, selected), the spec (deployable), calibration sweep, backtest + holdout metrics and breakevenWinRate for the payout. Present the numbers honestly (especially holdout vs breakeven). If ok:false, no event cleared the filters - report it and offer different params/pair. Deploy through lab_save + bot_create with strategyId custom:<id>.',
-    args: '{"asset": "EURUSD", "tf": "1m", "basis": "candles", "bars": 1200, "horizon": 1, "minSamples": 30, "minEdge": 1.5, "maxSignals": 8, "payout": 0.7}',
+      'LEARN A PAIR - run the AI learning agent over one instrument\'s candle history. It mines edge-bearing events across the FULL pattern vocabulary: 30+ candlestick formations, wide-range bar expansions, Heiken Ashi structures (flip / streak / strong bars), Renko brick structures (young flip / streak, ATR-sized bricks - see the renko chart) and Point & Figure breakout patterns (double/triple top-bottom, fire only on the bar that painted the box), line patterns (Donchian breakouts, higher-highs-lows runs) and its own invented indicators (rsi/bbpos/zscore/donchianpos/macdz/slope/streak/wickbias/emasign/hadist/bodypos/psar/fractal, plus the generic madist/osc0100/oscpm100/oscz/trenddist/bandpos/volflow/levels families covering the rest of the TA suite) - then measures each event\'s win-rate edge vs the horizon, weights the survivors by edge, calibrates a confluence threshold and backtests the composed spec (full sample + an honest HOLDOUT on the last 30%). Args: asset (required), tf (default 1m), basis ("candles" = raw OHLC default, "heikin" = learn on the Heiken-Ashi transform of the same feed - outcomes always settle on real prices; pick heikin when the user thinks in HA / smooth-trend terms), bars (default 1200 max 2200), horizon (bars ahead, default 1), minSamples (default 30; auto-relaxed on thin history), minEdge (win-rate pts above 50, default 1.5), maxSignals (default 8), payout (default 0.7 = the compounding cap), mineCombos (bool, default true - also searches 2-signal AND combos, 2-signal OR combos and 3-signal AND combos built from the best individual signals, producing synthetic "group" signals (kind:"group", op:"and"|"or", nested signals[]) alongside the normal candle/bar/ha/line/indicator ones whenever a combo beats the best single signal; pass false to mine only single signals, the old behavior), name. Returns: signals table (kind, n, winRate, edgePts, weight, selected - a "group" row\'s kind reads "group" and its nested signals compose with AND/OR, recognize it when reading back the table, not just when authoring one yourself), the spec (deployable), calibration sweep, backtest + holdout metrics and breakevenWinRate for the payout. Present the numbers honestly (especially holdout vs breakeven). If ok:false, no event cleared the filters - report it and offer different params/pair. Deploy through lab_save + bot_create with strategyId custom:<id>.',
+    args: '{"asset": "EURUSD", "tf": "1m", "basis": "candles", "bars": 1200, "horizon": 1, "minSamples": 30, "minEdge": 1.5, "maxSignals": 8, "payout": 0.7, "mineCombos": true}',
     run: (a) =>
       corePost('/lab_learn', {
         asset: String(a.asset),
@@ -804,13 +986,14 @@ const TOOLS: ToolSpec[] = [
         ...(a.minEdge !== undefined ? { minEdge: Number(a.minEdge) } : {}),
         ...(a.maxSignals !== undefined ? { maxSignals: Number(a.maxSignals) } : {}),
         ...(a.payout !== undefined ? { payout: Number(a.payout) } : {}),
+        ...(a.mineCombos !== undefined ? { mineCombos: Boolean(a.mineCombos) } : {}),
         ...(a.name !== undefined ? { name: String(a.name) } : {}),
       }),
   },
   {
     name: 'lab_backtest',
     description:
-      'Backtest a CUSTOM spec on a pair - either a saved lab id ("custom:...") or an INLINE spec you compose yourself (you are allowed to invent your own combinations: the DSL accepts signals of kind "candle" (name = a library pattern, e.g. "Bullish Engulfing"), "bar" (variant wide-bull|wide-bear, atrK), "ha" (variant flip-up|flip-down|streak-up|streak-down|strong-bull|strong-bear, len), "line" (variant breakout-up|breakout-down|hh-hl|lh-ll, lookback) and "indicator" (ind: rsi|bbpos|zscore|donchianpos|macdz|slope|streak|wickbias|emasign|hadist|bodypos|psar|fractal|madist|osc0100|oscpm100|oscz|trenddist|bandpos|volflow|levels, params {period|fast|slow|mult|afStep|afMax (psar)|left|right (fractal, flank bars each side, default 2)}, type - REQUIRED for the 8 generic families, picks the specific indicator: madist: sma|ema|wma|dema|tema|trima|kama|hma|vwma|zlema|t3|mcginley|linreg|midpoint; osc0100 (native 0-100): stochk|stochd|stochrsik|stochrsid|willr|ultosc|aroonup|aroondown|mfi; oscpm100 (native ~-100..100): cci|cmo|tsi|rvi|aroonosc; oscz (self- or ATR-scaled): roc|mom|ppo|apo|trix|dpo|kst|qstick|awesomeosc|fisher|massindex|natr|histvol|stddev|atrz|hilbert|ulcer; trenddist (signed breakout distance/ATR): supertrend|chandelier|ichimoku; bandpos (0..1 position in band): keltner|envelope; volflow (rolling z-score, except cmf/vwapdist which are natively scaled): obv|ad|cmf|forceindex|eom|nvi|pvi|klinger|chaikinosc|vwapdist; levels (signed distance/ATR to nearest static level): pivot|fib. op ">"|"<", threshold)). Every signal: {kind, ..., dir: "call"|"put", weight 1-50} - dir may INVERT the textbook meaning to fade a pattern. Spec: {name, signals[], minScore 5-95, minVotes 1-6, horizon}. Weights vote bull-minus-bear; a trade needs |score| >= minScore AND >= minVotes agreeing signals. Returns full-sample + holdout metrics and the breakeven win rate. Use to iterate on your own ideas BEFORE proposing deployment. Args: id OR spec, asset, tf, payout (default 0.7), amount (default 10), horizon.',
+      'Backtest a CUSTOM spec on a pair - either a saved lab id ("custom:...") or an INLINE spec you compose yourself (you are allowed to invent your own combinations: the DSL accepts signals of kind "candle" (name = a library pattern, e.g. "Bullish Engulfing"), "bar" (variant wide-bull|wide-bear, atrK), "ha" (variant flip-up|flip-down|streak-up|streak-down|strong-bull|strong-bear, len), "line" (variant breakout-up|breakout-down|hh-hl|lh-ll, lookback), "renko" (variant flip-up|flip-down|streak-up|streak-down, len - flip = brick trend reversed to dir within the last len bricks, streak = len same-color bricks; ATR-sized bricks like the renko-flip builtin, or fixed brickSize), "pf" (variant double-top-breakout|double-bottom-breakdown|triple-top-breakout|triple-bottom-breakdown, reversalBoxes 1-10 - fires ONLY on the bar that painted the breakout box, so expect few occurrences; ATR-sized boxes like the pf-breakout builtin, or fixed boxSize) and "indicator" (ind: rsi|bbpos|zscore|donchianpos|macdz|slope|streak|wickbias|emasign|hadist|bodypos|psar|fractal|madist|osc0100|oscpm100|oscz|trenddist|bandpos|volflow|levels, params {period|fast|slow|mult|afStep|afMax (psar)|left|right (fractal, flank bars each side, default 2)}, type - REQUIRED for the 8 generic families, picks the specific indicator: madist: sma|ema|wma|dema|tema|trima|kama|hma|vwma|zlema|t3|mcginley|linreg|midpoint; osc0100 (native 0-100): stochk|stochd|stochrsik|stochrsid|willr|ultosc|aroonup|aroondown|mfi; oscpm100 (native ~-100..100): cci|cmo|tsi|rvi|aroonosc; oscz (self- or ATR-scaled): roc|mom|ppo|apo|trix|dpo|kst|qstick|awesomeosc|fisher|massindex|natr|histvol|stddev|atrz|hilbert|ulcer; trenddist (signed breakout distance/ATR): supertrend|chandelier|ichimoku; bandpos (0..1 position in band): keltner|envelope; volflow (rolling z-score, except cmf/vwapdist which are natively scaled): obv|ad|cmf|forceindex|eom|nvi|pvi|klinger|chaikinosc|vwapdist; levels (signed distance/ATR to nearest static level): pivot|fib. op ">"|"<", threshold)) and "group" ({kind:"group", op:"and"|"or", signals:[<2+ nested signal defs of any of the kinds above>], dir:"call"|"put", weight}) - composes 2+ underlying signals with AND/OR logic into one synthetic signal that votes as a single unit (op:"and" fires only when every nested signal agrees, op:"or" fires when any one does). You may author your own "group" signals by hand, and lab_learn\'s auto-combo-mining (mineCombos, default true) already produces them automatically inside a learned spec\'s signals[] when a 2- or 3-signal AND/OR combo beats the best single signal - recognize and read back a "group" entry in a saved/learned spec the same as any other signal kind, not just when you invent a new one. Every signal: {kind, ..., dir: "call"|"put", weight 1-50} - dir may INVERT the textbook meaning to fade a pattern. Spec: {name, signals[], minScore 5-95, minVotes 1-6, horizon}. Weights vote bull-minus-bear; a trade needs |score| >= minScore AND >= minVotes agreeing signals. Returns full-sample + holdout metrics and the breakeven win rate. Use to iterate on your own ideas BEFORE proposing deployment. Args: id OR spec, asset, tf, payout (default 0.7), amount (default 10), horizon.',
     args: '{"asset": "EURUSD", "tf": "2m", "payout": 0.7, "spec": {"name": "HA fade", "signals": [{"kind": "ha", "variant": "flip-up", "len": 2, "dir": "put", "weight": 20}, {"kind": "indicator", "ind": "rsi", "params": {"period": 14}, "op": ">", "threshold": 70, "dir": "put", "weight": 20}], "minScore": 45, "minVotes": 2, "horizon": 1}}',
     run: (a) =>
       corePost('/lab_backtest', {
@@ -849,6 +1032,25 @@ const TOOLS: ToolSpec[] = [
     description: 'Delete a learned strategy from the lab library by id. Bots already configured with it keep running.',
     args: '{"id": "custom:eurusd-1m-lab"}',
     run: (a) => corePost('/lab_delete', { id: String(a.id) }),
+  },
+  {
+    name: 'engines_edge',
+    description:
+      'Research "WHICH CHART ENGINES CARRY EDGE" in ONE call - merges BOTH feedback loops the OS runs on the chart engines: (1) the live Signal-Panel honesty loop (every panel read is resolved at its own expiry on real prices and attributed per engine - renko / P&F / range / tick / footprint / Heikin Ashi / candle math, real + OTC markets, option and CFD kinds) and (2) the deep-history lab loop (each engine vote replayed as a lab EngineVoteSignal through the REAL binary settlement engine over each selected asset\'s trailing candles, pooled per engine+direction, scored with a Wilson 95% interval against the payout breakeven). One row per engine: verdict (edge = Wilson LB clears breakeven by +2pts on >= minN trades; watch = winRate above breakeven but LB unproven; thin = n < minN; coinflip; fade = Wilson UB BELOW breakeven - the engine is confidently WORSE than a coin, so testing the INVERTED vote is a legitimate research follow-up; live-only = OTC velocity footprint, which history cannot mine), n, winRate, wilsonLB/UB, edgeLB, per-direction breakdowns with the top assets each side fired on, the live per-kind columns, the payout breakeven, and labSpecs (engine specs already learned in the Strategy Lab with their backtest records). THE tool for "which engines carry edge", "is renko actually working", "what should I stop trusting", "what\'s actually working". ALWAYS say the sample sizes out loud in your verdict (a 56% win rate on n=18 is noise, not edge). Follow up on edge/watch rows with backtest / optimize_strategy / walkforward / lab_learn on the top assets; treat fade rows as inversion candidates to TEST, not as confirmed trades.',
+    args: '{ "tf": "1m", "assets": "EURUSD-OTC,BTCUSD", "window": 420, "expiryBars": 1, "payout": 0.85, "minN": 30 } (all optional - default tf 1m, active asset + top open assets, max 6 tickers)',
+    run: async (a) => {
+      const qs = new URLSearchParams()
+      const put = (k: string, v: unknown) => {
+        if (v !== undefined && v !== null && v !== '') qs.set(k, String(v))
+      }
+      put('tf', normalizeTf(a.tf))
+      put('assets', a.assets)
+      put('window', a.window)
+      put('expiryBars', a.expiryBars)
+      put('payout', a.payout)
+      put('minN', a.minN)
+      return coreGet(`/engines_edge${qs.toString() ? `?${qs}` : ''}`)
+    },
   },
   {
     name: 'create_strategy',
@@ -1093,13 +1295,14 @@ const TOOLS: ToolSpec[] = [
   },
   {
     name: 'autotrader_configure',
-    description: 'Tune the built-in AUTO-TRADER (the OS acting as its own trader in NO-HUMAN mode): signalSource ("screener" = full composite signals off the periodic sweep\'s cached row, "kalman-ou" = fade statistically stretched pairs via the Ornstein-Uhlenbeck/Kalman fit gated by reversion significance + half-life, "markov" = follow the Markov chain state forecast when decisive and not chop, "momentum" = ADX-confirmed trend continuation, "confluence" = the EXACT 14-factor Confluence Signal panel/confluence_read engine re-fit bar-fresh on each candidate pair - same math as "the panel"/"confluence-full", not the screener\'s cheaper cached approximation, "strategy" = one or more specific strategies from the combined Strategy Lab catalog (use list_strategies or /strategies to find ids - builtin ids like "ema-cross"/"confluence-full", or AI Lab-learned "custom:<id>" specs), evaluated market-wide on every open pair exactly like an autopilot bot\'s strategyId would be, requires strategyIds to be set or the auto-trader just stands aside), enabled (bool), tf (signal timeframe), stake, minScore (min |score| - NOT applied at all to the "strategy" source in any mode, single/ensemble/auto-learn: the strategy\'s own evaluate() already decides what counts as a signal, and there is no shared score scale across arbitrary strategies to threshold on), minConfidence (0-100, NOT applied to a single-strategy "strategy" source or its auto-learn pool - but when strategyPickMode is "ensemble" with 2+ strategyIds it is reused as the ensemble\'s MINIMUM AGREEMENT % - e.g. 60 = at least 60% of the listed strategies must vote the same direction or the pair is skipped), zEntry (kalman-ou only: |z| in sigmas required to enter, 0.5-4), maxHalfLife (kalman-ou only: skip pairs with slower reversion, bars), requireValidation (kalman-ou only: trade only walk-forward-validated pairs), minPUp (markov only: decisive P(up) threshold, 0.5-0.75), minAdx (momentum only: minimum trend strength, 10-45), strategyIds (signalSource "strategy": array of one or more strategy ids to trade, e.g. ["ema-cross"] for a single strategy or ["ema-cross","custom:abc123","confluence-full"] for a pool of 2+ that strategyPickMode combines - pass strategyIds:[] or strategyIds:null to clear; the older singular strategyId is still accepted as a one-id convenience but strategyIds is preferred), strategyPickMode (only matters with 2+ strategyIds: "ensemble" (default) = majority vote, minConfidence is the min agreement %; "best" = AUTO-LEARN - for each pair, reads each pool member\'s OWN settled-trade win rate on THAT exact pair (same Wilson-lower-bound math the adaptive gate uses) and trades whichever member is proven best there, falling back to raw score for members still building a record on that pair - this is how you let the auto-trader "learn what works on which pairs" across a watchlist/pool instead of forcing one fixed signal everywhere), autoDiscover (bool, default false - ONLY matters with strategyPickMode "best": true widens the pool every tick to the ENTIRE builtin strategy catalog plus every non-decayed AI Lab spec, not just manually-picked strategyIds, AND periodically runs the AI Lab own pattern-mining (same as a human clicking Discover) on open pairs that do not have a reasonably fresh spec yet, auto-saving whatever it finds so it joins the pool too - use this when the user wants the auto-trader to find and prove what works per pair on its own rather than only dispatching among strategies they hand-picked; heavier (evaluates the full catalog every tick, plus a mining pass at most once per pair every 6h), strategyParams (signalSource "strategy" only: per-strategy param overrides, e.g. {"ema-cross": {"fast": 8, "slow": 21}} - same param keys list_strategies/the strategy\'s own schema shows, SAME shape as a bot\'s own params; a strategy with no entry here just trades its defaults; an AI Lab "custom:<id>" spec has no configurable params and ignores anything passed for it; pass strategyParams:null to clear all overrides), pairStrategy (signalSource "strategy" only: per-PAIR strategy pin, e.g. {"GBPJPY-OTC": "custom:abc123", "EURUSD-OTC": "ema-cross"} - "for THIS exact ticker, ALWAYS use THIS one strategy", completely bypassing the global strategyIds/ensemble/auto-learn/autoDiscover pool for that pair only; every other open pair keeps using the global pool exactly as configured. This is the tool for "I studied/learned a strategy on one pair in the AI Lab but want it traded on a DIFFERENT pair" or "use strategy X on EURUSD and strategy Y on GBPJPY" - assign each pair its own pinned id here instead of trying to force it through strategyIds/ensemble, which combines across ALL pairs identically. If a pinned id stops resolving (e.g. that AI Lab spec gets deleted), that one pair just sits out - it does NOT fall back to the global pool. Pass pairStrategy:null to clear every pin, or re-send the whole map to replace it (it is not merged key-by-key - always resend the full set of pins you want to keep). Params for a pinned builtin strategy still come from strategyParams[id] above, same mechanism as any pool member), direction (both|call|put), maxOpen (concurrent), cooldownSec (per-asset), paceSec (between any two trades), dailyProfitTarget / dailyLossLimit (USD, 0=off), watchlist (array of tickers - OPTIONAL pair restriction that applies to EVERY signalSource identically: empty/omitted = GLOBAL, scans the whole open-instrument universe exactly as before), watchlistMode (only matters with a non-empty watchlist: "only" (default) = trade ONLY those tickers, nothing else; "exclude" = trade every open instrument EXCEPT those tickers - use this when the user wants a pair kept OUT of rotation ("never trade X", "block X", "stop touching X") rather than confined to it - picking the wrong one of these two is a common mix-up, so confirm which the user means when it\'s ambiguous), stakePlan (OPTIONAL compounding plan - SAME shape as a bot\'s: {kind:"compound", base, rollPct, maxStake, payoutCap (capped 70), stopOnLoss (default true - one loss ENDS the cycle, stand down until autotrader_restart), periods, deriskAfter, deriskPct, onComplete:"halt"|"reseed"} - pass stakePlan:null to go back to fixed `stake`. The auto-trader only ever holds one position at a time (maxOpen governs it) so there is no multi-asset pot conflict like a bot\'s watchlist could cause), smartStaking (bool, default false - scales the stake 0.5x-1.5x with the signal\'s own 0-100 confidence instead of a flat stake every trade), correlationGuard (bool, default true - wont open a NEW auto position in a pair correlated with one already open, e.g. EURUSD and GBPUSD, or XAUUSD and XAGUSD - treats them as one exposure, not two "diversified" ones), streakBreaker (bool, default true - benches a (strategy, pair) combo after 3+ consecutive losses, cooldown growing with streak length and clearing on its own, independent of the daily loss limit), avoidDeadHours (bool, default false - stands aside on non-OTC pairs during the 21:00-23:00 UTC thin-liquidity window; never applies to -OTC synthetic tickers, which have no real trading session). It trades 1-bar binary options.',
-    args: '{"enabled": true, "signalSource": "strategy", "strategyIds": ["ema-cross", "custom:abc123"], "minConfidence": 60, "tf": "1m", "stake": 10, "minScore": 60, "maxOpen": 3, "watchlist": ["EURUSD-OTC", "GBPUSD-OTC"]}',
+    description: 'Tune the built-in AUTO-TRADER (the OS acting as its own trader in NO-HUMAN mode): signalSource ("screener" = full composite signals off the periodic sweep\'s cached row, "kalman-ou" = fade statistically stretched pairs via the Ornstein-Uhlenbeck/Kalman fit gated by reversion significance + half-life, "markov" = follow the Markov chain state forecast when decisive and not chop, "momentum" = ADX-confirmed trend continuation, "confluence" = the EXACT 14-factor Confluence Signal panel/confluence_read engine re-fit bar-fresh on each candidate pair - same math as "the panel"/"confluence-full", not the screener\'s cheaper cached approximation, "strategy" = one or more specific strategies from the combined Strategy Lab catalog (use list_strategies or /strategies to find ids - builtin ids like "ema-cross"/"confluence-full", or AI Lab-learned "custom:<id>" specs), evaluated market-wide on every open pair exactly like an autopilot bot\'s strategyId would be, requires strategyIds to be set or the auto-trader just stands aside), enabled (bool), tf (signal timeframe - which candles signals are READ from), expiryTf (OPTIONAL, SEPARATE from tf - how long each trade actually RUNS before it settles, e.g. read signals on "1m" candles but let the trade expire on "5m". Previously there was no such field: every trade silently expired after exactly 1 bar of tf, so changing tf also changed trade duration whether you meant to or not. Omit/pass expiryTf:null to go back to that old 1:1 behavior; otherwise pass any timeframe string - it\'s converted to whole tf-bars at trade time, min 1), stake, minScore (min |score| - NOT applied at all to the "strategy" source in any mode, single/ensemble/auto-learn: the strategy\'s own evaluate() already decides what counts as a signal, and there is no shared score scale across arbitrary strategies to threshold on), minConfidence (0-100, NOT applied to a single-strategy "strategy" source or its auto-learn pool - but when strategyPickMode is "ensemble" with 2+ strategyIds it is reused as the ensemble\'s MINIMUM AGREEMENT % - e.g. 60 = at least 60% of the listed strategies must vote the same direction or the pair is skipped), zEntry (kalman-ou only: |z| in sigmas required to enter, 0.5-4), maxHalfLife (kalman-ou only: skip pairs with slower reversion, bars), requireValidation (kalman-ou only: trade only walk-forward-validated pairs), minPUp (markov only: decisive P(up) threshold, 0.5-0.75), minAdx (momentum only: minimum trend strength, 10-45), strategyIds (signalSource "strategy": array of one or more strategy ids to trade, e.g. ["ema-cross"] for a single strategy or ["ema-cross","custom:abc123","confluence-full"] for a pool of 2+ that strategyPickMode combines - pass strategyIds:[] or strategyIds:null to clear; the older singular strategyId is still accepted as a one-id convenience but strategyIds is preferred), strategyPickMode (only matters with 2+ strategyIds: "ensemble" (default) = majority vote, minConfidence is the min agreement %; "best" = AUTO-LEARN - for each pair, reads each pool member\'s OWN settled-trade win rate on THAT exact pair (same Wilson-lower-bound math the adaptive gate uses) and trades whichever member is proven best there, falling back to raw score for members still building a record on that pair - this is how you let the auto-trader "learn what works on which pairs" across a watchlist/pool instead of forcing one fixed signal everywhere), autoDiscover (bool, default false - ONLY matters with strategyPickMode "best": true widens the pool every tick to the ENTIRE builtin strategy catalog plus every non-decayed AI Lab spec, not just manually-picked strategyIds, AND periodically runs the AI Lab own pattern-mining (same as a human clicking Discover) on open pairs that do not have a reasonably fresh spec yet, auto-saving whatever it finds so it joins the pool too - use this when the user wants the auto-trader to find and prove what works per pair on its own rather than only dispatching among strategies they hand-picked; heavier (evaluates the full catalog every tick, plus a mining pass at most once per pair every 6h), strategyParams (signalSource "strategy" only: per-strategy param overrides, e.g. {"ema-cross": {"fast": 8, "slow": 21}} - same param keys list_strategies/the strategy\'s own schema shows, SAME shape as a bot\'s own params; a strategy with no entry here just trades its defaults; an AI Lab "custom:<id>" spec has no configurable params and ignores anything passed for it; pass strategyParams:null to clear all overrides), pairStrategy (signalSource "strategy" only: per-PAIR strategy pin, e.g. {"GBPJPY-OTC": "custom:abc123", "EURUSD-OTC": "ema-cross"} - "for THIS exact ticker, ALWAYS use THIS one strategy", completely bypassing the global strategyIds/ensemble/auto-learn/autoDiscover pool for that pair only; every other open pair keeps using the global pool exactly as configured. This is the tool for "I studied/learned a strategy on one pair in the AI Lab but want it traded on a DIFFERENT pair" or "use strategy X on EURUSD and strategy Y on GBPJPY" - assign each pair its own pinned id here instead of trying to force it through strategyIds/ensemble, which combines across ALL pairs identically. If a pinned id stops resolving (e.g. that AI Lab spec gets deleted), that one pair just sits out - it does NOT fall back to the global pool. Pass pairStrategy:null to clear every pin, or re-send the whole map to replace it (it is not merged key-by-key - always resend the full set of pins you want to keep). Params for a pinned builtin strategy still come from strategyParams[id] above, same mechanism as any pool member), direction (both|call|put), maxOpen (concurrent), cooldownSec (per-asset), paceSec (between any two trades), dailyProfitTarget / dailyLossLimit (USD, 0=off), watchlist (array of tickers - OPTIONAL pair restriction that applies to EVERY signalSource identically: empty/omitted = GLOBAL, scans the whole open-instrument universe exactly as before), watchlistMode (only matters with a non-empty watchlist: "only" (default) = trade ONLY those tickers, nothing else; "exclude" = trade every open instrument EXCEPT those tickers - use this when the user wants a pair kept OUT of rotation ("never trade X", "block X", "stop touching X") rather than confined to it - picking the wrong one of these two is a common mix-up, so confirm which the user means when it\'s ambiguous), stakePlan (OPTIONAL compounding plan - SAME shape as a bot\'s: {kind:"compound", base, rollPct, maxStake, payoutCap (capped 70), stopOnLoss (default true - one loss ENDS the cycle, stand down until autotrader_restart), periods, deriskAfter, deriskPct, onComplete:"halt"|"reseed"} - pass stakePlan:null to go back to fixed `stake`. The auto-trader only ever holds one position at a time (maxOpen governs it) so there is no multi-asset pot conflict like a bot\'s watchlist could cause), smartStaking (bool, default false - scales the stake 0.5x-1.5x with the signal\'s own 0-100 confidence instead of a flat stake every trade), correlationGuard (bool, default true - wont open a NEW auto position in a pair correlated with one already open, e.g. EURUSD and GBPUSD, or XAUUSD and XAGUSD - treats them as one exposure, not two "diversified" ones), streakBreaker (bool, default true - benches a (strategy, pair) combo after 3+ consecutive losses, cooldown growing with streak length and clearing on its own, independent of the daily loss limit), avoidDeadHours (bool, default false - stands aside on non-OTC pairs during the 21:00-23:00 UTC thin-liquidity window; never applies to -OTC synthetic tickers, which have no real trading session), pickVariety (integer 1-10, default 1 - how many of the top-scoring qualifying candidates each tick to randomly pick among instead of always taking the single best-scoring one: 1 (default) = always the best candidate; >1, e.g. 3, = randomly choose among the top 3 qualifying candidates that tick, so the auto-trader does not fixate on the same pair every time - use it when the user wants variety across the watchlist/universe rather than the single highest-scoring instrument every cycle). It trades 1-bar binary options.',
+    args: '{"enabled": true, "signalSource": "strategy", "strategyIds": ["ema-cross", "custom:abc123"], "minConfidence": 60, "tf": "1m", "stake": 10, "minScore": 60, "maxOpen": 3, "watchlist": ["EURUSD-OTC", "GBPUSD-OTC"], "pickVariety": 1}',
     run: (a) =>
       corePost('/autotrader_config', {
         ...(a.enabled !== undefined ? { enabled: Boolean(a.enabled) } : {}),
         ...(a.signalSource !== undefined ? { signalSource: String(a.signalSource) } : {}),
         ...(a.tf !== undefined ? { tf: String(a.tf) } : {}),
+        ...(a.expiryTf !== undefined ? { expiryTf: a.expiryTf === null ? null : String(a.expiryTf) } : {}),
         ...(a.stake !== undefined ? { stake: Number(a.stake) } : {}),
         ...(a.minScore !== undefined ? { minScore: Number(a.minScore) } : {}),
         ...(a.minConfidence !== undefined ? { minConfidence: Number(a.minConfidence) } : {}),
@@ -1129,6 +1332,7 @@ const TOOLS: ToolSpec[] = [
         ...(a.avoidDeadHours !== undefined ? { avoidDeadHours: Boolean(a.avoidDeadHours) } : {}),
         ...(a.autoDiscover !== undefined ? { autoDiscover: Boolean(a.autoDiscover) } : {}),
         ...(a.stakePlan !== undefined ? { stakePlan: a.stakePlan } : {}),
+        ...(a.pickVariety !== undefined ? { pickVariety: Number(a.pickVariety) } : {}),
       }),
   },
   {
@@ -1512,25 +1716,25 @@ const TOOLS: ToolSpec[] = [
         TRENDING: {
           fits: ['continuation entries on pullbacks', 'buying dips / selling rips in the trend direction', 'riding the 4-layer synthesis stacks'],
           avoid: ['fading extremes (rsi-reversion, bb-bounce)', 'tight mean-reversion targets against the trend'],
-          strategies: ['ema-trend', 'supertrend-follow', 'donchian-breakout', 'kalman-ou-adaptive-trend', 'vsk-synthesis', 'tsk-synthesis', 'ichimoku-cloud', 'keltner-chandelier', 'mtf-alignment'],
+          strategies: ['ema-trend', 'supertrend-follow', 'donchian-breakout', 'kalman-ou-adaptive-trend', 'vsk-synthesis', 'tsk-synthesis', 'ichimoku-cloud', 'keltner-chandelier', 'mtf-alignment', 'renko-flip', 'pf-breakout', 'range-run', 'volbars-conviction', 'footprint-imbalance'],
           expiryStyle: '1-2 bars of the working tf; give pullbacks room to resolve in trend direction',
         },
         RANGING: {
           fits: ['fading range extremes', 'entries at band/pivot edges back to the middle'],
           avoid: ['breakout chasing (donchian, supertrend)', 'trend-riding with tight trailing stops'],
-          strategies: ['rsi-reversion', 'bb-bounce', 'stoch-cross', 'kalman-ou-reversion', 'kalman-ou-scalp', 'kalman-mc-reversion-prob', 'vwap-reversion', 'liquidity-sweep-reversal'],
+          strategies: ['rsi-reversion', 'bb-bounce', 'stoch-cross', 'kalman-ou-reversion', 'kalman-ou-scalp', 'kalman-mc-reversion-prob', 'vwap-reversion', 'liquidity-sweep-reversal', 'tpo-fade'],
           expiryStyle: '1 bar of the working tf; mean-reversion resolves fast at range edges',
         },
         VOLATILE: {
           fits: ['waiting for the vol spike to decay', 'small size, wide invalidation', 'gap-and-go continuation after shocks settle'],
           avoid: ['tight-stop scalping', 'oversized positions', 'trading the first bars after the spike'],
-          strategies: ['confluence-core (with high minScore)', 'markov-edge (regime-aware)', 'markov-vol-regime', 'kalman-ou-vol-regime', 'kalman-ou-breakout', 'garch-vol-expansion'],
+          strategies: ['confluence-core (with high minScore)', 'markov-edge (regime-aware)', 'markov-vol-regime', 'kalman-ou-vol-regime', 'kalman-ou-breakout', 'garch-vol-expansion', 'ivhv-edge'],
           expiryStyle: 'stand aside until garchVol/ewmaVol ratio cools below ~1.3, then resume normal style',
         },
         MIXED: {
           fits: ['waiting for clearer regime', 'small-size probe trades with confluence_read >= 25'],
           avoid: ['heavy size on ambiguous reads'],
-          strategies: ['confluence-core', 'confluence-full', 'pattern-confluence', 'markov-edge', 'mc-fairvalue-edge', 'vol-squeeze-breakout'],
+          strategies: ['confluence-core', 'confluence-full', 'pattern-confluence', 'markov-edge', 'mc-fairvalue-edge', 'vol-squeeze-breakout', 'tick-regime'],
           expiryStyle: '1 bar, minimum stake until regime resolves',
         },
       }
@@ -1782,7 +1986,7 @@ const TOOLS: ToolSpec[] = [
   // ---------- OS control (executed client-side) ----------
   {
     name: 'ui_control',
-    description: `Operate the user's OS interface. ALWAYS pass "cmd" - one of: set_asset (+"asset":"BTCUSD"), set_tf (+"tf":"5m"), set_chart_type (+"chartType":"heikin-ashi"), add_indicator (+"id":"bollinger", optional "params":{...}, "pane":"overlay"|"sub"), remove_indicator (+"id":"macd"), clear_indicators. Use it to set up the workspace for your analysis.`,
+    description: `Operate the user's OS interface. ALWAYS pass "cmd" - one of: set_asset (+"asset":"BTCUSD"), set_tf (+"tf":"5m"), set_chart_type (+"chartType":"heikin-ashi" - candles|hollow|bars|line|area|baseline|heikin-ashi|renko|pointfigure|rangebars|volumebars|footprint|tpo|tickchart|ivhv), add_indicator (+"id":"bollinger", optional "params":{...}, "pane":"overlay"|"sub"), remove_indicator (+"id":"macd"), clear_indicators. Use it to set up the workspace for your analysis.`,
     args: '{"cmd": "set_asset", "asset": "BTCUSD"}  |  {"cmd": "add_indicator", "id": "macd", "pane": "sub"}',
     run: async (aRaw, ctx) => {
       const ALL_TFS = ['5s', '15s', '30s', '1m', '2m', '5m', '15m', '30m', '1h', '4h', '1d']
@@ -1818,6 +2022,14 @@ const TOOLS: ToolSpec[] = [
         line: 'line', lines: 'line', area: 'area', baseline: 'baseline',
         heikinashi: 'heikin-ashi', heikin: 'heikin-ashi', ha: 'heikin-ashi',
         renko: 'renko',
+        pointfigure: 'pointfigure', pointandfigure: 'pointfigure', pnf: 'pointfigure', pf: 'pointfigure', pandf: 'pointfigure',
+        rangebars: 'rangebars', rangebar: 'rangebars', range: 'rangebars',
+        volumebars: 'volumebars', volumebar: 'volumebars', volume: 'volumebars', constantvolume: 'volumebars', cvb: 'volumebars',
+        footprint: 'footprint', cluster: 'footprint', clusterchart: 'footprint', volumeprint: 'footprint',
+        otcfootprint: 'otcfootprint', otc: 'otcfootprint', otcfp: 'otcfootprint', otcvelocity: 'otcfootprint', velocityfootprint: 'otcfootprint', otcfootprintchart: 'otcfootprint',
+        tpo: 'tpo', marketprofile: 'tpo', timeprice: 'tpo', timepriceopportunity: 'tpo', profile: 'tpo',
+        tickchart: 'tickchart', tick: 'tickchart', ticks: 'tickchart', tickbars: 'tickchart',
+        ivhv: 'ivhv', ivvshv: 'ivhv', ivhvchart: 'ivhv', impliedvolatility: 'ivhv',
       }
       // ---- build command queue (inferred from args when cmd is missing) ----
       const queue: { cmd: string; args: Record<string, unknown> }[] = []
@@ -1910,6 +2122,9 @@ The OS also ships TWO sibling 4-layer SYNTHESIS stacks, both exposed as indicato
 2) TSK SYNTHESIS - the VOLUME-FREE sibling: L1 is a least-squares TRENDLINE z-score (price stretched N sigmas off the fitted trend = deviation channel; needs no volume at all) with the same L2 squeeze / L3 Kalman / L4 PSAR-on-curve layers. Indicators "tsk" / "tsk-z", strategy "tsk-synthesis", stress test tsk_montecarlo.
 All of them work in run_strategy / backtest / optimize_strategy / walkforward / asset_sweep / bot_create. When the user says "the algorithm", "the 4-layer stack", "VSK", "TSK", "trendline version" or asks to stress-test one, use those tools and explain which layer is blocking or firing (the strategy result notes name the layer). Prefer TSK when the user wants volume independence, VSK when volume weighting matters.
 SEVEN MORE BUILTIN STRATEGIES (same tools as above): "ichimoku-cloud" (price vs the senkou cloud + tenkan/kijun cross, thin-cloud crosses scored down), "vwap-reversion" (fades the z-score stretch from VWAP - the cheap cross-check against kalman-ou-reversion on the same instrument), "keltner-chandelier" (ATR-scaled channel breakout, reports the Chandelier Exit line as an invalidation reference since the binary engine is fixed-expiry, not trailing-stop), "mtf-alignment" (resamples the SAME feed into synthetic 5x/15x bars and requires minAgree of the 3 EMA(8/21) reads to agree - the confluence_read MTF idea as a deployable strategy), "vol-squeeze-breakout" (plain Bollinger-width squeeze-then-breakout - the simpler single-layer baseline to check whether VSK/TSK's extra Kalman/PSAR machinery earns its keep on a given instrument), "liquidity-sweep-reversal" (fires on a wick through a real supportResistance() zone that closes back inside it - a stop-hunt rejection, unlike Pattern Confluence which has no concept of WHERE on the chart a pattern fired), and "garch-vol-expansion" (the expansion mirror of kalman-ou-vol-regime, which fades compression - this one trades WITH momentum when GARCH/EWMA vol ratio clears 1.3, the same threshold regime_playbook uses for its VOLATILE classification).
+ORDER FLOW (approx) - use the order_flow tool to pull Volume Profile (Point of Control, Value Area High/Low, per-price-bucket volume) and candle delta / cumulative delta for an asset+timeframe, the same data behind the Order Flow panel on the chart. This is a CLV (close-location-value) approximation of buy/sell volume split from OHLCV candles, NOT real tick-level order-flow or order-book depth - IQ Option exposes no bid/ask-tagged trades, so always caveat any read from it as "(approx)". THREE MORE BUILTIN STRATEGIES use this data: "poc-reversion" (CALL when price has stretched below the recent Point of Control with delta turning positive, PUT the mirror above POC), "value-area-breakout" (CALL/PUT on a close outside the Value Area High/Low, scored up when supporting delta confirms the breakout and down when delta doesn't), and "delta-divergence" (PUT when price makes a new local high but cumulative delta fails to confirm it, CALL the mirror at a new local low) - all three show up in list_strategies/run_strategy/backtest like any other builtin. The AI Lab's signal DSL also gained an order-flow family (ind: "ofdelta"/"ofcumdelta"/"ofpocdist"/"ofvapos", same indicator-signal shape as rsi/zscore/etc.) so lab_learn/create_strategy can discover edge in delta, cumulative-delta slope, POC distance or value-area position automatically alongside every other indicator family.
+SIX CHART-TYPE STRATEGIES (the chart engines as tradeable builtins, all in list_strategies/run_strategy/backtest like any other): "range-run" (range-bar continuation - every range bar spans exactly one full ATR-sized range of travel, so a young run of same-direction bars is sustained pressure measured in distance, not time; fires while the run is young, stands aside once older than confirm - the no-reversal-multiplier sibling of renko-flip), "volbars-conviction" (constant-volume bars normalize activity, so a dominant BODY on equal (approx) volume is directional conviction, not a busy tape; reads only COMPLETED bars, the forming trailing bar is excluded), "footprint-imbalance" (the footprint chart's stacked-imbalance read: fires when the last candle shows minRows price bins where one side carries >= imbalanceRatio x the other - CLV proxy, volume-less candles never fire), "tpo-fade" (market-profile balance-day fade: only when price rotated through the POC minRotations times (balance) and the close pokes just outside the 70% value area, fade back toward POC; far excursions read as trend days and stand aside - the deliberate OPPOSITE of value-area-breakout, which trades the breakout), "tick-regime" (reads the tape's own character from candle closes as pseudo-ticks: P(same-direction consecutive move) with a binomial z vs the fair coin - persistent tapes continue the last move, anti-persistent tapes (real-feed bid-ask bounce) fade it, and a FAIR-COIN tape (|z| < zMin) stands aside by construction, which is how this strategy honestly refuses OTC feeds), and "ivhv-edge" (the IV-vs-HV chart's edge view: fires when the realized up-close frequency over the window clears the payout-implied breakeven q = 100/(1+payout) - the disclosed IV proxy - by a margin; payout is a PARAM, the live EV gate still applies at trade time). regime_playbook routes them: range-run/volbars-conviction/footprint-imbalance for TRENDING, tpo-fade for RANGING, ivhv-edge for VOLATILE, tick-regime for MIXED.
+ENGINE EDGE RESEARCH - the engines_edge tool answers "which chart engines actually carry edge" by merging BOTH feedback loops the OS keeps on the chart engines: the live Signal-Panel honesty loop (real resolved reads per engine, option + CFD kinds) and the deep-history lab loop (engine votes replayed through the binary settlement engine, Wilson interval vs the payout breakeven). Verdicts: edge / watch / thin / coinflip / fade - a "fade" verdict means the engine is confidently WORSE than breakeven and the INVERTED vote is a research candidate to test, not a confirmed trade. Call engines_edge when the user asks "is renko any good", "which signals should I trust", "what's actually working" - and always report the sample sizes alongside any verdict (a 56% win rate on n=18 is noise, not edge).
 ENSEMBLE (strategy id "ensemble-vote", params: members = comma-separated builtin strategy ids e.g. "ema-trend,rsi-reversion,markov-edge", voteMinScore = per-member score to count as a vote (default 40), minAgree = how many members must agree (default 2)) trades only the INTERSECTION of independent edges: it runs each member strategy on the same candles and only fires when minAgree+ of them agree on direction, scoring the average of the agreeing members' scores with a small consensus discount when agreement is right at the floor. Use it when the user wants higher precision at the cost of fewer signals ("I want fewer but more confident trades", "only trade when multiple things agree") - suggest 2-3 members that capture DIFFERENT signal types (e.g. one trend strategy + one mean-reversion + one Markov/statistical one) rather than near-duplicates, since correlated members defeat the point of voting. Always walkforward-validate the ensemble itself (not just its members individually) before arming a bot on it - member edges can each be real without their intersection being tradeable, and the research gate below enforces this anyway.
 CRITICAL - "members" is NOT a sweep key, it's a fixed param: members is a comma-separated id LIST, not a numeric range, so it can never go inside optimize_strategy/walkforward's "sweep" object (sweep only does from/to/step over numbers). To test YOUR chosen members (not the strategy's own default "ema-trend,rsi-reversion,markov-edge"), you MUST pass them in the separate "params" argument, e.g. walkforward with strategy "ensemble-vote" and params {"members":"pattern-confluence,confluence-full","minAgree":2,"voteMinScore":40}. Putting members inside "sweep" or leaving it out of the call entirely silently reverts to the default trio - always re-read the result's bestParams.members back before reporting a verdict, and if it doesn't match what you intended to test, STOP and say so rather than reporting a verdict on a different ensemble than the one discussed.
 STRUCTURAL chart tools (drawing-tool family, category "structural" in list_indicators): "pivots" (floor pivot points PP/R1-R3/S1-S3, variants classic/fibonacci/camarilla/woodie, session-based), "fib" (auto Fibonacci retracement 0-100% + 1.272/1.618 extensions of the last swing), "trendlines" (auto S/R trendlines from fractal swing pivots), "fvg" (fair value gaps - 3-bar imbalance zones tracked until filled). Add them to the user's chart with ui_control when they ask for pivot points, fibonacci, trendlines or liquidity gaps - e.g. add pivots + fib before a level-based read.
@@ -1942,12 +2157,13 @@ Rules:
 - TIME EXPIRY: "expiry 15 minutes" (or any minute-based expiry) on a bot = kind "digital" + expirySec (minutes * 60), NOT expiryBars - expiryBars counts candles of the tf (15 min on 2m candles would be 7.5 bars, impossible). Digital settles at the exact timestamp against a strike, both paper and live.
 - TIMEFRAME TOKENS: every candle/analysis store is keyed by the EXACT string "5s"|"15s"|"30s"|"1m"|"2m"|"5m"|"15m"|"30m"|"1h"|"4h"|"1d" - there is no "60m", it's "1h" ("1 hour"/"hourly"/"60 minute" all mean tf "1h"); no "240m", it's "4h"; no "1440m"/"24h"/"daily", it's "1d". A near-miss token isn't an error, it just looks up an empty bucket and comes back "no data" even though that exact market has plenty of history under its real token - if a tool ever says no data for a timeframe the UI clearly shows working, re-check you sent the canonical token before concluding data is missing.
 - DEPLOYMENT CONFIRMATION PROTOCOL (MANDATORY for ANY bot_create that will trade autonomously): when the user describes automation in natural language, DO NOT deploy on the first reply. 1) Parse every clause into its exact config. 2) Reply with a numbered RULE SHEET: strategy + params, watchlist, timeframe, kind + expiry (state WHY digital+expirySec when minutes are involved), no-concurrent rule (maxOpen 1), stake plan (seed, roll %, payout cap 70, stop-on-loss, periods, de-risk), session window in UTC + Lagos time, cooldown, minScore, plus the compound_plan ladder with cycleProfit. 3) Flag anything you had to ASSUME and propose a default. 4) Ask "confirm and I deploy" and WAIT - deploy only after the user explicitly agrees or amends. 5) After deploying: report the bot id, that it is ARMED and trading autonomously, and how to stop/restart it.
+- DIRECTION SPLIT: backtest/optimize_strategy/walkforward/asset_sweep results all include a "byDirection" field ({call:{...}, put:{...}}, each with its own win rate/trade count/PF etc.) alongside the blended overall stats - ALWAYS check byDirection before recommending a direction-agnostic deployment, since a strategy that looks mediocre blended can be strongly one-sided (e.g. solid on calls, a coinflip or worse on puts). When one side is clearly stronger, say so and suggest trading that side only: either pass "direction":"call"|"put" into backtest/optimize_strategy/walkforward/asset_sweep themselves to re-run restricted to that side, or set direction on the live config (bot_create / autopilot_configure, both take direction both|call|put) when actually deploying. Any strategy id from list_strategies works in backtest/optimize_strategy/walkforward/asset_sweep exactly the same way whether it's a builtin id or an AI-Lab-created "custom:<id>" one - no special handling needed, pass it as "strategy" like any other id.
 - RESEARCH WORKFLOW (use it whenever the user wants a validated strategy or asks "is this edge real"): 1) asset_sweep to find WHERE a strategy has an edge, 2) optimize_strategy on the best assets to find strong params, 3) walkforward on the winner - deploy only if OOS net is positive and at least half the folds were profitable, 4) only then bot_create with the validated params (keep the bot DISARMED and tell the user to arm it when ready). After arming, the watchdog watches the live edge - mention that. Research reads DEEP archived history; archive_status shows how much depth exists per asset - if depth is thin, warn that results may not be significant yet. Report IS vs OOS numbers honestly - large drops from in-sample to out-of-sample mean overfit.
 SYNTHETIC-DATA TRAP: asset_sweep rows carry liveDataPct - the % of the tested window backed by real archived bars vs the market simulator's deterministic fill. The simulator's own "range regime" price generator includes a built-in mean-reversion pull toward a regime anchor, so a mean-reversion strategy (kalman-ou-reversion and its siblings especially) can score a near-100% win rate on a thin/not-yet-live instrument purely by re-detecting the simulator's own generative process - that is NOT an edge, it's the model grading its own exam. Treat any row with liveDataPct below ~80% as unproven: say so plainly, do not recommend it, and do not let it pass walkforward/research-gate reasoning as if it were real. Prefer the highest-liveDataPct rows when picking a shortlist, even over a slightly better win rate on a lower-liveDataPct one.
-- AI LEARNING AGENT (Strategy Lab - "learn this pair", "build your own strategy", "find your own patterns", "make me a new indicator", "create a strategy based on <any indicator>"): you have your own research desk, and the DSL now spans the FULL analytics/indicators.ts suite - not just the lab's own 11 invented indicators (rsi/bbpos/zscore/donchianpos/macdz/slope/streak/wickbias/emasign/hadist/bodypos) but also psar, fractal (Williams Fractal), and 8 generic families selected via params.type: madist (every moving-average type: sma/ema/wma/dema/tema/trima/kama/hma/vwma/zlema/t3/mcginley/linreg/midpoint), osc0100 + oscpm100 + oscz (every oscillator: stochastic, stochRSI, williams%R, ultimate osc, aroon, mfi, CCI, CMO, TSI, RVI, ROC, momentum, PPO/APO, TRIX, DPO, KST, qstick, awesome osc, fisher transform, mass index, NATR, hist vol, stddev, Hilbert sine, ulcer index), trenddist (supertrend/chandelier exit/ichimoku cloud), bandpos (keltner/envelope), volflow (OBV/A-D/CMF/force index/EOM/NVI/PVI/klinger/chaikin osc/VWAP distance) and levels (pivot points/fibonacci). So "build a strategy based on X" for almost any named indicator is now something you can actually compose, not just proxy - use the matching ind/type from lab_backtest's tool doc. The only true gaps: correlation/beta (need a second instrument - architecturally out of scope for the single-asset evaluator) and zigzag (repaints, unsafe live).
+- AI LEARNING AGENT (Strategy Lab - "learn this pair", "build your own strategy", "find your own patterns", "make me a new indicator", "create a strategy based on <any indicator>"): you have your own research desk, and the DSL now spans the FULL analytics/indicators.ts suite - not just the lab's own 11 invented indicators (rsi/bbpos/zscore/donchianpos/macdz/slope/streak/wickbias/emasign/hadist/bodypos) but also psar, fractal (Williams Fractal), and 8 generic families selected via params.type: madist (every moving-average type: sma/ema/wma/dema/tema/trima/kama/hma/vwma/zlema/t3/mcginley/linreg/midpoint), osc0100 + oscpm100 + oscz (every oscillator: stochastic, stochRSI, williams%R, ultimate osc, aroon, mfi, CCI, CMO, TSI, RVI, ROC, momentum, PPO/APO, TRIX, DPO, KST, qstick, awesome osc, fisher transform, mass index, NATR, hist vol, stddev, Hilbert sine, ulcer index), trenddist (supertrend/chandelier exit/ichimoku cloud), bandpos (keltner/envelope), volflow (OBV/A-D/CMF/force index/EOM/NVI/PVI/klinger/chaikin osc/VWAP distance) and levels (pivot points/fibonacci). It also spans the chart-type engines: "renko" signals (flip-up/flip-down = young brick reversal, streak-up/streak-down = N same-color bricks - noise-averaged, no time noise) and "pf" signals (double/triple top-bottom breakouts from the Point & Figure engine - event signals that fire only on the bar that painted the box). So "build a strategy based on X" for almost any named indicator, and "use the renko chart" / "trade P&F breakouts", is now something you can actually compose, not just proxy - use the matching ind/type from lab_backtest's tool doc. The only true gaps: correlation/beta (need a second instrument - architecturally out of scope for the single-asset evaluator) and zigzag (repaints, unsafe live).
   PREFERRED PATH - create_strategy: one tool call that runs discovery (or backtests your own invented signal combo), checks the HOLDOUT honestly against breakeven with a safety margin, and auto-saves to the lab library ONLY if it actually passes - use this instead of manually chaining lab_learn/lab_backtest/lab_save. Manual mode (pass "signals") is exactly for a request like "create a strategy based on fractal and parabolic sar" - hand it a fractal+psar signal combo directly. If create_strategy reports passed:false, that is the honest answer - report the numbers (holdout vs breakeven) and do not claim deployment; offer to iterate (different tf/asset/horizon/threshold) or hand it back as an unsaved idea. create_strategy's own "strategyId" field is ALREADY the full "custom:<slug>" id (its save step is now self-verified against lab_list before it ever reports saved:true) - quote it EXACTLY, never prepend another "custom:" prefix yourself (that produced the "custom:custom:..." bug - fixed, but don't reintroduce it by hand). Before naming an asset that has no candle history at the tf you asked for (create_strategy/lab_learn will say so plainly, e.g. "no usable candle history") - that is not a bug, check archive_status for that asset to see which tf actually has bars and retry there, or tell the user the instrument has no archived history at that tf yet.
   TOOL-CALL DISCIPLINE: every tool call you actually emit as an action ALWAYS returns a result to you - success or a caught {ok:false, error} object - there is no such thing as a tool call that returns nothing. If you find yourself about to say "I called X but nothing came back" or "no result comes back", that means you did NOT actually emit that action (you narrated it in prose instead of issuing {"action": "lab_list", ...}) - the fix is to actually call it, not to report silence. Never claim "the tool isn't returning" as if it were a finding; either you have a real result (report it, including error objects verbatim) or you haven't called it yet (call it).
-  Manual step-by-step path (still available): lab_learn mines a pair's history for edge-bearing events across candlestick patterns, wide-range bar formations, HEIKEN ASHI structures, line breaks and the full indicator vocabulary above, weights the survivors by measured win-rate edge, calibrates a confluence threshold and backtests the composed spec (full sample + holdout on the last 30%). Report the discovery table (n, win rate, edge, weight) and the backtest vs breakevenWinRate HONESTLY - a holdout win rate below breakeven means the edge did not survive, say so. Iterate like a quant: try another horizon (2-3), more bars, a lower minEdge, or a different tf before giving up. You may also INVENT your own spec (lab_backtest accepts inline specs - the tool doc has the full DSL; dir can invert a pattern to fade it) and lab_save the winners. DEPLOY: lab_save the spec, then follow the DEPLOYMENT CONFIRMATION PROTOCOL and bot_create with strategyId "custom:<id>" (learned ids work everywhere builtin ids do - stake plans, compounding, sessions). Learned bots compound too: a $1 seed rolling on a spec the lab just validated is a perfectly normal ask - mirror periods/de-risk into compound_plan as always.
+  Manual step-by-step path (still available): lab_learn mines a pair's history for edge-bearing events across candlestick patterns, wide-range bar formations, HEIKEN ASHI structures, RENKO brick flips/streaks, P&F breakout patterns, line breaks and the full indicator vocabulary above, weights the survivors by measured win-rate edge, calibrates a confluence threshold and backtests the composed spec (full sample + holdout on the last 30%). Report the discovery table (n, win rate, edge, weight) and the backtest vs breakevenWinRate HONESTLY - a holdout win rate below breakeven means the edge did not survive, say so. Iterate like a quant: try another horizon (2-3), more bars, a lower minEdge, or a different tf before giving up. You may also INVENT your own spec (lab_backtest accepts inline specs - the tool doc has the full DSL; dir can invert a pattern to fade it) and lab_save the winners. DEPLOY: lab_save the spec, then follow the DEPLOYMENT CONFIRMATION PROTOCOL and bot_create with strategyId "custom:<id>" (learned ids work everywhere builtin ids do - stake plans, compounding, sessions). Learned bots compound too: a $1 seed rolling on a spec the lab just validated is a perfectly normal ask - mirror periods/de-risk into compound_plan as always.
 - When the user asks to be notified/watch an instrument ("alert me when...", "let me know if..."), create an alert rule with alert_rule_create and confirm the trigger in plain words. NEVER use alert rules to trade - they only notify.
 - NEVER promise profits. Always frame outputs as probabilistic analysis, not certainty.
 - PAPER trades only - you cannot and must not place live trades.
@@ -2209,7 +2425,13 @@ export async function POST(req: NextRequest) {
           const history = (await coreGet(`/chat?session=${encodeURIComponent(sessionId)}`)) as { ok: boolean; messages?: { role: string; content: string }[] }
           recent = (history.ok ? history.messages ?? [] : [])
             .slice(-10)
-            .map((m) => ({ role: m.role as 'assistant' | 'user', content: m.content }))
+            .map((m) => ({
+              role: m.role as 'assistant' | 'user',
+              // Task 58 (P3): the last-10 pull was the one unbounded prompt
+              // component - a single pasted 100k-char message rode along on
+              // every later request. Cap each message, keep the tail.
+              content: m.content.length > 4000 ? `…${m.content.slice(-4000)}` : m.content,
+            }))
         } catch {
           /* first message ever - fine */
         }

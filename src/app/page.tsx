@@ -21,6 +21,7 @@ import CointegrationPanel from '@/components/os/CointegrationPanel'
 import VolatilityArbPanel from '@/components/os/VolatilityArbPanel'
 import TriangulationPanel from '@/components/os/TriangulationPanel'
 import AdxPatternBiasPanel from '@/components/os/AdxPatternBiasPanel'
+import ShockPressurePanel from '@/components/os/ShockPressurePanel'
 import MarkovPanel from '@/components/os/MarkovPanel'
 import { DeltaFootprintView } from '@/components/os/OrderFlowPanel'
 import CandleMathView from '@/components/os/CandleMathView'
@@ -145,6 +146,7 @@ export default function OSPage() {
   const [volarbOpen, setVolarbOpen] = useState(false)
   const [triangulationOpen, setTriangulationOpen] = useState(false)
   const [adxPatternBiasOpen, setAdxPatternBiasOpen] = useState(false)
+  const [shockPressureOpen, setShockPressureOpen] = useState(false)
   const [registry, setRegistry] = useState<RegistryEntry[]>([])
   const [activeOverlays, setActiveOverlays] = useState<ActiveIndicator[]>([])
   const [activeSubs, setActiveSubs] = useState<ActiveIndicator[]>([])
@@ -950,7 +952,7 @@ export default function OSPage() {
                 closed = the slim open strip sits above the market watch and
                 everything is laid out exactly as before. */}
             <Panel defaultSize={17} minSize={11}>
-              {signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen ? (
+              {signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen || shockPressureOpen ? (
                 <div className="mr-0.5 h-full min-h-0">
                   {ydayOpen ? (
                     <YesterdayPanel onClose={() => setYdayOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onFocusWindow={handleFocusYesterday} />
@@ -966,6 +968,8 @@ export default function OSPage() {
                     <TriangulationPanel onClose={() => setTriangulationOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
                   ) : adxPatternBiasOpen ? (
                     <AdxPatternBiasPanel onClose={() => setAdxPatternBiasOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
+                  ) : shockPressureOpen ? (
+                    <ShockPressurePanel onClose={() => setShockPressureOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
                   ) : (
                     <ChartSignalsPanel onClose={() => setSignalsOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onTake={handleTakeSignal} />
                   )}
@@ -1060,6 +1064,16 @@ export default function OSPage() {
                       >
                         <span className="h-1.5 w-1.5 rounded-full bg-violet-400" />
                         ADX/DI + Pattern
+                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setShockPressureOpen(true)}
+                        title="open the shock + pressure panel - ATR-normalized shock on the latest bar combined with net buy/sell pressure building over prior bars"
+                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-orange-500/40 hover:text-orange-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-orange-400" />
+                        Shock + Pressure
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
                       </div>

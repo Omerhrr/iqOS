@@ -62,6 +62,7 @@ import { fitLeadLag, projectLeadLagSignal, LEADLAG_GROUPS, LEADLAG_MIN_ABS_CORRE
 import { fitCointegration, COINTEGRATION_WINDOW, COINTEGRATION_MIN_R2, COINTEGRATION_MIN_TSTAT, COINTEGRATION_MAX_HALFLIFE } from '../analytics/cointegration'
 import { findTriangles, fitTriangulationFromCandles, TRIANGULATION_WINDOW, TRIANGULATION_Z_ENTRY, type TriangleCandidate } from '../analytics/triangulation'
 import { fitAdxPatternBias, ADX_TREND_THRESHOLD, COMPOSITE_QUALIFY, PATTERN_BIAS_LOOKBACK } from '../analytics/adxpatternbias'
+import { fitShockPressure, SHOCK_RATIO_THRESHOLD, PRESSURE_LOOKBACK, SHOCKPRESSURE_COMPOSITE_QUALIFY } from '../analytics/shockpressure'
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
 /** NaN-safe comparison for trade gates. Thin-history screener rows can carry
@@ -75,7 +76,7 @@ const finGte = (v: number, floor: number): boolean => Number.isFinite(v) && v >=
 
 export type OsMode = 'human' | 'auto'
 
-export type AutoTraderSource = 'cointegration' | 'triangulation' | 'adx-pattern-bias' | 'strategy' | 'chartsignals' | 'leadlag'
+export type AutoTraderSource = 'cointegration' | 'triangulation' | 'adx-pattern-bias' | 'shock-pressure' | 'strategy' | 'chartsignals' | 'leadlag'
 
 /** Walk-forward validation verdict for the OU edge on one (asset, tf). */
 export interface OUVerdict {
@@ -357,7 +358,7 @@ const AUTOTRADER_NOTE = 'auto:os-trader'
  * its votes at the eval). Only these sources can guarantee every placed
  * trade is a FRESH edge, so only their alerts carry the "why now" crossing
  * note the pickers attach. */
-const SWEEP_SOURCES: readonly string[] = ['chartsignals', 'leadlag', 'cointegration', 'triangulation', 'adx-pattern-bias']
+const SWEEP_SOURCES: readonly string[] = ['chartsignals', 'leadlag', 'cointegration', 'triangulation', 'adx-pattern-bias', 'shock-pressure']
 /** analytics/chartsignals.ts combineVotes() now groups the 7 raw chart
  * engines into 5 independent-METHODOLOGY families before counting `agree`
  * - renko/range/P&F (all "price crossed N ATR-thresholds" read three ways)
@@ -571,7 +572,7 @@ export class ModeService {
         const num = (v: unknown, fb: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fb)
         this.config = {
           enabled: typeof c.enabled === 'boolean' ? c.enabled : DEFAULT_AUTOTRADER.enabled,
-          signalSource: (['cointegration', 'triangulation', 'adx-pattern-bias', 'strategy', 'chartsignals', 'leadlag'] as const).includes(c.signalSource as AutoTraderSource)
+          signalSource: (['cointegration', 'triangulation', 'adx-pattern-bias', 'shock-pressure', 'strategy', 'chartsignals', 'leadlag'] as const).includes(c.signalSource as AutoTraderSource)
             ? (c.signalSource as AutoTraderSource)
             : DEFAULT_AUTOTRADER.signalSource,
           tf: (typeof c.tf === 'string' && (ALL_TIMEFRAMES as string[]).includes(c.tf) ? c.tf : DEFAULT_AUTOTRADER.tf) as Timeframe,
@@ -969,7 +970,9 @@ export class ModeService {
             ? (row.note ?? `triangulation basis edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`)
             : this.config.signalSource === 'adx-pattern-bias'
               ? (row.note ?? `ADX ${row.adx.toFixed(0)} + pattern bias, edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`)
-              : this.config.signalSource === 'chartsignals'
+              : this.config.signalSource === 'shock-pressure'
+                ? (row.note ?? `shock + pressure, edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`)
+                : this.config.signalSource === 'chartsignals'
                 ? (row.note ?? `chart-signals vote ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`)
                 : this.config.signalSource === 'leadlag'
                   ? (row.note ?? `EUR/USD lead-lag ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`)
@@ -1025,6 +1028,7 @@ export class ModeService {
     if (this.config.signalSource === 'cointegration') return this.pickCointegrationSignal()
     if (this.config.signalSource === 'triangulation') return this.pickTriangulationSignal()
     if (this.config.signalSource === 'adx-pattern-bias') return this.pickAdxPatternBiasSignal()
+    if (this.config.signalSource === 'shock-pressure') return this.pickShockPressureSignal()
     if (this.config.signalSource === 'strategy') return this.pickStrategySignal()
     return null
   }
@@ -1364,6 +1368,88 @@ export class ModeService {
       }
       // pick the strongest fresh qualifier this sweep (|composite| desc),
       // same ranking scanAdxPatternBias/AdxPatternBiasPanel use.
+      if (!fresh.length) return null
+      fresh.sort((a, b) => b.metric - a.metric)
+      return fresh[0].row
+    })
+  }
+
+  /**
+   * Shock + Pressure source (analytics/shockpressure.ts): same shape as
+   * pickAdxPatternBiasSignal above - sweeps the full candidate universe,
+   * same gates the shock-pressure strategy applies per pair. Picks the
+   * single BEST fresh qualifier this sweep, ranked by |composite| desc -
+   * same ranking the shock-pressure strategy itself qualifies on.
+   */
+  private pickShockPressureSignal(): ScreenRow | null {
+    return this.edgeSweep('shock-pressure', (rec) => {
+      const fresh: Array<{ row: ScreenRow; metric: number }> = []
+      try {
+        const market = this.ctx.use<MarketDataService>('market')
+        const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
+        const pool = this.candidatePool(open)
+        const candidates = [...LIQUID_CANDIDATES.filter((a) => pool.includes(a)), ...pool.filter((a) => !LIQUID_CANDIDATES.includes(a))]
+        for (const asset of candidates) {
+          if (this.assetBlocked(asset)) continue
+          try {
+            const candles = market.getCandles(asset, this.config.tf, 200, true)
+            rec(asset)
+            if (candles.length < 60) continue
+            const fit = fitShockPressure(candles, 14, PRESSURE_LOOKBACK)
+            if (!fit || !fit.qualifies) continue
+            const dir: 'call' | 'put' | 'none' = fit.direction === 'bullish' ? 'call' : fit.direction === 'bearish' ? 'put' : 'none'
+            if (dir === 'none') continue
+            if (this.config.direction !== 'both' && dir !== this.config.direction) continue
+            const score = Math.round(clamp(40 + (Math.abs(fit.composite) - SHOCKPRESSURE_COMPOSITE_QUALIFY) * 10, 40, 95)) * (dir === 'call' ? 1 : -1)
+            const confidence = Math.round(clamp(40 + (Math.abs(fit.shockRatio) - SHOCK_RATIO_THRESHOLD) * 8 + (Math.abs(fit.composite) - SHOCKPRESSURE_COMPOSITE_QUALIFY) * 6, 35, 95))
+            if (!finGte(Math.abs(score), this.config.minScore)) continue
+            if (!finGte(confidence, this.config.minConfidence)) continue
+            const key = SweepEdgeMemory.key(asset, dir)
+            rec(asset, key)
+            if (this.sweepEdge.gate(key) === 'trade') {
+              const inst = market.assets.find((a) => a.ticker === asset)
+              fresh.push({
+                metric: Math.abs(fit.composite),
+                row: {
+                  asset,
+                  name: inst?.name ?? asset,
+                  category: (inst?.category ?? 'forex') as AssetCategory,
+                  otc: inst?.otc ?? asset.endsWith('-OTC'),
+                  tf: this.config.tf,
+                  price: candles[candles.length - 1]?.close ?? 0,
+                  score,
+                  direction: dir,
+                  confidence,
+                  pUp: 0,
+                  pDown: 0,
+                  regime: 'range',
+                  ouZ: 0,
+                  ouHalfLife: 0,
+                  ouMeanReverting: false,
+                  ouTStat: 0,
+                  rsi: 0,
+                  adx: 0,
+                  atrPct: 0,
+                  hurst: 0,
+                  changePct: 0,
+                  payout: this.payoutFor(asset, 'binary'),
+                  topPattern: null,
+                  ts: this.now(),
+                  computedTs: this.now(),
+                  // why NOW: a shock just printed and the pressure that was
+                  // already building agrees with its direction
+                  note: `shock ratio ${fit.shockRatio.toFixed(2)} (${fit.shockDirection}) agrees with pressure ${fit.pressureRatio >= 0 ? '+' : ''}${(fit.pressureRatio * 100).toFixed(0)}% - composite ${fit.composite.toFixed(1)} crossed ±${SHOCKPRESSURE_COMPOSITE_QUALIFY}`,
+                },
+              })
+            }
+          } catch {
+            // thin history for this pair - try the next
+          }
+        }
+      } catch {
+        // market not loaded - no signal source
+      }
+      // pick the strongest fresh qualifier this sweep (|composite| desc).
       if (!fresh.length) return null
       fresh.sort((a, b) => b.metric - a.metric)
       return fresh[0].row
@@ -2299,7 +2385,9 @@ export class ModeService {
               ? 'triangulation-arb'
               : this.config.signalSource === 'adx-pattern-bias'
                 ? 'adx-pattern-bias'
-                : this.config.signalSource === 'chartsignals'
+                : this.config.signalSource === 'shock-pressure'
+                  ? 'shock-pressure'
+                  : this.config.signalSource === 'chartsignals'
                   ? 'chartsignals-vote'
                   : this.config.signalSource === 'leadlag'
                     ? 'leadlag-echo'
@@ -2358,6 +2446,8 @@ export class ModeService {
         return 'triangulation-arb'
       case 'adx-pattern-bias':
         return 'adx-pattern-bias'
+      case 'shock-pressure':
+        return 'shock-pressure'
       case 'chartsignals':
         return 'chartsignals-vote'
       case 'leadlag':
@@ -2748,7 +2838,7 @@ export class ModeService {
       // moment too - whatever qualifies NOW predates this arm
       if (this.config.enabled && !was && this.mode === 'auto') this.armAutoEdgeBackfill()
     }
-    if (patch.signalSource !== undefined && (['cointegration', 'triangulation', 'adx-pattern-bias', 'strategy', 'chartsignals', 'leadlag'] as const).includes(patch.signalSource as AutoTraderSource))
+    if (patch.signalSource !== undefined && (['cointegration', 'triangulation', 'adx-pattern-bias', 'shock-pressure', 'strategy', 'chartsignals', 'leadlag'] as const).includes(patch.signalSource as AutoTraderSource))
       this.config.signalSource = patch.signalSource as AutoTraderSource
     // AUDIT FIX (Task 58, P2): tf used to be cast unchecked - a garbage tf
     // made every picker return nothing (silent "no signal" forever) and
@@ -2825,7 +2915,9 @@ export class ModeService {
           ? ` (basis z ≥ ${this.config.triangulationZEntry}σ across FX triangles)`
           : this.config.signalSource === 'adx-pattern-bias'
             ? ` (ADX ≥ ${ADX_TREND_THRESHOLD} + pattern bias agreement, composite ≥ ${COMPOSITE_QUALIFY})`
-            : this.config.signalSource === 'chartsignals'
+            : this.config.signalSource === 'shock-pressure'
+              ? ` (shock ratio ≥ ${SHOCK_RATIO_THRESHOLD}σ-ish of ATR + ${PRESSURE_LOOKBACK}-bar pressure agreement, composite ≥ ${SHOCKPRESSURE_COMPOSITE_QUALIFY})`
+              : this.config.signalSource === 'chartsignals'
                 ? ` (chart-type vote engine, agree ≥ ${CHARTSIGNALS_MIN_AGREE}/5 families)`
                 : this.config.signalSource === 'leadlag'
                 ? ` (intermarket lead-lag across ${LEADLAG_GROUPS.length} leader groups - EURUSD/XAUUSD/BTCUSD/oil, |corr| ≥ ${LEADLAG_MIN_ABS_CORRELATION}, trigger |z| ≥ ${LEADLAG_MIN_TRIGGER_Z})`

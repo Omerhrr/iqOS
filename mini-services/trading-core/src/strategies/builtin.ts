@@ -26,6 +26,7 @@ import { fitCointegration, COINTEGRATION_WINDOW, COINTEGRATION_MIN_R2, COINTEGRA
 import { computeVolArb, VOLARB_DEFAULT_WINDOW } from '../analytics/volarb'
 import { fitTriangulation, TRIANGULATION_WINDOW, TRIANGULATION_MIN_WINDOW, TRIANGULATION_Z_ENTRY } from '../analytics/triangulation'
 import { fitAdxPatternBias, ADX_TREND_THRESHOLD, COMPOSITE_QUALIFY } from '../analytics/adxpatternbias'
+import { fitShockPressure, SHOCK_RATIO_THRESHOLD, PRESSURE_LOOKBACK, SHOCKPRESSURE_COMPOSITE_QUALIFY } from '../analytics/shockpressure'
 
 const last = (arr: number[]): number => {
   for (let i = arr.length - 1; i >= 0; i--) if (Number.isFinite(arr[i])) return arr[i]
@@ -1863,6 +1864,42 @@ export const STRATEGIES: StrategyDef[] = [
         direction: dir,
         score,
         notes: `ADX ${fit.adx.toFixed(1)} (+DI ${fit.plusDI.toFixed(1)}/-DI ${fit.minusDI.toFixed(1)}) agrees with pattern bias ${fit.patternBias >= 0 ? '+' : ''}${fit.patternBias.toFixed(1)}${fit.topPattern ? ` (${fit.topPattern})` : ''} - composite ${fit.composite.toFixed(1)}`,
+      }
+    },
+  },
+  {
+    id: 'shock-pressure',
+    name: 'Shock + Pressure',
+    description:
+      'Combines two already-live reads instead of inventing new math: an ATR-normalized "shock ratio" on the latest closed bar (analytics/indicators.ts\'s atr() - how far this bar\'s move sits from this asset\'s own normal range) and net buy/sell PRESSURE building over the last few bars (analytics/orderflow.ts\'s existing CLV-based buy/sell volume split, summed over a short window). Trades only when a real shock just happened AND the pressure that was already building agrees with its direction (analytics/shockpressure.ts) - a one-bar spike with no pressure behind it is as likely to round-trip as continue, and pressure fighting the shock pulls the composite back toward 0 instead of just letting the bigger read win.',
+    params: [
+      { key: 'shockRatio', label: 'Min |shock ratio| (bar return / ATR)', type: 'number', min: 1, max: 6, step: 0.1, default: SHOCK_RATIO_THRESHOLD },
+      { key: 'lookback', label: 'Pressure lookback (bars)', type: 'number', min: 3, max: 30, default: PRESSURE_LOOKBACK },
+      { key: 'qualify', label: 'Min |composite| to trade (0-10)', type: 'number', min: 1, max: 10, step: 0.5, default: SHOCKPRESSURE_COMPOSITE_QUALIFY },
+    ],
+    evaluate: (candles, p) => {
+      const fit = fitShockPressure(candles, 14, num(p, 'lookback', PRESSURE_LOOKBACK))
+      if (!fit) return { direction: 'none', score: 0, notes: 'thin history - not enough bars for ATR + pressure window' }
+      if (!fit.shock) {
+        return { direction: 'none', score: 0, notes: `shock ratio ${fit.shockRatio.toFixed(2)} below ±${num(p, 'shockRatio', SHOCK_RATIO_THRESHOLD)} - no event on the latest bar` }
+      }
+      if (!fit.agree) {
+        return {
+          direction: 'none',
+          score: 0,
+          notes: `shock (${fit.shockDirection}) and building pressure (${fit.pressureDirection}, ${fit.pressureRatio >= 0 ? '+' : ''}${(fit.pressureRatio * 100).toFixed(0)}%) disagree or pressure is flat`,
+        }
+      }
+      const qualify = num(p, 'qualify', SHOCKPRESSURE_COMPOSITE_QUALIFY)
+      if (Math.abs(fit.composite) < qualify) {
+        return { direction: 'none', score: 0, notes: `composite ${fit.composite.toFixed(1)} agrees (${fit.direction}) but too weak to clear ${qualify}` }
+      }
+      const dir = fit.direction === 'bullish' ? 'call' : 'put'
+      const score = clamp(40 + Math.abs(fit.composite) * 5, 40, 95)
+      return {
+        direction: dir,
+        score,
+        notes: `shock ratio ${fit.shockRatio.toFixed(2)} agrees with pressure ${fit.pressureRatio >= 0 ? '+' : ''}${(fit.pressureRatio * 100).toFixed(0)}% over ${num(p, 'lookback', PRESSURE_LOOKBACK)} bars - composite ${fit.composite.toFixed(1)}`,
       }
     },
   },

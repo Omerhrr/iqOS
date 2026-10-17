@@ -37,6 +37,7 @@ import { fitCointegration, COINTEGRATION_WINDOW, COINTEGRATION_MIN_R2, COINTEGRA
 import { computeVolArb, VOLARB_DEFAULT_WINDOW } from './src/analytics/volarb'
 import { findTriangles, fitTriangulation, legsForCross, orientCandles, TRIANGULATION_WINDOW, TRIANGULATION_Z_ENTRY, type TriangleCandidate } from './src/analytics/triangulation'
 import { fitAdxPatternBias } from './src/analytics/adxpatternbias'
+import { fitShockPressure } from './src/analytics/shockpressure'
 import { normalizeSpec, type CustomSpec } from './src/strategies/custom'
 import { MINABLE_ENGINES, ENGINE_LABEL, type ChartEngineId } from './src/analytics/chartsignals'
 import { vskMonteCarlo } from './src/analytics/vsk'
@@ -495,6 +496,70 @@ function scanAdxPatternBias(market: MarketDataService, tfv: Timeframe): AdxPatte
   }
   rows.sort((x, y) => Number(y.qualifies) - Number(x.qualifies) || Math.abs(y.composite) - Math.abs(x.composite))
   adxPatternBiasScanCache.set(tfv, { ts: Date.now(), rows })
+  return rows
+}
+
+interface ShockPressureScanRow {
+  asset: string
+  name: string
+  category: string
+  otc: boolean
+  open: boolean
+  price: number
+  atr: number
+  barReturn: number
+  shockRatio: number
+  shock: boolean
+  shockDirection: 'bullish' | 'bearish' | 'neutral'
+  netDelta: number
+  netVolume: number
+  pressureRatio: number
+  pressureDirection: 'bullish' | 'bearish' | 'neutral'
+  agree: boolean
+  composite: number
+  direction: 'call' | 'put' | null
+  qualifies: boolean
+}
+const shockPressureScanCache = new Map<Timeframe, { ts: number; rows: ShockPressureScanRow[] }>()
+
+function scanShockPressure(market: MarketDataService, tfv: Timeframe): ShockPressureScanRow[] {
+  const cached = shockPressureScanCache.get(tfv)
+  if (cached && Date.now() - cached.ts < SCAN_CACHE_MS) return cached.rows
+  const rows: ShockPressureScanRow[] = []
+  for (const a of market.assets) {
+    if (!a.open) continue
+    try {
+      const candles = market.getCandlesDeep(a.ticker, tfv, 400, true)
+      const fit = fitShockPressure(candles)
+      if (!fit) continue
+      const direction: 'call' | 'put' | null = fit.qualifies ? (fit.direction === 'bullish' ? 'call' : fit.direction === 'bearish' ? 'put' : null) : null
+      rows.push({
+        asset: a.ticker,
+        name: a.name,
+        category: a.category,
+        otc: !!a.otc,
+        open: a.open,
+        price: candles[candles.length - 1]?.close ?? 0,
+        atr: fit.atr,
+        barReturn: fit.barReturn,
+        shockRatio: fit.shockRatio,
+        shock: fit.shock,
+        shockDirection: fit.shockDirection,
+        netDelta: fit.netDelta,
+        netVolume: fit.netVolume,
+        pressureRatio: fit.pressureRatio,
+        pressureDirection: fit.pressureDirection,
+        agree: fit.agree,
+        composite: fit.composite,
+        direction,
+        qualifies: fit.qualifies,
+      })
+    } catch {
+      /* one bad asset never breaks the scan */
+    }
+  }
+  rows.sort((x, y) => Number(y.qualifies) - Number(x.qualifies) || Math.abs(y.composite) - Math.abs(x.composite))
+  shockPressureScanCache.set(tfv, { ts: Date.now(), rows })
   return rows
 }
 
@@ -1872,6 +1937,22 @@ const httpServer = createServer(async (req, res) => {
           const tfv = tfStrict(q.get('tf'))
           if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
           const rows = scanAdxPatternBias(market, tfv)
+          return json(200, { ok: true, tf: tfv, scanned: rows.length, qualifying: rows.filter((r) => r.qualifies).length, rows, ts: Date.now() })
+        } catch (err) {
+          return json(400, { ok: false, error: (err as Error).message })
+        }
+      }
+
+      // Shock + Pressure scan: every open instrument's ATR-normalized "shock
+      // ratio" on the latest bar (analytics/indicators.ts's atr()) combined
+      // with net buy/sell pressure built up over the prior few bars
+      // (analytics/orderflow.ts's CLV-based delta) into one agreement-gated
+      // composite. See analytics/shockpressure.ts.
+      if (path === '/shock_pressure_scan') {
+        try {
+          const tfv = tfStrict(q.get('tf'))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const rows = scanShockPressure(market, tfv)
           return json(200, { ok: true, tf: tfv, scanned: rows.length, qualifying: rows.filter((r) => r.qualifies).length, rows, ts: Date.now() })
         } catch (err) {
           return json(400, { ok: false, error: (err as Error).message })

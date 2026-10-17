@@ -1491,7 +1491,9 @@ function AutoTraderStrip({
               ? `TRI·|z|≥${at.config.triangulationZEntry}`
               : at.config.signalSource === 'adx-pattern-bias'
                 ? `ADX+PAT·composite≥3.5`
-                : at.config.signalSource === 'chartsignals'
+                : at.config.signalSource === 'shock-pressure'
+                  ? `SHOCK+PRES·composite≥3.5`
+                  : at.config.signalSource === 'chartsignals'
                     ? `CHART-SIG·agree≥4`
                     : at.config.signalSource === 'leadlag'
                       ? `LEAD-LAG·4 groups·corr≥0.35`
@@ -1721,7 +1723,8 @@ function AutoTraderDialog({
           <DialogTitle className="text-[14px] tracking-wider">AUTO-TRADER</DialogTitle>
           <DialogDescription className="text-[11px] text-[#7c8aa5]">
             The OS acting as its own trader: takes the strongest signal as 1-bar binary options - the chart-type vote
-            engine, intermarket lead-lag, pairs cointegration, FX triangulation, ADX/DI + pattern bias, or one
+            engine, intermarket lead-lag, pairs cointegration, FX triangulation, ADX/DI + pattern bias, shock +
+            pressure, or one
             specific strategy picked from the Strategy Lab / AI Lab catalog. Only ever trades while the
             OS is in NO-HUMAN mode. Sentinel + risk limits still govern every order.
           </DialogDescription>
@@ -1818,6 +1821,7 @@ function AutoTraderDialog({
                   ['cointegration', 'Cointegration'],
                   ['triangulation', 'Triangulation'],
                   ['adx-pattern-bias', 'ADX/DI+Pattern'],
+                  ['shock-pressure', 'Shock+Pressure'],
                   ['strategy', 'Strategy'],
                 ] as const
               ).map(([v, label]) => (
@@ -1844,7 +1848,9 @@ function AutoTraderDialog({
                       ? 'FX triangular arbitrage: for every closed triangle among open forex pairs, compares the actual cross rate to its synthetic value (the product of the other two legs) and fades the gap when that basis is unusually stretched against its own recent history'
                       : d.signalSource === 'adx-pattern-bias'
                         ? 'combines ADX/DI trend strength+direction with recent candlestick pattern bias into one agreement-gated composite - trades only when both reads agree in direction and the composite clears its qualify bar'
-                        : d.signalSource === 'strategy'
+                        : d.signalSource === 'shock-pressure'
+                          ? 'combines a sudden ATR-normalized "shock" on the latest bar with net buy/sell pressure built up over the prior few bars (candle-level CLV approximation, no real order book) into one agreement-gated composite - trades only when a real shock just happened and the pressure already building agrees with its direction'
+                          : d.signalSource === 'strategy'
                         ? 'one specific strategy picked below, or several combined - as a vote (ENSEMBLE) or an AUTO-LEARN pool that trades whichever member is proven best per pair - the same strategyId an autopilot bot would use (a builtin strategy, or an AI Lab-learned "(Lab)" spec), not pinned to one bot\'s watchlist'
                         : ''}
             </p>

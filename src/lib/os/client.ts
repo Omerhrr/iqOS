@@ -705,6 +705,41 @@ export async function getAdxPatternBiasScan(tf: Timeframe): Promise<AdxPatternBi
   return osGet<AdxPatternBiasScanResponse>('/adx_pattern_bias_scan', { tf })
 }
 
+export interface ShockPressureScanRow {
+  asset: string
+  name: string
+  category: string
+  otc: boolean
+  open: boolean
+  price: number
+  atr: number
+  barReturn: number
+  shockRatio: number
+  shock: boolean
+  shockDirection: 'bullish' | 'bearish' | 'neutral'
+  netDelta: number
+  netVolume: number
+  pressureRatio: number
+  pressureDirection: 'bullish' | 'bearish' | 'neutral'
+  agree: boolean
+  composite: number
+  direction: 'call' | 'put' | null
+  qualifies: boolean
+}
+
+export interface ShockPressureScanResponse {
+  ok: boolean
+  tf: Timeframe
+  scanned: number
+  qualifying: number
+  rows: ShockPressureScanRow[]
+  ts: number
+}
+
+export async function getShockPressureScan(tf: Timeframe): Promise<ShockPressureScanResponse> {
+  return osGet<ShockPressureScanResponse>('/shock_pressure_scan', { tf })
+}
+
 // ---- chart-signal outcome stats (Task 64-c: the honesty loop) ------------
 
 export type SignalOutcomeId = 'win' | 'loss' | 'flat' | 'timeout'
@@ -2545,7 +2580,7 @@ export type OsMode = 'human' | 'auto'
 
 export interface AutoTraderConfig {
   enabled: boolean
-  signalSource: 'cointegration' | 'triangulation' | 'adx-pattern-bias' | 'strategy' | 'chartsignals' | 'leadlag'
+  signalSource: 'cointegration' | 'triangulation' | 'adx-pattern-bias' | 'shock-pressure' | 'strategy' | 'chartsignals' | 'leadlag'
   tf: Timeframe
   /** The trade's own expiry, as a timeframe - SEPARATE from `tf` (which
    * candles signals are read from). Unset = old behavior (expiry tracks tf
