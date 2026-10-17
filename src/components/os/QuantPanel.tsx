@@ -38,31 +38,15 @@ function agoLabel(ts: number): string {
 
 /**
  * Walk-forward validation of the OU edge on the active instrument (kernel
- * /ou_validate), plus a direct arm/disarm for the auto-trader's
- * requireValidation gate - so a user doesn't have to separately find it in
- * Autopilot settings to know (or control) whether this result does anything.
+ * /ou_validate) - a standalone diagnostic for the kalman-ou-reversion
+ * strategy's edge on this pair. 'kalman-ou' is no longer a selectable
+ * auto-trader signal source (it duplicated the strategy source), so this no
+ * longer arms/disarms anything live - it's a read-only check now.
  */
 function OuWalkForward({ asset, tf }: { asset: string; tf: string }) {
   const [verdict, setVerdict] = useState<OUVerdict | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [requireValidation, setRequireValidation] = useState<boolean | null>(null)
-  const [autoSource, setAutoSource] = useState<string | null>(null)
-  const [toggling, setToggling] = useState(false)
-
-  useEffect(() => {
-    let cancelled = false
-    osGet<{ ok: boolean } & OsModeStatus>('/mode')
-      .then((d) => {
-        if (cancelled || !d.ok) return
-        setRequireValidation(d.autotrader.config.requireValidation)
-        setAutoSource(d.autotrader.config.signalSource)
-      })
-      .catch(() => {})
-    return () => {
-      cancelled = true
-    }
-  }, [])
 
   const run = () => {
     setBusy(true)
@@ -74,16 +58,6 @@ function OuWalkForward({ asset, tf }: { asset: string; tf: string }) {
       })
       .catch((e: Error) => setError(e.message.slice(0, 120)))
       .finally(() => setBusy(false))
-  }
-
-  const toggleRequireValidation = () => {
-    if (requireValidation === null || toggling) return
-    const next = !requireValidation
-    setToggling(true)
-    setRequireValidation(next) // optimistic
-    osPost<{ ok: boolean; error?: string }>('/autotrader_config', { requireValidation: next })
-      .catch(() => setRequireValidation(!next))
-      .finally(() => setToggling(false))
   }
 
   const badge =
@@ -112,34 +86,10 @@ function OuWalkForward({ asset, tf }: { asset: string; tf: string }) {
         </button>
       </div>
       <p className="mt-1 text-[8px] leading-snug text-[#4b5a72]">
-        this checks ONE pair's OU edge only - it affects live trading only when the auto-trader's signal source is set to <span className="text-[#7c8aa5]">kalman-ou</span> AND &quot;require walk-forward validation&quot; is armed below. It has no effect on any other signal source or on manual trades.
+        this checks ONE pair's <span className="text-[#7c8aa5]">kalman-ou-reversion</span> strategy edge only - a
+        read-only diagnostic. It has no effect on the auto-trader (pick that strategy directly from the Strategy
+        source in Autopilot settings to trade it live) or on manual trades.
       </p>
-      {requireValidation !== null && (
-        <div className="mt-1.5 flex items-center justify-between gap-2 rounded border border-[#1c2739] bg-[#101828] px-2 py-1">
-          <div>
-            <div className="text-[9px] font-semibold text-[#e2e8f0]">
-              Require this validation before auto-trading kalman-ou
-              {autoSource && autoSource !== 'kalman-ou' && (
-                <span className="ml-1 font-normal text-[#f59e0b]">(auto-trader source is currently &quot;{autoSource}&quot; - no effect until switched)</span>
-              )}
-            </div>
-            <div className="text-[8px] text-[#4b5a72]">gates only the kalman-ou auto-trader source · verdicts cache ~1h</div>
-          </div>
-          <button
-            type="button"
-            onClick={toggleRequireValidation}
-            disabled={toggling}
-            className="shrink-0 rounded px-2 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wider transition-colors disabled:opacity-50"
-            style={
-              requireValidation
-                ? { color: '#10b981', background: 'rgba(16,185,129,0.14)', border: '1px solid rgba(16,185,129,0.4)' }
-                : { color: '#aab6cc', background: 'rgba(148,163,184,0.08)', border: '1px solid #1c2739' }
-            }
-          >
-            {requireValidation ? 'armed' : 'off'}
-          </button>
-        </div>
-      )}
       {error && <p className="mt-1 font-mono text-[10px] text-rose-400">{error}</p>}
       {verdict && badge && (
         <div className="mt-1.5">

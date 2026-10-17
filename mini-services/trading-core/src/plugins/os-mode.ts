@@ -7,22 +7,22 @@
 //    bots resume, and the built-in AUTO-TRADER - the OS acting as its own
 //    trader - places fixed-risk binary trades within strict self-imposed
 //    limits. The signal SOURCE is configurable:
-//      * 'screener'    - the strongest full-composite screener signals market-wide
-//      * 'kalman-ou'   - the Kalman/OU mean-reversion edge: fade statistically
-//                        stretched pairs (|z| sigmas from the OU equilibrium)
-//                        gated by reversion significance and a tradeable half-life
-//      * 'markov'      - the Markov chain state forecast: follow the model when it
-//                        assigns a decisive next-move probability and the regime
-//                        is not chop
-//      * 'momentum'    - trend-following on the screener row: ADX-confirmed
-//                        directional pressure with the move's rate-of-change
-//      * 'confluence'  - reads straight from Screener2Service, the dedicated
-//                        market-wide Confluence Signal sweep (screener2.ts) -
-//                        the EXACT 14-factor panel/confluence_read engine on
-//                        the SAME deep candle history the panel reads
-//                        (archived + live tail, 1500 bars), a genuinely
-//                        separate feed from 'screener' above, not derived
-//                        from it
+//      * 'chartsignals' - the chart-type scanner's own vote engine (renko/
+//                        P&F/range/tick/footprint/heikin/candle votes
+//                        combined into one signed score+direction)
+//      * 'leadlag'     - intermarket lead-lag: a liquidity/macro leader's
+//                        unusual move projected onto a correlated follower
+//      * 'cointegration' - pairs trading on PRICE LEVELS: Engle-Granger
+//                        hedge-ratio fit between a leader/follower pair,
+//                        fading the spread when stretched from its own
+//                        fitted equilibrium (analytics/cointegration.ts)
+//      * 'triangulation' - FX triangular arbitrage: fades the gap between
+//                        an actual cross pair and its synthetic value (the
+//                        product of the other two triangle legs) when that
+//                        basis is unusually stretched (analytics/triangulation.ts)
+//      * 'adx-pattern-bias' - ADX/DI trend strength+direction combined with
+//                        recent candlestick pattern bias into one
+//                        agreement-gated composite (analytics/adxpatternbias.ts)
 //      * 'strategy'    - ONE specific saved strategy, picked by strategyId
 //                        from the combined Strategy Lab catalog (every
 //                        builtin strategy PLUS every AI Lab-learned "custom:"
@@ -31,21 +31,23 @@
 //                        (builtin via AnalyticsService.runStrategy, AI Lab
 //                        specs via StrategyLabService.runStrategy) instead of
 //                        being pinned to one bot's watchlist
-//  With 'kalman-ou' + requireValidation, a candidate pair must ALSO pass a
-//  walk-forward validation of the OU strategy (out-of-sample net positive,
-//  majority of folds profitable, decent IS->OOS efficiency) before the
-//  auto-trader trusts the live stretch - validated verdicts are cached per
-//  (asset|tf) for an hour and refreshed lazily.
+//  'screener'/'kalman-ou'/'markov'/'momentum'/'confluence' used to be signal
+//  sources here too - each one duplicated an edge that already exists as a
+//  selectable 'strategy' (the composite screener read, kalman-ou-reversion,
+//  markov-forecast, momentum/adx-trend, confluence-full), so they were
+//  dropped from this list in favor of 'strategy', and cointegration/
+//  triangulation/adx-pattern-bias (which need a second/third aux series the
+//  plain 'strategy' sweep doesn't fetch on demand, so they earn their own
+//  dedicated source) took their place.
 // The mode is persisted, so restarts resume the same intent. Sentinel, the
 // watchdog and the base risk manager ALWAYS outrank the mode: flipping to
 // AUTO grants autonomy, never exemption. PANIC drops the OS back to HUMAN.
 
 import type { Plugin, KernelContext } from '../kernel'
 import type { Store } from '../store'
-import type { AssetCategory, Timeframe } from '../types'
+import type { AssetCategory, Candle, Timeframe } from '../types'
 import { ALL_TIMEFRAMES, TIMEFRAME_SECONDS } from '../types'
 import type { ScreenerService, ScreenRow } from './screener'
-import type { Screener2Service, ConfluenceRow } from './screener2'
 import type { MarketDataService } from './market-data'
 import type { ChartSignalsService, ChartScanResult } from './chartsignals'
 import type { AnalyticsService } from './analytics'
@@ -57,6 +59,9 @@ import { classifyRegime } from '../analytics/regime'
 import { classifySession } from '../analytics/session'
 import { SweepEdgeMemory } from '../analytics/edge'
 import { fitLeadLag, projectLeadLagSignal, LEADLAG_GROUPS, LEADLAG_MIN_ABS_CORRELATION, LEADLAG_MIN_TRIGGER_Z, LEADLAG_LOOKBACK_BARS } from '../analytics/leadlag'
+import { fitCointegration, COINTEGRATION_WINDOW, COINTEGRATION_MIN_R2, COINTEGRATION_MIN_TSTAT, COINTEGRATION_MAX_HALFLIFE } from '../analytics/cointegration'
+import { findTriangles, fitTriangulationFromCandles, TRIANGULATION_WINDOW, TRIANGULATION_Z_ENTRY, type TriangleCandidate } from '../analytics/triangulation'
+import { fitAdxPatternBias, ADX_TREND_THRESHOLD, COMPOSITE_QUALIFY, PATTERN_BIAS_LOOKBACK } from '../analytics/adxpatternbias'
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
 /** NaN-safe comparison for trade gates. Thin-history screener rows can carry
@@ -70,7 +75,7 @@ const finGte = (v: number, floor: number): boolean => Number.isFinite(v) && v >=
 
 export type OsMode = 'human' | 'auto'
 
-export type AutoTraderSource = 'screener' | 'kalman-ou' | 'markov' | 'momentum' | 'confluence' | 'strategy' | 'chartsignals' | 'leadlag'
+export type AutoTraderSource = 'cointegration' | 'triangulation' | 'adx-pattern-bias' | 'strategy' | 'chartsignals' | 'leadlag'
 
 /** Walk-forward validation verdict for the OU edge on one (asset, tf). */
 export interface OUVerdict {
@@ -108,11 +113,9 @@ export interface AutoTraderConfig {
   stake: number
   minScore: number // minimum |score| to act on (composite or per-source edge score)
   minConfidence: number // minimum signal confidence (0-100)
-  zEntry: number // kalman-ou source: |z| (stationary sigmas) required to enter
-  maxHalfLife: number // kalman-ou source: skip pairs reverting slower than this (bars)
-  requireValidation: boolean // kalman-ou source: only trade pairs whose walk-forward verdict is robust
-  minPUp: number // markov source: decisive next-move probability (call when P(up) >=, put when P(down) >=)
-  minAdx: number // momentum source: minimum trend strength (ADX)
+  cointegrationZEntry: number // cointegration source: |z| (spread sigmas) required to enter
+  cointegrationMaxHalfLife: number // cointegration source: skip pairs reverting slower than this (bars)
+  triangulationZEntry: number // triangulation source: |z| (basis sigmas) required to enter
   /** strategy source: id from the combined Strategy Lab catalog - a builtin
    * strategy id (e.g. "ema-cross", "confluence-full") or an AI Lab-learned
    * spec ("custom:<id>"), exactly like an autopilot bot's strategyId. Unset =
@@ -208,9 +211,9 @@ export interface AutoTraderConfig {
    * the single top one - the whole pool still gets covered over time
    * instead of one pair soaking up every slot, while a pair that doesn't
    * even clear the qualifying bar can never be picked just by bad luck.
-   * Applies to the 'screener' (default) and 'strategy' sources - the two
-   * that already rank/score the whole candidate pool before picking;
-   * kalman-ou/markov/momentum/confluence pick the first pair that clears
+   * Applies to the 'strategy' source, which ranks/scores the whole
+   * candidate pool before picking; chartsignals/leadlag/cointegration/
+   * triangulation/adx-pattern-bias each pick the first pair that clears
    * their own thresholds in priority order and are unaffected. */
   pickVariety?: number
   maxOpen: number // max concurrent auto-trader positions
@@ -325,17 +328,15 @@ export interface AutoStakePlan {
 
 export const DEFAULT_AUTOTRADER: AutoTraderConfig = {
   enabled: true,
-  signalSource: 'screener',
+  signalSource: 'chartsignals',
   tf: '1m',
   expiryTf: undefined,
   stake: 10,
   minScore: 60,
   minConfidence: 55,
-  zEntry: 1.8,
-  maxHalfLife: 60,
-  requireValidation: false,
-  minPUp: 0.58,
-  minAdx: 22,
+  cointegrationZEntry: 1.5,
+  cointegrationMaxHalfLife: COINTEGRATION_MAX_HALFLIFE,
+  triangulationZEntry: TRIANGULATION_Z_ENTRY,
   direction: 'both',
   maxOpen: 3,
   cooldownSec: 3600, // every pair gets a hard 1hr rest after it trades - see MIN_ASSET_COOLDOWN_SEC
@@ -351,12 +352,12 @@ export const DEFAULT_AUTOTRADER: AutoTraderConfig = {
 // (undefined = fixed-stake, the original unconditional behavior)
 
 const AUTOTRADER_NOTE = 'auto:os-trader'
-/** The four sweep-based auto-trader signal sources - the ones whose fresh-edge
- * discipline is enforced by SweepEdgeMemory (the screener source instead keeps
- * autoEdgeBackfill; 'strategy' phase-gates its votes at the eval). Only these
- * sources can guarantee every placed trade is a FRESH edge, so only their
- * alerts carry the "why now" crossing note the pickers attach. */
-const SWEEP_SOURCES: readonly string[] = ['kalman-ou', 'markov', 'momentum', 'confluence', 'chartsignals', 'leadlag']
+/** The sweep-based auto-trader signal sources - the ones whose fresh-edge
+ * discipline is enforced by SweepEdgeMemory ('strategy' instead phase-gates
+ * its votes at the eval). Only these sources can guarantee every placed
+ * trade is a FRESH edge, so only their alerts carry the "why now" crossing
+ * note the pickers attach. */
+const SWEEP_SOURCES: readonly string[] = ['chartsignals', 'leadlag', 'cointegration', 'triangulation', 'adx-pattern-bias']
 /** analytics/chartsignals.ts combineVotes() now groups the 7 raw chart
  * engines into 5 independent-METHODOLOGY families before counting `agree`
  * - renko/range/P&F (all "price crossed N ATR-thresholds" read three ways)
@@ -570,7 +571,7 @@ export class ModeService {
         const num = (v: unknown, fb: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fb)
         this.config = {
           enabled: typeof c.enabled === 'boolean' ? c.enabled : DEFAULT_AUTOTRADER.enabled,
-          signalSource: (['screener', 'kalman-ou', 'markov', 'momentum', 'confluence', 'strategy', 'chartsignals', 'leadlag'] as const).includes(c.signalSource as AutoTraderSource)
+          signalSource: (['cointegration', 'triangulation', 'adx-pattern-bias', 'strategy', 'chartsignals', 'leadlag'] as const).includes(c.signalSource as AutoTraderSource)
             ? (c.signalSource as AutoTraderSource)
             : DEFAULT_AUTOTRADER.signalSource,
           tf: (typeof c.tf === 'string' && (ALL_TIMEFRAMES as string[]).includes(c.tf) ? c.tf : DEFAULT_AUTOTRADER.tf) as Timeframe,
@@ -578,11 +579,9 @@ export class ModeService {
           stake: clamp(num(c.stake, DEFAULT_AUTOTRADER.stake), 1, 5000),
           minScore: clamp(num(c.minScore, DEFAULT_AUTOTRADER.minScore), 0, 100),
           minConfidence: clamp(num(c.minConfidence, DEFAULT_AUTOTRADER.minConfidence), 0, 100),
-          zEntry: num(c.zEntry, DEFAULT_AUTOTRADER.zEntry),
-          maxHalfLife: num(c.maxHalfLife, DEFAULT_AUTOTRADER.maxHalfLife),
-          requireValidation: typeof c.requireValidation === 'boolean' ? c.requireValidation : DEFAULT_AUTOTRADER.requireValidation,
-          minPUp: num(c.minPUp, DEFAULT_AUTOTRADER.minPUp),
-          minAdx: num(c.minAdx, DEFAULT_AUTOTRADER.minAdx),
+          cointegrationZEntry: num(c.cointegrationZEntry, DEFAULT_AUTOTRADER.cointegrationZEntry),
+          cointegrationMaxHalfLife: num(c.cointegrationMaxHalfLife, DEFAULT_AUTOTRADER.cointegrationMaxHalfLife),
+          triangulationZEntry: num(c.triangulationZEntry, DEFAULT_AUTOTRADER.triangulationZEntry),
           strategyId: typeof c.strategyId === 'string' && c.strategyId.trim() ? c.strategyId.trim() : undefined,
           strategyIds: Array.isArray(c.strategyIds)
             ? c.strategyIds.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).map((x) => x.trim())
@@ -945,20 +944,18 @@ export class ModeService {
       // rejection blocked stays fresh and is re-picked next tick (the retry
       // loop above), but once a trade actually places the edge is consumed -
       // the still-true condition reads as held from here on, so cooldown
-      // expiry can never re-enter the stale middle. The screener source's
-      // memory is autoEdgeBackfill (lapse-pruned in pickSignal), the sweep
-      // sources' is sweepEdge (pruned in edgeSweep); the strategy source
+      // expiry can never re-enter the stale middle. The sweep sources'
+      // memory is sweepEdge (pruned in edgeSweep); the strategy source
       // needs no stamp - its votes already carry phase (entered/flip only).
       const edgeKey = `${row.asset}:${row.direction}`
-      if (this.config.signalSource === 'screener') this.autoEdgeBackfill.set(edgeKey, { since: this.now(), origin: 'executed' })
-      else if (this.config.signalSource !== 'strategy') this.sweepEdge.stamp(edgeKey, this.now())
+      if (this.config.signalSource !== 'strategy') this.sweepEdge.stamp(edgeKey, this.now())
       this.rt.trades += 1
       this.rt.lastTradeTs = this.now()
       this.rt.lastAssetTs.set(row.asset, this.now())
       this.rt.openCount += 1
       this.rt.lastRejection = undefined
       const rollTag = bet.compound ? ` · ${bet.phase} roll x${bet.rollN + 1}${this.config.stakePlan?.periods ? `/${this.config.stakePlan.periods}` : ''} (pot $${bet.pot.toFixed(2)})` : ''
-      // The four sweep sources only ever reach this block on a FRESH edge
+      // The sweep sources only ever reach this block on a FRESH edge
       // (the picker's gate() === 'trade' branch), and each picker attaches a
       // note naming the gate that JUST crossed - surface it in the strip's
       // `last:` state row and in the alert, so the operator reads why the
@@ -966,19 +963,17 @@ export class ModeService {
       const why = SWEEP_SOURCES.includes(this.config.signalSource) && row.note ? row.note : ''
       this.rt.lastAction = `${side.toUpperCase()} ${row.asset}${rollTag}${why ? ` · ${why}` : ''}`
       const detail =
-        this.config.signalSource === 'kalman-ou'
-          ? `OU z ${row.ouZ.toFixed(2)}σ · HL ${row.ouHalfLife >= 9999 ? '∞' : row.ouHalfLife.toFixed(0)}b · t ${row.ouTStat.toFixed(1)} · edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)}`
-          : this.config.signalSource === 'markov'
-            ? `P(up) ${(row.pUp * 100).toFixed(1)}% · regime ${row.regime} · edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)}`
-            : this.config.signalSource === 'momentum'
-              ? `ADX ${row.adx.toFixed(0)} · RSI ${row.rsi.toFixed(0)} · Δ${row.changePct.toFixed(2)}% · edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)}`
-              : this.config.signalSource === 'confluence'
-                ? `14-factor confluence ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`
-                : this.config.signalSource === 'chartsignals'
-                  ? (row.note ?? `chart-signals vote ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`)
-                  : this.config.signalSource === 'leadlag'
-                    ? (row.note ?? `EUR/USD lead-lag ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`)
-                    : this.config.signalSource === 'strategy'
+        this.config.signalSource === 'cointegration'
+          ? (row.note ?? `cointegration spread edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`)
+          : this.config.signalSource === 'triangulation'
+            ? (row.note ?? `triangulation basis edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`)
+            : this.config.signalSource === 'adx-pattern-bias'
+              ? (row.note ?? `ADX ${row.adx.toFixed(0)} + pattern bias, edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`)
+              : this.config.signalSource === 'chartsignals'
+                ? (row.note ?? `chart-signals vote ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`)
+                : this.config.signalSource === 'leadlag'
+                  ? (row.note ?? `EUR/USD lead-lag ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`)
+                  : this.config.signalSource === 'strategy'
                   ? (row.note ?? `${this.effectiveStrategyIds().join('+') || 'strategy'} (${row.direction.toUpperCase()})`)
                   : `score ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} regime ${row.regime}`
       // Surface paper-vs-live right in the success line itself - this is the
@@ -1025,88 +1020,16 @@ export class ModeService {
   }
 
   private pickSignal(): ScreenRow | null {
-    if (this.config.signalSource === 'kalman-ou') return this.pickOUSignal()
-    if (this.config.signalSource === 'markov') return this.pickMarkovSignal()
-    if (this.config.signalSource === 'momentum') return this.pickMomentumSignal()
-    if (this.config.signalSource === 'confluence') return this.pickConfluenceSignal()
     if (this.config.signalSource === 'chartsignals') return this.pickChartSignalsSignal()
     if (this.config.signalSource === 'leadlag') return this.pickLeadLagSignal()
+    if (this.config.signalSource === 'cointegration') return this.pickCointegrationSignal()
+    if (this.config.signalSource === 'triangulation') return this.pickTriangulationSignal()
+    if (this.config.signalSource === 'adx-pattern-bias') return this.pickAdxPatternBiasSignal()
     if (this.config.signalSource === 'strategy') return this.pickStrategySignal()
-    try {
-      const screener = this.ctx.use<ScreenerService>('screener')
-      const dir = this.config.direction === 'both' ? undefined : this.config.direction
-      const restricted = this.config.watchlist.length > 0
-      // a watchlist pair might not make the global top-12 by composite score
-      // alone - widen the ranked window so assetBlocked's own watchlist
-      // filter (not this limit) is what decides inclusion.
-      const { rows } = screener.top({ tf: this.config.tf, minScore: this.config.minScore, direction: dir, limit: restricted ? 500 : 12 })
-      // Edge memory upkeep (screener source): this row list IS the complete
-      // qualifying universe for the tick, so an absence is a real lapse -
-      // drop any backfilled key that is no longer qualifying so its next
-      // appearance can trade as the fresh edge it then is.
-      const qualifyingNow = new Set<string>()
-      for (const r of rows) {
-        if (r.direction === 'none') continue
-        qualifyingNow.add(`${r.asset}:${r.direction}`)
-      }
-      for (const key of [...this.autoEdgeBackfill.keys()]) {
-        if (!qualifyingNow.has(key)) this.autoEdgeBackfill.delete(key)
-      }
-      const variety = this.config.pickVariety ?? 1
-      // rows is already ranked by |score| then confidence (screener.ts), so
-      // the first `variety` qualifying rows in iteration order ARE the top
-      // `variety` by rank - no separate sort needed here, unlike the pool
-      // collected below.
-      const ranked: Array<{ row: ScreenRow; metric: number }> = []
-      for (const r of rows) {
-        if (r.direction === 'none') continue
-        // already qualifying at arm and never lapsed since - the stale
-        // middle of a condition, not a fresh edge. Lapse handling above
-        // re-arms it honestly.
-        if (this.autoEdgeBackfill.has(`${r.asset}:${r.direction}`)) continue
-        // fail-closed: top() filters NaN scores itself, but confidence could
-        // still be NaN on a garbage row - never qualify one
-        if (!finGte(r.confidence, this.config.minConfidence)) continue
-        if (this.assetBlocked(r.asset)) continue
-        ranked.push({ row: r, metric: Math.abs(r.score) * 1000 + r.confidence })
-        if (ranked.length >= Math.max(1, variety)) break
-      }
-      if (ranked.length) return this.pickRandomFromPool(ranked, variety)
-      // sweep still warming (or rows stale) - evaluate liquid pairs directly,
-      // run through the SAME watchlist/watchlistMode gate (an 'only' restriction
-      // falls back to exactly its own pairs; an 'exclude' restriction falls
-      // back to the liquid pairs minus whatever's excluded; no restriction
-      // is unchanged LIQUID_CANDIDATES). Not globally ranked (evaluated
-      // on-demand in priority order), so collect every qualifier instead of
-      // stopping at the first `variety` hits, then let the same top-N random
-      // pick apply.
-      const fallback: Array<{ row: ScreenRow; metric: number }> = []
-      for (const asset of this.candidatePool(restricted ? [...this.config.watchlist, ...LIQUID_CANDIDATES] : LIQUID_CANDIDATES)) {
-        if (this.assetBlocked(asset)) continue
-        try {
-          const r = screener.evaluate(asset, this.config.tf)
-          if (r.direction === 'none') continue
-          // same edge memory as the ranked path - an on-demand read of a
-          // pair that was already qualifying at arm is just as stale
-          const edgeKey = `${asset}:${r.direction}`
-          if (this.autoEdgeBackfill.has(edgeKey)) continue
-          // fail-closed gates (raw evaluate - thin history can yield NaN)
-          if (!finGte(Math.abs(r.score), this.config.minScore)) continue
-          if (!finGte(r.confidence, this.config.minConfidence)) continue
-          if (this.config.direction !== 'both' && r.direction !== this.config.direction) continue
-          fallback.push({ row: r, metric: Math.abs(r.score) * 1000 + r.confidence })
-        } catch {
-          // thin history for this pair - try the next
-        }
-      }
-      if (fallback.length) return this.pickRandomFromPool(fallback, variety)
-    } catch {
-      // screener not loaded - no signal source
-    }
     return null
   }
 
-  /** Shared sweep harness for the four priority-order sources: wraps the
+  /** Shared sweep harness for the priority-order sources: wraps the
    * picker body with the sweepEdge memory so a qualifier only trades when it
    * is FRESH (just crossed its gates), never when it has been sitting there
    * since before the last arm/execution. The `rec` callback must be called
@@ -1114,7 +1037,7 @@ export class ModeService {
    * qualifies under the config gates; a throw (thin history) or a skipped
    * asset records nothing, and unobserved assets never get a lapse verdict. */
   private edgeSweep(
-    source: Exclude<AutoTraderSource, 'screener' | 'strategy'>,
+    source: Exclude<AutoTraderSource, 'strategy'>,
     body: (rec: (asset: string, key?: string) => void) => ScreenRow | null,
   ): ScreenRow | null {
     this.sweepEdge.beginSweep(source)
@@ -1129,243 +1052,280 @@ export class ModeService {
   }
 
   /**
-   * Kalman/OU mean-reversion source: sweep the open universe with the cheap
-   * screener path (rows carry the fitted OU state) and fade statistically
-   * stretched pairs - CALL when price sits |z| sigmas BELOW the OU equilibrium,
-   * PUT above - but only when the fit itself says the series actually reverts
-   * (t-stat gate) and fast enough to be tradeable (half-life cap).
+   * Cointegration source: pairs trading on PRICE LEVELS, not returns. Walks
+   * every leader group in LEADLAG_GROUPS (same roster lead-lag/cointegration
+   * strategies share - see analytics/cointegration.ts's own doc comment),
+   * Engle-Granger-fits a rolling hedge ratio between the leader and each
+   * follower, and fades the implied spread when it is stretched far enough
+   * from its own fitted OU equilibrium (z gate) and that equilibrium is
+   * itself statistically real (r2/t-stat gates) and fast enough to be
+   * tradeable (half-life cap) - exactly the cointegration-pairs strategy's
+   * own gates, applied market-wide instead of pinned to one bot's pair.
    */
-  private pickOUSignal(): ScreenRow | null {
-    return this.edgeSweep('kalman-ou', (rec) => {
-    try {
-      const screener = this.ctx.use<ScreenerService>('screener')
-      const market = this.ctx.use<MarketDataService>('market')
-      const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
-      // liquid pairs first so early ticks evaluate the deepest books, then the tail
-      const candidates = [...LIQUID_CANDIDATES.filter((a) => open.includes(a)), ...open.filter((a) => !LIQUID_CANDIDATES.includes(a))]
-      for (const asset of candidates) {
-        if (this.assetBlocked(asset)) continue
-        try {
-          const base = screener.evaluate(asset, this.config.tf) // cached when fresh, recomputed when stale
-          rec(asset) // the row was read - this sweep observed the asset
-          if (!base.ouMeanReverting) continue // fit not significant - fading a random walk is how accounts die
-          // NaN half-life would PASS `> maxHalfLife` (NaN comparisons are
-          // false) - require a real, finite half-life to fade against
-          if (!finGte(base.ouHalfLife, 0) || base.ouHalfLife > this.config.maxHalfLife) continue // reverts too slowly to be tradeable
-          const dir: 'call' | 'put' | 'none' =
-            base.ouZ <= -this.config.zEntry ? 'call' : base.ouZ >= this.config.zEntry ? 'put' : 'none'
-          if (dir === 'none') continue
-          if (this.config.direction !== 'both' && dir !== this.config.direction) continue
-          if (this.config.requireValidation) {
-            const verdict = this.ouVerdict(asset)
-            if (!verdict) {
-              // no fresh walk-forward verdict yet - validate lazily (bounded:
-              // at most one validation runs at a time) and skip this tick
-              void this.ensureOUValidation(asset)
-              continue
+  private pickCointegrationSignal(): ScreenRow | null {
+    return this.edgeSweep('cointegration', (rec) => {
+      try {
+        const market = this.ctx.use<MarketDataService>('market')
+        const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
+        const pool = this.candidatePool(open)
+        const leaderCloseCache = new Map<string, number[] | null>()
+        for (const group of LEADLAG_GROUPS) {
+          if (!open.includes(group.leader)) continue // leader itself not tradeable right now
+          let leaderCloses = leaderCloseCache.get(group.leader)
+          if (leaderCloses === undefined) {
+            try {
+              const leaderCandles = market.getCandles(group.leader, this.config.tf, LEADLAG_LOOKBACK_BARS, true)
+              leaderCloses = leaderCandles.length >= 60 ? leaderCandles.map((c) => c.close) : null
+            } catch {
+              leaderCloses = null
             }
-            if (verdict.verdict !== 'robust') continue // walk-forward said this edge is not tradeable
+            leaderCloseCache.set(group.leader, leaderCloses)
           }
-          const az = Math.abs(base.ouZ)
-          // same edge-score shape as the kalman-ou-reversion strategy so thresholds feel consistent
-          const score = Math.round(clamp(45 + (az - this.config.zEntry) * 20 + Math.min(18, Math.max(0, base.ouTStat) * 3), 42, 95))
-          const confidence = Math.round(clamp(40 + (base.ouTStat - 1.5) * 20 + (az - this.config.zEntry) * 8, 35, 95))
-          // fail-closed gates: a NaN score/confidence (a NaN input slipped
-          // into the formula) must never qualify the pair
-          if (!finGte(score, this.config.minScore)) continue
-          if (!finGte(confidence, this.config.minConfidence)) continue
-          // every config gate passed - the tradeable condition is TRUE right
-          // now. The edge memory decides whether it JUST became true ('trade')
-          // or was already qualifying last sweep ('skip' -> keep sweeping for
-          // a fresher edge deeper in the priority order).
-          const key = SweepEdgeMemory.key(asset, dir)
-          rec(asset, key)
-          if (this.sweepEdge.gate(key) === 'trade')
-            return {
-              ...base,
-              score,
-              confidence,
-              direction: dir,
-              // why NOW: the stretch just crossed the entry bar - the one
-              // bar-fresh gate this source's qualifying tuple hangs on (the
-              // OU fit and half-life gates are quasi-static by comparison)
-              note:
-                dir === 'call'
-                  ? `z ${base.ouZ.toFixed(2)} crossed below the ${(-this.config.zEntry).toFixed(2)} entry`
-                  : `z ${base.ouZ.toFixed(2)} crossed above the +${this.config.zEntry.toFixed(2)} entry`,
+          if (!leaderCloses) continue // too little leader history to fit a hedge ratio honestly
+          const candidates = group.followers.filter((a) => pool.includes(a) && a !== group.leader)
+          for (const asset of candidates) {
+            if (this.assetBlocked(asset)) continue
+            try {
+              const followerCandles = market.getCandles(asset, this.config.tf, LEADLAG_LOOKBACK_BARS, true)
+              rec(asset)
+              if (followerCandles.length < 60) continue // thin history for this follower - try the next
+              const followerCloses = followerCandles.map((c) => c.close)
+              const fit = fitCointegration(leaderCloses, followerCloses, COINTEGRATION_WINDOW)
+              if (!fit) continue
+              if (fit.r2 < COINTEGRATION_MIN_R2) continue // hedge-ratio fit too weak - not a reliable pair right now
+              if (fit.tStat < COINTEGRATION_MIN_TSTAT) continue // spread not mean-reverting enough
+              if (!finGte(fit.halfLifeBars, 0) || fit.halfLifeBars > this.config.cointegrationMaxHalfLife) continue // reverts too slowly
+              const zEntry = this.config.cointegrationZEntry
+              if (Math.abs(fit.z) < zEntry) continue // fairly priced right now
+              const dir: 'call' | 'put' = fit.z <= -zEntry ? 'call' : 'put'
+              if (this.config.direction !== 'both' && dir !== this.config.direction) continue
+              const score = Math.round(clamp(45 + (Math.abs(fit.z) - zEntry) * 18 + fit.r2 * 15, 40, 95)) * (dir === 'call' ? 1 : -1)
+              const confidence = Math.round(clamp(40 + (fit.tStat - COINTEGRATION_MIN_TSTAT) * 10 + (Math.abs(fit.z) - zEntry) * 8, 35, 95))
+              if (!finGte(Math.abs(score), this.config.minScore)) continue
+              if (!finGte(confidence, this.config.minConfidence)) continue
+              const key = SweepEdgeMemory.key(asset, dir)
+              rec(asset, key)
+              if (this.sweepEdge.gate(key) === 'trade') {
+                const inst = market.assets.find((a) => a.ticker === asset)
+                return {
+                  asset,
+                  name: inst?.name ?? asset,
+                  category: (inst?.category ?? 'forex') as AssetCategory,
+                  otc: inst?.otc ?? asset.endsWith('-OTC'),
+                  tf: this.config.tf,
+                  price: followerCandles[followerCandles.length - 1]?.close ?? 0,
+                  score,
+                  direction: dir,
+                  confidence,
+                  pUp: 0,
+                  pDown: 0,
+                  regime: 'range',
+                  ouZ: 0,
+                  ouHalfLife: 0,
+                  ouMeanReverting: false,
+                  ouTStat: 0,
+                  rsi: 0,
+                  adx: 0,
+                  atrPct: 0,
+                  hurst: 0,
+                  changePct: 0,
+                  payout: this.payoutFor(asset, 'binary'),
+                  topPattern: null,
+                  ts: this.now(),
+                  computedTs: this.now(),
+                  // why NOW: the spread just crossed its entry z-threshold,
+                  // backed by a significant (r2/t-stat-gated) hedge-ratio fit
+                  note: `spread z ${fit.z.toFixed(2)} crossed ±${zEntry.toFixed(2)} vs ${group.leader} (β ${fit.beta.toFixed(3)}, R² ${fit.r2.toFixed(2)}, HL ${fit.halfLifeBars.toFixed(0)}b) → ${dir.toUpperCase()}`,
+                }
+              }
+            } catch {
+              // thin history/candle fetch failed for this follower - try the next
             }
-        } catch {
-          // thin history for this pair - try the next (unobserved: its
-          // remembered edges, if any, survive)
+          }
         }
+      } catch {
+        // market not loaded - no signal source
       }
-    } catch {
-      // screener/market not loaded - no signal source
-    }
-    return null
+      return null
     })
   }
 
   /**
-   * Markov regime source: follow the chain when it assigns a decisive
-   * next-move probability - CALL when P(up) clears the threshold, PUT when it
-   * sits below its mirror - but never against/inside a chop regime, where the
-   * chain's transition matrix degenerates toward coin-flipping.
+   * Triangulation source: FX triangular arbitrage. Walks every closed
+   * triangle among the currently-open forex tickers (analytics/
+   * triangulation.ts's findTriangles), fetches the two non-cross legs plus
+   * the cross pair itself, and fades the gap between the cross's actual
+   * price and its synthetic value (the product of the other two legs,
+   * oriented into the cross's own units) when that basis is unusually
+   * stretched against its own recent history - the same gates the
+   * triangulation-arb strategy applies, swept market-wide.
    */
-  private pickMarkovSignal(): ScreenRow | null {
-    return this.edgeSweep('markov', (rec) => {
-    try {
-      const screener = this.ctx.use<ScreenerService>('screener')
-      const open = this.ctx.use<MarketDataService>('market').assets.filter((a) => a.open).map((a) => a.ticker)
-      const candidates = [...LIQUID_CANDIDATES.filter((a) => open.includes(a)), ...open.filter((a) => !LIQUID_CANDIDATES.includes(a))]
-      for (const asset of candidates) {
-        if (this.assetBlocked(asset)) continue
-        try {
-          const r = screener.evaluate(asset, this.config.tf)
-          rec(asset)
-          if (r.regime === 'chop') continue // the chain has no edge in chop
-          // Task 59 (P1): the put trigger was `pUp <= 1 - minPUp` - but in a
-          // 5-state chain 1-pUp = P(down)+P(flat), so a flat-heavy row with
-          // almost no down mass fired PUTs, and with the chain's true neutral
-          // near 0.36 puts triggered at 0.42 while calls needed 0.58
-          // (systematic put bias). Gate each side on ITS OWN probability.
-          const pDown = Number.isFinite(r.pDown) ? r.pDown : 1 - r.pUp // rows always carry pDown; guard legacy rows
-          const dir: 'call' | 'put' | 'none' =
-            r.pUp >= this.config.minPUp ? 'call' : pDown >= this.config.minPUp ? 'put' : 'none'
-          if (dir === 'none') continue
-          if (this.config.direction !== 'both' && dir !== this.config.direction) continue
-          const edge = clamp((dir === 'call' ? r.pUp - 0.5 : pDown - 0.5) * 2, 0, 1) // 0..1 decisiveness of the forecast, symmetric now
-          const score = Math.round(clamp(40 + edge * 60 + (r.regime === 'bull' || r.regime === 'bear' ? 8 : 0), 40, 95))
-          const confidence = Math.round(clamp(36 + edge * 55 + r.adx * 0.35, 35, 95))
-          // fail-closed gates (NaN adx feeds confidence here - never qualify)
-          if (!finGte(score, this.config.minScore)) continue
-          if (!finGte(confidence, this.config.minConfidence)) continue
-          const key = SweepEdgeMemory.key(asset, dir)
-          rec(asset, key)
-          if (this.sweepEdge.gate(key) === 'trade')
-            return {
-              ...r,
-              score,
-              confidence,
-              direction: dir,
-              // why NOW: the decisive side probability just cleared its bar
-              // (each side gated on ITS own probability - Task 59)
-              note:
-                dir === 'call'
-                  ? `P(up) ${(r.pUp * 100).toFixed(0)}% crossed the ${(this.config.minPUp * 100).toFixed(0)}% bar`
-                  : `P(down) ${(pDown * 100).toFixed(0)}% crossed the ${(this.config.minPUp * 100).toFixed(0)}% bar`,
+  private pickTriangulationSignal(): ScreenRow | null {
+    return this.edgeSweep('triangulation', (rec) => {
+      try {
+        const market = this.ctx.use<MarketDataService>('market')
+        const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
+        const pool = this.candidatePool(open)
+        const forexTickers = market.assets.filter((a) => a.category === 'forex').map((a) => a.ticker)
+        const triangles: TriangleCandidate[] = findTriangles(forexTickers)
+        const candleCache = new Map<string, Candle[] | null>()
+        const fetchCandles = (ticker: string): Candle[] | null => {
+          let c = candleCache.get(ticker)
+          if (c === undefined) {
+            try {
+              c = market.getCandles(ticker, this.config.tf, TRIANGULATION_WINDOW + 20, true)
+            } catch {
+              c = null
             }
-        } catch {
-          // thin history for this pair - try the next
+            candleCache.set(ticker, c)
+          }
+          return c
         }
+        for (const tri of triangles) {
+          const asset = tri.cross.ticker
+          if (!pool.includes(asset) || !open.includes(asset)) continue
+          if (this.assetBlocked(asset)) continue
+          if (!open.includes(tri.legAB.ticker) || !open.includes(tri.legBC.ticker)) continue
+          try {
+            const abCandles = fetchCandles(tri.legAB.ticker)
+            const bcCandles = fetchCandles(tri.legBC.ticker)
+            const acCandles = fetchCandles(asset)
+            rec(asset)
+            if (!abCandles || !bcCandles || !acCandles) continue
+            if (abCandles.length < TRIANGULATION_WINDOW || bcCandles.length < TRIANGULATION_WINDOW || acCandles.length < TRIANGULATION_WINDOW) continue
+            // fitTriangulationFromCandles reads tri.legAB.invert/legBC.invert/
+            // cross.invert itself - pass the raw (unoriented) leg candles.
+            const fit = fitTriangulationFromCandles(abCandles, bcCandles, acCandles, tri, TRIANGULATION_WINDOW)
+            if (!fit) continue
+            const zEntry = this.config.triangulationZEntry
+            if (Math.abs(fit.z) < zEntry) continue // synthetic and actual agree right now
+            const dir: 'call' | 'put' = fit.z >= zEntry ? 'put' : 'call' // actual rich -> fade (put); actual cheap -> call
+            if (this.config.direction !== 'both' && dir !== this.config.direction) continue
+            const score = Math.round(clamp(45 + (Math.abs(fit.z) - zEntry) * 20, 40, 90)) * (dir === 'call' ? 1 : -1)
+            const confidence = Math.round(clamp(40 + (Math.abs(fit.z) - zEntry) * 14, 35, 95))
+            if (!finGte(Math.abs(score), this.config.minScore)) continue
+            if (!finGte(confidence, this.config.minConfidence)) continue
+            const key = SweepEdgeMemory.key(asset, dir)
+            rec(asset, key)
+            if (this.sweepEdge.gate(key) === 'trade') {
+              const inst = market.assets.find((a) => a.ticker === asset)
+              return {
+                asset,
+                name: inst?.name ?? asset,
+                category: 'forex' as AssetCategory,
+                otc: inst?.otc ?? asset.endsWith('-OTC'),
+                tf: this.config.tf,
+                price: acCandles[acCandles.length - 1]?.close ?? 0,
+                score,
+                direction: dir,
+                confidence,
+                pUp: 0,
+                pDown: 0,
+                regime: 'range',
+                ouZ: 0,
+                ouHalfLife: 0,
+                ouMeanReverting: false,
+                ouTStat: 0,
+                rsi: 0,
+                adx: 0,
+                atrPct: 0,
+                hurst: 0,
+                changePct: 0,
+                payout: this.payoutFor(asset, 'binary'),
+                topPattern: null,
+                ts: this.now(),
+                computedTs: this.now(),
+                // why NOW: the basis just crossed its entry z-threshold -
+                // actual vs synthetic diverged enough to fade
+                note: `basis Δ ${fit.deltaPct.toFixed(4)}% (z ${fit.z.toFixed(2)}) crossed ±${zEntry.toFixed(2)} via ${tri.legAB.ticker}×${tri.legBC.ticker} → ${dir === 'put' ? 'rich, fade' : 'cheap, buy'}`,
+              }
+            }
+          } catch {
+            // thin history/candle fetch failed for this triangle - try the next
+          }
+        }
+      } catch {
+        // market not loaded - no signal source
       }
-    } catch {
-      // screener/market not loaded - no signal source
-    }
-    return null
+      return null
     })
   }
 
   /**
-   * Momentum source: ADX-confirmed trend continuation - CALL when trend
-   * strength clears the ADX gate with a positive rate-of-change and RSI on
-   * the bullish side of mid, PUT mirrored. Skips the extremes where the move
-   * is already statistically exhausted (RSI beyond ~78 / below ~22).
+   * ADX/DI + Pattern Bias source: single-asset scan (no leader/leg needed) -
+   * combines ADX/+DI/-DI trend strength+direction with recent candlestick
+   * pattern bias into one agreement-gated composite (analytics/
+   * adxpatternbias.ts), market-wide, same gates the adx-pattern-bias
+   * strategy applies per pair.
    */
-  private pickMomentumSignal(): ScreenRow | null {
-    return this.edgeSweep('momentum', (rec) => {
-    try {
-      const screener = this.ctx.use<ScreenerService>('screener')
-      const open = this.ctx.use<MarketDataService>('market').assets.filter((a) => a.open).map((a) => a.ticker)
-      const candidates = [...LIQUID_CANDIDATES.filter((a) => open.includes(a)), ...open.filter((a) => !LIQUID_CANDIDATES.includes(a))]
-      for (const asset of candidates) {
-        if (this.assetBlocked(asset)) continue
-        try {
-          const r = screener.evaluate(asset, this.config.tf)
-          rec(asset)
-          // fail-closed: `NaN < minAdx` is false, so a thin-history row with
-          // NaN adx would PASS this gate (its backfill-origin hold was
-          // observed live at the default bar) - require a real ADX value
-          if (!finGte(r.adx, this.config.minAdx)) continue
-          let dir: 'call' | 'put' | 'none' = 'none'
-          if (r.changePct > 0 && r.rsi >= 52 && r.rsi <= 78) dir = 'call'
-          else if (r.changePct < 0 && r.rsi >= 22 && r.rsi <= 48) dir = 'put'
-          if (dir === 'none') continue
-          if (this.config.direction !== 'both' && dir !== this.config.direction) continue
-          const score = Math.round(clamp(40 + (r.adx - this.config.minAdx) * 1.2 + Math.abs(r.rsi - 50) * 0.8, 40, 95))
-          const confidence = Math.round(clamp(36 + (r.adx - this.config.minAdx) * 0.8 + Math.abs(r.changePct) * 6, 35, 95))
-          // fail-closed gates: NaN score/confidence never qualifies
-          if (!finGte(score, this.config.minScore)) continue
-          if (!finGte(confidence, this.config.minConfidence)) continue
-          const key = SweepEdgeMemory.key(asset, dir)
-          rec(asset, key)
-          if (this.sweepEdge.gate(key) === 'trade')
-            return {
-              ...r,
-              score,
-              confidence,
-              direction: dir,
-              // why NOW: trend strength just cleared the ADX bar with the
-              // directional trigger intact - either leg failing means the
-              // tuple never qualified, so this is the crossing that made it
-              note: `ADX ${r.adx.toFixed(0)} crossed the ${this.config.minAdx} bar · RSI ${r.rsi.toFixed(0)} in the ${dir === 'call' ? 'bull' : 'bear'} band`,
+  private pickAdxPatternBiasSignal(): ScreenRow | null {
+    return this.edgeSweep('adx-pattern-bias', (rec) => {
+      try {
+        const market = this.ctx.use<MarketDataService>('market')
+        const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
+        const pool = this.candidatePool(open)
+        const candidates = [...LIQUID_CANDIDATES.filter((a) => pool.includes(a)), ...pool.filter((a) => !LIQUID_CANDIDATES.includes(a))]
+        for (const asset of candidates) {
+          if (this.assetBlocked(asset)) continue
+          try {
+            const candles = market.getCandles(asset, this.config.tf, 200, true)
+            rec(asset)
+            if (candles.length < 60) continue
+            const fit = fitAdxPatternBias(candles, 14, PATTERN_BIAS_LOOKBACK)
+            if (!fit || !fit.qualifies) continue
+            const dir: 'call' | 'put' | 'none' = fit.direction === 'bullish' ? 'call' : fit.direction === 'bearish' ? 'put' : 'none'
+            if (dir === 'none') continue
+            if (this.config.direction !== 'both' && dir !== this.config.direction) continue
+            const score = Math.round(clamp(40 + (Math.abs(fit.composite) - COMPOSITE_QUALIFY) * 10, 40, 95)) * (dir === 'call' ? 1 : -1)
+            const confidence = Math.round(clamp(40 + (fit.adx - ADX_TREND_THRESHOLD) * 0.8 + (Math.abs(fit.composite) - COMPOSITE_QUALIFY) * 6, 35, 95))
+            if (!finGte(Math.abs(score), this.config.minScore)) continue
+            if (!finGte(confidence, this.config.minConfidence)) continue
+            const key = SweepEdgeMemory.key(asset, dir)
+            rec(asset, key)
+            if (this.sweepEdge.gate(key) === 'trade') {
+              const inst = market.assets.find((a) => a.ticker === asset)
+              return {
+                asset,
+                name: inst?.name ?? asset,
+                category: (inst?.category ?? 'forex') as AssetCategory,
+                otc: inst?.otc ?? asset.endsWith('-OTC'),
+                tf: this.config.tf,
+                price: candles[candles.length - 1]?.close ?? 0,
+                score,
+                direction: dir,
+                confidence,
+                pUp: 0,
+                pDown: 0,
+                regime: 'range',
+                ouZ: 0,
+                ouHalfLife: 0,
+                ouMeanReverting: false,
+                ouTStat: 0,
+                rsi: 0,
+                adx: fit.adx,
+                atrPct: 0,
+                hurst: 0,
+                changePct: 0,
+                payout: this.payoutFor(asset, 'binary'),
+                // fit.topPattern is a bare pattern-name string here, not the
+                // {name, direction, reliability} ScreenRow.topPattern shape -
+                // the full pattern object isn't surfaced by this source.
+                topPattern: null,
+                ts: this.now(),
+                computedTs: this.now(),
+                // why NOW: ADX/DI direction and pattern bias just agreed and
+                // crossed the composite qualify bar together
+                note: `ADX ${fit.adx.toFixed(0)} (${fit.adxDirection}) agrees with pattern bias ${fit.patternBias.toFixed(1)}${fit.topPattern ? ` (${fit.topPattern})` : ''} - composite ${fit.composite.toFixed(1)} crossed ±${COMPOSITE_QUALIFY}`,
+              }
             }
-        } catch {
-          // thin history for this pair - try the next
+          } catch {
+            // thin history for this pair - try the next
+          }
         }
+      } catch {
+        // market not loaded - no signal source
       }
-    } catch {
-      // screener/market not loaded - no signal source
-    }
-    return null
-    })
-  }
-
-  /**
-   * Confluence source: reads straight from Screener2Service - the dedicated
-   * market-wide Confluence Signal sweep (screener2.ts), which runs the EXACT
-   * same engine (confluenceSignalOnly) on the SAME deep candle history
-   * (market.getCandlesDeep(..., 1500), archived + live tail) the single-asset
-   * panel uses. This is a genuinely separate read from 'screener' above - not
-   * derived from it, not borrowing its metadata. evaluate() returns the
-   * sweep's cached row when fresh and recomputes on demand when stale, same
-   * contract as ScreenerService.evaluate().
-   */
-  private pickConfluenceSignal(): ScreenRow | null {
-    return this.edgeSweep('confluence', (rec) => {
-    try {
-      const screener2 = this.ctx.use<Screener2Service>('screener2')
-      const market = this.ctx.use<MarketDataService>('market')
-      const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
-      const pool = this.candidatePool(open)
-      const candidates = [...LIQUID_CANDIDATES.filter((a) => pool.includes(a)), ...pool.filter((a) => !LIQUID_CANDIDATES.includes(a))]
-      for (const asset of candidates) {
-        if (this.assetBlocked(asset)) continue
-        try {
-          const row = screener2.evaluate(asset, this.config.tf)
-          rec(asset)
-          if (row.direction === 'none') continue
-          if (this.config.direction !== 'both' && row.direction !== this.config.direction) continue
-          // fail-closed gates: a NaN composite row must never qualify
-          if (!finGte(Math.abs(row.score), this.config.minScore)) continue
-          if (!finGte(row.confidence, this.config.minConfidence)) continue
-          const key = SweepEdgeMemory.key(asset, row.direction)
-          rec(asset, key)
-          if (this.sweepEdge.gate(key) === 'trade')
-            return {
-              ...ModeService.confluenceToScreenRow(row),
-              // why NOW: the 14-factor composite just crossed the score bar
-              // in this direction - the composite IS the trigger here
-              note: `composite ${Math.abs(row.score).toFixed(0)} crossed the ${this.config.minScore} factor-score bar`,
-            }
-        } catch {
-          // thin history for this pair - try the next
-        }
-      }
-    } catch {
-      // screener2/market not loaded - no signal source
-    }
-    return null
+      return null
     })
   }
 
@@ -1557,44 +1517,6 @@ export class ModeService {
       }
       return null
     })
-  }
-
-  /**
-   * Adapts a ConfluenceRow (screener2's real factor-based read) into the
-   * ScreenRow shape pickSignal()/place() share across every source - only
-   * asset/tf/price/score/direction/confidence/payout are ever read for
-   * 'confluence' (see the detail string in place()); the screener-specific
-   * scalar fields (rsi/adx/regime/hurst/ouZ/pUp/topPattern) don't apply to
-   * this engine's output and are inert placeholders here, never surfaced.
-   */
-  private static confluenceToScreenRow(row: ConfluenceRow): ScreenRow {
-    return {
-      asset: row.asset,
-      name: row.name,
-      category: row.category,
-      otc: row.otc,
-      tf: row.tf,
-      price: row.price,
-      score: row.score,
-      direction: row.direction,
-      confidence: row.confidence,
-      pUp: 0,
-      pDown: 0,
-      regime: 'range',
-      ouZ: 0,
-      ouHalfLife: 0,
-      ouMeanReverting: false,
-      ouTStat: 0,
-      rsi: 0,
-      adx: 0,
-      atrPct: 0,
-      hurst: 0,
-      changePct: 0,
-      payout: row.payout,
-      topPattern: null,
-      ts: row.ts,
-      computedTs: row.computedTs,
-    }
   }
 
   /** Sanitizes a strategyParams patch/restore blob: {id: {key: number|string}},
@@ -2306,25 +2228,23 @@ export class ModeService {
         // autopilot.ts's bot execution path).
         mode: exec.accountSource === 'iq' ? 'live' : 'paper',
         strategy:
-          this.config.signalSource === 'kalman-ou'
-            ? 'kalman-ou-reversion'
-            : this.config.signalSource === 'markov'
-              ? 'markov-edge'
-              : this.config.signalSource === 'momentum'
-                ? 'supertrend-follow'
-                : this.config.signalSource === 'confluence'
-                  ? 'confluence-full'
-                  : this.config.signalSource === 'chartsignals'
-                    ? 'chartsignals-vote'
-                    : this.config.signalSource === 'leadlag'
-                      ? 'eurusd-leadlag'
-                      : this.config.signalSource === 'strategy'
-                      ? (row.strategyLabel ??
-                        (() => {
-                          const ids = this.effectiveStrategyIds()
-                          return ids.length > 1 ? `ensemble:${ids.join('+')}` : ids[0] ?? 'custom-strategy'
-                        })())
-                      : 'screener-auto',
+          this.config.signalSource === 'cointegration'
+            ? 'cointegration-pairs'
+            : this.config.signalSource === 'triangulation'
+              ? 'triangulation-arb'
+              : this.config.signalSource === 'adx-pattern-bias'
+                ? 'adx-pattern-bias'
+                : this.config.signalSource === 'chartsignals'
+                  ? 'chartsignals-vote'
+                  : this.config.signalSource === 'leadlag'
+                    ? 'eurusd-leadlag'
+                    : this.config.signalSource === 'strategy'
+                    ? (row.strategyLabel ??
+                      (() => {
+                        const ids = this.effectiveStrategyIds()
+                        return ids.length > 1 ? `ensemble:${ids.join('+')}` : ids[0] ?? 'custom-strategy'
+                      })())
+                    : 'auto-trader',
         note: AUTOTRADER_NOTE,
       })
     } catch {
@@ -2367,20 +2287,16 @@ export class ModeService {
    * handled per-member inside pickStrategySignal instead). */
   private fixedStrategyLabel(): string | null {
     switch (this.config.signalSource) {
-      case 'kalman-ou':
-        return 'kalman-ou-reversion'
-      case 'markov':
-        return 'markov-edge'
-      case 'momentum':
-        return 'supertrend-follow'
-      case 'confluence':
-        return 'confluence-full'
+      case 'cointegration':
+        return 'cointegration-pairs'
+      case 'triangulation':
+        return 'triangulation-arb'
+      case 'adx-pattern-bias':
+        return 'adx-pattern-bias'
       case 'chartsignals':
         return 'chartsignals-vote'
       case 'leadlag':
         return 'eurusd-leadlag'
-      case 'screener':
-        return 'screener-auto'
       default:
         return null
     }
@@ -2761,7 +2677,7 @@ export class ModeService {
       // moment too - whatever qualifies NOW predates this arm
       if (this.config.enabled && !was && this.mode === 'auto') this.armAutoEdgeBackfill()
     }
-    if (patch.signalSource !== undefined && (['screener', 'kalman-ou', 'markov', 'momentum', 'confluence', 'strategy', 'chartsignals', 'leadlag'] as const).includes(patch.signalSource as AutoTraderSource))
+    if (patch.signalSource !== undefined && (['cointegration', 'triangulation', 'adx-pattern-bias', 'strategy', 'chartsignals', 'leadlag'] as const).includes(patch.signalSource as AutoTraderSource))
       this.config.signalSource = patch.signalSource as AutoTraderSource
     // AUDIT FIX (Task 58, P2): tf used to be cast unchecked - a garbage tf
     // made every picker return nothing (silent "no signal" forever) and
@@ -2776,11 +2692,9 @@ export class ModeService {
     if (patch.stake !== undefined) this.config.stake = clamp(numCur(patch.stake, this.config.stake), 1, 5000)
     if (patch.minScore !== undefined) this.config.minScore = clamp(numCur(patch.minScore, this.config.minScore), 0, 100)
     if (patch.minConfidence !== undefined) this.config.minConfidence = clamp(numCur(patch.minConfidence, this.config.minConfidence), 0, 100)
-    if (patch.zEntry !== undefined) this.config.zEntry = clamp(numCur(patch.zEntry, this.config.zEntry), 0.5, 4)
-    if (patch.maxHalfLife !== undefined) this.config.maxHalfLife = Math.round(clamp(numCur(patch.maxHalfLife, this.config.maxHalfLife), 5, 999))
-    if (patch.requireValidation !== undefined) this.config.requireValidation = Boolean(patch.requireValidation)
-    if (patch.minPUp !== undefined) this.config.minPUp = clamp(numCur(patch.minPUp, this.config.minPUp), 0.5, 0.75)
-    if (patch.minAdx !== undefined) this.config.minAdx = clamp(numCur(patch.minAdx, this.config.minAdx), 10, 45)
+    if (patch.cointegrationZEntry !== undefined) this.config.cointegrationZEntry = clamp(numCur(patch.cointegrationZEntry, this.config.cointegrationZEntry), 0.5, 4)
+    if (patch.cointegrationMaxHalfLife !== undefined) this.config.cointegrationMaxHalfLife = Math.round(clamp(numCur(patch.cointegrationMaxHalfLife, this.config.cointegrationMaxHalfLife), 5, 999))
+    if (patch.triangulationZEntry !== undefined) this.config.triangulationZEntry = clamp(numCur(patch.triangulationZEntry, this.config.triangulationZEntry), 0.5, 4)
     if (patch.strategyId !== undefined)
       this.config.strategyId = typeof patch.strategyId === 'string' && patch.strategyId.trim() ? patch.strategyId.trim() : undefined
     if (patch.strategyIds !== undefined)
@@ -2834,15 +2748,13 @@ export class ModeService {
     this.persist()
     this.rt.lastRejection = undefined
     const srcDetail =
-      this.config.signalSource === 'kalman-ou'
-        ? ` (z ≥ ${this.config.zEntry}σ · HL ≤ ${this.config.maxHalfLife}b${this.config.requireValidation ? ' · walk-forward validated' : ''})`
-        : this.config.signalSource === 'markov'
-          ? ` (P(up)/P(down) ≥ ${(this.config.minPUp * 100).toFixed(0)}% - Task 59: put side gates on P(down), not 1-P(up))`
-          : this.config.signalSource === 'momentum'
-            ? ` (ADX ≥ ${this.config.minAdx})`
-            : this.config.signalSource === 'confluence'
-              ? ' (full 14-factor panel engine, bar-fresh)'
-              : this.config.signalSource === 'chartsignals'
+      this.config.signalSource === 'cointegration'
+        ? ` (spread z ≥ ${this.config.cointegrationZEntry}σ · HL ≤ ${this.config.cointegrationMaxHalfLife}b, Engle-Granger)`
+        : this.config.signalSource === 'triangulation'
+          ? ` (basis z ≥ ${this.config.triangulationZEntry}σ across FX triangles)`
+          : this.config.signalSource === 'adx-pattern-bias'
+            ? ` (ADX ≥ ${ADX_TREND_THRESHOLD} + pattern bias agreement, composite ≥ ${COMPOSITE_QUALIFY})`
+            : this.config.signalSource === 'chartsignals'
                 ? ` (chart-type vote engine, agree ≥ ${CHARTSIGNALS_MIN_AGREE}/5 families)`
                 : this.config.signalSource === 'leadlag'
                 ? ` (intermarket lead-lag across ${LEADLAG_GROUPS.length} leader groups - EURUSD/XAUUSD/BTCUSD/oil, |corr| ≥ ${LEADLAG_MIN_ABS_CORRELATION}, trigger |z| ≥ ${LEADLAG_MIN_TRIGGER_Z})`
@@ -2932,7 +2844,10 @@ export class ModeService {
   } {
     const sweepDesc = this.sweepEdge.describe()
     const isSweepSource = SWEEP_SOURCES.includes(this.config.signalSource)
-    const isScreener = this.config.signalSource === 'screener'
+    // 'screener' is no longer a selectable signal source (it duplicated the
+    // 'strategy' source's screener-composite option) - screenerHeld is kept
+    // in the shape for API/UI backward-compat but is now always empty.
+    const isScreener = false
     return {
       mode: this.mode,
       ts: this.ts,

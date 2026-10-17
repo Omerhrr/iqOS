@@ -1436,16 +1436,14 @@ function NumField({ label, value, onChange, step }: { label: string; value: numb
 /** Fallback draft before the first /mode poll lands (mirrors kernel defaults). */
 const DEFAULT_AUTOTRADER_UI: AutoTraderConfig = {
   enabled: true,
-  signalSource: 'screener',
+  signalSource: 'chartsignals',
   tf: '1m',
   stake: 10,
   minScore: 60,
   minConfidence: 55,
-  zEntry: 1.8,
-  maxHalfLife: 60,
-  requireValidation: false,
-  minPUp: 0.58,
-  minAdx: 22,
+  cointegrationZEntry: 1.5,
+  cointegrationMaxHalfLife: 80,
+  triangulationZEntry: 1.5,
   direction: 'both',
   maxOpen: 3,
   cooldownSec: 180,
@@ -1487,15 +1485,13 @@ function AutoTraderStrip({
           {state.label}
         </span>
         <span className="font-mono text-[9px] text-[#4b5a72]">
-          {at.config.signalSource === 'kalman-ou'
-            ? `OU·|z|≥${at.config.zEntry}${at.config.requireValidation ? '·wf✓' : ''}`
-            : at.config.signalSource === 'markov'
-              ? `MARKOV·P(up)≥${(at.config.minPUp * 100).toFixed(0)}%`
-              : at.config.signalSource === 'momentum'
-                ? `MOM·ADX≥${at.config.minAdx}`
-                : at.config.signalSource === 'confluence'
-                  ? `CONFLUENCE·14F≥${at.config.minScore}`
-                  : at.config.signalSource === 'chartsignals'
+          {at.config.signalSource === 'cointegration'
+            ? `COINT·|z|≥${at.config.cointegrationZEntry}·HL≤${at.config.cointegrationMaxHalfLife}b`
+            : at.config.signalSource === 'triangulation'
+              ? `TRI·|z|≥${at.config.triangulationZEntry}`
+              : at.config.signalSource === 'adx-pattern-bias'
+                ? `ADX+PAT·composite≥3.5`
+                : at.config.signalSource === 'chartsignals'
                     ? `CHART-SIG·agree≥4`
                     : at.config.signalSource === 'leadlag'
                       ? `LEAD-LAG·4 groups·corr≥0.35`
@@ -1602,7 +1598,7 @@ function EdgeMemoryRow({
       </p>
     )
   }
-  const rows = edges.source === 'screener' ? edges.screenerHeld : edges.held
+  const rows = edges.held
   return (
     <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 font-mono text-[8px]">
       <span className="font-bold uppercase tracking-wider text-[#4b5a72]">edges</span>
@@ -1724,9 +1720,9 @@ function AutoTraderDialog({
         <DialogHeader>
           <DialogTitle className="text-[14px] tracking-wider">AUTO-TRADER</DialogTitle>
           <DialogDescription className="text-[11px] text-[#7c8aa5]">
-            The OS acting as its own trader: takes the strongest signal as 1-bar binary options - composite screener,
-            Kalman/OU mean reversion, Markov regime forecast, ADX momentum, the full 14-factor Confluence Signal
-            engine, or one specific strategy picked from the Strategy Lab / AI Lab catalog. Only ever trades while the
+            The OS acting as its own trader: takes the strongest signal as 1-bar binary options - the chart-type vote
+            engine, intermarket lead-lag, pairs cointegration, FX triangulation, ADX/DI + pattern bias, or one
+            specific strategy picked from the Strategy Lab / AI Lab catalog. Only ever trades while the
             OS is in NO-HUMAN mode. Sentinel + risk limits still govern every order.
           </DialogDescription>
         </DialogHeader>
@@ -1817,13 +1813,11 @@ function AutoTraderDialog({
             <div className="flex overflow-hidden rounded border border-[#1c2739]">
               {(
                 [
-                  ['screener', 'Screener'],
-                  ['kalman-ou', 'Kalman-OU'],
-                  ['markov', 'Markov'],
-                  ['momentum', 'Momentum'],
-                  ['confluence', 'Confluence'],
                   ['chartsignals', 'Chart-signals'],
                   ['leadlag', 'Lead-Lag'],
+                  ['cointegration', 'Cointegration'],
+                  ['triangulation', 'Triangulation'],
+                  ['adx-pattern-bias', 'ADX/DI+Pattern'],
                   ['strategy', 'Strategy'],
                 ] as const
               ).map(([v, label]) => (
@@ -1840,42 +1834,30 @@ function AutoTraderDialog({
               ))}
             </div>
             <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
-              {d.signalSource === 'kalman-ou'
-                ? 'sweeps the universe with the Ornstein-Uhlenbeck + Kalman fit and fades statistically stretched pairs: CALL when price sits |z|σ below the equilibrium, PUT above - only when reversion is significant and the half-life is tradeable'
-                : d.signalSource === 'markov'
-                  ? 'follows the Markov chain state forecast: CALL when P(next move up) clears the threshold, PUT below its mirror - skipped entirely in chop regimes where the transition matrix degenerates'
-                  : d.signalSource === 'momentum'
-                    ? 'trend continuation: CALL when ADX-confirmed strength, a positive rate-of-change and RSI on the bullish side of mid line up, PUT mirrored - skips statistically exhausted extremes'
-                    : d.signalSource === 'confluence'
-                      ? 'the EXACT 14-factor Confluence Signal panel/confluence_read engine, re-fit bar-fresh on each candidate (full Kalman/OU, not the screener sweep\'s cheaper approximation) - identical read to what the panel/copilot would show for that pair right now'
-                      : d.signalSource === 'chartsignals'
-                        ? 'the chart-type vote engine (renko/point-and-figure/range/tick/footprint/Heikin-Ashi/candle, grouped into 5 independent families since renko/range/P&F are the same ATR-threshold signal computed 3 ways) that also feeds the Signal Panel - CALL/PUT follows whichever side a qualifying majority of those families agree on, with a stricter agreement floor than the panel\'s own (≥3 of 5 families, not just 2) as extra margin above the correlated-vote safety floor'
-                        : d.signalSource === 'leadlag'
-                          ? 'intermarket, not technical: sweeps 4 liquidity/macro leader groups (EURUSD→major crosses, XAUUSD→silver/platinum/palladium, BTCUSD→crypto alts, oil→CAD pairs), fitting a rolling cross-correlation between each leader\'s returns and its followers\' returns across lags 0-10 bars, then firing only when the winning lag is both strongly correlated (|corr|≥0.35) AND the leader\'s own move there is itself unusual (|z|≥1) - the "shock ripples outward from the group leader" read, with no signal on ordinary chop'
-                          : d.signalSource === 'strategy'
+              {d.signalSource === 'chartsignals'
+                ? 'the chart-type vote engine (renko/point-and-figure/range/tick/footprint/Heikin-Ashi/candle, grouped into 5 independent families since renko/range/P&F are the same ATR-threshold signal computed 3 ways) that also feeds the Signal Panel - CALL/PUT follows whichever side a qualifying majority of those families agree on, with a stricter agreement floor than the panel\'s own (≥3 of 5 families, not just 2) as extra margin above the correlated-vote safety floor'
+                : d.signalSource === 'leadlag'
+                  ? 'intermarket, not technical: sweeps 4 liquidity/macro leader groups (EURUSD→major crosses, XAUUSD→silver/platinum/palladium, BTCUSD→crypto alts, oil→CAD pairs), fitting a rolling cross-correlation between each leader\'s returns and its followers\' returns across lags 0-10 bars, then firing only when the winning lag is both strongly correlated (|corr|≥0.35) AND the leader\'s own move there is itself unusual (|z|≥1) - the "shock ripples outward from the group leader" read, with no signal on ordinary chop'
+                  : d.signalSource === 'cointegration'
+                    ? 'pairs trading on PRICE LEVELS, not returns: Engle-Granger-fits a rolling hedge ratio between each leader/follower pair (same roster lead-lag uses) and fades the implied spread when it is stretched far enough from its own fitted equilibrium - only when that equilibrium is itself statistically real (R²/t-stat gates) and reverts fast enough to be tradeable (half-life cap)'
+                    : d.signalSource === 'triangulation'
+                      ? 'FX triangular arbitrage: for every closed triangle among open forex pairs, compares the actual cross rate to its synthetic value (the product of the other two legs) and fades the gap when that basis is unusually stretched against its own recent history'
+                      : d.signalSource === 'adx-pattern-bias'
+                        ? 'combines ADX/DI trend strength+direction with recent candlestick pattern bias into one agreement-gated composite - trades only when both reads agree in direction and the composite clears its qualify bar'
+                        : d.signalSource === 'strategy'
                         ? 'one specific strategy picked below, or several combined - as a vote (ENSEMBLE) or an AUTO-LEARN pool that trades whichever member is proven best per pair - the same strategyId an autopilot bot would use (a builtin strategy, or an AI Lab-learned "(Lab)" spec), not pinned to one bot\'s watchlist'
-                        : 'takes the strongest full-composite screener signals market-wide (trend + momentum + statistical + patterns)'}
+                        : ''}
             </p>
           </div>
 
           {/* source-specific thresholds live with the source that uses them */}
-          {d.signalSource === 'kalman-ou' && (
+          {d.signalSource === 'cointegration' && (
             <>
-              <NumField label="OU entry |z| (σ)" value={d.zEntry} onChange={(v) => p({ zEntry: v })} step={0.1} />
-              <NumField label="Max half-life (bars)" value={d.maxHalfLife} onChange={(v) => p({ maxHalfLife: v })} />
-              <div className="col-span-2 flex items-center justify-between rounded border border-[#1c2739] bg-[#101828] px-2.5 py-1.5">
-                <div>
-                  <div className="text-[10px] font-semibold text-[#e2e8f0]">Require walk-forward validation</div>
-                  <div className="text-[8px] leading-snug text-[#4b5a72]">
-                    only trade pairs whose OU edge survives out-of-sample (OOS net +, most folds profitable, ≥25% efficiency) - verdicts cached 1h
-                  </div>
-                </div>
-                <Switch checked={d.requireValidation} onCheckedChange={(v) => p({ requireValidation: v })} />
-              </div>
+              <NumField label="Spread entry |z| (σ)" value={d.cointegrationZEntry} onChange={(v) => p({ cointegrationZEntry: v })} step={0.1} />
+              <NumField label="Max half-life (bars)" value={d.cointegrationMaxHalfLife} onChange={(v) => p({ cointegrationMaxHalfLife: v })} />
             </>
           )}
-          {d.signalSource === 'markov' && <NumField label="Min P(up) threshold" value={d.minPUp} onChange={(v) => p({ minPUp: v })} step={0.01} />}
-          {d.signalSource === 'momentum' && <NumField label="Min ADX (trend strength)" value={d.minAdx} onChange={(v) => p({ minAdx: v })} />}
+          {d.signalSource === 'triangulation' && <NumField label="Basis entry |z| (σ)" value={d.triangulationZEntry} onChange={(v) => p({ triangulationZEntry: v })} step={0.1} />}
           {d.signalSource !== 'strategy' && <NumField label="Min confidence" value={d.minConfidence} onChange={(v) => p({ minConfidence: v })} />}
           {d.signalSource !== 'strategy' && <NumField label="Min |score|" value={d.minScore} onChange={(v) => p({ minScore: v })} />}
 
@@ -2278,7 +2260,7 @@ function AutoTraderDialog({
             <span className="text-[9px] font-bold uppercase tracking-[0.18em] text-cyan-400/80">Protection</span>
             <span className="h-px flex-1 bg-[#1c2739]" />
           </div>
-          {(d.signalSource === 'screener' || d.signalSource === 'strategy') && (
+          {d.signalSource === 'strategy' && (
             <div>
               <NumField
                 label="Pick variety (top-N, random)"

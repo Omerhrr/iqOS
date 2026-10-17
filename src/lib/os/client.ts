@@ -2545,7 +2545,7 @@ export type OsMode = 'human' | 'auto'
 
 export interface AutoTraderConfig {
   enabled: boolean
-  signalSource: 'screener' | 'kalman-ou' | 'markov' | 'momentum' | 'confluence' | 'strategy' | 'chartsignals' | 'leadlag'
+  signalSource: 'cointegration' | 'triangulation' | 'adx-pattern-bias' | 'strategy' | 'chartsignals' | 'leadlag'
   tf: Timeframe
   /** The trade's own expiry, as a timeframe - SEPARATE from `tf` (which
    * candles signals are read from). Unset = old behavior (expiry tracks tf
@@ -2555,11 +2555,9 @@ export interface AutoTraderConfig {
   stake: number
   minScore: number
   minConfidence: number
-  zEntry: number
-  maxHalfLife: number
-  requireValidation: boolean
-  minPUp: number
-  minAdx: number
+  cointegrationZEntry: number
+  cointegrationMaxHalfLife: number
+  triangulationZEntry: number
   /** strategy source: id from the combined Strategy Lab catalog (builtin id,
    * or "custom:<id>" for an AI Lab-learned spec) - same as a bot's strategyId.
    * @deprecated superseded by strategyIds; kept for older saved configs. */

@@ -823,6 +823,11 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
       a.pause()
       a.src = ''
     }
+    try {
+      window.speechSynthesis?.cancel()
+    } catch {
+      /* unavailable */
+    }
     setSpeaking(false)
   }, [])
 
@@ -856,6 +861,34 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
     setTranscribing(false)
   }
 
+  // tier 2 fallback: the browser's own voice (no backend needed at all) -
+  // used whenever /api/tts errors (e.g. the server-side TTS provider has no
+  // credentials configured on this deployment), so "voice off" never happens
+  // silently - either the server voice speaks, or the browser's own does.
+  const speakViaBrowser = useCallback((clean: string, seq: number) => {
+    try {
+      const synth = window.speechSynthesis
+      if (!synth) {
+        if (seq === speakSeqRef.current) {
+          setSpeaking(false)
+          setVoiceHint('voice unavailable - server TTS is not configured and this browser has no built-in speech')
+        }
+        return
+      }
+      synth.cancel()
+      const utter = new SpeechSynthesisUtterance(clean)
+      utter.onend = () => {
+        if (seq === speakSeqRef.current) setSpeaking(false)
+      }
+      utter.onerror = () => {
+        if (seq === speakSeqRef.current) setSpeaking(false)
+      }
+      synth.speak(utter)
+    } catch {
+      if (seq === speakSeqRef.current) setSpeaking(false)
+    }
+  }, [])
+
   const speak = useCallback(
     async (text: string) => {
       const clean = text
@@ -866,6 +899,11 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
         .trim()
       if (!clean) return
       stopSpeak()
+      try {
+        window.speechSynthesis?.cancel()
+      } catch {
+        /* unavailable */
+      }
       const seq = ++speakSeqRef.current
       setSpeaking(true)
       try {
@@ -874,7 +912,10 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ text: clean }),
         })
-        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        if (!res.ok) {
+          const d = (await res.json().catch(() => null)) as { error?: string } | null
+          throw new Error(d?.error || `HTTP ${res.status}`)
+        }
         const blob = await res.blob()
         if (seq !== speakSeqRef.current) return // superseded while generating
         const url = URL.createObjectURL(blob)
@@ -887,14 +928,18 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
         }
         audio.onerror = () => {
           URL.revokeObjectURL(url)
-          setSpeaking(false)
+          if (seq === speakSeqRef.current) speakViaBrowser(clean, seq)
         }
         await audio.play()
-      } catch {
-        if (seq === speakSeqRef.current) setSpeaking(false)
+      } catch (err) {
+        // server TTS unavailable (no provider configured, network error, etc.) -
+        // fall back to the browser's own speech synthesis instead of going silent
+        if (seq !== speakSeqRef.current) return
+        setVoiceHint(`server voice unavailable (${(err as Error).message || 'error'}) - using browser voice`)
+        speakViaBrowser(clean, seq)
       }
     },
-    [stopSpeak]
+    [stopSpeak, speakViaBrowser]
   )
 
   const toggleAutoSpeak = () => {
@@ -1262,7 +1307,8 @@ export default function Copilot({ session = 'default', asset, tf, chartType, ove
         <h3 className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">
           <span className={`h-1.5 w-1.5 rounded-full ${busy ? 'animate-pulse bg-cyan-400 shadow-[0_0_6px_#22d3ee]' : 'bg-cyan-400 shadow-[0_0_6px_#22d3ee]'}`} />
           OS Copilot
-          <span className="rounded bg-[#101828] px-1 py-0.5 text-[8px] font-mono tracking-normal text-cyan-400">v3 · 60 tools</span>
+          {/* keep in sync with TOOLS.length in src/app/api/agent/route.ts - was stale at "60 tools" long after that array grew */}
+          <span className="rounded bg-[#101828] px-1 py-0.5 text-[8px] font-mono tracking-normal text-cyan-400">v3 · 90 tools</span>
         </h3>
         <div className="flex items-center gap-1">
           <FullscreenButton active={full} onToggle={() => setFull((f) => !f)} />
