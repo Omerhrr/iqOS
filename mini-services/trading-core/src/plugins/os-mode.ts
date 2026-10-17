@@ -1061,9 +1061,13 @@ export class ModeService {
    * itself statistically real (r2/t-stat gates) and fast enough to be
    * tradeable (half-life cap) - exactly the cointegration-pairs strategy's
    * own gates, applied market-wide instead of pinned to one bot's pair.
+   * Picks the single BEST fresh qualifier this sweep, ranked the same way
+   * CointegrationPanel/scanCointegration ranks its rows (|z| desc) - not just
+   * the first one hit while walking the leader/follower roster.
    */
   private pickCointegrationSignal(): ScreenRow | null {
     return this.edgeSweep('cointegration', (rec) => {
+      const fresh: Array<{ row: ScreenRow; metric: number }> = []
       try {
         const market = this.ctx.use<MarketDataService>('market')
         const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
@@ -1107,36 +1111,39 @@ export class ModeService {
               rec(asset, key)
               if (this.sweepEdge.gate(key) === 'trade') {
                 const inst = market.assets.find((a) => a.ticker === asset)
-                return {
-                  asset,
-                  name: inst?.name ?? asset,
-                  category: (inst?.category ?? 'forex') as AssetCategory,
-                  otc: inst?.otc ?? asset.endsWith('-OTC'),
-                  tf: this.config.tf,
-                  price: followerCandles[followerCandles.length - 1]?.close ?? 0,
-                  score,
-                  direction: dir,
-                  confidence,
-                  pUp: 0,
-                  pDown: 0,
-                  regime: 'range',
-                  ouZ: 0,
-                  ouHalfLife: 0,
-                  ouMeanReverting: false,
-                  ouTStat: 0,
-                  rsi: 0,
-                  adx: 0,
-                  atrPct: 0,
-                  hurst: 0,
-                  changePct: 0,
-                  payout: this.payoutFor(asset, 'binary'),
-                  topPattern: null,
-                  ts: this.now(),
-                  computedTs: this.now(),
-                  // why NOW: the spread just crossed its entry z-threshold,
-                  // backed by a significant (r2/t-stat-gated) hedge-ratio fit
-                  note: `spread z ${fit.z.toFixed(2)} crossed ±${zEntry.toFixed(2)} vs ${group.leader} (β ${fit.beta.toFixed(3)}, R² ${fit.r2.toFixed(2)}, HL ${fit.halfLifeBars.toFixed(0)}b) → ${dir.toUpperCase()}`,
-                }
+                fresh.push({
+                  metric: Math.abs(fit.z),
+                  row: {
+                    asset,
+                    name: inst?.name ?? asset,
+                    category: (inst?.category ?? 'forex') as AssetCategory,
+                    otc: inst?.otc ?? asset.endsWith('-OTC'),
+                    tf: this.config.tf,
+                    price: followerCandles[followerCandles.length - 1]?.close ?? 0,
+                    score,
+                    direction: dir,
+                    confidence,
+                    pUp: 0,
+                    pDown: 0,
+                    regime: 'range',
+                    ouZ: 0,
+                    ouHalfLife: 0,
+                    ouMeanReverting: false,
+                    ouTStat: 0,
+                    rsi: 0,
+                    adx: 0,
+                    atrPct: 0,
+                    hurst: 0,
+                    changePct: 0,
+                    payout: this.payoutFor(asset, 'binary'),
+                    topPattern: null,
+                    ts: this.now(),
+                    computedTs: this.now(),
+                    // why NOW: the spread just crossed its entry z-threshold,
+                    // backed by a significant (r2/t-stat-gated) hedge-ratio fit
+                    note: `spread z ${fit.z.toFixed(2)} crossed ±${zEntry.toFixed(2)} vs ${group.leader} (β ${fit.beta.toFixed(3)}, R² ${fit.r2.toFixed(2)}, HL ${fit.halfLifeBars.toFixed(0)}b) → ${dir.toUpperCase()}`,
+                  },
+                })
               }
             } catch {
               // thin history/candle fetch failed for this follower - try the next
@@ -1146,7 +1153,12 @@ export class ModeService {
       } catch {
         // market not loaded - no signal source
       }
-      return null
+      // pick the strongest fresh qualifier this sweep (|z| desc), same
+      // ranking scanCointegration/CointegrationPanel use - not just the
+      // first one hit while walking the leader/follower roster.
+      if (!fresh.length) return null
+      fresh.sort((a, b) => b.metric - a.metric)
+      return fresh[0].row
     })
   }
 
@@ -1158,10 +1170,14 @@ export class ModeService {
    * price and its synthetic value (the product of the other two legs,
    * oriented into the cross's own units) when that basis is unusually
    * stretched against its own recent history - the same gates the
-   * triangulation-arb strategy applies, swept market-wide.
+   * triangulation-arb strategy applies, swept market-wide. Picks the single
+   * BEST fresh qualifier this sweep, ranked the same way TriangulationPanel/
+   * scanTriangulation ranks its rows (|z| desc) - not just the first
+   * triangle hit while walking the roster.
    */
   private pickTriangulationSignal(): ScreenRow | null {
     return this.edgeSweep('triangulation', (rec) => {
+      const fresh: Array<{ row: ScreenRow; metric: number }> = []
       try {
         const market = this.ctx.use<MarketDataService>('market')
         const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
@@ -1193,6 +1209,14 @@ export class ModeService {
             rec(asset)
             if (!abCandles || !bcCandles || !acCandles) continue
             if (abCandles.length < TRIANGULATION_WINDOW || bcCandles.length < TRIANGULATION_WINDOW || acCandles.length < TRIANGULATION_WINDOW) continue
+            // fitTriangulation slices the LAST w bars of each series assuming
+            // they're already bar-for-bar index-aligned from the end - three
+            // independently-fetched series can differ in length (gaps/thin
+            // history on one leg), which would silently misalign bars across
+            // legs. Require equal length first - same guard
+            // AnalyticsService.auxByStrategyMap uses before trusting these
+            // legs for the triangulation-arb STRATEGY's own live/backtest path.
+            if (abCandles.length !== bcCandles.length || bcCandles.length !== acCandles.length) continue
             // fitTriangulationFromCandles reads tri.legAB.invert/legBC.invert/
             // cross.invert itself - pass the raw (unoriented) leg candles.
             const fit = fitTriangulationFromCandles(abCandles, bcCandles, acCandles, tri, TRIANGULATION_WINDOW)
@@ -1209,36 +1233,39 @@ export class ModeService {
             rec(asset, key)
             if (this.sweepEdge.gate(key) === 'trade') {
               const inst = market.assets.find((a) => a.ticker === asset)
-              return {
-                asset,
-                name: inst?.name ?? asset,
-                category: 'forex' as AssetCategory,
-                otc: inst?.otc ?? asset.endsWith('-OTC'),
-                tf: this.config.tf,
-                price: acCandles[acCandles.length - 1]?.close ?? 0,
-                score,
-                direction: dir,
-                confidence,
-                pUp: 0,
-                pDown: 0,
-                regime: 'range',
-                ouZ: 0,
-                ouHalfLife: 0,
-                ouMeanReverting: false,
-                ouTStat: 0,
-                rsi: 0,
-                adx: 0,
-                atrPct: 0,
-                hurst: 0,
-                changePct: 0,
-                payout: this.payoutFor(asset, 'binary'),
-                topPattern: null,
-                ts: this.now(),
-                computedTs: this.now(),
-                // why NOW: the basis just crossed its entry z-threshold -
-                // actual vs synthetic diverged enough to fade
-                note: `basis Δ ${fit.deltaPct.toFixed(4)}% (z ${fit.z.toFixed(2)}) crossed ±${zEntry.toFixed(2)} via ${tri.legAB.ticker}×${tri.legBC.ticker} → ${dir === 'put' ? 'rich, fade' : 'cheap, buy'}`,
-              }
+              fresh.push({
+                metric: Math.abs(fit.z),
+                row: {
+                  asset,
+                  name: inst?.name ?? asset,
+                  category: 'forex' as AssetCategory,
+                  otc: inst?.otc ?? asset.endsWith('-OTC'),
+                  tf: this.config.tf,
+                  price: acCandles[acCandles.length - 1]?.close ?? 0,
+                  score,
+                  direction: dir,
+                  confidence,
+                  pUp: 0,
+                  pDown: 0,
+                  regime: 'range',
+                  ouZ: 0,
+                  ouHalfLife: 0,
+                  ouMeanReverting: false,
+                  ouTStat: 0,
+                  rsi: 0,
+                  adx: 0,
+                  atrPct: 0,
+                  hurst: 0,
+                  changePct: 0,
+                  payout: this.payoutFor(asset, 'binary'),
+                  topPattern: null,
+                  ts: this.now(),
+                  computedTs: this.now(),
+                  // why NOW: the basis just crossed its entry z-threshold -
+                  // actual vs synthetic diverged enough to fade
+                  note: `basis Δ ${fit.deltaPct.toFixed(4)}% (z ${fit.z.toFixed(2)}) crossed ±${zEntry.toFixed(2)} via ${tri.legAB.ticker}×${tri.legBC.ticker} → ${dir === 'put' ? 'rich, fade' : 'cheap, buy'}`,
+                },
+              })
             }
           } catch {
             // thin history/candle fetch failed for this triangle - try the next
@@ -1247,7 +1274,11 @@ export class ModeService {
       } catch {
         // market not loaded - no signal source
       }
-      return null
+      // pick the strongest fresh qualifier this sweep (|z| desc), same
+      // ranking scanTriangulation/TriangulationPanel use.
+      if (!fresh.length) return null
+      fresh.sort((a, b) => b.metric - a.metric)
+      return fresh[0].row
     })
   }
 
@@ -1256,10 +1287,13 @@ export class ModeService {
    * combines ADX/+DI/-DI trend strength+direction with recent candlestick
    * pattern bias into one agreement-gated composite (analytics/
    * adxpatternbias.ts), market-wide, same gates the adx-pattern-bias
-   * strategy applies per pair.
+   * strategy applies per pair. Picks the single BEST fresh qualifier this
+   * sweep, ranked the same way AdxPatternBiasPanel/scanAdxPatternBias ranks
+   * its rows (|composite| desc) - not just the first liquid pair hit.
    */
   private pickAdxPatternBiasSignal(): ScreenRow | null {
     return this.edgeSweep('adx-pattern-bias', (rec) => {
+      const fresh: Array<{ row: ScreenRow; metric: number }> = []
       try {
         const market = this.ctx.use<MarketDataService>('market')
         const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
@@ -1284,39 +1318,42 @@ export class ModeService {
             rec(asset, key)
             if (this.sweepEdge.gate(key) === 'trade') {
               const inst = market.assets.find((a) => a.ticker === asset)
-              return {
-                asset,
-                name: inst?.name ?? asset,
-                category: (inst?.category ?? 'forex') as AssetCategory,
-                otc: inst?.otc ?? asset.endsWith('-OTC'),
-                tf: this.config.tf,
-                price: candles[candles.length - 1]?.close ?? 0,
-                score,
-                direction: dir,
-                confidence,
-                pUp: 0,
-                pDown: 0,
-                regime: 'range',
-                ouZ: 0,
-                ouHalfLife: 0,
-                ouMeanReverting: false,
-                ouTStat: 0,
-                rsi: 0,
-                adx: fit.adx,
-                atrPct: 0,
-                hurst: 0,
-                changePct: 0,
-                payout: this.payoutFor(asset, 'binary'),
-                // fit.topPattern is a bare pattern-name string here, not the
-                // {name, direction, reliability} ScreenRow.topPattern shape -
-                // the full pattern object isn't surfaced by this source.
-                topPattern: null,
-                ts: this.now(),
-                computedTs: this.now(),
-                // why NOW: ADX/DI direction and pattern bias just agreed and
-                // crossed the composite qualify bar together
-                note: `ADX ${fit.adx.toFixed(0)} (${fit.adxDirection}) agrees with pattern bias ${fit.patternBias.toFixed(1)}${fit.topPattern ? ` (${fit.topPattern})` : ''} - composite ${fit.composite.toFixed(1)} crossed ±${COMPOSITE_QUALIFY}`,
-              }
+              fresh.push({
+                metric: Math.abs(fit.composite),
+                row: {
+                  asset,
+                  name: inst?.name ?? asset,
+                  category: (inst?.category ?? 'forex') as AssetCategory,
+                  otc: inst?.otc ?? asset.endsWith('-OTC'),
+                  tf: this.config.tf,
+                  price: candles[candles.length - 1]?.close ?? 0,
+                  score,
+                  direction: dir,
+                  confidence,
+                  pUp: 0,
+                  pDown: 0,
+                  regime: 'range',
+                  ouZ: 0,
+                  ouHalfLife: 0,
+                  ouMeanReverting: false,
+                  ouTStat: 0,
+                  rsi: 0,
+                  adx: fit.adx,
+                  atrPct: 0,
+                  hurst: 0,
+                  changePct: 0,
+                  payout: this.payoutFor(asset, 'binary'),
+                  // fit.topPattern is a bare pattern-name string here, not the
+                  // {name, direction, reliability} ScreenRow.topPattern shape -
+                  // the full pattern object isn't surfaced by this source.
+                  topPattern: null,
+                  ts: this.now(),
+                  computedTs: this.now(),
+                  // why NOW: ADX/DI direction and pattern bias just agreed and
+                  // crossed the composite qualify bar together
+                  note: `ADX ${fit.adx.toFixed(0)} (${fit.adxDirection}) agrees with pattern bias ${fit.patternBias.toFixed(1)}${fit.topPattern ? ` (${fit.topPattern})` : ''} - composite ${fit.composite.toFixed(1)} crossed ±${COMPOSITE_QUALIFY}`,
+                },
+              })
             }
           } catch {
             // thin history for this pair - try the next
@@ -1325,7 +1362,11 @@ export class ModeService {
       } catch {
         // market not loaded - no signal source
       }
-      return null
+      // pick the strongest fresh qualifier this sweep (|composite| desc),
+      // same ranking scanAdxPatternBias/AdxPatternBiasPanel use.
+      if (!fresh.length) return null
+      fresh.sort((a, b) => b.metric - a.metric)
+      return fresh[0].row
     })
   }
 
@@ -1340,10 +1381,14 @@ export class ModeService {
    * since pickSignal() runs once per tick with no await) rather than scan()
    * - the scanner already proactively rescans on bar close for any kind:tf
    * combo a consumer has recently asked for, so peek() warms its own cache
-   * within one or two ticks and the picker never blocks on it.
+   * within one or two ticks and the picker never blocks on it. Picks the
+   * single BEST fresh qualifier this sweep, ranked the same way
+   * ChartSignalsPanel's default sort does (strength desc, then agree-count
+   * desc) - not just the first liquid pair hit.
    */
   private pickChartSignalsSignal(): ScreenRow | null {
     return this.edgeSweep('chartsignals', (rec) => {
+      const fresh: Array<{ row: ScreenRow; strength: number; agree: number }> = []
       try {
         const chartSignals = this.ctx.use<ChartSignalsService>('chartSignals')
         const market = this.ctx.use<MarketDataService>('market')
@@ -1370,41 +1415,50 @@ export class ModeService {
           const key = SweepEdgeMemory.key(asset, s.direction)
           rec(asset, key)
           if (this.sweepEdge.gate(key) === 'trade')
-            return {
-              asset,
-              name: s.name,
-              category: s.category as AssetCategory,
-              otc: s.otc,
-              tf: this.config.tf,
-              price: s.price,
-              score,
-              direction: s.direction,
-              confidence,
-              pUp: 0,
-              pDown: 0,
-              regime: 'range',
-              ouZ: 0,
-              ouHalfLife: 0,
-              ouMeanReverting: false,
-              ouTStat: 0,
-              rsi: 0,
-              adx: 0,
-              atrPct: 0,
-              hurst: 0,
-              changePct: 0,
-              payout: this.payoutFor(asset, 'binary'),
-              topPattern: null,
-              ts: s.ts,
-              computedTs: s.ts,
-              // why NOW: the vote engine's agreement just crossed this
-              // source's safety-margin bar for this candidate
-              note: `${s.agree}/${s.total} independent chart methodologies agree (${s.direction.toUpperCase()}), strength ${s.strength.toFixed(0)}`,
-            }
+            fresh.push({
+              strength: s.strength,
+              agree: s.agree,
+              row: {
+                asset,
+                name: s.name,
+                category: s.category as AssetCategory,
+                otc: s.otc,
+                tf: this.config.tf,
+                price: s.price,
+                score,
+                direction: s.direction,
+                confidence,
+                pUp: 0,
+                pDown: 0,
+                regime: 'range',
+                ouZ: 0,
+                ouHalfLife: 0,
+                ouMeanReverting: false,
+                ouTStat: 0,
+                rsi: 0,
+                adx: 0,
+                atrPct: 0,
+                hurst: 0,
+                changePct: 0,
+                payout: this.payoutFor(asset, 'binary'),
+                topPattern: null,
+                ts: s.ts,
+                computedTs: s.ts,
+                // why NOW: the vote engine's agreement just crossed this
+                // source's safety-margin bar for this candidate
+                note: `${s.agree}/${s.total} independent chart methodologies agree (${s.direction.toUpperCase()}), strength ${s.strength.toFixed(0)}`,
+              },
+            })
         }
       } catch {
         // chartSignals/market not loaded - no signal source
       }
-      return null
+      // pick the strongest fresh qualifier this sweep: strength desc, then
+      // agree-count desc - the exact tie-break ChartSignalsPanel's own
+      // default sort uses.
+      if (!fresh.length) return null
+      fresh.sort((a, b) => b.strength - a.strength || b.agree - a.agree)
+      return fresh[0].row
     })
   }
 
@@ -1425,11 +1479,15 @@ export class ModeService {
    * generally correlated". Groups are tried in LEADLAG_GROUPS order, and
    * within a group followers are tried in listed order - the first
    * candidate whose fit clears every gate AND whose sweep-edge key is a
-   * fresh edge wins; a leader with no tradeable feed right now, or one
-   * whose fit never clears, simply falls through to the next group.
+   * fresh edge is collected; a leader with no tradeable feed right now, or
+   * one whose fit never clears, simply contributes nothing. Among every
+   * fresh qualifier found this sweep, picks the single BEST one by |corr|
+   * desc - the same ranking leadlagscan.ts/LeadLagPanel use - not just
+   * whichever group/follower happened to be walked first.
    */
   private pickLeadLagSignal(): ScreenRow | null {
     return this.edgeSweep('leadlag', (rec) => {
+      const fresh: Array<{ row: ScreenRow; metric: number }> = []
       try {
         const market = this.ctx.use<MarketDataService>('market')
         const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
@@ -1474,38 +1532,41 @@ export class ModeService {
               rec(asset, key)
               if (this.sweepEdge.gate(key) === 'trade') {
                 const inst = market.assets.find((a) => a.ticker === asset)
-                return {
-                  asset,
-                  name: inst?.name ?? asset,
-                  category: (inst?.category ?? 'forex') as AssetCategory,
-                  otc: inst?.otc ?? asset.endsWith('-OTC'),
-                  tf: this.config.tf,
-                  price: followerCandles[followerCandles.length - 1]?.close ?? 0,
-                  score,
-                  direction: dir,
-                  confidence,
-                  pUp: 0,
-                  pDown: 0,
-                  regime: 'range',
-                  ouZ: 0,
-                  ouHalfLife: 0,
-                  ouMeanReverting: false,
-                  ouTStat: 0,
-                  rsi: 0,
-                  adx: 0,
-                  atrPct: 0,
-                  hurst: 0,
-                  changePct: 0,
-                  payout: this.payoutFor(asset, 'binary'),
-                  topPattern: null,
-                  ts: this.now(),
-                  computedTs: this.now(),
-                  // why NOW: the leader's own move (the trigger) was unusual
-                  // enough, and the fitted lag/correlation says this
-                  // follower should echo it in this direction - both bars
-                  // just cleared, together
-                  note: `${group.leader} moved ${(signal.triggerReturn * 100).toFixed(2)}% (z ${signal.triggerZ.toFixed(1)}) ${fit.lag} bar${fit.lag === 1 ? '' : 's'} ago · corr ${fit.correlation.toFixed(2)} at lag ${fit.lag} → ${dir.toUpperCase()}`,
-                }
+                fresh.push({
+                  metric: Math.abs(fit.correlation),
+                  row: {
+                    asset,
+                    name: inst?.name ?? asset,
+                    category: (inst?.category ?? 'forex') as AssetCategory,
+                    otc: inst?.otc ?? asset.endsWith('-OTC'),
+                    tf: this.config.tf,
+                    price: followerCandles[followerCandles.length - 1]?.close ?? 0,
+                    score,
+                    direction: dir,
+                    confidence,
+                    pUp: 0,
+                    pDown: 0,
+                    regime: 'range',
+                    ouZ: 0,
+                    ouHalfLife: 0,
+                    ouMeanReverting: false,
+                    ouTStat: 0,
+                    rsi: 0,
+                    adx: 0,
+                    atrPct: 0,
+                    hurst: 0,
+                    changePct: 0,
+                    payout: this.payoutFor(asset, 'binary'),
+                    topPattern: null,
+                    ts: this.now(),
+                    computedTs: this.now(),
+                    // why NOW: the leader's own move (the trigger) was unusual
+                    // enough, and the fitted lag/correlation says this
+                    // follower should echo it in this direction - both bars
+                    // just cleared, together
+                    note: `${group.leader} moved ${(signal.triggerReturn * 100).toFixed(2)}% (z ${signal.triggerZ.toFixed(1)}) ${fit.lag} bar${fit.lag === 1 ? '' : 's'} ago · corr ${fit.correlation.toFixed(2)} at lag ${fit.lag} → ${dir.toUpperCase()}`,
+                  },
+                })
               }
             } catch {
               // thin history/candle fetch failed for this follower - try the next
@@ -1515,7 +1576,11 @@ export class ModeService {
       } catch {
         // market service not loaded - no signal source
       }
-      return null
+      // pick the strongest fresh qualifier this sweep (|correlation| desc),
+      // same ranking leadlagscan.ts/LeadLagPanel use.
+      if (!fresh.length) return null
+      fresh.sort((a, b) => b.metric - a.metric)
+      return fresh[0].row
     })
   }
 
@@ -2237,7 +2302,7 @@ export class ModeService {
                 : this.config.signalSource === 'chartsignals'
                   ? 'chartsignals-vote'
                   : this.config.signalSource === 'leadlag'
-                    ? 'eurusd-leadlag'
+                    ? 'leadlag-echo'
                     : this.config.signalSource === 'strategy'
                     ? (row.strategyLabel ??
                       (() => {
@@ -2296,7 +2361,7 @@ export class ModeService {
       case 'chartsignals':
         return 'chartsignals-vote'
       case 'leadlag':
-        return 'eurusd-leadlag'
+        return 'leadlag-echo'
       default:
         return null
     }
@@ -2315,7 +2380,13 @@ export class ModeService {
     const ids = (this.config.strategyIds ?? []).filter((x) => typeof x === 'string' && x.trim())
     if (dirIds.length) return Array.from(new Set([...dirIds, ...ids]))
     if (ids.length) return ids
-    return [String(this.config.signalSource ?? 'confluence')]
+    // fixed (non-'strategy') sources: the OTC guard mints verdicts under the
+    // real STRATEGY id (fixedStrategyLabel - e.g. 'cointegration-pairs', not
+    // the raw signalSource literal 'cointegration'), same id place()'s own
+    // strategy: switch tags the order with - using the raw signalSource here
+    // would look up a key /otc_defense_run never writes a verdict under,
+    // silently failing OTC-enforce for every fixed source.
+    return [this.fixedStrategyLabel() ?? String(this.config.signalSource)]
   }
 
   private isBenched(key: string): boolean {
