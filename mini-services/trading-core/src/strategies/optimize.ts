@@ -4,7 +4,7 @@
 // backtester so the numbers the user acts on match the Single-run lab exactly.
 import type { BacktestResult, BacktestTrade, Candle, StrategyDef, Timeframe } from '../types'
 import { defaultParams } from './builtin'
-import { backtest, directionBreakdown, resolveStrategyDef, type DirectionMetrics } from './backtest'
+import { backtest, directionBreakdown, resolveStrategyDef, sliceAuxByStrategy, sliceAuxByStrategyRange, type DirectionMetrics } from './backtest'
 import type { CustomSpec } from './custom'
 import { sharpeRatio } from '../analytics/quant'
 import { leadersFor } from '../analytics/leadlag'
@@ -321,6 +321,9 @@ export function fastBacktest(
     // triangulation-arb's second leg (B/C) - same alignment contract as
     // leaderCandles above, which carries leg A/B for that strategy.
     leaderCandles2?: Candle[]
+    // For a custom:<id> spec whose signals embed a builtin member needing
+    // its own aux series - see BacktestOptions.auxByStrategy's doc.
+    auxByStrategy?: Record<string, { leaderCandles?: Candle[]; leaderCandles2?: Candle[] }>
   } = {}
 ): FastMetrics {
   const strat = resolveStrategyDef(strategyId, opts.customSpec)
@@ -345,6 +348,7 @@ export function fastBacktest(
     asset: opts.asset,
     ...(alignedLeader ? { leaderCandles: alignedLeader.slice(0, i + 1) } : {}),
     ...(alignedLeader2 ? { leaderCandles2: alignedLeader2.slice(0, i + 1) } : {}),
+    ...(opts.auxByStrategy ? { auxByStrategy: sliceAuxByStrategy(opts.auxByStrategy, i) } : {}),
   })
 
   const trades: BacktestTrade[] = []
@@ -542,6 +546,12 @@ export interface GridSearchOptions {
   // triangulation-arb's second leg (B/C) - same alignment contract as
   // leaderCandles above, which carries leg A/B for that strategy.
   leaderCandles2?: Candle[]
+  // For a custom:<id> spec whose signals embed a builtin member needing its
+  // own aux series - see BacktestOptions.auxByStrategy's doc. Caller (e.g.
+  // index.ts's /optimize handler) fetches it once for the full `candles`
+  // array; gridSearch/walkForward slice it per fold the same way they slice
+  // leaderCandles.
+  auxByStrategy?: Record<string, { leaderCandles?: Candle[]; leaderCandles2?: Candle[] }>
 }
 
 export function gridSearch(candles: Candle[], asset: string, tf: Timeframe, opts: GridSearchOptions): GridSearchResult {
@@ -568,6 +578,7 @@ export function gridSearch(candles: Candle[], asset: string, tf: Timeframe, opts
     asset,
     leaderCandles,
     leaderCandles2,
+    auxByStrategy: opts.auxByStrategy,
   }
   const sweptKeys = Object.keys(opts.sweep).filter((k) => strat.params.some((p) => p.key === k))
   // Base every combo on the strategy's registered defaults, then let any
@@ -633,6 +644,7 @@ export function gridSearch(candles: Candle[], asset: string, tf: Timeframe, opts
           edgeTrigger: opts.edgeTrigger,
           leaderCandles,
           leaderCandles2,
+          auxByStrategy: opts.auxByStrategy,
         })
         const [fciLow, fciHigh] = wilsonInterval(full.metrics.wins, full.metrics.totalTrades)
         const fm: FastMetrics = {
@@ -773,8 +785,16 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
     // leaderCandles length) passes and index i means the same bar in both.
     const isLeaderSlice = leaderCandles ? leaderCandles.slice(isStart, isStart + isBars) : undefined
     const isLeaderSlice2 = leaderCandles2 ? leaderCandles2.slice(isStart, isStart + isBars) : undefined
+    const isAuxByStrategy = opts.auxByStrategy ? sliceAuxByStrategyRange(opts.auxByStrategy, isStart, isStart + isBars) : undefined
     for (const combo of combos) {
-      const m = fastBacktest(isSlice, strat.id, combo, { ...common, warmup: isWarmup, startEquity: 1000, leaderCandles: isLeaderSlice, leaderCandles2: isLeaderSlice2 })
+      const m = fastBacktest(isSlice, strat.id, combo, {
+        ...common,
+        warmup: isWarmup,
+        startEquity: 1000,
+        leaderCandles: isLeaderSlice,
+        leaderCandles2: isLeaderSlice2,
+        auxByStrategy: isAuxByStrategy,
+      })
       const s = scoreOf(m, objective, minTrades)
       if (Number.isFinite(s) && s > bestScore) {
         bestScore = s
@@ -801,6 +821,7 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
     // (including its own warmup prefix, matching the main candles slice).
     const oosLeaderSlice = leaderCandles ? leaderCandles.slice(oosSliceStart, oosEnd) : undefined
     const oosLeaderSlice2 = leaderCandles2 ? leaderCandles2.slice(oosSliceStart, oosEnd) : undefined
+    const oosAuxByStrategy = opts.auxByStrategy ? sliceAuxByStrategyRange(opts.auxByStrategy, oosSliceStart, oosEnd) : undefined
     const oosFull = backtest(candles.slice(oosSliceStart, oosEnd), asset, tf, {
       strategy: strat.id,
       params: bestCombo,
@@ -817,6 +838,7 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
       direction: opts.direction,
       leaderCandles: oosLeaderSlice,
       leaderCandles2: oosLeaderSlice2,
+      auxByStrategy: oosAuxByStrategy,
     })
     const [oosCiLow, oosCiHigh] = wilsonInterval(oosFull.metrics.wins, oosFull.metrics.totalTrades)
     const oosM: FastMetrics = {
@@ -949,6 +971,45 @@ export interface AssetSweepOptions {
   allForexTickers?: string[]
 }
 
+/** sweepAssets' own equivalent of AnalyticsService.auxByStrategyMap - for a
+ * custom:<id> spec whose signals embed a builtin member needing a second
+ * series, fetched per-row via the caller's own fetchCandles (sweepAssets has
+ * no market access of its own). Called only when opts.customSpec is set. */
+function auxByStrategyForRow(
+  ticker: string,
+  fetchCandles: CandleFetcher,
+  allForexTickers: string[],
+  windowFilter: (c: Candle[]) => Candle[],
+  expectedLength: number
+): Record<string, { leaderCandles?: Candle[]; leaderCandles2?: Candle[] }> {
+  const map: Record<string, { leaderCandles?: Candle[]; leaderCandles2?: Candle[] }> = {}
+  try {
+    const leaders = leadersFor(ticker)
+    if (leaders.length > 0) {
+      const lc = windowFilter(fetchCandles(leaders[0]))
+      if (lc.length === expectedLength) {
+        map['leadlag-echo'] = { leaderCandles: lc }
+        map['cointegration-pairs'] = { leaderCandles: lc }
+      }
+    }
+  } catch {
+    /* leader history unavailable for this row - those members stand aside */
+  }
+  try {
+    const legs = legsForCross(ticker, allForexTickers)
+    if (legs) {
+      const ab = windowFilter(fetchCandles(legs.legAB.ticker))
+      const bc = windowFilter(fetchCandles(legs.legBC.ticker))
+      if (ab.length === expectedLength && bc.length === expectedLength) {
+        map['triangulation-arb'] = { leaderCandles: orientCandles(ab, legs.legAB.invert), leaderCandles2: orientCandles(bc, legs.legBC.invert) }
+      }
+    }
+  } catch {
+    /* triangle leg history unavailable for this row - that member stands aside */
+  }
+  return map
+}
+
 export interface CandleFetcher {
   (asset: string): Candle[]
 }
@@ -1040,6 +1101,19 @@ export function sweepAssets(
           }
         }
       }
+      // A custom:<id> spec's signals can embed a builtin member needing its
+      // own aux series one level down (see sliceAuxByStrategy/auxByStrategy's
+      // doc) - computed per-row here the same way leaderCandles/
+      // leaderCandles2 are above for a top-level builtin strategy.
+      const auxByStrategy = opts.customSpec
+        ? auxByStrategyForRow(
+            a.ticker,
+            fetchCandles,
+            opts.allForexTickers ?? [],
+            (cs) => (sharedWindow && winStart < winEnd ? cs.filter((c) => c.time >= winStart && c.time <= winEnd) : cs),
+            candles.length
+          )
+        : undefined
       // Per-asset real payout by default (each instrument's own broker payout,
       // as reported live by the connected IQ account or curated in the
       // catalog) - a single flat payout across every asset made "rank assets
@@ -1061,6 +1135,7 @@ export function sweepAssets(
         edgeTrigger: opts.edgeTrigger,
         leaderCandles,
         leaderCandles2,
+        auxByStrategy,
       })
       const score = scoreOf(m, objective, minTrades)
       let liveDataPct: number | null = null

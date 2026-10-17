@@ -424,9 +424,16 @@ export interface EvalCtx {
    * asset the otcv* series honestly stays NaN (no candle-derived fallback:
    * tick velocity is the one thing OHLC bars cannot approximate). */
   asset?: string
+  /** Per-builtin-strategy auxiliary series, keyed by strategy id - feeds a
+   * 'builtin' signal (a registry strategy embedded as a member of this
+   * custom spec) that itself needs a second series: lead-lag-echo and
+   * cointegration-pairs need their group leader's candles, triangulation-
+   * arb needs its two FX triangle legs. Absent entries mean that member
+   * honestly stands aside, same as when it's evaluated standalone. */
+  auxByStrategy?: Record<string, { leaderCandles?: Candle[]; leaderCandles2?: Candle[] }>
 }
 
-export function buildCtx(candles: Candle[], asset?: string): EvalCtx {
+export function buildCtx(candles: Candle[], asset?: string, auxByStrategy?: EvalCtx['auxByStrategy']): EvalCtx {
   const n = candles.length
   const close = candles.map((k) => k.close)
   const high = candles.map((k) => k.high)
@@ -442,7 +449,7 @@ export function buildCtx(candles: Candle[], asset?: string): EvalCtx {
   if (n >= 13) {
     for (const hit of detectPatterns(candles, 1)) hits.set(hit.name.toLowerCase(), hit.direction)
   }
-  return { candles, n, asset, close, high, low, open, atr, ha, haColor, body, range, volume, hits }
+  return { candles, n, asset, close, high, low, open, atr, ha, haColor, body, range, volume, hits, auxByStrategy }
 }
 
 /** ATR-normalized rolling z-score of an arbitrary raw series - used to turn
@@ -1309,11 +1316,25 @@ export function prepareSignal(s: SignalDef, ctx: EvalCtx): (i: number) => boolea
       // counts this DSL allows (16 top-level, 8 per group) but genuinely
       // O(n) per bar, so this only ever activates for bars that have
       // enough history for the strategy to warm up.
+      // lead-lag-echo/cointegration-pairs/triangulation-arb need a second
+      // (or third) series of their own - ctx.auxByStrategy carries it,
+      // keyed by this exact strategy id, fetched by whoever built ctx
+      // (plugins/analytics.ts / lab.ts). Absent for every other builtin id,
+      // and absent here too if the caller didn't supply it - the member
+      // then honestly reads "no leader/legs" the same way it would standalone.
+      const aux = ctx.auxByStrategy?.[s.id]
       return (i: number) => {
         if (i < 30) return false
-        // the asset hint rides along so tick-driven builtins (OTC velocity
-        // footprint) read the right micro-tick buffer per bar
-        const ev = strat.evaluate(ctx.candles.slice(0, i + 1), params, { asset: ctx.asset })
+        // sliced to this bar so a nested lead-lag/triangulation member never
+        // sees its aux series' future relative to where this per-bar replay
+        // currently stands - same no-lookahead rule backtest.ts's hintsAt
+        // applies to the top-level case.
+        const hints = {
+          asset: ctx.asset,
+          ...(aux?.leaderCandles ? { leaderCandles: aux.leaderCandles.slice(0, i + 1) } : {}),
+          ...(aux?.leaderCandles2 ? { leaderCandles2: aux.leaderCandles2.slice(0, i + 1) } : {}),
+        }
+        const ev = strat.evaluate(ctx.candles.slice(0, i + 1), params, hints)
         return ev.direction === s.dir
       }
     }
@@ -1384,9 +1405,9 @@ export function evaluateCustomAt(spec: CustomSpec, ctx: EvalCtx, i = ctx.n - 1):
  * The spec's basis decides what the signals read (raw OHLC or the HA transform);
  * the caller keeps feeding RAW candles either way. `asset` rides along when
  * known so tick-driven signals (OTC velocity family) can read their buffer. */
-export function evaluateCustom(spec: CustomSpec, candles: Candle[], asset?: string): CustomEval {
+export function evaluateCustom(spec: CustomSpec, candles: Candle[], asset?: string, auxByStrategy?: EvalCtx['auxByStrategy']): CustomEval {
   if (candles.length < 25) return { direction: 'none', score: 0, notes: 'warming up (need >=25 bars)', active: [] }
-  const ctx = buildCtx(basisCandles(spec, candles), asset)
+  const ctx = buildCtx(basisCandles(spec, candles), asset, auxByStrategy)
   const out = evaluateCustomAt(spec, ctx)
   const names = out.active.filter((a) => a.dir === out.direction).map((a) => `${a.label} (${a.weight})`)
   if (out.direction === 'none') {

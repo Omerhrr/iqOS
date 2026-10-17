@@ -28,12 +28,52 @@ export function resolveStrategyDef(id: string, customSpec?: CustomSpec): Strateg
       name: customSpec.name ?? id,
       description: 'Custom AI Lab strategy',
       params: [],
-      evaluate: (candles) => evaluateCustom(customSpec, candles),
+      // hints rides through to evaluateCustom so a 'builtin' member nested
+      // inside this spec (strategies/custom.ts's prepareSignal 'builtin'
+      // case) gets its own leader/leg aux series via hints.auxByStrategy,
+      // the same way the top-level leaderCandles/leaderCandles2 feed a
+      // top-level lead-lag/cointegration/triangulation strategy.
+      evaluate: (candles, _params, hints) => evaluateCustom(customSpec, candles, hints?.asset, hints?.auxByStrategy),
     }
   }
   const strat = getStrategy(id)
   if (!strat) throw new Error(`Unknown strategy: ${id}`)
   return strat
+}
+
+/** Slices every entry of an auxByStrategy map to bar `i` (inclusive) - same
+ * no-lookahead rule as leaderCandles.slice(0, i + 1) above, just applied per
+ * entry since the map can hold more than one builtin member's aux series. */
+export function sliceAuxByStrategy(
+  map: Record<string, { leaderCandles?: Candle[]; leaderCandles2?: Candle[] }>,
+  i: number
+): Record<string, { leaderCandles?: Candle[]; leaderCandles2?: Candle[] }> {
+  const out: Record<string, { leaderCandles?: Candle[]; leaderCandles2?: Candle[] }> = {}
+  for (const [id, aux] of Object.entries(map)) {
+    out[id] = {
+      ...(aux.leaderCandles ? { leaderCandles: aux.leaderCandles.slice(0, i + 1) } : {}),
+      ...(aux.leaderCandles2 ? { leaderCandles2: aux.leaderCandles2.slice(0, i + 1) } : {}),
+    }
+  }
+  return out
+}
+
+/** Same idea as sliceAuxByStrategy, but slices every entry to an arbitrary
+ * [start, end) range instead of a 0-based prefix - used by walkForward's
+ * per-fold IS/OOS windows, which slice leaderCandles the same way. */
+export function sliceAuxByStrategyRange(
+  map: Record<string, { leaderCandles?: Candle[]; leaderCandles2?: Candle[] }>,
+  start: number,
+  end: number
+): Record<string, { leaderCandles?: Candle[]; leaderCandles2?: Candle[] }> {
+  const out: Record<string, { leaderCandles?: Candle[]; leaderCandles2?: Candle[] }> = {}
+  for (const [id, aux] of Object.entries(map)) {
+    out[id] = {
+      ...(aux.leaderCandles ? { leaderCandles: aux.leaderCandles.slice(start, end) } : {}),
+      ...(aux.leaderCandles2 ? { leaderCandles2: aux.leaderCandles2.slice(start, end) } : {}),
+    }
+  }
+  return out
 }
 
 export interface DirectionMetrics {
@@ -124,6 +164,12 @@ export interface BacktestOptions {
   // triangulation-arb's second leg (B/C) - same alignment rule as
   // leaderCandles above, which carries leg A/B for that strategy.
   leaderCandles2?: Candle[]
+  // For a custom:<id> spec ONLY, whose signals embed a builtin strategy
+  // (strategies/custom.ts's 'builtin' signal kind) that itself needs
+  // leaderCandles/leaderCandles2 - keyed by that builtin's strategy id,
+  // fetched by the same caller that fetches leaderCandles above (see
+  // StrategyHints.auxByStrategy's doc). Ignored for every other spec.
+  auxByStrategy?: Record<string, { leaderCandles?: Candle[]; leaderCandles2?: Candle[] }>
   // Manually force which side(s) are taken, instead of the default "take
   // whatever the strategy signals and report both sides blended". 'call'/
   // 'put' skip bars where the strategy signals the other direction (as if
@@ -193,6 +239,7 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
     asset,
     ...(opts.leaderCandles ? { leaderCandles: opts.leaderCandles.slice(0, i + 1) } : {}),
     ...(opts.leaderCandles2 ? { leaderCandles2: opts.leaderCandles2.slice(0, i + 1) } : {}),
+    ...(opts.auxByStrategy ? { auxByStrategy: sliceAuxByStrategy(opts.auxByStrategy, i) } : {}),
   })
 
   const trades: BacktestTrade[] = []

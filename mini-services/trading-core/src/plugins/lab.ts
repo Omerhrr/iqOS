@@ -853,10 +853,19 @@ export class StrategyLabService {
     if (!spec) throw new Error(`lab strategy ${id} has no usable signals`)
     const candles = this.market.getCandlesDeep(asset, tf, 1500, true) // Task 59: closedOnly
     if (candles.length < 25) throw new Error('not enough candle history yet')
+    // A learned spec's signals can embed a builtin strategy (strategies/
+    // custom.ts's 'builtin' signal kind) that itself needs a second series -
+    // lead-lag-echo/cointegration-pairs' group leader, triangulation-arb's
+    // two legs. Same lookup plugins/analytics.ts's runBacktest uses for a
+    // custom spec, reused here via the shared AnalyticsService instance so
+    // this LIVE path (bots + manual eval) doesn't silently diverge from the
+    // Backtest Lab's numbers for the same spec.
+    const analytics = this.ctx.use<{ auxByStrategyMap: (asset: string, tf: Timeframe, limit: number, expectedLength: number) => Record<string, { leaderCandles?: Candle[]; leaderCandles2?: Candle[] }> }>('analytics')
+    const auxByStrategy = analytics.auxByStrategyMap(asset, tf, 1500, candles.length)
     // Edge wrapper (same as builtin runStrategy): learned specs stay pure
     // level reads; the transition vs the previous closed bar rides along so
     // bots/the auto-trader gate on fresh edges, not on stale ones.
-    const ev = evalWithEdge((cs) => evaluateCustom(spec, cs, asset), candles)
+    const ev = evalWithEdge((cs) => evaluateCustom(spec, cs, asset, auxByStrategy), candles)
     return { ...ev, asset, tf, strategy: id, price: candles[candles.length - 1].close, barTs: candles[candles.length - 1].time }
   }
 }

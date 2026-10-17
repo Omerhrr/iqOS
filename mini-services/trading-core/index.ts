@@ -2678,10 +2678,15 @@ const httpServer = createServer(async (req, res) => {
               }
             }
           }
+          // A custom:<id> spec's signals can embed a builtin member needing
+          // its own aux series one level down - the same lookup
+          // plugins/analytics.ts's runBacktest uses for a custom backtest.
+          const optAuxByStrategy = strategyId.startsWith('custom:') ? analytics.auxByStrategyMap(optAsset, optTf, 2200, optCandles.length) : undefined
           const out = gridSearch(optCandles, optAsset, optTf, {
             strategy: strategyId,
             leaderCandles: optLeaderCandles,
             leaderCandles2: optLeaderCandles2,
+            auxByStrategy: optAuxByStrategy,
             sweep: (body.sweep as Record<string, { from: number; to: number; step: number }>) ?? {},
             fixedParams: (body.params as Record<string, number | string>) ?? {},
             objective: (body.objective as Objective) ?? 'netPnl',
@@ -2748,10 +2753,13 @@ const httpServer = createServer(async (req, res) => {
             }
           }
         }
+        // Same custom-spec aux lookup as /optimize.
+        const wfAuxByStrategy = strategyId.startsWith('custom:') ? analytics.auxByStrategyMap(wfAsset, wfTf, 2200, wfCandles.length) : undefined
         const out = walkForward(wfCandles, wfAsset, wfTf, {
           strategy: strategyId,
           leaderCandles: wfLeaderCandles,
           leaderCandles2: wfLeaderCandles2,
+          auxByStrategy: wfAuxByStrategy,
           sweep: (body.sweep as Record<string, { from: number; to: number; step: number }>) ?? {},
           fixedParams: (body.params as Record<string, number | string>) ?? {},
           objective: (body.objective as Objective) ?? 'netPnl',
@@ -2876,7 +2884,12 @@ const httpServer = createServer(async (req, res) => {
             edgeTrigger: Boolean(body.edgeTrigger),
             // triangulation-arb only: the full FX universe so legsForCross can
             // find a triangle leg pair outside the swept rows themselves.
-            allForexTickers: sweepStrategyId === 'triangulation-arb' ? market.assets.filter((a) => a.category === 'forex').map((a) => a.ticker) : undefined,
+            // Needed for triangulation-arb itself, AND for a custom:<id>
+            // spec whose signals might embed it as a 'builtin' member.
+            allForexTickers:
+              sweepStrategyId === 'triangulation-arb' || sweepStrategyId.startsWith('custom:')
+                ? market.assets.filter((a) => a.category === 'forex').map((a) => a.ticker)
+                : undefined,
           }
         )
         return json(200, { ok: true, result: out })

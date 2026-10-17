@@ -419,6 +419,15 @@ export interface StrategyHints {
    * cross side of a known FX triangle, or either leg's history couldn't be
    * fetched - the strategy stands aside honestly rather than guess. */
   leaderCandles2?: Candle[]
+  /** For a custom/ensemble spec only: per-builtin-strategy aux series, keyed
+   * by builtin strategy id, for a 'builtin' signal (strategies/custom.ts)
+   * nested inside the spec that itself needs leaderCandles/leaderCandles2 -
+   * lead-lag-echo and cointegration-pairs need their group leader, and
+   * triangulation-arb needs its two FX triangle legs. The leaderCandles/
+   * leaderCandles2 above only cover the case where the TOP-LEVEL strategy
+   * being evaluated is one of those three directly; this covers the same
+   * lookup one level down, per nested member. */
+  auxByStrategy?: Record<string, { leaderCandles?: Candle[]; leaderCandles2?: Candle[] }>
 }
 
 export interface StrategyDef {
