@@ -384,7 +384,18 @@ export class MarketDataService {
     // lazy seed: only the default active asset boots with full history;
     // every other asset seeds on first access (memory-friendly with 100+ instruments)
     this.ensureSeeded(this.activeAsset)
-    this.timer = setInterval(() => this.tickAll(), 1000)
+    // wrapped: this runs every 1s outside any request's try/catch - a single
+    // bad tick (one asset's data throwing) must never take the whole process
+    // down with it. index.ts also has a process-level uncaughtException
+    // safety net now, but catching it HERE means one bad asset doesn't skip
+    // every OTHER asset's tick for that cycle either.
+    this.timer = setInterval(() => {
+      try {
+        this.tickAll()
+      } catch (err) {
+        ctx.log('market-data', `tickAll() threw, skipping this cycle: ${(err as Error).message}`)
+      }
+    }, 1000)
     if (this.store) {
       this.flushTimer = setInterval(() => this.flushArchive(), ARCHIVE_FLUSH_MS)
       ctx.log('market-data', 'candle archive attached - closed bars persist across restarts')
@@ -414,7 +425,12 @@ export class MarketDataService {
       this.lastCandlePull = 0
       this.lastFeedBarTs = 0
       if (this.liveTimer) clearInterval(this.liveTimer)
-      this.liveTimer = setInterval(() => void this.pollLive(), 4000)
+      // fire-and-forget async call with no .catch() - a rejected promise
+      // here is an unhandled rejection (same crash risk as tickAll above).
+      this.liveTimer = setInterval(
+        () => void this.pollLive().catch((err) => this.ctx.log('market-data', `pollLive() rejected, skipping this cycle: ${(err as Error).message}`)),
+        4000,
+      )
       void this.pollLive()
       void this.ensureSidecarAssets()
       this.ctx.log('market-data', `LIVE resumed - adopted connected iqair sidecar @ ${base}`)

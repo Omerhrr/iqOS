@@ -140,6 +140,27 @@ function wilsonPct(wins: number, total: number, z = 1.96): [number, number] {
   return [Math.max(0, ((center - margin) / denom) * 100), Math.min(100, ((center + margin) / denom) * 100)]
 }
 
+// Process-level safety net. There are ~12 background setInterval callbacks
+// across the plugins (market-data tick/poll, execution settle/balance-sync,
+// autopilot, lab, screener/screener2, leadlagscan, chartsignals, os-mode's
+// autotrader tick, otcfootprint) that run OUTSIDE any HTTP request's try/
+// catch. Before this handler existed, a single throw inside any one of
+// them (a bad candle, a divide-by-zero, a null asset lookup - anything) was
+// an UNCAUGHT EXCEPTION with no process.on handler anywhere in the
+// codebase, which is a hard crash for the whole Bun process under Node/Bun
+// default behavior. docker-compose's `restart: unless-stopped` + healthcheck
+// then silently resurrects the container a few seconds later - which from
+// the client's side looks exactly like "intermittent 500s" (really
+// connection-refused/502 during the restart window), not a clean error.
+// This handler converts that into "log it and keep serving" instead of
+// "take the whole server down every time one background tick misbehaves."
+process.on('uncaughtException', (err) => {
+  console.error('[trading-core] uncaughtException (process kept alive):', err)
+})
+process.on('unhandledRejection', (reason) => {
+  console.error('[trading-core] unhandledRejection (process kept alive):', reason)
+})
+
 const kernel = new Kernel()
 kernel.register(storePlugin)
 kernel.register(osModePlugin)

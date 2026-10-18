@@ -462,6 +462,19 @@ export default function ChartPanel({
   const hvLineRef = useRef<ISeriesApi<'Line'> | null>(null)
   const ivLineRef = useRef<ISeriesApi<'Line'> | null>(null)
 
+  // Drop stale tick/IV-HV/OTC-footprint data the instant the asset changes,
+  // BEFORE the poll effects below land their next response. The "keep last
+  // good data" comments in those effects are about tolerating a transient
+  // poll FAILURE for the SAME asset - they were never meant to also cover a
+  // real asset SWITCH, but with no asset-keyed reset they did too: switching
+  // pairs while on Tick/IV-HV/OTC Footprint kept rendering the PREVIOUS
+  // asset's bars/buckets for up to one whole poll interval (5-15s).
+  useEffect(() => {
+    setTickBarsState([])
+    setIvhvState(null)
+    setOtcState(null)
+  }, [digitsTicker])
+
   // tick chart: real /ticks bars (sidecar 100ms capture when live, 5s-close
   // pseudo-ticks otherwise - the kernel's honest dataSource contract). Poll
   // at candle cadence while the type is active.

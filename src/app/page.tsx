@@ -87,6 +87,17 @@ export default function OSPage() {
   const [assets, setAssets] = useState<AssetRow[]>([])
   const [asset, setAsset] = useState('EURUSD')
   const [tf, setTf] = useState<Timeframe>('1m')
+  // "latest selection" ref, kept current on every render (not in an effect,
+  // so it is already correct by the time any in-flight promise's .then()
+  // checks it). loadCandles/loadAnalysis compare against this before
+  // committing state, so a slow response for a pair the user has since
+  // switched away from (or switched A->B->A fast enough that an old A
+  // response lands after B's) gets dropped instead of silently overwriting
+  // the currently-selected pair's stats with a stale/wrong pair's data.
+  const latestAssetRef = useRef(asset)
+  const latestTfRef = useRef(tf)
+  latestAssetRef.current = asset
+  latestTfRef.current = tf
   // which panel shows in the Markov-Chain slot next to Confluence Signal -
   // additive toggle, defaults to the existing Markov view so nothing changes
   // for users who never touch it
@@ -297,21 +308,28 @@ export default function OSPage() {
       const tfSec = TIMEFRAME_SECONDS[t] ?? 60
       const need = Math.min(4000, Math.max(320, Math.ceil((Date.now() / 1000 - f.from) / tfSec) + 8))
       const d = await getCandles(a, t, { limit: need, deep: true })
+      // dropped: the user has since switched to a different pair/timeframe,
+      // and this response no longer belongs to the current selection
+      if (latestAssetRef.current !== a || latestTfRef.current !== t) return
       if (d.ok) setCandles(d.candles)
       return
     }
     const d = await getCandles(a, t, { limit: 320 })
+    if (latestAssetRef.current !== a || latestTfRef.current !== t) return
     if (d.ok) setCandles(d.candles)
   }, [])
 
   const loadAnalysis = useCallback(async (a: string, t: Timeframe) => {
     try {
       const d = await osGet<{ ok: boolean; analysis: AnalysisResult }>(`/analysis`, { asset: a, tf: t })
+      // same stale-response guard as loadCandles above
+      if (latestAssetRef.current !== a || latestTfRef.current !== t) return
       if (d.ok) {
         setAnalysis(d.analysis)
         setAnalysisStale(false)
       }
     } catch {
+      if (latestAssetRef.current !== a || latestTfRef.current !== t) return
       // analysis needs more candles - keep the last good result on screen
       // (Task 59: but SAY so instead of silently showing stale data)
       setAnalysisStale(true)
@@ -493,6 +511,19 @@ export default function OSPage() {
       cancelled = true
     }
   }, [overlayKey, asset, tf])
+
+  // Drop stale analysis data the instant asset/tf changes, BEFORE the
+  // refetch below resolves - same reasoning as the overlay-clear effect
+  // above. Without this, SignalPanel/QuantPanel/IndicatorPanel/MarkovPanel
+  // keep rendering the PREVIOUS pair's signal score/factors/indicators/quant
+  // stats until the new /analysis response lands, which is exactly the
+  // "switch pair but the old signal/stat sticks around" bug. React commits
+  // effects in declaration order, so this one clears state before the
+  // asset/tf-switch effect below kicks off its request.
+  useEffect(() => {
+    setAnalysis(null)
+    setAnalysisStale(false)
+  }, [asset, tf])
 
   // asset/tf switch
   useEffect(() => {

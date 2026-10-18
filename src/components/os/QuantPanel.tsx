@@ -488,6 +488,19 @@ function OtcForensicsCard({ asset }: { asset: string }) {
       .finally(() => setBusy(false))
   }
 
+  // Drop the PREVIOUS asset's drift/forensics data the instant asset
+  // changes, before load() below lands the new pair's result - otherwise
+  // the drift badge (DRIFT UP/DOWN, decided split, persistence, lattice)
+  // keeps showing the old pair's numbers until the next successful fetch.
+  // Declared before the load effect so it runs first on an asset switch,
+  // and it is NOT keyed on the 60s regime re-probe below, so that interval
+  // keeps its "last good data on a transient failure" behavior for the
+  // SAME asset instead of flickering empty every 60s.
+  useEffect(() => {
+    setData(null)
+    setError(null)
+  }, [asset])
+
   useEffect(load, [asset])
   // regime monitor: re-probe every 60s so a dead regime is seen fast
   useEffect(() => {
@@ -633,6 +646,12 @@ function OtcDefenseCard({ asset, tf, strategies }: { asset: string; tf: string; 
   useEffect(() => {
     setReport(null)
     setError(null)
+    // same stale-badge bug as OtcForensicsCard above: clear BEFORE
+    // refreshStatus() resolves, otherwise the OTC-guard status badge and
+    // verdict list keep showing the previous asset/strategy's numbers
+    // until the new getOtcStatus/getOtcVerdicts responses land.
+    setStatus(null)
+    setVerdicts([])
     refreshStatus()
     getOtcConfig()
       .then((d) => setConfig(d.config))

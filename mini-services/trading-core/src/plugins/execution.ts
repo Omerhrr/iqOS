@@ -99,12 +99,25 @@ export class ExecutionService {
     // 1s sweep: binary/turbo/digital positions (paper AND live) settle the
     // moment their expiry is due - no waiting for a candle boundary - then
     // the ledger reconciles with the broker's real balance on IQ
-    this.settleTimer = setInterval(() => this.settleDue(), 1000)
+    // wrapped: settleDue() settles real money positions every 1s outside
+    // any request's try/catch - one bad position (a null lookup, a weird
+    // expiry) must never take the whole process down and stop EVERY other
+    // position from settling too.
+    this.settleTimer = setInterval(() => {
+      try {
+        this.settleDue()
+      } catch (err) {
+        ctx.log('execution', `settleDue() threw, skipping this cycle: ${(err as Error).message}`)
+      }
+    }, 1000)
     // keep the displayed IQ balance in tandem with the broker (wins/losses/
     // stakes book on IQ's side; the OS ledger is only an estimate). Runs
     // whenever a sidecar session is warm - even in paper mode - so the true
     // figure is always current when you switch sources.
-    this.balanceTimer = setInterval(() => void this.syncLiveBalance(), 10_000)
+    this.balanceTimer = setInterval(
+      () => void this.syncLiveBalance().catch((err) => ctx.log('execution', `syncLiveBalance() rejected, skipping this cycle: ${(err as Error).message}`)),
+      10_000,
+    )
     ctx.log('execution', 'paper broker + risk manager online')
   }
 

@@ -701,9 +701,15 @@ export class ModeService {
   private syncTimer(): void {
     const wantRunning = this.mode === 'auto'
     if (wantRunning && !this.timer) {
-      this.timer = setInterval(() => void this.tick(), 10_000)
+      // wrapped: tick() places real/paper orders every 10s outside any
+      // request's try/catch - a rejected promise here (one bad pick, one
+      // throwing picker) must never take the whole process down and stop
+      // every other kernel plugin's timers with it.
+      const safeTick = () =>
+        void this.tick().catch((err) => this.ctx.log('os-mode', `autotrader tick() rejected, skipping this cycle: ${(err as Error).message}`))
+      this.timer = setInterval(safeTick, 10_000)
       this.armAutoEdgeBackfill()
-      void this.tick() // act immediately on entry
+      safeTick() // act immediately on entry
     } else if (!wantRunning && this.timer) {
       clearInterval(this.timer)
       this.timer = null
