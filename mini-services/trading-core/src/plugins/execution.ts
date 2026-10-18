@@ -284,6 +284,25 @@ export class ExecutionService {
 
   // ---------- order placement ----------
 
+  /** Resolves the REAL bar count for an expiry. BUG FIX: manual trades used
+   * to send only a raw bar COUNT with no unit of its own - the unit was
+   * always whatever `tf` happened to be, so switching the chart's
+   * timeframe after setting the expiry silently changed the trade's real
+   * duration without the operator touching the expiry field at all.
+   * `expiryTf`, when present, is an independent expiry timeframe (set by
+   * TradeTicket.tsx) - this converts it against the trade's own `tf`
+   * exactly the way the autotrader's `place()` in os-mode.ts already does
+   * for its own (also independent) expiryTf field. Absent expiryTf falls
+   * back to the old behavior (raw bars of `tf`) for any older/other caller. */
+  private resolveExpiryBars(tf: Timeframe, expiryTf: Timeframe | undefined, rawBars: number | undefined): number {
+    if (expiryTf) {
+      const tfSec = TIMEFRAME_SECONDS[tf]
+      const expSec = TIMEFRAME_SECONDS[expiryTf]
+      if (tfSec > 0 && expSec > 0) return Math.max(1, Math.round(expSec / tfSec))
+    }
+    return Math.max(1, rawBars ?? 1)
+  }
+
   async placeOrder(req: {
     asset: string
     tf: Timeframe
@@ -291,6 +310,7 @@ export class ExecutionService {
     kind: TradeKind
     amount: number
     expiryBars?: number
+    expiryTf?: Timeframe // independent expiry timeframe - see resolveExpiryBars
     expirySec?: number // digital/turbo explicit expiry
     strikeOffsetPct?: number // digital strike distance from spot
     mode?: 'paper' | 'live'
@@ -321,7 +341,7 @@ export class ExecutionService {
     let position: Position
 
     if (kind === 'binary' || kind === 'turbo') {
-      const expiryBars = Math.max(1, req.expiryBars ?? 1)
+      const expiryBars = this.resolveExpiryBars(req.tf, req.expiryTf, req.expiryBars)
       // turbo on short TFs settles in whole seconds, minimum 30s
       const settleSec = kind === 'turbo' ? Math.max(30, expiryBars * tfSec) : expiryBars * tfSec
       position = {
@@ -408,6 +428,7 @@ export class ExecutionService {
     side: Side
     amount: number
     expiryBars?: number
+    expiryTf?: Timeframe // independent expiry timeframe - see resolveExpiryBars
     expirySec?: number
     strikeOffsetPct?: number
     mode?: 'paper' | 'live'
@@ -422,9 +443,10 @@ export class ExecutionService {
     const info = getInstrument(req.asset)
     const symbol = this.market.iqairSymbol(req.asset)
     const tfSec = TIMEFRAME_SECONDS[req.tf ?? '1m']
+    const resolvedExpiryBars = this.resolveExpiryBars(req.tf ?? '1m', req.expiryTf, req.expiryBars)
 
     // options payload (binary/turbo/digital)
-    const expirySec = kind === 'digital' ? Math.max(60, req.expirySec ?? 300) : Math.max(30, (req.expiryBars ?? 1) * tfSec)
+    const expirySec = kind === 'digital' ? Math.max(60, req.expirySec ?? 300) : Math.max(30, resolvedExpiryBars * tfSec)
     const expiryMin = Math.max(1, Math.round(expirySec / 60))
 
     // CFD-style live payload for spot categories
@@ -526,7 +548,7 @@ export class ExecutionService {
         kind: effectiveKind,
         mode: 'live',
         amount: req.amount,
-        expiryBars: req.expiryBars ?? 1,
+        expiryBars: resolvedExpiryBars,
         entryPrice: this.market.getPrice(req.asset),
         payout: effectiveKind === 'digital' ? this.market.payoutFor(req.asset, 'digital') : effectiveKind === 'turbo' ? this.market.payoutFor(req.asset, 'turbo') : effectiveKind === 'cfd' ? 1 : this.market.payoutFor(req.asset, 'binary'),
         status: 'open',

@@ -3166,6 +3166,14 @@ const httpServer = createServer(async (req, res) => {
           kind,
           amount: Number(body.amount ?? 10),
           expiryBars: body.expiryBars !== undefined ? Number(body.expiryBars) : undefined,
+          // BUG FIX: manual trades used to have no independent expiry unit -
+          // expiryBars alone meant "bars of body.tf", so changing the chart's
+          // tf silently changed a manual trade's real duration without the
+          // operator touching the expiry field. expiryTf (from
+          // TradeTicket.tsx) is resolved against tf in execution.ts's
+          // resolveExpiryBars(), same conversion the autotrader's own
+          // expiryTf field already uses in os-mode.ts.
+          expiryTf: body.expiryTf !== undefined ? tf(String(body.expiryTf)) : undefined,
           expirySec: body.expirySec !== undefined ? Number(body.expirySec) : undefined,
           strikeOffsetPct: body.strikeOffsetPct !== undefined ? Number(body.strikeOffsetPct) : undefined,
           // account source is the single routing truth: on IQ every order is

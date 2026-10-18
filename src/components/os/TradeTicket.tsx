@@ -5,7 +5,7 @@ import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { AccountState, AssetRow, Position, Timeframe, TradeKind } from '@/lib/os/client'
-import { KIND_LABEL, fmtMoney, fmtPrice, osGet, osPost } from '@/lib/os/client'
+import { KIND_LABEL, TIMEFRAMES, fmtMoney, fmtPrice, osGet, osPost } from '@/lib/os/client'
 
 // Task 64-b: a chart-signal can load the ticket - kind, expiry and CFD
 // levels arrive pre-filled, the voted side is highlighted. The money action
@@ -41,6 +41,18 @@ export default function TradeTicket({ asset, tf, price, account, prefill, onPlac
   const [kind, setKind] = useState<TradeKind>('binary')
   const [side, setSide] = useState<'call' | 'put' | null>(null)
   const [amount, setAmount] = useState('1')
+  // BUG FIX: this used to be "N bars of the chart's CURRENT tf" with no
+  // independent unit of its own - the chart's tf fed into the actual
+  // settle-time math server-side (execution.ts), so simply flipping the
+  // chart timeframe after setting this (without touching this field at
+  // all) silently changed how long the trade would actually run, even
+  // though the number on screen never changed. expiryTf is now a real,
+  // independent expiry timeframe (defaults to whatever the chart is on at
+  // mount, but does NOT keep following it afterward) sent to /trade
+  // alongside the chart's tf - the backend resolves the real bar count from
+  // the RATIO of the two, exactly like the autotrader's own expiryTf field
+  // in os-mode.ts already does.
+  const [expiryTf, setExpiryTf] = useState<Timeframe>(tf)
   const [expiryBars, setExpiryBars] = useState('1')
   const [digitalExpiry, setDigitalExpiry] = useState(300)
   const [strikeOffset, setStrikeOffset] = useState('0')
@@ -84,7 +96,11 @@ export default function TradeTicket({ asset, tf, price, account, prefill, onPlac
         side: s,
         kind,
         amount: amt,
-        ...(kind === 'binary' || kind === 'turbo' ? { expiryBars: Number(expiryBars) || 1 } : {}),
+        // expiryTf is the real fix: an independent expiry duration the
+        // backend resolves against the chart's tf (see execution.ts). The
+        // raw expiryBars still ships too, purely as the pre-fix fallback
+        // for any older backend that doesn't yet understand expiryTf.
+        ...(kind === 'binary' || kind === 'turbo' ? { expiryTf, expiryBars: Number(expiryBars) || 1 } : {}),
         ...(kind === 'digital' ? { expirySec: digitalExpiry, strikeOffsetPct: Number(strikeOffset) || 0 } : {}),
         ...(kind === 'cfd' ? { leverage: lev, tp: Number(tp), sl: Number(sl) } : {}),
         // Task 58 (P2): the hardcoded mode:'paper' is GONE - the kernel routes
@@ -172,23 +188,55 @@ export default function TradeTicket({ asset, tf, price, account, prefill, onPlac
 
         {kind === 'binary' && (
           <div>
-            <div className="mb-1 text-[9px] uppercase tracking-wider text-[#4b5a72]">Expiry (bars of {tf})</div>
-            <Input
-              value={expiryBars}
-              onChange={(e) => setExpiryBars(e.target.value.replace(/[^0-9]/g, ''))}
-              className="h-8 border-[#1c2739] bg-[#101828] text-right text-[12px] text-[#e2e8f0]"
-            />
+            <div className="mb-1 text-[9px] uppercase tracking-wider text-[#4b5a72]" title="independent of the chart's own tf - changing the chart timeframe no longer changes this trade's duration">
+              Expiry (bars of expiry-tf, not chart tf)
+            </div>
+            <div className="flex gap-1">
+              <Input
+                value={expiryBars}
+                onChange={(e) => setExpiryBars(e.target.value.replace(/[^0-9]/g, ''))}
+                className="h-8 w-14 border-[#1c2739] bg-[#101828] text-right text-[12px] text-[#e2e8f0]"
+              />
+              <select
+                value={expiryTf}
+                onChange={(e) => setExpiryTf(e.target.value as Timeframe)}
+                className="h-8 flex-1 rounded border border-[#1c2739] bg-[#101828] px-1 font-mono text-[11px] text-[#e2e8f0] outline-none"
+                title="the expiry's own timeframe - independent of whatever tf the chart is currently showing"
+              >
+                {TIMEFRAMES.map((t) => (
+                  <option key={t} value={t}>
+                    {t}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
         )}
 
         {kind === 'turbo' && (
           <div>
-            <div className="mb-1 text-[9px] uppercase tracking-wider text-[#4b5a72]">Expiry (bars, min 30s)</div>
-            <Input
-              value={expiryBars}
-              onChange={(e) => setExpiryBars(e.target.value.replace(/[^0-9]/g, ''))}
-              className="h-8 border-[#1c2739] bg-[#101828] text-right text-[12px] text-[#e2e8f0]"
-            />
+            <div className="mb-1 text-[9px] uppercase tracking-wider text-[#4b5a72]" title="independent of the chart's own tf - changing the chart timeframe no longer changes this trade's duration">
+              Expiry (bars of expiry-tf, min 30s)
+            </div>
+            <div className="flex gap-1">
+              <Input
+                value={expiryBars}
+                onChange={(e) => setExpiryBars(e.target.value.replace(/[^0-9]/g, ''))}
+                className="h-8 w-14 border-[#1c2739] bg-[#101828] text-right text-[12px] text-[#e2e8f0]"
+              />
+              <select
+                value={expiryTf}
+                onChange={(e) => setExpiryTf(e.target.value as Timeframe)}
+                className="h-8 flex-1 rounded border border-[#1c2739] bg-[#101828] px-1 font-mono text-[11px] text-[#e2e8f0] outline-none"
+                title="the expiry's own timeframe - independent of whatever tf the chart is currently showing"
+              >
+                {TIMEFRAMES.map((t) => (
+                  <option key={t} value={t}>
+                    {t}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
         )}
 
