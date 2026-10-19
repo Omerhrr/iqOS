@@ -323,7 +323,7 @@ export interface OtcFpRead {
   buckets: number
 }
 
-function otcFootprintVote(read: OtcFpRead | null): ChartEngineVote {
+export function otcFootprintVote(read: OtcFpRead | null): ChartEngineVote {
   if (!read || read.buckets === 0) {
     return { engine: 'otcfootprint', dir: 0, weight: 0, note: 'tick buffer cold' }
   }

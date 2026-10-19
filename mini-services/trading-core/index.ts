@@ -39,7 +39,8 @@ import { findTriangles, fitTriangulation, legsForCross, orientCandles, TRIANGULA
 import { fitAdxPatternBias } from './src/analytics/adxpatternbias'
 import { fitShockPressure } from './src/analytics/shockpressure'
 import { normalizeSpec, type CustomSpec } from './src/strategies/custom'
-import { MINABLE_ENGINES, ENGINE_LABEL, type ChartEngineId } from './src/analytics/chartsignals'
+import { MINABLE_ENGINES, ENGINE_LABEL, type ChartEngineId, engineVoteSingle, otcFootprintVote, type OtcFpRead } from './src/analytics/chartsignals'
+import { combineRenkoFootprint, type RenkoFootprintFit } from './src/analytics/renkofootprint'
 import { vskMonteCarlo } from './src/analytics/vsk'
 import { tskMonteCarlo } from './src/analytics/tsk'
 import { ALL_TIMEFRAMES, type Candle, type Timeframe, type Position } from './src/types'
@@ -583,6 +584,108 @@ function scanShockPressure(market: MarketDataService, tfv: Timeframe): ShockPres
   }
   rows.sort((x, y) => Number(y.qualifies) - Number(x.qualifies) || Math.abs(y.composite) - Math.abs(x.composite))
   shockPressureScanCache.set(tfv, { ts: Date.now(), rows })
+  return rows
+}
+
+// Renko + Footprint (real market) / Renko + OTC Footprint (OTC market): the
+// renko brick-trend read paired with the volume-footprint delta read (real
+// instruments) or the micro-tick velocity footprint read (OTC instruments,
+// no order book there) into one agreement-gated composite - same shape as
+// Shock+Pressure, just a different pair of independent reads. See
+// analytics/renkofootprint.ts; the votes themselves are the exact
+// renko/footprint/otcfootprint engine votes the Chart Signals scanner
+// already renders (analytics/chartsignals.ts).
+interface RenkoFootprintScanRow {
+  asset: string
+  name: string
+  category: string
+  otc: boolean
+  open: boolean
+  price: number
+  renkoDir: 'call' | 'put' | null
+  renkoWeight: number
+  renkoNote: string
+  fpDir: 'call' | 'put' | null
+  fpWeight: number
+  fpNote: string
+  agree: boolean
+  composite: number
+  direction: 'call' | 'put' | null
+  qualifies: boolean
+}
+
+function renkoFootprintRow(a: { ticker: string; name: string; category: string; otc?: boolean; open: boolean }, price: number, fit: RenkoFootprintFit): RenkoFootprintScanRow {
+  return {
+    asset: a.ticker,
+    name: a.name,
+    category: a.category,
+    otc: !!a.otc,
+    open: a.open,
+    price,
+    ...fit,
+  }
+}
+
+const renkoFootprintScanCache = new Map<Timeframe, { ts: number; rows: RenkoFootprintScanRow[] }>()
+
+/** Real-market only (OTC instruments have no real order book to footprint). */
+function scanRenkoFootprint(market: MarketDataService, tfv: Timeframe): RenkoFootprintScanRow[] {
+  const cached = renkoFootprintScanCache.get(tfv)
+  if (cached && Date.now() - cached.ts < SCAN_CACHE_MS) return cached.rows
+  const rows: RenkoFootprintScanRow[] = []
+  for (const a of market.assets) {
+    if (!a.open || a.otc) continue
+    try {
+      const candles = market.getCandlesDeep(a.ticker, tfv, 240, true)
+      if (candles.length < 40) continue
+      const renko = engineVoteSingle('renko', candles)
+      const fp = engineVoteSingle('footprint', candles)
+      const fit = combineRenkoFootprint(renko, fp)
+      rows.push(renkoFootprintRow(a, candles[candles.length - 1]?.close ?? 0, fit))
+    } catch {
+      /* one bad asset never breaks the scan */
+    }
+  }
+  rows.sort((x, y) => Number(y.qualifies) - Number(x.qualifies) || Math.abs(y.composite) - Math.abs(x.composite))
+  renkoFootprintScanCache.set(tfv, { ts: Date.now(), rows })
+  return rows
+}
+
+const renkoOtcFootprintScanCache = new Map<Timeframe, { ts: number; rows: RenkoFootprintScanRow[] }>()
+
+/** OTC only. Async: the micro-tick velocity footprint read awaits a fresh
+ * live-tick merge the same way the Chart Signals scanner's own OTC branch
+ * does (plugins/chartsignals.ts's otcReadAsync). Chunked concurrency keeps a
+ * full-universe scan from firing dozens of footprint() calls at once. */
+async function scanRenkoOtcFootprint(market: MarketDataService, fpSvc: OtcFootprintService, tfv: Timeframe): Promise<RenkoFootprintScanRow[]> {
+  const cached = renkoOtcFootprintScanCache.get(tfv)
+  if (cached && Date.now() - cached.ts < SCAN_CACHE_MS) return cached.rows
+  const rows: RenkoFootprintScanRow[] = []
+  const assets = market.assets.filter((a) => a.open && a.otc)
+  const CHUNK = 4
+  for (let i = 0; i < assets.length; i += CHUNK) {
+    await Promise.all(
+      assets.slice(i, i + CHUNK).map(async (a) => {
+        try {
+          const candles = market.getCandlesDeep(a.ticker, tfv, 240, true)
+          if (candles.length < 40) return
+          const renko = engineVoteSingle('renko', candles)
+          const res = await fpSvc.footprint(a.ticker, { minutes: 30, bucketSec: 60 })
+          const live = res.buckets.filter((b) => b.nTicks > 0)
+          const otcRead: OtcFpRead | null = live.length
+            ? { signal: res.summary.signal, score: res.summary.score, netDelta: res.summary.netDelta, avgSpeedRatio: res.summary.avgSpeedRatio, buckets: live.length }
+            : null
+          const fp = otcFootprintVote(otcRead)
+          const fit = combineRenkoFootprint(renko, fp)
+          rows.push(renkoFootprintRow(a, candles[candles.length - 1]?.close ?? 0, fit))
+        } catch {
+          /* one bad asset never breaks the scan */
+        }
+      })
+    )
+  }
+  rows.sort((x, y) => Number(y.qualifies) - Number(x.qualifies) || Math.abs(y.composite) - Math.abs(x.composite))
+  renkoOtcFootprintScanCache.set(tfv, { ts: Date.now(), rows })
   return rows
 }
 
@@ -1976,6 +2079,36 @@ const httpServer = createServer(async (req, res) => {
           const tfv = tfStrict(q.get('tf'))
           if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
           const rows = scanShockPressure(market, tfv)
+          return json(200, { ok: true, tf: tfv, scanned: rows.length, qualifying: rows.filter((r) => r.qualifies).length, rows, ts: Date.now() })
+        } catch (err) {
+          return json(400, { ok: false, error: (err as Error).message })
+        }
+      }
+
+      // Renko + Footprint scan (real market only - OTC has no real order
+      // book): renko brick-trend read paired with the volume-footprint delta
+      // read, agreement-gated. See analytics/renkofootprint.ts.
+      if (path === '/renko_footprint_scan') {
+        try {
+          const tfv = tfStrict(q.get('tf'))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const rows = scanRenkoFootprint(market, tfv)
+          return json(200, { ok: true, tf: tfv, scanned: rows.length, qualifying: rows.filter((r) => r.qualifies).length, rows, ts: Date.now() })
+        } catch (err) {
+          return json(400, { ok: false, error: (err as Error).message })
+        }
+      }
+
+      // Renko + OTC Footprint scan (OTC only): renko brick-trend read paired
+      // with the micro-tick velocity footprint read (no order book exists on
+      // OTC instruments - print timing stands in, see analytics/otcfootprint.ts),
+      // agreement-gated. See analytics/renkofootprint.ts.
+      if (path === '/renko_otc_footprint_scan') {
+        try {
+          const tfv = tfStrict(q.get('tf'))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const fpSvc = kernel.context().use<OtcFootprintService>('otcFootprint')
+          const rows = await scanRenkoOtcFootprint(market, fpSvc, tfv)
           return json(200, { ok: true, tf: tfv, scanned: rows.length, qualifying: rows.filter((r) => r.qualifies).length, rows, ts: Date.now() })
         } catch (err) {
           return json(400, { ok: false, error: (err as Error).message })

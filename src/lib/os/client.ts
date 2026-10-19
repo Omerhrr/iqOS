@@ -747,6 +747,42 @@ export async function getShockPressureScan(tf: Timeframe): Promise<ShockPressure
   return osGet<ShockPressureScanResponse>('/shock_pressure_scan', { tf })
 }
 
+export interface RenkoFootprintScanRow {
+  asset: string
+  name: string
+  category: string
+  otc: boolean
+  open: boolean
+  price: number
+  renkoDir: 'call' | 'put' | null
+  renkoWeight: number
+  renkoNote: string
+  fpDir: 'call' | 'put' | null
+  fpWeight: number
+  fpNote: string
+  agree: boolean
+  composite: number
+  direction: 'call' | 'put' | null
+  qualifies: boolean
+}
+
+export interface RenkoFootprintScanResponse {
+  ok: boolean
+  tf: Timeframe
+  scanned: number
+  qualifying: number
+  rows: RenkoFootprintScanRow[]
+  ts: number
+}
+
+export async function getRenkoFootprintScan(tf: Timeframe): Promise<RenkoFootprintScanResponse> {
+  return osGet<RenkoFootprintScanResponse>('/renko_footprint_scan', { tf })
+}
+
+export async function getRenkoOtcFootprintScan(tf: Timeframe): Promise<RenkoFootprintScanResponse> {
+  return osGet<RenkoFootprintScanResponse>('/renko_otc_footprint_scan', { tf })
+}
+
 // ---- chart-signal outcome stats (Task 64-c: the honesty loop) ------------
 
 export type SignalOutcomeId = 'win' | 'loss' | 'flat' | 'timeout'

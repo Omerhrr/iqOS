@@ -22,6 +22,7 @@ import VolatilityArbPanel from '@/components/os/VolatilityArbPanel'
 import TriangulationPanel from '@/components/os/TriangulationPanel'
 import AdxPatternBiasPanel from '@/components/os/AdxPatternBiasPanel'
 import ShockPressurePanel from '@/components/os/ShockPressurePanel'
+import RenkoFootprintPanel from '@/components/os/RenkoFootprintPanel'
 import MarkovPanel from '@/components/os/MarkovPanel'
 import { DeltaFootprintView } from '@/components/os/OrderFlowPanel'
 import CandleMathView from '@/components/os/CandleMathView'
@@ -74,7 +75,7 @@ const INDICATOR_STORAGE_KEY = 'iqos.activeIndicators.v1'
 // @ Now", "Cointegration") out of the open strip entirely instead of just
 // closing it each time - it stays hidden across reloads until re-checked in
 // the Panels settings menu. Nothing is deleted, this only gates rendering.
-type PanelId = 'signals' | 'yday' | 'leadlag' | 'distill' | 'cointegration' | 'volarb' | 'triangulation' | 'adxPatternBias' | 'shockPressure'
+type PanelId = 'signals' | 'yday' | 'leadlag' | 'distill' | 'cointegration' | 'volarb' | 'triangulation' | 'adxPatternBias' | 'shockPressure' | 'renkoFootprint' | 'renkoFootprintOtc'
 const PANEL_META: { id: PanelId; label: string }[] = [
   { id: 'signals', label: 'Chart Signals' },
   { id: 'yday', label: 'Yesterday @ Now' },
@@ -85,6 +86,8 @@ const PANEL_META: { id: PanelId; label: string }[] = [
   { id: 'triangulation', label: 'Triangulation' },
   { id: 'adxPatternBias', label: 'ADX/DI + Pattern' },
   { id: 'shockPressure', label: 'Shock + Pressure' },
+  { id: 'renkoFootprint', label: 'Renko + Footprint' },
+  { id: 'renkoFootprintOtc', label: 'Renko + OTC Footprint' },
 ]
 const DEFAULT_PANEL_VISIBILITY: Record<PanelId, boolean> = {
   signals: true,
@@ -96,6 +99,8 @@ const DEFAULT_PANEL_VISIBILITY: Record<PanelId, boolean> = {
   triangulation: true,
   adxPatternBias: true,
   shockPressure: true,
+  renkoFootprint: true,
+  renkoFootprintOtc: true,
 }
 const PANEL_VISIBILITY_STORAGE_KEY = 'iqos.panelVisibility.v1'
 
@@ -187,6 +192,8 @@ export default function OSPage() {
   const [triangulationOpen, setTriangulationOpen] = useState(false)
   const [adxPatternBiasOpen, setAdxPatternBiasOpen] = useState(false)
   const [shockPressureOpen, setShockPressureOpen] = useState(false)
+  const [renkoFootprintOpen, setRenkoFootprintOpen] = useState(false)
+  const [renkoFootprintOtcOpen, setRenkoFootprintOtcOpen] = useState(false)
   // panel visibility (Panels settings menu) - which of the above are even
   // offered in the open strip at all. Defaults to everything visible so a
   // first-ever load (or corrupt/missing storage) matches today's behavior.
@@ -261,6 +268,8 @@ export default function OSPage() {
         else if (id === 'triangulation') setTriangulationOpen(false)
         else if (id === 'adxPatternBias') setAdxPatternBiasOpen(false)
         else if (id === 'shockPressure') setShockPressureOpen(false)
+        else if (id === 'renkoFootprint') setRenkoFootprintOpen(false)
+        else if (id === 'renkoFootprintOtc') setRenkoFootprintOtcOpen(false)
       }
       return next
     })
@@ -1060,7 +1069,7 @@ export default function OSPage() {
                 closed = the slim open strip sits above the market watch and
                 everything is laid out exactly as before. */}
             <Panel defaultSize={17} minSize={11}>
-              {signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen || shockPressureOpen ? (
+              {signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen || shockPressureOpen || renkoFootprintOpen || renkoFootprintOtcOpen ? (
                 <div className="mr-0.5 h-full min-h-0">
                   {ydayOpen ? (
                     <YesterdayPanel onClose={() => setYdayOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onFocusWindow={handleFocusYesterday} />
@@ -1078,6 +1087,10 @@ export default function OSPage() {
                     <AdxPatternBiasPanel onClose={() => setAdxPatternBiasOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
                   ) : shockPressureOpen ? (
                     <ShockPressurePanel onClose={() => setShockPressureOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
+                  ) : renkoFootprintOpen ? (
+                    <RenkoFootprintPanel onClose={() => setRenkoFootprintOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} otc={false} />
+                  ) : renkoFootprintOtcOpen ? (
+                    <RenkoFootprintPanel onClose={() => setRenkoFootprintOtcOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} otc={true} />
                   ) : (
                     <ChartSignalsPanel onClose={() => setSignalsOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onTake={handleTakeSignal} />
                   )}
@@ -1234,6 +1247,30 @@ export default function OSPage() {
                       >
                         <span className="h-1.5 w-1.5 rounded-full bg-orange-400" />
                         Shock + Pressure
+                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
+                      </button>
+                      )}
+                      {panelVisibility.renkoFootprint && (
+                      <button
+                        type="button"
+                        onClick={() => setRenkoFootprintOpen(true)}
+                        title="open the renko + footprint panel - real-market renko brick trend combined with volume-footprint delta (CLV proxy)"
+                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-emerald-500/40 hover:text-emerald-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                        Renko + Footprint
+                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
+                      </button>
+                      )}
+                      {panelVisibility.renkoFootprintOtc && (
+                      <button
+                        type="button"
+                        onClick={() => setRenkoFootprintOtcOpen(true)}
+                        title="open the renko + OTC footprint panel - OTC renko brick trend combined with micro-tick velocity footprint (no real order book on OTC)"
+                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-amber-500/40 hover:text-amber-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
+                        Renko + OTC Footprint
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
                       )}
