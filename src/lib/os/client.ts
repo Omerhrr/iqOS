@@ -783,6 +783,39 @@ export async function getRenkoOtcFootprintScan(tf: Timeframe): Promise<RenkoFoot
   return osGet<RenkoFootprintScanResponse>('/renko_otc_footprint_scan', { tf })
 }
 
+export interface VolumeFootprintScanRow {
+  asset: string
+  name: string
+  category: string
+  otc: boolean
+  open: boolean
+  price: number
+  volDir: 'call' | 'put' | null
+  volWeight: number
+  volNote: string
+  relVolume: number
+  fpDir: 'call' | 'put' | null
+  fpWeight: number
+  fpNote: string
+  agree: boolean
+  composite: number
+  direction: 'call' | 'put' | null
+  qualifies: boolean
+}
+
+export interface VolumeFootprintScanResponse {
+  ok: boolean
+  tf: Timeframe
+  scanned: number
+  qualifying: number
+  rows: VolumeFootprintScanRow[]
+  ts: number
+}
+
+export async function getVolumeFootprintScan(tf: Timeframe): Promise<VolumeFootprintScanResponse> {
+  return osGet<VolumeFootprintScanResponse>('/volume_footprint_scan', { tf })
+}
+
 // ---- chart-signal outcome stats (Task 64-c: the honesty loop) ------------
 
 export type SignalOutcomeId = 'win' | 'loss' | 'flat' | 'timeout'

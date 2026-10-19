@@ -23,6 +23,7 @@ import TriangulationPanel from '@/components/os/TriangulationPanel'
 import AdxPatternBiasPanel from '@/components/os/AdxPatternBiasPanel'
 import ShockPressurePanel from '@/components/os/ShockPressurePanel'
 import RenkoFootprintPanel from '@/components/os/RenkoFootprintPanel'
+import VolumeFootprintPanel from '@/components/os/VolumeFootprintPanel'
 import MarkovPanel from '@/components/os/MarkovPanel'
 import { DeltaFootprintView } from '@/components/os/OrderFlowPanel'
 import CandleMathView from '@/components/os/CandleMathView'
@@ -75,7 +76,7 @@ const INDICATOR_STORAGE_KEY = 'iqos.activeIndicators.v1'
 // @ Now", "Cointegration") out of the open strip entirely instead of just
 // closing it each time - it stays hidden across reloads until re-checked in
 // the Panels settings menu. Nothing is deleted, this only gates rendering.
-type PanelId = 'signals' | 'yday' | 'leadlag' | 'distill' | 'cointegration' | 'volarb' | 'triangulation' | 'adxPatternBias' | 'shockPressure' | 'renkoFootprint' | 'renkoFootprintOtc'
+type PanelId = 'signals' | 'yday' | 'leadlag' | 'distill' | 'cointegration' | 'volarb' | 'triangulation' | 'adxPatternBias' | 'shockPressure' | 'renkoFootprint' | 'renkoFootprintOtc' | 'volumeFootprint'
 const PANEL_META: { id: PanelId; label: string }[] = [
   { id: 'signals', label: 'Chart Signals' },
   { id: 'yday', label: 'Yesterday @ Now' },
@@ -88,6 +89,7 @@ const PANEL_META: { id: PanelId; label: string }[] = [
   { id: 'shockPressure', label: 'Shock + Pressure' },
   { id: 'renkoFootprint', label: 'Renko + Footprint' },
   { id: 'renkoFootprintOtc', label: 'Renko + OTC Footprint' },
+  { id: 'volumeFootprint', label: 'Volume + Footprint' },
 ]
 const DEFAULT_PANEL_VISIBILITY: Record<PanelId, boolean> = {
   signals: true,
@@ -101,6 +103,7 @@ const DEFAULT_PANEL_VISIBILITY: Record<PanelId, boolean> = {
   shockPressure: true,
   renkoFootprint: true,
   renkoFootprintOtc: true,
+  volumeFootprint: true,
 }
 const PANEL_VISIBILITY_STORAGE_KEY = 'iqos.panelVisibility.v1'
 
@@ -194,6 +197,7 @@ export default function OSPage() {
   const [shockPressureOpen, setShockPressureOpen] = useState(false)
   const [renkoFootprintOpen, setRenkoFootprintOpen] = useState(false)
   const [renkoFootprintOtcOpen, setRenkoFootprintOtcOpen] = useState(false)
+  const [volumeFootprintOpen, setVolumeFootprintOpen] = useState(false)
   // panel visibility (Panels settings menu) - which of the above are even
   // offered in the open strip at all. Defaults to everything visible so a
   // first-ever load (or corrupt/missing storage) matches today's behavior.
@@ -270,6 +274,7 @@ export default function OSPage() {
         else if (id === 'shockPressure') setShockPressureOpen(false)
         else if (id === 'renkoFootprint') setRenkoFootprintOpen(false)
         else if (id === 'renkoFootprintOtc') setRenkoFootprintOtcOpen(false)
+        else if (id === 'volumeFootprint') setVolumeFootprintOpen(false)
       }
       return next
     })
@@ -1069,7 +1074,7 @@ export default function OSPage() {
                 closed = the slim open strip sits above the market watch and
                 everything is laid out exactly as before. */}
             <Panel defaultSize={17} minSize={11}>
-              {signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen || shockPressureOpen || renkoFootprintOpen || renkoFootprintOtcOpen ? (
+              {signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen || shockPressureOpen || renkoFootprintOpen || renkoFootprintOtcOpen || volumeFootprintOpen ? (
                 <div className="mr-0.5 h-full min-h-0">
                   {ydayOpen ? (
                     <YesterdayPanel onClose={() => setYdayOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onFocusWindow={handleFocusYesterday} />
@@ -1091,6 +1096,8 @@ export default function OSPage() {
                     <RenkoFootprintPanel onClose={() => setRenkoFootprintOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} otc={false} />
                   ) : renkoFootprintOtcOpen ? (
                     <RenkoFootprintPanel onClose={() => setRenkoFootprintOtcOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} otc={true} />
+                  ) : volumeFootprintOpen ? (
+                    <VolumeFootprintPanel onClose={() => setVolumeFootprintOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
                   ) : (
                     <ChartSignalsPanel onClose={() => setSignalsOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onTake={handleTakeSignal} />
                   )}
@@ -1271,6 +1278,18 @@ export default function OSPage() {
                       >
                         <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
                         Renko + OTC Footprint
+                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
+                      </button>
+                      )}
+                      {panelVisibility.volumeFootprint && (
+                      <button
+                        type="button"
+                        onClick={() => setVolumeFootprintOpen(true)}
+                        title="open the volume + footprint panel - real-market relative-volume surge combined with volume-footprint delta (CLV proxy)"
+                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-sky-500/40 hover:text-sky-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-sky-400" />
+                        Volume + Footprint
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
                       )}

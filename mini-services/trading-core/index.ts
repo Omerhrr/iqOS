@@ -41,6 +41,7 @@ import { fitShockPressure } from './src/analytics/shockpressure'
 import { normalizeSpec, type CustomSpec } from './src/strategies/custom'
 import { MINABLE_ENGINES, ENGINE_LABEL, type ChartEngineId, engineVoteSingle, otcFootprintVote, type OtcFpRead } from './src/analytics/chartsignals'
 import { combineRenkoFootprint, type RenkoFootprintFit } from './src/analytics/renkofootprint'
+import { volumeVote, combineVolumeFootprint } from './src/analytics/volumefootprint'
 import { vskMonteCarlo } from './src/analytics/vsk'
 import { tskMonteCarlo } from './src/analytics/tsk'
 import { ALL_TIMEFRAMES, type Candle, type Timeframe, type Position } from './src/types'
@@ -686,6 +687,63 @@ async function scanRenkoOtcFootprint(market: MarketDataService, fpSvc: OtcFootpr
   }
   rows.sort((x, y) => Number(y.qualifies) - Number(x.qualifies) || Math.abs(y.composite) - Math.abs(x.composite))
   renkoOtcFootprintScanCache.set(tfv, { ts: Date.now(), rows })
+  return rows
+}
+
+// Volume + Footprint (real market only - see analytics/volumefootprint.ts's
+// honesty header on why OTC isn't covered): a relative-volume surge read
+// (this window's volume vs its own recent baseline, direction from the
+// CLV-proxy buy/sell delta) paired with the volume-footprint delta read,
+// agreement-gated. Same shape as Shock+Pressure / Renko+Footprint.
+interface VolumeFootprintScanRow {
+  asset: string
+  name: string
+  category: string
+  otc: boolean
+  open: boolean
+  price: number
+  volDir: 'call' | 'put' | null
+  volWeight: number
+  volNote: string
+  relVolume: number
+  fpDir: 'call' | 'put' | null
+  fpWeight: number
+  fpNote: string
+  agree: boolean
+  composite: number
+  direction: 'call' | 'put' | null
+  qualifies: boolean
+}
+
+const volumeFootprintScanCache = new Map<Timeframe, { ts: number; rows: VolumeFootprintScanRow[] }>()
+
+function scanVolumeFootprint(market: MarketDataService, tfv: Timeframe): VolumeFootprintScanRow[] {
+  const cached = volumeFootprintScanCache.get(tfv)
+  if (cached && Date.now() - cached.ts < SCAN_CACHE_MS) return cached.rows
+  const rows: VolumeFootprintScanRow[] = []
+  for (const a of market.assets) {
+    if (!a.open || a.otc) continue
+    try {
+      const candles = market.getCandlesDeep(a.ticker, tfv, 240, true)
+      if (candles.length < 40) continue
+      const vol = volumeVote(candles)
+      const fp = engineVoteSingle('footprint', candles)
+      const fit = combineVolumeFootprint(vol, fp)
+      rows.push({
+        asset: a.ticker,
+        name: a.name,
+        category: a.category,
+        otc: false,
+        open: a.open,
+        price: candles[candles.length - 1]?.close ?? 0,
+        ...fit,
+      })
+    } catch {
+      /* one bad asset never breaks the scan */
+    }
+  }
+  rows.sort((x, y) => Number(y.qualifies) - Number(x.qualifies) || Math.abs(y.composite) - Math.abs(x.composite))
+  volumeFootprintScanCache.set(tfv, { ts: Date.now(), rows })
   return rows
 }
 
@@ -2109,6 +2167,20 @@ const httpServer = createServer(async (req, res) => {
           if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
           const fpSvc = kernel.context().use<OtcFootprintService>('otcFootprint')
           const rows = await scanRenkoOtcFootprint(market, fpSvc, tfv)
+          return json(200, { ok: true, tf: tfv, scanned: rows.length, qualifying: rows.filter((r) => r.qualifies).length, rows, ts: Date.now() })
+        } catch (err) {
+          return json(400, { ok: false, error: (err as Error).message })
+        }
+      }
+
+      // Volume + Footprint scan (real market only - see
+      // analytics/volumefootprint.ts): relative-volume surge read paired with
+      // the volume-footprint delta read, agreement-gated.
+      if (path === '/volume_footprint_scan') {
+        try {
+          const tfv = tfStrict(q.get('tf'))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const rows = scanVolumeFootprint(market, tfv)
           return json(200, { ok: true, tf: tfv, scanned: rows.length, qualifying: rows.filter((r) => r.qualifies).length, rows, ts: Date.now() })
         } catch (err) {
           return json(400, { ok: false, error: (err as Error).message })
