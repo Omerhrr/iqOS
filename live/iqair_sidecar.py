@@ -89,6 +89,19 @@ _client = None  # iqair IQOptionClient, set by /connect
 _assets_cache = None  # (rows, ts) - the ~90s instrument table, 30 min TTL
 _assets_fetching = False  # dedupe concurrent metadata crunches (they run unlocked)
 _asset_ids = {}  # ticker -> numeric active_id, from the account's own metadata
+# THE BUG this fixed: _asset_ids above conflates the turbo and binary
+# active_id namespaces into ONE dict keyed only by ticker (binary is seeded
+# last in the loops below, so any ticker present in BOTH groups - most
+# FX/OTC pairs - permanently resolved to its BINARY id even for a TURBO
+# order). IQ's buyv3 infers binary-vs-turbo purely from which group the
+# submitted active_id belongs to, so sending the wrong group's id is a
+# request for an instrument/duration pairing that doesn't exist on the
+# broker's side - rejected with the generic "Cannot purchase an option (the
+# asset is not available at the moment)" for every asset, independent of
+# expiry duration. _asset_ids itself is left alone (still used everywhere
+# else: the asset table, /health, /connect's mapped-count) - only the /trade
+# buy path now resolves through the group-aware table below.
+_asset_ids_by_group = {"turbo": {}, "binary": {}}  # ticker -> numeric active_id, split by instrument group - see _resolve_active_id_for_group
 _digital_ids = {}  # ticker -> numeric active_id, digital-option group only
 _asset_norm = {}  # normalized alias key -> account ticker (turbo/binary map)
 _digital_norm = {}  # normalized alias key -> account underlying (digital map)
@@ -475,9 +488,11 @@ def _seed_ids_from_init():
             for aid, active in actives.items():
                 t = active.get("ticker") or str(active.get("name", "")).split(".")[-1]
                 try:
-                    _asset_ids[t] = int(aid)
+                    aidi = int(aid)
                 except (TypeError, ValueError):
-                    pass
+                    continue
+                _asset_ids[t] = aidi
+                _asset_ids_by_group[option][t] = aidi
         if OP_code is not None:
             for t, aid in _asset_ids.items():
                 if t not in OP_code.ACTIVES:
@@ -529,9 +544,11 @@ def _resolve_active_id(ticker):
             for aid, active in actives.items():
                 t = active.get("ticker") or str(active.get("name", "")).split(".")[-1]
                 try:
-                    _asset_ids[t] = int(aid)
+                    aidi = int(aid)
                 except (TypeError, ValueError):
-                    pass
+                    continue
+                _asset_ids[t] = aidi
+                _asset_ids_by_group[option][t] = aidi
     except Exception:  # noqa: BLE001
         pass
     if ticker in _asset_ids:
@@ -546,6 +563,38 @@ def _resolve_active_id(ticker):
             _asset_ids[ticker] = v
             return v
     return None
+
+
+def _resolve_active_id_for_group(ticker, group):
+    """Group-aware variant of _resolve_active_id, for the /trade buy path
+    ONLY - see the big comment on _asset_ids_by_group above for why this
+    exists. `group` is "turbo" or "binary" (the group the caller actually
+    wants to trade). Returns (active_id, resolved_group) where
+    resolved_group may be the OTHER group when the account only carries
+    this ticker there (mirroring the existing turbo<->digital account
+    fallback already in the /trade handler) - the caller must adjust the
+    duration validation/labeling to match resolved_group, not the one it
+    asked for. Returns (None, None) when the account has this ticker in
+    NEITHER group at all."""
+    other = "binary" if group == "turbo" else "turbo"
+    # piggyback on _resolve_active_id's own seed-wait + lazy live rescan (it
+    # populates _asset_ids_by_group as a side effect now) before concluding
+    # neither group has this ticker
+    if ticker not in _asset_ids_by_group[group] and ticker not in _asset_ids_by_group[other]:
+        _resolve_active_id(ticker)
+    table = _asset_ids_by_group[group]
+    if ticker in table:
+        return table[ticker], group
+    canon = _alias_ticker(ticker, table, _asset_norm)
+    if canon is not None and canon in table:
+        return table[canon], group
+    other_table = _asset_ids_by_group[other]
+    if ticker in other_table:
+        return other_table[ticker], other
+    canon = _alias_ticker(ticker, other_table, _asset_norm)
+    if canon is not None and canon in other_table:
+        return other_table[canon], other
+    return None, None
 
 
 def _resolve_digital_id(ticker):
@@ -1090,8 +1139,22 @@ class Handler(BaseHTTPRequestHandler):
                         # instruments into turbo/binary (buyv3, numeric id)
                         # and digital (server-resolved instrument contracts);
                         # an account may carry a ticker in only one of them.
+                        #
+                        # BUG FIX: this used to call the single-namespace
+                        # _resolve_active_id(asset), which conflates turbo and
+                        # binary ids into one dict (binary wins when a ticker
+                        # is in both) - so a requested turbo order could
+                        # silently buy against a BINARY active_id instead,
+                        # which IQ's buyv3 rejects with the generic "asset is
+                        # not available" message for every asset, independent
+                        # of the requested expiry. _resolve_active_id_for_group
+                        # resolves the id from the GROUP the caller actually
+                        # asked for, falling back to the other group (and
+                        # reporting that fallback via tb_group) only when the
+                        # account truly doesn't carry this ticker there.
                         digital_req = mode.startswith("digital")
-                        tb_id = _resolve_active_id(asset)
+                        requested_group = "binary" if mode.startswith("binary") else "turbo"
+                        tb_id, tb_group = _resolve_active_id_for_group(asset, requested_group)
                         dig_id = _resolve_digital_id(asset) if digital_req or tb_id is None else None
                         # speak the account's dialect for the actual buy calls
                         # (EURUSD_otc -> EURUSD-OTC etc.) - buy_digital_spot
@@ -1102,9 +1165,12 @@ class Handler(BaseHTTPRequestHandler):
                             if dig_id is not None:
                                 check, order_id = _buy_digital_spot(amount, asset, direction, expiry)
                             elif tb_id is not None:
-                                # requested digital, account only has turbo/binary
+                                # requested digital, account only has turbo/binary -
+                                # mode now reflects which group tb_id ACTUALLY
+                                # belongs to (tb_group), not a hardcoded "turbo"
+                                # that could be wrong half the time
                                 check, order_id, expired = _buy_fast(amount, int(tb_id), direction, expiry, symbol=asset)
-                                mode = "turbo"
+                                mode = tb_group
                             else:
                                 return self._send(_err(f"{asset} is not a digital/turbo/binary instrument on this IQ account"), 400)
                         else:
@@ -1117,6 +1183,13 @@ class Handler(BaseHTTPRequestHandler):
                                 # that lacks OTC/new tickers -> active_id null
                                 # -> server rejection ("ActiveId is not nullable")
                                 check, order_id, expired = _buy_fast(amount, int(tb_id), direction, expiry, symbol=asset)
+                                # tb_group may differ from requested_group when
+                                # the account only carries this ticker in the
+                                # OTHER turbo/binary group - say so, same as
+                                # the digital fallback above, so the caller's
+                                # own duration validation matches what was
+                                # actually bought rather than what was asked for
+                                mode = tb_group
                             elif dig_id is not None:
                                 # requested turbo/binary, account only offers
                                 # this ticker as a digital option (common on
