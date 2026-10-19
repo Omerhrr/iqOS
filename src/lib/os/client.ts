@@ -816,6 +816,39 @@ export async function getVolumeFootprintScan(tf: Timeframe): Promise<VolumeFootp
   return osGet<VolumeFootprintScanResponse>('/volume_footprint_scan', { tf })
 }
 
+export interface TickVolumeScanRow {
+  asset: string
+  name: string
+  category: string
+  otc: boolean
+  open: boolean
+  price: number
+  tickDir: 'call' | 'put' | null
+  tickWeight: number
+  tickNote: string
+  volDir: 'call' | 'put' | null
+  volWeight: number
+  volNote: string
+  relVolume: number
+  agree: boolean
+  composite: number
+  direction: 'call' | 'put' | null
+  qualifies: boolean
+}
+
+export interface TickVolumeScanResponse {
+  ok: boolean
+  tf: Timeframe
+  scanned: number
+  qualifying: number
+  rows: TickVolumeScanRow[]
+  ts: number
+}
+
+export async function getTickVolumeScan(tf: Timeframe): Promise<TickVolumeScanResponse> {
+  return osGet<TickVolumeScanResponse>('/tick_volume_scan', { tf })
+}
+
 // ---- chart-signal outcome stats (Task 64-c: the honesty loop) ------------
 
 export type SignalOutcomeId = 'win' | 'loss' | 'flat' | 'timeout'

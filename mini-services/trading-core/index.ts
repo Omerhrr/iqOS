@@ -39,9 +39,10 @@ import { findTriangles, fitTriangulation, legsForCross, orientCandles, TRIANGULA
 import { fitAdxPatternBias } from './src/analytics/adxpatternbias'
 import { fitShockPressure } from './src/analytics/shockpressure'
 import { normalizeSpec, type CustomSpec } from './src/strategies/custom'
-import { MINABLE_ENGINES, ENGINE_LABEL, type ChartEngineId, engineVoteSingle, otcFootprintVote, type OtcFpRead } from './src/analytics/chartsignals'
+import { MINABLE_ENGINES, ENGINE_LABEL, type ChartEngineId, engineVoteSingle, otcFootprintVote, tickVote, type OtcFpRead } from './src/analytics/chartsignals'
 import { combineRenkoFootprint, type RenkoFootprintFit } from './src/analytics/renkofootprint'
 import { volumeVote, combineVolumeFootprint } from './src/analytics/volumefootprint'
+import { combineTickVolume } from './src/analytics/tickvolume'
 import { vskMonteCarlo } from './src/analytics/vsk'
 import { tskMonteCarlo } from './src/analytics/tsk'
 import { ALL_TIMEFRAMES, type Candle, type Timeframe, type Position } from './src/types'
@@ -744,6 +745,64 @@ function scanVolumeFootprint(market: MarketDataService, tfv: Timeframe): VolumeF
   }
   rows.sort((x, y) => Number(y.qualifies) - Number(x.qualifies) || Math.abs(y.composite) - Math.abs(x.composite))
   volumeFootprintScanCache.set(tfv, { ts: Date.now(), rows })
+  return rows
+}
+
+// Ticks + Volume (real market only - see analytics/tickvolume.ts's honesty
+// header): the tick-bar trend read (real sub-candle ticks when the ring
+// buffer has them, else the 1m-close pseudo-tick fallback the vote's own
+// note discloses) paired with the relative-volume surge read, agreement-
+// gated. Same shape as the other scanners.
+interface TickVolumeScanRow {
+  asset: string
+  name: string
+  category: string
+  otc: boolean
+  open: boolean
+  price: number
+  tickDir: 'call' | 'put' | null
+  tickWeight: number
+  tickNote: string
+  volDir: 'call' | 'put' | null
+  volWeight: number
+  volNote: string
+  relVolume: number
+  agree: boolean
+  composite: number
+  direction: 'call' | 'put' | null
+  qualifies: boolean
+}
+
+const tickVolumeScanCache = new Map<Timeframe, { ts: number; rows: TickVolumeScanRow[] }>()
+
+function scanTickVolume(market: MarketDataService, tfv: Timeframe): TickVolumeScanRow[] {
+  const cached = tickVolumeScanCache.get(tfv)
+  if (cached && Date.now() - cached.ts < SCAN_CACHE_MS) return cached.rows
+  const rows: TickVolumeScanRow[] = []
+  for (const a of market.assets) {
+    if (!a.open || a.otc) continue
+    try {
+      const candles = market.getCandlesDeep(a.ticker, tfv, 240, true)
+      if (candles.length < 40) continue
+      const realTicks = market.recentTicks(a.ticker, 400).map((t) => ({ time: t.ts / 1000, price: t.price }))
+      const tick = tickVote(candles, realTicks)
+      const vol = volumeVote(candles)
+      const fit = combineTickVolume(tick, vol)
+      rows.push({
+        asset: a.ticker,
+        name: a.name,
+        category: a.category,
+        otc: false,
+        open: a.open,
+        price: candles[candles.length - 1]?.close ?? 0,
+        ...fit,
+      })
+    } catch {
+      /* one bad asset never breaks the scan */
+    }
+  }
+  rows.sort((x, y) => Number(y.qualifies) - Number(x.qualifies) || Math.abs(y.composite) - Math.abs(x.composite))
+  tickVolumeScanCache.set(tfv, { ts: Date.now(), rows })
   return rows
 }
 
@@ -2181,6 +2240,20 @@ const httpServer = createServer(async (req, res) => {
           const tfv = tfStrict(q.get('tf'))
           if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
           const rows = scanVolumeFootprint(market, tfv)
+          return json(200, { ok: true, tf: tfv, scanned: rows.length, qualifying: rows.filter((r) => r.qualifies).length, rows, ts: Date.now() })
+        } catch (err) {
+          return json(400, { ok: false, error: (err as Error).message })
+        }
+      }
+
+      // Ticks + Volume scan (real market only - see analytics/tickvolume.ts):
+      // tick-bar trend read paired with the relative-volume surge read,
+      // agreement-gated.
+      if (path === '/tick_volume_scan') {
+        try {
+          const tfv = tfStrict(q.get('tf'))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const rows = scanTickVolume(market, tfv)
           return json(200, { ok: true, tf: tfv, scanned: rows.length, qualifying: rows.filter((r) => r.qualifies).length, rows, ts: Date.now() })
         } catch (err) {
           return json(400, { ok: false, error: (err as Error).message })

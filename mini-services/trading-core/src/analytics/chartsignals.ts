@@ -258,7 +258,7 @@ function pnfVote(candles: Candle[]): ChartEngineVote {
   return { engine: 'pnf', dir: 0, weight: 0, note: 'no column' }
 }
 
-function tickVote(candles: Candle[], realTicks: TickPoint[] | null): ChartEngineVote {
+export function tickVote(candles: Candle[], realTicks: TickPoint[] | null): ChartEngineVote {
   // Real sub-candle ticks when the engine's ring buffer has them (sim bus);
   // otherwise the honest fallback is 1m closes as pseudo-ticks (the same
   // fallback the /ticks chart engine labels dataSource 'candle').
