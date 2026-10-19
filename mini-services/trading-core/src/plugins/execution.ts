@@ -341,9 +341,21 @@ export class ExecutionService {
     let position: Position
 
     if (kind === 'binary' || kind === 'turbo') {
-      const expiryBars = this.resolveExpiryBars(req.tf, req.expiryTf, req.expiryBars)
+      // TradeTicket.tsx now sends an exact expirySec for binary/turbo too
+      // (a direct 1/5min-style duration picker, matching what IQ Option's
+      // real broker actually supports - see placeLiveOrder below). Prefer
+      // it outright when present: re-deriving the settle time by rounding
+      // expirySec into "bars of tf" and back can drift off the exact
+      // second the user actually picked. Falls back to the old bars/tf
+      // resolution for any older caller that only sends expiryBars/expiryTf.
+      const expiryBars = req.expirySec !== undefined ? Math.max(1, Math.round(req.expirySec / tfSec)) : this.resolveExpiryBars(req.tf, req.expiryTf, req.expiryBars)
       // turbo on short TFs settles in whole seconds, minimum 30s
-      const settleSec = kind === 'turbo' ? Math.max(30, expiryBars * tfSec) : expiryBars * tfSec
+      const settleSec =
+        req.expirySec !== undefined
+          ? Math.max(kind === 'turbo' ? 30 : 1, req.expirySec)
+          : kind === 'turbo'
+            ? Math.max(30, expiryBars * tfSec)
+            : expiryBars * tfSec
       position = {
         id: `pp-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`,
         tsOpen: this.now(),
@@ -445,9 +457,44 @@ export class ExecutionService {
     const tfSec = TIMEFRAME_SECONDS[req.tf ?? '1m']
     const resolvedExpiryBars = this.resolveExpiryBars(req.tf ?? '1m', req.expiryTf, req.expiryBars)
 
-    // options payload (binary/turbo/digital)
-    const expirySec = kind === 'digital' ? Math.max(60, req.expirySec ?? 300) : Math.max(30, resolvedExpiryBars * tfSec)
+    // options payload (binary/turbo/digital). For binary/turbo, prefer an
+    // exact req.expirySec when sent (TradeTicket.tsx's duration picker now
+    // sends one directly) over re-deriving it through bars*tfSec, which can
+    // round away from the precise minute value the broker actually needs.
+    const expirySec =
+      kind === 'digital'
+        ? Math.max(60, req.expirySec ?? 300)
+        : req.expirySec !== undefined
+          ? Math.max(30, req.expirySec)
+          : Math.max(30, resolvedExpiryBars * tfSec)
     const expiryMin = Math.max(1, Math.round(expirySec / 60))
+
+    // BUG FIX: IQ Option's real buyv3 endpoint only accepts specific
+    // durations for binary/turbo (binary-option: 1 or 5 minutes ONLY;
+    // turbo-option: 1-5 minutes) - anything else is rejected by the broker
+    // with the misleading "Cannot purchase an option (the asset is not
+    // available at the moment)" message, which has nothing to do with the
+    // asset actually being open. Neither execution.ts nor the sidecar used
+    // to validate expiryMin against this before sending it, so adding the
+    // independent expiryTf field (which lets expiryMin come out as ANY
+    // value, e.g. tf=1m + expiryTf=15m -> 15 minutes) newly exposed this:
+    // a perfectly valid-looking expiry choice could silently produce a
+    // duration the broker has never supported. Paper trading is unaffected
+    // (it never calls the real broker, so this check only runs here in the
+    // LIVE path) - this turns that cryptic broker rejection into an
+    // upfront, actionable error instead.
+    if (kind === 'binary' && expiryMin !== 1 && expiryMin !== 5) {
+      return {
+        ok: false,
+        error: `IQ Option binary options only support 1 or 5 minute expiries - your expiry resolves to ${expiryMin}m. Pick an expiry timeframe/bar count that works out to exactly 1 or 5 minutes against this trade's ${req.tf ?? '1m'} tf.`,
+      }
+    }
+    if (kind === 'turbo' && (expiryMin < 1 || expiryMin > 5)) {
+      return {
+        ok: false,
+        error: `IQ Option turbo options only support 1-5 minute expiries - your expiry resolves to ${expiryMin}m. Pick an expiry timeframe/bar count that works out to 1-5 minutes against this trade's ${req.tf ?? '1m'} tf.`,
+      }
+    }
 
     // CFD-style live payload for spot categories
     const isCfd = kind === 'cfd'

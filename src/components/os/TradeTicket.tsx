@@ -5,7 +5,21 @@ import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { AccountState, AssetRow, Position, Timeframe, TradeKind } from '@/lib/os/client'
-import { KIND_LABEL, TIMEFRAMES, fmtMoney, fmtPrice, osGet, osPost } from '@/lib/os/client'
+import { KIND_LABEL, TIMEFRAME_SECONDS, fmtMoney, fmtPrice, osGet, osPost } from '@/lib/os/client'
+
+// IQ Option's real broker only ever accepts these durations for binary/turbo
+// options - anything else is rejected with its own misleading "asset is not
+// available" message. Used to clamp both the UI's own chip picker and any
+// signal-prefilled expiry (which arrives as "N bars of the chart's tf" and
+// needs converting to a real minute count before it can be clamped).
+function clampOptionExpiryMin(kind: TradeKind, minutes: number): number {
+  if (kind === 'binary') {
+    const valid = [1, 5]
+    return valid.reduce((best, v) => (Math.abs(v - minutes) < Math.abs(best - minutes) ? v : best))
+  }
+  if (kind === 'turbo') return Math.max(1, Math.min(5, Math.round(minutes)))
+  return minutes
+}
 
 // Task 64-b: a chart-signal can load the ticket - kind, expiry and CFD
 // levels arrive pre-filled, the voted side is highlighted. The money action
@@ -41,19 +55,17 @@ export default function TradeTicket({ asset, tf, price, account, prefill, onPlac
   const [kind, setKind] = useState<TradeKind>('binary')
   const [side, setSide] = useState<'call' | 'put' | null>(null)
   const [amount, setAmount] = useState('1')
-  // BUG FIX: this used to be "N bars of the chart's CURRENT tf" with no
-  // independent unit of its own - the chart's tf fed into the actual
-  // settle-time math server-side (execution.ts), so simply flipping the
-  // chart timeframe after setting this (without touching this field at
-  // all) silently changed how long the trade would actually run, even
-  // though the number on screen never changed. expiryTf is now a real,
-  // independent expiry timeframe (defaults to whatever the chart is on at
-  // mount, but does NOT keep following it afterward) sent to /trade
-  // alongside the chart's tf - the backend resolves the real bar count from
-  // the RATIO of the two, exactly like the autotrader's own expiryTf field
-  // in os-mode.ts already does.
-  const [expiryTf, setExpiryTf] = useState<Timeframe>(tf)
-  const [expiryBars, setExpiryBars] = useState('1')
+  // BUG FIX (round 2): round 1 replaced "N bars of the chart's CURRENT tf"
+  // (which silently changed duration whenever you switched the chart's
+  // timeframe) with an independent expiryTf - but that still let you pick
+  // ANY resulting duration, and IQ Option's real broker only ever accepts
+  // 1 or 5 MINUTE expiries for binary options (1-5 minutes for turbo) -
+  // anything else gets rejected with the broker's own misleading "asset is
+  // not available" message, even though the asset is genuinely open. So
+  // binary/turbo now pick a duration DIRECTLY, in minutes, from exactly the
+  // set IQ Option supports - no tf/bars math involved at all, same as how
+  // digital already worked below.
+  const [optionExpiryMin, setOptionExpiryMin] = useState(1)
   const [digitalExpiry, setDigitalExpiry] = useState(300)
   const [strikeOffset, setStrikeOffset] = useState('0')
   const [leverage, setLeverage] = useState(String(asset?.leverage ?? 10))
@@ -67,12 +79,25 @@ export default function TradeTicket({ asset, tf, price, account, prefill, onPlac
   useEffect(() => {
     if (!prefill) return
     setKind(prefill.kind)
-    if (prefill.expiryBars !== undefined) setExpiryBars(String(prefill.expiryBars))
+    // prefill.expiryBars arrives as "N bars of the chart's tf" from whatever
+    // signal suggested it - convert to minutes and clamp to what IQ Option's
+    // broker actually supports for that kind before applying it.
+    if (prefill.expiryBars !== undefined && (prefill.kind === 'binary' || prefill.kind === 'turbo')) {
+      const minutes = (prefill.expiryBars * (TIMEFRAME_SECONDS[tf] ?? 60)) / 60
+      setOptionExpiryMin(clampOptionExpiryMin(prefill.kind, minutes))
+    }
     if (prefill.digitalExpirySec !== undefined) setDigitalExpiry(prefill.digitalExpirySec)
     if (prefill.tpPct !== undefined) setTp(String(prefill.tpPct))
     if (prefill.slPct !== undefined) setSl(String(prefill.slPct))
     setFromSignal({ label: prefill.source, side: prefill.side })
   }, [prefill?.nonce])
+
+  // kind switch (e.g. turbo's 3m -> binary, which doesn't support 3m):
+  // snap to the nearest duration the NEW kind actually supports instead of
+  // silently carrying over an invalid one.
+  useEffect(() => {
+    setOptionExpiryMin((m) => clampOptionExpiryMin(kind, m))
+  }, [kind])
 
   const amt = Math.max(0, Number(amount) || 0)
   const payout =
@@ -96,11 +121,10 @@ export default function TradeTicket({ asset, tf, price, account, prefill, onPlac
         side: s,
         kind,
         amount: amt,
-        // expiryTf is the real fix: an independent expiry duration the
-        // backend resolves against the chart's tf (see execution.ts). The
-        // raw expiryBars still ships too, purely as the pre-fix fallback
-        // for any older backend that doesn't yet understand expiryTf.
-        ...(kind === 'binary' || kind === 'turbo' ? { expiryTf, expiryBars: Number(expiryBars) || 1 } : {}),
+        // exact duration in seconds, picked directly from IQ's own
+        // supported set (see optionExpiryMin above) - no tf/bars
+        // conversion for the backend to get wrong or round badly.
+        ...(kind === 'binary' || kind === 'turbo' ? { expirySec: optionExpiryMin * 60 } : {}),
         ...(kind === 'digital' ? { expirySec: digitalExpiry, strikeOffsetPct: Number(strikeOffset) || 0 } : {}),
         ...(kind === 'cfd' ? { leverage: lev, tp: Number(tp), sl: Number(sl) } : {}),
         // Task 58 (P2): the hardcoded mode:'paper' is GONE - the kernel routes
@@ -188,54 +212,44 @@ export default function TradeTicket({ asset, tf, price, account, prefill, onPlac
 
         {kind === 'binary' && (
           <div>
-            <div className="mb-1 text-[9px] uppercase tracking-wider text-[#4b5a72]" title="independent of the chart's own tf - changing the chart timeframe no longer changes this trade's duration">
-              Expiry (bars of expiry-tf, not chart tf)
+            <div className="mb-1 text-[9px] uppercase tracking-wider text-[#4b5a72]" title="IQ Option's binary options only ever settle at exactly 1 or 5 minutes - not a chart-timeframe multiple">
+              Expiry
             </div>
-            <div className="flex gap-1">
-              <Input
-                value={expiryBars}
-                onChange={(e) => setExpiryBars(e.target.value.replace(/[^0-9]/g, ''))}
-                className="h-8 w-14 border-[#1c2739] bg-[#101828] text-right text-[12px] text-[#e2e8f0]"
-              />
-              <select
-                value={expiryTf}
-                onChange={(e) => setExpiryTf(e.target.value as Timeframe)}
-                className="h-8 flex-1 rounded border border-[#1c2739] bg-[#101828] px-1 font-mono text-[11px] text-[#e2e8f0] outline-none"
-                title="the expiry's own timeframe - independent of whatever tf the chart is currently showing"
-              >
-                {TIMEFRAMES.map((t) => (
-                  <option key={t} value={t}>
-                    {t}
-                  </option>
-                ))}
-              </select>
+            <div className="grid grid-cols-2 gap-1">
+              {[1, 5].map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => setOptionExpiryMin(m)}
+                  className={`rounded border py-1 text-[10px] font-mono transition-colors ${
+                    optionExpiryMin === m ? 'border-violet-500/50 bg-violet-500/10 text-violet-300' : 'border-[#1c2739] bg-[#101828] text-[#7c8aa5]'
+                  }`}
+                >
+                  {m}m
+                </button>
+              ))}
             </div>
           </div>
         )}
 
         {kind === 'turbo' && (
           <div>
-            <div className="mb-1 text-[9px] uppercase tracking-wider text-[#4b5a72]" title="independent of the chart's own tf - changing the chart timeframe no longer changes this trade's duration">
-              Expiry (bars of expiry-tf, min 30s)
+            <div className="mb-1 text-[9px] uppercase tracking-wider text-[#4b5a72]" title="IQ Option's turbo options settle anywhere from 1 to 5 minutes - not a chart-timeframe multiple">
+              Expiry
             </div>
-            <div className="flex gap-1">
-              <Input
-                value={expiryBars}
-                onChange={(e) => setExpiryBars(e.target.value.replace(/[^0-9]/g, ''))}
-                className="h-8 w-14 border-[#1c2739] bg-[#101828] text-right text-[12px] text-[#e2e8f0]"
-              />
-              <select
-                value={expiryTf}
-                onChange={(e) => setExpiryTf(e.target.value as Timeframe)}
-                className="h-8 flex-1 rounded border border-[#1c2739] bg-[#101828] px-1 font-mono text-[11px] text-[#e2e8f0] outline-none"
-                title="the expiry's own timeframe - independent of whatever tf the chart is currently showing"
-              >
-                {TIMEFRAMES.map((t) => (
-                  <option key={t} value={t}>
-                    {t}
-                  </option>
-                ))}
-              </select>
+            <div className="grid grid-cols-5 gap-1">
+              {[1, 2, 3, 4, 5].map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => setOptionExpiryMin(m)}
+                  className={`rounded border py-1 text-[10px] font-mono transition-colors ${
+                    optionExpiryMin === m ? 'border-violet-500/50 bg-violet-500/10 text-violet-300' : 'border-[#1c2739] bg-[#101828] text-[#7c8aa5]'
+                  }`}
+                >
+                  {m}m
+                </button>
+              ))}
             </div>
           </div>
         )}
