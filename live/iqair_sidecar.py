@@ -770,7 +770,7 @@ def _buy_fast(amount, active_id, direction, expiry_minutes, symbol=None):
     return True, resp["id"], expired
 
 
-def _buy_blitz(amount, active_id, direction, duration_sec):
+def _buy_blitz(amount, active_id, direction, duration_sec, profit_percent=80):
     """Blitz-option order: NOT supported by the iqair library at all (it only
     knows "blitz-option" as a label for reading portfolio/history, never for
     placing one - see the big comment on this in the /trade handler below),
@@ -780,14 +780,25 @@ def _buy_blitz(amount, active_id, direction, duration_sec):
     ever sets option_type_id to 1 or 3).
 
     Body shape and field names (user_balance_id, active_id, option_type_id,
-    direction, expired, refund_value, price, expiration_size) are copied
-    EXACTLY from a real captured blitz trade (HAR+console capture, 2026-10-19)
-    - option_type_id 12 is what IQ Option's own web client sent for a blitz
-    order; expiration_size is the blitz duration in SECONDS (not minutes -
-    blitz durations are sub-minute). This is reverse-engineered from a single
-    sample, not from any documented API, so treat it as best-effort: a
-    rejection here may mean a field this capture didn't exercise (e.g. an
-    unsupported duration_sec) rather than a real "asset unavailable".
+    direction, expired, refund_value, price, expiration_size, profit_percent)
+    are copied EXACTLY from a real captured blitz trade (HAR+console capture,
+    2026-10-19) - option_type_id 12 is what IQ Option's own web client sent
+    for a blitz order; expiration_size is the blitz duration in SECONDS (not
+    minutes - blitz durations are sub-minute). This is reverse-engineered
+    from a single sample, not from any documented API, so treat it as
+    best-effort: a rejection here may mean a field this capture didn't
+    exercise (e.g. an unsupported duration_sec) rather than a real "asset
+    unavailable".
+
+    profit_percent: THE SERVER REJECTS THE ORDER WITHOUT IT ("mandatory field
+    OpenOptionRequestV2.ProfitPercent is not found") - confirmed live
+    (2026-10-19). It's the displayed payout percentage (e.g. 87 for +87%),
+    which the real web client reads off its own live quote stream before
+    building the request - this sidecar has no equivalent live blitz payout
+    feed, so the caller (the /trade handler, which gets it from the kernel's
+    own best-estimate payout) is expected to pass the real current number;
+    the 80 default here is only a last-resort fallback and may not match
+    what IQ Option is actually quoting right now for this active_id.
 
     Returns (True, order_id, expired_unix | None) or (False, reason, None) -
     same contract as _buy_fast()."""
@@ -805,6 +816,7 @@ def _buy_blitz(amount, active_id, direction, duration_sec):
         "refund_value": 0,
         "price": amount,
         "expiration_size": int(duration_sec),
+        "profit_percent": int(round(profit_percent)),
     }
     msg = {"name": "binary-options.open-option", "version": "2.0", "body": body}
     _client.api.send_websocket_request("sendMessage", msg, req_id)
@@ -1222,6 +1234,9 @@ class Handler(BaseHTTPRequestHandler):
                     # a 5s/10s/15s/30s duration, so the kernel sends the exact
                     # seconds separately for blitz orders only (see _buy_blitz)
                     expiry_seconds_raw = body.get("expiry_seconds")
+                    # blitz-only: see _buy_blitz's profit_percent docstring -
+                    # the broker rejects a blitz order outright without this
+                    profit_percent_raw = body.get("profit_percent")
                     leverage = body.get("leverage")
                     strike_offset = body.get("strike_offset_pct")
                     expired = None  # broker echo of the real expiration (options family)
@@ -1259,6 +1274,10 @@ class Handler(BaseHTTPRequestHandler):
                         except (TypeError, ValueError):
                             blitz_duration_sec = max(1, expiry) * 60
                         blitz_duration_sec = max(1, min(300, blitz_duration_sec))
+                        try:
+                            blitz_profit_percent = float(profit_percent_raw) if profit_percent_raw is not None else 80.0
+                        except (TypeError, ValueError):
+                            blitz_profit_percent = 80.0
                         dig_id = _resolve_digital_id(asset) if digital_req or tb_id is None else None
                         # speak the account's dialect for the actual buy calls
                         # (EURUSD_otc -> EURUSD-OTC etc.) - buy_digital_spot
@@ -1283,7 +1302,7 @@ class Handler(BaseHTTPRequestHandler):
                                 # docstring for why (the iqair library has no
                                 # blitz support whatsoever, this is a raw,
                                 # reverse-engineered websocket request)
-                                check, order_id, expired = _buy_blitz(amount, int(tb_id), direction, blitz_duration_sec)
+                                check, order_id, expired = _buy_blitz(amount, int(tb_id), direction, blitz_duration_sec, blitz_profit_percent)
                                 mode = tb_group
                             elif tb_id is not None:
                                 # turbo/binary fast path (also the fallback when

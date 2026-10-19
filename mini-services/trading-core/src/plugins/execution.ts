@@ -509,6 +509,16 @@ export class ExecutionService {
       }
     }
 
+    // blitz-only: IQ Option's own open-option v2.0 call rejects a blitz order
+    // outright without a profit_percent field ("mandatory field
+    // OpenOptionRequestV2.ProfitPercent is not found") - confirmed live
+    // (2026-10-19). There's no live blitz payout feed from the sidecar (iqair
+    // never reports one, same gap payoutFor()'s 'blitz' branch already works
+    // around), so this sends the kernel's own best-estimate payout as a
+    // percent - the closest approximation available, not necessarily what
+    // IQ Option is quoting at the exact instant the order lands.
+    const blitzProfitPercent = kind === 'blitz' ? Math.round(this.market.payoutFor(req.asset, 'blitz') * 100) : undefined
+
     // CFD-style live payload for spot categories
     const isCfd = kind === 'cfd'
     const instrumentType = isCfd
@@ -546,7 +556,7 @@ export class ExecutionService {
           // minute and silently trade the wrong duration, so the sidecar
           // reads expiry_seconds instead for blitz (see /trade's
           // "options family" branch in iqair_sidecar.py)
-          ...(kind === 'blitz' ? { expiry_seconds: expirySec } : {}),
+          ...(kind === 'blitz' ? { expiry_seconds: expirySec, profit_percent: blitzProfitPercent } : {}),
           mode: instrumentType,
           ...(kind === 'digital' ? { strike_offset_pct: req.strikeOffsetPct ?? 0 } : {}),
           ...(isCfd ? { leverage: req.leverage ?? info?.leverage ?? 10, tp: req.tp, sl: req.sl } : {}),
