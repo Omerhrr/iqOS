@@ -55,20 +55,21 @@ export interface AssetInfo {
 export type MarketMode = 'sim' | 'live'
 
 export type Side = 'call' | 'put'
-export type TradeKind = 'binary' | 'turbo' | 'digital' | 'cfd'
+export type TradeKind = 'binary' | 'turbo' | 'blitz' | 'digital' | 'cfd'
 
 /** Trade kinds a given instrument supports. */
 export const CATEGORY_KINDS: Record<AssetCategory, TradeKind[]> = {
-  forex: ['binary', 'turbo', 'digital', 'cfd'],
-  crypto: ['binary', 'turbo', 'digital', 'cfd'],
-  commodity: ['binary', 'turbo', 'digital', 'cfd'],
-  stock: ['binary', 'turbo', 'digital', 'cfd'],
-  index: ['binary', 'turbo', 'digital', 'cfd'],
+  forex: ['binary', 'turbo', 'blitz', 'digital', 'cfd'],
+  crypto: ['binary', 'turbo', 'blitz', 'digital', 'cfd'],
+  commodity: ['binary', 'turbo', 'blitz', 'digital', 'cfd'],
+  stock: ['binary', 'turbo', 'blitz', 'digital', 'cfd'],
+  index: ['binary', 'turbo', 'blitz', 'digital', 'cfd'],
 }
 
 export const TRADE_KIND_LABEL: Record<TradeKind, string> = {
   binary: 'Binary',
   turbo: 'Turbo',
+  blitz: 'Blitz',
   digital: 'Digital',
   cfd: 'CFD',
 }

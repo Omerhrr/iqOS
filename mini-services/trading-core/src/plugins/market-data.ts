@@ -1123,7 +1123,7 @@ export class MarketDataService {
    * live mode) use the account's REAL reported payouts; the sim universe
    * keeps its own modeled payouts for paper settlement. Digital has no real
    * IQ figure in iqair 1.0.0 - the binary payout is the honest estimate. */
-  payoutFor(ticker: string, kind: 'binary' | 'turbo' | 'digital' | 'cfd'): number {
+  payoutFor(ticker: string, kind: 'binary' | 'turbo' | 'blitz' | 'digital' | 'cfd'): number {
     if (kind === 'cfd') return 1
     // AUDIT FIX (Task 58, P2): the lookup used the OS ticker only, so remapped
     // instruments (UKBrent→OIL_BRENT, USCrude→OIL_WTI, NASDAQ100→NSDQ100,
@@ -1136,11 +1136,14 @@ export class MarketDataService {
     const a = getInstrument(ticker)
     if (iq && (!a || this.mode === 'live')) {
       const base = iq.binary ?? (a ? a.payout : 0.85)
-      if (kind === 'turbo') return iq.turbo ?? base
+      // no real blitz payout figure comes back from the sidecar (iqair never
+      // reports one) - turbo is the closest real proxy, same reasoning as the
+      // sim branch below
+      if (kind === 'turbo' || kind === 'blitz') return iq.turbo ?? base
       return base // binary + digital (no real digital figure available)
     }
     if (!a) return 0.8
-    if (kind === 'turbo') return a.turboPayout ?? a.payout - 0.02
+    if (kind === 'turbo' || kind === 'blitz') return a.turboPayout ?? a.payout - 0.02
     if (kind === 'digital') return a.digitalPayout ?? a.payout + 0.05
     return a.payout
   }

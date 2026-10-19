@@ -340,7 +340,7 @@ export class ExecutionService {
     const tfSec = TIMEFRAME_SECONDS[req.tf]
     let position: Position
 
-    if (kind === 'binary' || kind === 'turbo') {
+    if (kind === 'binary' || kind === 'turbo' || kind === 'blitz') {
       // TradeTicket.tsx now sends an exact expirySec for binary/turbo too
       // (a direct 1/5min-style duration picker, matching what IQ Option's
       // real broker actually supports - see placeLiveOrder below). Prefer
@@ -348,14 +348,25 @@ export class ExecutionService {
       // expirySec into "bars of tf" and back can drift off the exact
       // second the user actually picked. Falls back to the old bars/tf
       // resolution for any older caller that only sends expiryBars/expiryTf.
-      const expiryBars = req.expirySec !== undefined ? Math.max(1, Math.round(req.expirySec / tfSec)) : this.resolveExpiryBars(req.tf, req.expiryTf, req.expiryBars)
-      // turbo on short TFs settles in whole seconds, minimum 30s
+      // blitz is sub-minute (5-60s, see BLITZ_EXPIRY_SECONDS) - never run it
+      // through the bars/tf resolver, which floors to whole bars of the
+      // chart tf and would round a 5s blitz up to a full minute.
+      const expiryBars =
+        kind === 'blitz'
+          ? Math.max(1, Math.round((req.expirySec ?? 60) / tfSec))
+          : req.expirySec !== undefined
+            ? Math.max(1, Math.round(req.expirySec / tfSec))
+            : this.resolveExpiryBars(req.tf, req.expiryTf, req.expiryBars)
+      // turbo on short TFs settles in whole seconds, minimum 30s; blitz has
+      // no such floor (IQ's own blitz picker goes down to 5s)
       const settleSec =
-        req.expirySec !== undefined
-          ? Math.max(kind === 'turbo' ? 30 : 1, req.expirySec)
-          : kind === 'turbo'
-            ? Math.max(30, expiryBars * tfSec)
-            : expiryBars * tfSec
+        kind === 'blitz'
+          ? Math.max(1, req.expirySec ?? 60)
+          : req.expirySec !== undefined
+            ? Math.max(kind === 'turbo' ? 30 : 1, req.expirySec)
+            : kind === 'turbo'
+              ? Math.max(30, expiryBars * tfSec)
+              : expiryBars * tfSec
       position = {
         id: `pp-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`,
         tsOpen: this.now(),
@@ -464,9 +475,11 @@ export class ExecutionService {
     const expirySec =
       kind === 'digital'
         ? Math.max(60, req.expirySec ?? 300)
-        : req.expirySec !== undefined
-          ? Math.max(30, req.expirySec)
-          : Math.max(30, resolvedExpiryBars * tfSec)
+        : kind === 'blitz'
+          ? Math.max(1, req.expirySec ?? 60) // sub-minute - see expiry_seconds below, never rounded to minutes
+          : req.expirySec !== undefined
+            ? Math.max(30, req.expirySec)
+            : Math.max(30, resolvedExpiryBars * tfSec)
     const expiryMin = Math.max(1, Math.round(expirySec / 60))
 
     // BUG FIX: IQ Option's real buyv3 endpoint only accepts specific
@@ -512,7 +525,9 @@ export class ExecutionService {
         ? 'digital-option'
         : kind === 'turbo'
           ? 'turbo-option'
-          : 'binary-option'
+          : kind === 'blitz'
+            ? 'blitz-option'
+            : 'binary-option'
 
     // Task 58 (P2): count this placement toward maxOpen while the /trade
     // round-trip is in flight (see riskCheck's TOCTOU note)
@@ -527,6 +542,11 @@ export class ExecutionService {
           amount: req.amount,
           direction: req.side === 'call' ? 'call' : 'put',
           expiry_minutes: expiryMin,
+          // blitz is sub-minute - expiryMin would floor/round it to a whole
+          // minute and silently trade the wrong duration, so the sidecar
+          // reads expiry_seconds instead for blitz (see /trade's
+          // "options family" branch in iqair_sidecar.py)
+          ...(kind === 'blitz' ? { expiry_seconds: expirySec } : {}),
           mode: instrumentType,
           ...(kind === 'digital' ? { strike_offset_pct: req.strikeOffsetPct ?? 0 } : {}),
           ...(isCfd ? { leverage: req.leverage ?? info?.leverage ?? 10, tp: req.tp, sl: req.sl } : {}),
@@ -574,11 +594,13 @@ export class ExecutionService {
         ? kind
         : data.mode === 'digital-option'
           ? 'digital'
-          : data.mode === 'turbo-option' || data.mode === 'turbo'
-            ? 'turbo'
-            : data.mode === 'binary-option' || data.mode === 'binary'
-              ? 'binary'
-              : kind
+          : data.mode === 'blitz-option' || data.mode === 'blitz'
+            ? 'blitz'
+            : data.mode === 'turbo-option' || data.mode === 'turbo'
+              ? 'turbo'
+              : data.mode === 'binary-option' || data.mode === 'binary'
+                ? 'binary'
+                : kind
       // The broker echoes the REAL expiration (minute-boundary aligned) - IQ
       // may settle up to ~30s either side of our now+N*60 estimate.
       const nowS = this.now()
@@ -597,15 +619,27 @@ export class ExecutionService {
         amount: req.amount,
         expiryBars: resolvedExpiryBars,
         entryPrice: this.market.getPrice(req.asset),
-        payout: effectiveKind === 'digital' ? this.market.payoutFor(req.asset, 'digital') : effectiveKind === 'turbo' ? this.market.payoutFor(req.asset, 'turbo') : effectiveKind === 'cfd' ? 1 : this.market.payoutFor(req.asset, 'binary'),
+        payout:
+          effectiveKind === 'digital'
+            ? this.market.payoutFor(req.asset, 'digital')
+            : effectiveKind === 'turbo'
+              ? this.market.payoutFor(req.asset, 'turbo')
+              : effectiveKind === 'blitz'
+                ? this.market.payoutFor(req.asset, 'blitz')
+                : effectiveKind === 'cfd'
+                  ? 1
+                  : this.market.payoutFor(req.asset, 'binary'),
         status: 'open',
         leverage: isCfd ? req.leverage ?? info?.leverage ?? 10 : undefined,
         strike: effectiveKind === 'digital' && req.strikeOffsetPct ? this.market.getPrice(req.asset) * (1 + (req.side === 'call' ? req.strikeOffsetPct : -req.strikeOffsetPct) / 100) : undefined,
-        expirySec: effectiveKind === 'digital' ? expirySec : undefined,
+        expirySec: effectiveKind === 'digital' || effectiveKind === 'blitz' ? expirySec : undefined,
         tp: req.tp,
         sl: req.sl,
         liveOrderId: orderId,
-        settlesAt: isCfd ? undefined : echoExp ?? this.now() + expiryMin * 60,
+        // blitz is sub-minute - falling back to expiryMin*60 here would round
+        // e.g. a 5s blitz trade up to a full minute whenever the broker
+        // doesn't echo `expired` back, badly misreporting when it actually settles
+        settlesAt: isCfd ? undefined : echoExp ?? this.now() + (effectiveKind === 'blitz' ? expirySec : expiryMin * 60),
         // THE BUG: this Position literal never carried `note` through, unlike
         // the paper-order branch above (`note: req.note`). Every live trade's
         // `note` therefore came back as `bot:${bot.id}` ... undefined, so
@@ -1096,7 +1130,7 @@ export class ExecutionService {
     // CFDs have no options-family history row to match - never mislabel a
     // cfd lookup as turbo (the old map did exactly that)
     if (kind === 'cfd') return null
-    const mode = kind === 'digital' ? 'digital' : kind === 'binary' ? 'binary' : 'turbo'
+    const mode = kind === 'digital' ? 'digital' : kind === 'binary' ? 'binary' : kind === 'blitz' ? 'blitz' : 'turbo'
     const res = await this.postLive('/order_result', { order_id: liveOrderId, mode, max_wait_sec: 6 }, 10_000)
     // null here means the HTTP call itself failed/timed out (network to the
     // sidecar, not the broker) - the caller already treats that as "keep
@@ -1133,9 +1167,11 @@ export class ExecutionService {
   private async reconcileLiveMeta(posId: string, orderId: string, modeHint: string): Promise<void> {
     const types = modeHint.startsWith('digital')
       ? ['digital-option', 'turbo-option', 'binary-option']
-      : modeHint === 'binary'
-        ? ['binary-option', 'turbo-option']
-        : ['turbo-option', 'binary-option', 'digital-option']
+      : modeHint.startsWith('blitz')
+        ? ['blitz-option', 'turbo-option', 'binary-option']
+        : modeHint === 'binary'
+          ? ['binary-option', 'turbo-option']
+          : ['turbo-option', 'binary-option', 'digital-option']
     for (const itype of types) {
       const res = await this.postLive('/positions', { instrument_type: itype }, 35_000)
       if (!res || !Array.isArray(res.positions)) continue

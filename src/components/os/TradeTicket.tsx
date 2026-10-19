@@ -5,7 +5,7 @@ import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { AccountState, AssetRow, Position, Timeframe, TradeKind } from '@/lib/os/client'
-import { KIND_LABEL, TIMEFRAME_SECONDS, fmtMoney, fmtPrice, osGet, osPost } from '@/lib/os/client'
+import { BLITZ_EXPIRY_SECONDS, KIND_LABEL, TIMEFRAME_SECONDS, fmtMoney, fmtPrice, osGet, osPost } from '@/lib/os/client'
 
 // IQ Option's real broker only ever accepts these durations for binary/turbo
 // options - anything else is rejected with its own misleading "asset is not
@@ -66,6 +66,10 @@ export default function TradeTicket({ asset, tf, price, account, prefill, onPlac
   // set IQ Option supports - no tf/bars math involved at all, same as how
   // digital already worked below.
   const [optionExpiryMin, setOptionExpiryMin] = useState(1)
+  // blitz is sub-minute (5-60s) - a direct seconds picker, same idea as
+  // optionExpiryMin above but never multiplied by 60. Reverse-engineered
+  // from a single captured trade - see BLITZ_EXPIRY_SECONDS in client.ts.
+  const [blitzExpirySec, setBlitzExpirySec] = useState(60)
   const [digitalExpiry, setDigitalExpiry] = useState(300)
   const [strikeOffset, setStrikeOffset] = useState('0')
   const [leverage, setLeverage] = useState(String(asset?.leverage ?? 10))
@@ -101,14 +105,14 @@ export default function TradeTicket({ asset, tf, price, account, prefill, onPlac
 
   const amt = Math.max(0, Number(amount) || 0)
   const payout =
-    kind === 'turbo'
+    kind === 'turbo' || kind === 'blitz'
       ? asset?.turboPayout ?? (asset?.payout ?? 0.85) - 0.02
       : kind === 'digital'
         ? asset?.digitalPayout ?? (asset?.payout ?? 0.85) + 0.05
         : asset?.payout ?? 0.85
   const lev = Math.max(1, Number(leverage) || 1)
   const notional = kind === 'cfd' ? amt * lev : 0
-  const win = kind === 'cfd' ? notional * (Number(tp) / 100) : kind === 'binary' || kind === 'turbo' || kind === 'digital' ? amt * payout : amt * (Number(tp) / 100)
+  const win = kind === 'cfd' ? notional * (Number(tp) / 100) : kind === 'binary' || kind === 'turbo' || kind === 'blitz' || kind === 'digital' ? amt * payout : amt * (Number(tp) / 100)
   const riskAmt = kind === 'cfd' ? Math.min(amt, notional * (Number(sl) / 100)) : amt
 
   const place = async (s: 'call' | 'put') => {
@@ -125,6 +129,7 @@ export default function TradeTicket({ asset, tf, price, account, prefill, onPlac
         // supported set (see optionExpiryMin above) - no tf/bars
         // conversion for the backend to get wrong or round badly.
         ...(kind === 'binary' || kind === 'turbo' ? { expirySec: optionExpiryMin * 60 } : {}),
+        ...(kind === 'blitz' ? { expirySec: blitzExpirySec } : {}),
         ...(kind === 'digital' ? { expirySec: digitalExpiry, strikeOffsetPct: Number(strikeOffset) || 0 } : {}),
         ...(kind === 'cfd' ? { leverage: lev, tp: Number(tp), sl: Number(sl) } : {}),
         // Task 58 (P2): the hardcoded mode:'paper' is GONE - the kernel routes
@@ -184,8 +189,8 @@ export default function TradeTicket({ asset, tf, price, account, prefill, onPlac
       </div>
 
       {/* kind selector */}
-      <div className="grid grid-cols-4 gap-1 rounded-md bg-[#101828] p-1">
-        {(['binary', 'turbo', 'digital', 'cfd'] as TradeKind[]).map((k) => (
+      <div className="grid grid-cols-5 gap-1 rounded-md bg-[#101828] p-1">
+        {(['binary', 'turbo', 'blitz', 'digital', 'cfd'] as TradeKind[]).map((k) => (
           <button
             key={k}
             onClick={() => setKind(k)}
@@ -248,6 +253,31 @@ export default function TradeTicket({ asset, tf, price, account, prefill, onPlac
                   }`}
                 >
                   {m}m
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {kind === 'blitz' && (
+          <div>
+            <div
+              className="mb-1 text-[9px] uppercase tracking-wider text-[#4b5a72]"
+              title="Experimental: reverse-engineered from a single captured trade, not documented by IQ Option - start with the smallest stake"
+            >
+              Expiry
+            </div>
+            <div className="grid grid-cols-3 gap-1">
+              {BLITZ_EXPIRY_SECONDS.map((s) => (
+                <button
+                  key={s}
+                  type="button"
+                  onClick={() => setBlitzExpirySec(s)}
+                  className={`rounded border py-1 text-[10px] font-mono transition-colors ${
+                    blitzExpirySec === s ? 'border-violet-500/50 bg-violet-500/10 text-violet-300' : 'border-[#1c2739] bg-[#101828] text-[#7c8aa5]'
+                  }`}
+                >
+                  {s}s
                 </button>
               ))}
             </div>

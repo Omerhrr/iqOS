@@ -23,9 +23,15 @@ export const TIMEFRAME_SECONDS: Record<Timeframe, number> = {
   '1d': 86400,
 }
 
-export type TradeKind = 'binary' | 'turbo' | 'digital' | 'cfd'
-export const TRADE_KINDS: TradeKind[] = ['binary', 'turbo', 'digital', 'cfd']
-export const KIND_LABEL: Record<TradeKind, string> = { binary: 'Binary', turbo: 'Turbo', digital: 'Digital', cfd: 'CFD' }
+export type TradeKind = 'binary' | 'turbo' | 'blitz' | 'digital' | 'cfd'
+export const TRADE_KINDS: TradeKind[] = ['binary', 'turbo', 'blitz', 'digital', 'cfd']
+export const KIND_LABEL: Record<TradeKind, string> = { binary: 'Binary', turbo: 'Turbo', blitz: 'Blitz', digital: 'Digital', cfd: 'CFD' }
+// Blitz expiries are sub-minute (IQ Option's own picker is seconds-based, not
+// minutes) - this is a best-effort set reverse-engineered from a single
+// captured trade (option_type_id 12, expiration_size in seconds). Confirm
+// against IQ Option's own blitz expiry dropdown before relying on the full
+// list; start with the smallest stake if you add/remove values here.
+export const BLITZ_EXPIRY_SECONDS: number[] = [5, 10, 15, 20, 30, 60]
 
 export type ChartType =
   | 'candles' | 'hollow' | 'heikin' | 'bars' | 'line' | 'area' | 'baseline'

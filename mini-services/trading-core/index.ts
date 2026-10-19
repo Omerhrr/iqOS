@@ -3153,7 +3153,7 @@ const httpServer = createServer(async (req, res) => {
 
       if (path === '/trade') {
         const asset = String(body.asset ?? market.activeAsset)
-        const kind = (body.kind as 'binary' | 'turbo' | 'digital' | 'cfd') ?? 'binary'
+        const kind = (body.kind as 'binary' | 'turbo' | 'blitz' | 'digital' | 'cfd') ?? 'binary'
         const inst = getInstrument(asset)
         // on IQ the account's own instruments are valid even when unknown to
         // the sim universe (exotics, OTC variants) - the sidecar validates

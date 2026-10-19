@@ -101,7 +101,7 @@ _asset_ids = {}  # ticker -> numeric active_id, from the account's own metadata
 # expiry duration. _asset_ids itself is left alone (still used everywhere
 # else: the asset table, /health, /connect's mapped-count) - only the /trade
 # buy path now resolves through the group-aware table below.
-_asset_ids_by_group = {"turbo": {}, "binary": {}}  # ticker -> numeric active_id, split by instrument group - see _resolve_active_id_for_group
+_asset_ids_by_group = {"turbo": {}, "binary": {}, "blitz": {}}  # ticker -> numeric active_id, split by instrument group - see _resolve_active_id_for_group
 _digital_ids = {}  # ticker -> numeric active_id, digital-option group only
 _asset_norm = {}  # normalized alias key -> account ticker (turbo/binary map)
 _digital_norm = {}  # normalized alias key -> account underlying (digital map)
@@ -493,6 +493,20 @@ def _seed_ids_from_init():
                     continue
                 _asset_ids[t] = aidi
                 _asset_ids_by_group[option][t] = aidi
+        # blitz: NOT merged into _asset_ids (the shared/legacy namespace) -
+        # only into its own group table, same reasoning as the turbo/binary
+        # split above. Whether the raw initialization-data payload actually
+        # carries a "blitz" key alongside "turbo"/"binary" is unconfirmed
+        # (the iqair library never reads one) - this is a no-op if it doesn't.
+        blitz_actives = (data or {}).get("blitz", {}).get("actives", {})
+        for aid, active in blitz_actives.items():
+            t = active.get("ticker") or str(active.get("name", "")).split(".")[-1]
+            try:
+                aidi = int(aid)
+            except (TypeError, ValueError):
+                continue
+            _asset_ids_by_group["blitz"][t] = aidi
+        print(f"[sidecar] blitz active_id map: {len(_asset_ids_by_group['blitz'])} tickers" + ("" if _asset_ids_by_group["blitz"] else " (none - init payload may not carry a separate blitz table; blitz orders will fall back to turbo/binary ids)"))
         if OP_code is not None:
             for t, aid in _asset_ids.items():
                 if t not in OP_code.ACTIVES:
@@ -549,6 +563,13 @@ def _resolve_active_id(ticker):
                     continue
                 _asset_ids[t] = aidi
                 _asset_ids_by_group[option][t] = aidi
+        for aid, active in (data or {}).get("blitz", {}).get("actives", {}).items():
+            t = active.get("ticker") or str(active.get("name", "")).split(".")[-1]
+            try:
+                aidi = int(aid)
+            except (TypeError, ValueError):
+                continue
+            _asset_ids_by_group["blitz"][t] = aidi
     except Exception:  # noqa: BLE001
         pass
     if ticker in _asset_ids:
@@ -565,35 +586,45 @@ def _resolve_active_id(ticker):
     return None
 
 
+# Fallback order per requested group for _resolve_active_id_for_group: tried
+# in order after the requested group itself comes up empty for a ticker.
+# turbo/binary mirror each other (the original account-availability
+# fallback). blitz has no confirmed id-sharing relationship with turbo/binary
+# (reverse-engineered from a single captured trade - see the big comment on
+# _asset_ids_by_group) but is the same short-duration options family, so
+# turbo is tried first as the most plausible fallback, then binary.
+_GROUP_FALLBACKS = {
+    "turbo": ("binary",),
+    "binary": ("turbo",),
+    "blitz": ("turbo", "binary"),
+}
+
+
 def _resolve_active_id_for_group(ticker, group):
     """Group-aware variant of _resolve_active_id, for the /trade buy path
     ONLY - see the big comment on _asset_ids_by_group above for why this
-    exists. `group` is "turbo" or "binary" (the group the caller actually
-    wants to trade). Returns (active_id, resolved_group) where
-    resolved_group may be the OTHER group when the account only carries
+    exists. `group` is "turbo", "binary", or "blitz" (the group the caller
+    actually wants to trade). Returns (active_id, resolved_group) where
+    resolved_group may be a DIFFERENT group when the account only carries
     this ticker there (mirroring the existing turbo<->digital account
     fallback already in the /trade handler) - the caller must adjust the
     duration validation/labeling to match resolved_group, not the one it
     asked for. Returns (None, None) when the account has this ticker in
-    NEITHER group at all."""
-    other = "binary" if group == "turbo" else "turbo"
+    NONE of the groups tried."""
+    fallbacks = _GROUP_FALLBACKS.get(group, ())
+    groups_to_try = (group,) + fallbacks
     # piggyback on _resolve_active_id's own seed-wait + lazy live rescan (it
     # populates _asset_ids_by_group as a side effect now) before concluding
-    # neither group has this ticker
-    if ticker not in _asset_ids_by_group[group] and ticker not in _asset_ids_by_group[other]:
+    # none of the groups has this ticker
+    if not any(ticker in _asset_ids_by_group.get(g, {}) for g in groups_to_try):
         _resolve_active_id(ticker)
-    table = _asset_ids_by_group[group]
-    if ticker in table:
-        return table[ticker], group
-    canon = _alias_ticker(ticker, table, _asset_norm)
-    if canon is not None and canon in table:
-        return table[canon], group
-    other_table = _asset_ids_by_group[other]
-    if ticker in other_table:
-        return other_table[ticker], other
-    canon = _alias_ticker(ticker, other_table, _asset_norm)
-    if canon is not None and canon in other_table:
-        return other_table[canon], other
+    for g in groups_to_try:
+        table = _asset_ids_by_group.get(g, {})
+        if ticker in table:
+            return table[ticker], g
+        canon = _alias_ticker(ticker, table, _asset_norm)
+        if canon is not None and canon in table:
+            return table[canon], g
     return None, None
 
 
@@ -731,6 +762,67 @@ def _buy_fast(amount, active_id, direction, expiry_minutes, symbol=None):
         print(f"[sidecar] buy rejected: {active_id} x {amount}: {msg}")
         return False, str(msg), None
     print(f"[sidecar] buy ok: active_id {active_id} x {amount} {direction} {expiry_minutes}m -> order {resp['id']}")
+    expired = resp.get("expired")
+    try:
+        expired = int(expired) if expired else None
+    except (TypeError, ValueError):
+        expired = None
+    return True, resp["id"], expired
+
+
+def _buy_blitz(amount, active_id, direction, duration_sec):
+    """Blitz-option order: NOT supported by the iqair library at all (it only
+    knows "blitz-option" as a label for reading portfolio/history, never for
+    placing one - see the big comment on this in the /trade handler below),
+    so this sends the raw "binary-options.open-option" v2.0 websocket
+    request directly via _client.api, the same underlying call buyv3() makes
+    for turbo/binary, bypassing the library's buyv3() wrapper (which only
+    ever sets option_type_id to 1 or 3).
+
+    Body shape and field names (user_balance_id, active_id, option_type_id,
+    direction, expired, refund_value, price, expiration_size) are copied
+    EXACTLY from a real captured blitz trade (HAR+console capture, 2026-10-19)
+    - option_type_id 12 is what IQ Option's own web client sent for a blitz
+    order; expiration_size is the blitz duration in SECONDS (not minutes -
+    blitz durations are sub-minute). This is reverse-engineered from a single
+    sample, not from any documented API, so treat it as best-effort: a
+    rejection here may mean a field this capture didn't exercise (e.g. an
+    unsupported duration_sec) rather than a real "asset unavailable".
+
+    Returns (True, order_id, expired_unix | None) or (False, reason, None) -
+    same contract as _buy_fast()."""
+    req_id = f"iqos-blitz-{int(time.time() * 1000)}"
+    _client.api.buy_multi_option = {}
+    _client.api.buy_successful = None
+    now_server = _client.api.timesync.server_timestamp
+    expired_at = int(now_server) + int(duration_sec)
+    body = {
+        "user_balance_id": int(_gv.balance_id),
+        "active_id": int(active_id),
+        "option_type_id": 12,
+        "direction": str(direction).lower(),
+        "expired": expired_at,
+        "refund_value": 0,
+        "price": amount,
+        "expiration_size": int(duration_sec),
+    }
+    msg = {"name": "binary-options.open-option", "version": "2.0", "body": body}
+    _client.api.send_websocket_request("sendMessage", msg, req_id)
+    deadline = time.time() + 10
+    resp = None
+    while time.time() < deadline:
+        resp = (_client.api.buy_multi_option or {}).get(req_id)
+        if isinstance(resp, dict) and (resp.get("id") is not None or resp.get("message")):
+            break
+        time.sleep(0.15)
+    if not isinstance(resp, dict):
+        print(f"[sidecar] blitz buy timeout: {active_id} x {amount} ({duration_sec}s)")
+        return False, "broker did not answer the blitz order in time - order state UNKNOWN, do NOT blind-retry (check the IQ trades page first)", None
+    if resp.get("id") is None:
+        msg_text = resp.get("message") or "rejected"
+        print(f"[sidecar] blitz buy rejected: {active_id} x {amount}: {msg_text}")
+        return False, str(msg_text), None
+    print(f"[sidecar] blitz buy ok: active_id {active_id} x {amount} {direction} {duration_sec}s -> order {resp['id']}")
     expired = resp.get("expired")
     try:
         expired = int(expired) if expired else None
@@ -1126,6 +1218,10 @@ class Handler(BaseHTTPRequestHandler):
                     amount = float(body.get("amount", 0))
                     direction = (body.get("direction") or "call").lower()
                     expiry = int(body.get("expiry_minutes", 1))
+                    # blitz is sub-minute - expiry_minutes alone can't express
+                    # a 5s/10s/15s/30s duration, so the kernel sends the exact
+                    # seconds separately for blitz orders only (see _buy_blitz)
+                    expiry_seconds_raw = body.get("expiry_seconds")
                     leverage = body.get("leverage")
                     strike_offset = body.get("strike_offset_pct")
                     expired = None  # broker echo of the real expiration (options family)
@@ -1133,7 +1229,7 @@ class Handler(BaseHTTPRequestHandler):
                         return self._send(_err("asset and positive amount required"), 400)
 
                     # ---- options family ----
-                    if mode in ("turbo", "binary", "digital", "digital-option", "binary-option", "turbo-option"):
+                    if mode in ("turbo", "binary", "blitz", "digital", "digital-option", "binary-option", "turbo-option", "blitz-option"):
                         # Resolve the ticker across BOTH option families and
                         # route to what the account actually offers. IQ splits
                         # instruments into turbo/binary (buyv3, numeric id)
@@ -1153,8 +1249,16 @@ class Handler(BaseHTTPRequestHandler):
                         # reporting that fallback via tb_group) only when the
                         # account truly doesn't carry this ticker there.
                         digital_req = mode.startswith("digital")
-                        requested_group = "binary" if mode.startswith("binary") else "turbo"
+                        requested_group = "binary" if mode.startswith("binary") else "blitz" if mode.startswith("blitz") else "turbo"
                         tb_id, tb_group = _resolve_active_id_for_group(asset, requested_group)
+                        # blitz duration in SECONDS (not minutes - see _buy_blitz).
+                        # Falls back to expiry_minutes*60 for any caller that
+                        # didn't send expiry_seconds, clamped to something sane.
+                        try:
+                            blitz_duration_sec = int(expiry_seconds_raw) if expiry_seconds_raw is not None else max(1, expiry) * 60
+                        except (TypeError, ValueError):
+                            blitz_duration_sec = max(1, expiry) * 60
+                        blitz_duration_sec = max(1, min(300, blitz_duration_sec))
                         dig_id = _resolve_digital_id(asset) if digital_req or tb_id is None else None
                         # speak the account's dialect for the actual buy calls
                         # (EURUSD_otc -> EURUSD-OTC etc.) - buy_digital_spot
@@ -1174,15 +1278,29 @@ class Handler(BaseHTTPRequestHandler):
                             else:
                                 return self._send(_err(f"{asset} is not a digital/turbo/binary instrument on this IQ account"), 400)
                         else:
-                            if tb_id is not None:
-                                # turbo/binary fast path: resolve the numeric
-                                # active_id ONCE (cached account metadata) and
-                                # send buyv3 directly. _client.buy() re-scans
-                                # the whole init table on EVERY order (slow)
-                                # and falls back to a stale 2018 static table
-                                # that lacks OTC/new tickers -> active_id null
-                                # -> server rejection ("ActiveId is not nullable")
-                                check, order_id, expired = _buy_fast(amount, int(tb_id), direction, expiry, symbol=asset)
+                            if tb_id is not None and tb_group == "blitz":
+                                # blitz: NOT a buyv3 call at all - see _buy_blitz's
+                                # docstring for why (the iqair library has no
+                                # blitz support whatsoever, this is a raw,
+                                # reverse-engineered websocket request)
+                                check, order_id, expired = _buy_blitz(amount, int(tb_id), direction, blitz_duration_sec)
+                                mode = tb_group
+                            elif tb_id is not None:
+                                # turbo/binary fast path (also the fallback when
+                                # a requested blitz order's account only carries
+                                # this ticker as turbo/binary, never blitz -
+                                # blitz_duration_sec is then reinterpreted as a
+                                # whole-minute turbo/binary duration, clamped
+                                # into iqOS's existing 1-5min validation range):
+                                # resolve the numeric active_id ONCE (cached
+                                # account metadata) and send buyv3 directly.
+                                # _client.buy() re-scans the whole init table on
+                                # EVERY order (slow) and falls back to a stale
+                                # 2018 static table that lacks OTC/new tickers
+                                # -> active_id null -> server rejection
+                                # ("ActiveId is not nullable")
+                                fallback_expiry = max(1, min(5, round(blitz_duration_sec / 60))) if requested_group == "blitz" else expiry
+                                check, order_id, expired = _buy_fast(amount, int(tb_id), direction, fallback_expiry, symbol=asset)
                                 # tb_group may differ from requested_group when
                                 # the account only carries this ticker in the
                                 # OTHER turbo/binary group - say so, same as
@@ -1258,6 +1376,8 @@ class Handler(BaseHTTPRequestHandler):
                     types = (
                         ["digital-option", "turbo-option", "binary-option"]
                         if mode.startswith("digital")
+                        else ["blitz-option", "turbo-option", "binary-option"]
+                        if mode.startswith("blitz")
                         else ["binary-option", "turbo-option"]
                         if mode.startswith("binary")
                         else ["turbo-option", "binary-option", "digital-option"]
