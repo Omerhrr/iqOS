@@ -70,6 +70,35 @@ interface ActiveIndicator {
 // overlays) and whatever the operator adds survives a page refresh
 const INDICATOR_STORAGE_KEY = 'iqos.activeIndicators.v1'
 
+// left-dock panel visibility: lets the operator hide a panel (e.g. "Yesterday
+// @ Now", "Cointegration") out of the open strip entirely instead of just
+// closing it each time - it stays hidden across reloads until re-checked in
+// the Panels settings menu. Nothing is deleted, this only gates rendering.
+type PanelId = 'signals' | 'yday' | 'leadlag' | 'distill' | 'cointegration' | 'volarb' | 'triangulation' | 'adxPatternBias' | 'shockPressure'
+const PANEL_META: { id: PanelId; label: string }[] = [
+  { id: 'signals', label: 'Chart Signals' },
+  { id: 'yday', label: 'Yesterday @ Now' },
+  { id: 'leadlag', label: 'Lead-Lag' },
+  { id: 'distill', label: 'Chart Distill' },
+  { id: 'cointegration', label: 'Cointegration' },
+  { id: 'volarb', label: 'Vol Arb' },
+  { id: 'triangulation', label: 'Triangulation' },
+  { id: 'adxPatternBias', label: 'ADX/DI + Pattern' },
+  { id: 'shockPressure', label: 'Shock + Pressure' },
+]
+const DEFAULT_PANEL_VISIBILITY: Record<PanelId, boolean> = {
+  signals: true,
+  yday: true,
+  leadlag: true,
+  distill: true,
+  cointegration: true,
+  volarb: true,
+  triangulation: true,
+  adxPatternBias: true,
+  shockPressure: true,
+}
+const PANEL_VISIBILITY_STORAGE_KEY = 'iqos.panelVisibility.v1'
+
 /** Desktop = the resizable 3-dock workspace; below lg the OS stacks into one scrollable column. */
 function useIsDesktop() {
   const [isDesktop, setIsDesktop] = useState(false)
@@ -158,6 +187,11 @@ export default function OSPage() {
   const [triangulationOpen, setTriangulationOpen] = useState(false)
   const [adxPatternBiasOpen, setAdxPatternBiasOpen] = useState(false)
   const [shockPressureOpen, setShockPressureOpen] = useState(false)
+  // panel visibility (Panels settings menu) - which of the above are even
+  // offered in the open strip at all. Defaults to everything visible so a
+  // first-ever load (or corrupt/missing storage) matches today's behavior.
+  const [panelVisibility, setPanelVisibility] = useState<Record<PanelId, boolean>>(DEFAULT_PANEL_VISIBILITY)
+  const [panelSettingsOpen, setPanelSettingsOpen] = useState(false)
   const [registry, setRegistry] = useState<RegistryEntry[]>([])
   const [activeOverlays, setActiveOverlays] = useState<ActiveIndicator[]>([])
   const [activeSubs, setActiveSubs] = useState<ActiveIndicator[]>([])
@@ -188,6 +222,49 @@ export default function OSPage() {
       /* storage unavailable (private mode) - selection just won't persist */
     }
   }, [indicatorsHydrated, activeOverlays, activeSubs])
+  // panel visibility persistence - same hydration-gate pattern as indicators
+  // above (first render must match the server/default-all-true, or React
+  // complains about a hydration mismatch)
+  const [panelVisibilityHydrated, setPanelVisibilityHydrated] = useState(false)
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(PANEL_VISIBILITY_STORAGE_KEY)
+      if (raw) {
+        const d = JSON.parse(raw) as Partial<Record<PanelId, boolean>>
+        setPanelVisibility((v) => ({ ...v, ...d }))
+      }
+    } catch {
+      /* corrupt storage - start with everything visible */
+    }
+    setPanelVisibilityHydrated(true)
+  }, [])
+  useEffect(() => {
+    if (!panelVisibilityHydrated) return
+    try {
+      window.localStorage.setItem(PANEL_VISIBILITY_STORAGE_KEY, JSON.stringify(panelVisibility))
+    } catch {
+      /* storage unavailable (private mode) - selection just won't persist */
+    }
+  }, [panelVisibilityHydrated, panelVisibility])
+  // unchecking a panel that's currently open closes it too - otherwise it'd
+  // stay open (just no longer reachable from the strip) until manually closed
+  const togglePanelVisible = useCallback((id: PanelId) => {
+    setPanelVisibility((v) => {
+      const next = { ...v, [id]: !v[id] }
+      if (!next[id]) {
+        if (id === 'signals') setSignalsOpen(false)
+        else if (id === 'yday') setYdayOpen(false)
+        else if (id === 'leadlag') setLeadlagOpen(false)
+        else if (id === 'distill') setDistillOpen(false)
+        else if (id === 'cointegration') setCointegrationOpen(false)
+        else if (id === 'volarb') setVolarbOpen(false)
+        else if (id === 'triangulation') setTriangulationOpen(false)
+        else if (id === 'adxPatternBias') setAdxPatternBiasOpen(false)
+        else if (id === 'shockPressure') setShockPressureOpen(false)
+      }
+      return next
+    })
+  }, [])
   const pricesRef = useRef<Record<string, { price: number; dir: number }>>({})
   const isDesktop = useIsDesktop()
 
@@ -1017,6 +1094,42 @@ export default function OSPage() {
                           exactly like Indicators resizes against it, instead
                           of the fixed button stack blocking the drag range. */}
                       <div className="min-h-0 shrink overflow-y-auto">
+                      <div className="relative mb-0.5">
+                        <button
+                          type="button"
+                          onClick={() => setPanelSettingsOpen((v) => !v)}
+                          title="choose which panels show in this list"
+                          className={`flex w-full shrink-0 items-center gap-1.5 rounded-lg border px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider transition-colors ${
+                            panelSettingsOpen
+                              ? 'border-[#3d4d66] bg-[#101828] text-[#aebccf]'
+                              : 'border-[#1c2739] bg-[#0b111c] text-[#7c8aa5] hover:border-[#3d4d66] hover:text-[#aebccf]'
+                          }`}
+                        >
+                          <span className="h-1.5 w-1.5 rounded-full bg-[#5a6a85]" />
+                          Panels
+                          <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">{panelSettingsOpen ? 'close' : 'settings'}</span>
+                        </button>
+                        {panelSettingsOpen && (
+                          <div className="absolute left-0 right-0 top-full z-20 mt-0.5 rounded-lg border border-[#1c2739] bg-[#0b111c] p-1.5 shadow-lg">
+                            <p className="mb-1 px-0.5 font-mono text-[8px] uppercase tracking-wider text-[#3d4d66]">show in list</p>
+                            {PANEL_META.map((p) => (
+                              <label
+                                key={p.id}
+                                className="flex cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 font-mono text-[9.5px] text-[#aebccf] hover:bg-[#1c2739]"
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={panelVisibility[p.id]}
+                                  onChange={() => togglePanelVisible(p.id)}
+                                  className="accent-cyan-500"
+                                />
+                                {p.label}
+                              </label>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      {panelVisibility.signals && (
                       <button
                         type="button"
                         onClick={() => setSignalsOpen(true)}
@@ -1027,6 +1140,8 @@ export default function OSPage() {
                         Chart Signals
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
+                      )}
+                      {panelVisibility.yday && (
                       <button
                         type="button"
                         onClick={() => setYdayOpen(true)}
@@ -1037,6 +1152,8 @@ export default function OSPage() {
                         Yesterday @ Now
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
+                      )}
+                      {panelVisibility.leadlag && (
                       <button
                         type="button"
                         onClick={() => setLeadlagOpen(true)}
@@ -1047,6 +1164,8 @@ export default function OSPage() {
                         Lead-Lag
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
+                      )}
+                      {panelVisibility.distill && (
                       <button
                         type="button"
                         onClick={() => setDistillOpen(true)}
@@ -1057,6 +1176,8 @@ export default function OSPage() {
                         Chart Distill
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
+                      )}
+                      {panelVisibility.cointegration && (
                       <button
                         type="button"
                         onClick={() => setCointegrationOpen(true)}
@@ -1067,6 +1188,8 @@ export default function OSPage() {
                         Cointegration
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
+                      )}
+                      {panelVisibility.volarb && (
                       <button
                         type="button"
                         onClick={() => setVolarbOpen(true)}
@@ -1077,6 +1200,8 @@ export default function OSPage() {
                         Vol Arb
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
+                      )}
+                      {panelVisibility.triangulation && (
                       <button
                         type="button"
                         onClick={() => setTriangulationOpen(true)}
@@ -1087,6 +1212,8 @@ export default function OSPage() {
                         Triangulation
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
+                      )}
+                      {panelVisibility.adxPatternBias && (
                       <button
                         type="button"
                         onClick={() => setAdxPatternBiasOpen(true)}
@@ -1097,6 +1224,8 @@ export default function OSPage() {
                         ADX/DI + Pattern
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
+                      )}
+                      {panelVisibility.shockPressure && (
                       <button
                         type="button"
                         onClick={() => setShockPressureOpen(true)}
@@ -1107,6 +1236,7 @@ export default function OSPage() {
                         Shock + Pressure
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
+                      )}
                       </div>
                       <div className="min-h-0 flex-1">
                         <MarketWatch assets={assets} active={asset} prices={prices} onSelect={handleSelectAsset} onVisibleTickers={handleVisibleTickers} />
