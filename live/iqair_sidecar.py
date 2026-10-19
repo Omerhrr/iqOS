@@ -800,40 +800,70 @@ def _buy_blitz(amount, active_id, direction, duration_sec, profit_percent=80):
     the 80 default here is only a last-resort fallback and may not match
     what IQ Option is actually quoting right now for this active_id.
 
+    THE RATE-CHANGE REJECTION ("The option has not been purchased because of
+    the profit rate change"): confirmed live (2026-10-19) that this fires
+    even with a plausible, recently-correct profit_percent - blitz quotes
+    move fast enough that IQ Option's own server validates the submitted
+    rate against whatever it's quoting at the literal instant it processes
+    the order. This sidecar has no live blitz quote feed to read a
+    guaranteed-fresh rate from (unlike the real web client, which has the
+    chart component's own live subscription open), so some rate-change
+    rejections are expected even when profit_percent is a good estimate -
+    the same race a human clicking "buy" on IQ Option's own site would
+    occasionally hit. One immediate retry (fresh request_id, same
+    profit_percent) is the practical mitigation: by the time it resends, the
+    rate has very likely settled onto whatever the estimate already
+    reflects.
+
     Returns (True, order_id, expired_unix | None) or (False, reason, None) -
     same contract as _buy_fast()."""
-    req_id = f"iqos-blitz-{int(time.time() * 1000)}"
-    _client.api.buy_multi_option = {}
-    _client.api.buy_successful = None
-    now_server = _client.api.timesync.server_timestamp
-    expired_at = int(now_server) + int(duration_sec)
-    body = {
-        "user_balance_id": int(_gv.balance_id),
-        "active_id": int(active_id),
-        "option_type_id": 12,
-        "direction": str(direction).lower(),
-        "expired": expired_at,
-        "refund_value": 0,
-        "price": amount,
-        "expiration_size": int(duration_sec),
-        "profit_percent": int(round(profit_percent)),
-    }
-    msg = {"name": "binary-options.open-option", "version": "2.0", "body": body}
-    _client.api.send_websocket_request("sendMessage", msg, req_id)
-    deadline = time.time() + 10
-    resp = None
-    while time.time() < deadline:
-        resp = (_client.api.buy_multi_option or {}).get(req_id)
-        if isinstance(resp, dict) and (resp.get("id") is not None or resp.get("message")):
-            break
-        time.sleep(0.15)
+
+    def _attempt():
+        req_id = f"iqos-blitz-{int(time.time() * 1000)}"
+        _client.api.buy_multi_option = {}
+        _client.api.buy_successful = None
+        now_server = _client.api.timesync.server_timestamp
+        expired_at = int(now_server) + int(duration_sec)
+        body = {
+            "user_balance_id": int(_gv.balance_id),
+            "active_id": int(active_id),
+            "option_type_id": 12,
+            "direction": str(direction).lower(),
+            "expired": expired_at,
+            "refund_value": 0,
+            "price": amount,
+            "expiration_size": int(duration_sec),
+            "profit_percent": int(round(profit_percent)),
+        }
+        msg = {"name": "binary-options.open-option", "version": "2.0", "body": body}
+        _client.api.send_websocket_request("sendMessage", msg, req_id)
+        deadline = time.time() + 10
+        resp = None
+        while time.time() < deadline:
+            resp = (_client.api.buy_multi_option or {}).get(req_id)
+            if isinstance(resp, dict) and (resp.get("id") is not None or resp.get("message")):
+                break
+            time.sleep(0.15)
+        return resp
+
+    resp = _attempt()
     if not isinstance(resp, dict):
         print(f"[sidecar] blitz buy timeout: {active_id} x {amount} ({duration_sec}s)")
         return False, "broker did not answer the blitz order in time - order state UNKNOWN, do NOT blind-retry (check the IQ trades page first)", None
     if resp.get("id") is None:
-        msg_text = resp.get("message") or "rejected"
-        print(f"[sidecar] blitz buy rejected: {active_id} x {amount}: {msg_text}")
-        return False, str(msg_text), None
+        msg_text = str(resp.get("message") or "rejected")
+        if "profit rate" in msg_text.lower():
+            print(f"[sidecar] blitz buy rate-race rejection, retrying once: {active_id} x {amount}: {msg_text}")
+            resp = _attempt()
+            if not isinstance(resp, dict):
+                return False, "broker did not answer the blitz retry in time - order state UNKNOWN, do NOT blind-retry (check the IQ trades page first)", None
+            if resp.get("id") is None:
+                msg_text = str(resp.get("message") or "rejected")
+                print(f"[sidecar] blitz buy rejected (after retry): {active_id} x {amount}: {msg_text}")
+                return False, msg_text, None
+        else:
+            print(f"[sidecar] blitz buy rejected: {active_id} x {amount}: {msg_text}")
+            return False, msg_text, None
     print(f"[sidecar] blitz buy ok: active_id {active_id} x {amount} {direction} {duration_sec}s -> order {resp['id']}")
     expired = resp.get("expired")
     try:
