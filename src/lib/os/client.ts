@@ -725,6 +725,7 @@ export interface ShockPressureScanRow {
   shockDirection: 'bullish' | 'bearish' | 'neutral'
   netDelta: number
   netVolume: number
+  volumeDegraded: boolean
   pressureRatio: number
   pressureDirection: 'bullish' | 'bearish' | 'neutral'
   agree: boolean

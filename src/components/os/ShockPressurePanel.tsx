@@ -80,12 +80,19 @@ function ShockPressureCard({ r, onSelectAsset }: { r: ShockPressureScanRow; onSe
         <span title="latest closed bar's return / ATR - an ATR-normalized ratio, not a real statistical z-score">
           shock <span className={r.shock ? 'text-[#dbe4f0]' : 'text-[#4b5a72]'}>{r.shockRatio >= 0 ? '+' : ''}{r.shockRatio.toFixed(2)}</span>
         </span>
-        <span title="net (buy - sell) volume over the pressure lookback window, as a fraction of total volume in that window - candle-level CLV approximation, no real order book">
+        <span
+          title={
+            r.volumeDegraded
+              ? 'no real volume in this window (common on OTC/live-forming bars) - falling back to average close-location-value position instead of the usual buy/sell volume split'
+              : 'net (buy - sell) volume over the pressure lookback window, as a fraction of total volume in that window - candle-level CLV approximation, no real order book'
+          }
+        >
           pressure{' '}
           <span className={Math.abs(r.pressureRatio) >= 0.1 ? 'text-[#dbe4f0]' : 'text-[#4b5a72]'}>
             {r.pressureRatio >= 0 ? '+' : ''}
             {(r.pressureRatio * 100).toFixed(0)}%
           </span>
+          {r.volumeDegraded && <span className="ml-1 text-amber-400/80">(no vol)</span>}
         </span>
         <span title="ATR(14) used to normalize the shock ratio">ATR {r.atr.toFixed(5)}</span>
         <span title="combined shock + pressure score, range -10..+10">

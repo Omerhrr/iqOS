@@ -1878,7 +1878,7 @@ export const STRATEGIES: StrategyDef[] = [
       { key: 'qualify', label: 'Min |composite| to trade (0-10)', type: 'number', min: 1, max: 10, step: 0.5, default: SHOCKPRESSURE_COMPOSITE_QUALIFY },
     ],
     evaluate: (candles, p) => {
-      const fit = fitShockPressure(candles, 14, num(p, 'lookback', PRESSURE_LOOKBACK))
+      const fit = fitShockPressure(candles, 14, num(p, 'lookback', PRESSURE_LOOKBACK), num(p, 'shockRatio', SHOCK_RATIO_THRESHOLD))
       if (!fit) return { direction: 'none', score: 0, notes: 'thin history - not enough bars for ATR + pressure window' }
       if (!fit.shock) {
         return { direction: 'none', score: 0, notes: `shock ratio ${fit.shockRatio.toFixed(2)} below ±${num(p, 'shockRatio', SHOCK_RATIO_THRESHOLD)} - no event on the latest bar` }
@@ -1887,7 +1887,7 @@ export const STRATEGIES: StrategyDef[] = [
         return {
           direction: 'none',
           score: 0,
-          notes: `shock (${fit.shockDirection}) and building pressure (${fit.pressureDirection}, ${fit.pressureRatio >= 0 ? '+' : ''}${(fit.pressureRatio * 100).toFixed(0)}%) disagree or pressure is flat`,
+          notes: `shock (${fit.shockDirection}) and building pressure (${fit.pressureDirection}, ${fit.pressureRatio >= 0 ? '+' : ''}${(fit.pressureRatio * 100).toFixed(0)}%${fit.volumeDegraded ? ', volume-approx: CLV position, no real volume this window' : ''}) disagree or pressure is flat`,
         }
       }
       const qualify = num(p, 'qualify', SHOCKPRESSURE_COMPOSITE_QUALIFY)

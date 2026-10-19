@@ -534,6 +534,7 @@ interface ShockPressureScanRow {
   shockDirection: 'bullish' | 'bearish' | 'neutral'
   netDelta: number
   netVolume: number
+  volumeDegraded: boolean
   pressureRatio: number
   pressureDirection: 'bullish' | 'bearish' | 'neutral'
   agree: boolean
@@ -568,6 +569,7 @@ function scanShockPressure(market: MarketDataService, tfv: Timeframe): ShockPres
         shockDirection: fit.shockDirection,
         netDelta: fit.netDelta,
         netVolume: fit.netVolume,
+        volumeDegraded: fit.volumeDegraded,
         pressureRatio: fit.pressureRatio,
         pressureDirection: fit.pressureDirection,
         agree: fit.agree,
