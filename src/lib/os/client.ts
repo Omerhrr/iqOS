@@ -2798,7 +2798,7 @@ export type OsMode = 'human' | 'auto'
 
 export interface AutoTraderConfig {
   enabled: boolean
-  signalSource: 'cointegration' | 'triangulation' | 'adx-pattern-bias' | 'shock-pressure' | 'strategy' | 'chartsignals' | 'leadlag'
+  signalSource: 'cointegration' | 'triangulation' | 'adx-pattern-bias' | 'pair-signal' | 'shock-pressure' | 'strategy' | 'chartsignals' | 'leadlag'
   tf: Timeframe
   /** The trade's own expiry, as a timeframe - SEPARATE from `tf` (which
    * candles signals are read from). Unset = old behavior (expiry tracks tf
