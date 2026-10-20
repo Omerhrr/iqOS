@@ -205,6 +205,10 @@ interface RuntimeState {
   lastTradeTs: number
   streak: number
   lastRejection?: string
+  /** when lastRejection was last actually emitted, so an ongoing/unresolved
+   * rejection re-surfaces periodically instead of going permanently silent
+   * after the first alert - see reject(). */
+  lastRejectionAt?: number
   quietNote?: string
   pot: number // compounding roll; 0 = fresh cycle at base
   rollN: number
@@ -983,11 +987,21 @@ export class AutopilotService {
     return { amount, pot, rollN: rt.rollN, compound: true, phase: derisk ? 'derisk' : 'compound' }
   }
 
+  private static REJECT_REMIND_SEC = 300
   private reject(bot: BotConfig, reason: string): void {
     const rt = this.runtime.get(bot.id)
-    // only surface a rejection once per distinct reason to avoid alert spam
-    if (!rt || rt.lastRejection === reason) return
+    if (!rt) return
+    // Only surface a rejection once per distinct reason to avoid alert spam
+    // - BUT an ongoing/unresolved rejection used to go permanently silent
+    // after that first alert (no further log line, ever), which reads
+    // exactly like "the bot stopped working" even though it's still ticking
+    // and retrying every cycle. Re-emit periodically while the same reason
+    // persists so a stuck condition stays visible instead of looking dead.
+    const sameReason = rt.lastRejection === reason
+    const dueForReminder = !rt.lastRejectionAt || Math.floor(Date.now() / 1000) - rt.lastRejectionAt >= AutopilotService.REJECT_REMIND_SEC
     rt.lastRejection = reason
+    if (sameReason && !dueForReminder) return
+    rt.lastRejectionAt = Math.floor(Date.now() / 1000)
     this.emit('info', `[${bot.name}] standing down: ${reason}`)
   }
 

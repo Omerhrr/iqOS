@@ -410,6 +410,10 @@ interface AutoRuntime {
   lastTradeTs: number
   lastAssetTs: Map<string, number>
   lastRejection?: string
+  /** when lastRejection was last actually emitted (emit() call), so an
+   * ongoing/unresolved rejection re-surfaces periodically instead of going
+   * permanently silent after the first alert - see standDown(). */
+  lastRejectionAt?: number
   lastAction?: string
   pot: number // compounding roll; 0 = fresh cycle at base
   rollN: number
@@ -440,8 +444,26 @@ export class ModeService {
    * on every single 10s tick forever - which is exactly what the logs showed:
    * hundreds of back-to-back "Active ... not found" rejections for the same
    * handful of active_ids while everything else kept trading fine. */
-  private static BROKER_UNAVAILABLE_RE = /not available at the moment|is not a (?:turbo\/binary\/digital|digital\/turbo\/binary) instrument|active\b[^.]*not found/i
+  private static BROKER_UNAVAILABLE_RE = /not available at the moment|is not a (?:turbo\/binary\/digital|digital\/turbo\/binary) instrument|active\b[^.]*not found|is suspended|active is suspended|suspended\b/i
   private static BROKER_UNAVAILABLE_COOLDOWN_SEC = 600
+  /** The small, explicit set of HARD stop reasons - account/risk-level gates
+   * (riskCheck in execution.ts) or connectivity problems that apply to every
+   * asset equally, where picking a different pair would just hit the same
+   * wall again. Everything else that reaches here is, by elimination, a
+   * broker rejection of THIS ONE pair/trade - "active is suspended",
+   * "Cannot purchase an option (...)", or any other IQ phrasing this file
+   * hasn't specifically catalogued - and those are exactly the cases that
+   * should cool the asset down and move on to the next candidate, not stop
+   * the whole tick. This used to be inverted: only a short allowlist of
+   * known-transient phrasings got the "continue" treatment and anything
+   * unrecognized (including "active is suspended", which IQ does send) fell
+   * through to standDown() and silently parked the auto-trader on a dead
+   * top-ranked pair forever (standDown's own dedupe then suppressed every
+   * repeat alert - see standDown()'s doc comment). Flipping the default
+   * means a brand-new broker rejection string is now safe-by-default
+   * (skip, don't lock up) instead of unsafe-by-default. */
+  private static HARD_STOP_RE =
+    /kill switch engaged|market closed for|amount must be positive|exceeds max stake|insufficient balance|daily loss limit hit|max concurrent positions|cooldown active:|live balance unknown|live broker not connected|unknown asset |no price feed|execution service unavailable/i
   // An OTC pair blocked by the placebo defense keeps its verdict until the
   // TTL expires or a new defense run lands - re-probing every tick would just
   // spam the same rejection; 30 min is long enough to be quiet, short enough
@@ -937,17 +959,32 @@ export class ModeService {
       if (!out.ok) {
         const reason = out.error ?? 'order rejected'
         lastReason = reason
-        if (ModeService.BROKER_UNAVAILABLE_RE.test(reason)) {
-          // IQ itself just said this pair isn't tradable right now - our own
-          // open/closed cache (sidecarAssetsTs, up to 10 min stale) is already
-          // wrong for it, and without this the picker just re-selects the
-          // same top-ranked-but-closed pair on the very next 10s tick, so the
-          // SAME rejection repeats "a lot" forever. Take it off the table for
-          // a while and kick a fresh /assets fetch so the cache catches up
-          // sooner than its normal TTL (once per tick - no point asking twice
-          // inside the same handful of seconds).
-          this.assetRejectedUntil.set(row.asset, this.now() + ModeService.BROKER_UNAVAILABLE_COOLDOWN_SEC)
-          if (!refreshedAssetsThisTick) {
+        // Hard stop ONLY for the small, explicit set of account/risk-level
+        // reasons (kill switch, daily loss limit, max stake, insufficient
+        // balance, connectivity) that apply no matter which pair is picked -
+        // trying a different candidate would just hit the same wall. Every
+        // other rejection - including ones this file has never specifically
+        // seen before - is treated as a per-asset broker rejection: cool
+        // THIS asset down and move on to the next-ranked candidate right
+        // now, rather than aborting the whole tick on an unrecognized
+        // string (see HARD_STOP_RE's doc comment for why the default flipped).
+        if (!ModeService.HARD_STOP_RE.test(reason)) {
+          // IQ itself just said this pair isn't tradable right now (closed,
+          // suspended, stale active_id, ...) - our own open/closed cache
+          // (sidecarAssetsTs, up to 10 min stale) is already wrong for it,
+          // and without this the picker just re-selects the same
+          // top-ranked-but-untradable pair on the very next 10s tick, so the
+          // SAME rejection repeats "a lot" forever. Take it off the table
+          // for a while and kick a fresh /assets fetch so the cache catches
+          // up sooner than its normal TTL (once per tick - no point asking
+          // twice inside the same handful of seconds). BROKER_UNAVAILABLE_RE
+          // additionally triggers that refresh for the specific phrasings
+          // known to mean our active_id/open-closed cache is stale.
+          this.assetRejectedUntil.set(
+            row.asset,
+            this.now() + (ModeService.BROKER_UNAVAILABLE_RE.test(reason) ? ModeService.BROKER_UNAVAILABLE_COOLDOWN_SEC : ModeService.PAYOUT_FLOOR_COOLDOWN_SEC)
+          )
+          if (ModeService.BROKER_UNAVAILABLE_RE.test(reason) && !refreshedAssetsThisTick) {
             refreshedAssetsThisTick = true
             try {
               this.ctx.use<{ forceRefreshSidecarAssets: () => void }>('market').forceRefreshSidecarAssets()
@@ -957,7 +994,7 @@ export class ModeService {
           }
           continue // try the next-best candidate right now instead of waiting a full tick
         }
-        return this.standDown(reason) // not a "pick a different pair" situation - stand down as before
+        return this.standDown(reason) // account/risk-level gate - not a "pick a different pair" situation
       }
 
       // Edge stamp ON EXECUTION, never on pick: a fresh edge that a transient
@@ -2430,9 +2467,19 @@ export class ModeService {
     }
   }
 
+  /** An ongoing/unresolved stand-down used to go permanently silent after
+   * the first alert for an identical reason - from the operator's side that
+   * read as "the auto-trader stopped working" (no further log line, ever),
+   * even though it was still ticking and retrying every cycle. Re-emits
+   * every STANDDOWN_REMIND_SEC while the same reason persists so a stuck
+   * condition stays visible instead of looking dead. */
+  private static STANDDOWN_REMIND_SEC = 300
   private standDown(reason: string): void {
-    if (this.rt.lastRejection === reason) return
+    const sameReason = this.rt.lastRejection === reason
+    const dueForReminder = !this.rt.lastRejectionAt || this.now() - this.rt.lastRejectionAt >= ModeService.STANDDOWN_REMIND_SEC
     this.rt.lastRejection = reason
+    if (sameReason && !dueForReminder) return
+    this.rt.lastRejectionAt = this.now()
     this.emit('info', `[AUTO-TRADER] standing down: ${reason}`)
   }
 
