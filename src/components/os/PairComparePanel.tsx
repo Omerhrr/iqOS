@@ -11,10 +11,80 @@
 // (analytics/adxpatternbias.ts + analytics/leadlag.ts, pure-function reuse).
 
 import { useCallback, useEffect, useState } from 'react'
-import type { PairCompareResponse, PairCompareSide, PairCompareLeadLag, Timeframe } from '@/lib/os/client'
+import type { PairCompareResponse, PairCompareSide, PairCompareLeadLag, PatternHit, Timeframe } from '@/lib/os/client'
 import { getPairCompare, fmtPrice } from '@/lib/os/client'
 
 const POLL_MS = 10_000
+
+// Same exact wording the Confluence Factors list uses for this reading
+// (analytics/engine.ts's Pattern Bias factor note) - "dominate" here means
+// the sign of the recency+reliability-weighted net pattern score, not a
+// single pattern hit.
+function patternBiasLabel(patternBias: number): string {
+  return patternBias > 0 ? 'Bullish formations dominate' : patternBias < 0 ? 'Bearish formations dominate' : 'No strong formations'
+}
+
+// Same exact wording + derivation the Confluence Factors list uses for its
+// "ADX / DI" factor (analytics/engine.ts): adxTrend from the ADX(14)
+// threshold, diSign from which DI line is on top.
+function adxDiLabel(adx: number, trending: boolean, plusDI: number, minusDI: number): string {
+  return `ADX ${adx.toFixed(1)} - ${trending ? 'trending' : 'no trend'}, ${plusDI > minusDI ? '+DI dominates' : '-DI dominates'}`
+}
+
+// A clamp-to-[-2,2] vote, same scale the Confluence Factors list uses for
+// its own factor bars, so these bars read exactly like the ones there.
+function clampVote(v: number): number {
+  return Math.max(-2, Math.min(2, v))
+}
+
+/** Exact bar styling/behavior as SignalPanel.tsx's Confluence Factors list:
+ * centered at 50%, fills right (green) for a positive vote, left (red) for
+ * zero/negative, width scaled by |vote|/2. */
+function VoteBar({ vote }: { vote: number }) {
+  const strength = Math.min(1, Math.abs(vote) / 2)
+  const color = vote > 0.15 ? '#10b981' : vote < -0.15 ? '#f43f5e' : '#4b5a72'
+  return (
+    <div className="mt-0.5 flex h-1 items-center">
+      <div className="relative h-1 w-full rounded bg-[#101828]">
+        <div className="absolute left-1/2 top-0 h-full w-px bg-[#2a3a52]" />
+        <div
+          className="absolute top-0 h-full rounded"
+          style={{
+            background: color,
+            width: `${strength * 50}%`,
+            left: vote > 0 ? '50%' : undefined,
+            right: vote <= 0 ? '50%' : undefined,
+          }}
+        />
+      </div>
+    </div>
+  )
+}
+
+/** One detected candlestick pattern hit (e.g. "Bullish Engulfing", "Hammer")
+ * - every hit in the lookback window, not just the single most-recent one
+ * patternBias/topPattern reduce to. Reliability (1-3) and recency (barsAgo)
+ * are both what the composite's patternBias score actually weights by, so
+ * showing them here is honest about why one hit outweighs another. */
+function PatternChip({ hit }: { hit: PatternHit }) {
+  const bullish = hit.direction === 'bullish'
+  const bearish = hit.direction === 'bearish'
+  return (
+    <span
+      title={`${hit.note} · reliability ${hit.reliability}/3 · ${hit.barsAgo} bar(s) ago`}
+      className={`rounded border px-1.5 py-0.5 font-mono text-[9px] font-bold ${
+        bullish
+          ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+          : bearish
+            ? 'border-rose-500/40 bg-rose-500/10 text-rose-300'
+            : 'border-[#1c2739] bg-[#101828] text-[#7c8aa5]'
+      }`}
+    >
+      {hit.name}
+      <span className="ml-1 font-normal text-[8px] opacity-70">{hit.barsAgo}b</span>
+    </span>
+  )
+}
 
 function dirChip(direction: 'call' | 'put' | null) {
   if (!direction) {
@@ -68,24 +138,71 @@ function SideCard({ side, onSelectAsset }: { side: PairCompareSide; onSelectAsse
       {!fit ? (
         <div className="mt-1.5 font-mono text-[9px] text-[#4b5a72]">thin history - no honest ADX/pattern read yet</div>
       ) : (
-        <div className="mt-1.5 flex flex-wrap items-center gap-2 font-mono text-[9px] text-[#7c8aa5]">
-          <span title="ADX(14) - trend strength; >=25 is considered trending">
-            ADX <span className={fit.trending ? 'text-[#dbe4f0]' : 'text-[#4b5a72]'}>{fit.adx.toFixed(1)}</span>
-          </span>
-          <span title="+DI / -DI - which side of the trend is in control">
-            DI <span className="text-emerald-400/80">{fit.plusDI.toFixed(1)}</span>/<span className="text-rose-400/80">{fit.minusDI.toFixed(1)}</span>
-          </span>
-          <span title="net candlestick pattern bias, recency+reliability weighted, range -6..+6">
-            pattern <span className={Math.abs(fit.patternBias) >= 0.5 ? 'text-[#dbe4f0]' : 'text-[#4b5a72]'}>{fit.patternBias >= 0 ? '+' : ''}{fit.patternBias.toFixed(1)}</span>
-          </span>
-          {fit.topPattern && (
-            <span title={`most recent pattern hit, ${fit.topPatternBarsAgo} bar(s) ago`}>
-              <span className="text-[#aebccf]">{fit.topPattern}</span>
-            </span>
-          )}
-          <span title="combined ADX/DI + pattern bias score, range -10..+10">
+        <div className="mt-1.5 space-y-1.5">
+          {(() => {
+            const adxTrend = fit.trending ? 2 : 0
+            const diSign = fit.plusDI > fit.minusDI ? 1 : -1
+            const adxVote = clampVote(adxTrend * diSign)
+            return (
+              <div className="text-[10px] leading-tight">
+                <div className="flex items-center justify-between font-mono">
+                  <span className="text-[#aab6cc]">ADX / DI</span>
+                  <span className={adxVote > 0 ? 'text-emerald-300' : adxVote < 0 ? 'text-rose-300' : 'text-[#4b5a72]'}>
+                    {adxVote > 0 ? '+' : ''}{adxVote.toFixed(1)}
+                  </span>
+                </div>
+                <VoteBar vote={adxVote} />
+                <div className="mt-0.5 font-mono text-[9px] text-[#7c8aa5]">{adxDiLabel(fit.adx, fit.trending, fit.plusDI, fit.minusDI)}</div>
+              </div>
+            )
+          })()}
+          {(() => {
+            const patternVote = clampVote(fit.patternBias / 2.5)
+            return (
+              <div className="text-[10px] leading-tight">
+                <div className="flex items-center justify-between font-mono">
+                  <span className="text-[#aab6cc]">Pattern Bias</span>
+                  <span className={patternVote > 0 ? 'text-emerald-300' : patternVote < 0 ? 'text-rose-300' : 'text-[#4b5a72]'}>
+                    {patternVote > 0 ? '+' : ''}{patternVote.toFixed(1)}
+                  </span>
+                </div>
+                <VoteBar vote={patternVote} />
+                <div className="mt-0.5 font-mono text-[9px] text-[#7c8aa5]">{patternBiasLabel(fit.patternBias)}</div>
+                {fit.patterns.length > 0 && (
+                  <div className="mt-1 flex flex-wrap gap-1">
+                    {fit.patterns.map((h, i) => (
+                      <PatternChip key={`${h.name}-${i}`} hit={h} />
+                    ))}
+                  </div>
+                )}
+              </div>
+            )
+          })()}
+          {(() => {
+            const haVote = clampVote(fit.haPatternBias / 2.5)
+            return (
+              <div className="text-[10px] leading-tight">
+                <div className="flex items-center justify-between font-mono">
+                  <span className="text-[#aab6cc]">HA Pattern Bias</span>
+                  <span className={haVote > 0 ? 'text-emerald-300' : haVote < 0 ? 'text-rose-300' : 'text-[#4b5a72]'}>
+                    {haVote > 0 ? '+' : ''}{haVote.toFixed(1)}
+                  </span>
+                </div>
+                <VoteBar vote={haVote} />
+                <div className="mt-0.5 font-mono text-[9px] text-[#7c8aa5]">{patternBiasLabel(fit.haPatternBias)}</div>
+                {fit.haPatterns.length > 0 && (
+                  <div className="mt-1 flex flex-wrap gap-1">
+                    {fit.haPatterns.map((h, i) => (
+                      <PatternChip key={`ha-${h.name}-${i}`} hit={h} />
+                    ))}
+                  </div>
+                )}
+              </div>
+            )
+          })()}
+          <div className="font-mono text-[9px] text-[#7c8aa5]" title="combined ADX/DI + pattern bias score, range -10..+10">
             comp <span className={Math.abs(fit.composite) >= 3.5 ? 'text-[#dbe4f0]' : 'text-[#4b5a72]'}>{fit.composite >= 0 ? '+' : ''}{fit.composite.toFixed(1)}</span>
-          </span>
+          </div>
         </div>
       )}
     </div>

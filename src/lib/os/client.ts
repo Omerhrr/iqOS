@@ -849,6 +849,14 @@ export async function getTickVolumeScan(tf: Timeframe): Promise<TickVolumeScanRe
   return osGet<TickVolumeScanResponse>('/tick_volume_scan', { tf })
 }
 
+export interface PatternHit {
+  name: string
+  direction: 'bullish' | 'bearish' | 'neutral'
+  reliability: 1 | 2 | 3
+  barsAgo: number
+  note: string
+}
+
 export interface AdxPatternBiasFit {
   adx: number
   plusDI: number
@@ -859,6 +867,14 @@ export interface AdxPatternBiasFit {
   patternDirection: 'bullish' | 'bearish' | 'neutral'
   topPattern: string | null
   topPatternBarsAgo: number | null
+  /** every pattern hit in the lookback window, most recent first (raw
+   * OHLC - this also IS the "bar chart" pattern read, since a Bar chart and
+   * a Candles chart plot the same OHLC values) */
+  patterns: PatternHit[]
+  /** same detectors, run against the Heikin Ashi transform of this series */
+  haPatterns: PatternHit[]
+  haPatternBias: number
+  haPatternDirection: 'bullish' | 'bearish' | 'neutral'
   agree: boolean
   composite: number
   direction: 'bullish' | 'bearish' | 'neutral'

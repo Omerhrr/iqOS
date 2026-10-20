@@ -17,9 +17,10 @@
 // high-confidence composite; disagreement or either read flat -> composite
 // near 0 and it does not qualify.
 
-import type { Candle } from '../types'
+import type { Candle, PatternHit } from '../types'
 import { adx } from './indicators'
 import { detectPatterns, patternBias } from './patterns'
+import { heikinAshiSeries } from './chartsignals'
 
 export const ADX_TREND_THRESHOLD = 25
 export const PATTERN_BIAS_LOOKBACK = 8
@@ -39,6 +40,23 @@ export interface AdxPatternBiasFit {
   patternDirection: Bias
   topPattern: string | null
   topPatternBarsAgo: number | null
+  /** Every pattern hit in the lookback window, most recent first (same list
+   * `topPattern` was already pulled from, just not truncated to one) - for
+   * UI that wants to show the whole formation list (e.g. "Bullish
+   * Engulfing", "Hammer"), not just the single strongest/most recent hit. */
+  patterns: PatternHit[]
+  /** Same pattern catalog, same detectors, run against the Heikin Ashi
+   * transform of this series instead of raw OHLC - HA's smoothed bodies
+   * surface reversal/continuation formations (Doji, Hammer, Engulfing, ...)
+   * that can read cleaner than the raw-candle version once the HA
+   * smoothing removes noise wicks, at the cost of lagging the real price a
+   * bit (HA open is a running average of the prior bar). Raw-candle
+   * patterns above already double as "bar chart" patterns: a Bar chart and
+   * a Candles chart plot the exact same OHLC values, just styled
+   * differently, so there is no separate bar transform to add. */
+  haPatterns: PatternHit[]
+  haPatternBias: number
+  haPatternDirection: Bias
   /** agree = adxDirection and patternDirection point the same way (and
    * neither is neutral) - the whole point of this panel over either read
    * alone. */
@@ -95,6 +113,10 @@ export function fitAdxPatternBias(candles: Candle[], period = 14, lookback = PAT
   const patternDirection = biasOf(patBias, 0.5)
   const top = hits[0] ?? null
 
+  const haHits = detectPatterns(heikinAshiSeries(candles), lookback)
+  const haPatBias = patternBias(haHits)
+  const haPatternDirection = biasOf(haPatBias, 0.5)
+
   const comp = composite(trendPush, patBias)
   const direction = biasOf(comp, 0.75)
   const agree = adxDirection !== 'neutral' && patternDirection !== 'neutral' && adxDirection === patternDirection
@@ -109,6 +131,10 @@ export function fitAdxPatternBias(candles: Candle[], period = 14, lookback = PAT
     patternDirection,
     topPattern: top?.name ?? null,
     topPatternBarsAgo: top?.barsAgo ?? null,
+    patterns: hits,
+    haPatterns: haHits,
+    haPatternBias: haPatBias,
+    haPatternDirection,
     agree,
     composite: comp,
     direction,
