@@ -20,7 +20,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import type { AssetRow, AutoTraderConfig, BotConfig, BotRow, OsModeStatus, OtcConfig, OtcPolicy, StrategyInfo, Timeframe, TradeKind, ValidationRow } from '@/lib/os/client'
-import { KIND_LABEL, TIMEFRAMES, fmtMoney, fmtTime, getOtcConfig, osGet, osPost, setOtcConfig } from '@/lib/os/client'
+import { BLITZ_EXPIRY_SECONDS, KIND_LABEL, TIMEFRAMES, fmtMoney, fmtTime, getOtcConfig, osGet, osPost, setOtcConfig } from '@/lib/os/client'
 
 const GATE_MAX_AGE_SEC = 14 * 24 * 60 * 60
 
@@ -461,7 +461,7 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
                 onChange={(e) => patch({ kind: e.target.value as TradeKind })}
                 className="h-8 w-full rounded border border-[#1c2739] bg-[#101828] px-2 text-[11px] text-[#e2e8f0] outline-none focus:border-cyan-500/50"
               >
-                {(['binary', 'turbo', 'digital', 'cfd'] as TradeKind[]).map((k) => (
+                {(['binary', 'turbo', 'blitz', 'digital', 'cfd'] as TradeKind[]).map((k) => (
                   <option key={k} value={k}>
                     {KIND_LABEL[k]}
                   </option>
@@ -708,6 +708,28 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
                 value={(draft.expirySec ?? 300) / 60}
                 onChange={(v) => patch({ expirySec: Math.min(1440, Math.max(1, Math.round(v))) * 60 })}
               />
+            ) : draft.kind === 'blitz' ? (
+              <div>
+                <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]" title="Experimental: reverse-engineered from a single captured trade, not documented by IQ Option">
+                  Expiry (seconds)
+                </Label>
+                <div className="mt-1 grid grid-cols-3 gap-1">
+                  {BLITZ_EXPIRY_SECONDS.map((s) => (
+                    <button
+                      key={s}
+                      type="button"
+                      onClick={() => patch({ expirySec: s })}
+                      className={`rounded border py-1 text-[10px] font-mono transition-colors ${
+                        (draft.expirySec ?? 15) === s
+                          ? 'border-violet-500/50 bg-violet-500/10 text-violet-300'
+                          : 'border-[#1c2739] bg-[#101828] text-[#7c8aa5]'
+                      }`}
+                    >
+                      {s}s
+                    </button>
+                  ))}
+                </div>
+              </div>
             ) : null}
 
             <div>
@@ -2108,36 +2130,80 @@ function AutoTraderDialog({
             </select>
           </div>
           <div>
-            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Expiry</Label>
+            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Instrument type</Label>
             <select
-              value={d.expiryTf ?? ''}
-              onChange={(e) =>
-                // "Track signal timeframe" writes a CONCRETE value (the
-                // current tf) rather than undefined/null - a bare undefined
-                // field is dropped entirely by JSON.stringify when this
-                // draft gets POSTed, so it would silently fail to clear a
-                // previously-set expiry on save (the same bug pairStrategy
-                // had earlier - fixed there by never emitting null/undefined
-                // either). Setting it equal to tf is exactly equivalent
-                // (1 tf-bar expiry), just always a value that survives.
-                p({ expiryTf: e.target.value ? (e.target.value as Timeframe) : d.tf })
-              }
+              value={d.kind ?? 'binary'}
+              onChange={(e) => p({ kind: e.target.value as TradeKind })}
               className="h-8 w-full rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-cyan-300 outline-none"
             >
-              <option value="" className="bg-[#0d1420]">
-                Track signal timeframe ({d.tf})
-              </option>
-              {TIMEFRAMES.map((t) => (
-                <option key={t} value={t} className="bg-[#0d1420]">
-                  {t}
+              {(['binary', 'turbo', 'blitz', 'digital', 'cfd'] as TradeKind[]).map((k) => (
+                <option key={k} value={k} className="bg-[#0d1420]">
+                  {KIND_LABEL[k]}
                 </option>
               ))}
             </select>
-            <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
-              How long each trade actually runs before it settles - separate from the signal timeframe above. Leave as "Track signal timeframe" for the
-              original 1-bar-of-tf behavior.
-            </p>
           </div>
+          {(d.kind ?? 'binary') === 'binary' || (d.kind ?? 'binary') === 'turbo' ? (
+            <div>
+              <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Expiry</Label>
+              <select
+                value={d.expiryTf ?? ''}
+                onChange={(e) =>
+                  // "Track signal timeframe" writes a CONCRETE value (the
+                  // current tf) rather than undefined/null - a bare undefined
+                  // field is dropped entirely by JSON.stringify when this
+                  // draft gets POSTed, so it would silently fail to clear a
+                  // previously-set expiry on save (the same bug pairStrategy
+                  // had earlier - fixed there by never emitting null/undefined
+                  // either). Setting it equal to tf is exactly equivalent
+                  // (1 tf-bar expiry), just always a value that survives.
+                  p({ expiryTf: e.target.value ? (e.target.value as Timeframe) : d.tf })
+                }
+                className="h-8 w-full rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-cyan-300 outline-none"
+              >
+                <option value="" className="bg-[#0d1420]">
+                  Track signal timeframe ({d.tf})
+                </option>
+                {TIMEFRAMES.map((t) => (
+                  <option key={t} value={t} className="bg-[#0d1420]">
+                    {t}
+                  </option>
+                ))}
+              </select>
+              <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+                How long each trade actually runs before it settles - separate from the signal timeframe above. Leave as "Track signal timeframe" for the
+                original 1-bar-of-tf behavior.
+              </p>
+            </div>
+          ) : d.kind === 'blitz' ? (
+            <div>
+              <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]" title="Experimental: reverse-engineered from a single captured trade, not documented by IQ Option">
+                Expiry (seconds)
+              </Label>
+              <div className="mt-1 grid grid-cols-3 gap-1">
+                {BLITZ_EXPIRY_SECONDS.map((s) => (
+                  <button
+                    key={s}
+                    type="button"
+                    onClick={() => p({ expirySec: s })}
+                    className={`rounded border py-1 text-[10px] font-mono transition-colors ${
+                      (d.expirySec ?? 15) === s
+                        ? 'border-violet-500/50 bg-violet-500/10 text-violet-300'
+                        : 'border-[#1c2739] bg-[#101828] text-[#7c8aa5]'
+                    }`}
+                  >
+                    {s}s
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : d.kind === 'digital' ? (
+            <NumField
+              label="Expiry (minutes)"
+              value={(d.expirySec ?? 300) / 60}
+              onChange={(v) => p({ expirySec: Math.min(1440, Math.max(1, Math.round(v))) * 60 })}
+            />
+          ) : null}
           <div>
             <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Direction</Label>
             <select

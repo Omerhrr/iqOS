@@ -28,9 +28,9 @@ export interface BotConfig {
   kind: TradeKind
   stake: number
   expiryBars: number
-  /** Explicit time expiry in seconds (e.g. 900 = 15 minutes) for digital
-   * bots - independent of the timeframe, settles at an exact timestamp.
-   * Undefined = kind default (5m for digital). */
+  /** Explicit time expiry in seconds (e.g. 900 = 15 minutes) for digital/
+   * blitz bots - independent of the timeframe, settles at an exact
+   * timestamp. Undefined = kind default (5m for digital, 15s for blitz). */
   expirySec?: number
   /** Trading-session filter: only open trades inside the window (UTC).
    * 'overlap' = London x New York 13:00-17:00 UTC. Undefined/'all' = 24h. */
@@ -515,6 +515,14 @@ export class AutopilotService {
     // execution.placeOrder's final else branch treated it as a CFD: margin
     // deducted, leverage defaulted up to 30x, no expiry. Whitelist it.
     const rawKind = String(input.kind ?? existing?.kind ?? DEFAULT_BOT.kind).trim()
+    const kind = (['binary', 'turbo', 'blitz', 'digital', 'cfd'].includes(rawKind) ? rawKind : DEFAULT_BOT.kind) as TradeKind
+    // expirySec is only meaningful for kinds that settle at an exact
+    // timestamp independent of the tf-bar count: digital (minutes-scale,
+    // 60-86400s) and blitz (sub-minute, 1-60s) - each gets its own clamp
+    // range rather than the old one-size digital-only 60s floor, which would
+    // have silently rounded every blitz bot's 5s/15s expiry up to a full
+    // minute.
+    const expirySecBounds: [number, number] = kind === 'blitz' ? [1, 60] : [60, 86400]
     const bot: BotConfig = {
       id,
       name: (input.name ?? existing?.name ?? `Bot ${id.slice(-4)}`).trim().slice(0, 32) || 'Bot',
@@ -526,7 +534,7 @@ export class AutopilotService {
       strategyId: this.validStrategy(input.strategyId ?? existing?.strategyId ?? DEFAULT_BOT.strategyId),
       tf: (input.tf ?? existing?.tf ?? DEFAULT_BOT.tf) as Timeframe,
       params: input.params && Object.keys(input.params).length ? input.params : existing?.params,
-      kind: (['binary', 'turbo', 'digital', 'cfd'].includes(rawKind) ? rawKind : DEFAULT_BOT.kind) as TradeKind,
+      kind,
       stake: clampNum(input.stake ?? existing?.stake ?? DEFAULT_BOT.stake, 1, 5000),
       expiryBars: Math.max(1, Math.round(input.expiryBars ?? existing?.expiryBars ?? DEFAULT_BOT.expiryBars)),
       minScore: clampNum(input.minScore ?? existing?.minScore ?? DEFAULT_BOT.minScore, 0, 100),
@@ -538,7 +546,7 @@ export class AutopilotService {
       dailyLossLimit: input.dailyLossLimit !== undefined ? Number(input.dailyLossLimit) : existing?.dailyLossLimit,
       expirySec:
         input.expirySec !== undefined || existing?.expirySec !== undefined
-          ? Math.round(clampNum(input.expirySec ?? existing?.expirySec ?? 300, 60, 86400))
+          ? Math.round(clampNum(input.expirySec ?? existing?.expirySec ?? (kind === 'blitz' ? 15 : 300), expirySecBounds[0], expirySecBounds[1]))
           : undefined,
       session: this.validSession(input.session ?? existing?.session),
       stakePlan: this.parseStakePlan(input.stakePlan, existing?.stakePlan),
@@ -911,7 +919,7 @@ export class AutopilotService {
       kind: bot.kind,
       amount: bet.amount,
       expiryBars: bot.expiryBars,
-      expirySec: bot.kind === 'digital' ? bot.expirySec : undefined,
+      expirySec: bot.kind === 'digital' || bot.kind === 'blitz' ? bot.expirySec : undefined,
       mode: this.exec.accountSource === 'iq' ? 'live' : 'paper',
       strategy: bot.strategyId,
       note: `bot:${bot.id}`,

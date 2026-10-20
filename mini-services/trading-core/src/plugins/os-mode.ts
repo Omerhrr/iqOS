@@ -45,8 +45,8 @@
 
 import type { Plugin, KernelContext } from '../kernel'
 import type { Store } from '../store'
-import type { AssetCategory, Candle, Timeframe } from '../types'
-import { ALL_TIMEFRAMES, TIMEFRAME_SECONDS } from '../types'
+import type { AssetCategory, Candle, Timeframe, TradeKind } from '../types'
+import { ALL_TIMEFRAMES, TIMEFRAME_SECONDS, BINARY_EXPIRY_MINUTES } from '../types'
 import type { ScreenerService, ScreenRow } from './screener'
 import type { MarketDataService } from './market-data'
 import type { ChartSignalsService, ChartScanResult } from './chartsignals'
@@ -111,6 +111,17 @@ export interface AutoTraderConfig {
    * floored at 1) since execution.ts's binary/turbo settlement is still
    * bar-counted off the signal tf, not a second independent clock. */
   expiryTf?: Timeframe
+  /** Instrument type to trade. Undefined/unset = 'binary' (the historical,
+   * only-ever-supported behavior - see placeOrder's hardcoded kind:'binary'
+   * before this field existed). 'blitz'/'digital' settle on an explicit
+   * wall-clock `expirySec` instead of expiryTf's bar math (see expirySec
+   * below); 'turbo' reuses expiryTf/bars exactly like binary. 'cfd' has no
+   * expiry at all (tp/sl-based). */
+  kind?: TradeKind
+  /** Explicit wall-clock expiry in seconds - only read for kind 'blitz'
+   * (1-60s) or 'digital' (60-86400s), mirroring an autopilot bot's
+   * expirySec. Undefined = kind default (15s blitz, 300s digital). */
+  expirySec?: number
   stake: number
   minScore: number // minimum |score| to act on (composite or per-source edge score)
   minConfidence: number // minimum signal confidence (0-100)
@@ -332,6 +343,8 @@ export const DEFAULT_AUTOTRADER: AutoTraderConfig = {
   signalSource: 'chartsignals',
   tf: '1m',
   expiryTf: undefined,
+  kind: 'binary',
+  expirySec: undefined,
   stake: 10,
   minScore: 60,
   minConfidence: 55,
@@ -888,7 +901,7 @@ export class ModeService {
         // payout that has since dropped below the floor used to pass on the
         // stale number (and a stale low number benched a pair that now pays
         // fine). The stale row value is only a fallback for cold metadata.
-        const freshPay = this.payoutFor(row.asset, 'binary')
+        const freshPay = this.payoutFor(row.asset, this.config.kind ?? 'binary')
         const pay = freshPay > 0 ? freshPay : row.payout
         if (pay > 0 && pay < minPay) {
           this.assetRejectedUntil.set(row.asset, this.now() + ModeService.PAYOUT_FLOOR_COOLDOWN_SEC)
@@ -998,7 +1011,7 @@ export class ModeService {
       } catch {
         // execution plugin unavailable - already failed above via place(), unreachable in practice
       }
-      const pay = this.payoutFor(row.asset, 'binary')
+      const pay = this.payoutFor(row.asset, this.config.kind ?? 'binary')
       const payTag = pay > 0 ? ` · pay ${(pay * 100).toFixed(0)}% (BE ${(100 / (1 + pay)).toFixed(1)}%)` : ''
       this.emit(
         'success',
@@ -1145,7 +1158,7 @@ export class ModeService {
                     atrPct: 0,
                     hurst: 0,
                     changePct: 0,
-                    payout: this.payoutFor(asset, 'binary'),
+                    payout: this.payoutFor(asset, this.config.kind ?? 'binary'),
                     topPattern: null,
                     ts: this.now(),
                     computedTs: this.now(),
@@ -1267,7 +1280,7 @@ export class ModeService {
                   atrPct: 0,
                   hurst: 0,
                   changePct: 0,
-                  payout: this.payoutFor(asset, 'binary'),
+                  payout: this.payoutFor(asset, this.config.kind ?? 'binary'),
                   topPattern: null,
                   ts: this.now(),
                   computedTs: this.now(),
@@ -1352,7 +1365,7 @@ export class ModeService {
                   atrPct: 0,
                   hurst: 0,
                   changePct: 0,
-                  payout: this.payoutFor(asset, 'binary'),
+                  payout: this.payoutFor(asset, this.config.kind ?? 'binary'),
                   // fit.topPattern is a bare pattern-name string here, not the
                   // {name, direction, reliability} ScreenRow.topPattern shape -
                   // the full pattern object isn't surfaced by this source.
@@ -1438,7 +1451,7 @@ export class ModeService {
                   atrPct: 0,
                   hurst: 0,
                   changePct: 0,
-                  payout: this.payoutFor(asset, 'binary'),
+                  payout: this.payoutFor(asset, this.config.kind ?? 'binary'),
                   topPattern: null,
                   ts: this.now(),
                   computedTs: this.now(),
@@ -1532,7 +1545,7 @@ export class ModeService {
                 atrPct: 0,
                 hurst: 0,
                 changePct: 0,
-                payout: this.payoutFor(asset, 'binary'),
+                payout: this.payoutFor(asset, this.config.kind ?? 'binary'),
                 topPattern: null,
                 ts: s.ts,
                 computedTs: s.ts,
@@ -1648,7 +1661,7 @@ export class ModeService {
                     atrPct: 0,
                     hurst: 0,
                     changePct: 0,
-                    payout: this.payoutFor(asset, 'binary'),
+                    payout: this.payoutFor(asset, this.config.kind ?? 'binary'),
                     topPattern: null,
                     ts: this.now(),
                     computedTs: this.now(),
@@ -2359,25 +2372,31 @@ export class ModeService {
           asset: string
           tf: Timeframe
           side: 'call' | 'put'
-          kind: 'binary'
+          kind: TradeKind
           amount: number
           expiryBars: number
+          expirySec?: number
           mode: 'paper' | 'live'
           strategy: string
           note: string
         }): Promise<{ ok: boolean; error?: string }>
       }>('execution')
+      const kind: TradeKind = this.config.kind ?? 'binary'
       return await exec.placeOrder({
         asset: row.asset,
         tf: this.config.tf,
         side,
-        kind: 'binary',
+        kind,
         amount,
         // expiryTf unset = the old behavior (expiry tracks the signal tf
         // 1:1, i.e. exactly 1 bar). Set = however many `tf` bars it takes to
         // cover that expiry timeframe (min 1) - e.g. signals on '1m' with
-        // expiryTf '5m' settles 5 bars later, not 1.
+        // expiryTf '5m' settles 5 bars later, not 1. Only meaningful for
+        // binary/turbo - blitz/digital settle on expirySec instead (below).
         expiryBars: this.config.expiryTf ? Math.max(1, Math.round(TIMEFRAME_SECONDS[this.config.expiryTf] / TIMEFRAME_SECONDS[this.config.tf])) : 1,
+        // blitz/digital settle at an explicit wall-clock duration, same as
+        // an autopilot bot - everything else (binary/turbo/cfd) ignores it.
+        expirySec: kind === 'blitz' || kind === 'digital' ? this.config.expirySec : undefined,
         // THE SAME BUG that was in autopilot.ts: this was hardcoded 'paper'
         // unconditionally, so the built-in AUTO-mode auto-trader could never
         // place a real order no matter what the account was connected to.
@@ -2492,7 +2511,7 @@ export class ModeService {
   /** Live binary payout for one ticker as a 0-1 fraction, 0 when the market
    * service can't answer (never invent a number - 0 reads as "unknown" to
    * every gate that consults this, which is the permissive contract). */
-  private payoutFor(asset: string, kind: 'binary' | 'turbo' | 'digital' | 'cfd'): number {
+  private payoutFor(asset: string, kind: TradeKind): number {
     try {
       const pay = this.ctx.use<MarketDataService>('market').payoutFor(asset, kind)
       return typeof pay === 'number' && Number.isFinite(pay) && pay > 0 ? pay : 0
@@ -2856,6 +2875,15 @@ export class ModeService {
     // since JSON.stringify drops a bare `undefined` from the request body.
     if (patch.expiryTf !== undefined)
       this.config.expiryTf = typeof patch.expiryTf === 'string' && (ALL_TIMEFRAMES as string[]).includes(patch.expiryTf) ? (patch.expiryTf as Timeframe) : undefined
+    // instrument type - whitelisted exactly like autopilot bots (Task 58,
+    // P2 pattern): an unknown/garbage kind silently falls back to 'binary'
+    // rather than reaching placeOrder unchecked.
+    if (patch.kind !== undefined)
+      this.config.kind = (['binary', 'turbo', 'blitz', 'digital', 'cfd'] as string[]).includes(String(patch.kind)) ? (patch.kind as TradeKind) : 'binary'
+    if (patch.expirySec !== undefined) {
+      const bounds: [number, number] = this.config.kind === 'blitz' ? [1, 60] : [60, 86400]
+      this.config.expirySec = patch.expirySec === null ? undefined : Math.round(clamp(numCur(patch.expirySec, this.config.expirySec ?? (this.config.kind === 'blitz' ? 15 : 300)), bounds[0], bounds[1]))
+    }
     if (patch.stake !== undefined) this.config.stake = clamp(numCur(patch.stake, this.config.stake), 1, 5000)
     if (patch.minScore !== undefined) this.config.minScore = clamp(numCur(patch.minScore, this.config.minScore), 0, 100)
     if (patch.minConfidence !== undefined) this.config.minConfidence = clamp(numCur(patch.minConfidence, this.config.minConfidence), 0, 100)

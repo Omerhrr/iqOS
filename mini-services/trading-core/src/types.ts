@@ -73,6 +73,13 @@ export const TRADE_KIND_LABEL: Record<TradeKind, string> = {
   digital: 'Digital',
   cfd: 'CFD',
 }
+
+/** Every duration (in minutes) IQ Option's real binary-option broker call
+ * actually accepts - confirmed wider than the original 1/5m-only assumption.
+ * Anything else gets rejected by the broker with its own misleading "asset
+ * is not available" message, so this is the clamp-and-validate source of
+ * truth for both the manual ticket and the autopilot bot engine. */
+export const BINARY_EXPIRY_MINUTES: number[] = [1, 2, 3, 4, 5, 15, 30, 45, 60, 120]
 export type TradeMode = 'paper' | 'live'
 // 'push' = at-the-money refund / broker-reported pnl 0 (Task 58): a neutral
 // third outcome. It is NOT a win (win-rate stats must not count it) and NOT a

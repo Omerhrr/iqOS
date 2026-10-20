@@ -14,7 +14,7 @@ import type {
   TradeKind,
 } from '../types'
 import type { KernelContext } from '../kernel'
-import { TIMEFRAME_SECONDS } from '../types'
+import { TIMEFRAME_SECONDS, BINARY_EXPIRY_MINUTES } from '../types'
 import type { Plugin } from '../kernel'
 import type { MarketDataService } from './market-data'
 import type { AnalyticsService } from './analytics'
@@ -483,8 +483,9 @@ export class ExecutionService {
     const expiryMin = Math.max(1, Math.round(expirySec / 60))
 
     // BUG FIX: IQ Option's real buyv3 endpoint only accepts specific
-    // durations for binary/turbo (binary-option: 1 or 5 minutes ONLY;
-    // turbo-option: 1-5 minutes) - anything else is rejected by the broker
+    // durations for binary/turbo (binary-option: see BINARY_EXPIRY_MINUTES
+    // in types.ts - 1,2,3,4,5,15,30,45,60,120 minutes; turbo-option: 1-5
+    // minutes) - anything else is rejected by the broker
     // with the misleading "Cannot purchase an option (the asset is not
     // available at the moment)" message, which has nothing to do with the
     // asset actually being open. Neither execution.ts nor the sidecar used
@@ -496,10 +497,10 @@ export class ExecutionService {
     // (it never calls the real broker, so this check only runs here in the
     // LIVE path) - this turns that cryptic broker rejection into an
     // upfront, actionable error instead.
-    if (kind === 'binary' && expiryMin !== 1 && expiryMin !== 5) {
+    if (kind === 'binary' && !BINARY_EXPIRY_MINUTES.includes(expiryMin)) {
       return {
         ok: false,
-        error: `IQ Option binary options only support 1 or 5 minute expiries - your expiry resolves to ${expiryMin}m. Pick an expiry timeframe/bar count that works out to exactly 1 or 5 minutes against this trade's ${req.tf ?? '1m'} tf.`,
+        error: `IQ Option binary options only support these expiries: ${BINARY_EXPIRY_MINUTES.map((m) => (m >= 60 ? `${m / 60}h` : `${m}m`)).join(', ')} - your expiry resolves to ${expiryMin}m. Pick an expiry timeframe/bar count that works out to exactly one of these against this trade's ${req.tf ?? '1m'} tf.`,
       }
     }
     if (kind === 'turbo' && (expiryMin < 1 || expiryMin > 5)) {

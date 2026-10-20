@@ -32,6 +32,14 @@ export const KIND_LABEL: Record<TradeKind, string> = { binary: 'Binary', turbo: 
 // against IQ Option's own blitz expiry dropdown before relying on the full
 // list; start with the smallest stake if you add/remove values here.
 export const BLITZ_EXPIRY_SECONDS: number[] = [5, 10, 15, 20, 30, 60]
+// Mirrors trading-core's types.ts BINARY_EXPIRY_MINUTES - every duration IQ
+// Option's real binary-option broker call actually accepts (wider than the
+// original 1/5m-only assumption). Used both by the manual ticket's expiry
+// chip picker and the bot engine's expiry field.
+export const BINARY_EXPIRY_MINUTES: number[] = [1, 2, 3, 4, 5, 15, 30, 45, 60, 120]
+export function fmtExpiryMinutes(m: number): string {
+  return m >= 60 ? `${m / 60}h` : `${m}m`
+}
 
 export type ChartType =
   | 'candles' | 'hollow' | 'heikin' | 'bars' | 'line' | 'area' | 'baseline'
@@ -2783,6 +2791,15 @@ export interface AutoTraderConfig {
    * 1:1, i.e. exactly one bar). Set to decouple them, e.g. read signals on
    * '1m' but let each trade run '5m' before it settles. */
   expiryTf?: Timeframe
+  /** Instrument type to trade. Undefined/unset = 'binary' (the historical
+   * behavior). 'blitz'/'digital' settle on `expirySec` instead of
+   * expiryTf's bar math; 'turbo' reuses expiryTf/bars exactly like binary;
+   * 'cfd' has no expiry at all (tp/sl-based). */
+  kind?: TradeKind
+  /** Explicit wall-clock expiry in seconds - only read for kind 'blitz'
+   * (1-60s) or 'digital' (60-86400s). Undefined = kind default (15s blitz,
+   * 300s digital). */
+  expirySec?: number
   stake: number
   minScore: number
   minConfidence: number

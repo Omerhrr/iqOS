@@ -5,7 +5,7 @@ import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { AccountState, AssetRow, Position, Timeframe, TradeKind } from '@/lib/os/client'
-import { BLITZ_EXPIRY_SECONDS, KIND_LABEL, TIMEFRAME_SECONDS, fmtMoney, fmtPrice, osGet, osPost } from '@/lib/os/client'
+import { BINARY_EXPIRY_MINUTES, BLITZ_EXPIRY_SECONDS, KIND_LABEL, TIMEFRAME_SECONDS, fmtExpiryMinutes, fmtMoney, fmtPrice, osGet, osPost } from '@/lib/os/client'
 
 // IQ Option's real broker only ever accepts these durations for binary/turbo
 // options - anything else is rejected with its own misleading "asset is not
@@ -14,8 +14,7 @@ import { BLITZ_EXPIRY_SECONDS, KIND_LABEL, TIMEFRAME_SECONDS, fmtMoney, fmtPrice
 // needs converting to a real minute count before it can be clamped).
 function clampOptionExpiryMin(kind: TradeKind, minutes: number): number {
   if (kind === 'binary') {
-    const valid = [1, 5]
-    return valid.reduce((best, v) => (Math.abs(v - minutes) < Math.abs(best - minutes) ? v : best))
+    return BINARY_EXPIRY_MINUTES.reduce((best, v) => (Math.abs(v - minutes) < Math.abs(best - minutes) ? v : best))
   }
   if (kind === 'turbo') return Math.max(1, Math.min(5, Math.round(minutes)))
   return minutes
@@ -217,11 +216,11 @@ export default function TradeTicket({ asset, tf, price, account, prefill, onPlac
 
         {kind === 'binary' && (
           <div>
-            <div className="mb-1 text-[9px] uppercase tracking-wider text-[#4b5a72]" title="IQ Option's binary options only ever settle at exactly 1 or 5 minutes - not a chart-timeframe multiple">
+            <div className="mb-1 text-[9px] uppercase tracking-wider text-[#4b5a72]" title="IQ Option's binary options only ever settle at one of these exact durations - not a chart-timeframe multiple">
               Expiry
             </div>
-            <div className="grid grid-cols-2 gap-1">
-              {[1, 5].map((m) => (
+            <div className="grid grid-cols-5 gap-1">
+              {BINARY_EXPIRY_MINUTES.map((m) => (
                 <button
                   key={m}
                   type="button"
@@ -230,7 +229,7 @@ export default function TradeTicket({ asset, tf, price, account, prefill, onPlac
                     optionExpiryMin === m ? 'border-violet-500/50 bg-violet-500/10 text-violet-300' : 'border-[#1c2739] bg-[#101828] text-[#7c8aa5]'
                   }`}
                 >
-                  {m}m
+                  {fmtExpiryMinutes(m)}
                 </button>
               ))}
             </div>
