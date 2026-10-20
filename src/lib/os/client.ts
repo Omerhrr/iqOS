@@ -944,6 +944,20 @@ export async function getPairCompare(a: string, b: string, tf: Timeframe): Promi
   return osGet<PairCompareResponse>('/pair_compare', { a, b, tf })
 }
 
+/** Single-asset twin of PairCompareResponse - same side shape (ADX/DI +
+ * pattern bias + HA pattern bias + per-candle delta), no second asset and
+ * no lead-lag section. */
+export interface PairSignalResponse {
+  ok: boolean
+  tf: Timeframe
+  side: PairCompareSide
+  ts: number
+}
+
+export async function getPairSignal(asset: string, tf: Timeframe): Promise<PairSignalResponse> {
+  return osGet<PairSignalResponse>('/pair_signal', { asset, tf })
+}
+
 // ---- chart-signal outcome stats (Task 64-c: the honesty loop) ------------
 
 export type SignalOutcomeId = 'win' | 'loss' | 'flat' | 'timeout'

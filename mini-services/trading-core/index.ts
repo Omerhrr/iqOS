@@ -2170,6 +2170,43 @@ const httpServer = createServer(async (req, res) => {
         }
       }
 
+      // Pair Signal: the single-asset twin of /pair_compare - type any one
+      // instrument and get back exactly the same ADX/DI + pattern bias + HA
+      // pattern bias + per-candle delta read a Pair Compare side shows, with
+      // no second asset and no lead-lag section (there's nothing to lead or
+      // lag against). Pure reuse of the same building blocks: fits/renders
+      // identically to PairCompareSide, so the frontend can share its
+      // SideCard component outright.
+      if (path === '/pair_signal') {
+        try {
+          const psAsset = String(q.get('asset') ?? 'EURUSD').toUpperCase()
+          const psTfv = tfStrict(q.get('tf'))
+          if (psTfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const psInfo = market.assets.find((x) => x.ticker === psAsset)
+          const psCandles = market.getCandlesDeep(psAsset, psTfv, 400, true)
+          const psFit = fitAdxPatternBias(psCandles)
+          const psDelta: PairCompareDelta[] = computeFootprint(psCandles.slice(-24)).candles.map((c) => ({ time: c.time, delta: c.delta, close: c.close }))
+          return json(200, {
+            ok: true,
+            tf: psTfv,
+            side: {
+              asset: psAsset,
+              name: psInfo?.name ?? psAsset,
+              category: psInfo?.category ?? '',
+              otc: !!psInfo?.otc,
+              open: psInfo?.open ?? false,
+              price: psCandles[psCandles.length - 1]?.close ?? 0,
+              fit: psFit,
+              direction: psFit?.qualifies ? (psFit.direction === 'bullish' ? 'call' : psFit.direction === 'bearish' ? 'put' : null) : null,
+              delta: psDelta,
+            },
+            ts: Date.now(),
+          })
+        } catch (err) {
+          return json(400, { ok: false, error: (err as Error).message })
+        }
+      }
+
       if (path === '/cointegration') {
         try {
           const cAsset = String(q.get('asset') ?? market.activeAsset)

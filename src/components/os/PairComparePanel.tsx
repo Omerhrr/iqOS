@@ -141,7 +141,7 @@ function dirChip(direction: 'call' | 'put' | null) {
   )
 }
 
-function SideCard({ side, onSelectAsset }: { side: PairCompareSide; onSelectAsset?: (a: string) => void }) {
+export function SideCard({ side, onSelectAsset }: { side: PairCompareSide; onSelectAsset?: (a: string) => void }) {
   const fit = side.fit
   return (
     <div

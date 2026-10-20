@@ -1868,6 +1868,55 @@ export const STRATEGIES: StrategyDef[] = [
     },
   },
   {
+    id: 'pair-signal',
+    name: 'Pair Signal (ADX/DI + Pattern + HA + Delta)',
+    description:
+      'The Pair Signal panel\'s own read, as a strategy: starts from the same agreement-gated ADX/DI + pattern bias composite as "ADX/DI + Pattern Bias" (analytics/adxpatternbias.ts), then layers on two more confirmations the panel also shows but that strategy does not use - the identical pattern detectors run against the Heikin Ashi transform of the series (fit.haPatternDirection), and the trailing per-candle buy/sell delta (footprint.ts\'s CLV-proxy split, same as the Footprint panels). Trading still gates on the base composite alone (so this never fires less often than the base strategy); HA and delta only ADJUST the score - agreeing with both pushes it up, either one disagreeing pulls it back down - so a Pair Signal read that looks strong on every axis scores meaningfully higher than one that only just cleared the ADX/pattern bar.',
+    params: [
+      { key: 'adxThreshold', label: 'Min ADX to count as trending', type: 'number', min: 10, max: 50, default: ADX_TREND_THRESHOLD },
+      { key: 'lookback', label: 'Pattern scan lookback (bars)', type: 'number', min: 3, max: 20, default: 8 },
+      { key: 'qualify', label: 'Min |composite| to trade (0-10)', type: 'number', min: 1, max: 10, step: 0.5, default: COMPOSITE_QUALIFY },
+    ],
+    evaluate: (candles, p) => {
+      const fit = fitAdxPatternBias(candles, 14, num(p, 'lookback', 8))
+      if (!fit) return { direction: 'none', score: 0, notes: 'thin history - not enough bars for ADX + pattern bias' }
+      if (!fit.agree) {
+        return {
+          direction: 'none',
+          score: 0,
+          notes: `ADX/DI (${fit.adxDirection}) and pattern bias (${fit.patternDirection}, ${fit.patternBias >= 0 ? '+' : ''}${fit.patternBias.toFixed(1)}) disagree or one is flat`,
+        }
+      }
+      const qualify = num(p, 'qualify', COMPOSITE_QUALIFY)
+      if (Math.abs(fit.composite) < qualify) {
+        return { direction: 'none', score: 0, notes: `composite ${fit.composite.toFixed(1)} agrees (${fit.direction}) but too weak to clear ${qualify}` }
+      }
+      const dir = fit.direction === 'bullish' ? 'call' : 'put'
+      let score = clamp(40 + Math.abs(fit.composite) * 5, 40, 95)
+
+      // HA confirmation: same detectors, Heikin Ashi series - already computed
+      // inside fitAdxPatternBias (fit.haPatternDirection), no extra work here.
+      const haAgrees = fit.haPatternDirection === fit.direction
+      const haOpposes = fit.haPatternDirection !== 'neutral' && fit.haPatternDirection !== fit.direction
+      score = clamp(score + (haAgrees ? 8 : haOpposes ? -12 : 0), 5, 97)
+
+      // Delta confirmation: trailing per-candle buy/sell delta (CLV-proxy,
+      // same math the Footprint/Pair Signal panels use) - net delta sign
+      // over the last 10 closed candles should point the same way as the
+      // composite's direction.
+      const netDelta = computeFootprint(candles.slice(-10)).candles.reduce((s, c) => s + c.delta, 0)
+      const deltaAgrees = (dir === 'call' && netDelta > 0) || (dir === 'put' && netDelta < 0)
+      const deltaOpposes = (dir === 'call' && netDelta < 0) || (dir === 'put' && netDelta > 0)
+      score = clamp(score + (deltaAgrees ? 6 : deltaOpposes ? -10 : 0), 5, 97)
+
+      return {
+        direction: dir,
+        score,
+        notes: `ADX ${fit.adx.toFixed(1)} (+DI ${fit.plusDI.toFixed(1)}/-DI ${fit.minusDI.toFixed(1)}) + pattern bias ${fit.patternBias >= 0 ? '+' : ''}${fit.patternBias.toFixed(1)}${fit.topPattern ? ` (${fit.topPattern})` : ''}, composite ${fit.composite.toFixed(1)} - HA ${haAgrees ? 'agrees' : haOpposes ? 'opposes' : 'flat'}, delta ${netDelta >= 0 ? '+' : ''}${netDelta.toFixed(1)} ${deltaAgrees ? 'agrees' : deltaOpposes ? 'opposes' : 'flat'}`,
+      }
+    },
+  },
+  {
     id: 'shock-pressure',
     name: 'Shock + Pressure',
     description:
