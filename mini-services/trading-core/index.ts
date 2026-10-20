@@ -2084,6 +2084,11 @@ const httpServer = createServer(async (req, res) => {
       // is stronger). Pure single-pair reuse of analytics/adxpatternbias.ts
       // and analytics/leadlag.ts - no scan/cache machinery, same shape as
       // /cointegration's single-asset route.
+      interface PairCompareDelta {
+        time: number
+        delta: number
+        close: number
+      }
       if (path === '/pair_compare') {
         try {
           const pa = String(q.get('a') ?? 'EURUSD')
@@ -2099,6 +2104,14 @@ const httpServer = createServer(async (req, res) => {
           const fitB = fitAdxPatternBias(candlesB)
           const closesA = candlesA.map((c) => c.close)
           const closesB = candlesB.map((c) => c.close)
+          // Per-candle delta strip: computeFootprint's own FootprintCandle.delta
+          // IS the per-candle buy-sell split (CLV-proxy, same approximation
+          // honesty as the Footprint/Volume+Footprint panels - see
+          // footprint.ts's header) summed across that candle's bins, so this
+          // is a direct reuse, not new math. Trailing 24 closed candles only -
+          // this is a glance strip, not a full footprint chart.
+          const deltaA: PairCompareDelta[] = computeFootprint(candlesA.slice(-24)).candles.map((c) => ({ time: c.time, delta: c.delta, close: c.close }))
+          const deltaB: PairCompareDelta[] = computeFootprint(candlesB.slice(-24)).candles.map((c) => ({ time: c.time, delta: c.delta, close: c.close }))
 
           const aLeadsB = fitLeadLag(closesA, closesB, 10)
           const bLeadsA = fitLeadLag(closesB, closesA, 10)
@@ -2126,6 +2139,7 @@ const httpServer = createServer(async (req, res) => {
             price: candlesA[candlesA.length - 1]?.close ?? 0,
             fit: fitA,
             direction: fitA?.qualifies ? (fitA.direction === 'bullish' ? 'call' : fitA.direction === 'bearish' ? 'put' : null) : null,
+            delta: deltaA,
           }
           const sideB = {
             asset: pb,
@@ -2136,6 +2150,7 @@ const httpServer = createServer(async (req, res) => {
             price: candlesB[candlesB.length - 1]?.close ?? 0,
             fit: fitB,
             direction: fitB?.qualifies ? (fitB.direction === 'bullish' ? 'call' : fitB.direction === 'bearish' ? 'put' : null) : null,
+            delta: deltaB,
           }
 
           return json(200, {

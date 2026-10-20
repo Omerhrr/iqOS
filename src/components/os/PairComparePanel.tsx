@@ -11,7 +11,7 @@
 // (analytics/adxpatternbias.ts + analytics/leadlag.ts, pure-function reuse).
 
 import { useCallback, useEffect, useState } from 'react'
-import type { PairCompareResponse, PairCompareSide, PairCompareLeadLag, PatternHit, Timeframe } from '@/lib/os/client'
+import type { PairCompareResponse, PairCompareSide, PairCompareLeadLag, PairCompareDelta, PatternHit, Timeframe } from '@/lib/os/client'
 import { getPairCompare, fmtPrice } from '@/lib/os/client'
 
 const POLL_MS = 10_000
@@ -86,6 +86,45 @@ function PatternChip({ hit }: { hit: PatternHit }) {
   )
 }
 
+/** Per-candle buy-sell delta strip: a bar per trailing closed candle, height
+ * scaled to the biggest |delta| in the window, green above the zero line /
+ * red below. Same CLV-proxy approximation as the Footprint/Volume+Footprint
+ * panels - this is a glance strip, not a full footprint ladder. */
+function DeltaStrip({ series }: { series: PairCompareDelta[] }) {
+  if (series.length === 0) return null
+  const maxAbs = Math.max(...series.map((d) => Math.abs(d.delta)), 1e-9)
+  const net = series.reduce((s, d) => s + d.delta, 0)
+  return (
+    <div className="text-[10px] leading-tight">
+      <div className="flex items-center justify-between font-mono">
+        <span className="text-[#aab6cc]">Per-Candle Delta</span>
+        <span className={net > 0 ? 'text-emerald-300' : net < 0 ? 'text-rose-300' : 'text-[#4b5a72]'} title="sum of the strip's per-candle deltas">
+          {net > 0 ? '+' : ''}{net.toFixed(0)}
+        </span>
+      </div>
+      <div className="mt-1 flex h-6 items-center gap-px">
+        {series.map((d, i) => {
+          const h = Math.max(2, Math.round((Math.abs(d.delta) / maxAbs) * 12))
+          const up = d.delta > 0
+          return (
+            <div
+              key={i}
+              className="flex-1"
+              style={{ height: '12px', display: 'flex', alignItems: up ? 'flex-end' : 'flex-start' }}
+              title={`delta ${d.delta >= 0 ? '+' : ''}${d.delta.toFixed(1)} @ ${fmtPrice(d.close, '')}`}
+            >
+              <div
+                className={d.delta === 0 ? 'bg-[#1c2739]' : up ? 'bg-emerald-500/70' : 'bg-rose-500/70'}
+                style={{ width: '100%', height: `${h}px` }}
+              />
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
 function dirChip(direction: 'call' | 'put' | null) {
   if (!direction) {
     return <span className="rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] uppercase tracking-wider text-[#4b5a72]">flat</span>
@@ -135,6 +174,11 @@ function SideCard({ side, onSelectAsset }: { side: PairCompareSide; onSelectAsse
         )}
         <span className="ml-auto font-mono text-[9px] text-[#7c8aa5]">{fmtPrice(side.price, side.asset)}</span>
       </div>
+      {side.delta.length > 0 && (
+        <div className="mt-1.5">
+          <DeltaStrip series={side.delta} />
+        </div>
+      )}
       {!fit ? (
         <div className="mt-1.5 font-mono text-[9px] text-[#4b5a72]">thin history - no honest ADX/pattern read yet</div>
       ) : (

@@ -881,6 +881,15 @@ export interface AdxPatternBiasFit {
   qualifies: boolean
 }
 
+/** One closed candle's buy-sell delta (footprint.ts's FootprintCandle.delta,
+ * CLV-proxy - same approximation-honesty caveat as the Footprint panels:
+ * no true bid/ask feed, volume spread by CLV ratio). */
+export interface PairCompareDelta {
+  time: number
+  delta: number
+  close: number
+}
+
 export interface PairCompareSide {
   asset: string
   name: string
@@ -890,6 +899,8 @@ export interface PairCompareSide {
   price: number
   fit: AdxPatternBiasFit | null
   direction: 'call' | 'put' | null
+  /** trailing 24 closed candles' per-candle delta, oldest first */
+  delta: PairCompareDelta[]
 }
 
 export interface LeadLagSignal {
