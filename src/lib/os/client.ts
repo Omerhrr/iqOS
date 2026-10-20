@@ -849,6 +849,66 @@ export async function getTickVolumeScan(tf: Timeframe): Promise<TickVolumeScanRe
   return osGet<TickVolumeScanResponse>('/tick_volume_scan', { tf })
 }
 
+export interface AdxPatternBiasFit {
+  adx: number
+  plusDI: number
+  minusDI: number
+  trending: boolean
+  adxDirection: 'bullish' | 'bearish' | 'neutral'
+  patternBias: number
+  patternDirection: 'bullish' | 'bearish' | 'neutral'
+  topPattern: string | null
+  topPatternBarsAgo: number | null
+  agree: boolean
+  composite: number
+  direction: 'bullish' | 'bearish' | 'neutral'
+  qualifies: boolean
+}
+
+export interface PairCompareSide {
+  asset: string
+  name: string
+  category: string
+  otc: boolean
+  open: boolean
+  price: number
+  fit: AdxPatternBiasFit | null
+  direction: 'call' | 'put' | null
+}
+
+export interface LeadLagSignal {
+  fit: { lag: number; correlation: number; lagsTested: number; n: number }
+  triggerReturn: number
+  triggerZ: number
+  direction: 'call' | 'put'
+}
+
+export interface PairCompareLeadLag {
+  lag: number
+  correlation: number
+  lagsTested: number
+  n: number
+  signal: LeadLagSignal | null
+  qualifies: boolean
+}
+
+export interface PairCompareResponse {
+  ok: boolean
+  tf: Timeframe
+  a: PairCompareSide
+  b: PairCompareSide
+  leadlag: {
+    aLeadsB: PairCompareLeadLag
+    bLeadsA: PairCompareLeadLag
+    strongerDirection: 'aLeadsB' | 'bLeadsA' | 'none'
+  }
+  ts: number
+}
+
+export async function getPairCompare(a: string, b: string, tf: Timeframe): Promise<PairCompareResponse> {
+  return osGet<PairCompareResponse>('/pair_compare', { a, b, tf })
+}
+
 // ---- chart-signal outcome stats (Task 64-c: the honesty loop) ------------
 
 export type SignalOutcomeId = 'win' | 'loss' | 'flat' | 'timeout'

@@ -31,7 +31,7 @@ import { yesterdayPlugin, YesterdayService } from './src/plugins/yesterday'
 import { gridSearch, walkForward, sweepAssets, type Objective } from './src/strategies/optimize'
 import { backtest } from './src/strategies/backtest'
 import type { BacktestOptions } from './src/strategies/backtest'
-import { leadersFor, LEADLAG_GROUPS } from './src/analytics/leadlag'
+import { leadersFor, LEADLAG_GROUPS, fitLeadLag, projectLeadLagSignal, LEADLAG_MIN_ABS_CORRELATION, LEADLAG_MIN_TRIGGER_Z, type LeadLagFit, type LeadLagSignal } from './src/analytics/leadlag'
 import { distillChartSignals, DISTILL_DEFAULT_WINDOW } from './src/analytics/chartsignalsdistill'
 import { fitCointegration, COINTEGRATION_WINDOW, COINTEGRATION_MIN_R2, COINTEGRATION_MIN_TSTAT, COINTEGRATION_MAX_HALFLIFE } from './src/analytics/cointegration'
 import { computeVolArb, VOLARB_DEFAULT_WINDOW } from './src/analytics/volarb'
@@ -2076,6 +2076,85 @@ const httpServer = createServer(async (req, res) => {
       // strategy - fetches this asset's group leader (same leadersFor() lookup
       // as /optimize's leaderCandles injection) and runs the Engle-Granger
       // beta/spread OU fit (analytics/cointegration.ts) for display.
+      // Pair Compare: for any two assets (default EURUSD/US2000), each
+      // asset's own ADX/DI + pattern bias read side by side, plus the
+      // lead-lag relationship BETWEEN them in both directions (does A lead
+      // B, or B lead A - fitLeadLag doesn't know which side is the real
+      // leader, so this tests both and reports whichever direction's |corr|
+      // is stronger). Pure single-pair reuse of analytics/adxpatternbias.ts
+      // and analytics/leadlag.ts - no scan/cache machinery, same shape as
+      // /cointegration's single-asset route.
+      if (path === '/pair_compare') {
+        try {
+          const pa = String(q.get('a') ?? 'EURUSD')
+          const pb = String(q.get('b') ?? 'US2000')
+          const pTfv = tfStrict(q.get('tf'))
+          if (pTfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+
+          const infoA = market.assets.find((x) => x.ticker === pa)
+          const infoB = market.assets.find((x) => x.ticker === pb)
+          const candlesA = market.getCandlesDeep(pa, pTfv, 400, true)
+          const candlesB = market.getCandlesDeep(pb, pTfv, 400, true)
+          const fitA = fitAdxPatternBias(candlesA)
+          const fitB = fitAdxPatternBias(candlesB)
+          const closesA = candlesA.map((c) => c.close)
+          const closesB = candlesB.map((c) => c.close)
+
+          const aLeadsB = fitLeadLag(closesA, closesB, 10)
+          const bLeadsA = fitLeadLag(closesB, closesA, 10)
+          const sigAB: LeadLagSignal | null = aLeadsB.n >= 10 ? projectLeadLagSignal(aLeadsB, closesA) : null
+          const sigBA: LeadLagSignal | null = bLeadsA.n >= 10 ? projectLeadLagSignal(bLeadsA, closesB) : null
+          const qualifiesAB = Math.abs(aLeadsB.correlation) >= LEADLAG_MIN_ABS_CORRELATION && !!sigAB && Math.abs(sigAB.triggerZ) >= LEADLAG_MIN_TRIGGER_Z
+          const qualifiesBA = Math.abs(bLeadsA.correlation) >= LEADLAG_MIN_ABS_CORRELATION && !!sigBA && Math.abs(sigBA.triggerZ) >= LEADLAG_MIN_TRIGGER_Z
+          // whichever direction's fit found the stronger relationship is the
+          // more honest read of "who actually leads" - fitLeadLag only fits
+          // the best lag for the leader/follower assignment it's GIVEN, it
+          // never decides that assignment itself, so this is decided here.
+          const strongerDirection: 'aLeadsB' | 'bLeadsA' | 'none' =
+            Math.abs(aLeadsB.correlation) === 0 && Math.abs(bLeadsA.correlation) === 0
+              ? 'none'
+              : Math.abs(aLeadsB.correlation) >= Math.abs(bLeadsA.correlation)
+                ? 'aLeadsB'
+                : 'bLeadsA'
+
+          const sideA = {
+            asset: pa,
+            name: infoA?.name ?? pa,
+            category: infoA?.category ?? '',
+            otc: !!infoA?.otc,
+            open: infoA?.open ?? false,
+            price: candlesA[candlesA.length - 1]?.close ?? 0,
+            fit: fitA,
+            direction: fitA?.qualifies ? (fitA.direction === 'bullish' ? 'call' : fitA.direction === 'bearish' ? 'put' : null) : null,
+          }
+          const sideB = {
+            asset: pb,
+            name: infoB?.name ?? pb,
+            category: infoB?.category ?? '',
+            otc: !!infoB?.otc,
+            open: infoB?.open ?? false,
+            price: candlesB[candlesB.length - 1]?.close ?? 0,
+            fit: fitB,
+            direction: fitB?.qualifies ? (fitB.direction === 'bullish' ? 'call' : fitB.direction === 'bearish' ? 'put' : null) : null,
+          }
+
+          return json(200, {
+            ok: true,
+            tf: pTfv,
+            a: sideA,
+            b: sideB,
+            leadlag: {
+              aLeadsB: { ...aLeadsB, signal: sigAB, qualifies: qualifiesAB },
+              bLeadsA: { ...bLeadsA, signal: sigBA, qualifies: qualifiesBA },
+              strongerDirection,
+            },
+            ts: Date.now(),
+          })
+        } catch (err) {
+          return json(400, { ok: false, error: (err as Error).message })
+        }
+      }
+
       if (path === '/cointegration') {
         try {
           const cAsset = String(q.get('asset') ?? market.activeAsset)
