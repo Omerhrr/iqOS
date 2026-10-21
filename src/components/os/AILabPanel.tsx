@@ -12,7 +12,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { AssetRow, LabLearnResult, LabSignalDef, LabSimMetrics, LabSpec, LabStrategyRow, StrategyInfo, Timeframe, TradeKind } from '@/lib/os/client'
 import { fmtMoney, osGet, osPost } from '@/lib/os/client'
-import { TIMEFRAMES, TIMEFRAME_SECONDS, SIGNAL_TEMPLATES, labelOfSignal } from '@/lib/os/client'
+import { TIMEFRAMES, TIMEFRAME_SECONDS, SIGNAL_TEMPLATES, labelOfSignal, CANDLE_PATTERN_NAMES } from '@/lib/os/client'
 
 type Basis = 'candles' | 'heikin' | 'kalman' | 'typical' | 'smoothed'
 const BASIS_OPTIONS: { value: Basis; label: string }[] = [
@@ -307,7 +307,8 @@ export default function AILabPanel({ assets, strategies, onError, refreshBots }:
   const [manualGroupPending, setManualGroupPending] = useState<LabSignalDef[]>([])
   const [manualTemplateIdx, setManualTemplateIdx] = useState(0)
   const [manualIsCandle, setManualIsCandle] = useState(false)
-  const [manualCandleName, setManualCandleName] = useState('')
+  const [manualCandleName, setManualCandleName] = useState(CANDLE_PATTERN_NAMES[0])
+  const [manualCandleSeries, setManualCandleSeries] = useState<'bar' | 'heikin'>('bar')
   // Pull a FULL builtin strategy (trading-core's STRATEGIES registry - RSI
   // reversion, MACD cross, the Markov/Kalman/Monte-Carlo ones, trend
   // structure pullback, all of it) in as one more combinable signal,
@@ -471,7 +472,7 @@ export default function AILabPanel({ assets, strategies, onError, refreshBots }:
     }
     const template = SIGNAL_TEMPLATES[manualTemplateIdx]
     const def: LabSignalDef = manualIsCandle
-      ? { kind: 'candle', name: manualCandleName.trim().slice(0, 40), dir: manualDir, weight: manualWeight }
+      ? { kind: 'candle', name: manualCandleName, series: manualCandleSeries, dir: manualDir, weight: manualWeight }
       : template.kind === 'indicator'
         ? {
             ...template,
@@ -482,16 +483,11 @@ export default function AILabPanel({ assets, strategies, onError, refreshBots }:
             ...(manualOp === 'between' || manualOp === 'outside' ? { threshold2: manualThreshold2 } : {}),
           }
         : { ...template, dir: manualDir, weight: manualWeight }
-    if (manualIsCandle && !manualCandleName.trim()) {
-      onError('enter a candlestick pattern name (e.g. "Hammer", "Engulfing")')
-      return
-    }
     if (manualGroupBuilding) {
       setManualGroupPending((prev) => [...prev, def])
     } else {
       setManualSignals((prev) => [...prev, { uid: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, def }])
     }
-    if (manualIsCandle) setManualCandleName('')
   }
 
   const removeManualSignal = (uid: string) => {
@@ -1159,15 +1155,33 @@ export default function AILabPanel({ assets, strategies, onError, refreshBots }:
               </select>
             </label>
           ) : manualIsCandle ? (
-            <label className="flex flex-col gap-0.5">
-              <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">pattern name</span>
-              <Input
-                value={manualCandleName}
-                onChange={(e) => setManualCandleName(e.target.value)}
-                placeholder="e.g. Hammer, Engulfing"
-                className="h-7 w-40 border-[#1c2739] bg-[#101828] font-mono text-[11px] text-[#dbe4f0]"
-              />
-            </label>
+            <>
+              <label className="flex flex-col gap-0.5">
+                <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">pattern</span>
+                <select
+                  value={manualCandleName}
+                  onChange={(e) => setManualCandleName(e.target.value)}
+                  className="h-7 w-48 rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-[#dbe4f0]"
+                >
+                  {CANDLE_PATTERN_NAMES.map((name) => (
+                    <option key={name} value={name}>
+                      {name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="flex flex-col gap-0.5">
+                <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">series</span>
+                <select
+                  value={manualCandleSeries}
+                  onChange={(e) => setManualCandleSeries(e.target.value === 'heikin' ? 'heikin' : 'bar')}
+                  className="h-7 w-32 rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-[#dbe4f0]"
+                >
+                  <option value="bar">raw / bar</option>
+                  <option value="heikin">heiken-ashi</option>
+                </select>
+              </label>
+            </>
           ) : (
             <label className="flex flex-col gap-0.5">
               <span className="text-[9px] uppercase tracking-wider text-[#4b5a72]">signal template</span>

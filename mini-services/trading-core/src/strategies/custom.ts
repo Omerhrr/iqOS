@@ -42,10 +42,17 @@ import { engineVoteSingle, MINABLE_ENGINES, ENGINE_LABEL, type MinableEngineId }
 // ---------- signal vocabulary ----------
 
 /** Candlestick pattern straight from the recognition library (e.g. "Bullish
- * Engulfing"). dir may invert the textbook implication to fade it. */
+ * Engulfing"). dir may invert the textbook implication to fade it. `series`
+ * picks which transform of the series the SAME detectors run against -
+ * 'bar' (default, undefined) is the raw OHLC series (a Bar chart and a
+ * Candles chart plot identical values, so this doubles as "bar" patterns
+ * too), 'heikin' is the Heikin Ashi transform (analytics/patterns.ts's
+ * detectPatterns run against heikinAshiCandles() instead of raw candles -
+ * same reuse adxpatternbias.ts's haPatterns field already relies on). */
 export interface CandleSignal {
   kind: 'candle'
   name: string
+  series?: 'bar' | 'heikin'
   dir: Side
   weight: number
 }
@@ -418,7 +425,8 @@ export interface EvalCtx {
   body: number[]
   range: number[]
   volume: number[]
-  hits: Map<string, 'bullish' | 'bearish' | 'neutral'> // candle patterns on the LAST bar only
+  hits: Map<string, 'bullish' | 'bearish' | 'neutral'> // candle patterns on the LAST bar only (raw bar/candle series)
+  haHits: Map<string, 'bullish' | 'bearish' | 'neutral'> // same patterns, on the Heikin Ashi transform, LAST bar only
   /** Which instrument this context evaluates. The OTC velocity indicator
    * family reads that asset's micro-tick buffer through it - without an
    * asset the otcv* series honestly stays NaN (no candle-derived fallback:
@@ -446,10 +454,16 @@ export function buildCtx(candles: Candle[], asset?: string, auxByStrategy?: Eval
   const body = candles.map((k) => Math.abs(k.close - k.open))
   const range = candles.map((k) => Math.max(k.high - k.low, 1e-12))
   const hits = new Map<string, 'bullish' | 'bearish' | 'neutral'>()
+  // Same detectors, same recognition library - run twice: once on the raw
+  // series (bar/candle patterns) and once on the Heikin Ashi transform (HA
+  // patterns), so a 'candle' signal can pick either via its `series` field
+  // without any new pattern-matching logic.
+  const haHits = new Map<string, 'bullish' | 'bearish' | 'neutral'>()
   if (n >= 13) {
     for (const hit of detectPatterns(candles, 1)) hits.set(hit.name.toLowerCase(), hit.direction)
+    for (const hit of detectPatterns(heikinAshiCandles(candles), 1)) haHits.set(hit.name.toLowerCase(), hit.direction)
   }
-  return { candles, n, asset, close, high, low, open, atr, ha, haColor, body, range, volume, hits, auxByStrategy }
+  return { candles, n, asset, close, high, low, open, atr, ha, haColor, body, range, volume, hits, haHits, auxByStrategy }
 }
 
 /** ATR-normalized rolling z-score of an arbitrary raw series - used to turn
@@ -1057,9 +1071,10 @@ export function prepareSignal(s: SignalDef, ctx: EvalCtx): (i: number) => boolea
       // will silently never fire for it. Do not "optimize away" the re-slice.
       const name = s.name.toLowerCase()
       const align = s.dir === 'call'
+      const useHa = s.series === 'heikin'
       return (i: number) => {
         if (i !== ctx.n - 1) return false
-        const d = ctx.hits.get(name)
+        const d = (useHa ? ctx.haHits : ctx.hits).get(name)
         return !!d && d !== 'neutral' && (d === 'bullish') === align
       }
     }
@@ -1493,7 +1508,7 @@ function normalizeOneSignal(s: unknown, depth = 0): SignalDef | null {
     return Math.max(-1e6, Math.min(100, n))
   }
   if (o.kind === 'candle' && typeof o.name === 'string' && o.name.length <= 40) {
-    return { kind: 'candle', name: o.name, dir: dir ?? 'call', weight }
+    return { kind: 'candle', name: o.name, series: o.series === 'heikin' ? 'heikin' : 'bar', dir: dir ?? 'call', weight }
   } else if (o.kind === 'bar' && KNOWN_BAR.has(String(o.variant))) {
     const variant = String(o.variant) as BarSignal['variant']
     return { kind: 'bar', variant, atrK: clampN(o.atrK, 0.5, 3, 1.1), dir: dir ?? (variant === 'wide-bull' ? 'call' : 'put'), weight }

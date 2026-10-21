@@ -413,8 +413,11 @@ export class StrategyLabService {
       test: prepareSignal(def, ctx),
     }))
 
-    // ---- candlestick family: per-bar scan ----
+    // ---- candlestick family: per-bar scan (raw series + its HA twin, so a
+    // manually-built 'candle' signal with series:'heikin' backtests against
+    // the right hit map) ----
     const candleHits = scanCandleHits(candles)
+    const haCandleHits = scanCandleHits(heikinAshiCandles(candles))
     const candleDefs = new Map<string, { name: string; dir: Side }>()
     for (let i = warm; i < n; i++) {
       for (const [name, dir] of candleHits[i]) {
@@ -652,7 +655,7 @@ export class StrategyLabService {
       ...(basis !== 'candles' ? { basis } : {}),
     }
 
-    const series = scoreSeriesFor(spec, ctx, candleHits)
+    const series = scoreSeriesFor(spec, ctx, candleHits, haCandleHits)
     const minVotes = spec.minVotes
     const thresholds: { minScore: number; trades: number; winRate: number }[] = []
     for (let t = 30; t <= 75; t += 5) {
@@ -740,7 +743,8 @@ export class StrategyLabService {
     const basisSeries = basisCandles(spec, raw)
     const ctx = buildCtx(basisSeries, asset)
     const candleHits = scanCandleHits(basisSeries)
-    const series = scoreSeriesFor(spec, ctx, candleHits)
+    const haCandleHits = scanCandleHits(heikinAshiCandles(basisSeries))
+    const series = scoreSeriesFor(spec, ctx, candleHits, haCandleHits)
     const backtest = simFromSeries(series, raw, 30, horizon, amount, payout, spec.minVotes, spec.minScore)
     const holdout = simFromSeries(series, raw, Math.floor(raw.length * 0.7), horizon, amount, payout, spec.minVotes, spec.minScore)
     const breakevenWinRate = round2((1 / (1 + payout)) * 100)
@@ -991,13 +995,14 @@ function basisLabel(basis: Basis): string {
  * tail-bar-only test via the group's own prepareSignal() recursing on its
  * members, so any group with a candle member backtested as if that member
  * almost never fired, skewing the group's measured win rate/trade count. */
-function buildBacktestTest(s: SignalDef, ctx: EvalCtx, candleHits: CandleHits): (i: number) => boolean {
+function buildBacktestTest(s: SignalDef, ctx: EvalCtx, candleHits: CandleHits, haCandleHits: CandleHits): (i: number) => boolean {
   if (s.kind === 'candle') {
     const name = s.name.toLowerCase()
-    return (i: number) => candleHits[i]?.get(name) === s.dir
+    const hits = s.series === 'heikin' ? haCandleHits : candleHits
+    return (i: number) => hits[i]?.get(name) === s.dir
   }
   if (s.kind === 'group') {
-    const members = s.signals.map((m) => buildBacktestTest(m, ctx, candleHits))
+    const members = s.signals.map((m) => buildBacktestTest(m, ctx, candleHits, haCandleHits))
     return s.op === 'and' ? (i: number) => members.every((fn) => fn(i)) : (i: number) => members.some((fn) => fn(i))
   }
   return prepareSignal(s, ctx)
@@ -1007,9 +1012,10 @@ function scoreSeriesFor(
   spec: CustomSpec,
   ctx: EvalCtx,
   candleHits: CandleHits,
+  haCandleHits: CandleHits,
 ): { score: number; votes: number; dir: Side | 'none' }[] {
   const n = ctx.n
-  const tests = spec.signals.map((s) => buildBacktestTest(s, ctx, candleHits))
+  const tests = spec.signals.map((s) => buildBacktestTest(s, ctx, candleHits, haCandleHits))
   const series: { score: number; votes: number; dir: Side | 'none' }[] = new Array(n)
   for (let i = 0; i < n; i++) {
     let bullW = 0

@@ -171,6 +171,7 @@ const allDetectors = (): Detector[] => {
   if (!DETECTORS_CACHE) {
     DETECTORS_CACHE = [
       ...DETECTORS_EXT,
+      ...DETECTORS_EXT2,
       doji,
   hammer,
   invertedHammer,
@@ -416,4 +417,294 @@ const DETECTORS_EXT: Detector[] = [
   kicker,
   spinningTop,
   highWave,
+]
+
+// ============================================================
+// Phase 3 - rest of the classic (Nison/TA-Lib) candlestick catalog,
+// so the recognizer and the AI Lab's manual pattern picker cover every
+// named pattern there is, not just the common ~36.
+// ============================================================
+
+const dragonflyDoji: Detector = (w) => {
+  const c = w[w.length - 1]
+  if (body(c) <= range(c) * 0.08 && lowerWick(c) >= range(c) * 0.6 && upperWick(c) <= range(c) * 0.08)
+    return { name: 'Dragonfly Doji', direction: 'bullish', reliability: 2, barsAgo: 0, note: 'Doji with long lower wick - bullish reversal signal' }
+  return null
+}
+
+const gravestoneDoji: Detector = (w) => {
+  const c = w[w.length - 1]
+  if (body(c) <= range(c) * 0.08 && upperWick(c) >= range(c) * 0.6 && lowerWick(c) <= range(c) * 0.08)
+    return { name: 'Gravestone Doji', direction: 'bearish', reliability: 2, barsAgo: 0, note: 'Doji with long upper wick - bearish reversal signal' }
+  return null
+}
+
+const longLeggedDoji: Detector = (w) => {
+  const c = w[w.length - 1]
+  if (body(c) <= range(c) * 0.08 && upperWick(c) >= range(c) * 0.3 && lowerWick(c) >= range(c) * 0.3)
+    return { name: 'Long-Legged Doji', direction: 'neutral', reliability: 1, barsAgo: 0, note: 'Long wicks both sides - high indecision' }
+  return null
+}
+
+const beltHold: Detector = (w) => {
+  const c = w[w.length - 1]
+  const p = w[w.length - 2]
+  if (isBull(c) && lowerWick(c) <= range(c) * 0.05 && body(c) >= range(c) * 0.7 && p && isBear(p))
+    return { name: 'Bullish Belt Hold', direction: 'bullish', reliability: 2, barsAgo: 0, note: 'Opens at low, strong close - reversal candle' }
+  if (isBear(c) && upperWick(c) <= range(c) * 0.05 && body(c) >= range(c) * 0.7 && p && isBull(p))
+    return { name: 'Bearish Belt Hold', direction: 'bearish', reliability: 2, barsAgo: 0, note: 'Opens at high, strong close down - reversal candle' }
+  return null
+}
+
+const threeLineStrike: Detector = (w) => {
+  const s = w.slice(-4)
+  if (s.length < 4) return null
+  const [a, b, c, d] = s
+  if (isBull(a) && isBull(b) && isBull(c) && b.close > a.close && c.close > b.close && isBear(d) && d.open > c.close && d.close < a.open)
+    return { name: 'Bullish Three Line Strike', direction: 'bullish', reliability: 2, barsAgo: 3, note: 'Pullback bar engulfs 3 prior bulls - often continuation' }
+  if (isBear(a) && isBear(b) && isBear(c) && b.close < a.close && c.close < b.close && isBull(d) && d.open < c.close && d.close > a.open)
+    return { name: 'Bearish Three Line Strike', direction: 'bearish', reliability: 2, barsAgo: 3, note: 'Pullback bar engulfs 3 prior bears - often continuation' }
+  return null
+}
+
+const twoCrows: Detector = (w) => {
+  const [a, b, c] = w.slice(-3)
+  if (isBull(a) && body(a) > range(a) * 0.5 && isBear(b) && b.open > a.close && isBear(c) && c.open < b.open && c.open > b.close && c.close < a.open && c.close > b.close)
+    return { name: 'Two Crows', direction: 'bearish', reliability: 2, barsAgo: 2, note: 'Gap up then two bear closes back inside - weakening rally' }
+  return null
+}
+
+const upsideGapTwoCrows: Detector = (w) => {
+  const [a, b, c] = w.slice(-3)
+  if (isBull(a) && isBear(b) && b.open > a.close && b.close > a.close && isBear(c) && c.open > b.open && c.close < b.close && c.close > a.close)
+    return { name: 'Upside Gap Two Crows', direction: 'bearish', reliability: 2, barsAgo: 2, note: 'Gap up stalls under two bear bars' }
+  return null
+}
+
+const advanceBlock: Detector = (w) => {
+  const [a, b, c] = w.slice(-3)
+  if (isBull(a) && isBull(b) && isBull(c) && b.close > a.close && c.close > b.close && body(b) < body(a) && body(c) < body(b) && upperWick(b) > body(b) * 0.3 && upperWick(c) > body(c) * 0.3)
+    return { name: 'Advance Block', direction: 'bearish', reliability: 1, barsAgo: 2, note: 'Weakening bullish momentum - shrinking bodies, growing wicks' }
+  return null
+}
+
+const deliberation: Detector = (w) => {
+  const [a, b, c] = w.slice(-3)
+  const ab = avgBody(w.slice(-12))
+  if (isBull(a) && isBull(b) && isBull(c) && body(a) > ab * 0.8 && body(b) > ab * 0.8 && body(c) < body(b) * 0.5 && c.open > b.close - body(b) * 0.2)
+    return { name: 'Deliberation', direction: 'bearish', reliability: 1, barsAgo: 2, note: 'Third bar stalls small near highs - exhaustion' }
+  return null
+}
+
+const concealingBabySwallow: Detector = (w) => {
+  const s = w.slice(-4)
+  if (s.length < 4) return null
+  const [a, b, c, d] = s
+  if (
+    isBear(a) &&
+    body(a) >= range(a) * 0.85 &&
+    isBear(b) &&
+    body(b) >= range(b) * 0.85 &&
+    isBear(c) &&
+    c.open < b.close &&
+    c.high > b.close &&
+    isBear(d) &&
+    d.open > c.high &&
+    d.close < c.low
+  )
+    return { name: 'Concealing Baby Swallow', direction: 'bearish', reliability: 2, barsAgo: 3, note: 'Rare 4-bar bearish continuation' }
+  return null
+}
+
+const ladderBottom: Detector = (w) => {
+  const s = w.slice(-5)
+  if (s.length < 5) return null
+  const [a, b, c, d, e] = s
+  if (isBear(a) && isBear(b) && isBear(c) && b.close < a.close && c.close < b.close && isBear(d) && upperWick(d) > body(d) && isBull(e) && e.open > d.high)
+    return { name: 'Ladder Bottom', direction: 'bullish', reliability: 2, barsAgo: 4, note: '5-bar bullish reversal after decline' }
+  return null
+}
+
+const triStar: Detector = (w) => {
+  const [a, b, c] = w.slice(-3)
+  const isDojiBar = (k: Candle) => body(k) <= range(k) * 0.08
+  if (isDojiBar(a) && isDojiBar(b) && isDojiBar(c)) {
+    if (Math.max(a.open, a.close) > Math.max(b.open, b.close) && Math.max(c.open, c.close) > Math.max(b.open, b.close))
+      return { name: 'Bearish Tri-Star', direction: 'bearish', reliability: 2, barsAgo: 2, note: 'Three dojis, middle gapping up - rare top reversal' }
+    if (Math.min(a.open, a.close) < Math.min(b.open, b.close) && Math.min(c.open, c.close) < Math.min(b.open, b.close))
+      return { name: 'Bullish Tri-Star', direction: 'bullish', reliability: 2, barsAgo: 2, note: 'Three dojis, middle gapping down - rare bottom reversal' }
+  }
+  return null
+}
+
+const uniqueThreeRiverBottom: Detector = (w) => {
+  const [a, b, c] = w.slice(-3)
+  if (isBear(a) && body(a) > range(a) * 0.6 && isBear(b) && b.high < a.high && b.low < a.low && body(b) < body(a) && isBull(c) && c.open < b.close && c.close < b.close)
+    return { name: 'Unique Three River Bottom', direction: 'bullish', reliability: 2, barsAgo: 2, note: 'Rare bottoming pattern - shrinking bear bars' }
+  return null
+}
+
+const onNeckLine: Detector = (w) => {
+  const c = w[w.length - 1]
+  const p = w[w.length - 2]
+  if (isBear(p) && isBull(c) && c.open < p.low && Math.abs(c.close - p.low) <= range(p) * 0.05)
+    return { name: 'On-Neck Line', direction: 'bearish', reliability: 1, barsAgo: 0, note: 'Weak bounce closes at prior low - downtrend likely continues' }
+  return null
+}
+
+const inNeckLine: Detector = (w) => {
+  const c = w[w.length - 1]
+  const p = w[w.length - 2]
+  if (isBear(p) && isBull(c) && c.open < p.low && c.close > p.low && c.close <= p.close + range(p) * 0.05 && c.close < p.open)
+    return { name: 'In-Neck Line', direction: 'bearish', reliability: 1, barsAgo: 0, note: 'Bounce closes just above prior close - weak continuation' }
+  return null
+}
+
+const thrustingLine: Detector = (w) => {
+  const c = w[w.length - 1]
+  const p = w[w.length - 2]
+  if (isBear(p) && isBull(c) && c.open < p.low && c.close > p.close && c.close < (p.open + p.close) / 2)
+    return { name: 'Thrusting Line', direction: 'bearish', reliability: 1, barsAgo: 0, note: 'Bounce fails below midpoint - downtrend continuation' }
+  return null
+}
+
+const sideBySideWhiteLines: Detector = (w) => {
+  const [a, b, c] = w.slice(-3)
+  if (isBull(b) && isBull(c) && Math.abs(b.open - c.open) <= range(b) * 0.08 && Math.abs(body(b) - body(c)) <= avgBody(w.slice(-10)) * 0.4) {
+    if (isBull(a) && b.open > a.close) return { name: 'Bullish Side-by-Side White Lines', direction: 'bullish', reliability: 1, barsAgo: 1, note: 'Two similar white bars after gap up - continuation' }
+    if (isBear(a) && b.open < a.close) return { name: 'Bearish Side-by-Side White Lines', direction: 'bearish', reliability: 1, barsAgo: 1, note: 'Two similar white bars after gap down - rare continuation' }
+  }
+  return null
+}
+
+const hikkake: Detector = (w) => {
+  const s = w.slice(-3)
+  if (s.length < 3) return null
+  const [p, inside, c] = s
+  if (inside.high <= p.high && inside.low >= p.low) {
+    if (c.high > inside.high && c.close > inside.high) return { name: 'Bullish Hikkake', direction: 'bullish', reliability: 1, barsAgo: 0, note: 'False breakdown trapped shorts - inside bar breakout up' }
+    if (c.low < inside.low && c.close < inside.low) return { name: 'Bearish Hikkake', direction: 'bearish', reliability: 1, barsAgo: 0, note: 'False breakout trapped longs - inside bar breakdown' }
+  }
+  return null
+}
+
+const breakaway: Detector = (w) => {
+  const s = w.slice(-5)
+  if (s.length < 5) return null
+  const [a, b, c, d, e] = s
+  const ab = avgBody(w.slice(-14))
+  if (isBear(a) && body(a) > ab * 0.8 && b.open < a.close && c.close < b.close && d.close < c.close && isBull(e) && e.close > b.open && e.close < a.open)
+    return { name: 'Bullish Breakaway', direction: 'bullish', reliability: 2, barsAgo: 4, note: '5-bar reversal - rally reclaims mid-range after breakdown' }
+  if (isBull(a) && body(a) > ab * 0.8 && b.open > a.close && c.close > b.close && d.close > c.close && isBear(e) && e.close < b.open && e.close > a.open)
+    return { name: 'Bearish Breakaway', direction: 'bearish', reliability: 2, barsAgo: 4, note: '5-bar reversal - selloff reclaims mid-range after breakout' }
+  return null
+}
+
+const DETECTORS_EXT2: Detector[] = [
+  dragonflyDoji,
+  gravestoneDoji,
+  longLeggedDoji,
+  beltHold,
+  threeLineStrike,
+  twoCrows,
+  upsideGapTwoCrows,
+  advanceBlock,
+  deliberation,
+  concealingBabySwallow,
+  ladderBottom,
+  triStar,
+  uniqueThreeRiverBottom,
+  onNeckLine,
+  inNeckLine,
+  thrustingLine,
+  sideBySideWhiteLines,
+  hikkake,
+  breakaway,
+]
+
+/** Every pattern NAME this file's detectors can produce, in no particular
+ * order - the exact strings `detectPatterns()` emits in each `PatternHit.name`
+ * (and what a 'candle' custom-strategy signal matches against, case
+ * insensitively - see strategies/custom.ts's CandleSignal). Kept here, next
+ * to the detectors themselves, as the one list to update when a detector is
+ * added, renamed or removed above - every other caller (the AI Lab's manual
+ * pattern picker, its validation) reuses this instead of hardcoding its own
+ * copy. Some detectors emit one of two names depending on direction
+ * (Marubozu, Tweezer, Separating Lines, Kicker, Abandoned Baby) - both
+ * variants are listed since either can be the tail-bar hit.
+ *
+ * Phase 3 added the rest of the classic Nison/TA-Lib catalog (doji
+ * sub-types, belt holds, three line strike, crows, block/deliberation,
+ * tri-star, river/ladder/swallow rarities, neck/thrusting lines,
+ * side-by-side lines, hikkake, breakaway) so this list now covers every
+ * named candlestick pattern in common use, not just the ~36 most frequent
+ * ones. */
+export const CANDLE_PATTERN_NAMES: string[] = [
+  'Doji',
+  'Hammer',
+  'Inverted Hammer',
+  'Shooting Star',
+  'Hanging Man',
+  'Bullish Engulfing',
+  'Bearish Engulfing',
+  'Morning Star',
+  'Evening Star',
+  'Three White Soldiers',
+  'Three Black Crows',
+  'Piercing Line',
+  'Dark Cloud Cover',
+  'Tweezer Bottom',
+  'Tweezer Top',
+  'Bullish Marubozu',
+  'Bearish Marubozu',
+  'Inside Bar',
+  'Bullish Outside Bar',
+  'Bearish Outside Bar',
+  'Bullish Harami',
+  'Bearish Harami',
+  'Harami Cross',
+  'Three Inside Up',
+  'Three Inside Down',
+  'Three Outside Up',
+  'Three Outside Down',
+  'Morning Doji Star',
+  'Evening Doji Star',
+  'Rising Three Methods',
+  'Falling Three Methods',
+  'Homing Pigeon',
+  'Matching Low',
+  'Stick Sandwich',
+  'Bullish Separating Lines',
+  'Bearish Separating Lines',
+  'Abandoned Baby (Bull)',
+  'Abandoned Baby (Bear)',
+  'Bullish Kicker',
+  'Bearish Kicker',
+  'Spinning Top',
+  'High Wave',
+  'Dragonfly Doji',
+  'Gravestone Doji',
+  'Long-Legged Doji',
+  'Bullish Belt Hold',
+  'Bearish Belt Hold',
+  'Bullish Three Line Strike',
+  'Bearish Three Line Strike',
+  'Two Crows',
+  'Upside Gap Two Crows',
+  'Advance Block',
+  'Deliberation',
+  'Concealing Baby Swallow',
+  'Ladder Bottom',
+  'Bullish Tri-Star',
+  'Bearish Tri-Star',
+  'Unique Three River Bottom',
+  'On-Neck Line',
+  'In-Neck Line',
+  'Thrusting Line',
+  'Bullish Side-by-Side White Lines',
+  'Bearish Side-by-Side White Lines',
+  'Bullish Hikkake',
+  'Bearish Hikkake',
+  'Bullish Breakaway',
+  'Bearish Breakaway',
 ]

@@ -2005,8 +2005,39 @@ export interface BotRow {
 
 // ---------- Strategy Lab (AI-learned strategies) ----------
 
+/** Mirror of trading-core's analytics/patterns.ts CANDLE_PATTERN_NAMES - every
+ * pattern name the backend's detectors can produce, for the AI Lab's manual
+ * "custom candlestick pattern" picker (replacing the old free-text input).
+ * Kept here in sync by hand, same convention as BINARY_EXPIRY_MINUTES. */
+export const CANDLE_PATTERN_NAMES: string[] = [
+  'Doji', 'Hammer', 'Inverted Hammer', 'Shooting Star', 'Hanging Man',
+  'Bullish Engulfing', 'Bearish Engulfing', 'Morning Star', 'Evening Star',
+  'Three White Soldiers', 'Three Black Crows', 'Piercing Line', 'Dark Cloud Cover',
+  'Tweezer Bottom', 'Tweezer Top', 'Bullish Marubozu', 'Bearish Marubozu',
+  'Inside Bar', 'Bullish Outside Bar', 'Bearish Outside Bar',
+  'Bullish Harami', 'Bearish Harami', 'Harami Cross',
+  'Three Inside Up', 'Three Inside Down', 'Three Outside Up', 'Three Outside Down',
+  'Morning Doji Star', 'Evening Doji Star', 'Rising Three Methods', 'Falling Three Methods',
+  'Homing Pigeon', 'Matching Low', 'Stick Sandwich',
+  'Bullish Separating Lines', 'Bearish Separating Lines',
+  'Abandoned Baby (Bull)', 'Abandoned Baby (Bear)',
+  'Bullish Kicker', 'Bearish Kicker', 'Spinning Top', 'High Wave',
+  'Dragonfly Doji', 'Gravestone Doji', 'Long-Legged Doji',
+  'Bullish Belt Hold', 'Bearish Belt Hold',
+  'Bullish Three Line Strike', 'Bearish Three Line Strike',
+  'Two Crows', 'Upside Gap Two Crows',
+  'Advance Block', 'Deliberation',
+  'Concealing Baby Swallow', 'Ladder Bottom',
+  'Bullish Tri-Star', 'Bearish Tri-Star',
+  'Unique Three River Bottom',
+  'On-Neck Line', 'In-Neck Line', 'Thrusting Line',
+  'Bullish Side-by-Side White Lines', 'Bearish Side-by-Side White Lines',
+  'Bullish Hikkake', 'Bearish Hikkake',
+  'Bullish Breakaway', 'Bearish Breakaway',
+]
+
 export type LabSignalDef =
-  | { kind: 'candle'; name: string; dir: 'call' | 'put'; weight: number }
+  | { kind: 'candle'; name: string; series?: 'bar' | 'heikin'; dir: 'call' | 'put'; weight: number }
   | { kind: 'bar'; variant: 'wide-bull' | 'wide-bear'; atrK?: number; dir: 'call' | 'put'; weight: number }
   | {
       kind: 'ha'
@@ -2114,7 +2145,7 @@ export type LabSignalDef =
 export function labelOfSignal(s: LabSignalDef, strategies?: StrategyInfo[]): string {
   switch (s.kind) {
     case 'candle':
-      return s.name
+      return s.series === 'heikin' ? `${s.name} (HA)` : s.name
     case 'bar':
       return s.variant === 'wide-bull' ? 'Wide Bull Bar' : 'Wide Bear Bar'
     case 'ha':
