@@ -323,7 +323,7 @@ export interface AutoTraderConfig {
   stakePlan?: AutoStakePlan
   /** Runtime roll state, persisted here (saveOsMode persists the whole config
    * blob) rather than a separate table - mirrors BotConfig.planState. */
-  planState?: { pot: number; rollN: number; restarts: number; halted: boolean; complete: boolean }
+  planState?: { pot: number; rollN: number; restarts: number; reseedCount?: number; lossReseedCount?: number; halted: boolean; complete: boolean }
 }
 
 export interface AutoStakePlan {
@@ -337,6 +337,21 @@ export interface AutoStakePlan {
   deriskAfter?: number
   deriskPct?: number
   onComplete?: 'halt' | 'reseed'
+  /** Caps how many times onComplete:'reseed' auto-starts a fresh cycle.
+   * undefined = unlimited (the original behavior - reseeds forever until a
+   * loss or a manual stop). Set = after this many auto-reseeds, the plan
+   * halts exactly like onComplete:'halt' would, instead of seeding another
+   * cycle. Only meaningful when onComplete is 'reseed'; ignored otherwise. */
+  reseedLimit?: number
+  /** Only meaningful when stopOnLoss is false ("On loss: Re-seed" - a loss
+   * does NOT end the cycle, it just keeps rolling). Caps how many LOSSES in
+   * a row it will silently re-seed through before giving up: undefined =
+   * unlimited (continues forever, the original behavior). Set = after this
+   * many consecutive losses, it is forced to stop exactly like
+   * stopOnLoss:true would (halted, awaiting an explicit restart), instead
+   * of continuing to re-seed indefinitely into a losing run. Resets to 0 on
+   * the next win (a win means it's no longer "on a losing streak"). */
+  lossReseedLimit?: number
 }
 
 export const DEFAULT_AUTOTRADER: AutoTraderConfig = {
@@ -419,6 +434,17 @@ interface AutoRuntime {
   pot: number // compounding roll; 0 = fresh cycle at base
   rollN: number
   restarts: number
+  /** How many times onComplete:'reseed' has actually fired (periods target
+   * hit, auto-seeded a fresh cycle) since the plan was last (re)started -
+   * compared against stakePlan.reseedLimit so "reseed" can be capped at N
+   * auto-cycles instead of running forever. Distinct from `restarts`, which
+   * also counts loss-ended cycles. */
+  reseedCount: number
+  /** Consecutive losses re-seeded through (stopOnLoss:false path only) since
+   * the last win or manual restart - compared against
+   * stakePlan.lossReseedLimit so a "re-seed on loss" plan can be force-
+   * stopped after N losses in a row instead of running forever. */
+  lossReseedCount: number
   halted: boolean // stop-on-loss: cycle ended, awaiting explicit restart
   complete: boolean // halted on the periods target (win-side completion)
 }
@@ -588,6 +614,8 @@ export class ModeService {
       pot: 0,
       rollN: 0,
       restarts: 0,
+      reseedCount: 0,
+      lossReseedCount: 0,
       halted: false,
       complete: false,
     }
@@ -2791,6 +2819,8 @@ export class ModeService {
       rt.pot = this.config.planState.pot
       rt.rollN = this.config.planState.rollN
       rt.restarts = this.config.planState.restarts
+      rt.reseedCount = this.config.planState.reseedCount ?? 0
+      rt.lossReseedCount = this.config.planState.lossReseedCount ?? 0
       rt.halted = this.config.planState.halted
       rt.complete = this.config.planState.complete
     }
@@ -2895,6 +2925,7 @@ export class ModeService {
       const base = plan.base
       const working = this.rt.pot >= 0.01 ? this.rt.pot : base
       if (position.status === 'won') {
+        this.rt.lossReseedCount = 0
         const cap = (plan.payoutCap ?? 70) / 100
         const fold = Math.min(pnl, position.amount * cap)
         this.rt.pot = Math.round((working + fold) * 100) / 100
@@ -2903,14 +2934,18 @@ export class ModeService {
         if (periods && this.rt.rollN >= periods) {
           this.rt.restarts += 1
           const banked = Math.round((this.rt.pot - base) * 100) / 100
-          if (plan.onComplete === 'reseed') {
+          const reseedsLeft = plan.onComplete === 'reseed' && plan.reseedLimit ? plan.reseedLimit - this.rt.reseedCount : Infinity
+          if (plan.onComplete === 'reseed' && reseedsLeft > 0) {
             this.rt.pot = 0
             this.rt.rollN = 0
-            this.emit('success', `[AUTO-TRADER] compound cycle COMPLETE - ${periods} periods, +$${banked.toFixed(2)} banked - re-seeding $${base}`)
+            this.rt.reseedCount += 1
+            const limitTag = plan.reseedLimit ? ` (re-seed ${this.rt.reseedCount}/${plan.reseedLimit})` : ''
+            this.emit('success', `[AUTO-TRADER] compound cycle COMPLETE - ${periods} periods, +$${banked.toFixed(2)} banked - re-seeding $${base}${limitTag}`)
           } else {
             this.rt.halted = true
             this.rt.complete = true
-            this.emit('success', `[AUTO-TRADER] compound cycle COMPLETE - ${periods} periods, +$${banked.toFixed(2)} banked - standing down; restart for a fresh cycle`)
+            const why = plan.onComplete === 'reseed' ? `re-seed limit reached (${plan.reseedLimit}/${plan.reseedLimit})` : `${periods} periods`
+            this.emit('success', `[AUTO-TRADER] compound cycle COMPLETE - ${why}, +$${banked.toFixed(2)} banked - standing down; restart for a fresh cycle`)
           }
         }
       } else if (position.status === 'lost') {
@@ -2922,6 +2957,19 @@ export class ModeService {
           this.rt.halted = true
           this.rt.complete = false
           this.emit('warn', `[AUTO-TRADER] compound cycle ENDED on a loss (-$${Math.abs(pnl).toFixed(2)})${kept >= 0.01 ? ` - $${kept.toFixed(2)} of the pot stays banked on the balance` : ''} - restart to trade again`)
+        } else {
+          // "On loss: Re-seed" - the cycle normally just keeps rolling
+          // through a loss, but lossReseedLimit caps how many losses in a
+          // row it will silently absorb before forcing a stop anyway.
+          this.rt.lossReseedCount += 1
+          if (plan.lossReseedLimit && this.rt.lossReseedCount >= plan.lossReseedLimit) {
+            this.rt.halted = true
+            this.rt.complete = false
+            this.emit(
+              'warn',
+              `[AUTO-TRADER] compound cycle FORCED TO STOP - ${this.rt.lossReseedCount}/${plan.lossReseedLimit} consecutive losses while re-seeding (-$${Math.abs(pnl).toFixed(2)} this one)${kept >= 0.01 ? ` - $${kept.toFixed(2)} of the pot stays banked on the balance` : ''} - restart to trade again`
+            )
+          }
         }
       }
       this.persistPlanState()
@@ -2952,6 +3000,8 @@ export class ModeService {
       deriskAfter: p.deriskAfter !== undefined && Number(p.deriskAfter) > 0 ? Math.round(Number(p.deriskAfter)) : undefined,
       deriskPct: p.deriskAfter !== undefined && Number(p.deriskAfter) > 0 ? clamp(Number(p.deriskPct) || 50, 1, 100) : undefined,
       onComplete: p.onComplete === 'reseed' ? 'reseed' : 'halt',
+      reseedLimit: p.onComplete === 'reseed' && p.reseedLimit !== undefined && Number(p.reseedLimit) > 0 ? Math.round(Number(p.reseedLimit)) : undefined,
+      lossReseedLimit: p.stopOnLoss === false && p.lossReseedLimit !== undefined && Number(p.lossReseedLimit) > 0 ? Math.round(Number(p.lossReseedLimit)) : undefined,
     }
   }
 
@@ -2990,6 +3040,8 @@ export class ModeService {
     if (!this.config.stakePlan) return { ok: false, error: 'restart applies to a compounding auto-trader plan only' }
     this.rt.pot = 0
     this.rt.rollN = 0
+    this.rt.reseedCount = 0
+    this.rt.lossReseedCount = 0
     this.rt.halted = false
     this.rt.complete = false
     this.persistPlanState()
@@ -2998,8 +3050,38 @@ export class ModeService {
   }
 
   private persistPlanState(): void {
-    this.config.planState = { pot: this.rt.pot, rollN: this.rt.rollN, restarts: this.rt.restarts, halted: this.rt.halted, complete: this.rt.complete }
+    this.config.planState = {
+      pot: this.rt.pot,
+      rollN: this.rt.rollN,
+      restarts: this.rt.restarts,
+      reseedCount: this.rt.reseedCount,
+      lossReseedCount: this.rt.lossReseedCount,
+      halted: this.rt.halted,
+      complete: this.rt.complete,
+    }
     this.persist()
+  }
+
+  /** Full fresh-start for the auto trader's own numbers - used by the
+   * "clear all data" action (new broker account connected, want to see how
+   * it does from zero). Unlike restart() (which only un-halts a compounding
+   * cycle), this wipes every piece of performance MEMORY this service
+   * keeps: the day/total P/L + win/loss counters (rebuilt from the journal,
+   * which the caller is expected to have just cleared, so this comes back
+   * all-zero), the compounding pot/rollN, and the operational cooldown maps
+   * (per-asset rejection cooldowns, streak-breaker benches, the sweepEdge
+   * freshness memory) so nothing left over from the old account's session
+   * blocks or biases the first few trades on the new one. Config (strategy,
+   * thresholds, risk limits) is untouched - this resets RESULTS, not setup. */
+  resetStats(): void {
+    this.config.planState = { pot: 0, rollN: 0, restarts: 0, reseedCount: 0, lossReseedCount: 0, halted: false, complete: false }
+    this.persist()
+    this.assetRejectedUntil.clear()
+    this.lossStreak.clear()
+    this.benchedUntil.clear()
+    this.sweepEdge.rearm()
+    this.rebuildRuntime()
+    this.emit('info', '[AUTO-TRADER] stats cleared - starting fresh')
   }
 
   configure(patch: Partial<AutoTraderConfig>): { ok: boolean; config: AutoTraderConfig; error?: string } {
@@ -3090,9 +3172,11 @@ export class ModeService {
       if (planChanged) {
         this.rt.pot = 0
         this.rt.rollN = 0
+        this.rt.reseedCount = 0
+        this.rt.lossReseedCount = 0
         this.rt.halted = false
         this.rt.complete = false
-        this.config.planState = { pot: 0, rollN: 0, restarts: this.rt.restarts, halted: false, complete: false }
+        this.config.planState = { pot: 0, rollN: 0, restarts: this.rt.restarts, reseedCount: 0, lossReseedCount: 0, halted: false, complete: false }
       }
     }
     this.persist()

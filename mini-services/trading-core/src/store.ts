@@ -296,6 +296,29 @@ export class Store {
     this.db.run('DELETE FROM positions WHERE status = "open" AND mode = "paper"')
   }
 
+  /** Full wipe for "connect a new account and see how it does from zero":
+   * every trade (paper AND live, open AND closed - the whole journal bot
+   * stats/auto-trader stats are rebuilt FROM), the per-mode live P/L
+   * baselines (so the next live balance sync re-baselines fresh off the
+   * NEW account's balance instead of measuring against the old account's
+   * numbers), the risk-breach/watchdog event logs, and the paper ledger
+   * (back to a clean $10,000, live balance/mode cleared so a stale reading
+   * doesn't show until the new account syncs). Bot configs, saved
+   * strategies, alert rules and risk/auto-trader CONFIG are untouched -
+   * this clears DATA, not setup. */
+  clearAllTradingData(): void {
+    this.db.run('DELETE FROM positions')
+    this.db.run('DELETE FROM live_stats')
+    this.db.run('DELETE FROM risk_events')
+    this.db.run('DELETE FROM watchdog_state')
+    this.db.run('DELETE FROM watchdog_events')
+    const dayKey = new Date().toISOString().slice(0, 10)
+    this.db.run(
+      'UPDATE account SET balance = ?, start_balance = ?, day_key = ?, day_start_balance = ?, kill_switch = 0, live_balance = NULL, live_mode = NULL WHERE id = 1',
+      [10000, 10000, dayKey, 10000]
+    )
+  }
+
   setKillSwitch(on: boolean): void {
     this.db.run('UPDATE account SET kill_switch = ? WHERE id = 1', [on ? 1 : 0])
   }

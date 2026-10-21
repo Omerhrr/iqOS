@@ -3650,6 +3650,18 @@ const httpServer = createServer(async (req, res) => {
         return json(200, { ok: true, account: exec.resetAccount() })
       }
 
+      // Full "clear all data, connect a new account" reset: wipes the trade
+      // journal, live P/L baselines, risk/watchdog event logs, and rebuilds
+      // the bot fleet + OS auto trader's own stats from the (now empty)
+      // journal - everything that makes the IQ Day P/L / Total P/L and
+      // autopilot start counting from zero again. See
+      // ExecutionService.resetAllData() for exactly what it touches (and
+      // what it deliberately leaves alone: bot configs, strategies, alert
+      // rules, risk/auto-trader settings).
+      if (path === '/reset_all') {
+        return json(200, { ok: true, account: exec.resetAllData() })
+      }
+
       if (path === '/live/connect') {
         // default: the sidecar's Docker service address (see docker-compose.yml)
         // - only hit when the caller omits url entirely; the Settings dialog

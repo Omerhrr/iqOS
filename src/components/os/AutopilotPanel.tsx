@@ -557,7 +557,14 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
                       { v: 'reseed', label: 'Re-seed' },
                     ]}
                     value={draft.stakePlan.onComplete === 'reseed' ? 'reseed' : 'halt'}
-                    onChange={(v) => patch({ stakePlan: plan({ onComplete: v as 'halt' | 'reseed' }) })}
+                    onChange={(v) => patch({ stakePlan: plan({ onComplete: v as 'halt' | 'reseed', ...(v !== 'reseed' ? { reseedLimit: undefined } : {}) }) })}
+                  />
+                )}
+                {(draft.stakePlan.periods ?? 0) > 0 && draft.stakePlan.onComplete === 'reseed' && (
+                  <NumField
+                    label="Reseed count (0 = continuous)"
+                    value={draft.stakePlan.reseedLimit ?? 0}
+                    onChange={(v) => patch({ stakePlan: plan({ reseedLimit: v > 0 ? Math.round(v) : undefined }) })}
                   />
                 )}
                 <Segmented
@@ -567,8 +574,15 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
                     { v: 'roll', label: 'Re-seed' },
                   ]}
                   value={draft.stakePlan.stopOnLoss === false ? 'roll' : 'end'}
-                  onChange={(v) => patch({ stakePlan: plan({ stopOnLoss: v !== 'roll' }) })}
+                  onChange={(v) => patch({ stakePlan: plan({ stopOnLoss: v !== 'roll', ...(v !== 'roll' ? { lossReseedLimit: undefined } : {}) }) })}
                 />
+                {draft.stakePlan.stopOnLoss === false && (
+                  <NumField
+                    label="Stop after N losses in a row (0 = continuous)"
+                    value={draft.stakePlan.lossReseedLimit ?? 0}
+                    onChange={(v) => patch({ stakePlan: plan({ lossReseedLimit: v > 0 ? Math.round(v) : undefined }) })}
+                  />
+                )}
               </>
             )}
 
@@ -975,6 +989,8 @@ function BotCard({
             {bot.stakePlan.periods ? ` · ${bot.stakePlan.periods}p` : ''}
             {bot.stakePlan.deriskAfter ? ` · derisk½@${bot.stakePlan.deriskAfter}` : ''}
             {bot.stakePlan.stopOnLoss === false ? ' · re-seed' : ' · stop on loss'}
+            {bot.stakePlan.stopOnLoss === false && bot.stakePlan.lossReseedLimit ? ` (stop@${stats.lossReseedCount}/${bot.stakePlan.lossReseedLimit}L)` : ''}
+            {bot.stakePlan.onComplete === 'reseed' && bot.stakePlan.reseedLimit ? ` · reseed ${stats.reseedCount}/${bot.stakePlan.reseedLimit}` : ''}
           </span>
         ) : (
           <span className="rounded bg-[#101828] px-1 py-px">${bot.stake}</span>
@@ -2319,7 +2335,14 @@ function AutoTraderDialog({
                     { v: 'reseed', label: 'Re-seed' },
                   ]}
                   value={d.stakePlan.onComplete === 'reseed' ? 'reseed' : 'halt'}
-                  onChange={(v) => p({ stakePlan: { ...d.stakePlan!, onComplete: v as 'halt' | 'reseed' } })}
+                  onChange={(v) => p({ stakePlan: { ...d.stakePlan!, onComplete: v as 'halt' | 'reseed', ...(v !== 'reseed' ? { reseedLimit: undefined } : {}) } })}
+                />
+              )}
+              {(d.stakePlan.periods ?? 0) > 0 && d.stakePlan.onComplete === 'reseed' && (
+                <NumField
+                  label="Reseed count (0 = continuous)"
+                  value={d.stakePlan.reseedLimit ?? 0}
+                  onChange={(v) => p({ stakePlan: { ...d.stakePlan!, reseedLimit: v > 0 ? Math.round(v) : undefined } })}
                 />
               )}
               <Segmented
@@ -2329,8 +2352,15 @@ function AutoTraderDialog({
                   { v: 'roll', label: 'Re-seed' },
                 ]}
                 value={d.stakePlan.stopOnLoss === false ? 'roll' : 'end'}
-                onChange={(v) => p({ stakePlan: { ...d.stakePlan!, stopOnLoss: v !== 'roll' } })}
+                onChange={(v) => p({ stakePlan: { ...d.stakePlan!, stopOnLoss: v !== 'roll', ...(v !== 'roll' ? { lossReseedLimit: undefined } : {}) } })}
               />
+              {d.stakePlan.stopOnLoss === false && (
+                <NumField
+                  label="Stop after N losses in a row (0 = continuous)"
+                  value={d.stakePlan.lossReseedLimit ?? 0}
+                  onChange={(v) => p({ stakePlan: { ...d.stakePlan!, lossReseedLimit: v > 0 ? Math.round(v) : undefined } })}
+                />
+              )}
             </>
           )}
 

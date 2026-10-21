@@ -61,7 +61,7 @@ export interface BotConfig {
   stakePlan?: StakePlan
   /** Persisted roll state (pot/rollN/restarts/halted) - written by the
    * autopilot on every settle so the compounding streak survives restarts. */
-  planState?: { pot: number; rollN: number; restarts: number; halted?: boolean; complete?: boolean }
+  planState?: { pot: number; rollN: number; restarts: number; reseedCount?: number; lossReseedCount?: number; halted?: boolean; complete?: boolean }
   /** Set when this bot was armed with force:true past a failing research
    * gate - kept visible everywhere the fleet is listed so an unvalidated
    * edge never quietly looks the same as a validated one. */
@@ -112,6 +112,21 @@ export interface StakePlan {
   /** What happens when `periods` is reached: 'halt' (default) stands down
    * until an explicit restart; 'reseed' immediately starts a fresh cycle. */
   onComplete?: 'halt' | 'reseed'
+  /** Caps how many times onComplete:'reseed' auto-starts a fresh cycle.
+   * undefined = unlimited (reseeds forever until a loss or a manual
+   * bot_restart). Set = after this many auto-reseeds the bot halts exactly
+   * like onComplete:'halt' would. Only meaningful when onComplete is
+   * 'reseed'; ignored otherwise. */
+  reseedLimit?: number
+  /** Only meaningful when stopOnLoss is false ("On loss: Re-seed" - a loss
+   * does NOT end the cycle, it just keeps rolling). Caps how many LOSSES in
+   * a row the bot will silently re-seed through before giving up: undefined
+   * = unlimited (continues forever, the original behavior). Set = after
+   * this many consecutive losses, it is forced to stop exactly like
+   * stopOnLoss:true would (halted, awaiting an explicit bot_restart),
+   * instead of continuing to re-seed indefinitely into a losing run. Resets
+   * to 0 on the next win. */
+  lossReseedLimit?: number
 }
 
 export type SessionFilter = 'all' | 'london' | 'newyork' | 'overlap' | 'asia' | 'sydney'
@@ -155,6 +170,8 @@ export interface BotStats {
   pot: number // compounding roll (0 = next trade starts a fresh cycle at base)
   rollN: number // wins compounded in the current cycle
   restarts: number // completed cycles (win streaks that ended)
+  reseedCount: number // how many times onComplete:'reseed' has auto-fired since last (re)start
+  lossReseedCount: number // consecutive losses re-seeded through (stopOnLoss:false) since last win/restart
   halted: boolean // compound stop-on-loss: cycle ended, awaiting restart
   complete: boolean // halted because the periods target was reached (a WIN, not a loss)
   /** Why the bot's last evaluation DIDN'T trade (research gate, session
@@ -213,6 +230,8 @@ interface RuntimeState {
   pot: number // compounding roll; 0 = fresh cycle at base
   rollN: number
   restarts: number
+  reseedCount: number // how many times onComplete:'reseed' has auto-fired since last (re)start
+  lossReseedCount: number // consecutive losses re-seeded through (stopOnLoss:false) since last win/restart
   halted: boolean // stop-on-loss: cycle ended, awaiting explicit restart
   complete: boolean // halted on the periods target (win-side completion)
   /** Edge-trigger de-dup: the direction of the last signal this bot actually
@@ -511,6 +530,23 @@ export class AutopilotService {
     }
   }
 
+  /** Full fresh-start for the bot fleet's own numbers - used by the "clear
+   * all data" action (new broker account connected, want to see how it does
+   * from zero). Every bot's compounding plan state (pot/rollN/restarts) is
+   * zeroed and persisted, and the whole in-memory runtime map is dropped so
+   * the next read rebuilds wins/losses/pnlToday/pnlTotal/streak from the
+   * trade journal - which the caller is expected to have just cleared, so
+   * every bot comes back to a clean 0-0 record. Bot configs (strategy,
+   * stakes, risk limits, enabled state) are untouched - this resets
+   * RESULTS, not setup. */
+  resetAllStats(): void {
+    for (const { bot } of this.store.listBots()) {
+      if (bot.planState) this.store.saveBot({ ...bot, planState: { pot: 0, rollN: 0, restarts: 0, reseedCount: 0, lossReseedCount: 0, halted: false, complete: false } })
+    }
+    this.runtime.clear()
+    this.emit('info', 'bot fleet stats cleared - starting fresh')
+  }
+
   saveBot(input: Partial<BotConfig>, opts: { force?: boolean } = {}): { ok: boolean; bot?: BotConfig; error?: string; forced?: boolean } {
     const id = input.id?.trim() || `bot-${Math.random().toString(36).slice(2, 8)}`
     const existing = this.store.listBots().find((b) => b.bot.id === id)?.bot
@@ -625,8 +661,10 @@ export class AutopilotService {
     rt.complete = false
     rt.pot = 0
     rt.rollN = 0
+    rt.reseedCount = 0
+    rt.lossReseedCount = 0
     rt.lastRejection = undefined
-    this.store.saveBot({ ...bot, planState: { pot: 0, rollN: 0, restarts: rt.restarts } })
+    this.store.saveBot({ ...bot, planState: { pot: 0, rollN: 0, restarts: rt.restarts, reseedCount: 0, lossReseedCount: 0 } })
     this.emit('success', `[${bot.name}] compound cycle RESTARTED - next trade seeds $${bot.stakePlan.base}`)
     return { ok: true, bot: this.store.listBots().find((b) => b.bot.id === id)?.bot }
   }
@@ -961,6 +999,8 @@ export class AutopilotService {
       deriskAfter: p.deriskAfter !== undefined ? Math.round(clampNum(p.deriskAfter, 1, 999)) : undefined,
       deriskPct: p.deriskPct !== undefined ? clampNum(p.deriskPct, 1, 100) : undefined,
       onComplete: p.onComplete === 'reseed' ? 'reseed' : p.onComplete === 'halt' ? 'halt' : undefined,
+      reseedLimit: p.onComplete === 'reseed' && p.reseedLimit !== undefined && Number(p.reseedLimit) > 0 ? Math.round(clampNum(p.reseedLimit, 1, 100000)) : undefined,
+      lossReseedLimit: p.stopOnLoss === false && p.lossReseedLimit !== undefined && Number(p.lossReseedLimit) > 0 ? Math.round(clampNum(p.lossReseedLimit, 1, 100000)) : undefined,
     }
   }
 
@@ -1067,6 +1107,7 @@ export class AutopilotService {
       const base = bot.stakePlan.base
       const working = rt.pot >= 0.01 ? rt.pot : base
       if (position.status === 'won') {
+        rt.lossReseedCount = 0
         // payout cap: fold in at most payoutCap% (default+max 70) of the stake
         // as profit - a broker paying more gets the excess skimmed to the
         // balance, never compounded into the pot
@@ -1079,14 +1120,19 @@ export class AutopilotService {
         if (periods && rt.rollN >= periods) {
           rt.restarts += 1
           const banked = Math.round((rt.pot - base) * 100) / 100
-          if (bot.stakePlan.onComplete === 'reseed') {
+          const reseedLimit = bot.stakePlan.reseedLimit
+          const reseedsLeft = bot.stakePlan.onComplete === 'reseed' && reseedLimit ? reseedLimit - rt.reseedCount : Infinity
+          if (bot.stakePlan.onComplete === 'reseed' && reseedsLeft > 0) {
             rt.pot = 0
             rt.rollN = 0
-            this.emit('success', `[${bot.name}] compound cycle COMPLETE - ${periods} periods, +$${banked.toFixed(2)} banked - re-seeding $${base}`)
+            rt.reseedCount += 1
+            const limitTag = reseedLimit ? ` (re-seed ${rt.reseedCount}/${reseedLimit})` : ''
+            this.emit('success', `[${bot.name}] compound cycle COMPLETE - ${periods} periods, +$${banked.toFixed(2)} banked - re-seeding $${base}${limitTag}`)
           } else {
             rt.halted = true
             rt.complete = true
-            this.emit('success', `[${bot.name}] compound cycle COMPLETE - ${periods} periods, +$${banked.toFixed(2)} banked - standing down; restart for a fresh cycle`)
+            const why = bot.stakePlan.onComplete === 'reseed' ? `re-seed limit reached (${reseedLimit}/${reseedLimit})` : `${periods} periods`
+            this.emit('success', `[${bot.name}] compound cycle COMPLETE - ${why}, +$${banked.toFixed(2)} banked - standing down; restart for a fresh cycle`)
           }
         }
       } else if (position.status === 'lost') {
@@ -1100,6 +1146,20 @@ export class AutopilotService {
           rt.halted = true
           rt.complete = false
           this.emit('warn', `[${bot.name}] compound cycle ENDED on a loss (-$${Math.abs(position.pnl ?? 0).toFixed(2)})${kept >= 0.01 ? ` - $${kept.toFixed(2)} of the pot stays banked on the balance` : ''} - restart to trade again`)
+        } else {
+          // "On loss: Re-seed" - the bot normally just keeps rolling through
+          // a loss, but lossReseedLimit caps how many losses in a row it
+          // will silently absorb before forcing a stop anyway.
+          rt.lossReseedCount += 1
+          const lossReseedLimit = bot.stakePlan.lossReseedLimit
+          if (lossReseedLimit && rt.lossReseedCount >= lossReseedLimit) {
+            rt.halted = true
+            rt.complete = false
+            this.emit(
+              'warn',
+              `[${bot.name}] compound cycle FORCED TO STOP - ${rt.lossReseedCount}/${lossReseedLimit} consecutive losses while re-seeding (-$${Math.abs(position.pnl ?? 0).toFixed(2)} this one)${kept >= 0.01 ? ` - $${kept.toFixed(2)} of the pot stays banked on the balance` : ''} - restart to trade again`
+            )
+          }
         }
       }
       // survive restarts: persist the roll on the bot record (raw store write
@@ -1110,6 +1170,8 @@ export class AutopilotService {
           pot: rt.pot,
           rollN: rt.rollN,
           restarts: rt.restarts,
+          reseedCount: rt.reseedCount,
+          lossReseedCount: rt.lossReseedCount,
           ...(rt.halted ? { halted: true } : {}),
           ...(rt.halted && rt.complete ? { complete: true } : {}),
         },
@@ -1148,6 +1210,8 @@ export class AutopilotService {
       pot: cfg?.planState?.pot ?? 0,
       rollN: cfg?.planState?.rollN ?? 0,
       restarts: cfg?.planState?.restarts ?? 0,
+      reseedCount: cfg?.planState?.reseedCount ?? 0,
+      lossReseedCount: cfg?.planState?.lossReseedCount ?? 0,
       halted: cfg?.planState?.halted ?? false,
       complete: cfg?.planState?.complete ?? false,
       // undefined, not null: a fresh runtime hasn't evaluated anything yet,
@@ -1210,6 +1274,8 @@ export class AutopilotService {
         pot: rt.pot,
         rollN: rt.rollN,
         restarts: rt.restarts,
+        reseedCount: rt.reseedCount,
+        lossReseedCount: rt.lossReseedCount,
         halted: rt.halted,
         complete: rt.complete,
         lastRejection: rt.lastRejection,
@@ -1230,6 +1296,8 @@ export class AutopilotService {
       pot: fresh.pot,
       rollN: fresh.rollN,
       restarts: fresh.restarts,
+      reseedCount: fresh.reseedCount,
+      lossReseedCount: fresh.lossReseedCount,
       halted: fresh.halted,
       complete: fresh.complete,
       lastRejection: fresh.lastRejection,

@@ -379,10 +379,34 @@ function SettingsDialog(props: Props & { onReset: () => void }) {
   const [real, setReal] = useState(false)
   const [liveMsg, setLiveMsg] = useState('')
   const [busy, setBusy] = useState(false)
+  const [clearArmed, setClearArmed] = useState(false)
+  const [clearBusy, setClearBusy] = useState(false)
+  const [clearMsg, setClearMsg] = useState('')
 
   const saveRisk = async () => {
     const res = await osPost<{ ok: boolean; risk: RiskConfig }>('/risk', risk)
     if (res.ok) props.onRiskChanged(res.risk)
+  }
+
+  const clearAllData = async () => {
+    if (!clearArmed) {
+      setClearArmed(true)
+      return
+    }
+    setClearBusy(true)
+    setClearMsg('')
+    try {
+      const res = await osPost<{ ok: boolean; account: AccountState }>('/reset_all')
+      if (res.ok) {
+        props.onAccountChanged(res.account)
+        setClearMsg('Cleared - trade journal, P/L baselines, bot + auto-trader stats all back to zero. Connect your new account below.')
+      }
+    } catch (err) {
+      setClearMsg(`Failed: ${(err as Error).message}`)
+    } finally {
+      setClearBusy(false)
+      setClearArmed(false)
+    }
   }
 
   const connectLive = async () => {
@@ -449,6 +473,35 @@ function SettingsDialog(props: Props & { onReset: () => void }) {
                 Reset paper account ($10,000)
               </Button>
             </div>
+          </section>
+
+          <section className="border-t border-[#1c2739] pt-3">
+            <h4 className="mb-1 text-[10px] font-bold uppercase tracking-[0.18em] text-rose-400">Fresh start - clear all data</h4>
+            <p className="mb-2 text-[10px] leading-relaxed text-[#4b5a72]">
+              Wipes the trade journal, IQ Day P/L + Total P/L baselines, and resets the bot fleet + auto-trader stats (wins/losses,
+              streaks, compounding pots, cooldowns) to zero - for starting fresh with a new broker account. Bot configs, saved
+              strategies and risk/auto-trader settings are untouched.
+            </p>
+            <div className="flex items-center gap-2">
+              <Button
+                onClick={() => void clearAllData()}
+                disabled={clearBusy}
+                variant="outline"
+                className={
+                  clearArmed
+                    ? 'h-8 border-rose-500 bg-rose-500/10 px-3 text-[11px] font-semibold text-rose-300 hover:bg-rose-500/20'
+                    : 'h-8 border-[#1c2739] px-3 text-[11px] text-[#7c8aa5] hover:text-rose-400'
+                }
+              >
+                {clearBusy ? 'Clearing…' : clearArmed ? 'Click again to confirm - this cannot be undone' : 'Clear all data & start fresh'}
+              </Button>
+              {clearArmed && !clearBusy && (
+                <Button onClick={() => setClearArmed(false)} variant="outline" className="h-8 border-[#1c2739] px-3 text-[11px] text-[#7c8aa5]">
+                  Cancel
+                </Button>
+              )}
+            </div>
+            {clearMsg && <p className="mt-2 text-[10px] leading-relaxed text-[#7c8aa5]">{clearMsg}</p>}
           </section>
 
           <section className="border-t border-[#1c2739] pt-3">

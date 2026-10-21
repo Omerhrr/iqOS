@@ -162,6 +162,33 @@ export class ExecutionService {
     return this.account()
   }
 
+  /** "Clear all data, start fresh with a new account" - wipes the whole
+   * trade journal, the per-mode live P/L baselines (IQ Day P/L + Total P/L
+   * both rebaseline off whatever balance the next sync reports, instead of
+   * the old account's numbers), and the paper ledger, then tells the bot
+   * fleet and OS auto trader to rebuild their own stats from the (now
+   * empty) journal too - so nothing from a previous account's session
+   * (open-position counts, win/loss streaks, compounding pots, per-asset
+   * cooldowns) carries over into the new one. Does NOT touch bot configs,
+   * saved strategies, alert rules, or risk/auto-trader settings - reconnect
+   * your new IQ account separately via /live/connect as usual. */
+  resetAllData(): AccountState {
+    this.store.clearAllTradingData()
+    try {
+      this.ctx.use<{ resetAllStats: () => void }>('autopilot').resetAllStats()
+    } catch {
+      // autopilot plugin not loaded - nothing to reset there
+    }
+    try {
+      this.ctx.use<{ resetStats: () => void }>('mode').resetStats()
+    } catch {
+      // mode (OS auto trader) plugin not loaded - nothing to reset there
+    }
+    this.ctx.bus.emit('account', { account: this.account() })
+    this.ctx.bus.emit('alert', { level: 'info', message: 'All trading data cleared - journal, P/L baselines and bot/auto-trader stats reset to zero', ts: this.now() })
+    return this.account()
+  }
+
   private now(): number {
     return Math.floor(Date.now() / 1000)
   }

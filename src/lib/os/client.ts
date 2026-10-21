@@ -1961,8 +1961,17 @@ export interface BotConfig {
     deriskAfter?: number
     deriskPct?: number
     onComplete?: 'halt' | 'reseed'
+    /** Caps how many times onComplete:'reseed' auto-starts a fresh cycle.
+     * undefined = unlimited (reseeds forever until a loss or a manual
+     * restart). Set = after this many auto-reseeds the bot halts instead. */
+    reseedLimit?: number
+    /** Only when stopOnLoss is false ("On loss: Re-seed"). Caps how many
+     * LOSSES IN A ROW the bot will silently re-seed through before being
+     * forced to stop (halted, same as stopOnLoss:true). undefined =
+     * unlimited. Resets to 0 on the next win. */
+    lossReseedLimit?: number
   }
-  planState?: { pot: number; rollN: number; restarts: number; halted?: boolean; complete?: boolean }
+  planState?: { pot: number; rollN: number; restarts: number; reseedCount?: number; lossReseedCount?: number; halted?: boolean; complete?: boolean }
   /** true when this bot was armed with force:true past a FAILING research
    * gate (no/stale/non-robust walk-forward verdict) - a deliberate user
    * override, not a validated edge. Surface this prominently; never let a
@@ -1988,6 +1997,8 @@ export interface BotStats {
   pot: number
   rollN: number
   restarts: number
+  reseedCount: number
+  lossReseedCount: number
   halted: boolean
   /** halted because the periods target was reached (win-side completion) */
   complete: boolean
@@ -2609,6 +2620,8 @@ export interface StakePlan {
   deriskAfter?: number
   deriskPct?: number
   onComplete?: 'halt' | 'reseed'
+  reseedLimit?: number
+  lossReseedLimit?: number
 }
 
 // ---------- research: optimizer / walk-forward / asset sweep ----------
@@ -2937,7 +2950,7 @@ export interface AutoTraderConfig {
   stakePlan?: StakePlan
   /** Server-persisted roll state (read-only from the client - the server
    * is the only writer; informational for the dialog/strip). */
-  planState?: { pot: number; rollN: number; restarts: number; halted: boolean; complete: boolean }
+  planState?: { pot: number; rollN: number; restarts: number; reseedCount?: number; lossReseedCount?: number; halted: boolean; complete: boolean }
 }
 
 export interface OsModeStatus {
