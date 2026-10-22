@@ -8,6 +8,14 @@
 // there's nothing to lead or lag against with just one instrument. Backed by
 // index.ts's /pair_signal. Shares PairComparePanel.tsx's own SideCard so the
 // two panels never drift apart visually.
+//
+// Two usages: (1) the floating "Pair Signal" panel (opened from its own
+// button) - uncontrolled, you type any one instrument and hit read,
+// independent of whatever is selected elsewhere; (2) embedded wherever the
+// OS's own selected asset should drive it directly (e.g. replacing the old
+// IndicatorPanel below Market Watch) - pass `asset` and it becomes fully
+// controlled: no input box, no manual "read", it just tracks that asset and
+// re-fetches the moment it changes, same as every other asset-bound panel.
 import { useCallback, useEffect, useState } from 'react'
 import type { PairSignalResponse, Timeframe } from '@/lib/os/client'
 import { getPairSignal } from '@/lib/os/client'
@@ -19,16 +27,33 @@ export default function PairSignalPanel({
   onClose,
   tf,
   onSelectAsset,
+  asset: controlledAsset,
 }: {
-  onClose: () => void
+  onClose?: () => void
   tf: Timeframe
   onSelectAsset?: (asset: string) => void
+  /** When set, the panel is fully controlled by this asset (no input box,
+   * no manual read) - it just follows whatever is passed in. Omit for the
+   * standalone floating panel's own type-any-instrument behavior. */
+  asset?: string
 }) {
-  const [asset, setAsset] = useState('EURUSD')
-  const [draft, setDraft] = useState('EURUSD')
+  const controlled = controlledAsset !== undefined
+  const [asset, setAsset] = useState(controlledAsset ?? 'EURUSD')
+  const [draft, setDraft] = useState(controlledAsset ?? 'EURUSD')
   const [data, setData] = useState<PairSignalResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+
+  // controlled mode: whenever the OS's own selected asset changes elsewhere
+  // (Market Watch, the chart's own picker, a card click anywhere), follow it
+  // automatically - no typing needed, exactly like every other asset-bound
+  // panel already behaves.
+  useEffect(() => {
+    if (controlled && controlledAsset && controlledAsset !== asset) {
+      setAsset(controlledAsset)
+      setDraft(controlledAsset)
+    }
+  }, [controlled, controlledAsset, asset])
 
   const load = useCallback(
     (opts?: { quiet?: boolean }) => {
@@ -62,35 +87,40 @@ export default function PairSignalPanel({
       <div className="flex flex-wrap items-center gap-1.5 border-b border-[#1c2739] px-2 py-1.5">
         <span className="h-1.5 w-1.5 rounded-full bg-violet-400" />
         <span className="font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5]">Pair Signal</span>
+        {controlled && <span className="font-mono text-[9px] font-bold text-violet-300">{asset}</span>}
         <span className="font-mono text-[8px] text-[#3d4d66]">{tf}</span>
         {data && <span className="ml-auto font-mono text-[8px] text-[#4b5a72]">updated {new Date(data.ts).toLocaleTimeString()}</span>}
-        <button
-          type="button"
-          onClick={onClose}
-          title="close"
-          className="ml-1 rounded px-1.5 py-0.5 font-mono text-[9px] text-[#5a6a85] hover:bg-[#1c2739] hover:text-[#aebccf]"
-        >
-          ✕
-        </button>
+        {onClose && (
+          <button
+            type="button"
+            onClick={onClose}
+            title="close"
+            className="ml-1 rounded px-1.5 py-0.5 font-mono text-[9px] text-[#5a6a85] hover:bg-[#1c2739] hover:text-[#aebccf]"
+          >
+            ✕
+          </button>
+        )}
       </div>
 
-      <div className="flex items-center gap-1 border-b border-[#1c2739] px-2 py-1.5">
-        <input
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && applyDraft()}
-          placeholder="asset"
-          spellCheck={false}
-          className="w-28 rounded border border-[#1c2739] bg-[#101828] px-2 py-1 font-mono text-[10px] uppercase text-[#e2e8f0] placeholder-[#3d4d66] outline-none focus:border-violet-500/50"
-        />
-        <button
-          type="button"
-          onClick={applyDraft}
-          className="ml-1 rounded border border-violet-500/40 bg-violet-500/10 px-2 py-1 font-mono text-[9px] font-bold uppercase text-violet-300 hover:bg-violet-500/20"
-        >
-          read
-        </button>
-      </div>
+      {!controlled && (
+        <div className="flex items-center gap-1 border-b border-[#1c2739] px-2 py-1.5">
+          <input
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && applyDraft()}
+            placeholder="asset"
+            spellCheck={false}
+            className="w-28 rounded border border-[#1c2739] bg-[#101828] px-2 py-1 font-mono text-[10px] uppercase text-[#e2e8f0] placeholder-[#3d4d66] outline-none focus:border-violet-500/50"
+          />
+          <button
+            type="button"
+            onClick={applyDraft}
+            className="ml-1 rounded border border-violet-500/40 bg-violet-500/10 px-2 py-1 font-mono text-[9px] font-bold uppercase text-violet-300 hover:bg-violet-500/20"
+          >
+            read
+          </button>
+        </div>
+      )}
 
       <div className="min-h-0 flex-1 space-y-2 overflow-auto p-2">
         {error && <div className="p-2 text-[10px] text-rose-400">{error}</div>}

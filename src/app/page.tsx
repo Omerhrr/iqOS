@@ -9,7 +9,6 @@ import { toast } from 'sonner'
 import MenuBar from '@/components/os/MenuBar'
 import MarketWatch from '@/components/os/MarketWatch'
 import ChartPanel from '@/components/os/ChartPanel'
-import IndicatorPanel from '@/components/os/IndicatorPanel'
 import IndicatorPicker from '@/components/os/IndicatorPicker'
 import SubPane from '@/components/os/SubPane'
 import SignalPanel from '@/components/os/SignalPanel'
@@ -1359,7 +1358,7 @@ export default function OSPage() {
                   {hHandle}
                   <Panel defaultSize={54} minSize={4}>
                     <div className="ml-0.5 h-full min-h-0">
-                      <IndicatorPanel analysis={analysis} />
+                      <PairSignalPanel tf={tf} asset={asset} onSelectAsset={handleSelectAsset} />
                     </div>
                   </Panel>
                 </PanelGroup>
