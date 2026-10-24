@@ -34,6 +34,11 @@ interface Props {
   onAccountChanged: (a: AccountState) => void
   onSourceChanged: (fresh: AccountState, kernelActiveAsset?: string) => void
   onError: (m: string) => void
+  /** Same text the Pair Signal panel's top candle/HA pattern chip shows on
+   * hover (patternHitDetailLine) - mirrored here so it's visible without
+   * hovering, and it updates live as the panel's own data refreshes. */
+  candleDetail?: string | null
+  haDetail?: string | null
 }
 
 export default function MenuBar(props: Props) {
@@ -77,6 +82,22 @@ export default function MenuBar(props: Props) {
             IQAIR<span className="text-cyan-400">{"//"}</span>OS
           </div>
           <div className="mt-0.5 text-[8px] uppercase tracking-[0.3em] text-[#4b5a72]">trading operating system</div>
+          {(props.candleDetail || props.haDetail) && (
+            <div className="mt-1 max-w-[260px] space-y-0.5 font-mono text-[8px] leading-tight text-[#5a6a85]">
+              {props.candleDetail && (
+                <div className="truncate" title={props.candleDetail}>
+                  <span className="text-[#3d4d66]">candle </span>
+                  {props.candleDetail}
+                </div>
+              )}
+              {props.haDetail && (
+                <div className="truncate" title={props.haDetail}>
+                  <span className="text-[#3d4d66]">ha </span>
+                  {props.haDetail}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
 

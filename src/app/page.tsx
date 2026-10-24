@@ -165,6 +165,10 @@ export default function OSPage() {
   const assetRef = useRef(asset)
   const [candles, setCandles] = useState<Candle[]>([])
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null)
+  // mirrors the Pair Signal panel's top candle/HA pattern hover-detail into
+  // the top-left brand header, so it's visible without hovering (see
+  // MenuBar's candleDetail/haDetail props)
+  const [pairDetail, setPairDetail] = useState<{ candle: string | null; ha: string | null }>({ candle: null, ha: null })
   const [account, setAccount] = useState<AccountState | null>(null)
   const accountRef = useRef<AccountState | null>(null)
   // mirror state into refs for callbacks that must not re-bind - done in an
@@ -1026,6 +1030,8 @@ export default function OSPage() {
           }
         }}
         onError={(m) => pushToast('danger', m)}
+        candleDetail={pairDetail.candle}
+        haDetail={pairDetail.ha}
       />
 
       {bootLine < BOOT_MSGS.length ? (
@@ -1358,7 +1364,7 @@ export default function OSPage() {
                   {hHandle}
                   <Panel defaultSize={54} minSize={4}>
                     <div className="ml-0.5 h-full min-h-0">
-                      <PairSignalPanel tf={tf} asset={asset} onSelectAsset={handleSelectAsset} />
+                      <PairSignalPanel tf={tf} asset={asset} onSelectAsset={handleSelectAsset} onDetail={setPairDetail} />
                     </div>
                   </Panel>
                 </PanelGroup>

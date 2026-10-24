@@ -23,11 +23,20 @@ import { SideCard } from './PairComparePanel'
 
 const POLL_MS = 10_000
 
+/** Same line PatternChip's hover title shows for a pattern hit (name +
+ * note + reliability/3 + bars-ago) - reused here so a readout fed by
+ * onDetail reads identically to what hovering a chip already told you. */
+export function patternHitDetailLine(hit: { name: string; note: string; reliability: number; barsAgo: number } | null | undefined): string | null {
+  if (!hit) return null
+  return `${hit.name} - ${hit.note} · reliability ${hit.reliability}/3 · ${hit.barsAgo} bar(s) ago`
+}
+
 export default function PairSignalPanel({
   onClose,
   tf,
   onSelectAsset,
   asset: controlledAsset,
+  onDetail,
 }: {
   onClose?: () => void
   tf: Timeframe
@@ -36,6 +45,11 @@ export default function PairSignalPanel({
    * no manual read) - it just follows whatever is passed in. Omit for the
    * standalone floating panel's own type-any-instrument behavior. */
   asset?: string
+  /** Fired every time fresh data lands, with the same detail hovering the
+   * top candle/HA pattern chip would show (see patternHitDetailLine) - for
+   * a caller that wants to mirror that hover text somewhere else without
+   * this panel's own rendering changing at all. */
+  onDetail?: (d: { candle: string | null; ha: string | null }) => void
 }) {
   const controlled = controlledAsset !== undefined
   const [asset, setAsset] = useState(controlledAsset ?? 'EURUSD')
@@ -63,12 +77,16 @@ export default function PairSignalPanel({
           if (d?.ok) {
             setData(d)
             setError(null)
+            onDetail?.({
+              candle: patternHitDetailLine(d.side.fit?.patterns[0]),
+              ha: patternHitDetailLine(d.side.fit?.haPatterns[0]),
+            })
           }
         })
         .catch((err: Error) => setError(err.message.slice(0, 180)))
         .finally(() => setLoading(false))
     },
-    [asset, tf],
+    [asset, tf, onDetail],
   )
 
   useEffect(() => {
