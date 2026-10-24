@@ -49,7 +49,7 @@ function detailColor(d: PatternDetail): string {
 function DetailLine({ d }: { d: PatternDetail }) {
   const arrow = d.reliability >= 3 && d.direction !== 'neutral' ? (d.direction === 'bullish' ? '▲' : '▼') : null
   return (
-    <div className={`truncate font-mono ${detailColor(d)}`} title={d.text}>
+    <div className={`whitespace-normal break-words font-mono ${detailColor(d)}`} title={d.text}>
       {arrow && <span className="mr-0.5">{arrow}</span>}
       {d.text}
     </div>
@@ -89,18 +89,18 @@ export default function MenuBar(props: Props) {
     <header className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-[#1c2739] bg-[#080d16] px-3 py-2">
       {/* brand */}
       <div className="flex items-start gap-2">
-        <div>
+        <div className="w-28 shrink-0">
           <div className="flex h-7 w-7 items-center justify-center rounded-md border border-cyan-500/50 bg-cyan-500/10 font-mono text-[11px] font-bold text-cyan-300">
             iQ
           </div>
           {(props.candleDetail || props.haDetail) && (
-            <div className="mt-2.5 max-w-[150px] space-y-0.5 font-mono text-[8px] leading-tight">
+            <div className="mt-2.5 w-28 space-y-1 whitespace-normal break-words font-mono text-[8px] leading-snug">
               {props.candleDetail && <DetailLine d={props.candleDetail} />}
               {props.haDetail && <DetailLine d={props.haDetail} />}
             </div>
           )}
         </div>
-        <div className="leading-none">
+        <div className="shrink-0 leading-none">
           <div className="text-[13px] font-bold tracking-[0.22em] text-[#e2e8f0]">
             IQAIR<span className="text-cyan-400">{"//"}</span>OS
           </div>
