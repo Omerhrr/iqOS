@@ -88,21 +88,23 @@ export default function MenuBar(props: Props) {
   return (
     <header className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-[#1c2739] bg-[#080d16] px-3 py-2">
       {/* brand */}
-      <div className="flex items-center gap-2">
-        <div className="flex h-7 w-7 items-center justify-center rounded-md border border-cyan-500/50 bg-cyan-500/10 font-mono text-[11px] font-bold text-cyan-300">
-          iQ
+      <div className="flex items-start gap-2">
+        <div>
+          <div className="flex h-7 w-7 items-center justify-center rounded-md border border-cyan-500/50 bg-cyan-500/10 font-mono text-[11px] font-bold text-cyan-300">
+            iQ
+          </div>
+          {(props.candleDetail || props.haDetail) && (
+            <div className="mt-2.5 max-w-[150px] space-y-0.5 font-mono text-[8px] leading-tight">
+              {props.candleDetail && <DetailLine d={props.candleDetail} />}
+              {props.haDetail && <DetailLine d={props.haDetail} />}
+            </div>
+          )}
         </div>
         <div className="leading-none">
           <div className="text-[13px] font-bold tracking-[0.22em] text-[#e2e8f0]">
             IQAIR<span className="text-cyan-400">{"//"}</span>OS
           </div>
           <div className="mt-0.5 text-[8px] uppercase tracking-[0.3em] text-[#4b5a72]">trading operating system</div>
-          {(props.candleDetail || props.haDetail) && (
-            <div className="mt-2.5 max-w-[260px] space-y-0.5 font-mono text-[8px] leading-tight">
-              {props.candleDetail && <DetailLine d={props.candleDetail} />}
-              {props.haDetail && <DetailLine d={props.haDetail} />}
-            </div>
-          )}
         </div>
       </div>
 
