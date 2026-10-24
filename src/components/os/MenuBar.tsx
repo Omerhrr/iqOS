@@ -46,11 +46,14 @@ function detailColor(d: PatternDetail): string {
   return d.direction === 'bullish' ? 'text-emerald-400' : d.direction === 'bearish' ? 'text-rose-400' : 'text-[#5a6a85]'
 }
 
+/** One pattern readout for the full-width strip under the header - a single
+ * truncated line (hover for the untruncated text) so it never grows taller
+ * than the bar and pushes the header's own row around. */
 function DetailLine({ d }: { d: PatternDetail }) {
-  const arrow = d.reliability >= 3 && d.direction !== 'neutral' ? (d.direction === 'bullish' ? '▲' : '▼') : null
+  const arrow = d.reliability >= 3 && d.direction !== 'neutral' ? (d.direction === 'bullish' ? '▲ ' : '▼ ') : ''
   return (
-    <div className={`whitespace-normal break-words font-mono ${detailColor(d)}`} title={d.text}>
-      {arrow && <span className="mr-0.5">{arrow}</span>}
+    <div className={`min-w-0 flex-1 truncate font-mono text-[9px] ${detailColor(d)}`} title={d.text}>
+      {arrow}
       {d.text}
     </div>
   )
@@ -86,19 +89,12 @@ export default function MenuBar(props: Props) {
   }
 
   return (
-    <header className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-[#1c2739] bg-[#080d16] px-3 py-2">
+    <div className="flex flex-col border-b border-[#1c2739] bg-[#080d16]">
+    <header className="flex flex-wrap items-center gap-x-4 gap-y-2 px-3 py-2">
       {/* brand */}
-      <div className="flex items-start gap-2">
-        <div className="w-28 shrink-0">
-          <div className="flex h-7 w-7 items-center justify-center rounded-md border border-cyan-500/50 bg-cyan-500/10 font-mono text-[11px] font-bold text-cyan-300">
-            iQ
-          </div>
-          {(props.candleDetail || props.haDetail) && (
-            <div className="mt-2.5 w-28 space-y-1 whitespace-normal break-words font-mono text-[8px] leading-snug">
-              {props.candleDetail && <DetailLine d={props.candleDetail} />}
-              {props.haDetail && <DetailLine d={props.haDetail} />}
-            </div>
-          )}
+      <div className="flex items-center gap-2">
+        <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-cyan-500/50 bg-cyan-500/10 font-mono text-[11px] font-bold text-cyan-300">
+          iQ
         </div>
         <div className="shrink-0 leading-none">
           <div className="text-[13px] font-bold tracking-[0.22em] text-[#e2e8f0]">
@@ -208,6 +204,13 @@ export default function MenuBar(props: Props) {
         <span className="font-mono text-[11px] text-[#4b5a72]">{now > 0 ? fmtClock(now) : '--:--:-- UTC'}</span>
       </div>
     </header>
+    {(props.candleDetail || props.haDetail) && (
+      <div className="flex items-center gap-4 border-t border-[#131c2b] px-3 py-1">
+        {props.candleDetail && <DetailLine d={props.candleDetail} />}
+        {props.haDetail && <DetailLine d={props.haDetail} />}
+      </div>
+    )}
+    </div>
   )
 }
 
