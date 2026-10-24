@@ -25,7 +25,7 @@ import RenkoFootprintPanel from '@/components/os/RenkoFootprintPanel'
 import VolumeFootprintPanel from '@/components/os/VolumeFootprintPanel'
 import TickVolumePanel from '@/components/os/TickVolumePanel'
 import PairComparePanel from '@/components/os/PairComparePanel'
-import PairSignalPanel from '@/components/os/PairSignalPanel'
+import PairSignalPanel, { type PatternDetail } from '@/components/os/PairSignalPanel'
 import MarkovPanel from '@/components/os/MarkovPanel'
 import { DeltaFootprintView } from '@/components/os/OrderFlowPanel'
 import CandleMathView from '@/components/os/CandleMathView'
@@ -168,7 +168,7 @@ export default function OSPage() {
   // mirrors the Pair Signal panel's top candle/HA pattern hover-detail into
   // the top-left brand header, so it's visible without hovering (see
   // MenuBar's candleDetail/haDetail props)
-  const [pairDetail, setPairDetail] = useState<{ candle: string | null; ha: string | null }>({ candle: null, ha: null })
+  const [pairDetail, setPairDetail] = useState<{ candle: PatternDetail | null; ha: PatternDetail | null }>({ candle: null, ha: null })
   const [account, setAccount] = useState<AccountState | null>(null)
   const accountRef = useRef<AccountState | null>(null)
   // mirror state into refs for callbacks that must not re-bind - done in an

@@ -23,12 +23,19 @@ import { SideCard } from './PairComparePanel'
 
 const POLL_MS = 10_000
 
-/** Same line PatternChip's hover title shows for a pattern hit (name +
- * note + reliability/3 + bars-ago) - reused here so a readout fed by
- * onDetail reads identically to what hovering a chip already told you. */
-export function patternHitDetailLine(hit: { name: string; note: string; reliability: number; barsAgo: number } | null | undefined): string | null {
+/** Same info PatternChip's hover title shows for a pattern hit - just the
+ * note + reliability/3 + bars-ago (no pattern name, that's what the chip
+ * itself already prints), plus direction/reliability so a caller can color
+ * and flag it exactly like the chip does. */
+export interface PatternDetail {
+  text: string
+  direction: 'bullish' | 'bearish' | 'neutral'
+  reliability: number
+}
+
+export function patternHitDetail(hit: { note: string; reliability: number; barsAgo: number; direction: 'bullish' | 'bearish' | 'neutral' } | null | undefined): PatternDetail | null {
   if (!hit) return null
-  return `${hit.name} - ${hit.note} · reliability ${hit.reliability}/3 · ${hit.barsAgo} bar(s) ago`
+  return { text: `${hit.note} · reliability ${hit.reliability}/3 · ${hit.barsAgo} bar(s) ago`, direction: hit.direction, reliability: hit.reliability }
 }
 
 export default function PairSignalPanel({
@@ -46,10 +53,10 @@ export default function PairSignalPanel({
    * standalone floating panel's own type-any-instrument behavior. */
   asset?: string
   /** Fired every time fresh data lands, with the same detail hovering the
-   * top candle/HA pattern chip would show (see patternHitDetailLine) - for
-   * a caller that wants to mirror that hover text somewhere else without
+   * top candle/HA pattern chip would show (see patternHitDetail) - for a
+   * caller that wants to mirror that hover info somewhere else without
    * this panel's own rendering changing at all. */
-  onDetail?: (d: { candle: string | null; ha: string | null }) => void
+  onDetail?: (d: { candle: PatternDetail | null; ha: PatternDetail | null }) => void
 }) {
   const controlled = controlledAsset !== undefined
   const [asset, setAsset] = useState(controlledAsset ?? 'EURUSD')
@@ -78,8 +85,8 @@ export default function PairSignalPanel({
             setData(d)
             setError(null)
             onDetail?.({
-              candle: patternHitDetailLine(d.side.fit?.patterns[0]),
-              ha: patternHitDetailLine(d.side.fit?.haPatterns[0]),
+              candle: patternHitDetail(d.side.fit?.patterns[0]),
+              ha: patternHitDetail(d.side.fit?.haPatterns[0]),
             })
           }
         })

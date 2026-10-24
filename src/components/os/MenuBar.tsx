@@ -15,6 +15,7 @@ import {
 import { Switch } from '@/components/ui/switch'
 import type { AccountState, AssetRow, ChartType, OsMode, RiskConfig, Timeframe } from '@/lib/os/client'
 import { CHART_TYPES, TIMEFRAMES, fmtClock, fmtMoney, fmtPct, osPost } from '@/lib/os/client'
+import type { PatternDetail } from './PairSignalPanel'
 
 interface Props {
   assets: AssetRow[]
@@ -34,11 +35,25 @@ interface Props {
   onAccountChanged: (a: AccountState) => void
   onSourceChanged: (fresh: AccountState, kernelActiveAsset?: string) => void
   onError: (m: string) => void
-  /** Same text the Pair Signal panel's top candle/HA pattern chip shows on
-   * hover (patternHitDetailLine) - mirrored here so it's visible without
+  /** Same detail the Pair Signal panel's top candle/HA pattern chip shows
+   * on hover (patternHitDetail) - mirrored here so it's visible without
    * hovering, and it updates live as the panel's own data refreshes. */
-  candleDetail?: string | null
-  haDetail?: string | null
+  candleDetail?: PatternDetail | null
+  haDetail?: PatternDetail | null
+}
+
+function detailColor(d: PatternDetail): string {
+  return d.direction === 'bullish' ? 'text-emerald-400' : d.direction === 'bearish' ? 'text-rose-400' : 'text-[#5a6a85]'
+}
+
+function DetailLine({ d }: { d: PatternDetail }) {
+  const arrow = d.reliability >= 3 && d.direction !== 'neutral' ? (d.direction === 'bullish' ? '▲' : '▼') : null
+  return (
+    <div className={`truncate font-mono ${detailColor(d)}`} title={d.text}>
+      {arrow && <span className="mr-0.5">{arrow}</span>}
+      {d.text}
+    </div>
+  )
 }
 
 export default function MenuBar(props: Props) {
@@ -83,19 +98,9 @@ export default function MenuBar(props: Props) {
           </div>
           <div className="mt-0.5 text-[8px] uppercase tracking-[0.3em] text-[#4b5a72]">trading operating system</div>
           {(props.candleDetail || props.haDetail) && (
-            <div className="mt-1 max-w-[260px] space-y-0.5 font-mono text-[8px] leading-tight text-[#5a6a85]">
-              {props.candleDetail && (
-                <div className="truncate" title={props.candleDetail}>
-                  <span className="text-[#3d4d66]">candle </span>
-                  {props.candleDetail}
-                </div>
-              )}
-              {props.haDetail && (
-                <div className="truncate" title={props.haDetail}>
-                  <span className="text-[#3d4d66]">ha </span>
-                  {props.haDetail}
-                </div>
-              )}
+            <div className="mt-2.5 max-w-[260px] space-y-0.5 font-mono text-[8px] leading-tight">
+              {props.candleDetail && <DetailLine d={props.candleDetail} />}
+              {props.haDetail && <DetailLine d={props.haDetail} />}
             </div>
           )}
         </div>
