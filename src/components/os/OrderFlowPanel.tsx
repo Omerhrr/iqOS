@@ -13,8 +13,8 @@
 // CLOSED candles only for these routes (closedOnly: true) - the forming bar
 // is excluded so nothing repaints mid-bar.
 import { useEffect, useMemo, useState } from 'react'
-import type { CandleDelta, CumulativeDeltaPoint, Timeframe, VolumeProfileResult } from '@/lib/os/client'
-import { fmtPrice, getDelta, getVolumeProfile } from '@/lib/os/client'
+import type { CandleDelta, CumulativeDeltaPoint, Timeframe, TpoResult, VolumeProfileResult } from '@/lib/os/client'
+import { fmtPrice, getDelta, getTpoProfile, getVolumeProfile } from '@/lib/os/client'
 
 interface OrderFlowPanelProps {
   asset: string
@@ -126,6 +126,112 @@ function VolumeProfileView({ asset, tf, closedTick }: OrderFlowPanelProps) {
         Derived from candle OHLCV, not real order-book data. Each candle's volume is split into buy/sell by where its close sits in its
         high-low range, then distributed across the price buckets its range overlaps. POC = bucket with the most volume. Value Area = the
         contiguous price range covering ~70% of volume around the POC.
+      </p>
+    </div>
+  )
+}
+
+/** Market Profile / TPO: a SECOND, independent way of finding the POC -
+ * Volume Profile's POC is the price bin with the most (approximated)
+ * volume; this one's POC is the price bin touched by the most distinct
+ * time periods (classic single-print-per-period counting), i.e. time spent
+ * at a price rather than volume traded there. Real counts, not an
+ * approximation - built straight from candle highs/lows, no CLV proxy.
+ * See trading-core/src/analytics/tpo.ts for the exact method. */
+function TpoProfileView({ asset, tf, closedTick }: OrderFlowPanelProps) {
+  const [tpo, setTpo] = useState<TpoResult | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    setBusy(true)
+    setError(null)
+    getTpoProfile(asset, tf, { limit: 400 })
+      .then((p) => {
+        if (!cancelled) setTpo(p)
+      })
+      .catch((e: Error) => {
+        if (!cancelled) setError(e.message.slice(0, 160))
+      })
+      .finally(() => {
+        if (!cancelled) setBusy(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [asset, tf, closedTick])
+
+  const chart = useMemo(() => {
+    if (!tpo || tpo.bins.length === 0) return null
+    const W = 220
+    const H = 320
+    const maxTpos = Math.max(...tpo.bins.map((b) => b.tpos), 1)
+    // bins are ordered low->high price; render high price at the top
+    const rows = [...tpo.bins].reverse()
+    const rowH = H / rows.length
+    return { W, H, rowH, rows, maxTpos }
+  }, [tpo])
+
+  if (busy && !tpo) return <div className="p-3 text-[10px] text-[#4b5a72]">loading TPO profile…</div>
+  if (error) return <div className="p-3 text-[10px] text-rose-400">{error}</div>
+  if (!chart || !tpo || tpo.poc === null) return <div className="p-3 text-[10px] text-[#4b5a72]">not enough candle history yet.</div>
+
+  const priceToY = (price: number) => {
+    const top = chart.rows[0].priceHigh
+    const bottom = chart.rows[chart.rows.length - 1].priceLow
+    return ((top - price) / (top - bottom)) * chart.H
+  }
+
+  return (
+    <div className="flex flex-col gap-2 p-2">
+      <div className="flex items-center justify-between">
+        <div className="text-[10px] uppercase tracking-wider text-[#4b5a72]">TPO Profile (Market Profile)</div>
+        <div className="font-mono text-[9px] text-[#3d4c66]">{tpo.periods.length} periods shown · {tpo.totalTpos} TPOs</div>
+      </div>
+      <div className="flex gap-2">
+        <svg viewBox={`0 0 ${chart.W} ${chart.H}`} className="h-[320px] w-[220px] shrink-0">
+          {chart.rows.map((b, i) => {
+            const isPoc = tpo.poc !== null && Math.abs(b.mid - tpo.poc) < 1e-9
+            const barW = (b.tpos / chart.maxTpos) * (chart.W - 4)
+            return (
+              <g key={i} transform={`translate(0, ${i * chart.rowH})`}>
+                <rect x={0} y={0} width={barW} height={chart.rowH - 1} fill={b.inValueArea ? 'rgba(168,85,247,0.55)' : 'rgba(96,110,140,0.4)'} />
+                {isPoc && <rect x={0} y={0} width={chart.W} height={chart.rowH - 1} fill="none" stroke="#facc15" strokeWidth="1.2" />}
+              </g>
+            )
+          })}
+          {tpo.valueAreaHigh !== null && tpo.valueAreaLow !== null && (
+            <>
+              <line x1={0} x2={chart.W} y1={priceToY(tpo.valueAreaHigh)} y2={priceToY(tpo.valueAreaHigh)} stroke="#38bdf8" strokeDasharray="3 2" strokeWidth="1" />
+              <line x1={0} x2={chart.W} y1={priceToY(tpo.valueAreaLow)} y2={priceToY(tpo.valueAreaLow)} stroke="#38bdf8" strokeDasharray="3 2" strokeWidth="1" />
+            </>
+          )}
+          {tpo.ibHigh !== null && tpo.ibLow !== null && (
+            <>
+              <line x1={0} x2={chart.W} y1={priceToY(tpo.ibHigh)} y2={priceToY(tpo.ibHigh)} stroke="#f472b6" strokeDasharray="1 2" strokeWidth="1" />
+              <line x1={0} x2={chart.W} y1={priceToY(tpo.ibLow)} y2={priceToY(tpo.ibLow)} stroke="#f472b6" strokeDasharray="1 2" strokeWidth="1" />
+            </>
+          )}
+        </svg>
+        <div className="flex flex-col justify-between py-0.5 font-mono text-[9px]">
+          <div className="text-[#4b5a72]">high {fmtPrice(chart.rows[0].priceHigh, asset)}</div>
+          <Legend label="POC" color="#facc15" value={fmtPrice(tpo.poc, asset)} />
+          {tpo.valueAreaHigh !== null && <Legend label="VA High" color="#38bdf8" value={fmtPrice(tpo.valueAreaHigh, asset)} />}
+          {tpo.valueAreaLow !== null && <Legend label="VA Low" color="#38bdf8" value={fmtPrice(tpo.valueAreaLow, asset)} />}
+          {tpo.ibHigh !== null && <Legend label="IB High" color="#f472b6" value={fmtPrice(tpo.ibHigh, asset)} />}
+          {tpo.ibLow !== null && <Legend label="IB Low" color="#f472b6" value={fmtPrice(tpo.ibLow, asset)} />}
+          <div className="text-[#4b5a72]">low {fmtPrice(chart.rows[chart.rows.length - 1].priceLow, asset)}</div>
+          <div className="mt-2 flex items-center gap-1 text-[#4b5a72]">
+            <span className="inline-block h-2 w-2 rounded-sm" style={{ background: 'rgba(168,85,247,0.55)' }} /> value area
+          </div>
+        </div>
+      </div>
+      <p className="text-[9px] leading-relaxed text-[#4b5a72]">
+        {tpo.periodRule} - each period "prints" on every price bin its high-low range touched ({tpo.countRule}), building a time-at-price
+        histogram, not a volume-at-price one (that's Volume Profile, the other tab - a second, independent read on where the POC sits).
+        POC = the bin with the most periods touching it. Value Area = the contiguous bins covering ~70% of all TPOs around the POC. IB =
+        Initial Balance, the first period's high/low range.
       </p>
     </div>
   )
@@ -247,13 +353,14 @@ export function DeltaFootprintView({ asset, tf, large = false, closedTick }: Ord
 }
 
 export default function OrderFlowPanel({ asset, tf, closedTick }: OrderFlowPanelProps) {
-  const [view, setView] = useState<'profile' | 'delta'>('profile')
+  const [view, setView] = useState<'profile' | 'tpo' | 'delta'>('profile')
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex items-center gap-1 border-b border-[#1c2739] px-2 py-1.5">
         {(
           [
             ['profile', 'Volume Profile'],
+            ['tpo', 'TPO Profile'],
             ['delta', 'Delta / Footprint'],
           ] as [typeof view, string][]
         ).map(([v, label]) => (
@@ -271,7 +378,13 @@ export default function OrderFlowPanel({ asset, tf, closedTick }: OrderFlowPanel
         <span className="ml-auto text-[9px] text-[#3d4c66]">{asset} · {tf}</span>
       </div>
       <div className="min-h-0 flex-1 overflow-auto">
-        {view === 'profile' ? <VolumeProfileView asset={asset} tf={tf} closedTick={closedTick} /> : <DeltaFootprintView asset={asset} tf={tf} closedTick={closedTick} />}
+        {view === 'profile' ? (
+          <VolumeProfileView asset={asset} tf={tf} closedTick={closedTick} />
+        ) : view === 'tpo' ? (
+          <TpoProfileView asset={asset} tf={tf} closedTick={closedTick} />
+        ) : (
+          <DeltaFootprintView asset={asset} tf={tf} closedTick={closedTick} />
+        )}
       </div>
     </div>
   )

@@ -235,6 +235,57 @@ export async function getVolumeProfile(asset: string, tf: Timeframe, opts?: { li
   return d.profile
 }
 
+// ---------- Market Profile / TPO (see trading-core/src/analytics/tpo.ts) ----------
+// A SECOND, independent way of finding the POC: Volume Profile's POC is the
+// price bin with the most (approximated) volume; TPO's POC is the price bin
+// touched by the most distinct time periods (classic "single print per
+// period" counting) - time-at-price rather than volume-at-price. They often
+// agree, and when they don't that disagreement is itself informative.
+export interface TpoBin {
+  priceLow: number
+  priceHigh: number
+  mid: number
+  tpos: number
+  letters: string[]
+  inValueArea: boolean
+}
+
+export interface TpoPeriod {
+  idx: number
+  letter: string
+  startTime: number
+  endTime: number
+  high: number
+  low: number
+  candles: number
+}
+
+export interface TpoResult {
+  asset: string
+  tf: Timeframe
+  periodSec: number
+  periodRule: string
+  countRule: string
+  poc: number | null
+  valueAreaHigh: number | null
+  valueAreaLow: number | null
+  ibHigh: number | null
+  ibLow: number | null
+  totalTpos: number
+  bins: TpoBin[]
+  periods: TpoPeriod[]
+}
+
+export async function getTpoProfile(asset: string, tf: Timeframe, opts?: { limit?: number; periodSec?: number; bins?: number }): Promise<TpoResult> {
+  return osGet<TpoResult>('/tpo', {
+    asset,
+    tf,
+    limit: opts?.limit,
+    periodSec: opts?.periodSec,
+    bins: opts?.bins,
+  })
+}
+
 // ---------- OTC micro-tick velocity footprint (see trading-core/src/analytics/otcfootprint.ts) ----------
 // OTC feeds are generator scripts - no order book, no real volume. This chart
 // reads the generator's own price-print stream instead: per price row up/down
