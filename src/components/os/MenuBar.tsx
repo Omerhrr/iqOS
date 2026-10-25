@@ -52,10 +52,16 @@ function detailColor(d: PatternDetail): string {
 /** One pattern readout for the full-width strip under the header - a single
  * truncated line (hover for the untruncated text) so it never grows taller
  * than the bar and pushes the header's own row around. */
-function DetailLine({ d }: { d: PatternDetail }) {
+/** `grow=false` (the POC read) keeps to a capped width on the left instead
+ * of sharing flex-1 equally with the candle/HA pattern lines - those two
+ * carry longer, more important pattern notes and were getting squeezed. */
+function DetailLine({ d, grow = true }: { d: PatternDetail; grow?: boolean }) {
   const arrow = d.reliability >= 3 && d.direction !== 'neutral' ? (d.direction === 'bullish' ? '▲ ' : '▼ ') : ''
   return (
-    <div className={`min-w-0 flex-1 truncate font-mono text-[9px] ${detailColor(d)}`} title={d.text}>
+    <div
+      className={`truncate font-mono text-[9px] ${detailColor(d)} ${grow ? 'min-w-0 flex-1' : 'max-w-[170px] shrink-0'}`}
+      title={d.text}
+    >
       {arrow}
       {d.text}
     </div>
@@ -209,9 +215,9 @@ export default function MenuBar(props: Props) {
     </header>
     {(props.candleDetail || props.haDetail || props.pocDetail) && (
       <div className="flex items-center gap-4 border-t border-[#131c2b] px-3 py-1">
+        {props.pocDetail && <DetailLine d={props.pocDetail} grow={false} />}
         {props.candleDetail && <DetailLine d={props.candleDetail} />}
         {props.haDetail && <DetailLine d={props.haDetail} />}
-        {props.pocDetail && <DetailLine d={props.pocDetail} />}
       </div>
     )}
     </div>
