@@ -168,7 +168,7 @@ export default function OSPage() {
   // mirrors the Pair Signal panel's top candle/HA pattern hover-detail into
   // the top-left brand header, so it's visible without hovering (see
   // MenuBar's candleDetail/haDetail props)
-  const [pairDetail, setPairDetail] = useState<{ candle: PatternDetail | null; ha: PatternDetail | null }>({ candle: null, ha: null })
+  const [pairDetail, setPairDetail] = useState<{ candle: PatternDetail | null; ha: PatternDetail | null; poc: PatternDetail | null }>({ candle: null, ha: null, poc: null })
   const [account, setAccount] = useState<AccountState | null>(null)
   const accountRef = useRef<AccountState | null>(null)
   // mirror state into refs for callbacks that must not re-bind - done in an
@@ -1032,6 +1032,7 @@ export default function OSPage() {
         onError={(m) => pushToast('danger', m)}
         candleDetail={pairDetail.candle}
         haDetail={pairDetail.ha}
+        pocDetail={pairDetail.poc}
       />
 
       {bootLine < BOOT_MSGS.length ? (

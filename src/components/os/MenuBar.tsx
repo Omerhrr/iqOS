@@ -40,6 +40,9 @@ interface Props {
    * hovering, and it updates live as the panel's own data refreshes. */
   candleDetail?: PatternDetail | null
   haDetail?: PatternDetail | null
+  /** Where price sits vs the TPO POC (analytics/tpo.ts) - same treatment,
+   * a third "something interesting" read alongside the candle/HA ones. */
+  pocDetail?: PatternDetail | null
 }
 
 function detailColor(d: PatternDetail): string {
@@ -204,10 +207,11 @@ export default function MenuBar(props: Props) {
         <span className="font-mono text-[11px] text-[#4b5a72]">{now > 0 ? fmtClock(now) : '--:--:-- UTC'}</span>
       </div>
     </header>
-    {(props.candleDetail || props.haDetail) && (
+    {(props.candleDetail || props.haDetail || props.pocDetail) && (
       <div className="flex items-center gap-4 border-t border-[#131c2b] px-3 py-1">
         {props.candleDetail && <DetailLine d={props.candleDetail} />}
         {props.haDetail && <DetailLine d={props.haDetail} />}
+        {props.pocDetail && <DetailLine d={props.pocDetail} />}
       </div>
     )}
     </div>

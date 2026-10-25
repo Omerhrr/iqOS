@@ -17,8 +17,8 @@
 // controlled: no input box, no manual "read", it just tracks that asset and
 // re-fetches the moment it changes, same as every other asset-bound panel.
 import { useCallback, useEffect, useState } from 'react'
-import type { PairSignalResponse, Timeframe } from '@/lib/os/client'
-import { getPairSignal } from '@/lib/os/client'
+import type { PairSignalResponse, Timeframe, TpoResult } from '@/lib/os/client'
+import { fmtPrice, getPairSignal, getTpoProfile } from '@/lib/os/client'
 import { SideCard } from './PairComparePanel'
 
 const POLL_MS = 10_000
@@ -36,6 +36,23 @@ export interface PatternDetail {
 export function patternHitDetail(hit: { note: string; reliability: number; barsAgo: number; direction: 'bullish' | 'bearish' | 'neutral' } | null | undefined): PatternDetail | null {
   if (!hit) return null
   return { text: `${hit.note} · reliability ${hit.reliability}/3 · ${hit.barsAgo} bar(s) ago`, direction: hit.direction, reliability: hit.reliability }
+}
+
+/** Where the current price sits vs the TPO POC (analytics/tpo.ts) - a third
+ * "something interesting happened" read alongside the candle/HA pattern
+ * ones: reliability climbs the further price has pushed away from the POC
+ * (1 = still inside the value area, 2 = outside it, 3 = outside it AND
+ * outside the Initial Balance - a genuine range break), same arrow/color
+ * treatment as a 3/3 pattern hit. */
+function tpoPocDetail(tpo: TpoResult | null | undefined, price: number, asset: string): PatternDetail | null {
+  if (!tpo || tpo.poc === null) return null
+  const direction: 'bullish' | 'bearish' | 'neutral' = price > tpo.poc ? 'bullish' : price < tpo.poc ? 'bearish' : 'neutral'
+  const insideVA = tpo.valueAreaHigh !== null && tpo.valueAreaLow !== null && price <= tpo.valueAreaHigh && price >= tpo.valueAreaLow
+  const insideIB = tpo.ibHigh !== null && tpo.ibLow !== null && price <= tpo.ibHigh && price >= tpo.ibLow
+  const reliability = insideVA ? 1 : insideIB ? 2 : 3
+  const where = direction === 'neutral' ? 'at POC' : direction === 'bullish' ? 'above POC' : 'below POC'
+  const context = insideVA ? 'inside value area' : insideIB ? 'outside value area' : 'outside value area, IB break'
+  return { text: `Price ${where} ${fmtPrice(tpo.poc, asset)} · ${context}`, direction, reliability }
 }
 
 export default function PairSignalPanel({
@@ -56,7 +73,7 @@ export default function PairSignalPanel({
    * top candle/HA pattern chip would show (see patternHitDetail) - for a
    * caller that wants to mirror that hover info somewhere else without
    * this panel's own rendering changing at all. */
-  onDetail?: (d: { candle: PatternDetail | null; ha: PatternDetail | null }) => void
+  onDetail?: (d: { candle: PatternDetail | null; ha: PatternDetail | null; poc: PatternDetail | null }) => void
 }) {
   const controlled = controlledAsset !== undefined
   const [asset, setAsset] = useState(controlledAsset ?? 'EURUSD')
@@ -87,7 +104,19 @@ export default function PairSignalPanel({
             onDetail?.({
               candle: patternHitDetail(d.side.fit?.patterns[0]),
               ha: patternHitDetail(d.side.fit?.haPatterns[0]),
+              poc: null,
             })
+            if (onDetail) {
+              getTpoProfile(asset, tf, { limit: 400 })
+                .then((tpo) => {
+                  onDetail({
+                    candle: patternHitDetail(d.side.fit?.patterns[0]),
+                    ha: patternHitDetail(d.side.fit?.haPatterns[0]),
+                    poc: tpoPocDetail(tpo, d.side.price, asset),
+                  })
+                })
+                .catch(() => {})
+            }
           }
         })
         .catch((err: Error) => setError(err.message.slice(0, 180)))
