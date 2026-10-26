@@ -720,6 +720,12 @@ export interface TriangulationScanRow {
   open: boolean
   direction: 'call' | 'put' | null
   qualifies: boolean
+  /** How many consecutive closed bars (counting this one) the same
+   * direction has qualified - 1 = just crossed this bar, 0 = not currently
+   * qualifying. Lets the panel tell a fresh divergence apart from one
+   * that's simply been sitting there a while (index.ts's scanTriangulation,
+   * same backward-walk idea as analytics/edge.ts's evalWithEdge). */
+  ageBars: number
 }
 
 export interface TriangulationScanResponse {

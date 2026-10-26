@@ -54,12 +54,20 @@ function TriangulationCard({ r, onSelectAsset }: { r: TriangulationScanRow; onSe
             closed
           </span>
         )}
-        {r.qualifies && (
+        {r.qualifies && r.ageBars <= 1 && (
+          <span
+            className="animate-pulse rounded border border-teal-400/60 bg-teal-500/20 px-1 py-px font-mono text-[8px] font-bold uppercase text-teal-200"
+            title="|z| just crossed the divergence-is-unusual threshold this bar - the freshest reads here"
+          >
+            fresh
+          </span>
+        )}
+        {r.qualifies && r.ageBars > 1 && (
           <span
             className="rounded border border-teal-500/40 bg-teal-500/10 px-1 py-px font-mono text-[8px] font-bold uppercase text-teal-300"
-            title="|z| clears the divergence-is-unusual threshold"
+            title={`|z| has cleared the divergence-is-unusual threshold for ${r.ageBars}+ bars straight - a persistent basis drift on this mirrored feed, not a brand-new signal`}
           >
-            qualifies
+            held {r.ageBars}b
           </span>
         )}
         <span className="ml-auto font-mono text-[9px] text-[#7c8aa5]">{fmtPrice(r.price, r.cross)}</span>
@@ -188,8 +196,10 @@ export default function TriangulationPanel({
           <p className="px-1 pt-1 text-[8.5px] leading-relaxed text-[#3d4d66]">
             Synthetic cross = leg A/B x leg B/C, chained through the shared currency. Δ is how far the real cross pair sits
             from that synthetic value right now; z is how unusual that gap is against its own recent rolling history (the
-            basis is expected to oscillate near 0, not drift). <span className="text-teal-400/80">qualifies</span> marks the
-            triangles worth a look. Backtestable in the Lab as &quot;Triangulation Arbitrage&quot; - the Single-Run/Optimizer/
+            basis is expected to oscillate near 0, not drift). <span className="text-teal-200">fresh</span> marks a
+            divergence that just crossed the threshold THIS bar; <span className="text-teal-400/80">held Nb</span> means it's
+            been qualifying for N+ bars straight - still real (a persistent basis drift on this mirrored feed), just not a
+            new event to react to. Backtestable in the Lab as &quot;Triangulation Arbitrage&quot; - the Single-Run/Optimizer/
             Walk-Forward/Asset-Sweep engines fetch both other legs for you when this asset is the cross side of a known
             triangle. Click a card to open the cross pair.
           </p>

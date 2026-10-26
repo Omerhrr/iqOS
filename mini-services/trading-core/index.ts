@@ -401,11 +401,23 @@ interface TriangulationScanRow {
    * being unusual against its own recent history, not just nonzero (the
    * basis is essentially never exactly 0 bar-to-bar). */
   qualifies: boolean
+  /** How many consecutive closed bars (counting this one) the SAME direction
+   * has qualified, walked backward by re-fitting on shrinking windows - same
+   * idea as analytics/edge.ts's evalWithEdge ageBars, computed locally here
+   * since this scan isn't bar-by-bar strategy evaluation. 1 = this bar is
+   * the fresh cross; 0 when not currently qualifying. Capped at
+   * TRIANGULATION_MAX_AGE_BARS+1 ("held 20+ bars" tells the same story as
+   * "held 40 bars" and every extra step costs a full re-fit. Lets the panel
+   * tell a just-crossed divergence apart from one that's been sitting there
+   * a while (a real, persistent basis drift on this mirrored feed, not a
+   * stuck reading). */
+  ageBars: number
 }
 const triangulationScanCache = new Map<Timeframe, { ts: number; rows: TriangulationScanRow[] }>()
 // triangle roster only depends on which FX tickers exist, not on price - safe
 // to compute once and reuse across every scan/tf
 let triangleCandidates: TriangleCandidate[] | null = null
+const TRIANGULATION_MAX_AGE_BARS = 20
 
 function scanTriangulation(market: MarketDataService, tfv: Timeframe): TriangulationScanRow[] {
   const cached = triangulationScanCache.get(tfv)
@@ -439,6 +451,33 @@ function scanTriangulation(market: MarketDataService, tfv: Timeframe): Triangula
       if (!fit) continue
       const crossInfo = byTicker.get(tri.cross.ticker)
       const qualifies = Math.abs(fit.z) >= TRIANGULATION_Z_ENTRY
+      const direction: 'call' | 'put' | null = fit.z >= TRIANGULATION_Z_ENTRY ? 'put' : fit.z <= -TRIANGULATION_Z_ENTRY ? 'call' : null
+      // ageBars: walk backward, re-fitting on progressively shorter slices,
+      // counting consecutive bars the SAME direction has qualified. Stops at
+      // the first bar that lapses, flips, or runs out of window - exactly
+      // evalWithEdge's backward walk, just against fitTriangulation instead
+      // of a strategy evaluate.
+      let ageBars = 0
+      if (qualifies && direction) {
+        ageBars = 1
+        for (let k = 1; k <= TRIANGULATION_MAX_AGE_BARS; k++) {
+          const trimmed = abCloses.length - k
+          if (trimmed < TRIANGULATION_WINDOW) break
+          const prior = fitTriangulation(
+            abCloses.slice(0, trimmed),
+            bcCloses.slice(0, trimmed),
+            acCloses.slice(0, trimmed),
+            tri.legAB.invert,
+            tri.legBC.invert,
+            tri.cross.invert,
+            TRIANGULATION_WINDOW,
+          )
+          if (!prior) break
+          const priorDir: 'call' | 'put' | null = prior.z >= TRIANGULATION_Z_ENTRY ? 'put' : prior.z <= -TRIANGULATION_Z_ENTRY ? 'call' : null
+          if (priorDir !== direction) break
+          ageBars++
+        }
+      }
       rows.push({
         currencies: tri.currencies.join('/'),
         legAB: tri.legAB.ticker,
@@ -451,14 +490,19 @@ function scanTriangulation(market: MarketDataService, tfv: Timeframe): Triangula
         n: fit.n,
         otc: !!crossInfo?.otc,
         open: !!crossInfo?.open,
-        direction: fit.z >= TRIANGULATION_Z_ENTRY ? 'put' : fit.z <= -TRIANGULATION_Z_ENTRY ? 'call' : null,
+        direction,
         qualifies,
+        ageBars,
       })
     } catch {
       /* one bad triangle never breaks the scan */
     }
   }
-  rows.sort((x, y) => Number(y.qualifies) - Number(x.qualifies) || Math.abs(y.z) - Math.abs(x.z))
+  // fresh crosses first (ageBars 1), then by how unusual the basis is -
+  // a triangle that's been qualifying for 40 bars is real information (a
+  // persistent drift on this mirrored feed) but isn't the thing to react to
+  // right now the way a just-crossed one is.
+  rows.sort((x, y) => Number(y.qualifies) - Number(x.qualifies) || x.ageBars - y.ageBars || Math.abs(y.z) - Math.abs(x.z))
   triangulationScanCache.set(tfv, { ts: Date.now(), rows })
   return rows
 }

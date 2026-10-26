@@ -1917,6 +1917,68 @@ export const STRATEGIES: StrategyDef[] = [
     },
   },
   {
+    id: 'poc-triple-confirm',
+    name: 'POC + Candle 3/3 + HA 3/3 (Triple Confirm)',
+    description:
+      'The strictest confirmation gate in the catalog: trades ONLY when all three independent reads the Pair Signal header strip shows agree on direction AND each one is at its own strongest tier. Candle pattern: the most recent hit (analytics/patterns.ts, same detectors as every other pattern strategy) must be reliability 3/3. Heikin Ashi pattern: the same detectors re-run against the HA transform (fit.haPatterns) must ALSO read reliability 3/3. TPO POC (analytics/tpo.ts): price must sit outside BOTH the 70% value area AND the Initial Balance - the "IB break" tier, the same one that earns the ▲/▼ arrow in the header strip. All three must point the same way; any one disagreeing or sitting at a lower tier stands this strategy aside. Expect this to trade rarely - that is the point, not a bug.',
+    params: [
+      { key: 'adxLookback', label: 'Pattern scan lookback (bars)', type: 'number', min: 3, max: 20, default: 8 },
+      { key: 'tpoWindow', label: 'TPO profile window (candles)', type: 'number', min: 60, max: 400, default: 200 },
+      { key: 'periodSec', label: 'TPO bracket (seconds)', type: 'number', min: 300, max: 86400, step: 300, default: 1800 },
+    ],
+    evaluate: (candles, p) => {
+      const fit = fitAdxPatternBias(candles, 14, num(p, 'adxLookback', 8))
+      if (!fit) return { direction: 'none', score: 0, notes: 'thin history - not enough bars for pattern detection' }
+      const topCandle = fit.patterns[0]
+      const topHa = fit.haPatterns[0]
+      if (!topCandle || topCandle.direction === 'neutral') {
+        return { direction: 'none', score: 0, notes: 'no directional candle pattern hit' }
+      }
+      if (topCandle.reliability < 3) {
+        return { direction: 'none', score: 0, notes: `top candle pattern "${topCandle.name}" only reliability ${topCandle.reliability}/3 - needs 3/3` }
+      }
+      if (!topHa || topHa.direction === 'neutral') {
+        return { direction: 'none', score: 0, notes: 'no directional HA pattern hit' }
+      }
+      if (topHa.reliability < 3) {
+        return { direction: 'none', score: 0, notes: `top HA pattern "${topHa.name}" only reliability ${topHa.reliability}/3 - needs 3/3` }
+      }
+      if (topHa.direction !== topCandle.direction) {
+        return { direction: 'none', score: 0, notes: `candle pattern (${topCandle.direction}) and HA pattern (${topHa.direction}) disagree` }
+      }
+
+      const win = Math.min(candles.length, Math.round(num(p, 'tpoWindow', 200)))
+      if (win < 40) return { direction: 'none', score: 0, notes: 'warming up (<40 bars for TPO profile)' }
+      const tpo = computeTpo(candles.slice(-win), { periodSec: num(p, 'periodSec', 1800) })
+      if (tpo.poc === null || tpo.valueAreaHigh === null || tpo.valueAreaLow === null || tpo.ibHigh === null || tpo.ibLow === null) {
+        return { direction: 'none', score: 0, notes: 'no TPO profile yet' }
+      }
+      const price = candles[candles.length - 1].close
+      const insideVA = price <= tpo.valueAreaHigh && price >= tpo.valueAreaLow
+      const insideIB = price <= tpo.ibHigh && price >= tpo.ibLow
+      if (insideVA || insideIB) {
+        return { direction: 'none', score: 0, notes: `price still ${insideVA ? 'inside value area' : 'inside Initial Balance'} vs POC - needs a clean IB break (3/3) to match the patterns` }
+      }
+      const pocDirection: 'bullish' | 'bearish' = price > tpo.poc ? 'bullish' : 'bearish'
+      if (pocDirection !== topCandle.direction) {
+        return { direction: 'none', score: 0, notes: `price trading ${pocDirection} of POC but patterns read ${topCandle.direction} - all three must agree` }
+      }
+
+      const dir = topCandle.direction === 'bullish' ? 'call' : 'put'
+      // every gate above is a hard pass/fail at its strongest tier already -
+      // score reflects how far outside the IB price has pushed, not whether
+      // to trade at all.
+      const ibSpan = Math.max(1e-9, tpo.ibHigh - tpo.ibLow)
+      const ibBreakPct = pocDirection === 'bullish' ? (price - tpo.ibHigh) / ibSpan : (tpo.ibLow - price) / ibSpan
+      const score = clamp(80 + ibBreakPct * 40, 80, 97)
+      return {
+        direction: dir,
+        score,
+        notes: `candle "${topCandle.name}" 3/3 + HA "${topHa.name}" 3/3 + POC ${pocDirection} IB break (${(ibBreakPct * 100).toFixed(0)}% past IB) - all three agree`,
+      }
+    },
+  },
+  {
     id: 'shock-pressure',
     name: 'Shock + Pressure',
     description:
