@@ -771,7 +771,7 @@ export default function OSPage() {
       setTf(t)
       try {
         localStorage.setItem('iqos.asset', a)
-        localStorage.setItem('iqos.tf', t)
+        localStorage.setItem('iqos.tf.v2', t)
       } catch {
         /* private mode - non-fatal */
       }
@@ -781,11 +781,15 @@ export default function OSPage() {
   )
 
   // restore the last selected pair/timeframe after a page refresh - without
-  // this every reload snapped back to EURUSD 1m
+  // this every reload snapped back to EURUSD 1m. tf uses a bumped storage
+  // key ('.v2') so a one-time migration drops whatever was saved under the
+  // old 'iqos.tf' key (a stale 5m that had been sticking across reloads) -
+  // this one load falls back to the component's own 1m default, and every
+  // pick from here on is remembered under the new key exactly as before.
   useEffect(() => {
     try {
       const savedAsset = localStorage.getItem('iqos.asset')
-      const savedTf = localStorage.getItem('iqos.tf') as Timeframe | null
+      const savedTf = localStorage.getItem('iqos.tf.v2') as Timeframe | null
       if (savedTf && (TF_VALUES as readonly string[]).includes(savedTf)) setTf(savedTf)
       if (savedAsset) {
         setAsset(savedAsset)
