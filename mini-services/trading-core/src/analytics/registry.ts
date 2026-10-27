@@ -55,6 +55,38 @@ const p = (key: string, label: string, min: number, max: number, dflt: number, s
   default: dflt,
 })
 
+// ============================ ZERO-LAG HMA STACK ============================
+// "Filtered Zero-Lag HMA Dashboard" - reconstructed from a screenshot of a
+// third-party chart overlay (no public spec found): a fast/medium/slow Hull
+// MA trio, each further de-lagged with the classic error-correction trick
+// (EC = HMA + (HMA - HMA[lag])), rendered as price-scale lines on the chart
+// AND reduced to a sparse per-bar dashboard: a block fires only when the
+// fast ZLHMA crosses the medium one AND that cross agrees with the slow
+// ZLHMA's own slope - the slow line "filters" crosses that go against the
+// bigger trend, so most bars sit empty and only confirmed flips light up.
+function zeroLagHma(src: number[], len: number): number[] {
+  const base = TA.hma(src, len)
+  const lag = Math.max(1, Math.round(Math.sqrt(len) / 2))
+  return base.map((v, i) => (isn(v) && i >= lag && isn(base[i - lag]) ? v + (v - base[i - lag]) : NaN))
+}
+
+function zlhmaStack(cl: number[], fastLen: number, medLen: number, slowLen: number) {
+  const fast = zeroLagHma(cl, fastLen)
+  const medium = zeroLagHma(cl, medLen)
+  const slow = zeroLagHma(cl, slowLen)
+  const signal = new Array<number>(cl.length).fill(NaN)
+  for (let i = 1; i < cl.length; i++) {
+    if (!isn(fast[i]) || !isn(fast[i - 1]) || !isn(medium[i]) || !isn(medium[i - 1]) || !isn(slow[i]) || !isn(slow[i - 1])) continue
+    const crossUp = fast[i - 1] <= medium[i - 1] && fast[i] > medium[i]
+    const crossDown = fast[i - 1] >= medium[i - 1] && fast[i] < medium[i]
+    const slowUp = slow[i] > slow[i - 1]
+    const slowDown = slow[i] < slow[i - 1]
+    if (crossUp && slowUp) signal[i] = 1
+    else if (crossDown && slowDown) signal[i] = -1
+  }
+  return { fast, medium, slow, signal }
+}
+
 // ============================ OVERLAP ============================
 
 const overlap: IndicatorDef[] = [
@@ -1354,7 +1386,35 @@ const structuralIndicators: IndicatorDef[] = [
   },
 ]
 
-export const REGISTRY: IndicatorDef[] = [...overlap, ...momentum, ...volume, ...volatility, ...trend, ...statistic, ...extras, ...extras2, ...vskIndicators, ...tskIndicators, ...structuralIndicators]
+const zlhmaIndicators: IndicatorDef[] = [
+  {
+    id: 'zlhma-lines', name: 'Zero-Lag HMA (Fast/Med/Slow)', category: 'overlap', pane: 'overlay',
+    params: [p('fast', 'Fast', 2, 50, 5), p('medium', 'Medium', 4, 100, 12), p('slow', 'Slow', 8, 200, 25)],
+    description: 'Three Zero-Lag Hull MAs plotted on price (fast/medium/slow) - the overlay half of the Filtered Zero-Lag HMA Dashboard. Pair with the sub-pane of the same name for the filtered flip dashboard.',
+    compute: (c, par) => {
+      const s = zlhmaStack(TA.closes(c), Math.max(2, Math.round(num(c, par, 'fast', 5))), Math.max(4, Math.round(num(c, par, 'medium', 12))), Math.max(8, Math.round(num(c, par, 'slow', 25))))
+      return {
+        lines: [line('fast', C.cyan, s.fast, 'solid', 2), line('medium', C.violet, s.medium), line('slow', C.slate, s.slow, 'dashed')],
+        note: 'cyan = fast ZLHMA · violet = medium · grey dashed = slow (the filter line)',
+      }
+    },
+  },
+  {
+    id: 'zlhma-dashboard', name: 'Filtered Zero-Lag HMA Dashboard', category: 'momentum', pane: 'sub',
+    params: [p('fast', 'Fast', 2, 50, 5), p('medium', 'Medium', 4, 100, 12), p('slow', 'Slow', 8, 200, 25)],
+    description: 'Per-bar dashboard: a block fires only when the fast Zero-Lag HMA crosses the medium one AND that cross agrees with the slow ZLHMA\'s own slope (the slow line filters out crosses against the bigger trend) - green = filtered bull flip, red = filtered bear flip, empty = no confirmed flip this bar. Defaults 5/12/25.',
+    compute: (c, par) => {
+      const s = zlhmaStack(TA.closes(c), Math.max(2, Math.round(num(c, par, 'fast', 5))), Math.max(4, Math.round(num(c, par, 'medium', 12))), Math.max(8, Math.round(num(c, par, 'slow', 25))))
+      return {
+        lines: [],
+        hist: { values: s.signal, color: 'updown' },
+        note: 'green block = filtered bull flip (fast x medium, with-slow-trend) · red = filtered bear flip · empty = no confirmed flip',
+      }
+    },
+  },
+]
+
+export const REGISTRY: IndicatorDef[] = [...overlap, ...momentum, ...volume, ...volatility, ...trend, ...statistic, ...extras, ...extras2, ...vskIndicators, ...tskIndicators, ...structuralIndicators, ...zlhmaIndicators]
 
 const REGISTRY_MAP = new Map(REGISTRY.map((d) => [d.id, d]))
 

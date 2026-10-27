@@ -1533,6 +1533,8 @@ function AutoTraderStrip({
                   ? `PAIR-SIG·composite≥3.5+HA/Δ`
                   : at.config.signalSource === 'shock-pressure'
                   ? `SHOCK+PRES·composite≥3.5`
+                  : at.config.signalSource === 'poc-triple-confirm'
+                  ? `POC·3/3+IB`
                   : at.config.signalSource === 'chartsignals'
                     ? `CHART-SIG·agree≥4`
                     : at.config.signalSource === 'leadlag'
@@ -1865,6 +1867,7 @@ function AutoTraderDialog({
                   ['adx-pattern-bias', 'ADX/DI+Pattern'],
                   ['pair-signal', 'Pair Signal'],
                   ['shock-pressure', 'Shock+Pressure'],
+                  ['poc-triple-confirm', 'POC Triple-Confirm'],
                   ['strategy', 'Strategy'],
                 ] as const
               ).map(([v, label]) => (
@@ -1895,6 +1898,8 @@ function AutoTraderDialog({
                           ? 'the Pair Signal panel\'s own read, as an auto-trader source: the same agreement-gated ADX/DI + pattern bias composite as ADX/DI+Pattern, with the identical pattern detectors also run against the Heikin Ashi transform of the series and the trailing per-candle buy/sell delta (footprint.ts CLV-proxy) layered on as score/confidence adjustments and ranking tie-breakers - qualification still gates on the base composite alone'
                           : d.signalSource === 'shock-pressure'
                           ? 'combines a sudden ATR-normalized "shock" on the latest bar with net buy/sell pressure built up over the prior few bars (candle-level CLV approximation, no real order book) into one agreement-gated composite - trades only when a real shock just happened and the pressure already building agrees with its direction'
+                          : d.signalSource === 'poc-triple-confirm'
+                            ? 'triple-confirmation: top candle pattern reliability 3/3, top Heikin-Ashi pattern reliability 3/3 agreeing in the same direction, AND price pushed outside both the TPO value area and the Initial Balance in that direction (POC-relative) - all three must agree before it qualifies, run standalone with its own fresh-edge gating so it doesn\'t fire repeatedly while the condition holds'
                           : d.signalSource === 'strategy'
                         ? 'one specific strategy picked below, or several combined - as a vote (ENSEMBLE) or an AUTO-LEARN pool that trades whichever member is proven best per pair - the same strategyId an autopilot bot would use (a builtin strategy, or an AI Lab-learned "(Lab)" spec), not pinned to one bot\'s watchlist'
                         : ''}
