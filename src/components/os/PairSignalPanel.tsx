@@ -17,8 +17,8 @@
 // controlled: no input box, no manual "read", it just tracks that asset and
 // re-fetches the moment it changes, same as every other asset-bound panel.
 import { useCallback, useEffect, useState } from 'react'
-import type { PairSignalResponse, Timeframe, TpoResult } from '@/lib/os/client'
-import { fmtPrice, getPairSignal, getTpoProfile } from '@/lib/os/client'
+import type { AdxPatternBiasFit, PairCompareDelta, PairSignalResponse, Timeframe, TpoResult } from '@/lib/os/client'
+import { fmtPrice, getKalmanOuZ, getPairSignal, getTpoProfile } from '@/lib/os/client'
 import { SideCard } from './PairComparePanel'
 
 const POLL_MS = 10_000
@@ -55,6 +55,45 @@ function tpoPocDetail(tpo: TpoResult | null | undefined, price: number, asset: s
   return { text: `Price ${where} ${fmtPrice(tpo.poc, asset)} · ${context}`, direction, reliability }
 }
 
+/** Kalman/OU stretch (analytics/kalman.ts's ouSeries, same z the "Kalman OU
+ * Z" sub-pane plots): how many σ price sits off its own fitted OU
+ * equilibrium. A real stretch is a MEAN-REVERSION read - price pushed above
+ * equilibrium (z > 0) leans bearish (expected to revert down), pushed below
+ * (z < 0) leans bullish - the opposite sign convention from the candle/HA/
+ * POC breakout reads above it, which is exactly the point of showing it
+ * alongside them. */
+function kalmanOuDetail(z: number | null): PatternDetail | null {
+  if (z === null || !Number.isFinite(z)) return null
+  const direction: 'bullish' | 'bearish' | 'neutral' = z <= -0.25 ? 'bullish' : z >= 0.25 ? 'bearish' : 'neutral'
+  const reliability = Math.abs(z) >= 2.5 ? 3 : Math.abs(z) >= 1.5 ? 2 : 1
+  const read = direction === 'neutral' ? 'near equilibrium' : direction === 'bullish' ? 'stretched below - reversion up' : 'stretched above - reversion down'
+  return { text: `OU z ${z >= 0 ? '+' : ''}${z.toFixed(2)} · ${read}`, direction, reliability }
+}
+
+/** ADX/DI trend read (analytics/adxpatternbias.ts's fit - same adx/+DI/-DI
+ * the ADX+Pattern/Pair Signal composite already gates on), standalone here:
+ * direction off which DI line leads, reliability off ADX's own strength
+ * tiers (no trend / developing / strong). */
+function adxDiDetail(fit: AdxPatternBiasFit | null | undefined): PatternDetail | null {
+  if (!fit) return null
+  const direction = fit.adxDirection
+  const reliability = fit.adx >= 35 ? 3 : fit.adx >= 20 ? 2 : 1
+  const rel = fit.plusDI > fit.minusDI ? '+DI>-DI' : fit.minusDI > fit.plusDI ? '-DI>+DI' : '+DI=-DI'
+  const strength = fit.adx >= 35 ? 'strong trend' : fit.adx >= 20 ? 'developing trend' : 'no trend'
+  return { text: `ADX ${fit.adx.toFixed(1)} ${rel} · ${strength}`, direction, reliability }
+}
+
+/** Latest closed candle's buy-sell delta (footprint.ts CLV-proxy, same
+ * array the SideCard's own delta strip renders) - most recent entry only,
+ * as a fourth quick read alongside Kalman/OU and ADX/DI. */
+function deltaDetail(delta: PairCompareDelta[] | undefined): PatternDetail | null {
+  if (!delta?.length) return null
+  const last = delta[delta.length - 1]
+  const direction: 'bullish' | 'bearish' | 'neutral' = last.delta > 0 ? 'bullish' : last.delta < 0 ? 'bearish' : 'neutral'
+  const reliability: 1 | 2 | 3 = last.delta === 0 ? 1 : 3
+  return { text: `Δ ${last.delta >= 0 ? '+' : ''}${last.delta.toFixed(1)} this candle`, direction, reliability }
+}
+
 export default function PairSignalPanel({
   onClose,
   tf,
@@ -73,7 +112,14 @@ export default function PairSignalPanel({
    * top candle/HA pattern chip would show (see patternHitDetail) - for a
    * caller that wants to mirror that hover info somewhere else without
    * this panel's own rendering changing at all. */
-  onDetail?: (d: { candle: PatternDetail | null; ha: PatternDetail | null; poc: PatternDetail | null }) => void
+  onDetail?: (d: {
+    candle: PatternDetail | null
+    ha: PatternDetail | null
+    poc: PatternDetail | null
+    ou: PatternDetail | null
+    adx: PatternDetail | null
+    delta: PatternDetail | null
+  }) => void
 }) {
   const controlled = controlledAsset !== undefined
   const [asset, setAsset] = useState(controlledAsset ?? 'EURUSD')
@@ -105,14 +151,20 @@ export default function PairSignalPanel({
               candle: patternHitDetail(d.side.fit?.patterns[0]),
               ha: patternHitDetail(d.side.fit?.haPatterns[0]),
               poc: null,
+              ou: null,
+              adx: adxDiDetail(d.side.fit),
+              delta: deltaDetail(d.side.delta),
             })
             if (onDetail) {
-              getTpoProfile(asset, tf, { limit: 400 })
-                .then((tpo) => {
+              Promise.all([getTpoProfile(asset, tf, { limit: 400 }), getKalmanOuZ(asset, tf)])
+                .then(([tpo, ouZ]) => {
                   onDetail({
                     candle: patternHitDetail(d.side.fit?.patterns[0]),
                     ha: patternHitDetail(d.side.fit?.haPatterns[0]),
                     poc: tpoPocDetail(tpo, d.side.price, asset),
+                    ou: kalmanOuDetail(ouZ),
+                    adx: adxDiDetail(d.side.fit),
+                    delta: deltaDetail(d.side.delta),
                   })
                 })
                 .catch(() => {})

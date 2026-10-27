@@ -43,6 +43,13 @@ interface Props {
   /** Where price sits vs the TPO POC (analytics/tpo.ts) - same treatment,
    * a third "something interesting" read alongside the candle/HA ones. */
   pocDetail?: PatternDetail | null
+  /** Second detail row, below the candle/HA/POC one: Kalman/OU stretch
+   * z-score, the standalone ADX/DI trend read and the latest candle's
+   * buy-sell delta - same PatternDetail shape/treatment, just a different
+   * trio of "what's happening right now" reads. */
+  ouDetail?: PatternDetail | null
+  adxDetail?: PatternDetail | null
+  deltaDetail?: PatternDetail | null
 }
 
 function detailColor(d: PatternDetail): string {
@@ -218,6 +225,13 @@ export default function MenuBar(props: Props) {
         {props.pocDetail && <DetailLine d={props.pocDetail} grow={false} />}
         {props.candleDetail && <DetailLine d={props.candleDetail} />}
         {props.haDetail && <DetailLine d={props.haDetail} />}
+      </div>
+    )}
+    {(props.ouDetail || props.adxDetail || props.deltaDetail) && (
+      <div className="flex items-center gap-4 border-t border-[#131c2b] px-3 py-1">
+        {props.ouDetail && <DetailLine d={props.ouDetail} grow={false} />}
+        {props.adxDetail && <DetailLine d={props.adxDetail} />}
+        {props.deltaDetail && <DetailLine d={props.deltaDetail} grow={false} />}
       </div>
     )}
     </div>

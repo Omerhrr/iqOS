@@ -1330,6 +1330,27 @@ export async function getDelta(asset: string, tf: Timeframe, opts?: { limit?: nu
   return { deltas: d.deltas, cumulative: d.cumulative }
 }
 
+/** Latest Kalman/OU stretch z-score for one asset - thin wrapper over the
+ * generic /indicator endpoint + the 'kalman-ou-z' registry entry
+ * (analytics/kalman.ts's ouSeries), just the last finite value instead of
+ * the full series a SubPane would render. Returns null when the feed is too
+ * short to fit an OU model yet. */
+export async function getKalmanOuZ(asset: string, tf: Timeframe, window = 240): Promise<number | null> {
+  const d = await osGet<{ ok: boolean; series: { lines: { key: string; values: (number | null)[] }[] } }>('/indicator', {
+    id: 'kalman-ou-z',
+    asset,
+    tf,
+    p_window: window,
+  })
+  const z = d.series.lines.find((l) => l.key === 'z')
+  if (!z) return null
+  for (let i = z.values.length - 1; i >= 0; i--) {
+    const v = z.values[i]
+    if (v !== null && Number.isFinite(v)) return v
+  }
+  return null
+}
+
 // ---------- randomness audit (descriptive feed statistics) ----------
 // Characterizes an OTC feed's empirical behavior - step size, return
 // volatility/skew/kurtosis, update cadence. Purely descriptive: this is
