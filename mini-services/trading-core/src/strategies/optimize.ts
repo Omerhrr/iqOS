@@ -129,6 +129,7 @@ export interface SweepResult {
 // converge quickly. Used to pick the evaluation window and fold sizes.
 function strategyWarmup(id: string): number {
   if (id === 'markov-edge' || id === 'confluence-core' || id === 'confluence-full') return 560
+  if (id === 'oracle-fusion') return 400 // ORACLE_MIN_CANDLES 320 + markov/OU/confluence slack
   if (id === 'mtf-alignment') return 340 // needs ~25 resampled 15x bars -> 375 raw bars, plus slack
   if (id === 'garch-vol-expansion') return 320 // window default 300 + slack
   if (id === 'vol-squeeze-breakout') return 130 // squeezeLookback default 100 + armWindow + slack

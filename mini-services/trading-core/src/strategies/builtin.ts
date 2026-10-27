@@ -27,6 +27,7 @@ import { computeVolArb, VOLARB_DEFAULT_WINDOW } from '../analytics/volarb'
 import { fitTriangulation, TRIANGULATION_WINDOW, TRIANGULATION_MIN_WINDOW, TRIANGULATION_Z_ENTRY } from '../analytics/triangulation'
 import { fitAdxPatternBias, ADX_TREND_THRESHOLD, COMPOSITE_QUALIFY } from '../analytics/adxpatternbias'
 import { fitShockPressure, SHOCK_RATIO_THRESHOLD, PRESSURE_LOOKBACK, SHOCKPRESSURE_COMPOSITE_QUALIFY } from '../analytics/shockpressure'
+import { predictNextCandle, applyCalibrationDiscount, oracleCalibrationFor, ORACLE_MIN_CANDLES, ORACLE_EVAL_WINDOW } from '../analytics/nextcandle'
 
 const last = (arr: number[]): number => {
   for (let i = arr.length - 1; i >= 0; i--) if (Number.isFinite(arr[i])) return arr[i]
@@ -2015,6 +2016,91 @@ export const STRATEGIES: StrategyDef[] = [
     },
   },
 ]
+
+// ---------------------------------------------------------------------------
+// Next-Candle Oracle Fusion - the research battery's "confluence beats single
+// signals" law as a tradeable strategy. The RAW fused read (7-model P(up)
+// fusion, regime-adaptive weights) is memoized per (asset, tf, last bar,
+// window shape, model-shape params): backtests + evalWithEdge's held-walk
+// re-evaluate the same bar many times, and each oracle eval costs a full
+// fusion. The memo caches ONLY the raw read; the confidence gates (and the
+// honesty-loop discount, which moves as the ledger resolves) are applied
+// fresh on every eval, so gate params stay sweepable at near-zero cost.
+interface OracleRawRead {
+  pUp: number
+  rawConfidence: number
+  regime: string
+  drivers: number
+}
+const oracleMemo = new Map<string, OracleRawRead>()
+
+const ORACLE_FUSION: StrategyDef = {
+  id: 'oracle-fusion',
+  name: 'Next-Candle Oracle Fusion',
+  description:
+    'Trades the kernel\'s fused next-candle forecast: 7 directional models (Markov, Monte Carlo, Kalman/OU, 14-factor confluence, chart committee, candle patterns, bar physics) fused in log-odds space with regime-adaptive weights. The gates ARE the params - min calibrated confidence + min P(up) edge - so the autopilot\'s own minScore applies on top. Live evals inherit the oracle panel\'s honesty-loop discount.',
+  params: [
+    { key: 'minConfidence', label: 'Min confidence %', type: 'number', min: 0, max: 95, default: 55 },
+    { key: 'minEdge', label: 'Min P(up) edge (pp)', type: 'number', min: 0, max: 40, default: 5 },
+    { key: 'mcSims', label: 'Monte Carlo paths', type: 'number', min: 100, max: 2000, default: 400 },
+    { key: 'committee', label: 'Chart committee (1 on / 0 off)', type: 'number', min: 0, max: 1, default: 1 },
+    { key: 'useCalibration', label: 'Honesty-loop discount (1 on / 0 off)', type: 'number', min: 0, max: 1, default: 1 },
+  ],
+  evaluate: (candles, p, hints) => {
+    if (candles.length < ORACLE_MIN_CANDLES) {
+      return { direction: 'none', score: 0, notes: `oracle warming up: ${candles.length}/${ORACLE_MIN_CANDLES} closed bars` }
+    }
+    const asset = hints?.asset ?? 'unknown'
+    const tf = hints?.tf ?? ''
+    const mcSims = Math.round(num(p, 'mcSims', 400))
+    const committee = num(p, 'committee', 1) >= 0.5
+    const useCal = num(p, 'useCalibration', 1) >= 0.5
+    // constant-cost window: every model inside reads <=300 bars, so the
+    // 520-bar tail is bit-identical input to a 1500-bar feed (see
+    // ORACLE_EVAL_WINDOW in analytics/nextcandle.ts)
+    const window = candles.length > ORACLE_EVAL_WINDOW ? candles.slice(-ORACLE_EVAL_WINDOW) : candles
+    const lastT = window[window.length - 1].time
+    // the window's CONTENT is determined by its last bar's open time unless
+    // the slice is shorter than the cap (backtest warmup + evalWithEdge's
+    // one-bar-dropped prev passes) - the length disambiguates those
+    const key = `${asset}|${tf}|${lastT}|${window.length < ORACLE_EVAL_WINDOW ? window.length : 'full'}|${mcSims}|${committee ? 1 : 0}`
+    let raw = oracleMemo.get(key)
+    if (!raw) {
+      const pred = predictNextCandle(window, {
+        asset,
+        tf: tf || '1m',
+        mode: 'sim',
+        mcSims,
+        includeCommittee: committee,
+        calibration: null, // discount applied fresh below, never baked into the memo
+      })
+      if (!pred) return { direction: 'none', score: 0, notes: 'oracle: not enough working models on this history' }
+      raw = { pUp: pred.pUp, rawConfidence: pred.rawConfidence, regime: pred.regime, drivers: pred.driversActive }
+      if (oracleMemo.size > 30000) oracleMemo.clear()
+      oracleMemo.set(key, raw)
+    }
+    const minConf = num(p, 'minConfidence', 55)
+    const minEdge = num(p, 'minEdge', 5)
+    const edgePp = (raw.pUp - 0.5) * 100
+    const lean = raw.pUp >= 0.5 ? 'call' : 'put'
+    const conf = applyCalibrationDiscount(raw.rawConfidence, useCal ? oracleCalibrationFor(asset, tf) : null)
+    if (!Number.isFinite(edgePp) || raw.pUp <= 0 || raw.pUp >= 1) {
+      return { direction: 'none', score: 0, notes: 'oracle read degenerate - standing aside' }
+    }
+    if (Math.abs(edgePp) < minEdge) {
+      return { direction: 'none', score: 0, notes: `oracle ${lean} lean too thin: edge ${edgePp.toFixed(1)}pp < ${minEdge}pp (conf ${conf.toFixed(0)}%, ${raw.regime}, ${raw.drivers} models)` }
+    }
+    if (conf < minConf) {
+      return { direction: 'none', score: 0, notes: `oracle ${lean} conf ${conf.toFixed(0)}% < ${minConf}% gate (edge ${edgePp.toFixed(1)}pp, ${raw.regime})` }
+    }
+    return {
+      direction: lean,
+      score: Math.round(clamp(conf, 40, 95)),
+      notes: `oracle ${lean}: P(up) ${(raw.pUp * 100).toFixed(1)}%, conf ${conf.toFixed(0)}%, ${raw.regime}, ${raw.drivers} models`,
+    }
+  },
+}
+STRATEGIES.push(ORACLE_FUSION)
 
 export const getStrategy = (id: string): StrategyDef | undefined => STRATEGIES.find((s) => s.id === id)
 

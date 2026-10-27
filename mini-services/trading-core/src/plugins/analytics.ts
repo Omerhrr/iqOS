@@ -70,7 +70,7 @@ export class AnalyticsService {
     // Lab validates them fine, since this is the path bots + manual eval +
     // the auto-trader's single-shot checks all go through.
     const aux = this.auxCandles(asset, tf, strategyId, 1500, candles.length)
-    const hints = { asset, leaderCandles: aux.leaderCandles, leaderCandles2: aux.leaderCandles2 }
+    const hints = { asset, tf, leaderCandles: aux.leaderCandles, leaderCandles2: aux.leaderCandles2 }
     // Edge wrapper: the evaluate stays pure/level-shaped; the transition vs
     // the previous closed bar is classified here so every consumer (bots,
     // auto-trader, panels) can gate on "just became true" vs "already true".

@@ -237,6 +237,7 @@ export function backtest(candles: Candle[], asset: string, tf: Timeframe, opts: 
   // future relative to where the follower backtest currently stands.
   const hintsAt = (i: number) => ({
     asset,
+    tf,
     ...(opts.leaderCandles ? { leaderCandles: opts.leaderCandles.slice(0, i + 1) } : {}),
     ...(opts.leaderCandles2 ? { leaderCandles2: opts.leaderCandles2.slice(0, i + 1) } : {}),
     ...(opts.auxByStrategy ? { auxByStrategy: sliceAuxByStrategy(opts.auxByStrategy, i) } : {}),

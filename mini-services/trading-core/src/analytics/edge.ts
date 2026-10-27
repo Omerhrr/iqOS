@@ -52,9 +52,9 @@ export const MAX_AGE_BARS = 20
  * (a strategy that needs 40 candles reads 'thin history' in both passes at
  * the same real depth). */
 export function evalWithEdge(
-  evaluate: (candles: Candle[], hints?: { asset?: string }) => { direction: ConditionDir; score: number; notes: string },
+  evaluate: (candles: Candle[], hints?: { asset?: string; tf?: string }) => { direction: ConditionDir; score: number; notes: string },
   candles: Candle[],
-  hints?: { asset?: string }
+  hints?: { asset?: string; tf?: string }
 ): EdgedEval {
   const cur = evaluate(candles, hints)
   if (cur.direction === 'none') return { ...cur }

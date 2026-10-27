@@ -16,6 +16,7 @@ import type { StrategyLabService } from './lab'
 import { classifyRegime } from '../analytics/regime'
 import { classifySession } from '../analytics/session'
 import { walkForward } from '../strategies/optimize'
+import type { GlobalScanRow, GlobalScanResult } from './nextcandle'
 
 export interface BotConfig {
   id: string
@@ -82,6 +83,23 @@ export interface BotConfig {
    * (bots already have watchdog + adaptive; this is the opt-in stricter
    * tier, mirroring the auto-trader's streakBreaker). */
   streakBreaker?: boolean
+  /** UNIVERSE SWEEP (Next Global hunter): ignore the fixed watchlist entirely
+   * - once per closed candle on this bot's tf, pull the whole Next Global
+   * board (every open instrument, one fused oracle read per pair, ranked by
+   * tradability = confidence x |P(up)-0.5|) and fire on the TOP rows that
+   * clear every gate: calibrated confidence >= max(minScore, params
+   * .minConfidence), P(up) edge >= params.minEdge pp, live payout floor,
+   * direction/regime filters, OTC guard, adaptive Wilson floor, memory gate
+   * on the actual stake. A per-pair edge-trigger (sweepDir) keeps it from
+   * re-firing a direction that is still standing, and the FIRST sweep after
+   * arm only RECORDS baseline reads without trading (the same arm-time
+   * backfill the watchlist bots do) so it never enters the stale middle of a
+   * move. watchlist may be empty for sweep bots. */
+  universeSweep?: boolean
+  /** Max trades a single universe sweep may open (per candle-close bar).
+   * The board is ranked, the bot walks down it and stops at this count.
+   * Default 1 - one BEST read per bar. Clamped 1..10. */
+  sweepMaxTrades?: number
 }
 
 export interface StakePlan {
@@ -253,6 +271,20 @@ interface RuntimeState {
    * streak itself is rebuilt from the journal, so a restarted bot with a
    * live loss streak re-benches on its next settled loss, not instantly. */
   benchedUntil?: number
+  /** Universe-sweep state. sweepDir: per-asset last direction this bot
+   * actually TRADED on the board - the edge-trigger de-dup, but keyed by
+   * asset because a sweep bot faces 25 pairs at once, not one. An asset
+   * whose oracle read keeps saying the same thing is the same persisting
+   * signal, not a fresh one; it trades again only after the read lapses to
+   * none/flip or the opposite side fires. sweepBackfilled: the first sweep
+   * after (re)arm records every qualifying row's direction WITHOUT trading
+   * (whatever the board says now was already true before the bot existed).
+   * lastSweepTs: burst guard - distinct assets' bar closes can land within
+   * the same second; the sweep itself runs once per tf bar, this just keeps
+   * pathological re-entry from ever stacking. */
+  sweepDir: Map<string, 'call' | 'put'>
+  sweepBackfilled: boolean
+  lastSweepTs: number
 }
 
 export class AutopilotService {
@@ -271,6 +303,10 @@ export class AutopilotService {
   // uses, under its own key, so this doesn't need a schema migration. Default
   // ON - this has to be an explicit opt-out, never a silent default.
   private researchGateEnabled = true
+  // Universe-sweep de-dup: key "tf|barTime" -> swept. Several assets close
+  // the same tf bar within milliseconds of each other; without this, every
+  // close would re-run the whole-board sweep. Insertion-ordered, pruned.
+  private sweptBars = new Map<string, number>()
   // walk-forward is CPU-heavy - re-checks are spread across ticks rather than
   // run all at once for a fleet with many bots/assets
   private static readonly REVALIDATE_TICK_MS = 15 * 60 * 1000 // 15 min sweep cadence
@@ -310,8 +346,8 @@ export class AutopilotService {
     for (const { bot } of this.store.listBots()) this.runtime.set(bot.id, this.buildRuntime(bot.id))
 
     this.unsubscribers.push(
-      ctx.bus.on('candle', ({ asset, tf, closed }) => {
-        if (closed) void this.onCandleClose(asset, tf)
+      ctx.bus.on('candle', ({ asset, tf, candle, closed }) => {
+        if (closed) void this.onCandleClose(asset, tf, candle?.time)
       }),
       ctx.bus.on('positionOpened', ({ position }) => this.onPositionOpened(position)),
       ctx.bus.on('positionClosed', ({ position }) => this.onPositionClosed(position))
@@ -382,6 +418,25 @@ export class AutopilotService {
    * clear to arm, or a `research-gate: ...` reason string when blocked. */
   private researchGate(bot: BotConfig): string | null {
     const MAX_AGE_SEC = 14 * 24 * 60 * 60 // 14 days - a stale pass doesn't mean much. v.ts is UNIX SECONDS (store.ts), not ms.
+    // UNIVERSE-SWEEP branch: a sweep bot trades whatever pairs the Next Global
+    // board surfaces bar by bar - a fixed watchlist (and its per-asset
+    // verdicts) doesn't exist. The honest bar it CAN meet: this exact strategy
+    // has a recent ROBUST walk-forward verdict on ANY pair at this bot's tf
+    // (for oracle-fusion that's the pair the operator validated the fusion on;
+    // the board's per-pair honesty records + the adaptive gate cover the rest
+    // live). custom:* sweeps go through the lab's own holdout gate instead.
+    if (bot.universeSweep) {
+      if (bot.strategyId.startsWith('custom:')) return this.labResearchGate(bot)
+      const v = this.store.latestRobustValidationAnyAsset(bot.tf, bot.strategyId)
+      if (!v) {
+        return `research-gate: universe sweep needs at least one ROBUST walk-forward of ${bot.strategyId} on any pair at ${bot.tf} - run /walkforward before arming`
+      }
+      if (Math.floor(Date.now() / 1000) - v.ts > MAX_AGE_SEC) {
+        return `research-gate: ${bot.strategyId} ${bot.tf}'s robust validation (on ${v.asset}) is stale (>14d old) - re-run /walkforward before arming`
+      }
+      return null
+    }
+    if (bot.strategyId.startsWith('custom:')) return this.labResearchGate(bot)
     // THE BUG this replaces: the gate below required a `/walkforward` verdict
     // for EVERY strategyId, but `/walkforward` resolves strategies through
     // getStrategy() (builtin.ts), which only knows the fixed built-in
@@ -596,11 +651,19 @@ export class AutopilotService {
           ? clampNum(input.minPayoutPct ?? existing?.minPayoutPct ?? 0, 0, 98)
           : undefined,
       streakBreaker: input.streakBreaker !== undefined ? Boolean(input.streakBreaker) : existing?.streakBreaker,
+      universeSweep: input.universeSweep !== undefined ? Boolean(input.universeSweep) : existing?.universeSweep,
+      sweepMaxTrades:
+        input.sweepMaxTrades !== undefined || existing?.sweepMaxTrades !== undefined
+          ? Math.round(clampNum(input.sweepMaxTrades ?? existing?.sweepMaxTrades ?? 1, 1, 10))
+          : undefined,
     }
     // a materially different plan invalidates the persisted roll - start clean
     const planChanged = JSON.stringify(bot.stakePlan ?? null) !== JSON.stringify(existing?.stakePlan ?? null)
     bot.planState = planChanged ? undefined : input.planState ?? existing?.planState
-    if (!bot.watchlist.length) return { ok: false, error: 'watchlist needs at least one valid instrument' }
+    // a universe-sweep bot hunts the whole Next Global board - an empty
+    // watchlist is its NORMAL state, not a config error (non-sweep bots
+    // still need at least one valid instrument below)
+    if (!bot.watchlist.length && !bot.universeSweep) return { ok: false, error: 'watchlist needs at least one valid instrument' }
     if (!this.isValidStrategy(bot.strategyId)) return { ok: false, error: `unknown strategy ${bot.strategyId}` }
     // research gate: only check when this save is what's arming the bot (new
     // enable, not every edit to an already-running one) so a stake tweak on a
@@ -629,7 +692,7 @@ export class AutopilotService {
     }
     this.store.saveBot(bot)
     if (!this.runtime.has(id)) this.runtime.set(id, this.buildRuntime(id))
-    this.emit(bot.enabled ? 'success' : 'info', `Bot "${bot.name}" saved - ${bot.enabled ? 'ARMED' : 'idle'} (${bot.strategyId} · ${bot.tf} · ${bot.watchlist.join(', ')})`)
+    this.emit(bot.enabled ? 'success' : 'info', `Bot "${bot.name}" saved - ${bot.enabled ? 'ARMED' : 'idle'} (${bot.strategyId} · ${bot.tf} · ${bot.universeSweep ? 'UNIVERSE SWEEP via Next Global' : bot.watchlist.join(', ')})`)
     return { ok: true, bot, forced }
   }
 
@@ -687,32 +750,57 @@ export class AutopilotService {
       bot.forcedUnvalidated = forced
     }
     this.store.saveBot(bot)
-    this.emit(bot.enabled ? 'success' : 'info', `Autopilot "${bot.name}" ${bot.enabled ? 'STARTED' : 'STOPPED'} - watching ${bot.watchlist.join(', ')} on ${bot.tf} (${bot.strategyId})`)
+    this.emit(bot.enabled ? 'success' : 'info', `Autopilot "${bot.name}" ${bot.enabled ? 'STARTED' : 'STOPPED'} - watching ${bot.universeSweep ? 'the whole universe (Next Global sweep)' : bot.watchlist.join(', ')} on ${bot.tf} (${bot.strategyId})`)
     return { ok: true, bot, forced }
   }
 
   // ---------- trading loop ----------
 
-  private async onCandleClose(asset: string, tf: Timeframe): Promise<void> {
+  private async onCandleClose(asset: string, tf: Timeframe, barTime?: number): Promise<void> {
     const bots = this.store.listBots().filter(
       (b) => b.bot.enabled && b.bot.tf === tf && b.bot.watchlist.includes(asset)
     )
-    if (!bots.length) return
-    const key = `${asset}|${tf}`
-    if (this.evaluating.has(key)) return
-    this.evaluating.add(key)
-    try {
-      for (const { bot } of bots) {
+    if (bots.length) {
+      const key = `${asset}|${tf}`
+      if (!this.evaluating.has(key)) {
+        this.evaluating.add(key)
         try {
-          await this.tradeForBot(bot, asset, tf)
-        } catch (err) {
-          // strategy evaluation can throw on thin history - Task 59: surface
-          // it as a rejection (deduped) instead of a console-only whisper
-          this.reject(bot, `evaluation failed: ${String((err as Error).message).slice(0, 160)}`)
+          for (const { bot } of bots) {
+            try {
+              await this.tradeForBot(bot, asset, tf)
+            } catch (err) {
+              // strategy evaluation can throw on thin history - Task 59: surface
+              // it as a rejection (deduped) instead of a console-only whisper
+              this.reject(bot, `evaluation failed: ${String((err as Error).message).slice(0, 160)}`)
+            }
+          }
+        } finally {
+          this.evaluating.delete(key)
         }
       }
-    } finally {
-      this.evaluating.delete(key)
+    }
+
+    // UNIVERSE SWEEP: bots with universeSweep:true ignore their (empty)
+    // watchlist - they run once per closed candle on their tf, whoever's bar
+    // closed first. sweptBars de-dups the several same-tf closes that land
+    // within milliseconds; the sweep then scans the whole Next Global board.
+    if (!barTime) return
+    const sweepers = this.store.listBots().filter((b) => b.bot.enabled && b.bot.universeSweep && b.bot.tf === tf)
+    if (!sweepers.length) return
+    const sweepKey = `${tf}|${barTime}`
+    if (this.sweptBars.has(sweepKey)) return
+    this.sweptBars.set(sweepKey, Date.now())
+    while (this.sweptBars.size > 60) {
+      const oldest = this.sweptBars.keys().next().value
+      if (oldest === undefined) break
+      this.sweptBars.delete(oldest)
+    }
+    for (const { bot } of sweepers) {
+      try {
+        await this.sweepUniverseForBot(bot)
+      } catch (err) {
+        this.reject(bot, `universe sweep failed: ${String((err as Error).message).slice(0, 160)}`)
+      }
     }
   }
 
@@ -984,6 +1072,263 @@ export class AutopilotService {
     this.emit('success', `[${bot.name}] ${wanted.toUpperCase()} ${asset} $${bet.amount} ${bot.kind} @ ${evalOut.price.toFixed(5)} - ${evalOut.notes} (score ${evalOut.score.toFixed(0)})${roll}${payTag}`)
   }
 
+  // ---------- universe sweep (Next Global hunter) ----------
+
+  /** One pass of the whole Next Global board for a universeSweep bot. Runs
+   * once per closed tf candle (de-duped in onCandleClose): pull the board
+   * (one fused oracle read per open pair, TTL-cached kernel-side, ranked by
+   * tradability), walk it top-down and fire on rows that clear EVERY gate,
+   * up to sweepMaxTrades per bar. All the governance the watchlist bots
+   * answer to still applies - session window, daily $ limits, max open,
+   * bot-level cooldown, streak-breaker bench, mode gate, watchdog, payout
+   * floor, direction/regime filters, OTC guard, adaptive Wilson floor,
+   * memory gate on the ACTUAL stake - and the ExecutionService risk manager
+   * remains the final gate on every order. Per-pair edge-triggers
+   * (rt.sweepDir) keep a standing oracle read from being re-fired bar after
+   * bar; the first sweep after arm only RECORDS baseline reads (arm-time
+   * backfill) so the bot never enters the stale middle of a move. */
+  private async sweepUniverseForBot(bot: BotConfig): Promise<void> {
+    const rt = this.runtime.get(bot.id) ?? this.buildRuntime(bot.id)
+    const dayKey = new Date().toISOString().slice(0, 10)
+
+    // daily rollover (same contract as tradeForBot)
+    if (rt.dayKey !== dayKey) {
+      rt.dayKey = dayKey
+      rt.trades = 0
+      rt.wins = 0
+      rt.losses = 0
+      rt.pnlToday = 0
+      rt.streak = 0
+    }
+
+    // compound stop-on-loss / periods-complete halt (identical wording to
+    // tradeForBot - an operator reading alerts should never learn two dialects)
+    if (bot.stakePlan?.kind === 'compound' && bot.stakePlan.stopOnLoss !== false && rt.halted) {
+      return this.reject(
+        bot,
+        rt.complete
+          ? `compound cycle COMPLETE (${rt.rollN}/${bot.stakePlan.periods ?? '?'} periods banked) - restart for a fresh cycle`
+          : 'compound cycle ended on a loss - restart to trade again',
+      )
+    }
+
+    // burst guard: several assets' same-tf bars close within milliseconds and
+    // sweptBars de-dups by barTime, but lazy-seeded feeds can emit slightly
+    // different barTimes for the same wall-clock bar - this 5s floor makes
+    // double-sweeps structurally impossible even then
+    if (Date.now() - rt.lastSweepTs < 5000) return
+    rt.lastSweepTs = Date.now()
+
+    // session window gate (UTC)
+    if (bot.session && bot.session !== 'all' && !inSession(bot.session)) {
+      return this.reject(bot, `outside ${bot.session} session (${SESSION_WINDOWS[bot.session].label})`)
+    }
+
+    // per-bot circuit breakers
+    if (bot.dailyProfitTarget && bot.dailyProfitTarget > 0 && rt.pnlToday >= bot.dailyProfitTarget) {
+      return this.reject(bot, `profit target reached (+$${rt.pnlToday.toFixed(2)})`)
+    }
+    if (bot.dailyLossLimit && bot.dailyLossLimit > 0 && rt.pnlToday <= -bot.dailyLossLimit) {
+      return this.reject(bot, `daily loss limit hit (-$${Math.abs(rt.pnlToday).toFixed(2)})`)
+    }
+    if (rt.openCount >= bot.maxOpen) return this.reject(bot, `max open positions (${bot.maxOpen})`)
+    if (bot.cooldownSec > 0 && rt.lastTradeTs > 0 && Math.floor(Date.now() / 1000) - rt.lastTradeTs < bot.cooldownSec) {
+      return this.reject(bot, 'cooldown between trades')
+    }
+
+    // streak-breaker bench (same ladder as the watchlist bots)
+    if (bot.streakBreaker && rt.benchedUntil && Math.floor(Date.now() / 1000) < rt.benchedUntil) {
+      const left = Math.ceil((rt.benchedUntil - Math.floor(Date.now() / 1000)) / 60)
+      return this.reject(bot, `streak-breaker bench: ${left}min left (after ${Math.abs(Math.min(rt.streak, -1))} losses in a row)`)
+    }
+
+    // mode gate: HUMAN-IN-THE-LOOP suspends sweep autonomy too
+    try {
+      const mode = this.ctx.use<{ gate: (origin: 'bot' | 'auto') => { ok: boolean; reason?: string } }>('mode')
+      const m = mode.gate('bot')
+      if (!m.ok) return this.reject(bot, m.reason ?? 'mode gate hold')
+    } catch {
+      // mode plugin not loaded - gate disabled
+    }
+
+    // watchdog gate: strategy-health ladder
+    try {
+      const wd = this.ctx.use<{ preTrade: (botId: string) => { ok: boolean; reason?: string } }>('watchdog')
+      const w = wd.preTrade(bot.id)
+      if (!w.ok) return this.reject(bot, w.reason ?? 'watchdog health hold')
+    } catch {
+      // watchdog plugin not loaded - health gating disabled
+    }
+
+    // pull the whole board - every open instrument, one fused oracle read per
+    // pair, already ranked by tradability (confidence x |P(up)-0.5|)
+    let scan: GlobalScanResult
+    try {
+      const nc = this.ctx.use<{ globalScan: (tf: Timeframe, opts?: { limit?: number }) => GlobalScanResult }>('nextcandle')
+      scan = nc.globalScan(bot.tf, { limit: 150 })
+    } catch {
+      return this.reject(bot, 'next-candle oracle unavailable - universe sweep offline')
+    }
+    const live: GlobalScanRow[] = scan.rows.filter((r) => r.ok)
+    if (!live.length) {
+      return this.reject(bot, `universe sweep: board still warming up (${scan.warming} pair(s) need 320+ closed bars on ${bot.tf})`)
+    }
+
+    // lapse re-arm: an asset whose read collapsed to 'none' frees its
+    // edge-trigger, exactly like evalOut.direction === 'none' does for the
+    // watchlist bots
+    for (const row of live) {
+      if (row.direction === 'none' && rt.sweepDir.has(row.asset)) rt.sweepDir.delete(row.asset)
+    }
+
+    // gate levels: the strategy's own minConfidence param (oracle-fusion
+    // convention) AND the bot's minScore slider both apply - the stricter wins
+    const minConfParam = Number(bot.params?.minConfidence)
+    const minConf = Math.max(bot.minScore, Number.isFinite(minConfParam) ? minConfParam : 0)
+    const minEdgeParam = Number(bot.params?.minEdge)
+    const minEdgePp = Number.isFinite(minEdgeParam) ? minEdgeParam : 5
+
+    // ARM-TIME BACKFILL: the first sweep after (re)arm only RECORDS the
+    // standing board - every qualifying read was already true before the bot
+    // existed, so trading it would be entering the stale middle of a move
+    // (the same failure mode the watchlist bots' backfill kills)
+    if (!rt.sweepBackfilled) {
+      for (const row of live) {
+        if (row.direction !== 'none') rt.sweepDir.set(row.asset, row.direction === 'call' ? 'call' : 'put')
+      }
+      rt.sweepBackfilled = true
+      return this.reject(
+        bot,
+        `universe sweep baseline recorded (${rt.sweepDir.size} standing reads) - next sweep fires on FRESH edges only`,
+      )
+    }
+
+    const maxTrades = bot.sweepMaxTrades ?? 1
+    let taken = 0
+    let firstBlock = ''
+    for (let i = 0; i < live.length; i++) {
+      const row = live[i]
+      if (taken >= maxTrades) break
+      if (row.direction === 'none') continue
+      const wanted: 'call' | 'put' = row.direction === 'call' ? 'call' : 'put'
+      const edgePp = Math.abs(row.pUp - 0.5) * 100
+      // per-pair edge-trigger de-dup: same direction still standing = same
+      // signal, not a fresh one
+      if (rt.sweepDir.get(row.asset) === wanted) continue
+      if (bot.direction !== 'both' && bot.direction !== wanted) continue
+      if (row.confidence < minConf) {
+        if (!firstBlock) firstBlock = `${row.asset} conf ${row.confidence.toFixed(0)}% < floor ${minConf}%`
+        continue
+      }
+      if (edgePp < minEdgePp) {
+        if (!firstBlock) firstBlock = `${row.asset} edge ${edgePp.toFixed(1)}pp < ${minEdgePp}pp`
+        continue
+      }
+      // payout floor (the EV gate) on this pair's LIVE payout
+      const livePay = this.payoutFor(row.asset, bot.kind)
+      if ((bot.minPayoutPct ?? 0) > 0 && livePay > 0 && livePay * 100 < bot.minPayoutPct!) {
+        if (!firstBlock)
+          firstBlock = `${row.asset} payout ${(livePay * 100).toFixed(0)}% < ${bot.minPayoutPct}% floor (BE ${(100 / (1 + livePay)).toFixed(1)}%)`
+        continue
+      }
+      // regime gate, read straight off the board's own classification
+      if (bot.regime === 'trend' && row.regime !== 'TRENDING') continue
+      if (bot.regime === 'range' && row.regime !== 'RANGING') continue
+      if (bot.regime === 'avoid-volatile' && row.regime === 'VOLATILE') continue
+      // OTC defense gate: generator-driven pairs stay off-limits unless this
+      // strategy beat its calibrated placebo (cheap persisted-verdict lookup)
+      try {
+        const guard = this.ctx.use<{ check: (target: { asset: string }, strategyKey: string) => { ok: boolean; reason?: string } }>('otcGuard')
+        const g = guard.check({ asset: row.asset }, bot.strategyId)
+        if (!g.ok) {
+          if (!firstBlock) firstBlock = `${row.asset}: ${g.reason ?? 'OTC defense gate hold'}`
+          continue
+        }
+      } catch {
+        // otc guard plugin not loaded - OTC gating disabled
+      }
+      // stake + compound over-bet guard (identical to tradeForBot)
+      const bet = this.stakeFor(bot, rt)
+      if (bet.compound && bet.pot >= 0.01 && bet.amount > bet.pot) {
+        return this.reject(
+          bot,
+          `compound pot $${bet.pot.toFixed(2)} is below the $1 broker minimum stake - restart the cycle to re-seed`,
+        )
+      }
+      // copilot memory gate on the REAL bet amount
+      try {
+        const mg = this.ctx.use<{ check: (asset: string, stake: number) => { ok: boolean; reason?: string } }>('memoryGate')
+        const g = mg.check(row.asset, bet.amount)
+        if (!g.ok) {
+          if (!firstBlock) firstBlock = `${row.asset}: ${g.reason ?? 'memory gate hold'}`
+          continue
+        }
+      } catch {
+        // memory gate plugin not loaded - rule gating disabled
+      }
+      // adaptive confidence gate: this exact (pair, tf, strategy, side,
+      // score-bucket[, regime][, session]) setup needs its own proven record
+      if (bot.adaptive !== false) {
+        try {
+          const adaptive = this.ctx.use<{
+            config: { enabled: boolean }
+            check: (asset: string, tf: string, strategyId: string, side: string, score: number, regime?: string, session?: string, payout?: number) => { ok: boolean; reason?: string }
+          }>('adaptive')
+          if (adaptive.config.enabled) {
+            const session = classifySession(Math.floor(Date.now() / 1000), row.asset)
+            const v = adaptive.check(row.asset, bot.tf, bot.strategyId, wanted, row.confidence, row.regime, session, livePay || undefined)
+            if (!v.ok) {
+              if (!firstBlock) firstBlock = `${row.asset}: ${v.reason ?? 'adaptive confidence gate hold'}`
+              continue
+            }
+          }
+        } catch {
+          // adaptive plugin not loaded - gate disabled
+        }
+      }
+
+      // execute - the ExecutionService risk manager is the final gate
+      const out = await this.exec.placeOrder({
+        asset: row.asset,
+        tf: bot.tf,
+        side: wanted,
+        kind: bot.kind,
+        amount: bet.amount,
+        expiryBars: bot.expiryBars,
+        expirySec: bot.kind === 'digital' || bot.kind === 'blitz' ? bot.expirySec : undefined,
+        mode: this.exec.accountSource === 'iq' ? 'live' : 'paper',
+        strategy: bot.strategyId,
+        note: `bot:${bot.id}`,
+      })
+      if (!out.ok) {
+        if (!firstBlock) firstBlock = `${row.asset}: ${out.error ?? 'order rejected'}`
+        continue
+      }
+      // edge-trigger stamp happens HERE (execution actually happened)
+      rt.sweepDir.set(row.asset, wanted)
+      rt.trades += 1
+      rt.lastTradeTs = Math.floor(Date.now() / 1000)
+      rt.lastRejection = undefined
+      taken++
+      const roll = bet.compound
+        ? ` - compound ${bet.phase} roll x${bet.rollN + 1} (pot $${bet.pot.toFixed(2)})`
+        : ''
+      const payTag = livePay > 0 ? ` · pay ${(livePay * 100).toFixed(0)}% (BE ${(100 / (1 + livePay)).toFixed(1)}%)` : ''
+      this.emit(
+        'success',
+        `[${bot.name}] SWEEP ${taken}/${maxTrades} ${wanted.toUpperCase()} ${row.asset} $${bet.amount.toFixed(2)} ${bot.kind} @ ${row.price.toFixed(5)} - oracle ${wanted} conf ${row.confidence.toFixed(0)}% edge ${edgePp.toFixed(1)}pp ${row.regime} (board rank ${i + 1}/${live.length}, P(up) ${(row.pUp * 100).toFixed(1)}%, ${row.driversActive} drivers)${roll}${payTag}`,
+      )
+    }
+
+    if (taken === 0) {
+      const top = live[0]
+      this.reject(
+        bot,
+        `universe sweep: no fresh edge cleared the gates - strongest read ${top.asset} ${top.direction} conf ${top.confidence.toFixed(0)}% (floor ${minConf}%, edge floor ${minEdgePp}pp)${firstBlock ? `; last block: ${firstBlock}` : ''}`,
+      )
+    }
+  }
+
   /** Normalize an incoming stake plan; undefined (or 'fixed') = classic fixed stake. */
   private parseStakePlan(raw: unknown, existing?: StakePlan): StakePlan | undefined {
     const p = (raw ?? existing) as Partial<StakePlan> | undefined
@@ -1218,6 +1563,9 @@ export class AutopilotService {
       // so the first candle close backfills the edge-trigger (arm-time
       // backfill) instead of trading an already-true condition
       lastSignalDir: undefined,
+      sweepDir: new Map(),
+      sweepBackfilled: false,
+      lastSweepTs: 0,
     }
     const journal = this.store.botJournal(botId, 400)
     for (const p of journal) {

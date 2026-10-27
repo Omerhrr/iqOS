@@ -49,6 +49,8 @@ import type { AssetCategory, Candle, Timeframe, TradeKind } from '../types'
 import { ALL_TIMEFRAMES, TIMEFRAME_SECONDS, BINARY_EXPIRY_MINUTES } from '../types'
 import type { ScreenerService, ScreenRow } from './screener'
 import type { MarketDataService } from './market-data'
+import type { NextCandleService } from './nextcandle'
+import type { TempoService } from './tempo'
 import type { ChartSignalsService, ChartScanResult } from './chartsignals'
 import type { AnalyticsService } from './analytics'
 import type { StrategyLabService } from './lab'
@@ -78,7 +80,7 @@ const finGte = (v: number, floor: number): boolean => Number.isFinite(v) && v >=
 
 export type OsMode = 'human' | 'auto'
 
-export type AutoTraderSource = 'cointegration' | 'triangulation' | 'adx-pattern-bias' | 'pair-signal' | 'shock-pressure' | 'poc-triple-confirm' | 'strategy' | 'chartsignals' | 'leadlag'
+export type AutoTraderSource = 'cointegration' | 'triangulation' | 'adx-pattern-bias' | 'pair-signal' | 'shock-pressure' | 'poc-triple-confirm' | 'strategy' | 'chartsignals' | 'leadlag' | 'oracle-fusion' | 'tempo'
 
 /** Walk-forward validation verdict for the OU edge on one (asset, tf). */
 export interface OUVerdict {
@@ -388,7 +390,7 @@ const AUTOTRADER_NOTE = 'auto:os-trader'
  * its votes at the eval). Only these sources can guarantee every placed
  * trade is a FRESH edge, so only their alerts carry the "why now" crossing
  * note the pickers attach. */
-const SWEEP_SOURCES: readonly string[] = ['chartsignals', 'leadlag', 'cointegration', 'triangulation', 'adx-pattern-bias', 'pair-signal', 'shock-pressure', 'poc-triple-confirm']
+const SWEEP_SOURCES: readonly string[] = ['chartsignals', 'leadlag', 'cointegration', 'triangulation', 'adx-pattern-bias', 'pair-signal', 'shock-pressure', 'poc-triple-confirm', 'oracle-fusion', 'tempo']
 /** analytics/chartsignals.ts combineVotes() now groups the 7 raw chart
  * engines into 5 independent-METHODOLOGY families before counting `agree`
  * - renko/range/P&F (all "price crossed N ATR-thresholds" read three ways)
@@ -637,7 +639,7 @@ export class ModeService {
         const num = (v: unknown, fb: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fb)
         this.config = {
           enabled: typeof c.enabled === 'boolean' ? c.enabled : DEFAULT_AUTOTRADER.enabled,
-          signalSource: (['cointegration', 'triangulation', 'adx-pattern-bias', 'pair-signal', 'shock-pressure', 'poc-triple-confirm', 'strategy', 'chartsignals', 'leadlag'] as const).includes(c.signalSource as AutoTraderSource)
+          signalSource: (['cointegration', 'triangulation', 'adx-pattern-bias', 'pair-signal', 'shock-pressure', 'poc-triple-confirm', 'strategy', 'chartsignals', 'leadlag', 'oracle-fusion', 'tempo'] as const).includes(c.signalSource as AutoTraderSource)
             ? (c.signalSource as AutoTraderSource)
             : DEFAULT_AUTOTRADER.signalSource,
           tf: (typeof c.tf === 'string' && (ALL_TIMEFRAMES as string[]).includes(c.tf) ? c.tf : DEFAULT_AUTOTRADER.tf) as Timeframe,
@@ -1066,6 +1068,10 @@ export class ModeService {
                 ? (row.note ?? `chart-signals vote ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`)
                 : this.config.signalSource === 'leadlag'
                   ? (row.note ?? `EUR/USD lead-lag ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`)
+                  : this.config.signalSource === 'oracle-fusion'
+                  ? (row.note ?? `oracle fusion ${row.direction.toUpperCase()} pUp ${(row.pUp * 100).toFixed(1)}% conf ${row.confidence.toFixed(0)}% edge ${Math.abs(row.score).toFixed(0)}pp`)
+                  : this.config.signalSource === 'tempo'
+                  ? (row.note ?? `tempo shot ${row.direction.toUpperCase()} conviction ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)}% (1-bar expiry)`)
                   : this.config.signalSource === 'strategy'
                   ? (row.note ?? `${this.effectiveStrategyIds().join('+') || 'strategy'} (${row.direction.toUpperCase()})`)
                   : `score ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} regime ${row.regime}`
@@ -1121,6 +1127,8 @@ export class ModeService {
     if (this.config.signalSource === 'pair-signal') return this.pickPairSignalSignal()
     if (this.config.signalSource === 'shock-pressure') return this.pickShockPressureSignal()
     if (this.config.signalSource === 'poc-triple-confirm') return this.pickPocTripleConfirmSignal()
+    if (this.config.signalSource === 'oracle-fusion') return this.pickOracleFusionSignal()
+    if (this.config.signalSource === 'tempo') return this.pickTempoSignal()
     if (this.config.signalSource === 'strategy') return this.pickStrategySignal()
     return null
   }
@@ -1969,6 +1977,189 @@ export class ModeService {
     })
   }
 
+  /**
+   * Oracle-fusion source: the Next-Candle Oracle's multi-model fused
+   * next-bar read as a first-class signal source (alongside lead-lag,
+   * cointegration, ...), not only the 'oracle' strategy a bot can pin.
+   * Sweeps the SAME board the Next Global panel renders - the nextcandle
+   * plugin's globalScan(), one fused prediction per open instrument on the
+   * configured tf, TTL-cached kernel-side so the picker, the panel and the
+   * autopilot's own sweep share one computed read per pair per TTL instead
+   * of fusing the same pair twice inside one forming bar. Every row already
+   * went through predict(), so it is TRACKED by the oracle's honesty loop -
+   * the calibrated confidence this source gates on is the same number the
+   * panel shows, tightened by the oracle's own recent hit rate on that
+   * exact pair+tf. Gates: the fusion's direction must be decisive (call/
+   * put, never 'none'), the calibration-adjusted confidence clears
+   * minConfidence, and the fused pUp's distance from the coin flip (in
+   * percentage points, |pUp-0.5|*200 - "how far from a coin flip the
+   * fusion leans") clears minScore. Ranking across the fresh qualifiers
+   * matches the Next Global board's own tradability sort: confidence *
+   * |pUp-0.5| desc.
+   */
+  private pickOracleFusionSignal(): ScreenRow | null {
+    return this.edgeSweep('oracle-fusion', (rec) => {
+      const fresh: Array<{ row: ScreenRow; metric: number }> = []
+      try {
+        const oracle = this.ctx.use<NextCandleService>('nextcandle')
+        const market = this.ctx.use<MarketDataService>('market')
+        const scan = oracle.globalScan(this.config.tf, { limit: 150 })
+        for (const r of scan.rows) {
+          if (!r.ok) continue // thin/no history - the oracle honestly abstains on this pair
+          if (r.direction === 'none') continue // fusion has no lean - never a signal
+          if (this.assetBlocked(r.asset)) continue
+          rec(r.asset)
+          if (this.config.direction !== 'both' && r.direction !== this.config.direction) continue
+          // fail-closed: a NaN confidence must never qualify
+          if (!finGte(r.confidence, this.config.minConfidence)) continue
+          const edgePp = Math.abs(r.pUp - 0.5) * 200
+          const score = Math.round(clamp(edgePp, 0, 100)) * (r.direction === 'call' ? 1 : -1)
+          if (!finGte(Math.abs(score), this.config.minScore)) continue
+          const key = SweepEdgeMemory.key(r.asset, r.direction)
+          rec(r.asset, key)
+          if (this.sweepEdge.gate(key) !== 'trade') continue
+          const inst = market.assets.find((a) => a.ticker === r.asset)
+          const cal = r.calibration
+          fresh.push({
+            metric: r.confidence * Math.abs(r.pUp - 0.5),
+            row: {
+              asset: r.asset,
+              name: inst?.name ?? r.asset,
+              category: (inst?.category ?? 'forex') as AssetCategory,
+              otc: inst?.otc ?? r.asset.endsWith('-OTC'),
+              tf: this.config.tf,
+              price: r.price,
+              score,
+              direction: r.direction,
+              confidence: Math.round(clamp(r.confidence, 0, 100)),
+              pUp: r.pUp,
+              pDown: 1 - r.pUp,
+              regime: 'range',
+              ouZ: 0,
+              ouHalfLife: 0,
+              ouMeanReverting: false,
+              ouTStat: 0,
+              rsi: 0,
+              adx: 0,
+              atrPct: r.atr > 0 && r.price > 0 ? (r.atr / r.price) * 100 : 0,
+              hurst: 0,
+              changePct: 0,
+              payout: this.payoutFor(r.asset, this.config.kind ?? 'binary'),
+              topPattern: null,
+              ts: this.now(),
+              computedTs: r.computedTs,
+              // why NOW: this pair's fused read JUST cleared both the
+              // calibrated-confidence gate and the edge-from-coin-flip gate
+              // on this sweep - drivers, regime and the pair's own honesty
+              // record go in the note so the operator reads the full why
+              note: `oracle fusion ${r.direction.toUpperCase()} pUp ${(r.pUp * 100).toFixed(1)}% conf ${r.confidence.toFixed(0)}% · ${r.driversActive} drivers · ${r.regime}${cal ? ` · record ${Math.round(cal.hitRate * 100)}% of ${cal.n}` : ''}`,
+            },
+          })
+        }
+      } catch {
+        // nextcandle/market plugin not loaded - no signal source
+      }
+      // pick the strongest fresh qualifier this sweep, the Next Global
+      // board's own tradability ordering (confidence weighted by distance
+      // from the coin flip)
+      if (!fresh.length) return null
+      fresh.sort((a, b) => b.metric - a.metric)
+      return fresh[0].row
+    })
+  }
+
+  /**
+   * Tempo source: the patience engine as a signal source. Tempo's promise
+   * is CADENCE, not another indicator: each 10-bar window on a pair is a
+   * hunting license for exactly ONE shot - the bar whose fused next-candle
+   * conviction is surest - so on 1m it trades at most 6 times an hour
+   * (1-minute expiry), on 2m 3 times, and every timeframe scales as
+   * "analyze 10 bars, trade 1, expiry = 1 bar of the signal tf". The
+   * picker sweeps the tempo board (plugins/tempo.ts scan() - shared fusion
+   * cache with the Next Global board and the Tempo panels), walks the rows
+   * whose stopping rule says FIRE (this bar's conviction clears the
+   * patience bar: the pair's own window-max rhythm scaled by the bars
+   * still to come, floored by an absolute conviction minimum), applies the
+   * standard config gates (direction, minConfidence on the calibrated
+   * fusion confidence, min |score| on the pp edge from coin flip) and the
+   * sweep freshness discipline, and only THEN calls tempo.claim() - the
+   * atomic one-shot commit, first claim wins, so panels polling the same
+   * board can never burn a shot the trader hasn't taken. Rank = conviction
+   * desc. Expiry: tempo signals are 1-bar-of-tf by construction; leave
+   * expiryTf unset (or match tf) to keep that promise.
+   */
+  private pickTempoSignal(): ScreenRow | null {
+    return this.edgeSweep('tempo', (rec) => {
+      const fresh: Array<{ row: ScreenRow; metric: number }> = []
+      try {
+        const tempo = this.ctx.use<TempoService>('tempo')
+        const market = this.ctx.use<MarketDataService>('market')
+        const scan = tempo.scan(this.config.tf, { limit: 150 })
+        for (const r of scan.rows) {
+          if (!r.ok) continue // thin/no history - the oracle abstains, no license
+          if (r.decision !== 'fire') continue // the patience engine's whole point
+          if (this.assetBlocked(r.asset)) continue
+          rec(r.asset)
+          if (r.direction === 'none') continue // conviction without a lean is not a trade
+          if (this.config.direction !== 'both' && r.direction !== this.config.direction) continue
+          // fail-closed config gates on the RAW fusion read
+          if (!finGte(r.confidence, this.config.minConfidence)) continue
+          const edgePp = Math.abs(r.pUp - 0.5) * 200
+          const score = Math.round(clamp(edgePp, 0, 100)) * (r.direction === 'call' ? 1 : -1)
+          if (!finGte(Math.abs(score), this.config.minScore)) continue
+          const key = SweepEdgeMemory.key(r.asset, r.direction)
+          rec(r.asset, key)
+          if (this.sweepEdge.gate(key) !== 'trade') continue
+          // the atomic one-shot commit - after this, the window is spent
+          const claimed = tempo.claim(r.asset, this.config.tf)
+          if (!claimed.ok || !claimed.signal) continue // another consumer took it / rule flipped
+          const sig = claimed.signal
+          const inst = market.assets.find((a) => a.ticker === r.asset)
+          fresh.push({
+            metric: r.conviction,
+            row: {
+              asset: r.asset,
+              name: inst?.name ?? r.asset,
+              category: (inst?.category ?? 'forex') as AssetCategory,
+              otc: inst?.otc ?? r.asset.endsWith('-OTC'),
+              tf: this.config.tf,
+              price: sig.price,
+              score,
+              direction: sig.direction,
+              confidence: Math.round(clamp(sig.confidence, 0, 100)),
+              pUp: sig.pUp,
+              pDown: 1 - sig.pUp,
+              regime: 'range',
+              ouZ: 0,
+              ouHalfLife: 0,
+              ouMeanReverting: false,
+              ouTStat: 0,
+              rsi: 0,
+              adx: 0,
+              atrPct: 0,
+              hurst: 0,
+              changePct: 0,
+              payout: this.payoutFor(r.asset, this.config.kind ?? 'binary'),
+              topPattern: null,
+              ts: this.now(),
+              computedTs: this.now(),
+              // why NOW: the patience engine spent this pair's 10-bar
+              // license HERE - the window clock, the conviction and what
+              // it had to beat all go in the note
+              note: `tempo shot ${sig.direction.toUpperCase()} bar ${r.barIndex + 1}/10 · conviction ${r.conviction.toFixed(1)} beat bar ${r.threshold.toFixed(1)} · conf ${sig.confidence.toFixed(0)}% pUp ${(sig.pUp * 100).toFixed(1)}% · 1-bar expiry`,
+            },
+          })
+        }
+      } catch {
+        // tempo/market plugin not loaded - no signal source
+      }
+      // pick the strongest shot this sweep (conviction desc)
+      if (!fresh.length) return null
+      fresh.sort((a, b) => b.metric - a.metric)
+      return fresh[0].row
+    })
+  }
+
   /** Sanitizes a strategyParams patch/restore blob: {id: {key: number|string}},
    * dropping anything that doesn't match that shape. Same leniency as a
    * bot's own params - unknown keys are harmless (defaultParams() merge just
@@ -2700,6 +2891,10 @@ export class ModeService {
                   ? 'chartsignals-vote'
                   : this.config.signalSource === 'leadlag'
                     ? 'leadlag-echo'
+                    : this.config.signalSource === 'oracle-fusion'
+                    ? 'oracle-fusion'
+                    : this.config.signalSource === 'tempo'
+                    ? 'tempo-one-shot'
                     : this.config.signalSource === 'strategy'
                     ? (row.strategyLabel ??
                       (() => {
@@ -2775,6 +2970,10 @@ export class ModeService {
         return 'chartsignals-vote'
       case 'leadlag':
         return 'leadlag-echo'
+      case 'oracle-fusion':
+        return 'oracle-fusion'
+      case 'tempo':
+        return 'tempo-one-shot'
       default:
         return null
     }
@@ -3215,7 +3414,7 @@ export class ModeService {
       // moment too - whatever qualifies NOW predates this arm
       if (this.config.enabled && !was && this.mode === 'auto') this.armAutoEdgeBackfill()
     }
-    if (patch.signalSource !== undefined && (['cointegration', 'triangulation', 'adx-pattern-bias', 'pair-signal', 'shock-pressure', 'poc-triple-confirm', 'strategy', 'chartsignals', 'leadlag'] as const).includes(patch.signalSource as AutoTraderSource))
+    if (patch.signalSource !== undefined && (['cointegration', 'triangulation', 'adx-pattern-bias', 'pair-signal', 'shock-pressure', 'poc-triple-confirm', 'strategy', 'chartsignals', 'leadlag', 'oracle-fusion', 'tempo'] as const).includes(patch.signalSource as AutoTraderSource))
       this.config.signalSource = patch.signalSource as AutoTraderSource
     // AUDIT FIX (Task 58, P2): tf used to be cast unchecked - a garbage tf
     // made every picker return nothing (silent "no signal" forever) and
@@ -3313,6 +3512,10 @@ export class ModeService {
                 ? ` (chart-type vote engine, agree ≥ ${CHARTSIGNALS_MIN_AGREE}/5 families)`
                 : this.config.signalSource === 'leadlag'
                 ? ` (intermarket lead-lag across ${LEADLAG_GROUPS.length} leader groups - EURUSD/XAUUSD/BTCUSD/oil, |corr| ≥ ${LEADLAG_MIN_ABS_CORRELATION}, trigger |z| ≥ ${LEADLAG_MIN_TRIGGER_Z})`
+                : this.config.signalSource === 'oracle-fusion'
+                ? ` (Next-Candle Oracle multi-model fusion swept across the whole open universe - the Next Global board's engine - calibrated confidence ≥ ${this.config.minConfidence}, |pUp-0.5| edge ≥ ${this.config.minScore}pp from coin flip)`
+                : this.config.signalSource === 'tempo'
+                ? ` (Tempo patience engine - analyze 10 bars, take exactly ONE shot per window on the surest one: conviction = calibrated confidence × pp edge must beat the pair's own window-max rhythm scaled by bars remaining, floor 8; ≤6 trades/hour on 1m, expiry = 1 bar of tf)`
                 : this.config.signalSource === 'strategy'
                 ? (() => {
                     const ids = this.effectiveStrategyIds()

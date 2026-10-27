@@ -46,6 +46,17 @@ const TF_SECONDS: Record<Timeframe, number> = {
  * user why a bot might be blocked, before they even try to start it. */
 function gateStatus(bot: BotConfig, validations: Map<string, ValidationRow>): { ready: boolean; missing: string[] } {
   const missing: string[] = []
+  // universe-sweep bots have no fixed watchlist - the kernel's gate for them
+  // is "one recent robust walk-forward of this strategy on ANY pair at this
+  // tf", so mirror that: ready when any validation for (tf, strategy) passes
+  if (bot.universeSweep) {
+    for (const [key, v] of validations) {
+      const [, tf, strategyId] = key.split('|')
+      if (tf !== bot.tf || strategyId !== bot.strategyId || v.verdict !== 'robust') continue
+      if (Math.floor(Date.now() / 1000) - v.ts <= GATE_MAX_AGE_SEC) return { ready: true, missing: [] }
+    }
+    return { ready: false, missing: [`any pair @ ${bot.tf} (${bot.strategyId})`] }
+  }
   for (const asset of bot.watchlist) {
     const v = validations.get(`${asset}|${bot.tf}|${bot.strategyId}`)
     const stale = v ? Math.floor(Date.now() / 1000) - v.ts > GATE_MAX_AGE_SEC : false
@@ -441,12 +452,21 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
               <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">
                 Watchlist ({draft.watchlist.length}/{draft.stakePlan?.kind === 'compound' ? 1 : 12})
               </Label>
-              <WatchlistPicker
-                assets={assets}
-                selected={draft.watchlist}
-                onChange={(w) => patch({ watchlist: draft.stakePlan?.kind === 'compound' ? w.slice(-1) : w })}
-              />
-              {draft.stakePlan?.kind === 'compound' && (
+              {draft.universeSweep ? (
+                <div className="rounded border border-violet-500/30 bg-violet-500/10 px-2 py-2 text-[10px] leading-relaxed text-violet-200">
+                  UNIVERSE SWEEP is ON - the watchlist is bypassed. Every closed {draft.tf} candle this bot pulls the
+                  whole <span className="font-bold">Next Global</span> board (all open pairs, one fused oracle read
+                  each, ranked by tradability) and fires on the top reads that clear every gate below. The pair
+                  edge-triggers, payout floor and adaptive gate still apply per pair.
+                </div>
+              ) : (
+                <WatchlistPicker
+                  assets={assets}
+                  selected={draft.watchlist}
+                  onChange={(w) => patch({ watchlist: draft.stakePlan?.kind === 'compound' ? w.slice(-1) : w })}
+                />
+              )}
+              {draft.stakePlan?.kind === 'compound' && !draft.universeSweep && (
                 <p className="mt-1 text-[9px] leading-relaxed text-[#4b5a72]">
                   Compound bots trade one asset at a time - the pot has no reservation between opening a trade and
                   settling it, so a second concurrent trade would stake off the same pot and corrupt the roll.
@@ -663,6 +683,30 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
               bench on its own, and any win lifts it immediately.
             </p>
 
+            <Segmented
+              label="Universe sweep (Next Global)"
+              options={[
+                { v: 'on', label: 'On' },
+                { v: 'off', label: 'Off' },
+              ]}
+              value={draft.universeSweep ? 'on' : 'off'}
+              onChange={(v) => patch({ universeSweep: v === 'on', watchlist: v === 'on' ? [] : draft.watchlist })}
+            />
+            <p className="-mt-1 text-[9px] leading-relaxed text-[#4b5a72]">
+              Hunt the WHOLE universe: ignore the watchlist and sweep the Next Global board once per closed
+              {draft.tf} candle - the top oracle reads (ranked by confidence x edge) get traded when they clear
+              every gate. Arm-time rule: the strategy needs one recent robust walk-forward on any pair at this tf.
+              The first sweep after arming only records the standing board - it fires on FRESH edges from the next
+              bar on, never the stale middle of a move.
+            </p>
+            {draft.universeSweep && (
+              <NumField
+                label="Sweep trades per bar (board top-N)"
+                value={draft.sweepMaxTrades ?? 1}
+                onChange={(v) => patch({ sweepMaxTrades: Math.min(10, Math.max(1, Math.round(v))) })}
+              />
+            )}
+
             {draft.stakePlan?.kind === 'compound' ? (
               <div>
                 <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Max open positions (locked)</Label>
@@ -855,7 +899,7 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
             ) : (
               <Button
                 onClick={() => void save()}
-                disabled={busy || !draft.watchlist.length}
+                disabled={busy || (!draft.watchlist.length && !draft.universeSweep)}
                 className="h-8 rounded bg-cyan-500/20 text-[11px] font-bold uppercase tracking-wider text-cyan-200 hover:bg-cyan-500/30"
               >
                 {busy ? 'Saving…' : draft.id ? 'Save bot' : 'Deploy bot'}
@@ -995,6 +1039,14 @@ function BotCard({
         ) : (
           <span className="rounded bg-[#101828] px-1 py-px">${bot.stake}</span>
         )}
+        {bot.universeSweep && (
+          <span
+            className="rounded bg-violet-500/15 px-1 py-px text-violet-300"
+            title="universe sweep: hunts the whole Next Global board once per candle - top oracle reads get traded, no fixed watchlist"
+          >
+            universe sweep{bot.sweepMaxTrades && bot.sweepMaxTrades > 1 ? ` x${bot.sweepMaxTrades}` : ''}
+          </span>
+        )}
         {bot.direction !== 'both' && <span className="rounded bg-[#101828] px-1 py-px">{bot.direction} only</span>}
         {bot.regime !== 'all' && <span className="rounded bg-[#101828] px-1 py-px">{bot.regime} regime</span>}
         {bot.adaptive === false ? (
@@ -1030,7 +1082,9 @@ function BotCard({
       </div>
 
       <div className="mt-1 flex items-center justify-between font-mono text-[9px]">
-        <span className="truncate text-[#3d4c66]">{bot.watchlist.join(' · ')}</span>
+        <span className="truncate text-[#3d4c66]">
+          {bot.universeSweep ? 'every open pair · Next Global board' : bot.watchlist.join(' · ')}
+        </span>
         <div className="flex shrink-0 items-center gap-2">
           <span className={stats.pnlToday >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
             today {stats.pnlToday >= 0 ? '+' : ''}{fmtMoney(stats.pnlToday)}
@@ -1539,6 +1593,10 @@ function AutoTraderStrip({
                     ? `CHART-SIG·agree≥4`
                     : at.config.signalSource === 'leadlag'
                       ? `LEAD-LAG·4 groups·corr≥0.35`
+                      : at.config.signalSource === 'oracle-fusion'
+                      ? `ORACLE·conf≥${at.config.minConfidence}·edge≥${at.config.minScore}pp`
+                      : at.config.signalSource === 'tempo'
+                      ? `TEMPO·1shot/10bars·conv${at.config.minConfidence}/${at.config.minScore}`
                       : at.config.signalSource === 'strategy'
                       ? (() => {
                           const ids = at.config.strategyIds?.length ? at.config.strategyIds : at.config.strategyId ? [at.config.strategyId] : []
@@ -1868,6 +1926,8 @@ function AutoTraderDialog({
                   ['pair-signal', 'Pair Signal'],
                   ['shock-pressure', 'Shock+Pressure'],
                   ['poc-triple-confirm', 'POC Triple-Confirm'],
+                  ['oracle-fusion', 'Oracle Fusion'],
+                  ['tempo', 'Tempo 1-Shot'],
                   ['strategy', 'Strategy'],
                 ] as const
               ).map(([v, label]) => (
@@ -1900,6 +1960,10 @@ function AutoTraderDialog({
                           ? 'combines a sudden ATR-normalized "shock" on the latest bar with net buy/sell pressure built up over the prior few bars (candle-level CLV approximation, no real order book) into one agreement-gated composite - trades only when a real shock just happened and the pressure already building agrees with its direction'
                           : d.signalSource === 'poc-triple-confirm'
                             ? 'triple-confirmation: top candle pattern reliability 3/3, top Heikin-Ashi pattern reliability 3/3 agreeing in the same direction, AND price pushed outside both the TPO value area and the Initial Balance in that direction (POC-relative) - all three must agree before it qualifies, run standalone with its own fresh-edge gating so it doesn\'t fire repeatedly while the condition holds'
+                          : d.signalSource === 'oracle-fusion'
+                        ? 'the Next-Candle Oracle\'s multi-model fused next-bar read, swept across the WHOLE open universe (the same board the Next Global panel renders, one fused prediction per pair on the signal tf, shared kernel-side cache). The fusion\'s calibrated confidence - already tightened by the oracle\'s own recent hit rate on that exact pair - must clear Min confidence, AND the fused pUp must lean far enough from the coin flip (|pUp-0.5| in percentage points clears Min |score|) before the fresh edge is acted on; among qualifying pairs it ranks exactly like the Next Global board: confidence × distance-from-coin-flip'
+                          : d.signalSource === 'tempo'
+                        ? 'the patience engine: every 10-bar window is a hunting license for exactly ONE shot per pair - the bar whose fused oracle conviction is surest. An optimal-stopping rule on the pair\'s OWN window-max rhythm decides when to spend the license (early bars must beat the pair\'s typical window best scaled by the bars still to come; the last bar only needs the absolute floor), so on 1m it trades at most 6 times an hour, on 2m 3 times - expiry is always 1 bar of the signal tf (leave expiryTf unset). Min confidence gates the calibrated fusion confidence, Min |score| gates the pp lean off the coin flip. Scanning the Tempo panels never spends a license - only this trader claims shots, one per window, first claim wins'
                           : d.signalSource === 'strategy'
                         ? 'one specific strategy picked below, or several combined - as a vote (ENSEMBLE) or an AUTO-LEARN pool that trades whichever member is proven best per pair - the same strategyId an autopilot bot would use (a builtin strategy, or an AI Lab-learned "(Lab)" spec), not pinned to one bot\'s watchlist'
                         : ''}

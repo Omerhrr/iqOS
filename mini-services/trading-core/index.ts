@@ -28,6 +28,8 @@ import { otcFootprintPlugin, OtcFootprintService } from './src/plugins/otcfootpr
 import { chartSignalsPlugin, ChartSignalsService } from './src/plugins/chartsignals'
 import { leadLagScanPlugin, LeadLagScanService } from './src/plugins/leadlagscan'
 import { yesterdayPlugin, YesterdayService } from './src/plugins/yesterday'
+import { nextCandlePlugin, NextCandleService } from './src/plugins/nextcandle'
+import { tempoPlugin, TempoService } from './src/plugins/tempo'
 import { gridSearch, walkForward, sweepAssets, type Objective } from './src/strategies/optimize'
 import { backtest } from './src/strategies/backtest'
 import type { BacktestOptions } from './src/strategies/backtest'
@@ -184,6 +186,8 @@ kernel.register(otcFootprintPlugin)
 kernel.register(chartSignalsPlugin)
 kernel.register(leadLagScanPlugin)
 kernel.register(yesterdayPlugin)
+kernel.register(nextCandlePlugin)
+kernel.register(tempoPlugin)
 
 // ---------- Full-universe scanners for Distill / Cointegration / Vol Arb ----------
 // These three started as single-asset-only panels (read whatever's on the
@@ -2742,6 +2746,84 @@ const httpServer = createServer(async (req, res) => {
 
       if (path === '/lab_list') {
         return json(200, { ok: true, strategies: kernel.context().use<StrategyLabService>('lab').list() })
+      }
+
+      // ---------- Next-Candle Oracle ----------
+      // GET /next_candle?asset=X&tf=1m -> fused multi-model prediction for the
+      // next candle + tracked for the honesty loop. GET /next_candle_stats ->
+      // the oracle's own resolved track record (hit rate + Brier per asset:tf).
+      if (path === '/next_candle') {
+        try {
+          const svc = kernel.context().use<NextCandleService>('nextcandle')
+          const ncAsset = String(q.get('asset') ?? market.activeAsset)
+          const ncTf = tf(String(q.get('tf') ?? '1m') as string)
+          const pred = svc.predict(ncAsset, ncTf)
+          if (!pred) return json(200, { ok: false, error: `not enough closed history on ${ncAsset} ${ncTf} for the oracle (needs 320+ bars)` })
+          return json(200, { ok: true, prediction: pred })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      if (path === '/next_candle_stats') {
+        try {
+          const svc = kernel.context().use<NextCandleService>('nextcandle')
+          return json(200, { ok: true, ...svc.stats() })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // GET /next_global?tf=1m&limit=30&category=all&refresh=1
+      // -> the Next Global board: one fused next-candle read per instrument
+      // (open universe, category-filterable), rows sorted by tradability
+      // (confidence x distance from coin-flip). Rows are TTL-cached per
+      // pair and every read is tracked by the oracle's honesty loop, so
+      // the board and the per-asset oracle panel share one calibration
+      // record.
+      if (path === '/next_global') {
+        try {
+          const svc = kernel.context().use<NextCandleService>('nextcandle')
+          const gTf = tf(String(q.get('tf') ?? '1m') as string)
+          const out = svc.globalScan(gTf, {
+            limit: Number(q.get('limit') ?? 30),
+            category: q.get('category') ?? 'all',
+            refresh: q.get('refresh') === '1',
+          })
+          return json(200, { ok: true, ...out })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // GET /tempo_scan?tf=1m&limit=30
+      // -> the Tempo board: the patience engine lifted to the whole
+      // universe. One row per open instrument: the shared 10-bar window
+      // clock, the pair's per-bar conviction trace of the CURRENT window,
+      // the patience bar it must clear, and the decision (fire / wait /
+      // skip / done). Pure evaluation - scanning never spends a window
+      // license; only the auto-trader's 'tempo' source claims shots via
+      // the service's claim(). Fusion reads come from /next_global's
+      // engine, so both boards share one TTL cache and one honesty ledger.
+      if (path === '/tempo_scan') {
+        try {
+          const svc = kernel.context().use<TempoService>('tempo')
+          const gTf = tf(String(q.get('tf') ?? '1m') as string)
+          const out = svc.scan(gTf, { limit: Number(q.get('limit') ?? 30) })
+          return json(200, { ok: true, ...out })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // GET /tempo_stats -> lifetime shot ledger (resolved 1-bar shots)
+      if (path === '/tempo_stats') {
+        try {
+          const svc = kernel.context().use<TempoService>('tempo')
+          return json(200, { ok: true, ...svc.stats() })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
       }
 
       if (path === '/lab_get') {

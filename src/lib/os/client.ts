@@ -2061,6 +2061,17 @@ export interface BotConfig {
   /** Self-bench after 3+ consecutive losses (15min, doubling per extra
    * loss, 4h cap; a win clears it). Default off for bots. */
   streakBreaker?: boolean
+  /** UNIVERSE SWEEP (Next Global hunter): ignores the watchlist - once per
+   * closed candle on this bot's tf it pulls the whole Next Global board
+   * (every open pair, fused oracle read, ranked by tradability) and fires on
+   * the top rows clearing every gate (confidence >= max(minScore,
+   * params.minConfidence), P(up) edge >= params.minEdge pp, payout floor,
+   * regime/direction filters, OTC guard, adaptive floor, memory gate).
+   * watchlist may be empty for sweep bots. */
+  universeSweep?: boolean
+  /** Max trades one universe sweep may open per bar (board is walked
+   * top-down, stops at this count). Default 1. */
+  sweepMaxTrades?: number
 }
 
 export interface BotStats {
@@ -2920,7 +2931,7 @@ export type OsMode = 'human' | 'auto'
 
 export interface AutoTraderConfig {
   enabled: boolean
-  signalSource: 'cointegration' | 'triangulation' | 'adx-pattern-bias' | 'pair-signal' | 'shock-pressure' | 'poc-triple-confirm' | 'strategy' | 'chartsignals' | 'leadlag'
+  signalSource: 'cointegration' | 'triangulation' | 'adx-pattern-bias' | 'pair-signal' | 'shock-pressure' | 'poc-triple-confirm' | 'strategy' | 'chartsignals' | 'leadlag' | 'oracle-fusion' | 'tempo'
   tf: Timeframe
   /** The trade's own expiry, as a timeframe - SEPARATE from `tf` (which
    * candles signals are read from). Unset = old behavior (expiry tracks tf
@@ -3232,4 +3243,203 @@ export function fmtTime(ts: number): string {
 export function fmtClock(ts: number): string {
   const d = new Date(ts * 1000)
   return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}:${String(d.getUTCSeconds()).padStart(2, '0')} UTC`
+}
+
+// ---------- Next-Candle Oracle ----------
+
+export interface OracleDriver {
+  name: string
+  pUp: number
+  weight: number
+  vote: number
+  detail: string
+}
+
+export interface NextCandlePrediction {
+  asset: string
+  tf: string
+  ts: number
+  targetBarTime: number
+  price: number
+  pUp: number
+  direction: 'call' | 'put' | 'none'
+  confidence: number
+  rawConfidence: number
+  regime: 'TRENDING' | 'RANGING' | 'VOLATILE' | 'MIXED'
+  expectedMove: number
+  atr: number
+  range: { low: number; high: number }
+  bodyRatio: number
+  closePos: number
+  drivers: OracleDriver[]
+  driversActive: number
+  calibration: { n: number; hitRate: number; brier: number } | null
+  mode: 'sim' | 'live'
+}
+
+export interface NextCandleResponse {
+  ok: boolean
+  error?: string
+  prediction?: NextCandlePrediction
+}
+
+export interface OracleRecord {
+  asset: string
+  tf: string
+  n: number
+  hitRate: number
+  brier: number
+  streak: number
+}
+
+export interface OracleRecentResolution {
+  asset: string
+  tf: string
+  targetBarTime: number
+  resolvedTs: number
+  predicted: 'call' | 'put'
+  pUp: number
+  confidence: number
+  entry: number
+  exit: number
+  actual: 'up' | 'down' | 'flat'
+  hit: boolean
+}
+
+export interface NextCandleStatsResponse {
+  ok: boolean
+  total: number
+  pending: number
+  records: OracleRecord[]
+  recent: OracleRecentResolution[]
+}
+
+export async function getNextCandle(asset: string, tf: Timeframe): Promise<NextCandleResponse> {
+  return osGet<NextCandleResponse>('/next_candle', { asset, tf })
+}
+
+export async function getNextCandleStats(): Promise<NextCandleStatsResponse> {
+  return osGet<NextCandleStatsResponse>('/next_candle_stats', {})
+}
+
+// ---------- Next Global (whole-universe oracle board) ----------
+
+export interface NextGlobalRow {
+  asset: string
+  tf: string
+  computedTs: number
+  ok: boolean
+  note: string
+  pUp: number
+  direction: 'call' | 'put' | 'none'
+  confidence: number
+  rawConfidence: number
+  regime: 'TRENDING' | 'RANGING' | 'VOLATILE' | 'MIXED'
+  price: number
+  expectedMove: number
+  atr: number
+  driversActive: number
+  calibration: { n: number; hitRate: number; brier: number } | null
+}
+
+export interface NextGlobalResponse {
+  ok: boolean
+  error?: string
+  tf: string
+  scannedTs: number
+  universe: number
+  scanned: number
+  live: number
+  warming: number
+  refreshed: number
+  rows?: NextGlobalRow[]
+}
+
+export async function getNextGlobal(
+  tf: Timeframe,
+  opts: { limit?: number; category?: string; refresh?: boolean } = {}
+): Promise<NextGlobalResponse> {
+  return osGet<NextGlobalResponse>('/next_global', {
+    tf,
+    limit: opts.limit,
+    category: opts.category,
+    refresh: opts.refresh ? 1 : undefined,
+  })
+}
+
+// ---------- Tempo (patience engine: 10 bars analyzed, 1 shot) ----------
+
+export interface TempoBarPoint {
+  barTime: number
+  conviction: number
+  direction: 'call' | 'put' | 'none'
+  confidence: number
+  pUp: number
+}
+
+export interface TempoFiredSignal {
+  direction: 'call' | 'put'
+  pUp: number
+  confidence: number
+  conviction: number
+  threshold: number
+  price: number
+  targetBarTime: number
+  ts: number
+  reason: string
+}
+
+export interface TempoRow {
+  asset: string
+  tf: string
+  ok: boolean
+  note: string
+  windowIdx: number
+  /** 0..9 - which bar of the 10-bar window the traded bar is */
+  barIndex: number
+  barsRemaining: number
+  /** wall-clock ms when the window (the license) expires */
+  windowEndsAt: number
+  conviction: number
+  threshold: number
+  patienceBar: number
+  decision: 'fire' | 'wait' | 'skip' | 'done'
+  decisionReason: string
+  fired: boolean
+  firedSignal: TempoFiredSignal | null
+  bestConviction: number
+  trace: TempoBarPoint[]
+  direction: 'call' | 'put' | 'none'
+  pUp: number
+  confidence: number
+  price: number
+  regime: string
+  driversActive: number
+  calibration: { n: number; hitRate: number; brier: number } | null
+  lastShot: { direction: 'call' | 'put'; hit: boolean; conviction: number; resolvedTs: number } | null
+  shotStats: { n: number; hitRate: number | null } | null
+}
+
+export interface TempoScanResponse {
+  ok: boolean
+  error?: string
+  tf: string
+  ts: number
+  window: { index: number; barIndex: number; barsRemaining: number; startedAt: number; endsAt: number }
+  scanned: number
+  live: number
+  firing: number
+  windowsSpent: number
+  windowsMissed: number
+  rows?: TempoRow[]
+}
+
+export async function getTempoScan(
+  tf: Timeframe,
+  opts: { limit?: number } = {}
+): Promise<TempoScanResponse> {
+  return osGet<TempoScanResponse>('/tempo_scan', {
+    tf,
+    limit: opts.limit,
+  })
 }

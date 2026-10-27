@@ -16,7 +16,7 @@ import { gaussLike } from './random'
 import { UNIVERSE, getInstrument, isInstrumentOpen, registerDynamicInstrument } from '../universe'
 import type { Store } from '../store'
 
-const HISTORY_CANDLES = 760
+const HISTORY_CANDLES = Math.max(760, Number(process.env.SIM_PREHISTORY_BARS ?? 760) || 760)
 const MAX_TICKS = 40000
 const MEM_CAP = 1500 // in-memory closed bars per asset|tf (unchanged memory profile)
 // Task 59: max assets the live poll keeps warm per cycle (charted + watchlists).

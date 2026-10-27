@@ -409,6 +409,12 @@ export interface StrategyEval {
  * stands aside instead of fabricating data. */
 export interface StrategyHints {
   asset?: string
+  /** Timeframe of the `candles` series - lets strategies read per-asset:tf
+   * state the rest of the kernel keeps (the oracle-fusion strategy reads the
+   * next-candle honesty loop's calibration record for exactly this pair+tf).
+   * Optional: callers that don't know it omit it, and strategies must treat
+   * a missing tf as "no such state available", never guess one. */
+  tf?: string
   /** For a lead-lag-style strategy only: the GROUP LEADER's candles,
    * aligned bar-for-bar with the `candles` the strategy is otherwise being
    * evaluated on (same slice length/position - index i in both arrays is

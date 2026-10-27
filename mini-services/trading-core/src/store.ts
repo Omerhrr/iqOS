@@ -636,6 +636,25 @@ export class Store {
     }
   }
 
+  /** Most recent ROBUST validation for (tf, strategyId) on ANY asset - the
+   * universe-sweep bots' research gate. A sweep bot trades whichever pairs the
+   * Next Global board surfaces, so demanding a per-pair verdict for all ~25 of
+   * them is unpassable busywork; the honest bar it CAN meet is "this strategy,
+   * at this timeframe, has recently been walk-forward proven somewhere".
+   * Returns null when no robust verdict exists at all. */
+  latestRobustValidationAnyAsset(
+    tf: string,
+    strategyId: string
+  ): { asset: string; oosNet: number; winRate: number; totalTrades: number; ts: number } | null {
+    const row = this.db
+      .query(
+        "SELECT asset, oos_net, win_rate, total_trades, ts FROM validations WHERE tf = ? AND strategy_id = ? AND verdict = 'robust' ORDER BY ts DESC LIMIT 1"
+      )
+      .get(tf, strategyId) as { asset: string; oos_net: number; win_rate: number; total_trades: number; ts: number } | null
+    if (!row) return null
+    return { asset: row.asset, oosNet: row.oos_net, winRate: row.win_rate, totalTrades: row.total_trades, ts: row.ts }
+  }
+
   /** All (asset, tf, strategyId) combos with a saved validation - powers the
    * research-gate status panel without one HTTP round trip per bot instrument. */
   listLatestValidations(): {
