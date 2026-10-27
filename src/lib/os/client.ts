@@ -2198,6 +2198,16 @@ export interface BotConfig {
   name: string
   enabled: boolean
   watchlist: string[]
+  /** Ignore the (then normally empty) watchlist entirely and hunt the WHOLE
+   * open universe instead, via the Next Global board (plugins/autopilot.ts's
+   * sweepers path) - one fused read per open pair, ranked by tradability,
+   * same strategy/tf/risk gates applied market-wide instead of pinned to a
+   * fixed pair list. undefined/false = normal watchlist-only behavior. */
+  universeSweep?: boolean
+  /** universeSweep bots only: how many trades to take off the Next Global
+   * board per bar, at most (1-10, default 1) - the board is ranked by
+   * tradability so this takes the top N qualifying rows, not a random N. */
+  sweepMaxTrades?: number
   strategyId: string
   tf: Timeframe
   params?: Record<string, number | string>
@@ -3118,7 +3128,7 @@ export type OsMode = 'human' | 'auto'
 
 export interface AutoTraderConfig {
   enabled: boolean
-  signalSource: 'cointegration' | 'triangulation' | 'adx-pattern-bias' | 'pair-signal' | 'shock-pressure' | 'poc-triple-confirm' | 'strategy' | 'chartsignals' | 'leadlag'
+  signalSource: 'cointegration' | 'triangulation' | 'adx-pattern-bias' | 'pair-signal' | 'shock-pressure' | 'poc-triple-confirm' | 'oracle-fusion' | 'tempo' | 'strategy' | 'chartsignals' | 'leadlag'
   tf: Timeframe
   /** The trade's own expiry, as a timeframe - SEPARATE from `tf` (which
    * candles signals are read from). Unset = old behavior (expiry tracks tf
