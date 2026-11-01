@@ -760,6 +760,10 @@ export interface AdxPatternBiasScanRow {
   agree: boolean
   composite: number
   direction: 'call' | 'put' | null
+  /** Heikin Ashi pattern read (independent third signal) actively
+   * contradicts the proposed direction - a precision veto that only
+   * tightens qualification, never loosens it. */
+  haDisagrees: boolean
   qualifies: boolean
 }
 

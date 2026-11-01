@@ -66,6 +66,13 @@ export interface AdxPatternBiasFit {
    * agreement amplifies, then clamped. See composite() for the exact rule. */
   composite: number
   direction: Bias
+  /** Heikin Ashi pattern direction actively CONTRADICTS the proposed
+   * direction (both non-neutral, opposite signs) - an independent third
+   * read (same detectors, smoothed series) catching exactly the "ADX/DI +
+   * raw-candle pattern agree, but the smoothed bodies disagree" case that
+   * the raw agree-check alone cannot see. Precision veto only: this never
+   * HELPS a marginal composite qualify, it only blocks one that would have. */
+  haDisagrees: boolean
   qualifies: boolean
 }
 
@@ -120,6 +127,12 @@ export function fitAdxPatternBias(candles: Candle[], period = 14, lookback = PAT
   const comp = composite(trendPush, patBias)
   const direction = biasOf(comp, 0.75)
   const agree = adxDirection !== 'neutral' && patternDirection !== 'neutral' && adxDirection === patternDirection
+  // HA veto: the same pattern catalog, re-run on the smoothed Heikin Ashi
+  // series, actively points the OTHER way - a real disagreement the
+  // raw-candle agree-check above cannot see (it only compares ADX/DI vs
+  // raw-candle patterns). Only ever tightens qualification, never loosens
+  // it: a neutral or agreeing HA read changes nothing.
+  const haDisagrees = haPatternDirection !== 'neutral' && direction !== 'neutral' && haPatternDirection !== direction
 
   return {
     adx: adxVal,
@@ -138,6 +151,7 @@ export function fitAdxPatternBias(candles: Candle[], period = 14, lookback = PAT
     agree,
     composite: comp,
     direction,
-    qualifies: agree && Math.abs(comp) >= COMPOSITE_QUALIFY,
+    haDisagrees,
+    qualifies: agree && Math.abs(comp) >= COMPOSITE_QUALIFY && !haDisagrees,
   }
 }

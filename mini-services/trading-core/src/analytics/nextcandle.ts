@@ -326,7 +326,12 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
   }
 
   const usable = drivers.filter((d) => Number.isFinite(d.pUp) && Number.isFinite(d.weight) && d.weight > 0)
-  if (usable.length < 3) return null // not enough working models - refuse rather than guess
+  // 7 drivers exist; requiring 4+ (a majority) rather than the old 3 (a
+  // minority, <=43%) closes a real small-sample overconfidence hole - a
+  // thin 3-driver read used to score confidence identically to a full
+  // 7-driver one as long as the few available agreed, which overstates how
+  // much evidence actually backs it.
+  if (usable.length < 4) return null // not enough working models - refuse rather than guess
 
   const pUp = fuseOdds(usable.map((d) => ({ pUp: d.pUp, weight: d.weight })))
 
@@ -336,7 +341,12 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
   const totalW = usable.reduce((s, d) => s + d.weight, 0)
   const agreement = totalW > 0 ? agreeW / totalW : 0.5
   const distance = Math.abs(pUp - 0.5) * 2 // 0..1
-  const rawConfidence = clamp((0.55 * agreement + 0.45 * distance) * 100, 0, 97)
+  // sample-size dampener: 7 is the full driver roster: a 4/7 read is
+  // dampened toward coin-flip confidence even when the 4 that fired agree
+  // completely, a 7/7 read gets none - the fused pUp itself is unaffected
+  // (direction never changes), only how much the number is allowed to say.
+  const sampleFactor = clamp(0.72 + 0.28 * (usable.length / drivers.length), 0.72, 1)
+  const rawConfidence = clamp((0.55 * agreement + 0.45 * distance) * 100 * sampleFactor, 0, 97)
 
   // calibration discount: the oracle's own realized record tempers the read
   const cal = input.calibration ?? null
@@ -364,6 +374,13 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
   const bodyRatio = clamp(avgBody / avgRange, 0.05, 0.95)
   const closePosRaw = clamp(0.5 + (dirSign * distance) / 2, 0.05, 0.95)
 
+  // direction deadband: wider in VOLATILE (every driver is noisier there,
+  // chaosFlatten already says so for the weights - the direction call
+  // should demand more separation from the coin flip to match), unchanged
+  // elsewhere. A 0.56/0.44 call on a VOLATILE bar used to get exactly the
+  // same confidence treatment as one on a clean TRENDING bar.
+  const deadband = regime === 'VOLATILE' ? 0.09 : 0.06
+
   return {
     asset: input.asset,
     tf: input.tf,
@@ -371,7 +388,7 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
     targetBarTime,
     price,
     pUp,
-    direction: pUp >= 0.56 ? 'call' : pUp <= 0.44 ? 'put' : 'none',
+    direction: pUp >= 0.5 + deadband ? 'call' : pUp <= 0.5 - deadband ? 'put' : 'none',
     confidence,
     rawConfidence,
     regime,

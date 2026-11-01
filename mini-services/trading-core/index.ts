@@ -528,6 +528,7 @@ interface AdxPatternBiasScanRow {
   agree: boolean
   composite: number
   direction: 'call' | 'put' | null
+  haDisagrees: boolean
   qualifies: boolean
 }
 const adxPatternBiasScanCache = new Map<Timeframe, { ts: number; rows: AdxPatternBiasScanRow[] }>()
@@ -560,6 +561,7 @@ function scanAdxPatternBias(market: MarketDataService, tfv: Timeframe): AdxPatte
         agree: fit.agree,
         composite: fit.composite,
         direction,
+        haDisagrees: fit.haDisagrees,
         qualifies: fit.qualifies,
       })
     } catch {

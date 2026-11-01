@@ -65,6 +65,14 @@ function AdxPatternBiasCard({ r, onSelectAsset }: { r: AdxPatternBiasScanRow; on
             qualifies
           </span>
         )}
+        {r.haDisagrees && (
+          <span
+            className="rounded border border-rose-500/40 bg-rose-500/10 px-1 py-px font-mono text-[8px] font-bold uppercase text-rose-300"
+            title="Heikin Ashi pattern read (independent third signal) contradicts this direction - vetoes qualification even though ADX/DI and raw-candle patterns agree"
+          >
+            ha veto
+          </span>
+        )}
         <span className="ml-auto font-mono text-[9px] text-[#7c8aa5]">{fmtPrice(r.price, r.asset)}</span>
       </div>
       <div className="mt-1.5 flex flex-wrap items-center gap-2 font-mono text-[9px] text-[#7c8aa5]">
@@ -201,7 +209,9 @@ export default function AdxPatternBiasPanel({
             they point the same way and halves the sum when they fight, so a strong trend running into a fresh reversal
             candle gets pulled back toward 0 instead of just winning on size. <span className="text-violet-400/80">agree</span> marks
             direction agreement; <span className="text-violet-400/80">qualifies</span> adds the composite-strength bar on top.
-            Click a card to open that asset on the chart.
+            <span className="text-rose-400/80">ha veto</span> is a third, independent read - the same pattern catalog re-run on
+            smoothed Heikin Ashi candles - and blocks qualification when it actively disagrees, even though ADX/DI and the raw
+            candles agree. Click a card to open that asset on the chart.
           </p>
         )}
         {loading && <div className="px-1 font-mono text-[8px] text-[#3d4d66]">refreshing…</div>}

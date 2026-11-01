@@ -89,11 +89,19 @@ export function tempoConviction(confidence: number, pUp: number): number {
 /** Rolling mean of the pair's recent window-maxima (last N windows). Fewer
  * than 3 observed windows = no statistics yet -> 0, which makes the rule
  * fall back to the absolute floor (explore first, get picky once the
- * pair's own rhythm is known). */
+ * pair's own rhythm is known). From 6 observations on, trims the single
+ * highest and lowest window-max before averaging: a plain mean let ONE
+ * freak high-conviction window drag the patience bar up for the next
+ * TEMPO_HISTORY_WINDOWS windows, making the pair go quiet right after its
+ * best read - the trim keeps the estimate anchored to the pair's typical
+ * rhythm instead of its single best or worst outlier. */
 export function expectedWindowMax(history: number[]): number {
   const h = history.slice(-TEMPO_HISTORY_WINDOWS).filter((v) => Number.isFinite(v) && v > 0)
   if (h.length < 3) return 0
-  return h.reduce((s, v) => s + v, 0) / h.length
+  if (h.length < 6) return h.reduce((s, v) => s + v, 0) / h.length
+  const sorted = [...h].sort((a, b) => a - b)
+  const trimmed = sorted.slice(1, -1)
+  return trimmed.reduce((s, v) => s + v, 0) / trimmed.length
 }
 
 export type TempoDecisionKind = 'fire' | 'wait' | 'skip'
