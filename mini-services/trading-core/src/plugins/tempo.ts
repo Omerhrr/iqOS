@@ -31,6 +31,8 @@ import { tempoConviction, tempoDecide, tempoWindow, TEMPO_FLOOR, TEMPO_PAIR_ACCU
 import { fitAdxPatternBias, PATTERN_BIAS_LOOKBACK } from '../analytics/adxpatternbias'
 import type { NextCandleService, GlobalScanRow } from './nextcandle'
 import type { MarketDataService } from './market-data'
+import type { AdxHonestyService } from './adxhonesty'
+import { weightedHitRate } from '../analytics/recencystats'
 
 const MAX_SHOTS = 400
 const SHOT_FILE = 'tempo_shots.json'
@@ -218,7 +220,12 @@ export class TempoService {
     const PAIR_ACCURACY_TARGET_HIT_RATE = 0.5
     const decided = this.shots.filter((s) => s.asset === asset && s.tf === tf && !s.flat)
     if (decided.length < PAIR_ACCURACY_MIN_N) return 1
-    const hitRate = decided.filter((s) => s.hit).length / decided.length
+    // recency-weighted (analytics/recencystats.ts): a pair's lifetime
+    // ledger used to treat a loss from months ago exactly like one from
+    // this morning - a pair that genuinely turned around would stay
+    // penalized until the whole ledger rolled over. Weighting lets the
+    // dampening ease off within a far shorter real improvement streak.
+    const hitRate = weightedHitRate(decided, (s) => s.hit).hitRate
     if (hitRate >= PAIR_ACCURACY_TARGET_HIT_RATE) return 1
     return Math.max(1, Math.min(TEMPO_PAIR_ACCURACY_MAX_PENALTY, 1 + (PAIR_ACCURACY_TARGET_HIT_RATE - hitRate) * 3))
   }
@@ -387,36 +394,45 @@ export class TempoService {
     const pred = oracle.predict(asset, tf)
     if (!pred) return { ok: false, reason: 'oracle has no read on this pair yet (warming up)' }
     const key = this.key(tf, asset)
-    const conviction = tempoConviction(pred.confidence, pred.pUp)
+    if (pred.direction === 'none') return { ok: false, reason: 'fusion has no directional lean on this bar' }
     const st = this.rollTo(key, pred.targetBarTime, tfSec)
     if (st.fired) return { ok: false, reason: 'license already spent this window' }
-    const w = tempoWindow(pred.targetBarTime, tfSec)
-    const hist = this.historyFor(key, Date.now())
-    const recentSimilarLoss = this.recentSimilarLoss(asset, tf, pred.direction, conviction, w.windowIdx)
-    const pairAccuracyMult = this.pairAccuracyMult(asset, tf)
-    const dec = tempoDecide({ conviction, barsRemaining: w.barsRemaining, windowMaxHistory: hist, recentSimilarLoss, pairAccuracyMult })
-    if (dec.kind !== 'fire') return { ok: false, reason: dec.reason }
-    if (pred.direction === 'none') return { ok: false, reason: 'fusion has no directional lean on this bar' }
-    // cross-engine confluence veto: claim time only (not the scan/display
-    // path above - that stays cheap and TTL-cached). An independently-
-    // built engine, ADX/DI + pattern bias, ACTIVELY calling this exact
-    // pair the OTHER way right now is real information the oracle fusion
-    // alone cannot see. Veto only, same contract as the HA/HTF vetoes
-    // inside fitAdxPatternBias itself - a neutral or agreeing read never
-    // blocks, this only stops a shot the other engine is actively fighting.
+    // cross-engine read, done BEFORE the stopping-rule decision (not just
+    // as a post-hoc veto) so an agreeing second engine can earn the same
+    // learned confluenceBoost() the ADX/DI+Pattern pickers use on a
+    // borderline conviction, not just block a disagreeing one. Veto
+    // contract unchanged: a neutral read never blocks or boosts, only an
+    // ACTIVE opposing read stops the shot.
+    let crossEngineAgrees: boolean | null = null
     try {
       const market = this.ctx.use<MarketDataService>('market')
       const candles = market.getCandlesDeep(asset, tf, 200, true)
       const fit = fitAdxPatternBias(candles, 14, PATTERN_BIAS_LOOKBACK)
       if (fit && fit.direction !== 'neutral') {
         const fitDir: 'call' | 'put' = fit.direction === 'bullish' ? 'call' : 'put'
-        if (fitDir !== pred.direction) {
+        crossEngineAgrees = fitDir === pred.direction
+        if (!crossEngineAgrees) {
           return { ok: false, reason: `held: ADX/DI + pattern bias on this pair currently reads ${fitDir.toUpperCase()}, opposing the oracle's ${pred.direction.toUpperCase()} - cross-engine confluence veto` }
         }
       }
     } catch {
       // confirmation optional - thin history or a bad read never blocks the oracle's own fire
     }
+    let confluenceBoost = 1
+    if (crossEngineAgrees) {
+      try {
+        confluenceBoost = this.ctx.use<AdxHonestyService>('adxhonesty').confluenceBoost()
+      } catch {
+        // learned boost optional - 1 (no change) when the honesty loop isn't loaded
+      }
+    }
+    const conviction = tempoConviction(pred.confidence, pred.pUp) * confluenceBoost
+    const w = tempoWindow(pred.targetBarTime, tfSec)
+    const hist = this.historyFor(key, Date.now())
+    const recentSimilarLoss = this.recentSimilarLoss(asset, tf, pred.direction, conviction, w.windowIdx)
+    const pairAccuracyMult = this.pairAccuracyMult(asset, tf)
+    const dec = tempoDecide({ conviction, barsRemaining: w.barsRemaining, windowMaxHistory: hist, recentSimilarLoss, pairAccuracyMult })
+    if (dec.kind !== 'fire') return { ok: false, reason: dec.reason }
     st.fired = true
     st.firedSignal = {
       direction: pred.direction,

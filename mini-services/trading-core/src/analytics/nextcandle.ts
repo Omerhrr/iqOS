@@ -169,6 +169,15 @@ export interface OracleInput {
    * another. Looked up by this prediction's OWN computed regime; falls
    * back to `calibration` when that regime's bucket is missing or thin. */
   regimeCalibration?: Partial<Record<OracleRegime, { n: number; hitRate: number; brier: number } | null>>
+  /** Same shape as `calibration`, this time the plugin's own bucket for
+   * the CURRENT trading session (classifySession - ASIA/LONDON/OVERLAP/
+   * NEWYORK/OFF/OTC) already resolved and selected before calling in -
+   * this engine just takes whatever single bucket the caller decided
+   * applies right now. Checked after regime (the stronger split) and
+   * before the direction fallback: a pair can be honestly calibrated
+   * overall yet systematically off during the thin OFF hours or the
+   * London/NY OVERLAP specifically. */
+  sessionCalibration?: { n: number; hitRate: number; brier: number } | null
   /** Same shape as `calibration` again, this time split by the PREDICTED
    * DIRECTION ('call'/'put') rather than regime - an oracle can be quietly
    * worse at calling puts than calls on a given pair, an asymmetry the
@@ -460,8 +469,16 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
   // its own n>=20 "thin record is no record" floor.
   const predictedDirSign: 'call' | 'put' = pUp >= 0.5 ? 'call' : 'put'
   const regimeCal = input.regimeCalibration?.[regime] ?? null
+  const sessionCal = input.sessionCalibration ?? null
   const dirCal = input.directionCalibration?.[predictedDirSign] ?? null
-  const cal = regimeCal && regimeCal.n >= 20 ? regimeCal : dirCal && dirCal.n >= 20 ? dirCal : input.calibration ?? null
+  const cal =
+    regimeCal && regimeCal.n >= 20
+      ? regimeCal
+      : sessionCal && sessionCal.n >= 20
+        ? sessionCal
+        : dirCal && dirCal.n >= 20
+          ? dirCal
+          : input.calibration ?? null
   const confidence = applyCalibrationDiscount(rawConfidence, cal)
 
   // ---------- magnitude: EWMA vol + markov next-state emphasis, ATR-anchored ----------

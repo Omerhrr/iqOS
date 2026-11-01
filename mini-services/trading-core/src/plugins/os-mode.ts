@@ -1421,35 +1421,46 @@ export class ModeService {
             }
             const fit = fitAdxPatternBias(candles, 14, PATTERN_BIAS_LOOKBACK, higherCandles)
             if (!fit) continue
-            // honesty loop: report every fit computed from real candles here
-            // (qualifying or not - track() itself only keeps the qualifying
-            // ones) so plugins/adxhonesty.ts can learn from real auto-trader
-            // sweeps, not just panel views.
+            const dir: 'call' | 'put' | 'none' = fit.direction === 'bullish' ? 'call' : fit.direction === 'bearish' ? 'put' : 'none'
+            // cross-engine read, done once up front: used both as the
+            // confluence veto below (opposing active read blocks) and as
+            // the signal fed to the honesty loop's confluenceBoost()
+            // learning (agreeing active read - currently a free no-op at
+            // the veto, this is what lets agreement earn a learned
+            // confidence nudge instead). null = oracle plugin not loaded /
+            // thin history / no active read either way.
+            let oracleAgrees: boolean | null = null
             try {
-              this.ctx.use<AdxHonestyService>('adxhonesty').track(asset, this.config.tf, fit, candles)
+              const oracle = this.ctx.use<NextCandleService>('nextcandle')
+              const oraclePred = oracle.predict(asset, this.config.tf)
+              if (oraclePred && oraclePred.direction !== 'none' && dir !== 'none') oracleAgrees = oraclePred.direction === dir
+            } catch {
+              // oracle plugin not loaded / thin history - confirmation optional, never blocks
+            }
+            // honesty loop: report every fit computed from real candles here
+            // (qualifying, or blocked only by the HTF veto for shadow
+            // learning - track() itself decides which) so
+            // plugins/adxhonesty.ts can learn from real auto-trader
+            // sweeps, not just panel views.
+            let confluenceBoost = 1
+            try {
+              const honesty = this.ctx.use<AdxHonestyService>('adxhonesty')
+              honesty.track(asset, this.config.tf, fit, candles, oracleAgrees)
+              confluenceBoost = honesty.confluenceBoost()
             } catch {
               // honesty tracking optional - never blocks the sweep
             }
             if (!fit.qualifies) continue
-            const dir: 'call' | 'put' | 'none' = fit.direction === 'bullish' ? 'call' : fit.direction === 'bearish' ? 'put' : 'none'
             if (dir === 'none') continue
             if (this.config.direction !== 'both' && dir !== this.config.direction) continue
             // cross-engine confluence veto: if the Next-Candle Oracle has an
             // ACTIVE opposing read on this exact pair+tf, skip - never
             // requires the oracle's agreement to fire (a 'none' or agreeing
             // oracle read changes nothing), only blocks a pair the oracle is
-            // actively calling the other way. Only called for candidates
-            // that already passed fit.qualifies, so this never runs the
-            // full fusion on the whole sweep.
-            try {
-              const oracle = this.ctx.use<NextCandleService>('nextcandle')
-              const oraclePred = oracle.predict(asset, this.config.tf)
-              if (oraclePred && oraclePred.direction !== 'none' && oraclePred.direction !== dir) continue
-            } catch {
-              // oracle plugin not loaded / thin history - confirmation optional, never blocks
-            }
-            const score = Math.round(clamp(40 + (Math.abs(fit.composite) - COMPOSITE_QUALIFY) * 10, 40, 95)) * (dir === 'call' ? 1 : -1)
-            const confidence = Math.round(clamp(40 + (fit.adx - ADX_TREND_THRESHOLD) * 0.8 + (Math.abs(fit.composite) - COMPOSITE_QUALIFY) * 6, 35, 95))
+            // actively calling the other way.
+            if (oracleAgrees === false) continue
+            const score = Math.round(clamp(clamp(40 + (Math.abs(fit.composite) - COMPOSITE_QUALIFY) * 10, 40, 95) * (oracleAgrees ? confluenceBoost : 1), 40, 95)) * (dir === 'call' ? 1 : -1)
+            const confidence = Math.round(clamp(clamp(40 + (fit.adx - ADX_TREND_THRESHOLD) * 0.8 + (Math.abs(fit.composite) - COMPOSITE_QUALIFY) * 6, 35, 95) * (oracleAgrees ? confluenceBoost : 1), 35, 95))
             if (!finGte(Math.abs(score), this.config.minScore)) continue
             if (!finGte(confidence, this.config.minConfidence)) continue
             const key = SweepEdgeMemory.key(asset, dir)
@@ -1631,29 +1642,38 @@ export class ModeService {
             }
             const fit = fitAdxPatternBias(candles, 14, PATTERN_BIAS_LOOKBACK, higherCandles)
             if (!fit) continue
-            // honesty loop: report every fit computed from real candles here
-            // (qualifying or not - track() itself only keeps the qualifying
-            // ones) so plugins/adxhonesty.ts can learn from real auto-trader
-            // sweeps, not just panel views.
+            const dir: 'call' | 'put' | 'none' = fit.direction === 'bullish' ? 'call' : fit.direction === 'bearish' ? 'put' : 'none'
+            // cross-engine read, done once up front - same contract as
+            // pickAdxPatternBiasSignal above: used both for the veto below
+            // and to feed the honesty loop's learned confluenceBoost().
+            let oracleAgrees: boolean | null = null
             try {
-              this.ctx.use<AdxHonestyService>('adxhonesty').track(asset, this.config.tf, fit, candles)
+              const oracle = this.ctx.use<NextCandleService>('nextcandle')
+              const oraclePred = oracle.predict(asset, this.config.tf)
+              if (oraclePred && oraclePred.direction !== 'none' && dir !== 'none') oracleAgrees = oraclePred.direction === dir
+            } catch {
+              // oracle plugin not loaded / thin history - confirmation optional, never blocks
+            }
+            // honesty loop: report every fit computed from real candles here
+            // (qualifying, or blocked only by the HTF veto for shadow
+            // learning - track() itself decides which) so
+            // plugins/adxhonesty.ts can learn from real auto-trader
+            // sweeps, not just panel views.
+            let confluenceBoost = 1
+            try {
+              const honesty = this.ctx.use<AdxHonestyService>('adxhonesty')
+              honesty.track(asset, this.config.tf, fit, candles, oracleAgrees)
+              confluenceBoost = honesty.confluenceBoost()
             } catch {
               // honesty tracking optional - never blocks the sweep
             }
             if (!fit.qualifies) continue
-            const dir: 'call' | 'put' | 'none' = fit.direction === 'bullish' ? 'call' : fit.direction === 'bearish' ? 'put' : 'none'
             if (dir === 'none') continue
             if (this.config.direction !== 'both' && dir !== this.config.direction) continue
             // cross-engine confluence veto - same contract as
             // pickAdxPatternBiasSignal above: only blocks an ACTIVE
             // opposing oracle read, never requires its agreement.
-            try {
-              const oracle = this.ctx.use<NextCandleService>('nextcandle')
-              const oraclePred = oracle.predict(asset, this.config.tf)
-              if (oraclePred && oraclePred.direction !== 'none' && oraclePred.direction !== dir) continue
-            } catch {
-              // oracle plugin not loaded / thin history - confirmation optional, never blocks
-            }
+            if (oracleAgrees === false) continue
 
             const haAgrees = fit.haPatternDirection === fit.direction
             const haOpposes = fit.haPatternDirection !== 'neutral' && fit.haPatternDirection !== fit.direction
@@ -1666,8 +1686,8 @@ export class ModeService {
             const volAdj = fit.volumeConfirms === true ? 4 : fit.volumeConfirms === false ? -4 : 0
             const confirmAdj = (haAgrees ? 8 : haOpposes ? -12 : 0) + (deltaAgrees ? 6 : deltaOpposes ? -10 : 0) + volAdj
 
-            const score = Math.round(clamp(40 + (Math.abs(fit.composite) - COMPOSITE_QUALIFY) * 10 + confirmAdj, 5, 97)) * (dir === 'call' ? 1 : -1)
-            const confidence = Math.round(clamp(40 + (fit.adx - ADX_TREND_THRESHOLD) * 0.8 + (Math.abs(fit.composite) - COMPOSITE_QUALIFY) * 6 + confirmAdj, 5, 97))
+            const score = Math.round(clamp(clamp(40 + (Math.abs(fit.composite) - COMPOSITE_QUALIFY) * 10 + confirmAdj, 5, 97) * (oracleAgrees ? confluenceBoost : 1), 5, 97)) * (dir === 'call' ? 1 : -1)
+            const confidence = Math.round(clamp(clamp(40 + (fit.adx - ADX_TREND_THRESHOLD) * 0.8 + (Math.abs(fit.composite) - COMPOSITE_QUALIFY) * 6 + confirmAdj, 5, 97) * (oracleAgrees ? confluenceBoost : 1), 5, 97))
             if (!finGte(Math.abs(score), this.config.minScore)) continue
             if (!finGte(confidence, this.config.minConfidence)) continue
             const key = SweepEdgeMemory.key(asset, dir)

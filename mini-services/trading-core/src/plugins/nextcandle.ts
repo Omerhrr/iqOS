@@ -21,6 +21,8 @@ import type { KernelContext, Plugin } from '../kernel'
 import type { Candle, Timeframe } from '../types'
 import { predictNextCandle, setOracleCalibrationProvider, type NextCandlePrediction, type OracleRegime } from '../analytics/nextcandle'
 import { setPatternReliabilityProvider } from '../analytics/patterns'
+import { weightedHitRate, weightedMeanBy } from '../analytics/recencystats'
+import { classifySession, type Session } from '../analytics/session'
 import type { MarketDataService } from './market-data'
 
 const MAX_RESOLVED = 800
@@ -173,12 +175,14 @@ export class NextCandleService {
   predict(asset: string, tf: string): NextCandlePrediction | null {
     const candles: Candle[] = this.market.getCandlesDeep(asset, tf as never, 1500, true)
     const cal = this.calibrationFor(asset, tf)
+    const currentSession = classifySession(Math.floor(Date.now() / 1000), asset)
     const pred = predictNextCandle(candles, {
       asset,
       tf,
       mode: this.market.mode,
       calibration: cal,
       regimeCalibration: this.regimeCalibrationFor(asset, tf),
+      sessionCalibration: this.sessionCalibrationFor(asset, tf)[currentSession] ?? null,
       directionCalibration: this.directionCalibrationFor(asset, tf),
       driverWeightMultipliers: this.driverWeightMultipliers(),
       regimeDriverWeightMultipliers: this.driverWeightMultipliersByRegime(),
@@ -248,12 +252,17 @@ export class NextCandleService {
     }
   }
 
-  /** Rolling record for one asset:tf, windowed to CALIBRATION_WINDOW. */
+  /** Rolling record for one asset:tf, windowed to CALIBRATION_WINDOW.
+   * Recency-weighted (see analytics/recencystats.ts): a loss streak from
+   * weeks ago no longer holds the discount down once the pair has clearly
+   * turned around - the discount now tracks a real accuracy shift within
+   * roughly a half-life's worth of fresh resolutions instead of waiting
+   * for the whole flat window to roll over. */
   calibrationFor(asset: string, tf: string): { n: number; hitRate: number; brier: number } | null {
     const rows = this.resolved.filter((r) => r.asset === asset && r.tf === tf).slice(-CALIBRATION_WINDOW)
     if (rows.length === 0) return null
-    const hitRate = rows.reduce((s, r) => s + r.score, 0) / rows.length
-    const brier = rows.reduce((s, r) => s + r.brier, 0) / rows.length
+    const hitRate = weightedMeanBy(rows, (r) => r.score)
+    const brier = weightedMeanBy(rows, (r) => r.brier)
     return { n: rows.length, hitRate, brier }
   }
 
@@ -273,8 +282,37 @@ export class NextCandleService {
       if (rs.length < 20) continue
       out[regime] = {
         n: rs.length,
-        hitRate: rs.reduce((s, r) => s + r.score, 0) / rs.length,
-        brier: rs.reduce((s, r) => s + r.brier, 0) / rs.length,
+        hitRate: weightedMeanBy(rs, (r) => r.score),
+        brier: weightedMeanBy(rs, (r) => r.brier),
+      }
+    }
+    return out
+  }
+
+  /** Session-bucketed rolling record (classifySession - ASIA/LONDON/
+   * OVERLAP/NEWYORK/OFF/OTC), same shape and same "n>=20" floor as
+   * regimeCalibrationFor() above. A pair that's honestly calibrated
+   * overall can still be systematically over-confident in the thin OFF
+   * hours or under-confident during the London/NY OVERLAP - this catches
+   * that without needing a separate regime bucket per session. Checked
+   * AFTER regime (the stronger, already-proven split) and BEFORE the
+   * direction fallback in predictNextCandle's preference order. */
+  private sessionCalibrationFor(asset: string, tf: string): Partial<Record<Session, { n: number; hitRate: number; brier: number }>> {
+    const rows = this.resolved.filter((r) => r.asset === asset && r.tf === tf).slice(-CALIBRATION_WINDOW * 2)
+    const out: Partial<Record<Session, { n: number; hitRate: number; brier: number }>> = {}
+    const bySession = new Map<Session, ResolvedPrediction[]>()
+    for (const r of rows) {
+      const session = classifySession(Math.floor(r.issuedTs / 1000), asset)
+      const list = bySession.get(session) ?? []
+      list.push(r)
+      bySession.set(session, list)
+    }
+    for (const [session, rs] of bySession) {
+      if (rs.length < 20) continue
+      out[session] = {
+        n: rs.length,
+        hitRate: weightedMeanBy(rs, (r) => r.score),
+        brier: weightedMeanBy(rs, (r) => r.brier),
       }
     }
     return out
@@ -294,8 +332,8 @@ export class NextCandleService {
       if (rs.length < 20) continue
       out[dir] = {
         n: rs.length,
-        hitRate: rs.reduce((s, r) => s + r.score, 0) / rs.length,
-        brier: rs.reduce((s, r) => s + r.brier, 0) / rs.length,
+        hitRate: weightedMeanBy(rs, (r) => r.score),
+        brier: weightedMeanBy(rs, (r) => r.brier),
       }
     }
     return out
@@ -309,21 +347,20 @@ export class NextCandleService {
    * carries in analytics/nextcandle.ts. */
   private driverWeightMultipliers(): Record<string, number> {
     const window = this.resolved.slice(-DRIVER_STATS_WINDOW)
-    const byName = new Map<string, { n: number; wins: number }>()
+    const byName = new Map<string, { calls: boolean[] }>()
     for (const r of window) {
       const realizedUpSign = r.actual === 'up' ? 1 : r.actual === 'down' ? -1 : 0
       if (realizedUpSign === 0) continue // flat bars don't score any driver
       for (const d of r.drivers ?? []) {
-        const s = byName.get(d.name) ?? { n: 0, wins: 0 }
-        s.n++
-        if (Math.sign(d.vote) === realizedUpSign) s.wins++
+        const s = byName.get(d.name) ?? { calls: [] }
+        s.calls.push(Math.sign(d.vote) === realizedUpSign)
         byName.set(d.name, s)
       }
     }
     const out: Record<string, number> = {}
     for (const [name, s] of byName) {
-      if (s.n < DRIVER_STATS_MIN_N) continue
-      const winRate = s.wins / s.n
+      if (s.calls.length < DRIVER_STATS_MIN_N) continue
+      const winRate = weightedHitRate(s.calls, (hit) => hit).hitRate
       out[name] = Math.max(0.75, Math.min(1.3, 0.75 + (winRate - 0.5) * 2.5))
     }
     return out
@@ -339,15 +376,14 @@ export class NextCandleService {
    * back to the blended table for it. */
   private driverWeightMultipliersByRegime(): Partial<Record<OracleRegime, Record<string, number>>> {
     const window = this.resolved.slice(-DRIVER_STATS_WINDOW * 2)
-    const byRegime = new Map<OracleRegime, Map<string, { n: number; wins: number }>>()
+    const byRegime = new Map<OracleRegime, Map<string, boolean[]>>()
     for (const r of window) {
       const realizedUpSign = r.actual === 'up' ? 1 : r.actual === 'down' ? -1 : 0
       if (realizedUpSign === 0) continue
-      const byName = byRegime.get(r.regime) ?? new Map<string, { n: number; wins: number }>()
+      const byName = byRegime.get(r.regime) ?? new Map<string, boolean[]>()
       for (const d of r.drivers ?? []) {
-        const s = byName.get(d.name) ?? { n: 0, wins: 0 }
-        s.n++
-        if (Math.sign(d.vote) === realizedUpSign) s.wins++
+        const s = byName.get(d.name) ?? []
+        s.push(Math.sign(d.vote) === realizedUpSign)
         byName.set(d.name, s)
       }
       byRegime.set(r.regime, byName)
@@ -355,9 +391,9 @@ export class NextCandleService {
     const out: Partial<Record<OracleRegime, Record<string, number>>> = {}
     for (const [regime, byName] of byRegime) {
       const table: Record<string, number> = {}
-      for (const [name, s] of byName) {
-        if (s.n < DRIVER_STATS_MIN_N) continue
-        const winRate = s.wins / s.n
+      for (const [name, calls] of byName) {
+        if (calls.length < DRIVER_STATS_MIN_N) continue
+        const winRate = weightedHitRate(calls, (hit) => hit).hitRate
         table[name] = Math.max(0.75, Math.min(1.3, 0.75 + (winRate - 0.5) * 2.5))
       }
       if (Object.keys(table).length > 0) out[regime] = table
@@ -374,8 +410,8 @@ export class NextCandleService {
   private magnitudeCalibrationFor(asset: string, tf: string): number | null {
     const rows = this.resolved.filter((r) => r.asset === asset && r.tf === tf && r.actual !== 'flat' && r.expectedMove > 0).slice(-CALIBRATION_WINDOW)
     if (rows.length < 20) return null
-    const realizedAvg = rows.reduce((s, r) => s + Math.abs(r.exit - r.entry), 0) / rows.length
-    const predictedAvg = rows.reduce((s, r) => s + r.expectedMove, 0) / rows.length
+    const realizedAvg = weightedMeanBy(rows, (r) => Math.abs(r.exit - r.entry))
+    const predictedAvg = weightedMeanBy(rows, (r) => r.expectedMove)
     if (predictedAvg <= 0) return null
     return realizedAvg / predictedAvg
   }
@@ -394,23 +430,22 @@ export class NextCandleService {
    * at. */
   private patternReliabilityTable(): Record<string, number> {
     const window = this.resolved.slice(-PATTERN_STATS_WINDOW)
-    const byName = new Map<string, { n: number; wins: number }>()
+    const byName = new Map<string, boolean[]>()
     for (const r of window) {
       const realizedUpSign = r.actual === 'up' ? 1 : r.actual === 'down' ? -1 : 0
       if (realizedUpSign === 0) continue // flat bars don't score any pattern
       for (const h of r.patternHits ?? []) {
         if (h.direction === 'neutral') continue // neutral patterns have nothing to score
         const dirSign = h.direction === 'bullish' ? 1 : -1
-        const s = byName.get(h.name) ?? { n: 0, wins: 0 }
-        s.n++
-        if (dirSign === realizedUpSign) s.wins++
+        const s = byName.get(h.name) ?? []
+        s.push(dirSign === realizedUpSign)
         byName.set(h.name, s)
       }
     }
     const out: Record<string, number> = {}
-    for (const [name, s] of byName) {
-      if (s.n < PATTERN_STATS_MIN_N) continue
-      const winRate = s.wins / s.n
+    for (const [name, calls] of byName) {
+      if (calls.length < PATTERN_STATS_MIN_N) continue
+      const winRate = weightedHitRate(calls, (hit) => hit).hitRate
       out[name] = Math.max(0.3, Math.min(4, winRate * 6))
     }
     return out

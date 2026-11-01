@@ -38,9 +38,11 @@ import type { Candle } from '../types'
 import {
   type AdxPatternBiasFit,
   type Bias,
+  setAdxHtfLearningProvider,
   setAdxPatternBiasLearningProvider,
   setAdxQualifyBarProvider,
 } from '../analytics/adxpatternbias'
+import { weightedHitRate } from '../analytics/recencystats'
 
 const MAX_RESOLVED = 600
 const OUTCOME_FILE = 'adxpatternbias_outcomes.json'
@@ -56,6 +58,15 @@ const QUALIFY_BAR_CANDIDATES = [2.5, 3, 3.5, 4, 4.5, 5, 5.5]
 const QUALIFY_TARGET_HIT_RATE = 0.55
 const QUALIFY_BAR_MIN_N = 30
 const QUALIFY_BAR_WINDOW = 500
+/** min samples per side (htf-agreeing vs htf-disagreeing, oracle-agreeing
+ * vs not) before the HTF-veto learning or the confluence boost trusts the
+ * comparison - same floor philosophy as everywhere else in this stack. */
+const SIDE_STATS_MIN_N = 20
+const SIDE_STATS_WINDOW = 500
+/** confluenceBoost() never amplifies confidence/composite by more than
+ * this - an agreeing second engine earns a real but bounded nudge, never
+ * enough to turn a marginal read into a sure thing on its own. */
+const CONFLUENCE_BOOST_MAX = 1.25
 
 interface PendingAdxCall {
   asset: string
@@ -67,6 +78,18 @@ interface PendingAdxCall {
   patternDirection: Bias
   composite: number
   price: number
+  /** this read's HTF disagreement flag, carried through to resolution so
+   * htfAlignmentLearning() can compare agree-vs-disagree hit rates. */
+  htfDisagrees: boolean
+  /** true when this call only exists because the HTF veto alone was
+   * blocking an otherwise-qualifying read - tracked for learning purposes
+   * only, never treated as a live signal by any caller (fit.qualifies was
+   * false, so nothing actually fired on it). */
+  shadow: boolean
+  /** did the Next-Candle Oracle have an ACTIVE same-direction read on this
+   * exact pair+tf at track time? null = oracle had no active read either
+   * way (not tracked as agreement OR disagreement). */
+  oracleAgrees: boolean | null
 }
 
 export interface ResolvedAdxCall {
@@ -83,6 +106,9 @@ export interface ResolvedAdxCall {
   exit: number
   actual: 'up' | 'down' | 'flat'
   hit: boolean
+  htfDisagrees: boolean
+  shadow: boolean
+  oracleAgrees: boolean | null
 }
 
 export class AdxHonestyService {
@@ -100,7 +126,8 @@ export class AdxHonestyService {
     })
     setAdxPatternBiasLearningProvider(() => this.legWeights())
     setAdxQualifyBarProvider(() => this.learnedQualifyBar())
-    ctx.log('adxhonesty', 'ADX/DI + pattern bias honesty loop online (learned leg weights + learned qualify bar)')
+    setAdxHtfLearningProvider(() => this.htfAlignmentLearning())
+    ctx.log('adxhonesty', 'ADX/DI + pattern bias honesty loop online (learned leg weights + learned qualify bar + learned HTF veto)')
   }
 
   stop(): void {
@@ -109,12 +136,21 @@ export class AdxHonestyService {
   }
 
   /** Report a freshly-computed fit (with REAL market candles) for tracking.
-   * No-op when it doesn't qualify - only qualifying calls are worth
-   * resolving, the same way the Oracle only tracks a real prediction, not
-   * every poll. Dedupes per (asset, tf, targetBarTime): a re-poll inside
-   * the same forming bar replaces the pending entry, not stacks it. */
-  track(asset: string, tf: string, fit: AdxPatternBiasFit, candles: Candle[]): void {
-    if (!fit.qualifies || fit.direction === 'neutral') return
+   * Tracks it when it actually qualifies (a live, fired signal), OR when
+   * it's blocked ONLY by the HTF veto (fit.qualifiesIgnoringHtf true,
+   * fit.qualifies false, fit.htfDisagrees true) - that second case is a
+   * SHADOW entry: nothing fired on it, but its real outcome is the only
+   * way htfAlignmentLearning() can ever learn whether the HTF veto is
+   * worth its cost, since a hard-blocked call otherwise never resolves
+   * against reality. `oracleAgrees` (optional) lets a caller that already
+   * checked the Next-Candle Oracle's own active read pass that agreement
+   * through for confluenceBoost() to learn from - omit it when the oracle
+   * wasn't checked. Dedupes per (asset, tf, targetBarTime): a re-poll
+   * inside the same forming bar replaces the pending entry, not stacks it. */
+  track(asset: string, tf: string, fit: AdxPatternBiasFit, candles: Candle[], oracleAgrees?: boolean | null): void {
+    if (fit.direction === 'neutral') return
+    const shadow = !fit.qualifies && fit.htfDisagrees && fit.qualifiesIgnoringHtf
+    if (!fit.qualifies && !shadow) return
     if (candles.length < 2) return
     const last = candles[candles.length - 1]
     const prev = candles[candles.length - 2]
@@ -131,11 +167,32 @@ export class AdxHonestyService {
       patternDirection: fit.patternDirection,
       composite: fit.composite,
       price: last.close,
+      htfDisagrees: fit.htfDisagrees,
+      shadow,
+      oracleAgrees: oracleAgrees ?? null,
     })
     if (this.pending.size > 400) {
       const keys = [...this.pending.keys()].slice(0, 80)
       for (const k of keys) this.pending.delete(k)
     }
+  }
+
+  /** Learned confluence boost: how much extra weight an agreeing
+   * Next-Candle Oracle read (same direction, active at track time) is
+   * worth, based on whether agreeing calls have actually resolved better
+   * than calls where the oracle disagreed or had no active read. 1 (no
+   * boost) until both sides have SIDE_STATS_MIN_N samples - agreement is
+   * currently a free no-op everywhere it's checked; this is what finally
+   * lets it count for something, capped at CONFLUENCE_BOOST_MAX so it can
+   * only ever nudge, not replace, the base read. */
+  confluenceBoost(): number {
+    const window = this.resolved.filter((r) => !r.shadow && r.actual !== 'flat').slice(-SIDE_STATS_WINDOW)
+    const agree = window.filter((r) => r.oracleAgrees === true)
+    const rest = window.filter((r) => r.oracleAgrees !== true)
+    if (agree.length < SIDE_STATS_MIN_N || rest.length < SIDE_STATS_MIN_N) return 1
+    const agreeRate = weightedHitRate(agree, (r) => r.hit).hitRate
+    const restRate = weightedHitRate(rest, (r) => r.hit).hitRate
+    return Math.max(1, Math.min(CONFLUENCE_BOOST_MAX, 1 + (agreeRate - restRate) * 2))
   }
 
   private resolveFor(asset: string, tf: string, candle: Candle): void {
@@ -161,6 +218,9 @@ export class AdxHonestyService {
         exit: candle.close,
         actual,
         hit,
+        htfDisagrees: p.htfDisagrees,
+        shadow: p.shadow,
+        oracleAgrees: p.oracleAgrees,
       }
       this.resolved.push(entry)
       while (this.resolved.length > MAX_RESOLVED) this.resolved.shift()
@@ -174,29 +234,49 @@ export class AdxHonestyService {
    * until BOTH legs have LEG_STATS_MIN_N - a one-sided record would let a
    * thin leg's noise silently out-weigh a well-sampled one. */
   private legWeights(): { trendWeight: number; patternWeight: number } | null {
-    const window = this.resolved.slice(-LEG_STATS_WINDOW).filter((r) => r.actual !== 'flat')
-    let trendN = 0
-    let trendWins = 0
-    let patN = 0
-    let patWins = 0
+    // shadow entries never actually fired (the HTF veto blocked them) -
+    // excluded here so leg-weight learning stays scoped to real, live
+    // calls, same as before this round's HTF-shadow tracking was added.
+    const window = this.resolved.slice(-LEG_STATS_WINDOW).filter((r) => !r.shadow && r.actual !== 'flat')
+    const trendCalls: boolean[] = []
+    const patCalls: boolean[] = []
     for (const r of window) {
       const up = r.actual === 'up'
-      if (r.adxDirection !== 'neutral') {
-        trendN++
-        if ((r.adxDirection === 'bullish') === up) trendWins++
-      }
-      if (r.patternDirection !== 'neutral') {
-        patN++
-        if ((r.patternDirection === 'bullish') === up) patWins++
-      }
+      if (r.adxDirection !== 'neutral') trendCalls.push((r.adxDirection === 'bullish') === up)
+      if (r.patternDirection !== 'neutral') patCalls.push((r.patternDirection === 'bullish') === up)
     }
-    if (trendN < LEG_STATS_MIN_N || patN < LEG_STATS_MIN_N) return null
-    const trendWinRate = trendWins / trendN
-    const patWinRate = patWins / patN
+    if (trendCalls.length < LEG_STATS_MIN_N || patCalls.length < LEG_STATS_MIN_N) return null
+    const trendWinRate = weightedHitRate(trendCalls, (hit) => hit).hitRate
+    const patWinRate = weightedHitRate(patCalls, (hit) => hit).hitRate
     return {
       trendWeight: Math.max(0.5, Math.min(2, 0.5 + (trendWinRate - 0.5) * 3)),
       patternWeight: Math.max(0.5, Math.min(2, 0.5 + (patWinRate - 0.5) * 3)),
     }
+  }
+
+  /** Learned replacement for the flat HTF veto (see
+   * setAdxHtfLearningProvider's doc in analytics/adxpatternbias.ts): compares
+   * the resolved hit rate of calls where the HTF read agreed/was neutral
+   * against calls where it actively disagreed (both the rare live ones and
+   * the shadow-tracked ones the veto blocked from firing) - INCLUDING
+   * shadow entries here, unlike legWeights()/learnedQualifyBar() above,
+   * because a shadow call's market outcome is exactly what's needed to
+   * judge the veto itself; it just never got a chance to be live. null
+   * (defaults the veto back to its original hard-block behavior) until
+   * both sides clear SIDE_STATS_MIN_N. */
+  private htfAlignmentLearning(): { penaltyMult: number } | null {
+    const window = this.resolved.filter((r) => r.actual !== 'flat').slice(-SIDE_STATS_WINDOW)
+    const agree = window.filter((r) => !r.htfDisagrees)
+    const disagree = window.filter((r) => r.htfDisagrees)
+    if (agree.length < SIDE_STATS_MIN_N || disagree.length < SIDE_STATS_MIN_N) return null
+    const agreeRate = weightedHitRate(agree, (r) => r.hit).hitRate
+    const disagreeRate = weightedHitRate(disagree, (r) => r.hit).hitRate
+    // disagreeing reads that do just as well (or better) than agreeing
+    // ones mean the veto isn't buying real accuracy - penaltyMult relaxes
+    // toward 1 (barely any extra margin required). Disagreeing reads that
+    // resolve meaningfully worse keep (or restore) a steep multiplier -
+    // at composite's own max scale, 8x is effectively still a hard block.
+    return { penaltyMult: Math.max(1, Math.min(8, 1 + (agreeRate - disagreeRate) * 6)) }
   }
 
   /** Smallest candidate qualify bar whose own resolved subset clears the
@@ -208,20 +288,29 @@ export class AdxHonestyService {
    * COMPOSITE_QUALIFY) until the smallest candidate itself has enough
    * samples to trust. */
   private learnedQualifyBar(): number | null {
-    const window = this.resolved.slice(-QUALIFY_BAR_WINDOW).filter((r) => r.actual !== 'flat')
+    const window = this.resolved.slice(-QUALIFY_BAR_WINDOW).filter((r) => !r.shadow && r.actual !== 'flat')
     if (window.length < QUALIFY_BAR_MIN_N) return null
     for (const c of QUALIFY_BAR_CANDIDATES) {
       const subset = window.filter((r) => Math.abs(r.composite) >= c)
       if (subset.length < QUALIFY_BAR_MIN_N) continue
-      const hitRate = subset.filter((r) => r.hit).length / subset.length
+      const hitRate = weightedHitRate(subset, (r) => r.hit).hitRate
       if (hitRate >= QUALIFY_TARGET_HIT_RATE) return c
     }
     return null
   }
 
   /** Lifetime ledger for panels/agents. */
-  stats(): { total: number; pending: number; hitRate: number | null; legWeights: { trendWeight: number; patternWeight: number } | null; qualifyBar: number | null; recent: ResolvedAdxCall[] } {
-    const decided = this.resolved.filter((r) => r.actual !== 'flat')
+  stats(): {
+    total: number
+    pending: number
+    hitRate: number | null
+    legWeights: { trendWeight: number; patternWeight: number } | null
+    qualifyBar: number | null
+    htfPenaltyMult: number | null
+    confluenceBoost: number
+    recent: ResolvedAdxCall[]
+  } {
+    const decided = this.resolved.filter((r) => !r.shadow && r.actual !== 'flat')
     const wins = decided.filter((r) => r.hit).length
     return {
       total: this.resolved.length,
@@ -229,6 +318,8 @@ export class AdxHonestyService {
       hitRate: decided.length ? wins / decided.length : null,
       legWeights: this.legWeights(),
       qualifyBar: this.learnedQualifyBar(),
+      htfPenaltyMult: this.htfAlignmentLearning()?.penaltyMult ?? null,
+      confluenceBoost: this.confluenceBoost(),
       recent: this.resolved.slice(-40).reverse(),
     }
   }

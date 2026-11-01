@@ -84,6 +84,19 @@ export function setAdxQualifyBarProvider(p: AdxQualifyBarProvider | null): void 
   adxQualifyBarProvider = p
 }
 
+/** Learned replacement for the flat HTF veto: how much extra composite
+ * margin an HTF-disagreeing read must clear to still qualify, as a
+ * multiplier on the normal qualify bar. null (the default, and the
+ * fallback below LEG_STATS_MIN_N-equivalent sample size in the honesty
+ * loop) means "no learning yet" and the veto stays exactly as hard as it
+ * always was - this can only ever make the veto data-driven, never
+ * silently remove it before there's evidence either way. */
+export type AdxHtfLearningProvider = () => { penaltyMult: number } | null
+let adxHtfLearningProvider: AdxHtfLearningProvider | null = null
+export function setAdxHtfLearningProvider(p: AdxHtfLearningProvider | null): void {
+  adxHtfLearningProvider = p
+}
+
 /** 5s..1d ladder, same order ALL_TIMEFRAMES uses - lets the multi-timeframe
  * confirmation below ask "what's one rung up from here" without keeping a
  * second lookup table in sync by hand. */
@@ -150,6 +163,12 @@ export interface AdxPatternBiasFit {
    * bigger timeframe's opposite trend. Precision veto only, same contract
    * as haDisagrees. */
   htfDisagrees: boolean
+  /** Would this fit have qualified if the HTF veto alone were ignored (HA
+   * veto and the qualify bar still apply)? Lets the honesty loop shadow-
+   * track exactly the calls the HTF veto blocks - the only way to ever
+   * learn whether that veto is worth its cost, since a hard-blocked call
+   * never gets to resolve against reality on its own. */
+  qualifiesIgnoringHtf: boolean
   /** The Oracle's own 4-way regime classifier (analytics/regime.ts), fed
    * this fit's own real ADX plus lightweight vol/persistence proxies - the
    * same classifier the Next-Candle Oracle runs, reused rather than
@@ -315,6 +334,20 @@ export function fitAdxPatternBias(candles: Candle[], period = 14, lookback = PAT
     if (topBar) volumeConfirms = topBar.volume > avgVol
   }
 
+  const qualifiesIgnoringHtf = agree && Math.abs(comp) >= qualifyBar && !haDisagrees
+  // Learned, graduated HTF veto: with no learning yet (null provider or
+  // thin sample in the honesty loop) this behaves EXACTLY like the old
+  // hard veto - htfBlocks === htfDisagrees. Once the honesty loop has
+  // enough shadow-tracked HTF-disagreeing calls to know whether the HTF
+  // read actually costs accuracy, penaltyMult replaces the flat block with
+  // a learned extra-margin requirement: small (near 1x) if disagreement
+  // turns out not to matter much, large enough to be a de-facto veto
+  // again if it does.
+  const htfLearning = adxHtfLearningProvider?.() ?? null
+  const htfPenaltyMult = htfLearning && Number.isFinite(htfLearning.penaltyMult) && htfLearning.penaltyMult > 0 ? htfLearning.penaltyMult : null
+  const htfBlocks = htfDisagrees && (htfPenaltyMult === null ? true : Math.abs(comp) < qualifyBar * htfPenaltyMult)
+  const qualifies = qualifiesIgnoringHtf && !htfBlocks
+
   return {
     adx: adxVal,
     plusDI: plusVal,
@@ -337,6 +370,7 @@ export function fitAdxPatternBias(candles: Candle[], period = 14, lookback = PAT
     htfDisagrees,
     regime,
     volumeConfirms,
-    qualifies: agree && Math.abs(comp) >= qualifyBar && !haDisagrees && !htfDisagrees,
+    qualifiesIgnoringHtf,
+    qualifies,
   }
 }
