@@ -38,7 +38,7 @@ import { distillChartSignals, DISTILL_DEFAULT_WINDOW } from './src/analytics/cha
 import { fitCointegration, COINTEGRATION_WINDOW, COINTEGRATION_MIN_R2, COINTEGRATION_MIN_TSTAT, COINTEGRATION_MAX_HALFLIFE } from './src/analytics/cointegration'
 import { computeVolArb, VOLARB_DEFAULT_WINDOW } from './src/analytics/volarb'
 import { findTriangles, fitTriangulation, legsForCross, orientCandles, TRIANGULATION_WINDOW, TRIANGULATION_Z_ENTRY, type TriangleCandidate } from './src/analytics/triangulation'
-import { fitAdxPatternBias } from './src/analytics/adxpatternbias'
+import { fitAdxPatternBias, PATTERN_BIAS_LOOKBACK, higherTimeframe } from './src/analytics/adxpatternbias'
 import { fitShockPressure } from './src/analytics/shockpressure'
 import { normalizeSpec, type CustomSpec } from './src/strategies/custom'
 import { MINABLE_ENGINES, ENGINE_LABEL, type ChartEngineId, engineVoteSingle, otcFootprintVote, tickVote, type OtcFpRead } from './src/analytics/chartsignals'
@@ -529,6 +529,9 @@ interface AdxPatternBiasScanRow {
   composite: number
   direction: 'call' | 'put' | null
   haDisagrees: boolean
+  htfDisagrees: boolean
+  regime: string
+  volumeConfirms: boolean | null
   qualifies: boolean
 }
 const adxPatternBiasScanCache = new Map<Timeframe, { ts: number; rows: AdxPatternBiasScanRow[] }>()
@@ -537,11 +540,22 @@ function scanAdxPatternBias(market: MarketDataService, tfv: Timeframe): AdxPatte
   const cached = adxPatternBiasScanCache.get(tfv)
   if (cached && Date.now() - cached.ts < SCAN_CACHE_MS) return cached.rows
   const rows: AdxPatternBiasScanRow[] = []
+  const htf = higherTimeframe(tfv)
   for (const a of market.assets) {
     if (!a.open) continue
     try {
       const candles = market.getCandlesDeep(a.ticker, tfv, 400, true)
-      const fit = fitAdxPatternBias(candles)
+      // optional multi-timeframe confirmation: one rung up's ADX/DI read -
+      // best-effort only, a miss here just leaves the htf veto untriggered
+      let higherCandles: Candle[] | undefined
+      if (htf) {
+        try {
+          higherCandles = market.getCandlesDeep(a.ticker, htf, 120, true)
+        } catch {
+          higherCandles = undefined
+        }
+      }
+      const fit = fitAdxPatternBias(candles, 14, PATTERN_BIAS_LOOKBACK, higherCandles)
       if (!fit) continue
       const direction: 'call' | 'put' | null = fit.qualifies ? (fit.direction === 'bullish' ? 'call' : fit.direction === 'bearish' ? 'put' : null) : null
       rows.push({
@@ -562,6 +576,9 @@ function scanAdxPatternBias(market: MarketDataService, tfv: Timeframe): AdxPatte
         composite: fit.composite,
         direction,
         haDisagrees: fit.haDisagrees,
+        htfDisagrees: fit.htfDisagrees,
+        regime: fit.regime,
+        volumeConfirms: fit.volumeConfirms,
         qualifies: fit.qualifies,
       })
     } catch {
@@ -2150,8 +2167,15 @@ const httpServer = createServer(async (req, res) => {
           const infoB = market.assets.find((x) => x.ticker === pb)
           const candlesA = market.getCandlesDeep(pa, pTfv, 400, true)
           const candlesB = market.getCandlesDeep(pb, pTfv, 400, true)
-          const fitA = fitAdxPatternBias(candlesA)
-          const fitB = fitAdxPatternBias(candlesB)
+          const pHtf = higherTimeframe(pTfv)
+          let higherA: Candle[] | undefined
+          let higherB: Candle[] | undefined
+          if (pHtf) {
+            try { higherA = market.getCandlesDeep(pa, pHtf, 120, true) } catch { higherA = undefined }
+            try { higherB = market.getCandlesDeep(pb, pHtf, 120, true) } catch { higherB = undefined }
+          }
+          const fitA = fitAdxPatternBias(candlesA, 14, PATTERN_BIAS_LOOKBACK, higherA)
+          const fitB = fitAdxPatternBias(candlesB, 14, PATTERN_BIAS_LOOKBACK, higherB)
           const closesA = candlesA.map((c) => c.close)
           const closesB = candlesB.map((c) => c.close)
           // Per-candle delta strip: computeFootprint's own FootprintCandle.delta
@@ -2234,7 +2258,12 @@ const httpServer = createServer(async (req, res) => {
           if (psTfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
           const psInfo = market.assets.find((x) => x.ticker === psAsset)
           const psCandles = market.getCandlesDeep(psAsset, psTfv, 400, true)
-          const psFit = fitAdxPatternBias(psCandles)
+          const psHtf = higherTimeframe(psTfv)
+          let psHigher: Candle[] | undefined
+          if (psHtf) {
+            try { psHigher = market.getCandlesDeep(psAsset, psHtf, 120, true) } catch { psHigher = undefined }
+          }
+          const psFit = fitAdxPatternBias(psCandles, 14, PATTERN_BIAS_LOOKBACK, psHigher)
           const psDelta: PairCompareDelta[] = computeFootprint(psCandles.slice(-24)).candles.map((c) => ({ time: c.time, delta: c.delta, close: c.close }))
           return json(200, {
             ok: true,

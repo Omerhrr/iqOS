@@ -764,6 +764,18 @@ export interface AdxPatternBiasScanRow {
    * contradicts the proposed direction - a precision veto that only
    * tightens qualification, never loosens it. */
   haDisagrees: boolean
+  /** Same ADX/DI read one timeframe rung up actively contradicts this
+   * read's proposed direction - another precision veto, same contract as
+   * haDisagrees. */
+  htfDisagrees: boolean
+  /** The Oracle's own 4-way regime classifier, fed this fit's own ADX plus
+   * lightweight vol/persistence proxies. A VOLATILE read raises the
+   * composite bar this row had to clear (never a hard veto). */
+  regime: string
+  /** Did the strongest recent pattern hit's bar carry above-average volume?
+   * null when volume data is degraded (routine for OTC/binary feeds) -
+   * informational only, never gates qualification. */
+  volumeConfirms: boolean | null
   qualifies: boolean
 }
 

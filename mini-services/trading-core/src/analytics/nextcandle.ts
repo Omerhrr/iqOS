@@ -151,8 +151,25 @@ export interface OracleInput {
   asset: string
   tf: string
   mode: 'sim' | 'live'
-  /** live self-calibration record from the plugin (null when no resolved predictions yet) */
+  /** live self-calibration record from the plugin (null when no resolved
+   * predictions yet) - used as the fallback when no regime-specific record
+   * below is thick enough yet, and as the only record when the plugin
+   * hasn't adopted regime-split tracking. */
   calibration?: { n: number; hitRate: number; brier: number } | null
+  /** Same shape as `calibration`, but one record per OracleRegime - the
+   * plugin's honesty loop can track "how honest am I specifically when I
+   * call this a TRENDING bar" separately from RANGING/VOLATILE/MIXED,
+   * since a model well-calibrated in one regime can be overconfident in
+   * another. Looked up by this prediction's OWN computed regime; falls
+   * back to `calibration` when that regime's bucket is missing or thin. */
+  regimeCalibration?: Partial<Record<OracleRegime, { n: number; hitRate: number; brier: number } | null>>
+  /** Per-driver weight multipliers, keyed by OracleDriver.name - the
+   * plugin's honesty loop tracks each model's own resolved accuracy and
+   * feeds a multiplier back (>1 = this driver has been reliably right
+   * lately, <1 = reliably wrong), on top of the static regime boosts each
+   * driver already gets below. Missing/omitted name = multiplier 1
+   * (unchanged), so existing callers that don't pass this are unaffected. */
+  driverWeightMultipliers?: Partial<Record<string, number>>
   /** Monte Carlo bootstrap paths. Default 1200 (panel-grade); the bar-by-bar
    * strategy eval passes fewer for backtest speed - the fused read is stable
    * well below the default (binomial noise on pUp ~ 1/sqrt(n)). */
@@ -161,6 +178,31 @@ export interface OracleInput {
    * vote). Default on; the backtester can drop it (the heaviest driver) when
    * sweeping gate params. */
   includeCommittee?: boolean
+}
+
+/** Correlated driver groups: members read substantially the same underlying
+ * evidence (raw bar shape), so when they AGREE it isn't two independent
+ * confirmations, it's partially the same evidence counted twice. Only the
+ * first member of a group keeps full weight; later agreeing members are
+ * discounted. Disagreement between group members is left untouched - that's
+ * genuinely informative, not redundant. */
+const CORRELATED_DRIVER_GROUPS: string[][] = [['Candle patterns', 'Bar physics']]
+const CORRELATION_DISCOUNT = 0.65
+
+function decorrelateWeights(usable: OracleDriver[]): OracleDriver[] {
+  const out = usable.map((d) => ({ ...d }))
+  for (const group of CORRELATED_DRIVER_GROUPS) {
+    const members = out.filter((d) => group.includes(d.name))
+    if (members.length < 2) continue
+    const base = members[0]
+    const baseSign = Math.sign(base.vote || base.pUp - 0.5)
+    for (let k = 1; k < members.length; k++) {
+      const m = members[k]
+      const mSign = Math.sign(m.vote || m.pUp - 0.5)
+      if (baseSign !== 0 && baseSign === mSign) m.weight *= CORRELATION_DISCOUNT
+    }
+  }
+  return out
 }
 
 export function predictNextCandle(candles: Candle[], input: OracleInput): NextCandlePrediction | null {
@@ -325,7 +367,19 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
     })
   }
 
-  const usable = drivers.filter((d) => Number.isFinite(d.pUp) && Number.isFinite(d.weight) && d.weight > 0)
+  // per-driver adaptive weighting: the plugin's honesty loop tracks each
+  // model's own resolved accuracy and feeds a multiplier back here, on top
+  // of the static regime boosts above - a driver that's been reliably
+  // wrong lately gets downweighted automatically instead of only ever being
+  // tuned by hand via trendBoost/fadeBoost/chaosFlatten.
+  if (input.driverWeightMultipliers) {
+    for (const d of drivers) {
+      const m = input.driverWeightMultipliers[d.name]
+      if (Number.isFinite(m) && m! > 0) d.weight *= clamp(m!, 0.6, 1.5)
+    }
+  }
+
+  const usable = decorrelateWeights(drivers.filter((d) => Number.isFinite(d.pUp) && Number.isFinite(d.weight) && d.weight > 0))
   // 7 drivers exist; requiring 4+ (a majority) rather than the old 3 (a
   // minority, <=43%) closes a real small-sample overconfidence hole - a
   // thin 3-driver read used to score confidence identically to a full
@@ -348,8 +402,14 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
   const sampleFactor = clamp(0.72 + 0.28 * (usable.length / drivers.length), 0.72, 1)
   const rawConfidence = clamp((0.55 * agreement + 0.45 * distance) * 100 * sampleFactor, 0, 97)
 
-  // calibration discount: the oracle's own realized record tempers the read
-  const cal = input.calibration ?? null
+  // calibration discount: the oracle's own realized record tempers the read.
+  // Prefer the REGIME-SPECIFIC record (this exact regime's own hit rate/
+  // Brier) when the plugin has tracked one and it's thick enough to trust;
+  // fall back to the blended-across-regimes record otherwise. A model well
+  // calibrated in TRENDING can be overconfident in VOLATILE - blending them
+  // into one number hides that.
+  const regimeCal = input.regimeCalibration?.[regime] ?? null
+  const cal = regimeCal && regimeCal.n >= 20 ? regimeCal : input.calibration ?? null
   const confidence = applyCalibrationDiscount(rawConfidence, cal)
 
   // ---------- magnitude: EWMA vol + markov next-state emphasis, ATR-anchored ----------

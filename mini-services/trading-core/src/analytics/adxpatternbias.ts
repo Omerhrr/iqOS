@@ -16,17 +16,44 @@
 // module scores AGREEMENT between the two: same direction + both strong ->
 // high-confidence composite; disagreement or either read flat -> composite
 // near 0 and it does not qualify.
+//
+// Three independent precision layers sit on top of that base agreement
+// check, each one only ever TIGHTENING qualification, never loosening it:
+//   - HA veto: the same pattern catalog re-run on Heikin Ashi candles
+//   - HTF veto: the same ADX/DI read one timeframe rung up (optional input)
+//   - regime dampening: a higher qualify bar when the Oracle's own regime
+//     classifier (analytics/regime.ts) reads this bar as VOLATILE
+// Volume confirmation is informational only (see `volumeConfirms`) - it
+// never gates `qualifies` because plenty of OTC/binary feeds carry no real
+// volume data at all (see shockpressure.ts's volumeDegraded).
 
-import type { Candle, PatternHit } from '../types'
+import type { Candle, PatternHit, Timeframe, AnalysisResult } from '../types'
 import { adx } from './indicators'
 import { detectPatterns, patternBias } from './patterns'
 import { heikinAshiSeries } from './chartsignals'
+import { classifyRegime, type Regime } from './regime'
+import { ewmaVol, garchVol } from './quant'
 
 export const ADX_TREND_THRESHOLD = 25
 export const PATTERN_BIAS_LOOKBACK = 8
 /** |composite| at/above this is "worth a look" - see composite() below for
- * how the two reads are combined into this single number. */
+ * how the two reads are combined into this single number. In a VOLATILE
+ * regime (see `regime` on the fit) this bar is raised 25%, same spirit as
+ * the Oracle's own chaosFlatten - a trending-looking ADX/DI read earned
+ * inside a volatile tape is less trustworthy than the same read in a clean
+ * trend, so it has to clear a higher bar instead of being vetoed outright. */
 export const COMPOSITE_QUALIFY = 3.5
+export const COMPOSITE_QUALIFY_VOLATILE = COMPOSITE_QUALIFY * 1.25
+
+/** 5s..1d ladder, same order ALL_TIMEFRAMES uses - lets the multi-timeframe
+ * confirmation below ask "what's one rung up from here" without keeping a
+ * second lookup table in sync by hand. */
+const TF_ORDER: Timeframe[] = ['5s', '15s', '30s', '1m', '2m', '5m', '15m', '30m', '1h', '4h', '1d']
+export function higherTimeframe(tf: Timeframe): Timeframe | null {
+  const i = TF_ORDER.indexOf(tf)
+  if (i < 0 || i >= TF_ORDER.length - 1) return null
+  return TF_ORDER[i + 1]
+}
 
 export type Bias = 'bullish' | 'bearish' | 'neutral'
 
@@ -73,6 +100,31 @@ export interface AdxPatternBiasFit {
    * the raw agree-check alone cannot see. Precision veto only: this never
    * HELPS a marginal composite qualify, it only blocks one that would have. */
   haDisagrees: boolean
+  /** Same ADX/DI read, one timeframe rung up (caller-supplied via the
+   * `higherCandles` param - optional, so every existing caller that doesn't
+   * pass it keeps running exactly as before: 'neutral', never vetoes).
+   * 'neutral' when the higher timeframe isn't itself trending (>= 25) or
+   * wasn't provided - a flat higher frame says nothing, so it never blocks. */
+  htfDirection: Bias
+  /** The higher-timeframe ADX/DI direction actively contradicts this read's
+   * proposed direction - catches a trend call about to be overrun by the
+   * bigger timeframe's opposite trend. Precision veto only, same contract
+   * as haDisagrees. */
+  htfDisagrees: boolean
+  /** The Oracle's own 4-way regime classifier (analytics/regime.ts), fed
+   * this fit's own real ADX plus lightweight vol/persistence proxies - the
+   * same classifier the Next-Candle Oracle runs, reused rather than
+   * reinvented. Cross-pollinates the two engines' understanding of "is this
+   * tape trustworthy right now" without computing the Oracle's full fusion. */
+  regime: Regime
+  /** Did the strongest recent pattern hit's own bar carry above-average
+   * volume for this lookback window? null when volume data is degraded
+   * (routinely true for OTC/binary feeds - see shockpressure.ts's
+   * volumeDegraded) so a caller never mistakes "no data" for "no
+   * confirmation". Informational only - this never gates `qualifies`, it
+   * only lets a caller adjust score/break ties, the same way pair-signal
+   * already uses haPatternDirection and footprint delta. */
+  volumeConfirms: boolean | null
   qualifies: boolean
 }
 
@@ -80,6 +132,24 @@ function biasOf(v: number, flatBand: number): Bias {
   if (v > flatBand) return 'bullish'
   if (v < -flatBand) return 'bearish'
   return 'neutral'
+}
+
+function mean(xs: number[]): number {
+  return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0
+}
+
+/** Cheap sign-persistence proxy for Hurst, same formula analytics/
+ * nextcandle.ts uses for its own regime read - kept local (not imported)
+ * so this module doesn't depend on nextcandle.ts at all; both independently
+ * feed the same shared classifyRegime(). */
+function hurstProxy(closes: number[]): number {
+  const rets: number[] = []
+  for (let i = Math.max(1, closes.length - 60); i < closes.length; i++) rets.push(Math.sign(closes[i] - closes[i - 1]))
+  if (rets.length < 20) return 0.5
+  let same = 0
+  for (let i = 1; i < rets.length; i++) if (rets[i] === rets[i - 1]) same++
+  const persistence = same / (rets.length - 1)
+  return Math.max(0.3, Math.min(0.7, 0.5 + (persistence - 0.5) * 0.5))
 }
 
 /** The combining rule: ADX/DI contributes a signed "trend push" (0 when not
@@ -97,9 +167,32 @@ function composite(trendPush: number, patBias: number): number {
   return Math.max(-10, Math.min(10, raw))
 }
 
+/** Plain ADX/DI direction of a series, trend-gated the same way the main
+ * fit is - shared by the base read and the optional higher-timeframe read
+ * below so the two can never silently drift apart in logic. */
+function adxDirectionOf(candles: Candle[], period: number): { adxVal: number; direction: Bias } | null {
+  if (candles.length < Math.max(period * 2, 30)) return null
+  const high = candles.map((c) => c.high)
+  const low = candles.map((c) => c.low)
+  const close = candles.map((c) => c.close)
+  const { adx: adxSeries, plusDI, minusDI } = adx(high, low, close, period)
+  const i = adxSeries.length - 1
+  const adxVal = adxSeries[i]
+  const plusVal = plusDI[i]
+  const minusVal = minusDI[i]
+  if (!Number.isFinite(adxVal) || !Number.isFinite(plusVal) || !Number.isFinite(minusVal)) return null
+  const trending = adxVal >= ADX_TREND_THRESHOLD
+  return { adxVal, direction: trending ? (plusVal > minusVal ? 'bullish' : plusVal < minusVal ? 'bearish' : 'neutral') : 'neutral' }
+}
+
 /** Fits the composite read from a closed-candle series. Returns null when
- * there isn't enough history for either leg. */
-export function fitAdxPatternBias(candles: Candle[], period = 14, lookback = PATTERN_BIAS_LOOKBACK): AdxPatternBiasFit | null {
+ * there isn't enough history for either leg.
+ *
+ * `higherCandles`, when supplied, is a closed-candle series for the NEXT
+ * timeframe up (see `higherTimeframe()`) for the same asset - used only for
+ * the htfDisagrees veto. Omitting it (the default - existing callers are
+ * unaffected) simply leaves htfDirection 'neutral' and htfDisagrees false. */
+export function fitAdxPatternBias(candles: Candle[], period = 14, lookback = PATTERN_BIAS_LOOKBACK, higherCandles?: Candle[]): AdxPatternBiasFit | null {
   if (candles.length < Math.max(period * 2, 30)) return null
   const high = candles.map((c) => c.high)
   const low = candles.map((c) => c.low)
@@ -134,6 +227,39 @@ export function fitAdxPatternBias(candles: Candle[], period = 14, lookback = PAT
   // it: a neutral or agreeing HA read changes nothing.
   const haDisagrees = haPatternDirection !== 'neutral' && direction !== 'neutral' && haPatternDirection !== direction
 
+  // HTF veto: this timeframe's own ADX/DI fight against one rung up's.
+  // Same shape as the HA veto - optional, only tightens, never fires when
+  // the higher frame isn't trending or wasn't supplied.
+  const htf = higherCandles && higherCandles.length ? adxDirectionOf(higherCandles, period) : null
+  const htfDirection: Bias = htf?.direction ?? 'neutral'
+  const htfDisagrees = htfDirection !== 'neutral' && direction !== 'neutral' && htfDirection !== direction
+
+  // Regime cross-pollination: reuse the Oracle's own 4-way classifier
+  // (analytics/regime.ts) fed this fit's REAL adx (better than the proxy
+  // nextcandle.ts has to estimate) plus the same lightweight vol/
+  // persistence proxies it uses. A VOLATILE read raises the qualify bar
+  // instead of vetoing outright - volatility makes a trend read noisier,
+  // not necessarily wrong.
+  const rets: number[] = []
+  for (let k = 1; k < close.length; k++) rets.push(Math.log(close[k] / close[k - 1]))
+  const recentRets = rets.slice(-300)
+  const regime = classifyRegime({
+    indicators: { adx: adxVal },
+    quant: { hurst: hurstProxy(close), garchVol: garchVol(recentRets), ewmaVol: ewmaVol(recentRets) },
+  } as unknown as AnalysisResult)
+  const qualifyBar = regime === 'VOLATILE' ? COMPOSITE_QUALIFY_VOLATILE : COMPOSITE_QUALIFY
+
+  // Volume confirmation (informational, see volumeConfirms doc above): only
+  // ever computed when real volume data exists for this window.
+  const volWindow = candles.slice(-lookback)
+  const avgVol = mean(volWindow.map((c) => c.volume))
+  const volumeDataPresent = avgVol > 0 && volWindow.some((c) => c.volume > 0)
+  let volumeConfirms: boolean | null = null
+  if (volumeDataPresent && top) {
+    const topBar = candles[candles.length - 1 - (top.barsAgo ?? 0)]
+    if (topBar) volumeConfirms = topBar.volume > avgVol
+  }
+
   return {
     adx: adxVal,
     plusDI: plusVal,
@@ -152,6 +278,10 @@ export function fitAdxPatternBias(candles: Candle[], period = 14, lookback = PAT
     composite: comp,
     direction,
     haDisagrees,
-    qualifies: agree && Math.abs(comp) >= COMPOSITE_QUALIFY && !haDisagrees,
+    htfDirection,
+    htfDisagrees,
+    regime,
+    volumeConfirms,
+    qualifies: agree && Math.abs(comp) >= qualifyBar && !haDisagrees && !htfDisagrees,
   }
 }

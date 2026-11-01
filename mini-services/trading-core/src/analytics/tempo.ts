@@ -44,8 +44,37 @@ export const TEMPO_HISTORY_WINDOWS = 12
 /** Absolute conviction floor - never fire below this even on the last bar
  * of a window. 8 = roughly "calibrated conf 65+ leaning 13pp+ off the coin
  * flip" or "conf 80 leaning 10pp+" - below that the fusion is not saying
- * anything worth a license. */
+ * anything worth a license. Used as pairFloor()'s fallback when a pair has
+ * no window history yet, and as the band pairFloor() is clamped within. */
 export const TEMPO_FLOOR = 8
+/** pairFloor() never drifts outside this band even for a pair whose own
+ * history runs unusually calm or unusually wild - keeps one outlier pair
+ * from setting an ultra-permissive or ultra-restrictive floor for itself. */
+export const TEMPO_FLOOR_MIN = 5
+export const TEMPO_FLOOR_MAX = 14
+/** Firing again on a setup that echoes a recent same-direction, similar-
+ * conviction LOSS on this exact pair raises its floor by this multiplier
+ * instead of refusing outright - a real edge can still clear the raised
+ * bar; a repeat of the same recent mistake usually can't. */
+export const TEMPO_RECENT_LOSS_PENALTY = 1.25
+
+function clamp(v: number, lo: number, hi: number): number {
+  return Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : lo
+}
+
+/** Per-pair floor instead of one global constant for every asset: a pair
+ * whose own typical window-best conviction runs hot (volatile pairs swing
+ * harder) gets a correspondingly higher floor, a pair that runs cool gets a
+ * lower one - a single flat TEMPO_FLOOR was either too loose for calm
+ * pairs or too tight for volatile ones. Falls back to the flat TEMPO_FLOOR
+ * while the pair has no window history yet (expectedWindowMax returns 0
+ * below 3 observed windows) - explore first, get picky once the pair's own
+ * rhythm is known, the same philosophy expectedWindowMax itself uses. */
+export function pairFloor(history: number[], fallback = TEMPO_FLOOR): number {
+  const expMax = expectedWindowMax(history)
+  if (expMax <= 0) return fallback
+  return clamp(expMax * 0.35, TEMPO_FLOOR_MIN, TEMPO_FLOOR_MAX)
+}
 
 export interface TempoWindow {
   /** epoch-aligned window index: floor(barTime / windowMs) */
@@ -124,14 +153,21 @@ export function tempoDecide(opts: {
   barsRemaining: number
   windowMaxHistory: number[]
   floor?: number
+  /** plugin-supplied: this pair's own shot ledger shows a same-direction
+   * loss at a similar conviction level within the last few windows -
+   * raises the floor by TEMPO_RECENT_LOSS_PENALTY instead of refusing
+   * outright (see the constant's doc above). */
+  recentSimilarLoss?: boolean
 }): TempoDecision {
-  const floor = opts.floor ?? TEMPO_FLOOR
+  const baseFloor = opts.floor ?? pairFloor(opts.windowMaxHistory)
+  const floor = opts.recentSimilarLoss ? baseFloor * TEMPO_RECENT_LOSS_PENALTY : baseFloor
   const conviction = Number.isFinite(opts.conviction) ? Math.max(0, opts.conviction) : 0
   const expMax = expectedWindowMax(opts.windowMaxHistory)
   // order-statistic decay: the best of k remaining bars from a distribution
   // whose window-max averages expMax scales ~ sqrt(k/10)
   const patienceBar = expMax * Math.sqrt(Math.max(0, opts.barsRemaining) / TEMPO_WINDOW_BARS)
   const threshold = Math.max(floor, patienceBar)
+  const cautionNote = opts.recentSimilarLoss ? ' (floor raised - echoes a recent similar loss on this pair)' : ''
   if (conviction < floor) {
     return {
       kind: 'skip',
@@ -140,17 +176,17 @@ export function tempoDecide(opts: {
       conviction,
       reason:
         expMax > 0
-          ? `conviction ${conviction.toFixed(1)} below the license floor ${floor.toFixed(1)}`
-          : `conviction ${conviction.toFixed(1)} below the license floor ${floor.toFixed(1)} (no window history yet - floor-only mode)`,
+          ? `conviction ${conviction.toFixed(1)} below the license floor ${floor.toFixed(1)}${cautionNote}`
+          : `conviction ${conviction.toFixed(1)} below the license floor ${floor.toFixed(1)} (no window history yet - floor-only mode)${cautionNote}`,
     }
   }
   if (conviction >= threshold) {
     const why =
       patienceBar > floor
-        ? `conviction ${conviction.toFixed(1)} clears the patience bar ${patienceBar.toFixed(1)} (${opts.barsRemaining} bar${opts.barsRemaining === 1 ? '' : 's'} left would only be expected to reach ${expMax.toFixed(1)} window-best)`
+        ? `conviction ${conviction.toFixed(1)} clears the patience bar ${patienceBar.toFixed(1)} (${opts.barsRemaining} bar${opts.barsRemaining === 1 ? '' : 's'} left would only be expected to reach ${expMax.toFixed(1)} window-best)${cautionNote}`
         : expMax > 0
-          ? `conviction ${conviction.toFixed(1)} clears floor ${floor.toFixed(1)} - patience bar decayed to it on the window's last leg`
-          : `conviction ${conviction.toFixed(1)} clears floor ${floor.toFixed(1)} (no window history yet - floor-only mode)`
+          ? `conviction ${conviction.toFixed(1)} clears floor ${floor.toFixed(1)} - patience bar decayed to it on the window's last leg${cautionNote}`
+          : `conviction ${conviction.toFixed(1)} clears floor ${floor.toFixed(1)} (no window history yet - floor-only mode)${cautionNote}`
     return { kind: 'fire', threshold, patienceBar, conviction, reason: why }
   }
   return {
@@ -158,6 +194,6 @@ export function tempoDecide(opts: {
     threshold,
     patienceBar,
     conviction,
-    reason: `conviction ${conviction.toFixed(1)} real but below the patience bar ${patienceBar.toFixed(1)} - wait for a better bar in this window`,
+    reason: `conviction ${conviction.toFixed(1)} real but below the patience bar ${patienceBar.toFixed(1)} - wait for a better bar in this window${cautionNote}`,
   }
 }

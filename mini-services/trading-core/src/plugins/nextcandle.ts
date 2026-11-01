@@ -19,11 +19,16 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { KernelContext, Plugin } from '../kernel'
 import type { Candle, Timeframe } from '../types'
-import { predictNextCandle, setOracleCalibrationProvider, type NextCandlePrediction } from '../analytics/nextcandle'
+import { predictNextCandle, setOracleCalibrationProvider, type NextCandlePrediction, type OracleRegime } from '../analytics/nextcandle'
 import type { MarketDataService } from './market-data'
 
 const MAX_RESOLVED = 800
 const CALIBRATION_WINDOW = 120 // rolling record length fed back into confidence
+/** min resolved rows (per-driver, or per asset:tf:regime bucket) before its
+ * record is trusted enough to adjust anything - thin records are no record,
+ * same floor philosophy applyCalibrationDiscount already uses (n>=20). */
+const DRIVER_STATS_MIN_N = 30
+const DRIVER_STATS_WINDOW = 250
 const OUTCOME_FILE = 'nextcandle_outcomes.json'
 /** Next Global board: a scanned row older than this is recomputed on the
  * next poll. Deliberately short - one prediction is ~15ms so a full board
@@ -40,6 +45,14 @@ interface PendingPrediction {
   direction: 'call' | 'put' | 'none'
   confidence: number
   price: number
+  /** the regime this prediction was issued under - carried through to the
+   * resolved record so the honesty loop can split calibration by regime. */
+  regime: OracleRegime
+  /** lightweight per-driver read at issue time (name + signed vote only,
+   * not the full OracleDriver) - carried through to the resolved record so
+   * each model's OWN accuracy can be tracked independently of the fused
+   * outcome. */
+  drivers: { name: string; vote: number }[]
 }
 
 export interface ResolvedPrediction {
@@ -60,6 +73,10 @@ export interface ResolvedPrediction {
   score: number
   /** Brier contribution: (pUp - realizedUp)² with realizedUp 1/0 (flat=0.5->0.25) */
   brier: number
+  /** regime this prediction was issued under - feeds regimeCalibrationFor() */
+  regime: OracleRegime
+  /** per-driver votes at issue time, carried through for driverStats() */
+  drivers: { name: string; vote: number }[]
 }
 
 export interface GlobalScanRow {
@@ -132,7 +149,14 @@ export class NextCandleService {
   predict(asset: string, tf: string): NextCandlePrediction | null {
     const candles: Candle[] = this.market.getCandlesDeep(asset, tf as never, 1500, true)
     const cal = this.calibrationFor(asset, tf)
-    const pred = predictNextCandle(candles, { asset, tf, mode: this.market.mode, calibration: cal })
+    const pred = predictNextCandle(candles, {
+      asset,
+      tf,
+      mode: this.market.mode,
+      calibration: cal,
+      regimeCalibration: this.regimeCalibrationFor(asset, tf),
+      driverWeightMultipliers: this.driverWeightMultipliers(),
+    })
     if (!pred) return null
     const key = `${asset}:${tf}:${pred.targetBarTime}`
     // dedupe: replace the pending entry for the same target bar - a re-poll
@@ -146,6 +170,8 @@ export class NextCandleService {
       direction: pred.direction,
       confidence: pred.confidence,
       price: pred.price,
+      regime: pred.regime,
+      drivers: pred.drivers.map((d) => ({ name: d.name, vote: d.vote })),
     })
     if (this.pending.size > 400) {
       // drop the oldest fifth - pending entries resolve on candle close anyway
@@ -182,6 +208,8 @@ export class NextCandleService {
         hit,
         score: hit ? 1 : 0,
         brier: (p.pUp - realizedUp) * (p.pUp - realizedUp),
+        regime: p.regime,
+        drivers: p.drivers,
       }
       this.resolved.push(entry)
       while (this.resolved.length > MAX_RESOLVED) this.resolved.shift()
@@ -196,6 +224,57 @@ export class NextCandleService {
     const hitRate = rows.reduce((s, r) => s + r.score, 0) / rows.length
     const brier = rows.reduce((s, r) => s + r.brier, 0) / rows.length
     return { n: rows.length, hitRate, brier }
+  }
+
+  /** Same rolling record as calibrationFor(), split one bucket per regime -
+   * lets predictNextCandle discount confidence using "how honest am I
+   * specifically on TRENDING bars for this pair" instead of one number
+   * blended across every regime it's ever seen. Buckets below
+   * DRIVER_STATS_MIN_N/2 (a regime sees fewer resolutions than the pair
+   * overall, so the bar is lower) are omitted entirely - predictNextCandle
+   * already falls back to the blended record when a regime key is absent. */
+  private regimeCalibrationFor(asset: string, tf: string): Partial<Record<OracleRegime, { n: number; hitRate: number; brier: number }>> {
+    const rows = this.resolved.filter((r) => r.asset === asset && r.tf === tf).slice(-CALIBRATION_WINDOW * 2)
+    const out: Partial<Record<OracleRegime, { n: number; hitRate: number; brier: number }>> = {}
+    const regimes: OracleRegime[] = ['TRENDING', 'RANGING', 'VOLATILE', 'MIXED']
+    for (const regime of regimes) {
+      const rs = rows.filter((r) => r.regime === regime)
+      if (rs.length < 20) continue
+      out[regime] = {
+        n: rs.length,
+        hitRate: rs.reduce((s, r) => s + r.score, 0) / rs.length,
+        brier: rs.reduce((s, r) => s + r.brier, 0) / rs.length,
+      }
+    }
+    return out
+  }
+
+  /** Per-driver win rate across the WHOLE universe (not per asset:tf - a
+   * driver's reliability is a property of the model, not one pair), fed
+   * back as a weight multiplier: a driver sitting meaningfully above 50%
+   * hit rate over a real sample gets upweighted, one sitting below gets
+   * downweighted, on top of the static regime boosts each driver already
+   * carries in analytics/nextcandle.ts. */
+  private driverWeightMultipliers(): Record<string, number> {
+    const window = this.resolved.slice(-DRIVER_STATS_WINDOW)
+    const byName = new Map<string, { n: number; wins: number }>()
+    for (const r of window) {
+      const realizedUpSign = r.actual === 'up' ? 1 : r.actual === 'down' ? -1 : 0
+      if (realizedUpSign === 0) continue // flat bars don't score any driver
+      for (const d of r.drivers ?? []) {
+        const s = byName.get(d.name) ?? { n: 0, wins: 0 }
+        s.n++
+        if (Math.sign(d.vote) === realizedUpSign) s.wins++
+        byName.set(d.name, s)
+      }
+    }
+    const out: Record<string, number> = {}
+    for (const [name, s] of byName) {
+      if (s.n < DRIVER_STATS_MIN_N) continue
+      const winRate = s.wins / s.n
+      out[name] = Math.max(0.75, Math.min(1.3, 0.75 + (winRate - 0.5) * 2.5))
+    }
+    return out
   }
 
   /** Full stats for the panel: per-asset:tf records + recent resolutions. */

@@ -61,7 +61,7 @@ import { SweepEdgeMemory } from '../analytics/edge'
 import { fitLeadLag, projectLeadLagSignal, LEADLAG_GROUPS, LEADLAG_MIN_ABS_CORRELATION, LEADLAG_MIN_TRIGGER_Z, LEADLAG_LOOKBACK_BARS } from '../analytics/leadlag'
 import { fitCointegration, COINTEGRATION_WINDOW, COINTEGRATION_MIN_R2, COINTEGRATION_MIN_TSTAT, COINTEGRATION_MAX_HALFLIFE } from '../analytics/cointegration'
 import { findTriangles, fitTriangulationFromCandles, TRIANGULATION_WINDOW, TRIANGULATION_Z_ENTRY, type TriangleCandidate } from '../analytics/triangulation'
-import { fitAdxPatternBias, ADX_TREND_THRESHOLD, COMPOSITE_QUALIFY, PATTERN_BIAS_LOOKBACK } from '../analytics/adxpatternbias'
+import { fitAdxPatternBias, ADX_TREND_THRESHOLD, COMPOSITE_QUALIFY, PATTERN_BIAS_LOOKBACK, higherTimeframe } from '../analytics/adxpatternbias'
 import { computeFootprint } from '../analytics/footprint'
 import { fitShockPressure, SHOCK_RATIO_THRESHOLD, PRESSURE_LOOKBACK, SHOCKPRESSURE_COMPOSITE_QUALIFY } from '../analytics/shockpressure'
 import { computeTpo } from '../analytics/tpo'
@@ -1403,13 +1403,22 @@ export class ModeService {
         const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
         const pool = this.candidatePool(open)
         const candidates = [...LIQUID_CANDIDATES.filter((a) => pool.includes(a)), ...pool.filter((a) => !LIQUID_CANDIDATES.includes(a))]
+        const htf = higherTimeframe(this.config.tf)
         for (const asset of candidates) {
           if (this.assetBlocked(asset)) continue
           try {
             const candles = market.getCandles(asset, this.config.tf, 200, true)
             rec(asset)
             if (candles.length < 60) continue
-            const fit = fitAdxPatternBias(candles, 14, PATTERN_BIAS_LOOKBACK)
+            let higherCandles: Candle[] | undefined
+            if (htf) {
+              try {
+                higherCandles = market.getCandles(asset, htf, 80, true)
+              } catch {
+                higherCandles = undefined
+              }
+            }
+            const fit = fitAdxPatternBias(candles, 14, PATTERN_BIAS_LOOKBACK, higherCandles)
             if (!fit || !fit.qualifies) continue
             const dir: 'call' | 'put' | 'none' = fit.direction === 'bullish' ? 'call' : fit.direction === 'bearish' ? 'put' : 'none'
             if (dir === 'none') continue
@@ -1454,7 +1463,9 @@ export class ModeService {
                   ts: this.now(),
                   computedTs: this.now(),
                   // why NOW: ADX/DI direction and pattern bias just agreed and
-                  // crossed the composite qualify bar together
+                  // crossed the composite qualify bar together (which, by
+                  // this point, already accounts for the HA/HTF vetoes and
+                  // the VOLATILE-regime dampening inside fitAdxPatternBias)
                   note: `ADX ${fit.adx.toFixed(0)} (${fit.adxDirection}) agrees with pattern bias ${fit.patternBias.toFixed(1)}${fit.topPattern ? ` (${fit.topPattern})` : ''} - composite ${fit.composite.toFixed(1)} crossed ±${COMPOSITE_QUALIFY}`,
                 },
               })
@@ -1578,13 +1589,22 @@ export class ModeService {
         const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
         const pool = this.candidatePool(open)
         const candidates = [...LIQUID_CANDIDATES.filter((a) => pool.includes(a)), ...pool.filter((a) => !LIQUID_CANDIDATES.includes(a))]
+        const htf = higherTimeframe(this.config.tf)
         for (const asset of candidates) {
           if (this.assetBlocked(asset)) continue
           try {
             const candles = market.getCandles(asset, this.config.tf, 200, true)
             rec(asset)
             if (candles.length < 60) continue
-            const fit = fitAdxPatternBias(candles, 14, PATTERN_BIAS_LOOKBACK)
+            let higherCandles: Candle[] | undefined
+            if (htf) {
+              try {
+                higherCandles = market.getCandles(asset, htf, 80, true)
+              } catch {
+                higherCandles = undefined
+              }
+            }
+            const fit = fitAdxPatternBias(candles, 14, PATTERN_BIAS_LOOKBACK, higherCandles)
             if (!fit || !fit.qualifies) continue
             const dir: 'call' | 'put' | 'none' = fit.direction === 'bullish' ? 'call' : fit.direction === 'bearish' ? 'put' : 'none'
             if (dir === 'none') continue
@@ -1595,7 +1615,11 @@ export class ModeService {
             const netDelta = computeFootprint(candles.slice(-10)).candles.reduce((s, c) => s + c.delta, 0)
             const deltaAgrees = (dir === 'call' && netDelta > 0) || (dir === 'put' && netDelta < 0)
             const deltaOpposes = (dir === 'call' && netDelta < 0) || (dir === 'put' && netDelta > 0)
-            const confirmAdj = (haAgrees ? 8 : haOpposes ? -12 : 0) + (deltaAgrees ? 6 : deltaOpposes ? -10 : 0)
+            // volume confirmation (fit.volumeConfirms, see adxpatternbias.ts)
+            // is a third soft tiebreaker alongside HA/delta - null (volume
+            // data degraded, routine for OTC/binary feeds) adjusts nothing.
+            const volAdj = fit.volumeConfirms === true ? 4 : fit.volumeConfirms === false ? -4 : 0
+            const confirmAdj = (haAgrees ? 8 : haOpposes ? -12 : 0) + (deltaAgrees ? 6 : deltaOpposes ? -10 : 0) + volAdj
 
             const score = Math.round(clamp(40 + (Math.abs(fit.composite) - COMPOSITE_QUALIFY) * 10 + confirmAdj, 5, 97)) * (dir === 'call' ? 1 : -1)
             const confidence = Math.round(clamp(40 + (fit.adx - ADX_TREND_THRESHOLD) * 0.8 + (Math.abs(fit.composite) - COMPOSITE_QUALIFY) * 6 + confirmAdj, 5, 97))

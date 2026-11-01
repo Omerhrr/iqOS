@@ -73,6 +73,22 @@ function AdxPatternBiasCard({ r, onSelectAsset }: { r: AdxPatternBiasScanRow; on
             ha veto
           </span>
         )}
+        {r.htfDisagrees && (
+          <span
+            className="rounded border border-rose-500/40 bg-rose-500/10 px-1 py-px font-mono text-[8px] font-bold uppercase text-rose-300"
+            title="the same ADX/DI read one timeframe rung up contradicts this direction - vetoes qualification"
+          >
+            htf veto
+          </span>
+        )}
+        {r.regime === 'VOLATILE' && (
+          <span
+            className="rounded border border-amber-500/40 bg-amber-500/10 px-1 py-px font-mono text-[8px] font-bold uppercase text-amber-400"
+            title="Oracle regime classifier reads this bar as VOLATILE - the composite had to clear a 25% higher bar to qualify"
+          >
+            volatile
+          </span>
+        )}
         <span className="ml-auto font-mono text-[9px] text-[#7c8aa5]">{fmtPrice(r.price, r.asset)}</span>
       </div>
       <div className="mt-1.5 flex flex-wrap items-center gap-2 font-mono text-[9px] text-[#7c8aa5]">
@@ -93,6 +109,11 @@ function AdxPatternBiasCard({ r, onSelectAsset }: { r: AdxPatternBiasScanRow; on
         <span title="combined ADX/DI + pattern bias score, range -10..+10">
           comp <span className={Math.abs(r.composite) >= 3.5 ? 'text-[#dbe4f0]' : 'text-[#4b5a72]'}>{r.composite >= 0 ? '+' : ''}{r.composite.toFixed(1)}</span>
         </span>
+        {r.volumeConfirms !== null && (
+          <span title="did the strongest recent pattern hit's bar carry above-average volume for this window?">
+            vol <span className={r.volumeConfirms ? 'text-emerald-400/80' : 'text-[#4b5a72]'}>{r.volumeConfirms ? 'confirms' : 'thin'}</span>
+          </span>
+        )}
       </div>
     </div>
   )
@@ -211,7 +232,12 @@ export default function AdxPatternBiasPanel({
             direction agreement; <span className="text-violet-400/80">qualifies</span> adds the composite-strength bar on top.
             <span className="text-rose-400/80">ha veto</span> is a third, independent read - the same pattern catalog re-run on
             smoothed Heikin Ashi candles - and blocks qualification when it actively disagrees, even though ADX/DI and the raw
-            candles agree. Click a card to open that asset on the chart.
+            candles agree. <span className="text-rose-400/80">htf veto</span> is a fourth independent read: the same ADX/DI check
+            one timeframe rung up, blocking qualification the same way when it disagrees. <span className="text-amber-400/80">volatile</span>{' '}
+            means the Oracle's own regime classifier reads this bar as choppy, so the composite needed to clear a 25% higher
+            bar rather than being blocked outright. <span className="text-[#aebccf]">vol confirms/thin</span> is informational only
+            - whether the top pattern hit's own bar carried above-average volume - and never gates qualification, since many
+            OTC/binary feeds carry no real volume data at all. Click a card to open that asset on the chart.
           </p>
         )}
         {loading && <div className="px-1 font-mono text-[8px] text-[#3d4d66]">refreshing…</div>}

@@ -126,7 +126,14 @@ export class TempoService {
   private ctx!: KernelContext
   private unsub: (() => void) | null = null
   private states = new Map<string, PairTempoState>() // key `${tf}:${asset}`
-  private history = new Map<string, number[]>() // key `${tf}:${asset}` -> window maxima
+  private history = new Map<string, number[]>() // key `${tf}:${asset}` -> window maxima, all sessions blended
+  /** Same window-maxima, split by session - a pair's rhythm during active
+   * hours and quiet hours blended into one history muddies expectedWindowMax
+   * (the quiet-hours numbers drag the active-hours patience bar down, or
+   * vice versa). Key `${tf}:${asset}:${session}`. Read via historyFor()
+   * below, which falls back to the blended `history` map until a session
+   * bucket has enough of its own samples to trust. */
+  private sessionHistory = new Map<string, number[]>()
   private shots: ResolvedShot[] = []
 
   async start(ctx: KernelContext): Promise<void> {
@@ -153,6 +160,49 @@ export class TempoService {
     return `${tf}:${asset}`
   }
 
+  /** Coarse 2-bucket session split (UTC): 07:00-21:00 covers the London/NY
+   * active window this universe is busiest in, everything else is "off".
+   * Deliberately simple - the point is separating "typical active-hours
+   * rhythm" from "typical quiet-hours rhythm" for THIS pair, not modeling
+   * every session boundary precisely. */
+  private session(ms: number): 'active' | 'off' {
+    const h = new Date(ms).getUTCHours()
+    return h >= 7 && h < 21 ? 'active' : 'off'
+  }
+
+  /** The history to feed tempoDecide: this moment's session bucket once it
+   * has enough of its own samples (>=6, same floor expectedWindowMax's own
+   * trimmed-mean kicks in at), otherwise the blended all-sessions history -
+   * explore blended first, specialize once the session's own rhythm is
+   * actually known. */
+  private historyFor(key: string, nowMs: number): number[] {
+    const sh = this.sessionHistory.get(`${key}:${this.session(nowMs)}`)
+    if (sh && sh.length >= 6) return sh
+    return this.history.get(key) ?? []
+  }
+
+  /** Did the most recent resolved shot(s) on this pair, within the last
+   * few windows, LOSE in the SAME direction at a similar conviction level
+   * to right now? If so the current setup echoes a fresh failure rather
+   * than being a clean fresh read - tempoDecide raises its floor for this
+   * one decision instead of refusing outright (see TEMPO_RECENT_LOSS_PENALTY). */
+  private recentSimilarLoss(asset: string, tf: string, direction: 'call' | 'put' | 'none', conviction: number, windowIdx: number): boolean {
+    if (direction === 'none') return false
+    const LOOKBACK_WINDOWS = 3
+    const TOL = 0.25
+    return this.shots.some(
+      (s) =>
+        s.asset === asset &&
+        s.tf === tf &&
+        !s.flat &&
+        !s.hit &&
+        s.direction === direction &&
+        windowIdx - s.windowIdx >= 0 &&
+        windowIdx - s.windowIdx <= LOOKBACK_WINDOWS &&
+        Math.abs(s.conviction - conviction) <= Math.max(1, conviction) * TOL,
+    )
+  }
+
   private stateFor(key: string): PairTempoState {
     let s = this.states.get(key)
     if (!s) {
@@ -174,6 +224,19 @@ export class TempoService {
         h.push(st.bestConviction)
         if (h.length > 24) h.splice(0, h.length - 24)
         this.history.set(key, h)
+        // archive into this window's own session bucket too - the window
+        // we're archiving STARTED at st.windowIdx's epoch, not "now"
+        const windowMs = TEMPO_WINDOW_BARS * tfSec * 1000
+        const oldWindowStartMs = st.windowIdx * windowMs
+        const sKey = `${key}:${this.session(oldWindowStartMs)}`
+        const sh = this.sessionHistory.get(sKey) ?? []
+        sh.push(st.bestConviction)
+        if (sh.length > 24) sh.splice(0, sh.length - 24)
+        this.sessionHistory.set(sKey, sh)
+        if (this.sessionHistory.size > MAX_STATES * 2) {
+          const stale = [...this.sessionHistory.keys()].slice(0, 200)
+          for (const k of stale) this.sessionHistory.delete(k)
+        }
       }
       st.windowIdx = w.windowIdx
       st.fired = false
@@ -263,8 +326,9 @@ export class TempoService {
       st.bestConviction = conviction
       st.bestBarTime = r.targetBarTime
     }
-    const hist = this.history.get(key) ?? []
-    const dec: TempoDecision = tempoDecide({ conviction, barsRemaining: w.barsRemaining, windowMaxHistory: hist })
+    const hist = this.historyFor(key, now)
+    const recentSimilarLoss = this.recentSimilarLoss(r.asset, tf, r.direction, conviction, w.windowIdx)
+    const dec: TempoDecision = tempoDecide({ conviction, barsRemaining: w.barsRemaining, windowMaxHistory: hist, recentSimilarLoss })
     const spent = st.fired
     const decision: TempoRow['decision'] = spent ? 'done' : dec.kind === 'fire' ? 'fire' : dec.kind
     const reason = spent
@@ -306,8 +370,9 @@ export class TempoService {
     const st = this.rollTo(key, pred.targetBarTime, tfSec)
     if (st.fired) return { ok: false, reason: 'license already spent this window' }
     const w = tempoWindow(pred.targetBarTime, tfSec)
-    const hist = this.history.get(key) ?? []
-    const dec = tempoDecide({ conviction, barsRemaining: w.barsRemaining, windowMaxHistory: hist })
+    const hist = this.historyFor(key, Date.now())
+    const recentSimilarLoss = this.recentSimilarLoss(asset, tf, pred.direction, conviction, w.windowIdx)
+    const dec = tempoDecide({ conviction, barsRemaining: w.barsRemaining, windowMaxHistory: hist, recentSimilarLoss })
     if (dec.kind !== 'fire') return { ok: false, reason: dec.reason }
     if (pred.direction === 'none') return { ok: false, reason: 'fusion has no directional lean on this bar' }
     st.fired = true
