@@ -15,8 +15,38 @@
 // claims shots (atomic claim, first consumer wins).
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { TempoRow, Timeframe } from '@/lib/os/client'
-import { fmtPrice, getTempoScan } from '@/lib/os/client'
+import type { TempoRow, TempoStatsResponse, Timeframe } from '@/lib/os/client'
+import { fmtPrice, getTempoScan, getTempoStats } from '@/lib/os/client'
+
+const STATS_POLL_MS = 20_000
+
+/** Which pairs pairAccuracyMult() is currently dampening, learned from each
+ * pair's own lifetime shot ledger - was already silently raising those
+ * pairs' firing floor with no way to see which ones or by how much. */
+function DampenedPairsStrip({ stats }: { stats: TempoStatsResponse }) {
+  const dampened = stats.pairAccuracy.filter((p) => p.mult > 1).sort((a, b) => b.mult - a.mult).slice(0, 6)
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] p-2 font-mono text-[8.5px]">
+      <span className="text-[#4b5a72]">per-pair accuracy gate</span>
+      <span className="text-[#7c8aa5]">
+        {stats.totalShots} lifetime shots · {stats.hitRate !== null ? `${(stats.hitRate * 100).toFixed(0)}% overall` : 'n/a'}
+      </span>
+      {dampened.length === 0 ? (
+        <span className="text-[#3d4d66]">no pair currently below target with enough samples</span>
+      ) : (
+        dampened.map((p) => (
+          <span
+            key={`${p.asset}:${p.tf}`}
+            className="rounded border border-amber-500/40 px-1 py-px text-amber-300"
+            title={`${p.asset} ${p.tf}: ${(p.hitRate * 100).toFixed(0)}% hit rate over ${p.n} shots - floor raised ×${p.mult.toFixed(2)}`}
+          >
+            {p.asset} ×{p.mult.toFixed(2)}
+          </span>
+        ))
+      )}
+    </div>
+  )
+}
 
 interface TempoGlobalPanelProps {
   /** active chart timeframe - the board starts there but can switch */
@@ -123,6 +153,7 @@ export default function TempoGlobalPanel({ tf, closedTick, onPickAsset, onClose 
   const [err, setErr] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [, forceTick] = useState(0) // re-render for countdowns
+  const [tempoStats, setTempoStats] = useState<TempoStatsResponse | null>(null)
 
   const load = useCallback(async () => {
     setBusy(true)
@@ -151,6 +182,21 @@ export default function TempoGlobalPanel({ tf, closedTick, onPickAsset, onClose 
       clearInterval(age)
     }
   }, [load, closedTick, tfSel])
+
+  useEffect(() => {
+    const loadStats = () => {
+      getTempoStats()
+        .then((d) => {
+          if (d?.ok) setTempoStats(d)
+        })
+        .catch(() => {
+          // learned-stats strip is optional - never block the board on it
+        })
+    }
+    loadStats()
+    const iv = setInterval(loadStats, STATS_POLL_MS)
+    return () => clearInterval(iv)
+  }, [])
 
   const shown = useMemo(() => rows.filter((r) => r.ok), [rows])
   const firing = shown.filter((r) => r.decision === 'fire')
@@ -219,6 +265,8 @@ export default function TempoGlobalPanel({ tf, closedTick, onPickAsset, onClose 
           </div>
         </div>
       )}
+
+      {tempoStats && <DampenedPairsStrip stats={tempoStats} />}
 
       {/* strongest live shot, or the best window in progress */}
       {best && (

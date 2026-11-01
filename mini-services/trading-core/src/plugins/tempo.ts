@@ -501,14 +501,40 @@ export class TempoService {
   }
 
   /** Lifetime ledger for panels/agents. */
-  stats(): { totalShots: number; hits: number; losses: number; hitRate: number | null; recent: ResolvedShot[] } {
+  /** Lifetime ledger for panels/agents - now also surfaces per-pair
+   * accuracy multipliers (pairAccuracyMult()), which were already
+   * dampening live decisions with no way for a panel to show which pairs
+   * are currently being dampened or why. */
+  stats(): {
+    totalShots: number
+    hits: number
+    losses: number
+    hitRate: number | null
+    pairAccuracy: { asset: string; tf: string; n: number; hitRate: number; mult: number }[]
+    recent: ResolvedShot[]
+  } {
     const decided = this.shots.filter((s) => !s.flat)
     const wins = decided.filter((s) => s.hit).length
+    const byPair = new Map<string, ResolvedShot[]>()
+    for (const s of decided) {
+      const k = `${s.asset}:${s.tf}`
+      const arr = byPair.get(k) ?? []
+      arr.push(s)
+      byPair.set(k, arr)
+    }
+    const pairAccuracy = [...byPair.entries()]
+      .map(([k, rows]) => {
+        const [asset, tf] = k.split(':')
+        const hits = rows.filter((r) => r.hit).length
+        return { asset, tf, n: rows.length, hitRate: hits / rows.length, mult: this.pairAccuracyMult(asset, tf) }
+      })
+      .sort((a, b) => b.n - a.n)
     return {
       totalShots: this.shots.length,
       hits: wins,
       losses: decided.length - wins,
       hitRate: decided.length ? wins / decided.length : null,
+      pairAccuracy,
       recent: this.shots.slice(-20).reverse(),
     }
   }

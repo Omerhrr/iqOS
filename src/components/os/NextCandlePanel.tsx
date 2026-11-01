@@ -167,6 +167,71 @@ function DriverRow({ d }: { d: NextCandlePrediction['drivers'][number] }) {
   )
 }
 
+/** Which calibration bucket is actually in force for this pair right now,
+ * in predictNextCandle's own preference order (regime -> session ->
+ * direction -> blended) - explains why the confidence badge above can
+ * differ from the plain blended record. */
+function activeCalibrationLabel(
+  record: NextCandleStatsResponse['records'][number] | undefined,
+  regime: string,
+): string {
+  if (!record) return 'blended (no record yet)'
+  const r = record.regimeCalibration[regime as keyof typeof record.regimeCalibration]
+  if (r && r.n >= 20) return `regime ${regime} (n=${r.n})`
+  // session isn't known client-side without re-deriving the clock; show
+  // the thickest available session bucket as a hint instead.
+  const sessionEntries = Object.entries(record.sessionCalibration) as [string, { n: number; hitRate: number; brier: number }][]
+  const thickSession = sessionEntries.filter(([, v]) => v.n >= 20).sort((a, b) => b[1].n - a[1].n)[0]
+  if (thickSession) return `session ${thickSession[0]} (n=${thickSession[1].n})`
+  const dirEntries = Object.entries(record.directionCalibration) as [string, { n: number }][]
+  const thickDir = dirEntries.filter(([, v]) => v.n >= 20).sort((a, b) => b[1].n - a[1].n)[0]
+  if (thickDir) return `direction ${thickDir[0]} (n=${thickDir[1].n})`
+  return `blended (n=${record.n})`
+}
+
+function LearnedDiagnostics({ stats, record, regime }: { stats: NextCandleStatsResponse; record: NextCandleStatsResponse['records'][number] | undefined; regime: string }) {
+  const drivers = Object.entries(stats.driverWeightMultipliers).sort((a, b) => Math.abs(b[1] - 1) - Math.abs(a[1] - 1)).slice(0, 4)
+  const patterns = Object.entries(stats.patternReliability).sort((a, b) => Math.abs(b[1] - 2) - Math.abs(a[1] - 2)).slice(0, 4)
+  return (
+    <div className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-2">
+      <p className="font-mono text-[9px] uppercase tracking-wider text-[#4b5a72]">learned (what's actually shaping this read)</p>
+      <p className="mt-1 font-mono text-[8.5px] text-[#7c8aa5]">
+        calibration bucket in force: <span className="text-[#dbe4f0]">{activeCalibrationLabel(record, regime)}</span>
+      </p>
+      {record && record.magnitudeCalibration !== null && (
+        <p className="mt-0.5 font-mono text-[8.5px] text-[#7c8aa5]">
+          magnitude calibration: <span className="text-[#dbe4f0]">{record.magnitudeCalibration.toFixed(2)}×</span>{' '}
+          {record.magnitudeCalibration > 1.05 ? '(has been predicting too narrow a move)' : record.magnitudeCalibration < 0.95 ? '(has been predicting too wide a move)' : '(on target)'}
+        </p>
+      )}
+      {drivers.length > 0 && (
+        <div className="mt-1.5">
+          <p className="font-mono text-[8px] uppercase tracking-wider text-[#4b5a72]">driver weight outliers (universe-wide)</p>
+          <div className="mt-0.5 flex flex-wrap gap-1">
+            {drivers.map(([name, w]) => (
+              <span key={name} className={`rounded border px-1 py-px font-mono text-[8px] ${w > 1 ? 'border-emerald-500/40 text-emerald-300' : 'border-rose-500/40 text-rose-300'}`} title="learned driver weight multiplier from its own resolved win rate">
+                {name} {w.toFixed(2)}×
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+      {patterns.length > 0 && (
+        <div className="mt-1.5">
+          <p className="font-mono text-[8px] uppercase tracking-wider text-[#4b5a72]">pattern reliability outliers (universe-wide)</p>
+          <div className="mt-0.5 flex flex-wrap gap-1">
+            {patterns.map(([name, w]) => (
+              <span key={name} className={`rounded border px-1 py-px font-mono text-[8px] ${w > 2 ? 'border-emerald-500/40 text-emerald-300' : 'border-rose-500/40 text-rose-300'}`} title="learned pattern reliability, 0.3-4 scale (hand-set default is ~2)">
+                {name} {w.toFixed(2)}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function ResolutionRow({ r }: { r: OracleRecentResolution }) {
   return (
     <div className="flex items-center gap-1.5 font-mono text-[9px]">
@@ -275,6 +340,8 @@ export default function NextCandlePanel({ asset, tf, closedTick, onClose }: Next
           </div>
         </div>
       )}
+
+      {stats && <LearnedDiagnostics stats={stats} record={record} regime={pred?.regime ?? ''} />}
     </div>
   )
 }

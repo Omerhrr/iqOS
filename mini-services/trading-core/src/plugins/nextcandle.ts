@@ -452,10 +452,30 @@ export class NextCandleService {
   }
 
   /** Full stats for the panel: per-asset:tf records + recent resolutions. */
+  /** Lifetime ledger for panels/agents - now also surfaces the learned
+   * diagnostics every prediction already uses internally (driver weights,
+   * pattern reliability, and each asset:tf's own regime/session/direction
+   * calibration buckets and magnitude ratio), none of which had an API
+   * surface before this round: the numbers were influencing predictions
+   * invisibly, with nothing to show what was actually learned. */
   stats(): {
     total: number
     pending: number
-    records: { asset: string; tf: string; n: number; hitRate: number; brier: number; streak: number }[]
+    records: {
+      asset: string
+      tf: string
+      n: number
+      hitRate: number
+      brier: number
+      streak: number
+      regimeCalibration: Partial<Record<OracleRegime, { n: number; hitRate: number; brier: number }>>
+      sessionCalibration: Partial<Record<Session, { n: number; hitRate: number; brier: number }>>
+      directionCalibration: Partial<Record<'call' | 'put', { n: number; hitRate: number; brier: number }>>
+      magnitudeCalibration: number | null
+    }[]
+    driverWeightMultipliers: Record<string, number>
+    regimeDriverWeightMultipliers: Partial<Record<OracleRegime, Record<string, number>>>
+    patternReliability: Record<string, number>
     recent: ResolvedPrediction[]
   } {
     const byKey = new Map<string, ResolvedPrediction[]>()
@@ -474,12 +494,26 @@ export class NextCandleService {
         if (rows[i].hit) streak++
         else break
       }
-      return { asset, tf, n: rows.length, hitRate: win, brier, streak }
+      return {
+        asset,
+        tf,
+        n: rows.length,
+        hitRate: win,
+        brier,
+        streak,
+        regimeCalibration: this.regimeCalibrationFor(asset, tf),
+        sessionCalibration: this.sessionCalibrationFor(asset, tf),
+        directionCalibration: this.directionCalibrationFor(asset, tf),
+        magnitudeCalibration: this.magnitudeCalibrationFor(asset, tf),
+      }
     }).sort((a, b) => b.n - a.n)
     return {
       total: this.resolved.length,
       pending: this.pending.size,
       records,
+      driverWeightMultipliers: this.driverWeightMultipliers(),
+      regimeDriverWeightMultipliers: this.driverWeightMultipliersByRegime(),
+      patternReliability: this.patternReliabilityTable(),
       recent: this.resolved.slice(-40).reverse(),
     }
   }

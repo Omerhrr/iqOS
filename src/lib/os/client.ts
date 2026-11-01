@@ -792,6 +792,63 @@ export async function getAdxPatternBiasScan(tf: Timeframe): Promise<AdxPatternBi
   return osGet<AdxPatternBiasScanResponse>('/adx_pattern_bias_scan', { tf })
 }
 
+/** One resolved ADX/DI+Pattern honesty-loop call
+ * (mini-services/trading-core/src/plugins/adxhonesty.ts's ResolvedAdxCall). */
+export interface AdxHonestyResolvedCall {
+  asset: string
+  tf: string
+  targetBarTime: number
+  issuedTs: number
+  resolvedTs: number
+  direction: 'call' | 'put'
+  adxDirection: 'bullish' | 'bearish' | 'neutral'
+  patternDirection: 'bullish' | 'bearish' | 'neutral'
+  composite: number
+  entry: number
+  exit: number
+  actual: 'up' | 'down' | 'flat'
+  hit: boolean
+  /** this read's HTF disagreement flag at track time. */
+  htfDisagrees: boolean
+  /** true = the HTF veto alone blocked this from firing live - it's here
+   * purely so the learned HTF-veto penalty can judge whether the veto is
+   * worth its cost; never treat a shadow entry as a real signal. */
+  shadow: boolean
+  /** did the Next-Candle Oracle have an active same-direction read at
+   * track time? null = no active oracle read either way. */
+  oracleAgrees: boolean | null
+}
+
+export interface AdxPatternBiasStatsResponse {
+  ok: boolean
+  error?: string
+  total: number
+  pending: number
+  hitRate: number | null
+  /** learned relative weight of the ADX/DI trend leg vs the candlestick
+   * pattern leg (0.5-2 each, re-normalized around 1 in composite()) -
+   * null until both legs have >=30 resolved samples. */
+  legWeights: { trendWeight: number; patternWeight: number } | null
+  /** learned replacement for the flat COMPOSITE_QUALIFY bar - the
+   * smallest composite threshold, among a small candidate sweep, whose
+   * own resolved hit rate clears 55%. null = still using the hand-set 3.5. */
+  qualifyBar: number | null
+  /** learned multiplier an HTF-disagreeing read's composite must clear
+   * (as a multiple of the normal qualify bar) to still qualify. null =
+   * the HTF veto is still a flat hard block (not enough shadow samples
+   * yet to judge it either way). */
+  htfPenaltyMult: number | null
+  /** learned confidence/score multiplier (capped at 1.25x) applied when
+   * the Next-Candle Oracle actively agrees on direction - 1 = no boost
+   * (not enough samples on both sides yet to trust the comparison). */
+  confluenceBoost: number
+  recent: AdxHonestyResolvedCall[]
+}
+
+export async function getAdxPatternBiasStats(): Promise<AdxPatternBiasStatsResponse> {
+  return osGet<AdxPatternBiasStatsResponse>('/adx_pattern_bias_stats', {})
+}
+
 export interface ShockPressureScanRow {
   asset: string
   name: string
@@ -1438,12 +1495,53 @@ export interface OracleRecentResolution {
   brier: number
 }
 
+/** One learned calibration bucket - shape shared by regime/session/
+ * direction splits (mini-services/trading-core/src/plugins/nextcandle.ts). */
+export interface OracleCalibrationBucket {
+  n: number
+  hitRate: number
+  brier: number
+}
+
+export type OracleSession = 'ASIA' | 'LONDON' | 'OVERLAP' | 'NEWYORK' | 'OFF' | 'OTC'
+
 export interface NextCandleStatsResponse {
   ok: boolean
   error?: string
   total: number
   pending: number
-  records: { asset: string; tf: string; n: number; hitRate: number; brier: number; streak: number }[]
+  records: {
+    asset: string
+    tf: string
+    n: number
+    hitRate: number
+    brier: number
+    streak: number
+    /** learned calibration buckets - whichever is thick enough (n>=20)
+     * actually gets used, in order regime -> session -> direction ->
+     * blended (see predictNextCandle's preference order). Shown here so a
+     * panel can explain WHY a prediction's confidence badge differs from
+     * the plain blended record above. */
+    regimeCalibration: Partial<Record<OracleRegime, OracleCalibrationBucket>>
+    sessionCalibration: Partial<Record<OracleSession, OracleCalibrationBucket>>
+    directionCalibration: Partial<Record<'call' | 'put', OracleCalibrationBucket>>
+    /** learned realized-move / predicted-move ratio for this pair - 1 =
+     * untouched (thin data), >1 = the model has been predicting too
+     * NARROW a move historically, <1 = too WIDE. null = not trusted yet. */
+    magnitudeCalibration: number | null
+  }[]
+  /** universe-wide learned driver weight multipliers (0.75-1.3), blended
+   * across regimes - a driver sitting meaningfully above/below 50% hit
+   * rate over a real sample gets up/down-weighted here. */
+  driverWeightMultipliers: Record<string, number>
+  /** same driver weights, split one table per regime when that regime has
+   * enough of its own resolutions - falls back to the blended table above
+   * when a regime bucket is thin or absent. */
+  regimeDriverWeightMultipliers: Partial<Record<OracleRegime, Record<string, number>>>
+  /** universe-wide learned per-pattern reliability (0.3-4 scale, same
+   * range the hand-set table used) - feeds every patternBias() caller in
+   * the codebase, not just this engine. */
+  patternReliability: Record<string, number>
   recent: OracleRecentResolution[]
 }
 
@@ -1563,6 +1661,44 @@ export interface TempoScanResponse {
 
 export async function getTempoScan(tf: Timeframe, opts?: { limit?: number }): Promise<TempoScanResponse> {
   return osGet('/tempo_scan', { tf, limit: opts?.limit })
+}
+
+/** One resolved Tempo shot (mini-services/trading-core/src/plugins/tempo.ts's
+ * ResolvedShot). */
+export interface TempoResolvedShot {
+  asset: string
+  tf: string
+  windowIdx: number
+  targetBarTime: number
+  direction: 'call' | 'put'
+  entry: number
+  exit: number
+  confidence: number
+  conviction: number
+  barIndex: number
+  ts: number
+  resolvedTs: number
+  hit: boolean
+  flat: boolean
+}
+
+export interface TempoStatsResponse {
+  ok: boolean
+  error?: string
+  totalShots: number
+  hits: number
+  losses: number
+  hitRate: number | null
+  /** per-pair lifetime hit rate and the learned floor multiplier
+   * pairAccuracyMult() is currently applying - mult > 1 means this pair's
+   * lifetime hit rate reads below target and Tempo is dampening it; mult
+   * === 1 means either healthy or still too thin (n<20) to judge. */
+  pairAccuracy: { asset: string; tf: string; n: number; hitRate: number; mult: number }[]
+  recent: TempoResolvedShot[]
+}
+
+export async function getTempoStats(): Promise<TempoStatsResponse> {
+  return osGet<TempoStatsResponse>('/tempo_stats', {})
 }
 
 // ---------- randomness audit (descriptive feed statistics) ----------

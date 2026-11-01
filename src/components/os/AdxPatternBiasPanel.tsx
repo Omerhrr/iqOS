@@ -8,10 +8,51 @@
 // /adx_pattern_bias_scan (analytics/adxpatternbias.ts).
 
 import { useCallback, useEffect, useState } from 'react'
-import type { AdxPatternBiasScanResponse, AdxPatternBiasScanRow, Timeframe } from '@/lib/os/client'
-import { getAdxPatternBiasScan, fmtPrice } from '@/lib/os/client'
+import type { AdxPatternBiasScanResponse, AdxPatternBiasScanRow, AdxPatternBiasStatsResponse, Timeframe } from '@/lib/os/client'
+import { getAdxPatternBiasScan, getAdxPatternBiasStats, fmtPrice } from '@/lib/os/client'
 
 const POLL_MS = 10_000
+const STATS_POLL_MS = 20_000
+
+/** Compact strip of the honesty loop's own learned numbers - every one of
+ * these already silently shapes the scan above (leg weights feed
+ * composite(), qualifyBar replaces the flat 3.5, htfPenaltyMult replaces
+ * the flat htf-veto block, confluenceBoost nudges score/confidence when
+ * the oracle agrees); this is just what makes any of that visible. */
+function LearnedStatsStrip({ stats }: { stats: AdxPatternBiasStatsResponse }) {
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 border-b border-[#1c2739] bg-[#0b111c] px-2 py-1.5 font-mono text-[8.5px]">
+      <span className="text-[#4b5a72]">honesty loop</span>
+      <span className="text-[#7c8aa5]">
+        n={stats.total} · hit {stats.hitRate !== null ? `${(stats.hitRate * 100).toFixed(0)}%` : 'n/a'}
+      </span>
+      <span
+        className={`rounded border px-1 py-px ${stats.legWeights ? 'border-violet-500/40 text-violet-300' : 'border-[#1c2739] text-[#4b5a72]'}`}
+        title="learned relative weight of the ADX/DI trend leg vs the pattern leg in composite() - unset (1:1) until both legs have >=30 resolved samples"
+      >
+        {stats.legWeights ? `legs trend ${stats.legWeights.trendWeight.toFixed(2)}× / pattern ${stats.legWeights.patternWeight.toFixed(2)}×` : 'legs 1:1 (learning)'}
+      </span>
+      <span
+        className={`rounded border px-1 py-px ${stats.qualifyBar !== null ? 'border-violet-500/40 text-violet-300' : 'border-[#1c2739] text-[#4b5a72]'}`}
+        title="learned replacement for the flat 3.5 qualify bar - smallest composite threshold whose own resolved hit rate clears 55%"
+      >
+        bar {stats.qualifyBar !== null ? stats.qualifyBar.toFixed(1) : '3.5 (default)'}
+      </span>
+      <span
+        className={`rounded border px-1 py-px ${stats.htfPenaltyMult !== null ? 'border-violet-500/40 text-violet-300' : 'border-[#1c2739] text-[#4b5a72]'}`}
+        title="learned HTF-veto penalty: the composite margin an HTF-disagreeing read must clear to still qualify, as a multiple of the normal bar. Unset = still a flat hard block."
+      >
+        htf {stats.htfPenaltyMult !== null ? `×${stats.htfPenaltyMult.toFixed(1)}` : 'hard veto (default)'}
+      </span>
+      <span
+        className={`rounded border px-1 py-px ${stats.confluenceBoost > 1 ? 'border-emerald-500/40 text-emerald-300' : 'border-[#1c2739] text-[#4b5a72]'}`}
+        title="learned confidence/score multiplier applied when the Next-Candle Oracle actively agrees on direction"
+      >
+        confluence ×{stats.confluenceBoost.toFixed(2)}
+      </span>
+    </div>
+  )
+}
 
 function dirChip(direction: 'call' | 'put' | null) {
   if (!direction) {
@@ -129,6 +170,7 @@ export default function AdxPatternBiasPanel({
   onSelectAsset?: (asset: string) => void
 }) {
   const [data, setData] = useState<AdxPatternBiasScanResponse | null>(null)
+  const [stats, setStats] = useState<AdxPatternBiasStatsResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [query, setQuery] = useState('')
@@ -150,11 +192,27 @@ export default function AdxPatternBiasPanel({
     [tf],
   )
 
+  const loadStats = useCallback(() => {
+    getAdxPatternBiasStats()
+      .then((d) => {
+        if (d?.ok) setStats(d)
+      })
+      .catch(() => {
+        // learned-stats strip is optional - never block the scan on it
+      })
+  }, [])
+
   useEffect(() => {
     load()
     const iv = setInterval(() => load({ quiet: true }), POLL_MS)
     return () => clearInterval(iv)
   }, [load])
+
+  useEffect(() => {
+    loadStats()
+    const iv = setInterval(loadStats, STATS_POLL_MS)
+    return () => clearInterval(iv)
+  }, [loadStats])
 
   const needle = query.trim().toLowerCase()
   const rows = (data?.rows ?? [])
@@ -182,6 +240,8 @@ export default function AdxPatternBiasPanel({
           ✕
         </button>
       </div>
+
+      {stats && <LearnedStatsStrip stats={stats} />}
 
       <div className="flex items-center gap-1 border-b border-[#1c2739] px-2 py-1">
         <div className="relative min-w-0 flex-1">

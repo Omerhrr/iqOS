@@ -2406,6 +2406,22 @@ const httpServer = createServer(async (req, res) => {
         }
       }
 
+      // GET /adx_pattern_bias_stats -> the ADX/DI+Pattern honesty loop's
+      // own resolved track record: lifetime hit rate, the learned leg
+      // weights (trend push vs pattern bias), the learned qualify bar, the
+      // learned HTF-veto penalty multiplier, and the learned confluence
+      // boost - every one of these already silently shapes live scans and
+      // auto-trader decisions (plugins/adxhonesty.ts); this is the first
+      // API surface that shows what was actually learned.
+      if (path === '/adx_pattern_bias_stats') {
+        try {
+          const svc = kernel.context().use<AdxHonestyService>('adxhonesty')
+          return json(200, { ok: true, ...svc.stats() })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
       // Shock + Pressure scan: every open instrument's ATR-normalized "shock
       // ratio" on the latest bar (analytics/indicators.ts's atr()) combined
       // with net buy/sell pressure built up over the prior few bars
