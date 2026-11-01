@@ -64,6 +64,11 @@ interface PendingPrediction {
    * can be learned, independent of the fused outcome and of the driver
    * accuracy above (see patternReliabilityTable()). */
   patternHits: { name: string; direction: 'bullish' | 'bearish' | 'neutral' }[]
+  /** this read's own predicted magnitude (price units) - carried through
+   * to the resolved record so the REALIZED move can be checked against it
+   * (see magnitudeCalibrationFor()), the one estimate in this fusion that
+   * was never checked against reality before. */
+  expectedMove: number
 }
 
 export interface ResolvedPrediction {
@@ -90,6 +95,8 @@ export interface ResolvedPrediction {
   drivers: { name: string; vote: number }[]
   /** pattern hits at issue time, carried through for patternReliabilityTable() */
   patternHits: { name: string; direction: 'bullish' | 'bearish' | 'neutral' }[]
+  /** predicted magnitude at issue time - feeds magnitudeCalibrationFor() against |exit-entry| */
+  expectedMove: number
 }
 
 export interface GlobalScanRow {
@@ -172,7 +179,10 @@ export class NextCandleService {
       mode: this.market.mode,
       calibration: cal,
       regimeCalibration: this.regimeCalibrationFor(asset, tf),
+      directionCalibration: this.directionCalibrationFor(asset, tf),
       driverWeightMultipliers: this.driverWeightMultipliers(),
+      regimeDriverWeightMultipliers: this.driverWeightMultipliersByRegime(),
+      magnitudeCalibration: this.magnitudeCalibrationFor(asset, tf),
     })
     if (!pred) return null
     const key = `${asset}:${tf}:${pred.targetBarTime}`
@@ -190,6 +200,7 @@ export class NextCandleService {
       regime: pred.regime,
       drivers: pred.drivers.map((d) => ({ name: d.name, vote: d.vote })),
       patternHits: pred.patternHits,
+      expectedMove: pred.expectedMove,
     })
     if (this.pending.size > 400) {
       // drop the oldest fifth - pending entries resolve on candle close anyway
@@ -229,6 +240,7 @@ export class NextCandleService {
         regime: p.regime,
         drivers: p.drivers,
         patternHits: p.patternHits,
+        expectedMove: p.expectedMove,
       }
       this.resolved.push(entry)
       while (this.resolved.length > MAX_RESOLVED) this.resolved.shift()
@@ -268,6 +280,27 @@ export class NextCandleService {
     return out
   }
 
+  /** Same rolling record as calibrationFor(), split one bucket per
+   * PREDICTED DIRECTION instead of regime - catches an oracle that's
+   * quietly worse at calling puts than calls on this pair, which the
+   * regime-blended and all-blended records both hide. Used only as a
+   * fallback when regimeCalibrationFor()'s own bucket for the read's
+   * regime is thin - see analytics/nextcandle.ts's preference order. */
+  private directionCalibrationFor(asset: string, tf: string): Partial<Record<'call' | 'put', { n: number; hitRate: number; brier: number }>> {
+    const rows = this.resolved.filter((r) => r.asset === asset && r.tf === tf).slice(-CALIBRATION_WINDOW * 2)
+    const out: Partial<Record<'call' | 'put', { n: number; hitRate: number; brier: number }>> = {}
+    for (const dir of ['call', 'put'] as const) {
+      const rs = rows.filter((r) => r.predicted === dir)
+      if (rs.length < 20) continue
+      out[dir] = {
+        n: rs.length,
+        hitRate: rs.reduce((s, r) => s + r.score, 0) / rs.length,
+        brier: rs.reduce((s, r) => s + r.brier, 0) / rs.length,
+      }
+    }
+    return out
+  }
+
   /** Per-driver win rate across the WHOLE universe (not per asset:tf - a
    * driver's reliability is a property of the model, not one pair), fed
    * back as a weight multiplier: a driver sitting meaningfully above 50%
@@ -294,6 +327,57 @@ export class NextCandleService {
       out[name] = Math.max(0.75, Math.min(1.3, 0.75 + (winRate - 0.5) * 2.5))
     }
     return out
+  }
+
+  /** Same per-driver win rate as driverWeightMultipliers(), split one
+   * bucket per OracleRegime - a driver can be genuinely good in TRENDING
+   * and noise in RANGING, which the blended table above hides. Splitting
+   * by regime means each bucket sees fewer resolutions, so this uses a
+   * wider window (DRIVER_STATS_WINDOW * 2) than the blended table to give
+   * each regime bucket a real chance to clear DRIVER_STATS_MIN_N; a regime
+   * with too few resolutions is simply absent, and predictNextCandle falls
+   * back to the blended table for it. */
+  private driverWeightMultipliersByRegime(): Partial<Record<OracleRegime, Record<string, number>>> {
+    const window = this.resolved.slice(-DRIVER_STATS_WINDOW * 2)
+    const byRegime = new Map<OracleRegime, Map<string, { n: number; wins: number }>>()
+    for (const r of window) {
+      const realizedUpSign = r.actual === 'up' ? 1 : r.actual === 'down' ? -1 : 0
+      if (realizedUpSign === 0) continue
+      const byName = byRegime.get(r.regime) ?? new Map<string, { n: number; wins: number }>()
+      for (const d of r.drivers ?? []) {
+        const s = byName.get(d.name) ?? { n: 0, wins: 0 }
+        s.n++
+        if (Math.sign(d.vote) === realizedUpSign) s.wins++
+        byName.set(d.name, s)
+      }
+      byRegime.set(r.regime, byName)
+    }
+    const out: Partial<Record<OracleRegime, Record<string, number>>> = {}
+    for (const [regime, byName] of byRegime) {
+      const table: Record<string, number> = {}
+      for (const [name, s] of byName) {
+        if (s.n < DRIVER_STATS_MIN_N) continue
+        const winRate = s.wins / s.n
+        table[name] = Math.max(0.75, Math.min(1.3, 0.75 + (winRate - 0.5) * 2.5))
+      }
+      if (Object.keys(table).length > 0) out[regime] = table
+    }
+    return out
+  }
+
+  /** Learned ratio of REALIZED candle move (|exit-entry|) to this engine's
+   * own predicted expectedMove, for this exact asset:tf - the magnitude
+   * estimate was never checked against reality before this. Excludes flat
+   * bars (a zero realized move against a non-zero prediction would always
+   * read as "predicted too wide", which isn't a fair read of a doji).
+   * null (expectedMove left unchanged) until there's a real sample. */
+  private magnitudeCalibrationFor(asset: string, tf: string): number | null {
+    const rows = this.resolved.filter((r) => r.asset === asset && r.tf === tf && r.actual !== 'flat' && r.expectedMove > 0).slice(-CALIBRATION_WINDOW)
+    if (rows.length < 20) return null
+    const realizedAvg = rows.reduce((s, r) => s + Math.abs(r.exit - r.entry), 0) / rows.length
+    const predictedAvg = rows.reduce((s, r) => s + r.expectedMove, 0) / rows.length
+    if (predictedAvg <= 0) return null
+    return realizedAvg / predictedAvg
   }
 
   /** Per-PATTERN live reliability, learned the same way driverWeightMultipliers()

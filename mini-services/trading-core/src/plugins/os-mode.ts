@@ -67,6 +67,7 @@ import { fitShockPressure, SHOCK_RATIO_THRESHOLD, PRESSURE_LOOKBACK, SHOCKPRESSU
 import { computeTpo } from '../analytics/tpo'
 import type { NextCandleService } from './nextcandle'
 import type { TempoService } from './tempo'
+import type { AdxHonestyService } from './adxhonesty'
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
 /** NaN-safe comparison for trade gates. Thin-history screener rows can carry
@@ -1419,7 +1420,17 @@ export class ModeService {
               }
             }
             const fit = fitAdxPatternBias(candles, 14, PATTERN_BIAS_LOOKBACK, higherCandles)
-            if (!fit || !fit.qualifies) continue
+            if (!fit) continue
+            // honesty loop: report every fit computed from real candles here
+            // (qualifying or not - track() itself only keeps the qualifying
+            // ones) so plugins/adxhonesty.ts can learn from real auto-trader
+            // sweeps, not just panel views.
+            try {
+              this.ctx.use<AdxHonestyService>('adxhonesty').track(asset, this.config.tf, fit, candles)
+            } catch {
+              // honesty tracking optional - never blocks the sweep
+            }
+            if (!fit.qualifies) continue
             const dir: 'call' | 'put' | 'none' = fit.direction === 'bullish' ? 'call' : fit.direction === 'bearish' ? 'put' : 'none'
             if (dir === 'none') continue
             if (this.config.direction !== 'both' && dir !== this.config.direction) continue
@@ -1619,7 +1630,17 @@ export class ModeService {
               }
             }
             const fit = fitAdxPatternBias(candles, 14, PATTERN_BIAS_LOOKBACK, higherCandles)
-            if (!fit || !fit.qualifies) continue
+            if (!fit) continue
+            // honesty loop: report every fit computed from real candles here
+            // (qualifying or not - track() itself only keeps the qualifying
+            // ones) so plugins/adxhonesty.ts can learn from real auto-trader
+            // sweeps, not just panel views.
+            try {
+              this.ctx.use<AdxHonestyService>('adxhonesty').track(asset, this.config.tf, fit, candles)
+            } catch {
+              // honesty tracking optional - never blocks the sweep
+            }
+            if (!fit.qualifies) continue
             const dir: 'call' | 'put' | 'none' = fit.direction === 'bullish' ? 'call' : fit.direction === 'bearish' ? 'put' : 'none'
             if (dir === 'none') continue
             if (this.config.direction !== 'both' && dir !== this.config.direction) continue

@@ -169,13 +169,38 @@ export interface OracleInput {
    * another. Looked up by this prediction's OWN computed regime; falls
    * back to `calibration` when that regime's bucket is missing or thin. */
   regimeCalibration?: Partial<Record<OracleRegime, { n: number; hitRate: number; brier: number } | null>>
+  /** Same shape as `calibration` again, this time split by the PREDICTED
+   * DIRECTION ('call'/'put') rather than regime - an oracle can be quietly
+   * worse at calling puts than calls on a given pair, an asymmetry the
+   * regime-blended and direction-blended records both hide. Used only as
+   * a fallback when regimeCalibration's own bucket for this read's regime
+   * is missing or thin - regime is the more specific signal when both are
+   * available; this fills the gap when it isn't. */
+  directionCalibration?: Partial<Record<'call' | 'put', { n: number; hitRate: number; brier: number } | null>>
   /** Per-driver weight multipliers, keyed by OracleDriver.name - the
    * plugin's honesty loop tracks each model's own resolved accuracy and
    * feeds a multiplier back (>1 = this driver has been reliably right
    * lately, <1 = reliably wrong), on top of the static regime boosts each
    * driver already gets below. Missing/omitted name = multiplier 1
-   * (unchanged), so existing callers that don't pass this are unaffected. */
+   * (unchanged), so existing callers that don't pass this are unaffected.
+   * This is the BLENDED-across-regimes table - used as the fallback when
+   * `regimeDriverWeightMultipliers` below has no bucket for this read's
+   * own regime yet. */
   driverWeightMultipliers?: Partial<Record<string, number>>
+  /** Same per-driver multiplier table, split one bucket per OracleRegime -
+   * a driver can be reliable in TRENDING and noise in RANGING; this is the
+   * more specific record predictNextCandle prefers once its own regime is
+   * known (which happens BEFORE the drivers loop runs, so there's no
+   * chicken-egg problem applying it here, unlike calibration). Falls back
+   * to `driverWeightMultipliers` when this regime's bucket is missing. */
+  regimeDriverWeightMultipliers?: Partial<Record<OracleRegime, Partial<Record<string, number>>>>
+  /** Learned ratio of REALIZED candle move to this engine's own predicted
+   * `expectedMove`, for this exact asset:tf - the one estimate in this
+   * whole fusion that was never checked against reality until now. 1 =
+   * unchanged (today's behavior); >1 widens the forecast cone (this pair's
+   * candles realize bigger moves than predicted), <1 narrows it. Clamped
+   * defensively inside predictNextCandle regardless of what's passed. */
+  magnitudeCalibration?: number | null
   /** Monte Carlo bootstrap paths. Default 1200 (panel-grade); the bar-by-bar
    * strategy eval passes fewer for backtest speed - the fused read is stable
    * well below the default (binomial noise on pUp ~ 1/sqrt(n)). */
@@ -388,10 +413,15 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
   // model's own resolved accuracy and feeds a multiplier back here, on top
   // of the static regime boosts above - a driver that's been reliably
   // wrong lately gets downweighted automatically instead of only ever being
-  // tuned by hand via trendBoost/fadeBoost/chaosFlatten.
-  if (input.driverWeightMultipliers) {
+  // tuned by hand via trendBoost/fadeBoost/chaosFlatten. Prefers the
+  // REGIME-SPECIFIC table (this exact regime's own per-driver accuracy,
+  // `regime` is already known at this point - no chicken-egg problem the
+  // way calibration below has) and falls back to the blended-across-
+  // regimes table when that regime's bucket is missing or wasn't provided.
+  const dwm = input.regimeDriverWeightMultipliers?.[regime] ?? input.driverWeightMultipliers
+  if (dwm) {
     for (const d of drivers) {
-      const m = input.driverWeightMultipliers[d.name]
+      const m = dwm[d.name]
       if (Number.isFinite(m) && m! > 0) d.weight *= clamp(m!, 0.6, 1.5)
     }
   }
@@ -419,14 +449,19 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
   const sampleFactor = clamp(0.72 + 0.28 * (usable.length / drivers.length), 0.72, 1)
   const rawConfidence = clamp((0.55 * agreement + 0.45 * distance) * 100 * sampleFactor, 0, 97)
 
-  // calibration discount: the oracle's own realized record tempers the read.
-  // Prefer the REGIME-SPECIFIC record (this exact regime's own hit rate/
-  // Brier) when the plugin has tracked one and it's thick enough to trust;
-  // fall back to the blended-across-regimes record otherwise. A model well
-  // calibrated in TRENDING can be overconfident in VOLATILE - blending them
-  // into one number hides that.
+  // calibration discount: the oracle's own realized record tempers the
+  // read. Preference order, most specific first: (1) REGIME-SPECIFIC
+  // record - a model well calibrated in TRENDING can be overconfident in
+  // VOLATILE, blending them hides that; (2) DIRECTION-SPECIFIC record
+  // (predictedDirSign below, derivable now since pUp is already fused) -
+  // an oracle can be quietly worse at calling puts than calls on a pair,
+  // an asymmetry the regime-blended record also hides; (3) the plain
+  // blended-across-everything record. Each tier only used once it clears
+  // its own n>=20 "thin record is no record" floor.
+  const predictedDirSign: 'call' | 'put' = pUp >= 0.5 ? 'call' : 'put'
   const regimeCal = input.regimeCalibration?.[regime] ?? null
-  const cal = regimeCal && regimeCal.n >= 20 ? regimeCal : input.calibration ?? null
+  const dirCal = input.directionCalibration?.[predictedDirSign] ?? null
+  const cal = regimeCal && regimeCal.n >= 20 ? regimeCal : dirCal && dirCal.n >= 20 ? dirCal : input.calibration ?? null
   const confidence = applyCalibrationDiscount(rawConfidence, cal)
 
   // ---------- magnitude: EWMA vol + markov next-state emphasis, ATR-anchored ----------
@@ -436,7 +471,16 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
   // 1-bar close-to-close move is on the order of one ATR; the Markov
   // next-state distribution stretches it when a big move state dominates
   const markovBoost = clamp(0.7 + (Math.abs(nextStateMean) / vol) * 0.35, 0.7, 1.8)
-  const expAbs = clamp(price * vol * markovBoost, 0.35 * atrSafe, 1.8 * atrSafe)
+  // magnitude calibration: the one estimate in this whole fusion nothing
+  // ever checked against reality until now - this engine's own self-
+  // calibration loop only ever checked DIRECTION (hit rate, Brier). A
+  // learned realized/predicted move ratio for this exact pair widens or
+  // narrows the cone to match how big its candles actually move, clamped
+  // defensively either way so a thin or noisy record can't blow the cone
+  // out - and the clamp band below is widened symmetrically to give the
+  // calibration real room to work instead of immediately re-clamping it away.
+  const magCal = input.magnitudeCalibration && Number.isFinite(input.magnitudeCalibration) && input.magnitudeCalibration > 0 ? clamp(input.magnitudeCalibration, 0.5, 2) : 1
+  const expAbs = clamp(price * vol * markovBoost * magCal, 0.2 * atrSafe, 2.2 * atrSafe)
   const dirSign = pUp >= 0.5 ? 1 : -1
 
   // range cone: typical range/body ratio of the last 40 bars

@@ -29,6 +29,7 @@ import { chartSignalsPlugin, ChartSignalsService } from './src/plugins/chartsign
 import { leadLagScanPlugin, LeadLagScanService } from './src/plugins/leadlagscan'
 import { yesterdayPlugin, YesterdayService } from './src/plugins/yesterday'
 import { nextCandlePlugin, NextCandleService } from './src/plugins/nextcandle'
+import { adxHonestyPlugin, AdxHonestyService } from './src/plugins/adxhonesty'
 import { tempoPlugin, TempoService } from './src/plugins/tempo'
 import { gridSearch, walkForward, sweepAssets, type Objective } from './src/strategies/optimize'
 import { backtest } from './src/strategies/backtest'
@@ -188,6 +189,7 @@ kernel.register(leadLagScanPlugin)
 kernel.register(yesterdayPlugin)
 kernel.register(nextCandlePlugin)
 kernel.register(tempoPlugin)
+kernel.register(adxHonestyPlugin)
 
 // ---------- Full-universe scanners for Distill / Cointegration / Vol Arb ----------
 // These three started as single-asset-only panels (read whatever's on the
@@ -557,6 +559,14 @@ function scanAdxPatternBias(market: MarketDataService, tfv: Timeframe): AdxPatte
       }
       const fit = fitAdxPatternBias(candles, 14, PATTERN_BIAS_LOOKBACK, higherCandles)
       if (!fit) continue
+      // honesty loop: report every qualifying fit computed from REAL market
+      // candles so plugins/adxhonesty.ts can resolve it and learn - never
+      // blocks the scan if the plugin isn't loaded or a call throws.
+      try {
+        kernel.context().use<AdxHonestyService>('adxhonesty').track(a.ticker, tfv, fit, candles)
+      } catch {
+        // honesty tracking optional - never breaks the scan
+      }
       const direction: 'call' | 'put' | null = fit.qualifies ? (fit.direction === 'bullish' ? 'call' : fit.direction === 'bearish' ? 'put' : null) : null
       rows.push({
         asset: a.ticker,

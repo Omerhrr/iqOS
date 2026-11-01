@@ -27,7 +27,7 @@ import { join } from 'node:path'
 import type { KernelContext, Plugin } from '../kernel'
 import type { Candle, Timeframe } from '../types'
 import { TIMEFRAME_SECONDS } from '../types'
-import { tempoConviction, tempoDecide, tempoWindow, TEMPO_FLOOR, TEMPO_WINDOW_BARS, type TempoDecision } from '../analytics/tempo'
+import { tempoConviction, tempoDecide, tempoWindow, TEMPO_FLOOR, TEMPO_PAIR_ACCURACY_MAX_PENALTY, TEMPO_WINDOW_BARS, type TempoDecision } from '../analytics/tempo'
 import { fitAdxPatternBias, PATTERN_BIAS_LOOKBACK } from '../analytics/adxpatternbias'
 import type { NextCandleService, GlobalScanRow } from './nextcandle'
 import type { MarketDataService } from './market-data'
@@ -204,6 +204,25 @@ export class TempoService {
     )
   }
 
+  /** This pair's own LIFETIME shot ledger (not just the last few windows,
+   * unlike recentSimilarLoss above) - a structural, longer-horizon read on
+   * whether this pair just runs worse than the fleet. "Thin record is no
+   * record": below PAIR_ACCURACY_MIN_N decided shots this returns 1 (no
+   * penalty) - a pair with few shots hasn't earned either trust or
+   * suspicion yet. Once trusted, a hit rate at or above the healthy target
+   * also returns 1; below target the floor gets multiplied up smoothly,
+   * capped at TEMPO_PAIR_ACCURACY_MAX_PENALTY so a structurally bad pair is
+   * dampened, never effectively shut off outright. */
+  private pairAccuracyMult(asset: string, tf: string): number {
+    const PAIR_ACCURACY_MIN_N = 20
+    const PAIR_ACCURACY_TARGET_HIT_RATE = 0.5
+    const decided = this.shots.filter((s) => s.asset === asset && s.tf === tf && !s.flat)
+    if (decided.length < PAIR_ACCURACY_MIN_N) return 1
+    const hitRate = decided.filter((s) => s.hit).length / decided.length
+    if (hitRate >= PAIR_ACCURACY_TARGET_HIT_RATE) return 1
+    return Math.max(1, Math.min(TEMPO_PAIR_ACCURACY_MAX_PENALTY, 1 + (PAIR_ACCURACY_TARGET_HIT_RATE - hitRate) * 3))
+  }
+
   private stateFor(key: string): PairTempoState {
     let s = this.states.get(key)
     if (!s) {
@@ -329,7 +348,8 @@ export class TempoService {
     }
     const hist = this.historyFor(key, now)
     const recentSimilarLoss = this.recentSimilarLoss(r.asset, tf, r.direction, conviction, w.windowIdx)
-    const dec: TempoDecision = tempoDecide({ conviction, barsRemaining: w.barsRemaining, windowMaxHistory: hist, recentSimilarLoss })
+    const pairAccuracyMult = this.pairAccuracyMult(r.asset, tf)
+    const dec: TempoDecision = tempoDecide({ conviction, barsRemaining: w.barsRemaining, windowMaxHistory: hist, recentSimilarLoss, pairAccuracyMult })
     const spent = st.fired
     const decision: TempoRow['decision'] = spent ? 'done' : dec.kind === 'fire' ? 'fire' : dec.kind
     const reason = spent
@@ -373,7 +393,8 @@ export class TempoService {
     const w = tempoWindow(pred.targetBarTime, tfSec)
     const hist = this.historyFor(key, Date.now())
     const recentSimilarLoss = this.recentSimilarLoss(asset, tf, pred.direction, conviction, w.windowIdx)
-    const dec = tempoDecide({ conviction, barsRemaining: w.barsRemaining, windowMaxHistory: hist, recentSimilarLoss })
+    const pairAccuracyMult = this.pairAccuracyMult(asset, tf)
+    const dec = tempoDecide({ conviction, barsRemaining: w.barsRemaining, windowMaxHistory: hist, recentSimilarLoss, pairAccuracyMult })
     if (dec.kind !== 'fire') return { ok: false, reason: dec.reason }
     if (pred.direction === 'none') return { ok: false, reason: 'fusion has no directional lean on this bar' }
     // cross-engine confluence veto: claim time only (not the scan/display

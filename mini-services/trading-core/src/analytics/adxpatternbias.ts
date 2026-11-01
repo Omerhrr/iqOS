@@ -44,6 +44,45 @@ export const PATTERN_BIAS_LOOKBACK = 8
  * trend, so it has to clear a higher bar instead of being vetoed outright. */
 export const COMPOSITE_QUALIFY = 3.5
 export const COMPOSITE_QUALIFY_VOLATILE = COMPOSITE_QUALIFY * 1.25
+/** VOLATILE multiplier applied to whichever qualify bar is active (hand-set
+ * or learned below) - kept as a ratio rather than a second flat constant so
+ * a learned bar still gets the same proportional VOLATILE dampening. */
+const VOLATILE_QUALIFY_MULT = COMPOSITE_QUALIFY_VOLATILE / COMPOSITE_QUALIFY
+
+// ---------- honesty-loop learning bridges ----------
+// plugins/adxhonesty.ts (new - this composite never had its own honesty
+// loop before) tracks every qualifying call this module produces through
+// its tracked callers, resolves each one against the REAL next-bar
+// direction, and feeds two learned numbers back here, universe-wide (same
+// "no asset keying needed" scope the Oracle's driver weights and the
+// learned pattern-reliability table already use) - so every caller of
+// fitAdxPatternBias, tracked or not, inherits the learned numbers with no
+// code changes on their end.
+export interface AdxPatternBiasLearning {
+  /** learned relative weight of the ADX/DI trend-push leg vs the pattern-
+   * bias leg in composite() - replaces the hand-set 1:1 blend once each
+   * leg has enough resolved samples to trust. Both default to 1 (today's
+   * behavior). composite() re-normalizes so (trendWeight+patternWeight)/2
+   * always averages to 1 - only the RELATIVE balance between the two legs
+   * ever changes, never the overall scale COMPOSITE_QUALIFY is tuned to. */
+  trendWeight: number
+  patternWeight: number
+}
+export type AdxPatternBiasLearningProvider = () => AdxPatternBiasLearning | null
+let adxLearningProvider: AdxPatternBiasLearningProvider | null = null
+export function setAdxPatternBiasLearningProvider(p: AdxPatternBiasLearningProvider | null): void {
+  adxLearningProvider = p
+}
+
+/** learned COMPOSITE_QUALIFY replacement - the smallest bar, among a small
+ * candidate sweep, whose own resolved hit rate (universe-wide) clears a
+ * target precision, found by plugins/adxhonesty.ts. null until there's
+ * enough resolved history to trust any candidate. */
+export type AdxQualifyBarProvider = () => number | null
+let adxQualifyBarProvider: AdxQualifyBarProvider | null = null
+export function setAdxQualifyBarProvider(p: AdxQualifyBarProvider | null): void {
+  adxQualifyBarProvider = p
+}
 
 /** 5s..1d ladder, same order ALL_TIMEFRAMES uses - lets the multi-timeframe
  * confirmation below ask "what's one rung up from here" without keeping a
@@ -161,8 +200,22 @@ function hurstProxy(closes: number[]): number {
  * pattern pulls the composite back toward 0 rather than letting the bigger
  * of the two just win. */
 function composite(trendPush: number, patBias: number): number {
-  const sum = trendPush + patBias
-  const sameSign = (trendPush >= 0 && patBias >= 0) || (trendPush <= 0 && patBias <= 0)
+  const learning = adxLearningProvider?.() ?? null
+  let tw = learning && Number.isFinite(learning.trendWeight) ? learning.trendWeight : 1
+  let pw = learning && Number.isFinite(learning.patternWeight) ? learning.patternWeight : 1
+  // re-normalize so the two legs' weights always average to 1 - only their
+  // RELATIVE balance moves, the overall scale COMPOSITE_QUALIFY is tuned
+  // to never silently drifts just because the learning provider's own
+  // scale differs.
+  const avg = (tw + pw) / 2
+  if (avg > 0) {
+    tw /= avg
+    pw /= avg
+  }
+  const wTrend = trendPush * tw
+  const wPattern = patBias * pw
+  const sum = wTrend + wPattern
+  const sameSign = (wTrend >= 0 && wPattern >= 0) || (wTrend <= 0 && wPattern <= 0)
   const raw = sameSign ? sum : sum * 0.5
   return Math.max(-10, Math.min(10, raw))
 }
@@ -247,7 +300,9 @@ export function fitAdxPatternBias(candles: Candle[], period = 14, lookback = PAT
     indicators: { adx: adxVal },
     quant: { hurst: hurstProxy(close), garchVol: garchVol(recentRets), ewmaVol: ewmaVol(recentRets) },
   } as unknown as AnalysisResult)
-  const qualifyBar = regime === 'VOLATILE' ? COMPOSITE_QUALIFY_VOLATILE : COMPOSITE_QUALIFY
+  const learnedBar = adxQualifyBarProvider?.() ?? null
+  const baseBar = learnedBar && learnedBar > 0 ? learnedBar : COMPOSITE_QUALIFY
+  const qualifyBar = regime === 'VOLATILE' ? baseBar * VOLATILE_QUALIFY_MULT : baseBar
 
   // Volume confirmation (informational, see volumeConfirms doc above): only
   // ever computed when real volume data exists for this window.

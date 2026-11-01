@@ -57,6 +57,10 @@ export const TEMPO_FLOOR_MAX = 14
  * instead of refusing outright - a real edge can still clear the raised
  * bar; a repeat of the same recent mistake usually can't. */
 export const TEMPO_RECENT_LOSS_PENALTY = 1.25
+/** pairAccuracyMult() (plugin-computed, from the pair's own lifetime shot
+ * ledger) never raises the floor by more than this - a structurally bad
+ * pair gets dampened, not effectively shut off outright. */
+export const TEMPO_PAIR_ACCURACY_MAX_PENALTY = 1.6
 
 function clamp(v: number, lo: number, hi: number): number {
   return Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : lo
@@ -158,16 +162,27 @@ export function tempoDecide(opts: {
    * raises the floor by TEMPO_RECENT_LOSS_PENALTY instead of refusing
    * outright (see the constant's doc above). */
   recentSimilarLoss?: boolean
+  /** plugin-supplied: this pair's own LIFETIME shot ledger (not just the
+   * last few windows) has enough resolved shots to trust and reads
+   * persistently below a healthy hit rate - a longer-horizon, structural
+   * version of recentSimilarLoss above. 1 = no penalty (default); clamped
+   * to [1, TEMPO_PAIR_ACCURACY_MAX_PENALTY] by the plugin before it gets
+   * here, but clamped again here defensively. */
+  pairAccuracyMult?: number
 }): TempoDecision {
   const baseFloor = opts.floor ?? pairFloor(opts.windowMaxHistory)
-  const floor = opts.recentSimilarLoss ? baseFloor * TEMPO_RECENT_LOSS_PENALTY : baseFloor
+  const pairMult = Number.isFinite(opts.pairAccuracyMult) ? clamp(opts.pairAccuracyMult ?? 1, 1, TEMPO_PAIR_ACCURACY_MAX_PENALTY) : 1
+  const floor = (opts.recentSimilarLoss ? baseFloor * TEMPO_RECENT_LOSS_PENALTY : baseFloor) * pairMult
   const conviction = Number.isFinite(opts.conviction) ? Math.max(0, opts.conviction) : 0
   const expMax = expectedWindowMax(opts.windowMaxHistory)
   // order-statistic decay: the best of k remaining bars from a distribution
   // whose window-max averages expMax scales ~ sqrt(k/10)
   const patienceBar = expMax * Math.sqrt(Math.max(0, opts.barsRemaining) / TEMPO_WINDOW_BARS)
   const threshold = Math.max(floor, patienceBar)
-  const cautionNote = opts.recentSimilarLoss ? ' (floor raised - echoes a recent similar loss on this pair)' : ''
+  const cautionBits: string[] = []
+  if (opts.recentSimilarLoss) cautionBits.push('echoes a recent similar loss on this pair')
+  if (pairMult > 1) cautionBits.push(`this pair's lifetime hit rate is below target (floor x${pairMult.toFixed(2)})`)
+  const cautionNote = cautionBits.length ? ` (floor raised - ${cautionBits.join('; ')})` : ''
   if (conviction < floor) {
     return {
       kind: 'skip',
