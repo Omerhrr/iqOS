@@ -194,13 +194,41 @@ const allDetectors = (): Detector[] => {
   return DETECTORS_CACHE
 }
 
+/** Every detector above only checks RELATIVE ratios (body vs range, body
+ * vs average body) - nothing stops a detector firing on a bar whose
+ * entire range is smaller than the pair's own typical tick-to-tick noise,
+ * which is routine on thin OTC synthetic feeds. A "Hammer" built entirely
+ * out of noise jitter is not a real formation, however clean its wick/body
+ * ratio looks. NOISE_FLOOR_MULT: a hit's anchor bar must have a range of
+ * at least this fraction of the series' own recent median bar range to
+ * count at all - well below 1 (most real bars should still pass), just
+ * high enough to reject the smallest fraction that's pure noise. Applied
+ * as a floor, never a ceiling: it can only ever REJECT a hit, same
+ * precision-only contract every veto in this codebase follows. */
+const NOISE_FLOOR_MULT = 0.25
+const NOISE_FLOOR_SAMPLE = 100
+
+function medianRange(candles: Candle[]): number {
+  const sample = candles.slice(-NOISE_FLOOR_SAMPLE).map(range).sort((a, b) => a - b)
+  if (sample.length === 0) return 0
+  const mid = Math.floor(sample.length / 2)
+  return sample.length % 2 ? sample[mid] : (sample[mid - 1] + sample[mid]) / 2
+}
+
 /** Scan the last `lookback` candles; every detector fires on each bar end. */
 export function detectPatterns(candles: Candle[], lookback = 8): PatternHit[] {
   const hits: PatternHit[] = []
   const start = Math.max(12, candles.length - lookback)
+  const noiseFloor = medianRange(candles) * NOISE_FLOOR_MULT
   for (let end = start + 1; end <= candles.length; end++) {
     const window = candles.slice(0, end)
     const barsAgo = candles.length - end
+    // noise-floor reject: the anchor bar (the window's own last bar, same
+    // one every detector keys its body/wick ratios off) carries too
+    // little real range to trust ANY pattern read on it - skip the whole
+    // bar rather than let a detector's relative-ratio math turn pure tick
+    // noise into a reported formation.
+    if (range(window[window.length - 1]) < noiseFloor) continue
     for (const fn of allDetectors()) {
       try {
         const hit = fn(window)

@@ -764,9 +764,17 @@ export interface AdxPatternBiasScanRow {
    * contradicts the proposed direction - a precision veto that only
    * tightens qualification, never loosens it. */
   haDisagrees: boolean
-  /** Same ADX/DI read one timeframe rung up actively contradicts this
-   * read's proposed direction - another precision veto, same contract as
-   * haDisagrees. */
+  /** Same ADX/DI read one timeframe rung up ('neutral' when the higher
+   * frame isn't itself trending or wasn't available). */
+  htfDirection: 'bullish' | 'bearish' | 'neutral'
+  /** Same pattern-bias read one timeframe rung up ('neutral' when there's
+   * no pattern hit on the higher frame or it wasn't available). */
+  htfPatternDirection: 'bullish' | 'bearish' | 'neutral'
+  /** The higher-timeframe ADX/DI direction OR the higher-timeframe pattern
+   * direction actively contradicts this read's proposed direction -
+   * another precision veto, same contract as haDisagrees. Check
+   * htfDirection/htfPatternDirection against `direction` to see which one
+   * actually triggered it. */
   htfDisagrees: boolean
   /** The Oracle's own 4-way regime classifier, fed this fit's own ADX plus
    * lightweight vol/persistence proxies. A VOLATILE read raises the
@@ -842,6 +850,12 @@ export interface AdxPatternBiasStatsResponse {
    * the Next-Candle Oracle actively agrees on direction - 1 = no boost
    * (not enough samples on both sides yet to trust the comparison). */
   confluenceBoost: number
+  /** learned replacement for the flat ADX_TREND_THRESHOLD (25) - the
+   * smallest candidate ADX level, among a small ascending sweep, whose
+   * own resolved subset clears the target hit rate. Can only ever be
+   * raised above 25 (every resolved call already required adx >= the
+   * threshold in force), never lowered. null = still using the flat 25. */
+  trendThreshold: number | null
   recent: AdxHonestyResolvedCall[]
 }
 

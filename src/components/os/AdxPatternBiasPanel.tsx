@@ -50,6 +50,12 @@ function LearnedStatsStrip({ stats }: { stats: AdxPatternBiasStatsResponse }) {
       >
         confluence ×{stats.confluenceBoost.toFixed(2)}
       </span>
+      <span
+        className={`rounded border px-1 py-px ${stats.trendThreshold !== null ? 'border-violet-500/40 text-violet-300' : 'border-[#1c2739] text-[#4b5a72]'}`}
+        title="learned ADX trend threshold - the smallest level, among a small ascending sweep, whose own resolved subset clears a 55% hit rate. Can only ever rise above the flat default of 25."
+      >
+        adx≥{stats.trendThreshold !== null ? stats.trendThreshold.toFixed(0) : '25 (default)'}
+      </span>
     </div>
   )
 }
@@ -117,7 +123,17 @@ function AdxPatternBiasCard({ r, onSelectAsset }: { r: AdxPatternBiasScanRow; on
         {r.htfDisagrees && (
           <span
             className="rounded border border-rose-500/40 bg-rose-500/10 px-1 py-px font-mono text-[8px] font-bold uppercase text-rose-300"
-            title="the same ADX/DI read one timeframe rung up contradicts this direction - vetoes qualification"
+            title={(() => {
+              const dirBias = r.direction === 'call' ? 'bullish' : r.direction === 'put' ? 'bearish' : null
+              return (
+                [
+                  r.htfDirection !== 'neutral' && r.htfDirection !== dirBias ? `HTF ADX/DI reads ${r.htfDirection}` : null,
+                  r.htfPatternDirection !== 'neutral' && r.htfPatternDirection !== dirBias ? `HTF pattern reads ${r.htfPatternDirection}` : null,
+                ]
+                  .filter(Boolean)
+                  .join(' · ') || 'the same ADX/DI or pattern read one timeframe rung up contradicts this direction'
+              )
+            })()}
           >
             htf veto
           </span>
@@ -293,7 +309,10 @@ export default function AdxPatternBiasPanel({
             <span className="text-rose-400/80">ha veto</span> is a third, independent read - the same pattern catalog re-run on
             smoothed Heikin Ashi candles - and blocks qualification when it actively disagrees, even though ADX/DI and the raw
             candles agree. <span className="text-rose-400/80">htf veto</span> is a fourth independent read: the same ADX/DI check
-            one timeframe rung up, blocking qualification the same way when it disagrees. <span className="text-amber-400/80">volatile</span>{' '}
+            AND the same pattern check, both one timeframe rung up - either one disagreeing blocks qualification the same way
+            (hover the chip to see which). ADX also now requires the trend reading to have held for 2 consecutive bars, not
+            just the current one, before counting as trending at all - a one-bar spike no longer qualifies alone.{' '}
+            <span className="text-amber-400/80">volatile</span>{' '}
             means the Oracle's own regime classifier reads this bar as choppy, so the composite needed to clear a 25% higher
             bar rather than being blocked outright. <span className="text-[#aebccf]">vol confirms/thin</span> is informational only
             - whether the top pattern hit's own bar carried above-average volume - and never gates qualification, since many

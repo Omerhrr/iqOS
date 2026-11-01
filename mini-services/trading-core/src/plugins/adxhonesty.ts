@@ -36,11 +36,13 @@ import { join } from 'node:path'
 import type { KernelContext, Plugin } from '../kernel'
 import type { Candle } from '../types'
 import {
+  ADX_TREND_THRESHOLD,
   type AdxPatternBiasFit,
   type Bias,
   setAdxHtfLearningProvider,
   setAdxPatternBiasLearningProvider,
   setAdxQualifyBarProvider,
+  setAdxTrendThresholdProvider,
 } from '../analytics/adxpatternbias'
 import { weightedHitRate } from '../analytics/recencystats'
 
@@ -67,6 +69,15 @@ const SIDE_STATS_WINDOW = 500
  * this - an agreeing second engine earns a real but bounded nudge, never
  * enough to turn a marginal read into a sure thing on its own. */
 const CONFLUENCE_BOOST_MAX = 1.25
+/** candidate ADX trend thresholds swept ascending from the flat default -
+ * every resolved call already required adx >= the threshold in force at
+ * track time, so there's no data on a LOWER threshold; only raising it is
+ * ever learnable here, same precision-tightening-only contract as the
+ * qualify-bar sweep above. */
+const TREND_THRESHOLD_CANDIDATES = [ADX_TREND_THRESHOLD, 27, 30, 33, 36, 40]
+const TREND_THRESHOLD_TARGET_HIT_RATE = 0.55
+const TREND_THRESHOLD_MIN_N = 30
+const TREND_THRESHOLD_WINDOW = 500
 
 interface PendingAdxCall {
   asset: string
@@ -77,6 +88,10 @@ interface PendingAdxCall {
   adxDirection: Bias
   patternDirection: Bias
   composite: number
+  /** raw ADX value at track time - feeds learnedAdxTrendThreshold()'s
+   * candidate sweep. Every tracked call already had adx >= whatever
+   * threshold was in force, so this can only ever inform RAISING the bar. */
+  adx: number
   price: number
   /** this read's HTF disagreement flag, carried through to resolution so
    * htfAlignmentLearning() can compare agree-vs-disagree hit rates. */
@@ -102,6 +117,7 @@ export interface ResolvedAdxCall {
   adxDirection: Bias
   patternDirection: Bias
   composite: number
+  adx: number
   entry: number
   exit: number
   actual: 'up' | 'down' | 'flat'
@@ -127,7 +143,8 @@ export class AdxHonestyService {
     setAdxPatternBiasLearningProvider(() => this.legWeights())
     setAdxQualifyBarProvider(() => this.learnedQualifyBar())
     setAdxHtfLearningProvider(() => this.htfAlignmentLearning())
-    ctx.log('adxhonesty', 'ADX/DI + pattern bias honesty loop online (learned leg weights + learned qualify bar + learned HTF veto)')
+    setAdxTrendThresholdProvider(() => this.learnedAdxTrendThreshold())
+    ctx.log('adxhonesty', 'ADX/DI + pattern bias honesty loop online (learned leg weights + learned qualify bar + learned HTF veto + learned trend threshold)')
   }
 
   stop(): void {
@@ -166,6 +183,7 @@ export class AdxHonestyService {
       adxDirection: fit.adxDirection,
       patternDirection: fit.patternDirection,
       composite: fit.composite,
+      adx: fit.adx,
       price: last.close,
       htfDisagrees: fit.htfDisagrees,
       shadow,
@@ -214,6 +232,7 @@ export class AdxHonestyService {
         adxDirection: p.adxDirection,
         patternDirection: p.patternDirection,
         composite: p.composite,
+        adx: p.adx,
         entry: p.price,
         exit: candle.close,
         actual,
@@ -299,6 +318,24 @@ export class AdxHonestyService {
     return null
   }
 
+  /** Smallest candidate ADX trend threshold, among candidates ascending
+   * from the flat ADX_TREND_THRESHOLD, whose own resolved subset clears
+   * the target hit rate with enough samples - same sweep shape as
+   * learnedQualifyBar() above, just over the trend-gate itself instead of
+   * the composite bar. null (stays at the flat default) until the
+   * smallest candidate (the default itself) has enough samples. */
+  private learnedAdxTrendThreshold(): number | null {
+    const window = this.resolved.slice(-TREND_THRESHOLD_WINDOW).filter((r) => !r.shadow && r.actual !== 'flat')
+    if (window.length < TREND_THRESHOLD_MIN_N) return null
+    for (const c of TREND_THRESHOLD_CANDIDATES) {
+      const subset = window.filter((r) => r.adx >= c)
+      if (subset.length < TREND_THRESHOLD_MIN_N) continue
+      const hitRate = weightedHitRate(subset, (r) => r.hit).hitRate
+      if (hitRate >= TREND_THRESHOLD_TARGET_HIT_RATE) return c
+    }
+    return null
+  }
+
   /** Lifetime ledger for panels/agents. */
   stats(): {
     total: number
@@ -308,6 +345,7 @@ export class AdxHonestyService {
     qualifyBar: number | null
     htfPenaltyMult: number | null
     confluenceBoost: number
+    trendThreshold: number | null
     recent: ResolvedAdxCall[]
   } {
     const decided = this.resolved.filter((r) => !r.shadow && r.actual !== 'flat')
@@ -320,6 +358,7 @@ export class AdxHonestyService {
       qualifyBar: this.learnedQualifyBar(),
       htfPenaltyMult: this.htfAlignmentLearning()?.penaltyMult ?? null,
       confluenceBoost: this.confluenceBoost(),
+      trendThreshold: this.learnedAdxTrendThreshold(),
       recent: this.resolved.slice(-40).reverse(),
     }
   }

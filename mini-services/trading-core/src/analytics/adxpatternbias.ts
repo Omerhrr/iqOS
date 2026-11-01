@@ -48,6 +48,14 @@ export const COMPOSITE_QUALIFY_VOLATILE = COMPOSITE_QUALIFY * 1.25
  * or learned below) - kept as a ratio rather than a second flat constant so
  * a learned bar still gets the same proportional VOLATILE dampening. */
 const VOLATILE_QUALIFY_MULT = COMPOSITE_QUALIFY_VOLATILE / COMPOSITE_QUALIFY
+/** A bar crossing ADX_TREND_THRESHOLD for ONE bar can be a spike, not a
+ * real trend - require the ADX reading to have held at/above the
+ * (possibly learned) threshold for this many consecutive bars, including
+ * the current one, before calling it trending at all. Applied identically
+ * to the base read and the HTF read (adxDirectionOf below). Precision-
+ * only: raising this only ever makes "trending" harder to earn, same
+ * never-loosens contract as every other veto in this module. */
+const TREND_PERSISTENCE_BARS = 2
 
 // ---------- honesty-loop learning bridges ----------
 // plugins/adxhonesty.ts (new - this composite never had its own honesty
@@ -91,6 +99,23 @@ export function setAdxQualifyBarProvider(p: AdxQualifyBarProvider | null): void 
  * loop) means "no learning yet" and the veto stays exactly as hard as it
  * always was - this can only ever make the veto data-driven, never
  * silently remove it before there's evidence either way. */
+/** Learned replacement for the flat ADX_TREND_THRESHOLD (25): a bar's own
+ * resolved ledger can only ever tell this whether RAISING the bar would
+ * have paid off - every resolved call already required adx >= the
+ * threshold in force at track time, so there's no data on what a LOWER
+ * threshold would have done. The learned value is therefore only ever
+ * >= ADX_TREND_THRESHOLD: precision-tightening only, same contract as
+ * every other learned veto here. null = still using the flat 25. */
+export type AdxTrendThresholdProvider = () => number | null
+let adxTrendThresholdProvider: AdxTrendThresholdProvider | null = null
+export function setAdxTrendThresholdProvider(p: AdxTrendThresholdProvider | null): void {
+  adxTrendThresholdProvider = p
+}
+function effectiveAdxTrendThreshold(): number {
+  const learned = adxTrendThresholdProvider?.()
+  return learned && learned >= ADX_TREND_THRESHOLD ? learned : ADX_TREND_THRESHOLD
+}
+
 export type AdxHtfLearningProvider = () => { penaltyMult: number } | null
 let adxHtfLearningProvider: AdxHtfLearningProvider | null = null
 export function setAdxHtfLearningProvider(p: AdxHtfLearningProvider | null): void {
@@ -158,10 +183,15 @@ export interface AdxPatternBiasFit {
    * 'neutral' when the higher timeframe isn't itself trending (>= 25) or
    * wasn't provided - a flat higher frame says nothing, so it never blocks. */
   htfDirection: Bias
-  /** The higher-timeframe ADX/DI direction actively contradicts this read's
-   * proposed direction - catches a trend call about to be overrun by the
-   * bigger timeframe's opposite trend. Precision veto only, same contract
-   * as haDisagrees. */
+  /** Same pattern-bias read as the raw-candle leg, one timeframe rung up
+   * (same optional `higherCandles` input as htfDirection) - 'neutral' when
+   * there's no pattern hit on the higher frame or it wasn't supplied. */
+  htfPatternDirection: Bias
+  /** The higher-timeframe ADX/DI direction OR the higher-timeframe pattern
+   * direction actively contradicts this read's proposed direction -
+   * catches a trend/pattern call about to be overrun by the bigger
+   * timeframe. Precision veto only, same contract as haDisagrees; both
+   * checks share one learned penalty (see setAdxHtfLearningProvider). */
   htfDisagrees: boolean
   /** Would this fit have qualified if the HTF veto alone were ignored (HA
    * veto and the qualify bar still apply)? Lets the honesty loop shadow-
@@ -242,6 +272,20 @@ function composite(trendPush: number, patBias: number): number {
 /** Plain ADX/DI direction of a series, trend-gated the same way the main
  * fit is - shared by the base read and the optional higher-timeframe read
  * below so the two can never silently drift apart in logic. */
+/** Has the ADX series held AT OR ABOVE `threshold` for TREND_PERSISTENCE_BARS
+ * consecutive bars ending at index `i` (inclusive)? A series shorter than
+ * the persistence window just checks whatever history exists - this can
+ * only ever make "trending" harder to earn, never impossible to earn on
+ * thin history. */
+function trendPersists(adxSeries: number[], i: number, threshold: number): boolean {
+  for (let k = 0; k < TREND_PERSISTENCE_BARS; k++) {
+    const idx = i - k
+    if (idx < 0) break
+    if (!(adxSeries[idx] >= threshold)) return false
+  }
+  return true
+}
+
 function adxDirectionOf(candles: Candle[], period: number): { adxVal: number; direction: Bias } | null {
   if (candles.length < Math.max(period * 2, 30)) return null
   const high = candles.map((c) => c.high)
@@ -253,7 +297,8 @@ function adxDirectionOf(candles: Candle[], period: number): { adxVal: number; di
   const plusVal = plusDI[i]
   const minusVal = minusDI[i]
   if (!Number.isFinite(adxVal) || !Number.isFinite(plusVal) || !Number.isFinite(minusVal)) return null
-  const trending = adxVal >= ADX_TREND_THRESHOLD
+  const threshold = effectiveAdxTrendThreshold()
+  const trending = adxVal >= threshold && trendPersists(adxSeries, i, threshold)
   return { adxVal, direction: trending ? (plusVal > minusVal ? 'bullish' : plusVal < minusVal ? 'bearish' : 'neutral') : 'neutral' }
 }
 
@@ -276,9 +321,10 @@ export function fitAdxPatternBias(candles: Candle[], period = 14, lookback = PAT
   const minusVal = minusDI[i]
   if (!Number.isFinite(adxVal) || !Number.isFinite(plusVal) || !Number.isFinite(minusVal)) return null
 
-  const trending = adxVal >= ADX_TREND_THRESHOLD
+  const trendThreshold = effectiveAdxTrendThreshold()
+  const trending = adxVal >= trendThreshold && trendPersists(adxSeries, i, trendThreshold)
   const adxDirection: Bias = trending ? (plusVal > minusVal ? 'bullish' : plusVal < minusVal ? 'bearish' : 'neutral') : 'neutral'
-  const trendPush = trending ? Math.max(-6, Math.min(6, (adxVal - ADX_TREND_THRESHOLD) * (adxDirection === 'bearish' ? -1 : 1) * 0.3)) : 0
+  const trendPush = trending ? Math.max(-6, Math.min(6, (adxVal - trendThreshold) * (adxDirection === 'bearish' ? -1 : 1) * 0.3)) : 0
 
   const hits = detectPatterns(candles, lookback)
   const patBias = patternBias(hits)
@@ -299,12 +345,23 @@ export function fitAdxPatternBias(candles: Candle[], period = 14, lookback = PAT
   // it: a neutral or agreeing HA read changes nothing.
   const haDisagrees = haPatternDirection !== 'neutral' && direction !== 'neutral' && haPatternDirection !== direction
 
-  // HTF veto: this timeframe's own ADX/DI fight against one rung up's.
-  // Same shape as the HA veto - optional, only tightens, never fires when
-  // the higher frame isn't trending or wasn't supplied.
+  // HTF veto: this timeframe's own ADX/DI fight against one rung up's, OR
+  // this timeframe's pattern read fighting one rung up's pattern read -
+  // same shape as the HA veto, optional, only tightens, never fires when
+  // the higher frame isn't trending/has no pattern read or wasn't
+  // supplied. Both checks share ONE learned penalty (htfPenaltyMult) -
+  // they're the same underlying idea (does the bigger timeframe disagree)
+  // just read off two different legs, so one learned number for "is the
+  // HTF veto worth its cost" covers both instead of needing two separate
+  // honesty-loop ledgers.
   const htf = higherCandles && higherCandles.length ? adxDirectionOf(higherCandles, period) : null
   const htfDirection: Bias = htf?.direction ?? 'neutral'
-  const htfDisagrees = htfDirection !== 'neutral' && direction !== 'neutral' && htfDirection !== direction
+  const htfAdxDisagrees = htfDirection !== 'neutral' && direction !== 'neutral' && htfDirection !== direction
+  const htfHits = higherCandles && higherCandles.length ? detectPatterns(higherCandles, lookback) : null
+  const htfPatternBias = htfHits ? patternBias(htfHits) : 0
+  const htfPatternDirection: Bias = htfHits ? biasOf(htfPatternBias, 0.5) : 'neutral'
+  const htfPatternDisagrees = htfPatternDirection !== 'neutral' && direction !== 'neutral' && htfPatternDirection !== direction
+  const htfDisagrees = htfAdxDisagrees || htfPatternDisagrees
 
   // Regime cross-pollination: reuse the Oracle's own 4-way classifier
   // (analytics/regime.ts) fed this fit's REAL adx (better than the proxy
@@ -367,6 +424,7 @@ export function fitAdxPatternBias(candles: Candle[], period = 14, lookback = PAT
     direction,
     haDisagrees,
     htfDirection,
+    htfPatternDirection,
     htfDisagrees,
     regime,
     volumeConfirms,

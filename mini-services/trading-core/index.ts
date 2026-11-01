@@ -531,6 +531,8 @@ interface AdxPatternBiasScanRow {
   composite: number
   direction: 'call' | 'put' | null
   haDisagrees: boolean
+  htfDirection: 'bullish' | 'bearish' | 'neutral'
+  htfPatternDirection: 'bullish' | 'bearish' | 'neutral'
   htfDisagrees: boolean
   regime: string
   volumeConfirms: boolean | null
@@ -586,6 +588,8 @@ function scanAdxPatternBias(market: MarketDataService, tfv: Timeframe): AdxPatte
         composite: fit.composite,
         direction,
         haDisagrees: fit.haDisagrees,
+        htfDirection: fit.htfDirection,
+        htfPatternDirection: fit.htfPatternDirection,
         htfDisagrees: fit.htfDisagrees,
         regime: fit.regime,
         volumeConfirms: fit.volumeConfirms,
