@@ -1423,6 +1423,20 @@ export class ModeService {
             const dir: 'call' | 'put' | 'none' = fit.direction === 'bullish' ? 'call' : fit.direction === 'bearish' ? 'put' : 'none'
             if (dir === 'none') continue
             if (this.config.direction !== 'both' && dir !== this.config.direction) continue
+            // cross-engine confluence veto: if the Next-Candle Oracle has an
+            // ACTIVE opposing read on this exact pair+tf, skip - never
+            // requires the oracle's agreement to fire (a 'none' or agreeing
+            // oracle read changes nothing), only blocks a pair the oracle is
+            // actively calling the other way. Only called for candidates
+            // that already passed fit.qualifies, so this never runs the
+            // full fusion on the whole sweep.
+            try {
+              const oracle = this.ctx.use<NextCandleService>('nextcandle')
+              const oraclePred = oracle.predict(asset, this.config.tf)
+              if (oraclePred && oraclePred.direction !== 'none' && oraclePred.direction !== dir) continue
+            } catch {
+              // oracle plugin not loaded / thin history - confirmation optional, never blocks
+            }
             const score = Math.round(clamp(40 + (Math.abs(fit.composite) - COMPOSITE_QUALIFY) * 10, 40, 95)) * (dir === 'call' ? 1 : -1)
             const confidence = Math.round(clamp(40 + (fit.adx - ADX_TREND_THRESHOLD) * 0.8 + (Math.abs(fit.composite) - COMPOSITE_QUALIFY) * 6, 35, 95))
             if (!finGte(Math.abs(score), this.config.minScore)) continue
@@ -1609,6 +1623,16 @@ export class ModeService {
             const dir: 'call' | 'put' | 'none' = fit.direction === 'bullish' ? 'call' : fit.direction === 'bearish' ? 'put' : 'none'
             if (dir === 'none') continue
             if (this.config.direction !== 'both' && dir !== this.config.direction) continue
+            // cross-engine confluence veto - same contract as
+            // pickAdxPatternBiasSignal above: only blocks an ACTIVE
+            // opposing oracle read, never requires its agreement.
+            try {
+              const oracle = this.ctx.use<NextCandleService>('nextcandle')
+              const oraclePred = oracle.predict(asset, this.config.tf)
+              if (oraclePred && oraclePred.direction !== 'none' && oraclePred.direction !== dir) continue
+            } catch {
+              // oracle plugin not loaded / thin history - confirmation optional, never blocks
+            }
 
             const haAgrees = fit.haPatternDirection === fit.direction
             const haOpposes = fit.haPatternDirection !== 'neutral' && fit.haPatternDirection !== fit.direction

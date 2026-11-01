@@ -105,6 +105,12 @@ export interface NextCandlePrediction {
   drivers: OracleDriver[]
   /** how many drivers were actually usable (had enough history) */
   driversActive: number
+  /** which candle patterns actually fired this read (name + direction only,
+   * capped to the strongest/most recent 6) - lets the plugin resolve each
+   * one against the real next-candle outcome and learn its own live
+   * reliability (see patterns.ts's provider bridge). Empty when the
+   * "Candle patterns" driver found nothing this bar. */
+  patternHits: { name: string; direction: 'bullish' | 'bearish' | 'neutral' }[]
   /** live self-calibration, injected by the plugin's honesty loop (null = no record yet) */
   calibration: { n: number; hitRate: number; brier: number } | null
   mode: 'sim' | 'live'
@@ -240,6 +246,7 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
   const chaosFlatten = regime === 'VOLATILE' ? 0.6 : 1
 
   const drivers: OracleDriver[] = []
+  let patternHitsSnapshot: { name: string; direction: 'bullish' | 'bearish' | 'neutral' }[] = []
 
   // ---------- 1. Markov transition matrix ----------
   {
@@ -322,7 +329,11 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
   // ---------- 6. Candle patterns ----------
   {
     const hits = detectPatterns(candles, 8)
-    const bias = patternBias(hits) // signed, roughly -2..2
+    const bias = patternBias(hits) // signed, roughly -2..2 (uses the LEARNED
+    // per-pattern reliability table when one exists - see patterns.ts's
+    // provider bridge - so this driver's own bias already reflects "does
+    // this pattern actually call the next candle on this universe", not
+    // just the hand-set reliability score)
     if (hits.length > 0) {
       const w = 6 * chaosFlatten
       drivers.push({
@@ -332,6 +343,12 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
         vote: clamp(bias / 2, -1, 1),
         detail: `${hits.length} recent patterns, net bias ${bias.toFixed(1)}`,
       })
+      // snapshot for the honesty loop: which patterns actually fired, so
+      // the plugin can resolve EACH ONE against the real next-candle
+      // direction and learn its own live reliability (see patterns.ts).
+      // Capped to the 6 strongest/most-recent hits - detectPatterns already
+      // sorts that way - to keep the resolved record small.
+      patternHitsSnapshot = hits.slice(0, 6).map((h) => ({ name: h.name, direction: h.direction }))
     }
   }
 
@@ -462,6 +479,7 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
     closePos: closePosRaw,
     drivers: usable,
     driversActive: usable.length,
+    patternHits: patternHitsSnapshot,
     calibration: cal,
     mode: input.mode,
   }

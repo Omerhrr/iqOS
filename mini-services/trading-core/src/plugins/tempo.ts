@@ -28,6 +28,7 @@ import type { KernelContext, Plugin } from '../kernel'
 import type { Candle, Timeframe } from '../types'
 import { TIMEFRAME_SECONDS } from '../types'
 import { tempoConviction, tempoDecide, tempoWindow, TEMPO_FLOOR, TEMPO_WINDOW_BARS, type TempoDecision } from '../analytics/tempo'
+import { fitAdxPatternBias, PATTERN_BIAS_LOOKBACK } from '../analytics/adxpatternbias'
 import type { NextCandleService, GlobalScanRow } from './nextcandle'
 import type { MarketDataService } from './market-data'
 
@@ -375,6 +376,26 @@ export class TempoService {
     const dec = tempoDecide({ conviction, barsRemaining: w.barsRemaining, windowMaxHistory: hist, recentSimilarLoss })
     if (dec.kind !== 'fire') return { ok: false, reason: dec.reason }
     if (pred.direction === 'none') return { ok: false, reason: 'fusion has no directional lean on this bar' }
+    // cross-engine confluence veto: claim time only (not the scan/display
+    // path above - that stays cheap and TTL-cached). An independently-
+    // built engine, ADX/DI + pattern bias, ACTIVELY calling this exact
+    // pair the OTHER way right now is real information the oracle fusion
+    // alone cannot see. Veto only, same contract as the HA/HTF vetoes
+    // inside fitAdxPatternBias itself - a neutral or agreeing read never
+    // blocks, this only stops a shot the other engine is actively fighting.
+    try {
+      const market = this.ctx.use<MarketDataService>('market')
+      const candles = market.getCandlesDeep(asset, tf, 200, true)
+      const fit = fitAdxPatternBias(candles, 14, PATTERN_BIAS_LOOKBACK)
+      if (fit && fit.direction !== 'neutral') {
+        const fitDir: 'call' | 'put' = fit.direction === 'bullish' ? 'call' : 'put'
+        if (fitDir !== pred.direction) {
+          return { ok: false, reason: `held: ADX/DI + pattern bias on this pair currently reads ${fitDir.toUpperCase()}, opposing the oracle's ${pred.direction.toUpperCase()} - cross-engine confluence veto` }
+        }
+      }
+    } catch {
+      // confirmation optional - thin history or a bad read never blocks the oracle's own fire
+    }
     st.fired = true
     st.firedSignal = {
       direction: pred.direction,

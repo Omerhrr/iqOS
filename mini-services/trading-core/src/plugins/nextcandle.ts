@@ -20,6 +20,7 @@ import { join } from 'node:path'
 import type { KernelContext, Plugin } from '../kernel'
 import type { Candle, Timeframe } from '../types'
 import { predictNextCandle, setOracleCalibrationProvider, type NextCandlePrediction, type OracleRegime } from '../analytics/nextcandle'
+import { setPatternReliabilityProvider } from '../analytics/patterns'
 import type { MarketDataService } from './market-data'
 
 const MAX_RESOLVED = 800
@@ -29,6 +30,11 @@ const CALIBRATION_WINDOW = 120 // rolling record length fed back into confidence
  * same floor philosophy applyCalibrationDiscount already uses (n>=20). */
 const DRIVER_STATS_MIN_N = 30
 const DRIVER_STATS_WINDOW = 250
+/** same "thin record is no record" floor, applied per PATTERN NAME instead
+ * of per driver - a pattern that's barely ever fired keeps its hand-set
+ * reliability until it has. */
+const PATTERN_STATS_MIN_N = 25
+const PATTERN_STATS_WINDOW = 400
 const OUTCOME_FILE = 'nextcandle_outcomes.json'
 /** Next Global board: a scanned row older than this is recomputed on the
  * next poll. Deliberately short - one prediction is ~15ms so a full board
@@ -53,6 +59,11 @@ interface PendingPrediction {
    * each model's OWN accuracy can be tracked independently of the fused
    * outcome. */
   drivers: { name: string; vote: number }[]
+  /** which candle patterns fired this read (name + direction) - carried
+   * through to the resolved record so each PATTERN's own live reliability
+   * can be learned, independent of the fused outcome and of the driver
+   * accuracy above (see patternReliabilityTable()). */
+  patternHits: { name: string; direction: 'bullish' | 'bearish' | 'neutral' }[]
 }
 
 export interface ResolvedPrediction {
@@ -77,6 +88,8 @@ export interface ResolvedPrediction {
   regime: OracleRegime
   /** per-driver votes at issue time, carried through for driverStats() */
   drivers: { name: string; vote: number }[]
+  /** pattern hits at issue time, carried through for patternReliabilityTable() */
+  patternHits: { name: string; direction: 'bullish' | 'bearish' | 'neutral' }[]
 }
 
 export interface GlobalScanRow {
@@ -137,7 +150,11 @@ export class NextCandleService {
     // evals read this so the confidence gate tightens when the oracle has
     // been wrong on exactly this pair+tf (see analytics/nextcandle.ts)
     setOracleCalibrationProvider((asset, tf) => this.calibrationFor(asset, tf))
-    ctx.log('nextcandle', 'next-candle oracle online (multi-model fusion + self-calibration honesty loop)')
+    // same bridge shape, one level down: learned per-PATTERN reliability,
+    // live everywhere patternBias() is called codebase-wide (see
+    // analytics/patterns.ts's provider bridge doc).
+    setPatternReliabilityProvider(() => this.patternReliabilityTable())
+    ctx.log('nextcandle', 'next-candle oracle online (multi-model fusion + self-calibration honesty loop + learned pattern reliability)')
   }
 
   stop(): void {
@@ -172,6 +189,7 @@ export class NextCandleService {
       price: pred.price,
       regime: pred.regime,
       drivers: pred.drivers.map((d) => ({ name: d.name, vote: d.vote })),
+      patternHits: pred.patternHits,
     })
     if (this.pending.size > 400) {
       // drop the oldest fifth - pending entries resolve on candle close anyway
@@ -210,6 +228,7 @@ export class NextCandleService {
         brier: (p.pUp - realizedUp) * (p.pUp - realizedUp),
         regime: p.regime,
         drivers: p.drivers,
+        patternHits: p.patternHits,
       }
       this.resolved.push(entry)
       while (this.resolved.length > MAX_RESOLVED) this.resolved.shift()
@@ -273,6 +292,42 @@ export class NextCandleService {
       if (s.n < DRIVER_STATS_MIN_N) continue
       const winRate = s.wins / s.n
       out[name] = Math.max(0.75, Math.min(1.3, 0.75 + (winRate - 0.5) * 2.5))
+    }
+    return out
+  }
+
+  /** Per-PATTERN live reliability, learned the same way driverWeightMultipliers()
+   * learns per-DRIVER reliability: a pattern's own win rate against the
+   * REAL realized next-candle direction, universe-wide (a pattern's
+   * reliability is a property of the pattern, not one pair), replacing its
+   * hand-set reliability score once there's a real sample. Fed into
+   * analytics/patterns.ts's provider bridge at start() below, so every
+   * patternBias() caller in the codebase - this engine's own "Candle
+   * patterns" driver, adxpatternbias.ts's two pattern reads, any strategy
+   * - picks it up automatically. Mapped to roughly the same 1-3(-4) scale
+   * the hand-set reliability table already uses, so a learned value slots
+   * in without silently changing the overall magnitude patternBias() reads
+   * at. */
+  private patternReliabilityTable(): Record<string, number> {
+    const window = this.resolved.slice(-PATTERN_STATS_WINDOW)
+    const byName = new Map<string, { n: number; wins: number }>()
+    for (const r of window) {
+      const realizedUpSign = r.actual === 'up' ? 1 : r.actual === 'down' ? -1 : 0
+      if (realizedUpSign === 0) continue // flat bars don't score any pattern
+      for (const h of r.patternHits ?? []) {
+        if (h.direction === 'neutral') continue // neutral patterns have nothing to score
+        const dirSign = h.direction === 'bullish' ? 1 : -1
+        const s = byName.get(h.name) ?? { n: 0, wins: 0 }
+        s.n++
+        if (dirSign === realizedUpSign) s.wins++
+        byName.set(h.name, s)
+      }
+    }
+    const out: Record<string, number> = {}
+    for (const [name, s] of byName) {
+      if (s.n < PATTERN_STATS_MIN_N) continue
+      const winRate = s.wins / s.n
+      out[name] = Math.max(0.3, Math.min(4, winRate * 6))
     }
     return out
   }

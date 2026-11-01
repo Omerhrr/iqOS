@@ -223,12 +223,42 @@ export function detectPatterns(candles: Candle[], lookback = 8): PatternHit[] {
   return [...byName.values()].sort((a, b) => a.barsAgo - b.barsAgo || b.reliability - a.reliability)
 }
 
-/** Net pattern bias: bullish weight minus bearish weight (weighted by recency + reliability). */
-export function patternBias(hits: PatternHit[]): number {
+// ---------- learned pattern reliability bridge ----------
+// plugins/nextcandle.ts resolves every next-candle prediction against the
+// REAL realized direction, and the pattern hits feeding its own "Candle
+// patterns" driver are resolved right alongside it - so that plugin is the
+// one natural place that knows "does Bullish Engulfing actually call the
+// next candle correctly on THIS universe", independent of the hand-set
+// reliability score each detector above was given at design time. It
+// registers that live table here; every `patternBias()` caller - this
+// module's own consumers, adxpatternbias.ts, strategies/builtin.ts, the
+// Oracle's own driver - picks it up automatically with zero changes on
+// their end, the same bridge shape analytics/nextcandle.ts already uses
+// for its calibration provider. A pattern with too few resolved samples
+// simply isn't in the table yet, so its hand-set reliability stands until
+// it is. */
+export type PatternReliabilityProvider = () => Record<string, number> | null
+let patternReliabilityProvider: PatternReliabilityProvider | null = null
+export function setPatternReliabilityProvider(p: PatternReliabilityProvider | null): void {
+  patternReliabilityProvider = p
+}
+export function learnedPatternReliability(): Record<string, number> | null {
+  return patternReliabilityProvider ? patternReliabilityProvider() : null
+}
+
+/** Net pattern bias: bullish weight minus bearish weight (weighted by
+ * recency + reliability). `reliabilityOverride`, when passed explicitly,
+ * wins outright (lets a caller force the hand-set table, e.g. for an
+ * apples-to-apples backtest); omitted, this falls back to the live learned
+ * table above when one exists, and to each hit's own hand-set
+ * `reliability` for any pattern not yet in that table. */
+export function patternBias(hits: PatternHit[], reliabilityOverride?: Record<string, number> | null): number {
+  const table = reliabilityOverride !== undefined ? reliabilityOverride : learnedPatternReliability()
   let score = 0
   for (const h of hits) {
+    const rel = table?.[h.name] ?? h.reliability
     const recency = 1 / (1 + h.barsAgo)
-    const w = h.reliability * recency
+    const w = rel * recency
     if (h.direction === 'bullish') score += w
     else if (h.direction === 'bearish') score -= w
   }
