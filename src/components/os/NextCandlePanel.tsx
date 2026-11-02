@@ -197,7 +197,12 @@ function LearnedDiagnostics({ stats, record, regime }: { stats: NextCandleStatsR
   const pairDrivers = Object.entries(record?.pairDriverWeightMultipliers ?? {}).sort((a, b) => Math.abs(b[1] - 1) - Math.abs(a[1] - 1)).slice(0, 4)
   const pairCalQuality = Object.entries(record?.pairDriverCalibrationMultipliers ?? {}).sort((a, b) => Math.abs(b[1] - 1) - Math.abs(a[1] - 1)).slice(0, 4)
   const pairCorrelated = Object.entries(record?.pairDriverCorrelation ?? {}).sort((a, b) => a[1] - b[1]).slice(0, 4)
-  const pairPhysiologyActive = pairDrivers.length > 0 || pairCalQuality.length > 0 || pairCorrelated.length > 0
+  const pairPattern = Object.entries(record?.pairPatternReliability ?? {}).sort((a, b) => Math.abs(b[1] - 2) - Math.abs(a[1] - 2)).slice(0, 4)
+  const pairPhysiologyActive = pairDrivers.length > 0 || pairCalQuality.length > 0 || pairCorrelated.length > 0 || pairPattern.length > 0 || record?.pairConfidenceBlendWeight != null
+  const clusterDrivers = Object.entries(record?.clusterDriverWeightMultipliers ?? {}).sort((a, b) => Math.abs(b[1] - 1) - Math.abs(a[1] - 1)).slice(0, 4)
+  const clusterCalQuality = Object.entries(record?.clusterDriverCalibrationMultipliers ?? {}).sort((a, b) => Math.abs(b[1] - 1) - Math.abs(a[1] - 1)).slice(0, 4)
+  const clusterCorrelated = Object.entries(record?.clusterDriverCorrelation ?? {}).sort((a, b) => a[1] - b[1]).slice(0, 4)
+  const clusterActive = clusterDrivers.length > 0 || clusterCalQuality.length > 0 || clusterCorrelated.length > 0
   return (
     <div className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-2">
       <p className="font-mono text-[9px] uppercase tracking-wider text-[#4b5a72]">learned (what's actually shaping this read)</p>
@@ -217,6 +222,14 @@ function LearnedDiagnostics({ stats, record, regime }: { stats: NextCandleStatsR
       <p className="mt-0.5 font-mono text-[8.5px] text-[#7c8aa5]">
         pair physiology: <span className={pairPhysiologyActive ? 'text-cyan-300' : 'text-[#dbe4f0]'}>{pairPhysiologyActive ? 'this pair has its own learned driver read' : 'not enough of this pair\'s own history yet'}</span>
       </p>
+      <p className="mt-0.5 font-mono text-[8.5px] text-[#7c8aa5]">
+        cluster physiology{record?.clusterKey ? ` (${record.clusterKey})` : ''}: <span className={clusterActive ? 'text-orange-300' : 'text-[#dbe4f0]'}>{clusterActive ? 'this asset class has its own learned driver read' : 'not enough of this cluster\'s own history yet'}</span>
+      </p>
+      {record?.pairConfidenceBlendWeight != null && (
+        <p className="mt-0.5 font-mono text-[8.5px] text-[#7c8aa5]">
+          this pair's confidence blend: <span className="text-cyan-300">{record.pairConfidenceBlendWeight.toFixed(2)} agreement / {(1 - record.pairConfidenceBlendWeight).toFixed(2)} distance</span> (learned, this pair's own)
+        </p>
+      )}
       {pairDrivers.length > 0 && (
         <div className="mt-1.5">
           <p className="font-mono text-[8px] uppercase tracking-wider text-[#4b5a72]">driver weight outliers (this pair, own physiology)</p>
@@ -247,6 +260,54 @@ function LearnedDiagnostics({ stats, record, regime }: { stats: NextCandleStatsR
           <div className="mt-0.5 flex flex-wrap gap-1">
             {pairCorrelated.map(([pair, discount]) => (
               <span key={pair} className="rounded border border-cyan-500/40 px-1 py-px font-mono text-[8px] text-cyan-300" title="this pair's OWN pairwise driver agreement discount, computed only from this asset:tf's own resolved co-occurrences">
+                {pair.replace('|', ' / ')} {discount.toFixed(2)}×
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+      {pairPattern.length > 0 && (
+        <div className="mt-1.5">
+          <p className="font-mono text-[8px] uppercase tracking-wider text-[#4b5a72]">pattern reliability outliers (this pair, own physiology)</p>
+          <div className="mt-0.5 flex flex-wrap gap-1">
+            {pairPattern.map(([name, w]) => (
+              <span key={name} className={`rounded border px-1 py-px font-mono text-[8px] ${w > 2 ? 'border-cyan-500/40 text-cyan-300' : 'border-orange-500/40 text-orange-300'}`} title="this pair's OWN pattern reliability, merged on top of the universe-wide learned table">
+                {name} {w.toFixed(2)}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+      {clusterDrivers.length > 0 && (
+        <div className="mt-1.5">
+          <p className="font-mono text-[8px] uppercase tracking-wider text-[#4b5a72]">driver weight outliers (cluster{record?.clusterKey ? `: ${record.clusterKey}` : ''})</p>
+          <div className="mt-0.5 flex flex-wrap gap-1">
+            {clusterDrivers.map(([name, w]) => (
+              <span key={name} className={`rounded border px-1 py-px font-mono text-[8px] ${w > 1 ? 'border-orange-500/40 text-orange-300' : 'border-amber-500/40 text-amber-300'}`} title="this asset category's learned win-rate-based driver weight multiplier - the fallback tier between this pair's own history and the universe-wide table">
+                {name} {w.toFixed(2)}×
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+      {clusterCalQuality.length > 0 && (
+        <div className="mt-1.5">
+          <p className="font-mono text-[8px] uppercase tracking-wider text-[#4b5a72]">driver calibration quality (cluster{record?.clusterKey ? `: ${record.clusterKey}` : ''})</p>
+          <div className="mt-0.5 flex flex-wrap gap-1">
+            {clusterCalQuality.map(([name, w]) => (
+              <span key={name} className={`rounded border px-1 py-px font-mono text-[8px] ${w > 1 ? 'border-orange-500/40 text-orange-300' : 'border-amber-500/40 text-amber-300'}`} title="this asset category's Brier-based calibration-quality multiplier">
+                {name} {w.toFixed(2)}×
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+      {clusterCorrelated.length > 0 && (
+        <div className="mt-1.5">
+          <p className="font-mono text-[8px] uppercase tracking-wider text-[#4b5a72]">correlated driver pairs (cluster{record?.clusterKey ? `: ${record.clusterKey}` : ''})</p>
+          <div className="mt-0.5 flex flex-wrap gap-1">
+            {clusterCorrelated.map(([pair, discount]) => (
+              <span key={pair} className="rounded border border-orange-500/40 px-1 py-px font-mono text-[8px] text-orange-300" title="this asset category's pairwise driver agreement discount">
                 {pair.replace('|', ' / ')} {discount.toFixed(2)}×
               </span>
             ))}

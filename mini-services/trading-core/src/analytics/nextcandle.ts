@@ -49,7 +49,7 @@ import { markovChain, monteCarlo, ewmaVol, garchVol, rng } from './quant'
 import { ouState } from './kalman'
 import { confluenceSignalOnly } from './engine'
 import { combineVotes, engineVotes, heikinAshiSeries } from './chartsignals'
-import { detectPatterns, patternBias } from './patterns'
+import { detectPatterns, patternBias, learnedPatternReliability } from './patterns'
 import { atr } from './indicators'
 import type { AnalysisResult } from '../types'
 import { classifyRegime } from './regime'
@@ -240,6 +240,25 @@ export interface OracleInput {
    * the universe-wide table once this pair has enough of its own
    * resolved history; falls through to it otherwise. */
   pairDriverCalibrationMultipliers?: Partial<Record<string, number>>
+  /** CLUSTER-level (asset-category, e.g. "forex" or "crypto:otc") driver
+   * weight multiplier table - an intermediate fallback tier between this
+   * pair's own thin history and the full universe-wide blend. A pair with
+   * too little of its own resolved history to trust `pairDriverWeightMultipliers`
+   * can still often be reasonably described by "how does this whole asset
+   * class behave", which accumulates history far faster than any one pair.
+   * Checked after the pair-blended table and before the universe-wide
+   * regime table in the cascade. */
+  clusterDriverWeightMultipliers?: Partial<Record<string, number>>
+  /** Same cluster-level table as `clusterDriverWeightMultipliers`, split
+   * one bucket per OracleRegime - checked after the pair-regime table and
+   * before the pair-blended table. */
+  clusterRegimeDriverWeightMultipliers?: Partial<Record<OracleRegime, Partial<Record<string, number>>>>
+  /** CLUSTER-level per-driver calibration-quality multiplier - same
+   * Brier-based shape as `driverCalibrationMultipliers`, scoped to this
+   * pair's asset category instead of one pair or the whole universe.
+   * Checked between the pair-level and universe-level calibration
+   * tables. */
+  clusterDriverCalibrationMultipliers?: Partial<Record<string, number>>
   /** Learned pairwise driver correlation discount, keyed by a stable
    * "NameA|NameB" string (alphabetical, built by pairKey() below) - how
    * much to discount the SECOND-listed driver's weight when both members
@@ -258,11 +277,31 @@ export interface OracleInput {
    * takes priority over the universe-wide table once this pair has
    * enough of its own resolved history; falls through to it otherwise. */
   pairDriverCorrelation?: Partial<Record<string, number>>
+  /** CLUSTER-level learned pairwise driver correlation discount - same key
+   * convention as `driverCorrelation`/`pairDriverCorrelation`, scoped to
+   * this pair's asset category. Checked between the pair-level and
+   * universe-level correlation tables. */
+  clusterDriverCorrelation?: Partial<Record<string, number>>
   /** Learned replacement for the flat 0.55/0.45 agreement/distance blend
    * that produces rawConfidence - the smallest-error candidate, among a
    * small sweep, at predicting the resolved ledger's own realized hit
    * rate. null = still using the flat 0.55 agreement weight. */
   confidenceBlendWeight?: number | null
+  /** THIS PAIR'S OWN learned replacement for confidenceBlendWeight, computed
+   * from only this asset:tf's own resolved ledger. Takes priority over the
+   * universe-wide confidenceBlendWeight once this pair has enough of its
+   * own resolved history; falls through to it (then the flat 0.55 default)
+   * otherwise. */
+  pairConfidenceBlendWeight?: number | null
+  /** THIS PAIR'S OWN learned per-pattern reliability table - same shape as
+   * patterns.ts's learnedPatternReliability(), filtered to only this
+   * asset:tf's own resolved pattern-hit history. Does this pattern actually
+   * call the next candle on THIS pair specifically, vs. the universe-wide
+   * table. Merged on top of the universe-wide table (not a wholesale
+   * replacement) so patterns absent from the thinner per-pair table still
+   * fall back to the universe-wide learned value rather than the hand-set
+   * default. */
+  pairPatternReliability?: Partial<Record<string, number>>
   /** Learned ratio of REALIZED candle move to this engine's own predicted
    * `expectedMove`, for this exact asset:tf - the one estimate in this
    * whole fusion that was never checked against reality until now. 1 =
@@ -444,9 +483,16 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
   // ---------- 6. Candle patterns ----------
   {
     const hits = detectPatterns(candles, 8)
-    const bias = patternBias(hits) // signed, roughly -2..2 (uses the LEARNED
-    // per-pattern reliability table when one exists - see patterns.ts's
-    // provider bridge - so this driver's own bias already reflects "does
+    const bias = patternBias(
+      hits,
+      input.pairPatternReliability
+        ? ({ ...(learnedPatternReliability() ?? {}), ...input.pairPatternReliability } as Record<string, number>)
+        : undefined
+    ) // signed, roughly -2..2 (uses this pair's own learned per-pattern
+    // reliability table, merged on top of the universe-wide learned table,
+    // when enough of this pair's own resolved history exists - otherwise
+    // falls back to the universe-wide table via patterns.ts's provider
+    // bridge - so this driver's own bias already reflects "does
     // this pattern actually call the next candle on this universe", not
     // just the hand-set reliability score)
     if (hits.length > 0) {
@@ -511,22 +557,34 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
   // universe's blended table - same cascade shape calibration already
   // uses (regime -> session -> direction -> blended), just one level more
   // specific at the top for a pair with enough of its own resolved history.
-  const pickMultiplier = (name: string, pairRegimeTable: Partial<Record<string, number>> | undefined, pairBlended: Partial<Record<string, number>> | undefined, universeRegimeTable: Partial<Record<string, number>> | undefined, universeBlended: Partial<Record<string, number>> | undefined): number | undefined => {
-    const v = pairRegimeTable?.[name] ?? pairBlended?.[name] ?? universeRegimeTable?.[name] ?? universeBlended?.[name]
-    return Number.isFinite(v) && v! > 0 ? v : undefined
+  // Cascade is now 5 tiers, most to least specific: pair-regime ->
+  // pair-blended -> cluster-regime -> cluster-blended -> universe-regime ->
+  // universe-blended. `pick5` checks each in that order and takes the
+  // first finite, positive value it finds.
+  const pick5 = (name: string, tiers: (Partial<Record<string, number>> | undefined)[]): number | undefined => {
+    for (const t of tiers) {
+      const v = t?.[name]
+      if (Number.isFinite(v) && (v as number) > 0) return v as number
+    }
+    return undefined
   }
   const pairRegimeDwm = input.pairRegimeDriverWeightMultipliers?.[regime]
+  const clusterRegimeDwm = input.clusterRegimeDriverWeightMultipliers?.[regime]
   const universeRegimeDwm = input.regimeDriverWeightMultipliers?.[regime]
-  if (pairRegimeDwm || input.pairDriverWeightMultipliers || universeRegimeDwm || input.driverWeightMultipliers || input.pairDriverCalibrationMultipliers || input.driverCalibrationMultipliers) {
+  if (
+    pairRegimeDwm || input.pairDriverWeightMultipliers || clusterRegimeDwm || input.clusterDriverWeightMultipliers ||
+    universeRegimeDwm || input.driverWeightMultipliers || input.pairDriverCalibrationMultipliers ||
+    input.clusterDriverCalibrationMultipliers || input.driverCalibrationMultipliers
+  ) {
     for (const d of drivers) {
-      const m = pickMultiplier(d.name, pairRegimeDwm, input.pairDriverWeightMultipliers, universeRegimeDwm, input.driverWeightMultipliers)
+      const m = pick5(d.name, [pairRegimeDwm, input.pairDriverWeightMultipliers, clusterRegimeDwm, input.clusterDriverWeightMultipliers, universeRegimeDwm, input.driverWeightMultipliers])
       if (m !== undefined) d.weight *= clamp(m, 0.6, 1.5)
       // calibration-quality axis, independent of the win-rate multiplier
       // above - rewards a driver for being honest about its own
       // uncertainty (low resolved Brier), not just lucky on sign. No
       // regime split for this axis (same as the universe-wide version),
-      // just pair-first then universe.
-      const c = pickMultiplier(d.name, undefined, input.pairDriverCalibrationMultipliers, undefined, input.driverCalibrationMultipliers)
+      // just pair-first, then cluster, then universe.
+      const c = pick5(d.name, [input.pairDriverCalibrationMultipliers, input.clusterDriverCalibrationMultipliers, input.driverCalibrationMultipliers])
       if (c !== undefined) d.weight *= clamp(c, 0.8, 1.2)
     }
   }
@@ -537,8 +595,8 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
   // once per call rather than threading two lookups through
   // decorrelateWeights() itself.
   const mergedCorrelation: Partial<Record<string, number>> | undefined =
-    input.pairDriverCorrelation || input.driverCorrelation
-      ? { ...(input.driverCorrelation ?? {}), ...(input.pairDriverCorrelation ?? {}) }
+    input.pairDriverCorrelation || input.clusterDriverCorrelation || input.driverCorrelation
+      ? { ...(input.driverCorrelation ?? {}), ...(input.clusterDriverCorrelation ?? {}), ...(input.pairDriverCorrelation ?? {}) }
       : undefined
   const usable = decorrelateWeights(
     drivers.filter((d) => Number.isFinite(d.pUp) && Number.isFinite(d.weight) && d.weight > 0),
@@ -568,7 +626,9 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
   // resolved ledger's own realized hit rate) replaces the flat hand-set
   // 0.55/0.45 split once there's enough history to pick one; null (thin
   // history) keeps today's 0.55 agreement weight exactly as it was.
-  const agreeWeight = Number.isFinite(input.confidenceBlendWeight) && (input.confidenceBlendWeight as number) >= 0 && (input.confidenceBlendWeight as number) <= 1 ? (input.confidenceBlendWeight as number) : 0.55
+  const pairBlendOk = Number.isFinite(input.pairConfidenceBlendWeight) && (input.pairConfidenceBlendWeight as number) >= 0 && (input.pairConfidenceBlendWeight as number) <= 1
+  const universeBlendOk = Number.isFinite(input.confidenceBlendWeight) && (input.confidenceBlendWeight as number) >= 0 && (input.confidenceBlendWeight as number) <= 1
+  const agreeWeight = pairBlendOk ? (input.pairConfidenceBlendWeight as number) : universeBlendOk ? (input.confidenceBlendWeight as number) : 0.55
   const rawConfidence = clamp((agreeWeight * agreement + (1 - agreeWeight) * distance) * 100 * sampleFactor, 0, 97)
 
   // calibration discount: the oracle's own realized record tempers the

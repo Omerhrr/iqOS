@@ -1578,6 +1578,20 @@ export interface NextCandleStatsResponse {
     pairRegimeDriverWeightMultipliers: Partial<Record<OracleRegime, Record<string, number>>>
     pairDriverCalibrationMultipliers: Record<string, number>
     pairDriverCorrelation: Record<string, number>
+    /** this pair's own learned confidence-blend weight and per-pattern
+     * reliability table - same priority as the physiology tables above:
+     * takes precedence over the universe-wide values once this pair has
+     * enough of its own resolved history. */
+    pairConfidenceBlendWeight: number | null
+    pairPatternReliability: Record<string, number>
+    /** intermediate asset-category fallback tier (e.g. "forex",
+     * "crypto:otc") between this pair's own tables and the universe-wide
+     * ones - null when this ticker's category couldn't be resolved. */
+    clusterKey: string | null
+    clusterDriverWeightMultipliers: Record<string, number>
+    clusterRegimeDriverWeightMultipliers: Partial<Record<OracleRegime, Record<string, number>>>
+    clusterDriverCalibrationMultipliers: Record<string, number>
+    clusterDriverCorrelation: Record<string, number>
   }[]
   /** universe-wide learned driver weight multipliers (0.75-1.3), blended
    * across regimes - a driver sitting meaningfully above/below 50% hit

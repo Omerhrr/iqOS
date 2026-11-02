@@ -49,6 +49,16 @@ const PAIR_CORR_WINDOW = 400
 const BLEND_WEIGHT_MIN_N = 60
 const BLEND_WEIGHT_WINDOW = 400
 const BLEND_WEIGHT_CANDIDATES = [0.35, 0.45, 0.5, 0.55, 0.65, 0.75]
+/** THIS PAIR'S OWN counterpart to BLEND_WEIGHT_MIN_N - necessarily smaller,
+ * same "pair physiology" reasoning as PAIR_DRIVER_STATS_MIN_N above: one
+ * pair accumulates qualifying rows (real driver snapshots, non-flat,
+ * 4+ drivers fired) far slower than the whole universe blended together. */
+const PAIR_BLEND_WEIGHT_MIN_N = 35
+/** THIS PAIR'S OWN counterpart to PATTERN_STATS_MIN_N - same reasoning,
+ * smaller floor since one pair's own pattern hits are rarer than the
+ * universe-wide pool. */
+const PAIR_PATTERN_STATS_MIN_N = 14
+const PAIR_PATTERN_STATS_WINDOW = 600
 /** "Pair physiology" floors: the per-asset:tf counterparts of
  * DRIVER_STATS_MIN_N/WINDOW and PAIR_CORR_MIN_N/WINDOW above, necessarily
  * smaller than the universe-wide ones - one pair accumulates resolved
@@ -64,6 +74,19 @@ const PAIR_DRIVER_STATS_MIN_N = 18
 const PAIR_DRIVER_STATS_WINDOW = 500
 const PAIR_CORR_PAIR_MIN_N = 18
 const PAIR_CORR_PAIR_WINDOW = 600
+/** "Cluster physiology" floors: an intermediate tier between one pair's own
+ * thin history and the full universe blend, grouping resolved rows by
+ * asset CATEGORY (plus OTC vs non-OTC - see clusterKeyFor()) instead of by
+ * exact ticker. A whole asset class accumulates resolved history faster
+ * than any one pair but still has its own character distinct from the
+ * universe blend (e.g. crypto's volatility physiology vs. a forex major's),
+ * so this floor sits between PAIR_DRIVER_STATS_MIN_N and DRIVER_STATS_MIN_N -
+ * stricter than the pair floor (a cluster's thin sample is less excusable
+ * than one pair's) but still looser than the full-universe floor. */
+const CLUSTER_DRIVER_STATS_MIN_N = 24
+const CLUSTER_DRIVER_STATS_WINDOW = 500
+const CLUSTER_CORR_PAIR_MIN_N = 24
+const CLUSTER_CORR_PAIR_WINDOW = 600
 const OUTCOME_FILE = 'nextcandle_outcomes.json'
 /** Next Global board: a scanned row older than this is recomputed on the
  * next poll. Deliberately short - one prediction is ~15ms so a full board
@@ -220,11 +243,17 @@ export class NextCandleService {
       regimeDriverWeightMultipliers: this.driverWeightMultipliersByRegime(),
       pairDriverWeightMultipliers: this.pairDriverWeightMultipliers(asset, tf),
       pairRegimeDriverWeightMultipliers: this.pairDriverWeightMultipliersByRegime(asset, tf),
+      clusterDriverWeightMultipliers: this.clusterDriverWeightMultipliers(asset),
+      clusterRegimeDriverWeightMultipliers: this.clusterDriverWeightMultipliersByRegime(asset),
       driverCalibrationMultipliers: this.driverCalibrationMultipliers(),
       pairDriverCalibrationMultipliers: this.pairDriverCalibrationMultipliers(asset, tf),
+      clusterDriverCalibrationMultipliers: this.clusterDriverCalibrationMultipliers(asset),
       driverCorrelation: this.driverCorrelationTable(),
       pairDriverCorrelation: this.pairDriverCorrelationTable(asset, tf),
+      clusterDriverCorrelation: this.clusterDriverCorrelationTable(asset),
       confidenceBlendWeight: this.learnedConfidenceBlendWeight(),
+      pairConfidenceBlendWeight: this.pairLearnedConfidenceBlendWeight(asset, tf),
+      pairPatternReliability: this.pairPatternReliabilityTable(asset, tf),
       magnitudeCalibration: this.magnitudeCalibrationFor(asset, tf),
     })
     if (!pred) return null
@@ -553,6 +582,37 @@ export class NextCandleService {
     return out
   }
 
+  /** THIS PAIR'S OWN learned per-pattern reliability table -
+   * analytics/nextcandle.ts's OracleInput.pairPatternReliability. Same
+   * win-rate algorithm as patternReliabilityTable() above, scoped to only
+   * this asset:tf's own resolved pattern-hit history. The caller (the
+   * "Candle patterns" driver in analytics/nextcandle.ts) merges this on
+   * TOP of the universe-wide table rather than using it standalone, since
+   * patternBias()'s override replaces the whole table rather than merging
+   * per-key. */
+  private pairPatternReliabilityTable(asset: string, tf: string): Record<string, number> {
+    const window = this.resolved.filter((r) => r.asset === asset && r.tf === tf).slice(-PAIR_PATTERN_STATS_WINDOW)
+    const byName = new Map<string, boolean[]>()
+    for (const r of window) {
+      const realizedUpSign = r.actual === 'up' ? 1 : r.actual === 'down' ? -1 : 0
+      if (realizedUpSign === 0) continue
+      for (const h of r.patternHits ?? []) {
+        if (h.direction === 'neutral') continue
+        const dirSign = h.direction === 'bullish' ? 1 : -1
+        const s = byName.get(h.name) ?? []
+        s.push(dirSign === realizedUpSign)
+        byName.set(h.name, s)
+      }
+    }
+    const out: Record<string, number> = {}
+    for (const [name, calls] of byName) {
+      if (calls.length < PAIR_PATTERN_STATS_MIN_N) continue
+      const winRate = weightedHitRate(calls, (hit) => hit).hitRate
+      out[name] = Math.max(0.3, Math.min(4, winRate * 6))
+    }
+    return out
+  }
+
   /** Per-driver CALIBRATION-quality multiplier, universe-wide - a second,
    * independent axis from driverWeightMultipliers() above. That one
    * rewards a driver for being directionally RIGHT (win rate); this one
@@ -679,6 +739,170 @@ export class NextCandleService {
     return out
   }
 
+  /** This asset's cluster key for the intermediate fallback tier: asset
+   * CATEGORY, plus an ":otc" suffix when the ticker is an OTC synthetic -
+   * OTC instruments of the same nominal category (e.g. "crypto" vs
+   * "crypto-OTC") can have a meaningfully different physiology (continuous
+   * synthetic feed vs. real market hours), so they're kept as separate
+   * clusters rather than merged. Returns null when the ticker isn't found
+   * in the live universe (never seen asset, or market-data not yet loaded) -
+   * callers simply skip the cluster tier in that case. */
+  private clusterKeyFor(asset: string): string | null {
+    const info = this.market.listAssets().find((a) => a.ticker === asset)
+    if (!info) return null
+    return info.ticker.endsWith('-OTC') ? `${info.category}:otc` : info.category
+  }
+
+  /** Resolved rows belonging to the same cluster as `asset`, re-derived at
+   * query time (ResolvedPrediction doesn't persist a category, and an
+   * asset's category can't meaningfully change mid-session anyway). */
+  private clusterRows(asset: string): ResolvedPrediction[] {
+    const key = this.clusterKeyFor(asset)
+    if (!key) return []
+    return this.resolved.filter((r) => this.clusterKeyFor(r.asset) === key)
+  }
+
+  /** CLUSTER-level per-driver win-rate multiplier -
+   * analytics/nextcandle.ts's OracleInput.clusterDriverWeightMultipliers.
+   * Same win-rate algorithm as driverWeightMultipliers()/
+   * pairDriverWeightMultipliers() above, scoped to every resolved row
+   * whose asset shares this asset's cluster key. */
+  private clusterDriverWeightMultipliers(asset: string): Record<string, number> {
+    const window = this.clusterRows(asset).slice(-CLUSTER_DRIVER_STATS_WINDOW)
+    const byName = new Map<string, boolean[]>()
+    for (const r of window) {
+      const realizedUpSign = r.actual === 'up' ? 1 : r.actual === 'down' ? -1 : 0
+      if (realizedUpSign === 0) continue
+      for (const d of r.drivers ?? []) {
+        const s = byName.get(d.name) ?? []
+        s.push(Math.sign(d.vote) === realizedUpSign)
+        byName.set(d.name, s)
+      }
+    }
+    const out: Record<string, number> = {}
+    for (const [name, calls] of byName) {
+      if (calls.length < CLUSTER_DRIVER_STATS_MIN_N) continue
+      const winRate = weightedHitRate(calls, (hit) => hit).hitRate
+      out[name] = Math.max(0.75, Math.min(1.3, 0.75 + (winRate - 0.5) * 2.5))
+    }
+    return out
+  }
+
+  /** Same cluster-level table as clusterDriverWeightMultipliers(), split
+   * one bucket per OracleRegime. */
+  private clusterDriverWeightMultipliersByRegime(asset: string): Partial<Record<OracleRegime, Record<string, number>>> {
+    const window = this.clusterRows(asset).slice(-CLUSTER_DRIVER_STATS_WINDOW * 2)
+    const byRegime = new Map<OracleRegime, Map<string, boolean[]>>()
+    for (const r of window) {
+      const realizedUpSign = r.actual === 'up' ? 1 : r.actual === 'down' ? -1 : 0
+      if (realizedUpSign === 0) continue
+      const byName = byRegime.get(r.regime) ?? new Map<string, boolean[]>()
+      for (const d of r.drivers ?? []) {
+        const s = byName.get(d.name) ?? []
+        s.push(Math.sign(d.vote) === realizedUpSign)
+        byName.set(d.name, s)
+      }
+      byRegime.set(r.regime, byName)
+    }
+    const out: Partial<Record<OracleRegime, Record<string, number>>> = {}
+    for (const [regime, byName] of byRegime) {
+      const bucket: Record<string, number> = {}
+      for (const [name, calls] of byName) {
+        if (calls.length < CLUSTER_DRIVER_STATS_MIN_N) continue
+        const winRate = weightedHitRate(calls, (hit) => hit).hitRate
+        bucket[name] = Math.max(0.75, Math.min(1.3, 0.75 + (winRate - 0.5) * 2.5))
+      }
+      if (Object.keys(bucket).length > 0) out[regime] = bucket
+    }
+    return out
+  }
+
+  /** CLUSTER-level per-driver calibration-quality multiplier -
+   * analytics/nextcandle.ts's OracleInput.clusterDriverCalibrationMultipliers.
+   * Same Brier-based algorithm as driverCalibrationMultipliers()/
+   * pairDriverCalibrationMultipliers() above. */
+  private clusterDriverCalibrationMultipliers(asset: string): Record<string, number> {
+    const window = this.clusterRows(asset).slice(-CLUSTER_DRIVER_STATS_WINDOW * 2)
+    const byName = new Map<string, number[]>()
+    for (const r of window) {
+      const realizedUp = r.actual === 'up' ? 1 : r.actual === 'down' ? 0 : 0.5
+      for (const d of r.drivers ?? []) {
+        if (!Number.isFinite(d.pUp)) continue
+        const arr = byName.get(d.name) ?? []
+        arr.push((d.pUp - realizedUp) ** 2)
+        byName.set(d.name, arr)
+      }
+    }
+    const out: Record<string, number> = {}
+    for (const [name, briers] of byName) {
+      if (briers.length < CLUSTER_DRIVER_STATS_MIN_N) continue
+      const meanBrier = weightedMean(briers)
+      out[name] = Math.max(0.8, Math.min(1.2, 1 + (0.25 - meanBrier) * 1.5))
+    }
+    return out
+  }
+
+  /** CLUSTER-level learned pairwise driver correlation discount -
+   * analytics/nextcandle.ts's OracleInput.clusterDriverCorrelation. Same
+   * co-occurrence-agreement algorithm as driverCorrelationTable()/
+   * pairDriverCorrelationTable() above. */
+  private clusterDriverCorrelationTable(asset: string): Record<string, number> {
+    const window = this.clusterRows(asset).slice(-CLUSTER_CORR_PAIR_WINDOW)
+    const pairs = new Map<string, boolean[]>()
+    for (const r of window) {
+      const ds = r.drivers ?? []
+      for (let i = 0; i < ds.length; i++) {
+        for (let j = i + 1; j < ds.length; j++) {
+          const a = ds[i]
+          const b = ds[j]
+          const aSign = Math.sign(a.vote)
+          const bSign = Math.sign(b.vote)
+          if (aSign === 0 || bSign === 0) continue
+          const key = pairKey(a.name, b.name)
+          const arr = pairs.get(key) ?? []
+          arr.push(aSign === bSign)
+          pairs.set(key, arr)
+        }
+      }
+    }
+    const out: Record<string, number> = {}
+    for (const [key, agrees] of pairs) {
+      if (agrees.length < CLUSTER_CORR_PAIR_MIN_N) continue
+      const agreeRate = weightedHitRate(agrees, (a) => a).hitRate
+      if (agreeRate > 0.6) out[key] = Math.max(0.5, 1 - (agreeRate - 0.6) * 1.5)
+    }
+    return out
+  }
+
+  /** THIS PAIR'S OWN learned replacement for the flat agreement/distance
+   * blend - analytics/nextcandle.ts's OracleInput.pairConfidenceBlendWeight.
+   * Same sweep as learnedConfidenceBlendWeight() below, scoped to only this
+   * asset:tf's own resolved rows; a smaller floor since one pair alone
+   * accumulates qualifying rows (real driver snapshots, 4+ drivers fired)
+   * far slower than the whole universe. */
+  private pairLearnedConfidenceBlendWeight(asset: string, tf: string): number | null {
+    const window = this.resolved
+      .filter((r) => r.asset === asset && r.tf === tf)
+      .slice(-BLEND_WEIGHT_WINDOW)
+      .filter((r) => r.actual !== 'flat' && (r.drivers?.length ?? 0) >= 4)
+    if (window.length < PAIR_BLEND_WEIGHT_MIN_N) return null
+    let best: { w: number; err: number } | null = null
+    for (const w of BLEND_WEIGHT_CANDIDATES) {
+      let errSum = 0
+      for (const r of window) {
+        const winSide = r.pUp >= 0.5 ? 1 : -1
+        const agree = r.drivers.filter((d) => Math.sign(d.vote) === winSide).length / r.drivers.length
+        const distance = Math.abs(r.pUp - 0.5) * 2
+        const confEst = Math.max(0, Math.min(1, w * agree + (1 - w) * distance))
+        const realizedHit = r.hit ? 1 : 0
+        errSum += (confEst - realizedHit) ** 2
+      }
+      const err = errSum / window.length
+      if (!best || err < best.err) best = { w, err }
+    }
+    return best?.w ?? null
+  }
+
   /** Learned replacement for the flat 0.55/0.45 agreement/distance blend
    * that produces rawConfidence: sweeps a small set of candidate agreement
    * weights and picks whichever would have best predicted the resolved
@@ -742,6 +966,18 @@ export class NextCandleService {
       pairRegimeDriverWeightMultipliers: Partial<Record<OracleRegime, Record<string, number>>>
       pairDriverCalibrationMultipliers: Record<string, number>
       pairDriverCorrelation: Record<string, number>
+      pairConfidenceBlendWeight: number | null
+      pairPatternReliability: Record<string, number>
+      /** intermediate asset-category tier between this pair's own tables
+       * above and the universe-wide tables below - empty objects mean
+       * still falling back further (to the pair table if present, else
+       * universe-wide), or that this ticker's category couldn't be
+       * resolved. */
+      clusterKey: string | null
+      clusterDriverWeightMultipliers: Record<string, number>
+      clusterRegimeDriverWeightMultipliers: Partial<Record<OracleRegime, Record<string, number>>>
+      clusterDriverCalibrationMultipliers: Record<string, number>
+      clusterDriverCorrelation: Record<string, number>
     }[]
     driverWeightMultipliers: Record<string, number>
     regimeDriverWeightMultipliers: Partial<Record<OracleRegime, Record<string, number>>>
@@ -782,6 +1018,13 @@ export class NextCandleService {
         pairRegimeDriverWeightMultipliers: this.pairDriverWeightMultipliersByRegime(asset, tf),
         pairDriverCalibrationMultipliers: this.pairDriverCalibrationMultipliers(asset, tf),
         pairDriverCorrelation: this.pairDriverCorrelationTable(asset, tf),
+        pairConfidenceBlendWeight: this.pairLearnedConfidenceBlendWeight(asset, tf),
+        pairPatternReliability: this.pairPatternReliabilityTable(asset, tf),
+        clusterKey: this.clusterKeyFor(asset),
+        clusterDriverWeightMultipliers: this.clusterDriverWeightMultipliers(asset),
+        clusterRegimeDriverWeightMultipliers: this.clusterDriverWeightMultipliersByRegime(asset),
+        clusterDriverCalibrationMultipliers: this.clusterDriverCalibrationMultipliers(asset),
+        clusterDriverCorrelation: this.clusterDriverCorrelationTable(asset),
       }
     }).sort((a, b) => b.n - a.n)
     return {
