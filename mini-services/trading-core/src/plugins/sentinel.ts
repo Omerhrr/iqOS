@@ -202,19 +202,36 @@ export class SentinelService {
       return
     }
     this.config = { ...DEFAULT_SENTINEL, ...(saved.config as Partial<SentinelConfig>) }
-    // per-source buckets live inside the config blob (hwmPaper/hwmIq); the
-    // legacy single `hwm` DB column (saved.hwm) predates the paper/IQ split
-    // and is migrated into whichever source was active when it was last
-    // written, so an upgrade doesn't lose a real, already-tracked peak.
+    // per-source buckets live inside the config blob (hwmPaper/hwmIq).
+    //
+    // FOLLOW-UP FIX: the first version of this migration guessed that the
+    // legacy single `hwm` DB column (saved.hwm, from before the paper/IQ
+    // split) belonged to whichever source happened to be ACTIVE AT RESTORE
+    // TIME. That's exactly backwards when the operator's last action before
+    // upgrading was switching sources - e.g. trip the HWM to $20,085.72 on
+    // IQ, then switch to paper, then restart: curSrc is 'paper' at restore,
+    // so the old code assigned IQ's real $20k peak to PAPER's bucket, and
+    // paper's $10k balance against a $20k "peak" it never reached tripped
+    // DRAWDOWN at ~50% on the very next trade - the identical false trip
+    // this whole hwmBySource change was supposed to fix, just moved one
+    // step later. There's no way to know which source actually produced
+    // the legacy value, so it is no longer guessed at all: a pre-migration
+    // `hwm` is simply retired. Both buckets start clean and the line below
+    // seeds the CURRENT source from its own real balance immediately
+    // (0 is never shown - drawdownPct() only treats <=0 as "no data yet").
     const cfgObj = (saved.config as Record<string, unknown>) ?? {}
     const curSrc = this.currentSource()
-    const legacyHwm = typeof saved.hwm === 'number' ? saved.hwm : 0
-    this.hwmBySource.paper = typeof cfgObj.hwmPaper === 'number' ? cfgObj.hwmPaper : curSrc === 'paper' ? legacyHwm : 0
-    this.hwmBySource.iq = typeof cfgObj.hwmIq === 'number' ? cfgObj.hwmIq : curSrc === 'iq' ? legacyHwm : 0
+    this.hwmBySource.paper = typeof cfgObj.hwmPaper === 'number' ? cfgObj.hwmPaper : 0
+    this.hwmBySource.iq = typeof cfgObj.hwmIq === 'number' ? cfgObj.hwmIq : 0
     // high-water mark never goes down with the balance; adopt a higher
     // balance on boot, scoped to the CURRENT source only.
     const bal = this.equityBalance()
     this.hwmBySource[curSrc] = Math.max(this.hwmBySource[curSrc], bal)
+    // write the migrated (now-retired-legacy, per-source) state back out
+    // immediately, rather than waiting for the next trade to persist() -
+    // a kernel that restarts again before any trade must not re-read the
+    // untouched old `hwm` column and redo the same guess.
+    this.persist()
   }
 
   private persist(): void {
