@@ -1567,6 +1567,17 @@ export interface NextCandleStatsResponse {
      * untouched (thin data), >1 = the model has been predicting too
      * NARROW a move historically, <1 = too WIDE. null = not trusted yet. */
     magnitudeCalibration: number | null
+    /** this pair's own "physiology" - its own per-driver win-rate
+     * multipliers (blended + per-regime), calibration-quality
+     * multipliers, and driver-correlation discounts, computed from only
+     * this asset:tf's own resolved history. Takes priority over the
+     * universe-wide tables below, per driver, once this pair has enough
+     * of its own resolved history; empty objects mean every driver is
+     * still falling back to the universe-wide read. */
+    pairDriverWeightMultipliers: Record<string, number>
+    pairRegimeDriverWeightMultipliers: Partial<Record<OracleRegime, Record<string, number>>>
+    pairDriverCalibrationMultipliers: Record<string, number>
+    pairDriverCorrelation: Record<string, number>
   }[]
   /** universe-wide learned driver weight multipliers (0.75-1.3), blended
    * across regimes - a driver sitting meaningfully above/below 50% hit

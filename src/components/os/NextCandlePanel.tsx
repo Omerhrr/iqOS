@@ -194,6 +194,10 @@ function LearnedDiagnostics({ stats, record, regime }: { stats: NextCandleStatsR
   const patterns = Object.entries(stats.patternReliability).sort((a, b) => Math.abs(b[1] - 2) - Math.abs(a[1] - 2)).slice(0, 4)
   const calQuality = Object.entries(stats.driverCalibrationMultipliers).sort((a, b) => Math.abs(b[1] - 1) - Math.abs(a[1] - 1)).slice(0, 4)
   const correlated = Object.entries(stats.driverCorrelation).sort((a, b) => a[1] - b[1]).slice(0, 4)
+  const pairDrivers = Object.entries(record?.pairDriverWeightMultipliers ?? {}).sort((a, b) => Math.abs(b[1] - 1) - Math.abs(a[1] - 1)).slice(0, 4)
+  const pairCalQuality = Object.entries(record?.pairDriverCalibrationMultipliers ?? {}).sort((a, b) => Math.abs(b[1] - 1) - Math.abs(a[1] - 1)).slice(0, 4)
+  const pairCorrelated = Object.entries(record?.pairDriverCorrelation ?? {}).sort((a, b) => a[1] - b[1]).slice(0, 4)
+  const pairPhysiologyActive = pairDrivers.length > 0 || pairCalQuality.length > 0 || pairCorrelated.length > 0
   return (
     <div className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-2">
       <p className="font-mono text-[9px] uppercase tracking-wider text-[#4b5a72]">learned (what's actually shaping this read)</p>
@@ -210,9 +214,48 @@ function LearnedDiagnostics({ stats, record, regime }: { stats: NextCandleStatsR
         confidence blend: <span className="text-[#dbe4f0]">{(stats.confidenceBlendWeight ?? 0.55).toFixed(2)} agreement / {(1 - (stats.confidenceBlendWeight ?? 0.55)).toFixed(2)} distance</span>{' '}
         {stats.confidenceBlendWeight === null ? '(default)' : '(learned)'}
       </p>
+      <p className="mt-0.5 font-mono text-[8.5px] text-[#7c8aa5]">
+        pair physiology: <span className={pairPhysiologyActive ? 'text-cyan-300' : 'text-[#dbe4f0]'}>{pairPhysiologyActive ? 'this pair has its own learned driver read' : 'not enough of this pair\'s own history yet'}</span>
+      </p>
+      {pairDrivers.length > 0 && (
+        <div className="mt-1.5">
+          <p className="font-mono text-[8px] uppercase tracking-wider text-[#4b5a72]">driver weight outliers (this pair, own physiology)</p>
+          <div className="mt-0.5 flex flex-wrap gap-1">
+            {pairDrivers.map(([name, w]) => (
+              <span key={name} className={`rounded border px-1 py-px font-mono text-[8px] ${w > 1 ? 'border-cyan-500/40 text-cyan-300' : 'border-orange-500/40 text-orange-300'}`} title="this pair's OWN win-rate-based driver weight multiplier, computed only from this asset:tf's own resolved history - takes priority over the universe-wide table above">
+                {name} {w.toFixed(2)}×
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+      {pairCalQuality.length > 0 && (
+        <div className="mt-1.5">
+          <p className="font-mono text-[8px] uppercase tracking-wider text-[#4b5a72]">driver calibration quality (this pair, own physiology)</p>
+          <div className="mt-0.5 flex flex-wrap gap-1">
+            {pairCalQuality.map(([name, w]) => (
+              <span key={name} className={`rounded border px-1 py-px font-mono text-[8px] ${w > 1 ? 'border-cyan-500/40 text-cyan-300' : 'border-orange-500/40 text-orange-300'}`} title="this pair's OWN Brier-based calibration-quality multiplier">
+                {name} {w.toFixed(2)}×
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+      {pairCorrelated.length > 0 && (
+        <div className="mt-1.5">
+          <p className="font-mono text-[8px] uppercase tracking-wider text-[#4b5a72]">correlated driver pairs (this pair, own physiology)</p>
+          <div className="mt-0.5 flex flex-wrap gap-1">
+            {pairCorrelated.map(([pair, discount]) => (
+              <span key={pair} className="rounded border border-cyan-500/40 px-1 py-px font-mono text-[8px] text-cyan-300" title="this pair's OWN pairwise driver agreement discount, computed only from this asset:tf's own resolved co-occurrences">
+                {pair.replace('|', ' / ')} {discount.toFixed(2)}×
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
       {drivers.length > 0 && (
         <div className="mt-1.5">
-          <p className="font-mono text-[8px] uppercase tracking-wider text-[#4b5a72]">driver weight outliers (universe-wide)</p>
+          <p className="font-mono text-[8px] uppercase tracking-wider text-[#4b5a72]">driver weight outliers (universe-wide fallback)</p>
           <div className="mt-0.5 flex flex-wrap gap-1">
             {drivers.map(([name, w]) => (
               <span key={name} className={`rounded border px-1 py-px font-mono text-[8px] ${w > 1 ? 'border-emerald-500/40 text-emerald-300' : 'border-rose-500/40 text-rose-300'}`} title="learned driver weight multiplier from its own resolved win rate">
@@ -236,7 +279,7 @@ function LearnedDiagnostics({ stats, record, regime }: { stats: NextCandleStatsR
       )}
       {calQuality.length > 0 && (
         <div className="mt-1.5">
-          <p className="font-mono text-[8px] uppercase tracking-wider text-[#4b5a72]">driver calibration quality (universe-wide)</p>
+          <p className="font-mono text-[8px] uppercase tracking-wider text-[#4b5a72]">driver calibration quality (universe-wide fallback)</p>
           <div className="mt-0.5 flex flex-wrap gap-1">
             {calQuality.map(([name, w]) => (
               <span key={name} className={`rounded border px-1 py-px font-mono text-[8px] ${w > 1 ? 'border-emerald-500/40 text-emerald-300' : 'border-rose-500/40 text-rose-300'}`} title="Brier-based calibration-quality multiplier (0.8-1.2) - rewards a driver for being honest about its own uncertainty, independent of win rate">
@@ -248,7 +291,7 @@ function LearnedDiagnostics({ stats, record, regime }: { stats: NextCandleStatsR
       )}
       {correlated.length > 0 && (
         <div className="mt-1.5">
-          <p className="font-mono text-[8px] uppercase tracking-wider text-[#4b5a72]">correlated driver pairs (discounted)</p>
+          <p className="font-mono text-[8px] uppercase tracking-wider text-[#4b5a72]">correlated driver pairs (universe-wide fallback, discounted)</p>
           <div className="mt-0.5 flex flex-wrap gap-1">
             {correlated.map(([pair, discount]) => (
               <span key={pair} className="rounded border border-amber-500/40 px-1 py-px font-mono text-[8px] text-amber-300" title="learned pairwise agreement discount - this pair agrees meaningfully more than chance, so one vote is discounted toward 0.5 to avoid double-counting shared evidence">

@@ -203,6 +203,26 @@ export interface OracleInput {
    * chicken-egg problem applying it here, unlike calibration). Falls back
    * to `driverWeightMultipliers` when this regime's bucket is missing. */
   regimeDriverWeightMultipliers?: Partial<Record<OracleRegime, Partial<Record<string, number>>>>
+  /** THIS PAIR'S OWN per-driver weight multiplier - same win-rate-based
+   * table as `driverWeightMultipliers` above, computed from only this
+   * asset:tf's own resolved history instead of the whole universe's. A
+   * pair's "physiology" can make one model reliably sharper on it and
+   * another reliably noisy, which the universe-blended table can't see.
+   * Takes priority over everything else in this cascade once this pair
+   * has enough of its own resolved history (plugins/nextcandle.ts's
+   * "thin record is no record" floor, necessarily smaller than the
+   * universe-wide one since one pair sees far fewer resolutions) -
+   * missing/omitted name falls through to `pairRegimeDriverWeightMultipliers`
+   * then the universe-wide tables above, same cascade shape as calibration
+   * already uses (regime -> session -> direction -> blended). */
+  pairDriverWeightMultipliers?: Partial<Record<string, number>>
+  /** Same per-pair table as `pairDriverWeightMultipliers`, split one
+   * bucket per OracleRegime - this pair's own driver physiology can itself
+   * differ by regime (e.g. reliably trend-following in TRENDING, noisy in
+   * RANGING). The most specific bucket in the whole cascade: checked
+   * first, before the pair-blended table, which is checked before the
+   * universe-wide regime/blended tables. */
+  pairRegimeDriverWeightMultipliers?: Partial<Record<OracleRegime, Partial<Record<string, number>>>>
   /** Per-driver CALIBRATION-quality multiplier, keyed by OracleDriver.name -
    * a second, independent axis from driverWeightMultipliers above. That
    * one rewards a driver for being directionally RIGHT (win rate); this
@@ -214,6 +234,12 @@ export interface OracleInput {
    * regardless of what's passed, so this can only ever nudge, not replace,
    * the win-rate multiplier above. */
   driverCalibrationMultipliers?: Partial<Record<string, number>>
+  /** THIS PAIR'S OWN per-driver calibration-quality multiplier - same
+   * Brier-based table as `driverCalibrationMultipliers` above, computed
+   * from only this asset:tf's own resolved history. Takes priority over
+   * the universe-wide table once this pair has enough of its own
+   * resolved history; falls through to it otherwise. */
+  pairDriverCalibrationMultipliers?: Partial<Record<string, number>>
   /** Learned pairwise driver correlation discount, keyed by a stable
    * "NameA|NameB" string (alphabetical, built by pairKey() below) - how
    * much to discount the SECOND-listed driver's weight when both members
@@ -224,6 +250,14 @@ export interface OracleInput {
    * learned discount instead, hand-picked or not. Missing/omitted pair =
    * no discount (1) unless the hand-set default applies. */
   driverCorrelation?: Partial<Record<string, number>>
+  /** THIS PAIR'S OWN learned pairwise driver correlation discount - same
+   * shape and key convention as `driverCorrelation` above, computed from
+   * only this asset:tf's own resolved co-occurrences. Which models double
+   * up on the same evidence can plausibly differ by instrument (a
+   * trending forex major vs. a mean-reverting OTC synthetic), so this
+   * takes priority over the universe-wide table once this pair has
+   * enough of its own resolved history; falls through to it otherwise. */
+  pairDriverCorrelation?: Partial<Record<string, number>>
   /** Learned replacement for the flat 0.55/0.45 agreement/distance blend
    * that produces rawConfidence - the smallest-error candidate, among a
    * small sweep, at predicting the resolved ledger's own realized hit
@@ -469,28 +503,46 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
   // model's own resolved accuracy and feeds a multiplier back here, on top
   // of the static regime boosts above - a driver that's been reliably
   // wrong lately gets downweighted automatically instead of only ever being
-  // tuned by hand via trendBoost/fadeBoost/chaosFlatten. Prefers the
-  // REGIME-SPECIFIC table (this exact regime's own per-driver accuracy,
-  // `regime` is already known at this point - no chicken-egg problem the
-  // way calibration below has) and falls back to the blended-across-
-  // regimes table when that regime's bucket is missing or wasn't provided.
-  const dwm = input.regimeDriverWeightMultipliers?.[regime] ?? input.driverWeightMultipliers
-  const dcm = input.driverCalibrationMultipliers
-  if (dwm || dcm) {
+  // tuned by hand via trendBoost/fadeBoost/chaosFlatten. Per driver, prefers
+  // THIS PAIR'S OWN regime-specific table (its physiology can itself differ
+  // by regime), then this pair's own blended table, then the UNIVERSE's
+  // regime-specific table (`regime` is already known at this point - no
+  // chicken-egg problem the way calibration below has), then the
+  // universe's blended table - same cascade shape calibration already
+  // uses (regime -> session -> direction -> blended), just one level more
+  // specific at the top for a pair with enough of its own resolved history.
+  const pickMultiplier = (name: string, pairRegimeTable: Partial<Record<string, number>> | undefined, pairBlended: Partial<Record<string, number>> | undefined, universeRegimeTable: Partial<Record<string, number>> | undefined, universeBlended: Partial<Record<string, number>> | undefined): number | undefined => {
+    const v = pairRegimeTable?.[name] ?? pairBlended?.[name] ?? universeRegimeTable?.[name] ?? universeBlended?.[name]
+    return Number.isFinite(v) && v! > 0 ? v : undefined
+  }
+  const pairRegimeDwm = input.pairRegimeDriverWeightMultipliers?.[regime]
+  const universeRegimeDwm = input.regimeDriverWeightMultipliers?.[regime]
+  if (pairRegimeDwm || input.pairDriverWeightMultipliers || universeRegimeDwm || input.driverWeightMultipliers || input.pairDriverCalibrationMultipliers || input.driverCalibrationMultipliers) {
     for (const d of drivers) {
-      const m = dwm?.[d.name]
-      if (Number.isFinite(m) && m! > 0) d.weight *= clamp(m!, 0.6, 1.5)
+      const m = pickMultiplier(d.name, pairRegimeDwm, input.pairDriverWeightMultipliers, universeRegimeDwm, input.driverWeightMultipliers)
+      if (m !== undefined) d.weight *= clamp(m, 0.6, 1.5)
       // calibration-quality axis, independent of the win-rate multiplier
       // above - rewards a driver for being honest about its own
-      // uncertainty (low resolved Brier), not just lucky on sign.
-      const c = dcm?.[d.name]
-      if (Number.isFinite(c) && c! > 0) d.weight *= clamp(c!, 0.8, 1.2)
+      // uncertainty (low resolved Brier), not just lucky on sign. No
+      // regime split for this axis (same as the universe-wide version),
+      // just pair-first then universe.
+      const c = pickMultiplier(d.name, undefined, input.pairDriverCalibrationMultipliers, undefined, input.driverCalibrationMultipliers)
+      if (c !== undefined) d.weight *= clamp(c, 0.8, 1.2)
     }
   }
 
+  // Driver correlation, per-PAIR-OF-DRIVERS: this pair's own learned
+  // discount for a given driver pair takes priority over the universe-wide
+  // one, independently for each pair of drivers - a merged table built
+  // once per call rather than threading two lookups through
+  // decorrelateWeights() itself.
+  const mergedCorrelation: Partial<Record<string, number>> | undefined =
+    input.pairDriverCorrelation || input.driverCorrelation
+      ? { ...(input.driverCorrelation ?? {}), ...(input.pairDriverCorrelation ?? {}) }
+      : undefined
   const usable = decorrelateWeights(
     drivers.filter((d) => Number.isFinite(d.pUp) && Number.isFinite(d.weight) && d.weight > 0),
-    input.driverCorrelation,
+    mergedCorrelation,
   )
   // 7 drivers exist; requiring 4+ (a majority) rather than the old 3 (a
   // minority, <=43%) closes a real small-sample overconfidence hole - a

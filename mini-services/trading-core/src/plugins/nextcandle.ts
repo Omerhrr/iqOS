@@ -49,6 +49,21 @@ const PAIR_CORR_WINDOW = 400
 const BLEND_WEIGHT_MIN_N = 60
 const BLEND_WEIGHT_WINDOW = 400
 const BLEND_WEIGHT_CANDIDATES = [0.35, 0.45, 0.5, 0.55, 0.65, 0.75]
+/** "Pair physiology" floors: the per-asset:tf counterparts of
+ * DRIVER_STATS_MIN_N/WINDOW and PAIR_CORR_MIN_N/WINDOW above, necessarily
+ * smaller than the universe-wide ones - one pair accumulates resolved
+ * predictions far slower than the whole universe blended together, so
+ * demanding the same sample size would mean these per-pair tables never
+ * actually trigger. Still a real floor, not zero - "thin record is no
+ * record" applies here too, just calibrated to what one pair alone can
+ * realistically produce. Deliberately uses a WIDER window than the
+ * universe-wide DRIVER_STATS_WINDOW (same reasoning
+ * driverWeightMultipliersByRegime() already uses *2) since a per-pair,
+ * per-regime split sees even fewer rows per bucket. */
+const PAIR_DRIVER_STATS_MIN_N = 18
+const PAIR_DRIVER_STATS_WINDOW = 500
+const PAIR_CORR_PAIR_MIN_N = 18
+const PAIR_CORR_PAIR_WINDOW = 600
 const OUTCOME_FILE = 'nextcandle_outcomes.json'
 /** Next Global board: a scanned row older than this is recomputed on the
  * next poll. Deliberately short - one prediction is ~15ms so a full board
@@ -203,8 +218,12 @@ export class NextCandleService {
       directionCalibration: this.directionCalibrationFor(asset, tf),
       driverWeightMultipliers: this.driverWeightMultipliers(),
       regimeDriverWeightMultipliers: this.driverWeightMultipliersByRegime(),
+      pairDriverWeightMultipliers: this.pairDriverWeightMultipliers(asset, tf),
+      pairRegimeDriverWeightMultipliers: this.pairDriverWeightMultipliersByRegime(asset, tf),
       driverCalibrationMultipliers: this.driverCalibrationMultipliers(),
+      pairDriverCalibrationMultipliers: this.pairDriverCalibrationMultipliers(asset, tf),
       driverCorrelation: this.driverCorrelationTable(),
+      pairDriverCorrelation: this.pairDriverCorrelationTable(asset, tf),
       confidenceBlendWeight: this.learnedConfidenceBlendWeight(),
       magnitudeCalibration: this.magnitudeCalibrationFor(asset, tf),
     })
@@ -421,6 +440,69 @@ export class NextCandleService {
     return out
   }
 
+  /** THIS PAIR'S OWN per-driver win-rate multiplier, blended across its own
+   * resolved regimes - analytics/nextcandle.ts's OracleInput.pairDriverWeightMultipliers.
+   * Same algorithm as driverWeightMultipliers() above, scoped to only this
+   * asset:tf's own resolved rows and gated at the smaller
+   * PAIR_DRIVER_STATS_MIN_N floor - a pair's own physiology (which model is
+   * actually sharp on IT specifically) can differ from the universe-blended
+   * read, and this is the first thing predictNextCandle's fusion checks for
+   * each driver before falling back to the universe-wide tables. */
+  private pairDriverWeightMultipliers(asset: string, tf: string): Record<string, number> {
+    const window = this.resolved.filter((r) => r.asset === asset && r.tf === tf).slice(-PAIR_DRIVER_STATS_WINDOW)
+    const byName = new Map<string, boolean[]>()
+    for (const r of window) {
+      const realizedUpSign = r.actual === 'up' ? 1 : r.actual === 'down' ? -1 : 0
+      if (realizedUpSign === 0) continue
+      for (const d of r.drivers ?? []) {
+        const s = byName.get(d.name) ?? []
+        s.push(Math.sign(d.vote) === realizedUpSign)
+        byName.set(d.name, s)
+      }
+    }
+    const out: Record<string, number> = {}
+    for (const [name, calls] of byName) {
+      if (calls.length < PAIR_DRIVER_STATS_MIN_N) continue
+      const winRate = weightedHitRate(calls, (hit) => hit).hitRate
+      out[name] = Math.max(0.75, Math.min(1.3, 0.75 + (winRate - 0.5) * 2.5))
+    }
+    return out
+  }
+
+  /** THIS PAIR'S OWN per-driver win-rate multiplier, split one bucket per
+   * OracleRegime - analytics/nextcandle.ts's
+   * OracleInput.pairRegimeDriverWeightMultipliers, the most specific bucket
+   * in the whole driver-weighting cascade. Same algorithm as
+   * driverWeightMultipliersByRegime() above, scoped to this asset:tf and a
+   * wider window (regime-split further thins an already-thin per-pair
+   * pool). */
+  private pairDriverWeightMultipliersByRegime(asset: string, tf: string): Partial<Record<OracleRegime, Record<string, number>>> {
+    const window = this.resolved.filter((r) => r.asset === asset && r.tf === tf).slice(-PAIR_DRIVER_STATS_WINDOW * 2)
+    const byRegime = new Map<OracleRegime, Map<string, boolean[]>>()
+    for (const r of window) {
+      const realizedUpSign = r.actual === 'up' ? 1 : r.actual === 'down' ? -1 : 0
+      if (realizedUpSign === 0) continue
+      const byName = byRegime.get(r.regime) ?? new Map<string, boolean[]>()
+      for (const d of r.drivers ?? []) {
+        const s = byName.get(d.name) ?? []
+        s.push(Math.sign(d.vote) === realizedUpSign)
+        byName.set(d.name, s)
+      }
+      byRegime.set(r.regime, byName)
+    }
+    const out: Partial<Record<OracleRegime, Record<string, number>>> = {}
+    for (const [regime, byName] of byRegime) {
+      const table: Record<string, number> = {}
+      for (const [name, calls] of byName) {
+        if (calls.length < PAIR_DRIVER_STATS_MIN_N) continue
+        const winRate = weightedHitRate(calls, (hit) => hit).hitRate
+        table[name] = Math.max(0.75, Math.min(1.3, 0.75 + (winRate - 0.5) * 2.5))
+      }
+      if (Object.keys(table).length > 0) out[regime] = table
+    }
+    return out
+  }
+
   /** Learned ratio of REALIZED candle move (|exit-entry|) to this engine's
    * own predicted expectedMove, for this exact asset:tf - the magnitude
    * estimate was never checked against reality before this. Excludes flat
@@ -501,6 +583,31 @@ export class NextCandleService {
     return out
   }
 
+  /** THIS PAIR'S OWN per-driver calibration-quality multiplier -
+   * analytics/nextcandle.ts's OracleInput.pairDriverCalibrationMultipliers.
+   * Same Brier-based algorithm as driverCalibrationMultipliers() above,
+   * scoped to only this asset:tf's own resolved rows. */
+  private pairDriverCalibrationMultipliers(asset: string, tf: string): Record<string, number> {
+    const window = this.resolved.filter((r) => r.asset === asset && r.tf === tf).slice(-PAIR_DRIVER_STATS_WINDOW * 2)
+    const byName = new Map<string, number[]>()
+    for (const r of window) {
+      const realizedUp = r.actual === 'up' ? 1 : r.actual === 'down' ? 0 : 0.5
+      for (const d of r.drivers ?? []) {
+        if (!Number.isFinite(d.pUp)) continue
+        const arr = byName.get(d.name) ?? []
+        arr.push((d.pUp - realizedUp) ** 2)
+        byName.set(d.name, arr)
+      }
+    }
+    const out: Record<string, number> = {}
+    for (const [name, briers] of byName) {
+      if (briers.length < PAIR_DRIVER_STATS_MIN_N) continue
+      const meanBrier = weightedMean(briers)
+      out[name] = Math.max(0.8, Math.min(1.2, 1 + (0.25 - meanBrier) * 1.5))
+    }
+    return out
+  }
+
   /** Learned pairwise driver correlation discount (analytics/
    * nextcandle.ts's `driverCorrelation` input, generalizing the old
    * hand-picked CORRELATED_DRIVER_GROUPS): for every pair of drivers that
@@ -532,6 +639,40 @@ export class NextCandleService {
     const out: Record<string, number> = {}
     for (const [key, agrees] of pairs) {
       if (agrees.length < PAIR_CORR_MIN_N) continue
+      const agreeRate = weightedHitRate(agrees, (a) => a).hitRate
+      if (agreeRate > 0.6) out[key] = Math.max(0.5, 1 - (agreeRate - 0.6) * 1.5)
+    }
+    return out
+  }
+
+  /** THIS PAIR'S OWN learned pairwise driver correlation discount -
+   * analytics/nextcandle.ts's OracleInput.pairDriverCorrelation. Same
+   * co-occurrence-agreement algorithm as driverCorrelationTable() above,
+   * scoped to only this asset:tf's own resolved rows and a wider window
+   * (PAIR_CORR_PAIR_WINDOW) since a driver PAIR's co-occurrence within one
+   * pair's own history is rarer still than a single driver's own history. */
+  private pairDriverCorrelationTable(asset: string, tf: string): Record<string, number> {
+    const window = this.resolved.filter((r) => r.asset === asset && r.tf === tf).slice(-PAIR_CORR_PAIR_WINDOW)
+    const pairs = new Map<string, boolean[]>()
+    for (const r of window) {
+      const ds = r.drivers ?? []
+      for (let i = 0; i < ds.length; i++) {
+        for (let j = i + 1; j < ds.length; j++) {
+          const a = ds[i]
+          const b = ds[j]
+          const aSign = Math.sign(a.vote)
+          const bSign = Math.sign(b.vote)
+          if (aSign === 0 || bSign === 0) continue
+          const key = pairKey(a.name, b.name)
+          const arr = pairs.get(key) ?? []
+          arr.push(aSign === bSign)
+          pairs.set(key, arr)
+        }
+      }
+    }
+    const out: Record<string, number> = {}
+    for (const [key, agrees] of pairs) {
+      if (agrees.length < PAIR_CORR_PAIR_MIN_N) continue
       const agreeRate = weightedHitRate(agrees, (a) => a).hitRate
       if (agreeRate > 0.6) out[key] = Math.max(0.5, 1 - (agreeRate - 0.6) * 1.5)
     }
@@ -590,6 +731,17 @@ export class NextCandleService {
       sessionCalibration: Partial<Record<Session, { n: number; hitRate: number; brier: number }>>
       directionCalibration: Partial<Record<'call' | 'put', { n: number; hitRate: number; brier: number }>>
       magnitudeCalibration: number | null
+      /** this pair's own "physiology": its own per-driver win-rate
+       * multipliers (blended + per-regime), calibration-quality
+       * multipliers, and driver-correlation discounts - takes priority
+       * over the universe-wide tables below once this pair has enough of
+       * its own resolved history (PAIR_DRIVER_STATS_MIN_N /
+       * PAIR_CORR_PAIR_MIN_N); empty objects mean still falling back to
+       * the universe-wide read for every driver. */
+      pairDriverWeightMultipliers: Record<string, number>
+      pairRegimeDriverWeightMultipliers: Partial<Record<OracleRegime, Record<string, number>>>
+      pairDriverCalibrationMultipliers: Record<string, number>
+      pairDriverCorrelation: Record<string, number>
     }[]
     driverWeightMultipliers: Record<string, number>
     regimeDriverWeightMultipliers: Partial<Record<OracleRegime, Record<string, number>>>
@@ -626,6 +778,10 @@ export class NextCandleService {
         sessionCalibration: this.sessionCalibrationFor(asset, tf),
         directionCalibration: this.directionCalibrationFor(asset, tf),
         magnitudeCalibration: this.magnitudeCalibrationFor(asset, tf),
+        pairDriverWeightMultipliers: this.pairDriverWeightMultipliers(asset, tf),
+        pairRegimeDriverWeightMultipliers: this.pairDriverWeightMultipliersByRegime(asset, tf),
+        pairDriverCalibrationMultipliers: this.pairDriverCalibrationMultipliers(asset, tf),
+        pairDriverCorrelation: this.pairDriverCorrelationTable(asset, tf),
       }
     }).sort((a, b) => b.n - a.n)
     return {
