@@ -331,6 +331,15 @@ export interface OracleInput {
    * candles realize bigger moves than predicted), <1 narrows it. Clamped
    * defensively inside predictNextCandle regardless of what's passed. */
   magnitudeCalibration?: number | null
+  /** Learned correction for the predicted candle SHAPE (bodyRatio +
+   * closePos), for this exact asset:tf - the other geometry estimate,
+   * besides magnitude, that nothing checked against reality until now.
+   * bodyRatioRatio: realized/predicted body-ratio ratio, 1 = unchanged.
+   * closePosBias: additive bias on closePos, 0 = unchanged (additive, not
+   * a ratio, since closePos is centered on 0.5, not anchored at 0). Both
+   * clamped defensively inside predictNextCandle regardless of what's
+   * passed, and either half may be null independently (thin-record). */
+  shapeCalibration?: { bodyRatioRatio: number | null; closePosBias: number | null } | null
   /** Monte Carlo bootstrap paths. Default 1200 (panel-grade); the bar-by-bar
    * strategy eval passes fewer for backtest speed - the fused read is stable
    * well below the default (binomial noise on pUp ~ 1/sqrt(n)). */
@@ -746,8 +755,16 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
   }
   const avgRange = rangeAcc / 40 || atrVal || 1e-9
   const avgBody = bodyAcc / 40 || 1e-9
-  const bodyRatio = clamp(avgBody / avgRange, 0.05, 0.95)
-  const closePosRaw = clamp(0.5 + (dirSign * distance) / 2, 0.05, 0.95)
+  const bodyRatioPred = clamp(avgBody / avgRange, 0.05, 0.95)
+  const closePosPred = clamp(0.5 + (dirSign * distance) / 2, 0.05, 0.95)
+  // learned shape correction - same defensive-clamp-regardless-of-input
+  // posture as magCal above. bodyRatioRatio multiplies, closePosBias adds
+  // (closePos is centered on 0.5, not anchored at 0 like bodyRatio).
+  const shapeCal = input.shapeCalibration
+  const bodyCal = shapeCal?.bodyRatioRatio && Number.isFinite(shapeCal.bodyRatioRatio) && shapeCal.bodyRatioRatio > 0 ? clamp(shapeCal.bodyRatioRatio, 0.5, 2) : 1
+  const closePosBias = shapeCal?.closePosBias && Number.isFinite(shapeCal.closePosBias) ? clamp(shapeCal.closePosBias, -0.2, 0.2) : 0
+  const bodyRatio = clamp(bodyRatioPred * bodyCal, 0.05, 0.95)
+  const closePosRaw = clamp(closePosPred + closePosBias, 0.05, 0.95)
 
   // direction deadband: wider in VOLATILE (every driver is noisier there,
   // chaosFlatten already says so for the weights - the direction call

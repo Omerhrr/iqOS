@@ -124,6 +124,13 @@ interface PendingPrediction {
    * (see magnitudeCalibrationFor()), the one estimate in this fusion that
    * was never checked against reality before. */
   expectedMove: number
+  /** this read's own predicted candle SHAPE (body-ratio + close-position,
+   * the same geometry expectedCandleType is classified from) - carried
+   * through to the resolved record so the REALIZED shape can be checked
+   * against it (see shapeCalibrationFor()), the other estimate besides
+   * magnitude that nothing checked against reality until now. */
+  bodyRatio: number
+  closePos: number
 }
 
 export interface ResolvedPrediction {
@@ -154,6 +161,14 @@ export interface ResolvedPrediction {
   patternHits: { name: string; direction: 'bullish' | 'bearish' | 'neutral' }[]
   /** predicted magnitude at issue time - feeds magnitudeCalibrationFor() against |exit-entry| */
   expectedMove: number
+  /** predicted shape at issue time - feeds shapeCalibrationFor() against
+   * the resolved candle's own realized body-ratio/close-position. */
+  predBodyRatio: number
+  predClosePos: number
+  /** the resolved candle's own REALIZED shape - computed once at
+   * resolution from the actual OHLC, not re-derived anywhere else. */
+  realizedBodyRatio: number
+  realizedClosePos: number
 }
 
 export interface GlobalScanRow {
@@ -268,6 +283,7 @@ export class NextCandleService {
       pairConfidenceBlendWeight: this.pairLearnedConfidenceBlendWeight(asset, tf),
       pairPatternReliability: this.pairPatternReliabilityTable(asset, tf),
       magnitudeCalibration: this.magnitudeCalibrationFor(asset, tf),
+      shapeCalibration: this.shapeCalibrationFor(asset, tf),
     })
     if (!pred) return null
     const key = `${asset}:${tf}:${pred.targetBarTime}`
@@ -286,6 +302,8 @@ export class NextCandleService {
       drivers: pred.drivers.map((d) => ({ name: d.name, vote: d.vote, pUp: d.pUp })),
       patternHits: pred.patternHits,
       expectedMove: pred.expectedMove,
+      bodyRatio: pred.bodyRatio,
+      closePos: pred.closePos,
     })
     if (this.pending.size > 400) {
       // drop the oldest fifth - pending entries resolve on candle close anyway
@@ -307,6 +325,13 @@ export class NextCandleService {
       const predicted = p.direction === 'none' ? (p.pUp >= 0.5 ? 'call' : 'put') : p.direction // 'none' still implies a lean via pUp
       const hit = predicted === 'call' ? actual === 'up' : predicted === 'put' ? actual === 'down' : false
       const realizedUp = actual === 'up' ? 1 : actual === 'down' ? 0 : 0.5
+      // realized SHAPE of the resolving candle itself - the same two
+      // numbers expectedCandleType is classified from, computed fresh from
+      // the actual OHLC (never re-derived anywhere else). Guard against a
+      // zero-range bar (high===low) with a tiny epsilon rather than NaN.
+      const range = Math.max(candle.high - candle.low, 1e-9)
+      const realizedBodyRatio = Math.min(1, Math.max(0, Math.abs(candle.close - candle.open) / range))
+      const realizedClosePos = Math.min(1, Math.max(0, (candle.close - candle.low) / range))
       const entry: ResolvedPrediction = {
         asset,
         tf,
@@ -326,6 +351,10 @@ export class NextCandleService {
         drivers: p.drivers,
         patternHits: p.patternHits,
         expectedMove: p.expectedMove,
+        predBodyRatio: p.bodyRatio,
+        predClosePos: p.closePos,
+        realizedBodyRatio,
+        realizedClosePos,
       }
       this.resolved.push(entry)
       while (this.resolved.length > MAX_RESOLVED) this.resolved.shift()
@@ -558,6 +587,32 @@ export class NextCandleService {
     const predictedAvg = weightedMeanBy(rows, (r) => r.expectedMove)
     if (predictedAvg <= 0) return null
     return realizedAvg / predictedAvg
+  }
+
+  /** Learned correction for the SHAPE prediction (bodyRatio + closePos) -
+   * the other geometry estimate, besides magnitude, that nothing checked
+   * against reality until now. Same pattern as magnitudeCalibrationFor():
+   * windowed to this exact asset:tf, thin-record-null, the engine clamps
+   * defensively regardless of what's returned here.
+   * - bodyRatioRatio: learned ratio of REALIZED body-ratio to this engine's
+   *   own PREDICTED body-ratio (centered on 1 = unchanged) - a value above
+   *   1 means candles are realizing bigger bodies than predicted (oracle is
+   *   under-calling doji/indecision), below 1 means the opposite.
+   * - closePosBias: learned ADDITIVE bias on closePos (centered on 0) - a
+   *   positive value means candles are realizing closes further toward the
+   *   high than predicted, negative means further toward the low. Additive
+   *   (not a ratio) because closePos is already centered around 0.5, not
+   *   anchored at 0 the way bodyRatio/expectedMove are. */
+  private shapeCalibrationFor(asset: string, tf: string): { bodyRatioRatio: number | null; closePosBias: number | null } | null {
+    const rows = this.resolved.filter((r) => r.asset === asset && r.tf === tf && r.predBodyRatio > 0).slice(-CALIBRATION_WINDOW)
+    if (rows.length < 20) return null
+    const predBodyAvg = weightedMeanBy(rows, (r) => r.predBodyRatio)
+    const realizedBodyAvg = weightedMeanBy(rows, (r) => r.realizedBodyRatio)
+    const bodyRatioRatio = predBodyAvg > 0 ? realizedBodyAvg / predBodyAvg : null
+    const predClosePosAvg = weightedMeanBy(rows, (r) => r.predClosePos)
+    const realizedClosePosAvg = weightedMeanBy(rows, (r) => r.realizedClosePos)
+    const closePosBias = realizedClosePosAvg - predClosePosAvg
+    return { bodyRatioRatio, closePosBias }
   }
 
   /** Per-PATTERN live reliability, learned the same way driverWeightMultipliers()
