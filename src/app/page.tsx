@@ -216,7 +216,7 @@ export default function OSPage() {
   const [prices, setPrices] = useState<Record<string, { price: number; dir: number }>>({})
   const [bootLine, setBootLine] = useState(0)
   const [connected, setConnected] = useState(false)
-  const [chartType, setChartType] = useState<ChartType>('candles')
+  const [chartType, setChartType] = useState<ChartType>('renko')
   const [pickerOpen, setPickerOpen] = useState(false)
   const [signalsOpen, setSignalsOpen] = useState(false)
   // left dock has six sidebar modes now: the chart-signals scanner, the
