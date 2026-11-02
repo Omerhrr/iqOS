@@ -27,6 +27,8 @@ import { otcGuardPlugin, OtcGuardService, type OtcDefenseReport } from './src/pl
 import { otcFootprintPlugin, OtcFootprintService } from './src/plugins/otcfootprint'
 import { chartSignalsPlugin, ChartSignalsService } from './src/plugins/chartsignals'
 import { leadLagScanPlugin, LeadLagScanService } from './src/plugins/leadlagscan'
+import { cointegrationScanPlugin, CointegrationScanService } from './src/plugins/cointegrationscan'
+import { volArbScanPlugin, VolArbScanService } from './src/plugins/volarbscan'
 import { yesterdayPlugin, YesterdayService } from './src/plugins/yesterday'
 import { nextCandlePlugin, NextCandleService } from './src/plugins/nextcandle'
 import { adxHonestyPlugin, AdxHonestyService } from './src/plugins/adxhonesty'
@@ -187,6 +189,8 @@ kernel.register(otcGuardPlugin)
 kernel.register(otcFootprintPlugin)
 kernel.register(chartSignalsPlugin)
 kernel.register(leadLagScanPlugin)
+kernel.register(cointegrationScanPlugin)
+kernel.register(volArbScanPlugin)
 kernel.register(yesterdayPlugin)
 kernel.register(nextCandlePlugin)
 kernel.register(tempoPlugin)
@@ -253,144 +257,14 @@ function scanDistill(market: MarketDataService, tfv: Timeframe): DistillScanRow[
   return rows
 }
 
-interface CointegrationScanRow {
-  leader: string
-  asset: string
-  name: string
-  category: string
-  otc: boolean
-  open: boolean
-  price: number
-  beta: number
-  r2: number
-  z: number
-  tStat: number
-  halfLifeBars: number
-  n: number
-  direction: 'call' | 'put' | null
-  /** clears the SAME gates the cointegration-pairs strategy itself requires
-   * (minR2/minTStat/maxHalfLife) plus a |z| >= 1.5 entry - i.e. this is what
-   * the strategy would actually act on right now, not just a plausible fit. */
-  qualifies: boolean
-}
-const cointegrationScanCache = new Map<Timeframe, { ts: number; rows: CointegrationScanRow[] }>()
-
-function scanCointegration(market: MarketDataService, tfv: Timeframe): CointegrationScanRow[] {
-  const cached = cointegrationScanCache.get(tfv)
-  if (cached && Date.now() - cached.ts < SCAN_CACHE_MS) return cached.rows
-  const rows: CointegrationScanRow[] = []
-  const byTicker = new Map(market.assets.map((a) => [a.ticker, a]))
-  const leaderCloseCache = new Map<string, number[] | null>()
-  for (const group of LEADLAG_GROUPS) {
-    const leaderInfo = byTicker.get(group.leader)
-    let leaderCloses = leaderCloseCache.get(group.leader)
-    if (leaderCloses === undefined) {
-      try {
-        leaderCloses =
-          leaderInfo?.open ? market.getCandlesDeep(group.leader, tfv, Math.max(600, COINTEGRATION_WINDOW + 50), true).map((c) => c.close) : null
-      } catch {
-        leaderCloses = null
-      }
-      leaderCloseCache.set(group.leader, leaderCloses)
-    }
-    if (!leaderCloses || leaderCloses.length < 30) continue
-    for (const asset of group.followers) {
-      const inst = byTicker.get(asset)
-      if (!inst?.open) continue
-      try {
-        const candles = market.getCandlesDeep(asset, tfv, Math.max(600, COINTEGRATION_WINDOW + 50), true)
-        if (candles.length < 30) continue
-        const fit = fitCointegration(leaderCloses, candles.map((c) => c.close), COINTEGRATION_WINDOW)
-        if (!fit) continue
-        const qualifies = fit.r2 >= COINTEGRATION_MIN_R2 && fit.tStat >= COINTEGRATION_MIN_TSTAT && fit.halfLifeBars <= COINTEGRATION_MAX_HALFLIFE && Math.abs(fit.z) >= 1.5
-        rows.push({
-          leader: group.leader,
-          asset,
-          name: inst.name,
-          category: inst.category,
-          otc: !!inst.otc,
-          open: inst.open,
-          price: candles[candles.length - 1]?.close ?? 0,
-          beta: fit.beta,
-          r2: fit.r2,
-          z: fit.z,
-          tStat: fit.tStat,
-          halfLifeBars: fit.halfLifeBars,
-          n: fit.n,
-          direction: fit.z <= -1.5 ? 'call' : fit.z >= 1.5 ? 'put' : null,
-          qualifies,
-        })
-      } catch {
-        /* one bad pair never breaks the scan */
-      }
-    }
-  }
-  rows.sort((x, y) => Number(y.qualifies) - Number(x.qualifies) || Math.abs(y.z) - Math.abs(x.z))
-  cointegrationScanCache.set(tfv, { ts: Date.now(), rows })
-  return rows
-}
-
-interface VolArbScanRow {
-  asset: string
-  name: string
-  category: string
-  otc: boolean
-  open: boolean
-  price: number
-  closeVol: number
-  rangeVol: number
-  ratio: number
-  momentum: number
-  lastBarDir: -1 | 0 | 1
-  direction: 'call' | 'put' | null
-  regime: 'fade' | 'continue' | 'balanced'
-}
-const volarbScanCache = new Map<Timeframe, { ts: number; rows: VolArbScanRow[] }>()
-// same ratioHigh/ratioLow convention as the volatility-arb strategy's own
-// defaults in builtin.ts and VolatilityArbPanel.tsx's local constants
-const VOLARB_SCAN_RATIO_HIGH = 1.6
-const VOLARB_SCAN_RATIO_LOW = 0.6
-
-function scanVolArb(market: MarketDataService, tfv: Timeframe): VolArbScanRow[] {
-  const cached = volarbScanCache.get(tfv)
-  if (cached && Date.now() - cached.ts < SCAN_CACHE_MS) return cached.rows
-  const rows: VolArbScanRow[] = []
-  for (const a of market.assets) {
-    if (!a.open) continue
-    try {
-      const candles = market.getCandlesDeep(a.ticker, tfv, Math.max(300, VOLARB_DEFAULT_WINDOW + 50), true)
-      const out = computeVolArb(candles, VOLARB_DEFAULT_WINDOW)
-      if (!out) continue
-      const direction: 'call' | 'put' | null =
-        out.ratio >= VOLARB_SCAN_RATIO_HIGH && out.lastBarDir !== 0
-          ? out.lastBarDir > 0 ? 'put' : 'call'
-          : out.ratio <= VOLARB_SCAN_RATIO_LOW && out.momentum !== 0
-            ? out.momentum > 0 ? 'call' : 'put'
-            : null
-      const regime: VolArbScanRow['regime'] = out.ratio >= VOLARB_SCAN_RATIO_HIGH ? 'fade' : out.ratio <= VOLARB_SCAN_RATIO_LOW ? 'continue' : 'balanced'
-      rows.push({
-        asset: a.ticker,
-        name: a.name,
-        category: a.category,
-        otc: !!a.otc,
-        open: a.open,
-        price: candles[candles.length - 1]?.close ?? 0,
-        closeVol: out.closeVol,
-        rangeVol: out.rangeVol,
-        ratio: out.ratio,
-        momentum: out.momentum,
-        lastBarDir: out.lastBarDir,
-        direction,
-        regime,
-      })
-    } catch {
-      /* one bad asset never breaks the scan */
-    }
-  }
-  rows.sort((x, y) => Math.abs(y.ratio - 1) - Math.abs(x.ratio - 1))
-  volarbScanCache.set(tfv, { ts: Date.now(), rows })
-  return rows
-}
+// scanCointegration/scanVolArb (bare cached module functions) replaced by
+// CointegrationScanService/VolArbScanService (src/plugins/cointegrationscan.ts,
+// src/plugins/volarbscan.ts) - same fit logic, now with real outcome
+// tracking (data/cointegration_outcomes.json, data/volarb_outcomes.json)
+// and a self-driving background rescan, same honesty-loop treatment
+// chart-signals/lead-lag already had (task: next-candle-oracle real-edge
+// audit, 2026-11-02). See /cointegration_scan, /volarb_scan,
+// /cointegration_stats, /volarb_stats below.
 
 interface TriangulationScanRow {
   currencies: string
@@ -2339,11 +2213,26 @@ const httpServer = createServer(async (req, res) => {
         try {
           const tfv = tfStrict(q.get('tf'))
           if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
-          const rows = scanCointegration(market, tfv)
-          return json(200, { ok: true, tf: tfv, scanned: rows.length, qualifying: rows.filter((r) => r.qualifies).length, rows, ts: Date.now() })
+          return json(200, kernel.context().use<CointegrationScanService>('cointegrationScan').scan(tfv))
         } catch (err) {
           return json(400, { ok: false, error: (err as Error).message })
         }
+      }
+
+      // Cointegration outcome stats (the honesty loop for the cointegration
+      // scanner): every row that qualified became a pending claim, resolved
+      // against the follower's actual price at a horizon set by the fitted
+      // spread half-life - same real-edge check /leadlag_stats gives the
+      // lead-lag scanner.
+      if (path === '/cointegration_stats') {
+        const tfq = q.get('tf')
+        let tfFilter: Timeframe | undefined
+        if (tfq !== null) {
+          const v = tfStrict(tfq)
+          if (v === null) return json(400, { ok: false, error: tfErr(tfq) })
+          tfFilter = v
+        }
+        return json(200, { ok: true, ...kernel.context().use<CointegrationScanService>('cointegrationScan').stats(tfFilter), ts: Date.now() })
       }
 
       // Volatility Arb: panel-facing twin of the volatility-arb strategy -
@@ -2375,11 +2264,25 @@ const httpServer = createServer(async (req, res) => {
         try {
           const tfv = tfStrict(q.get('tf'))
           if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
-          const rows = scanVolArb(market, tfv)
-          return json(200, { ok: true, tf: tfv, scanned: rows.length, rows, ts: Date.now() })
+          return json(200, kernel.context().use<VolArbScanService>('volArbScan').scan(tfv))
         } catch (err) {
           return json(400, { ok: false, error: (err as Error).message })
         }
+      }
+
+      // Vol-arb outcome stats (the honesty loop for the volatility-arb
+      // scanner): every directional (fade/continue) row became a pending
+      // claim, resolved against the asset's actual price a fixed number of
+      // bars later - same real-edge check /leadlag_stats gives lead-lag.
+      if (path === '/volarb_stats') {
+        const tfq = q.get('tf')
+        let tfFilter: Timeframe | undefined
+        if (tfq !== null) {
+          const v = tfStrict(tfq)
+          if (v === null) return json(400, { ok: false, error: tfErr(tfq) })
+          tfFilter = v
+        }
+        return json(200, { ok: true, ...kernel.context().use<VolArbScanService>('volArbScan').stats(tfFilter), ts: Date.now() })
       }
 
       // Triangulation Arbitrage scan: every closed FX triangle (A/B, B/C,
