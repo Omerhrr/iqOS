@@ -686,6 +686,24 @@ export default function OSPage() {
     void osPost('/asset', { asset: a })
   }, [])
 
+  // From the Next Global board: open a row's pair directly in the
+  // per-asset Next-Candle Oracle panel (not just switch the chart to it) -
+  // same asset-switch handleSelectAsset already does, plus swapping which
+  // detail panel is showing.
+  const handleOpenOracle = useCallback((a: string) => {
+    handleSelectAsset(a)
+    setNextGlobalOpen(false)
+    setOracleOpen(true)
+  }, [handleSelectAsset])
+
+  // From the Tempo Global board: open a row's pair directly in the
+  // per-asset Tempo panel.
+  const handleOpenTempo = useCallback((a: string) => {
+    handleSelectAsset(a)
+    setTempoGlobalOpen(false)
+    setTempoOpen(true)
+  }, [handleSelectAsset])
+
   // Yesterday panel echo chip: deep-load this asset's candles (so the window
   // has remembered bars behind it) and scroll the chart onto yesterday's
   // lead-in plus the forward replay window - the script the rhyme score is
@@ -1162,9 +1180,9 @@ export default function OSPage() {
                   ) : oracleOpen ? (
                     <NextCandlePanel onClose={() => setOracleOpen(false)} asset={asset} tf={tf} closedTick={closedTick} />
                   ) : nextGlobalOpen ? (
-                    <NextGlobalPanel onClose={() => setNextGlobalOpen(false)} tf={tf} closedTick={closedTick} onPickAsset={handleSelectAsset} />
+                    <NextGlobalPanel onClose={() => setNextGlobalOpen(false)} tf={tf} closedTick={closedTick} onPickAsset={handleSelectAsset} onOpenOracle={handleOpenOracle} />
                   ) : tempoGlobalOpen ? (
-                    <TempoGlobalPanel onClose={() => setTempoGlobalOpen(false)} tf={tf} closedTick={closedTick} onPickAsset={handleSelectAsset} />
+                    <TempoGlobalPanel onClose={() => setTempoGlobalOpen(false)} tf={tf} closedTick={closedTick} onPickAsset={handleSelectAsset} onOpenTempo={handleOpenTempo} />
                   ) : tempoOpen ? (
                     <TempoPanel onClose={() => setTempoOpen(false)} asset={asset} tf={tf} closedTick={closedTick} />
                   ) : (

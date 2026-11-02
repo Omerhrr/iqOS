@@ -25,6 +25,10 @@ interface NextGlobalPanelProps {
   closedTick?: number
   /** switch the main chart to a row's pair */
   onPickAsset?: (asset: string) => void
+  /** open the per-asset Next-Candle Oracle panel for a row's pair (switches
+   * the chart to it too) - distinct from onPickAsset, which only switches
+   * the chart and leaves the board open. */
+  onOpenOracle?: (asset: string) => void
   onClose: () => void
 }
 
@@ -97,7 +101,7 @@ function ageLabel(ts: number): string {
   return `${Math.floor(s / 60)}m${s % 60}s`
 }
 
-export default function NextGlobalPanel({ tf, closedTick, onPickAsset, onClose }: NextGlobalPanelProps) {
+export default function NextGlobalPanel({ tf, closedTick, onPickAsset, onOpenOracle, onClose }: NextGlobalPanelProps) {
   const [tfSel, setTfSel] = useState<Timeframe>(tf)
   const [rows, setRows] = useState<NextGlobalRow[]>([])
   const [meta, setMeta] = useState<{ scanned: number; live: number; warming: number; universe: number; refreshed: number; scannedTs: number } | null>(null)
@@ -211,6 +215,16 @@ export default function NextGlobalPanel({ tf, closedTick, onPickAsset, onClose }
             </button>
             {dirChip(best.direction)}
             {regimeChip(best.regime)}
+            {onOpenOracle && (
+              <button
+                type="button"
+                onClick={() => onOpenOracle(best.asset)}
+                className="rounded border border-sky-500/40 px-1.5 py-px font-mono text-[8.5px] uppercase text-sky-300 hover:bg-sky-500/10"
+                title="open the full Next-Candle Oracle panel for this pair"
+              >
+                open oracle
+              </button>
+            )}
             <span className="ml-auto font-mono text-[10px] text-[#7c8aa5]">
               P(up) <span className={best.pUp >= 0.5 ? 'text-emerald-300' : 'text-rose-300'}>{(best.pUp * 100).toFixed(1)}%</span>
               {' · '}exp {fmtPrice(best.expectedMove, best.asset)} ({(best.expectedMove / Math.max(best.atr, 1e-9)).toFixed(2)}× ATR)
@@ -257,10 +271,12 @@ export default function NextGlobalPanel({ tf, closedTick, onPickAsset, onClose }
         {shown.map((r) => {
           const edge = (r.pUp - 0.5) * 100
           return (
-            <button
+            <div
               key={r.asset}
-              type="button"
+              role="button"
+              tabIndex={0}
               onClick={() => onPickAsset?.(r.asset)}
+              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') onPickAsset?.(r.asset) }}
               className="group flex items-center gap-2 rounded border border-[#1c2739] bg-[#0b111c] px-2 py-1 text-left hover:border-[#24324a]"
               title={`${r.asset} ${r.tf} · P(up) ${(r.pUp * 100).toFixed(1)}% · ${r.driversActive} models · click to open on the chart`}
             >
@@ -271,12 +287,22 @@ export default function NextGlobalPanel({ tf, closedTick, onPickAsset, onClose }
               </span>
               {confBar(r.confidence)}
               {regimeChip(r.regime)}
+              {onOpenOracle && (
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); onOpenOracle(r.asset) }}
+                  className="shrink-0 rounded border border-sky-500/40 px-1 py-px font-mono text-[7.5px] uppercase text-sky-300 hover:bg-sky-500/10"
+                  title="open the full Next-Candle Oracle panel for this pair"
+                >
+                  oracle
+                </button>
+              )}
               <span className="ml-auto flex shrink-0 items-center gap-2 font-mono text-[8px] text-[#4b5a72]">
                 {recordBadge(r)}
                 <span className="text-[#3d4d66]">{fmtPrice(r.price, r.asset)}</span>
                 <span>{ageLabel(r.computedTs)}</span>
               </span>
-            </button>
+            </div>
           )
         })}
         {warmingCount > 0 && dirFilter === 'all' && (

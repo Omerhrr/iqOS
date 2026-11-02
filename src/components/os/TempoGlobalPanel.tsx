@@ -68,6 +68,10 @@ interface TempoGlobalPanelProps {
   closedTick?: number
   /** switch the main chart to a row's pair */
   onPickAsset?: (asset: string) => void
+  /** open the per-asset Tempo panel for a row's pair (switches the chart
+   * to it too) - distinct from onPickAsset, which only switches the chart
+   * and leaves the board open. */
+  onOpenTempo?: (asset: string) => void
   onClose: () => void
 }
 
@@ -159,7 +163,7 @@ function shotBadge(row: TempoRow) {
   return <span className="font-mono text-[8px] uppercase tracking-wider text-[#3d4d66]" title="no resolved tempo shots on this pair yet">no shots</span>
 }
 
-export default function TempoGlobalPanel({ tf, closedTick, onPickAsset, onClose }: TempoGlobalPanelProps) {
+export default function TempoGlobalPanel({ tf, closedTick, onPickAsset, onOpenTempo, onClose }: TempoGlobalPanelProps) {
   const [tfSel, setTfSel] = useState<Timeframe>(tf)
   const [rows, setRows] = useState<TempoRow[]>([])
   const [meta, setMeta] = useState<{ scanned: number; live: number; firing: number; window: TempoScanResponseSafe['window']; ts: number } | null>(null)
@@ -299,6 +303,16 @@ export default function TempoGlobalPanel({ tf, closedTick, onPickAsset, onClose 
             </button>
             {dirChip(best.direction)}
             {decisionChip(best.decision)}
+            {onOpenTempo && (
+              <button
+                type="button"
+                onClick={() => onOpenTempo(best.asset)}
+                className="rounded border border-fuchsia-500/40 px-1.5 py-px font-mono text-[8.5px] uppercase text-fuchsia-300 hover:bg-fuchsia-500/10"
+                title="open the full Tempo panel for this pair"
+              >
+                open tempo
+              </button>
+            )}
             <span className="ml-auto font-mono text-[10px] text-[#7c8aa5]">
               conviction <span className="text-fuchsia-300">{best.conviction.toFixed(1)}</span> vs bar {best.threshold.toFixed(1)}
               {' · '}P(up) <span className={best.pUp >= 0.5 ? 'text-emerald-300' : 'text-rose-300'}>{(best.pUp * 100).toFixed(1)}%</span>
@@ -316,10 +330,12 @@ export default function TempoGlobalPanel({ tf, closedTick, onPickAsset, onClose 
           </div>
         )}
         {shown.map((r) => (
-          <button
+          <div
             key={r.asset}
-            type="button"
+            role="button"
+            tabIndex={0}
             onClick={() => onPickAsset?.(r.asset)}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') onPickAsset?.(r.asset) }}
             className="group flex items-center gap-2 rounded border border-[#1c2739] bg-[#0b111c] px-2 py-1 text-left hover:border-[#24324a]"
             title={`${r.asset} ${r.tf} · ${r.decisionReason} · click to open on the chart`}
           >
@@ -328,11 +344,21 @@ export default function TempoGlobalPanel({ tf, closedTick, onPickAsset, onClose 
             {decisionChip(r.decision)}
             {convictionBar(r.conviction, r.threshold)}
             {windowClock(r)}
+            {onOpenTempo && (
+              <button
+                type="button"
+                onClick={(e) => { e.stopPropagation(); onOpenTempo(r.asset) }}
+                className="shrink-0 rounded border border-fuchsia-500/40 px-1 py-px font-mono text-[7.5px] uppercase text-fuchsia-300 hover:bg-fuchsia-500/10"
+                title="open the full Tempo panel for this pair"
+              >
+                tempo
+              </button>
+            )}
             <span className="ml-auto flex shrink-0 items-center gap-2 font-mono text-[8px] text-[#4b5a72]">
               {shotBadge(r)}
               <span className="text-[#3d4d66]">{fmtPrice(r.price, r.asset)}</span>
             </span>
-          </button>
+          </div>
         ))}
       </div>
 
