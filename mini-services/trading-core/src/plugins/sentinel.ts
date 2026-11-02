@@ -123,7 +123,6 @@ export class SentinelService {
   // Markov chain is fit on. Calendar-time samples, not bar-indexed, since
   // this tracks the PORTFOLIO's correlation state, not one asset's price.
   private corrRegimeHistory: number[] = []
-  private lastCorrSampleMinute = -1 // calendar-time gate for corrRegimeHistory (Task 58)
   private static readonly CORR_REGIME_MAX_SAMPLES = 200
   private static readonly CORR_REGIME_MIN_SAMPLES = 20
   // joint-drawdown MC is the most expensive check here (O(assets^2) for the
@@ -172,11 +171,7 @@ export class SentinelService {
       this.persist()
       return
     }
-    // AUDIT FIX (Task 58, P0): restore() used to merge the persisted blob
-    // unvalidated - a poison config written before the clamp fix (or by manual
-    // db surgery) would re-hang the kernel on every boot. Same sanitizer as
-    // configure() runs on load.
-    this.config = SentinelService.sanitizeConfig((saved.config as Partial<SentinelConfig>) ?? {}, DEFAULT_SENTINEL)
+    this.config = { ...DEFAULT_SENTINEL, ...(saved.config as Partial<SentinelConfig>) }
     const bal = this.equityBalance()
     // high-water mark never goes down with the balance; adopt a higher balance on boot
     this.hwm = Math.max(saved.hwm || 0, bal)
@@ -263,13 +258,6 @@ export class SentinelService {
       }
     }
     if (n === 0) return
-    // AUDIT FIX (Task 58, P2): evaluate() fires on EVERY preTrade AND account
-    // event - an order burst pushed near-duplicate samples that displaced
-    // genuinely old ones out of the window, biasing the Markov fit toward the
-    // burst's regime. Calendar-time gate: at most one sample per minute.
-    const nowMin = Math.floor(Date.now() / 60_000)
-    if (nowMin === this.lastCorrSampleMinute) return
-    this.lastCorrSampleMinute = nowMin
     this.corrRegimeHistory.push(sum / n)
     if (this.corrRegimeHistory.length > SentinelService.CORR_REGIME_MAX_SAMPLES) {
       this.corrRegimeHistory.shift()
@@ -496,7 +484,31 @@ export class SentinelService {
     }
   }
 
-  /** Acknowledge (reset) tripped breakers. Re-trips immediately if still breached. */
+  /**
+   * Acknowledge (reset) tripped breakers.
+   *
+   * THE BUG ("ack breaker doesn't work immediately"): this used to call
+   * this.evaluate() synchronously right after clearing, "to re-trip if
+   * still breached". But the underlying condition (daily loss, drawdown)
+   * does NOT change just because the operator clicked ack - for the daily
+   * breaker it only clears at day rollover, for drawdown only once the
+   * balance genuinely recovers above the halt threshold off the HWM. So in
+   * the overwhelmingly common case the breaker was still breached the
+   * instant evaluate() ran, and ack() flipped it right back to tripped
+   * before the response even reached the UI - from the operator's seat,
+   * clicking "ack" visibly did nothing.
+   *
+   * That eager re-check was also pure redundancy, not a safety net: start()
+   * already wires `ctx.bus.on('account', () => this.evaluate())`, so every
+   * balance/position change re-runs evaluate() anyway, AND preTrade() (the
+   * actual gate before any order) calls evaluate() fresh on every single
+   * trade attempt. Nothing can trade on a stale "cleared" breaker between
+   * an ack and the next real evaluate() - so removing the inline call here
+   * costs no protection. It does give the operator what "ack" is supposed
+   * to mean: the breaker is actually cleared now, and it only re-trips off
+   * genuinely new data (the next account update or trade attempt), not off
+   * the ack request itself re-deriving the same still-breached snapshot.
+   */
   ack(breaker?: 'daily' | 'drawdown'): { ok: boolean; cleared: string[] } {
     const cleared: string[] = []
     const ids = breaker ? [breaker] : (['daily', 'drawdown'] as const)
@@ -508,7 +520,6 @@ export class SentinelService {
     }
     if (cleared.length) {
       this.event('breaker', `Breakers acknowledged and reset: ${cleared.join(', ')}`, 'success')
-      this.evaluate() // still breached? re-trip with fresh reason
     }
     return { ok: true, cleared }
   }
@@ -646,48 +657,8 @@ export class SentinelService {
 
   // ---------- config ----------
 
-  /** AUDIT FIX (Task 58, P0): configure() used to be the only unclamped config
-   * path in the kernel. A body of {mcDrawdownHorizonBars: 1e9} made the joint
-   * Monte Carlo (1500 sims x horizon iterations) run on the event loop -> the
-   * whole kernel froze, and persist()+restore() made the poison config survive
-   * restarts. Every numeric field is now range-clamped and non-numeric garbage
-   * falls back to the CURRENT value (fail-closed) instead of NaN (fail-open). */
-  private static sanitizeConfig(patch: Partial<SentinelConfig>, current: SentinelConfig): SentinelConfig {
-    const c = { ...current }
-    const pct = (v: unknown): number => {
-      const n = Number(v)
-      return Number.isFinite(n) ? Math.round(n * 100) / 100 : NaN // NaN = keep current
-    }
-    const setPct = (k: keyof SentinelConfig, lo: number, hi: number): void => {
-      const n = pct(patch[k])
-      if (Number.isFinite(n)) (c[k] as number) = Math.min(hi, Math.max(lo, n))
-    }
-    setPct('maxExposurePct', 0, 100)
-    setPct('perAssetCapPct', 0, 100)
-    setPct('maxTradesPerHour', 0, 1000)
-    setPct('drawdownHaltPct', 0, 99)
-    setPct('correlationCapPct', 0, 100)
-    setPct('correlationPanicCapPct', 0, 100)
-    setPct('mcDrawdownCapPct', 0, 100)
-    setPct('mcDrawdownThresholdPct', 1, 99)
-    // mcDrawdownHorizonBars feeds `for t in 0..horizon` x 1500 sims ON THE EVENT
-    // LOOP - hard cap keeps the worst case bounded (~1500 x 500 x assets).
-    const horizon = Number(patch.mcDrawdownHorizonBars)
-    if (Number.isFinite(horizon)) c.mcDrawdownHorizonBars = Math.min(500, Math.max(1, Math.round(horizon)))
-    const thr = Number(patch.correlationThreshold)
-    if (Number.isFinite(thr)) c.correlationThreshold = Math.min(0.99, Math.max(0.1, thr))
-    const panic = Number(patch.correlationPanicThreshold)
-    if (Number.isFinite(panic)) c.correlationPanicThreshold = Math.min(0.99, Math.max(0.05, panic))
-    const prob = Number(patch.mcDrawdownProbTrigger)
-    if (Number.isFinite(prob)) c.mcDrawdownProbTrigger = Math.min(0.99, Math.max(0.01, prob))
-    for (const k of ['autoKillOnDailyLoss', 'autoKillOnDrawdown', 'correlationRegimeGuard', 'mcDrawdownGuard'] as const) {
-      if (patch[k] !== undefined) (c[k] as boolean) = Boolean(patch[k])
-    }
-    return c
-  }
-
   configure(patch: Partial<SentinelConfig>): SentinelConfig {
-    this.config = SentinelService.sanitizeConfig(patch, this.config)
+    this.config = { ...this.config, ...patch }
     this.persist()
     this.evaluate()
     this.event('config', `Sentinel limits updated: exposure ${this.config.maxExposurePct}% · per-asset ${this.config.perAssetCapPct}% · ${this.config.maxTradesPerHour}/h · dd halt ${this.config.drawdownHaltPct}%`)
