@@ -30,6 +30,7 @@ import { fitShockPressure, SHOCK_RATIO_THRESHOLD, PRESSURE_LOOKBACK, SHOCKPRESSU
 import { predictNextCandle, ORACLE_EVAL_WINDOW, ORACLE_MIN_CANDLES, type NextCandlePrediction } from '../analytics/nextcandle'
 import { tempoConviction, tempoDecide, tempoWindow, TEMPO_WINDOW_BARS, TEMPO_HISTORY_WINDOWS, TEMPO_FLOOR, type TempoDecision } from '../analytics/tempo'
 import { combineAccute, accuteSummary } from '../analytics/accute'
+import { trendPullbackSeries, rangeZoneSeries } from '../analytics/structure'
 
 /** Memoizes Oracle-fusion reads (shared by the 'oracle-fusion' and 'tempo'
  * strategies below) by (asset, tf, candle open time) - a bar's own
@@ -2098,6 +2099,34 @@ export const STRATEGIES: StrategyDef[] = [
         oracle: { direction: oracleDir, label: oracleLabel },
       })
       if (result.direction === 'none') return { direction: 'none', score: 0, notes: accuteSummary(result) }
+
+      // same two extra gates the LIVE Accute engine applies on top of the
+      // 3-leg agreement (plugins/accute.ts's zoneRead()/renkoRead()). The
+      // zone read is deliberately sparse (trendPullbackSeries/
+      // rangeZoneSeries are both non-zero well under 5% of bars on real
+      // data - they only fire on a confirmed swing pullback or a genuine
+      // range), so it only BLOCKS a direction it actively disagrees with;
+      // 'no recognized zone right now' passes through neutral, same
+      // "thin record is no record" rule as everywhere else in this stack.
+      // Requiring an ACTIVE zone match on every bar (an earlier version of
+      // this gate) effectively vetoed the signal almost always - that's
+      // what made this strategy's backtest numbers go quiet.
+      const trend = trendPullbackSeries(candles)
+      const tVal = trend[trend.length - 1] ?? 0
+      const range = rangeZoneSeries(candles)
+      const rVal = range[range.length - 1] ?? 0
+      const zoneSide: 'buy' | 'sell' | 'none' = tVal !== 0 ? (tVal > 0 ? 'buy' : 'sell') : rVal !== 0 ? (rVal > 0 ? 'buy' : 'sell') : 'none'
+      const zoneBlocks = result.direction === 'call' ? zoneSide === 'sell' : zoneSide === 'buy'
+      if (zoneBlocks) {
+        return { direction: 'none', score: 0, notes: `zone gate: ${result.direction.toUpperCase()} agreement found, but price reads the opposite buy/sell zone - standing aside` }
+      }
+
+      const renko = renkoBricks(candles)
+      const renkoBlocks = result.direction === 'call' ? renko.trend !== 'up' : renko.trend !== 'down'
+      if (renkoBlocks) {
+        return { direction: 'none', score: 0, notes: `renko gate: ${result.direction.toUpperCase()} agreement found, but Renko trend is ${renko.trend} - standing aside` }
+      }
+
       const conf = pred?.confidence ?? 60
       return {
         direction: result.direction,

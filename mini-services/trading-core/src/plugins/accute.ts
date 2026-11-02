@@ -53,11 +53,15 @@
 // (a ranging market's own channel - positive near the floor "buy zone",
 // negative near the ceiling "sell zone"). The two are mutually exclusive
 // by design (a market in one structure doesn't qualify for the other), so
-// whichever is non-zero at the live bar IS the zone read. A CALL is only
-// let through while that read is on the buy side, a PUT only while it's
-// on the sell side; everything else (no structure at all, or the read
-// disagreeing with the 3-leg direction) is WAITING - same "an extra gate,
-// not a 4th vote" shape as the adaptive confidence gate above.
+// whichever is non-zero at the live bar IS the zone read. Both series are
+// deliberately sparse (non-zero well under 5% of bars on real data, by
+// design - they only fire on a confirmed swing pullback or a genuine
+// range), so the gate blocks a CALL only when the read ACTIVELY
+// disagrees (reads sell) and a PUT only when it actively reads buy; 'no
+// recognized zone right now' passes through neutral, same "thin record
+// is no record" cold-start rule the adaptive gate above uses - requiring
+// an ACTIVE zone match on every bar would effectively veto the signal
+// almost always.
 //
 // Renko-direction gate (renkoBricks() in analytics/renko.ts, the same
 // engine of record the Renko + Footprint panel/strategies already use):
@@ -460,15 +464,20 @@ export class AccuteService {
     })
 
     // support/resistance + buy-zone/sell-zone gate (module header): a CALL
-    // only passes while price actually reads as a buy-zone right now
-    // (support pullback or range floor), a PUT only while it reads as a
-    // sell-zone (resistance pullback or range ceiling). No structure at
-    // all, or the zone disagreeing with the 3-leg direction, is WAITING.
+    // is blocked only while the zone read ACTIVELY disagrees (reads sell),
+    // a PUT only while it actively reads buy. 'none' (no recognized
+    // structure at this bar - trendPullbackSeries/rangeZoneSeries are both
+    // deliberately sparse, non-zero well under 5% of bars on real data) is
+    // treated as neutral and passes through, same "thin record is no
+    // record" cold-start rule the rest of this stack's gates use -
+    // requiring an ACTIVE zone match on every bar (the original version of
+    // this gate) effectively vetoed the signal almost always, which is
+    // what made both the live board and the backtest go quiet.
     const zone = zoneRead(candles)
     const zoneBlocks = rawResult.direction === 'call'
-      ? zone.side !== 'buy'
+      ? zone.side === 'sell'
       : rawResult.direction === 'put'
-        ? zone.side !== 'sell'
+        ? zone.side === 'buy'
         : false
 
     // renko-direction gate (module header): a CALL only clears while the
