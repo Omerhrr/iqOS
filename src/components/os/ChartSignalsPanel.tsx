@@ -162,7 +162,11 @@ function dirChip(direction: 'call' | 'put') {
 }
 
 function StrengthBar({ s }: { s: ChartSignal }) {
-  const pos = s.direction === 'call'
+  // colored/scored by the committee's own RAW read (rawDirection/score/
+  // agree/total) - this bar + its title describe "how much do the engines
+  // themselves agree", independent of the fade applied to the suggested
+  // trade below it (see dirChip's faded-badge).
+  const pos = s.rawDirection === 'call'
   return (
     <div className="h-1 w-full overflow-hidden rounded bg-[#101828]" title={`net score ${s.score} (${s.agree}/${s.total} independent methodologies agree - renko/range/P&F count as one family)`}>
       <div className={`h-full ${pos ? 'bg-emerald-500' : 'bg-rose-500'}`} style={{ width: `${Math.max(6, s.strength)}%` }} />
@@ -175,7 +179,10 @@ function EngineChips({ s }: { s: ChartSignal }) {
     <div className="flex flex-wrap gap-1">
       {s.votes.map((v) => {
         const dim = v.dir === 0
-        const agree = v.dir === (s.direction === 'call' ? 1 : -1)
+        // keyed to rawDirection (the committee's own read), same as
+        // StrengthBar above - these chips answer "did this engine agree
+        // with the committee", not "does it agree with the faded trade".
+        const agree = v.dir === (s.rawDirection === 'call' ? 1 : -1)
         return (
           <span
             key={v.engine}
@@ -225,6 +232,14 @@ function SignalCard({ s, now, tab, onSelectAsset, onTake }: { s: ChartSignal; no
     >
       <div className="flex flex-wrap items-center gap-1.5">
         {dirChip(s.direction)}
+        {s.rawDirection !== s.direction && (
+          <span
+            className="rounded border border-fuchsia-500/40 bg-fuchsia-500/10 px-1 py-px font-mono text-[8px] font-bold uppercase tracking-wide text-fuchsia-300"
+            title={`faded: the committee itself reads ${s.rawDirection.toUpperCase()} (${s.agree}/${s.total} engines, strength ${s.strength}) - the suggested trade above is the OPPOSITE side. Measured against 788 real resolved outcomes, taking the committee's own side wins only 41.8% of the time on its own suggested expiry (worse the more engines agree); fading it wins 58.2%.`}
+          >
+            faded
+          </span>
+        )}
         <span className="font-mono text-[11px] font-bold text-[#dbe4f0]">{s.asset}</span>
         {s.otc && (
           <span className="rounded border border-amber-500/40 bg-amber-500/10 px-1 py-px font-mono text-[8px] font-bold uppercase text-amber-400">otc</span>

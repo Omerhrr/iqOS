@@ -62,8 +62,18 @@ export interface ChartSignal {
   category: string
   otc: boolean
   price: number
+  /** The SUGGESTED trade direction - the opposite of the committee's own
+   * read (see FADE_COMMITTEE below) once the committee clears the
+   * agree/strength floor. This is what the panel should trade off and what
+   * cfd's levels are built for. */
   direction: 'call' | 'put'
-  /** -100..100 signed net conviction (call positive). */
+  /** The committee's own raw read before the fade - what votes/agree/total
+   * describe ("5/5 engines agree CALL"). Kept so the panel can still show
+   * the underlying read honestly even though `direction` now suggests the
+   * opposite trade. Equal to `direction` when FADE_COMMITTEE is off. */
+  rawDirection: 'call' | 'put'
+  /** -100..100 signed net conviction, in the RAW (pre-fade) committee's own
+   * terms (call positive) - unflipped, matching rawDirection/votes/agree. */
   score: number
   /** 0..100, |score|. */
   strength: number
@@ -499,6 +509,24 @@ export function cfdLevelsFor(candles: Candle[], direction: 'call' | 'put', pipDi
   return { entry: entryR, sl, tp, slDist: Math.abs(entryR - sl), tpDist: Math.abs(tp - entryR), rr: Math.round(rr * 100) / 100 }
 }
 
+/** FADE: the chart-engine committee's own suggested direction, measured
+ * against 788 real resolved binary-option outcomes on data/
+ * chartsignals_outcomes.json (live production ledger, checked 2026-11-02),
+ * wins only 41.8% of the time as-is over its own suggested expiry - and
+ * gets WORSE the more the engines agree (agree=2: 55.3% win, agree=5: only
+ * 37.5% win - full committee consensus is the single worst bucket, a
+ * classic short-horizon overextension/exhaustion signature, not a
+ * confidence signal). Taking the OPPOSITE side instead wins 58.2% of the
+ * time on that same real ledger. This is specific to this scanner's own
+ * suggested-expiry horizon (60-300s, path-dependent TP/SL) - the Next-
+ * Candle Oracle's separate 'Chart engines' driver (analytics/nextcandle.ts)
+ * calls the same engineVotes/combineVotes primitives but scores against
+ * the literal next 1-candle close, where the real resolved ledger shows a
+ * flat ~50% (no inversion) - so the fade below is applied ONLY here, never
+ * inside engineVotes/combineVotes/familyVotes themselves, which the Oracle
+ * (and the Lab's per-engine mining) still depend on reading true/unflipped. */
+const FADE_COMMITTEE = true
+
 /** Full per-asset signal build. Returns null when the chart engines do not
  * qualify (thin history, no confluence) - the caller honestly drops it.
  * tfSec scales the read's wall-clock semantics to the scanned timeframe:
@@ -528,20 +556,27 @@ export function buildChartSignal(
     Math.max(Math.round((expirySecFor(votes, combined.strength) * tfSec) / 60), expiryFloor),
     1800,
   )
+  // FADE_COMMITTEE: see the doc above this function - direction is the
+  // SUGGESTED trade (opposite of the committee), rawDirection/score/votes/
+  // agree stay in the committee's own true terms so the panel can still
+  // show "5/5 agree CALL" honestly next to the (now PUT) suggested trade.
+  const rawDirection = combined.direction
+  const direction: 'call' | 'put' = FADE_COMMITTEE ? (rawDirection === 'call' ? 'put' : 'call') : rawDirection
   return {
     asset: info.ticker,
     name: info.name,
     category: info.category,
     otc: info.otc,
     price: last.close,
-    direction: combined.direction,
+    direction,
+    rawDirection,
     score: combined.score,
     strength: combined.strength,
     agree: combined.agree,
     total: combined.total,
     expirySec,
     votes,
-    cfd: cfdLevelsFor(candles, combined.direction, info.pip),
+    cfd: cfdLevelsFor(candles, direction, info.pip),
     ts: now,
     validUntil: barEndMs + (opts.ttlSec ?? 150) * 1000,
     dataSource: `chart-engines:${info.otc ? 'renko,pnf,range,tick,otcfootprint,heikin,candle' : 'renko,pnf,range,tick,footprint,heikin,candle'}`,

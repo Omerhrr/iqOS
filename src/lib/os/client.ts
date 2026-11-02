@@ -392,7 +392,15 @@ export interface ChartSignal {
   category: string
   otc: boolean
   price: number
+  /** The SUGGESTED trade - the committee's own read FADED (see
+   * rawDirection), since the real resolved ledger showed the raw
+   * committee read loses on its own suggested-expiry horizon and gets
+   * worse the more engines agree. This is what cfd's levels are built for. */
   direction: 'call' | 'put'
+  /** The committee's own raw read before the fade - what votes/score/
+   * agree/total describe. Equal to `direction` only if the backend's fade
+   * is ever turned off. */
+  rawDirection: 'call' | 'put'
   score: number
   strength: number
   agree: number
