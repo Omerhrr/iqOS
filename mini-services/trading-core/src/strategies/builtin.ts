@@ -27,7 +27,8 @@ import { computeVolArb, VOLARB_DEFAULT_WINDOW } from '../analytics/volarb'
 import { fitTriangulation, TRIANGULATION_WINDOW, TRIANGULATION_MIN_WINDOW, TRIANGULATION_Z_ENTRY } from '../analytics/triangulation'
 import { fitAdxPatternBias, ADX_TREND_THRESHOLD, COMPOSITE_QUALIFY } from '../analytics/adxpatternbias'
 import { fitShockPressure, SHOCK_RATIO_THRESHOLD, PRESSURE_LOOKBACK, SHOCKPRESSURE_COMPOSITE_QUALIFY } from '../analytics/shockpressure'
-import { predictNextCandle, applyCalibrationDiscount, oracleCalibrationFor, ORACLE_MIN_CANDLES, ORACLE_EVAL_WINDOW } from '../analytics/nextcandle'
+import { predictNextCandle, ORACLE_EVAL_WINDOW, ORACLE_MIN_CANDLES } from '../analytics/nextcandle'
+import { tempoConviction, tempoDecide, tempoWindow, TEMPO_WINDOW_BARS, TEMPO_HISTORY_WINDOWS, TEMPO_FLOOR } from '../analytics/tempo'
 
 const last = (arr: number[]): number => {
   for (let i = arr.length - 1; i >= 0; i--) if (Number.isFinite(arr[i])) return arr[i]
@@ -1918,6 +1919,86 @@ export const STRATEGIES: StrategyDef[] = [
     },
   },
   {
+    id: 'tempo',
+    name: 'Tempo (Patience Engine)',
+    description:
+      "The patience engine (analytics/tempo.ts), as a backtest-able strategy. Live Tempo treats every 10-bar window as a hunting license for exactly ONE shot - the bar whose fused Next-Candle Oracle conviction is surest - firing only when that conviction clears a patience bar that starts near the pair's own typical window-best (hard to clear early in the window) and decays toward an absolute floor as the window runs out (easy to clear on the last bar). This entry reconstructs that same rule faithfully: each bar, it rebuilds the pair's own recent window-max history and checks whether an EARLIER bar in the current window already fired, by replaying the stopping rule across the trailing lookback span - the same quantities the live engine accumulates for free from watching the real candle stream, since a backtest strategy call gets no memory between bars. Faithful but CPU-heavy: every bar re-runs the full 7-driver Oracle fusion (markov/monte-carlo/kalman/confluence/chart-engines/patterns/bar-physics) up to ~130 times instead of once, so this strategy runs noticeably slower than the rest of the catalog - expect it on single-asset backtests, not large optimizer sweeps. Known simplification: the live engine's pair-accuracy dampening and recent-similar-loss penalty depend on that pair's OWN resolved trade ledger building up over real time, which a single backtest pass can't replay into itself bar-by-bar - this entry evaluates the stopping rule alone, without those two extra live-only dampeners.",
+    params: [{ key: 'floor', label: 'Absolute conviction floor (fallback)', type: 'number', min: 3, max: 20, default: TEMPO_FLOOR }],
+    evaluate: (candles, p, hints) => {
+      const oracleAsset = hints?.asset ?? 'backtest'
+      const oracleTf = hints?.tf ?? 'sim'
+      const lookbackBars = TEMPO_WINDOW_BARS * (TEMPO_HISTORY_WINDOWS + 1) // ~130 bars - enough to see TEMPO_HISTORY_WINDOWS full past windows
+      const n = candles.length
+      if (n < ORACLE_MIN_CANDLES + lookbackBars) {
+        return { direction: 'none', score: 0, notes: 'warming up - needs oracle history plus a patience-history lookback window' }
+      }
+      const floor = num(p, 'floor', TEMPO_FLOOR)
+      const last = candles[n - 1]
+      const prev = candles[n - 2]
+      const tfSec = Math.max(1, Math.round(last.time - prev.time) || 60)
+      const nowWindow = tempoWindow(last.time * 1000, tfSec)
+
+      // convictionAt(i): the Oracle-fusion conviction using only candles up
+      // through index i, bounded to the same ORACLE_EVAL_WINDOW tail the
+      // live plugin uses - keeps every one of these ~130 lookback calls at
+      // a constant cost no matter how deep the backtest's own candle feed
+      // runs.
+      const convictionAt = (i: number): number => {
+        const evalSlice = candles.slice(Math.max(0, i + 1 - ORACLE_EVAL_WINDOW), i + 1)
+        const pred = predictNextCandle(evalSlice, { asset: oracleAsset, tf: oracleTf, mode: 'sim' })
+        if (!pred) return 0
+        return tempoConviction(pred.confidence, pred.pUp)
+      }
+
+      // Rebuild the pair's own recent window-max history: re-evaluate
+      // conviction at every bar in the trailing lookback span, group by
+      // window index, keep each PAST window's own max (the current,
+      // still-forming window is excluded - live Tempo only archives a
+      // window's best once that window has actually rolled over).
+      const lookbackStart = Math.max(0, n - 1 - lookbackBars)
+      const byWindow = new Map<number, number>()
+      for (let i = lookbackStart; i < n - 1; i++) {
+        const w = tempoWindow(candles[i].time * 1000, tfSec)
+        if (w.windowIdx === nowWindow.windowIdx) continue
+        const conv = convictionAt(i)
+        if (conv > (byWindow.get(w.windowIdx) ?? 0)) byWindow.set(w.windowIdx, conv)
+      }
+      const history = [...byWindow.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v)
+
+      // Has an EARLIER bar in THIS window already fired? Tempo spends its
+      // license on the first qualifying bar of a window - replay the
+      // stopping rule across this window's own earlier bars (same
+      // history, their own barsRemaining) to find out, same reasoning as
+      // the live plugin's `fired` flag just reconstructed per-call instead
+      // of held in memory.
+      let windowStartIdx = Math.max(0, n - 1 - TEMPO_WINDOW_BARS)
+      for (let i = n - 1; i >= windowStartIdx; i--) {
+        if (tempoWindow(candles[i].time * 1000, tfSec).windowIdx !== nowWindow.windowIdx) {
+          windowStartIdx = i + 1
+          break
+        }
+      }
+      for (let i = windowStartIdx; i < n - 1; i++) {
+        const wAtI = tempoWindow(candles[i].time * 1000, tfSec)
+        const decAtI = tempoDecide({ conviction: convictionAt(i), barsRemaining: wAtI.barsRemaining, windowMaxHistory: history, floor: floor !== TEMPO_FLOOR ? floor : undefined })
+        if (decAtI.kind === 'fire') {
+          return { direction: 'none', score: 0, notes: `license already spent this window - an earlier bar (${i - windowStartIdx + 1}/${TEMPO_WINDOW_BARS}) already cleared the stopping rule` }
+        }
+      }
+
+      const pred = predictNextCandle(candles.slice(Math.max(0, n - ORACLE_EVAL_WINDOW), n), { asset: oracleAsset, tf: oracleTf, mode: 'sim' })
+      if (!pred || pred.direction === 'none') return { direction: 'none', score: 0, notes: 'oracle has no directional lean on this bar' }
+      const conviction = tempoConviction(pred.confidence, pred.pUp)
+      const dec = tempoDecide({ conviction, barsRemaining: nowWindow.barsRemaining, windowMaxHistory: history, floor: floor !== TEMPO_FLOOR ? floor : undefined })
+      if (dec.kind !== 'fire') return { direction: 'none', score: 0, notes: dec.reason }
+      return {
+        direction: pred.direction,
+        score: clamp(40 + conviction * 2, 40, 95),
+        notes: `bar ${nowWindow.barIndex + 1}/${TEMPO_WINDOW_BARS} of this pair's hunting window - ${dec.reason}`,
+      }
+    },
+  },
+  {
     id: 'poc-triple-confirm',
     name: 'POC + Candle 3/3 + HA 3/3 (Triple Confirm)',
     description:
@@ -2016,91 +2097,6 @@ export const STRATEGIES: StrategyDef[] = [
     },
   },
 ]
-
-// ---------------------------------------------------------------------------
-// Next-Candle Oracle Fusion - the research battery's "confluence beats single
-// signals" law as a tradeable strategy. The RAW fused read (7-model P(up)
-// fusion, regime-adaptive weights) is memoized per (asset, tf, last bar,
-// window shape, model-shape params): backtests + evalWithEdge's held-walk
-// re-evaluate the same bar many times, and each oracle eval costs a full
-// fusion. The memo caches ONLY the raw read; the confidence gates (and the
-// honesty-loop discount, which moves as the ledger resolves) are applied
-// fresh on every eval, so gate params stay sweepable at near-zero cost.
-interface OracleRawRead {
-  pUp: number
-  rawConfidence: number
-  regime: string
-  drivers: number
-}
-const oracleMemo = new Map<string, OracleRawRead>()
-
-const ORACLE_FUSION: StrategyDef = {
-  id: 'oracle-fusion',
-  name: 'Next-Candle Oracle Fusion',
-  description:
-    'Trades the kernel\'s fused next-candle forecast: 7 directional models (Markov, Monte Carlo, Kalman/OU, 14-factor confluence, chart committee, candle patterns, bar physics) fused in log-odds space with regime-adaptive weights. The gates ARE the params - min calibrated confidence + min P(up) edge - so the autopilot\'s own minScore applies on top. Live evals inherit the oracle panel\'s honesty-loop discount.',
-  params: [
-    { key: 'minConfidence', label: 'Min confidence %', type: 'number', min: 0, max: 95, default: 55 },
-    { key: 'minEdge', label: 'Min P(up) edge (pp)', type: 'number', min: 0, max: 40, default: 5 },
-    { key: 'mcSims', label: 'Monte Carlo paths', type: 'number', min: 100, max: 2000, default: 400 },
-    { key: 'committee', label: 'Chart committee (1 on / 0 off)', type: 'number', min: 0, max: 1, default: 1 },
-    { key: 'useCalibration', label: 'Honesty-loop discount (1 on / 0 off)', type: 'number', min: 0, max: 1, default: 1 },
-  ],
-  evaluate: (candles, p, hints) => {
-    if (candles.length < ORACLE_MIN_CANDLES) {
-      return { direction: 'none', score: 0, notes: `oracle warming up: ${candles.length}/${ORACLE_MIN_CANDLES} closed bars` }
-    }
-    const asset = hints?.asset ?? 'unknown'
-    const tf = hints?.tf ?? ''
-    const mcSims = Math.round(num(p, 'mcSims', 400))
-    const committee = num(p, 'committee', 1) >= 0.5
-    const useCal = num(p, 'useCalibration', 1) >= 0.5
-    // constant-cost window: every model inside reads <=300 bars, so the
-    // 520-bar tail is bit-identical input to a 1500-bar feed (see
-    // ORACLE_EVAL_WINDOW in analytics/nextcandle.ts)
-    const window = candles.length > ORACLE_EVAL_WINDOW ? candles.slice(-ORACLE_EVAL_WINDOW) : candles
-    const lastT = window[window.length - 1].time
-    // the window's CONTENT is determined by its last bar's open time unless
-    // the slice is shorter than the cap (backtest warmup + evalWithEdge's
-    // one-bar-dropped prev passes) - the length disambiguates those
-    const key = `${asset}|${tf}|${lastT}|${window.length < ORACLE_EVAL_WINDOW ? window.length : 'full'}|${mcSims}|${committee ? 1 : 0}`
-    let raw = oracleMemo.get(key)
-    if (!raw) {
-      const pred = predictNextCandle(window, {
-        asset,
-        tf: tf || '1m',
-        mode: 'sim',
-        mcSims,
-        includeCommittee: committee,
-        calibration: null, // discount applied fresh below, never baked into the memo
-      })
-      if (!pred) return { direction: 'none', score: 0, notes: 'oracle: not enough working models on this history' }
-      raw = { pUp: pred.pUp, rawConfidence: pred.rawConfidence, regime: pred.regime, drivers: pred.driversActive }
-      if (oracleMemo.size > 30000) oracleMemo.clear()
-      oracleMemo.set(key, raw)
-    }
-    const minConf = num(p, 'minConfidence', 55)
-    const minEdge = num(p, 'minEdge', 5)
-    const edgePp = (raw.pUp - 0.5) * 100
-    const lean = raw.pUp >= 0.5 ? 'call' : 'put'
-    const conf = applyCalibrationDiscount(raw.rawConfidence, useCal ? oracleCalibrationFor(asset, tf) : null)
-    if (!Number.isFinite(edgePp) || raw.pUp <= 0 || raw.pUp >= 1) {
-      return { direction: 'none', score: 0, notes: 'oracle read degenerate - standing aside' }
-    }
-    if (Math.abs(edgePp) < minEdge) {
-      return { direction: 'none', score: 0, notes: `oracle ${lean} lean too thin: edge ${edgePp.toFixed(1)}pp < ${minEdge}pp (conf ${conf.toFixed(0)}%, ${raw.regime}, ${raw.drivers} models)` }
-    }
-    if (conf < minConf) {
-      return { direction: 'none', score: 0, notes: `oracle ${lean} conf ${conf.toFixed(0)}% < ${minConf}% gate (edge ${edgePp.toFixed(1)}pp, ${raw.regime})` }
-    }
-    return {
-      direction: lean,
-      score: Math.round(clamp(conf, 40, 95)),
-      notes: `oracle ${lean}: P(up) ${(raw.pUp * 100).toFixed(1)}%, conf ${conf.toFixed(0)}%, ${raw.regime}, ${raw.drivers} models`,
-    }
-  },
-}
-STRATEGIES.push(ORACLE_FUSION)
 
 export const getStrategy = (id: string): StrategyDef | undefined => STRATEGIES.find((s) => s.id === id)
 
