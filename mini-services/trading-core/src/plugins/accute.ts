@@ -39,6 +39,25 @@
 // a bucket has history of its own, the only hand-set rule left is a flat
 // confidence bump during a VOLATILE regime read - the seed the learning
 // above is free to override once it has evidence either way.
+//
+// Support/resistance + buy-zone/sell-zone awareness (zoneRead()): the 3
+// legs above answer "does everything agree on a direction", but not
+// "is price actually somewhere sane to take that direction from" - a CALL
+// fired in the dead middle of a range, or chasing already-extended price
+// away from any structure, is a worse CALL than the identical 3-way
+// agreement fired right off support. Rather than invent new math for
+// this, it reuses analytics/structure.ts's two already-existing, pure,
+// non-repainting series: trendPullbackSeries (a trending market's own
+// swing structure - positive near a confirmed higher-low "support",
+// negative near a confirmed lower-high "resistance") and rangeZoneSeries
+// (a ranging market's own channel - positive near the floor "buy zone",
+// negative near the ceiling "sell zone"). The two are mutually exclusive
+// by design (a market in one structure doesn't qualify for the other), so
+// whichever is non-zero at the live bar IS the zone read. A CALL is only
+// let through while that read is on the buy side, a PUT only while it's
+// on the sell side; everything else (no structure at all, or the read
+// disagreeing with the 3-leg direction) is WAITING - same "an extra gate,
+// not a 4th vote" shape as the adaptive confidence gate above.
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -48,6 +67,7 @@ import { fitAdxPatternBias, PATTERN_BIAS_LOOKBACK, higherTimeframe } from '../an
 import { combineAccute, accuteSummary, type AccuteDirection, type AccuteResult } from '../analytics/accute'
 import { weightedMeanBy } from '../analytics/recencystats'
 import { classifySession, type Session } from '../analytics/session'
+import { trendPullbackSeries, rangeZoneSeries } from '../analytics/structure'
 import type { MarketDataService } from './market-data'
 import type { NextCandleService, GlobalScanRow } from './nextcandle'
 import type { TempoService, TempoRow } from './tempo'
@@ -98,6 +118,46 @@ export interface AccuteAdaptiveAdjustment {
   note: string
 }
 
+/** Support/resistance + buy-zone/sell-zone read, see module header. `source`
+ * says which structure detector actually produced it ('none' = price isn't
+ * currently sitting in any recognized zone at all). */
+export interface AccuteZoneRead {
+  source: 'trend' | 'range' | 'none'
+  side: 'buy' | 'sell' | 'none'
+  strength: number
+  label: string
+}
+
+function zoneRead(candles: Candle[]): AccuteZoneRead {
+  const trend = trendPullbackSeries(candles)
+  const tVal = trend[trend.length - 1] ?? 0
+  if (tVal !== 0) {
+    const side: 'buy' | 'sell' = tVal > 0 ? 'buy' : 'sell'
+    return {
+      source: 'trend',
+      side,
+      strength: Math.abs(tVal),
+      label: side === 'buy'
+        ? `trending structure - price pulled back to a confirmed support swing (${Math.abs(tVal).toFixed(2)} ATR margin)`
+        : `trending structure - price pulled back to a confirmed resistance swing (${Math.abs(tVal).toFixed(2)} ATR margin)`,
+    }
+  }
+  const range = rangeZoneSeries(candles)
+  const rVal = range[range.length - 1] ?? 0
+  if (rVal !== 0) {
+    const side: 'buy' | 'sell' = rVal > 0 ? 'buy' : 'sell'
+    return {
+      source: 'range',
+      side,
+      strength: Math.abs(rVal),
+      label: side === 'buy'
+        ? `ranging channel - price is in the buy zone near the channel floor (${Math.abs(rVal).toFixed(2)} ATR margin)`
+        : `ranging channel - price is in the sell zone near the channel ceiling (${Math.abs(rVal).toFixed(2)} ATR margin)`,
+    }
+  }
+  return { source: 'none', side: 'none', strength: 0, label: 'price is not currently in a recognized support/resistance or buy/sell zone' }
+}
+
 interface PendingAccuteSignal {
   asset: string
   tf: string
@@ -140,6 +200,7 @@ export interface AccuteSignalResponse {
   computedTs: number
   calibration: { n: number; hitRate: number } | null
   adaptive: AccuteAdaptiveAdjustment
+  zone: AccuteZoneRead
 }
 
 export interface AccuteGlobalResult {
@@ -189,6 +250,7 @@ export class AccuteService {
         bucket: 'n/a', session: classifySession(Math.floor(now / 1000), asset), regime: 'MIXED',
         n: 0, hitRate: null, minConfidenceUsed: ACCUTE_DEFAULT_MIN_ORACLE_CONFIDENCE, overridden: false, note,
       },
+      zone: { source: 'none', side: 'none', strength: 0, label: note },
     }
   }
 
@@ -365,10 +427,24 @@ export class AccuteService {
       tempo: { direction: tempoDir, label: tempoLabel },
       oracle: { direction: oracleDir, label: oracleLabel },
     })
+
+    // support/resistance + buy-zone/sell-zone gate (module header): a CALL
+    // only passes while price actually reads as a buy-zone right now
+    // (support pullback or range floor), a PUT only while it reads as a
+    // sell-zone (resistance pullback or range ceiling). No structure at
+    // all, or the zone disagreeing with the 3-leg direction, is WAITING.
+    const zone = zoneRead(candles)
+    const zoneBlocks = rawResult.direction === 'call'
+      ? zone.side !== 'buy'
+      : rawResult.direction === 'put'
+        ? zone.side !== 'sell'
+        : false
+
     // the adaptive override: a bucket that has already proven itself
     // wrong often enough stands aside outright, no matter what the 3 legs
-    // say this bar - see adaptiveAdjustment()'s doc.
-    const result: AccuteResult = adaptive.overridden
+    // say this bar - see adaptiveAdjustment()'s doc. Either gate alone is
+    // enough to force WAITING.
+    const result: AccuteResult = adaptive.overridden || zoneBlocks
       ? { ...rawResult, direction: 'none', waiting: true }
       : rawResult
 
@@ -386,7 +462,9 @@ export class AccuteService {
 
     const summary = adaptive.overridden
       ? `adaptive gate: ${adaptive.note}`
-      : accuteSummary(rawResult)
+      : zoneBlocks
+        ? `zone gate: ${rawResult.direction.toUpperCase()} agreement found, but ${zone.label} - standing aside`
+        : accuteSummary(rawResult)
 
     const row: AccuteSignalResponse = {
       asset,
@@ -404,6 +482,7 @@ export class AccuteService {
       computedTs: now,
       calibration: this.calibrationFor(asset, tf),
       adaptive,
+      zone,
     }
     this.scanRows.set(`${tf}:${asset}`, row)
     return row

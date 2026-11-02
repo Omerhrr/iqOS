@@ -127,6 +127,17 @@ export default function AccutePanel({ asset, tf, closedTick, onClose }: AccutePa
             {LEG_ORDER.map((name) => legCard(name, signal.legs[name]))}
           </div>
 
+          {/* support/resistance + buy-zone/sell-zone gate */}
+          <div className={`rounded-lg border p-2 ${signal.zone.side === 'none' ? 'border-[#1c2739] bg-[#0b111c]' : signal.zone.side === 'buy' ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-rose-500/30 bg-rose-500/5'}`}>
+            <div className="flex items-center justify-between">
+              <span className="font-mono text-[8.5px] uppercase tracking-wider text-[#7c8aa5]">S/R · zone ({signal.zone.source === 'none' ? 'no structure' : signal.zone.source})</span>
+              <span className={`rounded border px-1.5 py-px font-mono text-[8px] font-bold uppercase tracking-wider ${signal.zone.side === 'none' ? 'border-[#3d4d66] text-[#7c8aa5]' : signal.zone.side === 'buy' ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300' : 'border-rose-500/50 bg-rose-500/15 text-rose-300'}`}>
+                {signal.zone.side === 'none' ? 'NO ZONE' : signal.zone.side === 'buy' ? 'BUY ZONE' : 'SELL ZONE'}
+              </span>
+            </div>
+            <p className="mt-1 font-mono text-[8.5px] leading-relaxed text-[#4b5a72]">{signal.zone.label}</p>
+          </div>
+
           {/* adaptive gate: this pair's own session+regime bucket */}
           <div className={`rounded-lg border p-2 ${signal.adaptive.overridden ? 'border-rose-500/40 bg-rose-500/5' : 'border-[#1c2739] bg-[#0b111c]'}`}>
             <div className="flex items-center justify-between">
@@ -180,7 +191,7 @@ export default function AccutePanel({ asset, tf, closedTick, onClose }: AccutePa
           )}
 
           <p className="shrink-0 font-mono text-[8px] leading-relaxed text-[#3d4d66]">
-            Accute invents no new math - it only fires when ADX/DI + Pattern Bias, Tempo's one-shot stopping rule (actually firing, not just leaning), and the Next-Candle Oracle fusion all agree on direction right now. Any one leg sitting idle, or any disagreement, is WAITING. On top of that, the confidence bar itself adapts per pair, time-of-day session, and macro regime (a volatility spike bumps it up by default) from Accute's own resolved record - a combo that has proven itself wrong enough times gets its floor raised, or stands aside outright even on full agreement. Expect this to trade rarely - that is the point.
+            Accute invents no new math - it only fires when ADX/DI + Pattern Bias, Tempo's one-shot stopping rule (actually firing, not just leaning), and the Next-Candle Oracle fusion all agree on direction right now. Any one leg sitting idle, or any disagreement, is WAITING. A CALL also needs price sitting in an actual buy zone (support pullback or range floor) and a PUT in a sell zone (resistance pullback or range ceiling) - 3-way agreement in the middle of nowhere is still WAITING. On top of that, the confidence bar itself adapts per pair, time-of-day session, and macro regime (a volatility spike bumps it up by default) from Accute's own resolved record - a combo that has proven itself wrong enough times gets its floor raised, or stands aside outright even on full agreement. Expect this to trade rarely - that is the point.
           </p>
         </>
       )}

@@ -1821,6 +1821,19 @@ export interface AccuteAdaptive {
   note: string
 }
 
+/** Support/resistance + buy-zone/sell-zone read (analytics/structure.ts's
+ * trendPullbackSeries / rangeZoneSeries): 'trend' = a trending structure's
+ * own support/resistance pullback, 'range' = a ranging channel's own buy/
+ * sell zone, 'none' = price isn't currently in a recognized zone at all.
+ * A CALL/PUT only clears this gate while `side` matches ('buy' for CALL,
+ * 'sell' for PUT) - see plugins/accute.ts's zoneRead(). */
+export interface AccuteZone {
+  source: 'trend' | 'range' | 'none'
+  side: 'buy' | 'sell' | 'none'
+  strength: number
+  label: string
+}
+
 export interface AccuteSignal {
   asset: string
   tf: string
@@ -1837,6 +1850,7 @@ export interface AccuteSignal {
   computedTs: number
   calibration: { n: number; hitRate: number } | null
   adaptive: AccuteAdaptive
+  zone: AccuteZone
 }
 
 export async function getAccute(asset: string, tf: Timeframe, opts?: { minConfidence?: number }): Promise<{ ok: boolean; error?: string; signal?: AccuteSignal }> {

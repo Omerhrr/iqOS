@@ -218,6 +218,14 @@ export default function AccuteGlobalPanel({ tf, closedTick, onPickAsset, onOpenA
             <span className="w-24 shrink-0 truncate font-mono text-[10px] font-bold text-[#dbe4f0] group-hover:text-violet-300">{r.asset}</span>
             {dirChip(r.direction)}
             {legDots(r.legs)}
+            {r.zone.side !== 'none' && (
+              <span
+                className={`shrink-0 rounded border px-1 py-px font-mono text-[7px] uppercase ${r.zone.side === 'buy' ? 'border-emerald-500/40 text-emerald-300' : 'border-rose-500/40 text-rose-300'}`}
+                title={r.zone.label}
+              >
+                {r.zone.side === 'buy' ? 'buy zone' : 'sell zone'}
+              </span>
+            )}
             {r.adaptive.overridden && (
               <span className="shrink-0 rounded border border-rose-500/40 px-1 py-px font-mono text-[7px] uppercase text-rose-300" title={r.adaptive.note}>
                 gated
@@ -242,7 +250,7 @@ export default function AccuteGlobalPanel({ tf, closedTick, onPickAsset, onOpenA
       </div>
 
       <p className="shrink-0 font-mono text-[8px] leading-relaxed text-[#3d4d66]">
-        ADX/DI + Pattern, Tempo (actively firing), and Next-Candle Oracle - CALL/PUT only when all three agree right now, otherwise WAITING. The dots show each leg's own read (green=call, red=put, grey=flat). The confidence bar adapts per pair, session, and macro regime from Accute's own resolved record - a "gated" tag means that exact bucket has proven itself wrong often enough to stand aside regardless of agreement. Deliberately the rarest signal in the catalog.
+        ADX/DI + Pattern, Tempo (actively firing), and Next-Candle Oracle - CALL/PUT only when all three agree right now, otherwise WAITING. The dots show each leg's own read (green=call, red=put, grey=flat). A CALL also needs an actual buy zone (support/range floor) and a PUT a sell zone (resistance/range ceiling) - the buy/sell zone tag shows which. The confidence bar adapts per pair, session, and macro regime from Accute's own resolved record - a "gated" tag means that exact bucket has proven itself wrong often enough to stand aside regardless of agreement. Deliberately the rarest signal in the catalog.
       </p>
     </div>
   )
