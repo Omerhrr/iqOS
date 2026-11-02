@@ -58,6 +58,17 @@
 // on the sell side; everything else (no structure at all, or the read
 // disagreeing with the 3-leg direction) is WAITING - same "an extra gate,
 // not a 4th vote" shape as the adaptive confidence gate above.
+//
+// Renko-direction gate (renkoBricks() in analytics/renko.ts, the same
+// engine of record the Renko + Footprint panel/strategies already use):
+// a CALL only clears while the current Renko brick trend is 'up', a PUT
+// only while it's 'down' - 'none' (not enough history to have painted a
+// brick yet) blocks either direction, same as every other gate here. This
+// is the noise filter the other three legs don't have on their own:
+// bricks only form after price has actually moved a full ATR-scaled brick
+// size, so a Renko disagreement is a cheap, independent check that the
+// move Accute is about to call isn't just intrabar noise the 1-minute
+// candle-based legs are reading too eagerly.
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -68,6 +79,7 @@ import { combineAccute, accuteSummary, type AccuteDirection, type AccuteResult }
 import { weightedMeanBy } from '../analytics/recencystats'
 import { classifySession, type Session } from '../analytics/session'
 import { trendPullbackSeries, rangeZoneSeries } from '../analytics/structure'
+import { renkoBricks } from '../analytics/renko'
 import type { MarketDataService } from './market-data'
 import type { NextCandleService, GlobalScanRow } from './nextcandle'
 import type { TempoService, TempoRow } from './tempo'
@@ -158,6 +170,23 @@ function zoneRead(candles: Candle[]): AccuteZoneRead {
   return { source: 'none', side: 'none', strength: 0, label: 'price is not currently in a recognized support/resistance or buy/sell zone' }
 }
 
+/** Current Renko brick trend read, see module header. */
+export interface AccuteRenkoRead {
+  trend: 'up' | 'down' | 'none'
+  streak: number
+  brickSize: number
+  label: string
+}
+
+function renkoRead(candles: Candle[]): AccuteRenkoRead {
+  const r = renkoBricks(candles)
+  const label =
+    r.trend === 'none'
+      ? 'no Renko brick has painted yet on this history - warming up'
+      : `${r.streak} consecutive ${r.trend.toUpperCase()} brick${r.streak === 1 ? '' : 's'} (${r.brickRule})`
+  return { trend: r.trend, streak: r.streak, brickSize: r.brickSize, label }
+}
+
 interface PendingAccuteSignal {
   asset: string
   tf: string
@@ -201,6 +230,7 @@ export interface AccuteSignalResponse {
   calibration: { n: number; hitRate: number } | null
   adaptive: AccuteAdaptiveAdjustment
   zone: AccuteZoneRead
+  renko: AccuteRenkoRead
 }
 
 export interface AccuteGlobalResult {
@@ -251,6 +281,7 @@ export class AccuteService {
         n: 0, hitRate: null, minConfidenceUsed: ACCUTE_DEFAULT_MIN_ORACLE_CONFIDENCE, overridden: false, note,
       },
       zone: { source: 'none', side: 'none', strength: 0, label: note },
+      renko: { trend: 'none', streak: 0, brickSize: 0, label: note },
     }
   }
 
@@ -440,11 +471,20 @@ export class AccuteService {
         ? zone.side !== 'sell'
         : false
 
+    // renko-direction gate (module header): a CALL only clears while the
+    // current brick trend is 'up', a PUT only while it's 'down'.
+    const renko = renkoRead(candles)
+    const renkoBlocks = rawResult.direction === 'call'
+      ? renko.trend !== 'up'
+      : rawResult.direction === 'put'
+        ? renko.trend !== 'down'
+        : false
+
     // the adaptive override: a bucket that has already proven itself
     // wrong often enough stands aside outright, no matter what the 3 legs
-    // say this bar - see adaptiveAdjustment()'s doc. Either gate alone is
+    // say this bar - see adaptiveAdjustment()'s doc. Any gate alone is
     // enough to force WAITING.
-    const result: AccuteResult = adaptive.overridden || zoneBlocks
+    const result: AccuteResult = adaptive.overridden || zoneBlocks || renkoBlocks
       ? { ...rawResult, direction: 'none', waiting: true }
       : rawResult
 
@@ -464,7 +504,9 @@ export class AccuteService {
       ? `adaptive gate: ${adaptive.note}`
       : zoneBlocks
         ? `zone gate: ${rawResult.direction.toUpperCase()} agreement found, but ${zone.label} - standing aside`
-        : accuteSummary(rawResult)
+        : renkoBlocks
+          ? `renko gate: ${rawResult.direction.toUpperCase()} agreement found, but ${renko.label} - standing aside`
+          : accuteSummary(rawResult)
 
     const row: AccuteSignalResponse = {
       asset,
@@ -483,6 +525,7 @@ export class AccuteService {
       calibration: this.calibrationFor(asset, tf),
       adaptive,
       zone,
+      renko,
     }
     this.scanRows.set(`${tf}:${asset}`, row)
     return row

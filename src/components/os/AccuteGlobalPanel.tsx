@@ -187,7 +187,7 @@ export default function AccuteGlobalPanel({ tf, closedTick, onPickAsset, onOpenA
           </div>
           <p className="mt-1 font-mono text-[8px] text-[#3d4d66]">{best.summary}</p>
           <p className="mt-0.5 font-mono text-[7.5px] text-[#4b5a72]">
-            {best.adaptive.session} · {best.adaptive.regime} · confidence floor {best.adaptive.minConfidenceUsed} · {best.adaptive.note}
+            {best.adaptive.session} · {best.adaptive.regime} · confidence floor {best.adaptive.minConfidenceUsed} · renko {best.renko.trend} ({best.renko.streak} brick{best.renko.streak === 1 ? '' : 's'}) · {best.adaptive.note}
           </p>
         </div>
       ) : (
@@ -226,6 +226,14 @@ export default function AccuteGlobalPanel({ tf, closedTick, onPickAsset, onOpenA
                 {r.zone.side === 'buy' ? 'buy zone' : 'sell zone'}
               </span>
             )}
+            {r.renko.trend !== 'none' && (
+              <span
+                className={`shrink-0 rounded border px-1 py-px font-mono text-[7px] uppercase ${r.renko.trend === 'up' ? 'border-emerald-500/40 text-emerald-300' : 'border-rose-500/40 text-rose-300'}`}
+                title={r.renko.label}
+              >
+                renko {r.renko.trend}
+              </span>
+            )}
             {r.adaptive.overridden && (
               <span className="shrink-0 rounded border border-rose-500/40 px-1 py-px font-mono text-[7px] uppercase text-rose-300" title={r.adaptive.note}>
                 gated
@@ -250,7 +258,7 @@ export default function AccuteGlobalPanel({ tf, closedTick, onPickAsset, onOpenA
       </div>
 
       <p className="shrink-0 font-mono text-[8px] leading-relaxed text-[#3d4d66]">
-        ADX/DI + Pattern, Tempo (actively firing), and Next-Candle Oracle - CALL/PUT only when all three agree right now, otherwise WAITING. The dots show each leg's own read (green=call, red=put, grey=flat). A CALL also needs an actual buy zone (support/range floor) and a PUT a sell zone (resistance/range ceiling) - the buy/sell zone tag shows which. The confidence bar adapts per pair, session, and macro regime from Accute's own resolved record - a "gated" tag means that exact bucket has proven itself wrong often enough to stand aside regardless of agreement. Deliberately the rarest signal in the catalog.
+        ADX/DI + Pattern, Tempo (actively firing), and Next-Candle Oracle - CALL/PUT only when all three agree right now, otherwise WAITING. The dots show each leg's own read (green=call, red=put, grey=flat). A CALL also needs an actual buy zone (support/range floor), a PUT a sell zone (resistance/range ceiling), AND the Renko brick trend going the same way - the tags show each. The confidence bar adapts per pair, session, and macro regime from Accute's own resolved record - a "gated" tag means that exact bucket has proven itself wrong often enough to stand aside regardless of agreement. Deliberately the rarest signal in the catalog.
       </p>
     </div>
   )

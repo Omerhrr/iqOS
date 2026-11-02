@@ -1834,6 +1834,17 @@ export interface AccuteZone {
   label: string
 }
 
+/** Current Renko brick trend (analytics/renko.ts's renkoBricks(), the same
+ * engine of record the Renko + Footprint panel/strategies use). A CALL
+ * only clears while `trend` is 'up', a PUT only while it's 'down' - see
+ * plugins/accute.ts's renkoRead(). */
+export interface AccuteRenko {
+  trend: 'up' | 'down' | 'none'
+  streak: number
+  brickSize: number
+  label: string
+}
+
 export interface AccuteSignal {
   asset: string
   tf: string
@@ -1851,6 +1862,7 @@ export interface AccuteSignal {
   calibration: { n: number; hitRate: number } | null
   adaptive: AccuteAdaptive
   zone: AccuteZone
+  renko: AccuteRenko
 }
 
 export async function getAccute(asset: string, tf: Timeframe, opts?: { minConfidence?: number }): Promise<{ ok: boolean; error?: string; signal?: AccuteSignal }> {
