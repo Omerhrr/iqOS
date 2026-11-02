@@ -110,7 +110,34 @@ export class SentinelService {
   private unsubscribers: (() => void)[] = []
 
   config: SentinelConfig = { ...DEFAULT_SENTINEL }
-  hwm = 0 // balance high-water mark
+  // THE BUG ("switch to paper, immediately trip DRAWDOWN at ~50%"): hwm used
+  // to be a single scalar shared across BOTH account sources. equityBalance()
+  // is correctly source-aware (paper ledger vs IQ liveBalance), but the HWM
+  // it gets compared against was whichever balance was ever highest,
+  // regardless of which ledger produced it. Trade on IQ with a $20k balance,
+  // then flip to paper's (much smaller, independent) ledger, and
+  // drawdownPct() computed (20085.72 - paperBalance) / 20085.72 - a ~50%
+  // "drawdown" that never actually happened, tripping the breaker on the
+  // very next trade. Fixed by keeping one HWM PER source, mirroring how
+  // equityBalance()/equityDayLoss() already scope everything else to
+  // `account().source`. `hwm` below is now an accessor over hwmBySource[the
+  // CURRENT source], so every existing read/write site (drawdownPct(),
+  // onTradeOpened(), trip()'s log message, stats()) stays correct with no
+  // other call-site changes.
+  private hwmBySource: Record<'paper' | 'iq', number> = { paper: 0, iq: 0 }
+  private get hwm(): number {
+    return this.hwmBySource[this.currentSource()]
+  }
+  private set hwm(v: number) {
+    this.hwmBySource[this.currentSource()] = v
+  }
+  private currentSource(): 'paper' | 'iq' {
+    try {
+      return this.ctx.use<ExecLike>('execution').account().source
+    } catch {
+      return 'paper'
+    }
+  }
   private tradeTs: number[] = [] // rolling window of trade-open timestamps
   // short-lived cache of pairwise correlations - preTrade runs on every order
   // and a fresh 200-bar pearson per open asset would otherwise recompute on
@@ -167,20 +194,44 @@ export class SentinelService {
   private restore(): void {
     const saved = this.store.getSentinelState()
     if (!saved) {
-      this.hwm = this.equityBalance()
+      // first-ever boot: seed only the CURRENT source's bucket from its own
+      // equity. The other source's bucket stays 0 (drawdownPct() treats
+      // hwm<=0 as "no drawdown yet") until it's actually traded on.
+      this.hwmBySource[this.currentSource()] = this.equityBalance()
       this.persist()
       return
     }
     this.config = { ...DEFAULT_SENTINEL, ...(saved.config as Partial<SentinelConfig>) }
+    // per-source buckets live inside the config blob (hwmPaper/hwmIq); the
+    // legacy single `hwm` DB column (saved.hwm) predates the paper/IQ split
+    // and is migrated into whichever source was active when it was last
+    // written, so an upgrade doesn't lose a real, already-tracked peak.
+    const cfgObj = (saved.config as Record<string, unknown>) ?? {}
+    const curSrc = this.currentSource()
+    const legacyHwm = typeof saved.hwm === 'number' ? saved.hwm : 0
+    this.hwmBySource.paper = typeof cfgObj.hwmPaper === 'number' ? cfgObj.hwmPaper : curSrc === 'paper' ? legacyHwm : 0
+    this.hwmBySource.iq = typeof cfgObj.hwmIq === 'number' ? cfgObj.hwmIq : curSrc === 'iq' ? legacyHwm : 0
+    // high-water mark never goes down with the balance; adopt a higher
+    // balance on boot, scoped to the CURRENT source only.
     const bal = this.equityBalance()
-    // high-water mark never goes down with the balance; adopt a higher balance on boot
-    this.hwm = Math.max(saved.hwm || 0, bal)
+    this.hwmBySource[curSrc] = Math.max(this.hwmBySource[curSrc], bal)
   }
 
   private persist(): void {
-    // merge-preserving: the blob also carries the base risk manager keys (maxStake, ...)
+    // merge-preserving: the blob also carries the base risk manager keys
+    // (maxStake, ...) plus both per-source HWM buckets, so a restart never
+    // cross-contaminates paper's HWM with IQ's (or vice versa) again.
     const saved = this.store.getSentinelState()
-    this.store.saveSentinelState({ ...((saved?.config as Record<string, unknown>) ?? {}), ...this.config }, this.hwm)
+    const cfgObj = {
+      ...((saved?.config as Record<string, unknown>) ?? {}),
+      ...this.config,
+      hwmPaper: this.hwmBySource.paper,
+      hwmIq: this.hwmBySource.iq,
+    }
+    // the legacy `hwm` DB column keeps tracking the CURRENT source for any
+    // external/diagnostic reader of risk_config.hwm - the real source of
+    // truth is the per-source pair in the config blob above.
+    this.store.saveSentinelState(cfgObj, this.hwmBySource[this.currentSource()])
   }
 
   private event(kind: string, message: string, level: 'info' | 'warn' | 'danger' | 'success' = 'info'): void {
