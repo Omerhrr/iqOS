@@ -1805,6 +1805,22 @@ export interface AccuteLeg {
   label: string
 }
 
+/** Self-adaptive confidence gate read-out: this exact pair+timeframe+
+ * session+regime bucket's own learned adjustment (or the hand-set macro
+ * volatility bump / default floor, below the bucket's own sample floor).
+ * See mini-services/trading-core/src/plugins/accute.ts's adaptiveAdjustment()
+ * for the graduated fallback and override rule. */
+export interface AccuteAdaptive {
+  bucket: string
+  session: string
+  regime: string
+  n: number
+  hitRate: number | null
+  minConfidenceUsed: number
+  overridden: boolean
+  note: string
+}
+
 export interface AccuteSignal {
   asset: string
   tf: string
@@ -1820,6 +1836,7 @@ export interface AccuteSignal {
   targetBarTime: number
   computedTs: number
   calibration: { n: number; hitRate: number } | null
+  adaptive: AccuteAdaptive
 }
 
 export async function getAccute(asset: string, tf: Timeframe, opts?: { minConfidence?: number }): Promise<{ ok: boolean; error?: string; signal?: AccuteSignal }> {
@@ -1849,6 +1866,10 @@ export interface AccuteStatsResponse {
   pending: number
   hitRate: number | null
   records: { asset: string; tf: string; n: number; hitRate: number }[]
+  /** session+regime bucket breakdown for buckets with enough samples to be
+   * trusted (same floor the adaptive gate itself uses) - worst hit rate
+   * first, so a dampened pair/session/regime combo is easy to spot. */
+  buckets: { bucket: string; n: number; hitRate: number }[]
   recent: {
     asset: string
     tf: string

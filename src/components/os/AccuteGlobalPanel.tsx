@@ -186,6 +186,9 @@ export default function AccuteGlobalPanel({ tf, closedTick, onPickAsset, onOpenA
             <span className="ml-auto font-mono text-[10px] text-[#7c8aa5]">{fmtPrice(best.price, best.asset)}</span>
           </div>
           <p className="mt-1 font-mono text-[8px] text-[#3d4d66]">{best.summary}</p>
+          <p className="mt-0.5 font-mono text-[7.5px] text-[#4b5a72]">
+            {best.adaptive.session} · {best.adaptive.regime} · confidence floor {best.adaptive.minConfidenceUsed} · {best.adaptive.note}
+          </p>
         </div>
       ) : (
         !err && (
@@ -215,6 +218,11 @@ export default function AccuteGlobalPanel({ tf, closedTick, onPickAsset, onOpenA
             <span className="w-24 shrink-0 truncate font-mono text-[10px] font-bold text-[#dbe4f0] group-hover:text-violet-300">{r.asset}</span>
             {dirChip(r.direction)}
             {legDots(r.legs)}
+            {r.adaptive.overridden && (
+              <span className="shrink-0 rounded border border-rose-500/40 px-1 py-px font-mono text-[7px] uppercase text-rose-300" title={r.adaptive.note}>
+                gated
+              </span>
+            )}
             <span className="truncate font-mono text-[8px] text-[#4b5a72]">{r.summary}</span>
             {onOpenAccute && (
               <button
@@ -234,7 +242,7 @@ export default function AccuteGlobalPanel({ tf, closedTick, onPickAsset, onOpenA
       </div>
 
       <p className="shrink-0 font-mono text-[8px] leading-relaxed text-[#3d4d66]">
-        ADX/DI + Pattern, Tempo (actively firing), and Next-Candle Oracle - CALL/PUT only when all three agree right now, otherwise WAITING. The dots show each leg's own read (green=call, red=put, grey=flat). Deliberately the rarest signal in the catalog.
+        ADX/DI + Pattern, Tempo (actively firing), and Next-Candle Oracle - CALL/PUT only when all three agree right now, otherwise WAITING. The dots show each leg's own read (green=call, red=put, grey=flat). The confidence bar adapts per pair, session, and macro regime from Accute's own resolved record - a "gated" tag means that exact bucket has proven itself wrong often enough to stand aside regardless of agreement. Deliberately the rarest signal in the catalog.
       </p>
     </div>
   )
