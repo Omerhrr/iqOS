@@ -28,7 +28,8 @@ import { fitTriangulation, TRIANGULATION_WINDOW, TRIANGULATION_MIN_WINDOW, TRIAN
 import { fitAdxPatternBias, ADX_TREND_THRESHOLD, COMPOSITE_QUALIFY } from '../analytics/adxpatternbias'
 import { fitShockPressure, SHOCK_RATIO_THRESHOLD, PRESSURE_LOOKBACK, SHOCKPRESSURE_COMPOSITE_QUALIFY } from '../analytics/shockpressure'
 import { predictNextCandle, ORACLE_EVAL_WINDOW, ORACLE_MIN_CANDLES, type NextCandlePrediction } from '../analytics/nextcandle'
-import { tempoConviction, tempoDecide, tempoWindow, TEMPO_WINDOW_BARS, TEMPO_HISTORY_WINDOWS, TEMPO_FLOOR } from '../analytics/tempo'
+import { tempoConviction, tempoDecide, tempoWindow, TEMPO_WINDOW_BARS, TEMPO_HISTORY_WINDOWS, TEMPO_FLOOR, type TempoDecision } from '../analytics/tempo'
+import { combineAccute, accuteSummary } from '../analytics/accute'
 
 /** Memoizes Oracle-fusion reads (shared by the 'oracle-fusion' and 'tempo'
  * strategies below) by (asset, tf, candle open time) - a bar's own
@@ -60,6 +61,63 @@ function oracleFusionPredictionAt(candles: Candle[], i: number, asset: string, t
   if (oracleFusionPredictionCache.size > ORACLE_FUSION_PREDICTION_CACHE_MAX) oracleFusionPredictionCache.clear()
   oracleFusionPredictionCache.set(key, pred)
   return pred
+}
+
+/** Shared by the 'tempo' and 'accute' strategy entries - faithfully
+ * replays Tempo's one-shot-per-window stopping rule for the bar at index
+ * `i`, exactly as the 'tempo' entry used to inline: rebuild this pair's
+ * recent window-max history over the trailing lookback span, check
+ * whether an EARLIER bar in `i`'s own window already fired, then run the
+ * stopping rule at `i` itself. Each bar's own Oracle-fusion read is
+ * memoized by candle time (oracleFusionPredictionAt/Cache above), so
+ * calling this once per bar (as 'tempo' does) or three times at the same
+ * bar (as 'accute' does, once per leg's own evaluate call) never re-pays
+ * the fusion cost - only the cheap tempoDecide() replay itself repeats. */
+function tempoReplayAt(candles: Candle[], i: number, asset: string, tf: string, floor: number): TempoDecision & { direction: 'call' | 'put' | 'none'; barIndex: number } {
+  const lookbackBars = TEMPO_WINDOW_BARS * (TEMPO_HISTORY_WINDOWS + 1)
+  const last = candles[i]
+  const prev = candles[i - 1]
+  const tfSec = Math.max(1, Math.round(last.time - prev.time) || 60)
+  const nowWindow = tempoWindow(last.time * 1000, tfSec)
+
+  const convictionAt = (j: number): number => {
+    const pred = oracleFusionPredictionAt(candles, j, asset, tf)
+    if (!pred) return 0
+    return tempoConviction(pred.confidence, pred.pUp)
+  }
+
+  const lookbackStart = Math.max(0, i - lookbackBars)
+  const byWindow = new Map<number, number>()
+  for (let j = lookbackStart; j < i; j++) {
+    const w = tempoWindow(candles[j].time * 1000, tfSec)
+    if (w.windowIdx === nowWindow.windowIdx) continue
+    const conv = convictionAt(j)
+    if (conv > (byWindow.get(w.windowIdx) ?? 0)) byWindow.set(w.windowIdx, conv)
+  }
+  const history = [...byWindow.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v)
+
+  let windowStartIdx = Math.max(0, i - TEMPO_WINDOW_BARS)
+  for (let j = i; j >= windowStartIdx; j--) {
+    if (tempoWindow(candles[j].time * 1000, tfSec).windowIdx !== nowWindow.windowIdx) {
+      windowStartIdx = j + 1
+      break
+    }
+  }
+  for (let j = windowStartIdx; j < i; j++) {
+    const wAtJ = tempoWindow(candles[j].time * 1000, tfSec)
+    const decAtJ = tempoDecide({ conviction: convictionAt(j), barsRemaining: wAtJ.barsRemaining, windowMaxHistory: history, floor: floor !== TEMPO_FLOOR ? floor : undefined })
+    if (decAtJ.kind === 'fire') {
+      return { kind: 'skip', reason: `license already spent this window - an earlier bar (${j - windowStartIdx + 1}/${TEMPO_WINDOW_BARS}) already cleared the stopping rule`, threshold: 0, patienceBar: 0, conviction: 0, direction: 'none', barIndex: nowWindow.barIndex }
+    }
+  }
+
+  const pred = oracleFusionPredictionAt(candles, i, asset, tf)
+  if (!pred || pred.direction === 'none') {
+    return { kind: 'skip', reason: 'oracle has no directional lean on this bar', threshold: 0, patienceBar: 0, conviction: 0, direction: 'none', barIndex: nowWindow.barIndex }
+  }
+  const conviction = tempoConviction(pred.confidence, pred.pUp)
+  const dec = tempoDecide({ conviction, barsRemaining: nowWindow.barsRemaining, windowMaxHistory: history, floor: floor !== TEMPO_FLOOR ? floor : undefined })
+  return { ...dec, direction: dec.kind === 'fire' ? pred.direction : 'none', barIndex: nowWindow.barIndex }
 }
 
 const last = (arr: number[]): number => {
@@ -1982,75 +2040,69 @@ export const STRATEGIES: StrategyDef[] = [
       "The patience engine (analytics/tempo.ts), as a backtest-able strategy. Live Tempo treats every 10-bar window as a hunting license for exactly ONE shot - the bar whose fused Next-Candle Oracle conviction is surest - firing only when that conviction clears a patience bar that starts near the pair's own typical window-best (hard to clear early in the window) and decays toward an absolute floor as the window runs out (easy to clear on the last bar). This entry reconstructs that same rule faithfully: each bar, it rebuilds the pair's own recent window-max history and checks whether an EARLIER bar in the current window already fired, by replaying the stopping rule across the trailing lookback span - the same quantities the live engine accumulates for free from watching the real candle stream, since a backtest strategy call gets no memory between bars. Each bar's own Oracle-fusion read (markov/monte-carlo/kalman/confluence/chart-engines/patterns/bar-physics) is memoized by its exact candle time, so re-deriving that lookback/replay history costs roughly one fusion evaluation per bar overall, not per lookback step - the same cost tier as the rest of the catalog. Known simplification: the live engine's pair-accuracy dampening and recent-similar-loss penalty depend on that pair's OWN resolved trade ledger building up over real time, which a single backtest pass can't replay into itself bar-by-bar - this entry evaluates the stopping rule alone, without those two extra live-only dampeners.",
     params: [{ key: 'floor', label: 'Absolute conviction floor (fallback)', type: 'number', min: 3, max: 20, default: TEMPO_FLOOR }],
     evaluate: (candles, p, hints) => {
-      const oracleAsset = hints?.asset ?? 'backtest'
-      const oracleTf = hints?.tf ?? 'sim'
-      const lookbackBars = TEMPO_WINDOW_BARS * (TEMPO_HISTORY_WINDOWS + 1) // ~130 bars - enough to see TEMPO_HISTORY_WINDOWS full past windows
+      const asset = hints?.asset ?? 'backtest'
+      const tf = hints?.tf ?? 'sim'
       const n = candles.length
-      if (n < ORACLE_MIN_CANDLES + lookbackBars) {
+      if (n < ORACLE_MIN_CANDLES + TEMPO_WINDOW_BARS * (TEMPO_HISTORY_WINDOWS + 1)) {
         return { direction: 'none', score: 0, notes: 'warming up - needs oracle history plus a patience-history lookback window' }
       }
-      const floor = num(p, 'floor', TEMPO_FLOOR)
-      const last = candles[n - 1]
-      const prev = candles[n - 2]
-      const tfSec = Math.max(1, Math.round(last.time - prev.time) || 60)
-      const nowWindow = tempoWindow(last.time * 1000, tfSec)
-
-      // convictionAt(i): the Oracle-fusion conviction using only candles up
-      // through index i, bounded to the same ORACLE_EVAL_WINDOW tail the
-      // live plugin uses - memoized (oracleFusionPredictionAt/oracleFusionPredictionCache
-      // above) so each bar's own fusion read is only ever computed once,
-      // no matter how many later bars' lookback asks for it.
-      const convictionAt = (i: number): number => {
-        const pred = oracleFusionPredictionAt(candles, i, oracleAsset, oracleTf)
-        if (!pred) return 0
-        return tempoConviction(pred.confidence, pred.pUp)
-      }
-
-      // Rebuild the pair's own recent window-max history: re-evaluate
-      // conviction at every bar in the trailing lookback span, group by
-      // window index, keep each PAST window's own max (the current,
-      // still-forming window is excluded - live Tempo only archives a
-      // window's best once that window has actually rolled over).
-      const lookbackStart = Math.max(0, n - 1 - lookbackBars)
-      const byWindow = new Map<number, number>()
-      for (let i = lookbackStart; i < n - 1; i++) {
-        const w = tempoWindow(candles[i].time * 1000, tfSec)
-        if (w.windowIdx === nowWindow.windowIdx) continue
-        const conv = convictionAt(i)
-        if (conv > (byWindow.get(w.windowIdx) ?? 0)) byWindow.set(w.windowIdx, conv)
-      }
-      const history = [...byWindow.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v)
-
-      // Has an EARLIER bar in THIS window already fired? Tempo spends its
-      // license on the first qualifying bar of a window - replay the
-      // stopping rule across this window's own earlier bars (same
-      // history, their own barsRemaining) to find out, same reasoning as
-      // the live plugin's `fired` flag just reconstructed per-call instead
-      // of held in memory.
-      let windowStartIdx = Math.max(0, n - 1 - TEMPO_WINDOW_BARS)
-      for (let i = n - 1; i >= windowStartIdx; i--) {
-        if (tempoWindow(candles[i].time * 1000, tfSec).windowIdx !== nowWindow.windowIdx) {
-          windowStartIdx = i + 1
-          break
-        }
-      }
-      for (let i = windowStartIdx; i < n - 1; i++) {
-        const wAtI = tempoWindow(candles[i].time * 1000, tfSec)
-        const decAtI = tempoDecide({ conviction: convictionAt(i), barsRemaining: wAtI.barsRemaining, windowMaxHistory: history, floor: floor !== TEMPO_FLOOR ? floor : undefined })
-        if (decAtI.kind === 'fire') {
-          return { direction: 'none', score: 0, notes: `license already spent this window - an earlier bar (${i - windowStartIdx + 1}/${TEMPO_WINDOW_BARS}) already cleared the stopping rule` }
-        }
-      }
-
-      const pred = oracleFusionPredictionAt(candles, n - 1, oracleAsset, oracleTf)
-      if (!pred || pred.direction === 'none') return { direction: 'none', score: 0, notes: 'oracle has no directional lean on this bar' }
-      const conviction = tempoConviction(pred.confidence, pred.pUp)
-      const dec = tempoDecide({ conviction, barsRemaining: nowWindow.barsRemaining, windowMaxHistory: history, floor: floor !== TEMPO_FLOOR ? floor : undefined })
+      const dec = tempoReplayAt(candles, n - 1, asset, tf, num(p, 'floor', TEMPO_FLOOR))
       if (dec.kind !== 'fire') return { direction: 'none', score: 0, notes: dec.reason }
       return {
-        direction: pred.direction,
-        score: clamp(40 + conviction * 2, 40, 95),
-        notes: `bar ${nowWindow.barIndex + 1}/${TEMPO_WINDOW_BARS} of this pair's hunting window - ${dec.reason}`,
+        direction: dec.direction,
+        score: clamp(40 + dec.conviction * 2, 40, 95),
+        notes: `bar ${dec.barIndex + 1}/${TEMPO_WINDOW_BARS} of this pair's hunting window - ${dec.reason}`,
+      }
+    },
+  },
+  {
+    id: 'accute',
+    name: 'Accute (Triple Confluence)',
+    description:
+      "Invents no new math - fires only when THREE already-live engines all agree on direction right now: ADX/DI + Pattern Bias (analytics/adxpatternbias.ts, qualifies gate), Tempo's one-shot-per-window stopping rule (analytics/tempo.ts - actually FIRING this bar, not merely leaning a direction, since Tempo's raw lean is just the Oracle's own lean passed through and would be redundant here), and the Next-Candle Oracle fusion (analytics/nextcandle.ts, confidence floor). Any one leg sitting at 'none', or a disagreement between legs that do have a lean, is WAITING - analytics/accute.ts's combineAccute() is the single source of truth for the agreement rule, shared with the live Accute plugin so the two can never drift apart on what counts as a 3-way agreement. Deliberately the rarest, strictest entry in the catalog: expect very few trades, each backed by three independent reads.",
+    params: [
+      { key: 'adxThreshold', label: 'Min ADX to count as trending', type: 'number', min: 10, max: 50, default: ADX_TREND_THRESHOLD },
+      { key: 'lookback', label: 'Pattern scan lookback (bars)', type: 'number', min: 3, max: 20, default: 8 },
+      { key: 'qualify', label: 'Min |ADX/pattern composite| to qualify (0-10)', type: 'number', min: 1, max: 10, step: 0.5, default: COMPOSITE_QUALIFY },
+      { key: 'floor', label: 'Tempo absolute conviction floor (fallback)', type: 'number', min: 3, max: 20, default: TEMPO_FLOOR },
+      { key: 'minConfidence', label: 'Min Oracle fused confidence to count (0-100)', type: 'number', min: 0, max: 100, default: 55 },
+    ],
+    evaluate: (candles, p, hints) => {
+      const asset = hints?.asset ?? 'backtest'
+      const tf = hints?.tf ?? 'sim'
+      const n = candles.length
+      if (n < ORACLE_MIN_CANDLES + TEMPO_WINDOW_BARS * (TEMPO_HISTORY_WINDOWS + 1)) {
+        return { direction: 'none', score: 0, notes: 'warming up - needs oracle history plus a patience-history lookback window' }
+      }
+
+      // leg 1: ADX/DI + Pattern Bias - qualifies() already bakes in the
+      // agree check, composite bar, and the HA/HTF vetoes.
+      const fit = fitAdxPatternBias(candles, 14, num(p, 'lookback', 8))
+      const adxDir: 'call' | 'put' | 'none' = fit?.qualifies && Math.abs(fit.composite) >= num(p, 'qualify', COMPOSITE_QUALIFY) ? (fit.direction === 'bullish' ? 'call' : 'put') : 'none'
+      const adxLabel = fit ? `ADX/Pattern ${adxDir === 'none' ? 'not qualifying' : `${adxDir.toUpperCase()} (composite ${fit.composite.toFixed(1)})`}` : 'ADX/Pattern warming up'
+
+      // leg 2: Tempo - must be ACTIVELY FIRING this bar (see module doc).
+      const tempoDec = tempoReplayAt(candles, n - 1, asset, tf, num(p, 'floor', TEMPO_FLOOR))
+      const tempoDir: 'call' | 'put' | 'none' = tempoDec.kind === 'fire' ? tempoDec.direction : 'none'
+      const tempoLabel = tempoDec.kind === 'fire' ? `Tempo FIRING ${tempoDir.toUpperCase()}` : `Tempo ${tempoDec.kind} (${tempoDec.reason})`
+
+      // leg 3: Next-Candle Oracle fusion - direction + confidence floor.
+      const pred = oracleFusionPredictionAt(candles, n - 1, asset, tf)
+      const minConfidence = num(p, 'minConfidence', 55)
+      const oracleDir: 'call' | 'put' | 'none' = pred && pred.direction !== 'none' && pred.confidence >= minConfidence ? pred.direction : 'none'
+      const oracleLabel = pred ? `Oracle ${oracleDir === 'none' ? `not confident enough (${pred.confidence.toFixed(1)} < ${minConfidence})` : `${oracleDir.toUpperCase()} (confidence ${pred.confidence.toFixed(1)})`}` : 'Oracle warming up'
+
+      const result = combineAccute({
+        adxPattern: { direction: adxDir, label: adxLabel },
+        tempo: { direction: tempoDir, label: tempoLabel },
+        oracle: { direction: oracleDir, label: oracleLabel },
+      })
+      if (result.direction === 'none') return { direction: 'none', score: 0, notes: accuteSummary(result) }
+      const conf = pred?.confidence ?? 60
+      return {
+        direction: result.direction,
+        score: clamp(50 + conf * 0.45, 50, 97),
+        notes: accuteSummary(result),
       }
     },
   },

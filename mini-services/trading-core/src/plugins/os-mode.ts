@@ -67,6 +67,7 @@ import { fitShockPressure, SHOCK_RATIO_THRESHOLD, PRESSURE_LOOKBACK, SHOCKPRESSU
 import { computeTpo } from '../analytics/tpo'
 import type { NextCandleService } from './nextcandle'
 import type { TempoService } from './tempo'
+import type { AccuteService } from './accute'
 import type { AdxHonestyService } from './adxhonesty'
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
@@ -81,7 +82,7 @@ const finGte = (v: number, floor: number): boolean => Number.isFinite(v) && v >=
 
 export type OsMode = 'human' | 'auto'
 
-export type AutoTraderSource = 'cointegration' | 'triangulation' | 'adx-pattern-bias' | 'pair-signal' | 'shock-pressure' | 'poc-triple-confirm' | 'oracle-fusion' | 'tempo' | 'strategy' | 'chartsignals' | 'leadlag'
+export type AutoTraderSource = 'cointegration' | 'triangulation' | 'adx-pattern-bias' | 'pair-signal' | 'shock-pressure' | 'poc-triple-confirm' | 'oracle-fusion' | 'tempo' | 'accute' | 'strategy' | 'chartsignals' | 'leadlag'
 
 /** Walk-forward validation verdict for the OU edge on one (asset, tf). */
 export interface OUVerdict {
@@ -391,7 +392,7 @@ const AUTOTRADER_NOTE = 'auto:os-trader'
  * its votes at the eval). Only these sources can guarantee every placed
  * trade is a FRESH edge, so only their alerts carry the "why now" crossing
  * note the pickers attach. */
-const SWEEP_SOURCES: readonly string[] = ['chartsignals', 'leadlag', 'cointegration', 'triangulation', 'adx-pattern-bias', 'pair-signal', 'shock-pressure', 'poc-triple-confirm', 'oracle-fusion', 'tempo']
+const SWEEP_SOURCES: readonly string[] = ['chartsignals', 'leadlag', 'cointegration', 'triangulation', 'adx-pattern-bias', 'pair-signal', 'shock-pressure', 'poc-triple-confirm', 'oracle-fusion', 'tempo', 'accute']
 /** analytics/chartsignals.ts combineVotes() now groups the 7 raw chart
  * engines into 5 independent-METHODOLOGY families before counting `agree`
  * - renko/range/P&F (all "price crossed N ATR-thresholds" read three ways)
@@ -640,7 +641,7 @@ export class ModeService {
         const num = (v: unknown, fb: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fb)
         this.config = {
           enabled: typeof c.enabled === 'boolean' ? c.enabled : DEFAULT_AUTOTRADER.enabled,
-          signalSource: (['cointegration', 'triangulation', 'adx-pattern-bias', 'pair-signal', 'shock-pressure', 'poc-triple-confirm', 'oracle-fusion', 'tempo', 'strategy', 'chartsignals', 'leadlag'] as const).includes(c.signalSource as AutoTraderSource)
+          signalSource: (['cointegration', 'triangulation', 'adx-pattern-bias', 'pair-signal', 'shock-pressure', 'poc-triple-confirm', 'oracle-fusion', 'tempo', 'accute', 'strategy', 'chartsignals', 'leadlag'] as const).includes(c.signalSource as AutoTraderSource)
             ? (c.signalSource as AutoTraderSource)
             : DEFAULT_AUTOTRADER.signalSource,
           tf: (typeof c.tf === 'string' && (ALL_TIMEFRAMES as string[]).includes(c.tf) ? c.tf : DEFAULT_AUTOTRADER.tf) as Timeframe,
@@ -1069,6 +1070,8 @@ export class ModeService {
                 ? (row.note ?? `oracle fusion, edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`)
                 : this.config.signalSource === 'tempo'
                 ? (row.note ?? `tempo shot, edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`)
+                : this.config.signalSource === 'accute'
+                ? (row.note ?? `accute 3-way agreement, edge ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`)
                 : this.config.signalSource === 'chartsignals'
                 ? (row.note ?? `chart-signals vote ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`)
                 : this.config.signalSource === 'leadlag'
@@ -1130,6 +1133,7 @@ export class ModeService {
     if (this.config.signalSource === 'poc-triple-confirm') return this.pickPocTripleConfirmSignal()
     if (this.config.signalSource === 'oracle-fusion') return this.pickOracleFusionSignal()
     if (this.config.signalSource === 'tempo') return this.pickTempoSignal()
+    if (this.config.signalSource === 'accute') return this.pickAccuteSignal()
     if (this.config.signalSource === 'strategy') return this.pickStrategySignal()
     return null
   }
@@ -1999,6 +2003,95 @@ export class ModeService {
           ts: this.now(),
           computedTs: this.now(),
           note: `tempo fire: conviction ${sig.conviction.toFixed(0)} ≥ threshold ${sig.threshold.toFixed(0)} · ${sig.reason}`,
+        }
+      }
+      return null
+    } catch {
+      return null // market not loaded - no signal source
+    }
+  }
+
+  /**
+   * Accute source: the triple-confluence confirmation (plugins/accute.ts)
+   * wired straight into the auto-trader. Accute's own board already
+   * requires ADX/DI + Pattern Bias to qualify, Tempo to be ACTIVELY FIRING
+   * this bar, and the Next-Candle Oracle to clear its confidence floor -
+   * all three agreeing on direction - so by the time a row reaches this
+   * picker the hard work is done; placing just needs to atomically spend
+   * the shared Tempo window license via tempo.claim() (the exact same
+   * one-shot resource the 'tempo' source above claims), so an Accute
+   * trade and a Tempo trade on the same pair:tf can never double-spend
+   * one window's license. Like 'tempo', this does NOT go through
+   * edgeSweep - claim() already IS the one-shot/fresh-edge gate.
+   */
+  private pickAccuteSignal(): ScreenRow | null {
+    try {
+      const market = this.ctx.use<MarketDataService>('market')
+      let accute: AccuteService
+      let tempo: TempoService
+      try {
+        accute = this.ctx.use<AccuteService>('accute')
+        tempo = this.ctx.use<TempoService>('tempo')
+      } catch {
+        return null // accute/tempo plugin not loaded - source configured but idle
+      }
+      const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
+      const pool = this.candidatePool(open)
+      const board = accute.globalScan(this.config.tf, { limit: 60 })
+      const agreeing = board.rows
+        .filter((r) => r.ok && r.direction !== 'none' && pool.includes(r.asset) && !this.assetBlocked(r.asset))
+        .filter((r) => this.config.direction === 'both' || r.direction === this.config.direction)
+        .filter((r) => {
+          // Accute carries no single "confidence" number of its own (it's
+          // a 3-way agreement gate, not a scored read) - approximate one
+          // from how many legs lean the same way plus the Oracle leg's
+          // own confidence embedded in the row's legs for the score/conf
+          // thresholds every other source is checked against.
+          const conf = Math.round(80 + r.agreeCount * 5)
+          return finGte(conf, this.config.minConfidence) && finGte(conf, this.config.minScore)
+        })
+        .sort((a, b) => b.agreeCount - a.agreeCount)
+      for (const row of agreeing) {
+        if (row.direction === 'none') continue
+        const claim = tempo.claim(row.asset, this.config.tf)
+        if (!claim.ok || !claim.signal) continue // Tempo's own one-shot license already spent, or lost the race - try the next candidate
+        // re-verify the OTHER two legs are still agreeing right now (the
+        // board row could be up to GLOBAL_SCAN_TTL_MS stale) before
+        // actually committing to this candidate.
+        const fresh = accute.signal(row.asset, this.config.tf)
+        if (fresh.direction !== row.direction) continue // disagreement crept in since the board was cached - skip, license already spent is an acceptable cost of staying honest
+        const sig = claim.signal
+        const dir: 'call' | 'put' = sig.direction
+        const confidence = Math.round(80 + row.agreeCount * 5)
+        const score = confidence * (dir === 'call' ? 1 : -1)
+        const inst = market.assets.find((a) => a.ticker === row.asset)
+        return {
+          asset: row.asset,
+          name: inst?.name ?? row.asset,
+          category: (inst?.category ?? 'forex') as AssetCategory,
+          otc: inst?.otc ?? row.asset.endsWith('-OTC'),
+          tf: this.config.tf,
+          price: sig.price,
+          score,
+          direction: dir,
+          confidence,
+          pUp: sig.pUp,
+          pDown: 1 - sig.pUp,
+          regime: 'range',
+          ouZ: 0,
+          ouHalfLife: 0,
+          ouMeanReverting: false,
+          ouTStat: 0,
+          rsi: 0,
+          adx: 0,
+          atrPct: 0,
+          hurst: 0,
+          changePct: 0,
+          payout: this.payoutFor(row.asset, this.config.kind ?? 'binary'),
+          topPattern: null,
+          ts: this.now(),
+          computedTs: this.now(),
+          note: row.summary,
         }
       }
       return null
@@ -2952,6 +3045,8 @@ export class ModeService {
                       ? 'oracle-fusion'
                     : this.config.signalSource === 'tempo'
                       ? 'tempo'
+                    : this.config.signalSource === 'accute'
+                      ? 'accute'
                     : this.config.signalSource === 'chartsignals'
                   ? 'chartsignals-vote'
                   : this.config.signalSource === 'leadlag'
@@ -3031,6 +3126,8 @@ export class ModeService {
         return 'oracle-fusion'
       case 'tempo':
         return 'tempo'
+      case 'accute':
+        return 'accute'
       case 'chartsignals':
         return 'chartsignals-vote'
       case 'leadlag':
@@ -3475,7 +3572,7 @@ export class ModeService {
       // moment too - whatever qualifies NOW predates this arm
       if (this.config.enabled && !was && this.mode === 'auto') this.armAutoEdgeBackfill()
     }
-    if (patch.signalSource !== undefined && (['cointegration', 'triangulation', 'adx-pattern-bias', 'pair-signal', 'shock-pressure', 'poc-triple-confirm', 'oracle-fusion', 'tempo', 'strategy', 'chartsignals', 'leadlag'] as const).includes(patch.signalSource as AutoTraderSource))
+    if (patch.signalSource !== undefined && (['cointegration', 'triangulation', 'adx-pattern-bias', 'pair-signal', 'shock-pressure', 'poc-triple-confirm', 'oracle-fusion', 'tempo', 'accute', 'strategy', 'chartsignals', 'leadlag'] as const).includes(patch.signalSource as AutoTraderSource))
       this.config.signalSource = patch.signalSource as AutoTraderSource
     // AUDIT FIX (Task 58, P2): tf used to be cast unchecked - a garbage tf
     // made every picker return nothing (silent "no signal" forever) and
@@ -3573,6 +3670,8 @@ export class ModeService {
                 ? ` (Next-Candle Oracle fused multi-model read, self-calibrated against its own resolved track record)`
                 : this.config.signalSource === 'tempo'
                 ? ` (Tempo patience engine - one shot per 10-bar window at the most-convicted bar, claimed atomically)`
+                : this.config.signalSource === 'accute'
+                ? ` (Accute triple confluence - ADX/DI + Pattern, Tempo (firing) and Next-Candle Oracle all agreeing on direction)`
                 : this.config.signalSource === 'chartsignals'
                 ? ` (chart-type vote engine, agree ≥ ${CHARTSIGNALS_MIN_AGREE}/5 families)`
                 : this.config.signalSource === 'leadlag'

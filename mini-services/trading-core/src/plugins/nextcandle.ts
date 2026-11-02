@@ -1100,6 +1100,83 @@ export class NextCandleService {
 
   private scanRows = new Map<string, GlobalScanRow>() // key: `${tf}:${asset}`
 
+  /** Single-pair counterpart to globalScan()'s per-row computation - same
+   * TTL cache (keyed by `${tf}:${ticker}`, shared with the board: a panel
+   * reading one pair and the board scanning the whole universe hit the
+   * same cached row, never double the work), same thin/no-history fallback
+   * shape. Pulled out so other plugins (Tempo's single-pair rowFor(), the
+   * Accute confluence engine) can get one fresh oracle row without paying
+   * for or depending on a full board scan. `price` needs the asset's own
+   * AssetInfo (for the thin-history fallback's last-known price), so this
+   * takes it as a param rather than re-deriving it internally. */
+  private scanRowFor(a: { ticker: string; price: number }, tf: Timeframe, refresh = false): GlobalScanRow {
+    const now = Date.now()
+    const key = `${tf}:${a.ticker}`
+    const cached = this.scanRows.get(key)
+    if (!refresh && cached && now - cached.computedTs < GLOBAL_SCAN_TTL_MS) return cached
+    const pred = this.predict(a.ticker, tf)
+    let row: GlobalScanRow
+    if (pred) {
+      row = {
+        asset: a.ticker,
+        tf,
+        computedTs: now,
+        targetBarTime: pred.targetBarTime,
+        ok: true,
+        note: '',
+        pUp: pred.pUp,
+        direction: pred.direction,
+        confidence: pred.confidence,
+        rawConfidence: pred.rawConfidence,
+        regime: pred.regime,
+        price: pred.price,
+        expectedMove: pred.expectedMove,
+        atr: pred.atr,
+        driversActive: pred.driversActive,
+        calibration: pred.calibration,
+      }
+    } else {
+      // thin/no history yet (lazy-seeded feed) - keep the timestamp at the
+      // attempt so the row retries on a later poll, not every poll
+      row = {
+        asset: a.ticker,
+        tf,
+        computedTs: now,
+        targetBarTime: 0,
+        ok: false,
+        note: 'warming up: needs 320+ closed bars on this tf',
+        pUp: 0.5,
+        direction: 'none',
+        confidence: 0,
+        rawConfidence: 0,
+        regime: 'MIXED',
+        price: a.price,
+        expectedMove: 0,
+        atr: 0,
+        driversActive: 0,
+        calibration: this.calibrationFor(a.ticker, tf),
+      }
+    }
+    this.scanRows.set(key, row)
+    if (this.scanRows.size > 400) {
+      // evict the stalest quarter - boards on tfs nobody polls anymore
+      const stale = [...this.scanRows.entries()].sort((x, y) => x[1].computedTs - y[1].computedTs).slice(0, 100)
+      for (const [k] of stale) this.scanRows.delete(k)
+    }
+    return row
+  }
+
+  /** Public single-pair read - resolves the asset's current price/AssetInfo
+   * from the market service itself, so callers only need a ticker. */
+  rowFor(asset: string, tf: Timeframe, opts: { refresh?: boolean } = {}): GlobalScanRow {
+    // listAssets() (not the plain this.market.assets) because only it
+    // carries the live `price` field the thin-history fallback needs -
+    // one lookup per call, nowhere near the hot per-resolved-row path the
+    // cluster-key cache above exists to avoid.
+    const info = this.market.listAssets().find((a) => a.ticker === asset)
+    return this.scanRowFor({ ticker: asset, price: info?.price ?? 0 }, tf, opts.refresh === true)
+  }
+
   globalScan(tf: Timeframe, opts: { limit?: number; category?: string; refresh?: boolean } = {}): GlobalScanResult {
     const limit = Math.max(1, Math.min(Math.round(opts.limit ?? 30), 150))
     const category = opts.category && opts.category !== 'all' ? opts.category : null
@@ -1112,63 +1189,10 @@ export class NextCandleService {
     let refreshed = 0
     const rows: GlobalScanRow[] = []
     for (const a of picked) {
-      const key = `${tf}:${a.ticker}`
-      const cached = this.scanRows.get(key)
-      if (!refresh && cached && now - cached.computedTs < GLOBAL_SCAN_TTL_MS) {
-        rows.push(cached)
-        continue
-      }
-      const pred = this.predict(a.ticker, tf)
-      let row: GlobalScanRow
-      if (pred) {
-        row = {
-          asset: a.ticker,
-          tf,
-          computedTs: now,
-          targetBarTime: pred.targetBarTime,
-          ok: true,
-          note: '',
-          pUp: pred.pUp,
-          direction: pred.direction,
-          confidence: pred.confidence,
-          rawConfidence: pred.rawConfidence,
-          regime: pred.regime,
-          price: pred.price,
-          expectedMove: pred.expectedMove,
-          atr: pred.atr,
-          driversActive: pred.driversActive,
-          calibration: pred.calibration,
-        }
-      } else {
-        // thin/no history yet (lazy-seeded feed) - keep the timestamp at the
-        // attempt so the row retries on a later poll, not every poll
-        row = {
-          asset: a.ticker,
-          tf,
-          computedTs: now,
-          targetBarTime: 0,
-          ok: false,
-          note: 'warming up: needs 320+ closed bars on this tf',
-          pUp: 0.5,
-          direction: 'none',
-          confidence: 0,
-          rawConfidence: 0,
-          regime: 'MIXED',
-          price: a.price,
-          expectedMove: 0,
-          atr: 0,
-          driversActive: 0,
-          calibration: this.calibrationFor(a.ticker, tf),
-        }
-      }
-      this.scanRows.set(key, row)
-      if (this.scanRows.size > 400) {
-        // evict the stalest quarter - boards on tfs nobody polls anymore
-        const stale = [...this.scanRows.entries()].sort((x, y) => x[1].computedTs - y[1].computedTs).slice(0, 100)
-        for (const [k] of stale) this.scanRows.delete(k)
-      }
+      const before = this.scanRows.get(`${tf}:${a.ticker}`)
+      const row = this.scanRowFor(a, tf, refresh)
+      if (!before || row.computedTs !== before.computedTs) refreshed++
       rows.push(row)
-      refreshed++
     }
 
     // tradability sort: confidence weighted by how far the fused read sits

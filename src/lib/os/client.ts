@@ -1790,6 +1790,83 @@ export async function getTempoStats(): Promise<TempoStatsResponse> {
   return osGet<TempoStatsResponse>('/tempo_stats', {})
 }
 
+// ---------- Accute (triple-confluence confirmation) ----------
+// Combines ADX/DI + Pattern Bias, Tempo (actively firing), and the
+// Next-Candle Oracle fusion into one signal: 'call'/'put' ONLY when all
+// three agree, 'none' (waiting) otherwise. See
+// mini-services/trading-core/src/analytics/accute.ts for the agreement
+// rule and src/plugins/accute.ts for the live engine.
+
+export type AccuteDirection = 'call' | 'put' | 'none'
+export type AccuteLegName = 'adxPattern' | 'tempo' | 'oracle'
+
+export interface AccuteLeg {
+  direction: AccuteDirection
+  label: string
+}
+
+export interface AccuteSignal {
+  asset: string
+  tf: string
+  ok: boolean
+  note: string
+  direction: AccuteDirection
+  waiting: boolean
+  summary: string
+  legs: Record<AccuteLegName, AccuteLeg>
+  agreeCount: number
+  leaning: 'call' | 'put' | null
+  price: number
+  targetBarTime: number
+  computedTs: number
+  calibration: { n: number; hitRate: number } | null
+}
+
+export async function getAccute(asset: string, tf: Timeframe, opts?: { minConfidence?: number }): Promise<{ ok: boolean; error?: string; signal?: AccuteSignal }> {
+  return osGet('/accute', { asset, tf, minConfidence: opts?.minConfidence })
+}
+
+export interface AccuteScanResponse {
+  ok: boolean
+  error?: string
+  tf: string
+  scannedTs: number
+  universe: number
+  scanned: number
+  /** rows where all 3 legs currently agree */
+  agreeing: number
+  rows: AccuteSignal[]
+}
+
+export async function getAccuteScan(tf: Timeframe, opts?: { limit?: number; refresh?: boolean }): Promise<AccuteScanResponse> {
+  return osGet('/accute_scan', { tf, limit: opts?.limit, refresh: opts?.refresh ? 1 : undefined })
+}
+
+export interface AccuteStatsResponse {
+  ok: boolean
+  error?: string
+  total: number
+  pending: number
+  hitRate: number | null
+  records: { asset: string; tf: string; n: number; hitRate: number }[]
+  recent: {
+    asset: string
+    tf: string
+    targetBarTime: number
+    issuedTs: number
+    resolvedTs: number
+    direction: 'call' | 'put'
+    entry: number
+    exit: number
+    actual: 'up' | 'down' | 'flat'
+    hit: boolean
+  }[]
+}
+
+export async function getAccuteStats(): Promise<AccuteStatsResponse> {
+  return osGet<AccuteStatsResponse>('/accute_stats', {})
+}
+
 // ---------- randomness audit (descriptive feed statistics) ----------
 // Characterizes an OTC feed's empirical behavior - step size, return
 // volatility/skew/kurtosis, update cadence. Purely descriptive: this is
@@ -3369,7 +3446,7 @@ export type OsMode = 'human' | 'auto'
 
 export interface AutoTraderConfig {
   enabled: boolean
-  signalSource: 'cointegration' | 'triangulation' | 'adx-pattern-bias' | 'pair-signal' | 'shock-pressure' | 'poc-triple-confirm' | 'oracle-fusion' | 'tempo' | 'strategy' | 'chartsignals' | 'leadlag'
+  signalSource: 'cointegration' | 'triangulation' | 'adx-pattern-bias' | 'pair-signal' | 'shock-pressure' | 'poc-triple-confirm' | 'oracle-fusion' | 'tempo' | 'accute' | 'strategy' | 'chartsignals' | 'leadlag'
   tf: Timeframe
   /** The trade's own expiry, as a timeframe - SEPARATE from `tf` (which
    * candles signals are read from). Unset = old behavior (expiry tracks tf

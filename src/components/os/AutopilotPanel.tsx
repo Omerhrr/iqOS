@@ -1597,6 +1597,8 @@ function AutoTraderStrip({
                       ? `ORACLE·conf≥${at.config.minConfidence}·edge≥${at.config.minScore}pp`
                       : at.config.signalSource === 'tempo'
                       ? `TEMPO·1shot/10bars·conv${at.config.minConfidence}/${at.config.minScore}`
+                      : at.config.signalSource === 'accute'
+                      ? `ACCUTE·3-way agree·ADX+TEMPO+ORACLE`
                       : at.config.signalSource === 'strategy'
                       ? (() => {
                           const ids = at.config.strategyIds?.length ? at.config.strategyIds : at.config.strategyId ? [at.config.strategyId] : []
@@ -1928,6 +1930,7 @@ function AutoTraderDialog({
                   ['poc-triple-confirm', 'POC Triple-Confirm'],
                   ['oracle-fusion', 'Oracle Fusion'],
                   ['tempo', 'Tempo 1-Shot'],
+                  ['accute', 'Accute'],
                   ['strategy', 'Strategy'],
                 ] as const
               ).map(([v, label]) => (
@@ -1964,6 +1967,8 @@ function AutoTraderDialog({
                         ? 'the Next-Candle Oracle\'s multi-model fused next-bar read, swept across the WHOLE open universe (the same board the Next Global panel renders, one fused prediction per pair on the signal tf, shared kernel-side cache). The fusion\'s calibrated confidence - already tightened by the oracle\'s own recent hit rate on that exact pair - must clear Min confidence, AND the fused pUp must lean far enough from the coin flip (|pUp-0.5| in percentage points clears Min |score|) before the fresh edge is acted on; among qualifying pairs it ranks exactly like the Next Global board: confidence × distance-from-coin-flip'
                           : d.signalSource === 'tempo'
                         ? 'the patience engine: every 10-bar window is a hunting license for exactly ONE shot per pair - the bar whose fused oracle conviction is surest. An optimal-stopping rule on the pair\'s OWN window-max rhythm decides when to spend the license (early bars must beat the pair\'s typical window best scaled by the bars still to come; the last bar only needs the absolute floor), so on 1m it trades at most 6 times an hour, on 2m 3 times - expiry is always 1 bar of the signal tf (leave expiryTf unset). Min confidence gates the calibrated fusion confidence, Min |score| gates the pp lean off the coin flip. Scanning the Tempo panels never spends a license - only this trader claims shots, one per window, first claim wins'
+                          : d.signalSource === 'accute'
+                        ? 'triple-confluence confirmation: fires ONLY when ADX/DI+Pattern Bias qualifies, Tempo is ACTIVELY FIRING this bar (not merely leaning a direction - its one-shot-per-window stopping rule has to actually clear), and the Next-Candle Oracle fusion clears its confidence floor, all three agreeing on direction. Placing a trade atomically claims the same shared Tempo window license the Tempo source itself claims, so the two can never double-spend one pair\'s window. Deliberately the rarest source here - expect very few trades, each backed by three independent engines'
                           : d.signalSource === 'strategy'
                         ? 'one specific strategy picked below, or several combined - as a vote (ENSEMBLE) or an AUTO-LEARN pool that trades whichever member is proven best per pair - the same strategyId an autopilot bot would use (a builtin strategy, or an AI Lab-learned "(Lab)" spec), not pinned to one bot\'s watchlist'
                         : ''}

@@ -31,6 +31,7 @@ import { yesterdayPlugin, YesterdayService } from './src/plugins/yesterday'
 import { nextCandlePlugin, NextCandleService } from './src/plugins/nextcandle'
 import { adxHonestyPlugin, AdxHonestyService } from './src/plugins/adxhonesty'
 import { tempoPlugin, TempoService } from './src/plugins/tempo'
+import { accutePlugin, AccuteService } from './src/plugins/accute'
 import { gridSearch, walkForward, sweepAssets, type Objective } from './src/strategies/optimize'
 import { backtest } from './src/strategies/backtest'
 import type { BacktestOptions } from './src/strategies/backtest'
@@ -190,6 +191,7 @@ kernel.register(yesterdayPlugin)
 kernel.register(nextCandlePlugin)
 kernel.register(tempoPlugin)
 kernel.register(adxHonestyPlugin)
+kernel.register(accutePlugin)
 
 // ---------- Full-universe scanners for Distill / Cointegration / Vol Arb ----------
 // These three started as single-asset-only panels (read whatever's on the
@@ -2881,6 +2883,44 @@ const httpServer = createServer(async (req, res) => {
       if (path === '/tempo_stats') {
         try {
           const svc = kernel.context().use<TempoService>('tempo')
+          return json(200, { ok: true, ...svc.stats() })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // ---------- Accute (triple-confluence confirmation) ----------
+      // GET /accute?asset=X&tf=1m -> combined ADX/DI+Pattern + Tempo +
+      // Next-Candle Oracle read for one pair; direction is 'call'/'put'
+      // ONLY when all three agree, else 'none' (waiting). GET /accute_scan
+      // -> the same read lifted to the whole universe. GET /accute_stats
+      // -> the resolved honesty ledger for signals where all 3 agreed.
+      if (path === '/accute') {
+        try {
+          const svc = kernel.context().use<AccuteService>('accute')
+          const acAsset = String(q.get('asset') ?? market.activeAsset)
+          const acTf = tf(String(q.get('tf') ?? '1m') as string)
+          const row = svc.signal(acAsset, acTf, { minOracleConfidence: q.get('minConfidence') ? Number(q.get('minConfidence')) : undefined })
+          return json(200, { ok: true, signal: row })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      if (path === '/accute_scan') {
+        try {
+          const svc = kernel.context().use<AccuteService>('accute')
+          const gTf = tf(String(q.get('tf') ?? '1m') as string)
+          const out = svc.globalScan(gTf, { limit: Number(q.get('limit') ?? 40), refresh: q.get('refresh') === '1' })
+          return json(200, { ok: true, ...out })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      if (path === '/accute_stats') {
+        try {
+          const svc = kernel.context().use<AccuteService>('accute')
           return json(200, { ok: true, ...svc.stats() })
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })

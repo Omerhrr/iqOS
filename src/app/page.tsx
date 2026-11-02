@@ -25,6 +25,8 @@ import NextCandlePanel from '@/components/os/NextCandlePanel'
 import NextGlobalPanel from '@/components/os/NextGlobalPanel'
 import TempoGlobalPanel from '@/components/os/TempoGlobalPanel'
 import TempoPanel from '@/components/os/TempoPanel'
+import AccuteGlobalPanel from '@/components/os/AccuteGlobalPanel'
+import AccutePanel from '@/components/os/AccutePanel'
 import RenkoFootprintPanel from '@/components/os/RenkoFootprintPanel'
 import VolumeFootprintPanel from '@/components/os/VolumeFootprintPanel'
 import TickVolumePanel from '@/components/os/TickVolumePanel'
@@ -82,7 +84,7 @@ const INDICATOR_STORAGE_KEY = 'iqos.activeIndicators.v1'
 // @ Now", "Cointegration") out of the open strip entirely instead of just
 // closing it each time - it stays hidden across reloads until re-checked in
 // the Panels settings menu. Nothing is deleted, this only gates rendering.
-type PanelId = 'signals' | 'yday' | 'leadlag' | 'distill' | 'cointegration' | 'volarb' | 'triangulation' | 'adxPatternBias' | 'shockPressure' | 'renkoFootprint' | 'renkoFootprintOtc' | 'volumeFootprint' | 'tickVolume' | 'pairCompare' | 'pairSignal' | 'oracle' | 'nextGlobal' | 'tempo' | 'tempoGlobal'
+type PanelId = 'signals' | 'yday' | 'leadlag' | 'distill' | 'cointegration' | 'volarb' | 'triangulation' | 'adxPatternBias' | 'shockPressure' | 'renkoFootprint' | 'renkoFootprintOtc' | 'volumeFootprint' | 'tickVolume' | 'pairCompare' | 'pairSignal' | 'oracle' | 'nextGlobal' | 'tempo' | 'tempoGlobal' | 'accute' | 'accuteGlobal'
 const PANEL_META: { id: PanelId; label: string }[] = [
   { id: 'signals', label: 'Chart Signals' },
   { id: 'yday', label: 'Yesterday @ Now' },
@@ -103,6 +105,8 @@ const PANEL_META: { id: PanelId; label: string }[] = [
   { id: 'nextGlobal', label: 'Next Global' },
   { id: 'tempo', label: 'Tempo' },
   { id: 'tempoGlobal', label: 'Tempo Global' },
+  { id: 'accute', label: 'Accute' },
+  { id: 'accuteGlobal', label: 'Accute Global' },
 ]
 const DEFAULT_PANEL_VISIBILITY: Record<PanelId, boolean> = {
   signals: true,
@@ -124,6 +128,8 @@ const DEFAULT_PANEL_VISIBILITY: Record<PanelId, boolean> = {
   nextGlobal: true,
   tempo: true,
   tempoGlobal: true,
+  accute: true,
+  accuteGlobal: true,
 }
 const PANEL_VISIBILITY_STORAGE_KEY = 'iqos.panelVisibility.v1'
 
@@ -230,6 +236,8 @@ export default function OSPage() {
   const [nextGlobalOpen, setNextGlobalOpen] = useState(false)
   const [tempoOpen, setTempoOpen] = useState(false)
   const [tempoGlobalOpen, setTempoGlobalOpen] = useState(false)
+  const [accuteOpen, setAccuteOpen] = useState(false)
+  const [accuteGlobalOpen, setAccuteGlobalOpen] = useState(false)
   const [renkoFootprintOpen, setRenkoFootprintOpen] = useState(false)
   const [renkoFootprintOtcOpen, setRenkoFootprintOtcOpen] = useState(false)
   const [volumeFootprintOpen, setVolumeFootprintOpen] = useState(false)
@@ -314,6 +322,8 @@ export default function OSPage() {
         else if (id === 'nextGlobal') setNextGlobalOpen(false)
         else if (id === 'tempo') setTempoOpen(false)
         else if (id === 'tempoGlobal') setTempoGlobalOpen(false)
+        else if (id === 'accute') setAccuteOpen(false)
+        else if (id === 'accuteGlobal') setAccuteGlobalOpen(false)
         else if (id === 'renkoFootprint') setRenkoFootprintOpen(false)
         else if (id === 'renkoFootprintOtc') setRenkoFootprintOtcOpen(false)
         else if (id === 'volumeFootprint') setVolumeFootprintOpen(false)
@@ -702,6 +712,14 @@ export default function OSPage() {
     handleSelectAsset(a)
     setTempoGlobalOpen(false)
     setTempoOpen(true)
+  }, [handleSelectAsset])
+
+  // From the Accute Global board: open a row's pair directly in the
+  // per-asset Accute panel.
+  const handleOpenAccute = useCallback((a: string) => {
+    handleSelectAsset(a)
+    setAccuteGlobalOpen(false)
+    setAccuteOpen(true)
   }, [handleSelectAsset])
 
   // Yesterday panel echo chip: deep-load this asset's candles (so the window
@@ -1147,7 +1165,7 @@ export default function OSPage() {
                 closed = the slim open strip sits above the market watch and
                 everything is laid out exactly as before. */}
             <Panel defaultSize={17} minSize={11}>
-              {signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen || shockPressureOpen || renkoFootprintOpen || renkoFootprintOtcOpen || volumeFootprintOpen || tickVolumeOpen || pairCompareOpen || pairSignalOpen || oracleOpen || nextGlobalOpen || tempoOpen || tempoGlobalOpen ? (
+              {signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen || shockPressureOpen || renkoFootprintOpen || renkoFootprintOtcOpen || volumeFootprintOpen || tickVolumeOpen || pairCompareOpen || pairSignalOpen || oracleOpen || nextGlobalOpen || tempoOpen || tempoGlobalOpen || accuteOpen || accuteGlobalOpen ? (
                 <div className="mr-0.5 h-full min-h-0">
                   {ydayOpen ? (
                     <YesterdayPanel onClose={() => setYdayOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onFocusWindow={handleFocusYesterday} />
@@ -1185,6 +1203,10 @@ export default function OSPage() {
                     <TempoGlobalPanel onClose={() => setTempoGlobalOpen(false)} tf={tf} closedTick={closedTick} onPickAsset={handleSelectAsset} onOpenTempo={handleOpenTempo} />
                   ) : tempoOpen ? (
                     <TempoPanel onClose={() => setTempoOpen(false)} asset={asset} tf={tf} closedTick={closedTick} />
+                  ) : accuteGlobalOpen ? (
+                    <AccuteGlobalPanel onClose={() => setAccuteGlobalOpen(false)} tf={tf} closedTick={closedTick} onPickAsset={handleSelectAsset} onOpenAccute={handleOpenAccute} />
+                  ) : accuteOpen ? (
+                    <AccutePanel onClose={() => setAccuteOpen(false)} asset={asset} tf={tf} closedTick={closedTick} />
                   ) : (
                     <ChartSignalsPanel onClose={() => setSignalsOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onTake={handleTakeSignal} />
                   )}
@@ -1281,6 +1303,30 @@ export default function OSPage() {
                       >
                         <span className="h-1.5 w-1.5 rounded-full bg-fuchsia-400" />
                         Tempo
+                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
+                      </button>
+                      )}
+                      {panelVisibility.accuteGlobal && (
+                      <button
+                        type="button"
+                        onClick={() => setAccuteGlobalOpen(true)}
+                        title="accute global - triple confluence on the whole universe: ADX/DI + Pattern, Tempo (actively firing) and the Next-Candle Oracle all agreeing, per pair"
+                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-violet-500/40 hover:text-violet-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-violet-300" />
+                        Accute Global
+                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
+                      </button>
+                      )}
+                      {panelVisibility.accute && (
+                      <button
+                        type="button"
+                        onClick={() => setAccuteOpen(true)}
+                        title="accute - the strictest signal in the catalog: ADX/DI + Pattern Bias, Tempo (actively firing) and the Next-Candle Oracle all agreeing right now, else waiting"
+                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-violet-500/40 hover:text-violet-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-violet-400" />
+                        Accute
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
                       )}

@@ -397,6 +397,30 @@ export class TempoService {
     }
   }
 
+  /** Single-pair counterpart to scan() - computes a fresh Oracle read for
+   * just this one asset (NextCandleService.rowFor(), same shared TTL cache
+   * the board uses) instead of the whole universe, then runs it through
+   * the exact same rowFromScan() derivation scan() does, so a caller gets
+   * Tempo's REAL stateful decision - this pair's own window history,
+   * one-shot-per-window state, pair-accuracy dampening - without paying
+   * for or depending on a full board scan. Read-only: like scan(), this
+   * never spends the window license - only claim() does that. */
+  rowFor(asset: string, tf: Timeframe): TempoRow {
+    const tfSec = TIMEFRAME_SECONDS[tf] ?? 60
+    const now = Date.now()
+    let oracle: NextCandleService | null = null
+    try {
+      oracle = this.ctx.use<NextCandleService>('nextcandle')
+    } catch {
+      oracle = null
+    }
+    if (!oracle) {
+      return this.rowFromScan({ asset, tf, computedTs: now, targetBarTime: 0, ok: false, note: 'next-candle oracle plugin not loaded', pUp: 0.5, direction: 'none', confidence: 0, rawConfidence: 0, regime: 'MIXED', price: 0, expectedMove: 0, atr: 0, driversActive: 0, calibration: null }, tf, tfSec, now)
+    }
+    const row = oracle.rowFor(asset, tf)
+    return this.rowFromScan(row, tf, tfSec, now)
+  }
+
   private rowFromScan(r: GlobalScanRow, tf: string, tfSec: number, now: number): TempoRow {
     const key = this.key(tf, r.asset)
     const shotStats = this.shotStats(r.asset, tf)
