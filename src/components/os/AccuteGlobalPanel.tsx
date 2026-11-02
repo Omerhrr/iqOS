@@ -1,16 +1,17 @@
 'use client'
 
 // IQAIR//OS - Accute Global panel (the board)
-// The triple-confluence engine lifted to the whole universe: ADX/DI +
-// Pattern Bias, Tempo (actively firing, not merely leaning), and the
-// Next-Candle Oracle fusion, combined per pair. A row shows CALL/PUT only
-// when all three legs agree right now; otherwise it's WAITING, sorted to
-// the bottom. This is deliberately the rarest, strictest signal on the
-// board - expect most rows to read WAITING most of the time.
+// The multi-model prediction fusion lifted to the whole universe: up to 5
+// independent drivers (ADX/DI + Pattern Bias, Tempo, the Next-Candle
+// Oracle, the S/R zone, Renko trend) weighted log-odds fused per pair,
+// the same shape the Next-Candle Oracle itself produces - a continuous
+// pUp/confidence/direction prediction, not a unanimous-agreement gate. A
+// row shows CALL/PUT once the fused read clears the self-adaptive
+// confidence floor; otherwise it's WAITING, sorted to the bottom.
 // Backed by /accute_scan + /accute_stats (plugins/accute.ts).
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { AccuteLegName, AccuteSignal, AccuteStatsResponse, Timeframe } from '@/lib/os/client'
+import type { AccuteDriver, AccuteDriverName, AccuteSignal, AccuteStatsResponse, Timeframe } from '@/lib/os/client'
 import { fmtPrice, getAccuteScan, getAccuteStats } from '@/lib/os/client'
 
 interface AccuteGlobalPanelProps {
@@ -30,8 +31,8 @@ const STATS_POLL_MS = 20_000
 const TFS: Timeframe[] = ['1m', '2m', '5m']
 const LIMIT = 60
 
-const LEG_LABELS: Record<AccuteLegName, string> = { adxPattern: 'ADX/DI+Pat', tempo: 'Tempo', oracle: 'Oracle' }
-const LEG_ORDER: AccuteLegName[] = ['adxPattern', 'tempo', 'oracle']
+const DRIVER_LABELS: Record<AccuteDriverName, string> = { adxPattern: 'ADX/DI+Pat', tempo: 'Tempo', oracle: 'Oracle', zone: 'S/R zone', renko: 'Renko' }
+const DRIVER_ORDER: AccuteDriverName[] = ['adxPattern', 'tempo', 'oracle', 'zone', 'renko']
 
 function dirChip(direction: 'call' | 'put' | 'none', size: 'lg' | 'sm' = 'sm') {
   const none = direction === 'none'
@@ -49,18 +50,18 @@ function dirChip(direction: 'call' | 'put' | 'none', size: 'lg' | 'sm' = 'sm') {
   )
 }
 
-function legDots(legs: AccuteSignal['legs']) {
+/** One dot per possible driver (up to 5) - grey/dim when that driver had
+ * no weight this bar (zone/renko are often absent, by design), colored
+ * by its vote otherwise. Replaces the old "3 legs must agree" dots with
+ * a read of which of the up-to-5 drivers actually fed the fusion. */
+function driverDots(drivers: AccuteDriver[]) {
+  const byName = new Map(drivers.map((d) => [d.name, d]))
   return (
     <span className="inline-flex items-center gap-0.5">
-      {LEG_ORDER.map((name) => {
-        const leg = legs[name]
-        const cls =
-          leg.direction === 'none'
-            ? 'bg-[#24324a]'
-            : leg.direction === 'call'
-              ? 'bg-emerald-400'
-              : 'bg-rose-400'
-        return <span key={name} title={`${LEG_LABELS[name]}: ${leg.label}`} className={`h-2 w-2 rounded-full ${cls}`} />
+      {DRIVER_ORDER.map((name) => {
+        const d = byName.get(name)
+        const cls = !d || d.vote === 0 ? 'bg-[#24324a]' : d.vote > 0 ? 'bg-emerald-400' : 'bg-rose-400'
+        return <span key={name} title={`${DRIVER_LABELS[name]}: ${d ? d.label : 'not active this bar'}`} className={`h-2 w-2 rounded-full ${cls}`} />
       })}
     </span>
   )
@@ -110,7 +111,7 @@ export default function AccuteGlobalPanel({ tf, closedTick, onPickAsset, onOpenA
   }, [loadStats])
 
   const shown = useMemo(() => rows.filter((r) => r.ok), [rows])
-  const agreeing = useMemo(() => shown.filter((r) => r.direction !== 'none').sort((a, b) => b.agreeCount - a.agreeCount), [shown])
+  const agreeing = useMemo(() => shown.filter((r) => r.direction !== 'none').sort((a, b) => b.confidence - a.confidence), [shown])
   const waiting = useMemo(() => shown.filter((r) => r.direction === 'none'), [shown])
   const ordered = [...agreeing, ...waiting]
   const best = agreeing[0]
@@ -120,7 +121,7 @@ export default function AccuteGlobalPanel({ tf, closedTick, onPickAsset, onOpenA
       <div className="flex items-center gap-1.5">
         <span className="h-1.5 w-1.5 rounded-full bg-violet-300" />
         <h3 className="font-mono text-[11px] font-bold uppercase tracking-wider text-[#dbe4f0]">Accute Global</h3>
-        <span className="font-mono text-[9px] text-[#7c8aa5]">triple confluence · {meta ? `${meta.agreeing} agreeing / ${meta.scanned} scanned` : '…'}</span>
+        <span className="font-mono text-[9px] text-[#7c8aa5]">prediction fusion · {meta ? `${meta.agreeing} leaning / ${meta.scanned} scanned` : '…'}</span>
         <div className="ml-auto flex items-center gap-1">
           {TFS.map((t) => (
             <button
@@ -156,11 +157,11 @@ export default function AccuteGlobalPanel({ tf, closedTick, onPickAsset, onOpenA
         </div>
       )}
 
-      {/* strongest current 3-way agreement, if any */}
+      {/* strongest current fused prediction, if any */}
       {best ? (
         <div className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-2">
           <div className="flex items-center justify-between font-mono text-[9px] uppercase tracking-wider text-[#4b5a72]">
-            <span>strongest agreement right now</span>
+            <span>highest-confidence fused read right now</span>
           </div>
           <div className="mt-1.5 flex items-center gap-2">
             <button
@@ -172,7 +173,8 @@ export default function AccuteGlobalPanel({ tf, closedTick, onPickAsset, onOpenA
               {best.asset}
             </button>
             {dirChip(best.direction, 'lg')}
-            {legDots(best.legs)}
+            <span className="font-mono text-[10px] font-bold text-[#dbe4f0]">{best.confidence.toFixed(0)}%</span>
+            {driverDots(best.drivers)}
             {onOpenAccute && (
               <button
                 type="button"
@@ -193,7 +195,7 @@ export default function AccuteGlobalPanel({ tf, closedTick, onPickAsset, onOpenA
       ) : (
         !err && (
           <div className="rounded border border-[#1c2739] bg-[#0b111c] p-2 font-mono text-[9px] text-[#4b5a72]">
-            no 3-way agreement anywhere on the board right now - this is deliberately rare
+            no fused direction clears the confidence floor anywhere on the board right now
           </div>
         )
       )}
@@ -217,7 +219,8 @@ export default function AccuteGlobalPanel({ tf, closedTick, onPickAsset, onOpenA
           >
             <span className="w-24 shrink-0 truncate font-mono text-[10px] font-bold text-[#dbe4f0] group-hover:text-violet-300">{r.asset}</span>
             {dirChip(r.direction)}
-            {legDots(r.legs)}
+            <span className="shrink-0 font-mono text-[8px] text-[#7c8aa5]">{r.confidence.toFixed(0)}%</span>
+            {driverDots(r.drivers)}
             {r.zone.side !== 'none' && (
               <span
                 className={`shrink-0 rounded border px-1 py-px font-mono text-[7px] uppercase ${r.zone.side === 'buy' ? 'border-emerald-500/40 text-emerald-300' : 'border-rose-500/40 text-rose-300'}`}
@@ -258,7 +261,7 @@ export default function AccuteGlobalPanel({ tf, closedTick, onPickAsset, onOpenA
       </div>
 
       <p className="shrink-0 font-mono text-[8px] leading-relaxed text-[#3d4d66]">
-        ADX/DI + Pattern, Tempo (actively firing), and Next-Candle Oracle - CALL/PUT only when all three agree right now, otherwise WAITING. The dots show each leg's own read (green=call, red=put, grey=flat). A CALL is vetoed by an active sell-zone read, a PUT by an active buy-zone read (no zone at all doesn't block - that's the normal case), and either needs the Renko brick trend actively agreeing - the tags show each. The confidence bar adapts per pair, session, and macro regime from Accute's own resolved record - a "gated" tag means that exact bucket has proven itself wrong often enough to stand aside regardless of agreement. Deliberately the rarest signal in the catalog.
+        Up to 5 independent drivers - ADX/DI + Pattern, Tempo, Next-Candle Oracle, S/R zone, Renko trend - weighted log-odds fused per pair, the same shape the Next-Candle Oracle itself uses. CALL/PUT shows once the fused read clears the self-adaptive confidence floor; otherwise WAITING. The dots show each driver's own vote (green=call, red=put, grey=not active this bar - zone/renko sit out most bars by design, that's normal). The confidence floor adapts per pair, session, and macro regime from Accute's own resolved record - a "gated" tag means that exact bucket has proven itself wrong often enough to stand aside regardless of how the drivers lean.
       </p>
     </div>
   )

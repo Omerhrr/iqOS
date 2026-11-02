@@ -28,8 +28,8 @@ import { fitTriangulation, TRIANGULATION_WINDOW, TRIANGULATION_MIN_WINDOW, TRIAN
 import { fitAdxPatternBias, ADX_TREND_THRESHOLD, COMPOSITE_QUALIFY } from '../analytics/adxpatternbias'
 import { fitShockPressure, SHOCK_RATIO_THRESHOLD, PRESSURE_LOOKBACK, SHOCKPRESSURE_COMPOSITE_QUALIFY } from '../analytics/shockpressure'
 import { predictNextCandle, ORACLE_EVAL_WINDOW, ORACLE_MIN_CANDLES, type NextCandlePrediction } from '../analytics/nextcandle'
-import { tempoConviction, tempoDecide, tempoWindow, TEMPO_WINDOW_BARS, TEMPO_HISTORY_WINDOWS, TEMPO_FLOOR, type TempoDecision } from '../analytics/tempo'
-import { combineAccute, accuteSummary } from '../analytics/accute'
+import { tempoConviction, tempoCrossSignalMult, tempoDecide, tempoWindow, TEMPO_WINDOW_BARS, TEMPO_HISTORY_WINDOWS, TEMPO_FLOOR, type TempoDecision } from '../analytics/tempo'
+import { combineAccute, accuteSummary, type AccuteDriver } from '../analytics/accute'
 import { trendPullbackSeries, rangeZoneSeries } from '../analytics/structure'
 
 /** Memoizes Oracle-fusion reads (shared by the 'oracle-fusion' and 'tempo'
@@ -84,7 +84,12 @@ function tempoReplayAt(candles: Candle[], i: number, asset: string, tf: string, 
   const convictionAt = (j: number): number => {
     const pred = oracleFusionPredictionAt(candles, j, asset, tf)
     if (!pred) return 0
-    return tempoConviction(pred.confidence, pred.pUp)
+    // same Renko/Footprint nudge the live Tempo engine applies (plugins/
+    // tempo.ts) - read off this bar's own already-computed drivers, never
+    // re-derived, for live/backtest parity.
+    const renkoVote = pred.drivers.find((d) => d.name === 'Renko bricks')?.vote ?? 0
+    const footprintVote = pred.drivers.find((d) => d.name === 'Footprint')?.vote ?? 0
+    return tempoConviction(pred.confidence, pred.pUp) * tempoCrossSignalMult(pred.direction, renkoVote, footprintVote)
   }
 
   const lookbackStart = Math.max(0, i - lookbackBars)
@@ -116,7 +121,9 @@ function tempoReplayAt(candles: Candle[], i: number, asset: string, tf: string, 
   if (!pred || pred.direction === 'none') {
     return { kind: 'skip', reason: 'oracle has no directional lean on this bar', threshold: 0, patienceBar: 0, conviction: 0, direction: 'none', barIndex: nowWindow.barIndex }
   }
-  const conviction = tempoConviction(pred.confidence, pred.pUp)
+  const predRenkoVote = pred.drivers.find((d) => d.name === 'Renko bricks')?.vote ?? 0
+  const predFootprintVote = pred.drivers.find((d) => d.name === 'Footprint')?.vote ?? 0
+  const conviction = tempoConviction(pred.confidence, pred.pUp) * tempoCrossSignalMult(pred.direction, predRenkoVote, predFootprintVote)
   const dec = tempoDecide({ conviction, barsRemaining: nowWindow.barsRemaining, windowMaxHistory: history, floor: floor !== TEMPO_FLOOR ? floor : undefined })
   return { ...dec, direction: dec.kind === 'fire' ? pred.direction : 'none', barIndex: nowWindow.barIndex }
 }
@@ -2058,15 +2065,14 @@ export const STRATEGIES: StrategyDef[] = [
   },
   {
     id: 'accute',
-    name: 'Accute (Triple Confluence)',
+    name: 'Accute (Prediction Fusion)',
     description:
-      "Invents no new math - fires only when THREE already-live engines all agree on direction right now: ADX/DI + Pattern Bias (analytics/adxpatternbias.ts, qualifies gate), Tempo's one-shot-per-window stopping rule (analytics/tempo.ts - actually FIRING this bar, not merely leaning a direction, since Tempo's raw lean is just the Oracle's own lean passed through and would be redundant here), and the Next-Candle Oracle fusion (analytics/nextcandle.ts, confidence floor). Any one leg sitting at 'none', or a disagreement between legs that do have a lean, is WAITING - analytics/accute.ts's combineAccute() is the single source of truth for the agreement rule, shared with the live Accute plugin so the two can never drift apart on what counts as a 3-way agreement. Deliberately the rarest, strictest entry in the catalog: expect very few trades, each backed by three independent reads.",
+      "Used to fire only when THREE already-live engines all agreed on direction right now - now a weighted prediction fusion, the same shape the Next-Candle Oracle itself produces, not a boolean agreement gate (analytics/accute.ts's combineAccute(), the single source of truth shared with the live Accute plugin so the two never drift apart). Five already-live reads each become one independent, weighted driver: ADX/DI + Pattern Bias (analytics/adxpatternbias.ts, weight boosted when its own `qualifies` bar clears), Tempo (analytics/tempo.ts, weight boosted while its one-shot-per-window stopping rule is actually FIRING - its raw lean is the Oracle's own lean passed through, so it's correlation-discounted against the Oracle driver rather than double-counted), the Next-Candle Oracle fusion (analytics/nextcandle.ts, weight scaled by its own confidence), the support/resistance buy/sell zone read, and the Renko brick trend - the last two pushed only when actually active (both are deliberately sparse, well under 5% of bars by design). The fused pUp/confidence/direction clears a self-adaptive confidence floor (same session/regime-bucketed learning the live plugin runs) before it's allowed to trade, so this is still selective - just via a continuous confidence threshold instead of requiring unrelated drivers to unanimously agree.",
     params: [
       { key: 'adxThreshold', label: 'Min ADX to count as trending', type: 'number', min: 10, max: 50, default: ADX_TREND_THRESHOLD },
       { key: 'lookback', label: 'Pattern scan lookback (bars)', type: 'number', min: 3, max: 20, default: 8 },
-      { key: 'qualify', label: 'Min |ADX/pattern composite| to qualify (0-10)', type: 'number', min: 1, max: 10, step: 0.5, default: COMPOSITE_QUALIFY },
       { key: 'floor', label: 'Tempo absolute conviction floor (fallback)', type: 'number', min: 3, max: 20, default: TEMPO_FLOOR },
-      { key: 'minConfidence', label: 'Min Oracle fused confidence to count (0-100)', type: 'number', min: 0, max: 100, default: 55 },
+      { key: 'minConfidence', label: 'Min fused confidence to trade (0-100)', type: 'number', min: 0, max: 100, default: 55 },
     ],
     evaluate: (candles, p, hints) => {
       const asset = hints?.asset ?? 'backtest'
@@ -2076,62 +2082,90 @@ export const STRATEGIES: StrategyDef[] = [
         return { direction: 'none', score: 0, notes: 'warming up - needs oracle history plus a patience-history lookback window' }
       }
 
-      // leg 1: ADX/DI + Pattern Bias - qualifies() already bakes in the
-      // agree check, composite bar, and the HA/HTF vetoes.
+      // driver 1: ADX/DI + Pattern Bias - composite (-10..10) scaled to a
+      // vote; weight boosted when `qualifies` clears, smaller (not zero)
+      // when it doesn't.
       const fit = fitAdxPatternBias(candles, 14, num(p, 'lookback', 8))
-      const adxDir: 'call' | 'put' | 'none' = fit?.qualifies && Math.abs(fit.composite) >= num(p, 'qualify', COMPOSITE_QUALIFY) ? (fit.direction === 'bullish' ? 'call' : 'put') : 'none'
-      const adxLabel = fit ? `ADX/Pattern ${adxDir === 'none' ? 'not qualifying' : `${adxDir.toUpperCase()} (composite ${fit.composite.toFixed(1)})`}` : 'ADX/Pattern warming up'
+      const adxVote = fit ? clamp(fit.composite / 10, -1, 1) : 0
+      const adxDriver: AccuteDriver = {
+        name: 'adxPattern',
+        pUp: 0.5 + 0.5 * adxVote,
+        weight: fit ? (fit.qualifies ? 9 : 4) : 0,
+        vote: adxVote,
+        label: fit ? `ADX/Pattern ${fit.qualifies ? 'qualifying' : 'not qualifying'} (composite ${fit.composite.toFixed(1)})` : 'ADX/Pattern warming up',
+      }
 
-      // leg 2: Tempo - must be ACTIVELY FIRING this bar (see module doc).
-      const tempoDec = tempoReplayAt(candles, n - 1, asset, tf, num(p, 'floor', TEMPO_FLOOR))
-      const tempoDir: 'call' | 'put' | 'none' = tempoDec.kind === 'fire' ? tempoDec.direction : 'none'
-      const tempoLabel = tempoDec.kind === 'fire' ? `Tempo FIRING ${tempoDir.toUpperCase()}` : `Tempo ${tempoDec.kind} (${tempoDec.reason})`
-
-      // leg 3: Next-Candle Oracle fusion - direction + confidence floor.
+      // Next-Candle Oracle fusion, computed once and shared by driver 2
+      // (Tempo's raw lean IS this same read, passed through - see
+      // analytics/accute.ts's module doc) and driver 3 below.
       const pred = oracleFusionPredictionAt(candles, n - 1, asset, tf)
-      const minConfidence = num(p, 'minConfidence', 55)
-      const oracleDir: 'call' | 'put' | 'none' = pred && pred.direction !== 'none' && pred.confidence >= minConfidence ? pred.direction : 'none'
-      const oracleLabel = pred ? `Oracle ${oracleDir === 'none' ? `not confident enough (${pred.confidence.toFixed(1)} < ${minConfidence})` : `${oracleDir.toUpperCase()} (confidence ${pred.confidence.toFixed(1)})`}` : 'Oracle warming up'
 
-      const result = combineAccute({
-        adxPattern: { direction: adxDir, label: adxLabel },
-        tempo: { direction: tempoDir, label: tempoLabel },
-        oracle: { direction: oracleDir, label: oracleLabel },
-      })
-      if (result.direction === 'none') return { direction: 'none', score: 0, notes: accuteSummary(result) }
+      // driver 2: Tempo - weight boosted while ACTIVELY FIRING this bar;
+      // pUp is the Oracle's own read (Tempo adds timing, not direction -
+      // the correlation discount below prevents double-counting it).
+      const tempoDec = tempoReplayAt(candles, n - 1, asset, tf, num(p, 'floor', TEMPO_FLOOR))
+      const tempoDriver: AccuteDriver = {
+        name: 'tempo',
+        pUp: pred ? pred.pUp : 0.5,
+        weight: !pred ? 0 : tempoDec.kind === 'fire' ? 10 : tempoDec.kind === 'wait' ? 4 : 2,
+        vote: pred ? clamp((pred.pUp - 0.5) * 2, -1, 1) : 0,
+        label: tempoDec.kind === 'fire' ? `Tempo FIRING ${tempoDec.direction.toUpperCase()}` : `Tempo ${tempoDec.kind} (${tempoDec.reason})`,
+      }
 
-      // same two extra gates the LIVE Accute engine applies on top of the
-      // 3-leg agreement (plugins/accute.ts's zoneRead()/renkoRead()). The
-      // zone read is deliberately sparse (trendPullbackSeries/
-      // rangeZoneSeries are both non-zero well under 5% of bars on real
-      // data - they only fire on a confirmed swing pullback or a genuine
-      // range), so it only BLOCKS a direction it actively disagrees with;
-      // 'no recognized zone right now' passes through neutral, same
-      // "thin record is no record" rule as everywhere else in this stack.
-      // Requiring an ACTIVE zone match on every bar (an earlier version of
-      // this gate) effectively vetoed the signal almost always - that's
-      // what made this strategy's backtest numbers go quiet.
+      // driver 3: Next-Candle Oracle fusion, weight scaled by its own
+      // confidence.
+      const oracleDriver: AccuteDriver = {
+        name: 'oracle',
+        pUp: pred ? pred.pUp : 0.5,
+        weight: pred ? Math.max(2, 10 * (pred.confidence / 100)) : 0,
+        vote: pred ? clamp((pred.pUp - 0.5) * 2, -1, 1) : 0,
+        label: pred ? `Oracle ${pred.direction === 'none' ? 'no lean' : pred.direction.toUpperCase()} (confidence ${pred.confidence.toFixed(1)})` : 'Oracle warming up',
+      }
+
+      // driver 4: support/resistance + buy/sell zone - pushed only when
+      // active (both series are deliberately sparse, well under 5% of
+      // bars by design); weight 0 (dropped before fusing) otherwise.
       const trend = trendPullbackSeries(candles)
       const tVal = trend[trend.length - 1] ?? 0
       const range = rangeZoneSeries(candles)
       const rVal = range[range.length - 1] ?? 0
       const zoneSide: 'buy' | 'sell' | 'none' = tVal !== 0 ? (tVal > 0 ? 'buy' : 'sell') : rVal !== 0 ? (rVal > 0 ? 'buy' : 'sell') : 'none'
-      const zoneBlocks = result.direction === 'call' ? zoneSide === 'sell' : zoneSide === 'buy'
-      if (zoneBlocks) {
-        return { direction: 'none', score: 0, notes: `zone gate: ${result.direction.toUpperCase()} agreement found, but price reads the opposite buy/sell zone - standing aside` }
+      const zoneStrength = Math.abs(tVal !== 0 ? tVal : rVal)
+      const zoneVote: number = zoneSide === 'buy' ? 1 : zoneSide === 'sell' ? -1 : 0
+      const zoneDriver: AccuteDriver = {
+        name: 'zone',
+        pUp: 0.5 + 0.3 * zoneVote,
+        weight: zoneSide === 'none' ? 0 : clamp(6 + zoneStrength * 3, 6, 10),
+        vote: zoneVote,
+        label: zoneSide === 'none' ? 'no recognized zone' : `price reads the ${zoneSide} zone`,
       }
 
+      // driver 5: Renko brick trend - pushed only once a brick has
+      // actually painted.
       const renko = renkoBricks(candles)
-      const renkoBlocks = result.direction === 'call' ? renko.trend !== 'up' : renko.trend !== 'down'
-      if (renkoBlocks) {
-        return { direction: 'none', score: 0, notes: `renko gate: ${result.direction.toUpperCase()} agreement found, but Renko trend is ${renko.trend} - standing aside` }
+      const renkoVote: number = renko.trend === 'up' ? 1 : renko.trend === 'down' ? -1 : 0
+      const renkoDriver: AccuteDriver = {
+        name: 'renko',
+        pUp: 0.5 + 0.28 * renkoVote,
+        weight: renko.trend === 'none' ? 0 : clamp(5 + renko.streak * 0.3, 5, 9),
+        vote: renkoVote,
+        label: renko.trend === 'none' ? 'no Renko brick yet' : `Renko trend ${renko.trend} (${renko.streak} bricks)`,
       }
 
-      const conf = pred?.confidence ?? 60
+      const fused = combineAccute([adxDriver, tempoDriver, oracleDriver, zoneDriver, renkoDriver])
+      const minConfidence = num(p, 'minConfidence', 55)
+      if (fused.direction === 'none' || fused.confidence < minConfidence) {
+        return {
+          direction: 'none',
+          score: 0,
+          notes: fused.direction === 'none' ? accuteSummary(fused) : `confidence gate: fused ${fused.direction.toUpperCase()} at ${fused.confidence.toFixed(0)}, below ${minConfidence} - standing aside`,
+        }
+      }
+
       return {
-        direction: result.direction,
-        score: clamp(50 + conf * 0.45, 50, 97),
-        notes: accuteSummary(result),
+        direction: fused.direction,
+        score: clamp(50 + fused.confidence * 0.45, 50, 97),
+        notes: accuteSummary(fused),
       }
     },
   },

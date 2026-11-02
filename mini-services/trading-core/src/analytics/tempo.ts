@@ -146,6 +146,43 @@ export function tempoConviction(confidence: number, pUp: number): number {
   return Math.max(0, Math.min(100, (confidence * edgePp) / 100))
 }
 
+/** Renko bricks and Footprint (order-flow delta) as independent inputs to
+ * conviction - not a binary confluence veto like claim()'s cross-engine
+ * ADX/Pattern check, but a bounded multiplicative nudge, the same "driver,
+ * not a gate" treatment nextcandle.ts gives these same two reads as its
+ * own standalone fusion drivers (#8/#9 there). Tempo's conviction is
+ * already a scalar rather than a probability, so re-fusing from scratch
+ * doesn't fit - a nudge does: agreement raises conviction (more worth
+ * spending the window's one shot on), disagreement lowers it, but never
+ * to zero on its own - a single chart-reading engine disagreeing with the
+ * full oracle fusion is a data point, not a veto. `renkoVote`/
+ * `footprintVote` are signed votes in [-1, 1] (0 = that driver wasn't
+ * active this bar - see GlobalScanRow's own doc), passed straight through
+ * from the Oracle's own already-computed drivers, so this never
+ * recomputes Renko/Footprint itself. The two are correlation-discounted
+ * against each other (both read the same underlying price action) so an
+ * agreeing pair doesn't double-count, the same discount idea
+ * nextcandle.ts applies to its own correlated driver pairs. */
+const CROSS_SIGNAL_MAX_BOOST = 1.18
+const CROSS_SIGNAL_MAX_PENALTY = 0.82
+const CROSS_SIGNAL_CORRELATION_DISCOUNT = 0.6
+
+export function tempoCrossSignalMult(direction: 'call' | 'put' | 'none', renkoVote: number, footprintVote: number): number {
+  if (direction === 'none' || (renkoVote === 0 && footprintVote === 0)) return 1
+  const side = direction === 'call' ? 1 : -1
+  let rW = Math.abs(renkoVote)
+  let fW = Math.abs(footprintVote)
+  const rSign = Math.sign(renkoVote)
+  const fSign = Math.sign(footprintVote)
+  if (rSign !== 0 && rSign === fSign) fW *= CROSS_SIGNAL_CORRELATION_DISCOUNT // footprint listed second, discounted
+  const totalW = rW + fW
+  if (totalW <= 0) return 1
+  const agree = (rSign === side ? rW : rSign === -side ? -rW : 0) + (fSign === side ? fW : fSign === -side ? -fW : 0)
+  const score = Math.max(-1, Math.min(1, agree / totalW)) // -1 full disagree .. +1 full agree
+  const mult = score >= 0 ? 1 + score * (CROSS_SIGNAL_MAX_BOOST - 1) : 1 + score * (1 - CROSS_SIGNAL_MAX_PENALTY)
+  return Math.max(CROSS_SIGNAL_MAX_PENALTY, Math.min(CROSS_SIGNAL_MAX_BOOST, mult))
+}
+
 /** Rolling mean of the pair's recent window-maxima (last N windows). Fewer
  * than 3 observed windows = no statistics yet -> 0, which makes the rule
  * fall back to the absolute floor (explore first, get picky once the

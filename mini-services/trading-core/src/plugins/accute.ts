@@ -1,85 +1,69 @@
-// IQAIR//OS - Accute plugin (triple-confluence confirmation)
+// IQAIR//OS - Accute plugin (multi-model prediction fusion)
 //
-// Wires analytics/accute.ts's combineAccute() to the three engines already
-// running in this kernel instead of inventing anything new:
+// Used to be a strict "ADX/Pattern + Tempo + Oracle must all agree, and
+// zone/renko must not actively disagree" confirmation gate. Wires
+// analytics/accute.ts's combineAccute() to the same five already-live
+// reads this engine always used, but now as independent WEIGHTED DRIVERS
+// fused into a continuous prediction (pUp/confidence/direction), the same
+// shape the Next-Candle Oracle itself produces - not a boolean AND:
 //
 //   1. ADX/DI + Pattern Bias - computed fresh here (fitAdxPatternBias is
 //      pure; there's no standing plugin to read a live fit from, the same
 //      reason index.ts's own scanAdxPatternBias computes it inline), then
 //      fed into plugins/adxhonesty.ts's tracker so Accute's own reads also
-//      grow that honesty ledger.
+//      grow that honesty ledger. Weight boosted when the engine's own
+//      `qualifies` bar clears, smaller (not zero) when it doesn't.
 //   2. Tempo (plugins/tempo.ts's TempoService.rowFor/scan) - read-only:
 //      rowFor() never spends the shared one-shot license, only claim()
 //      does (called by the auto-trader source in os-mode.ts, right before
-//      actually placing a trade off an Accute signal).
+//      actually placing a trade off an Accute signal). Weight boosted
+//      specifically while Tempo's one-shot-per-window stopping rule is
+//      ACTIVELY FIRING this bar - see analytics/accute.ts's module doc for
+//      why that's the independent information Tempo adds, not its raw
+//      lean (which is the Oracle's own lean passed through, and
+//      correlation-discounted accordingly).
 //   3. Next-Candle Oracle (plugins/nextcandle.ts's NextCandleService.rowFor/
 //      globalScan) - same shared TTL-cached board every other panel reads.
+//      Weight scaled by the Oracle's own confidence.
+//   4. Support/resistance + buy/sell zone (zoneRead() below) - pushed as a
+//      driver only when a zone is actually active; see zoneRead()'s doc.
+//   5. Renko brick trend (renkoRead() below) - same idea, pushed only
+//      once a brick has actually painted.
 //
 // Same honesty-loop shape as chartsignals/adxhonesty/tempo/nextcandle:
-// every signal where all three legs agree is TRACKED pending, resolved on
-// the target bar's close, persisted to data/accute_outcomes.json.
+// every signal that clears the self-adaptive confidence floor below is
+// TRACKED pending, resolved on the target bar's close, persisted to
+// data/accute_outcomes.json.
 //
 // Self-adaptive confidence gate (adaptiveAdjustment()): no two pairs trade
 // alike, the same pair trades differently by time of day, and a macro vol
 // spike can make a strategy that works in calm conditions useless in a
-// news spike - so Accute does not use one flat minOracleConfidence bar
-// everywhere. Every resolved 3-way-agreement signal is tagged at issue
-// time with its own session (analytics/session.ts - the clock-based
-// classifier every other adaptive bucket in this stack already uses) and
-// regime (the Oracle/Tempo board's own classifyRegime() read, already
-// computed for every row - VOLATILE is the macro-vol-spike case). Those
-// tags bucket the resolved ledger exactly like plugins/tempo.ts's
-// pairAccuracyMult() and plugins/adaptive.ts's journal gate do, with the
-// same "thin record is no record" graduated fallback: asset+tf+session+
-// regime, widening to asset+tf+regime, then asset+tf, then tf-wide, then
-// fleet-wide, the first level with enough samples wins. A bucket that has
-// proven itself wrong gets its confidence floor raised (or, past a harder
-// threshold, forced to WAITING regardless of 3-way agreement); a bucket
-// that has proven itself strong gets a small, bounded floor relief. Until
-// a bucket has history of its own, the only hand-set rule left is a flat
-// confidence bump during a VOLATILE regime read - the seed the learning
-// above is free to override once it has evidence either way.
-//
-// Support/resistance + buy-zone/sell-zone awareness (zoneRead()): the 3
-// legs above answer "does everything agree on a direction", but not
-// "is price actually somewhere sane to take that direction from" - a CALL
-// fired in the dead middle of a range, or chasing already-extended price
-// away from any structure, is a worse CALL than the identical 3-way
-// agreement fired right off support. Rather than invent new math for
-// this, it reuses analytics/structure.ts's two already-existing, pure,
-// non-repainting series: trendPullbackSeries (a trending market's own
-// swing structure - positive near a confirmed higher-low "support",
-// negative near a confirmed lower-high "resistance") and rangeZoneSeries
-// (a ranging market's own channel - positive near the floor "buy zone",
-// negative near the ceiling "sell zone"). The two are mutually exclusive
-// by design (a market in one structure doesn't qualify for the other), so
-// whichever is non-zero at the live bar IS the zone read. Both series are
-// deliberately sparse (non-zero well under 5% of bars on real data, by
-// design - they only fire on a confirmed swing pullback or a genuine
-// range), so the gate blocks a CALL only when the read ACTIVELY
-// disagrees (reads sell) and a PUT only when it actively reads buy; 'no
-// recognized zone right now' passes through neutral, same "thin record
-// is no record" cold-start rule the adaptive gate above uses - requiring
-// an ACTIVE zone match on every bar would effectively veto the signal
-// almost always.
-//
-// Renko-direction gate (renkoBricks() in analytics/renko.ts, the same
-// engine of record the Renko + Footprint panel/strategies already use):
-// a CALL only clears while the current Renko brick trend is 'up', a PUT
-// only while it's 'down' - 'none' (not enough history to have painted a
-// brick yet) blocks either direction, same as every other gate here. This
-// is the noise filter the other three legs don't have on their own:
-// bricks only form after price has actually moved a full ATR-scaled brick
-// size, so a Renko disagreement is a cheap, independent check that the
-// move Accute is about to call isn't just intrabar noise the 1-minute
-// candle-based legs are reading too eagerly.
+// news spike - so Accute does not use one flat confidence bar everywhere.
+// Every resolved signal is tagged at issue time with its own session
+// (analytics/session.ts - the clock-based classifier every other adaptive
+// bucket in this stack already uses) and regime (the Oracle/Tempo board's
+// own classifyRegime() read, already computed for every row - VOLATILE is
+// the macro-vol-spike case). Those tags bucket the resolved ledger exactly
+// like plugins/tempo.ts's pairAccuracyMult() and plugins/adaptive.ts's
+// journal gate do, with the same "thin record is no record" graduated
+// fallback: asset+tf+session+regime, widening to asset+tf+regime, then
+// asset+tf, then tf-wide, then fleet-wide, the first level with enough
+// samples wins. A bucket that has proven itself wrong gets its confidence
+// floor raised (or, past a harder threshold, forced to WAITING outright);
+// a bucket that has proven itself strong gets a small, bounded floor
+// relief. Until a bucket has history of its own, the only hand-set rule
+// left is a flat confidence bump during a VOLATILE regime read - the seed
+// the learning above is free to override once it has evidence either way.
+// This is now the ONLY thing that can force a fused prediction to WAITING
+// - an honesty-loop check against this exact bucket's own real resolved
+// record, not a structural requirement that unrelated legs agree.
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { KernelContext, Plugin } from '../kernel'
 import type { Candle, Timeframe } from '../types'
 import { fitAdxPatternBias, PATTERN_BIAS_LOOKBACK, higherTimeframe } from '../analytics/adxpatternbias'
-import { combineAccute, accuteSummary, type AccuteDirection, type AccuteResult } from '../analytics/accute'
+import { combineAccute, accuteSummary, type AccuteDirection, type AccuteDriver, type AccuteResult } from '../analytics/accute'
 import { weightedMeanBy } from '../analytics/recencystats'
 import { classifySession, type Session } from '../analytics/session'
 import { trendPullbackSeries, rangeZoneSeries } from '../analytics/structure'
@@ -88,6 +72,10 @@ import type { MarketDataService } from './market-data'
 import type { NextCandleService, GlobalScanRow } from './nextcandle'
 import type { TempoService, TempoRow } from './tempo'
 import type { AdxHonestyService } from './adxhonesty'
+
+function clamp(v: number, lo: number, hi: number): number {
+  return Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : lo
+}
 
 const MAX_RESOLVED = 500
 const OUTCOME_FILE = 'accute_outcomes.json'
@@ -134,9 +122,30 @@ export interface AccuteAdaptiveAdjustment {
   note: string
 }
 
-/** Support/resistance + buy-zone/sell-zone read, see module header. `source`
- * says which structure detector actually produced it ('none' = price isn't
- * currently sitting in any recognized zone at all). */
+/** Support/resistance + buy-zone/sell-zone read - the other 3 drivers
+ * answer "does the fused read lean a direction", but not "is price
+ * actually somewhere sane to take that direction from" - a CALL fired in
+ * the dead middle of a range, or chasing already-extended price away
+ * from any structure, is worth less than the identical lean fired right
+ * off support. Rather than invent new math for this, it reuses
+ * analytics/structure.ts's two already-existing, pure, non-repainting
+ * series: trendPullbackSeries (a trending market's own swing structure -
+ * positive near a confirmed higher-low "support", negative near a
+ * confirmed lower-high "resistance") and rangeZoneSeries (a ranging
+ * market's own channel - positive near the floor "buy zone", negative
+ * near the ceiling "sell zone"). The two are mutually exclusive by design
+ * (a market in one structure doesn't qualify for the other), so whichever
+ * is non-zero at the live bar IS the zone read. Both series are
+ * deliberately sparse (non-zero well under 5% of bars on real data, by
+ * design - they only fire on a confirmed swing pullback or a genuine
+ * range), which is exactly why this is pushed into the fusion as a
+ * DRIVER that's simply ABSENT most bars (weight 0, dropped before
+ * fusing) rather than a gate that has to actively match every bar - an
+ * earlier version of this read required an ACTIVE zone match to avoid
+ * being blocked, which (being non-zero under 5% of the time) effectively
+ * vetoed the signal almost always. `source` says which structure detector
+ * actually produced it ('none' = price isn't currently sitting in any
+ * recognized zone at all, i.e. this driver sits out this bar). */
 export interface AccuteZoneRead {
   source: 'trend' | 'range' | 'none'
   side: 'buy' | 'sell' | 'none'
@@ -174,7 +183,15 @@ function zoneRead(candles: Candle[]): AccuteZoneRead {
   return { source: 'none', side: 'none', strength: 0, label: 'price is not currently in a recognized support/resistance or buy/sell zone' }
 }
 
-/** Current Renko brick trend read, see module header. */
+/** Current Renko brick trend read (renkoBricks() in analytics/renko.ts,
+ * the same engine of record the Renko + Footprint panel/strategies
+ * already use) - pushed into the fusion as a driver only once a brick
+ * has actually painted ('none' = not enough history yet, sits out this
+ * bar), same sparse-driver convention as zoneRead() above. This is the
+ * noise filter the other drivers don't have on their own: bricks only
+ * form after price has actually moved a full ATR-scaled brick size, so a
+ * Renko read is a cheap, independent check that a move isn't just
+ * intrabar noise the 1-minute candle-based drivers read too eagerly. */
 export interface AccuteRenkoRead {
   trend: 'up' | 'down' | 'none'
   streak: number
@@ -225,9 +242,18 @@ export interface AccuteSignalResponse {
   direction: AccuteDirection
   waiting: boolean
   summary: string
-  legs: AccuteResult['legs']
-  agreeCount: number
-  leaning: 'call' | 'put' | null
+  /** fused probability of the next window resolving 'up' - 0.5 = no lean. */
+  pUp: number
+  /** 0-100, the fused prediction's own confidence - see analytics/
+   * accute.ts's combineAccute() for how it's derived. */
+  confidence: number
+  /** every driver that had a nonzero weight this bar (up to 5: ADX/
+   * Pattern, Tempo, Oracle, Zone, Renko) - absent drivers simply aren't
+   * listed, same convention the Oracle's own driver list uses. */
+  drivers: AccuteDriver[]
+  driversActive: number
+  /** share of the active weight agreeing with the winning side, 0..1. */
+  agreement: number
   price: number
   targetBarTime: number
   computedTs: number
@@ -260,7 +286,7 @@ export class AccuteService {
       if (!closed) return
       this.resolveFor(asset, tf, candle)
     })
-    ctx.log('accute', "Accute triple-confluence engine online (ADX/DI + Pattern, Tempo, Next-Candle Oracle - signals only when all 3 agree)")
+    ctx.log('accute', 'Accute prediction engine online (ADX/DI + Pattern, Tempo, Next-Candle Oracle, Zone, Renko - weighted fusion, not a 3-way agreement gate)')
   }
 
   stop(): void {
@@ -272,12 +298,7 @@ export class AccuteService {
     return {
       asset, tf, ok: false, note,
       direction: 'none', waiting: true, summary: note,
-      legs: {
-        adxPattern: { direction: 'none', label: note },
-        tempo: { direction: 'none', label: note },
-        oracle: { direction: 'none', label: note },
-      },
-      agreeCount: 0, leaning: null,
+      pUp: 0.5, confidence: 0, drivers: [], driversActive: 0, agreement: 0.5,
       price: 0, targetBarTime: 0, computedTs: now,
       calibration: this.calibrationFor(asset, tf),
       adaptive: {
@@ -414,88 +435,112 @@ export class AccuteService {
     } catch {
       fit = null
     }
-    const adxDir: AccuteDirection = fit?.qualifies ? (fit.direction === 'bullish' ? 'call' : 'put') : 'none'
-    const adxLabel = fit
-      ? `ADX/Pattern ${adxDir === 'none' ? 'not qualifying' : `${adxDir.toUpperCase()} (composite ${fit.composite.toFixed(1)})`}`
-      : 'ADX/Pattern thin history'
+    // driver 1: ADX/DI + Pattern Bias - composite (-10..10) scaled to a
+    // vote; weight boosted when the engine's own `qualifies` bar clears,
+    // smaller (not zero) when it doesn't - still informative, just less.
+    const adxVote = fit ? clamp(fit.composite / 10, -1, 1) : 0
+    const adxDriver: AccuteDriver = {
+      name: 'adxPattern',
+      pUp: 0.5 + 0.5 * adxVote,
+      weight: fit ? (fit.qualifies ? 9 : 4) : 0,
+      vote: adxVote,
+      label: fit
+        ? `ADX/Pattern ${fit.qualifies ? 'qualifying' : 'not qualifying'} (composite ${fit.composite.toFixed(1)})`
+        : 'ADX/Pattern thin history',
+    }
 
-    // leg 2: Tempo - must be ACTIVELY FIRING this bar, not merely leaning a
-    // direction (see analytics/accute.ts's module doc for why).
+    // driver 2: Tempo - weight boosted specifically while its one-shot-
+    // per-window stopping rule is ACTIVELY FIRING this bar (see analytics/
+    // accute.ts's module doc for why that's the independent information
+    // Tempo adds - its raw lean is correlation-discounted against the
+    // Oracle driver below since it's the Oracle's own lean passed through).
     let tempoRow: TempoRow | null = null
     try {
       tempoRow = this.ctx.use<TempoService>('tempo').rowFor(asset, tf as Timeframe)
     } catch {
       tempoRow = null
     }
-    const tempoDir: AccuteDirection = tempoRow?.ok && tempoRow.decision === 'fire' ? tempoRow.direction : 'none'
-    const tempoLabel = !tempoRow?.ok
-      ? 'Tempo warming up'
-      : tempoRow.decision === 'fire'
-        ? `Tempo FIRING ${tempoDir === 'none' ? '' : tempoDir.toUpperCase()}`
-        : `Tempo ${tempoRow.decision} (${tempoRow.decisionReason})`
+    const tempoDriver: AccuteDriver = {
+      name: 'tempo',
+      pUp: tempoRow?.ok ? tempoRow.pUp : 0.5,
+      weight: !tempoRow?.ok ? 0 : tempoRow.decision === 'fire' ? 10 : tempoRow.decision === 'wait' ? 4 : 2,
+      vote: tempoRow?.ok ? clamp((tempoRow.pUp - 0.5) * 2, -1, 1) : 0,
+      label: !tempoRow?.ok
+        ? 'Tempo warming up'
+        : tempoRow.decision === 'fire'
+          ? `Tempo FIRING ${tempoRow.direction === 'none' ? '' : tempoRow.direction.toUpperCase()}`
+          : `Tempo ${tempoRow.decision} (${tempoRow.decisionReason})`,
+    }
 
-    // leg 3: Next-Candle Oracle fusion. Its regime read (classifyRegime,
-    // already computed for every board row) is also what feeds the
-    // adaptive gate below - the "macro factor" the user asked Accute to
-    // account for, since a VOLATILE read is exactly a vol-spike macro
-    // event that can render a calm-conditions edge useless.
+    // driver 3: Next-Candle Oracle fusion, weight scaled by its own
+    // confidence. Its regime read (classifyRegime, already computed for
+    // every board row) is also what feeds the adaptive gate below - the
+    // "macro factor" the user asked Accute to account for, since a
+    // VOLATILE read is exactly a vol-spike macro event that can render a
+    // calm-conditions edge useless.
     let oracleRow: GlobalScanRow | null = null
     try {
       oracleRow = this.ctx.use<NextCandleService>('nextcandle').rowFor(asset, tf as Timeframe)
     } catch {
       oracleRow = null
     }
+    const oracleDriver: AccuteDriver = {
+      name: 'oracle',
+      pUp: oracleRow?.ok ? oracleRow.pUp : 0.5,
+      weight: oracleRow?.ok ? Math.max(2, 10 * (oracleRow.confidence / 100)) : 0,
+      vote: oracleRow?.ok ? clamp((oracleRow.pUp - 0.5) * 2, -1, 1) : 0,
+      label: !oracleRow?.ok
+        ? 'Oracle warming up'
+        : `Oracle ${oracleRow.direction === 'none' ? 'no lean' : oracleRow.direction.toUpperCase()} (confidence ${oracleRow.confidence.toFixed(1)})`,
+    }
+
     const regime = ((oracleRow?.regime ?? tempoRow?.regime ?? 'MIXED') as AccuteRegimeHint)
     const session = classifySession(Math.floor(now / 1000), asset)
     const adaptive = this.adaptiveAdjustment(asset, tf, session, regime, minConf)
     const effectiveMinConf = adaptive.minConfidenceUsed
 
-    const oracleDir: AccuteDirection = oracleRow?.ok && oracleRow.direction !== 'none' && oracleRow.confidence >= effectiveMinConf ? oracleRow.direction : 'none'
-    const oracleLabel = !oracleRow?.ok
-      ? 'Oracle warming up'
-      : oracleDir === 'none'
-        ? `Oracle not confident enough (${oracleRow.confidence.toFixed(1)} < ${effectiveMinConf})`
-        : `Oracle ${oracleDir.toUpperCase()} (confidence ${oracleRow.confidence.toFixed(1)})`
-
-    const rawResult = combineAccute({
-      adxPattern: { direction: adxDir, label: adxLabel },
-      tempo: { direction: tempoDir, label: tempoLabel },
-      oracle: { direction: oracleDir, label: oracleLabel },
-    })
-
-    // support/resistance + buy-zone/sell-zone gate (module header): a CALL
-    // is blocked only while the zone read ACTIVELY disagrees (reads sell),
-    // a PUT only while it actively reads buy. 'none' (no recognized
-    // structure at this bar - trendPullbackSeries/rangeZoneSeries are both
-    // deliberately sparse, non-zero well under 5% of bars on real data) is
-    // treated as neutral and passes through, same "thin record is no
-    // record" cold-start rule the rest of this stack's gates use -
-    // requiring an ACTIVE zone match on every bar (the original version of
-    // this gate) effectively vetoed the signal almost always, which is
-    // what made both the live board and the backtest go quiet.
+    // driver 4: support/resistance + buy/sell zone - pushed only when a
+    // zone is actually active (see zoneRead()'s doc above); weight 0
+    // (dropped before fusing) the rest of the time.
     const zone = zoneRead(candles)
-    const zoneBlocks = rawResult.direction === 'call'
-      ? zone.side === 'sell'
-      : rawResult.direction === 'put'
-        ? zone.side === 'buy'
-        : false
+    const zoneVote: number = zone.side === 'buy' ? 1 : zone.side === 'sell' ? -1 : 0
+    const zoneDriver: AccuteDriver = {
+      name: 'zone',
+      pUp: 0.5 + 0.3 * zoneVote,
+      weight: zone.side === 'none' ? 0 : clamp(6 + zone.strength * 3, 6, 10),
+      vote: zoneVote,
+      label: zone.label,
+    }
 
-    // renko-direction gate (module header): a CALL only clears while the
-    // current brick trend is 'up', a PUT only while it's 'down'.
+    // driver 5: Renko brick trend - pushed only once a brick has actually
+    // painted (see renkoRead()'s doc above).
     const renko = renkoRead(candles)
-    const renkoBlocks = rawResult.direction === 'call'
-      ? renko.trend !== 'up'
-      : rawResult.direction === 'put'
-        ? renko.trend !== 'down'
-        : false
+    const renkoVote: number = renko.trend === 'up' ? 1 : renko.trend === 'down' ? -1 : 0
+    const renkoDriver: AccuteDriver = {
+      name: 'renko',
+      pUp: 0.5 + 0.28 * renkoVote,
+      weight: renko.trend === 'none' ? 0 : clamp(5 + renko.streak * 0.3, 5, 9),
+      vote: renkoVote,
+      label: renko.label,
+    }
 
-    // the adaptive override: a bucket that has already proven itself
-    // wrong often enough stands aside outright, no matter what the 3 legs
-    // say this bar - see adaptiveAdjustment()'s doc. Any gate alone is
-    // enough to force WAITING.
-    const result: AccuteResult = adaptive.overridden || zoneBlocks || renkoBlocks
-      ? { ...rawResult, direction: 'none', waiting: true }
-      : rawResult
+    // fused prediction - a weighted log-odds blend across whichever of
+    // the up-to-5 drivers above had something to say this bar, exactly
+    // like the Next-Candle Oracle's own fusion. No single driver, and no
+    // required subset of drivers, has to agree - see analytics/accute.ts.
+    const fused = combineAccute([adxDriver, tempoDriver, oracleDriver, zoneDriver, renkoDriver])
+
+    // the only thing that can still force WAITING: this exact bucket
+    // (asset+tf+session+regime, or a wider fallback) has either not yet
+    // cleared the self-adaptive confidence floor, or has already proven
+    // itself wrong often enough to be overridden outright - see
+    // adaptiveAdjustment()'s doc. This is an honesty-loop check against
+    // this bucket's own resolved record, not a requirement that unrelated
+    // drivers agree.
+    const confidenceBlocks = fused.direction !== 'none' && fused.confidence < effectiveMinConf
+    const result: AccuteResult = adaptive.overridden || confidenceBlocks
+      ? { ...fused, direction: 'none', waiting: true }
+      : fused
 
     const price = oracleRow?.price || tempoRow?.price || candles[candles.length - 1]?.close || 0
     const targetBarTime = oracleRow?.targetBarTime || tempoRow?.windowEndsAt || 0
@@ -511,11 +556,9 @@ export class AccuteService {
 
     const summary = adaptive.overridden
       ? `adaptive gate: ${adaptive.note}`
-      : zoneBlocks
-        ? `zone gate: ${rawResult.direction.toUpperCase()} agreement found, but ${zone.label} - standing aside`
-        : renkoBlocks
-          ? `renko gate: ${rawResult.direction.toUpperCase()} agreement found, but ${renko.label} - standing aside`
-          : accuteSummary(rawResult)
+      : confidenceBlocks
+        ? `confidence gate: fused ${fused.direction.toUpperCase()} at ${fused.confidence.toFixed(0)} confidence, below the ${effectiveMinConf} floor for this bucket - standing aside`
+        : accuteSummary(fused)
 
     const row: AccuteSignalResponse = {
       asset,
@@ -525,9 +568,11 @@ export class AccuteService {
       direction: result.direction,
       waiting: result.waiting,
       summary,
-      legs: rawResult.legs,
-      agreeCount: rawResult.agreeCount,
-      leaning: rawResult.leaning,
+      pUp: fused.pUp,
+      confidence: fused.confidence,
+      drivers: fused.drivers,
+      driversActive: fused.driversActive,
+      agreement: fused.agreement,
       price,
       targetBarTime,
       computedTs: now,
@@ -569,12 +614,12 @@ export class AccuteService {
         rows.push(this.emptyRow(a.ticker, tf, now, 'read failed this poll'))
       }
     }
-    // agreeing-first, then by how many legs lean the same way, then asset
+    // directional-first, then by fused confidence, then asset
     rows.sort((x, y) => {
       const xAgree = x.direction !== 'none' ? 1 : 0
       const yAgree = y.direction !== 'none' ? 1 : 0
       if (xAgree !== yAgree) return yAgree - xAgree
-      if (y.agreeCount !== x.agreeCount) return y.agreeCount - x.agreeCount
+      if (y.confidence !== x.confidence) return y.confidence - x.confidence
       return x.asset.localeCompare(y.asset)
     })
     return {

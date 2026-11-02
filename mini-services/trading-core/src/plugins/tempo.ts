@@ -27,7 +27,7 @@ import { join } from 'node:path'
 import type { KernelContext, Plugin } from '../kernel'
 import type { Candle, Timeframe } from '../types'
 import { TIMEFRAME_SECONDS } from '../types'
-import { tempoConviction, tempoDecide, tempoWindow, TEMPO_FLOOR, TEMPO_PAIR_ACCURACY_MAX_PENALTY, TEMPO_WINDOW_BARS, PATIENCE_COEFF_DEFAULT, PATIENCE_COEFF_MIN, PATIENCE_COEFF_MAX, type TempoDecision } from '../analytics/tempo'
+import { tempoConviction, tempoCrossSignalMult, tempoDecide, tempoWindow, TEMPO_FLOOR, TEMPO_PAIR_ACCURACY_MAX_PENALTY, TEMPO_WINDOW_BARS, PATIENCE_COEFF_DEFAULT, PATIENCE_COEFF_MIN, PATIENCE_COEFF_MAX, type TempoDecision } from '../analytics/tempo'
 import { fitAdxPatternBias, PATTERN_BIAS_LOOKBACK } from '../analytics/adxpatternbias'
 import type { NextCandleService, GlobalScanRow } from './nextcandle'
 import type { MarketDataService } from './market-data'
@@ -131,6 +131,14 @@ export interface TempoRow {
   calibration: { n: number; hitRate: number; brier: number } | null
   lastShot: { direction: 'call' | 'put'; hit: boolean; conviction: number; resolvedTs: number } | null
   shotStats: { n: number; hitRate: number | null } | null
+  /** signed Renko/Footprint votes feeding tempoCrossSignalMult() - 0 when
+   * that driver wasn't active this bar. Passthrough of the Oracle's own
+   * drivers, see GlobalScanRow's doc. */
+  renkoVote: number
+  footprintVote: number
+  /** plain-language candle-shape label, passthrough of the Oracle's own
+   * classification (analytics/nextcandle.ts's classifyExpectedCandleType()). */
+  expectedCandleType: string
 }
 
 export interface TempoScanResult {
@@ -415,7 +423,7 @@ export class TempoService {
       oracle = null
     }
     if (!oracle) {
-      return this.rowFromScan({ asset, tf, computedTs: now, targetBarTime: 0, ok: false, note: 'next-candle oracle plugin not loaded', pUp: 0.5, direction: 'none', confidence: 0, rawConfidence: 0, regime: 'MIXED', price: 0, expectedMove: 0, atr: 0, driversActive: 0, calibration: null }, tf, tfSec, now)
+      return this.rowFromScan({ asset, tf, computedTs: now, targetBarTime: 0, ok: false, note: 'next-candle oracle plugin not loaded', pUp: 0.5, direction: 'none', confidence: 0, rawConfidence: 0, regime: 'MIXED', price: 0, expectedMove: 0, atr: 0, driversActive: 0, calibration: null, renkoVote: 0, footprintVote: 0, expectedCandleType: '' }, tf, tfSec, now)
     }
     const row = oracle.rowFor(asset, tf)
     return this.rowFromScan(row, tf, tfSec, now)
@@ -433,9 +441,14 @@ export class TempoService {
         fired: false, firedSignal: null, bestConviction: 0, trace: [],
         direction: 'none', pUp: 0.5, confidence: 0, price: r.price, regime: r.regime, driversActive: 0,
         calibration: r.calibration, lastShot, shotStats,
+        renkoVote: 0, footprintVote: 0, expectedCandleType: '',
       }
     }
-    const conviction = tempoConviction(r.confidence, r.pUp)
+    // Renko/Footprint nudge conviction up on agreement, down on
+    // disagreement - a bounded multiplier, not a veto (see
+    // tempoCrossSignalMult()'s doc). Passthrough votes already computed
+    // by the Oracle's own fusion, never re-derived here.
+    const conviction = tempoConviction(r.confidence, r.pUp) * tempoCrossSignalMult(r.direction, r.renkoVote, r.footprintVote)
     const st = this.rollTo(key, r.targetBarTime, tfSec)
     const w = tempoWindow(r.targetBarTime, tfSec)
     // per-bar trace: one entry per predicted bar (dedupe re-polls of the
@@ -475,6 +488,7 @@ export class TempoService {
       direction: r.direction, pUp: r.pUp, confidence: r.confidence, price: r.price,
       regime: r.regime, driversActive: r.driversActive, calibration: r.calibration,
       lastShot, shotStats,
+      renkoVote: r.renkoVote, footprintVote: r.footprintVote, expectedCandleType: r.expectedCandleType,
     }
   }
 
@@ -528,7 +542,11 @@ export class TempoService {
         // learned boost optional - 1 (no change) when the honesty loop isn't loaded
       }
     }
-    const conviction = tempoConviction(pred.confidence, pred.pUp) * confluenceBoost
+    // same Renko/Footprint nudge rowFromScan() applies, read straight off
+    // this claim's own fresh prediction's drivers (never recomputed).
+    const renkoVote = pred.drivers.find((d) => d.name === 'Renko bricks')?.vote ?? 0
+    const footprintVote = pred.drivers.find((d) => d.name === 'Footprint')?.vote ?? 0
+    const conviction = tempoConviction(pred.confidence, pred.pUp) * confluenceBoost * tempoCrossSignalMult(pred.direction, renkoVote, footprintVote)
     const w = tempoWindow(pred.targetBarTime, tfSec)
     const hist = this.historyFor(key, Date.now())
     const recentSimilarLoss = this.recentSimilarLoss(asset, tf, pred.direction, conviction, w.windowIdx)

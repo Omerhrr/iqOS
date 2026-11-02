@@ -179,6 +179,19 @@ export interface GlobalScanRow {
   atr: number
   driversActive: number
   calibration: { n: number; hitRate: number; brier: number } | null
+  /** signed vote in [-1, 1] from the fusion's own "Renko bricks" driver,
+   * 0 when that driver wasn't active this bar (no brick painted yet) -
+   * a passthrough of a read the fusion already computed, not a second
+   * calculation, so Tempo (plugins/tempo.ts) can treat it as one more
+   * independent input without re-deriving Renko itself. */
+  renkoVote: number
+  /** same passthrough for the fusion's "Footprint" driver. */
+  footprintVote: number
+  /** plain-language label for the kind of candle shape this geometry
+   * implies - passthrough of predictNextCandle()'s own classification,
+   * so a consumer built on top of the Oracle (Tempo, Accute) can surface
+   * it without recomputing bodyRatio/closePos itself. */
+  expectedCandleType: string
 }
 
 export interface GlobalScanResult {
@@ -1117,6 +1130,8 @@ export class NextCandleService {
     const pred = this.predict(a.ticker, tf)
     let row: GlobalScanRow
     if (pred) {
+      const renkoDriver = pred.drivers.find((d) => d.name === 'Renko bricks')
+      const footprintDriver = pred.drivers.find((d) => d.name === 'Footprint')
       row = {
         asset: a.ticker,
         tf,
@@ -1134,6 +1149,9 @@ export class NextCandleService {
         atr: pred.atr,
         driversActive: pred.driversActive,
         calibration: pred.calibration,
+        renkoVote: renkoDriver?.vote ?? 0,
+        footprintVote: footprintDriver?.vote ?? 0,
+        expectedCandleType: pred.expectedCandleType,
       }
     } else {
       // thin/no history yet (lazy-seeded feed) - keep the timestamp at the
@@ -1155,6 +1173,9 @@ export class NextCandleService {
         atr: 0,
         driversActive: 0,
         calibration: this.calibrationFor(a.ticker, tf),
+        renkoVote: 0,
+        footprintVote: 0,
+        expectedCandleType: '',
       }
     }
     this.scanRows.set(key, row)

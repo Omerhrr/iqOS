@@ -2012,13 +2012,17 @@ export class ModeService {
   }
 
   /**
-   * Accute source: the triple-confluence confirmation (plugins/accute.ts)
-   * wired straight into the auto-trader. Accute's own board already
-   * requires ADX/DI + Pattern Bias to qualify, Tempo to be ACTIVELY FIRING
-   * this bar, and the Next-Candle Oracle to clear its confidence floor -
-   * all three agreeing on direction - so by the time a row reaches this
-   * picker the hard work is done; placing just needs to atomically spend
-   * the shared Tempo window license via tempo.claim() (the exact same
+   * Accute source: the multi-model prediction fusion (plugins/accute.ts)
+   * wired straight into the auto-trader. Accute's own board already fuses
+   * ADX/DI + Pattern Bias, Tempo, the Next-Candle Oracle, the support/
+   * resistance zone read and the Renko trend into one weighted pUp/
+   * confidence/direction read (analytics/accute.ts's combineAccute(), the
+   * same log-odds fusion shape the Oracle itself uses - not a boolean
+   * "all legs must agree" gate), and the self-adaptive confidence floor
+   * already filters out whatever this exact pair/session/regime bucket
+   * hasn't proven itself on - so by the time a row reaches this picker
+   * the hard work is done; placing just needs to atomically spend the
+   * shared Tempo window license via tempo.claim() (the exact same
    * one-shot resource the 'tempo' source above claims), so an Accute
    * trade and a Tempo trade on the same pair:tf can never double-spend
    * one window's license. Like 'tempo', this does NOT go through
@@ -2042,27 +2046,27 @@ export class ModeService {
         .filter((r) => r.ok && r.direction !== 'none' && pool.includes(r.asset) && !this.assetBlocked(r.asset))
         .filter((r) => this.config.direction === 'both' || r.direction === this.config.direction)
         .filter((r) => {
-          // Accute carries no single "confidence" number of its own (it's
-          // a 3-way agreement gate, not a scored read) - approximate one
-          // from how many legs lean the same way plus the Oracle leg's
-          // own confidence embedded in the row's legs for the score/conf
-          // thresholds every other source is checked against.
-          const conf = Math.round(80 + r.agreeCount * 5)
+          // Accute now carries a real fused confidence number of its own
+          // (analytics/accute.ts's combineAccute(), a weighted prediction
+          // across up to 5 drivers, not a boolean agreement gate) - use
+          // it directly for the score/conf thresholds every other source
+          // is checked against.
+          const conf = Math.round(r.confidence)
           return finGte(conf, this.config.minConfidence) && finGte(conf, this.config.minScore)
         })
-        .sort((a, b) => b.agreeCount - a.agreeCount)
+        .sort((a, b) => b.confidence - a.confidence)
       for (const row of agreeing) {
         if (row.direction === 'none') continue
         const claim = tempo.claim(row.asset, this.config.tf)
         if (!claim.ok || !claim.signal) continue // Tempo's own one-shot license already spent, or lost the race - try the next candidate
-        // re-verify the OTHER two legs are still agreeing right now (the
+        // re-verify the fused read still leans the same way right now (the
         // board row could be up to GLOBAL_SCAN_TTL_MS stale) before
         // actually committing to this candidate.
         const fresh = accute.signal(row.asset, this.config.tf)
-        if (fresh.direction !== row.direction) continue // disagreement crept in since the board was cached - skip, license already spent is an acceptable cost of staying honest
+        if (fresh.direction !== row.direction) continue // the fused lean flipped since the board was cached - skip, license already spent is an acceptable cost of staying honest
         const sig = claim.signal
         const dir: 'call' | 'put' = sig.direction
-        const confidence = Math.round(80 + row.agreeCount * 5)
+        const confidence = Math.round(row.confidence)
         const score = confidence * (dir === 'call' ? 1 : -1)
         const inst = market.assets.find((a) => a.ticker === row.asset)
         return {

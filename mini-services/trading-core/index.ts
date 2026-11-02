@@ -2889,12 +2889,15 @@ const httpServer = createServer(async (req, res) => {
         }
       }
 
-      // ---------- Accute (triple-confluence confirmation) ----------
-      // GET /accute?asset=X&tf=1m -> combined ADX/DI+Pattern + Tempo +
-      // Next-Candle Oracle read for one pair; direction is 'call'/'put'
-      // ONLY when all three agree, else 'none' (waiting). GET /accute_scan
-      // -> the same read lifted to the whole universe. GET /accute_stats
-      // -> the resolved honesty ledger for signals where all 3 agreed.
+      // ---------- Accute (multi-model prediction fusion) ----------
+      // GET /accute?asset=X&tf=1m -> weighted fusion of ADX/DI+Pattern,
+      // Tempo, the Next-Candle Oracle, the support/resistance zone and
+      // Renko (analytics/accute.ts's combineAccute()) for one pair -
+      // pUp/confidence/direction, same shape the Oracle itself returns,
+      // not a unanimous-agreement gate. GET /accute_scan -> the same read
+      // lifted to the whole universe. GET /accute_stats -> the resolved
+      // honesty ledger for signals that cleared the self-adaptive
+      // confidence floor.
       if (path === '/accute') {
         try {
           const svc = kernel.context().use<AccuteService>('accute')

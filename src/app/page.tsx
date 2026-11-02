@@ -704,14 +704,16 @@ export default function OSPage() {
     handleSelectAsset(a)
     setNextGlobalOpen(false)
     setAccuteOpen(false)
+    setTempoOpen(false)
     setOracleOpen(true)
   }, [handleSelectAsset])
 
-  // From the Tempo Global board: open a row's pair directly in the
-  // per-asset Tempo panel.
+  // From the Tempo Global board (or the Oracle panel's cross-nav button):
+  // open a row's pair directly in the per-asset Tempo panel.
   const handleOpenTempo = useCallback((a: string) => {
     handleSelectAsset(a)
     setTempoGlobalOpen(false)
+    setOracleOpen(false)
     setTempoOpen(true)
   }, [handleSelectAsset])
 
@@ -1198,13 +1200,13 @@ export default function OSPage() {
                   ) : pairSignalOpen ? (
                     <PairSignalPanel onClose={() => setPairSignalOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
                   ) : oracleOpen ? (
-                    <NextCandlePanel onClose={() => setOracleOpen(false)} asset={asset} tf={tf} closedTick={closedTick} onOpenAccute={handleOpenAccute} />
+                    <NextCandlePanel onClose={() => setOracleOpen(false)} asset={asset} tf={tf} closedTick={closedTick} onOpenAccute={handleOpenAccute} onOpenTempo={handleOpenTempo} />
                   ) : nextGlobalOpen ? (
                     <NextGlobalPanel onClose={() => setNextGlobalOpen(false)} tf={tf} closedTick={closedTick} onPickAsset={handleSelectAsset} onOpenOracle={handleOpenOracle} />
                   ) : tempoGlobalOpen ? (
                     <TempoGlobalPanel onClose={() => setTempoGlobalOpen(false)} tf={tf} closedTick={closedTick} onPickAsset={handleSelectAsset} onOpenTempo={handleOpenTempo} />
                   ) : tempoOpen ? (
-                    <TempoPanel onClose={() => setTempoOpen(false)} asset={asset} tf={tf} closedTick={closedTick} />
+                    <TempoPanel onClose={() => setTempoOpen(false)} asset={asset} tf={tf} closedTick={closedTick} onOpenOracle={handleOpenOracle} />
                   ) : accuteGlobalOpen ? (
                     <AccuteGlobalPanel onClose={() => setAccuteGlobalOpen(false)} tf={tf} closedTick={closedTick} onPickAsset={handleSelectAsset} onOpenAccute={handleOpenAccute} />
                   ) : accuteOpen ? (

@@ -1725,6 +1725,14 @@ export interface TempoRow {
   calibration: { n: number; hitRate: number; brier: number } | null
   lastShot: { direction: 'call' | 'put'; hit: boolean; conviction: number; resolvedTs: number } | null
   shotStats: { n: number; hitRate: number | null } | null
+  /** signed Renko/Footprint votes nudging conviction (tempoCrossSignalMult())
+   * - 0 when that driver wasn't active this bar. Passthrough of the
+   * Oracle's own drivers, not a separate calculation. */
+  renkoVote: number
+  footprintVote: number
+  /** plain-language candle-shape label, passthrough of the Oracle's own
+   * classification. */
+  expectedCandleType: string
 }
 
 export interface TempoScanResponse {
@@ -1794,25 +1802,32 @@ export async function getTempoStats(): Promise<TempoStatsResponse> {
   return osGet<TempoStatsResponse>('/tempo_stats', {})
 }
 
-// ---------- Accute (triple-confluence confirmation) ----------
-// Combines ADX/DI + Pattern Bias, Tempo (actively firing), and the
-// Next-Candle Oracle fusion into one signal: 'call'/'put' ONLY when all
-// three agree, 'none' (waiting) otherwise. See
-// mini-services/trading-core/src/analytics/accute.ts for the agreement
-// rule and src/plugins/accute.ts for the live engine.
+// ---------- Accute (multi-model prediction fusion) ----------
+// Used to be a strict "ADX/Pattern + Tempo + Oracle must all agree, and
+// zone/renko must not disagree" confluence gate. Now a weighted log-odds
+// fusion across up to 5 independent drivers (ADX/Pattern, Tempo, the
+// Next-Candle Oracle, the support/resistance zone, Renko trend), the same
+// shape the Next-Candle Oracle itself produces - a continuous pUp/
+// confidence/direction prediction, not a unanimous-agreement requirement.
+// See mini-services/trading-core/src/analytics/accute.ts for the fusion
+// and src/plugins/accute.ts for the live engine.
 
 export type AccuteDirection = 'call' | 'put' | 'none'
-export type AccuteLegName = 'adxPattern' | 'tempo' | 'oracle'
+export type AccuteDriverName = 'adxPattern' | 'tempo' | 'oracle' | 'zone' | 'renko'
 
-export interface AccuteLeg {
-  direction: AccuteDirection
+export interface AccuteDriver {
+  name: AccuteDriverName
+  pUp: number
+  weight: number
+  vote: number
   label: string
 }
 
 /** Self-adaptive confidence gate read-out: this exact pair+timeframe+
  * session+regime bucket's own learned adjustment (or the hand-set macro
  * volatility bump / default floor, below the bucket's own sample floor).
- * See mini-services/trading-core/src/plugins/accute.ts's adaptiveAdjustment()
+ * The only thing left that can force a fused prediction to WAITING - see
+ * mini-services/trading-core/src/plugins/accute.ts's adaptiveAdjustment()
  * for the graduated fallback and override rule. */
 export interface AccuteAdaptive {
   bucket: string
@@ -1829,8 +1844,8 @@ export interface AccuteAdaptive {
  * trendPullbackSeries / rangeZoneSeries): 'trend' = a trending structure's
  * own support/resistance pullback, 'range' = a ranging channel's own buy/
  * sell zone, 'none' = price isn't currently in a recognized zone at all.
- * A CALL/PUT only clears this gate while `side` matches ('buy' for CALL,
- * 'sell' for PUT) - see plugins/accute.ts's zoneRead(). */
+ * Feeds the fusion as a driver only while `side` is 'buy'/'sell' - see
+ * plugins/accute.ts's zoneRead(). */
 export interface AccuteZone {
   source: 'trend' | 'range' | 'none'
   side: 'buy' | 'sell' | 'none'
@@ -1839,8 +1854,8 @@ export interface AccuteZone {
 }
 
 /** Current Renko brick trend (analytics/renko.ts's renkoBricks(), the same
- * engine of record the Renko + Footprint panel/strategies use). A CALL
- * only clears while `trend` is 'up', a PUT only while it's 'down' - see
+ * engine of record the Renko + Footprint panel/strategies use). Feeds the
+ * fusion as a driver only while `trend` is 'up'/'down' - see
  * plugins/accute.ts's renkoRead(). */
 export interface AccuteRenko {
   trend: 'up' | 'down' | 'none'
@@ -1857,9 +1872,15 @@ export interface AccuteSignal {
   direction: AccuteDirection
   waiting: boolean
   summary: string
-  legs: Record<AccuteLegName, AccuteLeg>
-  agreeCount: number
-  leaning: 'call' | 'put' | null
+  /** fused probability of the next window resolving 'up' - 0.5 = no lean. */
+  pUp: number
+  /** 0-100, the fused prediction's own confidence. */
+  confidence: number
+  /** every driver that had a nonzero weight this bar (up to 5). */
+  drivers: AccuteDriver[]
+  driversActive: number
+  /** share of the active weight agreeing with the winning side, 0..1. */
+  agreement: number
   price: number
   targetBarTime: number
   computedTs: number
@@ -1880,7 +1901,7 @@ export interface AccuteScanResponse {
   scannedTs: number
   universe: number
   scanned: number
-  /** rows where all 3 legs currently agree */
+  /** rows with a non-'none' fused direction */
   agreeing: number
   rows: AccuteSignal[]
 }

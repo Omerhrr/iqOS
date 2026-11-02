@@ -21,10 +21,41 @@ interface TempoPanelProps {
   /** bumps on every closed candle - keeps the window state fresh */
   closedTick?: number
   onClose: () => void
+  /** cross-nav: jump straight to the Next-Candle Oracle for this same asset */
+  onOpenOracle?: (asset: string) => void
 }
 
 const POLL_MS = 8_000
 const LIMIT = 150 // scan wide enough to always include the chart's pair
+
+/** Same small candlestick glyph NextCandlePanel draws from the Oracle's
+ * own geometry - Tempo's fused read IS that same geometry passed through
+ * (see analytics/accute.ts's module doc), so there's no separate shape to
+ * compute; this just needs bodyRatio/closePos, which the row doesn't
+ * carry today, so it falls back to a simple pUp-driven glyph instead of
+ * duplicating the Oracle's own body-ratio math here. */
+function tempoCandleGlyph(pUp: number, direction: 'call' | 'put' | 'none') {
+  const W = 28
+  const H = 40
+  const none = direction === 'none'
+  const call = direction === 'call'
+  const color = none ? '#7c8aa5' : call ? '#34d399' : '#fb7185'
+  const closePos = Math.min(Math.max(pUp, 0.05), 0.95)
+  const closeY = H * (1 - closePos)
+  const bodyH = Math.max(Math.abs(closePos - 0.5) * H * 0.9, 3)
+  const openY = call ? closeY + bodyH : closeY - bodyH
+  const bodyTop = Math.min(openY, closeY)
+  const bodyBottom = Math.max(openY, closeY)
+  const cx = W / 2
+  const bodyW = W * 0.55
+  return (
+    <svg width={W} height={H + 2} viewBox={`0 0 ${W} ${H}`} className="shrink-0">
+      <line x1={cx} y1={Math.max(bodyTop, 0)} x2={cx} y2={0} stroke={color} strokeWidth={1.5} />
+      <line x1={cx} y1={Math.min(bodyBottom, H)} x2={cx} y2={H} stroke={color} strokeWidth={1.5} />
+      <rect x={cx - bodyW / 2} y={Math.max(bodyTop, 0.5)} width={bodyW} height={Math.max(bodyBottom - bodyTop, 1.5)} fill={none ? 'none' : color} fillOpacity={none ? 0 : 0.85} stroke={color} strokeWidth={1.25} rx={0.75} />
+    </svg>
+  )
+}
 
 function decisionBanner(row: TempoRow) {
   const map: Record<TempoRow['decision'], { cls: string; label: string }> = {
@@ -42,7 +73,7 @@ function decisionBanner(row: TempoRow) {
   )
 }
 
-export default function TempoPanel({ asset, tf, closedTick, onClose }: TempoPanelProps) {
+export default function TempoPanel({ asset, tf, closedTick, onClose, onOpenOracle }: TempoPanelProps) {
   const [row, setRow] = useState<TempoRow | null>(null)
   const [meta, setMeta] = useState<{ window: { index: number; barIndex: number; barsRemaining: number; endsAt: number }; firing: number; scanned: number } | null>(null)
   const [err, setErr] = useState<string | null>(null)
@@ -86,10 +117,20 @@ export default function TempoPanel({ asset, tf, closedTick, onClose }: TempoPane
         <h3 className="font-mono text-[11px] font-bold uppercase tracking-wider text-[#dbe4f0]">Tempo</h3>
         <span className="truncate font-mono text-[10px] font-bold text-fuchsia-300">{asset}</span>
         <span className="font-mono text-[9px] text-[#7c8aa5]">one shot per 10 bars · {tf} expiry</span>
+        {onOpenOracle && (
+          <button
+            type="button"
+            onClick={() => onOpenOracle(asset)}
+            className="ml-auto rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-amber-500/40 hover:text-amber-300"
+            title="open Next-Candle Oracle for this asset"
+          >
+            → oracle
+          </button>
+        )}
         <button
           type="button"
           onClick={onClose}
-          className="ml-auto rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-rose-500/40 hover:text-rose-300"
+          className={`rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-rose-500/40 hover:text-rose-300 ${onOpenOracle ? '' : 'ml-auto'}`}
         >
           ✕
         </button>
@@ -162,14 +203,26 @@ export default function TempoPanel({ asset, tf, closedTick, onClose }: TempoPane
             <div className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-2">
               <div className="font-mono text-[8px] uppercase tracking-wider text-[#4b5a72]">the fused read on this bar</div>
               <div className="mt-1 flex items-center gap-2">
-                <span className={`font-mono text-lg font-bold leading-none ${row.direction === 'call' ? 'text-emerald-300' : row.direction === 'put' ? 'text-rose-300' : 'text-[#7c8aa5]'}`}>
-                  {row.direction === 'none' ? '—' : row.direction === 'call' ? '▲ CALL' : '▼ PUT'}
-                </span>
-                <span className="font-mono text-[9px] text-[#aab6cc]">P(up) {(row.pUp * 100).toFixed(1)}%</span>
+                {tempoCandleGlyph(row.pUp, row.direction)}
+                <div>
+                  <span className={`font-mono text-lg font-bold leading-none ${row.direction === 'call' ? 'text-emerald-300' : row.direction === 'put' ? 'text-rose-300' : 'text-[#7c8aa5]'}`}>
+                    {row.direction === 'none' ? '—' : row.direction === 'call' ? '▲ CALL' : '▼ PUT'}
+                  </span>
+                  <span className="ml-2 font-mono text-[9px] text-[#aab6cc]">P(up) {(row.pUp * 100).toFixed(1)}%</span>
+                </div>
               </div>
               <div className="mt-1 font-mono text-[9px] text-[#7c8aa5]">
                 conf {row.confidence.toFixed(0)}% · {row.driversActive} drivers · {row.regime}
               </div>
+              {row.expectedCandleType && (
+                <p className="mt-1 font-mono text-[8px] italic text-[#7c8aa5]">expecting: {row.expectedCandleType}</p>
+              )}
+              {(row.renkoVote !== 0 || row.footprintVote !== 0) && (
+                <p className="mt-1 font-mono text-[8px] text-[#4b5a72]" title="Renko/Footprint nudge conviction up on agreement, down on disagreement - see tempoCrossSignalMult()">
+                  {row.renkoVote !== 0 && <>renko {(row.renkoVote > 0) === (row.direction === 'call') ? 'agrees' : 'disagrees'} </>}
+                  {row.footprintVote !== 0 && <>footprint {(row.footprintVote > 0) === (row.direction === 'call') ? 'agrees' : 'disagrees'}</>}
+                </p>
+              )}
               <div className="mt-1 font-mono text-[9px] text-[#3d4d66]">
                 {fmtPrice(row.price, asset)}
                 {row.calibration ? ` · oracle record ${Math.round(row.calibration.hitRate * 100)}% of ${row.calibration.n}` : ' · oracle uncalibrated'}
