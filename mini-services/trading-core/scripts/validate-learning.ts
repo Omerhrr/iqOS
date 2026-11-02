@@ -189,4 +189,49 @@ interface ResolvedShot {
   }
 }
 
+// ---------- Accute (triple confluence + zone + renko + adaptive gate) ----------
+interface ResolvedAccute {
+  asset: string
+  tf: string
+  hit: boolean
+  actual: 'up' | 'down' | 'flat'
+  session?: string
+  regime?: string
+}
+{
+  section('Accute (triple confluence)')
+  const data = readJson<{ resolved: ResolvedAccute[] }>('accute_outcomes.json')
+  const rows = (data?.resolved ?? []).filter((r) => r.actual !== 'flat')
+  console.log(`resolved 3-way-agreement signals: ${rows.length}`)
+  if (rows.length >= 20) {
+    const { first, second } = splitHalves(rows)
+    console.log(`half 1 (n=${first.length}): hit rate ${fmt(hitRate(first, (r) => r.hit))}`)
+    console.log(`half 2 (n=${second.length}): hit rate ${fmt(hitRate(second, (r) => r.hit))}`)
+  } else {
+    console.log('not enough resolved history yet for a half-split comparison (need >=20)')
+  }
+  // session/regime buckets the adaptive gate (plugins/accute.ts's
+  // adaptiveAdjustment()) is actually drawing from - same ADAPTIVE_MIN_N
+  // floor (20) that gate itself uses, so "flagged here" means "the live
+  // gate is already acting on this".
+  const byBucket = new Map<string, ResolvedAccute[]>()
+  for (const r of rows) {
+    const k = `${r.asset} ${r.tf} ${r.session ?? 'OFF'} ${r.regime ?? 'MIXED'}`
+    const list = byBucket.get(k) ?? []
+    list.push(r)
+    byBucket.set(k, list)
+  }
+  const flagged = [...byBucket.entries()]
+    .filter(([, rs]) => rs.length >= 20)
+    .map(([k, rs]) => ({ k, n: rs.length, hr: hitRate(rs, (r) => r.hit) ?? 0 }))
+    .sort((a, b) => a.hr - b.hr)
+  if (flagged.length) {
+    console.log('session/regime buckets with enough samples for the adaptive gate to be acting on (worst first):')
+    for (const f of flagged) console.log(`  ${f.k}: ${fmt(f.hr)} over ${f.n} signals${f.hr < 0.42 ? '  <-- past the force-waiting override threshold' : ''}`)
+  } else {
+    console.log('no session/regime bucket has 20+ resolved signals yet - adaptive gate still running on hand-set defaults everywhere')
+  }
+  console.log('note: this only judges signals that made it PAST the zone/renko gates (they are never tracked when blocked) - see scripts/accute_firerate_check.ts for whether those gates are blocking a sane fraction of agreements, not almost all of them.')
+}
+
 console.log('\n(this is a from-disk comparison of real resolved outcomes, not a simulated parallel learning-disabled run - see file header)')
