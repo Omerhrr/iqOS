@@ -30,31 +30,35 @@ import { fitShockPressure, SHOCK_RATIO_THRESHOLD, PRESSURE_LOOKBACK, SHOCKPRESSU
 import { predictNextCandle, ORACLE_EVAL_WINDOW, ORACLE_MIN_CANDLES, type NextCandlePrediction } from '../analytics/nextcandle'
 import { tempoConviction, tempoDecide, tempoWindow, TEMPO_WINDOW_BARS, TEMPO_HISTORY_WINDOWS, TEMPO_FLOOR } from '../analytics/tempo'
 
-/** Memoizes the 'tempo' strategy's Oracle-fusion reads by (asset, tf,
- * candle open time) - a bar's own prediction is a deterministic function
- * of the candle history up through it, so once computed it never needs
- * recomputing, no matter how many later bars' window-max-history rebuild
- * or already-fired replay looks back at it. Without this, a naive replay
- * re-runs the full 7-driver fusion ~140x per bar (O(bars x 140) Oracle
- * evaluations) - slow enough to trip a backtest request's own timeout.
- * With it, each bar's fusion runs ONCE ever (the first time any later bar
- * asks for it) and every subsequent lookback is a cache hit - the backtest
- * as a whole costs about one Oracle evaluation per bar, the same tier as
- * every other Oracle-driven strategy in this catalog. Capped and cleared
- * wholesale when it grows unreasonably large (a long-running process
- * backtesting many different assets/timeframes over a session) rather than
- * evicted piecemeal - simplicity over a proper LRU, since a cache miss
- * only costs one recomputation, never a correctness problem. */
-const TEMPO_PREDICTION_CACHE_MAX = 300_000
-const tempoPredictionCache = new Map<string, NextCandlePrediction | null>()
-function tempoPredictionAt(candles: Candle[], i: number, asset: string, tf: string): NextCandlePrediction | null {
+/** Memoizes Oracle-fusion reads (shared by the 'oracle-fusion' and 'tempo'
+ * strategies below) by (asset, tf, candle open time) - a bar's own
+ * prediction is a deterministic function of the candle history up through
+ * it, so once computed it never needs recomputing, no matter how many
+ * later bars' window-max-history rebuild or already-fired replay (tempo)
+ * looks back at it, or how many different param combinations an
+ * optimizer/sweep re-runs the same candle series through (oracle-fusion's
+ * read never depends on strategy params at all). Without this, tempo's
+ * naive replay re-runs the full 7-driver fusion ~140x per bar (O(bars x
+ * 140) Oracle evaluations) - slow enough to trip a backtest request's own
+ * timeout. With it, each bar's fusion runs ONCE ever (the first time any
+ * later bar or re-run asks for it) and every subsequent lookup is a cache
+ * hit - a tempo backtest as a whole costs about one Oracle evaluation per
+ * bar, the same tier as every other Oracle-driven strategy in this
+ * catalog. Capped and cleared wholesale when it grows unreasonably large
+ * (a long-running process backtesting many different assets/timeframes
+ * over a session) rather than evicted piecemeal - simplicity over a
+ * proper LRU, since a cache miss only costs one recomputation, never a
+ * correctness problem. */
+const ORACLE_FUSION_PREDICTION_CACHE_MAX = 300_000
+const oracleFusionPredictionCache = new Map<string, NextCandlePrediction | null>()
+function oracleFusionPredictionAt(candles: Candle[], i: number, asset: string, tf: string): NextCandlePrediction | null {
   const key = `${asset}|${tf}|${candles[i].time}`
-  const cached = tempoPredictionCache.get(key)
+  const cached = oracleFusionPredictionCache.get(key)
   if (cached !== undefined) return cached
   const evalSlice = candles.slice(Math.max(0, i + 1 - ORACLE_EVAL_WINDOW), i + 1)
   const pred = predictNextCandle(evalSlice, { asset, tf, mode: 'sim' })
-  if (tempoPredictionCache.size > TEMPO_PREDICTION_CACHE_MAX) tempoPredictionCache.clear()
-  tempoPredictionCache.set(key, pred)
+  if (oracleFusionPredictionCache.size > ORACLE_FUSION_PREDICTION_CACHE_MAX) oracleFusionPredictionCache.clear()
+  oracleFusionPredictionCache.set(key, pred)
   return pred
 }
 
@@ -1947,6 +1951,31 @@ export const STRATEGIES: StrategyDef[] = [
     },
   },
   {
+    id: 'oracle-fusion',
+    name: 'Oracle Fusion (Next-Candle Oracle)',
+    description:
+      "The Next-Candle Oracle's own fused read (analytics/nextcandle.ts), as a backtest-able strategy - the same read AutoPilot's 'Oracle Fusion' live signal source trades off of (plugins/os-mode.ts's pickOracleFusionSignal, via the live NextCandleService singleton), reproduced here as a pure per-bar function so it can run through BacktestLab/AILab/Optimizer/Walk-Forward instead of only live. Fuses 7 already-existing models every bar (markov transitions, Monte Carlo bootstrap, Kalman/OU drift, the 14-factor confluence engine, the chart-engines committee, candlestick patterns, and bar physics) into one probability via a log-odds opinion pool, then trades the fused direction once its confidence (agreement + distance from the coin flip, sample-size-dampened) clears a floor. Known simplification: the live engine's learned calibration/driver-weight/correlation/blend-ratio adjustments (plugins/nextcandle.ts's honesty loop) all depend on a resolved-prediction ledger built up over real time that a single backtest pass can't replay into itself bar-by-bar - this entry runs the fusion on its hand-set defaults only, same scope every other strategy here already keeps to its own hand-set constants.",
+    params: [{ key: 'minConfidence', label: 'Min fused confidence to trade (0-100)', type: 'number', min: 0, max: 100, default: 55 }],
+    evaluate: (candles, p, hints) => {
+      const asset = hints?.asset ?? 'backtest'
+      const tf = hints?.tf ?? 'sim'
+      if (candles.length < ORACLE_MIN_CANDLES) {
+        return { direction: 'none', score: 0, notes: 'warming up - not enough bars for the oracle fusion' }
+      }
+      const pred = oracleFusionPredictionAt(candles, candles.length - 1, asset, tf)
+      if (!pred || pred.direction === 'none') return { direction: 'none', score: 0, notes: 'oracle has no directional lean on this bar' }
+      const minConfidence = num(p, 'minConfidence', 55)
+      if (!(pred.confidence >= minConfidence)) {
+        return { direction: 'none', score: 0, notes: `confidence ${pred.confidence.toFixed(1)} leans ${pred.direction} but too thin to clear ${minConfidence}` }
+      }
+      return {
+        direction: pred.direction,
+        score: clamp(pred.confidence, 5, 97),
+        notes: `fused pUp ${(pred.pUp * 100).toFixed(1)}% (${pred.driversActive} drivers active, ${pred.regime.toLowerCase()} regime) - confidence ${pred.confidence.toFixed(1)} clears ${minConfidence}`,
+      }
+    },
+  },
+  {
     id: 'tempo',
     name: 'Tempo (Patience Engine)',
     description:
@@ -1968,11 +1997,11 @@ export const STRATEGIES: StrategyDef[] = [
 
       // convictionAt(i): the Oracle-fusion conviction using only candles up
       // through index i, bounded to the same ORACLE_EVAL_WINDOW tail the
-      // live plugin uses - memoized (tempoPredictionAt/tempoPredictionCache
+      // live plugin uses - memoized (oracleFusionPredictionAt/oracleFusionPredictionCache
       // above) so each bar's own fusion read is only ever computed once,
       // no matter how many later bars' lookback asks for it.
       const convictionAt = (i: number): number => {
-        const pred = tempoPredictionAt(candles, i, oracleAsset, oracleTf)
+        const pred = oracleFusionPredictionAt(candles, i, oracleAsset, oracleTf)
         if (!pred) return 0
         return tempoConviction(pred.confidence, pred.pUp)
       }
@@ -2013,7 +2042,7 @@ export const STRATEGIES: StrategyDef[] = [
         }
       }
 
-      const pred = tempoPredictionAt(candles, n - 1, oracleAsset, oracleTf)
+      const pred = oracleFusionPredictionAt(candles, n - 1, oracleAsset, oracleTf)
       if (!pred || pred.direction === 'none') return { direction: 'none', score: 0, notes: 'oracle has no directional lean on this bar' }
       const conviction = tempoConviction(pred.confidence, pred.pUp)
       const dec = tempoDecide({ conviction, barsRemaining: nowWindow.barsRemaining, windowMaxHistory: history, floor: floor !== TEMPO_FLOOR ? floor : undefined })
