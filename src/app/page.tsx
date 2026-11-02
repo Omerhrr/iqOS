@@ -703,6 +703,7 @@ export default function OSPage() {
   const handleOpenOracle = useCallback((a: string) => {
     handleSelectAsset(a)
     setNextGlobalOpen(false)
+    setAccuteOpen(false)
     setOracleOpen(true)
   }, [handleSelectAsset])
 
@@ -719,6 +720,7 @@ export default function OSPage() {
   const handleOpenAccute = useCallback((a: string) => {
     handleSelectAsset(a)
     setAccuteGlobalOpen(false)
+    setOracleOpen(false)
     setAccuteOpen(true)
   }, [handleSelectAsset])
 
@@ -1196,7 +1198,7 @@ export default function OSPage() {
                   ) : pairSignalOpen ? (
                     <PairSignalPanel onClose={() => setPairSignalOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
                   ) : oracleOpen ? (
-                    <NextCandlePanel onClose={() => setOracleOpen(false)} asset={asset} tf={tf} closedTick={closedTick} />
+                    <NextCandlePanel onClose={() => setOracleOpen(false)} asset={asset} tf={tf} closedTick={closedTick} onOpenAccute={handleOpenAccute} />
                   ) : nextGlobalOpen ? (
                     <NextGlobalPanel onClose={() => setNextGlobalOpen(false)} tf={tf} closedTick={closedTick} onPickAsset={handleSelectAsset} onOpenOracle={handleOpenOracle} />
                   ) : tempoGlobalOpen ? (
@@ -1206,7 +1208,7 @@ export default function OSPage() {
                   ) : accuteGlobalOpen ? (
                     <AccuteGlobalPanel onClose={() => setAccuteGlobalOpen(false)} tf={tf} closedTick={closedTick} onPickAsset={handleSelectAsset} onOpenAccute={handleOpenAccute} />
                   ) : accuteOpen ? (
-                    <AccutePanel onClose={() => setAccuteOpen(false)} asset={asset} tf={tf} closedTick={closedTick} />
+                    <AccutePanel onClose={() => setAccuteOpen(false)} asset={asset} tf={tf} closedTick={closedTick} onOpenOracle={handleOpenOracle} />
                   ) : (
                     <ChartSignalsPanel onClose={() => setSignalsOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onTake={handleTakeSignal} />
                   )}

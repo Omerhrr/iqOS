@@ -22,6 +22,8 @@ interface NextCandlePanelProps {
   /** bumps on every closed candle - keeps the prediction + record fresh */
   closedTick?: number
   onClose: () => void
+  /** cross-nav: jump straight to Accute for this same asset */
+  onOpenAccute?: (asset: string) => void
 }
 
 const FALLBACK_POLL_MS = 15_000
@@ -379,7 +381,7 @@ function ResolutionRow({ r }: { r: OracleRecentResolution }) {
   )
 }
 
-export default function NextCandlePanel({ asset, tf, closedTick, onClose }: NextCandlePanelProps) {
+export default function NextCandlePanel({ asset, tf, closedTick, onClose, onOpenAccute }: NextCandlePanelProps) {
   const [pred, setPred] = useState<NextCandlePrediction | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [stats, setStats] = useState<NextCandleStatsResponse | null>(null)
@@ -415,10 +417,20 @@ export default function NextCandlePanel({ asset, tf, closedTick, onClose }: Next
         <span className="h-1.5 w-1.5 rounded-full bg-amber-300" />
         <h3 className="font-mono text-[11px] font-bold uppercase tracking-wider text-[#dbe4f0]">Next-Candle Oracle</h3>
         <span className="font-mono text-[9px] text-[#7c8aa5]">{asset} · {tf}</span>
+        {onOpenAccute && (
+          <button
+            type="button"
+            onClick={() => onOpenAccute(asset)}
+            className="ml-auto rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-sky-500/40 hover:text-sky-300"
+            title="open Accute for this asset"
+          >
+            → accute
+          </button>
+        )}
         <button
           type="button"
           onClick={onClose}
-          className="ml-auto rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-rose-500/40 hover:text-rose-300"
+          className={`rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-rose-500/40 hover:text-rose-300 ${onOpenAccute ? '' : 'ml-auto'}`}
         >
           close
         </button>
@@ -447,6 +459,11 @@ export default function NextCandlePanel({ asset, tf, closedTick, onClose }: Next
           </div>
 
           {dirBanner(pred)}
+          {pred.expectedCandleType && (
+            <p className="-mt-0.5 font-mono text-[8.5px] italic text-[#7c8aa5]" title="derived from the oracle's own body-ratio/close-position/direction geometry">
+              expecting: {pred.expectedCandleType}
+            </p>
+          )}
           <CalibrationBadge cal={pred.calibration ?? (record ? { n: record.n, hitRate: record.hitRate, brier: record.brier } : null)} />
           <RangeCone p={pred} />
 

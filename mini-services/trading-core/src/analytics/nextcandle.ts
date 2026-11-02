@@ -18,6 +18,21 @@
 //   7. bar physics          - close-location-value + body pressure of the
 //                             last few bars (the OTC feed's only real tell,
 //                             see analytics/otcfootprint.ts)
+//   8. Renko bricks         - the brick-trend read on its own, not folded
+//                             into the chart-engine committee's vote - a
+//                             standalone, independently-weighted model
+//                             exactly like 1-7, not a confluence check
+//                             (analytics/renko.ts via chartsignals.ts's
+//                             engineVoteSingle())
+//   9. Footprint             - order-flow delta/absorption read, same
+//                             standalone treatment as Renko above
+//                             (analytics/footprint.ts via engineVoteSingle())
+// Drivers 8-9 reuse the EXACT SAME vote functions driver #5 (chart-engine
+// committee) already calls internally - they are not a second measurement,
+// just the same read exposed as its own model instead of buried inside
+// the committee's combined score. Since #5 still includes them too, a
+// correlation discount (CORRELATED_DRIVER_GROUPS below) keeps an agreeing
+// pair from being counted as two independent confirmations.
 //
 // REGIME WEIGHTING - the market understanding from the 2026-10-27 research
 // battery (scripts/results/FINDINGS.md): this universe is regime-persistent
@@ -48,7 +63,7 @@ import type { Candle, MarkovResult } from '../types'
 import { markovChain, monteCarlo, ewmaVol, garchVol, rng } from './quant'
 import { ouState } from './kalman'
 import { confluenceSignalOnly } from './engine'
-import { combineVotes, engineVotes, heikinAshiSeries } from './chartsignals'
+import { combineVotes, engineVotes, engineVoteSingle, heikinAshiSeries } from './chartsignals'
 import { detectPatterns, patternBias, learnedPatternReliability } from './patterns'
 import { atr } from './indicators'
 import type { AnalysisResult } from '../types'
@@ -102,6 +117,13 @@ export interface NextCandlePrediction {
   bodyRatio: number
   /** expected close position within the range 0..1 (wick asymmetry read) */
   closePos: number
+  /** plain-language label for the kind of candle shape this geometry
+   * (bodyRatio + closePos + direction) implies - e.g. a wide body with a
+   * close pinned near the extreme reads as a marubozu-like strong candle;
+   * a thin body near the middle reads as a doji/indecision bar. Derived
+   * purely from the estimates above, not a new model - see
+   * classifyExpectedCandleType(). */
+  expectedCandleType: string
   drivers: OracleDriver[]
   /** how many drivers were actually usable (had enough history) */
   driversActive: number
@@ -325,7 +347,15 @@ export interface OracleInput {
  * now only the DEFAULT prior for the one pair hand-picked at design time -
  * see `driverCorrelation` on OracleInput and pairKey() below for the
  * learned, general replacement that covers any pair, not just this one. */
-const CORRELATED_DRIVER_GROUPS: string[][] = [['Candle patterns', 'Bar physics']]
+const CORRELATED_DRIVER_GROUPS: string[][] = [
+  ['Candle patterns', 'Bar physics'],
+  // driver #5 (chart-engine committee) already folds the renko/footprint
+  // votes into its combined score - #8/#9 expose those SAME reads as
+  // their own standalone models (see module header), so when they agree
+  // with the committee it's the same evidence, not a second confirmation.
+  ['Chart engines', 'Renko bricks'],
+  ['Chart engines', 'Footprint'],
+]
 const CORRELATION_DISCOUNT = 0.65
 
 /** Stable, order-independent key for a driver pair - how plugins/
@@ -545,6 +575,38 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
     })
   }
 
+  // ---------- 8. Renko bricks (standalone, not confluence) ----------
+  {
+    const rv = engineVoteSingle('renko', candles)
+    if (rv.dir !== 0) {
+      const w = 8 * trendBoost * chaosFlatten
+      const signed = clamp(rv.dir * rv.weight, -1, 1)
+      drivers.push({
+        name: 'Renko bricks',
+        pUp: pUpFromScore(signed),
+        weight: w,
+        vote: signed,
+        detail: rv.note,
+      })
+    }
+  }
+
+  // ---------- 9. Footprint (order-flow delta/absorption) ----------
+  {
+    const fv = engineVoteSingle('footprint', candles)
+    if (fv.dir !== 0) {
+      const w = 7 * chaosFlatten
+      const signed = clamp(fv.dir * fv.weight, -1, 1)
+      drivers.push({
+        name: 'Footprint',
+        pUp: pUpFromScore(signed),
+        weight: w,
+        vote: signed,
+        detail: fv.note,
+      })
+    }
+  }
+
   // per-driver adaptive weighting: the plugin's honesty loop tracks each
   // model's own resolved accuracy and feeds a multiplier back here, on top
   // of the static regime boosts above - a driver that's been reliably
@@ -602,12 +664,14 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
     drivers.filter((d) => Number.isFinite(d.pUp) && Number.isFinite(d.weight) && d.weight > 0),
     mergedCorrelation,
   )
-  // 7 drivers exist; requiring 4+ (a majority) rather than the old 3 (a
-  // minority, <=43%) closes a real small-sample overconfidence hole - a
-  // thin 3-driver read used to score confidence identically to a full
-  // 7-driver one as long as the few available agreed, which overstates how
-  // much evidence actually backs it.
-  if (usable.length < 4) return null // not enough working models - refuse rather than guess
+  // Up to 9 drivers can fire now (Renko bricks/Footprint, #8-9, are
+  // conditional on having a nonzero vote, same as Chart engines #5);
+  // requiring 5+ (a majority of 9) rather than the old 4-of-7 bar keeps the
+  // same "closes the small-sample overconfidence hole" intent as the
+  // original comment - a thin read used to score confidence identically
+  // to a full-roster one as long as the few available agreed, which
+  // overstates how much evidence actually backs it.
+  if (usable.length < 5) return null // not enough working models - refuse rather than guess
 
   const pUp = fuseOdds(usable.map((d) => ({ pUp: d.pUp, weight: d.weight })))
 
@@ -691,6 +755,7 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
   // elsewhere. A 0.56/0.44 call on a VOLATILE bar used to get exactly the
   // same confidence treatment as one on a clean TRENDING bar.
   const deadband = regime === 'VOLATILE' ? 0.09 : 0.06
+  const direction: 'call' | 'put' | 'none' = pUp >= 0.5 + deadband ? 'call' : pUp <= 0.5 - deadband ? 'put' : 'none'
 
   return {
     asset: input.asset,
@@ -699,7 +764,7 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
     targetBarTime,
     price,
     pUp,
-    direction: pUp >= 0.5 + deadband ? 'call' : pUp <= 0.5 - deadband ? 'put' : 'none',
+    direction,
     confidence,
     rawConfidence,
     regime,
@@ -711,6 +776,7 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
     },
     bodyRatio,
     closePos: closePosRaw,
+    expectedCandleType: classifyExpectedCandleType(bodyRatio, closePosRaw, direction),
     drivers: usable,
     driversActive: usable.length,
     patternHits: patternHitsSnapshot,
@@ -749,6 +815,32 @@ export function setOracleCalibrationProvider(p: OracleCalibrationProvider | null
 }
 export function oracleCalibrationFor(asset: string, tf: string): { n: number; hitRate: number; brier: number } | null {
   return oracleCalibrationProvider ? oracleCalibrationProvider(asset, tf) : null
+}
+
+/** Plain-language label for the kind of candle shape the fused geometry
+ * (body-vs-range ratio, close position within the range, direction)
+ * implies - not a new model, just naming what the already-computed
+ * estimates amount to: a wide body with the close pinned near the
+ * extreme reads as a strong/marubozu-like candle, a thin body near the
+ * middle reads as a doji/indecision bar, and the in-between cases read as
+ * an ordinary directional candle with some wick. */
+function classifyExpectedCandleType(bodyRatio: number, closePos: number, direction: 'call' | 'put' | 'none'): string {
+  if (direction === 'none') {
+    return bodyRatio < 0.3 ? 'doji / indecision candle (no clear direction)' : 'choppy candle, no clear direction despite some body'
+  }
+  const bullish = direction === 'call'
+  const extremeClose = bullish ? closePos >= 0.78 : closePos <= 0.22
+  if (bodyRatio < 0.25) {
+    return `small-bodied ${bullish ? 'bullish' : 'bearish'} spinning-top / near-doji (weak conviction)`
+  }
+  if (bodyRatio >= 0.65 && extremeClose) {
+    return `strong ${bullish ? 'bullish' : 'bearish'} marubozu-like candle (wide body, little opposing wick)`
+  }
+  if (bodyRatio >= 0.65) {
+    return `solid ${bullish ? 'bullish' : 'bearish'} candle with a modest ${bullish ? 'upper' : 'lower'} wick`
+  }
+  const wickSide = bullish ? (closePos < 0.6 ? 'a rejection wick above the close' : 'balanced wicks') : (closePos > 0.4 ? 'a rejection wick below the close' : 'balanced wicks')
+  return `moderate-bodied ${bullish ? 'bullish' : 'bearish'} candle with ${wickSide}`
 }
 
 /** proxy ADX: directional persistence of closes over 20 bars normalized by range travel */

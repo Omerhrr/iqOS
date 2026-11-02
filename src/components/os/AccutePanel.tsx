@@ -18,6 +18,8 @@ interface AccutePanelProps {
   tf: Timeframe
   closedTick?: number
   onClose: () => void
+  /** cross-nav: jump straight to the Next-Candle Oracle for this same asset */
+  onOpenOracle?: (asset: string) => void
 }
 
 const FALLBACK_POLL_MS = 10_000
@@ -53,7 +55,7 @@ function legCard(name: AccuteLegName, leg: AccuteSignal['legs'][AccuteLegName]) 
   )
 }
 
-export default function AccutePanel({ asset, tf, closedTick, onClose }: AccutePanelProps) {
+export default function AccutePanel({ asset, tf, closedTick, onClose, onOpenOracle }: AccutePanelProps) {
   const [signal, setSignal] = useState<AccuteSignal | null>(null)
   const [stats, setStats] = useState<AccuteStatsResponse | null>(null)
   const [err, setErr] = useState<string | null>(null)
@@ -98,10 +100,20 @@ export default function AccutePanel({ asset, tf, closedTick, onClose }: AccutePa
         <span className="h-1.5 w-1.5 rounded-full bg-violet-300" />
         <h3 className="font-mono text-[11px] font-bold uppercase tracking-wider text-[#dbe4f0]">Accute</h3>
         <span className="font-mono text-[9px] text-[#7c8aa5]">{asset} · {tf} · triple confluence</span>
+        {onOpenOracle && (
+          <button
+            type="button"
+            onClick={() => onOpenOracle(asset)}
+            className="ml-auto rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-amber-500/40 hover:text-amber-300"
+            title="open Next-Candle Oracle for this asset"
+          >
+            → oracle
+          </button>
+        )}
         <button
           type="button"
           onClick={onClose}
-          className="ml-auto rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-rose-500/40 hover:text-rose-300"
+          className={`rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-rose-500/40 hover:text-rose-300 ${onOpenOracle ? '' : 'ml-auto'}`}
         >
           ✕
         </button>

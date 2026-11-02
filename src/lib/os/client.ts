@@ -1507,6 +1507,10 @@ export interface NextCandlePrediction {
   bodyRatio: number
   /** expected close position within the range 0..1 (wick asymmetry read) */
   closePos: number
+  /** plain-language label for the kind of candle shape this geometry
+   * implies (marubozu-like, doji/indecision, rejection-wick, etc.) - see
+   * analytics/nextcandle.ts's classifyExpectedCandleType(). */
+  expectedCandleType: string
   drivers: OracleDriver[]
   /** how many drivers were actually usable (had enough history) */
   driversActive: number
