@@ -818,10 +818,18 @@ export interface AdxHonestyResolvedCall {
   hit: boolean
   /** this read's HTF disagreement flag at track time. */
   htfDisagrees: boolean
+  /** this read's HA (Heikin Ashi pattern) disagreement flag at track time. */
+  haDisagrees: boolean
+  /** this read's volumeConfirms flag at track time - null = no volume
+   * data available for this window. */
+  volumeConfirms: boolean | null
   /** true = the HTF veto alone blocked this from firing live - it's here
    * purely so the learned HTF-veto penalty can judge whether the veto is
    * worth its cost; never treat a shadow entry as a real signal. */
   shadow: boolean
+  /** true = the HA veto alone blocked this from firing live - the haBlocks
+   * counterpart of `shadow` above, same non-live, learning-only contract. */
+  haShadow: boolean
   /** did the Next-Candle Oracle have an active same-direction read at
    * track time? null = no active oracle read either way. */
   oracleAgrees: boolean | null
@@ -841,15 +849,31 @@ export interface AdxPatternBiasStatsResponse {
    * smallest composite threshold, among a small candidate sweep, whose
    * own resolved hit rate clears 55%. null = still using the hand-set 3.5. */
   qualifyBar: number | null
+  /** direction-split counterpart of qualifyBar above - a pair/regime can
+   * carry a structural trend bias that makes bullish and bearish reads
+   * differently reliable. Each side independently null until it has its
+   * own 30+ resolved samples clearing the target hit rate, falling back
+   * to the flat qualifyBar (then the hand-set 3.5) when null. */
+  qualifyBarByDirection: { bullish: number | null; bearish: number | null }
   /** learned multiplier an HTF-disagreeing read's composite must clear
    * (as a multiple of the normal qualify bar) to still qualify. null =
    * the HTF veto is still a flat hard block (not enough shadow samples
    * yet to judge it either way). */
   htfPenaltyMult: number | null
+  /** learned multiplier an HA (Heikin Ashi pattern)-disagreeing read's
+   * composite must clear to still qualify - the haBlocks counterpart of
+   * htfPenaltyMult above. null = still a flat hard block. */
+  haPenaltyMult: number | null
   /** learned confidence/score multiplier (capped at 1.25x) applied when
    * the Next-Candle Oracle actively agrees on direction - 1 = no boost
    * (not enough samples on both sides yet to trust the comparison). */
   confluenceBoost: number
+  /** learned, bounded boost (capped at 1.2x) applied to the composite-vs-
+   * qualify-bar comparison when volumeConfirms reads true - 1 = no boost
+   * (not enough resolved samples on both the confirmed and unconfirmed
+   * sides yet, routinely slow on OTC/binary feeds with no real volume
+   * data). */
+  volumeBoost: number
   /** learned replacement for the flat ADX_TREND_THRESHOLD (25) - the
    * smallest candidate ADX level, among a small ascending sweep, whose
    * own resolved subset clears the target hit rate. Can only ever be
@@ -1552,6 +1576,23 @@ export interface NextCandleStatsResponse {
    * enough of its own resolutions - falls back to the blended table above
    * when a regime bucket is thin or absent. */
   regimeDriverWeightMultipliers: Partial<Record<OracleRegime, Record<string, number>>>
+  /** universe-wide CALIBRATION-quality multiplier per driver (0.8-1.2) -
+   * independent of the win-rate multiplier above: rewards a driver for
+   * being honest about its own uncertainty (low resolved Brier), not just
+   * lucky on direction. */
+  driverCalibrationMultipliers: Record<string, number>
+  /** learned pairwise driver correlation discount, keyed by "NameA|NameB"
+   * (alphabetical) - a pair agreeing meaningfully more than chance gets
+   * discounted toward 0.5 so their shared evidence isn't double-counted;
+   * a pair not in this table has no learned discount (the fusion still
+   * applies ONE hand-set default pair, Candle patterns/Bar physics, as a
+   * fallback when nothing's been learned for it yet). */
+  driverCorrelation: Record<string, number>
+  /** learned agreement-weight in the final rawConfidence blend
+   * (confidence = blend*agreement + (1-blend)*distance) - replaces the
+   * flat hand-set 0.55 once there's enough resolved history to pick a
+   * better one. null = still using 0.55. */
+  confidenceBlendWeight: number | null
   /** universe-wide learned per-pattern reliability (0.3-4 scale, same
    * range the hand-set table used) - feeds every patternBias() caller in
    * the codebase, not just this engine. */
@@ -1706,8 +1747,17 @@ export interface TempoStatsResponse {
   /** per-pair lifetime hit rate and the learned floor multiplier
    * pairAccuracyMult() is currently applying - mult > 1 means this pair's
    * lifetime hit rate reads below target and Tempo is dampening it; mult
-   * === 1 means either healthy or still too thin (n<20) to judge. */
-  pairAccuracy: { asset: string; tf: string; n: number; hitRate: number; mult: number }[]
+   * === 1 means either healthy or still too thin (n<20) to judge.
+   * callMult/putMult: the same dampening judged separately per direction
+   * (min 12 of that direction's own resolved shots, else falls back to
+   * the combined mult) - lets a pair that's fine on calls but weak on
+   * puts (or vice versa) get dampened only on its actually-weak side. */
+  pairAccuracy: { asset: string; tf: string; n: number; hitRate: number; mult: number; callMult: number; putMult: number }[]
+  /** fleet-learned pairFloor() coefficient (searched against the resolved
+   * shot ledger for whichever fraction of a pair's expected window-max
+   * would have maximized net hit rate) - replaces the hand-set 0.35 once
+   * there's enough resolved history (n>=40 fleet-wide) to trust one. */
+  patienceCoeff: number
   recent: TempoResolvedShot[]
 }
 

@@ -37,12 +37,16 @@ import type { KernelContext, Plugin } from '../kernel'
 import type { Candle } from '../types'
 import {
   ADX_TREND_THRESHOLD,
+  VOLUME_BOOST_MAX,
   type AdxPatternBiasFit,
   type Bias,
+  setAdxHaLearningProvider,
   setAdxHtfLearningProvider,
   setAdxPatternBiasLearningProvider,
+  setAdxQualifyBarByDirectionProvider,
   setAdxQualifyBarProvider,
   setAdxTrendThresholdProvider,
+  setAdxVolumeBoostProvider,
 } from '../analytics/adxpatternbias'
 import { weightedHitRate } from '../analytics/recencystats'
 
@@ -96,11 +100,22 @@ interface PendingAdxCall {
   /** this read's HTF disagreement flag, carried through to resolution so
    * htfAlignmentLearning() can compare agree-vs-disagree hit rates. */
   htfDisagrees: boolean
+  /** this read's HA (Heikin Ashi pattern) disagreement flag - the haBlocks
+   * counterpart of htfDisagrees above, feeds haAlignmentLearning(). */
+  haDisagrees: boolean
+  /** this read's volumeConfirms flag at track time - feeds
+   * volumeConfirmBoost()'s candidate comparison. null carried through
+   * unchanged (no data, never compared either way). */
+  volumeConfirms: boolean | null
   /** true when this call only exists because the HTF veto alone was
    * blocking an otherwise-qualifying read - tracked for learning purposes
    * only, never treated as a live signal by any caller (fit.qualifies was
    * false, so nothing actually fired on it). */
   shadow: boolean
+  /** true when this call only exists because the HA veto alone was
+   * blocking an otherwise-qualifying read - the haBlocks counterpart of
+   * `shadow` above. Same non-live, learning-only contract. */
+  haShadow: boolean
   /** did the Next-Candle Oracle have an ACTIVE same-direction read on this
    * exact pair+tf at track time? null = oracle had no active read either
    * way (not tracked as agreement OR disagreement). */
@@ -123,7 +138,10 @@ export interface ResolvedAdxCall {
   actual: 'up' | 'down' | 'flat'
   hit: boolean
   htfDisagrees: boolean
+  haDisagrees: boolean
+  volumeConfirms: boolean | null
   shadow: boolean
+  haShadow: boolean
   oracleAgrees: boolean | null
 }
 
@@ -142,9 +160,15 @@ export class AdxHonestyService {
     })
     setAdxPatternBiasLearningProvider(() => this.legWeights())
     setAdxQualifyBarProvider(() => this.learnedQualifyBar())
+    setAdxQualifyBarByDirectionProvider(() => this.learnedQualifyBarByDirection())
     setAdxHtfLearningProvider(() => this.htfAlignmentLearning())
+    setAdxHaLearningProvider(() => this.haAlignmentLearning())
     setAdxTrendThresholdProvider(() => this.learnedAdxTrendThreshold())
-    ctx.log('adxhonesty', 'ADX/DI + pattern bias honesty loop online (learned leg weights + learned qualify bar + learned HTF veto + learned trend threshold)')
+    setAdxVolumeBoostProvider(() => this.volumeConfirmBoost())
+    ctx.log(
+      'adxhonesty',
+      'ADX/DI + pattern bias honesty loop online (learned leg weights + learned qualify bar + direction-split qualify bar + learned HTF veto + learned HA veto + learned trend threshold + learned volume-confirm boost)',
+    )
   }
 
   stop(): void {
@@ -167,7 +191,8 @@ export class AdxHonestyService {
   track(asset: string, tf: string, fit: AdxPatternBiasFit, candles: Candle[], oracleAgrees?: boolean | null): void {
     if (fit.direction === 'neutral') return
     const shadow = !fit.qualifies && fit.htfDisagrees && fit.qualifiesIgnoringHtf
-    if (!fit.qualifies && !shadow) return
+    const haShadow = !fit.qualifies && fit.haDisagrees && fit.qualifiesIgnoringHa
+    if (!fit.qualifies && !shadow && !haShadow) return
     if (candles.length < 2) return
     const last = candles[candles.length - 1]
     const prev = candles[candles.length - 2]
@@ -186,7 +211,10 @@ export class AdxHonestyService {
       adx: fit.adx,
       price: last.close,
       htfDisagrees: fit.htfDisagrees,
+      haDisagrees: fit.haDisagrees,
+      volumeConfirms: fit.volumeConfirms,
       shadow,
+      haShadow,
       oracleAgrees: oracleAgrees ?? null,
     })
     if (this.pending.size > 400) {
@@ -204,7 +232,7 @@ export class AdxHonestyService {
    * lets it count for something, capped at CONFLUENCE_BOOST_MAX so it can
    * only ever nudge, not replace, the base read. */
   confluenceBoost(): number {
-    const window = this.resolved.filter((r) => !r.shadow && r.actual !== 'flat').slice(-SIDE_STATS_WINDOW)
+    const window = this.resolved.filter((r) => !r.shadow && !r.haShadow && r.actual !== 'flat').slice(-SIDE_STATS_WINDOW)
     const agree = window.filter((r) => r.oracleAgrees === true)
     const rest = window.filter((r) => r.oracleAgrees !== true)
     if (agree.length < SIDE_STATS_MIN_N || rest.length < SIDE_STATS_MIN_N) return 1
@@ -238,7 +266,10 @@ export class AdxHonestyService {
         actual,
         hit,
         htfDisagrees: p.htfDisagrees,
+        haDisagrees: p.haDisagrees,
+        volumeConfirms: p.volumeConfirms,
         shadow: p.shadow,
+        haShadow: p.haShadow,
         oracleAgrees: p.oracleAgrees,
       }
       this.resolved.push(entry)
@@ -256,7 +287,7 @@ export class AdxHonestyService {
     // shadow entries never actually fired (the HTF veto blocked them) -
     // excluded here so leg-weight learning stays scoped to real, live
     // calls, same as before this round's HTF-shadow tracking was added.
-    const window = this.resolved.slice(-LEG_STATS_WINDOW).filter((r) => !r.shadow && r.actual !== 'flat')
+    const window = this.resolved.slice(-LEG_STATS_WINDOW).filter((r) => !r.shadow && !r.haShadow && r.actual !== 'flat')
     const trendCalls: boolean[] = []
     const patCalls: boolean[] = []
     for (const r of window) {
@@ -307,7 +338,7 @@ export class AdxHonestyService {
    * COMPOSITE_QUALIFY) until the smallest candidate itself has enough
    * samples to trust. */
   private learnedQualifyBar(): number | null {
-    const window = this.resolved.slice(-QUALIFY_BAR_WINDOW).filter((r) => !r.shadow && r.actual !== 'flat')
+    const window = this.resolved.slice(-QUALIFY_BAR_WINDOW).filter((r) => !r.shadow && !r.haShadow && r.actual !== 'flat')
     if (window.length < QUALIFY_BAR_MIN_N) return null
     for (const c of QUALIFY_BAR_CANDIDATES) {
       const subset = window.filter((r) => Math.abs(r.composite) >= c)
@@ -318,6 +349,63 @@ export class AdxHonestyService {
     return null
   }
 
+  /** Direction-split counterpart of learnedQualifyBar() above - a bullish
+   * composite this reliable doesn't necessarily mean a bearish one of the
+   * same magnitude is equally reliable (many pairs/regimes carry a
+   * structural trend bias). Same ascending-candidate sweep, just run
+   * separately over the call-direction and put-direction subsets. Each
+   * side independently falls back to null (the flat learnedQualifyBar(),
+   * then the hand-set default) below its own QUALIFY_BAR_MIN_N. */
+  private learnedQualifyBarByDirection(): { bullish: number | null; bearish: number | null } {
+    const window = this.resolved.slice(-QUALIFY_BAR_WINDOW).filter((r) => !r.shadow && !r.haShadow && r.actual !== 'flat')
+    const sweep = (dir: 'call' | 'put'): number | null => {
+      const subsetAll = window.filter((r) => r.direction === dir)
+      for (const c of QUALIFY_BAR_CANDIDATES) {
+        const subset = subsetAll.filter((r) => Math.abs(r.composite) >= c)
+        if (subset.length < QUALIFY_BAR_MIN_N) continue
+        const hitRate = weightedHitRate(subset, (r) => r.hit).hitRate
+        if (hitRate >= QUALIFY_TARGET_HIT_RATE) return c
+      }
+      return null
+    }
+    return { bullish: sweep('call'), bearish: sweep('put') }
+  }
+
+  /** Learned replacement for the flat HA (Heikin Ashi pattern) veto - the
+   * haBlocks counterpart of htfAlignmentLearning() below, same comparison
+   * shape: calls where the HA read agreed/was neutral vs calls where it
+   * actively disagreed (including HA-shadow entries, since their real
+   * market outcome is exactly what's needed to judge the veto itself).
+   * null (hard-block default) until both sides clear SIDE_STATS_MIN_N. */
+  private haAlignmentLearning(): { penaltyMult: number } | null {
+    const window = this.resolved.filter((r) => r.actual !== 'flat').slice(-SIDE_STATS_WINDOW)
+    const agree = window.filter((r) => !r.haDisagrees)
+    const disagree = window.filter((r) => r.haDisagrees)
+    if (agree.length < SIDE_STATS_MIN_N || disagree.length < SIDE_STATS_MIN_N) return null
+    const agreeRate = weightedHitRate(agree, (r) => r.hit).hitRate
+    const disagreeRate = weightedHitRate(disagree, (r) => r.hit).hitRate
+    return { penaltyMult: Math.max(1, Math.min(8, 1 + (agreeRate - disagreeRate) * 6)) }
+  }
+
+  /** Learned, bounded boost (see setAdxVolumeBoostProvider in
+   * analytics/adxpatternbias.ts) comparing resolved hit rate when
+   * volumeConfirms read true against when it read false (null/no-data
+   * excluded from both sides - there's nothing to compare there). 1 (no
+   * boost) until both sides clear SIDE_STATS_MIN_N - volume data is
+   * routinely absent on OTC/binary feeds, so this can take a while longer
+   * to earn trust than the other learned numbers here. */
+  private volumeConfirmBoost(): number {
+    const window = this.resolved
+      .filter((r) => !r.shadow && !r.haShadow && r.actual !== 'flat' && r.volumeConfirms !== null)
+      .slice(-SIDE_STATS_WINDOW)
+    const confirmed = window.filter((r) => r.volumeConfirms === true)
+    const unconfirmed = window.filter((r) => r.volumeConfirms === false)
+    if (confirmed.length < SIDE_STATS_MIN_N || unconfirmed.length < SIDE_STATS_MIN_N) return 1
+    const confirmedRate = weightedHitRate(confirmed, (r) => r.hit).hitRate
+    const unconfirmedRate = weightedHitRate(unconfirmed, (r) => r.hit).hitRate
+    return Math.max(1, Math.min(VOLUME_BOOST_MAX, 1 + (confirmedRate - unconfirmedRate) * 2))
+  }
+
   /** Smallest candidate ADX trend threshold, among candidates ascending
    * from the flat ADX_TREND_THRESHOLD, whose own resolved subset clears
    * the target hit rate with enough samples - same sweep shape as
@@ -325,7 +413,7 @@ export class AdxHonestyService {
    * the composite bar. null (stays at the flat default) until the
    * smallest candidate (the default itself) has enough samples. */
   private learnedAdxTrendThreshold(): number | null {
-    const window = this.resolved.slice(-TREND_THRESHOLD_WINDOW).filter((r) => !r.shadow && r.actual !== 'flat')
+    const window = this.resolved.slice(-TREND_THRESHOLD_WINDOW).filter((r) => !r.shadow && !r.haShadow && r.actual !== 'flat')
     if (window.length < TREND_THRESHOLD_MIN_N) return null
     for (const c of TREND_THRESHOLD_CANDIDATES) {
       const subset = window.filter((r) => r.adx >= c)
@@ -343,12 +431,15 @@ export class AdxHonestyService {
     hitRate: number | null
     legWeights: { trendWeight: number; patternWeight: number } | null
     qualifyBar: number | null
+    qualifyBarByDirection: { bullish: number | null; bearish: number | null }
     htfPenaltyMult: number | null
+    haPenaltyMult: number | null
     confluenceBoost: number
+    volumeBoost: number
     trendThreshold: number | null
     recent: ResolvedAdxCall[]
   } {
-    const decided = this.resolved.filter((r) => !r.shadow && r.actual !== 'flat')
+    const decided = this.resolved.filter((r) => !r.shadow && !r.haShadow && r.actual !== 'flat')
     const wins = decided.filter((r) => r.hit).length
     return {
       total: this.resolved.length,
@@ -356,8 +447,11 @@ export class AdxHonestyService {
       hitRate: decided.length ? wins / decided.length : null,
       legWeights: this.legWeights(),
       qualifyBar: this.learnedQualifyBar(),
+      qualifyBarByDirection: this.learnedQualifyBarByDirection(),
       htfPenaltyMult: this.htfAlignmentLearning()?.penaltyMult ?? null,
+      haPenaltyMult: this.haAlignmentLearning()?.penaltyMult ?? null,
       confluenceBoost: this.confluenceBoost(),
+      volumeBoost: this.volumeConfirmBoost(),
       trendThreshold: this.learnedAdxTrendThreshold(),
       recent: this.resolved.slice(-40).reverse(),
     }
@@ -375,7 +469,18 @@ export class AdxHonestyService {
       const f = this.dataFile()
       if (!existsSync(f)) return
       const raw = JSON.parse(readFileSync(f, 'utf8'))
-      if (Array.isArray(raw?.resolved)) this.resolved = raw.resolved.slice(-MAX_RESOLVED)
+      // haDisagrees/volumeConfirms/haShadow are new - older persisted
+      // records won't have them. Default haDisagrees/haShadow to false
+      // (the pre-upgrade behavior never tracked HA-only-blocked shadow
+      // calls, so there are none to recover) and volumeConfirms to null
+      // (unknown, never compared either way).
+      if (Array.isArray(raw?.resolved))
+        this.resolved = raw.resolved.slice(-MAX_RESOLVED).map((r: ResolvedAdxCall) => ({
+          ...r,
+          haDisagrees: typeof r.haDisagrees === 'boolean' ? r.haDisagrees : false,
+          haShadow: typeof r.haShadow === 'boolean' ? r.haShadow : false,
+          volumeConfirms: r.volumeConfirms ?? null,
+        }))
       this.ctx.log('adxhonesty', `restored ${this.resolved.length} resolved ADX/DI + pattern bias calls from data/`)
     } catch {
       // corrupt/missing file - clean ledger, never break boot

@@ -27,12 +27,30 @@ import { join } from 'node:path'
 import type { KernelContext, Plugin } from '../kernel'
 import type { Candle, Timeframe } from '../types'
 import { TIMEFRAME_SECONDS } from '../types'
-import { tempoConviction, tempoDecide, tempoWindow, TEMPO_FLOOR, TEMPO_PAIR_ACCURACY_MAX_PENALTY, TEMPO_WINDOW_BARS, type TempoDecision } from '../analytics/tempo'
+import { tempoConviction, tempoDecide, tempoWindow, TEMPO_FLOOR, TEMPO_PAIR_ACCURACY_MAX_PENALTY, TEMPO_WINDOW_BARS, PATIENCE_COEFF_DEFAULT, PATIENCE_COEFF_MIN, PATIENCE_COEFF_MAX, type TempoDecision } from '../analytics/tempo'
 import { fitAdxPatternBias, PATTERN_BIAS_LOOKBACK } from '../analytics/adxpatternbias'
 import type { NextCandleService, GlobalScanRow } from './nextcandle'
 import type { MarketDataService } from './market-data'
 import type { AdxHonestyService } from './adxhonesty'
 import { weightedHitRate } from '../analytics/recencystats'
+
+/** Candidate coefficients searched by learnedPatienceCoeff() - centered on
+ * the original hand-set PATIENCE_COEFF_DEFAULT (0.35), spanning the full
+ * PATIENCE_COEFF_MIN/MAX band. */
+const PATIENCE_COEFF_CANDIDATES = [0.25, 0.3, 0.35, 0.4, 0.45, 0.5]
+/** "Thin record is no record": fleet-wide resolved-shot floor below which
+ * learnedPatienceCoeff() falls back to the hand-set default rather than
+ * trusting a coefficient search on too little history. */
+const PATIENCE_COEFF_MIN_N = 40
+/** Direction-split pairAccuracyMult: a pair's call-side and put-side
+ * ledgers are judged separately once each has its own min sample count -
+ * thinner than the combined PAIR_ACCURACY_MIN_N (20) since each direction
+ * only sees roughly half the shots a pair takes. */
+const PAIR_ACCURACY_DIRECTION_MIN_N = 12
+
+function clampCoeff(v: number): number {
+  return Math.max(PATIENCE_COEFF_MIN, Math.min(PATIENCE_COEFF_MAX, v))
+}
 
 const MAX_SHOTS = 400
 const SHOT_FILE = 'tempo_shots.json'
@@ -61,6 +79,11 @@ export interface ResolvedShot {
   exit: number
   confidence: number
   conviction: number
+  /** the license floor this shot had to clear at claim time - persisted so
+   * learnedPatienceCoeff() can replay "would a different floor coefficient
+   * still have let this fire" without needing the pair's window-max
+   * history at that moment. */
+  threshold: number
   /** how far into the window the shot was taken (0..9) */
   barIndex: number
   ts: number
@@ -215,11 +238,29 @@ export class TempoService {
    * also returns 1; below target the floor gets multiplied up smoothly,
    * capped at TEMPO_PAIR_ACCURACY_MAX_PENALTY so a structurally bad pair is
    * dampened, never effectively shut off outright. */
-  private pairAccuracyMult(asset: string, tf: string): number {
+  /** `direction` optional: when given, judges only that direction's own
+   * ledger (see PAIR_ACCURACY_DIRECTION_MIN_N) instead of the pair's
+   * combined call+put history - a pair that is structurally fine on calls
+   * but weak on puts (or vice versa) used to get BOTH directions dampened
+   * equally by the combined hit rate; this lets only the actually-weak
+   * side get the raised floor. Falls back to the combined, direction-
+   * blind read below its own sample floor, same "thin record is no
+   * record" philosophy as everywhere else. */
+  private pairAccuracyMult(asset: string, tf: string, direction?: 'call' | 'put'): number {
     const PAIR_ACCURACY_MIN_N = 20
     const PAIR_ACCURACY_TARGET_HIT_RATE = 0.5
-    const decided = this.shots.filter((s) => s.asset === asset && s.tf === tf && !s.flat)
-    if (decided.length < PAIR_ACCURACY_MIN_N) return 1
+    const base = this.shots.filter((s) => s.asset === asset && s.tf === tf && !s.flat)
+    const decided = direction ? base.filter((s) => s.direction === direction) : base
+    const minN = direction ? PAIR_ACCURACY_DIRECTION_MIN_N : PAIR_ACCURACY_MIN_N
+    if (decided.length < minN) {
+      // not enough of this direction's own history yet - fall back to the
+      // pair's combined ledger rather than assuming "no penalty"
+      // outright, so a structurally bad pair doesn't get a free pass on
+      // its thinner-sampled direction while the other direction's penalty
+      // is already well-established.
+      if (direction && base.length >= PAIR_ACCURACY_MIN_N) return this.pairAccuracyMult(asset, tf)
+      return 1
+    }
     // recency-weighted (analytics/recencystats.ts): a pair's lifetime
     // ledger used to treat a loss from months ago exactly like one from
     // this morning - a pair that genuinely turned around would stay
@@ -228,6 +269,42 @@ export class TempoService {
     const hitRate = weightedHitRate(decided, (s) => s.hit).hitRate
     if (hitRate >= PAIR_ACCURACY_TARGET_HIT_RATE) return 1
     return Math.max(1, Math.min(TEMPO_PAIR_ACCURACY_MAX_PENALTY, 1 + (PAIR_ACCURACY_TARGET_HIT_RATE - hitRate) * 3))
+  }
+
+  /** Fleet-wide search over PATIENCE_COEFF_CANDIDATES for whichever
+   * pairFloor() coefficient would have maximized net hit rate across every
+   * resolved shot, replacing the hand-set PATIENCE_COEFF_DEFAULT (0.35).
+   * Can't exactly replay history (a shot's own window-max history at the
+   * time isn't persisted), so this uses each candidate purely as a
+   * decision-quality proxy: for a resolved shot, a HIGHER coefficient
+   * would have required MORE conviction to fire - so a candidate above
+   * the shot's own normalized conviction-vs-threshold margin would have
+   * skipped a trade that, in hindsight, should or shouldn't have been
+   * taken. Concretely: score each candidate by, for every resolved shot,
+   * whether scaling that shot's recorded threshold by (candidate /
+   * PATIENCE_COEFF_DEFAULT) would still have let a WIN fire (good) or
+   * would have blocked a LOSS (good) - counting the fraction of "good"
+   * outcomes per candidate and picking the best. Falls back to
+   * PATIENCE_COEFF_DEFAULT below PATIENCE_COEFF_MIN_N resolved shots
+   * fleet-wide. */
+  private learnedPatienceCoeff(): number {
+    const decided = this.shots.filter((s) => !s.flat && s.threshold !== undefined)
+    if (decided.length < PATIENCE_COEFF_MIN_N) return PATIENCE_COEFF_DEFAULT
+    let best = { coeff: PATIENCE_COEFF_DEFAULT, score: -1 }
+    for (const coeff of PATIENCE_COEFF_CANDIDATES) {
+      const scale = coeff / PATIENCE_COEFF_DEFAULT
+      let good = 0
+      for (const s of decided) {
+        const scaledThreshold = (s.threshold ?? s.conviction) * scale
+        const wouldFire = s.conviction >= scaledThreshold
+        // a win that still would have fired, or a loss that would now be
+        // blocked, counts as this coefficient doing the right thing
+        if ((s.hit && wouldFire) || (!s.hit && !wouldFire)) good++
+      }
+      const score = good / decided.length
+      if (score > best.score) best = { coeff: clampCoeff(coeff), score }
+    }
+    return best.coeff
   }
 
   private stateFor(key: string): PairTempoState {
@@ -355,8 +432,9 @@ export class TempoService {
     }
     const hist = this.historyFor(key, now)
     const recentSimilarLoss = this.recentSimilarLoss(r.asset, tf, r.direction, conviction, w.windowIdx)
-    const pairAccuracyMult = this.pairAccuracyMult(r.asset, tf)
-    const dec: TempoDecision = tempoDecide({ conviction, barsRemaining: w.barsRemaining, windowMaxHistory: hist, recentSimilarLoss, pairAccuracyMult })
+    const pairAccuracyMult = r.direction === 'none' ? this.pairAccuracyMult(r.asset, tf) : this.pairAccuracyMult(r.asset, tf, r.direction)
+    const floorCoeff = this.learnedPatienceCoeff()
+    const dec: TempoDecision = tempoDecide({ conviction, barsRemaining: w.barsRemaining, windowMaxHistory: hist, recentSimilarLoss, pairAccuracyMult, floorCoeff })
     const spent = st.fired
     const decision: TempoRow['decision'] = spent ? 'done' : dec.kind === 'fire' ? 'fire' : dec.kind
     const reason = spent
@@ -430,8 +508,9 @@ export class TempoService {
     const w = tempoWindow(pred.targetBarTime, tfSec)
     const hist = this.historyFor(key, Date.now())
     const recentSimilarLoss = this.recentSimilarLoss(asset, tf, pred.direction, conviction, w.windowIdx)
-    const pairAccuracyMult = this.pairAccuracyMult(asset, tf)
-    const dec = tempoDecide({ conviction, barsRemaining: w.barsRemaining, windowMaxHistory: hist, recentSimilarLoss, pairAccuracyMult })
+    const pairAccuracyMult = this.pairAccuracyMult(asset, tf, pred.direction)
+    const floorCoeff = this.learnedPatienceCoeff()
+    const dec = tempoDecide({ conviction, barsRemaining: w.barsRemaining, windowMaxHistory: hist, recentSimilarLoss, pairAccuracyMult, floorCoeff })
     if (dec.kind !== 'fire') return { ok: false, reason: dec.reason }
     st.fired = true
     st.firedSignal = {
@@ -469,6 +548,7 @@ export class TempoService {
         exit: candle.close,
         confidence: st.firedSignal.confidence,
         conviction: st.firedSignal.conviction,
+        threshold: st.firedSignal.threshold,
         barIndex: tempoWindow(barTimeMs, tfSec).barIndex,
         ts: st.firedSignal.ts,
         resolvedTs: Date.now(),
@@ -510,7 +590,12 @@ export class TempoService {
     hits: number
     losses: number
     hitRate: number | null
-    pairAccuracy: { asset: string; tf: string; n: number; hitRate: number; mult: number }[]
+    pairAccuracy: { asset: string; tf: string; n: number; hitRate: number; mult: number; callMult: number; putMult: number }[]
+    /** fleet-learned pairFloor() coefficient (see learnedPatienceCoeff()) -
+     * replaces the hand-set PATIENCE_COEFF_DEFAULT (0.35) once there's
+     * enough resolved history to trust one. Equal to PATIENCE_COEFF_DEFAULT
+     * when still in fallback mode. */
+    patienceCoeff: number
     recent: ResolvedShot[]
   } {
     const decided = this.shots.filter((s) => !s.flat)
@@ -526,7 +611,15 @@ export class TempoService {
       .map(([k, rows]) => {
         const [asset, tf] = k.split(':')
         const hits = rows.filter((r) => r.hit).length
-        return { asset, tf, n: rows.length, hitRate: hits / rows.length, mult: this.pairAccuracyMult(asset, tf) }
+        return {
+          asset,
+          tf,
+          n: rows.length,
+          hitRate: hits / rows.length,
+          mult: this.pairAccuracyMult(asset, tf),
+          callMult: this.pairAccuracyMult(asset, tf, 'call'),
+          putMult: this.pairAccuracyMult(asset, tf, 'put'),
+        }
       })
       .sort((a, b) => b.n - a.n)
     return {
@@ -535,6 +628,7 @@ export class TempoService {
       losses: decided.length - wins,
       hitRate: decided.length ? wins / decided.length : null,
       pairAccuracy,
+      patienceCoeff: this.learnedPatienceCoeff(),
       recent: this.shots.slice(-20).reverse(),
     }
   }
@@ -552,7 +646,11 @@ export class TempoService {
       const f = this.dataFile()
       if (!existsSync(f)) return
       const raw = JSON.parse(readFileSync(f, 'utf8'))
-      if (Array.isArray(raw?.shots)) this.shots = raw.shots.slice(-MAX_SHOTS)
+      // threshold is new - older persisted shots won't have it. Default to
+      // the shot's own conviction (threshold<=conviction is always true at
+      // fire time) so learnedPatienceCoeff()'s replay treats a legacy shot
+      // as "barely cleared the floor" rather than crashing on undefined.
+      if (Array.isArray(raw?.shots)) this.shots = raw.shots.slice(-MAX_SHOTS).map((s: ResolvedShot) => ({ ...s, threshold: Number.isFinite(s.threshold) ? s.threshold : s.conviction }))
       this.ctx.log('tempo', `restored ${this.shots.length} resolved tempo shots from data/`)
     } catch {
       // corrupt/missing file - clean ledger, never break boot

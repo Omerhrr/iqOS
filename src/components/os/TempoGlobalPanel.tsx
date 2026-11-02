@@ -22,7 +22,11 @@ const STATS_POLL_MS = 20_000
 
 /** Which pairs pairAccuracyMult() is currently dampening, learned from each
  * pair's own lifetime shot ledger - was already silently raising those
- * pairs' firing floor with no way to see which ones or by how much. */
+ * pairs' firing floor with no way to see which ones or by how much.
+ * Also surfaces the two newer learned numbers: the fleet-wide patience
+ * coefficient (replacing the hand-set 0.35 pairFloor() fraction) and, per
+ * dampened pair, whether the dampening is actually direction-specific
+ * (call-only or put-only weak) rather than blanket. */
 function DampenedPairsStrip({ stats }: { stats: TempoStatsResponse }) {
   const dampened = stats.pairAccuracy.filter((p) => p.mult > 1).sort((a, b) => b.mult - a.mult).slice(0, 6)
   return (
@@ -31,18 +35,27 @@ function DampenedPairsStrip({ stats }: { stats: TempoStatsResponse }) {
       <span className="text-[#7c8aa5]">
         {stats.totalShots} lifetime shots · {stats.hitRate !== null ? `${(stats.hitRate * 100).toFixed(0)}% overall` : 'n/a'}
       </span>
+      <span
+        className="rounded border border-[#1c2739] px-1 py-px text-[#7c8aa5]"
+        title="fleet-learned pairFloor() coefficient - the fraction of a pair's expected window-max used as its firing floor. 0.35 = still the hand-set default (not enough resolved history yet)."
+      >
+        patience coeff {stats.patienceCoeff.toFixed(2)} {stats.patienceCoeff === 0.35 ? '(default)' : '(learned)'}
+      </span>
       {dampened.length === 0 ? (
         <span className="text-[#3d4d66]">no pair currently below target with enough samples</span>
       ) : (
-        dampened.map((p) => (
-          <span
-            key={`${p.asset}:${p.tf}`}
-            className="rounded border border-amber-500/40 px-1 py-px text-amber-300"
-            title={`${p.asset} ${p.tf}: ${(p.hitRate * 100).toFixed(0)}% hit rate over ${p.n} shots - floor raised ×${p.mult.toFixed(2)}`}
-          >
-            {p.asset} ×{p.mult.toFixed(2)}
-          </span>
-        ))
+        dampened.map((p) => {
+          const dirNote = p.callMult > p.putMult ? ' - weaker on CALLs' : p.putMult > p.callMult ? ' - weaker on PUTs' : ''
+          return (
+            <span
+              key={`${p.asset}:${p.tf}`}
+              className="rounded border border-amber-500/40 px-1 py-px text-amber-300"
+              title={`${p.asset} ${p.tf}: ${(p.hitRate * 100).toFixed(0)}% hit rate over ${p.n} shots - floor raised ×${p.mult.toFixed(2)} (call ×${p.callMult.toFixed(2)}, put ×${p.putMult.toFixed(2)})${dirNote}`}
+            >
+              {p.asset} ×{p.mult.toFixed(2)}{dirNote}
+            </span>
+          )
+        })
       )}
     </div>
   )

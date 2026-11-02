@@ -19,9 +19,9 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { KernelContext, Plugin } from '../kernel'
 import type { Candle, Timeframe } from '../types'
-import { predictNextCandle, setOracleCalibrationProvider, type NextCandlePrediction, type OracleRegime } from '../analytics/nextcandle'
+import { pairKey, predictNextCandle, setOracleCalibrationProvider, type NextCandlePrediction, type OracleRegime } from '../analytics/nextcandle'
 import { setPatternReliabilityProvider } from '../analytics/patterns'
-import { weightedHitRate, weightedMeanBy } from '../analytics/recencystats'
+import { weightedHitRate, weightedMean, weightedMeanBy } from '../analytics/recencystats'
 import { classifySession, type Session } from '../analytics/session'
 import type { MarketDataService } from './market-data'
 
@@ -37,6 +37,18 @@ const DRIVER_STATS_WINDOW = 250
  * reliability until it has. */
 const PATTERN_STATS_MIN_N = 25
 const PATTERN_STATS_WINDOW = 400
+/** min resolved rows before a driver PAIR's agreement rate is trusted for
+ * driverCorrelationTable() - a thin pair shouldn't get discounted off one
+ * lucky/unlucky coincidence of agreement. */
+const PAIR_CORR_MIN_N = 30
+const PAIR_CORR_WINDOW = 400
+/** min resolved rows before learnedConfidenceBlendWeight() trusts its own
+ * sweep - this one re-derives a synthetic "would-be confidence" per row,
+ * which is noisier than a plain hit-rate average, so it wants more samples
+ * than the other DRIVER_STATS_MIN_N=30-style floors before committing. */
+const BLEND_WEIGHT_MIN_N = 60
+const BLEND_WEIGHT_WINDOW = 400
+const BLEND_WEIGHT_CANDIDATES = [0.35, 0.45, 0.5, 0.55, 0.65, 0.75]
 const OUTCOME_FILE = 'nextcandle_outcomes.json'
 /** Next Global board: a scanned row older than this is recomputed on the
  * next poll. Deliberately short - one prediction is ~15ms so a full board
@@ -59,8 +71,11 @@ interface PendingPrediction {
   /** lightweight per-driver read at issue time (name + signed vote only,
    * not the full OracleDriver) - carried through to the resolved record so
    * each model's OWN accuracy can be tracked independently of the fused
-   * outcome. */
-  drivers: { name: string; vote: number }[]
+   * outcome. `pUp` (this driver's own probability read, pre-fusion) feeds
+   * driverCalibrationMultipliers()'s Brier-based quality weighting and
+   * driverCorrelationTable()'s pairwise agreement learning - neither
+   * existed before this round, when only the sign (`vote`) was kept. */
+  drivers: { name: string; vote: number; pUp: number }[]
   /** which candle patterns fired this read (name + direction) - carried
    * through to the resolved record so each PATTERN's own live reliability
    * can be learned, independent of the fused outcome and of the driver
@@ -93,8 +108,10 @@ export interface ResolvedPrediction {
   brier: number
   /** regime this prediction was issued under - feeds regimeCalibrationFor() */
   regime: OracleRegime
-  /** per-driver votes at issue time, carried through for driverStats() */
-  drivers: { name: string; vote: number }[]
+  /** per-driver votes + own pUp at issue time, carried through for
+   * driverWeightMultipliers()/driverCalibrationMultipliers()/
+   * driverCorrelationTable(). */
+  drivers: { name: string; vote: number; pUp: number }[]
   /** pattern hits at issue time, carried through for patternReliabilityTable() */
   patternHits: { name: string; direction: 'bullish' | 'bearish' | 'neutral' }[]
   /** predicted magnitude at issue time - feeds magnitudeCalibrationFor() against |exit-entry| */
@@ -186,6 +203,9 @@ export class NextCandleService {
       directionCalibration: this.directionCalibrationFor(asset, tf),
       driverWeightMultipliers: this.driverWeightMultipliers(),
       regimeDriverWeightMultipliers: this.driverWeightMultipliersByRegime(),
+      driverCalibrationMultipliers: this.driverCalibrationMultipliers(),
+      driverCorrelation: this.driverCorrelationTable(),
+      confidenceBlendWeight: this.learnedConfidenceBlendWeight(),
       magnitudeCalibration: this.magnitudeCalibrationFor(asset, tf),
     })
     if (!pred) return null
@@ -202,7 +222,7 @@ export class NextCandleService {
       confidence: pred.confidence,
       price: pred.price,
       regime: pred.regime,
-      drivers: pred.drivers.map((d) => ({ name: d.name, vote: d.vote })),
+      drivers: pred.drivers.map((d) => ({ name: d.name, vote: d.vote, pUp: d.pUp })),
       patternHits: pred.patternHits,
       expectedMove: pred.expectedMove,
     })
@@ -451,6 +471,104 @@ export class NextCandleService {
     return out
   }
 
+  /** Per-driver CALIBRATION-quality multiplier, universe-wide - a second,
+   * independent axis from driverWeightMultipliers() above. That one
+   * rewards a driver for being directionally RIGHT (win rate); this one
+   * rewards it for being honest about its OWN uncertainty: its resolved
+   * Brier contribution ((pUp - realizedUp)², 0.25 = an honest coin flip),
+   * computed from the driver's OWN pUp read, not the fused one. A driver
+   * right 55% of the time while confidently predicting 90% every time is
+   * directionally fine but badly miscalibrated - win rate alone can't see
+   * that; this can. */
+  private driverCalibrationMultipliers(): Record<string, number> {
+    const window = this.resolved.slice(-DRIVER_STATS_WINDOW * 2)
+    const byName = new Map<string, number[]>()
+    for (const r of window) {
+      const realizedUp = r.actual === 'up' ? 1 : r.actual === 'down' ? 0 : 0.5
+      for (const d of r.drivers ?? []) {
+        if (!Number.isFinite(d.pUp)) continue
+        const arr = byName.get(d.name) ?? []
+        arr.push((d.pUp - realizedUp) ** 2)
+        byName.set(d.name, arr)
+      }
+    }
+    const out: Record<string, number> = {}
+    for (const [name, briers] of byName) {
+      if (briers.length < DRIVER_STATS_MIN_N) continue
+      const meanBrier = weightedMean(briers)
+      out[name] = Math.max(0.8, Math.min(1.2, 1 + (0.25 - meanBrier) * 1.5))
+    }
+    return out
+  }
+
+  /** Learned pairwise driver correlation discount (analytics/
+   * nextcandle.ts's `driverCorrelation` input, generalizing the old
+   * hand-picked CORRELATED_DRIVER_GROUPS): for every pair of drivers that
+   * both fired on the same resolved call, how often did they agree on
+   * direction (unweighted sign match)? A pair that agrees meaningfully
+   * more than chance (>60%) is probably reading overlapping evidence, not
+   * confirming independently - discounted toward 0.5 the more they agree;
+   * a pair at or below 60% agreement gets no discount at all. Requires
+   * PAIR_CORR_MIN_N resolved co-occurrences per pair before trusting it. */
+  private driverCorrelationTable(): Record<string, number> {
+    const window = this.resolved.slice(-PAIR_CORR_WINDOW)
+    const pairs = new Map<string, boolean[]>()
+    for (const r of window) {
+      const ds = r.drivers ?? []
+      for (let i = 0; i < ds.length; i++) {
+        for (let j = i + 1; j < ds.length; j++) {
+          const a = ds[i]
+          const b = ds[j]
+          const aSign = Math.sign(a.vote)
+          const bSign = Math.sign(b.vote)
+          if (aSign === 0 || bSign === 0) continue
+          const key = pairKey(a.name, b.name)
+          const arr = pairs.get(key) ?? []
+          arr.push(aSign === bSign)
+          pairs.set(key, arr)
+        }
+      }
+    }
+    const out: Record<string, number> = {}
+    for (const [key, agrees] of pairs) {
+      if (agrees.length < PAIR_CORR_MIN_N) continue
+      const agreeRate = weightedHitRate(agrees, (a) => a).hitRate
+      if (agreeRate > 0.6) out[key] = Math.max(0.5, 1 - (agreeRate - 0.6) * 1.5)
+    }
+    return out
+  }
+
+  /** Learned replacement for the flat 0.55/0.45 agreement/distance blend
+   * that produces rawConfidence: sweeps a small set of candidate agreement
+   * weights and picks whichever would have best predicted the resolved
+   * ledger's own realized hit rate (lowest mean squared error, same shape
+   * as a Brier score). Reconstructs `agreement` from each resolved row's
+   * own stored drivers (unweighted sign match against the row's own pUp
+   * side - the per-driver WEIGHTS used at issue time aren't persisted, so
+   * this is an unweighted proxy, close enough to pick a sane blend ratio)
+   * and `distance` directly from the row's stored pUp. null (keeps the
+   * flat 0.55) until there's enough resolved history with real driver
+   * snapshots to trust the sweep. */
+  private learnedConfidenceBlendWeight(): number | null {
+    const window = this.resolved.slice(-BLEND_WEIGHT_WINDOW).filter((r) => r.actual !== 'flat' && (r.drivers?.length ?? 0) >= 4)
+    if (window.length < BLEND_WEIGHT_MIN_N) return null
+    let best: { w: number; err: number } | null = null
+    for (const w of BLEND_WEIGHT_CANDIDATES) {
+      let errSum = 0
+      for (const r of window) {
+        const winSide = r.pUp >= 0.5 ? 1 : -1
+        const agree = r.drivers.filter((d) => Math.sign(d.vote) === winSide).length / r.drivers.length
+        const distance = Math.abs(r.pUp - 0.5) * 2
+        const confEst = Math.max(0, Math.min(1, w * agree + (1 - w) * distance))
+        const realizedHit = r.hit ? 1 : 0
+        errSum += (confEst - realizedHit) ** 2
+      }
+      const err = errSum / window.length
+      if (!best || err < best.err) best = { w, err }
+    }
+    return best?.w ?? null
+  }
+
   /** Full stats for the panel: per-asset:tf records + recent resolutions. */
   /** Lifetime ledger for panels/agents - now also surfaces the learned
    * diagnostics every prediction already uses internally (driver weights,
@@ -475,6 +593,9 @@ export class NextCandleService {
     }[]
     driverWeightMultipliers: Record<string, number>
     regimeDriverWeightMultipliers: Partial<Record<OracleRegime, Record<string, number>>>
+    driverCalibrationMultipliers: Record<string, number>
+    driverCorrelation: Record<string, number>
+    confidenceBlendWeight: number | null
     patternReliability: Record<string, number>
     recent: ResolvedPrediction[]
   } {
@@ -513,6 +634,9 @@ export class NextCandleService {
       records,
       driverWeightMultipliers: this.driverWeightMultipliers(),
       regimeDriverWeightMultipliers: this.driverWeightMultipliersByRegime(),
+      driverCalibrationMultipliers: this.driverCalibrationMultipliers(),
+      driverCorrelation: this.driverCorrelationTable(),
+      confidenceBlendWeight: this.learnedConfidenceBlendWeight(),
       patternReliability: this.patternReliabilityTable(),
       recent: this.resolved.slice(-40).reverse(),
     }

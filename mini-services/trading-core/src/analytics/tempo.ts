@@ -62,6 +62,26 @@ export const TEMPO_RECENT_LOSS_PENALTY = 1.25
  * pair gets dampened, not effectively shut off outright. */
 export const TEMPO_PAIR_ACCURACY_MAX_PENALTY = 1.6
 
+/** Half-life, in WINDOWS (not bars), for the recency weighting inside
+ * expectedWindowMax below. Deliberately much shorter than the universal
+ * recencystats.ts default (150) - the window-max history only holds the
+ * last TEMPO_HISTORY_WINDOWS (12) entries to begin with, so a half-life on
+ * that scale makes the 2-3 most recent windows meaningfully outweigh ones
+ * from the start of the buffer instead of all 12 counting almost equally. */
+export const TEMPO_HISTORY_HALFLIFE = 5
+
+/** The hand-set fraction of a pair's expected window-max that pairFloor()
+ * used to always use. Kept as the fallback/default and as the center of
+ * the learned-coefficient search band below - see
+ * PATIENCE_COEFF_MIN/MAX and the plugin's learnedPatienceCoeff(). */
+export const PATIENCE_COEFF_DEFAULT = 0.35
+/** pairFloor()'s learned coefficient (plugin-computed from the resolved
+ * shot ledger) never drifts outside this band - keeps a thin or noisy
+ * ledger from pushing the floor fraction to an extreme that would make
+ * every pair effectively never-fire or always-fire. */
+export const PATIENCE_COEFF_MIN = 0.25
+export const PATIENCE_COEFF_MAX = 0.5
+
 function clamp(v: number, lo: number, hi: number): number {
   return Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : lo
 }
@@ -73,11 +93,18 @@ function clamp(v: number, lo: number, hi: number): number {
  * pairs or too tight for volatile ones. Falls back to the flat TEMPO_FLOOR
  * while the pair has no window history yet (expectedWindowMax returns 0
  * below 3 observed windows) - explore first, get picky once the pair's own
- * rhythm is known, the same philosophy expectedWindowMax itself uses. */
-export function pairFloor(history: number[], fallback = TEMPO_FLOOR): number {
+ * rhythm is known, the same philosophy expectedWindowMax itself uses.
+ *
+ * `coeff` used to be a hard-coded 0.35 here. The plugin can now pass a
+ * fleet-learned coefficient instead (searched against the resolved shot
+ * ledger for whichever fraction would have maximized net hit rate) - falls
+ * back to PATIENCE_COEFF_DEFAULT (the original 0.35) below its own
+ * "thin record is no record" sample floor, so behavior never regresses
+ * before there's enough resolved history to trust a learned value. */
+export function pairFloor(history: number[], fallback = TEMPO_FLOOR, coeff = PATIENCE_COEFF_DEFAULT): number {
   const expMax = expectedWindowMax(history)
   if (expMax <= 0) return fallback
-  return clamp(expMax * 0.35, TEMPO_FLOOR_MIN, TEMPO_FLOOR_MAX)
+  return clamp(expMax * clamp(coeff, PATIENCE_COEFF_MIN, PATIENCE_COEFF_MAX), TEMPO_FLOOR_MIN, TEMPO_FLOOR_MAX)
 }
 
 export interface TempoWindow {
@@ -127,14 +154,34 @@ export function tempoConviction(confidence: number, pUp: number): number {
  * freak high-conviction window drag the patience bar up for the next
  * TEMPO_HISTORY_WINDOWS windows, making the pair go quiet right after its
  * best read - the trim keeps the estimate anchored to the pair's typical
- * rhythm instead of its single best or worst outlier. */
-export function expectedWindowMax(history: number[]): number {
+ * rhythm instead of its single best or worst outlier.
+ *
+ * Recency-weighted (TEMPO_HISTORY_HALFLIFE): the buffer used to average
+ * its last-12 window-maxima flat, so a volatility shift only showed up
+ * once enough stale windows had rolled out of the 12-slot buffer - up to
+ * 12 windows of lag. Each surviving (post-trim) entry now gets weight
+ * 0.5^(age/halfLife) by its position in the ORIGINAL chronological array
+ * (age measured before trimming, so removing the two outliers doesn't
+ * distort how old the remaining entries actually are), letting the
+ * estimate track a real rhythm change within 2-3 windows instead. */
+export function expectedWindowMax(history: number[], halfLife = TEMPO_HISTORY_HALFLIFE): number {
   const h = history.slice(-TEMPO_HISTORY_WINDOWS).filter((v) => Number.isFinite(v) && v > 0)
   if (h.length < 3) return 0
-  if (h.length < 6) return h.reduce((s, v) => s + v, 0) / h.length
-  const sorted = [...h].sort((a, b) => a - b)
-  const trimmed = sorted.slice(1, -1)
-  return trimmed.reduce((s, v) => s + v, 0) / trimmed.length
+  const indexed = h.map((v, idx) => ({ v, age: h.length - 1 - idx }))
+  const keep = h.length < 6 ? indexed : (() => {
+    const sorted = [...indexed].sort((a, b) => a.v - b.v)
+    const dropLow = sorted[0]
+    const dropHigh = sorted[sorted.length - 1]
+    return indexed.filter((e) => e !== dropLow && e !== dropHigh)
+  })()
+  let wSum = 0
+  let total = 0
+  for (const { v, age } of keep) {
+    const w = Math.pow(0.5, age / halfLife)
+    wSum += w
+    total += v * w
+  }
+  return wSum > 0 ? total / wSum : 0
 }
 
 export type TempoDecisionKind = 'fire' | 'wait' | 'skip'
@@ -169,8 +216,13 @@ export function tempoDecide(opts: {
    * to [1, TEMPO_PAIR_ACCURACY_MAX_PENALTY] by the plugin before it gets
    * here, but clamped again here defensively. */
   pairAccuracyMult?: number
+  /** plugin-supplied: the fleet-learned pairFloor() coefficient (see
+   * PATIENCE_COEFF_DEFAULT/MIN/MAX above), replacing the hand-set 0.35
+   * once the resolved shot ledger has enough history to trust one.
+   * Ignored when `floor` is already supplied directly. */
+  floorCoeff?: number
 }): TempoDecision {
-  const baseFloor = opts.floor ?? pairFloor(opts.windowMaxHistory)
+  const baseFloor = opts.floor ?? pairFloor(opts.windowMaxHistory, TEMPO_FLOOR, opts.floorCoeff ?? PATIENCE_COEFF_DEFAULT)
   const pairMult = Number.isFinite(opts.pairAccuracyMult) ? clamp(opts.pairAccuracyMult ?? 1, 1, TEMPO_PAIR_ACCURACY_MAX_PENALTY) : 1
   const floor = (opts.recentSimilarLoss ? baseFloor * TEMPO_RECENT_LOSS_PENALTY : baseFloor) * pairMult
   const conviction = Number.isFinite(opts.conviction) ? Math.max(0, opts.conviction) : 0

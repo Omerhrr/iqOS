@@ -39,16 +39,34 @@ function LearnedStatsStrip({ stats }: { stats: AdxPatternBiasStatsResponse }) {
         bar {stats.qualifyBar !== null ? stats.qualifyBar.toFixed(1) : '3.5 (default)'}
       </span>
       <span
+        className={`rounded border px-1 py-px ${stats.qualifyBarByDirection.bullish !== null || stats.qualifyBarByDirection.bearish !== null ? 'border-violet-500/40 text-violet-300' : 'border-[#1c2739] text-[#4b5a72]'}`}
+        title="direction-split qualify bar - a pair/regime can carry a structural trend bias that makes bullish and bearish reads differently reliable. Falls back to the flat bar above, per direction, below 30 resolved samples on that side."
+      >
+        bar↑{stats.qualifyBarByDirection.bullish !== null ? stats.qualifyBarByDirection.bullish.toFixed(1) : '—'} / bar↓{stats.qualifyBarByDirection.bearish !== null ? stats.qualifyBarByDirection.bearish.toFixed(1) : '—'}
+      </span>
+      <span
         className={`rounded border px-1 py-px ${stats.htfPenaltyMult !== null ? 'border-violet-500/40 text-violet-300' : 'border-[#1c2739] text-[#4b5a72]'}`}
         title="learned HTF-veto penalty: the composite margin an HTF-disagreeing read must clear to still qualify, as a multiple of the normal bar. Unset = still a flat hard block."
       >
         htf {stats.htfPenaltyMult !== null ? `×${stats.htfPenaltyMult.toFixed(1)}` : 'hard veto (default)'}
       </span>
       <span
+        className={`rounded border px-1 py-px ${stats.haPenaltyMult !== null ? 'border-violet-500/40 text-violet-300' : 'border-[#1c2739] text-[#4b5a72]'}`}
+        title="learned HA (Heikin Ashi pattern)-veto penalty - the haBlocks counterpart of the HTF penalty above. Unset = still a flat hard block."
+      >
+        ha {stats.haPenaltyMult !== null ? `×${stats.haPenaltyMult.toFixed(1)}` : 'hard veto (default)'}
+      </span>
+      <span
         className={`rounded border px-1 py-px ${stats.confluenceBoost > 1 ? 'border-emerald-500/40 text-emerald-300' : 'border-[#1c2739] text-[#4b5a72]'}`}
         title="learned confidence/score multiplier applied when the Next-Candle Oracle actively agrees on direction"
       >
         confluence ×{stats.confluenceBoost.toFixed(2)}
+      </span>
+      <span
+        className={`rounded border px-1 py-px ${stats.volumeBoost > 1 ? 'border-emerald-500/40 text-emerald-300' : 'border-[#1c2739] text-[#4b5a72]'}`}
+        title="learned, bounded boost (capped ×1.2) to the composite-vs-qualify-bar comparison when volumeConfirms reads true - routinely slow to earn trust on OTC/binary feeds with no real volume data"
+      >
+        volume ×{stats.volumeBoost.toFixed(2)}
       </span>
       <span
         className={`rounded border px-1 py-px ${stats.trendThreshold !== null ? 'border-violet-500/40 text-violet-300' : 'border-[#1c2739] text-[#4b5a72]'}`}

@@ -203,6 +203,32 @@ export interface OracleInput {
    * chicken-egg problem applying it here, unlike calibration). Falls back
    * to `driverWeightMultipliers` when this regime's bucket is missing. */
   regimeDriverWeightMultipliers?: Partial<Record<OracleRegime, Partial<Record<string, number>>>>
+  /** Per-driver CALIBRATION-quality multiplier, keyed by OracleDriver.name -
+   * a second, independent axis from driverWeightMultipliers above. That
+   * one rewards a driver for being directionally RIGHT (win rate); this
+   * one rewards a driver for being honest about its OWN uncertainty (low
+   * resolved Brier) rather than just lucky on sign - a driver that's
+   * right 55% of the time while confidently predicting 90% every time is
+   * directionally fine but badly miscalibrated, and win-rate alone can't
+   * see that. 1 = unchanged; clamped to [0.8, 1.2] inside predictNextCandle
+   * regardless of what's passed, so this can only ever nudge, not replace,
+   * the win-rate multiplier above. */
+  driverCalibrationMultipliers?: Partial<Record<string, number>>
+  /** Learned pairwise driver correlation discount, keyed by a stable
+   * "NameA|NameB" string (alphabetical, built by pairKey() below) - how
+   * much to discount the SECOND-listed driver's weight when both members
+   * of a pair agree on direction. Generalizes the old hand-picked
+   * CORRELATED_DRIVER_GROUPS: that list is still the DEFAULT prior for the
+   * one pair it names, but any pair the honesty loop has enough resolved
+   * history on (agreeing meaningfully more than chance) gets its own
+   * learned discount instead, hand-picked or not. Missing/omitted pair =
+   * no discount (1) unless the hand-set default applies. */
+  driverCorrelation?: Partial<Record<string, number>>
+  /** Learned replacement for the flat 0.55/0.45 agreement/distance blend
+   * that produces rawConfidence - the smallest-error candidate, among a
+   * small sweep, at predicting the resolved ledger's own realized hit
+   * rate. null = still using the flat 0.55 agreement weight. */
+  confidenceBlendWeight?: number | null
   /** Learned ratio of REALIZED candle move to this engine's own predicted
    * `expectedMove`, for this exact asset:tf - the one estimate in this
    * whole fusion that was never checked against reality until now. 1 =
@@ -222,24 +248,45 @@ export interface OracleInput {
 
 /** Correlated driver groups: members read substantially the same underlying
  * evidence (raw bar shape), so when they AGREE it isn't two independent
- * confirmations, it's partially the same evidence counted twice. Only the
- * first member of a group keeps full weight; later agreeing members are
- * discounted. Disagreement between group members is left untouched - that's
- * genuinely informative, not redundant. */
+ * confirmations, it's partially the same evidence counted twice. This is
+ * now only the DEFAULT prior for the one pair hand-picked at design time -
+ * see `driverCorrelation` on OracleInput and pairKey() below for the
+ * learned, general replacement that covers any pair, not just this one. */
 const CORRELATED_DRIVER_GROUPS: string[][] = [['Candle patterns', 'Bar physics']]
 const CORRELATION_DISCOUNT = 0.65
 
-function decorrelateWeights(usable: OracleDriver[]): OracleDriver[] {
-  const out = usable.map((d) => ({ ...d }))
+/** Stable, order-independent key for a driver pair - how plugins/
+ * nextcandle.ts's learned driverCorrelation table is keyed, so a caller
+ * never has to guess which of the two names comes first. */
+export function pairKey(a: string, b: string): string {
+  return a < b ? `${a}|${b}` : `${b}|${a}`
+}
+
+function handSetDiscount(a: string, b: string): number | null {
   for (const group of CORRELATED_DRIVER_GROUPS) {
-    const members = out.filter((d) => group.includes(d.name))
-    if (members.length < 2) continue
-    const base = members[0]
-    const baseSign = Math.sign(base.vote || base.pUp - 0.5)
-    for (let k = 1; k < members.length; k++) {
-      const m = members[k]
-      const mSign = Math.sign(m.vote || m.pUp - 0.5)
-      if (baseSign !== 0 && baseSign === mSign) m.weight *= CORRELATION_DISCOUNT
+    if (group.includes(a) && group.includes(b)) return CORRELATION_DISCOUNT
+  }
+  return null
+}
+
+/** Discount the weight of whichever driver in an agreeing, correlated pair
+ * is listed SECOND when both members agree on direction - only ever
+ * tightens (reduces double-counted weight), never loosens. Checks the
+ * LEARNED table first (any pair with enough resolved history), falling
+ * back to the hand-set default for the one pair that was ever manually
+ * flagged; a pair with neither gets no discount at all. */
+function decorrelateWeights(usable: OracleDriver[], learnedCorrelation?: Partial<Record<string, number>> | null): OracleDriver[] {
+  const out = usable.map((d) => ({ ...d }))
+  for (let i = 0; i < out.length; i++) {
+    for (let j = i + 1; j < out.length; j++) {
+      const a = out[i]
+      const b = out[j]
+      const learned = learnedCorrelation?.[pairKey(a.name, b.name)]
+      const discount = Number.isFinite(learned) && learned! > 0 && learned! < 1 ? learned! : handSetDiscount(a.name, b.name)
+      if (discount === null) continue
+      const aSign = Math.sign(a.vote || a.pUp - 0.5)
+      const bSign = Math.sign(b.vote || b.pUp - 0.5)
+      if (aSign !== 0 && aSign === bSign) b.weight *= discount
     }
   }
   return out
@@ -428,14 +475,23 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
   // way calibration below has) and falls back to the blended-across-
   // regimes table when that regime's bucket is missing or wasn't provided.
   const dwm = input.regimeDriverWeightMultipliers?.[regime] ?? input.driverWeightMultipliers
-  if (dwm) {
+  const dcm = input.driverCalibrationMultipliers
+  if (dwm || dcm) {
     for (const d of drivers) {
-      const m = dwm[d.name]
+      const m = dwm?.[d.name]
       if (Number.isFinite(m) && m! > 0) d.weight *= clamp(m!, 0.6, 1.5)
+      // calibration-quality axis, independent of the win-rate multiplier
+      // above - rewards a driver for being honest about its own
+      // uncertainty (low resolved Brier), not just lucky on sign.
+      const c = dcm?.[d.name]
+      if (Number.isFinite(c) && c! > 0) d.weight *= clamp(c!, 0.8, 1.2)
     }
   }
 
-  const usable = decorrelateWeights(drivers.filter((d) => Number.isFinite(d.pUp) && Number.isFinite(d.weight) && d.weight > 0))
+  const usable = decorrelateWeights(
+    drivers.filter((d) => Number.isFinite(d.pUp) && Number.isFinite(d.weight) && d.weight > 0),
+    input.driverCorrelation,
+  )
   // 7 drivers exist; requiring 4+ (a majority) rather than the old 3 (a
   // minority, <=43%) closes a real small-sample overconfidence hole - a
   // thin 3-driver read used to score confidence identically to a full
@@ -456,7 +512,12 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
   // completely, a 7/7 read gets none - the fused pUp itself is unaffected
   // (direction never changes), only how much the number is allowed to say.
   const sampleFactor = clamp(0.72 + 0.28 * (usable.length / drivers.length), 0.72, 1)
-  const rawConfidence = clamp((0.55 * agreement + 0.45 * distance) * 100 * sampleFactor, 0, 97)
+  // learned agreement/distance blend: the smallest-error candidate (vs the
+  // resolved ledger's own realized hit rate) replaces the flat hand-set
+  // 0.55/0.45 split once there's enough history to pick one; null (thin
+  // history) keeps today's 0.55 agreement weight exactly as it was.
+  const agreeWeight = Number.isFinite(input.confidenceBlendWeight) && (input.confidenceBlendWeight as number) >= 0 && (input.confidenceBlendWeight as number) <= 1 ? (input.confidenceBlendWeight as number) : 0.55
+  const rawConfidence = clamp((agreeWeight * agreement + (1 - agreeWeight) * distance) * 100 * sampleFactor, 0, 97)
 
   // calibration discount: the oracle's own realized record tempers the
   // read. Preference order, most specific first: (1) REGIME-SPECIFIC

@@ -122,6 +122,50 @@ export function setAdxHtfLearningProvider(p: AdxHtfLearningProvider | null): voi
   adxHtfLearningProvider = p
 }
 
+/** Learned replacement for the flat HA (Heikin Ashi pattern) veto - same
+ * graduated-penalty shape as the HTF veto above (setAdxHtfLearningProvider),
+ * just for the OTHER independent precision layer. The HA veto used to be a
+ * hard block with no way to ever learn whether the smoothed-series
+ * contradiction actually costs accuracy or not; this lets the honesty loop
+ * shadow-track calls blocked only by HA disagreement and replace the flat
+ * block with a learned extra-margin requirement once there's evidence
+ * either way. null = still a hard block (today's original behavior). */
+export type AdxHaLearningProvider = () => { penaltyMult: number } | null
+let adxHaLearningProvider: AdxHaLearningProvider | null = null
+export function setAdxHaLearningProvider(p: AdxHaLearningProvider | null): void {
+  adxHaLearningProvider = p
+}
+
+/** Learned, bounded boost to the composite-vs-qualify-bar comparison when
+ * `volumeConfirms` reads true - was purely informational (never gated or
+ * helped `qualifies`) despite plausibly carrying real signal on feeds that
+ * DO have volume data. Capped well under the HTF/confluence boosts' own
+ * ceiling (VOLUME_BOOST_MAX) since this is a much weaker, more occasional
+ * signal (volume data is routinely absent on OTC/binary feeds - see
+ * shockpressure.ts's volumeDegraded). 1 (no boost) until the honesty loop
+ * has enough resolved history on BOTH the confirmed and unconfirmed sides
+ * to trust the comparison. */
+export const VOLUME_BOOST_MAX = 1.2
+export type AdxVolumeBoostProvider = () => number | null
+let adxVolumeBoostProvider: AdxVolumeBoostProvider | null = null
+export function setAdxVolumeBoostProvider(p: AdxVolumeBoostProvider | null): void {
+  adxVolumeBoostProvider = p
+}
+
+/** Learned, direction-split replacement for the flat universe-wide qualify
+ * bar - a composite this reliable at +7 (bullish) doesn't necessarily mean
+ * the same reliability at -7 (bearish); many pairs/regimes carry a
+ * structural trend bias that makes one direction's reads more trustworthy
+ * than the other's. Falls back through: this direction's own learned bar,
+ * then the flat universe-wide learned bar (adxQualifyBarProvider), then the
+ * hand-set COMPOSITE_QUALIFY - same graduated-fallback shape used
+ * everywhere else in this module. */
+export type AdxQualifyBarByDirectionProvider = () => { bullish: number | null; bearish: number | null } | null
+let adxQualifyBarByDirectionProvider: AdxQualifyBarByDirectionProvider | null = null
+export function setAdxQualifyBarByDirectionProvider(p: AdxQualifyBarByDirectionProvider | null): void {
+  adxQualifyBarByDirectionProvider = p
+}
+
 /** 5s..1d ladder, same order ALL_TIMEFRAMES uses - lets the multi-timeframe
  * confirmation below ask "what's one rung up from here" without keeping a
  * second lookup table in sync by hand. */
@@ -199,6 +243,11 @@ export interface AdxPatternBiasFit {
    * learn whether that veto is worth its cost, since a hard-blocked call
    * never gets to resolve against reality on its own. */
   qualifiesIgnoringHtf: boolean
+  /** Would this fit have qualified if the HA veto alone were ignored (HTF
+   * veto and qualify bar still apply)? Shadow-tracking counterpart of
+   * qualifiesIgnoringHtf, for the HA veto's own learned graduated penalty
+   * (see setAdxHaLearningProvider). */
+  qualifiesIgnoringHa: boolean
   /** The Oracle's own 4-way regime classifier (analytics/regime.ts), fed
    * this fit's own real ADX plus lightweight vol/persistence proxies - the
    * same classifier the Next-Candle Oracle runs, reused rather than
@@ -377,11 +426,17 @@ export function fitAdxPatternBias(candles: Candle[], period = 14, lookback = PAT
     quant: { hurst: hurstProxy(close), garchVol: garchVol(recentRets), ewmaVol: ewmaVol(recentRets) },
   } as unknown as AnalysisResult)
   const learnedBar = adxQualifyBarProvider?.() ?? null
-  const baseBar = learnedBar && learnedBar > 0 ? learnedBar : COMPOSITE_QUALIFY
+  const byDir = adxQualifyBarByDirectionProvider?.() ?? null
+  const dirBar = direction === 'bullish' ? byDir?.bullish : direction === 'bearish' ? byDir?.bearish : null
+  const baseBar = dirBar && dirBar > 0 ? dirBar : learnedBar && learnedBar > 0 ? learnedBar : COMPOSITE_QUALIFY
   const qualifyBar = regime === 'VOLATILE' ? baseBar * VOLATILE_QUALIFY_MULT : baseBar
 
-  // Volume confirmation (informational, see volumeConfirms doc above): only
-  // ever computed when real volume data exists for this window.
+  // Volume confirmation: computed before the qualify checks below (used to
+  // be purely informational, computed last) so volumeConfirmBoost() can
+  // feed into the composite-vs-qualify-bar comparison. See volumeConfirms
+  // doc above - only ever computed when real volume data exists for this
+  // window; null (no data, routinely true for OTC/binary feeds) never
+  // boosts or penalizes, same as it never gated before.
   const volWindow = candles.slice(-lookback)
   const avgVol = mean(volWindow.map((c) => c.volume))
   const volumeDataPresent = avgVol > 0 && volWindow.some((c) => c.volume > 0)
@@ -390,8 +445,24 @@ export function fitAdxPatternBias(candles: Candle[], period = 14, lookback = PAT
     const topBar = candles[candles.length - 1 - (top.barsAgo ?? 0)]
     if (topBar) volumeConfirms = topBar.volume > avgVol
   }
+  // Learned, bounded boost (see setAdxVolumeBoostProvider) - only ever
+  // applied to the COMPARISON against the qualify bar, never to the
+  // `composite` value itself reported on the fit, so the panel's own
+  // composite number stays the honest, un-boosted read.
+  const volBoost = volumeConfirms === true ? Math.max(1, Math.min(VOLUME_BOOST_MAX, adxVolumeBoostProvider?.() ?? 1)) : 1
+  const effectiveComp = comp * volBoost
 
-  const qualifiesIgnoringHtf = agree && Math.abs(comp) >= qualifyBar && !haDisagrees
+  const qualifiesBase = agree && Math.abs(effectiveComp) >= qualifyBar
+  // Learned, graduated HA veto: with no learning yet (null provider or
+  // thin shadow-tracked sample) this behaves EXACTLY like the old hard
+  // veto - haBlocks === haDisagrees. Once the honesty loop has enough
+  // shadow-tracked HA-disagreeing calls to know whether the smoothed-series
+  // contradiction actually costs accuracy, penaltyMult replaces the flat
+  // block with a learned extra-margin requirement, same shape as the HTF
+  // veto below.
+  const haLearning = adxHaLearningProvider?.() ?? null
+  const haPenaltyMult = haLearning && Number.isFinite(haLearning.penaltyMult) && haLearning.penaltyMult > 0 ? haLearning.penaltyMult : null
+  const haBlocks = haDisagrees && (haPenaltyMult === null ? true : Math.abs(effectiveComp) < qualifyBar * haPenaltyMult)
   // Learned, graduated HTF veto: with no learning yet (null provider or
   // thin sample in the honesty loop) this behaves EXACTLY like the old
   // hard veto - htfBlocks === htfDisagrees. Once the honesty loop has
@@ -402,8 +473,10 @@ export function fitAdxPatternBias(candles: Candle[], period = 14, lookback = PAT
   // again if it does.
   const htfLearning = adxHtfLearningProvider?.() ?? null
   const htfPenaltyMult = htfLearning && Number.isFinite(htfLearning.penaltyMult) && htfLearning.penaltyMult > 0 ? htfLearning.penaltyMult : null
-  const htfBlocks = htfDisagrees && (htfPenaltyMult === null ? true : Math.abs(comp) < qualifyBar * htfPenaltyMult)
-  const qualifies = qualifiesIgnoringHtf && !htfBlocks
+  const htfBlocks = htfDisagrees && (htfPenaltyMult === null ? true : Math.abs(effectiveComp) < qualifyBar * htfPenaltyMult)
+  const qualifiesIgnoringHtf = qualifiesBase && !haBlocks
+  const qualifiesIgnoringHa = qualifiesBase && !htfBlocks
+  const qualifies = qualifiesBase && !haBlocks && !htfBlocks
 
   return {
     adx: adxVal,
@@ -429,6 +502,7 @@ export function fitAdxPatternBias(candles: Candle[], period = 14, lookback = PAT
     regime,
     volumeConfirms,
     qualifiesIgnoringHtf,
+    qualifiesIgnoringHa,
     qualifies,
   }
 }
