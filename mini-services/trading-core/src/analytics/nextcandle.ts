@@ -68,6 +68,7 @@ import { detectPatterns, patternBias, learnedPatternReliability } from './patter
 import { atr } from './indicators'
 import type { AnalysisResult } from '../types'
 import { classifyRegime } from './regime'
+import type { HmaRocBullBearPrediction } from './hmarocbullbear'
 
 export const ORACLE_MIN_CANDLES = 320 // markov(lookback 300) + warmup for the rest
 /** Evaluation window cap for consumers that re-evaluate bar-by-bar (the
@@ -136,6 +137,15 @@ export interface NextCandlePrediction {
   /** live self-calibration, injected by the plugin's honesty loop (null = no record yet) */
   calibration: { n: number; hitRate: number; brier: number } | null
   mode: 'sim' | 'live'
+  /** A SEPARATE, deliberately simple secondary read (Hull MA slope + ROC +
+   * Elder Ray Bull/Bear Power, averaged) - NOT one of the drivers above,
+   * not fused through this engine's log-odds/correlation/calibration
+   * machinery, and not tracked by the honesty loop. Computed and attached
+   * by the plugin (analytics/hmarocbullbear.ts) purely so the panel can
+   * show "what would three textbook indicators alone say" next to this
+   * engine's own calibrated fusion - null when there isn't enough history
+   * for all three indicators to clear their own warmup. */
+  altPrediction?: HmaRocBullBearPrediction | null
 }
 
 function clamp(v: number, lo: number, hi: number): number {

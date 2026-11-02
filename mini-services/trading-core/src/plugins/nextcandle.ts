@@ -20,6 +20,7 @@ import { join } from 'node:path'
 import type { KernelContext, Plugin } from '../kernel'
 import type { Candle, Timeframe } from '../types'
 import { pairKey, predictNextCandle, setOracleCalibrationProvider, type NextCandlePrediction, type OracleRegime } from '../analytics/nextcandle'
+import { predictHmaRocBullBear } from '../analytics/hmarocbullbear'
 import { setPatternReliabilityProvider } from '../analytics/patterns'
 import { weightedHitRate, weightedMean, weightedMeanBy } from '../analytics/recencystats'
 import { classifySession, type Session } from '../analytics/session'
@@ -286,6 +287,11 @@ export class NextCandleService {
       shapeCalibration: this.shapeCalibrationFor(asset, tf),
     })
     if (!pred) return null
+    // secondary, deliberately-simple comparison read (Hull MA slope + ROC +
+    // Elder Ray Bull/Bear Power) - purely for the panel to show alongside
+    // the fused prediction above; never tracked, never fed back into
+    // calibration, see analytics/hmarocbullbear.ts's module header.
+    pred.altPrediction = predictHmaRocBullBear(candles)
     const key = `${asset}:${tf}:${pred.targetBarTime}`
     // dedupe: replace the pending entry for the same target bar - a re-poll
     // inside the same forming bar is a refresh, not a second bet

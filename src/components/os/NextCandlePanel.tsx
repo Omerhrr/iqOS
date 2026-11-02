@@ -79,7 +79,7 @@ function regimeChip(regime: string) {
 // wick above the body is "room above the body to the expected high" and the
 // wick below is the mirror - body size/placement come straight from
 // bodyRatio/closePos, no separate drawing logic to keep in sync.
-function expectedCandleGlyph(p: NextCandlePrediction) {
+function expectedCandleGlyph(p: { direction: 'call' | 'put' | 'none'; bodyRatio: number; closePos: number }) {
   const W = 40
   const H = 56
   const call = p.direction === 'call'
@@ -533,11 +533,25 @@ export default function NextCandlePanel({ asset, tf, closedTick, onClose, onOpen
 
           {dirBanner(pred)}
           {pred.expectedCandleType && (
-            <div className="-mt-0.5 flex items-center gap-1.5 rounded border border-[#1c2739] bg-[#0b111c] px-1.5 py-1">
-              {expectedCandleGlyph(pred)}
-              <p className="font-mono text-[8.5px] italic text-[#7c8aa5]" title="derived from the oracle's own body-ratio/close-position/direction geometry">
-                expecting: {pred.expectedCandleType}
-              </p>
+            <div className="-mt-0.5 flex flex-wrap items-stretch gap-1.5">
+              <div className="flex flex-1 items-center gap-1.5 rounded border border-[#1c2739] bg-[#0b111c] px-1.5 py-1">
+                {expectedCandleGlyph(pred)}
+                <p className="font-mono text-[8.5px] italic text-[#7c8aa5]" title="derived from the oracle's own body-ratio/close-position/direction geometry">
+                  expecting: {pred.expectedCandleType}
+                </p>
+              </div>
+              {pred.altPrediction && (
+                <div
+                  className="flex flex-1 items-center gap-1.5 rounded border border-[#1c2739] bg-[#0b111c] px-1.5 py-1"
+                  title={`Hull MA slope ${pred.altPrediction.hmaSlope >= 0 ? '+' : ''}${pred.altPrediction.hmaSlope.toFixed(3)}% · ROC ${pred.altPrediction.rocValue >= 0 ? '+' : ''}${pred.altPrediction.rocValue.toFixed(3)}% · bull power ${pred.altPrediction.bullPower.toFixed(5)} · bear power ${pred.altPrediction.bearPower.toFixed(5)} - simple average, NOT fused with the oracle above and not tracked by the honesty loop`}
+                >
+                  {expectedCandleGlyph(pred.altPrediction)}
+                  <div className="flex flex-col">
+                    <p className="font-mono text-[8.5px] italic text-[#7c8aa5]">HMA/ROC/Bull-Bear: {pred.altPrediction.expectedCandleType}</p>
+                    <p className="font-mono text-[7.5px] uppercase tracking-wider text-[#4b5a72]">simple · untracked · strength {pred.altPrediction.strength}%</p>
+                  </div>
+                </div>
+              )}
             </div>
           )}
           <CalibrationBadge cal={pred.calibration ?? (record ? { n: record.n, hitRate: record.hitRate, brier: record.brier } : null)} />

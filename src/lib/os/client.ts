@@ -1525,6 +1525,30 @@ export interface NextCandlePrediction {
   /** live self-calibration (null = no resolved record yet) */
   calibration: { n: number; hitRate: number; brier: number } | null
   mode: 'sim' | 'live'
+  /** A SEPARATE, deliberately simple secondary read (Hull MA slope + ROC +
+   * Elder Ray Bull/Bear Power, averaged) for the panel to show next to the
+   * Oracle's own fused prediction - not one of the drivers above, not
+   * fused through the Oracle's calibration/correlation machinery, and not
+   * tracked by the honesty loop. null when there wasn't enough history. */
+  altPrediction?: HmaRocBullBearPrediction | null
+}
+
+/** The HMA/ROC/Bull-Bear secondary read attached to NextCandlePrediction.altPrediction
+ * - see analytics/hmarocbullbear.ts. Deliberately simple/untracked; shown
+ * next to the Oracle's own prediction for comparison, not fused with it. */
+export interface HmaRocBullBearPrediction {
+  direction: 'call' | 'put' | 'none'
+  /** combined -1..1 score, simple average of the three normalized reads */
+  score: number
+  /** 0..100 - |score| scaled; NOT the Oracle's confidence (no calibration discount) */
+  strength: number
+  hmaSlope: number
+  rocValue: number
+  bullPower: number
+  bearPower: number
+  bodyRatio: number
+  closePos: number
+  expectedCandleType: string
 }
 
 /** One resolved prediction from the oracle's honesty ledger. */
