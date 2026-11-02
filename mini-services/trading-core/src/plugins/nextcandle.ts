@@ -747,11 +747,50 @@ export class NextCandleService {
    * clusters rather than merged. Returns null when the ticker isn't found
    * in the live universe (never seen asset, or market-data not yet loaded) -
    * callers simply skip the cluster tier in that case. */
+  // Ticker -> cluster-key cache. clusterKeyFor() is called once per
+  // RESOLVED ROW inside clusterRows() below, and predict() calls the 4
+  // cluster methods on every single prediction - on a live universe
+  // (1000+ auto-discovered instruments) a naive listAssets().find() per
+  // call turns into resolved-rows x universe-size array scans PER
+  // PREDICTION, run across every asset a global scan touches: enough to
+  // block the event loop for seconds and 524-timeout the whole kernel,
+  // not just this feature (every REST route lives on the same thread).
+  // Rebuilt only when the live universe's size changes (rare - a handful
+  // of times per session as new instruments get auto-discovered), so
+  // lookups are O(1) amortized instead of O(universe size) every time.
+  private clusterKeyCache: Map<string, string> | null = null
+  private clusterKeyCacheUniverseSize = -1
+
+  /** This asset's cluster key for the intermediate fallback tier: asset
+   * CATEGORY, plus an ":otc" suffix when the ticker is an OTC synthetic -
+   * OTC instruments of the same nominal category (e.g. "crypto" vs
+   * "crypto-OTC") can have a meaningfully different physiology (continuous
+   * synthetic feed vs. real market hours), so they're kept as separate
+   * clusters rather than merged. Returns null when the ticker isn't found
+   * in the live universe (never seen asset, or market-data not yet loaded) -
+   * callers simply skip the cluster tier in that case. */
   private clusterKeyFor(asset: string): string | null {
-    const info = this.market.listAssets().find((a) => a.ticker === asset)
-    if (!info) return null
-    return info.ticker.endsWith('-OTC') ? `${info.category}:otc` : info.category
+    // this.market.assets is the plain backing array (O(1) to read/length-
+    // check); listAssets() re-maps it with a price/iq lookup per item on
+    // EVERY call, which would make even this staleness check O(universe
+    // size) again if used here instead.
+    const assets = this.market.assets
+    if (!this.clusterKeyCache || this.clusterKeyCacheUniverseSize !== assets.length) {
+      this.clusterKeyCache = new Map(assets.map((a) => [a.ticker, a.ticker.endsWith('-OTC') ? `${a.category}:otc` : a.category]))
+      this.clusterKeyCacheUniverseSize = assets.length
+    }
+    return this.clusterKeyCache.get(asset) ?? null
   }
+
+  // clusterRows() result cache, keyed by cluster key (not by asset - every
+  // pair in the same cluster shares one answer) and invalidated by
+  // this.resolved's own length, which only ever grows (ResolvedPrediction
+  // rows are pushed, then shifted off the front once MAX_RESOLVED is hit -
+  // a length change is exactly "something changed, recompute"). Without
+  // this, a global scan touching N same-cluster pairs would still redo the
+  // full this.resolved filter N times per poll.
+  private clusterRowsCache = new Map<string, ResolvedPrediction[]>()
+  private clusterRowsCacheResolvedLen = -1
 
   /** Resolved rows belonging to the same cluster as `asset`, re-derived at
    * query time (ResolvedPrediction doesn't persist a category, and an
@@ -759,7 +798,15 @@ export class NextCandleService {
   private clusterRows(asset: string): ResolvedPrediction[] {
     const key = this.clusterKeyFor(asset)
     if (!key) return []
-    return this.resolved.filter((r) => this.clusterKeyFor(r.asset) === key)
+    if (this.clusterRowsCacheResolvedLen !== this.resolved.length) {
+      this.clusterRowsCache.clear()
+      this.clusterRowsCacheResolvedLen = this.resolved.length
+    }
+    const cached = this.clusterRowsCache.get(key)
+    if (cached) return cached
+    const rows = this.resolved.filter((r) => this.clusterKeyFor(r.asset) === key)
+    this.clusterRowsCache.set(key, rows)
+    return rows
   }
 
   /** CLUSTER-level per-driver win-rate multiplier -
