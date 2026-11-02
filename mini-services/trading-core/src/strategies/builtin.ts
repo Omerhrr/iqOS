@@ -1,7 +1,7 @@
 // IQAIR//OS - Strategy registry
 // Data-driven strategy definitions. `evaluate` is pure: candles + params in,
 // a directional eval out. Used by the Strategy Lab, the backtester and the agent.
-import type { StrategyDef } from '../types'
+import type { StrategyDef, Candle } from '../types'
 import * as ta from '../analytics/indicators'
 import { markovChain, fitDiscreteMarkov, logReturns, stdev, mean, rng, gauss, ewmaVol, garchVol, supportResistance } from '../analytics/quant'
 import { detectPatterns, patternBias } from '../analytics/patterns'
@@ -27,8 +27,36 @@ import { computeVolArb, VOLARB_DEFAULT_WINDOW } from '../analytics/volarb'
 import { fitTriangulation, TRIANGULATION_WINDOW, TRIANGULATION_MIN_WINDOW, TRIANGULATION_Z_ENTRY } from '../analytics/triangulation'
 import { fitAdxPatternBias, ADX_TREND_THRESHOLD, COMPOSITE_QUALIFY } from '../analytics/adxpatternbias'
 import { fitShockPressure, SHOCK_RATIO_THRESHOLD, PRESSURE_LOOKBACK, SHOCKPRESSURE_COMPOSITE_QUALIFY } from '../analytics/shockpressure'
-import { predictNextCandle, ORACLE_EVAL_WINDOW, ORACLE_MIN_CANDLES } from '../analytics/nextcandle'
+import { predictNextCandle, ORACLE_EVAL_WINDOW, ORACLE_MIN_CANDLES, type NextCandlePrediction } from '../analytics/nextcandle'
 import { tempoConviction, tempoDecide, tempoWindow, TEMPO_WINDOW_BARS, TEMPO_HISTORY_WINDOWS, TEMPO_FLOOR } from '../analytics/tempo'
+
+/** Memoizes the 'tempo' strategy's Oracle-fusion reads by (asset, tf,
+ * candle open time) - a bar's own prediction is a deterministic function
+ * of the candle history up through it, so once computed it never needs
+ * recomputing, no matter how many later bars' window-max-history rebuild
+ * or already-fired replay looks back at it. Without this, a naive replay
+ * re-runs the full 7-driver fusion ~140x per bar (O(bars x 140) Oracle
+ * evaluations) - slow enough to trip a backtest request's own timeout.
+ * With it, each bar's fusion runs ONCE ever (the first time any later bar
+ * asks for it) and every subsequent lookback is a cache hit - the backtest
+ * as a whole costs about one Oracle evaluation per bar, the same tier as
+ * every other Oracle-driven strategy in this catalog. Capped and cleared
+ * wholesale when it grows unreasonably large (a long-running process
+ * backtesting many different assets/timeframes over a session) rather than
+ * evicted piecemeal - simplicity over a proper LRU, since a cache miss
+ * only costs one recomputation, never a correctness problem. */
+const TEMPO_PREDICTION_CACHE_MAX = 300_000
+const tempoPredictionCache = new Map<string, NextCandlePrediction | null>()
+function tempoPredictionAt(candles: Candle[], i: number, asset: string, tf: string): NextCandlePrediction | null {
+  const key = `${asset}|${tf}|${candles[i].time}`
+  const cached = tempoPredictionCache.get(key)
+  if (cached !== undefined) return cached
+  const evalSlice = candles.slice(Math.max(0, i + 1 - ORACLE_EVAL_WINDOW), i + 1)
+  const pred = predictNextCandle(evalSlice, { asset, tf, mode: 'sim' })
+  if (tempoPredictionCache.size > TEMPO_PREDICTION_CACHE_MAX) tempoPredictionCache.clear()
+  tempoPredictionCache.set(key, pred)
+  return pred
+}
 
 const last = (arr: number[]): number => {
   for (let i = arr.length - 1; i >= 0; i--) if (Number.isFinite(arr[i])) return arr[i]
@@ -1922,7 +1950,7 @@ export const STRATEGIES: StrategyDef[] = [
     id: 'tempo',
     name: 'Tempo (Patience Engine)',
     description:
-      "The patience engine (analytics/tempo.ts), as a backtest-able strategy. Live Tempo treats every 10-bar window as a hunting license for exactly ONE shot - the bar whose fused Next-Candle Oracle conviction is surest - firing only when that conviction clears a patience bar that starts near the pair's own typical window-best (hard to clear early in the window) and decays toward an absolute floor as the window runs out (easy to clear on the last bar). This entry reconstructs that same rule faithfully: each bar, it rebuilds the pair's own recent window-max history and checks whether an EARLIER bar in the current window already fired, by replaying the stopping rule across the trailing lookback span - the same quantities the live engine accumulates for free from watching the real candle stream, since a backtest strategy call gets no memory between bars. Faithful but CPU-heavy: every bar re-runs the full 7-driver Oracle fusion (markov/monte-carlo/kalman/confluence/chart-engines/patterns/bar-physics) up to ~130 times instead of once, so this strategy runs noticeably slower than the rest of the catalog - expect it on single-asset backtests, not large optimizer sweeps. Known simplification: the live engine's pair-accuracy dampening and recent-similar-loss penalty depend on that pair's OWN resolved trade ledger building up over real time, which a single backtest pass can't replay into itself bar-by-bar - this entry evaluates the stopping rule alone, without those two extra live-only dampeners.",
+      "The patience engine (analytics/tempo.ts), as a backtest-able strategy. Live Tempo treats every 10-bar window as a hunting license for exactly ONE shot - the bar whose fused Next-Candle Oracle conviction is surest - firing only when that conviction clears a patience bar that starts near the pair's own typical window-best (hard to clear early in the window) and decays toward an absolute floor as the window runs out (easy to clear on the last bar). This entry reconstructs that same rule faithfully: each bar, it rebuilds the pair's own recent window-max history and checks whether an EARLIER bar in the current window already fired, by replaying the stopping rule across the trailing lookback span - the same quantities the live engine accumulates for free from watching the real candle stream, since a backtest strategy call gets no memory between bars. Each bar's own Oracle-fusion read (markov/monte-carlo/kalman/confluence/chart-engines/patterns/bar-physics) is memoized by its exact candle time, so re-deriving that lookback/replay history costs roughly one fusion evaluation per bar overall, not per lookback step - the same cost tier as the rest of the catalog. Known simplification: the live engine's pair-accuracy dampening and recent-similar-loss penalty depend on that pair's OWN resolved trade ledger building up over real time, which a single backtest pass can't replay into itself bar-by-bar - this entry evaluates the stopping rule alone, without those two extra live-only dampeners.",
     params: [{ key: 'floor', label: 'Absolute conviction floor (fallback)', type: 'number', min: 3, max: 20, default: TEMPO_FLOOR }],
     evaluate: (candles, p, hints) => {
       const oracleAsset = hints?.asset ?? 'backtest'
@@ -1940,12 +1968,11 @@ export const STRATEGIES: StrategyDef[] = [
 
       // convictionAt(i): the Oracle-fusion conviction using only candles up
       // through index i, bounded to the same ORACLE_EVAL_WINDOW tail the
-      // live plugin uses - keeps every one of these ~130 lookback calls at
-      // a constant cost no matter how deep the backtest's own candle feed
-      // runs.
+      // live plugin uses - memoized (tempoPredictionAt/tempoPredictionCache
+      // above) so each bar's own fusion read is only ever computed once,
+      // no matter how many later bars' lookback asks for it.
       const convictionAt = (i: number): number => {
-        const evalSlice = candles.slice(Math.max(0, i + 1 - ORACLE_EVAL_WINDOW), i + 1)
-        const pred = predictNextCandle(evalSlice, { asset: oracleAsset, tf: oracleTf, mode: 'sim' })
+        const pred = tempoPredictionAt(candles, i, oracleAsset, oracleTf)
         if (!pred) return 0
         return tempoConviction(pred.confidence, pred.pUp)
       }
@@ -1986,7 +2013,7 @@ export const STRATEGIES: StrategyDef[] = [
         }
       }
 
-      const pred = predictNextCandle(candles.slice(Math.max(0, n - ORACLE_EVAL_WINDOW), n), { asset: oracleAsset, tf: oracleTf, mode: 'sim' })
+      const pred = tempoPredictionAt(candles, n - 1, oracleAsset, oracleTf)
       if (!pred || pred.direction === 'none') return { direction: 'none', score: 0, notes: 'oracle has no directional lean on this bar' }
       const conviction = tempoConviction(pred.confidence, pred.pUp)
       const dec = tempoDecide({ conviction, barsRemaining: nowWindow.barsRemaining, windowMaxHistory: history, floor: floor !== TEMPO_FLOOR ? floor : undefined })
