@@ -71,6 +71,67 @@ function regimeChip(regime: string) {
   )
 }
 
+// Draws the shape expectedCandleType only describes in words: a tiny
+// candlestick glyph laid out from the oracle's own body-ratio/close-position/
+// direction geometry. The glyph's box IS the expected high-low range, so the
+// wick above the body is "room above the body to the expected high" and the
+// wick below is the mirror - body size/placement come straight from
+// bodyRatio/closePos, no separate drawing logic to keep in sync.
+function expectedCandleGlyph(p: NextCandlePrediction) {
+  const W = 40
+  const H = 56
+  const call = p.direction === 'call'
+  const none = p.direction === 'none'
+  const bodyRatio = Math.min(Math.max(p.bodyRatio, 0.04), 1)
+  const closePos = Math.min(Math.max(p.closePos, 0), 1)
+  const closeY = H * (1 - closePos)
+  const bodyH = Math.max(bodyRatio * H, 2)
+  let openY: number
+  let closeYClamped: number
+  if (none) {
+    openY = Math.max(0, Math.min(H, closeY - bodyH / 2))
+    closeYClamped = openY + bodyH
+  } else if (call) {
+    closeYClamped = closeY
+    openY = closeYClamped + bodyH
+    if (openY > H) {
+      openY = H
+      closeYClamped = H - bodyH
+    }
+  } else {
+    closeYClamped = closeY
+    openY = closeYClamped - bodyH
+    if (openY < 0) {
+      openY = 0
+      closeYClamped = bodyH
+    }
+  }
+  const bodyTop = Math.min(openY, closeYClamped)
+  const bodyBottom = Math.max(openY, closeYClamped)
+  const color = none ? '#7c8aa5' : call ? '#34d399' : '#fb7185'
+  const cx = W / 2
+  const bodyW = W * 0.55
+  return (
+    <svg width={W} height={H + 4} viewBox={`0 0 ${W} ${H + 2}`} className="shrink-0">
+      {/* upper wick: body top -> expected high */}
+      <line x1={cx} y1={bodyTop} x2={cx} y2={0} stroke={color} strokeWidth={1.5} />
+      {/* lower wick: body bottom -> expected low */}
+      <line x1={cx} y1={bodyBottom} x2={cx} y2={H} stroke={color} strokeWidth={1.5} />
+      <rect
+        x={cx - bodyW / 2}
+        y={Math.max(bodyTop, 0.5)}
+        width={bodyW}
+        height={Math.max(bodyBottom - bodyTop, 1.5)}
+        fill={none ? 'none' : color}
+        fillOpacity={none ? 0 : 0.85}
+        stroke={color}
+        strokeWidth={1.25}
+        rx={0.75}
+      />
+    </svg>
+  )
+}
+
 function dirBanner(p: NextCandlePrediction) {
   const call = p.direction === 'call'
   const none = p.direction === 'none'
@@ -460,9 +521,12 @@ export default function NextCandlePanel({ asset, tf, closedTick, onClose, onOpen
 
           {dirBanner(pred)}
           {pred.expectedCandleType && (
-            <p className="-mt-0.5 font-mono text-[8.5px] italic text-[#7c8aa5]" title="derived from the oracle's own body-ratio/close-position/direction geometry">
-              expecting: {pred.expectedCandleType}
-            </p>
+            <div className="-mt-0.5 flex items-center gap-1.5 rounded border border-[#1c2739] bg-[#0b111c] px-1.5 py-1">
+              {expectedCandleGlyph(pred)}
+              <p className="font-mono text-[8.5px] italic text-[#7c8aa5]" title="derived from the oracle's own body-ratio/close-position/direction geometry">
+                expecting: {pred.expectedCandleType}
+              </p>
+            </div>
           )}
           <CalibrationBadge cal={pred.calibration ?? (record ? { n: record.n, hitRate: record.hitRate, brier: record.brier } : null)} />
           <RangeCone p={pred} />
