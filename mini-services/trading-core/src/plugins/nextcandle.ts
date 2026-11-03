@@ -21,6 +21,7 @@ import type { KernelContext, Plugin } from '../kernel'
 import type { Candle, Timeframe } from '../types'
 import { pairKey, predictNextCandle, setOracleCalibrationProvider, type NextCandlePrediction, type OracleRegime } from '../analytics/nextcandle'
 import { predictHmaRocBullBear } from '../analytics/hmarocbullbear'
+import { predictMomentumScore } from '../analytics/momentumscore'
 import { setPatternReliabilityProvider } from '../analytics/patterns'
 import { weightedHitRate, weightedMean, weightedMeanBy } from '../analytics/recencystats'
 import { classifySession, type Session } from '../analytics/session'
@@ -292,6 +293,23 @@ export class NextCandleService {
     // the fused prediction above; never tracked, never fed back into
     // calibration, see analytics/hmarocbullbear.ts's module header.
     pred.altPrediction = predictHmaRocBullBear(candles)
+    // third secondary comparison read - the user's own multi-timeframe
+    // "Market Momentum Score" formula, genuinely cross-timeframe (not a
+    // resample of `candles` above): pulls its own 15m/5m/1m/30s candles
+    // for this asset regardless of what tf the chart/Oracle is running on.
+    // Best-effort per timeframe - an instrument that can't seed one of the
+    // four (e.g. briefly closed) just can't produce this read right now,
+    // same null-on-insufficient-history contract as altPrediction above.
+    try {
+      pred.momentumPrediction = predictMomentumScore({
+        t15m: this.market.getCandlesDeep(asset, '15m', 60, true),
+        t5m: this.market.getCandlesDeep(asset, '5m', 60, true),
+        t1m: this.market.getCandlesDeep(asset, '1m', 60, true),
+        t30s: this.market.getCandlesDeep(asset, '30s', 60, true),
+      })
+    } catch {
+      pred.momentumPrediction = null
+    }
     const key = `${asset}:${tf}:${pred.targetBarTime}`
     // dedupe: replace the pending entry for the same target bar - a re-poll
     // inside the same forming bar is a refresh, not a second bet

@@ -81,6 +81,7 @@ import { atr } from './indicators'
 import type { AnalysisResult } from '../types'
 import { classifyRegime } from './regime'
 import type { HmaRocBullBearPrediction } from './hmarocbullbear'
+import type { MomentumScorePrediction } from './momentumscore'
 import { scanSmc, smcSummaryScore } from './smc'
 
 export const ORACLE_MIN_CANDLES = 320 // markov(lookback 300) + warmup for the rest
@@ -159,6 +160,14 @@ export interface NextCandlePrediction {
    * engine's own calibrated fusion - null when there isn't enough history
    * for all three indicators to clear their own warmup. */
   altPrediction?: HmaRocBullBearPrediction | null
+  /** A THIRD, deliberately simple secondary read - the user's own
+   * multi-timeframe "Market Momentum Score" formula (W1*T15m + W2*T5m +
+   * W3*T1m + W4*T30s, pure candle-math terms). Same treatment as
+   * altPrediction above: computed and attached by the plugin
+   * (analytics/momentumscore.ts), NOT fused through this engine's own
+   * machinery, not tracked by the honesty loop - null until all four
+   * timeframes have enough history. */
+  momentumPrediction?: MomentumScorePrediction | null
 }
 
 function clamp(v: number, lo: number, hi: number): number {

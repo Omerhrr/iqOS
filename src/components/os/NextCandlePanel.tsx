@@ -552,6 +552,18 @@ export default function NextCandlePanel({ asset, tf, closedTick, onClose, onOpen
                   </div>
                 </div>
               )}
+              {pred.momentumPrediction && (
+                <div
+                  className="flex flex-1 items-center gap-1.5 rounded border border-[#1c2739] bg-[#0b111c] px-1.5 py-1"
+                  title={`Market Momentum Score = ${pred.momentumPrediction.weights.w15m}*T15m + ${pred.momentumPrediction.weights.w5m}*T5m + ${pred.momentumPrediction.weights.w1m}*T1m + ${pred.momentumPrediction.weights.w30s}*T30s · T15m ${pred.momentumPrediction.components.t15m >= 0 ? '+' : ''}${pred.momentumPrediction.components.t15m} · T5m ${pred.momentumPrediction.components.t5m >= 0 ? '+' : ''}${pred.momentumPrediction.components.t5m} · T1m ${pred.momentumPrediction.components.t1m >= 0 ? '+' : ''}${pred.momentumPrediction.components.t1m} · T30s ${pred.momentumPrediction.components.t30s >= 0 ? '+' : ''}${pred.momentumPrediction.components.t30s} - pure candle-math terms (own timeframes, independent of the chart's tf), NOT fused with the oracle above and not tracked by the honesty loop`}
+                >
+                  {expectedCandleGlyph(pred.momentumPrediction)}
+                  <div className="flex flex-col">
+                    <p className="font-mono text-[8.5px] italic text-[#7c8aa5]">Momentum Score: {pred.momentumPrediction.expectedCandleType}</p>
+                    <p className="font-mono text-[7.5px] uppercase tracking-wider text-[#4b5a72]">15m/5m/1m/30s · untracked · score {pred.momentumPrediction.score >= 0 ? '+' : ''}{pred.momentumPrediction.score}</p>
+                  </div>
+                </div>
+              )}
             </div>
           )}
           <CalibrationBadge cal={pred.calibration ?? (record ? { n: record.n, hitRate: record.hitRate, brier: record.brier } : null)} />

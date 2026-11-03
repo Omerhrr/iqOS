@@ -1593,6 +1593,11 @@ export interface NextCandlePrediction {
    * fused through the Oracle's calibration/correlation machinery, and not
    * tracked by the honesty loop. null when there wasn't enough history. */
   altPrediction?: HmaRocBullBearPrediction | null
+  /** Third secondary read - the user's own multi-timeframe "Market
+   * Momentum Score" formula (analytics/momentumscore.ts). Same treatment
+   * as altPrediction: deliberately simple, untracked, not fused with the
+   * Oracle's own prediction, shown alongside it for comparison. */
+  momentumPrediction?: MomentumScorePrediction | null
 }
 
 /** The HMA/ROC/Bull-Bear secondary read attached to NextCandlePrediction.altPrediction
@@ -1608,6 +1613,22 @@ export interface HmaRocBullBearPrediction {
   rocValue: number
   bullPower: number
   bearPower: number
+  bodyRatio: number
+  closePos: number
+  expectedCandleType: string
+}
+
+/** The Market Momentum Score secondary read attached to
+ * NextCandlePrediction.momentumPrediction - see analytics/momentumscore.ts.
+ * Score = W1*T15m + W2*T5m + W3*T1m + W4*T30s, each T_<tf> a pure
+ * candle-math (body-direction-within-range) term on that timeframe's own
+ * candles - genuinely cross-timeframe, not a resample of one series. */
+export interface MomentumScorePrediction {
+  direction: 'call' | 'put' | 'none'
+  score: number
+  strength: number
+  weights: { w15m: number; w5m: number; w1m: number; w30s: number }
+  components: { t15m: number; t5m: number; t1m: number; t30s: number }
   bodyRatio: number
   closePos: number
   expectedCandleType: string
