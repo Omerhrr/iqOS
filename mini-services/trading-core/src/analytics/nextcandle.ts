@@ -27,6 +27,18 @@
 //   9. Footprint             - order-flow delta/absorption read, same
 //                             standalone treatment as Renko above
 //                             (analytics/footprint.ts via engineVoteSingle())
+//  10. Smart Money Concepts  - FVG/OB/BOS/CHoCH/sweep/OTE/breaker/S&D/S&R/
+//                             breakout/CRT/Power of 3/Silver Bullet/KRM,
+//                             net active-signal lean               (smc.ts)
+// Driver 10 is the newest addition and, UNLIKE 1-9, has not yet been
+// measured against real resolved outcomes - it ships at a deliberately
+// conservative starting weight (see its block below) specifically so the
+// per-driver learned weight multiplier (the `pick5`/driverWeightMultipliers
+// cascade a few hundred lines down) has real room to correct it once this
+// pair's own honesty-loop history accumulates, the same mechanism that
+// already governs drivers 1-9's live weight. It does not participate in
+// CORRELATED_DRIVER_GROUPS below - its inputs (swing fractals, imbalances,
+// structure breaks) are not derived from any of the other nine.
 // Drivers 8-9 reuse the EXACT SAME vote functions driver #5 (chart-engine
 // committee) already calls internally - they are not a second measurement,
 // just the same read exposed as its own model instead of buried inside
@@ -69,6 +81,7 @@ import { atr } from './indicators'
 import type { AnalysisResult } from '../types'
 import { classifyRegime } from './regime'
 import type { HmaRocBullBearPrediction } from './hmarocbullbear'
+import { scanSmc, smcSummaryScore } from './smc'
 
 export const ORACLE_MIN_CANDLES = 320 // markov(lookback 300) + warmup for the rest
 /** Evaluation window cap for consumers that re-evaluate bar-by-bar (the
@@ -622,6 +635,29 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
         weight: w,
         vote: signed,
         detail: fv.note,
+      })
+    }
+  }
+
+  // ---------- 10. Smart Money Concepts (FVG/OB/BOS/CHoCH/sweep/OTE/...) ----------
+  {
+    const smc = scanSmc(candles)
+    const score = smcSummaryScore(smc)
+    if (smc && score !== 0) {
+      // Deliberately conservative starting weight - see module header.
+      // Drivers 1-9 sit at weight 6-14; this starts at HALF the lightest of
+      // those (3) so a wrong read can't swing the fusion much on day one,
+      // while still being large enough for the learned per-driver
+      // multiplier (0.6-1.5x, same cascade every other driver gets) to
+      // pull it toward its real, resolved-outcome-earned weight once this
+      // pair's own honesty-loop history on "Smart Money Concepts" builds up.
+      const w = 3 * chaosFlatten
+      drivers.push({
+        name: 'Smart Money Concepts',
+        pUp: pUpFromScore(score),
+        weight: w,
+        vote: score,
+        detail: `${smc.summary.bullish} bullish vs ${smc.summary.bearish} bearish active signal(s), structure ${smc.trend} (unvalidated - starting weight, see analytics/smc.ts)`,
       })
     }
   }

@@ -17,8 +17,8 @@
 // controlled: no input box, no manual "read", it just tracks that asset and
 // re-fetches the moment it changes, same as every other asset-bound panel.
 import { useCallback, useEffect, useState } from 'react'
-import type { AdxPatternBiasFit, PairCompareDelta, PairSignalResponse, Timeframe, TpoResult } from '@/lib/os/client'
-import { fmtPrice, getKalmanOuZ, getPairSignal, getTpoProfile } from '@/lib/os/client'
+import type { AdxPatternBiasFit, PairCompareDelta, PairSignalResponse, SmcScanResponse, Timeframe, TpoResult } from '@/lib/os/client'
+import { fmtPrice, getKalmanOuZ, getPairSignal, getSmcScan, getTpoProfile } from '@/lib/os/client'
 import { SideCard } from './PairComparePanel'
 
 const POLL_MS = 10_000
@@ -94,6 +94,23 @@ function deltaDetail(delta: PairCompareDelta[] | undefined): PatternDetail | nul
   return { text: `Δ ${last.delta >= 0 ? '+' : ''}${last.delta.toFixed(1)} this candle`, direction, reliability }
 }
 
+/** Smart Money Concepts panel's own net lean (analytics/smc.ts) - a fifth
+ * quick read alongside POC/OU/ADX/delta. direction/reliability mirror the
+ * panel's own summary (bullish/bearish active-signal count), reliability
+ * off how lopsided that count is (a 2/1 split reads weaker than 6/0).
+ * Detection-only, same caveat the SMC tab itself carries - see
+ * trading-core/src/analytics/smc.ts's module header. */
+function smcDetail(smc: SmcScanResponse['result'] | null | undefined): PatternDetail | null {
+  if (!smc || smc.summary.direction === 'none') return null
+  const direction: 'bullish' | 'bearish' | 'neutral' = smc.summary.direction === 'call' ? 'bullish' : 'bearish'
+  const reliability: 1 | 2 | 3 = smc.summary.confidence >= 80 ? 3 : smc.summary.confidence >= 60 ? 2 : 1
+  return {
+    text: `SMC ${smc.summary.bullish}▲/${smc.summary.bearish}▼ active · structure ${smc.trend} · ${smc.summary.confidence}%`,
+    direction,
+    reliability,
+  }
+}
+
 export default function PairSignalPanel({
   onClose,
   tf,
@@ -119,6 +136,7 @@ export default function PairSignalPanel({
     ou: PatternDetail | null
     adx: PatternDetail | null
     delta: PatternDetail | null
+    smc: PatternDetail | null
   }) => void
 }) {
   const controlled = controlledAsset !== undefined
@@ -154,10 +172,11 @@ export default function PairSignalPanel({
               ou: null,
               adx: adxDiDetail(d.side.fit),
               delta: deltaDetail(d.side.delta),
+              smc: null,
             })
             if (onDetail) {
-              Promise.all([getTpoProfile(asset, tf, { limit: 400 }), getKalmanOuZ(asset, tf)])
-                .then(([tpo, ouZ]) => {
+              Promise.all([getTpoProfile(asset, tf, { limit: 400 }), getKalmanOuZ(asset, tf), getSmcScan(asset, tf)])
+                .then(([tpo, ouZ, smc]) => {
                   onDetail({
                     candle: patternHitDetail(d.side.fit?.patterns[0]),
                     ha: patternHitDetail(d.side.fit?.haPatterns[0]),
@@ -165,6 +184,7 @@ export default function PairSignalPanel({
                     ou: kalmanOuDetail(ouZ),
                     adx: adxDiDetail(d.side.fit),
                     delta: deltaDetail(d.side.delta),
+                    smc: smcDetail(smc.result),
                   })
                 })
                 .catch(() => {})

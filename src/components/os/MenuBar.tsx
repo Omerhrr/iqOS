@@ -50,6 +50,11 @@ interface Props {
   ouDetail?: PatternDetail | null
   adxDetail?: PatternDetail | null
   deltaDetail?: PatternDetail | null
+  /** Third detail row, below OU/ADX/delta: the Smart Money Concepts panel's
+   * own net lean (analytics/smc.ts - FVG/OB/BOS/CHoCH/sweep/OTE/breaker/
+   * S&D/S&R/breakout/CRT/Power of 3/Silver Bullet/KRM), same
+   * PatternDetail shape/treatment as every other read on this strip. */
+  smcDetail?: PatternDetail | null
 }
 
 function detailColor(d: PatternDetail): string {
@@ -232,6 +237,11 @@ export default function MenuBar(props: Props) {
         {props.ouDetail && <DetailLine d={props.ouDetail} grow={false} />}
         {props.adxDetail && <DetailLine d={props.adxDetail} />}
         {props.deltaDetail && <DetailLine d={props.deltaDetail} grow={false} />}
+      </div>
+    )}
+    {props.smcDetail && (
+      <div className="flex items-center gap-4 border-t border-[#131c2b] px-3 py-1">
+        <DetailLine d={props.smcDetail} grow={false} />
       </div>
     )}
     </div>
