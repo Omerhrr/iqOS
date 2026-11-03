@@ -2213,8 +2213,9 @@ const httpServer = createServer(async (req, res) => {
       // cointegration-pairs strategy itself would act on right now.
       // Smart Money Concepts / ICT structure scan (single instrument, the
       // chart's own asset+tf) - FVG/OB/BOS/CHoCH/sweep/OTE/breaker/S&D/S&R/
-      // breakout/CRT/Power of 3/Silver Bullet/KRM. Detection-only panel for
-      // now (see analytics/smc.ts's module header) - not an Oracle driver yet.
+      // breakout/CRT/Power of 3/Silver Bullet/KRM. Panel-facing, and also
+      // what nextcandle.ts's driver #10 fuses from - see /smc_stats below
+      // for its honesty-loop numbers.
       if (path === '/smc_scan') {
         try {
           const tfv = tfStrict(q.get('tf'))
@@ -2224,6 +2225,23 @@ const httpServer = createServer(async (req, res) => {
         } catch (err) {
           return json(400, { ok: false, error: (err as Error).message })
         }
+      }
+
+      // SMC outcome stats (the honesty loop for the Smart Money Concepts
+      // scanner): every scan whose summary cleared the confidence floor
+      // became a pending claim, resolved against the asset's own price at
+      // a flat bar-count horizon - this is what will tell us whether the
+      // Oracle's SMC driver (#10, currently an unvalidated guessed weight)
+      // should move, once enough resolved outcomes accrue.
+      if (path === '/smc_stats') {
+        const tfq = q.get('tf')
+        let tfFilter: Timeframe | undefined
+        if (tfq !== null) {
+          const v = tfStrict(tfq)
+          if (v === null) return json(400, { ok: false, error: tfErr(tfq) })
+          tfFilter = v
+        }
+        return json(200, { ok: true, ...kernel.context().use<SmcScanService>('smcScan').stats(tfFilter), ts: Date.now() })
       }
 
       if (path === '/cointegration_scan') {

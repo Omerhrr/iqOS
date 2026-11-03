@@ -3,17 +3,22 @@
 // Finds the market-structure concepts the user asked for - Fair Value Gap,
 // Order Block, Liquidity Sweep, Break of Structure, CHoCH, IFVG, Breaker
 // Block, OTE, KRM, Supply & Demand, Support & Resistance, Breakout, CRT,
-// Power of 3, Silver Bullet - on ONE instrument's own candles, as a new,
-// STANDALONE panel (SmcPanel.tsx / /smc_scan). Per the user's own framing
-// ("so this panel find [...], our next candle oracle can later use it"),
-// this module is built to be Oracle-consumable later (see smcSummary()
-// below, a single-number digest shaped like every other driver input
-// nextcandle.ts already fuses), but it is NOT wired into the Oracle's
-// fusion yet - same rule this session has followed for every other new
-// signal source (cointegration/vol-arb outcome trackers, chart-signals):
-// a new driver earns a weight slot only after it's measured against real
-// resolved outcomes, not on the strength of how plausible the concept
-// sounds. Nothing here has been outcome-tracked yet.
+// Power of 3, Silver Bullet - on ONE instrument's own candles, feeding both
+// a STANDALONE panel (SmcPanel.tsx / /smc_scan) and, per direct
+// instruction, driver #10 of the next-candle Oracle's fusion
+// (nextcandle.ts, via smcSummaryScore() below - a single-number digest
+// shaped like every other driver input it already fuses).
+//
+// That wiring happened AHEAD of this session's usual "validate before
+// wire" rule (a new driver normally earns its weight slot only after being
+// measured against real resolved outcomes, same as cointegration/vol-arb/
+// chart-signals/lead-lag) - done anyway because the user asked for it
+// directly, with a deliberately low starting weight so the Oracle's own
+// learned-multiplier cascade can correct it. The honesty loop has since
+// been added retroactively (analytics/smcoutcomes.ts / plugins/smcscan.ts
+// / /smc_stats), so that starting weight is no longer a permanent guess -
+// once enough resolved outcomes accrue, /smc_stats is what tells you
+// whether it should move.
 //
 // Two of the fifteen names need an explicit admission rather than a quiet
 // guess:
