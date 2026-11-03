@@ -192,6 +192,68 @@ export interface Factor {
 }
 
 // ---------- order flow (approximation - see trading-core/src/analytics/orderflow.ts) ----------
+// ---------- Smart Money Concepts / ICT structure (trading-core/src/analytics/smc.ts) ----------
+// FVG/IFVG/Order Block/Breaker Block/Liquidity Sweep/BOS/CHoCH/OTE/KRM/
+// Supply & Demand/Support & Resistance/Breakout/CRT/Power of 3/Silver Bullet
+// on the chart's own asset+tf. Detection-only for now - see smc.ts's module
+// header: NOT wired into the Next-Candle Oracle's fusion yet, built so it
+// can be once it's measured against real resolved outcomes. Two of these
+// (KRM, Silver Bullet) are explicitly-flagged interpretations/approximations
+// - see the per-signal note text and smc.ts's header comment.
+
+export type SmcDirection = 'bullish' | 'bearish'
+
+export type SmcKind =
+  | 'FVG'
+  | 'IFVG'
+  | 'ORDER_BLOCK'
+  | 'BREAKER_BLOCK'
+  | 'LIQUIDITY_SWEEP'
+  | 'BOS'
+  | 'CHOCH'
+  | 'OTE'
+  | 'KRM'
+  | 'SUPPLY_DEMAND'
+  | 'SUPPORT_RESISTANCE'
+  | 'BREAKOUT'
+  | 'CRT'
+  | 'POWER_OF_3'
+  | 'SILVER_BULLET'
+
+export interface SmcSignal {
+  kind: SmcKind
+  direction: SmcDirection
+  top?: number
+  bottom?: number
+  level?: number
+  index: number
+  barsAgo: number
+  active: boolean
+  touches?: number
+  note: string
+}
+
+export interface SmcScanResult {
+  price: number
+  ts: number
+  trend: SmcDirection | 'range'
+  signals: SmcSignal[]
+  summary: { direction: 'call' | 'put' | 'none'; confidence: number; bullish: number; bearish: number }
+}
+
+export interface SmcScanResponse {
+  ok: true
+  asset: string
+  tf: Timeframe
+  result: SmcScanResult | null
+  ts: number
+  scanMs: number
+}
+
+export async function getSmcScan(asset: string, tf: Timeframe): Promise<SmcScanResponse> {
+  return osGet<SmcScanResponse>('/smc_scan', { asset, tf })
+}
+
 // IQ Option exposes no real bid/ask-tagged trades or order-book depth, so all
 // of this is derived from OHLCV candles via a close-location-value (CLV) proxy.
 // Never present it as real order-flow data in the UI - always label it approx.

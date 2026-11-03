@@ -29,6 +29,7 @@ import { chartSignalsPlugin, ChartSignalsService } from './src/plugins/chartsign
 import { leadLagScanPlugin, LeadLagScanService } from './src/plugins/leadlagscan'
 import { cointegrationScanPlugin, CointegrationScanService } from './src/plugins/cointegrationscan'
 import { volArbScanPlugin, VolArbScanService } from './src/plugins/volarbscan'
+import { smcScanPlugin, SmcScanService } from './src/plugins/smcscan'
 import { yesterdayPlugin, YesterdayService } from './src/plugins/yesterday'
 import { nextCandlePlugin, NextCandleService } from './src/plugins/nextcandle'
 import { adxHonestyPlugin, AdxHonestyService } from './src/plugins/adxhonesty'
@@ -191,6 +192,7 @@ kernel.register(chartSignalsPlugin)
 kernel.register(leadLagScanPlugin)
 kernel.register(cointegrationScanPlugin)
 kernel.register(volArbScanPlugin)
+kernel.register(smcScanPlugin)
 kernel.register(yesterdayPlugin)
 kernel.register(nextCandlePlugin)
 kernel.register(tempoPlugin)
@@ -2209,6 +2211,21 @@ const httpServer = createServer(async (req, res) => {
       // leader/follower pair in LEADLAG_GROUPS (same roster lead-lag scans),
       // Engle-Granger-fit and ranked, `qualifies` marking exactly what the
       // cointegration-pairs strategy itself would act on right now.
+      // Smart Money Concepts / ICT structure scan (single instrument, the
+      // chart's own asset+tf) - FVG/OB/BOS/CHoCH/sweep/OTE/breaker/S&D/S&R/
+      // breakout/CRT/Power of 3/Silver Bullet/KRM. Detection-only panel for
+      // now (see analytics/smc.ts's module header) - not an Oracle driver yet.
+      if (path === '/smc_scan') {
+        try {
+          const tfv = tfStrict(q.get('tf'))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const asset = q.get('asset') ?? market.activeAsset
+          return json(200, kernel.context().use<SmcScanService>('smcScan').scan(asset, tfv))
+        } catch (err) {
+          return json(400, { ok: false, error: (err as Error).message })
+        }
+      }
+
       if (path === '/cointegration_scan') {
         try {
           const tfv = tfStrict(q.get('tf'))

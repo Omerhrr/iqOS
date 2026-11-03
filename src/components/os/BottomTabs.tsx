@@ -24,6 +24,7 @@ import AILabPanel from './AILabPanel'
 import JournalTab from './JournalTab'
 import ScreenerPanel from './ScreenerPanel'
 import ScreenerPanel2 from './ScreenerPanel2'
+import SmcPanel from './SmcPanel'
 import AlertRulesPanel from './AlertRulesPanel'
 import SentinelPanel from './SentinelPanel'
 import WatchdogPanel from './WatchdogPanel'
@@ -109,6 +110,7 @@ export default function BottomTabs(props: BottomTabsProps) {
             ['history', `History (${history.length})`],
             ['screener', 'Screener'],
             ['screener2', 'Confluence Signal'],
+            ['smc', 'SMC'],
             ['autopilot', `Autopilot${props.bots.filter((b) => b.bot.enabled).length ? ` (${props.bots.filter((b) => b.bot.enabled).length})` : ''}`],
             ['sentinel', 'Sentinel'],
             ['watchdog', 'Watchdog'],
@@ -253,6 +255,11 @@ export default function BottomTabs(props: BottomTabsProps) {
 
       <TabsContent value="screener2" className="mt-0 min-h-0 flex-1 overflow-hidden">
         <ScreenerPanel2 onSelectSetup={props.onSelectSetup} onError={onError} />
+      </TabsContent>
+
+      {/* SMART MONEY CONCEPTS / ICT STRUCTURE */}
+      <TabsContent value="smc" className="mt-0 min-h-0 flex-1 overflow-hidden">
+        <SmcPanel asset={asset} tf={props.tf} closedTick={closedTick} onError={onError} />
       </TabsContent>
 
       {/* AUTOPILOT */}
