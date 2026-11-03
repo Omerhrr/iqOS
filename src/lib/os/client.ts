@@ -254,6 +254,95 @@ export async function getSmcScan(asset: string, tf: Timeframe): Promise<SmcScanR
   return osGet<SmcScanResponse>('/smc_scan', { asset, tf })
 }
 
+// ---------- Meta-strategy (panel-combinator strategies, trading-core/src/analytics+plugins/metastrategy.ts) ----------
+// Build a strategy OUT OF the panels directly - "Oracle call AND HMA/ROC/
+// Bull-Bear call AND Accute call AND Renko call" - instead of out of raw
+// candles. Deliberately NOT a scripting language: a spec is plain data (a
+// list of conditions + one combine rule), never executable code.
+
+export type MetaConditionSource = 'oracle' | 'hmaRocBullBear' | 'momentumScore' | 'accute' | 'renko' | 'smc'
+
+export const META_CONDITION_SOURCE_LABELS: Record<MetaConditionSource, string> = {
+  oracle: 'Next-Candle Oracle',
+  hmaRocBullBear: 'HMA/ROC/Bull-Bear',
+  momentumScore: 'Market Momentum Score',
+  accute: 'Accute',
+  renko: 'Renko',
+  smc: 'Smart Money Concepts',
+}
+
+export interface MetaCondition {
+  source: MetaConditionSource
+  direction: 'call' | 'put' | 'either'
+  minConfidence?: number
+  weight?: number
+}
+
+export interface MetaStrategySpec {
+  id: string
+  name: string
+  mode: 'all' | 'any' | 'weighted'
+  threshold?: number
+  conditions: MetaCondition[]
+  createdTs?: number
+  updatedTs?: number
+}
+
+export interface MetaSourceRead {
+  source: MetaConditionSource
+  direction: 'call' | 'put' | 'none'
+  confidence: number
+  label: string
+}
+
+export interface MetaConditionResult {
+  condition: MetaCondition
+  read: MetaSourceRead
+  passed: boolean
+}
+
+export interface MetaEvalResult {
+  direction: 'call' | 'put' | 'none'
+  score: number
+  confidence: number
+  conditions: MetaConditionResult[]
+  notes: string
+}
+
+export interface MetaStrategyEvalResponse {
+  ok: true
+  spec: MetaStrategySpec
+  result: MetaEvalResult
+  price: number
+  ts: number
+}
+
+export async function getMetaStrategies(): Promise<{ ok: true; strategies: MetaStrategySpec[] }> {
+  return osGet('/meta_strategy_list')
+}
+
+export async function getMetaStrategySources(): Promise<{ ok: true; sources: MetaConditionSource[] }> {
+  return osGet('/meta_strategy_sources')
+}
+
+export async function saveMetaStrategy(input: {
+  id?: string
+  name: string
+  mode: 'all' | 'any' | 'weighted'
+  threshold?: number
+  conditions: MetaCondition[]
+}): Promise<{ ok: boolean; id: string; spec: MetaStrategySpec; error?: string }> {
+  return osPost('/meta_strategy_save', input)
+}
+
+export async function deleteMetaStrategy(id: string): Promise<{ ok: boolean; error?: string }> {
+  return osPost('/meta_strategy_delete', { id })
+}
+
+export async function evalMetaStrategy(id: string, asset: string, tf: Timeframe): Promise<MetaStrategyEvalResponse> {
+  return osGet<MetaStrategyEvalResponse>('/meta_strategy_eval', { id, asset, tf })
+}
+
 // IQ Option exposes no real bid/ask-tagged trades or order-book depth, so all
 // of this is derived from OHLCV candles via a close-location-value (CLV) proxy.
 // Never present it as real order-flow data in the UI - always label it approx.
@@ -3633,7 +3722,7 @@ export type OsMode = 'human' | 'auto'
 
 export interface AutoTraderConfig {
   enabled: boolean
-  signalSource: 'cointegration' | 'triangulation' | 'adx-pattern-bias' | 'pair-signal' | 'shock-pressure' | 'poc-triple-confirm' | 'oracle-fusion' | 'tempo' | 'accute' | 'strategy' | 'chartsignals' | 'leadlag'
+  signalSource: 'cointegration' | 'triangulation' | 'adx-pattern-bias' | 'pair-signal' | 'shock-pressure' | 'poc-triple-confirm' | 'oracle-fusion' | 'tempo' | 'accute' | 'strategy' | 'chartsignals' | 'leadlag' | 'meta-strategy'
   tf: Timeframe
   /** The trade's own expiry, as a timeframe - SEPARATE from `tf` (which
    * candles signals are read from). Unset = old behavior (expiry tracks tf
@@ -3659,6 +3748,9 @@ export interface AutoTraderConfig {
    * or "custom:<id>" for an AI Lab-learned spec) - same as a bot's strategyId.
    * @deprecated superseded by strategyIds; kept for older saved configs. */
   strategyId?: string
+  /** meta-strategy source: which saved panel-combinator spec (id
+   * "meta:<slug>") to trade - see the Meta-Strategy panel/section above. */
+  metaStrategyId?: string
   /** strategy source: one or more ids to trade. One id = that single
    * strategy (score-gated only). Two+ = an ENSEMBLE - every member votes,
    * the majority direction wins, and minConfidence is reused as the

@@ -30,6 +30,8 @@ import { leadLagScanPlugin, LeadLagScanService } from './src/plugins/leadlagscan
 import { cointegrationScanPlugin, CointegrationScanService } from './src/plugins/cointegrationscan'
 import { volArbScanPlugin, VolArbScanService } from './src/plugins/volarbscan'
 import { smcScanPlugin, SmcScanService } from './src/plugins/smcscan'
+import { metaStrategyPlugin, MetaStrategyService } from './src/plugins/metastrategy'
+import { META_CONDITION_SOURCES } from './src/analytics/metastrategy'
 import { yesterdayPlugin, YesterdayService } from './src/plugins/yesterday'
 import { nextCandlePlugin, NextCandleService } from './src/plugins/nextcandle'
 import { adxHonestyPlugin, AdxHonestyService } from './src/plugins/adxhonesty'
@@ -193,6 +195,7 @@ kernel.register(leadLagScanPlugin)
 kernel.register(cointegrationScanPlugin)
 kernel.register(volArbScanPlugin)
 kernel.register(smcScanPlugin)
+kernel.register(metaStrategyPlugin)
 kernel.register(yesterdayPlugin)
 kernel.register(nextCandlePlugin)
 kernel.register(tempoPlugin)
@@ -2244,6 +2247,37 @@ const httpServer = createServer(async (req, res) => {
         return json(200, { ok: true, ...kernel.context().use<SmcScanService>('smcScan').stats(tfFilter), ts: Date.now() })
       }
 
+      // ---------- meta-strategy (panel-combinator strategies) ----------
+      // Build a strategy OUT OF the panels directly - "Oracle call AND
+      // HMA/ROC/Bull-Bear call AND Accute call AND Renko call" - instead of
+      // out of raw candles (that's what strategies/custom.ts is for). See
+      // analytics/metastrategy.ts's module header for the full design.
+      if (path === '/meta_strategy_list') {
+        return json(200, { ok: true, strategies: kernel.context().use<MetaStrategyService>('metaStrategy').list() })
+      }
+
+      if (path === '/meta_strategy_sources') {
+        return json(200, { ok: true, sources: META_CONDITION_SOURCES })
+      }
+
+      // GET /meta_strategy_eval?id=meta:xxx&asset=EURUSD&tf=1m - live
+      // evaluation against one pair right now, same evaluate() path the
+      // auto-trader's 'meta-strategy' source calls, for testing a spec
+      // before wiring it in.
+      if (path === '/meta_strategy_eval') {
+        try {
+          const id = String(q.get('id') ?? '')
+          const tfv = tfStrict(q.get('tf'))
+          if (!id) return json(400, { ok: false, error: 'missing id' })
+          if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const asset = q.get('asset') ?? market.activeAsset
+          const meta = kernel.context().use<MetaStrategyService>('metaStrategy')
+          return json(200, { ok: true, ...meta.evaluate(id, asset, tfv), ts: Date.now() })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
       if (path === '/cointegration_scan') {
         try {
           const tfv = tfStrict(q.get('tf'))
@@ -4005,6 +4039,28 @@ const httpServer = createServer(async (req, res) => {
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }
+      }
+
+      if (path === '/meta_strategy_save') {
+        try {
+          const meta = kernel.context().use<MetaStrategyService>('metaStrategy')
+          return json(200, {
+            ...meta.save({
+              id: body.id !== undefined ? String(body.id) : undefined,
+              name: String(body.name ?? 'Meta Strategy'),
+              mode: body.mode === 'any' || body.mode === 'weighted' ? body.mode : 'all',
+              threshold: body.threshold !== undefined ? Number(body.threshold) : undefined,
+              conditions: Array.isArray(body.conditions) ? body.conditions : [],
+            }),
+          })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      if (path === '/meta_strategy_delete') {
+        const meta = kernel.context().use<MetaStrategyService>('metaStrategy')
+        return json(200, meta.remove(String(body.id ?? '')))
       }
 
       if (path === '/lab_delete') {

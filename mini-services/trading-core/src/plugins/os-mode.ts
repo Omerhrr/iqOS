@@ -68,6 +68,7 @@ import { computeTpo } from '../analytics/tpo'
 import type { NextCandleService } from './nextcandle'
 import type { TempoService } from './tempo'
 import type { AccuteService } from './accute'
+import type { MetaStrategyService } from './metastrategy'
 import type { AdxHonestyService } from './adxhonesty'
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
@@ -82,7 +83,7 @@ const finGte = (v: number, floor: number): boolean => Number.isFinite(v) && v >=
 
 export type OsMode = 'human' | 'auto'
 
-export type AutoTraderSource = 'cointegration' | 'triangulation' | 'adx-pattern-bias' | 'pair-signal' | 'shock-pressure' | 'poc-triple-confirm' | 'oracle-fusion' | 'tempo' | 'accute' | 'strategy' | 'chartsignals' | 'leadlag'
+export type AutoTraderSource = 'cointegration' | 'triangulation' | 'adx-pattern-bias' | 'pair-signal' | 'shock-pressure' | 'poc-triple-confirm' | 'oracle-fusion' | 'tempo' | 'accute' | 'strategy' | 'chartsignals' | 'leadlag' | 'meta-strategy'
 
 /** Walk-forward validation verdict for the OU edge on one (asset, tf). */
 export interface OUVerdict {
@@ -141,6 +142,12 @@ export interface AutoTraderConfig {
    * @deprecated superseded by strategyIds (kept for old saved configs - a
    * lone strategyId is treated as a one-member strategyIds list). */
   strategyId?: string
+  /** meta-strategy source: which saved panel-combinator spec
+   * (plugins/metastrategy.ts, id "meta:<slug>") to trade. One spec at a
+   * time - unlike strategyIds' ensemble/auto-learn pool, a meta-strategy
+   * is already a combination of several sources by construction, so there
+   * is no second layer of ensembling here. */
+  metaStrategyId?: string
   /** strategy source: one or more ids from the combined Strategy Lab catalog.
    * One id = trade that single strategy, exactly as strategyId always did.
    * Two or more = an ENSEMBLE: every listed strategy votes call/put/none on
@@ -392,7 +399,7 @@ const AUTOTRADER_NOTE = 'auto:os-trader'
  * its votes at the eval). Only these sources can guarantee every placed
  * trade is a FRESH edge, so only their alerts carry the "why now" crossing
  * note the pickers attach. */
-const SWEEP_SOURCES: readonly string[] = ['chartsignals', 'leadlag', 'cointegration', 'triangulation', 'adx-pattern-bias', 'pair-signal', 'shock-pressure', 'poc-triple-confirm', 'oracle-fusion', 'tempo', 'accute']
+const SWEEP_SOURCES: readonly string[] = ['chartsignals', 'leadlag', 'cointegration', 'triangulation', 'adx-pattern-bias', 'pair-signal', 'shock-pressure', 'poc-triple-confirm', 'oracle-fusion', 'tempo', 'accute', 'meta-strategy']
 /** analytics/chartsignals.ts combineVotes() now groups the 7 raw chart
  * engines into 5 independent-METHODOLOGY families before counting `agree`
  * - renko/range/P&F (all "price crossed N ATR-thresholds" read three ways)
@@ -641,7 +648,7 @@ export class ModeService {
         const num = (v: unknown, fb: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fb)
         this.config = {
           enabled: typeof c.enabled === 'boolean' ? c.enabled : DEFAULT_AUTOTRADER.enabled,
-          signalSource: (['cointegration', 'triangulation', 'adx-pattern-bias', 'pair-signal', 'shock-pressure', 'poc-triple-confirm', 'oracle-fusion', 'tempo', 'accute', 'strategy', 'chartsignals', 'leadlag'] as const).includes(c.signalSource as AutoTraderSource)
+          signalSource: (['cointegration', 'triangulation', 'adx-pattern-bias', 'pair-signal', 'shock-pressure', 'poc-triple-confirm', 'oracle-fusion', 'tempo', 'accute', 'strategy', 'chartsignals', 'leadlag', 'meta-strategy'] as const).includes(c.signalSource as AutoTraderSource)
             ? (c.signalSource as AutoTraderSource)
             : DEFAULT_AUTOTRADER.signalSource,
           tf: (typeof c.tf === 'string' && (ALL_TIMEFRAMES as string[]).includes(c.tf) ? c.tf : DEFAULT_AUTOTRADER.tf) as Timeframe,
@@ -653,6 +660,7 @@ export class ModeService {
           cointegrationMaxHalfLife: num(c.cointegrationMaxHalfLife, DEFAULT_AUTOTRADER.cointegrationMaxHalfLife),
           triangulationZEntry: num(c.triangulationZEntry, DEFAULT_AUTOTRADER.triangulationZEntry),
           strategyId: typeof c.strategyId === 'string' && c.strategyId.trim() ? c.strategyId.trim() : undefined,
+          metaStrategyId: typeof c.metaStrategyId === 'string' && c.metaStrategyId.trim() ? c.metaStrategyId.trim() : undefined,
           strategyIds: Array.isArray(c.strategyIds)
             ? c.strategyIds.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).map((x) => x.trim())
             : undefined,
@@ -1078,6 +1086,8 @@ export class ModeService {
                   ? (row.note ?? `EUR/USD lead-lag ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} (${row.direction.toUpperCase()})`)
                   : this.config.signalSource === 'strategy'
                   ? (row.note ?? `${this.effectiveStrategyIds().join('+') || 'strategy'} (${row.direction.toUpperCase()})`)
+                  : this.config.signalSource === 'meta-strategy'
+                  ? (row.note ?? `meta-strategy (${row.direction.toUpperCase()})`)
                   : `score ${Math.abs(row.score).toFixed(0)} conf ${row.confidence.toFixed(0)} regime ${row.regime}`
       // Surface paper-vs-live right in the success line itself - this is the
       // one place an operator actually reads "trade placed" and, before this,
@@ -1135,6 +1145,7 @@ export class ModeService {
     if (this.config.signalSource === 'tempo') return this.pickTempoSignal()
     if (this.config.signalSource === 'accute') return this.pickAccuteSignal()
     if (this.config.signalSource === 'strategy') return this.pickStrategySignal()
+    if (this.config.signalSource === 'meta-strategy') return this.pickMetaStrategySignal()
     return null
   }
 
@@ -2105,6 +2116,103 @@ export class ModeService {
   }
 
   /**
+   * Meta-strategy source: trades a saved panel-combinator spec
+   * (plugins/metastrategy.ts - config.metaStrategyId) market-wide, same
+   * sweep/fresh-edge shape pickOracleFusionSignal() uses. The spec itself
+   * decides what counts as a signal (which panels, which combine rule);
+   * this picker's only job is to run that spec against every open
+   * candidate, apply the SAME minScore/minConfidence/direction gates every
+   * other source respects, and hand the single best fresh qualifier to the
+   * sweep-edge gate so a spec that keeps reading the same way bar after
+   * bar doesn't re-fire on stale evidence.
+   */
+  private pickMetaStrategySignal(): ScreenRow | null {
+    return this.edgeSweep('meta-strategy', (rec) => {
+      const fresh: Array<{ row: ScreenRow; metric: number }> = []
+      const id = this.config.metaStrategyId
+      if (!id) return null // source selected but no spec picked yet - idle, not an error
+      try {
+        const market = this.ctx.use<MarketDataService>('market')
+        let meta: MetaStrategyService
+        try {
+          meta = this.ctx.use<MetaStrategyService>('metaStrategy')
+        } catch {
+          return null // meta-strategy plugin not loaded - source configured but idle
+        }
+        if (!meta.isValidStrategyId(id)) return null // saved spec was removed since this config was set
+        const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
+        const pool = this.candidatePool(open)
+        const candidates = [...LIQUID_CANDIDATES.filter((a) => pool.includes(a)), ...pool.filter((a) => !LIQUID_CANDIDATES.includes(a))]
+        for (const asset of candidates) {
+          if (this.assetBlocked(asset)) continue
+          try {
+            const { result, price } = meta.evaluate(id, asset, this.config.tf)
+            rec(asset)
+            if (result.direction === 'none' || !(price > 0)) continue
+            const dir: 'call' | 'put' = result.direction
+            if (this.config.direction !== 'both' && dir !== this.config.direction) continue
+            if (!finGte(Math.abs(result.score), this.config.minScore)) continue
+            if (!finGte(result.confidence, this.config.minConfidence)) continue
+            const key = SweepEdgeMemory.key(asset, dir)
+            rec(asset, key)
+            if (this.sweepEdge.gate(key) === 'trade') {
+              const inst = market.assets.find((a) => a.ticker === asset)
+              fresh.push({
+                metric: result.confidence,
+                row: {
+                  asset,
+                  name: inst?.name ?? asset,
+                  category: (inst?.category ?? 'forex') as AssetCategory,
+                  otc: inst?.otc ?? asset.endsWith('-OTC'),
+                  tf: this.config.tf,
+                  price,
+                  score: result.score,
+                  direction: dir,
+                  confidence: result.confidence,
+                  pUp: dir === 'call' ? 0.5 + result.confidence / 200 : 0.5 - result.confidence / 200,
+                  pDown: dir === 'call' ? 0.5 - result.confidence / 200 : 0.5 + result.confidence / 200,
+                  regime: 'range',
+                  ouZ: 0,
+                  ouHalfLife: 0,
+                  ouMeanReverting: false,
+                  ouTStat: 0,
+                  rsi: 0,
+                  adx: 0,
+                  atrPct: 0,
+                  hurst: 0,
+                  changePct: 0,
+                  payout: this.payoutFor(asset, this.config.kind ?? 'binary'),
+                  topPattern: null,
+                  ts: this.now(),
+                  computedTs: this.now(),
+                  note: `meta "${this.metaStrategyLabel(id)}": ${result.notes}`,
+                },
+              })
+            }
+          } catch {
+            // thin history / a condition's underlying plugin not loaded for this pair - try the next
+          }
+        }
+      } catch {
+        // market not loaded - no signal source
+      }
+      if (!fresh.length) return null
+      fresh.sort((a, b) => b.metric - a.metric)
+      return fresh[0].row
+    })
+  }
+
+  /** Best-effort spec name for the meta-strategy source's own note/label -
+   * falls back to the raw id if the spec was removed mid-tick. */
+  private metaStrategyLabel(id: string): string {
+    try {
+      return this.ctx.use<MetaStrategyService>('metaStrategy').get(id)?.name ?? id
+    } catch {
+      return id
+    }
+  }
+
+  /**
    * Chart-signals source: the chart-type scanner's own vote engine
    * (plugins/chartsignals.ts - renko/P&F/range/tick/footprint|otcfootprint/
    * heikin/candle votes combined by analytics/chartsignals.ts combineVotes
@@ -3061,6 +3169,8 @@ export class ModeService {
                         const ids = this.effectiveStrategyIds()
                         return ids.length > 1 ? `ensemble:${ids.join('+')}` : ids[0] ?? 'custom-strategy'
                       })())
+                    : this.config.signalSource === 'meta-strategy'
+                      ? (this.config.metaStrategyId ?? 'meta-strategy')
                     : 'auto-trader',
         note: AUTOTRADER_NOTE,
       })
@@ -3576,7 +3686,7 @@ export class ModeService {
       // moment too - whatever qualifies NOW predates this arm
       if (this.config.enabled && !was && this.mode === 'auto') this.armAutoEdgeBackfill()
     }
-    if (patch.signalSource !== undefined && (['cointegration', 'triangulation', 'adx-pattern-bias', 'pair-signal', 'shock-pressure', 'poc-triple-confirm', 'oracle-fusion', 'tempo', 'accute', 'strategy', 'chartsignals', 'leadlag'] as const).includes(patch.signalSource as AutoTraderSource))
+    if (patch.signalSource !== undefined && (['cointegration', 'triangulation', 'adx-pattern-bias', 'pair-signal', 'shock-pressure', 'poc-triple-confirm', 'oracle-fusion', 'tempo', 'accute', 'strategy', 'chartsignals', 'leadlag', 'meta-strategy'] as const).includes(patch.signalSource as AutoTraderSource))
       this.config.signalSource = patch.signalSource as AutoTraderSource
     // AUDIT FIX (Task 58, P2): tf used to be cast unchecked - a garbage tf
     // made every picker return nothing (silent "no signal" forever) and
@@ -3605,6 +3715,8 @@ export class ModeService {
     if (patch.triangulationZEntry !== undefined) this.config.triangulationZEntry = clamp(numCur(patch.triangulationZEntry, this.config.triangulationZEntry), 0.5, 4)
     if (patch.strategyId !== undefined)
       this.config.strategyId = typeof patch.strategyId === 'string' && patch.strategyId.trim() ? patch.strategyId.trim() : undefined
+    if (patch.metaStrategyId !== undefined)
+      this.config.metaStrategyId = typeof patch.metaStrategyId === 'string' && patch.metaStrategyId.trim() ? patch.metaStrategyId.trim() : undefined
     if (patch.strategyIds !== undefined)
       this.config.strategyIds = Array.isArray(patch.strategyIds)
         ? patch.strategyIds.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).map((x) => x.trim())
@@ -3701,6 +3813,8 @@ export class ModeService {
                             : `ensemble of ${ids.length}: ${ids.join(', ')} · ≥${this.config.minConfidence}% agreement`
                     return ` (${body}${pinNote}${dirNote})`
                   })()
+                : this.config.signalSource === 'meta-strategy'
+                ? ` (panel-combinator: ${this.config.metaStrategyId ? this.metaStrategyLabel(this.config.metaStrategyId) : 'no spec picked yet'})`
                 : ''
     // minScore/minConfidence are meaningless noise on a config line unless
     // this source actually gates on them - 'strategy' never applies minScore

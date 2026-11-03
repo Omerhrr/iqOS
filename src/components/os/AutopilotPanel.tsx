@@ -19,8 +19,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import type { AssetRow, AutoTraderConfig, BotConfig, BotRow, OsModeStatus, OtcConfig, OtcPolicy, StrategyInfo, Timeframe, TradeKind, ValidationRow } from '@/lib/os/client'
-import { BLITZ_EXPIRY_SECONDS, KIND_LABEL, TIMEFRAMES, fmtMoney, fmtTime, getOtcConfig, osGet, osPost, setOtcConfig } from '@/lib/os/client'
+import type { AssetRow, AutoTraderConfig, BotConfig, BotRow, MetaStrategySpec, OsModeStatus, OtcConfig, OtcPolicy, StrategyInfo, Timeframe, TradeKind, ValidationRow } from '@/lib/os/client'
+import { BLITZ_EXPIRY_SECONDS, KIND_LABEL, TIMEFRAMES, fmtMoney, fmtTime, getMetaStrategies, getOtcConfig, osGet, osPost, setOtcConfig } from '@/lib/os/client'
 
 const GATE_MAX_AGE_SEC = 14 * 24 * 60 * 60
 
@@ -1610,6 +1610,8 @@ function AutoTraderStrip({
                                 ? `AUTO-LEARN·${ids.length}`
                                 : `ENSEMBLE·${ids.length}≥${at.config.minConfidence}%`
                         })()
+                      : at.config.signalSource === 'meta-strategy'
+                      ? `META·${at.config.metaStrategyId ?? 'none picked'}`
                       : `score ≥${at.config.minScore}`}
           {' · '}{at.config.tf} ·{' '}
           {at.config.stakePlan ? `compound seed $${at.config.stakePlan.base}` : `$${at.config.stake}`} · max {at.config.maxOpen}
@@ -1793,6 +1795,25 @@ function AutoTraderDialog({
       alive = false
     }
   }, [])
+  // Meta-strategy library (the "META" source's own saved panel-combinator
+  // specs, built/edited in the Meta-Strategy tab) - fetched here the same
+  // "load on mount, informational if it fails" way the OTC config above is,
+  // since this dialog only needs to let the operator PICK an already-saved
+  // spec, not build one.
+  const [metaStrategies, setMetaStrategies] = useState<MetaStrategySpec[]>([])
+  useEffect(() => {
+    let alive = true
+    getMetaStrategies()
+      .then((res) => {
+        if (alive) setMetaStrategies(res.strategies)
+      })
+      .catch(() => {
+        // picker just shows an empty list - the Meta-Strategy tab is the source of truth
+      })
+    return () => {
+      alive = false
+    }
+  }, [])
   const setOtcPolicy = async (policy: OtcPolicy) => {
     if (!otc || otcBusy || otc.policy === policy) return
     setOtcBusy(true)
@@ -1932,6 +1953,7 @@ function AutoTraderDialog({
                   ['tempo', 'Tempo 1-Shot'],
                   ['accute', 'Accute'],
                   ['strategy', 'Strategy'],
+                  ['meta-strategy', 'Meta-Strategy'],
                 ] as const
               ).map(([v, label]) => (
                 <button
@@ -1971,6 +1993,8 @@ function AutoTraderDialog({
                         ? 'triple-confluence confirmation: fires ONLY when ADX/DI+Pattern Bias qualifies, Tempo is ACTIVELY FIRING this bar (not merely leaning a direction - its one-shot-per-window stopping rule has to actually clear), and the Next-Candle Oracle fusion clears its confidence floor, all three agreeing on direction. Placing a trade atomically claims the same shared Tempo window license the Tempo source itself claims, so the two can never double-spend one pair\'s window. Deliberately the rarest source here - expect very few trades, each backed by three independent engines'
                           : d.signalSource === 'strategy'
                         ? 'one specific strategy picked below, or several combined - as a vote (ENSEMBLE) or an AUTO-LEARN pool that trades whichever member is proven best per pair - the same strategyId an autopilot bot would use (a builtin strategy, or an AI Lab-learned "(Lab)" spec), not pinned to one bot\'s watchlist'
+                        : d.signalSource === 'meta-strategy'
+                        ? 'trades a saved panel-combinator spec (built in the Meta-Strategy tab) directly off the panels\' own current verdicts - e.g. "Oracle call AND HMA/ROC/Bull-Bear call AND Accute call AND Renko call" - instead of recomputing anything from raw candles. Pick which saved spec to trade below'
                         : ''}
             </p>
           </div>
@@ -2168,6 +2192,32 @@ function AutoTraderDialog({
               </div>
             )
           })()}
+
+          {d.signalSource === 'meta-strategy' && (
+            <div className="col-span-2">
+              <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Meta-strategy spec</Label>
+              <select
+                value={d.metaStrategyId ?? ''}
+                onChange={(e) => p({ metaStrategyId: e.target.value || undefined })}
+                className="mt-1 h-7 w-full rounded border border-[#1c2739] bg-[#0b111c] px-1.5 text-[11px] text-[#e2e8f0] outline-none"
+              >
+                <option value="">— pick a saved spec —</option>
+                {metaStrategies.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name} ({s.mode}, {s.conditions.length} condition{s.conditions.length === 1 ? '' : 's'})
+                  </option>
+                ))}
+              </select>
+              {metaStrategies.length === 0 ? (
+                <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+                  No meta-strategies saved yet - build one in the Meta-Strategy tab (panel-combinator conditions over
+                  Oracle/HMA-ROC-Bull-Bear/Momentum Score/Accute/Renko/SMC), then come back here to pick it.
+                </p>
+              ) : !d.metaStrategyId ? (
+                <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">no spec picked yet - the auto-trader stands aside until you pick one.</p>
+              ) : null}
+            </div>
+          )}
 
           {/* ---------- PAIRS ---------- */}
           <div className="col-span-2 mt-1 flex items-center gap-2">

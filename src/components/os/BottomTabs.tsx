@@ -25,6 +25,7 @@ import JournalTab from './JournalTab'
 import ScreenerPanel from './ScreenerPanel'
 import ScreenerPanel2 from './ScreenerPanel2'
 import SmcPanel from './SmcPanel'
+import MetaStrategyPanel from './MetaStrategyPanel'
 import AlertRulesPanel from './AlertRulesPanel'
 import SentinelPanel from './SentinelPanel'
 import WatchdogPanel from './WatchdogPanel'
@@ -111,6 +112,7 @@ export default function BottomTabs(props: BottomTabsProps) {
             ['screener', 'Screener'],
             ['screener2', 'Confluence Signal'],
             ['smc', 'SMC'],
+            ['meta-strategy', 'Meta-Strategy'],
             ['autopilot', `Autopilot${props.bots.filter((b) => b.bot.enabled).length ? ` (${props.bots.filter((b) => b.bot.enabled).length})` : ''}`],
             ['sentinel', 'Sentinel'],
             ['watchdog', 'Watchdog'],
@@ -260,6 +262,11 @@ export default function BottomTabs(props: BottomTabsProps) {
       {/* SMART MONEY CONCEPTS / ICT STRUCTURE */}
       <TabsContent value="smc" className="mt-0 min-h-0 flex-1 overflow-hidden">
         <SmcPanel asset={asset} tf={props.tf} closedTick={closedTick} onError={onError} />
+      </TabsContent>
+
+      {/* META-STRATEGY BUILDER (panel-combinator strategies) */}
+      <TabsContent value="meta-strategy" className="mt-0 min-h-0 flex-1 overflow-hidden">
+        <MetaStrategyPanel asset={asset} tf={props.tf} onError={onError} />
       </TabsContent>
 
       {/* AUTOPILOT */}
