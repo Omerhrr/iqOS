@@ -87,6 +87,27 @@ const MAX_PLACE_ATTEMPTS_PER_TICK = 5
 const HARD_STOP_RE =
   /kill switch engaged|market closed for|amount must be positive|exceeds max stake|insufficient balance|live balance unknown|live broker not connected|unknown asset |no price feed|execution service unavailable/i
 
+/** AUDIT FIX - same bug os-mode.ts's own BROKER_UNAVAILABLE_RE/
+ * assetRejectedUntil was built to fix for the auto-trader, ported here
+ * because Meta Trader never had an equivalent: a broker rejection like
+ * "order rejected: Cannot purchase an option (the asset is not available
+ * at the moment)" does NOT match HARD_STOP_RE, so the tick loop above just
+ * tries the next-ranked candidate THIS tick and moves on - but nothing
+ * persisted that rejection anywhere. If the rejected asset is still the
+ * top-ranked candidate (e.g. tied at 100% confidence, as a "now" SMC read
+ * commonly is), the VERY NEXT tick (10s later) picks the exact same
+ * already-known-untradable asset again, gets the exact same rejection
+ * again, forever - which is exactly what "standing down: order rejected:
+ * Cannot purchase an option..." repeating on the same pair every tick is.
+ * This is almost always our own open/closed cache lagging IQ's real
+ * schedule (OTC closures, mid-session suspensions, a stale active_id), not
+ * a misconfiguration - so the fix is the same as os-mode.ts's: take the
+ * asset off the table for a while (not forever) rather than retrying it
+ * every single tick. */
+const BROKER_UNAVAILABLE_RE =
+  /not available at the moment|is not a (?:turbo\/binary\/digital|digital\/turbo\/binary) instrument|active\b[^.]*not found|is suspended|active is suspended|suspended\b/i
+const BROKER_UNAVAILABLE_COOLDOWN_SEC = 600
+
 const SMC_KIND_SOURCE: Record<SmcKind, string> = {
   FVG: 'smc-fvg',
   IFVG: 'smc-ifvg',
@@ -300,6 +321,12 @@ export class MetaTraderService {
    * there is nothing else stopping the same top-ranked pair being re-hit
    * the instant its last position closes. */
   private lastTradedAt = new Map<string, number>()
+  /** Broker-rejected-this-asset-specifically backoff (BROKER_UNAVAILABLE_RE
+   * et al.) - epoch seconds until the asset is worth trying again. Separate
+   * from assetCooldownUntil (that one is the user-tunable post-TRADE
+   * cooldown, no floor by design) - this one exists regardless of
+   * cooldownSec, because a rejected order was never a trade to begin with. */
+  private rejectedUntil = new Map<string, number>()
 
   async start(ctx: KernelContext): Promise<void> {
     this.ctx = ctx
@@ -509,6 +536,7 @@ export class MetaTraderService {
       .slice(0, MAX_TICK_CANDIDATES)
       .filter((a) => !this.hasOpenOn(a))
       .filter((a) => (this.assetCooldownUntil.get(a) ?? 0) <= this.now())
+      .filter((a) => (this.rejectedUntil.get(a) ?? 0) <= this.now())
   }
 
   private assetInfo(ticker: string) {
@@ -551,6 +579,7 @@ export class MetaTraderService {
       return
     }
 
+    let refreshedAssetsThisTick = false
     for (let i = 0; i < Math.min(MAX_PLACE_ATTEMPTS_PER_TICK, candidates.length); i++) {
       const row = candidates[i]
       const out = await this.place(row)
@@ -565,7 +594,20 @@ export class MetaTraderService {
       const reason = out.error ?? 'order rejected'
       this.rt.lastRejection = reason
       if (HARD_STOP_RE.test(reason)) return // account/risk-level - no point trying the next candidate
-      // otherwise a per-asset/broker hiccup - try the next-ranked candidate this same tick
+      // Per-asset broker rejection (closed/suspended/stale active_id, etc.) -
+      // take THIS asset off the table for a while so the next tick doesn't
+      // just re-pick it and repeat the identical rejection forever (see
+      // BROKER_UNAVAILABLE_RE's doc comment above). Still try the next-
+      // ranked candidate right now, within this same tick.
+      this.rejectedUntil.set(row.asset, this.now() + BROKER_UNAVAILABLE_COOLDOWN_SEC)
+      if (BROKER_UNAVAILABLE_RE.test(reason) && !refreshedAssetsThisTick) {
+        refreshedAssetsThisTick = true
+        try {
+          this.ctx.use<{ forceRefreshSidecarAssets: () => void }>('market').forceRefreshSidecarAssets()
+        } catch {
+          // market plugin not loaded - cache catches up on its own next cycle
+        }
+      }
     }
   }
 
@@ -599,6 +641,27 @@ export class MetaTraderService {
   private rankRows(rows: MetaTraderRow[]): MetaTraderRow[] {
     return rows.sort((a, b) => {
       if (b.confidence !== a.confidence) return b.confidence - a.confidence
+      const at = this.lastTradedAt.get(a.asset) ?? 0
+      const bt = this.lastTradedAt.get(b.asset) ?? 0
+      return at - bt
+    })
+  }
+
+  /** Recency-only ranking - used for every SMC source instead of rankRows().
+   * Per direct instruction: SMC "now"'s confidence is just how many
+   * concepts firing on THIS candle happen to agree with each other - it has
+   * never been honesty-tracked/resolved against real outcomes the way
+   * Oracle's and Accute's confidence have been (smcscan.ts's outcome
+   * tracker records the panel's blended-all-ages summary, not this now-
+   * only number), so ranking qualifying SMC candidates BY it was ranking by
+   * a number with no demonstrated predictive value. Any asset with a
+   * direction here already passed the "did at least one concept fire now"
+   * bar (see pickSmc's dropped minConfidence check) - ranking is purely
+   * about which of several equally-eligible assets to act on first, so
+   * least-recently-traded (or never-traded) wins, same tie-break rankRows()
+   * uses, just without confidence deciding anything first. */
+  private rankByRecency(rows: MetaTraderRow[]): MetaTraderRow[] {
+    return rows.sort((a, b) => {
       const at = this.lastTradedAt.get(a.asset) ?? 0
       const bt = this.lastTradedAt.get(b.asset) ?? 0
       return at - bt
@@ -705,6 +768,15 @@ export class MetaTraderService {
     } catch {
       return []
     }
+    // minConfidence is deliberately NOT applied to SMC sources - per direct
+    // instruction, its "now" confidence is only a same-candle agreement
+    // count with no honesty-loop/resolved-outcome backing (see
+    // rankByRecency's doc comment), so gating on it would be filtering on a
+    // number that's never been shown to mean anything. Any concept firing
+    // now, alone or alongside others, qualifies - exactly the "any signal
+    // that can fire should fire here" behavior smcNowRead() itself already
+    // implements for direction; this just stops minConfidence from vetoing
+    // it a second time on the way out.
     const out: MetaTraderRow[] = []
     for (const asset of this.candidatePool()) {
       try {
@@ -713,14 +785,13 @@ export class MetaTraderService {
         const read = smcNowRead(res.result, onlyKind)
         if (read.direction === 'none') continue
         if (this.config.direction !== 'both' && read.direction !== this.config.direction) continue
-        if (!finGte(read.confidence, this.config.minConfidence)) continue
         const row = this.rowFrom(asset, read.direction, read.confidence, res.result.price, `smc: ${read.note}`)
         if (row) out.push(row)
       } catch {
         /* thin history - try the next */
       }
     }
-    return this.rankRows(out)
+    return this.rankByRecency(out)
   }
 
   // ---------- placement ----------

@@ -2697,7 +2697,9 @@ function MetaTraderStrip({
         <span className="font-mono text-[9px] text-[#4b5a72]">
           {META_TRADER_SOURCE_LABELS[mt.config.signalSource]}
           {mt.config.signalSource === 'meta-strategy' && ` · ${mt.config.metaStrategyId ?? 'none picked'}`}
-          {' · '}conf≥{mt.config.minConfidence}% · {mt.config.tf} · ${mt.config.stake} · max {mt.config.maxOpen}
+          {' · '}
+          {mt.config.signalSource === 'smc' || mt.config.signalSource.startsWith('smc-') ? 'any now-signal' : `conf≥${mt.config.minConfidence}%`}
+          {' · '}{mt.config.tf} · ${mt.config.stake} · max {mt.config.maxOpen}
           {mt.config.marketScope === 'real' && <span className="text-emerald-400/80"> · REAL only</span>}
           {mt.config.marketScope === 'otc' && <span className="text-violet-400/80"> · OTC only</span>}
         </span>
@@ -2824,9 +2826,16 @@ function MetaTraderDialog({
                   : d.signalSource === 'accute'
                     ? 'Accute\'s weighted multi-driver fused read, swept across the whole open universe'
                     : d.signalSource === 'smc'
-                      ? 'the SMC scanner\'s AGGREGATE "now" read: every concept that fired on the CURRENT candle only (not the panel\'s all-ages blended summary), majority direction across all 15 kinds'
-                      : `one single SMC concept (${META_TRADER_SOURCE_LABELS[d.signalSource]}), restricted to the CURRENT candle only - confidence is how many other "now" signals (any kind) agree with its direction`}
+                      ? 'the SMC scanner\'s AGGREGATE "now" read: every concept that fired on the CURRENT candle only (not the panel\'s all-ages blended summary) - fires on ANY now-signal, no majority vote required'
+                      : `one single SMC concept (${META_TRADER_SOURCE_LABELS[d.signalSource]}), restricted to the CURRENT candle only - fires the instant it hits, alone or alongside others`}
             </p>
+            {(d.signalSource === 'smc' || d.signalSource.startsWith('smc-')) && (
+              <p className="mt-1 text-[8px] leading-relaxed text-amber-500/70">
+                Min confidence below does NOT apply to SMC sources - its "now" confidence is only a same-candle agreement count,
+                never honesty-tracked against real outcomes the way Oracle/Accute are, so it isn't used as a quality gate here.
+                Ranking among several qualifying pairs this tick goes by least-recently-traded instead.
+              </p>
+            )}
           </div>
 
           {d.signalSource === 'meta-strategy' && (
@@ -2854,7 +2863,14 @@ function MetaTraderDialog({
             </div>
           )}
 
-          <NumField label="Min confidence %" value={d.minConfidence} onChange={(v) => p({ minConfidence: Math.min(100, Math.max(0, v)) })} />
+          {d.signalSource === 'smc' || d.signalSource.startsWith('smc-') ? (
+            <div>
+              <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Min confidence % (unused for SMC)</Label>
+              <div className="mt-1 flex h-8 items-center rounded border border-dashed border-[#1c2739] px-2 font-mono text-[11px] text-[#3d4c66]">not applied</div>
+            </div>
+          ) : (
+            <NumField label="Min confidence %" value={d.minConfidence} onChange={(v) => p({ minConfidence: Math.min(100, Math.max(0, v)) })} />
+          )}
           <NumField label="Max open" value={d.maxOpen} onChange={(v) => p({ maxOpen: Math.max(1, Math.round(v)) })} />
           {d.stakePlan?.kind === 'compound' ? (
             <NumField label="Seed stake $ (ignored)" value={d.stakePlan.base} onChange={() => {}} />
