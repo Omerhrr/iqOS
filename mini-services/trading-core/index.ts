@@ -2230,6 +2230,21 @@ const httpServer = createServer(async (req, res) => {
         }
       }
 
+      // Global SMC board: the whole-universe twin of /smc_scan - same
+      // scan, ranked by summary confidence (directional-first), same board
+      // shape /next_global and /accute_global already use.
+      if (path === '/smc_global') {
+        try {
+          const svc = kernel.context().use<SmcScanService>('smcScan')
+          const gTf = tfStrict(q.get('tf'))
+          if (gTf === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const out = svc.globalScan(gTf, { limit: Number(q.get('limit') ?? 40) })
+          return json(200, { ok: true, ...out })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
       // SMC outcome stats (the honesty loop for the Smart Money Concepts
       // scanner): every scan whose summary cleared the confidence floor
       // became a pending claim, resolved against the asset's own price at

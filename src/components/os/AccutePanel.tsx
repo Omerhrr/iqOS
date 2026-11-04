@@ -21,6 +21,8 @@ interface AccutePanelProps {
   onClose: () => void
   /** cross-nav: jump straight to the Next-Candle Oracle for this same asset */
   onOpenOracle?: (asset: string) => void
+  /** cross-nav: jump straight to the SMC Recent panel for this same asset */
+  onOpenSmc?: (asset: string) => void
 }
 
 const FALLBACK_POLL_MS = 10_000
@@ -66,7 +68,7 @@ function driverCard(d: AccuteDriver) {
   )
 }
 
-export default function AccutePanel({ asset, tf, closedTick, onClose, onOpenOracle }: AccutePanelProps) {
+export default function AccutePanel({ asset, tf, closedTick, onClose, onOpenOracle, onOpenSmc }: AccutePanelProps) {
   const [signal, setSignal] = useState<AccuteSignal | null>(null)
   const [stats, setStats] = useState<AccuteStatsResponse | null>(null)
   const [err, setErr] = useState<string | null>(null)
@@ -115,16 +117,26 @@ export default function AccutePanel({ asset, tf, closedTick, onClose, onOpenOrac
           <button
             type="button"
             onClick={() => onOpenOracle(asset)}
-            className="ml-auto rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-amber-500/40 hover:text-amber-300"
+            className={`rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-amber-500/40 hover:text-amber-300 ${onOpenSmc ? '' : 'ml-auto'}`}
             title="open Next-Candle Oracle for this asset"
           >
             → oracle
           </button>
         )}
+        {onOpenSmc && (
+          <button
+            type="button"
+            onClick={() => onOpenSmc(asset)}
+            className={`rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-cyan-500/40 hover:text-cyan-300 ${onOpenOracle ? '' : 'ml-auto'}`}
+            title="open SMC Recent for this asset"
+          >
+            → smc
+          </button>
+        )}
         <button
           type="button"
           onClick={onClose}
-          className={`rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-rose-500/40 hover:text-rose-300 ${onOpenOracle ? '' : 'ml-auto'}`}
+          className={`rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-rose-500/40 hover:text-rose-300 ${onOpenOracle || onOpenSmc ? '' : 'ml-auto'}`}
         >
           ✕
         </button>

@@ -23,6 +23,7 @@ import AdxPatternBiasPanel from '@/components/os/AdxPatternBiasPanel'
 import ShockPressurePanel from '@/components/os/ShockPressurePanel'
 import NextCandlePanel from '@/components/os/NextCandlePanel'
 import SmcRecentPanel from '@/components/os/SmcRecentPanel'
+import SmcGlobalPanel from '@/components/os/SmcGlobalPanel'
 import NextGlobalPanel from '@/components/os/NextGlobalPanel'
 import TempoGlobalPanel from '@/components/os/TempoGlobalPanel'
 import TempoPanel from '@/components/os/TempoPanel'
@@ -85,7 +86,7 @@ const INDICATOR_STORAGE_KEY = 'iqos.activeIndicators.v1'
 // @ Now", "Cointegration") out of the open strip entirely instead of just
 // closing it each time - it stays hidden across reloads until re-checked in
 // the Panels settings menu. Nothing is deleted, this only gates rendering.
-type PanelId = 'signals' | 'yday' | 'leadlag' | 'distill' | 'cointegration' | 'volarb' | 'triangulation' | 'adxPatternBias' | 'shockPressure' | 'renkoFootprint' | 'renkoFootprintOtc' | 'volumeFootprint' | 'tickVolume' | 'pairCompare' | 'pairSignal' | 'oracle' | 'nextGlobal' | 'tempo' | 'tempoGlobal' | 'accute' | 'accuteGlobal' | 'smcRecent'
+type PanelId = 'signals' | 'yday' | 'leadlag' | 'distill' | 'cointegration' | 'volarb' | 'triangulation' | 'adxPatternBias' | 'shockPressure' | 'renkoFootprint' | 'renkoFootprintOtc' | 'volumeFootprint' | 'tickVolume' | 'pairCompare' | 'pairSignal' | 'oracle' | 'nextGlobal' | 'tempo' | 'tempoGlobal' | 'accute' | 'accuteGlobal' | 'smcRecent' | 'smcGlobal'
 const PANEL_META: { id: PanelId; label: string }[] = [
   { id: 'signals', label: 'Chart Signals' },
   { id: 'yday', label: 'Yesterday @ Now' },
@@ -109,6 +110,7 @@ const PANEL_META: { id: PanelId; label: string }[] = [
   { id: 'accute', label: 'Accute' },
   { id: 'accuteGlobal', label: 'Accute Global' },
   { id: 'smcRecent', label: 'SMC Recent' },
+  { id: 'smcGlobal', label: 'SMC Global' },
 ]
 const DEFAULT_PANEL_VISIBILITY: Record<PanelId, boolean> = {
   signals: true,
@@ -133,6 +135,7 @@ const DEFAULT_PANEL_VISIBILITY: Record<PanelId, boolean> = {
   accute: true,
   accuteGlobal: true,
   smcRecent: true,
+  smcGlobal: true,
 }
 const PANEL_VISIBILITY_STORAGE_KEY = 'iqos.panelVisibility.v1'
 
@@ -239,6 +242,7 @@ export default function OSPage() {
   const [shockPressureOpen, setShockPressureOpen] = useState(false)
   const [oracleOpen, setOracleOpen] = useState(false)
   const [smcRecentOpen, setSmcRecentOpen] = useState(false)
+  const [smcGlobalOpen, setSmcGlobalOpen] = useState(false)
   const [nextGlobalOpen, setNextGlobalOpen] = useState(false)
   const [tempoOpen, setTempoOpen] = useState(false)
   const [tempoGlobalOpen, setTempoGlobalOpen] = useState(false)
@@ -326,6 +330,7 @@ export default function OSPage() {
         else if (id === 'shockPressure') setShockPressureOpen(false)
         else if (id === 'oracle') setOracleOpen(false)
         else if (id === 'smcRecent') setSmcRecentOpen(false)
+        else if (id === 'smcGlobal') setSmcGlobalOpen(false)
         else if (id === 'nextGlobal') setNextGlobalOpen(false)
         else if (id === 'tempo') setTempoOpen(false)
         else if (id === 'tempoGlobal') setTempoGlobalOpen(false)
@@ -712,6 +717,8 @@ export default function OSPage() {
     setNextGlobalOpen(false)
     setAccuteOpen(false)
     setTempoOpen(false)
+    setSmcRecentOpen(false)
+    setSmcGlobalOpen(false)
     setOracleOpen(true)
   }, [handleSelectAsset])
 
@@ -730,7 +737,21 @@ export default function OSPage() {
     handleSelectAsset(a)
     setAccuteGlobalOpen(false)
     setOracleOpen(false)
+    setSmcRecentOpen(false)
+    setSmcGlobalOpen(false)
     setAccuteOpen(true)
+  }, [handleSelectAsset])
+
+  // From the SMC Global board, or from the Oracle/Accute panels' cross-nav
+  // buttons: open a row's/the chart's pair directly in the per-asset SMC
+  // Recent panel - same relationship handleOpenOracle/handleOpenAccute have
+  // to their own Global boards.
+  const handleOpenSmc = useCallback((a: string) => {
+    handleSelectAsset(a)
+    setSmcGlobalOpen(false)
+    setOracleOpen(false)
+    setAccuteOpen(false)
+    setSmcRecentOpen(true)
   }, [handleSelectAsset])
 
   // Yesterday panel echo chip: deep-load this asset's candles (so the window
@@ -1178,7 +1199,7 @@ export default function OSPage() {
                 closed = the slim open strip sits above the market watch and
                 everything is laid out exactly as before. */}
             <Panel defaultSize={17} minSize={11}>
-              {signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen || shockPressureOpen || renkoFootprintOpen || renkoFootprintOtcOpen || volumeFootprintOpen || tickVolumeOpen || pairCompareOpen || pairSignalOpen || oracleOpen || smcRecentOpen || nextGlobalOpen || tempoOpen || tempoGlobalOpen || accuteOpen || accuteGlobalOpen ? (
+              {signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen || shockPressureOpen || renkoFootprintOpen || renkoFootprintOtcOpen || volumeFootprintOpen || tickVolumeOpen || pairCompareOpen || pairSignalOpen || oracleOpen || smcRecentOpen || smcGlobalOpen || nextGlobalOpen || tempoOpen || tempoGlobalOpen || accuteOpen || accuteGlobalOpen ? (
                 <div className="mr-0.5 h-full min-h-0">
                   {ydayOpen ? (
                     <YesterdayPanel onClose={() => setYdayOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onFocusWindow={handleFocusYesterday} />
@@ -1209,9 +1230,11 @@ export default function OSPage() {
                   ) : pairSignalOpen ? (
                     <PairSignalPanel onClose={() => setPairSignalOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
                   ) : oracleOpen ? (
-                    <NextCandlePanel onClose={() => setOracleOpen(false)} asset={asset} tf={tf} closedTick={closedTick} onOpenAccute={handleOpenAccute} onOpenTempo={handleOpenTempo} />
+                    <NextCandlePanel onClose={() => setOracleOpen(false)} asset={asset} tf={tf} closedTick={closedTick} onOpenAccute={handleOpenAccute} onOpenTempo={handleOpenTempo} onOpenSmc={handleOpenSmc} />
+                  ) : smcGlobalOpen ? (
+                    <SmcGlobalPanel onClose={() => setSmcGlobalOpen(false)} tf={tf} closedTick={closedTick} onPickAsset={handleSelectAsset} onOpenSmc={handleOpenSmc} />
                   ) : smcRecentOpen ? (
-                    <SmcRecentPanel onClose={() => setSmcRecentOpen(false)} asset={asset} tf={tf} closedTick={closedTick} />
+                    <SmcRecentPanel onClose={() => setSmcRecentOpen(false)} asset={asset} tf={tf} closedTick={closedTick} onOpenOracle={handleOpenOracle} onOpenAccute={handleOpenAccute} />
                   ) : nextGlobalOpen ? (
                     <NextGlobalPanel onClose={() => setNextGlobalOpen(false)} tf={tf} closedTick={closedTick} onPickAsset={handleSelectAsset} onOpenOracle={handleOpenOracle} />
                   ) : tempoGlobalOpen ? (
@@ -1221,7 +1244,7 @@ export default function OSPage() {
                   ) : accuteGlobalOpen ? (
                     <AccuteGlobalPanel onClose={() => setAccuteGlobalOpen(false)} tf={tf} closedTick={closedTick} onPickAsset={handleSelectAsset} onOpenAccute={handleOpenAccute} />
                   ) : accuteOpen ? (
-                    <AccutePanel onClose={() => setAccuteOpen(false)} asset={asset} tf={tf} closedTick={closedTick} onOpenOracle={handleOpenOracle} />
+                    <AccutePanel onClose={() => setAccuteOpen(false)} asset={asset} tf={tf} closedTick={closedTick} onOpenOracle={handleOpenOracle} onOpenSmc={handleOpenSmc} />
                   ) : (
                     <ChartSignalsPanel onClose={() => setSignalsOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onTake={handleTakeSignal} />
                   )}
@@ -1294,6 +1317,18 @@ export default function OSPage() {
                       >
                         <span className="h-1.5 w-1.5 rounded-full bg-cyan-300" />
                         SMC Recent
+                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
+                      </button>
+                      )}
+                      {panelVisibility.smcGlobal && (
+                      <button
+                        type="button"
+                        onClick={() => setSmcGlobalOpen(true)}
+                        title="smc global - the structure scanner lifted to the whole universe: one SMC summary read per pair, ranked directional-first then by confidence"
+                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-teal-500/40 hover:text-teal-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-teal-300" />
+                        SMC Global
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
                       )}

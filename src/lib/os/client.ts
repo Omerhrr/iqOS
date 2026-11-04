@@ -254,6 +254,20 @@ export async function getSmcScan(asset: string, tf: Timeframe): Promise<SmcScanR
   return osGet<SmcScanResponse>('/smc_scan', { asset, tf })
 }
 
+export interface SmcGlobalResult {
+  ok: true
+  tf: Timeframe
+  scannedTs: number
+  universe: number
+  scanned: number
+  agreeing: number
+  rows: SmcScanResponse[]
+}
+
+export async function getSmcGlobal(tf: Timeframe, opts: { limit?: number } = {}): Promise<SmcGlobalResult> {
+  return osGet<SmcGlobalResult>('/smc_global', { tf, limit: opts.limit })
+}
+
 // ---------- Meta-strategy (panel-combinator strategies, trading-core/src/analytics+plugins/metastrategy.ts) ----------
 // Build a strategy OUT OF the panels directly - "Oracle call AND HMA/ROC/
 // Bull-Bear call AND Accute call AND Renko call" - instead of out of raw

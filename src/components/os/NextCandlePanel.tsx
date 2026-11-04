@@ -26,6 +26,8 @@ interface NextCandlePanelProps {
   onOpenAccute?: (asset: string) => void
   /** cross-nav: jump straight to Tempo for this same asset */
   onOpenTempo?: (asset: string) => void
+  /** cross-nav: jump straight to the SMC Recent panel for this same asset */
+  onOpenSmc?: (asset: string) => void
 }
 
 const FALLBACK_POLL_MS = 15_000
@@ -444,7 +446,7 @@ function ResolutionRow({ r }: { r: OracleRecentResolution }) {
   )
 }
 
-export default function NextCandlePanel({ asset, tf, closedTick, onClose, onOpenAccute, onOpenTempo }: NextCandlePanelProps) {
+export default function NextCandlePanel({ asset, tf, closedTick, onClose, onOpenAccute, onOpenTempo, onOpenSmc }: NextCandlePanelProps) {
   const [pred, setPred] = useState<NextCandlePrediction | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [stats, setStats] = useState<NextCandleStatsResponse | null>(null)
@@ -484,7 +486,7 @@ export default function NextCandlePanel({ asset, tf, closedTick, onClose, onOpen
           <button
             type="button"
             onClick={() => onOpenTempo(asset)}
-            className={`rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-fuchsia-500/40 hover:text-fuchsia-300 ${onOpenAccute ? '' : 'ml-auto'}`}
+            className={`rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-fuchsia-500/40 hover:text-fuchsia-300 ${onOpenAccute || onOpenSmc ? '' : 'ml-auto'}`}
             title="open Tempo for this asset"
           >
             → tempo
@@ -494,16 +496,26 @@ export default function NextCandlePanel({ asset, tf, closedTick, onClose, onOpen
           <button
             type="button"
             onClick={() => onOpenAccute(asset)}
-            className={`rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-sky-500/40 hover:text-sky-300 ${onOpenTempo ? '' : 'ml-auto'}`}
+            className={`rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-sky-500/40 hover:text-sky-300 ${onOpenTempo || onOpenSmc ? '' : 'ml-auto'}`}
             title="open Accute for this asset"
           >
             → accute
           </button>
         )}
+        {onOpenSmc && (
+          <button
+            type="button"
+            onClick={() => onOpenSmc(asset)}
+            className={`rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-cyan-500/40 hover:text-cyan-300 ${onOpenTempo || onOpenAccute ? '' : 'ml-auto'}`}
+            title="open SMC Recent for this asset"
+          >
+            → smc
+          </button>
+        )}
         <button
           type="button"
           onClick={onClose}
-          className={`rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-rose-500/40 hover:text-rose-300 ${onOpenAccute || onOpenTempo ? '' : 'ml-auto'}`}
+          className={`rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-rose-500/40 hover:text-rose-300 ${onOpenAccute || onOpenTempo || onOpenSmc ? '' : 'ml-auto'}`}
         >
           close
         </button>

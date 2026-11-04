@@ -23,6 +23,10 @@ interface SmcRecentPanelProps {
   tf: Timeframe
   closedTick?: number
   onClose: () => void
+  /** cross-nav: jump straight to the Next-Candle Oracle for this same asset */
+  onOpenOracle?: (asset: string) => void
+  /** cross-nav: jump straight to Accute for this same asset */
+  onOpenAccute?: (asset: string) => void
 }
 
 const FALLBACK_POLL_MS = 8_000
@@ -80,7 +84,7 @@ function RecentRow({ s, price, asset }: { s: SmcSignal; price: number; asset: st
   )
 }
 
-export default function SmcRecentPanel({ asset, tf, closedTick, onClose }: SmcRecentPanelProps) {
+export default function SmcRecentPanel({ asset, tf, closedTick, onClose, onOpenOracle, onOpenAccute }: SmcRecentPanelProps) {
   const [data, setData] = useState<SmcScanResponse | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -128,7 +132,31 @@ export default function SmcRecentPanel({ asset, tf, closedTick, onClose }: SmcRe
             structure: {result.trend}
           </span>
         )}
-        <button type="button" onClick={onClose} className="ml-auto rounded px-2 py-1 font-mono text-[10px] text-[#7c8aa5] hover:bg-[#1c2739] hover:text-[#dbe4f0]">
+        {onOpenOracle && (
+          <button
+            type="button"
+            onClick={() => onOpenOracle(asset)}
+            className={`rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-amber-500/40 hover:text-amber-300 ${onOpenAccute ? '' : 'ml-auto'}`}
+            title="open the Next-Candle Oracle for this asset"
+          >
+            → oracle
+          </button>
+        )}
+        {onOpenAccute && (
+          <button
+            type="button"
+            onClick={() => onOpenAccute(asset)}
+            className={`rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-sky-500/40 hover:text-sky-300 ${onOpenOracle ? '' : 'ml-auto'}`}
+            title="open Accute for this asset"
+          >
+            → accute
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={onClose}
+          className={`rounded px-2 py-1 font-mono text-[10px] text-[#7c8aa5] hover:bg-[#1c2739] hover:text-[#dbe4f0] ${onOpenOracle || onOpenAccute ? '' : 'ml-auto'}`}
+        >
           close
         </button>
       </div>

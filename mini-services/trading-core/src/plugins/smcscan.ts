@@ -40,6 +40,18 @@ export interface SmcScanResponse {
   scanMs: number
 }
 
+export interface SmcGlobalResult {
+  tf: Timeframe
+  scannedTs: number
+  universe: number
+  scanned: number
+  agreeing: number
+  rows: SmcScanResponse[]
+}
+
+const GLOBAL_SCAN_LIMIT_DEFAULT = 40
+const GLOBAL_SCAN_LIMIT_MAX = 150
+
 export class SmcScanService {
   private ctx!: KernelContext
   private market!: MarketDataService
@@ -143,6 +155,46 @@ export class SmcScanService {
     this.cache.set(key, { ts: result.ts, result })
     this.recordFromResponse(asset, tf, result)
     return result
+  }
+
+  /** Whole-universe board, same TTL-cache-per-row shape the Oracle's and
+   * Accute's own global boards use (globalScan calling this service's own
+   * per-asset scan(), which already caches for CACHE_MS, so a panel
+   * polling one pair and the board scanning the whole universe share the
+   * same cached row) - lets a Global SMC panel rank every open pair by
+   * summary confidence instead of only ever looking at the chart's own
+   * asset. */
+  globalScan(tf: Timeframe, opts: { limit?: number } = {}): SmcGlobalResult {
+    const limit = Math.max(1, Math.min(Math.round(opts.limit ?? GLOBAL_SCAN_LIMIT_DEFAULT), GLOBAL_SCAN_LIMIT_MAX))
+    const now = Date.now()
+    const universe = this.market.listAssets().filter((a) => a.open)
+    const picked = universe.slice(0, limit)
+    const rows: SmcScanResponse[] = []
+    for (const a of picked) {
+      try {
+        rows.push(this.scan(a.ticker, tf))
+      } catch {
+        rows.push({ ok: true, asset: a.ticker, tf, result: null, ts: now, scanMs: 0 })
+      }
+    }
+    // directional-first, then by summary confidence, then asset
+    rows.sort((x, y) => {
+      const xDir = x.result && x.result.summary.direction !== 'none' ? 1 : 0
+      const yDir = y.result && y.result.summary.direction !== 'none' ? 1 : 0
+      if (xDir !== yDir) return yDir - xDir
+      const xConf = x.result?.summary.confidence ?? 0
+      const yConf = y.result?.summary.confidence ?? 0
+      if (yConf !== xConf) return yConf - xConf
+      return x.asset.localeCompare(y.asset)
+    })
+    return {
+      tf,
+      scannedTs: now,
+      universe: universe.length,
+      scanned: rows.length,
+      agreeing: rows.filter((r) => r.result && r.result.summary.direction !== 'none').length,
+      rows,
+    }
   }
 
   /** Feed the current summary into the outcome tracker (record a fresh
