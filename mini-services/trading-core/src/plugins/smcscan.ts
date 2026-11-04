@@ -38,6 +38,11 @@ export interface SmcScanResponse {
   result: SmcScanResult | null
   ts: number
   scanMs: number
+  /** true = this asset is an OTC synthetic (ticker ends -OTC). Added so
+   * SMC Global can badge/filter OTC pairs the same way ScreenerPanel
+   * already does - previously this response carried nothing that could
+   * tell a '-OTC' pair apart from its real-market twin. */
+  otc: boolean
 }
 
 export interface SmcGlobalResult {
@@ -49,7 +54,12 @@ export interface SmcGlobalResult {
   rows: SmcScanResponse[]
 }
 
-const GLOBAL_SCAN_LIMIT_DEFAULT = 40
+// Was 40 - forex (33) + forex-OTC (10, always open) alone is 43 open assets
+// on an ordinary weekday, so the old default silently truncated OTC pairs
+// (and everything after them) out of the 'all'-scope board before crypto
+// even got a look. Raised so 'all' comfortably covers forex + OTC without
+// relying on marketScope='otc' just to see them.
+const GLOBAL_SCAN_LIMIT_DEFAULT = 60
 const GLOBAL_SCAN_LIMIT_MAX = 150
 
 export class SmcScanService {
@@ -139,7 +149,8 @@ export class SmcScanService {
     } catch {
       result = null
     }
-    return { ok: true, asset, tf, result, ts: Date.now(), scanMs: Date.now() - t0 }
+    const otc = Boolean(this.market.listAssets().find((a) => a.ticker === asset)?.otc)
+    return { ok: true, asset, tf, result, ts: Date.now(), scanMs: Date.now() - t0, otc }
   }
 
   scan(asset: string, tf: Timeframe): SmcScanResponse {
@@ -164,17 +175,30 @@ export class SmcScanService {
    * same cached row) - lets a Global SMC panel rank every open pair by
    * summary confidence instead of only ever looking at the chart's own
    * asset. */
-  globalScan(tf: Timeframe, opts: { limit?: number } = {}): SmcGlobalResult {
+  globalScan(tf: Timeframe, opts: { limit?: number; marketScope?: 'all' | 'real' | 'otc' } = {}): SmcGlobalResult {
     const limit = Math.max(1, Math.min(Math.round(opts.limit ?? GLOBAL_SCAN_LIMIT_DEFAULT), GLOBAL_SCAN_LIMIT_MAX))
+    const scope = opts.marketScope ?? 'all'
     const now = Date.now()
-    const universe = this.market.listAssets().filter((a) => a.open)
+    // AUDIT FIX: universe.ts orders the catalog forex -> OTC -> crypto ->
+    // commodities -> stocks -> indices, and on an ordinary weekday ALL 33
+    // forex pairs plus all 10 forex-OTC pairs are open at once (forex-OTC
+    // is schedule '24/7', not gated behind the real market being closed) -
+    // that's 43 open assets before crypto even starts. With the old flat
+    // slice(0, 40), the last few OTC pairs (and everything after them)
+    // silently never made it into the scanned universe at all, so SMC
+    // Global effectively never showed them - this is what "doesn't detect
+    // otc" was. marketScope lets a caller ask for 'otc' specifically (which
+    // this filters BEFORE slicing, so OTC pairs are never crowded out by
+    // real-market ones competing for the same limit) in addition to fixing
+    // the default 'all' case to filter by scope correctly when asked.
+    const universe = this.market.listAssets().filter((a) => a.open && (scope === 'all' || (scope === 'otc') === Boolean(a.otc)))
     const picked = universe.slice(0, limit)
     const rows: SmcScanResponse[] = []
     for (const a of picked) {
       try {
         rows.push(this.scan(a.ticker, tf))
       } catch {
-        rows.push({ ok: true, asset: a.ticker, tf, result: null, ts: now, scanMs: 0 })
+        rows.push({ ok: true, asset: a.ticker, tf, result: null, ts: now, scanMs: 0, otc: Boolean(a.otc) })
       }
     }
     // directional-first, then by summary confidence, then asset

@@ -12,6 +12,16 @@
 // Support & Resistance is NOT excluded here (unlike SMC Recent) - the
 // summary direction/confidence this board ranks by already blends every
 // active signal kind, same as the SMC tab's own summary chip.
+//
+// OTC detection: rows now carry `otc` (badged amber), and a scope filter
+// (All/Real/OTC) sits next to the direction filter. Previously there was
+// no way to tell an OTC row apart, AND OTC pairs could be silently
+// crowded out of the scanned universe entirely - universe.ts orders the
+// catalog forex -> OTC -> ..., and on an ordinary weekday all 33 forex +
+// 10 forex-OTC pairs are open at once (forex-OTC is 24/7, not gated), so
+// the old flat limit=40 slice never even reached some of them. Picking
+// "OTC" here filters BEFORE the scan limit is applied, so OTC pairs are
+// guaranteed to show regardless of how many real-market pairs are open.
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { SmcScanResponse, Timeframe } from '@/lib/os/client'
@@ -33,6 +43,7 @@ const TFS: Timeframe[] = ['1m', '5m']
 const LIMIT = 30
 
 type DirFilter = 'all' | 'call' | 'put'
+type ScopeFilter = 'all' | 'real' | 'otc'
 
 function dirChip(direction: 'call' | 'put' | 'none') {
   const none = direction === 'none'
@@ -68,6 +79,7 @@ export default function SmcGlobalPanel({ tf, closedTick, onPickAsset, onOpenSmc,
   const [rows, setRows] = useState<SmcScanResponse[]>([])
   const [meta, setMeta] = useState<{ scanned: number; universe: number; agreeing: number; scannedTs: number } | null>(null)
   const [dirFilter, setDirFilter] = useState<DirFilter>('all')
+  const [scopeFilter, setScopeFilter] = useState<ScopeFilter>('all')
   const [err, setErr] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [, forceTick] = useState(0)
@@ -75,7 +87,7 @@ export default function SmcGlobalPanel({ tf, closedTick, onPickAsset, onOpenSmc,
   const load = useCallback(async () => {
     setBusy(true)
     try {
-      const res = await getSmcGlobal(tfSel, { limit: LIMIT })
+      const res = await getSmcGlobal(tfSel, { limit: LIMIT, marketScope: scopeFilter })
       if (res.ok) {
         setRows(res.rows)
         setMeta({ scanned: res.scanned, universe: res.universe, agreeing: res.agreeing, scannedTs: res.scannedTs })
@@ -86,7 +98,7 @@ export default function SmcGlobalPanel({ tf, closedTick, onPickAsset, onOpenSmc,
     } finally {
       setBusy(false)
     }
-  }, [tfSel])
+  }, [tfSel, scopeFilter])
 
   useEffect(() => {
     void load()
@@ -96,7 +108,7 @@ export default function SmcGlobalPanel({ tf, closedTick, onPickAsset, onOpenSmc,
       clearInterval(t)
       clearInterval(age)
     }
-  }, [load, closedTick, tfSel])
+  }, [load, closedTick, tfSel, scopeFilter])
 
   const shown = useMemo(() => {
     const live = rows.filter((r) => r.result && (dirFilter === 'all' || r.result.summary.direction === dirFilter))
@@ -161,6 +173,7 @@ export default function SmcGlobalPanel({ tf, closedTick, onPickAsset, onOpenSmc,
               {best.asset}
             </button>
             {dirChip(best.result.summary.direction)}
+            {best.otc && <span className="rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-px font-mono text-[8px] font-bold uppercase text-amber-300">OTC</span>}
             <span className="rounded border border-[#1c2739] px-1.5 py-px font-mono text-[8.5px] uppercase text-[#7c8aa5]">structure {best.result.trend}</span>
             {onOpenSmc && (
               <button
@@ -190,6 +203,18 @@ export default function SmcGlobalPanel({ tf, closedTick, onPickAsset, onOpenSmc,
             {d}
           </button>
         ))}
+        <span className="mx-0.5 h-3 w-px bg-[#1c2739]" />
+        {(['all', 'real', 'otc'] as ScopeFilter[]).map((s) => (
+          <button
+            key={s}
+            type="button"
+            onClick={() => setScopeFilter(s)}
+            title={s === 'otc' ? 'OTC pairs only - never crowded out by real-market pairs competing for the same scan limit' : s === 'real' ? 'real-market pairs only' : 'everything open, real + OTC'}
+            className={`rounded border px-1.5 py-px font-mono text-[8.5px] uppercase ${scopeFilter === s ? 'border-amber-500/50 bg-amber-500/10 text-amber-300' : 'border-[#1c2739] text-[#4b5a72] hover:text-[#7c8aa5]'}`}
+          >
+            {s === 'otc' ? 'OTC' : s}
+          </button>
+        ))}
       </div>
 
       <div className="flex min-h-0 flex-1 flex-col gap-1">
@@ -210,6 +235,7 @@ export default function SmcGlobalPanel({ tf, closedTick, onPickAsset, onOpenSmc,
               title={`${r.asset} ${r.tf} · structure ${result.trend} · click to open on the chart`}
             >
               <span className="w-24 shrink-0 truncate font-mono text-[10px] font-bold text-[#dbe4f0] group-hover:text-cyan-300">{r.asset}</span>
+              {r.otc && <span className="shrink-0 rounded border border-amber-500/40 bg-amber-500/10 px-1 py-px font-mono text-[7px] font-bold uppercase text-amber-300">OTC</span>}
               {dirChip(result.summary.direction)}
               {confBar(result.summary.confidence)}
               <span className="shrink-0 font-mono text-[8px] text-[#4b5a72]">{result.summary.bullish}▲/{result.summary.bearish}▼</span>

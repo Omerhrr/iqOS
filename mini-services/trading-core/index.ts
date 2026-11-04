@@ -2248,13 +2248,19 @@ const httpServer = createServer(async (req, res) => {
 
       // Global SMC board: the whole-universe twin of /smc_scan - same
       // scan, ranked by summary confidence (directional-first), same board
-      // shape /next_global and /accute_global already use.
+      // shape /next_global and /accute_global already use. scope=all|real|
+      // otc lets the caller ask for OTC pairs specifically (so they're
+      // never crowded out of the limit by real-market pairs competing for
+      // the same slice - see globalScan's own comment on why OTC used to
+      // go missing here).
       if (path === '/smc_global') {
         try {
           const svc = kernel.context().use<SmcScanService>('smcScan')
           const gTf = tfStrict(q.get('tf'))
           if (gTf === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
-          const out = svc.globalScan(gTf, { limit: Number(q.get('limit') ?? 40) })
+          const scopeRaw = q.get('scope')
+          const scope: 'all' | 'real' | 'otc' = scopeRaw === 'real' || scopeRaw === 'otc' ? scopeRaw : 'all'
+          const out = svc.globalScan(gTf, { limit: Number(q.get('limit') ?? 60), marketScope: scope })
           return json(200, { ok: true, ...out })
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })

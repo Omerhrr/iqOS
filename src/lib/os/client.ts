@@ -248,6 +248,8 @@ export interface SmcScanResponse {
   result: SmcScanResult | null
   ts: number
   scanMs: number
+  /** true = this is an OTC synthetic pair (ticker ends -OTC). */
+  otc: boolean
 }
 
 export async function getSmcScan(asset: string, tf: Timeframe): Promise<SmcScanResponse> {
@@ -264,8 +266,8 @@ export interface SmcGlobalResult {
   rows: SmcScanResponse[]
 }
 
-export async function getSmcGlobal(tf: Timeframe, opts: { limit?: number } = {}): Promise<SmcGlobalResult> {
-  return osGet<SmcGlobalResult>('/smc_global', { tf, limit: opts.limit })
+export async function getSmcGlobal(tf: Timeframe, opts: { limit?: number; marketScope?: 'all' | 'real' | 'otc' } = {}): Promise<SmcGlobalResult> {
+  return osGet<SmcGlobalResult>('/smc_global', { tf, limit: opts.limit, scope: opts.marketScope })
 }
 
 // ---------- Meta-strategy (panel-combinator strategies, trading-core/src/analytics+plugins/metastrategy.ts) ----------
