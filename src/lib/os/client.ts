@@ -3885,6 +3885,69 @@ export interface AutoTraderConfig {
   planState?: { pot: number; rollN: number; restarts: number; reseedCount?: number; lossReseedCount?: number; halted: boolean; complete: boolean }
 }
 
+// ---------- Meta Trader (plugins/metatrader.ts) ----------
+// "Like the auto-trader, but without its frictions" per direct instruction:
+// one flat stake, no cooldown/pacing/payout-floor/vol-gate/OTC-guard/daily-
+// limits/streak-breaker - the one quality gate it keeps is Min confidence.
+// Still fully subject to the kill switch/risk manager (ExecutionService
+// enforces those for every caller) and to the same global OS mode switch
+// the auto-trader and bots obey.
+
+export type MetaTraderSource =
+  | 'meta-strategy'
+  | 'oracle'
+  | 'accute'
+  | 'smc'
+  | 'smc-fvg'
+  | 'smc-ifvg'
+  | 'smc-order-block'
+  | 'smc-breaker-block'
+  | 'smc-liquidity-sweep'
+  | 'smc-bos'
+  | 'smc-choch'
+  | 'smc-ote'
+  | 'smc-krm'
+  | 'smc-supply-demand'
+  | 'smc-support-resistance'
+  | 'smc-breakout'
+  | 'smc-crt'
+  | 'smc-power-of-3'
+  | 'smc-silver-bullet'
+
+export interface MetaTraderConfig {
+  enabled: boolean
+  signalSource: MetaTraderSource
+  /** only meaningful when signalSource === 'meta-strategy'. */
+  metaStrategyId?: string
+  tf: Timeframe
+  direction: 'call' | 'put' | 'both'
+  minConfidence: number
+  stake: number
+  maxOpen: number
+  kind: TradeKind
+  marketScope: 'all' | 'real' | 'otc'
+}
+
+export interface MetaTraderRuntime {
+  trades: number
+  wins: number
+  losses: number
+  pnlTotal: number
+  openCount: number
+  lastTradeTs: number
+  lastAction?: string
+  lastRejection?: string
+}
+
+export interface MetaTraderStatus {
+  enabled: boolean
+  mode: OsMode
+  active: boolean
+  config: MetaTraderConfig
+  runtime: MetaTraderRuntime
+  sources: readonly MetaTraderSource[]
+}
+
 export interface OsModeStatus {
   mode: OsMode
   ts: number

@@ -52,6 +52,7 @@ import type {
   Candle,
   ChartType,
   IndicatorSeries,
+  MetaTraderStatus,
   OsMode,
   OsModeStatus,
   Position,
@@ -588,6 +589,25 @@ export default function OSPage() {
     return () => clearInterval(t)
   }, [loadMode])
   const osMode: OsMode = modeStatus?.mode ?? 'human'
+
+  // meta trader polling - "like the auto-trader, but without its
+  // frictions" (plugins/metatrader.ts) - separate status/poll from the OS
+  // mode above since it's its own engine with its own config, just gated
+  // by the same mode switch.
+  const [metaTraderStatus, setMetaTraderStatus] = useState<MetaTraderStatus | null>(null)
+  const loadMetaTrader = useCallback(async () => {
+    try {
+      const d = await osGet<{ ok: boolean } & MetaTraderStatus>('/meta_trader_status')
+      if (d.ok) setMetaTraderStatus({ enabled: d.enabled, mode: d.mode, active: d.active, config: d.config, runtime: d.runtime, sources: d.sources })
+    } catch {
+      /* kernel not up yet */
+    }
+  }, [])
+  useEffect(() => {
+    void loadMetaTrader()
+    const t = setInterval(() => void loadMetaTrader(), 5000)
+    return () => clearInterval(t)
+  }, [loadMetaTrader])
 
   // initial load
   useEffect(() => {
@@ -1178,8 +1198,10 @@ export default function OSPage() {
               price={livePrice}
               prices={prices}
               modeStatus={modeStatus}
+              metaTraderStatus={metaTraderStatus}
               closedTick={closedTick}
               refreshMode={loadMode}
+              refreshMetaTrader={loadMetaTrader}
               refreshPositions={loadPositions}
               refreshBots={loadBots}
               refreshAccount={loadAccount}
@@ -1710,8 +1732,10 @@ export default function OSPage() {
                         price={livePrice}
                         prices={prices}
                         modeStatus={modeStatus}
+                        metaTraderStatus={metaTraderStatus}
                         closedTick={closedTick}
                         refreshMode={loadMode}
+                        refreshMetaTrader={loadMetaTrader}
                         refreshPositions={loadPositions}
                         refreshBots={loadBots}
                         refreshAccount={loadAccount}

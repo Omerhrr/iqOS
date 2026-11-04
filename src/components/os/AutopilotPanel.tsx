@@ -19,7 +19,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import type { AssetRow, AutoTraderConfig, BotConfig, BotRow, MetaStrategySpec, OsModeStatus, OtcConfig, OtcPolicy, StrategyInfo, Timeframe, TradeKind, ValidationRow } from '@/lib/os/client'
+import type { AssetRow, AutoTraderConfig, BotConfig, BotRow, MetaStrategySpec, MetaTraderConfig, MetaTraderSource, MetaTraderStatus, OsModeStatus, OtcConfig, OtcPolicy, StrategyInfo, Timeframe, TradeKind, ValidationRow } from '@/lib/os/client'
 import { BLITZ_EXPIRY_SECONDS, KIND_LABEL, TIMEFRAMES, fmtMoney, fmtTime, getMetaStrategies, getOtcConfig, osGet, osPost, setOtcConfig } from '@/lib/os/client'
 
 const GATE_MAX_AGE_SEC = 14 * 24 * 60 * 60
@@ -70,7 +70,9 @@ interface AutopilotPanelProps {
   assets: AssetRow[]
   strategies: StrategyInfo[]
   modeStatus: OsModeStatus | null
+  metaTraderStatus: MetaTraderStatus | null
   refreshMode: () => void
+  refreshMetaTrader: () => void
   onChanged: () => void
   onError: (m: string) => void
 }
@@ -94,10 +96,11 @@ const emptyDraft = (): BotConfig => ({
   dailyLossLimit: 0,
 })
 
-export default function AutopilotPanel({ bots, assets, strategies, modeStatus, refreshMode, onChanged, onError }: AutopilotPanelProps) {
+export default function AutopilotPanel({ bots, assets, strategies, modeStatus, metaTraderStatus, refreshMode, refreshMetaTrader, onChanged, onError }: AutopilotPanelProps) {
   const mode = modeStatus?.mode ?? 'human'
   const [editorOpen, setEditorOpen] = useState(false)
   const [atOpen, setAtOpen] = useState(false)
+  const [mtOpen, setMtOpen] = useState(false)
   const [draft, setDraft] = useState<BotConfig>(emptyDraft())
   const [busy, setBusy] = useState(false)
   const [filter, setFilter] = useState('')
@@ -302,6 +305,26 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, r
         onSave={async (cfg) => {
           await osPost<{ ok: boolean }>('/autotrader_config', cfg)
           refreshMode()
+        }}
+      />
+
+      {/* meta trader strip - "like the auto-trader, but without its
+          frictions" (plugins/metatrader.ts) - a separate, faster executor
+          alongside the auto-trader above, gated by the same mode switch */}
+      {metaTraderStatus && (
+        <MetaTraderStrip mt={metaTraderStatus} onConfigure={() => setMtOpen(true)} />
+      )}
+
+      {/* meta trader config editor (remounts on open so the draft mirrors the kernel) */}
+      <MetaTraderDialog
+        key={String(mtOpen)}
+        open={mtOpen}
+        onOpenChange={setMtOpen}
+        config={metaTraderStatus?.config ?? DEFAULT_META_TRADER_UI}
+        sources={metaTraderStatus?.sources ?? []}
+        onSave={async (cfg) => {
+          await osPost<{ ok: boolean }>('/meta_trader_config', cfg)
+          refreshMetaTrader()
         }}
       />
 
@@ -2583,6 +2606,279 @@ function AutoTraderDialog({
               }
             }}
             className="h-8 bg-cyan-600 px-3 text-[11px] font-bold text-white hover:bg-cyan-500"
+          >
+            {busy ? 'Saving…' : 'Save config'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// ---------- meta trader strip + config editor ----------
+// "Like the auto-trader, but without its frictions" (plugins/metatrader.ts's
+// own header) - a separate, faster executor, armed by the same mode switch.
+// Deliberately simpler than the auto-trader's own section above: one flat
+// stake, no pacing/cooldown/payout-floor/vol-gate/watchlist/compounding -
+// those are exactly the frictions this engine was built to skip.
+
+const META_TRADER_SOURCE_LABELS: Record<MetaTraderSource, string> = {
+  'meta-strategy': 'Meta-Strategy',
+  oracle: 'Oracle',
+  accute: 'Accute',
+  smc: 'SMC (now)',
+  'smc-fvg': 'SMC: FVG',
+  'smc-ifvg': 'SMC: IFVG',
+  'smc-order-block': 'SMC: Order Block',
+  'smc-breaker-block': 'SMC: Breaker Block',
+  'smc-liquidity-sweep': 'SMC: Liquidity Sweep',
+  'smc-bos': 'SMC: BOS',
+  'smc-choch': 'SMC: CHoCH',
+  'smc-ote': 'SMC: OTE',
+  'smc-krm': 'SMC: KRM',
+  'smc-supply-demand': 'SMC: Supply & Demand',
+  'smc-support-resistance': 'SMC: Support & Resistance',
+  'smc-breakout': 'SMC: Breakout',
+  'smc-crt': 'SMC: CRT',
+  'smc-power-of-3': 'SMC: Power of 3',
+  'smc-silver-bullet': 'SMC: Silver Bullet',
+}
+
+const DEFAULT_META_TRADER_UI: MetaTraderConfig = {
+  enabled: false,
+  signalSource: 'meta-strategy',
+  tf: '1m',
+  direction: 'both',
+  minConfidence: 60,
+  stake: 1,
+  maxOpen: 3,
+  kind: 'binary',
+  marketScope: 'all',
+}
+
+function MetaTraderStrip({ mt, onConfigure }: { mt: MetaTraderStatus; onConfigure: () => void }) {
+  const state =
+    mt.mode === 'auto' && mt.config.enabled
+      ? { label: 'ARMED · trading', cls: 'border-teal-500/50 bg-teal-500/10 text-teal-300', dot: 'animate-pulse bg-teal-400' }
+      : mt.mode === 'auto'
+        ? { label: 'off', cls: 'border-[#1c2739] bg-[#101828] text-[#4b5a72]', dot: 'bg-[#2a3850]' }
+        : { label: 'standby · human mode', cls: 'border-cyan-500/40 bg-cyan-500/10 text-cyan-300', dot: 'bg-cyan-500' }
+  const closed = mt.runtime.trades
+  const wins = mt.runtime.wins
+  const wr = closed ? Math.round((wins / closed) * 100) : null
+  return (
+    <div className="shrink-0 rounded border border-[#1c2739] bg-[#0d1420] px-2.5 py-1.5">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span className="text-[9px] font-bold uppercase tracking-[0.18em] text-[#7c8aa5]">meta trader</span>
+        <span className={`flex items-center gap-1.5 rounded border px-1.5 py-px font-mono text-[8px] font-bold uppercase tracking-wider ${state.cls}`}>
+          <span className={`h-1 w-1 rounded-full ${state.dot}`} />
+          {state.label}
+        </span>
+        <span className="font-mono text-[9px] text-[#4b5a72]">
+          {META_TRADER_SOURCE_LABELS[mt.config.signalSource]}
+          {mt.config.signalSource === 'meta-strategy' && ` · ${mt.config.metaStrategyId ?? 'none picked'}`}
+          {' · '}conf≥{mt.config.minConfidence}% · {mt.config.tf} · ${mt.config.stake} · max {mt.config.maxOpen}
+          {mt.config.marketScope === 'real' && <span className="text-emerald-400/80"> · REAL only</span>}
+          {mt.config.marketScope === 'otc' && <span className="text-violet-400/80"> · OTC only</span>}
+        </span>
+        <span className="ml-auto font-mono text-[9px] text-[#4b5a72]">
+          {closed}t{wr !== null ? ` · ${wr}% wr` : ''} ·{' '}
+          <span className={mt.runtime.pnlTotal >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+            {mt.runtime.pnlTotal >= 0 ? '+' : ''}
+            {fmtMoney(mt.runtime.pnlTotal)}
+          </span>
+          {mt.runtime.openCount > 0 && <span className="text-[#aab6cc]"> · {mt.runtime.openCount} open</span>}
+        </span>
+        <Button
+          size="sm"
+          onClick={onConfigure}
+          className="h-5 rounded bg-[#1c2739] px-2 text-[9px] font-bold uppercase tracking-wider text-[#aab6cc] hover:bg-[#243352] hover:text-teal-300"
+        >
+          Configure
+        </Button>
+      </div>
+      {(mt.runtime.lastAction || mt.runtime.lastRejection) && (
+        <p className="mt-0.5 truncate font-mono text-[8px] text-[#3d4c66]">
+          {mt.runtime.lastAction && <span title={mt.runtime.lastAction}>last: {mt.runtime.lastAction}</span>}
+          {mt.runtime.lastRejection && <span className="text-amber-500/70"> · standing down: {mt.runtime.lastRejection}</span>}
+        </p>
+      )}
+    </div>
+  )
+}
+
+function MetaTraderDialog({
+  open,
+  onOpenChange,
+  config,
+  sources,
+  onSave,
+}: {
+  open: boolean
+  onOpenChange: (o: boolean) => void
+  config: MetaTraderConfig
+  sources: readonly MetaTraderSource[]
+  onSave: (patch: Partial<MetaTraderConfig>) => Promise<void>
+}) {
+  const [d, setD] = useState<MetaTraderConfig>(config)
+  const [busy, setBusy] = useState(false)
+  const p = (patch: Partial<MetaTraderConfig>) => setD((prev) => ({ ...prev, ...patch }))
+  // Same "load on mount, picker just shows empty if it fails" convention the
+  // auto-trader dialog's own meta-strategy picker uses.
+  const [metaStrategies, setMetaStrategies] = useState<MetaStrategySpec[]>([])
+  useEffect(() => {
+    let alive = true
+    getMetaStrategies()
+      .then((res) => {
+        if (alive) setMetaStrategies(res.strategies)
+      })
+      .catch(() => {
+        // picker just shows an empty list - the Meta-Strategy tab is the source of truth
+      })
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-h-[85vh] max-w-md overflow-y-auto border-[#1c2739] bg-[#0b111c] text-[#dbe4f0]">
+        <DialogHeader>
+          <DialogTitle className="text-[14px] tracking-wider">META TRADER</DialogTitle>
+          <DialogDescription className="text-[11px] text-[#7c8aa5]">
+            Like the auto-trader, but without its frictions: one flat stake, no pacing/cooldown/payout-floor/vol-gate/
+            watchlist/compounding - just a confidence floor. Trades a saved meta-strategy spec, the Oracle, Accute, the
+            SMC scanner&apos;s current-candle ("now") read, or any one of its 15 individual concepts (FVG, OTE, KRM, ...)
+            as its own standalone source. Only ever trades while the OS is in NO-HUMAN mode. Sentinel + the kill switch +
+            risk limits still govern every order - those never get skipped.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="grid grid-cols-2 gap-2.5">
+          <div className="col-span-2 flex items-center justify-between rounded border border-[#1c2739] bg-[#101828] px-2.5 py-2">
+            <div>
+              <div className="text-[11px] font-semibold text-[#e2e8f0]">Enabled</div>
+              <div className="text-[9px] text-[#4b5a72]">armed for the next NO-HUMAN session</div>
+            </div>
+            <Switch checked={d.enabled} onCheckedChange={(v) => p({ enabled: v })} />
+          </div>
+
+          <div className="col-span-2">
+            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Signal source</Label>
+            <div
+              className="flex max-h-28 flex-wrap gap-px overflow-y-auto rounded border border-[#1c2739] p-0.5"
+            >
+              {sources.map((v) => (
+                <button
+                  key={v}
+                  type="button"
+                  onClick={() => p({ signalSource: v })}
+                  className={`shrink-0 whitespace-nowrap rounded px-2 py-1 font-mono text-[9.5px] uppercase tracking-wider transition-colors ${
+                    d.signalSource === v ? 'bg-teal-500/20 text-teal-300' : 'text-[#4b5a72] hover:text-[#aab6cc]'
+                  }`}
+                >
+                  {META_TRADER_SOURCE_LABELS[v]}
+                </button>
+              ))}
+            </div>
+            <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+              {d.signalSource === 'meta-strategy'
+                ? 'trades a saved panel-combinator spec (built in the Meta-Strategy tab) directly off the panels\' own current verdicts - pick which saved spec below'
+                : d.signalSource === 'oracle'
+                  ? 'the Next-Candle Oracle\'s fused read, swept across the whole open universe - already honesty-tracked'
+                  : d.signalSource === 'accute'
+                    ? 'Accute\'s weighted multi-driver fused read, swept across the whole open universe'
+                    : d.signalSource === 'smc'
+                      ? 'the SMC scanner\'s AGGREGATE "now" read: every concept that fired on the CURRENT candle only (not the panel\'s all-ages blended summary), majority direction across all 15 kinds'
+                      : `one single SMC concept (${META_TRADER_SOURCE_LABELS[d.signalSource]}), restricted to the CURRENT candle only - confidence is how many other "now" signals (any kind) agree with its direction`}
+            </p>
+          </div>
+
+          {d.signalSource === 'meta-strategy' && (
+            <div className="col-span-2">
+              <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Meta-strategy spec</Label>
+              <select
+                value={d.metaStrategyId ?? ''}
+                onChange={(e) => p({ metaStrategyId: e.target.value || undefined })}
+                className="mt-1 h-7 w-full rounded border border-[#1c2739] bg-[#0b111c] px-1.5 text-[11px] text-[#e2e8f0] outline-none"
+              >
+                <option value="">— pick a saved spec —</option>
+                {metaStrategies.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name} ({s.mode}, {s.conditions.length} condition{s.conditions.length === 1 ? '' : 's'})
+                  </option>
+                ))}
+              </select>
+              {metaStrategies.length === 0 ? (
+                <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+                  No meta-strategies saved yet - build one in the Meta-Strategy tab, then come back here to pick it.
+                </p>
+              ) : !d.metaStrategyId ? (
+                <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">no spec picked yet - meta trader stands aside until you pick one.</p>
+              ) : null}
+            </div>
+          )}
+
+          <NumField label="Min confidence %" value={d.minConfidence} onChange={(v) => p({ minConfidence: Math.min(100, Math.max(0, v)) })} />
+          <NumField label="Max open" value={d.maxOpen} onChange={(v) => p({ maxOpen: Math.max(1, Math.round(v)) })} />
+          <NumField label="Stake $" value={d.stake} onChange={(v) => p({ stake: v })} />
+          <div>
+            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Timeframe</Label>
+            <select
+              value={d.tf}
+              onChange={(e) => p({ tf: e.target.value as Timeframe })}
+              className="h-8 w-full rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-teal-300 outline-none"
+            >
+              {TIMEFRAMES.map((t) => (
+                <option key={t} value={t} className="bg-[#0d1420]">
+                  {t}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Direction</Label>
+            <select
+              value={d.direction}
+              onChange={(e) => p({ direction: e.target.value as MetaTraderConfig['direction'] })}
+              className="h-8 w-full rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-teal-300 outline-none"
+            >
+              {['both', 'call', 'put'].map((v) => (
+                <option key={v} value={v} className="bg-[#0d1420]">
+                  {v}
+                </option>
+              ))}
+            </select>
+          </div>
+          <Segmented
+            label="Feed family"
+            options={[
+              { v: 'all', label: 'All' },
+              { v: 'real', label: 'Real only' },
+              { v: 'otc', label: 'OTC only' },
+            ]}
+            value={d.marketScope}
+            onChange={(v) => p({ marketScope: v as MetaTraderConfig['marketScope'] })}
+          />
+        </div>
+
+        <DialogFooter className="mt-1 gap-2">
+          <Button variant="outline" className="h-8 border-[#1c2739] px-3 text-[11px] text-[#7c8aa5]" onClick={() => onOpenChange(false)}>
+            Cancel
+          </Button>
+          <Button
+            disabled={busy}
+            onClick={async () => {
+              setBusy(true)
+              try {
+                await onSave(d)
+                onOpenChange(false)
+              } finally {
+                setBusy(false)
+              }
+            }}
+            className="h-8 bg-teal-600 px-3 text-[11px] font-bold text-white hover:bg-teal-500"
           >
             {busy ? 'Saving…' : 'Save config'}
           </Button>

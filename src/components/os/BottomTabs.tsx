@@ -11,6 +11,7 @@ import type {
   AssetRow,
   BacktestResult,
   BotRow,
+  MetaTraderStatus,
   OsModeStatus,
   Position,
   StrategyInfo,
@@ -51,7 +52,9 @@ interface BottomTabsProps {
   price: number
   prices: Record<string, { price: number; dir: number }>
   modeStatus: OsModeStatus | null
+  metaTraderStatus: MetaTraderStatus | null
   refreshMode: () => void
+  refreshMetaTrader: () => void
   refreshPositions: () => void
   refreshBots: () => void
   refreshAccount: () => void
@@ -277,7 +280,9 @@ export default function BottomTabs(props: BottomTabsProps) {
             assets={props.assets}
             strategies={props.strategies}
             modeStatus={props.modeStatus}
+            metaTraderStatus={props.metaTraderStatus}
             refreshMode={props.refreshMode}
+            refreshMetaTrader={props.refreshMetaTrader}
             onChanged={props.refreshBots}
             onError={onError}
           />
