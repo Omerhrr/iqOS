@@ -3903,6 +3903,16 @@ const httpServer = createServer(async (req, res) => {
         }
       }
 
+      if (path === '/meta_trader_restart') {
+        // compound stop-on-loss: revive a halted meta-trader cycle (clears halt, re-seeds pot)
+        try {
+          const metaTrader = kernel.context().use<MetaTraderService>('metaTrader')
+          return json(200, metaTrader.restart())
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
       if (path === '/autotrader_restart') {
         // compound stop-on-loss: revive a halted auto-trader cycle (clears halt, re-seeds pot)
         const mode = kernel.context().use<ModeService>('mode')

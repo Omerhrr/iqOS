@@ -3914,6 +3914,14 @@ export type MetaTraderSource =
   | 'smc-power-of-3'
   | 'smc-silver-bullet'
 
+export interface MetaStakePlan {
+  kind: 'compound'
+  base: number
+  rollPct?: number
+  payoutCap?: number
+  stopOnLoss?: boolean
+}
+
 export interface MetaTraderConfig {
   enabled: boolean
   signalSource: MetaTraderSource
@@ -3926,6 +3934,9 @@ export interface MetaTraderConfig {
   maxOpen: number
   kind: TradeKind
   marketScope: 'all' | 'real' | 'otc'
+  /** per-asset cooldown in seconds after a placed trade - no hard floor. */
+  cooldownSec: number
+  stakePlan?: MetaStakePlan
 }
 
 export interface MetaTraderRuntime {
@@ -3937,6 +3948,9 @@ export interface MetaTraderRuntime {
   lastTradeTs: number
   lastAction?: string
   lastRejection?: string
+  pot: number
+  rollN: number
+  halted: boolean
 }
 
 export interface MetaTraderStatus {

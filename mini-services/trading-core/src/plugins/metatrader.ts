@@ -138,6 +138,24 @@ export const META_TRADER_SOURCES: readonly MetaTraderSource[] = [
   ...(Object.values(SMC_KIND_SOURCE) as MetaTraderSource[]),
 ]
 
+/** Deliberately simpler than the auto-trader's full StakePlan (client.ts) -
+ * no periods/derisk/reseed-limit machinery, just the core compounding loop:
+ * win folds a share of the payout into the pot, loss burns the stake back
+ * out (and, by default, halts the cycle until restart() - same "a loss
+ * ends the compound run" convention the auto-trader uses). */
+export interface MetaStakePlan {
+  kind: 'compound'
+  base: number
+  /** % of the WON amount folded into the pot each win. Default 100. */
+  rollPct?: number
+  /** caps the fold to this % of the stake risked, even at a higher real
+   * payout. Default 70. */
+  payoutCap?: number
+  /** false = keep rolling through a loss (burn the pot, don't halt).
+   * Default true. */
+  stopOnLoss?: boolean
+}
+
 export interface MetaTraderConfig {
   enabled: boolean
   signalSource: MetaTraderSource
@@ -146,15 +164,21 @@ export interface MetaTraderConfig {
   metaStrategyId?: string
   tf: Timeframe
   direction: 'call' | 'put' | 'both'
-  /** 0-100 - the one quality gate this engine keeps (deliberately: "no
-   * frictions" means no SELF-IMPOSED pacing/cooldown/payout/vol gating, not
-   * "trade literally anything"). */
+  /** 0-100 - the one quality gate this engine always keeps (deliberately:
+   * "no frictions" means no SELF-IMPOSED pacing/payout/vol gating by
+   * default, not "trade literally anything"). */
   minConfidence: number
   stake: number
   /** max concurrently open meta-trader positions, across all assets. */
   maxOpen: number
   kind: TradeKind
   marketScope: 'all' | 'real' | 'otc'
+  /** per-asset re-entry cooldown in seconds - 0 (default) = off. Added per
+   * direct instruction; UNLIKE the auto-trader's cooldownSec, there is no
+   * hard floor here - 0 really does mean no cooldown at all. */
+  cooldownSec: number
+  /** optional compounding plan - undefined (default) = fixed `stake` every trade. */
+  stakePlan?: MetaStakePlan
 }
 
 export interface MetaTraderRuntime {
@@ -166,6 +190,10 @@ export interface MetaTraderRuntime {
   lastTradeTs: number
   lastAction?: string
   lastRejection?: string
+  /** compounding state - only meaningful when config.stakePlan is set. */
+  pot: number
+  rollN: number
+  halted: boolean
 }
 
 interface MetaTraderRow {
@@ -189,6 +217,7 @@ const DEFAULT_META_TRADER: MetaTraderConfig = {
   maxOpen: 3,
   kind: 'binary',
   marketScope: 'all',
+  cooldownSec: 0,
 }
 
 /** The fixed note prefix every Meta Trader position is tagged with -
@@ -203,9 +232,18 @@ const META_TRADER_NOTE = 'meta:trader'
  * honest, explainable number rather than a flat guess, and it naturally
  * rewards a kind firing ALONGSIDE other agreeing structure over one firing
  * in isolation. A lone signal with nothing else to agree or disagree with
- * gets a flat 65 (clearly labeled in the note). */
+ * gets a flat 65 (clearly labeled in the note).
+ *
+ * The AGGREGATE 'smc' source (onlyKind undefined) excludes Support &
+ * Resistance entirely, per direct instruction - its touch-cluster read
+ * fires far more often than the other 14 concepts and would drown out
+ * everything else in a "now" majority vote, same reasoning SmcRecentPanel's
+ * own EXCLUDED_KINDS already applies on its "now"/"1 bar ago" view. The
+ * dedicated 'smc-support-resistance' source (onlyKind === 'SUPPORT_RESISTANCE')
+ * still trades it on its own - this exclusion only affects the aggregate. */
 function smcNowRead(result: SmcScanResult, onlyKind?: SmcKind): { direction: 'call' | 'put' | 'none'; confidence: number; note: string } {
-  const now = result.signals.filter((s) => s.barsAgo === 0)
+  const allNow = result.signals.filter((s) => s.barsAgo === 0)
+  const now = onlyKind ? allNow : allNow.filter((s) => s.kind !== 'SUPPORT_RESISTANCE')
   const pool = onlyKind ? now.filter((s) => s.kind === onlyKind) : now
   if (pool.length === 0) return { direction: 'none', confidence: 0, note: 'nothing hit this candle' }
   const bullish = pool.filter((s) => s.direction === 'bullish').length
@@ -224,10 +262,13 @@ export class MetaTraderService {
   private market!: MarketDataService
   private store!: Store
   private config: MetaTraderConfig = { ...DEFAULT_META_TRADER }
-  private rt: MetaTraderRuntime = { trades: 0, wins: 0, losses: 0, pnlTotal: 0, openCount: 0, lastTradeTs: 0 }
+  private rt: MetaTraderRuntime = { trades: 0, wins: 0, losses: 0, pnlTotal: 0, openCount: 0, lastTradeTs: 0, pot: 0, rollN: 0, halted: false }
   private timer: ReturnType<typeof setInterval> | null = null
   private ticking = false
   private unsub: (() => void) | null = null
+  /** per-asset re-entry cooldown (config.cooldownSec) - epoch seconds until
+   * each asset is tradeable again. Cleared lazily (checked, not swept). */
+  private assetCooldownUntil = new Map<string, number>()
 
   async start(ctx: KernelContext): Promise<void> {
     this.ctx = ctx
@@ -270,14 +311,36 @@ export class MetaTraderService {
         maxOpen: clamp(Math.round(num(saved.maxOpen, DEFAULT_META_TRADER.maxOpen)), 1, 20),
         kind: (['binary', 'turbo', 'blitz', 'digital', 'cfd'] as const).includes(saved.kind as TradeKind) ? (saved.kind as TradeKind) : 'binary',
         marketScope: saved.marketScope === 'real' || saved.marketScope === 'otc' ? saved.marketScope : 'all',
+        cooldownSec: Math.max(0, Math.round(num(saved.cooldownSec, DEFAULT_META_TRADER.cooldownSec))),
+        stakePlan: MetaTraderService.sanitizeStakePlan(saved.stakePlan),
+      }
+      const rt = saved.rt as Record<string, unknown> | undefined
+      if (rt && typeof rt === 'object') {
+        this.rt.pot = Math.max(0, num(rt.pot, 0))
+        this.rt.rollN = Math.max(0, Math.round(num(rt.rollN, 0)))
+        this.rt.halted = Boolean(rt.halted)
       }
     } catch {
       /* corrupt/missing config - start clean */
     }
   }
 
+  private static sanitizeStakePlan(v: unknown): MetaStakePlan | undefined {
+    if (!v || typeof v !== 'object') return undefined
+    const o = v as Record<string, unknown>
+    if (o.kind !== 'compound') return undefined
+    const num = (x: unknown, fb: number) => (typeof x === 'number' && Number.isFinite(x) ? x : fb)
+    return {
+      kind: 'compound',
+      base: clamp(num(o.base, 1), 1, 5000),
+      rollPct: o.rollPct !== undefined ? clamp(num(o.rollPct, 100), 1, 100) : undefined,
+      payoutCap: o.payoutCap !== undefined ? clamp(num(o.payoutCap, 70), 1, 100) : undefined,
+      stopOnLoss: typeof o.stopOnLoss === 'boolean' ? o.stopOnLoss : undefined,
+    }
+  }
+
   private persist(): void {
-    this.store.saveMetaTraderConfig(this.config)
+    this.store.saveMetaTraderConfig({ ...this.config, rt: { pot: this.rt.pot, rollN: this.rt.rollN, halted: this.rt.halted } })
   }
 
   private rebuildOpenCount(): void {
@@ -296,13 +359,48 @@ export class MetaTraderService {
     }
   }
 
-  private onPositionClosed(position: { note?: string; pnl?: number; status: string; asset?: string }): void {
+  private onPositionClosed(position: { note?: string; pnl?: number; status: string; asset?: string; amount?: number }): void {
     if (!position.note?.startsWith(META_TRADER_NOTE)) return
     this.rebuildOpenCount()
     const pnl = position.pnl ?? 0
     this.rt.pnlTotal += pnl
     if (position.status === 'won') this.rt.wins += 1
     else if (position.status === 'lost') this.rt.losses += 1
+
+    // compounding roll - same fold-in/burn shape the auto-trader uses
+    // (os-mode.ts's onPositionClosed), simplified: no periods/derisk/
+    // reseed-limit machinery, just "win folds a share in, loss burns the
+    // stake back out and (by default) halts the cycle until restart()".
+    const plan = this.config.stakePlan
+    if (plan && (position.status === 'won' || position.status === 'lost')) {
+      const base = plan.base
+      const working = this.rt.pot >= 0.01 ? this.rt.pot : base
+      const amount = position.amount ?? base
+      if (position.status === 'won') {
+        const rollPct = plan.rollPct ?? 100
+        const cap = (plan.payoutCap ?? 70) / 100
+        const fold = Math.min(pnl, amount * cap) * (rollPct / 100)
+        this.rt.pot = Math.round((working + fold) * 100) / 100
+        this.rt.rollN += 1
+      } else {
+        this.rt.pot = Math.round(Math.max(0, working - amount) * 100) / 100
+        this.rt.rollN = 0
+        if (plan.stopOnLoss !== false) this.rt.halted = true
+      }
+      this.persist()
+    }
+  }
+
+  /** Clears a halted compounding cycle and re-seeds the pot at base - same
+   * "restart to trade again" contract the auto-trader's compounding uses. */
+  restart(): { ok: boolean; error?: string } {
+    if (!this.config.stakePlan) return { ok: false, error: 'restart applies to a compounding meta-trader plan only' }
+    this.rt.pot = 0
+    this.rt.rollN = 0
+    this.rt.halted = false
+    this.persist()
+    this.ctx.log('meta-trader', `compound cycle restarted - next trade seeds $${this.config.stakePlan.base}`)
+    return { ok: true }
   }
 
   status(): { enabled: boolean; mode: OsMode; active: boolean; config: MetaTraderConfig; runtime: MetaTraderRuntime; sources: readonly MetaTraderSource[] } {
@@ -337,6 +435,20 @@ export class MetaTraderService {
     if (patch.kind !== undefined && (['binary', 'turbo', 'blitz', 'digital', 'cfd'] as const).includes(patch.kind)) this.config.kind = patch.kind
     if (patch.marketScope !== undefined && (patch.marketScope === 'all' || patch.marketScope === 'real' || patch.marketScope === 'otc'))
       this.config.marketScope = patch.marketScope
+    if (patch.cooldownSec !== undefined) this.config.cooldownSec = Math.max(0, Math.round(num(patch.cooldownSec, this.config.cooldownSec)))
+    if (patch.stakePlan !== undefined) {
+      const next = MetaTraderService.sanitizeStakePlan(patch.stakePlan)
+      const changed = JSON.stringify(this.config.stakePlan ?? null) !== JSON.stringify(next ?? null)
+      this.config.stakePlan = next
+      // switching the plan itself (not just tuning a field on the same
+      // plan) starts a fresh roll - an old pot/halt from a different
+      // config would be meaningless carried into a newly (re)enabled plan.
+      if (changed) {
+        this.rt.pot = 0
+        this.rt.rollN = 0
+        this.rt.halted = false
+      }
+    }
     this.persist()
     this.ctx.log('meta-trader', `config updated - ${this.config.enabled ? 'armed' : 'off'} · src ${this.config.signalSource} · ${this.config.tf} · stake $${this.config.stake} · maxOpen ${this.config.maxOpen}`)
     return this.config
@@ -348,7 +460,10 @@ export class MetaTraderService {
     const open = this.market.listAssets().filter((a) => a.open && (this.config.marketScope === 'all' || (this.config.marketScope === 'otc') === Boolean(a.otc)))
     const tickers = open.map((a) => a.ticker)
     const ordered = [...LIQUID_CANDIDATES.filter((a) => tickers.includes(a)), ...tickers.filter((a) => !LIQUID_CANDIDATES.includes(a))]
-    return ordered.slice(0, MAX_TICK_CANDIDATES).filter((a) => !this.hasOpenOn(a))
+    return ordered
+      .slice(0, MAX_TICK_CANDIDATES)
+      .filter((a) => !this.hasOpenOn(a))
+      .filter((a) => (this.assetCooldownUntil.get(a) ?? 0) <= this.now())
   }
 
   private assetInfo(ticker: string) {
@@ -376,6 +491,10 @@ export class MetaTraderService {
       /* no mode plugin - treat as human (safe default), nothing trades */
     }
     if (mode !== 'auto') return
+    if (this.config.stakePlan && this.rt.halted) {
+      this.rt.lastRejection = 'compound cycle halted on a loss - restart to trade again'
+      return
+    }
     if (this.rt.openCount >= this.config.maxOpen) {
       this.rt.lastRejection = `max open meta-trader positions (${this.rt.openCount}/${this.config.maxOpen})`
       return
@@ -538,6 +657,19 @@ export class MetaTraderService {
 
   // ---------- placement ----------
 
+  /** Stake-plan-aware sizing: mirrors the auto-trader's pot-based compounding -
+   * fold the running pot (or seed with `base` if the pot hasn't started yet)
+   * by rollPct, clamp to the configured payout cap's implied stake, round to
+   * cents. Falls back to the flat configured stake with no plan. */
+  private stakeForMeta(): number {
+    const plan = this.config.stakePlan
+    if (!plan) return this.config.stake
+    const working = this.rt.pot >= 0.01 ? this.rt.pot : plan.base
+    const rollPct = plan.rollPct ?? 100
+    const raw = (working * rollPct) / 100
+    return Math.max(1, Math.round(raw * 100) / 100)
+  }
+
   private async place(row: MetaTraderRow): Promise<{ ok: boolean; error?: string }> {
     try {
       const exec = this.ctx.use<{
@@ -554,17 +686,21 @@ export class MetaTraderService {
           note: string
         }): Promise<{ ok: boolean; error?: string }>
       }>('execution')
-      return await exec.placeOrder({
+      const out = await exec.placeOrder({
         asset: row.asset,
         tf: this.config.tf,
         side: row.direction,
         kind: this.config.kind,
-        amount: this.config.stake,
+        amount: this.stakeForMeta(),
         expiryBars: 1,
         mode: exec.accountSource === 'iq' ? 'live' : 'paper',
         strategy: `meta:${this.config.signalSource}${this.config.signalSource === 'meta-strategy' && this.config.metaStrategyId ? `:${this.config.metaStrategyId}` : ''}`,
         note: META_TRADER_NOTE,
       })
+      if (out.ok && this.config.cooldownSec > 0) {
+        this.assetCooldownUntil.set(row.asset, this.now() + this.config.cooldownSec)
+      }
+      return out
     } catch {
       return { ok: false, error: 'execution service unavailable' }
     }

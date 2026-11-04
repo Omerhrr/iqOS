@@ -19,7 +19,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import type { AssetRow, AutoTraderConfig, BotConfig, BotRow, MetaStrategySpec, MetaTraderConfig, MetaTraderSource, MetaTraderStatus, OsModeStatus, OtcConfig, OtcPolicy, StrategyInfo, Timeframe, TradeKind, ValidationRow } from '@/lib/os/client'
+import type { AssetRow, AutoTraderConfig, BotConfig, BotRow, MetaStakePlan, MetaStrategySpec, MetaTraderConfig, MetaTraderSource, MetaTraderStatus, OsModeStatus, OtcConfig, OtcPolicy, StrategyInfo, Timeframe, TradeKind, ValidationRow } from '@/lib/os/client'
 import { BLITZ_EXPIRY_SECONDS, KIND_LABEL, TIMEFRAMES, fmtMoney, fmtTime, getMetaStrategies, getOtcConfig, osGet, osPost, setOtcConfig } from '@/lib/os/client'
 
 const GATE_MAX_AGE_SEC = 14 * 24 * 60 * 60
@@ -312,7 +312,18 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, m
           frictions" (plugins/metatrader.ts) - a separate, faster executor
           alongside the auto-trader above, gated by the same mode switch */}
       {metaTraderStatus && (
-        <MetaTraderStrip mt={metaTraderStatus} onConfigure={() => setMtOpen(true)} />
+        <MetaTraderStrip
+          mt={metaTraderStatus}
+          onConfigure={() => setMtOpen(true)}
+          onRestart={async () => {
+            try {
+              await osPost('/meta_trader_restart', {})
+              refreshMetaTrader()
+            } catch (err) {
+              onError((err as Error).message)
+            }
+          }}
+        />
       )}
 
       {/* meta trader config editor (remounts on open so the draft mirrors the kernel) */}
@@ -2654,9 +2665,18 @@ const DEFAULT_META_TRADER_UI: MetaTraderConfig = {
   maxOpen: 3,
   kind: 'binary',
   marketScope: 'all',
+  cooldownSec: 0,
 }
 
-function MetaTraderStrip({ mt, onConfigure }: { mt: MetaTraderStatus; onConfigure: () => void }) {
+function MetaTraderStrip({
+  mt,
+  onConfigure,
+  onRestart,
+}: {
+  mt: MetaTraderStatus
+  onConfigure: () => void
+  onRestart: () => void
+}) {
   const state =
     mt.mode === 'auto' && mt.config.enabled
       ? { label: 'ARMED · trading', cls: 'border-teal-500/50 bg-teal-500/10 text-teal-300', dot: 'animate-pulse bg-teal-400' }
@@ -2703,6 +2723,18 @@ function MetaTraderStrip({ mt, onConfigure }: { mt: MetaTraderStatus; onConfigur
           {mt.runtime.lastRejection && <span className="text-amber-500/70"> · standing down: {mt.runtime.lastRejection}</span>}
         </p>
       )}
+      {mt.config.stakePlan && mt.runtime.halted && (
+        <div className="mt-1 flex items-center justify-between rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1">
+          <span className="text-[9px] text-amber-300">compound cycle halted on a loss - standing down until restarted</span>
+          <Button
+            size="sm"
+            onClick={onRestart}
+            className="h-5 rounded bg-amber-600/80 px-2 text-[9px] font-bold uppercase tracking-wider text-white hover:bg-amber-500"
+          >
+            Restart cycle
+          </Button>
+        </div>
+      )}
     </div>
   )
 }
@@ -2723,6 +2755,9 @@ function MetaTraderDialog({
   const [d, setD] = useState<MetaTraderConfig>(config)
   const [busy, setBusy] = useState(false)
   const p = (patch: Partial<MetaTraderConfig>) => setD((prev) => ({ ...prev, ...patch }))
+  /** Merge-compound-plan helper, same convention as the auto-trader dialog's own. */
+  const planPatch = (over: Partial<MetaStakePlan>): MetaStakePlan =>
+    d.stakePlan?.kind === 'compound' ? { ...d.stakePlan, ...over } : { kind: 'compound', base: Math.max(1, d.stake), rollPct: 100, payoutCap: 70, stopOnLoss: true, ...over }
   // Same "load on mount, picker just shows empty if it fails" convention the
   // auto-trader dialog's own meta-strategy picker uses.
   const [metaStrategies, setMetaStrategies] = useState<MetaStrategySpec[]>([])
@@ -2821,7 +2856,12 @@ function MetaTraderDialog({
 
           <NumField label="Min confidence %" value={d.minConfidence} onChange={(v) => p({ minConfidence: Math.min(100, Math.max(0, v)) })} />
           <NumField label="Max open" value={d.maxOpen} onChange={(v) => p({ maxOpen: Math.max(1, Math.round(v)) })} />
-          <NumField label="Stake $" value={d.stake} onChange={(v) => p({ stake: v })} />
+          {d.stakePlan?.kind === 'compound' ? (
+            <NumField label="Seed stake $ (ignored)" value={d.stakePlan.base} onChange={() => {}} />
+          ) : (
+            <NumField label="Stake $" value={d.stake} onChange={(v) => p({ stake: v })} />
+          )}
+          <NumField label="Cooldown (s)" value={d.cooldownSec} onChange={(v) => p({ cooldownSec: Math.max(0, Math.round(v)) })} />
           <div>
             <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Timeframe</Label>
             <select
@@ -2861,6 +2901,44 @@ function MetaTraderDialog({
             value={d.marketScope}
             onChange={(v) => p({ marketScope: v as MetaTraderConfig['marketScope'] })}
           />
+
+          <Segmented
+            label="Stake plan"
+            options={[
+              { v: 'fixed', label: 'Fixed' },
+              { v: 'compound', label: 'Compound' },
+            ]}
+            value={d.stakePlan?.kind === 'compound' ? 'compound' : 'fixed'}
+            onChange={(v) => p({ stakePlan: v === 'compound' ? planPatch({}) : undefined })}
+          />
+          {d.stakePlan?.kind === 'compound' && (
+            <>
+              <NumField label="Base $" value={d.stakePlan.base} onChange={(v) => p({ stakePlan: planPatch({ base: Math.max(1, v) }) })} />
+              <NumField
+                label="Roll %"
+                value={d.stakePlan.rollPct ?? 100}
+                onChange={(v) => p({ stakePlan: planPatch({ rollPct: Math.min(100, Math.max(1, v)) }) })}
+              />
+              <NumField
+                label="Payout cap %"
+                value={d.stakePlan.payoutCap ?? 70}
+                onChange={(v) => p({ stakePlan: planPatch({ payoutCap: Math.min(70, Math.max(1, v)) }) })}
+              />
+              <Segmented
+                label="On a loss"
+                options={[
+                  { v: 'end', label: 'Stop' },
+                  { v: 'roll', label: 'Keep rolling' },
+                ]}
+                value={d.stakePlan.stopOnLoss === false ? 'roll' : 'end'}
+                onChange={(v) => p({ stakePlan: planPatch({ stopOnLoss: v !== 'roll' }) })}
+              />
+              <p className="col-span-2 text-[8px] leading-relaxed text-[#3d4c66]">
+                a win folds its payout (capped at {d.stakePlan.payoutCap ?? 70}% of stake) into the running pot by{' '}
+                {d.stakePlan.rollPct ?? 100}%; {d.stakePlan.stopOnLoss === false ? 're-seeds and keeps rolling' : 'halts the cycle'} on a loss.
+              </p>
+            </>
+          )}
         </div>
 
         <DialogFooter className="mt-1 gap-2">
