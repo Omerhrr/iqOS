@@ -31,6 +31,7 @@ import { cointegrationScanPlugin, CointegrationScanService } from './src/plugins
 import { volArbScanPlugin, VolArbScanService } from './src/plugins/volarbscan'
 import { smcScanPlugin, SmcScanService } from './src/plugins/smcscan'
 import { metaStrategyPlugin, MetaStrategyService } from './src/plugins/metastrategy'
+import { metaTraderPlugin, MetaTraderService } from './src/plugins/metatrader'
 import { META_CONDITION_SOURCES } from './src/analytics/metastrategy'
 import { yesterdayPlugin, YesterdayService } from './src/plugins/yesterday'
 import { nextCandlePlugin, NextCandleService } from './src/plugins/nextcandle'
@@ -201,6 +202,7 @@ kernel.register(nextCandlePlugin)
 kernel.register(tempoPlugin)
 kernel.register(adxHonestyPlugin)
 kernel.register(accutePlugin)
+kernel.register(metaTraderPlugin)
 
 // ---------- Full-universe scanners for Distill / Cointegration / Vol Arb ----------
 // These three started as single-asset-only panels (read whatever's on the
@@ -868,6 +870,20 @@ const httpServer = createServer(async (req, res) => {
       if (path === '/mode') {
         const mode = kernel.context().use<ModeService>('mode')
         return json(200, { ok: true, ...mode.status() })
+      }
+
+      // GET /meta_trader_status -> Meta Trader's own status, same shape
+      // family as /mode's auto-trader block (config + runtime + which
+      // signal sources exist) - "like the auto-trader, but without its
+      // frictions" (see plugins/metatrader.ts's own header for what that
+      // means and what it never skips).
+      if (path === '/meta_trader_status') {
+        try {
+          const metaTrader = kernel.context().use<MetaTraderService>('metaTrader')
+          return json(200, { ok: true, ...metaTrader.status() })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
       }
 
       if (path === '/assets') {
@@ -3873,6 +3889,18 @@ const httpServer = createServer(async (req, res) => {
       if (path === '/autotrader_config') {
         const mode = kernel.context().use<ModeService>('mode')
         return json(200, mode.configure(body as Record<string, never>))
+      }
+
+      // POST /meta_trader_config -> patch Meta Trader's own config (same
+      // patch-whatever-fields-are-present contract as /autotrader_config).
+      if (path === '/meta_trader_config') {
+        try {
+          const metaTrader = kernel.context().use<MetaTraderService>('metaTrader')
+          const cfg = metaTrader.configure(body as Record<string, never>)
+          return json(200, { ok: true, config: cfg })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
       }
 
       if (path === '/autotrader_restart') {

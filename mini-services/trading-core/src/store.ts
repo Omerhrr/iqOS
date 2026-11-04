@@ -111,6 +111,10 @@ export class Store {
         id INTEGER PRIMARY KEY CHECK (id = 1),
         config TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS meta_trader_config (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        config TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS watchdog_state (
         bot_id TEXT PRIMARY KEY,
         state TEXT NOT NULL,
@@ -1080,6 +1084,27 @@ export class Store {
       'INSERT INTO os_mode (id, mode, reason, ts, config) VALUES (1, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET mode = excluded.mode, reason = excluded.reason, ts = excluded.ts, config = excluded.config',
       [mode, reason, ts, config === null ? null : JSON.stringify(config)]
     )
+  }
+
+  // ---------- meta trader (plugins/metatrader.ts) ----------
+  // Same single-row JSON-blob shape as watchdog_config below - meta trader's
+  // config is persisted/restored exactly like the auto-trader's, just under
+  // its own table so the two never collide.
+
+  getMetaTraderConfig(): unknown | null {
+    const row = this.db.query('SELECT config FROM meta_trader_config WHERE id = 1').get() as { config: string } | null
+    if (!row) return null
+    try {
+      return JSON.parse(row.config)
+    } catch {
+      return null
+    }
+  }
+
+  saveMetaTraderConfig(config: unknown): void {
+    this.db.run('INSERT INTO meta_trader_config (id, config) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET config = excluded.config', [
+      JSON.stringify(config),
+    ])
   }
 
   // ---------- watchdog (strategy health) ----------
