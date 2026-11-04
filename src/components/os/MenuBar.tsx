@@ -55,6 +55,12 @@ interface Props {
    * S&D/S&R/breakout/CRT/Power of 3/Silver Bullet/KRM), same
    * PatternDetail shape/treatment as every other read on this strip. */
   smcDetail?: PatternDetail | null
+  /** What specifically hit on the CURRENT (still-forming) candle - the
+   * kind(s) and direction of any SMC signal whose barsAgo is 0, e.g. "FVG▲,
+   * BOS▼" - separate from smcDetail above, which is the panel's overall
+   * net lean across every active signal, not just this candle's. null
+   * when nothing has hit on this candle yet. */
+  smcNowDetail?: PatternDetail | null
 }
 
 function detailColor(d: PatternDetail): string {
@@ -239,9 +245,10 @@ export default function MenuBar(props: Props) {
         {props.deltaDetail && <DetailLine d={props.deltaDetail} grow={false} />}
       </div>
     )}
-    {props.smcDetail && (
+    {(props.smcDetail || props.smcNowDetail) && (
       <div className="flex items-center gap-4 border-t border-[#131c2b] px-3 py-1">
-        <DetailLine d={props.smcDetail} grow={false} />
+        {props.smcDetail && <DetailLine d={props.smcDetail} grow={false} />}
+        {props.smcNowDetail && <DetailLine d={props.smcNowDetail} />}
       </div>
     )}
     </div>

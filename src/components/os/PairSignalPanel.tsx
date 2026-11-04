@@ -111,6 +111,45 @@ function smcDetail(smc: SmcScanResponse['result'] | null | undefined): PatternDe
   }
 }
 
+/** Short label for a SMC signal kind, for the compact "this candle" strip
+ * below - the SMC tab's own KIND_LABEL is the full spelled-out name, too
+ * long to pack several of these onto one line. */
+const SMC_KIND_SHORT: Record<string, string> = {
+  FVG: 'FVG',
+  IFVG: 'IFVG',
+  ORDER_BLOCK: 'OB',
+  BREAKER_BLOCK: 'Breaker',
+  LIQUIDITY_SWEEP: 'Sweep',
+  BOS: 'BOS',
+  CHOCH: 'CHoCH',
+  OTE: 'OTE',
+  KRM: 'KRM',
+  SUPPLY_DEMAND: 'S&D',
+  SUPPORT_RESISTANCE: 'S&R',
+  BREAKOUT: 'Breakout',
+  CRT: 'CRT',
+  POWER_OF_3: 'Po3',
+  SILVER_BULLET: 'SB',
+}
+
+/** What specifically hit on the CURRENT (still-forming) candle - every SMC
+ * signal whose barsAgo is 0, kind + direction, e.g. "FVG▲, BOS▼". Separate
+ * from smcDetail above (the panel's overall net lean across EVERY active
+ * signal regardless of age) - this is only what triggered THIS bar, which
+ * is what "what just hit" actually means. null when nothing has hit yet on
+ * this candle. */
+function smcNowDetail(smc: SmcScanResponse['result'] | null | undefined): PatternDetail | null {
+  if (!smc) return null
+  const now = smc.signals.filter((s) => s.barsAgo === 0)
+  if (!now.length) return null
+  const bullish = now.filter((s) => s.direction === 'bullish').length
+  const bearish = now.filter((s) => s.direction === 'bearish').length
+  const direction: 'bullish' | 'bearish' | 'neutral' = bullish > bearish ? 'bullish' : bearish > bullish ? 'bearish' : 'neutral'
+  const reliability: 1 | 2 | 3 = now.length >= 3 ? 3 : now.length === 2 ? 2 : 1
+  const parts = now.map((s) => `${SMC_KIND_SHORT[s.kind] ?? s.kind}${s.direction === 'bullish' ? '▲' : '▼'}`)
+  return { text: `this candle: ${parts.join(', ')}`, direction, reliability }
+}
+
 export default function PairSignalPanel({
   onClose,
   tf,
@@ -137,6 +176,7 @@ export default function PairSignalPanel({
     adx: PatternDetail | null
     delta: PatternDetail | null
     smc: PatternDetail | null
+    smcNow: PatternDetail | null
   }) => void
 }) {
   const controlled = controlledAsset !== undefined
@@ -173,6 +213,7 @@ export default function PairSignalPanel({
               adx: adxDiDetail(d.side.fit),
               delta: deltaDetail(d.side.delta),
               smc: null,
+              smcNow: null,
             })
             if (onDetail) {
               Promise.all([getTpoProfile(asset, tf, { limit: 400 }), getKalmanOuZ(asset, tf), getSmcScan(asset, tf)])
@@ -185,6 +226,7 @@ export default function PairSignalPanel({
                     adx: adxDiDetail(d.side.fit),
                     delta: deltaDetail(d.side.delta),
                     smc: smcDetail(smc.result),
+                    smcNow: smcNowDetail(smc.result),
                   })
                 })
                 .catch(() => {})
