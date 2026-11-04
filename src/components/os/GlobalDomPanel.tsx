@@ -1,14 +1,18 @@
 'use client'
 
 // IQAIR//OS - Global Dom panel
-// The Momentum Score's "full domination" read (analytics/momentumscore.ts -
-// every one of the 15m/5m/1m/30s timeframes agreeing AND individually
-// clearing the domination threshold) lifted from one chart to the whole
-// universe: a confirmation-hunting board, not a ranking board. Most polls
-// this comes back thin or empty - that's the point. When a row DOES show
-// up here, the next move is to cross-check it against the full Next-Candle
-// Oracle and Accute reads for that same pair before trading it manually,
-// which is exactly what this panel's two cross-nav buttons are for.
+// "Who fully has control right now" (analytics/orderflow.ts
+// computeControlRead) lifted from one chart to the whole universe: a
+// confirmation-hunting board, not a ranking board. This is deliberately
+// NOT a direction prediction (that was the original Momentum-Score-based
+// "every timeframe agrees on candle color" read, replaced per direct
+// instruction) - it's a read of actual buy/sell transaction pressure:
+// "full control" means one side held EVERY bar of a short recent window,
+// not just won the net average. Most polls this comes back thin or empty -
+// that's the point. When a row DOES show up here, the next move is to
+// cross-check it against the full Next-Candle Oracle and Accute reads for
+// that same pair before trading it manually, which is exactly what this
+// panel's two cross-nav buttons are for.
 //
 // Backed by /dom_global (plugins/nextcandle.ts domGlobalScan) - it reuses
 // the SAME TTL-cached rows Next Global/Accute/Tempo already keep warm
@@ -37,19 +41,19 @@ const POLL_MS = 12_000
 const TFS: Timeframe[] = ['1m', '5m']
 const LIMIT = 80
 
-type DirFilter = 'all' | 'call' | 'put'
+type DirFilter = 'all' | 'buy' | 'sell'
 
-function dirChip(direction: string) {
-  const call = direction === 'call'
+function controlChip(direction: string) {
+  const buy = direction === 'buy'
   const none = direction === 'none' || !direction
   const cls = none
     ? 'border-[#3d4d66] text-[#7c8aa5]'
-    : call
+    : buy
       ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
       : 'border-rose-500/40 bg-rose-500/10 text-rose-300'
   return (
     <span className={`inline-flex items-center gap-0.5 rounded border px-1.5 py-px font-mono text-[8.5px] font-bold uppercase tracking-wider ${cls}`}>
-      {none ? '—' : call ? '▲ call' : '▼ put'}
+      {none ? '—' : buy ? '▲ buyers' : '▼ sellers'}
     </span>
   )
 }
@@ -98,12 +102,12 @@ export default function GlobalDomPanel({ tf, closedTick, onPickAsset, onOpenOrac
   }, [load, closedTick, tfSel])
 
   const shown = useMemo(() => {
-    const live = rows.filter((r) => dirFilter === 'all' || r.momentumDirection === dirFilter)
-    return [...live].sort((a, b) => Math.abs(b.momentumScore ?? 0) - Math.abs(a.momentumScore ?? 0))
+    const live = rows.filter((r) => dirFilter === 'all' || r.controlDirection === dirFilter)
+    return [...live].sort((a, b) => (b.controlDominance ?? 0) - (a.controlDominance ?? 0))
   }, [rows, dirFilter])
 
-  const calls = rows.filter((r) => r.momentumDirection === 'call').length
-  const puts = rows.filter((r) => r.momentumDirection === 'put').length
+  const buys = rows.filter((r) => r.controlDirection === 'buy').length
+  const sells = rows.filter((r) => r.controlDirection === 'sell').length
   const best = shown[0]
 
   return (
@@ -143,9 +147,9 @@ export default function GlobalDomPanel({ tf, closedTick, onPickAsset, onOpenOrac
       {best ? (
         <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 p-2 shadow-[0_0_10px_-4px_rgba(245,158,11,0.6)]">
           <div className="flex items-center justify-between font-mono text-[9px] uppercase tracking-wider text-amber-300/80">
-            <span>⚡ strongest domination</span>
+            <span>⚡ strongest control</span>
             <span className="normal-case text-[#7c8aa5]">
-              {calls}▲ / {puts}▼{meta && <span className="text-[#3d4d66]"> · scanned {ageLabel(meta.scannedTs)} ago</span>}
+              {buys}▲ / {sells}▼{meta && <span className="text-[#3d4d66]"> · scanned {ageLabel(meta.scannedTs)} ago</span>}
             </span>
           </div>
           <div className="mt-1.5 flex items-center gap-2">
@@ -157,9 +161,9 @@ export default function GlobalDomPanel({ tf, closedTick, onPickAsset, onOpenOrac
             >
               {best.asset}
             </button>
-            {dirChip(best.momentumDirection ?? 'none')}
+            {controlChip(best.controlDirection ?? 'none')}
             <span className="rounded border border-[#1c2739] px-1.5 py-px font-mono text-[8.5px] uppercase text-[#7c8aa5]">
-              score {(best.momentumScore ?? 0) >= 0 ? '+' : ''}{best.momentumScore}
+              weakest bar {best.controlDominance ?? 0}%
             </span>
             {onOpenOracle && (
               <button
@@ -182,18 +186,18 @@ export default function GlobalDomPanel({ tf, closedTick, onPickAsset, onOpenOrac
               </button>
             )}
           </div>
-          <p className="mt-1 font-mono text-[8px] text-[#3d4d66]">{best.momentumExpectedCandleType}</p>
+          <p className="mt-1 font-mono text-[8px] text-[#3d4d66]">{best.controlNote}</p>
         </div>
       ) : (
         !err && (
           <div className="rounded border border-[#1c2739] bg-[#0b111c] p-2 font-mono text-[9px] text-[#4b5a72]">
-            no domination right now - that's normal, this board is meant to stay quiet. give it a poll or two; it fires only when every timeframe (15m/5m/1m/30s) is one-sided at once.
+            no full control right now - that's normal, this board is meant to stay quiet. give it a poll or two; it fires only when one side (buyers or sellers) has held every bar of the last few candles, not just won on average.
           </div>
         )
       )}
 
       <div className="flex items-center gap-1">
-        {(['all', 'call', 'put'] as DirFilter[]).map((d) => (
+        {(['all', 'buy', 'sell'] as DirFilter[]).map((d) => (
           <button
             key={d}
             type="button"
@@ -214,12 +218,12 @@ export default function GlobalDomPanel({ tf, closedTick, onPickAsset, onOpenOrac
             onClick={() => onPickAsset?.(r.asset)}
             onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') onPickAsset?.(r.asset) }}
             className="group flex items-center gap-2 rounded border border-amber-500/20 bg-[#0b111c] px-2 py-1 text-left hover:border-amber-500/40"
-            title={`${r.asset} ${r.tf} · ${r.momentumExpectedCandleType ?? ''} · click to open on the chart`}
+            title={`${r.asset} ${r.tf} · ${r.controlNote ?? ''} · click to open on the chart`}
           >
             <span className="w-24 shrink-0 truncate font-mono text-[10px] font-bold text-[#dbe4f0] group-hover:text-amber-300">{r.asset}</span>
-            {dirChip(r.momentumDirection ?? 'none')}
+            {controlChip(r.controlDirection ?? 'none')}
             <span className="shrink-0 font-mono text-[9px] text-[#aab6cc]">
-              score {(r.momentumScore ?? 0) >= 0 ? '+' : ''}{r.momentumScore}
+              weakest bar {r.controlDominance ?? 0}%
             </span>
             {onOpenOracle && (
               <button

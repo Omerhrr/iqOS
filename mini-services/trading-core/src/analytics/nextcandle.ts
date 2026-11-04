@@ -82,6 +82,7 @@ import type { AnalysisResult } from '../types'
 import { classifyRegime } from './regime'
 import type { HmaRocBullBearPrediction } from './hmarocbullbear'
 import type { MomentumScorePrediction } from './momentumscore'
+import type { ControlRead } from './orderflow'
 import { scanSmc, smcSummaryScore } from './smc'
 
 export const ORACLE_MIN_CANDLES = 320 // markov(lookback 300) + warmup for the rest
@@ -168,6 +169,15 @@ export interface NextCandlePrediction {
    * machinery, not tracked by the honesty loop - null until all four
    * timeframes have enough history. */
   momentumPrediction?: MomentumScorePrediction | null
+  /** "who fully has control right now" - buy/sell transaction-pressure
+   * dominance (analytics/orderflow.ts computeControlRead), NOT a direction
+   * prediction. Computed and attached by the plugin from this same tf's
+   * own candles, replacing momentumPrediction.domination as the thing
+   * "full domination" surfaces (the chip on this panel, Global Dom) show -
+   * per direct instruction, those should reflect who's actually
+   * transacting right now, not a forecast of the next candle's color.
+   * null until there's enough history for the window. */
+  controlRead?: ControlRead | null
 }
 
 function clamp(v: number, lo: number, hi: number): number {

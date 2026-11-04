@@ -22,6 +22,7 @@ import type { Candle, Timeframe } from '../types'
 import { pairKey, predictNextCandle, setOracleCalibrationProvider, type NextCandlePrediction, type OracleRegime } from '../analytics/nextcandle'
 import { predictHmaRocBullBear } from '../analytics/hmarocbullbear'
 import { predictMomentumScore } from '../analytics/momentumscore'
+import { computeControlRead } from '../analytics/orderflow'
 import { setPatternReliabilityProvider } from '../analytics/patterns'
 import { weightedHitRate, weightedMean, weightedMeanBy } from '../analytics/recencystats'
 import { classifySession, type Session } from '../analytics/session'
@@ -220,6 +221,17 @@ export interface GlobalScanRow {
   momentumScore: number | null
   momentumDomination: boolean
   momentumExpectedCandleType: string | null
+  /** "who fully has control right now" (analytics/orderflow.ts
+   * computeControlRead) - buy/sell transaction-pressure dominance over
+   * this row's own tf, passthrough of predict()'s pred.controlRead. This,
+   * not momentumDomination, is what Global Dom (domGlobalScan() below)
+   * filters/sorts on - per direct instruction, "full domination" means
+   * who's actually transacting, not a prediction of the next candle's
+   * color. null when there isn't enough history for the window yet. */
+  controlDirection: 'buy' | 'sell' | 'none' | null
+  controlDominance: number | null
+  controlFullControl: boolean
+  controlNote: string | null
 }
 
 export interface GlobalScanResult {
@@ -235,8 +247,13 @@ export interface GlobalScanResult {
 }
 
 /** Result of domGlobalScan() - "Global Dom": the whole universe filtered
- * down to rows whose Momentum Score read is in full domination right now.
- * `rows` carries the SAME GlobalScanRow shape as GlobalScanResult (just the
+ * down to rows where one side (buyers or sellers) has FULL control right
+ * now - every bar of a short recent window one-sided, not just the net
+ * average (analytics/orderflow.ts computeControlRead). Per direct
+ * instruction, this is deliberately NOT a direction prediction (that's
+ * what momentumDomination/candle-color was, and why it got replaced here) -
+ * it's a read of who's actually transacting. `rows` carries the SAME
+ * GlobalScanRow shape as GlobalScanResult (just the
  * dominating subset, already sorted), so the panel can reuse every field
  * (price, oracle direction/confidence, expectedCandleType, etc.) the Next
  * Global board already knows how to render. */
@@ -337,6 +354,17 @@ export class NextCandleService {
       })
     } catch {
       pred.momentumPrediction = null
+    }
+    // "who fully has control right now" - buy/sell transaction-pressure
+    // dominance over this SAME tf's own candles (already fetched above as
+    // `candles`, no extra fetch needed) - replaces momentumPrediction's
+    // domination as what the panel's "full domination" chip and Global Dom
+    // actually surface (see analytics/orderflow.ts's own doc comment for
+    // why this measures actual buy/sell pressure, not a direction forecast).
+    try {
+      pred.controlRead = computeControlRead(candles)
+    } catch {
+      pred.controlRead = null
     }
     const key = `${asset}:${tf}:${pred.targetBarTime}`
     // dedupe: replace the pending entry for the same target bar - a re-poll
@@ -1263,6 +1291,10 @@ export class NextCandleService {
         momentumScore: pred.momentumPrediction?.score ?? null,
         momentumDomination: pred.momentumPrediction?.domination ?? false,
         momentumExpectedCandleType: pred.momentumPrediction?.expectedCandleType ?? null,
+        controlDirection: pred.controlRead?.direction ?? null,
+        controlDominance: pred.controlRead?.dominance ?? null,
+        controlFullControl: pred.controlRead?.fullControl ?? false,
+        controlNote: pred.controlRead?.note ?? null,
       }
     } else {
       // thin/no history yet (lazy-seeded feed) - keep the timestamp at the
@@ -1291,6 +1323,10 @@ export class NextCandleService {
         momentumScore: null,
         momentumDomination: false,
         momentumExpectedCandleType: null,
+        controlDirection: null,
+        controlDominance: null,
+        controlFullControl: false,
+        controlNote: null,
       }
     }
     this.scanRows.set(key, row)
@@ -1349,15 +1385,19 @@ export class NextCandleService {
     }
   }
 
-  // ---------- Global Dom: whole-universe "full domination" board ----------
+  // ---------- Global Dom: whole-universe "full control" board ----------
   // Same scan as globalScan() above (same scanRowFor() cache, same TTL, so
   // polling this board doesn't cost a second fusion per pair - it just
   // rereads rows the per-asset panels/Next Global/Accute are already
-  // keeping warm), filtered down to the rare case the user asked for: every
-  // one of the Momentum Score's four timeframes agreeing AND individually
-  // clearing the domination threshold (see analytics/momentumscore.ts). The
-  // whole point of this board is that it should usually come back thin or
-  // empty - that's what makes a hit worth checking Accute/Oracle over.
+  // keeping warm), filtered down to the rare case the user asked for: one
+  // side (buyers or sellers) has held FULL control of the pair's own tf for
+  // a short recent window - every bar one-sided, not just the net average
+  // (see analytics/orderflow.ts computeControlRead). This replaced the
+  // original Momentum-Score-based "every timeframe agrees on direction"
+  // read per direct instruction - that was a candle-color forecast, this is
+  // a read of who's actually transacting. The whole point of this board is
+  // that it should usually come back thin or empty - that's what makes a
+  // hit worth checking Accute/Oracle over.
   domGlobalScan(tf: Timeframe, opts: { limit?: number; category?: string; refresh?: boolean } = {}): DomGlobalResult {
     const limit = Math.max(1, Math.min(Math.round(opts.limit ?? 60), 200))
     const category = opts.category && opts.category !== 'all' ? opts.category : null
@@ -1376,10 +1416,10 @@ export class NextCandleService {
       rows.push(row)
     }
 
-    const dominating = rows.filter((r) => r.ok && r.momentumDomination)
-    // strongest lean first - |momentumScore| close to 1 means every
-    // timeframe closed nearer its own extreme, not just over the threshold
-    dominating.sort((x, y) => Math.abs(y.momentumScore ?? 0) - Math.abs(x.momentumScore ?? 0))
+    const dominating = rows.filter((r) => r.ok && r.controlFullControl)
+    // strongest control first - dominance is the WEAKEST bar's share in
+    // the window, so a higher number here means even that bar was lopsided
+    dominating.sort((x, y) => (y.controlDominance ?? 0) - (x.controlDominance ?? 0))
 
     return {
       tf,

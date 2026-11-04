@@ -75,6 +75,63 @@ export function computeCumulativeDelta(deltas: Array<Pick<CandleDelta, 'time' | 
   })
 }
 
+/** "Who has FULL control right now" - per direct instruction, replacing
+ * Momentum Score's candle-color (direction-prediction) domination read
+ * with something that measures actual buy/sell transaction pressure
+ * instead of forecasting the next bar. Built on the SAME CLV buy/sell
+ * delta proxy every other order-flow surface in this codebase already
+ * uses (the module header above) - "control" here means one side's
+ * (approximated) volume has been dominant in EVERY bar of a short recent
+ * window, not just on net/average. A side that wins the net delta but lost
+ * 2 of the last 5 bars to the other side doesn't have "full" control, it's
+ * just ahead on points - this requires it to have won every single bar.
+ *
+ * `dominance` is the WEAKEST bar's share in the window (not the average) -
+ * same "every component must individually clear the bar" discipline
+ * momentumscore.ts's own DOMINATION_THRESHOLD used, just applied to buy/
+ * sell transaction share instead of multi-timeframe direction agreement. */
+export interface ControlRead {
+  direction: 'buy' | 'sell' | 'none'
+  /** 0-100 - the weakest bar's dominant-side share in the window. */
+  dominance: number
+  /** true = the SAME side held every bar in the window AND even its
+   * weakest bar still cleared the threshold. */
+  fullControl: boolean
+  barsChecked: number
+  note: string
+}
+
+const CONTROL_WINDOW = 5
+const CONTROL_THRESHOLD = 0.70 // each bar's dominant side must hold >=70% of that bar's own volume
+
+export function computeControlRead(candles: Candle[], window = CONTROL_WINDOW, threshold = CONTROL_THRESHOLD): ControlRead {
+  if (candles.length < window) {
+    return { direction: 'none', dominance: 0, fullControl: false, barsChecked: 0, note: 'not enough bars yet' }
+  }
+  const recent = candles.slice(-window)
+  const deltas = computeCandleDelta(recent)
+  const shares = deltas.map((d) => {
+    const total = d.buyVolume + d.sellVolume
+    if (!(total > 0)) return { side: 'none' as const, share: 0 }
+    const buyShare = d.buyVolume / total
+    return buyShare >= 0.5 ? { side: 'buy' as const, share: buyShare } : { side: 'sell' as const, share: 1 - buyShare }
+  })
+  const sides = new Set(shares.map((s) => s.side))
+  if (sides.size !== 1 || sides.has('none')) {
+    return { direction: 'none', dominance: 0, fullControl: false, barsChecked: window, note: `control flipped sides within the last ${window} bars - no one-sided read` }
+  }
+  const direction = shares[0]!.side as 'buy' | 'sell'
+  const weakestShare = Math.min(...shares.map((s) => s.share))
+  const fullControl = weakestShare >= threshold
+  return {
+    direction,
+    dominance: Math.round(weakestShare * 100),
+    fullControl,
+    barsChecked: window,
+    note: `${direction === 'buy' ? 'buyers' : 'sellers'} held every one of the last ${window} bars - weakest bar ${(weakestShare * 100).toFixed(0)}% (approx, CLV-proxy volume - see module header)`,
+  }
+}
+
 const DEFAULT_BUCKETS = 36
 const MIN_BUCKETS = 10
 const MAX_BUCKETS = 80

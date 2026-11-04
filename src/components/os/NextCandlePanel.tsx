@@ -564,21 +564,25 @@ export default function NextCandlePanel({ asset, tf, closedTick, onClose, onOpen
                   </div>
                 </div>
               )}
-              {pred.momentumPrediction?.domination && (
+              {pred.controlRead?.fullControl && (
                 <div
                   className={`flex flex-1 items-center gap-1.5 rounded border px-1.5 py-1 ${
-                    pred.momentumPrediction.direction === 'call'
+                    pred.controlRead.direction === 'buy'
                       ? 'border-emerald-400/70 bg-emerald-500/10 shadow-[0_0_10px_-2px_rgba(16,185,129,0.6)]'
                       : 'border-rose-400/70 bg-rose-500/10 shadow-[0_0_10px_-2px_rgba(244,63,94,0.6)]'
                   }`}
-                  title={`FULL DOMINATION - every timeframe (15m/5m/1m/30s) agrees ${pred.momentumPrediction.direction} and each individually clears the domination threshold, not just the weighted average · T15m ${pred.momentumPrediction.components.t15m >= 0 ? '+' : ''}${pred.momentumPrediction.components.t15m} · T5m ${pred.momentumPrediction.components.t5m >= 0 ? '+' : ''}${pred.momentumPrediction.components.t5m} · T1m ${pred.momentumPrediction.components.t1m >= 0 ? '+' : ''}${pred.momentumPrediction.components.t1m} · T30s ${pred.momentumPrediction.components.t30s >= 0 ? '+' : ''}${pred.momentumPrediction.components.t30s} · score ${pred.momentumPrediction.score >= 0 ? '+' : ''}${pred.momentumPrediction.score} - manual-trade confirmation signal, not fused with the oracle above and not tracked by the honesty loop`}
+                  title={`FULL CONTROL - ${pred.controlRead.note} - who's actually transacting right now (CLV-proxy buy/sell volume, approx), NOT a prediction of the next candle's color - manual-trade confirmation signal, not fused with the oracle above and not tracked by the honesty loop`}
                 >
-                  {expectedCandleGlyph(pred.momentumPrediction)}
+                  <span className={`font-mono text-[18px] leading-none ${pred.controlRead.direction === 'buy' ? 'text-emerald-300' : 'text-rose-300'}`}>
+                    {pred.controlRead.direction === 'buy' ? '▲' : '▼'}
+                  </span>
                   <div className="flex flex-col">
-                    <p className={`font-mono text-[8.5px] font-bold uppercase tracking-wider ${pred.momentumPrediction.direction === 'call' ? 'text-emerald-300' : 'text-rose-300'}`}>
-                      ⚡ full domination · {pred.momentumPrediction.direction}
+                    <p className={`font-mono text-[8.5px] font-bold uppercase tracking-wider ${pred.controlRead.direction === 'buy' ? 'text-emerald-300' : 'text-rose-300'}`}>
+                      ⚡ full control · {pred.controlRead.direction === 'buy' ? 'buyers' : 'sellers'}
                     </p>
-                    <p className="font-mono text-[7.5px] uppercase tracking-wider text-[#4b5a72]">15m/5m/1m/30s all in lockstep · untracked · score {pred.momentumPrediction.score >= 0 ? '+' : ''}{pred.momentumPrediction.score}</p>
+                    <p className="font-mono text-[7.5px] uppercase tracking-wider text-[#4b5a72]">
+                      every bar last {pred.controlRead.barsChecked} · untracked · weakest bar {pred.controlRead.dominance}%
+                    </p>
                   </div>
                 </div>
               )}

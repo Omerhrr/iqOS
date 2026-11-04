@@ -1703,6 +1703,11 @@ export interface NextCandlePrediction {
    * as altPrediction: deliberately simple, untracked, not fused with the
    * Oracle's own prediction, shown alongside it for comparison. */
   momentumPrediction?: MomentumScorePrediction | null
+  /** "who fully has control right now" - buy/sell transaction-pressure
+   * dominance (analytics/orderflow.ts computeControlRead), NOT a direction
+   * prediction. This is what the panel's "full domination" chip and
+   * Global Dom actually surface, replacing momentumPrediction.domination. */
+  controlRead?: ControlRead | null
 }
 
 /** The HMA/ROC/Bull-Bear secondary read attached to NextCandlePrediction.altPrediction
@@ -1739,8 +1744,24 @@ export interface MomentumScorePrediction {
   expectedCandleType: string
   /** true only when all four timeframes agree in direction AND each one
    * individually clears the backend's domination threshold - manual-trade
-   * confirmation signal. The panel only shows this read when true. */
+   * confirmation signal. Superseded by controlRead.fullControl as what the
+   * panel's "full domination" chip actually shows; kept as a field for
+   * anything else still reading it. */
   domination: boolean
+}
+
+/** "Who fully has control right now" (analytics/orderflow.ts
+ * computeControlRead) - buy/sell transaction-pressure dominance over a
+ * short recent window on the asset's own tf, NOT a direction prediction.
+ * `dominance` is the WEAKEST bar's dominant-side share in the window (not
+ * the average) - fullControl requires the SAME side to have held every
+ * bar AND even the weakest one to clear the threshold. */
+export interface ControlRead {
+  direction: 'buy' | 'sell' | 'none'
+  dominance: number
+  fullControl: boolean
+  barsChecked: number
+  note: string
 }
 
 /** One resolved prediction from the oracle's honesty ledger. */
@@ -1888,6 +1909,14 @@ export interface NextGlobalRow {
   momentumScore?: number | null
   momentumDomination?: boolean
   momentumExpectedCandleType?: string | null
+  /** "who fully has control right now" - buy/sell transaction-pressure
+   * dominance (analytics/orderflow.ts), NOT a direction prediction. Global
+   * Dom filters/sorts on controlFullControl/controlDominance, not the
+   * momentum fields above - see domGlobalScan()'s own doc comment. */
+  controlDirection?: 'buy' | 'sell' | 'none' | null
+  controlDominance?: number | null
+  controlFullControl?: boolean
+  controlNote?: string | null
 }
 
 export interface NextGlobalResponse {

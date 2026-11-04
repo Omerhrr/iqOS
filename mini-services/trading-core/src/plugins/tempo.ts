@@ -423,7 +423,7 @@ export class TempoService {
       oracle = null
     }
     if (!oracle) {
-      return this.rowFromScan({ asset, tf, computedTs: now, targetBarTime: 0, ok: false, note: 'next-candle oracle plugin not loaded', pUp: 0.5, direction: 'none', confidence: 0, rawConfidence: 0, regime: 'MIXED', price: 0, expectedMove: 0, atr: 0, driversActive: 0, calibration: null, renkoVote: 0, footprintVote: 0, expectedCandleType: '', momentumDirection: null, momentumScore: null, momentumDomination: false, momentumExpectedCandleType: null }, tf, tfSec, now)
+      return this.rowFromScan({ asset, tf, computedTs: now, targetBarTime: 0, ok: false, note: 'next-candle oracle plugin not loaded', pUp: 0.5, direction: 'none', confidence: 0, rawConfidence: 0, regime: 'MIXED', price: 0, expectedMove: 0, atr: 0, driversActive: 0, calibration: null, renkoVote: 0, footprintVote: 0, expectedCandleType: '', momentumDirection: null, momentumScore: null, momentumDomination: false, momentumExpectedCandleType: null, controlDirection: null, controlDominance: null, controlFullControl: false, controlNote: null }, tf, tfSec, now)
     }
     const row = oracle.rowFor(asset, tf)
     return this.rowFromScan(row, tf, tfSec, now)
