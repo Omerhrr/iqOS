@@ -2878,6 +2878,69 @@ function MetaTraderDialog({
           </div>
 
           <div>
+            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Instrument type</Label>
+            <select
+              value={d.kind ?? 'binary'}
+              onChange={(e) => p({ kind: e.target.value as TradeKind })}
+              className="h-8 w-full rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-teal-300 outline-none"
+            >
+              {(['binary', 'turbo', 'blitz', 'digital', 'cfd'] as TradeKind[]).map((k) => (
+                <option key={k} value={k} className="bg-[#0d1420]">
+                  {KIND_LABEL[k]}
+                </option>
+              ))}
+            </select>
+          </div>
+          {(d.kind ?? 'binary') === 'binary' || (d.kind ?? 'binary') === 'turbo' ? (
+            <div>
+              <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Expiry</Label>
+              <select
+                value={d.expiryTf ?? ''}
+                onChange={(e) => p({ expiryTf: e.target.value ? (e.target.value as Timeframe) : d.tf })}
+                className="h-8 w-full rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-teal-300 outline-none"
+              >
+                <option value="" className="bg-[#0d1420]">
+                  Track signal timeframe ({d.tf})
+                </option>
+                {TIMEFRAMES.map((t) => (
+                  <option key={t} value={t} className="bg-[#0d1420]">
+                    {t}
+                  </option>
+                ))}
+              </select>
+              <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+                How long each trade actually runs before it settles - separate from the signal timeframe above.
+              </p>
+            </div>
+          ) : d.kind === 'blitz' ? (
+            <div>
+              <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Expiry (seconds)</Label>
+              <div className="mt-1 grid grid-cols-3 gap-1">
+                {BLITZ_EXPIRY_SECONDS.map((s) => (
+                  <button
+                    key={s}
+                    type="button"
+                    onClick={() => p({ expirySec: s })}
+                    className={`rounded border py-1 text-[10px] font-mono transition-colors ${
+                      (d.expirySec ?? 15) === s
+                        ? 'border-teal-500/50 bg-teal-500/10 text-teal-300'
+                        : 'border-[#1c2739] bg-[#101828] text-[#7c8aa5]'
+                    }`}
+                  >
+                    {s}s
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : d.kind === 'digital' ? (
+            <NumField
+              label="Expiry (minutes)"
+              value={(d.expirySec ?? 300) / 60}
+              onChange={(v) => p({ expirySec: Math.min(1440, Math.max(1, Math.round(v))) * 60 })}
+            />
+          ) : null}
+
+          <div>
             <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Direction</Label>
             <select
               value={d.direction}

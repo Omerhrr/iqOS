@@ -3933,6 +3933,11 @@ export interface MetaTraderConfig {
   stake: number
   maxOpen: number
   kind: TradeKind
+  /** trade's own expiry as a timeframe, separate from `tf` - undefined
+   * tracks `tf` 1:1 (1 bar). Only meaningful for binary/turbo. */
+  expiryTf?: Timeframe
+  /** wall-clock expiry in seconds - only read for kind 'blitz'/'digital'. */
+  expirySec?: number
   marketScope: 'all' | 'real' | 'otc'
   /** per-asset cooldown in seconds after a placed trade - no hard floor. */
   cooldownSec: number

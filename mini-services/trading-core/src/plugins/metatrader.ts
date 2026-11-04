@@ -56,7 +56,7 @@
 import type { Plugin, KernelContext } from '../kernel'
 import type { Store } from '../store'
 import type { AssetCategory, Timeframe, TradeKind } from '../types'
-import { ALL_TIMEFRAMES } from '../types'
+import { ALL_TIMEFRAMES, TIMEFRAME_SECONDS } from '../types'
 import type { MarketDataService } from './market-data'
 import type { NextCandleService } from './nextcandle'
 import type { AccuteService } from './accute'
@@ -172,6 +172,16 @@ export interface MetaTraderConfig {
   /** max concurrently open meta-trader positions, across all assets. */
   maxOpen: number
   kind: TradeKind
+  /** The trade's own expiry, as a timeframe - SEPARATE from `tf` (the
+   * timeframe signals are read from). Undefined = track `tf` 1:1 (exactly
+   * 1 bar), same convention as the auto-trader's own expiryTf. Only
+   * meaningful for binary/turbo - blitz/digital settle on expirySec
+   * instead. Converted to whole bars-of-`tf` at placement time. */
+  expiryTf?: Timeframe
+  /** Explicit wall-clock expiry in seconds - only read for kind 'blitz'
+   * (1-60s) or 'digital' (60-86400s). Undefined = kind default (15s
+   * blitz, 300s digital), same convention as the auto-trader's own. */
+  expirySec?: number
   marketScope: 'all' | 'real' | 'otc'
   /** per-asset re-entry cooldown in seconds - 0 (default) = off. Added per
    * direct instruction; UNLIKE the auto-trader's cooldownSec, there is no
@@ -310,6 +320,8 @@ export class MetaTraderService {
         stake: clamp(num(saved.stake, DEFAULT_META_TRADER.stake), 1, 5000),
         maxOpen: clamp(Math.round(num(saved.maxOpen, DEFAULT_META_TRADER.maxOpen)), 1, 20),
         kind: (['binary', 'turbo', 'blitz', 'digital', 'cfd'] as const).includes(saved.kind as TradeKind) ? (saved.kind as TradeKind) : 'binary',
+        expiryTf: typeof saved.expiryTf === 'string' && (ALL_TIMEFRAMES as string[]).includes(saved.expiryTf) ? (saved.expiryTf as Timeframe) : undefined,
+        expirySec: typeof saved.expirySec === 'number' && Number.isFinite(saved.expirySec) ? saved.expirySec : undefined,
         marketScope: saved.marketScope === 'real' || saved.marketScope === 'otc' ? saved.marketScope : 'all',
         cooldownSec: Math.max(0, Math.round(num(saved.cooldownSec, DEFAULT_META_TRADER.cooldownSec))),
         stakePlan: MetaTraderService.sanitizeStakePlan(saved.stakePlan),
@@ -433,6 +445,18 @@ export class MetaTraderService {
     if (patch.stake !== undefined) this.config.stake = clamp(num(patch.stake, this.config.stake), 1, 5000)
     if (patch.maxOpen !== undefined) this.config.maxOpen = clamp(Math.round(num(patch.maxOpen, this.config.maxOpen)), 1, 20)
     if (patch.kind !== undefined && (['binary', 'turbo', 'blitz', 'digital', 'cfd'] as const).includes(patch.kind)) this.config.kind = patch.kind
+    // null/empty clears back to "track tf 1:1" - same convention the
+    // auto-trader's own expiryTf patch uses (a bare undefined is dropped by
+    // JSON.stringify, so null is the only way to clear it from the client).
+    if (patch.expiryTf !== undefined)
+      this.config.expiryTf = typeof patch.expiryTf === 'string' && (ALL_TIMEFRAMES as string[]).includes(patch.expiryTf) ? patch.expiryTf : undefined
+    if (patch.expirySec !== undefined) {
+      const bounds: [number, number] = this.config.kind === 'blitz' ? [1, 60] : [60, 86400]
+      this.config.expirySec =
+        patch.expirySec === null
+          ? undefined
+          : Math.round(clamp(num(patch.expirySec, this.config.expirySec ?? (this.config.kind === 'blitz' ? 15 : 300)), bounds[0], bounds[1]))
+    }
     if (patch.marketScope !== undefined && (patch.marketScope === 'all' || patch.marketScope === 'real' || patch.marketScope === 'otc'))
       this.config.marketScope = patch.marketScope
     if (patch.cooldownSec !== undefined) this.config.cooldownSec = Math.max(0, Math.round(num(patch.cooldownSec, this.config.cooldownSec)))
@@ -681,18 +705,24 @@ export class MetaTraderService {
           kind: TradeKind
           amount: number
           expiryBars: number
+          expirySec?: number
           mode: 'paper' | 'live'
           strategy: string
           note: string
         }): Promise<{ ok: boolean; error?: string }>
       }>('execution')
+      const kind = this.config.kind
       const out = await exec.placeOrder({
         asset: row.asset,
         tf: this.config.tf,
         side: row.direction,
-        kind: this.config.kind,
+        kind,
         amount: this.stakeForMeta(),
-        expiryBars: 1,
+        // expiryTf unset = track the signal tf 1:1 (exactly 1 bar), same
+        // convention as the auto-trader's own expiryTf - only meaningful
+        // for binary/turbo; blitz/digital settle on expirySec instead.
+        expiryBars: this.config.expiryTf ? Math.max(1, Math.round(TIMEFRAME_SECONDS[this.config.expiryTf] / TIMEFRAME_SECONDS[this.config.tf])) : 1,
+        expirySec: kind === 'blitz' || kind === 'digital' ? this.config.expirySec : undefined,
         mode: exec.accountSource === 'iq' ? 'live' : 'paper',
         strategy: `meta:${this.config.signalSource}${this.config.signalSource === 'meta-strategy' && this.config.metaStrategyId ? `:${this.config.metaStrategyId}` : ''}`,
         note: META_TRADER_NOTE,
