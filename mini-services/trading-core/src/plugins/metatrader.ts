@@ -279,6 +279,12 @@ export class MetaTraderService {
   /** per-asset re-entry cooldown (config.cooldownSec) - epoch seconds until
    * each asset is tradeable again. Cleared lazily (checked, not swept). */
   private assetCooldownUntil = new Map<string, number>()
+  /** Last successful placement time per asset, used ONLY to break ties
+   * between equally-confident candidates (see rankRows()) - tracked
+   * regardless of cooldownSec, since with cooldownSec at its default of 0
+   * there is nothing else stopping the same top-ranked pair being re-hit
+   * the instant its last position closes. */
+  private lastTradedAt = new Map<string, number>()
 
   async start(ctx: KernelContext): Promise<void> {
     this.ctx = ctx
@@ -561,6 +567,29 @@ export class MetaTraderService {
     return []
   }
 
+  /** Confidence-desc, ties broken by least-recently-traded. Root cause of
+   * "it keeps trading the same pair": candidatePool() always lists assets
+   * in the same fixed LIQUID_CANDIDATES order, and a plain confidence sort
+   * is STABLE - so whenever two+ assets tie on confidence (common: SMC's
+   * "now" confidence is a coarse winners/totalNow ratio or a flat 65,
+   * Accute/Oracle often round to the same whole number too), the earliest
+   * one in that fixed order wins every single time. With cooldownSec at
+   * its default of 0, nothing else stops that same pair being re-picked
+   * the instant its last position closes - so it looks like Meta Trader
+   * is stuck on one asset forever. This tie-break never overrides a real
+   * confidence edge - it only decides between genuinely equal reads, and
+   * favors whichever qualifying asset hasn't traded in the longest time
+   * (or never has), rotating fairly across ties instead of always picking
+   * the same one. */
+  private rankRows(rows: MetaTraderRow[]): MetaTraderRow[] {
+    return rows.sort((a, b) => {
+      if (b.confidence !== a.confidence) return b.confidence - a.confidence
+      const at = this.lastTradedAt.get(a.asset) ?? 0
+      const bt = this.lastTradedAt.get(b.asset) ?? 0
+      return at - bt
+    })
+  }
+
   private rowFrom(asset: string, direction: 'call' | 'put', confidence: number, price: number, note: string): MetaTraderRow | null {
     const inst = this.assetInfo(asset)
     if (!inst || !(price > 0)) return null
@@ -599,7 +628,7 @@ export class MetaTraderService {
         /* thin history for this pair - try the next */
       }
     }
-    return out.sort((a, b) => b.confidence - a.confidence)
+    return this.rankRows(out)
   }
 
   private pickOracle(): MetaTraderRow[] {
@@ -628,7 +657,7 @@ export class MetaTraderService {
         /* thin history - try the next */
       }
     }
-    return out.sort((a, b) => b.confidence - a.confidence)
+    return this.rankRows(out)
   }
 
   private pickAccute(): MetaTraderRow[] {
@@ -651,7 +680,7 @@ export class MetaTraderService {
         /* thin history - try the next */
       }
     }
-    return out.sort((a, b) => b.confidence - a.confidence)
+    return this.rankRows(out)
   }
 
   private pickSmc(onlyKind: SmcKind | undefined): MetaTraderRow[] {
@@ -676,7 +705,7 @@ export class MetaTraderService {
         /* thin history - try the next */
       }
     }
-    return out.sort((a, b) => b.confidence - a.confidence)
+    return this.rankRows(out)
   }
 
   // ---------- placement ----------
@@ -727,8 +756,11 @@ export class MetaTraderService {
         strategy: `meta:${this.config.signalSource}${this.config.signalSource === 'meta-strategy' && this.config.metaStrategyId ? `:${this.config.metaStrategyId}` : ''}`,
         note: META_TRADER_NOTE,
       })
-      if (out.ok && this.config.cooldownSec > 0) {
-        this.assetCooldownUntil.set(row.asset, this.now() + this.config.cooldownSec)
+      if (out.ok) {
+        this.lastTradedAt.set(row.asset, this.now())
+        if (this.config.cooldownSec > 0) {
+          this.assetCooldownUntil.set(row.asset, this.now() + this.config.cooldownSec)
+        }
       }
       return out
     } catch {
