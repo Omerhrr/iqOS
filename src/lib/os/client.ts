@@ -1878,6 +1878,14 @@ export interface NextGlobalRow {
   atr: number
   driversActive: number
   calibration: { n: number; hitRate: number; brier: number } | null
+  /** passthrough of this row's own Momentum Score read (see
+   * analytics/momentumscore.ts) - computed alongside the fused oracle read
+   * above in the same backend call, not a second fetch. Global Dom reuses
+   * this same row shape filtered to momentumDomination === true. */
+  momentumDirection?: 'call' | 'put' | 'none' | null
+  momentumScore?: number | null
+  momentumDomination?: boolean
+  momentumExpectedCandleType?: string | null
 }
 
 export interface NextGlobalResponse {
@@ -1898,6 +1906,29 @@ export async function getNextGlobal(
   opts?: { limit?: number; category?: string; refresh?: boolean },
 ): Promise<NextGlobalResponse> {
   return osGet('/next_global', { tf, limit: opts?.limit, category: opts?.category, refresh: opts?.refresh ? 1 : undefined })
+}
+
+/** Global Dom - the whole universe filtered to pairs whose Momentum Score
+ * is in full domination right now (plugins/nextcandle.ts's domGlobalScan(),
+ * backed by /dom_global). Shares Next Global's TTL-cached rows, so polling
+ * this costs nothing extra; rows use the same shape as NextGlobalRow. */
+export interface DomGlobalResponse {
+  ok: boolean
+  error?: string
+  tf: string
+  scannedTs: number
+  universe: number
+  scanned: number
+  dominating: number
+  refreshed: number
+  rows: NextGlobalRow[]
+}
+
+export async function getDomGlobal(
+  tf: Timeframe,
+  opts?: { limit?: number; category?: string; refresh?: boolean },
+): Promise<DomGlobalResponse> {
+  return osGet('/dom_global', { tf, limit: opts?.limit, category: opts?.category, refresh: opts?.refresh ? 1 : undefined })
 }
 
 // ---------- Tempo (analytics/tempo.ts, plugins/tempo.ts) ----------

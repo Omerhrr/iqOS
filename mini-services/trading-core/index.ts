@@ -2846,6 +2846,30 @@ const httpServer = createServer(async (req, res) => {
         }
       }
 
+      // GET /dom_global?tf=1m&limit=60&category=all&refresh=1
+      // -> Global Dom: the whole universe filtered to pairs whose Momentum
+      // Score read is in full domination right now (every one of its four
+      // timeframes agreeing AND individually clearing the threshold - see
+      // analytics/momentumscore.ts). Shares /next_global's TTL-cached rows
+      // (same scanRowFor cache, same honesty-tracked predict() underneath),
+      // so this board costs nothing extra to poll alongside Next Global/
+      // Accute/Tempo - it's a filter on rows that are already being kept
+      // warm, not a second scan.
+      if (path === '/dom_global') {
+        try {
+          const svc = kernel.context().use<NextCandleService>('nextcandle')
+          const gTf = tf(String(q.get('tf') ?? '1m') as string)
+          const out = svc.domGlobalScan(gTf, {
+            limit: Number(q.get('limit') ?? 60),
+            category: q.get('category') ?? 'all',
+            refresh: q.get('refresh') === '1',
+          })
+          return json(200, { ok: true, ...out })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
       // GET /tempo_scan?tf=1m&limit=30
       // -> the Tempo board: the patience engine lifted to the whole
       // universe. One row per open instrument: the shared 10-bar window

@@ -209,6 +209,17 @@ export interface GlobalScanRow {
    * so a consumer built on top of the Oracle (Tempo, Accute) can surface
    * it without recomputing bodyRatio/closePos itself. */
   expectedCandleType: string
+  /** passthrough of this row's own momentumPrediction (analytics/momentumscore.ts)
+   * - the per-asset Oracle panel's "Momentum Score" read, computed fresh
+   * alongside the fused prediction above in the same predict() call, not a
+   * second fetch. null when that read couldn't be produced this bar (one of
+   * the four timeframes briefly thin) - same best-effort contract as
+   * predict()'s own pred.momentumPrediction. Global Dom (domGlobalScan()
+   * below) filters on momentumDomination without recomputing anything. */
+  momentumDirection: 'call' | 'put' | 'none' | null
+  momentumScore: number | null
+  momentumDomination: boolean
+  momentumExpectedCandleType: string | null
 }
 
 export interface GlobalScanResult {
@@ -219,6 +230,23 @@ export interface GlobalScanResult {
   live: number
   warming: number
   /** refresh=1 forced every row's recompute, not just stale ones */
+  refreshed: number
+  rows: GlobalScanRow[]
+}
+
+/** Result of domGlobalScan() - "Global Dom": the whole universe filtered
+ * down to rows whose Momentum Score read is in full domination right now.
+ * `rows` carries the SAME GlobalScanRow shape as GlobalScanResult (just the
+ * dominating subset, already sorted), so the panel can reuse every field
+ * (price, oracle direction/confidence, expectedCandleType, etc.) the Next
+ * Global board already knows how to render. */
+export interface DomGlobalResult {
+  tf: string
+  scannedTs: number
+  universe: number
+  scanned: number
+  /** how many of the scanned rows are currently dominating */
+  dominating: number
   refreshed: number
   rows: GlobalScanRow[]
 }
@@ -1231,6 +1259,10 @@ export class NextCandleService {
         renkoVote: renkoDriver?.vote ?? 0,
         footprintVote: footprintDriver?.vote ?? 0,
         expectedCandleType: pred.expectedCandleType,
+        momentumDirection: pred.momentumPrediction?.direction ?? null,
+        momentumScore: pred.momentumPrediction?.score ?? null,
+        momentumDomination: pred.momentumPrediction?.domination ?? false,
+        momentumExpectedCandleType: pred.momentumPrediction?.expectedCandleType ?? null,
       }
     } else {
       // thin/no history yet (lazy-seeded feed) - keep the timestamp at the
@@ -1255,6 +1287,10 @@ export class NextCandleService {
         renkoVote: 0,
         footprintVote: 0,
         expectedCandleType: '',
+        momentumDirection: null,
+        momentumScore: null,
+        momentumDomination: false,
+        momentumExpectedCandleType: null,
       }
     }
     this.scanRows.set(key, row)
@@ -1310,6 +1346,49 @@ export class NextCandleService {
       warming: warming.length,
       refreshed,
       rows: [...live, ...warming],
+    }
+  }
+
+  // ---------- Global Dom: whole-universe "full domination" board ----------
+  // Same scan as globalScan() above (same scanRowFor() cache, same TTL, so
+  // polling this board doesn't cost a second fusion per pair - it just
+  // rereads rows the per-asset panels/Next Global/Accute are already
+  // keeping warm), filtered down to the rare case the user asked for: every
+  // one of the Momentum Score's four timeframes agreeing AND individually
+  // clearing the domination threshold (see analytics/momentumscore.ts). The
+  // whole point of this board is that it should usually come back thin or
+  // empty - that's what makes a hit worth checking Accute/Oracle over.
+  domGlobalScan(tf: Timeframe, opts: { limit?: number; category?: string; refresh?: boolean } = {}): DomGlobalResult {
+    const limit = Math.max(1, Math.min(Math.round(opts.limit ?? 60), 200))
+    const category = opts.category && opts.category !== 'all' ? opts.category : null
+    const refresh = opts.refresh === true
+    const now = Date.now()
+
+    const universe = this.market.listAssets().filter((a) => a.open && (!category || a.category === category))
+    const picked = universe.slice(0, limit)
+
+    let refreshed = 0
+    const rows: GlobalScanRow[] = []
+    for (const a of picked) {
+      const before = this.scanRows.get(`${tf}:${a.ticker}`)
+      const row = this.scanRowFor(a, tf, refresh)
+      if (!before || row.computedTs !== before.computedTs) refreshed++
+      rows.push(row)
+    }
+
+    const dominating = rows.filter((r) => r.ok && r.momentumDomination)
+    // strongest lean first - |momentumScore| close to 1 means every
+    // timeframe closed nearer its own extreme, not just over the threshold
+    dominating.sort((x, y) => Math.abs(y.momentumScore ?? 0) - Math.abs(x.momentumScore ?? 0))
+
+    return {
+      tf,
+      scannedTs: now,
+      universe: universe.length,
+      scanned: rows.length,
+      dominating: dominating.length,
+      refreshed,
+      rows: dominating,
     }
   }
 
