@@ -237,18 +237,30 @@ const DEFAULT_META_TRADER: MetaTraderConfig = {
 const META_TRADER_NOTE = 'meta:trader'
 
 /** barsAgo===0 read of an SmcScanResult, optionally restricted to one kind.
- * Confidence is derived from how many "now" signals agree with the winning
- * side (including itself) out of every "now" signal across all kinds - an
- * honest, explainable number rather than a flat guess, and it naturally
- * rewards a kind firing ALONGSIDE other agreeing structure over one firing
- * in isolation. A lone signal with nothing else to agree or disagree with
- * gets a flat 65 (clearly labeled in the note).
+ * Per direct instruction, this now matches SmcRecentPanel's own stance:
+ * "any signal that one can fires should be fired here also" - any concept
+ * that hits THIS candle is eligible to produce a read, with NO majority-
+ * vote veto. There used to be a "split evenly - no lean" case that stood
+ * aside entirely on an exact bullish/bearish tie; that's gone - a tie now
+ * goes with whichever concept fired first in the scan's own signal order
+ * (SmcScanResult.signals is itself ordered, so this is deterministic, not
+ * arbitrary) rather than refusing to read at all.
+ *
+ * Confidence is still derived from how many "now" signals agree with the
+ * winning side (including itself) out of every "now" signal across all
+ * kinds - an honest, explainable number rather than a flat guess, and it
+ * naturally rewards a kind firing ALONGSIDE other agreeing structure over
+ * one firing in isolation. A lone signal with nothing else to agree or
+ * disagree with gets a flat 65 (clearly labeled in the note); a tied split
+ * necessarily lands at 50 (half the now-signals agree with whichever side
+ * won the tie-break) - the minConfidence floor is what filters that out if
+ * you don't want to act on ties.
  *
  * The AGGREGATE 'smc' source (onlyKind undefined) excludes Support &
  * Resistance entirely, per direct instruction - its touch-cluster read
  * fires far more often than the other 14 concepts and would drown out
- * everything else in a "now" majority vote, same reasoning SmcRecentPanel's
- * own EXCLUDED_KINDS already applies on its "now"/"1 bar ago" view. The
+ * everything else in a "now" read, same reasoning SmcRecentPanel's own
+ * EXCLUDED_KINDS already applies on its "now"/"1 bar ago" view. The
  * dedicated 'smc-support-resistance' source (onlyKind === 'SUPPORT_RESISTANCE')
  * still trades it on its own - this exclusion only affects the aggregate. */
 function smcNowRead(result: SmcScanResult, onlyKind?: SmcKind): { direction: 'call' | 'put' | 'none'; confidence: number; note: string } {
@@ -258,13 +270,16 @@ function smcNowRead(result: SmcScanResult, onlyKind?: SmcKind): { direction: 'ca
   if (pool.length === 0) return { direction: 'none', confidence: 0, note: 'nothing hit this candle' }
   const bullish = pool.filter((s) => s.direction === 'bullish').length
   const bearish = pool.filter((s) => s.direction === 'bearish').length
-  if (bullish === bearish) return { direction: 'none', confidence: 0, note: `${pool.length} now-signal(s), split evenly - no lean` }
-  const direction: 'call' | 'put' = bullish > bearish ? 'call' : 'put'
+  const tied = bullish === bearish
+  // no-vote-required: any now-signal fires. A tie breaks on whichever
+  // concept hit first in the scan's own order, rather than standing aside.
+  const direction: 'call' | 'put' = tied ? (pool[0].direction === 'bullish' ? 'call' : 'put') : bullish > bearish ? 'call' : 'put'
   const winners = Math.max(bullish, bearish)
   const totalNow = now.length // agreement measured against EVERY kind firing now, not just onlyKind's own pool
   const confidence = totalNow <= 1 ? 65 : Math.round((winners / totalNow) * 100)
   const kindNote = onlyKind ? `${onlyKind} now (${pool.length}x)` : `${pool.length} concept(s) now`
-  return { direction, confidence, note: `${kindNote} - ${winners}/${totalNow} now-signals agree ${direction}` }
+  const tieNote = tied && totalNow > 1 ? ` (tied - went with ${pool[0].kind}'s first fire)` : ''
+  return { direction, confidence, note: `${kindNote} - ${winners}/${totalNow} now-signals agree ${direction}${tieNote}` }
 }
 
 export class MetaTraderService {
