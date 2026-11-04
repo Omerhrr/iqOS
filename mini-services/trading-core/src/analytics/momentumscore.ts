@@ -30,6 +30,20 @@ import type { Candle } from '../types'
 const LOOKBACK = 5
 const DEFAULT_WEIGHTS = { w15m: 0.4, w5m: 0.3, w1m: 0.2, w30s: 0.1 }
 
+// "Full and absolute domination" per direct instruction: the panel chip for
+// this read should stay silent almost always and only speak up when every
+// single timeframe is screaming the same direction at once - a manual-trade
+// confirmation signal, not a running readout. Domination requires BOTH:
+//   1. every one of the four T_<tf> terms shares the fused direction's sign
+//      (no timeframe disagreeing even a little), and
+//   2. every one of them individually clears DOMINATION_THRESHOLD, not just
+//      the weighted average - a fast timeframe can't carry a weak slow one
+//      (or vice versa) across the line on its own.
+// 0.85 means each timeframe's last LOOKBACK candles averaged closing within
+// the top/bottom 7.5% of their own range - genuinely one-sided, not just
+// "leaning". Tune this one constant to loosen/tighten how rare the badge is.
+const DOMINATION_THRESHOLD = 0.85
+
 export interface MomentumScoreWeights {
   w15m: number
   w5m: number
@@ -49,6 +63,10 @@ export interface MomentumScorePrediction {
   bodyRatio: number
   closePos: number
   expectedCandleType: string
+  /** true only when all four timeframes agree in direction AND each one
+   * individually clears DOMINATION_THRESHOLD - see that constant's comment.
+   * The panel uses this to decide whether to show this read at all. */
+  domination: boolean
 }
 
 function clamp(v: number, lo: number, hi: number): number {
@@ -106,6 +124,10 @@ export function predictMomentumScore(
   const bodyRatio = clamp(0.2 + Math.abs(score) * 0.7, 0.05, 0.95)
   const closePos = clamp(0.5 + (direction === 'none' ? 0 : score) * 0.45, 0.05, 0.95)
 
+  const domination =
+    direction !== 'none' &&
+    [t15m, t5m, t1m, t30s].every((t) => (direction === 'call' ? t >= DOMINATION_THRESHOLD : t <= -DOMINATION_THRESHOLD))
+
   return {
     direction,
     score: Math.round(score * 1000) / 1000,
@@ -120,5 +142,6 @@ export function predictMomentumScore(
     bodyRatio,
     closePos,
     expectedCandleType: classifyShape(bodyRatio, closePos, direction),
+    domination,
   }
 }

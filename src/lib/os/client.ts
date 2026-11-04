@@ -1735,6 +1735,10 @@ export interface MomentumScorePrediction {
   bodyRatio: number
   closePos: number
   expectedCandleType: string
+  /** true only when all four timeframes agree in direction AND each one
+   * individually clears the backend's domination threshold - manual-trade
+   * confirmation signal. The panel only shows this read when true. */
+  domination: boolean
 }
 
 /** One resolved prediction from the oracle's honesty ledger. */
