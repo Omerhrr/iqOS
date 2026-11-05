@@ -25,6 +25,8 @@
 // spec's id) - this panel is for building/testing specs, not for arming
 // the auto-trader itself.
 import { useEffect, useState } from 'react'
+import { Button } from '@/components/ui/button'
+import CodeAssistBar from './CodeAssistBar'
 import type { MetaCondition, MetaConditionSource, MetaStrategyEvalResponse, MetaStrategyScriptTestResponse, MetaStrategySpec, MetaTraderSource, Timeframe } from '@/lib/os/client'
 import {
   ALL_META_TRADER_SOURCES,
@@ -33,8 +35,10 @@ import {
   META_TRADER_SOURCE_LABELS,
   deleteMetaStrategy,
   evalMetaStrategy,
+  getMetaSourceCode,
   getMetaStrategies,
   getMetaStrategySources,
+  saveMetaSourceCode,
   saveMetaStrategy,
   testMetaStrategyScript,
 } from '@/lib/os/client'
@@ -331,6 +335,56 @@ export default function MetaStrategyPanel({ asset, tf, onError }: MetaStrategyPa
   const [showBuiltins, setShowBuiltins] = useState(false)
   const [builtinSourceId, setBuiltinSourceId] = useState<MetaTraderSource | null>(null)
 
+  // "we should be able to edit and save the builtin meta strategies" per
+  // direct instruction - these built-in sources are real pickXxx() methods
+  // on MetaTraderService (not a saved spec), so "view as code" here means
+  // literally reading/rewriting that method in metatrader.ts (same safety
+  // story as the Strategy Lab's builtin.ts editor: brace-matched extraction,
+  // syntax-checked, backed up - see metasourceedit.ts). Note editing 'smc'
+  // or any smc-<KIND> id edits the ONE shared pickSmc() method underneath.
+  const [codeViewId, setCodeViewId] = useState<MetaTraderSource | null>(null)
+  const [codeText, setCodeText] = useState('')
+  const [codeLoading, setCodeLoading] = useState(false)
+  const [codeError, setCodeError] = useState<string | null>(null)
+  const [codeEditingId, setCodeEditingId] = useState<MetaTraderSource | null>(null)
+  const [codeSaving, setCodeSaving] = useState(false)
+  const [codeSaveNote, setCodeSaveNote] = useState<string | null>(null)
+  const [codeMethod, setCodeMethod] = useState<string | null>(null)
+
+  const loadSourceCode = (src: MetaTraderSource) => {
+    if (codeViewId === src) {
+      setCodeViewId(null)
+      setCodeEditingId(null)
+      return
+    }
+    setCodeViewId(src)
+    setCodeEditingId(null)
+    setCodeError(null)
+    setCodeSaveNote(null)
+    setCodeLoading(true)
+    getMetaSourceCode(src)
+      .then((r) => {
+        if (!r.ok) throw new Error(r.error ?? 'could not read source')
+        setCodeText(r.source ?? '')
+        setCodeMethod(r.method ?? null)
+      })
+      .catch((e: Error) => setCodeError(e.message))
+      .finally(() => setCodeLoading(false))
+  }
+
+  const saveSourceCode = (src: MetaTraderSource) => {
+    setCodeSaving(true)
+    setCodeError(null)
+    saveMetaSourceCode(src, codeText)
+      .then((r) => {
+        if (!r.ok) throw new Error(r.error ?? 'save failed')
+        setCodeSaveNote(r.message ?? 'saved')
+        setCodeEditingId(null)
+      })
+      .catch((e: Error) => setCodeError(e.message))
+      .finally(() => setCodeSaving(false))
+  }
+
   const refresh = () => {
     getMetaStrategies()
       .then((d) => setStrategies(d.strategies))
@@ -530,6 +584,14 @@ export default function MetaStrategyPanel({ asset, tf, onError }: MetaStrategyPa
             </>
           ) : (
             <>
+              <CodeAssistBar
+                kind="msl"
+                currentCode={script}
+                onApply={setScript}
+                lastError={scriptTestResult && !scriptTestResult.ok ? scriptTestResult.error ?? null : null}
+                context={{ asset, tf }}
+                className="mt-2"
+              />
               <textarea
                 value={script}
                 onChange={(e) => setScript(e.target.value)}
@@ -700,15 +762,99 @@ export default function MetaStrategyPanel({ asset, tf, onError }: MetaStrategyPa
                     <button
                       type="button"
                       onClick={() => setBuiltinSourceId((prev) => (prev === src ? null : src))}
-                      className={`ml-auto rounded px-1.5 py-0.5 font-mono text-[9px] hover:bg-violet-500/10 ${builtinSourceId === src ? 'text-violet-300' : 'text-[#aab6cc]'}`}
+                      className={`rounded px-1.5 py-0.5 font-mono text-[9px] hover:bg-violet-500/10 ${builtinSourceId === src ? 'text-violet-300' : 'text-[#aab6cc]'}`}
                     >
-                      source
+                      explain
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => loadSourceCode(src)}
+                      className={`ml-auto rounded px-1.5 py-0.5 font-mono text-[9px] hover:bg-amber-500/10 ${codeViewId === src ? 'text-amber-300' : 'text-[#aab6cc]'}`}
+                    >
+                      {codeViewId === src ? 'close code' : 'view/edit code'}
                     </button>
                   </div>
                   {builtinSourceId === src && (
                     <pre className="mt-1.5 overflow-x-auto whitespace-pre-wrap rounded border border-violet-500/30 bg-[#070c15] p-1.5 font-mono text-[9px] leading-relaxed text-[#aab6cc]">
                       {builtinSourceExplainer(src)}
                     </pre>
+                  )}
+                  {codeViewId === src && (
+                    <div className="mt-1.5 rounded border border-amber-500/30 bg-[#070c15] p-1.5">
+                      {codeLoading ? (
+                        <p className="font-mono text-[9px] text-[#7c8aa5]">loading...</p>
+                      ) : codeError && codeEditingId !== src ? (
+                        <p className="font-mono text-[9px] text-rose-300">{codeError}</p>
+                      ) : (
+                        <>
+                          {codeMethod && (src === 'smc' || src.startsWith('smc-')) && (
+                            <p className="mb-1 font-mono text-[8.5px] text-amber-300">
+                              every smc-flavored source shares this ONE method ({codeMethod}()) - editing it changes all of them, not just &quot;{META_TRADER_SOURCE_LABELS[src]}&quot;
+                            </p>
+                          )}
+                          {codeEditingId === src ? (
+                            <>
+                              <CodeAssistBar
+                                kind="meta_source_ts"
+                                currentCode={codeText}
+                                onApply={setCodeText}
+                                lastError={codeError}
+                                context={{ id: src, method: codeMethod ?? undefined }}
+                                className="mb-1.5"
+                              />
+                              <textarea
+                                value={codeText}
+                                onChange={(e) => setCodeText(e.target.value)}
+                                rows={16}
+                                spellCheck={false}
+                                className="w-full resize-y rounded border border-[#1c2739] bg-[#0b111c] p-2 font-mono text-[9.5px] leading-relaxed text-[#dbe4f0] outline-none focus:border-amber-500/40"
+                              />
+                              {codeError && <p className="mt-1 font-mono text-[9px] text-rose-300">{codeError}</p>}
+                              <div className="mt-1.5 flex items-center gap-1.5">
+                                <Button
+                                  size="sm"
+                                  disabled={codeSaving}
+                                  className="h-6 bg-amber-600 px-2 text-[9px] font-bold uppercase tracking-wider text-white hover:bg-amber-500 disabled:opacity-50"
+                                  onClick={() => saveSourceCode(src)}
+                                >
+                                  {codeSaving ? 'saving...' : 'save changes'}
+                                </Button>
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5]"
+                                  onClick={() => {
+                                    setCodeEditingId(null)
+                                    setCodeError(null)
+                                  }}
+                                >
+                                  cancel
+                                </Button>
+                                <span className="font-mono text-[8.5px] text-[#4b5a72]">takes effect after the kernel restarts - backed up first</span>
+                              </div>
+                            </>
+                          ) : (
+                            <>
+                              <pre className="max-h-64 overflow-auto font-mono text-[9.5px] leading-relaxed text-[#dbe4f0]">{codeText}</pre>
+                              <div className="mt-1.5 flex items-center gap-1.5">
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  className="h-6 border-amber-500/40 px-2 text-[9px] uppercase text-amber-300 hover:bg-amber-500/10"
+                                  onClick={() => {
+                                    setCodeEditingId(src)
+                                    setCodeSaveNote(null)
+                                  }}
+                                >
+                                  edit
+                                </Button>
+                                {codeSaveNote && <span className="font-mono text-[8.5px] text-emerald-300">{codeSaveNote}</span>}
+                              </div>
+                            </>
+                          )}
+                        </>
+                      )}
+                    </div>
                   )}
                 </div>
               ))}

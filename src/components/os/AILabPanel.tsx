@@ -11,6 +11,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { AssetRow, LabLearnResult, LabSignalDef, LabSimMetrics, LabSpec, LabStrategyRow, StrategyInfo, Timeframe, TradeKind } from '@/lib/os/client'
+import { signalsToScript } from './labSignalScript'
+import CodeAssistBar from './CodeAssistBar'
 import { fmtMoney, osGet, osPost } from '@/lib/os/client'
 import { TIMEFRAMES, TIMEFRAME_SECONDS, SIGNAL_TEMPLATES, labelOfSignal, CANDLE_PATTERN_NAMES } from '@/lib/os/client'
 
@@ -1011,13 +1013,24 @@ export default function AILabPanel({ assets, strategies, onError, refreshBots }:
   const [labEditError, setLabEditError] = useState<string | null>(null)
   const [scriptTestResult, setScriptTestResult] = useState<{ ok: boolean; direction?: string; confidence?: number; trace?: string[]; price?: number; error?: string } | null>(null)
   const [scriptTestBusy, setScriptTestBusy] = useState(false)
+  const [showSignalFuncRef, setShowSignalFuncRef] = useState(false)
 
   const startEditLab = (r: LabStrategyRow) => {
     setExpandedLabId(r.id)
     setEditingLabId(r.id)
     setEditingLabText(JSON.stringify(r.spec, null, 2))
-    setEditingScriptText(r.spec.script ?? SIGNAL_SCRIPT_PLACEHOLDER)
-    setEditMode(r.spec.script ? 'script' : 'json')
+    // "meta strategy language is the new language we are using" per direct
+    // instruction - script is the DEFAULT edit mode for every spec, not
+    // just ones that already have a script: a signals[]-only spec (every
+    // learned one) gets translated into the exact same weighted-vote math
+    // as an MSL script (signalsToScript - see its own header), so there is
+    // no JSON-only strategy left to edit as JSON by default. JSON stays
+    // available as a fallback tab for anyone who wants to see/tweak the
+    // raw structured form, or for a spec a script can't faithfully round-
+    // trip (e.g. a nested 'group' signal's own weight/dir, which the
+    // translation folds into the parent score rather than re-exposing).
+    setEditingScriptText(r.spec.script ?? signalsToScript(r.spec))
+    setEditMode('script')
     setScriptTestResult(null)
     setLabEditError(null)
   }
@@ -1995,21 +2008,37 @@ export default function AILabPanel({ assets, strategies, onError, refreshBots }:
               )}
               {editingLabId === r.id && (
                 <div className="border-t border-[#141d2e] px-2.5 py-2">
-                  <div className="mb-1.5 flex items-center gap-px rounded border border-[#1c2739] p-0.5" style={{ width: 'fit-content' }}>
-                    {(['json', 'script'] as const).map((m) => (
+                  <div className="mb-1.5 flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-px rounded border border-[#1c2739] p-0.5" style={{ width: 'fit-content' }}>
+                      {(['script', 'json'] as const).map((m) => (
+                        <button
+                          key={m}
+                          type="button"
+                          onClick={() => setEditMode(m)}
+                          className={`rounded px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider transition-colors ${
+                            editMode === m ? 'bg-violet-500/20 text-violet-300' : 'text-[#4b5a72] hover:text-[#aab6cc]'
+                          }`}
+                          title={m === 'json' ? 'fallback view - the raw structured signals[] spec' : "Meta-Strategy Lab's own script language (strategylang.ts) - the language this OS now uses for every strategy"}
+                        >
+                          {m === 'json' ? 'json (fallback)' : 'script (MSL)'}
+                        </button>
+                      ))}
+                    </div>
+                    {editMode === 'script' && (
                       <button
-                        key={m}
                         type="button"
-                        onClick={() => setEditMode(m)}
-                        className={`rounded px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider transition-colors ${
-                          editMode === m ? 'bg-violet-500/20 text-violet-300' : 'text-[#4b5a72] hover:text-[#aab6cc]'
-                        }`}
-                        title={m === 'json' ? 'edit the raw signals[] spec' : "edit as Meta-Strategy Lab's own script language (strategylang.ts) - same language, AI Lab's own signal vocabulary"}
+                        onClick={() => setShowSignalFuncRef((v) => !v)}
+                        className="font-mono text-[8.5px] text-[#4b5a72] hover:text-violet-300"
                       >
-                        {m === 'json' ? 'json' : 'script (MSL)'}
+                        {showSignalFuncRef ? 'hide function reference' : 'show function reference'}
                       </button>
-                    ))}
+                    )}
                   </div>
+                  {editMode === 'script' && showSignalFuncRef && (
+                    <pre className="mb-1.5 overflow-x-auto whitespace-pre-wrap rounded border border-[#1c2739] bg-[#070c15] p-1.5 font-mono text-[8.5px] leading-relaxed text-[#7c8aa5]">
+                      {SIGNAL_SCRIPT_PLACEHOLDER}
+                    </pre>
+                  )}
                   {editMode === 'json' ? (
                     <textarea
                       value={editingLabText}
@@ -2020,6 +2049,14 @@ export default function AILabPanel({ assets, strategies, onError, refreshBots }:
                     />
                   ) : (
                     <>
+                      <CodeAssistBar
+                        kind="ai_lab_script"
+                        currentCode={editingScriptText}
+                        onApply={setEditingScriptText}
+                        lastError={scriptTestResult && !scriptTestResult.ok ? scriptTestResult.error ?? null : null}
+                        context={{ asset: r.asset, tf: r.tf, strategyId: r.id }}
+                        className="mb-1.5"
+                      />
                       <textarea
                         value={editingScriptText}
                         onChange={(e) => setEditingScriptText(e.target.value)}

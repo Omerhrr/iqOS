@@ -41,6 +41,7 @@ import { accutePlugin, AccuteService } from './src/plugins/accute'
 import { gridSearch, walkForward, sweepAssets, type Objective } from './src/strategies/optimize'
 import { backtest } from './src/strategies/backtest'
 import { readBuiltinStrategySource, saveBuiltinStrategySource } from './src/strategies/sourceedit'
+import { readBuiltinMetaSourceCode, saveBuiltinMetaSourceCode } from './src/strategies/metasourceedit'
 import type { BacktestOptions } from './src/strategies/backtest'
 import { leadersFor, LEADLAG_GROUPS, fitLeadLag, projectLeadLagSignal, LEADLAG_MIN_ABS_CORRELATION, LEADLAG_MIN_TRIGGER_Z, type LeadLagFit, type LeadLagSignal } from './src/analytics/leadlag'
 import { distillChartSignals, DISTILL_DEFAULT_WINDOW } from './src/analytics/chartsignalsdistill'
@@ -2826,6 +2827,18 @@ const httpServer = createServer(async (req, res) => {
         return res.ok ? json(200, { ok: true, source: res.source }) : json(404, res)
       }
 
+      // GET /meta_source_code?id=<MetaTraderSource> - "we should be able to
+      // edit and save the builtin meta strategies" per direct instruction:
+      // the Meta Trader panel's own built-in signal sources (oracle/accute/
+      // smc/renko-smc/renko-smc-majority/meta-strategy and every smc-<KIND>
+      // variant) are real pickXxx() methods on MetaTraderService, not a
+      // saved spec - view/edit/save-as-code for them, same safety story as
+      // /strategy_builtin_source (metasourceedit.ts does the actual work).
+      if (path === '/meta_source_code') {
+        const res = readBuiltinMetaSourceCode(String(q.get('id') ?? ''))
+        return res.ok ? json(200, { ok: true, source: res.source, method: res.method }) : json(404, res)
+      }
+
       if (path === '/lab_list') {
         return json(200, { ok: true, strategies: kernel.context().use<StrategyLabService>('lab').list() })
       }
@@ -4128,6 +4141,18 @@ const httpServer = createServer(async (req, res) => {
         const res = saveBuiltinStrategySource(String(body.id ?? ''), String(body.source ?? ''))
         return res.ok
           ? json(200, { ok: true, message: 'saved - restart the kernel for this change to take effect', backup: res.backup })
+          : json(400, res)
+      }
+
+      // POST /meta_source_save {id, source} - saves one built-in Meta
+      // Trader signal source's pickXxx() method back into metatrader.ts
+      // (syntax-checked + backed up first). Editing 'smc' or any smc-<KIND>
+      // id edits the SAME shared pickSmc() method - the response's `method`
+      // field says which one actually changed.
+      if (path === '/meta_source_save') {
+        const res = saveBuiltinMetaSourceCode(String(body.id ?? ''), String(body.source ?? ''))
+        return res.ok
+          ? json(200, { ok: true, message: 'saved - restart the kernel for this change to take effect', backup: res.backup, method: res.method })
           : json(400, res)
       }
 

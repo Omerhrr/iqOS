@@ -34,6 +34,7 @@ import ResearchPanel from './ResearchPanel'
 import OrderFlowPanel from './OrderFlowPanel'
 import OtcFootprintPanel from './OtcFootprintPanel'
 import DiagnosticsPanel from './DiagnosticsPanel'
+import CodeAssistBar from './CodeAssistBar'
 import { FullscreenBackdrop, FullscreenButton } from './FullscreenButton'
 
 interface BottomTabsProps {
@@ -430,6 +431,14 @@ export default function BottomTabs(props: BottomTabsProps) {
                     <p className="font-mono text-[9px] text-[#4b5a72]">loading source…</p>
                   ) : editing ? (
                     <>
+                      <CodeAssistBar
+                        kind="builtin_strategy_ts"
+                        currentCode={strategySource}
+                        onApply={setStrategySource}
+                        lastError={strategySourceError}
+                        context={{ id: s.id, name: s.name }}
+                        className="mb-1.5"
+                      />
                       <textarea
                         value={strategySource}
                         onChange={(e) => setStrategySource(e.target.value)}

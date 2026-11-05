@@ -457,6 +457,22 @@ export async function testMetaStrategyScript(script: string, asset: string, tf: 
   return osPost('/meta_strategy_test_script', { script, asset, tf })
 }
 
+/** "we should be able to edit and save the builtin meta strategies" per
+ * direct instruction - Meta Trader's own built-in signal sources (oracle/
+ * accute/smc/renko-smc/renko-smc-majority/meta-strategy, every smc-<KIND>
+ * variant) are real pickXxx() methods on the kernel's MetaTraderService,
+ * not a saved spec - these back the Meta Strategy panel's "view/edit/save
+ * as code" for them (metasourceedit.ts does the actual file surgery).
+ * Editing 'smc' or any smc-<KIND> id edits the ONE shared pickSmc() method
+ * (it dispatches on kind internally) - `method` says which one changed. */
+export async function getMetaSourceCode(id: string): Promise<{ ok: boolean; source?: string; method?: string; error?: string }> {
+  return osGet('/meta_source_code', { id })
+}
+
+export async function saveMetaSourceCode(id: string, source: string): Promise<{ ok: boolean; message?: string; method?: string; error?: string }> {
+  return osPost('/meta_source_save', { id, source })
+}
+
 // IQ Option exposes no real bid/ask-tagged trades or order-book depth, so all
 // of this is derived from OHLCV candles via a close-location-value (CLV) proxy.
 // Never present it as real order-flow data in the UI - always label it approx.
@@ -4231,6 +4247,41 @@ export async function osPost<T>(path: string, body: unknown = {}): Promise<T> {
   })
   if (!res.ok) throw await errorFrom(res, `POST ${clean}`)
   return res.json() as Promise<T>
+}
+
+/** "invoke the ai and describe it so it will build the strat... if any
+ * error, we can have the ai scan and fix" per direct instruction - backs
+ * every code editor's shared "AI" bar (CodeAssistBar.tsx). This hits this
+ * NEXT.JS APP's own /api/code_assist route directly (like /api/agent),
+ * NOT the kernel via osPost - it calls the LLM layer in src/lib/llm, which
+ * only runs server-side here, not in trading-core. */
+export type CodeAssistKind = 'msl' | 'ai_lab_script' | 'builtin_strategy_ts' | 'meta_source_ts'
+
+export interface CodeAssistResult {
+  ok: boolean
+  code?: string
+  explanation?: string
+  provider?: string
+  model?: string
+  error?: string
+}
+
+export async function codeAssist(input: {
+  kind: CodeAssistKind
+  mode: 'build' | 'fix'
+  instruction?: string
+  currentCode?: string
+  error?: string
+  context?: Record<string, string | number | undefined>
+}): Promise<CodeAssistResult> {
+  const res = await fetch('/api/code_assist', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+    cache: 'no-store',
+  })
+  const body = (await res.json().catch(() => ({ ok: false, error: `request failed: ${res.status}` }))) as CodeAssistResult
+  return body
 }
 
 // ---------- socket feed ----------
