@@ -13,6 +13,7 @@ import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import type { AiTraderConfig, AiTraderDecision, AiTraderStatus, AssetRow, Timeframe } from '@/lib/os/client'
 import { fmtTime, osGet, osPost } from '@/lib/os/client'
+import AssetPicker from './AssetPicker'
 
 interface Props {
   assets: AssetRow[]
@@ -99,17 +100,12 @@ export default function AiTraderPanel({ assets, onError }: Props) {
       <div className="grid grid-cols-2 gap-2 rounded border border-[#1c2739] bg-[#0b0f17] p-2 sm:grid-cols-4">
         <label className="flex flex-col gap-1">
           <span className="text-[#7c8aa5]">asset</span>
-          <select
+          <AssetPicker
+            tickers={assets.length ? assets.map((a) => a.ticker) : [draft.asset]}
             value={draft.asset}
-            onChange={(e) => setDraft({ ...draft, asset: e.target.value })}
-            className="rounded border border-[#1c2739] bg-[#070c15] px-1.5 py-1 text-[#dbe4f0]"
-          >
-            {assets.map((a) => (
-              <option key={a.ticker} value={a.ticker}>
-                {a.ticker}
-              </option>
-            ))}
-          </select>
+            onChange={(t) => setDraft({ ...draft, asset: t })}
+            className="w-full"
+          />
         </label>
         <label className="flex flex-col gap-1">
           <span className="text-[#7c8aa5]">tf</span>
