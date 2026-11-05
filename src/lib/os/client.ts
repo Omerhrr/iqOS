@@ -4045,6 +4045,58 @@ export type MetaTraderSource =
   | 'renko-smc'
   | 'renko-smc-majority'
 
+/** Every Meta Trader signal source, in the same order the kernel's own
+ * META_TRADER_SOURCES array lists them (plugins/metatrader.ts) - exported
+ * here so any panel (AutopilotPanel's picker, MetaStrategyPanel's "all
+ * strats" list) can enumerate them without duplicating the list. */
+export const ALL_META_TRADER_SOURCES: readonly MetaTraderSource[] = [
+  'meta-strategy',
+  'oracle',
+  'accute',
+  'smc',
+  'smc-fvg',
+  'smc-ifvg',
+  'smc-order-block',
+  'smc-breaker-block',
+  'smc-liquidity-sweep',
+  'smc-bos',
+  'smc-choch',
+  'smc-ote',
+  'smc-krm',
+  'smc-supply-demand',
+  'smc-support-resistance',
+  'smc-breakout',
+  'smc-crt',
+  'smc-power-of-3',
+  'smc-silver-bullet',
+  'renko-smc',
+  'renko-smc-majority',
+]
+
+export const META_TRADER_SOURCE_LABELS: Record<MetaTraderSource, string> = {
+  'meta-strategy': 'Meta-Strategy',
+  oracle: 'Oracle',
+  accute: 'Accute',
+  smc: 'SMC (now)',
+  'smc-fvg': 'SMC: FVG',
+  'smc-ifvg': 'SMC: IFVG',
+  'smc-order-block': 'SMC: Order Block',
+  'smc-breaker-block': 'SMC: Breaker Block',
+  'smc-liquidity-sweep': 'SMC: Liquidity Sweep',
+  'smc-bos': 'SMC: BOS',
+  'smc-choch': 'SMC: CHoCH',
+  'smc-ote': 'SMC: OTE',
+  'smc-krm': 'SMC: KRM',
+  'smc-supply-demand': 'SMC: Supply & Demand',
+  'smc-support-resistance': 'SMC: Support & Resistance',
+  'smc-breakout': 'SMC: Breakout',
+  'smc-crt': 'SMC: CRT',
+  'smc-power-of-3': 'SMC: Power of 3',
+  'smc-silver-bullet': 'SMC: Silver Bullet',
+  'renko-smc': 'Renko + SMC confluence (any agrees)',
+  'renko-smc-majority': 'Renko + SMC confluence (majority)',
+}
+
 export interface MetaStakePlan {
   kind: 'compound'
   base: number

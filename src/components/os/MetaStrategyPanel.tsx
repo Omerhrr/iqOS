@@ -25,10 +25,12 @@
 // spec's id) - this panel is for building/testing specs, not for arming
 // the auto-trader itself.
 import { useEffect, useState } from 'react'
-import type { MetaCondition, MetaConditionSource, MetaStrategyEvalResponse, MetaStrategyScriptTestResponse, MetaStrategySpec, Timeframe } from '@/lib/os/client'
+import type { MetaCondition, MetaConditionSource, MetaStrategyEvalResponse, MetaStrategyScriptTestResponse, MetaStrategySpec, MetaTraderSource, Timeframe } from '@/lib/os/client'
 import {
+  ALL_META_TRADER_SOURCES,
   ALL_SMC_KINDS,
   META_CONDITION_SOURCE_LABELS,
+  META_TRADER_SOURCE_LABELS,
   deleteMetaStrategy,
   evalMetaStrategy,
   getMetaStrategies,
@@ -89,6 +91,79 @@ confidence = avg(oracle.conf, renko.conf, pointFigure.conf, rangeBars.conf)
 
 function emptyCondition(): MetaCondition {
   return { source: 'oracle', direction: 'either', minConfidence: 50, weight: 1 }
+}
+
+/** "all the strats we have in meta trader signal source should also
+ * appear" per direct instruction - these are NOT saved MetaStrategySpecs,
+ * they're the kernel's own hardcoded signal sources (plugins/
+ * metatrader.ts's pickCandidates() dispatcher/pickXxx() methods) that
+ * Meta Trader's own signalSource dropdown already picks from. No stored
+ * script or conditions exist for them, so this is a hand-written, honest
+ * explanation of each one's actual logic (mirrors that file's own doc
+ * comments) rather than a generated pseudo-script. */
+function builtinSourceExplainer(source: MetaTraderSource): string {
+  if (source === 'meta-strategy') {
+    return [
+      '# built-in Meta Trader source: meta-strategy',
+      "# Delegates entirely to a saved Meta-Strategy spec (metaStrategyId),",
+      '# evaluated per-candidate the same way the "test" button above does -',
+      "# see that spec's own \"source\" for its actual logic.",
+    ].join('\n')
+  }
+  if (source === 'oracle') {
+    return [
+      '# built-in Meta Trader source: oracle',
+      "# Reads the Next-Candle Oracle's multi-model fusion prediction",
+      '# directly (same read the oracle condition source uses).',
+      'call when oracle.dir == call and oracle.conf >= minConfidence',
+      'put when oracle.dir == put and oracle.conf >= minConfidence',
+    ].join('\n')
+  }
+  if (source === 'accute') {
+    return [
+      '# built-in Meta Trader source: accute',
+      "# Reads Accute's own signal() verdict directly.",
+      'call when accute.dir == call and accute.conf >= minConfidence',
+      'put when accute.dir == put and accute.conf >= minConfidence',
+    ].join('\n')
+  }
+  if (source === 'smc') {
+    return [
+      '# built-in Meta Trader source: smc',
+      '# smcNowRead() aggregate across ALL "now" concepts (barsAgo===0,',
+      '# excludes Support & Resistance) - majority/tie-broken winner.',
+      '# NOTE: minConfidence is NOT applied to any smc-flavored source -',
+      '# the "now" confidence has no honesty-loop/resolved-outcome backing,',
+      '# so any concept firing now qualifies, ranked by recency not score.',
+      'call when smcNow.dir == call',
+      'put when smcNow.dir == put',
+    ].join('\n')
+  }
+  if (source === 'renko-smc' || source === 'renko-smc-majority') {
+    const majority = source === 'renko-smc-majority'
+    return [
+      `# built-in Meta Trader source: ${source}`,
+      '# "if renko is green and smc now says up, trade up, but if renko is',
+      '#  red and smc now says down, trade down" per direct instruction.',
+      'let renkoDir = renko.dir   # streak-based trend, confidence = 40+streak*12 capped 100',
+      majority
+        ? "let confluence = smcNow.dir == renkoDir   # SMC's OWN MAJORITY verdict must match renko"
+        : 'let confluence = any(smc:<KIND>.dir == renkoDir for KIND in ALL_SMC_KINDS except SUPPORT_RESISTANCE)   # ANY one concept agreeing is enough',
+      'call when renkoDir == call and confluence',
+      'put when renkoDir == put and confluence',
+      'confidence = avg(renko.conf, smc-agreement-ratio)',
+    ].join('\n')
+  }
+  // the 15 individual smc-<kind> sources - same shape, just pinned to one concept
+  const kind = source.replace(/^smc-/, '').toUpperCase().replace(/-/g, '_')
+  return [
+    `# built-in Meta Trader source: ${source}`,
+    `# smcNowRead() pinned to ONE concept (smcKind='${kind}') instead of the`,
+    '# aggregate across all of them - fires the instant THIS concept hits,',
+    '# "now" only (barsAgo===0). minConfidence not applied (see smc above).',
+    `call when smc:${kind}.dir == call`,
+    `put when smc:${kind}.dir == put`,
+  ].join('\n')
 }
 
 /** "a place to see all the strats... view their source code" per direct
@@ -248,6 +323,13 @@ export default function MetaStrategyPanel({ asset, tf, onError }: MetaStrategyPa
   // "a place to see all the strats we currently have... and view their
   // source code" per direct instruction - toggled per saved strategy row.
   const [viewSourceId, setViewSourceId] = useState<string | null>(null)
+
+  // "all the strats we have in meta trader signal source should also
+  // appear" per direct instruction - built-in sources get their own
+  // (collapsed by default - there are 21 of them) section + per-row
+  // explainer toggle, same shape as the saved-spec list above.
+  const [showBuiltins, setShowBuiltins] = useState(false)
+  const [builtinSourceId, setBuiltinSourceId] = useState<MetaTraderSource | null>(null)
 
   const refresh = () => {
     getMetaStrategies()
@@ -590,6 +672,48 @@ export default function MetaStrategyPanel({ asset, tf, onError }: MetaStrategyPa
               )}
             </div>
           ))}
+        </div>
+
+        {/* ---------- built-in Meta Trader sources ---------- */}
+        <div className="rounded border border-[#1c2739] bg-[#070c15] p-2">
+          <button
+            type="button"
+            onClick={() => setShowBuiltins((v) => !v)}
+            className="flex w-full items-center gap-1.5 text-left"
+          >
+            <span className="text-[9px] font-bold uppercase tracking-wider text-[#aab6cc]">
+              Meta Trader built-in signal sources ({ALL_META_TRADER_SOURCES.length})
+            </span>
+            <span className="font-mono text-[8.5px] text-[#4b5a72]">
+              not saved specs - the hardcoded sources Meta Trader&apos;s own signalSource picker already offers
+            </span>
+            <span className="ml-auto font-mono text-[9px] text-[#4b5a72]">{showBuiltins ? '▾ hide' : '▸ show'}</span>
+          </button>
+          {showBuiltins && (
+            <div className="mt-2 space-y-1">
+              {ALL_META_TRADER_SOURCES.map((src) => (
+                <div key={src} className="rounded border border-[#1c2739] bg-[#0b111c] p-1.5">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="font-mono text-[9.5px] font-bold text-[#dbe4f0]">{META_TRADER_SOURCE_LABELS[src]}</span>
+                    <span className="rounded border border-amber-500/40 bg-amber-500/10 px-1 py-px font-mono text-[8px] uppercase text-amber-300">built-in</span>
+                    <span className="font-mono text-[8px] text-[#4b5a72]">{src}</span>
+                    <button
+                      type="button"
+                      onClick={() => setBuiltinSourceId((prev) => (prev === src ? null : src))}
+                      className={`ml-auto rounded px-1.5 py-0.5 font-mono text-[9px] hover:bg-violet-500/10 ${builtinSourceId === src ? 'text-violet-300' : 'text-[#aab6cc]'}`}
+                    >
+                      source
+                    </button>
+                  </div>
+                  {builtinSourceId === src && (
+                    <pre className="mt-1.5 overflow-x-auto whitespace-pre-wrap rounded border border-violet-500/30 bg-[#070c15] p-1.5 font-mono text-[9px] leading-relaxed text-[#aab6cc]">
+                      {builtinSourceExplainer(src)}
+                    </pre>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
 

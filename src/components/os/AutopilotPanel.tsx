@@ -20,7 +20,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import type { AssetRow, AutoTraderConfig, BotConfig, BotRow, MetaStakePlan, MetaStrategySpec, MetaTraderConfig, MetaTraderSource, MetaTraderStatus, OsModeStatus, OtcConfig, OtcPolicy, StrategyInfo, Timeframe, TradeKind, ValidationRow } from '@/lib/os/client'
-import { BLITZ_EXPIRY_SECONDS, KIND_LABEL, TIMEFRAMES, fmtMoney, fmtTime, getMetaStrategies, getOtcConfig, osGet, osPost, setOtcConfig } from '@/lib/os/client'
+import { BLITZ_EXPIRY_SECONDS, KIND_LABEL, META_TRADER_SOURCE_LABELS, TIMEFRAMES, fmtMoney, fmtTime, getMetaStrategies, getOtcConfig, osGet, osPost, setOtcConfig } from '@/lib/os/client'
 
 const GATE_MAX_AGE_SEC = 14 * 24 * 60 * 60
 
@@ -2632,30 +2632,6 @@ function AutoTraderDialog({
 // Deliberately simpler than the auto-trader's own section above: one flat
 // stake, no pacing/cooldown/payout-floor/vol-gate/watchlist/compounding -
 // those are exactly the frictions this engine was built to skip.
-
-const META_TRADER_SOURCE_LABELS: Record<MetaTraderSource, string> = {
-  'meta-strategy': 'Meta-Strategy',
-  oracle: 'Oracle',
-  accute: 'Accute',
-  smc: 'SMC (now)',
-  'smc-fvg': 'SMC: FVG',
-  'smc-ifvg': 'SMC: IFVG',
-  'smc-order-block': 'SMC: Order Block',
-  'smc-breaker-block': 'SMC: Breaker Block',
-  'smc-liquidity-sweep': 'SMC: Liquidity Sweep',
-  'smc-bos': 'SMC: BOS',
-  'smc-choch': 'SMC: CHoCH',
-  'smc-ote': 'SMC: OTE',
-  'smc-krm': 'SMC: KRM',
-  'smc-supply-demand': 'SMC: Supply & Demand',
-  'smc-support-resistance': 'SMC: Support & Resistance',
-  'smc-breakout': 'SMC: Breakout',
-  'smc-crt': 'SMC: CRT',
-  'smc-power-of-3': 'SMC: Power of 3',
-  'smc-silver-bullet': 'SMC: Silver Bullet',
-  'renko-smc': 'Renko + SMC confluence (any agrees)',
-  'renko-smc-majority': 'Renko + SMC confluence (majority)',
-}
 
 const DEFAULT_META_TRADER_UI: MetaTraderConfig = {
   enabled: false,
