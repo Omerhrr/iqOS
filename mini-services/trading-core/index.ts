@@ -31,6 +31,7 @@ import { cointegrationScanPlugin, CointegrationScanService } from './src/plugins
 import { volArbScanPlugin, VolArbScanService } from './src/plugins/volarbscan'
 import { smcScanPlugin, SmcScanService } from './src/plugins/smcscan'
 import { metaStrategyPlugin, MetaStrategyService } from './src/plugins/metastrategy'
+import { aiTraderPlugin, AiTraderService } from './src/plugins/aitrader'
 import { metaTraderPlugin, MetaTraderService } from './src/plugins/metatrader'
 import { META_CONDITION_SOURCES } from './src/analytics/metastrategy'
 import { yesterdayPlugin, YesterdayService } from './src/plugins/yesterday'
@@ -199,6 +200,7 @@ kernel.register(cointegrationScanPlugin)
 kernel.register(volArbScanPlugin)
 kernel.register(smcScanPlugin)
 kernel.register(metaStrategyPlugin)
+kernel.register(aiTraderPlugin)
 kernel.register(yesterdayPlugin)
 kernel.register(nextCandlePlugin)
 kernel.register(tempoPlugin)
@@ -2317,6 +2319,19 @@ const httpServer = createServer(async (req, res) => {
         }
       }
 
+      // GET /ai_trader_status - config + running state + last error, for the panel.
+      if (path === '/ai_trader_status') {
+        const ai = kernel.context().use<AiTraderService>('aiTrader')
+        return json(200, { ok: true, ...ai.getStatus(), ts: Date.now() })
+      }
+
+      // GET /ai_trader_decisions?limit=100 - the decision log (every skip too).
+      if (path === '/ai_trader_decisions') {
+        const ai = kernel.context().use<AiTraderService>('aiTrader')
+        const limit = Math.max(1, Math.min(500, Number(q.get('limit') ?? 100)))
+        return json(200, { ok: true, decisions: ai.listDecisions(limit) })
+      }
+
       if (path === '/cointegration_scan') {
         try {
           const tfv = tfStrict(q.get('tf'))
@@ -4237,6 +4252,27 @@ const httpServer = createServer(async (req, res) => {
       if (path === '/meta_strategy_delete') {
         const meta = kernel.context().use<MetaStrategyService>('metaStrategy')
         return json(200, meta.remove(String(body.id ?? '')))
+      }
+
+      // ---------- AI Trader (LLM-reasoned opportunity-scan trader) ----------
+      // POST /ai_trader_config - patch-whatever-fields-are-present, same
+      // contract as /autotrader_config and /meta_trader_config.
+      if (path === '/ai_trader_config') {
+        try {
+          const ai = kernel.context().use<AiTraderService>('aiTrader')
+          const cfg = ai.configure(body as Record<string, never>)
+          return json(200, { ok: true, config: cfg })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // POST /ai_trader_run_now - manual trigger (testing, or "decide now"
+      // from the UI) instead of waiting out the real interval.
+      if (path === '/ai_trader_run_now') {
+        const ai = kernel.context().use<AiTraderService>('aiTrader')
+        const out = await ai.runNow()
+        return json(out.ok ? 200 : 400, out)
       }
 
       if (path === '/lab_delete') {

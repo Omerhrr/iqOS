@@ -4230,6 +4230,55 @@ async function errorFrom(res: Response, label: string): Promise<Error> {
   return new Error(`${label} failed: ${res.status}`)
 }
 
+// ---------- AI Trader (LLM-reasoned opportunity-scan trader) ----------
+// "its like having meta or auto trader with brains" per direct instruction -
+// unlike every other auto-trader here, it decides with actual LLM reasoning
+// over a snapshot of the same panel reads the fixed-rule traders use, on a
+// timer (default every 10min) rather than every candle close. Starts in
+// SHADOW mode (live:false) by direct instruction - logs every decision
+// including skips, places nothing real until explicitly flipped live.
+export interface AiTraderConfig {
+  enabled: boolean
+  live: boolean
+  asset: string
+  tf: Timeframe
+  intervalMin: number
+  stake: number
+  kind: TradeKind
+  minConfidence: number
+  expiryChoices: number[]
+  provider?: string
+}
+
+export interface AiTraderStatus {
+  config: AiTraderConfig
+  enabled: boolean
+  live: boolean
+  running: boolean
+  cycles: number
+  lastRunTs: number
+  nextRunTs: number | null
+  lastError: string | null
+}
+
+export interface AiTraderDecision {
+  id: number
+  asset: string
+  tf: string
+  direction: 'call' | 'put' | 'skip'
+  confidence: number
+  expiryMin: number | null
+  reasoning: string
+  snapshot: { source: string; direction: string; confidence: number; label: string }[]
+  live: boolean
+  acted: boolean
+  positionId: string | null
+  provider: string | null
+  model: string | null
+  error: string | null
+  ts: number
+}
+
 export async function osGet<T>(path: string, params: Record<string, string | number | undefined> = {}): Promise<T> {
   const clean = path.replace(/^\/+/, '')
   const res = await fetch(`/${clean}?${qs(params)}`, { cache: 'no-store' })

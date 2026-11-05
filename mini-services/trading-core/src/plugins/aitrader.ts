@@ -1,0 +1,400 @@
+// IQAIR//OS - AI Trader: "a meta/auto trader with brains," per direct
+// request. Every other auto-trader in this codebase (the single Meta
+// Trader, the autopilot bot fleet, Meta Strategy specs) decides with FIXED
+// rules - indicator thresholds, panel-source votes, learned AI-Lab specs.
+// This one decides with actual LLM reasoning over a snapshot of the exact
+// same panel reads those rules already compute (MetaStrategyService.
+// snapshotSources - oracle/accute/smc/renko/pointFigure/rangeBars etc, the
+// same reads a human would glance at before pulling the trigger), on a
+// timer rather than every candle close - the user's own framing was "6
+// trades an hour, roughly one every ~10 minutes, 3-5 min expiry, only when
+// it sees a good opportunity" - so this is an opportunity-scan loop, not an
+// edge-trigger dispatcher like the bots.
+//
+// Per direct instruction this starts in SHADOW mode by default (config.live
+// = false): every cycle still runs the full snapshot -> LLM -> decision
+// pipeline and logs the result (direction/confidence/expiry/reasoning),
+// but no real order is placed until the operator explicitly flips `live`
+// to true. An LLM's judgment can't be walk-forward validated the way a
+// fixed rule can (same prompt, same weights, different day - no stable
+// "edge" to even measure), so the honest trust-building path is: watch it
+// decide for a while, read its reasoning, THEN let it touch money - never
+// the "always forced, always live" treatment meta: specs get elsewhere in
+// this codebase, which is appropriate there because that's a FIXED
+// combinator the operator already built and chose to run; here the
+// operator hasn't even seen a single decision yet.
+//
+// A live decision still goes through ExecutionService.placeOrder(), so the
+// SAME risk manager (kill switch, daily loss limit, max stake, max
+// concurrent positions, loss-streak cooldown, sentinel, market hours) gates
+// it exactly like every other order in this system - there is no side door
+// around that gate for this trader or any other.
+//
+// KNOWN GAP (documented, not silently skipped): the OTC defense guard
+// (otcguard.ts) placebo-tests a fixed strategyKey against its own
+// synthetic-feed calibration - there is no strategyKey here (a prompt
+// isn't one), so OTC gating does not apply to this trader yet. Treat an
+// OTC asset here as unverified until that's addressed; the global risk
+// manager's other gates still apply either way.
+
+import type { Timeframe, TradeKind } from '../types'
+import type { KernelContext, Plugin } from '../kernel'
+import { Store } from '../store'
+import type { MarketDataService } from './market-data'
+import type { ExecutionService } from './execution'
+import type { MetaStrategyService } from './metastrategy'
+import { chatComplete, type ChatMessage } from '../lib/llm'
+
+export interface AiTraderConfig {
+  enabled: boolean
+  /** false (default) = shadow: decide + log every cycle, place nothing.
+   *  true = act on non-skip decisions through the real risk-gated order path. */
+  live: boolean
+  asset: string
+  tf: Timeframe
+  /** Minutes between opportunity scans - NOT a guaranteed trade cadence
+   *  ("6 trades an hour" is the user's own ceiling if it sees an
+   *  opportunity every single cycle; a quiet market can skip every cycle). */
+  intervalMin: number
+  stake: number
+  kind: TradeKind
+  /** Decisions below this are forced to 'skip' regardless of what the model
+   *  itself returned - the floor the operator sets, not just a suggestion
+   *  the model can talk itself past. */
+  minConfidence: number
+  /** Expiry choices (minutes) the prompt offers the model - it picks ONE
+   *  per decision, it does not invent others. */
+  expiryChoices: number[]
+  /** LLM provider override - omit to use whatever's enabled in trading-
+   *  core's own .env (see lib/llm.ts's module header for why that's a
+   *  SEPARATE env read from the frontend's). */
+  provider?: string
+}
+
+export interface AiTraderDecision {
+  id: number
+  asset: string
+  tf: string
+  direction: 'call' | 'put' | 'skip'
+  confidence: number
+  expiryMin: number | null
+  reasoning: string
+  live: boolean
+  acted: boolean
+  positionId: string | null
+  provider: string | null
+  model: string | null
+  error: string | null
+  ts: number
+}
+
+const DEFAULT_CONFIG: AiTraderConfig = {
+  enabled: false,
+  live: false,
+  asset: 'EURUSD',
+  tf: '1m',
+  intervalMin: 10,
+  stake: 1,
+  kind: 'binary',
+  minConfidence: 65,
+  expiryChoices: [3, 5],
+}
+
+/** Minutes -> seconds, used for placeOrder's direct expirySec path (binary
+ * accepts an exact expirySec same as turbo/blitz - see execution.ts). */
+const minToSec = (m: number) => Math.max(1, Math.round(m * 60))
+
+interface ParsedDecision {
+  direction: 'call' | 'put' | 'skip'
+  confidence: number
+  expiryMin: number
+  reasoning: string
+}
+
+/** Strict-then-forgiving JSON extraction, same ladder codeAssist.ts's
+ * parseCodeAssistReply uses for the same reason: a model that's 95% good at
+ * "return ONLY JSON" still occasionally wraps it in prose or a fenced block,
+ * and a trade decision is exactly the place NOT to throw that away. */
+function parseDecision(raw: string, fallbackExpiry: number): ParsedDecision | null {
+  const tryParse = (text: string): Record<string, unknown> | null => {
+    try {
+      const v = JSON.parse(text)
+      return typeof v === 'object' && v !== null ? (v as Record<string, unknown>) : null
+    } catch {
+      return null
+    }
+  }
+  let obj = tryParse(raw.trim())
+  if (!obj) {
+    const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i)
+    if (fenced) obj = tryParse(fenced[1].trim())
+  }
+  if (!obj) {
+    const brace = raw.match(/\{[\s\S]*\}/)
+    if (brace) obj = tryParse(brace[0])
+  }
+  if (!obj) return null
+  const dirRaw = String(obj.direction ?? '').toLowerCase()
+  const direction: ParsedDecision['direction'] = dirRaw === 'call' || dirRaw === 'put' ? dirRaw : 'skip'
+  const confidence = Math.max(0, Math.min(100, Number(obj.confidence) || 0))
+  const expiryMin = Number(obj.expiryMin) > 0 ? Number(obj.expiryMin) : fallbackExpiry
+  const reasoning = String(obj.reasoning ?? '').trim() || '(no reasoning given)'
+  return { direction, confidence, expiryMin, reasoning }
+}
+
+export class AiTraderService {
+  private ctx!: KernelContext
+  private store!: Store
+  private market!: MarketDataService
+  private exec!: ExecutionService
+  private meta: MetaStrategyService | null = null
+  private config: AiTraderConfig = { ...DEFAULT_CONFIG }
+  private timer: ReturnType<typeof setInterval> | null = null
+  private running = false // reentrancy guard - a slow LLM call must never overlap its own next tick
+  private lastRunTs = 0
+  private lastError: string | null = null
+  private cycles = 0
+
+  private metaStrategyService(): MetaStrategyService | null {
+    if (this.meta) return this.meta
+    try {
+      this.meta = this.ctx.use<MetaStrategyService>('metaStrategy')
+    } catch {
+      this.meta = null
+    }
+    return this.meta
+  }
+
+  async start(ctx: KernelContext): Promise<void> {
+    this.ctx = ctx
+    this.store = ctx.use<Store>('store')
+    this.market = ctx.use<MarketDataService>('market')
+    this.exec = ctx.use<ExecutionService>('execution')
+    const saved = this.store.getAiTraderConfig() as Partial<AiTraderConfig> | null
+    this.config = { ...DEFAULT_CONFIG, ...(saved ?? {}) }
+    this.store.pruneAiTraderDecisions(1000)
+    ctx.log('ai-trader', `AI Trader online - ${this.config.enabled ? 'ENABLED' : 'disabled'}, ${this.config.live ? 'LIVE' : 'shadow (logging only)'}, ${this.config.asset} ${this.config.tf}, every ${this.config.intervalMin}min`)
+    this.scheduleTimer()
+  }
+
+  stop(): void {
+    if (this.timer) clearInterval(this.timer)
+    this.timer = null
+  }
+
+  private scheduleTimer(): void {
+    if (this.timer) {
+      clearInterval(this.timer)
+      this.timer = null
+    }
+    if (!this.config.enabled) return
+    const ms = Math.max(1, this.config.intervalMin) * 60 * 1000
+    this.timer = setInterval(() => void this.runCycle(), ms)
+  }
+
+  getStatus() {
+    return {
+      config: this.config,
+      enabled: this.config.enabled,
+      live: this.config.live,
+      running: this.running,
+      cycles: this.cycles,
+      lastRunTs: this.lastRunTs,
+      nextRunTs: this.config.enabled && this.lastRunTs ? this.lastRunTs + this.config.intervalMin * 60 : null,
+      lastError: this.lastError,
+    }
+  }
+
+  configure(patch: Partial<AiTraderConfig>): AiTraderConfig {
+    this.config = { ...this.config, ...patch }
+    this.store.saveAiTraderConfig(this.config)
+    this.scheduleTimer()
+    this.emit('info', `AI Trader config updated - ${this.config.enabled ? 'enabled' : 'disabled'} · ${this.config.live ? 'LIVE' : 'shadow'} · ${this.config.asset} ${this.config.tf} · every ${this.config.intervalMin}min`)
+    return this.config
+  }
+
+  listDecisions(limit = 100): AiTraderDecision[] {
+    return this.store.listAiTraderDecisions(limit) as AiTraderDecision[]
+  }
+
+  /** Manual trigger - the UI's "run a cycle now" button, and how this gets
+   * tested without waiting out a real interval. Runs the exact same path
+   * runCycle's timer calls, just on demand. */
+  async runNow(): Promise<{ ok: boolean; decision?: AiTraderDecision; error?: string }> {
+    try {
+      const d = await this.runCycle()
+      return d ? { ok: true, decision: d } : { ok: false, error: this.lastError ?? 'cycle did not produce a decision' }
+    } catch (err) {
+      return { ok: false, error: String(err instanceof Error ? err.message : err) }
+    }
+  }
+
+  /** Best-effort recent track record for THIS asset+tf, folded into the
+   * prompt so the model isn't reasoning in a vacuum about its own past
+   * calls - open positions are excluded (no outcome yet), settled ones
+   * contribute win/loss. Never throws; a store/position lookup failure
+   * just means an empty record, not a broken cycle. */
+  private recentRecord(asset: string, tf: string): { wins: number; losses: number; open: number } {
+    let wins = 0
+    let losses = 0
+    let open = 0
+    try {
+      const rows = this.store
+        .listAiTraderDecisions(50)
+        .filter((r) => r.asset === asset && r.tf === tf && r.acted && r.positionId)
+      for (const r of rows) {
+        const pos = this.store.getPosition(r.positionId as string)
+        if (!pos) continue
+        if (pos.status === 'open') open += 1
+        else if ((pos.pnl ?? 0) > 0) wins += 1
+        else losses += 1
+      }
+    } catch {
+      // best-effort only
+    }
+    return { wins, losses, open }
+  }
+
+  private async runCycle(): Promise<AiTraderDecision | null> {
+    if (this.running) return null // reentrancy guard - see field comment
+    this.running = true
+    const ts = Math.floor(Date.now() / 1000)
+    this.lastRunTs = ts
+    this.cycles += 1
+    const { asset, tf } = this.config
+    try {
+      const meta = this.metaStrategyService()
+      const snapshot = meta ? meta.snapshotSources(asset, tf) : []
+      let price = 0
+      try {
+        price = this.market.getPrice(asset)
+      } catch {
+        price = 0
+      }
+      const record = this.recentRecord(asset, tf)
+
+      const snapshotLines = snapshot.length
+        ? snapshot.map((r) => `- ${r.label}`).join('\n')
+        : '- (no panel reads available - thin history or plugins still warming up)'
+
+      const system: ChatMessage = {
+        role: 'system',
+        content: [
+          'You are the AI Trader inside IQAIR//OS, a binary-options trading platform.',
+          'You scan the market periodically (not every candle) and decide whether THIS is a',
+          'genuinely good moment to take a trade, or whether to stand aside. Most cycles should',
+          'be a SKIP - only call/put when the panel reads below give you real, non-contradictory',
+          'conviction. You are not required to trade every cycle.',
+          '',
+          'Respond with ONLY a JSON object, no prose outside it, in exactly this shape:',
+          '{"direction": "call" | "put" | "skip", "confidence": 0-100, "expiryMin": <one of the offered choices>, "reasoning": "<one or two sentences, concrete, referencing the actual reads below>"}',
+        ].join('\n'),
+      }
+      const user: ChatMessage = {
+        role: 'user',
+        content: [
+          `Asset: ${asset}   Timeframe: ${tf}   Current price: ${price || 'unavailable'}`,
+          `Allowed expiry choices (minutes): ${this.config.expiryChoices.join(', ')}`,
+          `Your own recent record on this exact asset+tf: ${record.wins}W / ${record.losses}L settled, ${record.open} still open.`,
+          '',
+          'Current panel reads:',
+          snapshotLines,
+          '',
+          `Minimum confidence to actually act: ${this.config.minConfidence} (a lower confidence will be treated as a skip regardless of direction, so be honest rather than inflating it).`,
+        ].join('\n'),
+      }
+
+      let content: string
+      let provider = ''
+      let model = ''
+      try {
+        const res = await chatComplete({ messages: [system, user], temperature: 0.4, maxTokens: 500, timeoutMs: 45_000 })
+        content = res.content
+        provider = res.provider
+        model = res.model
+      } catch (err) {
+        const msg = String(err instanceof Error ? err.message : err)
+        this.lastError = msg
+        this.store.recordAiTraderDecision({
+          asset, tf, direction: 'skip', confidence: 0, reasoning: `LLM call failed: ${msg}`,
+          snapshot, live: this.config.live, acted: false, error: msg, ts,
+        })
+        this.emit('warn', `AI Trader cycle failed on ${asset} ${tf}: ${msg}`)
+        return null
+      }
+
+      const parsed = parseDecision(content, this.config.expiryChoices[0] ?? 3)
+      if (!parsed) {
+        this.lastError = 'model reply was not parseable JSON'
+        this.store.recordAiTraderDecision({
+          asset, tf, direction: 'skip', confidence: 0, reasoning: `unparseable model reply: ${content.slice(0, 300)}`,
+          snapshot, live: this.config.live, acted: false, provider, model, error: 'unparseable reply', ts,
+        })
+        this.emit('warn', `AI Trader got an unparseable reply on ${asset} ${tf} - treated as skip`)
+        return null
+      }
+      this.lastError = null
+
+      // the floor is enforced HERE, not just suggested in the prompt - a
+      // model that talks itself into high confidence on a weak setup still
+      // gets overridden if the operator's own floor says no
+      let direction = parsed.direction
+      if (direction !== 'skip' && parsed.confidence < this.config.minConfidence) {
+        direction = 'skip'
+      }
+
+      let acted = false
+      let positionId: string | null = null
+      let actionError: string | undefined
+
+      if (direction !== 'skip' && this.config.live) {
+        const out = await this.exec.placeOrder({
+          asset,
+          tf,
+          side: direction,
+          kind: this.config.kind,
+          amount: this.config.stake,
+          expirySec: minToSec(parsed.expiryMin),
+          mode: this.exec.accountSource === 'iq' ? 'live' : 'paper',
+          strategy: 'ai-trader',
+          note: 'ai-trader',
+        })
+        if (out.ok && out.position) {
+          acted = true
+          positionId = out.position.id
+          this.emit('success', `[AI Trader] ${direction.toUpperCase()} ${asset} $${this.config.stake} @ ${parsed.expiryMin}min - ${parsed.reasoning} (confidence ${parsed.confidence.toFixed(0)}%)`)
+        } else {
+          actionError = out.error ?? 'order rejected'
+          this.emit('warn', `[AI Trader] wanted ${direction.toUpperCase()} ${asset} but the order was rejected: ${actionError}`)
+        }
+      } else if (direction !== 'skip') {
+        // shadow mode - a real decision, logged, but no order placed
+        this.emit('info', `[AI Trader][SHADOW] would ${direction.toUpperCase()} ${asset} $${this.config.stake} @ ${parsed.expiryMin}min - ${parsed.reasoning} (confidence ${parsed.confidence.toFixed(0)}%)`)
+      }
+
+      this.store.recordAiTraderDecision({
+        asset, tf, direction, confidence: parsed.confidence, expiryMin: parsed.expiryMin,
+        reasoning: parsed.reasoning, snapshot, live: this.config.live, acted, positionId: positionId ?? undefined,
+        provider, model, error: actionError, ts,
+      })
+
+      const rows = this.store.listAiTraderDecisions(1)
+      return (rows[0] as AiTraderDecision) ?? null
+    } finally {
+      this.running = false
+    }
+  }
+
+  private emit(level: 'info' | 'warn' | 'danger' | 'success', message: string): void {
+    this.ctx.bus.emit('alert', { level, message, ts: Math.floor(Date.now() / 1000) })
+  }
+}
+
+export const aiTraderPlugin: Plugin = {
+  name: 'ai-trader',
+  start: async (ctx) => {
+    const svc = new AiTraderService()
+    await svc.start(ctx)
+    ctx.provide('aiTrader', svc)
+  },
+}

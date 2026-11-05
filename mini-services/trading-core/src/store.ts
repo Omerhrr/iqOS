@@ -236,6 +236,28 @@ export class Store {
         config TEXT NOT NULL,
         ts INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS ai_trader_config (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        config TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS ai_trader_decisions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        asset TEXT NOT NULL,
+        tf TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        expiry_min REAL,
+        reasoning TEXT NOT NULL,
+        snapshot TEXT NOT NULL,
+        live INTEGER NOT NULL,
+        acted INTEGER NOT NULL,
+        position_id TEXT,
+        provider TEXT,
+        model TEXT,
+        error TEXT,
+        ts INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_ai_trader_decisions_ts ON ai_trader_decisions(ts);
     `)
   }
 
@@ -830,6 +852,115 @@ export class Store {
       `INSERT INTO otc_config (id, config, ts) VALUES (1, ?, ?)
        ON CONFLICT(id) DO UPDATE SET config = excluded.config, ts = excluded.ts`,
       [JSON.stringify(config), Math.floor(Date.now() / 1000)],
+    )
+  }
+
+  // ---------- AI Trader (LLM-reasoned decision loop) ----------
+
+  getAiTraderConfig(): unknown | null {
+    const row = this.db.query('SELECT config FROM ai_trader_config WHERE id = 1').get() as { config: string } | null
+    if (!row) return null
+    try {
+      return JSON.parse(row.config)
+    } catch {
+      return null
+    }
+  }
+
+  saveAiTraderConfig(config: unknown): void {
+    this.db.run('INSERT INTO ai_trader_config (id, config) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET config = excluded.config', [
+      JSON.stringify(config),
+    ])
+  }
+
+  /** One row per decision cycle - including every SKIP, not just acted-on
+   * trades, so the shadow-mode log actually shows what the AI would have
+   * done and why, not just a sparse trade history. */
+  recordAiTraderDecision(d: {
+    asset: string
+    tf: string
+    direction: 'call' | 'put' | 'skip'
+    confidence: number
+    expiryMin?: number
+    reasoning: string
+    snapshot: unknown
+    live: boolean
+    acted: boolean
+    positionId?: string
+    provider?: string
+    model?: string
+    error?: string
+    ts: number
+  }): void {
+    this.db.run(
+      `INSERT INTO ai_trader_decisions
+         (asset, tf, direction, confidence, expiry_min, reasoning, snapshot, live, acted, position_id, provider, model, error, ts)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        d.asset, d.tf, d.direction, d.confidence, d.expiryMin ?? null, d.reasoning,
+        JSON.stringify(d.snapshot), d.live ? 1 : 0, d.acted ? 1 : 0,
+        d.positionId ?? null, d.provider ?? null, d.model ?? null, d.error ?? null, d.ts,
+      ],
+    )
+  }
+
+  listAiTraderDecisions(limit = 100): {
+    id: number
+    asset: string
+    tf: string
+    direction: string
+    confidence: number
+    expiryMin: number | null
+    reasoning: string
+    snapshot: unknown
+    live: boolean
+    acted: boolean
+    positionId: string | null
+    provider: string | null
+    model: string | null
+    error: string | null
+    ts: number
+  }[] {
+    const rows = this.db
+      .query(
+        `SELECT id, asset, tf, direction, confidence, expiry_min, reasoning, snapshot, live, acted, position_id, provider, model, error, ts
+         FROM ai_trader_decisions ORDER BY ts DESC, id DESC LIMIT ?`,
+      )
+      .all(limit) as {
+      id: number; asset: string; tf: string; direction: string; confidence: number; expiry_min: number | null
+      reasoning: string; snapshot: string; live: number; acted: number; position_id: string | null
+      provider: string | null; model: string | null; error: string | null; ts: number
+    }[]
+    return rows.map((r) => ({
+      id: r.id,
+      asset: r.asset,
+      tf: r.tf,
+      direction: r.direction,
+      confidence: r.confidence,
+      expiryMin: r.expiry_min,
+      reasoning: r.reasoning,
+      snapshot: (() => {
+        try {
+          return JSON.parse(r.snapshot)
+        } catch {
+          return null
+        }
+      })(),
+      live: Boolean(r.live),
+      acted: Boolean(r.acted),
+      positionId: r.position_id,
+      provider: r.provider,
+      model: r.model,
+      error: r.error,
+      ts: r.ts,
+    }))
+  }
+
+  /** Keep the decision log bounded - called on plugin start. */
+  pruneAiTraderDecisions(keep = 1000): void {
+    this.db.run(
+      `DELETE FROM ai_trader_decisions WHERE id NOT IN (SELECT id FROM ai_trader_decisions ORDER BY ts DESC, id DESC LIMIT ?)`,
+      [keep],
     )
   }
 

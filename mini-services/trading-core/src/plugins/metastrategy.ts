@@ -98,6 +98,24 @@ export class MetaStrategyService {
     return id.startsWith('meta:') && this.specs.has(normalizeMetaId(id))
   }
 
+  /** Public snapshot of the most decision-relevant panel reads for one pair -
+   * exposes the same readSource() this service already uses to build Meta-
+   * Strategy conditions and MSL script reads, so any OTHER consumer that
+   * wants "what do our panels currently say about this pair" (the AI Trader's
+   * market-analysis prompt, say) gets the identical reads a human flipping
+   * through the panels would see, instead of a second reimplementation that
+   * could drift from this one. Deliberately a curated subset, not the full
+   * ~20-source buildScriptReads() map - candle/bar/line/area/tick/footprint/
+   * tpo/ivHv etc are MSL script primitives, not independently decision-worthy
+   * panel reads on their own. */
+  snapshotSources(asset: string, tf: Timeframe): MetaSourceRead[] {
+    const sources: MetaConditionSource[] = [
+      'oracle', 'hmaRocBullBear', 'momentumScore', 'accute', 'renko',
+      'smc', 'smcNow', 'renkoSmc', 'renkoSmcMajority', 'pointFigure', 'rangeBars',
+    ]
+    return sources.map((s) => this.readSource(s, asset, tf))
+  }
+
   /** Save (or overwrite) a spec. Two ways to build one, per direct
    * instruction ("let's create our own strategy language, that we can use
    * to achieve almost everything" instead of hand-written JSON):

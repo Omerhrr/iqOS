@@ -21,6 +21,7 @@ import { fmtMoney, fmtPct, fmtPrice, fmtTime, osGet, osPost } from '@/lib/os/cli
 import BacktestLab from './BacktestLab'
 import QuantPanel from './QuantPanel'
 import AutopilotPanel from './AutopilotPanel'
+import AiTraderPanel from './AiTraderPanel'
 import AILabPanel from './AILabPanel'
 import JournalTab from './JournalTab'
 import ScreenerPanel from './ScreenerPanel'
@@ -235,6 +236,7 @@ export default function BottomTabs(props: BottomTabsProps) {
             ['smc', 'SMC'],
             ['meta-strategy', 'Meta-Strategy'],
             ['autopilot', `Autopilot${props.bots.filter((b) => b.bot.enabled).length ? ` (${props.bots.filter((b) => b.bot.enabled).length})` : ''}`],
+            ['ai-trader', 'AI Trader'],
             ['sentinel', 'Sentinel'],
             ['watchdog', 'Watchdog'],
             ['research', 'Research'],
@@ -404,6 +406,13 @@ export default function BottomTabs(props: BottomTabsProps) {
             onChanged={props.refreshBots}
             onError={onError}
           />
+        </div>
+      </TabsContent>
+
+      {/* AI TRADER - LLM-reasoned opportunity scan, "meta/auto trader with brains" */}
+      <TabsContent value="ai-trader" className="mt-0 min-h-0 flex-1 overflow-hidden">
+        <div className="h-full">
+          <AiTraderPanel assets={props.assets} onError={onError} />
         </div>
       </TabsContent>
 
