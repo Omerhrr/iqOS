@@ -8,6 +8,15 @@ import { createHash, timingSafeEqual } from 'crypto'
 import { appendFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { Server } from 'socket.io'
+import { loadSharedEnv } from './src/lib/envfile'
+
+// Load the repo-root .env (the SAME file the Next.js app / Copilot reads)
+// before anything below touches process.env - trading-core is a separate
+// process with its own cwd, so Bun's automatic .env loading never saw this
+// file on its own. Must run before the KERNEL_PORT/KERNEL_TOKEN reads below,
+// and before any plugin that reads an LLM provider env var at call time.
+loadSharedEnv()
+
 import { Kernel } from './src/kernel'
 import { storePlugin } from './src/plugins/store'
 import { osModePlugin, ModeService, type OsMode } from './src/plugins/os-mode'
