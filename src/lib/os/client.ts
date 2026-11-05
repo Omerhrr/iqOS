@@ -273,10 +273,18 @@ export async function getSmcGlobal(tf: Timeframe, opts: { limit?: number; market
 // ---------- Meta-strategy (panel-combinator strategies, trading-core/src/analytics+plugins/metastrategy.ts) ----------
 // Build a strategy OUT OF the panels directly - "Oracle call AND HMA/ROC/
 // Bull-Bear call AND Accute call AND Renko call" - instead of out of raw
-// candles. Deliberately NOT a scripting language: a spec is plain data (a
-// list of conditions + one combine rule), never executable code.
+// candles. Two ways to build a spec, per direct instruction ("instead of
+// using json, lets create our own strategy language, that we can use to
+// achieve almost everything"):
+//   - conditions-built (the default, simple path, below) - plain data (a
+//     list of conditions + one combine rule), never executable code.
+//   - script-built (MetaStrategySpec.script) - the Meta Strategy Lab's
+//     own small language (mini-services/trading-core/src/analytics/
+//     strategylang.ts), real boolean/arithmetic logic over the same named
+//     panel reads, still sandboxed (no loops, no I/O, no raw candles) -
+//     see that module's header for the full grammar.
 
-export type MetaConditionSource = 'oracle' | 'hmaRocBullBear' | 'momentumScore' | 'accute' | 'renko' | 'smc'
+export type MetaConditionSource = 'oracle' | 'hmaRocBullBear' | 'momentumScore' | 'accute' | 'renko' | 'smc' | 'smcNow' | 'renkoSmc'
 
 export const META_CONDITION_SOURCE_LABELS: Record<MetaConditionSource, string> = {
   oracle: 'Next-Candle Oracle',
@@ -284,14 +292,41 @@ export const META_CONDITION_SOURCE_LABELS: Record<MetaConditionSource, string> =
   momentumScore: 'Market Momentum Score',
   accute: 'Accute',
   renko: 'Renko',
-  smc: 'Smart Money Concepts',
+  smc: 'Smart Money Concepts (blended)',
+  smcNow: 'SMC "now" (this candle only)',
+  renkoSmc: 'Renko + SMC "now" confluence',
 }
+
+/** All 15 SMC concepts, same list Meta Trader's own smc-<kind> sources
+ * cover - only meaningful on a 'smcNow' condition's optional smcKind
+ * field (undefined = the aggregate "now" read across all of them except
+ * Support & Resistance). */
+export const ALL_SMC_KINDS = [
+  'FVG',
+  'IFVG',
+  'ORDER_BLOCK',
+  'BREAKER_BLOCK',
+  'LIQUIDITY_SWEEP',
+  'BOS',
+  'CHOCH',
+  'OTE',
+  'KRM',
+  'SUPPLY_DEMAND',
+  'SUPPORT_RESISTANCE',
+  'BREAKOUT',
+  'CRT',
+  'POWER_OF_3',
+  'SILVER_BULLET',
+] as const
 
 export interface MetaCondition {
   source: MetaConditionSource
   direction: 'call' | 'put' | 'either'
   minConfidence?: number
   weight?: number
+  /** only meaningful when source === 'smcNow' - one of ALL_SMC_KINDS, or
+   * undefined for the aggregate "now" read. */
+  smcKind?: string
 }
 
 export interface MetaStrategySpec {
@@ -300,6 +335,11 @@ export interface MetaStrategySpec {
   mode: 'all' | 'any' | 'weighted'
   threshold?: number
   conditions: MetaCondition[]
+  /** the strategy-language source, when this spec is script-built - see
+   * the module header above. Takes priority over `conditions` whenever
+   * it's set (kept non-empty so switching back to the dropdown builder
+   * in the UI doesn't lose what was there). */
+  script?: string
   createdTs?: number
   updatedTs?: number
 }
@@ -347,6 +387,7 @@ export async function saveMetaStrategy(input: {
   mode: 'all' | 'any' | 'weighted'
   threshold?: number
   conditions: MetaCondition[]
+  script?: string
 }): Promise<{ ok: boolean; id: string; spec: MetaStrategySpec; error?: string }> {
   return osPost('/meta_strategy_save', input)
 }
@@ -357,6 +398,22 @@ export async function deleteMetaStrategy(id: string): Promise<{ ok: boolean; err
 
 export async function evalMetaStrategy(id: string, asset: string, tf: Timeframe): Promise<MetaStrategyEvalResponse> {
   return osGet<MetaStrategyEvalResponse>('/meta_strategy_eval', { id, asset, tf })
+}
+
+/** Dry-run a strategy-script string against one asset+tf without saving
+ * it - backs the Meta Strategy Lab code editor's "test" button. */
+export interface MetaStrategyScriptTestResponse {
+  ok: boolean
+  direction?: 'call' | 'put' | 'none'
+  confidence?: number
+  trace?: string[]
+  price?: number
+  error?: string
+  ts?: number
+}
+
+export async function testMetaStrategyScript(script: string, asset: string, tf: Timeframe): Promise<MetaStrategyScriptTestResponse> {
+  return osPost('/meta_strategy_test_script', { script, asset, tf })
 }
 
 // IQ Option exposes no real bid/ask-tagged trades or order-book depth, so all
@@ -3944,6 +4001,7 @@ export type MetaTraderSource =
   | 'smc-crt'
   | 'smc-power-of-3'
   | 'smc-silver-bullet'
+  | 'renko-smc'
 
 export interface MetaStakePlan {
   kind: 'compound'

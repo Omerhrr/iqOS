@@ -4134,8 +4134,24 @@ const httpServer = createServer(async (req, res) => {
               mode: body.mode === 'any' || body.mode === 'weighted' ? body.mode : 'all',
               threshold: body.threshold !== undefined ? Number(body.threshold) : undefined,
               conditions: Array.isArray(body.conditions) ? body.conditions : [],
+              script: typeof body.script === 'string' ? body.script : undefined,
             }),
           })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // POST /meta_strategy_test_script {script, asset, tf} - dry-run a
+      // Meta Strategy Lab script against one pair WITHOUT saving it, for
+      // the code editor's own "test" button (analytics/strategylang.ts).
+      if (path === '/meta_strategy_test_script') {
+        try {
+          const meta = kernel.context().use<MetaStrategyService>('metaStrategy')
+          const tfv = tfStrict(String(body.tf ?? ''))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(String(body.tf ?? '')) })
+          const asset = String(body.asset ?? market.activeAsset)
+          return json(200, { ...meta.testScript(String(body.script ?? ''), asset, tfv), ts: Date.now() })
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }

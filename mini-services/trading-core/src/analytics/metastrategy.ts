@@ -32,9 +32,11 @@ export type MetaConditionSource =
   | 'momentumScore' // the Oracle panel's second secondary read, the user's own Market Momentum Score formula (analytics/momentumscore.ts)
   | 'accute' // Accute's fused multi-driver prediction (plugins/accute.ts)
   | 'renko' // Renko brick trend/streak (analytics/renko.ts, same read Accute's own renko leg uses)
-  | 'smc' // Smart Money Concepts structure summary (analytics/smc.ts)
+  | 'smc' // Smart Money Concepts BLENDED structure summary (analytics/smc.ts's scanSmc().summary - mixes in older hits, not just this candle)
+  | 'smcNow' // SMC "now" read (analytics/smc.ts's smcNowRead(), barsAgo===0 only) - aggregate across all 14 non-S&R concepts by default, or ONE concept via this condition's `smcKind` field ("build all the smc strats separately", same per-kind reads Meta Trader's own smc-<kind> sources use)
+  | 'renkoSmc' // Renko trend + SMC "now" confluence - same rule Meta Trader's 'renko-smc' source trades (renko green + smc now up = call, renko red + smc now down = put), as a condition any meta-strategy can require
 
-export const META_CONDITION_SOURCES: readonly MetaConditionSource[] = ['oracle', 'hmaRocBullBear', 'momentumScore', 'accute', 'renko', 'smc']
+export const META_CONDITION_SOURCES: readonly MetaConditionSource[] = ['oracle', 'hmaRocBullBear', 'momentumScore', 'accute', 'renko', 'smc', 'smcNow', 'renkoSmc']
 
 export type MetaDirection = 'call' | 'put' | 'none'
 
@@ -53,6 +55,12 @@ export interface MetaCondition {
   /** Only used in 'weighted' mode - this condition's share of the vote.
    * Default 1 (every condition counts equally unless you say otherwise). */
   weight?: number
+  /** Only meaningful when source === 'smcNow' - which of the 15 SMC
+   * concepts to read "now" (barsAgo===0) instead of the default aggregate
+   * (every concept except Support & Resistance). Lets a dropdown-built
+   * spec target one concept the same way Meta Trader's own smc-<kind>
+   * sources do, without a new MetaConditionSource per kind. */
+  smcKind?: string
 }
 
 export interface MetaStrategySpec {
@@ -73,7 +81,23 @@ export interface MetaStrategySpec {
    * Default 60 - the same "clearly leaning, not a coin flip" bar the
    * Oracle's own driver fusion effectively enforces via its deadband. */
   threshold?: number
+  /** Dropdown-built conditions - the default, simple path. Required to
+   * have at least one entry UNLESS `script` is set (see below) - a spec
+   * is either conditions-built or script-built, never both evaluated at
+   * once (script, when present, always wins - see plugins/
+   * metastrategy.ts's evaluate()). */
   conditions: MetaCondition[]
+  /** The Meta Strategy Lab's own strategy language (analytics/
+   * strategylang.ts) - "instead of using json, our own strategy language,
+   * that we can use to achieve almost everything" per direct instruction.
+   * When set, this spec is evaluated by parsing+running this source
+   * instead of combining `conditions` - `conditions`/`mode`/`threshold`
+   * are then ignored (but still saved, so switching back to the dropdown
+   * builder doesn't lose what was there before). Validated at save() time
+   * (parseStrategyScript) so a broken script never reaches the trading
+   * loop - a script that fails to parse is rejected on save, not silently
+   * traded as "no signal" later. */
+  script?: string
   createdTs?: number
   updatedTs?: number
 }

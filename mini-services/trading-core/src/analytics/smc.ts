@@ -57,6 +57,29 @@ export type SmcKind =
   | 'POWER_OF_3'
   | 'SILVER_BULLET'
 
+/** Every SmcKind, in the same order the union above lists them - the
+ * runtime companion to the type, for callers that need to iterate all 15
+ * concepts (plugins/metastrategy.ts building the strategy-language
+ * `smc:<KIND>` read map; plugins/metatrader.ts's SMC_KIND_SOURCE could
+ * use this too, left as-is to avoid an unrelated diff). */
+export const ALL_SMC_KINDS: readonly SmcKind[] = [
+  'FVG',
+  'IFVG',
+  'ORDER_BLOCK',
+  'BREAKER_BLOCK',
+  'LIQUIDITY_SWEEP',
+  'BOS',
+  'CHOCH',
+  'OTE',
+  'KRM',
+  'SUPPLY_DEMAND',
+  'SUPPORT_RESISTANCE',
+  'BREAKOUT',
+  'CRT',
+  'POWER_OF_3',
+  'SILVER_BULLET',
+]
+
 export interface SmcSignal {
   kind: SmcKind
   direction: SmcDirection
@@ -687,4 +710,45 @@ export function smcSummaryScore(result: SmcScanResult | null): number {
   if (!result || result.summary.direction === 'none') return 0
   const sign = result.summary.direction === 'call' ? 1 : -1
   return sign * (result.summary.confidence / 100)
+}
+
+/** barsAgo===0 read of an SmcScanResult, optionally restricted to one kind -
+ * "the now moment itself is the whole signal" rather than the blended
+ * summary above (which mixes in older hits too). Shared by Meta Trader
+ * (plugins/metatrader.ts - each of the 15 SMC concepts as its own signal
+ * source, plus the aggregate, plus the Renko+SMC confluence source), and
+ * the Meta Strategy Lab (plugins/metastrategy.ts - the 'smcNow' condition
+ * source, its per-kind variants, and the strategy-language evaluator's
+ * `smc:<KIND>` reads) - originally lived only in metatrader.ts; moved here
+ * per direct instruction to reuse the exact same "now" read everywhere
+ * instead of duplicating this logic a second time.
+ *
+ * No-vote-required: any now-signal fires. A tie breaks on whichever
+ * concept hit first in the scan's own order (SmcScanResult.signals is
+ * itself ordered - see the sort just above scanSmc's return), rather than
+ * standing aside. Confidence is how many "now" signals agree with the
+ * winning side (including itself) out of every "now" signal across all
+ * kinds - a lone signal with nothing else to agree or disagree with gets
+ * a flat 65 (clearly labeled); a tied split necessarily lands at 50.
+ *
+ * The AGGREGATE read (onlyKind undefined) excludes Support & Resistance
+ * entirely - its touch-cluster read fires far more often than the other
+ * 14 concepts and would drown out everything else in a "now" read. The
+ * dedicated per-kind read for SUPPORT_RESISTANCE itself still works fine -
+ * this exclusion only affects the aggregate. */
+export function smcNowRead(result: SmcScanResult, onlyKind?: SmcKind): { direction: 'call' | 'put' | 'none'; confidence: number; note: string } {
+  const allNow = result.signals.filter((s) => s.barsAgo === 0)
+  const now = onlyKind ? allNow : allNow.filter((s) => s.kind !== 'SUPPORT_RESISTANCE')
+  const pool = onlyKind ? now.filter((s) => s.kind === onlyKind) : now
+  if (pool.length === 0) return { direction: 'none', confidence: 0, note: 'nothing hit this candle' }
+  const bullish = pool.filter((s) => s.direction === 'bullish').length
+  const bearish = pool.filter((s) => s.direction === 'bearish').length
+  const tied = bullish === bearish
+  const direction: 'call' | 'put' = tied ? (pool[0].direction === 'bullish' ? 'call' : 'put') : bullish > bearish ? 'call' : 'put'
+  const winners = Math.max(bullish, bearish)
+  const totalNow = now.length // agreement measured against EVERY kind firing now, not just onlyKind's own pool
+  const confidence = totalNow <= 1 ? 65 : Math.round((winners / totalNow) * 100)
+  const kindNote = onlyKind ? `${onlyKind} now (${pool.length}x)` : `${pool.length} concept(s) now`
+  const tieNote = tied && totalNow > 1 ? ` (tied - went with ${pool[0].kind}'s first fire)` : ''
+  return { direction, confidence, note: `${kindNote} - ${winners}/${totalNow} now-signals agree ${direction}${tieNote}` }
 }

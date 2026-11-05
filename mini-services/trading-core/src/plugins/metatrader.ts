@@ -63,7 +63,10 @@ import type { AccuteService } from './accute'
 import type { MetaStrategyService } from './metastrategy'
 import type { SmcScanService } from './smcscan'
 import type { SmcKind, SmcScanResult } from '../analytics/smc'
+import { smcNowRead } from '../analytics/smc'
 import type { OsMode } from './os-mode'
+import type { Candle } from '../types'
+import { renkoBricks } from '../analytics/renko'
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
 const finGte = (v: number, floor: number): boolean => Number.isFinite(v) && v >= floor
@@ -150,6 +153,7 @@ export type MetaTraderSource =
   | 'smc-crt'
   | 'smc-power-of-3'
   | 'smc-silver-bullet'
+  | 'renko-smc'
 
 export const META_TRADER_SOURCES: readonly MetaTraderSource[] = [
   'meta-strategy',
@@ -157,6 +161,7 @@ export const META_TRADER_SOURCES: readonly MetaTraderSource[] = [
   'accute',
   'smc',
   ...(Object.values(SMC_KIND_SOURCE) as MetaTraderSource[]),
+  'renko-smc',
 ]
 
 /** Deliberately simpler than the auto-trader's full StakePlan (client.ts) -
@@ -257,51 +262,11 @@ const DEFAULT_META_TRADER: MetaTraderConfig = {
  * confuses the two engines' positions with each other. */
 const META_TRADER_NOTE = 'meta:trader'
 
-/** barsAgo===0 read of an SmcScanResult, optionally restricted to one kind.
- * Per direct instruction, this now matches SmcRecentPanel's own stance:
- * "any signal that one can fires should be fired here also" - any concept
- * that hits THIS candle is eligible to produce a read, with NO majority-
- * vote veto. There used to be a "split evenly - no lean" case that stood
- * aside entirely on an exact bullish/bearish tie; that's gone - a tie now
- * goes with whichever concept fired first in the scan's own signal order
- * (SmcScanResult.signals is itself ordered, so this is deterministic, not
- * arbitrary) rather than refusing to read at all.
- *
- * Confidence is still derived from how many "now" signals agree with the
- * winning side (including itself) out of every "now" signal across all
- * kinds - an honest, explainable number rather than a flat guess, and it
- * naturally rewards a kind firing ALONGSIDE other agreeing structure over
- * one firing in isolation. A lone signal with nothing else to agree or
- * disagree with gets a flat 65 (clearly labeled in the note); a tied split
- * necessarily lands at 50 (half the now-signals agree with whichever side
- * won the tie-break) - the minConfidence floor is what filters that out if
- * you don't want to act on ties.
- *
- * The AGGREGATE 'smc' source (onlyKind undefined) excludes Support &
- * Resistance entirely, per direct instruction - its touch-cluster read
- * fires far more often than the other 14 concepts and would drown out
- * everything else in a "now" read, same reasoning SmcRecentPanel's own
- * EXCLUDED_KINDS already applies on its "now"/"1 bar ago" view. The
- * dedicated 'smc-support-resistance' source (onlyKind === 'SUPPORT_RESISTANCE')
- * still trades it on its own - this exclusion only affects the aggregate. */
-function smcNowRead(result: SmcScanResult, onlyKind?: SmcKind): { direction: 'call' | 'put' | 'none'; confidence: number; note: string } {
-  const allNow = result.signals.filter((s) => s.barsAgo === 0)
-  const now = onlyKind ? allNow : allNow.filter((s) => s.kind !== 'SUPPORT_RESISTANCE')
-  const pool = onlyKind ? now.filter((s) => s.kind === onlyKind) : now
-  if (pool.length === 0) return { direction: 'none', confidence: 0, note: 'nothing hit this candle' }
-  const bullish = pool.filter((s) => s.direction === 'bullish').length
-  const bearish = pool.filter((s) => s.direction === 'bearish').length
-  const tied = bullish === bearish
-  // no-vote-required: any now-signal fires. A tie breaks on whichever
-  // concept hit first in the scan's own order, rather than standing aside.
-  const direction: 'call' | 'put' = tied ? (pool[0].direction === 'bullish' ? 'call' : 'put') : bullish > bearish ? 'call' : 'put'
-  const winners = Math.max(bullish, bearish)
-  const totalNow = now.length // agreement measured against EVERY kind firing now, not just onlyKind's own pool
-  const confidence = totalNow <= 1 ? 65 : Math.round((winners / totalNow) * 100)
-  const kindNote = onlyKind ? `${onlyKind} now (${pool.length}x)` : `${pool.length} concept(s) now`
-  const tieNote = tied && totalNow > 1 ? ` (tied - went with ${pool[0].kind}'s first fire)` : ''
-  return { direction, confidence, note: `${kindNote} - ${winners}/${totalNow} now-signals agree ${direction}${tieNote}` }
-}
+// smcNowRead() moved to analytics/smc.ts (shared with plugins/metastrategy.ts
+// and the strategy-language evaluator's `smc:<KIND>` reads, and reused below
+// by 'renko-smc') - see that module for the full doc comment. Same function,
+// same barsAgo===0/no-vote-required/agreement-ratio-confidence behavior, just
+// no longer duplicated here.
 
 export class MetaTraderService {
   private ctx!: KernelContext
@@ -338,7 +303,7 @@ export class MetaTraderService {
     this.timer = setInterval(() => {
       void this.tick().catch((err) => ctx.log('meta-trader', `tick() rejected, skipping this cycle: ${(err as Error).message}`))
     }, 10_000)
-    ctx.log('meta-trader', `meta trader online (sources: meta-strategy/oracle/accute/smc + 15 individual SMC concepts) - ${this.config.enabled ? 'armed' : 'off'} · src ${this.config.signalSource}`)
+    ctx.log('meta-trader', `meta trader online (sources: meta-strategy/oracle/accute/smc + 15 individual SMC concepts + renko-smc confluence) - ${this.config.enabled ? 'armed' : 'off'} · src ${this.config.signalSource}`)
   }
 
   stop(): void {
@@ -619,6 +584,7 @@ export class MetaTraderService {
     if (src === 'oracle') return this.pickOracle()
     if (src === 'accute') return this.pickAccute()
     if (src === 'smc') return this.pickSmc(undefined)
+    if (src === 'renko-smc') return this.pickRenkoSmc()
     const kind = SOURCE_SMC_KIND[src]
     if (kind) return this.pickSmc(kind)
     return []
@@ -786,6 +752,62 @@ export class MetaTraderService {
         if (read.direction === 'none') continue
         if (this.config.direction !== 'both' && read.direction !== this.config.direction) continue
         const row = this.rowFrom(asset, read.direction, read.confidence, res.result.price, `smc: ${read.note}`)
+        if (row) out.push(row)
+      } catch {
+        /* thin history - try the next */
+      }
+    }
+    return this.rankByRecency(out)
+  }
+
+  /** 'renko-smc' - per direct instruction: "if renko is green and smc now
+   * says up, trade up, but if renko is red and smc now says down, trade
+   * down" - a confluence source that only fires when BOTH legs agree,
+   * never on either one alone. Renko's brick trend is the noise filter
+   * (bricks only paint after price has actually moved a full ATR-scaled
+   * brick size - see analytics/renko.ts's module header and Accute's own
+   * renkoRead()), SMC "now" (smcNowRead(), aggregate - same exclusion of
+   * Support & Resistance the plain 'smc' source uses) is the structural
+   * confirmation; neither is honesty-tracked on its own, but requiring
+   * both to point the same way is a stricter bar than either source's
+   * dedicated Meta Trader entry trades alone.
+   *
+   * Confidence blends both legs: SMC's agreement ratio (smcNowRead's own
+   * number) and a Renko streak-based proxy (same `40 + streak*12, capped
+   * 100` scaling plugins/metastrategy.ts's 'renko' condition source
+   * already uses, so a 1-brick confirmation doesn't read as confidently as
+   * a committed multi-brick trend) - simple average of the two, same
+   * "neither source gets to dominate" spirit the rest of this file's
+   * confluence logic follows. Ranked by recency, not confidence, same
+   * reasoning as every other SMC-flavored source (rankByRecency's doc
+   * comment) - this is still fundamentally an SMC "now" read gated by
+   * Renko, not a calibrated number. */
+  private pickRenkoSmc(): MetaTraderRow[] {
+    let smc: SmcScanService
+    try {
+      smc = this.ctx.use<SmcScanService>('smcScan')
+    } catch {
+      return []
+    }
+    const out: MetaTraderRow[] = []
+    for (const asset of this.candidatePool()) {
+      try {
+        const res = smc.scan(asset, this.config.tf)
+        if (!res.result) continue
+        const smcRead = smcNowRead(res.result)
+        if (smcRead.direction === 'none') continue
+
+        const candles: Candle[] = this.market.getCandlesDeep(asset, this.config.tf, 300, true)
+        const renko = renkoBricks(candles)
+        if (renko.trend === 'none') continue
+        const renkoDirection: 'call' | 'put' = renko.trend === 'up' ? 'call' : 'put'
+        if (renkoDirection !== smcRead.direction) continue // confluence required - either alone does not qualify
+
+        if (this.config.direction !== 'both' && renkoDirection !== this.config.direction) continue
+        const renkoConfidence = Math.min(100, 40 + renko.streak * 12)
+        const confidence = Math.round((smcRead.confidence + renkoConfidence) / 2)
+        const note = `renko+smc: ${renko.streak} ${renko.trend.toUpperCase()} brick(s) & ${smcRead.note}`
+        const row = this.rowFrom(asset, renkoDirection, confidence, res.result.price, note)
         if (row) out.push(row)
       } catch {
         /* thin history - try the next */
