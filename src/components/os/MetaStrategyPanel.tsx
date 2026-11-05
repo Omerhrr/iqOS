@@ -43,12 +43,41 @@ interface MetaStrategyPanelProps {
   onError: (m: string) => void
 }
 
-const ALL_SOURCES: MetaConditionSource[] = ['oracle', 'hmaRocBullBear', 'momentumScore', 'accute', 'renko', 'pointFigure', 'rangeBars', 'smc', 'smcNow', 'renkoSmc']
+const ALL_SOURCES: MetaConditionSource[] = [
+  'oracle',
+  'hmaRocBullBear',
+  'momentumScore',
+  'accute',
+  'renko',
+  'pointFigure',
+  'rangeBars',
+  'candle',
+  'bar',
+  'heikinAshi',
+  'line',
+  'area',
+  'baseline',
+  'volumeBars',
+  'tick',
+  'footprint',
+  'tpo',
+  'ivHv',
+  'smc',
+  'smcNow',
+  'renkoSmc',
+  'renkoSmcMajority',
+]
+
+const OPS = ['>=', '>', '<=', '<', '==', '!='] as const
 
 const SCRIPT_PLACEHOLDER = `# Meta Strategy Lab script - combine any panel read with real logic.
 # Sources: oracle, hmaRocBullBear, momentumScore, accute, renko,
-# pointFigure, rangeBars, smc, smcNow, renkoSmc, and smc:<KIND> for any of
-# the 15 SMC concepts (e.g. smc:FVG, smc:BOS, smc:ORDER_BLOCK...).
+# pointFigure, rangeBars, candle, bar, heikinAshi, line, area, baseline,
+# volumeBars, tick, footprint, tpo, ivHv, smc, smcNow, renkoSmc
+# (confluence: any SMC concept agrees with renko), renkoSmcMajority
+# (confluence: SMC's own majority verdict must agree with renko), and
+# smc:<KIND> for any of the 15 SMC concepts (e.g. smc:FVG, smc:BOS,
+# smc:ORDER_BLOCK...).
 # Fields: .dir (call/put/none), .conf (0-100), .active, .call, .put
 
 let strong = smc:FVG.conf >= 60
@@ -60,6 +89,42 @@ confidence = avg(oracle.conf, renko.conf, pointFigure.conf, rangeBars.conf)
 
 function emptyCondition(): MetaCondition {
   return { source: 'oracle', direction: 'either', minConfidence: 50, weight: 1 }
+}
+
+/** "a place to see all the strats... view their source code" per direct
+ * instruction - a script-built spec's source IS its script (shown as-is);
+ * a dropdown-built spec has no stored script, so this renders an
+ * equivalent, readable pseudo-script from its conditions/mode/threshold -
+ * same grammar strategylang.ts understands, so it also doubles as a
+ * starting point for "promoting" a dropdown spec into the code editor. */
+function specSourceCode(s: MetaStrategySpec): string {
+  if (s.script) return s.script
+  const lines: string[] = [`# ${s.name} - auto-generated from the dropdown builder (mode: ${s.mode})`]
+  if (!s.conditions.length) {
+    lines.push('# (no conditions)')
+    return lines.join('\n')
+  }
+  const condExpr = (c: MetaCondition, i: number) => {
+    const ref = c.source === 'smcNow' && c.smcKind ? `smc:${c.smcKind}` : c.source
+    const dirPart = c.direction === 'either' ? `${ref}.active` : `${ref}.dir == ${c.direction}`
+    const op = c.op ?? '>='
+    const confPart = c.minConfidence ? ` and ${ref}.conf ${op} ${c.minConfidence}` : ''
+    return `cond${i} = ${dirPart}${confPart}`
+  }
+  s.conditions.forEach((c, i) => lines.push(condExpr(c, i)))
+  const names = s.conditions.map((_, i) => `cond${i}`)
+  if (s.mode === 'all') {
+    lines.push(`call when ${names.join(' and ')} and ${s.conditions.map((c) => `${c.source}.dir == call`).join(' and ')}`)
+    lines.push(`put when ${names.join(' and ')} and ${s.conditions.map((c) => `${c.source}.dir == put`).join(' and ')}`)
+  } else if (s.mode === 'any') {
+    lines.push(`# fires on majority-side agreement among: ${names.join(', ')}`)
+    lines.push(`call when (${names.join(' or ')}) and count(${s.conditions.map((c) => `${c.source}.dir == call`).join(', ')}) > count(${s.conditions.map((c) => `${c.source}.dir == put`).join(', ')})`)
+    lines.push(`put when (${names.join(' or ')}) and count(${s.conditions.map((c) => `${c.source}.dir == put`).join(', ')}) > count(${s.conditions.map((c) => `${c.source}.dir == call`).join(', ')})`)
+  } else {
+    lines.push(`# weighted score, threshold ${s.threshold ?? 60}% - each condition votes weight(${s.conditions.map((c) => c.weight ?? 1).join(',')}) * its own confidence`)
+    lines.push(`confidence = avg(${s.conditions.map((c) => `${c.source}.conf`).join(', ')})`)
+  }
+  return lines.join('\n')
 }
 
 function dirColor(d: 'call' | 'put' | 'none'): string {
@@ -118,7 +183,19 @@ function ConditionRow({
         <option value="either">either (active)</option>
       </select>
       <label className="flex items-center gap-1 font-mono text-[9px] text-[#7c8aa5]">
-        min conf
+        conf
+        <select
+          value={cond.op ?? '>='}
+          onChange={(e) => onChange({ ...cond, op: e.target.value as MetaCondition['op'] })}
+          className="rounded border border-[#1c2739] bg-[#0b111c] px-1 py-0.5 font-mono text-[9px] text-[#dbe4f0]"
+          title="comparison applied between this source's live confidence and the number below - 'a wide range of conditions' (e.g. fire only while confidence is BELOW a value)"
+        >
+          {OPS.map((o) => (
+            <option key={o} value={o}>
+              {o}
+            </option>
+          ))}
+        </select>
         <input
           type="number"
           min={0}
@@ -167,6 +244,10 @@ export default function MetaStrategyPanel({ asset, tf, onError }: MetaStrategyPa
 
   const [scriptTestResult, setScriptTestResult] = useState<MetaStrategyScriptTestResponse | null>(null)
   const [scriptTestBusy, setScriptTestBusy] = useState(false)
+
+  // "a place to see all the strats we currently have... and view their
+  // source code" per direct instruction - toggled per saved strategy row.
+  const [viewSourceId, setViewSourceId] = useState<string | null>(null)
 
   const refresh = () => {
     getMetaStrategies()
@@ -440,6 +521,13 @@ export default function MetaStrategyPanel({ asset, tf, onError }: MetaStrategyPa
                   <button type="button" onClick={() => runTest(s.id)} className="rounded px-1.5 py-0.5 font-mono text-[9px] text-cyan-300 hover:bg-cyan-500/10">
                     test
                   </button>
+                  <button
+                    type="button"
+                    onClick={() => setViewSourceId((prev) => (prev === s.id ? null : s.id))}
+                    className={`rounded px-1.5 py-0.5 font-mono text-[9px] hover:bg-violet-500/10 ${viewSourceId === s.id ? 'text-violet-300' : 'text-[#aab6cc]'}`}
+                  >
+                    source
+                  </button>
                   <button type="button" onClick={() => loadForEdit(s)} className="rounded px-1.5 py-0.5 font-mono text-[9px] text-[#aab6cc] hover:bg-[#1c2739]">
                     edit
                   </button>
@@ -456,12 +544,21 @@ export default function MetaStrategyPanel({ asset, tf, onError }: MetaStrategyPa
                     <span key={i} className="rounded border border-[#1c2739] px-1 py-px font-mono text-[8px] text-[#7c8aa5]">
                       {META_CONDITION_SOURCE_LABELS[c.source]}
                       {c.smcKind ? `:${c.smcKind}` : ''}:{c.direction}
-                      {c.minConfidence ? ` ≥${c.minConfidence}%` : ''}
+                      {c.minConfidence ? ` ${c.op ?? '>='}${c.minConfidence}%` : ''}
                       {s.mode === 'weighted' ? ` w${c.weight ?? 1}` : ''}
                     </span>
                   ))
                 )}
               </div>
+
+              {viewSourceId === s.id && (
+                <div className="mt-1.5 rounded border border-violet-500/30 bg-[#0b111c] p-1.5">
+                  <div className="mb-1 font-mono text-[8px] uppercase tracking-wider text-violet-300">
+                    {s.script ? 'source (script-built)' : 'source (auto-generated from dropdown builder)'}
+                  </div>
+                  <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-[9px] leading-relaxed text-[#aab6cc]">{specSourceCode(s)}</pre>
+                </div>
+              )}
 
               {testId === s.id && (
                 <div className="mt-1.5 rounded border border-[#1c2739] bg-[#0b111c] p-1.5">

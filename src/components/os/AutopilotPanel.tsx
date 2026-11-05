@@ -2653,7 +2653,8 @@ const META_TRADER_SOURCE_LABELS: Record<MetaTraderSource, string> = {
   'smc-crt': 'SMC: CRT',
   'smc-power-of-3': 'SMC: Power of 3',
   'smc-silver-bullet': 'SMC: Silver Bullet',
-  'renko-smc': 'Renko + SMC confluence',
+  'renko-smc': 'Renko + SMC confluence (any agrees)',
+  'renko-smc-majority': 'Renko + SMC confluence (majority)',
 }
 
 const DEFAULT_META_TRADER_UI: MetaTraderConfig = {
@@ -2829,10 +2830,12 @@ function MetaTraderDialog({
                     : d.signalSource === 'smc'
                       ? 'the SMC scanner\'s AGGREGATE "now" read: every concept that fired on the CURRENT candle only (not the panel\'s all-ages blended summary) - fires on ANY now-signal, no majority vote required'
                       : d.signalSource === 'renko-smc'
-                        ? 'confluence only: trades a pair ONLY when Renko\'s brick trend and SMC\'s aggregate "now" read agree (renko green + smc now up = call, renko red + smc now down = put) - either one alone does not qualify'
-                        : `one single SMC concept (${META_TRADER_SOURCE_LABELS[d.signalSource]}), restricted to the CURRENT candle only - fires the instant it hits, alone or alongside others`}
+                        ? 'confluence (any agrees): trades a pair ONLY when Renko\'s brick trend and AT LEAST ONE SMC concept firing "now" agree on direction - no vote, no majority, one agreeing concept is enough. Either leg alone does not qualify'
+                        : d.signalSource === 'renko-smc-majority'
+                          ? 'confluence (majority): trades a pair ONLY when Renko\'s brick trend matches SMC\'s own AGGREGATE "now" verdict (majority of concepts firing this candle, same read the plain SMC source trades) - stricter than the any-agrees variant above, since a lone agreeing concept can still lose the vote'
+                          : `one single SMC concept (${META_TRADER_SOURCE_LABELS[d.signalSource]}), restricted to the CURRENT candle only - fires the instant it hits, alone or alongside others`}
             </p>
-            {(d.signalSource === 'smc' || d.signalSource.startsWith('smc-') || d.signalSource === 'renko-smc') && (
+            {(d.signalSource === 'smc' || d.signalSource.startsWith('smc-') || d.signalSource === 'renko-smc' || d.signalSource === 'renko-smc-majority') && (
               <p className="mt-1 text-[8px] leading-relaxed text-amber-500/70">
                 Min confidence below does NOT apply to SMC-flavored sources (including Renko+SMC confluence) - its "now"
                 confidence is only a same-candle agreement count, never honesty-tracked against real outcomes the way

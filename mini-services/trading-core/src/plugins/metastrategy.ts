@@ -20,10 +20,14 @@ import type { MarketDataService } from './market-data'
 import type { NextCandleService } from './nextcandle'
 import type { AccuteService } from './accute'
 import type { SmcScanService } from './smcscan'
-import { renkoBricks } from '../analytics/renko'
+import { renkoBricks, renkoAtr } from '../analytics/renko'
 import { rangeBars } from '../analytics/rangebars'
 import { pointFigure } from '../analytics/pointfigure'
-import { smcNowRead, ALL_SMC_KINDS } from '../analytics/smc'
+import { volumeBars } from '../analytics/volumebars'
+import { computeTpo } from '../analytics/tpo'
+import { realizedUpProb } from '../analytics/ivhv'
+import { engineVoteSingle, type ChartEngineVote } from '../analytics/chartsignals'
+import { smcNowRead, smcAnyAgrees, ALL_SMC_KINDS } from '../analytics/smc'
 import {
   evaluateMetaStrategy,
   META_CONDITION_SOURCES,
@@ -132,6 +136,8 @@ export class MetaStrategyService {
         if (c.direction !== 'call' && c.direction !== 'put' && c.direction !== 'either') throw new Error(`condition direction must be 'call'/'put'/'either', got "${c.direction}"`)
         if (c.source === 'smcNow' && c.smcKind !== undefined && !(ALL_SMC_KINDS as readonly string[]).includes(c.smcKind))
           throw new Error(`unknown smcKind "${c.smcKind}" - must be one of ${ALL_SMC_KINDS.join(', ')}`)
+        if (c.op !== undefined && !(['>=', '>', '<=', '<', '==', '!='] as const).includes(c.op))
+          throw new Error(`condition op must be one of >=, >, <=, <, ==, !=, got "${c.op}"`)
       }
     }
     const mode = input.mode === 'any' || input.mode === 'weighted' ? input.mode : 'all'
@@ -143,7 +149,7 @@ export class MetaStrategyService {
       mode,
       threshold: mode === 'weighted' ? Math.max(0, Math.min(100, input.threshold ?? 60)) : undefined,
       conditions: Array.isArray(input.conditions)
-        ? input.conditions.map((c) => ({ source: c.source, direction: c.direction, minConfidence: c.minConfidence, weight: c.weight, smcKind: c.smcKind }))
+        ? input.conditions.map((c) => ({ source: c.source, direction: c.direction, minConfidence: c.minConfidence, weight: c.weight, smcKind: c.smcKind, op: c.op }))
         : [],
       script,
       createdTs: existing?.createdTs ?? Date.now(),
@@ -267,20 +273,163 @@ export class MetaStrategyService {
           const confidence = Math.min(100, 40 + rb.streak * 12)
           return { source, direction, confidence, label: `Range bars ${rb.streak} ${rb.trend.toUpperCase()} bar(s)` }
         }
+        case 'candle':
+        case 'bar': {
+          // "support all charts" per direct instruction - 'bar' is the SAME
+          // OHLC data as 'candle' (just rendered differently, no distinct
+          // math), so both share the chart-engine committee's own
+          // candleVote via engineVoteSingle('candle', ...) - the identical
+          // math the Signal Panel/Oracle "chart engines" driver already
+          // uses, not a reimplementation.
+          const candles = this.market.getCandlesDeep(asset, tf, 300, true)
+          const vote = engineVoteSingle('candle', candles)
+          if (vote.dir === 0) return none(`${source === 'bar' ? 'Bar' : 'Candle'}: no lean - ${vote.note}`)
+          const direction = vote.dir === 1 ? 'call' : 'put'
+          const confidence = Math.round(Math.min(1, Math.max(0, vote.weight)) * 100)
+          return { source, direction, confidence, label: `${source === 'bar' ? 'Bar' : 'Candle'} ${direction.toUpperCase()} - ${vote.note}` }
+        }
+        case 'heikinAshi': {
+          const candles = this.market.getCandlesDeep(asset, tf, 300, true)
+          const vote = engineVoteSingle('heikin', candles)
+          if (vote.dir === 0) return none(`Heikin Ashi: no lean - ${vote.note}`)
+          const direction = vote.dir === 1 ? 'call' : 'put'
+          const confidence = Math.round(Math.min(1, Math.max(0, vote.weight)) * 100)
+          return { source, direction, confidence, label: `Heikin Ashi ${direction.toUpperCase()} - ${vote.note}` }
+        }
+        case 'tick': {
+          const candles = this.market.getCandlesDeep(asset, tf, 300, true)
+          const vote = engineVoteSingle('tick', candles)
+          if (vote.dir === 0) return none(`Tick: no lean - ${vote.note}`)
+          const direction = vote.dir === 1 ? 'call' : 'put'
+          const confidence = Math.round(Math.min(1, Math.max(0, vote.weight)) * 100)
+          return { source, direction, confidence, label: `Tick ${direction.toUpperCase()} - ${vote.note}` }
+        }
+        case 'footprint': {
+          const candles = this.market.getCandlesDeep(asset, tf, 300, true)
+          const vote = engineVoteSingle('footprint', candles)
+          if (vote.dir === 0) return none(`Footprint: no lean - ${vote.note}`)
+          const direction = vote.dir === 1 ? 'call' : 'put'
+          const confidence = Math.round(Math.min(1, Math.max(0, vote.weight)) * 100)
+          return { source, direction, confidence, label: `Footprint ${direction.toUpperCase()} - ${vote.note}` }
+        }
+        case 'line':
+        case 'area':
+        case 'baseline': {
+          // Line/area/baseline are the SAME close-only price series, just
+          // rendered three ways - no distinct math, so all three share one
+          // close-trend reduction: closed-candle-count of consecutive
+          // closes moving the same direction as the latest close-vs-close
+          // delta, scaled by that delta relative to ATR (renkoAtr) so a
+          // big move reads as more committed than a one-tick drift, same
+          // 40+n*12-capped-100 confidence convention as renko/range/P&F.
+          const candles = this.market.getCandlesDeep(asset, tf, 300, true)
+          if (candles.length < 3) return none(`${source}: not enough closes yet`)
+          let streak = 0
+          const lastDelta = candles[candles.length - 1].close - candles[candles.length - 2].close
+          if (lastDelta === 0) return none(`${source}: flat close, no lean`)
+          const wantUp = lastDelta > 0
+          for (let i = candles.length - 1; i > 0; i--) {
+            const d = candles[i].close - candles[i - 1].close
+            if (d === 0) break
+            if (wantUp !== d > 0) break
+            streak++
+          }
+          const atr = renkoAtr(candles)
+          const magnitude = Number.isFinite(atr) && atr > 0 ? Math.min(2, Math.abs(lastDelta) / atr) : 0
+          const direction = wantUp ? 'call' : 'put'
+          const confidence = Math.min(100, 40 + streak * 12 + Math.round(magnitude * 10))
+          const label = source === 'line' ? 'Line' : source === 'area' ? 'Area' : 'Baseline'
+          return { source, direction, confidence, label: `${label} ${streak} closed ${direction.toUpperCase()} bar(s), delta ${lastDelta.toFixed(5)} vs ATR ${Number.isFinite(atr) ? atr.toFixed(5) : 'n/a'}` }
+        }
+        case 'volumeBars': {
+          const candles = this.market.getCandlesDeep(asset, tf, 300, true)
+          const vb = volumeBars(candles)
+          if (vb.degenerate || vb.bars.length < 2) return none('Volume bars: no bars painted yet (or all-zero volume window)')
+          let streak = 0
+          const bars = vb.bars
+          const lastUp = bars[bars.length - 1].close > bars[bars.length - 1].open
+          for (let i = bars.length - 1; i >= 0; i--) {
+            const up = bars[i].close > bars[i].open
+            if (up !== lastUp) break
+            streak++
+          }
+          const direction = lastUp ? 'call' : 'put'
+          const confidence = Math.min(100, 40 + streak * 12)
+          return { source, direction, confidence, label: `Volume bars ${streak} ${direction.toUpperCase()} bar(s) (${vb.volumeSource})` }
+        }
+        case 'tpo': {
+          // POC-distance reduction: last close ABOVE the Point-of-Control
+          // reads as bullish conviction (price trading above fair value),
+          // below reads bearish - scaled by distance relative to the value
+          // area's own width so a close just outside POC reads weaker than
+          // one well outside the whole value area.
+          const candles = this.market.getCandlesDeep(asset, tf, 300, true)
+          const tpo = computeTpo(candles)
+          if (tpo.poc === null) return none('TPO: no profile built yet (window too thin)')
+          const lastClose = candles[candles.length - 1].close
+          const delta = lastClose - tpo.poc
+          if (delta === 0) return none('TPO: close sitting right on POC, no lean')
+          const vaWidth = tpo.valueAreaHigh !== null && tpo.valueAreaLow !== null ? Math.max(tpo.valueAreaHigh - tpo.valueAreaLow, 1e-9) : NaN
+          const ratio = Number.isFinite(vaWidth) ? Math.min(2, Math.abs(delta) / vaWidth) : 0
+          const direction = delta > 0 ? 'call' : 'put'
+          const confidence = Math.min(100, 45 + Math.round(ratio * 35))
+          return { source, direction, confidence, label: `TPO close ${direction.toUpperCase()} of POC (poc ${tpo.poc.toFixed(5)}, close ${lastClose.toFixed(5)})` }
+        }
+        case 'ivHv': {
+          // Deviation-from-50% reduction on realizedUpProb() - NOT a
+          // volatility forecast ("vol has no direction" - see ivhv.ts's own
+          // doc comment); this reads the realized up-closing frequency
+          // itself as a directional lean, same honest framing the IV/HV
+          // panel uses for its "realized WR vs breakeven" line.
+          const candles = this.market.getCandlesDeep(asset, tf, 300, true)
+          if (candles.length < 10) return none('IV-HV: not enough closes yet')
+          const upProb = realizedUpProb(candles, 100)
+          const delta = upProb - 50
+          if (Math.abs(delta) < 1e-9) return none('IV-HV: exactly 50/50 up-closes, no lean')
+          const direction = delta > 0 ? 'call' : 'put'
+          const confidence = Math.min(100, 50 + Math.round(Math.abs(delta) * 2.5))
+          return { source, direction, confidence, label: `IV-HV realized up-close ${upProb.toFixed(1)}% (${direction.toUpperCase()} lean)` }
+        }
         case 'renkoSmc': {
-          // Same confluence rule Meta Trader's 'renko-smc' source trades:
-          // fires ONLY when Renko's brick trend and SMC's aggregate "now"
-          // read agree, blending both legs' confidence 50/50.
+          // Same confluence rule Meta Trader's 'renko-smc' source trades -
+          // AUDIT FIX: "smc now says up" means ANY SMC concept agreeing
+          // with Renko's direction right now, not smcNowRead()'s own
+          // majority/tie-broken winner (that would reject a case where a
+          // minority concept DID agree, just because other concepts
+          // outvoted it - see pickRenkoSmc()'s doc comment in
+          // plugins/metatrader.ts for the full story). Renko decides the
+          // direction; smcAnyAgrees() (analytics/smc.ts) only checks
+          // whether at least one now-signal points the same way.
+          const r = this.renkoDirectionRead(asset, tf)
+          if (r.direction === 'none') return none('Renko+SMC: no bricks painted yet')
           const smc = this.ctx.use<SmcScanService>('smcScan')
           const resp = smc.scan(asset, tf)
           if (!resp.result) return none('Renko+SMC: no scan result yet')
-          const smcRead = smcNowRead(resp.result)
-          const r = this.renkoDirectionRead(asset, tf)
-          if (smcRead.direction === 'none' || r.direction === 'none' || smcRead.direction !== r.direction) {
-            return none(`Renko+SMC: no confluence (renko ${r.direction}, smc now ${smcRead.direction})`)
+          const agreement = smcAnyAgrees(resp.result, r.direction)
+          if (!agreement.agrees) return none(`Renko+SMC: no confluence (renko ${r.direction}, ${agreement.note})`)
+          const confidence = Math.round((agreement.confidence + r.confidence) / 2)
+          return { source, direction: r.direction, confidence, label: `Renko+SMC ${r.direction.toUpperCase()} - ${r.streak} ${r.trend.toUpperCase()} brick(s) & ${agreement.note}` }
+        }
+        case 'renkoSmcMajority': {
+          // The OTHER confluence rule, kept alongside 'renkoSmc' above per
+          // direct instruction ("we can have the confluence version also
+          // tho, lets have both"): requires SMC's own AGGREGATE "now"
+          // verdict (smcNowRead() - majority of now-concepts, same read
+          // the plain 'smc' source trades) to match Renko's direction,
+          // not just any one concept agreeing. Stricter - a pair with 3
+          // bearish concepts and 1 bullish now will NOT qualify here even
+          // if Renko is up, where 'renkoSmc' still would.
+          const r2 = this.renkoDirectionRead(asset, tf)
+          if (r2.direction === 'none') return none('Renko+SMC (majority): no bricks painted yet')
+          const smc2 = this.ctx.use<SmcScanService>('smcScan')
+          const resp2 = smc2.scan(asset, tf)
+          if (!resp2.result) return none('Renko+SMC (majority): no scan result yet')
+          const smcRead = smcNowRead(resp2.result)
+          if (smcRead.direction === 'none' || smcRead.direction !== r2.direction) {
+            return none(`Renko+SMC (majority): no confluence (renko ${r2.direction}, smc now ${smcRead.direction})`)
           }
-          const confidence = Math.round((smcRead.confidence + r.confidence) / 2)
-          return { source, direction: r.direction, confidence, label: `Renko+SMC ${r.direction.toUpperCase()} - ${r.streak} ${r.trend.toUpperCase()} brick(s) & ${smcRead.note}` }
+          const confidence2 = Math.round((smcRead.confidence + r2.confidence) / 2)
+          return { source, direction: r2.direction, confidence: confidence2, label: `Renko+SMC (majority) ${r2.direction.toUpperCase()} - ${r2.streak} ${r2.trend.toUpperCase()} brick(s) & ${smcRead.note}` }
         }
       }
     } catch {
@@ -307,8 +456,20 @@ export class MetaStrategyService {
       smc: toMsl(this.readSource('smc', asset, tf)),
       smcNow: toMsl(this.readSource('smcNow', asset, tf)),
       renkoSmc: toMsl(this.readSource('renkoSmc', asset, tf)),
+      renkoSmcMajority: toMsl(this.readSource('renkoSmcMajority', asset, tf)),
       pointFigure: toMsl(this.readSource('pointFigure', asset, tf)),
       rangeBars: toMsl(this.readSource('rangeBars', asset, tf)),
+      candle: toMsl(this.readSource('candle', asset, tf)),
+      bar: toMsl(this.readSource('bar', asset, tf)),
+      heikinAshi: toMsl(this.readSource('heikinAshi', asset, tf)),
+      line: toMsl(this.readSource('line', asset, tf)),
+      area: toMsl(this.readSource('area', asset, tf)),
+      baseline: toMsl(this.readSource('baseline', asset, tf)),
+      volumeBars: toMsl(this.readSource('volumeBars', asset, tf)),
+      tick: toMsl(this.readSource('tick', asset, tf)),
+      footprint: toMsl(this.readSource('footprint', asset, tf)),
+      tpo: toMsl(this.readSource('tpo', asset, tf)),
+      ivHv: toMsl(this.readSource('ivHv', asset, tf)),
     }
     try {
       const smc = this.ctx.use<SmcScanService>('smcScan')

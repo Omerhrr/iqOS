@@ -292,9 +292,21 @@ export type MetaConditionSource =
   | 'renko'
   | 'pointFigure'
   | 'rangeBars'
+  | 'candle'
+  | 'bar'
+  | 'heikinAshi'
+  | 'line'
+  | 'area'
+  | 'baseline'
+  | 'volumeBars'
+  | 'tick'
+  | 'footprint'
+  | 'tpo'
+  | 'ivHv'
   | 'smc'
   | 'smcNow'
   | 'renkoSmc'
+  | 'renkoSmcMajority'
 
 export const META_CONDITION_SOURCE_LABELS: Record<MetaConditionSource, string> = {
   oracle: 'Next-Candle Oracle',
@@ -304,9 +316,21 @@ export const META_CONDITION_SOURCE_LABELS: Record<MetaConditionSource, string> =
   renko: 'Renko',
   pointFigure: 'Point & Figure',
   rangeBars: 'Range Bars',
+  candle: 'Candlestick',
+  bar: 'Bar (OHLC)',
+  heikinAshi: 'Heikin Ashi',
+  line: 'Line',
+  area: 'Area',
+  baseline: 'Baseline',
+  volumeBars: 'Volume Bars',
+  tick: 'Tick Bars',
+  footprint: 'Footprint',
+  tpo: 'TPO / Market Profile',
+  ivHv: 'IV-HV (realized up-close %)',
   smc: 'Smart Money Concepts (blended)',
   smcNow: 'SMC "now" (this candle only)',
-  renkoSmc: 'Renko + SMC "now" confluence',
+  renkoSmc: 'Renko + SMC "now" confluence (any agrees)',
+  renkoSmcMajority: 'Renko + SMC "now" confluence (majority)',
 }
 
 /** All 15 SMC concepts, same list Meta Trader's own smc-<kind> sources
@@ -335,6 +359,11 @@ export interface MetaCondition {
   source: MetaConditionSource
   direction: 'call' | 'put' | 'either'
   minConfidence?: number
+  /** Comparison operator applied between the source's confidence and
+   * minConfidence - "a wide range of conditions" per direct instruction.
+   * Default '>=' (unchanged behavior for every spec saved before this
+   * field existed). */
+  op?: '>=' | '>' | '<=' | '<' | '==' | '!='
   weight?: number
   /** only meaningful when source === 'smcNow' - one of ALL_SMC_KINDS, or
    * undefined for the aggregate "now" read. */
@@ -4014,6 +4043,7 @@ export type MetaTraderSource =
   | 'smc-power-of-3'
   | 'smc-silver-bullet'
   | 'renko-smc'
+  | 'renko-smc-majority'
 
 export interface MetaStakePlan {
   kind: 'compound'

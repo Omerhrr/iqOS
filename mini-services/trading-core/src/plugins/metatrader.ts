@@ -63,7 +63,7 @@ import type { AccuteService } from './accute'
 import type { MetaStrategyService } from './metastrategy'
 import type { SmcScanService } from './smcscan'
 import type { SmcKind, SmcScanResult } from '../analytics/smc'
-import { smcNowRead } from '../analytics/smc'
+import { smcNowRead, smcAnyAgrees } from '../analytics/smc'
 import type { OsMode } from './os-mode'
 import type { Candle } from '../types'
 import { renkoBricks } from '../analytics/renko'
@@ -154,6 +154,7 @@ export type MetaTraderSource =
   | 'smc-power-of-3'
   | 'smc-silver-bullet'
   | 'renko-smc'
+  | 'renko-smc-majority'
 
 export const META_TRADER_SOURCES: readonly MetaTraderSource[] = [
   'meta-strategy',
@@ -162,6 +163,7 @@ export const META_TRADER_SOURCES: readonly MetaTraderSource[] = [
   'smc',
   ...(Object.values(SMC_KIND_SOURCE) as MetaTraderSource[]),
   'renko-smc',
+  'renko-smc-majority',
 ]
 
 /** Deliberately simpler than the auto-trader's full StakePlan (client.ts) -
@@ -303,7 +305,7 @@ export class MetaTraderService {
     this.timer = setInterval(() => {
       void this.tick().catch((err) => ctx.log('meta-trader', `tick() rejected, skipping this cycle: ${(err as Error).message}`))
     }, 10_000)
-    ctx.log('meta-trader', `meta trader online (sources: meta-strategy/oracle/accute/smc + 15 individual SMC concepts + renko-smc confluence) - ${this.config.enabled ? 'armed' : 'off'} · src ${this.config.signalSource}`)
+    ctx.log('meta-trader', `meta trader online (sources: meta-strategy/oracle/accute/smc + 15 individual SMC concepts + renko-smc (any-agrees) + renko-smc-majority confluence) - ${this.config.enabled ? 'armed' : 'off'} · src ${this.config.signalSource}`)
   }
 
   stop(): void {
@@ -585,6 +587,7 @@ export class MetaTraderService {
     if (src === 'accute') return this.pickAccute()
     if (src === 'smc') return this.pickSmc(undefined)
     if (src === 'renko-smc') return this.pickRenkoSmc()
+    if (src === 'renko-smc-majority') return this.pickRenkoSmcMajority()
     const kind = SOURCE_SMC_KIND[src]
     if (kind) return this.pickSmc(kind)
     return []
@@ -762,27 +765,78 @@ export class MetaTraderService {
 
   /** 'renko-smc' - per direct instruction: "if renko is green and smc now
    * says up, trade up, but if renko is red and smc now says down, trade
-   * down" - a confluence source that only fires when BOTH legs agree,
-   * never on either one alone. Renko's brick trend is the noise filter
-   * (bricks only paint after price has actually moved a full ATR-scaled
-   * brick size - see analytics/renko.ts's module header and Accute's own
-   * renkoRead()), SMC "now" (smcNowRead(), aggregate - same exclusion of
-   * Support & Resistance the plain 'smc' source uses) is the structural
-   * confirmation; neither is honesty-tracked on its own, but requiring
-   * both to point the same way is a stricter bar than either source's
-   * dedicated Meta Trader entry trades alone.
+   * down" - AUDIT FIX: "smc now says up" means "AT THE TIME, if ANY of
+   * the SMC concepts agree on the direction", NOT smcNowRead()'s
+   * majority/tie-broken winner. The original build compared Renko's
+   * trend against smcNowRead()'s single aggregate direction - so if 3
+   * concepts fired bearish and only 1 fired bullish "now", the whole scan
+   * read 'put' and a genuinely up Renko trend with bullish FVG support
+   * (say) would be rejected even though that one concept DID agree with
+   * "up". Fixed by checking the raw now-signals directly via
+   * smcAnyAgrees() (analytics/smc.ts): Renko decides the candidate
+   * direction, and SMC only needs ONE now-concept (barsAgo===0, same S&R
+   * exclusion the aggregate uses) pointing the same way to confirm it -
+   * no vote, no majority, exactly "any of the smcs agree".
    *
-   * Confidence blends both legs: SMC's agreement ratio (smcNowRead's own
-   * number) and a Renko streak-based proxy (same `40 + streak*12, capped
-   * 100` scaling plugins/metastrategy.ts's 'renko' condition source
-   * already uses, so a 1-brick confirmation doesn't read as confidently as
-   * a committed multi-brick trend) - simple average of the two, same
-   * "neither source gets to dominate" spirit the rest of this file's
-   * confluence logic follows. Ranked by recency, not confidence, same
-   * reasoning as every other SMC-flavored source (rankByRecency's doc
-   * comment) - this is still fundamentally an SMC "now" read gated by
-   * Renko, not a calibrated number. */
+   * Renko's brick trend is the noise filter (bricks only paint after
+   * price has actually moved a full ATR-scaled brick size - see
+   * analytics/renko.ts's module header and Accute's own renkoRead());
+   * requiring at least one SMC concept to agree is the structural
+   * confirmation. Neither leg is honesty-tracked on its own.
+   *
+   * Confidence blends both legs: SMC's agreement ratio (smcAnyAgrees()'s
+   * own number - agreeing concepts out of every now-signal, whichever
+   * side they're on) and a Renko streak-based proxy (same `40 +
+   * streak*12, capped 100` scaling plugins/metastrategy.ts's 'renko'
+   * condition source already uses) - simple average of the two. Ranked
+   * by recency, not confidence, same reasoning as every other SMC-
+   * flavored source (rankByRecency's doc comment). */
   private pickRenkoSmc(): MetaTraderRow[] {
+    let smc: SmcScanService
+    try {
+      smc = this.ctx.use<SmcScanService>('smcScan')
+    } catch {
+      return []
+    }
+    const out: MetaTraderRow[] = []
+    for (const asset of this.candidatePool()) {
+      try {
+        const candles: Candle[] = this.market.getCandlesDeep(asset, this.config.tf, 300, true)
+        const renko = renkoBricks(candles)
+        if (renko.trend === 'none') continue
+        const renkoDirection: 'call' | 'put' = renko.trend === 'up' ? 'call' : 'put'
+        if (this.config.direction !== 'both' && renkoDirection !== this.config.direction) continue
+
+        const res = smc.scan(asset, this.config.tf)
+        if (!res.result) continue
+        const agreement = smcAnyAgrees(res.result, renkoDirection)
+        if (!agreement.agrees) continue // confluence required - renko alone does not qualify
+
+        const renkoConfidence = Math.min(100, 40 + renko.streak * 12)
+        const confidence = Math.round((agreement.confidence + renkoConfidence) / 2)
+        const note = `renko+smc: ${renko.streak} ${renko.trend.toUpperCase()} brick(s) & ${agreement.note}`
+        const row = this.rowFrom(asset, renkoDirection, confidence, res.result.price, note)
+        if (row) out.push(row)
+      } catch {
+        /* thin history - try the next */
+      }
+    }
+    return this.rankByRecency(out)
+  }
+
+  /** 'renko-smc-majority' - the OTHER confluence rule, kept alongside
+   * 'renko-smc' per direct instruction ("we can have the confluence
+   * version also tho, lets have both"): instead of "any ONE SMC concept
+   * agrees with Renko's direction" (pickRenkoSmc() above, via
+   * smcAnyAgrees()), this requires SMC's own AGGREGATE "now" verdict
+   * (smcNowRead() - majority of now-concepts, tie-broken by first-fire,
+   * same read the plain 'smc' source trades) to match Renko's direction.
+   * Stricter: a pair with 3 bearish concepts and 1 bullish now will NOT
+   * qualify here even if Renko is up (that lone bullish concept loses the
+   * vote) - pickRenkoSmc() would still take it. Neither is "the right
+   * one" - they're two different confluence standards, pick whichever
+   * fits the risk appetite. */
+  private pickRenkoSmcMajority(): MetaTraderRow[] {
     let smc: SmcScanService
     try {
       smc = this.ctx.use<SmcScanService>('smcScan')
@@ -801,12 +855,12 @@ export class MetaTraderService {
         const renko = renkoBricks(candles)
         if (renko.trend === 'none') continue
         const renkoDirection: 'call' | 'put' = renko.trend === 'up' ? 'call' : 'put'
-        if (renkoDirection !== smcRead.direction) continue // confluence required - either alone does not qualify
+        if (renkoDirection !== smcRead.direction) continue // confluence required - renko's trend must match SMC's own majority verdict
 
         if (this.config.direction !== 'both' && renkoDirection !== this.config.direction) continue
         const renkoConfidence = Math.min(100, 40 + renko.streak * 12)
         const confidence = Math.round((smcRead.confidence + renkoConfidence) / 2)
-        const note = `renko+smc: ${renko.streak} ${renko.trend.toUpperCase()} brick(s) & ${smcRead.note}`
+        const note = `renko+smc (majority): ${renko.streak} ${renko.trend.toUpperCase()} brick(s) & ${smcRead.note}`
         const row = this.rowFrom(asset, renkoDirection, confidence, res.result.price, note)
         if (row) out.push(row)
       } catch {

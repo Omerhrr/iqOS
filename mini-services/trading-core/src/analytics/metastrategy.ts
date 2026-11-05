@@ -34,9 +34,29 @@ export type MetaConditionSource =
   | 'renko' // Renko brick trend/streak (analytics/renko.ts, same read Accute's own renko leg uses)
   | 'smc' // Smart Money Concepts BLENDED structure summary (analytics/smc.ts's scanSmc().summary - mixes in older hits, not just this candle)
   | 'smcNow' // SMC "now" read (analytics/smc.ts's smcNowRead(), barsAgo===0 only) - aggregate across all 14 non-S&R concepts by default, or ONE concept via this condition's `smcKind` field ("build all the smc strats separately", same per-kind reads Meta Trader's own smc-<kind> sources use)
-  | 'renkoSmc' // Renko trend + SMC "now" confluence - same rule Meta Trader's 'renko-smc' source trades (renko green + smc now up = call, renko red + smc now down = put), as a condition any meta-strategy can require
+  | 'renkoSmc' // Renko trend + SMC "now" confluence, ANY-AGREES variant - Renko's direction fires as soon as ONE SMC concept agrees with it right now (analytics/smc.ts's smcAnyAgrees()), no vote/majority involved - same rule Meta Trader's 'renko-smc' source trades
+  | 'renkoSmcMajority' // Renko trend + SMC "now" confluence, MAJORITY variant - requires SMC's own aggregate "now" verdict (smcNowRead(), majority of now-concepts) to match Renko's direction - stricter than renkoSmc above; kept as a separate source per direct instruction ("we can have the confluence version also tho, lets have both") rather than replacing one with the other
   | 'pointFigure' // Point & Figure column direction/streak (analytics/pointfigure.ts) - "not just renko, p&f, range and all others" per direct instruction
   | 'rangeBars' // Range bar trend/streak (analytics/rangebars.ts) - same "call any other chart" instruction; a different noise filter than Renko (fixed price span per bar vs. ATR-scaled brick + reversal multiplier)
+  // Per direct instruction ("lets support all chats also... candle, bar,
+  // heikin ashi, tpo, lines, area, baselins, volbars, foot print, tick,
+  // iv-hv") - every chart TYPE this OS's own chart picker lists
+  // (types.ts's ChartType) now has a meta-strategy condition source. Most
+  // reuse analytics/chartsignals.ts's engine-vote committee (the exact
+  // math the Signal Panel/Oracle's chart-engine driver already run) via
+  // engineVoteSingle() - see plugins/metastrategy.ts's readSource() for
+  // which function backs each one.
+  | 'candle' // plain candlestick pattern read (chartsignals.ts candleVote - close position in range, 3-bar streak, engulfing)
+  | 'bar' // OHLC bar chart - SAME data/math as 'candle' above, just a different rendering of the identical open-high-low-close series; kept as its own source so "bar" shows up by name, not because the math differs
+  | 'heikinAshi' // Heikin Ashi smoothed-candle trend (chartsignals.ts haVote - HA streak + body dominance)
+  | 'line' // line/area/baseline are the SAME close-only price series, three different renderings - no distinct math exists for them (there is no "line chart indicator"), so all three share one close-trend reduction (recent close vs N bars back, scaled by ATR) - see lineTrendVote() in plugins/metastrategy.ts
+  | 'area' // see 'line' above - identical reduction, different chart-type name for the dropdown
+  | 'baseline' // see 'line' above - identical reduction, different chart-type name for the dropdown
+  | 'volumeBars' // constant-volume bar trend/streak (analytics/volumebars.ts) - same streak convention as Renko/Range, but bars close on cumulative volume instead of price distance; 'none' when the feed has no real volume (volumeBars().degenerate)
+  | 'tick' // tick-bar cadence read (chartsignals.ts tickVote) - uses the close-price proxy fallback here (no live tick-buffer wiring into the Meta Strategy Lab yet), same honest "close-proxy" labeling the committee itself uses when no real tick buffer is available
+  | 'footprint' // volume footprint CLV-proxy delta (chartsignals.ts footprintVote) - same CLV approximation orderflow.ts uses everywhere else in this codebase, since IQ Option exposes no real bid/ask-tagged trades
+  | 'tpo' // Market Profile / Time Price Opportunity (analytics/tpo.ts) - direction from price trading above/below the session's Point of Control, confidence scaled by distance relative to the 70% value-area width
+  | 'ivHv' // Implied vs Historical Volatility (analytics/ivhv.ts) - NOT a volatility forecast (vol has no direction); the directional read here is the realized up-closing frequency over a trailing window vs 50% (same honest "realized WR vs breakeven" framing ivhv.ts's own module header uses)
 
 export const META_CONDITION_SOURCES: readonly MetaConditionSource[] = [
   'oracle',
@@ -47,8 +67,20 @@ export const META_CONDITION_SOURCES: readonly MetaConditionSource[] = [
   'smc',
   'smcNow',
   'renkoSmc',
+  'renkoSmcMajority',
   'pointFigure',
   'rangeBars',
+  'candle',
+  'bar',
+  'heikinAshi',
+  'line',
+  'area',
+  'baseline',
+  'volumeBars',
+  'tick',
+  'footprint',
+  'tpo',
+  'ivHv',
 ]
 
 export type MetaDirection = 'call' | 'put' | 'none'
@@ -61,10 +93,18 @@ export interface MetaCondition {
    * which side it has to be on. 'call'/'put' = it must specifically lean
    * that way to count. */
   direction: 'call' | 'put' | 'either'
-  /** 0..100, default 0 - a source reading below this doesn't count as
-   * active for this condition, same spirit as the Oracle's own
-   * minConfidence gates. */
+  /** 0..100, default 0 - the confidence THRESHOLD this condition compares
+   * the source's reading against, via `op` below. */
   minConfidence?: number
+  /** Comparison operator applied between the source's confidence and
+   * `minConfidence` - "a wide range of conditions" per direct instruction,
+   * not just the original fixed ">=" gate. Default '>=' (unchanged
+   * behavior for every spec saved before this existed). '<=' / '<' are
+   * genuinely useful here: "fire only while Accute's confidence is BELOW
+   * 40" is a real condition (e.g. "the other driver is uncertain, so
+   * trust this one instead"), not something the weighted/any/all combine
+   * modes could express without it. */
+  op?: '>=' | '>' | '<=' | '<' | '==' | '!='
   /** Only used in 'weighted' mode - this condition's share of the vote.
    * Default 1 (every condition counts equally unless you say otherwise). */
   weight?: number
@@ -147,7 +187,21 @@ function clamp(v: number, lo: number, hi: number): number {
 function conditionPasses(cond: MetaCondition, read: MetaSourceRead): boolean {
   if (read.direction === 'none') return false
   if (cond.direction !== 'either' && read.direction !== cond.direction) return false
-  return read.confidence >= (cond.minConfidence ?? 0)
+  const threshold = cond.minConfidence ?? 0
+  switch (cond.op ?? '>=') {
+    case '>=':
+      return read.confidence >= threshold
+    case '>':
+      return read.confidence > threshold
+    case '<=':
+      return read.confidence <= threshold
+    case '<':
+      return read.confidence < threshold
+    case '==':
+      return read.confidence === threshold
+    case '!=':
+      return read.confidence !== threshold
+  }
 }
 
 /** Combine one read per condition (same order/length as spec.conditions -

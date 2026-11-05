@@ -43,8 +43,10 @@
 // Source identifiers may contain ':' (e.g. `smc:FVG`, `smc:now`) - the
 // caller (plugins/metastrategy.ts) builds the `reads` map with exactly the
 // keys a script is allowed to reference: 'oracle', 'hmaRocBullBear',
-// 'momentumScore', 'accute', 'renko', 'pointFigure', 'rangeBars', 'smc',
-// 'smcNow', 'renkoSmc', and 'smc:<KIND>' for each of the 15 SMC concepts
+// 'momentumScore', 'accute', 'renko', 'pointFigure', 'rangeBars', 'candle',
+// 'bar', 'heikinAshi', 'line', 'area', 'baseline', 'volumeBars', 'tick',
+// 'footprint', 'tpo', 'ivHv', 'smc', 'smcNow', 'renkoSmc',
+// 'renkoSmcMajority', and 'smc:<KIND>' for each of the 15 SMC concepts
 // (smcNowRead() per kind) - "any of the smcs" per direct instruction,
 // without needing 15 new MetaConditionSource union members. 'pointFigure'/
 // 'rangeBars' are the same "not just renko - p&f, range and all others as
@@ -452,7 +454,7 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, reads: Record<string, 
     }
     case 'field': {
       const read = reads[e.obj]
-      if (!read) throw new MslRuntimeError(`unknown source "${e.obj}" - available sources are set by the Meta Strategy Lab (oracle, hmaRocBullBear, momentumScore, accute, renko, pointFigure, rangeBars, smc, smcNow, renkoSmc, smc:<KIND>)`)
+      if (!read) throw new MslRuntimeError(`unknown source "${e.obj}" - available sources are set by the Meta Strategy Lab (oracle, hmaRocBullBear, momentumScore, accute, renko, pointFigure, rangeBars, candle, bar, heikinAshi, line, area, baseline, volumeBars, tick, footprint, tpo, ivHv, smc, smcNow, renkoSmc, renkoSmcMajority, smc:<KIND>)`)
       switch (e.field) {
         case 'dir':
         case 'direction':

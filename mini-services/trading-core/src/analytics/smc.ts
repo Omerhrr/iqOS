@@ -752,3 +752,34 @@ export function smcNowRead(result: SmcScanResult, onlyKind?: SmcKind): { directi
   const tieNote = tied && totalNow > 1 ? ` (tied - went with ${pool[0].kind}'s first fire)` : ''
   return { direction, confidence, note: `${kindNote} - ${winners}/${totalNow} now-signals agree ${direction}${tieNote}` }
 }
+
+/** "If ANY of the SMC concepts agree on the direction (at the time)" -
+ * per direct instruction, this is NOT smcNowRead()'s majority/tie-broken
+ * winner: smcNowRead() picks ONE side for the whole scan (3 concepts
+ * bearish vs. 1 bullish now still reads as a 'put' overall), so a caller
+ * that compares that single winner against an external direction (e.g.
+ * Renko's trend) would reject a case where a minority concept DID agree
+ * with that direction just because other concepts outvoted it. This
+ * checks the raw now-signals directly instead: does at least one "now"
+ * concept (barsAgo===0, same Support & Resistance exclusion smcNowRead's
+ * aggregate uses - it fires far more often than the other 14 and isn't a
+ * meaningful "lean" on its own) point the SAME way as `direction`, with
+ * no regard for how many point the other way.
+ *
+ * Confidence is NOT "how many signals agree with the winner" (that's
+ * smcNowRead's framing) - it's "how many now-signals agree with THIS
+ * specific direction out of every now-signal, whichever side they're on",
+ * so a direction with 1 agreeing concept out of 4 firing now honestly
+ * reads ~25%, not smcNowRead's unrelated majority-based number. A lone
+ * now-signal that agrees still gets the same flat-65 "nothing to compare
+ * against" convention smcNowRead uses. */
+export function smcAnyAgrees(result: SmcScanResult, direction: 'call' | 'put'): { agrees: boolean; confidence: number; note: string } {
+  const allNow = result.signals.filter((s) => s.barsAgo === 0)
+  const now = allNow.filter((s) => s.kind !== 'SUPPORT_RESISTANCE')
+  if (now.length === 0) return { agrees: false, confidence: 0, note: 'nothing hit this candle' }
+  const wantSide: SmcDirection = direction === 'call' ? 'bullish' : 'bearish'
+  const agreeing = now.filter((s) => s.direction === wantSide)
+  if (!agreeing.length) return { agrees: false, confidence: 0, note: `0/${now.length} now-signal(s) agree ${direction} - ${now.map((s) => `${s.kind}:${s.direction}`).join(', ')}` }
+  const confidence = now.length <= 1 ? 65 : Math.round((agreeing.length / now.length) * 100)
+  return { agrees: true, confidence, note: `${agreeing.length}/${now.length} now-signal(s) agree ${direction} (${agreeing.map((s) => s.kind).join(', ')})` }
+}
