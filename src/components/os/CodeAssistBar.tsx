@@ -2,12 +2,15 @@
 
 // IQAIR//OS - "we should be able to invoke the ai and describe it so it
 // will build the strat, also we can build ourself, if any error, we can
-// have the ai scan and fix" per direct instruction. One shared bar, reused
-// in every code editor (Meta Strategy Lab's script editor, Meta Strategy's
-// built-in-source editor, the Strategy Lab's builtin.ts editor, AI Lab's
-// script editor) - each just passes its own `kind` so /api/code_assist's
-// system prompt matches the exact language/shape that editor edits. Two
-// actions:
+// have the ai scan and fix" per direct instruction - and per direct
+// correction, "the code assist is just copilot going out to other parts":
+// this bar is the Copilot itself (same identity/knowledge, see
+// lib/copilotKnowledge.ts) reaching into one editor, not a separate
+// assistant. One shared bar, reused in every code editor (Meta Strategy
+// Lab's script editor, Meta Strategy's built-in-source editor, the
+// Strategy Lab's builtin.ts editor, AI Lab's script editor) - each just
+// passes its own `kind` so /api/code_assist's prompt matches the exact
+// language/shape that editor edits. Two actions:
 //   - describe what you want -> "build/update with AI" (mode 'build')
 //   - after a failed test/save -> "scan & fix with AI" (mode 'fix'),
 //     enabled only once `lastError` is non-empty, so there's always a real
@@ -71,8 +74,8 @@ export default function CodeAssistBar({ kind, currentCode, onApply, lastError, c
   return (
     <div className={`rounded border border-violet-500/30 bg-[#0b0817] p-1.5 ${className ?? ''}`}>
       <div className="flex items-center gap-1 font-mono text-[8.5px] font-bold uppercase tracking-wider text-violet-300">
-        <span>✦ ai</span>
-        <span className="font-normal normal-case text-[#4b5a72]">describe it and the AI writes it - or write it yourself and ask the AI to fix an error</span>
+        <span>✦ copilot</span>
+        <span className="font-normal normal-case text-[#4b5a72]">describe it and Copilot writes it here - or write it yourself and ask Copilot to fix an error</span>
       </div>
       <div className="mt-1 flex items-center gap-1.5">
         <input

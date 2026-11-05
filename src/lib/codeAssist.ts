@@ -3,11 +3,21 @@
 // editor, the Strategy Lab's builtin.ts editor, AI Lab's script editor).
 // Per direct instruction: "we should be able to invoke the ai and describe
 // it so it will build the strat, also we can build ourself, if any error,
-// we can have the ai scan and fix" - one shared prompt-building module, one
-// API route (src/app/api/code_assist/route.ts), one small UI component
-// (components/os/CodeAssistBar.tsx) reused by all four editors, each just
-// passing its own `kind` so the system prompt matches the exact language/
-// shape that editor actually edits. Two modes:
+// we can have the ai scan and fix" - then, per direct correction, "the
+// code assist is just copilot going out to other parts": this is NOT a
+// separate bespoke assistant with its own private understanding of MSL/the
+// AI Lab/Meta-Strategy Lab bolted on beside the Copilot - it IS the
+// Copilot, same identity, same domain knowledge (imported from
+// copilotKnowledge.ts, the single source both this module and the chat
+// Copilot's own SYSTEM_BASE compose from, so the two can never silently
+// drift apart), just invoked from inside a code editor instead of the chat
+// panel, with its output constrained to "return this one code block" (the
+// output-format instruction below) instead of "call a tool". One shared
+// prompt-building module, one API route (src/app/api/code_assist/
+// route.ts), one small UI component (components/os/CodeAssistBar.tsx)
+// reused by all four editors, each just passing its own `kind` so the
+// knowledge matches the exact language/shape that editor actually edits.
+// Two modes:
 //   'build' - describe what you want in plain English, get a full
 //             replacement for the editor's contents
 //   'fix'   - hand back the editor's current (broken) contents plus the
@@ -19,6 +29,7 @@
 // Transpiler's syntax check for the two real-TypeScript kinds) are still
 // the thing that actually validates and persists it.
 import type { ChatMessage } from './llm'
+import { COPILOT_IDENTITY, AI_LEARNING_AGENT_KNOWLEDGE, META_STRATEGY_MSL_KNOWLEDGE } from './copilotKnowledge'
 
 export type CodeAssistKind = 'msl' | 'ai_lab_script' | 'builtin_strategy_ts' | 'meta_source_ts'
 
@@ -39,34 +50,6 @@ export interface CodeAssistRequest {
   context?: Record<string, string | number | undefined>
 }
 
-const MSL_GRAMMAR = `Meta Strategy Lab's own script language ("MSL") - a small, safe, line-oriented language, NOT general-purpose code:
-  let <name> = <expr>          bind an intermediate value for reuse
-  call when <boolExpr>         sets the CALL verdict if true (REQUIRED - every script needs this line)
-  put when <boolExpr>          sets the PUT verdict if true (REQUIRED)
-  confidence = <numExpr>       overrides the default confidence, clamped 0-100 (REQUIRED)
-'#' starts a comment to end-of-line. Blank lines ignored.
-Expressions (low to high precedence): or < and < not < comparisons (== != >= <= > <) < + - < * / < unary - < atoms.
-Atoms: number literals, true/false, call/put/none (direction literals), string literal '...'/"...", an identifier (a source name or a let-binding), identifier.field, '(' expr ')', a function call.
-Functions: avg(...) sum(...) min(...) max(...) count(...) abs(x) - all take 1+ numeric/boolean args.
-Field access on any source or function-call result: .dir / .direction (call/put/none), .conf / .confidence (0-100), .active (true if dir != none), .call / .put (true if dir equals that side).
-Sandboxed on purpose: no loops, no function definitions, no I/O, no raw candle access - only reads, and/or/not/comparisons/arithmetic, and assignment to call/put/confidence.`
-
-const MSL_SOURCES = `Named sources this script can read (each exposes .dir/.conf/.active/.call/.put): oracle, hmaRocBullBear, momentumScore, accute, renko, pointFigure, rangeBars, candle, bar, heikinAshi, line, area, baseline, volumeBars, tick, footprint, tpo, ivHv, smc (aggregate across all 15 SMC concepts, "now" only), smcNow (same aggregate, explicit name), renkoSmc (renko trend + any one SMC concept agreeing), renkoSmcMajority (renko trend + SMC's own majority verdict agreeing), and smc:<KIND> for one specific SMC concept by name (e.g. smc:FVG, smc:BOS, smc:ORDER_BLOCK, smc:LIQUIDITY_SWEEP - KIND is written directly after the colon, not quoted, not a function argument). Every one of these reads a live PANEL VERDICT - it never recomputes from raw candles itself.`
-
-const AI_LAB_FUNCS = `This editor speaks the SAME MSL grammar (let/call when/put when/confidence, same operators, same field access), but instead of named panel-read sources it calls SIGNAL FUNCTIONS over raw candle patterns/indicators - the AI Lab's own vocabulary, each one returning a read you field-access exactly like a named source (e.g. candle('Bullish Engulfing', call, 70).active). Every function's args end with an optional confidence (0-100, default 65) and the read reports .dir 'none' when the signal didn't fire on the current bar:
-  candle(name, dir, conf?, series?)              - a candlestick pattern by its library name (e.g. 'Bullish Engulfing', 'Bearish Engulfing', 'Doji', 'Hammer'...), series 'heikin' reads it on the Heikin-Ashi transform instead of raw candles
-  bar('wide-bull'|'wide-bear', dir, conf?, atrK?) - a wide-range bar (atrK = ATR multiple that counts as "wide", default per the builtin)
-  ha(variant, dir, conf?, len?)                  - a Heikin-Ashi structure: variant one of flip-up|flip-down|streak-up|streak-down|strong-bull|strong-bear
-  line(variant, dir, conf?, lookback?)           - variant one of breakout-up|breakout-down|hh-hl|lh-ll (Donchian breakout / higher-highs-lows run)
-  renko(variant, dir, conf?, len?)               - variant one of flip-up|flip-down|streak-up|streak-down (young brick-trend reversal vs N same-color streak)
-  pf(variant, dir, conf?, reversalBoxes?)        - variant one of double-top-breakout|double-bottom-breakdown|triple-top-breakout|triple-bottom-breakdown (Point & Figure breakout, fires only on the box-painting bar)
-  mtf(5|15, dir, conf?)                          - multi-timeframe EMA(8/21) alignment resampled to that factor (ONLY 5 or 15 are valid)
-  indicator(ind, op, threshold, dir, conf?, threshold2?) - ind one of rsi|bbpos|zscore|donchianpos|macdz|slope|streak|wickbias|emasign|hadist|bodypos|psar|fractal, op '>' or '<'
-  indicatorType(ind, type, op, threshold, dir, conf?, threshold2?) - ind one of the 8 generic families (madist|osc0100|oscpm100|oscz|trenddist|bandpos|volflow|levels), type picks the specific indicator inside that family (e.g. madist+'hma', osc0100+'stochk', trenddist+'supertrend')
-  indicatorPeriod(ind, period, op, threshold, dir, conf?, threshold2?) - same ind set as indicator(), with an explicit lookback period
-  builtinSig(id, dir, conf?)                     - votes an entire builtin.ts strategy (by its id) as one signal
-  engine(engineId, dir, conf?)                   - a chart-engine committee vote
-Field access on every one of these calls: .dir, .conf, .active, .call, .put - identical to a named Meta-Strategy source.`
 
 const BUILTIN_STRATEGY_SHAPE = `trading-core/src/strategies/builtin.ts - ONE array-element object literal from the STRATEGIES: StrategyDef[] array (real compiled TypeScript, NOT a sandboxed language). The shape (every field required):
   {
@@ -145,12 +128,18 @@ private pickOracle(): MetaTraderRow[] {
 NEVER rename the method - whatever name the current code (or the context) says this method must keep, keep it exactly; pickCandidates()'s own dispatch table calls these methods by name.`
 
 function systemPromptFor(kind: CodeAssistKind): string {
-  const shared =
-    'You are a precise code-generation assistant embedded in a trading platform\'s live code editor. You write ONLY the one code block the editor holds - never a whole file, never surrounding context, never markdown fences around it. Respond with a single JSON object: {"code": "<the complete replacement text for the editor, exactly as it should be pasted in>", "explanation": "<one or two plain-English sentences on what you built/changed, for the user>"}. No other text outside that JSON object.'
-  if (kind === 'msl') return `${shared}\n\n${MSL_GRAMMAR}\n\n${MSL_SOURCES}\n\nWrite a complete script: it MUST include at least one \`call when\`, one \`put when\`, and a \`confidence =\` line, using \`let\` bindings for readability when the logic has more than one or two pieces.`
-  if (kind === 'ai_lab_script') return `${shared}\n\n${MSL_GRAMMAR}\n\n${AI_LAB_FUNCS}\n\nWrite a complete script: it MUST include at least one \`call when\`, one \`put when\`, and a \`confidence =\` line.`
-  if (kind === 'builtin_strategy_ts') return `${shared}\n\n${BUILTIN_STRATEGY_SHAPE}\n\nWrite exactly one such object literal (including its own braces), nothing else - it gets spliced back into the array in place of whatever was there.`
-  return `${shared}\n\n${META_SOURCE_SHAPE}\n\nWrite exactly one such method (signature through its closing brace), nothing else - it gets spliced back into the class in place of whatever was there.`
+  // Same identity + same domain knowledge the chat Copilot's own
+  // SYSTEM_BASE carries (imported, not re-described) - the ONLY thing
+  // added here is the output-format constraint: return one code block as
+  // JSON instead of calling a tool or chatting. "the code assist is just
+  // copilot going out to other parts" per direct correction - this is that
+  // same Copilot, not a second assistant with its own opinions about MSL.
+  const outputFormat =
+    'Right now you are embedded directly in one of the OS\'s own code editors, asked to write or fix the ONE code block that editor holds - not to chat, not to call a tool, just to produce that code. Respond with a single JSON object: {"code": "<the complete replacement text for the editor, exactly as it should be pasted in>", "explanation": "<one or two plain-English sentences on what you built/changed, for the user>"}. No markdown fences, no other text outside that JSON object - the code goes verbatim into a live editor, so it must be nothing but the code itself.'
+  if (kind === 'msl') return `${COPILOT_IDENTITY}\n\n${META_STRATEGY_MSL_KNOWLEDGE}\n\n${outputFormat}\n\nWrite a complete MSL script for the Meta-Strategy Lab's code editor: it MUST include at least one \`call when\`, one \`put when\`, and a \`confidence =\` line, using \`let\` bindings for readability when the logic has more than one or two pieces.`
+  if (kind === 'ai_lab_script') return `${COPILOT_IDENTITY}\n\n${META_STRATEGY_MSL_KNOWLEDGE}\n\n${AI_LEARNING_AGENT_KNOWLEDGE}\n\n${outputFormat}\n\nWrite a complete MSL script for the AI Lab's code editor (the AI Lab's own signal-function vocabulary described above, not named Meta-Strategy sources): it MUST include at least one \`call when\`, one \`put when\`, and a \`confidence =\` line.`
+  if (kind === 'builtin_strategy_ts') return `${COPILOT_IDENTITY}\n\n${AI_LEARNING_AGENT_KNOWLEDGE}\n\n${outputFormat}\n\n${BUILTIN_STRATEGY_SHAPE}\n\nWrite exactly one such object literal (including its own braces), nothing else - it gets spliced back into the array in place of whatever was there.`
+  return `${COPILOT_IDENTITY}\n\n${META_STRATEGY_MSL_KNOWLEDGE}\n\n${outputFormat}\n\n${META_SOURCE_SHAPE}\n\nWrite exactly one such method (signature through its closing brace), nothing else - it gets spliced back into the class in place of whatever was there.`
 }
 
 export function buildCodeAssistMessages(req: CodeAssistRequest): ChatMessage[] {

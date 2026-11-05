@@ -35,6 +35,7 @@ import OrderFlowPanel from './OrderFlowPanel'
 import OtcFootprintPanel from './OtcFootprintPanel'
 import DiagnosticsPanel from './DiagnosticsPanel'
 import CodeAssistBar from './CodeAssistBar'
+import { builtinStrategyToMsl } from './builtinMslView'
 import { FullscreenBackdrop, FullscreenButton } from './FullscreenButton'
 
 interface BottomTabsProps {
@@ -76,7 +77,23 @@ export default function BottomTabs(props: BottomTabsProps) {
   // side - this is just the UI for it). AI-learned specs ("(Lab)" suffix,
   // custom:<id>) are handled by AI Lab's own JSON editor instead - they
   // aren't real source code, so they don't belong here.
+  //
+  // "make them all msl then" per direct instruction, after explaining that
+  // a builtin strategy is real compiled TypeScript (Markov/Kalman/Monte
+  // Carlo/VSK-TSK/correlation - genuinely iterative code MSL's sandboxed
+  // grammar can't hand-write) - the honest version: builtinSig() is one of
+  // the AI Lab's own MSL functions and calls a builtin strategy's REAL
+  // evaluate() unmodified (strategies/signalscript.ts), so every single one
+  // of the 57 gets a byte-identical-on-direction MSL view for free, shown
+  // by DEFAULT when you view/edit a strategy here (builtinMslView.ts
+  // generates it client-side, no fetch needed) - "view as TypeScript (real
+  // code)" is the fallback toggle for the actual source. Editing the MSL
+  // view and "save as new AI Lab strategy" promotes it to an independent
+  // custom:<id> spec built on top of the original - it never rewrites
+  // builtin.ts, since that's a different, genuinely safe thing to do than
+  // pretending the original strategy's own logic IS an MSL script.
   const [viewingStrategyId, setViewingStrategyId] = useState<string | null>(null)
+  const [sourceViewKind, setSourceViewKind] = useState<'msl' | 'ts'>('msl')
   const [strategySource, setStrategySource] = useState('')
   const [strategySourceLoading, setStrategySourceLoading] = useState(false)
   const [strategySourceError, setStrategySourceError] = useState<string | null>(null)
@@ -84,16 +101,34 @@ export default function BottomTabs(props: BottomTabsProps) {
   const [savingStrategySource, setSavingStrategySource] = useState(false)
   const [strategySaveNote, setStrategySaveNote] = useState<string | null>(null)
 
-  const loadStrategySource = (id: string) => {
-    if (viewingStrategyId === id) {
+  const [mslText, setMslText] = useState('')
+  const [mslTestResult, setMslTestResult] = useState<{ ok: boolean; direction?: string; confidence?: number; trace?: string[]; error?: string } | null>(null)
+  const [mslTestBusy, setMslTestBusy] = useState(false)
+  const [mslSaveBusy, setMslSaveBusy] = useState(false)
+  const [mslSaveNote, setMslSaveNote] = useState<string | null>(null)
+  const [mslSaveError, setMslSaveError] = useState<string | null>(null)
+
+  const toggleStrategyView = (s: StrategyInfo) => {
+    if (viewingStrategyId === s.id) {
       setViewingStrategyId(null)
       setEditingStrategyId(null)
       return
     }
-    setViewingStrategyId(id)
+    setViewingStrategyId(s.id)
+    setSourceViewKind('msl')
     setEditingStrategyId(null)
+    setMslText(builtinStrategyToMsl(s.id, s.name))
+    setMslTestResult(null)
+    setMslSaveNote(null)
+    setMslSaveError(null)
+    setStrategySource('')
     setStrategySourceError(null)
     setStrategySaveNote(null)
+  }
+
+  const ensureTsLoaded = (id: string) => {
+    if (strategySource || strategySourceLoading) return
+    setStrategySourceError(null)
     setStrategySourceLoading(true)
     osGet<{ ok: boolean; source?: string; error?: string }>('/strategy_builtin_source', { id })
       .then((r) => {
@@ -115,6 +150,38 @@ export default function BottomTabs(props: BottomTabsProps) {
       })
       .catch((e: Error) => setStrategySourceError(e.message))
       .finally(() => setSavingStrategySource(false))
+  }
+
+  const testMsl = () => {
+    setMslTestBusy(true)
+    setMslTestResult(null)
+    osPost<{ ok: boolean; direction?: string; confidence?: number; trace?: string[]; error?: string }>('/lab_test_script', {
+      script: mslText,
+      asset,
+      tf: props.tf,
+    })
+      .then((r) => setMslTestResult(r))
+      .catch((e: Error) => setMslTestResult({ ok: false, error: e.message }))
+      .finally(() => setMslTestBusy(false))
+  }
+
+  const saveMslAsNewStrategy = (s: StrategyInfo) => {
+    if (!mslText.trim()) return setMslSaveError('nothing to save - the script is empty')
+    setMslSaveBusy(true)
+    setMslSaveError(null)
+    setMslSaveNote(null)
+    osPost<{ ok: boolean; id?: string; error?: string }>('/lab_save', {
+      name: `${s.name} (MSL)`,
+      asset,
+      tf: props.tf,
+      spec: { name: `${s.name} (MSL)`, signals: [], script: mslText },
+    })
+      .then((r) => {
+        if (!r.ok) throw new Error(r.error ?? 'save failed')
+        setMslSaveNote(`saved as new AI Lab strategy "${r.id}" - find it in the AI Lab tab (the original "${s.id}" is untouched)`)
+      })
+      .catch((e: Error) => setMslSaveError(e.message))
+      .finally(() => setMslSaveBusy(false))
   }
 
   const closePos = async (id: string) => {
@@ -406,11 +473,11 @@ export default function BottomTabs(props: BottomTabsProps) {
                     variant="outline"
                     size="sm"
                     className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5] hover:text-violet-400"
-                    onClick={() => loadStrategySource(s.id)}
+                    onClick={() => toggleStrategyView(s)}
                   >
                     {viewing ? 'hide source' : 'view source'}
                   </Button>
-                  {viewing && (
+                  {viewing && sourceViewKind === 'ts' && (
                     <Button
                       variant="outline"
                       size="sm"
@@ -427,7 +494,83 @@ export default function BottomTabs(props: BottomTabsProps) {
               )}
               {viewing && (
                 <div className="mt-2 rounded border border-[#1c2739] bg-[#070c15] p-2">
-                  {strategySourceLoading ? (
+                  <div className="mb-1.5 flex items-center gap-px rounded border border-[#1c2739] p-0.5" style={{ width: 'fit-content' }}>
+                    {(['msl', 'ts'] as const).map((k) => (
+                      <button
+                        key={k}
+                        type="button"
+                        onClick={() => {
+                          setSourceViewKind(k)
+                          setEditingStrategyId(null)
+                          if (k === 'ts') ensureTsLoaded(s.id)
+                        }}
+                        className={`rounded px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider transition-colors ${
+                          sourceViewKind === k ? 'bg-violet-500/20 text-violet-300' : 'text-[#4b5a72] hover:text-[#aab6cc]'
+                        }`}
+                        title={k === 'ts' ? "The strategy's actual compiled TypeScript source" : 'A view/edit of this strategy as MSL via builtinSig() - a live call-through, not a reimplementation'}
+                      >
+                        {k === 'ts' ? 'TypeScript (real code)' : 'MSL'}
+                      </button>
+                    ))}
+                  </div>
+                  {sourceViewKind === 'msl' ? (
+                    <>
+                      <CodeAssistBar kind="ai_lab_script" currentCode={mslText} onApply={setMslText} lastError={mslTestResult && !mslTestResult.ok ? mslTestResult.error ?? null : null} context={{ id: s.id, name: s.name, asset, tf: String(props.tf) }} className="mb-1.5" />
+                      <textarea
+                        value={mslText}
+                        onChange={(e) => setMslText(e.target.value)}
+                        rows={16}
+                        spellCheck={false}
+                        className="w-full resize-y rounded border border-[#1c2739] bg-[#0b111c] p-2 font-mono text-[9.5px] leading-relaxed text-[#dbe4f0] outline-none focus:border-violet-500/40"
+                      />
+                      <div className="mt-1.5 flex items-center gap-1.5">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={mslTestBusy}
+                          className="h-6 border-violet-500/40 bg-violet-500/10 px-2 text-[9px] font-bold uppercase text-violet-300 hover:bg-violet-500/20 disabled:opacity-50"
+                          onClick={testMsl}
+                        >
+                          {mslTestBusy ? 'testing...' : `test on ${asset}`}
+                        </Button>
+                        <Button
+                          size="sm"
+                          disabled={mslSaveBusy}
+                          className="h-6 bg-cyan-600 px-2 text-[9px] font-bold uppercase tracking-wider text-white hover:bg-cyan-500 disabled:opacity-50"
+                          onClick={() => saveMslAsNewStrategy(s)}
+                        >
+                          {mslSaveBusy ? 'saving...' : 'save as new AI Lab strategy'}
+                        </Button>
+                      </div>
+                      {mslTestResult && (
+                        <div className="mt-1.5 rounded border border-[#1c2739] bg-[#070c15] p-1.5">
+                          {mslTestResult.ok ? (
+                            <>
+                              <span className={`font-mono text-[10px] font-bold uppercase ${mslTestResult.direction === 'call' ? 'text-emerald-300' : mslTestResult.direction === 'put' ? 'text-rose-300' : 'text-[#4b5a72]'}`}>
+                                {mslTestResult.direction === 'none' ? 'no fire' : `${mslTestResult.direction} signal`}
+                              </span>
+                              {mslTestResult.direction !== 'none' && <span className="ml-1.5 font-mono text-[9px] text-[#7c8aa5]">conf {mslTestResult.confidence}%</span>}
+                              <div className="mt-0.5 space-y-0.5">
+                                {(mslTestResult.trace ?? []).map((line, i) => (
+                                  <p key={i} className="font-mono text-[8.5px] text-[#7c8aa5]">
+                                    {line}
+                                  </p>
+                                ))}
+                              </div>
+                            </>
+                          ) : (
+                            <p className="font-mono text-[9px] text-rose-300">{mslTestResult.error}</p>
+                          )}
+                        </div>
+                      )}
+                      {mslSaveError && <p className="mt-1 font-mono text-[9px] text-rose-300">{mslSaveError}</p>}
+                      {mslSaveNote && <p className="mt-1 font-mono text-[9px] text-emerald-300">{mslSaveNote}</p>}
+                      <p className="mt-1 font-mono text-[8.5px] text-[#4b5a72]">
+                        builtinSig() calls this strategy&apos;s own evaluate() directly - the call/put verdict is byte-identical to &quot;{s.id}&quot;, only the confidence number is yours to
+                        choose. Saving here creates a NEW, independent AI Lab strategy built on top of this one - it never rewrites builtin.ts.
+                      </p>
+                    </>
+                  ) : strategySourceLoading ? (
                     <p className="font-mono text-[9px] text-[#4b5a72]">loading source…</p>
                   ) : editing ? (
                     <>
@@ -467,8 +610,8 @@ export default function BottomTabs(props: BottomTabsProps) {
                   ) : (
                     <pre className="max-h-72 overflow-auto font-mono text-[9.5px] leading-relaxed text-[#aab6cc]">{strategySource}</pre>
                   )}
-                  {strategySourceError && <p className="mt-1 font-mono text-[9px] text-rose-300">{strategySourceError}</p>}
-                  {strategySaveNote && !editing && <p className="mt-1 font-mono text-[9px] text-emerald-300">{strategySaveNote}</p>}
+                  {sourceViewKind === 'ts' && strategySourceError && <p className="mt-1 font-mono text-[9px] text-rose-300">{strategySourceError}</p>}
+                  {sourceViewKind === 'ts' && strategySaveNote && !editing && <p className="mt-1 font-mono text-[9px] text-emerald-300">{strategySaveNote}</p>}
                 </div>
               )}
             </div>
