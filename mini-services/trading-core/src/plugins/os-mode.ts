@@ -2597,6 +2597,18 @@ export class ModeService {
       const candidates = [...liquidSlice, ...rotated]
       const analytics = this.ctx.use<AnalyticsService>('analytics')
       const lab = this.ctx.use<StrategyLabService>('lab')
+      // meta:<slug> saved Meta Strategy Lab combos - live-only, same as an
+      // autopilot bot's meta: branch (see autopilot.ts's metaResearchGate doc
+      // comment): no candle-slice evaluate exists, so these never go through
+      // the fresh-edge phase gate below (no `phase` to check, so they're
+      // always treated as a fresh vote, same tradeoff every other 'meta'-kind
+      // dispatch in this codebase accepts).
+      let meta: MetaStrategyService | null = null
+      try {
+        meta = this.ctx.use<MetaStrategyService>('metaStrategy')
+      } catch {
+        meta = null
+      }
       // autoDiscover: instead of ranking only among manually-picked
       // strategyIds, pull in the ENTIRE builtin catalog plus every
       // non-decayed AI Lab spec that exists so far - the adaptive gate's own
@@ -2645,12 +2657,14 @@ export class ModeService {
         memberIds
           .map((id) => {
             const isCustom = id.startsWith('custom:')
-            const strat = isCustom ? null : getStrategy(id)
+            const isMeta = !isCustom && id.startsWith('meta:')
+            const strat = isCustom || isMeta ? null : getStrategy(id)
             // user-configured overrides (same shape as a bot's own params) merged
-            // over that strategy's defaults - never applies to a custom: lab spec,
-            // which is a fixed learned structure with no exposed param schema
+            // over that strategy's defaults - never applies to a custom: lab spec
+            // or a meta: combo, neither of which has an exposed param schema
             const params = strat ? { ...defaultParams(strat), ...(this.config.strategyParams?.[id] ?? {}) } : undefined
-            return { id, isCustom, params, valid: isCustom || Boolean(strat) }
+            const validMeta = isMeta && (meta?.isValidStrategyId(id) ?? false)
+            return { id, isCustom, isMeta, params, valid: isCustom || validMeta || Boolean(strat) }
           })
           .filter((s) => s.valid)
       const liveSpecs = ids.length ? resolveMemberSpecs(ids) : []
@@ -2720,7 +2734,13 @@ export class ModeService {
           try {
             const ev = s.isCustom
               ? lab.runStrategy(asset, this.config.tf, s.id)
-              : analytics.runStrategy(asset, this.config.tf, s.id, s.params)
+              : s.isMeta
+                ? (() => {
+                    if (!meta) throw new Error('meta strategy lab unavailable')
+                    const { result, price: p } = meta.evaluate(s.id, asset, this.config.tf)
+                    return { direction: result.direction, score: result.score, notes: result.notes, price: p } as ReturnType<AnalyticsService['runStrategy']>
+                  })()
+                : analytics.runStrategy(asset, this.config.tf, s.id, s.params)
             if (ev.direction === 'none') continue
             // fresh-edge gate: a vote whose condition has been true since
             // before this bar is the stale middle of a move. Only reads that

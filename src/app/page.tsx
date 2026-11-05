@@ -535,6 +535,21 @@ export default function OSPage() {
     }
   }, [])
 
+  // Strategy catalog - was fetched ONCE on initial load, so a strategy saved
+  // or deleted afterwards (a Strategy Lab "save as new AI Lab strategy", a
+  // new Meta Strategy Lab combo) never appeared in the Bots/Auto Trader
+  // pickers until a full page refresh. Re-fetched on the same cadence as
+  // loadBots (both are cheap, in-memory reads on the kernel side) so newly
+  // saved custom:/meta: strategies show up live.
+  const loadStrategies = useCallback(async () => {
+    try {
+      const d = await osGet<{ ok: boolean; strategies: StrategyInfo[] }>('/strategies')
+      if (d.ok) setStrategies(d.strategies)
+    } catch {
+      // kernel not up yet
+    }
+  }, [])
+
   // sentinel status polling - feeds the governance chip in the status bar
   const [sentinelArmed, setSentinelArmed] = useState(false)
   useEffect(() => {
@@ -616,16 +631,14 @@ export default function OSPage() {
     void loadAccount()
     void loadPositions()
     void loadBots()
-    void osGet<{ ok: boolean; strategies: StrategyInfo[] }>('/strategies').then((d) => {
-      if (d.ok) setStrategies(d.strategies)
-    })
+    void loadStrategies()
     void osGet<{ ok: boolean; indicators: RegistryEntry[] }>('/indicators').then((d) => {
       if (d.ok) setRegistry(d.indicators)
     })
     void osGet<{ ok: boolean; alerts: AlertRow[] }>('/alerts').then((d) => {
       if (d.ok) setAlerts(d.alerts.slice(0, 40))
     })
-  }, [loadAssets, loadAccount, loadPositions, loadBots, ensureKernel])
+  }, [loadAssets, loadAccount, loadPositions, loadBots, loadStrategies, ensureKernel])
 
   // if the feed stays dark, give the keeper a chance to revive the kernel
   useEffect(() => {
@@ -639,6 +652,14 @@ export default function OSPage() {
     const t = setInterval(() => void loadBots(), 6000)
     return () => clearInterval(t)
   }, [loadBots])
+
+  // strategy catalog polling - same cadence, so a strategy saved in another
+  // tab (Strategy Lab, AI Lab, Meta Strategy Lab) appears in the Bots/Auto
+  // Trader pickers without a page refresh
+  useEffect(() => {
+    const t = setInterval(() => void loadStrategies(), 6000)
+    return () => clearInterval(t)
+  }, [loadStrategies])
 
   // screener status polling - feeds the discovery chip in the status bar
   useEffect(() => {
