@@ -4265,6 +4265,10 @@ export interface AiTraderStatus {
   lastRunTs: number
   nextRunTs: number | null
   lastError: string | null
+  /** The app URL a cycle will ACTUALLY call right now, after APP_URL env /
+   * saved config / default resolution - shown directly so there's nothing
+   * to guess about which one is in effect. */
+  resolvedAppUrl: string
   llm: {
     order: string[]
     providers: { id: string; enabled: boolean; ready: boolean; model: string }[]

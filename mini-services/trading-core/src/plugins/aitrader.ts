@@ -107,7 +107,24 @@ const DEFAULT_CONFIG: AiTraderConfig = {
   kind: 'binary',
   minConfidence: 65,
   expiryChoices: [3, 5],
-  appUrl: 'http://127.0.0.1:3000',
+  // NOT a literal default on purpose - see resolveAppUrl() below. Baking
+  // 'http://127.0.0.1:3000' in here would get written into every saved
+  // config (the panel always sends the whole draft on save), permanently
+  // shadowing a correct APP_URL env var set later (e.g. after moving this
+  // deployment behind docker-compose, where the right address is a service
+  // name like http://iqos-web:47311, not localhost at all).
+  appUrl: undefined,
+}
+
+/** Resolution order: an APP_URL env var (the deployment's own wiring - set
+ * this in docker-compose.yml's iqos-kernel service, mirroring how iqos-web
+ * already gets KERNEL_URL=http://iqos-kernel:47312 there) always wins, THEN
+ * whatever's saved in config (useful for a bare dev setup with no compose
+ * env at all), THEN localhost:3000 as the last-resort default. Env wins
+ * over config specifically so a correct container-network address isn't
+ * permanently stuck behind a stale 127.0.0.1 the UI already saved once. */
+function resolveAppUrl(config: AiTraderConfig): string {
+  return process.env.APP_URL || config.appUrl || 'http://127.0.0.1:3000'
 }
 
 /** Primary path: call THROUGH the Next.js app's /api/ai_trader_decide,
@@ -249,9 +266,15 @@ export class AiTraderService {
       lastRunTs: this.lastRunTs,
       nextRunTs: this.config.enabled && this.lastRunTs ? this.lastRunTs + this.config.intervalMin * 60 : null,
       lastError: this.lastError,
+      // the actual URL a cycle will call RIGHT NOW (after APP_URL/config/
+      // default resolution) - shown directly so there's no guessing whether
+      // an env var or a saved config value is the one actually in effect.
+      resolvedAppUrl: resolveAppUrl(this.config),
       // which providers THIS process currently sees as enabled/ready - the
       // direct way to check "did it actually pick up the shared .env"
-      // instead of guessing from the cycle error message alone.
+      // instead of guessing from the cycle error message alone. Only the
+      // FALLBACK path (see callLlm()) - the primary path's providers live
+      // in the app process, not here.
       llm: providerStatus(),
     }
   }
@@ -359,7 +382,7 @@ export class AiTraderService {
       let provider = ''
       let model = ''
       try {
-        const res = await callLlm(this.config.appUrl || DEFAULT_CONFIG.appUrl!, [system, user], { temperature: 0.4, maxTokens: 500, timeoutMs: 45_000 })
+        const res = await callLlm(resolveAppUrl(this.config), [system, user], { temperature: 0.4, maxTokens: 500, timeoutMs: 45_000 })
         content = res.content
         provider = res.provider
         model = res.model

@@ -9,10 +9,6 @@ services:
         # in `environment:`, is a SEPARATE thing that only covers the
         # server-side API routes evaluated per-request. Both must match.
         KERNEL_URL: http://iqos-kernel:47312
-        # P0: middleware.ts injects the kernel token into the browser's
-        # XTransformPort rewrite path - middleware inlines process.env at
-        # BUILD time, so the token must be a build arg (rotation = rebuild).
-        KERNEL_TOKEN: ${KERNEL_TOKEN:-}
     container_name: iqos-web
     restart: unless-stopped
     environment:
@@ -27,9 +23,6 @@ services:
       - HOSTNAME=0.0.0.0
       - KERNEL_URL=http://iqos-kernel:47312
       - KERNEL_MANAGED=false
-      # P0 security: the agent/keeper API routes read the token at RUNTIME.
-      # Keep this in sync with the build arg above (same .env value).
-      - KERNEL_TOKEN=${KERNEL_TOKEN:-}
       # LLM provider config - copy the flags/keys you use from .env.example
       - USE_ZAI=${USE_ZAI:-true}
       - ZAI_API_KEY=${ZAI_API_KEY:-}
@@ -59,10 +52,13 @@ services:
     restart: unless-stopped
     environment:
       - KERNEL_PORT=47312
-      # P0 security: when set, every kernel REST route except /health and the
-      # socket.io feed requires this token (x-kernel-token / Bearer / ?token=).
-      # Generate one with: openssl rand -hex 24
-      - KERNEL_TOKEN=${KERNEL_TOKEN:-}
+      # AI Trader's decision calls go THROUGH iqos-web (same chatComplete,
+      # same LLM keys the Copilot already uses - see src/plugins/aitrader.ts's
+      # resolveAppUrl()), so it needs iqos-web's address on this SAME
+      # internal network - the service name, not localhost (each container
+      # has its own network namespace). Mirrors the KERNEL_URL iqos-web gets
+      # below, just in the opposite direction.
+      - APP_URL=http://iqos-web:47311
     volumes:
       - iqos-kernel-data:/app/data
     healthcheck:
@@ -84,13 +80,8 @@ services:
     environment:
       - SIDECAR_HOST=0.0.0.0
       - SIDECAR_PORT=47313
-      - SIDECAR_SESSION_DIR=/app/session
     volumes:
-      # Task 58 (P1): this volume used to mount the WHOLE /app workdir - a
-      # first-up volume copy is fine, but any image rebuild then ran the OLD
-      # sidecar code from the volume forever (code updates never deployed).
-      # Persist ONLY the session file directory.
-      - iqos-sidecar-session:/app/session
+      - iqos-sidecar-session:/app
     networks:
       - iqos-internal
     # Optional - only needed for LIVE (IQ Option) mode. Not exposed to the

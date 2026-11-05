@@ -169,11 +169,14 @@ export default function AiTraderPanel({ assets, onError }: Props) {
           />
         </label>
         <label className="col-span-2 flex flex-col gap-1 sm:col-span-4">
-          <span className="text-[#7c8aa5]">this app&apos;s own URL (how trading-core reaches it for decisions - same keys as Copilot, nothing else to set up)</span>
+          <span className="text-[#7c8aa5]">
+            this app&apos;s own URL override (only matters if there&apos;s no APP_URL env var on trading-core - currently resolved to:{' '}
+            <span className="font-bold text-cyan-300">{status.resolvedAppUrl}</span>)
+          </span>
           <Input
-            value={draft.appUrl ?? 'http://127.0.0.1:3000'}
-            onChange={(e) => setDraft({ ...draft, appUrl: e.target.value })}
-            placeholder="http://127.0.0.1:3000"
+            value={draft.appUrl ?? ''}
+            onChange={(e) => setDraft({ ...draft, appUrl: e.target.value || undefined })}
+            placeholder="leave blank unless APP_URL isn't set in trading-core's environment"
             className="h-6 bg-[#070c15] text-[9.5px] text-[#dbe4f0]"
           />
         </label>
