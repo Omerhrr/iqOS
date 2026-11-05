@@ -17,7 +17,7 @@ import type {
   StrategyInfo,
   Timeframe,
 } from '@/lib/os/client'
-import { fmtMoney, fmtPct, fmtPrice, fmtTime, osPost } from '@/lib/os/client'
+import { fmtMoney, fmtPct, fmtPrice, fmtTime, osGet, osPost } from '@/lib/os/client'
 import BacktestLab from './BacktestLab'
 import QuantPanel from './QuantPanel'
 import AutopilotPanel from './AutopilotPanel'
@@ -65,6 +65,56 @@ interface BottomTabsProps {
 export default function BottomTabs(props: BottomTabsProps) {
   const { positions, history, alerts, patterns, price, prices, asset, refreshPositions, onError, closedTick } = props
   const [full, setFull] = useState(false)
+
+  // "the strategy lab should not be read only... let it be fully
+  // functional" per direct instruction - the built-in Strategy Lab
+  // catalog (STRATEGIES in trading-core/src/strategies/builtin.ts) gets
+  // real view/edit/save-as-code, backed by /strategy_builtin_source and
+  // /strategy_builtin_save (src/strategies/sourceedit.ts does the actual
+  // brace-matched file surgery + syntax check + backup on the kernel
+  // side - this is just the UI for it). AI-learned specs ("(Lab)" suffix,
+  // custom:<id>) are handled by AI Lab's own JSON editor instead - they
+  // aren't real source code, so they don't belong here.
+  const [viewingStrategyId, setViewingStrategyId] = useState<string | null>(null)
+  const [strategySource, setStrategySource] = useState('')
+  const [strategySourceLoading, setStrategySourceLoading] = useState(false)
+  const [strategySourceError, setStrategySourceError] = useState<string | null>(null)
+  const [editingStrategyId, setEditingStrategyId] = useState<string | null>(null)
+  const [savingStrategySource, setSavingStrategySource] = useState(false)
+  const [strategySaveNote, setStrategySaveNote] = useState<string | null>(null)
+
+  const loadStrategySource = (id: string) => {
+    if (viewingStrategyId === id) {
+      setViewingStrategyId(null)
+      setEditingStrategyId(null)
+      return
+    }
+    setViewingStrategyId(id)
+    setEditingStrategyId(null)
+    setStrategySourceError(null)
+    setStrategySaveNote(null)
+    setStrategySourceLoading(true)
+    osGet<{ ok: boolean; source?: string; error?: string }>('/strategy_builtin_source', { id })
+      .then((r) => {
+        if (!r.ok) throw new Error(r.error ?? 'could not read source')
+        setStrategySource(r.source ?? '')
+      })
+      .catch((e: Error) => setStrategySourceError(e.message))
+      .finally(() => setStrategySourceLoading(false))
+  }
+
+  const saveStrategySource = (id: string) => {
+    setSavingStrategySource(true)
+    setStrategySourceError(null)
+    osPost<{ ok: boolean; message?: string; error?: string }>('/strategy_builtin_save', { id, source: strategySource })
+      .then((r) => {
+        if (!r.ok) throw new Error(r.error ?? 'save failed')
+        setStrategySaveNote(r.message ?? 'saved')
+        setEditingStrategyId(null)
+      })
+      .catch((e: Error) => setStrategySourceError(e.message))
+      .finally(() => setSavingStrategySource(false))
+  }
 
   const closePos = async (id: string) => {
     try {
@@ -331,9 +381,13 @@ export default function BottomTabs(props: BottomTabsProps) {
       {/* STRATEGIES */}
       <TabsContent value="strategies" className="mt-0 min-h-0 flex-1 overflow-auto p-3">
         <div className="grid grid-cols-1 gap-2 lg:grid-cols-2">
-          {props.strategies.map((s) => (
+          {props.strategies.map((s) => {
+            const isLab = s.id.startsWith('custom:')
+            const viewing = viewingStrategyId === s.id
+            const editing = editingStrategyId === s.id
+            return (
             <div key={s.id} className="rounded-lg border border-[#1c2739] bg-[#0b111c] p-3">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-2">
                 <h4 className="text-[12px] font-semibold text-[#dbe4f0]">{s.name}</h4>
                 <span className="font-mono text-[9px] text-[#4b5a72]">{s.id}</span>
               </div>
@@ -345,8 +399,72 @@ export default function BottomTabs(props: BottomTabsProps) {
                   </span>
                 ))}
               </div>
+              {!isLab && (
+                <div className="mt-2 flex items-center gap-1.5">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5] hover:text-violet-400"
+                    onClick={() => loadStrategySource(s.id)}
+                  >
+                    {viewing ? 'hide source' : 'view source'}
+                  </Button>
+                  {viewing && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5] hover:text-amber-400"
+                      onClick={() => setEditingStrategyId(editing ? null : s.id)}
+                    >
+                      {editing ? 'cancel edit' : 'edit'}
+                    </Button>
+                  )}
+                </div>
+              )}
+              {isLab && (
+                <p className="mt-2 font-mono text-[8.5px] text-[#4b5a72]">AI-learned spec - edit it as JSON in the AI Lab tab, not here.</p>
+              )}
+              {viewing && (
+                <div className="mt-2 rounded border border-[#1c2739] bg-[#070c15] p-2">
+                  {strategySourceLoading ? (
+                    <p className="font-mono text-[9px] text-[#4b5a72]">loading source…</p>
+                  ) : editing ? (
+                    <>
+                      <textarea
+                        value={strategySource}
+                        onChange={(e) => setStrategySource(e.target.value)}
+                        rows={18}
+                        spellCheck={false}
+                        className="w-full resize-y rounded border border-[#1c2739] bg-[#0b111c] p-2 font-mono text-[9.5px] leading-relaxed text-[#dbe4f0] outline-none focus:border-amber-500/40"
+                      />
+                      <div className="mt-1.5 flex items-center gap-1.5">
+                        <Button
+                          size="sm"
+                          disabled={savingStrategySource}
+                          className="h-6 bg-amber-600 px-2 text-[9px] font-bold uppercase tracking-wider text-white hover:bg-amber-500 disabled:opacity-50"
+                          onClick={() => saveStrategySource(s.id)}
+                        >
+                          {savingStrategySource ? 'saving...' : 'save changes'}
+                        </Button>
+                        <Button variant="outline" size="sm" className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5]" onClick={() => setEditingStrategyId(null)}>
+                          cancel
+                        </Button>
+                      </div>
+                      <p className="mt-1 font-mono text-[8.5px] text-[#4b5a72]">
+                        This is real TypeScript, not data - edits are syntax-checked and backed up before saving, but a logic mistake can still ship. Saving
+                        rewrites this strategy&apos;s block in builtin.ts in place; the kernel needs a restart for the change to take effect.
+                      </p>
+                    </>
+                  ) : (
+                    <pre className="max-h-72 overflow-auto font-mono text-[9.5px] leading-relaxed text-[#aab6cc]">{strategySource}</pre>
+                  )}
+                  {strategySourceError && <p className="mt-1 font-mono text-[9px] text-rose-300">{strategySourceError}</p>}
+                  {strategySaveNote && !editing && <p className="mt-1 font-mono text-[9px] text-emerald-300">{strategySaveNote}</p>}
+                </div>
+              )}
             </div>
-          ))}
+            )
+          })}
         </div>
       </TabsContent>
 

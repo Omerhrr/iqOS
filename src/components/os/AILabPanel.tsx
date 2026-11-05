@@ -956,6 +956,62 @@ export default function AILabPanel({ assets, strategies, onError, refreshBots }:
   // result already has (its own <details> block), just not previously
   // available once a strategy was saved into the library.
   const [expandedLabId, setExpandedLabId] = useState<string | null>(null)
+
+  // "the strategy lab should not be read only... let it be fully
+  // functional" per direct instruction - a CustomSpec is already just
+  // data (signals[]/minScore/minVotes/horizon/basis), so "view as code,
+  // edit, and save" is a JSON textarea wired straight to the EXISTING
+  // /lab_save endpoint (same one "learn this pair" already saves
+  // through) - no new backend surface needed, just no longer read-only.
+  const [editingLabId, setEditingLabId] = useState<string | null>(null)
+  const [editingLabText, setEditingLabText] = useState('')
+  const [savingLabEdit, setSavingLabEdit] = useState(false)
+  const [labEditError, setLabEditError] = useState<string | null>(null)
+
+  const startEditLab = (r: LabStrategyRow) => {
+    setExpandedLabId(r.id)
+    setEditingLabId(r.id)
+    setEditingLabText(JSON.stringify(r.spec, null, 2))
+    setLabEditError(null)
+  }
+
+  const cancelEditLab = () => {
+    setEditingLabId(null)
+    setLabEditError(null)
+  }
+
+  const saveEditLab = async (r: LabStrategyRow) => {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(editingLabText)
+    } catch (e) {
+      setLabEditError(`invalid JSON: ${(e as Error).message}`)
+      return
+    }
+    setSavingLabEdit(true)
+    setLabEditError(null)
+    try {
+      // /lab_save runs the spec through the SAME normalizeSpec() validation
+      // the learner itself uses (invalid signals/thresholds are rejected
+      // with a real error, not silently accepted) - keep this row's own
+      // id/asset/tf so the edit replaces it in place rather than forking a
+      // new entry.
+      const res = await osPost<{ ok: boolean; id: string; error?: string }>('/lab_save', {
+        id: r.id,
+        spec: parsed,
+        asset: r.asset,
+        tf: r.tf,
+        stats: r.stats,
+      })
+      if (!res.ok) throw new Error(res.error ?? 'save failed')
+      setEditingLabId(null)
+      loadLibrary()
+    } catch (e) {
+      setLabEditError((e as Error).message)
+    } finally {
+      setSavingLabEdit(false)
+    }
+  }
   const backtestRow = async (id: string) => {
     // Use the saved row's OWN asset/tf, not whatever pair the learn form
     // currently has selected - the library holds strategies learned on
@@ -1827,19 +1883,57 @@ export default function AILabPanel({ assets, strategies, onError, refreshBots }:
                     variant="outline"
                     size="sm"
                     className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5] hover:text-violet-400"
-                    onClick={() => setExpandedLabId(expanded ? null : r.id)}
+                    onClick={() => {
+                      if (editingLabId === r.id) cancelEditLab()
+                      setExpandedLabId(expanded ? null : r.id)
+                    }}
                     title="view this strategy's spec JSON"
                   >
                     {expanded ? 'hide json' : 'view json'}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5] hover:text-amber-400"
+                    onClick={() => (editingLabId === r.id ? cancelEditLab() : startEditLab(r))}
+                    title="edit this strategy's spec JSON directly and save it back in place"
+                  >
+                    {editingLabId === r.id ? 'cancel edit' : 'edit'}
                   </Button>
                   <Button variant="outline" size="sm" className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5] hover:text-rose-400" onClick={() => void removeLab(r.id)}>
                     delete
                   </Button>
                 </div>
               </div>
-              {expanded && (
+              {expanded && editingLabId !== r.id && (
                 <div className="border-t border-[#141d2e] px-2.5 py-2">
                   <pre className="max-h-64 overflow-auto font-mono text-[10px] leading-relaxed text-[#aab6cc]">{JSON.stringify(r.spec, null, 2)}</pre>
+                </div>
+              )}
+              {editingLabId === r.id && (
+                <div className="border-t border-[#141d2e] px-2.5 py-2">
+                  <textarea
+                    value={editingLabText}
+                    onChange={(e) => setEditingLabText(e.target.value)}
+                    rows={16}
+                    spellCheck={false}
+                    className="w-full resize-y rounded border border-[#1c2739] bg-[#070c15] p-2 font-mono text-[10px] leading-relaxed text-[#dbe4f0] outline-none focus:border-amber-500/40"
+                  />
+                  {labEditError && <p className="mt-1 font-mono text-[9px] text-rose-300">{labEditError}</p>}
+                  <div className="mt-1.5 flex items-center gap-1.5">
+                    <Button
+                      size="sm"
+                      disabled={savingLabEdit}
+                      className="h-6 bg-amber-600 px-2 text-[9px] font-bold uppercase tracking-wider text-white hover:bg-amber-500 disabled:opacity-50"
+                      onClick={() => void saveEditLab(r)}
+                    >
+                      {savingLabEdit ? 'saving...' : 'save changes'}
+                    </Button>
+                    <Button variant="outline" size="sm" className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5]" onClick={cancelEditLab}>
+                      cancel
+                    </Button>
+                    <span className="font-mono text-[8.5px] text-[#4b5a72]">saves straight back to this spec (id {r.id}) - validated the same way the learner validates a fresh spec</span>
+                  </div>
                 </div>
               )}
               </div>

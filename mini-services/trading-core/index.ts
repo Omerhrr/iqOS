@@ -40,6 +40,7 @@ import { tempoPlugin, TempoService } from './src/plugins/tempo'
 import { accutePlugin, AccuteService } from './src/plugins/accute'
 import { gridSearch, walkForward, sweepAssets, type Objective } from './src/strategies/optimize'
 import { backtest } from './src/strategies/backtest'
+import { readBuiltinStrategySource, saveBuiltinStrategySource } from './src/strategies/sourceedit'
 import type { BacktestOptions } from './src/strategies/backtest'
 import { leadersFor, LEADLAG_GROUPS, fitLeadLag, projectLeadLagSignal, LEADLAG_MIN_ABS_CORRELATION, LEADLAG_MIN_TRIGGER_Z, type LeadLagFit, type LeadLagSignal } from './src/analytics/leadlag'
 import { distillChartSignals, DISTILL_DEFAULT_WINDOW } from './src/analytics/chartsignalsdistill'
@@ -2816,6 +2817,15 @@ const httpServer = createServer(async (req, res) => {
           ],
         })
 
+      // GET /strategy_builtin_source?id=<strategyId> - the built-in
+      // Strategy Lab catalog's own "view as code" - returns the exact
+      // object-literal text for one STRATEGIES entry out of builtin.ts
+      // (src/strategies/sourceedit.ts does the brace-matched extraction).
+      if (path === '/strategy_builtin_source') {
+        const res = readBuiltinStrategySource(String(q.get('id') ?? ''))
+        return res.ok ? json(200, { ok: true, source: res.source }) : json(404, res)
+      }
+
       if (path === '/lab_list') {
         return json(200, { ok: true, strategies: kernel.context().use<StrategyLabService>('lab').list() })
       }
@@ -4106,6 +4116,19 @@ const httpServer = createServer(async (req, res) => {
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }
+      }
+
+      // POST /strategy_builtin_save {id, source} - "the strategy lab
+      // should not be read only... let it be fully functional" per direct
+      // instruction: rewrites that ONE strategy's block in builtin.ts in
+      // place (syntax-checked + backed up first - see sourceedit.ts's own
+      // header for the full safety story). Takes effect on next kernel
+      // restart, same as any other source change.
+      if (path === '/strategy_builtin_save') {
+        const res = saveBuiltinStrategySource(String(body.id ?? ''), String(body.source ?? ''))
+        return res.ok
+          ? json(200, { ok: true, message: 'saved - restart the kernel for this change to take effect', backup: res.backup })
+          : json(400, res)
       }
 
       if (path === '/lab_save') {
