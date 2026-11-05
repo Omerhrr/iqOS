@@ -39,7 +39,14 @@ interface GlobalDomPanelProps {
 
 const POLL_MS = 12_000
 const TFS: Timeframe[] = ['1m', '5m']
-const LIMIT = 80
+// AUDIT FIX - this used to hardcode 80, which silently truncated the scan
+// well below the open universe (the full catalog is ~117 instruments;
+// forex+OTC alone is already over 40, and crypto/commodities/stocks/
+// indices add more whenever they're open too) - see domGlobalScan()'s own
+// doc comment in plugins/nextcandle.ts for the full story. 300 is a safety
+// ceiling, not a target - comfortably above the whole catalog so this
+// board always scans every open pair, never a slice of them.
+const LIMIT = 300
 
 type DirFilter = 'all' | 'buy' | 'sell'
 
@@ -115,7 +122,9 @@ export default function GlobalDomPanel({ tf, closedTick, onPickAsset, onOpenOrac
       <div className="flex items-center gap-1.5">
         <span className="h-1.5 w-1.5 rounded-full bg-amber-300" />
         <h3 className="font-mono text-[11px] font-bold uppercase tracking-wider text-[#dbe4f0]">Global Dom</h3>
-        <span className="font-mono text-[9px] text-[#7c8aa5]">{meta ? `${meta.dominating}/${meta.scanned} dominating` : '…'}</span>
+        <span className="font-mono text-[9px] text-[#7c8aa5]" title="dominating / pairs scanned / pairs open right now - scanned should always equal open (no truncation)">
+          {meta ? `${meta.dominating}/${meta.scanned} dominating${meta.scanned !== meta.universe ? ` (of ${meta.universe} open!)` : ''}` : '…'}
+        </span>
         <div className="ml-auto flex items-center gap-1">
           {TFS.map((t) => (
             <button

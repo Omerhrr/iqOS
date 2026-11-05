@@ -43,10 +43,15 @@
 // Source identifiers may contain ':' (e.g. `smc:FVG`, `smc:now`) - the
 // caller (plugins/metastrategy.ts) builds the `reads` map with exactly the
 // keys a script is allowed to reference: 'oracle', 'hmaRocBullBear',
-// 'momentumScore', 'accute', 'renko', 'smc', 'smcNow', 'renkoSmc', and
-// 'smc:<KIND>' for each of the 15 SMC concepts (smcNowRead() per kind) -
-// "any of the smcs" per direct instruction, without needing 15 new
-// MetaConditionSource union members.
+// 'momentumScore', 'accute', 'renko', 'pointFigure', 'rangeBars', 'smc',
+// 'smcNow', 'renkoSmc', and 'smc:<KIND>' for each of the 15 SMC concepts
+// (smcNowRead() per kind) - "any of the smcs" per direct instruction,
+// without needing 15 new MetaConditionSource union members. 'pointFigure'/
+// 'rangeBars' are the same "not just renko - p&f, range and all others as
+// we see fit" instruction: every chart engine this codebase already keeps
+// as its own pure module (analytics/renko.ts, pointfigure.ts, rangebars.ts)
+// is reachable from a script the same way, so a new chart type only ever
+// needs a new `reads` key here, never a language change.
 
 export type MslValue = number | boolean | string
 
@@ -447,7 +452,7 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, reads: Record<string, 
     }
     case 'field': {
       const read = reads[e.obj]
-      if (!read) throw new MslRuntimeError(`unknown source "${e.obj}" - available sources are set by the Meta Strategy Lab (oracle, hmaRocBullBear, momentumScore, accute, renko, smc, smcNow, renkoSmc, smc:<KIND>)`)
+      if (!read) throw new MslRuntimeError(`unknown source "${e.obj}" - available sources are set by the Meta Strategy Lab (oracle, hmaRocBullBear, momentumScore, accute, renko, pointFigure, rangeBars, smc, smcNow, renkoSmc, smc:<KIND>)`)
       switch (e.field) {
         case 'dir':
         case 'direction':

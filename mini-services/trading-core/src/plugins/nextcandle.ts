@@ -1398,8 +1398,26 @@ export class NextCandleService {
   // a read of who's actually transacting. The whole point of this board is
   // that it should usually come back thin or empty - that's what makes a
   // hit worth checking Accute/Oracle over.
+  //
+  // AUDIT FIX: "is it scanning a single pair or the whole market" - it was
+  // silently truncating. `universe.slice(0, limit)` cut the open universe
+  // down to whatever `limit` the caller passed BEFORE any filtering, same
+  // truncation-class bug smcscan.ts's globalScan() had (GLOBAL_SCAN_LIMIT_
+  // DEFAULT=40 silently dropping OTC pairs once forex+OTC alone exceeded
+  // it - see that fix's commit). GlobalDomPanel.tsx was hardcoding
+  // limit:80, and the full catalog (universe.ts) is 117 instruments - on
+  // an ordinary session with crypto/commodities/stocks/indices also open
+  // alongside forex+OTC, "0/80 dominating" could easily mean "0/80 of
+  // MORE than 80 open pairs", quietly leaving the rest unscanned. There is
+  // no good reason to cap this board below the whole open universe - the
+  // whole point of "Global Dom" is whole-market coverage, and scanning is
+  // nearly free here (same TTL-cached scanRowFor() rows the per-asset
+  // panels already keep warm, per the module comment above). `limit` is
+  // now a hard SAFETY CEILING only (default 300, comfortably above the
+  // current ~117-row catalog so normal use never hits it), not a silent
+  // truncation knob - if the caller doesn't pass one, nothing gets cut.
   domGlobalScan(tf: Timeframe, opts: { limit?: number; category?: string; refresh?: boolean } = {}): DomGlobalResult {
-    const limit = Math.max(1, Math.min(Math.round(opts.limit ?? 60), 200))
+    const limit = Math.max(1, Math.min(Math.round(opts.limit ?? 300), 500))
     const category = opts.category && opts.category !== 'all' ? opts.category : null
     const refresh = opts.refresh === true
     const now = Date.now()

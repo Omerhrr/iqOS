@@ -35,8 +35,21 @@ export type MetaConditionSource =
   | 'smc' // Smart Money Concepts BLENDED structure summary (analytics/smc.ts's scanSmc().summary - mixes in older hits, not just this candle)
   | 'smcNow' // SMC "now" read (analytics/smc.ts's smcNowRead(), barsAgo===0 only) - aggregate across all 14 non-S&R concepts by default, or ONE concept via this condition's `smcKind` field ("build all the smc strats separately", same per-kind reads Meta Trader's own smc-<kind> sources use)
   | 'renkoSmc' // Renko trend + SMC "now" confluence - same rule Meta Trader's 'renko-smc' source trades (renko green + smc now up = call, renko red + smc now down = put), as a condition any meta-strategy can require
+  | 'pointFigure' // Point & Figure column direction/streak (analytics/pointfigure.ts) - "not just renko, p&f, range and all others" per direct instruction
+  | 'rangeBars' // Range bar trend/streak (analytics/rangebars.ts) - same "call any other chart" instruction; a different noise filter than Renko (fixed price span per bar vs. ATR-scaled brick + reversal multiplier)
 
-export const META_CONDITION_SOURCES: readonly MetaConditionSource[] = ['oracle', 'hmaRocBullBear', 'momentumScore', 'accute', 'renko', 'smc', 'smcNow', 'renkoSmc']
+export const META_CONDITION_SOURCES: readonly MetaConditionSource[] = [
+  'oracle',
+  'hmaRocBullBear',
+  'momentumScore',
+  'accute',
+  'renko',
+  'smc',
+  'smcNow',
+  'renkoSmc',
+  'pointFigure',
+  'rangeBars',
+]
 
 export type MetaDirection = 'call' | 'put' | 'none'
 

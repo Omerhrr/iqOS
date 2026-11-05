@@ -21,6 +21,8 @@ import type { NextCandleService } from './nextcandle'
 import type { AccuteService } from './accute'
 import type { SmcScanService } from './smcscan'
 import { renkoBricks } from '../analytics/renko'
+import { rangeBars } from '../analytics/rangebars'
+import { pointFigure } from '../analytics/pointfigure'
 import { smcNowRead, ALL_SMC_KINDS } from '../analytics/smc'
 import {
   evaluateMetaStrategy,
@@ -240,6 +242,31 @@ export class MetaStrategyService {
           if (read.direction === 'none') return none(`SMC now${kind ? ` (${kind})` : ''}: ${read.note}`)
           return { source, direction: read.direction, confidence: read.confidence, label: `SMC now${kind ? ` ${kind}` : ''} ${read.direction.toUpperCase()} - ${read.note}` }
         }
+        case 'pointFigure': {
+          // "not just renko, p&f, range and all others as we see fit" per
+          // direct instruction - Point & Figure has no native streak the
+          // way Renko/range bars do (a column grows by boxes, not bars),
+          // so the confidence proxy is the current column's own box count,
+          // same `40 + n*12` capped-100 scaling convention as Renko -
+          // more boxes painted in the live column reads as more committed
+          // than a column that just flipped.
+          const candles = this.market.getCandlesDeep(asset, tf, 300, true)
+          const pf = pointFigure(candles)
+          if (!pf.lastDir) return none('Point & Figure: no column painted yet')
+          const direction = pf.lastDir === 'X' ? 'call' : 'put'
+          const liveBoxes = pf.columns.length ? pf.columns[pf.columns.length - 1].boxes : 0
+          const confidence = Math.min(100, 40 + liveBoxes * 12)
+          const breakout = pf.pattern && pf.pattern.direction === direction ? ` - ${pf.pattern.name}` : ''
+          return { source, direction, confidence, label: `P&F ${pf.lastDir} column, ${liveBoxes} box(es)${breakout}` }
+        }
+        case 'rangeBars': {
+          const candles = this.market.getCandlesDeep(asset, tf, 300, true)
+          const rb = rangeBars(candles)
+          if (rb.trend === 'none') return none('Range bars: no bars painted yet')
+          const direction = rb.trend === 'up' ? 'call' : 'put'
+          const confidence = Math.min(100, 40 + rb.streak * 12)
+          return { source, direction, confidence, label: `Range bars ${rb.streak} ${rb.trend.toUpperCase()} bar(s)` }
+        }
         case 'renkoSmc': {
           // Same confluence rule Meta Trader's 'renko-smc' source trades:
           // fires ONLY when Renko's brick trend and SMC's aggregate "now"
@@ -280,6 +307,8 @@ export class MetaStrategyService {
       smc: toMsl(this.readSource('smc', asset, tf)),
       smcNow: toMsl(this.readSource('smcNow', asset, tf)),
       renkoSmc: toMsl(this.readSource('renkoSmc', asset, tf)),
+      pointFigure: toMsl(this.readSource('pointFigure', asset, tf)),
+      rangeBars: toMsl(this.readSource('rangeBars', asset, tf)),
     }
     try {
       const smc = this.ctx.use<SmcScanService>('smcScan')

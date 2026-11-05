@@ -2868,21 +2868,23 @@ const httpServer = createServer(async (req, res) => {
         }
       }
 
-      // GET /dom_global?tf=1m&limit=60&category=all&refresh=1
-      // -> Global Dom: the whole universe filtered to pairs whose Momentum
-      // Score read is in full domination right now (every one of its four
-      // timeframes agreeing AND individually clearing the threshold - see
-      // analytics/momentumscore.ts). Shares /next_global's TTL-cached rows
-      // (same scanRowFor cache, same honesty-tracked predict() underneath),
-      // so this board costs nothing extra to poll alongside Next Global/
-      // Accute/Tempo - it's a filter on rows that are already being kept
-      // warm, not a second scan.
+      // GET /dom_global?tf=1m&limit=300&category=all&refresh=1
+      // -> Global Dom: the WHOLE open universe (not a slice of it - see
+      // domGlobalScan()'s own doc comment for the truncation bug this
+      // fixed) filtered to pairs in genuine buy/sell "full control" right
+      // now (analytics/orderflow.ts computeControlRead). Shares /next_
+      // global's TTL-cached rows (same scanRowFor cache, same honesty-
+      // tracked predict() underneath), so this board costs nothing extra
+      // to poll alongside Next Global/Accute/Tempo - it's a filter on rows
+      // that are already being kept warm, not a second scan. `limit` is a
+      // safety ceiling only, defaulted well above the current catalog
+      // size - omit it rather than passing something below universe size.
       if (path === '/dom_global') {
         try {
           const svc = kernel.context().use<NextCandleService>('nextcandle')
           const gTf = tf(String(q.get('tf') ?? '1m') as string)
           const out = svc.domGlobalScan(gTf, {
-            limit: Number(q.get('limit') ?? 60),
+            limit: q.get('limit') ? Number(q.get('limit')) : undefined,
             category: q.get('category') ?? 'all',
             refresh: q.get('refresh') === '1',
           })

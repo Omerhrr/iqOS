@@ -43,18 +43,19 @@ interface MetaStrategyPanelProps {
   onError: (m: string) => void
 }
 
-const ALL_SOURCES: MetaConditionSource[] = ['oracle', 'hmaRocBullBear', 'momentumScore', 'accute', 'renko', 'smc', 'smcNow', 'renkoSmc']
+const ALL_SOURCES: MetaConditionSource[] = ['oracle', 'hmaRocBullBear', 'momentumScore', 'accute', 'renko', 'pointFigure', 'rangeBars', 'smc', 'smcNow', 'renkoSmc']
 
 const SCRIPT_PLACEHOLDER = `# Meta Strategy Lab script - combine any panel read with real logic.
-# Sources: oracle, hmaRocBullBear, momentumScore, accute, renko, smc,
-# smcNow, renkoSmc, and smc:<KIND> for any of the 15 SMC concepts
-# (e.g. smc:FVG, smc:BOS, smc:ORDER_BLOCK...).
+# Sources: oracle, hmaRocBullBear, momentumScore, accute, renko,
+# pointFigure, rangeBars, smc, smcNow, renkoSmc, and smc:<KIND> for any of
+# the 15 SMC concepts (e.g. smc:FVG, smc:BOS, smc:ORDER_BLOCK...).
 # Fields: .dir (call/put/none), .conf (0-100), .active, .call, .put
 
 let strong = smc:FVG.conf >= 60
-call when oracle.dir == call and renkoSmc.dir == call and strong
-put when oracle.dir == put and renkoSmc.dir == put
-confidence = avg(oracle.conf, renkoSmc.conf)
+let chartsAgree = renko.dir == pointFigure.dir and renko.dir == rangeBars.dir
+call when oracle.dir == call and chartsAgree and renko.dir == call and strong
+put when oracle.dir == put and chartsAgree and renko.dir == put
+confidence = avg(oracle.conf, renko.conf, pointFigure.conf, rangeBars.conf)
 `
 
 function emptyCondition(): MetaCondition {
@@ -496,9 +497,10 @@ export default function MetaStrategyPanel({ asset, tf, onError }: MetaStrategyPa
       </div>
 
       <p className="border-t border-[#1c2739] px-2 py-1 text-[8.5px] leading-relaxed text-[#3d4d66]">
-        Reads each panel&apos;s own current verdict (Oracle/HMA-ROC-Bull-Bear/Momentum Score/Accute/Renko/SMC, including per-kind SMC &quot;now&quot; reads and the Renko+SMC
-        confluence) - never recomputes from candles. Build with the dropdown builder or the code editor (Meta Strategy Lab&apos;s own strategy language - sandboxed, no
-        loops/I-O/raw candles). Pick a saved strategy as the auto-trader&apos;s signal source (Autopilot panel → Meta-Strategy) to trade it live.
+        Reads each panel&apos;s own current verdict (Oracle/HMA-ROC-Bull-Bear/Momentum Score/Accute, every chart engine - Renko/Point &amp; Figure/Range Bars - and SMC,
+        including per-kind SMC &quot;now&quot; reads and the Renko+SMC confluence) - never recomputes from candles itself, it only reads what each engine already
+        computed. Build with the dropdown builder or the code editor (Meta Strategy Lab&apos;s own strategy language - sandboxed, no loops/I-O/raw candles). Pick a
+        saved strategy as the auto-trader&apos;s signal source (Autopilot panel → Meta-Strategy) to trade it live.
       </p>
     </div>
   )

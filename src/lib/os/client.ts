@@ -284,7 +284,17 @@ export async function getSmcGlobal(tf: Timeframe, opts: { limit?: number; market
 //     panel reads, still sandboxed (no loops, no I/O, no raw candles) -
 //     see that module's header for the full grammar.
 
-export type MetaConditionSource = 'oracle' | 'hmaRocBullBear' | 'momentumScore' | 'accute' | 'renko' | 'smc' | 'smcNow' | 'renkoSmc'
+export type MetaConditionSource =
+  | 'oracle'
+  | 'hmaRocBullBear'
+  | 'momentumScore'
+  | 'accute'
+  | 'renko'
+  | 'pointFigure'
+  | 'rangeBars'
+  | 'smc'
+  | 'smcNow'
+  | 'renkoSmc'
 
 export const META_CONDITION_SOURCE_LABELS: Record<MetaConditionSource, string> = {
   oracle: 'Next-Candle Oracle',
@@ -292,6 +302,8 @@ export const META_CONDITION_SOURCE_LABELS: Record<MetaConditionSource, string> =
   momentumScore: 'Market Momentum Score',
   accute: 'Accute',
   renko: 'Renko',
+  pointFigure: 'Point & Figure',
+  rangeBars: 'Range Bars',
   smc: 'Smart Money Concepts (blended)',
   smcNow: 'SMC "now" (this candle only)',
   renkoSmc: 'Renko + SMC "now" confluence',
