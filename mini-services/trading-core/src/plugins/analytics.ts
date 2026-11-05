@@ -70,7 +70,7 @@ export class AnalyticsService {
     // Lab validates them fine, since this is the path bots + manual eval +
     // the auto-trader's single-shot checks all go through.
     const aux = this.auxCandles(asset, tf, strategyId, 1500, candles.length)
-    const hints = { asset, tf, leaderCandles: aux.leaderCandles, leaderCandles2: aux.leaderCandles2 }
+    const hints = { asset, leaderCandles: aux.leaderCandles, leaderCandles2: aux.leaderCandles2 }
     // Edge wrapper: the evaluate stays pure/level-shaped; the transition vs
     // the previous closed bar is classified here so every consumer (bots,
     // auto-trader, panels) can gate on "just became true" vs "already true".
@@ -85,6 +85,15 @@ export class AnalyticsService {
   }
 
   runBacktest(asset: string, tf: Timeframe, opts: BacktestOptions) {
+    // Meta Strategy Lab specs (meta:<slug>) have no candle-slice evaluate -
+    // MetaStrategyService.evaluate() always reads the market's LATEST window
+    // plus other plugins' live-cached state, so there is no honest way to
+    // replay history for one. Reject explicitly here rather than falling
+    // through to getStrategy() returning undefined and failing with a
+    // confusing "unknown strategy" error several calls deeper.
+    if (opts.strategy.startsWith('meta:')) {
+      throw new Error(`${opts.strategy} is a Meta-Strategy spec - these are live-only and can't be backtested (no candle-slice evaluate exists for them)`)
+    }
     // deep read: the backtest lab sees the full accumulated history (up to 2200 bars)
     // Task 59 (P1): closedOnly for the same live-parity reason as runStrategy.
     const candles = this.market.getCandlesDeep(asset, tf, 2200, true)

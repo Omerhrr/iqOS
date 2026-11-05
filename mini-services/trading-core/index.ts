@@ -2815,6 +2815,17 @@ const httpServer = createServer(async (req, res) => {
               params: [],
               defaults: {},
             })),
+            // Saved Meta-Strategy combos (meta:<slug>) - live-only (no
+            // candle-slice evaluate exists), so these always arm forced-
+            // unvalidated; surfaced here so a bot's strategy picker can list
+            // and select them, same as custom:* Lab specs above.
+            ...kernel.context().use<MetaStrategyService>('metaStrategy').list().map((s) => ({
+              id: s.id,
+              name: `${s.name} (Meta-Strategy, live-only)`,
+              description: `panel-combinator strategy - built from live panel reads, not candles; can't be backtested, so a bot using it always needs force:true to arm`,
+              params: [],
+              defaults: {},
+            })),
           ],
         })
 

@@ -169,6 +169,15 @@ export class OtcGuardService {
     const limit = Math.max(300, Math.min(2000, input.limit ?? 1000))
     const payout = input.payout ?? 0.85
 
+    // Meta Strategy Lab specs (meta:<slug>) are live-only - no candle-slice
+    // evaluate exists for them, so fastBacktest can't replay history on
+    // synthetic placebo series either. Reject explicitly (same reasoning as
+    // analytics.ts's runBacktest) instead of letting this fall through to an
+    // "unknown strategy" error from deep inside fastBacktest.
+    if (strategyKey.startsWith('meta:')) {
+      throw new Error(`${strategyKey} is a Meta-Strategy spec - these are live-only and can't be placebo-tested (no candle-slice evaluate exists for them); OTC defense gating doesn't apply to meta: bots the same way - they're never auto-armed without force:true anyway`)
+    }
+
     // Resolve custom:<id> lab strategies to their spec (same path the
     // autopilot and run_strategy use), so lab-learned strategies can be
     // placebo-tested exactly like builtins.

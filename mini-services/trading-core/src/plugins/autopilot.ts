@@ -13,6 +13,7 @@ import type { ExecutionService } from './execution'
 import { Store } from '../store'
 import { getStrategy, defaultParams } from '../strategies/builtin'
 import type { StrategyLabService } from './lab'
+import type { MetaStrategyService } from './metastrategy'
 import { classifyRegime } from '../analytics/regime'
 import { classifySession } from '../analytics/session'
 import { walkForward } from '../strategies/optimize'
@@ -297,6 +298,7 @@ export class AutopilotService {
   private runtime = new Map<string, RuntimeState>()
   private evaluating = new Set<string>() // asset|tf pairs currently being processed
   private lab: StrategyLabService | null = null
+  private meta: MetaStrategyService | null = null
   private revalidateTimer: ReturnType<typeof setInterval> | null = null
   // Global research-gate off-switch, user-requested. Persisted (survives
   // restarts) in the SAME sentinel-state JSON blob execution.ts's setRisk()
@@ -323,6 +325,22 @@ export class AutopilotService {
       this.lab = null
     }
     return this.lab
+  }
+
+  /** Lazy-resolve the Meta Strategy Lab (registered after the core plugins) -
+   * meta:<slug> strategy ids evaluate through it, live-only (see evaluate()'s
+   * own doc comment in metastrategy.ts: no candle-slice param exists, so a
+   * meta: bot can never go through evalWithEdge/resolveStrategyDef the way
+   * custom: and builtin strategies do - it's wired straight into the live
+   * tick dispatch below instead, bypassing analytics/lab entirely). */
+  private metaStrategyService(): MetaStrategyService | null {
+    if (this.meta) return this.meta
+    try {
+      this.meta = this.ctx.use<MetaStrategyService>('metaStrategy')
+    } catch {
+      this.meta = null
+    }
+    return this.meta
   }
 
   async start(ctx: KernelContext): Promise<void> {
@@ -427,6 +445,7 @@ export class AutopilotService {
     // live). custom:* sweeps go through the lab's own holdout gate instead.
     if (bot.universeSweep) {
       if (bot.strategyId.startsWith('custom:')) return this.labResearchGate(bot)
+      if (bot.strategyId.startsWith('meta:')) return this.metaResearchGate(bot)
       const v = this.store.latestRobustValidationAnyAsset(bot.tf, bot.strategyId)
       if (!v) {
         return `research-gate: universe sweep needs at least one ROBUST walk-forward of ${bot.strategyId} on any pair at ${bot.tf} - run /walkforward before arming`
@@ -437,6 +456,7 @@ export class AutopilotService {
       return null
     }
     if (bot.strategyId.startsWith('custom:')) return this.labResearchGate(bot)
+    if (bot.strategyId.startsWith('meta:')) return this.metaResearchGate(bot)
     // THE BUG this replaces: the gate below required a `/walkforward` verdict
     // for EVERY strategyId, but `/walkforward` resolves strategies through
     // getStrategy() (builtin.ts), which only knows the fixed built-in
@@ -493,6 +513,22 @@ export class AutopilotService {
     return null
   }
 
+  /** The meta:* equivalent of researchGate()/labResearchGate() above: a saved
+   * Meta Strategy Lab spec is architecturally LIVE-ONLY - MetaStrategyService
+   * .evaluate() has no candles/history parameter (it always reads the
+   * market's latest window plus other plugins' own live-cached state:
+   * NextCandleService, AccuteService, SmcScanService - none of which accept a
+   * historical slice), so there is no walk-forward verdict and no lab-style
+   * holdout stat that could ever exist for it. This gate therefore ALWAYS
+   * blocks - arming a meta: bot always requires force:true, same mechanism
+   * (forcedUnvalidated) as any other forced arm, never a new bypass path. */
+  private metaResearchGate(bot: BotConfig): string | null {
+    const meta = this.metaStrategyService()
+    if (!meta) return `research-gate: ${bot.strategyId} can't be checked - Meta Strategy Lab isn't loaded`
+    if (!meta.isValidStrategyId(bot.strategyId)) return `research-gate: ${bot.strategyId} not found in the Meta Strategy Lab library`
+    return `research-gate: ${bot.strategyId} is a Meta-Strategy spec - these only run live (no candle-slice evaluate exists, so no backtest/walk-forward is architecturally possible) - arm with force:true to accept it unvalidated`
+  }
+
   /** Sweep every ENABLED bot's watchlist for (asset, tf, strategyId) combos
    * whose latest validation is missing or older than REVALIDATE_AFTER_SEC,
    * and re-run walk-forward on up to REVALIDATE_MAX_PER_TICK of them per
@@ -503,7 +539,7 @@ export class AutopilotService {
     const now = Math.floor(Date.now() / 1000)
     const due = new Map<string, { asset: string; tf: Timeframe; strategyId: string; botIds: string[] }>()
     for (const { bot } of this.store.listBots()) {
-      if (!bot.enabled || bot.strategyId.startsWith('custom:')) continue
+      if (!bot.enabled || bot.strategyId.startsWith('custom:') || bot.strategyId.startsWith('meta:')) continue
       for (const asset of bot.watchlist) {
         const v = this.store.latestValidation(asset, bot.tf, bot.strategyId)
         if (v && now - v.ts < AutopilotService.REVALIDATE_AFTER_SEC) continue
@@ -914,13 +950,34 @@ export class AutopilotService {
     }
 
     // strategy evaluation (pure, on closed candles) - builtin strategies run
-    // through analytics, AI-learned specs (custom:*) through the lab
+    // through analytics, AI-learned specs (custom:*) through the lab, saved
+    // Meta-Strategy combos (meta:*) through the Meta Strategy Lab - live-only,
+    // no phase/ageBars (see metaStrategyService()'s doc comment above)
     const isCustom = bot.strategyId.startsWith('custom:')
+    const isMeta = bot.strategyId.startsWith('meta:')
     let evalOut: ReturnType<AnalyticsService['runStrategy']>
     if (isCustom) {
       const lab = this.labService()
       if (!lab) return this.reject(bot, 'strategy lab unavailable for custom strategy')
       evalOut = lab.runStrategy(asset, tf, bot.strategyId)
+    } else if (isMeta) {
+      const meta = this.metaStrategyService()
+      if (!meta) return this.reject(bot, 'meta strategy lab unavailable for meta strategy')
+      try {
+        const { result, price } = meta.evaluate(bot.strategyId, asset, tf)
+        evalOut = {
+          direction: result.direction,
+          score: result.score,
+          notes: result.notes,
+          asset,
+          tf,
+          strategy: bot.strategyId,
+          price,
+          barTs: Math.floor(Date.now() / 1000),
+        }
+      } catch (err) {
+        return this.reject(bot, `meta-strategy error: ${String(err instanceof Error ? err.message : err)}`)
+      }
     } else {
       const merged = { ...defaultParams(getStrategy(bot.strategyId)!), ...(bot.params ?? {}) }
       evalOut = this.analytics.runStrategy(asset, tf, bot.strategyId, merged)
@@ -1658,12 +1715,16 @@ export class AutopilotService {
     // AI-learned strategies from the Strategy Lab (custom:<slug>) are valid
     // when they exist in the lab library
     if (id.startsWith('custom:') && this.labService()?.isValidStrategyId(id)) return id
+    // Meta Strategy Lab specs (meta:<slug>) - saved Meta-Strategy combos,
+    // live-only (see metaStrategyService() above)
+    if (id.startsWith('meta:') && this.metaStrategyService()?.isValidStrategyId(id)) return id
     return DEFAULT_BOT.strategyId
   }
 
   private isValidStrategy(id: string): boolean {
     if (getStrategy(id)) return true
     if (id.startsWith('custom:')) return this.labService()?.isValidStrategyId(id) ?? false
+    if (id.startsWith('meta:')) return this.metaStrategyService()?.isValidStrategyId(id) ?? false
     return false
   }
 }
