@@ -25,6 +25,7 @@ import {
   prepareSignal,
   slugify,
   type Basis,
+  type CustomEval,
   type CustomSpec,
   type EvalCtx,
   type SignalDef,
@@ -33,6 +34,8 @@ import { detectPatterns } from '../analytics/patterns'
 import { analyze } from '../analytics/engine'
 import { classifyRegime, type Regime } from '../analytics/regime'
 import { evalWithEdge } from '../analytics/edge'
+import { parseStrategyScript, evaluateStrategyScript } from '../analytics/strategylang'
+import { makeSignalResolver } from '../strategies/signalscript'
 
 export interface LearnOptions {
   asset: string
@@ -780,7 +783,14 @@ export class StrategyLabService {
 
   save(input: { id?: string; name?: string; spec: unknown; asset?: string; tf?: string; stats?: unknown }): { ok: boolean; id: string; spec: CustomSpec } {
     const spec = normalizeSpec(input.spec, input.name ?? 'Learned Strategy')
-    if (!spec) throw new Error('invalid spec - no usable signals survived normalization')
+    if (!spec) throw new Error('invalid spec - no usable signals survived normalization (and no script)')
+    if (spec.script) {
+      // Reject a syntactically broken script up front, same as
+      // meta_strategy_save's own script validation - a save that "works"
+      // but can never actually evaluate is worse than one that's refused.
+      const parsed = parseStrategyScript(spec.script)
+      if (!parsed.ok) throw new Error(`script error: ${parsed.error}`)
+    }
     if (input.name) spec.name = String(input.name).slice(0, 60)
     // Defensive: `id` is the literal strategyId ("custom:<slug>") returned to
     // callers - it must carry the "custom:" prefix EXACTLY ONCE. A caller
@@ -869,8 +879,51 @@ export class StrategyLabService {
     // Edge wrapper (same as builtin runStrategy): learned specs stay pure
     // level reads; the transition vs the previous closed bar rides along so
     // bots/the auto-trader gate on fresh edges, not on stale ones.
-    const ev = evalWithEdge((cs) => evaluateCustom(spec, cs, asset, auxByStrategy), candles)
-    return { ...ev, asset, tf, strategy: id, price: candles[candles.length - 1].close, barTs: candles[candles.length - 1].time }
+    //
+    // "it should use the same language we created for meta strategy" per
+    // direct instruction - a script-built spec (spec.script set, see
+    // CustomSpec's own doc comment) is evaluated by Meta-Strategy Lab's
+    // OWN language (MSL) instead of the weighted-vote signals[] path,
+    // addressing AI Lab's signal vocabulary through signalscript.ts's
+    // resolver - same "script wins when present" convention
+    // MetaStrategySpec already established. Mining/backtesting never
+    // produce a script spec (see learn()/backtestSpec() - untouched by
+    // this), only a hand-written or hand-edited one trades this way.
+    const evaluate = spec.script
+      ? (() => {
+          const parsed = parseStrategyScript(spec.script as string)
+          if (!parsed.ok) throw new Error(`lab strategy ${id}: ${parsed.error}`)
+          return (cs: Candle[]) => {
+            const ctx2 = buildCtx(cs, asset, auxByStrategy)
+            const result = evaluateStrategyScript(parsed.ast, {}, makeSignalResolver(ctx2))
+            if (result.error) throw new Error(result.error)
+            return { direction: result.direction, score: result.direction === 'none' ? 0 : result.confidence, notes: result.trace.join('; ') || 'script' }
+          }
+        })()
+      : (cs: Candle[]) => evaluateCustom(spec, cs, asset, auxByStrategy)
+    const ev = evalWithEdge(evaluate, candles)
+    return { ...ev, active: [] as CustomEval['active'], asset, tf, strategy: id, price: candles[candles.length - 1].close, barTs: candles[candles.length - 1].time }
+  }
+
+  /** Dry-run a script against one asset/tf WITHOUT saving it - the AI Lab
+   * code editor's own "test" button, same role /meta_strategy_test_script
+   * plays for Meta-Strategy's editor. */
+  testScript(script: string, asset: string, tf: Timeframe) {
+    const parsed = parseStrategyScript(script)
+    if (!parsed.ok) return { ok: false as const, error: parsed.error }
+    const candles = this.market.getCandlesDeep(asset, tf, 1500, true)
+    if (candles.length < 25) return { ok: false as const, error: 'not enough candle history yet' }
+    let auxByStrategy: Record<string, { leaderCandles?: Candle[]; leaderCandles2?: Candle[] }> = {}
+    try {
+      const analytics = this.ctx.use<{ auxByStrategyMap: (asset: string, tf: Timeframe, limit: number, expectedLength: number) => Record<string, { leaderCandles?: Candle[]; leaderCandles2?: Candle[] }> }>('analytics')
+      auxByStrategy = analytics.auxByStrategyMap(asset, tf, 1500, candles.length)
+    } catch {
+      /* best-effort - a script that never references a 'builtin' lead-lag/
+       * triangulation member works fine without this */
+    }
+    const ctx = buildCtx(candles, asset, auxByStrategy)
+    const result = evaluateStrategyScript(parsed.ast, {}, makeSignalResolver(ctx))
+    return { ok: true as const, ...result, price: candles[candles.length - 1].close, ts: Date.now() }
   }
 }
 

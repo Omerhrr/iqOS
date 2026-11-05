@@ -3484,6 +3484,12 @@ export interface LabSpec {
   horizon: number
   /** candle basis the signals read: raw (default), Heiken-Ashi, or Kalman-smoothed */
   basis?: 'candles' | 'heikin' | 'kalman' | 'typical' | 'smoothed'
+  /** Meta-Strategy Lab's own script language (MSL), addressing this spec's
+   * signal vocabulary via strategies/signalscript.ts's resolver functions
+   * (candle/bar/ha/line/renko/pf/indicator/mtf/builtinSig/engine) instead
+   * of `signals`. Wins over signals[] when present - same convention
+   * MetaStrategySpec's own script field uses. */
+  script?: string
 }
 
 export interface LabSignalStat {

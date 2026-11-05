@@ -279,6 +279,20 @@ export interface CustomSpec {
    * damps single-bar noise spikes). Outcomes/settlement are ALWAYS measured
    * on real prices, whichever basis the signals themselves read. */
   basis?: Basis
+  /** "it should use the same language we created for meta strategy" per
+   * direct instruction - the Meta Strategy Lab's own script language
+   * (MSL, analytics/strategylang.ts), addressing this exact spec's signal
+   * vocabulary through strategies/signalscript.ts's resolver (candle/bar/
+   * ha/line/renko/pf/indicator/mtf/builtinSig/engine functions - one per
+   * SignalDef kind below) instead of the signals[] array. Same "script
+   * wins over the structured form when present" convention
+   * MetaStrategySpec already uses: when set, the live evaluator
+   * (StrategyLabService.runStrategy) runs this script instead of
+   * evaluateCustomAt()'s weighted vote, and `signals` may be empty.
+   * Mining/backtesting (learn()/backtestSpec()) still only ever PRODUCE a
+   * signals[]-based spec - this field is for a strategy you write or edit
+   * by hand, same as Meta-Strategy's own code editor. */
+  script?: string
 }
 
 export type Basis = 'candles' | 'heikin' | 'kalman' | 'typical' | 'smoothed'
@@ -1627,7 +1641,12 @@ export function normalizeSpec(raw: unknown, fallbackName = 'Learned Strategy'): 
     const norm = normalizeOneSignal(s, 0)
     if (norm) signals.push(norm)
   }
-  if (!signals.length) return null
+  // Script-built specs (see CustomSpec.script's own doc comment) carry
+  // their logic in the script text, not signals[] - same "script wins,
+  // conditions/signals may be empty" convention MetaStrategySpec uses, so
+  // this is the ONE case `signals.length === 0` is allowed through.
+  const script = typeof r.script === 'string' && r.script.trim() ? r.script : undefined
+  if (!signals.length && !script) return null
   return {
     name: String(r.name ?? fallbackName).slice(0, 60) || fallbackName,
     description: r.description ? String(r.description).slice(0, 400) : undefined,
@@ -1641,6 +1660,7 @@ export function normalizeSpec(raw: unknown, fallbackName = 'Learned Strategy'): 
     // from storage and re-normalized, quietly changing what every signal
     // actually reads without changing a single number in the spec itself.
     ...(r.basis === 'heikin' || r.basis === 'kalman' || r.basis === 'typical' || r.basis === 'smoothed' ? { basis: r.basis } : {}),
+    ...(script ? { script } : {}),
   }
 }
 

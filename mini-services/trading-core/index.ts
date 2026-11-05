@@ -4131,6 +4131,22 @@ const httpServer = createServer(async (req, res) => {
           : json(400, res)
       }
 
+      // POST /lab_test_script {script, asset, tf} - dry-run a Meta
+      // Strategy Lab script against one pair WITHOUT saving it, for AI
+      // Lab's own code editor "test" button - same role
+      // /meta_strategy_test_script plays for Meta-Strategy's editor.
+      if (path === '/lab_test_script') {
+        try {
+          const lab = kernel.context().use<StrategyLabService>('lab')
+          const tfv = tfStrict(String(body.tf ?? ''))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(String(body.tf ?? '')) })
+          const labAsset = String(body.asset ?? market.activeAsset)
+          return json(200, lab.testScript(String(body.script ?? ''), labAsset, tfv))
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
       if (path === '/lab_save') {
         try {
           const lab = kernel.context().use<StrategyLabService>('lab')

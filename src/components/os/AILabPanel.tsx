@@ -23,6 +23,35 @@ const BASIS_OPTIONS: { value: Basis; label: string }[] = [
   { value: 'smoothed', label: 'sma-smoothed (3-bar)' },
 ]
 
+// Meta-Strategy Lab's own language (MSL), addressing AI Lab's signal
+// vocabulary via strategies/signalscript.ts's resolver - same language,
+// same call-when/put-when/confidence= grammar, just a different set of
+// functions than Meta-Strategy's own panel-read sources.
+const SIGNAL_SCRIPT_PLACEHOLDER = `# AI Lab script - same language Meta-Strategy's code editor uses, this
+# vocabulary resolves to AI Lab's own signal families instead of panel
+# reads. Every function's args end with an optional confidence (0-100,
+# default 65) and reports 'none' when the signal didn't fire this bar.
+#   candle(name, dir, conf?, series?)             - candlestick pattern
+#   bar('wide-bull'|'wide-bear', dir, conf?, atrK?) - wide-body bar
+#   ha(variant, dir, conf?, len?)                  - Heikin Ashi pattern
+#   line(variant, dir, conf?, lookback?)           - breakout/HH-HL/LH-LL
+#   renko(variant, dir, conf?, len?)               - brick flip/streak
+#   pf(variant, dir, conf?, reversalBoxes?)        - P&F breakout
+#   mtf(5|15, dir, conf?)                          - MTF EMA alignment
+#   indicator(ind, op, threshold, dir, conf?, threshold2?) - e.g. rsi/bbpos/...
+#   indicatorType(ind, type, op, threshold, dir, conf?)    - the 8 generic families
+#   indicatorPeriod(ind, period, op, threshold, dir, conf?)
+#   builtinSig(id, dir, conf?)                     - a builtin.ts strategy as a signal
+#   engine(engineId, dir, conf?)                   - a chart-engine committee vote
+# Fields: .dir (call/put/none), .conf (0-100), .active, .call, .put
+
+let bullEngulf = candle('Bullish Engulfing', call, 70)
+let rsiLow = indicator('rsi', '<', 30, call, 60)
+call when bullEngulf.active or rsiLow.active
+put when candle('Bearish Engulfing', put, 70).active
+confidence = avg(bullEngulf.conf, rsiLow.conf)
+`
+
 // Same searchable-combobox pattern as Backtest Lab's StrategyPicker -
 // a plain <select> with 60+ pairs in it meant scrolling through an
 // alphabetical wall to find one; this filters as you type instead.
@@ -960,45 +989,94 @@ export default function AILabPanel({ assets, strategies, onError, refreshBots }:
   // "the strategy lab should not be read only... let it be fully
   // functional" per direct instruction - a CustomSpec is already just
   // data (signals[]/minScore/minVotes/horizon/basis), so "view as code,
-  // edit, and save" is a JSON textarea wired straight to the EXISTING
-  // /lab_save endpoint (same one "learn this pair" already saves
-  // through) - no new backend surface needed, just no longer read-only.
+  // edit, and save" is wired straight to the EXISTING /lab_save endpoint
+  // (same one "learn this pair" already saves through) - no new backend
+  // surface needed for the JSON path, just no longer read-only.
+  //
+  // "it should use the same language we created for meta strategy" per
+  // direct instruction - added a SECOND edit mode: Meta-Strategy Lab's
+  // own script language (MSL, analytics/strategylang.ts), addressing AI
+  // Lab's signal vocabulary via strategies/signalscript.ts's resolver
+  // (candle/bar/ha/line/renko/pf/indicator/mtf/builtinSig/engine
+  // functions). A script-built spec has signals:[] and a `script` string
+  // instead - same "script wins when present" convention Meta-Strategy's
+  // own dropdown-vs-code toggle established. Mining/backtesting/re-learn
+  // still only ever work on the signals[] form; a script spec trades live
+  // and can be tested, same scope Meta-Strategy's code editor has.
   const [editingLabId, setEditingLabId] = useState<string | null>(null)
+  const [editMode, setEditMode] = useState<'json' | 'script'>('json')
   const [editingLabText, setEditingLabText] = useState('')
+  const [editingScriptText, setEditingScriptText] = useState('')
   const [savingLabEdit, setSavingLabEdit] = useState(false)
   const [labEditError, setLabEditError] = useState<string | null>(null)
+  const [scriptTestResult, setScriptTestResult] = useState<{ ok: boolean; direction?: string; confidence?: number; trace?: string[]; price?: number; error?: string } | null>(null)
+  const [scriptTestBusy, setScriptTestBusy] = useState(false)
 
   const startEditLab = (r: LabStrategyRow) => {
     setExpandedLabId(r.id)
     setEditingLabId(r.id)
     setEditingLabText(JSON.stringify(r.spec, null, 2))
+    setEditingScriptText(r.spec.script ?? SIGNAL_SCRIPT_PLACEHOLDER)
+    setEditMode(r.spec.script ? 'script' : 'json')
+    setScriptTestResult(null)
     setLabEditError(null)
   }
 
   const cancelEditLab = () => {
     setEditingLabId(null)
     setLabEditError(null)
+    setScriptTestResult(null)
+  }
+
+  const testEditScript = async (r: LabStrategyRow) => {
+    setScriptTestBusy(true)
+    setScriptTestResult(null)
+    try {
+      const res = await osPost<{ ok: boolean; direction?: string; confidence?: number; trace?: string[]; price?: number; error?: string }>('/lab_test_script', {
+        script: editingScriptText,
+        asset: r.asset,
+        tf: r.tf,
+      })
+      setScriptTestResult(res)
+    } catch (e) {
+      setScriptTestResult({ ok: false, error: (e as Error).message })
+    } finally {
+      setScriptTestBusy(false)
+    }
   }
 
   const saveEditLab = async (r: LabStrategyRow) => {
-    let parsed: unknown
-    try {
-      parsed = JSON.parse(editingLabText)
-    } catch (e) {
-      setLabEditError(`invalid JSON: ${(e as Error).message}`)
-      return
+    let specPayload: unknown
+    if (editMode === 'script') {
+      if (!editingScriptText.trim()) {
+        setLabEditError('write a script first')
+        return
+      }
+      // Keep the row's own name/minScore/minVotes/horizon/basis - the
+      // script replaces signals[] as the actual logic, those fields just
+      // ride along (minScore/minVotes are ignored once a script is
+      // present, same as Meta-Strategy's conditions[] once it has a
+      // script - normalizeSpec still wants them for schema validity).
+      specPayload = { ...r.spec, signals: [], script: editingScriptText }
+    } else {
+      try {
+        specPayload = JSON.parse(editingLabText)
+      } catch (e) {
+        setLabEditError(`invalid JSON: ${(e as Error).message}`)
+        return
+      }
     }
     setSavingLabEdit(true)
     setLabEditError(null)
     try {
       // /lab_save runs the spec through the SAME normalizeSpec() validation
-      // the learner itself uses (invalid signals/thresholds are rejected
-      // with a real error, not silently accepted) - keep this row's own
-      // id/asset/tf so the edit replaces it in place rather than forking a
-      // new entry.
+      // the learner itself uses (invalid signals/thresholds, or a broken
+      // script, are rejected with a real error, not silently accepted) -
+      // keep this row's own id/asset/tf so the edit replaces it in place
+      // rather than forking a new entry.
       const res = await osPost<{ ok: boolean; id: string; error?: string }>('/lab_save', {
         id: r.id,
-        spec: parsed,
+        spec: specPayload,
         asset: r.asset,
         tf: r.tf,
         stats: r.stats,
@@ -1839,6 +1917,11 @@ export default function AILabPanel({ assets, strategies, onError, refreshBots }:
                       {r.spec.name}
                     </button>
                     <span className="rounded border border-cyan-500/40 bg-cyan-500/10 px-1 py-0.5 font-mono text-[8px] uppercase text-cyan-300">lab</span>
+                    {r.spec.script && (
+                      <span className="rounded border border-violet-500/40 bg-violet-500/10 px-1 py-0.5 font-mono text-[8px] uppercase text-violet-300" title="script-built - trades the Meta-Strategy language, not the signals[] weighted vote">
+                        script
+                      </span>
+                    )}
                     {r.stats?.decayed && (
                       <span className="rounded border border-rose-500/40 bg-rose-500/10 px-1 py-0.5 font-mono text-[8px] uppercase text-rose-300" title="the auto re-learn sweep found this spec no longer clears its own filters / can't beat breakeven on fresh data - any bot trading it was auto-disarmed">
                         decayed
@@ -1912,13 +1995,74 @@ export default function AILabPanel({ assets, strategies, onError, refreshBots }:
               )}
               {editingLabId === r.id && (
                 <div className="border-t border-[#141d2e] px-2.5 py-2">
-                  <textarea
-                    value={editingLabText}
-                    onChange={(e) => setEditingLabText(e.target.value)}
-                    rows={16}
-                    spellCheck={false}
-                    className="w-full resize-y rounded border border-[#1c2739] bg-[#070c15] p-2 font-mono text-[10px] leading-relaxed text-[#dbe4f0] outline-none focus:border-amber-500/40"
-                  />
+                  <div className="mb-1.5 flex items-center gap-px rounded border border-[#1c2739] p-0.5" style={{ width: 'fit-content' }}>
+                    {(['json', 'script'] as const).map((m) => (
+                      <button
+                        key={m}
+                        type="button"
+                        onClick={() => setEditMode(m)}
+                        className={`rounded px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider transition-colors ${
+                          editMode === m ? 'bg-violet-500/20 text-violet-300' : 'text-[#4b5a72] hover:text-[#aab6cc]'
+                        }`}
+                        title={m === 'json' ? 'edit the raw signals[] spec' : "edit as Meta-Strategy Lab's own script language (strategylang.ts) - same language, AI Lab's own signal vocabulary"}
+                      >
+                        {m === 'json' ? 'json' : 'script (MSL)'}
+                      </button>
+                    ))}
+                  </div>
+                  {editMode === 'json' ? (
+                    <textarea
+                      value={editingLabText}
+                      onChange={(e) => setEditingLabText(e.target.value)}
+                      rows={16}
+                      spellCheck={false}
+                      className="w-full resize-y rounded border border-[#1c2739] bg-[#070c15] p-2 font-mono text-[10px] leading-relaxed text-[#dbe4f0] outline-none focus:border-amber-500/40"
+                    />
+                  ) : (
+                    <>
+                      <textarea
+                        value={editingScriptText}
+                        onChange={(e) => setEditingScriptText(e.target.value)}
+                        rows={18}
+                        spellCheck={false}
+                        className="w-full resize-y rounded border border-[#1c2739] bg-[#070c15] p-2 font-mono text-[10px] leading-relaxed text-[#dbe4f0] outline-none focus:border-violet-500/40"
+                      />
+                      <div className="mt-1.5">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={scriptTestBusy}
+                          className="h-6 border-violet-500/40 bg-violet-500/10 px-2 text-[9px] font-bold uppercase text-violet-300 hover:bg-violet-500/20 disabled:opacity-50"
+                          onClick={() => void testEditScript(r)}
+                        >
+                          {scriptTestBusy ? 'testing...' : `test on ${r.asset}`}
+                        </Button>
+                      </div>
+                      {scriptTestResult && (
+                        <div className="mt-1.5 rounded border border-[#1c2739] bg-[#070c15] p-1.5">
+                          {scriptTestResult.ok ? (
+                            <>
+                              <span className={`font-mono text-[10px] font-bold uppercase ${scriptTestResult.direction === 'call' ? 'text-emerald-300' : scriptTestResult.direction === 'put' ? 'text-rose-300' : 'text-[#4b5a72]'}`}>
+                                {scriptTestResult.direction === 'none' ? 'no fire' : `${scriptTestResult.direction} signal`}
+                              </span>
+                              {scriptTestResult.direction !== 'none' && (
+                                <span className="ml-1.5 font-mono text-[9px] text-[#7c8aa5]">conf {scriptTestResult.confidence}%</span>
+                              )}
+                              <div className="mt-0.5 space-y-0.5">
+                                {(scriptTestResult.trace ?? []).map((line, i) => (
+                                  <p key={i} className="font-mono text-[8.5px] text-[#7c8aa5]">
+                                    {line}
+                                  </p>
+                                ))}
+                              </div>
+                            </>
+                          ) : (
+                            <p className="font-mono text-[9px] text-rose-300">{scriptTestResult.error}</p>
+                          )}
+                        </div>
+                      )}
+                    </>
+                  )}
                   {labEditError && <p className="mt-1 font-mono text-[9px] text-rose-300">{labEditError}</p>}
                   <div className="mt-1.5 flex items-center gap-1.5">
                     <Button
@@ -1932,7 +2076,11 @@ export default function AILabPanel({ assets, strategies, onError, refreshBots }:
                     <Button variant="outline" size="sm" className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5]" onClick={cancelEditLab}>
                       cancel
                     </Button>
-                    <span className="font-mono text-[8.5px] text-[#4b5a72]">saves straight back to this spec (id {r.id}) - validated the same way the learner validates a fresh spec</span>
+                    <span className="font-mono text-[8.5px] text-[#4b5a72]">
+                      {editMode === 'script'
+                        ? 'script-built - trades live/testable; mining and backtest still work on signals[] only'
+                        : `saves straight back to this spec (id ${r.id}) - validated the same way the learner validates a fresh spec`}
+                    </span>
                   </div>
                 </div>
               )}

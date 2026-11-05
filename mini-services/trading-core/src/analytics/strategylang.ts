@@ -55,12 +55,44 @@
 // is reachable from a script the same way, so a new chart type only ever
 // needs a new `reads` key here, never a language change.
 
-export type MslValue = number | boolean | string
-
 export interface MslSourceRead {
   direction: 'call' | 'put' | 'none'
   confidence: number // 0..100
 }
+
+/** A source read, tagged so it's distinguishable from a plain string at
+ * runtime (MslValue has no other object variant). Both the caller's static
+ * `reads` map AND a signal-function call (see MslSignalResolver below) now
+ * produce this SAME shape, so `.dir`/`.conf`/etc. work identically either
+ * way - "oracle.dir" and "candle('Bullish Engulfing', call).dir" are the
+ * same kind of thing to the evaluator. */
+export interface MslReadValue extends MslSourceRead {
+  readonly __mslRead: true
+}
+
+function readValue(r: MslSourceRead): MslReadValue {
+  return { __mslRead: true, direction: r.direction, confidence: r.confidence }
+}
+
+function isReadValue(v: unknown): v is MslReadValue {
+  return typeof v === 'object' && v !== null && (v as MslReadValue).__mslRead === true
+}
+
+export type MslValue = number | boolean | string | MslReadValue
+
+/** Resolves a function call the core language doesn't itself know (i.e.
+ * not one of avg/sum/min/max/count/abs) into a source read - this is how
+ * AI Lab's signal vocabulary (candle/bar/ha/line/renko/pf/indicator/...,
+ * see strategies/signalscript.ts) plugs into the SAME language Meta-
+ * Strategy already uses, without this module needing to know anything
+ * about candles, indicators, or any other domain - it just asks the
+ * caller "what does this call resolve to right now" and gets back a
+ * direction+confidence, exactly like a named `reads` entry. Args are
+ * already-evaluated plain values (never another read - see the guard in
+ * evalExpr's 'call' case); the resolver throws to fail the whole script
+ * evaluation (caught the same way any other runtime error is), or returns
+ * a read normally. */
+export type MslSignalResolver = (fn: string, args: (number | boolean | string)[]) => MslSourceRead
 
 export interface MslEvalResult {
   direction: 'call' | 'put' | 'none'
@@ -225,7 +257,7 @@ type Expr =
   | { t: 'bool'; v: boolean }
   | { t: 'dir'; v: 'call' | 'put' | 'none' }
   | { t: 'ident'; name: string }
-  | { t: 'field'; obj: string; field: string }
+  | { t: 'field'; obj: Expr; field: string }
   | { t: 'unary'; op: 'not' | 'neg'; e: Expr }
   | { t: 'bin'; op: 'and' | 'or' | '==' | '!=' | '>=' | '<=' | '>' | '<' | '+' | '-' | '*' | '/'; l: Expr; r: Expr }
   | { t: 'call'; fn: string; args: Expr[] }
@@ -237,7 +269,11 @@ export interface MslAst {
 }
 
 const FIELDS = new Set(['dir', 'direction', 'conf', 'confidence', 'active', 'call', 'put'])
-const FUNCS = new Set(['avg', 'sum', 'min', 'max', 'count', 'abs'])
+// Core arithmetic funcs (avg/sum/min/max/count/abs) are no longer special-
+// cased at PARSE time - any identifier followed by "(" parses as a call
+// (see parsePrimary's doc comment). evalExpr's 'call' case still handles
+// those six itself; every other name falls through to a caller-supplied
+// resolver (signal functions, etc - see MslSignalResolver above).
 
 // ---------- parser (recursive descent, one statement per source line) ----------
 
@@ -369,7 +405,22 @@ class Parser {
     }
     return this.parseAtom()
   }
+  // Postfix ".field" is now generic: it applies to ANY primary expression
+  // (a bare source identifier, same as always, OR a function call like
+  // `candle('Bullish Engulfing', call).dir` - see MslSignalResolver's doc
+  // comment above for why calls can now produce field-able values too).
   private parseAtom(): Expr {
+    let e = this.parsePrimary()
+    while (this.peek().kind === 'dot') {
+      this.next()
+      const field = this.expect('ident')
+      if (!FIELDS.has(field.value)) throw new MslSyntaxError(`line ${field.line}: unknown field ".${field.value}" - use dir/direction/conf/confidence/active/call/put`)
+      e = { t: 'field', obj: e, field: field.value }
+    }
+    return e
+  }
+
+  private parsePrimary(): Expr {
     const t = this.next()
     if (t.kind === 'num') return { t: 'num', v: Number(t.value) }
     if (t.kind === 'str') return { t: 'str', v: t.value }
@@ -382,7 +433,14 @@ class Parser {
       if (t.value === 'true') return { t: 'bool', v: true }
       if (t.value === 'false') return { t: 'bool', v: false }
       if (t.value === 'none') return { t: 'dir', v: 'none' }
-      if (FUNCS.has(t.value) && this.peek().kind === 'lparen') {
+      // Any identifier immediately followed by "(" is a function call -
+      // the core arithmetic funcs (avg/sum/min/max/count/abs) and any
+      // signal function a caller's resolver understands (candle/bar/ha/
+      // renko/pf/indicator/...) are syntactically identical; which bucket
+      // a name falls into is decided at EVAL time (evalExpr's 'call'
+      // case), not at parse time - a new signal vocabulary never needs a
+      // parser/grammar change, only a new resolver entry.
+      if (this.peek().kind === 'lparen') {
         this.next()
         const args: Expr[] = []
         if (this.peek().kind !== 'rparen') {
@@ -394,12 +452,6 @@ class Parser {
         }
         this.expect('rparen')
         return { t: 'call', fn: t.value, args }
-      }
-      if (this.peek().kind === 'dot') {
-        this.next()
-        const field = this.expect('ident')
-        if (!FIELDS.has(field.value)) throw new MslSyntaxError(`line ${field.line}: unknown field ".${field.value}" - use dir/direction/conf/confidence/active/call/put`)
-        return { t: 'field', obj: t.value, field: field.value }
       }
       return { t: 'ident', name: t.value }
     }
@@ -427,18 +479,39 @@ export function parseStrategyScript(src: string): { ok: true; ast: MslAst } | { 
 class MslRuntimeError extends Error {}
 
 function truthy(v: MslValue): boolean {
+  if (isReadValue(v)) throw new MslRuntimeError('a source/signal value can\'t be used directly - access .dir/.conf/.active/.call/.put instead')
   if (typeof v === 'boolean') return v
   if (typeof v === 'number') return v !== 0
   return v !== 'none' && v !== ''
 }
 
 function asNum(v: MslValue): number {
+  if (isReadValue(v)) throw new MslRuntimeError('a source/signal value can\'t be used directly - access .conf (or .dir/.active/.call/.put) instead')
   if (typeof v === 'number') return v
   if (typeof v === 'boolean') return v ? 1 : 0
   throw new MslRuntimeError(`expected a number, got "${v}"`)
 }
 
-function evalExpr(e: Expr, env: Record<string, MslValue>, reads: Record<string, MslSourceRead>): MslValue {
+function fieldOf(read: MslSourceRead, field: string): MslValue {
+  switch (field) {
+    case 'dir':
+    case 'direction':
+      return read.direction
+    case 'conf':
+    case 'confidence':
+      return read.confidence
+    case 'active':
+      return read.direction !== 'none'
+    case 'call':
+      return read.direction === 'call'
+    case 'put':
+      return read.direction === 'put'
+    default:
+      throw new MslRuntimeError(`unknown field ".${field}"`)
+  }
+}
+
+function evalExpr(e: Expr, env: Record<string, MslValue>, reads: Record<string, MslSourceRead>, resolve?: MslSignalResolver): MslValue {
   switch (e.t) {
     case 'num':
       return e.v
@@ -449,39 +522,33 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, reads: Record<string, 
     case 'dir':
       return e.v
     case 'ident': {
+      // let-bindings take priority (a script can shadow a source name with
+      // its own intermediate value); a name that isn't bound falls back to
+      // the static `reads` map the caller supplied, wrapped into the SAME
+      // read shape a signal-function call produces, so e.g. `oracle.dir`
+      // and `let o = oracle; o.dir` behave identically.
       if (e.name in env) return env[e.name]
+      if (e.name in reads) return readValue(reads[e.name])
       throw new MslRuntimeError(`unknown identifier "${e.name}" - not a let-binding, and not a known source (did you mean to add ".dir" or ".conf"?)`)
     }
     case 'field': {
-      const read = reads[e.obj]
-      if (!read) throw new MslRuntimeError(`unknown source "${e.obj}" - available sources are set by the Meta Strategy Lab (oracle, hmaRocBullBear, momentumScore, accute, renko, pointFigure, rangeBars, candle, bar, heikinAshi, line, area, baseline, volumeBars, tick, footprint, tpo, ivHv, smc, smcNow, renkoSmc, renkoSmcMajority, smc:<KIND>)`)
-      switch (e.field) {
-        case 'dir':
-        case 'direction':
-          return read.direction
-        case 'conf':
-        case 'confidence':
-          return read.confidence
-        case 'active':
-          return read.direction !== 'none'
-        case 'call':
-          return read.direction === 'call'
-        case 'put':
-          return read.direction === 'put'
-        default:
-          throw new MslRuntimeError(`unknown field ".${e.field}"`)
-      }
+      const val = evalExpr(e.obj, env, reads, resolve)
+      if (!isReadValue(val)) throw new MslRuntimeError(`".${e.field}" needs a source or signal value, not "${val}"`)
+      return fieldOf(val, e.field)
     }
     case 'unary': {
-      const v = evalExpr(e.e, env, reads)
+      const v = evalExpr(e.e, env, reads, resolve)
       if (e.op === 'not') return !truthy(v)
       return -asNum(v)
     }
     case 'bin': {
-      if (e.op === 'and') return truthy(evalExpr(e.l, env, reads)) && truthy(evalExpr(e.r, env, reads))
-      if (e.op === 'or') return truthy(evalExpr(e.l, env, reads)) || truthy(evalExpr(e.r, env, reads))
-      const l = evalExpr(e.l, env, reads)
-      const r = evalExpr(e.r, env, reads)
+      if (e.op === 'and') return truthy(evalExpr(e.l, env, reads, resolve)) && truthy(evalExpr(e.r, env, reads, resolve))
+      if (e.op === 'or') return truthy(evalExpr(e.l, env, reads, resolve)) || truthy(evalExpr(e.r, env, reads, resolve))
+      const l = evalExpr(e.l, env, reads, resolve)
+      const r = evalExpr(e.r, env, reads, resolve)
+      if ((e.op === '==' || e.op === '!=') && (isReadValue(l) || isReadValue(r))) {
+        throw new MslRuntimeError('a source/signal value can\'t be compared directly - access .dir/.conf/.active/.call/.put instead')
+      }
       switch (e.op) {
         case '==':
           return l === r
@@ -507,7 +574,7 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, reads: Record<string, 
       break
     }
     case 'call': {
-      const args = e.args.map((a) => evalExpr(a, env, reads))
+      const args = e.args.map((a) => evalExpr(a, env, reads, resolve))
       switch (e.fn) {
         case 'avg':
           return args.length ? args.reduce((s: number, a) => s + asNum(a), 0) / args.length : 0
@@ -521,8 +588,20 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, reads: Record<string, 
           return args.filter(truthy).length
         case 'abs':
           return Math.abs(asNum(args[0] ?? 0))
-        default:
-          throw new MslRuntimeError(`unknown function "${e.fn}"`)
+        default: {
+          // Not a core arithmetic func - ask the caller's resolver (AI
+          // Lab's signal vocabulary plugs in exactly here, see
+          // strategies/signalscript.ts). Args to a signal function are
+          // always plain config values (names/numbers/flags), never
+          // another source/signal - asPlainArg enforces that so a
+          // resolver never has to guard against receiving a read object.
+          if (!resolve) throw new MslRuntimeError(`unknown function "${e.fn}"`)
+          const plainArgs = args.map((a) => {
+            if (isReadValue(a)) throw new MslRuntimeError(`"${e.fn}(...)" got a source/signal value as an argument - pass plain values (numbers, 'call'/'put', strings) instead`)
+            return a
+          })
+          return readValue(resolve(e.fn, plainArgs))
+        }
       }
     }
   }
@@ -534,7 +613,7 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, reads: Record<string, 
  * codebase uses: a runtime error (unknown source, a thin-history source
  * that never got a slot in `reads`) resolves to 'none' with the error
  * message attached, never a thrown exception into the trading loop. */
-export function evaluateStrategyScript(ast: MslAst, reads: Record<string, MslSourceRead>): MslEvalResult {
+export function evaluateStrategyScript(ast: MslAst, reads: Record<string, MslSourceRead>, resolve?: MslSignalResolver): MslEvalResult {
   const env: Record<string, MslValue> = {}
   const trace: string[] = []
   let callFired = false
@@ -543,17 +622,17 @@ export function evaluateStrategyScript(ast: MslAst, reads: Record<string, MslSou
   try {
     for (const stmt of ast.stmts) {
       if (stmt.kind === 'let') {
-        env[stmt.name] = evalExpr(stmt.expr, env, reads)
+        env[stmt.name] = evalExpr(stmt.expr, env, reads, resolve)
         continue
       }
       if (stmt.kind === 'call') {
-        const v = truthy(evalExpr(stmt.expr, env, reads))
+        const v = truthy(evalExpr(stmt.expr, env, reads, resolve))
         if (v) callFired = true
         trace.push(`call when ... -> ${v}`)
         continue
       }
       if (stmt.kind === 'put') {
-        const v = truthy(evalExpr(stmt.expr, env, reads))
+        const v = truthy(evalExpr(stmt.expr, env, reads, resolve))
         if (v) putFired = true
         trace.push(`put when ... -> ${v}`)
         continue
@@ -577,7 +656,7 @@ export function evaluateStrategyScript(ast: MslAst, reads: Record<string, MslSou
   let confidence = 65 // same "lone signal, no honesty-loop number to lean on" flat default smcNowRead() uses
   if (confidenceExpr) {
     try {
-      confidence = Math.max(0, Math.min(100, Math.round(asNum(evalExpr(confidenceExpr, env, reads)))))
+      confidence = Math.max(0, Math.min(100, Math.round(asNum(evalExpr(confidenceExpr, env, reads, resolve)))))
     } catch (err) {
       return { direction: 'none', confidence: 0, trace, error: `confidence expression failed: ${err instanceof Error ? err.message : String(err)}` }
     }
