@@ -4259,6 +4259,10 @@ export interface AiTraderStatus {
   lastRunTs: number
   nextRunTs: number | null
   lastError: string | null
+  llm: {
+    order: string[]
+    providers: { id: string; enabled: boolean; ready: boolean; model: string }[]
+  }
 }
 
 export interface AiTraderDecision {

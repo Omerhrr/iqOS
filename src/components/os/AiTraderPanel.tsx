@@ -195,6 +195,24 @@ export default function AiTraderPanel({ assets, onError }: Props) {
         {status.lastError && <span className="text-rose-300">last error: {status.lastError}</span>}
       </div>
 
+      <div className="flex flex-wrap items-center gap-2 rounded border border-[#1c2739] bg-[#0b0f17] p-2">
+        <span className="text-[#7c8aa5]">LLM providers seen by trading-core:</span>
+        {status.llm.providers.map((p) => (
+          <span
+            key={p.id}
+            className={`rounded px-1.5 py-0.5 ${
+              p.ready ? 'bg-emerald-500/15 text-emerald-300' : p.enabled ? 'bg-amber-500/15 text-amber-300' : 'bg-[#101828] text-[#4b5a72]'
+            }`}
+            title={p.enabled ? (p.ready ? `ready - ${p.model}` : 'enabled but missing its API key/config') : 'not enabled (USE_* flag unset or false)'}
+          >
+            {p.id}
+          </span>
+        ))}
+        {!status.llm.providers.some((p) => p.ready) && (
+          <span className="text-rose-300">none ready - if Copilot works, trading-core probably hasn&apos;t been restarted since the shared-.env fix, or your .env lives somewhere other than the repo root</span>
+        )}
+      </div>
+
       <div className="flex-1 overflow-y-auto rounded border border-[#1c2739]">
         <table className="w-full border-collapse text-left">
           <thead className="sticky top-0 bg-[#0b0f17] text-[#7c8aa5]">

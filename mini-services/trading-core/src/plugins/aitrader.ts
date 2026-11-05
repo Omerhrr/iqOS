@@ -43,7 +43,7 @@ import { Store } from '../store'
 import type { MarketDataService } from './market-data'
 import type { ExecutionService } from './execution'
 import type { MetaStrategyService } from './metastrategy'
-import { chatComplete, type ChatMessage } from '../lib/llm'
+import { chatComplete, providerStatus, type ChatMessage } from '../lib/llm'
 
 export interface AiTraderConfig {
   enabled: boolean
@@ -202,6 +202,10 @@ export class AiTraderService {
       lastRunTs: this.lastRunTs,
       nextRunTs: this.config.enabled && this.lastRunTs ? this.lastRunTs + this.config.intervalMin * 60 : null,
       lastError: this.lastError,
+      // which providers THIS process currently sees as enabled/ready - the
+      // direct way to check "did it actually pick up the shared .env"
+      // instead of guessing from the cycle error message alone.
+      llm: providerStatus(),
     }
   }
 

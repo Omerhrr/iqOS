@@ -21,7 +21,11 @@ import { join } from 'node:path'
  * worth a dependency for. */
 function parseEnvFile(text: string): Record<string, string> {
   const out: Record<string, string> = {}
-  for (const rawLine of text.split(/\r?\n/)) {
+  // strip a UTF-8 BOM - Windows editors (Notepad included) commonly save
+  // .env files with one, which would otherwise corrupt the very first key
+  // on the first line (it'd read as "﻿USE_ZAI" and never match).
+  const clean = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text
+  for (const rawLine of clean.split(/\r?\n/)) {
     const line = rawLine.trim()
     if (!line || line.startsWith('#')) continue
     const eq = line.indexOf('=')
@@ -41,20 +45,24 @@ function parseEnvFile(text: string): Record<string, string> {
  * that aren't already set. Missing file is silently fine - trading-core ran
  * without a root .env before this existed, and should keep working the same
  * way if the repo layout ever changes. */
-function loadInto(path: string): number {
-  let applied = 0
+function loadInto(path: string): { found: boolean; parsed: number; applied: number; keys: string[] } {
   try {
-    const parsed = parseEnvFile(readFileSync(path, 'utf8'))
+    const raw = readFileSync(path, 'utf8')
+    const parsed = parseEnvFile(raw)
+    const keys: string[] = []
+    let applied = 0
     for (const [k, v] of Object.entries(parsed)) {
       if (process.env[k] === undefined) {
         process.env[k] = v
         applied += 1
+        keys.push(k)
       }
     }
+    return { found: true, parsed: Object.keys(parsed).length, applied, keys }
   } catch {
     // file doesn't exist (or isn't readable) - nothing to load
+    return { found: false, parsed: 0, applied: 0, keys: [] }
   }
-  return applied
 }
 
 /** Call once, as early as possible in index.ts - before any module-scope
@@ -70,8 +78,16 @@ export function loadSharedEnv(): void {
   // mini-services/trading-core/src/lib - four levels up is the repo root.
   const repoRoot = join(import.meta.dir, '..', '..', '..', '..')
   const rootEnvPath = join(repoRoot, '.env')
-  const applied = loadInto(rootEnvPath)
-  if (applied > 0) {
-    console.log(`[trading-core] loaded ${applied} env var(s) from the repo root .env (shared with the Next.js app / Copilot)`)
+  const result = loadInto(rootEnvPath)
+  // ALWAYS log the outcome (not just "> 0 applied") - a silent no-op here is
+  // exactly the kind of thing that leaves an operator staring at "no LLM
+  // provider available" with no way to tell whether the file was even found,
+  // found-but-empty, or found-but-every-key-already-set.
+  if (!result.found) {
+    console.log(`[trading-core] no repo-root .env found at ${rootEnvPath} - AI Trader will rely on trading-core's own .env / real OS env vars only`)
+  } else if (result.applied === 0) {
+    console.log(`[trading-core] repo-root .env found at ${rootEnvPath} (${result.parsed} key(s) parsed) but none applied - every key it defines was already set in this process' own env`)
+  } else {
+    console.log(`[trading-core] loaded ${result.applied}/${result.parsed} env var(s) from the repo root .env (shared with the Next.js app / Copilot): ${result.keys.join(', ')}`)
   }
 }
