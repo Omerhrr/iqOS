@@ -4248,6 +4248,12 @@ export interface AiTraderConfig {
   minConfidence: number
   expiryChoices: number[]
   provider?: string
+  /** Base URL of THIS Next.js app, as trading-core (a separate process)
+   * reaches it - the AI Trader's decision calls go through this app's
+   * /api/ai_trader_decide first (same chatComplete the Copilot already
+   * uses, same keys, nothing extra to configure), falling back to trading-
+   * core's own .env only if this app is unreachable. Default localhost:3000. */
+  appUrl?: string
 }
 
 export interface AiTraderStatus {

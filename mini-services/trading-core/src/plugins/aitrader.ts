@@ -65,10 +65,19 @@ export interface AiTraderConfig {
   /** Expiry choices (minutes) the prompt offers the model - it picks ONE
    *  per decision, it does not invent others. */
   expiryChoices: number[]
-  /** LLM provider override - omit to use whatever's enabled in trading-
-   *  core's own .env (see lib/llm.ts's module header for why that's a
-   *  SEPARATE env read from the frontend's). */
+  /** LLM provider override - only used on the local-fallback path (see
+   *  callLlm() below); the primary path calls through to the Next.js app,
+   *  which picks its own provider exactly like the Copilot does. */
   provider?: string
+  /** Base URL of the Next.js app (this app's own frontend) - the primary
+   *  LLM path POSTs to `${appUrl}/api/ai_trader_decide`, which runs
+   *  THROUGH the exact same chatComplete() the Copilot and CodeAssistBar
+   *  already use successfully, so there's nothing new to configure: same
+   *  keys, same provider, zero separate setup. Defaults to localhost:3000
+   *  (the standard `next dev`/`next start` port) - override here if this
+   *  app is actually served from somewhere else (a different port, a
+   *  docker-compose service name, etc). */
+  appUrl?: string
 }
 
 export interface AiTraderDecision {
@@ -98,6 +107,44 @@ const DEFAULT_CONFIG: AiTraderConfig = {
   kind: 'binary',
   minConfidence: 65,
   expiryChoices: [3, 5],
+  appUrl: 'http://127.0.0.1:3000',
+}
+
+/** Primary path: call THROUGH the Next.js app's /api/ai_trader_decide,
+ * which runs the exact same chatComplete() the Copilot/CodeAssistBar
+ * already use successfully in that process - same env, same provider, no
+ * second copy of any key to keep in sync. Falls back to trading-core's OWN
+ * local LLM client (lib/llm.ts, reading trading-core's/the shared root
+ * .env) only if the app is unreachable at all (not running, wrong appUrl,
+ * network blocked) - so this still works for an operator who genuinely
+ * wants trading-core fully independent of the frontend, but that's now the
+ * fallback, not the thing everyone has to configure first. */
+async function callLlm(
+  appUrl: string,
+  messages: ChatMessage[],
+  opts: { temperature?: number; maxTokens?: number; timeoutMs?: number }
+): Promise<{ content: string; provider: string; model: string }> {
+  try {
+    const res = await fetch(`${appUrl.replace(/\/$/, '')}/api/ai_trader_decide`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ messages, ...opts }),
+      signal: AbortSignal.timeout((opts.timeoutMs ?? 45_000) + 5_000), // small margin over the route's own internal timeout
+    })
+    const data = (await res.json().catch(() => ({}))) as { ok?: boolean; content?: string; provider?: string; model?: string; error?: string }
+    if (!res.ok || !data.ok) throw new Error(data.error ?? `app HTTP ${res.status}`)
+    if (!data.content) throw new Error('app returned no content')
+    return { content: data.content, provider: data.provider ?? 'app', model: data.model ?? '' }
+  } catch (appErr) {
+    try {
+      const res = await chatComplete({ messages, ...opts })
+      return res
+    } catch (localErr) {
+      throw new Error(
+        `via app (${appUrl}): ${String(appErr instanceof Error ? appErr.message : appErr)} | via trading-core's own .env: ${String(localErr instanceof Error ? localErr.message : localErr)}`
+      )
+    }
+  }
 }
 
 /** Minutes -> seconds, used for placeOrder's direct expirySec path (binary
@@ -312,7 +359,7 @@ export class AiTraderService {
       let provider = ''
       let model = ''
       try {
-        const res = await chatComplete({ messages: [system, user], temperature: 0.4, maxTokens: 500, timeoutMs: 45_000 })
+        const res = await callLlm(this.config.appUrl || DEFAULT_CONFIG.appUrl!, [system, user], { temperature: 0.4, maxTokens: 500, timeoutMs: 45_000 })
         content = res.content
         provider = res.provider
         model = res.model

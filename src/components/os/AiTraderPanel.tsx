@@ -168,6 +168,15 @@ export default function AiTraderPanel({ assets, onError }: Props) {
             className="h-6 bg-[#070c15] text-[9.5px] text-[#dbe4f0]"
           />
         </label>
+        <label className="col-span-2 flex flex-col gap-1 sm:col-span-4">
+          <span className="text-[#7c8aa5]">this app&apos;s own URL (how trading-core reaches it for decisions - same keys as Copilot, nothing else to set up)</span>
+          <Input
+            value={draft.appUrl ?? 'http://127.0.0.1:3000'}
+            onChange={(e) => setDraft({ ...draft, appUrl: e.target.value })}
+            placeholder="http://127.0.0.1:3000"
+            className="h-6 bg-[#070c15] text-[9.5px] text-[#dbe4f0]"
+          />
+        </label>
         <div className="col-span-2 flex items-center gap-4">
           <label className="flex items-center gap-1.5">
             <Switch checked={draft.enabled} onCheckedChange={(v) => setDraft({ ...draft, enabled: v })} />
@@ -196,7 +205,7 @@ export default function AiTraderPanel({ assets, onError }: Props) {
       </div>
 
       <div className="flex flex-wrap items-center gap-2 rounded border border-[#1c2739] bg-[#0b0f17] p-2">
-        <span className="text-[#7c8aa5]">LLM providers seen by trading-core:</span>
+        <span className="text-[#7c8aa5]">decisions normally go through this app (same keys as Copilot) - this row is only trading-core&apos;s OWN fallback providers, used only if this app is unreachable:</span>
         {status.llm.providers.map((p) => (
           <span
             key={p.id}
@@ -208,9 +217,6 @@ export default function AiTraderPanel({ assets, onError }: Props) {
             {p.id}
           </span>
         ))}
-        {!status.llm.providers.some((p) => p.ready) && (
-          <span className="text-rose-300">none ready - if Copilot works, trading-core probably hasn&apos;t been restarted since the shared-.env fix, or your .env lives somewhere other than the repo root</span>
-        )}
       </div>
 
       <div className="flex-1 overflow-y-auto rounded border border-[#1c2739]">
