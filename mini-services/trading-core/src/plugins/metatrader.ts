@@ -67,6 +67,7 @@ import { smcNowRead, smcAnyAgrees } from '../analytics/smc'
 import type { OsMode } from './os-mode'
 import type { Candle } from '../types'
 import { renkoBricks } from '../analytics/renko'
+import { SweepEdgeMemory } from '../analytics/edge'
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
 const finGte = (v: number, floor: number): boolean => Number.isFinite(v) && v >= floor
@@ -98,6 +99,25 @@ const HARD_STOP_RE =
  * Every other source here fails closed on thin history because its engine
  * throws or returns no lean; this gives the renko paths the same floor. */
 const MIN_CANDLES_FOR_RENKO = 50
+
+/** P1 AUDIT FIX - fresh-edge discipline for the LEVEL-shaped signal sources.
+ * meta-strategy/oracle/accute/renko-smc/renko-smc-majority read conditions
+ * that can stay true for many consecutive ticks ("oracle says call, 72%",
+ * "renko is 4 bricks up") - without edge memory, the FIRST tick after
+ * enable (or after a restart, or after a position closes) happily trades
+ * the STALE MIDDLE of a condition that has been true for an hour, exactly
+ * what the auto-trader's SweepEdgeMemory exists to prevent. Gated sources
+ * now run the same contract: first sweep after an arm/restart/source
+ * switch is COLD (every qualifier is backfilled and skipped - arming can
+ * never trade an already-true read), a qualifier the memory has never seen
+ * is a fresh edge (trades), a key stamped on execution stays held until
+ * its read observably lapses (evaluated-but-no-longer-qualifying) or flips
+ * (opposite key = unseen = fresh). The SMC sources are deliberately NOT in
+ * this set: barsAgo===0 is inherently "just fired on THIS candle" (per
+ * direct instruction "taking the now" means only this instant counts), so
+ * each new candle's firing is by construction a fresh event, not a held
+ * level - gating those would change their designed behavior. */
+const EDGE_GATED_SOURCES: ReadonlySet<string> = new Set(['meta-strategy', 'oracle', 'accute', 'renko-smc', 'renko-smc-majority'])
 
 /** AUDIT FIX - same bug os-mode.ts's own BROKER_UNAVAILABLE_RE/
  * assetRejectedUntil was built to fix for the auto-trader, ported here
@@ -303,6 +323,9 @@ export class MetaTraderService {
    * cooldown, no floor by design) - this one exists regardless of
    * cooldownSec, because a rejected order was never a trade to begin with. */
   private rejectedUntil = new Map<string, number>()
+  /** P1 AUDIT FIX (see EDGE_GATED_SOURCES) - cross-tick fresh-edge memory,
+   * the SAME class the auto-trader's sweep sources use (analytics/edge.ts). */
+  private sweepEdge = new SweepEdgeMemory()
 
   async start(ctx: KernelContext): Promise<void> {
     this.ctx = ctx
@@ -470,11 +493,30 @@ export class MetaTraderService {
 
   configure(patch: Partial<MetaTraderConfig>): MetaTraderConfig {
     const num = (v: unknown, fb: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fb)
-    if (patch.enabled !== undefined) this.config.enabled = Boolean(patch.enabled)
-    if (patch.signalSource !== undefined && (META_TRADER_SOURCES as readonly string[]).includes(patch.signalSource))
+    if (patch.enabled !== undefined) {
+      const next = Boolean(patch.enabled)
+      // P1 AUDIT: arming is an arm event - the next sweep must backfill
+      // whatever already qualifies instead of trading the stale middle.
+      if (next && !this.config.enabled) this.sweepEdge.rearm()
+      this.config.enabled = next
+    }
+    if (patch.signalSource !== undefined && (META_TRADER_SOURCES as readonly string[]).includes(patch.signalSource)) {
+      // a source switch re-colds anyway inside beginSweep(); rearm here too
+      // so the change is visible in describe()/state immediately.
+      if (patch.signalSource !== this.config.signalSource) this.sweepEdge.rearm()
       this.config.signalSource = patch.signalSource
-    if (patch.metaStrategyId !== undefined) this.config.metaStrategyId = String(patch.metaStrategyId).trim() || undefined
-    if (patch.tf !== undefined && (ALL_TIMEFRAMES as string[]).includes(patch.tf)) this.config.tf = patch.tf
+    }
+    if (patch.metaStrategyId !== undefined) {
+      const nextId = String(patch.metaStrategyId).trim() || undefined
+      // a different spec is a different qualifier universe - the old spec's
+      // held/edge verdicts would be meaningless carried over (P1 AUDIT).
+      if (nextId !== this.config.metaStrategyId) this.sweepEdge.rearm()
+      this.config.metaStrategyId = nextId
+    }
+    if (patch.tf !== undefined && (ALL_TIMEFRAMES as string[]).includes(patch.tf)) {
+      if (patch.tf !== this.config.tf) this.sweepEdge.rearm() // reads on a new tf are a new universe
+      this.config.tf = patch.tf
+    }
     if (patch.direction !== undefined && (patch.direction === 'call' || patch.direction === 'put' || patch.direction === 'both'))
       this.config.direction = patch.direction
     if (patch.minConfidence !== undefined) this.config.minConfidence = clamp(num(patch.minConfidence, this.config.minConfidence), 0, 100)
@@ -561,9 +603,18 @@ export class MetaTraderService {
       return
     }
 
-    const candidates = this.pickCandidates()
-    if (!candidates.length) {
+    const rows = this.pickCandidates()
+    if (!rows.length) {
       this.rt.lastRejection = `no ${this.config.signalSource} signal meets the ${this.config.minConfidence}% confidence floor right now`
+      return
+    }
+    // P1 AUDIT FIX: fresh-edge gate on the level-shaped sources (see
+    // EDGE_GATED_SOURCES) - a qualifier that has been sitting there since
+    // before the last arm/execution is the stale middle of a read, not a
+    // signal. First sweep after an arm/restart/source switch is cold.
+    const candidates = this.gateByFreshEdge(rows)
+    if (!candidates.length) {
+      this.rt.lastRejection = `${rows.length} ${this.config.signalSource} candidate(s) but none is a fresh edge - already held from an earlier tick (arm-time backfill / previously traded, waiting for the read to lapse or flip)`
       return
     }
 
@@ -572,6 +623,10 @@ export class MetaTraderService {
       const row = candidates[i]
       const out = await this.place(row)
       if (out.ok) {
+        // P1 AUDIT FIX: the edge is consumed on EXECUTION - this (asset,
+        // direction) counts as held from here until its read lapses or
+        // flips, so a cooldown expiring can never re-enter the stale middle.
+        this.sweepEdge.stamp(SweepEdgeMemory.key(row.asset, row.direction), this.now())
         this.rt.trades += 1
         this.rt.lastTradeTs = this.now()
         this.rt.openCount += 1
@@ -891,6 +946,29 @@ export class MetaTraderService {
       }
     }
     return this.rankByRecency(out)
+  }
+
+  /** P1 AUDIT FIX - run the fully-qualified candidate rows through the
+   * sweep-edge memory for the level-shaped sources (no-op for the SMC
+   * "now" sources - see EDGE_GATED_SOURCES). Contract mirrors the
+   * auto-trader's edgeSweep(): every candidate row was OBSERVED this tick
+   * (its read already succeeded in pickCandidates), fully-qualified keys
+   * feed the cold-sweep backfill, and only never-seen keys come back as
+   * fresh rows - order preserved (confidence/recency ranking intact). */
+  private gateByFreshEdge(rows: MetaTraderRow[]): MetaTraderRow[] {
+    if (!EDGE_GATED_SOURCES.has(this.config.signalSource)) return rows
+    this.sweepEdge.beginSweep(this.config.signalSource)
+    const evaluated = new Set<string>()
+    const qualifying = new Set<string>()
+    const fresh: MetaTraderRow[] = []
+    for (const row of rows) {
+      evaluated.add(row.asset)
+      const key = SweepEdgeMemory.key(row.asset, row.direction)
+      qualifying.add(key)
+      if (this.sweepEdge.gate(key) === 'trade') fresh.push(row)
+    }
+    this.sweepEdge.endSweep(evaluated, qualifying, this.now())
+    return fresh
   }
 
   // ---------- placement ----------

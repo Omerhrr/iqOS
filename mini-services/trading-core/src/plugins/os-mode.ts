@@ -2575,7 +2575,24 @@ export class ModeService {
     }
   }
 
+  /** P2 AUDIT FIX - cross-tick phase memory for meta:<slug> members of the
+   * 'strategy' source pool. Panel-read-based evaluates (MetaStrategyService
+   * .evaluate) have no candle-slice form, so evalWithEdge can't classify
+   * their transition the way it does for candle-window strategies - the
+   * held/entered verdict is RECONSTRUCTED across ticks instead: the same
+   * member voting the same (id, asset, direction) on consecutive ticks is
+   * HELD (the stale middle of a read), a key absent from last tick's set is
+   * ENTERED/FLIP (fresh - a flip is a different key by construction, same
+   * convention SweepEdgeMemory uses). Replaces the old "always treated as a
+   * fresh vote" tradeoff documented at the meta branch below. */
+  private metaMemberPrevVotes = new Set<string>()
+  private metaMemberCurVotes = new Set<string>()
+
   private pickStrategySignal(): ScreenRow | null {
+    // rotate the phase memory FIRST - every return path below then observes
+    // a consistent "previous tick" set for this tick's votes
+    this.metaMemberPrevVotes = this.metaMemberCurVotes
+    this.metaMemberCurVotes = new Set()
     try {
       const market = this.ctx.use<MarketDataService>('market')
       const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
@@ -2599,10 +2616,12 @@ export class ModeService {
       const lab = this.ctx.use<StrategyLabService>('lab')
       // meta:<slug> saved Meta Strategy Lab combos - live-only, same as an
       // autopilot bot's meta: branch (see autopilot.ts's metaResearchGate doc
-      // comment): no candle-slice evaluate exists, so these never go through
-      // the fresh-edge phase gate below (no `phase` to check, so they're
-      // always treated as a fresh vote, same tradeoff every other 'meta'-kind
-      // dispatch in this codebase accepts).
+      // comment): no candle-slice evaluate exists, so evalWithEdge can't
+      // classify their transition. P2 AUDIT FIX: phase is reconstructed
+      // cross-tick instead (see metaMemberPrevVotes above) - a member that
+      // voted the same (id, asset, direction) last tick is HELD and skips
+      // its vote, instead of the old always-fresh treatment that let a
+      // held meta combo vote on every single tick.
       let meta: MetaStrategyService | null = null
       try {
         meta = this.ctx.use<MetaStrategyService>('metaStrategy')
@@ -2738,7 +2757,16 @@ export class ModeService {
                 ? (() => {
                     if (!meta) throw new Error('meta strategy lab unavailable')
                     const { result, price: p } = meta.evaluate(s.id, asset, this.config.tf)
-                    return { direction: result.direction, score: result.score, notes: result.notes, price: p } as ReturnType<AnalyticsService['runStrategy']>
+                    // P2 AUDIT FIX: reconstruct phase cross-tick (see
+                    // metaMemberPrevVotes) so the shared `held` gate below
+                    // actually applies to meta members too.
+                    let phase: 'entered' | 'flip' | 'held' | undefined
+                    if (result.direction !== 'none') {
+                      const key = `${s.id}|${asset}|${result.direction}`
+                      phase = this.metaMemberPrevVotes.has(key) ? 'held' : 'entered'
+                      this.metaMemberCurVotes.add(key)
+                    }
+                    return { direction: result.direction, score: result.score, notes: result.notes, price: p, phase } as ReturnType<AnalyticsService['runStrategy']>
                   })()
                 : analytics.runStrategy(asset, this.config.tf, s.id, s.params)
             if (ev.direction === 'none') continue

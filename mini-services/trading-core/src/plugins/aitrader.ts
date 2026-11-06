@@ -187,7 +187,15 @@ async function callLlm(
   try {
     const res = await fetch(`${appUrl.replace(/\/$/, '')}/api/ai_trader_decide`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        // P2 AUDIT FIX: the app route now requires this header whenever
+        // KERNEL_TOKEN is set in ITS env - send it whenever THIS process
+        // carries the same shared secret (index.ts already reads it for the
+        // kernel's own REST auth, so it's the same value in any deployment
+        // that sets it at all).
+        ...(String(process.env.KERNEL_TOKEN ?? '').trim() ? { 'x-kernel-token': String(process.env.KERNEL_TOKEN).trim() } : {}),
+      },
       body: JSON.stringify({ messages, ...opts }),
       signal: AbortSignal.timeout((opts.timeoutMs ?? 45_000) + 5_000), // small margin over the route's own internal timeout
     })

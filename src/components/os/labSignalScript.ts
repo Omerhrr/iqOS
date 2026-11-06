@@ -19,6 +19,21 @@ function confFromWeight(weight: number): number {
   return Math.max(1, Math.min(100, Math.round((weight / 50) * 100)))
 }
 
+/** AUDIT: MSL's tokenizer only accepts plain decimal literals - a JSON spec
+ * carrying a float like 1e-7 (or any value String() would render in exponent
+ * notation) used to generate a script that immediately failed to parse.
+ * Render every number at 6-decimal resolution, exponent-notation-proof. */
+function mslNum(v: number): string {
+  if (!Number.isFinite(v)) return '0'
+  const r = Math.round(v * 1e6) / 1e6
+  if (Math.abs(r) >= 1e15) return r > 0 ? '999999999999999' : '-999999999999999'
+  if (Number.isInteger(r)) return String(r)
+  return r
+    .toFixed(6)
+    .replace(/(\.\d*?)0+$/, '$1')
+    .replace(/\.$/, '')
+}
+
 /** One signal -> its MSL function call text (see signalscript.ts for the
  * exact resolver these map to - argument order and names match exactly).
  * `group` is the one kind that ISN'T a function call - it's a boolean
@@ -29,23 +44,23 @@ function callFor(s: LabSignalDef): string {
     case 'candle':
       return `candle('${s.name.replace(/'/g, "\\'")}', ${s.dir}, ${conf}${s.series === 'heikin' ? ", 'heikin'" : ''})`
     case 'bar':
-      return `bar('${s.variant}', ${s.dir}, ${conf}${s.atrK !== undefined ? `, ${s.atrK}` : ''})`
+      return `bar('${s.variant}', ${s.dir}, ${conf}${s.atrK !== undefined ? `, ${mslNum(s.atrK)}` : ''})`
     case 'ha':
-      return `ha('${s.variant}', ${s.dir}, ${conf}${s.len !== undefined ? `, ${s.len}` : ''})`
+      return `ha('${s.variant}', ${s.dir}, ${conf}${s.len !== undefined ? `, ${mslNum(s.len)}` : ''})`
     case 'line':
-      return `line('${s.variant}', ${s.dir}, ${conf}${s.lookback !== undefined ? `, ${s.lookback}` : ''})`
+      return `line('${s.variant}', ${s.dir}, ${conf}${s.lookback !== undefined ? `, ${mslNum(s.lookback)}` : ''})`
     case 'renko':
-      return `renko('${s.variant}', ${s.dir}, ${conf}${s.len !== undefined ? `, ${s.len}` : ''})`
+      return `renko('${s.variant}', ${s.dir}, ${conf}${s.len !== undefined ? `, ${mslNum(s.len)}` : ''})`
     case 'pf':
-      return `pf('${s.variant}', ${s.dir}, ${conf}${s.reversalBoxes !== undefined ? `, ${s.reversalBoxes}` : ''})`
+      return `pf('${s.variant}', ${s.dir}, ${conf}${s.reversalBoxes !== undefined ? `, ${mslNum(s.reversalBoxes)}` : ''})`
     case 'mtf':
       return `mtf(${s.factor}, ${s.dir}, ${conf})`
     case 'indicator': {
-      const t2 = s.threshold2 !== undefined ? `, ${s.threshold2}` : ''
-      if (s.type) return `indicatorType('${s.ind}', '${s.type}', '${s.op}', ${s.threshold}, ${s.dir}, ${conf}${t2})`
+      const t2 = s.threshold2 !== undefined ? `, ${mslNum(s.threshold2)}` : ''
+      if (s.type) return `indicatorType('${s.ind}', '${s.type}', '${s.op}', ${mslNum(s.threshold)}, ${s.dir}, ${conf}${t2})`
       const period = s.params?.period
-      if (period !== undefined) return `indicatorPeriod('${s.ind}', ${period}, '${s.op}', ${s.threshold}, ${s.dir}, ${conf}${t2})`
-      return `indicator('${s.ind}', '${s.op}', ${s.threshold}, ${s.dir}, ${conf}${t2})`
+      if (period !== undefined) return `indicatorPeriod('${s.ind}', ${mslNum(period)}, '${s.op}', ${mslNum(s.threshold)}, ${s.dir}, ${conf}${t2})`
+      return `indicator('${s.ind}', '${s.op}', ${mslNum(s.threshold)}, ${s.dir}, ${conf}${t2})`
     }
     case 'builtin':
       return `builtinSig('${s.id}', ${s.dir}, ${conf})`
@@ -89,8 +104,12 @@ export function signalsToScript(spec: LabSpec): string {
   lines.push(`let score = (bullW - bearW) / (bullW + bearW) * 100`)
   if (callNames.length) lines.push(`let bullVotes = count(${callNames.map((n) => `${n}.active`).join(', ')})`)
   if (putNames.length) lines.push(`let bearVotes = count(${putNames.map((n) => `${n}.active`).join(', ')})`)
-  const minScore = spec.minScore
-  const minVotes = spec.minVotes
+  // AUDIT: clamp to the SAME window evaluateCustomAt enforces (custom.ts:
+  // Math.max(5, Math.min(95, spec.minScore))) so the generated script's
+  // behavior is identical to the JSON spec's - an out-of-range minScore
+  // used to translate verbatim and the two evaluators would disagree.
+  const minScore = Math.max(5, Math.min(95, Math.round(Number(spec.minScore) || 45)))
+  const minVotes = Math.max(1, Math.round(Number(spec.minVotes) || 1))
   lines.push(
     `call when score >= ${minScore}${callNames.length ? ` and bullVotes >= ${minVotes}` : ''}`,
     `put when score <= -${minScore}${putNames.length ? ` and bearVotes >= ${minVotes}` : ''}`,

@@ -31,8 +31,23 @@
 import type { EvalCtx, SignalDef } from './custom'
 import { signalActive } from './custom'
 import type { MinableEngineId } from '../analytics/chartsignals'
+import { MINABLE_ENGINES } from '../analytics/chartsignals'
 import { getStrategy, defaultParams } from './builtin'
 import type { MslSourceRead } from '../analytics/strategylang'
+
+/** Every indicator id custom.ts's IndicatorSignal.ind union accepts - a
+ * RUNTIME mirror of that type so an MSL script naming a nonexistent
+ * indicator gets a friendly error listing the valid ids (AUDIT: it used to
+ * pass straight through into signalActive as a raw TypeError that killed
+ * the whole script evaluation - still fail-closed, but unreadable). */
+const INDICATOR_IDS: ReadonlySet<string> = new Set([
+  'rsi', 'bbpos', 'zscore', 'donchianpos', 'macdz', 'slope', 'streak', 'wickbias', 'emasign', 'hadist',
+  'bodypos', 'psar', 'fractal', 'trendpullback', 'rangezone', 'madist', 'osc0100', 'oscpm100', 'oscz',
+  'trenddist', 'bandpos', 'volflow', 'levels', 'ofdelta', 'ofcumdelta', 'ofpocdist', 'ofvapos',
+  'otcvdelta', 'otcvratio', 'otcstagn',
+])
+/** custom.ts's IndicatorSignal.op union, runtime copy (same reasoning). */
+const INDICATOR_OPS: ReadonlySet<string> = new Set(['>', '<', 'between', 'outside'])
 
 /** Every function name this module answers for - strategylang.ts's
  * evaluator falls through to the resolver for any of these (anything NOT
@@ -127,10 +142,16 @@ function buildSignalDef(fn: string, args: Arg[]): SignalDef {
     case 'indicator': {
       // indicator(ind, op, threshold, dir, conf?, threshold2?)
       const [ind, op, threshold, dirArg, , threshold2] = args
+      const indName = String(ind)
+      const opName = String(op)
+      // AUDIT: friendly validation - an unknown ind/op used to become a raw
+      // TypeError deep inside signalActive; fail HERE with the valid values.
+      if (!INDICATOR_IDS.has(indName)) throw new Error(`indicator(): unknown indicator "${indName}" - valid: ${[...INDICATOR_IDS].join(', ')}`)
+      if (!INDICATOR_OPS.has(opName)) throw new Error(`indicator(): unknown op "${opName}" - use >, <, between or outside`)
       return {
         kind: 'indicator',
-        ind: String(ind) as never,
-        op: String(op) as never,
+        ind: indName as never,
+        op: opName as never,
         threshold: num(threshold, 0),
         threshold2: threshold2 === undefined ? undefined : num(threshold2, 0),
         dir: side(dirArg, 'indicator()'),
@@ -140,11 +161,15 @@ function buildSignalDef(fn: string, args: Arg[]): SignalDef {
     case 'indicatorType': {
       // indicatorType(ind, type, op, threshold, dir, conf?, threshold2?)
       const [ind, type, op, threshold, dirArg, , threshold2] = args
+      const indName = String(ind)
+      const opName = String(op)
+      if (!INDICATOR_IDS.has(indName)) throw new Error(`indicatorType(): unknown indicator "${indName}" - valid: ${[...INDICATOR_IDS].join(', ')}`)
+      if (!INDICATOR_OPS.has(opName)) throw new Error(`indicatorType(): unknown op "${opName}" - use >, <, between or outside`)
       return {
         kind: 'indicator',
-        ind: String(ind) as never,
+        ind: indName as never,
         type: String(type),
-        op: String(op) as never,
+        op: opName as never,
         threshold: num(threshold, 0),
         threshold2: threshold2 === undefined ? undefined : num(threshold2, 0),
         dir: side(dirArg, 'indicatorType()'),
@@ -154,11 +179,15 @@ function buildSignalDef(fn: string, args: Arg[]): SignalDef {
     case 'indicatorPeriod': {
       // indicatorPeriod(ind, period, op, threshold, dir, conf?, threshold2?)
       const [ind, period, op, threshold, dirArg, , threshold2] = args
+      const indName = String(ind)
+      const opName = String(op)
+      if (!INDICATOR_IDS.has(indName)) throw new Error(`indicatorPeriod(): unknown indicator "${indName}" - valid: ${[...INDICATOR_IDS].join(', ')}`)
+      if (!INDICATOR_OPS.has(opName)) throw new Error(`indicatorPeriod(): unknown op "${opName}" - use >, <, between or outside`)
       return {
         kind: 'indicator',
-        ind: String(ind) as never,
+        ind: indName as never,
         params: { period: num(period, 14) },
-        op: String(op) as never,
+        op: opName as never,
         threshold: num(threshold, 0),
         threshold2: threshold2 === undefined ? undefined : num(threshold2, 0),
         dir: side(dirArg, 'indicatorPeriod()'),
@@ -166,14 +195,20 @@ function buildSignalDef(fn: string, args: Arg[]): SignalDef {
       }
     }
     case 'builtinSig': {
-      // builtinSig(id, dir, conf?)
+      // builtinSig(id, dir, conf?) - AUDIT: unknown ids now fail with the
+      // same friendly error a JSON spec's learner would produce, instead of
+      // signalActive's raw undefined-dereference.
       const [id, dirArg] = args
-      return { kind: 'builtin', id: String(id), dir: side(dirArg, 'builtinSig()'), weight: 1 }
+      const idName = String(id)
+      if (!getStrategy(idName)) throw new Error(`builtinSig(): unknown builtin strategy "${idName}"`)
+      return { kind: 'builtin', id: idName, dir: side(dirArg, 'builtinSig()'), weight: 1 }
     }
     case 'engine': {
-      // engine(engineId, dir, conf?)
+      // engine(engineId, dir, conf?) - AUDIT: same friendly validation.
       const [engineId, dirArg] = args
-      return { kind: 'engine', engine: String(engineId) as MinableEngineId, dir: side(dirArg, 'engine()'), weight: 1 }
+      const engName = String(engineId)
+      if (!(MINABLE_ENGINES as readonly string[]).includes(engName)) throw new Error(`engine(): unknown engine "${engName}" - valid: ${MINABLE_ENGINES.join(', ')}`)
+      return { kind: 'engine', engine: engName as MinableEngineId, dir: side(dirArg, 'engine()'), weight: 1 }
     }
     default:
       throw new Error(`unknown signal function "${fn}"`)
