@@ -55,7 +55,7 @@ import type { MetaStrategyService } from './metastrategy'
 import type { ScreenerService } from './screener'
 import { chatComplete, providerStatus, type ChatMessage } from '../lib/llm'
 import { tfSeconds } from '../analytics/synthfeed'
-import { atr, closes, ema, highs, lows, rsi } from '../analytics/indicators'
+import { atr, closes, ema, highs, lows, rsi, trueRange } from '../analytics/indicators'
 
 export type AiTraderScanMode = 'single' | 'selected' | 'global'
 
@@ -229,6 +229,38 @@ interface HorizonRead {
    * from noise alone over that many bars; well under 1 means it's
    * indistinguishable from chop and shouldn't be read as a trend. */
   snr: number
+}
+
+/**
+ * Glitch-resistant ATR% of price. `validCandle` (market-data.ts) deliberately
+ * does NOT do shape-policing on high/low - a live feed can legitimately
+ * sample an odd extreme, and rejecting on shape would throw away real data.
+ * But that means a single bad bar (a decimal/scale glitch from the sidecar -
+ * one tick where high/low lands 10-100x normal) sails straight into
+ * Wilder's ATR(14), which is an EMA: one such outlier dominates the average
+ * for ~13 bars and can make ATR% read as "500% of price" on an asset that
+ * is actually moving a fraction of a percent per bar - and since every
+ * horizon's signal-to-noise below divides by atrPct, that one bad bar also
+ * silently crushes every expiry's snr to ~0.00x regardless of real momentum
+ * (both symptoms, one root cause). Standard Wilder ATR is kept for the
+ * trend-context display line, but clamp each bar's true range to a multiple
+ * of the window's MEDIAN true range (median is outlier-resistant in a way a
+ * mean/EMA is not) before averaging, so one glitched bar can't hijack the
+ * whole read. With no glitch this is a no-op (nothing exceeds the clamp).
+ */
+function robustAtrPct(highPrices: number[], lowPrices: number[], closePrices: number[], price: number, period = 14): number {
+  if (price <= 0 || closePrices.length < period + 1) return 0
+  const tr = trueRange(highPrices, lowPrices, closePrices)
+  const window = tr.slice(-period).filter((v) => Number.isFinite(v))
+  if (!window.length) return 0
+  const sorted = [...window].sort((a, b) => a - b)
+  const mid = Math.floor(sorted.length / 2)
+  const median = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
+  if (median <= 0) return 0
+  const cap = median * 5 // generous - real volatility bursts still pass through, a scale glitch does not
+  const clamped = window.map((v) => Math.min(v, cap))
+  const avg = clamped.reduce((a, b) => a + b, 0) / clamped.length
+  return (avg / price) * 100
 }
 
 function buildHorizonReads(closePrices: number[], tfSec: number, expiryChoices: number[], atrPct: number): HorizonRead[] {
@@ -622,7 +654,13 @@ export class AiTraderService {
       const lowPrices = lows(candles)
       const atrSeries = closePrices.length >= 15 ? atr(highPrices, lowPrices, closePrices, 14) : []
       const atrLast = atrSeries.length ? atrSeries[atrSeries.length - 1] : 0
-      const atrPct = price > 0 && atrLast > 0 ? (atrLast / price) * 100 : 0
+      const rawAtrPct = price > 0 && atrLast > 0 ? (atrLast / price) * 100 : 0
+      // Use the glitch-resistant read (see robustAtrPct) for everything that
+      // actually drives a decision - the per-expiry signal-to-noise below,
+      // and the confidence/skip logic - so one bad feed bar can't silently
+      // nuke every horizon's snr to 0.00x. Standard Wilder ATR% stays in the
+      // trend-context line sent to the model as a secondary data point.
+      const atrPct = robustAtrPct(highPrices, lowPrices, closePrices, price, 14) || rawAtrPct
       const rsiSeries = closePrices.length >= 15 ? rsi(closePrices, 14) : []
       const rsiLast = rsiSeries.length ? rsiSeries[rsiSeries.length - 1] : 50
       const ema9Series = closePrices.length >= 9 ? ema(closePrices, 9) : []
@@ -703,7 +741,7 @@ export class AiTraderService {
         role: 'user',
         content: [
           `Asset: ${asset}   Timeframe: ${tf}   Current price: ${price || 'unavailable'}`,
-          `Trend context: EMA9 ${ema9Last.toFixed(5)} vs EMA21 ${ema21Last.toFixed(5)} (${ema9Last > ema21Last ? 'short-term above long-term - up-bias' : ema9Last < ema21Last ? 'short-term below long-term - down-bias' : 'flat'}), RSI14 ${rsiLast.toFixed(1)}, ATR14 ${atrPct.toFixed(4)}% of price (volatility regime).`,
+          `Trend context: EMA9 ${ema9Last.toFixed(5)} vs EMA21 ${ema21Last.toFixed(5)} (${ema9Last > ema21Last ? 'short-term above long-term - up-bias' : ema9Last < ema21Last ? 'short-term below long-term - down-bias' : 'flat'}), RSI14 ${rsiLast.toFixed(1)}, ATR14 ${atrPct.toFixed(4)}% of price (volatility regime)${Math.abs(rawAtrPct - atrPct) > 0.01 ? ` [raw ATR read ${rawAtrPct.toFixed(2)}% - one outlier bar in the window was clamped as a likely feed glitch, the figure above is the corrected one]` : ''}.`,
           `Recent closes, oldest -> newest (${closePrices.length ? closePrices.length : 0} bars available, showing last ${Math.min(24, closePrices.length)}): ${recentCloses || '(none yet)'}`,
           '',
           'Per-expiry-choice reads (computed directly from the candles above - this is YOUR analysis to build on):',
