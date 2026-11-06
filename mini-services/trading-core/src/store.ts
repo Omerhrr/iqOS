@@ -189,6 +189,13 @@ export class Store {
       // actually works during London/NY overlap" instead of pooling a
       // strategy's record across hours that behave completely differently.
       `ALTER TABLE positions ADD COLUMN entry_session TEXT`,
+      // price_at_decision: the price AT THE MOMENT the AI Trader decided,
+      // so a shadow-mode (non-acted) call can still be graded win/loss
+      // later by comparing this to the price at ts + expiryMin - without
+      // it there was no way to tell the model "you were right/wrong" on
+      // the vast majority of its own cycles, since shadow mode never opens
+      // a real position to read a pnl back from.
+      `ALTER TABLE ai_trader_decisions ADD COLUMN price_at_decision REAL`,
     ]) {
       try {
         this.db.run(stmt)
@@ -258,6 +265,9 @@ export class Store {
         ts INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_ai_trader_decisions_ts ON ai_trader_decisions(ts);
+      -- price_at_decision: see migration below (long after this table was
+      -- first shipped, so CREATE TABLE IF NOT EXISTS alone won't add it to
+      -- an already-existing database).
     `)
   }
 
@@ -890,16 +900,21 @@ export class Store {
     provider?: string
     model?: string
     error?: string
+    /** Price at the moment of THIS decision - the anchor a shadow-mode
+     * (non-acted) call gets graded win/loss against later, by comparing it
+     * to the price at ts + expiryMin once that time has actually passed. */
+    priceAtDecision?: number
     ts: number
   }): void {
     this.db.run(
       `INSERT INTO ai_trader_decisions
-         (asset, tf, direction, confidence, expiry_min, reasoning, snapshot, live, acted, position_id, provider, model, error, ts)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (asset, tf, direction, confidence, expiry_min, reasoning, snapshot, live, acted, position_id, provider, model, error, price_at_decision, ts)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         d.asset, d.tf, d.direction, d.confidence, d.expiryMin ?? null, d.reasoning,
         JSON.stringify(d.snapshot), d.live ? 1 : 0, d.acted ? 1 : 0,
-        d.positionId ?? null, d.provider ?? null, d.model ?? null, d.error ?? null, d.ts,
+        d.positionId ?? null, d.provider ?? null, d.model ?? null, d.error ?? null,
+        d.priceAtDecision ?? null, d.ts,
       ],
     )
   }
@@ -919,17 +934,18 @@ export class Store {
     provider: string | null
     model: string | null
     error: string | null
+    priceAtDecision: number | null
     ts: number
   }[] {
     const rows = this.db
       .query(
-        `SELECT id, asset, tf, direction, confidence, expiry_min, reasoning, snapshot, live, acted, position_id, provider, model, error, ts
+        `SELECT id, asset, tf, direction, confidence, expiry_min, reasoning, snapshot, live, acted, position_id, provider, model, error, price_at_decision, ts
          FROM ai_trader_decisions ORDER BY ts DESC, id DESC LIMIT ?`,
       )
       .all(limit) as {
       id: number; asset: string; tf: string; direction: string; confidence: number; expiry_min: number | null
       reasoning: string; snapshot: string; live: number; acted: number; position_id: string | null
-      provider: string | null; model: string | null; error: string | null; ts: number
+      provider: string | null; model: string | null; error: string | null; price_at_decision: number | null; ts: number
     }[]
     return rows.map((r) => ({
       id: r.id,
@@ -952,6 +968,7 @@ export class Store {
       provider: r.provider,
       model: r.model,
       error: r.error,
+      priceAtDecision: r.price_at_decision,
       ts: r.ts,
     }))
   }

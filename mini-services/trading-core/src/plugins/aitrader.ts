@@ -370,30 +370,79 @@ export class AiTraderService {
     }
   }
 
-  /** Best-effort recent track record for THIS asset+tf, folded into the
-   * prompt so the model isn't reasoning in a vacuum about its own past
-   * calls - open positions are excluded (no outcome yet), settled ones
-   * contribute win/loss. Never throws; a store/position lookup failure
-   * just means an empty record, not a broken cycle. */
-  private recentRecord(asset: string, tf: string): { wins: number; losses: number; open: number } {
-    let wins = 0
-    let losses = 0
-    let open = 0
-    try {
-      const rows = this.store
-        .listAiTraderDecisions(50)
-        .filter((r) => r.asset === asset && r.tf === tf && r.acted && r.positionId)
-      for (const r of rows) {
-        const pos = this.store.getPosition(r.positionId as string)
-        if (!pos) continue
-        if (pos.status === 'open') open += 1
-        else if ((pos.pnl ?? 0) > 0) wins += 1
-        else losses += 1
+  /** A graded entry for one past decision - this is the "did I get it right"
+   * feedback a human trader carries into the next call, fed back into the
+   * NEXT prompt per direct instruction ("he should be allowed to know also
+   * that his prediction went well or wrong, so he can learn from it"). */
+  private gradeOne(
+    r: { direction: string; expiryMin: number | null; priceAtDecision: number | null; acted: boolean; positionId: string | null; ts: number },
+    candles: Candle[],
+    nowSec: number
+  ): 'win' | 'loss' | 'pending' | 'skip' | 'ungraded' {
+    if (r.direction === 'skip') return 'skip'
+    // A LIVE/acted trade has a real position with a real pnl - grade off
+    // that, it's ground truth, not an estimate.
+    if (r.acted && r.positionId) {
+      try {
+        const pos = this.store.getPosition(r.positionId)
+        if (!pos) return 'ungraded'
+        if (pos.status === 'open') return 'pending'
+        return (pos.pnl ?? 0) > 0 ? 'win' : 'loss'
+      } catch {
+        return 'ungraded'
       }
-    } catch {
-      // best-effort only
     }
-    return { wins, losses, open }
+    // Shadow mode never opens a position, so there is no pnl to read back -
+    // the only way it can ever learn from a shadow call is to self-grade it
+    // against what price actually did: a CALL "wins" if price at ts+expiry
+    // closed above price-at-decision, a PUT wins if it closed below. This
+    // is an approximation (ignores payout/exact-strike mechanics) but it's
+    // the right binary comparison for "was my DIRECTION call correct."
+    if (!r.priceAtDecision || !r.expiryMin) return 'ungraded'
+    const targetTs = r.ts + Math.round(r.expiryMin * 60)
+    if (nowSec < targetTs) return 'pending' // expiry hasn't happened yet
+    const future = candles.find((c) => c.time >= targetTs)
+    if (!future) return 'ungraded' // expiry passed but no candle data reaches that far - can't grade, don't guess
+    const won = r.direction === 'call' ? future.close > r.priceAtDecision : future.close < r.priceAtDecision
+    return won ? 'win' : 'loss'
+  }
+
+  /** Grades the last few decisions on THIS exact asset+tf and formats them
+   * as feedback for the next prompt - the model sees, in order, what it
+   * called, how confident it was, and whether it was actually right, so it
+   * can learn from its own track record instead of starting cold every
+   * cycle. Deep candles (not just the short window runCycle already
+   * fetched) so a shadow call from an hour ago can still be graded even
+   * though its expiry window is well behind the current candle slice. */
+  private gradeRecent(asset: string, tf: Timeframe, limit = 8): { lines: string; wins: number; losses: number; pending: number } {
+    let deepCandles: Candle[] = []
+    try {
+      deepCandles = this.market.getCandlesDeep(asset, tf, 2200, true)
+    } catch {
+      deepCandles = []
+    }
+    const nowSec = Math.floor(Date.now() / 1000)
+    let rows: ReturnType<Store['listAiTraderDecisions']> = []
+    try {
+      rows = this.store.listAiTraderDecisions(50).filter((r) => r.asset === asset && r.tf === tf)
+    } catch {
+      rows = []
+    }
+    const graded = rows.slice(0, limit).map((r) => ({ r, outcome: this.gradeOne(r, deepCandles, nowSec) }))
+    const wins = graded.filter((g) => g.outcome === 'win').length
+    const losses = graded.filter((g) => g.outcome === 'loss').length
+    const pending = graded.filter((g) => g.outcome === 'pending').length
+    const lines = graded.length
+      ? graded
+          .map(({ r, outcome }) => {
+            const agoMin = Math.max(0, Math.round((nowSec - r.ts) / 60))
+            if (r.direction === 'skip') return `- ${agoMin}min ago: SKIPPED - "${r.reasoning.slice(0, 160)}"`
+            const verdict = outcome === 'win' ? 'WON' : outcome === 'loss' ? 'LOST' : outcome === 'pending' ? 'pending (expiry not reached yet)' : 'ungraded (no outcome data)'
+            return `- ${agoMin}min ago: ${r.direction.toUpperCase()} @ ${r.confidence.toFixed(0)}% confidence, ${r.expiryMin ?? '?'}min expiry - ${verdict} - "${r.reasoning.slice(0, 160)}"`
+          })
+          .join('\n')
+      : '- (no prior decisions on this exact asset+tf yet - this is a fresh start, no track record to lean on)'
+    return { lines, wins, losses, pending }
   }
 
   private async runCycle(): Promise<AiTraderDecision | null> {
@@ -412,7 +461,7 @@ export class AiTraderService {
       } catch {
         price = 0
       }
-      const record = this.recentRecord(asset, tf)
+      const graded = this.gradeRecent(asset, tf, 8)
 
       // Raw candles - the model does its OWN read of price action here,
       // it is not just tallying what other predictors already concluded.
@@ -498,6 +547,13 @@ export class AiTraderService {
           '   spends most of a session watching and waiting, not firing on every tick. Only call/put when you',
           '   would genuinely expect to be right most of the time at that confidence level. Being honestly',
           '   uncertain and skipping beats a confident-sounding guess that is wrong half the time.',
+          '5. Learn from yourself. Below is YOUR OWN recent track record on this exact asset+tf - what you called,',
+          '   how sure you were, and whether you were actually right or wrong once price played out. A human',
+          '   trader carries yesterday\'s mistakes into today\'s read instead of starting cold every time - do the',
+          '   same. If you have been getting a particular read wrong (e.g. confidently calling reversals that keep',
+          '   not reversing, or a signal-to-noise read that keeps being overridden by chop), actively correct for',
+          '   that pattern now rather than repeating it. If your recent calls have been landing, that is grounds',
+          '   for genuine confidence, not for taking it as "the current moment" supporting evidence too.',
           '',
           'Respond with ONLY a JSON object, no prose outside it, in exactly this shape:',
           '{"direction": "call" | "put" | "skip", "confidence": 0-100, "expiryMin": <the ONE allowed choice your analysis is clearest on>, "reasoning": "<2-4 sentences: your own read of the price action, how it specifically supports a move completing within the chosen expiry, and whether you sided with or against the desk and why>"}',
@@ -514,7 +570,9 @@ export class AiTraderService {
           horizonLines,
           '',
           `Allowed expiry choices (minutes): ${this.config.expiryChoices.join(', ')} - you must pick exactly one of these.`,
-          `Your own recent record on this exact asset+tf: ${record.wins}W / ${record.losses}L settled, ${record.open} still open.`,
+          '',
+          `Your own recent calls on this exact asset+tf, most recent first (${graded.wins}W / ${graded.losses}L graded, ${graded.pending} still pending) - learn from these, this is YOUR track record:`,
+          graded.lines,
           '',
           "The desk's panel reads (second opinion, not a vote - see system instructions on when to defer to this vs override it):",
           snapshotLines,
@@ -536,7 +594,7 @@ export class AiTraderService {
         this.lastError = msg
         this.store.recordAiTraderDecision({
           asset, tf, direction: 'skip', confidence: 0, reasoning: `LLM call failed: ${msg}`,
-          snapshot, live: this.config.live, acted: false, error: msg, ts,
+          snapshot, live: this.config.live, acted: false, error: msg, priceAtDecision: price || undefined, ts,
         })
         this.emit('warn', `AI Trader cycle failed on ${asset} ${tf}: ${msg}`)
         return null
@@ -547,7 +605,7 @@ export class AiTraderService {
         this.lastError = 'model reply was not parseable JSON'
         this.store.recordAiTraderDecision({
           asset, tf, direction: 'skip', confidence: 0, reasoning: `unparseable model reply: ${content.slice(0, 300)}`,
-          snapshot, live: this.config.live, acted: false, provider, model, error: 'unparseable reply', ts,
+          snapshot, live: this.config.live, acted: false, provider, model, error: 'unparseable reply', priceAtDecision: price || undefined, ts,
         })
         this.emit('warn', `AI Trader got an unparseable reply on ${asset} ${tf} - treated as skip`)
         return null
@@ -594,7 +652,7 @@ export class AiTraderService {
       this.store.recordAiTraderDecision({
         asset, tf, direction, confidence: parsed.confidence, expiryMin: parsed.expiryMin,
         reasoning: parsed.reasoning, snapshot, live: this.config.live, acted, positionId: positionId ?? undefined,
-        provider, model, error: actionError, ts,
+        provider, model, error: actionError, priceAtDecision: price || undefined, ts,
       })
 
       const rows = this.store.listAiTraderDecisions(1)
