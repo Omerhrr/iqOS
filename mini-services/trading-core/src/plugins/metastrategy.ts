@@ -107,13 +107,25 @@ export class MetaStrategyService {
    * could drift from this one. Deliberately a curated subset, not the full
    * ~20-source buildScriptReads() map - candle/bar/line/area/tick/footprint/
    * tpo/ivHv etc are MSL script primitives, not independently decision-worthy
-   * panel reads on their own. */
+   * panel reads on their own.
+   *
+   * Includes EACH of the 15 individual SMC concepts on its own (FVG, Order
+   * Block, Breaker Block, Liquidity Sweep, BOS, CHoCH, OTE, KRM, Supply/
+   * Demand, Support/Resistance, Breakout, CRT, Power of 3, Silver Bullet),
+   * not just the aggregate smc/smcNow "did anything agree" reads above - per
+   * direct instruction ("what about all the smcs?"). The aggregate reads can
+   * hide a concept that's firing a cleaner read than whichever one happened
+   * to win the aggregate vote, so the AI Trader's desk gets to see each one
+   * by name, the same way Meta Trader's SMC_KIND_SOURCE can target one
+   * specific concept instead of only the "any" read. */
   snapshotSources(asset: string, tf: Timeframe): MetaSourceRead[] {
     const sources: MetaConditionSource[] = [
       'oracle', 'hmaRocBullBear', 'momentumScore', 'accute', 'renko',
       'smc', 'smcNow', 'renkoSmc', 'renkoSmcMajority', 'pointFigure', 'rangeBars',
     ]
-    return sources.map((s) => this.readSource(s, asset, tf))
+    const base = sources.map((s) => this.readSource(s, asset, tf))
+    const perSmcConcept = ALL_SMC_KINDS.map((kind) => this.readSource('smcNow', asset, tf, kind))
+    return [...base, ...perSmcConcept]
   }
 
   /** Save (or overwrite) a spec. Two ways to build one, per direct
