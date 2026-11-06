@@ -103,6 +103,55 @@ export interface NextExpiryStatsResponse {
   recent: ResolvedExpiry[]
 }
 
+// ---------- Next-Expiry Global: whole-universe board ----------
+// One best-expiry read per open instrument (the per-asset panel's engine,
+// TTL-cached per pair like plugins/nextcandle.ts's globalScan). Every
+// computed row goes through this.predict() and is therefore TRACKED by the
+// honesty loop - the board and the per-asset expiry panel share one
+// calibration ledger, so scanning more pairs calibrates every rung faster.
+// The board is deliberately tf-free: the expiry ladder is minute-native,
+// there is no per-board timeframe to pick.
+
+/** Board scan TTL - deliberately short: one prediction is single-digit ms,
+ * so a full-universe refresh is cheap, and the TTL keeps N simultaneous
+ * panels from fusing the same pair twice inside one window. */
+const GLOBAL_SCAN_TTL_MS = 15_000
+
+export interface NextExpiryGlobalRow {
+  asset: string
+  /** when this row's fused read was computed (0 = never, warming up) */
+  computedTs: number
+  /** true = a live best-pick read; false = thin/no 1m history on this pair yet */
+  ok: boolean
+  note: string
+  price: number
+  regime: string
+  session: string
+  /** OU reversion half-life in whole minutes (null = not mean-reverting now) */
+  halfLifeMin: number | null
+  /** the oracle's single recommendation for this pair - null when nothing
+   * cleared the floors (honest "wait", still a live row) */
+  best: { expiry: number; direction: 'call' | 'put'; pWin: number; confidence: number; edge: number } | null
+  /** mini per-rung strip for the board row: one slot per ladder expiry */
+  rungs: { expiry: number; ok: boolean; direction: 'call' | 'put' | 'none'; pWin: number; confidence: number }[]
+  /** how many rungs are live (ok) on this pair right now */
+  liveRungs: number
+  /** the best rung's own honesty record (null = uncalibrated pair) */
+  calibration: { n: number; hitRate: number; brier: number } | null
+  mode: 'sim' | 'live'
+}
+
+export interface NextExpiryGlobalResult {
+  scannedTs: number
+  universe: number
+  scanned: number
+  live: number
+  warming: number
+  /** refresh=1 forced every row's recompute, not just stale ones */
+  refreshed: number
+  rows: NextExpiryGlobalRow[]
+}
+
 export class NextExpiryService {
   private ctx!: KernelContext
   private market!: MarketDataService
@@ -281,6 +330,109 @@ export class NextExpiryService {
       expirySummary,
       driverWeightMultipliers: this.driverWeightMultipliers(),
       recent: this.resolved.slice(-40).reverse(),
+    }
+  }
+
+  // ---------- Next-Expiry Global: whole-universe scan ----------
+  // One fused per-expiry read per open instrument, TTL-cached per pair.
+  // Rows are recomputed lazily: a poll only refuses a row older than
+  // GLOBAL_SCAN_TTL_MS, so N panels polling cost one fusion per pair per
+  // TTL, not one per poll. WARMING rows are deliberately NOT cached - a
+  // thin pair fails fast (the engine's length gate), so recomputing it each
+  // poll is near-free and the row joins the board the moment its feed
+  // gains enough closed 1m history.
+
+  private scanRows = new Map<string, { row: NextExpiryGlobalRow; computedTs: number }>()
+
+  /** Single-pair board row - same TTL cache globalScan() reads, so a panel
+   * pinned to one pair and the board hit the same cache. */
+  rowFor(asset: string, priceHint: number, opts: { refresh?: boolean } = {}): NextExpiryGlobalRow {
+    const cached = this.scanRows.get(asset)
+    if (!opts.refresh && cached && Date.now() - cached.computedTs < GLOBAL_SCAN_TTL_MS) return cached.row
+    const pred = this.predict(asset)
+    if (!pred) {
+      // thin pair: no cache, honest warming note, zeroed geometry
+      this.scanRows.delete(asset)
+      return {
+        asset,
+        computedTs: 0,
+        ok: false,
+        note: `warming up - needs ${EXPIRY_ORACLE_MIN_CANDLES}+ closed 1m bars`,
+        price: priceHint,
+        regime: '',
+        session: '',
+        halfLifeMin: null,
+        best: null,
+        rungs: EXPIRIES_MIN.map((E) => ({ expiry: E, ok: false, direction: 'none' as const, pWin: 0.5, confidence: 0 })),
+        liveRungs: 0,
+        calibration: null,
+        mode: this.market.mode,
+      }
+    }
+    const bestRow = pred.rows.find((r) => r.expiry === pred.best?.expiry) ?? null
+    const row: NextExpiryGlobalRow = {
+      asset,
+      computedTs: Date.now(),
+      ok: true,
+      note: pred.note,
+      price: pred.price,
+      regime: pred.regime,
+      session: pred.session,
+      halfLifeMin: pred.halfLifeMin,
+      best: pred.best,
+      rungs: pred.rows.map((r) => ({
+        expiry: r.expiry,
+        ok: r.ok,
+        direction: r.direction,
+        pWin: r.pWin,
+        confidence: r.confidence,
+      })),
+      liveRungs: pred.rows.filter((r) => r.ok).length,
+      calibration: bestRow?.calibration ?? null,
+      mode: pred.mode,
+    }
+    this.scanRows.set(asset, { row, computedTs: row.computedTs })
+    if (this.scanRows.size > 400) {
+      // evict the stalest quarter - board entries for pairs nobody polls
+      const stale = [...this.scanRows.entries()].sort((a, b) => a[1].computedTs - b[1].computedTs).slice(0, 100)
+      for (const [k] of stale) this.scanRows.delete(k)
+    }
+    return row
+  }
+
+  globalScan(opts: { limit?: number; category?: string; refresh?: boolean } = {}): NextExpiryGlobalResult {
+    // NO silent truncation (same audit lesson plugins/nextcandle.ts's
+    // domGlobalScan learned): `limit` is a hard SAFETY CEILING only - when
+    // the caller omits it, the WHOLE open universe is scanned. Scanning is
+    // cheap here (single-digit ms per pair, TTL-cached).
+    const category = opts.category && opts.category !== 'all' ? opts.category : null
+    const universe = this.market.listAssets().filter((a) => a.open && (!category || a.category === category))
+    const limit = opts.limit !== undefined ? Math.max(1, Math.min(Math.round(opts.limit), 500)) : universe.length
+    const picked = universe.slice(0, limit)
+
+    let refreshed = 0
+    const rows: NextExpiryGlobalRow[] = []
+    for (const a of picked) {
+      const before = this.scanRows.get(a.ticker)?.computedTs ?? 0
+      const row = this.rowFor(a.ticker, a.price ?? 0, { refresh: opts.refresh === true })
+      if (row.computedTs !== 0 && row.computedTs !== before) refreshed++
+      rows.push(row)
+    }
+
+    // tradability sort: strongest edge first (the board's job is to surface
+    // "which pair, WHICH expiry"); honest "wait" rows rank below picks
+    const live = rows.filter((r) => r.ok)
+    live.sort((x, y) => (y.best?.edge ?? 0) - (x.best?.edge ?? 0))
+    const warming = rows.filter((r) => !r.ok)
+    warming.sort((a, b) => a.asset.localeCompare(b.asset))
+    return {
+      scannedTs: Date.now(),
+      universe: universe.length,
+      scanned: rows.length,
+      live: live.length,
+      warming: warming.length,
+      refreshed,
+      rows: [...live, ...warming],
     }
   }
 

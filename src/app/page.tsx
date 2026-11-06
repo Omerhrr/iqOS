@@ -23,6 +23,7 @@ import AdxPatternBiasPanel from '@/components/os/AdxPatternBiasPanel'
 import ShockPressurePanel from '@/components/os/ShockPressurePanel'
 import NextCandlePanel from '@/components/os/NextCandlePanel'
 import NextExpiryPanel from '@/components/os/NextExpiryPanel'
+import NextExpiryGlobalPanel from '@/components/os/NextExpiryGlobalPanel'
 import SmcRecentPanel from '@/components/os/SmcRecentPanel'
 import SmcGlobalPanel from '@/components/os/SmcGlobalPanel'
 import GlobalDomPanel from '@/components/os/GlobalDomPanel'
@@ -89,7 +90,7 @@ const INDICATOR_STORAGE_KEY = 'iqos.activeIndicators.v1'
 // @ Now", "Cointegration") out of the open strip entirely instead of just
 // closing it each time - it stays hidden across reloads until re-checked in
 // the Panels settings menu. Nothing is deleted, this only gates rendering.
-type PanelId = 'signals' | 'yday' | 'leadlag' | 'distill' | 'cointegration' | 'volarb' | 'triangulation' | 'adxPatternBias' | 'shockPressure' | 'renkoFootprint' | 'renkoFootprintOtc' | 'volumeFootprint' | 'tickVolume' | 'pairCompare' | 'pairSignal' | 'oracle' | 'nextExpiry' | 'nextGlobal' | 'tempo' | 'tempoGlobal' | 'accute' | 'accuteGlobal' | 'smcRecent' | 'smcGlobal' | 'globalDom'
+type PanelId = 'signals' | 'yday' | 'leadlag' | 'distill' | 'cointegration' | 'volarb' | 'triangulation' | 'adxPatternBias' | 'shockPressure' | 'renkoFootprint' | 'renkoFootprintOtc' | 'volumeFootprint' | 'tickVolume' | 'pairCompare' | 'pairSignal' | 'oracle' | 'nextExpiry' | 'nextExpiryGlobal' | 'nextGlobal' | 'tempo' | 'tempoGlobal' | 'accute' | 'accuteGlobal' | 'smcRecent' | 'smcGlobal' | 'globalDom'
 const PANEL_META: { id: PanelId; label: string }[] = [
   { id: 'signals', label: 'Chart Signals' },
   { id: 'yday', label: 'Yesterday @ Now' },
@@ -108,6 +109,7 @@ const PANEL_META: { id: PanelId; label: string }[] = [
   { id: 'pairSignal', label: 'Pair Signal' },
   { id: 'oracle', label: 'Next-Candle Oracle' },
   { id: 'nextExpiry', label: 'Next-Expiry Oracle' },
+  { id: 'nextExpiryGlobal', label: 'Next-Expiry Global' },
   { id: 'nextGlobal', label: 'Next Global' },
   { id: 'tempo', label: 'Tempo' },
   { id: 'tempoGlobal', label: 'Tempo Global' },
@@ -135,6 +137,7 @@ const DEFAULT_PANEL_VISIBILITY: Record<PanelId, boolean> = {
   pairSignal: true,
   oracle: true,
   nextExpiry: true,
+  nextExpiryGlobal: true,
   nextGlobal: true,
   tempo: true,
   tempoGlobal: true,
@@ -249,6 +252,7 @@ export default function OSPage() {
   const [shockPressureOpen, setShockPressureOpen] = useState(false)
   const [oracleOpen, setOracleOpen] = useState(false)
   const [nextExpiryOpen, setNextExpiryOpen] = useState(false)
+  const [nextExpiryGlobalOpen, setNextExpiryGlobalOpen] = useState(false)
   const [smcRecentOpen, setSmcRecentOpen] = useState(false)
   const [smcGlobalOpen, setSmcGlobalOpen] = useState(false)
   const [globalDomOpen, setGlobalDomOpen] = useState(false)
@@ -339,6 +343,7 @@ export default function OSPage() {
         else if (id === 'shockPressure') setShockPressureOpen(false)
         else if (id === 'oracle') setOracleOpen(false)
         else if (id === 'nextExpiry') setNextExpiryOpen(false)
+        else if (id === 'nextExpiryGlobal') setNextExpiryGlobalOpen(false)
         else if (id === 'smcRecent') setSmcRecentOpen(false)
         else if (id === 'smcGlobal') setSmcGlobalOpen(false)
         else if (id === 'globalDom') setGlobalDomOpen(false)
@@ -772,6 +777,7 @@ export default function OSPage() {
     setSmcGlobalOpen(false)
     setGlobalDomOpen(false)
     setNextExpiryOpen(false)
+    setNextExpiryGlobalOpen(false)
     setOracleOpen(true)
   }, [handleSelectAsset])
 
@@ -814,7 +820,17 @@ export default function OSPage() {
   const handleOpenNextExpiry = useCallback((a: string) => {
     handleSelectAsset(a)
     setOracleOpen(false)
+    setNextExpiryGlobalOpen(false)
     setNextExpiryOpen(true)
+  }, [handleSelectAsset])
+
+  // From the Next-Expiry panel's cross-nav button (or the strip): open the
+  // whole-universe best-expiry board.
+  const handleOpenNextExpiryGlobal = useCallback((a: string) => {
+    if (a) handleSelectAsset(a)
+    setOracleOpen(false)
+    setNextExpiryOpen(false)
+    setNextExpiryGlobalOpen(true)
   }, [handleSelectAsset])
 
   // Yesterday panel echo chip: deep-load this asset's candles (so the window
@@ -1264,7 +1280,7 @@ export default function OSPage() {
                 closed = the slim open strip sits above the market watch and
                 everything is laid out exactly as before. */}
             <Panel defaultSize={17} minSize={11}>
-              {signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen || shockPressureOpen || renkoFootprintOpen || renkoFootprintOtcOpen || volumeFootprintOpen || tickVolumeOpen || pairCompareOpen || pairSignalOpen || oracleOpen || nextExpiryOpen || smcRecentOpen || smcGlobalOpen || globalDomOpen || nextGlobalOpen || tempoOpen || tempoGlobalOpen || accuteOpen || accuteGlobalOpen ? (
+              {signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen || shockPressureOpen || renkoFootprintOpen || renkoFootprintOtcOpen || volumeFootprintOpen || tickVolumeOpen || pairCompareOpen || pairSignalOpen || oracleOpen || nextExpiryOpen || nextExpiryGlobalOpen || smcRecentOpen || smcGlobalOpen || globalDomOpen || nextGlobalOpen || tempoOpen || tempoGlobalOpen || accuteOpen || accuteGlobalOpen ? (
                 <div className="mr-0.5 h-full min-h-0">
                   {ydayOpen ? (
                     <YesterdayPanel onClose={() => setYdayOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onFocusWindow={handleFocusYesterday} />
@@ -1297,7 +1313,9 @@ export default function OSPage() {
                   ) : oracleOpen ? (
                     <NextCandlePanel onClose={() => setOracleOpen(false)} asset={asset} tf={tf} closedTick={closedTick} onOpenAccute={handleOpenAccute} onOpenTempo={handleOpenTempo} onOpenSmc={handleOpenSmc} onOpenNextExpiry={handleOpenNextExpiry} />
                   ) : nextExpiryOpen ? (
-                    <NextExpiryPanel onClose={() => setNextExpiryOpen(false)} asset={asset} closedTick={closedTick} onOpenOracle={handleOpenOracle} />
+                    <NextExpiryPanel onClose={() => setNextExpiryOpen(false)} asset={asset} closedTick={closedTick} onOpenOracle={handleOpenOracle} onOpenGlobal={() => handleOpenNextExpiryGlobal('')} />
+                  ) : nextExpiryGlobalOpen ? (
+                    <NextExpiryGlobalPanel onClose={() => setNextExpiryGlobalOpen(false)} closedTick={closedTick} onPickAsset={handleSelectAsset} onOpenNextExpiry={handleOpenNextExpiry} />
                   ) : globalDomOpen ? (
                     <GlobalDomPanel onClose={() => setGlobalDomOpen(false)} tf={tf} closedTick={closedTick} onPickAsset={handleSelectAsset} onOpenOracle={handleOpenOracle} onOpenAccute={handleOpenAccute} />
                   ) : smcGlobalOpen ? (
@@ -1386,6 +1404,18 @@ export default function OSPage() {
                       >
                         <span className="h-1.5 w-1.5 rounded-full bg-sky-300" />
                         Next-Expiry Oracle
+                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
+                      </button>
+                      )}
+                      {panelVisibility.nextExpiryGlobal && (
+                      <button
+                        type="button"
+                        onClick={() => handleOpenNextExpiryGlobal('')}
+                        title="next-expiry global - the whole universe ranked by expiry edge: one best-expiry pick per pair with its 5-rung strip, each read tracked by the honesty loop"
+                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-teal-500/40 hover:text-teal-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-teal-300" />
+                        Next-Expiry Global
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
                       )}

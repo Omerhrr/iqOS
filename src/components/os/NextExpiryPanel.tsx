@@ -29,6 +29,8 @@ interface NextExpiryPanelProps {
   onClose: () => void
   /** cross-nav: jump to the Next-Candle Oracle for this same asset */
   onOpenOracle?: (asset: string) => void
+  /** cross-nav: open the whole-universe Next-Expiry Global board */
+  onOpenGlobal?: () => void
 }
 
 const FALLBACK_POLL_MS = 15_000
@@ -194,7 +196,7 @@ function ResolutionRow({ r }: { r: NextExpiryStatsResponse['recent'][number] }) 
   )
 }
 
-export default function NextExpiryPanel({ asset, closedTick, onClose, onOpenOracle }: NextExpiryPanelProps) {
+export default function NextExpiryPanel({ asset, closedTick, onClose, onOpenOracle, onOpenGlobal }: NextExpiryPanelProps) {
   const [pred, setPred] = useState<NextExpiryPrediction | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [stats, setStats] = useState<NextExpiryStatsResponse | null>(null)
@@ -245,6 +247,16 @@ export default function NextExpiryPanel({ asset, closedTick, onClose, onOpenOrac
         <span className="h-1.5 w-1.5 rounded-full bg-sky-300" />
         <h3 className="font-mono text-[11px] font-bold uppercase tracking-wider text-[#dbe4f0]">Next-Expiry Oracle</h3>
         <span className="font-mono text-[9px] text-[#7c8aa5]">{asset} · 1m base</span>
+        {onOpenGlobal && (
+          <button
+            type="button"
+            onClick={() => onOpenGlobal()}
+            className={`rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-teal-500/40 hover:text-teal-300 ${onOpenOracle ? '' : 'ml-auto'}`}
+            title="open the Next-Expiry Global board - one best-expiry read per pair, ranked by edge"
+          >
+            → global
+          </button>
+        )}
         {onOpenOracle && (
           <button
             type="button"

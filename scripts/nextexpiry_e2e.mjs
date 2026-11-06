@@ -119,5 +119,40 @@ for (const r of s.body.recent ?? []) {
 ok('ledger rows internally consistent (hit math + brier band)', ledgerSane, JSON.stringify((s.body.recent ?? [])[0] ?? {}).slice(0, 200))
 ok('predictions registered on the ledger path', d2.status === 200 && (s.body.pending + s.body.total) >= 0)
 
+// ---------- /next_expiry_global board ----------
+const g = await get('/next_expiry_global')
+ok('board 200 + ok', g.status === 200 && g.body.ok === true, JSON.stringify(g.body).slice(0, 160))
+ok('board counters coherent', Number.isFinite(g.body.universe) && g.body.scanned === g.body.rows.length && g.body.live + g.body.warming === g.body.scanned, `universe=${g.body.universe} scanned=${g.body.scanned} live=${g.body.live} warming=${g.body.warming}`)
+ok('board scans the WHOLE universe (no silent truncation)', g.body.scanned === g.body.universe, `scanned=${g.body.scanned} vs universe=${g.body.universe}`)
+const gRows = g.body.rows ?? []
+const gLive = gRows.filter((r) => r.ok)
+const gWarming = gRows.filter((r) => !r.ok)
+ok('board has live rows after warmup', gLive.length >= 3, `live=${gLive.length}`)
+let boardSane = true
+for (const r of gRows) {
+  if (!Array.isArray(r.rungs) || r.rungs.map((x) => x.expiry).join(',') !== '1,2,3,5,15') boardSane = false
+  if (r.ok) {
+    if (!(Number.isFinite(r.price) && r.price > 0)) boardSane = false
+    if (!['TRENDING', 'RANGING', 'VOLATILE', 'MIXED'].includes(r.regime)) boardSane = false
+    if (r.best && !(r.best.pWin >= 0.56 && r.best.confidence >= 25 && ['call', 'put'].includes(r.best.direction))) boardSane = false
+    if (!Number.isFinite(r.liveRungs) || r.liveRungs < 1 || r.liveRungs > 5) boardSane = false
+  } else if (r.computedTs !== 0 || !/warming/.test(r.note ?? '')) {
+    boardSane = false
+  }
+}
+ok('board rows sane (rung ladder, live geometry, warming markers)', boardSane)
+let edgeSorted = true
+for (let i = 1; i < gLive.length; i++) if ((gLive[i - 1].best?.edge ?? 0) < (gLive[i].best?.edge ?? 0)) edgeSorted = false
+ok('board live rows sorted by edge descending', edgeSorted)
+ok('live rows precede warming rows', gWarming.length === 0 || gRows.findIndex((r) => r.ok) < gRows.indexOf(gWarming[0]))
+// TTL: immediate re-poll refreshes nothing; refresh=1 recomputes everything
+const g2 = await get('/next_expiry_global')
+ok('board TTL: immediate re-poll refreshes nothing', g2.body.refreshed === 0, `refreshed=${g2.body.refreshed}`)
+const g3 = await get('/next_expiry_global?refresh=1')
+ok('board refresh=1 recomputes the live board', g3.body.refreshed === g3.body.live && g3.body.refreshed > 0, `refreshed=${g3.body.refreshed} live=${g3.body.live}`)
+// category filter narrows the universe
+const gf = await get('/next_expiry_global?category=forex')
+ok('category filter narrows the scan', gf.body.ok === true && gf.body.universe <= g.body.universe && gf.body.scanned === gf.body.universe, `forex universe=${gf.body.universe} vs ${g.body.universe}`)
+
 console.log(`next_expiry e2e: ${pass} pass, ${fail} fail`)
 process.exit(fail === 0 ? 0 : 1)

@@ -2108,6 +2108,51 @@ export async function getNextExpiryStats(): Promise<NextExpiryStatsResponse> {
   return osGet('/next_expiry_stats', {})
 }
 
+/** One row of the Next-Expiry Global board - one best-expiry read per open
+ * instrument (plugins/nextexpiry.ts's NextExpiryGlobalRow). */
+export interface NextExpiryGlobalRow {
+  asset: string
+  /** when this row's fused read was computed (0 = never, warming up) */
+  computedTs: number
+  /** true = a live best-pick read; false = thin 1m history on this pair yet */
+  ok: boolean
+  note: string
+  price: number
+  regime: string
+  session: string
+  /** OU reversion half-life in whole minutes, null = not mean-reverting now */
+  halfLifeMin: number | null
+  /** the pair's single recommendation - null = honest "wait" (still live) */
+  best: { expiry: number; direction: 'call' | 'put'; pWin: number; confidence: number; edge: number } | null
+  /** mini per-rung strip: one slot per ladder expiry (1/2/3/5/15m) */
+  rungs: { expiry: number; ok: boolean; direction: 'call' | 'put' | 'none'; pWin: number; confidence: number }[]
+  /** how many rungs are live on this pair right now */
+  liveRungs: number
+  /** the best rung's own honesty record (null = uncalibrated pair) */
+  calibration: { n: number; hitRate: number; brier: number } | null
+  mode: 'sim' | 'live'
+}
+
+export interface NextExpiryGlobalResponse {
+  ok: boolean
+  error?: string
+  scannedTs: number
+  universe: number
+  scanned: number
+  live: number
+  warming: number
+  refreshed: number
+  rows: NextExpiryGlobalRow[]
+}
+
+export async function getNextExpiryGlobal(opts: { limit?: number; category?: string; refresh?: boolean } = {}): Promise<NextExpiryGlobalResponse> {
+  return osGet('/next_expiry_global', {
+    limit: opts.limit,
+    category: opts.category,
+    refresh: opts.refresh ? 1 : undefined,
+  })
+}
+
 /** One row of the Next Global board - the oracle's fused read for one
  * instrument, whole-universe scan (plugins/nextcandle.ts's GlobalScanRow). */
 export interface NextGlobalRow {

@@ -2934,6 +2934,27 @@ const httpServer = createServer(async (req, res) => {
         }
       }
 
+      // GET /next_expiry_global?category=all&refresh=1&limit=<safety ceiling>
+      // -> Next-Expiry Global: the WHOLE open universe (limit omitted = no
+      // truncation, same audit contract as /dom_global) with one fused
+      // best-expiry read per pair + its 5-rung mini strip. Rows are
+      // TTL-cached per pair and every read is tracked by the expiry
+      // oracle's honesty loop, so the board and the per-asset expiry panel
+      // share one calibration record.
+      if (path === '/next_expiry_global') {
+        try {
+          const svc = kernel.context().use<NextExpiryService>('nextexpiry')
+          const out = svc.globalScan({
+            limit: q.get('limit') ? Number(q.get('limit')) : undefined,
+            category: q.get('category') ?? 'all',
+            refresh: q.get('refresh') === '1',
+          })
+          return json(200, { ok: true, ...out })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
       // GET /next_global?tf=1m&limit=30&category=all&refresh=1
       // -> the Next Global board: one fused next-candle read per instrument
       // (open universe, category-filterable), rows sorted by tradability

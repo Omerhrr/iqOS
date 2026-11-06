@@ -207,5 +207,69 @@ const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFi
   svc.stop()
 }
 
+// ---------- 6. globalScan: board sort, TTL cache, refresh, warming rows ----------
+{
+  // isolate persistence for this service too (fresh temp dir #2)
+  process.chdir(mkdtempSync(join(tmpdir(), 'nextexpiry-unit-')))
+  const mk = (seed: number, drift: number) => walk(EXPIRY_ORACLE_MIN_CANDLES + 300, seed, 1.2, drift)
+  const series: Record<string, Candle[]> = {
+    EURUSD: mk(61, 0.00003),
+    GBPUSD: mk(62, -0.00004),
+    THIN1: mk(63, 0).slice(0, 100), // too thin for the engine
+  }
+  const market = {
+    mode: 'sim' as const,
+    getCandlesDeep: (asset: string) => series[asset] ?? [],
+    listAssets: () => [
+      { ticker: 'EURUSD', price: series.EURUSD[series.EURUSD.length - 1].close, open: true },
+      { ticker: 'GBPUSD', price: series.GBPUSD[series.GBPUSD.length - 1].close, open: true },
+      { ticker: 'THIN1', price: 1.0, open: true },
+    ],
+  }
+  const bus2 = new EventBus()
+  const ctx2 = {
+    bus: bus2,
+    services: new Map(),
+    provide: () => {},
+    use: () => market,
+    log: () => {},
+  } as unknown as KernelContext
+  const svc2 = new NextExpiryService()
+  await svc2.start(ctx2)
+
+  const scan1 = svc2.globalScan()
+  ok(scan1.scanned === 3 && scan1.universe === 3, 'board scans the whole open universe (no silent truncation)', `scanned=${scan1.scanned}`)
+  ok(scan1.live === 2 && scan1.warming === 1, 'live/warming split is honest', `live=${scan1.live} warming=${scan1.warming}`)
+  const liveRows = scan1.rows.filter((r) => r.ok)
+  const warmingRows = scan1.rows.filter((r) => !r.ok)
+  ok(warmingRows.length === 1 && warmingRows[0].asset === 'THIN1' && warmingRows[0].computedTs === 0 && /warming/.test(warmingRows[0].note), 'warming row carries computedTs=0 + warming note')
+  ok(warmingRows[0].rungs.length === 5 && warmingRows[0].rungs.every((r) => !r.ok), 'warming row still carries the full 5-rung strip')
+  // edge sort: non-increasing across live rows, live before warming
+  let sortedOk = true
+  for (let i = 1; i < liveRows.length; i++) if ((liveRows[i - 1].best?.edge ?? 0) < (liveRows[i].best?.edge ?? 0)) sortedOk = false
+  ok(sortedOk, 'live rows sorted by best edge descending')
+  ok(scan1.rows.findIndex((r) => r.ok) < scan1.rows.findIndex((r) => !r.ok) || scan1.warming === 0, 'live rows precede warming rows')
+  // row shape
+  const r0 = liveRows[0]
+  ok(r0.rungs.map((g) => g.expiry).join(',') === '1,2,3,5,15', 'board row rungs span the ladder')
+  ok(r0.best === null || (r0.best.pWin >= 0.56 && r0.best.confidence >= 25), 'board best pick clears floors (or honest wait)')
+  ok(['TRENDING', 'RANGING', 'VOLATILE', 'MIXED'].includes(r0.regime) && r0.session.length > 0, 'board row carries regime + session')
+
+  // TTL cache: immediate re-poll recomputes nothing
+  const scan2 = svc2.globalScan()
+  ok(scan2.refreshed === 0, 'TTL cache: immediate re-poll refreshes nothing', `refreshed=${scan2.refreshed}`)
+  ok(scan2.rows.find((r) => r.asset === 'EURUSD')?.computedTs === r0.computedTs, 'TTL cache: computedTs unchanged inside the TTL window')
+  // refresh=1 forces recompute of every live row
+  const scan3 = svc2.globalScan({ refresh: true })
+  ok(scan3.refreshed === scan3.live && scan3.refreshed > 0, 'refresh=1 forces every live row to recompute', `refreshed=${scan3.refreshed} live=${scan3.live}`)
+  ok(scan3.rows.find((r) => r.asset === 'EURUSD')!.computedTs > r0.computedTs, 'refresh=1 bumps computedTs')
+  // the board feeds the SAME honesty ledger as the per-asset panel
+  ok(svc2.stats().pending > 0, 'board scans register pending windows on the shared ledger')
+  // limit is a safety ceiling, not a truncation knob: limit=2 scans exactly 2
+  const scan4 = svc2.globalScan({ limit: 2 })
+  ok(scan4.scanned === 2 && scan4.universe === 3, 'explicit limit acts as a ceiling (2 of 3 scanned)')
+  svc2.stop()
+}
+
 console.log(`nextexpiry_unit: ${pass} pass, ${fail} fail`)
 process.exit(fail === 0 ? 0 : 1)
