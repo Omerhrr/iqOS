@@ -842,6 +842,18 @@ export class MarketDataService {
     } catch {
       /* mode plugin absent */
     }
+    try {
+      // THE FROZEN-CANDLE BUG (see AiTraderService.watchedAssets' comment):
+      // AI Trader's own scanned asset(s) were never kept warm here, so an
+      // asset that is only ever scanned by AI Trader (not charted, not on
+      // any bot/auto-trader watchlist) never got a live tick/candle - every
+      // cycle re-read the same frozen bars, which is why RSI/price/ATR can
+      // print IDENTICAL numbers for 30+ minutes straight.
+      const ai = this.ctx.use<{ watchedAssets?: () => string[] }>('aiTrader')
+      for (const a of ai?.watchedAssets?.() ?? []) push(a)
+    } catch {
+      /* ai-trader plugin absent */
+    }
     if (out.length > MAX_LIVE_POLL_ASSETS && Date.now() - this.warnedPollCap > 3_600_000) {
       this.warnedPollCap = Date.now()
       this.ctx.log('market-data', `live poll capped at ${MAX_LIVE_POLL_ASSETS} assets - ${out.length - MAX_LIVE_POLL_ASSETS} watchlist pair(s) beyond the cap get no live candles`)

@@ -461,6 +461,28 @@ export class AiTraderService {
     return this.config
   }
 
+  /** THE FROZEN-CANDLE BUG: market-data's live poll only ever kept the
+   * CHARTED asset + enabled bots' watchlists + the os-mode auto-trader's
+   * watchlist warm with real broker ticks/candles (see livePollAssets() in
+   * market-data.ts) - AI Trader's own scanned asset(s) were never added to
+   * that set. If US2000 (or whatever AI Trader is pointed at) isn't also
+   * charted or on one of those other watchlists, its candle series never
+   * receives a fresh bar: every cycle re-reads the exact same stale closes,
+   * so RSI/EMA/the "price ripped from 2836 to 2860" narrative/ATR all read
+   * IDENTICAL cycle after cycle (and if whatever bar happened to be sitting
+   * in that frozen window was itself a feed glitch, it never ages out of
+   * the ATR(14) window either - compounding the earlier 500%-ATR symptom).
+   * Exposed here so market-data can pull it in without a circular import -
+   * disabled AI Trader or an enabled-but-empty scan returns nothing to add. */
+  watchedAssets(): string[] {
+    if (!this.config.enabled) return []
+    try {
+      return this.buildCandidateList().slice(0, this.config.maxScanPerCycle)
+    } catch {
+      return [this.config.asset]
+    }
+  }
+
   listDecisions(limit = 100): AiTraderDecision[] {
     return this.store.listAiTraderDecisions(limit) as AiTraderDecision[]
   }
