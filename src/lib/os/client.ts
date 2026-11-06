@@ -1996,6 +1996,118 @@ export async function getNextCandleStats(): Promise<NextCandleStatsResponse> {
   return osGet('/next_candle_stats', {})
 }
 
+// ---------- Next-Expiry Oracle (analytics/nextexpiry.ts, plugins/nextexpiry.ts) ----------
+
+export type OracleSessionName = 'ASIA' | 'LONDON' | 'OVERLAP' | 'NEWYORK' | 'OFF' | 'OTC'
+
+/** One horizon model inside a single expiry's fusion. */
+export interface ExpiryDriver {
+  name: string
+  /** the model's own read of P(close E minutes ahead > spot) */
+  pUp: number
+  weight: number
+  /** signed -1..+1 convenience read */
+  vote: number
+  /** one-line human explanation of what the model sees at THIS expiry */
+  detail: string
+}
+
+/** One expiry rung (1/2/3/5/15 min) of the Next-Expiry Oracle's ladder. */
+export interface ExpiryRow {
+  expiry: number
+  /** false = this horizon's models are still warming up - never a recommendation */
+  ok: boolean
+  note: string
+  pUp: number
+  direction: 'call' | 'put' | 'none'
+  /** probability the RECOMMENDED direction wins = max(pUp, 1-pUp) */
+  pWin: number
+  /** 0..100 calibrated confidence (own per-(asset,expiry) record applied) */
+  confidence: number
+  rawConfidence: number
+  /** tradability score the best pick is ranked on */
+  edge: number
+  /** 0..1 - how far this horizon's variance ratio sits from a random walk */
+  predictability: number
+  expectedMove: number
+  cone: { low: number; high: number }
+  drivers: ExpiryDriver[]
+  driversActive: number
+  calibration: { n: number; hitRate: number; brier: number } | null
+  /** 1m bar-open timestamp (seconds) whose close resolves this window */
+  targetBarTime: number
+}
+
+export interface NextExpiryPrediction {
+  asset: string
+  ts: number
+  mode: 'sim' | 'live'
+  /** spot = last closed 1m close - the entry every row is measured from */
+  price: number
+  regime: OracleRegime
+  session: OracleSessionName
+  /** OU reversion half-life in whole minutes (the expiry compass), null
+   * when the pair isn't mean-reverting enough to have one */
+  halfLifeMin: number | null
+  rows: ExpiryRow[]
+  best: { expiry: number; direction: 'call' | 'put'; pWin: number; confidence: number; edge: number } | null
+  note: string
+  calibrationTotal: { n: number; hitRate: number; brier: number } | null
+}
+
+/** One resolved window from the expiry oracle's honesty ledger. */
+export interface ExpiryRecentResolution {
+  asset: string
+  expiry: number
+  targetBarTime: number
+  issuedTs: number
+  resolvedTs: number
+  predicted: 'call' | 'put'
+  pUp: number
+  confidence: number
+  entry: number
+  exit: number
+  actual: 'up' | 'down' | 'flat'
+  hit: boolean
+  score: number
+  brier: number
+}
+
+export interface NextExpiryStatsResponse {
+  ok: boolean
+  error?: string
+  total: number
+  pending: number
+  /** per (asset, expiry) honesty records */
+  records: {
+    asset: string
+    expiry: number
+    n: number
+    hitRate: number
+    brier: number
+    streak: number
+  }[]
+  /** universe-wide per-expiry summary - which rung of the ladder actually
+   * pays across every pair the oracle has resolved */
+  expirySummary: {
+    expiry: number
+    n: number
+    hitRate: number
+    brier: number
+  }[]
+  /** learned per-driver win-rate multipliers keyed by String(expiry) */
+  driverWeightMultipliers: Record<string, Record<string, number>>
+  recent: ExpiryRecentResolution[]
+}
+
+export async function getNextExpiry(asset: string): Promise<{ ok: boolean; prediction?: NextExpiryPrediction; error?: string }> {
+  return osGet('/next_expiry', { asset })
+}
+
+export async function getNextExpiryStats(): Promise<NextExpiryStatsResponse> {
+  return osGet('/next_expiry_stats', {})
+}
+
 /** One row of the Next Global board - the oracle's fused read for one
  * instrument, whole-universe scan (plugins/nextcandle.ts's GlobalScanRow). */
 export interface NextGlobalRow {

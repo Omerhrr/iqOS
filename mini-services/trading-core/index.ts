@@ -45,6 +45,7 @@ import { metaTraderPlugin, MetaTraderService } from './src/plugins/metatrader'
 import { META_CONDITION_SOURCES } from './src/analytics/metastrategy'
 import { yesterdayPlugin, YesterdayService } from './src/plugins/yesterday'
 import { nextCandlePlugin, NextCandleService } from './src/plugins/nextcandle'
+import { nextExpiryPlugin, NextExpiryService, EXPIRY_ORACLE_MIN_CANDLES } from './src/plugins/nextexpiry'
 import { adxHonestyPlugin, AdxHonestyService } from './src/plugins/adxhonesty'
 import { tempoPlugin, TempoService } from './src/plugins/tempo'
 import { accutePlugin, AccuteService } from './src/plugins/accute'
@@ -212,6 +213,7 @@ kernel.register(metaStrategyPlugin)
 kernel.register(aiTraderPlugin)
 kernel.register(yesterdayPlugin)
 kernel.register(nextCandlePlugin)
+kernel.register(nextExpiryPlugin)
 kernel.register(tempoPlugin)
 kernel.register(adxHonestyPlugin)
 kernel.register(accutePlugin)
@@ -2898,6 +2900,34 @@ const httpServer = createServer(async (req, res) => {
       if (path === '/next_candle_stats') {
         try {
           const svc = kernel.context().use<NextCandleService>('nextcandle')
+          return json(200, { ok: true, ...svc.stats() })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // ---------- Next-Expiry Oracle ----------
+      // GET /next_expiry?asset=X -> per-expiry fused reads (1/2/3/5/15 min)
+      // + the single best-expiry pick, tracked by its own honesty loop.
+      // Always runs on closed 1m candles regardless of the chart's tf -
+      // the expiry ladder is minute-native (see analytics/nextexpiry.ts).
+      if (path === '/next_expiry') {
+        try {
+          const svc = kernel.context().use<NextExpiryService>('nextexpiry')
+          const neAsset = String(q.get('asset') ?? market.activeAsset)
+          const pred = svc.predict(neAsset)
+          if (!pred) return json(200, { ok: false, error: `not enough closed 1m history on ${neAsset} for the expiry oracle (needs ${EXPIRY_ORACLE_MIN_CANDLES}+ bars)` })
+          return json(200, { ok: true, prediction: pred })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // GET /next_expiry_stats -> the expiry oracle's resolved honesty ledger
+      // (per asset:expiry records + universe-wide per-expiry summary).
+      if (path === '/next_expiry_stats') {
+        try {
+          const svc = kernel.context().use<NextExpiryService>('nextexpiry')
           return json(200, { ok: true, ...svc.stats() })
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })

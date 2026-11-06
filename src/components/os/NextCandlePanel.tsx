@@ -28,6 +28,10 @@ interface NextCandlePanelProps {
   onOpenTempo?: (asset: string) => void
   /** cross-nav: jump straight to the SMC Recent panel for this same asset */
   onOpenSmc?: (asset: string) => void
+  /** cross-nav: jump straight to the sibling Next-Expiry Oracle for this
+   * same asset - the candle read says which way the next bar leans, the
+   * expiry read says WHICH expiry to take */
+  onOpenNextExpiry?: (asset: string) => void
 }
 
 const FALLBACK_POLL_MS = 15_000
@@ -446,7 +450,7 @@ function ResolutionRow({ r }: { r: OracleRecentResolution }) {
   )
 }
 
-export default function NextCandlePanel({ asset, tf, closedTick, onClose, onOpenAccute, onOpenTempo, onOpenSmc }: NextCandlePanelProps) {
+export default function NextCandlePanel({ asset, tf, closedTick, onClose, onOpenAccute, onOpenTempo, onOpenSmc, onOpenNextExpiry }: NextCandlePanelProps) {
   const [pred, setPred] = useState<NextCandlePrediction | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [stats, setStats] = useState<NextCandleStatsResponse | null>(null)
@@ -502,11 +506,21 @@ export default function NextCandlePanel({ asset, tf, closedTick, onClose, onOpen
             → accute
           </button>
         )}
+        {onOpenNextExpiry && (
+          <button
+            type="button"
+            onClick={() => onOpenNextExpiry(asset)}
+            className={`rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-sky-500/40 hover:text-sky-300 ${onOpenAccute || onOpenTempo || onOpenSmc ? '' : 'ml-auto'}`}
+            title="open the Next-Expiry Oracle for this asset - which of the 1/2/3/5/15m expiries to take"
+          >
+            → expiry
+          </button>
+        )}
         {onOpenSmc && (
           <button
             type="button"
             onClick={() => onOpenSmc(asset)}
-            className={`rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-cyan-500/40 hover:text-cyan-300 ${onOpenTempo || onOpenAccute ? '' : 'ml-auto'}`}
+            className={`rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-cyan-500/40 hover:text-cyan-300 ${onOpenTempo || onOpenAccute || onOpenNextExpiry ? '' : 'ml-auto'}`}
             title="open SMC Recent for this asset"
           >
             → smc
@@ -515,7 +529,7 @@ export default function NextCandlePanel({ asset, tf, closedTick, onClose, onOpen
         <button
           type="button"
           onClick={onClose}
-          className={`rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-rose-500/40 hover:text-rose-300 ${onOpenAccute || onOpenTempo || onOpenSmc ? '' : 'ml-auto'}`}
+          className={`rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-rose-500/40 hover:text-rose-300 ${onOpenAccute || onOpenTempo || onOpenSmc || onOpenNextExpiry ? '' : 'ml-auto'}`}
         >
           close
         </button>

@@ -36,6 +36,10 @@ echo "--- nan_ingest_unit (bun, in-process)"
 bun scripts/nan_ingest_unit.ts 2>&1 | tail -1 || rc=1
 echo "--- msl_unit (bun, in-process)"
 bun scripts/msl_unit.ts 2>&1 | tail -1 || rc=1
+echo "--- nextexpiry_unit (bun, in-process)"
+bun scripts/nextexpiry_unit.ts 2>&1 | tail -1 || rc=1
+echo "--- nextexpiry_e2e (node, HTTP)"
+node scripts/nextexpiry_e2e.mjs 2>&1 | tail -4 || rc=1
 echo "--- yesterday_e2e (node, HTTP)"
 node scripts/yesterday_e2e.mjs 2>&1 | tail -3 || rc=1
 echo "--- classweek_smoke (node, HTTP)"
