@@ -46,6 +46,8 @@ import { META_CONDITION_SOURCES } from './src/analytics/metastrategy'
 import { yesterdayPlugin, YesterdayService } from './src/plugins/yesterday'
 import { nextCandlePlugin, NextCandleService } from './src/plugins/nextcandle'
 import { nextExpiryPlugin, NextExpiryService, EXPIRY_ORACLE_MIN_CANDLES } from './src/plugins/nextexpiry'
+import { technicalPlugin, TechnicalService } from './src/plugins/technical'
+import { reversalPlugin, ReversalService } from './src/plugins/reversal'
 import { adxHonestyPlugin, AdxHonestyService } from './src/plugins/adxhonesty'
 import { tempoPlugin, TempoService } from './src/plugins/tempo'
 import { accutePlugin, AccuteService } from './src/plugins/accute'
@@ -214,6 +216,8 @@ kernel.register(aiTraderPlugin)
 kernel.register(yesterdayPlugin)
 kernel.register(nextCandlePlugin)
 kernel.register(nextExpiryPlugin)
+kernel.register(technicalPlugin)
+kernel.register(reversalPlugin)
 kernel.register(tempoPlugin)
 kernel.register(adxHonestyPlugin)
 kernel.register(accutePlugin)
@@ -2944,6 +2948,78 @@ const httpServer = createServer(async (req, res) => {
       if (path === '/next_expiry_global') {
         try {
           const svc = kernel.context().use<NextExpiryService>('nextexpiry')
+          const out = svc.globalScan({
+            limit: q.get('limit') ? Number(q.get('limit')) : undefined,
+            category: q.get('category') ?? 'all',
+            refresh: q.get('refresh') === '1',
+          })
+          return json(200, { ok: true, ...out })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // GET /technical?asset=X -> the Technical Summary: investing.com-style
+      // oscillator + moving-average vote panels condensed into STRONG BUY /
+      // BUY / NEUTRAL / SELL / STRONG SELL at EVERY rung of the
+      // 1s/2s/3s/5s/15s/30s/1m/2m/3m/5m ladder (analytics/technicals.ts).
+      // Seconds rungs are built from the raw tick buffer, 3m is aggregated
+      // from 3 x 1m - every rung discloses its data source.
+      if (path === '/technical') {
+        try {
+          const svc = kernel.context().use<TechnicalService>('technical')
+          const tAsset = String(q.get('asset') ?? market.activeAsset)
+          const sum = svc.summaryFor(tAsset)
+          if (!sum) return json(200, { ok: false, error: `unknown asset ${tAsset} - no technical read` })
+          return json(200, { ok: true, summary: sum })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // GET /technical_global?category=all&refresh=1&limit=<safety ceiling>
+      // -> Technical Global: the WHOLE open universe with one cross-TF
+      // consensus verdict per pair + its 10-rung mini strip, TTL-cached and
+      // sorted by conviction (|score| first). No honesty ledger by design -
+      // the engine emits disclosed vote counts, not pWin predictions.
+      if (path === '/technical_global') {
+        try {
+          const svc = kernel.context().use<TechnicalService>('technical')
+          const out = svc.globalScan({
+            limit: q.get('limit') ? Number(q.get('limit')) : undefined,
+            category: q.get('category') ?? 'all',
+            refresh: q.get('refresh') === '1',
+          })
+          return json(200, { ok: true, ...out })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // GET /reversal?asset=X -> the Reversal panel: per-rung
+      // calm / forming / REVERSING NOW / confirmed reads from 7 fail-closed
+      // detectors (RSI hook, stoch cross, the OS's own candle-pattern
+      // library, Bollinger re-entry, divergence, run exhaustion, stretch
+      // fade) - analytics/reversal.ts.
+      if (path === '/reversal') {
+        try {
+          const svc = kernel.context().use<ReversalService>('reversal')
+          const rAsset = String(q.get('asset') ?? market.activeAsset)
+          const sum = svc.readFor(rAsset)
+          if (!sum) return json(200, { ok: false, error: `unknown asset ${rAsset} - no reversal read` })
+          return json(200, { ok: true, summary: sum })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // GET /reversal_global?category=all&refresh=1&limit=<safety ceiling>
+      // -> Reversal Global: the whole universe ranked by urgency
+      // (reversing now > confirmed > forming > calm, then |score|), each
+      // row with its 10-rung state strip. TTL-cached per pair.
+      if (path === '/reversal_global') {
+        try {
+          const svc = kernel.context().use<ReversalService>('reversal')
           const out = svc.globalScan({
             limit: q.get('limit') ? Number(q.get('limit')) : undefined,
             category: q.get('category') ?? 'all',

@@ -2159,6 +2159,162 @@ export async function getNextExpiryGlobal(opts: { limit?: number; category?: str
   })
 }
 
+// ---------- Technical Summary + Reversal (analytics/technicals.ts +
+// analytics/reversal.ts, plugins/technical.ts, plugins/reversal.ts) ----------
+// investing.com-style per-timeframe technical summary + a dedicated
+// reversal-state engine, both over the same 10-rung ladder
+// (1s/2s/3s tick-built, 5s/15s/30s/1m/2m/5m native, 3m aggregated from 1m).
+
+export type TechVerdictLabel = 'STRONG BUY' | 'BUY' | 'NEUTRAL' | 'SELL' | 'STRONG SELL'
+export type ReversalState = 'calm' | 'forming' | 'reversing' | 'confirmed'
+
+export interface TechVote {
+  name: string
+  read: 'buy' | 'sell' | 'neutral' | 'na'
+  value: string
+}
+
+export interface TechVerdict {
+  label: TechVerdictLabel
+  score: number
+  buys: number
+  sells: number
+  neutrals: number
+  counted: number
+}
+
+export interface TechTfRow {
+  tf: string
+  sec: number
+  source: 'ticks' | 'native' | 'agg1m'
+  ok: boolean
+  note: string
+  bars: number
+  ticksPerBar: number | null
+  osc: TechVote[]
+  oscSummary: TechVerdict
+  mas: TechVote[]
+  maSummary: TechVerdict
+  summary: TechVerdict
+}
+
+export interface TechnicalSummary {
+  asset: string
+  ts: number
+  mode: 'sim' | 'live'
+  price: number
+  rows: TechTfRow[]
+  overall: TechVerdict
+  direction: 'call' | 'put' | 'none'
+  note: string
+}
+
+export async function getTechnical(asset: string): Promise<{ ok: boolean; summary?: TechnicalSummary; error?: string }> {
+  return osGet('/technical', { asset })
+}
+
+export interface TechnicalGlobalRow {
+  asset: string
+  price: number
+  computedTs: number
+  ok: boolean
+  note: string
+  mode: 'sim' | 'live'
+  overall: TechVerdict
+  direction: 'call' | 'put' | 'none'
+  cells: { tf: string; ok: boolean; label: TechVerdictLabel; score: number }[]
+  strongest: { tf: string; label: TechVerdictLabel; score: number } | null
+}
+
+export interface TechnicalGlobalResponse {
+  ok: boolean
+  error?: string
+  scannedTs: number
+  universe: number
+  scanned: number
+  live: number
+  warming: number
+  refreshed: number
+  rows: TechnicalGlobalRow[]
+}
+
+export async function getTechnicalGlobal(opts: { limit?: number; category?: string; refresh?: boolean } = {}): Promise<TechnicalGlobalResponse> {
+  return osGet('/technical_global', {
+    limit: opts.limit,
+    category: opts.category,
+    refresh: opts.refresh ? 1 : undefined,
+  })
+}
+
+export interface ReversalReason {
+  detector: string
+  dir: 'up' | 'down'
+  weight: number
+  note: string
+}
+
+export interface ReversalTfRow {
+  tf: string
+  sec: number
+  source: 'ticks' | 'native' | 'agg1m'
+  ok: boolean
+  note: string
+  bars: number
+  ticksPerBar: number | null
+  state: ReversalState
+  direction: 'up' | 'down' | 'none'
+  score: number
+  reasons: ReversalReason[]
+}
+
+export interface ReversalSummary {
+  asset: string
+  ts: number
+  mode: 'sim' | 'live'
+  price: number
+  rows: ReversalTfRow[]
+  best: { tf: string; state: ReversalState; direction: 'up' | 'down'; score: number } | null
+  note: string
+}
+
+export async function getReversal(asset: string): Promise<{ ok: boolean; summary?: ReversalSummary; error?: string }> {
+  return osGet('/reversal', { asset })
+}
+
+export interface ReversalGlobalRow {
+  asset: string
+  price: number
+  computedTs: number
+  ok: boolean
+  note: string
+  mode: 'sim' | 'live'
+  best: { tf: string; state: ReversalState; direction: 'up' | 'down'; score: number } | null
+  state: ReversalState
+  direction: 'up' | 'down' | 'none'
+  score: number
+  cells: { tf: string; ok: boolean; state: ReversalState; direction: string; score: number }[]
+}
+
+export interface ReversalGlobalResponse {
+  ok: boolean
+  error?: string
+  scannedTs: number
+  universe: number
+  scanned: number
+  live: number
+  warming: number
+  refreshed: number
+  rows: ReversalGlobalRow[]
+}
+
+export async function getReversalGlobal(opts: { limit?: number; category?: string; refresh?: boolean } = {}): Promise<ReversalGlobalResponse> {
+  return osGet('/reversal_global', {
+    limit: opts.limit,
+    category: opts.category,
+    refresh: opts.refresh ? 1 : undefined,
+  })
+}
+
 /** One row of the Next Global board - the oracle's fused read for one
  * instrument, whole-universe scan (plugins/nextcandle.ts's GlobalScanRow). */
 export interface NextGlobalRow {

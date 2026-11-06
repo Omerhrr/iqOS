@@ -24,6 +24,10 @@ import ShockPressurePanel from '@/components/os/ShockPressurePanel'
 import NextCandlePanel from '@/components/os/NextCandlePanel'
 import NextExpiryPanel from '@/components/os/NextExpiryPanel'
 import NextExpiryGlobalPanel from '@/components/os/NextExpiryGlobalPanel'
+import TechnicalPanel from '@/components/os/TechnicalPanel'
+import TechnicalGlobalPanel from '@/components/os/TechnicalGlobalPanel'
+import ReversalPanel from '@/components/os/ReversalPanel'
+import ReversalGlobalPanel from '@/components/os/ReversalGlobalPanel'
 import SmcRecentPanel from '@/components/os/SmcRecentPanel'
 import SmcGlobalPanel from '@/components/os/SmcGlobalPanel'
 import GlobalDomPanel from '@/components/os/GlobalDomPanel'
@@ -90,7 +94,7 @@ const INDICATOR_STORAGE_KEY = 'iqos.activeIndicators.v1'
 // @ Now", "Cointegration") out of the open strip entirely instead of just
 // closing it each time - it stays hidden across reloads until re-checked in
 // the Panels settings menu. Nothing is deleted, this only gates rendering.
-type PanelId = 'signals' | 'yday' | 'leadlag' | 'distill' | 'cointegration' | 'volarb' | 'triangulation' | 'adxPatternBias' | 'shockPressure' | 'renkoFootprint' | 'renkoFootprintOtc' | 'volumeFootprint' | 'tickVolume' | 'pairCompare' | 'pairSignal' | 'oracle' | 'nextExpiry' | 'nextExpiryGlobal' | 'nextGlobal' | 'tempo' | 'tempoGlobal' | 'accute' | 'accuteGlobal' | 'smcRecent' | 'smcGlobal' | 'globalDom'
+type PanelId = 'signals' | 'yday' | 'leadlag' | 'distill' | 'cointegration' | 'volarb' | 'triangulation' | 'adxPatternBias' | 'shockPressure' | 'renkoFootprint' | 'renkoFootprintOtc' | 'volumeFootprint' | 'tickVolume' | 'pairCompare' | 'pairSignal' | 'oracle' | 'nextExpiry' | 'nextExpiryGlobal' | 'technical' | 'technicalGlobal' | 'reversal' | 'reversalGlobal' | 'nextGlobal' | 'tempo' | 'tempoGlobal' | 'accute' | 'accuteGlobal' | 'smcRecent' | 'smcGlobal' | 'globalDom'
 const PANEL_META: { id: PanelId; label: string }[] = [
   { id: 'signals', label: 'Chart Signals' },
   { id: 'yday', label: 'Yesterday @ Now' },
@@ -110,6 +114,10 @@ const PANEL_META: { id: PanelId; label: string }[] = [
   { id: 'oracle', label: 'Next-Candle Oracle' },
   { id: 'nextExpiry', label: 'Next-Expiry Oracle' },
   { id: 'nextExpiryGlobal', label: 'Next-Expiry Global' },
+  { id: 'technical', label: 'Technical' },
+  { id: 'technicalGlobal', label: 'Technical Global' },
+  { id: 'reversal', label: 'Reversal' },
+  { id: 'reversalGlobal', label: 'Reversal Global' },
   { id: 'nextGlobal', label: 'Next Global' },
   { id: 'tempo', label: 'Tempo' },
   { id: 'tempoGlobal', label: 'Tempo Global' },
@@ -138,6 +146,10 @@ const DEFAULT_PANEL_VISIBILITY: Record<PanelId, boolean> = {
   oracle: true,
   nextExpiry: true,
   nextExpiryGlobal: true,
+  technical: true,
+  technicalGlobal: true,
+  reversal: true,
+  reversalGlobal: true,
   nextGlobal: true,
   tempo: true,
   tempoGlobal: true,
@@ -253,6 +265,10 @@ export default function OSPage() {
   const [oracleOpen, setOracleOpen] = useState(false)
   const [nextExpiryOpen, setNextExpiryOpen] = useState(false)
   const [nextExpiryGlobalOpen, setNextExpiryGlobalOpen] = useState(false)
+  const [technicalOpen, setTechnicalOpen] = useState(false)
+  const [technicalGlobalOpen, setTechnicalGlobalOpen] = useState(false)
+  const [reversalOpen, setReversalOpen] = useState(false)
+  const [reversalGlobalOpen, setReversalGlobalOpen] = useState(false)
   const [smcRecentOpen, setSmcRecentOpen] = useState(false)
   const [smcGlobalOpen, setSmcGlobalOpen] = useState(false)
   const [globalDomOpen, setGlobalDomOpen] = useState(false)
@@ -344,6 +360,10 @@ export default function OSPage() {
         else if (id === 'oracle') setOracleOpen(false)
         else if (id === 'nextExpiry') setNextExpiryOpen(false)
         else if (id === 'nextExpiryGlobal') setNextExpiryGlobalOpen(false)
+        else if (id === 'technical') setTechnicalOpen(false)
+        else if (id === 'technicalGlobal') setTechnicalGlobalOpen(false)
+        else if (id === 'reversal') setReversalOpen(false)
+        else if (id === 'reversalGlobal') setReversalGlobalOpen(false)
         else if (id === 'smcRecent') setSmcRecentOpen(false)
         else if (id === 'smcGlobal') setSmcGlobalOpen(false)
         else if (id === 'globalDom') setGlobalDomOpen(false)
@@ -833,6 +853,45 @@ export default function OSPage() {
     setNextExpiryGlobalOpen(true)
   }, [handleSelectAsset])
 
+  // From the Technical panel's cross-nav button (or the strip): the
+  // investing.com-style per-timeframe technical summary for the chart's
+  // pair (or a Technical Global row's pair).
+  const handleOpenTechnical = useCallback((a: string) => {
+    handleSelectAsset(a)
+    setTechnicalGlobalOpen(false)
+    setReversalOpen(false)
+    setOracleOpen(false)
+    setNextExpiryOpen(false)
+    setTechnicalOpen(true)
+  }, [handleSelectAsset])
+
+  // From the Technical panel's cross-nav button (or the strip): open the
+  // whole-universe technical consensus board.
+  const handleOpenTechnicalGlobal = useCallback(() => {
+    setTechnicalOpen(false)
+    setReversalGlobalOpen(false)
+    setTechnicalGlobalOpen(true)
+  }, [])
+
+  // From the Reversal panel's cross-nav button (or a Reversal Global row):
+  // the "is a timeframe turning RIGHT NOW" radar for the chart's pair.
+  const handleOpenReversal = useCallback((a: string) => {
+    handleSelectAsset(a)
+    setReversalGlobalOpen(false)
+    setTechnicalOpen(false)
+    setOracleOpen(false)
+    setNextExpiryOpen(false)
+    setReversalOpen(true)
+  }, [handleSelectAsset])
+
+  // From the Reversal panel's cross-nav button (or the strip): the
+  // whole-universe reversal-urgency board.
+  const handleOpenReversalGlobal = useCallback(() => {
+    setReversalOpen(false)
+    setTechnicalGlobalOpen(false)
+    setReversalGlobalOpen(true)
+  }, [])
+
   // Yesterday panel echo chip: deep-load this asset's candles (so the window
   // has remembered bars behind it) and scroll the chart onto yesterday's
   // lead-in plus the forward replay window - the script the rhyme score is
@@ -1280,7 +1339,7 @@ export default function OSPage() {
                 closed = the slim open strip sits above the market watch and
                 everything is laid out exactly as before. */}
             <Panel defaultSize={17} minSize={11}>
-              {signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen || shockPressureOpen || renkoFootprintOpen || renkoFootprintOtcOpen || volumeFootprintOpen || tickVolumeOpen || pairCompareOpen || pairSignalOpen || oracleOpen || nextExpiryOpen || nextExpiryGlobalOpen || smcRecentOpen || smcGlobalOpen || globalDomOpen || nextGlobalOpen || tempoOpen || tempoGlobalOpen || accuteOpen || accuteGlobalOpen ? (
+              {signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen || shockPressureOpen || renkoFootprintOpen || renkoFootprintOtcOpen || volumeFootprintOpen || tickVolumeOpen || pairCompareOpen || pairSignalOpen || oracleOpen || nextExpiryOpen || nextExpiryGlobalOpen || technicalOpen || technicalGlobalOpen || reversalOpen || reversalGlobalOpen || smcRecentOpen || smcGlobalOpen || globalDomOpen || nextGlobalOpen || tempoOpen || tempoGlobalOpen || accuteOpen || accuteGlobalOpen ? (
                 <div className="mr-0.5 h-full min-h-0">
                   {ydayOpen ? (
                     <YesterdayPanel onClose={() => setYdayOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onFocusWindow={handleFocusYesterday} />
@@ -1316,6 +1375,14 @@ export default function OSPage() {
                     <NextExpiryPanel onClose={() => setNextExpiryOpen(false)} asset={asset} closedTick={closedTick} onOpenOracle={handleOpenOracle} onOpenGlobal={() => handleOpenNextExpiryGlobal('')} />
                   ) : nextExpiryGlobalOpen ? (
                     <NextExpiryGlobalPanel onClose={() => setNextExpiryGlobalOpen(false)} closedTick={closedTick} onPickAsset={handleSelectAsset} onOpenNextExpiry={handleOpenNextExpiry} />
+                  ) : technicalOpen ? (
+                    <TechnicalPanel onClose={() => setTechnicalOpen(false)} asset={asset} closedTick={closedTick} onOpenGlobal={handleOpenTechnicalGlobal} onOpenReversal={handleOpenReversal} />
+                  ) : technicalGlobalOpen ? (
+                    <TechnicalGlobalPanel onClose={() => setTechnicalGlobalOpen(false)} closedTick={closedTick} onPickAsset={handleSelectAsset} onOpenTechnical={handleOpenTechnical} />
+                  ) : reversalOpen ? (
+                    <ReversalPanel onClose={() => setReversalOpen(false)} asset={asset} closedTick={closedTick} onOpenGlobal={handleOpenReversalGlobal} onOpenTechnical={handleOpenTechnical} />
+                  ) : reversalGlobalOpen ? (
+                    <ReversalGlobalPanel onClose={() => setReversalGlobalOpen(false)} closedTick={closedTick} onPickAsset={handleSelectAsset} onOpenReversal={handleOpenReversal} />
                   ) : globalDomOpen ? (
                     <GlobalDomPanel onClose={() => setGlobalDomOpen(false)} tf={tf} closedTick={closedTick} onPickAsset={handleSelectAsset} onOpenOracle={handleOpenOracle} onOpenAccute={handleOpenAccute} />
                   ) : smcGlobalOpen ? (
@@ -1416,6 +1483,54 @@ export default function OSPage() {
                       >
                         <span className="h-1.5 w-1.5 rounded-full bg-teal-300" />
                         Next-Expiry Global
+                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
+                      </button>
+                      )}
+                      {panelVisibility.technical && (
+                      <button
+                        type="button"
+                        onClick={() => handleOpenTechnical(asset)}
+                        title="technical summary - investing.com-style oscillator + moving-average vote panels condensed into STRONG BUY..STRONG SELL at every rung of the 1s/2s/3s/5s/15s/30s/1m/2m/3m/5m ladder"
+                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-lime-500/40 hover:text-lime-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-lime-300" />
+                        Technical
+                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
+                      </button>
+                      )}
+                      {panelVisibility.technicalGlobal && (
+                      <button
+                        type="button"
+                        onClick={handleOpenTechnicalGlobal}
+                        title="technical global - the whole universe with one cross-timeframe consensus verdict per pair, ranked by conviction, 10-rung mini strip per row"
+                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-green-500/40 hover:text-green-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-green-300" />
+                        Technical Global
+                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
+                      </button>
+                      )}
+                      {panelVisibility.reversal && (
+                      <button
+                        type="button"
+                        onClick={() => handleOpenReversal(asset)}
+                        title="reversal radar - is a timeframe turning RIGHT NOW: 7 fail-closed detectors vote per rung, state machine answers calm / forming / reversing now / confirmed"
+                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-fuchsia-500/40 hover:text-fuchsia-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-fuchsia-300" />
+                        Reversal
+                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
+                      </button>
+                      )}
+                      {panelVisibility.reversalGlobal && (
+                      <button
+                        type="button"
+                        onClick={handleOpenReversalGlobal}
+                        title="reversal global - the whole universe ranked by reversal urgency: reversing now > confirmed > forming > calm, 10-rung state strip per row"
+                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-purple-500/40 hover:text-purple-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-purple-300" />
+                        Reversal Global
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
                       )}
