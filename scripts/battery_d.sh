@@ -40,6 +40,8 @@ echo "--- nextexpiry_unit (bun, in-process)"
 bun scripts/nextexpiry_unit.ts 2>&1 | tail -1 || rc=1
 echo "--- aitrader_compound_unit (bun, in-process)"
 bun scripts/aitrader_compound_unit.ts 2>&1 | tail -1 || rc=1
+echo "--- aitrader_briefing_unit (bun, in-process)"
+bun scripts/aitrader_briefing_unit.ts 2>&1 | tail -1 || rc=1
 echo "--- nextexpiry_e2e (node, HTTP)"
 node scripts/nextexpiry_e2e.mjs 2>&1 | tail -4 || rc=1
 echo "--- yesterday_e2e (node, HTTP)"
