@@ -150,5 +150,127 @@ const BIG = '9'.repeat(40) // 1e40; ^8 overflows past 1.8e308
   }
 }
 
+// 7 - MSL v2: expiry statement (fires-only, clamped 1..60, non-finite fails closed)
+{
+  const p = parseStrategyScript('call when oracle.call\nconfidence = 70\nexpiry = 2')
+  ok(p.ok, 'expiry statement parses')
+  if (p.ok) {
+    const out = evaluateStrategyScript(p.ast, reads)
+    ok(out.direction === 'call' && out.expiryMin === 2 && !out.error, 'expiry = 2 surfaces as expiryMin 2 on a fired side')
+  }
+  const p2 = parseStrategyScript('put when accute.put\nexpiry = 2.7')
+  ok(p2.ok, 'fractional expiry parses')
+  if (p2.ok) {
+    const out = evaluateStrategyScript(p2.ast, reads)
+    ok(out.expiryMin === 3 && out.direction === 'put', 'expiry 2.7 rounds to whole 3')
+  }
+  const p3 = parseStrategyScript('call when oracle.call\nexpiry = 300')
+  if (p3.ok) {
+    const out = evaluateStrategyScript(p3.ast, reads)
+    ok(out.expiryMin === 60, 'expiry 300 clamps to 60')
+  }
+  const p4 = parseStrategyScript('call when oracle.call\nexpiry = 0')
+  if (p4.ok) {
+    const out = evaluateStrategyScript(p4.ast, reads)
+    ok(out.expiryMin === 1, 'expiry 0 clamps up to 1')
+  }
+  const p5 = parseStrategyScript(`call when oracle.call\nexpiry = ${'9'.repeat(40)} * ${'9'.repeat(40)} * ${'9'.repeat(40)} * ${'9'.repeat(40)} * ${'9'.repeat(40)} * ${'9'.repeat(40)} * ${'9'.repeat(40)} * ${'9'.repeat(40)}`)
+  ok(p5.ok, 'overflow expiry script parses (literals finite)')
+  if (p5.ok) {
+    const out = evaluateStrategyScript(p5.ast, reads)
+    ok(out.direction === 'none' && out.confidence === 0 && !!out.error, 'non-finite expiry (overflow to Infinity) fails the script closed')
+  }
+  const p6 = parseStrategyScript('call when none == call\nexpiry = 5')
+  ok(p6.ok, 'unfired expiry script parses')
+  if (p6.ok) {
+    const out = evaluateStrategyScript(p6.ast, reads)
+    ok(out.direction === 'none' && out.expiryMin === undefined, 'no side fired -> no expiryMin (fires-only contract)')
+  }
+}
+
+// 8 - MSL v2: configure statements (collected plain values, last write wins)
+{
+  const p = parseStrategyScript('configure renko.atrMult = 0.5\nconfigure pf.reversalBoxes = 4\nconfigure strategy.ema-trend.fast = 5\ncall when oracle.call')
+  ok(p.ok, 'configure lines parse (chart knobs + strategy params)')
+  if (p.ok) {
+    const out = evaluateStrategyScript(p.ast, reads)
+    ok(out.configs?.['renko.atrMult'] === 0.5 && out.configs?.['pf.reversalBoxes'] === 4 && out.configs?.['strategy.ema-trend.fast'] === 5 && !out.error, 'configure values collected into configs')
+  }
+  const p2 = parseStrategyScript('configure renko.atrMult = 2\nconfigure renko.atrMult = 0.5\ncall when oracle.call')
+  if (p2.ok) {
+    const out = evaluateStrategyScript(p2.ast, reads)
+    ok(out.configs?.['renko.atrMult'] === 0.5, 'duplicate configure key: last write wins')
+  }
+  const p3 = parseStrategyScript('configure renko = 1\ncall when oracle.call')
+  ok(!p3.ok, 'configure without a dotted key rejected at parse time')
+  const p4 = parseStrategyScript('configure renko.atrMult = oracle\ncall when oracle.call')
+  ok(p4.ok, 'configure with a source value parses (runtime catches it)')
+  if (p4.ok) {
+    const out = evaluateStrategyScript(p4.ast, reads)
+    ok(out.direction === 'none' && !!out.error, 'configure value that is a read object fails the script closed')
+  }
+}
+
+// 9 - MSL v2: new core funcs (if lazy / clamp / pow / sqrt / mod / round family)
+{
+  const p = parseStrategyScript("call when oracle.call\nconfidence = if(oracle.call, clamp(oracle.conf + 10, 0, 85), 0)")
+  ok(p.ok, 'if + clamp parse')
+  if (p.ok) {
+    const out = evaluateStrategyScript(p.ast, reads)
+    ok(out.confidence === 85 && !out.error, 'if takes the call branch; clamp caps at 85')
+  }
+  const lazy = parseStrategyScript("call when oracle.call\nconfidence = if(oracle.call, 80, missingSource.conf)")
+  ok(lazy.ok, 'lazy-if script parses')
+  if (lazy.ok) {
+    const out = evaluateStrategyScript(lazy.ast, reads)
+    ok(out.confidence === 80 && !out.error, 'if is LAZY - the untaken branch (unknown source) never evaluates')
+  }
+  const p2 = parseStrategyScript('call when oracle.call\nconfidence = pow(2, 5) + mod(10, 3)')
+  if (p2.ok) {
+    const out = evaluateStrategyScript(p2.ast, reads)
+    ok(out.confidence === 33 && !out.error, 'pow(2,5) + mod(10,3) = 33 exactly')
+  }
+  const p3 = parseStrategyScript('call when oracle.call\nconfidence = round(74.6)')
+  if (p3.ok) {
+    const out = evaluateStrategyScript(p3.ast, reads)
+    ok(out.confidence === 75 && !out.error, 'round() rounds')
+  }
+  const p4 = parseStrategyScript('call when oracle.call\nconfidence = floor(40.9) + ceil(20.1) + sign(-3) + sign(2)')
+  if (p4.ok) {
+    const out = evaluateStrategyScript(p4.ast, reads)
+    ok(out.confidence === 61 && !out.error, 'floor(40.9)+ceil(20.1)+sign(-3)+sign(2) = 40+21-1+1 = 61')
+  }
+  const p5 = parseStrategyScript('call when oracle.call\nconfidence = sqrt(-1)')
+  if (p5.ok) {
+    const out = evaluateStrategyScript(p5.ast, reads)
+    ok(out.direction === 'none' && !!out.error, 'sqrt of a negative fails the script closed')
+  }
+  const p6 = parseStrategyScript('call when oracle.call\nconfidence = mod(5, 0)')
+  if (p6.ok) {
+    const out = evaluateStrategyScript(p6.ast, reads)
+    ok(out.direction === 'none' && !!out.error, 'mod by zero fails the script closed')
+  }
+}
+
+// 10 - MSL v2: the .value field (raw headline metric on a read)
+{
+  const valued: Record<string, MslSourceRead> = {
+    oracle: { direction: 'call', confidence: 80 },
+    'nextExpiry:5': { direction: 'call', confidence: 62, value: 0.61 },
+    accute: { direction: 'none', confidence: 55 },
+  }
+  const p = parseStrategyScript('call when nextExpiry:5.dir == call and nextExpiry:5.value > 0.56\nput when accute.put\nconfidence = 60')
+  ok(p.ok, '.value field parses on a pinned rung key')
+  if (p.ok) {
+    const out = evaluateStrategyScript(p.ast, valued)
+    ok(out.direction === 'call' && out.confidence === 60 && !out.error, 'pWin 0.61 > 0.56 threshold fires on .value')
+  }
+  const p2 = parseStrategyScript('call when oracle.value > 0.9\nput when accute.put\nconfidence = 50')
+  if (p2.ok) {
+    const out = evaluateStrategyScript(p2.ast, valued)
+    ok(out.direction === 'none' && !out.error, 'a source without a headline number reads .value as 0 (honest default)')
+  }
+}
+
 console.log(`msl_unit: ${pass} ok, ${fail} FAIL`)
 if (fail > 0) process.exit(1)

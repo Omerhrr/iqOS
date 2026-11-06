@@ -29,6 +29,24 @@
 //   put when <boolExpr>          sets the PUT verdict if true
 //   confidence = <numExpr>       optional - overrides the default 0-100
 //                                 confidence (clamped); may appear once
+//   expiry = <numExpr>           optional - the expiry this script PREFERS
+//                                 for its trade, whole minutes (clamped 1-60;
+//                                 1/2/3/5/15 are the rungs the engines
+//                                 actually price). Evaluated only when a side
+//                                 actually fired, like confidence. Surfaces
+//                                 as MslEvalResult.expiryMin for the caller.
+//   configure <a.b> = <expr>     optional, repeatable - per-script overrides
+//                                 for HOW a source computes its read (chart
+//                                 engine knobs like renko.atrMult = 0.5,
+//                                 pf.reversalBoxes = 4, tpo.periodSec = 900,
+//                                 strategy param overrides like
+//                                 strategy.ema-cross.fast = 5). Paths are
+//                                 dotted identifiers (at least one dot); the
+//                                 CALLER owns the whitelist - unknown keys or
+//                                 out-of-range values are a script ERROR (fail
+//                                 closed), never silently ignored. Collected
+//                                 into MslEvalResult.configs (last write wins
+//                                 per key).
 //
 // Expressions (standard precedence, low to high):
 //   or  <  and  <  not  <  comparisons (== != >= <= > <)  <  + -  <  * /
@@ -37,8 +55,11 @@
 // also valid as bare identifiers), string literal '...'/"...", identifier
 // (a source key the caller provided in `reads`, or a `let` binding),
 // identifier '.' field (field in dir/direction/conf/confidence/active/
-// call/put), '(' expr ')', func(args...) where func in
-// {avg, sum, min, max, count, abs}.
+// call/put/value - 'value' is the source's own headline NUMBER in its
+// native scale, e.g. the next-expiry rung's pWin 0..1 or renko's signed
+// streak; 0 when a source has none), '(' expr ')', func(args...) where
+// func in {avg, sum, min, max, count, abs, if, clamp, round, floor, ceil,
+// sign, sqrt, pow, mod}.
 //
 // Source identifiers may contain ':' (e.g. `smc:FVG`, `smc:now`) - the
 // caller (plugins/metastrategy.ts) builds the `reads` map with exactly the
@@ -64,6 +85,13 @@
 export interface MslSourceRead {
   direction: 'call' | 'put' | 'none'
   confidence: number // 0..100
+  /** OPTIONAL: the source's own headline numeric metric, in its native scale
+   * (documented per source by whoever builds the reads map - e.g. a
+   * next-expiry rung reports pWin 0..1, the tick oracle its walk-forward
+   * score, renko its signed streak). Exposed to scripts as the `.value`
+   * field; a source without a headline number omits it and `.value`
+   * honestly reads 0. */
+  value?: number
 }
 
 /** A source read, tagged so it's distinguishable from a plain string at
@@ -77,7 +105,12 @@ export interface MslReadValue extends MslSourceRead {
 }
 
 function readValue(r: MslSourceRead): MslReadValue {
-  return { __mslRead: true, direction: r.direction, confidence: r.confidence }
+  return {
+    __mslRead: true,
+    direction: r.direction,
+    confidence: r.confidence,
+    ...(r.value !== undefined && Number.isFinite(r.value) ? { value: r.value } : {}),
+  }
 }
 
 function isReadValue(v: unknown): v is MslReadValue {
@@ -103,6 +136,15 @@ export type MslSignalResolver = (fn: string, args: (number | boolean | string)[]
 export interface MslEvalResult {
   direction: 'call' | 'put' | 'none'
   confidence: number // 0..100
+  /** set by an "expiry = <minutes>" statement (whole minutes, clamped 1-60)
+   * - the caller decides what to do with the script's preferred horizon
+   * (Meta Trader surfaces it in its eval result; the engines' own honesty
+   * gates still apply on top of it). */
+  expiryMin?: number
+  /** collected "configure <key> = <value>" statements (last write wins) -
+   * the CALLER validates every key against its own whitelist and applies
+   * them when building the reads; unknown keys fail the script closed. */
+  configs?: Record<string, number | boolean | string>
   /** human-readable evaluation trace - which when-clauses fired, final
    * confidence source - surfaced in the Meta Strategy Lab's test panel so
    * a script's behavior is inspectable, not a black box. */
@@ -115,7 +157,8 @@ export interface MslEvalResult {
 type TokKind =
   | 'num' | 'str' | 'ident' | 'dot' | 'comma' | 'lparen' | 'rparen' | 'eq_assign'
   | 'eqeq' | 'neq' | 'gte' | 'lte' | 'gt' | 'lt' | 'plus' | 'minus' | 'star' | 'slash'
-  | 'and' | 'or' | 'not' | 'let' | 'call_kw' | 'put_kw' | 'when' | 'confidence_kw' | 'eof'
+  | 'and' | 'or' | 'not' | 'let' | 'call_kw' | 'put_kw' | 'when' | 'confidence_kw'
+  | 'expiry_kw' | 'configure_kw' | 'eof'
 
 interface Token {
   kind: TokKind
@@ -132,6 +175,8 @@ const KEYWORDS: Record<string, TokKind> = {
   put: 'put_kw',
   when: 'when',
   confidence: 'confidence_kw',
+  expiry: 'expiry_kw',
+  configure: 'configure_kw',
 }
 
 class MslSyntaxError extends Error {}
@@ -298,13 +343,19 @@ type Expr =
   | { t: 'bin'; op: 'and' | 'or' | '==' | '!=' | '>=' | '<=' | '>' | '<' | '+' | '-' | '*' | '/'; l: Expr; r: Expr }
   | { t: 'call'; fn: string; args: Expr[] }
 
-type Stmt = { kind: 'let'; name: string; expr: Expr } | { kind: 'call'; expr: Expr } | { kind: 'put'; expr: Expr } | { kind: 'confidence'; expr: Expr }
+type Stmt =
+  | { kind: 'let'; name: string; expr: Expr }
+  | { kind: 'call'; expr: Expr }
+  | { kind: 'put'; expr: Expr }
+  | { kind: 'confidence'; expr: Expr }
+  | { kind: 'expiry'; expr: Expr }
+  | { kind: 'configure'; path: string; expr: Expr }
 
 export interface MslAst {
   stmts: Stmt[]
 }
 
-const FIELDS = new Set(['dir', 'direction', 'conf', 'confidence', 'active', 'call', 'put'])
+const FIELDS = new Set(['dir', 'direction', 'conf', 'confidence', 'active', 'call', 'put', 'value'])
 // Core arithmetic funcs (avg/sum/min/max/count/abs) are no longer special-
 // cased at PARSE time - any identifier followed by "(" parses as a call
 // (see parsePrimary's doc comment). evalExpr's 'call' case still handles
@@ -376,7 +427,27 @@ class Parser {
       this.expect('eq_assign')
       return { kind: 'confidence', expr: this.parseOr() }
     }
-    throw new MslSyntaxError(`line ${t.line}: expected "let", "call when", "put when" or "confidence =", got "${t.value}"`)
+    if (t.kind === 'expiry_kw') {
+      this.next()
+      this.expect('eq_assign')
+      return { kind: 'expiry', expr: this.parseOr() }
+    }
+    if (t.kind === 'configure_kw') {
+      // configure <ident>(.<ident>)+ = <expr> - the path is collected as a
+      // dotted string; which keys are legal (and their ranges) is the
+      // CALLER's whitelist (plugins/metastrategy.ts), applied at eval time
+      // so a stale parser can never bless a key the kernel no longer honors.
+      this.next()
+      let path = this.expect('ident').value
+      while (this.peek().kind === 'dot') {
+        this.next()
+        path += `.${this.expect('ident').value}`
+      }
+      if (!path.includes('.')) throw new MslSyntaxError(`line ${t.line}: "configure" needs a dotted key like configure renko.atrMult = 0.5 (got "${path}")`)
+      this.expect('eq_assign')
+      return { kind: 'configure', path, expr: this.parseOr() }
+    }
+    throw new MslSyntaxError(`line ${t.line}: expected "let", "call when", "put when", "confidence =", "expiry =" or "configure ... =", got "${t.value}"`)
   }
 
   private expectWord(word: string): void {
@@ -459,8 +530,8 @@ class Parser {
       const ft = this.next()
       const fieldKw = ft.kind === 'call_kw' || ft.kind === 'put_kw'
       if (ft.kind !== 'ident' && !fieldKw)
-        throw new MslSyntaxError(`line ${ft.line}: unknown field ".${ft.value}" - use dir/direction/conf/confidence/active/call/put`)
-      if (!FIELDS.has(ft.value)) throw new MslSyntaxError(`line ${ft.line}: unknown field ".${ft.value}" - use dir/direction/conf/confidence/active/call/put`)
+        throw new MslSyntaxError(`line ${ft.line}: unknown field ".${ft.value}" - use dir/direction/conf/confidence/active/call/put/value`)
+      if (!FIELDS.has(ft.value)) throw new MslSyntaxError(`line ${ft.line}: unknown field ".${ft.value}" - use dir/direction/conf/confidence/active/call/put/value`)
       e = { t: 'field', obj: e, field: ft.value }
     }
     return e
@@ -552,6 +623,11 @@ function fieldOf(read: MslSourceRead, field: string): MslValue {
       return read.direction === 'call'
     case 'put':
       return read.direction === 'put'
+    case 'value':
+      // the source's own headline number in its native scale; a source
+      // without one honestly reads 0 (documented per source in the reads
+      // map builder - never a fabricated default)
+      return read.value !== undefined && Number.isFinite(read.value) ? read.value : 0
     default:
       throw new MslRuntimeError(`unknown field ".${field}"`)
   }
@@ -620,6 +696,13 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, reads: Record<string, 
       break
     }
     case 'call': {
+      // 'if' is LAZY - only the taken branch is evaluated (so a branch that
+      // would throw on this bar's data, e.g. reading a warming source, is
+      // never touched when the condition picks the other one).
+      if (e.fn === 'if') {
+        if (e.args.length !== 3) throw new MslRuntimeError(`if(cond, then, else) takes exactly 3 arguments, got ${e.args.length}`)
+        return truthy(evalExpr(e.args[0], env, reads, resolve)) ? evalExpr(e.args[1], env, reads, resolve) : evalExpr(e.args[2], env, reads, resolve)
+      }
       const args = e.args.map((a) => evalExpr(a, env, reads, resolve))
       switch (e.fn) {
         case 'avg':
@@ -634,6 +717,34 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, reads: Record<string, 
           return args.filter(truthy).length
         case 'abs':
           return Math.abs(asNum(args[0] ?? 0))
+        case 'clamp': {
+          if (args.length !== 3) throw new MslRuntimeError(`clamp(x, lo, hi) takes exactly 3 arguments, got ${args.length}`)
+          const [x, lo, hi] = args.map(asNum)
+          return Math.max(lo, Math.min(hi, x))
+        }
+        case 'round':
+          return Math.round(asNum(args[0] ?? 0))
+        case 'floor':
+          return Math.floor(asNum(args[0] ?? 0))
+        case 'ceil':
+          return Math.ceil(asNum(args[0] ?? 0))
+        case 'sign':
+          return Math.sign(asNum(args[0] ?? 0))
+        case 'sqrt': {
+          const v = asNum(args[0] ?? 0)
+          if (v < 0) throw new MslRuntimeError('sqrt() of a negative number - would produce NaN confidence')
+          return Math.sqrt(v)
+        }
+        case 'pow': {
+          if (args.length !== 2) throw new MslRuntimeError(`pow(base, exp) takes exactly 2 arguments, got ${args.length}`)
+          return Math.pow(asNum(args[0]), asNum(args[1]))
+        }
+        case 'mod': {
+          if (args.length !== 2) throw new MslRuntimeError(`mod(a, b) takes exactly 2 arguments, got ${args.length}`)
+          const b = asNum(args[1])
+          if (b === 0) throw new MslRuntimeError('mod(a, 0) - divide by zero')
+          return asNum(args[0]) % b
+        }
         default: {
           // Not a core arithmetic func - ask the caller's resolver (AI
           // Lab's signal vocabulary plugs in exactly here, see
@@ -662,9 +773,11 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, reads: Record<string, 
 export function evaluateStrategyScript(ast: MslAst, reads: Record<string, MslSourceRead>, resolve?: MslSignalResolver): MslEvalResult {
   const env: Record<string, MslValue> = {}
   const trace: string[] = []
+  const configs: Record<string, number | boolean | string> = {}
   let callFired = false
   let putFired = false
   let confidenceExpr: Expr | null = null
+  let expiryExpr: Expr | null = null
   try {
     for (const stmt of ast.stmts) {
       if (stmt.kind === 'let') {
@@ -685,6 +798,22 @@ export function evaluateStrategyScript(ast: MslAst, reads: Record<string, MslSou
       }
       if (stmt.kind === 'confidence') {
         confidenceExpr = stmt.expr // evaluated below, only if a side actually fired
+        continue
+      }
+      if (stmt.kind === 'expiry') {
+        expiryExpr = stmt.expr // evaluated below, only if a side actually fired
+        continue
+      }
+      if (stmt.kind === 'configure') {
+        // config values are PLAIN numbers/booleans/strings - a read object
+        // here is almost certainly a typo ("configure renko = ..." without
+        // the key), so it fails the script loudly instead of poisoning the
+        // caller's whitelist lookup.
+        const v = evalExpr(stmt.expr, env, reads, resolve)
+        if (isReadValue(v)) throw new MslRuntimeError(`"configure ${stmt.path}" got a source/signal value - the value must be a plain number/boolean/string`)
+        configs[stmt.path] = v as number | boolean | string
+        trace.push(`configure ${stmt.path} = ${String(v)}`)
+        continue
       }
     }
   } catch (err) {
@@ -716,5 +845,19 @@ export function evaluateStrategyScript(ast: MslAst, reads: Record<string, MslSou
   } else {
     trace.push('no "confidence = ..." statement - defaulted to 65 (set one explicitly for a real number)')
   }
-  return { direction, confidence, trace }
+  // expiry statement: whole minutes 1-60, evaluated ONLY when a side fired
+  // (same laziness contract as confidence) - a non-finite result fails the
+  // whole script closed, same as a bad confidence.
+  let expiryMin: number | undefined
+  if (expiryExpr) {
+    try {
+      const raw = asNum(evalExpr(expiryExpr, env, reads, resolve))
+      if (!Number.isFinite(raw)) throw new MslRuntimeError('expiry expression produced a non-finite value')
+      expiryMin = Math.max(1, Math.min(60, Math.round(raw)))
+      if (expiryMin !== raw) trace.push(`expiry = ${raw} clamped/rounded to ${expiryMin} (whole minutes 1-60)`)
+    } catch (err) {
+      return { direction: 'none', confidence: 0, trace, error: `expiry expression failed: ${err instanceof Error ? err.message : String(err)}` }
+    }
+  }
+  return { direction, confidence, trace, ...(expiryMin !== undefined ? { expiryMin } : {}), ...(Object.keys(configs).length ? { configs } : {}) }
 }

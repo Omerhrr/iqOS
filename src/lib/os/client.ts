@@ -317,6 +317,12 @@ export type MetaConditionSource =
   | 'tickOracle'
   | 'tickTechnical'
   | 'tickFootprint'
+  | 'technical'
+  | 'reversal'
+  | 'tempo'
+  | 'confluence'
+  | 'volArb'
+  | 'cointegration'
 
 export const META_CONDITION_SOURCE_LABELS: Record<MetaConditionSource, string> = {
   oracle: 'Next-Candle Oracle',
@@ -346,6 +352,12 @@ export const META_CONDITION_SOURCE_LABELS: Record<MetaConditionSource, string> =
   tickOracle: 'Tick next-candle oracle',
   tickTechnical: 'Tick technical summary',
   tickFootprint: 'Tick footprint (measured delta)',
+  technical: 'Technical Summary ladder (osc+MA votes)',
+  reversal: 'Reversal Radar (reversing/confirmed only)',
+  tempo: 'Tempo shot license (fires on FIRE only)',
+  confluence: 'Confluence Screener composite',
+  volArb: 'Volatility-Arb scanner',
+  cointegration: 'Cointegration spread reversion',
 }
 
 /** All 15 SMC concepts, same list Meta Trader's own smc-<kind> sources

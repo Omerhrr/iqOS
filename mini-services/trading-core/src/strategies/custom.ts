@@ -104,6 +104,7 @@ export interface IndicatorSignal {
     | 'fractal' // Williams Fractal breakout: (close - lastConfirmedFractalHigh)/ATR when breaking above resistance, (close - lastConfirmedFractalLow)/ATR when breaking below support, 0 otherwise
     | 'trendpullback' // trending-market pullback: signed, nonzero only inside a confirmed HH/HL (bull) or LH/LL (bear) swing structure AND price pulled back near the last confirmed swing point - see analytics/structure.ts
     | 'rangezone' // ranging-market buy/sell zone: signed, nonzero only while price is drifting sideways in a channel AND near its floor (buy zone, positive) or ceiling (sell zone, negative) - see analytics/structure.ts
+    | 'adx' // ADX/DI family. params.type: 'diff' (default: +DI minus -DI - the DIRECTIONAL read, >0 means up-pressure dominant) or 'adx' (the raw ADX 0..100 - the REGIME read, >=25 trending / <20 chop; use a plain threshold like "adx:adx > 25" as a trade-anything gate)
     // ---- generic families covering the rest of analytics/indicators.ts (selected via params.type) ----
     | 'madist' // (close - MA)/ATR. params.type: sma|ema|wma|dema|tema|trima|kama|hma|vwma|zlema|t3|mcginley|linreg|midpoint
     | 'osc0100' // native 0..100 oscillator. params.type: stochk|stochd|willr|ultosc|aroonup|aroondown|mfi
@@ -822,6 +823,14 @@ export function indicatorSeries(s: IndicatorSignal, ctx: EvalCtx): number[] {
         return 0
       })
     }
+    case 'adx': {
+      // ADX/DI family (analytics/indicators.ts's adx()): type 'diff' =
+      // +DI minus -DI (directional pressure, sign = which side dominates),
+      // type 'adx' = the raw ADX 0..100 (regime strength, no direction).
+      const type = s.type ?? 'diff'
+      const r = ta.adx(ctx.high, ctx.low, ctx.close, Math.max(2, Math.round(num(p.period, 14))))
+      return type === 'adx' ? r.adx : r.plusDI.map((v, i) => v - r.minusDI[i])
+    }
     case 'bandpos': {
       const type = s.type ?? 'keltner'
       const period = Math.max(2, Math.round(num(p.period, 20)))
@@ -1459,7 +1468,7 @@ export function evaluateCustom(spec: CustomSpec, candles: Candle[], asset?: stri
 
 const KNOWN_INDS = new Set([
   'rsi', 'bbpos', 'zscore', 'donchianpos', 'macdz', 'slope', 'streak', 'wickbias', 'emasign', 'hadist', 'bodypos',
-  'psar', 'fractal', 'madist', 'osc0100', 'oscpm100', 'oscz', 'trenddist', 'bandpos', 'volflow', 'levels',
+  'psar', 'fractal', 'madist', 'osc0100', 'oscpm100', 'oscz', 'trenddist', 'bandpos', 'volflow', 'levels', 'adx',
   // THE BUG: trendpullback/rangezone were wired into the ind type union,
   // indicatorSeries(), lab.ts's CANDIDATE_SIGNALS and client.ts's templates,
   // but never added to THIS allow-list - normalizeSpec is what actually

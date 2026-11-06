@@ -70,6 +70,18 @@ export type MetaConditionSource =
   | 'tickOracle' // tick next-candle oracle (computeTickOracle) - by default the engine's own best bucket across the 1s..5m ladder; pin ONE bucket via this condition's tickBucketSec field. A bucket still warming up (ok:false) or two-sided (direction 'none') reads 'none', never a guess
   | 'tickTechnical' // investing.com-style technical summary over tick buckets (computeTickTechnical) - by default the best-rated ok bucket's summary; pin ONE bucket via tickBucketSec. Oscillators + MAs vote buy/sell/neutral, RATING_RULE aggregates to strong-buy..strong-sell
   | 'tickFootprint' // REAL tick footprint delta (computeTickFootprint, default 60s buckets) - measured up/down PRINT counts per price bin (not the CLV proxy); direction from the window's net delta, confidence from its share of total prints, gated on enough prints to matter
+  // Remaining whole-OS panels that were NOT condition sources yet - per
+  // direct instruction ("let msl have access to all our panels") every
+  // direction-reporting panel this kernel runs is now reachable as a
+  // condition/MSL source. All six fail closed exactly like their own
+  // panels: a warming scan / thin history / no-row reads 'none' with the
+  // panel's own note, never a guess.
+  | 'technical' // the Technical Summary panel (analytics/technicals.ts, plugins/technical.ts): investing.com-style oscillator+MA vote ladder over 1s..5m; direction = the ladder-consensus verdict, confidence scaled by its (buys-sells)/counted score
+  | 'reversal' // the Reversal Radar panel (analytics/reversal.ts, plugins/reversal.ts): 7 fail-closed detectors per rung; a read fires ONLY in the 'reversing'/'confirmed' states (calm/forming = no tradeable claim yet)
+  | 'tempo' // the Tempo shot-license scanner (plugins/tempo.ts): direction counts ONLY on decision 'fire' (an unclaimed license this window) - wait/skip/done honestly read 'none'
+  | 'confluence' // the Confluence Screener (plugins/screener.ts): the composite multi-model read (regime + OU stretch + patterns + structure) already scored per pair; direction/confidence straight off its ScreenRow
+  | 'volArb' // the Volatility-Arbitrage scanner (plugins/volarbscan.ts): IV/HV ratio regime per pair - direction from its own fade/continue read, 'none' when the scanner reports balanced/no-lean
+  | 'cointegration' // the Cointegration scanner (plugins/cointegrationscan.ts): spread-reversion z-score vs the pair's statistical leader; direction = the scanner's suggested reversion trade, gated on its own fit quality (beta/R2/half-life)
 
 export const META_CONDITION_SOURCES: readonly MetaConditionSource[] = [
   'oracle',
@@ -99,6 +111,12 @@ export const META_CONDITION_SOURCES: readonly MetaConditionSource[] = [
   'tickOracle',
   'tickTechnical',
   'tickFootprint',
+  'technical',
+  'reversal',
+  'tempo',
+  'confluence',
+  'volArb',
+  'cointegration',
 ]
 
 export type MetaDirection = 'call' | 'put' | 'none'
@@ -193,6 +211,13 @@ export interface MetaSourceRead {
   /** 0..100. 0 when direction is 'none' (nothing to be confident about). */
   confidence: number
   label: string
+  /** OPTIONAL headline numeric metric in the source's NATIVE scale
+   * (renko's signed brick streak, a next-expiry rung's pWin 0..1, the
+   * technical ladder's -1..1 vote score, the cointegration z, ...). Meta
+   * evaluation ignores it; plugins/metastrategy.ts's buildScriptReads()
+   * copies it into the MSL read so a script can threshold the RAW number
+   * via the `.value` field instead of only direction+confidence. */
+  value?: number
 }
 
 export interface MetaConditionResult {
@@ -210,6 +235,12 @@ export interface MetaEvalResult {
   confidence: number
   conditions: MetaConditionResult[]
   notes: string
+  /** set ONLY by a script-built spec whose MSL carried an
+   * "expiry = <minutes>" statement (clamped whole minutes 1-60) - the
+   * script's own preferred horizon for this verdict; conditions-built
+   * specs never set it. Advisory: the trading engines' own expiry
+   * contracts still apply on top. */
+  expiryMin?: number
 }
 
 function clamp(v: number, lo: number, hi: number): number {

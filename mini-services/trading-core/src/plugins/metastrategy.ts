@@ -22,6 +22,12 @@ import type { AccuteService } from './accute'
 import type { SmcScanService } from './smcscan'
 import type { NextExpiryService } from './nextexpiry'
 import type { OtcFootprintService } from './otcfootprint'
+import type { TechnicalService } from './technical'
+import type { ReversalService } from './reversal'
+import type { TempoService } from './tempo'
+import type { ScreenerService } from './screener'
+import type { VolArbScanService } from './volarbscan'
+import type { CointegrationScanService } from './cointegrationscan'
 import type { TickPoint } from '../analytics/otcfootprint'
 import { ORACLE_BUCKETS_SEC, computeTickFootprint, computeTickOracle, computeTickSmc, computeTickTechnical, medianTickGapMs, type TickTechnicalResult } from '../analytics/tickdesk'
 import { renkoBricks, renkoAtr } from '../analytics/renko'
@@ -33,6 +39,8 @@ import { realizedUpProb } from '../analytics/ivhv'
 import { EXPIRIES_MIN } from '../analytics/nextexpiry'
 import { engineVoteSingle, type ChartEngineVote } from '../analytics/chartsignals'
 import { smcNowRead, smcAnyAgrees, ALL_SMC_KINDS } from '../analytics/smc'
+import { buildCtx } from '../strategies/custom'
+import { makeSignalResolver } from '../strategies/signalscript'
 import {
   evaluateMetaStrategy,
   META_CONDITION_SOURCES,
@@ -41,7 +49,8 @@ import {
   type MetaSourceRead,
   type MetaStrategySpec,
 } from '../analytics/metastrategy'
-import { parseStrategyScript, evaluateStrategyScript, type MslSourceRead } from '../analytics/strategylang'
+import { parseStrategyScript, evaluateStrategyScript, type MslEvalResult, type MslSourceRead } from '../analytics/strategylang'
+import { getStrategy } from '../strategies/builtin'
 
 function slugify(name: string): string {
   return (
@@ -51,6 +60,80 @@ function slugify(name: string): string {
       .replace(/[^a-z0-9]+/g, '-')
       .replace(/^-+|-+$/g, '') || 'strategy'
   )
+}
+
+// ---------- MSL configure whitelist ("configure them all from msl") ----------
+//
+// A script's "configure <key> = <value>" statements are per-script overrides
+// for HOW the sources this script reads get COMPUTED (chart-engine knobs,
+// the tick engines' bucket length, IV/HV window, builtin strategy params
+// via strategy.<id>.<param>). They NEVER mutate live plugin state - every
+// override is applied inside THIS script's own read-building, so two specs
+// reading the same panel with different configure lines get different,
+// both-honest reads, and the panels themselves keep their own configs.
+//
+// Unknown keys / out-of-range values / unknown strategy ids are a script
+// ERROR (fail closed: none/0 + the reason in the trace), never silently
+// ignored - a typo'd knob must not quietly read as "no override".
+interface MslConfigSpec {
+  min: number
+  max: number
+  integer?: boolean
+  /** human description for the save/eval error message */
+  desc: string
+}
+const MSL_READ_CONFIGS: Record<string, MslConfigSpec> = {
+  'renko.brick': { min: 1e-9, max: 1e9, desc: 'explicit renko brick size in price units' },
+  'renko.atrPeriod': { min: 2, max: 200, integer: true, desc: 'renko ATR brick period' },
+  'renko.atrMult': { min: 0.05, max: 20, desc: 'renko ATR brick multiplier' },
+  'range.range': { min: 1e-9, max: 1e9, desc: 'explicit range-bar size in price units' },
+  'range.atrPeriod': { min: 2, max: 200, integer: true, desc: 'range-bar ATR period' },
+  'range.atrMult': { min: 0.05, max: 20, desc: 'range-bar ATR multiplier' },
+  'pf.boxSize': { min: 1e-9, max: 1e9, desc: 'explicit P&F box size in price units' },
+  'pf.atrPeriod': { min: 2, max: 200, integer: true, desc: 'P&F ATR box period' },
+  'pf.atrMult': { min: 0.05, max: 20, desc: 'P&F ATR box multiplier' },
+  'pf.reversalBoxes': { min: 1, max: 10, integer: true, desc: 'P&F reversal boxes' },
+  'volbar.per': { min: 1e-9, max: 1e12, desc: 'volume per constant-volume bar' },
+  'tpo.periodSec': { min: 60, max: 86400, integer: true, desc: 'TPO profile period (seconds)' },
+  'tpo.binCount': { min: 5, max: 200, integer: true, desc: 'TPO profile bin count' },
+  'ivhv.window': { min: 10, max: 500, integer: true, desc: 'IV/HV realized up-close window (bars)' },
+  'tickSmc.bucketSec': { min: 1, max: 3600, integer: true, desc: 'tick SMC bucket length (seconds)' },
+  'tickOracle.bucketSec': { min: 1, max: 3600, integer: true, desc: 'tick oracle bucket length (seconds)' },
+  'tickTechnical.bucketSec': { min: 1, max: 3600, integer: true, desc: 'tick technical bucket length (seconds)' },
+  'tickFootprint.bucketSec': { min: 1, max: 3600, integer: true, desc: 'tick footprint bucket length (seconds)' },
+}
+
+/** Validates a collected configure map against the whitelist. Throws with a
+ * human message on the FIRST bad key (fail closed - the whole script errors,
+ * same as a syntax error). `strategy.<id>.<param>` keys are validated
+ * structurally + by strategy existence; the param NAME itself is whatever
+ * the strategy's own evaluate() understands (custom.ts clamps values). */
+function validateMslConfigs(configs: Record<string, number | boolean | string>): void {
+  for (const [k, v] of Object.entries(configs)) {
+    if (k.startsWith('strategy.')) {
+      const rest = k.slice('strategy.'.length)
+      const dot = rest.indexOf('.')
+      if (dot <= 0 || dot === rest.length - 1 || rest.slice(dot + 1).includes('.')) {
+        throw new Error(`configure ${k}: expected strategy.<id>.<param> (e.g. strategy.ema-cross.fast = 5)`)
+      }
+      const id = rest.slice(0, dot)
+      if (!getStrategy(id)) throw new Error(`configure ${k}: unknown builtin strategy "${id}"`)
+      if (typeof v === 'boolean') throw new Error(`configure ${k}: strategy params are numbers or strings, not booleans`)
+      continue
+    }
+    const spec = MSL_READ_CONFIGS[k]
+    if (!spec) throw new Error(`configure ${k}: unknown key - valid keys: ${Object.keys(MSL_READ_CONFIGS).join(', ')} (or strategy.<id>.<param> for a builtin strategy's params)`)
+    if (typeof v !== 'number' || !Number.isFinite(v)) throw new Error(`configure ${k}: ${spec.desc} must be a finite number, got "${String(v)}"`)
+    const val = spec.integer ? Math.round(v) : v
+    if (val < spec.min || val > spec.max) throw new Error(`configure ${k}: ${spec.desc} must be ${spec.min}..${spec.max}${spec.integer ? ' (whole)' : ''}, got ${v}`)
+  }
+}
+
+/** Numeric getter for an applied config map - returns undefined when the key
+ * is absent; callers pass the value straight into the engine opts. */
+function cfgNum(cfg: Record<string, number | boolean | string> | undefined, key: string): number | undefined {
+  const v = cfg?.[key]
+  return typeof v === 'number' && Number.isFinite(v) ? v : undefined
 }
 
 /** Defensive, same reasoning as lab.ts's save(): collapse a repeated
@@ -136,6 +219,7 @@ export class MetaStrategyService {
       'smc', 'smcNow', 'renkoSmc', 'renkoSmcMajority', 'pointFigure', 'rangeBars',
       'candle', 'heikinAshi', 'volumeBars', 'tick', 'footprint', 'tpo', 'ivHv', 'line',
       'tickSmc', 'tickOracle', 'tickTechnical', 'tickFootprint',
+      'technical', 'reversal', 'tempo', 'confluence', 'volArb', 'cointegration',
     ]
     const base = sources.map((s) => this.readSource(s, asset, tf))
     const perSmcConcept = ALL_SMC_KINDS.map((kind) => this.readSource('smcNow', asset, tf, kind))
@@ -173,6 +257,22 @@ export class MetaStrategyService {
     if (script) {
       const parsed = parseStrategyScript(script)
       if (!parsed.ok) throw new Error(`strategy script error: ${parsed.error}`)
+      // configure statements: validate the PATHS statically here (values may
+      // be dynamic expressions - their ranges are re-checked at every eval,
+      // see evaluateScript's two-pass flow). A typo'd knob or unknown
+      // strategy id is rejected on save, so it can never sit in the library
+      // failing silently every cycle.
+      for (const stmt of parsed.ast.stmts) {
+        if (stmt.kind !== 'configure') continue
+        if (stmt.path.startsWith('strategy.')) {
+          const rest = stmt.path.slice('strategy.'.length)
+          const dot = rest.indexOf('.')
+          if (dot <= 0 || dot === rest.length - 1 || rest.slice(dot + 1).includes('.')) throw new Error(`strategy script error: configure ${stmt.path}: expected strategy.<id>.<param> (e.g. strategy.ema-cross.fast = 5)`)
+          if (!getStrategy(rest.slice(0, dot))) throw new Error(`strategy script error: configure ${stmt.path}: unknown builtin strategy "${rest.slice(0, dot)}"`)
+        } else if (!MSL_READ_CONFIGS[stmt.path]) {
+          throw new Error(`strategy script error: configure ${stmt.path}: unknown key - valid: ${Object.keys(MSL_READ_CONFIGS).join(', ')} (or strategy.<id>.<param> for a builtin strategy's params)`)
+        }
+      }
     } else {
       if (!Array.isArray(input.conditions) || !input.conditions.length) throw new Error('a meta-strategy needs at least one condition (or a strategy script)')
       for (const c of input.conditions) {
@@ -233,9 +333,13 @@ export class MetaStrategyService {
   /** Current Renko trend as a call/put/none read, shared by the 'renko'
    * condition source and the 'renkoSmc' confluence read below - kept as
    * one small helper so both read the exact same bricks the same way. */
-  private renkoDirectionRead(asset: string, tf: Timeframe): { direction: 'call' | 'put' | 'none'; confidence: number; streak: number; trend: 'up' | 'down' | 'none' } {
+  private renkoDirectionRead(asset: string, tf: Timeframe, cfg?: Record<string, number | boolean | string>): { direction: 'call' | 'put' | 'none'; confidence: number; streak: number; trend: 'up' | 'down' | 'none' } {
     const candles = this.market.getCandlesDeep(asset, tf, 300, true)
-    const r = renkoBricks(candles)
+    const r = renkoBricks(candles, {
+      ...(cfgNum(cfg, 'renko.brick') !== undefined ? { brickSize: cfgNum(cfg, 'renko.brick') } : {}),
+      ...(cfgNum(cfg, 'renko.atrPeriod') !== undefined ? { atrPeriod: cfgNum(cfg, 'renko.atrPeriod') } : {}),
+      ...(cfgNum(cfg, 'renko.atrMult') !== undefined ? { atrMult: cfgNum(cfg, 'renko.atrMult') } : {}),
+    })
     if (r.trend === 'none') return { direction: 'none', confidence: 0, streak: 0, trend: 'none' }
     const direction = r.trend === 'up' ? 'call' : 'put'
     const confidence = Math.min(100, 40 + r.streak * 12)
@@ -287,7 +391,7 @@ export class MetaStrategyService {
     return { direction, confidence: Math.min(100, Math.round(40 + Math.abs(net) * 100)), label }
   }
 
-  private readSource(source: MetaConditionSource, asset: string, tf: Timeframe, smcKind?: string, expiryMin?: number, tickBucketSec?: number): MetaSourceRead {
+  private readSource(source: MetaConditionSource, asset: string, tf: Timeframe, smcKind?: string, expiryMin?: number, tickBucketSec?: number, cfg?: Record<string, number | boolean | string>): MetaSourceRead {
     const none = (label: string): MetaSourceRead => ({ source, direction: 'none', confidence: 0, label })
     try {
       switch (source) {
@@ -330,10 +434,10 @@ export class MetaStrategyService {
             const rung = pred.rows.find((r) => r.expiry === expiryMin)
             if (!rung || !rung.ok) return none(`Expiry oracle ${expiryMin}m: warming up`)
             if (rung.direction === 'none') return none(`Expiry oracle ${expiryMin}m: ${rung.note}`)
-            return { source, direction: rung.direction, confidence: rung.confidence, label: `Expiry ${expiryMin}m ${rung.direction.toUpperCase()} ${rung.confidence.toFixed(0)}% (pWin ${(rung.pWin * 100).toFixed(0)}%)` }
+            return { source, direction: rung.direction, confidence: rung.confidence, value: rung.pWin, label: `Expiry ${expiryMin}m ${rung.direction.toUpperCase()} ${rung.confidence.toFixed(0)}% (pWin ${(rung.pWin * 100).toFixed(0)}%)` }
           }
           if (!pred.best) return none(`Expiry oracle: wait - ${pred.note}`)
-          return { source, direction: pred.best.direction, confidence: pred.best.confidence, label: `Expiry oracle ${pred.best.expiry}m ${pred.best.direction.toUpperCase()} ${pred.best.confidence.toFixed(0)}% (pWin ${(pred.best.pWin * 100).toFixed(0)}%)` }
+          return { source, direction: pred.best.direction, confidence: pred.best.confidence, value: pred.best.pWin, label: `Expiry oracle ${pred.best.expiry}m ${pred.best.direction.toUpperCase()} ${pred.best.confidence.toFixed(0)}% (pWin ${(pred.best.pWin * 100).toFixed(0)}%)` }
         }
         case 'accute': {
           const accute = this.ctx.use<AccuteService>('accute')
@@ -347,9 +451,13 @@ export class MetaStrategyService {
           // reads as conviction), same scaling AccuteRenkoRead's own label
           // implies without putting a number on it. Capped at 10 bricks:
           // deeper streaks all read the same "committed trend" story.
-          const r = this.renkoDirectionRead(asset, tf)
+          // `.value` = the SIGNED streak (+up/-down) so an MSL script can
+          // threshold raw commitment (renko.value >= 3) without re-parsing
+          // the label.
+          const r = this.renkoDirectionRead(asset, tf, cfg)
           if (r.direction === 'none') return none('Renko: no bricks painted yet')
-          return { source, direction: r.direction, confidence: r.confidence, label: `Renko ${r.streak} ${r.trend.toUpperCase()} brick(s)` }
+          const signedStreak = r.direction === 'call' ? r.streak : -r.streak
+          return { source, direction: r.direction, confidence: r.confidence, value: signedStreak, label: `Renko ${r.streak} ${r.trend.toUpperCase()} brick(s)${cfg ? ' [configured]' : ''}` }
         }
         case 'smc': {
           const smc = this.ctx.use<SmcScanService>('smcScan')
@@ -381,21 +489,30 @@ export class MetaStrategyService {
           // more boxes painted in the live column reads as more committed
           // than a column that just flipped.
           const candles = this.market.getCandlesDeep(asset, tf, 300, true)
-          const pf = pointFigure(candles)
+          const pf = pointFigure(candles, {
+            ...(cfgNum(cfg, 'pf.boxSize') !== undefined ? { boxSize: cfgNum(cfg, 'pf.boxSize') } : {}),
+            ...(cfgNum(cfg, 'pf.atrPeriod') !== undefined ? { atrPeriod: cfgNum(cfg, 'pf.atrPeriod') } : {}),
+            ...(cfgNum(cfg, 'pf.atrMult') !== undefined ? { atrMult: cfgNum(cfg, 'pf.atrMult') } : {}),
+            ...(cfgNum(cfg, 'pf.reversalBoxes') !== undefined ? { reversalBoxes: cfgNum(cfg, 'pf.reversalBoxes') } : {}),
+          })
           if (!pf.lastDir) return none('Point & Figure: no column painted yet')
           const direction = pf.lastDir === 'X' ? 'call' : 'put'
           const liveBoxes = pf.columns.length ? pf.columns[pf.columns.length - 1].boxes : 0
           const confidence = Math.min(100, 40 + liveBoxes * 12)
           const breakout = pf.pattern && pf.pattern.direction === direction ? ` - ${pf.pattern.name}` : ''
-          return { source, direction, confidence, label: `P&F ${pf.lastDir} column, ${liveBoxes} box(es)${breakout}` }
+          return { source, direction, confidence, value: direction === 'call' ? liveBoxes : -liveBoxes, label: `P&F ${pf.lastDir} column, ${liveBoxes} box(es)${breakout}` }
         }
         case 'rangeBars': {
           const candles = this.market.getCandlesDeep(asset, tf, 300, true)
-          const rb = rangeBars(candles)
+          const rb = rangeBars(candles, {
+            ...(cfgNum(cfg, 'range.range') !== undefined ? { range: cfgNum(cfg, 'range.range') } : {}),
+            ...(cfgNum(cfg, 'range.atrPeriod') !== undefined ? { atrPeriod: cfgNum(cfg, 'range.atrPeriod') } : {}),
+            ...(cfgNum(cfg, 'range.atrMult') !== undefined ? { atrMult: cfgNum(cfg, 'range.atrMult') } : {}),
+          })
           if (rb.trend === 'none') return none('Range bars: no bars painted yet')
           const direction = rb.trend === 'up' ? 'call' : 'put'
           const confidence = Math.min(100, 40 + rb.streak * 12)
-          return { source, direction, confidence, label: `Range bars ${rb.streak} ${rb.trend.toUpperCase()} bar(s)` }
+          return { source, direction, confidence, value: direction === 'call' ? rb.streak : -rb.streak, label: `Range bars ${rb.streak} ${rb.trend.toUpperCase()} bar(s)` }
         }
         case 'candle':
         case 'bar': {
@@ -467,7 +584,7 @@ export class MetaStrategyService {
         }
         case 'volumeBars': {
           const candles = this.market.getCandlesDeep(asset, tf, 300, true)
-          const vb = volumeBars(candles)
+          const vb = volumeBars(candles, cfgNum(cfg, 'volbar.per') !== undefined ? { per: cfgNum(cfg, 'volbar.per') } : {})
           if (vb.degenerate || vb.bars.length < 2) return none('Volume bars: no bars painted yet (or all-zero volume window)')
           let streak = 0
           const bars = vb.bars
@@ -479,7 +596,7 @@ export class MetaStrategyService {
           }
           const direction = lastUp ? 'call' : 'put'
           const confidence = Math.min(100, 40 + streak * 12)
-          return { source, direction, confidence, label: `Volume bars ${streak} ${direction.toUpperCase()} bar(s) (${vb.volumeSource})` }
+          return { source, direction, confidence, value: direction === 'call' ? streak : -streak, label: `Volume bars ${streak} ${direction.toUpperCase()} bar(s) (${vb.volumeSource})` }
         }
         case 'tpo': {
           // POC-distance reduction: last close ABOVE the Point-of-Control
@@ -488,7 +605,10 @@ export class MetaStrategyService {
           // area's own width so a close just outside POC reads weaker than
           // one well outside the whole value area.
           const candles = this.market.getCandlesDeep(asset, tf, 300, true)
-          const tpo = computeTpo(candles)
+          const tpo = computeTpo(candles, {
+            ...(cfgNum(cfg, 'tpo.periodSec') !== undefined ? { periodSec: cfgNum(cfg, 'tpo.periodSec') } : {}),
+            ...(cfgNum(cfg, 'tpo.binCount') !== undefined ? { binCount: cfgNum(cfg, 'tpo.binCount') } : {}),
+          })
           if (tpo.poc === null) return none('TPO: no profile built yet (window too thin)')
           const lastClose = candles[candles.length - 1].close
           const delta = lastClose - tpo.poc
@@ -497,7 +617,7 @@ export class MetaStrategyService {
           const ratio = Number.isFinite(vaWidth) ? Math.min(2, Math.abs(delta) / vaWidth) : 0
           const direction = delta > 0 ? 'call' : 'put'
           const confidence = Math.min(100, 45 + Math.round(ratio * 35))
-          return { source, direction, confidence, label: `TPO close ${direction.toUpperCase()} of POC (poc ${tpo.poc.toFixed(5)}, close ${lastClose.toFixed(5)})` }
+          return { source, direction, confidence, value: Number.isFinite(vaWidth) ? delta / vaWidth : undefined, label: `TPO close ${direction.toUpperCase()} of POC (poc ${tpo.poc.toFixed(5)}, close ${lastClose.toFixed(5)})` }
         }
         case 'ivHv': {
           // Deviation-from-50% reduction on realizedUpProb() - NOT a
@@ -507,12 +627,12 @@ export class MetaStrategyService {
           // panel uses for its "realized WR vs breakeven" line.
           const candles = this.market.getCandlesDeep(asset, tf, 300, true)
           if (candles.length < 10) return none('IV-HV: not enough closes yet')
-          const upProb = realizedUpProb(candles, 100)
+          const upProb = realizedUpProb(candles, cfgNum(cfg, 'ivhv.window') ?? 100)
           const delta = upProb - 50
           if (Math.abs(delta) < 1e-9) return none('IV-HV: exactly 50/50 up-closes, no lean')
           const direction = delta > 0 ? 'call' : 'put'
           const confidence = Math.min(100, 50 + Math.round(Math.abs(delta) * 2.5))
-          return { source, direction, confidence, label: `IV-HV realized up-close ${upProb.toFixed(1)}% (${direction.toUpperCase()} lean)` }
+          return { source, direction, confidence, value: delta, label: `IV-HV realized up-close ${upProb.toFixed(1)}% (${direction.toUpperCase()} lean)` }
         }
         case 'renkoSmc': {
           // Same confluence rule Meta Trader's 'renko-smc' source trades -
@@ -584,19 +704,20 @@ export class MetaStrategyService {
           if (!row.ok) return none(`Tick oracle ${row.label}: ${row.note ?? 'warming up'}`)
           if (row.direction === 'none') return none(`Tick oracle ${row.label}: ${row.note ?? 'two-sided tape'}`)
           const wf = row.wf && row.wf.hitRatePct != null ? `, own walk-forward ${row.wf.hitRatePct}% over ${row.wf.n}` : ''
-          return { source, direction: row.direction, confidence: row.confidence, label: `Tick oracle ${row.label} ${row.direction.toUpperCase()} ${row.confidence.toFixed(0)}% (score ${row.score >= 0 ? '+' : ''}${row.score}${wf})` }
+          return { source, direction: row.direction, confidence: row.confidence, value: row.score, label: `Tick oracle ${row.label} ${row.direction.toUpperCase()} ${row.confidence.toFixed(0)}% (score ${row.score >= 0 ? '+' : ''}${row.score}${wf})` }
         }
         case 'tickTechnical':
-          return { source, ...this.tickTechnicalRead(asset, tickBucketSec) }
+          return { source, ...this.tickTechnicalRead(asset, tickBucketSec ?? cfgNum(cfg, 'tickTechnical.bucketSec')) }
         case 'tickFootprint': {
           // The REAL measured-print footprint (not the CLV proxy 'footprint'
           // above): direction from the window's net delta (up prints minus
           // down prints), confidence from the delta's SHARE of total prints
           // so a 3-print window can't read as conviction. Gated on >= 8
           // measured prints - below that the ladder is trivia, not evidence.
+          // `.value` = the signed one-sided share (-1..1).
           const ticks = this.tickBuffer(asset)
           if (!ticks?.length) return none('Tick footprint: no tick buffer yet (collector warming up)')
-          const fp = computeTickFootprint(ticks, { bucketSec: tickBucketSec ?? 60 })
+          const fp = computeTickFootprint(ticks, { bucketSec: tickBucketSec ?? cfgNum(cfg, 'tickFootprint.bucketSec') ?? 60 })
           if (!fp.ok) return none(`Tick footprint: ${fp.note ?? 'no closed buckets yet'}`)
           const s = fp.summary
           const total = s.totalUp + s.totalDn
@@ -604,7 +725,93 @@ export class MetaStrategyService {
           if (s.netDelta === 0) return none('Tick footprint: perfectly balanced tape, no lean')
           const direction = s.netDelta > 0 ? 'call' : 'put'
           const share = Math.abs(s.netDelta) / total
-          return { source, direction, confidence: Math.min(100, Math.round(40 + share * 100)), label: `Tick footprint ${direction.toUpperCase()} - net delta ${s.netDelta >= 0 ? '+' : ''}${s.netDelta} (${s.totalUp}u/${s.totalDn}d, ${Math.round(share * 100)}% one-sided, POC ${s.dominantPoc != null ? s.dominantPoc.toFixed(5) : 'n/a'}, ${s.buckets}x${fp.bucketSec}s)` }
+          return { source, direction, confidence: Math.min(100, Math.round(40 + share * 100)), value: direction === 'call' ? share : -share, label: `Tick footprint ${direction.toUpperCase()} - net delta ${s.netDelta >= 0 ? '+' : ''}${s.netDelta} (${s.totalUp}u/${s.totalDn}d, ${Math.round(share * 100)}% one-sided, POC ${s.dominantPoc != null ? s.dominantPoc.toFixed(5) : 'n/a'}, ${s.buckets}x${fp.bucketSec}s)` }
+        }
+        case 'technical': {
+          // The Technical Summary panel's own ladder-consensus verdict (the
+          // exact row the per-asset panel and the whole-universe board
+          // render): direction straight off the board's call/put/none,
+          // confidence scaled by the overall (buys-sells)/counted vote
+          // score (-1..1), `.value` = that raw score.
+          const tech = this.ctx.use<TechnicalService>('technical')
+          let priceHint = 0
+          try {
+            priceHint = this.market.getPrice(asset)
+          } catch {
+            /* rowFor handles a 0 hint */
+          }
+          const row = tech.rowFor(asset, priceHint)
+          if (!row.ok) return none(`Technical: ${row.note}`)
+          if (row.direction === 'none') return none(`Technical: ladder consensus neutral (${row.overall.label})`)
+          const score = row.overall.score
+          return { source, direction: row.direction, confidence: Math.min(100, Math.round(40 + Math.abs(score) * 80)), value: score, label: `Technical ladder ${row.direction.toUpperCase()} - ${row.overall.label} (score ${(score * 100).toFixed(0)}%, ${row.overall.buys}buy/${row.overall.sells}sell/${row.overall.neutrals}n over ${row.overall.counted})` }
+        }
+        case 'reversal': {
+          // The Reversal Radar's most urgent live read - but a read only
+          // CLAIMS direction in the two tradeable states: 'reversing NOW'
+          // and 'confirmed'. calm/forming honestly read none (a forming
+          // reversal is a watch, not a trade).
+          const rev = this.ctx.use<ReversalService>('reversal')
+          let priceHint = 0
+          try {
+            priceHint = this.market.getPrice(asset)
+          } catch {
+            /* rowFor handles a 0 hint */
+          }
+          const row = rev.rowFor(asset, priceHint)
+          if (!row.ok) return none(`Reversal: ${row.note}`)
+          if (row.state !== 'reversing' && row.state !== 'confirmed') return none(`Reversal: ${row.state} (no tradeable claim yet)`)
+          if (row.direction === 'none') return none('Reversal: no direction resolved')
+          const rdir: 'call' | 'put' = row.direction === 'up' ? 'call' : 'put'
+          return { source, direction: rdir, confidence: Math.min(100, Math.round(35 + Math.abs(row.score) * 15)), value: row.score, label: `Reversal ${row.state.toUpperCase()} ${rdir.toUpperCase()} (net vote ${row.score.toFixed(1)} @ ${row.best?.tf ?? '?'})` }
+        }
+        case 'tempo': {
+          // The Tempo shot-license scanner's read for THIS pair+tf: the
+          // direction only counts on decision 'fire' (an unclaimed license
+          // this window) - wait/skip/done are honest 'none's, exactly what
+          // the Tempo panel itself would tell a human.
+          const tempo = this.ctx.use<TempoService>('tempo')
+          const row = tempo.rowFor(asset, tf)
+          if (!row.ok) return none(`Tempo: ${row.note}`)
+          if (row.decision !== 'fire') return none(`Tempo: ${row.decision.toUpperCase()} - ${row.decisionReason}`)
+          if (row.direction === 'none') return none(`Tempo: fire without a direction - ${row.decisionReason}`)
+          return { source, direction: row.direction, confidence: Math.min(100, Math.round(row.conviction)), value: row.conviction, label: `Tempo FIRE ${row.direction.toUpperCase()} (conviction ${row.conviction.toFixed(0)} vs ${row.threshold.toFixed(0)}, ${row.barsRemaining} bar(s) left)` }
+        }
+        case 'confluence': {
+          // The Confluence Screener's composite read for THIS pair+tf (the
+          // same ScreenRow its own panel and the auto-trader's 'screener'
+          // source trade): direction + confidence straight off the row,
+          // `.value` = its signed score (-100..100).
+          const screener = this.ctx.use<ScreenerService>('screener')
+          if (!screener.hasRow(asset, tf)) return none('Confluence: screener has not scored this pair yet (sweep warming up)')
+          const row = screener.evaluate(asset, tf)
+          if (row.direction === 'none') return none(`Confluence: no lean (score ${row.score.toFixed(0)}, regime ${row.regime})`)
+          return { source, direction: row.direction, confidence: row.confidence, value: row.score, label: `Confluence ${row.direction.toUpperCase()} ${row.confidence.toFixed(0)}% (score ${row.score.toFixed(0)}, regime ${row.regime}, pUp ${(row.pUp * 100).toFixed(0)}%)` }
+        }
+        case 'volArb': {
+          // The Volatility-Arb scanner's per-pair read: direction only when
+          // the scanner's own ratio regime produces one (balanced/no-lean =
+          // honest none); `.value` = the signed IV/HV ratio distance from 1.
+          const va = this.ctx.use<VolArbScanService>('volArbScan')
+          const res = va.scan(tf)
+          const row = res.rows.find((r) => r.asset === asset)
+          if (!row || !row.open) return none('Vol-arb: no scan row for this pair (warming up or closed)')
+          if (!row.direction) return none(`Vol-arb: ${row.regime} regime, no lean (ratio ${row.ratio.toFixed(2)})`)
+          const confidence = Math.min(100, Math.round(40 + Math.abs(row.ratio - 1) * 40 + Math.abs(row.momentum) * 10))
+          return { source, direction: row.direction, confidence, value: row.ratio - 1, label: `Vol-arb ${row.direction.toUpperCase()} (IV/HV ratio ${row.ratio.toFixed(2)}, ${row.regime}, momentum ${row.momentum >= 0 ? '+' : ''}${row.momentum.toFixed(2)})` }
+        }
+        case 'cointegration': {
+          // The Cointegration scanner's spread-reversion read vs this pair's
+          // statistical leader: direction = the scanner's own suggested
+          // trade (already gated on beta/R2/half-life fit quality inside the
+          // scan), `.value` = the raw spread z (sigmas).
+          const ci = this.ctx.use<CointegrationScanService>('cointegrationScan')
+          const res = ci.scan(tf)
+          const row = res.rows.find((r) => r.asset === asset)
+          if (!row) return none('Cointegration: no fitted leader for this pair (warming up or no cointegrated partner)')
+          if (!row.direction) return none(`Cointegration: fit ok (z ${row.z >= 0 ? '+' : ''}${row.z.toFixed(2)}) but no trade suggestion`) 
+          const confidence = Math.min(100, Math.round(40 + Math.abs(row.z) * 12))
+          return { source, direction: row.direction, confidence, value: row.z, label: `Cointegration ${row.direction.toUpperCase()} - spread z ${row.z >= 0 ? '+' : ''}${row.z.toFixed(2)} vs ${row.leader} (beta ${row.beta.toFixed(2)}, R2 ${row.r2.toFixed(2)})` }
         }
       }
     } catch {
@@ -619,36 +826,50 @@ export class MetaStrategyService {
    * without the caller having to know in advance which ones it uses. Only
    * computed when a spec actually has a script (see evaluate() below) -
    * scanning all 15 SMC kinds plus Renko plus every Oracle driver on
-   * every candidate would be wasted work for a conditions-built spec. */
-  private buildScriptReads(asset: string, tf: Timeframe): Record<string, MslSourceRead> {
-    const toMsl = (r: MetaSourceRead): MslSourceRead => ({ direction: r.direction, confidence: r.confidence })
+   * every candidate would be wasted work for a conditions-built spec.
+   *
+   * `cfg` carries the script's own validated "configure <key> = <v>"
+   * overrides (chart-engine knobs, tick bucket lengths, IV/HV window) -
+   * applied ONLY here, per script evaluation, never to live plugin state.
+   * Sources whose read carries a natural headline number also populate
+   * `.value` (renko's signed streak, the expiry rungs' pWin, the tick
+   * oracle's score, the tick technical net share, the tick footprint's
+   * signed one-sided share) so scripts can threshold RAW metrics. */
+  private buildScriptReads(asset: string, tf: Timeframe, cfg?: Record<string, number | boolean | string>): Record<string, MslSourceRead> {
+    const toMsl = (r: MetaSourceRead): MslSourceRead => ({ direction: r.direction, confidence: r.confidence, ...(r.value !== undefined ? { value: r.value } : {}) })
     const reads: Record<string, MslSourceRead> = {
       oracle: toMsl(this.readSource('oracle', asset, tf)),
       hmaRocBullBear: toMsl(this.readSource('hmaRocBullBear', asset, tf)),
       momentumScore: toMsl(this.readSource('momentumScore', asset, tf)),
       accute: toMsl(this.readSource('accute', asset, tf)),
-      renko: toMsl(this.readSource('renko', asset, tf)),
+      renko: toMsl(this.readSource('renko', asset, tf, undefined, undefined, undefined, cfg)),
       smc: toMsl(this.readSource('smc', asset, tf)),
       smcNow: toMsl(this.readSource('smcNow', asset, tf)),
-      renkoSmc: toMsl(this.readSource('renkoSmc', asset, tf)),
-      renkoSmcMajority: toMsl(this.readSource('renkoSmcMajority', asset, tf)),
-      pointFigure: toMsl(this.readSource('pointFigure', asset, tf)),
-      rangeBars: toMsl(this.readSource('rangeBars', asset, tf)),
+      renkoSmc: toMsl(this.readSource('renkoSmc', asset, tf, undefined, undefined, undefined, cfg)),
+      renkoSmcMajority: toMsl(this.readSource('renkoSmcMajority', asset, tf, undefined, undefined, undefined, cfg)),
+      pointFigure: toMsl(this.readSource('pointFigure', asset, tf, undefined, undefined, undefined, cfg)),
+      rangeBars: toMsl(this.readSource('rangeBars', asset, tf, undefined, undefined, undefined, cfg)),
       candle: toMsl(this.readSource('candle', asset, tf)),
       bar: toMsl(this.readSource('bar', asset, tf)),
       heikinAshi: toMsl(this.readSource('heikinAshi', asset, tf)),
       line: toMsl(this.readSource('line', asset, tf)),
       area: toMsl(this.readSource('area', asset, tf)),
       baseline: toMsl(this.readSource('baseline', asset, tf)),
-      volumeBars: toMsl(this.readSource('volumeBars', asset, tf)),
+      volumeBars: toMsl(this.readSource('volumeBars', asset, tf, undefined, undefined, undefined, cfg)),
       tick: toMsl(this.readSource('tick', asset, tf)),
       footprint: toMsl(this.readSource('footprint', asset, tf)),
-      tpo: toMsl(this.readSource('tpo', asset, tf)),
-      ivHv: toMsl(this.readSource('ivHv', asset, tf)),
-      tickSmc: toMsl(this.readSource('tickSmc', asset, tf)),
-      tickOracle: toMsl(this.readSource('tickOracle', asset, tf)),
-      tickTechnical: toMsl(this.readSource('tickTechnical', asset, tf)),
-      tickFootprint: toMsl(this.readSource('tickFootprint', asset, tf)),
+      tpo: toMsl(this.readSource('tpo', asset, tf, undefined, undefined, undefined, cfg)),
+      ivHv: toMsl(this.readSource('ivHv', asset, tf, undefined, undefined, undefined, cfg)),
+      tickSmc: toMsl(this.readSource('tickSmc', asset, tf, undefined, undefined, undefined, cfg)),
+      tickOracle: toMsl(this.readSource('tickOracle', asset, tf, undefined, undefined, undefined, cfg)),
+      tickTechnical: toMsl(this.readSource('tickTechnical', asset, tf, undefined, undefined, undefined, cfg)),
+      tickFootprint: toMsl(this.readSource('tickFootprint', asset, tf, undefined, undefined, undefined, cfg)),
+      technical: toMsl(this.readSource('technical', asset, tf)),
+      reversal: toMsl(this.readSource('reversal', asset, tf)),
+      tempo: toMsl(this.readSource('tempo', asset, tf)),
+      confluence: toMsl(this.readSource('confluence', asset, tf)),
+      volArb: toMsl(this.readSource('volArb', asset, tf)),
+      cointegration: toMsl(this.readSource('cointegration', asset, tf)),
     }
     // Tick-desk reads for scripts: bare keys = each engine's own default read
     // (SMC 15s, oracle best bucket, technical best-rated bucket, footprint
@@ -659,16 +880,16 @@ export class MetaStrategyService {
     try {
       const ticks = this.tickBuffer(asset)
       if (ticks?.length) {
-        const oracle = computeTickOracle(ticks)
+        const oracle = computeTickOracle(ticks, cfgNum(cfg, 'tickOracle.bucketSec') !== undefined ? { bucketsSec: [cfgNum(cfg, 'tickOracle.bucketSec') as number] } : {})
         for (const sec of ORACLE_BUCKETS_SEC) {
           const row = oracle.rows.find((r) => r.bucketSec === sec)
-          reads[`tickOracle:${sec}`] = row && row.ok && row.direction !== 'none' ? { direction: row.direction, confidence: row.confidence } : { direction: 'none', confidence: 0 }
+          reads[`tickOracle:${sec}`] = row && row.ok && row.direction !== 'none' ? { direction: row.direction, confidence: row.confidence, value: row.score } : { direction: 'none', confidence: 0 }
         }
         const tech = computeTickTechnical(ticks)
         for (const b of tech.buckets) {
           const total = b.summary.buy + b.summary.sell
           const net = total > 0 ? (b.summary.buy - b.summary.sell) / total : 0
-          reads[`tickTechnical:${b.bucketSec}`] = b.ok && Math.abs(net) >= 0.2 ? { direction: net > 0 ? 'call' : 'put', confidence: Math.min(100, Math.round(40 + Math.abs(net) * 100)) } : { direction: 'none', confidence: 0 }
+          reads[`tickTechnical:${b.bucketSec}`] = b.ok && Math.abs(net) >= 0.2 ? { direction: net > 0 ? 'call' : 'put', confidence: Math.min(100, Math.round(40 + Math.abs(net) * 100)), value: net } : { direction: 'none', confidence: 0 }
         }
       } else {
         for (const sec of ORACLE_BUCKETS_SEC) reads[`tickOracle:${sec}`] = { direction: 'none', confidence: 0 }
@@ -685,10 +906,10 @@ export class MetaStrategyService {
     try {
       const expiryOracle = this.ctx.use<NextExpiryService>('nextexpiry')
       const pred = expiryOracle.predict(asset)
-      reads.nextExpiry = pred?.best ? { direction: pred.best.direction, confidence: pred.best.confidence } : { direction: 'none', confidence: 0 }
+      reads.nextExpiry = pred?.best ? { direction: pred.best.direction, confidence: pred.best.confidence, value: pred.best.pWin } : { direction: 'none', confidence: 0 }
       for (const E of EXPIRIES_MIN) {
         const rung = pred?.rows.find((r) => r.expiry === E)
-        reads[`nextExpiry:${E}`] = rung && rung.ok && rung.direction !== 'none' ? { direction: rung.direction, confidence: rung.confidence } : { direction: 'none', confidence: 0 }
+        reads[`nextExpiry:${E}`] = rung && rung.ok && rung.direction !== 'none' ? { direction: rung.direction, confidence: rung.confidence, value: rung.pWin } : { direction: 'none', confidence: 0 }
       }
     } catch {
       reads.nextExpiry = { direction: 'none', confidence: 0 }
@@ -730,39 +951,103 @@ export class MetaStrategyService {
     return evaluateMetaStrategy(spec, reads)
   }
 
+  /** Build the AI-Lab signal resolver for a meta script - the SAME signal
+   * vocabulary the AI Lab's own code editor uses (candle/bar/ha/line/renko/
+   * pf/mtf/indicator/indicatorType/indicatorPeriod/builtinSig/engine),
+   * evaluated by custom.ts's own signalActive() on this pair's deep candles.
+   * Per direct instruction ("let msl have access to all our indicators and
+   * strategies") a Meta-Strategy script can now call any of them, not just
+   * read the named panel sources. Returns undefined on a thin history (<40
+   * closed candles - the chart engines' own floor) - the script then runs
+   * reads-only and a signal call fails the script closed, same as before.
+   * `cfg` threads the script's validated strategy.<id>.<param> overrides
+   * into builtinSig() calls. */
+  private scriptResolver(asset: string, tf: Timeframe, cfg?: Record<string, number | boolean | string>): ReturnType<typeof makeSignalResolver> | undefined {
+    try {
+      const candles = this.market.getCandlesDeep(asset, tf, 240, true)
+      if (candles.length < 40) return undefined
+      return makeSignalResolver(buildCtx(candles, asset), candles.length - 1, cfg)
+    } catch {
+      return undefined
+    }
+  }
+
   /** Run a strategy-language script against one asset+tf's current
    * source reads, shaped as a MetaEvalResult so it's a drop-in for
    * evaluateMetaStrategy's conditions-built result - every caller
    * (Meta Trader, the REST eval route, this service's own evaluate())
    * gets the same {direction, score, confidence, notes} shape either
-   * way, never needing to know which path a given spec took. */
+   * way, never needing to know which path a given spec took.
+   *
+   * TWO-PASS because a script's "configure" lines must be known before the
+   * reads they affect can be built: pass 1 evaluates on default reads and
+   * collects the configure statements; if there are none, pass 1 IS the
+   * result. Otherwise the configs are whitelist-validated (unknown key /
+   * bad range / unknown strategy id = script error, fail closed), the reads
+   * are rebuilt with them applied and the resolver re-threaded, and pass 2's
+   * result wins. A script's own configure lines therefore change how ITS
+   * sources are computed while never touching live plugin state. */
   private evaluateScript(script: string, asset: string, tf: Timeframe): MetaEvalResult {
     const parsed = parseStrategyScript(script)
     if (!parsed.ok) return { direction: 'none', score: 0, confidence: 0, conditions: [], notes: `script error: ${parsed.error}` }
     const reads = this.buildScriptReads(asset, tf)
-    const out = evaluateStrategyScript(parsed.ast, reads)
+    const out = evaluateStrategyScript(parsed.ast, reads, this.scriptResolver(asset, tf))
+    if (!out.error && out.configs) {
+      try {
+        validateMslConfigs(out.configs)
+      } catch (err) {
+        return { direction: 'none', score: 0, confidence: 0, conditions: [], notes: `script error: ${err instanceof Error ? err.message : String(err)}` }
+      }
+      const reads2 = this.buildScriptReads(asset, tf, out.configs)
+      const out2 = evaluateStrategyScript(parsed.ast, reads2, this.scriptResolver(asset, tf, out.configs))
+      return this.scriptMetaResult(out2)
+    }
+    return this.scriptMetaResult(out)
+  }
+
+  private scriptMetaResult(out: MslEvalResult): MetaEvalResult {
     const score = out.confidence * (out.direction === 'call' ? 1 : out.direction === 'put' ? -1 : 0)
     const notes = out.error ? `script error: ${out.error}` : out.trace.join(' · ') || `script: ${out.direction} ${out.confidence}%`
-    return { direction: out.direction, score, confidence: out.confidence, conditions: [], notes }
+    return {
+      direction: out.direction,
+      score,
+      confidence: out.confidence,
+      conditions: [],
+      notes,
+      ...(out.expiryMin !== undefined ? { expiryMin: out.expiryMin } : {}),
+    }
   }
 
   /** Dry-run a strategy-script string against one asset+tf WITHOUT saving
    * it - the Meta Strategy Lab's "test" button in its code editor, so a
    * script can be iterated on before committing it (save() still
-   * re-validates the syntax on its own, this is purely for live preview). */
-  testScript(script: string, asset: string, tf: Timeframe): { ok: boolean; direction?: 'call' | 'put' | 'none'; confidence?: number; trace?: string[]; price?: number; error?: string } {
+   * re-validates the syntax on its own, this is purely for live preview).
+   * Same two-pass configure contract as evaluateScript; surfaces the
+   * script's preferred expiryMin when it set one. */
+  testScript(script: string, asset: string, tf: Timeframe): { ok: boolean; direction?: 'call' | 'put' | 'none'; confidence?: number; expiryMin?: number; trace?: string[]; price?: number; error?: string } {
     const parsed = parseStrategyScript(script)
     if (!parsed.ok) return { ok: false, error: parsed.error }
     const reads = this.buildScriptReads(asset, tf)
-    const out = evaluateStrategyScript(parsed.ast, reads)
+    const out = evaluateStrategyScript(parsed.ast, reads, this.scriptResolver(asset, tf))
     if (out.error) return { ok: false, error: out.error }
+    let final = out
+    if (out.configs) {
+      try {
+        validateMslConfigs(out.configs)
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) }
+      }
+      const reads2 = this.buildScriptReads(asset, tf, out.configs)
+      final = evaluateStrategyScript(parsed.ast, reads2, this.scriptResolver(asset, tf, out.configs))
+      if (final.error) return { ok: false, error: final.error }
+    }
     let price = 0
     try {
       price = this.market.getPrice(asset)
     } catch {
       /* price stays 0 */
     }
-    return { ok: true, direction: out.direction, confidence: out.confidence, trace: out.trace, price }
+    return { ok: true, direction: final.direction, confidence: final.confidence, ...(final.expiryMin !== undefined ? { expiryMin: final.expiryMin } : {}), trace: final.trace, price }
   }
 }
 

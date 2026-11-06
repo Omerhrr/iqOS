@@ -302,5 +302,49 @@ async function freshService(seats: Map<string, unknown>) {
   ok(vfQuiet.length === 1, 'otcFootprintLines: no note -> single line, no empty filler', vfQuiet.join(' | '))
 }
 
+// ---------- 8b. INDICATOR BOARD seat: the full indicator workup reaches the desk ----------
+{
+  // 300-bar rising series through a market stub - the board seat reads
+  // getCandlesDeep(asset, tf, 300, true) exactly like the live plugin
+  const deep: Candle[] = []
+  const t0 = nowSec - 300 * 60
+  for (let i = 0; i < 300; i++) {
+    const open = 1.1 * Math.pow(1.0006, i)
+    const close = 1.1 * Math.pow(1.0006, i + 1)
+    deep.push({ time: t0 + i * 60, open, close, high: Math.max(open, close) + 0.0004, low: Math.min(open, close) - 0.0004, volume: 900 + (i % 7) * 10 })
+  }
+  const market = {
+    mode: 'sim' as const,
+    getPrice: () => 1.12,
+    getCandles: () => [],
+    getCandlesDeep: (_asset: string, _tf: string, n: number) => deep.slice(-n),
+    listAssets: () => [],
+  }
+  const { svc } = await freshService(new Map([['market', market]]))
+  const b = await svc.deskBriefingFor('EURUSD', '1m', nowSec, 1)
+  const idx = b.lines.findIndex((l) => l.startsWith('[indicator board'))
+  ok(idx >= 0, 'briefing: the FULL INDICATOR BOARD seat reports', JSON.stringify(b.lines.slice(0, 3)))
+  const board = idx >= 0 ? b.lines.slice(idx) : []
+  ok(board.some((l) => /vote tally: \d+ counted -> \d+ bull \/ \d+ bear \/ \d+ neutral/.test(l)), 'briefing board: tally header present', board[1] ?? '')
+  ok(board.some((l) => l.startsWith('trend: ') && l.includes('ADX')), 'briefing board: trend family line carries ADX (the previously-missing indicator)', '')
+  ok(board.some((l) => l.startsWith('momentum: ') && l.includes('RSI(14)') && l.includes('Stochastic')), 'briefing board: momentum family carries RSI + Stochastic (+ more)', '')
+  ok(board.some((l) => l.startsWith('volatility: ') && l.includes('Bollinger')), 'briefing board: volatility family carries the band suite', '')
+  ok(board.some((l) => l.startsWith('volume: ') && l.includes('OBV') && l.includes('MFI')), 'briefing board: volume-flow family carries OBV/MFI/CMF', '')
+  ok(board.some((l) => l.startsWith('levels: ') && l.includes('pivot') && l.includes('fib')), 'briefing board: levels family carries pivot/fib distances', '')
+  ok(board.some((l) => /\[BULL\]/.test(l)), 'briefing board: the rising series leans bullish somewhere on the board', '')
+  ok(b.sourcesSeen >= 2, 'briefing: board seat counts toward sourcesSeen', String(b.sourcesSeen))
+  svc.stop()
+
+  // thin history: the seat surfaces the honest warming note instead of a vote
+  const cold = {
+    ...market,
+    getCandlesDeep: () => [] as Candle[],
+  }
+  const { svc: svc2 } = await freshService(new Map([['market', cold]]))
+  const b2 = await svc2.deskBriefingFor('EURUSD', '1m', nowSec, 1)
+  ok(!b2.lines.some((l) => l.startsWith('[indicator board')), 'briefing: no candles -> no fabricated board seat (omitted like any other seat)', JSON.stringify(b2.lines.slice(0, 2)))
+  svc2.stop()
+}
+
 console.log(`\naitrader_briefing_unit: ${pass} passed, ${fail} failed`)
 process.exit(fail ? 1 : 0)

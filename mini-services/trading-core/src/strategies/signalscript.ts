@@ -43,7 +43,7 @@ import type { MslSourceRead } from '../analytics/strategylang'
 const INDICATOR_IDS: ReadonlySet<string> = new Set([
   'rsi', 'bbpos', 'zscore', 'donchianpos', 'macdz', 'slope', 'streak', 'wickbias', 'emasign', 'hadist',
   'bodypos', 'psar', 'fractal', 'trendpullback', 'rangezone', 'madist', 'osc0100', 'oscpm100', 'oscz',
-  'trenddist', 'bandpos', 'volflow', 'levels', 'ofdelta', 'ofcumdelta', 'ofpocdist', 'ofvapos',
+  'trenddist', 'bandpos', 'volflow', 'levels', 'adx', 'ofdelta', 'ofcumdelta', 'ofpocdist', 'ofvapos',
   'otcvdelta', 'otcvratio', 'otcstagn',
 ])
 /** custom.ts's IndicatorSignal.op union, runtime copy (same reasoning). */
@@ -90,7 +90,7 @@ function confOf(v: Arg | undefined): number {
 /** Turns one SIGNAL_FUNCS call into the matching SignalDef, weight is
  * irrelevant for a live read (only matters for the OLD weighted-vote
  * evaluator, never invoked here) so every def gets a placeholder of 1. */
-function buildSignalDef(fn: string, args: Arg[]): SignalDef {
+function buildSignalDef(fn: string, args: Arg[], configs?: Record<string, number | boolean | string>): SignalDef {
   switch (fn) {
     case 'candle': {
       // candle(name, dir, conf?, series?)
@@ -197,11 +197,27 @@ function buildSignalDef(fn: string, args: Arg[]): SignalDef {
     case 'builtinSig': {
       // builtinSig(id, dir, conf?) - AUDIT: unknown ids now fail with the
       // same friendly error a JSON spec's learner would produce, instead of
-      // signalActive's raw undefined-dereference.
+      // signalActive's raw undefined-dereference. A script's OWN
+      // "configure strategy.<id>.<param>" statements (see makeSignalResolver)
+      // merge over the registry defaults here - custom.ts's builtin case
+      // already does `{ ...defaultParams(strat), ...def.params }`, so this
+      // reconfigures ONE script's view of the strategy, never the shared
+      // registry.
       const [id, dirArg] = args
       const idName = String(id)
       if (!getStrategy(idName)) throw new Error(`builtinSig(): unknown builtin strategy "${idName}"`)
-      return { kind: 'builtin', id: idName, dir: side(dirArg, 'builtinSig()'), weight: 1 }
+      const params: Record<string, number | string> = {}
+      for (const [k, v] of Object.entries(configs ?? {})) {
+        if (!k.startsWith('strategy.')) continue
+        const rest = k.slice('strategy.'.length)
+        const dot = rest.indexOf('.')
+        if (dot <= 0 || dot === rest.length - 1) continue
+        if (rest.slice(0, dot) !== idName) continue
+        const pname = rest.slice(dot + 1)
+        if (typeof v === 'number' && Number.isFinite(v)) params[pname] = v
+        else if (typeof v === 'string' && v.length <= 60) params[pname] = v
+      }
+      return { kind: 'builtin', id: idName, ...(Object.keys(params).length ? { params } : {}), dir: side(dirArg, 'builtinSig()'), weight: 1 }
     }
     case 'engine': {
       // engine(engineId, dir, conf?) - AUDIT: same friendly validation.
@@ -239,13 +255,21 @@ function confArgIndexFor(fn: string): number {
  * `ctx` at bar `i` (default: latest closed bar, same as every other live
  * read in this codebase) via custom.ts's own signalActive(), unmodified -
  * so a script's "candle(...)" and a JSON spec's `{kind:'candle',...}`
- * signal are checked by the EXACT same code, nothing reimplemented. */
-export function makeSignalResolver(ctx: EvalCtx, i: number = ctx.n - 1): (fn: string, args: Arg[]) => MslSourceRead {
+ * signal are checked by the EXACT same code, nothing reimplemented.
+ *
+ * `configs` carries the script's OWN "configure strategy.<id>.<param> = <v>"
+ * statements (see strategylang.ts) - every builtinSig() call for strategy
+ * `<id>` gets those params merged over the strategy's defaults, so MSL can
+ * reconfigure a builtin strategy WITHOUT touching the registry's shared
+ * defaults (the override lives only inside this one script's evaluation).
+ * Unknown strategies/params are rejected by the caller's whitelist before
+ * anything reaches here. */
+export function makeSignalResolver(ctx: EvalCtx, i: number = ctx.n - 1, configs?: Record<string, number | boolean | string>): (fn: string, args: Arg[]) => MslSourceRead {
   return (fn, args) => {
     if (!(SIGNAL_FUNCS as readonly string[]).includes(fn)) {
-      throw new Error(`unknown function "${fn}" - available signal functions: ${SIGNAL_FUNCS.join(', ')} (plus avg/sum/min/max/count/abs)`)
+      throw new Error(`unknown function "${fn}" - available signal functions: ${SIGNAL_FUNCS.join(', ')} (plus the core math/logic funcs avg/sum/min/max/count/abs/if/clamp/round/floor/ceil/sign/sqrt/pow/mod)`)
     }
-    const def = buildSignalDef(fn, args)
+    const def = buildSignalDef(fn, args, configs)
     const active = signalActive(def, ctx, i)
     const confidence = active ? confOf(args[confArgIndexFor(fn)]) : 0
     return { direction: active ? def.dir : 'none', confidence }

@@ -90,6 +90,7 @@ import { computeTickFootprint, computeTickOracle, computeTickSmc, computeTickTec
 import { chatComplete, providerStatus, type ChatMessage } from '../lib/llm'
 import { tfSeconds } from '../analytics/synthfeed'
 import { atr, closes, ema, highs, lows, rsi, trueRange } from '../analytics/indicators'
+import { indicatorBoardLines } from '../analytics/indicatorboard'
 import { classifySession } from '../analytics/session'
 
 export type AiTraderScanMode = 'single' | 'selected' | 'global'
@@ -1489,6 +1490,30 @@ export class AiTraderService {
       // omitted
     }
 
+    // ---- 19. FULL INDICATOR BOARD (per direct instruction: "do the ai
+    // trader have access to all our indicators, or it's still only having
+    // rsi and atr" - the honest answer WAS rsi/atr/ema only; this seat
+    // reports every indicator family analytics/indicators.ts offers, each
+    // reduced to name + value + stance, so the trader's chartist pass
+    // covers the whole board: 9 trend reads, 16 momentum oscillators, the
+    // volatility band/width suite, the volume-flow family (honest n/a on a
+    // zero-volume feed) and the pivot/fib levels. A WARMING board (thin
+    // history) prints its honest note and is omitted like any other seat.)
+    try {
+      let board: Candle[] = []
+      try {
+        board = this.market.getCandlesDeep(asset, tf, 300, true)
+      } catch {
+        board = []
+      }
+      const boardLines = board.length ? indicatorBoardLines(board) : []
+      // indicatorBoardLines returns a warming note even on thin history -
+      // surface that honestly rather than silently omitting the seat.
+      if (boardLines.length) section('indicator board (the FULL indicator workup: trend / momentum / volatility / volume / levels, every read name value [BULL|BEAR|=|n/a])', boardLines)
+    } catch {
+      // omitted
+    }
+
     return { lines, sourcesSeen }
   }
 
@@ -1699,7 +1724,10 @@ export class AiTraderService {
           'TICK DESK (the raw micro-tick print stream: tape freshness, SMC structure on tick candles, a tick',
           'next-candle oracle, a technical-summary ladder and a measured-print footprint with its delta slope),',
           'the OTC velocity footprint (measured print-speed order flow), the account book, the operator rule',
-          'gate, the OTC defense guard, and the AI Lab where learned strategies report their holdout edge.',
+          'gate, the OTC defense guard, the AI Lab where learned strategies report their holdout edge, and the',
+          'FULL INDICATOR BOARD (every indicator this OS computes - trend MAs/Supertrend/PSAR/Ichimoku/ADX, the',
+          'momentum oscillator suite, volatility bands and widths, the volume-flow family and pivot/fib levels -',
+          'each reduced to name value [BULL|BEAR|=|n/a] with a bull/bear vote tally).',
           'You are their HUMAN - not one more system running alongside them.',
           '',
           'A real senior trader works exactly like this: read the tape with his own eyes first (the raw closes,',
@@ -1718,6 +1746,10 @@ export class AiTraderService {
           '  same way is evidence; the same scanner family restated five times is one voice, not five.',
           '- The desk tally is a starting point, never your decision - it says nothing about expiry, and a loud',
           '  tally of weak/unproven voices is exactly the trap you exist to not fall into.',
+          '- The indicator board is YOUR chartist pass, not one more voice: read it as votes, not verdicts. Its',
+          '  tally ("N bull / M bear / K neutral") shows the whole board\'s balance; the ADX line tells you whether',
+          '  the regime is even trending (ADX < 20 = chop: discount every trend read), and an n/a line means that',
+          '  indicator had no honest read this cycle - an absent vote is not a quiet vote.',
           '- You are VOLUME-AWARE and STALENESS-AWARE, in that order: read the tick desk\'s tape line FIRST - a',
           '  STALE tape (last print too old) down-weights every tick-desk and footprint read no matter how loud',
           '  they are. On fresh tape, the measured print flow (up/down prints, net delta, delta slope, speed',
