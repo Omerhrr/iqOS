@@ -211,6 +211,53 @@ async function callLlm(
  * accepts an exact expirySec same as turbo/blitz - see execution.ts). */
 const minToSec = (m: number) => Math.max(1, Math.round(m * 60))
 
+/** Minimum closed candles an asset must have before this trader is allowed
+ * to spend an LLM call (let alone place an order) on it - covers a real
+ * ATR(14)/RSI(14) window with headroom for the shortest horizon read.
+ * AUDIT: before this gate, a just-booted asset (or one whose feed never
+ * warmed) went to the model as "Current price: unavailable ... (none yet)",
+ * and the model could still answer "call, 80%" - which LIVE mode would
+ * have placed verbatim. Every other decision path in this codebase is
+ * fail-closed on thin history; this trader now is too. */
+const MIN_CANDLES_FOR_DECISION = 25
+/** A candle series older than this (relative to the tf - 5 closed bars,
+ * floored at 5 wall-clock minutes) reads as a stalled/frozen feed or a
+ * closed market: skip without calling the model, same fail-closed rule.
+ * This is the hard backstop behind market-data's watchedAssets() warming -
+ * warming can lag boot or stall mid-session, and a decision made on
+ * hours-old candles is not a decision about THIS market. */
+const staleToleranceSec = (tfSec: number) => Math.max(5 * tfSec, 300)
+
+/** AUDIT: one sanitizer for every field the panel's draft can send up (the
+ * panel always POSTs whole fields on save, and a stale UI build or a hand-
+ * edited config row can carry NaN/strings/junk). configure() and start()
+ * both run through this, so a poisoned value can never reach the timer
+ * math, the prompt ("NaNmin expiry"), or placeOrder's amount. */
+function sanitizeAiConfig(c: AiTraderConfig): AiTraderConfig {
+  const num = (v: unknown, fb: number, lo: number, hi: number): number => {
+    const n = Number(v)
+    return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : fb
+  }
+  if (!['single', 'selected', 'global'].includes(c.scanMode)) c.scanMode = 'single'
+  if (!Array.isArray(c.selectedAssets)) c.selectedAssets = []
+  c.selectedAssets = c.selectedAssets.filter((a) => typeof a === 'string' && a.trim()).map((a) => a.trim().toUpperCase())
+  if (typeof c.asset !== 'string' || !c.asset.trim()) c.asset = DEFAULT_CONFIG.asset
+  else c.asset = c.asset.trim().toUpperCase()
+  if (!['binary', 'turbo', 'blitz', 'digital', 'cfd'].includes(c.kind)) c.kind = DEFAULT_CONFIG.kind
+  c.intervalMin = num(c.intervalMin, DEFAULT_CONFIG.intervalMin, 1, 1440)
+  c.stake = num(c.stake, DEFAULT_CONFIG.stake, 1, 5000)
+  c.minConfidence = num(c.minConfidence, DEFAULT_CONFIG.minConfidence, 0, 100)
+  c.maxConcurrent = Math.round(num(c.maxConcurrent, DEFAULT_CONFIG.maxConcurrent, 1, 20))
+  c.maxScanPerCycle = Math.round(num(c.maxScanPerCycle, DEFAULT_CONFIG.maxScanPerCycle, 1, 20))
+  // Expiry menu: finite whole minutes only, deduped + sorted, capped at
+  // 120 (the operator's own framing was 3-5 min expiries; an absurd value
+  // here would also balloon the candle fetch - longestExpiryBars * 4 + 30)
+  if (!Array.isArray(c.expiryChoices)) c.expiryChoices = [...DEFAULT_CONFIG.expiryChoices]
+  c.expiryChoices = [...new Set(c.expiryChoices.map((m) => Math.round(Number(m))).filter((m) => Number.isFinite(m) && m >= 1 && m <= 120))].sort((a, b) => a - b)
+  if (!c.expiryChoices.length) c.expiryChoices = [...DEFAULT_CONFIG.expiryChoices]
+  return c
+}
+
 /** Per-expiry-choice read, computed directly off the raw candles rather than
  * any other predictor's pre-digested verdict. This is what makes the model
  * actually reason about THIS trade's specific holding period instead of
@@ -401,7 +448,7 @@ export class AiTraderService {
     this.market = ctx.use<MarketDataService>('market')
     this.exec = ctx.use<ExecutionService>('execution')
     const saved = this.store.getAiTraderConfig() as Partial<AiTraderConfig> | null
-    this.config = { ...DEFAULT_CONFIG, ...(saved ?? {}) }
+    this.config = sanitizeAiConfig({ ...DEFAULT_CONFIG, ...(saved ?? {}) })
     this.store.pruneAiTraderDecisions(1000)
     ctx.log('ai-trader', `AI Trader online - ${this.config.enabled ? 'ENABLED' : 'disabled'}, ${this.config.live ? 'LIVE' : 'shadow (logging only)'}, ${this.config.asset} ${this.config.tf}, every ${this.config.intervalMin}min`)
     this.scheduleTimer()
@@ -446,15 +493,7 @@ export class AiTraderService {
   }
 
   configure(patch: Partial<AiTraderConfig>): AiTraderConfig {
-    this.config = { ...this.config, ...patch }
-    // Light sanitization on the new scan/concurrency fields - a bad value
-    // here (an empty string scanMode from a stale UI build, a 0 or
-    // negative count) should fall back to something safe, not silently
-    // break scheduleTimer/buildCandidateList/the concurrency math below.
-    if (!['single', 'selected', 'global'].includes(this.config.scanMode)) this.config.scanMode = 'single'
-    if (!Array.isArray(this.config.selectedAssets)) this.config.selectedAssets = []
-    this.config.maxConcurrent = Math.max(1, Math.round(Number(this.config.maxConcurrent) || 1))
-    this.config.maxScanPerCycle = Math.min(20, Math.max(1, Math.round(Number(this.config.maxScanPerCycle) || 5)))
+    this.config = sanitizeAiConfig({ ...this.config, ...patch })
     this.store.saveAiTraderConfig(this.config)
     this.scheduleTimer()
     this.emit('info', `AI Trader config updated - ${this.config.enabled ? 'enabled' : 'disabled'} · ${this.config.live ? 'LIVE' : 'shadow'} · ${this.config.scanMode} · ${this.config.asset} ${this.config.tf} · every ${this.config.intervalMin}min · max ${this.config.maxConcurrent} concurrent`)
@@ -672,6 +711,30 @@ export class AiTraderService {
       }
 
       const closePrices = closes(candles)
+
+      // AUDIT: fail-closed gates, BEFORE any LLM spend - no price, thin
+      // history, or a stale/frozen series must resolve to a logged skip,
+      // never to a model judgment call (and never to a live order). See
+      // MIN_CANDLES_FOR_DECISION / staleToleranceSec above for the why.
+      const lastCandle = candles.length ? candles[candles.length - 1] : null
+      const staleSec = staleToleranceSec(tfSec)
+      const noPrice = !(Number.isFinite(price) && price > 0)
+      const thin = closePrices.length < MIN_CANDLES_FOR_DECISION
+      const stale = !lastCandle || !(lastCandle.time > 0) || ts - lastCandle.time > staleSec
+      if (noPrice || thin || stale) {
+        const why = noPrice
+          ? `no live price for ${asset} - cycle skipped before any analysis, no LLM call made`
+          : thin
+            ? `thin history (${closePrices.length}/${MIN_CANDLES_FOR_DECISION} closed candles) - cycle skipped before any analysis, no LLM call made`
+            : `stale candle series (last closed bar ${lastCandle && lastCandle.time > 0 ? `${Math.round((ts - lastCandle.time) / 60)}min old, tolerance ${Math.round(staleSec / 60)}min` : 'unusable'}) - cycle skipped before any analysis, no LLM call made`
+        this.store.recordAiTraderDecision({
+          asset, tf, direction: 'skip', confidence: 0,
+          reasoning: why,
+          snapshot: [], live: this.config.live, acted: false, ts,
+        })
+        return null
+      }
+
       const highPrices = highs(candles)
       const lowPrices = lows(candles)
       const atrSeries = closePrices.length >= 15 ? atr(highPrices, lowPrices, closePrices, 14) : []

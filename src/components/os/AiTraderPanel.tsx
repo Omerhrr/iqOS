@@ -324,8 +324,11 @@ export default function AiTraderPanel({ assets, onError }: Props) {
 
       <div className="flex flex-wrap items-center gap-3 rounded border border-[#1c2739] bg-[#0b0f17] p-2 text-[#aab6cc]">
         <span>cycles: {status.cycles}</span>
-        <span>last run: {status.lastRunTs ? fmtTime(status.lastRunTs * 1000) : 'never'}</span>
-        <span>next run: {status.nextRunTs ? fmtTime(status.nextRunTs * 1000) : '-'}</span>
+        {/* fmtTime takes epoch SECONDS (it multiplies by 1000 internally) -
+            these fields are kernel epoch-seconds; passing them pre-multiplied
+            double-counted and rendered garbage clock times. */}
+        <span>last run: {status.lastRunTs ? fmtTime(status.lastRunTs) : 'never'}</span>
+        <span>next run: {status.nextRunTs ? fmtTime(status.nextRunTs) : '-'}</span>
         {status.lastError && <span className="text-rose-300">last error: {status.lastError}</span>}
       </div>
 
@@ -374,7 +377,7 @@ export default function AiTraderPanel({ assets, onError }: Props) {
             )}
             {decisions.map((d) => (
               <tr key={d.id} className="border-t border-[#1c2739] align-top">
-                <td className="whitespace-nowrap px-1.5 py-1 text-[#7c8aa5]">{fmtTime(d.ts * 1000)}</td>
+                <td className="whitespace-nowrap px-1.5 py-1 text-[#7c8aa5]">{fmtTime(d.ts)}</td>
                 <td className="whitespace-nowrap px-1.5 py-1">
                   {d.asset} {d.tf}
                 </td>

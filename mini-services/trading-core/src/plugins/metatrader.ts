@@ -90,6 +90,15 @@ const MAX_PLACE_ATTEMPTS_PER_TICK = 5
 const HARD_STOP_RE =
   /kill switch engaged|market closed for|amount must be positive|exceeds max stake|insufficient balance|live balance unknown|live broker not connected|unknown asset |no price feed|execution service unavailable/i
 
+/** AUDIT: minimum CLOSED candles the renko confluence sources require
+ * before they'll qualify a pair. renkoBricks() itself is thin-history-safe
+ * (no bricks -> trend 'none'), but a 2-3 candle series yields a 1-2 brick
+ * "trend" whose `40 + streak*12` confidence proxy can blend over the SMC
+ * agreement into a passing score - a boot-warmup artifact, not a read.
+ * Every other source here fails closed on thin history because its engine
+ * throws or returns no lean; this gives the renko paths the same floor. */
+const MIN_CANDLES_FOR_RENKO = 50
+
 /** AUDIT FIX - same bug os-mode.ts's own BROKER_UNAVAILABLE_RE/
  * assetRejectedUntil was built to fix for the auto-trader, ported here
  * because Meta Trader never had an equivalent: a broker rejection like
@@ -336,7 +345,19 @@ export class MetaTraderService {
         maxOpen: clamp(Math.round(num(saved.maxOpen, DEFAULT_META_TRADER.maxOpen)), 1, 20),
         kind: (['binary', 'turbo', 'blitz', 'digital', 'cfd'] as const).includes(saved.kind as TradeKind) ? (saved.kind as TradeKind) : 'binary',
         expiryTf: typeof saved.expiryTf === 'string' && (ALL_TIMEFRAMES as string[]).includes(saved.expiryTf) ? (saved.expiryTf as Timeframe) : undefined,
-        expirySec: typeof saved.expirySec === 'number' && Number.isFinite(saved.expirySec) ? saved.expirySec : undefined,
+        expirySec:
+          typeof saved.expirySec === 'number' && Number.isFinite(saved.expirySec)
+            ? // AUDIT: restore now applies the same kind-specific bounds
+              // configure() enforces - a hand-edited config row could
+              // otherwise resurrect a 100000s "blitz" expiry.
+              Math.round(
+                clamp(
+                  saved.expirySec,
+                  (saved as { kind?: unknown }).kind === 'blitz' ? 1 : 60,
+                  (saved as { kind?: unknown }).kind === 'blitz' ? 60 : 86400,
+                ),
+              )
+            : undefined,
         marketScope: saved.marketScope === 'real' || saved.marketScope === 'otc' ? saved.marketScope : 'all',
         cooldownSec: Math.max(0, Math.round(num(saved.cooldownSec, DEFAULT_META_TRADER.cooldownSec))),
         stakePlan: MetaTraderService.sanitizeStakePlan(saved.stakePlan),
@@ -802,6 +823,7 @@ export class MetaTraderService {
     for (const asset of this.candidatePool()) {
       try {
         const candles: Candle[] = this.market.getCandlesDeep(asset, this.config.tf, 300, true)
+        if (candles.length < MIN_CANDLES_FOR_RENKO) continue // thin history - try the next
         const renko = renkoBricks(candles)
         if (renko.trend === 'none') continue
         const renkoDirection: 'call' | 'put' = renko.trend === 'up' ? 'call' : 'put'
@@ -852,6 +874,7 @@ export class MetaTraderService {
         if (smcRead.direction === 'none') continue
 
         const candles: Candle[] = this.market.getCandlesDeep(asset, this.config.tf, 300, true)
+        if (candles.length < MIN_CANDLES_FOR_RENKO) continue // thin history - try the next
         const renko = renkoBricks(candles)
         if (renko.trend === 'none') continue
         const renkoDirection: 'call' | 'put' = renko.trend === 'up' ? 'call' : 'put'

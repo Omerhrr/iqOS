@@ -130,11 +130,29 @@ const KEYWORDS: Record<string, TokKind> = {
 
 class MslSyntaxError extends Error {}
 
+/** AUDIT: strip a '#' comment to end-of-line WITHOUT cutting '#' inside a
+ * string literal (`candle('Bull #3', call)` used to lose the tail of its
+ * own first argument to the comment pass, then fail to parse). Quote-aware
+ * scan: a '#' opens a comment only outside '...' / "...". */
+function stripComment(line: string): string {
+  let quote: string | null = null
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i]
+    if (quote) {
+      if (c === quote) quote = null
+      continue
+    }
+    if (c === "'" || c === '"') quote = c
+    else if (c === '#') return line.slice(0, i)
+  }
+  return line
+}
+
 function tokenize(src: string): Token[] {
   const lines = src.split('\n')
   const toks: Token[] = []
   for (let li = 0; li < lines.length; li++) {
-    const line = lines[li].split('#')[0] // '#' starts a comment - rest of the line is dropped
+    const line = stripComment(lines[li]) // '#' starts a comment - rest of the line is dropped
     let i = 0
     while (i < line.length) {
       const c = line[i]
@@ -145,7 +163,15 @@ function tokenize(src: string): Token[] {
       if (/[0-9]/.test(c) || (c === '.' && /[0-9]/.test(line[i + 1] ?? ''))) {
         let j = i
         while (j < line.length && /[0-9.]/.test(line[j])) j++
-        toks.push({ kind: 'num', value: line.slice(i, j), line: li + 1 })
+        const word = line.slice(i, j)
+        // AUDIT: a multi-dot token like "1.2.3" used to tokenize happily and
+        // Number() to NaN - a NaN atom that flowed through arithmetic into
+        // confidence (Math.max/min pass NaN straight through) and OUT of the
+        // evaluator as a tradeable decision. Reject at the source instead:
+        // the parser only ever sees finite literals now.
+        const numVal = Number(word)
+        if (!Number.isFinite(numVal)) throw new MslSyntaxError(`line ${li + 1}: malformed number "${word}"`)
+        toks.push({ kind: 'num', value: word, line: li + 1 })
         i = j
         continue
       }
@@ -153,6 +179,10 @@ function tokenize(src: string): Token[] {
         const quote = c
         let j = i + 1
         while (j < line.length && line[j] !== quote) j++
+        // AUDIT: an unterminated string used to be silently accepted as the
+        // rest-of-line (a typo like 'Bullish Engulfing without its closing
+        // quote changed the script's meaning instead of failing at save).
+        if (j >= line.length) throw new MslSyntaxError(`line ${li + 1}: unterminated string literal - missing closing ${quote}`)
         toks.push({ kind: 'str', value: line.slice(i + 1, j), line: li + 1 })
         i = j + 1
         continue
@@ -413,9 +443,19 @@ class Parser {
     let e = this.parsePrimary()
     while (this.peek().kind === 'dot') {
       this.next()
-      const field = this.expect('ident')
-      if (!FIELDS.has(field.value)) throw new MslSyntaxError(`line ${field.line}: unknown field ".${field.value}" - use dir/direction/conf/confidence/active/call/put`)
-      e = { t: 'field', obj: e, field: field.value }
+      // AUDIT FIX (caught by scripts/msl_unit.ts): `.call` / `.put` are
+      // documented FIELDS (fieldOf implements them, the grammar comment
+      // lists them), but `call`/`put` tokenize as KEYWORDS everywhere - so
+      // expect('ident') here rejected them and EVERY script using the
+      // documented `oracle.call` / `accute.put` shape failed to parse.
+      // Accept the two direction keywords as field names; the value slot
+      // carries the literal word either way.
+      const ft = this.next()
+      const fieldKw = ft.kind === 'call_kw' || ft.kind === 'put_kw'
+      if (ft.kind !== 'ident' && !fieldKw)
+        throw new MslSyntaxError(`line ${ft.line}: unknown field ".${ft.value}" - use dir/direction/conf/confidence/active/call/put`)
+      if (!FIELDS.has(ft.value)) throw new MslSyntaxError(`line ${ft.line}: unknown field ".${ft.value}" - use dir/direction/conf/confidence/active/call/put`)
+      e = { t: 'field', obj: e, field: ft.value }
     }
     return e
   }
@@ -656,7 +696,14 @@ export function evaluateStrategyScript(ast: MslAst, reads: Record<string, MslSou
   let confidence = 65 // same "lone signal, no honesty-loop number to lean on" flat default smcNowRead() uses
   if (confidenceExpr) {
     try {
-      confidence = Math.max(0, Math.min(100, Math.round(asNum(evalExpr(confidenceExpr, env, reads, resolve)))))
+      const raw = asNum(evalExpr(confidenceExpr, env, reads, resolve))
+      // AUDIT: Math.max/Math.min/round all pass NaN straight through, so an
+      // expression that reached +/-Infinity (huge-literal overflow) and then
+      // Infinity - Infinity in a let-binding used to exit here as a NaN
+      // confidence on a live direction. Fail closed instead: a non-finite
+      // confidence is an error, and an error resolves to none/0 (below).
+      if (!Number.isFinite(raw)) throw new MslRuntimeError('confidence expression produced a non-finite value (check for divide-by-zero-style arithmetic on huge literals)')
+      confidence = Math.max(0, Math.min(100, Math.round(raw)))
     } catch (err) {
       return { direction: 'none', confidence: 0, trace, error: `confidence expression failed: ${err instanceof Error ? err.message : String(err)}` }
     }
