@@ -15,9 +15,10 @@
 import { EventBus } from '../mini-services/trading-core/src/kernel'
 import type { KernelContext } from '../mini-services/trading-core/src/kernel'
 import { Store } from '../mini-services/trading-core/src/store'
-import { AiTraderService, candleAnatomy, swingStructure, deskTally, calibrationLines } from '../mini-services/trading-core/src/plugins/aitrader'
+import { AiTraderService, candleAnatomy, swingStructure, deskTally, calibrationLines, tapeHealthLines, tickDeskLines, otcFootprintLines } from '../mini-services/trading-core/src/plugins/aitrader'
 import type { Candle } from '../mini-services/trading-core/src/types'
 import type { MetaSourceRead } from '../mini-services/trading-core/src/analytics/metastrategy'
+import type { TickPoint, FootprintResult } from '../mini-services/trading-core/src/analytics/otcfootprint'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -254,6 +255,51 @@ async function freshService(seats: Map<string, unknown>) {
   ok(!snap.some((e) => e.source === 'desk' && (e.label.startsWith('- bar ') || e.label.includes('swing'))), 'e2e: own-analysis sections stay prompt-only (audit = desk briefing + tally, not the anatomy rows)', JSON.stringify(snap?.filter((e) => e.source === 'desk').map((e) => e.label.slice(0, 30))))
   svc.stop()
   void store
+}
+
+// ---------- 9. tick-desk briefing helpers (tape health / tick engines / velocity footprint) ----------
+{
+  // fresh rising staircase: 250ms prints, 3 buckets up / 2 buckets back
+  const nowMs = Date.now()
+  const t0 = nowMs - 3000 * 250
+  const freshTicks: TickPoint[] = []
+  let p = 1.1
+  for (let i = 0; i < 3000; i++) {
+    p += (i % 300) < 180 ? 0.0005 : -0.0002
+    freshTicks.push({ ts: t0 + i * 250, price: p })
+  }
+  const health = tapeHealthLines(freshTicks, nowMs)
+  ok(health.length >= 1 && health[0].includes('(fresh)'), 'tapeHealthLines: fresh tape reports cadence + age + fresh flag', health[0] ?? '')
+  ok(health.some((l) => l.includes('print flow') && l.includes('up-prints')), 'tapeHealthLines: measured print-flow line present on a directional stream', health.join(' | '))
+  const staleTicks: TickPoint[] = freshTicks.slice(0, 400).map((t) => ({ ...t, ts: t.ts - 600_000 }))
+  const stale = tapeHealthLines(staleTicks, nowMs)
+  ok(stale.length >= 1 && /STALE/.test(stale[0]), 'tapeHealthLines: an old last print is flagged STALE with the discount instruction', stale[0] ?? '')
+  ok(tapeHealthLines([], nowMs).length === 0, 'tapeHealthLines: no prints -> empty seat, never a fabricated line')
+
+  const desk = tickDeskLines(freshTicks, nowMs)
+  ok(desk.some((l) => l.startsWith('tick SMC (15s buckets): trend UP')), 'tickDeskLines: tick SMC reads the uptrend off tick candles', desk.join(' | '))
+  ok(desk.some((l) => l.startsWith('tick oracle (next tick-candle): best')), 'tickDeskLines: tick oracle best-bucket line present', '')
+  ok(desk.some((l) => l.startsWith('tick technical (osc+MA committee per bucket):')), 'tickDeskLines: tick technical ladder line present', '')
+  ok(desk.some((l) => l.startsWith('tick footprint (60s buckets, measured prints): net delta +')), 'tickDeskLines: measured-print footprint delta line present (uptrend -> positive)', '')
+  ok(!desk.some((l) => l.toLowerCase().includes('swing')), 'tickDeskLines: no own-analysis vocabulary leaks into desk audit lines', desk.join(' | '))
+  const thin = tickDeskLines([{ ts: nowMs - 1000, price: 1.1 }, { ts: nowMs, price: 1.1001 }], nowMs)
+  ok(thin.every((l) => typeof l === 'string' && l.length > 0) && !thin.some((l) => l.startsWith('tick SMC')), 'tickDeskLines: a 2-print stream still fails closed (SMC omitted, no throw)', JSON.stringify(thin))
+
+  const fp: FootprintResult = {
+    asset: 'EURUSD',
+    bucketSec: 60,
+    tickSize: 0.00001,
+    dataSource: 'sim-tick-1s',
+    cadenceMs: 1000,
+    minutes: 30,
+    buckets: [],
+    summary: { totalUp: 34, totalDn: 22, netDelta: 12, avgSpeedRatio: 1.25, dominantPoc: 1.10234, signal: 'call', score: 42, note: 'delta +12, ratio 1.25, stagnation 0.0 - no OTC footprint edge' },
+  }
+  const vf = otcFootprintLines(fp)
+  ok(vf.length >= 1 && vf[0].includes('velocity footprint') && vf[0].includes('CALL') && vf[0].includes('+12'), 'otcFootprintLines: verdict/score/delta line rendered', vf[0] ?? '')
+  ok(vf.some((l) => l.startsWith('engine note:')), 'otcFootprintLines: the engine\'s own note is carried verbatim', vf.join(' | '))
+  const vfQuiet = otcFootprintLines({ ...fp, summary: { ...fp.summary, note: '' } })
+  ok(vfQuiet.length === 1, 'otcFootprintLines: no note -> single line, no empty filler', vfQuiet.join(' | '))
 }
 
 console.log(`\naitrader_briefing_unit: ${pass} passed, ${fail} failed`)

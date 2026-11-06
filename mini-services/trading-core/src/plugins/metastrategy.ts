@@ -21,6 +21,9 @@ import type { NextCandleService } from './nextcandle'
 import type { AccuteService } from './accute'
 import type { SmcScanService } from './smcscan'
 import type { NextExpiryService } from './nextexpiry'
+import type { OtcFootprintService } from './otcfootprint'
+import type { TickPoint } from '../analytics/otcfootprint'
+import { ORACLE_BUCKETS_SEC, computeTickFootprint, computeTickOracle, computeTickSmc, computeTickTechnical, medianTickGapMs, type TickTechnicalResult } from '../analytics/tickdesk'
 import { renkoBricks, renkoAtr } from '../analytics/renko'
 import { rangeBars } from '../analytics/rangebars'
 import { pointFigure } from '../analytics/pointfigure'
@@ -106,10 +109,7 @@ export class MetaStrategyService {
    * wants "what do our panels currently say about this pair" (the AI Trader's
    * market-analysis prompt, say) gets the identical reads a human flipping
    * through the panels would see, instead of a second reimplementation that
-   * could drift from this one. Deliberately a curated subset, not the full
-   * ~20-source buildScriptReads() map - candle/bar/line/area/tick/footprint/
-   * tpo/ivHv etc are MSL script primitives, not independently decision-worthy
-   * panel reads on their own.
+   * could drift from this one.
    *
    * Includes EACH of the 15 individual SMC concepts on its own (FVG, Order
    * Block, Breaker Block, Liquidity Sweep, BOS, CHoCH, OTE, KRM, Supply/
@@ -119,11 +119,23 @@ export class MetaStrategyService {
    * hide a concept that's firing a cleaner read than whichever one happened
    * to win the aggregate vote, so the AI Trader's desk gets to see each one
    * by name, the same way Meta Trader's SMC_KIND_SOURCE can target one
-   * specific concept instead of only the "any" read. */
+   * specific concept instead of only the "any" read.
+   *
+   * ALSO includes every chart-TYPE source (candle, heikin ashi, volume bars,
+   * tpo, iv-hv, line, and the four tick-desk engines) - per direct
+   * instruction the AI Trader must see the FULL chart surface ("full tick
+   * chart analysis, footprint, OTC footprint, renko, range, line, p&f,
+   * heiken ashi, IVHV, volume and so on"), so the desk grid now reads every
+   * chart type this OS renders, not just the headline predictors. Only
+   * area/baseline stay out - they are the SAME math as 'line' (one close-only
+   * reduction, three names) and would just triple one voice in the desk
+   * tally; the MSL script map below still exposes them by name. */
   snapshotSources(asset: string, tf: Timeframe): MetaSourceRead[] {
     const sources: MetaConditionSource[] = [
       'oracle', 'hmaRocBullBear', 'momentumScore', 'nextExpiry', 'accute', 'renko',
       'smc', 'smcNow', 'renkoSmc', 'renkoSmcMajority', 'pointFigure', 'rangeBars',
+      'candle', 'heikinAshi', 'volumeBars', 'tick', 'footprint', 'tpo', 'ivHv', 'line',
+      'tickSmc', 'tickOracle', 'tickTechnical', 'tickFootprint',
     ]
     const base = sources.map((s) => this.readSource(s, asset, tf))
     const perSmcConcept = ALL_SMC_KINDS.map((kind) => this.readSource('smcNow', asset, tf, kind))
@@ -170,6 +182,13 @@ export class MetaStrategyService {
           throw new Error(`unknown smcKind "${c.smcKind}" - must be one of ${ALL_SMC_KINDS.join(', ')}`)
         if (c.source === 'nextExpiry' && c.expiryMin !== undefined && !(EXPIRIES_MIN as readonly number[]).includes(c.expiryMin))
           throw new Error(`nextExpiry expiryMin must be one of ${EXPIRIES_MIN.join('/')} (minutes), got "${c.expiryMin}"`)
+        if (c.tickBucketSec !== undefined) {
+          if (!['tickSmc', 'tickOracle', 'tickTechnical', 'tickFootprint'].includes(c.source))
+            throw new Error(`tickBucketSec is only meaningful on the tick-desk sources (tickSmc/tickOracle/tickTechnical/tickFootprint), not "${c.source}"`)
+          const b = Math.round(Number(c.tickBucketSec))
+          if (!Number.isFinite(b) || b < 1 || b > 3600) throw new Error(`tickBucketSec must be a whole number of seconds 1..3600, got "${c.tickBucketSec}"`)
+          c.tickBucketSec = b
+        }
         if (c.op !== undefined && !(['>=', '>', '<=', '<', '==', '!='] as const).includes(c.op))
           throw new Error(`condition op must be one of >=, >, <=, <, ==, !=, got "${c.op}"`)
       }
@@ -183,7 +202,7 @@ export class MetaStrategyService {
       mode,
       threshold: mode === 'weighted' ? Math.max(0, Math.min(100, input.threshold ?? 60)) : undefined,
       conditions: Array.isArray(input.conditions)
-        ? input.conditions.map((c) => ({ source: c.source, direction: c.direction, minConfidence: c.minConfidence, weight: c.weight, smcKind: c.smcKind, op: c.op, expiryMin: c.expiryMin }))
+        ? input.conditions.map((c) => ({ source: c.source, direction: c.direction, minConfidence: c.minConfidence, weight: c.weight, smcKind: c.smcKind, op: c.op, expiryMin: c.expiryMin, tickBucketSec: c.tickBucketSec }))
         : [],
       script,
       createdTs: existing?.createdTs ?? Date.now(),
@@ -223,7 +242,52 @@ export class MetaStrategyService {
     return { direction, confidence, streak: r.streak, trend: r.trend }
   }
 
-  private readSource(source: MetaConditionSource, asset: string, tf: Timeframe, smcKind?: string, expiryMin?: number): MetaSourceRead {
+  /** The raw micro-tick buffer for one asset (the otc-footprint collector's
+   * own per-asset store - sim = the kernel engine's ~1s prints, live = the
+   * sidecar's 100ms price-change captures), the SAME buffer every Tick Desk
+   * panel reads. Returns null when the collector isn't loaded; every tick-
+   * desk source read then reports its honest warming note instead of
+   * guessing off candles. */
+  private tickBuffer(asset: string): TickPoint[] | null {
+    try {
+      const ofp = this.ctx.use<OtcFootprintService>('otcFootprint')
+      return ofp.ticksFor(asset)
+    } catch {
+      return null
+    }
+  }
+
+  /** 'tickTechnical' reduction: pick the pinned bucket's ladder row (or, when
+   * unpinned, the best-rated ok bucket - strongest |net| wins, ties favor the
+   * FASTER bucket because a newer read is worth more) and turn its
+   * strong-buy..strong-sell summary into a call/put/none read with the same
+   * 40+net*100 confidence convention the other streak sources use. */
+  private tickTechnicalRead(asset: string, bucketSec?: number): { direction: 'call' | 'put' | 'none'; confidence: number; label: string } {
+    const ticks = this.tickBuffer(asset)
+    if (!ticks) return { direction: 'none', confidence: 0, label: 'tick technical: no tick collector loaded yet' }
+    const opts = bucketSec !== undefined ? { bucketsSec: [bucketSec], detailBucketSec: bucketSec } : {}
+    const res = computeTickTechnical(ticks, opts)
+    const ok = res.buckets.filter((b) => b.ok)
+    if (!ok.length) return { direction: 'none', confidence: 0, label: `tick technical: ${res.note ?? 'warming up'}` }
+    const netOf = (b: TickTechnicalResult['buckets'][number]) => {
+      const total = b.summary.buy + b.summary.sell
+      return total > 0 ? (b.summary.buy - b.summary.sell) / total : 0
+    }
+    const pick = bucketSec !== undefined
+      ? ok.find((b) => b.bucketSec === bucketSec)
+      : ok.reduce((best, b) => (Math.abs(netOf(b)) > Math.abs(netOf(best)) ? b : best), ok[0])
+    if (!pick) return { direction: 'none', confidence: 0, label: `tick technical: ${bucketSec}s bucket still warming up` }
+    const net = netOf(pick)
+    const rating = pick.summary.rating
+    const direction = net >= 0.2 ? 'call' : net <= -0.2 ? 'put' : 'none'
+    const cadence = medianTickGapMs(ticks)
+    const label = direction === 'none'
+      ? `tick technical ${pick.label}: ${rating} (osc ${pick.osc.buy}/${pick.osc.sell}/${pick.osc.neutral}, ma ${pick.mas.buy}/${pick.mas.sell}/${pick.mas.neutral} - neutral band)`
+      : `tick technical ${pick.label}: ${rating} (osc ${pick.osc.buy}/${pick.osc.sell}/${pick.osc.neutral}, ma ${pick.mas.buy}/${pick.mas.sell}/${pick.mas.neutral}, net ${(net * 100).toFixed(0)}%${cadence != null ? `, ${cadence}ms cadence` : ''})`
+    return { direction, confidence: Math.min(100, Math.round(40 + Math.abs(net) * 100)), label }
+  }
+
+  private readSource(source: MetaConditionSource, asset: string, tf: Timeframe, smcKind?: string, expiryMin?: number, tickBucketSec?: number): MetaSourceRead {
     const none = (label: string): MetaSourceRead => ({ source, direction: 'none', confidence: 0, label })
     try {
       switch (source) {
@@ -491,6 +555,57 @@ export class MetaStrategyService {
           const confidence2 = Math.round((smcRead.confidence + r2.confidence) / 2)
           return { source, direction: r2.direction, confidence: confidence2, label: `Renko+SMC (majority) ${r2.direction.toUpperCase()} - ${r2.streak} ${r2.trend.toUpperCase()} brick(s) & ${smcRead.note}` }
         }
+        case 'tickSmc': {
+          // The Tick Desk's own SMC engine on the RAW print stream - same
+          // computeTickSmc call the /tick_smc route serves, so a condition
+          // reads exactly what the panel shows (swing structure, BOS/CHoCH,
+          // order blocks, FVGs, sweeps, premium/discount). Warming/degenerate
+          // buckets come back ok:false with the engine's own note - a 'none'
+          // read, never a guess.
+          const ticks = this.tickBuffer(asset)
+          if (!ticks?.length) return none('Tick SMC: no tick buffer yet (collector warming up)')
+          const r = computeTickSmc(ticks, { bucketSec: tickBucketSec ?? 15 })
+          if (!r.ok || r.direction === 'none') return none(`Tick SMC: ${r.note ?? 'no lean'}`)
+          const zones = `${r.fvgs.length} FVG(s), ${r.bullOrderBlock || r.bearOrderBlock ? 'OB present' : 'no OB'}${r.sweeps.length ? `, ${r.sweeps.length} sweep(s)` : ''}`
+          return { source, direction: r.direction, confidence: r.confidence, label: `Tick SMC ${r.trend.toUpperCase()} ${r.direction.toUpperCase()} ${r.confidence.toFixed(0)}% - ${zones} (${r.medTicksPerCandle.toFixed(1)} prints/bucket @${r.bucketSec}s)` }
+        }
+        case 'tickOracle': {
+          // The Tick Desk's next-candle oracle. Unpinned = the engine's own
+          // best bucket (same pick the tick oracle panel highlights); pinned
+          // tickBucketSec = exactly that rung's read, same fail-closed shape
+          // as the nextExpiry rungs above (warming/deadband -> 'none'). The
+          // engine's walk-forward hit rate (when resolved) is disclosed in
+          // the label, so a meta condition can be judged by its own record.
+          const ticks = this.tickBuffer(asset)
+          if (!ticks?.length) return none('Tick oracle: no tick buffer yet (collector warming up)')
+          const res = computeTickOracle(ticks, tickBucketSec !== undefined ? { bucketsSec: [tickBucketSec] } : {})
+          const row = tickBucketSec !== undefined ? res.rows[0] : res.best
+          if (!row) return none(`Tick oracle: ${res.note ?? 'no read'}`)
+          if (!row.ok) return none(`Tick oracle ${row.label}: ${row.note ?? 'warming up'}`)
+          if (row.direction === 'none') return none(`Tick oracle ${row.label}: ${row.note ?? 'two-sided tape'}`)
+          const wf = row.wf && row.wf.hitRatePct != null ? `, own walk-forward ${row.wf.hitRatePct}% over ${row.wf.n}` : ''
+          return { source, direction: row.direction, confidence: row.confidence, label: `Tick oracle ${row.label} ${row.direction.toUpperCase()} ${row.confidence.toFixed(0)}% (score ${row.score >= 0 ? '+' : ''}${row.score}${wf})` }
+        }
+        case 'tickTechnical':
+          return { source, ...this.tickTechnicalRead(asset, tickBucketSec) }
+        case 'tickFootprint': {
+          // The REAL measured-print footprint (not the CLV proxy 'footprint'
+          // above): direction from the window's net delta (up prints minus
+          // down prints), confidence from the delta's SHARE of total prints
+          // so a 3-print window can't read as conviction. Gated on >= 8
+          // measured prints - below that the ladder is trivia, not evidence.
+          const ticks = this.tickBuffer(asset)
+          if (!ticks?.length) return none('Tick footprint: no tick buffer yet (collector warming up)')
+          const fp = computeTickFootprint(ticks, { bucketSec: tickBucketSec ?? 60 })
+          if (!fp.ok) return none(`Tick footprint: ${fp.note ?? 'no closed buckets yet'}`)
+          const s = fp.summary
+          const total = s.totalUp + s.totalDn
+          if (total < 8) return none(`Tick footprint: only ${total} measured print(s) in ${s.buckets} bucket(s) - too thin to lean on`)
+          if (s.netDelta === 0) return none('Tick footprint: perfectly balanced tape, no lean')
+          const direction = s.netDelta > 0 ? 'call' : 'put'
+          const share = Math.abs(s.netDelta) / total
+          return { source, direction, confidence: Math.min(100, Math.round(40 + share * 100)), label: `Tick footprint ${direction.toUpperCase()} - net delta ${s.netDelta >= 0 ? '+' : ''}${s.netDelta} (${s.totalUp}u/${s.totalDn}d, ${Math.round(share * 100)}% one-sided, POC ${s.dominantPoc != null ? s.dominantPoc.toFixed(5) : 'n/a'}, ${s.buckets}x${fp.bucketSec}s)` }
+        }
       }
     } catch {
       return none(`${source}: not available (plugin not loaded or thin history)`)
@@ -530,6 +645,36 @@ export class MetaStrategyService {
       footprint: toMsl(this.readSource('footprint', asset, tf)),
       tpo: toMsl(this.readSource('tpo', asset, tf)),
       ivHv: toMsl(this.readSource('ivHv', asset, tf)),
+      tickSmc: toMsl(this.readSource('tickSmc', asset, tf)),
+      tickOracle: toMsl(this.readSource('tickOracle', asset, tf)),
+      tickTechnical: toMsl(this.readSource('tickTechnical', asset, tf)),
+      tickFootprint: toMsl(this.readSource('tickFootprint', asset, tf)),
+    }
+    // Tick-desk reads for scripts: bare keys = each engine's own default read
+    // (SMC 15s, oracle best bucket, technical best-rated bucket, footprint
+    // 60s) plus 'tickOracle:<SEC>' and 'tickTechnical:<SEC>' pinned-bucket
+    // keys (same 'source:<KIND>' convention as smc:<KIND> and
+    // nextExpiry:<E> - the part after the colon is part of the identifier).
+    // ONE computeTickOracle/computeTickTechnical call feeds all their keys.
+    try {
+      const ticks = this.tickBuffer(asset)
+      if (ticks?.length) {
+        const oracle = computeTickOracle(ticks)
+        for (const sec of ORACLE_BUCKETS_SEC) {
+          const row = oracle.rows.find((r) => r.bucketSec === sec)
+          reads[`tickOracle:${sec}`] = row && row.ok && row.direction !== 'none' ? { direction: row.direction, confidence: row.confidence } : { direction: 'none', confidence: 0 }
+        }
+        const tech = computeTickTechnical(ticks)
+        for (const b of tech.buckets) {
+          const total = b.summary.buy + b.summary.sell
+          const net = total > 0 ? (b.summary.buy - b.summary.sell) / total : 0
+          reads[`tickTechnical:${b.bucketSec}`] = b.ok && Math.abs(net) >= 0.2 ? { direction: net > 0 ? 'call' : 'put', confidence: Math.min(100, Math.round(40 + Math.abs(net) * 100)) } : { direction: 'none', confidence: 0 }
+        }
+      } else {
+        for (const sec of ORACLE_BUCKETS_SEC) reads[`tickOracle:${sec}`] = { direction: 'none', confidence: 0 }
+      }
+    } catch {
+      for (const sec of ORACLE_BUCKETS_SEC) reads[`tickOracle:${sec}`] = { direction: 'none', confidence: 0 }
     }
     // Next-Expiry Oracle reads for scripts: bare 'nextExpiry' = the best
     // pick (engine honesty floors already applied, null best = none) and
@@ -581,7 +726,7 @@ export class MetaStrategyService {
   }
 
   private evaluateConditions(spec: MetaStrategySpec, asset: string, tf: Timeframe): MetaEvalResult {
-    const reads = spec.conditions.map((c) => this.readSource(c.source, asset, tf, c.smcKind, c.expiryMin))
+    const reads = spec.conditions.map((c) => this.readSource(c.source, asset, tf, c.smcKind, c.expiryMin, c.tickBucketSec))
     return evaluateMetaStrategy(spec, reads)
   }
 

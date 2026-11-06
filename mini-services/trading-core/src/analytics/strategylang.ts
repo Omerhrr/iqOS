@@ -46,12 +46,15 @@
 // 'momentumScore', 'accute', 'renko', 'pointFigure', 'rangeBars', 'candle',
 // 'bar', 'heikinAshi', 'line', 'area', 'baseline', 'volumeBars', 'tick',
 // 'footprint', 'tpo', 'ivHv', 'smc', 'smcNow', 'renkoSmc',
-// 'renkoSmcMajority', 'nextExpiry' (the Next-Expiry Oracle's best pick,
-// honesty-floored) plus 'nextExpiry:<E>' for each ladder rung
-// (nextExpiry:1/2/3/5/15 - same ':' convention), and 'smc:<KIND>' for each
-// of the 15 SMC concepts (smcNowRead() per kind) - "any of the smcs" per
-// direct instruction, without needing 15 new MetaConditionSource union
-// members. 'pointFigure'/
+// 'renkoSmcMajority', the tick-desk engines 'tickSmc', 'tickOracle',
+// 'tickTechnical', 'tickFootprint' (raw micro-tick reads), 'nextExpiry'
+// (the Next-Expiry Oracle's best pick, honesty-floored) plus
+// 'nextExpiry:<E>' for each ladder rung (nextExpiry:1/2/3/5/15 - same ':'
+// convention), the pinned tick-desk buckets 'tickOracle:<SEC>' /
+// 'tickTechnical:<SEC>' (SEC = one of 1/2/3/5/15/30/60/120/180/300), and
+// 'smc:<KIND>' for each of the 15 SMC concepts (smcNowRead() per kind) -
+// "any of the smcs" per direct instruction, without needing 15 new
+// MetaConditionSource union members. 'pointFigure'/
 // 'rangeBars' are the same "not just renko - p&f, range and all others as
 // we see fit" instruction: every chart engine this codebase already keeps
 // as its own pure module (analytics/renko.ts, pointfigure.ts, rangebars.ts)

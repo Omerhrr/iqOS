@@ -58,6 +58,18 @@ export type MetaConditionSource =
   | 'footprint' // volume footprint CLV-proxy delta (chartsignals.ts footprintVote) - same CLV approximation orderflow.ts uses everywhere else in this codebase, since IQ Option exposes no real bid/ask-tagged trades
   | 'tpo' // Market Profile / Time Price Opportunity (analytics/tpo.ts) - direction from price trading above/below the session's Point of Control, confidence scaled by distance relative to the 70% value-area width
   | 'ivHv' // Implied vs Historical Volatility (analytics/ivhv.ts) - NOT a volatility forecast (vol has no direction); the directional read here is the realized up-closing frequency over a trailing window vs 50% (same honest "realized WR vs breakeven" framing ivhv.ts's own module header uses)
+  // Tick-desk sources (analytics/tickdesk.ts) - the SAME four engines the
+  // Tick Desk chart tabs render, read off the RAW micro-tick stream the
+  // otc-footprint collector buffers (sim = ~1s prints, live = sidecar 100ms
+  // captures). These are real tick-built reads, not the close-proxy 'tick'
+  // and CLV-proxy 'footprint' above - per direct instruction ("are they all
+  // fully accessible in meta strategy") every tick-desk panel is now also a
+  // condition source. All four fail closed exactly like their panels: a
+  // warming/degenerate bucket reads 'none' with the engine's own note.
+  | 'tickSmc' // Smart Money Concepts on tick-built candles (computeTickSmc, default 15s buckets) - swing structure, BOS/CHoCH, order blocks, FVGs, liquidity sweeps, premium/discount
+  | 'tickOracle' // tick next-candle oracle (computeTickOracle) - by default the engine's own best bucket across the 1s..5m ladder; pin ONE bucket via this condition's tickBucketSec field. A bucket still warming up (ok:false) or two-sided (direction 'none') reads 'none', never a guess
+  | 'tickTechnical' // investing.com-style technical summary over tick buckets (computeTickTechnical) - by default the best-rated ok bucket's summary; pin ONE bucket via tickBucketSec. Oscillators + MAs vote buy/sell/neutral, RATING_RULE aggregates to strong-buy..strong-sell
+  | 'tickFootprint' // REAL tick footprint delta (computeTickFootprint, default 60s buckets) - measured up/down PRINT counts per price bin (not the CLV proxy); direction from the window's net delta, confidence from its share of total prints, gated on enough prints to matter
 
 export const META_CONDITION_SOURCES: readonly MetaConditionSource[] = [
   'oracle',
@@ -83,6 +95,10 @@ export const META_CONDITION_SOURCES: readonly MetaConditionSource[] = [
   'footprint',
   'tpo',
   'ivHv',
+  'tickSmc',
+  'tickOracle',
+  'tickTechnical',
+  'tickFootprint',
 ]
 
 export type MetaDirection = 'call' | 'put' | 'none'
@@ -122,6 +138,14 @@ export interface MetaCondition {
    * honesty floors already gate it); a pinned rung that is still warming
    * up or sitting in its deadband reads as 'none', never as a guess. */
   expiryMin?: number
+  /** Only meaningful on the tick-desk sources (tickSmc/tickOracle/
+   * tickTechnical/tickFootprint) - which tick-bucket length in SECONDS to
+   * read instead of each engine's own default (SMC 15s, oracle = best
+   * across the whole 1s..5m ladder, technical = best-rated ok bucket,
+   * footprint 60s). Must be a whole number 1..3600; short buckets on a
+   * slow feed read as warming-up 'none', same fail-closed contract the
+   * Tick Desk panels render. */
+  tickBucketSec?: number
 }
 
 export interface MetaStrategySpec {

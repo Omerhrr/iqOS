@@ -73,7 +73,29 @@ const ALL_SOURCES: MetaConditionSource[] = [
   'smcNow',
   'renkoSmc',
   'renkoSmcMajority',
+  'tickSmc',
+  'tickOracle',
+  'tickTechnical',
+  'tickFootprint',
 ]
+
+/** Tick-bucket lengths the tick-desk sources can be pinned to - the same
+ * ladder the tick oracle panel renders (1s..5m). Only shown for tick*
+ * sources; blank = each engine's own default (SMC 15s, oracle best bucket,
+ * technical best-rated bucket, footprint 60s). */
+const TICK_BUCKET_CHOICES: { sec: number; label: string }[] = [
+  { sec: 1, label: '1s buckets' },
+  { sec: 2, label: '2s buckets' },
+  { sec: 3, label: '3s buckets' },
+  { sec: 5, label: '5s buckets' },
+  { sec: 15, label: '15s buckets' },
+  { sec: 30, label: '30s buckets' },
+  { sec: 60, label: '1m buckets' },
+  { sec: 120, label: '2m buckets' },
+  { sec: 180, label: '3m buckets' },
+  { sec: 300, label: '5m buckets' },
+]
+const isTickSource = (s: MetaConditionSource): boolean => s === 'tickSmc' || s === 'tickOracle' || s === 'tickTechnical' || s === 'tickFootprint'
 
 const OPS = ['>=', '>', '<=', '<', '==', '!='] as const
 
@@ -87,7 +109,10 @@ const SCRIPT_PLACEHOLDER = `# Meta Strategy Lab script - combine any panel read 
 # nextExpiry:<E> for a pinned rung (nextExpiry:1 / nextExpiry:2 /
 # nextExpiry:3 / nextExpiry:5 / nextExpiry:15), and
 # smc:<KIND> for any of the 15 SMC concepts (e.g. smc:FVG, smc:BOS,
-# smc:ORDER_BLOCK...).
+# smc:ORDER_BLOCK...), plus the TICK-DESK engines: tickSmc, tickOracle,
+# tickTechnical, tickFootprint (the raw micro-tick stream, not the
+# close-proxy 'tick'/'footprint'), with tickOracle:<SEC> and
+# tickTechnical:<SEC> pinned-bucket keys (tickOracle:15, tickTechnical:60...).
 # Fields: .dir (call/put/none), .conf (0-100), .active, .call, .put
 
 let strong = smc:FVG.conf >= 60
@@ -109,6 +134,7 @@ function emptyCondition(): MetaCondition {
 function mslRefFor(c: MetaCondition): string {
   if (c.source === 'smcNow' && c.smcKind) return `smc:${c.smcKind}`
   if (c.source === 'nextExpiry' && c.expiryMin) return `nextExpiry:${c.expiryMin}`
+  if (isTickSource(c.source) && c.tickBucketSec && (c.source === 'tickOracle' || c.source === 'tickTechnical')) return `${c.source}:${c.tickBucketSec}`
   return c.source
 }
 
@@ -290,6 +316,21 @@ function ConditionRow({
           {[1, 2, 3, 5, 15].map((m) => (
             <option key={m} value={String(m)}>
               {m}m rung
+            </option>
+          ))}
+        </select>
+      )}
+      {isTickSource(cond.source) && (
+        <select
+          value={cond.tickBucketSec ? String(cond.tickBucketSec) : ''}
+          onChange={(e) => onChange({ ...cond, tickBucketSec: e.target.value ? Number(e.target.value) || undefined : undefined })}
+          className="rounded border border-[#1c2739] bg-[#0b111c] px-1 py-0.5 font-mono text-[9px] text-[#dbe4f0]"
+          title="which tick-bucket length to read - blank = each engine's own default (SMC 15s, oracle best bucket, technical best-rated bucket, footprint 60s); a bucket still warming up reads as none"
+        >
+          <option value="">default bucket</option>
+          {TICK_BUCKET_CHOICES.map((b) => (
+            <option key={b.sec} value={String(b.sec)}>
+              {b.label}
             </option>
           ))}
         </select>

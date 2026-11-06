@@ -39,6 +39,18 @@
 // it exactly like every other order in this system - there is no side door
 // around that gate for this trader or any other.
 //
+// TICK DESK UPGRADE (per direct instruction "full tick chart analysis,
+// footprint, OTC footprint, ... volume and so on" + "it should not be
+// stale ... it should be volume aware"): the desk now carries two more
+// seats - 17. the TICK DESK (tape freshness + the four tick-built engines:
+// tick SMC, tick next-candle oracle, tick technical ladder, measured-print
+// footprint with delta slope) and 18. the OTC velocity footprint (print
+// speed ratios / stagnation / exhaustion) - plus a snapshotSources() grid
+// that now spans EVERY chart type (renko/range/line/p&f/heiken ashi/IV-HV/
+// volume bars/TPO and the four tick-desk reads). The system prompt makes
+// the model staleness-aware (a STALE tape down-weights the tick reads) and
+// volume-aware (measured print flow = the desk's real order-flow evidence).
+//
 // KNOWN GAP (documented, not silently skipped): the OTC defense guard
 // (otcguard.ts) placebo-tests a fixed strategyKey against its own
 // synthetic-feed calibration - there is no strategyKey here (a prompt
@@ -71,6 +83,10 @@ import type { SentinelService } from './sentinel'
 import type { MemoryGateService } from './memory-gate'
 import type { OtcGuardService } from './otcguard'
 import type { StrategyLabService } from './lab'
+import type { OtcFootprintService } from './otcfootprint'
+import type { TickPoint } from '../analytics/otcfootprint'
+import type { FootprintResult } from '../analytics/otcfootprint'
+import { computeTickFootprint, computeTickOracle, computeTickSmc, computeTickTechnical, medianTickGapMs } from '../analytics/tickdesk'
 import { chatComplete, providerStatus, type ChatMessage } from '../lib/llm'
 import { tfSeconds } from '../analytics/synthfeed'
 import { atr, closes, ema, highs, lows, rsi, trueRange } from '../analytics/indicators'
@@ -665,6 +681,138 @@ export function calibrationLines(rows: CalibrationRow[]): string[] {
     if (w + l > 0) lines.push(`- your ${b.label}: ${fmt(w, l)}`)
   }
   if (lines.length >= 2) lines.unshift('- self-calibration (your claimed confidence vs what actually happened):')
+  return lines
+}
+
+// ---------------------------------------------------------------------------
+// TICK-DESK BRIEFING HELPERS - the AI trader's full tick-chart analysis, per
+// direct instruction ("full tick chart analysis, footprint, OTC footprint,
+// renko, range, line, p&f, heiken ashi, IVHV, volume and so on"). Pure
+// functions over the RAW micro-tick print stream (the same buffers the Tick
+// Desk panels read), unit-testable without a kernel, fail-closed: a read
+// that isn't ready is OMITTED, never guessed. The desk grid carries the
+// chart-TYPE panel reads (renko/range/line/p&f/heikin ashi/IV-HV/volume)
+// via MetaStrategyService.snapshotSources(); these helpers add the tick-
+// built engines and the volume/staleness evidence those one-label reads
+// can't carry.
+// ---------------------------------------------------------------------------
+
+/** Tape health + volume pressure off the raw print stream - the FIRST line
+ * the model should read every cycle: how fresh the tick stream is (a stale
+ * tape down-weights every tick-desk read below) and which side is winning
+ * the print flow (up-prints vs down-prints - the feed's own measured volume
+ * proxy; the collector stores price CHANGES, so every buffered print after
+ * the first carries a direction). Returns [] only when there are no prints
+ * at all - the seat then stays empty, same fail-closed contract as ever. */
+export function tapeHealthLines(ticks: TickPoint[], nowMs = Date.now()): string[] {
+  if (!ticks.length) return []
+  const cadence = medianTickGapMs(ticks)
+  const lastTs = ticks[ticks.length - 1].ts
+  const ageSec = Math.max(0, Math.round((nowMs - lastTs) / 1000))
+  // stale threshold scales with the feed's own cadence: 6 missed prints is
+  // a dead stream, never a slow one; floored at 20s so a fast feed's normal
+  // quiet patch doesn't trip it
+  const staleLimitSec = cadence != null ? Math.max((cadence * 6) / 1000, 20) : 30
+  const stale = ageSec > staleLimitSec
+  const lines = [
+    `tape: ${ticks.length} prints buffered, median cadence ${cadence != null ? `${cadence}ms` : 'n/a'}, last print ${ageSec}s ago${stale ? ` - STALE (older than ~${Math.round(staleLimitSec)}s: DISCOUNT every tick-desk read below and demand candle-structure agreement before trusting any direction)` : ' (fresh)'}`,
+  ]
+  let up = 0
+  let dn = 0
+  for (let i = 1; i < ticks.length; i++) {
+    if (ticks[i].price > ticks[i - 1].price) up += 1
+    else if (ticks[i].price < ticks[i - 1].price) dn += 1
+  }
+  if (up + dn >= 10) {
+    const share = up / (up + dn)
+    lines.push(
+      `print flow (volume proxy): ${up} up-prints vs ${dn} down-prints over the buffer (${(share * 100).toFixed(0)}% upward) - measured executed-print pressure, not a sentiment guess; ${share >= 0.6 ? 'buyers dominating the tape' : share <= 0.4 ? 'sellers dominating the tape' : 'two-sided tape'}`,
+    )
+  }
+  return lines
+}
+
+/** The four tick-desk engines, reduced to desk lines. Each engine reads the
+ * SAME ticks the Tick Desk panels render (SMC on 15s tick candles, the
+ * next-candle oracle across its 1s..5m bucket ladder, the investing.com-
+ * style technical summary ladder, the measured-print footprint) - a warming
+ * or two-sided engine simply doesn't speak. Deliberately numbered so the
+ * model can cross-reference them in its reasoning. */
+export function tickDeskLines(ticks: TickPoint[], nowMs = Date.now()): string[] {
+  const lines: string[] = []
+  // 1. tick SMC (15s buckets) - structure on tick-built candles
+  try {
+    const r = computeTickSmc(ticks, { bucketSec: 15, nowMs })
+    if (r.ok) {
+      const bits: string[] = []
+      if (r.bos) bits.push(`BOS ${r.bos.dir} ${r.bos.agoBars} bucket(s) ago`)
+      if (r.choch) bits.push(`CHoCH ${r.choch.dir} ${r.choch.agoBars} bucket(s) ago`)
+      if (r.bullOrderBlock && !r.bullOrderBlock.mitigated) bits.push('bull OB unmitigated')
+      if (r.bearOrderBlock && !r.bearOrderBlock.mitigated) bits.push('bear OB unmitigated')
+      const fvgs = r.fvgs.filter((f) => !f.filled)
+      if (fvgs.length) bits.push(`${fvgs.length} unfilled FVG (${fvgs[0].dir} newest)`)
+      if (r.sweeps.length) bits.push(`${r.sweeps.length} liquidity sweep(s)`)
+      if (r.premiumDiscount) bits.push(`price in ${r.premiumDiscount.zone}`)
+      lines.push(
+        `tick SMC (15s buckets): trend ${r.trend.toUpperCase()} -> ${r.direction.toUpperCase()} ${r.confidence.toFixed(0)}% (${r.medTicksPerCandle.toFixed(1)} prints/bucket)${bits.length ? `: ${bits.join(', ')}` : ''}${r.reasons.length ? ` - ${r.reasons[0]}` : ''}`,
+      )
+    }
+    // warming up -> omitted (the tape-health line already disclosed why)
+  } catch {
+    /* seat empty */
+  }
+  // 2. tick next-candle oracle - best bucket + the agreeing-buckets count
+  try {
+    const o = computeTickOracle(ticks, { nowMs })
+    if (o.best) {
+      const agreeing = o.rows.filter((r) => r.ok && r.direction === o.best?.direction).length
+      const wf = o.best.wf?.hitRatePct != null ? `, own walk-forward ${o.best.wf.hitRatePct}% over ${o.best.wf.n}` : ''
+      lines.push(
+        `tick oracle (next tick-candle): best ${o.best.label} ${o.best.direction.toUpperCase()} ${o.best.confidence.toFixed(0)}% (score ${o.best.score >= 0 ? '+' : ''}${o.best.score}${wf}; ${agreeing}/${o.rows.filter((r) => r.ok).length} live buckets lean the same way) - reasons: ${o.best.reasons.slice(0, 3).join('; ') || 'n/a'}`,
+      )
+    }
+  } catch {
+    /* seat empty */
+  }
+  // 3. tick technical summary - the whole investing.com-style ladder, one line
+  try {
+    const t = computeTickTechnical(ticks, { nowMs })
+    const okBuckets = t.buckets.filter((b) => b.ok)
+    if (okBuckets.length) {
+      const ladder = okBuckets.map((b) => `${b.label} ${b.summary.rating.toUpperCase()} (${b.summary.buy}B/${b.summary.sell}S/${b.summary.neutral}N)`).join(' | ')
+      lines.push(`tick technical (osc+MA committee per bucket): ${ladder}`)
+    }
+  } catch {
+    /* seat empty */
+  }
+  // 4. measured-print footprint - net delta, POC, the last buckets' delta
+  // slope (volume-aware momentum of the flow itself, not of price)
+  try {
+    const fp = computeTickFootprint(ticks, { bucketSec: 60, nowMs })
+    if (fp.ok && fp.candles.length) {
+      const s = fp.summary
+      const recent = fp.candles.slice(-5).map((c) => (c.delta >= 0 ? `+${c.delta}` : `${c.delta}`)).join(', ')
+      const lastImb = fp.candles[fp.candles.length - 1].rows.filter((r) => r.imbalance).length
+      lines.push(
+        `tick footprint (60s buckets, measured prints): net delta ${s.netDelta >= 0 ? '+' : ''}${s.netDelta} (${s.totalUp}u/${s.totalDn}d over ${s.buckets} buckets), dominant POC ${s.dominantPoc != null ? s.dominantPoc.toFixed(5) : 'n/a'}, last-bucket delta slope ${recent}${lastImb ? `, ${lastImb} imbalance bin(s) in the last bucket` : ''} - delta slope against price direction = absorption; with it = confirmation`,
+      )
+    }
+  } catch {
+    /* seat empty */
+  }
+  return lines
+}
+
+/** The OTC/micro-tick VELOCITY footprint (analytics/otcfootprint.ts via the
+ * otcFootprint service's /otc_footprint read) reduced to desk lines - this
+ * is the flow-speed engine (up/dn print speed ratios, stagnation loops,
+ * exhaustion), distinct from the plain tick footprint above. */
+export function otcFootprintLines(fp: FootprintResult): string[] {
+  const s = fp.summary
+  const lines = [
+    `velocity footprint (${fp.minutes}m window @${fp.bucketSec}s buckets, ${fp.dataSource}${fp.cadenceMs != null ? `, ${fp.cadenceMs}ms cadence` : ''}): engine verdict ${s.signal.toUpperCase()} score ${s.score >= 0 ? '+' : ''}${s.score} - net delta ${s.netDelta >= 0 ? '+' : ''}${s.netDelta} (${s.totalUp}u/${s.totalDn}d), avg speed ratio ${s.avgSpeedRatio.toFixed(2)}, POC ${s.dominantPoc != null ? s.dominantPoc.toFixed(5) : 'n/a'}`,
+  ]
+  if (s.note) lines.push(`engine note: ${s.note}`)
   return lines
 }
 
@@ -1307,6 +1455,40 @@ export class AiTraderService {
       // omitted
     }
 
+    // ---- 17. TICK DESK (the raw micro-tick print stream - tape freshness
+    // first, then the four tick-built engines: SMC on tick candles, the tick
+    // next-candle oracle, the technical-summary ladder, the measured-print
+    // footprint with its delta slope). Per direct instruction the trader is
+    // VOLUME-AWARE and STALENESS-AWARE: the tape line says how old the
+    // stream is (STALE = discount everything below), the flow lines are
+    // measured up/down prints - the feed's own volume evidence.
+    try {
+      const ofp = this.svc<OtcFootprintService>('otcFootprint')
+      const ticks = ofp?.ticksFor(asset) ?? []
+      if (ticks.length) {
+        const nowMs = Date.now()
+        section('tick desk (raw micro-tick stream: tape health / tick SMC / tick oracle / tick technical / tick footprint)', [...tapeHealthLines(ticks, nowMs), ...tickDeskLines(ticks, nowMs)])
+      }
+    } catch {
+      // omitted - no tick collector or no prints yet
+    }
+
+    // ---- 18. OTC velocity footprint (the flow-SPEED engine: up/dn print
+    // speed ratios, stagnation loops, exhaustion - async read off the same
+    // collector, raced with a short timeout exactly like the yesterday-echo
+    // seat so a cold pull can never stall the decision loop)
+    try {
+      const ofp = this.svc<OtcFootprintService>('otcFootprint')
+      if (ofp) {
+        const fp = ofp.footprint(asset, { minutes: 30, bucketSec: 60 }).then((r) => ({ r })).catch(() => null)
+        const timeout = new Promise<{ r: null }>((res) => setTimeout(() => res({ r: null }), 2500))
+        const got = await Promise.race([fp, timeout])
+        if (got?.r) section('OTC velocity footprint (print-speed order flow, 30m)', otcFootprintLines(got.r))
+      }
+    } catch {
+      // omitted
+    }
+
     return { lines, sourcesSeen }
   }
 
@@ -1514,8 +1696,11 @@ export class AiTraderService {
           'honesty engine (1/2/3/5/15 minute rungs with pWin per rung), a shot-license tempo scanner, a 14-factor',
           'confluence screener, an OU mean-reversion stretch model, an SMC structure engine, a chart-pattern',
           'committee, lead-lag/cointegration/volatility-dislocation cross-asset scanners, a T-24h replay, the',
-          'account book, the operator rule gate, the OTC defense guard, and the AI Lab where learned strategies',
-          'report their holdout edge. You are their HUMAN - not one more system running alongside them.',
+          'TICK DESK (the raw micro-tick print stream: tape freshness, SMC structure on tick candles, a tick',
+          'next-candle oracle, a technical-summary ladder and a measured-print footprint with its delta slope),',
+          'the OTC velocity footprint (measured print-speed order flow), the account book, the operator rule',
+          'gate, the OTC defense guard, and the AI Lab where learned strategies report their holdout edge.',
+          'You are their HUMAN - not one more system running alongside them.',
           '',
           'A real senior trader works exactly like this: read the tape with his own eyes first (the raw closes,',
           'the candle anatomy and swing structure in YOUR OWN ANALYSIS below), then take the meeting with the',
@@ -1533,6 +1718,12 @@ export class AiTraderService {
           '  same way is evidence; the same scanner family restated five times is one voice, not five.',
           '- The desk tally is a starting point, never your decision - it says nothing about expiry, and a loud',
           '  tally of weak/unproven voices is exactly the trap you exist to not fall into.',
+          '- You are VOLUME-AWARE and STALENESS-AWARE, in that order: read the tick desk\'s tape line FIRST - a',
+          '  STALE tape (last print too old) down-weights every tick-desk and footprint read no matter how loud',
+          '  they are. On fresh tape, the measured print flow (up/down prints, net delta, delta slope, speed',
+          '  ratios, POC migration) is the desk\'s only REAL order-flow evidence: flow agreeing with price',
+          '  structure is confirmation, flow against price is absorption - both beat another indicator restating',
+          '  the candle close.',
           '- A MEMORY-GATE "BLOCKED" line or an engaged kill switch is a HARD skip for that asset - no override.',
           '',
           'Your job each cycle:',
@@ -1541,10 +1732,13 @@ export class AiTraderService {
           '   trending, ranging, exhausting, reversing? Do not restate the numbers back - interpret them.',
           '2. Take the desk meeting: weigh the briefing by each read\'s own calibration record as above. If the',
           '   desk conflicts with your own read, decide who you trust more for THIS moment and say which you did.',
+          '   Check the tick desk\'s tape-freshness and print-flow lines before you trust any direction: fresh',
+          '   tape + flow agreeing with structure is the highest-conviction stack this desk can show you.',
           '3. Direction and expiry TOGETHER: check the per-expiry runs and the expiry-oracle rungs for EACH menu',
           '   choice, and pick the ONE expiry where your evidence is clearest for that specific holding period.',
           '   A read that is strong at 3min can be noise at 15min; the OU half-life line tells you which windows',
-          '   can plausibly see a round trip at all.',
+          '   can plausibly see a round trip at all, and the tick oracle\'s per-bucket reads tell you what the',
+          '   raw stream itself expects over the NEXT seconds-to-minutes candles.',
           '4. Precision over frequency: most cycles SHOULD be a skip. Only call/put when you would genuinely',
           '   expect to be right most of the time at the confidence you claim. Honestly uncertain + skip always',
           '   beats a confident-sounding coin flip.',

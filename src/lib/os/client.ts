@@ -313,6 +313,10 @@ export type MetaConditionSource =
   | 'smcNow'
   | 'renkoSmc'
   | 'renkoSmcMajority'
+  | 'tickSmc'
+  | 'tickOracle'
+  | 'tickTechnical'
+  | 'tickFootprint'
 
 export const META_CONDITION_SOURCE_LABELS: Record<MetaConditionSource, string> = {
   oracle: 'Next-Candle Oracle',
@@ -338,6 +342,10 @@ export const META_CONDITION_SOURCE_LABELS: Record<MetaConditionSource, string> =
   smcNow: 'SMC "now" (this candle only)',
   renkoSmc: 'Renko + SMC "now" confluence (any agrees)',
   renkoSmcMajority: 'Renko + SMC "now" confluence (majority)',
+  tickSmc: 'Tick SMC (tick-chart structure)',
+  tickOracle: 'Tick next-candle oracle',
+  tickTechnical: 'Tick technical summary',
+  tickFootprint: 'Tick footprint (measured delta)',
 }
 
 /** All 15 SMC concepts, same list Meta Trader's own smc-<kind> sources
@@ -379,6 +387,10 @@ export interface MetaCondition {
    * rung (1/2/3/5/15 minutes) to read, or undefined for the oracle's own
    * best pick (already gated by its pWin/confidence honesty floors). */
   expiryMin?: number
+  /** only meaningful on the tick-desk sources (tickSmc/tickOracle/
+   * tickTechnical/tickFootprint) - which tick-bucket length in seconds to
+   * read, or undefined for each engine's own default. */
+  tickBucketSec?: number
 }
 
 export interface MetaStrategySpec {
