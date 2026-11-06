@@ -83,6 +83,7 @@ import { volumeBars } from './src/analytics/volumebars'
 import { computeFootprint } from './src/analytics/footprint'
 import { computeTpo } from './src/analytics/tpo'
 import { tickBars } from './src/analytics/tickbars'
+import { computeTickSmc, computeTickOracle, computeTickTechnical, computeTickFootprint, medianTickGapMs } from './src/analytics/tickdesk'
 import { hvSeries, ivFromPayout, realizedUpProb } from './src/analytics/ivhv'
 import { buildCalibrationReport, type CalibrationStoreSlice } from './src/analytics/calibration'
 import { computeStepStats, computeIntervalStats } from './src/analytics/randomness'
@@ -1796,6 +1797,42 @@ const httpServer = createServer(async (req, res) => {
         const minutes = Math.max(1, Math.min(240, Number(q.get('minutes') ?? 30)))
         const bucketSec = Math.max(5, Math.min(3600, Number(q.get('bucketSec') ?? 60)))
         return json(200, { ok: true, ...(await fp.footprint(asset, { minutes, bucketSec })) })
+      }
+
+      // ---------- Tick Desk: the tick-chart views ----------
+      // Everything below reads the RAW micro-tick stream (the otc-footprint
+      // collector's per-asset buffers: sim = the kernel engine's ~1s prints,
+      // live = the sidecar's 100ms price-change captures) - NOT time candles.
+      // Each view derives its own tick-chart buckets from the same prints and
+      // discloses dataSource + measured cadence on every response.
+      if (path === '/tick_smc' || path === '/tick_oracle' || path === '/tick_technical' || path === '/tick_footprint') {
+        const ofp = kernel.context().use<OtcFootprintService>('otcFootprint')
+        const asset = String(q.get('asset') ?? '').toUpperCase() || market.activeAsset
+        const ticks = ofp.ticksFor(asset)
+        const live = market.mode === 'live'
+        const source = {
+          asset,
+          feed: market.mode,
+          dataSource: live ? 'sidecar-tick-100ms' : ticks.length ? 'sim-tick-1s' : 'no-ticks-yet',
+          cadenceMs: medianTickGapMs(ticks),
+          ticks: ticks.length,
+          lastTickTs: ticks.length ? ticks[ticks.length - 1].ts : null,
+        }
+        if (path === '/tick_smc') {
+          const bucketSec = Math.max(5, Math.min(3600, Number(q.get('bucketSec') ?? 15)))
+          return json(200, { ...source, ...computeTickSmc(ticks, { bucketSec }) })
+        }
+        if (path === '/tick_oracle') {
+          return json(200, { ...source, ...computeTickOracle(ticks) })
+        }
+        if (path === '/tick_technical') {
+          const detailBucketSec = Math.max(5, Math.min(3600, Number(q.get('bucketSec') ?? 60)))
+          return json(200, { ...source, ...computeTickTechnical(ticks, { detailBucketSec }) })
+        }
+        const fbBucketSec = Math.max(5, Math.min(3600, Number(q.get('bucketSec') ?? 60)))
+        const fbBins = Math.max(2, Math.min(24, Number(q.get('bins') ?? 12)))
+        const fbCandles = Math.max(2, Math.min(80, Number(q.get('candles') ?? 30)))
+        return json(200, { ...source, ...computeTickFootprint(ticks, { bucketSec: fbBucketSec, bins: fbBins, maxBuckets: fbCandles }) })
       }
 
       if (path === '/analysis') {

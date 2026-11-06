@@ -113,7 +113,7 @@ function trimAnalysis(a: Record<string, unknown>): Record<string, unknown> {
   return out
 }
 
-const CHART_TYPES = ['candles', 'hollow', 'bars', 'line', 'area', 'baseline', 'heikin-ashi', 'renko', 'pointfigure', 'rangebars', 'volumebars', 'footprint', 'otcfootprint', 'tpo', 'tickchart', 'ivhv']
+const CHART_TYPES = ['candles', 'hollow', 'bars', 'line', 'area', 'baseline', 'heikin-ashi', 'renko', 'pointfigure', 'rangebars', 'volumebars', 'footprint', 'otcfootprint', 'tickfootprint', 'tpo', 'tickchart', 'ivhv']
 
 // ---------- shared helpers for the composed power tools ----------
 
@@ -455,6 +455,54 @@ const TOOLS: ToolSpec[] = [
           exhaustion: b.exhaustion,
         })),
         note: 'velocity footprint of the OTC generator print stream - not real order flow; cadence is bounded by the capture rate',
+      }
+    },
+  },
+  {
+    name: 'tick_desk',
+    description:
+      'Tick Desk - the TICK-CHART read (raw price-print stream, NOT time candles) in one call: (1) Tick SMC - Smart Money Concepts on tick-derived buckets: swing structure trend, BOS/CHoCH, order blocks, FVGs, liquidity sweeps, premium/discount with a call/put vote; (2) Tick Oracle - per-bucket (1s..5m) next-candle direction with an on-buffer walk-forward hit rate per row ("wf 54% (23)" = the same rule replayed on recent history, evidence not promise); (3) Tick Technical - investing.com-style summary on tick buckets: oscillators + moving averages each vote buy/sell/neutral, aggregated strong-buy..strong-sell per bucket ladder. Everything derives from the feed\'s OWN prints (sim ~1s engine or sidecar 100ms live), cadence disclosed on every response. HONESTY: short buckets on slow feeds read "capture cadence too slow", thin history reads "warming up", a two-sided tape reads "no honest lean" - report those verbatim, never dress them up. Use when the user asks for tick-based SMC, the tick oracle, tick technical summary, or "what does the tick desk say".',
+    args: '{"asset": "EURUSD", "smcBucketSec": 15, "techBucketSec": 60}',
+    run: async (a) => {
+      const asset = String(a.asset ?? 'EURUSD').toUpperCase()
+      const smcBucketSec = Math.max(5, Math.min(3600, Number(a.smcBucketSec) || 15))
+      const techBucketSec = Math.max(5, Math.min(3600, Number(a.techBucketSec) || 60))
+      const enc = encodeURIComponent(asset)
+      try {
+        const [smc, oracle, tech] = (await Promise.all([
+          coreGet(`/tick_smc?asset=${enc}&bucketSec=${smcBucketSec}`),
+          coreGet(`/tick_oracle?asset=${enc}`),
+          coreGet(`/tick_technical?asset=${enc}&bucketSec=${techBucketSec}`),
+        ])) as [
+          { ok: boolean; dataSource?: string; cadenceMs?: number | null; ticks?: number; okRead?: boolean; trend?: string; bos?: { dir: string; level: number; agoBars: number } | null; choch?: { dir: string; level: number; agoBars: number } | null; sweeps?: unknown[]; premiumDiscount?: { zone: string } | null; direction?: string; confidence?: number; note?: string; reasons?: string[] } & Record<string, unknown>,
+          { ok: boolean; dataSource?: string; rows?: { label: string; ok: boolean; note?: string; direction?: string; confidence?: number; score?: number; wf?: { n: number; hits: number; misses: number; hitRatePct: number | null } | null; reasons?: string[] }[]; best?: { label: string; direction?: string; confidence?: number } | null },
+          { ok: boolean; dataSource?: string; buckets?: { label: string; ok: boolean; note?: string; osc?: { rating: string }; mas?: { rating: string }; summary?: { rating: string; buy: number; sell: number; neutral: number } }[]; detail?: { ok: boolean; candles?: number; skipped?: string[]; rows?: { name: string; group: string; vote: string; value: string }[] } },
+        ]
+        const orows = (oracle.rows ?? []).map((r) => ({
+          bucket: r.label,
+          read: r.ok ? `${r.direction ?? 'none'}${r.direction && r.direction !== 'none' ? ` ${r.confidence}%` : ''}` : r.note ?? 'warming up',
+          score: r.score,
+          wf: r.wf ? `${r.wf.hitRatePct}% (${r.wf.n})` : 'thin',
+          why: (r.reasons ?? []).slice(0, 3).join(' · ') || undefined,
+        }))
+        const trows = (tech.buckets ?? []).map((b) => ({
+          bucket: b.label,
+          read: b.ok ? `${b.summary?.rating ?? 'neutral'} (osc ${b.osc?.rating}, mas ${b.mas?.rating}, votes ${b.summary?.buy}+/${b.summary?.sell}-/${b.summary?.neutral}=)` : b.note ?? 'warming up',
+        }))
+        return {
+          ok: true,
+          asset,
+          dataSource: smc.dataSource,
+          cadenceMs: smc.cadenceMs,
+          smc: smc.ok
+            ? { trend: smc.trend, bos: smc.bos, choch: smc.choch, sweeps: (smc.sweeps as unknown[] | undefined)?.length ?? 0, zone: smc.premiumDiscount?.zone, direction: smc.direction, confidence: smc.confidence, reasons: smc.reasons }
+            : { warmingUp: true, note: smc.note ?? 'no tick structure yet' },
+          oracle: { rows: orows, best: oracle.best ?? null },
+          technical: { ladder: trows, detailSkipped: tech.detail?.skipped ?? [], detailCandles: tech.detail?.candles ?? 0 },
+          note: 'everything reads the raw print stream (tick chart), not time candles; short buckets on slow feeds are cadence-gated and say so',
+        }
+      } catch (e) {
+        return { ok: false, error: (e as Error).message.slice(0, 160) }
       }
     },
   },
@@ -1987,7 +2035,7 @@ const TOOLS: ToolSpec[] = [
   // ---------- OS control (executed client-side) ----------
   {
     name: 'ui_control',
-    description: `Operate the user's OS interface. ALWAYS pass "cmd" - one of: set_asset (+"asset":"BTCUSD"), set_tf (+"tf":"5m"), set_chart_type (+"chartType":"heikin-ashi" - candles|hollow|bars|line|area|baseline|heikin-ashi|renko|pointfigure|rangebars|volumebars|footprint|tpo|tickchart|ivhv), add_indicator (+"id":"bollinger", optional "params":{...}, "pane":"overlay"|"sub"), remove_indicator (+"id":"macd"), clear_indicators. Use it to set up the workspace for your analysis.`,
+    description: `Operate the user's OS interface. ALWAYS pass "cmd" - one of: set_asset (+"asset":"BTCUSD"), set_tf (+"tf":"5m"), set_chart_type (+"chartType":"heikin-ashi" - candles|hollow|bars|line|area|baseline|heikin-ashi|renko|pointfigure|rangebars|volumebars|footprint|otcfootprint|tickfootprint|tpo|tickchart|ivhv), add_indicator (+"id":"bollinger", optional "params":{...}, "pane":"overlay"|"sub"), remove_indicator (+"id":"macd"), clear_indicators. Use it to set up the workspace for your analysis.`,
     args: '{"cmd": "set_asset", "asset": "BTCUSD"}  |  {"cmd": "add_indicator", "id": "macd", "pane": "sub"}',
     run: async (aRaw, ctx) => {
       const ALL_TFS = ['5s', '15s', '30s', '1m', '2m', '5m', '15m', '30m', '1h', '4h', '1d']
@@ -2028,6 +2076,7 @@ const TOOLS: ToolSpec[] = [
         volumebars: 'volumebars', volumebar: 'volumebars', volume: 'volumebars', constantvolume: 'volumebars', cvb: 'volumebars',
         footprint: 'footprint', cluster: 'footprint', clusterchart: 'footprint', volumeprint: 'footprint',
         otcfootprint: 'otcfootprint', otc: 'otcfootprint', otcfp: 'otcfootprint', otcvelocity: 'otcfootprint', velocityfootprint: 'otcfootprint', otcfootprintchart: 'otcfootprint',
+        tickfootprint: 'tickfootprint', tickfp: 'tickfootprint', tickfootprintchart: 'tickfootprint', printfp: 'tickfootprint', printfootprint: 'tickfootprint',
         tpo: 'tpo', marketprofile: 'tpo', timeprice: 'tpo', timepriceopportunity: 'tpo', profile: 'tpo',
         tickchart: 'tickchart', tick: 'tickchart', ticks: 'tickchart', tickbars: 'tickchart',
         ivhv: 'ivhv', ivvshv: 'ivhv', ivhvchart: 'ivhv', impliedvolatility: 'ivhv',
@@ -2193,6 +2242,8 @@ All of them work in run_strategy / backtest / optimize_strategy / walkforward / 
 SEVEN MORE BUILTIN STRATEGIES (same tools as above): "ichimoku-cloud" (price vs the senkou cloud + tenkan/kijun cross, thin-cloud crosses scored down), "vwap-reversion" (fades the z-score stretch from VWAP - the cheap cross-check against kalman-ou-reversion on the same instrument), "keltner-chandelier" (ATR-scaled channel breakout, reports the Chandelier Exit line as an invalidation reference since the binary engine is fixed-expiry, not trailing-stop), "mtf-alignment" (resamples the SAME feed into synthetic 5x/15x bars and requires minAgree of the 3 EMA(8/21) reads to agree - the confluence_read MTF idea as a deployable strategy), "vol-squeeze-breakout" (plain Bollinger-width squeeze-then-breakout - the simpler single-layer baseline to check whether VSK/TSK's extra Kalman/PSAR machinery earns its keep on a given instrument), "liquidity-sweep-reversal" (fires on a wick through a real supportResistance() zone that closes back inside it - a stop-hunt rejection, unlike Pattern Confluence which has no concept of WHERE on the chart a pattern fired), and "garch-vol-expansion" (the expansion mirror of kalman-ou-vol-regime, which fades compression - this one trades WITH momentum when GARCH/EWMA vol ratio clears 1.3, the same threshold regime_playbook uses for its VOLATILE classification).
 ORDER FLOW (approx) - use the order_flow tool to pull Volume Profile (Point of Control, Value Area High/Low, per-price-bucket volume) and candle delta / cumulative delta for an asset+timeframe, the same data behind the Order Flow panel on the chart. This is a CLV (close-location-value) approximation of buy/sell volume split from OHLCV candles, NOT real tick-level order-flow or order-book depth - IQ Option exposes no bid/ask-tagged trades, so always caveat any read from it as "(approx)". THREE MORE BUILTIN STRATEGIES use this data: "poc-reversion" (CALL when price has stretched below the recent Point of Control with delta turning positive, PUT the mirror above POC), "value-area-breakout" (CALL/PUT on a close outside the Value Area High/Low, scored up when supporting delta confirms the breakout and down when delta doesn't), and "delta-divergence" (PUT when price makes a new local high but cumulative delta fails to confirm it, CALL the mirror at a new local low) - all three show up in list_strategies/run_strategy/backtest like any other builtin. The AI Lab's signal DSL also gained an order-flow family (ind: "ofdelta"/"ofcumdelta"/"ofpocdist"/"ofvapos", same indicator-signal shape as rsi/zscore/etc.) so lab_learn/create_strategy can discover edge in delta, cumulative-delta slope, POC distance or value-area position automatically alongside every other indicator family.
 SIX CHART-TYPE STRATEGIES (the chart engines as tradeable builtins, all in list_strategies/run_strategy/backtest like any other): "range-run" (range-bar continuation - every range bar spans exactly one full ATR-sized range of travel, so a young run of same-direction bars is sustained pressure measured in distance, not time; fires while the run is young, stands aside once older than confirm - the no-reversal-multiplier sibling of renko-flip), "volbars-conviction" (constant-volume bars normalize activity, so a dominant BODY on equal (approx) volume is directional conviction, not a busy tape; reads only COMPLETED bars, the forming trailing bar is excluded), "footprint-imbalance" (the footprint chart's stacked-imbalance read: fires when the last candle shows minRows price bins where one side carries >= imbalanceRatio x the other - CLV proxy, volume-less candles never fire), "tpo-fade" (market-profile balance-day fade: only when price rotated through the POC minRotations times (balance) and the close pokes just outside the 70% value area, fade back toward POC; far excursions read as trend days and stand aside - the deliberate OPPOSITE of value-area-breakout, which trades the breakout), "tick-regime" (reads the tape's own character from candle closes as pseudo-ticks: P(same-direction consecutive move) with a binomial z vs the fair coin - persistent tapes continue the last move, anti-persistent tapes (real-feed bid-ask bounce) fade it, and a FAIR-COIN tape (|z| < zMin) stands aside by construction, which is how this strategy honestly refuses OTC feeds), and "ivhv-edge" (the IV-vs-HV chart's edge view: fires when the realized up-close frequency over the window clears the payout-implied breakeven q = 100/(1+payout) - the disclosed IV proxy - by a margin; payout is a PARAM, the live EV gate still applies at trade time). regime_playbook routes them: range-run/volbars-conviction/footprint-imbalance for TRENDING, tpo-fade for RANGING, ivhv-edge for VOLATILE, tick-regime for MIXED.
+
+TICK DESK (tick_desk tool + /tick_smc /tick_oracle /tick_technical /tick_footprint kernel routes + the Tick SMC / Tick Oracle / Tick Technical bottom tabs + the 'Tick FP' chart type): everything here reads the RAW micro-tick print stream (the otc-footprint collector's buffers - sim ~1s engine prints, live sidecar 100ms captures) bucketed into TICK CHARTS, never time candles. Tick SMC = Smart Money Concepts on tick buckets (swing trend, BOS/CHoCH, order blocks, FVGs, liquidity sweeps, premium/discount). Tick Oracle = per-bucket (1s/2s/3s/5s/15s/30s/1m/2m/3m/5m) next-candle direction where each row discloses the same rule's on-buffer walk-forward hit rate. Tick Technical = investing.com-style summary (oscillators + SMA/EMA/VWMA/Hull/Ichimoku-base each vote buy/sell/neutral -> strong-buy..strong-sell per bucket). Tick Footprint = per-bucket price-bin ladder of MEASURED up/down prints (not the candle footprint's CLV proxy) - chart type 'tickfootprint'. Honesty: short buckets on slow feeds are cadence-gated ('capture cadence too slow'), thin history says 'warming up', a two-sided tape reads 'no honest lean' - report those verbatim; these are the views to quote when the user asks for tick-level/SMC/next-candle/technical-summary reads at sub-candle resolution.
 ENGINE EDGE RESEARCH - the engines_edge tool answers "which chart engines actually carry edge" by merging BOTH feedback loops the OS keeps on the chart engines: the live Signal-Panel honesty loop (real resolved reads per engine, option + CFD kinds) and the deep-history lab loop (engine votes replayed through the binary settlement engine, Wilson interval vs the payout breakeven). Verdicts: edge / watch / thin / coinflip / fade - a "fade" verdict means the engine is confidently WORSE than breakeven and the INVERTED vote is a research candidate to test, not a confirmed trade. Call engines_edge when the user asks "is renko any good", "which signals should I trust", "what's actually working" - and always report the sample sizes alongside any verdict (a 56% win rate on n=18 is noise, not edge).
 ENSEMBLE (strategy id "ensemble-vote", params: members = comma-separated builtin strategy ids e.g. "ema-trend,rsi-reversion,markov-edge", voteMinScore = per-member score to count as a vote (default 40), minAgree = how many members must agree (default 2)) trades only the INTERSECTION of independent edges: it runs each member strategy on the same candles and only fires when minAgree+ of them agree on direction, scoring the average of the agreeing members' scores with a small consensus discount when agreement is right at the floor. Use it when the user wants higher precision at the cost of fewer signals ("I want fewer but more confident trades", "only trade when multiple things agree") - suggest 2-3 members that capture DIFFERENT signal types (e.g. one trend strategy + one mean-reversion + one Markov/statistical one) rather than near-duplicates, since correlated members defeat the point of voting. Always walkforward-validate the ensemble itself (not just its members individually) before arming a bot on it - member edges can each be real without their intersection being tradeable, and the research gate below enforces this anyway.
 CRITICAL - "members" is NOT a sweep key, it's a fixed param: members is a comma-separated id LIST, not a numeric range, so it can never go inside optimize_strategy/walkforward's "sweep" object (sweep only does from/to/step over numbers). To test YOUR chosen members (not the strategy's own default "ema-trend,rsi-reversion,markov-edge"), you MUST pass them in the separate "params" argument, e.g. walkforward with strategy "ensemble-vote" and params {"members":"pattern-confluence,confluence-full","minAgree":2,"voteMinScore":40}. Putting members inside "sweep" or leaving it out of the call entirely silently reverts to the default trio - always re-read the result's bestParams.members back before reporting a verdict, and if it doesn't match what you intended to test, STOP and say so rather than reporting a verdict on a different ensemble than the one discussed.

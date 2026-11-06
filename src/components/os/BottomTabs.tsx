@@ -37,6 +37,9 @@ import OtcFootprintPanel from './OtcFootprintPanel'
 import DiagnosticsPanel from './DiagnosticsPanel'
 import CodeAssistBar from './CodeAssistBar'
 import { builtinStrategyToMsl } from './builtinMslView'
+import TickSmcPanel from './TickSmcPanel'
+import TickOraclePanel from './TickOraclePanel'
+import TickTechnicalPanel from './TickTechnicalPanel'
 import { FullscreenBackdrop, FullscreenButton } from './FullscreenButton'
 
 interface BottomTabsProps {
@@ -247,6 +250,9 @@ export default function BottomTabs(props: BottomTabsProps) {
             ['quant', 'Quant Lab'],
             ['orderflow', 'Order Flow'],
             ['otcfootprint', 'OTC Footprint'],
+            ['ticksmc', 'Tick SMC'],
+            ['tickoracle', 'Tick Oracle'],
+            ['ticktech', 'Tick Technical'],
             ['patterns', `Patterns (${patterns.length})`],
             ['alerts', 'Alerts'],
             ['diagnostics', 'Diagnostics'],
@@ -645,6 +651,21 @@ export default function BottomTabs(props: BottomTabsProps) {
       {/* OTC MICRO-TICK VELOCITY FOOTPRINT (generator-print speed matrix) */}
       <TabsContent value="otcfootprint" className="mt-0 min-h-0 flex-1 overflow-hidden">
         <OtcFootprintPanel asset={asset} />
+      </TabsContent>
+
+      {/* TICK DESK: SMC structure on tick-chart buckets (prints, not candles) */}
+      <TabsContent value="ticksmc" className="mt-0 min-h-0 flex-1 overflow-hidden">
+        <TickSmcPanel asset={asset} />
+      </TabsContent>
+
+      {/* TICK DESK: per-bucket next-candle oracle from the tick stream */}
+      <TabsContent value="tickoracle" className="mt-0 min-h-0 flex-1 overflow-hidden">
+        <TickOraclePanel asset={asset} />
+      </TabsContent>
+
+      {/* TICK DESK: investing.com-style technical summary on tick buckets */}
+      <TabsContent value="ticktech" className="mt-0 min-h-0 flex-1 overflow-hidden">
+        <TickTechnicalPanel asset={asset} />
       </TabsContent>
 
       {/* PATTERNS */}

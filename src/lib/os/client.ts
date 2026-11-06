@@ -49,6 +49,10 @@ export type ChartType =
   | 'rangebars' | 'volumebars' | 'footprint' | 'tpo' | 'tickchart' | 'ivhv'
   // OTC micro-tick velocity footprint (kernel route /otc_footprint)
   | 'otcfootprint'
+  // Tick Desk: measured-print footprint over tick-chart buckets
+  // (kernel route /tick_footprint - real up/down prints per price bin,
+  // not the CLV proxy)
+  | 'tickfootprint'
 export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'candles', label: 'Candles' },
   { id: 'hollow', label: 'Hollow' },
@@ -63,6 +67,7 @@ export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'volumebars', label: 'Vol Bars' },
   { id: 'footprint', label: 'Footprint' },
   { id: 'otcfootprint', label: 'OTC Footprint' },
+  { id: 'tickfootprint', label: 'Tick FP' },
   { id: 'tpo', label: 'TPO' },
   { id: 'tickchart', label: 'Tick' },
   { id: 'ivhv', label: 'IV·HV' },
@@ -639,6 +644,184 @@ export async function getOtcFootprint(asset: string, opts?: { minutes?: number; 
     asset,
     minutes: opts?.minutes,
     bucketSec: opts?.bucketSec,
+  })
+}
+
+// ---------- Tick Desk (see trading-core/src/analytics/tickdesk.ts) ----------
+// The tick-chart views: SMC structure, next-candle oracle, investing.com-style
+// technical summary and a measured-print footprint - all derived from the RAW
+// micro-tick stream (the otc-footprint collector's buffers), never time
+// candles. Every response discloses the tick source + measured cadence.
+
+/** Shared envelope of every /tick_* route: the print source honestly labeled. */
+export interface TickSourceMeta {
+  asset: string
+  feed: 'sim' | 'live' | string
+  /** 'sim-tick-1s' | 'sidecar-tick-100ms' | 'no-ticks-yet' */
+  dataSource: string
+  cadenceMs: number | null
+  ticks: number
+  lastTickTs: number | null
+}
+
+export type TickRating = 'strong-buy' | 'buy' | 'neutral' | 'sell' | 'strong-sell'
+
+export interface TickSmcZone {
+  top: number
+  bottom: number
+  time: number
+}
+
+export interface TickSmcBreak {
+  dir: 'bull' | 'bear'
+  level: number
+  time: number
+  agoBars: number
+}
+
+export interface TickSmcResult extends TickSourceMeta {
+  ok: boolean
+  note?: string
+  bucketSec: number
+  candles: number
+  medTicksPerCandle: number
+  trend: 'up' | 'down' | 'range'
+  bos: TickSmcBreak | null
+  choch: TickSmcBreak | null
+  bullOrderBlock: (TickSmcZone & { mitigated: boolean }) | null
+  bearOrderBlock: (TickSmcZone & { mitigated: boolean }) | null
+  fvgs: (TickSmcZone & { dir: 'bull' | 'bear'; filled: boolean })[]
+  sweeps: (TickSmcZone & { dir: 'bull' | 'bear'; close: number })[]
+  premiumDiscount: { eq: number; high: number; low: number; zone: 'premium' | 'discount' | 'equilibrium' } | null
+  price: number
+  direction: 'call' | 'put' | 'none'
+  confidence: number
+  reasons: string[]
+}
+
+export interface TickOracleRow {
+  label: string
+  bucketSec: number
+  ok: boolean
+  note?: string
+  candles: number
+  medTicksPerCandle: number
+  direction: 'call' | 'put' | 'none'
+  confidence: number
+  score: number
+  reasons: string[]
+  wf: { n: number; hits: number; misses: number; hitRatePct: number | null } | null
+}
+
+export interface TickOracleResult extends TickSourceMeta {
+  ok: boolean
+  note?: string
+  rows: TickOracleRow[]
+  best: TickOracleRow | null
+}
+
+export interface TickTechRow {
+  name: string
+  group: 'osc' | 'ma'
+  vote: 'buy' | 'sell' | 'neutral'
+  value: string
+}
+
+export interface TickTechVotes {
+  buy: number
+  sell: number
+  neutral: number
+  rating: TickRating
+}
+
+export interface TickTechBucket {
+  label: string
+  bucketSec: number
+  ok: boolean
+  note?: string
+  candles: number
+  osc: TickTechVotes
+  mas: TickTechVotes
+  summary: TickTechVotes
+}
+
+export interface TickTechnicalResult extends TickSourceMeta {
+  ok: boolean
+  note?: string
+  buckets: TickTechBucket[]
+  detail: {
+    label: string
+    bucketSec: number
+    ok: boolean
+    note?: string
+    candles: number
+    rows: TickTechRow[]
+    skipped: string[]
+    price: number
+  }
+  rule: string
+}
+
+export interface TickFootprintRow {
+  priceLow: number
+  priceHigh: number
+  mid: number
+  up: number
+  dn: number
+  upMs: number
+  dnMs: number
+  delta: number
+  imbalance: 'buy' | 'sell' | null
+}
+
+export interface TickFootprintCandle {
+  time: number
+  open: number
+  high: number
+  low: number
+  close: number
+  ticks: number
+  upTicks: number
+  dnTicks: number
+  delta: number
+  poc: number | null
+  rows: TickFootprintRow[]
+}
+
+export interface TickFootprintResult extends TickSourceMeta {
+  ok: boolean
+  note?: string
+  bucketSec: number
+  bins: number
+  imbRatio: number
+  candles: TickFootprintCandle[]
+  summary: {
+    netDelta: number
+    totalUp: number
+    totalDn: number
+    dominantPoc: number | null
+    buckets: number
+  }
+}
+
+export async function getTickSmc(asset: string, opts?: { bucketSec?: number }): Promise<TickSmcResult> {
+  return osGet<TickSmcResult>('/tick_smc', { asset, bucketSec: opts?.bucketSec })
+}
+
+export async function getTickOracle(asset: string): Promise<TickOracleResult> {
+  return osGet<TickOracleResult>('/tick_oracle', { asset })
+}
+
+export async function getTickTechnical(asset: string, opts?: { bucketSec?: number }): Promise<TickTechnicalResult> {
+  return osGet<TickTechnicalResult>('/tick_technical', { asset, bucketSec: opts?.bucketSec })
+}
+
+export async function getTickFootprint(asset: string, opts?: { bucketSec?: number; bins?: number; candles?: number }): Promise<TickFootprintResult> {
+  return osGet<TickFootprintResult>('/tick_footprint', {
+    asset,
+    bucketSec: opts?.bucketSec,
+    bins: opts?.bins,
+    candles: opts?.candles,
   })
 }
 

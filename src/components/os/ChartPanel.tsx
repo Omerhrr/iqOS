@@ -24,8 +24,8 @@ import {
   type Time,
   type UTCTimestamp,
 } from 'lightweight-charts'
-import type { AnalysisResult, Candle, ChartType, IndicatorSeries, IvHvResponse, OtcFootprintResult, Position, TickBarRow, TicksResponse, Timeframe } from '@/lib/os/client'
-import { chartPriceFormat, fmtPrice, getOtcFootprint, osGet } from '@/lib/os/client'
+import type { AnalysisResult, Candle, ChartType, IndicatorSeries, IvHvResponse, OtcFootprintResult, Position, TickBarRow, TickFootprintResult, TicksResponse, Timeframe } from '@/lib/os/client'
+import { chartPriceFormat, fmtPrice, getOtcFootprint, getTickFootprint, osGet, TIMEFRAME_SECONDS } from '@/lib/os/client'
 
 interface ChartPanelProps {
   candles: Candle[]
@@ -457,6 +457,7 @@ export default function ChartPanel({
   const [tickBarsState, setTickBarsState] = useState<TickBarRow[]>([])
   const [ivhvState, setIvhvState] = useState<IvHvResponse | null>(null)
   const [otcState, setOtcState] = useState<OtcFootprintResult | null>(null)
+  const [tickFpState, setTickFpState] = useState<TickFootprintResult | null>(null)
   const customCanvasRef = useRef<HTMLCanvasElement | null>(null)
   // IV/HV pane line series (created only when chartType === 'ivhv')
   const hvLineRef = useRef<ISeriesApi<'Line'> | null>(null)
@@ -546,6 +547,31 @@ export default function ChartPanel({
     }
   }, [chartType, digitsTicker])
 
+  // Tick Footprint: measured-print footprint over TICK-CHART buckets
+  // (/tick_footprint) - real up/down print counts per price bin, never the
+  // CLV proxy. Bucket length follows the chart's own timeframe.
+  useEffect(() => {
+    if (chartType !== 'tickfootprint') return
+    let dead = false
+    const bucketSec = TIMEFRAME_SECONDS[tf ?? '1m'] ?? 60
+    const pull = () => {
+      getTickFootprint(digitsTicker, { bucketSec, bins: 12, candles: 40 })
+        .then((r) => {
+          if (dead) return
+          setTickFpState(r)
+        })
+        .catch(() => {
+          // keep last good data
+        })
+    }
+    pull()
+    const iv = setInterval(pull, 6000)
+    return () => {
+      dead = true
+      clearInterval(iv)
+    }
+  }, [chartType, digitsTicker, tf])
+
   const displayCandles = useMemo(() => {
     if (chartType === 'heikin') return heikinAshi(candles)
     if (chartType === 'renko') return renko(candles, tfSec)
@@ -605,7 +631,7 @@ export default function ChartPanel({
         upColor: UP, downColor: DOWN, borderUpColor: UP, borderDownColor: DOWN, wickUpColor: UP, wickDownColor: DOWN,
         priceLineColor: '#38bdf8',
       })
-    } else if (chartType === 'footprint' || chartType === 'tpo' || chartType === 'otcfootprint') {
+    } else if (chartType === 'footprint' || chartType === 'tpo' || chartType === 'otcfootprint' || chartType === 'tickfootprint') {
       // hidden behind the opaque custom canvas - but keeps the series
       // machinery (markers/price lines) alive and the data effect fed with
       // candle-shaped objects (falling through to baseline would crash)
@@ -739,7 +765,7 @@ export default function ChartPanel({
   // These two chart types cannot be candlestick pseudo-series; an opaque
   // canvas overlays the lightweight chart. Redraws on data/type/resize.
   useEffect(() => {
-    if (chartType !== 'footprint' && chartType !== 'tpo' && chartType !== 'otcfootprint') return
+    if (chartType !== 'footprint' && chartType !== 'tpo' && chartType !== 'otcfootprint' && chartType !== 'tickfootprint') return
     const canvas = customCanvasRef.current
     if (!canvas) return
     const parent = canvas.parentElement
@@ -902,6 +928,117 @@ export default function ChartPanel({
           ctx.fillStyle = b.velDelta > 0 ? UP : b.velDelta < 0 ? DOWN : TEXT
           ctx.fillText(`${b.velDelta >= 0 ? '+' : ''}${b.velDelta}`, cx, H - 5)
         }
+      } else if (chartType === 'tickfootprint') {
+        // Tick Footprint: MEASURED prints per price bin over tick-chart
+        // buckets (/tick_footprint) - real up/down print counts, not the
+        // candle footprint's CLV spread. Same visual grammar as the OTC
+        // velocity matrix, but the buckets follow the chart timeframe and
+        // each bin shows count·avg-ms per side.
+        const candlesFp = tickFpState?.candles ?? []
+        const visible = candlesFp.filter((c) => c.rows.length > 0)
+        if (!tickFpState) {
+          ctx.fillStyle = TEXT
+          ctx.textAlign = 'center'
+          ctx.fillText('loading tick footprint…', W / 2, H / 2)
+          return
+        }
+        if (!visible.length) {
+          ctx.fillStyle = TEXT
+          ctx.textAlign = 'center'
+          ctx.fillText(tickFpState.note ?? 'no closed tick buckets yet', W / 2, H / 2 - 8)
+          ctx.font = '9px var(--font-geist-mono), monospace'
+          ctx.fillText(`${tickFpState.dataSource} · ${tickFpState.ticks} prints buffered - the footprint bins real up/down prints`, W / 2, H / 2 + 8)
+          return
+        }
+        const colW = 64
+        const maxCols = Math.max(3, Math.floor((W - 24) / colW))
+        const vis = visible.slice(-maxCols)
+        const allRows = vis.flatMap((c) => c.rows)
+        const pLo = Math.min(...allRows.map((r) => r.priceLow), ...vis.map((c) => c.low))
+        const pHi = Math.max(...allRows.map((r) => r.priceHigh), ...vis.map((c) => c.high))
+        const padT = 18
+        const padB = 28
+        const y = (p: number) => padT + ((pHi - p) / Math.max(pHi - pLo, 1e-12)) * (H - padT - padB)
+        const maxTotal = Math.max(...allRows.map((r) => r.up + r.dn), 1)
+        const domPoc = tickFpState.summary.dominantPoc
+        if (domPoc !== null && domPoc >= pLo && domPoc <= pHi) {
+          ctx.strokeStyle = 'rgba(245,158,11,0.5)'
+          ctx.setLineDash([4, 3])
+          ctx.beginPath()
+          ctx.moveTo(8, y(domPoc))
+          ctx.lineTo(W - 8, y(domPoc))
+          ctx.stroke()
+          ctx.setLineDash([])
+          ctx.fillStyle = '#f59e0b'
+          ctx.textAlign = 'right'
+          ctx.fillText(`dominant POC ${fmtPrice(domPoc, digitsTicker)}`, W - 10, y(domPoc) - 3)
+        }
+        const halfW = colW / 2 - 6
+        for (let ci = 0; ci < vis.length; ci++) {
+          const c = vis[ci]
+          const cx = 12 + ci * colW + colW / 2
+          // hi-lo skeleton for orientation
+          ctx.strokeStyle = 'rgba(124,138,165,0.35)'
+          ctx.beginPath()
+          ctx.moveTo(cx, y(c.high))
+          ctx.lineTo(cx, y(c.low))
+          ctx.stroke()
+          // open/close stubs (candle direction hint)
+          ctx.strokeStyle = c.close >= c.open ? UP : DOWN
+          const openY = y(c.open)
+          const closeY = y(c.close)
+          ctx.beginPath()
+          ctx.moveTo(cx - halfW * 0.5, openY)
+          ctx.lineTo(cx + halfW * 0.5, openY)
+          ctx.moveTo(cx - halfW * 0.5, closeY)
+          ctx.lineTo(cx + halfW * 0.5, closeY)
+          ctx.stroke()
+          const rows = [...c.rows].sort((a, b2) => b2.mid - a.mid)
+          for (const r of rows) {
+            const yTop = y(r.priceHigh)
+            const yBot = y(r.priceLow)
+            const h = Math.max(3, yBot - yTop - 1)
+            const tot = r.up + r.dn
+            const w = (tot / maxTotal) * halfW
+            if (r.dn > 0) {
+              ctx.fillStyle = 'rgba(244,63,94,0.6)'
+              ctx.fillRect(cx - 2 - (w * r.dn) / Math.max(tot, 1e-9), yTop, (w * r.dn) / Math.max(tot, 1e-9), h)
+            }
+            if (r.up > 0) {
+              ctx.fillStyle = 'rgba(16,185,129,0.6)'
+              ctx.fillRect(cx + 2, yTop, (w * r.up) / Math.max(tot, 1e-9), h)
+            }
+            if (r.imbalance) {
+              ctx.strokeStyle = r.imbalance === 'buy' ? 'rgba(16,185,129,0.9)' : 'rgba(244,63,94,0.9)'
+              ctx.strokeRect(cx - 3 - w / 2, yTop, w + 6, h)
+            }
+            if (c.poc !== null && r.priceLow <= c.poc && c.poc <= r.priceHigh) {
+              ctx.strokeStyle = 'rgba(245,158,11,0.95)'
+              ctx.strokeRect(cx - 4 - w / 2, yTop, w + 8, h)
+            }
+            ctx.font = '8px var(--font-geist-mono), monospace'
+            ctx.fillStyle = 'rgba(219,228,240,0.85)'
+            if (r.dn > 0 && w * (r.dn / Math.max(tot, 1e-9)) >= 22) {
+              ctx.textAlign = 'right'
+              ctx.fillText(`${r.dn}·${Math.round(r.dnMs)}`, cx - 4, yTop + h / 2 + 2.5)
+            }
+            if (r.up > 0 && w * (r.up / Math.max(tot, 1e-9)) >= 22) {
+              ctx.textAlign = 'left'
+              ctx.fillText(`${r.up}·${Math.round(r.upMs)}`, cx + 4, yTop + h / 2 + 2.5)
+            }
+          }
+          const d2 = new Date(c.time * 1000)
+          ctx.font = '8px var(--font-geist-mono), monospace'
+          ctx.fillStyle = TEXT
+          ctx.textAlign = 'center'
+          ctx.fillText(
+            c.time % 60 === 0 ? `${String(d2.getHours()).padStart(2, '0')}:${String(d2.getMinutes()).padStart(2, '0')}` : `${String(d2.getMinutes()).padStart(2, '0')}:${String(d2.getSeconds()).padStart(2, '0')}`,
+            cx,
+            H - 15,
+          )
+          ctx.fillStyle = c.delta > 0 ? UP : c.delta < 0 ? DOWN : TEXT
+          ctx.fillText(`${c.delta >= 0 ? '+' : ''}${c.delta}`, cx, H - 5)
+        }
       } else {
         // TPO: left = close path for time orientation, right = profile
         const prof = tpoProfile(candles.slice(-400))
@@ -971,7 +1108,7 @@ export default function ChartPanel({
     const ro = new ResizeObserver(draw)
     ro.observe(parent)
     return () => ro.disconnect()
-  }, [chartType, candles, digitsTicker, otcState])
+  }, [chartType, candles, digitsTicker, otcState, tickFpState])
 
   // live precision sync: asset switch or a quote crossing a magnitude band
   useEffect(() => {
@@ -1225,7 +1362,7 @@ export default function ChartPanel({
       </div>
 
       <div ref={elRef} className="min-h-0 flex-1" />
-      {(chartType === 'footprint' || chartType === 'tpo' || chartType === 'otcfootprint') && (
+      {(chartType === 'footprint' || chartType === 'tpo' || chartType === 'otcfootprint' || chartType === 'tickfootprint') && (
         <div className="absolute inset-x-0 bottom-[30px] top-0 z-[5] bg-[#0b111c]">
           <canvas ref={customCanvasRef} className="block h-full w-full" />
         </div>
