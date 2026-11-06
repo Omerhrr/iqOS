@@ -4345,6 +4345,16 @@ const httpServer = createServer(async (req, res) => {
         return json(200, { ok: true })
       }
 
+      // POST /ai_trader_restart_compound - revive a compounding AI Trader
+      // plan after a stop-on-loss / periods-complete halt: clears the halt,
+      // re-seeds the pot at base (same contract as bot_restart for compound
+      // bots and the meta-trader's restart). 400 with no plan armed.
+      if (path === '/ai_trader_restart_compound') {
+        const ai = kernel.context().use<AiTraderService>('aiTrader')
+        const out = ai.restartCompound()
+        return json(out.ok ? 200 : 400, out)
+      }
+
       if (path === '/lab_delete') {
         const lab = kernel.context().use<StrategyLabService>('lab')
         return json(200, lab.remove(String(body.id ?? '')))

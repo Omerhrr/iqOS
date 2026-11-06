@@ -59,6 +59,43 @@ import { atr, closes, ema, highs, lows, rsi, trueRange } from '../analytics/indi
 
 export type AiTraderScanMode = 'single' | 'selected' | 'global'
 
+/** Money-management plan - deliberately the SAME shape as the autopilot
+ * bots' StakePlan (plugins/autopilot.ts) and the meta-trader's MetaStakePlan
+ * field-for-field, so a compounding scheme tuned on a bot carries over to
+ * the AI Trader with zero translation and one mental model across the
+ * platform. kind:'compound' rolls a pot seeded at `base`: every win folds
+ * the payout in (skimming anything above payoutCap%), every loss burns the
+ * stake back out and - by default (stopOnLoss) - ENDS the cycle until an
+ * explicit restart, exactly like the bots. undefined (the default) = the
+ * flat configured `stake` every trade, unchanged original behavior. */
+export interface AiTraderStakePlan {
+  kind: 'compound'
+  base: number
+  rollPct?: number
+  maxStake?: number
+  payoutCap?: number
+  stopOnLoss?: boolean
+  periods?: number
+  deriskAfter?: number
+  deriskPct?: number
+  onComplete?: 'halt' | 'reseed'
+  reseedLimit?: number
+  lossReseedLimit?: number
+}
+
+/** Persisted roll state (pot/rollN/restarts/halted) - written into the same
+ * ai_trader_config blob on every settle so the compounding run survives
+ * kernel restarts, the same way the bots carry planState on their record. */
+export interface AiTraderPlanState {
+  pot: number
+  rollN: number
+  restarts: number
+  reseedCount: number
+  lossReseedCount: number
+  halted: boolean
+  complete: boolean
+}
+
 export interface AiTraderConfig {
   enabled: boolean
   /** false (default) = shadow: decide + log every cycle, place nothing.
@@ -117,6 +154,13 @@ export interface AiTraderConfig {
    *  app is actually served from somewhere else (a different port, a
    *  docker-compose service name, etc). */
   appUrl?: string
+  /** Optional compounding plan (AiTraderStakePlan above). undefined = flat
+   *  `stake` every trade. When armed, every LIVE order (and the shadow log
+   *  line) sizes off the running pot instead, and a loss ends the cycle -
+   *  the trader stands down until restartCompound(). The model is TOLD its
+   *  pot/roll state in the prompt (a human at the desk knows his account
+   *  state) but sizing stays the operator's lever, never the model's. */
+  stakePlan?: AiTraderStakePlan
 }
 
 export interface AiTraderDecision {
@@ -236,6 +280,57 @@ const MIN_CANDLES_FOR_DECISION = 25
  * hours-old candles is not a decision about THIS market. */
 const staleToleranceSec = (tfSec: number) => Math.max(5 * tfSec, 300)
 
+/** One sanitizer for the stake plan patch - same clamps as the autopilot's
+ * parseStakePlan so a plan hand-edited in the config blob (or sent up by a
+ * stale UI build) can't smuggle in a $0 seed, a 500% payout cap, or an
+ * unknown kind. kind !== 'compound' (including junk) = no plan at all. */
+function sanitizeAiStakePlan(v: unknown): AiTraderStakePlan | undefined {
+  if (!v || typeof v !== 'object') return undefined
+  const o = v as Record<string, unknown>
+  if (o.kind !== 'compound') return undefined
+  const num = (x: unknown, fb: number, lo: number, hi: number): number => {
+    const n = Number(x)
+    return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : fb
+  }
+  return {
+    kind: 'compound',
+    base: num(o.base, 1, 1, 5000),
+    rollPct: o.rollPct !== undefined ? num(o.rollPct, 100, 1, 100) : undefined,
+    maxStake: o.maxStake !== undefined ? num(o.maxStake, 5000, 1, 5000) : undefined,
+    // 70 stays the house maximum fold-in no matter what the patch asks for
+    payoutCap: o.payoutCap !== undefined ? num(o.payoutCap, 70, 1, 70) : undefined,
+    stopOnLoss: o.stopOnLoss !== undefined ? Boolean(o.stopOnLoss) : undefined,
+    periods: o.periods !== undefined ? Math.round(num(o.periods, 1, 1, 1000)) : undefined,
+    deriskAfter: o.deriskAfter !== undefined ? Math.round(num(o.deriskAfter, 1, 1, 999)) : undefined,
+    deriskPct: o.deriskPct !== undefined ? num(o.deriskPct, 50, 1, 100) : undefined,
+    onComplete: o.onComplete === 'reseed' ? 'reseed' : o.onComplete === 'halt' ? 'halt' : undefined,
+    reseedLimit:
+      o.onComplete === 'reseed' && o.reseedLimit !== undefined && Number(o.reseedLimit) > 0
+        ? Math.round(num(o.reseedLimit, 1, 1, 100000))
+        : undefined,
+    lossReseedLimit:
+      o.stopOnLoss === false && o.lossReseedLimit !== undefined && Number(o.lossReseedLimit) > 0
+        ? Math.round(num(o.lossReseedLimit, 1, 1, 100000))
+        : undefined,
+  }
+}
+
+/** Restores the persisted roll state from the config blob, clamped to sane
+ * non-negative numbers so a hand-edited row can't poison the sizing math. */
+function sanitizeAiPlanState(v: unknown): AiTraderPlanState {
+  const o = (v && typeof v === 'object' ? v : {}) as Record<string, unknown>
+  const num = (x: unknown): number => (typeof x === 'number' && Number.isFinite(x) ? Math.max(0, x) : 0)
+  return {
+    pot: num(o.pot),
+    rollN: Math.round(num(o.rollN)),
+    restarts: Math.round(num(o.restarts)),
+    reseedCount: Math.round(num(o.reseedCount)),
+    lossReseedCount: Math.round(num(o.lossReseedCount)),
+    halted: Boolean(o.halted),
+    complete: Boolean(o.complete),
+  }
+}
+
 /** AUDIT: one sanitizer for every field the panel's draft can send up (the
  * panel always POSTs whole fields on save, and a stale UI build or a hand-
  * edited config row can carry NaN/strings/junk). configure() and start()
@@ -263,6 +358,7 @@ function sanitizeAiConfig(c: AiTraderConfig): AiTraderConfig {
   if (!Array.isArray(c.expiryChoices)) c.expiryChoices = [...DEFAULT_CONFIG.expiryChoices]
   c.expiryChoices = [...new Set(c.expiryChoices.map((m) => Math.round(Number(m))).filter((m) => Number.isFinite(m) && m >= 1 && m <= 120))].sort((a, b) => a - b)
   if (!c.expiryChoices.length) c.expiryChoices = [...DEFAULT_CONFIG.expiryChoices]
+  c.stakePlan = sanitizeAiStakePlan(c.stakePlan)
   return c
 }
 
@@ -398,6 +494,11 @@ export class AiTraderService {
   private lastRunTs = 0
   private lastError: string | null = null
   private cycles = 0
+  /** Compounding roll state - only meaningful while config.stakePlan is
+   * armed. Restored from the config blob on start(), persisted back on every
+   * settle (persistPlanState) so the run survives kernel restarts. */
+  private plan: AiTraderPlanState = { pot: 0, rollN: 0, restarts: 0, reseedCount: 0, lossReseedCount: 0, halted: false, complete: false }
+  private unsubPlan: (() => void) | null = null
 
   private metaStrategyService(): MetaStrategyService | null {
     if (this.meta) return this.meta
@@ -455,16 +556,30 @@ export class AiTraderService {
     this.store = ctx.use<Store>('store')
     this.market = ctx.use<MarketDataService>('market')
     this.exec = ctx.use<ExecutionService>('execution')
-    const saved = this.store.getAiTraderConfig() as Partial<AiTraderConfig> | null
-    this.config = sanitizeAiConfig({ ...DEFAULT_CONFIG, ...(saved ?? {}) })
+    // planState rides in the same blob as the config (persistPlanState) but
+    // is NOT part of AiTraderConfig - strip it before sanitizing so a stale
+    // blob field can never leak into status().config or a later save.
+    const saved = this.store.getAiTraderConfig() as (Partial<AiTraderConfig> & { planState?: unknown }) | null
+    const { planState, ...savedConfig } = saved ?? {}
+    this.config = sanitizeAiConfig({ ...DEFAULT_CONFIG, ...(savedConfig ?? {}) })
+    this.plan = sanitizeAiPlanState(planState)
     this.store.pruneAiTraderDecisions(1000)
-    ctx.log('ai-trader', `AI Trader online - ${this.config.enabled ? 'ENABLED' : 'disabled'}, ${this.config.live ? 'LIVE' : 'shadow (logging only)'}, ${this.config.asset} ${this.config.tf}, every ${this.config.intervalMin}min`)
+    // settle hook: every closed AI Trader position (identified by the
+    // strategy tag runCycleForAsset places orders with) feeds the roll -
+    // same bus pattern the autopilot/meta-trader/watchdog use.
+    this.unsubPlan = ctx.bus.on('positionClosed', ({ position }: { position: { strategy?: string; status: string; pnl?: number; amount?: number } }) => this.onPlanPositionClosed(position))
+    ctx.log(
+      'ai-trader',
+      `AI Trader online - ${this.config.enabled ? 'ENABLED' : 'disabled'}, ${this.config.live ? 'LIVE' : 'shadow (logging only)'}, ${this.config.asset} ${this.config.tf}, every ${this.config.intervalMin}min${this.config.stakePlan ? `, compound pot (seed $${this.config.stakePlan.base}, roll x${this.plan.rollN}${this.plan.halted ? ', HALTED - restart to trade again' : ''})` : ''}`,
+    )
     this.scheduleTimer()
   }
 
   stop(): void {
     if (this.timer) clearInterval(this.timer)
     this.timer = null
+    this.unsubPlan?.()
+    this.unsubPlan = null
   }
 
   private scheduleTimer(): void {
@@ -487,6 +602,11 @@ export class AiTraderService {
       lastRunTs: this.lastRunTs,
       nextRunTs: this.config.enabled && this.lastRunTs ? this.lastRunTs + this.config.intervalMin * 60 : null,
       lastError: this.lastError,
+      // compounding roll state + the stake the NEXT trade would place - the
+      // panel renders the pot/roll/halt strip and the restart button off
+      // these instead of re-deriving the plan math client-side.
+      planState: this.plan,
+      nextStake: this.stakeFor(),
       // the actual URL a cycle will call RIGHT NOW (after APP_URL/config/
       // default resolution) - shown directly so there's no guessing whether
       // an env var or a saved config value is the one actually in effect.
@@ -501,10 +621,21 @@ export class AiTraderService {
   }
 
   configure(patch: Partial<AiTraderConfig>): AiTraderConfig {
+    const hadPlan = Boolean(this.config.stakePlan)
     this.config = sanitizeAiConfig({ ...this.config, ...patch })
-    this.store.saveAiTraderConfig(this.config)
+    // dropping the plan (compound -> fixed) also drops the roll state, so a
+    // later re-arm starts a FRESH cycle instead of resurrecting a stale
+    // halted pot from a previous run - same fresh-start contract as switching
+    // a bot's stake plan off in the fleet editor.
+    if (hadPlan && !this.config.stakePlan) {
+      this.plan = { pot: 0, rollN: 0, restarts: 0, reseedCount: 0, lossReseedCount: 0, halted: false, complete: false }
+    }
+    this.persistPlanState()
     this.scheduleTimer()
-    this.emit('info', `AI Trader config updated - ${this.config.enabled ? 'enabled' : 'disabled'} · ${this.config.live ? 'LIVE' : 'shadow'} · ${this.config.scanMode} · ${this.config.asset} ${this.config.tf} · every ${this.config.intervalMin}min · max ${this.config.maxConcurrent} concurrent`)
+    this.emit(
+      'info',
+      `AI Trader config updated - ${this.config.enabled ? 'enabled' : 'disabled'} · ${this.config.live ? 'LIVE' : 'shadow'} · ${this.config.scanMode} · ${this.config.asset} ${this.config.tf} · every ${this.config.intervalMin}min · max ${this.config.maxConcurrent} concurrent${this.config.stakePlan ? ` · compound pot (seed $${this.config.stakePlan.base}, rollPct ${this.config.stakePlan.rollPct ?? 100}%)` : ''}`,
+    )
     return this.config
   }
 
@@ -641,6 +772,23 @@ export class AiTraderService {
     this.lastRunTs = ts
     this.cycles += 1
     try {
+      // compound stop-on-loss / periods-complete: a halted cycle stands down
+      // ENTIRELY - no snapshot, no candles, no LLM call, no order - until the
+      // operator explicitly restarts it (the same "restart to trade again"
+      // contract the autopilot bots' compound plans and the meta-trader use).
+      // Logged as a skip row each cycle so the decision log keeps telling the
+      // truth about WHY nothing is happening.
+      if (this.config.stakePlan && this.plan.halted) {
+        const why = this.plan.complete
+          ? `compound cycle COMPLETE (${this.plan.rollN}/${this.config.stakePlan.periods ?? '?'} periods banked) - standing down until restarted, no LLM call made`
+          : 'compound cycle ended on a loss - standing down until restarted, no LLM call made'
+        this.store.recordAiTraderDecision({
+          asset: this.config.asset, tf: this.config.tf, direction: 'skip', confidence: 0,
+          reasoning: why, snapshot: [], live: this.config.live, acted: false, ts,
+        })
+        this.emit('warn', `[AI Trader] ${why}`)
+        return null
+      }
       const candidates = this.buildCandidateList()
       if (!candidates.length) {
         this.lastError = 'no candidate assets to scan this cycle'
@@ -780,6 +928,14 @@ export class AiTraderService {
         ? snapshot.map((r) => `- ${r.label}`).join('\n')
         : '- (no reference reads available - thin history or plugins still warming up)'
 
+      // Stake-plan awareness: a human at the desk knows his account state,
+      // so the model gets the pot/roll facts too - framed so the pot can
+      // only ever make it MORE selective with a big roll on the line, never
+      // resize the bet (sizing is the operator's lever, direction is the
+      // model's, and placeOrder takes the operator-computed stake verbatim).
+      // Computed once here and reused for placement + the log lines below.
+      const bet = this.stakeFor()
+
       const system: ChatMessage = {
         role: 'system',
         content: [
@@ -849,6 +1005,12 @@ export class AiTraderService {
           snapshotLines,
           '',
           `Minimum confidence to actually act: ${this.config.minConfidence} (a lower confidence will be treated as a skip regardless of direction, so be honest rather than inflating it).`,
+          ...(bet.compound
+            ? [
+                '',
+                `Your stake plan (set by the operator, not you): COMPOUNDING - the pot is $${bet.pot.toFixed(2)} after ${bet.rollN} compounded win(s) this run, so the next trade stakes $${bet.amount.toFixed(2)} (${bet.phase} phase). A loss ends the compounding run${this.config.stakePlan?.stopOnLoss !== false ? ' and stands you down until the operator restarts the cycle' : ''}. A larger roll is a reason to be MORE selective about marginal setups, never less - but pot size must not change your direction read: size is the operator's lever, direction is yours.`,
+              ]
+            : []),
         ].join('\n'),
       }
 
@@ -901,7 +1063,7 @@ export class AiTraderService {
           tf,
           side: direction,
           kind: this.config.kind,
-          amount: this.config.stake,
+          amount: bet.amount,
           expirySec: minToSec(parsed.expiryMin),
           mode: this.exec.accountSource === 'iq' ? 'live' : 'paper',
           strategy: 'ai-trader',
@@ -910,14 +1072,14 @@ export class AiTraderService {
         if (out.ok && out.position) {
           acted = true
           positionId = out.position.id
-          this.emit('success', `[AI Trader] ${direction.toUpperCase()} ${asset} $${this.config.stake} @ ${parsed.expiryMin}min - ${parsed.reasoning} (confidence ${parsed.confidence.toFixed(0)}%)`)
+          this.emit('success', `[AI Trader] ${direction.toUpperCase()} ${asset} $${bet.amount.toFixed(2)}${bet.compound ? ` (compound ${bet.phase} roll x${bet.rollN + 1}, pot $${bet.pot.toFixed(2)})` : ''} @ ${parsed.expiryMin}min - ${parsed.reasoning} (confidence ${parsed.confidence.toFixed(0)}%)`)
         } else {
           actionError = out.error ?? 'order rejected'
           this.emit('warn', `[AI Trader] wanted ${direction.toUpperCase()} ${asset} but the order was rejected: ${actionError}`)
         }
       } else if (direction !== 'skip') {
         // shadow mode - a real decision, logged, but no order placed
-        this.emit('info', `[AI Trader][SHADOW] would ${direction.toUpperCase()} ${asset} $${this.config.stake} @ ${parsed.expiryMin}min - ${parsed.reasoning} (confidence ${parsed.confidence.toFixed(0)}%)`)
+        this.emit('info', `[AI Trader][SHADOW] would ${direction.toUpperCase()} ${asset} $${bet.amount.toFixed(2)}${bet.compound ? ` (compound ${bet.phase} roll x${bet.rollN + 1}, pot $${bet.pot.toFixed(2)})` : ''} @ ${parsed.expiryMin}min - ${parsed.reasoning} (confidence ${parsed.confidence.toFixed(0)}%)`)
       }
 
       this.store.recordAiTraderDecision({
@@ -936,6 +1098,120 @@ export class AiTraderService {
       this.emit('warn', `AI Trader cycle failed on ${asset} ${tf}: ${msg}`)
       return null
     }
+  }
+
+  /** Stake-plan-aware sizing - the SAME pot math as the autopilot bots'
+   * stakeFor() (plugins/autopilot.ts): the working pot is the running roll
+   * (or the seed once the pot is dust), rolled by rollPct% - or deriskPct%
+   * once the de-risk threshold is crossed - clamped by maxStake and the
+   * broker's $1 minimum, rounded to cents. Falls back to the flat configured
+   * stake with no plan. The GLOBAL risk manager still outranks this:
+   * execution.ts gates the actual bet amount like every other order. */
+  private stakeFor(): { amount: number; pot: number; rollN: number; compound: boolean; phase: 'compound' | 'derisk' } {
+    const plan = this.config.stakePlan
+    if (!plan) return { amount: this.config.stake, pot: 0, rollN: 0, compound: false, phase: 'compound' }
+    // dust guard: a pot worth less than a cent is a fresh cycle
+    const pot = this.plan.pot >= 0.01 ? this.plan.pot : plan.base
+    const derisk = plan.deriskAfter !== undefined && plan.deriskPct !== undefined && this.plan.rollN >= plan.deriskAfter
+    const rollPct = derisk ? plan.deriskPct! : (plan.rollPct ?? 100)
+    const raw = (pot * rollPct) / 100
+    const amount = Math.min(plan.maxStake ?? 5000, Math.max(1, Math.round(raw * 100) / 100))
+    return { amount, pot, rollN: this.plan.rollN, compound: true, phase: derisk ? 'derisk' : 'compound' }
+  }
+
+  /** Settle hook - the fold-in/burn half of the compounding plan, mirrored
+   * field-for-field from the autopilot bots' onPositionClosed (os-mode.ts's
+   * shape): a win folds the payout into the pot (skimming anything above the
+   * payout cap), a loss burns the stake back out; stopOnLoss (default) ends
+   * the cycle on a loss, `periods` completes it on the Nth win, and the
+   * reseed/lossReseed limits bound the automatic continuations. Only this
+   * trader's own positions count (strategy 'ai-trader' - the tag every
+   * order runCycleForAsset places carries; identical filter to the
+   * concurrency counter). Rounds to cents at EVERY fold: stakes are rounded
+   * to cents at open, and an unrounded pot (3.7636) minus a rounded stake
+   * (3.76) leaves dust that never reaches 0 - the cycle would then compound
+   * from dust forever. */
+  private onPlanPositionClosed(position: { strategy?: string; status: string; pnl?: number; amount?: number }): void {
+    if (position.strategy !== 'ai-trader') return
+    const plan = this.config.stakePlan
+    if (!plan || (position.status !== 'won' && position.status !== 'lost')) return
+    const base = plan.base
+    const working = this.plan.pot >= 0.01 ? this.plan.pot : base
+    const amount = position.amount ?? base
+    if (position.status === 'won') {
+      this.plan.lossReseedCount = 0
+      // payout cap: fold in at most payoutCap% (default+max 70) of the stake
+      // as profit - a broker paying more gets the excess skimmed to the
+      // balance, never compounded into the pot
+      const cap = (plan.payoutCap ?? 70) / 100
+      const fold = Math.min(position.pnl ?? amount * cap, amount * cap)
+      this.plan.pot = Math.round((working + fold) * 100) / 100
+      this.plan.rollN += 1
+      // periods target reached: the cycle is COMPLETE (win-side halt or reseed)
+      const periods = plan.periods
+      if (periods && this.plan.rollN >= periods) {
+        this.plan.restarts += 1
+        const banked = Math.round((this.plan.pot - base) * 100) / 100
+        const reseedLimit = plan.reseedLimit
+        const reseedsLeft = plan.onComplete === 'reseed' && reseedLimit ? reseedLimit - this.plan.reseedCount : Infinity
+        if (plan.onComplete === 'reseed' && reseedsLeft > 0) {
+          this.plan.pot = 0
+          this.plan.rollN = 0
+          this.plan.reseedCount += 1
+          const limitTag = reseedLimit ? ` (re-seed ${this.plan.reseedCount}/${reseedLimit})` : ''
+          this.emit('success', `[AI Trader] compound cycle COMPLETE - ${periods} periods, +$${banked.toFixed(2)} banked - re-seeding $${base}${limitTag}`)
+        } else {
+          this.plan.halted = true
+          this.plan.complete = true
+          const why = plan.onComplete === 'reseed' ? `re-seed limit reached (${reseedLimit}/${reseedLimit})` : `${periods} periods`
+          this.emit('success', `[AI Trader] compound cycle COMPLETE - ${why}, +$${banked.toFixed(2)} banked - standing down; restart the compound cycle to trade again`)
+        }
+      }
+    } else {
+      this.plan.pot = Math.round(Math.max(0, working - amount) * 100) / 100
+      const kept = this.plan.pot
+      if (this.plan.rollN > 0) this.plan.restarts += 1 // a winning streak ended
+      this.plan.rollN = 0
+      // stop-on-loss (default): the sequence is over - stand down until an
+      // explicit restart. stopOnLoss:false keeps the legacy re-seed roll.
+      if (plan.stopOnLoss !== false) {
+        this.plan.halted = true
+        this.plan.complete = false
+        this.emit('warn', `[AI Trader] compound cycle ENDED on a loss (-$${Math.abs(position.pnl ?? 0).toFixed(2)})${kept >= 0.01 ? ` - $${kept.toFixed(2)} of the pot stays banked on the balance` : ''} - restart the compound cycle to trade again`)
+      } else {
+        // "On loss: Re-seed" - the trader normally just keeps rolling through
+        // a loss, but lossReseedLimit caps how many losses in a row it will
+        // silently absorb before being forced to stop anyway.
+        this.plan.lossReseedCount += 1
+        const lossReseedLimit = plan.lossReseedLimit
+        if (lossReseedLimit && this.plan.lossReseedCount >= lossReseedLimit) {
+          this.plan.halted = true
+          this.plan.complete = false
+          this.emit('warn', `[AI Trader] compound cycle FORCED TO STOP - ${this.plan.lossReseedCount}/${lossReseedLimit} consecutive losses while re-seeding (-$${Math.abs(position.pnl ?? 0).toFixed(2)} this one)${kept >= 0.01 ? ` - $${kept.toFixed(2)} of the pot stays banked on the balance` : ''} - restart the compound cycle to trade again`)
+        }
+      }
+    }
+    this.persistPlanState()
+  }
+
+  /** Clears a halted compounding cycle and re-seeds the pot at base - the
+   * same "restart to trade again" contract the autopilot bots' compound
+   * plans (bot_restart) and the meta-trader's restart() use. The cumulative
+   * restarts counter is kept for the record. */
+  restartCompound(): { ok: boolean; error?: string } {
+    if (!this.config.stakePlan) return { ok: false, error: 'restart applies to a compounding AI Trader plan only' }
+    this.plan = { pot: 0, rollN: 0, restarts: this.plan.restarts, reseedCount: 0, lossReseedCount: 0, halted: false, complete: false }
+    this.persistPlanState()
+    this.emit('success', `[AI Trader] compound cycle RESTARTED - next trade seeds $${this.config.stakePlan.base}`)
+    return { ok: true }
+  }
+
+  /** Raw store write of the roll state (config + planState in one blob) -
+   * deliberately NOT a full configure() round-trip, which would re-emit a
+   * config alert and restart the timer on every settle; same shape the
+   * autopilot's per-settle saveBot(planState) write uses. */
+  private persistPlanState(): void {
+    this.store.saveAiTraderConfig({ ...this.config, planState: this.plan })
   }
 
   private emit(level: 'info' | 'warn' | 'danger' | 'success', message: string): void {

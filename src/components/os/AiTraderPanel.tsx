@@ -22,6 +22,38 @@ interface Props {
 
 const TFS: Timeframe[] = ['1m', '2m', '5m', '15m']
 
+/** Tiny labeled numeric field for the stake-plan grid - same compact style
+ * as the panel's own inputs, keeps the plan row readable at 10px mono. */
+function NumField({
+  label,
+  value,
+  onChange,
+  min = 0,
+  max = 100000,
+  title,
+}: {
+  label: string
+  value: number
+  onChange: (v: number) => void
+  min?: number
+  max?: number
+  title?: string
+}) {
+  return (
+    <label className="flex flex-col gap-1" title={title}>
+      <span className="whitespace-nowrap text-[#7c8aa5]">{label}</span>
+      <Input
+        type="number"
+        min={min}
+        max={max}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className="h-6 w-20 bg-[#070c15] text-[9.5px] text-[#dbe4f0]"
+      />
+    </label>
+  )
+}
+
 export default function AiTraderPanel({ assets, onError }: Props) {
   const [status, setStatus] = useState<AiTraderStatus | null>(null)
   const [decisions, setDecisions] = useState<AiTraderDecision[]>([])
@@ -31,6 +63,7 @@ export default function AiTraderPanel({ assets, onError }: Props) {
   const [expiryText, setExpiryText] = useState('3,5')
   const [clearing, setClearing] = useState(false)
   const [clearArmed, setClearArmed] = useState(false)
+  const [restarting, setRestarting] = useState(false)
 
   // Decision log height is user-draggable (grab the handle above the table
   // and drag up to grow it, down to shrink) instead of a fixed flex-1 split -
@@ -130,9 +163,34 @@ export default function AiTraderPanel({ assets, onError }: Props) {
     }
   }
 
+  /** Revive a halted compounding cycle (stop-on-loss / periods-complete /
+   * re-seed-limit halt): clears the halt, re-seeds the pot at base - the
+   * same "restart to trade again" contract the fleet bots and meta-trader
+   * use. */
+  const restartCompound = async () => {
+    setRestarting(true)
+    try {
+      const res = await osPost<{ ok: boolean; error?: string }>('/ai_trader_restart_compound')
+      if (!res.ok) onError(res.error ?? 'restart failed')
+      void load()
+    } catch (err) {
+      onError((err as Error).message)
+    } finally {
+      setRestarting(false)
+    }
+  }
+
   if (!draft || !status) {
     return <div className="p-3 font-mono text-[10px] text-[#4b5a72]">loading AI Trader…</div>
   }
+
+  /** Merge-compound-plan helper (same pattern as the fleet editor): keeps
+   * every armed plan field and overrides `over`; arming from flat seeds the
+   * pot at the current flat stake so nothing silently changes size. */
+  const plan = (over: Partial<NonNullable<AiTraderConfig['stakePlan']>>): NonNullable<AiTraderConfig['stakePlan']> =>
+    draft.stakePlan?.kind === 'compound'
+      ? { ...draft.stakePlan, ...over }
+      : { kind: 'compound', base: draft.stake, rollPct: 100, payoutCap: 70, stopOnLoss: true, ...over }
 
   return (
     <div className="flex h-full flex-col gap-2 overflow-y-auto p-2 font-mono text-[10px]">
@@ -248,7 +306,7 @@ export default function AiTraderPanel({ assets, onError }: Props) {
           />
         </label>
         <label className="flex flex-col gap-1">
-          <span className="text-[#7c8aa5]">stake $</span>
+          <span className="text-[#7c8aa5]">{draft.stakePlan?.kind === 'compound' ? 'flat stake $ (unused)' : 'stake $'}</span>
           <Input
             type="number"
             min={1}
@@ -320,6 +378,123 @@ export default function AiTraderPanel({ assets, onError }: Props) {
             {running ? 'deciding...' : 'run a cycle now'}
           </Button>
         </div>
+      </div>
+
+      {/* STAKE PLAN - flat stake vs the compounding pot, the SAME plan shape
+          the fleet bots and the meta-trader use: a pot seeded at `base` rolls
+          rollPct% of itself into every trade, wins fold the payout in (capped
+          at payoutCap%), a loss ends the run by default (halt until restart).
+          The live roll strip below reads the KERNEL's plan state, not the
+          unsaved draft. */}
+      <div className="flex flex-wrap items-start gap-3 rounded border border-[#1c2739] bg-[#0b0f17] p-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-[#7c8aa5]">stake plan</span>
+          {(
+            [
+              ['fixed', 'flat stake'],
+              ['compound', 'compound pot'],
+            ] as ['fixed' | 'compound', string][]
+          ).map(([mode, label]) => (
+            <button
+              key={mode}
+              type="button"
+              onClick={() => setDraft({ ...draft, stakePlan: mode === 'compound' ? plan({}) : undefined })}
+              className={`rounded px-2 py-1 text-[9px] uppercase tracking-wide ${
+                (draft.stakePlan?.kind === 'compound' ? 'compound' : 'fixed') === mode
+                  ? 'bg-violet-600 text-white'
+                  : 'border border-[#1c2739] text-[#7c8aa5] hover:text-[#dbe4f0]'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+          <span className="text-[#4b5a72]">
+            {draft.stakePlan?.kind === 'compound'
+              ? 'wins fold the payout into a pot seeded at `base`; a loss ends the run (restart below) - the model is told its pot state but never sizes the bet'
+              : `every trade bets the flat stake ($${draft.stake})`}
+          </span>
+        </div>
+
+        {draft.stakePlan?.kind === 'compound' && (
+          <div className="flex flex-wrap items-end gap-2">
+            <NumField label="seed $" min={1} value={draft.stakePlan.base} onChange={(v) => setDraft({ ...draft, stakePlan: plan({ base: Math.max(1, v) }) })} title="the stake each fresh compounding cycle starts from" />
+            <NumField label="roll %" min={1} max={100} value={draft.stakePlan.rollPct ?? 100} onChange={(v) => setDraft({ ...draft, stakePlan: plan({ rollPct: Math.min(100, Math.max(1, v)) }) })} title="% of the pot wagered each trade (100 = full roll)" />
+            <NumField label="max stake $ (0 = off)" min={0} value={draft.stakePlan.maxStake ?? 0} onChange={(v) => setDraft({ ...draft, stakePlan: plan({ maxStake: v > 0 ? v : undefined }) })} title="per-trade ceiling on the rolled stake - the global risk manager still outranks it" />
+            <NumField label="payout cap %" min={1} max={70} value={draft.stakePlan.payoutCap ?? 70} onChange={(v) => setDraft({ ...draft, stakePlan: plan({ payoutCap: Math.min(70, Math.max(1, v)) }) })} title="fold in at most this % of the stake as profit - a broker paying more gets the excess skimmed, never compounded" />
+            <NumField label="periods (0 = until loss)" min={0} value={draft.stakePlan.periods ?? 0} onChange={(v) => setDraft({ ...draft, stakePlan: plan({ periods: v > 0 ? Math.round(v) : undefined }) })} title="the Nth win COMPLETES the cycle (halt, or auto re-seed below)" />
+            <NumField label="derisk after N wins (0 = off)" min={0} value={draft.stakePlan.deriskAfter ?? 0} onChange={(v) => setDraft({ ...draft, stakePlan: plan({ deriskAfter: v > 0 ? Math.round(v) : undefined }) })} title="after that many wins, later trades stake only deriskPct% of the pot so a late loss can't give back the whole ladder" />
+            <NumField label="derisk %" min={1} max={100} value={draft.stakePlan.deriskPct ?? 50} onChange={(v) => setDraft({ ...draft, stakePlan: plan({ deriskPct: Math.min(100, Math.max(1, v)) }) })} title="% of the pot staked once the de-risk threshold is crossed" />
+            <div className="flex items-center gap-1.5">
+              <span className="text-[#7c8aa5]">on complete</span>
+              {(['halt', 'reseed'] as const).map((oc) => (
+                <button
+                  key={oc}
+                  type="button"
+                  onClick={() => setDraft({ ...draft, stakePlan: plan({ onComplete: oc, ...(oc === 'halt' ? { reseedLimit: undefined } : {}) }) })}
+                  className={`rounded px-2 py-1 text-[9px] uppercase tracking-wide ${
+                    (draft.stakePlan?.onComplete ?? 'halt') === oc
+                      ? 'bg-violet-600 text-white'
+                      : 'border border-[#1c2739] text-[#7c8aa5] hover:text-[#dbe4f0]'
+                  }`}
+                >
+                  {oc}
+                </button>
+              ))}
+              {draft.stakePlan.onComplete === 'reseed' && (
+                <NumField label="reseed limit (0 = \u221e)" min={0} value={draft.stakePlan.reseedLimit ?? 0} onChange={(v) => setDraft({ ...draft, stakePlan: plan({ reseedLimit: v > 0 ? Math.round(v) : undefined }) })} title="caps how many auto re-seeds run before the cycle halts like onComplete 'halt'" />
+              )}
+            </div>
+            <label className="flex items-center gap-1.5" title="a loss ends the cycle and the trader stands down until restarted; off = the pot re-seeds at base and keeps rolling">
+              <Switch checked={draft.stakePlan.stopOnLoss !== false} onCheckedChange={(v) => setDraft({ ...draft, stakePlan: plan({ stopOnLoss: v, ...(v ? { lossReseedLimit: undefined } : {}) }) })} />
+              <span className="text-[#aab6cc]">stop on loss</span>
+            </label>
+            {draft.stakePlan.stopOnLoss === false && (
+              <NumField label="max loss re-seeds (0 = \u221e)" min={0} value={draft.stakePlan.lossReseedLimit ?? 0} onChange={(v) => setDraft({ ...draft, stakePlan: plan({ lossReseedLimit: v > 0 ? Math.round(v) : undefined }) })} title="caps consecutive losses absorbed while re-seeding before a forced stop" />
+            )}
+          </div>
+        )}
+
+        {/* live roll state straight from the kernel - pot, roll count, the
+            stake the NEXT trade would place, and the halt/restart control */}
+        {status.nextStake.compound && (
+          <div
+            className={`flex w-full flex-wrap items-center gap-3 rounded p-1.5 ${
+              status.planState.halted ? 'border border-rose-500/40 bg-rose-500/5' : 'bg-[#070c15]'
+            }`}
+          >
+            <span className="text-[#aab6cc]">
+              pot <span className="font-bold text-cyan-300">${status.nextStake.pot.toFixed(2)}</span>
+            </span>
+            <span className="text-[#aab6cc]">
+              roll <span className="font-bold text-cyan-300">x{status.nextStake.rollN}</span>
+            </span>
+            <span className="text-[#aab6cc]">
+              next stake <span className="font-bold text-violet-300">${status.nextStake.amount.toFixed(2)}</span> ({status.nextStake.phase})
+            </span>
+            <span className="text-[#7c8aa5]">
+              restarts: {status.planState.restarts}
+              {status.planState.reseedCount ? ` · re-seeds: ${status.planState.reseedCount}` : ''}
+              {status.planState.lossReseedCount ? ` · loss re-seeds: ${status.planState.lossReseedCount}` : ''}
+            </span>
+            {status.planState.halted && (
+              <>
+                <span className="font-bold text-rose-300">
+                  {status.planState.complete
+                    ? `cycle COMPLETE (${status.planState.rollN} periods banked) - standing down`
+                    : 'cycle ended on a loss - standing down'}
+                </span>
+                <Button
+                  size="sm"
+                  disabled={restarting}
+                  className="h-5 bg-emerald-600 px-2 text-[9px] font-bold uppercase tracking-wider text-white hover:bg-emerald-500"
+                  onClick={() => void restartCompound()}
+                >
+                  {restarting ? 'restarting...' : 'restart compound cycle'}
+                </Button>
+              </>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="flex flex-wrap items-center gap-3 rounded border border-[#1c2739] bg-[#0b0f17] p-2 text-[#aab6cc]">

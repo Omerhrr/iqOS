@@ -4435,6 +4435,13 @@ export interface AiTraderConfig {
    * uses, same keys, nothing extra to configure), falling back to trading-
    * core's own .env only if this app is unreachable. Default localhost:3000. */
   appUrl?: string
+  /** Optional compounding stake plan - the SAME StakePlan shape the bots
+   *  use (see StakePlan above), so a scheme tuned in the fleet editor
+   *  carries over verbatim: a pot seeded at `base` rolls rollPct% of itself
+   *  into every trade, wins fold the payout in (capped at payoutCap%), a
+   *  loss ends the cycle (halt until restart) by default. undefined = flat
+   *  `stake` every trade, unchanged original behavior. */
+  stakePlan?: StakePlan
 }
 
 export interface AiTraderStatus {
@@ -4446,6 +4453,14 @@ export interface AiTraderStatus {
   lastRunTs: number
   nextRunTs: number | null
   lastError: string | null
+  /** Compounding roll state (pot/rollN/restarts/halted/complete) - zeroed
+   *  and inert while no stakePlan is armed; the panel renders the pot/roll
+   *  strip and the restart button off this. */
+  planState: { pot: number; rollN: number; restarts: number; reseedCount: number; lossReseedCount: number; halted: boolean; complete: boolean }
+  /** The stake the NEXT trade would place (flat config.stake, or the
+   *  compounding pot math's answer) plus its plan context - the panel shows
+   *  this instead of re-deriving the plan math client-side. */
+  nextStake: { amount: number; pot: number; rollN: number; compound: boolean; phase: 'compound' | 'derisk' }
   /** The app URL a cycle will ACTUALLY call right now, after APP_URL env /
    * saved config / default resolution - shown directly so there's nothing
    * to guess about which one is in effect. */
