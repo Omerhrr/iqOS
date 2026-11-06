@@ -40,6 +40,7 @@ import { builtinStrategyToMsl } from './builtinMslView'
 import TickSmcPanel from './TickSmcPanel'
 import TickOraclePanel from './TickOraclePanel'
 import TickTechnicalPanel from './TickTechnicalPanel'
+import TickFootprintPanel from './TickFootprintPanel'
 import { FullscreenBackdrop, FullscreenButton } from './FullscreenButton'
 
 interface BottomTabsProps {
@@ -253,6 +254,7 @@ export default function BottomTabs(props: BottomTabsProps) {
             ['ticksmc', 'Tick SMC'],
             ['tickoracle', 'Tick Oracle'],
             ['ticktech', 'Tick Technical'],
+            ['tickfp', 'Tick Footprint'],
             ['patterns', `Patterns (${patterns.length})`],
             ['alerts', 'Alerts'],
             ['diagnostics', 'Diagnostics'],
@@ -666,6 +668,11 @@ export default function BottomTabs(props: BottomTabsProps) {
       {/* TICK DESK: investing.com-style technical summary on tick buckets */}
       <TabsContent value="ticktech" className="mt-0 min-h-0 flex-1 overflow-hidden">
         <TickTechnicalPanel asset={asset} />
+      </TabsContent>
+
+      {/* TICK DESK: measured-print cluster ladder tab (the Tick FP chart type's dock twin) */}
+      <TabsContent value="tickfp" className="mt-0 min-h-0 flex-1 overflow-hidden">
+        <TickFootprintPanel asset={asset} />
       </TabsContent>
 
       {/* PATTERNS */}
