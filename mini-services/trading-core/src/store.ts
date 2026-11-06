@@ -964,6 +964,11 @@ export class Store {
     )
   }
 
+  /** Wipe the whole AI Trader decision log - user-initiated "clear log", not a size-bound prune. */
+  clearAiTraderDecisions(): void {
+    this.db.run(`DELETE FROM ai_trader_decisions`)
+  }
+
   // ---------- alerts / journal ----------
 
   recordAlert(level: string, message: string, ts: number): void {

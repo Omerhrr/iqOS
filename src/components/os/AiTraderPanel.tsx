@@ -7,7 +7,7 @@
 // cycle including skips, with the model's own reasoning) - this is the one
 // place "trust me" isn't good enough, so the log is the point, not an
 // afterthought.
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
@@ -29,6 +29,33 @@ export default function AiTraderPanel({ assets, onError }: Props) {
   const [saving, setSaving] = useState(false)
   const [running, setRunning] = useState(false)
   const [expiryText, setExpiryText] = useState('3,5')
+  const [clearing, setClearing] = useState(false)
+  const [clearArmed, setClearArmed] = useState(false)
+
+  // Decision log height is user-draggable (grab the handle above the table
+  // and drag up to grow it, down to shrink) instead of a fixed flex-1 split -
+  // the log is the point of this panel, so it should be easy to give it most
+  // of the screen when you're actually reading through reasoning.
+  const [histHeight, setHistHeight] = useState(240)
+  const dragState = useRef<{ startY: number; startHeight: number } | null>(null)
+
+  const onDragStart = useCallback((e: React.MouseEvent) => {
+    e.preventDefault()
+    dragState.current = { startY: e.clientY, startHeight: histHeight }
+    const onMove = (ev: MouseEvent) => {
+      if (!dragState.current) return
+      // dragging UP (clientY decreases) should GROW the log, so the delta is inverted.
+      const delta = dragState.current.startY - ev.clientY
+      setHistHeight(Math.max(120, Math.min(900, dragState.current.startHeight + delta)))
+    }
+    const onUp = () => {
+      dragState.current = null
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }, [histHeight])
 
   const load = useCallback(async () => {
     try {
@@ -71,6 +98,25 @@ export default function AiTraderPanel({ assets, onError }: Props) {
     }
   }
 
+  const clearDecisions = async () => {
+    if (!clearArmed) {
+      setClearArmed(true)
+      setTimeout(() => setClearArmed(false), 4000)
+      return
+    }
+    setClearing(true)
+    try {
+      const res = await osPost<{ ok: boolean; error?: string }>('/ai_trader_clear_decisions')
+      if (res.ok) setDecisions([])
+      else onError(res.error ?? 'clear failed')
+    } catch (err) {
+      onError((err as Error).message)
+    } finally {
+      setClearing(false)
+      setClearArmed(false)
+    }
+  }
+
   const runNow = async () => {
     setRunning(true)
     try {
@@ -93,7 +139,7 @@ export default function AiTraderPanel({ assets, onError }: Props) {
       <div className="flex flex-wrap items-center gap-3 rounded border border-violet-500/30 bg-[#0b0817] p-2">
         <span className="font-bold uppercase tracking-wider text-violet-300">✦ AI Trader</span>
         <span className="text-[#aab6cc]">
-          scans {draft.asset} {draft.tf} every {draft.intervalMin}min, decides with LLM reasoning over the same panel reads the other auto-traders use - most cycles should SKIP.
+          scans {draft.asset} {draft.tf} every {draft.intervalMin}min - plays the human at the desk: reads the raw price action itself, weighs the other panels as a second opinion (not a vote), decides direction + expiry together, and sides with its own read when they disagree. Most cycles should SKIP.
         </span>
       </div>
 
@@ -203,22 +249,29 @@ export default function AiTraderPanel({ assets, onError }: Props) {
         {status.lastError && <span className="text-rose-300">last error: {status.lastError}</span>}
       </div>
 
-      <div className="flex flex-wrap items-center gap-2 rounded border border-[#1c2739] bg-[#0b0f17] p-2">
-        <span className="text-[#7c8aa5]">decisions normally go through this app (same keys as Copilot) - this row is only trading-core&apos;s OWN fallback providers, used only if this app is unreachable:</span>
-        {status.llm.providers.map((p) => (
-          <span
-            key={p.id}
-            className={`rounded px-1.5 py-0.5 ${
-              p.ready ? 'bg-emerald-500/15 text-emerald-300' : p.enabled ? 'bg-amber-500/15 text-amber-300' : 'bg-[#101828] text-[#4b5a72]'
-            }`}
-            title={p.enabled ? (p.ready ? `ready - ${p.model}` : 'enabled but missing its API key/config') : 'not enabled (USE_* flag unset or false)'}
-          >
-            {p.id}
-          </span>
-        ))}
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[#7c8aa5]">decision log ({decisions.length}) - drag the handle to resize</span>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={clearing || decisions.length === 0}
+          onClick={() => void clearDecisions()}
+          className={`h-6 px-2 text-[9px] uppercase ${clearArmed ? 'border-rose-500/50 text-rose-300' : 'border-[#1c2739] text-[#7c8aa5]'}`}
+        >
+          {clearing ? 'clearing...' : clearArmed ? 'click again to confirm' : 'clear log'}
+        </Button>
       </div>
 
-      <div className="flex-1 overflow-y-auto rounded border border-[#1c2739]">
+      {/* Drag handle - grab and drag up to grow the log, down to shrink it. */}
+      <div
+        onMouseDown={onDragStart}
+        className="group flex h-2 w-full shrink-0 cursor-row-resize items-center justify-center rounded-sm hover:bg-[#1c2739]"
+        title="drag to resize the decision log"
+      >
+        <div className="h-0.5 w-10 rounded-full bg-[#1c2739] group-hover:bg-violet-400" />
+      </div>
+
+      <div className="shrink-0 overflow-y-auto rounded border border-[#1c2739]" style={{ height: histHeight }}>
         <table className="w-full border-collapse text-left">
           <thead className="sticky top-0 bg-[#0b0f17] text-[#7c8aa5]">
             <tr>

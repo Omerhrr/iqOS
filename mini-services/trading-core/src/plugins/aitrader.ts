@@ -2,14 +2,23 @@
 // request. Every other auto-trader in this codebase (the single Meta
 // Trader, the autopilot bot fleet, Meta Strategy specs) decides with FIXED
 // rules - indicator thresholds, panel-source votes, learned AI-Lab specs.
-// This one decides with actual LLM reasoning over a snapshot of the exact
-// same panel reads those rules already compute (MetaStrategyService.
-// snapshotSources - oracle/accute/smc/renko/pointFigure/rangeBars etc, the
-// same reads a human would glance at before pulling the trigger), on a
-// timer rather than every candle close - the user's own framing was "6
-// trades an hour, roughly one every ~10 minutes, 3-5 min expiry, only when
-// it sees a good opportunity" - so this is an opportunity-scan loop, not an
-// edge-trigger dispatcher like the bots.
+//
+// This one is explicitly cast as the HUMAN at the desk, not another system
+// alongside those - per direct instruction: "take all analysis, make yours,
+// decide expiry, decide direction and whether to trade or not." The other
+// auto-traders' panel reads (MetaStrategyService.snapshotSources -
+// oracle/accute/smc/renko/pointFigure/rangeBars etc) are handed to it as a
+// SECOND OPINION from "the desk," same as a real trader's own indicators -
+// but the PRIMARY evidence is its own read of the raw recent candles,
+// computed per-expiry-choice (see buildHorizonReads below) so the direction
+// AND the expiry get decided together against that one specific holding
+// period, not a generic longer-term bias. It can agree with the desk, it
+// can override it, or it can conclude disagreement itself means skip - see
+// the system prompt in runCycle() for exactly how that's framed to the
+// model. On a timer rather than every candle close - the user's own framing
+// was "6 trades an hour, roughly one every ~10 minutes, 3-5 min expiry,
+// only when it sees a good opportunity" - so this is an opportunity-scan
+// loop, not an edge-trigger dispatcher like the bots.
 //
 // Per direct instruction this starts in SHADOW mode by default (config.live
 // = false): every cycle still runs the full snapshot -> LLM -> decision
@@ -37,13 +46,15 @@
 // OTC asset here as unverified until that's addressed; the global risk
 // manager's other gates still apply either way.
 
-import type { Timeframe, TradeKind } from '../types'
+import type { Candle, Timeframe, TradeKind } from '../types'
 import type { KernelContext, Plugin } from '../kernel'
 import { Store } from '../store'
 import type { MarketDataService } from './market-data'
 import type { ExecutionService } from './execution'
 import type { MetaStrategyService } from './metastrategy'
 import { chatComplete, providerStatus, type ChatMessage } from '../lib/llm'
+import { tfSeconds } from '../analytics/synthfeed'
+import { atr, closes, ema, highs, lows, rsi } from '../analytics/indicators'
 
 export interface AiTraderConfig {
   enabled: boolean
@@ -168,6 +179,47 @@ async function callLlm(
  * accepts an exact expirySec same as turbo/blitz - see execution.ts). */
 const minToSec = (m: number) => Math.max(1, Math.round(m * 60))
 
+/** Per-expiry-choice read, computed directly off the raw candles rather than
+ * any other predictor's pre-digested verdict. This is what makes the model
+ * actually reason about THIS trade's specific holding period instead of
+ * reacting to a generic, horizon-agnostic signal - a 3min and a 15min expiry
+ * can legitimately disagree, and conflating them is exactly the "immediate
+ * context" loss the operator flagged. */
+interface HorizonRead {
+  expiryMin: number
+  bars: number
+  momentumPct: number
+  upBars: number
+  downBars: number
+  /** |momentum| divided by a random-walk-scaled noise estimate (atr% *
+   * sqrt(bars)) - a rough signal-to-noise ratio for THIS window length.
+   * Comfortably >1 means the drift measured is bigger than you'd expect
+   * from noise alone over that many bars; well under 1 means it's
+   * indistinguishable from chop and shouldn't be read as a trend. */
+  snr: number
+}
+
+function buildHorizonReads(closePrices: number[], tfSec: number, expiryChoices: number[], atrPct: number): HorizonRead[] {
+  const n = closePrices.length
+  return expiryChoices.map((expiryMin) => {
+    const bars = Math.max(1, Math.round((expiryMin * 60) / tfSec))
+    const start = n - 1 - bars
+    let momentumPct = 0
+    let upBars = 0
+    let downBars = 0
+    if (start >= 0 && closePrices[start]) {
+      momentumPct = ((closePrices[n - 1] - closePrices[start]) / closePrices[start]) * 100
+      for (let i = start + 1; i < n; i++) {
+        if (closePrices[i] > closePrices[i - 1]) upBars += 1
+        else if (closePrices[i] < closePrices[i - 1]) downBars += 1
+      }
+    }
+    const noise = atrPct * Math.sqrt(bars)
+    const snr = noise > 0 ? Math.abs(momentumPct) / noise : 0
+    return { expiryMin, bars, momentumPct, upBars, downBars, snr }
+  })
+}
+
 interface ParsedDecision {
   direction: 'call' | 'put' | 'skip'
   confidence: number
@@ -179,7 +231,8 @@ interface ParsedDecision {
  * parseCodeAssistReply uses for the same reason: a model that's 95% good at
  * "return ONLY JSON" still occasionally wraps it in prose or a fenced block,
  * and a trade decision is exactly the place NOT to throw that away. */
-function parseDecision(raw: string, fallbackExpiry: number): ParsedDecision | null {
+function parseDecision(raw: string, allowedExpiries: number[]): ParsedDecision | null {
+  const fallbackExpiry = allowedExpiries[0] ?? 3
   const tryParse = (text: string): Record<string, unknown> | null => {
     try {
       const v = JSON.parse(text)
@@ -201,7 +254,14 @@ function parseDecision(raw: string, fallbackExpiry: number): ParsedDecision | nu
   const dirRaw = String(obj.direction ?? '').toLowerCase()
   const direction: ParsedDecision['direction'] = dirRaw === 'call' || dirRaw === 'put' ? dirRaw : 'skip'
   const confidence = Math.max(0, Math.min(100, Number(obj.confidence) || 0))
-  const expiryMin = Number(obj.expiryMin) > 0 ? Number(obj.expiryMin) : fallbackExpiry
+  // The model is offered a fixed menu of expiries and told to pick one, not
+  // invent one - snap to the closest allowed choice rather than trusting an
+  // arbitrary number back, since placeOrder will use this verbatim.
+  const rawExpiry = Number(obj.expiryMin)
+  const expiryMin =
+    rawExpiry > 0 && allowedExpiries.length
+      ? allowedExpiries.reduce((best, c) => (Math.abs(c - rawExpiry) < Math.abs(best - rawExpiry) ? c : best), allowedExpiries[0])
+      : fallbackExpiry
   const reasoning = String(obj.reasoning ?? '').trim() || '(no reasoning given)'
   return { direction, confidence, expiryMin, reasoning }
 }
@@ -291,6 +351,13 @@ export class AiTraderService {
     return this.store.listAiTraderDecisions(limit) as AiTraderDecision[]
   }
 
+  /** User-initiated "clear log" - wipes the whole decision history, not a
+   * size-bound prune. Does not touch config/cycles/running state. */
+  clearDecisions(): void {
+    this.store.clearAiTraderDecisions()
+    this.emit('info', 'AI Trader decision log cleared')
+  }
+
   /** Manual trigger - the UI's "run a cycle now" button, and how this gets
    * tested without waiting out a real interval. Runs the exact same path
    * runCycle's timer calls, just on demand. */
@@ -347,31 +414,109 @@ export class AiTraderService {
       }
       const record = this.recentRecord(asset, tf)
 
+      // Raw candles - the model does its OWN read of price action here,
+      // it is not just tallying what other predictors already concluded.
+      // Need enough bars to cover both a real ATR(14) and the longest
+      // expiry choice's lookback window, with headroom.
+      const tfSec = tfSeconds(tf)
+      const longestExpiryBars = Math.max(1, ...this.config.expiryChoices.map((m) => Math.round((m * 60) / tfSec)))
+      const candleLimit = Math.max(80, longestExpiryBars * 4 + 30)
+      let candles: Candle[] = []
+      try {
+        candles = this.market.getCandles(asset, tf, candleLimit, true)
+      } catch {
+        candles = []
+      }
+
+      const closePrices = closes(candles)
+      const highPrices = highs(candles)
+      const lowPrices = lows(candles)
+      const atrSeries = closePrices.length >= 15 ? atr(highPrices, lowPrices, closePrices, 14) : []
+      const atrLast = atrSeries.length ? atrSeries[atrSeries.length - 1] : 0
+      const atrPct = price > 0 && atrLast > 0 ? (atrLast / price) * 100 : 0
+      const rsiSeries = closePrices.length >= 15 ? rsi(closePrices, 14) : []
+      const rsiLast = rsiSeries.length ? rsiSeries[rsiSeries.length - 1] : 50
+      const ema9Series = closePrices.length >= 9 ? ema(closePrices, 9) : []
+      const ema21Series = closePrices.length >= 21 ? ema(closePrices, 21) : []
+      const ema9Last = ema9Series.length ? ema9Series[ema9Series.length - 1] : price
+      const ema21Last = ema21Series.length ? ema21Series[ema21Series.length - 1] : price
+
+      const horizons = closePrices.length ? buildHorizonReads(closePrices, tfSec, this.config.expiryChoices, atrPct) : []
+      const horizonLines = horizons.length
+        ? horizons
+            .map(
+              (h) =>
+                `- ${h.expiryMin}min expiry (~${h.bars} x ${tf} bars): net move over that exact window ${h.momentumPct >= 0 ? '+' : ''}${h.momentumPct.toFixed(3)}% (${h.upBars} up-bars / ${h.downBars} down-bars), signal-to-noise ${h.snr.toFixed(2)}x` +
+                (h.snr >= 1 ? ' (drift exceeds typical noise for this window - a real move, not just chop)' : h.snr >= 0.5 ? ' (borderline - could be either)' : ' (well within noise - likely just chop, not a trend)')
+            )
+            .join('\n')
+        : '- (not enough candle history yet to compute per-expiry reads - plugin still warming up)'
+
+      // Last ~24 closes, oldest first, so the model can see the actual shape
+      // of recent price action with its own eyes instead of only a verdict.
+      const recentCloses = closePrices.slice(-24).map((v) => v.toFixed(5)).join(', ')
+
       const snapshotLines = snapshot.length
         ? snapshot.map((r) => `- ${r.label}`).join('\n')
-        : '- (no panel reads available - thin history or plugins still warming up)'
+        : '- (no reference reads available - thin history or plugins still warming up)'
 
       const system: ChatMessage = {
         role: 'system',
         content: [
-          'You are the AI Trader inside IQAIR//OS, a binary-options trading platform.',
-          'You scan the market periodically (not every candle) and decide whether THIS is a',
-          'genuinely good moment to take a trade, or whether to stand aside. Most cycles should',
-          'be a SKIP - only call/put when the panel reads below give you real, non-contradictory',
-          'conviction. You are not required to trade every cycle.',
+          'You are the AI Trader inside IQAIR//OS, a binary-options trading platform - and your role here is',
+          'specifically the HUMAN sitting at the desk, not one more system running alongside the others. This',
+          'platform already has a whole desk of analysts, predictors and watchers working for you (the panel',
+          "reads below) - a real trader doesn't blindly obey their analysts either. They listen to what the desk",
+          'says, form their OWN independent read of the actual price action, weigh the two together, and THEN',
+          'decide: which way, how big a window, and whether this is even a moment worth trading at all. That',
+          'full decision - direction, expiry, and trade-or-skip, together, as one judgment call - is your job.',
+          'You are allowed, and expected, to disagree with your own desk when your own read of the price action',
+          'says something different, exactly like a human trader would override a system he built himself.',
+          '',
+          'A mechanical confluence vote across that same panel already exists elsewhere in this platform',
+          '(Meta-Strategy/Meta-Trader) - that is NOT your job, and just restating or averaging their labels back',
+          'is not a trade decision, it is exactly the "just another bot" behavior you are explicitly here to not be.',
+          'A binary option only pays out on where price is AT THE EXACT EXPIRY you pick, not on a generic bias, so',
+          'a decision that ignores the specific window it will be judged on is not a real decision either.',
+          '',
+          'Your job each cycle:',
+          '1. Read the raw recent closes and the per-expiry-choice momentum/signal-to-noise reads below yourself -',
+          '   this is your OWN analysis, your primary evidence. Form a real view of the actual short-term price',
+          '   action: is it trending, ranging, exhausting a move, reversing? Do not just restate the numbers back.',
+          "2. Then bring in the desk's panel reads as a second opinion, not a vote to average into yours. If they",
+          '   agree with your own read, that raises your conviction, same as a trader feeling better about a call',
+          '   when the room agrees with him. If they conflict, you decide whose read you trust more for THIS',
+          '   moment - you are allowed to override the desk and go with your own analysis, or to defer to them',
+          '   and lower your own confidence, or to conclude the disagreement itself means skip. State which you',
+          '   did and why.',
+          '3. Decide direction and expiry together, not independently - look at the per-expiry reads below and',
+          '   choose the ONE expiry (from the allowed list) where your own analysis is clearest and the',
+          '   signal-to-noise is least ambiguous for THAT specific holding period. A read that looks strong at',
+          "   one expiry can be noise at another - do not pick an expiry just because it's listed first.",
+          '4. Decide whether this moment is even worth trading. Precision matters more than frequency - you are',
+          '   not required to trade every cycle, and most cycles SHOULD be a skip, the same way a real trader',
+          '   spends most of a session watching and waiting, not firing on every tick. Only call/put when you',
+          '   would genuinely expect to be right most of the time at that confidence level. Being honestly',
+          '   uncertain and skipping beats a confident-sounding guess that is wrong half the time.',
           '',
           'Respond with ONLY a JSON object, no prose outside it, in exactly this shape:',
-          '{"direction": "call" | "put" | "skip", "confidence": 0-100, "expiryMin": <one of the offered choices>, "reasoning": "<one or two sentences, concrete, referencing the actual reads below>"}',
+          '{"direction": "call" | "put" | "skip", "confidence": 0-100, "expiryMin": <the ONE allowed choice your analysis is clearest on>, "reasoning": "<2-4 sentences: your own read of the price action, how it specifically supports a move completing within the chosen expiry, and whether you sided with or against the desk and why>"}',
         ].join('\n'),
       }
       const user: ChatMessage = {
         role: 'user',
         content: [
           `Asset: ${asset}   Timeframe: ${tf}   Current price: ${price || 'unavailable'}`,
-          `Allowed expiry choices (minutes): ${this.config.expiryChoices.join(', ')}`,
+          `Trend context: EMA9 ${ema9Last.toFixed(5)} vs EMA21 ${ema21Last.toFixed(5)} (${ema9Last > ema21Last ? 'short-term above long-term - up-bias' : ema9Last < ema21Last ? 'short-term below long-term - down-bias' : 'flat'}), RSI14 ${rsiLast.toFixed(1)}, ATR14 ${atrPct.toFixed(4)}% of price (volatility regime).`,
+          `Recent closes, oldest -> newest (${closePrices.length ? closePrices.length : 0} bars available, showing last ${Math.min(24, closePrices.length)}): ${recentCloses || '(none yet)'}`,
+          '',
+          'Per-expiry-choice reads (computed directly from the candles above - this is YOUR analysis to build on):',
+          horizonLines,
+          '',
+          `Allowed expiry choices (minutes): ${this.config.expiryChoices.join(', ')} - you must pick exactly one of these.`,
           `Your own recent record on this exact asset+tf: ${record.wins}W / ${record.losses}L settled, ${record.open} still open.`,
           '',
-          'Current panel reads:',
+          "The desk's panel reads (second opinion, not a vote - see system instructions on when to defer to this vs override it):",
           snapshotLines,
           '',
           `Minimum confidence to actually act: ${this.config.minConfidence} (a lower confidence will be treated as a skip regardless of direction, so be honest rather than inflating it).`,
@@ -382,7 +527,7 @@ export class AiTraderService {
       let provider = ''
       let model = ''
       try {
-        const res = await callLlm(resolveAppUrl(this.config), [system, user], { temperature: 0.4, maxTokens: 500, timeoutMs: 45_000 })
+        const res = await callLlm(resolveAppUrl(this.config), [system, user], { temperature: 0.3, maxTokens: 700, timeoutMs: 45_000 })
         content = res.content
         provider = res.provider
         model = res.model
@@ -397,7 +542,7 @@ export class AiTraderService {
         return null
       }
 
-      const parsed = parseDecision(content, this.config.expiryChoices[0] ?? 3)
+      const parsed = parseDecision(content, this.config.expiryChoices)
       if (!parsed) {
         this.lastError = 'model reply was not parseable JSON'
         this.store.recordAiTraderDecision({

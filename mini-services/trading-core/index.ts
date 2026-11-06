@@ -4284,6 +4284,16 @@ const httpServer = createServer(async (req, res) => {
         return json(out.ok ? 200 : 400, out)
       }
 
+      // POST /ai_trader_clear_decisions - wipes the decision log (the UI's
+      // "clear" button on the AI Trader panel's history). Leaves config and
+      // running state untouched - mirrors how /ai_trader_run_now only ever
+      // touches the log, not the config.
+      if (path === '/ai_trader_clear_decisions') {
+        const ai = kernel.context().use<AiTraderService>('aiTrader')
+        ai.clearDecisions()
+        return json(200, { ok: true })
+      }
+
       if (path === '/lab_delete') {
         const lab = kernel.context().use<StrategyLabService>('lab')
         return json(200, lab.remove(String(body.id ?? '')))
