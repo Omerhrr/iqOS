@@ -30,6 +30,7 @@ export type MetaConditionSource =
   | 'oracle' // Next-Candle Oracle's own fused pUp/confidence (analytics/nextcandle.ts)
   | 'hmaRocBullBear' // the Oracle panel's first secondary read (analytics/hmarocbullbear.ts)
   | 'momentumScore' // the Oracle panel's second secondary read, the user's own Market Momentum Score formula (analytics/momentumscore.ts)
+  | 'nextExpiry' // Next-Expiry Oracle's own fused read (plugins/nextexpiry.ts) - minute-native (1/2/3/5/15m over the 1m base), so this read ignores the condition's tf exactly like its own panel does. By default it reads the oracle's single best pick (already gated by the engine's pWin>=0.56 AND confidence>=25 floors, honest "wait" -> none); a condition may pin ONE rung via its expiryMin field instead
   | 'accute' // Accute's fused multi-driver prediction (plugins/accute.ts)
   | 'renko' // Renko brick trend/streak (analytics/renko.ts, same read Accute's own renko leg uses)
   | 'smc' // Smart Money Concepts BLENDED structure summary (analytics/smc.ts's scanSmc().summary - mixes in older hits, not just this candle)
@@ -62,6 +63,7 @@ export const META_CONDITION_SOURCES: readonly MetaConditionSource[] = [
   'oracle',
   'hmaRocBullBear',
   'momentumScore',
+  'nextExpiry',
   'accute',
   'renko',
   'smc',
@@ -114,6 +116,12 @@ export interface MetaCondition {
    * spec target one concept the same way Meta Trader's own smc-<kind>
    * sources do, without a new MetaConditionSource per kind. */
   smcKind?: string
+  /** Only meaningful when source === 'nextExpiry' - which expiry ladder
+   * rung (minutes, one of 1/2/3/5/15) to read instead of the oracle's
+   * default single best pick. Undefined = best pick (the engine's own
+   * honesty floors already gate it); a pinned rung that is still warming
+   * up or sitting in its deadband reads as 'none', never as a guess. */
+  expiryMin?: number
 }
 
 export interface MetaStrategySpec {

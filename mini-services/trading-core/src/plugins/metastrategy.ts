@@ -20,12 +20,14 @@ import type { MarketDataService } from './market-data'
 import type { NextCandleService } from './nextcandle'
 import type { AccuteService } from './accute'
 import type { SmcScanService } from './smcscan'
+import type { NextExpiryService } from './nextexpiry'
 import { renkoBricks, renkoAtr } from '../analytics/renko'
 import { rangeBars } from '../analytics/rangebars'
 import { pointFigure } from '../analytics/pointfigure'
 import { volumeBars } from '../analytics/volumebars'
 import { computeTpo } from '../analytics/tpo'
 import { realizedUpProb } from '../analytics/ivhv'
+import { EXPIRIES_MIN } from '../analytics/nextexpiry'
 import { engineVoteSingle, type ChartEngineVote } from '../analytics/chartsignals'
 import { smcNowRead, smcAnyAgrees, ALL_SMC_KINDS } from '../analytics/smc'
 import {
@@ -120,7 +122,7 @@ export class MetaStrategyService {
    * specific concept instead of only the "any" read. */
   snapshotSources(asset: string, tf: Timeframe): MetaSourceRead[] {
     const sources: MetaConditionSource[] = [
-      'oracle', 'hmaRocBullBear', 'momentumScore', 'accute', 'renko',
+      'oracle', 'hmaRocBullBear', 'momentumScore', 'nextExpiry', 'accute', 'renko',
       'smc', 'smcNow', 'renkoSmc', 'renkoSmcMajority', 'pointFigure', 'rangeBars',
     ]
     const base = sources.map((s) => this.readSource(s, asset, tf))
@@ -166,6 +168,8 @@ export class MetaStrategyService {
         if (c.direction !== 'call' && c.direction !== 'put' && c.direction !== 'either') throw new Error(`condition direction must be 'call'/'put'/'either', got "${c.direction}"`)
         if (c.source === 'smcNow' && c.smcKind !== undefined && !(ALL_SMC_KINDS as readonly string[]).includes(c.smcKind))
           throw new Error(`unknown smcKind "${c.smcKind}" - must be one of ${ALL_SMC_KINDS.join(', ')}`)
+        if (c.source === 'nextExpiry' && c.expiryMin !== undefined && !(EXPIRIES_MIN as readonly number[]).includes(c.expiryMin))
+          throw new Error(`nextExpiry expiryMin must be one of ${EXPIRIES_MIN.join('/')} (minutes), got "${c.expiryMin}"`)
         if (c.op !== undefined && !(['>=', '>', '<=', '<', '==', '!='] as const).includes(c.op))
           throw new Error(`condition op must be one of >=, >, <=, <, ==, !=, got "${c.op}"`)
       }
@@ -179,7 +183,7 @@ export class MetaStrategyService {
       mode,
       threshold: mode === 'weighted' ? Math.max(0, Math.min(100, input.threshold ?? 60)) : undefined,
       conditions: Array.isArray(input.conditions)
-        ? input.conditions.map((c) => ({ source: c.source, direction: c.direction, minConfidence: c.minConfidence, weight: c.weight, smcKind: c.smcKind, op: c.op }))
+        ? input.conditions.map((c) => ({ source: c.source, direction: c.direction, minConfidence: c.minConfidence, weight: c.weight, smcKind: c.smcKind, op: c.op, expiryMin: c.expiryMin }))
         : [],
       script,
       createdTs: existing?.createdTs ?? Date.now(),
@@ -219,7 +223,7 @@ export class MetaStrategyService {
     return { direction, confidence, streak: r.streak, trend: r.trend }
   }
 
-  private readSource(source: MetaConditionSource, asset: string, tf: Timeframe, smcKind?: string): MetaSourceRead {
+  private readSource(source: MetaConditionSource, asset: string, tf: Timeframe, smcKind?: string, expiryMin?: number): MetaSourceRead {
     const none = (label: string): MetaSourceRead => ({ source, direction: 'none', confidence: 0, label })
     try {
       switch (source) {
@@ -240,6 +244,32 @@ export class MetaStrategyService {
           const mom = oracle.predict(asset, tf)?.momentumPrediction
           if (!mom || mom.direction === 'none') return none('Momentum Score: no lean')
           return { source, direction: mom.direction, confidence: mom.strength, label: `Momentum Score ${mom.direction.toUpperCase()} ${mom.strength.toFixed(0)}%` }
+        }
+        case 'nextExpiry': {
+          // The Next-Expiry Oracle's own fused read (plugins/nextexpiry.ts),
+          // same data its panel renders. Minute-native by design - the ladder
+          // is 1/2/3/5/15 minutes over the 1m base - so this read
+          // deliberately ignores the condition's tf exactly the way its own
+          // panel and global board do. Two shapes:
+          //   - expiryMin set -> that specific rung's LIVE read; a rung still
+          //     warming up (ok:false) or sitting in its deadband (direction
+          //     'none') reads as none - a warming rung makes no claim, so a
+          //     meta condition pinned to it cannot pass, never guesses.
+          //   - expiryMin unset -> the oracle's single best pick, which the
+          //     ENGINE already gated (pWin >= 0.56 AND confidence >= 25, else
+          //     honest null = "wait" -> none). No second gate here on
+          //     purpose: duplicating floors would just drift from the panel.
+          const expiryOracle = this.ctx.use<NextExpiryService>('nextexpiry')
+          const pred = expiryOracle.predict(asset)
+          if (!pred) return none('Expiry oracle: no read (thin 1m history)')
+          if (expiryMin !== undefined) {
+            const rung = pred.rows.find((r) => r.expiry === expiryMin)
+            if (!rung || !rung.ok) return none(`Expiry oracle ${expiryMin}m: warming up`)
+            if (rung.direction === 'none') return none(`Expiry oracle ${expiryMin}m: ${rung.note}`)
+            return { source, direction: rung.direction, confidence: rung.confidence, label: `Expiry ${expiryMin}m ${rung.direction.toUpperCase()} ${rung.confidence.toFixed(0)}% (pWin ${(rung.pWin * 100).toFixed(0)}%)` }
+          }
+          if (!pred.best) return none(`Expiry oracle: wait - ${pred.note}`)
+          return { source, direction: pred.best.direction, confidence: pred.best.confidence, label: `Expiry oracle ${pred.best.expiry}m ${pred.best.direction.toUpperCase()} ${pred.best.confidence.toFixed(0)}% (pWin ${(pred.best.pWin * 100).toFixed(0)}%)` }
         }
         case 'accute': {
           const accute = this.ctx.use<AccuteService>('accute')
@@ -501,6 +531,24 @@ export class MetaStrategyService {
       tpo: toMsl(this.readSource('tpo', asset, tf)),
       ivHv: toMsl(this.readSource('ivHv', asset, tf)),
     }
+    // Next-Expiry Oracle reads for scripts: bare 'nextExpiry' = the best
+    // pick (engine honesty floors already applied, null best = none) and
+    // 'nextExpiry:<E>' for each ladder rung (1/2/3/5/15) - same smc:<KIND>
+    // convention, so a script can pin a horizon without a new language
+    // keyword. ONE predict() call feeds all six keys; the plugin's pending
+    // dedupe makes the extra poll idempotent on the honesty ledger anyway.
+    try {
+      const expiryOracle = this.ctx.use<NextExpiryService>('nextexpiry')
+      const pred = expiryOracle.predict(asset)
+      reads.nextExpiry = pred?.best ? { direction: pred.best.direction, confidence: pred.best.confidence } : { direction: 'none', confidence: 0 }
+      for (const E of EXPIRIES_MIN) {
+        const rung = pred?.rows.find((r) => r.expiry === E)
+        reads[`nextExpiry:${E}`] = rung && rung.ok && rung.direction !== 'none' ? { direction: rung.direction, confidence: rung.confidence } : { direction: 'none', confidence: 0 }
+      }
+    } catch {
+      reads.nextExpiry = { direction: 'none', confidence: 0 }
+      for (const E of EXPIRIES_MIN) reads[`nextExpiry:${E}`] = { direction: 'none', confidence: 0 }
+    }
     try {
       const smc = this.ctx.use<SmcScanService>('smcScan')
       const resp = smc.scan(asset, tf)
@@ -533,7 +581,7 @@ export class MetaStrategyService {
   }
 
   private evaluateConditions(spec: MetaStrategySpec, asset: string, tf: Timeframe): MetaEvalResult {
-    const reads = spec.conditions.map((c) => this.readSource(c.source, asset, tf, c.smcKind))
+    const reads = spec.conditions.map((c) => this.readSource(c.source, asset, tf, c.smcKind, c.expiryMin))
     return evaluateMetaStrategy(spec, reads)
   }
 

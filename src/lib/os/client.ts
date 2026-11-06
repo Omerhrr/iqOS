@@ -288,6 +288,7 @@ export type MetaConditionSource =
   | 'oracle'
   | 'hmaRocBullBear'
   | 'momentumScore'
+  | 'nextExpiry'
   | 'accute'
   | 'renko'
   | 'pointFigure'
@@ -312,6 +313,7 @@ export const META_CONDITION_SOURCE_LABELS: Record<MetaConditionSource, string> =
   oracle: 'Next-Candle Oracle',
   hmaRocBullBear: 'HMA/ROC/Bull-Bear',
   momentumScore: 'Market Momentum Score',
+  nextExpiry: 'Next-Expiry Oracle (1/2/3/5/15m)',
   accute: 'Accute',
   renko: 'Renko',
   pointFigure: 'Point & Figure',
@@ -368,6 +370,10 @@ export interface MetaCondition {
   /** only meaningful when source === 'smcNow' - one of ALL_SMC_KINDS, or
    * undefined for the aggregate "now" read. */
   smcKind?: string
+  /** only meaningful when source === 'nextExpiry' - which expiry ladder
+   * rung (1/2/3/5/15 minutes) to read, or undefined for the oracle's own
+   * best pick (already gated by its pWin/confidence honesty floors). */
+  expiryMin?: number
 }
 
 export interface MetaStrategySpec {

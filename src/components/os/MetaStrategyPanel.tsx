@@ -53,6 +53,7 @@ const ALL_SOURCES: MetaConditionSource[] = [
   'oracle',
   'hmaRocBullBear',
   'momentumScore',
+  'nextExpiry',
   'accute',
   'renko',
   'pointFigure',
@@ -81,7 +82,10 @@ const SCRIPT_PLACEHOLDER = `# Meta Strategy Lab script - combine any panel read 
 # pointFigure, rangeBars, candle, bar, heikinAshi, line, area, baseline,
 # volumeBars, tick, footprint, tpo, ivHv, smc, smcNow, renkoSmc
 # (confluence: any SMC concept agrees with renko), renkoSmcMajority
-# (confluence: SMC's own majority verdict must agree with renko), and
+# (confluence: SMC's own majority verdict must agree with renko),
+# nextExpiry (the Next-Expiry Oracle's best pick, honesty-floored),
+# nextExpiry:<E> for a pinned rung (nextExpiry:1 / nextExpiry:2 /
+# nextExpiry:3 / nextExpiry:5 / nextExpiry:15), and
 # smc:<KIND> for any of the 15 SMC concepts (e.g. smc:FVG, smc:BOS,
 # smc:ORDER_BLOCK...).
 # Fields: .dir (call/put/none), .conf (0-100), .active, .call, .put
@@ -95,6 +99,17 @@ confidence = avg(oracle.conf, renko.conf, pointFigure.conf, rangeBars.conf)
 
 function emptyCondition(): MetaCondition {
   return { source: 'oracle', direction: 'either', minConfidence: 50, weight: 1 }
+}
+
+/** The MSL source key a condition reads, used by the pseudo-script
+ * generator: a pinned smcKind becomes `smc:<KIND>`, a pinned expiry rung
+ * becomes `nextExpiry:<E>` - both are real script identifiers (same ':')
+ * the evaluator's reads map actually carries, so a promoted dropdown spec
+ * behaves identically after the promotion. */
+function mslRefFor(c: MetaCondition): string {
+  if (c.source === 'smcNow' && c.smcKind) return `smc:${c.smcKind}`
+  if (c.source === 'nextExpiry' && c.expiryMin) return `nextExpiry:${c.expiryMin}`
+  return c.source
 }
 
 /** "all the strats we have in meta trader signal source should also
@@ -184,7 +199,7 @@ function specSourceCode(s: MetaStrategySpec): string {
     return lines.join('\n')
   }
   const condExpr = (c: MetaCondition, i: number) => {
-    const ref = c.source === 'smcNow' && c.smcKind ? `smc:${c.smcKind}` : c.source
+    const ref = mslRefFor(c)
     const dirPart = c.direction === 'either' ? `${ref}.active` : `${ref}.dir == ${c.direction}`
     const op = c.op ?? '>='
     const confPart = c.minConfidence ? ` and ${ref}.conf ${op} ${c.minConfidence}` : ''
@@ -193,15 +208,15 @@ function specSourceCode(s: MetaStrategySpec): string {
   s.conditions.forEach((c, i) => lines.push(condExpr(c, i)))
   const names = s.conditions.map((_, i) => `cond${i}`)
   if (s.mode === 'all') {
-    lines.push(`call when ${names.join(' and ')} and ${s.conditions.map((c) => `${c.source}.dir == call`).join(' and ')}`)
-    lines.push(`put when ${names.join(' and ')} and ${s.conditions.map((c) => `${c.source}.dir == put`).join(' and ')}`)
+    lines.push(`call when ${names.join(' and ')} and ${s.conditions.map((c) => `${mslRefFor(c)}.dir == call`).join(' and ')}`)
+    lines.push(`put when ${names.join(' and ')} and ${s.conditions.map((c) => `${mslRefFor(c)}.dir == put`).join(' and ')}`)
   } else if (s.mode === 'any') {
     lines.push(`# fires on majority-side agreement among: ${names.join(', ')}`)
-    lines.push(`call when (${names.join(' or ')}) and count(${s.conditions.map((c) => `${c.source}.dir == call`).join(', ')}) > count(${s.conditions.map((c) => `${c.source}.dir == put`).join(', ')})`)
-    lines.push(`put when (${names.join(' or ')}) and count(${s.conditions.map((c) => `${c.source}.dir == put`).join(', ')}) > count(${s.conditions.map((c) => `${c.source}.dir == call`).join(', ')})`)
+    lines.push(`call when (${names.join(' or ')}) and count(${s.conditions.map((c) => `${mslRefFor(c)}.dir == call`).join(', ')}) > count(${s.conditions.map((c) => `${mslRefFor(c)}.dir == put`).join(', ')})`)
+    lines.push(`put when (${names.join(' or ')}) and count(${s.conditions.map((c) => `${mslRefFor(c)}.dir == put`).join(', ')}) > count(${s.conditions.map((c) => `${mslRefFor(c)}.dir == call`).join(', ')})`)
   } else {
     lines.push(`# weighted score, threshold ${s.threshold ?? 60}% - each condition votes weight(${s.conditions.map((c) => c.weight ?? 1).join(',')}) * its own confidence`)
-    lines.push(`confidence = avg(${s.conditions.map((c) => `${c.source}.conf`).join(', ')})`)
+    lines.push(`confidence = avg(${s.conditions.map((c) => `${mslRefFor(c)}.conf`).join(', ')})`)
   }
   return lines.join('\n')
 }
@@ -247,6 +262,21 @@ function ConditionRow({
           {ALL_SMC_KINDS.map((k) => (
             <option key={k} value={k}>
               {k}
+            </option>
+          ))}
+        </select>
+      )}
+      {cond.source === 'nextExpiry' && (
+        <select
+          value={cond.expiryMin ? String(cond.expiryMin) : ''}
+          onChange={(e) => onChange({ ...cond, expiryMin: e.target.value ? Number(e.target.value) || undefined : undefined })}
+          className="rounded border border-[#1c2739] bg-[#0b111c] px-1 py-0.5 font-mono text-[9px] text-[#dbe4f0]"
+          title="which expiry rung to read - blank = the oracle's own best pick (already gated by its pWin/confidence honesty floors); a pinned rung still warming up reads as none"
+        >
+          <option value="">best pick (oracle's own)</option>
+          {[1, 2, 3, 5, 15].map((m) => (
+            <option key={m} value={String(m)}>
+              {m}m rung
             </option>
           ))}
         </select>
