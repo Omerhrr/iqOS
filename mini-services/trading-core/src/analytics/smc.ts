@@ -654,10 +654,28 @@ export function scanSmc(candles: Candle[]): SmcScanResult | null {
       note: `tight base before a ${z.direction} expansion move - broader cousin of the order block`,
     })
   }
+  // detectSR returns the top touch-clusters across the WHOLE scanned window -
+  // the nearest support below price AND the nearest resistance above it are
+  // both legitimately in that top-8 list at once, which is why this was
+  // firing both directions "now" simultaneously: every one of those 8 got
+  // stamped barsAgo:0/active:true regardless of whether price was anywhere
+  // near it. A level only counts as a live "now" touch if price is actually
+  // AT it right now (within half an ATR); a level price is nowhere near is
+  // still a real, useful support/resistance line for the panel to show, but
+  // it is not something happening on THIS candle, so it gets barsAgo:1 and
+  // active:false instead - it simply won't show up in a barsAgo===0 "now"
+  // read (smcNowRead's per-kind SUPPORT_RESISTANCE query included), fixing
+  // the always-both-directions-at-once symptom without hiding the levels
+  // from the plain SMC panel (which lists every kind regardless of barsAgo).
+  const srProximity = atrArr[n - 1] > 0 ? atrArr[n - 1] * 0.5 : price * 0.001
   for (const lvl of sr.slice(0, 8)) {
+    const atLevelNow = Math.abs(price - lvl.price) <= srProximity
     signals.push({
-      kind: 'SUPPORT_RESISTANCE', direction: lvl.direction, level: lvl.price, index: n - 1, barsAgo: 0, active: true, touches: lvl.touches,
-      note: `${lvl.direction === 'bullish' ? 'support' : 'resistance'} - ${lvl.touches} swing touches clustered here`,
+      kind: 'SUPPORT_RESISTANCE', direction: lvl.direction, level: lvl.price, index: n - 1,
+      barsAgo: atLevelNow ? 0 : 1, active: atLevelNow, touches: lvl.touches,
+      note: atLevelNow
+        ? `${lvl.direction === 'bullish' ? 'support' : 'resistance'} - price is AT this level right now (${lvl.touches} swing touches clustered here)`
+        : `${lvl.direction === 'bullish' ? 'support' : 'resistance'} - ${lvl.touches} swing touches clustered here, price not there yet`,
     })
   }
   if (breakout) {
