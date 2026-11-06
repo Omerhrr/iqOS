@@ -4237,16 +4237,31 @@ async function errorFrom(res: Response, label: string): Promise<Error> {
 // timer (default every 10min) rather than every candle close. Starts in
 // SHADOW mode (live:false) by direct instruction - logs every decision
 // including skips, places nothing real until explicitly flipped live.
+export type AiTraderScanMode = 'single' | 'selected' | 'global'
+
 export interface AiTraderConfig {
   enabled: boolean
   live: boolean
+  /** 'single' - only ever scans `asset`. 'selected' - scans
+   *  `selectedAssets`. 'global' - scans whatever the Screener currently
+   *  ranks as the best opportunities across the whole instrument universe. */
+  scanMode: AiTraderScanMode
   asset: string
+  selectedAssets: string[]
   tf: Timeframe
   intervalMin: number
   stake: number
   kind: TradeKind
   minConfidence: number
   expiryChoices: number[]
+  /** Max OPEN positions this trader may hold at once - enforced in LIVE
+   *  mode only. At the cap, a cycle skips entirely (no analysis, no LLM
+   *  call) rather than deciding something it has no room to act on. */
+  maxConcurrent: number
+  /** Hard ceiling on how many assets get analyzed in ONE cycle under
+   *  'selected'/'global' (and the live concurrency budget is clamped to
+   *  this too). Always 1 for 'single'. */
+  maxScanPerCycle: number
   provider?: string
   /** Base URL of THIS Next.js app, as trading-core (a separate process)
    * reaches it - the AI Trader's decision calls go through this app's

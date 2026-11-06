@@ -11,7 +11,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
-import type { AiTraderConfig, AiTraderDecision, AiTraderStatus, AssetRow, Timeframe } from '@/lib/os/client'
+import type { AiTraderConfig, AiTraderDecision, AiTraderScanMode, AiTraderStatus, AssetRow, Timeframe } from '@/lib/os/client'
 import { fmtTime, osGet, osPost } from '@/lib/os/client'
 import AssetPicker from './AssetPicker'
 
@@ -120,7 +120,7 @@ export default function AiTraderPanel({ assets, onError }: Props) {
   const runNow = async () => {
     setRunning(true)
     try {
-      const res = await osPost<{ ok: boolean; decision?: AiTraderDecision; error?: string }>('/ai_trader_run_now')
+      const res = await osPost<{ ok: boolean; decisions?: AiTraderDecision[]; error?: string }>('/ai_trader_run_now')
       if (!res.ok) onError(res.error ?? 'cycle failed')
       void load()
     } catch (err) {
@@ -139,20 +139,90 @@ export default function AiTraderPanel({ assets, onError }: Props) {
       <div className="flex flex-wrap items-center gap-3 rounded border border-violet-500/30 bg-[#0b0817] p-2">
         <span className="font-bold uppercase tracking-wider text-violet-300">✦ AI Trader</span>
         <span className="text-[#aab6cc]">
-          scans {draft.asset} {draft.tf} every {draft.intervalMin}min - plays the human at the desk: reads the raw price action itself, weighs the other panels as a second opinion (not a vote), decides direction + expiry together, and sides with its own read when they disagree. Most cycles should SKIP.
+          scans {draft.scanMode === 'single' ? draft.asset : draft.scanMode === 'selected' ? `${draft.selectedAssets.length || 0} selected pair(s)` : 'the Screener\'s top-ranked pairs'} on {draft.tf} every {draft.intervalMin}min (max {draft.maxScanPerCycle}/cycle) - plays the human at the desk: reads the raw price action itself, weighs the other panels as a second opinion (not a vote), decides direction + expiry together, and sides with its own read when they disagree. Most cycles should SKIP. Max {draft.maxConcurrent} concurrent position(s) while LIVE.
         </span>
       </div>
 
-      <div className="grid grid-cols-2 gap-2 rounded border border-[#1c2739] bg-[#0b0f17] p-2 sm:grid-cols-4">
-        <label className="flex flex-col gap-1">
-          <span className="text-[#7c8aa5]">asset</span>
+      <div className="flex flex-wrap items-center gap-2 rounded border border-[#1c2739] bg-[#0b0f17] p-2">
+        <span className="text-[#7c8aa5]">scan mode</span>
+        {(
+          [
+            ['single', 'single pair'],
+            ['selected', 'selected pairs'],
+            ['global', 'global (screener-ranked)'],
+          ] as [AiTraderScanMode, string][]
+        ).map(([mode, label]) => (
+          <button
+            key={mode}
+            type="button"
+            onClick={() => setDraft({ ...draft, scanMode: mode })}
+            className={`rounded px-2 py-1 text-[9px] uppercase tracking-wide ${
+              draft.scanMode === mode ? 'bg-violet-600 text-white' : 'border border-[#1c2739] text-[#7c8aa5] hover:text-[#dbe4f0]'
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+        {draft.scanMode !== 'single' && (
+          <label className="ml-auto flex items-center gap-1.5">
+            <span className="text-[#7c8aa5]">max pairs/cycle</span>
+            <Input
+              type="number"
+              min={1}
+              max={20}
+              value={draft.maxScanPerCycle}
+              onChange={(e) => setDraft({ ...draft, maxScanPerCycle: Math.max(1, Math.min(20, Number(e.target.value) || 5)) })}
+              className="h-6 w-14 bg-[#070c15] text-[9.5px] text-[#dbe4f0]"
+            />
+          </label>
+        )}
+      </div>
+
+      {draft.scanMode === 'selected' && (
+        <div className="flex flex-wrap items-center gap-1.5 rounded border border-[#1c2739] bg-[#0b0f17] p-2">
+          <span className="text-[#7c8aa5]">pairs:</span>
+          {draft.selectedAssets.length === 0 && <span className="text-[#4b5a72]">none picked yet - add at least one below</span>}
+          {draft.selectedAssets.map((t) => (
+            <span key={t} className="flex items-center gap-1 rounded bg-[#101828] px-1.5 py-0.5 text-[#dbe4f0]">
+              {t}
+              <button
+                type="button"
+                onClick={() => setDraft({ ...draft, selectedAssets: draft.selectedAssets.filter((x) => x !== t) })}
+                className="text-[#7c8aa5] hover:text-rose-300"
+              >
+                ×
+              </button>
+            </span>
+          ))}
           <AssetPicker
             tickers={assets.length ? assets.map((a) => a.ticker) : [draft.asset]}
-            value={draft.asset}
-            onChange={(t) => setDraft({ ...draft, asset: t })}
-            className="w-full"
+            value="+ add pair"
+            onChange={(t) => {
+              if (!draft.selectedAssets.includes(t)) setDraft({ ...draft, selectedAssets: [...draft.selectedAssets, t] })
+            }}
+            className="w-32"
           />
-        </label>
+        </div>
+      )}
+
+      {draft.scanMode === 'global' && (
+        <div className="rounded border border-[#1c2739] bg-[#0b0f17] p-2 text-[#7c8aa5]">
+          scans whatever the Screener currently ranks as the best opportunities across the whole instrument universe for this timeframe (falls back to the raw asset list if the screener hasn&apos;t swept yet) - no pair list to maintain.
+        </div>
+      )}
+
+      <div className="grid grid-cols-2 gap-2 rounded border border-[#1c2739] bg-[#0b0f17] p-2 sm:grid-cols-4">
+        {draft.scanMode === 'single' && (
+          <label className="flex flex-col gap-1">
+            <span className="text-[#7c8aa5]">asset</span>
+            <AssetPicker
+              tickers={assets.length ? assets.map((a) => a.ticker) : [draft.asset]}
+              value={draft.asset}
+              onChange={(t) => setDraft({ ...draft, asset: t })}
+              className="w-full"
+            />
+          </label>
+        )}
         <label className="flex flex-col gap-1">
           <span className="text-[#7c8aa5]">tf</span>
           <select
@@ -230,6 +300,16 @@ export default function AiTraderPanel({ assets, onError }: Props) {
           <label className="flex items-center gap-1.5" title="shadow mode logs every decision but places no real order - flip this only once you trust its reasoning">
             <Switch checked={draft.live} onCheckedChange={(v) => setDraft({ ...draft, live: v })} />
             <span className={draft.live ? 'font-bold text-rose-300' : 'text-emerald-300'}>{draft.live ? 'LIVE (real orders)' : 'shadow (logging only)'}</span>
+          </label>
+          <label className="flex items-center gap-1.5" title="max OPEN positions this trader may hold at once - LIVE only. At the cap, a cycle skips entirely (no analysis, no LLM call) instead of deciding something it has no room to act on.">
+            <span className="text-[#7c8aa5]">max concurrent</span>
+            <Input
+              type="number"
+              min={1}
+              value={draft.maxConcurrent}
+              onChange={(e) => setDraft({ ...draft, maxConcurrent: Math.max(1, Math.round(Number(e.target.value) || 1)) })}
+              className="h-6 w-14 bg-[#070c15] text-[9.5px] text-[#dbe4f0]"
+            />
           </label>
         </div>
         <div className="col-span-2 flex items-center justify-end gap-2 sm:col-span-4">

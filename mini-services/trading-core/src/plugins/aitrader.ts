@@ -52,16 +52,30 @@ import { Store } from '../store'
 import type { MarketDataService } from './market-data'
 import type { ExecutionService } from './execution'
 import type { MetaStrategyService } from './metastrategy'
+import type { ScreenerService } from './screener'
 import { chatComplete, providerStatus, type ChatMessage } from '../lib/llm'
 import { tfSeconds } from '../analytics/synthfeed'
 import { atr, closes, ema, highs, lows, rsi } from '../analytics/indicators'
+
+export type AiTraderScanMode = 'single' | 'selected' | 'global'
 
 export interface AiTraderConfig {
   enabled: boolean
   /** false (default) = shadow: decide + log every cycle, place nothing.
    *  true = act on non-skip decisions through the real risk-gated order path. */
   live: boolean
+  /** 'single' (default, unchanged behavior) - only ever scans `asset`.
+   *  'selected' - scans `selectedAssets`, operator-curated.
+   *  'global' - scans whatever the Screener currently ranks as the best
+   *  opportunities across the WHOLE instrument universe (cheap pre-filter
+   *  that's already running every cycle anyway), falling back to the raw
+   *  asset universe if the screener has no rows yet. */
+  scanMode: AiTraderScanMode
+  /** Used when scanMode === 'single' (and as the fallback if 'selected'
+   *  ends up with an empty list). */
   asset: string
+  /** Used when scanMode === 'selected'. */
+  selectedAssets: string[]
   tf: Timeframe
   /** Minutes between opportunity scans - NOT a guaranteed trade cadence
    *  ("6 trades an hour" is the user's own ceiling if it sees an
@@ -76,6 +90,20 @@ export interface AiTraderConfig {
   /** Expiry choices (minutes) the prompt offers the model - it picks ONE
    *  per decision, it does not invent others. */
   expiryChoices: number[]
+  /** Max OPEN positions this trader is allowed to hold AT ONCE - only
+   *  enforced in LIVE mode (shadow never opens a real position, so there is
+   *  nothing "concurrent" to cap). When live and already at this cap, a
+   *  cycle skips ENTIRELY - no snapshot, no candles, no LLM call - rather
+   *  than running a full analysis that could not be acted on anyway. Per
+   *  direct instruction: "should it run a cycle when one trade is not
+   *  completed yet" - no, not when there's no room left to act on it. */
+  maxConcurrent: number
+  /** Hard ceiling on how many assets get a full LLM analysis in ONE cycle
+   *  under 'selected'/'global' scan modes (and the live-mode concurrency
+   *  budget is clamped to this too) - without this, selecting 50 pairs or
+   *  scanning "global" would mean 50 LLM calls every single interval tick.
+   *  Does not apply to 'single' mode (always exactly 1). */
+  maxScanPerCycle: number
   /** LLM provider override - only used on the local-fallback path (see
    *  callLlm() below); the primary path calls through to the Next.js app,
    *  which picks its own provider exactly like the Copilot does. */
@@ -111,13 +139,17 @@ export interface AiTraderDecision {
 const DEFAULT_CONFIG: AiTraderConfig = {
   enabled: false,
   live: false,
+  scanMode: 'single',
   asset: 'EURUSD',
+  selectedAssets: [],
   tf: '1m',
   intervalMin: 10,
   stake: 1,
   kind: 'binary',
   minConfidence: 65,
   expiryChoices: [3, 5],
+  maxConcurrent: 1,
+  maxScanPerCycle: 5,
   // NOT a literal default on purpose - see resolveAppUrl() below. Baking
   // 'http://127.0.0.1:3000' in here would get written into every saved
   // config (the panel always sends the whole draft on save), permanently
@@ -272,6 +304,7 @@ export class AiTraderService {
   private market!: MarketDataService
   private exec!: ExecutionService
   private meta: MetaStrategyService | null = null
+  private screener: ScreenerService | null = null
   private config: AiTraderConfig = { ...DEFAULT_CONFIG }
   private timer: ReturnType<typeof setInterval> | null = null
   private running = false // reentrancy guard - a slow LLM call must never overlap its own next tick
@@ -287,6 +320,47 @@ export class AiTraderService {
       this.meta = null
     }
     return this.meta
+  }
+
+  private screenerService(): ScreenerService | null {
+    if (this.screener) return this.screener
+    try {
+      this.screener = this.ctx.use<ScreenerService>('screener')
+    } catch {
+      this.screener = null
+    }
+    return this.screener
+  }
+
+  /** Which assets THIS cycle should scan, before any concurrency budget is
+   * applied - purely scanMode's own sourcing logic. */
+  private buildCandidateList(): string[] {
+    const { scanMode, asset, selectedAssets, tf, maxScanPerCycle } = this.config
+    if (scanMode === 'selected') {
+      const list = (selectedAssets ?? []).filter(Boolean)
+      // an empty selection scans nothing useful - fall back to the single
+      // configured asset rather than silently doing no work every cycle.
+      return list.length ? list : [asset]
+    }
+    if (scanMode === 'global') {
+      try {
+        const scr = this.screenerService()
+        if (scr) {
+          const { rows } = scr.top({ tf, limit: maxScanPerCycle })
+          if (rows.length) return rows.map((r) => r.asset)
+        }
+      } catch {
+        // fall through to the raw-universe fallback below
+      }
+      // screener has no rows yet (just booted, or disabled) - fall back to
+      // the raw asset universe rather than scanning nothing.
+      try {
+        return this.market.listAssets().slice(0, maxScanPerCycle).map((a) => a.ticker)
+      } catch {
+        return [asset]
+      }
+    }
+    return [asset] // 'single' - unchanged original behavior
   }
 
   async start(ctx: KernelContext): Promise<void> {
@@ -341,9 +415,17 @@ export class AiTraderService {
 
   configure(patch: Partial<AiTraderConfig>): AiTraderConfig {
     this.config = { ...this.config, ...patch }
+    // Light sanitization on the new scan/concurrency fields - a bad value
+    // here (an empty string scanMode from a stale UI build, a 0 or
+    // negative count) should fall back to something safe, not silently
+    // break scheduleTimer/buildCandidateList/the concurrency math below.
+    if (!['single', 'selected', 'global'].includes(this.config.scanMode)) this.config.scanMode = 'single'
+    if (!Array.isArray(this.config.selectedAssets)) this.config.selectedAssets = []
+    this.config.maxConcurrent = Math.max(1, Math.round(Number(this.config.maxConcurrent) || 1))
+    this.config.maxScanPerCycle = Math.min(20, Math.max(1, Math.round(Number(this.config.maxScanPerCycle) || 5)))
     this.store.saveAiTraderConfig(this.config)
     this.scheduleTimer()
-    this.emit('info', `AI Trader config updated - ${this.config.enabled ? 'enabled' : 'disabled'} · ${this.config.live ? 'LIVE' : 'shadow'} · ${this.config.asset} ${this.config.tf} · every ${this.config.intervalMin}min`)
+    this.emit('info', `AI Trader config updated - ${this.config.enabled ? 'enabled' : 'disabled'} · ${this.config.live ? 'LIVE' : 'shadow'} · ${this.config.scanMode} · ${this.config.asset} ${this.config.tf} · every ${this.config.intervalMin}min · max ${this.config.maxConcurrent} concurrent`)
     return this.config
   }
 
@@ -360,11 +442,13 @@ export class AiTraderService {
 
   /** Manual trigger - the UI's "run a cycle now" button, and how this gets
    * tested without waiting out a real interval. Runs the exact same path
-   * runCycle's timer calls, just on demand. */
-  async runNow(): Promise<{ ok: boolean; decision?: AiTraderDecision; error?: string }> {
+   * runCycle's timer calls, just on demand - including scanMode's candidate
+   * selection and the live-mode concurrency budget, so a manual trigger can
+   * come back with MULTIPLE decisions (one per asset actually scanned). */
+  async runNow(): Promise<{ ok: boolean; decisions?: AiTraderDecision[]; error?: string }> {
     try {
-      const d = await this.runCycle()
-      return d ? { ok: true, decision: d } : { ok: false, error: this.lastError ?? 'cycle did not produce a decision' }
+      const ds = await this.runCycle()
+      return ds && ds.length ? { ok: true, decisions: ds } : { ok: false, error: this.lastError ?? 'cycle did not produce a decision' }
     } catch (err) {
       return { ok: false, error: String(err instanceof Error ? err.message : err) }
     }
@@ -445,13 +529,69 @@ export class AiTraderService {
     return { lines, wins, losses, pending }
   }
 
-  private async runCycle(): Promise<AiTraderDecision | null> {
+  /** The orchestrator the timer (and runNow()) actually calls - picks WHICH
+   * asset(s) to scan this cycle (scanMode), applies the live-mode
+   * concurrency budget, then runs the full per-asset analysis pipeline
+   * (runCycleForAsset) on each candidate it can actually afford to act on. */
+  private async runCycle(): Promise<AiTraderDecision[] | null> {
     if (this.running) return null // reentrancy guard - see field comment
     this.running = true
     const ts = Math.floor(Date.now() / 1000)
     this.lastRunTs = ts
     this.cycles += 1
-    const { asset, tf } = this.config
+    try {
+      const candidates = this.buildCandidateList()
+      if (!candidates.length) {
+        this.lastError = 'no candidate assets to scan this cycle'
+        return null
+      }
+
+      // Concurrency budget - LIVE mode only (see maxConcurrent's field
+      // comment: shadow never opens a real position, so nothing is
+      // "concurrent" to cap). At/over the cap, skip the WHOLE cycle before
+      // any snapshot/candle/LLM work happens - answering "should it run a
+      // cycle when one trade is not completed yet" with: no, not when
+      // there's no room left to act on whatever it would decide.
+      let budget = Math.min(candidates.length, this.config.maxScanPerCycle)
+      if (this.config.live) {
+        const openCount = this.store.listPositions('open').filter((p) => p.strategy === 'ai-trader').length
+        const slots = Math.max(0, this.config.maxConcurrent - openCount)
+        if (slots <= 0) {
+          this.store.recordAiTraderDecision({
+            asset: candidates[0], tf: this.config.tf, direction: 'skip', confidence: 0,
+            reasoning: `at max concurrent AI Trader position(s) (${openCount}/${this.config.maxConcurrent} open) - cycle skipped before any analysis, no LLM call made`,
+            snapshot: [], live: this.config.live, acted: false, ts,
+          })
+          this.emit('info', `[AI Trader] skipping cycle - already at max concurrent positions (${openCount}/${this.config.maxConcurrent})`)
+          return null
+        }
+        budget = Math.min(budget, slots)
+      }
+
+      const decisions: AiTraderDecision[] = []
+      for (const candidate of candidates.slice(0, budget)) {
+        const d = await this.runCycleForAsset(candidate, this.config.tf, ts)
+        if (d) decisions.push(d)
+        // A trade opened by one candidate consumes a concurrency slot the
+        // NEXT candidate in this same loop might have been counting on -
+        // re-check before continuing rather than trusting the budget
+        // computed before any of them ran.
+        if (this.config.live && d?.acted) {
+          const openNow = this.store.listPositions('open').filter((p) => p.strategy === 'ai-trader').length
+          if (openNow >= this.config.maxConcurrent) break
+        }
+      }
+      return decisions.length ? decisions : null
+    } finally {
+      this.running = false
+    }
+  }
+
+  /** Full own-analysis -> desk-cross-check -> learn-from-track-record ->
+   * decide pipeline for ONE asset - unchanged from the original single-
+   * asset runCycle, just parameterized so the orchestrator above can call
+   * it once per scanned candidate instead of always on `this.config.asset`. */
+  private async runCycleForAsset(asset: string, tf: Timeframe, ts: number): Promise<AiTraderDecision | null> {
     try {
       const meta = this.metaStrategyService()
       const snapshot = meta ? meta.snapshotSources(asset, tf) : []
@@ -657,8 +797,13 @@ export class AiTraderService {
 
       const rows = this.store.listAiTraderDecisions(1)
       return (rows[0] as AiTraderDecision) ?? null
-    } finally {
-      this.running = false
+    } catch (err) {
+      // Never let one bad candidate (in a multi-asset scan) throw the whole
+      // cycle - log it and let the orchestrator move on to the next one.
+      const msg = String(err instanceof Error ? err.message : err)
+      this.lastError = msg
+      this.emit('warn', `AI Trader cycle failed on ${asset} ${tf}: ${msg}`)
+      return null
     }
   }
 
