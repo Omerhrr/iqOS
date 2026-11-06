@@ -173,6 +173,19 @@ function builtinSourceExplainer(source: MetaTraderSource): string {
       'confidence = avg(renko.conf, smc-agreement-ratio)',
     ].join('\n')
   }
+  if (source === 'next-expiry') {
+    return [
+      '# built-in Meta Trader source: next-expiry',
+      "# Reads the Next-Expiry Oracle's fused BEST PICK across the 1/2/3/5/15m",
+      '# ladder directly (same read the nextExpiry condition source uses; the',
+      '# oracle is minute-native so the panel tf is ignored). Its pWin>=56%',
+      '# and conf>=25 honesty floors are already applied by the engine - a',
+      '# null best ("wait") yields no candidate. FRESH-EDGE GATED like oracle:',
+      '# the pick is window-anchored, so arming never trades a stale middle.',
+      'call when nextExpiry.dir == call and nextExpiry.conf >= minConfidence',
+      'put when nextExpiry.dir == put and nextExpiry.conf >= minConfidence',
+    ].join('\n')
+  }
   // the 15 individual smc-<kind> sources - same shape, just pinned to one concept
   const kind = source.replace(/^smc-/, '').toUpperCase().replace(/-/g, '_')
   return [

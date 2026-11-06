@@ -4210,6 +4210,7 @@ export interface AutoTraderConfig {
 export type MetaTraderSource =
   | 'meta-strategy'
   | 'oracle'
+  | 'next-expiry'
   | 'accute'
   | 'smc'
   | 'smc-fvg'
@@ -4237,6 +4238,7 @@ export type MetaTraderSource =
 export const ALL_META_TRADER_SOURCES: readonly MetaTraderSource[] = [
   'meta-strategy',
   'oracle',
+  'next-expiry',
   'accute',
   'smc',
   'smc-fvg',
@@ -4261,6 +4263,7 @@ export const ALL_META_TRADER_SOURCES: readonly MetaTraderSource[] = [
 export const META_TRADER_SOURCE_LABELS: Record<MetaTraderSource, string> = {
   'meta-strategy': 'Meta-Strategy',
   oracle: 'Oracle',
+  'next-expiry': 'Next-Expiry Oracle (best pick)',
   accute: 'Accute',
   smc: 'SMC (now)',
   'smc-fvg': 'SMC: FVG',

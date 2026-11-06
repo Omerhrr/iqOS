@@ -32,6 +32,12 @@
 //                       auto-trader's own 'meta-strategy' source uses.
 //   - 'oracle'        - the Next-Candle Oracle's fused read (plugins/
 //                       nextcandle.ts predict()) - already honesty-tracked.
+//   - 'next-expiry'   - the Next-Expiry Oracle's fused best pick across the
+//                       1/2/3/5/15-minute ladder (plugins/nextexpiry.ts
+//                       predict()) - minute-native (the configured tf is
+//                       deliberately ignored, the ladder has no tf axis),
+//                       already honesty-tracked per (asset, expiry) window
+//                       with its own calibration + driver-weight loop.
 //   - 'accute'        - the Accute fused read (plugins/accute.ts signal())
 //                       - already a weighted multi-driver fusion.
 //   - 'smc'           - the SMC scanner's AGGREGATE "now" read: every
@@ -59,6 +65,7 @@ import type { AssetCategory, Timeframe, TradeKind } from '../types'
 import { ALL_TIMEFRAMES, TIMEFRAME_SECONDS } from '../types'
 import type { MarketDataService } from './market-data'
 import type { NextCandleService } from './nextcandle'
+import type { NextExpiryService } from './nextexpiry'
 import type { AccuteService } from './accute'
 import type { MetaStrategyService } from './metastrategy'
 import type { SmcScanService } from './smcscan'
@@ -112,12 +119,15 @@ const MIN_CANDLES_FOR_RENKO = 50
  * never trade an already-true read), a qualifier the memory has never seen
  * is a fresh edge (trades), a key stamped on execution stays held until
  * its read observably lapses (evaluated-but-no-longer-qualifying) or flips
- * (opposite key = unseen = fresh). The SMC sources are deliberately NOT in
+ * (opposite key = unseen = fresh). 'next-expiry' is in this set too: its
+ * best pick is window-anchored (re-issued per 1m bar, so it can hold for
+ * many consecutive 10s ticks inside one window exactly like the candle
+ * oracle's read can). The SMC sources are deliberately NOT in
  * this set: barsAgo===0 is inherently "just fired on THIS candle" (per
  * direct instruction "taking the now" means only this instant counts), so
  * each new candle's firing is by construction a fresh event, not a held
  * level - gating those would change their designed behavior. */
-const EDGE_GATED_SOURCES: ReadonlySet<string> = new Set(['meta-strategy', 'oracle', 'accute', 'renko-smc', 'renko-smc-majority'])
+const EDGE_GATED_SOURCES: ReadonlySet<string> = new Set(['meta-strategy', 'oracle', 'next-expiry', 'accute', 'renko-smc', 'renko-smc-majority'])
 
 /** AUDIT FIX - same bug os-mode.ts's own BROKER_UNAVAILABLE_RE/
  * assetRejectedUntil was built to fix for the auto-trader, ported here
@@ -165,6 +175,7 @@ const SOURCE_SMC_KIND: Record<string, SmcKind> = Object.fromEntries(
 export type MetaTraderSource =
   | 'meta-strategy'
   | 'oracle'
+  | 'next-expiry'
   | 'accute'
   | 'smc'
   | 'smc-fvg'
@@ -188,6 +199,7 @@ export type MetaTraderSource =
 export const META_TRADER_SOURCES: readonly MetaTraderSource[] = [
   'meta-strategy',
   'oracle',
+  'next-expiry',
   'accute',
   'smc',
   ...(Object.values(SMC_KIND_SOURCE) as MetaTraderSource[]),
@@ -337,7 +349,7 @@ export class MetaTraderService {
     this.timer = setInterval(() => {
       void this.tick().catch((err) => ctx.log('meta-trader', `tick() rejected, skipping this cycle: ${(err as Error).message}`))
     }, 10_000)
-    ctx.log('meta-trader', `meta trader online (sources: meta-strategy/oracle/accute/smc + 15 individual SMC concepts + renko-smc (any-agrees) + renko-smc-majority confluence) - ${this.config.enabled ? 'armed' : 'off'} · src ${this.config.signalSource}`)
+    ctx.log('meta-trader', `meta trader online (sources: meta-strategy/oracle/next-expiry/accute/smc + 15 individual SMC concepts + renko-smc (any-agrees) + renko-smc-majority confluence) - ${this.config.enabled ? 'armed' : 'off'} · src ${this.config.signalSource}`)
   }
 
   stop(): void {
@@ -660,6 +672,7 @@ export class MetaTraderService {
     const src = this.config.signalSource
     if (src === 'meta-strategy') return this.pickMetaStrategy()
     if (src === 'oracle') return this.pickOracle()
+    if (src === 'next-expiry') return this.pickNextExpiry()
     if (src === 'accute') return this.pickAccute()
     if (src === 'smc') return this.pickSmc(undefined)
     if (src === 'renko-smc') return this.pickRenkoSmc()
@@ -778,6 +791,47 @@ export class MetaTraderService {
         if (row) out.push(row)
       } catch {
         /* thin history - try the next */
+      }
+    }
+    return this.rankRows(out)
+  }
+
+  /** The Next-Expiry Oracle's fused best pick as a signal source - the same
+   * honesty-tracked read the expiry panel and the 'nextExpiry' meta-strategy
+   * condition source render. The ENGINE's own floors (pWin >= 0.56 AND
+   * confidence >= 25) already gate `best`, so a null best is the oracle's
+   * honest "wait" and simply yields no candidate; the only gate applied
+   * here is the user's own minConfidence, exactly like every other picker.
+   * The expiry ladder is minute-native over the 1m base, so the configured
+   * tf is deliberately ignored (same as the panel and the meta condition).
+   * Each poll re-issues/refreshes the window entries on the shared pending
+   * ledger (deduped per asset+expiry+targetBarTime), so running this source
+   * also calibrates the oracle's honesty loop faster. */
+  private pickNextExpiry(): MetaTraderRow[] {
+    let oracle: NextExpiryService
+    try {
+      oracle = this.ctx.use<NextExpiryService>('nextexpiry')
+    } catch {
+      return []
+    }
+    const out: MetaTraderRow[] = []
+    for (const asset of this.candidatePool()) {
+      try {
+        const pred = oracle.predict(asset)
+        if (!pred || !pred.best) continue
+        const { direction, confidence, expiry, pWin } = pred.best
+        if (this.config.direction !== 'both' && direction !== this.config.direction) continue
+        if (!finGte(confidence, this.config.minConfidence)) continue
+        const row = this.rowFrom(
+          asset,
+          direction,
+          confidence,
+          pred.price,
+          `expiry oracle: ${expiry}m pick · pWin ${(pWin * 100).toFixed(0)}% · regime ${pred.regime} · ${pred.session}`,
+        )
+        if (row) out.push(row)
+      } catch {
+        /* thin 1m history - try the next */
       }
     }
     return this.rankRows(out)

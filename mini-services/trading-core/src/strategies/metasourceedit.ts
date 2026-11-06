@@ -38,6 +38,7 @@ const BACKUP_DIR = join(import.meta.dir, '..', '..', 'data', 'strategy_backups')
 const METHOD_FOR_ID: Record<string, string> = {
   'meta-strategy': 'pickMetaStrategy',
   oracle: 'pickOracle',
+  'next-expiry': 'pickNextExpiry',
   accute: 'pickAccute',
   smc: 'pickSmc',
   'renko-smc': 'pickRenkoSmc',

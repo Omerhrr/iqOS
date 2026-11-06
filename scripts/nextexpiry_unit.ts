@@ -20,6 +20,7 @@ import type { KernelContext } from '../mini-services/trading-core/src/kernel'
 import { EXPIRIES_MIN, EXPIRY_ORACLE_MIN_CANDLES, predictNextExpiry } from '../mini-services/trading-core/src/analytics/nextexpiry'
 import { NextExpiryService } from '../mini-services/trading-core/src/plugins/nextexpiry'
 import { MetaStrategyService } from '../mini-services/trading-core/src/plugins/metastrategy'
+import { MetaTraderService, META_TRADER_SOURCES } from '../mini-services/trading-core/src/plugins/metatrader'
 import type { Candle } from '../mini-services/trading-core/src/types'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -367,6 +368,99 @@ const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFi
   ok(evThin.result.conditions.every((c) => c.read.direction === 'none' && c.read.confidence === 0), 'thin pair -> both nextExpiry conditions read none/0 (fail-closed, no throw)')
 
   expSvc.stop()
+}
+
+// ---------- 8. Meta Trader built-in source 'next-expiry' ----------
+// The expiry oracle as one of Meta Trader's own signal sources: picker rows
+// mirror the engine's honesty-floored best pick (no second gate except the
+// user's own minConfidence), config accepts/validates the new source id,
+// and the source is fresh-edge gated like 'oracle' (window-anchored read).
+{
+  // isolate persistence (fresh temp dir #4) - MetaTraderService persists its
+  // config through the Store, which the fake below captures instead
+  process.chdir(mkdtempSync(join(tmpdir(), 'nextexpiry-unit-')))
+  // find a deterministic series whose fused best pick is live (non-null):
+  // the fusion is regime-sensitive, so probe seeds until one yields a best
+  let chosen: Candle[] | null = null
+  let best: { expiry: number; direction: 'call' | 'put'; pWin: number; confidence: number; edge: number } | null = null
+  for (let seed = 51; seed < 140 && !chosen; seed++) {
+    const cs = walk(EXPIRY_ORACLE_MIN_CANDLES + 300, seed, 1.2, 0.00002)
+    const p = predictNextExpiry(cs, { asset: 'EURUSD', mode: 'sim' })
+    if (p?.best) {
+      chosen = cs
+      best = p.best
+    }
+  }
+  ok(chosen !== null && best !== null, 'found a deterministic series with a live best pick for the picker test')
+  const candles = chosen ?? walk(EXPIRY_ORACLE_MIN_CANDLES + 300, 51, 1.2, 0.00002)
+  const market = {
+    mode: 'sim' as const,
+    getCandlesDeep: () => candles,
+    listAssets: () => [{ ticker: 'EURUSD', price: candles[candles.length - 1].close, open: true }],
+    getPrice: () => candles[candles.length - 1].close,
+  }
+  const savedConfigs: Array<{ signalSource?: string; enabled?: boolean }> = []
+  const store = {
+    getMetaTraderConfig: () => null,
+    saveMetaTraderConfig: (c: unknown) => savedConfigs.push(c as { signalSource?: string }),
+    listPositions: () => [],
+  }
+  const bus4 = new EventBus()
+  const expSvc2 = new NextExpiryService()
+  const mt = new MetaTraderService()
+  const ctx4 = {
+    bus: bus4,
+    services: new Map(),
+    provide: () => {},
+    use: (name: string) => {
+      if (name === 'market') return market
+      if (name === 'store') return store
+      if (name === 'nextexpiry') return expSvc2
+      throw new Error(`service ${name} not faked`)
+    },
+    log: () => {},
+  } as unknown as KernelContext
+  await expSvc2.start(ctx4)
+  await mt.start(ctx4)
+  mt.stop() // kill the 10s tick interval immediately - this test drives the internals directly
+
+  const cfg = mt.configure({ enabled: true, signalSource: 'next-expiry', minConfidence: 0 })
+  ok(cfg.signalSource === 'next-expiry', "configure() accepts signalSource 'next-expiry'", cfg.signalSource)
+  ok((META_TRADER_SOURCES as readonly string[]).includes('next-expiry'), 'META_TRADER_SOURCES exposes next-expiry to the UI dropdowns')
+  ok(savedConfigs.some((c) => c.signalSource === 'next-expiry'), 'source round-trips through the Store persist')
+
+  const rows = (mt as unknown as { pickCandidates: () => Array<{ asset: string; direction: 'call' | 'put'; confidence: number; note: string }> }).pickCandidates()
+  if (best) {
+    ok(rows.length >= 1, 'picker yields the qualifying best-pick candidate(s)', `rows=${rows.length}`)
+    if (rows.length >= 1) {
+      ok(rows[0].direction === best.direction && rows[0].confidence === best.confidence, 'row mirrors the engine best (direction + confidence, no second gate)', `${rows[0].direction}/${rows[0].confidence} vs ${best.direction}/${best.confidence}`)
+      ok(/expiry oracle: \d+m pick/.test(rows[0].note), 'row note names the expiry rung', rows[0].note)
+    }
+  }
+  // the user's own minConfidence gate applies on top (engine conf caps at 97)
+  mt.configure({ minConfidence: 100 })
+  ok((mt as unknown as { pickCandidates: () => unknown[] }).pickCandidates().length === 0, 'minConfidence 100 filters every candidate')
+  mt.configure({ minConfidence: 0 })
+
+  // fresh-edge gating membership: 'next-expiry' runs the same SweepEdgeMemory
+  // contract as 'oracle' - drive gateByFreshEdge() with synthetic rows so the
+  // cold-backfill / held / flip-fresh lifecycle is deterministic (empty
+  // sweeps never prune, so a real-fusion direction flip is not needed here)
+  const gate = (rowsIn: Array<{ asset: string; direction: 'call' | 'put' }>) =>
+    (mt as unknown as { gateByFreshEdge: (r: unknown) => typeof rowsIn }).gateByFreshEdge(
+      rowsIn.map((r) => ({ ...r, name: r.asset, category: 'forex' as const, otc: false, price: 1.2, confidence: 50, note: 'synthetic' })),
+    )
+  const callRow = { asset: 'EURUSD', direction: 'call' as const }
+  const putRow = { asset: 'EURUSD', direction: 'put' as const }
+  ok(gate([callRow]).length === 0, 'first sweep is COLD - the live pick is backfilled, not traded')
+  ok(gate([callRow]).length === 0, 'held pick skips on the next sweep (stale middle)')
+  const flipped = gate([putRow])
+  ok(flipped.length === 1 && flipped[0].direction === 'put', 'flipped pick is a fresh edge (held call lapsed, put never seen)')
+  ok(gate([putRow]).length === 1, 'an untraded fresh edge keeps offering - gate() is pure, only execution consumes the edge')
+  ;(mt as unknown as { sweepEdge: { stamp: (key: string, ts: number) => void } }).sweepEdge.stamp('EURUSD:put', 0)
+  ok(gate([putRow]).length === 0, 'after an execution stamps the edge, the pick is held')
+
+  expSvc2.stop()
 }
 
 console.log(`nextexpiry_unit: ${pass} pass, ${fail} fail`)
