@@ -121,6 +121,23 @@ export class YesterdayService {
     return p
   }
 
+  /** Synchronous cache peek - no scan triggered, no await, so a caller that
+   * must stay synchronous (the Meta-Strategy script evaluator's `reads`
+   * map - readSource()/buildScriptReads() are plain sync functions, same
+   * as every other source) can still surface today's cached echo instead
+   * of being structurally excluded from MSL. Null when nothing has warmed
+   * the cache for this exact key yet (first-ever request, or past the TTL)
+   * - the caller reads that as "not available yet", never fabricates a
+   * result; the next async scan() call (aitrader's race-with-timeout, or
+   * the panel itself) warms it for next time either way. */
+  peekCached(tf: Timeframe, windowMin: number, days = 1, profile = false): YesterdayResult | null {
+    const nDays = Math.max(1, Math.min(7, Math.round(Number.isFinite(days) ? days : 1)))
+    const plan = YesterdayService.plan(tf, windowMin, nDays)
+    const key = `${tf}:${plan.windowSec}:${nDays}:${profile ? 1 : 0}`
+    const cached = this.cache.get(key)
+    return cached && Date.now() - cached.ts < CACHE_MS ? cached.result : null
+  }
+
   /** How many bars of the window came from the kernel's own store (real
    * accumulated history - broker bars in live mode) vs deterministic
    * prehistory. Read-only, best-effort: provenance never breaks the scan. */

@@ -28,6 +28,9 @@ import type { TempoService } from './tempo'
 import type { ScreenerService } from './screener'
 import type { VolArbScanService } from './volarbscan'
 import type { CointegrationScanService } from './cointegrationscan'
+import type { ChartSignalsService } from './chartsignals'
+import type { LeadLagScanService } from './leadlagscan'
+import type { YesterdayService } from './yesterday'
 import type { TickPoint } from '../analytics/otcfootprint'
 import { ORACLE_BUCKETS_SEC, computeTickFootprint, computeTickOracle, computeTickSmc, computeTickTechnical, medianTickGapMs, type TickTechnicalResult } from '../analytics/tickdesk'
 import { renkoBricks, renkoAtr } from '../analytics/renko'
@@ -814,6 +817,63 @@ export class MetaStrategyService {
           const confidence = Math.min(100, Math.round(40 + Math.abs(row.z) * 12))
           return { source, direction: row.direction, confidence, value: row.z, label: `Cointegration ${row.direction.toUpperCase()} - spread z ${row.z >= 0 ? '+' : ''}${row.z.toFixed(2)} vs ${row.leader} (beta ${row.beta.toFixed(2)}, R2 ${row.r2.toFixed(2)})` }
         }
+        case 'screenerRank': {
+          // The market-wide Screener board's own row for this pair+tf -
+          // same ScreenRow 'confluence' reads above, under its own name
+          // per direct instruction to give every panel full MSL coverage.
+          const scr = this.ctx.use<ScreenerService>('screener')
+          if (!scr.hasRow(asset, tf)) return none('Screener: has not scored this pair yet (sweep warming up)')
+          const row = scr.evaluate(asset, tf)
+          if (row.direction === 'none') return none(`Screener: no lean (score ${row.score.toFixed(0)}, regime ${row.regime})`)
+          return { source, direction: row.direction, confidence: row.confidence, value: row.score, label: `Screener rank ${row.direction.toUpperCase()} ${row.confidence.toFixed(0)}% (score ${row.score.toFixed(0)}, regime ${row.regime}, pUp ${(row.pUp * 100).toFixed(0)}%)` }
+        }
+        case 'chartSignals': {
+          // The chart-signal pattern committee's row for this pair - the
+          // SUGGESTED (already fade-adjusted) trade direction, strength
+          // 0..100 as confidence, signed -100..100 score as .value.
+          const cs = this.ctx.use<ChartSignalsService>('chartSignals')
+          const res = cs.peek('option', tf)
+          if (!res?.ok) return none('Chart signals: committee scan warming up')
+          const row = res.signals.find((s) => s.asset === asset)
+          if (!row) return none('Chart signals: no qualifying committee read for this pair this cycle')
+          const faded = row.rawDirection !== row.direction ? ` (FADE of the committee's own ${row.rawDirection.toUpperCase()} ${row.agree}/${row.total} read)` : ''
+          return { source, direction: row.direction, confidence: Math.round(row.strength), value: row.score, label: `Chart-signal committee ${row.direction.toUpperCase()} strength ${row.strength.toFixed(0)}${faded}` }
+        }
+        case 'leadLag': {
+          // Is a correlated LEADER already moving first - direction = the
+          // scanner's own suggested follow trade; confidence from fit
+          // quality (|correlation|) and how sharp the leader's trigger move
+          // was (|triggerZ|), same "40 + magnitude" shape as volArb/
+          // cointegration above. `.value` = the leader's triggerZ.
+          const ll = this.ctx.use<LeadLagScanService>('leadLagScan')
+          const res = ll.scan(tf)
+          const row = res.rows.find((r) => r.asset === asset && r.direction != null)
+          if (!row) return none('Lead-lag: no qualifying leader/lag fit for this pair this cycle')
+          const confidence = Math.min(100, Math.round(40 + Math.abs(row.correlation) * 30 + Math.min(20, Math.abs(row.triggerZ) * 5)))
+          return { source, direction: row.direction as 'call' | 'put', confidence, value: row.triggerZ, label: `Lead-lag ${row.direction!.toUpperCase()} - leader ${row.leader} by ${row.lag} bar(s) (corr ${row.correlation.toFixed(2)}, trigger ${row.triggerZ >= 0 ? '+' : ''}${row.triggerZ.toFixed(1)}σ, n=${row.n})` }
+        }
+        case 'yesterday': {
+          // T-24h replay echo - a WEAK PRIOR by design ("markets rhyme,
+          // they do not repeat"): direction only claimed when today's
+          // lead-in actually agrees with yesterday's at this wall-clock
+          // hour (echo.dirAgree === 'same') and the window wasn't quiet/
+          // trivial; confidence capped low-to-moderate (30-80) on purpose -
+          // this should never out-rank a real structural/momentum read.
+          // Synchronous cache peek (YesterdayService.peekCached) rather
+          // than the async scan() every other caller uses - MSL's reads
+          // map must stay a plain sync build, so a cold cache honestly
+          // reads 'none' and warms for the NEXT evaluation instead of this
+          // one call going async.
+          const yd = this.ctx.use<YesterdayService>('yesterday')
+          const res = yd.peekCached(tf, 60, 1)
+          const row = res?.rows.find((r) => r.asset === asset)
+          if (!row) return none('Yesterday echo: no cached T-24h read yet for this pair+tf (warming up - poll the panel once to prime it)')
+          if (!row.echo || row.echo.quiet || row.echo.dirAgree !== 'same' || row.dir === 'none') {
+            return none(`Yesterday echo: ${!row.echo ? 'no echo window' : row.echo.quiet ? 'both lead-ins flat (trivial)' : `dirAgree ${row.echo.dirAgree}`} - no directional claim`)
+          }
+          const confidence = Math.min(80, Math.round(30 + row.echo.rhyme * 0.5))
+          return { source, direction: row.dir === 'up' ? 'call' : 'put', confidence, value: row.echo.rhyme, label: `Yesterday echo ${row.dir.toUpperCase()} - rhyme ${row.echo.rhyme.toFixed(0)}/100, same-hour move ${row.movePct >= 0 ? '+' : ''}${row.movePct.toFixed(3)}% (weak prior, not a signal)` }
+        }
       }
     } catch {
       return none(`${source}: not available (plugin not loaded or thin history)`)
@@ -871,6 +931,10 @@ export class MetaStrategyService {
       confluence: toMsl(this.readSource('confluence', asset, tf)),
       volArb: toMsl(this.readSource('volArb', asset, tf)),
       cointegration: toMsl(this.readSource('cointegration', asset, tf)),
+      screenerRank: toMsl(this.readSource('screenerRank', asset, tf)),
+      chartSignals: toMsl(this.readSource('chartSignals', asset, tf)),
+      leadLag: toMsl(this.readSource('leadLag', asset, tf)),
+      yesterday: toMsl(this.readSource('yesterday', asset, tf)),
     }
     // Tick-desk reads for scripts: bare keys = each engine's own default read
     // (SMC 15s, oracle best bucket, technical best-rated bucket, footprint

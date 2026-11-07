@@ -73,6 +73,11 @@
 // 'nextExpiry:<E>' for each ladder rung (nextExpiry:1/2/3/5/15 - same ':'
 // convention), the pinned tick-desk buckets 'tickOracle:<SEC>' /
 // 'tickTechnical:<SEC>' (SEC = one of 1/2/3/5/15/30/60/120/180/300), and
+// 'screenerRank' (the market-wide Screener board's row for this pair+tf),
+// 'chartSignals' (the chart-signal pattern committee's fade-adjusted
+// suggested trade), 'leadLag' (is a correlated leader already moving
+// first) and 'yesterday' (the T-24h replay echo - a deliberately weak
+// prior, confidence capped 30-80), plus
 // 'technical' (the Technical Summary panel's whole-ladder consensus) plus
 // 'technical:<TF>' for each TECH_LADDER rung (technical:1s, technical:2s,
 // technical:3s, technical:5s, technical:15s, technical:30s, technical:1m,

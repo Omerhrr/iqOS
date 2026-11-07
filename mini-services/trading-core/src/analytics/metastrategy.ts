@@ -82,6 +82,14 @@ export type MetaConditionSource =
   | 'confluence' // the Confluence Screener (plugins/screener.ts): the composite multi-model read (regime + OU stretch + patterns + structure) already scored per pair; direction/confidence straight off its ScreenRow
   | 'volArb' // the Volatility-Arbitrage scanner (plugins/volarbscan.ts): IV/HV ratio regime per pair - direction from its own fade/continue read, 'none' when the scanner reports balanced/no-lean
   | 'cointegration' // the Cointegration scanner (plugins/cointegrationscan.ts): spread-reversion z-score vs the pair's statistical leader; direction = the scanner's suggested reversion trade, gated on its own fit quality (beta/R2/half-life)
+  // Per direct instruction ("not only the technical summary, wire summary
+  // of any other panel into it, so we have full coverage") - the last four
+  // panels that still had no condition/MSL source of their own, each fail-
+  // closed the same way every source above already is.
+  | 'screenerRank' // the market-wide Screener/Confluence board's row for THIS pair+tf (plugins/screener.ts) - same ScreenRow 'confluence' already reads, exposed under its own name so a script can reference "where does the universe-wide screener rank this pair" without conflating it with the Confluence Screener's own composite label
+  | 'chartSignals' // the chart-signal pattern COMMITTEE (analytics/chartsignals.ts via plugins/chartsignals.ts) - the SUGGESTED trade direction (already FADE-adjusted when the committee's own agree/strength floor says to fade it), confidence = |score| 0..100
+  | 'leadLag' // the Lead-Lag scanner (plugins/leadlagscan.ts): is a correlated LEADER already moving first - direction = the scanner's own suggested follow trade, 'none' when no qualifying leader/lag fit exists for this pair this cycle
+  | 'yesterday' // the Yesterday (T-24h replay) echo (plugins/yesterday.ts): did today's lead-in rhyme with yesterday's at this same wall-clock hour - a WEAK PRIOR by design (markets rhyme, they do not repeat), direction only claimed when the echo's dirAgree is 'same' and the window wasn't quiet/trivial, confidence capped low-to-moderate on purpose
 
 export const META_CONDITION_SOURCES: readonly MetaConditionSource[] = [
   'oracle',
@@ -117,6 +125,10 @@ export const META_CONDITION_SOURCES: readonly MetaConditionSource[] = [
   'confluence',
   'volArb',
   'cointegration',
+  'screenerRank',
+  'chartSignals',
+  'leadLag',
+  'yesterday',
 ]
 
 export type MetaDirection = 'call' | 'put' | 'none'
