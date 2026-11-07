@@ -15,6 +15,12 @@ import { getTickTechnical } from '@/lib/os/client'
 
 interface TickTechnicalPanelProps {
   asset: string
+  /** left-dock window chrome: closing the panel window (absent in the bottom-dock tab) */
+  onClose?: () => void
+  /** tick-desk cross-nav: open the sibling tick panel on the same pair */
+  onOpenTickSmc?: () => void
+  onOpenTickOracle?: () => void
+  onOpenTickFootprint?: () => void
 }
 
 const BUCKET_OPTIONS = [5, 15, 30, 60, 120, 180, 300]
@@ -45,7 +51,7 @@ function VoteDot({ vote }: { vote: 'buy' | 'sell' | 'neutral' }) {
   return <span className="inline-block h-1.5 w-1.5 rounded-full align-middle" style={{ background: color }} />
 }
 
-export default function TickTechnicalPanel({ asset }: TickTechnicalPanelProps) {
+export default function TickTechnicalPanel({ asset, onClose, onOpenTickSmc, onOpenTickOracle, onOpenTickFootprint }: TickTechnicalPanelProps) {
   const [data, setData] = useState<TickTechnicalResult | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -79,6 +85,7 @@ export default function TickTechnicalPanel({ asset }: TickTechnicalPanelProps) {
       {/* summary strip */}
       <div className="flex flex-wrap items-center gap-2 border-b border-[#1c2739] px-3 py-1.5">
         <span className="text-[10px] font-bold uppercase tracking-wider text-cyan-300">Tick Technical</span>
+        <span className="font-mono text-[9px] text-[#7c8aa5]" title="indicator votes are computed on this pair's tick-derived buckets">{asset}</span>
         {data?.detail.ok && <RatingChip rating={data.detail.ok ? (data.buckets.find((b) => b.bucketSec === bucketSec)?.summary.rating ?? 'neutral') : 'neutral'} />}
         {data && (
           <span
@@ -109,6 +116,45 @@ export default function TickTechnicalPanel({ asset }: TickTechnicalPanelProps) {
           >
             {busy ? '…' : 'refresh'}
           </button>
+          {onOpenTickSmc && (
+            <button
+              type="button"
+              onClick={onOpenTickSmc}
+              className="rounded border border-[#1c2739] px-1.5 py-0.5 font-mono text-[9px] text-[#7c8aa5] hover:border-indigo-500/40 hover:text-indigo-300"
+              title="open Tick SMC - structure read on the same tick buckets"
+            >
+              → smc
+            </button>
+          )}
+          {onOpenTickOracle && (
+            <button
+              type="button"
+              onClick={onOpenTickOracle}
+              className="rounded border border-[#1c2739] px-1.5 py-0.5 font-mono text-[9px] text-[#7c8aa5] hover:border-blue-500/40 hover:text-blue-300"
+              title="open the Tick Oracle - per-bucket next-candle direction from the same tick stream"
+            >
+              → oracle
+            </button>
+          )}
+          {onOpenTickFootprint && (
+            <button
+              type="button"
+              onClick={onOpenTickFootprint}
+              className="rounded border border-[#1c2739] px-1.5 py-0.5 font-mono text-[9px] text-[#7c8aa5] hover:border-orange-500/40 hover:text-orange-300"
+              title="open the Tick Footprint - per-bucket cluster ladder from measured prints"
+            >
+              → fp
+            </button>
+          )}
+          {onClose && (
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded border border-[#1c2739] px-1.5 py-0.5 font-mono text-[9px] text-[#7c8aa5] hover:border-rose-500/40 hover:text-rose-300"
+            >
+              close
+            </button>
+          )}
         </div>
       </div>
 

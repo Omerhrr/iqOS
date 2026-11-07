@@ -15,6 +15,12 @@ import { getTickOracle } from '@/lib/os/client'
 
 interface TickOraclePanelProps {
   asset: string
+  /** left-dock window chrome: closing the panel window (absent in the bottom-dock tab) */
+  onClose?: () => void
+  /** tick-desk cross-nav: open the sibling tick panel on the same pair */
+  onOpenTickSmc?: () => void
+  onOpenTickTechnical?: () => void
+  onOpenTickFootprint?: () => void
 }
 
 function RowDirBadge({ dir, confidence }: { dir: 'call' | 'put' | 'none'; confidence: number }) {
@@ -45,7 +51,7 @@ function WfBadge({ wf }: { wf: { n: number; hits: number; misses: number; hitRat
   )
 }
 
-export default function TickOraclePanel({ asset }: TickOraclePanelProps) {
+export default function TickOraclePanel({ asset, onClose, onOpenTickSmc, onOpenTickTechnical, onOpenTickFootprint }: TickOraclePanelProps) {
   const [data, setData] = useState<TickOracleResult | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -77,6 +83,7 @@ export default function TickOraclePanel({ asset }: TickOraclePanelProps) {
       {/* summary strip */}
       <div className="flex flex-wrap items-center gap-2 border-b border-[#1c2739] px-3 py-1.5">
         <span className="text-[10px] font-bold uppercase tracking-wider text-cyan-300">Tick Oracle</span>
+        <span className="font-mono text-[9px] text-[#7c8aa5]" title="the ladder reads this pair's live print stream">{asset}</span>
         {data?.best && data.best.direction !== 'none' && (
           <RowDirBadge dir={data.best.direction} confidence={data.best.confidence} />
         )}
@@ -98,6 +105,45 @@ export default function TickOraclePanel({ asset }: TickOraclePanelProps) {
           >
             {busy ? '…' : 'refresh'}
           </button>
+          {onOpenTickSmc && (
+            <button
+              type="button"
+              onClick={onOpenTickSmc}
+              className="rounded border border-[#1c2739] px-1.5 py-0.5 font-mono text-[9px] text-[#7c8aa5] hover:border-indigo-500/40 hover:text-indigo-300"
+              title="open Tick SMC - structure read on the same tick buckets"
+            >
+              → smc
+            </button>
+          )}
+          {onOpenTickTechnical && (
+            <button
+              type="button"
+              onClick={onOpenTickTechnical}
+              className="rounded border border-[#1c2739] px-1.5 py-0.5 font-mono text-[9px] text-[#7c8aa5] hover:border-yellow-500/40 hover:text-yellow-300"
+              title="open the Tick Technical - oscillator + MA votes on tick buckets"
+            >
+              → technical
+            </button>
+          )}
+          {onOpenTickFootprint && (
+            <button
+              type="button"
+              onClick={onOpenTickFootprint}
+              className="rounded border border-[#1c2739] px-1.5 py-0.5 font-mono text-[9px] text-[#7c8aa5] hover:border-orange-500/40 hover:text-orange-300"
+              title="open the Tick Footprint - per-bucket cluster ladder from measured prints"
+            >
+              → fp
+            </button>
+          )}
+          {onClose && (
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded border border-[#1c2739] px-1.5 py-0.5 font-mono text-[9px] text-[#7c8aa5] hover:border-rose-500/40 hover:text-rose-300"
+            >
+              close
+            </button>
+          )}
         </div>
       </div>
 
