@@ -31,23 +31,8 @@
 import type { EvalCtx, SignalDef } from './custom'
 import { signalActive } from './custom'
 import type { MinableEngineId } from '../analytics/chartsignals'
-import { MINABLE_ENGINES } from '../analytics/chartsignals'
 import { getStrategy, defaultParams } from './builtin'
 import type { MslSourceRead } from '../analytics/strategylang'
-
-/** Every indicator id custom.ts's IndicatorSignal.ind union accepts - a
- * RUNTIME mirror of that type so an MSL script naming a nonexistent
- * indicator gets a friendly error listing the valid ids (AUDIT: it used to
- * pass straight through into signalActive as a raw TypeError that killed
- * the whole script evaluation - still fail-closed, but unreadable). */
-const INDICATOR_IDS: ReadonlySet<string> = new Set([
-  'rsi', 'bbpos', 'zscore', 'donchianpos', 'macdz', 'slope', 'streak', 'wickbias', 'emasign', 'hadist',
-  'bodypos', 'psar', 'fractal', 'trendpullback', 'rangezone', 'madist', 'osc0100', 'oscpm100', 'oscz',
-  'trenddist', 'bandpos', 'volflow', 'levels', 'adx', 'ofdelta', 'ofcumdelta', 'ofpocdist', 'ofvapos',
-  'otcvdelta', 'otcvratio', 'otcstagn',
-])
-/** custom.ts's IndicatorSignal.op union, runtime copy (same reasoning). */
-const INDICATOR_OPS: ReadonlySet<string> = new Set(['>', '<', 'between', 'outside'])
 
 /** Every function name this module answers for - strategylang.ts's
  * evaluator falls through to the resolver for any of these (anything NOT
@@ -89,8 +74,15 @@ function confOf(v: Arg | undefined): number {
 
 /** Turns one SIGNAL_FUNCS call into the matching SignalDef, weight is
  * irrelevant for a live read (only matters for the OLD weighted-vote
- * evaluator, never invoked here) so every def gets a placeholder of 1. */
-function buildSignalDef(fn: string, args: Arg[], configs?: Record<string, number | boolean | string>): SignalDef {
+ * evaluator, never invoked here) so every def gets a placeholder of 1.
+ * `cfg` (builtinSig() only) is the script's validated strategy.<id>.<param>
+ * override map, keyed "<builtinId>.<param>" - same per-signal `params`
+ * override shape custom.ts's own JSON-spec builtin branch already reads
+ * (see normalizeOneSignal's BuiltinSignal case). Threaded through here so a
+ * script's builtinSig("hma-roc", "call") can be tuned the same way a JSON
+ * spec's builtin signal always could, instead of only ever running the
+ * builtin at its hardcoded defaultParams(). */
+function buildSignalDef(fn: string, args: Arg[], cfg?: Record<string, number | boolean | string>): SignalDef {
   switch (fn) {
     case 'candle': {
       // candle(name, dir, conf?, series?)
@@ -142,16 +134,10 @@ function buildSignalDef(fn: string, args: Arg[], configs?: Record<string, number
     case 'indicator': {
       // indicator(ind, op, threshold, dir, conf?, threshold2?)
       const [ind, op, threshold, dirArg, , threshold2] = args
-      const indName = String(ind)
-      const opName = String(op)
-      // AUDIT: friendly validation - an unknown ind/op used to become a raw
-      // TypeError deep inside signalActive; fail HERE with the valid values.
-      if (!INDICATOR_IDS.has(indName)) throw new Error(`indicator(): unknown indicator "${indName}" - valid: ${[...INDICATOR_IDS].join(', ')}`)
-      if (!INDICATOR_OPS.has(opName)) throw new Error(`indicator(): unknown op "${opName}" - use >, <, between or outside`)
       return {
         kind: 'indicator',
-        ind: indName as never,
-        op: opName as never,
+        ind: String(ind) as never,
+        op: String(op) as never,
         threshold: num(threshold, 0),
         threshold2: threshold2 === undefined ? undefined : num(threshold2, 0),
         dir: side(dirArg, 'indicator()'),
@@ -161,15 +147,11 @@ function buildSignalDef(fn: string, args: Arg[], configs?: Record<string, number
     case 'indicatorType': {
       // indicatorType(ind, type, op, threshold, dir, conf?, threshold2?)
       const [ind, type, op, threshold, dirArg, , threshold2] = args
-      const indName = String(ind)
-      const opName = String(op)
-      if (!INDICATOR_IDS.has(indName)) throw new Error(`indicatorType(): unknown indicator "${indName}" - valid: ${[...INDICATOR_IDS].join(', ')}`)
-      if (!INDICATOR_OPS.has(opName)) throw new Error(`indicatorType(): unknown op "${opName}" - use >, <, between or outside`)
       return {
         kind: 'indicator',
-        ind: indName as never,
+        ind: String(ind) as never,
         type: String(type),
-        op: opName as never,
+        op: String(op) as never,
         threshold: num(threshold, 0),
         threshold2: threshold2 === undefined ? undefined : num(threshold2, 0),
         dir: side(dirArg, 'indicatorType()'),
@@ -179,15 +161,11 @@ function buildSignalDef(fn: string, args: Arg[], configs?: Record<string, number
     case 'indicatorPeriod': {
       // indicatorPeriod(ind, period, op, threshold, dir, conf?, threshold2?)
       const [ind, period, op, threshold, dirArg, , threshold2] = args
-      const indName = String(ind)
-      const opName = String(op)
-      if (!INDICATOR_IDS.has(indName)) throw new Error(`indicatorPeriod(): unknown indicator "${indName}" - valid: ${[...INDICATOR_IDS].join(', ')}`)
-      if (!INDICATOR_OPS.has(opName)) throw new Error(`indicatorPeriod(): unknown op "${opName}" - use >, <, between or outside`)
       return {
         kind: 'indicator',
-        ind: indName as never,
+        ind: String(ind) as never,
         params: { period: num(period, 14) },
-        op: opName as never,
+        op: String(op) as never,
         threshold: num(threshold, 0),
         threshold2: threshold2 === undefined ? undefined : num(threshold2, 0),
         dir: side(dirArg, 'indicatorPeriod()'),
@@ -195,36 +173,27 @@ function buildSignalDef(fn: string, args: Arg[], configs?: Record<string, number
       }
     }
     case 'builtinSig': {
-      // builtinSig(id, dir, conf?) - AUDIT: unknown ids now fail with the
-      // same friendly error a JSON spec's learner would produce, instead of
-      // signalActive's raw undefined-dereference. A script's OWN
-      // "configure strategy.<id>.<param>" statements (see makeSignalResolver)
-      // merge over the registry defaults here - custom.ts's builtin case
-      // already does `{ ...defaultParams(strat), ...def.params }`, so this
-      // reconfigures ONE script's view of the strategy, never the shared
-      // registry.
+      // builtinSig(id, dir, conf?)
       const [id, dirArg] = args
-      const idName = String(id)
-      if (!getStrategy(idName)) throw new Error(`builtinSig(): unknown builtin strategy "${idName}"`)
+      const builtinId = String(id)
+      const prefix = `${builtinId}.`
       const params: Record<string, number | string> = {}
-      for (const [k, v] of Object.entries(configs ?? {})) {
-        if (!k.startsWith('strategy.')) continue
-        const rest = k.slice('strategy.'.length)
-        const dot = rest.indexOf('.')
-        if (dot <= 0 || dot === rest.length - 1) continue
-        if (rest.slice(0, dot) !== idName) continue
-        const pname = rest.slice(dot + 1)
-        if (typeof v === 'number' && Number.isFinite(v)) params[pname] = v
-        else if (typeof v === 'string' && v.length <= 60) params[pname] = v
+      if (cfg) {
+        for (const [k, v] of Object.entries(cfg)) {
+          if (!k.startsWith(prefix)) continue
+          const param = k.slice(prefix.length)
+          if (typeof v === 'number' && Number.isFinite(v)) params[param] = v
+          else if (typeof v === 'string' && v.length <= 60) params[param] = v
+          // a boolean override has no meaning for a builtin's numeric/string
+          // params table - silently dropped, same as custom.ts's own filter
+        }
       }
-      return { kind: 'builtin', id: idName, ...(Object.keys(params).length ? { params } : {}), dir: side(dirArg, 'builtinSig()'), weight: 1 }
+      return { kind: 'builtin', id: builtinId, ...(Object.keys(params).length ? { params } : {}), dir: side(dirArg, 'builtinSig()'), weight: 1 }
     }
     case 'engine': {
-      // engine(engineId, dir, conf?) - AUDIT: same friendly validation.
+      // engine(engineId, dir, conf?)
       const [engineId, dirArg] = args
-      const engName = String(engineId)
-      if (!(MINABLE_ENGINES as readonly string[]).includes(engName)) throw new Error(`engine(): unknown engine "${engName}" - valid: ${MINABLE_ENGINES.join(', ')}`)
-      return { kind: 'engine', engine: engName as MinableEngineId, dir: side(dirArg, 'engine()'), weight: 1 }
+      return { kind: 'engine', engine: String(engineId) as MinableEngineId, dir: side(dirArg, 'engine()'), weight: 1 }
     }
     default:
       throw new Error(`unknown signal function "${fn}"`)
@@ -255,21 +224,17 @@ function confArgIndexFor(fn: string): number {
  * `ctx` at bar `i` (default: latest closed bar, same as every other live
  * read in this codebase) via custom.ts's own signalActive(), unmodified -
  * so a script's "candle(...)" and a JSON spec's `{kind:'candle',...}`
- * signal are checked by the EXACT same code, nothing reimplemented.
- *
- * `configs` carries the script's OWN "configure strategy.<id>.<param> = <v>"
- * statements (see strategylang.ts) - every builtinSig() call for strategy
- * `<id>` gets those params merged over the strategy's defaults, so MSL can
- * reconfigure a builtin strategy WITHOUT touching the registry's shared
- * defaults (the override lives only inside this one script's evaluation).
- * Unknown strategies/params are rejected by the caller's whitelist before
- * anything reaches here. */
-export function makeSignalResolver(ctx: EvalCtx, i: number = ctx.n - 1, configs?: Record<string, number | boolean | string>): (fn: string, args: Arg[]) => MslSourceRead {
+ * signal are checked by the EXACT same code, nothing reimplemented. */
+export function makeSignalResolver(
+  ctx: EvalCtx,
+  i: number = ctx.n - 1,
+  cfg?: Record<string, number | boolean | string>,
+): (fn: string, args: Arg[]) => MslSourceRead {
   return (fn, args) => {
     if (!(SIGNAL_FUNCS as readonly string[]).includes(fn)) {
-      throw new Error(`unknown function "${fn}" - available signal functions: ${SIGNAL_FUNCS.join(', ')} (plus the core math/logic funcs avg/sum/min/max/count/abs/if/clamp/round/floor/ceil/sign/sqrt/pow/mod)`)
+      throw new Error(`unknown function "${fn}" - available signal functions: ${SIGNAL_FUNCS.join(', ')} (plus avg/sum/min/max/count/abs)`)
     }
-    const def = buildSignalDef(fn, args, configs)
+    const def = buildSignalDef(fn, args, cfg)
     const active = signalActive(def, ctx, i)
     const confidence = active ? confOf(args[confArgIndexFor(fn)]) : 0
     return { direction: active ? def.dir : 'none', confidence }

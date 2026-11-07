@@ -65,7 +65,7 @@ export class ReversalService {
   /** Full per-timeframe reversal read for one asset. Returns null for a
    * ticker outside the universe - clean fail-closed, never a fake calm. */
   readFor(asset: string): ReversalSummary | null {
-    const data = gatherLadder(this.market, asset)
+    const data = gatherLadder(this.market, asset, this.ctx)
     if (!data) return null
     return buildReversalSummary({ asset, ...data })
   }
@@ -74,7 +74,7 @@ export class ReversalService {
   rowFor(asset: string, priceHint: number, opts: { refresh?: boolean } = {}): ReversalGlobalRow {
     const cached = this.scanRows.get(asset)
     if (!opts.refresh && cached && Date.now() - cached.computedTs < GLOBAL_SCAN_TTL_MS) return cached.row
-    const data = gatherLadder(this.market, asset)
+    const data = gatherLadder(this.market, asset, this.ctx)
     if (!data) {
       this.scanRows.delete(asset)
       return {

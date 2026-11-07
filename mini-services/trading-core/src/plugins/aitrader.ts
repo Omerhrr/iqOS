@@ -84,6 +84,9 @@ import type { MemoryGateService } from './memory-gate'
 import type { OtcGuardService } from './otcguard'
 import type { StrategyLabService } from './lab'
 import type { OtcFootprintService } from './otcfootprint'
+import type { ReversalService } from './reversal'
+import type { TechnicalService } from './technical'
+import type { AccuteService } from './accute'
 import type { TickPoint } from '../analytics/otcfootprint'
 import type { FootprintResult } from '../analytics/otcfootprint'
 import { computeTickFootprint, computeTickOracle, computeTickSmc, computeTickTechnical, medianTickGapMs } from '../analytics/tickdesk'
@@ -476,6 +479,75 @@ interface ParsedDecision {
   confidence: number
   expiryMin: number
   reasoning: string
+}
+
+/** Per direct instruction: AI Trader should not be forced to run EVERY
+ * scanner/engine on EVERY cycle regardless of whether this asset/moment
+ * needs it - "it should be free to choose what it run as far as it
+ * suffices its analysis ... should know what works best for the
+ * particular pair." The desk's ALWAYS-ON core (own candle/swing/horizon
+ * math, next-candle oracle, the full tick desk incl. tick SMC/footprint,
+ * the OTC velocity footprint, reversal, technical summary, Accute, plus
+ * the non-skippable governance seats: session/risk-book/memory-gate/OTC-
+ * guard) is NOT in this catalog - those always run, they're either the
+ * named must-haves or cheap safety gates, not optional analysis spend.
+ * Everything in this list is an EXTRA desk seat, each with a real compute
+ * (and on 'global'/'selected' scan modes, per-candidate) cost - a cheap
+ * triage call (triageSelectSources below) asks the model which of these,
+ * if any, it actually wants before the full briefing is built, so a quiet
+ * cycle on a pair that's already clear from the core seats doesn't pay for
+ * a cointegration fit, a 14-factor confluence scan, and the full indicator
+ * board it never needed. MSL is in here too per direct instruction ("msl
+ * is for when it actually need it") - it is NOT core. */
+const OPTIONAL_DESK_SOURCES: { id: string; label: string }[] = [
+  { id: 'nextExpiry', label: 'next-expiry oracle - per-rung (1/2/3/5/15min) pWin honesty engine; most useful when your own expiry choice is genuinely unclear' },
+  { id: 'tempo', label: "tempo desk - this pair's own shot-license rhythm scanner (fire/wait/skip with its own hit-rate record)" },
+  { id: 'confluenceScreener', label: '14-factor mechanical confluence screener (a different vote-counting method than your own read, for cross-checking)' },
+  { id: 'screenerRank', label: 'universe rank + OU mean-reversion stretch (how statistically stretched price is from equilibrium right now)' },
+  { id: 'smcScan', label: 'candle-built SMC structure engine (separate from tick SMC - useful when the tick tape is stale/thin and you need a candle-based structure cross-check)' },
+  { id: 'chartSignals', label: 'chart-pattern committee (may suggest fading its own read - both sides shown)' },
+  { id: 'leadLag', label: 'lead-lag scanner - is a correlated leader already moving first' },
+  { id: 'volArb', label: 'volatility-arb scan - close-vol vs range-vol dislocation vs peers' },
+  { id: 'cointegration', label: 'cointegration scan - spread stretch vs a statistically paired asset' },
+  { id: 'yesterdayEcho', label: 'T-24h replay - did this same hour rhyme with yesterday (a weak prior, not a signal)' },
+  { id: 'aiLab', label: 'AI Lab - learned specs on this exact asset+tf with their holdout honesty' },
+  { id: 'indicatorBoard', label: 'full indicator board - every trend/momentum/volatility/volume/pivot indicator this OS computes, one tf, name+value+stance' },
+  { id: 'msl', label: 'MSL / meta-strategy - your OWN saved specs and scripts, evaluated live on this asset+tf' },
+]
+const OPTIONAL_DESK_IDS = new Set(OPTIONAL_DESK_SOURCES.map((s) => s.id))
+
+/** Parses the triage call's reply - same strict-then-forgiving ladder as
+ * parseDecision, but tolerant of a bare JSON array too (the simplest
+ * correct answer to "which of these do you want") alongside the
+ * {"use":[...]} shape the prompt actually asks for. Unknown ids are
+ * dropped silently (never thrown on) - a model inventing an id it misread
+ * from the catalog must never crash the cycle, it just doesn't get run. */
+function parseTriageReply(raw: string): Set<string> {
+  const tryParse = (text: string): unknown => {
+    try {
+      return JSON.parse(text)
+    } catch {
+      return null
+    }
+  }
+  let v = tryParse(raw.trim())
+  if (v === null) {
+    const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i)
+    if (fenced) v = tryParse(fenced[1].trim())
+  }
+  if (v === null) {
+    const braced = raw.match(/\{[\s\S]*\}/)
+    const bracketed = raw.match(/\[[\s\S]*\]/)
+    if (braced) v = tryParse(braced[0])
+    else if (bracketed) v = tryParse(bracketed[0])
+  }
+  const arr: unknown[] = Array.isArray(v) ? v : Array.isArray((v as { use?: unknown })?.use) ? ((v as { use: unknown[] }).use) : []
+  const out = new Set<string>()
+  for (const item of arr) {
+    const id = String(item ?? '')
+    if (OPTIONAL_DESK_IDS.has(id)) out.add(id)
+  }
+  return out
 }
 
 /** Strict-then-forgiving JSON extraction, same ladder codeAssist.ts's
@@ -1141,7 +1213,74 @@ export class AiTraderService {
    * Returns { lines, sourcesSeen } - sourcesSeen (how many desk seats
    * actually reported) is surfaced in status()/the log as an honest health
    * count for the briefing itself. */
-  async deskBriefingFor(asset: string, tf: Timeframe, ts: number, stake: number): Promise<{ lines: string[]; sourcesSeen: number }> {
+  /** Cheap pre-decision call: shows the model its OWN math (candle anatomy,
+   * swing structure, per-expiry horizon reads, ATR%/RSI) plus the
+   * OPTIONAL_DESK_SOURCES catalog, and asks which EXTRA desk seats (if any)
+   * are worth computing before it decides. Per direct instruction - the
+   * trader should know what works best for a particular pair rather than
+   * always paying for the full 13-source spread. Fails CHEAP, not
+   * expensive: any error, timeout, or unparseable reply here returns an
+   * EMPTY set (core-only briefing), never the full set - a triage failure
+   * must never silently escalate the next LLM call's cost, and the core
+   * seats alone are always enough for a decision (the fail-closed gates
+   * upstream already guaranteed real data to reason over). */
+  private async triageSelectSources(
+    asset: string,
+    tf: Timeframe,
+    horizonLines: string,
+    recentCloses: string,
+    anatomy: string[],
+    structure: string[],
+    atrPct: number,
+    rsiLast: number,
+  ): Promise<Set<string>> {
+    try {
+      const menu = OPTIONAL_DESK_SOURCES.map((s) => `- ${s.id}: ${s.label}`).join('\n')
+      const system: ChatMessage = {
+        role: 'system',
+        content: [
+          'You are the same AI Trader about to decide on a binary-option trade. Before the full desk briefing is',
+          'built, pick which EXTRA desk seats (if any) you actually want this cycle - you already have your own',
+          'candle/swing/horizon math and the CORE desk (next-candle oracle, the full tick desk incl. tick SMC and',
+          'tick footprint, the OTC velocity footprint, the reversal detector, the technical summary ladder, and',
+          'Accute) below for free, always. Pick only what would genuinely change or firm up your read for THIS',
+          'asset+tf right now - not everything, not out of habit. A clear, high-conviction core read needs',
+          'nothing extra; a genuinely unclear or conflicted one is worth spending a seat or two on. Different',
+          'pairs and moments call for different tools - you decide what this one needs.',
+          '',
+          'Available extra seats:',
+          menu,
+          '',
+          'Respond with ONLY a JSON object, no prose: {"use": [<zero or more ids from the list above>]}',
+        ].join('\n'),
+      }
+      const user: ChatMessage = {
+        role: 'user',
+        content: [
+          `${asset} ${tf}`,
+          `your own candle anatomy: ${anatomy.join('; ') || '(n/a)'}`,
+          `your own swing structure: ${structure.join('; ') || '(n/a)'}`,
+          `ATR14 ${atrPct.toFixed(3)}% of price, RSI14 ${rsiLast.toFixed(1)}`,
+          `recent closes: ${recentCloses}`,
+          `per-expiry horizon reads:\n${horizonLines}`,
+        ].join('\n'),
+      }
+      const res = await callLlm(resolveAppUrl(this.config), [system, user], { temperature: 0, maxTokens: 150, timeoutMs: 15_000 })
+      return parseTriageReply(res.content)
+    } catch {
+      // triage failure -> core-only briefing, never the expensive fallback
+      return new Set<string>()
+    }
+  }
+
+  /** `optionalIds` - the EXTRA desk seats this cycle's triage call (see
+   * triageSelectSources) decided are worth their compute, from
+   * OPTIONAL_DESK_SOURCES above. Every seat NOT gated on optionalIds below
+   * is core: always computed, never skipped - either a named must-have
+   * (own math/next-candle/tick desk/OTC velocity footprint/reversal/
+   * technical/Accute) or a cheap, safety-relevant governance read
+   * (session/risk-book/memory-gate/OTC-guard) that is never optional. */
+  async deskBriefingFor(asset: string, tf: Timeframe, ts: number, stake: number, optionalIds: Set<string>): Promise<{ lines: string[]; sourcesSeen: number }> {
     const lines: string[] = []
     let sourcesSeen = 0
     const section = (header: string, body: string[]) => {
@@ -1183,10 +1322,37 @@ export class AiTraderService {
       // omitted - the desk seat is empty this cycle
     }
 
-    // ---- 2. Next-expiry oracle (minute-native per-rung probabilities -
-    // the single most expiry-relevant read for a binary trader; rungs that
-    // match THIS trader's own expiry menu are marked so the model can
-    // cross-check its expiry choice against the oracle's per-rung pWin)
+    // ---- 1b. Accute DEEP read (CORE - named explicitly, per direct
+    // instruction, alongside next-candle/tick/footprint/reversal/technical
+    // as a tool this trader must always have at hand). Accute is itself a
+    // weighted fusion of up to 5 drivers (ADX/Pattern, Tempo, Oracle, Zone,
+    // Renko) with a decorrelation discount when Tempo and the Oracle agree
+    // for the same reason - this is NOT the same as reading those drivers
+    // individually elsewhere in this briefing, it's the platform's own
+    // pre-fused cross-check, and `signal()` here is the read-only call
+    // (never spends the shared one-shot license claim() does).
+    try {
+      const accute = this.svc<AccuteService>('accute')
+      const r = accute?.signal(asset, tf)
+      if (accute && r && r.ok && !r.waiting) {
+        const body: string[] = [
+          `fused read: ${r.direction.toUpperCase()} (pUp ${(r.pUp * 100).toFixed(0)}%), confidence ${r.confidence.toFixed(0)}%, ${r.driversActive} driver(s) active, agreement ${(r.agreement * 100).toFixed(0)}%`,
+          `drivers: ${r.drivers.map((d) => `${d.name} pUp ${(d.pUp * 100).toFixed(0)}% (w=${d.weight.toFixed(2)})`).join(', ') || 'none active'}`,
+        ]
+        if (r.calibration) body.push(`engine's own live record: ${r.calibration.n} graded calls, ${(r.calibration.hitRate * 100).toFixed(0)}% hit rate`)
+        section('Accute (ADX/DI+Pattern, Tempo, Oracle, Zone, Renko - weighted fusion)', body)
+      }
+    } catch {
+      // omitted
+    }
+
+    // ---- 2. Next-expiry oracle (OPTIONAL - minute-native per-rung
+    // probabilities - the single most expiry-relevant read for a binary
+    // trader; rungs that match THIS trader's own expiry menu are marked so
+    // the model can cross-check its expiry choice against the oracle's
+    // per-rung pWin. Request it when your own expiry read is genuinely
+    // unclear.)
+    if (optionalIds.has('nextExpiry'))
     try {
       const exp = this.svc<NextExpiryService>('nextexpiry')
       const pred = exp?.predict(asset)
@@ -1205,8 +1371,10 @@ export class AiTraderService {
       // omitted
     }
 
-    // ---- 3. Tempo desk (the shot-license read: is THIS pair's own firing
-    // rhythm saying fire/wait/skip right now, with its own shot record)
+    // ---- 3. Tempo desk (OPTIONAL - the shot-license read: is THIS pair's
+    // own firing rhythm saying fire/wait/skip right now, with its own shot
+    // record)
+    if (optionalIds.has('tempo'))
     try {
       const tempo = this.svc<TempoService>('tempo')
       const row = tempo?.rowFor(asset, tf)
@@ -1223,9 +1391,10 @@ export class AiTraderService {
       // omitted
     }
 
-    // ---- 4. Confluence screener (the 14-factor mechanical read; only when
-    // the sweeper already has a row - calling evaluate() blind would
-    // trigger a fresh full-engine fit mid-cycle)
+    // ---- 4. Confluence screener (OPTIONAL - the 14-factor mechanical
+    // read; only when the sweeper already has a row - calling evaluate()
+    // blind would trigger a fresh full-engine fit mid-cycle)
+    if (optionalIds.has('confluenceScreener'))
     try {
       const s2 = this.svc<Screener2Service>('screener2')
       if (s2 && s2.hasRow(asset, tf)) {
@@ -1243,9 +1412,11 @@ export class AiTraderService {
       // omitted
     }
 
-    // ---- 5. Screener rank + OU stretch (how stretched is price from its
-    // equilibrium RIGHT NOW - the classic reversion tell with a half-life
-    // attached; plus this asset's rank among the universe's best rows)
+    // ---- 5. Screener rank + OU stretch (OPTIONAL - how stretched is price
+    // from its equilibrium RIGHT NOW - the classic reversion tell with a
+    // half-life attached; plus this asset's rank among the universe's best
+    // rows)
+    if (optionalIds.has('screenerRank'))
     try {
       const scr = this.svc<ScreenerService>('screener')
       if (scr) {
@@ -1267,9 +1438,12 @@ export class AiTraderService {
       // omitted
     }
 
-    // ---- 6. SMC structure scan (BOS/CHoCH trend + signal counts - the
-    // model has its OWN swing-structure read in the user message; this is
-    // the dedicated SMC engine's independent verdict on the same question)
+    // ---- 6. SMC structure scan (OPTIONAL - candle-built BOS/CHoCH trend +
+    // signal counts, separate from tick SMC in the core tick desk below.
+    // The model has its OWN swing-structure read in the user message too;
+    // request this when the tick tape is stale/thin and a candle-based
+    // structure cross-check is worth the call.)
+    if (optionalIds.has('smcScan'))
     try {
       const smc = this.svc<SmcScanService>('smcScan')
       const resp = smc?.scan(asset, tf)
@@ -1283,8 +1457,9 @@ export class AiTraderService {
       // omitted
     }
 
-    // ---- 7. Chart signals (pattern committee; direction may be a
-    // deliberate FADE of the committee's own read - both sides shown)
+    // ---- 7. Chart signals (OPTIONAL - pattern committee; direction may be
+    // a deliberate FADE of the committee's own read - both sides shown)
+    if (optionalIds.has('chartSignals'))
     try {
       const cs = this.svc<ChartSignalsService>('chartSignals')
       const res = cs?.peek('option', tf)
@@ -1300,7 +1475,9 @@ export class AiTraderService {
       // omitted
     }
 
-    // ---- 8. Lead-lag (is a correlated leader already moving FIRST)
+    // ---- 8. Lead-lag (OPTIONAL - is a correlated leader already moving
+    // FIRST)
+    if (optionalIds.has('leadLag'))
     try {
       const ll = this.svc<LeadLagScanService>('leadLagScan')
       const res = ll?.scan(tf)
@@ -1313,7 +1490,8 @@ export class AiTraderService {
       // omitted
     }
 
-    // ---- 9. Vol-arb (volatility dislocation vs peers)
+    // ---- 9. Vol-arb (OPTIONAL - volatility dislocation vs peers)
+    if (optionalIds.has('volArb'))
     try {
       const va = this.svc<VolArbScanService>('volArbScan')
       const res = va?.scan(tf)
@@ -1326,7 +1504,9 @@ export class AiTraderService {
       // omitted
     }
 
-    // ---- 10. Cointegration (spread stretch vs a statistical pair)
+    // ---- 10. Cointegration (OPTIONAL - spread stretch vs a statistical
+    // pair)
+    if (optionalIds.has('cointegration'))
     try {
       const ci = this.svc<CointegrationScanService>('cointegrationScan')
       const res = ci?.scan(tf)
@@ -1339,10 +1519,11 @@ export class AiTraderService {
       // omitted
     }
 
-    // ---- 11. Yesterday echo (same-time-24h-ago replay: did this hour have
-    // a rhyme last session; async + cached, raced with a short timeout so a
-    // cold first scan can never stall the decision loop - the loser keeps
-    // warming the cache for the NEXT cycle)
+    // ---- 11. Yesterday echo (OPTIONAL - same-time-24h-ago replay: did
+    // this hour have a rhyme last session; async + cached, raced with a
+    // short timeout so a cold first scan can never stall the decision loop
+    // - the loser keeps warming the cache for the NEXT cycle)
+    if (optionalIds.has('yesterdayEcho'))
     try {
       const yd = this.svc<YesterdayService>('yesterday')
       if (yd) {
@@ -1438,8 +1619,9 @@ export class AiTraderService {
       // omitted
     }
 
-    // ---- 16. AI Lab (learned specs live on this exact asset+tf, with
-    // their holdout honesty)
+    // ---- 16. AI Lab (OPTIONAL - learned specs live on this exact
+    // asset+tf, with their holdout honesty)
+    if (optionalIds.has('aiLab'))
     try {
       const lab = this.svc<StrategyLabService>('lab')
       const rows = lab?.list() ?? []
@@ -1498,7 +1680,11 @@ export class AiTraderService {
     // covers the whole board: 9 trend reads, 16 momentum oscillators, the
     // volatility band/width suite, the volume-flow family (honest n/a on a
     // zero-volume feed) and the pivot/fib levels. A WARMING board (thin
-    // history) prints its honest note and is omitted like any other seat.)
+    // history) prints its honest note and is omitted like any other seat.
+    // OPTIONAL - this is the biggest single seat in the briefing; request
+    // it when your own math and the core reads leave the chartist picture
+    // genuinely unclear, not as a default every-cycle pass.)
+    if (optionalIds.has('indicatorBoard'))
     try {
       let board: Candle[] = []
       try {
@@ -1510,6 +1696,86 @@ export class AiTraderService {
       // indicatorBoardLines returns a warming note even on thin history -
       // surface that honestly rather than silently omitting the seat.
       if (boardLines.length) section('indicator board (the FULL indicator workup: trend / momentum / volatility / volume / levels, every read name value [BULL|BEAR|=|n/a])', boardLines)
+    } catch {
+      // omitted
+    }
+
+    // ---- 20. Reversal detector (the "is this turning RIGHT NOW" state
+    // engine - calm/forming/reversing/confirmed across the same 10-rung
+    // timeframe ladder the Technical Summary panel uses, down to sub-minute
+    // tick-built rungs on a live feed). This is the human operator's own
+    // Reversal panel, read exactly as they would read it: the model gets
+    // the single most urgent live rung plus a quick per-rung strip so it
+    // can see whether a reversal is forming on the trader's exact tf or
+    // only on a faster/slower rung.
+    try {
+      const rv = this.svc<ReversalService>('reversal')
+      const sum = rv?.readFor(asset)
+      if (sum) {
+        const body: string[] = []
+        if (sum.best) {
+          body.push(
+            `most urgent live rung: ${sum.best.tf} is ${sum.best.state.toUpperCase()} ${sum.best.direction.toUpperCase()} (score ${sum.best.score})`,
+          )
+        } else {
+          body.push('every live rung reads CALM - no reversal forming anywhere on the ladder right now')
+        }
+        const mine = sum.rows.find((r) => r.tf === tf)
+        if (mine && mine.ok) body.push(`on YOUR OWN tf (${tf}): ${mine.state.toUpperCase()} ${mine.direction.toUpperCase()} (score ${mine.score})${mine.reasons.length ? ` - ${mine.reasons[0].note}` : ''}`)
+        const strip = sum.rows.filter((r) => r.ok).map((r) => `${r.tf}:${r.state[0].toUpperCase()}${r.direction === 'up' ? '^' : r.direction === 'down' ? 'v' : '-'}`).join(' ')
+        if (strip) body.push(`ladder strip: ${strip}`)
+        section('reversal detector (calm/forming/reversing/confirmed, 10-rung ladder incl. sub-minute tick rungs)', body)
+      }
+    } catch {
+      // omitted
+    }
+
+    // ---- 21. Technical Summary (the investing.com-style oscillator + MA
+    // vote panel, same 10-rung ladder as the Reversal seat above - this is
+    // the human operator's OWN Technical Summary panel, not a duplicate of
+    // the indicator board: that board is raw name/value/stance per
+    // indicator on ONE tf, this is BUY/SELL/NEUTRAL vote counts cross-checked
+    // across every rung from sub-minute ticks up).
+    try {
+      const tc = this.svc<TechnicalService>('technical')
+      const sum = tc?.summaryFor(asset)
+      if (sum) {
+        const body = [
+          `cross-timeframe consensus: ${sum.overall.label} (score ${sum.overall.score >= 0 ? '+' : ''}${sum.overall.score.toFixed(2)}, ${sum.overall.buys}B/${sum.overall.sells}S/${sum.overall.neutrals}N of ${sum.overall.counted} rungs counted) -> leans ${sum.direction.toUpperCase()}`,
+        ]
+        const mine = sum.rows.find((r) => r.tf === tf)
+        if (mine && mine.ok) body.push(`on YOUR OWN tf (${tf}): oscillators ${mine.oscSummary.label} (${mine.oscSummary.buys}B/${mine.oscSummary.sells}S), ${mine.source === 'ticks' ? `tick-built (${mine.ticksPerBar?.toFixed(1) ?? '?'} prints/bar)` : mine.source}`)
+        section('technical summary (oscillator+MA vote ladder, same rungs as the reversal seat)', body)
+      }
+    } catch {
+      // omitted
+    }
+
+    // ---- 22. MSL / Meta-Strategy (OPTIONAL, per direct instruction: "msl
+    // is for when it actually need it" - the operator's OWN saved
+    // meta-strategy specs and scripts, evaluated live against THIS
+    // asset+tf exactly as Meta Trader or the MSL editor would run them.
+    // This is NOT the same as seat/snapshot's static panel reads above
+    // (oracle/smc/renko/etc labels) - these are the operator's own
+    // hand-built logic. A spec that errors on this asset (wrong script
+    // assumptions, thin history) is skipped silently - one broken saved
+    // spec must never blank the whole desk seat.)
+    if (optionalIds.has('msl'))
+    try {
+      const msl = this.metaStrategyService()
+      const specs = msl?.list() ?? []
+      const body: string[] = []
+      for (const spec of specs.slice(0, 10)) {
+        try {
+          const { result } = msl!.evaluate(spec.id, asset, tf)
+          if (result.direction === 'none') continue
+          const expiryTag = result.expiryMin ? `, script's own preferred expiry ${result.expiryMin}min` : ''
+          body.push(`"${spec.name}" (${spec.mode}): ${result.direction.toUpperCase()} ${result.confidence.toFixed(0)}%${expiryTag}${result.notes ? ` - ${result.notes}` : ''}`)
+        } catch {
+          // this spec doesn't resolve on this asset/tf - skip it, not the whole seat
+        }
+      }
+      if (body.length) section('MSL / meta-strategy (your own saved specs and scripts, evaluated live on this asset+tf)', body)
     } catch {
       // omitted
     }
@@ -1692,16 +1958,24 @@ export class AiTraderService {
       // Computed once here and reused for placement + the log lines below.
       const bet = this.stakeFor()
 
-      // THE EXPERT DESK: own detection upgrades (candle anatomy, swing
-      // structure) + the full briefing from every scanner/oracle/learned
-      // model in the kernel. All fail-closed - each desk seat that isn't
-      // reporting simply shortens the briefing. Computed BEFORE the LLM call
-      // and reused in EVERY decision record below, so the stored row always
-      // carries what the desk actually said this cycle (the audit trail).
-      const briefing = await this.deskBriefingFor(asset, tf, ts, bet.amount)
+      // Own detection upgrades FIRST - the model's own math, computed
+      // before anything else so the triage call below can see it too (no
+      // point asking "do you want the confluence screener" without first
+      // showing what the own-read already settled on its own).
       const anatomy = candleAnatomy(candles)
       const structure = swingStructure(candles)
       const tally = deskTally(snapshot)
+
+      // THE EXPERT DESK: core seats (own math above + next-candle/tick
+      // desk/OTC velocity footprint/reversal/technical/Accute + the
+      // governance seats) always run. Everything else is OPTIONAL per
+      // direct instruction - the trader should be "free to choose what it
+      // runs as far as it suffices its analysis" rather than paying for
+      // every scanner on every cycle regardless of whether this pair/
+      // moment needs it - so a cheap triage call picks which EXTRA seats
+      // (if any) are worth computing before the full briefing is built.
+      const optionalIds = await this.triageSelectSources(asset, tf, horizonLines, recentCloses, anatomy, structure, atrPct, rsiLast)
+      const briefing = await this.deskBriefingFor(asset, tf, ts, bet.amount, optionalIds)
       // audit trail: the stored decision's snapshot keeps the panel grid AND
       // every desk line, tagged source 'desk' so a replay of the log can tell
       // a panel read from a briefing line (matches the client's
@@ -1727,8 +2001,24 @@ export class AiTraderService {
           'gate, the OTC defense guard, the AI Lab where learned strategies report their holdout edge, and the',
           'FULL INDICATOR BOARD (every indicator this OS computes - trend MAs/Supertrend/PSAR/Ichimoku/ADX, the',
           'momentum oscillator suite, volatility bands and widths, the volume-flow family and pivot/fib levels -',
-          'each reduced to name value [BULL|BEAR|=|n/a] with a bull/bear vote tally).',
-          'You are their HUMAN - not one more system running alongside them.',
+          'each reduced to name value [BULL|BEAR|=|n/a] with a bull/bear vote tally), a REVERSAL DETECTOR (the',
+          'is-it-turning-RIGHT-NOW state engine - calm/forming/reversing/confirmed across a 10-rung ladder down',
+          'to sub-minute tick rungs), a TECHNICAL SUMMARY (the oscillator+MA vote ladder on those same rungs),',
+          'and your own MSL / META-STRATEGY seat: every saved spec and script the operator has built in this',
+          'platform, evaluated live against this exact asset+tf exactly as the Meta Trader or the MSL editor',
+          'would run it - this is the operator\'s own hand-built logic, not another panel label.',
+          'You are their HUMAN - not one more system running alongside them. Everything the human running this',
+          'desk can see, you can see: every chart type this platform charts (candle/bar/renko/point-and-figure/',
+          'range-bars/Heikin-Ashi/line/area/baseline/volume-bars/tick-bars/footprint/TPO), every SMC concept on',
+          'BOTH candle-built AND tick-built structure (tick SMC is the more precise of the two when the tape is',
+          'fresh - read its tape-health line first), the full indicator board, the reversal/technical ladders,',
+          'and your own saved MSL specs. A handful of these (next-expiry, tempo, confluence screener, OU/universe',
+          'rank, candle-SMC, chart-pattern committee, lead-lag, vol-arb, cointegration, yesterday-echo, AI Lab,',
+          'the full indicator board, and MSL) are OPTIONAL - you already picked which of those, if any, you',
+          'wanted for THIS cycle before this briefing was built, based on your own math. If one of those is',
+          'absent, it is because you did not ask for it, not because it failed. If a CORE seat is absent (the',
+          'ones named above as always-on), its data genuinely was not available this cycle - never read either',
+          'kind of absence as agreement or disagreement.',
           '',
           'A real senior trader works exactly like this: read the tape with his own eyes first (the raw closes,',
           'the candle anatomy and swing structure in YOUR OWN ANALYSIS below), then take the meeting with the',
@@ -1941,6 +2231,25 @@ export class AiTraderService {
     if (position.strategy !== 'ai-trader') return
     const plan = this.config.stakePlan
     if (!plan || (position.status !== 'won' && position.status !== 'lost')) return
+    // THE CONCURRENT-SETTLEMENT BUG: with maxConcurrent > 1 (or scanMode
+    // 'selected'/'global'), more than one AI Trader position can be open at
+    // once under the SAME pot. If one of them settles as a loss first, the
+    // plan halts (stands down, pot frozen) - but a SECOND position opened
+    // before that halt can still be out there and settle afterward. Without
+    // this guard its win/loss would silently fold into or burn from a pot
+    // that's supposed to be frozen, which both lies to the operator (the
+    // displayed pot moves after "HALTED, restart to trade again" already
+    // fired) and double-counts risk the halt was meant to stop compounding
+    // on. The real position's own pnl already settled for real on the
+    // account via execution.ts's settle() regardless - this guard only
+    // protects the DERIVED sizing pot, never the account balance. */
+    if (this.plan.halted) {
+      this.emit(
+        'warn',
+        `[AI Trader] late ${position.status} settlement (opened before the compound cycle halted, probably from maxConcurrent > 1) - pot stays frozen at $${this.plan.pot.toFixed(2)}, this trade's real pnl already settled on the account and is unaffected - restart the compound cycle to resume`,
+      )
+      return
+    }
     const base = plan.base
     const working = this.plan.pot >= 0.01 ? this.plan.pot : base
     const amount = position.amount ?? base

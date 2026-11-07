@@ -69,7 +69,7 @@ export class TechnicalService {
    * ticker outside the universe - the route reports that as a clean
    * fail-closed, never as a fake neutral read. */
   summaryFor(asset: string): TechnicalSummary | null {
-    const data = gatherLadder(this.market, asset)
+    const data = gatherLadder(this.market, asset, this.ctx)
     if (!data) return null
     return buildTechnicalSummary({ asset, ...data })
   }
@@ -78,7 +78,7 @@ export class TechnicalService {
   rowFor(asset: string, priceHint: number, opts: { refresh?: boolean } = {}): TechnicalGlobalRow {
     const cached = this.scanRows.get(asset)
     if (!opts.refresh && cached && Date.now() - cached.computedTs < GLOBAL_SCAN_TTL_MS) return cached.row
-    const data = gatherLadder(this.market, asset)
+    const data = gatherLadder(this.market, asset, this.ctx)
     if (!data) {
       this.scanRows.delete(asset)
       const empty: TechTfRow[] = []

@@ -157,6 +157,20 @@ export class OtcFootprintService {
     } catch {
       // autopilot not loaded - active asset only
     }
+    try {
+      // THE SAME FROZEN-TICK GAP market-data.ts's livePollAssets() had for
+      // candles: AI Trader's own scanned asset(s) were never kept warm here
+      // either, so its tick desk (tick SMC / tick oracle / tick technical /
+      // tick footprint - see deskBriefingFor seat 17 in aitrader.ts) and the
+      // OTC velocity footprint (seat 18) would silently sit empty/stale for
+      // an asset AI Trader scans that isn't also charted or on a bot
+      // watchlist - exactly the class of bug the candle-side fix closed,
+      // just on the tick collector instead of the candle one.
+      const ai = this.ctx.use<{ watchedAssets?: () => string[] }>('aiTrader')
+      for (const a of ai?.watchedAssets?.() ?? []) assets.add(a)
+    } catch {
+      // ai-trader plugin absent
+    }
     for (const asset of [...assets].slice(0, PULL_ASSETS_CAP)) {
       await this.pullLive(asset)
     }
