@@ -189,8 +189,53 @@ function Markdown({ src }: { src: string }) {
     para = []
   }
 
+  // Fenced code blocks (```lang\n...\n```), e.g. a generated MSL script or a
+  // TypeScript strategy snippet in the Copilot's final answer - previously
+  // this mini renderer had NO fence handling at all, so the ``` lines just
+  // fell through to flushList/flushPara as ordinary text and the whole block
+  // got lumped into one paragraph alongside its prose, losing all
+  // formatting, monospacing and line breaks ("it doesn't come in code
+  // format, it lumps it together as text"). Collected raw (untrimmed) so
+  // indentation in the code itself survives.
+  let inFence = false
+  let fenceLang = ''
+  let fenceLines: string[] = []
+  const flushFence = () => {
+    if (!inFence) return
+    out.push(
+      <pre
+        key={`c${out.length}`}
+        className="my-1.5 overflow-x-auto rounded border border-[#1c2739] bg-[#0a0f18] px-2.5 py-2 font-mono text-[10px] leading-relaxed text-[#c8d4e6]"
+      >
+        {fenceLang && <div className="mb-1 text-[8px] uppercase tracking-wider text-[#4b5a72]">{fenceLang}</div>}
+        <code className="whitespace-pre">{fenceLines.join('\n')}</code>
+      </pre>
+    )
+    inFence = false
+    fenceLang = ''
+    fenceLines = []
+  }
+
   for (const raw of lines) {
     const t = raw.trim()
+    const fence = /^```\s*([a-zA-Z0-9_-]*)\s*$/.exec(t)
+    if (fence) {
+      if (inFence) {
+        flushFence()
+      } else {
+        flushList()
+        flushTable()
+        flushPara()
+        inFence = true
+        fenceLang = fence[1] || ''
+        fenceLines = []
+      }
+      continue
+    }
+    if (inFence) {
+      fenceLines.push(raw)
+      continue
+    }
     if (t.startsWith('|') && t.endsWith('|') && t.length > 2) {
       flushList()
       flushPara()
@@ -246,6 +291,7 @@ function Markdown({ src }: { src: string }) {
   flushList()
   flushTable()
   flushPara()
+  flushFence() // unbalanced trailing ``` (model forgot the close) - still render what we collected, don't drop it
   return <div className="text-[11px] text-[#dbe4f0]">{out}</div>
 }
 
