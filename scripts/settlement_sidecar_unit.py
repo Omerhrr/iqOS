@@ -25,6 +25,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + "/live")
 sys.path.insert(0, "/tmp/iqair_inspect")  # local iqair install, skips the auto pip
 
+import threading  # noqa: E402
+import time  # noqa: E402
+
 import iqair_sidecar as m  # noqa: E402
 
 pass_n = 0
@@ -197,6 +200,28 @@ m._iq_last_attempt = None
 res = run({"order_id": OID, "mode": "binary"}, FakeClient(raise_all=True))
 ok(m._iq_last_attempt is not None and m._iq_last_ok is None,
    "an all-failing poll stamps attempt but NOT ok (rot signal)", f"{m._iq_last_attempt} / {m._iq_last_ok}")
+
+# ---------------- boot-resume hang guard: the pending stamp lifecycle ----------------
+# The lib's connect() has `while global_value.balance_id == None: pass` - an
+# unbounded busy-wait. The wrapper must stamp pending while the resume runs
+# and clear it when it finishes (success OR failure), so the establishment
+# watchdog only exits on a genuinely stuck resume.
+orig_inner = m._try_resume_session_inner
+m._resume_pending_since = None
+m._try_resume_session_inner = lambda: (time.sleep(0.4), True)[1]
+th = threading.Thread(target=m._try_resume_session, daemon=True)
+th.start()
+time.sleep(0.15)
+ok(m._resume_pending_since is not None, "resume pending stamped while the resume is in flight")
+th.join()
+ok(m._resume_pending_since is None, "resume pending cleared when the resume finishes")
+
+# a FAILING resume must also clear the stamp (no spurious restart loop)
+m._try_resume_session_inner = lambda: False
+th = threading.Thread(target=m._try_resume_session, daemon=True)
+th.start(); th.join()
+ok(m._resume_pending_since is None, "failed resume also clears the pending stamp")
+m._try_resume_session_inner = orig_inner
 
 print(f"settlement_sidecar_unit: {pass_n} ok, {fail_n} fail")
 sys.exit(1 if fail_n else 0)

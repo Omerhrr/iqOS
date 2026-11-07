@@ -522,7 +522,30 @@ def _save_session(email, balance_mode="PRACTICE"):
         print(f"[sidecar] session save failed: {exc}")
 
 
+# THE BOOT-RESUME HANG GUARD: the lib's connect() contains
+# `while global_value.balance_id == None: pass` - an UNBOUNDED busy-wait
+# with NO timeout. If IQ never pushes the balance after the saved ssid is
+# injected (half-rotten session at boot), the resume thread spins forever,
+# _client stays None, every endpoint 400s "not connected", nothing ever
+# settles - and the liveness watchdog deliberately skips that state (it
+# only judges when a client EXISTS). Track both session-establishment
+# paths (boot auto-resume, manual /connect); the watchdog exits hard when
+# one has been pending >90s (legit connect is 20-55s) so the keeper
+# restarts and the ssid gets another chance instead of spinning forever.
+_resume_pending_since = None
+_connect_pending_since = None
+
+
 def _try_resume_session():
+    global _resume_pending_since
+    _resume_pending_since = time.time()
+    try:
+        return _try_resume_session_inner()
+    finally:
+        _resume_pending_since = None
+
+
+def _try_resume_session_inner():
     """Boot-time auto-resume: inject the saved ssid into the lib's global slot
     BEFORE client.connect() so api.connect() sends the ssid over a fresh
     websocket (fast path, no credentials).
@@ -571,6 +594,22 @@ def _try_resume_session():
     except Exception as exc:  # noqa: BLE001
         print(f"[sidecar] session resume error: {exc}")
         return False
+
+
+def _session_establishment_watchdog():
+    while True:
+        time.sleep(5)
+        for label, since in (
+            ("boot session resume", _resume_pending_since),
+            ("manual /connect", _connect_pending_since),
+        ):
+            if since is not None and time.time() - since > 90:
+                print(f"[sidecar] WATCHDOG: {label} stuck >90s (lib connect busy-wait, "
+                      f"IQ not answering) - restarting process to retry the session")
+                os._exit(1)
+
+
+threading.Thread(target=_session_establishment_watchdog, daemon=True).start()
 
 
 def _ws_health_monitor():
@@ -1459,6 +1498,8 @@ class Handler(BaseHTTPRequestHandler):
                     "last_iq_attempt_age_sec": (now - _iq_last_attempt) if _iq_last_attempt else None,
                     "portfolio_lock_held_sec": (now - _portfolio_held_since) if _portfolio_held_since else None,
                     "bus_lock_held_sec": (now - _held_since) if _held_since else None,
+                    "resume_pending_sec": (now - _resume_pending_since) if _resume_pending_since else None,
+                    "connect_pending_sec": (now - _connect_pending_since) if _connect_pending_since else None,
                 },
             }))
 
@@ -1589,7 +1630,7 @@ class Handler(BaseHTTPRequestHandler):
     # ---------------- POST ----------------
 
     def do_POST(self):
-        global _client
+        global _client, _connect_pending_since
         # Task 58 (P2): CSRF guard - the CORS * header let ANY visited website
         # POST /connect or /trade against a locally-running sidecar from the
         # operator's browser. Browser-originated calls ALWAYS carry an Origin
@@ -1611,14 +1652,24 @@ class Handler(BaseHTTPRequestHandler):
                 if not email or not password:
                     return self._send(_err("email and password required"), 400)
                 client = IQOptionClient(email, password)
-                check, reason = client.connect()
-                if not check:
-                    return self._send(_err(f"connect failed: {reason}"), 401)
-                mode = (body.get("balance_mode") or "PRACTICE").upper()
-                if mode == "REAL":
-                    print("[sidecar] WARNING: connecting with REAL balance at user request")
-                client.change_balance(mode)
-                _client = client
+                # stamp the establishment guard for the WHOLE connect window:
+                # connect() itself AND change_balance() are unbounded-busy-wait
+                # round-trips in the lib; if IQ never answers, this thread
+                # spins forever with _client still None (invisible to the
+                # liveness watchdog). _session_establishment_watchdog exits
+                # hard past 90s so the keeper retries the login.
+                _connect_pending_since = time.time()
+                try:
+                    check, reason = client.connect()
+                    if not check:
+                        return self._send(_err(f"connect failed: {reason}"), 401)
+                    mode = (body.get("balance_mode") or "PRACTICE").upper()
+                    if mode == "REAL":
+                        print("[sidecar] WARNING: connecting with REAL balance at user request")
+                    client.change_balance(mode)
+                    _client = client
+                finally:
+                    _connect_pending_since = None
                 # persist the ssid AND the balance mode: every future keeper
                 # respawn / watchdog restart resumes from them instead of
                 # asking for credentials - and resumes on the SAME ledger the
