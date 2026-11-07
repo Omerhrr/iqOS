@@ -80,8 +80,20 @@ services:
     environment:
       - SIDECAR_HOST=0.0.0.0
       - SIDECAR_PORT=47313
+      # Session state MUST live outside /app: Docker seeds a named volume
+      # from the image's content exactly ONCE (the first `up`, while the
+      # volume is still empty) and never again - so a volume mounted on /app
+      # shadows the image's code forever after. That is how production ran
+      # 570+ unanswered settlement polls with zero watchdog output: every
+      # rebuild shipped the new script to the IMAGE, but the container kept
+      # executing the FIRST deploy's iqair_sidecar.py out of the volume.
+      - SIDECAR_SESSION_DIR=/state
     volumes:
-      - iqos-sidecar-session:/app
+      # Same named volume as before - the saved ssid sits at its root, so it
+      # used to resolve as /app/.iq_session and now resolves as
+      # /state/.iq_session: the live session survives this migration with NO
+      # manual re-login.
+      - iqos-sidecar-session:/state
     networks:
       - iqos-internal
     # Optional - only needed for LIVE (IQ Option) mode. Not exposed to the

@@ -2053,6 +2053,10 @@ class Server(ThreadingHTTPServer):
 
 if __name__ == "__main__":
     print(f"[iqair-sidecar] listening on http://{HOST}:{PORT} - POST /connect to start a session")
+    # visible on every boot so a stale/misrouted session path can't hide:
+    # if this path is NOT the volume-mounted one, a container recreate just
+    # silently dropped the saved ssid
+    print(f"[sidecar] session file: {SESSION_FILE}")
     # transparent auto-resume: if a previous session saved its ssid, bring the
     # client back BEFORE anyone asks - kernel boot-restore / adopt will find a
     # connected sidecar and the operator never re-enters credentials

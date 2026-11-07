@@ -1159,6 +1159,19 @@ export class ExecutionService {
         const health = await this.getLive('/health')
         if (!health) {
           this.ctx.log('execution', `live ${pos.kind} ${pos.liveOrderId} on ${pos.asset}: sidecar /health unreachable - the sidecar process itself is not answering (keeper should respawn it within seconds)`)
+        } else if (!health.session) {
+          // THE STALE-IMAGE GUARD: a /health WITHOUT the session object
+          // predates the liveness bookkeeping (8a660a9) - the container is
+          // running OLD code no matter how many times the image was rebuilt.
+          // Found in production: 570+ unanswered polls, /health green, zero
+          // watchdog output, restarts=0 - because a named volume mounted over
+          // /app is seeded from the image exactly ONCE (first up), so every
+          // rebuild shipped new code to the image while the container went on
+          // running the FIRST deploy's script from the volume.
+          this.ctx.log(
+            'execution',
+            `live ${pos.kind} ${pos.liveOrderId} on ${pos.asset}: sidecar /health has no session bookkeeping - the iqos-sidecar container is running STALE code (old image, or a volume still shadowing /app). Rebuild the image and recreate the container; no watchdog exists in the code that is running.`,
+          )
         } else {
           const s = (health.session ?? {}) as Record<string, unknown>
           const age = (v: unknown) => (typeof v === 'number' ? `${Math.round(v)}s ago` : 'never')

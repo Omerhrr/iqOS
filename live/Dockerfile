@@ -5,8 +5,11 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY iqair_sidecar.py ./
-# .iq_session (the persisted broker session) is written next to the script -
-# mount a volume there so a container recreate doesn't force a re-login.
+# The persisted broker session (.iq_session) is written to $SIDECAR_SESSION_DIR
+# (compose sets /state) so the session can be volume-mounted WITHOUT shadowing
+# this image's code - a volume over /app pins the FIRST deploy's
+# iqair_sidecar.py in place and every rebuild silently runs stale code.
+# Local dev (env unset) still writes next to the script.
 ENV SIDECAR_HOST=0.0.0.0
 # Unusual internal port on purpose - not the default 8788 used in
 # local/Windows dev.
