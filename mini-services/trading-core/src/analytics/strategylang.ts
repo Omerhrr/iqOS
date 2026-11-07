@@ -73,6 +73,15 @@
 // 'nextExpiry:<E>' for each ladder rung (nextExpiry:1/2/3/5/15 - same ':'
 // convention), the pinned tick-desk buckets 'tickOracle:<SEC>' /
 // 'tickTechnical:<SEC>' (SEC = one of 1/2/3/5/15/30/60/120/180/300), and
+// 'technical' (the Technical Summary panel's whole-ladder consensus) plus
+// 'technical:<TF>' for each TECH_LADDER rung (technical:1s, technical:2s,
+// technical:3s, technical:5s, technical:15s, technical:30s, technical:1m,
+// technical:2m, technical:3m, technical:5m, ... - same TF tokens the panel
+// itself uses), and 'reversal' (the Reversal Radar's single most-urgent
+// live read) plus 'reversal:<TF>' for the same rungs - a reversal rung
+// only ever claims .dir in its two tradeable states (reversing-now or
+// confirmed); calm/forming honestly read .dir == none, so "is NOT
+// reversing" at a rung is simply `not reversal:1s.active`, and
 // 'smc:<KIND>' for each of the 15 SMC concepts (smcNowRead() per kind) -
 // "any of the smcs" per direct instruction, without needing 15 new
 // MetaConditionSource union members. 'pointFigure'/

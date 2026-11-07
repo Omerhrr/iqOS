@@ -311,6 +311,18 @@ const minToSec = (m: number) => Math.max(1, Math.round(m * 60))
  * have placed verbatim. Every other decision path in this codebase is
  * fail-closed on thin history; this trader now is too. */
 const MIN_CANDLES_FOR_DECISION = 25
+/** Same broker-rejection family os-mode.ts's auto-trader and metatrader.ts
+ * already cool down on ("Cannot purchase an option (the asset is not
+ * available at the moment)", suspended/not-a-tradeable-instrument, etc.) -
+ * a REAL AI Trader deployment just hit this verbatim on BTCUSD for hours
+ * (every ~5min interval, a full desk briefing + LLM call + a place-order
+ * attempt that was rejected every single time) because nothing here ever
+ * remembered the rejection past that one cycle. Mirrors the other two
+ * plugins' cooldown pattern instead of inventing a third one: once the
+ * broker says an asset's option book is closed/suspended, stop spending an
+ * LLM call on it at all (not just skip the order) until the cooldown lapses. */
+const AI_TRADER_BROKER_UNAVAILABLE_RE = /not available at the moment|is not a (?:turbo\/binary\/digital|digital\/turbo\/binary) instrument|active\b[^.]*not found|is suspended|active is suspended|suspended\b/i
+const AI_TRADER_UNAVAILABLE_COOLDOWN_SEC = 600
 /** A candle series older than this (relative to the tf - 5 closed bars,
  * floored at 5 wall-clock minutes) reads as a stalled/frozen feed or a
  * closed market: skip without calling the model, same fail-closed rule.
@@ -901,6 +913,9 @@ export class AiTraderService {
   private running = false // reentrancy guard - a slow LLM call must never overlap its own next tick
   private lastRunTs = 0
   private lastError: string | null = null
+  /** asset -> epoch-seconds until which we don't even spend an LLM call on it,
+   * set after a broker rejection matching AI_TRADER_BROKER_UNAVAILABLE_RE. */
+  private assetRejectedUntil = new Map<string, number>()
   private cycles = 0
   /** Compounding roll state - only meaningful while config.stakePlan is
    * armed. Restored from the config blob on start(), persisted back on every
@@ -1864,6 +1879,21 @@ export class AiTraderService {
    * it once per scanned candidate instead of always on `this.config.asset`. */
   private async runCycleForAsset(asset: string, tf: Timeframe, ts: number): Promise<AiTraderDecision | null> {
     try {
+      // Broker-rejection cooldown - BEFORE any snapshot/candle/LLM work,
+      // same fail-closed spirit as the stale-candle gate below. Without
+      // this, an asset whose option book the broker has closed/suspended
+      // (weekend hours, delisted, etc.) gets a full desk briefing + LLM
+      // call + a place-order attempt EVERY single cycle forever, each one
+      // rejected the same way - pure wasted spend and decision-log noise.
+      const rejectedUntil = this.assetRejectedUntil.get(asset) ?? 0
+      if (rejectedUntil > ts) {
+        this.store.recordAiTraderDecision({
+          asset, tf, direction: 'skip', confidence: 0,
+          reasoning: `broker rejected this asset recently (option book closed/suspended) - cooling down for ${Math.round((rejectedUntil - ts) / 60)} more min, cycle skipped before any analysis, no LLM call made`,
+          snapshot: [], live: this.config.live, acted: false, ts,
+        })
+        return null
+      }
       const meta = this.metaStrategyService()
       const snapshot = meta ? meta.snapshotSources(asset, tf) : []
       let price = 0
@@ -2171,6 +2201,9 @@ export class AiTraderService {
           this.emit('success', `[AI Trader] ${direction.toUpperCase()} ${asset} $${bet.amount.toFixed(2)}${bet.compound ? ` (compound ${bet.phase} roll x${bet.rollN + 1}, pot $${bet.pot.toFixed(2)})` : ''} @ ${parsed.expiryMin}min - ${parsed.reasoning} (confidence ${parsed.confidence.toFixed(0)}%, desk: ${briefing.sourcesSeen} sources reporting)`)
         } else {
           actionError = out.error ?? 'order rejected'
+          if (AI_TRADER_BROKER_UNAVAILABLE_RE.test(actionError)) {
+            this.assetRejectedUntil.set(asset, ts + AI_TRADER_UNAVAILABLE_COOLDOWN_SEC)
+          }
           this.emit('warn', `[AI Trader] wanted ${direction.toUpperCase()} ${asset} but the order was rejected: ${actionError}`)
         }
       } else if (direction !== 'skip') {

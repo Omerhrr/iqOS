@@ -37,6 +37,7 @@ import { volumeBars } from '../analytics/volumebars'
 import { computeTpo } from '../analytics/tpo'
 import { realizedUpProb } from '../analytics/ivhv'
 import { EXPIRIES_MIN } from '../analytics/nextexpiry'
+import { TECH_LADDER } from '../analytics/technicals'
 import { engineVoteSingle, type ChartEngineVote } from '../analytics/chartsignals'
 import { smcNowRead, smcAnyAgrees, ALL_SMC_KINDS } from '../analytics/smc'
 import { buildCtx } from '../strategies/custom'
@@ -924,6 +925,69 @@ export class MetaStrategyService {
       }
     } catch {
       for (const kind of ALL_SMC_KINDS) reads[`smc:${kind}`] = { direction: 'none', confidence: 0 }
+    }
+    // Technical Summary + Reversal reads PER RUNG - the bare 'technical'/
+    // 'reversal' keys above only ever give the whole-ladder consensus or
+    // the single most-urgent rung; per direct request ("the technical
+    // indicator panel at 1 sec, 2 sec, 3 sec... says strong buy... and
+    // reversal panel at 1 sec, 2sec... is not reversing") a script needs
+    // to test EACH rung independently, same 'source:<KIND>' colon
+    // convention as smc:<KIND>/nextExpiry:<E>/tickOracle:<SEC> above - the
+    // part after the colon is one of TECH_LADDER's own tf tokens (1s/2s/
+    // 3s/5s/15s/30s/1m/2m/3m/5m/...), identical rungs both panels share.
+    // ONE rowFor() call per engine feeds every rung key, same one-call-
+    // feeds-every-key shape as the tick-desk block above.
+    // Technical: direction/confidence mirror the bare 'technical' case's
+    // own formula exactly (score -1..1, confidence 40+|score|*80, clamped
+    // 100) - a STRONG BUY/STRONG SELL rung (|score|>=0.5) always reads
+    // >=80 confidence, a plain BUY/SELL (|score|>=0.15) reads 52-79, so
+    // "says strong buy" is simply `.dir == call and .conf >= 80` (or
+    // `.value >= 0.5`) while "says buy" (strong or not) is `.dir == call`.
+    try {
+      const tech = this.ctx.use<TechnicalService>('technical')
+      let priceHint = 0
+      try {
+        priceHint = this.market.getPrice(asset)
+      } catch {
+        /* rowFor handles a 0 hint */
+      }
+      const row = tech.rowFor(asset, priceHint)
+      for (const rung of TECH_LADDER) {
+        const cell = row.cells.find((c) => c.tf === rung.tf)
+        if (!cell || !cell.ok || cell.label === 'NEUTRAL') {
+          reads[`technical:${rung.tf}`] = { direction: 'none', confidence: 0 }
+          continue
+        }
+        const dir: 'call' | 'put' = cell.score >= 0 ? 'call' : 'put'
+        reads[`technical:${rung.tf}`] = { direction: dir, confidence: Math.min(100, Math.round(40 + Math.abs(cell.score) * 80)), value: cell.score }
+      }
+    } catch {
+      for (const rung of TECH_LADDER) reads[`technical:${rung.tf}`] = { direction: 'none', confidence: 0 }
+    }
+    // Reversal: same honesty rule as the bare 'reversal' case - a rung only
+    // claims a direction in its two TRADEABLE states ('reversing' now or
+    // 'confirmed'); 'calm'/'forming' honestly reads none, so "is NOT
+    // reversing" at a rung is simply `.dir == none` (or `not reversal:1s.active`).
+    try {
+      const rev = this.ctx.use<ReversalService>('reversal')
+      let priceHint = 0
+      try {
+        priceHint = this.market.getPrice(asset)
+      } catch {
+        /* rowFor handles a 0 hint */
+      }
+      const row = rev.rowFor(asset, priceHint)
+      for (const rung of TECH_LADDER) {
+        const cell = row.cells.find((c) => c.tf === rung.tf)
+        if (!cell || !cell.ok || (cell.state !== 'reversing' && cell.state !== 'confirmed') || cell.direction === 'none') {
+          reads[`reversal:${rung.tf}`] = { direction: 'none', confidence: 0 }
+          continue
+        }
+        const dir: 'call' | 'put' = cell.direction === 'up' ? 'call' : 'put'
+        reads[`reversal:${rung.tf}`] = { direction: dir, confidence: Math.min(100, Math.round(35 + Math.abs(cell.score) * 15)), value: cell.score }
+      }
+    } catch {
+      for (const rung of TECH_LADDER) reads[`reversal:${rung.tf}`] = { direction: 'none', confidence: 0 }
     }
     return reads
   }

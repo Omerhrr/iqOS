@@ -899,7 +899,7 @@ const TOOLS: ToolSpec[] = [
   },
   {
     name: 'ai_trader_configure',
-    description: 'Patch AI Trader config (same patch-whatever-fields-are-present contract as autopilot/meta-trader config) - only send the fields that changed. Common patches: {enabled:true/false}, {live:true/false} (going live means it will place REAL risk-gated orders on non-skip decisions - confirm with the user before flipping live:true, exactly like arming an autopilot bot), {scanMode, asset, selectedAssets, tf, intervalMin, stake, kind, minConfidence, expiryChoices, maxConcurrent, maxScanPerCycle, stakePlan}. Follow the same DEPLOYMENT CONFIRMATION PROTOCOL as bot_create before turning live on.',
+    description: 'Patch AI Trader config (same patch-whatever-fields-are-present contract as autopilot/meta-trader config) - only send the fields that changed, using these EXACT field names: {enabled:true/false}, {live:true/false} (going live means it will place REAL risk-gated orders on non-skip decisions - confirm with the user before flipping live:true, exactly like arming an autopilot bot), {scanMode, asset, selectedAssets, tf, intervalMin, stake, kind, minConfidence, expiryChoices, maxConcurrent, maxScanPerCycle, stakePlan, provider, appUrl}. The provider override field is named "provider" (NOT llmProvider/model) and only affects the local-fallback call path, not the primary app-side LLM choice - see AI_TRADER_KNOWLEDGE for what actually controls the primary path. Follow the same DEPLOYMENT CONFIRMATION PROTOCOL as bot_create before turning live on.',
     args: '{}',
     run: (a) => corePost('/ai_trader_config', a),
   },
@@ -2233,7 +2233,7 @@ FORCING THE GATE - the ONE way around it is bot_create/bot_toggle with force:tru
 /override (a literal prefix the USER types, stripped before it reaches you - you will instead see an "OVERRIDE MODE IS ACTIVE" directive appended to this system prompt for that one message): this IS the user's explicit "force it / proceed anyway" consent, decided up front, for that single request. In override mode, run the full validation chain the request needs without pausing between steps to ask permission, then go straight to bot_create/bot_toggle - passing force:true automatically if (and only if) the gate actually fails. You still run the real checks and still report the real numbers and verdict - override removes the back-and-forth around confirming each step, it never removes the checks themselves or the honesty about what they found. A request WITHOUT the override directive gets the normal step-by-step confirmation flow - do not treat "force"/"deploy anyway" typed in an ordinary (non-override) message as license to skip showing the failing result first.
 
 Tool protocol - follow it EXACTLY:
-- Respond with ONE JSON object and nothing else. No markdown fences, no prose outside the JSON.
+- Respond with ONE JSON object and nothing else. No markdown fences, no prose outside the JSON. NEVER use any XML/tag-based tool-call syntax (no <invoke>, <function_calls>, <tool_call> or similar tags, whatever your own native format for calling functions normally looks like) - this harness only understands the flat {"action": ..., "args": {...}} JSON shown below, and a tagged call is silently treated as "nothing ran."
 - You MAY batch several tool calls in one reply when they are independent - list them as consecutive JSON objects, each on its own line. They execute in order.
 - To call a tool: {"action": "<tool_name>", "args": {...}, "say": "one short sentence about what you're doing"}
 - Available tools:
@@ -2317,6 +2317,50 @@ function topJsonObjects(text: string): string[] {
  * Tolerates three arg styles: nested ({action, args:{...}}), flat
  * ({action, cmd:"set_tf", tf:"5m"}) and stringified ({action, args:"{...}"}).
  */
+/** Fallback for a provider that ignores the "respond with one JSON object"
+ * instruction and instead emits ITS OWN native tool-call chat-template
+ * syntax as plain text - observed live with deepseek-chat: an
+ * invoke-name="..."/parameter-name="..." XML-ish block (structurally the
+ * same invoke/parameter shape Anthropic's own tool-call format uses,
+ * apparently bled into this model's training) wrapped in odd sentinel
+ * glyphs around the tag names. Those wrapper glyphs vary/are unpredictable,
+ * so this matches on the stable substrings ("invoke name=", "parameter
+ * name=") and ignores whatever surrounds them, rather than hard-coding one
+ * exact token. Without this, the call silently "never executed" from the
+ * model's own perspective (it said so and retried identically) - the args
+ * were sitting right there in the text, just in the wrong dialect. */
+function extractXmlStyleActions(text: string): Action[] {
+  const res: Action[] = []
+  const invokeRe = /invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)(?=invoke\s+name="|$)/g
+  let m: RegExpExecArray | null
+  while ((m = invokeRe.exec(text))) {
+    const action = m[1]
+    const body = m[2]
+    const args: Record<string, unknown> = {}
+    let say: string | undefined
+    const paramRe = /parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)<[^<>]*parameter/g
+    let pm: RegExpExecArray | null
+    while ((pm = paramRe.exec(body))) {
+      const key = pm[1]
+      const raw = pm[2].trim()
+      if (key === 'say') {
+        say = raw
+        continue
+      }
+      let val: unknown = raw
+      try {
+        val = JSON.parse(raw)
+      } catch {
+        /* keep as the raw string */
+      }
+      if (key === 'args' && val && typeof val === 'object' && !Array.isArray(val)) Object.assign(args, val as Record<string, unknown>)
+      else args[key] = val
+    }
+    if (action) res.push({ action, args, say })
+  }
+  return res
+}
+
 function extractActions(text: string): Action[] {
   const cleaned = text.replace(/```json|```/g, '')
   const res: Action[] = []
@@ -2345,7 +2389,12 @@ function extractActions(text: string): Action[] {
       /* not valid json - skip */
     }
   }
-  return res
+  if (res.length) return res
+  // Nothing parsed as our own JSON protocol - try the native-tool-syntax
+  // fallback before giving up and falling through to salvageSay (which
+  // would otherwise dump the raw invoke/parameter markup as if it were
+  // narration).
+  return extractXmlStyleActions(cleaned)
 }
 
 /** Salvage narration from a reply we could not fully parse. */
