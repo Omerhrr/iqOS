@@ -138,5 +138,65 @@ ok(res.get("found") is True and res.get("pnl") == -3.2, "digital family searched
 res = run({"order_id": OID, "mode": "binary"}, FakeClient(hist_rows=[{"id": OID, "status": "closed", "pnl": "\u22123.2"}]))
 ok(res.get("pnl") == -3.2, "unicode-minus pnl parsed", str(res))
 
+# ---------------- _session_watchdog_verdict (the half-open-socket rot detector) ----------------
+# Production rot mode: TCP alive so the lib's ws flag stays green, but IQ
+# answers nothing - settlement polls keep being ATTEMPTED while nothing
+# DEMONSTRABLY succeeds. The verdict must fire on that and ONLY on that.
+NOW = 1_000_000.0
+
+# no client -> never judge
+exit_now, why = m._session_watchdog_verdict(NOW, False, None, NOW - 5)
+ok(exit_now is False, "no client -> no restart")
+
+# idle session (no attempt in the demand window) -> never judge, even with a stale ok
+exit_now, why = m._session_watchdog_verdict(NOW, True, NOW - 10_000, NOW - 10_000)
+ok(exit_now is False, "no recent demand -> no restart (idle must not be killed)")
+
+# demand is fresh but IQ has NEVER answered -> rotten, restart
+exit_now, why = m._session_watchdog_verdict(NOW, True, None, NOW - 5)
+ok(exit_now is True and "never" in why, "demand with zero ever-successful responses -> restart", why)
+
+# demand fresh, last ok older than stale_after (2min) -> rotten, restart with the age
+exit_now, why = m._session_watchdog_verdict(NOW, True, NOW - 300.0, NOW - 5)
+ok(exit_now is True and "300s ago" in why, "stale ok (300s) under fresh demand -> restart", why)
+
+# boundary: stale means strictly PAST stale_after (the kernel's health hint
+# uses the same >120 convention) - exactly 120s is the last healthy instant
+exit_now, _ = m._session_watchdog_verdict(NOW, True, NOW - 120.0, NOW - 5)
+ok(exit_now is False, "ok exactly 120s old -> not yet rotten (stale strictly past 120s)")
+exit_now, _ = m._session_watchdog_verdict(NOW, True, NOW - 120.5, NOW - 5)
+ok(exit_now is True, "ok 120.5s old -> rotten (boundary)")
+exit_now, _ = m._session_watchdog_verdict(NOW, True, NOW - 119.0, NOW - 5)
+ok(exit_now is False, "ok 119s old -> healthy (boundary)")
+
+# demand just outside the window -> idle again (a one-off attempt long ago is not demand)
+exit_now, _ = m._session_watchdog_verdict(NOW, True, None, NOW - 91.0)
+ok(exit_now is False, "attempt older than the 90s demand window -> not judged")
+
+# fresh ok under fresh demand -> healthy (the every-poll success case)
+exit_now, why = m._session_watchdog_verdict(NOW, True, NOW - 3.0, NOW - 1.0)
+ok(exit_now is False, "fresh ok under fresh demand -> healthy session")
+
+# the note helpers actually move the bookkeeping the verdict reads
+m._iq_last_ok = None
+m._iq_last_attempt = None
+m._note_iq_attempt()
+ok(m._iq_last_attempt is not None and m._iq_last_ok is None, "_note_iq_attempt stamps demand only")
+m._note_iq_ok()
+ok(m._iq_last_ok is not None, "_note_iq_ok stamps the success side")
+
+# ---------------- order_result records liveness against the fake client ----------------
+m._iq_last_ok = None
+m._iq_last_attempt = None
+res = run({"order_id": OID, "mode": "binary"}, FakeClient(hist_rows=[{"id": OID, "status": "closed", "pnl": 5}]))
+ok(m._iq_last_attempt is not None and m._iq_last_ok is not None,
+   "a successful order_result poll stamps attempt AND ok", f"{m._iq_last_attempt} / {m._iq_last_ok}")
+
+m._iq_last_ok = None
+m._iq_last_attempt = None
+res = run({"order_id": OID, "mode": "binary"}, FakeClient(raise_all=True))
+ok(m._iq_last_attempt is not None and m._iq_last_ok is None,
+   "an all-failing poll stamps attempt but NOT ok (rot signal)", f"{m._iq_last_attempt} / {m._iq_last_ok}")
+
 print(f"settlement_sidecar_unit: {pass_n} ok, {fail_n} fail")
 sys.exit(1 if fail_n else 0)

@@ -205,21 +205,98 @@ def lock_guard(timeout=None):
 # settlement polls used to sit in that queue past their HTTP timeout, every
 # single sweep, which looked EXACTLY like "IQ never confirms" from the
 # outside (silent null -> keep waiting -> forever). Portfolio calls now wait
-# on their own lock; the watchdog below covers the global bus only, but
-# every portfolio call is a bounded-wait lib call, so a stuck holder cannot
-# hang this lock indefinitely.
+# on their own lock; a stuck holder inside THIS lock is covered by
+# _portfolio_watchdog below (the "bounded-wait lib call" assumption was
+# proven wrong in production - the lib does have unbounded loops).
 _portfolio_lock = threading.Lock()
 PORTFOLIO_WAIT = 10  # seconds to ACQUIRE the portfolio lock before giving up
+
+# THE SECOND STUCK-HOLDER HOLE (found in production, docker compose logs
+# 2026-11): the global bus watchdog above covers _lock only. A lib call that
+# hangs forever INSIDE a portfolio route (unbounded busy-wait on a half-open
+# websocket - iqair's connect/timesync loops have no timeout) held
+# _portfolio_lock forever: every /order_result then waited PORTFOLIO_WAIT,
+# 503'd, and the kernel saw "sidecar busy or down" on 90+ consecutive
+# settlement polls while /health stayed green and NOTHING in the sidecar
+# logged a word (the per-lookup print never ran - the payload was never
+# reached). Same treatment as the global bus: stamp the hold, exit hard past
+# a threshold that no legitimate payload can reach (worst legit payload is
+# /order_debug: 4 types x (10s positions + 2x10s history) = 120s).
+PORTFOLIO_STUCK_EXIT_SECS = 180.0
+_portfolio_held_since = None  # ts when the current portfolio holder acquired
 
 
 @contextlib.contextmanager
 def lock_guard_for(lock, timeout=None):
+    global _portfolio_held_since
     if not lock.acquire(timeout=LOCK_WAIT_TIMEOUT if timeout is None else timeout):
         raise SidecarBusy("portfolio bus busy - another lookup is holding the lock")
+    if lock is _portfolio_lock:
+        _portfolio_held_since = time.time()
     try:
         yield
     finally:
+        if lock is _portfolio_lock:
+            _portfolio_held_since = None
         lock.release()
+
+
+def _portfolio_watchdog():
+    while True:
+        time.sleep(5)
+        if _portfolio_held_since is not None:
+            held = time.time() - _portfolio_held_since
+            if held > PORTFOLIO_STUCK_EXIT_SECS:
+                print(f"[sidecar] WATCHDOG: portfolio call held the settlement bus for {held:.0f}s "
+                      f"(hung lib call on a dead websocket) - restarting process")
+                os._exit(1)
+
+
+threading.Thread(target=_portfolio_watchdog, daemon=True).start()
+
+
+# ---- session-liveness bookkeeping: the half-open-socket rot detector ----
+# THE HOLE (found in production right after the portfolio-lock fix):
+# check_connect() only reads global_value.check_websocket_if_connect, which
+# the lib sets in on_close/on_error - NEITHER fires on a half-open socket
+# (TCP established, IQ silently stopped answering - the classic VPS <-> IQ
+# drop). The flag stayed green for HOURS while every portfolio round-trip
+# burned its full max_wait, so the old watchdog never restarted and the
+# kernel polled a corpse. Track the two things that actually matter instead:
+# the last time an IQ round-trip was ATTEMPTED (demand) and the last time one
+# DEMONSTRABLY SUCCEEDED (a parsed answer, not a flag). Lookups flowing in
+# while zero answers come out = rotten session = restart and let the keeper
+# auto-resume the saved ssid. Deliberately NOT counted as "ok": stream/RAM
+# reads (_stream_price, the tick capture loop) - they go stale exactly when
+# the socket rots, so counting them would mask the rot.
+_iq_last_ok = None       # time.time() of the last lib call that returned a real answer
+_iq_last_attempt = None  # time.time() of the last lib round-trip attempted
+
+
+def _note_iq_ok():
+    global _iq_last_ok
+    _iq_last_ok = time.time()
+
+
+def _note_iq_attempt():
+    global _iq_last_attempt
+    _iq_last_attempt = time.time()
+
+
+def _session_watchdog_verdict(now, client_present, last_ok, last_attempt,
+                              demand_window=90.0, stale_after=120.0):
+    """Pure decision table (unit-tested): True when the operator is actively
+    asking IQ for things but IQ has demonstrably answered NOTHING for
+    stale_after seconds. Idle sessions (no recent demand) are never judged -
+    an untouched-but-healthy session must not be restarted for its own sake."""
+    if not client_present:
+        return False, ""
+    if last_attempt is None or now - last_attempt > demand_window:
+        return False, ""  # no recent demand - nothing to judge
+    if last_ok is None or now - last_ok > stale_after:
+        age = "never" if last_ok is None else f"{now - last_ok:.0f}s ago"
+        return True, f"no successful IQ response since {age} while lookups are actively being attempted"
+    return False, ""
 
 
 def _lock_watchdog():
@@ -500,7 +577,17 @@ def _ws_health_monitor():
     """On a dead websocket every lib call silently pays a FULL re-login
     inside the lock (20-55s each - that is what made /price time out while
     /health stayed green). Detect a dead socket proactively and exit hard:
-    the keeper respawns in ~5s and the saved ssid auto-resumes."""
+    the keeper respawns in ~5s and the saved ssid auto-resumes.
+
+    TWO detectors, because a websocket dies in TWO ways:
+      1. flag-drop (on_close/on_error fired) - the classic check_connect()
+         read below catches it in ~30s.
+      2. HALF-OPEN socket (TCP alive, IQ silently stopped answering) - the
+         flag NEVER drops (see the liveness bookkeeping comment), which is
+         exactly how a session rotted for hours in production while every
+         portfolio poll burned its max_wait. The verdict below catches it:
+         lookups being attempted with zero successful IQ responses for 2min
+         = rotten, regardless of what the flag claims."""
     dead = 0
     time.sleep(45)  # let boot resume / first login settle
     while True:
@@ -515,6 +602,11 @@ def _ws_health_monitor():
         dead = dead + 1 if not alive else 0
         if dead >= 3:
             print("[sidecar] WATCHDOG: websocket dead ~30s - restarting for auto-resume")
+            os._exit(1)
+        rotten, why = _session_watchdog_verdict(time.time(), True, _iq_last_ok, _iq_last_attempt)
+        if rotten:
+            print(f"[sidecar] WATCHDOG: iq session rotten ({why}; ws flag says connected "
+                  f"- half-open socket) - restarting for auto-resume")
             os._exit(1)
 
 
@@ -993,6 +1085,7 @@ def _order_result_payload(body):
     order_id_raw = body.get("order_id")
     if order_id_raw is None:
         return _err("order_id required")
+    _note_iq_attempt()  # a settlement poll = live demand for IQ's books
     order_id_norm = _norm_id(order_id_raw)
     order_id_str = str(order_id_raw)
     mode = (body.get("mode") or "turbo").lower()
@@ -1131,6 +1224,8 @@ def _order_result_payload(body):
         # session) - surface that as a real error, distinct from a genuine
         # not-found-yet.
         verdict = {"found": False, "status": "unknown", "error": "all broker lookups failed (session/network)"}
+    if any_lookup_ok:
+        _note_iq_ok()  # at least one IQ call demonstrably answered - session alive
     try:
         bid = int(_gv.balance_id) if _gv is not None and getattr(_gv, "balance_id", None) is not None else "?"
     except Exception:  # noqa: BLE001
@@ -1153,6 +1248,7 @@ def _order_debug_payload(body):
     order_id_raw = body.get("order_id")
     order_id_norm = _norm_id(order_id_raw) if order_id_raw is not None else None
     wait = min(float(body.get("max_wait_sec", 4)), 10)
+    _note_iq_attempt()
     types = ["binary-option", "turbo-option", "digital-option", "blitz-option"]
     try:
         bid = int(_gv.balance_id) if _gv is not None and getattr(_gv, "balance_id", None) is not None else None
@@ -1176,6 +1272,8 @@ def _order_debug_payload(body):
         try:
             ok, data = _client.get_positions(itype, max_wait_sec=wait)
             entry["positions_ok"] = bool(ok)
+            if ok:
+                _note_iq_ok()
             rows = data.get("positions", []) if ok and isinstance(data, dict) else []
             entry["open_rows"] = len(rows)
         except Exception as exc:  # noqa: BLE001
@@ -1197,6 +1295,7 @@ def _order_debug_payload(body):
                     hist_error = "no/!dict response"
                 break
             hist_ok = True
+            _note_iq_ok()
             pages += 1
             hist_rows.extend(data2.get("positions", []) or [])
             if len(data2.get("positions", []) or []) < 50:
@@ -1342,7 +1441,26 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/health":
             connected = _client is not None
-            return self._send(_ok({"connected": connected, "assets_mapped": len(_asset_ids)}))
+            # the honest session view: flag + the liveness bookkeeping the
+            # watchdogs act on. The kernel logs this on settlement-poll
+            # streaks so "sidecar busy or down" becomes a precise diagnosis.
+            now = time.time()
+            ws_flag_ok = False
+            try:
+                ws_flag_ok = bool(_client.check_connect()) if connected else False
+            except Exception:  # noqa: BLE001
+                ws_flag_ok = False
+            return self._send(_ok({
+                "connected": connected,
+                "assets_mapped": len(_asset_ids),
+                "session": {
+                    "ws_flag": ws_flag_ok,
+                    "last_iq_ok_age_sec": (now - _iq_last_ok) if _iq_last_ok else None,
+                    "last_iq_attempt_age_sec": (now - _iq_last_attempt) if _iq_last_attempt else None,
+                    "portfolio_lock_held_sec": (now - _portfolio_held_since) if _portfolio_held_since else None,
+                    "bus_lock_held_sec": (now - _held_since) if _held_since else None,
+                },
+            }))
 
         if _client is None:
             return self._send(_err("not connected - POST /connect first"), 400)
@@ -1370,6 +1488,7 @@ class Handler(BaseHTTPRequestHandler):
             # fallback: get_financial_information round-trip (busy-waits in
             # the lib). SHORT lock wait - a price poll must never queue
             # behind a 240-bar candle pull; the kernel retries in 4s.
+            _note_iq_attempt()
             try:
                 with lock_guard(PRICE_WAIT):
                     active_id = OP_code.ACTIVES.get(canon, canon) if OP_code is not None else canon
@@ -1387,6 +1506,7 @@ class Handler(BaseHTTPRequestHandler):
                             pass
                     if price is None:
                         return self._send(_err("no price in response"), 502)
+                    _note_iq_ok()
                     return self._send(_ok({"asset": asset, "price": price, "src": "roundtrip"}))
             except SidecarBusy:
                 return self._send(_err("iqair bus busy - retry shortly"), 503)
@@ -1408,6 +1528,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/balance":
             # short lock wait: balance is polled on a 15s cadence, missing
             # one poll is harmless - blocking the bus for it is not
+            _note_iq_attempt()
             try:
                 with lock_guard(PRICE_WAIT):
                     bal = _client.get_balance()
@@ -1415,6 +1536,7 @@ class Handler(BaseHTTPRequestHandler):
                         mode = _client.get_balance_mode()
                     except Exception:  # noqa: BLE001
                         mode = None
+                    _note_iq_ok()
                     return self._send(_ok({"amount": bal, "mode": mode}))
             except SidecarBusy:
                 return self._send(_err("iqair bus busy - retry shortly"), 503)
@@ -1438,7 +1560,10 @@ class Handler(BaseHTTPRequestHandler):
                         return self._send(_err(f"unknown asset {asset}"), 400)
                     # iqair 1.0.0: get_candles(ACTIVES, interval, count, endtime)
                     # returns the candle list directly (no ok-wrapper).
+                    _note_iq_attempt()
                     data = _client.get_candles(canon, tf, size, endtime)
+                    if isinstance(data, list) and data:
+                        _note_iq_ok()
                     candles = [
                         {
                             "time": int(c.get("from", 0)),
@@ -1586,6 +1711,7 @@ class Handler(BaseHTTPRequestHandler):
                         # starved the 4s active-asset poll into timeouts).
                         # Tickers left unfetched stay uncached - the next
                         # UI poll (8s) continues where this one stopped.
+                        _note_iq_attempt()
                         budget = time.time() + 3.0
                         for t in missing:
                             if time.time() > budget:
@@ -1599,6 +1725,7 @@ class Handler(BaseHTTPRequestHandler):
                                     p = float(data[-1]["close"])
                                     _prices_cache[t] = (p, time.time())
                                     prices[t] = p
+                                    _note_iq_ok()
                             except Exception:  # noqa: BLE001
                                 pass
                 except SidecarBusy:
@@ -1621,7 +1748,10 @@ class Handler(BaseHTTPRequestHandler):
                         return self._send(_order_debug_payload(body))
                     if path == "/positions":
                         itype = body.get("instrument_type") or "turbo-option"
+                        _note_iq_attempt()
                         ok, data = _client.get_positions(itype)
+                        if ok:
+                            _note_iq_ok()
                         return self._send(_ok({"positions": data.get("positions", []) if ok and isinstance(data, dict) else []}))
                     if path == "/history":
                         itype = body.get("instrument_type") or "turbo-option"
@@ -1631,6 +1761,7 @@ class Handler(BaseHTTPRequestHandler):
                         # websocket response lands in api.position_history_v2.
                         _client.api.position_history_v2 = None
                         user_id = None
+                        _note_iq_attempt()
                         try:
                             prof = _client.get_profile()
                             if isinstance(prof, dict) and prof.get("user_id"):
@@ -1649,6 +1780,7 @@ class Handler(BaseHTTPRequestHandler):
                         raw = _client.api.position_history_v2
                         if raw is None:
                             return self._send(_err("history fetch timed out"), 504)
+                        _note_iq_ok()
                         payload = raw.get("body", raw) if isinstance(raw, dict) else raw
                         items = payload.get("positions", payload) if isinstance(payload, dict) else payload
                         return self._send(_ok({"history": items if isinstance(items, list) else []}))

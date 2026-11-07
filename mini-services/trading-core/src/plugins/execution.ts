@@ -1149,6 +1149,31 @@ export class ExecutionService {
         this.lastLiveError = `live ${pos.kind} ${pos.liveOrderId} on ${pos.asset}: broker lookup failing/timing out (${streak} consecutive unanswered polls - sidecar busy or down). Still holding, still no guesses.`
         this.ctx.log('execution', this.lastLiveError)
         this.ctx.bus.emit('alert', { level: 'warn', message: this.lastLiveError, ts: this.now() })
+        // THE PRECISE-DIAGNOSIS UPGRADE: "sidecar busy or down" used to be
+        // where the trail went cold - production sat on 90+ unanswered polls
+        // with /health green and no sidecar log line at all (the payload
+        // never ran - a hung holder had the settlement bus). The sidecar's
+        // /health now discloses its own liveness bookkeeping (last
+        // successful IQ response age, last attempt age, lock holds); log it
+        // so the docker log shows WHY it is busy-or-down, not just THAT.
+        const health = await this.getLive('/health')
+        if (!health) {
+          this.ctx.log('execution', `live ${pos.kind} ${pos.liveOrderId} on ${pos.asset}: sidecar /health unreachable - the sidecar process itself is not answering (keeper should respawn it within seconds)`)
+        } else {
+          const s = (health.session ?? {}) as Record<string, unknown>
+          const age = (v: unknown) => (typeof v === 'number' ? `${Math.round(v)}s ago` : 'never')
+          const held = (v: unknown) => (typeof v === 'number' ? `held ${Math.round(v)}s` : 'free')
+          this.ctx.log(
+            'execution',
+            `live ${pos.kind} ${pos.liveOrderId} on ${pos.asset}: sidecar self-report - ` +
+              `connected=${String(health.connected)} ws_flag=${String(s.ws_flag)} ` +
+              `last_iq_ok=${age(s.last_iq_ok_age_sec)} last_iq_attempt=${age(s.last_iq_attempt_age_sec)} ` +
+              `portfolio_lock=${held(s.portfolio_lock_held_sec)} bus_lock=${held(s.bus_lock_held_sec)}` +
+              (typeof s.last_iq_ok_age_sec === 'number' && s.last_iq_ok_age_sec > 120
+                ? ' -> IQ session looks rotten; the sidecar watchdog will restart it and auto-resume the saved session'
+                : ''),
+          )
+        }
       }
     } else {
       this.lookupFailStreak.delete(pos.id)
