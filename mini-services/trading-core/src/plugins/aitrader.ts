@@ -61,7 +61,7 @@
 // least visible at the desk; the global risk manager's other gates still
 // apply either way.
 
-import type { Candle, Timeframe, TradeKind } from '../types'
+import type { Candle, Timeframe, TradeKind, Position } from '../types'
 import type { KernelContext, Plugin } from '../kernel'
 import { Store } from '../store'
 import type { MarketDataService } from './market-data'
@@ -769,6 +769,48 @@ export function calibrationLines(rows: CalibrationRow[]): string[] {
   return lines
 }
 
+/** PRECISION FIX (operator report: "incurs a lot of losses, lets make it more
+ * precise and accurate"): calibrationLines() above was only ADVISORY text -
+ * it showed the model its own inflation pattern in the prompt but never
+ * stopped an inflating model from claiming 85% on a call that, by its own
+ * track record, only wins ~55% of the time at that confidence/direction. The
+ * minConfidence floor is a hard code-side gate, but it only ever compared
+ * against the model's SELF-reported number - a model that doesn't correct
+ * for its own documented overconfidence still clears the bar every time.
+ * This makes the correction numeric and automatic: given enough graded
+ * history in the SAME direction and the SAME confidence bucket the model
+ * just claimed, blend the claimed confidence halfway toward the REALIZED win
+ * rate whenever the model is claiming meaningfully more than its own record
+ * supports. Never adjusts upward (an underconfident model isn't the problem
+ * here) and stays silent below MIN_CALIBRATION_SAMPLE - too few samples to
+ * trust a bucket's realized rate over the model's own read. Pure function,
+ * unit-testable like calibrationLines. */
+export const MIN_CALIBRATION_SAMPLE = 8
+
+export function calibratedConfidence(
+  rows: CalibrationRow[],
+  direction: 'call' | 'put',
+  claimed: number,
+): { adjusted: number; sample: number; realized: number | null } {
+  const graded = rows.filter((r) => r.outcome === 'win' || r.outcome === 'loss')
+  // same bucket edges as calibrationLines - a claim of e.g. 78% is graded
+  // against how 75-84 calls in this direction have actually done
+  const bucket =
+    claimed >= 85 ? { lo: 85, hi: 100.001 } : claimed >= 75 ? { lo: 75, hi: 84.999 } : claimed >= 65 ? { lo: 65, hi: 74.999 } : null
+  if (!bucket) return { adjusted: claimed, sample: 0, realized: null } // below the lowest bucket - already headed for a skip, nothing to correct
+  const inBucket = graded.filter((r) => r.direction === direction && r.confidence >= bucket.lo && r.confidence <= bucket.hi)
+  const sample = inBucket.length
+  if (sample < MIN_CALIBRATION_SAMPLE) return { adjusted: claimed, sample, realized: null }
+  const wins = inBucket.filter((r) => r.outcome === 'win').length
+  const realized = (wins / sample) * 100
+  // only correct DOWNWARD, and only when the gap is big enough to be the
+  // model's own documented inflation rather than normal variance on a small
+  // sample - a 2-3 point gap isn't worth second-guessing
+  if (realized >= claimed - 10) return { adjusted: claimed, sample, realized }
+  const adjusted = Math.round(claimed * 0.5 + realized * 0.5)
+  return { adjusted: Math.min(claimed, adjusted), sample, realized }
+}
+
 // ---------------------------------------------------------------------------
 // TICK-DESK BRIEFING HELPERS - the AI trader's full tick-chart analysis, per
 // direct instruction ("full tick chart analysis, footprint, OTC footprint,
@@ -1214,6 +1256,40 @@ export class AiTraderService {
       graded.map(({ r, outcome }) => ({ direction: r.direction, confidence: r.confidence, outcome })),
     )
     return { lines, wins, losses, pending, calibration }
+  }
+
+  /** ACCOUNT-WIDE calibration sample for calibratedConfidence() above.
+   * gradeRecent() is deliberately scoped to ONE asset+tf (limit 8) for the
+   * prompt's own narrative - accurate for "what has THIS pair done" but far
+   * too thin a sample to safely base a numeric confidence haircut on (one or
+   * two rows either way would swing the bucket's realized rate wildly). The
+   * haircut instead draws on every ACTED trade across every asset/tf this
+   * trader has ever placed, graded by its REAL settlement outcome
+   * (won/lost on the position row, not a re-derivation from candles like
+   * gradeOne does for shadow-mode rows) - acted trades are exactly the
+   * population the calibration bucket needs to answer "when I claim 80%+ on
+   * a CALL, how often do I actually win," and settlement status is ground
+   * truth, not an estimate. */
+  private accountCalibrationRows(limit = 400): CalibrationRow[] {
+    let decisions: ReturnType<Store['listAiTraderDecisions']> = []
+    try {
+      decisions = this.store.listAiTraderDecisions(limit).filter((r) => r.acted && r.positionId && (r.direction === 'call' || r.direction === 'put'))
+    } catch {
+      decisions = []
+    }
+    const rows: CalibrationRow[] = []
+    for (const d of decisions) {
+      let pos: Position | null = null
+      try {
+        pos = this.store.getPosition(d.positionId!)
+      } catch {
+        pos = null
+      }
+      if (!pos) continue
+      const outcome = pos.status === 'won' ? 'win' : pos.status === 'lost' ? 'loss' : pos.status === 'open' ? 'pending' : 'ungraded'
+      rows.push({ direction: d.direction, confidence: d.confidence, outcome })
+    }
+    return rows
   }
 
   /** THE DESK BRIEFING - "an expert trader with access to all tools,
@@ -1856,15 +1932,31 @@ export class AiTraderService {
       // unchanged), never "how many candidates are we allowed to look at."
       let budget = Math.min(candidates.length, this.config.maxScanPerCycle)
       if (this.config.live) {
-        const openCount = this.store.listPositions('open').filter((p) => p.strategy === 'ai-trader').length
+        const allOpen = this.store.listPositions('open')
+        const openCount = allOpen.filter((p) => p.strategy === 'ai-trader').length
+        // DIAGNOSTIC (operator report: "max concurrent is 1 but it still
+        // trades more than one at a time without one finishing"): maxConcurrent
+        // only ever counts THIS trader's own positions (strategy ===
+        // 'ai-trader') - verified against the singleton service, the
+        // reentrancy guard, and the sequential per-candidate loop below, none
+        // of which can let AI Trader itself open a 2nd position of its own
+        // before the 1st is recorded. What a "more than one open at once" view
+        // in the UI most likely means is a DIFFERENT concurrent source - a
+        // manual TradeTicket trade, an autopilot bot, Meta-Strategy, etc. -
+        // opening its own position around the same time, which this cap was
+        // never meant to gate. Surfacing the account-wide count alongside AI
+        // Trader's own count here (and in the acted-decision log below) lets
+        // the operator tell the two apart from the decision log itself,
+        // instead of having to take my word for which positions are whose.
+        const otherOpen = allOpen.length - openCount
         const slots = Math.max(0, this.config.maxConcurrent - openCount)
         if (slots <= 0) {
           this.store.recordAiTraderDecision({
             asset: candidates[0], tf: this.config.tf, direction: 'skip', confidence: 0,
-            reasoning: `at max concurrent AI Trader position(s) (${openCount}/${this.config.maxConcurrent} open) - cycle skipped before any analysis, no LLM call made`,
+            reasoning: `at max concurrent AI Trader position(s) (${openCount}/${this.config.maxConcurrent} open)${otherOpen ? ` - ${otherOpen} OTHER non-AI-Trader position(s) also open on the account right now (manual/autopilot/meta-strategy, not capped by this setting)` : ''} - cycle skipped before any analysis, no LLM call made`,
             snapshot: [], live: this.config.live, acted: false, ts,
           })
-          this.emit('info', `[AI Trader] skipping cycle - already at max concurrent positions (${openCount}/${this.config.maxConcurrent})`)
+          this.emit('info', `[AI Trader] skipping cycle - already at max concurrent positions (${openCount}/${this.config.maxConcurrent})${otherOpen ? ` · ${otherOpen} other non-AI-Trader position(s) also open` : ''}`)
           return null
         }
       }
@@ -2190,7 +2282,24 @@ export class AiTraderService {
       // model that talks itself into high confidence on a weak setup still
       // gets overridden if the operator's own floor says no
       let direction = parsed.direction
-      if (direction !== 'skip' && parsed.confidence < this.config.minConfidence) {
+      // PRECISION FIX: before comparing to the floor, haircut the model's
+      // SELF-reported confidence against its own account-wide track record
+      // in this exact direction+bucket (see calibratedConfidence's doc
+      // comment) - a model whose claimed 85%+ CALLs have actually only won
+      // ~55% of the time no longer gets to clear minConfidence just by
+      // saying "85%" again; the number used for the gate (and recorded to
+      // the decision log) is the calibration-corrected one.
+      let effectiveConfidence = parsed.confidence
+      let calibrationNote = ''
+      if (direction === 'call' || direction === 'put') {
+        const calRows = this.accountCalibrationRows()
+        const cal = calibratedConfidence(calRows, direction, parsed.confidence)
+        if (cal.adjusted !== parsed.confidence) {
+          effectiveConfidence = cal.adjusted
+          calibrationNote = ` [calibration haircut: claimed ${parsed.confidence.toFixed(0)}% -> ${effectiveConfidence.toFixed(0)}% - this trader's own ${direction.toUpperCase()} calls at that confidence have realized ${cal.realized?.toFixed(0)}% over ${cal.sample} graded trades]`
+        }
+      }
+      if (direction !== 'skip' && effectiveConfidence < this.config.minConfidence) {
         direction = 'skip'
       }
 
@@ -2227,8 +2336,12 @@ export class AiTraderService {
       }
 
       this.store.recordAiTraderDecision({
-        asset, tf, direction, confidence: parsed.confidence, expiryMin: parsed.expiryMin,
-        reasoning: parsed.reasoning, snapshot: snapshotWithDesk, live: this.config.live, acted, positionId: positionId ?? undefined,
+        // confidence recorded (and gated on above) is the CALIBRATED number,
+        // not the model's raw claim - the decision log, the stake plan, and
+        // next cycle's own calibration bucket should all see the honest
+        // figure, not the possibly-inflated one the model said out loud
+        asset, tf, direction, confidence: effectiveConfidence, expiryMin: parsed.expiryMin,
+        reasoning: parsed.reasoning + calibrationNote, snapshot: snapshotWithDesk, live: this.config.live, acted, positionId: positionId ?? undefined,
         provider, model, error: actionError, priceAtDecision: price || undefined, ts,
       })
 
