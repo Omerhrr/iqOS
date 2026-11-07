@@ -22,6 +22,7 @@ switches to REAL unless you ask the sidecar to.
 import contextlib
 import json
 import os
+import sys
 import threading
 import time
 
@@ -45,6 +46,22 @@ except ModuleNotFoundError:
         print(f"[sidecar] WARNING: auto-install of iqair failed: {_exc}")
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+def _hard_exit(code: int) -> None:
+    """os._exit skips the stdio flush - under Docker (stdout is a pipe,
+    block-buffered) a WATCHDOG print right before a hard exit would be
+    silently swallowed, exactly when docker logs is the only evidence of
+    why the process died. Flush, then vanish. (PYTHONUNBUFFERED=1 in the
+    Dockerfile covers the normal lines; this covers the exit path even if
+    the sidecar is ever run without it.)"""
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001
+        pass
+    os._exit(code)
+
 
 # Static symbol map (symbol -> numeric active id) used to validate assets and
 # to translate the kernel's symbol strings into ids the broker API expects.
@@ -249,7 +266,7 @@ def _portfolio_watchdog():
             if held > PORTFOLIO_STUCK_EXIT_SECS:
                 print(f"[sidecar] WATCHDOG: portfolio call held the settlement bus for {held:.0f}s "
                       f"(hung lib call on a dead websocket) - restarting process")
-                os._exit(1)
+                _hard_exit(1)
 
 
 threading.Thread(target=_portfolio_watchdog, daemon=True).start()
@@ -307,7 +324,7 @@ def _lock_watchdog():
             if held > LOCK_STUCK_EXIT_SECS:
                 print(f"[sidecar] WATCHDOG: iqair call held the bus for {held:.0f}s "
                       f"(hung lib call, dead websocket) - restarting process")
-                os._exit(1)
+                _hard_exit(1)
 
 
 threading.Thread(target=_lock_watchdog, daemon=True).start()
@@ -606,7 +623,7 @@ def _session_establishment_watchdog():
             if since is not None and time.time() - since > 90:
                 print(f"[sidecar] WATCHDOG: {label} stuck >90s (lib connect busy-wait, "
                       f"IQ not answering) - restarting process to retry the session")
-                os._exit(1)
+                _hard_exit(1)
 
 
 threading.Thread(target=_session_establishment_watchdog, daemon=True).start()
@@ -641,12 +658,12 @@ def _ws_health_monitor():
         dead = dead + 1 if not alive else 0
         if dead >= 3:
             print("[sidecar] WATCHDOG: websocket dead ~30s - restarting for auto-resume")
-            os._exit(1)
+            _hard_exit(1)
         rotten, why = _session_watchdog_verdict(time.time(), True, _iq_last_ok, _iq_last_attempt)
         if rotten:
             print(f"[sidecar] WATCHDOG: iq session rotten ({why}; ws flag says connected "
                   f"- half-open socket) - restarting for auto-resume")
-            os._exit(1)
+            _hard_exit(1)
 
 
 threading.Thread(target=_ws_health_monitor, daemon=True).start()

@@ -11,5 +11,10 @@ ENV SIDECAR_HOST=0.0.0.0
 # Unusual internal port on purpose - not the default 8788 used in
 # local/Windows dev.
 ENV SIDECAR_PORT=47313
+# stdout is a pipe under Docker -> Python block-buffers it, so prints only
+# surface after ~8KB (or never, if os._exit ends the process first). Every
+# WATCHDOG line is written exactly at the moment the process is about to
+# die - force it out immediately or docker logs shows NOTHING.
+ENV PYTHONUNBUFFERED=1
 EXPOSE 47313
 CMD ["python", "iqair_sidecar.py"]
