@@ -1838,6 +1838,22 @@ export class AiTraderService {
       // any snapshot/candle/LLM work happens - answering "should it run a
       // cycle when one trade is not completed yet" with: no, not when
       // there's no room left to act on whatever it would decide.
+      //
+      // AUDIT (real deployment bug, "in selected, it's only trying one
+      // instead of checking others too"): this used to also clamp the SCAN
+      // budget itself down to the free slot COUNT (`budget =
+      // Math.min(budget, slots)`), not just gate whether there is ANY room
+      // at all. With the default maxConcurrent:1 and zero open positions,
+      // slots was always exactly 1 - so scanMode 'selected'/'global' could
+      // never analyze more than the FIRST candidate in the list, ever,
+      // regardless of maxScanPerCycle or how many assets were selected
+      // (every single logged decision landed on candidates[0]). Analyzing
+      // extra candidates is harmless on its own - it costs an LLM call, not
+      // a position - the in-loop re-check right below already stops NEW
+      // orders the moment concurrency actually fills, live, candidate by
+      // candidate. So the slot count now only answers "is there room to act
+      // on ANYTHING at all this cycle" (0 slots -> skip the whole cycle,
+      // unchanged), never "how many candidates are we allowed to look at."
       let budget = Math.min(candidates.length, this.config.maxScanPerCycle)
       if (this.config.live) {
         const openCount = this.store.listPositions('open').filter((p) => p.strategy === 'ai-trader').length
@@ -1851,7 +1867,6 @@ export class AiTraderService {
           this.emit('info', `[AI Trader] skipping cycle - already at max concurrent positions (${openCount}/${this.config.maxConcurrent})`)
           return null
         }
-        budget = Math.min(budget, slots)
       }
 
       const decisions: AiTraderDecision[] = []
