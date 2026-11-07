@@ -4,9 +4,10 @@
 // Both engines run the SAME 10-rung timeframe ladder (analytics/technicals.ts
 // TECH_LADDER), so the market-data plumbing is factored out here: native
 // deep candles for the tracked timeframes, 1m deep candles for the 3m
-// aggregation, and the raw tick buffer for the 1s/2s/3s time bars. Pure
-// data-in/data-out - no engine logic, no caching policy (each plugin owns
-// its own TTL cache).
+// aggregation, and the per-asset tick ring for the 1s/2s/3s time bars (sim:
+// the engine's 1s prints, LIVE: the real broker quotes the 4s poll lands -
+// see the DEAD SECONDS-RUNGS FIX in market-data.ts). Pure data-in/data-out -
+// no engine logic, no caching policy (each plugin owns its own TTL cache).
 
 import type { Candle } from '../types'
 import type { MarketDataService } from './market-data'

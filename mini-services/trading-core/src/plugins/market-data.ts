@@ -912,6 +912,19 @@ export class MarketDataService {
         const feedTs = asset === this.activeAsset ? this.lastFeedBarTs : (this.lastFeedBarByAsset.get(asset) ?? 0)
         if (feedTs > 0 && now - feedTs <= 150) {
           for (const tf of ALL_TIMEFRAMES) this.applyTick(asset, tf, { ts: now, price: priceData.price, vol: 0 })
+          // THE DEAD SECONDS-RUNGS FIX: this ring used to be sim-engine-only
+          // (tickAll() bailed on mode !== 'sim'), so on a LIVE IQ feed the
+          // technical/reversal panels' 1s/2s/3s rungs - which build their
+          // bars from recentTicks() - never had a single observation and sat
+          // at "warming up" forever. Every real broker quote the poll already
+          // fetches lands here too (4s cadence - the rungs' ticksPerBar
+          // disclosure shows the honest density); the sidecar's 100ms
+          // capture stays the sub-4s source for the tick-desk views.
+          const tickArr = this.ticks.get(asset)
+          if (tickArr) {
+            tickArr.push({ ts: now, price: priceData.price, vol: 0 })
+            if (tickArr.length > MAX_TICKS) tickArr.splice(0, tickArr.length - MAX_TICKS)
+          }
         }
       } else {
         void (await candleJson) // drain the in-flight candle fetch
@@ -1069,11 +1082,15 @@ export class MarketDataService {
     return this.prices.get(asset) ?? 0
   }
 
-  /** Read-only view of the SIM engine's own tick ring buffer (1s cadence,
-   * ~MAX_TICKS deep). The OTC footprint collector lazily backfills its
-   * per-asset micro-tick history from here so a fresh kernel boot doesn't
-   * start the velocity footprint from zero. NOT the live feed - live OTC
-   * ticks come from the sidecar's 100ms capture via getTickSeries(). */
+  /**
+   * Read-only view of the per-asset tick ring (sim: the engine's own 1s
+   * prints; LIVE: every real broker quote the 4s poll fetches - see the
+   * DEAD SECONDS-RUNGS FIX in pollLiveAsset). ~MAX_TICKS deep. The OTC
+   * footprint collector lazily backfills its per-asset micro-tick history
+   * from here so a fresh kernel boot doesn't start the velocity footprint
+   * from zero. Sub-4s live ticks come from the sidecar's 100ms capture via
+   * getTickSeries().
+   */
   recentTicks(asset: string, limit = 60000): { ts: number; price: number }[] {
     const arr = this.ticks.get(asset)
     if (!arr || !arr.length) return []

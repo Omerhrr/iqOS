@@ -22,6 +22,7 @@ import { getInstrument, isInstrumentOpen } from '../universe'
 import { Store } from '../store'
 import { classifyRegime } from '../analytics/regime'
 import { classifySession } from '../analytics/session'
+import { brokerSettleDecision, type BrokerLookupResult } from '../analytics/brokersettle'
 
 export interface RiskConfig {
   maxStake: number
@@ -60,6 +61,12 @@ export class ExecutionService {
   private lastCfdFeedWarnTs = 0
   // sweeps spent trying to fetch an expiry quote per position (backoff ladder)
   private expiryAttempts = new Map<string, number>()
+  // THE BLACK-HOLE FIX: consecutive /order_result polls per position that
+  // never produced ANY response (timeout, sidecar busy/down). Collapsed into
+  // the same silent "keep waiting" path as a genuine broker not-closed-yet,
+  // a saturated sidecar could stall a settlement forever with zero
+  // visibility - the streak surfaces it after 3 unanswered polls.
+  private lookupFailStreak = new Map<string, number>()
   // throttles the "live positions can't settle - IQ session down" warn to 60s
   private lastLiveGateWarnTs = 0
 
@@ -808,7 +815,7 @@ export class ExecutionService {
     void ts
   }
 
-  closePosition(id: string): { ok: boolean; position?: Position; error?: string } {
+  closePosition(id: string, opts: { force?: boolean } = {}): { ok: boolean; position?: Position; error?: string } {
     const pos = this.store.getPosition(id)
     if (!pos) return { ok: false, error: 'position not found' }
     if (pos.status !== 'open') return { ok: false, error: 'position already settled' }
@@ -826,6 +833,12 @@ export class ExecutionService {
       // closes happen BEFORE settlesAt, so the expiry sweep alone would
       // never pick them up), and a rejected sell surfaces honestly.
       if (pos.kind === 'binary' || pos.kind === 'turbo' || pos.kind === 'digital') {
+        // Operator override for the "awaiting IQ confirmation" state (a
+        // zombie the poll loop can't resolve because the sidecar never sees
+        // the row): force = one fresh broker lookup, then either IQ's own
+        // figure or an honestly-labeled $0 flat close. Never runs when the
+        // broker already reported - a racing settle() keeps ITS figure.
+        if (opts.force) return this.forceCloseLiveOption(pos)
         if (this.settlingLive.has(pos.id) || this.closingLive.has(pos.id)) {
           return { ok: false, error: 'close already requested - awaiting broker confirmation' }
         }
@@ -874,6 +887,42 @@ export class ExecutionService {
       this.settle(id, price, 'closed', pnl)
     }
     return { ok: true, position: this.store.getPosition(id) ?? undefined }
+  }
+
+  /** Operator FORCE close for a live option (the "if I force close, it must
+   * close" contract): one fresh /order_result lookup - if IQ's own closed row
+   * is there, settle from IT (fully honest, identical to the poll path); if
+   * the broker still reports nothing, record the position CLOSED FLAT ($0)
+   * under the operator's explicit instruction - the one sanctioned bypass of
+   * the "broker confirms first" contract, loudly labeled so the history row
+   * gets reconciled against the IQ trades page. A racing poll that lands a
+   * real broker figure first always wins (settle() is first-writer-wins via
+   * the store's open-status check). */
+  private forceCloseLiveOption(pos: Position): { ok: boolean; position?: Position; error?: string } {
+    this.settlingLive.add(pos.id) // re-entry guard: in-flight expiry polls no-op once settled
+    this.closingLive.delete(pos.id)
+    void (async () => {
+      try {
+        const result = pos.liveOrderId ? await this.iqOrderResult(pos.liveOrderId, pos.kind) : null
+        if (result && brokerSettleDecision(result) === 'settle-broker' && Number.isFinite(result.pnl)) {
+          this.finishLiveExpiryFromBroker(pos, result.pnl as number, result.closePrice, result.closeTime)
+          return
+        }
+        const fresh = this.store.getPosition(pos.id)
+        if (!fresh || fresh.status !== 'open') return // a racing poll settled it with the broker's own figure
+        this.ctx.bus.emit('alert', {
+          level: 'danger',
+          message: `FORCE-CLOSED ${pos.asset} ${pos.side.toUpperCase()} ${pos.kind} ${pos.liveOrderId} by operator without IQ confirmation - recorded $0 flat, reconcile this one against the IQ trades page.`,
+          ts: this.now(),
+        })
+        this.settle(pos.id, pos.entryPrice, 'closed', 0, 'force-closed by operator - no IQ confirmation to record')
+      } finally {
+        this.settlingLive.delete(pos.id)
+        this.closingLive.delete(pos.id)
+        this.expiryAttempts.delete(pos.id)
+      }
+    })()
+    return { ok: true, position: this.store.getPosition(pos.id) ?? undefined }
   }
 
   /** Ask IQ to early-sell a live option, then hand the position to the broker
@@ -1087,8 +1136,39 @@ export class ExecutionService {
       return
     }
     const result = await this.iqOrderResult(pos.liveOrderId, pos.kind)
-    if (result?.found && result.status === 'closed' && Number.isFinite(result.pnl)) {
-      this.finishLiveExpiryFromBroker(pos, result.pnl as number, result.closePrice, result.closeTime)
+    // THE BLACK-HOLE FIX: null = the HTTP call itself produced nothing
+    // (timeout, sidecar busy/down, non-JSON). It used to collapse into the
+    // same silent "keep waiting" path as a genuine broker not-closed-yet -
+    // so a saturated sidecar (its serialized bus serving candles/prices
+    // first) could stall a settlement forever with ZERO visibility. A
+    // per-position failure streak now surfaces it.
+    if (!result) {
+      const streak = (this.lookupFailStreak.get(pos.id) ?? 0) + 1
+      this.lookupFailStreak.set(pos.id, streak)
+      if (streak === 3 || (streak > 3 && streak % 30 === 0)) {
+        this.lastLiveError = `live ${pos.kind} ${pos.liveOrderId} on ${pos.asset}: broker lookup failing/timing out (${streak} consecutive unanswered polls - sidecar busy or down). Still holding, still no guesses.`
+        this.ctx.log('execution', this.lastLiveError)
+        this.ctx.bus.emit('alert', { level: 'warn', message: this.lastLiveError, ts: this.now() })
+      }
+    } else {
+      this.lookupFailStreak.delete(pos.id)
+    }
+    const decision = brokerSettleDecision(result)
+    if (decision === 'settle-broker') {
+      this.finishLiveExpiryFromBroker(pos, (result as BrokerLookupResult & { pnl: number }).pnl, result?.closePrice, result?.closeTime)
+      return
+    }
+    if (decision === 'settle-flat-unverified') {
+      // IQ's own history row EXISTS and says the trade closed, but its pnl
+      // figure couldn't be parsed. Hanging forever on a row we can see is
+      // worse than an honestly-labeled flat close: settle $0, keep the
+      // operator in the loop, never guess the sign.
+      this.ctx.bus.emit('alert', {
+        level: 'danger',
+        message: `${pos.asset} ${pos.kind} ${pos.liveOrderId}: IQ's history confirms the trade CLOSED but its pnl figure could not be parsed - settled FLAT ($0) for bookkeeping. Reconcile against the IQ trades page.`,
+        ts: this.now(),
+      })
+      this.settle(pos.id, pos.entryPrice, 'closed', 0, 'broker confirmed closed - pnl figure unreadable, reconciled flat')
       return
     }
     // The lookup itself failed (sidecar says every get_positions()/
@@ -1114,12 +1194,15 @@ export class ExecutionService {
     // log line buried in the console - still does not affect settlement.
     if (attempt === 150 || (attempt > 150 && attempt % 150 === 0)) {
       const waitedSec = this.now() - (pos.settlesAt ?? this.now())
-      this.lastLiveError = `live ${pos.kind} ${pos.liveOrderId ?? pos.id} on ${pos.asset} still awaiting IQ confirmation ${waitedSec}s past expected expiry - holding, no history recorded yet`
+      // past the 1h mark the warn escalates to danger with a concrete
+      // instruction - an 11-hour zombie must never look like normal waiting
+      const overdue = waitedSec > 3600
+      this.lastLiveError = `live ${pos.kind} ${pos.liveOrderId ?? pos.id} on ${pos.asset} still awaiting IQ confirmation ${waitedSec}s past expected expiry - holding, no history recorded yet${overdue ? ' (over 1h - check the sidecar logs / run the /order_debug diagnostic, or force-close from Positions)' : ''}`
       this.ctx.log('execution', this.lastLiveError)
       // Surface it as a visible alert (not just a log line) the first time a
       // position crosses this threshold, so a stuck settlement is noticed
       // from the existing alerts panel instead of requiring a log dig.
-      this.ctx.bus.emit('alert', { level: 'warn', message: this.lastLiveError, ts: this.now() })
+      this.ctx.bus.emit('alert', { level: overdue ? 'danger' : 'warn', message: this.lastLiveError, ts: this.now() })
     }
     // unresolved - the next 1s sweep re-asks the broker. No local guess, no
     // timeout that forces a settlement: we wait as long as it takes for IQ
@@ -1164,12 +1247,17 @@ export class ExecutionService {
   private async iqOrderResult(
     liveOrderId: string,
     kind: Position['kind']
-  ): Promise<{ found: boolean; status?: string; pnl?: number; closePrice?: number; closeTime?: number; error?: string } | null> {
+  ): Promise<BrokerLookupResult | null> {
     // CFDs have no options-family history row to match - never mislabel a
     // cfd lookup as turbo (the old map did exactly that)
     if (kind === 'cfd') return null
     const mode = kind === 'digital' ? 'digital' : kind === 'binary' ? 'binary' : kind === 'blitz' ? 'blitz' : 'turbo'
-    const res = await this.postLive('/order_result', { order_id: liveOrderId, mode, max_wait_sec: 6 }, 10_000)
+    // 30s budget: the sidecar walks get_positions() + paged history across
+    // 2-3 instrument types per lookup (tens of seconds worst case on its
+    // serialized bus). The old 10s budget aborted COMPLETE lookups into
+    // silent nulls whenever the bus was busy - the exact "awaiting IQ
+    // confirmation forever" symptom.
+    const res = await this.postLive('/order_result', { order_id: liveOrderId, mode, max_wait_sec: 4 }, 30_000)
     // null here means the HTTP call itself failed/timed out (network to the
     // sidecar, not the broker) - the caller already treats that as "keep
     // waiting, no guess". `error` below is the OTHER failure mode: the
@@ -1191,6 +1279,9 @@ export class ExecutionService {
       closePrice: Number.isFinite(cp) && cp > 0 ? cp : undefined,
       // IQ reports close_time in unix seconds (float); tolerate ms payloads
       closeTime: Number.isFinite(ct) && ct > 1e9 ? (ct > 1e12 ? ct / 1000 : ct) : undefined,
+      // the sidecar sets this when it matched IQ's own CLOSED row but could
+      // not extract a pnl number from it (see _row_outcome in the sidecar)
+      pnlUnreadable: res.pnl_unreadable === true,
       error,
     }
   }

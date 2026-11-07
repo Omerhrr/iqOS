@@ -197,6 +197,31 @@ def lock_guard(timeout=None):
         _lock.release()
 
 
+# THE SETTLEMENT-STARVATION FIX: the portfolio endpoints (/order_result,
+# /positions, /history) hit the lib's SHARED api.positions / api.position_
+# history_v2 response slots, so they must serialize among THEMSELVES - but
+# they must NOT queue behind the global iqair bus, where candle/price/trade
+# traffic holds the lock for tens of seconds at a time. The kernel's
+# settlement polls used to sit in that queue past their HTTP timeout, every
+# single sweep, which looked EXACTLY like "IQ never confirms" from the
+# outside (silent null -> keep waiting -> forever). Portfolio calls now wait
+# on their own lock; the watchdog below covers the global bus only, but
+# every portfolio call is a bounded-wait lib call, so a stuck holder cannot
+# hang this lock indefinitely.
+_portfolio_lock = threading.Lock()
+PORTFOLIO_WAIT = 10  # seconds to ACQUIRE the portfolio lock before giving up
+
+
+@contextlib.contextmanager
+def lock_guard_for(lock, timeout=None):
+    if not lock.acquire(timeout=LOCK_WAIT_TIMEOUT if timeout is None else timeout):
+        raise SidecarBusy("portfolio bus busy - another lookup is holding the lock")
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 def _lock_watchdog():
     while True:
         time.sleep(5)
@@ -408,12 +433,12 @@ except Exception:  # noqa: BLE001
     _gv = None
 
 
-def _save_session(email):
+def _save_session(email, balance_mode="PRACTICE"):
     if _gv is None or not getattr(_gv, "SSID", None):
         return
     try:
         with open(SESSION_FILE, "w") as f:
-            json.dump({"email": email, "ssid": _gv.SSID}, f)
+            json.dump({"email": email, "ssid": _gv.SSID, "balance_mode": str(balance_mode or "PRACTICE").upper()}, f)
         os.chmod(SESSION_FILE, 0o600)
         print("[sidecar] session token saved - future respawns will auto-resume")
     except Exception as exc:  # noqa: BLE001
@@ -423,7 +448,18 @@ def _save_session(email):
 def _try_resume_session():
     """Boot-time auto-resume: inject the saved ssid into the lib's global slot
     BEFORE client.connect() so api.connect() sends the ssid over a fresh
-    websocket (fast path, no credentials). Always lands on PRACTICE."""
+    websocket (fast path, no credentials).
+
+    THE WRONG-BALANCE-RESUME FIX: this used to ALWAYS land on PRACTICE. An
+    operator trading the REAL account had every sidecar respawn silently
+    re-scope the session (and therefore every portfolio.get-positions /
+    portfolio.get-history-positions user_balance_id) to the PRACTICE balance
+    - from that moment IQ's own books for the REAL trades were unreadable:
+    live positions past expiry polled "still awaiting IQ confirmation"
+    FOREVER while the trades sat closed on the real account, and nothing
+    ever errored because the queries themselves succeeded (they just queried
+    the wrong balance). The saved balance mode is now persisted at /connect
+    time and restored here, loudly."""
     global _client
     try:
         with open(SESSION_FILE) as f:
@@ -439,11 +475,19 @@ def _try_resume_session():
         if not check:
             print(f"[sidecar] session resume failed ({reason}) - manual login required")
             return False
-        client.change_balance("PRACTICE")
+        # restore the balance mode the operator actually traded on - default
+        # PRACTICE only when the saved session predates this fix
+        mode = str(saved.get("balance_mode") or "PRACTICE").upper()
+        if mode not in ("PRACTICE", "REAL"):
+            mode = "PRACTICE"
+        client.change_balance(mode)
         _client = client
-        _save_session(str(saved.get("email") or ""))
+        _save_session(str(saved.get("email") or ""), mode)
         threading.Thread(target=_seed_ids_from_init, daemon=True).start()
-        print("[sidecar] session RESUMED from saved token (no re-login needed)")
+        if mode == "REAL":
+            print("[sidecar] session RESUMED from saved token - balance_mode=REAL (restored)")
+        else:
+            print("[sidecar] session RESUMED from saved token (no re-login needed) - balance_mode=PRACTICE")
         return True
     except FileNotFoundError:
         return False
@@ -873,6 +917,319 @@ def _buy_blitz(amount, active_id, direction, duration_sec, profit_percent=80):
     return True, resp["id"], expired
 
 
+# ---------------- settlement lookup engine (moved OUT of Handler) ----------------
+#
+# THE WHY: /order_result is the kernel's ONLY authoritative settlement input
+# ("wait for IQ to report back"). Three independent failure modes used to make
+# it return {"found": false} forever for trades IQ had long since closed:
+#   1. LOCK STARVATION - the handler ran inside the global iqair bus lock,
+#      behind candle/price/trade traffic, so the kernel's HTTP poll timed out
+#      before the response ever left (silent null -> "keep waiting" -> 11h+).
+#      The route now runs under _portfolio_lock (see its comment) with the
+#      kernel polling at a 30s budget.
+#   2. WRONG BALANCE SCOPE - a respawned sidecar used to auto-resume on
+#      PRACTICE while the operator traded REAL; every portfolio query scoped
+#      to the wrong user_balance_id and came back healthy-but-empty (fixed in
+#      _try_resume_session; /order_debug below exists to prove/disprove any
+#      remaining scope mismatch in one call).
+#   3. SILENT ROW-SHAPE MISSES - ids arriving float-ized (14425223607.0),
+#      pnl figures arriving as strings ("−10.40") or under a different key
+#      were each enough to skip a row that was literally in the response.
+#      _norm_id/_num below close those classes, and a matched CLOSED row with
+#      no parseable pnl now returns an explicit pnl_unreadable verdict (the
+#      kernel settles it flat under a loud reconciliation alert) instead of
+#      silently looping forever.
+
+
+def _norm_id(v):
+    """String-normalize an id-ish field: ints, digit strings, and floats that
+    are really ints (JSON parsers hand large ids back as 14425223607.0 more
+    often than anyone would like) all collapse onto one comparable form."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int,)):
+        return str(v)
+    if isinstance(v, float):
+        return str(int(v)) if v.is_integer() else str(v)
+    s = str(v).strip()
+    try:
+        f = float(s)
+        if f.is_integer():
+            return str(int(f))
+    except (TypeError, ValueError):
+        pass
+    return s
+
+
+def _num(v):
+    """Coerce a broker numeric field that may arrive as int, float, a string
+    ("-10.40", unicode minus, thousands separators) - or garbage. Returns a
+    float or None; never raises."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v) if v == v and v not in (float("inf"), float("-inf")) else None
+    if isinstance(v, str):
+        t = v.strip().replace("\u2212", "-").replace(",", "")
+        if not t:
+            return None
+        try:
+            return float(t)
+        except ValueError:
+            return None
+    return None
+
+
+def _order_result_payload(body):
+    """Authoritative broker-side outcome for a placed order - NOT a price
+    quote compared against strike/entry ourselves. Walks the same unified
+    portfolio endpoints get_digital_position() already uses (get_positions()
+    for still-open, then get_position_history_v2() once IQ has closed it out)
+    and reports IQ's own pnl - this is what "wait for IQ to report back"
+    means: we ask the broker what actually happened instead of inferring
+    win/loss from a fetched candle/stream price."""
+    order_id_raw = body.get("order_id")
+    if order_id_raw is None:
+        return _err("order_id required")
+    order_id_norm = _norm_id(order_id_raw)
+    order_id_str = str(order_id_raw)
+    mode = (body.get("mode") or "turbo").lower()
+    wait = min(float(body.get("max_wait_sec", 6)), 20)
+    types = (
+        ["digital-option", "turbo-option", "binary-option"]
+        if mode.startswith("digital")
+        else ["blitz-option", "turbo-option", "binary-option"]
+        if mode.startswith("blitz")
+        else ["binary-option", "turbo-option"]
+        if mode.startswith("binary")
+        else ["turbo-option", "binary-option", "digital-option"]
+    )
+
+    def _row_matches(item):
+        for key in ("id", "external_id", "position_id", "order_id"):
+            if _norm_id(item.get(key)) == order_id_norm:
+                return True
+        raw_event = item.get("raw_event") or {}
+        for value in raw_event.values():
+            if isinstance(value, dict):
+                for oid in value.get("order_ids", []) or []:
+                    if _norm_id(oid) == order_id_norm:
+                        return True
+        return False
+
+    def _row_outcome(item):
+        status = item.get("status")
+        if status == "open":
+            return {"status": "open"}
+        # pnl extraction ladder: pnl -> pnl_net -> close_profit - invest.
+        # Every broker figure goes through _num(): a perfectly readable
+        # "-10.40" STRING used to be treated as no-pnl-at-all and the row
+        # skipped - forever, on every poll.
+        pnl = _num(item.get("pnl"))
+        if pnl is None:
+            pnl = _num(item.get("pnl_net"))
+        if pnl is None:
+            invest = _num(item.get("invest"))
+            close_profit = _num(item.get("close_profit"))
+            if close_profit is not None and invest is not None:
+                pnl = close_profit - invest
+        out = {"status": "closed", "close_reason": item.get("close_reason")}
+        if pnl is not None:
+            out["pnl"] = pnl
+        else:
+            # THE UNREADABLE-PNL VERDICT: IQ's own row matched and says the
+            # trade is closed, but no field carried a number we could read.
+            # Returning found:true + pnl_unreadable lets the kernel settle
+            # the position FLAT under a loud reconciliation alert instead of
+            # silently polling this same row forever.
+            out["pnl_unreadable"] = True
+            out["row_keys"] = sorted(k for k in item.keys() if k != "raw_event")
+        # THE FAKE-EXIT BUG: the kernel used to record exit_price = entry_price
+        # for every broker-settled trade (we only forwarded pnl), so the
+        # History tab's Exit column never matched IQ's own trades page. IQ's
+        # settled rows carry the settlement quote under `close_quote` -
+        # pass it through when present; the kernel sanity-bands it before use.
+        for k in ("close_quote", "close_price", "closeprice", "closePrice"):
+            v = _num(item.get(k))
+            if v is not None and v > 0:
+                out["close_price"] = v
+                break
+        for k in ("close_time", "closetime", "closeTime"):
+            v = _num(item.get(k))
+            if v is not None and v > 1e9:
+                # unix seconds expected; tolerate ms payloads
+                out["close_time"] = v / 1000 if v > 1e12 else v
+                break
+        return out
+
+    # THE DRIFT BUG this fixes: get_positions() is IQ's LIVE/OPEN-positions
+    # stream. A row for an order that just crossed its expiry second can show
+    # up there with a non-"open" status AND a close_profit/pnl already - but
+    # that number can be a PROVISIONAL read. Every CLOSED verdict comes
+    # exclusively from get_position_history_v2(), IQ's authoritative settled-
+    # trade record; get_positions() is only a fast "still genuinely open" read.
+    history_page_size = 100
+    history_max_pages = 5  # up to the 500 most-recent closed positions per instrument type
+
+    # Distinguish "we genuinely asked IQ and it said no" from "every lookup
+    # call itself failed" (session expired, network blip, rate limit) - both
+    # used to collapse into the same {"found": false}, which looks IDENTICAL
+    # to "IQ hasn't closed it yet" on the kernel side.
+    any_lookup_ok = False
+    pages_fetched = 0
+
+    def _find_in_history(itype: str):
+        nonlocal any_lookup_ok, pages_fetched
+        for page in range(history_max_pages):
+            try:
+                ok2, data2 = _client.get_position_history_v2(
+                    itype, history_page_size, page * history_page_size, max_wait_sec=wait
+                )
+            except Exception:  # noqa: BLE001
+                ok2, data2 = False, None
+            if ok2:
+                any_lookup_ok = True
+            if not (ok2 and isinstance(data2, dict)):
+                break
+            pages_fetched += 1
+            rows = data2.get("positions", []) or []
+            for item in rows:
+                if _row_matches(item):
+                    outcome = _row_outcome(item)
+                    if outcome.get("status") == "open":
+                        continue  # history row still showing open - not a verdict
+                    if "pnl" in outcome or outcome.get("pnl_unreadable"):
+                        return outcome
+            if len(rows) < history_page_size:
+                break  # reached the end of IQ's available history
+        return None
+
+    verdict = {"found": False, "status": "unknown"}
+    for itype in types:
+        try:
+            ok, data = _client.get_positions(itype, max_wait_sec=wait)
+        except Exception:  # noqa: BLE001
+            ok, data = False, None
+        if ok:
+            any_lookup_ok = True
+        if ok and isinstance(data, dict):
+            for item in data.get("positions", []) or []:
+                if _row_matches(item) and item.get("status") == "open":
+                    verdict = {"found": True, "status": "open", "instrument_type": itype}
+                    break
+        if verdict.get("found"):
+            break
+        outcome = _find_in_history(itype)
+        if outcome is not None:
+            verdict = {"found": True, "instrument_type": itype, **outcome}
+            break
+    if not verdict.get("found") and not any_lookup_ok:
+        # every get_positions()/get_position_history_v2() call across every
+        # instrument type failed outright (likely an expired/broken IQ
+        # session) - surface that as a real error, distinct from a genuine
+        # not-found-yet.
+        verdict = {"found": False, "status": "unknown", "error": "all broker lookups failed (session/network)"}
+    try:
+        bid = int(_gv.balance_id) if _gv is not None and getattr(_gv, "balance_id", None) is not None else "?"
+    except Exception:  # noqa: BLE001
+        bid = "?"
+    print(
+        f"[sidecar] order_result {order_id_str} ({mode}): "
+        f"{verdict.get('status', 'unknown')}{'/' + str(verdict.get('instrument_type')) if verdict.get('found') else ''} "
+        f"pnl={verdict.get('pnl', 'n/a')} pages={pages_fetched} balance={bid}"
+    )
+    return _ok(verdict)
+
+
+def _order_debug_payload(body):
+    """THE settlement diagnostic: for one order id (optional), report what IQ
+    ACTUALLY returns per instrument type - row counts, the newest rows' id-ish
+    fields, whether the target matched, which calls failed, and the balance id
+    every query was scoped to. One call answers "why is my live binary stuck
+    awaiting confirmation": wrong balance scope, empty history, or a row whose
+    id/pnl shape we miss - no more guesswork in docker logs."""
+    order_id_raw = body.get("order_id")
+    order_id_norm = _norm_id(order_id_raw) if order_id_raw is not None else None
+    wait = min(float(body.get("max_wait_sec", 4)), 10)
+    types = ["binary-option", "turbo-option", "digital-option", "blitz-option"]
+    try:
+        bid = int(_gv.balance_id) if _gv is not None and getattr(_gv, "balance_id", None) is not None else None
+    except Exception:  # noqa: BLE001
+        bid = None
+    try:
+        uid = None
+        try:
+            prof = _client.get_profile()
+            if isinstance(prof, dict) and prof.get("user_id"):
+                uid = int(prof["user_id"])
+        except Exception:  # noqa: BLE001
+            uid = None
+        if uid is None:
+            uid = getattr(getattr(_client, "api", None).profile, "user_id", None) if _client is not None else None
+    except Exception:  # noqa: BLE001
+        uid = None
+    report = {}
+    for itype in types:
+        entry = {}
+        try:
+            ok, data = _client.get_positions(itype, max_wait_sec=wait)
+            entry["positions_ok"] = bool(ok)
+            rows = data.get("positions", []) if ok and isinstance(data, dict) else []
+            entry["open_rows"] = len(rows)
+        except Exception as exc:  # noqa: BLE001
+            entry["positions_ok"] = False
+            entry["positions_error"] = str(exc)[:200]
+            rows = []
+        pages = 0
+        hist_rows = []
+        hist_ok = False
+        hist_error = None
+        for page in range(2):
+            try:
+                ok2, data2 = _client.get_position_history_v2(itype, 50, page * 50, max_wait_sec=wait)
+            except Exception as exc:  # noqa: BLE001
+                hist_error = str(exc)[:200]
+                break
+            if not (ok2 and isinstance(data2, dict)):
+                if not hist_ok:
+                    hist_error = "no/!dict response"
+                break
+            hist_ok = True
+            pages += 1
+            hist_rows.extend(data2.get("positions", []) or [])
+            if len(data2.get("positions", []) or []) < 50:
+                break
+        entry["history_ok"] = hist_ok
+        entry["history_pages"] = pages
+        entry["history_rows"] = len(hist_rows)
+        if hist_error:
+            entry["history_error"] = hist_error
+        matched = None
+        for item in hist_rows:
+            if order_id_norm is not None:
+                hit = any(_norm_id(item.get(k)) == order_id_norm for k in ("id", "external_id", "position_id", "order_id"))
+                raw_event = item.get("raw_event") or {}
+                if not hit and isinstance(raw_event, dict):
+                    for value in raw_event.values():
+                        if isinstance(value, dict) and any(_norm_id(o) == order_id_norm for o in value.get("order_ids", []) or []):
+                            hit = True
+                            break
+                if hit:
+                    matched = {k: item.get(k) for k in ("id", "external_id", "position_id", "status", "pnl", "close_profit", "invest", "close_quote", "close_reason") if k in item}
+                    break
+        entry["matched"] = matched
+        # id-shape sample: the newest 5 closed rows so a field-rename or
+        # float-ized id is visible at a glance
+        entry["sample_ids"] = [
+            {k: item.get(k) for k in ("id", "external_id", "position_id", "status") if k in item}
+            for item in hist_rows[:5]
+        ]
+        report[itype] = entry
+    return _ok({"order_id": order_id_raw, "balance_id": bid, "user_id": uid, "types": report})
+
+
 def _ok(data=None):
     body = {"ok": True}
     if data:
@@ -1137,9 +1494,12 @@ class Handler(BaseHTTPRequestHandler):
                     print("[sidecar] WARNING: connecting with REAL balance at user request")
                 client.change_balance(mode)
                 _client = client
-                # persist the ssid: every future keeper respawn / watchdog
-                # restart resumes from it instead of asking for credentials
-                _save_session(email)
+                # persist the ssid AND the balance mode: every future keeper
+                # respawn / watchdog restart resumes from them instead of
+                # asking for credentials - and resumes on the SAME ledger the
+                # operator actually trades (see _try_resume_session's
+                # wrong-balance-resume fix)
+                _save_session(email, mode)
                 # build the ticker -> active_id map in the background so the
                 # FIRST trade already takes the fast path (connect replies now)
                 threading.Thread(target=_seed_ids_from_init, daemon=True).start()
@@ -1244,6 +1604,58 @@ class Handler(BaseHTTPRequestHandler):
                 except SidecarBusy:
                     pass  # serve the stream/cache hits we already have
             return self._send(_ok({"prices": prices}))
+
+        # ---- portfolio endpoints: _portfolio_lock, NOT the global bus ----
+        # The settlement poll must never queue behind candle/price/trade
+        # traffic (that starvation was the silent killer - see the comment on
+        # _portfolio_lock). /order_result, /positions, /history and /order_
+        # debug share api.positions / api.position_history_v2 response slots,
+        # so they serialize among themselves HERE; they touch nothing the
+        # global-lock endpoints own.
+        if path in ("/order_result", "/positions", "/history", "/order_debug"):
+            try:
+                with lock_guard_for(_portfolio_lock, PORTFOLIO_WAIT):
+                    if path == "/order_result":
+                        return self._send(_order_result_payload(body))
+                    if path == "/order_debug":
+                        return self._send(_order_debug_payload(body))
+                    if path == "/positions":
+                        itype = body.get("instrument_type") or "turbo-option"
+                        ok, data = _client.get_positions(itype)
+                        return self._send(_ok({"positions": data.get("positions", []) if ok and isinstance(data, dict) else []}))
+                    if path == "/history":
+                        itype = body.get("instrument_type") or "turbo-option"
+                        limit = int(body.get("limit", 20))
+                        # iqair 1.0.0 moved position history to the api layer:
+                        # api.get_position_history_v2 is a command factory; the
+                        # websocket response lands in api.position_history_v2.
+                        _client.api.position_history_v2 = None
+                        user_id = None
+                        try:
+                            prof = _client.get_profile()
+                            if isinstance(prof, dict) and prof.get("user_id"):
+                                user_id = int(prof["user_id"])
+                        except Exception:  # noqa: BLE001
+                            user_id = None
+                        if user_id is None:
+                            try:
+                                user_id = int(_client.api.profile.user_id)
+                            except Exception:  # noqa: BLE001
+                                user_id = None
+                        _client.api.get_position_history_v2()(itype, limit, offset=0, user_id=user_id)
+                        deadline = time.time() + 10
+                        while _client.api.position_history_v2 is None and time.time() < deadline:
+                            time.sleep(0.1)
+                        raw = _client.api.position_history_v2
+                        if raw is None:
+                            return self._send(_err("history fetch timed out"), 504)
+                        payload = raw.get("body", raw) if isinstance(raw, dict) else raw
+                        items = payload.get("positions", payload) if isinstance(payload, dict) else payload
+                        return self._send(_ok({"history": items if isinstance(items, list) else []}))
+            except SidecarBusy:
+                return self._send(_err("portfolio bus busy - retry shortly"), 503)
+            except Exception as exc:  # noqa: BLE001
+                return self._send(_err(exc), 500)
 
         try:
             with lock_guard():
@@ -1390,204 +1802,6 @@ class Handler(BaseHTTPRequestHandler):
                         return self._send(_err(f"order rejected: {order_id}"), 502)
                     return self._send(_ok({"order_id": order_id, "mode": mode, "asset": asset, "expired": expired}))
 
-                if path == "/order_result":
-                    # Authoritative broker-side outcome for a placed order - NOT
-                    # a price quote we compare against strike/entry ourselves.
-                    # Walks the same unified portfolio endpoints get_digital_position()
-                    # already uses (get_positions() for still-open, then
-                    # get_position_history_v2() once IQ has closed it out) and
-                    # reports IQ's own pnl - this is what "wait for IQ to
-                    # report back" means: we ask the broker what actually
-                    # happened instead of inferring win/loss from a fetched
-                    # candle/stream price.
-                    #
-                    # Matching and pnl extraction are done HERE, self-contained,
-                    # rather than via iqair's position_matches_order_id()/
-                    # get_pnl() helpers: that first version shipped matched only
-                    # on "external_id", but /positions's own working consumer
-                    # (reconcileLiveMeta in the kernel, matching open orders for
-                    # the expiry/open-price true-up) has always matched on "id"
-                    # instead and works - meaning external_id was the wrong key
-                    # for this account's row shape, so every lookup silently
-                    # came back empty and this endpoint ALWAYS fell through to
-                    # the old price-based ladder, which is exactly the bug this
-                    # endpoint exists to fix. Checking every plausible id field
-                    # with a string-normalized compare (int vs str id drift is
-                    # the other way this kind of match silently fails) removes
-                    # the guesswork, and also sidesteps needing a newer iqair
-                    # version just for those two helper methods to exist at all.
-                    order_id_raw = body.get("order_id")
-                    if order_id_raw is None:
-                        return self._send(_err("order_id required"), 400)
-                    order_id_str = str(order_id_raw)
-                    mode = (body.get("mode") or "turbo").lower()
-                    wait = min(float(body.get("max_wait_sec", 6)), 20)
-                    types = (
-                        ["digital-option", "turbo-option", "binary-option"]
-                        if mode.startswith("digital")
-                        else ["blitz-option", "turbo-option", "binary-option"]
-                        if mode.startswith("blitz")
-                        else ["binary-option", "turbo-option"]
-                        if mode.startswith("binary")
-                        else ["turbo-option", "binary-option", "digital-option"]
-                    )
-
-                    def _row_matches(item):
-                        for key in ("id", "external_id", "position_id", "order_id"):
-                            v = item.get(key)
-                            if v is not None and str(v) == order_id_str:
-                                return True
-                        raw_event = item.get("raw_event") or {}
-                        for value in raw_event.values():
-                            if isinstance(value, dict):
-                                for oid in value.get("order_ids", []) or []:
-                                    if str(oid) == order_id_str:
-                                        return True
-                        return False
-
-                    def _row_outcome(item):
-                        status = item.get("status")
-                        if status == "open":
-                            return {"status": "open"}
-                        pnl = item.get("pnl")
-                        if not isinstance(pnl, (int, float)):
-                            # closed rows sometimes carry close_profit/invest
-                            # instead of a precomputed pnl - derive it the same
-                            # way the (unused) get_pnl() helper would have
-                            invest = item.get("invest")
-                            close_profit = item.get("close_profit")
-                            if isinstance(close_profit, (int, float)) and isinstance(invest, (int, float)):
-                                pnl = close_profit - invest
-                        out = {"status": "closed", "close_reason": item.get("close_reason")}
-                        if isinstance(pnl, (int, float)):
-                            out["pnl"] = pnl
-                        # THE FAKE-EXIT BUG: the kernel used to record
-                        # exit_price = entry_price for every broker-settled
-                        # trade (we only forwarded pnl), so the History tab's
-                        # Exit column never matched IQ's own trades page.
-                        # IQ's settled rows carry the settlement quote under
-                        # `close_quote` (confirmed against iqair's own
-                        # Position.from_raw: open -> current_price, closed ->
-                        # close_quote) - pass it through when present; the
-                        # kernel sanity-bands it before use.
-                        for k in ("close_quote", "close_price", "closeprice", "closePrice"):
-                            v = item.get(k)
-                            if isinstance(v, (int, float)) and v > 0:
-                                out["close_price"] = float(v)
-                                break
-                        for k in ("close_time", "closetime", "closeTime"):
-                            v = item.get(k)
-                            if isinstance(v, (int, float)) and v > 1e9:
-                                # unix seconds expected; tolerate ms payloads
-                                out["close_time"] = float(v) / 1000 if v > 1e12 else float(v)
-                                break
-                        return out
-
-                    # THE DRIFT BUG this fixes: get_positions() is IQ's LIVE/
-                    # OPEN-positions stream. A row for an order that just
-                    # crossed its expiry second can show up there with a
-                    # non-"open" status AND a close_profit/pnl already - but
-                    # that number can be a PROVISIONAL, not-yet-final read
-                    # (the backend settling a few seconds behind the stream,
-                    # a requote, an interim snapshot). The code used to treat
-                    # ANY closed-looking row found here as the verdict and
-                    # return immediately, before ever checking
-                    # get_position_history_v2() - the dedicated, immutable,
-                    # SETTLED-trade ledger. If that provisional stream read
-                    # flipped sign moments later once IQ actually finalized
-                    # it, we'd already have reported the wrong result and
-                    # the kernel would settle (and learn from) a win that
-                    # IQ itself later booked as a loss, with nothing ever
-                    # re-checking it.
-                    #
-                    # Fix: get_positions() is now used ONLY to fast-detect a
-                    # genuinely still-open position (status "open" - that
-                    # read is reliable, there is no "provisional open").
-                    # Every CLOSED verdict comes exclusively from
-                    # get_position_history_v2(), IQ's authoritative
-                    # settled-trade record. If a trade has expired but
-                    # history hasn't picked it up yet, this correctly
-                    # reports not-found for it and the kernel's existing
-                    # retry ladder (settleLiveExpiry in execution.ts) keeps
-                    # polling instead of accepting a possibly-wrong number -
-                    # exactly the "wait for IQ to report back" contract this
-                    # endpoint was built for, now actually honored.
-                    # THE LOOKBACK-WINDOW BUG: history was fetched as a single
-                    # page of the 20 most-recent closed positions (limit=20,
-                    # offset=0). On an account trading many bots/orders per
-                    # minute, a position can have more than 20 OTHER trades
-                    # close behind it before we next ask for its result - at
-                    # that point it has scrolled off page 1 forever, so this
-                    # lookup reports {"found": false} every single time even
-                    # though get_position_history_v2() genuinely has the row,
-                    # just on a later page. The kernel sees that as "IQ hasn't
-                    # closed it yet" and polls forever - exactly the "trade
-                    # closed on IQ but stuck open in iqOS" symptom. Paging
-                    # through several pages (newest first) per lookup fixes
-                    # it; stop as soon as a page comes back short, since that
-                    # means we've reached the end of IQ's own history.
-                    history_page_size = 100
-                    history_max_pages = 5  # up to the 500 most-recent closed positions per instrument type
-
-                    # Distinguish "we genuinely asked IQ and it said no" from
-                    # "every lookup call itself failed" (session expired,
-                    # network blip, rate limit). Both used to collapse into
-                    # the same {"found": false}, which looks IDENTICAL to
-                    # "IQ hasn't closed it yet" on the kernel side - a broken
-                    # session could silently stall every pending settlement
-                    # forever while execution.ts just logs "still awaiting
-                    # IQ confirmation" as if everything were normal. Tracking
-                    # whether even one lookup call succeeded lets us report
-                    # a real `error` instead when NONE did.
-                    any_lookup_ok = False
-
-                    def _find_in_history(itype: str):
-                        nonlocal any_lookup_ok
-                        for page in range(history_max_pages):
-                            try:
-                                ok2, data2 = _client.get_position_history_v2(
-                                    itype, history_page_size, page * history_page_size, max_wait_sec=wait
-                                )
-                            except Exception:  # noqa: BLE001
-                                ok2, data2 = False, None
-                            if ok2:
-                                any_lookup_ok = True
-                            if not (ok2 and isinstance(data2, dict)):
-                                break
-                            rows = data2.get("positions", []) or []
-                            for item in rows:
-                                if _row_matches(item):
-                                    outcome = _row_outcome(item)
-                                    if "pnl" in outcome:
-                                        return outcome
-                            if len(rows) < history_page_size:
-                                break  # reached the end of IQ's available history
-                        return None
-
-                    for itype in types:
-                        try:
-                            ok, data = _client.get_positions(itype, max_wait_sec=wait)
-                        except Exception:  # noqa: BLE001
-                            ok, data = False, None
-                        if ok:
-                            any_lookup_ok = True
-                        if ok and isinstance(data, dict):
-                            for item in data.get("positions", []) or []:
-                                if _row_matches(item) and item.get("status") == "open":
-                                    return self._send(_ok({"found": True, "status": "open", "instrument_type": itype}))
-                        outcome = _find_in_history(itype)
-                        if outcome is not None:
-                            return self._send(_ok({"found": True, "instrument_type": itype, **outcome}))
-                    if not any_lookup_ok:
-                        # every get_positions()/get_position_history_v2() call
-                        # across every instrument type failed outright (likely
-                        # an expired/broken IQ session) - surface that as a
-                        # real error, distinct from a genuine not-found-yet.
-                        return self._send(_ok({"found": False, "status": "unknown", "error": "all broker lookups failed (session/network)"}))
-                    # not found anywhere yet - caller's ladder decides whether to
-                    # keep polling or fall back to a price-based quote
-                    return self._send(_ok({"found": False, "status": "unknown"}))
-
                 if path == "/close_trade":
                     mode = (body.get("mode") or "turbo").lower()
                     order_id = body.get("order_id")
@@ -1611,11 +1825,6 @@ class Handler(BaseHTTPRequestHandler):
                         check, data = bool(raw), raw
                     return self._send(_ok({"closed": check, "data": data}))
 
-                if path == "/positions":
-                    itype = body.get("instrument_type") or "turbo-option"
-                    ok, data = _client.get_positions(itype)
-                    return self._send(_ok({"positions": data.get("positions", []) if ok and isinstance(data, dict) else []}))
-
                 if path == "/payouts":
                     # best-effort payout snapshot for the active asset
                     asset = body.get("asset") or "EURUSD"
@@ -1630,36 +1839,6 @@ class Handler(BaseHTTPRequestHandler):
                             except Exception:
                                 pass
                     return self._send(_ok(out))
-
-                if path == "/history":
-                    itype = body.get("instrument_type") or "turbo-option"
-                    limit = int(body.get("limit", 20))
-                    # iqair 1.0.0 moved position history to the api layer:
-                    # api.get_position_history_v2 is a command factory; the
-                    # websocket response lands in api.position_history_v2.
-                    _client.api.position_history_v2 = None
-                    user_id = None
-                    try:
-                        prof = _client.get_profile()
-                        if isinstance(prof, dict) and prof.get("user_id"):
-                            user_id = int(prof["user_id"])
-                    except Exception:  # noqa: BLE001
-                        user_id = None
-                    if user_id is None:
-                        try:
-                            user_id = int(_client.api.profile.user_id)
-                        except Exception:  # noqa: BLE001
-                            user_id = None
-                    _client.api.get_position_history_v2()(itype, limit, offset=0, user_id=user_id)
-                    deadline = time.time() + 10
-                    while _client.api.position_history_v2 is None and time.time() < deadline:
-                        time.sleep(0.1)
-                    raw = _client.api.position_history_v2
-                    if raw is None:
-                        return self._send(_err("history fetch timed out"), 504)
-                    payload = raw.get("body", raw) if isinstance(raw, dict) else raw
-                    items = payload.get("positions", payload) if isinstance(payload, dict) else payload
-                    return self._send(_ok({"history": items if isinstance(items, list) else []}))
 
             return self._send(_err(f"no POST route {path}"), 404)
         except SidecarBusy:

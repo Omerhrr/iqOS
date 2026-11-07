@@ -910,9 +910,10 @@ const TOOLS: ToolSpec[] = [
   },
   {
     name: 'close_position',
-    description: 'Close an open position early by its id.',
-    args: '{"id": "position-id"}',
-    run: (a) => corePost('/close', { id: a.id }),
+    description:
+      'Close an open position early by its id. For a LIVE option stuck "awaiting IQ confirmation" past its expiry, pass force:true - one fresh broker lookup, then IQ\'s own result if the broker now reports it, otherwise an honestly-labeled $0 flat close (reconcile that one on the IQ trades page).',
+    args: '{"id": "position-id", "force": false}',
+    run: (a) => corePost('/close', { id: a.id, force: a.force === true }),
   },
   {
     name: 'positions',

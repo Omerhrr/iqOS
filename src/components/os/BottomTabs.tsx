@@ -189,11 +189,14 @@ export default function BottomTabs(props: BottomTabsProps) {
       .finally(() => setMslSaveBusy(false))
   }
 
-  const closePos = async (id: string) => {
+  const closePos = async (id: string, force = false) => {
     try {
       // Task 58 (P2): 200-with-ok:false rejections ("position already settled")
       // used to be silently swallowed - surface them like hard failures
-      const res = await osPost<{ ok: boolean; error?: string }>('/close', { id })
+      // force: the operator override for the "awaiting IQ…" zombie state -
+      // one fresh broker lookup, then IQ's own figure or an honestly-labeled
+      // $0 flat close (the kernel's forceCloseLiveOption contract)
+      const res = await osPost<{ ok: boolean; error?: string }>('/close', { id, force })
       if (!res.ok) onError(res.error ?? 'close rejected')
       refreshPositions()
     } catch (err) {
@@ -316,9 +319,20 @@ export default function BottomTabs(props: BottomTabsProps) {
                       {fmtMoney(pnl)}
                     </Td>
                     <Td>
-                      <Button onClick={() => void closePos(p.id)} variant="outline" size="sm" className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5] hover:text-rose-400">
-                        close
-                      </Button>
+                      {awaitingBroker ? (
+                        <Button
+                          onClick={() => void closePos(p.id, true)}
+                          variant="outline"
+                          size="sm"
+                          className="h-6 animate-pulse border-amber-500/50 px-2 text-[9px] uppercase text-amber-400 hover:text-amber-300"
+                        >
+                          force close
+                        </Button>
+                      ) : (
+                        <Button onClick={() => void closePos(p.id)} variant="outline" size="sm" className="h-6 border-[#1c2739] px-2 text-[9px] uppercase text-[#7c8aa5] hover:text-rose-400">
+                          close
+                        </Button>
+                      )}
                     </Td>
                   </tr>
                 )

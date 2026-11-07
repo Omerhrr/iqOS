@@ -77,3 +77,4 @@ live/.iq_session
 __pycache__/
 *.pyc
 .sandbox-backup/
+upload/

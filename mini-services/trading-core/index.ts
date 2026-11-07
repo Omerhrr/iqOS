@@ -4087,7 +4087,10 @@ const httpServer = createServer(async (req, res) => {
       }
 
       if (path === '/close') {
-        const out = exec.closePosition(String(body.id ?? ''))
+        // force:1 = operator override for the "awaiting IQ confirmation"
+        // zombie state - one fresh broker lookup, then IQ's own figure or an
+        // honestly-labeled $0 flat close (see forceCloseLiveOption)
+        const out = exec.closePosition(String(body.id ?? ''), { force: body.force === true })
         return json(200, out)
       }
 
