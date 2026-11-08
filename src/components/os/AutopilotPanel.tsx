@@ -5,7 +5,7 @@
 // watchlist and execute through the broker; the global risk manager
 // (kill switch, daily loss, max stake) always outranks them.
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -454,17 +454,7 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, m
 
             <div>
               <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Strategy</Label>
-              <select
-                value={draft.strategyId}
-                onChange={(e) => patch({ strategyId: e.target.value })}
-                className="h-8 w-full rounded border border-[#1c2739] bg-[#101828] px-2 text-[11px] text-[#e2e8f0] outline-none focus:border-cyan-500/50"
-              >
-                {strategies.map((s) => (
-                  <option key={s.id} value={s.id}>
-                    {s.name}
-                  </option>
-                ))}
-              </select>
+              <StrategySelect strategies={strategies} value={draft.strategyId} onChange={(id) => patch({ strategyId: id })} />
             </div>
 
             <div>
@@ -1155,6 +1145,99 @@ function BotCard({
  * previously selected one is deselected - so a pool can never accumulate by
  * accident; POOL mode keeps the toggle-many behavior. Mirrors WatchlistPicker's
  * search+chip pattern. */
+/** Single-strategy searchable combobox - a type-to-filter text input with a
+ * dropdown of matches, replacing a plain <select> that forced scrolling
+ * through 80+ builtin/Lab/Meta-Strategy ids to find one by eye. Shows the
+ * picked strategy's name when closed; typing re-opens the list filtered by
+ * name or id, with the (Lab)/(Meta-Strategy, live-only) suffix visible so
+ * it's clear which kind is being picked. Click a row, or Escape/blur with no
+ * exact match, to close without losing the current selection. */
+function StrategySelect({
+  strategies,
+  value,
+  onChange,
+}: {
+  strategies: StrategyInfo[]
+  value: string
+  onChange: (id: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const [q, setQ] = useState('')
+  const rootRef = useRef<HTMLDivElement>(null)
+  const current = strategies.find((s) => s.id === value)
+
+  useEffect(() => {
+    if (!open) return
+    const onDocMouseDown = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) {
+        setOpen(false)
+        setQ('')
+      }
+    }
+    document.addEventListener('mousedown', onDocMouseDown)
+    return () => document.removeEventListener('mousedown', onDocMouseDown)
+  }, [open])
+
+  const options = useMemo(() => {
+    const query = q.trim().toLowerCase()
+    const list = query
+      ? strategies.filter((s) => s.name.toLowerCase().includes(query) || s.id.toLowerCase().includes(query))
+      : strategies
+    return list.slice(0, 80)
+  }, [strategies, q])
+
+  const pick = (id: string) => {
+    onChange(id)
+    setOpen(false)
+    setQ('')
+  }
+
+  return (
+    <div ref={rootRef} className="relative">
+      <Input
+        value={open ? q : current?.name ?? value}
+        onFocus={() => {
+          setOpen(true)
+          setQ('')
+        }}
+        onChange={(e) => {
+          setOpen(true)
+          setQ(e.target.value)
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'Escape') {
+            setOpen(false)
+            setQ('')
+            ;(e.target as HTMLInputElement).blur()
+          } else if (e.key === 'Enter' && options.length > 0) {
+            pick(options[0].id)
+          }
+        }}
+        placeholder="search strategies…"
+        className="h-8 border-[#1c2739] bg-[#101828] text-[11px] text-[#e2e8f0] placeholder:text-[#4b5a72]"
+      />
+      {open && (
+        <div className="absolute left-0 right-0 top-full z-20 mt-1 max-h-48 overflow-y-auto rounded border border-[#1c2739] bg-[#0b111c] shadow-lg">
+          {options.map((s) => (
+            <button
+              key={s.id}
+              type="button"
+              onClick={() => pick(s.id)}
+              className={`block w-full truncate px-2 py-1.5 text-left text-[11px] transition-colors ${
+                s.id === value ? 'bg-cyan-500/25 text-cyan-200' : 'text-[#dbe4f0] hover:bg-[#1c2739]'
+              }`}
+              title={s.id}
+            >
+              {s.name}
+            </button>
+          ))}
+          {options.length === 0 && <div className="px-2 py-1.5 text-[10px] text-[#4b5a72]">no strategies match</div>}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function StrategyPicker({
   strategies,
   selected,
