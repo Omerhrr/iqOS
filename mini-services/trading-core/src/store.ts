@@ -115,6 +115,10 @@ export class Store {
         id INTEGER PRIMARY KEY CHECK (id = 1),
         config TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS omni_trader_config (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        config TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS watchdog_state (
         bot_id TEXT PRIMARY KEY,
         state TEXT NOT NULL,
@@ -189,6 +193,13 @@ export class Store {
       // actually works during London/NY overlap" instead of pooling a
       // strategy's record across hours that behave completely differently.
       `ALTER TABLE positions ADD COLUMN entry_session TEXT`,
+      // price_at_decision: the price AT THE MOMENT the AI Trader decided,
+      // so a shadow-mode (non-acted) call can still be graded win/loss
+      // later by comparing this to the price at ts + expiryMin - without
+      // it there was no way to tell the model "you were right/wrong" on
+      // the vast majority of its own cycles, since shadow mode never opens
+      // a real position to read a pnl back from.
+      `ALTER TABLE ai_trader_decisions ADD COLUMN price_at_decision REAL`,
     ]) {
       try {
         this.db.run(stmt)
@@ -255,26 +266,13 @@ export class Store {
         provider TEXT,
         model TEXT,
         error TEXT,
-        price_at_decision REAL,
         ts INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_ai_trader_decisions_ts ON ai_trader_decisions(ts);
+      -- price_at_decision: see migration below (long after this table was
+      -- first shipped, so CREATE TABLE IF NOT EXISTS alone won't add it to
+      -- an already-existing database).
     `)
-    // price_at_decision: the price AT THE MOMENT the AI Trader decided, so a
-    // shadow-mode (non-acted) call can still be graded win/loss later by
-    // comparing this to the price at ts + expiryMin. BUGFIX (found by the
-    // aitrader_compound_unit fresh-DB harness): this ALTER used to run in the
-    // FIRST migration loop - BEFORE the CREATE TABLE above - so on a FRESH
-    // database it threw "no such table", was swallowed by the guarded catch,
-    // and every fresh install then booted with a decisions table missing the
-    // column: recordAiTraderDecision/listAiTraderDecisions both broke. Now
-    // the column is in the CREATE (fresh DBs) AND the guarded ALTER runs
-    // AFTER the CREATE block (databases created before the column shipped).
-    try {
-      this.db.run(`ALTER TABLE ai_trader_decisions ADD COLUMN price_at_decision REAL`)
-    } catch {
-      // column already exists - nothing to migrate
-    }
   }
 
   private seedAccount(): void {
@@ -1262,6 +1260,26 @@ export class Store {
 
   saveMetaTraderConfig(config: unknown): void {
     this.db.run('INSERT INTO meta_trader_config (id, config) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET config = excluded.config', [
+      JSON.stringify(config),
+    ])
+  }
+
+  // ---------- omni trader (plugins/omnitrader.ts) ----------
+  // Same single-row JSON-blob shape as meta trader's config above - its own
+  // table so the two engines' persisted config never collide.
+
+  getOmniTraderConfig(): unknown | null {
+    const row = this.db.query('SELECT config FROM omni_trader_config WHERE id = 1').get() as { config: string } | null
+    if (!row) return null
+    try {
+      return JSON.parse(row.config)
+    } catch {
+      return null
+    }
+  }
+
+  saveOmniTraderConfig(config: unknown): void {
+    this.db.run('INSERT INTO omni_trader_config (id, config) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET config = excluded.config', [
       JSON.stringify(config),
     ])
   }

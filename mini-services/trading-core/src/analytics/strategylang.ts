@@ -19,8 +19,46 @@
 // .call/.put, combine them with and/or/not/comparisons/arithmetic, and
 // assign the result to `call`/`put`/`confidence` - there is no loop, no
 // function definition, no I/O, no way to reach anything but the `reads`
-// map the caller hands in. Evaluation is pure and terminates in O(script
-// length) - no unbounded recursion, no host object ever exposed.
+// map (and, since MSL v2 below, the caller's optional raw-series ctx) the
+// caller hands in. Evaluation is pure and terminates in O(script length) -
+// no unbounded recursion, no host object ever exposed.
+//
+// MSL v2 ("lets make it a multipurpose lang... have all indicators, have
+// all charts and their own specs... should be able to compute anything") -
+// per direct instruction, the language now ALSO has:
+//   - a `series` value (MslSeriesValue) and `ser[-1]`/`ser[-2]`/... offset
+//     indexing (indexSeries() below), plus series methods .crossed(...)/
+//     .slope(n)/.max/min/mean/stddev(n) (seriesMethod() below);
+//   - the `ind.*` namespace (indicatorCall() below) - raw indicator
+//     PRIMITIVES (continuous series, not a boolean threshold check), reusing
+//     analytics/indicators.ts's existing implementations verbatim: rsi, ema,
+//     sma, wma, hma, kama, vwma, atr, roc, momentum, zscore, obv, cmf,
+//     forceindex, psar (single series), and macd, bb, stoch, adx, supertrend
+//     (bundles of named sub-series - .hist, .upper, .k, .plusDI, .line, ...);
+//   - `ohlc(-n)` - one historical bar's raw OHLCV + derived shape (.body,
+//     .range, .upper_wick, .lower_wick), `-1` = the latest closed bar;
+//   - `cross(a, b)` / `between(x, lo, hi)` function-call aliases.
+// This is a genuine, scoped exception to "doesn't know about candles or
+// indicators" above: `ind.*`/`ohlc()` DO need the caller's raw per-bar
+// history (EvalEnv.series, duck-typed to analytics/indicators.ts's own
+// array shapes - still no import of custom.ts/metastrategy.ts, so the
+// dependency direction this module's header describes elsewhere is
+// unchanged), and are the deliberate point where this module stops being
+// "panel verdicts only" and starts being able to express a genuinely novel
+// indicator/candle strategy, not just compose what other engines already
+// computed. Still bounded the same way as everything else here: no loop, no
+// I/O, no unbounded recursion - `ind.*` calls one existing pure function and
+// returns, same cost shape as any other primitive in this language.
+//
+// NOT yet in MSL v2 (tracked in the project's msl-v2-grammar-proposal.md,
+// not silently dropped): `foot.*`/`tick.*` raw order-flow primitives (the
+// otcv*/of* indicators above already cover much of this via ind.*),
+// `renko.*`/`range.*`/`ha.*`/`pf.*` namespaced sugar over the existing panel
+// sources (cosmetic - `renko.dir`/`renko.value` already work today), an
+// `<TF>` suffix on ind.* calls (needs market-data access threaded in, not
+// just this pair's own candles), and `state.*`/`since()` persisted state
+// (a bigger design decision - lifecycle/isolation - flagged for a separate
+// pass rather than bolted on here).
 //
 // Grammar (line-oriented; '#' to end-of-line is a comment; blank lines
 // ignored):
@@ -96,6 +134,35 @@
 // is reachable from a script the same way, so a new chart type only ever
 // needs a new `reads` key here, never a language change.
 
+// MSL v2's `ind.*` namespace (indicatorCall(), further below) is a thin
+// script-callable wrapper over these EXISTING array-returning
+// implementations - aliased on import (never renamed in indicators.ts
+// itself) purely to keep this module's own helper names (rsi/ema/sma/...
+// would otherwise shadow nothing here, but the alias makes "this came from
+// indicators.ts, unmodified" unmistakable at every call site below).
+import {
+  rsi as rsiInd,
+  ema as emaInd,
+  sma as smaInd,
+  wma as wmaInd,
+  hma as hmaInd,
+  kama as kamaInd,
+  vwma as vwmaInd,
+  atr as atrInd,
+  roc as rocInd,
+  mom as momInd,
+  zscoreSeries as zscoreInd,
+  obv as obvInd,
+  cmf as cmfInd,
+  forceIndex as forceIndexInd,
+  parabolicSar as parabolicSarInd,
+  macd as macdInd,
+  bollinger as bollingerInd,
+  stochastic as stochasticInd,
+  adx as adxInd,
+  supertrend as supertrendInd,
+} from './indicators'
+
 export interface MslSourceRead {
   direction: 'call' | 'put' | 'none'
   confidence: number // 0..100
@@ -131,7 +198,143 @@ function isReadValue(v: unknown): v is MslReadValue {
   return typeof v === 'object' && v !== null && (v as MslReadValue).__mslRead === true
 }
 
-export type MslValue = number | boolean | string | MslReadValue
+/** MSL v2: a rolling numeric series (e.g. `ind.rsi(14)`) - chronological
+ * ascending, same convention as EvalCtx's own close/high/low/... arrays
+ * (last element = the latest closed bar). `[-1]`/`[-2]`/... index FROM that
+ * latest end: `ser[-1]` = values[length-1] (latest), `ser[-2]` = one bar
+ * back, etc - see indexSeries() below for the exact mapping. Tagged the
+ * same way MslReadValue is, so evalExpr's existing "is this a composite
+ * value, not a plain number" guards (truthy/asNum) extend to it for free. */
+export interface MslSeriesValue {
+  readonly __mslSeries: true
+  values: number[]
+}
+
+function seriesValue(values: number[]): MslSeriesValue {
+  return { __mslSeries: true, values }
+}
+
+function isSeriesValue(v: unknown): v is MslSeriesValue {
+  return typeof v === 'object' && v !== null && (v as MslSeriesValue).__mslSeries === true
+}
+
+/** MSL v2: one historical bar's OHLCV + derived shape, from `bar(-n)`.
+ * Field access only (`.o`/`.open`, `.h`/`.high`, `.l`/`.low`, `.c`/`.close`,
+ * `.v`/`.volume`, `.body`, `.range`, `.upper_wick`, `.lower_wick`) - see
+ * fieldOf() below. */
+export interface MslBarValue {
+  readonly __mslBar: true
+  o: number
+  h: number
+  l: number
+  c: number
+  v: number
+  body: number
+  range: number
+  upperWick: number
+  lowerWick: number
+}
+
+function isBarValue(v: unknown): v is MslBarValue {
+  return typeof v === 'object' && v !== null && (v as MslBarValue).__mslBar === true
+}
+
+/** MSL v2: a named bundle of sub-values, for an indicator call that
+ * naturally returns more than one series (`ind.macd(12,26,9)` ->
+ * `{macd, signal, hist}`, `ind.bb(20,2)` -> `{upper, mid, lower, width,
+ * percentB}`, `ind.stoch(14,3,3)` -> `{k, d}`, `ind.adx(14)` -> `{adx,
+ * plusDI, minusDI}`, `ind.supertrend(10,3)` -> `{line, dir}`). Each named
+ * field is itself a full MslValue (almost always a series) - `.field`
+ * access just looks the name up, see fieldOf() below. */
+export interface MslBundleValue {
+  readonly __mslBundle: true
+  fields: Record<string, MslValue>
+}
+
+function bundleValue(fields: Record<string, MslValue>): MslBundleValue {
+  return { __mslBundle: true, fields }
+}
+
+function isBundleValue(v: unknown): v is MslBundleValue {
+  return typeof v === 'object' && v !== null && (v as MslBundleValue).__mslBundle === true
+}
+
+/** Any non-plain MSL value - a source/signal read, a series, a bar, or a
+ * bundle. None of these can be used directly as a number/boolean (compare,
+ * add, "and"/"or") - a script must narrow to a plain value first, via
+ * `.field` (read/bar/bundle) or `[n]`/`.method()` (series). Centralizes the
+ * guard truthy()/asNum() both already had for reads alone. */
+function isComposite(v: unknown): v is MslReadValue | MslSeriesValue | MslBarValue | MslBundleValue {
+  return isReadValue(v) || isSeriesValue(v) || isBarValue(v) || isBundleValue(v)
+}
+
+export type MslValue = number | boolean | string | MslReadValue | MslSeriesValue | MslBarValue | MslBundleValue
+
+/** The raw per-bar history a script's `ind.*`/`bar(-n)` primitives read
+ * from - chronological ascending, index n-1 = the latest CLOSED bar, same
+ * shape/convention strategies/custom.ts's EvalCtx already uses for its own
+ * close/high/low/open/volume/atr/body/range arrays (passed in directly,
+ * duck-typed - this module still never imports custom.ts, same dependency-
+ * isolation this file's header already explains for the reads map). Optional
+ * everywhere: a caller with no candle history (or one that only wants the
+ * panel-source side of the language) simply omits it, and `ind.*`/`bar()`
+ * fail closed with a clear error instead of silently reading nothing. */
+export interface MslSeriesCtx {
+  open: number[]
+  high: number[]
+  low: number[]
+  close: number[]
+  volume: number[]
+}
+
+/** Bundles the three things every evalExpr/explainExpr call threads through
+ * unchanged (the static `reads` map, the signal-function `resolve`r, and the
+ * optional raw-series `series` ctx) into one object, so a deeper recursive
+ * call is `(subExpr, env, ctx)` instead of three positional params that have
+ * to be repeated correctly at every call site. */
+export interface EvalEnv {
+  reads: Record<string, MslSourceRead>
+  resolve?: MslSignalResolver
+  series?: MslSeriesCtx
+  /** MSL v2: the optional trailing timeframe string on `ind.*(...)`/
+   * `ohlc(-n, tf)` ("5m", "1h", ...) - looks up (and the caller is expected
+   * to cache) that timeframe's OWN MslSeriesCtx, fetched from a SEPARATE
+   * candle history than this pair's native tf. Undefined means the caller
+   * built no cross-timeframe support (e.g. a context with only panel
+   * reads) - a TF-suffixed call then fails closed with a clear error, same
+   * convention as `series` being absent. Returning undefined for an
+   * unrecognized/unavailable tf (vs throwing) lets the caller distinguish
+   * "no cross-TF support at all" from "that specific tf has no data yet" -
+   * both still fail the call closed, just with a more specific message. */
+  seriesFor?: (tf: string) => MslSeriesCtx | undefined
+  /** MSL v2/omni-trader: the CURRENTLY FORMING (unclosed) bar's OHLCV-so-
+   * far, snapshotted at evaluation time - a `live()` call reads this.
+   * Deliberately separate from `series`/`ohlc()` (which only ever see
+   * CLOSED, settled bars - that guarantee stays intact for every existing
+   * script): a caller that wants sub-bar reactivity passes this in
+   * ADDITIONALLY, it never replaces the closed-bar series. Undefined
+   * (every caller except the omni-trader) means `live()` fails closed. */
+  liveBar?: MslBarValue
+  /** MSL v2/omni-trader: the raw tick buffer (price-change events, ms
+   * timestamps, chronological ascending) backing the `tick.*` namespace -
+   * real broker tick data (see plugins/otcfootprint.ts), not a candle-
+   * bucket aggregate. Undefined means no live tick feed was wired in (the
+   * normal case for every evaluator except the omni-trader) - `tick.*`
+   * calls then fail closed with a clear error, same convention as
+   * `series`/`liveBar` being absent. */
+  liveTicks?: readonly { ts: number; price: number }[]
+  /** Wall-clock "now" (ms) that `tick.*` windows are measured back FROM.
+   * AUDIT FIX: measuring back from the LAST TICK'S OWN timestamp instead
+   * (the first version of this) can never detect a real stall - if ticks
+   * genuinely stop arriving, the buffer's last entry stops advancing, but
+   * the window just before it still has the same old ticks in it forever,
+   * so "velocity dropped to zero 3 seconds ago" would never show up no
+   * matter how long the real stall lasts. Measuring from actual wall-clock
+   * now means a stall becomes visible as soon as it's been quiet for
+   * `windowSec`. Defaults to Date.now() when ticks are supplied but this
+   * isn't (set explicitly for a deterministic replay/test). */
+  liveNowMs?: number
+}
 
 /** Resolves a function call the core language doesn't itself know (i.e.
  * not one of avg/sum/min/max/count/abs) into a source read - this is how
@@ -169,7 +372,7 @@ export interface MslEvalResult {
 // ---------- tokenizer ----------
 
 type TokKind =
-  | 'num' | 'str' | 'ident' | 'dot' | 'comma' | 'lparen' | 'rparen' | 'eq_assign'
+  | 'num' | 'str' | 'ident' | 'dot' | 'comma' | 'lparen' | 'rparen' | 'lbracket' | 'rbracket' | 'eq_assign'
   | 'eqeq' | 'neq' | 'gte' | 'lte' | 'gt' | 'lt' | 'plus' | 'minus' | 'star' | 'slash'
   | 'and' | 'or' | 'not' | 'let' | 'call_kw' | 'put_kw' | 'when' | 'confidence_kw'
   | 'expiry_kw' | 'configure_kw' | 'eof'
@@ -281,6 +484,16 @@ function tokenize(src: string): Token[] {
         i++
         continue
       }
+      if (c === '[') {
+        toks.push({ kind: 'lbracket', value: '[', line: li + 1 })
+        i++
+        continue
+      }
+      if (c === ']') {
+        toks.push({ kind: 'rbracket', value: ']', line: li + 1 })
+        i++
+        continue
+      }
       if (c === '=' && line[i + 1] === '=') {
         toks.push({ kind: 'eqeq', value: '==', line: li + 1 })
         i += 2
@@ -356,6 +569,16 @@ type Expr =
   | { t: 'unary'; op: 'not' | 'neg'; e: Expr }
   | { t: 'bin'; op: 'and' | 'or' | '==' | '!=' | '>=' | '<=' | '>' | '<' | '+' | '-' | '*' | '/'; l: Expr; r: Expr }
   | { t: 'call'; fn: string; args: Expr[] }
+  /** MSL v2: `ser[-1]` - idx must evaluate to a (usually negative, whole)
+   * number; see indexSeries() for the exact "-1 = latest" mapping. */
+  | { t: 'index'; obj: Expr; idx: Expr }
+  /** MSL v2: `obj.name(args)` - a dotted call, distinct from plain `.field`
+   * access (no parens). Covers BOTH a namespace pseudo-call where `obj` is
+   * a bare `ind`/`foot`/`tick` identifier never meant to be evaluated on
+   * its own (methodCall() below special-cases those before touching `obj`
+   * at all), and a real series/bar method call (`ser.crossed(...)`,
+   * `ser.slope(5)`) where `obj` IS evaluated normally first. */
+  | { t: 'method'; obj: Expr; name: string; args: Expr[] }
 
 type Stmt =
   | { kind: 'let'; name: string; expr: Expr }
@@ -369,7 +592,19 @@ export interface MslAst {
   stmts: Stmt[]
 }
 
-const FIELDS = new Set(['dir', 'direction', 'conf', 'confidence', 'active', 'call', 'put', 'value'])
+// Read fields (unchanged) PLUS bar fields (MslBarValue) PLUS the named
+// sub-fields the ind.* bundle indicators return (MslBundleValue) - all in
+// one flat set the PARSER checks for an early typo-catch; which subset
+// actually applies to a given value is a RUNTIME question (fieldOf()
+// throws a clear "not valid on this kind of value" error there), same
+// split every other type error in this language already uses.
+const FIELDS = new Set([
+  'dir', 'direction', 'conf', 'confidence', 'active', 'call', 'put', 'value',
+  // bar (MslBarValue)
+  'o', 'open', 'h', 'high', 'l', 'low', 'c', 'close', 'v', 'volume', 'body', 'range', 'upper_wick', 'lower_wick',
+  // bundle sub-fields across every ind.* multi-series indicator
+  'macd', 'signal', 'hist', 'upper', 'mid', 'lower', 'width', 'percentB', 'k', 'd', 'adx', 'plusDI', 'minusDI', 'line',
+])
 // Core arithmetic funcs (avg/sum/min/max/count/abs) are no longer special-
 // cased at PARSE time - any identifier followed by "(" parses as a call
 // (see parsePrimary's doc comment). evalExpr's 'call' case still handles
@@ -526,27 +761,66 @@ class Parser {
     }
     return this.parseAtom()
   }
-  // Postfix ".field" is now generic: it applies to ANY primary expression
-  // (a bare source identifier, same as always, OR a function call like
-  // `candle('Bullish Engulfing', call).dir` - see MslSignalResolver's doc
-  // comment above for why calls can now produce field-able values too).
+  // Postfix chain, generic over ANY primary expression (a bare source
+  // identifier, a function call like `candle(...)`, now also a series or
+  // bar expression):
+  //   ".field"      - field access, no parens (read/bar/bundle - FIELDS
+  //                   whitelist below, fieldOf() does the real per-kind
+  //                   check at eval time)
+  //   ".name(args)" - a dotted METHOD call (MSL v2: ind.rsi(14),
+  //                   ser.crossed(...), ser.slope(5), ...) - distinct AST
+  //                   node from plain field access since it takes args and
+  //                   its name isn't restricted to the FIELDS whitelist
+  //                   (methodCall()/the ind.* namespace own their own name
+  //                   lists, checked at eval time for a clearer error).
+  //   "[idx]"       - series indexing (MSL v2: ser[-1]) - idx is itself a
+  //                   full expression so `ser[-n]` with a let-bound `n`
+  //                   works too.
   private parseAtom(): Expr {
     let e = this.parsePrimary()
-    while (this.peek().kind === 'dot') {
-      this.next()
-      // AUDIT FIX (caught by scripts/msl_unit.ts): `.call` / `.put` are
-      // documented FIELDS (fieldOf implements them, the grammar comment
-      // lists them), but `call`/`put` tokenize as KEYWORDS everywhere - so
-      // expect('ident') here rejected them and EVERY script using the
-      // documented `oracle.call` / `accute.put` shape failed to parse.
-      // Accept the two direction keywords as field names; the value slot
-      // carries the literal word either way.
-      const ft = this.next()
-      const fieldKw = ft.kind === 'call_kw' || ft.kind === 'put_kw'
-      if (ft.kind !== 'ident' && !fieldKw)
-        throw new MslSyntaxError(`line ${ft.line}: unknown field ".${ft.value}" - use dir/direction/conf/confidence/active/call/put/value`)
-      if (!FIELDS.has(ft.value)) throw new MslSyntaxError(`line ${ft.line}: unknown field ".${ft.value}" - use dir/direction/conf/confidence/active/call/put/value`)
-      e = { t: 'field', obj: e, field: ft.value }
+    for (;;) {
+      if (this.peek().kind === 'dot') {
+        this.next()
+        // AUDIT FIX (caught by scripts/msl_unit.ts): `.call` / `.put` are
+        // documented FIELDS (fieldOf implements them, the grammar comment
+        // lists them), but `call`/`put` tokenize as KEYWORDS everywhere - so
+        // expect('ident') here rejected them and EVERY script using the
+        // documented `oracle.call` / `accute.put` shape failed to parse.
+        // Accept the two direction keywords as field names; the value slot
+        // carries the literal word either way.
+        const ft = this.next()
+        const fieldKw = ft.kind === 'call_kw' || ft.kind === 'put_kw'
+        if (ft.kind !== 'ident' && !fieldKw)
+          throw new MslSyntaxError(`line ${ft.line}: unknown field/method ".${ft.value}"`)
+        if (this.peek().kind === 'lparen') {
+          // a dotted call - name isn't checked against FIELDS (methods
+          // have their own vocabulary, validated at eval time by
+          // methodCall()/the ind./foot./tick. namespace dispatchers).
+          this.next()
+          const args: Expr[] = []
+          if (this.peek().kind !== 'rparen') {
+            args.push(this.parseOr())
+            while (this.peek().kind === 'comma') {
+              this.next()
+              args.push(this.parseOr())
+            }
+          }
+          this.expect('rparen')
+          e = { t: 'method', obj: e, name: ft.value, args }
+          continue
+        }
+        if (!FIELDS.has(ft.value)) throw new MslSyntaxError(`line ${ft.line}: unknown field ".${ft.value}" - use dir/direction/conf/confidence/active/call/put/value, a bar field (o/h/l/c/v/body/range/upper_wick/lower_wick), or an indicator bundle field (macd/signal/hist/upper/mid/lower/width/percentB/k/d/adx/plusDI/minusDI/line)`)
+        e = { t: 'field', obj: e, field: ft.value }
+        continue
+      }
+      if (this.peek().kind === 'lbracket') {
+        this.next()
+        const idx = this.parseOr()
+        this.expect('rbracket')
+        e = { t: 'index', obj: e, idx }
+        continue
+      }
+      break
     }
     return e
   }
@@ -609,45 +883,406 @@ export function parseStrategyScript(src: string): { ok: true; ast: MslAst } | { 
 
 class MslRuntimeError extends Error {}
 
+/** Human-readable name for an error message - "a series (ind.rsi(...) result)",
+ * "a bar (ohlc(...) result)", etc - instead of the raw tagged object. */
+function compositeKind(v: unknown): string {
+  if (isReadValue(v)) return 'a source/signal value'
+  if (isSeriesValue(v)) return 'a series (ind.* result)'
+  if (isBarValue(v)) return 'a bar (ohlc() result)'
+  if (isBundleValue(v)) return 'an indicator bundle (ind.macd/bb/stoch/adx/supertrend result)'
+  return 'this value'
+}
+
 function truthy(v: MslValue): boolean {
-  if (isReadValue(v)) throw new MslRuntimeError('a source/signal value can\'t be used directly - access .dir/.conf/.active/.call/.put instead')
+  if (isComposite(v)) throw new MslRuntimeError(`${compositeKind(v)} can't be used directly - access .dir/.conf/.active/.call/.put (read), a field (bar/bundle), or [n]/.method() (series) instead`)
   if (typeof v === 'boolean') return v
   if (typeof v === 'number') return v !== 0
   return v !== 'none' && v !== ''
 }
 
 function asNum(v: MslValue): number {
-  if (isReadValue(v)) throw new MslRuntimeError('a source/signal value can\'t be used directly - access .conf (or .dir/.active/.call/.put) instead')
+  if (isComposite(v)) throw new MslRuntimeError(`${compositeKind(v)} can't be used directly - access .conf/.value (read), a field (bar/bundle), or [n] (series) instead`)
   if (typeof v === 'number') return v
   if (typeof v === 'boolean') return v ? 1 : 0
   throw new MslRuntimeError(`expected a number, got "${v}"`)
 }
 
-function fieldOf(read: MslSourceRead, field: string): MslValue {
+/** Dispatches `.field` by the OBJECT's actual kind - a read's dir/conf/
+ * active/call/put/value (unchanged), a bar's OHLCV + shape, or a bundle's
+ * named sub-value (ind.macd(...).hist, ind.bb(...).upper, ...). The parser's
+ * FIELDS set is a flat early typo-catch across all three; this is where a
+ * name that's valid for the WRONG kind (e.g. ".body" on a read) gets its
+ * real, specific error. */
+function fieldOf(val: MslValue, field: string): MslValue {
+  if (isBundleValue(val)) {
+    if (!(field in val.fields)) throw new MslRuntimeError(`"${compositeKind(val)}" has no field ".${field}"`)
+    return val.fields[field]
+  }
+  if (isBarValue(val)) {
+    switch (field) {
+      case 'o':
+      case 'open':
+        return val.o
+      case 'h':
+      case 'high':
+        return val.h
+      case 'l':
+      case 'low':
+        return val.l
+      case 'c':
+      case 'close':
+        return val.c
+      case 'v':
+      case 'volume':
+        return val.v
+      case 'body':
+        return val.body
+      case 'range':
+        return val.range
+      case 'upper_wick':
+        return val.upperWick
+      case 'lower_wick':
+        return val.lowerWick
+      default:
+        throw new MslRuntimeError(`a bar has no field ".${field}" - use o/open, h/high, l/low, c/close, v/volume, body, range, upper_wick, lower_wick`)
+    }
+  }
+  if (isSeriesValue(val)) throw new MslRuntimeError(`a series has no ".${field}" field - index it with "[n]" or call a method like ".crossed(...)"/".slope(n)"`)
+  if (!isReadValue(val)) throw new MslRuntimeError(`".${field}" needs a source, signal, bar or indicator-bundle value, not "${val}"`)
   switch (field) {
     case 'dir':
     case 'direction':
-      return read.direction
+      return val.direction
     case 'conf':
     case 'confidence':
-      return read.confidence
+      return val.confidence
     case 'active':
-      return read.direction !== 'none'
+      return val.direction !== 'none'
     case 'call':
-      return read.direction === 'call'
+      return val.direction === 'call'
     case 'put':
-      return read.direction === 'put'
+      return val.direction === 'put'
     case 'value':
       // the source's own headline number in its native scale; a source
       // without one honestly reads 0 (documented per source in the reads
       // map builder - never a fabricated default)
-      return read.value !== undefined && Number.isFinite(read.value) ? read.value : 0
+      return val.value !== undefined && Number.isFinite(val.value) ? val.value : 0
     default:
       throw new MslRuntimeError(`unknown field ".${field}"`)
   }
 }
 
-function evalExpr(e: Expr, env: Record<string, MslValue>, reads: Record<string, MslSourceRead>, resolve?: MslSignalResolver): MslValue {
+/** `ser[-1]` = the latest value, `ser[-2]` = one bar back, etc - same
+ * "-1 = latest" convention as the grammar proposal. `values` is stored
+ * chronological ascending (last element = latest), so offset `k` (expected
+ * <= 0) maps to `values.length - 1 + (k + 1)` = `values.length + k`. Throws
+ * (fail-closed, same convention as every other "no data here" case in this
+ * language) rather than returning NaN, both for a genuinely out-of-range
+ * offset and for a value that's still NaN (indicator warmup window). */
+function indexSeries(s: MslSeriesValue, offset: number): number {
+  const i = s.values.length + Math.trunc(offset)
+  if (i < 0 || i >= s.values.length) throw new MslRuntimeError(`series index [${offset}] out of range - only ${s.values.length} bar(s) of history available`)
+  const v = s.values[i]
+  if (!Number.isFinite(v)) throw new MslRuntimeError(`series value at [${offset}] isn't available yet (indicator warmup / thin history)`)
+  return v
+}
+
+/** Last `n` FINITE values off the tail of a series (dropping NaN warmup
+ * entries) - the window `.max/.min/.mean/.stddev(n)` compute over. Throws
+ * if nothing finite is in that window at all (fail-closed). */
+function lastFiniteWindow(values: number[], n: number): number[] {
+  const window = Math.max(1, Math.trunc(n))
+  const tail = values.slice(Math.max(0, values.length - window))
+  const finite = tail.filter((v) => Number.isFinite(v))
+  if (!finite.length) throw new MslRuntimeError(`not enough history for a ${window}-bar window yet`)
+  return finite
+}
+
+/** Simple least-squares slope over a window of values, index-as-x (0..n-1) -
+ * same idea strategies/custom.ts's own 'slope' indicator (linreg slope/ATR)
+ * uses, exposed raw here so a script can scale/compare it itself. */
+function linRegSlope(values: number[]): number {
+  const n = values.length
+  if (n < 2) return 0
+  const mx = (n - 1) / 2
+  const my = values.reduce((a, b) => a + b, 0) / n
+  let num = 0
+  let den = 0
+  for (let i = 0; i < n; i++) {
+    const dx = i - mx
+    num += dx * (values[i] - my)
+    den += dx * dx
+  }
+  return den === 0 ? 0 : num / den
+}
+
+/** `ser.crossed(...)` / `.slope(n)` / `.max/min/mean/stddev(n)` - the series
+ * method vocabulary. `args` are already-evaluated MslValue (a `.crossed`
+ * comparison level may itself be another series, e.g.
+ * `ind.ema(9).crossed(ind.ema(21))`). */
+function seriesMethod(name: string, args: MslValue[], s: MslSeriesValue): MslValue {
+  const at = (v: MslValue, offset: number): number => (isSeriesValue(v) ? indexSeries(v, offset) : asNum(v))
+  switch (name) {
+    case 'slope':
+      return linRegSlope(lastFiniteWindow(s.values, args.length ? asNum(args[0]) : 10))
+    case 'max':
+      return Math.max(...lastFiniteWindow(s.values, args.length ? asNum(args[0]) : 10))
+    case 'min':
+      return Math.min(...lastFiniteWindow(s.values, args.length ? asNum(args[0]) : 10))
+    case 'mean': {
+      const w = lastFiniteWindow(s.values, args.length ? asNum(args[0]) : 10)
+      return w.reduce((a, b) => a + b, 0) / w.length
+    }
+    case 'stddev': {
+      const w = lastFiniteWindow(s.values, args.length ? asNum(args[0]) : 10)
+      const m = w.reduce((a, b) => a + b, 0) / w.length
+      return Math.sqrt(w.reduce((a, b) => a + (b - m) ** 2, 0) / w.length)
+    }
+    case 'crossed': {
+      // 1 arg: crossed another series/level, EITHER direction.
+      // 2 args: crossed "up"/"down" through a level/series, that direction only.
+      if (args.length === 1) {
+        const other = args[0]
+        const prevSign = Math.sign(at(s, -2) - at(other, -2))
+        const curSign = Math.sign(at(s, -1) - at(other, -1))
+        return prevSign !== 0 && curSign !== 0 && prevSign !== curSign
+      }
+      if (args.length === 2) {
+        const dir = String(args[0])
+        if (dir !== 'up' && dir !== 'down') throw new MslRuntimeError(`".crossed(dir, level)" dir must be "up" or "down" (got "${dir}") - or pass one argument to cross either direction`)
+        const level = args[1]
+        const prevA = at(s, -2)
+        const curA = at(s, -1)
+        const prevB = at(level, -2)
+        const curB = at(level, -1)
+        return dir === 'up' ? prevA <= prevB && curA > curB : prevA >= prevB && curA < curB
+      }
+      throw new MslRuntimeError('".crossed(...)" takes either (otherSeriesOrLevel) or ("up"|"down", level)')
+    }
+    default:
+      throw new MslRuntimeError(`unknown series method ".${name}(...)" - use crossed/slope/max/min/mean/stddev`)
+  }
+}
+
+/** `ohlc(-n)` - one historical bar's OHLCV + derived shape (body/range/
+ * wicks), `-1` = the latest CLOSED bar, same offset convention as series
+ * indexing. Needs the caller's raw candle history (`EvalEnv.series`) -
+ * absent in a context that only built the panel-source `reads` map (fails
+ * closed with a clear error, same as every other "not available here"
+ * case). */
+function ohlcAt(series: MslSeriesCtx | undefined, offset: number): MslBarValue {
+  if (!series) throw new MslRuntimeError('ohlc() needs raw candle history, which is not available in this evaluation context')
+  const n = series.close.length
+  const i = n + Math.trunc(offset)
+  if (i < 0 || i >= n) throw new MslRuntimeError(`ohlc(${offset}) out of range - only ${n} bar(s) of history available`)
+  const o = series.open[i]
+  const h = series.high[i]
+  const l = series.low[i]
+  const c = series.close[i]
+  const v = series.volume[i]
+  if (![o, h, l, c].every(Number.isFinite)) throw new MslRuntimeError(`ohlc(${offset}) isn't available yet (thin history)`)
+  return {
+    __mslBar: true,
+    o,
+    h,
+    l,
+    c,
+    v: Number.isFinite(v) ? v : 0,
+    body: Math.abs(c - o),
+    range: h - l,
+    upperWick: h - Math.max(o, c),
+    lowerWick: Math.min(o, c) - l,
+  }
+}
+
+/** `cross(a, b)` - the function-call alias of `a.crossed(b)` (either
+ * direction), for when neither side reads more naturally as the "owner" of
+ * the method - at least one side must be a series (crossing needs history;
+ * two plain numbers never "cross"). */
+function crossAny(a: MslValue, b: MslValue): boolean {
+  if (!isSeriesValue(a) && !isSeriesValue(b)) throw new MslRuntimeError('cross(a, b) needs at least one series (e.g. ind.ema(9), ind.ema(21)) - two plain numbers can\'t cross')
+  const at = (v: MslValue, offset: number): number => (isSeriesValue(v) ? indexSeries(v, offset) : asNum(v))
+  const prevSign = Math.sign(at(a, -2) - at(b, -2))
+  const curSign = Math.sign(at(a, -1) - at(b, -1))
+  return prevSign !== 0 && curSign !== 0 && prevSign !== curSign
+}
+
+/** `ind.*` namespace - raw indicator primitives over the caller's series
+ * context, reusing analytics/indicators.ts's EXISTING array-returning
+ * implementations verbatim (nothing here recomputes any indicator math -
+ * this is purely a script-callable wrapper). Single-series indicators
+ * return an MslSeriesValue directly; indicators that naturally produce more
+ * than one line (macd/bb/stoch/adx/supertrend) return an MslBundleValue
+ * whose named fields are each themselves a series (`.hist`, `.upper`,
+ * `.k`, `.plusDI`, `.line`, ...). */
+/** `ind.*` needs the raw per-bar series context; some evaluation contexts
+ * (no candle history threaded in) don't have one. Fails with a clear
+ * message instead of a confusing downstream "undefined" error. */
+/** Resolves which MslSeriesCtx a `ind.*`/`ohlc()` call should read from: the
+ * caller's own-timeframe `series` by default, or a different timeframe's
+ * series when `tf` (MSL v2's optional trailing TF argument, e.g.
+ * `ind.rsi(14, "5m")`) names one - via `ctx.seriesFor`, which a caller with
+ * no cross-timeframe support simply leaves undefined. Fails closed with a
+ * message that distinguishes "no history at all here" from "no <TF>
+ * support wired up" from "that tf has no data yet", rather than one
+ * generic error for all three. */
+/** `tick.*` namespace - raw live tick-window stats, for the omni-trader's
+ * sub-bar reactivity (see EvalEnv.liveTicks's doc comment). Every method
+ * takes an optional trailing window in SECONDS (default 5) and looks only
+ * at ticks within that many seconds of the LAST tick in the buffer (not
+ * wall-clock "now" - the buffer's own latest print IS "now" for a replay/
+ * backtest context). Deliberately returns RAW numbers, not z-scored
+ * thresholds like the otcv* indicator family - a script combines/compares
+ * these itself (e.g. "velocity dropped near zero then burst" is naturally
+ * "small window count, then a larger one, compared arithmetically"),
+ * exactly the same raw-vs-thresholded split `ind.*` already drew for the
+ * mainstream indicators. */
+function tickMethod(name: string, args: MslValue[], ticks: readonly { ts: number; price: number }[], nowTs: number): MslValue {
+  const windowSec = args.length ? asNum(args[0]) : 5
+  if (!Number.isFinite(windowSec) || windowSec <= 0) throw new MslRuntimeError(`tick.${name}(windowSec) - windowSec must be a positive number`)
+  if (!ticks.length) return 0
+  const floorTs = nowTs - windowSec * 1000
+  // ticks are chronological ascending - walk back from the end instead of
+  // filtering the whole buffer every call (the buffer can hold up to 60k
+  // prints per asset). A buffer whose last print is already OLDER than
+  // floorTs (a genuine stall) correctly yields an EMPTY window here, not
+  // the stale ticks from before the stall started.
+  let i = ticks.length
+  while (i > 0 && ticks[i - 1].ts >= floorTs) i--
+  const windowTicks = ticks.slice(i).filter((t) => t.ts <= nowTs)
+  switch (name) {
+    case 'count':
+      return windowTicks.length
+    case 'delta': {
+      // signed: up-ticks minus down-ticks (consecutive-equal prints never
+      // enter the buffer at all - see otcfootprint.ts's record()).
+      let up = 0
+      let dn = 0
+      for (let j = 1; j < windowTicks.length; j++) {
+        if (windowTicks[j].price > windowTicks[j - 1].price) up++
+        else if (windowTicks[j].price < windowTicks[j - 1].price) dn++
+      }
+      return up - dn
+    }
+    case 'velocity': {
+      // ticks per second over however much of the window is actually
+      // covered (not the requested window, in case the buffer itself
+      // doesn't go back that far) - "velocity dropped to zero" reads
+      // honestly as "0" rather than being diluted by an unfilled window.
+      if (windowTicks.length < 2) return 0
+      const spanSec = Math.max((windowTicks[windowTicks.length - 1].ts - windowTicks[0].ts) / 1000, 1e-3)
+      return windowTicks.length / spanSec
+    }
+    case 'ratio': {
+      // same log2(dnAvgMs/upAvgMs) shape as the otcvratio indicator/
+      // velocitySeriesFor(), just over a live trailing window instead of a
+      // candle bucket.
+      let up = 0
+      let dn = 0
+      let upMs = 0
+      let dnMs = 0
+      for (let j = 1; j < windowTicks.length; j++) {
+        const gap = Math.max(0, windowTicks[j].ts - windowTicks[j - 1].ts)
+        if (windowTicks[j].price > windowTicks[j - 1].price) {
+          up++
+          upMs += gap
+        } else if (windowTicks[j].price < windowTicks[j - 1].price) {
+          dn++
+          dnMs += gap
+        }
+      }
+      const upAvg = up ? upMs / up : 0
+      const dnAvg = dn ? dnMs / dn : 0
+      const ratio = upAvg > 0 ? dnAvg / upAvg : dnAvg > 0 ? 8 : 1
+      return Math.log2(Math.max(ratio, 1 / 8))
+    }
+    default:
+      throw new MslRuntimeError(`unknown tick method "tick.${name}(...)" - use delta/velocity/ratio/count`)
+  }
+}
+
+/** `tick.*` needs the raw live tick buffer; fails closed with a message
+ * that distinguishes "no live tick feed wired in" from the equivalent
+ * `requireSeries()` messages for `ind.*`/`ohlc()`. */
+function requireTicks(ctx: EvalEnv): readonly { ts: number; price: number }[] {
+  if (!ctx.liveTicks) throw new MslRuntimeError('tick.*() needs a live tick feed, which is not available in this evaluation context (only the omni-trader wires one in)')
+  return ctx.liveTicks
+}
+
+function requireSeries(ctx: EvalEnv, tf?: string): MslSeriesCtx {
+  if (tf === undefined) {
+    if (!ctx.series) throw new MslRuntimeError('ind.*() needs raw candle history, which is not available in this evaluation context')
+    return ctx.series
+  }
+  if (!ctx.seriesFor) throw new MslRuntimeError(`a <tf> argument ("${tf}") was given, but this evaluation context has no cross-timeframe support`)
+  const s = ctx.seriesFor(tf)
+  if (!s) throw new MslRuntimeError(`no candle history available for timeframe "${tf}" (unknown timeframe, or too thin to use yet)`)
+  return s
+}
+
+function indicatorCall(name: string, args: MslValue[], s: MslSeriesCtx): MslValue {
+  const n = (i: number, fallback: number): number => (args[i] !== undefined ? asNum(args[i]) : fallback)
+  const { open, high, low, close, volume } = s
+  switch (name) {
+    case 'rsi':
+      return seriesValue(rsiInd(close, n(0, 14)))
+    case 'ema':
+      return seriesValue(emaInd(close, n(0, 9)))
+    case 'sma':
+      return seriesValue(smaInd(close, n(0, 20)))
+    case 'wma':
+      return seriesValue(wmaInd(close, n(0, 20)))
+    case 'hma':
+      return seriesValue(hmaInd(close, n(0, 20)))
+    case 'kama':
+      return seriesValue(kamaInd(close, n(0, 10)))
+    case 'vwma':
+      return seriesValue(vwmaInd(close, volume, n(0, 20)))
+    case 'atr':
+      return seriesValue(atrInd(high, low, close, n(0, 14)))
+    case 'roc':
+      return seriesValue(rocInd(close, n(0, 12)))
+    case 'momentum':
+      return seriesValue(momInd(close, n(0, 10)))
+    case 'zscore':
+      return seriesValue(zscoreInd(close, n(0, 20)))
+    case 'obv':
+      return seriesValue(obvInd(close, volume))
+    case 'cmf':
+      return seriesValue(cmfInd(high, low, close, volume, n(0, 20)))
+    case 'forceindex':
+      return seriesValue(forceIndexInd(close, volume, n(0, 13)))
+    case 'psar':
+      return seriesValue(parabolicSarInd(high, low, n(0, 0.02), n(1, 0.2)))
+    case 'macd': {
+      const r = macdInd(close, n(0, 12), n(1, 26), n(2, 9))
+      return bundleValue({ macd: seriesValue(r.macd), signal: seriesValue(r.signal), hist: seriesValue(r.hist) })
+    }
+    case 'bb': {
+      const r = bollingerInd(close, n(0, 20), n(1, 2))
+      return bundleValue({ upper: seriesValue(r.upper), mid: seriesValue(r.mid), lower: seriesValue(r.lower), width: seriesValue(r.width), percentB: seriesValue(r.percentB) })
+    }
+    case 'stoch': {
+      const r = stochasticInd(high, low, close, n(0, 14), n(1, 3), n(2, 3))
+      return bundleValue({ k: seriesValue(r.k), d: seriesValue(r.d) })
+    }
+    case 'adx': {
+      const r = adxInd(high, low, close, n(0, 14))
+      return bundleValue({ adx: seriesValue(r.adx), plusDI: seriesValue(r.plusDI), minusDI: seriesValue(r.minusDI) })
+    }
+    case 'supertrend': {
+      // proposal's arg order is (mult, len); the underlying function takes
+      // (period, mult) - mapped explicitly rather than reordering the
+      // shared indicators.ts signature other callers already depend on.
+      const r = supertrendInd(high, low, close, n(1, 10), n(0, 3))
+      return bundleValue({ line: seriesValue(r.line), dir: seriesValue(r.dir) })
+    }
+    default:
+      throw new MslRuntimeError(`unknown indicator "ind.${name}(...)" - rsi/ema/sma/wma/hma/kama/vwma/atr/roc/momentum/zscore/obv/cmf/forceindex/psar/macd/bb/stoch/adx/supertrend`)
+  }
+}
+
+function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValue {
   switch (e.t) {
     case 'num':
       return e.v
@@ -664,26 +1299,56 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, reads: Record<string, 
       // read shape a signal-function call produces, so e.g. `oracle.dir`
       // and `let o = oracle; o.dir` behave identically.
       if (e.name in env) return env[e.name]
-      if (e.name in reads) return readValue(reads[e.name])
+      if (e.name in ctx.reads) return readValue(ctx.reads[e.name])
       throw new MslRuntimeError(`unknown identifier "${e.name}" - not a let-binding, and not a known source (did you mean to add ".dir" or ".conf"?)`)
     }
     case 'field': {
-      const val = evalExpr(e.obj, env, reads, resolve)
-      if (!isReadValue(val)) throw new MslRuntimeError(`".${e.field}" needs a source or signal value, not "${val}"`)
+      const val = evalExpr(e.obj, env, ctx)
       return fieldOf(val, e.field)
     }
+    case 'index': {
+      const obj = evalExpr(e.obj, env, ctx)
+      const idx = asNum(evalExpr(e.idx, env, ctx))
+      if (!isSeriesValue(obj)) throw new MslRuntimeError(`"[...]" indexing needs a series value, not "${compositeKind(obj)}"`)
+      return indexSeries(obj, idx)
+    }
+    case 'method': {
+      // `ind.rsi(14)` etc - "ind" is a namespace marker, not a real value,
+      // so it's special-cased here rather than evaluated as an ident (which
+      // would otherwise throw "unknown identifier ind").
+      if (e.obj.t === 'ident' && e.obj.name === 'ind' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        // MSL v2: an optional trailing TF string ("5m", "1h", ...) reads
+        // this indicator against a DIFFERENT timeframe's own candle history
+        // instead of this pair's native one - e.g. ind.rsi(14, "5m") while
+        // trading the 1m. Every ind.* param is otherwise numeric, so a
+        // trailing string argument is unambiguous.
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return indicatorCall(e.name, args, requireSeries(ctx, tf))
+      }
+      // `tick.delta(5)` etc - same namespace-marker special case as "ind",
+      // omni-trader only (requireTicks() fails closed everywhere else).
+      if (e.obj.t === 'ident' && e.obj.name === 'tick' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        return tickMethod(e.name, args, requireTicks(ctx), ctx.liveNowMs ?? Date.now())
+      }
+      const obj = evalExpr(e.obj, env, ctx)
+      const args = e.args.map((a) => evalExpr(a, env, ctx))
+      if (isSeriesValue(obj)) return seriesMethod(e.name, args, obj)
+      throw new MslRuntimeError(`".${e.name}(...)" needs a series value, not "${compositeKind(obj)}"`)
+    }
     case 'unary': {
-      const v = evalExpr(e.e, env, reads, resolve)
+      const v = evalExpr(e.e, env, ctx)
       if (e.op === 'not') return !truthy(v)
       return -asNum(v)
     }
     case 'bin': {
-      if (e.op === 'and') return truthy(evalExpr(e.l, env, reads, resolve)) && truthy(evalExpr(e.r, env, reads, resolve))
-      if (e.op === 'or') return truthy(evalExpr(e.l, env, reads, resolve)) || truthy(evalExpr(e.r, env, reads, resolve))
-      const l = evalExpr(e.l, env, reads, resolve)
-      const r = evalExpr(e.r, env, reads, resolve)
-      if ((e.op === '==' || e.op === '!=') && (isReadValue(l) || isReadValue(r))) {
-        throw new MslRuntimeError('a source/signal value can\'t be compared directly - access .dir/.conf/.active/.call/.put instead')
+      if (e.op === 'and') return truthy(evalExpr(e.l, env, ctx)) && truthy(evalExpr(e.r, env, ctx))
+      if (e.op === 'or') return truthy(evalExpr(e.l, env, ctx)) || truthy(evalExpr(e.r, env, ctx))
+      const l = evalExpr(e.l, env, ctx)
+      const r = evalExpr(e.r, env, ctx)
+      if ((e.op === '==' || e.op === '!=') && (isComposite(l) || isComposite(r))) {
+        throw new MslRuntimeError(`${compositeKind(isComposite(l) ? l : r)} can't be compared directly - access .dir/.conf/.active/.call/.put (read), a field (bar/bundle), or [n]/.method() (series) instead`)
       }
       switch (e.op) {
         case '==':
@@ -715,9 +1380,9 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, reads: Record<string, 
       // never touched when the condition picks the other one).
       if (e.fn === 'if') {
         if (e.args.length !== 3) throw new MslRuntimeError(`if(cond, then, else) takes exactly 3 arguments, got ${e.args.length}`)
-        return truthy(evalExpr(e.args[0], env, reads, resolve)) ? evalExpr(e.args[1], env, reads, resolve) : evalExpr(e.args[2], env, reads, resolve)
+        return truthy(evalExpr(e.args[0], env, ctx)) ? evalExpr(e.args[1], env, ctx) : evalExpr(e.args[2], env, ctx)
       }
-      const args = e.args.map((a) => evalExpr(a, env, reads, resolve))
+      const args = e.args.map((a) => evalExpr(a, env, ctx))
       switch (e.fn) {
         case 'avg':
           return args.length ? args.reduce((s: number, a) => s + asNum(a), 0) / args.length : 0
@@ -759,6 +1424,28 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, reads: Record<string, 
           if (b === 0) throw new MslRuntimeError('mod(a, 0) - divide by zero')
           return asNum(args[0]) % b
         }
+        case 'ohlc': {
+          // ohlc(offset) or ohlc(offset, "5m") - the optional 2nd arg is the
+          // same cross-timeframe TF string ind.*() takes.
+          if (args.length !== 1 && args.length !== 2) throw new MslRuntimeError(`ohlc(offset) or ohlc(offset, tf) takes 1 or 2 arguments, got ${args.length}`)
+          const tf = args.length === 2 ? String(args[1]) : undefined
+          return ohlcAt(requireSeries(ctx, tf), asNum(args[0]))
+        }
+        case 'cross': {
+          if (args.length !== 2) throw new MslRuntimeError(`cross(a, b) takes exactly 2 arguments, got ${args.length}`)
+          return crossAny(args[0], args[1])
+        }
+        case 'between': {
+          if (args.length !== 3) throw new MslRuntimeError(`between(x, lo, hi) takes exactly 3 arguments, got ${args.length}`)
+          const [x, lo, hi] = args.map(asNum)
+          return x >= lo && x <= hi
+        }
+        case 'live': {
+          // live() - the currently FORMING (unclosed) bar, omni-trader only.
+          if (args.length !== 0) throw new MslRuntimeError(`live() takes no arguments, got ${args.length}`)
+          if (!ctx.liveBar) throw new MslRuntimeError('live() needs the currently-forming bar, which is not available in this evaluation context (only the omni-trader wires one in)')
+          return ctx.liveBar
+        }
         default: {
           // Not a core arithmetic func - ask the caller's resolver (AI
           // Lab's signal vocabulary plugs in exactly here, see
@@ -766,12 +1453,12 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, reads: Record<string, 
           // always plain config values (names/numbers/flags), never
           // another source/signal - asPlainArg enforces that so a
           // resolver never has to guard against receiving a read object.
-          if (!resolve) throw new MslRuntimeError(`unknown function "${e.fn}"`)
+          if (!ctx.resolve) throw new MslRuntimeError(`unknown function "${e.fn}"`)
           const plainArgs = args.map((a) => {
-            if (isReadValue(a)) throw new MslRuntimeError(`"${e.fn}(...)" got a source/signal value as an argument - pass plain values (numbers, 'call'/'put', strings) instead`)
+            if (isComposite(a)) throw new MslRuntimeError(`"${e.fn}(...)" got ${compositeKind(a)} as an argument - pass plain values (numbers, 'call'/'put', strings) instead`)
             return a
           })
-          return readValue(resolve(e.fn, plainArgs))
+          return readValue(ctx.resolve(e.fn, plainArgs))
         }
       }
     }
@@ -812,6 +1499,12 @@ function fmtExplainVal(v: MslValue): string {
     if (v.value !== undefined) parts.push(`val ${Math.round(v.value * 100) / 100}`)
     return parts.join(', ')
   }
+  if (isSeriesValue(v)) {
+    const last = v.values.length ? v.values[v.values.length - 1] : NaN
+    return `series(...,${Number.isFinite(last) ? Math.round(last * 100) / 100 : 'NaN'})`
+  }
+  if (isBarValue(v)) return `bar(o${v.o} h${v.h} l${v.l} c${v.c})`
+  if (isBundleValue(v)) return `bundle(${Object.keys(v.fields).join('/')})`
   if (typeof v === 'number') return String(Math.round(v * 100) / 100)
   return String(v)
 }
@@ -827,57 +1520,69 @@ function fmtExplainVal(v: MslValue): string {
  * is still produced by evalExpr itself (never reimplemented), so the trace
  * can never disagree with the actual verdict - this only adds narration
  * around calls evalExpr already made. */
-function explainExpr(e: Expr, env: Record<string, MslValue>, reads: Record<string, MslSourceRead>, resolve?: MslSignalResolver): { text: string; value: MslValue } {
+function explainExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): { text: string; value: MslValue } {
   switch (e.t) {
     case 'num':
     case 'str':
     case 'bool':
     case 'dir': {
-      const value = evalExpr(e, env, reads, resolve)
+      const value = evalExpr(e, env, ctx)
       return { text: fmtExplainVal(value), value }
     }
     case 'ident':
     case 'field': {
-      const value = evalExpr(e, env, reads, resolve)
+      const value = evalExpr(e, env, ctx)
       return { text: `${prettyExpr(e)}=${fmtExplainVal(value)}`, value }
     }
     case 'unary': {
-      const inner = explainExpr(e.e, env, reads, resolve)
+      const inner = explainExpr(e.e, env, ctx)
       const value = e.op === 'not' ? !truthy(inner.value) : -asNum(inner.value)
       return { text: `${e.op === 'not' ? 'not' : '-'}(${inner.text})=${fmtExplainVal(value)}`, value }
     }
     case 'bin': {
       if (e.op === 'and') {
-        const left = explainExpr(e.l, env, reads, resolve)
+        const left = explainExpr(e.l, env, ctx)
         if (!truthy(left.value)) return { text: `${left.text} and <short-circuited, not evaluated>`, value: false }
-        const right = explainExpr(e.r, env, reads, resolve)
+        const right = explainExpr(e.r, env, ctx)
         return { text: `${left.text} and ${right.text}`, value: truthy(right.value) }
       }
       if (e.op === 'or') {
-        const left = explainExpr(e.l, env, reads, resolve)
+        const left = explainExpr(e.l, env, ctx)
         if (truthy(left.value)) return { text: `${left.text} or <short-circuited, not evaluated>`, value: true }
-        const right = explainExpr(e.r, env, reads, resolve)
+        const right = explainExpr(e.r, env, ctx)
         return { text: `${left.text} or ${right.text}`, value: truthy(right.value) }
       }
       // every other binary op is non-lazy (evalExpr always touches both
       // sides) - safe to explain both, then let evalExpr itself compute the
       // real result rather than re-deriving comparison/arithmetic semantics
       // here a second time.
-      const left = explainExpr(e.l, env, reads, resolve)
-      const right = explainExpr(e.r, env, reads, resolve)
-      const value = evalExpr(e, env, reads, resolve)
+      const left = explainExpr(e.l, env, ctx)
+      const right = explainExpr(e.r, env, ctx)
+      const value = evalExpr(e, env, ctx)
       return { text: `${left.text} ${e.op} ${right.text}=${fmtExplainVal(value)}`, value }
     }
     case 'call': {
       if (e.fn === 'if') {
-        const cond = explainExpr(e.args[0], env, reads, resolve)
+        const cond = explainExpr(e.args[0], env, ctx)
         const takeThen = truthy(cond.value)
-        const branch = explainExpr(takeThen ? e.args[1] : e.args[2], env, reads, resolve)
+        const branch = explainExpr(takeThen ? e.args[1] : e.args[2], env, ctx)
         return { text: `if(${cond.text}) ${takeThen ? 'then' : 'else'} ${branch.text}`, value: branch.value }
       }
-      const value = evalExpr(e, env, reads, resolve)
-      const argTexts = e.args.map((a) => explainExpr(a, env, reads, resolve).text)
+      const value = evalExpr(e, env, ctx)
+      const argTexts = e.args.map((a) => explainExpr(a, env, ctx).text)
       return { text: `${e.fn}(${argTexts.join(', ')})=${fmtExplainVal(value)}`, value }
+    }
+    case 'index': {
+      const value = evalExpr(e, env, ctx)
+      return { text: `${prettyExpr(e.obj)}[${explainExpr(e.idx, env, ctx).text}]=${fmtExplainVal(value)}`, value }
+    }
+    case 'method': {
+      // Not lazy and doesn't need its own per-arg narration (ind.*/series
+      // methods are leaf numeric computations, not boolean gates) - just
+      // evaluate once and format, same as a plain 'call'.
+      const value = evalExpr(e, env, ctx)
+      const argTexts = e.args.map((a) => explainExpr(a, env, ctx).text)
+      return { text: `${prettyExpr(e.obj)}.${e.name}(${argTexts.join(', ')})=${fmtExplainVal(value)}`, value }
     }
   }
 }
@@ -887,7 +1592,15 @@ function explainExpr(e: Expr, env: Record<string, MslValue>, reads: Record<strin
  * codebase uses: a runtime error (unknown source, a thin-history source
  * that never got a slot in `reads`) resolves to 'none' with the error
  * message attached, never a thrown exception into the trading loop. */
-export function evaluateStrategyScript(ast: MslAst, reads: Record<string, MslSourceRead>, resolve?: MslSignalResolver): MslEvalResult {
+export function evaluateStrategyScript(
+  ast: MslAst,
+  reads: Record<string, MslSourceRead>,
+  resolve?: MslSignalResolver,
+  series?: MslSeriesCtx,
+  seriesFor?: (tf: string) => MslSeriesCtx | undefined,
+  live?: { bar?: MslBarValue; ticks?: readonly { ts: number; price: number }[]; nowMs?: number },
+): MslEvalResult {
+  const ctx: EvalEnv = { reads, resolve, series, seriesFor, liveBar: live?.bar, liveTicks: live?.ticks, liveNowMs: live?.nowMs }
   const env: Record<string, MslValue> = {}
   const trace: string[] = []
   const configs: Record<string, number | boolean | string> = {}
@@ -898,19 +1611,19 @@ export function evaluateStrategyScript(ast: MslAst, reads: Record<string, MslSou
   try {
     for (const stmt of ast.stmts) {
       if (stmt.kind === 'let') {
-        env[stmt.name] = evalExpr(stmt.expr, env, reads, resolve)
+        env[stmt.name] = evalExpr(stmt.expr, env, ctx)
         continue
       }
       if (stmt.kind === 'call') {
-        const v = truthy(evalExpr(stmt.expr, env, reads, resolve))
+        const v = truthy(evalExpr(stmt.expr, env, ctx))
         if (v) callFired = true
-        trace.push(`call when ${explainExpr(stmt.expr, env, reads, resolve).text} -> ${v}`)
+        trace.push(`call when ${explainExpr(stmt.expr, env, ctx).text} -> ${v}`)
         continue
       }
       if (stmt.kind === 'put') {
-        const v = truthy(evalExpr(stmt.expr, env, reads, resolve))
+        const v = truthy(evalExpr(stmt.expr, env, ctx))
         if (v) putFired = true
-        trace.push(`put when ${explainExpr(stmt.expr, env, reads, resolve).text} -> ${v}`)
+        trace.push(`put when ${explainExpr(stmt.expr, env, ctx).text} -> ${v}`)
         continue
       }
       if (stmt.kind === 'confidence') {
@@ -926,7 +1639,7 @@ export function evaluateStrategyScript(ast: MslAst, reads: Record<string, MslSou
         // here is almost certainly a typo ("configure renko = ..." without
         // the key), so it fails the script loudly instead of poisoning the
         // caller's whitelist lookup.
-        const v = evalExpr(stmt.expr, env, reads, resolve)
+        const v = evalExpr(stmt.expr, env, ctx)
         if (isReadValue(v)) throw new MslRuntimeError(`"configure ${stmt.path}" got a source/signal value - the value must be a plain number/boolean/string`)
         configs[stmt.path] = v as number | boolean | string
         trace.push(`configure ${stmt.path} = ${String(v)}`)
@@ -948,7 +1661,7 @@ export function evaluateStrategyScript(ast: MslAst, reads: Record<string, MslSou
   let confidence = 65 // same "lone signal, no honesty-loop number to lean on" flat default smcNowRead() uses
   if (confidenceExpr) {
     try {
-      const raw = asNum(evalExpr(confidenceExpr, env, reads, resolve))
+      const raw = asNum(evalExpr(confidenceExpr, env, ctx))
       // AUDIT: Math.max/Math.min/round all pass NaN straight through, so an
       // expression that reached +/-Infinity (huge-literal overflow) and then
       // Infinity - Infinity in a let-binding used to exit here as a NaN
@@ -968,7 +1681,7 @@ export function evaluateStrategyScript(ast: MslAst, reads: Record<string, MslSou
   let expiryMin: number | undefined
   if (expiryExpr) {
     try {
-      const raw = asNum(evalExpr(expiryExpr, env, reads, resolve))
+      const raw = asNum(evalExpr(expiryExpr, env, ctx))
       if (!Number.isFinite(raw)) throw new MslRuntimeError('expiry expression produced a non-finite value')
       expiryMin = Math.max(1, Math.min(60, Math.round(raw)))
       if (expiryMin !== raw) trace.push(`expiry = ${raw} clamped/rounded to ${expiryMin} (whole minutes 1-60)`)

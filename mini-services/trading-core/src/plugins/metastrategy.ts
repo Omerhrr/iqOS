@@ -55,7 +55,7 @@ import {
   type MetaSourceRead,
   type MetaStrategySpec,
 } from '../analytics/metastrategy'
-import { parseStrategyScript, evaluateStrategyScript, type MslEvalResult, type MslSourceRead } from '../analytics/strategylang'
+import { parseStrategyScript, evaluateStrategyScript, type MslEvalResult, type MslSourceRead, type MslSeriesCtx, type MslBarValue } from '../analytics/strategylang'
 import { getStrategy } from '../strategies/builtin'
 
 function slugify(name: string): string {
@@ -1130,6 +1130,40 @@ export class MetaStrategyService {
     return { spec, result, price }
   }
 
+  /** Same contract as evaluate(), but ALSO threads live sub-bar data
+   * (the forming bar + raw tick buffer) into the script - the omni-
+   * trader's own read path, for a spec that wants `live()`/`tick.*`
+   * reactivity instead of waiting for `evaluate()`'s candle-close-only
+   * view. Only meaningful for a SCRIPT spec (conditions-built specs never
+   * touch strategylang.ts's evaluator at all, so there's nothing to feed
+   * live data into) - a conditions-only spec id fails closed here rather
+   * than silently falling back to the non-live path, so the caller always
+   * knows whether it actually got live reactivity. */
+  evaluateLive(
+    id: string,
+    asset: string,
+    tf: Timeframe,
+    live: { bar?: MslBarValue; ticks?: readonly { ts: number; price: number }[]; nowMs?: number },
+  ): { spec: MetaStrategySpec; result: MetaEvalResult; price: number } {
+    const spec = this.get(id)
+    if (!spec) throw new Error(`unknown meta-strategy ${id}`)
+    if (!spec.script) {
+      return {
+        spec,
+        result: { direction: 'none', score: 0, confidence: 0, conditions: [], notes: 'omni-trader needs a SCRIPT meta-strategy (live()/tick.* reactivity) - this spec is conditions-built' },
+        price: 0,
+      }
+    }
+    const result = this.evaluateScript(spec.script, asset, tf, live)
+    let price = 0
+    try {
+      price = this.market.getPrice(asset)
+    } catch {
+      /* price stays 0 - caller treats that as "not tradeable right now" */
+    }
+    return { spec, result, price }
+  }
+
   private evaluateConditions(spec: MetaStrategySpec, asset: string, tf: Timeframe): MetaEvalResult {
     const reads = spec.conditions.map((c) => this.readSource(c.source, asset, tf, c.smcKind, c.expiryMin, c.tickBucketSec))
     return evaluateMetaStrategy(spec, reads)
@@ -1156,6 +1190,50 @@ export class MetaStrategyService {
     }
   }
 
+  /** MSL v2's `ind.*`/`ohlc()` primitives need the raw per-bar OHLCV arrays
+   * directly (not the resolver-wrapped signal vocabulary) - built from the
+   * SAME candle fetch buildCtx() already uses for scriptResolver(), so a
+   * script gets both without a duplicate history read. Returns undefined on
+   * the same thin-history floor as scriptResolver() (ind.* / ohlc() calls
+   * then fail the script closed, same fail-closed convention as every other
+   * runtime error here). */
+  private scriptSeries(asset: string, tf: Timeframe): MslSeriesCtx | undefined {
+    try {
+      const candles = this.market.getCandlesDeep(asset, tf, 240, true)
+      if (candles.length < 40) return undefined
+      return {
+        open: candles.map((k) => k.open),
+        high: candles.map((k) => k.high),
+        low: candles.map((k) => k.low),
+        close: candles.map((k) => k.close),
+        volume: candles.map((k) => k.volume ?? 0),
+      }
+    } catch {
+      return undefined
+    }
+  }
+
+  /** MSL v2's cross-timeframe `ind.rsi(14, "5m")` / `ohlc(-1, "5m")` -
+   * builds a memoized `(tf) => MslSeriesCtx | undefined` resolver so a
+   * script referencing the SAME other-timeframe tf more than once (e.g.
+   * `ind.ema(8, "5m")` and `ind.ema(21, "5m")` in the same script) only
+   * fetches that tf's candle history once per evaluateScript()/testScript()
+   * call, not once per call site. An unrecognized string (not a real
+   * Timeframe) or a too-thin history both resolve to undefined - the
+   * evaluator's own requireSeries() turns that into the script's "no data
+   * for that tf" error, same fail-closed convention as every other MSL
+   * runtime error. */
+  private scriptSeriesFor(asset: string): (tf: string) => MslSeriesCtx | undefined {
+    const cache = new Map<string, MslSeriesCtx | undefined>()
+    return (tf: string) => {
+      if (cache.has(tf)) return cache.get(tf)
+      const known: readonly string[] = ['5s', '15s', '30s', '1m', '2m', '5m', '15m', '30m', '1h', '4h', '1d']
+      const result = known.includes(tf) ? this.scriptSeries(asset, tf as Timeframe) : undefined
+      cache.set(tf, result)
+      return result
+    }
+  }
+
   /** Run a strategy-language script against one asset+tf's current
    * source reads, shaped as a MetaEvalResult so it's a drop-in for
    * evaluateMetaStrategy's conditions-built result - every caller
@@ -1171,11 +1249,18 @@ export class MetaStrategyService {
    * are rebuilt with them applied and the resolver re-threaded, and pass 2's
    * result wins. A script's own configure lines therefore change how ITS
    * sources are computed while never touching live plugin state. */
-  private evaluateScript(script: string, asset: string, tf: Timeframe): MetaEvalResult {
+  private evaluateScript(
+    script: string,
+    asset: string,
+    tf: Timeframe,
+    live?: { bar?: MslBarValue; ticks?: readonly { ts: number; price: number }[]; nowMs?: number },
+  ): MetaEvalResult {
     const parsed = parseStrategyScript(script)
     if (!parsed.ok) return { direction: 'none', score: 0, confidence: 0, conditions: [], notes: `script error: ${parsed.error}` }
     const reads = this.buildScriptReads(asset, tf)
-    const out = evaluateStrategyScript(parsed.ast, reads, this.scriptResolver(asset, tf))
+    const series = this.scriptSeries(asset, tf)
+    const seriesFor = this.scriptSeriesFor(asset)
+    const out = evaluateStrategyScript(parsed.ast, reads, this.scriptResolver(asset, tf), series, seriesFor, live)
     if (!out.error && out.configs) {
       try {
         validateMslConfigs(out.configs)
@@ -1183,7 +1268,7 @@ export class MetaStrategyService {
         return { direction: 'none', score: 0, confidence: 0, conditions: [], notes: `script error: ${err instanceof Error ? err.message : String(err)}` }
       }
       const reads2 = this.buildScriptReads(asset, tf, out.configs)
-      const out2 = evaluateStrategyScript(parsed.ast, reads2, this.scriptResolver(asset, tf, out.configs))
+      const out2 = evaluateStrategyScript(parsed.ast, reads2, this.scriptResolver(asset, tf, out.configs), series, seriesFor, live)
       return this.scriptMetaResult(out2)
     }
     return this.scriptMetaResult(out)
@@ -1212,7 +1297,9 @@ export class MetaStrategyService {
     const parsed = parseStrategyScript(script)
     if (!parsed.ok) return { ok: false, error: parsed.error }
     const reads = this.buildScriptReads(asset, tf)
-    const out = evaluateStrategyScript(parsed.ast, reads, this.scriptResolver(asset, tf))
+    const series = this.scriptSeries(asset, tf)
+    const seriesFor = this.scriptSeriesFor(asset)
+    const out = evaluateStrategyScript(parsed.ast, reads, this.scriptResolver(asset, tf), series, seriesFor)
     if (out.error) return { ok: false, error: out.error }
     let final = out
     if (out.configs) {
@@ -1222,7 +1309,7 @@ export class MetaStrategyService {
         return { ok: false, error: err instanceof Error ? err.message : String(err) }
       }
       const reads2 = this.buildScriptReads(asset, tf, out.configs)
-      final = evaluateStrategyScript(parsed.ast, reads2, this.scriptResolver(asset, tf, out.configs))
+      final = evaluateStrategyScript(parsed.ast, reads2, this.scriptResolver(asset, tf, out.configs), series, seriesFor)
       if (final.error) return { ok: false, error: final.error }
     }
     let price = 0

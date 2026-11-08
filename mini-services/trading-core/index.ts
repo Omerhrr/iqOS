@@ -42,6 +42,7 @@ import { smcScanPlugin, SmcScanService } from './src/plugins/smcscan'
 import { metaStrategyPlugin, MetaStrategyService } from './src/plugins/metastrategy'
 import { aiTraderPlugin, AiTraderService } from './src/plugins/aitrader'
 import { metaTraderPlugin, MetaTraderService } from './src/plugins/metatrader'
+import { omniTraderPlugin, OmniTraderService } from './src/plugins/omnitrader'
 import { META_CONDITION_SOURCES } from './src/analytics/metastrategy'
 import { yesterdayPlugin, YesterdayService } from './src/plugins/yesterday'
 import { nextCandlePlugin, NextCandleService } from './src/plugins/nextcandle'
@@ -67,6 +68,8 @@ import { findTriangles, fitTriangulation, legsForCross, orientCandles, TRIANGULA
 import { fitAdxPatternBias, PATTERN_BIAS_LOOKBACK, higherTimeframe } from './src/analytics/adxpatternbias'
 import { fitShockPressure } from './src/analytics/shockpressure'
 import { normalizeSpec, type CustomSpec } from './src/strategies/custom'
+import { CANDLE_PATTERN_NAMES } from './src/analytics/patterns'
+import { SIGNAL_FUNCS } from './src/strategies/signalscript'
 import { MINABLE_ENGINES, ENGINE_LABEL, type ChartEngineId, engineVoteSingle, otcFootprintVote, tickVote, type OtcFpRead } from './src/analytics/chartsignals'
 import { combineRenkoFootprint, type RenkoFootprintFit } from './src/analytics/renkofootprint'
 import { volumeVote, combineVolumeFootprint } from './src/analytics/volumefootprint'
@@ -222,6 +225,7 @@ kernel.register(tempoPlugin)
 kernel.register(adxHonestyPlugin)
 kernel.register(accutePlugin)
 kernel.register(metaTraderPlugin)
+kernel.register(omniTraderPlugin)
 // PRECISION FIX: these three plugins (and the panels/client.ts wrappers
 // that call them) existed in the repo but were never registered with the
 // kernel, so every one of /next_expiry, /reversal, /technical (and their
@@ -925,6 +929,20 @@ const httpServer = createServer(async (req, res) => {
           const metaTrader = kernel.context().use<MetaTraderService>('metaTrader')
           const asset = String(q.get('asset') ?? market.activeAsset)
           return json(200, { ok: true, ...metaTrader.peek(asset) })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // GET /omni_trader_status -> Omni Trader's own status (config +
+      // runtime) - same shape family as /meta_trader_status. See
+      // plugins/omnitrader.ts's header for what this engine is for and how
+      // it differs from Meta Trader (sub-bar live()/tick.* reactivity on a
+      // tight wall-clock loop, instead of candle-close-paced evaluation).
+      if (path === '/omni_trader_status') {
+        try {
+          const omniTrader = kernel.context().use<OmniTraderService>('omniTrader')
+          return json(200, { ok: true, ...omniTrader.status() })
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }
@@ -2482,6 +2500,96 @@ const httpServer = createServer(async (req, res) => {
 
       if (path === '/meta_strategy_sources') {
         return json(200, { ok: true, sources: META_CONDITION_SOURCES })
+      }
+
+      // GET /signal_vocab - the full MSL/AI-Lab signal vocabulary catalog:
+      // every candlestick pattern a `candle(name, dir)` call can name
+      // (CANDLE_PATTERN_NAMES, the same list detectPatterns()/custom.ts's
+      // candle signal already match against - marabozu, hammer, doji
+      // variants, engulfing, harami, three soldiers/crows, morning/evening
+      // star and the rest of the Nison catalog are ALL already wired, not
+      // missing), the full signal-function roster (SIGNAL_FUNCS - candle/
+      // bar/ha/line/renko/pf/mtf/indicator/indicatorType/indicatorPeriod/
+      // builtinSig/engine) with their call signatures, and the full
+      // IndicatorSignal.ind catalog (strategies/custom.ts) - rsi, bbpos,
+      // zscore, macdz, slope, streak, wickbias, emasign, hadist, bodypos,
+      // psar, fractal, trendpullback, rangezone, plus the generic families
+      // selected via a `type` param: madist (12 MA flavors), osc0100
+      // (stochk/stochd/willr/ultosc/aroonup/aroondown/mfi), oscpm100 (cci/
+      // cmo/tsi/rvi/aroonosc/stochrsik/stochrsid), oscz (roc/mom/ppo/apo/
+      // trix/dpo/kst/qstick/awesomeosc/fisher/massindex/natr/histvol/
+      // stddev/atrz/hilbert/ulcer), trenddist (supertrend/chandelier/
+      // ichimoku), bandpos (keltner/envelope), volflow (obv/ad/cmf/
+      // forceindex/eom/nvi/pvi/klinger/chaikinosc/vwapdist), levels (pivot/
+      // fib), plus the order-flow/OTC-tick families (ofdelta/ofcumdelta/
+      // ofpocdist/ofvapos, otcvdelta/otcvratio/otcstagn). Exists because
+      // this entire catalog was already built and already reachable from
+      // an MSL script (per direct instruction: "let msl have access to all
+      // our indicators and strategies") but had no listing route - a
+      // caller with no view of it had no way to know "RSI cross" or
+      // "engulfing" were already expressible today, not a gap to build.
+      if (path === '/signal_vocab') {
+        return json(200, {
+          ok: true,
+          candlePatterns: CANDLE_PATTERN_NAMES,
+          signalFuncs: [
+            { fn: 'candle', usage: 'candle(name, dir, conf?, series?)', note: 'any name from candlePatterns[] above, case-insensitive; series "heikin" tests the pattern on Heikin-Ashi bars instead of raw bars' },
+            { fn: 'bar', usage: 'bar(variant, dir, conf?, atrK?)', note: 'variant: wide-bull | wide-bear (ATR-relative wide-range bar)' },
+            { fn: 'ha', usage: 'ha(variant, dir, conf?, len?)', note: 'variant: flip-up | flip-down | streak-up | streak-down | strong-bull | strong-bear' },
+            { fn: 'line', usage: 'line(variant, dir, conf?, lookback?)', note: 'variant: breakout-up | breakout-down | hh-hl | lh-ll' },
+            { fn: 'renko', usage: 'renko(variant, dir, conf?)', note: 'brick-trend based' },
+            { fn: 'pf', usage: 'pf(variant, dir, conf?)', note: 'Point & Figure column-break based' },
+            { fn: 'mtf', usage: 'mtf(factor, dir, conf?)', note: 'resamples to a synthetic higher timeframe (factor x this tf) and checks EMA(8) vs EMA(21) agreement' },
+            { fn: 'indicator', usage: 'indicator(ind, op, threshold, dir, conf?, threshold2?)', note: 'op: > | < | between | outside. ind: one of indicatorIds[] below (default params)' },
+            { fn: 'indicatorType', usage: 'indicatorType(ind, type, op, threshold, dir, conf?, threshold2?)', note: 'for a generic family (madist/osc0100/oscpm100/oscz/trenddist/bandpos/volflow/levels) - type picks the specific indicator inside it' },
+            { fn: 'indicatorPeriod', usage: 'indicatorPeriod(ind, period, op, threshold, dir, conf?, threshold2?)', note: 'same as indicator() but with an explicit period override instead of the default' },
+            { fn: 'builtinSig', usage: 'builtinSig(id, dir, conf?)', note: 'id = a builtin strategy id from list_strategies - runs that whole strategy as one signal' },
+            { fn: 'engine', usage: 'engine(id, dir, conf?)', note: 'id: renko | pnf | range | tick | footprint | heikin | candle - reconstructs that chart engine\'s vote from candle history, the SAME math the live Signal Panel scanner runs for it. "tick" is a close-price-reconstruction fallback here (no real tick buffer in this path) - for REAL tick data see tick.* in mslV2 below.' },
+          ],
+          indicatorIds: [
+            { ind: 'rsi', note: 'RSI(period)' },
+            { ind: 'bbpos', note: 'Bollinger %B, 0..1' },
+            { ind: 'zscore', note: '(close - SMA) / std' },
+            { ind: 'donchianpos', note: 'close position inside the N-bar range, 0..1' },
+            { ind: 'macdz', note: 'MACD histogram / ATR' },
+            { ind: 'slope', note: 'linreg slope / ATR' },
+            { ind: 'streak', note: 'signed run of same-colour candles' },
+            { ind: 'wickbias', note: '(lowerWick - upperWick) / range' },
+            { ind: 'emasign', note: '(emaFast - emaSlow) / ATR' },
+            { ind: 'hadist', note: '(haClose - haOpen) / ATR' },
+            { ind: 'bodypos', note: '(close - low) / range' },
+            { ind: 'psar', note: 'Parabolic SAR trend distance / ATR' },
+            { ind: 'fractal', note: 'Williams Fractal breakout distance / ATR' },
+            { ind: 'trendpullback', note: 'signed pullback-to-swing inside a confirmed HH/HL or LH/LL structure' },
+            { ind: 'rangezone', note: 'signed buy/sell zone near a ranging channel\'s floor/ceiling' },
+            { ind: 'madist', note: '(close - MA)/ATR - needs type: sma|ema|wma|dema|tema|trima|kama|hma|vwma|zlema|t3|mcginley|linreg|midpoint' },
+            { ind: 'osc0100', note: 'native 0..100 oscillator - needs type: stochk|stochd|willr|ultosc|aroonup|aroondown|mfi' },
+            { ind: 'oscpm100', note: 'native -100..100-ish oscillator - needs type: cci|cmo|tsi|rvi|aroonosc|stochrsik|stochrsid' },
+            { ind: 'oscz', note: 'z-scored momentum/volatility family - needs type: roc|mom|ppo|apo|trix|dpo|kst|qstick|awesomeosc|fisher|massindex|natr|histvol|stddev|atrz|hilbert|ulcer' },
+            { ind: 'trenddist', note: 'signed trend-line breakout distance/ATR - needs type: supertrend|chandelier|ichimoku' },
+            { ind: 'bandpos', note: 'position inside a band, 0..1 - needs type: keltner|envelope' },
+            { ind: 'volflow', note: 'volume-flow accumulator, rolling z-scored - needs type: obv|ad|cmf|forceindex|eom|nvi|pvi|klinger|chaikinosc|vwapdist' },
+            { ind: 'levels', note: 'signed distance to nearest static level/ATR - needs type: pivot|fib' },
+            { ind: 'ofdelta', note: 'rolling z-score of per-candle CLV buy/sell delta (candle-approximated order flow)' },
+            { ind: 'ofcumdelta', note: 'rolling z-score of cumulative-delta slope' },
+            { ind: 'ofpocdist', note: '(close - rolling Volume Profile POC) / ATR' },
+            { ind: 'ofvapos', note: 'close position relative to the rolling Value Area (below/inside/above)' },
+            { ind: 'otcvdelta', note: 'per-bar REAL tick velocity delta (up-ticks minus down-ticks), OTC tick collector only' },
+            { ind: 'otcvratio', note: 'per-bar REAL tick speed ratio (down/up avg ms, log2-signed), OTC tick collector only' },
+            { ind: 'otcstagn', note: 'per-bar REAL cluster stagnation (POC print count / median), OTC tick collector only' },
+          ],
+          mslV2: {
+            note: 'MSL v2 - raw series/bar/tick primitives, ON TOP of everything above (signal_funcs/indicatorIds are all still boolean/threshold reads; these are CONTINUOUS values a script can pull into a `let` and combine arithmetically with anything else). All already wired and script-callable today in meta_strategy_save/meta_strategy_test_script.',
+            seriesType: 'ind.<id>(...) returns a series (chronological, [-1] = latest closed bar) or a bundle (named sub-series, e.g. ind.macd(...).hist). Index with [n] (e.g. s[-1], s[-2]); methods: s.slope(n), s.max/min/mean/stddev(n), s.crossed(otherSeriesOrLevel) [either direction] or s.crossed("up"|"down", level) [one direction - dir must be a quoted string]. Top-level aliases: cross(a, b) (either-direction, same as .crossed with one arg), between(x, lo, hi).',
+            indNamespace: 'ind.rsi(period) · ind.ema/sma/wma/hma/kama/vwma(len) · ind.atr(period) · ind.roc(len) · ind.momentum(len) · ind.zscore(len) · ind.obv() · ind.cmf(len) · ind.forceindex(len) · ind.psar() -> series. ind.macd(fast,slow,signal) -> {macd,signal,hist} · ind.bb(len,mult) -> {upper,mid,lower,width,percentB} · ind.stoch(k,d,smooth) -> {k,d} · ind.adx(len) -> {adx,plusDI,minusDI} · ind.supertrend(mult,len) -> {line,dir} -> bundle. ALL reuse the exact same indicator math analytics/indicators.ts already has (nothing re-derived) - this is the CONTINUOUS-value sibling of indicator()/indicatorType()/indicatorPeriod() above, not a new indicator catalog.',
+            crossTimeframe: 'Any ind.*(...) call or ohlc(offset) takes an OPTIONAL trailing timeframe string to read a DIFFERENT timeframe\'s own candle history instead of the signal\'s native tf - e.g. ind.rsi(14, "5m") or ohlc(-1, "1h") while evaluating on the 1m. Valid tf strings: 5s/15s/30s/1m/2m/5m/15m/30m/1h/4h/1d. Fails closed with a clear error if that tf has too little history yet.',
+            ohlc: 'ohlc(offset) or ohlc(offset, tf?) - ONE raw historical CLOSED bar as {o,h,l,c,v,body,range,upper_wick,lower_wick} (access fields with .close, .body, etc, no parens). offset -1 = the latest closed bar, -2 = one before that. For custom one-off math no named pattern/indicator covers (e.g. "is the 3rd-to-last candle the widest of the last 10") - use ohlc(-3).range vs a let-bound loop of max()/avg() over several ohlc() calls.',
+            live: 'live() - the CURRENTLY FORMING (not yet closed) bar, same {o,h,l,c,v,body,range,upper_wick,lower_wick} shape as ohlc(). Only meaningful in a context that feeds one in - today that is ONLY the omni-trader (see omni_trader_status/omni_trader_configure below); meta_strategy_eval/meta_strategy_test_script/Meta Trader never do (they are candle-close-paced by design), so live() there fails closed with a clear "not available in this evaluation context" error, not a silent zero.',
+            tick: 'tick.delta(windowSec?) / tick.velocity(windowSec?) / tick.ratio(windowSec?) / tick.count(windowSec?) - RAW (not z-scored/thresholded, unlike otcvdelta/otcvratio/otcstagn above) live tick-window stats over the real broker tick buffer, default window 5 seconds, measured back from actual wall-clock now (so a genuine stall - no new ticks for windowSec - correctly reads near-zero, it is not frozen at the last tick\'s own old timestamp). Same real tick data for BOTH OTC and real-market pairs (the "otc" in otcfootprint.ts\'s name is legacy - the sidecar polls the broker\'s actual tick feed either way). Only meaningful where a live tick feed is wired in - same "omni-trader only, fails closed elsewhere" contract as live().',
+            useCase: 'This is specifically for strategies whose ENTRY SIGNAL is sub-bar/tick-time (e.g. "tick velocity collapses near zero while delta spikes at a stalling price, then velocity bursts the other way - all within one still-forming candle"). Every other engine (autopilot, Meta Trader, the OS auto-trader) evaluates on CLOSED candles only - Autopilot literally ignores every non-closed candle event, and Meta Trader/OS-mode poll every 10s in real time but still only ever read closed-candle history. live()/tick.* need the omni-trader to have any data to read.',
+          },
+          note: 'All of this is ALREADY reachable from a Meta-Strategy Lab script today (plugins/metastrategy.ts\'s scriptResolver -> strategies/signalscript.ts, plus the mslV2 raw primitives above), the same vocabulary the AI Lab\'s own code editor uses. If a strategy you want isn\'t expressible with these plus MSL\'s own panel sources (meta_strategy_sources) and operators (and/or/not, comparisons, avg/sum/min/max/count/abs, let, if()), that is a real gap - say which one. Known REMAINING gaps, stated plainly rather than silently: no per-price-level footprint structure (diagonal imbalance ratio at a specific node, multi-node density scanning - tick.* above gives aggregate window stats, not a price-level breakdown); no cross-cycle state (cooldowns/streaks a script remembers between evaluations - a future since()/state.* primitive, not built yet).',
+        })
       }
 
       // GET /meta_strategy_eval?id=meta:xxx&asset=EURUSD&tf=1m - live
@@ -4163,6 +4271,18 @@ const httpServer = createServer(async (req, res) => {
         try {
           const metaTrader = kernel.context().use<MetaTraderService>('metaTrader')
           const cfg = metaTrader.configure(body as Record<string, never>)
+          return json(200, { ok: true, config: cfg })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // POST /omni_trader_config -> patch Omni Trader's own config (same
+      // patch-whatever-fields-are-present contract as /meta_trader_config).
+      if (path === '/omni_trader_config') {
+        try {
+          const omniTrader = kernel.context().use<OmniTraderService>('omniTrader')
+          const cfg = omniTrader.configure(body as Record<string, never>)
           return json(200, { ok: true, config: cfg })
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })

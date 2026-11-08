@@ -1416,6 +1416,54 @@ const TOOLS: ToolSpec[] = [
     args: '{"asset": "EURUSD"}',
     run: (a) => coreGet(`/meta_trader_peek?asset=${encodeURIComponent(String(a.asset ?? 'EURUSD'))}`),
   },
+  // ---------- Omni Trader: a FOURTH, separate execution engine from Meta
+  // Trader/autopilot/the auto-trader, built specifically for strategies
+  // whose entry signal is SUB-BAR/tick-time (e.g. "tick velocity collapses
+  // near zero while delta spikes at a stalling price, then bursts the
+  // other way - all within one still-forming candle"). Every other engine
+  // evaluates on CLOSED candles only - autopilot literally ignores every
+  // non-closed candle event, Meta Trader/the auto-trader poll every 10s in
+  // real time but still only ever read closed-candle history. Omni Trader
+  // polls on its OWN much tighter wall-clock loop (default 2s) and feeds a
+  // script the CURRENTLY FORMING bar (live()) and the REAL live tick
+  // buffer (tick.delta/velocity/ratio/count()) on top of the normal
+  // closed-bar reads - see signal_vocabulary's mslV2.live/mslV2.tick for
+  // the exact primitives. It trades exactly ONE saved SCRIPT meta-strategy
+  // spec (conditions-built specs never touch these primitives, so
+  // evaluateLive() fails closed on one rather than silently ignoring the
+  // live data) - same account-level floor (kill switch, risk manager,
+  // OS-mode human/auto gate) as every other engine; "a faster loop" is
+  // ONLY freedom from candle-close pacing, never from those. ----------
+  {
+    name: 'omni_trader_status',
+    description:
+      'Omni Trader snapshot: config (enabled, metaStrategyId - which saved SCRIPT spec it is trading, tf - timeframe its CLOSED-bar ind.*/ohlc()/panel reads use, direction, minConfidence, stake, maxOpen, kind, expiryTf/expirySec, marketScope, cooldownSec, intervalMs - its wall-clock poll interval in ms, 1000-10000, default 2000, assets - optional explicit watchlist override) plus runtime (trades/wins/losses/pnlTotal/openCount/lastTradeTs/lastAction/lastRejection) and current OS mode/active flag. This is the engine built specifically for sub-bar/tick-reactive strategies that Meta Trader structurally cannot run (see the header note above) - check this, not meta_trader_status, when the user asks about a strategy using live()/tick.* or describes an "the moment X happens mid-candle" trigger.',
+    args: '{}',
+    run: () => coreGet('/omni_trader_status'),
+  },
+  {
+    name: 'omni_trader_configure',
+    description:
+      'Patch Omni Trader config (same patch-whatever-fields-are-present contract as meta_trader_configure) - only send the fields that changed. Fields: enabled (bool - turning this on means it starts placing REAL risk-gated orders on its own tight loop, exactly like arming Meta Trader or an autopilot bot - confirm with the user first), metaStrategyId (REQUIRED to actually trade - a saved spec id from meta_strategy_list, and it MUST be a SCRIPT spec (one saved via meta_strategy_save with a `script`, not conditions) that actually uses live()/tick.* - a conditions-built spec id will evaluate but get "needs a SCRIPT meta-strategy" in its notes and never fire; verify with meta_strategy_eval/meta_strategy_test_script that the spec is script-based before configuring this), tf (timeframe the script\'s CLOSED-bar ind.*/ohlc()/panel reads use - separate from the live tick/forming-bar feed, which has no timeframe of its own), direction ("call"|"put"|"both"), minConfidence (0-100), stake, maxOpen (max concurrently open omni-trader positions across all assets), kind (binary|turbo|blitz|digital|cfd), expiryTf (SEPARATE from tf; omit/null = track tf 1:1), expirySec (blitz/digital only), marketScope ("all"|"real"|"otc"), cooldownSec (per-asset re-entry cooldown, 0 = off), intervalMs (wall-clock poll interval, 1000-10000ms, default 2000 - THIS, not candle closes, paces the whole engine; lower = more reactive but checks more often, the live tick buffer itself only refreshes on the broker sidecar\'s own ~100ms-8s cadence so going below ~1000ms buys little), assets (optional explicit watchlist array - omit for the same liquid-first default pool Meta Trader uses). Follow the same deployment confirmation protocol as meta_trader_configure/bot_create/autotrader_configure before turning enabled:true on.',
+    args: '{"enabled": true, "metaStrategyId": "my-tick-reactive-spec", "tf": "1m", "minConfidence": 70, "stake": 1, "maxOpen": 2, "intervalMs": 2000}',
+    run: (a) =>
+      corePost('/omni_trader_config', {
+        ...(a.enabled !== undefined ? { enabled: Boolean(a.enabled) } : {}),
+        ...(a.metaStrategyId !== undefined ? { metaStrategyId: a.metaStrategyId === null ? null : String(a.metaStrategyId) } : {}),
+        ...(a.tf !== undefined ? { tf: String(a.tf) } : {}),
+        ...(a.direction !== undefined ? { direction: String(a.direction) } : {}),
+        ...(a.minConfidence !== undefined ? { minConfidence: Number(a.minConfidence) } : {}),
+        ...(a.stake !== undefined ? { stake: Number(a.stake) } : {}),
+        ...(a.maxOpen !== undefined ? { maxOpen: Number(a.maxOpen) } : {}),
+        ...(a.kind !== undefined ? { kind: String(a.kind) } : {}),
+        ...(a.expiryTf !== undefined ? { expiryTf: a.expiryTf === null ? null : String(a.expiryTf) } : {}),
+        ...(a.expirySec !== undefined ? { expirySec: a.expirySec === null ? null : Number(a.expirySec) } : {}),
+        ...(a.marketScope !== undefined ? { marketScope: String(a.marketScope) } : {}),
+        ...(a.cooldownSec !== undefined ? { cooldownSec: Number(a.cooldownSec) } : {}),
+        ...(a.intervalMs !== undefined ? { intervalMs: Number(a.intervalMs) } : {}),
+        ...(a.assets !== undefined ? { assets: a.assets === null ? null : a.assets } : {}),
+      }),
+  },
   // ---------- archive: deep history ----------
   {
     name: 'archive_status',
@@ -2201,6 +2249,13 @@ const TOOLS: ToolSpec[] = [
     run: () => coreGet('/meta_strategy_sources'),
   },
   {
+    name: 'signal_vocabulary',
+    description:
+      'The full function/indicator/candlestick-pattern vocabulary an MSL script (meta_strategy_save with a script, or meta_strategy_test_script) can call INSIDE a call-when/put-when expression, beyond the panel sources meta_strategy_sources lists. This is ALREADY wired, not a future feature: candlePatterns[] is every named candlestick pattern "candle(name, dir)" can match (marubozu, hammer, doji and its variants, engulfing, harami, morning/evening star, three soldiers/crows, piercing line, dark cloud cover, tweezer, and the rest of the classic Nison catalog - detected per-bar by the SAME engine the AI Lab uses, not re-derived). signalFuncs[] lists every callable function with its exact call signature (candle/bar/ha/line/renko/pf/mtf/indicator/indicatorType/indicatorPeriod/builtinSig/engine). indicatorIds[] lists every indicator "indicator()"/"indicatorType()"/"indicatorPeriod()" can threshold against - RSI, Bollinger %B, MACD histogram/ATR, z-score, slope, Williams Fractal, Parabolic SAR, Supertrend/Ichimoku/Chandelier, every classic oscillator family (Stochastic, Williams %R, Ultimate Oscillator, Aroon, MFI, CCI, CMO, TSI, RVI, ROC, Momentum, PPO, APO, TRIX, DPO, KST, Awesome Oscillator, Fisher Transform, Mass Index, NATR, Historical Volatility, StdDev, Hilbert, Ulcer Index), volume-flow (OBV, A/D, CMF, Force Index, EOM, NVI, PVI, Klinger, Chaikin Osc, VWAP distance), pivot/Fibonacci levels, candle-approximated order flow (delta, cumulative delta, POC distance, value-area position), and REAL-tick OTC order-flow (tick velocity delta/ratio, cluster stagnation). Call this BEFORE telling anyone a strategy type ("find marubozu", "RSI cross", "fade a stacked imbalance") isn\'t possible in MSL - almost everything already is, through these primitives combined with and/or/not/comparisons/avg/sum/min/max/count/abs/let/if() - and before writing a script that uses any of these names, to get the exact call signature right.',
+    args: '{}',
+    run: () => coreGet('/signal_vocab'),
+  },
+  {
     name: 'meta_strategy_snapshot',
     description:
       'The FULL panel-read grid for one pair+tf RIGHT NOW - every condition source a Meta-Strategy could reference (Oracle, HMA-ROC-Bull-Bear, Momentum Score, Next-Expiry, Accute, Renko, SMC aggregate AND each of the 15 individual SMC concepts by name - FVG/IFVG/Order Block/Breaker Block/Liquidity Sweep/BOS/CHoCH/OTE/KRM/Supply-Demand/Support-Resistance/Breakout/CRT/Power-of-3/Silver-Bullet, both Renko+SMC confluence rules, every chart-TYPE engine - Point&Figure/Range Bars/Candle/Heikin Ashi/Volume Bars/TPO/IV-HV/Line, the tick-desk quartet - tickSmc/tickOracle/tickTechnical/tickFootprint, and Technical/Reversal/Tempo/Confluence/VolArb/Cointegration), each with its OWN live {source, direction, confidence, label, value} - direct access to the actual reads, with no saved Meta-Strategy spec and no Meta Trader/auto-trader configuration needed. This is the gap meta_strategy_eval (needs a saved spec) and meta_trader_peek (only the ONE source Meta Trader is currently configured on) both leave open: "what does renko/smc-fvg/reversal say about EURUSD right now" with nothing armed. Use this first when sanity-checking an idea or comparing sources before writing a condition or script, or any time you need the raw per-source picture rather than a verdict.',
@@ -2210,7 +2265,7 @@ const TOOLS: ToolSpec[] = [
   {
     name: 'meta_strategy_test_script',
     description:
-      'Dry-run an MSL (Meta Strategy Lab script language) string against one asset+tf WITHOUT saving it - use this to validate a script you are drafting before meta_strategy_save. MSL grammar: `let <name> = <boolExpr|numExpr>`, `call when <boolExpr>`, `put when <boolExpr>`, `confidence = <numExpr>` (all four required in every script; call/put conditions and confidence are mandatory). Functions: avg/sum/min/max/count/abs. Field access on any condition source: .dir (call/put/none), .direction (alias), .conf/.confidence (0-100), .active (true if .dir != none), .call/.put (true if .dir matches that side). Sources: see meta_strategy_sources (oracle, accute, renko, pointFigure, rangeBars, smc, smcNow, renkoSmc, renkoSmcMajority, etc.) plus `smc:<KIND>` for any of the 15 individual SMC concepts (e.g. smc:FVG, smc:BOS, smc:ORDER_BLOCK) - KIND is NOT quoted and is part of the identifier, unlike a function call. Comparisons: == != >= > <= <, boolean and/or. Sandboxed: no loops, no function definitions, no raw candle access. Example: `let strong = smc:FVG.conf >= 60\\nlet chartsAgree = renko.dir == pointFigure.dir and renko.dir == rangeBars.dir\\ncall when oracle.dir == call and chartsAgree and strong\\nput when oracle.dir == put and chartsAgree\\nconfidence = avg(oracle.conf, renko.conf)`. Returns {ok, direction, confidence, trace (human-readable per-let-binding trace), price} or {ok:false, error} on a parse/type error - report the error verbatim and fix the script, don\'t guess.',
+      'Dry-run an MSL (Meta Strategy Lab script language) string against one asset+tf WITHOUT saving it - use this to validate a script you are drafting before meta_strategy_save. MSL grammar: `let <name> = <boolExpr|numExpr>`, `call when <boolExpr>`, `put when <boolExpr>`, `confidence = <numExpr>` (all four required in every script; call/put conditions and confidence are mandatory). Functions: avg/sum/min/max/count/abs. Field access on any condition source: .dir (call/put/none), .direction (alias), .conf/.confidence (0-100), .active (true if .dir != none), .call/.put (true if .dir matches that side). Sources: see meta_strategy_sources (oracle, accute, renko, pointFigure, rangeBars, smc, smcNow, renkoSmc, renkoSmcMajority, etc.) plus `smc:<KIND>` for any of the 15 individual SMC concepts (e.g. smc:FVG, smc:BOS, smc:ORDER_BLOCK) - KIND is NOT quoted and is part of the identifier, unlike a function call. Comparisons: == != >= > <= <, boolean and/or. Sandboxed: no loops, no function definitions. MSL v2 ALSO available (call signal_vocabulary first for the full reference, under mslV2): raw CONTINUOUS series via ind.<id>(...) (ind.rsi(14), ind.macd(12,26,9), etc - indexable [n], methods .slope/.max/.min/.mean/.stddev(n)/.crossed(...)), ohlc(offset) for a raw historical closed bar, cross(a,b)/between(x,lo,hi), and an optional trailing tf string on ind.*()/ohlc() for cross-timeframe reads (ind.rsi(14, "5m")). live() and tick.delta/velocity/ratio/count() exist too but only work inside the omni-trader (omni_trader_configure) - they fail closed here since this test path and every saved spec\'s normal evaluation are candle-close-paced, not live. Example: `let strong = smc:FVG.conf >= 60\\nlet chartsAgree = renko.dir == pointFigure.dir and renko.dir == rangeBars.dir\\ncall when oracle.dir == call and chartsAgree and strong\\nput when oracle.dir == put and chartsAgree\\nconfidence = avg(oracle.conf, renko.conf)`. Returns {ok, direction, confidence, trace (human-readable per-let-binding trace), price} or {ok:false, error} on a parse/type error - report the error verbatim and fix the script, don\'t guess.',
     args: '{"script": "let strong = smc:FVG.conf >= 60\\ncall when oracle.dir == call and strong\\nput when oracle.dir == put and strong\\nconfidence = oracle.conf", "asset": "EURUSD", "tf": "1m"}',
     run: (a) =>
       corePost('/meta_strategy_test_script', {
