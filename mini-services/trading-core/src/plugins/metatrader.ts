@@ -68,6 +68,7 @@ import type { NextCandleService } from './nextcandle'
 import type { NextExpiryService } from './nextexpiry'
 import type { AccuteService } from './accute'
 import type { MetaStrategyService } from './metastrategy'
+import type { MetaEvalResult } from '../analytics/metastrategy'
 import type { SmcScanService } from './smcscan'
 import type { SmcKind, SmcScanResult } from '../analytics/smc'
 import { smcNowRead, smcAnyAgrees } from '../analytics/smc'
@@ -527,6 +528,11 @@ export class MetaTraderService {
     passesConfidence: boolean
     configuredDirection: 'both' | 'call' | 'put'
     minConfidence: number
+    /** only set when signalSource is 'meta-strategy' and the spec is
+     * conditions-built (not scripted) - same per-condition {condition,
+     * read, passed} breakdown meta_strategy_eval exposes, so a quiet
+     * 'meta-strategy' source doesn't need a second call to explain itself. */
+    conditions?: MetaEvalResult['conditions']
   } | { source: MetaTraderSource; asset: string; error: string } {
     const src = this.config.signalSource
     const fail = (error: string) => ({ source: src, asset, error })
@@ -535,6 +541,7 @@ export class MetaTraderService {
       let confidence = 0
       let price = 0
       let note = ''
+      let conditions: MetaEvalResult['conditions'] | undefined
 
       if (src === 'meta-strategy') {
         const id = this.config.metaStrategyId
@@ -546,6 +553,7 @@ export class MetaTraderService {
         confidence = result.confidence
         price = p
         note = `meta-strategy "${id}": ${result.notes}`
+        conditions = result.conditions
       } else if (src === 'oracle') {
         const oracle = this.ctx.use<NextCandleService>('nextcandle')
         const pred = oracle.predict(asset, this.config.tf)
@@ -625,6 +633,7 @@ export class MetaTraderService {
         passesConfidence: finGte(confidence, this.config.minConfidence),
         configuredDirection: this.config.direction,
         minConfidence: this.config.minConfidence,
+        ...(conditions !== undefined ? { conditions } : {}),
       }
     } catch (err) {
       return fail(err instanceof Error ? err.message : String(err))

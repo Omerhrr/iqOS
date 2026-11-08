@@ -2502,6 +2502,32 @@ const httpServer = createServer(async (req, res) => {
         }
       }
 
+      // GET /meta_strategy_snapshot?asset=EURUSD&tf=1m - the FULL panel-read
+      // grid for one pair right now (MetaStrategyService.snapshotSources()):
+      // every condition source a Meta-Strategy could reference - Oracle,
+      // HMA-ROC-Bull-Bear, Momentum Score, Next-Expiry, Accute, Renko, SMC
+      // (aggregate + each of the 15 concepts by name), Renko+SMC confluence
+      // (both rules), every chart-TYPE engine (Point&Figure, Range Bars,
+      // Candle, Heikin Ashi, Volume Bars, TPO, IV-HV, Line), the tick-desk
+      // quartet, and Technical/Reversal/Tempo/Confluence/VolArb/Cointegration
+      // - each with its own live .direction/.confidence/.value, by name,
+      // independent of any saved spec or Meta Trader's single configured
+      // source. This is the SAME grid the AI Trader's desk prompt already
+      // gets handed as its second opinion (aitrader.ts) - exposed directly
+      // so "what does renko/technical:30s/reversal say about this pair right
+      // now" never needs a saved spec or a configured engine to answer.
+      if (path === '/meta_strategy_snapshot') {
+        try {
+          const tfv = tfStrict(q.get('tf'))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const asset = q.get('asset') ?? market.activeAsset
+          const meta = kernel.context().use<MetaStrategyService>('metaStrategy')
+          return json(200, { ok: true, asset, tf: tfv, reads: meta.snapshotSources(asset, tfv), ts: Date.now() })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
       // GET /ai_trader_status - config + running state + last error, for the panel.
       if (path === '/ai_trader_status') {
         const ai = kernel.context().use<AiTraderService>('aiTrader')

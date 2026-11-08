@@ -779,6 +779,109 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, reads: Record<string, 
   throw new MslRuntimeError('unreachable expression node')
 }
 
+/** Syntax-only rendering of an identifier/field-access chain (e.g.
+ * "technical:30s.conf") - no evaluation, just the dotted name a `call
+ * when`/`put when` clause actually wrote. Falls back to a generic
+ * placeholder for a sub-expression that isn't a plain name (a nested
+ * bin/unary/call as the object of a field access, e.g. "renko(2).dir" -
+ * rare in practice since clauses almost always name a source directly). */
+function prettyExpr(e: Expr): string {
+  switch (e.t) {
+    case 'ident':
+      return e.name
+    case 'field':
+      return `${prettyExpr(e.obj)}.${e.field}`
+    case 'num':
+      return String(e.v)
+    case 'str':
+      return JSON.stringify(e.v)
+    case 'bool':
+      return String(e.v)
+    case 'dir':
+      return e.v
+    default:
+      return '<expr>'
+  }
+}
+
+/** One decimal place for a clause-trace number - plenty of precision for
+ * "was this confidence over the gate", without trailing float noise. */
+function fmtExplainVal(v: MslValue): string {
+  if (isReadValue(v)) {
+    const parts = [`${v.direction}/${v.confidence}`]
+    if (v.value !== undefined) parts.push(`val ${Math.round(v.value * 100) / 100}`)
+    return parts.join(', ')
+  }
+  if (typeof v === 'number') return String(Math.round(v * 100) / 100)
+  return String(v)
+}
+
+/** Clause-level trace for ONE `call when`/`put when` expression - the
+ * per-source .dir/.conf (or let-bound intermediate) values that actually
+ * decided the true/false, instead of a bare "call when ... -> false" that
+ * names no cause. Mirrors evalExpr's exact laziness (and/or short-circuit,
+ * if()'s untaken branch) so it never forces a branch evalExpr itself would
+ * have skipped - a warming source in the untaken half of an if(), or past
+ * the short-circuit point of an "and"/"or", must stay unevaluated here too,
+ * or this would throw on data evalExpr never needed to touch. Every value
+ * is still produced by evalExpr itself (never reimplemented), so the trace
+ * can never disagree with the actual verdict - this only adds narration
+ * around calls evalExpr already made. */
+function explainExpr(e: Expr, env: Record<string, MslValue>, reads: Record<string, MslSourceRead>, resolve?: MslSignalResolver): { text: string; value: MslValue } {
+  switch (e.t) {
+    case 'num':
+    case 'str':
+    case 'bool':
+    case 'dir': {
+      const value = evalExpr(e, env, reads, resolve)
+      return { text: fmtExplainVal(value), value }
+    }
+    case 'ident':
+    case 'field': {
+      const value = evalExpr(e, env, reads, resolve)
+      return { text: `${prettyExpr(e)}=${fmtExplainVal(value)}`, value }
+    }
+    case 'unary': {
+      const inner = explainExpr(e.e, env, reads, resolve)
+      const value = e.op === 'not' ? !truthy(inner.value) : -asNum(inner.value)
+      return { text: `${e.op === 'not' ? 'not' : '-'}(${inner.text})=${fmtExplainVal(value)}`, value }
+    }
+    case 'bin': {
+      if (e.op === 'and') {
+        const left = explainExpr(e.l, env, reads, resolve)
+        if (!truthy(left.value)) return { text: `${left.text} and <short-circuited, not evaluated>`, value: false }
+        const right = explainExpr(e.r, env, reads, resolve)
+        return { text: `${left.text} and ${right.text}`, value: truthy(right.value) }
+      }
+      if (e.op === 'or') {
+        const left = explainExpr(e.l, env, reads, resolve)
+        if (truthy(left.value)) return { text: `${left.text} or <short-circuited, not evaluated>`, value: true }
+        const right = explainExpr(e.r, env, reads, resolve)
+        return { text: `${left.text} or ${right.text}`, value: truthy(right.value) }
+      }
+      // every other binary op is non-lazy (evalExpr always touches both
+      // sides) - safe to explain both, then let evalExpr itself compute the
+      // real result rather than re-deriving comparison/arithmetic semantics
+      // here a second time.
+      const left = explainExpr(e.l, env, reads, resolve)
+      const right = explainExpr(e.r, env, reads, resolve)
+      const value = evalExpr(e, env, reads, resolve)
+      return { text: `${left.text} ${e.op} ${right.text}=${fmtExplainVal(value)}`, value }
+    }
+    case 'call': {
+      if (e.fn === 'if') {
+        const cond = explainExpr(e.args[0], env, reads, resolve)
+        const takeThen = truthy(cond.value)
+        const branch = explainExpr(takeThen ? e.args[1] : e.args[2], env, reads, resolve)
+        return { text: `if(${cond.text}) ${takeThen ? 'then' : 'else'} ${branch.text}`, value: branch.value }
+      }
+      const value = evalExpr(e, env, reads, resolve)
+      const argTexts = e.args.map((a) => explainExpr(a, env, reads, resolve).text)
+      return { text: `${e.fn}(${argTexts.join(', ')})=${fmtExplainVal(value)}`, value }
+    }
+  }
+}
+
 /** Run a parsed script against one asset+tf's current source reads.
  * Fail-closed, same convention every other strategy evaluator in this
  * codebase uses: a runtime error (unknown source, a thin-history source
@@ -801,13 +904,13 @@ export function evaluateStrategyScript(ast: MslAst, reads: Record<string, MslSou
       if (stmt.kind === 'call') {
         const v = truthy(evalExpr(stmt.expr, env, reads, resolve))
         if (v) callFired = true
-        trace.push(`call when ... -> ${v}`)
+        trace.push(`call when ${explainExpr(stmt.expr, env, reads, resolve).text} -> ${v}`)
         continue
       }
       if (stmt.kind === 'put') {
         const v = truthy(evalExpr(stmt.expr, env, reads, resolve))
         if (v) putFired = true
-        trace.push(`put when ... -> ${v}`)
+        trace.push(`put when ${explainExpr(stmt.expr, env, reads, resolve).text} -> ${v}`)
         continue
       }
       if (stmt.kind === 'confidence') {
