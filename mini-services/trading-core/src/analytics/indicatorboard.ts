@@ -40,6 +40,18 @@
 // closed bars only. No kernel imports - analytics stays the pure layer.
 import type { Candle } from '../types'
 import * as ta from './indicators'
+// Direct instruction: "we currently have 113 [indicators], add each of our
+// chart type as an indicator also" - ten more lines, one per chart-type
+// engine (candle/tick/footprint/otc-footprint/renko/range/tick-footprint/
+// IV-HV/SMC/ICT), under their OWN family so they're clearly distinct from
+// the classic TA families above rather than mixed into 'trend'/'momentum'.
+// Reuses analytics/chartindicators.ts's adapter (same engines AI Trader's
+// own-math and the MSL sources now read) - no new math, just one more place
+// those ten reads show up.
+import { buildChartIndicatorBoard, type ChartIndicatorRow } from './chartindicators'
+import type { TickPoint } from './tickbars'
+import type { TickFootprintResult } from './tickdesk'
+import type { SmcScanResult } from './smc'
 
 export const BOARD_MIN_BARS = 30
 /** trailing z-score window for the unbounded volume accumulators */
@@ -47,7 +59,19 @@ const Z_WINDOW = 20
 /** minimum |z| for a volume-flow vote (below this the flow is balanced) */
 const Z_EPS = 0.5
 
-export type BoardFamily = 'trend' | 'momentum' | 'volatility' | 'volume' | 'levels'
+export type BoardFamily = 'trend' | 'momentum' | 'volatility' | 'volume' | 'levels' | 'chartType'
+
+/** Optional extra inputs for the ten chart-type indicator lines - every
+ * field is optional and independently missing-safe (see
+ * chartindicators.ts's buildChartIndicatorBoard), so a caller with only
+ * candles still gets the candle-only subset (candle/footprint-proxy/renko/
+ * range/IV-HV) with the rest reporting an honest 'n/a', never thrown away. */
+export interface BoardChartTypeInput {
+  realTicks?: TickPoint[] | null
+  otcFootprint?: { signal: 'call' | 'put' | 'none'; score: number; netDelta: number; avgSpeedRatio: number; buckets: number } | null
+  tickFootprint?: TickFootprintResult | null
+  smc?: SmcScanResult | null
+}
 export type BoardStance = 'bullish' | 'bearish' | 'neutral' | 'n/a'
 
 export interface BoardLine {
@@ -125,7 +149,7 @@ function tallyOf(lines: BoardLine[]): IndicatorBoard['tally'] {
 /** The full indicator workup over CLOSED candles. Returns ok:false with a
  * warming note (and zero lines) on a slice too thin for the shortest
  * warmups - every longer warmup degrades to its own honest 'n/a' line. */
-export function buildIndicatorBoard(candles: Candle[]): IndicatorBoard {
+export function buildIndicatorBoard(candles: Candle[], chartTypeInput?: BoardChartTypeInput): IndicatorBoard {
   const n = candles.length
   if (n < BOARD_MIN_BARS) {
     return { ok: false, note: `warming up - needs ${BOARD_MIN_BARS}+ closed bars (has ${n})`, lines: [], tally: { bull: 0, bear: 0, neutral: 0, counted: 0 } }
@@ -331,6 +355,22 @@ export function buildIndicatorBoard(candles: Candle[]): IndicatorBoard {
     lines.push(line('levels', 'Nearest fib dist', 'n/a', 'n/a'))
   }
 
+  // ---------- CHART TYPE (candle/tick/footprint/otc-footprint/renko/range/
+  // tick-footprint/IV-HV/SMC/ICT) - one line each, same rows
+  // chartindicators.ts already hands AI Trader's own-math and the MSL
+  // sources, just reduced to this board's BoardLine shape so they show up
+  // here too instead of only in those two places.
+  const chartRows: ChartIndicatorRow[] = buildChartIndicatorBoard({
+    candles,
+    realTicks: chartTypeInput?.realTicks ?? null,
+    otcFootprint: chartTypeInput?.otcFootprint ?? null,
+    tickFootprint: chartTypeInput?.tickFootprint ?? null,
+    smc: chartTypeInput?.smc ?? null,
+  })
+  for (const r of chartRows) {
+    lines.push(line('chartType', r.label, r.direction === 'none' ? 'n/a' : `${r.confidence}%`, r.direction === 'call' ? 'bullish' : r.direction === 'put' ? 'bearish' : 'n/a', r.note))
+  }
+
   return { ok: true, note: `${lines.length} indicators reported`, lines, tally: tallyOf(lines) }
 }
 
@@ -340,17 +380,17 @@ const STANCE_MARK: Record<BoardStance, string> = { bullish: 'BULL', bearish: 'BE
  * "name value [STANCE]" - compact enough for a prompt, complete enough that
  * "does the trader see ALL our indicators" is answered YES. The tally header
  * leads with the vote count so the model reads the balance first. */
-export function indicatorBoardLines(candles: Candle[]): string[] {
-  const board = buildIndicatorBoard(candles)
+export function indicatorBoardLines(candles: Candle[], chartTypeInput?: BoardChartTypeInput): string[] {
+  const board = buildIndicatorBoard(candles, chartTypeInput)
   if (!board.ok) return [`indicator board: ${board.note}`]
-  const order: BoardFamily[] = ['trend', 'momentum', 'volatility', 'volume', 'levels']
+  const order: BoardFamily[] = ['trend', 'momentum', 'volatility', 'volume', 'levels', 'chartType']
   const out: string[] = [
     `vote tally: ${board.tally.counted} counted -> ${board.tally.bull} bull / ${board.tally.bear} bear / ${board.tally.neutral} neutral (n/a warmups excluded - an absent vote is not a quiet vote)`,
   ]
   for (const fam of order) {
     const famLines = board.lines.filter((l) => l.family === fam)
     if (!famLines.length) continue
-    const body = famLines.map((l) => `${l.name} ${l.value} [${STANCE_MARK[l.stance]}]${l.detail && l.family === 'trend' ? ` (${l.detail})` : ''}`).join(' · ')
+    const body = famLines.map((l) => `${l.name} ${l.value} [${STANCE_MARK[l.stance]}]${l.detail && (l.family === 'trend' || l.family === 'chartType') ? ` (${l.detail})` : ''}`).join(' · ')
     out.push(`${fam}: ${body}`)
   }
   return out

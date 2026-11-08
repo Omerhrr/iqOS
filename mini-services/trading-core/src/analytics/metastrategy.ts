@@ -54,8 +54,25 @@ export type MetaConditionSource =
   | 'area' // see 'line' above - identical reduction, different chart-type name for the dropdown
   | 'baseline' // see 'line' above - identical reduction, different chart-type name for the dropdown
   | 'volumeBars' // constant-volume bar trend/streak (analytics/volumebars.ts) - same streak convention as Renko/Range, but bars close on cumulative volume instead of price distance; 'none' when the feed has no real volume (volumeBars().degenerate)
-  | 'tick' // tick-bar cadence read (chartsignals.ts tickVote) - uses the close-price proxy fallback here (no live tick-buffer wiring into the Meta Strategy Lab yet), same honest "close-proxy" labeling the committee itself uses when no real tick buffer is available
+  // PRECISION FIX (operator noticed, while discussing AI Trader's own-math
+  // overhaul, that 'tick' below was never actually wired to a real tick
+  // buffer): readSource('tick') now passes the SAME otc-footprint tick
+  // stream the tick-desk sources already read (ticksFor(asset)) into
+  // chartsignals.ts's tickVote - when that buffer is cold/thin it still
+  // falls back to the honest close-price proxy (tickVote's own contract),
+  // so this never regresses to a worse answer than before, only a better
+  // one once real prints exist.
+  | 'tick' // tick-bar cadence read (chartsignals.ts tickVote) - REAL micro-tick stream when the otc-footprint collector has one buffered for this asset, close-price proxy fallback otherwise (tickVote's own honest degrade, same one used when no buffer exists at all)
   | 'footprint' // volume footprint CLV-proxy delta (chartsignals.ts footprintVote) - same CLV approximation orderflow.ts uses everywhere else in this codebase, since IQ Option exposes no real bid/ask-tagged trades
+  // otcFootprint: the REAL print-SPEED/velocity engine (analytics/otcfootprint.ts's
+  // buildFootprint, same one plugins/otcfootprint.ts's async footprint()
+  // wraps - this calls the identical pure function directly, sync, off
+  // whatever ticks are already buffered, so it never forces a fresh live
+  // pull from inside a condition read) - distinct from 'footprint' above
+  // (that one is a CANDLE-close CLV proxy): this one is actual measured
+  // up/down print speed and net delta, the same numbers the OTC Footprint
+  // panel and AI Trader's own-math both already show.
+  | 'otcFootprint'
   | 'tpo' // Market Profile / Time Price Opportunity (analytics/tpo.ts) - direction from price trading above/below the session's Point of Control, confidence scaled by distance relative to the 70% value-area width
   | 'ivHv' // Implied vs Historical Volatility (analytics/ivhv.ts) - NOT a volatility forecast (vol has no direction); the directional read here is the realized up-closing frequency over a trailing window vs 50% (same honest "realized WR vs breakeven" framing ivhv.ts's own module header uses)
   // Tick-desk sources (analytics/tickdesk.ts) - the SAME four engines the
@@ -90,6 +107,13 @@ export type MetaConditionSource =
   | 'chartSignals' // the chart-signal pattern COMMITTEE (analytics/chartsignals.ts via plugins/chartsignals.ts) - the SUGGESTED trade direction (already FADE-adjusted when the committee's own agree/strength floor says to fade it), confidence = |score| 0..100
   | 'leadLag' // the Lead-Lag scanner (plugins/leadlagscan.ts): is a correlated LEADER already moving first - direction = the scanner's own suggested follow trade, 'none' when no qualifying leader/lag fit exists for this pair this cycle
   | 'yesterday' // the Yesterday (T-24h replay) echo (plugins/yesterday.ts): did today's lead-in rhyme with yesterday's at this same wall-clock hour - a WEAK PRIOR by design (markets rhyme, they do not repeat), direction only claimed when the echo's dirAgree is 'same' and the window wasn't quiet/trivial, confidence capped low-to-moderate on purpose
+  // Per direct instruction: 'smc'/'smcNow' above lump all 15 SMC/ICT
+  // concepts into one vote - this splits that SAME scan (never re-scanned)
+  // into the two halves analytics/smc.ts's own module header already
+  // documents: classic/generic market-structure terms vs specifically
+  // ICT-originated ones. 'smc' below is renamed in spirit, not in code -
+  // it still means "the generic half" when read next to this one.
+  | 'ict' // ICT-specific concepts only (FVG, IFVG, Order Block, Breaker Block, Liquidity Sweep, OTE, KRM, CRT, Power of 3, Silver Bullet) off the SAME scanSmc() scan 'smc'/'smcNow' already read - see analytics/chartindicators.ts's ICT_KINDS split for the exact list and the reasoning
 
 export const META_CONDITION_SOURCES: readonly MetaConditionSource[] = [
   'oracle',
@@ -129,6 +153,8 @@ export const META_CONDITION_SOURCES: readonly MetaConditionSource[] = [
   'chartSignals',
   'leadLag',
   'yesterday',
+  'otcFootprint',
+  'ict',
 ]
 
 export type MetaDirection = 'call' | 'put' | 'none'

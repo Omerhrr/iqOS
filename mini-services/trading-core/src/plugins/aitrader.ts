@@ -93,7 +93,7 @@ import { computeTickFootprint, computeTickOracle, computeTickSmc, computeTickTec
 import { chatComplete, providerStatus, type ChatMessage } from '../lib/llm'
 import { tfSeconds } from '../analytics/synthfeed'
 import { atr, closes, highs, lows, rsi, trueRange } from '../analytics/indicators'
-import { indicatorBoardLines } from '../analytics/indicatorboard'
+import { indicatorBoardLines, type BoardChartTypeInput } from '../analytics/indicatorboard'
 import { classifySession } from '../analytics/session'
 // OWN-MATH PRECISION REWORK (direct instruction: shift the trader's own math
 // off raw-candle indicators onto tick+footprint+technical-ladder as the
@@ -1420,7 +1420,18 @@ export class AiTraderService {
    * (own math/next-candle/tick desk/OTC velocity footprint/reversal/
    * technical/Accute) or a cheap, safety-relevant governance read
    * (session/risk-book/memory-gate/OTC-guard) that is never optional. */
-  async deskBriefingFor(asset: string, tf: Timeframe, ts: number, stake: number, optionalIds: Set<string>): Promise<{ lines: string[]; sourcesSeen: number }> {
+  async deskBriefingFor(
+    asset: string,
+    tf: Timeframe,
+    ts: number,
+    stake: number,
+    optionalIds: Set<string>,
+    // Reuses whatever own-math already computed this cycle (real ticks,
+    // the OTC footprint summary, the tick-footprint read, the SMC scan) so
+    // the OPTIONAL indicator-board seat's ten new chart-type lines don't
+    // recompute any of it - see chartindicators.ts / indicatorboard.ts.
+    chartTypeCtx?: BoardChartTypeInput,
+  ): Promise<{ lines: string[]; sourcesSeen: number }> {
     const lines: string[] = []
     let sourcesSeen = 0
     const section = (header: string, body: string[]) => {
@@ -1832,10 +1843,10 @@ export class AiTraderService {
       } catch {
         board = []
       }
-      const boardLines = board.length ? indicatorBoardLines(board) : []
+      const boardLines = board.length ? indicatorBoardLines(board, chartTypeCtx) : []
       // indicatorBoardLines returns a warming note even on thin history -
       // surface that honestly rather than silently omitting the seat.
-      if (boardLines.length) section('indicator board (the FULL indicator workup: trend / momentum / volatility / volume / levels, every read name value [BULL|BEAR|=|n/a])', boardLines)
+      if (boardLines.length) section('indicator board (the FULL indicator workup: trend / momentum / volatility / volume / levels / chart-type, every read name value [BULL|BEAR|=|n/a])', boardLines)
     } catch {
       // omitted
     }
@@ -2299,7 +2310,12 @@ export class AiTraderService {
       // moment needs it - so a cheap triage call picks which EXTRA seats
       // (if any) are worth computing before the full briefing is built.
       const optionalIds = await this.triageSelectSources(asset, tf, horizonLines, recentCloses, anatomy, structure, atrPct, rsiLast, ownMathSummaryForTriage)
-      const briefing = await this.deskBriefingFor(asset, tf, ts, bet.amount, optionalIds)
+      const briefing = await this.deskBriefingFor(asset, tf, ts, bet.amount, optionalIds, {
+        realTicks: rawTicks.length ? rawTicks.map((t) => ({ time: Math.floor(t.ts / 1000), price: t.price })) : null,
+        otcFootprint: footprintResult ? { ...footprintResult.summary, buckets: footprintResult.buckets.length } : null,
+        tickFootprint: rawTicks.length ? computeTickFootprint(rawTicks, { bucketSec: 60 }) : null,
+        smc: smcResult,
+      })
       // audit trail: the stored decision's snapshot keeps the panel grid AND
       // every desk line, tagged source 'desk' so a replay of the log can tell
       // a panel read from a briefing line (matches the client's

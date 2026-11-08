@@ -41,8 +41,10 @@ import { computeTpo } from '../analytics/tpo'
 import { realizedUpProb } from '../analytics/ivhv'
 import { EXPIRIES_MIN } from '../analytics/nextexpiry'
 import { TECH_LADDER } from '../analytics/technicals'
-import { engineVoteSingle, type ChartEngineVote } from '../analytics/chartsignals'
+import { engineVoteSingle, tickVote, otcFootprintVote, type ChartEngineVote } from '../analytics/chartsignals'
 import { smcNowRead, smcAnyAgrees, ALL_SMC_KINDS } from '../analytics/smc'
+import { buildFootprint } from '../analytics/otcfootprint'
+import { ICT_KINDS, voteForKindSet } from '../analytics/chartindicators'
 import { buildCtx } from '../strategies/custom'
 import { makeSignalResolver } from '../strategies/signalscript'
 import {
@@ -484,6 +486,17 @@ export class MetaStrategyService {
           if (read.direction === 'none') return none(`SMC now${kind ? ` (${kind})` : ''}: ${read.note}`)
           return { source, direction: read.direction, confidence: read.confidence, label: `SMC now${kind ? ` ${kind}` : ''} ${read.direction.toUpperCase()} - ${read.note}` }
         }
+        case 'ict': {
+          // Splits the SAME scan 'smc'/'smcNow' above already read into just
+          // the ICT-originated concepts (analytics/chartindicators.ts's
+          // ICT_KINDS, reused here rather than redefined) - never re-scans.
+          const smc = this.ctx.use<SmcScanService>('smcScan')
+          const resp = smc.scan(asset, tf)
+          if (!resp.result) return none('ICT: no scan result yet')
+          const row = voteForKindSet(resp.result, ICT_KINDS, 'ict', 'ICT')
+          if (row.direction === 'none') return none(`ICT: ${row.note}`)
+          return { source, direction: row.direction, confidence: row.confidence, label: `ICT ${row.direction.toUpperCase()} - ${row.note}` }
+        }
         case 'pointFigure': {
           // "not just renko, p&f, range and all others as we see fit" per
           // direct instruction - Point & Figure has no native streak the
@@ -543,7 +556,21 @@ export class MetaStrategyService {
         }
         case 'tick': {
           const candles = this.market.getCandlesDeep(asset, tf, 300, true)
-          const vote = engineVoteSingle('tick', candles)
+          // PRECISION FIX: this used to always pass realTicks:null (the
+          // close-price proxy fallback, see the type's own doc comment in
+          // analytics/metastrategy.ts) - now reuses the SAME tick buffer
+          // the tick-desk sources already read, so a warm buffer gets the
+          // real transaction-built vote; tickVote's own contract still
+          // degrades honestly to the close-proxy when the buffer is cold.
+          let realTicks: { time: number; price: number }[] | null = null
+          try {
+            const ofp = this.ctx.use<OtcFootprintService>('otcFootprint')
+            const raw = ofp.ticksFor(asset)
+            if (raw.length) realTicks = raw.map((t) => ({ time: Math.floor(t.ts / 1000), price: t.price }))
+          } catch {
+            realTicks = null // collector not loaded - proxy fallback, unchanged behavior
+          }
+          const vote = tickVote(candles, realTicks)
           if (vote.dir === 0) return none(`Tick: no lean - ${vote.note}`)
           const direction = vote.dir === 1 ? 'call' : 'put'
           const confidence = Math.round(Math.min(1, Math.max(0, vote.weight)) * 100)
@@ -556,6 +583,33 @@ export class MetaStrategyService {
           const direction = vote.dir === 1 ? 'call' : 'put'
           const confidence = Math.round(Math.min(1, Math.max(0, vote.weight)) * 100)
           return { source, direction, confidence, label: `Footprint ${direction.toUpperCase()} - ${vote.note}` }
+        }
+        case 'otcFootprint': {
+          // REAL print-speed/velocity footprint (analytics/otcfootprint.ts's
+          // buildFootprint - the exact pure function plugins/otcfootprint.ts's
+          // async footprint() wraps) - called directly here, sync, off
+          // whatever ticks are ALREADY buffered, so a condition read never
+          // triggers a fresh live pull itself (that stays the async service's
+          // job on its own poll cadence; this is best-effort off the
+          // existing buffer, same "never block a sync read" rule every
+          // other source here already follows).
+          const ofp = this.ctx.use<OtcFootprintService>('otcFootprint')
+          const ticks = ofp.ticksFor(asset)
+          if (!ticks.length) return none('OTC footprint: tick buffer cold')
+          const fp = buildFootprint(ticks, { minutes: 30, bucketSec: 60, asset, dataSourceLabel: this.market.mode === 'live' ? 'sidecar-tick-100ms' : 'sim-tick-1s' })
+          // reuse otcFootprintVote's own weight scaling (chartsignals.ts) -
+          // the SAME function the Chart Signal committee and
+          // chartindicators.ts's board use for this exact OtcFpRead shape,
+          // rather than re-deriving a confidence formula here.
+          const vote = otcFootprintVote({ signal: fp.summary.signal, score: fp.summary.score, netDelta: fp.summary.netDelta, avgSpeedRatio: fp.summary.avgSpeedRatio, buckets: fp.buckets.length })
+          if (vote.dir === 0) return none(`OTC footprint: ${vote.note}`)
+          return {
+            source,
+            direction: vote.dir === 1 ? 'call' : 'put',
+            confidence: Math.round(Math.min(1, Math.max(0, vote.weight)) * 100),
+            value: fp.summary.netDelta,
+            label: `OTC footprint ${vote.dir === 1 ? 'CALL' : 'PUT'} - ${vote.note}`,
+          }
         }
         case 'line':
         case 'area':
@@ -906,6 +960,7 @@ export class MetaStrategyService {
       renko: toMsl(this.readSource('renko', asset, tf, undefined, undefined, undefined, cfg)),
       smc: toMsl(this.readSource('smc', asset, tf)),
       smcNow: toMsl(this.readSource('smcNow', asset, tf)),
+      ict: toMsl(this.readSource('ict', asset, tf)),
       renkoSmc: toMsl(this.readSource('renkoSmc', asset, tf, undefined, undefined, undefined, cfg)),
       renkoSmcMajority: toMsl(this.readSource('renkoSmcMajority', asset, tf, undefined, undefined, undefined, cfg)),
       pointFigure: toMsl(this.readSource('pointFigure', asset, tf, undefined, undefined, undefined, cfg)),
@@ -919,6 +974,7 @@ export class MetaStrategyService {
       volumeBars: toMsl(this.readSource('volumeBars', asset, tf, undefined, undefined, undefined, cfg)),
       tick: toMsl(this.readSource('tick', asset, tf)),
       footprint: toMsl(this.readSource('footprint', asset, tf)),
+      otcFootprint: toMsl(this.readSource('otcFootprint', asset, tf)),
       tpo: toMsl(this.readSource('tpo', asset, tf, undefined, undefined, undefined, cfg)),
       ivHv: toMsl(this.readSource('ivHv', asset, tf, undefined, undefined, undefined, cfg)),
       tickSmc: toMsl(this.readSource('tickSmc', asset, tf, undefined, undefined, undefined, cfg)),

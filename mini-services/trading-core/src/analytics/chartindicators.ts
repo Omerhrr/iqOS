@@ -54,10 +54,12 @@ export interface ChartIndicatorRow {
 
 /** ICT-originated concepts (per smc.ts's own module-header admission) -
  * everything else live in SmcKind is the generic/classic structure half. */
-const ICT_KINDS: ReadonlySet<SmcKind> = new Set<SmcKind>([
+/** Exported so other callers (plugins/metastrategy.ts's 'ict'/'smc' MSL
+ * sources) can reuse the exact same split instead of redefining it. */
+export const ICT_KINDS: ReadonlySet<SmcKind> = new Set<SmcKind>([
   'FVG', 'IFVG', 'ORDER_BLOCK', 'BREAKER_BLOCK', 'LIQUIDITY_SWEEP', 'OTE', 'KRM', 'CRT', 'POWER_OF_3', 'SILVER_BULLET',
 ])
-const SMC_KINDS: ReadonlySet<SmcKind> = new Set<SmcKind>(['BOS', 'CHOCH', 'SUPPLY_DEMAND', 'SUPPORT_RESISTANCE', 'BREAKOUT'])
+export const SMC_KINDS: ReadonlySet<SmcKind> = new Set<SmcKind>(['BOS', 'CHOCH', 'SUPPLY_DEMAND', 'SUPPORT_RESISTANCE', 'BREAKOUT'])
 
 function fromVote(id: ChartIndicatorId, label: string, v: ChartEngineVote): ChartIndicatorRow {
   return {
@@ -74,7 +76,7 @@ function fromVote(id: ChartIndicatorId, label: string, v: ChartEngineVote): Char
  * smcNowRead() (smc.ts) uses for the whole-scan read, just scoped to a
  * SUBSET of kinds so SMC and ICT can be reported as two separate rows off
  * one scan instead of smcNowRead's single all-kinds verdict. */
-function voteForKindSet(result: SmcScanResult, kinds: ReadonlySet<SmcKind>, id: ChartIndicatorId, label: string): ChartIndicatorRow {
+export function voteForKindSet(result: SmcScanResult, kinds: ReadonlySet<SmcKind>, id: ChartIndicatorId, label: string): ChartIndicatorRow {
   const now = result.signals.filter((s) => s.barsAgo === 0 && kinds.has(s.kind))
   if (!now.length) return { id, label, direction: 'none', confidence: 0, note: 'no concept in this group fired this candle' }
   const bullish = now.filter((s) => s.direction === 'bullish').length
