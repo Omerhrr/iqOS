@@ -76,6 +76,42 @@ export const CHART_TYPES: { id: ChartType; label: string }[] = [
 // kernel route payloads for the Task 63 chart fetches (ChartPanel)
 export interface TickBarRow { time: number; endTime: number; open: number; high: number; low: number; close: number; ticks: number }
 export interface TicksResponse { ok: boolean; dataSource: 'tick' | 'candle'; per: number; note: string; bars: TickBarRow[] }
+
+// candlestick pattern detection on the TICK chart (/tick_patterns,
+// analytics/tickpatterns.ts) - same detectPatterns() library every other
+// pattern surface (Pattern Bias, ADX+Pattern, Candle Math) uses, run
+// against tick-bars (tickBars()'s own N-tick aggregation) instead of
+// time-candles, so a formation that forms and resolves inside a single
+// time-candle still gets caught.
+export interface TickPatternHit {
+  name: string
+  direction: 'bullish' | 'bearish' | 'neutral'
+  reliability: 1 | 2 | 3
+  barsAgo: number
+  note: string
+  /** the anchor tick-bar's own close time - lines the hit up against the
+   * tick chart's own x-axis, which doesn't share a grid with time candles */
+  time: number
+  /** ticks aggregated into the anchor bar (== `per` except a half-formed trailing bar) */
+  ticks: number
+}
+export interface TickPatternsResponse {
+  ok: boolean
+  asset: string
+  feed: string
+  dataSource: 'tick' | 'candle'
+  per: number
+  perRule: string
+  barCount: number
+  lookback: number
+  hits: TickPatternHit[]
+  note: string
+  error?: string
+}
+
+export async function getTickPatterns(asset: string, opts?: { per?: number; lookback?: number }): Promise<TickPatternsResponse> {
+  return osGet<TickPatternsResponse>('/tick_patterns', { asset, per: opts?.per, lookback: opts?.lookback })
+}
 export interface IvHvResponse {
   ok: boolean
   hv: { time: number; hv: number }[]

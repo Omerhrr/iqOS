@@ -89,6 +89,7 @@ import { volumeBars } from './src/analytics/volumebars'
 import { computeFootprint } from './src/analytics/footprint'
 import { computeTpo } from './src/analytics/tpo'
 import { tickBars } from './src/analytics/tickbars'
+import { detectTickPatterns } from './src/analytics/tickpatterns'
 import { hvSeries, ivFromPayout, realizedUpProb } from './src/analytics/ivhv'
 import { buildCalibrationReport, type CalibrationStoreSlice } from './src/analytics/calibration'
 import { computeStepStats, computeIntervalStats } from './src/analytics/randomness'
@@ -1331,6 +1332,41 @@ const httpServer = createServer(async (req, res) => {
           count: r.bars.length,
           bars: r.bars.slice(-160),
           note: r.dataSource === 'candle' ? 'pseudo-ticks = 5s candle closes (no raw tick buffer available) - NOT raw tick data' : 'real broker price changes from the 100ms capture buffer (coalescing bounded by poll rate)',
+        })
+      }
+
+      // Candlestick pattern detection on the TICK chart - per direct
+      // instruction ("lets build a panel for detecting candle pattern on
+      // tick chart"). Same tick-bar construction /ticks itself uses
+      // (tickBars() over market.getTickSeries()'s honest tick/candle-
+      // fallback feed), then detectTickPatterns() (analytics/
+      // tickpatterns.ts) runs the SAME detectPatterns() library every other
+      // pattern surface in this OS uses - just against tick-bars instead of
+      // time-candles, so a formation that only resolves inside one time-
+      // candle (invisible to every candle-timeframe pattern scan) still
+      // gets caught here.
+      if (path === '/tick_patterns') {
+        const asset = q.get('asset') ?? market.activeAsset
+        const perRaw = Number(q.get('per'))
+        const lookbackRaw = Number(q.get('lookback'))
+        const { points, dataSource } = await market.getTickSeries(asset)
+        const r = tickBars(points, { per: Number.isFinite(perRaw) && perRaw >= 2 ? perRaw : undefined, dataSource })
+        const lookback = Number.isFinite(lookbackRaw) && lookbackRaw >= 1 ? Math.min(Math.round(lookbackRaw), 40) : 8
+        const hits = detectTickPatterns(r.bars, lookback)
+        return json(200, {
+          ok: true,
+          asset,
+          feed: market.mode,
+          dataSource: r.dataSource,
+          per: r.per,
+          perRule: r.perRule,
+          barCount: r.bars.length,
+          lookback,
+          hits,
+          note:
+            r.dataSource === 'candle'
+              ? 'pseudo-ticks = 5s candle closes (no raw tick buffer available) - patterns here reflect THAT resolution, not raw ticks'
+              : 'scanned over real broker tick bars - a hit can complete and resolve faster than any time-candle (1m, 5m, ...) would ever show it',
         })
       }
 

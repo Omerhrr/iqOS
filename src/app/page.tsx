@@ -43,6 +43,7 @@ import TickSmcPanel from '@/components/os/TickSmcPanel'
 import TickOraclePanel from '@/components/os/TickOraclePanel'
 import TickTechnicalPanel from '@/components/os/TickTechnicalPanel'
 import TickFootprintPanel from '@/components/os/TickFootprintPanel'
+import TickPatternsPanel from '@/components/os/TickPatternsPanel'
 import PairComparePanel from '@/components/os/PairComparePanel'
 import PairSignalPanel, { type PatternDetail } from '@/components/os/PairSignalPanel'
 import MarkovPanel from '@/components/os/MarkovPanel'
@@ -99,7 +100,7 @@ const INDICATOR_STORAGE_KEY = 'iqos.activeIndicators.v1'
 // @ Now", "Cointegration") out of the open strip entirely instead of just
 // closing it each time - it stays hidden across reloads until re-checked in
 // the Panels settings menu. Nothing is deleted, this only gates rendering.
-type PanelId = 'signals' | 'yday' | 'leadlag' | 'distill' | 'cointegration' | 'volarb' | 'triangulation' | 'adxPatternBias' | 'shockPressure' | 'renkoFootprint' | 'renkoFootprintOtc' | 'volumeFootprint' | 'tickVolume' | 'tickSmc' | 'tickOracle' | 'tickTechnical' | 'tickFootprint' | 'pairCompare' | 'pairSignal' | 'oracle' | 'nextExpiry' | 'nextExpiryGlobal' | 'technical' | 'technicalGlobal' | 'reversal' | 'reversalGlobal' | 'nextGlobal' | 'tempo' | 'tempoGlobal' | 'accute' | 'accuteGlobal' | 'smcRecent' | 'smcGlobal' | 'globalDom'
+type PanelId = 'signals' | 'yday' | 'leadlag' | 'distill' | 'cointegration' | 'volarb' | 'triangulation' | 'adxPatternBias' | 'shockPressure' | 'renkoFootprint' | 'renkoFootprintOtc' | 'volumeFootprint' | 'tickVolume' | 'tickSmc' | 'tickOracle' | 'tickTechnical' | 'tickFootprint' | 'tickPatterns' | 'pairCompare' | 'pairSignal' | 'oracle' | 'nextExpiry' | 'nextExpiryGlobal' | 'technical' | 'technicalGlobal' | 'reversal' | 'reversalGlobal' | 'nextGlobal' | 'tempo' | 'tempoGlobal' | 'accute' | 'accuteGlobal' | 'smcRecent' | 'smcGlobal' | 'globalDom'
 const PANEL_META: { id: PanelId; label: string }[] = [
   { id: 'signals', label: 'Chart Signals' },
   { id: 'yday', label: 'Yesterday @ Now' },
@@ -118,6 +119,7 @@ const PANEL_META: { id: PanelId; label: string }[] = [
   { id: 'tickOracle', label: 'Tick Oracle' },
   { id: 'tickTechnical', label: 'Tick Technical' },
   { id: 'tickFootprint', label: 'Tick Footprint' },
+  { id: 'tickPatterns', label: 'Tick Patterns' },
   { id: 'pairCompare', label: 'Pair Compare' },
   { id: 'pairSignal', label: 'Pair Signal' },
   { id: 'oracle', label: 'Next-Candle Oracle' },
@@ -154,6 +156,7 @@ const DEFAULT_PANEL_VISIBILITY: Record<PanelId, boolean> = {
   tickOracle: true,
   tickTechnical: true,
   tickFootprint: true,
+  tickPatterns: true,
   pairCompare: true,
   pairSignal: true,
   oracle: true,
@@ -298,6 +301,7 @@ export default function OSPage() {
   const [tickOracleOpen, setTickOracleOpen] = useState(false)
   const [tickTechnicalOpen, setTickTechnicalOpen] = useState(false)
   const [tickFootprintOpen, setTickFootprintOpen] = useState(false)
+  const [tickPatternsOpen, setTickPatternsOpen] = useState(false)
   const [pairCompareOpen, setPairCompareOpen] = useState(false)
   const [pairSignalOpen, setPairSignalOpen] = useState(false)
   // panel visibility (Panels settings menu) - which of the above are even
@@ -1412,7 +1416,7 @@ export default function OSPage() {
                 closed = the slim open strip sits above the market watch and
                 everything is laid out exactly as before. */}
             <Panel defaultSize={17} minSize={11}>
-              {signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen || shockPressureOpen || renkoFootprintOpen || renkoFootprintOtcOpen || volumeFootprintOpen || tickVolumeOpen || tickSmcOpen || tickOracleOpen || tickTechnicalOpen || tickFootprintOpen || pairCompareOpen || pairSignalOpen || oracleOpen || nextExpiryOpen || nextExpiryGlobalOpen || technicalOpen || technicalGlobalOpen || reversalOpen || reversalGlobalOpen || smcRecentOpen || smcGlobalOpen || globalDomOpen || nextGlobalOpen || tempoOpen || tempoGlobalOpen || accuteOpen || accuteGlobalOpen ? (
+              {signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen || shockPressureOpen || renkoFootprintOpen || renkoFootprintOtcOpen || volumeFootprintOpen || tickVolumeOpen || tickSmcOpen || tickOracleOpen || tickTechnicalOpen || tickFootprintOpen || tickPatternsOpen || pairCompareOpen || pairSignalOpen || oracleOpen || nextExpiryOpen || nextExpiryGlobalOpen || technicalOpen || technicalGlobalOpen || reversalOpen || reversalGlobalOpen || smcRecentOpen || smcGlobalOpen || globalDomOpen || nextGlobalOpen || tempoOpen || tempoGlobalOpen || accuteOpen || accuteGlobalOpen ? (
                 <div className="mr-0.5 h-full min-h-0">
                   {ydayOpen ? (
                     <YesterdayPanel onClose={() => setYdayOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onFocusWindow={handleFocusYesterday} />
@@ -1480,6 +1484,8 @@ export default function OSPage() {
                     <TickTechnicalPanel asset={asset} onClose={() => setTickTechnicalOpen(false)} onOpenTickSmc={() => handleOpenTickSmc(asset)} onOpenTickOracle={() => handleOpenTickOracle(asset)} onOpenTickFootprint={() => handleOpenTickFootprint(asset)} />
                   ) : tickFootprintOpen ? (
                     <TickFootprintPanel asset={asset} onClose={() => setTickFootprintOpen(false)} onOpenTickSmc={() => handleOpenTickSmc(asset)} onOpenTickOracle={() => handleOpenTickOracle(asset)} onOpenTickTechnical={() => handleOpenTickTechnical(asset)} />
+                  ) : tickPatternsOpen ? (
+                    <TickPatternsPanel asset={asset} onClose={() => setTickPatternsOpen(false)} />
                   ) : (
                     <ChartSignalsPanel onClose={() => setSignalsOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onTake={handleTakeSignal} />
                   )}
@@ -1660,6 +1666,18 @@ export default function OSPage() {
                       >
                         <span className="h-1.5 w-1.5 rounded-full bg-orange-300" />
                         Tick Footprint
+                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
+                      </button>
+                      )}
+                      {panelVisibility.tickPatterns && (
+                      <button
+                        type="button"
+                        onClick={() => setTickPatternsOpen(true)}
+                        title="tick patterns - candlestick pattern detection run against the tick chart's own N-tick bars, not time-candles, so a formation that forms and resolves inside a single 1m/5m candle still gets caught"
+                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-cyan-500/40 hover:text-cyan-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-cyan-300" />
+                        Tick Patterns
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
                       )}
