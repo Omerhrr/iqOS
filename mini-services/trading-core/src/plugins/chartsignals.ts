@@ -105,13 +105,15 @@ export class ChartSignalsService {
       this.otcFp = null // footprint engine absent - OTC votes read 0 honestly
     }
     this.loadOutcomes()
-    // outcome sweep: sample pending reads, resolve the matured ones
+    // outcome sweep: sample pending reads, resolve the matured ones. No
+    // per-resolution console.log here anymore (removed on request) - the
+    // resolved outcomes still flow into this.tracker's state and get
+    // flushed to data/chartsignals_outcomes.json by the timer below exactly
+    // as before, so nothing downstream (win-rate stats, persistence) lost
+    // anything - only the console line itself is gone.
     this.sweepTimer = setInterval(() => {
       try {
-        const resolved = this.tracker.tick(Date.now(), (a) => this.market.getPrice(a))
-        if (resolved.length) {
-          ctx.log('chart-signals', `resolved ${resolved.length} signal outcome(s) (${resolved.map((r) => `${r.asset} ${r.outcome}`).join(', ')})`)
-        }
+        this.tracker.tick(Date.now(), (a) => this.market.getPrice(a))
       } catch {
         /* the honesty loop never breaks scanning */
       }

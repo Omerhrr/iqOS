@@ -85,10 +85,84 @@ function heikinAshi(candles: Candle[]): Candle[] {
   return out
 }
 
-function renko(candles: Candle[], tfSec: number): Candle[] {
-  if (candles.length < 10) return []
-  const window = candles.slice(-150)
-  // brick size = 30% of average true range of the window
+// ---------- incremental window engine ----------
+// renko/pointFigure/rangeBars/volumeBars all re-scanned their WHOLE sliding
+// window (150-400 candles, with nested brick/box-painting loops) on every
+// single live price TICK, because `candles` gets a new array identity on
+// every tick (the forming last candle is replaced in place - see page.tsx's
+// onCandle reducer) and the useMemo computing displayCandles re-ran the
+// transform from scratch each time. That O(window) rescan, several times a
+// SECOND, was the actual CPU cost behind "the renko/range/volume chart feels
+// stuck" (separate from the setData() cost ChartPanel already fixed for the
+// 1:1 bar-for-bar chart types).
+//
+// The fix: every one of these transforms is a single left-to-right scan
+// with a small running state (refPrice/dir/top-bottom/accumulator) - the
+// textbook shape for incremental computation. `candles`' array elements are
+// never MUTATED in place (page.tsx always replaces-and-returns a new array),
+// so every element except the live forming last one keeps the exact same
+// object reference tick after tick. That means "has the window's PREFIX
+// (everything except the newest candle) changed" is answerable with a
+// handful of reference (===) comparisons - no math - and when it hasn't,
+// only the ONE new/changed tail candle needs to be scanned, reusing the
+// cached running state from the end of the prefix. A full rescan only
+// happens when the prefix itself actually changed (a bar closed and the
+// window's start boundary shifted, or the sliding window dropped its oldest
+// candle) - once per bar-close instead of once per tick.
+interface IncCache<S> {
+  prefixFirst: Candle | null
+  prefixLastBeforeTail: Candle | null
+  prefixLen: number
+  state: S
+  emitted: Candle[]
+}
+
+function scanIncremental<S>(
+  window: Candle[],
+  cacheRef: { current: IncCache<S> | null },
+  seed: (window: Candle[]) => S,
+  step: (state: S, c: Candle) => { state: S; emitted: Candle[] }
+): Candle[] {
+  if (window.length < 2) return []
+  const prefix = window.slice(0, -1)
+  const tail = window[window.length - 1]
+  const cache = cacheRef.current
+  const canReuse =
+    !!cache &&
+    cache.prefixLen === prefix.length &&
+    (prefix.length === 0 || (cache.prefixFirst === prefix[0] && cache.prefixLastBeforeTail === prefix[prefix.length - 1]))
+  if (canReuse && cache) {
+    const tailResult = step(cache.state, tail)
+    return [...cache.emitted, ...tailResult.emitted]
+  }
+  // full rescan: window's prefix shifted (new bar closed, or the sliding
+  // window dropped its oldest candle) - reseed and replay the whole prefix.
+  let state = seed(window)
+  let emitted: Candle[] = []
+  for (const c of prefix) {
+    const r = step(state, c)
+    state = r.state
+    if (r.emitted.length) emitted = emitted.concat(r.emitted)
+  }
+  cacheRef.current = { prefixFirst: prefix[0] ?? null, prefixLastBeforeTail: prefix[prefix.length - 1] ?? null, prefixLen: prefix.length, state, emitted }
+  const tailResult = step(state, tail)
+  return [...emitted, ...tailResult.emitted]
+}
+
+function ascendingGuard(bars: Candle[]): Candle[] {
+  for (let i = 1; i < bars.length; i++) {
+    if (bars[i].time <= bars[i - 1].time) bars[i].time = bars[i - 1].time + 1
+  }
+  return bars
+}
+
+interface RenkoState {
+  refPrice: number
+  lastClose: number
+  brick: number
+}
+
+function atrOf(window: Candle[]): number {
   let trSum = 0
   for (let i = 1; i < window.length; i++) {
     trSum += Math.max(
@@ -97,37 +171,45 @@ function renko(candles: Candle[], tfSec: number): Candle[] {
       Math.abs(window[i].low - window[i - 1].close)
     )
   }
-  const brick = Math.max((trSum / Math.max(window.length - 1, 1)) * 0.3, 1e-9)
-  const bricks: Candle[] = []
-  let lastClose = window[0].close
-  let refPrice = lastClose
+  return trSum / Math.max(window.length - 1, 1)
+}
+
+function renkoStep(state: RenkoState, c: Candle): { state: RenkoState; emitted: Candle[] } {
+  let { refPrice, lastClose, brick } = state
+  const emitted: Candle[] = []
+  refPrice = lastClose
+  let painted = 0
+  while (c.close >= refPrice + brick) {
+    emitted.push({ time: c.time + painted, open: refPrice, high: refPrice + brick, low: refPrice, close: refPrice + brick, volume: 0 })
+    painted++
+    refPrice += brick
+    lastClose = refPrice
+  }
+  while (c.close <= refPrice - brick) {
+    emitted.push({ time: c.time + painted, open: refPrice, high: refPrice, low: refPrice - brick, close: refPrice - brick, volume: 0 })
+    painted++
+    refPrice -= brick
+    lastClose = refPrice
+  }
+  return { state: { refPrice, lastClose, brick }, emitted }
+}
+
+function renko(candles: Candle[], tfSec: number, cacheRef: { current: IncCache<RenkoState> | null }): Candle[] {
+  if (candles.length < 10) return []
+  const window = candles.slice(-150)
+  void tfSec
+  const bricks = scanIncremental(
+    window,
+    cacheRef,
+    (w) => ({ refPrice: w[0].close, lastClose: w[0].close, brick: Math.max(atrOf(w) * 0.3, 1e-9) }),
+    renkoStep
+  )
   // Task 61: HONEST brick times - a brick's time is the open time of the
   // candle that COMPLETED it (the moment the brick became knowable), not a
   // fictional countdown from the last candle. When one candle completes
   // several bricks, extras stagger +1s (renko bricks have no independent
   // clock; lightweight-charts needs ascending unique times).
-  for (const c of window) {
-    refPrice = lastClose
-    let painted = 0
-    while (c.close >= refPrice + brick) {
-      bricks.push({ time: c.time + painted, open: refPrice, high: refPrice + brick, low: refPrice, close: refPrice + brick, volume: 0 })
-      painted++
-      refPrice += brick
-      lastClose = refPrice
-    }
-    while (c.close <= refPrice - brick) {
-      bricks.push({ time: c.time + painted, open: refPrice, high: refPrice, low: refPrice - brick, close: refPrice - brick, volume: 0 })
-      painted++
-      refPrice -= brick
-      lastClose = refPrice
-    }
-  }
-  // ascending guard (a candle that painted more bricks than its tf has
-  // seconds could collide with the next candle's open time)
-  for (let i = 1; i < bricks.length; i++) {
-    if (bricks[i].time <= bricks[i - 1].time) bricks[i].time = bricks[i - 1].time + 1
-  }
-  return bricks.slice(-300)
+  return ascendingGuard(bricks).slice(-300)
 }
 
 /** Point & Figure boxes rendered as pseudo-candles: X boxes paint as up
@@ -137,152 +219,180 @@ function renko(candles: Candle[], tfSec: number): Candle[] {
  * record (mini-services/trading-core/src/analytics/pointfigure.ts). Brick
  * times are honest: each box carries the open time of the candle that
  * painted it (+1s stagger for extra boxes in the same candle). */
-function pointFigureChart(candles: Candle[], tfSec: number): Candle[] {
+interface PfState {
+  dir: 'X' | 'O' | null
+  top: number
+  bottom: number
+  box: number
+}
+
+const PF_REVERSAL = 3
+
+function pfPaint(level: number, d: 'X' | 'O', t: number, seq: number, box: number): Candle {
+  return {
+    time: t + seq,
+    open: d === 'X' ? level : level + box,
+    close: d === 'X' ? level + box : level,
+    high: level + box,
+    low: level,
+    volume: 0,
+  }
+}
+
+function pfStep(state: PfState, c: Candle): { state: PfState; emitted: Candle[] } {
+  let { dir, top, bottom, box } = state
+  const emitted: Candle[] = []
+  const hi = Math.floor(c.high / box)
+  const lo = Math.floor(c.low / box)
+  let painted = 0
+  if (dir === null) {
+    dir = 'X'
+    top = hi
+    bottom = lo
+    for (let lvl = bottom; lvl <= top; lvl++) emitted.push(pfPaint(lvl, 'X', c.time, painted++, box))
+    return { state: { dir, top, bottom, box }, emitted }
+  }
+  if (dir === 'X') {
+    while (hi > top) {
+      top++
+      emitted.push(pfPaint(top, 'X', c.time, painted++, box))
+    }
+    if (lo <= top - PF_REVERSAL) {
+      // reversal: new O column starts one box below the X top box
+      const newBottom = Math.min(top - PF_REVERSAL, lo)
+      dir = 'O'
+      const newTop = top - 1
+      for (let lvl = newTop; lvl >= newBottom; lvl--) emitted.push(pfPaint(lvl, 'O', c.time, painted++, box))
+      top = newTop
+      bottom = newBottom
+    }
+  } else {
+    while (lo < bottom) {
+      bottom--
+      emitted.push(pfPaint(bottom, 'O', c.time, painted++, box))
+    }
+    if (hi >= bottom + PF_REVERSAL) {
+      const newTop = Math.max(bottom + PF_REVERSAL, hi)
+      dir = 'X'
+      const newBottom = bottom + 1
+      for (let lvl = newBottom; lvl <= newTop; lvl++) emitted.push(pfPaint(lvl, 'X', c.time, painted++, box))
+      bottom = newBottom
+      top = newTop
+    }
+  }
+  return { state: { dir, top, bottom, box }, emitted }
+}
+
+/** Point & Figure boxes rendered as pseudo-candles: X boxes paint as up
+ * candles (open=box bottom, close=box top), O boxes as down candles, so the
+ * classic X/O staircase reads straight off the candlestick series. High/low
+ * based, 3-box reversal, absolute box grid - mirrors the kernel engine of
+ * record (mini-services/trading-core/src/analytics/pointfigure.ts). Brick
+ * times are honest: each box carries the open time of the candle that
+ * painted it (+1s stagger for extra boxes in the same candle). Incremental
+ * via scanIncremental() - see its doc comment. */
+function pointFigureChart(candles: Candle[], tfSec: number, cacheRef: { current: IncCache<PfState> | null }): Candle[] {
   if (candles.length < 10) return []
   const window = candles.slice(-200)
-  // box size = 50% of average true range of the window
-  let trSum = 0
-  for (let i = 1; i < window.length; i++) {
-    trSum += Math.max(
-      window[i].high - window[i].low,
-      Math.abs(window[i].high - window[i - 1].close),
-      Math.abs(window[i].low - window[i - 1].close)
-    )
-  }
-  const box = Math.max((trSum / Math.max(window.length - 1, 1)) * 0.5, 1e-9)
-  const REVERSAL = 3
-  const cells: Candle[] = []
-  let dir: 'X' | 'O' | null = null
-  let top = 0
-  let bottom = 0
-  const paint = (level: number, d: 'X' | 'O', t: number, seq: number) =>
-    cells.push({
-      time: t + seq,
-      open: d === 'X' ? level : level + box,
-      close: d === 'X' ? level + box : level,
-      high: level + box,
-      low: level,
-      volume: 0,
-    })
-  for (const c of window) {
-    const hi = Math.floor(c.high / box)
-    const lo = Math.floor(c.low / box)
-    let painted = 0
-    if (dir === null) {
-      dir = 'X'
-      top = hi
-      bottom = lo
-      for (let lvl = bottom; lvl <= top; lvl++) paint(lvl, 'X', c.time, painted++)
-      continue
-    }
-    if (dir === 'X') {
-      while (hi > top) {
-        top++
-        paint(top, 'X', c.time, painted++)
-      }
-      if (lo <= top - REVERSAL) {
-        // reversal: new O column starts one box below the X top box
-        const newBottom = Math.min(top - REVERSAL, lo)
-        dir = 'O'
-        const newTop = top - 1
-        for (let lvl = newTop; lvl >= newBottom; lvl--) paint(lvl, 'O', c.time, painted++)
-        top = newTop
-        bottom = newBottom
-      }
-    } else {
-      while (lo < bottom) {
-        bottom--
-        paint(bottom, 'O', c.time, painted++)
-      }
-      if (hi >= bottom + REVERSAL) {
-        const newTop = Math.max(bottom + REVERSAL, hi)
-        dir = 'X'
-        const newBottom = bottom + 1
-        for (let lvl = newBottom; lvl <= newTop; lvl++) paint(lvl, 'X', c.time, painted++)
-        bottom = newBottom
-        top = newTop
-      }
-    }
-  }
-  // ascending guard (same rationale as renko)
-  for (let i = 1; i < cells.length; i++) {
-    if (cells[i].time <= cells[i - 1].time) cells[i].time = cells[i - 1].time + 1
-  }
   void tfSec
-  return cells.slice(-300)
+  const cells = scanIncremental(
+    window,
+    cacheRef,
+    (w) => ({ dir: null, top: 0, bottom: 0, box: Math.max(atrOf(w) * 0.5, 1e-9) }),
+    pfStep
+  )
+  return ascendingGuard(cells).slice(-300)
 }
 
 // ---------- Task 63 transforms (kernel-mirrored; engines of record live in
 // mini-services/trading-core/src/analytics/{rangebars,volumebars}.ts) ----------
 
+interface RangeState {
+  ref: number
+  range: number
+}
+
+function rangeStep(state: RangeState, c: Candle): { state: RangeState; emitted: Candle[] } {
+  let { ref, range } = state
+  const emitted: Candle[] = []
+  let painted = 0
+  while (c.close >= ref + range) {
+    emitted.push({ time: c.time + painted, open: ref, high: ref + range, low: ref, close: ref + range, volume: 0 })
+    painted++
+    ref += range
+  }
+  while (c.close <= ref - range) {
+    emitted.push({ time: c.time + painted, open: ref, high: ref, low: ref - range, close: ref - range, volume: 0 })
+    painted++
+    ref -= range
+  }
+  return { state: { ref, range }, emitted }
+}
+
 /** Range bars - close-chained like the kernel engine: a bar closes when the
  * candle CLOSE clears one full `range` (ATR(window) x 0.5 default) beyond the
  * running reference, either direction, no reversal multiplier. Wickless by
- * construction; honest completion-candle times (+1s stagger). */
-function rangeBarsChart(candles: Candle[], tfSec: number): Candle[] {
+ * construction; honest completion-candle times (+1s stagger). Incremental
+ * via scanIncremental() - see its doc comment. */
+function rangeBarsChart(candles: Candle[], tfSec: number, cacheRef: { current: IncCache<RangeState> | null }): Candle[] {
   if (candles.length < 10) return []
   const window = candles.slice(-150)
-  let trSum = 0
-  for (let i = 1; i < window.length; i++) {
-    trSum += Math.max(
-      window[i].high - window[i].low,
-      Math.abs(window[i].high - window[i - 1].close),
-      Math.abs(window[i].low - window[i - 1].close)
-    )
-  }
-  const range = Math.max((trSum / Math.max(window.length - 1, 1)) * 0.5, 1e-9)
-  const bars: Candle[] = []
-  let ref = window[0].close
-  let painted = 0
-  for (const c of window) {
-    painted = 0
-    while (c.close >= ref + range) {
-      bars.push({ time: c.time + painted, open: ref, high: ref + range, low: ref, close: ref + range, volume: 0 })
-      painted++
-      ref += range
-    }
-    while (c.close <= ref - range) {
-      bars.push({ time: c.time + painted, open: ref, high: ref, low: ref - range, close: ref - range, volume: 0 })
-      painted++
-      ref -= range
-    }
-  }
-  for (let i = 1; i < bars.length; i++) {
-    if (bars[i].time <= bars[i - 1].time) bars[i].time = bars[i - 1].time + 1
-  }
   void tfSec
-  return bars.slice(-300)
+  const bars = scanIncremental(
+    window,
+    cacheRef,
+    (w) => ({ ref: w[0].close, range: Math.max(atrOf(w) * 0.5, 1e-9) }),
+    rangeStep
+  )
+  return ascendingGuard(bars).slice(-300)
+}
+
+interface VolState {
+  cur: Candle | null
+  acc: number
+  per: number
+}
+
+function volStep(state: VolState, c: Candle): { state: VolState; emitted: Candle[] } {
+  let { cur, acc, per } = state
+  const emitted: Candle[] = []
+  if (!cur) cur = { ...c, volume: 0 }
+  else cur = { ...cur } // never mutate the cached bar in place - a cached ref is shared across ticks until it closes
+  cur.high = Math.max(cur.high, c.high)
+  cur.low = Math.min(cur.low, c.low)
+  cur.close = c.close
+  cur.volume += c.volume
+  acc += c.volume
+  if (acc >= per) {
+    emitted.push(cur)
+    cur = null
+    acc = 0
+  }
+  return { state: { cur, acc, per }, emitted }
 }
 
 /** Constant (equi) volume bars - kernel mirror of volumeBars(): a bar closes
  * when cumulative (approx) volume first reaches `per` (auto: totalVol/80,
- * floor median*0.25). Real clock: time = first contributing candle open. */
-function volumeBarsChart(candles: Candle[]): Candle[] {
+ * floor median*0.25). Real clock: time = first contributing candle open.
+ * Incremental via scanIncremental() - see its doc comment. The one bar still
+ * accumulating (not yet past `per`) isn't in scanIncremental's `emitted`
+ * list (it only collects CLOSED bars) - append it here from the live state
+ * so the forming bar stays visible, same as the original always did. */
+function volumeBarsChart(candles: Candle[], cacheRef: { current: IncCache<VolState> | null }): Candle[] {
   if (candles.length < 10) return []
   const window = candles.slice(-400)
   const total = window.reduce((s, c) => s + (Number.isFinite(c.volume) ? c.volume : 0), 0)
   if (total <= 0) return [] // all-zero volume -> nothing honest to draw
-  const sorted = [...window].map((c) => c.volume).sort((a, b) => a - b)
+  const sorted = window.map((c) => c.volume).sort((a, b) => a - b)
   const median = sorted[sorted.length >> 1]
   const per = Math.max(total / 80, median * 0.25, 1e-9)
-  const bars: Candle[] = []
-  let cur: Candle | null = null
-  let acc = 0
-  for (const c of window) {
-    if (!cur) cur = { ...c, volume: 0 }
-    cur.high = Math.max(cur.high, c.high)
-    cur.low = Math.min(cur.low, c.low)
-    cur.close = c.close
-    cur.volume += c.volume
-    acc += c.volume
-    if (acc >= per) {
-      bars.push(cur)
-      cur = null
-      acc = 0
-    }
-  }
-  if (cur) bars.push(cur)
-  return bars.slice(-300)
+  // `per` is itself window-derived (changes slightly as the window slides) -
+  // fold it into the cache key the same way brick/box/range size changes
+  // force a reseed: a cache built under a different `per` is stale.
+  if (cacheRef.current && cacheRef.current.state.per !== per) cacheRef.current = null
+  const bars = scanIncremental(window, cacheRef, () => ({ cur: null, acc: 0, per }), volStep)
+  const pending = cacheRef.current?.state.cur
+  return (pending ? [...bars, pending] : bars).slice(-300)
 }
 
 // ---------- Task 63 custom-canvas chart data (footprint / TPO) ----------
@@ -438,6 +548,36 @@ export default function ChartPanel({
   const entryLineRefs = useRef<Map<string, { series: AnyPriceSeries; line: IPriceLine; price: number; title: string }>>(new Map())
   const markersRef = useRef<{ series: AnyPriceSeries; api: ISeriesMarkersPluginApi<Time> } | null>(null)
   const priceFmtKeyRef = useRef<string | null>(null)
+  // Perf: tracks what's ALREADY rendered on the price/volume series, so the
+  // data effect below can tell "the forming bar just ticked" (replace the
+  // last point - series.update(), O(1)) and "one new bar appended while the
+  // buffer hadn't hit its cap yet" (append - also series.update()) apart
+  // from "the dataset actually changed shape" (chart-type switch, asset
+  // switch, or the capped candle buffer rolled - full series.setData(),
+  // O(n)). Every live price TICK used to force a full setData() of up to
+  // ~320 bars - on a fast-ticking asset that's a full series rebuild
+  // several times a SECOND, which is exactly what "the chart feels stuck"
+  // was - lightweight-charts is built around update() for this, setData()
+  // is for a genuine reload. Reset to null whenever the series itself is
+  // torn down/recreated (chartType switch) so the first paint after that
+  // always goes through the safe full-setData path.
+  const renderStateRef = useRef<{ len: number; lastTime: number } | null>(null)
+  // Incremental-scan caches for the sliding-window chart types - one per
+  // transform, persisted across renders (see scanIncremental()'s doc
+  // comment above). Reset whenever the underlying candle feed restarts for
+  // a different reason than "one more tick/bar" (asset switch) so a stale
+  // cached running state never bleeds into a different instrument's bricks/
+  // boxes/bars - digitsTicker already identifies the instrument uniquely.
+  const renkoCacheRef = useRef<IncCache<RenkoState> | null>(null)
+  const pfCacheRef = useRef<IncCache<PfState> | null>(null)
+  const rangeCacheRef = useRef<IncCache<RangeState> | null>(null)
+  const volCacheRef = useRef<IncCache<VolState> | null>(null)
+  useEffect(() => {
+    renkoCacheRef.current = null
+    pfCacheRef.current = null
+    rangeCacheRef.current = null
+    volCacheRef.current = null
+  }, [digitsTicker])
 
   // axis/crosshair/price-line precision follows the asset's quote convention
   // (the library default of 2 decimals turns 1.10283 into 1.10)
@@ -572,12 +712,34 @@ export default function ChartPanel({
     }
   }, [chartType, digitsTicker, tf])
 
+  // footprint/TPO/OTC-footprint/tick-footprint's canvas redraw used to key
+  // off raw `candles`, which gets a new array identity on every live tick
+  // (the forming last candle is replaced in place). For footprint/TPO that
+  // meant rebuilding their cluster/profile math AND repainting the whole
+  // canvas (many fillRect/fillText calls - text draws are themselves not
+  // cheap) several times a SECOND; for otcfootprint/tickfootprint it was
+  // even more wasteful since those two don't read `candles` at all (their
+  // pixels come from otcState/tickFpState, which already poll on their own
+  // 5-6s interval) - `candles` ticking was repainting them for data that
+  // hadn't changed. This signature is a primitive STRING, so even though
+  // the useMemo recomputes every tick (cheap - O(1), not O(window)), its
+  // VALUE only changes once a bar actually closes (the array's second-to-
+  // last element is what's stable across ticks and shifts only on a close),
+  // and React's effect-dependency check compares by value for primitives -
+  // so the canvas effect below only reruns on an actual bar close, not on
+  // every forming-bar tick.
+  const closedBarSignature = useMemo(() => {
+    if (!candles.length) return '0'
+    const anchor = candles.length >= 2 ? candles[candles.length - 2] : candles[0]
+    return `${candles.length}:${anchor.time}`
+  }, [candles])
+
   const displayCandles = useMemo(() => {
     if (chartType === 'heikin') return heikinAshi(candles)
-    if (chartType === 'renko') return renko(candles, tfSec)
-    if (chartType === 'pointfigure') return pointFigureChart(candles, tfSec)
-    if (chartType === 'rangebars') return rangeBarsChart(candles, tfSec)
-    if (chartType === 'volumebars') return volumeBarsChart(candles)
+    if (chartType === 'renko') return renko(candles, tfSec, renkoCacheRef)
+    if (chartType === 'pointfigure') return pointFigureChart(candles, tfSec, pfCacheRef)
+    if (chartType === 'rangebars') return rangeBarsChart(candles, tfSec, rangeCacheRef)
+    if (chartType === 'volumebars') return volumeBarsChart(candles, volCacheRef)
     if (chartType === 'tickchart') {
       // real /ticks bars when the fetch landed; else fall through to raw
       // candles (kernel always falls back server-side, so empty = not loaded)
@@ -692,30 +854,63 @@ export default function ChartPanel({
       markersRef.current = null
       indMarkersRef.current = []
       tradeMarkersRef.current = []
+      renderStateRef.current = null
     }
   }, [chartType])
 
-  // price + volume data
+  // price + volume data. Incremental by default (series.update() - O(1)):
+  // any bar-for-bar builder - plain candles/heikin/tickchart/ivhv's base
+  // candles, AND renko/pointFigure/rangeBars/volumeBars now that their brick/
+  // box/range size is frozen for the currently-forming bar (see renkoStep/
+  // pfStep/rangeStep/scanIncremental above) - can always tell "forming bar
+  // ticked, same last point" (last time unchanged) and "exactly one new bar
+  // landed before the cap" (length +1, same prior last time now second-to-
+  // last) apart from a genuine reshape, and handle both with update().
+  // Falls back to the old full setData() for everything else: first paint,
+  // chart-type/asset switch, the capped candle buffer actually rolling (once
+  // per bar after the buffer fills, not once per tick), OR - specific to the
+  // synthetic brick/box/bar series - a tick RETRACTING part of the still-
+  // forming bar's output (price pulls back enough that the live candle now
+  // paints fewer bricks than the previous tick did): that always changes the
+  // new last point's time away from what was last rendered, so it's caught
+  // by the same two checks below and safely falls through to setData()
+  // rather than silently under-updating.
   useEffect(() => {
     const price = priceSeriesRef.current
     const vol = volRef.current
     if (!price || !vol || displayCandles.length === 0) return
-    if (chartType === 'line' || chartType === 'area' || chartType === 'baseline') {
-      const lineData = displayCandles.map((c) => ({ time: c.time as UTCTimestamp, value: c.close }))
-      ;(price as ISeriesApi<'Line'>).setData(lineData)
-      vol.setData(displayCandles.map((c) => ({ time: c.time as UTCTimestamp, value: c.volume, color: c.close >= c.open ? 'rgba(16,185,129,0.30)' : 'rgba(244,63,94,0.30)' })))
-      return
+    const last = displayCandles[displayCandles.length - 1]
+    const prev = renderStateRef.current
+    const volBarFor = (c: Candle) => ({ time: c.time as UTCTimestamp, value: c.volume, color: c.close >= c.open ? 'rgba(16,185,129,0.30)' : 'rgba(244,63,94,0.30)' })
+    const isLineLike = chartType === 'line' || chartType === 'area' || chartType === 'baseline'
+    const priceBarFor = (c: Candle) => (isLineLike ? { time: c.time as UTCTimestamp, value: c.close } : { time: c.time as UTCTimestamp, open: c.open, high: c.high, low: c.low, close: c.close })
+
+    if (prev) {
+      if (last.time === prev.lastTime) {
+        // the forming bar just ticked - replace just the last point
+        ;(price as ISeriesApi<'Line'>).update(priceBarFor(last) as never)
+        vol.update(volBarFor(last))
+        renderStateRef.current = { len: displayCandles.length, lastTime: last.time }
+        return
+      }
+      if (last.time > prev.lastTime && displayCandles.length === prev.len + 1) {
+        // exactly one new bar landed and the buffer hasn't rolled yet - append
+        ;(price as ISeriesApi<'Line'>).update(priceBarFor(last) as never)
+        vol.update(volBarFor(last))
+        renderStateRef.current = { len: displayCandles.length, lastTime: last.time }
+        return
+      }
+      // anything else (buffer rolled, time went backwards, length jumped by
+      // more than one) - fall through to the full rebuild below
     }
-    ;(price as unknown as ISeriesApi<'Candlestick'>).setData(
-      displayCandles.map((c) => ({ time: c.time as UTCTimestamp, open: c.open, high: c.high, low: c.low, close: c.close }))
-    )
-    vol.setData(
-      displayCandles.map((c) => ({
-        time: c.time as UTCTimestamp,
-        value: c.volume,
-        color: c.close >= c.open ? 'rgba(16,185,129,0.30)' : 'rgba(244,63,94,0.30)',
-      }))
-    )
+
+    if (isLineLike) {
+      ;(price as ISeriesApi<'Line'>).setData(displayCandles.map(priceBarFor) as { time: UTCTimestamp; value: number }[])
+    } else {
+      ;(price as unknown as ISeriesApi<'Candlestick'>).setData(displayCandles.map(priceBarFor) as never)
+    }
+    vol.setData(displayCandles.map(volBarFor))
+    renderStateRef.current = { len: displayCandles.length, lastTime: last.time }
   }, [displayCandles, chartType])
 
   // ---------- yesterday-echo click-through ----------
@@ -1108,7 +1303,11 @@ export default function ChartPanel({
     const ro = new ResizeObserver(draw)
     ro.observe(parent)
     return () => ro.disconnect()
-  }, [chartType, candles, digitsTicker, otcState, tickFpState])
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally
+    // keyed on closedBarSignature, not raw `candles` (see its own doc
+    // comment above) - `candles` is still read fresh via closure when this
+    // DOES run, just not used to decide whether it reruns.
+  }, [chartType, closedBarSignature, digitsTicker, otcState, tickFpState])
 
   // live precision sync: asset switch or a quote crossing a magnitude band
   useEffect(() => {
