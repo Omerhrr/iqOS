@@ -89,10 +89,24 @@
 // script evaluator, via metastrategy.ts's evaluateScript) - still fails
 // closed with a clear error if neither is wired in.
 //
-// STILL NOT in MSL (tracked in the project's msl-v2-grammar-proposal.md,
-// not silently dropped): `renko.*`/`range.*`/`ha.*`/`pf.*` namespaced
-// sugar over the existing panel sources (cosmetic - `renko.dir`/
-// `renko.value` already work today).
+// SINCE ADDED (3): `renko.bricks(n?)`/`renko.brickSize()`, `pf.boxes(n?)`/
+// `pf.boxSize()`, `ha.bars(n?)`/`ha.streak()`/`ha.flip()`/`ha.bodyAtr()` -
+// brick/box/HA-candle-LEVEL primitives (renkoMethod/pfMethod/haMethod
+// below), closing the gap the plain `renko`/`pointFigure`/`heikinAshi`
+// verdict reads leave open: those only ever vote on the AGGREGATE trend,
+// never let a script pattern-match the bricks/boxes/candles themselves.
+// `renko`/`pf`/`ha` are METHOD-CALL namespaces (parens required - `ha.flip`
+// with no parens is a FIELD access on a different identifier and fails
+// closed with "unknown field"), and `.bricks(n)`/`.boxes(n)`/`.bars(n)`
+// return a SERIES (same as `ind.*`) - index it (`[-1]`) before using it in
+// a comparison, exactly like any `ind.*` series; using the bare series
+// value fails closed with the same "can't be used directly" error `ind.*`
+// already gives. Reuses the EXISTING renkoBricks()/pointFigure()/
+// heikinAshiSeries() engines verbatim via a shared candle conversion -
+// nothing re-derived. `tick.*`/`foot.*` (above) also each gained a
+// `<x>Series(windowSec?, buckets?)` historical sibling of their scalar
+// form, for the same reason - `.slope()`/`.mean(n)` rate-of-change on the
+// tape, not just a now-snapshot.
 //
 // Grammar (line-oriented; '#' to end-of-line is a comment; blank lines
 // ignored):
