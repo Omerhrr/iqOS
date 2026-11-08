@@ -197,6 +197,17 @@ import {
   supertrend as supertrendInd,
 } from './indicators'
 import { buildFootprint, type FootprintBucket } from './otcfootprint'
+// `renko.*`/`pf.*`/`ha.*` namespaces (renkoMethod/pfMethod/haMethod below) -
+// reuse the SAME pure engines the 'renko'/'pointFigure'/'heikinAshi' verdict
+// reads already call (plugins/metastrategy.ts), nothing re-derived. A type-
+// only import of Candle (types.ts is a plain shared type module, not a
+// domain plugin, so this doesn't break the "no import of custom.ts/
+// metastrategy.ts" isolation this file's header describes) plus the three
+// engines' own pure functions.
+import type { Candle } from '../types'
+import { renkoBricks, renkoAtr } from './renko'
+import { pointFigure } from './pointfigure'
+import { heikinAshiSeries } from './chartsignals'
 
 export interface MslSourceRead {
   direction: 'call' | 'put' | 'none'
@@ -1259,19 +1270,23 @@ function crossAny(a: MslValue, b: MslValue): boolean {
  * "small window count, then a larger one, compared arithmetically"),
  * exactly the same raw-vs-thresholded split `ind.*` already drew for the
  * mainstream indicators. */
-function tickMethod(name: string, args: MslValue[], ticks: readonly { ts: number; price: number }[], nowTs: number): MslValue {
-  const windowSec = args.length ? asNum(args[0]) : 5
-  if (!Number.isFinite(windowSec) || windowSec <= 0) throw new MslRuntimeError(`tick.${name}(windowSec) - windowSec must be a positive number`)
-  if (!ticks.length) return 0
-  const floorTs = nowTs - windowSec * 1000
-  // ticks are chronological ascending - walk back from the end instead of
-  // filtering the whole buffer every call (the buffer can hold up to 60k
-  // prints per asset). A buffer whose last print is already OLDER than
-  // floorTs (a genuine stall) correctly yields an EMPTY window here, not
-  // the stale ticks from before the stall started.
+// ticks are chronological ascending - walk back from the end instead of
+// filtering the whole buffer every call (the buffer can hold up to 60k
+// prints per asset). A buffer whose last print is already OLDER than
+// floorTs (a genuine stall) correctly yields an EMPTY window here, not the
+// stale ticks from before the stall started. Shared by tickMethod()'s
+// scalar reads and tickBucketedSeries()'s per-bucket reads below.
+function sliceTickWindow(ticks: readonly { ts: number; price: number }[], endTs: number, windowSec: number): readonly { ts: number; price: number }[] {
+  const floorTs = endTs - windowSec * 1000
   let i = ticks.length
   while (i > 0 && ticks[i - 1].ts >= floorTs) i--
-  const windowTicks = ticks.slice(i).filter((t) => t.ts <= nowTs)
+  return ticks.slice(i).filter((t) => t.ts <= endTs)
+}
+
+// The scalar math for count/delta/velocity/ratio, factored out of
+// tickMethod() so tickBucketedSeries() below can run it once per historical
+// bucket instead of only ever on "now"'s trailing window.
+function tickWindowMetric(name: 'count' | 'delta' | 'velocity' | 'ratio', windowTicks: readonly { ts: number; price: number }[]): number {
   switch (name) {
     case 'count':
       return windowTicks.length
@@ -1318,9 +1333,55 @@ function tickMethod(name: string, args: MslValue[], ticks: readonly { ts: number
       const ratio = upAvg > 0 ? dnAvg / upAvg : dnAvg > 0 ? 8 : 1
       return Math.log2(Math.max(ratio, 1 / 8))
     }
-    default:
-      throw new MslRuntimeError(`unknown tick method "tick.${name}(...)" - use delta/velocity/ratio/count`)
   }
+}
+
+// Clamp bucket count the same way everywhere a script asks for a bucketed
+// history (tick.*Series/foot.*Series) - at least 2 (a 1-bucket "series"
+// isn't one), capped at 50 (each bucket is its own buffer walk/
+// buildFootprint() call - 50 is already generous for a .slope()/.mean(n)
+// read, which rarely wants more than a handful of recent buckets).
+function seriesBucketCount(raw: number | undefined, dflt: number): number {
+  const n = raw !== undefined && Number.isFinite(raw) ? raw : dflt
+  return Math.max(2, Math.min(50, Math.round(n)))
+}
+
+/** `tick.<x>Series(windowSec?, buckets?)` - a SERIES of the last `buckets`
+ * non-overlapping `windowSec`-wide tick-window readings of the same metric
+ * `tick.<x>()` already returns as a scalar-now snapshot, chronological,
+ * `[-1]` = the most recent (still-forming-ish, but same "now" window
+ * tick.<x>() itself reads) bucket - giving a script `.slope()`/`.mean(n)`/
+ * `.crossed()` rate-of-change over the tape, not just an instantaneous
+ * read. Buckets are consecutive and END-aligned to `nowTs` (bucket 0 is the
+ * OLDEST, ending `buckets * windowSec` seconds before now; the last bucket
+ * ends exactly at `nowTs`, identical to what tick.<x>(windowSec) itself
+ * would read right now) - no gaps, no overlap, same windowing semantics as
+ * the scalar method reusing sliceTickWindow()/tickWindowMetric() per
+ * bucket. */
+function tickBucketedSeries(name: 'count' | 'delta' | 'velocity' | 'ratio', args: MslValue[], ticks: readonly { ts: number; price: number }[], nowTs: number): MslValue {
+  const windowSec = args.length > 0 ? asNum(args[0]) : 5
+  if (!Number.isFinite(windowSec) || windowSec <= 0) throw new MslRuntimeError(`tick.${name}Series(windowSec, buckets?) - windowSec must be a positive number`)
+  const buckets = seriesBucketCount(args.length > 1 ? asNum(args[1]) : undefined, 10)
+  const out: number[] = new Array(buckets)
+  for (let b = 0; b < buckets; b++) {
+    const endTs = nowTs - (buckets - 1 - b) * windowSec * 1000
+    out[b] = ticks.length ? tickWindowMetric(name, sliceTickWindow(ticks, endTs, windowSec)) : 0
+  }
+  return seriesValue(out)
+}
+
+function tickMethod(name: string, args: MslValue[], ticks: readonly { ts: number; price: number }[], nowTs: number): MslValue {
+  if (name === 'countSeries') return tickBucketedSeries('count', args, ticks, nowTs)
+  if (name === 'deltaSeries') return tickBucketedSeries('delta', args, ticks, nowTs)
+  if (name === 'velocitySeries') return tickBucketedSeries('velocity', args, ticks, nowTs)
+  if (name === 'ratioSeries') return tickBucketedSeries('ratio', args, ticks, nowTs)
+  if (name !== 'count' && name !== 'delta' && name !== 'velocity' && name !== 'ratio')
+    throw new MslRuntimeError(`unknown tick method "tick.${name}(...)" - use delta/velocity/ratio/count, or deltaSeries/velocitySeries/ratioSeries/countSeries for a historical series`)
+  const windowSec = args.length ? asNum(args[0]) : 5
+  if (!Number.isFinite(windowSec) || windowSec <= 0) throw new MslRuntimeError(`tick.${name}(windowSec) - windowSec must be a positive number`)
+  if (!ticks.length) return 0
+  const windowTicks = sliceTickWindow(ticks, nowTs, windowSec)
+  return tickWindowMetric(name, windowTicks)
 }
 
 /** `tick.*` needs the raw live tick buffer; fails closed with a message
@@ -1348,12 +1409,58 @@ function footSnapshot(ticks: readonly { ts: number; price: number }[], nowMs: nu
   return bucket && bucket.nTicks >= 3 ? bucket : undefined
 }
 
+/** `foot.<x>Series(bucketSec?, buckets?)` - a SERIES of the last `buckets`
+ * footprint-bucket readings of one aggregate field (poc/pocTicks/
+ * stagnation/delta(velDelta)/speedRatio), chronological, `[-1]` = most
+ * recent - the per-price-NODE sibling of `tick.<x>Series()`. Unlike
+ * tick.*Series (which has to hand-roll bucketing via sliceTickWindow()
+ * because tick.* has no natural multi-bucket engine), buildFootprint()
+ * ALREADY produces a chronological array of buckets in one call - so this
+ * reuses `result.buckets` directly instead of calling buildFootprint()
+ * once per bucket (one pass over the tick buffer total, not `buckets`
+ * passes). A bucket with too few prints (< 3 ticks, same thin-coverage
+ * floor footSnapshot() itself uses) reads back as NaN rather than a
+ * misleading zero - `.slope()`/`.mean(n)` on a series with real gaps is a
+ * script-visible "thin data" signal, not a silent flat line. */
+function footBucketedSeries(field: 'poc' | 'pocTicks' | 'stagnation' | 'delta' | 'speedRatio', args: MslValue[], ticks: readonly { ts: number; price: number }[], nowMs: number): MslValue {
+  const bucketSec = Math.max(5, Math.round(args.length > 0 ? asNum(args[0]) : 10))
+  if (!Number.isFinite(bucketSec) || bucketSec <= 0) throw new MslRuntimeError(`foot.${field}Series(bucketSec, buckets?) - bucketSec must be a positive number`)
+  const buckets = seriesBucketCount(args.length > 1 ? asNum(args[1]) : undefined, 10)
+  if (!ticks.length) return seriesValue(new Array(buckets).fill(NaN))
+  const minutes = Math.max(1, Math.ceil((bucketSec * buckets) / 60))
+  const result = buildFootprint([...ticks], { bucketSec, minutes, nowMs })
+  const pick = (b: FootprintBucket | undefined): number => {
+    if (!b || b.nTicks < 3) return NaN
+    switch (field) {
+      case 'poc':
+        return b.pocPrice
+      case 'pocTicks':
+        return b.pocTicks
+      case 'stagnation':
+        return b.stagnation
+      case 'delta':
+        return b.velDelta
+      case 'speedRatio':
+        return b.speedRatio
+    }
+  }
+  const tail = result.buckets.slice(-buckets)
+  const out = tail.map(pick)
+  while (out.length < buckets) out.unshift(NaN) // pad the front if buildFootprint() couldn't form `buckets` full windows yet (thin history)
+  return seriesValue(out)
+}
+
 /** `foot.*` namespace - raw per-price-NODE footprint primitives, the piece
  * `tick.*` deliberately left out (tick.* is aggregate-over-the-whole-
  * window only, no per-price-level breakdown). Reuses buildFootprint()
  * verbatim; nothing here recomputes footprint math. */
 function footMethod(name: string, args: MslValue[], ticks: readonly { ts: number; price: number }[], nowMs: number): MslValue {
   const defaultWindowSec = 10 // wider than tick.*'s 5s default - a footprint needs enough prints to actually form rows across price levels
+  if (name === 'pocSeries') return footBucketedSeries('poc', args, ticks, nowMs)
+  if (name === 'pocTicksSeries') return footBucketedSeries('pocTicks', args, ticks, nowMs)
+  if (name === 'stagnationSeries') return footBucketedSeries('stagnation', args, ticks, nowMs)
+  if (name === 'deltaSeries') return footBucketedSeries('delta', args, ticks, nowMs)
+  if (name === 'speedRatioSeries') return footBucketedSeries('speedRatio', args, ticks, nowMs)
   switch (name) {
     case 'poc': {
       const b = footSnapshot(ticks, nowMs, args.length ? asNum(args[0]) : defaultWindowSec)
@@ -1428,7 +1535,118 @@ function footMethod(name: string, args: MslValue[], ticks: readonly { ts: number
       return false
     }
     default:
-      throw new MslRuntimeError(`unknown foot method "foot.${name}(...)" - use poc/pocTicks/stagnation/delta/speedRatio/imbalance/consecutiveDense`)
+      throw new MslRuntimeError(`unknown foot method "foot.${name}(...)" - use poc/pocTicks/stagnation/delta/speedRatio/imbalance/consecutiveDense, or pocSeries/pocTicksSeries/stagnationSeries/deltaSeries/speedRatioSeries for a historical series`)
+  }
+}
+
+/** `renko.*`/`pf.*`/`ha.*`'s shared conversion - renkoBricks()/pointFigure()/
+ * heikinAshiSeries() all want a real Candle[] (they only use .time to STAMP
+ * their output, never to decide the math - brick/box/HA logic is pure
+ * sequence + OHLCV), so a synthetic sequential time (0,1,2,...) is exactly
+ * as correct as a real one here and lets these namespaces reuse
+ * EvalEnv.series/seriesFor (the plain OHLCV arrays ind.* / ohlc() already
+ * read) instead of needing a whole second raw-candle channel threaded in. */
+function seriesToCandles(s: MslSeriesCtx): Candle[] {
+  const n = s.close.length
+  const out: Candle[] = new Array(n)
+  for (let i = 0; i < n; i++) out[i] = { time: i, open: s.open[i], high: s.high[i], low: s.low[i], close: s.close[i], volume: s.volume[i] }
+  return out
+}
+
+/** Clamp + round a series lookback argument the same way everywhere
+ * (renko.bricks(n)/pf.boxes(n)/ha.bars(n)) - at least 1, capped at 200 (an
+ * indicator-scale window; deeper history all tells the same "long-run
+ * structure" story and costs a full brick/box/HA rebuild per extra bar). */
+function seriesLookback(args: MslValue[], dflt: number): number {
+  const n = args.length ? asNum(args[0]) : dflt
+  return Math.max(1, Math.min(200, Math.round(n)))
+}
+
+/** `renko.*` - BRICK-level primitives, closing the gap the plain 'renko'
+ * verdict read (.dir/.conf/.value - value is already the signed streak, so
+ * renko.value covers "how long has it been running") leaves open: a script
+ * can trade the aggregate trend, but couldn't ask a pattern question about
+ * the bricks THEMSELVES ("first green brick after exactly 3 red bricks
+ * where this brick is oversized") until now. `renko.bricks(n?)` is a
+ * SERIES of the last n bricks' signed directions (+1/-1, chronological,
+ * [-1] = the latest brick - same convention every other MSL series uses),
+ * indexable and usable with every series method (.slope/.max/.min/.mean/
+ * .stddev/.crossed). `renko.brickSize()` is the current ATR-derived (or
+ * explicit, if configured) brick size in price units, for "is this brick
+ * bigger than usual" checks (renko.brickSize() vs ohlc(-1).range, say).
+ * Same optional trailing TF-string contract as ind.* / ohlc(). */
+function renkoMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const candles = seriesToCandles(requireSeries(ctx, tf))
+  const r = renkoBricks(candles)
+  switch (name) {
+    case 'bricks':
+      return seriesValue(r.bricks.map((b) => b.dir).slice(-seriesLookback(args, 50)))
+    case 'brickSize':
+      return r.brickSize
+    default:
+      throw new MslRuntimeError(`unknown renko method "renko.${name}(...)" - use bricks(n?)/brickSize() (or renko.dir/.conf/.value for the plain verdict read)`)
+  }
+}
+
+/** `pf.*` - BOX-level primitives, same reasoning as renko.* above: the
+ * plain 'pointFigure' verdict read only gives the aggregate column vote.
+ * `pf.boxes(n?)` is a series of the last n columns' SIGNED box counts
+ * (positive = X column, negative = O column, chronological, [-1] = the
+ * current/most recent column) - lets a script ask "how many boxes has each
+ * recent column painted," not just which way the current one leans.
+ * `pf.boxSize()` is the current box size in price units. */
+function pfMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const candles = seriesToCandles(requireSeries(ctx, tf))
+  const r = pointFigure(candles)
+  switch (name) {
+    case 'boxes':
+      return seriesValue(r.columns.map((c) => (c.dir === 'X' ? c.boxes : -c.boxes)).slice(-seriesLookback(args, 50)))
+    case 'boxSize':
+      return r.boxSize
+    default:
+      throw new MslRuntimeError(`unknown pf method "pf.${name}(...)" - use boxes(n?)/boxSize() (or pointFigure.dir/.conf/.value for the plain verdict read)`)
+  }
+}
+
+/** `ha.*` - Heikin Ashi candle-level primitives (a BRAND NEW namespace, not
+ * the existing 'heikinAshi' verdict-read identifier - no collision, since
+ * that one is only ever used as a field access, never a method call).
+ * `ha.bars(n?)` is a series of the last n HA candles' signed body
+ * directions (close>=open -> +1, else -1), same chronological/[-1]-latest
+ * convention as renko.bricks()/pf.boxes() - lets a script pattern-match
+ * across several HA candles. `ha.streak()` is the CURRENT signed run length
+ * (positive = n consecutive green HA candles, negative = n red) - same
+ * "+up/-down" convention renko's own .value field already uses.
+ * `ha.flip()` is true the instant the latest HA candle's color differs from
+ * the one before it (a fresh reversal, not a held trend). `ha.bodyAtr()` is
+ * the latest HA candle's body size scaled by the SAME candle-based ATR
+ * renko's own adaptive brick sizing uses (renkoAtr()) - "is this HA candle
+ * unusually strong" without a script re-deriving its own ATR. */
+function haMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const candles = seriesToCandles(requireSeries(ctx, tf))
+  const ha = heikinAshiSeries(candles)
+  const dirs = ha.map((c) => (c.close >= c.open ? 1 : -1))
+  switch (name) {
+    case 'bars':
+      return seriesValue(dirs.slice(-seriesLookback(args, 50)))
+    case 'streak': {
+      if (!dirs.length) return 0
+      const last = dirs[dirs.length - 1]
+      let streak = 0
+      for (let i = dirs.length - 1; i >= 0 && dirs[i] === last; i--) streak++
+      return last * streak
+    }
+    case 'flip':
+      return dirs.length >= 2 && dirs[dirs.length - 1] !== dirs[dirs.length - 2]
+    case 'bodyAtr': {
+      if (!ha.length) return 0
+      const lastBar = ha[ha.length - 1]
+      const body = Math.abs(lastBar.close - lastBar.open)
+      const atr = renkoAtr(candles)
+      return Number.isFinite(atr) && atr > 0 ? body / atr : 0
+    }
+    default:
+      throw new MslRuntimeError(`unknown ha method "ha.${name}(...)" - use bars(n?)/streak()/flip()/bodyAtr() (or heikinAshi.dir/.conf for the plain verdict read)`)
   }
 }
 
@@ -1560,6 +1778,30 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
       if (e.obj.t === 'ident' && e.obj.name === 'foot' && !(e.obj.name in env)) {
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         return footMethod(e.name, args, requireTicks(ctx), ctx.liveNowMs ?? Date.now())
+      }
+      // `renko.bricks(...)`/`pf.boxes(...)`/`ha.bars(...)` etc - brick/box/
+      // HA-candle-level primitives, same optional trailing TF-string
+      // contract as ind.*/ohlc(). 'renko' is ALSO a real reads-map identifier
+      // (the plain verdict read, e.g. `renko.dir`) but that's a DIFFERENT
+      // AST node (a 'field' access, no parens) - this only intercepts the
+      // METHOD-call form, so `renko.dir`/`renko.value` are completely
+      // unaffected. 'pf'/'ha' are brand new namespace markers (the verdict
+      // reads use the different identifiers 'pointFigure'/'heikinAshi'), so
+      // there's no collision to guard against for those two at all.
+      if (e.obj.t === 'ident' && e.obj.name === 'renko' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return renkoMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'pf' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return pfMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'ha' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return haMethod(e.name, args, ctx, tf)
       }
       const obj = evalExpr(e.obj, env, ctx)
       const args = e.args.map((a) => evalExpr(a, env, ctx))
