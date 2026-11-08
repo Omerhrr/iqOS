@@ -45,12 +45,15 @@ import { metaTraderPlugin, MetaTraderService } from './src/plugins/metatrader'
 import { META_CONDITION_SOURCES } from './src/analytics/metastrategy'
 import { yesterdayPlugin, YesterdayService } from './src/plugins/yesterday'
 import { nextCandlePlugin, NextCandleService } from './src/plugins/nextcandle'
-import { nextExpiryPlugin, NextExpiryService, EXPIRY_ORACLE_MIN_CANDLES } from './src/plugins/nextexpiry'
-import { technicalPlugin, TechnicalService } from './src/plugins/technical'
-import { reversalPlugin, ReversalService } from './src/plugins/reversal'
 import { adxHonestyPlugin, AdxHonestyService } from './src/plugins/adxhonesty'
 import { tempoPlugin, TempoService } from './src/plugins/tempo'
 import { accutePlugin, AccuteService } from './src/plugins/accute'
+import { nextExpiryPlugin, NextExpiryService } from './src/plugins/nextexpiry'
+import { reversalPlugin, ReversalService } from './src/plugins/reversal'
+import { technicalPlugin, TechnicalService } from './src/plugins/technical'
+import {
+  computeTickSmc, computeTickOracle, computeTickTechnical, computeTickFootprint, medianTickGapMs,
+} from './src/analytics/tickdesk'
 import { gridSearch, walkForward, sweepAssets, type Objective } from './src/strategies/optimize'
 import { backtest } from './src/strategies/backtest'
 import { readBuiltinStrategySource, saveBuiltinStrategySource } from './src/strategies/sourceedit'
@@ -83,7 +86,6 @@ import { volumeBars } from './src/analytics/volumebars'
 import { computeFootprint } from './src/analytics/footprint'
 import { computeTpo } from './src/analytics/tpo'
 import { tickBars } from './src/analytics/tickbars'
-import { computeTickSmc, computeTickOracle, computeTickTechnical, computeTickFootprint, medianTickGapMs } from './src/analytics/tickdesk'
 import { hvSeries, ivFromPayout, realizedUpProb } from './src/analytics/ivhv'
 import { buildCalibrationReport, type CalibrationStoreSlice } from './src/analytics/calibration'
 import { computeStepStats, computeIntervalStats } from './src/analytics/randomness'
@@ -216,13 +218,19 @@ kernel.register(metaStrategyPlugin)
 kernel.register(aiTraderPlugin)
 kernel.register(yesterdayPlugin)
 kernel.register(nextCandlePlugin)
-kernel.register(nextExpiryPlugin)
-kernel.register(technicalPlugin)
-kernel.register(reversalPlugin)
 kernel.register(tempoPlugin)
 kernel.register(adxHonestyPlugin)
 kernel.register(accutePlugin)
 kernel.register(metaTraderPlugin)
+// PRECISION FIX: these three plugins (and the panels/client.ts wrappers
+// that call them) existed in the repo but were never registered with the
+// kernel, so every one of /next_expiry, /reversal, /technical (and their
+// Global siblings) 404'd and the frontend panels built against exports
+// that didn't exist yet either - caught when a production `bun run build`
+// finally exercised that half-wired code path. Wiring both ends now.
+kernel.register(nextExpiryPlugin)
+kernel.register(reversalPlugin)
+kernel.register(technicalPlugin)
 
 // ---------- Full-universe scanners for Distill / Cointegration / Vol Arb ----------
 // These three started as single-asset-only panels (read whatever's on the
@@ -1799,40 +1807,147 @@ const httpServer = createServer(async (req, res) => {
         return json(200, { ok: true, ...(await fp.footprint(asset, { minutes, bucketSec })) })
       }
 
-      // ---------- Tick Desk: the tick-chart views ----------
-      // Everything below reads the RAW micro-tick stream (the otc-footprint
-      // collector's per-asset buffers: sim = the kernel engine's ~1s prints,
-      // live = the sidecar's 100ms price-change captures) - NOT time candles.
-      // Each view derives its own tick-chart buckets from the same prints and
-      // discloses dataSource + measured cadence on every response.
+      // ---------- Next-Expiry Oracle (per-expiry fused read + honesty loop) ----------
+      // GET /next_expiry?asset=X -> plugins/nextexpiry.ts's predict(), one
+      // row per EXPIRIES_MIN rung. GET /next_expiry_stats -> the resolved
+      // honesty ledger. GET /next_expiry_global -> whole-universe board,
+      // same TTL-cached rows the per-asset read warms.
+      if (path === '/next_expiry') {
+        try {
+          const svc = kernel.context().use<NextExpiryService>('nextexpiry')
+          const asset = String(q.get('asset') ?? market.activeAsset)
+          const prediction = svc.predict(asset)
+          if (!prediction) return json(200, { ok: false, error: 'warming up - not enough closed 1m history yet' })
+          return json(200, { ok: true, prediction })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      if (path === '/next_expiry_stats') {
+        try {
+          const svc = kernel.context().use<NextExpiryService>('nextexpiry')
+          return json(200, { ok: true, ...svc.stats() })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      if (path === '/next_expiry_global') {
+        try {
+          const svc = kernel.context().use<NextExpiryService>('nextexpiry')
+          const out = svc.globalScan({
+            limit: q.get('limit') ? Number(q.get('limit')) : undefined,
+            category: q.get('category') ?? 'all',
+            refresh: q.get('refresh') === '1',
+          })
+          return json(200, { ok: true, ...out })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // ---------- Reversal Radar (is this turning RIGHT NOW) ----------
+      // GET /reversal?asset=X -> plugins/reversal.ts's readFor(), the full
+      // per-timeframe calm/forming/reversing/confirmed ladder for one pair.
+      // GET /reversal_global -> whole-universe board, same TTL-cached rows.
+      if (path === '/reversal') {
+        try {
+          const svc = kernel.context().use<ReversalService>('reversal')
+          const asset = String(q.get('asset') ?? market.activeAsset)
+          const summary = svc.readFor(asset)
+          if (!summary) return json(200, { ok: false, error: 'not in the tracked universe' })
+          return json(200, { ok: true, summary })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      if (path === '/reversal_global') {
+        try {
+          const svc = kernel.context().use<ReversalService>('reversal')
+          const out = svc.globalScan({
+            limit: q.get('limit') ? Number(q.get('limit')) : undefined,
+            category: q.get('category') ?? 'all',
+            refresh: q.get('refresh') === '1',
+          })
+          return json(200, { ok: true, ...out })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // ---------- Technical Summary (investing.com-style oscillator+MA ladder) ----------
+      // GET /technical?asset=X -> plugins/technical.ts's summaryFor(), the
+      // full per-timeframe vote ladder for one pair. GET /technical_global
+      // -> whole-universe board, same TTL-cached rows.
+      if (path === '/technical') {
+        try {
+          const svc = kernel.context().use<TechnicalService>('technical')
+          const asset = String(q.get('asset') ?? market.activeAsset)
+          const summary = svc.summaryFor(asset)
+          if (!summary) return json(200, { ok: false, error: 'not in the tracked universe' })
+          return json(200, { ok: true, summary })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      if (path === '/technical_global') {
+        try {
+          const svc = kernel.context().use<TechnicalService>('technical')
+          const out = svc.globalScan({
+            limit: q.get('limit') ? Number(q.get('limit')) : undefined,
+            category: q.get('category') ?? 'all',
+            refresh: q.get('refresh') === '1',
+          })
+          return json(200, { ok: true, ...out })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // ---------- Tick Desk (the four engines read off the raw micro-tick
+      // stream, same buffer otc_footprint collects: sim ~1s prints, live
+      // sidecar 100ms captures). Pure analytics/tickdesk.ts functions called
+      // directly off otcFootprint's ticksFor(asset) - no separate service,
+      // same honesty labeling convention OtcFootprintService.footprint()
+      // already uses (dataSource + median cadenceMs). ----------
       if (path === '/tick_smc' || path === '/tick_oracle' || path === '/tick_technical' || path === '/tick_footprint') {
-        const ofp = kernel.context().use<OtcFootprintService>('otcFootprint')
-        const asset = String(q.get('asset') ?? '').toUpperCase() || market.activeAsset
-        const ticks = ofp.ticksFor(asset)
-        const live = market.mode === 'live'
-        const source = {
-          asset,
-          feed: market.mode,
-          dataSource: live ? 'sidecar-tick-100ms' : ticks.length ? 'sim-tick-1s' : 'no-ticks-yet',
-          cadenceMs: medianTickGapMs(ticks),
-          ticks: ticks.length,
-          lastTickTs: ticks.length ? ticks[ticks.length - 1].ts : null,
+        try {
+          const fp = kernel.context().use<OtcFootprintService>('otcFootprint')
+          const asset = String(q.get('asset') ?? market.activeAsset)
+          const ticks = fp.ticksFor(asset)
+          const live = market.mode === 'live'
+          const dataSource = live ? 'sidecar-tick-100ms' : ticks.length ? 'sim-tick-1s' : 'no-ticks-yet'
+          const cadenceMs = medianTickGapMs(ticks)
+          // each compute* function's own `ok` already means "this pair's
+          // read is warm, not a request-failure flag" - the panels key off
+          // exactly that (data.ok -> warming note), so it's passed through
+          // as-is rather than overwritten with a blanket true.
+          if (path === '/tick_smc') {
+            const bucketSec = q.get('bucketSec') ? Number(q.get('bucketSec')) : undefined
+            const result = computeTickSmc(ticks, { bucketSec })
+            return json(200, { ...result, dataSource, cadenceMs, ticks: ticks.length })
+          }
+          if (path === '/tick_oracle') {
+            const result = computeTickOracle(ticks, {})
+            return json(200, { ...result, dataSource, cadenceMs })
+          }
+          if (path === '/tick_technical') {
+            const bucketSec = q.get('bucketSec') ? Number(q.get('bucketSec')) : undefined
+            const result = computeTickTechnical(ticks, bucketSec ? { detailBucketSec: bucketSec } : {})
+            return json(200, { ...result, dataSource, cadenceMs })
+          }
+          // /tick_footprint
+          const bucketSec = q.get('bucketSec') ? Number(q.get('bucketSec')) : undefined
+          const bins = q.get('bins') ? Number(q.get('bins')) : undefined
+          const maxBuckets = q.get('maxBuckets') ? Number(q.get('maxBuckets')) : undefined
+          const result = computeTickFootprint(ticks, { bucketSec, bins, maxBuckets })
+          return json(200, { ...result, dataSource, cadenceMs })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }
-        if (path === '/tick_smc') {
-          const bucketSec = Math.max(5, Math.min(3600, Number(q.get('bucketSec') ?? 15)))
-          return json(200, { ...source, ...computeTickSmc(ticks, { bucketSec }) })
-        }
-        if (path === '/tick_oracle') {
-          return json(200, { ...source, ...computeTickOracle(ticks) })
-        }
-        if (path === '/tick_technical') {
-          const detailBucketSec = Math.max(5, Math.min(3600, Number(q.get('bucketSec') ?? 60)))
-          return json(200, { ...source, ...computeTickTechnical(ticks, { detailBucketSec }) })
-        }
-        const fbBucketSec = Math.max(5, Math.min(3600, Number(q.get('bucketSec') ?? 60)))
-        const fbBins = Math.max(2, Math.min(24, Number(q.get('bins') ?? 12)))
-        const fbCandles = Math.max(2, Math.min(80, Number(q.get('candles') ?? 30)))
-        return json(200, { ...source, ...computeTickFootprint(ticks, { bucketSec: fbBucketSec, bins: fbBins, maxBuckets: fbCandles }) })
       }
 
       if (path === '/analysis') {
@@ -2947,127 +3062,6 @@ const httpServer = createServer(async (req, res) => {
         }
       }
 
-      // ---------- Next-Expiry Oracle ----------
-      // GET /next_expiry?asset=X -> per-expiry fused reads (1/2/3/5/15 min)
-      // + the single best-expiry pick, tracked by its own honesty loop.
-      // Always runs on closed 1m candles regardless of the chart's tf -
-      // the expiry ladder is minute-native (see analytics/nextexpiry.ts).
-      if (path === '/next_expiry') {
-        try {
-          const svc = kernel.context().use<NextExpiryService>('nextexpiry')
-          const neAsset = String(q.get('asset') ?? market.activeAsset)
-          const pred = svc.predict(neAsset)
-          if (!pred) return json(200, { ok: false, error: `not enough closed 1m history on ${neAsset} for the expiry oracle (needs ${EXPIRY_ORACLE_MIN_CANDLES}+ bars)` })
-          return json(200, { ok: true, prediction: pred })
-        } catch (err) {
-          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
-        }
-      }
-
-      // GET /next_expiry_stats -> the expiry oracle's resolved honesty ledger
-      // (per asset:expiry records + universe-wide per-expiry summary).
-      if (path === '/next_expiry_stats') {
-        try {
-          const svc = kernel.context().use<NextExpiryService>('nextexpiry')
-          return json(200, { ok: true, ...svc.stats() })
-        } catch (err) {
-          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
-        }
-      }
-
-      // GET /next_expiry_global?category=all&refresh=1&limit=<safety ceiling>
-      // -> Next-Expiry Global: the WHOLE open universe (limit omitted = no
-      // truncation, same audit contract as /dom_global) with one fused
-      // best-expiry read per pair + its 5-rung mini strip. Rows are
-      // TTL-cached per pair and every read is tracked by the expiry
-      // oracle's honesty loop, so the board and the per-asset expiry panel
-      // share one calibration record.
-      if (path === '/next_expiry_global') {
-        try {
-          const svc = kernel.context().use<NextExpiryService>('nextexpiry')
-          const out = svc.globalScan({
-            limit: q.get('limit') ? Number(q.get('limit')) : undefined,
-            category: q.get('category') ?? 'all',
-            refresh: q.get('refresh') === '1',
-          })
-          return json(200, { ok: true, ...out })
-        } catch (err) {
-          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
-        }
-      }
-
-      // GET /technical?asset=X -> the Technical Summary: investing.com-style
-      // oscillator + moving-average vote panels condensed into STRONG BUY /
-      // BUY / NEUTRAL / SELL / STRONG SELL at EVERY rung of the
-      // 1s/2s/3s/5s/15s/30s/1m/2m/3m/5m ladder (analytics/technicals.ts).
-      // Seconds rungs are built from the raw tick buffer, 3m is aggregated
-      // from 3 x 1m - every rung discloses its data source.
-      if (path === '/technical') {
-        try {
-          const svc = kernel.context().use<TechnicalService>('technical')
-          const tAsset = String(q.get('asset') ?? market.activeAsset)
-          const sum = svc.summaryFor(tAsset)
-          if (!sum) return json(200, { ok: false, error: `unknown asset ${tAsset} - no technical read` })
-          return json(200, { ok: true, summary: sum })
-        } catch (err) {
-          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
-        }
-      }
-
-      // GET /technical_global?category=all&refresh=1&limit=<safety ceiling>
-      // -> Technical Global: the WHOLE open universe with one cross-TF
-      // consensus verdict per pair + its 10-rung mini strip, TTL-cached and
-      // sorted by conviction (|score| first). No honesty ledger by design -
-      // the engine emits disclosed vote counts, not pWin predictions.
-      if (path === '/technical_global') {
-        try {
-          const svc = kernel.context().use<TechnicalService>('technical')
-          const out = svc.globalScan({
-            limit: q.get('limit') ? Number(q.get('limit')) : undefined,
-            category: q.get('category') ?? 'all',
-            refresh: q.get('refresh') === '1',
-          })
-          return json(200, { ok: true, ...out })
-        } catch (err) {
-          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
-        }
-      }
-
-      // GET /reversal?asset=X -> the Reversal panel: per-rung
-      // calm / forming / REVERSING NOW / confirmed reads from 7 fail-closed
-      // detectors (RSI hook, stoch cross, the OS's own candle-pattern
-      // library, Bollinger re-entry, divergence, run exhaustion, stretch
-      // fade) - analytics/reversal.ts.
-      if (path === '/reversal') {
-        try {
-          const svc = kernel.context().use<ReversalService>('reversal')
-          const rAsset = String(q.get('asset') ?? market.activeAsset)
-          const sum = svc.readFor(rAsset)
-          if (!sum) return json(200, { ok: false, error: `unknown asset ${rAsset} - no reversal read` })
-          return json(200, { ok: true, summary: sum })
-        } catch (err) {
-          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
-        }
-      }
-
-      // GET /reversal_global?category=all&refresh=1&limit=<safety ceiling>
-      // -> Reversal Global: the whole universe ranked by urgency
-      // (reversing now > confirmed > forming > calm, then |score|), each
-      // row with its 10-rung state strip. TTL-cached per pair.
-      if (path === '/reversal_global') {
-        try {
-          const svc = kernel.context().use<ReversalService>('reversal')
-          const out = svc.globalScan({
-            limit: q.get('limit') ? Number(q.get('limit')) : undefined,
-            category: q.get('category') ?? 'all',
-            refresh: q.get('refresh') === '1',
-          })
-          return json(200, { ok: true, ...out })
-        } catch (err) {
-          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
-        }
-      }
-
       // GET /next_global?tf=1m&limit=30&category=all&refresh=1
       // -> the Next Global board: one fused next-candle read per instrument
       // (open universe, category-filterable), rows sorted by tradability
@@ -4087,10 +4081,7 @@ const httpServer = createServer(async (req, res) => {
       }
 
       if (path === '/close') {
-        // force:1 = operator override for the "awaiting IQ confirmation"
-        // zombie state - one fresh broker lookup, then IQ's own figure or an
-        // honestly-labeled $0 flat close (see forceCloseLiveOption)
-        const out = exec.closePosition(String(body.id ?? ''), { force: body.force === true })
+        const out = exec.closePosition(String(body.id ?? ''))
         return json(200, out)
       }
 
@@ -4459,16 +4450,6 @@ const httpServer = createServer(async (req, res) => {
         const ai = kernel.context().use<AiTraderService>('aiTrader')
         ai.clearDecisions()
         return json(200, { ok: true })
-      }
-
-      // POST /ai_trader_restart_compound - revive a compounding AI Trader
-      // plan after a stop-on-loss / periods-complete halt: clears the halt,
-      // re-seeds the pot at base (same contract as bot_restart for compound
-      // bots and the meta-trader's restart). 400 with no plan armed.
-      if (path === '/ai_trader_restart_compound') {
-        const ai = kernel.context().use<AiTraderService>('aiTrader')
-        const out = ai.restartCompound()
-        return json(out.ok ? 200 : 400, out)
       }
 
       if (path === '/lab_delete') {

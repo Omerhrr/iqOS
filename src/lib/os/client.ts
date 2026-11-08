@@ -670,6 +670,443 @@ export async function getOtcFootprint(asset: string, opts?: { minutes?: number; 
   })
 }
 
+// ---------- Next-Expiry Oracle (mini-services/trading-core/src/plugins/nextexpiry.ts) ----------
+
+export interface ExpiryDriver {
+  name: string
+  pUp: number
+  weight: number
+  vote: number
+  detail: string
+}
+
+export interface ExpiryRow {
+  expiry: number
+  ok: boolean
+  note: string
+  pUp: number
+  direction: 'call' | 'put' | 'none'
+  pWin: number
+  confidence: number
+  rawConfidence: number
+  edge: number
+  predictability: number
+  expectedMove: number
+  cone: { low: number; high: number }
+  drivers: ExpiryDriver[]
+  driversActive: number
+  calibration: { n: number; hitRate: number; brier: number } | null
+  targetBarTime: number
+}
+
+export interface NextExpiryPrediction {
+  asset: string
+  ts: number
+  mode: 'sim' | 'live'
+  price: number
+  regime: string
+  session: string
+  halfLifeMin: number | null
+  rows: ExpiryRow[]
+  best: { expiry: number; direction: 'call' | 'put'; pWin: number; confidence: number; edge: number } | null
+  note: string
+  calibrationTotal: { n: number; hitRate: number; brier: number } | null
+}
+
+export async function getNextExpiry(asset: string): Promise<{ ok: boolean; prediction?: NextExpiryPrediction; error?: string }> {
+  return osGet('/next_expiry', { asset })
+}
+
+export interface NextExpiryStatsResponse {
+  ok: boolean
+  error?: string
+  total: number
+  pending: number
+  records: { asset: string; expiry: number; n: number; hitRate: number; brier: number; streak: number }[]
+  expirySummary: { expiry: number; n: number; hitRate: number; brier: number }[]
+  driverWeightMultipliers: Record<string, Record<string, number>>
+  recent: {
+    asset: string
+    expiry: number
+    targetBarTime: number
+    issuedTs: number
+    resolvedTs: number
+    predicted: 'call' | 'put'
+    pUp: number
+    confidence: number
+    entry: number
+    exit: number
+    actual: 'up' | 'down' | 'flat'
+    hit: boolean
+    score: number
+    brier: number
+    drivers: { name: string; vote: number; pUp: number }[]
+  }[]
+}
+
+export async function getNextExpiryStats(): Promise<NextExpiryStatsResponse> {
+  return osGet<NextExpiryStatsResponse>('/next_expiry_stats', {})
+}
+
+export interface NextExpiryGlobalRow {
+  asset: string
+  computedTs: number
+  ok: boolean
+  note: string
+  price: number
+  regime: string
+  session: string
+  halfLifeMin: number | null
+  best: { expiry: number; direction: 'call' | 'put'; pWin: number; confidence: number; edge: number } | null
+  rungs: { expiry: number; ok: boolean; direction: 'call' | 'put' | 'none'; pWin: number; confidence: number }[]
+  liveRungs: number
+  calibration: { n: number; hitRate: number; brier: number } | null
+  mode: 'sim' | 'live'
+}
+
+export async function getNextExpiryGlobal(opts?: { limit?: number; category?: string; refresh?: boolean }): Promise<{
+  ok: boolean
+  error?: string
+  scannedTs: number
+  universe: number
+  scanned: number
+  live: number
+  warming: number
+  refreshed: number
+  rows: NextExpiryGlobalRow[]
+}> {
+  return osGet('/next_expiry_global', {
+    limit: opts?.limit,
+    category: opts?.category,
+    refresh: opts?.refresh ? 1 : undefined,
+  })
+}
+
+// ---------- Reversal Radar (mini-services/trading-core/src/plugins/reversal.ts) ----------
+
+export type ReversalState = 'calm' | 'forming' | 'reversing' | 'confirmed'
+export type ReversalDir = 'up' | 'down' | 'none'
+
+export interface ReversalReason {
+  detector: string
+  dir: 'up' | 'down'
+  weight: number
+  note: string
+}
+
+export interface ReversalTfRow {
+  tf: string
+  sec: number
+  source: 'ticks' | 'native' | 'agg1m'
+  ok: boolean
+  note: string
+  bars: number
+  ticksPerBar: number | null
+  state: ReversalState
+  direction: ReversalDir
+  score: number
+  reasons: ReversalReason[]
+}
+
+export interface ReversalSummary {
+  asset: string
+  ts: number
+  mode: 'sim' | 'live'
+  price: number
+  rows: ReversalTfRow[]
+  best: { tf: string; state: ReversalState; direction: 'up' | 'down'; score: number } | null
+  note: string
+}
+
+export async function getReversal(asset: string): Promise<{ ok: boolean; summary?: ReversalSummary; error?: string }> {
+  return osGet('/reversal', { asset })
+}
+
+export interface ReversalGlobalRow {
+  asset: string
+  price: number
+  computedTs: number
+  ok: boolean
+  note: string
+  mode: 'sim' | 'live'
+  best: { tf: string; state: ReversalState; direction: 'up' | 'down'; score: number } | null
+  state: ReversalState
+  direction: 'up' | 'down' | 'none'
+  score: number
+  cells: { tf: string; ok: boolean; state: ReversalState; direction: string; score: number }[]
+}
+
+export async function getReversalGlobal(opts?: { limit?: number; category?: string; refresh?: boolean }): Promise<{
+  ok: boolean
+  error?: string
+  scannedTs: number
+  universe: number
+  scanned: number
+  live: number
+  warming: number
+  refreshed: number
+  rows: ReversalGlobalRow[]
+}> {
+  return osGet('/reversal_global', {
+    limit: opts?.limit,
+    category: opts?.category,
+    refresh: opts?.refresh ? 1 : undefined,
+  })
+}
+
+// ---------- Technical Summary (mini-services/trading-core/src/plugins/technical.ts) ----------
+
+export type TechRead = 'buy' | 'sell' | 'neutral' | 'na'
+export type TechVerdictLabel = 'STRONG BUY' | 'BUY' | 'NEUTRAL' | 'SELL' | 'STRONG SELL'
+
+export interface TechVote {
+  name: string
+  read: TechRead
+  value: string
+}
+
+export interface TechVerdict {
+  label: TechVerdictLabel
+  score: number
+  buys: number
+  sells: number
+  neutrals: number
+  counted: number
+}
+
+export interface TechTfRow {
+  tf: string
+  sec: number
+  source: 'ticks' | 'native' | 'agg1m'
+  ok: boolean
+  note: string
+  bars: number
+  ticksPerBar: number | null
+  osc: TechVote[]
+  oscSummary: TechVerdict
+  mas: TechVote[]
+  maSummary: TechVerdict
+  summary: TechVerdict
+}
+
+export interface TechnicalSummary {
+  asset: string
+  ts: number
+  mode: 'sim' | 'live'
+  price: number
+  rows: TechTfRow[]
+  overall: TechVerdict
+  direction: 'call' | 'put' | 'none'
+  note: string
+}
+
+export async function getTechnical(asset: string): Promise<{ ok: boolean; summary?: TechnicalSummary; error?: string }> {
+  return osGet('/technical', { asset })
+}
+
+export interface TechnicalGlobalRow {
+  asset: string
+  price: number
+  computedTs: number
+  ok: boolean
+  note: string
+  mode: 'sim' | 'live'
+  overall: TechVerdict
+  direction: 'call' | 'put' | 'none'
+  cells: { tf: string; ok: boolean; label: TechVerdictLabel; score: number }[]
+  strongest: { tf: string; label: TechVerdictLabel; score: number } | null
+}
+
+export async function getTechnicalGlobal(opts?: { limit?: number; category?: string; refresh?: boolean }): Promise<{
+  ok: boolean
+  error?: string
+  scannedTs: number
+  universe: number
+  scanned: number
+  live: number
+  warming: number
+  refreshed: number
+  rows: TechnicalGlobalRow[]
+}> {
+  return osGet('/technical_global', {
+    limit: opts?.limit,
+    category: opts?.category,
+    refresh: opts?.refresh ? 1 : undefined,
+  })
+}
+
+// ---------- Tick Desk (mini-services/trading-core/src/analytics/tickdesk.ts) - the
+// four engines read off the raw micro-tick stream (same buffer otc_footprint
+// collects): Tick SMC, Tick Oracle, Tick Technical, Tick Footprint. Every
+// response carries dataSource + cadenceMs, same honesty-labeling convention
+// OtcFootprintResult above uses. ----------
+
+export type TickRating = 'strong-buy' | 'buy' | 'neutral' | 'sell' | 'strong-sell'
+
+export interface TickSmcZone {
+  top: number
+  bottom: number
+  time: number
+}
+
+export interface TickSmcBreak {
+  dir: 'bull' | 'bear'
+  level: number
+  time: number
+  agoBars: number
+}
+
+export interface TickSmcResult {
+  ok: boolean
+  note?: string
+  bucketSec: number
+  candles: number
+  medTicksPerCandle: number
+  trend: 'up' | 'down' | 'range'
+  bos: TickSmcBreak | null
+  choch: TickSmcBreak | null
+  bullOrderBlock: (TickSmcZone & { mitigated: boolean }) | null
+  bearOrderBlock: (TickSmcZone & { mitigated: boolean }) | null
+  fvgs: (TickSmcZone & { dir: 'bull' | 'bear'; filled: boolean })[]
+  sweeps: (TickSmcZone & { dir: 'bull' | 'bear'; close: number })[]
+  premiumDiscount: { eq: number; high: number; low: number; zone: 'premium' | 'discount' | 'equilibrium' } | null
+  price: number
+  direction: 'call' | 'put' | 'none'
+  confidence: number
+  reasons: string[]
+  dataSource: string
+  cadenceMs: number | null
+  ticks: number
+}
+
+export async function getTickSmc(asset: string, opts?: { bucketSec?: number }): Promise<TickSmcResult> {
+  return osGet<TickSmcResult>('/tick_smc', { asset, bucketSec: opts?.bucketSec })
+}
+
+export interface TickOracleRow {
+  label: string
+  bucketSec: number
+  ok: boolean
+  note?: string
+  candles: number
+  medTicksPerCandle: number
+  direction: 'call' | 'put' | 'none'
+  confidence: number
+  score: number
+  reasons: string[]
+  wf: { n: number; hits: number; misses: number; hitRatePct: number | null } | null
+}
+
+export interface TickOracleResult {
+  ok: boolean
+  note?: string
+  rows: TickOracleRow[]
+  best: TickOracleRow | null
+  ticks: number
+  dataSource: string
+  cadenceMs: number | null
+}
+
+export async function getTickOracle(asset: string): Promise<TickOracleResult> {
+  return osGet<TickOracleResult>('/tick_oracle', { asset })
+}
+
+export interface TickTechRow {
+  name: string
+  group: 'osc' | 'ma'
+  vote: 'buy' | 'sell' | 'neutral'
+  value: string
+}
+
+export interface TickTechBucket {
+  label: string
+  bucketSec: number
+  ok: boolean
+  note?: string
+  candles: number
+  osc: { buy: number; sell: number; neutral: number; rating: TickRating }
+  mas: { buy: number; sell: number; neutral: number; rating: TickRating }
+  summary: { buy: number; sell: number; neutral: number; rating: TickRating }
+}
+
+export interface TickTechnicalResult {
+  ok: boolean
+  note?: string
+  buckets: TickTechBucket[]
+  detail: {
+    label: string
+    bucketSec: number
+    ok: boolean
+    note?: string
+    candles: number
+    rows: TickTechRow[]
+    skipped: string[]
+    price: number
+  }
+  ticks: number
+  rule: string
+  dataSource: string
+  cadenceMs: number | null
+}
+
+export async function getTickTechnical(asset: string, opts?: { bucketSec?: number }): Promise<TickTechnicalResult> {
+  return osGet<TickTechnicalResult>('/tick_technical', { asset, bucketSec: opts?.bucketSec })
+}
+
+export interface TickFootprintRow {
+  priceLow: number
+  priceHigh: number
+  mid: number
+  up: number
+  dn: number
+  upMs: number
+  dnMs: number
+  delta: number
+  imbalance: 'buy' | 'sell' | null
+}
+
+export interface TickFootprintCandle {
+  time: number
+  open: number
+  high: number
+  low: number
+  close: number
+  ticks: number
+  upTicks: number
+  dnTicks: number
+  delta: number
+  poc: number | null
+  rows: TickFootprintRow[]
+}
+
+export interface TickFootprintResult {
+  ok: boolean
+  note?: string
+  bucketSec: number
+  bins: number
+  imbRatio: number
+  candles: TickFootprintCandle[]
+  summary: {
+    netDelta: number
+    totalUp: number
+    totalDn: number
+    dominantPoc: number | null
+    buckets: number
+  }
+  ticks: number
+  dataSource: string
+  cadenceMs: number | null
+}
+
+export async function getTickFootprint(asset: string, opts?: { bucketSec?: number; bins?: number; candles?: number }): Promise<TickFootprintResult> {
+  return osGet<TickFootprintResult>('/tick_footprint', {
+    asset,
+    bucketSec: opts?.bucketSec,
+    bins: opts?.bins,
+    maxBuckets: opts?.candles,
+  })
+}
+
 // ---------- chart-signal scanner (Signal Panel) ----------
 
 export type ChartEngineId = 'renko' | 'pnf' | 'range' | 'tick' | 'footprint' | 'otcfootprint' | 'heikin' | 'candle'
