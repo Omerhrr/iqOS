@@ -503,6 +503,134 @@ export class MetaTraderService {
     }
   }
 
+  /** Raw, UN-GATED read for ONE asset on the currently configured
+   * signalSource - "what does renko.dir/.conf say about EURUSD right now",
+   * not "did it qualify to trade". pickCandidates()/pick*() above apply
+   * this.config.minConfidence + this.config.direction before a row ever
+   * surfaces, so a quiet Meta Trader gives no visibility into WHY a pair
+   * didn't fire (gated out vs. no read at all vs. thin history). peek()
+   * runs the identical per-source engine call pickCandidates() would, but
+   * skips both those user-config gates and reports whether they'd currently
+   * pass - the missing diagnostic surface raised directly: "I don't have a
+   * tool that returns renko.dir/.conf... as data" needed exactly this.
+   * Engine-level "no read possible" floors (thin history, no price, no
+   * saved meta-strategy id) still return null - those aren't gates, they're
+   * "nothing to show". */
+  peek(asset: string): {
+    source: MetaTraderSource
+    asset: string
+    direction: 'call' | 'put' | 'none'
+    confidence: number
+    price: number
+    note: string
+    passesDirection: boolean
+    passesConfidence: boolean
+    configuredDirection: 'both' | 'call' | 'put'
+    minConfidence: number
+  } | { source: MetaTraderSource; asset: string; error: string } {
+    const src = this.config.signalSource
+    const fail = (error: string) => ({ source: src, asset, error })
+    try {
+      let direction: 'call' | 'put' | 'none' = 'none'
+      let confidence = 0
+      let price = 0
+      let note = ''
+
+      if (src === 'meta-strategy') {
+        const id = this.config.metaStrategyId
+        if (!id) return fail('no metaStrategyId configured')
+        const meta = this.ctx.use<MetaStrategyService>('metaStrategy')
+        if (!meta.isValidStrategyId(id)) return fail(`unknown meta-strategy id "${id}"`)
+        const { result, price: p } = meta.evaluate(id, asset, this.config.tf)
+        direction = result.direction
+        confidence = result.confidence
+        price = p
+        note = `meta-strategy "${id}": ${result.notes}`
+      } else if (src === 'oracle') {
+        const oracle = this.ctx.use<NextCandleService>('nextcandle')
+        const pred = oracle.predict(asset, this.config.tf)
+        if (!pred) return fail('thin history - oracle has no read yet')
+        direction = pred.direction
+        confidence = pred.confidence
+        price = pred.price
+        note = `oracle: pUp ${(pred.pUp * 100).toFixed(0)}% · ${pred.driversActive} models · regime ${pred.regime}`
+      } else if (src === 'next-expiry') {
+        const oracle = this.ctx.use<NextExpiryService>('nextexpiry')
+        const pred = oracle.predict(asset)
+        if (!pred || !pred.best) return fail('thin 1m history - next-expiry oracle has no read yet')
+        direction = pred.best.direction
+        confidence = pred.best.confidence
+        price = pred.price
+        note = `expiry oracle: ${pred.best.expiry}m pick · pWin ${(pred.best.pWin * 100).toFixed(0)}% · regime ${pred.regime} · ${pred.session}`
+      } else if (src === 'accute') {
+        const accute = this.ctx.use<AccuteService>('accute')
+        const sig = accute.signal(asset, this.config.tf)
+        if (!sig.ok) return fail('thin history - accute has no read yet')
+        direction = sig.direction
+        confidence = sig.confidence
+        price = sig.price
+        note = `accute: ${sig.summary}`
+      } else if (src === 'renko-smc' || src === 'renko-smc-majority') {
+        const smc = this.ctx.use<SmcScanService>('smcScan')
+        const candles: Candle[] = this.market.getCandlesDeep(asset, this.config.tf, 300, true)
+        if (candles.length < MIN_CANDLES_FOR_RENKO) return fail(`thin history - need ${MIN_CANDLES_FOR_RENKO}+ closed candles, have ${candles.length}`)
+        const renko = renkoBricks(candles)
+        const res = smc.scan(asset, this.config.tf)
+        if (!res.result) return fail('thin history - smc scan has no read yet')
+        price = res.result.price
+        if (src === 'renko-smc') {
+          if (renko.trend === 'none') {
+            note = 'renko+smc: renko has no trend yet'
+          } else {
+            const renkoDirection: 'call' | 'put' = renko.trend === 'up' ? 'call' : 'put'
+            const agreement = smcAnyAgrees(res.result, renkoDirection)
+            direction = agreement.agrees ? renkoDirection : 'none'
+            const renkoConfidence = Math.min(100, 40 + renko.streak * 12)
+            confidence = agreement.agrees ? Math.round((agreement.confidence + renkoConfidence) / 2) : 0
+            note = `renko+smc: ${renko.streak} ${renko.trend.toUpperCase()} brick(s) & ${agreement.note}${agreement.agrees ? '' : ' (no SMC confluence)'}`
+          }
+        } else {
+          const smcRead = smcNowRead(res.result)
+          if (smcRead.direction === 'none' || renko.trend === 'none') {
+            note = `renko+smc (majority): ${smcRead.direction === 'none' ? 'smc now has no verdict' : 'renko has no trend yet'}`
+          } else {
+            const renkoDirection: 'call' | 'put' = renko.trend === 'up' ? 'call' : 'put'
+            direction = smcRead.direction === renkoDirection ? renkoDirection : 'none'
+            const renkoConfidence = Math.min(100, 40 + renko.streak * 12)
+            confidence = direction !== 'none' ? Math.round((smcRead.confidence + renkoConfidence) / 2) : 0
+            note = `renko+smc (majority): ${renko.streak} ${renko.trend.toUpperCase()} brick(s) vs smc now ${smcRead.direction} - ${direction !== 'none' ? 'agree' : 'disagree'}`
+          }
+        }
+      } else {
+        // 'smc' (aggregate) or one of the 15 'smc-<kind>' sources
+        const kind = SOURCE_SMC_KIND[src]
+        const smc = this.ctx.use<SmcScanService>('smcScan')
+        const res = smc.scan(asset, this.config.tf)
+        if (!res.result) return fail('thin history - smc scan has no read yet')
+        const read = smcNowRead(res.result, kind)
+        direction = read.direction
+        confidence = read.confidence
+        price = res.result.price
+        note = `smc${kind ? ` (${kind})` : ''}: ${read.note}`
+      }
+
+      return {
+        source: src,
+        asset,
+        direction,
+        confidence,
+        price,
+        note,
+        passesDirection: direction !== 'none' && (this.config.direction === 'both' || direction === this.config.direction),
+        passesConfidence: finGte(confidence, this.config.minConfidence),
+        configuredDirection: this.config.direction,
+        minConfidence: this.config.minConfidence,
+      }
+    } catch (err) {
+      return fail(err instanceof Error ? err.message : String(err))
+    }
+  }
+
   configure(patch: Partial<MetaTraderConfig>): MetaTraderConfig {
     const num = (v: unknown, fb: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fb)
     if (patch.enabled !== undefined) {

@@ -914,6 +914,22 @@ const httpServer = createServer(async (req, res) => {
         }
       }
 
+      // GET /meta_trader_peek?asset=EURUSD -> the raw, UN-GATED read for one
+      // asset on Meta Trader's currently configured signalSource (direction/
+      // confidence/note/price), plus whether it would currently pass the
+      // configured minConfidence/direction filters - the diagnostic
+      // pickCandidates() itself never surfaces, since a row that fails
+      // either gate is simply dropped rather than returned with a reason.
+      if (path === '/meta_trader_peek') {
+        try {
+          const metaTrader = kernel.context().use<MetaTraderService>('metaTrader')
+          const asset = String(q.get('asset') ?? market.activeAsset)
+          return json(200, { ok: true, ...metaTrader.peek(asset) })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
       if (path === '/assets') {
         // IQ mode serves the IQ ACCOUNT'S OWN asset list from the authenticated
         // session metadata - the sim universe must never leak into it. The

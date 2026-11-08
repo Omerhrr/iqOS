@@ -1409,6 +1409,13 @@ const TOOLS: ToolSpec[] = [
     args: '{}',
     run: () => corePost('/meta_trader_restart', {}),
   },
+  {
+    name: 'meta_trader_peek',
+    description:
+      'The raw, UN-GATED read for ONE asset on Meta Trader\'s currently configured signalSource - direction, confidence, note and price exactly as that source\'s own engine computed them right now (renko streak+direction, SMC "now" concepts, the Oracle/Accute/Next-Expiry fused read, or a saved meta-strategy spec\'s evaluate() output), PLUS passesDirection/passesConfidence flags showing whether this read would currently clear the configured direction/minConfidence gates. Use this to explain WHY Meta Trader is or isn\'t trading a pair - meta_trader_status only reports totals and the last trade/rejection; pickCandidates() (what actually fires) silently drops any pair that fails either gate, so a quiet engine with no tool like this is indistinguishable from "no read at all". Returns {source, asset, error} instead when the engine itself has nothing to show (thin history, no price, no metaStrategyId configured) - that is a genuine no-data case, not a gate.',
+    args: '{"asset": "EURUSD"}',
+    run: (a) => coreGet(`/meta_trader_peek?asset=${encodeURIComponent(String(a.asset ?? 'EURUSD'))}`),
+  },
   // ---------- archive: deep history ----------
   {
     name: 'archive_status',
@@ -2208,7 +2215,7 @@ const TOOLS: ToolSpec[] = [
   {
     name: 'meta_strategy_eval',
     description:
-      'Evaluate ONE saved Meta-Strategy spec (by id, from meta_strategy_list) against one asset+tf right now - returns direction/confidence/notes/price, the same read the auto-trader would get if this spec were armed as its signalSource. Use to sanity-check a saved spec live before recommending it, or to answer "what is spec X saying about EURUSD right now".',
+      'Evaluate ONE saved Meta-Strategy spec (by id, from meta_strategy_list) against one asset+tf right now - returns direction/confidence/notes/price, the same read the auto-trader, an autopilot bot ("meta:*" strategyId), or Meta Trader would get if this spec were armed as its signal. For a CONDITIONS-built spec (not a script), result.conditions[] is the per-condition breakdown you need to explain a verdict instead of just reporting it: each entry has condition (the source/direction/minConfidence/weight as saved) and read (THAT source\'s own live .direction/.confidence/.label right now - e.g. renko\'s trend+streak, SMC\'s now-concepts, oracle\'s pUp) and passed (whether that one condition\'s own direction+minConfidence gate cleared). Use this to answer "why did/didn\'t spec X fire" - with the full per-source reads, not a guess. (Script-built specs leave conditions empty; notes carries the script\'s own trace instead.) Use to sanity-check a saved spec live before recommending it, or to answer "what is spec X saying about EURUSD right now".',
     args: '{"id": "my-spec-id", "asset": "EURUSD", "tf": "1m"}',
     run: (a) => coreGet(`/meta_strategy_eval?id=${encodeURIComponent(String(a.id ?? ''))}&asset=${encodeURIComponent(String(a.asset ?? 'EURUSD'))}&tf=${encodeURIComponent(String(a.tf ?? '1m'))}`),
   },
