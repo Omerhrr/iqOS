@@ -19,7 +19,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import type { AssetRow, AutoTraderConfig, BotConfig, BotRow, MetaStakePlan, MetaStrategySpec, MetaTraderConfig, MetaTraderSource, MetaTraderStatus, OsModeStatus, OtcConfig, OtcPolicy, StrategyInfo, Timeframe, TradeKind, ValidationRow } from '@/lib/os/client'
+import type { AssetRow, AutoTraderConfig, BotConfig, BotRow, MetaStakePlan, MetaStrategySpec, MetaTraderConfig, MetaTraderSource, MetaTraderStatus, OmniTraderConfig, OmniTraderStatus, OsModeStatus, OtcConfig, OtcPolicy, StrategyInfo, Timeframe, TradeKind, ValidationRow } from '@/lib/os/client'
 import { BLITZ_EXPIRY_SECONDS, KIND_LABEL, META_TRADER_SOURCE_LABELS, TIMEFRAMES, fmtMoney, fmtTime, getMetaStrategies, getOtcConfig, osGet, osPost, setOtcConfig } from '@/lib/os/client'
 
 const GATE_MAX_AGE_SEC = 14 * 24 * 60 * 60
@@ -71,8 +71,10 @@ interface AutopilotPanelProps {
   strategies: StrategyInfo[]
   modeStatus: OsModeStatus | null
   metaTraderStatus: MetaTraderStatus | null
+  omniTraderStatus: OmniTraderStatus | null
   refreshMode: () => void
   refreshMetaTrader: () => void
+  refreshOmniTrader: () => void
   onChanged: () => void
   onError: (m: string) => void
 }
@@ -96,11 +98,12 @@ const emptyDraft = (): BotConfig => ({
   dailyLossLimit: 0,
 })
 
-export default function AutopilotPanel({ bots, assets, strategies, modeStatus, metaTraderStatus, refreshMode, refreshMetaTrader, onChanged, onError }: AutopilotPanelProps) {
+export default function AutopilotPanel({ bots, assets, strategies, modeStatus, metaTraderStatus, omniTraderStatus, refreshMode, refreshMetaTrader, refreshOmniTrader, onChanged, onError }: AutopilotPanelProps) {
   const mode = modeStatus?.mode ?? 'human'
   const [editorOpen, setEditorOpen] = useState(false)
   const [atOpen, setAtOpen] = useState(false)
   const [mtOpen, setMtOpen] = useState(false)
+  const [otOpen, setOtOpen] = useState(false)
   const [draft, setDraft] = useState<BotConfig>(emptyDraft())
   const [busy, setBusy] = useState(false)
   const [filter, setFilter] = useState('')
@@ -336,6 +339,26 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, m
         onSave={async (cfg) => {
           await osPost<{ ok: boolean }>('/meta_trader_config', cfg)
           refreshMetaTrader()
+        }}
+      />
+
+      {/* omni trader strip - the 4th execution engine (plugins/omnitrader.ts):
+          sub-bar/tick-reactive, trades exactly one saved SCRIPT meta-strategy
+          spec on its own tight wall-clock poll loop instead of waiting for a
+          candle close. Same mode gate as autopilot/meta trader above. */}
+      {omniTraderStatus && (
+        <OmniTraderStrip mt={omniTraderStatus} onConfigure={() => setOtOpen(true)} />
+      )}
+
+      {/* omni trader config editor (remounts on open so the draft mirrors the kernel) */}
+      <OmniTraderDialog
+        key={String(otOpen)}
+        open={otOpen}
+        onOpenChange={setOtOpen}
+        config={omniTraderStatus?.config ?? DEFAULT_OMNI_TRADER_UI}
+        onSave={async (cfg) => {
+          await osPost<{ ok: boolean }>('/omni_trader_config', cfg)
+          refreshOmniTrader()
         }}
       />
 
@@ -3102,6 +3125,330 @@ function MetaTraderDialog({
               }
             }}
             className="h-8 bg-teal-600 px-3 text-[11px] font-bold text-white hover:bg-teal-500"
+          >
+            {busy ? 'Saving…' : 'Save config'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+const DEFAULT_OMNI_TRADER_UI: OmniTraderConfig = {
+  enabled: false,
+  tf: '1m',
+  direction: 'both',
+  minConfidence: 60,
+  stake: 1,
+  maxOpen: 3,
+  kind: 'binary',
+  marketScope: 'otc',
+  cooldownSec: 0,
+  intervalMs: 2000,
+}
+
+function OmniTraderStrip({ mt, onConfigure }: { mt: OmniTraderStatus; onConfigure: () => void }) {
+  const state =
+    mt.mode === 'auto' && mt.config.enabled
+      ? { label: 'ARMED · trading', cls: 'border-fuchsia-500/50 bg-fuchsia-500/10 text-fuchsia-300', dot: 'animate-pulse bg-fuchsia-400' }
+      : mt.mode === 'auto'
+        ? { label: 'off', cls: 'border-[#1c2739] bg-[#101828] text-[#4b5a72]', dot: 'bg-[#2a3850]' }
+        : { label: 'standby · human mode', cls: 'border-cyan-500/40 bg-cyan-500/10 text-cyan-300', dot: 'bg-cyan-500' }
+  const closed = mt.runtime.trades
+  const wins = mt.runtime.wins
+  const wr = closed ? Math.round((wins / closed) * 100) : null
+  return (
+    <div className="shrink-0 rounded border border-[#1c2739] bg-[#0d1420] px-2.5 py-1.5">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span className="text-[9px] font-bold uppercase tracking-[0.18em] text-[#7c8aa5]">omni trader</span>
+        <span className={`flex items-center gap-1.5 rounded border px-1.5 py-px font-mono text-[8px] font-bold uppercase tracking-wider ${state.cls}`}>
+          <span className={`h-1 w-1 rounded-full ${state.dot}`} />
+          {state.label}
+        </span>
+        <span className="font-mono text-[9px] text-[#4b5a72]">
+          {mt.config.metaStrategyId ?? 'none picked'} · conf≥{mt.config.minConfidence}% · {mt.config.tf} · ${mt.config.stake} · max {mt.config.maxOpen}
+          {' · '}
+          {mt.config.intervalMs}ms poll
+          {mt.config.marketScope === 'real' && <span className="text-emerald-400/80"> · REAL only</span>}
+          {mt.config.marketScope === 'otc' && <span className="text-violet-400/80"> · OTC only</span>}
+        </span>
+        <span className="ml-auto font-mono text-[9px] text-[#4b5a72]">
+          {closed}t{wr !== null ? ` · ${wr}% wr` : ''} ·{' '}
+          <span className={mt.runtime.pnlTotal >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+            {mt.runtime.pnlTotal >= 0 ? '+' : ''}
+            {fmtMoney(mt.runtime.pnlTotal)}
+          </span>
+          {mt.runtime.openCount > 0 && <span className="text-[#aab6cc]"> · {mt.runtime.openCount} open</span>}
+        </span>
+        <Button
+          size="sm"
+          onClick={onConfigure}
+          className="h-5 rounded bg-[#1c2739] px-2 text-[9px] font-bold uppercase tracking-wider text-[#aab6cc] hover:bg-[#243352] hover:text-fuchsia-300"
+        >
+          Configure
+        </Button>
+      </div>
+      {(mt.runtime.lastAction || mt.runtime.lastRejection) && (
+        <p className="mt-0.5 truncate font-mono text-[8px] text-[#3d4c66]">
+          {mt.runtime.lastAction && <span title={mt.runtime.lastAction}>last: {mt.runtime.lastAction}</span>}
+          {mt.runtime.lastRejection && <span className="text-amber-500/70"> · standing down: {mt.runtime.lastRejection}</span>}
+        </p>
+      )}
+    </div>
+  )
+}
+
+function OmniTraderDialog({
+  open,
+  onOpenChange,
+  config,
+  onSave,
+}: {
+  open: boolean
+  onOpenChange: (o: boolean) => void
+  config: OmniTraderConfig
+  onSave: (patch: Partial<OmniTraderConfig>) => Promise<void>
+}) {
+  const [d, setD] = useState<OmniTraderConfig>(config)
+  const [busy, setBusy] = useState(false)
+  const p = (patch: Partial<OmniTraderConfig>) => setD((prev) => ({ ...prev, ...patch }))
+  // Same "load on mount" convention Meta Trader's own picker uses.
+  const [metaStrategies, setMetaStrategies] = useState<MetaStrategySpec[]>([])
+  useEffect(() => {
+    let alive = true
+    getMetaStrategies()
+      .then((res) => {
+        if (alive) setMetaStrategies(res.strategies)
+      })
+      .catch(() => {
+        // picker just shows an empty list - the Meta-Strategy tab is the source of truth
+      })
+    return () => {
+      alive = false
+    }
+  }, [])
+  // Omni Trader can ONLY trade a SCRIPT spec (evaluateLive() fails closed on
+  // a conditions-built one) - filter the picker down to those so there's
+  // nothing to pick wrong, rather than showing every spec and explaining
+  // the restriction in prose only.
+  const scriptSpecs = metaStrategies.filter((s) => !!s.script)
+  const assetsText = (d.assets ?? []).join(', ')
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-h-[85vh] max-w-md overflow-y-auto border-[#1c2739] bg-[#0b111c] text-[#dbe4f0]">
+        <DialogHeader>
+          <DialogTitle className="text-[14px] tracking-wider">OMNI TRADER</DialogTitle>
+          <DialogDescription className="text-[11px] text-[#7c8aa5]">
+            The 4th execution engine - for strategies whose entry signal is sub-bar/tick-time (e.g. tick velocity
+            collapsing then bursting the other way, all within one still-forming candle). Autopilot/Meta Trader/the
+            auto-trader all evaluate on CLOSED candles only, so none of them can express that. Omni Trader polls on
+            its own tight wall-clock loop (not candle closes) and feeds the forming bar + raw tick buffer
+            (live()/tick.*/foot.* in MSL) into ONE saved SCRIPT meta-strategy spec. Same kill switch/risk manager/OS
+            mode gate as everything else - only ever trades in NO-HUMAN mode.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="grid grid-cols-2 gap-2.5">
+          <div className="col-span-2 flex items-center justify-between rounded border border-[#1c2739] bg-[#101828] px-2.5 py-2">
+            <div>
+              <div className="text-[11px] font-semibold text-[#e2e8f0]">Enabled</div>
+              <div className="text-[9px] text-[#4b5a72]">armed for the next NO-HUMAN session</div>
+            </div>
+            <Switch checked={d.enabled} onCheckedChange={(v) => p({ enabled: v })} />
+          </div>
+
+          <div className="col-span-2">
+            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Meta-strategy SCRIPT spec</Label>
+            <select
+              value={d.metaStrategyId ?? ''}
+              onChange={(e) => p({ metaStrategyId: e.target.value || undefined })}
+              className="mt-1 h-7 w-full rounded border border-[#1c2739] bg-[#0b111c] px-1.5 text-[11px] text-[#e2e8f0] outline-none"
+            >
+              <option value="">— pick a saved SCRIPT spec —</option>
+              {scriptSpecs.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.name} ({s.id})
+                </option>
+              ))}
+            </select>
+            {scriptSpecs.length === 0 ? (
+              <p className="mt-1 text-[8px] leading-relaxed text-amber-500/70">
+                No SCRIPT meta-strategies saved yet - Omni Trader only trades a script-built spec (live()/tick.*/
+                foot.* need a script to call them from). Build one with a script in the Meta-Strategy tab, then come
+                back here to pick it. A conditions-built spec can't be picked here at all.
+              </p>
+            ) : !d.metaStrategyId ? (
+              <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">no spec picked yet - omni trader stands aside until you pick one.</p>
+            ) : null}
+          </div>
+
+          <NumField label="Min confidence %" value={d.minConfidence} onChange={(v) => p({ minConfidence: Math.min(100, Math.max(0, v)) })} />
+          <NumField label="Max open" value={d.maxOpen} onChange={(v) => p({ maxOpen: Math.max(1, Math.round(v)) })} />
+          <NumField label="Stake $" value={d.stake} onChange={(v) => p({ stake: v })} />
+          <NumField label="Cooldown (s)" value={d.cooldownSec} onChange={(v) => p({ cooldownSec: Math.max(0, Math.round(v)) })} />
+
+          <div>
+            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Signal timeframe</Label>
+            <select
+              value={d.tf}
+              onChange={(e) => p({ tf: e.target.value as Timeframe })}
+              className="h-8 w-full rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-fuchsia-300 outline-none"
+            >
+              {TIMEFRAMES.map((t) => (
+                <option key={t} value={t} className="bg-[#0d1420]">
+                  {t}
+                </option>
+              ))}
+            </select>
+            <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+              For the script's CLOSED-bar ind.*/ohlc()/panel reads only - the live tick/forming-bar feed has no tf of its own.
+            </p>
+          </div>
+
+          <div>
+            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Poll interval (ms)</Label>
+            <Input
+              type="number"
+              min={1000}
+              max={10000}
+              step={100}
+              value={d.intervalMs}
+              onChange={(e) => p({ intervalMs: Math.min(10000, Math.max(1000, Math.round(Number(e.target.value) || 2000))) })}
+              className="h-8 border-[#1c2739] bg-[#101828] font-mono text-[11px] text-fuchsia-300"
+            />
+            <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+              1000-10000ms. THIS, not candle closes, paces the whole engine - lower is more reactive but the live tick
+              buffer itself only refreshes on the broker sidecar's own ~100ms-8s cadence, so going much below 1000ms
+              buys little.
+            </p>
+          </div>
+
+          <div>
+            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Instrument type</Label>
+            <select
+              value={d.kind ?? 'binary'}
+              onChange={(e) => p({ kind: e.target.value as TradeKind })}
+              className="h-8 w-full rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-fuchsia-300 outline-none"
+            >
+              {(['binary', 'turbo', 'blitz', 'digital', 'cfd'] as TradeKind[]).map((k) => (
+                <option key={k} value={k} className="bg-[#0d1420]">
+                  {KIND_LABEL[k]}
+                </option>
+              ))}
+            </select>
+          </div>
+          {(d.kind ?? 'binary') === 'binary' || (d.kind ?? 'binary') === 'turbo' ? (
+            <div>
+              <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Expiry</Label>
+              <select
+                value={d.expiryTf ?? ''}
+                onChange={(e) => p({ expiryTf: e.target.value ? (e.target.value as Timeframe) : d.tf })}
+                className="h-8 w-full rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-fuchsia-300 outline-none"
+              >
+                <option value="" className="bg-[#0d1420]">
+                  Track signal timeframe ({d.tf})
+                </option>
+                {TIMEFRAMES.map((t) => (
+                  <option key={t} value={t} className="bg-[#0d1420]">
+                    {t}
+                  </option>
+                ))}
+              </select>
+            </div>
+          ) : d.kind === 'blitz' ? (
+            <div>
+              <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Expiry (seconds)</Label>
+              <div className="mt-1 grid grid-cols-3 gap-1">
+                {BLITZ_EXPIRY_SECONDS.map((s) => (
+                  <button
+                    key={s}
+                    type="button"
+                    onClick={() => p({ expirySec: s })}
+                    className={`rounded border py-1 text-[10px] font-mono transition-colors ${
+                      (d.expirySec ?? 15) === s
+                        ? 'border-fuchsia-500/50 bg-fuchsia-500/10 text-fuchsia-300'
+                        : 'border-[#1c2739] bg-[#101828] text-[#7c8aa5]'
+                    }`}
+                  >
+                    {s}s
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : d.kind === 'digital' ? (
+            <NumField
+              label="Expiry (minutes)"
+              value={(d.expirySec ?? 300) / 60}
+              onChange={(v) => p({ expirySec: Math.min(1440, Math.max(1, Math.round(v))) * 60 })}
+            />
+          ) : null}
+
+          <div>
+            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Direction</Label>
+            <select
+              value={d.direction}
+              onChange={(e) => p({ direction: e.target.value as OmniTraderConfig['direction'] })}
+              className="h-8 w-full rounded border border-[#1c2739] bg-[#101828] px-2 font-mono text-[11px] text-fuchsia-300 outline-none"
+            >
+              {['both', 'call', 'put'].map((v) => (
+                <option key={v} value={v} className="bg-[#0d1420]">
+                  {v}
+                </option>
+              ))}
+            </select>
+          </div>
+          <Segmented
+            label="Feed family"
+            options={[
+              { v: 'all', label: 'All' },
+              { v: 'real', label: 'Real only' },
+              { v: 'otc', label: 'OTC only' },
+            ]}
+            value={d.marketScope}
+            onChange={(v) => p({ marketScope: v as OmniTraderConfig['marketScope'] })}
+          />
+
+          <div className="col-span-2">
+            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Watchlist override (optional)</Label>
+            <Input
+              value={assetsText}
+              onChange={(e) =>
+                p({
+                  assets: e.target.value.trim()
+                    ? e.target.value
+                        .split(',')
+                        .map((a) => a.trim().toUpperCase())
+                        .filter(Boolean)
+                    : undefined,
+                })
+              }
+              placeholder="EURUSD, GBPUSD, XAUUSD (comma-separated - leave blank for the default liquid pool)"
+              className="mt-1 h-8 border-[#1c2739] bg-[#101828] font-mono text-[11px] text-[#e2e8f0]"
+            />
+            <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+              Leave blank for the same liquid-first default pool Meta Trader uses, capped tighter (12 assets) since
+              this engine's whole point is a tight poll loop.
+            </p>
+          </div>
+        </div>
+
+        <DialogFooter className="mt-1 gap-2">
+          <Button variant="outline" className="h-8 border-[#1c2739] px-3 text-[11px] text-[#7c8aa5]" onClick={() => onOpenChange(false)}>
+            Cancel
+          </Button>
+          <Button
+            disabled={busy}
+            onClick={async () => {
+              setBusy(true)
+              try {
+                await onSave(d)
+                onOpenChange(false)
+              } finally {
+                setBusy(false)
+              }
+            }}
+            className="h-8 bg-fuchsia-600 px-3 text-[11px] font-bold text-white hover:bg-fuchsia-500"
           >
             {busy ? 'Saving…' : 'Save config'}
           </Button>

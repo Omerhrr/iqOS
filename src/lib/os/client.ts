@@ -4659,6 +4659,66 @@ export interface MetaTraderStatus {
   sources: readonly MetaTraderSource[]
 }
 
+// ---------- Omni Trader ----------
+// IQAIR//OS - the 4th execution engine (plugins/omnitrader.ts), built
+// specifically for strategies whose entry signal is sub-bar/tick-time
+// reactive - Autopilot/Meta Trader/the OS auto-trader all evaluate on
+// CLOSED candles only, so none of them can express "tick velocity
+// collapses then bursts the other way, all within one still-forming
+// candle." Trades exactly one saved SCRIPT meta-strategy spec on its own
+// tight wall-clock poll loop (default 2s, 1-10s range), feeding the
+// currently-forming bar (live()) and the real tick buffer (tick.*/foot.*)
+// into it alongside the normal closed-bar reads. Same account-level floor
+// as every other engine (kill switch/risk manager/OS mode gate) - "a
+// faster loop" is its only difference from Meta Trader, never freedom from
+// those. No signalSource picker (always meta-strategy) and no stakePlan -
+// kept deliberately simpler than Meta Trader's own config shape.
+
+export interface OmniTraderConfig {
+  enabled: boolean
+  /** MUST resolve to a SCRIPT meta-strategy spec (built with a script in
+   * the Meta-Strategy tab, not conditions) - a conditions-built spec id
+   * evaluates but never fires (evaluateLive() fails it closed). */
+  metaStrategyId?: string
+  /** timeframe the script's CLOSED-bar ind.* / ohlc() / panel reads use -
+   * separate from the live tick/forming-bar feed, which has no tf of its own. */
+  tf: Timeframe
+  direction: 'call' | 'put' | 'both'
+  minConfidence: number
+  stake: number
+  maxOpen: number
+  kind: TradeKind
+  expiryTf?: Timeframe
+  expirySec?: number
+  marketScope: 'all' | 'real' | 'otc'
+  cooldownSec: number
+  /** wall-clock poll interval in ms, 1000-10000 (default 2000) - THIS,
+   * not candle closes, paces the whole engine. */
+  intervalMs: number
+  /** explicit watchlist override - undefined = the same liquid-first
+   * default pool Meta Trader uses. */
+  assets?: string[]
+}
+
+export interface OmniTraderRuntime {
+  trades: number
+  wins: number
+  losses: number
+  pnlTotal: number
+  openCount: number
+  lastTradeTs: number
+  lastAction?: string
+  lastRejection?: string
+}
+
+export interface OmniTraderStatus {
+  enabled: boolean
+  mode: OsMode
+  active: boolean
+  config: OmniTraderConfig
+  runtime: OmniTraderRuntime
+}
+
 export interface OsModeStatus {
   mode: OsMode
   ts: number

@@ -63,6 +63,7 @@ import type {
   ChartType,
   IndicatorSeries,
   MetaTraderStatus,
+  OmniTraderStatus,
   OsMode,
   OsModeStatus,
   Position,
@@ -673,6 +674,24 @@ export default function OSPage() {
     const t = setInterval(() => void loadMetaTrader(), 5000)
     return () => clearInterval(t)
   }, [loadMetaTrader])
+
+  // omni trader polling - the 4th execution engine (plugins/omnitrader.ts),
+  // sub-bar/tick-reactive. Same poll/status shape as meta trader above,
+  // separate state since it's its own engine with its own config.
+  const [omniTraderStatus, setOmniTraderStatus] = useState<OmniTraderStatus | null>(null)
+  const loadOmniTrader = useCallback(async () => {
+    try {
+      const d = await osGet<{ ok: boolean } & OmniTraderStatus>('/omni_trader_status')
+      if (d.ok) setOmniTraderStatus({ enabled: d.enabled, mode: d.mode, active: d.active, config: d.config, runtime: d.runtime })
+    } catch {
+      /* kernel not up yet */
+    }
+  }, [])
+  useEffect(() => {
+    void loadOmniTrader()
+    const t = setInterval(() => void loadOmniTrader(), 5000)
+    return () => clearInterval(t)
+  }, [loadOmniTrader])
 
   // initial load
   useEffect(() => {
@@ -1362,9 +1381,11 @@ export default function OSPage() {
               prices={prices}
               modeStatus={modeStatus}
               metaTraderStatus={metaTraderStatus}
+              omniTraderStatus={omniTraderStatus}
               closedTick={closedTick}
               refreshMode={loadMode}
               refreshMetaTrader={loadMetaTrader}
+              refreshOmniTrader={loadOmniTrader}
               refreshPositions={loadPositions}
               refreshBots={loadBots}
               refreshAccount={loadAccount}
@@ -2036,9 +2057,11 @@ export default function OSPage() {
                         prices={prices}
                         modeStatus={modeStatus}
                         metaTraderStatus={metaTraderStatus}
+                        omniTraderStatus={omniTraderStatus}
                         closedTick={closedTick}
                         refreshMode={loadMode}
                         refreshMetaTrader={loadMetaTrader}
+                        refreshOmniTrader={loadOmniTrader}
                         refreshPositions={loadPositions}
                         refreshBots={loadBots}
                         refreshAccount={loadAccount}

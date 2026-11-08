@@ -339,6 +339,14 @@ export class MetaTraderService {
   /** P1 AUDIT FIX (see EDGE_GATED_SOURCES) - cross-tick fresh-edge memory,
    * the SAME class the auto-trader's sweep sources use (analytics/edge.ts). */
   private sweepEdge = new SweepEdgeMemory()
+  /** BUG FIX (see gateByFreshEdge's doc comment): every asset this tick's
+   * edge-gated pick*() actually READ a verdict for, qualifying or not -
+   * populated at the TOP of each pick*() method's per-asset loop, before
+   * any `continue`. Cleared at the start of each pickCandidates() call.
+   * This is what lets SweepEdgeMemory's lapse path (an asset that WAS held
+   * but no longer qualifies gets its held key dropped) actually fire - see
+   * the fix note below for why it couldn't before. */
+  private attemptedThisTick = new Set<string>()
 
   async start(ctx: KernelContext): Promise<void> {
     this.ctx = ctx
@@ -806,6 +814,7 @@ export class MetaTraderService {
   /** Every qualifying candidate for the configured source, best-confidence
    * first - the tick loop works down this list on a placement rejection. */
   private pickCandidates(): MetaTraderRow[] {
+    this.attemptedThisTick.clear()
     const src = this.config.signalSource
     if (src === 'meta-strategy') return this.pickMetaStrategy()
     if (src === 'oracle') return this.pickOracle()
@@ -890,6 +899,7 @@ export class MetaTraderService {
     if (!meta.isValidStrategyId(id)) return []
     const out: MetaTraderRow[] = []
     for (const asset of this.candidatePool()) {
+      this.attemptedThisTick.add(asset)
       try {
         const { result, price } = meta.evaluate(id, asset, this.config.tf)
         if (result.direction === 'none' || !(price > 0)) continue
@@ -913,6 +923,7 @@ export class MetaTraderService {
     }
     const out: MetaTraderRow[] = []
     for (const asset of this.candidatePool()) {
+      this.attemptedThisTick.add(asset)
       try {
         const pred = oracle.predict(asset, this.config.tf)
         if (!pred || pred.direction === 'none') continue
@@ -953,6 +964,7 @@ export class MetaTraderService {
     }
     const out: MetaTraderRow[] = []
     for (const asset of this.candidatePool()) {
+      this.attemptedThisTick.add(asset)
       try {
         const pred = oracle.predict(asset)
         if (!pred || !pred.best) continue
@@ -983,6 +995,7 @@ export class MetaTraderService {
     }
     const out: MetaTraderRow[] = []
     for (const asset of this.candidatePool()) {
+      this.attemptedThisTick.add(asset)
       try {
         const sig = accute.signal(asset, this.config.tf)
         if (!sig.ok || sig.direction === 'none') continue
@@ -1067,6 +1080,7 @@ export class MetaTraderService {
     }
     const out: MetaTraderRow[] = []
     for (const asset of this.candidatePool()) {
+      this.attemptedThisTick.add(asset)
       try {
         const candles: Candle[] = this.market.getCandlesDeep(asset, this.config.tf, 300, true)
         if (candles.length < MIN_CANDLES_FOR_RENKO) continue // thin history - try the next
@@ -1113,6 +1127,7 @@ export class MetaTraderService {
     }
     const out: MetaTraderRow[] = []
     for (const asset of this.candidatePool()) {
+      this.attemptedThisTick.add(asset)
       try {
         const res = smc.scan(asset, this.config.tf)
         if (!res.result) continue
@@ -1145,15 +1160,37 @@ export class MetaTraderService {
    * auto-trader's edgeSweep(): every candidate row was OBSERVED this tick
    * (its read already succeeded in pickCandidates), fully-qualified keys
    * feed the cold-sweep backfill, and only never-seen keys come back as
-   * fresh rows - order preserved (confidence/recency ranking intact). */
+   * fresh rows - order preserved (confidence/recency ranking intact).
+   *
+   * BUG FIX: `evaluated` used to be built from `rows` alone (the asset of
+   * every row passed in) - but `rows` is ALREADY the post-filter output of
+   * pickCandidates()'s pick*() methods, which `continue` past (never add
+   * to `rows`) any asset whose read is thin-history, direction 'none', or
+   * below minConfidence. That made `evaluated` always exactly equal to
+   * `qualifying`'s asset set, which made SweepEdgeMemory.endSweep()'s
+   * lapse-pruning branch (`evaluated.has(asset) && !qualifying.has(key)`)
+   * structurally unreachable for a genuine lapse: the moment an asset's
+   * condition goes quiet, it simply never appears in `rows` again, so it
+   * was never marked "evaluated" either, so its held key was NEVER
+   * dropped - only an outright direction FLIP (a different key for an
+   * asset that's still qualifying, just the other way) could ever free a
+   * held key. A condition that goes quiet and comes back TRUE in the SAME
+   * direction (exactly what "waiting for the read to lapse" promises) was
+   * silently impossible to recover from without a flip, a source switch,
+   * or a restart - this is almost certainly why a correctly-written
+   * script can sit "standing down: not a fresh edge" for hours even
+   * though its condition visibly toggles on the panel. Fixed by using
+   * `attemptedThisTick` (every asset actually read this tick, qualifying
+   * or not - populated at the top of each pick*() loop, before any
+   * `continue`) as `evaluated` instead, so a real lapse is now observable
+   * and gets pruned the very next tick. */
   private gateByFreshEdge(rows: MetaTraderRow[]): MetaTraderRow[] {
     if (!EDGE_GATED_SOURCES.has(this.config.signalSource)) return rows
     this.sweepEdge.beginSweep(this.config.signalSource)
-    const evaluated = new Set<string>()
+    const evaluated = new Set(this.attemptedThisTick)
     const qualifying = new Set<string>()
     const fresh: MetaTraderRow[] = []
     for (const row of rows) {
-      evaluated.add(row.asset)
       const key = SweepEdgeMemory.key(row.asset, row.direction)
       qualifying.add(key)
       if (this.sweepEdge.gate(key) === 'trade') fresh.push(row)
