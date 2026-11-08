@@ -12,6 +12,9 @@ import { computeTSK, TSK_DEFAULTS } from './tsk'
 import {
   computePivotSeries, computeFibSeries, computeTrendlineSeries, computeFvgSeries,
 } from './structural'
+import { scanSmc, type SmcScanResult, type SmcSignal } from './smc'
+import { ICT_KINDS, SMC_KINDS } from './chartindicators'
+import { realizedUpProb } from './ivhv'
 
 const isn = TA.isn
 
@@ -26,6 +29,40 @@ const line = (key: string, color: string, values: number[], style?: 'solid' | 'd
 const num = (candles: Candle[], params: Record<string, number>, key: string, dflt: number): number => {
   const v = params[key]
   return typeof v === 'number' && Number.isFinite(v) ? v : dflt
+}
+
+/** Shared by the 'smc' and 'ict' overlay entries below: reuses ONE scanSmc()
+ * scan (never reimplements it), restricts its signals to a kind-set, and
+ * extends the most recent still-active bullish/bearish signal of that set as
+ * a zone (or flat level, when the concept has no top/bottom) from where it
+ * fired to the current bar - same "redraw forward until replaced" idea as
+ * the 'trendlines' entry above, applied to smc.ts's own zones/levels instead
+ * of a fresh least-squares fit. */
+function smcKindSetLines(candles: Candle[], kinds: ReadonlySet<SmcSignal['kind']>): {
+  bullTop: number[]; bullBot: number[]; bearTop: number[]; bearBot: number[]; note: string
+} {
+  const n = candles.length
+  const bullTop = new Array(n).fill(NaN)
+  const bullBot = new Array(n).fill(NaN)
+  const bearTop = new Array(n).fill(NaN)
+  const bearBot = new Array(n).fill(NaN)
+  const result: SmcScanResult | null = n >= 60 ? scanSmc(candles) : null
+  if (!result) return { bullTop, bullBot, bearTop, bearBot, note: 'not enough candles for an SMC scan yet' }
+  const inSet = result.signals.filter((s) => kinds.has(s.kind))
+  const pick = (dir: 'bullish' | 'bearish') => inSet.filter((s) => s.direction === dir && s.active).sort((a, b) => a.barsAgo - b.barsAgo)[0]
+  const bull = pick('bullish')
+  const bear = pick('bearish')
+  const fill = (sig: SmcSignal | undefined, topArr: number[], botArr: number[]) => {
+    if (!sig) return
+    const top = sig.top ?? sig.level ?? sig.bottom
+    const bot = sig.bottom ?? sig.level ?? sig.top
+    if (top == null || bot == null) return
+    for (let i = Math.max(0, sig.index); i < n; i += 1) { topArr[i] = top; botArr[i] = bot }
+  }
+  fill(bull, bullTop, bullBot)
+  fill(bear, bearTop, bearBot)
+  const note = `latest active - bullish: ${bull ? bull.kind : 'none'}, bearish: ${bear ? bear.kind : 'none'}`
+  return { bullTop, bullBot, bearTop, bearBot, note }
 }
 
 // palette
@@ -1381,6 +1418,71 @@ const structuralIndicators: IndicatorDef[] = [
           line('bearBot', C.red, s.bearBot, 'dotted'),
         ],
         note: `fvg ${st}`,
+      }
+    },
+  },
+  {
+    id: 'smc', name: 'SMC Structure (BOS/CHoCH/Supply-Demand/S&R/Breakout)', category: 'structural', pane: 'overlay',
+    params: [],
+    description: 'The generic/classic half of analytics/smc.ts\'s scanSmc() - Break of Structure, Change of Character, Supply & Demand zones, Support & Resistance, Breakout - drawn as the most recent still-active bullish (green) and bearish (red) zone/level from each side, extended to the current bar. Same scan the ICT indicator below and AI Trader\'s own-math both already read; this just puts it on the chart.',
+    compute: (c) => {
+      const s = smcKindSetLines(c, SMC_KINDS)
+      return {
+        lines: [
+          line('bullTop', C.green, s.bullTop, 'dashed', 2),
+          line('bullBot', C.green, s.bullBot, 'dashed', 2),
+          line('bearTop', C.red, s.bearTop, 'dashed', 2),
+          line('bearBot', C.red, s.bearBot, 'dashed', 2),
+        ],
+        note: s.note,
+      }
+    },
+  },
+  {
+    id: 'ict', name: 'ICT Concepts (FVG/OB/Breaker/Liquidity Sweep/OTE/KRM/CRT/Po3/Silver Bullet)', category: 'structural', pane: 'overlay',
+    params: [],
+    description: 'The ICT-originated half of analytics/smc.ts\'s scanSmc() - Fair Value Gap, Inverse FVG, Order Block, Breaker Block, Liquidity Sweep, Optimal Trade Entry, Key Reversal, CRT, Power of 3, Silver Bullet - drawn as the most recent still-active bullish (green) and bearish (red) zone/level from each side, extended to the current bar. Same split (ICT_KINDS) the SMC indicator above and AI Trader\'s own-math both already read.',
+    compute: (c) => {
+      const s = smcKindSetLines(c, ICT_KINDS)
+      return {
+        lines: [
+          line('bullTop', C.teal, s.bullTop, 'dotted', 2),
+          line('bullBot', C.teal, s.bullBot, 'dotted', 2),
+          line('bearTop', C.violet, s.bearTop, 'dotted', 2),
+          line('bearBot', C.violet, s.bearBot, 'dotted', 2),
+        ],
+        note: s.note,
+      }
+    },
+  },
+  {
+    id: 'ivHv', name: 'IV-HV (Realized Up-Close vs 50%)', category: 'structural', pane: 'sub',
+    params: [p('window', 'Rolling window (bars)', 10, 200, 100)],
+    description: 'Rolling realized up-close frequency (analytics/ivhv.ts\'s realizedUpProb), centered on zero: positive/green bars mean closes have been skewing up-candle more often than 50/50 over the window, negative/red mean down-candle skew - the same realized-vs-50% read AI Trader\'s own-math and the chart-type indicator board already use, as a sub-pane oscillator.',
+    compute: (c, par) => {
+      const window = Math.max(2, Math.round(num(c, par, 'window', 100)))
+      const n = c.length
+      const vals: number[] = new Array(n).fill(NaN)
+      // O(n) sliding window of up/down closes, instead of re-slicing per bar -
+      // same ups/total definition realizedUpProb() (ivhv.ts) uses, just walked
+      // incrementally so a long chart history doesn't re-scan the window
+      // every single bar.
+      let ups = 0
+      for (let i = 0; i < n; i += 1) {
+        if (c[i].close > c[i].open) ups += 1
+        const dropIdx = i - window
+        if (dropIdx >= 0 && c[dropIdx].close > c[dropIdx].open) ups -= 1
+        const w = Math.min(window, i + 1)
+        vals[i] = (ups / w) * 100 - 50
+      }
+      // last bar re-derived from realizedUpProb() itself (ivhv.ts) rather than
+      // the sliding window above, so the headline note always matches the
+      // exact same math AI Trader's own-math and the indicator board use.
+      const lastPct = n ? realizedUpProb(c, Math.min(window, n)) : NaN
+      return {
+        lines: [],
+        hist: { values: vals, color: 'updown' },
+        note: Number.isFinite(lastPct) ? `realized up-close ${lastPct.toFixed(1)}% over last ${Math.min(window, n)} bars` : 'not enough closes yet',
       }
     },
   },

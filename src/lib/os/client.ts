@@ -49,10 +49,6 @@ export type ChartType =
   | 'rangebars' | 'volumebars' | 'footprint' | 'tpo' | 'tickchart' | 'ivhv'
   // OTC micro-tick velocity footprint (kernel route /otc_footprint)
   | 'otcfootprint'
-  // Tick Desk: measured-print footprint over tick-chart buckets
-  // (kernel route /tick_footprint - real up/down prints per price bin,
-  // not the CLV proxy)
-  | 'tickfootprint'
 export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'candles', label: 'Candles' },
   { id: 'hollow', label: 'Hollow' },
@@ -67,7 +63,6 @@ export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'volumebars', label: 'Vol Bars' },
   { id: 'footprint', label: 'Footprint' },
   { id: 'otcfootprint', label: 'OTC Footprint' },
-  { id: 'tickfootprint', label: 'Tick FP' },
   { id: 'tpo', label: 'TPO' },
   { id: 'tickchart', label: 'Tick' },
   { id: 'ivhv', label: 'IV·HV' },
@@ -307,12 +302,14 @@ export type MetaConditionSource =
   | 'volumeBars'
   | 'tick'
   | 'footprint'
+  | 'otcFootprint'
   | 'tpo'
   | 'ivHv'
   | 'smc'
   | 'smcNow'
   | 'renkoSmc'
   | 'renkoSmcMajority'
+  | 'ict'
   | 'tickSmc'
   | 'tickOracle'
   | 'tickTechnical'
@@ -323,12 +320,16 @@ export type MetaConditionSource =
   | 'confluence'
   | 'volArb'
   | 'cointegration'
+  | 'screenerRank'
+  | 'chartSignals'
+  | 'leadLag'
+  | 'yesterday'
 
 export const META_CONDITION_SOURCE_LABELS: Record<MetaConditionSource, string> = {
   oracle: 'Next-Candle Oracle',
   hmaRocBullBear: 'HMA/ROC/Bull-Bear',
   momentumScore: 'Market Momentum Score',
-  nextExpiry: 'Next-Expiry Oracle (1/2/3/5/15m)',
+  nextExpiry: 'Next-Expiry Oracle',
   accute: 'Accute',
   renko: 'Renko',
   pointFigure: 'Point & Figure',
@@ -341,23 +342,29 @@ export const META_CONDITION_SOURCE_LABELS: Record<MetaConditionSource, string> =
   baseline: 'Baseline',
   volumeBars: 'Volume Bars',
   tick: 'Tick Bars',
-  footprint: 'Footprint',
+  footprint: 'Footprint (candle-proxy CLV)',
+  otcFootprint: 'OTC/Velocity Footprint (real print speed)',
   tpo: 'TPO / Market Profile',
   ivHv: 'IV-HV (realized up-close %)',
   smc: 'Smart Money Concepts (blended)',
   smcNow: 'SMC "now" (this candle only)',
   renkoSmc: 'Renko + SMC "now" confluence (any agrees)',
   renkoSmcMajority: 'Renko + SMC "now" confluence (majority)',
-  tickSmc: 'Tick SMC (tick-chart structure)',
-  tickOracle: 'Tick next-candle oracle',
-  tickTechnical: 'Tick technical summary',
-  tickFootprint: 'Tick footprint (measured delta)',
-  technical: 'Technical Summary ladder (osc+MA votes)',
-  reversal: 'Reversal Radar (reversing/confirmed only)',
-  tempo: 'Tempo shot license (fires on FIRE only)',
-  confluence: 'Confluence Screener composite',
-  volArb: 'Volatility-Arb scanner',
-  cointegration: 'Cointegration spread reversion',
+  ict: 'ICT Concepts (FVG/OB/Breaker/Sweep/OTE/KRM/CRT/Po3/Silver Bullet)',
+  tickSmc: 'Tick-built SMC',
+  tickOracle: 'Tick Next-Candle Oracle',
+  tickTechnical: 'Tick Technical Summary',
+  tickFootprint: 'Tick Footprint (real prints)',
+  technical: 'Technical Summary',
+  reversal: 'Reversal Radar',
+  tempo: 'Tempo Shot License',
+  confluence: 'Confluence Screener',
+  volArb: 'Volatility Arbitrage',
+  cointegration: 'Cointegration Scanner',
+  screenerRank: 'Screener Rank (this pair)',
+  chartSignals: 'Chart Signals Committee',
+  leadLag: 'Lead-Lag Scanner',
+  yesterday: 'Yesterday Echo (T-24h)',
 }
 
 /** All 15 SMC concepts, same list Meta Trader's own smc-<kind> sources
@@ -395,14 +402,6 @@ export interface MetaCondition {
   /** only meaningful when source === 'smcNow' - one of ALL_SMC_KINDS, or
    * undefined for the aggregate "now" read. */
   smcKind?: string
-  /** only meaningful when source === 'nextExpiry' - which expiry ladder
-   * rung (1/2/3/5/15 minutes) to read, or undefined for the oracle's own
-   * best pick (already gated by its pWin/confidence honesty floors). */
-  expiryMin?: number
-  /** only meaningful on the tick-desk sources (tickSmc/tickOracle/
-   * tickTechnical/tickFootprint) - which tick-bucket length in seconds to
-   * read, or undefined for each engine's own default. */
-  tickBucketSec?: number
 }
 
 export interface MetaStrategySpec {
@@ -668,184 +667,6 @@ export async function getOtcFootprint(asset: string, opts?: { minutes?: number; 
     asset,
     minutes: opts?.minutes,
     bucketSec: opts?.bucketSec,
-  })
-}
-
-// ---------- Tick Desk (see trading-core/src/analytics/tickdesk.ts) ----------
-// The tick-chart views: SMC structure, next-candle oracle, investing.com-style
-// technical summary and a measured-print footprint - all derived from the RAW
-// micro-tick stream (the otc-footprint collector's buffers), never time
-// candles. Every response discloses the tick source + measured cadence.
-
-/** Shared envelope of every /tick_* route: the print source honestly labeled. */
-export interface TickSourceMeta {
-  asset: string
-  feed: 'sim' | 'live' | string
-  /** 'sim-tick-1s' | 'sidecar-tick-100ms' | 'no-ticks-yet' */
-  dataSource: string
-  cadenceMs: number | null
-  ticks: number
-  lastTickTs: number | null
-}
-
-export type TickRating = 'strong-buy' | 'buy' | 'neutral' | 'sell' | 'strong-sell'
-
-export interface TickSmcZone {
-  top: number
-  bottom: number
-  time: number
-}
-
-export interface TickSmcBreak {
-  dir: 'bull' | 'bear'
-  level: number
-  time: number
-  agoBars: number
-}
-
-export interface TickSmcResult extends TickSourceMeta {
-  ok: boolean
-  note?: string
-  bucketSec: number
-  candles: number
-  medTicksPerCandle: number
-  trend: 'up' | 'down' | 'range'
-  bos: TickSmcBreak | null
-  choch: TickSmcBreak | null
-  bullOrderBlock: (TickSmcZone & { mitigated: boolean }) | null
-  bearOrderBlock: (TickSmcZone & { mitigated: boolean }) | null
-  fvgs: (TickSmcZone & { dir: 'bull' | 'bear'; filled: boolean })[]
-  sweeps: (TickSmcZone & { dir: 'bull' | 'bear'; close: number })[]
-  premiumDiscount: { eq: number; high: number; low: number; zone: 'premium' | 'discount' | 'equilibrium' } | null
-  price: number
-  direction: 'call' | 'put' | 'none'
-  confidence: number
-  reasons: string[]
-}
-
-export interface TickOracleRow {
-  label: string
-  bucketSec: number
-  ok: boolean
-  note?: string
-  candles: number
-  medTicksPerCandle: number
-  direction: 'call' | 'put' | 'none'
-  confidence: number
-  score: number
-  reasons: string[]
-  wf: { n: number; hits: number; misses: number; hitRatePct: number | null } | null
-}
-
-export interface TickOracleResult extends TickSourceMeta {
-  ok: boolean
-  note?: string
-  rows: TickOracleRow[]
-  best: TickOracleRow | null
-}
-
-export interface TickTechRow {
-  name: string
-  group: 'osc' | 'ma'
-  vote: 'buy' | 'sell' | 'neutral'
-  value: string
-}
-
-export interface TickTechVotes {
-  buy: number
-  sell: number
-  neutral: number
-  rating: TickRating
-}
-
-export interface TickTechBucket {
-  label: string
-  bucketSec: number
-  ok: boolean
-  note?: string
-  candles: number
-  osc: TickTechVotes
-  mas: TickTechVotes
-  summary: TickTechVotes
-}
-
-export interface TickTechnicalResult extends TickSourceMeta {
-  ok: boolean
-  note?: string
-  buckets: TickTechBucket[]
-  detail: {
-    label: string
-    bucketSec: number
-    ok: boolean
-    note?: string
-    candles: number
-    rows: TickTechRow[]
-    skipped: string[]
-    price: number
-  }
-  rule: string
-}
-
-export interface TickFootprintRow {
-  priceLow: number
-  priceHigh: number
-  mid: number
-  up: number
-  dn: number
-  upMs: number
-  dnMs: number
-  delta: number
-  imbalance: 'buy' | 'sell' | null
-}
-
-export interface TickFootprintCandle {
-  time: number
-  open: number
-  high: number
-  low: number
-  close: number
-  ticks: number
-  upTicks: number
-  dnTicks: number
-  delta: number
-  poc: number | null
-  rows: TickFootprintRow[]
-}
-
-export interface TickFootprintResult extends TickSourceMeta {
-  ok: boolean
-  note?: string
-  bucketSec: number
-  bins: number
-  imbRatio: number
-  candles: TickFootprintCandle[]
-  summary: {
-    netDelta: number
-    totalUp: number
-    totalDn: number
-    dominantPoc: number | null
-    buckets: number
-  }
-}
-
-export async function getTickSmc(asset: string, opts?: { bucketSec?: number }): Promise<TickSmcResult> {
-  return osGet<TickSmcResult>('/tick_smc', { asset, bucketSec: opts?.bucketSec })
-}
-
-export async function getTickOracle(asset: string): Promise<TickOracleResult> {
-  return osGet<TickOracleResult>('/tick_oracle', { asset })
-}
-
-export async function getTickTechnical(asset: string, opts?: { bucketSec?: number }): Promise<TickTechnicalResult> {
-  return osGet<TickTechnicalResult>('/tick_technical', { asset, bucketSec: opts?.bucketSec })
-}
-
-export async function getTickFootprint(asset: string, opts?: { bucketSec?: number; bins?: number; candles?: number }): Promise<TickFootprintResult> {
-  return osGet<TickFootprintResult>('/tick_footprint', {
-    asset,
-    bucketSec: opts?.bucketSec,
-    bins: opts?.bins,
-    candles: opts?.candles,
   })
 }
 
@@ -2207,319 +2028,6 @@ export async function getNextCandle(asset: string, tf: Timeframe): Promise<{ ok:
 
 export async function getNextCandleStats(): Promise<NextCandleStatsResponse> {
   return osGet('/next_candle_stats', {})
-}
-
-// ---------- Next-Expiry Oracle (analytics/nextexpiry.ts, plugins/nextexpiry.ts) ----------
-
-export type OracleSessionName = 'ASIA' | 'LONDON' | 'OVERLAP' | 'NEWYORK' | 'OFF' | 'OTC'
-
-/** One horizon model inside a single expiry's fusion. */
-export interface ExpiryDriver {
-  name: string
-  /** the model's own read of P(close E minutes ahead > spot) */
-  pUp: number
-  weight: number
-  /** signed -1..+1 convenience read */
-  vote: number
-  /** one-line human explanation of what the model sees at THIS expiry */
-  detail: string
-}
-
-/** One expiry rung (1/2/3/5/15 min) of the Next-Expiry Oracle's ladder. */
-export interface ExpiryRow {
-  expiry: number
-  /** false = this horizon's models are still warming up - never a recommendation */
-  ok: boolean
-  note: string
-  pUp: number
-  direction: 'call' | 'put' | 'none'
-  /** probability the RECOMMENDED direction wins = max(pUp, 1-pUp) */
-  pWin: number
-  /** 0..100 calibrated confidence (own per-(asset,expiry) record applied) */
-  confidence: number
-  rawConfidence: number
-  /** tradability score the best pick is ranked on */
-  edge: number
-  /** 0..1 - how far this horizon's variance ratio sits from a random walk */
-  predictability: number
-  expectedMove: number
-  cone: { low: number; high: number }
-  drivers: ExpiryDriver[]
-  driversActive: number
-  calibration: { n: number; hitRate: number; brier: number } | null
-  /** 1m bar-open timestamp (seconds) whose close resolves this window */
-  targetBarTime: number
-}
-
-export interface NextExpiryPrediction {
-  asset: string
-  ts: number
-  mode: 'sim' | 'live'
-  /** spot = last closed 1m close - the entry every row is measured from */
-  price: number
-  regime: OracleRegime
-  session: OracleSessionName
-  /** OU reversion half-life in whole minutes (the expiry compass), null
-   * when the pair isn't mean-reverting enough to have one */
-  halfLifeMin: number | null
-  rows: ExpiryRow[]
-  best: { expiry: number; direction: 'call' | 'put'; pWin: number; confidence: number; edge: number } | null
-  note: string
-  calibrationTotal: { n: number; hitRate: number; brier: number } | null
-}
-
-/** One resolved window from the expiry oracle's honesty ledger. */
-export interface ExpiryRecentResolution {
-  asset: string
-  expiry: number
-  targetBarTime: number
-  issuedTs: number
-  resolvedTs: number
-  predicted: 'call' | 'put'
-  pUp: number
-  confidence: number
-  entry: number
-  exit: number
-  actual: 'up' | 'down' | 'flat'
-  hit: boolean
-  score: number
-  brier: number
-}
-
-export interface NextExpiryStatsResponse {
-  ok: boolean
-  error?: string
-  total: number
-  pending: number
-  /** per (asset, expiry) honesty records */
-  records: {
-    asset: string
-    expiry: number
-    n: number
-    hitRate: number
-    brier: number
-    streak: number
-  }[]
-  /** universe-wide per-expiry summary - which rung of the ladder actually
-   * pays across every pair the oracle has resolved */
-  expirySummary: {
-    expiry: number
-    n: number
-    hitRate: number
-    brier: number
-  }[]
-  /** learned per-driver win-rate multipliers keyed by String(expiry) */
-  driverWeightMultipliers: Record<string, Record<string, number>>
-  recent: ExpiryRecentResolution[]
-}
-
-export async function getNextExpiry(asset: string): Promise<{ ok: boolean; prediction?: NextExpiryPrediction; error?: string }> {
-  return osGet('/next_expiry', { asset })
-}
-
-export async function getNextExpiryStats(): Promise<NextExpiryStatsResponse> {
-  return osGet('/next_expiry_stats', {})
-}
-
-/** One row of the Next-Expiry Global board - one best-expiry read per open
- * instrument (plugins/nextexpiry.ts's NextExpiryGlobalRow). */
-export interface NextExpiryGlobalRow {
-  asset: string
-  /** when this row's fused read was computed (0 = never, warming up) */
-  computedTs: number
-  /** true = a live best-pick read; false = thin 1m history on this pair yet */
-  ok: boolean
-  note: string
-  price: number
-  regime: string
-  session: string
-  /** OU reversion half-life in whole minutes, null = not mean-reverting now */
-  halfLifeMin: number | null
-  /** the pair's single recommendation - null = honest "wait" (still live) */
-  best: { expiry: number; direction: 'call' | 'put'; pWin: number; confidence: number; edge: number } | null
-  /** mini per-rung strip: one slot per ladder expiry (1/2/3/5/15m) */
-  rungs: { expiry: number; ok: boolean; direction: 'call' | 'put' | 'none'; pWin: number; confidence: number }[]
-  /** how many rungs are live on this pair right now */
-  liveRungs: number
-  /** the best rung's own honesty record (null = uncalibrated pair) */
-  calibration: { n: number; hitRate: number; brier: number } | null
-  mode: 'sim' | 'live'
-}
-
-export interface NextExpiryGlobalResponse {
-  ok: boolean
-  error?: string
-  scannedTs: number
-  universe: number
-  scanned: number
-  live: number
-  warming: number
-  refreshed: number
-  rows: NextExpiryGlobalRow[]
-}
-
-export async function getNextExpiryGlobal(opts: { limit?: number; category?: string; refresh?: boolean } = {}): Promise<NextExpiryGlobalResponse> {
-  return osGet('/next_expiry_global', {
-    limit: opts.limit,
-    category: opts.category,
-    refresh: opts.refresh ? 1 : undefined,
-  })
-}
-
-// ---------- Technical Summary + Reversal (analytics/technicals.ts +
-// analytics/reversal.ts, plugins/technical.ts, plugins/reversal.ts) ----------
-// investing.com-style per-timeframe technical summary + a dedicated
-// reversal-state engine, both over the same 10-rung ladder
-// (1s/2s/3s tick-built, 5s/15s/30s/1m/2m/5m native, 3m aggregated from 1m).
-
-export type TechVerdictLabel = 'STRONG BUY' | 'BUY' | 'NEUTRAL' | 'SELL' | 'STRONG SELL'
-export type ReversalState = 'calm' | 'forming' | 'reversing' | 'confirmed'
-
-export interface TechVote {
-  name: string
-  read: 'buy' | 'sell' | 'neutral' | 'na'
-  value: string
-}
-
-export interface TechVerdict {
-  label: TechVerdictLabel
-  score: number
-  buys: number
-  sells: number
-  neutrals: number
-  counted: number
-}
-
-export interface TechTfRow {
-  tf: string
-  sec: number
-  source: 'ticks' | 'native' | 'agg1m'
-  ok: boolean
-  note: string
-  bars: number
-  ticksPerBar: number | null
-  osc: TechVote[]
-  oscSummary: TechVerdict
-  mas: TechVote[]
-  maSummary: TechVerdict
-  summary: TechVerdict
-}
-
-export interface TechnicalSummary {
-  asset: string
-  ts: number
-  mode: 'sim' | 'live'
-  price: number
-  rows: TechTfRow[]
-  overall: TechVerdict
-  direction: 'call' | 'put' | 'none'
-  note: string
-}
-
-export async function getTechnical(asset: string): Promise<{ ok: boolean; summary?: TechnicalSummary; error?: string }> {
-  return osGet('/technical', { asset })
-}
-
-export interface TechnicalGlobalRow {
-  asset: string
-  price: number
-  computedTs: number
-  ok: boolean
-  note: string
-  mode: 'sim' | 'live'
-  overall: TechVerdict
-  direction: 'call' | 'put' | 'none'
-  cells: { tf: string; ok: boolean; label: TechVerdictLabel; score: number }[]
-  strongest: { tf: string; label: TechVerdictLabel; score: number } | null
-}
-
-export interface TechnicalGlobalResponse {
-  ok: boolean
-  error?: string
-  scannedTs: number
-  universe: number
-  scanned: number
-  live: number
-  warming: number
-  refreshed: number
-  rows: TechnicalGlobalRow[]
-}
-
-export async function getTechnicalGlobal(opts: { limit?: number; category?: string; refresh?: boolean } = {}): Promise<TechnicalGlobalResponse> {
-  return osGet('/technical_global', {
-    limit: opts.limit,
-    category: opts.category,
-    refresh: opts.refresh ? 1 : undefined,
-  })
-}
-
-export interface ReversalReason {
-  detector: string
-  dir: 'up' | 'down'
-  weight: number
-  note: string
-}
-
-export interface ReversalTfRow {
-  tf: string
-  sec: number
-  source: 'ticks' | 'native' | 'agg1m'
-  ok: boolean
-  note: string
-  bars: number
-  ticksPerBar: number | null
-  state: ReversalState
-  direction: 'up' | 'down' | 'none'
-  score: number
-  reasons: ReversalReason[]
-}
-
-export interface ReversalSummary {
-  asset: string
-  ts: number
-  mode: 'sim' | 'live'
-  price: number
-  rows: ReversalTfRow[]
-  best: { tf: string; state: ReversalState; direction: 'up' | 'down'; score: number } | null
-  note: string
-}
-
-export async function getReversal(asset: string): Promise<{ ok: boolean; summary?: ReversalSummary; error?: string }> {
-  return osGet('/reversal', { asset })
-}
-
-export interface ReversalGlobalRow {
-  asset: string
-  price: number
-  computedTs: number
-  ok: boolean
-  note: string
-  mode: 'sim' | 'live'
-  best: { tf: string; state: ReversalState; direction: 'up' | 'down'; score: number } | null
-  state: ReversalState
-  direction: 'up' | 'down' | 'none'
-  score: number
-  cells: { tf: string; ok: boolean; state: ReversalState; direction: string; score: number }[]
-}
-
-export interface ReversalGlobalResponse {
-  ok: boolean
-  error?: string
-  scannedTs: number
-  universe: number
-  scanned: number
-  live: number
-  warming: number
-  refreshed: number
-  rows: ReversalGlobalRow[]
-}
-
-export async function getReversalGlobal(opts: { limit?: number; category?: string; refresh?: boolean } = {}): Promise<ReversalGlobalResponse> {
-  return osGet('/reversal_global', {
-    limit: opts.limit,
-    category: opts.category,
-    refresh: opts.refresh ? 1 : undefined,
-  })
 }
 
 /** One row of the Next Global board - the oracle's fused read for one
@@ -4573,7 +4081,6 @@ export interface AutoTraderConfig {
 export type MetaTraderSource =
   | 'meta-strategy'
   | 'oracle'
-  | 'next-expiry'
   | 'accute'
   | 'smc'
   | 'smc-fvg'
@@ -4601,7 +4108,6 @@ export type MetaTraderSource =
 export const ALL_META_TRADER_SOURCES: readonly MetaTraderSource[] = [
   'meta-strategy',
   'oracle',
-  'next-expiry',
   'accute',
   'smc',
   'smc-fvg',
@@ -4626,7 +4132,6 @@ export const ALL_META_TRADER_SOURCES: readonly MetaTraderSource[] = [
 export const META_TRADER_SOURCE_LABELS: Record<MetaTraderSource, string> = {
   'meta-strategy': 'Meta-Strategy',
   oracle: 'Oracle',
-  'next-expiry': 'Next-Expiry Oracle (best pick)',
   accute: 'Accute',
   smc: 'SMC (now)',
   'smc-fvg': 'SMC: FVG',
@@ -4798,13 +4303,6 @@ export interface AiTraderConfig {
    * uses, same keys, nothing extra to configure), falling back to trading-
    * core's own .env only if this app is unreachable. Default localhost:3000. */
   appUrl?: string
-  /** Optional compounding stake plan - the SAME StakePlan shape the bots
-   *  use (see StakePlan above), so a scheme tuned in the fleet editor
-   *  carries over verbatim: a pot seeded at `base` rolls rollPct% of itself
-   *  into every trade, wins fold the payout in (capped at payoutCap%), a
-   *  loss ends the cycle (halt until restart) by default. undefined = flat
-   *  `stake` every trade, unchanged original behavior. */
-  stakePlan?: StakePlan
 }
 
 export interface AiTraderStatus {
@@ -4816,14 +4314,6 @@ export interface AiTraderStatus {
   lastRunTs: number
   nextRunTs: number | null
   lastError: string | null
-  /** Compounding roll state (pot/rollN/restarts/halted/complete) - zeroed
-   *  and inert while no stakePlan is armed; the panel renders the pot/roll
-   *  strip and the restart button off this. */
-  planState: { pot: number; rollN: number; restarts: number; reseedCount: number; lossReseedCount: number; halted: boolean; complete: boolean }
-  /** The stake the NEXT trade would place (flat config.stake, or the
-   *  compounding pot math's answer) plus its plan context - the panel shows
-   *  this instead of re-deriving the plan math client-side. */
-  nextStake: { amount: number; pot: number; rollN: number; compound: boolean; phase: 'compound' | 'derisk' }
   /** The app URL a cycle will ACTUALLY call right now, after APP_URL env /
    * saved config / default resolution - shown directly so there's nothing
    * to guess about which one is in effect. */
