@@ -324,6 +324,137 @@ export function buildFootprint(ticks: TickPoint[], opts: FootprintOpts & { asset
   }
 }
 
+// ---------- bucket-level value area / diagonal imbalance / absorption / unfinished auction ----------
+//
+// Added in the post-roadmap follow-up session to close §L of
+// claude/msl-capability-matrix.md (footprint's own VAH/VAL, diagonal
+// imbalance, absorption, unfinished-auction detection) - the single
+// largest flagged gap in the whole audit. These operate on ONE
+// FootprintBucket at a time (the same snapshot foot.poc()/foot.divergence()
+// etc. already read) - no new engine, no new tick-collection logic, pure
+// functions over data buildFootprint() already computes.
+
+export interface FootprintValueArea {
+  poc: number
+  vah: number
+  val: number
+  /** fraction of the bucket's total prints actually covered by [val, vah] -
+   * always >= the requested pct, since whole rows are included, never split */
+  coveredPct: number
+}
+
+/** Classic value-area algorithm (same two-steps-at-a-time expansion from POC
+ * TPO/Volume Profile already use), run on footprint ROW TOTALS (real tick
+ * counts, not volume - this engine has no real volume, see the module
+ * header) instead of candle-overlap-estimated volume. This is a genuinely
+ * NEW value area, distinct from both tpo.vah()/val() (time-based) and
+ * vp.vah()/val() (candle-overlap volume-estimated) - never conflate the
+ * three. Returns null on an empty/too-thin bucket rather than a
+ * misleading single-row answer. */
+export function footprintValueArea(bucket: FootprintBucket, pct = 0.7): FootprintValueArea | null {
+  const rows = bucket.rows // sorted high price -> low
+  if (!rows.length) return null
+  const total = rows.reduce((s, r) => s + r.total, 0)
+  if (total <= 0) return null
+  let pocIdx = 0
+  for (let i = 1; i < rows.length; i++) if (rows[i].total > rows[pocIdx].total) pocIdx = i
+  const target = Math.min(1, Math.max(0.5, pct)) * total
+  let lo = pocIdx
+  let hi = pocIdx
+  let covered = rows[pocIdx].total
+  while (covered < target && (lo > 0 || hi < rows.length - 1)) {
+    const aboveTotal = lo > 0 ? rows[lo - 1].total : -1
+    const belowTotal = hi < rows.length - 1 ? rows[hi + 1].total : -1
+    // classic rule: step toward whichever side has MORE volume two rows at a
+    // time when possible; falls back to one row when only one side remains
+    if (aboveTotal >= belowTotal && aboveTotal >= 0) {
+      lo--
+      covered += aboveTotal
+    } else if (belowTotal >= 0) {
+      hi++
+      covered += belowTotal
+    } else break
+  }
+  return { poc: rows[pocIdx].price, vah: rows[lo].price, val: rows[hi].price, coveredPct: Math.round((covered / total) * 1000) / 1000 }
+}
+
+export interface DiagonalImbalanceHit {
+  price: number // the level whose up-ticks were compared against the level BELOW's down-ticks (or mirror for sell)
+  ratio: number
+}
+
+/** The literal classic-footprint "diagonal" read: THIS level's buy-side
+ * prints vs the level BELOW it's sell-side prints (not same-level imbalance,
+ * which foot.imbalance()/consecutiveDense() already cover) - the read that
+ * actually reconstructs "aggressive buying absorbed the level below's
+ * resting sellers" rather than just "more buys than sells at one level."
+ * Rows are already sorted high->low, so array index i+1 IS "one level
+ * below" with no separate price lookup needed. */
+export function diagonalImbalance(bucket: FootprintBucket, side: 'buy' | 'sell', ratio: number): DiagonalImbalanceHit[] {
+  const rows = bucket.rows
+  const hits: DiagonalImbalanceHit[] = []
+  for (let i = 0; i < rows.length - 1; i++) {
+    const upper = rows[i]
+    const lower = rows[i + 1]
+    if (side === 'buy') {
+      if (lower.dn > 0 ? upper.up / lower.dn >= ratio : upper.up > 0) hits.push({ price: upper.price, ratio: lower.dn > 0 ? upper.up / lower.dn : Infinity })
+    } else {
+      if (upper.up > 0 ? lower.dn / upper.up >= ratio : lower.dn > 0) hits.push({ price: lower.price, ratio: upper.up > 0 ? lower.dn / upper.up : Infinity })
+    }
+  }
+  return hits
+}
+
+export interface AbsorptionRead {
+  side: 'buy' | 'sell' | null
+  density: number // total prints / price-levels spanned - how "packed" the volume was into a narrow range
+  closePos: number
+}
+
+/** Absorption, stated as an explicit heuristic (not a universal textbook
+ * formula - none exists, this is a documented design decision, same as
+ * every other honesty-labeled read in this codebase): heavy print density
+ * (many ticks packed into few price rows - the opposite of a clean thrust)
+ * WITHOUT the price actually breaking to either edge of its own range
+ * (closePos stays mid-range), despite a real directional delta existing.
+ * Reads as the SIDE the delta favors having its aggression absorbed by
+ * resting opposite-side orders - e.g. heavy buy delta that still closes
+ * mid-range means sellers absorbed the buying, a bearish tell, so `side`
+ * reports which side's AGGRESSION got absorbed, not which direction to
+ * trade (a script decides that itself, same convention as every other raw
+ * foot.* primitive). densityAt is the ratio of print density in this
+ * bucket (total/levels) over the bucket's own best approximation of a
+ * "thin" baseline (1 per level) - >= densityAt with velDelta present and
+ * closePos inside [0.35,0.65] triggers a read. */
+export function footprintAbsorption(bucket: FootprintBucket, densityAt = 3, minDelta = 3): AbsorptionRead {
+  const rows = bucket.rows
+  const levels = Math.max(1, rows.length)
+  const density = bucket.nTicks / levels
+  const mid = bucket.closePos >= 0.35 && bucket.closePos <= 0.65
+  let side: 'buy' | 'sell' | null = null
+  if (density >= densityAt && mid && Math.abs(bucket.velDelta) >= minDelta) {
+    side = bucket.velDelta > 0 ? 'buy' : 'sell'
+  }
+  return { side, density: Math.round(density * 100) / 100, closePos: bucket.closePos }
+}
+
+export interface UnfinishedAuctionRead {
+  side: 'high' | 'low' | null
+  pocAtEdge: boolean
+}
+
+/** Unfinished auction: the bucket's busiest price node (POC) sits AT the
+ * bucket's own high or low - the auction never rotated away from the edge
+ * it printed the most volume at, meaning price may still be "owed" a move
+ * back through that level before the auction can be considered resolved.
+ * A documented, explicit definition (there is no single textbook formula
+ * for this either) - `side` names which edge the stuck POC is at. */
+export function unfinishedAuction(bucket: FootprintBucket): UnfinishedAuctionRead {
+  const atHigh = Math.abs(bucket.pocPrice - bucket.high) < 1e-12
+  const atLow = Math.abs(bucket.pocPrice - bucket.low) < 1e-12
+  return { side: atHigh ? 'high' : atLow ? 'low' : null, pocAtEdge: atHigh || atLow }
+}
+
 function fmtAge(bucketSec: number, nowMs: number): string {
   const mins = Math.max(0, Math.round((nowMs / 1000 - bucketSec) / 60))
   return mins <= 1 ? 'latest' : `-${mins}m`

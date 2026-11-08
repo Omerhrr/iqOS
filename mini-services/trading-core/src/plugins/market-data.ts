@@ -854,6 +854,23 @@ export class MarketDataService {
     } catch {
       /* ai-trader plugin absent */
     }
+    try {
+      // BUG FIX (reported directly: "Meta Trader only trades the pair I
+      // have the chart open on, instead of being global"): Meta Trader's
+      // own candidatePool()/pick*() methods were always market-wide (every
+      // open asset, never chart-scoped) - but market-data's live poll never
+      // kept any of those other assets warm, so in practice only the
+      // charted asset (or one on a bot/auto-trader/AI-Trader watchlist) ever
+      // had fresh enough candles to produce a tradeable read. This is THE
+      // FROZEN-CANDLE BUG (see AiTraderService.watchedAssets()' doc comment
+      // above) recurring a third time for a fourth consumer - ported the
+      // exact same fix: expose Meta Trader's own candidate universe here so
+      // it gets pulled into the warm set too, same as AI Trader's was.
+      const metaTrader = this.ctx.use<{ watchedAssets?: () => string[] }>('metaTrader')
+      for (const a of metaTrader?.watchedAssets?.() ?? []) push(a)
+    } catch {
+      /* meta-trader plugin absent */
+    }
     if (out.length > MAX_LIVE_POLL_ASSETS && Date.now() - this.warnedPollCap > 3_600_000) {
       this.warnedPollCap = Date.now()
       this.ctx.log('market-data', `live poll capped at ${MAX_LIVE_POLL_ASSETS} assets - ${out.length - MAX_LIVE_POLL_ASSETS} watchlist pair(s) beyond the cap get no live candles`)

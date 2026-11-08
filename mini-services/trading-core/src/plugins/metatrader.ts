@@ -648,6 +648,41 @@ export class MetaTraderService {
     }
   }
 
+  /** THE FROZEN-CANDLE BUG, ported from AI Trader's own watchedAssets() fix
+   * (plugins/aitrader.ts - see that doc comment for the full history):
+   * market-data's live poll only ever kept the CHARTED asset + enabled
+   * bots' watchlists + the os-mode auto-trader's watchlist + AI Trader's
+   * scanned asset(s) warm with real broker ticks/candles (livePollAssets()
+   * in market-data.ts) - Meta Trader was never added to that set, despite
+   * being designed from the start to scan the WHOLE tradeable universe
+   * (candidatePool() below already lists every open asset, market-wide,
+   * exactly like the auto-trader's own pickers - this was never scoped to
+   * "the asset whose chart happens to be open"). The visible symptom this
+   * caused is exactly "Meta Trader only ever trades the pair I have
+   * charted": every asset OTHER than the charted one (or one coincidentally
+   * on a bot/auto-trader watchlist) silently re-read the exact same stale
+   * candle window forever, so every pick*() method's own real-asset reads
+   * (oracle/accute/smc/renko/meta-strategy evaluate(), all genuinely keyed
+   * by the `asset` argument, never by anything chart-global) kept producing
+   * either a frozen/unchanging verdict that never re-qualified, or a "thin
+   * history"/stale-read failure that silently dropped the asset from that
+   * tick's candidate list - leaving only the one asset market-data happened
+   * to keep fresh (the charted one) as a candidate that could ever
+   * actually fire. The scanning/picking logic itself was never pair-scoped
+   * - the DATA feeding it was. Exposed here so market-data can pull it in
+   * without a circular import, same shape as AI Trader's own fix: disabled
+   * Meta Trader returns nothing to add, and a transient candidatePool()
+   * failure (store/market not ready yet) falls back to an empty list
+   * rather than throwing into market-data's poll loop. */
+  watchedAssets(): string[] {
+    if (!this.config.enabled) return []
+    try {
+      return this.candidatePool()
+    } catch {
+      return []
+    }
+  }
+
   configure(patch: Partial<MetaTraderConfig>): MetaTraderConfig {
     const num = (v: unknown, fb: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fb)
     if (patch.enabled !== undefined) {

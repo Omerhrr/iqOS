@@ -210,7 +210,7 @@ import {
   adx as adxInd,
   supertrend as supertrendInd,
 } from './indicators'
-import { buildFootprint, type FootprintBucket } from './otcfootprint'
+import { buildFootprint, footprintValueArea, diagonalImbalance, footprintAbsorption, unfinishedAuction, type FootprintBucket } from './otcfootprint'
 // `renko.*`/`pf.*`/`ha.*` namespaces (renkoMethod/pfMethod/haMethod below) -
 // reuse the SAME pure engines the 'renko'/'pointFigure'/'heikinAshi' verdict
 // reads already call (plugins/metastrategy.ts), nothing re-derived. A type-
@@ -226,12 +226,14 @@ import { rangeBars } from './rangebars'
 import { volumeBars } from './volumebars'
 import { computeTpo } from './tpo'
 import { computeVolumeProfile } from './volumeprofile'
+import { computeDeltaProfile } from './deltaprofile'
 import { lineBreak } from './linebreak'
 import { kagi } from './kagi'
 import { computeSwing } from './swing'
 import { tickBars, type TickPoint } from './tickbars'
 import { computeBaseline } from './baseline'
 import { hvSeries, realizedUpProb } from './ivhv'
+import { expiryMomentum, priceDisplacement, volAdjustedExpectedMove, reversalRisk, expiryStagnationExhaustion, candleCompletionProbability } from './expiryintel'
 
 export interface MslSourceRead {
   direction: 'call' | 'put' | 'none'
@@ -419,6 +421,40 @@ export interface EvalEnv {
    * tight poll loop - never double-counts). Undefined means the same as
    * stateKeyPrefix being undefined: `since()`/`streak()` fail closed. */
   barTimeSec?: number
+  /** BUG FIX (flagged repeatedly across the roadmap tracker and capability
+   * matrix as a standing gap, closed in the footprint-completion follow-up):
+   * the SAME `configure <path> = <value>` statements a script already
+   * collects into MslEvalResult.configs (see evaluateStrategyScript below)
+   * - but by reference, LIVE, so a namespace method evaluated LATER in the
+   * same script (the renko, pf, rangebars, volumebars, vp, dp, linebreak,
+   * kagi, and swing namespaces) can read its own sizing overrides
+   * at call time, not just have them collected and handed to the CALLER for
+   * a SEPARATE future run. Before this fix, `configure vp.binCount = 30`
+   * followed by `vp.poc()` in the same script had ZERO effect on that call
+   * - the override only ever reached `plugins/metastrategy.ts`'s readSource()
+   * switch (the live VERDICT-source path), never a raw namespace call
+   * evaluated directly inside evaluateStrategyScript(). Undefined (the
+   * normal case for a reads-only evaluation with no configure statements,
+   * or a caller that built no `configs` object at all) means every
+   * namespace method below falls back to its engine's own hardcoded
+   * default, exactly the pre-fix behavior - this is purely additive. */
+  configs?: Record<string, number | boolean | string>
+}
+
+/** Shared config-override readers for the namespace methods below - same
+ * shape as plugins/metastrategy.ts's own cfgNum()/cfgBool(), duplicated
+ * rather than imported (dependency-isolation convention this codebase keeps
+ * throughout; see e.g. analytics/momentumscore.ts's module header for the
+ * same reasoning applied elsewhere). Reads from ctx.configs, which is
+ * either the live, in-progress `configs` map a script's own `configure`
+ * statements are writing into THIS SAME run (see EvalEnv.configs' doc
+ * comment), or whatever a caller pre-seeded it with (e.g. a saved spec's
+ * previously-collected overrides) - either way, undefined/missing/wrong-
+ * typed always means "use the engine's own default", never a thrown error -
+ * configure overrides are an optional convenience, not a requirement. */
+function cfgNumLang(ctx: EvalEnv, key: string, fallback: number | undefined): number | undefined {
+  const v = ctx.configs?.[key]
+  return typeof v === 'number' && Number.isFinite(v) ? v : fallback
 }
 
 /** `since()`/`streak()`'s per-call-site memory. Deliberately NOT a general
@@ -758,6 +794,15 @@ const FIELDS = new Set([
   // unsigned box count (signed direction is already pf.boxes(n)'s own job,
   // not duplicated here)
   'top', 'bottom', 'boxes',
+  // bundle sub-fields on foot.row(levelIndex, bucketsAgo?, bucketSec?) -
+  // the footprint-completion sweep's raw per-price-level ladder walk (see
+  // that method's own doc comment in footMethod()). 'price'/'up'/'dn'/
+  // 'total' are genuinely new names; 'delta'/'imbalance' already exist as
+  // foot.* METHOD names (foot.delta()/foot.imbalance()) but never as a
+  // FIELD before - no collision, since a method call (foot.delta()) and a
+  // bundle field access (r.delta) are different grammar productions and
+  // this same set is already shared safely across every bundle kind above.
+  'price', 'up', 'dn', 'total', 'delta', 'imbalance',
 ])
 // Core arithmetic funcs (avg/sum/min/max/count/abs) are no longer special-
 // cased at PARSE time - any identifier followed by "(" parses as a call
@@ -1435,8 +1480,23 @@ function tickMethod(name: string, args: MslValue[], ticks: readonly { ts: number
   if (name === 'deltaSeries') return tickBucketedSeries('delta', args, ticks, nowTs)
   if (name === 'velocitySeries') return tickBucketedSeries('velocity', args, ticks, nowTs)
   if (name === 'ratioSeries') return tickBucketedSeries('ratio', args, ticks, nowTs)
+  if (name === 'acceleration') {
+    // tick.acceleration(windowSec?) - the 2nd-derivative primitive §M/§P
+    // flagged as missing ("velocity acceleration... would need slope-of-
+    // slope, not directly expressible"): this bucket's velocity minus the
+    // PREVIOUS same-width bucket's velocity, i.e. a 2-point finite
+    // difference of tick.velocity() itself (no new engine - reuses
+    // sliceTickWindow()/tickWindowMetric() twice). Positive = the tape is
+    // speeding up, negative = slowing down, 0 on too-thin history.
+    const windowSec = args.length ? asNum(args[0]) : 5
+    if (!Number.isFinite(windowSec) || windowSec <= 0) throw new MslRuntimeError('tick.acceleration(windowSec) - windowSec must be a positive number')
+    if (!ticks.length) return 0
+    const now = tickWindowMetric('velocity', sliceTickWindow(ticks, nowTs, windowSec))
+    const prev = tickWindowMetric('velocity', sliceTickWindow(ticks, nowTs - windowSec * 1000, windowSec))
+    return now - prev
+  }
   if (name !== 'count' && name !== 'delta' && name !== 'velocity' && name !== 'ratio')
-    throw new MslRuntimeError(`unknown tick method "tick.${name}(...)" - use delta/velocity/ratio/count, or deltaSeries/velocitySeries/ratioSeries/countSeries for a historical series`)
+    throw new MslRuntimeError(`unknown tick method "tick.${name}(...)" - use delta/velocity/ratio/count/acceleration, or deltaSeries/velocitySeries/ratioSeries/countSeries for a historical series`)
   const windowSec = args.length ? asNum(args[0]) : 5
   if (!Number.isFinite(windowSec) || windowSec <= 0) throw new MslRuntimeError(`tick.${name}(windowSec) - windowSec must be a positive number`)
   if (!ticks.length) return 0
@@ -1466,6 +1526,31 @@ function footSnapshot(ticks: readonly { ts: number; price: number }[], nowMs: nu
   const minutes = Math.max(1, Math.ceil(bucketSec / 60))
   const result = buildFootprint([...ticks], { bucketSec, minutes, nowMs })
   const bucket = result.buckets[result.buckets.length - 1]
+  return bucket && bucket.nTicks >= 3 ? bucket : undefined
+}
+
+/** Like footSnapshot(), but for a SPECIFIC past bucket rather than only the
+ * latest one - foot.row()/foot.rowCount()'s own fetch (see their doc
+ * comments for the gap this closes). `bucketsAgo` 0 = the latest bucket,
+ * same "0 = most recent" convention foot.*Series's own buckets argument
+ * already uses elsewhere, just picking ONE bucket out of the array instead
+ * of mapping a field across all of them. Builds enough minutes of history
+ * to cover bucketsAgo+1 buckets (same sizing foot.*Series already does for
+ * its own `buckets` count), so asking further back pulls more raw ticks,
+ * not a different bucketing rule. */
+function footBucketAt(
+  ticks: readonly { ts: number; price: number }[],
+  nowMs: number,
+  windowSec: number,
+  bucketsAgo: number,
+): FootprintBucket | undefined {
+  if (!ticks.length || !Number.isFinite(windowSec) || windowSec <= 0) return undefined
+  const ago = Number.isFinite(bucketsAgo) ? Math.max(0, Math.round(bucketsAgo)) : 0
+  const bucketSec = Math.max(5, Math.round(windowSec))
+  const minutes = Math.max(1, Math.ceil((bucketSec * (ago + 1)) / 60))
+  const result = buildFootprint([...ticks], { bucketSec, minutes, nowMs })
+  const idx = result.buckets.length - 1 - ago
+  const bucket = idx >= 0 ? result.buckets[idx] : undefined
   return bucket && bucket.nTicks >= 3 ? bucket : undefined
 }
 
@@ -1665,8 +1750,125 @@ function footMethod(name: string, args: MslValue[], ticks: readonly { ts: number
         return side === 'buy' ? (pocRow.dn > 0 ? pocRow.up / pocRow.dn >= ratio : pocRow.up > 0) : pocRow.up > 0 ? pocRow.dn / pocRow.up >= ratio : pocRow.dn > 0
       })
     }
+    case 'vah': {
+      // foot.vah(windowSec?, pct?) - footprint's OWN value area (real tick
+      // counts, not candle-overlap-estimated volume) - distinct from BOTH
+      // tpo.vah() (time-based) and vp.vah() (candle-overlap volume-
+      // estimated). Closes §L's longest-standing flagged gap.
+      const b = footSnapshot(ticks, nowMs, args.length ? asNum(args[0]) : defaultWindowSec)
+      if (!b) return NaN
+      const va = footprintValueArea(b, args.length >= 2 ? asNum(args[1]) : 0.7)
+      return va ? va.vah : NaN
+    }
+    case 'val': {
+      const b = footSnapshot(ticks, nowMs, args.length ? asNum(args[0]) : defaultWindowSec)
+      if (!b) return NaN
+      const va = footprintValueArea(b, args.length >= 2 ? asNum(args[1]) : 0.7)
+      return va ? va.val : NaN
+    }
+    case 'deltaPct': {
+      // foot.deltaPct(windowSec?) - velDelta / total prints, as a signed
+      // percentage (-100..100) - the named accessor §L flagged as missing
+      // ("Delta %... derivable, no named accessor").
+      const b = footSnapshot(ticks, nowMs, args.length ? asNum(args[0]) : defaultWindowSec)
+      if (!b) return 0
+      const total = b.upTicks + b.dnTicks
+      return total > 0 ? (b.velDelta / total) * 100 : 0
+    }
+    case 'deltaVelocity': {
+      // foot.deltaVelocity(bucketSec?, buckets?) - rate of change of delta
+      // across consecutive buckets (this bucket's velDelta minus the
+      // previous bucket's) - the named "delta velocity" accessor §L flagged
+      // as missing. Returns 0 (not NaN) on too-thin history, same
+      // cumulativeDelta() convention right above this case.
+      const bucketSec = Math.max(5, Math.round(args.length > 0 ? asNum(args[0]) : defaultWindowSec))
+      const buckets = seriesBucketCount(args.length > 1 ? asNum(args[1]) : undefined, 10)
+      if (!ticks.length) return 0
+      const minutes = Math.max(1, Math.ceil((bucketSec * buckets) / 60))
+      const result = buildFootprint([...ticks], { bucketSec, minutes, nowMs })
+      const recent = result.buckets.filter((b) => b.nTicks >= 3).slice(-2)
+      if (recent.length < 2) return 0
+      return recent[1].velDelta - recent[0].velDelta
+    }
+    case 'diagonalImbalance': {
+      // foot.diagonalImbalance(side, ratio, windowSec?) - the classic
+      // footprint "diagonal" read: this level's buy-side prints vs the
+      // level BELOW's sell-side prints (not foot.imbalance()'s same-level
+      // check) - §L's flagged "diagonal imbalance... different check than
+      // same-level imbalance" gap.
+      if (args.length < 2) throw new MslRuntimeError('foot.diagonalImbalance(side, ratio, windowSec?) takes at least 2 arguments')
+      const side = String(args[0])
+      if (side !== 'buy' && side !== 'sell') throw new MslRuntimeError(`foot.diagonalImbalance(side, ...) - side must be "buy" or "sell" (got "${side}")`)
+      const ratio = asNum(args[1])
+      const b = footSnapshot(ticks, nowMs, args.length >= 3 ? asNum(args[2]) : defaultWindowSec)
+      if (!b) return false
+      return diagonalImbalance(b, side, ratio).length > 0
+    }
+    case 'absorption': {
+      // foot.absorption(windowSec?) - §L's flagged "absorption detection"
+      // gap: heavy print density packed into few price rows, with closePos
+      // staying mid-range despite a real directional delta - the side whose
+      // aggression got absorbed, stated as an explicit documented heuristic
+      // (see otcfootprint.ts's own header comment on this function - no
+      // universal textbook formula exists, this is a design decision).
+      // Returns 'buy'|'sell'|'none', never a forced guess.
+      const b = footSnapshot(ticks, nowMs, args.length ? asNum(args[0]) : defaultWindowSec)
+      if (!b) return 'none'
+      return footprintAbsorption(b).side ?? 'none'
+    }
+    case 'unfinishedAuction': {
+      // foot.unfinishedAuction(windowSec?) - §L's flagged gap: true when the
+      // bucket's busiest price node (POC) sits AT the bucket's own high or
+      // low, meaning the auction never rotated away from the edge it
+      // printed the most volume at. Returns 'high'|'low'|'none'.
+      const b = footSnapshot(ticks, nowMs, args.length ? asNum(args[0]) : defaultWindowSec)
+      if (!b) return 'none'
+      return unfinishedAuction(b).side ?? 'none'
+    }
+    case 'rowCount': {
+      // foot.rowCount(bucketsAgo?, bucketSec?) - FOOTPRINT-COMPLETION SWEEP:
+      // closes the one remaining item in §L's "Historical per-price-level
+      // data" row - FootprintBucket[] already stores a full per-row ladder
+      // for every bucket server-side, but until now nothing beyond the
+      // AGGREGATE *Series rollups (pocSeries/deltaSeries/...) could reach
+      // any bucket OTHER than the very latest one, and even that one only
+      // ever gave back scalars (poc/pocTicks/...), never the per-row ladder
+      // itself. foot.rowCount() tells a script how many rows a given past
+      // bucket actually has, so foot.row(levelIndex, bucketsAgo?) below can
+      // be called with a valid levelIndex instead of guessing - MSL has no
+      // loops, so a script walks a ladder via explicit foot.row(0, ...),
+      // foot.row(1, ...), etc., exactly the same "no iteration, only named
+      // offset access" convention every other historical primitive in this
+      // language already uses (ohlc(offset), swing.high(offset), ...).
+      const b = footBucketAt(ticks, nowMs, args.length >= 2 ? asNum(args[1]) : defaultWindowSec, args.length ? asNum(args[0]) : 0)
+      return b ? b.rows.length : 0
+    }
+    case 'row': {
+      // foot.row(levelIndex, bucketsAgo?, bucketSec?) - one row of the raw
+      // per-price-level ladder, from the bucket `bucketsAgo` buckets back
+      // (0 = latest, same "how far back" convention as every *Series
+      // accessor's `buckets` argument, just picking ONE bucket instead of a
+      // whole series of one field). Rows are sorted high price -> low
+      // (buildFootprint()'s own order, unchanged) - levelIndex 0 is always
+      // the HIGHEST price row in that bucket, not the POC. Returns a bundle
+      // {price, up, dn, total, delta, imbalance} - imbalance is up/dn (or
+      // dn/up, whichever side is busier) so a script doesn't have to divide
+      // by a possibly-zero count itself; 0 when either side is empty rather
+      // than Infinity/NaN leaking into a script's own arithmetic.
+      if (!args.length) throw new MslRuntimeError('foot.row(levelIndex, bucketsAgo?, bucketSec?) needs a levelIndex argument, e.g. foot.row(0)')
+      const b = footBucketAt(ticks, nowMs, args.length >= 3 ? asNum(args[2]) : defaultWindowSec, args.length >= 2 ? asNum(args[1]) : 0)
+      if (!b) throw new MslRuntimeError('foot.row(...) - no bucket available yet (thin tick history)')
+      const idx = Math.trunc(asNum(args[0]))
+      const row = idx >= 0 && idx < b.rows.length ? b.rows[idx] : undefined
+      if (!row) throw new MslRuntimeError(`foot.row(${idx}, ...) out of range - this bucket has ${b.rows.length} row(s)`)
+      const delta = row.up - row.dn
+      const imbalance = row.dn > 0 && row.up > 0 ? Math.max(row.up / row.dn, row.dn / row.up) : 0
+      return bundleValue({ price: row.price, up: row.up, dn: row.dn, total: row.total, delta, imbalance })
+    }
     default:
-      throw new MslRuntimeError(`unknown foot method "foot.${name}(...)" - use poc/pocTicks/stagnation/delta/speedRatio/imbalance/consecutiveDense/divergence/exhaustion/cumulativeDelta/consecutiveImbalance, or pocSeries/pocTicksSeries/stagnationSeries/deltaSeries/speedRatioSeries for a historical series`)
+      throw new MslRuntimeError(
+        `unknown foot method "foot.${name}(...)" - use poc/pocTicks/stagnation/delta/speedRatio/imbalance/consecutiveDense/divergence/exhaustion/cumulativeDelta/consecutiveImbalance/vah/val/deltaPct/deltaVelocity/diagonalImbalance/absorption/unfinishedAuction/row/rowCount, or pocSeries/pocTicksSeries/stagnationSeries/deltaSeries/speedRatioSeries for a historical series`,
+      )
   }
 }
 
@@ -1708,7 +1910,16 @@ function seriesLookback(args: MslValue[], dflt: number): number {
  * Same optional trailing TF-string contract as ind.* / ohlc(). */
 function renkoMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
   const candles = seriesToCandles(requireSeries(ctx, tf))
-  const r = renkoBricks(candles)
+  // BUG FIX (configure-override gap, see EvalEnv.configs' doc comment):
+  // renko.brick/renko.atrPeriod/renko.atrMult (the EXACT keys
+  // plugins/metastrategy.ts's MSL_READ_CONFIGS whitelist already uses for
+  // this engine) now actually reach it when a script sets them, instead of
+  // always using the hardcoded defaults no matter what `configure` said.
+  const r = renkoBricks(candles, {
+    brickSize: cfgNumLang(ctx, 'renko.brick', undefined),
+    atrPeriod: cfgNumLang(ctx, 'renko.atrPeriod', undefined),
+    atrMult: cfgNumLang(ctx, 'renko.atrMult', undefined),
+  })
   switch (name) {
     case 'bricks':
       return seriesValue(r.bricks.map((b) => b.dir).slice(-seriesLookback(args, 50)))
@@ -1740,7 +1951,14 @@ function renkoMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | 
  * `pf.boxSize()` is the current box size in price units. */
 function pfMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
   const candles = seriesToCandles(requireSeries(ctx, tf))
-  const r = pointFigure(candles)
+  // BUG FIX (configure-override gap) - pf.boxSize/pf.atrPeriod/pf.atrMult/
+  // pf.reversalBoxes now reach the engine from a script's own `configure`.
+  const r = pointFigure(candles, {
+    boxSize: cfgNumLang(ctx, 'pf.boxSize', undefined),
+    atrPeriod: cfgNumLang(ctx, 'pf.atrPeriod', undefined),
+    atrMult: cfgNumLang(ctx, 'pf.atrMult', undefined),
+    reversalBoxes: cfgNumLang(ctx, 'pf.reversalBoxes', undefined),
+  })
   switch (name) {
     case 'boxes':
       return seriesValue(r.columns.map((c) => (c.dir === 'X' ? c.boxes : -c.boxes)).slice(-seriesLookback(args, 50)))
@@ -1835,7 +2053,15 @@ function haMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | und
  * as renko.ohlc(). */
 function rangebarsMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
   const candles = seriesToCandles(requireSeries(ctx, tf))
-  const r = rangeBars(candles)
+  // BUG FIX (configure-override gap) - range.range/range.atrPeriod/
+  // range.atrMult (the existing whitelist's key names for this engine,
+  // confusingly prefixed 'range.' rather than 'rangebars.' - matched
+  // exactly rather than introducing a second, inconsistent naming).
+  const r = rangeBars(candles, {
+    range: cfgNumLang(ctx, 'range.range', undefined),
+    atrPeriod: cfgNumLang(ctx, 'range.atrPeriod', undefined),
+    atrMult: cfgNumLang(ctx, 'range.atrMult', undefined),
+  })
   switch (name) {
     case 'bars':
       return seriesValue(r.bars.map((b) => b.dir).slice(-seriesLookback(args, 50)))
@@ -1869,7 +2095,9 @@ function rangebarsMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: strin
  * future third state doesn't silently collapse into one side. */
 function volumebarsMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
   const candles = seriesToCandles(requireSeries(ctx, tf))
-  const r = volumeBars(candles)
+  // BUG FIX (configure-override gap) - volbar.per (the existing whitelist's
+  // key name for this engine).
+  const r = volumeBars(candles, { per: cfgNumLang(ctx, 'volbar.per', undefined) })
   switch (name) {
     case 'bars':
       return seriesValue(r.bars.map((b) => (b.close >= b.open ? 1 : -1)).slice(-seriesLookback(args, 50)))
@@ -1932,7 +2160,10 @@ function tpoMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | un
  * footprint.ts) - never 'measured'. */
 function vpMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
   const candles = seriesToCandles(requireSeries(ctx, tf))
-  const r = computeVolumeProfile(candles)
+  // BUG FIX (configure-override gap) - vp.binCount (already whitelisted in
+  // plugins/metastrategy.ts's MSL_READ_CONFIGS for the verdict-source path;
+  // this closes the same gap for a script's own direct vp.* calls).
+  const r = computeVolumeProfile(candles, { binCount: cfgNumLang(ctx, 'vp.binCount', undefined) })
   const num = (v: number | null): number => (v === null ? NaN : v)
   switch (name) {
     case 'poc':
@@ -1952,6 +2183,42 @@ function vpMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | und
   }
 }
 
+/** `dp.*` - Delta Profile (the 5th new chart type, deferred since the
+ * roadmap's Phase 6, built in the post-roadmap follow-up session). Same
+ * range-overlap/CLV-proxy approach as vp.*, just splitting each candle's
+ * volume into buy/sell shares via close-location-value before binning (see
+ * analytics/deltaprofile.ts's own header). Quality 'estimated', never
+ * 'measured' - same disclosure convention as every other volume-shaped
+ * surface in this codebase. */
+function dpMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const candles = seriesToCandles(requireSeries(ctx, tf))
+  // BUG FIX (configure-override gap) - dp.binCount.
+  const r = computeDeltaProfile(candles, { binCount: cfgNumLang(ctx, 'dp.binCount', undefined) })
+  const num = (v: number | null): number => (v === null ? NaN : v)
+  switch (name) {
+    case 'positiveDeltaPoc':
+      return num(r.positiveDeltaPoc)
+    case 'negativeDeltaPoc':
+      return num(r.negativeDeltaPoc)
+    case 'totalDelta':
+      return r.totalDelta
+    case 'totalVolume':
+      return r.totalVolume
+    case 'deltaSkew':
+      return r.deltaSkew
+    case 'deltaAt': {
+      // dp.deltaAt(price) - the net delta of whichever bin a given price
+      // falls into, 0 if the price is outside the profiled window.
+      if (!args.length) throw new MslRuntimeError('dp.deltaAt(price) needs a price argument')
+      const price = asNum(args[0])
+      const row = r.rows.find((row) => price >= row.priceLow && price < row.priceHigh)
+      return row ? row.delta : 0
+    }
+    default:
+      throw new MslRuntimeError(`unknown dp method "dp.${name}(...)" - use positiveDeltaPoc()/negativeDeltaPoc()/totalDelta()/totalVolume()/deltaSkew()/deltaAt(price)`)
+  }
+}
+
 /** `linebreak.*` - Three-Line-Break (Phase 6). linebreak.bars(n?) is a
  * SERIES of the last n lines' signed direction, same chronological/[-1]
  * convention as renko.bricks()/rangebars.bars(). linebreak.ohlc(offset) is
@@ -1962,7 +2229,10 @@ function vpMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | und
  * the engine's own consecutive-same-direction line count. */
 function linebreakMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
   const candles = seriesToCandles(requireSeries(ctx, tf))
-  const r = lineBreak(candles)
+  // BUG FIX (configure-override gap) - linebreak.lines (already whitelisted
+  // for the verdict-source path; now also honored by a script's own direct
+  // linebreak.* calls).
+  const r = lineBreak(candles, { lines: cfgNumLang(ctx, 'linebreak.lines', undefined) })
   switch (name) {
     case 'bars':
       return seriesValue(r.bars.map((b) => b.dir).slice(-seriesLookback(args, 50)))
@@ -1989,7 +2259,14 @@ function linebreakMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: strin
  * reversal has occurred, never a misleading 0). */
 function kagiMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
   const candles = seriesToCandles(requireSeries(ctx, tf))
-  const r = kagi(candles)
+  // BUG FIX (configure-override gap) - kagi.reversal/.atrPeriod/
+  // .reversalAtrMult (all three already whitelisted for the verdict-source
+  // path; now also honored by a script's own direct kagi.* calls).
+  const r = kagi(candles, {
+    reversal: cfgNumLang(ctx, 'kagi.reversal', undefined),
+    atrPeriod: cfgNumLang(ctx, 'kagi.atrPeriod', undefined),
+    reversalAtrMult: cfgNumLang(ctx, 'kagi.reversalAtrMult', undefined),
+  })
   const num = (v: number | null): number => (v === null ? NaN : v)
   switch (name) {
     case 'direction':
@@ -2020,7 +2297,10 @@ function kagiMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | u
  * `index` difference) - a duration, not a price. */
 function swingMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
   const candles = seriesToCandles(requireSeries(ctx, tf))
-  const r = computeSwing(candles)
+  // BUG FIX (configure-override gap) - swing.lookback (already whitelisted
+  // for the verdict-source path; now also honored by a script's own direct
+  // swing.* calls).
+  const r = computeSwing(candles, { lookback: cfgNumLang(ctx, 'swing.lookback', undefined) })
   const highs = r.swings.filter((s) => s.kind === 'high')
   const lows = r.swings.filter((s) => s.kind === 'low')
   switch (name) {
@@ -2061,8 +2341,13 @@ function swingMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | 
  * (or a person reading its trace) which mode is live right now. Every
  * accessor takes an optional trailing `per` argument (ticks per bar,
  * default 10, clamped 2-200 same as the engine's own default) - this is a
- * plain numeric argument, not a `configure` key, same convention
- * renko/pf/ha already use for their own fixed internal sizing. */
+ * plain numeric argument, not a `configure` key, which is actually a
+ * strictly BETTER fit here (every call can pick its own `per`, not just one
+ * script-wide value) - so, unlike renko/pf/rangebars/volumebars/vp/dp/
+ * linebreak/kagi/swing (which only ever had one fixed hardcoded default
+ * until the configure-override fix - see EvalEnv.configs' doc comment),
+ * tickbar.* was never missing this capability and doesn't need a
+ * `tickbar.per` configure key added alongside its existing argument. */
 function tickbarPoints(ctx: EvalEnv, tf: string | undefined): { points: TickPoint[]; dataSource: 'tick' | 'candle' } {
   if (ctx.liveTicks && ctx.liveTicks.length) {
     return { points: ctx.liveTicks.map((t) => ({ time: t.ts / 1000, price: t.price })), dataSource: 'tick' }
@@ -2182,6 +2467,57 @@ function ivhvMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | u
     }
     default:
       throw new MslRuntimeError(`unknown ivhv method "ivhv.${name}(...)" - use hvNow(window?)/hvSeries(n?)/realizedUpProb(window?)/change(lookback?)/percentile(lookback?)`)
+  }
+}
+
+/** `nearExpiry.*` - Section 9 of the original checklist (binary-options-
+ * specific intelligence): expiry-aligned momentum/displacement/expected-
+ * move/reversal-risk/stagnation-exhaustion, all PURE candle functions
+ * (analytics/expiryintel.ts) so they replay in meta_strategy_backtest.
+ * Named `nearExpiry`, not `expiry` - `expiry` is already a hard statement
+ * keyword (the script-level `expiry = <numExpr>` line) and can't double as
+ * an identifier. completionProb()/completionDir() are the one genuinely new
+ * idea here and are an explicit documented heuristic (see expiryintel.ts's
+ * own header) - never present as a measured probability. */
+function nearExpiryMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const candles = seriesToCandles(requireSeries(ctx, tf))
+  switch (name) {
+    case 'momentum':
+      return expiryMomentum(candles, args.length ? Math.max(1, Math.round(asNum(args[0]))) : 5)
+    case 'displacement':
+      return priceDisplacement(candles, args.length ? Math.max(1, Math.round(asNum(args[0]))) : 5).price
+    case 'displacementAtr':
+      return priceDisplacement(candles, args.length ? Math.max(1, Math.round(asNum(args[0]))) : 5).atrMultiple
+    case 'expectedMove':
+      return volAdjustedExpectedMove(candles, args.length ? Math.max(1, Math.round(asNum(args[0]))) : 5)
+    case 'reversalRisk':
+      return reversalRisk(candles, args.length ? Math.max(1, Math.round(asNum(args[0]))) : 5)
+    case 'stagnation':
+      return expiryStagnationExhaustion(candles, args.length ? Math.max(1, Math.round(asNum(args[0]))) : 5).stagnation
+    case 'exhaustion':
+      return expiryStagnationExhaustion(candles, args.length ? Math.max(1, Math.round(asNum(args[0]))) : 5).exhaustion
+    case 'completionProb':
+    case 'completionDir': {
+      // completionProb(remainingFraction)/completionDir(remainingFraction) -
+      // remainingFraction (0..1) is the caller's own read of how much of
+      // the current expiry/bar is left (this module takes no stance on
+      // where that number comes from - a script already knows its own
+      // expiry countdown). openToNow reads the CURRENTLY FORMING bar via
+      // live() when available (omni-trader), else honestly falls back to
+      // the last CLOSED bar's own open-to-close move (documented fallback,
+      // not a forming-bar read) so this stays callable everywhere ohlc()
+      // is, same as every other candle-derived namespace.
+      if (!args.length) throw new MslRuntimeError(`expiry.${name}(remainingFraction) needs a remainingFraction argument (0..1)`)
+      const remainingFraction = asNum(args[0])
+      const openToNow = ctx.liveBar ? ctx.liveBar.c - ctx.liveBar.o : candles.length ? candles[candles.length - 1].close - candles[candles.length - 1].open : 0
+      const histForAtr = ctx.liveBar ? candles : candles.slice(0, -1)
+      const r = candleCompletionProbability(histForAtr, openToNow, remainingFraction)
+      return name === 'completionProb' ? r.probability : r.direction
+    }
+    default:
+      throw new MslRuntimeError(
+        `unknown nearExpiry method "nearExpiry.${name}(...)" - use momentum(lookback?)/displacement(window?)/displacementAtr(window?)/expectedMove(window?)/reversalRisk(lookback?)/stagnation(window?)/exhaustion(window?)/completionProb(remainingFraction)/completionDir(remainingFraction)`,
+      )
   }
 }
 
@@ -2373,6 +2709,11 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
         return vpMethod(e.name, args, ctx, tf)
       }
+      if (e.obj.t === 'ident' && e.obj.name === 'dp' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return dpMethod(e.name, args, ctx, tf)
+      }
       if (e.obj.t === 'ident' && e.obj.name === 'linebreak' && !(e.obj.name in env)) {
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
@@ -2402,6 +2743,11 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
         return ivhvMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'nearExpiry' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return nearExpiryMethod(e.name, args, ctx, tf)
       }
       const obj = evalExpr(e.obj, env, ctx)
       const args = e.args.map((a) => evalExpr(a, env, ctx))
@@ -2510,6 +2856,38 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
           if (args.length !== 3) throw new MslRuntimeError(`between(x, lo, hi) takes exactly 3 arguments, got ${args.length}`)
           const [x, lo, hi] = args.map(asNum)
           return x >= lo && x <= hi
+        }
+        case 'breakeven': {
+          // breakeven(payout) - the breakeven win-rate (0..1) for a given
+          // payout fraction: 1/(1+payout). Section 9's payout-aware gate
+          // item - previously a script had to spell this arithmetic out by
+          // hand every time (see the payout source's own doc comment); now
+          // a named 1-liner, no new concept, same formula.
+          if (args.length !== 1) throw new MslRuntimeError(`breakeven(payout) takes exactly 1 argument, got ${args.length}`)
+          const payout = asNum(args[0])
+          return payout > -1 ? 1 / (1 + payout) : 1
+        }
+        case 'ev': {
+          // ev(winProb, payout) - expected value per $1 staked at a
+          // hypothetical win probability: winProb*payout - (1-winProb).
+          if (args.length !== 2) throw new MslRuntimeError(`ev(winProb, payout) takes exactly 2 arguments, got ${args.length}`)
+          const [winProb, payout] = args.map(asNum)
+          return winProb * payout - (1 - winProb)
+        }
+        case 'gate': {
+          // gate(winProb, payout, minEdge?) - Section 9's explicitly-flagged
+          // missing primitive: "an actual payout-aware minimum-confidence-
+          // threshold GATE mechanism, not just the raw payout value".
+          // Returns true iff the expected value at winProb clears minEdge
+          // (default 0 - plain non-negative-EV gate). A script combines this
+          // with `payout.value` directly: `call when ... and gate(0.65,
+          // payout.value, 0.02)` replaces hand-rolled EV arithmetic with one
+          // named boolean check.
+          if (args.length < 2 || args.length > 3) throw new MslRuntimeError(`gate(winProb, payout, minEdge?) takes 2 or 3 arguments, got ${args.length}`)
+          const winProb = asNum(args[0])
+          const payout = asNum(args[1])
+          const minEdge = args.length === 3 ? asNum(args[2]) : 0
+          return winProb * payout - (1 - winProb) >= minEdge
         }
         case 'live': {
           // live() - the currently FORMING (unclosed) bar, omni-trader only.
@@ -2680,6 +3058,12 @@ export function evaluateStrategyScript(
   live?: { bar?: MslBarValue; ticks?: readonly { ts: number; price: number }[]; nowMs?: number },
   state?: { keyPrefix: string; barTimeSec?: number },
 ): MslEvalResult {
+  // configs is declared before ctx so ctx.configs can point at the SAME
+  // object the 'configure' statement branch below mutates - a namespace
+  // method called by a LATER statement in this script then sees every
+  // override collected so far, live, without a second pass (see
+  // EvalEnv.configs' doc comment for the bug this fixes).
+  const configs: Record<string, number | boolean | string> = {}
   const ctx: EvalEnv = {
     reads,
     resolve,
@@ -2690,10 +3074,10 @@ export function evaluateStrategyScript(
     liveNowMs: live?.nowMs,
     stateKeyPrefix: state?.keyPrefix,
     barTimeSec: state?.barTimeSec,
+    configs,
   }
   const env: Record<string, MslValue> = {}
   const trace: string[] = []
-  const configs: Record<string, number | boolean | string> = {}
   let callFired = false
   let putFired = false
   let confidenceExpr: Expr | null = null

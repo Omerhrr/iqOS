@@ -39,6 +39,7 @@ import { pointFigure } from '../analytics/pointfigure'
 import { volumeBars } from '../analytics/volumebars'
 import { computeTpo } from '../analytics/tpo'
 import { computeVolumeProfile } from '../analytics/volumeprofile'
+import { computeDeltaProfile } from '../analytics/deltaprofile'
 import { lineBreak } from '../analytics/linebreak'
 import { kagi } from '../analytics/kagi'
 import { computeSwing } from '../analytics/swing'
@@ -48,7 +49,7 @@ import { EXPIRIES_MIN } from '../analytics/nextexpiry'
 import { TECH_LADDER } from '../analytics/technicals'
 import { engineVoteSingle, tickVote, otcFootprintVote, type ChartEngineVote } from '../analytics/chartsignals'
 import { smcNowRead, smcAnyAgrees, ALL_SMC_KINDS } from '../analytics/smc'
-import { buildFootprint } from '../analytics/otcfootprint'
+import { buildFootprint, footprintAbsorption, unfinishedAuction } from '../analytics/otcfootprint'
 import { ICT_KINDS, voteForKindSet } from '../analytics/chartindicators'
 import { buildCtx } from '../strategies/custom'
 import { makeSignalResolver } from '../strategies/signalscript'
@@ -93,7 +94,7 @@ interface MslConfigSpec {
   /** human description for the save/eval error message */
   desc: string
 }
-const MSL_READ_CONFIGS: Record<string, MslConfigSpec> = {
+export const MSL_READ_CONFIGS: Record<string, MslConfigSpec> = {
   'renko.brick': { min: 1e-9, max: 1e9, desc: 'explicit renko brick size in price units' },
   'renko.atrPeriod': { min: 2, max: 200, integer: true, desc: 'renko ATR brick period' },
   'renko.atrMult': { min: 0.05, max: 20, desc: 'renko ATR brick multiplier' },
@@ -126,6 +127,14 @@ const MSL_READ_CONFIGS: Record<string, MslConfigSpec> = {
   'footstack.n': { min: 1, max: 20, integer: true, desc: 'footStackedImbalance consecutive-bucket count' },
   'footstack.ratio': { min: 1.01, max: 50, desc: 'footStackedImbalance diagonal-imbalance ratio threshold' },
   'footstack.bucketSec': { min: 5, max: 3600, integer: true, desc: 'footStackedImbalance bucket length (seconds)' },
+  // Footprint-completion sweep: closes the configure-override gap this
+  // tracker flagged for every candle-derived namespace's own internal
+  // sizing (renko/pf/range/volbar/vp/linebreak/kagi/swing already had
+  // whitelist entries above - they just weren't wired into strategylang.ts's
+  // own raw namespace calls until now; see EvalEnv.configs' doc comment
+  // there). dp.binCount is the one genuinely NEW key - Delta Profile didn't
+  // exist before this sweep.
+  'dp.binCount': { min: 5, max: 200, integer: true, desc: 'Delta Profile bin count' },
 }
 
 /** Validates a collected configure map against the whitelist. Throws with a
@@ -133,7 +142,7 @@ const MSL_READ_CONFIGS: Record<string, MslConfigSpec> = {
  * same as a syntax error). `strategy.<id>.<param>` keys are validated
  * structurally + by strategy existence; the param NAME itself is whatever
  * the strategy's own evaluate() understands (custom.ts clamps values). */
-function validateMslConfigs(configs: Record<string, number | boolean | string>): void {
+export function validateMslConfigs(configs: Record<string, number | boolean | string>): void {
   for (const [k, v] of Object.entries(configs)) {
     if (k.startsWith('strategy.')) {
       const rest = k.slice('strategy.'.length)
@@ -470,6 +479,22 @@ export class MetaStrategyService {
           }
           if (!pred.best) return none(`Expiry oracle: wait - ${pred.note}`)
           return { source, direction: pred.best.direction, confidence: pred.best.confidence, value: pred.best.pWin, label: `Expiry oracle ${pred.best.expiry}m ${pred.best.direction.toUpperCase()} ${pred.best.confidence.toFixed(0)}% (pWin ${(pred.best.pWin * 100).toFixed(0)}%)` }
+        }
+        case 'nextExpiryBest': {
+          // VALUE-ONLY companion to 'nextExpiry' above - same fused best
+          // pick, but .value is WHICH rung (minutes) was picked, not pWin.
+          // See MetaConditionSource's own doc comment for why this gets its
+          // own source rather than overloading nextExpiry's .value field.
+          const expiryOracle = this.ctx.use<NextExpiryService>('nextexpiry')
+          const pred = expiryOracle.predict(asset)
+          if (!pred?.best) return none(pred ? `Expiry oracle: wait - ${pred.note}` : 'Expiry oracle: no read (thin 1m history)')
+          return {
+            source,
+            direction: pred.best.direction,
+            confidence: pred.best.confidence,
+            value: pred.best.expiry,
+            label: `Expiry oracle's best pick is the ${pred.best.expiry}m rung (${pred.best.direction.toUpperCase()} ${pred.best.confidence.toFixed(0)}%)`,
+          }
         }
         case 'accute': {
           const accute = this.ctx.use<AccuteService>('accute')
@@ -1082,6 +1107,50 @@ export class MetaStrategyService {
           const direction = buyStacked ? 'call' : 'put'
           return { source, direction, confidence: 60, label: `Stacked imbalance ${direction.toUpperCase()} - ${n} consecutive bucket(s) at >=${ratio}x diagonal imbalance` }
         }
+        case 'footAbsorption': {
+          // Heavy print density packed into few price rows with closePos
+          // staying mid-range despite a real delta - direction = the side
+          // whose aggression got absorbed (a documented heuristic, see
+          // otcfootprint.ts#footprintAbsorption's own header). Same
+          // tick-buffer-required contract as 'footDivergence' above.
+          const ofpA = this.ctx.use<OtcFootprintService>('otcFootprint')
+          const ticksA = ofpA.ticksFor(asset)
+          if (!ticksA.length) return none('Footprint absorption: tick buffer cold')
+          const fpA = buildFootprint(ticksA, { minutes: 30, bucketSec: 60, asset, dataSourceLabel: this.market.mode === 'live' ? 'sidecar-tick-100ms' : 'sim-tick-1s' })
+          const latestA = fpA.buckets[fpA.buckets.length - 1]
+          if (!latestA || latestA.nTicks < 3) return none('Footprint absorption: thin bucket')
+          const absA = footprintAbsorption(latestA)
+          if (!absA.side) return none('Footprint absorption: no absorption read in the latest bucket')
+          const direction = absA.side === 'buy' ? 'put' : 'call' // the absorbed side's aggression failed - contrarian tell
+          return { source, direction, confidence: 55, value: absA.density, label: `Footprint absorption - ${absA.side} aggression absorbed (density ${absA.density}x, closePos ${(absA.closePos * 100).toFixed(0)}%)` }
+        }
+        case 'footUnfinishedAuction': {
+          // POC sitting at the bucket's own high or low - reads toward the
+          // stuck edge, low confidence since this names an unresolved state,
+          // not a directional edge on its own. Same tick-buffer-required
+          // contract as 'footDivergence' above.
+          const ofpU = this.ctx.use<OtcFootprintService>('otcFootprint')
+          const ticksU = ofpU.ticksFor(asset)
+          if (!ticksU.length) return none('Unfinished auction: tick buffer cold')
+          const fpU = buildFootprint(ticksU, { minutes: 30, bucketSec: 60, asset, dataSourceLabel: this.market.mode === 'live' ? 'sidecar-tick-100ms' : 'sim-tick-1s' })
+          const latestU = fpU.buckets[fpU.buckets.length - 1]
+          if (!latestU || latestU.nTicks < 3) return none('Unfinished auction: thin bucket')
+          const uaU = unfinishedAuction(latestU)
+          if (!uaU.side) return none('Unfinished auction: POC is not at either edge of the bucket')
+          const direction = uaU.side === 'high' ? 'call' : 'put'
+          return { source, direction, confidence: 45, label: `Unfinished auction - POC stuck at the bucket's ${uaU.side} (${latestU.pocPrice.toPrecision(6)})` }
+        }
+        case 'deltaProfile': {
+          // Delta Profile - the 5th new chart type, deferred since Phase 6.
+          // Direction from the window's own net deltaSkew; confidence
+          // scaled by |deltaSkew|, same shape as the volumeProfile case.
+          const candlesDp = this.market.getCandlesDeep(asset, tf, 300, true)
+          const dp = computeDeltaProfile(candlesDp, { binCount: cfgNum(cfg, 'dp.binCount') })
+          if (dp.totalVolume <= 0 || dp.deltaSkew === 0) return none('Delta Profile: no net delta lean in the window')
+          const direction = dp.deltaSkew > 0 ? 'call' : 'put'
+          const confidence = Math.min(100, 45 + Math.round(Math.abs(dp.deltaSkew) * 45))
+          return { source, direction, confidence, value: dp.deltaSkew, label: `Delta Profile ${direction.toUpperCase()} - net delta skew ${(dp.deltaSkew * 100).toFixed(1)}% (${dp.method})` }
+        }
       }
     } catch {
       return none(`${source}: not available (plugin not loaded or thin history)`)
@@ -1151,6 +1220,9 @@ export class MetaStrategyService {
       swing: toMsl(this.readSource('swing', asset, tf, undefined, undefined, undefined, cfg)),
       footDivergence: toMsl(this.readSource('footDivergence', asset, tf)),
       footStackedImbalance: toMsl(this.readSource('footStackedImbalance', asset, tf, undefined, undefined, undefined, cfg)),
+      footAbsorption: toMsl(this.readSource('footAbsorption', asset, tf)),
+      footUnfinishedAuction: toMsl(this.readSource('footUnfinishedAuction', asset, tf)),
+      deltaProfile: toMsl(this.readSource('deltaProfile', asset, tf)),
     }
     // Tick-desk reads for scripts: bare keys = each engine's own default read
     // (SMC 15s, oracle best bucket, technical best-rated bucket, footprint
@@ -1192,9 +1264,27 @@ export class MetaStrategyService {
         const rung = pred?.rows.find((r) => r.expiry === E)
         reads[`nextExpiry:${E}`] = rung && rung.ok && rung.direction !== 'none' ? { direction: rung.direction, confidence: rung.confidence, value: rung.pWin } : { direction: 'none', confidence: 0 }
       }
+      // Footprint-completion follow-up (closes a gap flagged in the
+      // capability matrix since Phase 8): until now, a script using the
+      // bare `nextExpiry` source could see WHAT the oracle's fused best
+      // pick thinks (direction/confidence/pWin, via .value) but never
+      // WHICH expiry rung (1/2/3/5/15m) that pick actually was -
+      // pred.best.expiry existed on the engine's own predict() result the
+      // whole time, it just never got its own read. 'nextExpiryBest' is
+      // this missing field, exposed the same shape every other MSL source
+      // uses (direction mirrors the bare nextExpiry pick so a script can
+      // still gate on it the normal way; .value is the chosen expiry in
+      // MINUTES, not a probability - documented here and in /signal_vocab
+      // precisely because every other nextExpiry* source's .value is a
+      // 0-1 probability, so a script reading the wrong one by habit would
+      // otherwise silently misinterpret a "5" as "500% win probability").
+      reads.nextExpiryBest = pred?.best
+        ? { direction: pred.best.direction, confidence: pred.best.confidence, value: pred.best.expiry }
+        : { direction: 'none', confidence: 0 }
     } catch {
       reads.nextExpiry = { direction: 'none', confidence: 0 }
       for (const E of EXPIRIES_MIN) reads[`nextExpiry:${E}`] = { direction: 'none', confidence: 0 }
+      reads.nextExpiryBest = { direction: 'none', confidence: 0 }
     }
     // Phase 8 of the chart-engine expansion roadmap (binary-options-specific
     // intelligence): the account's REAL current binary payout fraction
@@ -1214,6 +1304,39 @@ export class MetaStrategyService {
       reads.payout = { direction: 'none', confidence: 0, value: Number.isFinite(payoutRate) && payoutRate > 0 ? payoutRate : 0 }
     } catch {
       reads.payout = { direction: 'none', confidence: 0, value: 0 }
+    }
+    // Footprint-completion sweep: closes the "OTC/weekend-session
+    // awareness" gap flagged since Phase 8 - no asset.otc()/session flag
+    // existed in MSL at all, so a script had no way to tell a genuinely
+    // generator-driven OTC/synthetic-weekend instrument apart from a real
+    // market one, even though AssetInfo.otc already carries exactly that
+    // flag server-side (types.ts) and the auto-trader's own "OTC defense
+    // gate" (os-mode.ts) already treats the two very differently. Both are
+    // VALUE-ONLY reads, same honest-no-guess shape as 'payout' immediately
+    // above - neither an OTC flag nor a weekday number has a directional
+    // lean of its own, so neither is ever forced into a call/put verdict.
+    // 'otc': 1 when this asset is the OTC/synthetic-generator variant
+    // (AssetInfo.otc), 0 for a real-market instrument or if asset lookup
+    // fails (the honest "don't know, assume real market" default - never
+    // silently treat an unknown asset as OTC, which would suppress trust
+    // in a real feed for no reason).
+    try {
+      const info = this.market.listAssets().find((a) => a.ticker === asset)
+      reads.otc = { direction: 'none', confidence: 0, value: info?.otc ? 1 : 0 }
+    } catch {
+      reads.otc = { direction: 'none', confidence: 0, value: 0 }
+    }
+    // 'session': wall-clock weekend flag (1 = Sat/Sun UTC, when every real-
+    // market instrument is closed and only OTC/synthetic pairs trade at
+    // all - 0 otherwise). Deliberately UTC, not the user's local day - IQ
+    // Option's own market calendar runs on UTC weekends, and a local-time
+    // read would disagree with the broker's actual open/closed state for
+    // roughly half the world. Combine with `otc` above for the literal
+    // "weekend AND this asset is the synthetic generator" check a script
+    // would actually want, e.g. `call when otc.value == 1 and session.value == 1 and ...`.
+    {
+      const day = new Date().getUTCDay() // 0=Sun, 6=Sat
+      reads.session = { direction: 'none', confidence: 0, value: day === 0 || day === 6 ? 1 : 0 }
     }
     try {
       const smc = this.ctx.use<SmcScanService>('smcScan')

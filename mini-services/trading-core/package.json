@@ -5,7 +5,8 @@
   "description": "IQAIR//OS kernel - plugin-based trading engine (REST + socket.io)",
   "scripts": {
     "dev": "bun --hot index.ts",
-    "start": "bun index.ts"
+    "start": "bun index.ts",
+    "test": "bun tests/msl.test.ts"
   },
   "dependencies": {
     "socket.io": "^4.8.3"

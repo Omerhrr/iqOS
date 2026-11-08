@@ -161,7 +161,7 @@ export interface AccountState {
 // Unified Chart & Property Registry (analytics/chartpropertyregistry.ts)
 // needs both lists to agree so every chart type is addressable from one
 // shared type instead of two near-duplicate unions.
-export type ChartType = 'candles' | 'hollow' | 'heikin' | 'bars' | 'line' | 'area' | 'baseline' | 'renko' | 'pointfigure' | 'rangebars' | 'volumebars' | 'footprint' | 'otcfootprint' | 'tickfootprint' | 'tpo' | 'tickchart' | 'ivhv' | 'volumeprofile' | 'linebreak' | 'kagi' | 'swing'
+export type ChartType = 'candles' | 'hollow' | 'heikin' | 'bars' | 'line' | 'area' | 'baseline' | 'renko' | 'pointfigure' | 'rangebars' | 'volumebars' | 'footprint' | 'otcfootprint' | 'tickfootprint' | 'tpo' | 'tickchart' | 'ivhv' | 'volumeprofile' | 'linebreak' | 'kagi' | 'swing' | 'deltaprofile'
 
 export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'candles', label: 'Candles' },
@@ -185,6 +185,7 @@ export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'linebreak', label: 'Line Break' },
   { id: 'kagi', label: 'Kagi' },
   { id: 'swing', label: 'Swing' },
+  { id: 'deltaprofile', label: 'Delta Profile' },
 ]
 
 export type Direction = 'call' | 'put' | 'none'

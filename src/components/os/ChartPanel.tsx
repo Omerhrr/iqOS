@@ -304,6 +304,131 @@ function pointFigureChart(candles: Candle[], tfSec: number, cacheRef: { current:
   return ascendingGuard(cells).slice(-300)
 }
 
+/** Three-Line-Break, rendered as pseudo-candles - mirrors the kernel engine
+ * of record (mini-services/trading-core/src/analytics/linebreak.ts): a new
+ * line only forms when the close either extends the current line's
+ * direction past its own close, or breaks past the EXTREME close of the
+ * last `lineCount` lines (reversal rule). Most candles are absorbed (no new
+ * line), which is the whole point of the chart. Close-based, same
+ * simplification the kernel engine states explicitly (no per-line high/low
+ * tracking). Incremental via scanIncremental() - see its doc comment. */
+interface LineBreakState {
+  /** Trailing window of closed lines, oldest first, capped at lineCount - all
+   * that's needed to test the next close against the N-line reversal rule. */
+  lines: { close: number; dir: 1 | -1 }[]
+  lineCount: number
+}
+
+function lineBreakStep(state: LineBreakState, c: Candle): { state: LineBreakState; emitted: Candle[] } {
+  const { lineCount } = state
+  let lines = state.lines
+  const close = c.close
+  const emitted: Candle[] = []
+  if (lines.length === 0) {
+    const dir: 1 | -1 = close >= c.open ? 1 : -1
+    lines = [{ close, dir }]
+    emitted.push({ time: c.time, open: c.open, high: Math.max(c.open, close), low: Math.min(c.open, close), close, volume: 0 })
+    return { state: { lines, lineCount }, emitted }
+  }
+  const last = lines[lines.length - 1]
+  if (close === last.close) return { state: { lines, lineCount }, emitted } // absorbed - no price change
+  if ((last.dir === 1 && close > last.close) || (last.dir === -1 && close < last.close)) {
+    const open = last.close
+    lines = [...lines, { close, dir: last.dir }].slice(-lineCount)
+    emitted.push({ time: c.time, open, high: Math.max(open, close), low: Math.min(open, close), close, volume: 0 })
+    return { state: { lines, lineCount }, emitted }
+  }
+  const extreme = last.dir === 1 ? Math.min(...lines.map((l) => l.close)) : Math.max(...lines.map((l) => l.close))
+  const broke = last.dir === 1 ? close < extreme : close > extreme
+  if (broke) {
+    const newDir: 1 | -1 = last.dir === 1 ? -1 : 1
+    const open = last.close
+    lines = [...lines, { close, dir: newDir }].slice(-lineCount)
+    emitted.push({ time: c.time, open, high: Math.max(open, close), low: Math.min(open, close), close, volume: 0 })
+  }
+  // else: absorbed - moved against the trend but not far enough to break
+  // the last N lines' extreme, so no new line paints.
+  return { state: { lines, lineCount }, emitted }
+}
+
+function lineBreakChart(candles: Candle[], tfSec: number, cacheRef: { current: IncCache<LineBreakState> | null }): Candle[] {
+  if (candles.length < 10) return []
+  const window = candles.slice(-400) // wider input window than renko/PF since most candles get absorbed
+  void tfSec
+  const bars = scanIncremental(window, cacheRef, () => ({ lines: [], lineCount: 3 }), lineBreakStep)
+  return ascendingGuard(bars).slice(-300)
+}
+
+/** Kagi, rendered as pseudo-candles - mirrors the kernel engine of record
+ * (mini-services/trading-core/src/analytics/kagi.ts): a zig-zag line that
+ * only reverses once price moves `reversal` (ATR-adaptive, same convention
+ * renko/rangebars use) against the current extreme. SIMPLIFICATION, stated
+ * honestly: the kernel engine updates one growing line's price in place as
+ * it extends and flips its THICKNESS independently (shoulder/waist breaks)
+ * for the yin/yang distinction; scanIncremental()'s append-only emission
+ * model (same one renko/point-&-figure use - see its doc comment) can't
+ * update an already-emitted pseudo-candle in place, so each extending step
+ * instead appends its own short segment (open = prior extreme, close = new
+ * extreme) rather than growing one continuous line. The zig-zag SHAPE this
+ * produces is identical to the kernel engine's; only the thickness overlay
+ * is dropped - direction still reads straight off each pseudo-candle's
+ * up/down color. */
+interface KagiState {
+  dir: 1 | -1
+  extreme: number
+  shoulder: number | null
+  waist: number | null
+  thick: boolean
+  reversal: number
+}
+
+function kagiStep(state: KagiState, c: Candle): { state: KagiState; emitted: Candle[] } {
+  let { dir, extreme, shoulder, waist, thick, reversal } = state
+  const close = c.close
+  const emitted: Candle[] = []
+  if (shoulder !== null && close > shoulder) thick = true
+  if (waist !== null && close < waist) thick = false
+  if (dir === 1) {
+    if (close >= extreme) {
+      const open = extreme
+      extreme = close
+      emitted.push({ time: c.time, open, high: Math.max(open, extreme), low: Math.min(open, extreme), close: extreme, volume: 0 })
+    } else if (extreme - close >= reversal) {
+      shoulder = extreme
+      const open = extreme
+      dir = -1
+      extreme = close
+      emitted.push({ time: c.time, open, high: Math.max(open, extreme), low: Math.min(open, extreme), close: extreme, volume: 0 })
+    }
+  } else {
+    if (close <= extreme) {
+      const open = extreme
+      extreme = close
+      emitted.push({ time: c.time, open, high: Math.max(open, extreme), low: Math.min(open, extreme), close: extreme, volume: 0 })
+    } else if (close - extreme >= reversal) {
+      waist = extreme
+      const open = extreme
+      dir = 1
+      extreme = close
+      emitted.push({ time: c.time, open, high: Math.max(open, extreme), low: Math.min(open, extreme), close: extreme, volume: 0 })
+    }
+  }
+  return { state: { dir, extreme, shoulder, waist, thick, reversal }, emitted }
+}
+
+function kagiChart(candles: Candle[], tfSec: number, cacheRef: { current: IncCache<KagiState> | null }): Candle[] {
+  if (candles.length < 10) return []
+  const window = candles.slice(-200)
+  void tfSec
+  const bars = scanIncremental(
+    window,
+    cacheRef,
+    (w) => ({ dir: 1 as 1 | -1, extreme: w[0].close, shoulder: null, waist: null, thick: true, reversal: Math.max(atrOf(w), 1e-9) }),
+    kagiStep
+  )
+  return ascendingGuard(bars).slice(-300)
+}
+
 // ---------- Task 63 transforms (kernel-mirrored; engines of record live in
 // mini-services/trading-core/src/analytics/{rangebars,volumebars}.ts) ----------
 
@@ -572,11 +697,15 @@ export default function ChartPanel({
   const pfCacheRef = useRef<IncCache<PfState> | null>(null)
   const rangeCacheRef = useRef<IncCache<RangeState> | null>(null)
   const volCacheRef = useRef<IncCache<VolState> | null>(null)
+  const lineBreakCacheRef = useRef<IncCache<LineBreakState> | null>(null)
+  const kagiCacheRef = useRef<IncCache<KagiState> | null>(null)
   useEffect(() => {
     renkoCacheRef.current = null
     pfCacheRef.current = null
     rangeCacheRef.current = null
     volCacheRef.current = null
+    lineBreakCacheRef.current = null
+    kagiCacheRef.current = null
   }, [digitsTicker])
 
   // axis/crosshair/price-line precision follows the asset's quote convention
@@ -740,6 +869,8 @@ export default function ChartPanel({
     if (chartType === 'pointfigure') return pointFigureChart(candles, tfSec, pfCacheRef)
     if (chartType === 'rangebars') return rangeBarsChart(candles, tfSec, rangeCacheRef)
     if (chartType === 'volumebars') return volumeBarsChart(candles, volCacheRef)
+    if (chartType === 'linebreak') return lineBreakChart(candles, tfSec, lineBreakCacheRef)
+    if (chartType === 'kagi') return kagiChart(candles, tfSec, kagiCacheRef)
     if (chartType === 'tickchart') {
       // real /ticks bars when the fetch landed; else fall through to raw
       // candles (kernel always falls back server-side, so empty = not loaded)
@@ -788,7 +919,7 @@ export default function ChartPanel({
         upColor: 'transparent', downColor: DOWN, borderUpColor: UP, borderDownColor: DOWN, wickUpColor: UP, wickDownColor: DOWN,
         priceLineColor: '#38bdf8',
       })
-    } else if (chartType === 'heikin' || chartType === 'renko' || chartType === 'pointfigure' || chartType === 'rangebars' || chartType === 'volumebars' || chartType === 'tickchart') {
+    } else if (chartType === 'heikin' || chartType === 'renko' || chartType === 'pointfigure' || chartType === 'rangebars' || chartType === 'volumebars' || chartType === 'tickchart' || chartType === 'linebreak' || chartType === 'kagi') {
       price = chart.addSeries(CandlestickSeries, {
         upColor: UP, downColor: DOWN, borderUpColor: UP, borderDownColor: DOWN, wickUpColor: UP, wickDownColor: DOWN,
         priceLineColor: '#38bdf8',

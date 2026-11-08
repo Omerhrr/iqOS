@@ -53,6 +53,19 @@ export type ChartType =
   // chart canvas (kernel route /tick_footprint, same engine the Tick
   // Footprint dock tab renders, analytics/tickdesk.ts's computeTickFootprint)
   | 'tickfootprint'
+  // Footprint-completion sweep, item 1 ("frontend chart rendering for the
+  // 5 analytics-only chart types"): Line Break and Kagi render as
+  // pseudo-candles client-side, same INCREMENTAL-rebuild pattern as
+  // renko/pointfigure/rangebars/volumebars above (see ChartPanel.tsx's
+  // lineBreakChart()/kagiChart()) - mirroring
+  // mini-services/trading-core/src/analytics/{linebreak,kagi}.ts's own
+  // math, not re-deriving it. Volume Profile, Swing, and Delta Profile are
+  // NOT added here - each needs a genuinely different UI shape (a
+  // horizontal histogram panel for the first and third, point overlays on
+  // the existing candle series for the second) rather than a pseudo-candle
+  // series, and were deliberately left as their own follow-up rather than
+  // forced into this same pattern just to tick a box.
+  | 'linebreak' | 'kagi'
 export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'candles', label: 'Candles' },
   { id: 'hollow', label: 'Hollow' },
@@ -71,6 +84,8 @@ export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'tpo', label: 'TPO' },
   { id: 'tickchart', label: 'Tick' },
   { id: 'ivhv', label: 'IV·HV' },
+  { id: 'linebreak', label: 'Line Break' },
+  { id: 'kagi', label: 'Kagi' },
 ]
 
 // kernel route payloads for the Task 63 chart fetches (ChartPanel)

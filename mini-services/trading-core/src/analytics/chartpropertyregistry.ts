@@ -633,6 +633,120 @@ export const CHART_PROPERTY_REGISTRY: ChartPropertyDef[] = [
     missingDataBehavior: '\'none\' verdict with a cold tick buffer or no qualifying stack on either side',
     status: 'existing', mslAccessor: 'footStackedImbalance (bare source identifier)',
   },
+
+  // ---- Post-roadmap follow-up session: baseline.ts, tickbar.*, ivhv.*, and
+  // footprint's own VAH/VAL/diagonal-imbalance/absorption/unfinished-auction
+  // (closes claude/chart-engine-roadmap-progress.md's "still open" items) ----
+  {
+    id: 'baseline.deviation', label: 'Baseline value/deviation', description: 'The window\'s first close (the flat reference line itself) and current price\'s deviation/%deviation/above-below state against it.',
+    chartTypes: ['baseline'], engine: 'analytics/baseline.ts#computeBaseline',
+    dataType: 'number', unit: 'price', historyKind: 'live', updateFrequency: 'per-bar-close',
+    supportedTimeframes: 'all', supportedContexts: ALL_CONTEXTS, quality: 'measured',
+    missingDataBehavior: 'throws "needs at least 1 bar of history" on an empty window',
+    status: 'existing', mslAccessor: 'baseline.value() / baseline.deviation() / baseline.deviationPct() / baseline.above()',
+  },
+  {
+    id: 'baseline.cross', label: 'Baseline crossing + history', description: 'Signed crossing direction on the most recent bar (+1/-1/0), and the full per-bar deviation series.',
+    chartTypes: ['baseline'], engine: 'analytics/baseline.ts#computeBaseline',
+    dataType: 'series', unit: 'price', historyKind: 'historical', updateFrequency: 'per-bar-close',
+    supportedTimeframes: 'all', supportedContexts: ALL_CONTEXTS, quality: 'measured',
+    missingDataBehavior: '0 (no crossing) with fewer than 2 bars',
+    status: 'existing', mslAccessor: 'baseline.cross() / baseline.deviationSeries(n?)',
+  },
+  {
+    id: 'verdict.baseline', label: 'Baseline verdict', description: 'Direction = fresh crossing direction when just crossed this bar, else plain above/below; confidence scaled by |deviationPct|.',
+    chartTypes: ['baseline'], engine: 'plugins/metastrategy.ts#readSource(\'baseline\')',
+    dataType: 'direction', unit: 'none', historyKind: 'live', updateFrequency: 'per-poll',
+    supportedTimeframes: 'all', supportedContexts: ALL_CONTEXTS, quality: 'measured',
+    missingDataBehavior: '\'none\' verdict when price sits exactly on the baseline with no lean',
+    status: 'existing', mslAccessor: 'baseline (bare source identifier)',
+  },
+  {
+    id: 'tickbar.ohlc', label: 'Tick-bar OHLC/direction/duration', description: 'Real tick-count bars (default 10 ticks/bar) - full OHLC by offset, direction, and formation duration.',
+    chartTypes: ['tickchart'], engine: 'analytics/tickbars.ts#tickBars (via strategylang.ts#tickbarMethod)',
+    dataType: 'number', unit: 'price', historyKind: 'historical', updateFrequency: 'per-tick',
+    supportedTimeframes: 'all', supportedContexts: ALL_CONTEXTS, quality: 'measured',
+    qualityNote: 'REAL ticks (dataSource "tick") only inside the Omni Trader with a live tick feed; everywhere else honestly falls back to candle-close pseudo-ticks (dataSource "candle") - always check tickbar.dataSource() before presenting as real tick data.',
+    missingDataBehavior: 'empty series with no ticks/candles yet',
+    status: 'existing', mslAccessor: 'tickbar.bars(n?, per?) / tickbar.ohlc(offset, per?) / tickbar.direction(per?) / tickbar.duration(per?) / tickbar.dataSource()',
+  },
+  {
+    id: 'ivhv.realized', label: 'Realized/historical volatility', description: 'Rolling-stddev-of-log-returns historical volatility (annualized), its series, change over a lookback, and percentile rank; plus realized up-close probability.',
+    chartTypes: ['ivhv'], engine: 'analytics/ivhv.ts#hvSeries / #realizedUpProb (via strategylang.ts#ivhvMethod)',
+    dataType: 'number', unit: 'percentage', historyKind: 'historical', updateFrequency: 'per-bar-close',
+    supportedTimeframes: 'all', supportedContexts: ALL_CONTEXTS, quality: 'measured',
+    qualityNote: 'Candle-derived only - deliberately does NOT cover this file\'s IV/breakeven side (depends on MarketDataService\'s live payoutHistory, no backtest replay path; already covered by the payout source\'s own arithmetic).',
+    missingDataBehavior: '0 on an empty window',
+    status: 'existing', mslAccessor: 'ivhv.hvNow(window?) / ivhv.hvSeries(n?) / ivhv.realizedUpProb(window?) / ivhv.change(lookback?) / ivhv.percentile(lookback?)',
+  },
+  {
+    id: 'footprint.valueArea', label: 'Footprint\'s own VAH/VAL', description: 'Classic value-area algorithm run on real tick-row totals (not candle-overlap-estimated volume) - distinct from both tpo.vah/val (time-based) and vp.vah/val (candle-overlap-estimated).',
+    chartTypes: ['otcfootprint', 'tickfootprint'], engine: 'analytics/otcfootprint.ts#footprintValueArea (via strategylang.ts foot.vah()/foot.val())',
+    dataType: 'number', unit: 'price', historyKind: 'live', updateFrequency: 'per-tick',
+    supportedTimeframes: 'all', supportedContexts: ['omniTrader'], quality: 'measured',
+    missingDataBehavior: 'NaN on an empty/too-thin bucket',
+    status: 'existing', mslAccessor: 'foot.vah(windowSec?, pct?) / foot.val(windowSec?, pct?)',
+  },
+  {
+    id: 'footprint.diagonalImbalance', label: 'Diagonal imbalance', description: 'This level\'s buy-side prints vs the level BELOW\'s sell-side prints (the classic footprint "diagonal" read) - distinct from foot.imbalance()\'s same-level check.',
+    chartTypes: ['otcfootprint', 'tickfootprint'], engine: 'analytics/otcfootprint.ts#diagonalImbalance (via strategylang.ts foot.diagonalImbalance())',
+    dataType: 'boolean', unit: 'none', historyKind: 'live', updateFrequency: 'per-tick',
+    supportedTimeframes: 'all', supportedContexts: ['omniTrader'], quality: 'measured',
+    missingDataBehavior: 'false on an empty/too-thin bucket',
+    status: 'existing', mslAccessor: 'foot.diagonalImbalance(side, ratio, windowSec?)',
+  },
+  {
+    id: 'footprint.absorption', label: 'Absorption detection', description: 'Heavy print density packed into few price rows with closePos staying mid-range despite a real delta - the side whose aggression got absorbed, a documented explicit heuristic (no universal textbook formula exists).',
+    chartTypes: ['otcfootprint', 'tickfootprint'], engine: 'analytics/otcfootprint.ts#footprintAbsorption (via strategylang.ts foot.absorption() / verdict footAbsorption)',
+    dataType: 'string', unit: 'none', historyKind: 'live', updateFrequency: 'per-tick',
+    supportedTimeframes: 'all', supportedContexts: ['omniTrader'], quality: 'measured',
+    qualityNote: 'Explicit documented heuristic, not a textbook formula - see otcfootprint.ts#footprintAbsorption\'s own header comment.',
+    missingDataBehavior: '\'none\' on an empty/too-thin bucket or no qualifying read',
+    status: 'existing', mslAccessor: 'foot.absorption(windowSec?) / footAbsorption (bare source identifier)',
+  },
+  {
+    id: 'footprint.unfinishedAuction', label: 'Unfinished auction detection', description: 'The bucket\'s busiest price node (POC) sitting at its own high or low - the auction never rotated away from that edge.',
+    chartTypes: ['otcfootprint', 'tickfootprint'], engine: 'analytics/otcfootprint.ts#unfinishedAuction (via strategylang.ts foot.unfinishedAuction() / verdict footUnfinishedAuction)',
+    dataType: 'string', unit: 'none', historyKind: 'live', updateFrequency: 'per-tick',
+    supportedTimeframes: 'all', supportedContexts: ['omniTrader'], quality: 'measured',
+    missingDataBehavior: '\'none\' when the POC is not at either edge, or on an empty/too-thin bucket',
+    status: 'existing', mslAccessor: 'foot.unfinishedAuction(windowSec?) / footUnfinishedAuction (bare source identifier)',
+  },
+  {
+    id: 'footprint.deltaMetrics', label: 'Delta % and delta velocity', description: 'Signed delta as a percentage of total prints, and the rate of change of delta across consecutive buckets.',
+    chartTypes: ['otcfootprint', 'tickfootprint'], engine: 'analytics/otcfootprint.ts#FootprintBucket (via strategylang.ts foot.deltaPct() / foot.deltaVelocity())',
+    dataType: 'number', unit: 'percentage', historyKind: 'live', updateFrequency: 'per-tick',
+    supportedTimeframes: 'all', supportedContexts: ['omniTrader'], quality: 'measured',
+    missingDataBehavior: '0 on an empty/too-thin bucket or too-thin history',
+    status: 'existing', mslAccessor: 'foot.deltaPct(windowSec?) / foot.deltaVelocity(bucketSec?, buckets?)',
+  },
+
+  // ---- Delta Profile (post-roadmap follow-up session) - the 5th new chart
+  // type, deferred since Phase 6 ----
+  {
+    id: 'deltaprofile.nodes', label: 'Delta Profile positive/negative nodes', description: 'The strongest buy node (largest positive delta row) and strongest sell node (largest negative delta row) across the window, via the same CLV proxy footprint.ts uses.',
+    chartTypes: ['deltaprofile'], engine: 'analytics/deltaprofile.ts#computeDeltaProfile',
+    dataType: 'number', unit: 'price', historyKind: 'live', updateFrequency: 'per-bar-close',
+    supportedTimeframes: 'all', supportedContexts: ALL_CONTEXTS, quality: 'estimated',
+    missingDataBehavior: 'NaN on an empty window',
+    status: 'existing', mslAccessor: 'dp.positiveDeltaPoc() / dp.negativeDeltaPoc()',
+  },
+  {
+    id: 'deltaprofile.skew', label: 'Delta Profile net skew/totals', description: 'Total net delta and total volume across the window, and the net delta as a fraction of total volume (-1..1) - the profile\'s own bullish/bearish skew.',
+    chartTypes: ['deltaprofile'], engine: 'analytics/deltaprofile.ts#computeDeltaProfile',
+    dataType: 'number', unit: 'ratio', historyKind: 'live', updateFrequency: 'per-bar-close',
+    supportedTimeframes: 'all', supportedContexts: ALL_CONTEXTS, quality: 'estimated',
+    missingDataBehavior: '0 on an empty window',
+    status: 'existing', mslAccessor: 'dp.totalDelta() / dp.totalVolume() / dp.deltaSkew() / dp.deltaAt(price)',
+  },
+  {
+    id: 'verdict.deltaProfile', label: 'Delta Profile verdict', description: 'Direction from the window\'s own net deltaSkew; confidence scaled by |deltaSkew|.',
+    chartTypes: ['deltaprofile'], engine: 'plugins/metastrategy.ts#readSource(\'deltaProfile\')',
+    dataType: 'direction', unit: 'none', historyKind: 'live', updateFrequency: 'per-poll',
+    supportedTimeframes: 'all', supportedContexts: ['metaStrategyEval', 'metaStrategyTestScript'], quality: 'estimated',
+    missingDataBehavior: '\'none\' verdict when the window has no net delta lean',
+    status: 'existing', mslAccessor: 'deltaProfile (bare source identifier)',
+  },
 ]
 
 // ---------------------------------------------------------------------------

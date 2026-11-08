@@ -127,6 +127,17 @@ export type MetaConditionSource =
   | 'swing' // swing-structure (analytics/swing.ts) - direction from the confirmed hh-hl/lh-ll structure read (bullish/bearish structure respectively); 'none' structure reads as a 'none' verdict, never a guess
   | 'footDivergence' // the Metric-B divergence trap off the REAL tick buffer (foot.divergence() in strategylang.ts, FootprintBucket.divergence in otcfootprint.ts) - 'put-trap' reads PUT (heavy buy delta trapped at the window low), 'call-trap' reads CALL, 'none' reads none. Omni-trader-only data (needs a live tick buffer) - reads 'none' with an honest note everywhere else, same fail-closed contract foot.*/tick.* already have.
   | 'footStackedImbalance' // consecutive same-direction diagonal imbalance across several footprint buckets (foot.consecutiveImbalance() in strategylang.ts) - direction = whichever side (buy/sell) is currently stacking, checked both ways and whichever (if either) qualifies wins; 'none' if neither side has a qualifying stack right now. Same omni-trader-only, tick-buffer-required contract as 'footDivergence'.
+  // Post-roadmap follow-up session - closes §L's longest-standing flagged
+  // gap (footprint VAH/VAL, diagonal imbalance, absorption, unfinished
+  // auction - see claude/msl-capability-matrix.md). Both wrap new raw
+  // otcfootprint.ts functions (footprintAbsorption/unfinishedAuction),
+  // reachable directly in MSL via foot.absorption()/foot.unfinishedAuction()
+  // too - same "verdict never replaces the raw read" rule as every source
+  // above. Same omni-trader-only, tick-buffer-required fail-closed contract.
+  | 'footAbsorption' // heavy print density packed into few price rows with closePos staying mid-range despite a real directional delta (otcfootprint.ts#footprintAbsorption) - direction = the side WHOSE AGGRESSION GOT ABSORBED (a contrarian tell, stated as an explicit documented heuristic, not a textbook formula - see that function's own header comment); 'none' when no absorption read qualifies
+  | 'footUnfinishedAuction' // the bucket's busiest price node (POC) sitting AT its own high or low (otcfootprint.ts#unfinishedAuction) - direction reads toward the STUCK edge (POC at the high -> call, read as "still being bid up and unresolved"; POC at the low -> put, mirrored) with low confidence since this names an unresolved state, not a directional edge on its own; 'none' when the POC isn't at either edge
+  | 'deltaProfile' // Delta Profile (analytics/deltaprofile.ts) - the 5th new chart type, deferred since Phase 6, built in the post-roadmap follow-up session. Direction from the window's own deltaSkew (net buy-vs-sell delta as a fraction of total volume, CLV proxy, same "estimated not measured" disclosure as volumeProfile above); confidence scaled by |deltaSkew|
+  | 'nextExpiryBest' // VALUE-ONLY companion to 'nextExpiry' above (plugins/nextexpiry.ts) - same direction/confidence as the oracle's fused best pick, but its .value is WHICH expiry rung (in MINUTES - 1/2/3/5/15) was actually picked, not a probability like every nextExpiry* source's .value elsewhere. Closes a gap flagged since Phase 8: pred.best.expiry existed on the engine's own predict() result the whole time, it just never had its own MSL-reachable read - a script previously had no way to ask "which horizon is the oracle's pick FOR", only what that pick says
 
 export const META_CONDITION_SOURCES: readonly MetaConditionSource[] = [
   'oracle',
@@ -174,6 +185,10 @@ export const META_CONDITION_SOURCES: readonly MetaConditionSource[] = [
   'swing',
   'footDivergence',
   'footStackedImbalance',
+  'footAbsorption',
+  'footUnfinishedAuction',
+  'deltaProfile',
+  'nextExpiryBest',
 ]
 
 export type MetaDirection = 'call' | 'put' | 'none'
