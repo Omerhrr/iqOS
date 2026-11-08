@@ -222,6 +222,13 @@ import type { Candle } from '../types'
 import { renkoBricks, renkoAtr } from './renko'
 import { pointFigure } from './pointfigure'
 import { heikinAshiSeries } from './chartsignals'
+import { rangeBars } from './rangebars'
+import { volumeBars } from './volumebars'
+import { computeTpo } from './tpo'
+import { computeVolumeProfile } from './volumeprofile'
+import { lineBreak } from './linebreak'
+import { kagi } from './kagi'
+import { computeSwing } from './swing'
 
 export interface MslSourceRead {
   direction: 'call' | 'put' | 'none'
@@ -744,6 +751,10 @@ const FIELDS = new Set([
   'o', 'open', 'h', 'high', 'l', 'low', 'c', 'close', 'v', 'volume', 'body', 'range', 'upper_wick', 'lower_wick',
   // bundle sub-fields across every ind.* multi-series indicator
   'macd', 'signal', 'hist', 'upper', 'mid', 'lower', 'width', 'percentB', 'k', 'd', 'adx', 'plusDI', 'minusDI', 'line',
+  // bundle sub-fields on pf.column(offset) - top/bottom price boundary,
+  // unsigned box count (signed direction is already pf.boxes(n)'s own job,
+  // not duplicated here)
+  'top', 'bottom', 'boxes',
 ])
 // Core arithmetic funcs (avg/sum/min/max/count/abs) are no longer special-
 // cased at PARSE time - any identifier followed by "(" parses as a call
@@ -1242,6 +1253,38 @@ function ohlcAt(series: MslSeriesCtx | undefined, offset: number): MslBarValue {
   }
 }
 
+/** Builds the same MslBarValue shape ohlcAt() returns, from an arbitrary
+ * O/H/L/C/V - used by renko.ohlc()/ha.ohlc()/rangebars.ohlc()/
+ * volumebars.ohlc() to expose a synthetic bar's full OHLC through the
+ * IDENTICAL .o/.h/.l/.c/.v/.body/.range/.upper_wick/.lower_wick field
+ * contract a real ohlc(offset) bar already has - a script written against
+ * one works unmodified against the other. */
+function barValueFromOHLC(o: number, h: number, l: number, c: number, v = 0): MslBarValue {
+  return {
+    __mslBar: true,
+    o,
+    h,
+    l,
+    c,
+    v,
+    body: Math.abs(c - o),
+    range: h - l,
+    upperWick: h - Math.max(o, c),
+    lowerWick: Math.min(o, c) - l,
+  }
+}
+
+/** Shared offset-into-an-array resolver for the brick/column/HA/synthetic-
+ * bar `.ohlc(offset)` methods below - same convention as ohlc(offset)
+ * itself: -1 = the latest, out-of-range fails closed with a clear error
+ * naming how much history actually exists (never a silent wrap/clamp). */
+function offsetInto<T>(arr: T[], offset: number, label: string): T {
+  const n = arr.length
+  const i = n + Math.trunc(offset)
+  if (i < 0 || i >= n) throw new MslRuntimeError(`${label}(${offset}) out of range - only ${n} bar(s) of history available`)
+  return arr[i]
+}
+
 /** `cross(a, b)` - the function-call alias of `a.crossed(b)` (either
  * direction), for when neither side reads more naturally as the "owner" of
  * the method - at least one side must be a series (crossing needs history;
@@ -1548,8 +1591,79 @@ function footMethod(name: string, args: MslValue[], ticks: readonly { ts: number
       }
       return false
     }
+    case 'divergence': {
+      // foot.divergence(windowSec?) - buildFootprint() ALREADY computes this
+      // per bucket (FootprintBucket.divergence) and it was simply never
+      // surfaced to MSL before (see claude/msl-capability-matrix.md section
+      // L's "delta divergence" row) - the Metric-B divergence trap: heavy
+      // positive delta closing at the window's LOW ('put-trap' - the
+      // generator is capping a ceiling) or heavy negative delta closing at
+      // the HIGH ('call-trap' - flooring). Returns the string itself
+      // ('put-trap'|'call-trap'|'none'), never coerced to a boolean, so
+      // "which kind" is never lost.
+      const b = footSnapshot(ticks, nowMs, args.length ? asNum(args[0]) : defaultWindowSec)
+      return b ? b.divergence ?? 'none' : 'none'
+    }
+    case 'exhaustion': {
+      // foot.exhaustion(windowSec?) - same story: FootprintBucket.exhaustion
+      // (speed-ratio exhaustion - one side ticking >= ratioAt times faster
+      // while the OTHER side still has prints, a genuine one-sided thrust
+      // rather than a one-way gap with no opposing flow at all) already
+      // existed and was never exposed. Returns 'up'|'down'|'none'.
+      const b = footSnapshot(ticks, nowMs, args.length ? asNum(args[0]) : defaultWindowSec)
+      return b ? b.exhaustion ?? 'none' : 'none'
+    }
+    case 'cumulativeDelta': {
+      // foot.cumulativeDelta(bucketSec?, buckets?) - RAW running sum of
+      // per-bucket delta (velDelta) across the trailing `buckets` window,
+      // the raw sibling of the existing `ofcumdelta` indicator (which is
+      // candle-approximated AND z-scored - this is real-tick-derived and
+      // unscaled, matching the "RAW, not z-scored/thresholded" convention
+      // every other foot.*/tick.* primitive already follows). A bucket with
+      // too few prints contributes 0, not NaN, to the SUM (unlike the
+      // *Series siblings, which deliberately keep NaN gaps visible for
+      // .slope()/.mean() - a running total should not go NaN just because
+      // one thin bucket interrupted it).
+      const bucketSec = Math.max(5, Math.round(args.length > 0 ? asNum(args[0]) : defaultWindowSec))
+      const buckets = seriesBucketCount(args.length > 1 ? asNum(args[1]) : undefined, 10)
+      if (!ticks.length) return 0
+      const minutes = Math.max(1, Math.ceil((bucketSec * buckets) / 60))
+      const result = buildFootprint([...ticks], { bucketSec, minutes, nowMs })
+      const recent = result.buckets.slice(-buckets)
+      let sum = 0
+      for (const b of recent) if (b.nTicks >= 3) sum += b.velDelta
+      return sum
+    }
+    case 'consecutiveImbalance': {
+      // foot.consecutiveImbalance(side, ratio, n, bucketSec?) - the
+      // "stacked imbalance" read (roadmap section 5): true iff the last `n`
+      // CONSECUTIVE footprint buckets each show their own POC-row diagonal
+      // imbalance of at least `ratio`x in `side`'s direction - same
+      // per-bucket imbalance test foot.imbalance() already runs on a single
+      // window, generalized across several consecutive buckets so a script
+      // can tell "one lucky window" from "this side has been in control for
+      // N buckets running" without re-deriving the loop itself.
+      if (args.length < 3) throw new MslRuntimeError('foot.consecutiveImbalance(side, ratio, n, bucketSec?) takes at least 3 arguments')
+      const side = String(args[0])
+      if (side !== 'buy' && side !== 'sell') throw new MslRuntimeError(`foot.consecutiveImbalance(side, ...) - side must be "buy" or "sell" (got "${side}")`)
+      const ratio = asNum(args[1])
+      const n = Math.max(1, Math.round(asNum(args[2])))
+      const bucketSec = Math.max(5, Math.round(args.length > 3 ? asNum(args[3]) : defaultWindowSec))
+      if (!ticks.length) return false
+      const minutes = Math.max(1, Math.ceil((bucketSec * n) / 60))
+      const result = buildFootprint([...ticks], { bucketSec, minutes, nowMs })
+      const recent = result.buckets.slice(-n)
+      if (recent.length < n) return false
+      return recent.every((b) => {
+        if (b.nTicks < 3) return false
+        let pocRow: FootprintBucket['rows'][number] | undefined
+        for (const row of b.rows) if (!pocRow || row.total > pocRow.total) pocRow = row
+        if (!pocRow) return false
+        return side === 'buy' ? (pocRow.dn > 0 ? pocRow.up / pocRow.dn >= ratio : pocRow.up > 0) : pocRow.up > 0 ? pocRow.dn / pocRow.up >= ratio : pocRow.dn > 0
+      })
+    }
     default:
-      throw new MslRuntimeError(`unknown foot method "foot.${name}(...)" - use poc/pocTicks/stagnation/delta/speedRatio/imbalance/consecutiveDense, or pocSeries/pocTicksSeries/stagnationSeries/deltaSeries/speedRatioSeries for a historical series`)
+      throw new MslRuntimeError(`unknown foot method "foot.${name}(...)" - use poc/pocTicks/stagnation/delta/speedRatio/imbalance/consecutiveDense/divergence/exhaustion/cumulativeDelta/consecutiveImbalance, or pocSeries/pocTicksSeries/stagnationSeries/deltaSeries/speedRatioSeries for a historical series`)
   }
 }
 
@@ -1597,8 +1711,20 @@ function renkoMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | 
       return seriesValue(r.bricks.map((b) => b.dir).slice(-seriesLookback(args, 50)))
     case 'brickSize':
       return r.brickSize
+    case 'ohlc': {
+      // renko.ohlc(offset) - a brick's own full OHLC (renko.bricks(n) only
+      // ever gave signed DIRECTION; the brick's actual open/high/low/close
+      // was already computed by renkoBricks() and simply never exposed -
+      // see claude/msl-capability-matrix.md section H). Same -1=latest
+      // offset convention as ohlc(offset) itself. Volume has no meaning for
+      // a synthetic brick (it spans a variable number of source candles),
+      // so v is always 0 here - never fabricate a number for it.
+      if (!args.length) throw new MslRuntimeError('renko.ohlc(offset) needs an offset argument, e.g. renko.ohlc(-1)')
+      const b = offsetInto(r.bricks, asNum(args[0]), 'renko.ohlc')
+      return barValueFromOHLC(b.open, b.high, b.low, b.close, 0)
+    }
     default:
-      throw new MslRuntimeError(`unknown renko method "renko.${name}(...)" - use bricks(n?)/brickSize() (or renko.dir/.conf/.value for the plain verdict read)`)
+      throw new MslRuntimeError(`unknown renko method "renko.${name}(...)" - use bricks(n?)/brickSize()/ohlc(offset) (or renko.dir/.conf/.value for the plain verdict read)`)
   }
 }
 
@@ -1617,8 +1743,21 @@ function pfMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | und
       return seriesValue(r.columns.map((c) => (c.dir === 'X' ? c.boxes : -c.boxes)).slice(-seriesLookback(args, 50)))
     case 'boxSize':
       return r.boxSize
+    case 'column': {
+      // pf.column(offset) - a column's own top/bottom price boundary and
+      // unsigned box count (PFColumn{top,bottom,boxes} - computed by
+      // pointFigure() and, like renko's bricks, never exposed before). Dir
+      // is deliberately NOT a field here (it's a string 'X'|'O' in the
+      // underlying engine, which would be a confusing third "direction"
+      // representation alongside the call/put/none literals and
+      // pf.boxes(n)'s own +X/-O signed convention) - read pf.boxes(n)[-1]'s
+      // sign for the same information.
+      if (!args.length) throw new MslRuntimeError('pf.column(offset) needs an offset argument, e.g. pf.column(-1)')
+      const col = offsetInto(r.columns, asNum(args[0]), 'pf.column')
+      return bundleValue({ top: col.top, bottom: col.bottom, boxes: col.boxes })
+    }
     default:
-      throw new MslRuntimeError(`unknown pf method "pf.${name}(...)" - use boxes(n?)/boxSize() (or pointFigure.dir/.conf/.value for the plain verdict read)`)
+      throw new MslRuntimeError(`unknown pf method "pf.${name}(...)" - use boxes(n?)/boxSize()/column(offset) (or pointFigure.dir/.conf/.value for the plain verdict read)`)
   }
 }
 
@@ -1659,8 +1798,251 @@ function haMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | und
       const atr = renkoAtr(candles)
       return Number.isFinite(atr) && atr > 0 ? body / atr : 0
     }
+    case 'ohlc': {
+      // ha.ohlc(offset) - the HA candle's own full OHLC (ha.bars(n) only
+      // ever gave signed body direction - see claude/msl-capability-matrix.md
+      // section C, the single biggest named gap there). Volume is the
+      // UNDERLYING real candle's own volume at the same index (HA smoothing
+      // only touches O/H/L/C, never volume) - carried through honestly
+      // rather than fabricated as 0.
+      if (!args.length) throw new MslRuntimeError('ha.ohlc(offset) needs an offset argument, e.g. ha.ohlc(-1)')
+      const idx = candles.length + Math.trunc(asNum(args[0]))
+      if (idx < 0 || idx >= ha.length) throw new MslRuntimeError(`ha.ohlc(${asNum(args[0])}) out of range - only ${ha.length} bar(s) of history available`)
+      const bar = ha[idx]
+      const v = candles[idx]?.volume
+      return barValueFromOHLC(bar.open, bar.high, bar.low, bar.close, Number.isFinite(v) ? (v as number) : 0)
+    }
     default:
-      throw new MslRuntimeError(`unknown ha method "ha.${name}(...)" - use bars(n?)/streak()/flip()/bodyAtr() (or heikinAshi.dir/.conf for the plain verdict read)`)
+      throw new MslRuntimeError(`unknown ha method "ha.${name}(...)" - use bars(n?)/streak()/flip()/bodyAtr()/ohlc(offset) (or heikinAshi.dir/.conf for the plain verdict read)`)
+  }
+}
+
+/** `rangebars.*` - Range Bars had NO MSL namespace at all before this (see
+ * claude/msl-capability-matrix.md section J) - only the aggregate
+ * `rangeBars` verdict source existed. `rangebars.bars(n?)` is a series of
+ * the last n bars' signed direction (+1 = closed at open+range, -1 =
+ * open-range, same convention renko.bricks()/pf.boxes() already use).
+ * `rangebars.ohlc(offset)` is a bar's full OHLC (range bars are wickless by
+ * construction - high=max(open,close), low=min(open,close) - so this is
+ * honest, not an approximation). `rangebars.range()` is the current range
+ * threshold in price units. `rangebars.streak()` is the engine's own
+ * consecutive-same-direction count (RangeBarsResult.streak), not
+ * re-derived. Volume has no meaning for a range bar (wickless, time-
+ * independent span) - rangebars.ohlc()'s v is always 0, same honesty rule
+ * as renko.ohlc(). */
+function rangebarsMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const candles = seriesToCandles(requireSeries(ctx, tf))
+  const r = rangeBars(candles)
+  switch (name) {
+    case 'bars':
+      return seriesValue(r.bars.map((b) => b.dir).slice(-seriesLookback(args, 50)))
+    case 'ohlc': {
+      if (!args.length) throw new MslRuntimeError('rangebars.ohlc(offset) needs an offset argument, e.g. rangebars.ohlc(-1)')
+      const b = offsetInto(r.bars, asNum(args[0]), 'rangebars.ohlc')
+      return barValueFromOHLC(b.open, b.high, b.low, b.close, 0)
+    }
+    case 'range':
+      return r.range
+    case 'streak':
+      return r.streak
+    default:
+      throw new MslRuntimeError(`unknown rangebars method "rangebars.${name}(...)" - use bars(n?)/ohlc(offset)/range()/streak() (or rangeBars.dir/.conf/.value for the plain verdict read)`)
+  }
+}
+
+/** `volumebars.*` - Volume Bars also had NO MSL namespace at all before
+ * this (same gap as Range Bars). `volumebars.bars(n?)` is a series of the
+ * last n bars' signed direction - DERIVED here (close>=open -> +1, else
+ * -1), since VolumeBar itself carries no `dir` field yet; deriving it at
+ * the call site rather than editing volumebars.ts's shipped interface
+ * keeps this change additive-only. `volumebars.ohlc(offset)` is a bar's
+ * full OHLC WITH its real accumulated volume (unlike renko/range/pf, a
+ * volume bar's volume is exactly the thing that closed it, so v is always
+ * populated, honestly labeled via volumeSource below). `volumebars.
+ * threshold()` is the current volume-per-bar threshold. `volumebars.
+ * volumeSource()` surfaces the engine's own 'feed'|'none' honesty flag (a
+ * script can gate on real-volume-vs-none exactly like the route already
+ * does) - returned as the string itself, not coerced to a boolean, so a
+ * future third state doesn't silently collapse into one side. */
+function volumebarsMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const candles = seriesToCandles(requireSeries(ctx, tf))
+  const r = volumeBars(candles)
+  switch (name) {
+    case 'bars':
+      return seriesValue(r.bars.map((b) => (b.close >= b.open ? 1 : -1)).slice(-seriesLookback(args, 50)))
+    case 'ohlc': {
+      if (!args.length) throw new MslRuntimeError('volumebars.ohlc(offset) needs an offset argument, e.g. volumebars.ohlc(-1)')
+      const b = offsetInto(r.bars, asNum(args[0]), 'volumebars.ohlc')
+      return barValueFromOHLC(b.open, b.high, b.low, b.close, b.volume)
+    }
+    case 'threshold':
+      return r.per
+    case 'volumeSource':
+      return r.volumeSource
+    default:
+      throw new MslRuntimeError(`unknown volumebars method "volumebars.${name}(...)" - use bars(n?)/ohlc(offset)/threshold()/volumeSource() (or volumeBars.dir/.conf/.value for the plain verdict read)`)
+  }
+}
+
+/** `tpo.*` - TPO/Market Profile also had NO MSL namespace at all before
+ * this (same gap as Range/Volume Bars) - POC/VAH/VAL/Initial-Balance were
+ * all already computed server-side (computeTpo()) and only reachable
+ * through the aggregate `tpo` verdict source. Every accessor here is a
+ * plain scalar (TPO has no natural "series of n" shape the way bricks/
+ * boxes/HA bars do - a TPO profile is one value per PERIOD, and periods
+ * default to 30 minutes, not per-candle) - returns NaN when the engine
+ * itself returns null (empty window), never a misleading 0. Reminder (see
+ * claude/msl-capability-matrix.md section O): this POC is TIME-based (TPO
+ * letter counts), never confuse it with a VOLUME-based POC - that concept
+ * doesn't exist anywhere yet (Volume Profile is a separate, not-yet-built
+ * engine). */
+function tpoMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const candles = seriesToCandles(requireSeries(ctx, tf))
+  const r = computeTpo(candles)
+  const num = (v: number | null): number => (v === null ? NaN : v)
+  switch (name) {
+    case 'poc':
+      return num(r.poc)
+    case 'vah':
+      return num(r.valueAreaHigh)
+    case 'val':
+      return num(r.valueAreaLow)
+    case 'ibHigh':
+      return num(r.ibHigh)
+    case 'ibLow':
+      return num(r.ibLow)
+    default:
+      throw new MslRuntimeError(`unknown tpo method "tpo.${name}(...)" - use poc()/vah()/val()/ibHigh()/ibLow() (or tpo.dir/.conf/.value for the plain verdict read)`)
+  }
+}
+
+/** `vp.*` - Volume Profile (Phase 5 of the chart-engine expansion roadmap -
+ * a genuinely NEW engine, not an exposure of something that already
+ * existed server-side, unlike most of the Phase 2-4 additions above).
+ * vp.poc()/vah()/val() are VOLUME-based (analytics/volumeprofile.ts) -
+ * never confuse these with tpo.poc()/vah()/val() above, which are
+ * TIME-based. vp.hvn(n?)/vp.lvn(n?) return a SERIES of up to n High/Low
+ * Volume Node prices (chronological by PRICE, ascending - there is no
+ * natural time order for a price-level list, so "series" here just means
+ * "indexable list", [-1] = the highest-priced node, [0] = the lowest).
+ * Quality is 'estimated' (range-overlap volume-spread proxy, same as
+ * footprint.ts) - never 'measured'. */
+function vpMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const candles = seriesToCandles(requireSeries(ctx, tf))
+  const r = computeVolumeProfile(candles)
+  const num = (v: number | null): number => (v === null ? NaN : v)
+  switch (name) {
+    case 'poc':
+      return num(r.poc)
+    case 'vah':
+      return num(r.valueAreaHigh)
+    case 'val':
+      return num(r.valueAreaLow)
+    case 'totalVolume':
+      return r.totalVolume
+    case 'hvn':
+      return seriesValue(r.hvn.slice(-seriesLookback(args, 10)))
+    case 'lvn':
+      return seriesValue(r.lvn.slice(-seriesLookback(args, 10)))
+    default:
+      throw new MslRuntimeError(`unknown vp method "vp.${name}(...)" - use poc()/vah()/val()/totalVolume()/hvn(n?)/lvn(n?)`)
+  }
+}
+
+/** `linebreak.*` - Three-Line-Break (Phase 6). linebreak.bars(n?) is a
+ * SERIES of the last n lines' signed direction, same chronological/[-1]
+ * convention as renko.bricks()/rangebars.bars(). linebreak.ohlc(offset) is
+ * a line's own open/close (CLOSE-based engine - see linebreak.ts's header -
+ * so high=max(open,close)/low=min(open,close)/v=0, same honesty convention
+ * as renko.ohlc()/rangebars.ohlc()). linebreak.lineCount() is the
+ * configured N (3 by default - "three-line break"). linebreak.streak() is
+ * the engine's own consecutive-same-direction line count. */
+function linebreakMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const candles = seriesToCandles(requireSeries(ctx, tf))
+  const r = lineBreak(candles)
+  switch (name) {
+    case 'bars':
+      return seriesValue(r.bars.map((b) => b.dir).slice(-seriesLookback(args, 50)))
+    case 'ohlc': {
+      if (!args.length) throw new MslRuntimeError('linebreak.ohlc(offset) needs an offset argument, e.g. linebreak.ohlc(-1)')
+      const b = offsetInto(r.bars, asNum(args[0]), 'linebreak.ohlc')
+      return barValueFromOHLC(b.open, Math.max(b.open, b.close), Math.min(b.open, b.close), b.close, 0)
+    }
+    case 'lineCount':
+      return r.lineCount
+    case 'streak':
+      return r.streak
+    default:
+      throw new MslRuntimeError(`unknown linebreak method "linebreak.${name}(...)" - use bars(n?)/ohlc(offset)/lineCount()/streak()`)
+  }
+}
+
+/** `kagi.*` - Kagi (Phase 6). kagi.direction() is the current trend's
+ * signed direction. kagi.thick() is the CURRENT line segment's thickness
+ * (true = thick/yang, false = thin/yin - see kagi.ts's header for the exact
+ * shoulder/waist-break rule). kagi.reversal() is the current ATR-derived
+ * reversal amount in price units. kagi.shoulder()/kagi.waist() are the most
+ * recent shoulder/waist price levels (NaN until the first down/up
+ * reversal has occurred, never a misleading 0). */
+function kagiMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const candles = seriesToCandles(requireSeries(ctx, tf))
+  const r = kagi(candles)
+  const num = (v: number | null): number => (v === null ? NaN : v)
+  switch (name) {
+    case 'direction':
+      return r.direction
+    case 'thick':
+      return r.thick
+    case 'reversal':
+      return r.reversal
+    case 'shoulder':
+      return num(r.shoulder)
+    case 'waist':
+      return num(r.waist)
+    default:
+      throw new MslRuntimeError(`unknown kagi method "kagi.${name}(...)" - use direction()/thick()/reversal()/shoulder()/waist()`)
+  }
+}
+
+/** `swing.*` - swing-structure (Phase 6). swing.structure() is
+ * 'hh-hl'|'lh-ll'|'none' (see swing.ts's header - compares only the last TWO
+ * confirmed highs and lows, 'none' is the honest "no clean structure yet"
+ * read, not a forced guess). swing.direction() is the signed direction of
+ * the most recent confirmed leg. swing.high(offset)/swing.low(offset) index
+ * into the confirmed swing-high/swing-low price list (same -1=latest
+ * convention as everywhere else), fails closed on an out-of-range offset -
+ * remember a swing needs `lookback` bars AFTER it to confirm, so the most
+ * recent bars never have one yet (not a bug). swing.length() is the bar
+ * distance between the last two confirmed swings of EITHER kind (their
+ * `index` difference) - a duration, not a price. */
+function swingMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const candles = seriesToCandles(requireSeries(ctx, tf))
+  const r = computeSwing(candles)
+  const highs = r.swings.filter((s) => s.kind === 'high')
+  const lows = r.swings.filter((s) => s.kind === 'low')
+  switch (name) {
+    case 'structure':
+      return r.structure
+    case 'direction':
+      return r.direction
+    case 'high': {
+      if (!args.length) throw new MslRuntimeError('swing.high(offset) needs an offset argument, e.g. swing.high(-1)')
+      if (!highs.length) throw new MslRuntimeError('swing.high(offset) - no confirmed swing highs yet (too little history, or none met the lookback window)')
+      return offsetInto(highs, asNum(args[0]), 'swing.high').price
+    }
+    case 'low': {
+      if (!args.length) throw new MslRuntimeError('swing.low(offset) needs an offset argument, e.g. swing.low(-1)')
+      if (!lows.length) throw new MslRuntimeError('swing.low(offset) - no confirmed swing lows yet (too little history, or none met the lookback window)')
+      return offsetInto(lows, asNum(args[0]), 'swing.low').price
+    }
+    case 'length': {
+      if (r.swings.length < 2) return 0
+      const a = r.swings[r.swings.length - 2]
+      const b = r.swings[r.swings.length - 1]
+      return Math.abs(b.index - a.index)
+    }
+    default:
+      throw new MslRuntimeError(`unknown swing method "swing.${name}(...)" - use structure()/direction()/high(offset)/low(offset)/length()`)
   }
 }
 
@@ -1816,6 +2198,56 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
         return haMethod(e.name, args, ctx, tf)
+      }
+      // `rangebars.*`/`volumebars.*`/`tpo.*` - same namespace-marker pattern
+      // as renko/pf/ha above. 'rangeBars'/'volumeBars'/'tpo' are ALSO real
+      // reads-map identifiers (the plain verdict reads, e.g. `tpo.dir`) but
+      // that's the DIFFERENT 'field' AST node (no parens) - this only
+      // intercepts the METHOD-call form, exactly the same non-collision as
+      // renko.dir vs renko.bricks(...) above. Note the lowercase namespace
+      // names here (rangebars/volumebars) vs the camelCase verdict-read
+      // identifiers (rangeBars/volumeBars) - deliberately distinct spellings
+      // so a script can never typo one into silently meaning the other.
+      if (e.obj.t === 'ident' && e.obj.name === 'rangebars' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return rangebarsMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'volumebars' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return volumebarsMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'tpo' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return tpoMethod(e.name, args, ctx, tf)
+      }
+      // `vp.*`/`linebreak.*`/`kagi.*`/`swing.*` - Phase 5/6 namespaces, same
+      // namespace-marker pattern as everything above. None of these four
+      // collide with an existing verdict-read identifier ('vp'/'linebreak'/
+      // 'kagi'/'swing' are brand new names, unlike renko/pf/ha/tpo/
+      // rangebars/volumebars which already existed as field-access verdict
+      // reads before gaining a method-call namespace).
+      if (e.obj.t === 'ident' && e.obj.name === 'vp' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return vpMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'linebreak' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return linebreakMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'kagi' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return kagiMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'swing' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return swingMethod(e.name, args, ctx, tf)
       }
       const obj = evalExpr(e.obj, env, ctx)
       const args = e.args.map((a) => evalExpr(a, env, ctx))

@@ -38,6 +38,10 @@ import { rangeBars } from '../analytics/rangebars'
 import { pointFigure } from '../analytics/pointfigure'
 import { volumeBars } from '../analytics/volumebars'
 import { computeTpo } from '../analytics/tpo'
+import { computeVolumeProfile } from '../analytics/volumeprofile'
+import { lineBreak } from '../analytics/linebreak'
+import { kagi } from '../analytics/kagi'
+import { computeSwing } from '../analytics/swing'
 import { realizedUpProb } from '../analytics/ivhv'
 import { EXPIRIES_MIN } from '../analytics/nextexpiry'
 import { TECH_LADDER } from '../analytics/technicals'
@@ -935,6 +939,117 @@ export class MetaStrategyService {
           const confidence = Math.min(80, Math.round(30 + row.echo.rhyme * 0.5))
           return { source, direction: row.dir === 'up' ? 'call' : 'put', confidence, value: row.echo.rhyme, label: `Yesterday echo ${row.dir.toUpperCase()} - rhyme ${row.echo.rhyme.toFixed(0)}/100, same-hour move ${row.movePct >= 0 ? '+' : ''}${row.movePct.toFixed(3)}% (weak prior, not a signal)` }
         }
+        case 'volumeProfile': {
+          // VOLUME-based POC-distance reduction - the exact same shape as
+          // 'tpo' above, mirrored onto analytics/volumeprofile.ts's
+          // range-overlap-proxy volume POC/value-area instead of TPO's
+          // time-based ones. Never confuse the two (see volumeprofile.ts's
+          // own module header) - this case exists precisely so a script can
+          // trade "price vs volume-weighted fair value" as a DISTINCT read
+          // from "price vs time-weighted fair value".
+          const candles = this.market.getCandlesDeep(asset, tf, 300, true)
+          const vp = computeVolumeProfile(candles, {
+            ...(cfgNum(cfg, 'vp.binCount') !== undefined ? { binCount: cfgNum(cfg, 'vp.binCount') } : {}),
+          })
+          if (vp.poc === null) return none('Volume Profile: no profile built yet (window too thin)')
+          const lastClose = candles[candles.length - 1].close
+          const delta = lastClose - vp.poc
+          if (delta === 0) return none('Volume Profile: close sitting right on POC, no lean')
+          const vaWidth = vp.valueAreaHigh !== null && vp.valueAreaLow !== null ? Math.max(vp.valueAreaHigh - vp.valueAreaLow, 1e-9) : NaN
+          const ratio = Number.isFinite(vaWidth) ? Math.min(2, Math.abs(delta) / vaWidth) : 0
+          const direction = delta > 0 ? 'call' : 'put'
+          const confidence = Math.min(100, 45 + Math.round(ratio * 35))
+          return { source, direction, confidence, value: Number.isFinite(vaWidth) ? delta / vaWidth : undefined, label: `Volume Profile close ${direction.toUpperCase()} of POC (poc ${vp.poc.toFixed(5)}, close ${lastClose.toFixed(5)}, vol ${vp.method})` }
+        }
+        case 'lineBreak': {
+          // direction = the current line's own direction; confidence scaled
+          // by the consecutive-same-direction streak, same 40+n*12-capped
+          // shape renko/range/P&F/volumeBars above already use.
+          const candles = this.market.getCandlesDeep(asset, tf, 300, true)
+          const lb = lineBreak(candles, {
+            ...(cfgNum(cfg, 'linebreak.lines') !== undefined ? { lines: cfgNum(cfg, 'linebreak.lines') } : {}),
+          })
+          if (lb.direction === 0 || lb.bars.length < 2) return none('Line Break: no lines painted yet')
+          const direction = lb.direction === 1 ? 'call' : 'put'
+          const confidence = Math.min(100, 40 + lb.streak * 12)
+          return { source, direction, confidence, value: lb.direction === 1 ? lb.streak : -lb.streak, label: `Line Break ${lb.streak} ${direction.toUpperCase()} line(s) (of ${lb.lineCount})` }
+        }
+        case 'kagi': {
+          // direction = the current trend direction; confidence boosted
+          // when the line is currently thick (yang - price has broken its
+          // last shoulder) vs thin (yin) - thickness is Kagi's own
+          // conviction signal, independent of the last reversal itself.
+          const candles = this.market.getCandlesDeep(asset, tf, 300, true)
+          const kg = kagi(candles, {
+            ...(cfgNum(cfg, 'kagi.reversal') !== undefined ? { reversal: cfgNum(cfg, 'kagi.reversal') } : {}),
+            ...(cfgNum(cfg, 'kagi.atrPeriod') !== undefined ? { atrPeriod: cfgNum(cfg, 'kagi.atrPeriod') } : {}),
+            ...(cfgNum(cfg, 'kagi.reversalAtrMult') !== undefined ? { reversalAtrMult: cfgNum(cfg, 'kagi.reversalAtrMult') } : {}),
+          })
+          if (kg.direction === 0 || !kg.lines.length) return none('Kagi: no lines painted yet')
+          const direction = kg.direction === 1 ? 'call' : 'put'
+          const confidence = kg.thick ? 70 : 45
+          return { source, direction, confidence, label: `Kagi ${direction.toUpperCase()} - line is ${kg.thick ? 'thick (yang)' : 'thin (yin)'} (reversal ${kg.reversal.toFixed(5)})` }
+        }
+        case 'swing': {
+          // direction from the confirmed hh-hl/lh-ll structure read only -
+          // 'none' structure (including a high/low moving in different
+          // directions) reads as a 'none' verdict, never a forced guess,
+          // same honest-no-read contract swing.ts's own structure() field
+          // documents.
+          const candles = this.market.getCandlesDeep(asset, tf, 300, true)
+          const sw = computeSwing(candles, {
+            ...(cfgNum(cfg, 'swing.lookback') !== undefined ? { lookback: cfgNum(cfg, 'swing.lookback') } : {}),
+          })
+          if (sw.structure === 'none') return none(`Swing: no clean hh-hl/lh-ll structure yet (${sw.swings.length} confirmed swing(s))`)
+          const direction = sw.structure === 'hh-hl' ? 'call' : 'put'
+          const confidence = 60
+          return { source, direction, confidence, label: `Swing structure ${sw.structure.toUpperCase()} (${sw.swings.length} confirmed swing(s), lookback ${sw.lookback})` }
+        }
+        case 'footDivergence': {
+          // The Metric-B divergence trap off the REAL tick buffer - same
+          // sync-off-existing-buffer rule 'otcFootprint' above follows (never
+          // triggers a fresh live pull itself). 'put-trap' = heavy buy delta
+          // trapped at the window low -> reads PUT; 'call-trap' -> CALL.
+          const ofpD = this.ctx.use<OtcFootprintService>('otcFootprint')
+          const ticksD = ofpD.ticksFor(asset)
+          if (!ticksD.length) return none('Footprint divergence: tick buffer cold')
+          const fpD = buildFootprint(ticksD, { minutes: 30, bucketSec: 60, asset, dataSourceLabel: this.market.mode === 'live' ? 'sidecar-tick-100ms' : 'sim-tick-1s' })
+          const div = [...fpD.buckets].reverse().find((b) => b.divergence)
+          if (!div || !div.divergence) return none('Footprint divergence: no divergence trap in the recent buckets')
+          const direction = div.divergence === 'put-trap' ? 'put' : 'call'
+          return { source, direction, confidence: 65, value: div.velDelta, label: `Footprint divergence ${direction.toUpperCase()} trap - ${div.divergence} (vel delta ${div.velDelta >= 0 ? '+' : ''}${div.velDelta})` }
+        }
+        case 'footStackedImbalance': {
+          // Consecutive same-direction diagonal imbalance across several
+          // footprint buckets - checks BOTH sides and returns whichever (if
+          // either) currently qualifies; 'none' if neither side has a
+          // qualifying stack right now. Same tick-buffer-required,
+          // never-block-a-sync-read contract as 'footDivergence' above.
+          const ofpS = this.ctx.use<OtcFootprintService>('otcFootprint')
+          const ticksS = ofpS.ticksFor(asset)
+          if (!ticksS.length) return none('Stacked imbalance: tick buffer cold')
+          const n = Math.max(1, Math.round(cfgNum(cfg, 'footstack.n') ?? 3))
+          const ratio = cfgNum(cfg, 'footstack.ratio') ?? 1.5
+          const bucketSec = Math.max(5, Math.round(cfgNum(cfg, 'footstack.bucketSec') ?? 60))
+          const minutes = Math.max(1, Math.ceil((bucketSec * n) / 60))
+          const fpS = buildFootprint(ticksS, { bucketSec, minutes, asset, dataSourceLabel: this.market.mode === 'live' ? 'sidecar-tick-100ms' : 'sim-tick-1s' })
+          const recent = fpS.buckets.slice(-n)
+          const qualifies = (side: 'buy' | 'sell'): boolean => {
+            if (recent.length < n) return false
+            return recent.every((b) => {
+              if (b.nTicks < 3) return false
+              let pocRow: (typeof b.rows)[number] | undefined
+              for (const row of b.rows) if (!pocRow || row.total > pocRow.total) pocRow = row
+              if (!pocRow) return false
+              return side === 'buy' ? (pocRow.dn > 0 ? pocRow.up / pocRow.dn >= ratio : pocRow.up > 0) : pocRow.up > 0 ? pocRow.dn / pocRow.up >= ratio : pocRow.dn > 0
+            })
+          }
+          const buyStacked = qualifies('buy')
+          const sellStacked = qualifies('sell')
+          if (!buyStacked && !sellStacked) return none(`Stacked imbalance: no ${n}-bucket diagonal stack on either side right now`)
+          const direction = buyStacked ? 'call' : 'put'
+          return { source, direction, confidence: 60, label: `Stacked imbalance ${direction.toUpperCase()} - ${n} consecutive bucket(s) at >=${ratio}x diagonal imbalance` }
+        }
       }
     } catch {
       return none(`${source}: not available (plugin not loaded or thin history)`)
@@ -998,6 +1113,12 @@ export class MetaStrategyService {
       chartSignals: toMsl(this.readSource('chartSignals', asset, tf)),
       leadLag: toMsl(this.readSource('leadLag', asset, tf)),
       yesterday: toMsl(this.readSource('yesterday', asset, tf)),
+      volumeProfile: toMsl(this.readSource('volumeProfile', asset, tf, undefined, undefined, undefined, cfg)),
+      lineBreak: toMsl(this.readSource('lineBreak', asset, tf, undefined, undefined, undefined, cfg)),
+      kagi: toMsl(this.readSource('kagi', asset, tf, undefined, undefined, undefined, cfg)),
+      swing: toMsl(this.readSource('swing', asset, tf, undefined, undefined, undefined, cfg)),
+      footDivergence: toMsl(this.readSource('footDivergence', asset, tf)),
+      footStackedImbalance: toMsl(this.readSource('footStackedImbalance', asset, tf, undefined, undefined, undefined, cfg)),
     }
     // Tick-desk reads for scripts: bare keys = each engine's own default read
     // (SMC 15s, oracle best bucket, technical best-rated bucket, footprint
@@ -1042,6 +1163,25 @@ export class MetaStrategyService {
     } catch {
       reads.nextExpiry = { direction: 'none', confidence: 0 }
       for (const E of EXPIRIES_MIN) reads[`nextExpiry:${E}`] = { direction: 'none', confidence: 0 }
+    }
+    // Phase 8 of the chart-engine expansion roadmap (binary-options-specific
+    // intelligence): the account's REAL current binary payout fraction
+    // (0-1) for this asset, as a plain VALUE-only read (no direction - a
+    // payout rate has no up/down lean of its own, so it is deliberately
+    // NOT forced into a call/put verdict, same honest-no-guess rule
+    // 'baseline'/IV-ratio/etc already follow for non-directional data).
+    // This is the first place MSL can see payout at all - every expected-
+    // value/breakeven calc a script wants (breakeven win-rate needed =
+    // 1/(1+payout), EV per $1 staked = winProb*payout - (1-winProb)) is
+    // now directly expressible from `payout.value` with plain arithmetic,
+    // no new primitive needed for the derived math itself. 0 (not a
+    // misleading default like 0.8) when the account reports no payout for
+    // this instrument (e.g. a CFD-only asset with no binary/turbo option).
+    try {
+      const payoutRate = this.market.payoutFor(asset, 'binary')
+      reads.payout = { direction: 'none', confidence: 0, value: Number.isFinite(payoutRate) && payoutRate > 0 ? payoutRate : 0 }
+    } catch {
+      reads.payout = { direction: 'none', confidence: 0, value: 0 }
     }
     try {
       const smc = this.ctx.use<SmcScanService>('smcScan')

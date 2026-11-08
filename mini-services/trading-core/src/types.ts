@@ -156,7 +156,12 @@ export interface AccountState {
 
 // ---------- Analytics ----------
 
-export type ChartType = 'candles' | 'hollow' | 'heikin' | 'bars' | 'line' | 'area' | 'baseline' | 'renko' | 'pointfigure' | 'rangebars' | 'volumebars' | 'footprint' | 'tpo' | 'tickchart' | 'ivhv'
+// otcfootprint/tickfootprint added to match the frontend's ChartType
+// (src/lib/os/client.ts) - this backend copy had drifted behind it; the
+// Unified Chart & Property Registry (analytics/chartpropertyregistry.ts)
+// needs both lists to agree so every chart type is addressable from one
+// shared type instead of two near-duplicate unions.
+export type ChartType = 'candles' | 'hollow' | 'heikin' | 'bars' | 'line' | 'area' | 'baseline' | 'renko' | 'pointfigure' | 'rangebars' | 'volumebars' | 'footprint' | 'otcfootprint' | 'tickfootprint' | 'tpo' | 'tickchart' | 'ivhv' | 'volumeprofile' | 'linebreak' | 'kagi' | 'swing'
 
 export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'candles', label: 'Candles' },
@@ -171,9 +176,15 @@ export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'rangebars', label: 'Range' },
   { id: 'volumebars', label: 'Vol Bars' },
   { id: 'footprint', label: 'Footprint' },
+  { id: 'otcfootprint', label: 'OTC Footprint' },
+  { id: 'tickfootprint', label: 'Tick FP' },
   { id: 'tpo', label: 'TPO' },
   { id: 'tickchart', label: 'Tick' },
   { id: 'ivhv', label: 'IV·HV' },
+  { id: 'volumeprofile', label: 'Volume Profile' },
+  { id: 'linebreak', label: 'Line Break' },
+  { id: 'kagi', label: 'Kagi' },
+  { id: 'swing', label: 'Swing' },
 ]
 
 export type Direction = 'call' | 'put' | 'none'

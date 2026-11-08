@@ -114,6 +114,19 @@ export type MetaConditionSource =
   // ICT-originated ones. 'smc' below is renamed in spirit, not in code -
   // it still means "the generic half" when read next to this one.
   | 'ict' // ICT-specific concepts only (FVG, IFVG, Order Block, Breaker Block, Liquidity Sweep, OTE, KRM, CRT, Power of 3, Silver Bullet) off the SAME scanSmc() scan 'smc'/'smcNow' already read - see analytics/chartindicators.ts's ICT_KINDS split for the exact list and the reasoning
+  // Phase 5/6/7 of the chart-engine expansion roadmap (see
+  // claude/chart-engine-roadmap-progress.md) - new engines/raw primitives
+  // from those phases, each now wrapped in a verdict exactly like every
+  // source above, per the roadmap's own rule that a verdict NEVER replaces
+  // the raw read (vp.*/linebreak.*/kagi.*/swing.*/foot.divergence()/
+  // foot.consecutiveImbalance() all stay independently callable in MSL -
+  // these are an ADDITIONAL, convenience way in, not the only way).
+  | 'volumeProfile' // Volume Profile (analytics/volumeprofile.ts) - direction from last close vs the VOLUME-based POC (never confuse with 'tpo' above, which is TIME-based), confidence scaled by distance relative to the value area's width - same reduction shape 'tpo' already uses, mirrored onto volume instead of time
+  | 'lineBreak' // Three-Line-Break (analytics/linebreak.ts) - direction = the current line's own direction, confidence scaled by the consecutive-same-direction streak
+  | 'kagi' // Kagi (analytics/kagi.ts) - direction = the current trend direction, confidence boosted when the line is currently thick (yang - price has broken its last shoulder) vs thin
+  | 'swing' // swing-structure (analytics/swing.ts) - direction from the confirmed hh-hl/lh-ll structure read (bullish/bearish structure respectively); 'none' structure reads as a 'none' verdict, never a guess
+  | 'footDivergence' // the Metric-B divergence trap off the REAL tick buffer (foot.divergence() in strategylang.ts, FootprintBucket.divergence in otcfootprint.ts) - 'put-trap' reads PUT (heavy buy delta trapped at the window low), 'call-trap' reads CALL, 'none' reads none. Omni-trader-only data (needs a live tick buffer) - reads 'none' with an honest note everywhere else, same fail-closed contract foot.*/tick.* already have.
+  | 'footStackedImbalance' // consecutive same-direction diagonal imbalance across several footprint buckets (foot.consecutiveImbalance() in strategylang.ts) - direction = whichever side (buy/sell) is currently stacking, checked both ways and whichever (if either) qualifies wins; 'none' if neither side has a qualifying stack right now. Same omni-trader-only, tick-buffer-required contract as 'footDivergence'.
 
 export const META_CONDITION_SOURCES: readonly MetaConditionSource[] = [
   'oracle',
@@ -155,6 +168,12 @@ export const META_CONDITION_SOURCES: readonly MetaConditionSource[] = [
   'yesterday',
   'otcFootprint',
   'ict',
+  'volumeProfile',
+  'lineBreak',
+  'kagi',
+  'swing',
+  'footDivergence',
+  'footStackedImbalance',
 ]
 
 export type MetaDirection = 'call' | 'put' | 'none'
