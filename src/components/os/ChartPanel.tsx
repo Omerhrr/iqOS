@@ -572,6 +572,180 @@ function footprintClusters(candles: Candle[], bins = 8, imbRatio = 3): FootClust
   })
 }
 
+// ---------- Meta-Trader-bug-fix sweep: Volume Profile / Delta Profile
+// custom-canvas histogram panels, Swing point-overlay ----------
+// Volume Profile and Delta Profile are a HORIZONTAL HISTOGRAM over the
+// visible price range, not a time series - they render on the same opaque
+// canvas-overlay mechanism as footprint/tpo/otcfootprint/tickfootprint
+// above, not as a pseudo-candle series. The math below is a client-side
+// mirror of mini-services/trading-core/src/analytics/{volumeprofile,
+// deltaprofile}.ts's own range-overlap volume-spreading (+ CLV buy/sell
+// split for delta) - same honesty convention: `quality: 'estimated'`,
+// never "measured bid/ask volume," labeled "(approx)" everywhere it's drawn.
+
+interface VpRow { priceLow: number; priceHigh: number; mid: number; volume: number }
+interface VpResult { rows: VpRow[]; totalVolume: number; poc: number | null; vah: number | null; val: number | null }
+
+function volumeProfileBins(candles: Candle[], binCount = 36): VpResult {
+  const empty: VpResult = { rows: [], totalVolume: 0, poc: null, vah: null, val: null }
+  if (!candles.length) return empty
+  let lo = Infinity
+  let hi = -Infinity
+  for (const c of candles) {
+    lo = Math.min(lo, c.low)
+    hi = Math.max(hi, c.high)
+  }
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return empty
+  const binSize = (hi - lo) / binCount
+  const volumes = new Array(binCount).fill(0)
+  let totalVolume = 0
+  for (const c of candles) {
+    const vol = Number.isFinite(c.volume) ? c.volume : 0
+    if (vol <= 0) continue
+    const span = Math.max(c.high, c.low) - Math.min(c.high, c.low)
+    if (span <= 0) {
+      const idx = Math.min(binCount - 1, Math.max(0, Math.floor((c.close - lo) / binSize)))
+      volumes[idx] += vol
+      totalVolume += vol
+      continue
+    }
+    const firstBin = Math.max(0, Math.floor((c.low - lo) / binSize))
+    const lastBin = Math.min(binCount - 1, Math.floor((c.high - lo) / binSize))
+    for (let b = firstBin; b <= lastBin; b++) {
+      const binLo = lo + b * binSize
+      const binHi = binLo + binSize
+      const overlap = Math.min(binHi, c.high) - Math.max(binLo, c.low)
+      if (overlap <= 0) continue
+      const share = vol * (overlap / span)
+      volumes[b] += share
+      totalVolume += share
+    }
+  }
+  const rows: VpRow[] = volumes.map((volume, b) => {
+    const priceLow = lo + b * binSize
+    const priceHigh = priceLow + binSize
+    return { priceLow, priceHigh, mid: (priceLow + priceHigh) / 2, volume }
+  })
+  if (totalVolume <= 0) return { ...empty, rows }
+  let pocIdx = 0
+  for (let i = 1; i < rows.length; i++) if (rows[i].volume > rows[pocIdx].volume) pocIdx = i
+  let loIdx = pocIdx
+  let hiIdx = pocIdx
+  let acc = rows[pocIdx].volume
+  const target = totalVolume * 0.7
+  while (acc < target && (loIdx > 0 || hiIdx < rows.length - 1)) {
+    const belowVol = loIdx > 0 ? rows[loIdx - 1].volume : -1
+    const aboveVol = hiIdx < rows.length - 1 ? rows[hiIdx + 1].volume : -1
+    if (aboveVol >= belowVol) {
+      hiIdx++
+      acc += rows[hiIdx].volume
+    } else {
+      loIdx--
+      acc += rows[loIdx].volume
+    }
+  }
+  return { rows, totalVolume, poc: rows[pocIdx].mid, vah: rows[hiIdx].priceHigh, val: rows[loIdx].priceLow }
+}
+
+interface DpRow { priceLow: number; priceHigh: number; mid: number; delta: number; volume: number }
+interface DpResult { rows: DpRow[]; totalDelta: number; totalVolume: number; positiveDeltaPoc: number | null; negativeDeltaPoc: number | null; deltaSkew: number }
+
+function deltaProfileBins(candles: Candle[], binCount = 36): DpResult {
+  const empty: DpResult = { rows: [], totalDelta: 0, totalVolume: 0, positiveDeltaPoc: null, negativeDeltaPoc: null, deltaSkew: 0 }
+  if (!candles.length) return empty
+  let lo = Infinity
+  let hi = -Infinity
+  for (const c of candles) {
+    lo = Math.min(lo, c.low)
+    hi = Math.max(hi, c.high)
+  }
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return empty
+  const binSize = (hi - lo) / binCount
+  const deltas = new Array(binCount).fill(0)
+  const volumes = new Array(binCount).fill(0)
+  let totalVolume = 0
+  for (const c of candles) {
+    const vol = Number.isFinite(c.volume) ? c.volume : 0
+    if (vol <= 0) continue
+    const range = c.high - c.low
+    const clv = range > 0 ? (2 * c.close - c.high - c.low) / range : 0
+    const buyShare = (1 + clv) / 2
+    const buyVol = vol * buyShare
+    const sellVol = vol - buyVol
+    const span = Math.max(c.high, c.low) - Math.min(c.high, c.low)
+    if (span <= 0) {
+      const idx = Math.min(binCount - 1, Math.max(0, Math.floor((c.close - lo) / binSize)))
+      deltas[idx] += buyVol - sellVol
+      volumes[idx] += vol
+      totalVolume += vol
+      continue
+    }
+    const firstBin = Math.max(0, Math.floor((c.low - lo) / binSize))
+    const lastBin = Math.min(binCount - 1, Math.floor((c.high - lo) / binSize))
+    for (let b = firstBin; b <= lastBin; b++) {
+      const binLo = lo + b * binSize
+      const binHi = binLo + binSize
+      const overlap = Math.min(binHi, c.high) - Math.max(binLo, c.low)
+      if (overlap <= 0) continue
+      const overlapShare = overlap / span
+      deltas[b] += (buyVol - sellVol) * overlapShare
+      volumes[b] += vol * overlapShare
+      totalVolume += vol * overlapShare
+    }
+  }
+  const rows: DpRow[] = deltas.map((delta, b) => {
+    const priceLow = lo + b * binSize
+    const priceHigh = priceLow + binSize
+    return { priceLow, priceHigh, mid: (priceLow + priceHigh) / 2, delta, volume: volumes[b] }
+  })
+  const totalDelta = rows.reduce((s, r) => s + r.delta, 0)
+  if (totalVolume <= 0) return { ...empty, rows }
+  let posIdx = -1
+  let negIdx = -1
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i].delta > 0 && (posIdx === -1 || rows[i].delta > rows[posIdx].delta)) posIdx = i
+    if (rows[i].delta < 0 && (negIdx === -1 || rows[i].delta < rows[negIdx].delta)) negIdx = i
+  }
+  return {
+    rows,
+    totalDelta,
+    totalVolume,
+    positiveDeltaPoc: posIdx >= 0 ? rows[posIdx].mid : null,
+    negativeDeltaPoc: negIdx >= 0 ? rows[negIdx].mid : null,
+    deltaSkew: Math.max(-1, Math.min(1, totalDelta / totalVolume)),
+  }
+}
+
+// Swing is NOT a histogram or a pseudo-candle series - it's a point overlay
+// on the existing (plain) candle series, so this is the one client-side
+// mirror that feeds the markers effect below rather than the custom-canvas
+// one. Mirrors analytics/swing.ts#computeSwing exactly (fractal-pivot
+// swing high/low, honest lookback-confirmation lag, hh-hl/lh-ll structure).
+interface SwingPoint { time: number; price: number; kind: 'high' | 'low'; index: number }
+
+function computeSwingClient(candles: Candle[], lookback = 3): SwingPoint[] {
+  const swings: SwingPoint[] = []
+  for (let i = lookback; i < candles.length - lookback; i++) {
+    let isHigh = true
+    let isLow = true
+    const h = candles[i].high
+    const l = candles[i].low
+    for (let j = i - lookback; j <= i + lookback; j++) {
+      if (j === i) continue
+      if (candles[j].high >= h) isHigh = false
+      if (candles[j].low <= l) isLow = false
+    }
+    if (isHigh && isLow) {
+      const mid = (h + l) / 2
+      if (candles[i].close >= mid) isLow = false
+      else isHigh = false
+    }
+    if (isHigh) swings.push({ time: candles[i].time, price: h, kind: 'high', index: i })
+    else if (isLow) swings.push({ time: candles[i].time, price: l, kind: 'low', index: i })
+  }
+  return swings
+}
+
 interface TpoBinRow { priceLow: number; priceHigh: number; tpos: number; inVA: boolean }
 interface TpoPeriodRow { letter: string; startTime: number; endTime: number; high: number; low: number }
 interface TpoProfile {
@@ -716,6 +890,7 @@ export default function ChartPanel({
   // setMarkers payload on the price series - two refs, one plugin
   const indMarkersRef = useRef<SeriesMarker<Time>[]>([])
   const tradeMarkersRef = useRef<SeriesMarker<Time>[]>([])
+  const swingMarkersRef = useRef<SeriesMarker<Time>[]>([])
 
   const tfSec = useMemo(() => {
     if (!candles || candles.length < 2) return 60
@@ -919,7 +1094,7 @@ export default function ChartPanel({
         upColor: 'transparent', downColor: DOWN, borderUpColor: UP, borderDownColor: DOWN, wickUpColor: UP, wickDownColor: DOWN,
         priceLineColor: '#38bdf8',
       })
-    } else if (chartType === 'heikin' || chartType === 'renko' || chartType === 'pointfigure' || chartType === 'rangebars' || chartType === 'volumebars' || chartType === 'tickchart' || chartType === 'linebreak' || chartType === 'kagi') {
+    } else if (chartType === 'heikin' || chartType === 'renko' || chartType === 'pointfigure' || chartType === 'rangebars' || chartType === 'volumebars' || chartType === 'tickchart' || chartType === 'linebreak' || chartType === 'kagi' || chartType === 'swing') {
       price = chart.addSeries(CandlestickSeries, {
         upColor: UP, downColor: DOWN, borderUpColor: UP, borderDownColor: DOWN, wickUpColor: UP, wickDownColor: DOWN,
         priceLineColor: '#38bdf8',
@@ -985,6 +1160,7 @@ export default function ChartPanel({
       markersRef.current = null
       indMarkersRef.current = []
       tradeMarkersRef.current = []
+      swingMarkersRef.current = []
       renderStateRef.current = null
     }
   }, [chartType])
@@ -1091,7 +1267,15 @@ export default function ChartPanel({
   // These two chart types cannot be candlestick pseudo-series; an opaque
   // canvas overlays the lightweight chart. Redraws on data/type/resize.
   useEffect(() => {
-    if (chartType !== 'footprint' && chartType !== 'tpo' && chartType !== 'otcfootprint' && chartType !== 'tickfootprint') return
+    if (
+      chartType !== 'footprint' &&
+      chartType !== 'tpo' &&
+      chartType !== 'otcfootprint' &&
+      chartType !== 'tickfootprint' &&
+      chartType !== 'volumeprofile' &&
+      chartType !== 'deltaprofile'
+    )
+      return
     const canvas = customCanvasRef.current
     if (!canvas) return
     const parent = canvas.parentElement
@@ -1365,6 +1549,106 @@ export default function ChartPanel({
           ctx.fillStyle = c.delta > 0 ? UP : c.delta < 0 ? DOWN : TEXT
           ctx.fillText(`${c.delta >= 0 ? '+' : ''}${c.delta}`, cx, H - 5)
         }
+      } else if (chartType === 'volumeprofile' || chartType === 'deltaprofile') {
+        // Volume Profile / Delta Profile: a horizontal histogram over the
+        // visible price range - left = dim close path for time orientation
+        // (same layout convention TPO's own panel below uses), right = the
+        // profile itself. Volume Profile bars run single-direction (volume
+        // magnitude only); Delta Profile bars diverge from a center zero
+        // line (green = net buy, red = net sell at that price level).
+        const win = candles.slice(-400)
+        if (win.length < 2) {
+          ctx.fillStyle = TEXT
+          ctx.textAlign = 'center'
+          ctx.fillText('not enough bars yet', W / 2, H / 2)
+          return
+        }
+        const isDelta = chartType === 'deltaprofile'
+        const vp = isDelta ? null : volumeProfileBins(win)
+        const dp = isDelta ? deltaProfileBins(win) : null
+        const rows = isDelta ? dp!.rows : vp!.rows
+        if (!rows.length) return
+        const pLo = rows[0].priceLow
+        const pHi = rows[rows.length - 1].priceHigh
+        const padT = 12
+        const padB = 20
+        const profileW = Math.min(220, W * 0.4)
+        const chartW = W - profileW - 24
+        const y = (p: number) => padT + ((pHi - p) / Math.max(pHi - pLo, 1e-12)) * (H - padT - padB)
+        ctx.strokeStyle = 'rgba(124,138,165,0.35)'
+        ctx.beginPath()
+        win.forEach((c, i) => {
+          const px = 8 + (i / (win.length - 1)) * chartW
+          const py = y(c.close)
+          if (i === 0) ctx.moveTo(px, py)
+          else ctx.lineTo(px, py)
+        })
+        ctx.stroke()
+        const binH = Math.max(2, (H - padT - padB) / rows.length)
+        if (!isDelta) {
+          const prof = vp!
+          if (prof.val !== null && prof.vah !== null) {
+            ctx.fillStyle = 'rgba(56,189,248,0.08)'
+            ctx.fillRect(chartW, y(prof.vah), profileW, y(prof.val) - y(prof.vah))
+          }
+          const maxVol = Math.max(...rows.map((r) => r.volume), 1e-9)
+          rows.forEach((r) => {
+            const by = y(r.priceHigh)
+            const w = (r.volume / maxVol) * (profileW - 10)
+            ctx.fillStyle = 'rgba(56,189,248,0.45)'
+            ctx.fillRect(chartW + 6, by, Math.max(w, r.volume > 0 ? 2 : 0), Math.max(1.5, binH - 1))
+          })
+          if (prof.poc !== null) {
+            ctx.strokeStyle = 'rgba(56,189,248,0.9)'
+            ctx.setLineDash([4, 3])
+            ctx.beginPath()
+            ctx.moveTo(8, y(prof.poc))
+            ctx.lineTo(chartW + profileW, y(prof.poc))
+            ctx.stroke()
+            ctx.setLineDash([])
+            ctx.fillStyle = '#38bdf8'
+            ctx.textAlign = 'left'
+            ctx.fillText(`POC ${fmtPrice(prof.poc, digitsTicker)}`, chartW + 8, y(prof.poc) - 4)
+          }
+          ctx.fillStyle = TEXT
+          ctx.textAlign = 'left'
+          ctx.font = '9px var(--font-geist-mono), monospace'
+          ctx.fillText('volume (approx - range-overlap proxy, no bid/ask feed)', 8, H - 6)
+        } else {
+          const prof = dp!
+          const maxAbs = Math.max(...prof.rows.map((r) => Math.abs(r.delta)), 1e-9)
+          const zeroX = chartW + 6 + (profileW - 12) / 2
+          const halfW = (profileW - 12) / 2
+          prof.rows.forEach((r) => {
+            const by = y(r.priceHigh)
+            const w = (Math.abs(r.delta) / maxAbs) * halfW
+            ctx.fillStyle = r.delta >= 0 ? 'rgba(16,185,129,0.55)' : 'rgba(244,63,94,0.55)'
+            if (r.delta >= 0) ctx.fillRect(zeroX, by, Math.max(w, r.delta !== 0 ? 2 : 0), Math.max(1.5, binH - 1))
+            else ctx.fillRect(zeroX - w, by, Math.max(w, 2), Math.max(1.5, binH - 1))
+          })
+          ctx.strokeStyle = 'rgba(124,138,165,0.4)'
+          ctx.beginPath()
+          ctx.moveTo(zeroX, padT)
+          ctx.lineTo(zeroX, H - padB)
+          ctx.stroke()
+          if (prof.positiveDeltaPoc !== null) {
+            ctx.fillStyle = UP
+            ctx.textAlign = 'left'
+            ctx.fillText(`+POC ${fmtPrice(prof.positiveDeltaPoc, digitsTicker)}`, chartW + 8, y(prof.positiveDeltaPoc) - 4)
+          }
+          if (prof.negativeDeltaPoc !== null) {
+            ctx.fillStyle = DOWN
+            ctx.textAlign = 'left'
+            ctx.fillText(`-POC ${fmtPrice(prof.negativeDeltaPoc, digitsTicker)}`, chartW + 8, y(prof.negativeDeltaPoc) + 11)
+          }
+          ctx.fillStyle = prof.deltaSkew >= 0 ? UP : DOWN
+          ctx.textAlign = 'left'
+          ctx.font = '10px var(--font-geist-mono), monospace'
+          ctx.fillText(`skew ${prof.deltaSkew >= 0 ? '+' : ''}${(prof.deltaSkew * 100).toFixed(1)}%`, 8, H - 18)
+          ctx.fillStyle = TEXT
+          ctx.font = '9px var(--font-geist-mono), monospace'
+          ctx.fillText('delta (approx - CLV buy/sell proxy, no bid/ask feed)', 8, H - 6)
+        }
       } else {
         // TPO: left = close path for time orientation, right = profile
         const prof = tpoProfile(candles.slice(-400))
@@ -1508,10 +1792,39 @@ export default function ChartPanel({
 
   const applyMarkers = useCallback(() => {
     if (!markersRef.current) return
-    const all = [...indMarkersRef.current, ...tradeMarkersRef.current]
+    const all = [...indMarkersRef.current, ...tradeMarkersRef.current, ...swingMarkersRef.current]
     all.sort((a, b) => Number(a.time) - Number(b.time))
     markersRef.current.api.setMarkers(all)
   }, [])
+
+  // Swing point-overlay (Meta-Trader-bug-fix sweep follow-up): confirmed
+  // swing highs/lows drawn as markers on the plain candle series, mirroring
+  // analytics/swing.ts's fractal-pivot definition client-side
+  // (computeSwingClient above) - NOT its own chart type/series, per the
+  // design decision recorded in client.ts's ChartType doc comment. Honors
+  // the same lookback-confirmation lag the backend engine documents: the
+  // most recent `lookback` closed bars never show a marker yet.
+  useEffect(() => {
+    if (chartType !== 'swing') {
+      if (swingMarkersRef.current.length) {
+        swingMarkersRef.current = []
+        applyMarkers()
+      }
+      return
+    }
+    const swings = computeSwingClient(candles, 3)
+    const out: SeriesMarker<Time>[] = swings.map((s) => ({
+      time: s.time as UTCTimestamp,
+      position: s.kind === 'high' ? 'aboveBar' : 'belowBar',
+      shape: s.kind === 'high' ? 'arrowDown' : 'arrowUp',
+      color: s.kind === 'high' ? DOWN : UP,
+      text: s.kind === 'high' ? 'H' : 'L',
+      size: 1,
+    }))
+    swingMarkersRef.current = out
+    ensureMarkerApi()
+    applyMarkers()
+  }, [chartType, candles, ensureMarkerApi, applyMarkers])
 
   // registry indicator markers (Williams fractal arrows) - times snap to the
   // displayed candle grid (heikin/renko remap times), then merge via applyMarkers
@@ -1692,7 +2005,7 @@ export default function ChartPanel({
       </div>
 
       <div ref={elRef} className="min-h-0 flex-1" />
-      {(chartType === 'footprint' || chartType === 'tpo' || chartType === 'otcfootprint' || chartType === 'tickfootprint') && (
+      {(chartType === 'footprint' || chartType === 'tpo' || chartType === 'otcfootprint' || chartType === 'tickfootprint' || chartType === 'volumeprofile' || chartType === 'deltaprofile') && (
         <div className="absolute inset-x-0 bottom-[30px] top-0 z-[5] bg-[#0b111c]">
           <canvas ref={customCanvasRef} className="block h-full w-full" />
         </div>

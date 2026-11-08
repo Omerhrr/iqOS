@@ -59,13 +59,21 @@ export type ChartType =
   // renko/pointfigure/rangebars/volumebars above (see ChartPanel.tsx's
   // lineBreakChart()/kagiChart()) - mirroring
   // mini-services/trading-core/src/analytics/{linebreak,kagi}.ts's own
-  // math, not re-deriving it. Volume Profile, Swing, and Delta Profile are
-  // NOT added here - each needs a genuinely different UI shape (a
-  // horizontal histogram panel for the first and third, point overlays on
-  // the existing candle series for the second) rather than a pseudo-candle
-  // series, and were deliberately left as their own follow-up rather than
-  // forced into this same pattern just to tick a box.
+  // math, not re-deriving it.
   | 'linebreak' | 'kagi'
+  // Meta-Trader-bug-fix sweep follow-up: the 3 remaining analytics-only
+  // chart types, each rendered with its own UI shape rather than forced
+  // into the pseudo-candle pattern above:
+  //  - 'volumeprofile'/'deltaprofile': an opaque canvas overlay (same
+  //    pattern as 'footprint'/'tpo'/'otcfootprint'/'tickfootprint' already
+  //    use) drawing a horizontal histogram over the visible price range,
+  //    client-side mirrors of analytics/{volumeprofile,deltaprofile}.ts's
+  //    exact range-overlap/CLV math.
+  //  - 'swing': NOT its own series - renders as plain candles (see
+  //    ChartPanel.tsx's series-creation dispatch) with a point-overlay of
+  //    confirmed swing-high/swing-low markers on top, mirroring
+  //    analytics/swing.ts's fractal-pivot logic client-side.
+  | 'volumeprofile' | 'deltaprofile' | 'swing'
 export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'candles', label: 'Candles' },
   { id: 'hollow', label: 'Hollow' },
@@ -86,6 +94,9 @@ export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'ivhv', label: 'IV·HV' },
   { id: 'linebreak', label: 'Line Break' },
   { id: 'kagi', label: 'Kagi' },
+  { id: 'volumeprofile', label: 'Volume Profile' },
+  { id: 'deltaprofile', label: 'Delta Profile' },
+  { id: 'swing', label: 'Swing' },
 ]
 
 // kernel route payloads for the Task 63 chart fetches (ChartPanel)
