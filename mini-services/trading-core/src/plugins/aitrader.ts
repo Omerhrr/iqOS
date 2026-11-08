@@ -92,9 +92,28 @@ import type { FootprintResult } from '../analytics/otcfootprint'
 import { computeTickFootprint, computeTickOracle, computeTickSmc, computeTickTechnical, medianTickGapMs } from '../analytics/tickdesk'
 import { chatComplete, providerStatus, type ChatMessage } from '../lib/llm'
 import { tfSeconds } from '../analytics/synthfeed'
-import { atr, closes, ema, highs, lows, rsi, trueRange } from '../analytics/indicators'
+import { atr, closes, highs, lows, rsi, trueRange } from '../analytics/indicators'
 import { indicatorBoardLines } from '../analytics/indicatorboard'
 import { classifySession } from '../analytics/session'
+// OWN-MATH PRECISION REWORK (direct instruction: shift the trader's own math
+// off raw-candle indicators onto tick+footprint+technical-ladder as the
+// PRIMARY read, renko/range as the noise-filtered confirmation that
+// REPLACES moving averages, and SMC/ICT-on-candles as the structural
+// confirmation layer, not the primary gauge) - engineVoteSingle gives the
+// exact same renko/range brick-trend votes the Chart Signal panel renders
+// (analytics/chartsignals.ts), scanSmc/smcNowRead give the same SMC/ICT
+// read the SMC panel renders (analytics/smc.ts) - both pure, synchronous,
+// over candles already in hand, no new service dependency.
+import { engineVoteSingle } from '../analytics/chartsignals'
+import { scanSmc, smcNowRead } from '../analytics/smc'
+// UNIFIED INDICATOR BOARD (direct instruction: "just as we have them as
+// charts, now having them as indicators... great help for easy
+// accessibility") - one call gets all ten chart-type indicators (candle,
+// tick, footprint, otc-footprint, renko, range, tick-footprint, IV-HV, SMC,
+// ICT) in one consistent row shape, see analytics/chartindicators.ts's
+// module header for the adapter contract (it wraps existing engines, never
+// reimplements them).
+import { buildChartIndicatorBoard, chartIndicatorBoardLines, type ChartIndicatorRow } from '../analytics/chartindicators'
 
 export type AiTraderScanMode = 'single' | 'selected' | 'global'
 
@@ -733,6 +752,33 @@ export function deskTally(snapshot: MetaSourceRead[]): string | null {
   return `Desk tally across ${snapshot.length} panel reads: ${callN} call / ${putN} put / ${noneN} abstaining; confidence-weighted net ${net >= 0 ? '+' : ''}${net.toFixed(0)} toward ${dir}. This is a starting point, not your decision - the tally says nothing about WHICH expiry, and a loud tally can still be wrong.`
 }
 
+/** OWN-MATH CONSENSUS (precision rework, direct instruction): a weighted
+ * tally across the trader's own PRIMARY read - tick desk flow, OTC
+ * footprint pressure, the all-timeframe technical ladder, and the
+ * noise-filtered renko/range votes - explicitly SEPARATE from deskTally()
+ * above (which tallies the EXTERNAL desk/panel snapshot, step 2 of the
+ * trader's job). This is "what does my own math say before I even open the
+ * meeting with the desk" - same mechanical-starting-point framing, scoped
+ * to the sources the operator asked to be primary. SMC/ICT is deliberately
+ * NOT folded into this number - per direct instruction it's the
+ * CONFIRMATION layer applied to candle structure, read on its own merits in
+ * the prompt rather than blended into one score. */
+export interface OwnMathVote {
+  label: string
+  dir: 1 | -1 | 0
+  weight: number
+}
+
+export function ownMathTally(votes: OwnMathVote[]): string | null {
+  const live = votes.filter((v) => v.dir !== 0 && v.weight > 0)
+  if (!live.length) return null
+  let net = 0
+  for (const v of live) net += v.dir * v.weight
+  const dir = net > 0 ? 'call' : net < 0 ? 'put' : 'evenly split'
+  const detail = live.map((v) => `${v.label} ${v.dir > 0 ? 'call' : 'put'} (${(v.weight * 100).toFixed(0)}% weight)`).join(', ')
+  return `Own-math consensus (tick flow + footprint + technical ladder + renko/range, ${live.length}/${votes.length} reporting): ${detail} -> net ${net >= 0 ? '+' : ''}${net.toFixed(2)} toward ${dir}. A mechanical starting point from YOUR primary read, computed BEFORE the desk meeting - weigh it, don't just restate it, and SMC/ICT below still needs its own read as structural confirmation.`
+}
+
 /** One row of the trader's own graded history, reduced for calibration. */
 export interface CalibrationRow {
   direction: string
@@ -1324,6 +1370,7 @@ export class AiTraderService {
     structure: string[],
     atrPct: number,
     rsiLast: number,
+    ownMathSummary?: string,
   ): Promise<Set<string>> {
     try {
       const menu = OPTIONAL_DESK_SOURCES.map((s) => `- ${s.id}: ${s.label}`).join('\n')
@@ -1332,9 +1379,10 @@ export class AiTraderService {
         content: [
           'You are the same AI Trader about to decide on a binary-option trade. Before the full desk briefing is',
           'built, pick which EXTRA desk seats (if any) you actually want this cycle - you already have your own',
-          'candle/swing/horizon math and the CORE desk (next-candle oracle, the full tick desk incl. tick SMC and',
-          'tick footprint, the OTC velocity footprint, the reversal detector, the technical summary ladder, and',
-          'Accute) below for free, always. Pick only what would genuinely change or firm up your read for THIS',
+          'PRIMARY read (tick desk transactions, footprint pressure, the all-timeframe technical ladder,',
+          'noise-filtered renko/range, SMC/ICT structure) and the CORE desk (next-candle oracle, the full tick',
+          'desk incl. tick SMC and tick footprint, the OTC velocity footprint, the reversal detector, the',
+          'technical summary ladder, and Accute) below for free, always. Pick only what would genuinely change or firm up your read for THIS',
           'asset+tf right now - not everything, not out of habit. A clear, high-conviction core read needs',
           'nothing extra; a genuinely unclear or conflicted one is worth spending a seat or two on. Different',
           'pairs and moments call for different tools - you decide what this one needs.',
@@ -1354,6 +1402,7 @@ export class AiTraderService {
           `ATR14 ${atrPct.toFixed(3)}% of price, RSI14 ${rsiLast.toFixed(1)}`,
           `recent closes: ${recentCloses}`,
           `per-expiry horizon reads:\n${horizonLines}`,
+          ...(ownMathSummary ? [`own-math primary read (tick/footprint/technical/renko/range/SMC-ICT): ${ownMathSummary}`] : []),
         ].join('\n'),
       }
       const res = await callLlm(resolveAppUrl(this.config), [system, user], { temperature: 0, maxTokens: 150, timeoutMs: 15_000 })
@@ -2062,11 +2111,12 @@ export class AiTraderService {
       // trend-context line sent to the model as a secondary data point.
       const atrPct = robustAtrPct(highPrices, lowPrices, closePrices, price, 14) || rawAtrPct
       const rsiSeries = closePrices.length >= 15 ? rsi(closePrices, 14) : []
+      // RSI kept ONLY as a minor secondary context figure (sent to triage,
+      // never framed as a directional own-math vote any more - see the
+      // PRECISION REWORK block below). EMA9/21 crossover is GONE entirely:
+      // per direct instruction, moving averages are replaced as the
+      // trend-confirmation role by the noise-filtered renko/range votes.
       const rsiLast = rsiSeries.length ? rsiSeries[rsiSeries.length - 1] : 50
-      const ema9Series = closePrices.length >= 9 ? ema(closePrices, 9) : []
-      const ema21Series = closePrices.length >= 21 ? ema(closePrices, 21) : []
-      const ema9Last = ema9Series.length ? ema9Series[ema9Series.length - 1] : price
-      const ema21Last = ema21Series.length ? ema21Series[ema21Series.length - 1] : price
 
       const horizons = closePrices.length ? buildHorizonReads(closePrices, tfSec, this.config.expiryChoices, atrPct) : []
       const horizonLines = horizons.length
@@ -2095,10 +2145,147 @@ export class AiTraderService {
       // Computed once here and reused for placement + the log lines below.
       const bet = this.stakeFor()
 
-      // Own detection upgrades FIRST - the model's own math, computed
-      // before anything else so the triage call below can see it too (no
-      // point asking "do you want the confluence screener" without first
-      // showing what the own-read already settled on its own).
+      // ===================================================================
+      // OWN-MATH PRECISION REWORK (direct instruction): the trader's own
+      // math no longer leans on raw-candle indicators (RSI/EMA-as-trend)
+      // as its PRIMARY gauge. Technical measures TIME, tick measures
+      // TRANSACTIONS, footprint reveals buying/selling PRESSURE - each is
+      // a different lens the candle-only read above couldn't see, and all
+      // three are already computed every cycle by their own engines (the
+      // tick desk / OTC footprint / technical ladder are CORE desk seats,
+      // never gated by triage) - this pulls the SAME reads in here, BEFORE
+      // the desk briefing, so they anchor the own-read instead of only
+      // showing up later as one more "desk opinion" to weigh against.
+      // Renko and range (noise-eliminated by construction - a brick/bar
+      // only prints once price has actually moved a real distance) replace
+      // moving averages as the trend-confirmation layer. SMC/ICT applied
+      // to candles is kept as the STRUCTURAL CONFIRMATION step on top of
+      // all of the above, not the primary read itself.
+      // ===================================================================
+
+      // 1. TICK (transactions) - tape health + the tick desk's four
+      // tick-built engines, same pure functions the desk briefing's tick
+      // seat renders, computed here too so they anchor the own-read.
+      let tickTapeLines: string[] = []
+      let tickDeskOwnLines: string[] = []
+      let rawTicks: TickPoint[] = []
+      try {
+        const ofpTicks = this.svc<OtcFootprintService>('otcFootprint')
+        rawTicks = ofpTicks?.ticksFor(asset) ?? []
+        if (rawTicks.length) {
+          tickTapeLines = tapeHealthLines(rawTicks, Date.now())
+          tickDeskOwnLines = tickDeskLines(rawTicks, Date.now())
+        }
+      } catch {
+        // tick collector not warm yet - own-read falls back to candle-only evidence below
+      }
+
+      // 2. FOOTPRINT (buying/selling pressure) - the OTC velocity footprint
+      // engine is asset-agnostic (used for ANY live asset, not just OTC
+      // pairs, per its own module comment) - same race-with-timeout
+      // pattern the desk briefing uses so a cold pull never stalls the cycle.
+      let footprintResult: FootprintResult | null = null
+      let footprintOwnLines: string[] = []
+      try {
+        const ofpFlow = this.svc<OtcFootprintService>('otcFootprint')
+        if (ofpFlow) {
+          const fp = ofpFlow.footprint(asset, { minutes: 30, bucketSec: 60 }).then((r) => ({ r })).catch(() => null)
+          const timeout = new Promise<{ r: null }>((res) => setTimeout(() => res({ r: null }), 2500))
+          const got = await Promise.race([fp, timeout])
+          if (got?.r) {
+            footprintResult = got.r
+            footprintOwnLines = otcFootprintLines(got.r)
+          }
+        }
+      } catch {
+        // omitted - own-read proceeds without it
+      }
+
+      // 3. TECHNICAL (time, at EVERY timeframe) - the full cross-timeframe
+      // ladder, not just this one tf's RSI/EMA snapshot. Sync, pure compute.
+      let technicalOwn: ReturnType<TechnicalService['summaryFor']> | null = null
+      try {
+        const tcOwn = this.svc<TechnicalService>('technical')
+        technicalOwn = tcOwn?.summaryFor(asset) ?? null
+      } catch {
+        technicalOwn = null
+      }
+
+      // 4. RENKO + RANGE (noise-eliminated trend confirmation, replacing
+      // moving averages) - the exact votes the Chart Signal panel renders,
+      // pure sync functions over the same candles already in hand.
+      const renkoRead = candles.length ? engineVoteSingle('renko', candles) : null
+      const rangeRead = candles.length ? engineVoteSingle('range', candles) : null
+
+      // 5. SMC/ICT applied to candles - STRUCTURAL CONFIRMATION, read
+      // alongside (not blended into) the own-math tally below.
+      const smcResult = candles.length ? scanSmc(candles) : null
+      const smcRead = smcResult ? smcNowRead(smcResult) : null
+
+      // 6. UNIFIED INDICATOR BOARD (direct instruction: "just as we have
+      // them as charts, now having them as indicators... great help for
+      // easy accessibility") - all ten chart-type indicators (candle,
+      // tick, footprint, otc-footprint, renko, range, tick-footprint,
+      // IV-HV, SMC, ICT) in ONE call, ONE consistent row shape. Reuses the
+      // SAME candles/ticks/footprint/smc already computed above - no extra
+      // engine work, purely an adapter (see analytics/chartindicators.ts).
+      let indicatorBoard: ChartIndicatorRow[] = []
+      try {
+        const tickFpForBoard = rawTicks.length ? computeTickFootprint(rawTicks, { bucketSec: 60 }) : null
+        indicatorBoard = buildChartIndicatorBoard({
+          candles,
+          realTicks: rawTicks.length ? rawTicks.map((t) => ({ time: Math.floor(t.ts / 1000), price: t.price })) : null,
+          otcFootprint: footprintResult ? { ...footprintResult.summary, buckets: footprintResult.buckets.length } : null,
+          tickFootprint: tickFpForBoard,
+          smc: smcResult,
+        })
+      } catch {
+        indicatorBoard = []
+      }
+      const indicatorBoardOwnLines = indicatorBoard.length ? chartIndicatorBoardLines(indicatorBoard) : []
+      const tickFootprintBoardRow = indicatorBoard.find((r) => r.id === 'tickFootprint') ?? null
+      const ivHvBoardRow = indicatorBoard.find((r) => r.id === 'ivHv') ?? null
+
+      const ownMathVotes: OwnMathVote[] = [
+        { label: 'Renko', dir: renkoRead?.dir ?? 0, weight: renkoRead?.weight ?? 0 },
+        { label: 'Range', dir: rangeRead?.dir ?? 0, weight: rangeRead?.weight ?? 0 },
+        {
+          label: 'Technical (all-tf)',
+          dir: technicalOwn?.direction === 'call' ? 1 : technicalOwn?.direction === 'put' ? -1 : 0,
+          weight: technicalOwn ? Math.min(1, Math.abs(technicalOwn.overall.score)) : 0,
+        },
+        {
+          label: 'Footprint pressure',
+          dir: footprintResult?.summary.signal === 'call' ? 1 : footprintResult?.summary.signal === 'put' ? -1 : 0,
+          weight: footprintResult ? Math.min(1, Math.abs(footprintResult.summary.score)) : 0,
+        },
+        {
+          label: 'Tick footprint (real prints)',
+          dir: tickFootprintBoardRow?.direction === 'call' ? 1 : tickFootprintBoardRow?.direction === 'put' ? -1 : 0,
+          weight: tickFootprintBoardRow ? tickFootprintBoardRow.confidence / 100 : 0,
+        },
+        {
+          label: 'IV-HV',
+          dir: ivHvBoardRow?.direction === 'call' ? 1 : ivHvBoardRow?.direction === 'put' ? -1 : 0,
+          weight: ivHvBoardRow ? ivHvBoardRow.confidence / 100 : 0,
+        },
+      ]
+      const ownMathTallyLine = ownMathTally(ownMathVotes)
+      // Compact digest for triageSelectSources - the cheap pre-call that
+      // picks which OPTIONAL desk seats to pay for should see the SAME
+      // primary own-math reads the main decision call gets, not just the
+      // old candle anatomy/ATR/RSI snapshot (precision rework follow-up:
+      // "feed it into triage too").
+      const ownMathSummaryForTriage = [
+        ownMathTallyLine ?? '(own-math tally: nothing live yet)',
+        `SMC/ICT: ${smcRead ? (smcRead.direction === 'none' ? 'nothing fired' : `${smcRead.direction.toUpperCase()} (${smcRead.confidence}%)`) : 'n/a'}`,
+        `tick tape: ${tickTapeLines[0] ?? 'cold'}`,
+      ].join(' | ')
+
+      // Candle anatomy/swing structure kept as the SMC/ICT-adjacent
+      // structural read (step 1b, confirmation), no longer the whole of
+      // "own math" by themselves - tick/footprint/technical/renko/range
+      // above are the primary read now.
       const anatomy = candleAnatomy(candles)
       const structure = swingStructure(candles)
       const tally = deskTally(snapshot)
@@ -2111,7 +2298,7 @@ export class AiTraderService {
       // every scanner on every cycle regardless of whether this pair/
       // moment needs it - so a cheap triage call picks which EXTRA seats
       // (if any) are worth computing before the full briefing is built.
-      const optionalIds = await this.triageSelectSources(asset, tf, horizonLines, recentCloses, anatomy, structure, atrPct, rsiLast)
+      const optionalIds = await this.triageSelectSources(asset, tf, horizonLines, recentCloses, anatomy, structure, atrPct, rsiLast, ownMathSummaryForTriage)
       const briefing = await this.deskBriefingFor(asset, tf, ts, bet.amount, optionalIds)
       // audit trail: the stored decision's snapshot keeps the panel grid AND
       // every desk line, tagged source 'desk' so a replay of the log can tell
@@ -2157,11 +2344,15 @@ export class AiTraderService {
           'ones named above as always-on), its data genuinely was not available this cycle - never read either',
           'kind of absence as agreement or disagreement.',
           '',
-          'A real senior trader works exactly like this: read the tape with his own eyes first (the raw closes,',
-          'the candle anatomy and swing structure in YOUR OWN ANALYSIS below), then take the meeting with the',
-          'analysts (the desk briefing), then make ONE judgment call that belongs to him alone: which way, which',
-          'exact expiry, and whether this moment is even worth money. You may agree with your desk, override it,',
-          'or conclude that disagreement itself means skip - but the call, and the reasoning behind it, is yours.',
+          'A real senior trader works exactly like this: read the tape with his own eyes first - and "the tape"',
+          'means the TRANSACTIONS (tick desk) and the buying/selling PRESSURE behind them (footprint), not just',
+          'the candle close. Technical measures TIME (the cross-timeframe ladder), tick measures TRANSACTIONS,',
+          'footprint reveals PRESSURE - three different lenses on the same moment, all in YOUR OWN ANALYSIS below,',
+          'confirmed by renko/range (noise-eliminated by construction - they replace moving averages here) and by',
+          'SMC/ICT applied to the candles themselves (structural confirmation, not the primary read). Only THEN',
+          'take the meeting with the analysts (the desk briefing), then make ONE judgment call that belongs to',
+          'him alone: which way, which exact expiry, and whether this moment is even worth money. You may agree',
+          'with your desk, override it, or conclude that disagreement itself means skip - the call is yours.',
           '',
           'How to WEIGH the desk (this is what makes you precise, not just busy):',
           '- Reads carrying their own LIVE RECORD (hit rate / Brier / pWin over n) are worth more than unproven',
@@ -2186,9 +2377,15 @@ export class AiTraderService {
           '- A MEMORY-GATE "BLOCKED" line or an engaged kill switch is a HARD skip for that asset - no override.',
           '',
           'Your job each cycle:',
-          '1. YOUR OWN ANALYSIS first: read the raw closes, the candle anatomy (bodies, wicks, streaks, range',
-          '   position) and the swing structure (levels, break-of-structure or range) below. Form a real view:',
-          '   trending, ranging, exhausting, reversing? Do not restate the numbers back - interpret them.',
+          '1. YOUR OWN ANALYSIS first, in this order: (a) tick desk - tape freshness, then the tick-built',
+          '   SMC/oracle/technical/footprint reads (TRANSACTIONS); (b) footprint - buying vs selling PRESSURE',
+          '   and its delta slope; (c) technical - the cross-TIMEFRAME ladder, not just this one tf; (d) renko',
+          '   and range - noise-eliminated trend confirmation (these replace moving averages - trust a brick/bar',
+          '   flip over an EMA cross); (e) SMC/ICT applied to the candles - structural confirmation (order',
+          '   blocks, FVGs, BOS) on top of (a)-(d), never the primary signal by itself. The own-math tally below',
+          '   is a mechanical starting point across (a)-(d) - weigh it, do not just restate it. The raw closes,',
+          '   candle anatomy and swing structure further below are the last, lowest-priority confirmation layer,',
+          '   not where you start. Form a real view: trending, ranging, exhausting, reversing?',
           '2. Take the desk meeting: weigh the briefing by each read\'s own calibration record as above. If the',
           '   desk conflicts with your own read, decide who you trust more for THIS moment and say which you did.',
           '   Check the tick desk\'s tape-freshness and print-flow lines before you trust any direction: fresh',
@@ -2213,13 +2410,30 @@ export class AiTraderService {
         role: 'user',
         content: [
           `Asset: ${asset}   Timeframe: ${tf}   Current price: ${price || 'unavailable'}`,
-          `Trend context: EMA9 ${ema9Last.toFixed(5)} vs EMA21 ${ema21Last.toFixed(5)} (${ema9Last > ema21Last ? 'short-term above long-term - up-bias' : ema9Last < ema21Last ? 'short-term below long-term - down-bias' : 'flat'}), RSI14 ${rsiLast.toFixed(1)}, ATR14 ${atrPct.toFixed(4)}% of price (volatility regime)${Math.abs(rawAtrPct - atrPct) > 0.01 ? ` [raw ATR read ${rawAtrPct.toFixed(2)}% - one outlier bar in the window was clamped as a likely feed glitch, the figure above is the corrected one]` : ''}.`,
-          `Recent closes, oldest -> newest (${closePrices.length ? closePrices.length : 0} bars available, showing last ${Math.min(24, closePrices.length)}): ${recentCloses || '(none yet)'}`,
+          `Volatility regime (context only, not a directional vote): ATR14 ${atrPct.toFixed(4)}% of price, RSI14 ${rsiLast.toFixed(1)}${Math.abs(rawAtrPct - atrPct) > 0.01 ? ` [raw ATR read ${rawAtrPct.toFixed(2)}% - one outlier bar in the window was clamped as a likely feed glitch, the figure above is the corrected one]` : ''}.`,
           '',
-          'YOUR OWN ANALYSIS - candle anatomy of the last 3 closed bars (primary evidence, read it with your own eyes):',
+          'YOUR OWN ANALYSIS (a) TICK DESK - transactions, read FIRST (tape health, then tick-built SMC/oracle/technical/footprint):',
+          ...(tickTapeLines.length || tickDeskOwnLines.length ? [...tickTapeLines, ...tickDeskOwnLines] : ['- (tick collector not warm yet on this asset - own-read proceeds on technical/renko/range/SMC below)']),
+          '',
+          'YOUR OWN ANALYSIS (b) FOOTPRINT - buying vs selling PRESSURE (the OTC velocity footprint engine, asset-agnostic):',
+          ...(footprintOwnLines.length ? footprintOwnLines : ['- (footprint not available this cycle - cold pull or thin print history)']),
+          '',
+          `YOUR OWN ANALYSIS (c) TECHNICAL - cross-TIMEFRAME ladder (TIME, not just this one tf):${technicalOwn ? ` ${technicalOwn.overall.label} (score ${technicalOwn.overall.score >= 0 ? '+' : ''}${technicalOwn.overall.score.toFixed(2)}, ${technicalOwn.overall.buys}B/${technicalOwn.overall.sells}S/${technicalOwn.overall.neutrals}N of ${technicalOwn.overall.counted} rungs) -> leans ${technicalOwn.direction.toUpperCase()}` : ' (ladder still warming up on this asset)'}`,
+          '',
+          `YOUR OWN ANALYSIS (d) RENKO + RANGE - noise-eliminated trend confirmation, REPLACES moving averages: Renko ${renkoRead && renkoRead.dir !== 0 ? `${renkoRead.dir > 0 ? 'BULLISH' : 'BEARISH'} (${renkoRead.note})` : 'no brick trend'}; Range ${rangeRead && rangeRead.dir !== 0 ? `${rangeRead.dir > 0 ? 'BULLISH' : 'BEARISH'} (${rangeRead.note})` : 'no range trend'}.`,
+          ...(ownMathTallyLine ? ['', ownMathTallyLine] : []),
+          '',
+          `YOUR OWN ANALYSIS (e) SMC/ICT applied to the candles - STRUCTURAL CONFIRMATION only, never the primary signal: ${smcRead ? `${smcRead.direction === 'none' ? 'no concept fired this candle' : `${smcRead.direction.toUpperCase()} (${smcRead.confidence}% agreement) - ${smcRead.note}`}` : '(thin candle history for an SMC read)'}`,
+          '',
+          'Indicator board - all ten chart-type reads at a glance (candle/tick/footprint/otc-footprint/renko/range/tick-footprint/IV-HV/SMC/ICT), each the SAME engine behind its chart panel, reduced to one line for easy reference:',
+          ...(indicatorBoardOwnLines.length ? indicatorBoardOwnLines : ['- (indicator board unavailable this cycle)']),
+          '',
+          'YOUR OWN ANALYSIS (f) candle anatomy of the last 3 closed bars (lowest-priority confirmation, not where you start):',
           ...(anatomy.length ? anatomy : ['- (too few closed bars for an anatomy read)']),
-          'YOUR OWN ANALYSIS - swing structure and break-of-structure:',
+          'YOUR OWN ANALYSIS (f) swing structure and break-of-structure:',
           ...(structure.length ? structure : ['- (too few closed bars for a structure read)']),
+          '',
+          `Recent closes, oldest -> newest (${closePrices.length ? closePrices.length : 0} bars available, showing last ${Math.min(24, closePrices.length)}): ${recentCloses || '(none yet)'}`,
           '',
           'Per-expiry-choice reads (computed directly from the candles above - YOUR raw evidence per holding period):',
           horizonLines,
