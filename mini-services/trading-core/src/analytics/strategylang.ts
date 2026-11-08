@@ -229,6 +229,9 @@ import { computeVolumeProfile } from './volumeprofile'
 import { lineBreak } from './linebreak'
 import { kagi } from './kagi'
 import { computeSwing } from './swing'
+import { tickBars, type TickPoint } from './tickbars'
+import { computeBaseline } from './baseline'
+import { hvSeries, realizedUpProb } from './ivhv'
 
 export interface MslSourceRead {
   direction: 'call' | 'put' | 'none'
@@ -2046,6 +2049,142 @@ function swingMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | 
   }
 }
 
+/** `tickbar.*` - the Tick Chart engine (analytics/tickbars.ts) previously
+ * had NO MSL namespace at all (claude/msl-capability-matrix.md section P) -
+ * the only access was via /tick_patterns's own pattern detection, never
+ * arbitrary script use. HONEST SOURCE, same contract tickbars.ts itself
+ * already documents: uses REAL ticks (dataSource 'tick') when this
+ * evaluation context has a live tick feed wired in (the omni-trader via
+ * ctx.liveTicks), otherwise falls back to this tf's own closed-candle
+ * closes as pseudo-ticks (dataSource 'candle') - NEVER silently fabricates
+ * real ticks where none exist. `tickbar.dataSource()` always tells a script
+ * (or a person reading its trace) which mode is live right now. Every
+ * accessor takes an optional trailing `per` argument (ticks per bar,
+ * default 10, clamped 2-200 same as the engine's own default) - this is a
+ * plain numeric argument, not a `configure` key, same convention
+ * renko/pf/ha already use for their own fixed internal sizing. */
+function tickbarPoints(ctx: EvalEnv, tf: string | undefined): { points: TickPoint[]; dataSource: 'tick' | 'candle' } {
+  if (ctx.liveTicks && ctx.liveTicks.length) {
+    return { points: ctx.liveTicks.map((t) => ({ time: t.ts / 1000, price: t.price })), dataSource: 'tick' }
+  }
+  const s = requireSeries(ctx, tf)
+  return { points: s.close.map((c, i) => ({ time: i, price: c })), dataSource: 'candle' }
+}
+
+function tickbarMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  if (name === 'dataSource') return tickbarPoints(ctx, tf).dataSource
+  switch (name) {
+    case 'bars': {
+      const per = args.length >= 2 ? asNum(args[1]) : undefined
+      const { points, dataSource } = tickbarPoints(ctx, tf)
+      const r = tickBars(points, { per, dataSource })
+      return seriesValue(r.bars.map((b) => (b.close >= b.open ? 1 : -1)).slice(-seriesLookback(args.length ? [args[0]] : [], 50)))
+    }
+    case 'ohlc': {
+      if (!args.length) throw new MslRuntimeError('tickbar.ohlc(offset, per?) needs an offset argument, e.g. tickbar.ohlc(-1)')
+      const per = args.length >= 2 ? asNum(args[1]) : undefined
+      const { points, dataSource } = tickbarPoints(ctx, tf)
+      const r = tickBars(points, { per, dataSource })
+      const b = offsetInto(r.bars, asNum(args[0]), 'tickbar.ohlc')
+      return barValueFromOHLC(b.open, b.high, b.low, b.close, b.ticks)
+    }
+    case 'direction': {
+      const per = args.length >= 1 ? asNum(args[0]) : undefined
+      const { points, dataSource } = tickbarPoints(ctx, tf)
+      const r = tickBars(points, { per, dataSource })
+      const last = r.bars[r.bars.length - 1]
+      return last ? (last.close >= last.open ? 1 : -1) : 0
+    }
+    case 'duration': {
+      // seconds the latest bar took to form (endTime - time) - 0 for the
+      // candle-fallback mode's own integer pseudo-time, which is NOT wall-
+      // clock seconds (see tickbarPoints()); dataSource() tells a script
+      // which reading applies, same honesty contract the engine itself uses.
+      const per = args.length >= 1 ? asNum(args[0]) : undefined
+      const { points, dataSource } = tickbarPoints(ctx, tf)
+      const r = tickBars(points, { per, dataSource })
+      const last = r.bars[r.bars.length - 1]
+      return last ? last.endTime - last.time : 0
+    }
+    default:
+      throw new MslRuntimeError(`unknown tickbar method "tickbar.${name}(...)" - use bars(n?, per?)/ohlc(offset, per?)/direction(per?)/duration(per?)/dataSource()`)
+  }
+}
+
+/** `baseline.*` - the Baseline chart previously had NO backing analytics
+ * module at all (claude/msl-capability-matrix.md section G) - see
+ * analytics/baseline.ts for the definition (first close in the window). */
+function baselineMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const candles = seriesToCandles(requireSeries(ctx, tf))
+  const r = computeBaseline(candles)
+  if (!r) throw new MslRuntimeError('baseline.*() needs at least 1 bar of history')
+  switch (name) {
+    case 'value':
+      return r.baseline
+    case 'deviation':
+      return r.deviation
+    case 'deviationPct':
+      return r.deviationPct
+    case 'above':
+      return r.aboveBaseline
+    case 'cross':
+      return r.crossDirection
+    case 'deviationSeries':
+      return seriesValue(r.deviationSeries.slice(-seriesLookback(args, 50)))
+    default:
+      throw new MslRuntimeError(`unknown baseline method "baseline.${name}(...)" - use value()/deviation()/deviationPct()/above()/cross()/deviationSeries(n?) (or the plain baseline.dir/.conf verdict read)`)
+  }
+}
+
+/** `ivhv.*` - realized/historical volatility, purely candle-derived
+ * (analytics/ivhv.ts hvSeries/realizedUpProb). Deliberately does NOT expose
+ * ivhv.ts's IV/breakeven side here - that depends on MarketDataService's
+ * live payoutHistory and has no historical replay path; the already-shipped
+ * `payout` source already covers breakeven/EV arithmetic from live payout,
+ * so duplicating it here would just give two sources of truth for the same
+ * number. Kept lowercase `ivhv` (matching the file name) to avoid any
+ * casing confusion with the separate `ivHv` verdict source. */
+function ivhvMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const candles = seriesToCandles(requireSeries(ctx, tf))
+  switch (name) {
+    case 'hvNow': {
+      const window = args.length ? asNum(args[0]) : undefined
+      const r = hvSeries(candles, window !== undefined ? { window } : undefined)
+      return Number.isFinite(r.hvNow) ? r.hvNow : 0
+    }
+    case 'hvSeries': {
+      const r = hvSeries(candles)
+      return seriesValue(r.series.map((p) => p.hv).slice(-seriesLookback(args, 50)))
+    }
+    case 'realizedUpProb': {
+      const window = args.length ? asNum(args[0]) : 100
+      return realizedUpProb(candles, window)
+    }
+    case 'change': {
+      const lookback = args.length ? Math.max(1, Math.round(asNum(args[0]))) : 1
+      const r = hvSeries(candles)
+      const series = r.series.map((p) => p.hv)
+      if (!series.length) return 0
+      const now = series[series.length - 1]
+      const idx = series.length - 1 - lookback
+      const then = idx >= 0 ? series[idx] : series[0]
+      return now - then
+    }
+    case 'percentile': {
+      const lookback = args.length ? Math.max(1, Math.round(asNum(args[0]))) : 100
+      const r = hvSeries(candles)
+      const series = r.series.map((p) => p.hv)
+      if (!series.length) return 0
+      const now = series[series.length - 1]
+      const window = series.slice(-lookback)
+      const below = window.filter((v) => v <= now).length
+      return (below / window.length) * 100
+    }
+    default:
+      throw new MslRuntimeError(`unknown ivhv method "ivhv.${name}(...)" - use hvNow(window?)/hvSeries(n?)/realizedUpProb(window?)/change(lookback?)/percentile(lookback?)`)
+  }
+}
+
 function requireSeries(ctx: EvalEnv, tf?: string): MslSeriesCtx {
   if (tf === undefined) {
     if (!ctx.series) throw new MslRuntimeError('ind.*() needs raw candle history, which is not available in this evaluation context')
@@ -2248,6 +2387,21 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
         return swingMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'tickbar' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return tickbarMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'baseline' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return baselineMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'ivhv' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return ivhvMethod(e.name, args, ctx, tf)
       }
       const obj = evalExpr(e.obj, env, ctx)
       const args = e.args.map((a) => evalExpr(a, env, ctx))

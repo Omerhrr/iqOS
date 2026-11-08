@@ -42,6 +42,7 @@ import { computeVolumeProfile } from '../analytics/volumeprofile'
 import { lineBreak } from '../analytics/linebreak'
 import { kagi } from '../analytics/kagi'
 import { computeSwing } from '../analytics/swing'
+import { computeBaseline } from '../analytics/baseline'
 import { realizedUpProb } from '../analytics/ivhv'
 import { EXPIRIES_MIN } from '../analytics/nextexpiry'
 import { TECH_LADDER } from '../analytics/technicals'
@@ -111,6 +112,20 @@ const MSL_READ_CONFIGS: Record<string, MslConfigSpec> = {
   'tickOracle.bucketSec': { min: 1, max: 3600, integer: true, desc: 'tick oracle bucket length (seconds)' },
   'tickTechnical.bucketSec': { min: 1, max: 3600, integer: true, desc: 'tick technical bucket length (seconds)' },
   'tickFootprint.bucketSec': { min: 1, max: 3600, integer: true, desc: 'tick footprint bucket length (seconds)' },
+  // Section 10 audit fix: these were added alongside their readSource()
+  // cases in Phases 5-7 but never added to this whitelist - a script's own
+  // "configure vp.binCount = 30" would have failed closed with "unknown
+  // key" at save AND eval time despite the underlying engine already
+  // honoring the override via cfgNum(). Closing that gap here.
+  'vp.binCount': { min: 5, max: 200, integer: true, desc: 'Volume Profile bin count' },
+  'linebreak.lines': { min: 2, max: 10, integer: true, desc: 'Three-Line-Break reversal line count' },
+  'kagi.reversal': { min: 1e-9, max: 1e9, desc: 'explicit Kagi reversal size in price units' },
+  'kagi.atrPeriod': { min: 2, max: 200, integer: true, desc: 'Kagi ATR reversal period' },
+  'kagi.reversalAtrMult': { min: 0.05, max: 20, desc: 'Kagi ATR reversal multiplier' },
+  'swing.lookback': { min: 1, max: 20, integer: true, desc: 'swing fractal-pivot lookback (bars each side)' },
+  'footstack.n': { min: 1, max: 20, integer: true, desc: 'footStackedImbalance consecutive-bucket count' },
+  'footstack.ratio': { min: 1.01, max: 50, desc: 'footStackedImbalance diagonal-imbalance ratio threshold' },
+  'footstack.bucketSec': { min: 5, max: 3600, integer: true, desc: 'footStackedImbalance bucket length (seconds)' },
 }
 
 /** Validates a collected configure map against the whitelist. Throws with a
@@ -622,12 +637,29 @@ export class MetaStrategyService {
             label: `OTC footprint ${vote.dir === 1 ? 'CALL' : 'PUT'} - ${vote.note}`,
           }
         }
-        case 'line':
-        case 'area':
         case 'baseline': {
-          // Line/area/baseline are the SAME close-only price series, just
-          // rendered three ways - no distinct math, so all three share one
-          // close-trend reduction: closed-candle-count of consecutive
+          // Real baseline-deviation reduction (analytics/baseline.ts,
+          // Section 3/G closeout) - direction = crossing direction when the
+          // baseline was JUST crossed this bar (the cleanest, freshest
+          // signal), otherwise the plain above/below state; confidence
+          // scaled by |deviationPct| (bigger displacement from the
+          // baseline = more committed), capped the same 40-100 range every
+          // other candle-derived source in this switch already uses.
+          const candles = this.market.getCandlesDeep(asset, tf, 300, true)
+          const bl = computeBaseline(candles)
+          if (!bl) return none('baseline: no candles yet')
+          if (bl.crossDirection === 0 && bl.deviation === 0) return none('baseline: price sitting right on the baseline, no lean')
+          const direction: 'call' | 'put' = bl.crossDirection !== 0 ? (bl.crossDirection === 1 ? 'call' : 'put') : bl.aboveBaseline ? 'call' : 'put'
+          const magnitude = Math.min(2, Math.abs(bl.deviationPct) / 0.5) // 0.5% displacement already reads as "fully committed"
+          const confidence = Math.min(100, 40 + Math.round(magnitude * 30) + (bl.crossDirection !== 0 ? 10 : 0))
+          return { source, direction, confidence, value: bl.deviationPct, label: `Baseline ${direction.toUpperCase()}${bl.crossDirection !== 0 ? ' (just crossed)' : ''} - ${bl.deviation >= 0 ? '+' : ''}${bl.deviation.toFixed(5)} (${bl.deviationPct.toFixed(2)}%) vs baseline ${bl.baseline.toFixed(5)}` }
+        }
+        case 'line':
+        case 'area': {
+          // Line/area are the SAME close-only price series, just rendered
+          // two ways - no distinct math, so both share one close-trend
+          // reduction (baseline now has its own real deviation-based
+          // reduction above, see analytics/baseline.ts): closed-candle-count of consecutive
           // closes moving the same direction as the latest close-vs-close
           // delta, scaled by that delta relative to ATR (renkoAtr) so a
           // big move reads as more committed than a one-tick drift, same
@@ -648,7 +680,7 @@ export class MetaStrategyService {
           const magnitude = Number.isFinite(atr) && atr > 0 ? Math.min(2, Math.abs(lastDelta) / atr) : 0
           const direction = wantUp ? 'call' : 'put'
           const confidence = Math.min(100, 40 + streak * 12 + Math.round(magnitude * 10))
-          const label = source === 'line' ? 'Line' : source === 'area' ? 'Area' : 'Baseline'
+          const label = source === 'line' ? 'Line' : 'Area'
           return { source, direction, confidence, label: `${label} ${streak} closed ${direction.toUpperCase()} bar(s), delta ${lastDelta.toFixed(5)} vs ATR ${Number.isFinite(atr) ? atr.toFixed(5) : 'n/a'}` }
         }
         case 'volumeBars': {
