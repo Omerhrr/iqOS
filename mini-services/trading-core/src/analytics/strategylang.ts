@@ -19,11 +19,11 @@
 // .call/.put, combine them with and/or/not/comparisons/arithmetic, and
 // assign the result to `call`/`put`/`confidence` - there is no loop, no
 // function definition, no I/O, no way to reach anything but the `reads`
-// map (and, since MSL v2 below, the caller's optional raw-series ctx) the
+// map (and, since MSL below, the caller's optional raw-series ctx) the
 // caller hands in. Evaluation is pure and terminates in O(script length) -
 // no unbounded recursion, no host object ever exposed.
 //
-// MSL v2 ("lets make it a multipurpose lang... have all indicators, have
+// MSL ("lets make it a multipurpose lang... have all indicators, have
 // all charts and their own specs... should be able to compute anything") -
 // per direct instruction, the language now ALSO has:
 //   - a `series` value (MslSeriesValue) and `ser[-1]`/`ser[-2]`/... offset
@@ -50,15 +50,49 @@
 // I/O, no unbounded recursion - `ind.*` calls one existing pure function and
 // returns, same cost shape as any other primitive in this language.
 //
-// NOT yet in MSL v2 (tracked in the project's msl-v2-grammar-proposal.md,
-// not silently dropped): `foot.*`/`tick.*` raw order-flow primitives (the
-// otcv*/of* indicators above already cover much of this via ind.*),
-// `renko.*`/`range.*`/`ha.*`/`pf.*` namespaced sugar over the existing panel
-// sources (cosmetic - `renko.dir`/`renko.value` already work today), an
-// `<TF>` suffix on ind.* calls (needs market-data access threaded in, not
-// just this pair's own candles), and `state.*`/`since()` persisted state
-// (a bigger design decision - lifecycle/isolation - flagged for a separate
-// pass rather than bolted on here).
+// SINCE ADDED (this section originally listed these as not-yet-built -
+// corrected in place rather than left stale): `live()` - the currently
+// FORMING bar (EvalEnv.liveBar), and `tick.delta/velocity/ratio/count()` -
+// RAW live tick-window stats over the real broker tick buffer
+// (EvalEnv.liveTicks/liveNowMs) - both only meaningful in a context that
+// wires live data in (today: only the omni-trader, plugins/omnitrader.ts -
+// every candle-close-paced evaluator fails these closed with a clear
+// error, not a silent zero); an `<TF>` suffix on `ind.*`/`ohlc()` calls
+// (EvalEnv.seriesFor) for reading a DIFFERENT timeframe's own history; and
+// the `foot.*` namespace (footMethod() below) - RAW per-price-NODE
+// footprint primitives (foot.poc/pocTicks/stagnation/delta/speedRatio,
+// foot.imbalance(side, ratio, windowSec?) for a diagonal buy/sell
+// imbalance at the busiest node, foot.consecutiveDense(n, factor,
+// windowSec?) for a run of n price-adjacent dense nodes) - same
+// omni-trader-only, real-tick-buffer contract as tick.*, built on top of
+// buildFootprint() (analytics/otcfootprint.ts) verbatim, nothing
+// recomputed. This closes the "aggregate stats only, no price-level
+// breakdown" gap tick.* deliberately left open.
+//
+// SINCE ADDED (2): `since(cond)` / `streak(cond)` - narrow, deliberately-
+// scoped persisted cross-cycle state (MslStateStore below), NOT a general
+// state.*/read-write primitive. `since(cond)` counts whole CLOSED bars
+// since `cond` last evaluated true for THIS script+asset+tf+call-site (0
+// while true, a large sentinel if it has never been true yet); `streak(
+// cond)` counts the current run of consecutive closed bars `cond` has
+// been true (0 once it goes false). Scope is per (spec id, asset, tf, the
+// call site's position in the script source) - two `since(...)` calls in
+// the same script track independently even with an identical condition
+// expression. In-memory, reset on process restart, AND reset whenever a
+// script-built spec is re-saved (editing the script invalidates its old
+// counters rather than silently carrying stale state into new logic).
+// Dedupes by the bar's own close time, not by call count, so being
+// evaluated more than once on the same closed bar (the two-pass configure
+// re-run, a tight omni-trader poll loop re-checking a bar that hasn't
+// closed yet) never double-advances a counter. Only meaningful wherever a
+// caller threads EvalEnv.stateKeyPrefix/barTimeSec through (today: every
+// script evaluator, via metastrategy.ts's evaluateScript) - still fails
+// closed with a clear error if neither is wired in.
+//
+// STILL NOT in MSL (tracked in the project's msl-v2-grammar-proposal.md,
+// not silently dropped): `renko.*`/`range.*`/`ha.*`/`pf.*` namespaced
+// sugar over the existing panel sources (cosmetic - `renko.dir`/
+// `renko.value` already work today).
 //
 // Grammar (line-oriented; '#' to end-of-line is a comment; blank lines
 // ignored):
@@ -134,7 +168,7 @@
 // is reachable from a script the same way, so a new chart type only ever
 // needs a new `reads` key here, never a language change.
 
-// MSL v2's `ind.*` namespace (indicatorCall(), further below) is a thin
+// MSL's `ind.*` namespace (indicatorCall(), further below) is a thin
 // script-callable wrapper over these EXISTING array-returning
 // implementations - aliased on import (never renamed in indicators.ts
 // itself) purely to keep this module's own helper names (rsi/ema/sma/...
@@ -162,6 +196,7 @@ import {
   adx as adxInd,
   supertrend as supertrendInd,
 } from './indicators'
+import { buildFootprint, type FootprintBucket } from './otcfootprint'
 
 export interface MslSourceRead {
   direction: 'call' | 'put' | 'none'
@@ -198,7 +233,7 @@ function isReadValue(v: unknown): v is MslReadValue {
   return typeof v === 'object' && v !== null && (v as MslReadValue).__mslRead === true
 }
 
-/** MSL v2: a rolling numeric series (e.g. `ind.rsi(14)`) - chronological
+/** MSL: a rolling numeric series (e.g. `ind.rsi(14)`) - chronological
  * ascending, same convention as EvalCtx's own close/high/low/... arrays
  * (last element = the latest closed bar). `[-1]`/`[-2]`/... index FROM that
  * latest end: `ser[-1]` = values[length-1] (latest), `ser[-2]` = one bar
@@ -218,7 +253,7 @@ function isSeriesValue(v: unknown): v is MslSeriesValue {
   return typeof v === 'object' && v !== null && (v as MslSeriesValue).__mslSeries === true
 }
 
-/** MSL v2: one historical bar's OHLCV + derived shape, from `bar(-n)`.
+/** MSL: one historical bar's OHLCV + derived shape, from `bar(-n)`.
  * Field access only (`.o`/`.open`, `.h`/`.high`, `.l`/`.low`, `.c`/`.close`,
  * `.v`/`.volume`, `.body`, `.range`, `.upper_wick`, `.lower_wick`) - see
  * fieldOf() below. */
@@ -239,7 +274,7 @@ function isBarValue(v: unknown): v is MslBarValue {
   return typeof v === 'object' && v !== null && (v as MslBarValue).__mslBar === true
 }
 
-/** MSL v2: a named bundle of sub-values, for an indicator call that
+/** MSL: a named bundle of sub-values, for an indicator call that
  * naturally returns more than one series (`ind.macd(12,26,9)` ->
  * `{macd, signal, hist}`, `ind.bb(20,2)` -> `{upper, mid, lower, width,
  * percentB}`, `ind.stoch(14,3,3)` -> `{k, d}`, `ind.adx(14)` -> `{adx,
@@ -296,7 +331,7 @@ export interface EvalEnv {
   reads: Record<string, MslSourceRead>
   resolve?: MslSignalResolver
   series?: MslSeriesCtx
-  /** MSL v2: the optional trailing timeframe string on `ind.*(...)`/
+  /** MSL: the optional trailing timeframe string on `ind.*(...)`/
    * `ohlc(-n, tf)` ("5m", "1h", ...) - looks up (and the caller is expected
    * to cache) that timeframe's OWN MslSeriesCtx, fetched from a SEPARATE
    * candle history than this pair's native tf. Undefined means the caller
@@ -307,7 +342,7 @@ export interface EvalEnv {
    * "no cross-TF support at all" from "that specific tf has no data yet" -
    * both still fail the call closed, just with a more specific message. */
   seriesFor?: (tf: string) => MslSeriesCtx | undefined
-  /** MSL v2/omni-trader: the CURRENTLY FORMING (unclosed) bar's OHLCV-so-
+  /** MSL/omni-trader: the CURRENTLY FORMING (unclosed) bar's OHLCV-so-
    * far, snapshotted at evaluation time - a `live()` call reads this.
    * Deliberately separate from `series`/`ohlc()` (which only ever see
    * CLOSED, settled bars - that guarantee stays intact for every existing
@@ -315,7 +350,7 @@ export interface EvalEnv {
    * ADDITIONALLY, it never replaces the closed-bar series. Undefined
    * (every caller except the omni-trader) means `live()` fails closed. */
   liveBar?: MslBarValue
-  /** MSL v2/omni-trader: the raw tick buffer (price-change events, ms
+  /** MSL/omni-trader: the raw tick buffer (price-change events, ms
    * timestamps, chronological ascending) backing the `tick.*` namespace -
    * real broker tick data (see plugins/otcfootprint.ts), not a candle-
    * bucket aggregate. Undefined means no live tick feed was wired in (the
@@ -334,6 +369,81 @@ export interface EvalEnv {
    * `windowSec`. Defaults to Date.now() when ticks are supplied but this
    * isn't (set explicitly for a deterministic replay/test). */
   liveNowMs?: number
+  /** `since()`/`streak()`'s scope key - everything except the call-site
+   * sequence number (ctx builds `${stateKeyPrefix}|${seq}`). The CALLER
+   * decides what this identifies (metastrategy.ts uses `${specId}|
+   * ${asset}|${tf}`) - this module never knows or cares what a spec/asset/
+   * tf even are, same dependency-isolation every other EvalEnv field here
+   * already keeps. Undefined means the caller wired no state tracking in
+   * - `since()`/`streak()` then fail closed. */
+  stateKeyPrefix?: string
+  /** The CLOSED bar this evaluation is for, epoch seconds - `since()`/
+   * `streak()`'s dedup key (MslStateStore.observe() below only advances a
+   * counter the FIRST time it sees a given barTimeSec for a given key, so
+   * a re-run on the same still-open bar - the two-pass configure retry, a
+   * tight poll loop - never double-counts). Undefined means the same as
+   * stateKeyPrefix being undefined: `since()`/`streak()` fail closed. */
+  barTimeSec?: number
+}
+
+/** `since()`/`streak()`'s per-call-site memory. Deliberately NOT a general
+ * state.* read/write primitive (see the module header's "SINCE ADDED (2)"
+ * note) - just these two narrow counters, in-memory, reset on restart. One
+ * module-level singleton; `clearMslState()` lets a caller invalidate every
+ * key under one prefix (metastrategy.ts calls it when a script-built spec
+ * is re-saved, so an edited script never inherits a stale counter from its
+ * previous version). */
+interface MslStateRecord {
+  lastBarTimeSec: number
+  lastTrue: boolean
+  sinceBars: number
+  streakBars: number
+}
+/** Sentinel for "cond has never been true yet" - large rather than -1 so a
+ * script written as `since(x) > 20` (or any plain threshold check) reads
+ * correctly as true without a special "never happened" case to guard for. */
+const MSL_SINCE_NEVER = 1_000_000
+
+class MslStateStore {
+  private recs = new Map<string, MslStateRecord>()
+
+  observe(key: string, barTimeSec: number, condTrue: boolean): MslStateRecord {
+    const existing = this.recs.get(key)
+    if (existing && existing.lastBarTimeSec === barTimeSec) return existing // already advanced for this bar
+    const rec: MslStateRecord = existing
+      ? {
+          lastBarTimeSec: barTimeSec,
+          lastTrue: condTrue,
+          sinceBars: condTrue ? 0 : existing.sinceBars >= MSL_SINCE_NEVER ? MSL_SINCE_NEVER : existing.sinceBars + 1,
+          streakBars: condTrue ? (existing.lastTrue ? existing.streakBars + 1 : 1) : 0,
+        }
+      : { lastBarTimeSec: barTimeSec, lastTrue: condTrue, sinceBars: condTrue ? 0 : MSL_SINCE_NEVER, streakBars: condTrue ? 1 : 0 }
+    this.recs.set(key, rec)
+    return rec
+  }
+
+  clearPrefix(prefix: string): void {
+    const needle = `${prefix}|`
+    for (const key of this.recs.keys()) if (key.startsWith(needle)) this.recs.delete(key)
+  }
+}
+
+const mslStateStore = new MslStateStore()
+
+/** Invalidate every `since()`/`streak()` counter scoped under one
+ * `stateKeyPrefix` (e.g. a meta-strategy spec id) - call this whenever the
+ * script that prefix belongs to changes, so edited logic never resumes
+ * counting from a previous version's state. */
+export function clearMslState(stateKeyPrefix: string): void {
+  mslStateStore.clearPrefix(stateKeyPrefix)
+}
+
+function requireMslState(ctx: EvalEnv, fn: string, seq: number | undefined, condTrue: boolean): MslStateRecord {
+  if (seq === undefined) throw new MslRuntimeError(`"${fn}(...)" internal error - call site wasn't assigned a state slot (parser bug)`)
+  if (ctx.stateKeyPrefix === undefined || ctx.barTimeSec === undefined) {
+    throw new MslRuntimeError(`${fn}() needs bar-close state tracking, which is not available in this evaluation context`)
+  }
+  return mslStateStore.observe(`${ctx.stateKeyPrefix}|${seq}`, ctx.barTimeSec, condTrue)
 }
 
 /** Resolves a function call the core language doesn't itself know (i.e.
@@ -568,11 +678,16 @@ type Expr =
   | { t: 'field'; obj: Expr; field: string }
   | { t: 'unary'; op: 'not' | 'neg'; e: Expr }
   | { t: 'bin'; op: 'and' | 'or' | '==' | '!=' | '>=' | '<=' | '>' | '<' | '+' | '-' | '*' | '/'; l: Expr; r: Expr }
-  | { t: 'call'; fn: string; args: Expr[] }
-  /** MSL v2: `ser[-1]` - idx must evaluate to a (usually negative, whole)
+  /** `seq` is only set for a `since(...)`/`streak(...)` call - its stable,
+   * parse-order call-site index within THIS script (Parser.stateSeq below),
+   * used to scope that call's MslStateStore memory from every other
+   * since()/streak() call in the same script, even an identical-looking
+   * one. Every other function ignores it. */
+  | { t: 'call'; fn: string; args: Expr[]; seq?: number }
+  /** MSL: `ser[-1]` - idx must evaluate to a (usually negative, whole)
    * number; see indexSeries() for the exact "-1 = latest" mapping. */
   | { t: 'index'; obj: Expr; idx: Expr }
-  /** MSL v2: `obj.name(args)` - a dotted call, distinct from plain `.field`
+  /** MSL: `obj.name(args)` - a dotted call, distinct from plain `.field`
    * access (no parens). Covers BOTH a namespace pseudo-call where `obj` is
    * a bare `ind`/`foot`/`tick` identifier never meant to be evaluated on
    * its own (methodCall() below special-cases those before touching `obj`
@@ -615,6 +730,12 @@ const FIELDS = new Set([
 
 class Parser {
   private pos = 0
+  /** Assigns each `since(...)`/`streak(...)` call site a stable, parse-
+   * order index (see Expr's `seq` field) - deterministic across re-parses
+   * of the SAME script text (single-pass recursive descent, always visits
+   * call sites in the same left-to-right order), which is exactly the
+   * stability MslStateStore's keys need. */
+  private stateSeq = 0
   constructor(private toks: Token[]) {}
 
   private peek(): Token {
@@ -767,13 +888,13 @@ class Parser {
   //   ".field"      - field access, no parens (read/bar/bundle - FIELDS
   //                   whitelist below, fieldOf() does the real per-kind
   //                   check at eval time)
-  //   ".name(args)" - a dotted METHOD call (MSL v2: ind.rsi(14),
+  //   ".name(args)" - a dotted METHOD call (MSL: ind.rsi(14),
   //                   ser.crossed(...), ser.slope(5), ...) - distinct AST
   //                   node from plain field access since it takes args and
   //                   its name isn't restricted to the FIELDS whitelist
   //                   (methodCall()/the ind.* namespace own their own name
   //                   lists, checked at eval time for a clearer error).
-  //   "[idx]"       - series indexing (MSL v2: ser[-1]) - idx is itself a
+  //   "[idx]"       - series indexing (MSL: ser[-1]) - idx is itself a
   //                   full expression so `ser[-n]` with a let-bound `n`
   //                   works too.
   private parseAtom(): Expr {
@@ -856,7 +977,8 @@ class Parser {
           }
         }
         this.expect('rparen')
-        return { t: 'call', fn: t.value, args }
+        const seq = t.value === 'since' || t.value === 'streak' ? this.stateSeq++ : undefined
+        return { t: 'call', fn: t.value, args, ...(seq !== undefined ? { seq } : {}) }
       }
       return { t: 'ident', name: t.value }
     }
@@ -1120,7 +1242,7 @@ function crossAny(a: MslValue, b: MslValue): boolean {
  * message instead of a confusing downstream "undefined" error. */
 /** Resolves which MslSeriesCtx a `ind.*`/`ohlc()` call should read from: the
  * caller's own-timeframe `series` by default, or a different timeframe's
- * series when `tf` (MSL v2's optional trailing TF argument, e.g.
+ * series when `tf` (MSL's optional trailing TF argument, e.g.
  * `ind.rsi(14, "5m")`) names one - via `ctx.seriesFor`, which a caller with
  * no cross-timeframe support simply leaves undefined. Fails closed with a
  * message that distinguishes "no history at all here" from "no <TF>
@@ -1207,6 +1329,107 @@ function tickMethod(name: string, args: MslValue[], ticks: readonly { ts: number
 function requireTicks(ctx: EvalEnv): readonly { ts: number; price: number }[] {
   if (!ctx.liveTicks) throw new MslRuntimeError('tick.*() needs a live tick feed, which is not available in this evaluation context (only the omni-trader wires one in)')
   return ctx.liveTicks
+}
+
+/** One footprint snapshot (per-price-level up/dn ticks, POC, stagnation,
+ * speed ratio, delta) over the trailing `windowSec` of the live tick
+ * buffer, measured back from wall-clock `nowMs` - same semantics as
+ * `tick.*`'s windowing, built by asking `buildFootprint()` (analytics/
+ * otcfootprint.ts - the SAME math the live Signal Panel's footprint chart
+ * uses, nothing re-derived) for one bucket exactly `windowSec` wide and
+ * taking its only/latest bucket. Returns undefined on no coverage (too few
+ * prints in the window) rather than a zeroed-out fake bucket. */
+function footSnapshot(ticks: readonly { ts: number; price: number }[], nowMs: number, windowSec: number): FootprintBucket | undefined {
+  if (!ticks.length || !Number.isFinite(windowSec) || windowSec <= 0) return undefined
+  const bucketSec = Math.max(5, Math.round(windowSec))
+  const minutes = Math.max(1, Math.ceil(bucketSec / 60))
+  const result = buildFootprint([...ticks], { bucketSec, minutes, nowMs })
+  const bucket = result.buckets[result.buckets.length - 1]
+  return bucket && bucket.nTicks >= 3 ? bucket : undefined
+}
+
+/** `foot.*` namespace - raw per-price-NODE footprint primitives, the piece
+ * `tick.*` deliberately left out (tick.* is aggregate-over-the-whole-
+ * window only, no per-price-level breakdown). Reuses buildFootprint()
+ * verbatim; nothing here recomputes footprint math. */
+function footMethod(name: string, args: MslValue[], ticks: readonly { ts: number; price: number }[], nowMs: number): MslValue {
+  const defaultWindowSec = 10 // wider than tick.*'s 5s default - a footprint needs enough prints to actually form rows across price levels
+  switch (name) {
+    case 'poc': {
+      const b = footSnapshot(ticks, nowMs, args.length ? asNum(args[0]) : defaultWindowSec)
+      return b ? b.pocPrice : 0
+    }
+    case 'pocTicks': {
+      const b = footSnapshot(ticks, nowMs, args.length ? asNum(args[0]) : defaultWindowSec)
+      return b ? b.pocTicks : 0
+    }
+    case 'stagnation': {
+      // pocTicks / median(row totals) - ~1 = ordinary, >= 3 = a genuine
+      // cluster (the "massive volume, no price movement" node).
+      const b = footSnapshot(ticks, nowMs, args.length ? asNum(args[0]) : defaultWindowSec)
+      return b ? b.stagnation : 0
+    }
+    case 'delta': {
+      // up-ticks minus down-ticks across the WHOLE window (bucket-level,
+      // not per-row) - the raw sibling of tick.delta(), footprint-shaped.
+      const b = footSnapshot(ticks, nowMs, args.length ? asNum(args[0]) : defaultWindowSec)
+      return b ? b.velDelta : 0
+    }
+    case 'speedRatio': {
+      // dnAvgMs/upAvgMs, RAW (not log2-signed like tick.ratio()/otcvratio)
+      // - >1 means price is moving UP through these levels faster, <1 the
+      // mirror, 1 = symmetric.
+      const b = footSnapshot(ticks, nowMs, args.length ? asNum(args[0]) : defaultWindowSec)
+      return b ? b.speedRatio : 1
+    }
+    case 'imbalance': {
+      // foot.imbalance("buy"|"sell", ratio, windowSec?) - true if the
+      // BUSIEST price node (the POC - the level price is stalling at)
+      // shows a diagonal up/dn imbalance of at least `ratio`x in that
+      // direction. This is the literal "footprint prints extreme Delta
+      // cluster... massive buying delta at the top of a candle" primitive
+      // ("massive buying" = up-ticks; "buy"-side imbalance checks up/dn).
+      if (args.length < 2) throw new MslRuntimeError(`foot.imbalance(side, ratio, windowSec?) takes at least 2 arguments, got ${args.length}`)
+      const side = String(args[0])
+      if (side !== 'buy' && side !== 'sell') throw new MslRuntimeError(`foot.imbalance(side, ...) - side must be "buy" or "sell" (got "${side}")`)
+      const ratio = asNum(args[1])
+      const b = footSnapshot(ticks, nowMs, args.length >= 3 ? asNum(args[2]) : defaultWindowSec)
+      if (!b) return false
+      let pocRow: FootprintBucket['rows'][number] | undefined
+      for (const row of b.rows) if (!pocRow || row.total > pocRow.total) pocRow = row
+      if (!pocRow) return false
+      return side === 'buy' ? (pocRow.dn > 0 ? pocRow.up / pocRow.dn >= ratio : pocRow.up > 0) : pocRow.up > 0 ? pocRow.dn / pocRow.up >= ratio : pocRow.dn > 0
+    }
+    case 'consecutiveDense': {
+      // foot.consecutiveDense(n, factor, windowSec?) - true if there is a
+      // run of at least `n` PRICE-ADJACENT nodes (rows are already sorted
+      // high price -> low, so array adjacency IS price adjacency) each
+      // printing at least `factor` x the window's median row density. The
+      // literal "3 to 5 consecutive price nodes printing maximum volume
+      // density" primitive.
+      if (args.length < 2) throw new MslRuntimeError(`foot.consecutiveDense(n, factor, windowSec?) takes at least 2 arguments, got ${args.length}`)
+      const n = Math.max(1, Math.round(asNum(args[0])))
+      const factor = asNum(args[1])
+      const b = footSnapshot(ticks, nowMs, args.length >= 3 ? asNum(args[2]) : defaultWindowSec)
+      if (!b || b.rows.length < n) return false
+      const totals = b.rows.map((r) => r.total).sort((x, y) => x - y)
+      const mid = totals.length >> 1
+      const med = totals.length % 2 ? totals[mid] : (totals[mid - 1] + totals[mid]) / 2
+      if (med <= 0) return false
+      let run = 0
+      for (const row of b.rows) {
+        if (row.total >= factor * med) {
+          run++
+          if (run >= n) return true
+        } else {
+          run = 0
+        }
+      }
+      return false
+    }
+    default:
+      throw new MslRuntimeError(`unknown foot method "foot.${name}(...)" - use poc/pocTicks/stagnation/delta/speedRatio/imbalance/consecutiveDense`)
+  }
 }
 
 function requireSeries(ctx: EvalEnv, tf?: string): MslSeriesCtx {
@@ -1318,7 +1541,7 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
       // would otherwise throw "unknown identifier ind").
       if (e.obj.t === 'ident' && e.obj.name === 'ind' && !(e.obj.name in env)) {
         const args = e.args.map((a) => evalExpr(a, env, ctx))
-        // MSL v2: an optional trailing TF string ("5m", "1h", ...) reads
+        // MSL: an optional trailing TF string ("5m", "1h", ...) reads
         // this indicator against a DIFFERENT timeframe's own candle history
         // instead of this pair's native one - e.g. ind.rsi(14, "5m") while
         // trading the 1m. Every ind.* param is otherwise numeric, so a
@@ -1331,6 +1554,12 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
       if (e.obj.t === 'ident' && e.obj.name === 'tick' && !(e.obj.name in env)) {
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         return tickMethod(e.name, args, requireTicks(ctx), ctx.liveNowMs ?? Date.now())
+      }
+      // `foot.imbalance(...)` etc - same namespace-marker special case,
+      // same omni-trader-only contract (requireTicks() fails closed).
+      if (e.obj.t === 'ident' && e.obj.name === 'foot' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        return footMethod(e.name, args, requireTicks(ctx), ctx.liveNowMs ?? Date.now())
       }
       const obj = evalExpr(e.obj, env, ctx)
       const args = e.args.map((a) => evalExpr(a, env, ctx))
@@ -1445,6 +1674,14 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
           if (args.length !== 0) throw new MslRuntimeError(`live() takes no arguments, got ${args.length}`)
           if (!ctx.liveBar) throw new MslRuntimeError('live() needs the currently-forming bar, which is not available in this evaluation context (only the omni-trader wires one in)')
           return ctx.liveBar
+        }
+        case 'since': {
+          if (args.length !== 1) throw new MslRuntimeError(`since(cond) takes exactly 1 argument, got ${args.length}`)
+          return requireMslState(ctx, 'since', e.seq, truthy(args[0])).sinceBars
+        }
+        case 'streak': {
+          if (args.length !== 1) throw new MslRuntimeError(`streak(cond) takes exactly 1 argument, got ${args.length}`)
+          return requireMslState(ctx, 'streak', e.seq, truthy(args[0])).streakBars
         }
         default: {
           // Not a core arithmetic func - ask the caller's resolver (AI
@@ -1599,8 +1836,19 @@ export function evaluateStrategyScript(
   series?: MslSeriesCtx,
   seriesFor?: (tf: string) => MslSeriesCtx | undefined,
   live?: { bar?: MslBarValue; ticks?: readonly { ts: number; price: number }[]; nowMs?: number },
+  state?: { keyPrefix: string; barTimeSec?: number },
 ): MslEvalResult {
-  const ctx: EvalEnv = { reads, resolve, series, seriesFor, liveBar: live?.bar, liveTicks: live?.ticks, liveNowMs: live?.nowMs }
+  const ctx: EvalEnv = {
+    reads,
+    resolve,
+    series,
+    seriesFor,
+    liveBar: live?.bar,
+    liveTicks: live?.ticks,
+    liveNowMs: live?.nowMs,
+    stateKeyPrefix: state?.keyPrefix,
+    barTimeSec: state?.barTimeSec,
+  }
   const env: Record<string, MslValue> = {}
   const trace: string[] = []
   const configs: Record<string, number | boolean | string> = {}

@@ -18,7 +18,7 @@
 //     2s, configurable down to 1s) instead of waiting for a candle close
 //   - feeds the CURRENTLY FORMING bar (`live()`) and the raw live tick
 //     buffer (`tick.delta/velocity/ratio/count()`, analytics/strategylang.
-//     ts's MSL v2 primitives) into the script ADDITIONALLY to the normal
+//     ts's MSL primitives) into the script ADDITIONALLY to the normal
 //     closed-bar `ind.*`/`ohlc()`/panel reads - a script can combine both
 //     in one expression (closed-bar context + this-instant tick behavior)
 //

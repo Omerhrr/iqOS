@@ -55,7 +55,7 @@ import {
   type MetaSourceRead,
   type MetaStrategySpec,
 } from '../analytics/metastrategy'
-import { parseStrategyScript, evaluateStrategyScript, type MslEvalResult, type MslSourceRead, type MslSeriesCtx, type MslBarValue } from '../analytics/strategylang'
+import { parseStrategyScript, evaluateStrategyScript, clearMslState, type MslEvalResult, type MslSourceRead, type MslSeriesCtx, type MslBarValue } from '../analytics/strategylang'
 import { getStrategy } from '../strategies/builtin'
 
 function slugify(name: string): string {
@@ -315,6 +315,13 @@ export class MetaStrategyService {
       updatedTs: Date.now(),
     }
     this.specs.set(id, spec)
+    // `since()`/`streak()` memory is scoped by this spec's OWN id (see
+    // evaluateScript's `state.keyPrefix` below) - a re-save (even just
+    // editing other statements, not the counters themselves) means the
+    // script's logic may have changed underneath those counters, so clear
+    // them rather than let an edited script silently resume counting from
+    // its previous version's history.
+    if (script) clearMslState(id)
     this.persist()
     this.ctx.bus.emit('alert', {
       level: 'success',
@@ -1120,7 +1127,7 @@ export class MetaStrategyService {
   evaluate(id: string, asset: string, tf: Timeframe): { spec: MetaStrategySpec; result: MetaEvalResult; price: number } {
     const spec = this.get(id)
     if (!spec) throw new Error(`unknown meta-strategy ${id}`)
-    const result = spec.script ? this.evaluateScript(spec.script, asset, tf) : this.evaluateConditions(spec, asset, tf)
+    const result = spec.script ? this.evaluateScript(spec.id, spec.script, asset, tf) : this.evaluateConditions(spec, asset, tf)
     let price = 0
     try {
       price = this.market.getPrice(asset)
@@ -1154,7 +1161,7 @@ export class MetaStrategyService {
         price: 0,
       }
     }
-    const result = this.evaluateScript(spec.script, asset, tf, live)
+    const result = this.evaluateScript(spec.id, spec.script, asset, tf, live)
     let price = 0
     try {
       price = this.market.getPrice(asset)
@@ -1190,7 +1197,7 @@ export class MetaStrategyService {
     }
   }
 
-  /** MSL v2's `ind.*`/`ohlc()` primitives need the raw per-bar OHLCV arrays
+  /** MSL's `ind.*`/`ohlc()` primitives need the raw per-bar OHLCV arrays
    * directly (not the resolver-wrapped signal vocabulary) - built from the
    * SAME candle fetch buildCtx() already uses for scriptResolver(), so a
    * script gets both without a duplicate history read. Returns undefined on
@@ -1213,7 +1220,23 @@ export class MetaStrategyService {
     }
   }
 
-  /** MSL v2's cross-timeframe `ind.rsi(14, "5m")` / `ohlc(-1, "5m")` -
+  /** `since()`/`streak()`'s dedup key - the native tf's latest CLOSED
+   * bar's own open time (epoch seconds), same convention Candle.time
+   * already uses. Cheap (2-candle fetch): called once per evaluateScript()
+   * call, not per since()/streak() call site. Returns undefined on a
+   * fetch failure - since()/streak() then fail the script closed via
+   * EvalEnv.barTimeSec being absent, same convention as every other MSL
+   * primitive here. */
+  private scriptBarTimeSec(asset: string, tf: Timeframe): number | undefined {
+    try {
+      const candles = this.market.getCandlesDeep(asset, tf, 2, true)
+      return candles.length ? candles[candles.length - 1].time : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /** MSL's cross-timeframe `ind.rsi(14, "5m")` / `ohlc(-1, "5m")` -
    * builds a memoized `(tf) => MslSeriesCtx | undefined` resolver so a
    * script referencing the SAME other-timeframe tf more than once (e.g.
    * `ind.ema(8, "5m")` and `ind.ema(21, "5m")` in the same script) only
@@ -1250,6 +1273,7 @@ export class MetaStrategyService {
    * result wins. A script's own configure lines therefore change how ITS
    * sources are computed while never touching live plugin state. */
   private evaluateScript(
+    specId: string,
     script: string,
     asset: string,
     tf: Timeframe,
@@ -1260,7 +1284,14 @@ export class MetaStrategyService {
     const reads = this.buildScriptReads(asset, tf)
     const series = this.scriptSeries(asset, tf)
     const seriesFor = this.scriptSeriesFor(asset)
-    const out = evaluateStrategyScript(parsed.ast, reads, this.scriptResolver(asset, tf), series, seriesFor, live)
+    // `since()`/`streak()` scope - keyed by THIS spec's id (so two specs
+    // reading an identically-worded condition never share memory) plus
+    // asset+tf (so the same spec watching two pairs, or the same pair on
+    // two timeframes, tracks each independently); barTimeSec is what lets
+    // MslStateStore tell "still the same closed bar" from "a new one just
+    // closed" apart across repeat polls.
+    const state = { keyPrefix: `${specId}|${asset}|${tf}`, barTimeSec: this.scriptBarTimeSec(asset, tf) }
+    const out = evaluateStrategyScript(parsed.ast, reads, this.scriptResolver(asset, tf), series, seriesFor, live, state)
     if (!out.error && out.configs) {
       try {
         validateMslConfigs(out.configs)
@@ -1268,7 +1299,7 @@ export class MetaStrategyService {
         return { direction: 'none', score: 0, confidence: 0, conditions: [], notes: `script error: ${err instanceof Error ? err.message : String(err)}` }
       }
       const reads2 = this.buildScriptReads(asset, tf, out.configs)
-      const out2 = evaluateStrategyScript(parsed.ast, reads2, this.scriptResolver(asset, tf, out.configs), series, seriesFor, live)
+      const out2 = evaluateStrategyScript(parsed.ast, reads2, this.scriptResolver(asset, tf, out.configs), series, seriesFor, live, state)
       return this.scriptMetaResult(out2)
     }
     return this.scriptMetaResult(out)
@@ -1299,7 +1330,12 @@ export class MetaStrategyService {
     const reads = this.buildScriptReads(asset, tf)
     const series = this.scriptSeries(asset, tf)
     const seriesFor = this.scriptSeriesFor(asset)
-    const out = evaluateStrategyScript(parsed.ast, reads, this.scriptResolver(asset, tf), series, seriesFor)
+    // Test-button preview: not a saved spec, so there's no real spec id to
+    // scope since()/streak() under - 'test' + asset + tf is stable enough
+    // across repeated clicks on the SAME script/pair for a human to see the
+    // counters move sensibly, and never collides with a real `meta:...` id.
+    const state = { keyPrefix: `test|${asset}|${tf}`, barTimeSec: this.scriptBarTimeSec(asset, tf) }
+    const out = evaluateStrategyScript(parsed.ast, reads, this.scriptResolver(asset, tf), series, seriesFor, undefined, state)
     if (out.error) return { ok: false, error: out.error }
     let final = out
     if (out.configs) {
@@ -1309,7 +1345,7 @@ export class MetaStrategyService {
         return { ok: false, error: err instanceof Error ? err.message : String(err) }
       }
       const reads2 = this.buildScriptReads(asset, tf, out.configs)
-      final = evaluateStrategyScript(parsed.ast, reads2, this.scriptResolver(asset, tf, out.configs), series, seriesFor)
+      final = evaluateStrategyScript(parsed.ast, reads2, this.scriptResolver(asset, tf, out.configs), series, seriesFor, undefined, state)
       if (final.error) return { ok: false, error: final.error }
     }
     let price = 0
