@@ -49,6 +49,10 @@ export type ChartType =
   | 'rangebars' | 'volumebars' | 'footprint' | 'tpo' | 'tickchart' | 'ivhv'
   // OTC micro-tick velocity footprint (kernel route /otc_footprint)
   | 'otcfootprint'
+  // Tick footprint chart type - measured print cluster ladder on the price
+  // chart canvas (kernel route /tick_footprint, same engine the Tick
+  // Footprint dock tab renders, analytics/tickdesk.ts's computeTickFootprint)
+  | 'tickfootprint'
 export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'candles', label: 'Candles' },
   { id: 'hollow', label: 'Hollow' },
@@ -63,6 +67,7 @@ export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'volumebars', label: 'Vol Bars' },
   { id: 'footprint', label: 'Footprint' },
   { id: 'otcfootprint', label: 'OTC Footprint' },
+  { id: 'tickfootprint', label: 'Tick FP' },
   { id: 'tpo', label: 'TPO' },
   { id: 'tickchart', label: 'Tick' },
   { id: 'ivhv', label: 'IV·HV' },
@@ -402,6 +407,14 @@ export interface MetaCondition {
   /** only meaningful when source === 'smcNow' - one of ALL_SMC_KINDS, or
    * undefined for the aggregate "now" read. */
   smcKind?: string
+  /** only meaningful when source === 'nextExpiry' - which expiry ladder
+   * rung (minutes, one of 1/2/3/5/15) to read instead of the oracle's own
+   * best pick. undefined = best pick. */
+  expiryMin?: number
+  /** only meaningful on the tick-desk sources (tickSmc/tickOracle/
+   * tickTechnical/tickFootprint) - which tick-bucket length in seconds to
+   * read instead of each engine's own default. */
+  tickBucketSec?: number
 }
 
 export interface MetaStrategySpec {
@@ -4518,6 +4531,7 @@ export interface AutoTraderConfig {
 export type MetaTraderSource =
   | 'meta-strategy'
   | 'oracle'
+  | 'next-expiry'
   | 'accute'
   | 'smc'
   | 'smc-fvg'
@@ -4545,6 +4559,7 @@ export type MetaTraderSource =
 export const ALL_META_TRADER_SOURCES: readonly MetaTraderSource[] = [
   'meta-strategy',
   'oracle',
+  'next-expiry',
   'accute',
   'smc',
   'smc-fvg',
@@ -4569,6 +4584,7 @@ export const ALL_META_TRADER_SOURCES: readonly MetaTraderSource[] = [
 export const META_TRADER_SOURCE_LABELS: Record<MetaTraderSource, string> = {
   'meta-strategy': 'Meta-Strategy',
   oracle: 'Oracle',
+  'next-expiry': 'Next-Expiry Oracle',
   accute: 'Accute',
   smc: 'SMC (now)',
   'smc-fvg': 'SMC: FVG',
@@ -4740,6 +4756,38 @@ export interface AiTraderConfig {
    * uses, same keys, nothing extra to configure), falling back to trading-
    * core's own .env only if this app is unreachable. Default localhost:3000. */
   appUrl?: string
+  /** Optional compounding plan (AiTraderStakePlan below). undefined = flat
+   *  `stake` every trade. When armed, every LIVE order (and the shadow log
+   *  line) sizes off the running pot instead, and a loss ends the cycle -
+   *  the trader stands down until restartCompound(). */
+  stakePlan?: AiTraderStakePlan
+}
+
+export interface AiTraderStakePlan {
+  kind: 'compound'
+  base: number
+  rollPct?: number
+  maxStake?: number
+  payoutCap?: number
+  stopOnLoss?: boolean
+  periods?: number
+  deriskAfter?: number
+  deriskPct?: number
+  onComplete?: 'halt' | 'reseed'
+  reseedLimit?: number
+  lossReseedLimit?: number
+}
+
+/** Persisted roll state (pot/rollN/restarts/halted) - mirrors
+ * mini-services/trading-core/src/plugins/aitrader.ts's AiTraderPlanState. */
+export interface AiTraderPlanState {
+  pot: number
+  rollN: number
+  restarts: number
+  reseedCount: number
+  lossReseedCount: number
+  halted: boolean
+  complete: boolean
 }
 
 export interface AiTraderStatus {
@@ -4751,6 +4799,13 @@ export interface AiTraderStatus {
   lastRunTs: number
   nextRunTs: number | null
   lastError: string | null
+  /** compounding roll state - only meaningful while config.stakePlan is set */
+  planState: AiTraderPlanState
+  /** the stake the NEXT trade would place - mirrors
+   *  mini-services/trading-core/src/plugins/aitrader.ts's private
+   *  stakeFor(): flat config.stake (compound: false) when no stakePlan is
+   *  armed, the pot-derived size when one is. */
+  nextStake: { amount: number; pot: number; rollN: number; compound: boolean; phase: 'compound' | 'derisk' }
   /** The app URL a cycle will ACTUALLY call right now, after APP_URL env /
    * saved config / default resolution - shown directly so there's nothing
    * to guess about which one is in effect. */
