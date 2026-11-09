@@ -41,6 +41,16 @@ export interface LadderData {
  * sim mode and any live asset the sidecar hasn't captured yet still get
  * SOMETHING rather than an empty ladder. */
 function gatherTicks(market: MarketDataService, ctx: KernelContext | undefined, asset: string): TickPoint[] {
+  // Meta-Strategy historical replay (market.setReplayAsof): both tick
+  // sources here are live-only ring buffers with no historical record - the
+  // coarse ring only ever holds "recent" ticks and the OTC footprint
+  // collector's dense buffer is built from a live sidecar capture. Neither
+  // has anything honest to say about a bar from the middle of a backtest,
+  // so the 1s/2s/3s rungs these ticks build (TECH_LADDER) fail closed to
+  // "not ok" during replay instead of silently answering with TODAY's
+  // ticks relabeled as history - the same fail-closed convention every
+  // other MSL primitive in this codebase follows.
+  if (market.isReplaying()) return []
   const coarse: TickPoint[] = market.recentTicks(asset, 4000).map((t) => ({ time: t.ts, price: t.price }))
   let dense: TickPoint[] = []
   try {

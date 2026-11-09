@@ -140,6 +140,29 @@ export class MarketDataService {
   private payoutHistory: Map<string, { t: number; payout: number }[]> = new Map()
   private static PAYOUT_HISTORY_CAP = 2000
 
+  // Meta-Strategy historical replay: when set, every getCandlesDeep() read
+  // (ANY caller - the chart engines, Technical/Reversal panels, the MSL
+  // signal-function resolver, ...) is transparently truncated to bars at or
+  // before this timestamp instead of "whatever's live right now". This is
+  // the ONE primitive that makes a pure-candle Meta-Strategy honestly
+  // backtestable: every consumer already funnels through getCandlesDeep (or
+  // the shallow getCandles it wraps), so flipping this single flag makes the
+  // WHOLE call graph underneath a backtest replay step see the correct
+  // historical window with zero changes at each of those call sites - see
+  // MetaStrategyService.backtestMeta()'s own doc comment for why this
+  // deliberately does NOT extend to every Meta-Strategy source (several
+  // read OTHER plugins' live-only scan caches / claim trackers, which this
+  // flag cannot make retroactively honest).
+  private replayAsof: number | null = null
+
+  setReplayAsof(ts: number | null): void {
+    this.replayAsof = ts
+  }
+
+  isReplaying(): boolean {
+    return this.replayAsof !== null
+  }
+
   /** Refresh the IQ tradable-asset list from the sidecar (10 min TTL).
    * NOTE: the sidecar's get_asset_metadata round-trip against IQ is SLOW
    * (~95s for the full instrument table) - callers must not block on this;
@@ -1054,25 +1077,55 @@ export class MarketDataService {
    */
   getCandlesDeep(asset: string, tf: Timeframe, limit = 2200, closedOnly = false): Candle[] {
     const live = this.getCandles(asset, tf, limit, closedOnly)
-    if (!this.store) return live
-    let archived: Candle[] = []
-    try {
-      // read-side glitch guard (see buildSeries): the research lab, screener2's
-      // deep read and the backtests all come through here
-      archived = this.store.getCandlesArchive(asset, tf, limit).filter((c) => c && validCandle(c))
-    } catch {
-      return live
+    let out: Candle[]
+    if (!this.store) {
+      out = live
+    } else {
+      let archived: Candle[] = []
+      try {
+        // read-side glitch guard (see buildSeries): the research lab, screener2's
+        // deep read and the backtests all come through here
+        archived = this.store.getCandlesArchive(asset, tf, limit).filter((c) => c && validCandle(c))
+      } catch {
+        out = live
+        return this.applyReplayWindow(out, limit)
+      }
+      if (!archived.length) {
+        out = live
+      } else if (!live.length) {
+        out = archived.slice(-limit)
+      } else {
+        const liveFirst = live[0].time
+        const archLast = archived[archived.length - 1].time
+        if (archLast < liveFirst) {
+          out = [...archived, ...live].slice(-limit)
+        } else {
+          // overlap: newest source wins per timestamp
+          const byTime = new Map<number, Candle>()
+          for (const c of archived) byTime.set(c.time, c)
+          for (const c of live) byTime.set(c.time, c)
+          out = [...byTime.values()].sort((a, b) => a.time - b.time).slice(-limit)
+        }
+      }
     }
-    if (!archived.length) return live
-    if (!live.length) return archived.slice(-limit)
-    const liveFirst = live[0].time
-    const archLast = archived[archived.length - 1].time
-    if (archLast < liveFirst) return [...archived, ...live].slice(-limit)
-    // overlap: newest source wins per timestamp
-    const byTime = new Map<number, Candle>()
-    for (const c of archived) byTime.set(c.time, c)
-    for (const c of live) byTime.set(c.time, c)
-    return [...byTime.values()].sort((a, b) => a.time - b.time).slice(-limit)
+    return this.applyReplayWindow(out, limit)
+  }
+
+  /** Meta-Strategy replay truncation - see `replayAsof`'s own doc comment.
+   * Binary search for the cutoff (candles are always time-ascending) so this
+   * costs O(log n) + a slice, not a per-call O(n) filter, even though a
+   * multi-timeframe replay (the Technical/Reversal ladder) calls this many
+   * times per simulated bar. */
+  private applyReplayWindow(candles: Candle[], limit: number): Candle[] {
+    if (this.replayAsof === null || !candles.length) return candles
+    const asof = this.replayAsof
+    let lo = 0, hi = candles.length
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (candles[mid].time <= asof) lo = mid + 1
+      else hi = mid
+    }
+    return lo === candles.length ? candles.slice(-limit) : candles.slice(0, lo).slice(-limit)
   }
 
   /**

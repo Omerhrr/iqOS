@@ -15,7 +15,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { KernelContext, Plugin } from '../kernel'
-import type { Timeframe } from '../types'
+import type { Timeframe, Candle, BacktestResult, BacktestTrade } from '../types'
 import type { MarketDataService } from './market-data'
 import type { NextCandleService } from './nextcandle'
 import type { AccuteService } from './accute'
@@ -61,8 +61,99 @@ import {
   type MetaSourceRead,
   type MetaStrategySpec,
 } from '../analytics/metastrategy'
-import { parseStrategyScript, evaluateStrategyScript, clearMslState, type MslEvalResult, type MslSourceRead, type MslSeriesCtx, type MslBarValue } from '../analytics/strategylang'
+import { parseStrategyScript, evaluateStrategyScript, clearMslState, type MslEvalResult, type MslSourceRead, type MslSeriesCtx, type MslBarValue, type MslAst } from '../analytics/strategylang'
 import { getStrategy } from '../strategies/builtin'
+import { directionBreakdown } from '../strategies/backtest'
+import { sharpeRatio } from '../analytics/quant'
+
+// ---------- backtest support (safe, pure-candle subset only) ----------
+//
+// Most MetaConditionSource values read some OTHER plugin's LIVE-only state -
+// a wall-clock-TTL-cached whole-universe scan (screener/volArb/cointegration/
+// leadLag/chartSignals), a one-shot claim/license tracker (accute/tempo), or
+// a raw tick buffer that is never archived (tick/footprint/otcFootprint and
+// their tick-desk siblings). None of those have an honest historical replay:
+// there is no archived record of "what the screener board said three weeks
+// ago", and re-running those services' live scan methods during a backtest
+// would not just read wrong data, it would WRITE wrong data - several of
+// them (smcScan's outcome tracker, accute's claim map, nextexpiry's pending
+// dedupe ledger) record every call into real accuracy/outcome stats that a
+// flood of simulated historical calls would quietly corrupt.
+//
+// The sources below are the ones that reduce to a PURE function of this
+// pair's own archived candle history, with NOTHING else live in the loop:
+//  - the direct-candle cases (renko, pointFigure, rangeBars, candle/bar,
+//    heikinAshi, line/area, baseline, volumeBars, tpo, ivHv, volumeProfile,
+//    lineBreak, kagi, swing, deltaProfile) call market.getCandlesDeep()
+//    straight through readSource() with no other plugin involved at all.
+//  - technical/reversal go through TechnicalService/ReversalService, which
+//    are themselves stateless (see technical.ts's stop(): "nothing to
+//    flush") candle-ladder reads - their only non-candle input is a live
+//    tick buffer feeding the 1s/2s/3s rungs, which backtestMeta() forces to
+//    read "not ok" during replay (ladderdata.ts's gatherTicks) rather than
+//    fake it, and their wall-clock TTL cache is bypassed with
+//    `{ refresh: true }` via the `inReplay` flag below.
+// Once market.setReplayAsof() truncates getCandlesDeep() to a historical
+// cutoff (see market-data.ts), every one of these becomes correct for free.
+const SAFE_BACKTEST_SOURCES = new Set<MetaConditionSource>([
+  'renko', 'pointFigure', 'rangeBars', 'candle', 'bar', 'heikinAshi', 'line', 'area',
+  'baseline', 'volumeBars', 'tpo', 'ivHv', 'volumeProfile', 'lineBreak', 'kagi', 'swing',
+  'deltaProfile', 'technical', 'reversal',
+])
+
+/** Every OTHER MetaConditionSource - named explicitly (rather than derived
+ * as "whatever's not in SAFE_BACKTEST_SOURCES") so a script that references
+ * one gets told WHICH source blocked it and why, instead of a generic
+ * refusal. Kept in sync with META_CONDITION_SOURCES by the dev-time
+ * assertion right below. */
+const UNSAFE_BACKTEST_SOURCES = new Set<MetaConditionSource>([
+  'oracle', 'hmaRocBullBear', 'momentumScore', 'accute', 'smc', 'smcNow', 'ict',
+  'renkoSmc', 'renkoSmcMajority', 'tick', 'footprint', 'otcFootprint', 'tickSmc',
+  'tickOracle', 'tickTechnical', 'tickFootprint', 'tempo', 'confluence', 'volArb',
+  'cointegration', 'screenerRank', 'chartSignals', 'leadLag', 'yesterday',
+  'nextExpiry', 'nextExpiryBest', 'footDivergence', 'footStackedImbalance',
+  'footAbsorption', 'footUnfinishedAuction',
+])
+for (const s of META_CONDITION_SOURCES) {
+  if (!SAFE_BACKTEST_SOURCES.has(s) && !UNSAFE_BACKTEST_SOURCES.has(s)) {
+    // A new MetaConditionSource was added without deciding whether it's
+    // backtestable - fail loudly at module load (dev/test time) rather
+    // than silently treating it as either safe or unsafe by omission.
+    throw new Error(`metastrategy.ts: condition source '${s}' is not classified in SAFE_BACKTEST_SOURCES or UNSAFE_BACKTEST_SOURCES`)
+  }
+}
+
+/** Walks a parsed MSL script collecting every bare identifier used as the
+ * object of a `.field` access (e.g. the `renko` in `renko.dir`) - exactly
+ * the syntax the reads-map vocabulary (buildScriptReads' flat object) is
+ * read through. Deliberately untyped/structural (MslAst's Expr/Stmt node
+ * types aren't exported) rather than re-declaring the AST shape here - this
+ * only needs to recognize the `{ t: 'field', obj: { t: 'ident', name } }`
+ * shape and otherwise walk every object/array property it finds, so it
+ * stays correct if the AST grows new statement/expression kinds.
+ * `obj.method(args)` - the SEPARATE namespaced signal-function vocabulary
+ * (ind./tick./foot./renko./pf./ha./... - see buildSignalResolver's own doc
+ * comment) - is a `{ t: 'method' }` node, a different tag, so it is never
+ * collected here: that vocabulary is always candle-pure (scriptResolver()/
+ * scriptSeries() below read straight off market.getCandlesDeep with no
+ * other plugin involved), so it needs no safety check at all. */
+function collectFieldSources(ast: MslAst): Set<string> {
+  const names = new Set<string>()
+  const visit = (node: unknown): void => {
+    if (!node || typeof node !== 'object') return
+    const n = node as Record<string, unknown>
+    if (n.t === 'field') {
+      const obj = n.obj as Record<string, unknown> | undefined
+      if (obj && obj.t === 'ident' && typeof obj.name === 'string') names.add(obj.name)
+    }
+    for (const v of Object.values(n)) {
+      if (Array.isArray(v)) v.forEach(visit)
+      else if (v && typeof v === 'object') visit(v)
+    }
+  }
+  for (const s of ast.stmts) visit(s)
+  return names
+}
 
 function slugify(name: string): string {
   return (
@@ -182,6 +273,12 @@ export class MetaStrategyService {
   private market!: MarketDataService
   private specs = new Map<string, MetaStrategySpec>()
   private libPath = join(process.cwd(), 'data', 'meta_strategies.json')
+  // Set only for the duration of backtestMeta()'s own replay loop - lets
+  // the 'technical'/'reversal' cases below bypass TechnicalService's and
+  // ReversalService's wall-clock TTL cache (`{ refresh: true }`), which
+  // would otherwise serve the SAME cached row for every simulated bar a
+  // real backtest moves through in a few milliseconds of actual wall time.
+  private inReplay = false
 
   async start(ctx: KernelContext): Promise<void> {
     this.ctx = ctx
@@ -866,7 +963,7 @@ export class MetaStrategyService {
           } catch {
             /* rowFor handles a 0 hint */
           }
-          const row = tech.rowFor(asset, priceHint)
+          const row = tech.rowFor(asset, priceHint, { refresh: this.inReplay })
           if (!row.ok) return none(`Technical: ${row.note}`)
           if (row.direction === 'none') return none(`Technical: ladder consensus neutral (${row.overall.label})`)
           const score = row.overall.score
@@ -884,7 +981,7 @@ export class MetaStrategyService {
           } catch {
             /* rowFor handles a 0 hint */
           }
-          const row = rev.rowFor(asset, priceHint)
+          const row = rev.rowFor(asset, priceHint, { refresh: this.inReplay })
           if (!row.ok) return none(`Reversal: ${row.note}`)
           if (row.state !== 'reversing' && row.state !== 'confirmed') return none(`Reversal: ${row.state} (no tradeable claim yet)`)
           if (row.direction === 'none') return none('Reversal: no direction resolved')
@@ -1650,6 +1747,207 @@ export class MetaStrategyService {
       /* price stays 0 */
     }
     return { ok: true, direction: final.direction, confidence: final.confidence, ...(final.expiryMin !== undefined ? { expiryMin: final.expiryMin } : {}), trace: final.trace, price }
+  }
+
+  /** Same shape as buildScriptReads(), but computes ONLY the sources in
+   * SAFE_BACKTEST_SOURCES directly via readSource() - every other key
+   * defaults to an inert `{direction:'none',confidence:0}` WITHOUT ever
+   * calling the plugin that owns it. This is deliberately a separate,
+   * narrower function rather than a flag on buildScriptReads(): that
+   * function's whole contract is "compute the full map, unconditionally,
+   * every call" (see its own doc comment), which is exactly what must NOT
+   * happen during a backtest replay (see SAFE_BACKTEST_SOURCES' doc
+   * comment on why calling smcScan/accute/nextexpiry/etc. during replay
+   * would corrupt their real accuracy-tracking state, not just read stale
+   * data) - backtestMeta() only ever reaches here after confirming (via
+   * collectFieldSources) the script doesn't reference any of those keys
+   * anyway, so leaving them 'none' here changes nothing the script reads. */
+  private buildReplaySafeReads(asset: string, tf: Timeframe, cfg?: Record<string, number | boolean | string>): Record<string, MslSourceRead> {
+    const toMsl = (r: MetaSourceRead): MslSourceRead => ({ direction: r.direction, confidence: r.confidence, ...(r.value !== undefined ? { value: r.value } : {}) })
+    const none: MslSourceRead = { direction: 'none', confidence: 0 }
+    const reads: Record<string, MslSourceRead> = {}
+    for (const s of META_CONDITION_SOURCES) reads[s] = none
+    for (const s of SAFE_BACKTEST_SOURCES) {
+      reads[s] =
+        s === 'candle' || s === 'bar' || s === 'heikinAshi' || s === 'line' || s === 'area' || s === 'baseline' || s === 'deltaProfile' || s === 'technical' || s === 'reversal'
+          ? toMsl(this.readSource(s, asset, tf))
+          : toMsl(this.readSource(s, asset, tf, undefined, undefined, undefined, cfg))
+    }
+    // The three value-only reads (payout/otc/session) are cheap, side-
+    // effect-free, and not plugin-scan-dependent - same blocks buildScriptReads
+    // uses, duplicated here rather than factored out so this function stays
+    // self-contained and obviously safe to audit on its own.
+    try {
+      const payoutRate = this.market.payoutFor(asset, 'binary')
+      reads.payout = { direction: 'none', confidence: 0, value: Number.isFinite(payoutRate) && payoutRate > 0 ? payoutRate : 0 }
+    } catch {
+      reads.payout = { direction: 'none', confidence: 0, value: 0 }
+    }
+    try {
+      const info = this.market.listAssets().find((a) => a.ticker === asset)
+      reads.otc = { direction: 'none', confidence: 0, value: info?.otc ? 1 : 0 }
+    } catch {
+      reads.otc = { direction: 'none', confidence: 0, value: 0 }
+    }
+    return reads
+  }
+
+  /**
+   * Backtest a saved Meta-Strategy spec (conditions-built OR script-built)
+   * over its own asset's REAL archived candle history.
+   *
+   * Mechanism: this is a bar-by-bar replay, same shape as strategies/
+   * backtest.ts's binary-mode loop, except each step calls market's
+   * setReplayAsof(candle.time) FIRST so every candle-derived read anywhere
+   * under evaluate() - renko, technical/reversal's whole ladder, the MSL
+   * `ind.*`/`renko.*`/etc. signal-function vocabulary - transparently sees
+   * ONLY bars up to that point, not the live feed (see market-data.ts's
+   * replayAsof). `inReplay` additionally bypasses Technical/Reversal's TTL
+   * cache (wall-clock-keyed, meaningless against a simulated asof clock)
+   * and ladderdata.ts's gatherTicks() honestly degrades the 1s/2s/3s rungs
+   * to "not ok" (no archived tick history exists to replay).
+   *
+   * Safety gate (see SAFE_BACKTEST_SOURCES/UNSAFE_BACKTEST_SOURCES): a spec
+   * that references ANY source reading another plugin's live-only scan
+   * cache or tick buffer is rejected up front, naming the exact source,
+   * rather than silently running a replay that would either read garbage
+   * or corrupt that plugin's own real-time stats. A script spec additionally
+   * NEVER goes through evaluateScript()/buildScriptReads() during replay -
+   * buildReplaySafeReads() above computes only the safe subset directly, so
+   * there is no path by which replay can reach an unsafe plugin even
+   * transiently.
+   */
+  backtestMeta(
+    id: string,
+    asset: string,
+    tf: Timeframe,
+    opts: { amount?: number; payout?: number; expiryBars?: number; warmupBars?: number; startEquity?: number } = {},
+  ): BacktestResult {
+    const spec = this.get(id)
+    if (!spec) throw new Error(`unknown meta-strategy ${id}`)
+    let ast: MslAst | null = null
+    if (spec.script) {
+      const parsed = parseStrategyScript(spec.script)
+      if (!parsed.ok) throw new Error(`${spec.id}: script error - ${parsed.error}`)
+      ast = parsed.ast
+      for (const name of collectFieldSources(ast)) {
+        if (UNSAFE_BACKTEST_SOURCES.has(name as MetaConditionSource)) {
+          throw new Error(
+            `${spec.id} uses '${name}' - that source reads another plugin's LIVE-only scan cache or tick buffer with no historical record, so it can't be honestly replayed. Remove it (it can stay in a separate live-only spec) to backtest the rest of this script.`
+          )
+        }
+      }
+    } else {
+      if (!spec.conditions.length) throw new Error(`${spec.id} has no conditions and no script - nothing to backtest`)
+      for (const c of spec.conditions) {
+        if (!SAFE_BACKTEST_SOURCES.has(c.source)) {
+          throw new Error(
+            `${spec.id} uses condition source '${c.source}' - that source reads another plugin's LIVE-only scan cache or tick buffer with no historical record, so it can't be honestly replayed.`
+          )
+        }
+      }
+    }
+
+    const candles: Candle[] = this.market.getCandlesDeep(asset, tf, 2200, true)
+    if (candles.length < 300) throw new Error(`not enough candle history for a meaningful backtest (${candles.length} bars)`)
+
+    const payout = opts.payout ?? 0.85
+    const amount = Math.max(0.01, opts.amount ?? 10)
+    const expiryBars = Math.max(1, opts.expiryBars ?? 1)
+    const warmup = Math.max(40, Math.min(candles.length - 20, opts.warmupBars ?? 300)) // SAFE_BACKTEST_SOURCES engines want >=300 bars of their own warmup
+    let equity = opts.startEquity ?? 1000
+    const startEquity = equity
+    const trades: BacktestTrade[] = []
+    const equityCurve: { time: number; value: number }[] = []
+    const rets: number[] = []
+    let peak = equity
+    let maxDD = 0
+
+    this.inReplay = true
+    try {
+      for (let i = warmup; i < candles.length - expiryBars; i++) {
+        this.market.setReplayAsof(candles[i].time)
+        let result: MetaEvalResult
+        try {
+          result = spec.script
+            ? this.scriptMetaResult(
+                evaluateStrategyScript(ast!, this.buildReplaySafeReads(asset, tf), this.scriptResolver(asset, tf), this.scriptSeries(asset, tf), this.scriptSeriesFor(asset), undefined, {
+                  keyPrefix: `backtest:${spec.id}|${asset}|${tf}`,
+                  barTimeSec: candles[i].time,
+                })
+              )
+            : this.evaluateConditions(spec, asset, tf)
+        } catch (err) {
+          result = { direction: 'none', score: 0, confidence: 0, conditions: [], notes: `replay error: ${err instanceof Error ? err.message : String(err)}` }
+        }
+        if (result.direction === 'none') continue
+        const entry = candles[i].close
+        const exitCandle = candles[i + expiryBars]
+        const stake = Math.min(amount, equity)
+        if (stake <= 0) break
+        const won = result.direction === 'call' ? exitCandle.close > entry : exitCandle.close < entry
+        const draw = exitCandle.close === entry
+        const pnl = draw ? 0 : won ? stake * payout : -stake
+        equity += pnl
+        rets.push(pnl / Math.max(stake, 0.01))
+        trades.push({
+          ts: exitCandle.time,
+          side: result.direction,
+          entry,
+          exit: exitCandle.close,
+          amount: stake,
+          pnl,
+          status: draw ? 'push' : won ? 'won' : 'lost',
+        })
+        if (equity > peak) peak = equity
+        const dd = peak - equity
+        if (dd > maxDD) maxDD = dd
+        equityCurve.push({ time: exitCandle.time, value: equity })
+      }
+    } finally {
+      this.inReplay = false
+      this.market.setReplayAsof(null)
+    }
+
+    const wins = trades.filter((t) => t.status === 'won').length
+    const losses = trades.filter((t) => t.status === 'lost').length
+    const grossWin = trades.filter((t) => t.pnl > 0).reduce((a, t) => a + t.pnl, 0)
+    const grossLoss = Math.abs(trades.filter((t) => t.pnl < 0).reduce((a, t) => a + t.pnl, 0))
+    const tsSorted = trades.map((t) => t.ts).sort((a, b) => a - b)
+    let meanGapSec = 0
+    if (tsSorted.length > 1) {
+      let gaps = 0
+      for (let i = 1; i < tsSorted.length; i++) gaps += tsSorted[i] - tsSorted[i - 1]
+      meanGapSec = gaps / (tsSorted.length - 1)
+    }
+    const periodsPerYear = meanGapSec > 0 ? (365 * 24 * 3600) / meanGapSec : 252
+    const byDirection = directionBreakdown(trades)
+
+    return {
+      strategy: spec.id,
+      asset,
+      tf,
+      mode: 'binary',
+      params: {},
+      candlesTested: Math.max(0, candles.length - warmup),
+      trades,
+      equityCurve,
+      metrics: {
+        totalTrades: trades.length,
+        wins,
+        losses,
+        winRate: wins + losses ? (wins / (wins + losses)) * 100 : 0,
+        netPnl: equity - startEquity,
+        profitFactor: grossLoss === 0 ? (grossWin > 0 ? 99 : 0) : grossWin / grossLoss,
+        maxDrawdown: maxDD,
+        maxDrawdownPct: startEquity > 0 ? (maxDD / startEquity) * 100 : 0,
+        sharpe: sharpeRatio(rets, periodsPerYear),
+        expectancy: trades.length ? (equity - startEquity) / trades.length : 0,
+        finalEquity: equity,
+        startEquity,
+        byDirection,
+      },
+    }
   }
 }
 

@@ -5,6 +5,7 @@
 import type { AnalysisResult, Candle, Timeframe } from '../types'
 import type { KernelContext, Plugin } from '../kernel'
 import type { MarketDataService } from './market-data'
+import type { MetaStrategyService } from './metastrategy'
 import { analyze } from '../analytics/engine'
 import { backtest, type BacktestOptions } from '../strategies/backtest'
 import { STRATEGIES, getStrategy, defaultParams } from '../strategies/builtin'
@@ -85,14 +86,27 @@ export class AnalyticsService {
   }
 
   runBacktest(asset: string, tf: Timeframe, opts: BacktestOptions) {
-    // Meta Strategy Lab specs (meta:<slug>) have no candle-slice evaluate -
-    // MetaStrategyService.evaluate() always reads the market's LATEST window
-    // plus other plugins' live-cached state, so there is no honest way to
-    // replay history for one. Reject explicitly here rather than falling
-    // through to getStrategy() returning undefined and failing with a
-    // confusing "unknown strategy" error several calls deeper.
+    // Meta Strategy Lab specs (meta:<slug>): most condition sources read
+    // another plugin's LIVE-only scan cache or tick buffer with no
+    // historical record (see metastrategy.ts's SAFE_BACKTEST_SOURCES/
+    // UNSAFE_BACKTEST_SOURCES for the full breakdown), so those can't be
+    // honestly replayed - but a spec built ONLY from pure-candle sources
+    // (renko, technical, reversal, pointFigure, rangeBars, candle/bar,
+    // heikinAshi, line/area, baseline, volumeBars, tpo, ivHv, volumeProfile,
+    // deltaProfile, lineBreak, kagi, swing) genuinely can be, so
+    // MetaStrategyService.backtestMeta() does exactly that instead of this
+    // rejecting every meta: spec outright. backtestMeta() throws its own
+    // specific "uses '<source>' - that's live-only" error naming the exact
+    // offending source when a spec mixes in one, which this lets propagate
+    // as-is rather than re-wrapping it.
     if (opts.strategy.startsWith('meta:')) {
-      throw new Error(`${opts.strategy} is a Meta-Strategy spec - these are live-only and can't be backtested (no candle-slice evaluate exists for them)`)
+      return this.ctx.use<MetaStrategyService>('metaStrategy').backtestMeta(opts.strategy, asset, tf, {
+        amount: opts.amount,
+        payout: opts.payout,
+        expiryBars: opts.expiryBars,
+        warmupBars: opts.warmupBars,
+        startEquity: opts.startEquity,
+      })
     }
     // deep read: the backtest lab sees the full accumulated history (up to 2200 bars)
     // Task 59 (P1): closedOnly for the same live-parity reason as runStrategy.

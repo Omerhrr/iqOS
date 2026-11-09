@@ -3244,14 +3244,22 @@ const httpServer = createServer(async (req, res) => {
               params: [],
               defaults: {},
             })),
-            // Saved Meta-Strategy combos (meta:<slug>) - live-only (no
-            // candle-slice evaluate exists), so these always arm forced-
-            // unvalidated; surfaced here so a bot's strategy picker can list
-            // and select them, same as custom:* Lab specs above.
+            // Saved Meta-Strategy combos (meta:<slug>). Most condition
+            // sources read another plugin's LIVE-only scan cache/tick
+            // buffer (no historical record), so a bot using one of THOSE
+            // still always needs force:true to arm. A spec built only from
+            // pure-candle sources (renko, technical, reversal,
+            // pointFigure/rangeBars/candle/bar/heikinAshi/line/area/
+            // baseline/volumeBars/tpo/ivHv/volumeProfile/deltaProfile/
+            // lineBreak/kagi/swing) IS backtestable now - analytics.ts's
+            // runBacktest() delegates meta: ids to MetaStrategyService.
+            // backtestMeta(), which honestly replays those sources over
+            // archived candles and rejects (naming the exact source) any
+            // spec that mixes in a live-only one.
             ...kernel.context().use<MetaStrategyService>('metaStrategy').list().map((s) => ({
               id: s.id,
-              name: `${s.name} (Meta-Strategy, live-only)`,
-              description: `panel-combinator strategy - built from live panel reads, not candles; can't be backtested, so a bot using it always needs force:true to arm`,
+              name: `${s.name} (Meta-Strategy)`,
+              description: `panel-combinator strategy - backtestable here IF built only from pure-candle sources (renko/technical/reversal/pointFigure/rangeBars/candle/bar/heikinAshi/line/area/baseline/volumeBars/tpo/ivHv/volumeProfile/deltaProfile/lineBreak/kagi/swing); a spec using any other source (footprint/tempo/screener/smc/etc.) stays live-only and a bot using it needs force:true to arm`,
               params: [],
               defaults: {},
             })),
