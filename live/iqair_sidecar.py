@@ -1668,6 +1668,38 @@ class Handler(BaseHTTPRequestHandler):
                 password = body.get("password") or ""
                 if not email or not password:
                     return self._send(_err("email and password required"), 400)
+                # Drop the previous session's websocket before starting a new
+                # one. Its background receive thread otherwise keeps running
+                # against the OLD account for a few seconds after _client is
+                # reassigned below (connect() for the NEW client already
+                # closes whatever websocket IT was holding, but never touches
+                # a DIFFERENT client object left over from an earlier login).
+                if _client is not None:
+                    try:
+                        _client.api.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                # BUG FIX: iqair's IQOptionAPI.connect() reuses a PROCESS-WIDE
+                # global_value.SSID cookie when one is already set, instead of
+                # doing a fresh username/password login - see api.py: "if
+                # global_value.SSID != None: check_ssid = self.send_ssid()
+                # ... " and only falls back to get_ssid() (real login) if that
+                # stale cookie happens to be rejected. Every earlier connect
+                # (this manual flow, or the boot-time session resume) leaves
+                # that global SSID set, so logging in with a DIFFERENT
+                # account's credentials here silently re-authenticated the
+                # OLD account's still-valid SSID instead of the new one - the
+                # UI showed "connected" but every balance/profile/position
+                # read kept coming from the FORMER account. A manual /connect
+                # is an explicit "log in as this account" request, so it must
+                # never inherit a stale SSID from whatever was connected
+                # before - force a real login by clearing it first.
+                try:
+                    import iqair.global_value as _gv_connect
+                    _gv_connect.SSID = None
+                    _gv_connect.balance_id = None
+                except Exception:  # noqa: BLE001
+                    pass
                 client = IQOptionClient(email, password)
                 # stamp the establishment guard for the WHOLE connect window:
                 # connect() itself AND change_balance() are unbounded-busy-wait
