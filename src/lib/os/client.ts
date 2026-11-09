@@ -4883,6 +4883,14 @@ export interface AiTraderConfig {
    *  line) sizes off the running pot instead, and a loss ends the cycle -
    *  the trader stands down until restartCompound(). */
   stakePlan?: AiTraderStakePlan
+  /** Free-text operator spec - what to use in its analysis and what to
+   *  consider. When set: (1) injected into the decision prompt as an
+   *  operator focus/instructions block (never overrides the hard risk/
+   *  confidence gates); (2) replaces the per-cycle triage LLM call with a
+   *  deterministic keyword match of this text against the optional desk
+   *  seats - fewer LLM calls and fewer seats pulled per cycle. Leave empty
+   *  for the original behavior (a cheap triage call decides per cycle). */
+  spec?: string
 }
 
 export interface AiTraderStakePlan {

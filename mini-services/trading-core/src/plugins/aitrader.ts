@@ -219,7 +219,25 @@ export interface AiTraderConfig {
    *  pot/roll state in the prompt (a human at the desk knows his account
    *  state) but sizing stays the operator's lever, never the model's. */
   stakePlan?: AiTraderStakePlan
+  /** Free-text operator spec - "what to use in its analysis and what to
+   *  consider" (direct instruction), so the operator can steer the trader
+   *  instead of it always pulling the full fixed menu. Two effects:
+   *  (1) injected into the decision prompt verbatim as an operator
+   *  focus/instructions block (never overriding the hard risk/confidence
+   *  gates - stated explicitly in that block); (2) when set, REPLACES the
+   *  per-cycle triage LLM call with a deterministic, zero-token keyword
+   *  match of this text against OPTIONAL_DESK_SOURCES - the operator has
+   *  already told it what to consider, so there's nothing left to ask the
+   *  model about. undefined/empty = unchanged original behavior (no
+   *  operator steering, triage LLM call decides optional seats per cycle). */
+  spec?: string
 }
+
+/** Shared shapes between the single-asset and batched decision paths - see
+ * applyDecision()'s own doc comment for why this got pulled out of
+ * runCycleForAsset into something both paths can call. */
+interface AiTraderBet { amount: number; pot: number; rollN: number; compound: boolean; phase: 'compound' | 'derisk' }
+type DeskSnapshotLine = { source: string; direction: string; confidence: number; label: string }
 
 export interface AiTraderDecision {
   id: number
@@ -429,7 +447,33 @@ function sanitizeAiConfig(c: AiTraderConfig): AiTraderConfig {
   c.expiryChoices = [...new Set(c.expiryChoices.map((m) => Math.round(Number(m))).filter((m) => Number.isFinite(m) && m >= 1 && m <= 120))].sort((a, b) => a - b)
   if (!c.expiryChoices.length) c.expiryChoices = [...DEFAULT_CONFIG.expiryChoices]
   c.stakePlan = sanitizeAiStakePlan(c.stakePlan)
+  // Spec: free text, capped so one pasted essay can't balloon every prompt
+  // forever - 3000 chars is generous for "what to use/consider" guidance,
+  // well short of anything that would meaningfully crowd out the briefing.
+  if (typeof c.spec !== 'string' || !c.spec.trim()) c.spec = undefined
+  else c.spec = c.spec.trim().slice(0, 3000)
   return c
+}
+
+/** Operator-facing description of what THIS cycle actually scans - the one
+ * string every status/log line should use instead of unconditionally
+ * interpolating `config.asset` (which is only meaningful in 'single' mode).
+ * AUDIT (real report: saving config while on 'selected'/'global' still
+ * logged "... selected · BTCUSD 2m ..." - the single-pair field verbatim,
+ * regardless of scan mode): every one of this plugin's own status/log
+ * strings (online(), configure()'s save toast, the halted/max-concurrent
+ * skip logs) now goes through this one function instead of each
+ * reimplementing (or forgetting) the scanMode branch - the exact same
+ * branch AiTraderPanel.tsx's header line already gets right on the
+ * frontend, just centralized here so the backend's own logs can't drift
+ * from it again. */
+function scanDescription(c: AiTraderConfig): string {
+  if (c.scanMode === 'selected') {
+    const n = (c.selectedAssets ?? []).filter(Boolean).length
+    return n ? `${n} selected pair${n === 1 ? '' : 's'} (${c.selectedAssets.slice(0, 6).join(', ')}${n > 6 ? ', …' : ''}) ${c.tf}` : `${c.asset} ${c.tf} (no pairs selected yet - falling back to the single asset)`
+  }
+  if (c.scanMode === 'global') return `Screener's top ${c.maxScanPerCycle} ranked pair(s) on ${c.tf}`
+  return `${c.asset} ${c.tf}`
 }
 
 /** Per-expiry-choice read, computed directly off the raw candles rather than
@@ -547,6 +591,53 @@ const OPTIONAL_DESK_SOURCES: { id: string; label: string }[] = [
 ]
 const OPTIONAL_DESK_IDS = new Set(OPTIONAL_DESK_SOURCES.map((s) => s.id))
 
+/** A few human-typed aliases for the catalog's own ids, so an operator spec
+ * that says "footprint" or "indicator board" matches without needing to
+ * know the exact camelCase id. Deliberately short - the id itself and its
+ * own label words already match via the substring scan in
+ * specSelectedSources below, this only covers the common short-hands that
+ * wouldn't otherwise appear in the label text. */
+const OPTIONAL_DESK_ALIASES: Record<string, string[]> = {
+  nextExpiry: ['next expiry', 'expiry oracle'],
+  tempo: ['shot license', 'rhythm'],
+  confluenceScreener: ['confluence'],
+  screenerRank: ['universe rank', 'ou', 'mean reversion', 'mean-reversion'],
+  smcScan: ['candle smc', 'candle-smc'],
+  chartSignals: ['chart pattern', 'pattern committee'],
+  leadLag: ['lead-lag', 'lead lag', 'correlated leader'],
+  volArb: ['vol-arb', 'vol arb', 'volatility arb', 'volatility-arb'],
+  cointegration: ['cointegrated', 'spread stretch'],
+  yesterdayEcho: ['yesterday', 't-24h', 'replay'],
+  aiLab: ['ai lab', 'learned spec'],
+  indicatorBoard: ['indicator board', 'full indicator'],
+  msl: ['meta-strategy', 'meta strategy', 'own spec', 'own script'],
+}
+
+/** Deterministic, zero-token stand-in for triageSelectSources - scans the
+ * operator's own spec text for the catalog's ids, labels, and the aliases
+ * above. Per direct instruction ("tell this what to use ... so it wont
+ * just be running too much tool and consuming token"): when the operator
+ * has already said what to consider, asking the model to triage AGAIN
+ * every single cycle is a second LLM call spent re-deriving an answer the
+ * operator already gave. Returns the matched id set - deliberately CAN be
+ * empty (operator's spec was pure behavioral guidance, naming no optional
+ * seat by name), which still correctly means "core-only briefing," not
+ * "match failed, fall back to triage" - once a spec is set, triage never
+ * runs again for that cycle, matched or not. */
+function specSelectedSources(spec: string): Set<string> {
+  const hay = spec.toLowerCase()
+  const out = new Set<string>()
+  for (const s of OPTIONAL_DESK_SOURCES) {
+    const idWords = s.id.replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase()
+    const labelHead = s.label.split(' - ')[0].toLowerCase()
+    const aliases = OPTIONAL_DESK_ALIASES[s.id] ?? []
+    if (hay.includes(s.id.toLowerCase()) || hay.includes(idWords) || hay.includes(labelHead) || aliases.some((a) => hay.includes(a))) {
+      out.add(s.id)
+    }
+  }
+  return out
+}
+
 /** Parses the triage call's reply - same strict-then-forgiving ladder as
  * parseDecision, but tolerant of a bare JSON array too (the simplest
  * correct answer to "which of these do you want") alongside the
@@ -618,6 +709,44 @@ function parseDecision(raw: string, allowedExpiries: number[]): ParsedDecision |
       : fallbackExpiry
   const reasoning = String(obj.reasoning ?? '').trim() || '(no reasoning given)'
   return { direction, confidence, expiryMin, reasoning }
+}
+
+/** Same strict-then-forgiving extraction ladder as parseDecision, for the
+ * BATCHED reply shape: a JSON array of per-asset objects instead of one
+ * bare object. Each element is run back through parseDecision's own
+ * per-field parsing (by reusing it on the stringified element) so a single
+ * malformed entry can't throw the whole batch - it's just dropped (the
+ * caller already treats a missing asset as its own skip, see
+ * runBatchCycle). Keyed by the asset's UPPERCASE name (sanitizeAiConfig
+ * already upper-cases every asset this plugin ever scans, so this matches
+ * consistently regardless of what case the model echoed back). */
+function parseBatchDecisions(raw: string, allowedExpiries: number[]): Map<string, ParsedDecision> {
+  const tryParse = (text: string): unknown => {
+    try {
+      return JSON.parse(text)
+    } catch {
+      return null
+    }
+  }
+  let v = tryParse(raw.trim())
+  if (v === null) {
+    const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i)
+    if (fenced) v = tryParse(fenced[1].trim())
+  }
+  if (v === null) {
+    const bracketed = raw.match(/\[[\s\S]*\]/)
+    if (bracketed) v = tryParse(bracketed[0])
+  }
+  const out = new Map<string, ParsedDecision>()
+  const arr: unknown[] = Array.isArray(v) ? v : []
+  for (const item of arr) {
+    if (typeof item !== 'object' || item === null) continue
+    const asset = String((item as { asset?: unknown }).asset ?? '').trim().toUpperCase()
+    if (!asset) continue
+    const parsed = parseDecision(JSON.stringify(item), allowedExpiries)
+    if (parsed) out.set(asset, parsed)
+  }
+  return out
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,7 +1233,7 @@ export class AiTraderService {
     this.unsubPlan = ctx.bus.on('positionClosed', ({ position }: { position: { strategy?: string; status: string; pnl?: number; amount?: number } }) => this.onPlanPositionClosed(position))
     ctx.log(
       'ai-trader',
-      `AI Trader online - ${this.config.enabled ? 'ENABLED' : 'disabled'}, ${this.config.live ? 'LIVE' : 'shadow (logging only)'}, ${this.config.asset} ${this.config.tf}, every ${this.config.intervalMin}min${this.config.stakePlan ? `, compound pot (seed $${this.config.stakePlan.base}, roll x${this.plan.rollN}${this.plan.halted ? ', HALTED - restart to trade again' : ''})` : ''}`,
+      `AI Trader online - ${this.config.enabled ? 'ENABLED' : 'disabled'}, ${this.config.live ? 'LIVE' : 'shadow (logging only)'}, ${this.config.scanMode}: ${scanDescription(this.config)}, every ${this.config.intervalMin}min${this.config.stakePlan ? `, compound pot (seed $${this.config.stakePlan.base}, roll x${this.plan.rollN}${this.plan.halted ? ', HALTED - restart to trade again' : ''})` : ''}`,
     )
     this.scheduleTimer()
   }
@@ -1168,7 +1297,7 @@ export class AiTraderService {
     this.scheduleTimer()
     this.emit(
       'info',
-      `AI Trader config updated - ${this.config.enabled ? 'enabled' : 'disabled'} · ${this.config.live ? 'LIVE' : 'shadow'} · ${this.config.scanMode} · ${this.config.asset} ${this.config.tf} · every ${this.config.intervalMin}min · max ${this.config.maxConcurrent} concurrent${this.config.stakePlan ? ` · compound pot (seed $${this.config.stakePlan.base}, rollPct ${this.config.stakePlan.rollPct ?? 100}%)` : ''}`,
+      `AI Trader config updated - ${this.config.enabled ? 'enabled' : 'disabled'} · ${this.config.live ? 'LIVE' : 'shadow'} · ${this.config.scanMode} · ${scanDescription(this.config)} · every ${this.config.intervalMin}min · max ${this.config.maxConcurrent} concurrent${this.config.stakePlan ? ` · compound pot (seed $${this.config.stakePlan.base}, rollPct ${this.config.stakePlan.rollPct ?? 100}%)` : ''}`,
     )
     return this.config
   }
@@ -1956,7 +2085,7 @@ export class AiTraderService {
           ? `compound cycle COMPLETE (${this.plan.rollN}/${this.config.stakePlan.periods ?? '?'} periods banked) - standing down until restarted, no LLM call made`
           : 'compound cycle ended on a loss - standing down until restarted, no LLM call made'
         this.store.recordAiTraderDecision({
-          asset: this.config.asset, tf: this.config.tf, direction: 'skip', confidence: 0,
+          asset: scanDescription(this.config), tf: this.config.tf, direction: 'skip', confidence: 0,
           reasoning: why, snapshot: [], live: this.config.live, acted: false, ts,
         })
         this.emit('warn', `[AI Trader] ${why}`)
@@ -2012,7 +2141,7 @@ export class AiTraderService {
         const slots = Math.max(0, this.config.maxConcurrent - openCount)
         if (slots <= 0) {
           this.store.recordAiTraderDecision({
-            asset: candidates[0], tf: this.config.tf, direction: 'skip', confidence: 0,
+            asset: scanDescription(this.config), tf: this.config.tf, direction: 'skip', confidence: 0,
             reasoning: `at max concurrent AI Trader position(s) (${openCount}/${this.config.maxConcurrent} open)${otherOpen ? ` - ${otherOpen} OTHER non-AI-Trader position(s) also open on the account right now (manual/autopilot/meta-strategy, not capped by this setting)` : ''} - cycle skipped before any analysis, no LLM call made`,
             snapshot: [], live: this.config.live, acted: false, ts,
           })
@@ -2021,30 +2150,48 @@ export class AiTraderService {
         }
       }
 
-      const decisions: AiTraderDecision[] = []
-      for (const candidate of candidates.slice(0, budget)) {
-        const d = await this.runCycleForAsset(candidate, this.config.tf, ts)
-        if (d) decisions.push(d)
-        // A trade opened by one candidate consumes a concurrency slot the
-        // NEXT candidate in this same loop might have been counting on -
-        // re-check before continuing rather than trusting the budget
-        // computed before any of them ran.
-        if (this.config.live && d?.acted) {
-          const openNow = this.store.listPositions('open').filter((p) => p.strategy === 'ai-trader').length
-          if (openNow >= this.config.maxConcurrent) break
+      // 'single' always has exactly 1 candidate, so there's nothing to
+      // batch - keep its own dedicated per-asset LLM call unchanged.
+      // 'selected'/'global' run through runBatchCycle instead: ONE LLM
+      // call covers every candidate in this cycle (see that method's own
+      // doc comment) rather than one dedicated call per candidate.
+      if (this.config.scanMode === 'single') {
+        const decisions: AiTraderDecision[] = []
+        for (const candidate of candidates.slice(0, budget)) {
+          const d = await this.runCycleForAsset(candidate, this.config.tf, ts)
+          if (d) decisions.push(d)
+          if (this.config.live && d?.acted) {
+            const openNow = this.store.listPositions('open').filter((p) => p.strategy === 'ai-trader').length
+            if (openNow >= this.config.maxConcurrent) break
+          }
         }
+        return decisions.length ? decisions : null
       }
-      return decisions.length ? decisions : null
+      return await this.runBatchCycle(candidates.slice(0, budget), this.config.tf, ts)
     } finally {
       this.running = false
     }
   }
 
-  /** Full own-analysis -> desk-cross-check -> learn-from-track-record ->
-   * decide pipeline for ONE asset - unchanged from the original single-
-   * asset runCycle, just parameterized so the orchestrator above can call
-   * it once per scanned candidate instead of always on `this.config.asset`. */
-  private async runCycleForAsset(asset: string, tf: Timeframe, ts: number): Promise<AiTraderDecision | null> {
+  /** Full own-analysis -> desk-cross-check pipeline for ONE asset, STOPPING
+   * right before the LLM call - everything through building the `system`/
+   * `user` chat messages, never calling out to an LLM itself. Pulled out of
+   * the old single monolithic runCycleForAsset (the gate/compute/prompt-
+   * build logic itself is untouched, word for word) so BOTH scan paths can
+   * share it: the single-asset path (runCycleForAsset below) calls the LLM
+   * immediately on the one result; the batched path (runBatchCycle) calls
+   * this once per candidate (still gates/computes exactly the same, this
+   * part costs CPU, not tokens) and then fires exactly ONE combined LLM
+   * call across every candidate that survived its own gates - see
+   * runBatchCycle's own doc comment for why. Returns null when a gate
+   * already recorded its own skip decision (broker cooldown, no price,
+   * thin/stale history) - the caller has nothing further to do for that
+   * candidate, same contract the old inline early-returns always had. */
+  private async prepareAssetAnalysis(
+    asset: string,
+    tf: Timeframe,
+    ts: number,
+  ): Promise<{ system: ChatMessage; user: ChatMessage; price: number; snapshotWithDesk: DeskSnapshotLine[]; bet: AiTraderBet; sourcesSeen: number } | null> {
     try {
       // Broker-rejection cooldown - BEFORE any snapshot/candle/LLM work,
       // same fail-closed spirit as the stale-candle gate below. Without
@@ -2309,7 +2456,10 @@ export class AiTraderService {
       // every scanner on every cycle regardless of whether this pair/
       // moment needs it - so a cheap triage call picks which EXTRA seats
       // (if any) are worth computing before the full briefing is built.
-      const optionalIds = await this.triageSelectSources(asset, tf, horizonLines, recentCloses, anatomy, structure, atrPct, rsiLast, ownMathSummaryForTriage)
+      // Operator spec, when set, REPLACES the triage LLM call entirely -
+      // see specSelectedSources' own doc comment: the operator already said
+      // what to consider, so there's nothing left to ask the model.
+      const optionalIds = this.config.spec ? specSelectedSources(this.config.spec) : await this.triageSelectSources(asset, tf, horizonLines, recentCloses, anatomy, structure, atrPct, rsiLast, ownMathSummaryForTriage)
       const briefing = await this.deskBriefingFor(asset, tf, ts, bet.amount, optionalIds, {
         realTicks: rawTicks.length ? rawTicks.map((t) => ({ time: Math.floor(t.ts / 1000), price: t.price })) : null,
         otcFootprint: footprintResult ? { ...footprintResult.summary, buckets: footprintResult.buckets.length } : null,
@@ -2418,6 +2568,15 @@ export class AiTraderService {
           '   more than your 65%? does one direction keep losing on this pair?) are below - correct any inflation',
           '   or bias you find there NOW, in this decision.',
           '',
+          ...(this.config.spec
+            ? [
+                'OPERATOR FOCUS/INSTRUCTIONS (what the operator told you to use/consider this run - weigh your',
+                'analysis accordingly, but this never overrides the hard risk/confidence gates above or the',
+                'memory-gate/kill-switch/sentinel seats - those still win regardless of what this says):',
+                this.config.spec,
+                '',
+              ]
+            : []),
           'Respond with ONLY a JSON object, no prose outside it, in exactly this shape:',
           '{"direction": "call" | "put" | "skip", "confidence": 0-100, "expiryMin": <the ONE allowed choice your analysis is clearest on>, "reasoning": "<2-4 sentences: your own read of the price action, which desk evidence you weighed and how its calibration graded it, whether you sided with or against the desk, and why THIS expiry>"}',
         ].join('\n'),
@@ -2477,106 +2636,7 @@ export class AiTraderService {
         ].join('\n'),
       }
 
-      let content: string
-      let provider = ''
-      let model = ''
-      try {
-        const res = await callLlm(resolveAppUrl(this.config), [system, user], { temperature: 0.3, maxTokens: 900, timeoutMs: 45_000 })
-        content = res.content
-        provider = res.provider
-        model = res.model
-      } catch (err) {
-        const msg = String(err instanceof Error ? err.message : err)
-        this.lastError = msg
-        this.store.recordAiTraderDecision({
-          asset, tf, direction: 'skip', confidence: 0, reasoning: `LLM call failed: ${msg}`,
-          snapshot: snapshotWithDesk, live: this.config.live, acted: false, error: msg, priceAtDecision: price || undefined, ts,
-        })
-        this.emit('warn', `AI Trader cycle failed on ${asset} ${tf}: ${msg}`)
-        return null
-      }
-
-      const parsed = parseDecision(content, this.config.expiryChoices)
-      if (!parsed) {
-        this.lastError = 'model reply was not parseable JSON'
-        this.store.recordAiTraderDecision({
-          asset, tf, direction: 'skip', confidence: 0, reasoning: `unparseable model reply: ${content.slice(0, 300)}`,
-          snapshot: snapshotWithDesk, live: this.config.live, acted: false, provider, model, error: 'unparseable reply', priceAtDecision: price || undefined, ts,
-        })
-        this.emit('warn', `AI Trader got an unparseable reply on ${asset} ${tf} - treated as skip`)
-        return null
-      }
-      this.lastError = null
-
-      // the floor is enforced HERE, not just suggested in the prompt - a
-      // model that talks itself into high confidence on a weak setup still
-      // gets overridden if the operator's own floor says no
-      let direction = parsed.direction
-      // PRECISION FIX: before comparing to the floor, haircut the model's
-      // SELF-reported confidence against its own account-wide track record
-      // in this exact direction+bucket (see calibratedConfidence's doc
-      // comment) - a model whose claimed 85%+ CALLs have actually only won
-      // ~55% of the time no longer gets to clear minConfidence just by
-      // saying "85%" again; the number used for the gate (and recorded to
-      // the decision log) is the calibration-corrected one.
-      let effectiveConfidence = parsed.confidence
-      let calibrationNote = ''
-      if (direction === 'call' || direction === 'put') {
-        const calRows = this.accountCalibrationRows()
-        const cal = calibratedConfidence(calRows, direction, parsed.confidence)
-        if (cal.adjusted !== parsed.confidence) {
-          effectiveConfidence = cal.adjusted
-          calibrationNote = ` [calibration haircut: claimed ${parsed.confidence.toFixed(0)}% -> ${effectiveConfidence.toFixed(0)}% - this trader's own ${direction.toUpperCase()} calls at that confidence have realized ${cal.realized?.toFixed(0)}% over ${cal.sample} graded trades]`
-        }
-      }
-      if (direction !== 'skip' && effectiveConfidence < this.config.minConfidence) {
-        direction = 'skip'
-      }
-
-      let acted = false
-      let positionId: string | null = null
-      let actionError: string | undefined
-
-      if (direction !== 'skip' && this.config.live) {
-        const out = await this.exec.placeOrder({
-          asset,
-          tf,
-          side: direction,
-          kind: this.config.kind,
-          amount: bet.amount,
-          expirySec: minToSec(parsed.expiryMin),
-          mode: this.exec.accountSource === 'iq' ? 'live' : 'paper',
-          strategy: 'ai-trader',
-          note: 'ai-trader',
-        })
-        if (out.ok && out.position) {
-          acted = true
-          positionId = out.position.id
-          this.emit('success', `[AI Trader] ${direction.toUpperCase()} ${asset} $${bet.amount.toFixed(2)}${bet.compound ? ` (compound ${bet.phase} roll x${bet.rollN + 1}, pot $${bet.pot.toFixed(2)})` : ''} @ ${parsed.expiryMin}min - ${parsed.reasoning} (confidence ${parsed.confidence.toFixed(0)}%, desk: ${briefing.sourcesSeen} sources reporting)`)
-        } else {
-          actionError = out.error ?? 'order rejected'
-          if (AI_TRADER_BROKER_UNAVAILABLE_RE.test(actionError)) {
-            this.assetRejectedUntil.set(asset, ts + AI_TRADER_UNAVAILABLE_COOLDOWN_SEC)
-          }
-          this.emit('warn', `[AI Trader] wanted ${direction.toUpperCase()} ${asset} but the order was rejected: ${actionError}`)
-        }
-      } else if (direction !== 'skip') {
-        // shadow mode - a real decision, logged, but no order placed
-        this.emit('info', `[AI Trader][SHADOW] would ${direction.toUpperCase()} ${asset} $${bet.amount.toFixed(2)}${bet.compound ? ` (compound ${bet.phase} roll x${bet.rollN + 1}, pot $${bet.pot.toFixed(2)})` : ''} @ ${parsed.expiryMin}min - ${parsed.reasoning} (confidence ${parsed.confidence.toFixed(0)}%, desk: ${briefing.sourcesSeen} sources reporting)`)
-      }
-
-      this.store.recordAiTraderDecision({
-        // confidence recorded (and gated on above) is the CALIBRATED number,
-        // not the model's raw claim - the decision log, the stake plan, and
-        // next cycle's own calibration bucket should all see the honest
-        // figure, not the possibly-inflated one the model said out loud
-        asset, tf, direction, confidence: effectiveConfidence, expiryMin: parsed.expiryMin,
-        reasoning: parsed.reasoning + calibrationNote, snapshot: snapshotWithDesk, live: this.config.live, acted, positionId: positionId ?? undefined,
-        provider, model, error: actionError, priceAtDecision: price || undefined, ts,
-      })
-
-      const rows = this.store.listAiTraderDecisions(1)
-      return (rows[0] as AiTraderDecision) ?? null
+      return { system, user, price, snapshotWithDesk, bet, sourcesSeen: briefing.sourcesSeen }
     } catch (err) {
       // Never let one bad candidate (in a multi-asset scan) throw the whole
       // cycle - log it and let the orchestrator move on to the next one.
@@ -2585,6 +2645,243 @@ export class AiTraderService {
       this.emit('warn', `AI Trader cycle failed on ${asset} ${tf}: ${msg}`)
       return null
     }
+  }
+
+  /** Single-asset entry point ('single' scan mode, always exactly 1
+   * candidate) - thin now: prepare the one asset's briefing, fire its own
+   * dedicated LLM call, apply the decision. Byte-for-byte the same
+   * behavior as the original monolithic runCycleForAsset this replaced -
+   * see prepareAssetAnalysis's own doc comment for the split rationale. */
+  private async runCycleForAsset(asset: string, tf: Timeframe, ts: number): Promise<AiTraderDecision | null> {
+    const prep = await this.prepareAssetAnalysis(asset, tf, ts)
+    if (!prep) return null
+    const { system, user, price, snapshotWithDesk, bet, sourcesSeen } = prep
+    let content: string
+    let provider = ''
+    let model = ''
+    try {
+      const res = await callLlm(resolveAppUrl(this.config), [system, user], { temperature: 0.3, maxTokens: 900, timeoutMs: 45_000 })
+      content = res.content
+      provider = res.provider
+      model = res.model
+    } catch (err) {
+      const msg = String(err instanceof Error ? err.message : err)
+      this.lastError = msg
+      this.store.recordAiTraderDecision({
+        asset, tf, direction: 'skip', confidence: 0, reasoning: `LLM call failed: ${msg}`,
+        snapshot: snapshotWithDesk, live: this.config.live, acted: false, error: msg, priceAtDecision: price || undefined, ts,
+      })
+      this.emit('warn', `AI Trader cycle failed on ${asset} ${tf}: ${msg}`)
+      return null
+    }
+    return await this.applyDecision(asset, tf, ts, price, snapshotWithDesk, bet, sourcesSeen, parseDecision(content, this.config.expiryChoices), content, provider, model)
+  }
+
+  /** Multi-asset entry point ('selected'/'global' scan modes) - direct
+   * instruction: "for its selected pairs and global, we should create a
+   * way that it will run them in a single tool calling not seperate, to
+   * minimize token consumption." The old behavior called
+   * prepareAssetAnalysis + a FULL dedicated LLM call once PER candidate
+   * (N candidates -> N ~900-word-system-prompt round trips every cycle,
+   * each paying that huge system prompt's token cost again). This instead
+   * runs prepareAssetAnalysis for every candidate (CPU only, never an LLM
+   * call - unchanged gating/desk-building per asset) and then fires
+   * EXACTLY ONE LLM call for the whole cycle: one shared system prompt
+   * (same senior-trader framing, asking for a JSON ARRAY instead of one
+   * object) plus one combined user message holding every surviving
+   * candidate's own full desk briefing, each clearly asset-labeled. A
+   * candidate that fails its own gate (broker cooldown / no price / thin
+   * or stale history) is excluded from the batch and has already recorded
+   * its own skip decision by prepareAssetAnalysis - exactly like the old
+   * per-candidate loop. The model must return one decision per surviving
+   * asset; a response that omits one is logged as its own skip ("model
+   * omitted this asset..."), never silently dropped. */
+  private async runBatchCycle(candidates: string[], tf: Timeframe, ts: number): Promise<AiTraderDecision[] | null> {
+    const preps: { asset: string; prep: NonNullable<Awaited<ReturnType<AiTraderService['prepareAssetAnalysis']>>> }[] = []
+    for (const asset of candidates) {
+      const prep = await this.prepareAssetAnalysis(asset, tf, ts)
+      if (prep) preps.push({ asset, prep })
+    }
+    if (!preps.length) return null // every candidate already gated out + logged
+
+    // Shared system prompt: identical senior-trader framing every
+    // candidate's own `system` message already carries (that text has no
+    // per-asset content at all - confirmed by using the FIRST candidate's
+    // system message verbatim, just swapping its single-object closing
+    // instruction for an array one covering every asset in this batch).
+    const arrayInstruction =
+      'Respond with ONLY a JSON ARRAY, no prose outside it, with exactly one object per asset listed below (use its exact ' +
+      'name in an "asset" field), in exactly this shape: [{"asset": "<name>", "direction": "call" | "put" | "skip", ' +
+      '"confidence": 0-100, "expiryMin": <the ONE allowed choice your analysis is clearest on>, "reasoning": "<2-4 sentences ' +
+      '- your own read, which desk evidence you weighed and how its calibration graded it, whether you sided with or ' +
+      'against the desk, and why THIS expiry>"}, ...] - analyze and decide on EACH asset independently; one asset\'s ' +
+      'evidence must never leak into another\'s decision.'
+    const sharedSystemLines = String(preps[0].prep.system.content).split('\n')
+    const closingIdx = sharedSystemLines.findIndex((l) => l.startsWith('Respond with ONLY a JSON object'))
+    const batchSystem: ChatMessage = {
+      role: 'system',
+      content: (closingIdx >= 0 ? [...sharedSystemLines.slice(0, closingIdx), arrayInstruction] : [...sharedSystemLines, '', arrayInstruction]).join('\n'),
+    }
+    const batchUser: ChatMessage = {
+      role: 'user',
+      content: preps.map(({ asset, prep }) => `=================== ASSET: ${asset} ===================\n${prep.user.content}`).join('\n\n'),
+    }
+
+    let content: string
+    let provider = ''
+    let model = ''
+    try {
+      const res = await callLlm(resolveAppUrl(this.config), [batchSystem, batchUser], {
+        temperature: 0.3,
+        // scales with candidate count rather than a fixed 900 - a batch of
+        // N assets needs roughly N decision objects back, not one.
+        maxTokens: Math.min(6000, 350 * preps.length + 300),
+        timeoutMs: Math.min(90_000, 45_000 + 4_000 * preps.length),
+      })
+      content = res.content
+      provider = res.provider
+      model = res.model
+    } catch (err) {
+      const msg = String(err instanceof Error ? err.message : err)
+      this.lastError = msg
+      const decisions: AiTraderDecision[] = []
+      for (const { asset, prep } of preps) {
+        this.store.recordAiTraderDecision({
+          asset, tf, direction: 'skip', confidence: 0, reasoning: `batched LLM call failed: ${msg}`,
+          snapshot: prep.snapshotWithDesk, live: this.config.live, acted: false, error: msg, priceAtDecision: prep.price || undefined, ts,
+        })
+        const rows = this.store.listAiTraderDecisions(1)
+        if (rows[0]) decisions.push(rows[0] as AiTraderDecision)
+      }
+      this.emit('warn', `AI Trader batched cycle failed on ${preps.length} candidate(s): ${msg}`)
+      return decisions.length ? decisions : null
+    }
+
+    const parsedByAsset = parseBatchDecisions(content, this.config.expiryChoices)
+    const decisions: AiTraderDecision[] = []
+    for (const { asset, prep } of preps) {
+      const parsed = parsedByAsset.get(asset.toUpperCase()) ?? null
+      const d = await this.applyDecision(
+        asset, tf, ts, prep.price, prep.snapshotWithDesk, prep.bet, prep.sourcesSeen,
+        parsed, parsed ? content : `${content}\n\n(no entry for ${asset} in the batched reply)`, provider, model,
+      )
+      if (d) decisions.push(d)
+      // same re-check as the old sequential loop: a trade opened by one
+      // candidate consumes a concurrency slot a LATER candidate in this
+      // same batch might have been counting on.
+      if (this.config.live && d?.acted) {
+        const openNow = this.store.listPositions('open').filter((p) => p.strategy === 'ai-trader').length
+        if (openNow >= this.config.maxConcurrent) break
+      }
+    }
+    return decisions.length ? decisions : null
+  }
+
+  /** The parse -> confidence-floor -> calibration-haircut -> place-order ->
+   * log tail - pulled out of runCycleForAsset (unchanged logic, word for
+   * word) so the BATCHED scan path (runBatchCycle below) can apply a
+   * decision that came back as one entry of a combined multi-asset reply,
+   * not just a single-asset `content` string, without duplicating this
+   * floor/calibration/placement logic a second time (which is exactly the
+   * kind of drift this file's own Ground Rules elsewhere warn about -
+   * three independent re-derivations of the same math is how they go
+   * subtly out of sync). `parsed`/`rawContent` split (rather than always
+   * re-parsing a string here) is what lets the batch path hand in an
+   * already-parsed per-asset object straight from the one combined LLM
+   * reply. */
+  private async applyDecision(
+    asset: string,
+    tf: Timeframe,
+    ts: number,
+    price: number,
+    snapshotWithDesk: DeskSnapshotLine[],
+    bet: AiTraderBet,
+    sourcesSeen: number,
+    parsed: ParsedDecision | null,
+    rawContent: string,
+    provider: string,
+    model: string,
+  ): Promise<AiTraderDecision | null> {
+    if (!parsed) {
+      this.lastError = 'model reply was not parseable JSON'
+      this.store.recordAiTraderDecision({
+        asset, tf, direction: 'skip', confidence: 0, reasoning: `unparseable model reply: ${rawContent.slice(0, 300)}`,
+        snapshot: snapshotWithDesk, live: this.config.live, acted: false, provider, model, error: 'unparseable reply', priceAtDecision: price || undefined, ts,
+      })
+      this.emit('warn', `AI Trader got an unparseable reply on ${asset} ${tf} - treated as skip`)
+      return null
+    }
+    this.lastError = null
+
+    // the floor is enforced HERE, not just suggested in the prompt - a
+    // model that talks itself into high confidence on a weak setup still
+    // gets overridden if the operator's own floor says no
+    let direction = parsed.direction
+    // PRECISION FIX: before comparing to the floor, haircut the model's
+    // SELF-reported confidence against its own account-wide track record
+    // in this exact direction+bucket (see calibratedConfidence's doc
+    // comment) - a model whose claimed 85%+ CALLs have actually only won
+    // ~55% of the time no longer gets to clear minConfidence just by
+    // saying "85%" again; the number used for the gate (and recorded to
+    // the decision log) is the calibration-corrected one.
+    let effectiveConfidence = parsed.confidence
+    let calibrationNote = ''
+    if (direction === 'call' || direction === 'put') {
+      const calRows = this.accountCalibrationRows()
+      const cal = calibratedConfidence(calRows, direction, parsed.confidence)
+      if (cal.adjusted !== parsed.confidence) {
+        effectiveConfidence = cal.adjusted
+        calibrationNote = ` [calibration haircut: claimed ${parsed.confidence.toFixed(0)}% -> ${effectiveConfidence.toFixed(0)}% - this trader's own ${direction.toUpperCase()} calls at that confidence have realized ${cal.realized?.toFixed(0)}% over ${cal.sample} graded trades]`
+      }
+    }
+    if (direction !== 'skip' && effectiveConfidence < this.config.minConfidence) {
+      direction = 'skip'
+    }
+
+    let acted = false
+    let positionId: string | null = null
+    let actionError: string | undefined
+
+    if (direction !== 'skip' && this.config.live) {
+      const out = await this.exec.placeOrder({
+        asset,
+        tf,
+        side: direction,
+        kind: this.config.kind,
+        amount: bet.amount,
+        expirySec: minToSec(parsed.expiryMin),
+        mode: this.exec.accountSource === 'iq' ? 'live' : 'paper',
+        strategy: 'ai-trader',
+        note: 'ai-trader',
+      })
+      if (out.ok && out.position) {
+        acted = true
+        positionId = out.position.id
+        this.emit('success', `[AI Trader] ${direction.toUpperCase()} ${asset} $${bet.amount.toFixed(2)}${bet.compound ? ` (compound ${bet.phase} roll x${bet.rollN + 1}, pot $${bet.pot.toFixed(2)})` : ''} @ ${parsed.expiryMin}min - ${parsed.reasoning} (confidence ${parsed.confidence.toFixed(0)}%, desk: ${sourcesSeen} sources reporting)`)
+      } else {
+        actionError = out.error ?? 'order rejected'
+        if (AI_TRADER_BROKER_UNAVAILABLE_RE.test(actionError)) {
+          this.assetRejectedUntil.set(asset, ts + AI_TRADER_UNAVAILABLE_COOLDOWN_SEC)
+        }
+        this.emit('warn', `[AI Trader] wanted ${direction.toUpperCase()} ${asset} but the order was rejected: ${actionError}`)
+      }
+    } else if (direction !== 'skip') {
+      // shadow mode - a real decision, logged, but no order placed
+      this.emit('info', `[AI Trader][SHADOW] would ${direction.toUpperCase()} ${asset} $${bet.amount.toFixed(2)}${bet.compound ? ` (compound ${bet.phase} roll x${bet.rollN + 1}, pot $${bet.pot.toFixed(2)})` : ''} @ ${parsed.expiryMin}min - ${parsed.reasoning} (confidence ${parsed.confidence.toFixed(0)}%, desk: ${sourcesSeen} sources reporting)`)
+    }
+
+    this.store.recordAiTraderDecision({
+      // confidence recorded (and gated on above) is the CALIBRATED number,
+      // not the model's raw claim - the decision log, the stake plan, and
+      // next cycle's own calibration bucket should all see the honest
+      // figure, not the possibly-inflated one the model said out loud
+      asset, tf, direction, confidence: effectiveConfidence, expiryMin: parsed.expiryMin,
+      reasoning: parsed.reasoning + calibrationNote, snapshot: snapshotWithDesk, live: this.config.live, acted, positionId: positionId ?? undefined,
+      provider, model, error: actionError, priceAtDecision: price || undefined, ts,
+    })
+
+    const rows = this.store.listAiTraderDecisions(1)
+    return (rows[0] as AiTraderDecision) ?? null
   }
 
   /** Stake-plan-aware sizing - the SAME pot math as the autopilot bots'

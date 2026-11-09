@@ -340,6 +340,20 @@ export default function AiTraderPanel({ assets, onError }: Props) {
         </label>
         <label className="col-span-2 flex flex-col gap-1 sm:col-span-4">
           <span className="text-[#7c8aa5]">
+            spec - what should it use/consider? (optional - tell it which desk seats to pull, e.g. &quot;footprint, technical, indicator board&quot;, or just
+            freeform guidance on what matters for these pairs. When set, this replaces the per-cycle triage call entirely - fewer LLM calls, fewer seats
+            pulled, lower token spend.)
+          </span>
+          <textarea
+            value={draft.spec ?? ''}
+            onChange={(e) => setDraft({ ...draft, spec: e.target.value || undefined })}
+            placeholder="leave blank for the default behavior - a cheap triage call decides which extra desk seats to pull each cycle"
+            rows={3}
+            className="rounded border border-[#1c2739] bg-[#070c15] p-1.5 text-[9.5px] text-[#dbe4f0] placeholder:text-[#4b5a72]"
+          />
+        </label>
+        <label className="col-span-2 flex flex-col gap-1 sm:col-span-4">
+          <span className="text-[#7c8aa5]">
             this app&apos;s own URL override (only matters if there&apos;s no APP_URL env var on trading-core - currently resolved to:{' '}
             <span className="font-bold text-cyan-300">{status.resolvedAppUrl}</span>)
           </span>
