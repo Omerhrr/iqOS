@@ -471,7 +471,7 @@ function SettingsDialog(props: Props & { onReset: () => void }) {
       const res = await osPost<{ ok: boolean; account: AccountState }>('/reset_all')
       if (res.ok) {
         props.onAccountChanged(res.account)
-        setClearMsg('Cleared - trade journal, P/L baselines, bot + auto-trader stats all back to zero. Connect your new account below.')
+        setClearMsg('Cleared - trade journal, P/L baselines, bot + auto-trader + Meta Trader + Omni Trader stats all back to zero. Connect your new account below.')
       }
     } catch (err) {
       setClearMsg(`Failed: ${(err as Error).message}`)
@@ -550,9 +550,9 @@ function SettingsDialog(props: Props & { onReset: () => void }) {
           <section className="border-t border-[#1c2739] pt-3">
             <h4 className="mb-1 text-[10px] font-bold uppercase tracking-[0.18em] text-rose-400">Fresh start - clear all data</h4>
             <p className="mb-2 text-[10px] leading-relaxed text-[#4b5a72]">
-              Wipes the trade journal, IQ Day P/L + Total P/L baselines, and resets the bot fleet + auto-trader stats (wins/losses,
-              streaks, compounding pots, cooldowns) to zero - for starting fresh with a new broker account. Bot configs, saved
-              strategies and risk/auto-trader settings are untouched.
+              Wipes the trade journal, IQ Day P/L + Total P/L baselines, and resets the bot fleet + auto-trader + Meta Trader +
+              Omni Trader stats (wins/losses, streaks, compounding pots, cooldowns) to zero - for starting fresh with a new
+              broker account. Bot configs, saved strategies and risk/auto-trader settings are untouched.
             </p>
             <div className="flex items-center gap-2">
               <Button

@@ -233,6 +233,22 @@ export class OmniTraderService {
     else if (position.status === 'lost') this.rt.losses += 1
   }
 
+  /** Full fresh-start for Omni Trader's own numbers - same BUG FIX and
+   * "clear RESULTS, not setup" contract as MetaTraderService.resetAllStats()
+   * (see its doc comment for the root cause: ExecutionService's "clear all
+   * data" action never called either trader's own reset, only AI Trader's
+   * and the OS auto-trader's). Wipes trades/wins/losses/pnlTotal, the
+   * per-asset cooldown/rejection-backoff maps, and the sweepEdge freshness
+   * memory; config (spec, thresholds, interval) is untouched. */
+  resetAllStats(): void {
+    this.rt = { trades: 0, wins: 0, losses: 0, pnlTotal: 0, openCount: 0, lastTradeTs: 0 }
+    this.assetCooldownUntil.clear()
+    this.rejectedUntil.clear()
+    this.sweepEdge.rearm()
+    this.rebuildOpenCount()
+    this.ctx.log('omni-trader', 'stats cleared - starting fresh')
+  }
+
   status(): { enabled: boolean; mode: OsMode; active: boolean; config: OmniTraderConfig; runtime: OmniTraderRuntime } {
     let mode: OsMode = 'human'
     try {

@@ -495,6 +495,29 @@ export class MetaTraderService {
     return { ok: true }
   }
 
+  /** Full fresh-start for Meta Trader's own numbers - BUG FIX: ExecutionService's
+   * "clear all data" action (resetAllData()) only ever reset the AI Trader
+   * (autopilot) and OS auto-trader (mode) plugins' stats - Meta Trader (and,
+   * see OmniTraderService's own resetAllStats() sibling, Omni Trader) had no
+   * such method at all, so "clear all data & start fresh" silently left
+   * every Meta Trader number (trades/wins/losses/pnlTotal, the compounding
+   * pot/rollN/halted state, per-asset cooldowns, broker-rejection backoffs,
+   * the sweepEdge freshness memory) exactly as it was from the old account.
+   * Same "clear RESULTS, not setup" contract AutoTraderService.resetStats()
+   * already follows: config (signal source, thresholds, stake plan) is
+   * untouched. */
+  resetAllStats(): void {
+    this.rt = { trades: 0, wins: 0, losses: 0, pnlTotal: 0, openCount: 0, lastTradeTs: 0, pot: 0, rollN: 0, halted: false }
+    this.assetCooldownUntil.clear()
+    this.lastTradedAt.clear()
+    this.rejectedUntil.clear()
+    this.sweepEdge.rearm()
+    this.attemptedThisTick.clear()
+    this.persist()
+    this.rebuildOpenCount()
+    this.ctx.log('meta-trader', 'stats cleared - starting fresh')
+  }
+
   status(): { enabled: boolean; mode: OsMode; active: boolean; config: MetaTraderConfig; runtime: MetaTraderRuntime; sources: readonly MetaTraderSource[] } {
     let mode: OsMode = 'human'
     try {

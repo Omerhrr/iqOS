@@ -133,13 +133,13 @@ export const CHART_PROPERTY_REGISTRY: ChartPropertyDef[] = [
     status: 'existing', mslAccessor: "indicator('streak', ...), or streak(upCandle)/streak(downCandle) with a let-bound condition",
   },
   {
-    id: 'candle.gap', label: 'Gap size + direction', description: 'Price gap between this bar\'s open and the prior bar\'s close.',
-    chartTypes: ['candles', 'hollow', 'bars'], engine: 'NOT YET BUILT',
+    id: 'candle.gap', label: 'Gap size + direction', description: 'Price gap between this bar\'s open and the prior bar\'s close, plus fill tracking.',
+    chartTypes: ['candles', 'hollow', 'bars'], engine: 'analytics/gap.ts#detectGaps',
     dataType: 'number', unit: 'price', historyKind: 'historical', updateFrequency: 'per-bar-close',
-    supportedTimeframes: 'all', supportedContexts: ALL_CONTEXTS, quality: 'unavailable',
-    qualityNote: 'No gap detector exists yet anywhere in analytics/ - scoped for Phase 2. Meaningless on OTC synthetic pairs (never gap); only matters for forex/stock session opens.',
-    missingDataBehavior: 'n/a - not implemented',
-    status: 'missing', mslAccessor: null,
+    supportedTimeframes: 'all', supportedContexts: ALL_CONTEXTS, quality: 'measured',
+    qualityNote: 'Meaningless on OTC synthetic pairs (continuous trading, essentially never gap); built for forex/real-market session opens. Math is honest and generic either way, it just rarely fires on one feed type.',
+    missingDataBehavior: 'gap.*(offset) throws a clear "no gaps yet" error when the window has none, rather than a confusing out-of-range message',
+    status: 'existing' /* resolved, loose-threads sweep */, mslAccessor: 'gap.count()/.direction(offset)/.size(offset)/.filled(offset)/.filledAt(offset)',
   },
   {
     id: 'candle.pattern', label: 'Candlestick pattern hit', description: 'Any of the 74 named Nison-catalog patterns, on raw or Heikin-Ashi bars.',
@@ -304,12 +304,12 @@ export const CHART_PROPERTY_REGISTRY: ChartPropertyDef[] = [
     status: 'existing', mslAccessor: 'pf.column(offset) -> {top, bottom, boxes} (no .dir field - read pf.boxes(n)[offset]\'s sign for direction)',
   },
   {
-    id: 'pf.doubleTopBottom', label: 'Double-top / double-bottom breakout', description: 'Classic P&F double-top/bottom column-break pattern.',
-    chartTypes: ['pointfigure'], engine: 'NOT YET BUILT',
+    id: 'pf.doubleTopBottom', label: 'Double-top / double-bottom breakout', description: 'Classic P&F double/triple-top/bottom column-break pattern.',
+    chartTypes: ['pointfigure'], engine: 'analytics/pointfigure.ts#pointFigure (buySignal/sellSignal/pattern were already computed internally; strategylang.ts#pfMethod now exposes them)',
     dataType: 'boolean', unit: 'none', historyKind: 'historical', updateFrequency: 'per-bar-close',
-    supportedTimeframes: 'all', supportedContexts: ALL_CONTEXTS, quality: 'unavailable',
-    missingDataBehavior: 'n/a - not implemented',
-    status: 'missing', mslAccessor: null,
+    supportedTimeframes: 'all', supportedContexts: ALL_CONTEXTS, quality: 'measured',
+    missingDataBehavior: 'honest "none" when no breakout pattern has occurred yet in the window, same convention as swing.structure()',
+    status: 'existing' /* resolved, loose-threads sweep */, mslAccessor: 'pf.breakout() / pf.breakoutName() / pf.breakoutAt()',
   },
 
   // ---- J: Range Bars ----
@@ -325,7 +325,7 @@ export const CHART_PROPERTY_REGISTRY: ChartPropertyDef[] = [
 
   // ---- K: Volume Bars ----
   {
-    id: 'volumebars.namespace', label: 'volumebars.* namespace', description: 'volumebars.bars(n?) signed direction series (derived - VolumeBar still carries no dir field of its own), volumebars.ohlc(offset) full OHLC with real volume, volumebars.threshold() volume-per-bar target, volumebars.volumeSource() "feed"|"none" honesty flag.',
+    id: 'volumebars.namespace', label: 'volumebars.* namespace', description: 'volumebars.bars(n?) signed direction series (STORED on VolumeBar.dir as of the loose-threads sweep, read directly rather than re-derived), volumebars.ohlc(offset) full OHLC with real volume, volumebars.threshold() volume-per-bar target, volumebars.volumeSource() "feed"|"none" honesty flag.',
     chartTypes: ['volumebars'], engine: 'analytics/volumebars.ts#volumeBars, exposed via strategylang.ts#volumebarsMethod',
     dataType: 'object', unit: 'none', historyKind: 'historical', updateFrequency: 'per-bar-close',
     supportedTimeframes: 'all', supportedContexts: ALL_CONTEXTS, quality: 'estimated',
@@ -426,25 +426,27 @@ export const CHART_PROPERTY_REGISTRY: ChartPropertyDef[] = [
     chartTypes: ['tpo'], engine: 'analytics/tpo.ts#computeTpo, exposed via strategylang.ts#tpoMethod',
     dataType: 'object', unit: 'none', historyKind: 'snapshot', updateFrequency: 'per-poll',
     supportedTimeframes: 'all', supportedContexts: ALL_CONTEXTS, quality: 'measured',
-    qualityNote: 'TPO POC is TIME-based (time spent at a price), never confuse it with a VOLUME POC - that concept does not exist anywhere in the codebase yet (see Volume Profile, roadmap section 7.1). These accessors read the CURRENT profile snapshot only (computeTpo() returns one final value per period, not a running/developing value) - developing POC/VAH/VAL remains a separate, unbuilt gap (see tpo.developingValues below).',
+    qualityNote: 'TPO POC is TIME-based (time spent at a price), never confuse it with a VOLUME POC - that concept does not exist anywhere in the codebase yet (see Volume Profile, roadmap section 7.1). These accessors read the FINAL whole-window snapshot - for the running, mid-session value see tpo.developingValues below (now built).',
     missingDataBehavior: 'returns NaN (never 0) when the engine itself returns null for an empty window',
     status: 'existing', mslAccessor: 'tpo.poc() / tpo.vah() / tpo.val() / tpo.ibHigh() / tpo.ibLow()',
   },
   {
-    id: 'tpo.developingValues', label: 'Developing POC / VAH / VAL', description: 'A running value sampled intra-period, not just the final snapshot computeTpo() returns.',
-    chartTypes: ['tpo'], engine: 'NOT YET BUILT - computeTpo() only returns one final-snapshot-per-period value today',
+    id: 'tpo.developingValues', label: 'Developing POC / VAH / VAL', description: 'A running value sampled per period as the profile builds, not just the final snapshot.',
+    chartTypes: ['tpo'], engine: 'analytics/tpo.ts#computeTpo (developingPoc/developingVah/developingVal), exposed via strategylang.ts#tpoMethod',
     dataType: 'series', unit: 'price', historyKind: 'live', updateFrequency: 'per-poll',
-    supportedTimeframes: 'all', supportedContexts: ALL_CONTEXTS, quality: 'unavailable',
-    missingDataBehavior: 'n/a - not implemented',
-    status: 'missing', mslAccessor: null,
+    supportedTimeframes: 'all', supportedContexts: ALL_CONTEXTS, quality: 'measured',
+    qualityNote: 'One value PER PERIOD (not per-candle) - recomputed using only periods[0..k], never a look-ahead into later periods.',
+    missingDataBehavior: 'returns NaN entries only on an empty window',
+    status: 'existing' /* resolved, loose-threads sweep */, mslAccessor: 'tpo.developingPoc(n?) / tpo.developingVah(n?) / tpo.developingVal(n?)',
   },
   {
     id: 'tpo.singlePrintsPoorExcess', label: 'Single prints / poor high-low / excess high-low', description: 'Classic market-profile shape markers.',
-    chartTypes: ['tpo'], engine: 'NOT YET BUILT',
+    chartTypes: ['tpo'], engine: 'analytics/tpo.ts#computeTpo (singlePrintBins/excessHigh/excessLow/poorHigh/poorLow), exposed via strategylang.ts#tpoMethod',
     dataType: 'boolean', unit: 'none', historyKind: 'historical', updateFrequency: 'per-poll',
-    supportedTimeframes: 'all', supportedContexts: ALL_CONTEXTS, quality: 'unavailable',
-    missingDataBehavior: 'n/a - not implemented',
-    status: 'missing', mslAccessor: null,
+    supportedTimeframes: 'all', supportedContexts: ALL_CONTEXTS, quality: 'measured',
+    qualityNote: 'poorHigh === !excessHigh and poorLow === !excessLow by construction (every touched extreme bin is exactly one or the other); both false together only on an empty window.',
+    missingDataBehavior: 'tpo.singlePrintPrice(offset) throws a clear "none yet" error when the window has no single-print bins',
+    status: 'existing' /* resolved, loose-threads sweep */, mslAccessor: 'tpo.singlePrintCount() / tpo.singlePrintPrice(offset) / tpo.excessHigh() / tpo.excessLow() / tpo.poorHigh() / tpo.poorLow()',
   },
 
   // ---- P: Tick Chart ----
@@ -471,7 +473,7 @@ export const CHART_PROPERTY_REGISTRY: ChartPropertyDef[] = [
     dataType: 'number', unit: 'seconds', historyKind: 'live', updateFrequency: 'per-tick',
     supportedTimeframes: 'n/a', supportedContexts: ['omniTrader'], quality: 'measured',
     missingDataBehavior: 'returns null with no ticks in window',
-    status: 'partial', mslAccessor: 'not yet wired into tickbars.ts / tick.* namespace - reuse medianTickGapMs(), don\'t reimplement',
+    status: 'existing' /* resolved, loose-threads sweep */, mslAccessor: 'tickbar.avgGapMs(per?) - reuses medianTickGapMs(), does not reimplement',
   },
 
   // ---- Q: IV/HV ----
@@ -482,15 +484,16 @@ export const CHART_PROPERTY_REGISTRY: ChartPropertyDef[] = [
     supportedTimeframes: 'all', supportedContexts: ALL_CONTEXTS, quality: 'estimated',
     qualityNote: 'ivSource: "observed"|"current"|"none" already honestly labeled - this is the one other place in the codebase (besides dataSource on ticks) that models this registry\'s own quality-labeling discipline.',
     missingDataBehavior: 'ivSource: "none" when no usable payout data exists',
-    status: 'existing', mslAccessor: '(verdict-only via the `ivHv` source today - no raw ivhv.* namespace for individual fields)',
+    status: 'existing', mslAccessor: '(verdict-only via the `ivHv` source today, plus ivhv.ivNow() below for a raw script-level accessor)',
   },
   {
-    id: 'ivhv.ratio', label: 'IV/HV ratio, vol change, vol percentile', description: 'Derived comparison metrics between the two series - not computed as named fields anywhere.',
-    chartTypes: ['ivhv'], engine: 'NOT YET BUILT (both source series exist; the ratio/change/percentile derivations do not)',
+    id: 'ivhv.ratio', label: 'IV/HV ratio', description: 'Payout-implied breakeven probability (the honest IV-analog) divided by historical volatility.',
+    chartTypes: ['ivhv'], engine: 'analytics/ivhv.ts#ivFromPayout + hvSeries, exposed via strategylang.ts#ivhvMethod',
     dataType: 'number', unit: 'ratio', historyKind: 'historical', updateFrequency: 'per-poll',
-    supportedTimeframes: 'all', supportedContexts: ALL_CONTEXTS, quality: 'unavailable',
-    missingDataBehavior: 'n/a - not implemented',
-    status: 'missing', mslAccessor: null,
+    supportedTimeframes: 'all', supportedContexts: ALL_CONTEXTS, quality: 'estimated',
+    qualityNote: 'ivNow() reads the SAME live `payout.value` source payout.* already exposes (no historical replay path) - NaN whenever no payout source was wired into this evaluation. Never label this "implied volatility" unqualified; it is the payout-implied breakeven-probability proxy, same disclosure ivhv.ts\'s own header carries.',
+    missingDataBehavior: 'NaN when payout is unavailable/0, or when hvNow() is 0 (never a divide-by-zero Infinity)',
+    status: 'existing' /* resolved, loose-threads sweep */, mslAccessor: 'ivhv.ivNow() / ivhv.ratio(window?)',
   },
 
   // ---- Volume Profile (Phase 5) ----

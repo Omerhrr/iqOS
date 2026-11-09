@@ -178,7 +178,17 @@ export class ExecutionService {
    * (open-position counts, win/loss streaks, compounding pots, per-asset
    * cooldowns) carries over into the new one. Does NOT touch bot configs,
    * saved strategies, alert rules, or risk/auto-trader settings - reconnect
-   * your new IQ account separately via /live/connect as usual. */
+   * your new IQ account separately via /live/connect as usual.
+   *
+   * BUG FIX: this only ever reset `autopilot` (AI Trader) and `mode` (the
+   * OS auto-trader) - Meta Trader and Omni Trader had no resetAllStats()
+   * method at all, so "clear all data & start fresh" silently left both
+   * engines' trade counters, compounding pots, and per-asset cooldown maps
+   * exactly as they were from the old account (visibly, Meta Trader kept
+   * showing the previous account's win/loss counts and compounding pot).
+   * Both plugins now expose the identical resetAllStats() contract
+   * autopilot/mode already did - see their own doc comments for exactly
+   * what each wipes. */
   resetAllData(): AccountState {
     this.store.clearAllTradingData()
     try {
@@ -190,6 +200,31 @@ export class ExecutionService {
       this.ctx.use<{ resetStats: () => void }>('mode').resetStats()
     } catch {
       // mode (OS auto trader) plugin not loaded - nothing to reset there
+    }
+    try {
+      this.ctx.use<{ resetAllStats: () => void }>('metaTrader').resetAllStats()
+    } catch {
+      // meta-trader plugin not loaded - nothing to reset there
+    }
+    try {
+      this.ctx.use<{ resetAllStats: () => void }>('omniTrader').resetAllStats()
+    } catch {
+      // omni-trader plugin not loaded - nothing to reset there
+    }
+    // Default-ack the Sentinel breakers as part of the same reset, so a
+    // fresh start never leaves the daily-loss/drawdown breakers latched
+    // from the OLD account's numbers requiring a separate manual "ack" in
+    // the Sentinel panel - the whole point of "clear all data" is that
+    // nothing from the previous account should still be blocking trades
+    // afterward. Sentinel's own evaluate() re-derives both breakers fresh
+    // off the very next account update anyway (see ack()'s own doc comment
+    // on why it doesn't eagerly re-check here either), so this is safe:
+    // a breaker that's genuinely still breached under the NEW account's
+    // numbers will simply re-trip on its own right after.
+    try {
+      this.ctx.use<{ ack: (breaker?: 'daily' | 'drawdown') => { ok: boolean; cleared: string[] } }>('sentinel').ack()
+    } catch {
+      // sentinel plugin not loaded - nothing to ack there
     }
     this.ctx.bus.emit('account', { account: this.account() })
     this.ctx.bus.emit('alert', { level: 'info', message: 'All trading data cleared - journal, P/L baselines and bot/auto-trader stats reset to zero', ts: this.now() })

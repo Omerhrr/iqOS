@@ -37,6 +37,16 @@ export interface VolumeBar {
   volume: number
   /** Candles aggregated into this bar. */
   candles: number
+  /** Signed bar direction (close>=open -> +1, else -1) - STORED here as of
+   * the capability-matrix follow-up sweep (claude/msl-capability-matrix.md
+   * section K: "Bar direction... VolumeBar itself still has no stored
+   * `dir` field, kept additive-only"). Previously every caller (the
+   * `volumebars.bars(n?)` MSL accessor, the client-side volumeBarsChart()
+   * transform) derived `close>=open` itself at the call site - harmless
+   * since it's a pure function of fields already on the bar, but a true
+   * gap against RangeBar/renko/P&F's own convention of storing direction
+   * once on the bar rather than re-deriving it everywhere it's read. */
+  dir: 1 | -1
 }
 
 export interface VolumeBarsResult {
@@ -81,11 +91,12 @@ export function volumeBars(candles: Candle[], opts: { per?: number } = {}): Volu
   for (const c of candles) {
     const vol = Number.isFinite(c.volume) ? c.volume : 0
     if (!cur) {
-      cur = { time: c.time, endTime: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: 0, candles: 0 }
+      cur = { time: c.time, endTime: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: 0, candles: 0, dir: c.close >= c.open ? 1 : -1 }
     }
     cur.high = Math.max(cur.high, c.high)
     cur.low = Math.min(cur.low, c.low)
     cur.close = c.close
+    cur.dir = cur.close >= cur.open ? 1 : -1
     cur.volume += vol
     cur.candles++
     acc += vol

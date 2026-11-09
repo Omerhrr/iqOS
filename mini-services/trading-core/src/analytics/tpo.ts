@@ -68,6 +68,39 @@ export interface TpoResult {
   ibLow: number | null
   periods: TpoPeriod[]
   totalTpos: number
+  /** DEVELOPING POC/VAH/VAL (claude/msl-capability-matrix.md section O,
+   * flagged "missing" since the Phase 0 audit) - one entry PER PERIOD,
+   * recomputed using only the TPOs printed by periods[0..k] (never a
+   * look-ahead into later periods) - the classic "where is the profile
+   * balancing RIGHT NOW, mid-session" read, as opposed to `poc`/
+   * `valueAreaHigh`/`valueAreaLow` above which are the FINAL, whole-window
+   * values. Entries are null only before any TPO has printed at all
+   * (never reached in practice - period 0 always prints at least one). */
+  developingPoc: (number | null)[]
+  developingVah: (number | null)[]
+  developingVal: (number | null)[]
+  /** SINGLE PRINTS (claude/msl-capability-matrix.md section O, flagged
+   * "missing" since Phase 0): bins touched by exactly ONE period - the
+   * classic "thin row" a profile reader scans for. Bin indices into
+   * `bins` above, ascending by price. */
+  singlePrintBins: number[]
+  /** POOR HIGH / POOR LOW vs. EXCESS HIGH / EXCESS LOW (claude/msl-
+   * capability-matrix.md section O, flagged "missing" since Phase 0):
+   * classic market-profile shape read at the session's price EXTREMES.
+   *   - excessHigh/excessLow: the highest/lowest TOUCHED bin was printed
+   *     by exactly one period - a clean single-print "tail" at the
+   *     extreme (rejection/exhaustion: price tried that level once and
+   *     moved away).
+   *   - poorHigh/poorLow: the highest/lowest touched bin was printed by
+   *     TWO OR MORE periods - a flat, built-up extreme with no tail
+   *     (failure to show excess - the classic "expect a retest" read).
+   *   poorHigh === !excessHigh and poorLow === !excessLow by construction
+   *   (every touched extreme bin is exactly one or the other); both false
+   *   together only on an empty window. */
+  excessHigh: boolean
+  excessLow: boolean
+  poorHigh: boolean
+  poorLow: boolean
 }
 
 const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
@@ -93,6 +126,14 @@ export function computeTpo(
     ibLow: null,
     periods: [],
     totalTpos: 0,
+    developingPoc: [],
+    developingVah: [],
+    developingVal: [],
+    singlePrintBins: [],
+    excessHigh: false,
+    excessLow: false,
+    poorHigh: false,
+    poorLow: false,
   }
   if (candles.length === 0) return { ...empty, periodRule: 'no candles' }
 
@@ -141,7 +182,31 @@ export function computeTpo(
       letters: periods.map((p) => p.letter),
       inValueArea: true,
     }]
-    return { ...empty, periodRule, binCount: 1, bins, poc: bins[0].mid, valueAreaHigh: bins[0].priceHigh, valueAreaLow: bins[0].priceLow, ibHigh: periods[0].high, ibLow: periods[0].low, periods, totalTpos: periods.length }
+    return {
+      ...empty,
+      periodRule,
+      binCount: 1,
+      bins,
+      poc: bins[0].mid,
+      valueAreaHigh: bins[0].priceHigh,
+      valueAreaLow: bins[0].priceLow,
+      ibHigh: periods[0].high,
+      ibLow: periods[0].low,
+      periods,
+      totalTpos: periods.length,
+      // single-price window: every period stacks on the one bin, so the
+      // developing values never move, there's no "single print" (every
+      // period touches it), and the extreme is maximally "poor" (never
+      // excess) as soon as 2+ periods have printed.
+      developingPoc: periods.map(() => bins[0].mid),
+      developingVah: periods.map(() => bins[0].priceHigh),
+      developingVal: periods.map(() => bins[0].priceLow),
+      singlePrintBins: periods.length === 1 ? [0] : [],
+      excessHigh: periods.length === 1,
+      excessLow: periods.length === 1,
+      poorHigh: periods.length >= 2,
+      poorLow: periods.length >= 2,
+    }
   }
   const bin = span / binCount
 
@@ -155,44 +220,81 @@ export function computeTpo(
     inValueArea: false,
   }))
 
+  const winMid = (winLow + winHigh) / 2
+
+  // Shared POC + value-area reduction over any tpos snapshot (used for both
+  // the final whole-window result and, below, each developing/running
+  // snapshot - same ties-toward-mid / two-sided-expansion rules either way).
+  const pocAndVa = (tpos: number[]): { pocIdx: number; lo: number; hi: number } => {
+    let pocIdx = 0
+    for (let b = 1; b < binCount; b++) {
+      if (tpos[b] > tpos[pocIdx] ||
+          (tpos[b] === tpos[pocIdx] && Math.abs(bins[b].mid - winMid) < Math.abs(bins[pocIdx].mid - winMid))) {
+        pocIdx = b
+      }
+    }
+    const total = tpos.reduce((s, v) => s + v, 0)
+    const target = total * 0.7
+    let va = tpos[pocIdx]
+    let lo = pocIdx
+    let hi = pocIdx
+    while (va < target && (lo > 0 || hi < binCount - 1)) {
+      const below = lo > 0 ? tpos[lo - 1] : -1
+      const above = hi < binCount - 1 ? tpos[hi + 1] : -1
+      if (above > below) {
+        hi++
+        va += tpos[hi]
+      } else {
+        lo--
+        va += tpos[lo]
+      }
+    }
+    return { pocIdx, lo, hi }
+  }
+
+  // ---- running (developing) snapshot, one period at a time ----
+  const runningTpos = new Array(binCount).fill(0)
+  const developingPoc: (number | null)[] = []
+  const developingVah: (number | null)[] = []
+  const developingVal: (number | null)[] = []
   for (const p of periods) {
     const from = Math.max(0, Math.floor((p.low - winLow) / bin))
     const to = Math.min(binCount - 1, Math.floor((p.high - winLow) / bin))
     for (let b = from; b <= to; b++) {
-      bins[b].tpos++
+      runningTpos[b]++
       bins[b].letters.push(p.letter)
     }
+    if (runningTpos.some((v) => v > 0)) {
+      const { pocIdx, lo, hi } = pocAndVa(runningTpos)
+      developingPoc.push(bins[pocIdx].mid)
+      developingVah.push(bins[hi].priceHigh)
+      developingVal.push(bins[lo].priceLow)
+    } else {
+      developingPoc.push(null)
+      developingVah.push(null)
+      developingVal.push(null)
+    }
   }
+  // runningTpos now holds the FINAL whole-window counts
+  for (let b = 0; b < binCount; b++) bins[b].tpos = runningTpos[b]
 
   const totalTpos = bins.reduce((s, b) => s + b.tpos, 0)
-
-  // ---- POC (ties resolve toward the window mid price) ----
-  const winMid = (winLow + winHigh) / 2
-  let pocIdx = 0
-  for (let b = 1; b < binCount; b++) {
-    if (bins[b].tpos > bins[pocIdx].tpos ||
-        (bins[b].tpos === bins[pocIdx].tpos && Math.abs(bins[b].mid - winMid) < Math.abs(bins[pocIdx].mid - winMid))) {
-      pocIdx = b
-    }
-  }
-
-  // ---- value area: classic two-sided expansion from POC to 70% ----
-  const target = totalTpos * 0.7
-  let va = bins[pocIdx].tpos
-  let lo = pocIdx
-  let hi = pocIdx
-  while (va < target && (lo > 0 || hi < binCount - 1)) {
-    const below = lo > 0 ? bins[lo - 1].tpos : -1
-    const above = hi < binCount - 1 ? bins[hi + 1].tpos : -1
-    if (above > below) {
-      hi++
-      va += bins[hi].tpos
-    } else {
-      lo--
-      va += bins[lo].tpos
-    }
-  }
+  const { pocIdx, lo, hi } = pocAndVa(runningTpos)
   for (let b = lo; b <= hi; b++) bins[b].inValueArea = true
+
+  // ---- single prints: bins touched by exactly one period ----
+  const singlePrintBins: number[] = []
+  for (let b = 0; b < binCount; b++) if (bins[b].tpos === 1) singlePrintBins.push(b)
+
+  // ---- poor/excess at the session extremes (highest/lowest TOUCHED bin) ----
+  let topTouched = -1
+  let bottomTouched = -1
+  for (let b = binCount - 1; b >= 0; b--) if (bins[b].tpos > 0) { topTouched = b; break }
+  for (let b = 0; b < binCount; b++) if (bins[b].tpos > 0) { bottomTouched = b; break }
+  const excessHigh = topTouched >= 0 && bins[topTouched].tpos === 1
+  const excessLow = bottomTouched >= 0 && bins[bottomTouched].tpos === 1
+  const poorHigh = topTouched >= 0 && bins[topTouched].tpos >= 2
+  const poorLow = bottomTouched >= 0 && bins[bottomTouched].tpos >= 2
 
   return {
     periodSec,
@@ -207,5 +309,13 @@ export function computeTpo(
     ibLow: periods[0].low,
     periods,
     totalTpos,
+    developingPoc,
+    developingVah,
+    developingVal,
+    singlePrintBins,
+    excessHigh,
+    excessLow,
+    poorHigh,
+    poorLow,
   }
 }

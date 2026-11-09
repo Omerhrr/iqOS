@@ -23,6 +23,8 @@
 //
 // Pure function, O(n), no look-ahead.
 
+import { medianTickGapMs } from './tickdesk'
+
 export interface TickPoint {
   time: number
   price: number
@@ -47,6 +49,14 @@ export interface TickBarsResult {
   dataSource: 'tick' | 'candle'
   timeRule: string
   bars: TickBar[]
+  /** Median inter-observation gap, in milliseconds - claude/msl-capability-
+   * matrix.md section P flagged this as "already computed (tickdesk.ts
+   * #medianTickGapMs, built for Tick Oracle/SMC), just not wired to the
+   * tick-chart engine itself." REUSED here, not reimplemented - adapts
+   * this module's own {time: seconds} TickPoint into tickdesk.ts's
+   * {ts: milliseconds} shape rather than duplicating the median-gap math.
+   * null with fewer than 2 points (nothing to measure a gap between). */
+  avgGapMs: number | null
 }
 
 export function tickBars(
@@ -83,5 +93,7 @@ export function tickBars(
   // trailing partial bar kept (the honest "still forming" bar)
   if (cur) bars.push(cur)
 
-  return { per, perRule, dataSource, timeRule: 'first contributing observation time', bars }
+  const avgGapMs = medianTickGapMs(points.filter((p) => Number.isFinite(p.price)).map((p) => ({ ts: p.time * 1000, price: p.price })))
+
+  return { per, perRule, dataSource, timeRule: 'first contributing observation time', bars, avgGapMs }
 }

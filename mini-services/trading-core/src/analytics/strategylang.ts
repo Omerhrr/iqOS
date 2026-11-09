@@ -232,8 +232,9 @@ import { kagi } from './kagi'
 import { computeSwing } from './swing'
 import { tickBars, type TickPoint } from './tickbars'
 import { computeBaseline } from './baseline'
-import { hvSeries, realizedUpProb } from './ivhv'
+import { hvSeries, realizedUpProb, ivFromPayout } from './ivhv'
 import { expiryMomentum, priceDisplacement, volAdjustedExpectedMove, reversalRisk, expiryStagnationExhaustion, candleCompletionProbability } from './expiryintel'
+import { detectGaps } from './gap'
 
 export interface MslSourceRead {
   direction: 'call' | 'put' | 'none'
@@ -1977,8 +1978,24 @@ function pfMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | und
       const col = offsetInto(r.columns, asNum(args[0]), 'pf.column')
       return bundleValue({ top: col.top, bottom: col.bottom, boxes: col.boxes })
     }
+    // Double/triple top-bottom breakout detection (claude/msl-capability-
+    // matrix.md section I, flagged "missing" since Phase 2) - the engine
+    // (pointFigure()) was ALREADY computing this internally the whole
+    // time (`buySignal`/`sellSignal`/`pattern` - the "most recent of
+    // either side" reduction) and simply never exposing it to MSL, the
+    // same shape of gap foot.divergence()/foot.exhaustion() turned out to
+    // be back in Phase 4. `pf.breakout()`/.breakoutName()/.breakoutAt()
+    // read the MOST RECENT pattern of either side (r.pattern); honest
+    // "none" (never a forced guess) when no breakout has occurred yet in
+    // the window, same convention swing.structure() already uses.
+    case 'breakout':
+      return r.pattern?.direction ?? 'none'
+    case 'breakoutName':
+      return r.pattern?.name ?? 'none'
+    case 'breakoutAt':
+      return r.pattern?.at ?? 0
     default:
-      throw new MslRuntimeError(`unknown pf method "pf.${name}(...)" - use boxes(n?)/boxSize()/column(offset) (or pointFigure.dir/.conf/.value for the plain verdict read)`)
+      throw new MslRuntimeError(`unknown pf method "pf.${name}(...)" - use boxes(n?)/boxSize()/column(offset)/breakout()/breakoutName()/breakoutAt() (or pointFigure.dir/.conf/.value for the plain verdict read)`)
   }
 }
 
@@ -2100,7 +2117,10 @@ function volumebarsMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: stri
   const r = volumeBars(candles, { per: cfgNumLang(ctx, 'volbar.per', undefined) })
   switch (name) {
     case 'bars':
-      return seriesValue(r.bars.map((b) => (b.close >= b.open ? 1 : -1)).slice(-seriesLookback(args, 50)))
+      // BUG FIX (capability-matrix section K): VolumeBar.dir is now a
+      // STORED field (volumebars.ts) - read it directly instead of
+      // re-deriving close>=open at every call site.
+      return seriesValue(r.bars.map((b) => b.dir).slice(-seriesLookback(args, 50)))
     case 'ohlc': {
       if (!args.length) throw new MslRuntimeError('volumebars.ohlc(offset) needs an offset argument, e.g. volumebars.ohlc(-1)')
       const b = offsetInto(r.bars, asNum(args[0]), 'volumebars.ohlc')
@@ -2142,8 +2162,45 @@ function tpoMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | un
       return num(r.ibHigh)
     case 'ibLow':
       return num(r.ibLow)
+    // DEVELOPING POC/VAH/VAL (capability-matrix section O) - series of n,
+    // one value PER PERIOD (not per-candle - see tpo.ts's own doc comment
+    // on developingPoc/developingVah/developingVal for why), [-1] = the
+    // most recently closed period's running value. NaN entries only on an
+    // empty window (never in practice once period 0 has printed).
+    case 'developingPoc':
+      return seriesValue(r.developingPoc.slice(-seriesLookback(args, 50)).map(num))
+    case 'developingVah':
+      return seriesValue(r.developingVah.slice(-seriesLookback(args, 50)).map(num))
+    case 'developingVal':
+      return seriesValue(r.developingVal.slice(-seriesLookback(args, 50)).map(num))
+    // SINGLE PRINTS (capability-matrix section O) - count() is the number
+    // of thin (one-period) bins in the window; price(offset) reads the
+    // offset-th single-print bin's mid price, chronological-by-PRICE order
+    // (same -1-is-latest/highest convention as vp.hvn/.lvn above). Fails
+    // closed with a clear "none yet" error rather than a confusing
+    // out-of-range message, same pattern swing.high()/.low() use.
+    case 'singlePrintCount':
+      return r.singlePrintBins.length
+    case 'singlePrintPrice': {
+      if (!args.length) throw new MslRuntimeError('tpo.singlePrintPrice(offset) needs an offset argument, e.g. tpo.singlePrintPrice(-1)')
+      if (!r.singlePrintBins.length) throw new MslRuntimeError('tpo.singlePrintPrice(offset) - no single-print bins in this window yet')
+      const idx = offsetInto(r.singlePrintBins, asNum(args[0]), 'tpo.singlePrintPrice')
+      return r.bins[idx].mid
+    }
+    // POOR HIGH/LOW vs EXCESS HIGH/LOW (capability-matrix section O) - see
+    // tpo.ts's own doc comment on these fields for the exact shape-read
+    // definition; poorHigh===!excessHigh and poorLow===!excessLow by
+    // construction (both false together only on an empty window).
+    case 'excessHigh':
+      return r.excessHigh
+    case 'excessLow':
+      return r.excessLow
+    case 'poorHigh':
+      return r.poorHigh
+    case 'poorLow':
+      return r.poorLow
     default:
-      throw new MslRuntimeError(`unknown tpo method "tpo.${name}(...)" - use poc()/vah()/val()/ibHigh()/ibLow() (or tpo.dir/.conf/.value for the plain verdict read)`)
+      throw new MslRuntimeError(`unknown tpo method "tpo.${name}(...)" - use poc()/vah()/val()/ibHigh()/ibLow()/developingPoc(n?)/developingVah(n?)/developingVal(n?)/singlePrintCount()/singlePrintPrice(offset)/excessHigh()/excessLow()/poorHigh()/poorLow() (or tpo.dir/.conf/.value for the plain verdict read)`)
   }
 }
 
@@ -2329,6 +2386,38 @@ function swingMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | 
   }
 }
 
+/** `gap.*` - candlestick gap detection (claude/msl-capability-matrix.md
+ * section A, flagged "missing" since the Phase 0 audit - see
+ * analytics/gap.ts for the full honest-scope note: near-meaningless on
+ * OTC synthetic pairs, which trade continuously and essentially never
+ * gap; built for forex/real-market session opens). `gap.count()` is the
+ * number of gaps found in the current series window; the offset-indexed
+ * accessors below read the gap at that offset in CHRONOLOGICAL order,
+ * same -1-is-latest convention as every other offset-indexed primitive
+ * in this file (renko.ohlc/pf.column/swing.high/...). Fails closed with a
+ * clear "no gaps yet" error rather than a confusing out-of-range message
+ * when the window has none - same pattern swing.high()/.low() use. */
+function gapMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const candles = seriesToCandles(requireSeries(ctx, tf))
+  const r = detectGaps(candles)
+  if (name === 'count') return r.gaps.length
+  if (!args.length) throw new MslRuntimeError(`gap.${name}(offset) needs an offset argument, e.g. gap.${name}(-1)`)
+  if (!r.gaps.length) throw new MslRuntimeError('gap.*(offset) - no gaps in this window yet (most candles never gap; OTC synthetic pairs essentially never do)')
+  const g = offsetInto(r.gaps, asNum(args[0]), `gap.${name}`)
+  switch (name) {
+    case 'direction':
+      return g.dir
+    case 'size':
+      return g.size
+    case 'filled':
+      return g.filled
+    case 'filledAt':
+      return g.filledAt ?? 0
+    default:
+      throw new MslRuntimeError(`unknown gap method "gap.${name}(...)" - use count()/direction(offset)/size(offset)/filled(offset)/filledAt(offset)`)
+  }
+}
+
 /** `tickbar.*` - the Tick Chart engine (analytics/tickbars.ts) previously
  * had NO MSL namespace at all (claude/msl-capability-matrix.md section P) -
  * the only access was via /tick_patterns's own pattern detection, never
@@ -2391,8 +2480,20 @@ function tickbarMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string 
       const last = r.bars[r.bars.length - 1]
       return last ? last.endTime - last.time : 0
     }
+    // BUG FIX (capability-matrix section P: "avg time between ticks...
+    // already computed [tickdesk.ts#medianTickGapMs], just not wired to
+    // the tick-chart engine itself") - tickBars() now computes this
+    // directly (reusing medianTickGapMs, not reimplementing it); this is
+    // the MSL-reachability half of closing that gap. NaN (never 0 - the
+    // honest "no measurable gap yet" value) with fewer than 2 points.
+    case 'avgGapMs': {
+      const per = args.length >= 1 ? asNum(args[0]) : undefined
+      const { points, dataSource } = tickbarPoints(ctx, tf)
+      const r = tickBars(points, { per, dataSource })
+      return r.avgGapMs ?? NaN
+    }
     default:
-      throw new MslRuntimeError(`unknown tickbar method "tickbar.${name}(...)" - use bars(n?, per?)/ohlc(offset, per?)/direction(per?)/duration(per?)/dataSource()`)
+      throw new MslRuntimeError(`unknown tickbar method "tickbar.${name}(...)" - use bars(n?, per?)/ohlc(offset, per?)/direction(per?)/duration(per?)/dataSource()/avgGapMs(per?)`)
   }
 }
 
@@ -2422,16 +2523,47 @@ function baselineMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string
 }
 
 /** `ivhv.*` - realized/historical volatility, purely candle-derived
- * (analytics/ivhv.ts hvSeries/realizedUpProb). Deliberately does NOT expose
- * ivhv.ts's IV/breakeven side here - that depends on MarketDataService's
- * live payoutHistory and has no historical replay path; the already-shipped
- * `payout` source already covers breakeven/EV arithmetic from live payout,
- * so duplicating it here would just give two sources of truth for the same
- * number. Kept lowercase `ivhv` (matching the file name) to avoid any
- * casing confusion with the separate `ivHv` verdict source. */
+ * (analytics/ivhv.ts hvSeries/realizedUpProb). Kept lowercase `ivhv`
+ * (matching the file name) to avoid any casing confusion with the separate
+ * `ivHv` verdict source.
+ *
+ * ivNow()/ratio() (capability-matrix section Q, flagged "NOT YET BUILT
+ * [both source series exist; the ratio/change/percentile derivations do
+ * not]") - the raw IV accessor that was PREVIOUSLY deliberately left out:
+ * breakeven()/ev()/gate() already cover the practical "is this payout
+ * worth taking" arithmetic from `payout.value` directly, so a second,
+ * narrower accessor felt redundant. Added now because the IV/HV RATIO
+ * specifically needs a scalar IV number to divide by HV, and the plain
+ * payout fraction isn't that number - ivNow() reads `ctx.reads.payout`
+ * (the SAME live source `payout.value` already exposes; see
+ * plugins/metastrategy.ts's own reads.payout for where that's populated -
+ * no historical replay path, exactly as ivFromPayout()'s own module
+ * header discloses) and runs it through ivFromPayout() to get the
+ * payout-implied BREAKEVEN PROBABILITY, the closest honest IV-analog this
+ * OS can compute (never "implied volatility" unqualified - see ivhv.ts's
+ * header for the full ATM-digital-inversion-has-no-solution reasoning).
+ * NaN (never a misleading 0) when no `payout` source was wired into this
+ * evaluation (the normal case for a pure historical/backtest run) or the
+ * account reports no payout. ratio() = ivNow()/hvNow() - NaN whenever
+ * either side is NaN or hvNow() is 0 (never a divide-by-zero Infinity). */
 function ivhvMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
   const candles = seriesToCandles(requireSeries(ctx, tf))
   switch (name) {
+    case 'ivNow': {
+      const payout = ctx.reads.payout?.value
+      if (payout === undefined || !Number.isFinite(payout) || payout <= 0) return NaN
+      const r = ivFromPayout(payout)
+      return Number.isFinite(r.breakevenPct) ? r.breakevenPct : NaN
+    }
+    case 'ratio': {
+      const payout = ctx.reads.payout?.value
+      if (payout === undefined || !Number.isFinite(payout) || payout <= 0) return NaN
+      const iv = ivFromPayout(payout).breakevenPct
+      const window = args.length ? asNum(args[0]) : undefined
+      const hv = hvSeries(candles, window !== undefined ? { window } : undefined).hvNow
+      if (!Number.isFinite(iv) || !Number.isFinite(hv) || hv === 0) return NaN
+      return iv / hv
+    }
     case 'hvNow': {
       const window = args.length ? asNum(args[0]) : undefined
       const r = hvSeries(candles, window !== undefined ? { window } : undefined)
@@ -2466,7 +2598,7 @@ function ivhvMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | u
       return (below / window.length) * 100
     }
     default:
-      throw new MslRuntimeError(`unknown ivhv method "ivhv.${name}(...)" - use hvNow(window?)/hvSeries(n?)/realizedUpProb(window?)/change(lookback?)/percentile(lookback?)`)
+      throw new MslRuntimeError(`unknown ivhv method "ivhv.${name}(...)" - use hvNow(window?)/hvSeries(n?)/realizedUpProb(window?)/change(lookback?)/percentile(lookback?)/ivNow()/ratio(window?)`)
   }
 }
 
@@ -2728,6 +2860,11 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
         return swingMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'gap' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return gapMethod(e.name, args, ctx, tf)
       }
       if (e.obj.t === 'ident' && e.obj.name === 'tickbar' && !(e.obj.name in env)) {
         const args = e.args.map((a) => evalExpr(a, env, ctx))

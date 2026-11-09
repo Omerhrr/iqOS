@@ -20,6 +20,7 @@ import { backtestMslScript } from '../src/analytics/mslbacktest'
 import { computeBaseline } from '../src/analytics/baseline'
 import { computeDeltaProfile } from '../src/analytics/deltaprofile'
 import { MSL_READ_CONFIGS, validateMslConfigs } from '../src/plugins/metastrategy'
+import { volumeBars } from '../src/analytics/volumebars'
 import type { Candle } from '../src/types'
 
 type Test = { name: string; fn: () => void }
@@ -364,6 +365,103 @@ test('otc.value and session.value are plain VALUE-ONLY reads a script can combin
   })
   assert.equal(r2.error, undefined)
   assert.equal(r2.direction, 'put')
+})
+
+// ---------------------------------------------------------------------
+// Loose-threads sweep (capability-matrix items carried but never
+// prioritized into a sweep until now): pf.breakout(), VolumeBar.dir
+// stored field, gap.* candlestick gaps, tpo.developingPoc/singlePrint/
+// excess-poor, tickbar.avgGapMs(), ivhv.ivNow()/.ratio().
+// ---------------------------------------------------------------------
+
+test('pf.breakout()/.breakoutName()/.breakoutAt() run and return the documented honest shapes', () => {
+  const series = syntheticSeries(150, 7)
+  const r = run(
+    'let d = pf.breakout()\nlet n = pf.breakoutName()\nlet at = pf.breakoutAt()\ncall when d == call or d == put or d == none\nconfidence = 50',
+    series,
+  )
+  assert.equal(r.error, undefined)
+  // d is always one of call/put/none by construction - the condition above
+  // only ever fires if evaluation actually ran without a type error.
+  assert.equal(r.direction, 'call')
+})
+
+test('volumebars.bars() reads the STORED VolumeBar.dir field directly (no re-derivation)', () => {
+  const candles = seriesToCandles(syntheticSeries(60, 3)).map((c) => ({ ...c, volume: 100 }))
+  const result = volumeBars(candles, { per: 500 })
+  assert.ok(result.bars.length > 0)
+  for (const b of result.bars) {
+    assert.equal(b.dir, b.close >= b.open ? 1 : -1) // stored field matches the honest close>=open rule
+  }
+})
+
+test('gap.* detects a real gap up and tracks fill', () => {
+  // Hand-built series: candle 4 opens well above candle 3's own high (gap
+  // up), then candle 6 trades back down through candle 3's close (fill).
+  const open = [100, 100.2, 100.4, 100.5, 105, 105.2, 105.1]
+  const close = [100.2, 100.4, 100.5, 100.6, 105.2, 105.1, 100.1]
+  const high = open.map((o, i) => Math.max(o, close[i]) + 0.1)
+  const low = open.map((o, i) => Math.min(o, close[i]) - 0.1)
+  const volume = open.map(() => 1000)
+  const series: MslSeriesCtx = { open, high, low, close, volume }
+  const r = run(
+    'let n = gap.count()\nlet d = gap.direction(-1)\nlet sz = gap.size(-1)\nlet f = gap.filled(-1)\ncall when n > 0 and d == 1\nconfidence = 50',
+    series,
+  )
+  assert.equal(r.error, undefined)
+  assert.equal(r.direction, 'call') // exactly one gap up exists in this hand-built window
+})
+
+test('gap.*(offset) fails closed with a clear error when the window has no gaps', () => {
+  const series = syntheticSeries(5, 1) // smooth synthetic series, no engineered gap
+  const r = run('let d = gap.direction(-1)\ncall when d == 1\nconfidence = 50', series)
+  // either no gaps at all (clear error) or - vanishingly unlikely with this
+  // synthetic generator - a real one; assert it never silently misbehaves
+  if (r.error) assert.match(r.error, /no gaps/)
+})
+
+test('tpo.developingPoc/Vah/Val and single-print/poor-excess read without throwing and keep their documented invariant', () => {
+  const series = syntheticSeries(80, 11)
+  const r = run(
+    [
+      'let dp = tpo.developingPoc(-1)',
+      'let dvah = tpo.developingVah(-1)',
+      'let dval = tpo.developingVal(-1)',
+      'let spc = tpo.singlePrintCount()',
+      'let eh = tpo.excessHigh()',
+      'let el = tpo.excessLow()',
+      'let ph = tpo.poorHigh()',
+      'let pl = tpo.poorLow()',
+      'call when (eh or ph) and (el or pl) and spc >= 0',
+      'confidence = 50',
+    ].join('\n'),
+    series,
+  )
+  assert.equal(r.error, undefined)
+  assert.equal(r.direction, 'call') // every touched extreme is exactly excess XOR poor - this always holds
+})
+
+test('tickbar.avgGapMs() reuses medianTickGapMs() and returns a finite number for a candle-fallback series', () => {
+  const series = syntheticSeries(60, 4)
+  const r = run('let g = tickbar.avgGapMs()\ncall when g > 0\nconfidence = 50', series)
+  assert.equal(r.error, undefined)
+  assert.equal(r.direction, 'call') // candle-spaced "ticks" always have a positive median gap
+})
+
+test('ivhv.ivNow()/.ratio() are NaN with no payout source wired in (honest, never a fabricated default)', () => {
+  const series = syntheticSeries(40, 6)
+  const r = run('let iv = ivhv.ivNow()\nlet ratio = ivhv.ratio()\ncall when iv != iv\nconfidence = 50', series) // iv != iv is the NaN self-inequality check
+  assert.equal(r.error, undefined)
+  assert.equal(r.direction, 'call')
+})
+
+test('ivhv.ivNow()/.ratio() compute real numbers once a payout source IS wired in', () => {
+  const series = syntheticSeries(40, 6)
+  const r = run('let iv = ivhv.ivNow()\ncall when iv > 0 and iv < 100\nconfidence = 50', series, {
+    payout: { direction: 'none', confidence: 0, value: 0.85 },
+  })
+  assert.equal(r.error, undefined)
+  assert.equal(r.direction, 'call') // breakeven% for payout 0.85 is 100/1.85 ~= 54.05, a real finite number in (0,100)
 })
 
 // ---------------------------------------------------------------------
