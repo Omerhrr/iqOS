@@ -146,6 +146,26 @@ function collectFieldSources(ast: MslAst): Set<string> {
       const obj = n.obj as Record<string, unknown> | undefined
       if (obj && obj.t === 'ident' && typeof obj.name === 'string') names.add(obj.name)
     }
+    // `tick.*(...)`/`foot.*(...)` - the two namespaced signal-function
+    // vocabularies that are NOT candle-pure (unlike ind./renko./pf./ha./
+    // rangebars./volumebars./tpo./vp./dp./linebreak./kagi./swing./gap./
+    // tickbar./baseline./ivhv./nearExpiry., which all read straight off
+    // market.getCandlesDeep via scriptResolver/scriptSeries and need no
+    // check at all). strategylang.ts's own evaluator dispatches these via
+    // requireTicks(ctx), which fails closed with a runtime error outside a
+    // live `ticks` context - harmless, but it would make backtestMeta()
+    // silently return an EMPTY result (every bar's eval throws, caught,
+    // treated as 'none') instead of a clear upfront rejection naming the
+    // actual blocker, so they're caught here too. Mapped onto the SAME
+    // names UNSAFE_BACKTEST_SOURCES already carries ('tick' / 'footprint')
+    // so one classification set and one error message cover both the
+    // bare-reads-map form (`tick.dir`) and this namespaced-call form
+    // (`tick.delta(5)`).
+    if (n.t === 'method') {
+      const obj = n.obj as Record<string, unknown> | undefined
+      if (obj && obj.t === 'ident' && obj.name === 'tick') names.add('tick')
+      if (obj && obj.t === 'ident' && obj.name === 'foot') names.add('footprint')
+    }
     for (const v of Object.values(n)) {
       if (Array.isArray(v)) v.forEach(visit)
       else if (v && typeof v === 'object') visit(v)
