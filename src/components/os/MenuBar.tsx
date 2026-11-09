@@ -13,6 +13,7 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog'
 import { Switch } from '@/components/ui/switch'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import type { AccountState, AssetRow, ChartType, OsMode, RiskConfig, Timeframe } from '@/lib/os/client'
 import { CHART_TYPES, TIMEFRAMES, fmtClock, fmtMoney, fmtPct, osPost } from '@/lib/os/client'
 import type { PatternDetail } from './PairSignalPanel'
@@ -506,7 +507,7 @@ function SettingsDialog(props: Props & { onReset: () => void }) {
           ⚙ Settings
         </Button>
       </DialogTrigger>
-      <DialogContent className="max-w-lg border-[#1c2739] bg-[#0b111c] text-[#dbe4f0]">
+      <DialogContent className="flex max-h-[85vh] max-w-lg flex-col border-[#1c2739] bg-[#0b111c] text-[#dbe4f0]">
         <DialogHeader>
           <DialogTitle className="text-[14px] tracking-wider">OS Settings</DialogTitle>
           <DialogDescription className="text-[11px] text-[#7c8aa5]">
@@ -514,7 +515,32 @@ function SettingsDialog(props: Props & { onReset: () => void }) {
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-4">
+        {/* Split into tabs so the dialog's own height never outgrows the
+           screen - a direct report ("the settings page is too long, i
+           cant see it fully") since this grows every time a new section
+           (fresh-start wipe, live broker) gets bolted on. Each tab's
+           panel scrolls independently (max-h-[65vh] overflow-y-auto)
+           rather than the whole dialog growing past the viewport. */}
+        <Tabs defaultValue="risk" className="min-h-0 flex-1">
+          <TabsList className="h-8 w-full justify-start gap-1 rounded-md border border-[#1c2739] bg-[#0d1420] p-1">
+            {(
+              [
+                ['risk', 'Risk'],
+                ['data', 'Data'],
+                ['live', 'Live broker'],
+              ] as const
+            ).map(([value, label]) => (
+              <TabsTrigger
+                key={value}
+                value={value}
+                className="h-6 rounded px-3 text-[10px] font-bold uppercase tracking-wider text-[#7c8aa5] data-[state=active]:bg-cyan-600 data-[state=active]:text-white data-[state=active]:shadow-none"
+              >
+                {label}
+              </TabsTrigger>
+            ))}
+          </TabsList>
+
+          <TabsContent value="risk" className="max-h-[65vh] space-y-4 overflow-y-auto pr-1">
           <section>
             <h4 className="mb-2 text-[10px] font-bold uppercase tracking-[0.18em] text-cyan-400">Risk Manager</h4>
             <div className="grid grid-cols-2 gap-2">
@@ -546,8 +572,10 @@ function SettingsDialog(props: Props & { onReset: () => void }) {
               </Button>
             </div>
           </section>
+          </TabsContent>
 
-          <section className="border-t border-[#1c2739] pt-3">
+          <TabsContent value="data" className="max-h-[65vh] space-y-4 overflow-y-auto pr-1">
+          <section>
             <h4 className="mb-1 text-[10px] font-bold uppercase tracking-[0.18em] text-rose-400">Fresh start - clear all data</h4>
             <p className="mb-2 text-[10px] leading-relaxed text-[#4b5a72]">
               Wipes the trade journal, IQ Day P/L + Total P/L baselines, and resets the bot fleet + auto-trader + Meta Trader +
@@ -575,8 +603,10 @@ function SettingsDialog(props: Props & { onReset: () => void }) {
             </div>
             {clearMsg && <p className="mt-2 text-[10px] leading-relaxed text-[#7c8aa5]">{clearMsg}</p>}
           </section>
+          </TabsContent>
 
-          <section className="border-t border-[#1c2739] pt-3">
+          <TabsContent value="live" className="max-h-[65vh] space-y-4 overflow-y-auto pr-1">
+          <section>
             <h4 className="mb-1 text-[10px] font-bold uppercase tracking-[0.18em] text-cyan-400">LIVE broker - iqair sidecar</h4>
             <p className="mb-2 text-[10px] leading-relaxed text-[#4b5a72]">
               Run your iqair library bridge locally: <code className="text-cyan-500">python live/iqair_sidecar.py</code> (repo file), then
@@ -596,7 +626,8 @@ function SettingsDialog(props: Props & { onReset: () => void }) {
               {liveMsg && <p className="text-[10px] leading-relaxed text-[#7c8aa5]">{liveMsg}</p>}
             </div>
           </section>
-        </div>
+          </TabsContent>
+        </Tabs>
       </DialogContent>
     </Dialog>
   )
