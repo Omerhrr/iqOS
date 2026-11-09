@@ -592,6 +592,53 @@ export class SentinelService {
     return { ok: true, cleared }
   }
 
+  /**
+   * FORCE reset - unconditionally clears both breakers AND rebaselines the
+   * drawdown high-water mark to the CURRENT equity.
+   *
+   * THE BUG ("I reset sentinel and it's not resetting"): ack() above only
+   * clears the `tripped` flag - it deliberately does NOT touch whatever
+   * made the breaker trip in the first place (by design, see ack()'s own
+   * doc comment: that's what makes ack() instant and side-effect-free). If
+   * the underlying condition is still breached the moment the NEXT
+   * evaluate() runs - and it runs on every single account update, i.e.
+   * every few seconds via the 'account' bus event - it just re-trips right
+   * back. The drawdown breaker in particular can get stuck in this loop
+   * even after a totally legitimate reason to clear it, because `hwm` only
+   * ever moves UP (onTradeOpened() bumps it on a new peak, nothing ever
+   * lowers it): switch account source, run "clear all data" and drop the
+   * ledger back to $10,000, or just eat a real drawdown you've decided to
+   * treat as the new baseline - in every one of those cases hwm keeps
+   * pointing at a now-irrelevant old peak, drawdownPct() keeps computing a
+   * huge % against it, and ack() keeps losing the race against the very
+   * next evaluate(). From the operator's seat that's "reset doesn't work."
+   *
+   * forceReset() breaks the loop by moving the goalposts instead of just
+   * waiving the current breach: hwm becomes "now" (current equity), so
+   * drawdownPct() is 0 the instant this returns and NOTHING can re-trip the
+   * drawdown breaker off stale data again - only a genuinely NEW drawdown
+   * from this point forward will. The daily breaker and the trade-rate
+   * throttle window are cleared the same unconditional way. This is the
+   * "no matter what" reset - unlike ack(), it does not require the breach
+   * to have actually gone away first.
+   *
+   * Deliberately does NOT touch the kill switch: that's a separate,
+   * explicit safety control (armed manually, or by trip()'s autoKillOn*
+   * options) and a risk-governor reset should never silently re-enable
+   * live order placement as a side effect - the operator disengages it on
+   * purpose, in the Sentinel panel, same as always.
+   */
+  forceReset(): { ok: boolean; hwm: number } {
+    const bal = this.equityBalance()
+    this.hwm = bal
+    this.breakers.daily = { ...this.breakers.daily, tripped: false, reason: '', ts: null }
+    this.breakers.drawdown = { ...this.breakers.drawdown, tripped: false, reason: '', ts: null }
+    this.tradeTs = []
+    this.persist()
+    this.event('breaker', `Sentinel FORCE RESET - breakers cleared, high-water mark rebaselined to $${bal.toFixed(2)}`, 'success')
+    return { ok: true, hwm: bal }
+  }
+
   // ---------- pre-trade gate ----------
 
   preTrade(asset: string, amount: number): { ok: boolean; reason?: string } {

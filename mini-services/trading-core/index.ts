@@ -4885,6 +4885,17 @@ const httpServer = createServer(async (req, res) => {
         return json(200, sen.ack(b))
       }
 
+      // Unconditional reset: clears both breakers AND rebaselines the
+      // drawdown high-water mark to current equity, so a still-breached
+      // condition (the normal "ack did nothing" complaint - see
+      // SentinelService.forceReset()'s own doc comment) can't immediately
+      // re-trip it. Distinct from /sentinel_ack, which only waives a
+      // breach that has already genuinely cleared.
+      if (path === '/sentinel_force_reset') {
+        const sen = kernel.context().use<SentinelService>('sentinel')
+        return json(200, sen.forceReset())
+      }
+
       if (path === '/panic') {
         const sen = kernel.context().use<SentinelService>('sentinel')
         return json(200, sen.panic({ killSwitch: Boolean(body.killSwitch) }))

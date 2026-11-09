@@ -76,6 +76,21 @@ export default function SentinelPanel({ onError, onAccountChanged }: Props) {
     }
   }
 
+  // "Ack" only clears the tripped flag - if the breach itself is still
+  // there (most often: the drawdown high-water mark is stale, e.g. from an
+  // account switch or balance that's since moved on) the very next account
+  // update re-trips it right back, which looks like ack doing nothing.
+  // Force reset also rebaselines the high-water mark to current equity, so
+  // nothing stale is left for the next check to re-trip on.
+  const forceReset = async () => {
+    try {
+      await osPost('/sentinel_force_reset', {})
+      void load()
+    } catch (err) {
+      onError((err as Error).message)
+    }
+  }
+
   const panic = async (kill: boolean) => {
     setPanicking(true)
     try {
@@ -120,6 +135,14 @@ export default function SentinelPanel({ onError, onAccountChanged }: Props) {
               ✓ Ack breakers
             </Button>
           )}
+          <Button
+            onClick={() => void forceReset()}
+            variant="outline"
+            title="Clears both breakers unconditionally and rebaselines the drawdown high-water mark to current equity - use this when Ack doesn't stick"
+            className="h-7 border-cyan-500/40 bg-cyan-500/10 px-2.5 text-[10px] font-bold uppercase tracking-wider text-cyan-300 hover:bg-cyan-500/20"
+          >
+            ⟲ Force reset
+          </Button>
           {/* PANIC */}
           <Dialog>
             <DialogTrigger asChild>

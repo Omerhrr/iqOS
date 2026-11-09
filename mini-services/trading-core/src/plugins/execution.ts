@@ -211,20 +211,27 @@ export class ExecutionService {
     } catch {
       // omni-trader plugin not loaded - nothing to reset there
     }
-    // Default-ack the Sentinel breakers as part of the same reset, so a
+    // FORCE-reset the Sentinel breakers as part of the same reset, so a
     // fresh start never leaves the daily-loss/drawdown breakers latched
-    // from the OLD account's numbers requiring a separate manual "ack" in
+    // from the OLD account's numbers requiring a separate manual reset in
     // the Sentinel panel - the whole point of "clear all data" is that
     // nothing from the previous account should still be blocking trades
-    // afterward. Sentinel's own evaluate() re-derives both breakers fresh
-    // off the very next account update anyway (see ack()'s own doc comment
-    // on why it doesn't eagerly re-check here either), so this is safe:
-    // a breaker that's genuinely still breached under the NEW account's
-    // numbers will simply re-trip on its own right after.
+    // afterward.
+    //
+    // BUG FIX: this used to call sentinel.ack(), which only clears the
+    // `tripped` flag and leaves the drawdown high-water mark untouched -
+    // but the ledger above was JUST reset to a flat $10,000 while hwm can
+    // still be sitting at whatever peak the OLD account reached (hwm only
+    // ever moves up). The very next account update (this method emits one
+    // a few lines down) re-ran evaluate(), saw a ~huge "drawdown" off that
+    // stale peak, and re-tripped the breaker it had just acked - "clear
+    // all data" silently left trading blocked. forceReset() rebaselines
+    // hwm to the fresh $10,000 balance too, so there's nothing left for
+    // evaluate() to re-trip on.
     try {
-      this.ctx.use<{ ack: (breaker?: 'daily' | 'drawdown') => { ok: boolean; cleared: string[] } }>('sentinel').ack()
+      this.ctx.use<{ forceReset: () => { ok: boolean; hwm: number } }>('sentinel').forceReset()
     } catch {
-      // sentinel plugin not loaded - nothing to ack there
+      // sentinel plugin not loaded - nothing to reset there
     }
     this.ctx.bus.emit('account', { account: this.account() })
     this.ctx.bus.emit('alert', { level: 'info', message: 'All trading data cleared - journal, P/L baselines and bot/auto-trader stats reset to zero', ts: this.now() })
