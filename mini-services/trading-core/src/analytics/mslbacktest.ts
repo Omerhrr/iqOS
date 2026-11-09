@@ -39,7 +39,7 @@
 // candles[0..i] via `series`/`seriesFor`.
 
 import type { Candle, Timeframe } from '../types'
-import { parseStrategyScript, evaluateStrategyScript, clearMslState, type MslSeriesCtx, type MslSourceRead } from './strategylang'
+import { parseStrategyScript, evaluateStrategyScript, clearMslState, type MslSeriesCtx, type MslSourceRead, type MslAst } from './strategylang'
 import { META_CONDITION_SOURCES } from './metastrategy'
 import { ALL_SMC_KINDS } from './smc'
 import { EXPIRIES_MIN } from './nextexpiry'
@@ -76,6 +76,20 @@ export interface MslBacktestExpiryBreakdown {
   expectancy?: number
 }
 
+/** A plain win/loss/expectancy breakdown over SOME subset of a full trade
+ * list - the shared shape `inSample`/`outOfSample` (below) and each walk-
+ * forward fold use, so a caller reads them all the same way. */
+export interface MslBacktestBreakdown {
+  trades: number
+  wins: number
+  losses: number
+  winRate: number | null
+  avgConfidence: number | null
+  /** only present when a payout fraction was supplied */
+  expectancy?: number
+  netPnl?: number
+}
+
 export interface MslBacktestResult {
   ok: boolean
   error?: string
@@ -108,6 +122,87 @@ export interface MslBacktestResult {
    * compatibility) - one entry per requested horizon, same fired signals,
    * different settlement distance. */
   byExpiry?: MslBacktestExpiryBreakdown[]
+  /** OUT-OF-SAMPLE SPLIT (the last remaining item from the entire chart-
+   * engine roadmap backlog, closed in the loose-threads-backtesting
+   * follow-up sweep) - present only when `opts.outOfSampleBars` was
+   * supplied. `inSample` is every trade whose signal fired BEFORE the
+   * trailing `outOfSampleBars`-wide window; `outOfSample` is every trade
+   * that fired INSIDE it - the same fired-signal list and settlement this
+   * result's own top-level trades[] already computed, just partitioned by
+   * index, never re-evaluated or re-settled. A script with a real edge
+   * should show a broadly similar winRate/expectancy in both halves; a
+   * sharp dropoff out-of-sample is the classic "looked good on the exact
+   * window I was staring at" warning sign this split exists to surface -
+   * this engine does not itself fit/tune any parameter, so "out-of-sample"
+   * here means "does the edge still hold on bars nobody looked at while
+   * writing the script", not "holds out a fitting set". */
+  inSample?: MslBacktestBreakdown
+  outOfSample?: MslBacktestBreakdown
+}
+
+/** One walk-forward fold's own breakdown, PLUS which bar range it covers -
+ * `claude/chart-engine-roadmap-progress.md`'s "walk-forward" item. Folds
+ * are contiguous, chronological, non-overlapping slices of the SAME fired-
+ * signal list a plain backtest already produces (one evaluation pass, then
+ * split by index) - never a fresh evaluation per fold, which would be both
+ * wasteful and (since `since()`/`streak()` carry state across the whole
+ * run) subtly different from a true single continuous pass. */
+export interface MslBacktestFold extends MslBacktestBreakdown {
+  foldIndex: number
+  /** first/last candle INDEX this fold's fired signals were drawn from
+   * (inclusive) - the signal's own fire bar, not its settlement bar. */
+  fromIndex: number
+  toIndex: number
+  fromTime: number
+  toTime: number
+}
+
+export interface MslBacktestWalkForwardResult {
+  ok: boolean
+  error?: string
+  barsEvaluated: number
+  unavailableSources: string[]
+  /** the whole run's combined breakdown - identical numbers a plain
+   * `backtestMslScript()` call over the same candles/script/opts would
+   * report (same fired signals, same settlement), just also folded. */
+  overall: MslBacktestBreakdown
+  folds: MslBacktestFold[]
+  /** stddev of each fold's own winRate (folds with zero trades excluded,
+   * null when fewer than 2 folds have any trades) - a quick, honest
+   * single-number "how consistent was this across time" read; a script
+   * that's genuinely robust to regime shifts has a LOW number here, not
+   * just a high overall winRate (which a single lucky fold can produce on
+   * its own). Never presented as a significance test - just a dispersion
+   * measure over however many folds this run happened to have. */
+  winRateStdDev: number | null
+}
+
+/** One asset's own plain backtest result, tagged with which asset it was -
+ * `claude/chart-engine-roadmap-progress.md`'s "cross-asset" item. */
+export interface MslBacktestAssetResult {
+  asset: string
+  result: MslBacktestResult
+}
+
+export interface MslBacktestCrossAssetResult {
+  ok: boolean
+  error?: string
+  /** one full MslBacktestResult per asset, in the order given - an asset
+   * whose own candles were too few/invalid still gets an entry here with
+   * that asset's own result.ok:false/error, never silently dropped. */
+  perAsset: MslBacktestAssetResult[]
+  /** combined breakdown across every asset's own trades pooled together -
+   * the "does this edge generalize, or is it one asset's quirk" read.
+   * Built by concatenating each OK asset's own already-settled trades, not
+   * by re-evaluating anything - an asset that failed (too little history,
+   * parse error) contributes zero trades here, same honest exclusion the
+   * single-asset engine already uses for a horizon that runs past the end
+   * of history. */
+  combined: MslBacktestBreakdown
+  /** stddev of each (successful, >=1 trade) asset's own winRate - same
+   * "how consistent across assets" read `winRateStdDev` gives across time
+   * for the walk-forward result; null when fewer than 2 qualifying assets. */
+  winRateStdDevAcrossAssets: number | null
 }
 
 /** Every source name a script could reference by bare identifier, each
@@ -143,6 +238,93 @@ function seriesUpTo(candles: Candle[], i: number): MslSeriesCtx {
     close: slice.map((c) => c.close),
     volume: slice.map((c) => c.volume ?? 0),
   }
+}
+
+interface FiredSignal {
+  index: number
+  direction: 'call' | 'put'
+  confidence: number
+}
+
+/** The one expensive pass every exported function in this module shares:
+ * parse once, evaluate once per bar from `warmupBars` through `lastIdx`
+ * (inclusive), collect every bar that actually fired above `minConfidence`.
+ * `backtestMslScript()`, `backtestMslScriptWalkForward()`, and each asset
+ * inside `backtestMslScriptCrossAsset()` all call this and then only ever
+ * SETTLE/partition the result afterward - never a second evaluation pass
+ * over the same candles, so `since()`/`streak()`'s own cross-bar state
+ * (scoped to `runId`) stays a single continuous run exactly like a live
+ * evaluator would see it, not an artificially chunked one. */
+function fireSignals(
+  candles: Candle[],
+  parsedAst: MslAst,
+  reads: Record<string, MslSourceRead>,
+  warmupBars: number,
+  lastIdx: number,
+  minConfidence: number,
+  runId: string,
+): FiredSignal[] {
+  const fired: FiredSignal[] = []
+  try {
+    for (let i = warmupBars; i <= lastIdx; i++) {
+      const series = seriesUpTo(candles, i)
+      const seriesFor = (_tf: string): MslSeriesCtx | undefined => undefined // no cross-timeframe history available to a pure candle-array backtest
+      const state = { keyPrefix: runId, barTimeSec: candles[i].time }
+      const out = evaluateStrategyScript(parsedAst, reads, undefined, series, seriesFor, undefined, state)
+      if (out.error || out.direction === 'none') continue
+      if (out.confidence < minConfidence) continue
+      fired.push({ index: i, direction: out.direction, confidence: out.confidence })
+    }
+  } finally {
+    clearMslState(runId)
+  }
+  return fired
+}
+
+/** Settle a fired-signal list against ONE bars-ahead horizon - the same
+ * binary settlement rule the module header documents (flat = loss). Shared
+ * by every caller below so the settlement math can never drift between
+ * the plain/walk-forward/cross-asset entry points. */
+function settleFired(fired: FiredSignal[], candles: Candle[], bars: number, payout: number | undefined): MslBacktestTrade[] {
+  return fired
+    .filter((f) => f.index + bars <= candles.length - 1)
+    .map((f) => {
+      const entry = candles[f.index].close
+      const exit = candles[f.index + bars].close
+      const delta = exit - entry
+      const win = f.direction === 'call' ? delta > 0 : delta < 0
+      const trade: MslBacktestTrade = { index: f.index, time: candles[f.index].time, direction: f.direction, confidence: f.confidence, entry, exit, win }
+      if (payout !== undefined) trade.pnl = win ? payout : -1
+      return trade
+    })
+}
+
+/** Reduce an already-settled trade list to the shared breakdown shape -
+ * used for the top-level result, `inSample`/`outOfSample`, each walk-
+ * forward fold, and cross-asset's `combined`/per-asset breakdowns, so
+ * "how do I read a win/loss subset" only has one answer in this module. */
+function breakdownOf(trades: MslBacktestTrade[], payout: number | undefined): MslBacktestBreakdown {
+  const wins = trades.filter((t) => t.win).length
+  const losses = trades.length - wins
+  const winRate = trades.length ? wins / trades.length : null
+  const avgConfidence = trades.length ? trades.reduce((s, t) => s + t.confidence, 0) / trades.length : null
+  const out: MslBacktestBreakdown = { trades: trades.length, wins, losses, winRate, avgConfidence }
+  if (payout !== undefined && trades.length) {
+    out.expectancy = trades.reduce((s, t) => s + (t.pnl ?? 0), 0) / trades.length
+    out.netPnl = trades.reduce((s, t) => s + (t.pnl ?? 0), 0)
+  }
+  return out
+}
+
+/** Population stddev of a list of win rates, ignoring nulls (zero-trade
+ * folds/assets) - null when fewer than 2 remain, never a misleading 0 or
+ * NaN from dividing by a too-small sample. */
+function winRateStdDev(rates: (number | null)[]): number | null {
+  const vals = rates.filter((r): r is number => r !== null)
+  if (vals.length < 2) return null
+  const mean = vals.reduce((s, v) => s + v, 0) / vals.length
+  const variance = vals.reduce((s, v) => s + (v - mean) * (v - mean), 0) / vals.length
+  return Math.sqrt(variance)
 }
 
 export interface MslBacktestOpts {
@@ -185,6 +367,15 @@ export interface MslBacktestOpts {
    * silently excluded from that trade (never fabricated), same as the
    * single-expiry path already does by construction. */
   expiryBarsList?: number[]
+  /** when supplied, splits the result into `inSample` (every fired signal
+   * at index < candles.length - outOfSampleBars) and `outOfSample` (every
+   * fired signal from that point on) - the out-of-sample item from
+   * `claude/chart-engine-roadmap-progress.md`'s backlog. Clamped so at
+   * least 1 bar stays in each half when both are non-empty; a value >=
+   * the evaluated window simply makes `inSample` empty rather than
+   * erroring (the same "silently excluded, never fabricated" convention
+   * `expiryBarsList`'s own too-short horizons already use). */
+  outOfSampleBars?: number
 }
 
 export function backtestMslScript(candles: Candle[], script: string, opts: MslBacktestOpts = {}): MslBacktestResult {
@@ -209,40 +400,13 @@ export function backtestMslScript(candles: Candle[], script: string, opts: MslBa
   // requested horizon still has a forward candle to settle against; each
   // horizon's own trade list is then just a cheap re-settlement of the
   // same fired signals, not a re-run of the script.
-  const fired: { index: number; direction: 'call' | 'put'; confidence: number }[] = []
   const lastIdx = candles.length - 1 - maxExpiryNeeded
-  try {
-    for (let i = warmupBars; i <= lastIdx; i++) {
-      const series = seriesUpTo(candles, i)
-      const seriesFor = (_tf: string): MslSeriesCtx | undefined => undefined // no cross-timeframe history available to a pure candle-array backtest
-      const state = { keyPrefix: runId, barTimeSec: candles[i].time }
-      const out = evaluateStrategyScript(parsed.ast, reads, undefined, series, seriesFor, undefined, state)
-      if (out.error || out.direction === 'none') continue
-      if (out.confidence < minConfidence) continue
-      fired.push({ index: i, direction: out.direction, confidence: out.confidence })
-    }
-  } finally {
-    clearMslState(runId)
-  }
+  const fired = fireSignals(candles, parsed.ast, reads, warmupBars, lastIdx, minConfidence, runId)
 
-  const settle = (bars: number): MslBacktestTrade[] =>
-    fired
-      .filter((f) => f.index + bars <= candles.length - 1)
-      .map((f) => {
-        const entry = candles[f.index].close
-        const exit = candles[f.index + bars].close
-        const delta = exit - entry
-        const win = f.direction === 'call' ? delta > 0 : delta < 0
-        const trade: MslBacktestTrade = { index: f.index, time: candles[f.index].time, direction: f.direction, confidence: f.confidence, entry, exit, win }
-        if (payout !== undefined) trade.pnl = win ? payout : -1
-        return trade
-      })
+  const settle = (bars: number): MslBacktestTrade[] => settleFired(fired, candles, bars, payout)
 
   const trades = settle(expiryBars)
-  const wins = trades.filter((t) => t.win).length
-  const losses = trades.length - wins
-  const winRate = trades.length ? wins / trades.length : null
-  const avgConfidence = trades.length ? trades.reduce((s, t) => s + t.confidence, 0) / trades.length : null
+  const { wins, losses, winRate, avgConfidence } = breakdownOf(trades, payout)
 
   const result: MslBacktestResult = { ok: true, barsEvaluated: lastIdx - warmupBars + 1, trades, wins, losses, winRate, avgConfidence, unavailableSources }
 
@@ -263,12 +427,131 @@ export function backtestMslScript(candles: Candle[], script: string, opts: MslBa
   if (expiryBarsList.length) {
     result.byExpiry = expiryBarsList.map((bars) => {
       const ts = settle(bars)
-      const w = ts.filter((t) => t.win).length
-      const entry: MslBacktestExpiryBreakdown = { expiryBars: bars, trades: ts.length, wins: w, losses: ts.length - w, winRate: ts.length ? w / ts.length : null }
-      if (payout !== undefined && ts.length) entry.expectancy = ts.reduce((s, t) => s + (t.pnl ?? 0), 0) / ts.length
+      const b = breakdownOf(ts, payout)
+      const entry: MslBacktestExpiryBreakdown = { expiryBars: bars, trades: b.trades, wins: b.wins, losses: b.losses, winRate: b.winRate }
+      if (b.expectancy !== undefined) entry.expectancy = b.expectancy
       return entry
     })
   }
 
+  if (opts.outOfSampleBars !== undefined && Number.isFinite(opts.outOfSampleBars) && opts.outOfSampleBars > 0) {
+    const oosBars = Math.round(opts.outOfSampleBars)
+    const splitIdx = candles.length - oosBars // trades firing at index >= splitIdx are out-of-sample
+    const inSampleTrades = trades.filter((t) => t.index < splitIdx)
+    const outOfSampleTrades = trades.filter((t) => t.index >= splitIdx)
+    result.inSample = breakdownOf(inSampleTrades, payout)
+    result.outOfSample = breakdownOf(outOfSampleTrades, payout)
+  }
+
   return result
+}
+
+export interface MslBacktestWalkForwardOpts extends MslBacktestOpts {
+  /** number of contiguous, chronological, non-overlapping folds to split
+   * the evaluated bar range into (default 5). Folds are sized as evenly as
+   * possible by bar count - the last fold absorbs any remainder, same
+   * convention a plain integer-division split would produce, never
+   * silently dropping a leftover bar. Clamped to at least 1 and at most
+   * the number of bars actually evaluated (a fold needs at least 1 bar). */
+  folds?: number
+}
+
+/** Walk-forward: the SAME single evaluation pass `backtestMslScript()`
+ * runs, partitioned into `folds` contiguous chronological slices so a
+ * caller can see whether an edge holds up consistently ACROSS TIME rather
+ * than being carried by one lucky stretch inside an otherwise flat overall
+ * winRate. Never re-evaluates the script per fold (see `fireSignals()`'s
+ * own doc comment for why that would also subtly change `since()`/
+ * `streak()`'s behavior) - folds are a pure partition of one continuous
+ * run's already-fired signals. */
+export function backtestMslScriptWalkForward(candles: Candle[], script: string, opts: MslBacktestWalkForwardOpts = {}): MslBacktestWalkForwardResult {
+  const expiryBars = Math.max(1, Math.round(opts.expiryBars ?? 3))
+  const warmupBars = Math.max(1, Math.round(opts.warmupBars ?? 60))
+  const minConfidence = Math.max(0, Math.min(100, opts.minConfidence ?? 0))
+  const runId = opts.runId ?? `mslbacktest-wf:${Date.now()}:${Math.random().toString(36).slice(2)}`
+  const reads = unavailableReads()
+  const unavailableSources = Object.keys(reads)
+  const payout = opts.payout !== undefined && Number.isFinite(opts.payout) ? Math.max(0, opts.payout) : undefined
+  const emptyWf = (error: string): MslBacktestWalkForwardResult => ({
+    ok: false,
+    error,
+    barsEvaluated: 0,
+    unavailableSources,
+    overall: breakdownOf([], undefined),
+    folds: [],
+    winRateStdDev: null,
+  })
+
+  const parsed = parseStrategyScript(script)
+  if (!parsed.ok) return emptyWf(`script parse error: ${parsed.error}`)
+  if (candles.length < warmupBars + expiryBars + 1) {
+    return emptyWf(`not enough candles - need at least ${warmupBars + expiryBars + 1} (warmup ${warmupBars} + expiry ${expiryBars} + 1), got ${candles.length}`)
+  }
+
+  const lastIdx = candles.length - 1 - expiryBars
+  const barsEvaluated = lastIdx - warmupBars + 1
+  const folds = Math.max(1, Math.min(barsEvaluated, Math.round(opts.folds ?? 5)))
+
+  const fired = fireSignals(candles, parsed.ast, reads, warmupBars, lastIdx, minConfidence, runId)
+  const allTrades = settleFired(fired, candles, expiryBars, payout)
+  const overall = breakdownOf(allTrades, payout)
+
+  const foldSize = Math.floor(barsEvaluated / folds)
+  const foldResults: MslBacktestFold[] = []
+  for (let f = 0; f < folds; f++) {
+    const fromIndex = warmupBars + f * foldSize
+    const toIndex = f === folds - 1 ? lastIdx : fromIndex + foldSize - 1
+    const foldTrades = allTrades.filter((t) => t.index >= fromIndex && t.index <= toIndex)
+    const b = breakdownOf(foldTrades, payout)
+    foldResults.push({ ...b, foldIndex: f, fromIndex, toIndex, fromTime: candles[fromIndex].time, toTime: candles[toIndex].time })
+  }
+
+  return {
+    ok: true,
+    barsEvaluated,
+    unavailableSources,
+    overall,
+    folds: foldResults,
+    winRateStdDev: winRateStdDev(foldResults.map((f) => f.winRate)),
+  }
+}
+
+export interface MslBacktestCrossAssetOpts extends MslBacktestOpts {}
+
+/** Cross-asset: runs the SAME script, independently, through the plain
+ * `backtestMslScript()` engine against each asset's own candle history -
+ * the "does this edge generalize, or is it one pair's own quirk" check.
+ * Each asset gets its own `runId` derived from the shared base (so their
+ * `since()`/`streak()` state never bleeds across assets, even though
+ * they're sequential calls in this one process) unless the caller passed
+ * an explicit `opts.runId`, in which case that exact id is reused for
+ * every asset verbatim (a caller doing that deliberately wants shared
+ * state across assets - not this function's default, but not blocked
+ * either). */
+export function backtestMslScriptCrossAsset(
+  assetCandles: Record<string, Candle[]>,
+  script: string,
+  opts: MslBacktestCrossAssetOpts = {},
+): MslBacktestCrossAssetResult {
+  const assets = Object.keys(assetCandles)
+  const baseRunId = opts.runId
+  const perAsset: MslBacktestAssetResult[] = assets.map((asset, i) => {
+    const runId = baseRunId ?? `mslbacktest-xasset:${asset}:${Date.now()}:${Math.random().toString(36).slice(2)}:${i}`
+    const result = backtestMslScript(assetCandles[asset], script, { ...opts, runId })
+    return { asset, result }
+  })
+
+  const combinedTrades: MslBacktestTrade[] = []
+  for (const { result } of perAsset) if (result.ok) combinedTrades.push(...result.trades)
+  const payout = opts.payout !== undefined && Number.isFinite(opts.payout) ? Math.max(0, opts.payout) : undefined
+  const combined = breakdownOf(combinedTrades, payout)
+
+  const perAssetWinRates = perAsset.map(({ result }) => (result.ok ? result.winRate : null))
+
+  return {
+    ok: perAsset.some((a) => a.result.ok),
+    perAsset,
+    combined,
+    winRateStdDevAcrossAssets: winRateStdDev(perAssetWinRates),
+  }
 }

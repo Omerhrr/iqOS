@@ -91,7 +91,7 @@ import { computeTpo } from './src/analytics/tpo'
 import { tickBars } from './src/analytics/tickbars'
 import { detectTickPatterns } from './src/analytics/tickpatterns'
 import { chartPropertyRegistryForVocab } from './src/analytics/chartpropertyregistry'
-import { backtestMslScript } from './src/analytics/mslbacktest'
+import { backtestMslScript, backtestMslScriptWalkForward, backtestMslScriptCrossAsset } from './src/analytics/mslbacktest'
 import { hvSeries, ivFromPayout, realizedUpProb } from './src/analytics/ivhv'
 import { buildCalibrationReport, type CalibrationStoreSlice } from './src/analytics/calibration'
 import { computeStepStats, computeIntervalStats } from './src/analytics/randomness'
@@ -2632,7 +2632,7 @@ const httpServer = createServer(async (req, res) => {
             state: 'since(boolExpr) / streak(boolExpr) - persisted CROSS-CYCLE memory, unlike everything else above (which only ever sees the CURRENT evaluation). since(cond) = whole closed bars since cond last evaluated true (0 while true, a large sentinel if never true yet). streak(cond) = the current run-length of consecutive closed bars cond has been true (0 once false). Scoped per spec id + asset + tf + the call site\'s own position in the script, so two since()/streak() calls never share memory even with an identical-looking condition. Works everywhere a script runs (meta_strategy_eval, meta_strategy_test_script, Meta Trader, the omni-trader) - unlike live()/tick.*/foot.*, these do NOT need the omni-trader. In-memory (resets on a backend restart) and reset whenever the spec\'s script is re-saved (meta_strategy_save), so edited logic never resumes counting from a stale prior version. Use case: "call when streak(upCandle) >= 3" (3 consecutive up bars), "put when since(bearishEngulf) <= 1 and tick.delta(5) < 0" (fire within 1 bar of a pattern, gated by live tick delta).',
             baselineTickbarIvhv: 'POST-ROADMAP FOLLOW-UP SESSION - 3 more namespaces closing claude/msl-capability-matrix.md gaps that had the exact same shape as the pre-Phase-2 rangeBars/volumeBars/tpo gap (an engine existed, or a chart rendered, with ZERO MSL raw-primitive access). baseline.value()/deviation()/deviationPct()/above()/cross()/deviationSeries(n?) - the Baseline chart previously had NO backing analytics module at all; baseline.value() is the window\'s first close (matching the frontend\'s own existing render rule exactly), deviation/deviationPct measure current price against it, cross() is signed crossing direction on the most recent bar (+1/-1/0). A real `baseline` verdict source now also uses this same engine instead of placeholder logic. tickbar.bars(n?, per?)/ohlc(offset, per?)/direction(per?)/duration(per?)/dataSource() - real tick-count bars (default 10 ticks/bar, wraps analytics/tickbars.ts#tickBars) - dataSource() returns "tick" (real ticks, omni-trader only) or "candle" (honest fallback to candle-close pseudo-ticks everywhere else) - ALWAYS relay which mode is active, never present the fallback as real tick data. tickbar.avgGapMs(per?) -> SCALAR, median inter-observation gap in milliseconds (loose-threads sweep: reuses tickdesk.ts#medianTickGapMs, does not reimplement) - NaN with fewer than 2 points. ivhv.hvNow(window?)/hvSeries(n?)/realizedUpProb(window?)/change(lookback?)/percentile(lookback?) - realized/historical volatility, purely candle-derived (rolling stddev of log returns, annualized). ivhv.ivNow() -> SCALAR (loose-threads sweep, the raw IV accessor previously deliberately left out) - reads the SAME live `payout.value` source payout.* exposes, run through ivFromPayout() for the payout-implied breakeven-probability proxy (the closest honest IV-analog this OS can compute - never "implied volatility" unqualified); NaN when no payout source is wired into this evaluation (no historical replay path) or the account reports none. ivhv.ratio(window?) -> SCALAR, ivNow()/hvNow() - NaN whenever either side is NaN or hvNow() is 0.',
             nearExpiry: 'POST-ROADMAP FOLLOW-UP SESSION - Section 9 of the original checklist (binary-options-specific intelligence), the least-built section of the whole roadmap. nearExpiry.momentum(lookback?) -> SCALAR, signed % rate-of-change over the lookback (same ROC formula ind.roc() uses, named for the "pressure heading into expiry" use case). nearExpiry.displacement(window?) -> SCALAR, raw price displacement over the window, in price units · nearExpiry.displacementAtr(window?) -> SCALAR, that same displacement as a multiple of the window\'s own ATR (comparable across assets/vol regimes). nearExpiry.expectedMove(window?) -> SCALAR, volatility-adjusted expected move (ATR-per-bar * sqrt(bars), the standard square-root-of-time vol scaling). nearExpiry.reversalRisk(lookback?) -> SCALAR (0+), how many ATRs the recent move has already travelled - a documented overextension heuristic, not a textbook formula (see analytics/expiryintel.ts\'s header), magnitude only, direction comes from nearExpiry.displacement()\'s own sign. nearExpiry.stagnation(window?)/nearExpiry.exhaustion(window?) -> SCALARs (0+), the window\'s own range-vs-ATR (stagnation - went nowhere) and momentum-vs-ATR (exhaustion - a sustained run low on fresh volatility) reads, a script compares against its own threshold (no forced boolean baked in). nearExpiry.completionProb(remainingFraction)/nearExpiry.completionDir(remainingFraction) -> SCALAR (0.5-1)/STRING ("call"|"put"|"none") - candle-completion probability, an EXPLICIT documented heuristic (models the remaining time as a driftless random walk with ATR-estimated volatility, reads the normal-CDF probability the already-realized move survives to the close) - NEVER present this as a measured/historical probability, always relay that it is a stated model. Reads the CURRENTLY FORMING bar via live() when available (omni-trader), else honestly falls back to the last CLOSED bar\'s own open-to-close move. IMPORTANT NAMING NOTE: this namespace is `nearExpiry`, NOT `expiry` - `expiry` is already a hard script-level keyword (the `expiry = <numExpr>` statement line) and cannot double as an identifier; `nearExpiry.momentum(...)` is correct, `expiry.momentum(...)` is a parse error.',
-            backtest: 'POST /meta_strategy_backtest {script, asset, tf, candles?, expiryBars?, warmupBars?, minConfidence?, payout?, expiryBarsList?} - Phase 9 of the chart-engine expansion roadmap (analytics/mslbacktest.ts), extended in a post-roadmap follow-up session (Section 11: payout-aware settlement + win-rate-by-expiry breakdowns). Walks the script bar-by-bar over this asset real closed-candle history (candles param picks how many, default 1500, capped 5000) and settles each fire as a fixed-expiryBars-ahead binary (default 3 bars; a flat close counts as a loss, same convention strategies/backtest.ts already uses). Returns {trades, wins, losses, winRate, avgConfidence, barsEvaluated, unavailableSources}, PLUS (only when `payout` 0..1 is supplied) each trade gets `pnl` (win -> +payout, loss -> -1, per $1 staked) and the response gets `expectancy` (mean pnl)/`maxDrawdown` (largest peak-to-trough cumulative-pnl drop)/`netPnl` (final cumulative pnl) - these fields are simply ABSENT, never fabricated, when no payout is given. PLUS (only when `expiryBarsList` - an array of bar-counts-ahead - is supplied) a `byExpiry` array: the SAME fired signals re-settled against each requested horizon in the one run (no re-evaluation of the script), each entry {expiryBars, trades, wins, losses, winRate, expectancy?}. HONEST SCOPE: only the pure candle-derived primitives (ind.*/ohlc()/renko.*/pf.*/ha.*/rangebars.*/volumebars.*/tpo.*/vp.*/linebreak.*/kagi.*/swing.*/since()/streak()) replay faithfully bar-by-bar; every source that depends on a LIVE plugin own internal state (smc/oracle/technical/tickOracle/nextExpiry/payout/accute/etc) reads none for the ENTIRE run, because this engine has no historical snapshot of those services to replay - fabricating one would be exactly the "proxy labeled as measured" mistake this whole roadmap has repeatedly refused to make elsewhere. The response own unavailableSources field names every one of them so a script author knows exactly which conditions never had a chance to fire during the backtest. A script using ONLY the candle-derived group backtests end-to-end for real.',
+            backtest: 'POST /meta_strategy_backtest {script, asset, tf, candles?, expiryBars?, warmupBars?, minConfidence?, payout?, expiryBarsList?, outOfSampleBars?} - Phase 9 of the chart-engine expansion roadmap (analytics/mslbacktest.ts), extended in a post-roadmap follow-up session (Section 11: payout-aware settlement + win-rate-by-expiry breakdowns) and again in the loose-threads-backtesting sweep (out-of-sample split, walk-forward, cross-asset - the sole item that survived every prior sweep). Walks the script bar-by-bar over this asset real closed-candle history (candles param picks how many, default 1500, capped 5000) and settles each fire as a fixed-expiryBars-ahead binary (default 3 bars; a flat close counts as a loss, same convention strategies/backtest.ts already uses). Returns {trades, wins, losses, winRate, avgConfidence, barsEvaluated, unavailableSources}, PLUS (only when `payout` 0..1 is supplied) each trade gets `pnl` (win -> +payout, loss -> -1, per $1 staked) and the response gets `expectancy` (mean pnl)/`maxDrawdown` (largest peak-to-trough cumulative-pnl drop)/`netPnl` (final cumulative pnl) - these fields are simply ABSENT, never fabricated, when no payout is given. PLUS (only when `expiryBarsList` - an array of bar-counts-ahead - is supplied) a `byExpiry` array: the SAME fired signals re-settled against each requested horizon in the one run (no re-evaluation of the script), each entry {expiryBars, trades, wins, losses, winRate, expectancy?}. PLUS (only when `outOfSampleBars` - a trailing bar count - is supplied) `inSample`/`outOfSample` breakdowns {trades, wins, losses, winRate, avgConfidence, expectancy?, netPnl?} - every fired signal before vs. from that trailing window, so you can see whether the edge still holds on bars nobody looked at while writing the script (this engine fits/tunes nothing, so "out-of-sample" here means exactly that, not a held-out fitting set). HONEST SCOPE: only the pure candle-derived primitives (ind.*/ohlc()/renko.*/pf.*/ha.*/rangebars.*/volumebars.*/tpo.*/vp.*/linebreak.*/kagi.*/swing.*/dp.*/baseline.*/tickbar.*/ivhv.*/nearExpiry.*/gap.*, breakeven()/ev()/gate(), since()/streak()) replay faithfully bar-by-bar; every source that depends on a LIVE plugin own internal state (smc/oracle/technical/tickOracle/nextExpiry/payout/accute/etc) reads none for the ENTIRE run, because this engine has no historical snapshot of those services to replay - fabricating one would be exactly the "proxy labeled as measured" mistake this whole roadmap has repeatedly refused to make elsewhere. The response own unavailableSources field names every one of them so a script author knows exactly which conditions never had a chance to fire during the backtest. A script using ONLY the candle-derived group backtests end-to-end for real. WALK-FORWARD: POST /meta_strategy_backtest_walkforward {script, asset, tf, candles?, folds? (default 5), expiryBars?, warmupBars?, minConfidence?, payout?} - the SAME one evaluation pass, partitioned into `folds` contiguous chronological slices, so a script with a real edge should show a broadly similar winRate across folds rather than one lucky stretch carrying an otherwise-flat overall number. Returns {overall, folds: [{foldIndex, fromIndex, toIndex, fromTime, toTime, trades, wins, losses, winRate, avgConfidence, expectancy?, netPnl?}], winRateStdDev (population stddev of each qualifying fold own winRate, null below 2 qualifying folds - a dispersion read, never presented as a significance test), barsEvaluated, unavailableSources}. CROSS-ASSET: POST /meta_strategy_backtest_crossasset {script, assets: string[], tf, candles?, expiryBars?, warmupBars?, minConfidence?, payout?} - runs the SAME script, independently, against each named asset own candle history through the plain backtest engine, then pools every asset own already-settled trades into one combined breakdown - the "does this edge generalize, or is it one pair quirk" check. Returns {perAsset: [{asset, result: <same shape as the plain /meta_strategy_backtest response>}], combined, winRateStdDevAcrossAssets}; an asset with too little history or a bad name still gets its own perAsset entry with result.ok:false/error, never silently dropped.',
           },
           note: 'All of this is ALREADY reachable from a Meta-Strategy Lab script today (plugins/metastrategy.ts\'s scriptResolver -> strategies/signalscript.ts, plus the mslRawPrimitives primitives above), the same vocabulary the AI Lab\'s own code editor uses. If a strategy you want isn\'t expressible with these plus MSL\'s own panel sources (meta_strategy_sources) and operators (and/or/not, comparisons, avg/sum/min/max/count/abs, let, if()), that is a real gap - say which one. No known remaining gaps as of the loose-threads sweep (pf.breakout()/.breakoutName()/.breakoutAt(), VolumeBar.dir stored, gap.* candlestick gap detection, tpo.developingPoc/Vah/Val + singlePrint/poorHigh-Low/excessHigh-Low, ivhv.ivNow()/.ratio(), tickbar.avgGapMs()).',
           // The full MSL grammar + a mistakes list, added after a review of an
@@ -4717,8 +4717,83 @@ const httpServer = createServer(async (req, res) => {
             minConfidence: body.minConfidence !== undefined ? Math.max(0, Math.min(100, Number(body.minConfidence))) : undefined,
             payout: body.payout !== undefined ? Math.max(0, Number(body.payout)) : undefined,
             expiryBarsList: Array.isArray(body.expiryBarsList) ? body.expiryBarsList.map((n: unknown) => Math.max(1, Math.round(Number(n)))).filter((n: number) => Number.isFinite(n)) : undefined,
+            // out-of-sample split (loose-threads-backtesting sweep, closing
+            // the sole item left in the entire roadmap-plus-sweeps backlog)
+            // - a trailing window's own breakdown, so a caller can see
+            // whether the edge holds on bars nobody looked at while writing
+            // the script. See analytics/mslbacktest.ts#MslBacktestOpts's own
+            // doc comment on outOfSampleBars for exactly what this is.
+            outOfSampleBars: body.outOfSampleBars !== undefined ? Math.max(1, Math.round(Number(body.outOfSampleBars))) : undefined,
           })
           return json(200, { ...result, asset, tf: tfv, candlesUsed: candles.length, ts: Date.now() })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // POST /meta_strategy_backtest_walkforward {script, asset, tf,
+      // candles?, folds?, expiryBars?, warmupBars?, minConfidence?,
+      // payout?} - loose-threads-backtesting sweep (closing the
+      // walk-forward item). Same engine as /meta_strategy_backtest, one
+      // evaluation pass, partitioned into `folds` (default 5) contiguous
+      // chronological slices so a caller can see whether an edge holds up
+      // consistently ACROSS TIME rather than being carried by one lucky
+      // stretch. Returns {overall, folds: [{foldIndex, fromIndex, toIndex,
+      // fromTime, toTime, trades, wins, losses, winRate, avgConfidence,
+      // expectancy?, netPnl?}], winRateStdDev, barsEvaluated,
+      // unavailableSources} - same HONEST SCOPE as the plain backtest
+      // above (see analytics/mslbacktest.ts's own header).
+      if (path === '/meta_strategy_backtest_walkforward') {
+        try {
+          const tfv = tfStrict(String(body.tf ?? ''))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(String(body.tf ?? '')) })
+          const asset = String(body.asset ?? market.activeAsset)
+          const script = String(body.script ?? '')
+          if (!script.trim()) return json(400, { ok: false, error: 'script is required' })
+          const candleCount = Math.max(100, Math.min(5000, Math.round(Number(body.candles) || 1500)))
+          const candles = market.getCandlesDeep(asset, tfv, candleCount, true)
+          const result = backtestMslScriptWalkForward(candles, script, {
+            folds: body.folds !== undefined ? Math.max(1, Math.round(Number(body.folds))) : undefined,
+            expiryBars: body.expiryBars !== undefined ? Math.max(1, Math.round(Number(body.expiryBars))) : undefined,
+            warmupBars: body.warmupBars !== undefined ? Math.max(1, Math.round(Number(body.warmupBars))) : undefined,
+            minConfidence: body.minConfidence !== undefined ? Math.max(0, Math.min(100, Number(body.minConfidence))) : undefined,
+            payout: body.payout !== undefined ? Math.max(0, Number(body.payout)) : undefined,
+          })
+          return json(200, { ...result, asset, tf: tfv, candlesUsed: candles.length, ts: Date.now() })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // POST /meta_strategy_backtest_crossasset {script, assets: string[],
+      // tf, candles?, expiryBars?, warmupBars?, minConfidence?, payout?} -
+      // loose-threads-backtesting sweep (closing the cross-asset item).
+      // Runs the SAME script, independently, against each named asset's
+      // own candle history through the plain backtest engine, then pools
+      // every asset's own already-settled trades into `combined` - the
+      // "does this edge generalize, or is it one pair's own quirk" check.
+      // Returns {perAsset: [{asset, result}], combined,
+      // winRateStdDevAcrossAssets}. An asset with too little history or a
+      // bad asset name still gets its own `perAsset` entry with
+      // result.ok:false/error, never silently dropped from the list.
+      if (path === '/meta_strategy_backtest_crossasset') {
+        try {
+          const tfv = tfStrict(String(body.tf ?? ''))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(String(body.tf ?? '')) })
+          const script = String(body.script ?? '')
+          if (!script.trim()) return json(400, { ok: false, error: 'script is required' })
+          const assetsReq = Array.isArray(body.assets) ? body.assets.map((a: unknown) => String(a)).filter((a: string) => a.trim()) : []
+          if (!assetsReq.length) return json(400, { ok: false, error: 'assets (non-empty string array) is required' })
+          const candleCount = Math.max(100, Math.min(5000, Math.round(Number(body.candles) || 1500)))
+          const assetCandles: Record<string, ReturnType<typeof market.getCandlesDeep>> = {}
+          for (const a of assetsReq) assetCandles[a] = market.getCandlesDeep(a, tfv, candleCount, true)
+          const result = backtestMslScriptCrossAsset(assetCandles, script, {
+            expiryBars: body.expiryBars !== undefined ? Math.max(1, Math.round(Number(body.expiryBars))) : undefined,
+            warmupBars: body.warmupBars !== undefined ? Math.max(1, Math.round(Number(body.warmupBars))) : undefined,
+            minConfidence: body.minConfidence !== undefined ? Math.max(0, Math.min(100, Number(body.minConfidence))) : undefined,
+            payout: body.payout !== undefined ? Math.max(0, Number(body.payout)) : undefined,
+          })
+          return json(200, { ...result, tf: tfv, ts: Date.now() })
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }
