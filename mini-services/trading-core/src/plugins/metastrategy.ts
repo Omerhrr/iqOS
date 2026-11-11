@@ -43,6 +43,9 @@ import { computeDeltaProfile } from '../analytics/deltaprofile'
 import { lineBreak } from '../analytics/linebreak'
 import { kagi } from '../analytics/kagi'
 import { computeSwing } from '../analytics/swing'
+import { effortBricks } from '../analytics/effortbricks'
+import { computeMrc } from '../analytics/mrc'
+import { computeOutcomeMemory } from '../analytics/outcomememory'
 import { computeBaseline } from '../analytics/baseline'
 import { realizedUpProb } from '../analytics/ivhv'
 import { EXPIRIES_MIN } from '../analytics/nextexpiry'
@@ -98,7 +101,7 @@ import { sharpeRatio } from '../analytics/quant'
 const SAFE_BACKTEST_SOURCES = new Set<MetaConditionSource>([
   'renko', 'pointFigure', 'rangeBars', 'candle', 'bar', 'heikinAshi', 'line', 'area',
   'baseline', 'volumeBars', 'tpo', 'ivHv', 'volumeProfile', 'lineBreak', 'kagi', 'swing',
-  'deltaProfile', 'technical', 'reversal',
+  'deltaProfile', 'technical', 'reversal', 'effort', 'mrc', 'outcomeMemory',
 ])
 
 /** Every OTHER MetaConditionSource - named explicitly (rather than derived
@@ -246,6 +249,31 @@ export const MSL_READ_CONFIGS: Record<string, MslConfigSpec> = {
   // there). dp.binCount is the one genuinely NEW key - Delta Profile didn't
   // exist before this sweep.
   'dp.binCount': { min: 5, max: 200, integer: true, desc: 'Delta Profile bin count' },
+  // Effort Bricks (analytics/effortbricks.ts) - same renko.*-style knobs for
+  // brick sizing, plus the two knobs unique to this engine: how strict the
+  // participation-confirmation gate is (effort.mult) and how many trailing
+  // bricks its regime/trailing-average reads look back over (effort.lookback).
+  'effort.brick': { min: 1e-9, max: 1e9, desc: 'explicit effort-brick size in price units' },
+  'effort.atrPeriod': { min: 2, max: 200, integer: true, desc: 'effort-brick ATR period' },
+  'effort.atrMult': { min: 0.05, max: 20, desc: 'effort-brick ATR multiplier' },
+  'effort.mult': { min: 0.1, max: 20, desc: 'effort-brick participation multiplier threshold (a brick confirms when its effortRatio clears this)' },
+  'effort.lookback': { min: 2, max: 100, integer: true, desc: 'effort-brick trailing average / regime lookback (bricks)' },
+  // Market Response Chart (analytics/mrc.ts) - the three event-trigger knobs
+  // plus the trailing-average lookback its response/activity reads use.
+  'mrc.priceMult': { min: 0.5, max: 200, desc: 'MRC price-event threshold, as a multiple of the trailing average single-step move' },
+  'mrc.activityMult': { min: 0.1, max: 1e6, desc: 'MRC activity-event bootstrap threshold, before enough bars exist for a trailing average' },
+  'mrc.maxDuration': { min: 1, max: 86400, desc: 'MRC time-safeguard: force-close a bar after this many seconds with no price/activity trigger' },
+  'mrc.maxGapMult': { min: 1.5, max: 1000, desc: 'MRC dead-time guard: a recording gap bigger than this multiple of the base sampling interval force-closes the current bar as dataGap' },
+  'mrc.lookback': { min: 2, max: 100, integer: true, desc: 'MRC trailing response_efficiency/activity-threshold lookback (bars)' },
+  // Historical Outcome Memory (analytics/outcomememory.ts) - the k-NN search
+  // knobs. 'memory.expiry' is in BARS of the condition's own tf (not
+  // minutes - this engine has no minute-native requirement the way the
+  // Next-Expiry Oracle does), matching how every other bar-offset-based
+  // engine in this file already counts.
+  'memory.expiry': { min: 1, max: 500, integer: true, desc: 'Outcome Memory: settlement horizon in bars of the condition tf' },
+  'memory.k': { min: 3, max: 200, integer: true, desc: 'Outcome Memory: number of nearest historical matches to draw' },
+  'memory.lookback': { min: 100, max: 10000, integer: true, desc: 'Outcome Memory: how many trailing bars to search for candidates' },
+  'memory.minPool': { min: 3, max: 500, integer: true, desc: 'Outcome Memory: minimum comparable (same-session) pool size before trusting a read' },
 }
 
 /** Validates a collected configure map against the whitelist. Throws with a
@@ -370,7 +398,7 @@ export class MetaStrategyService {
       'smc', 'smcNow', 'renkoSmc', 'renkoSmcMajority', 'pointFigure', 'rangeBars',
       'candle', 'heikinAshi', 'volumeBars', 'tick', 'footprint', 'tpo', 'ivHv', 'line',
       'tickSmc', 'tickOracle', 'tickTechnical', 'tickFootprint',
-      'technical', 'reversal', 'tempo', 'confluence', 'volArb', 'cointegration',
+      'technical', 'reversal', 'tempo', 'confluence', 'volArb', 'cointegration', 'effort', 'mrc', 'outcomeMemory',
     ]
     const base = sources.map((s) => this.readSource(s, asset, tf))
     const perSmcConcept = ALL_SMC_KINDS.map((kind) => this.readSource('smcNow', asset, tf, kind))
@@ -1179,6 +1207,102 @@ export class MetaStrategyService {
           const confidence = 60
           return { source, direction, confidence, label: `Swing structure ${sw.structure.toUpperCase()} (${sw.swings.length} confirmed swing(s), lookback ${sw.lookback})` }
         }
+        case 'effort': {
+          // direction = the last brick's trend (same as 'renko' above);
+          // confidence boosted when that LAST brick is itself confirmed
+          // (its own participation cleared effortMult) vs not - mirrors
+          // 'kagi' above using its own thickness as the conviction boost.
+          // 'none' both when no bricks have painted yet AND (same honest
+          // no-guess contract every source here follows) there isn't
+          // enough history to say anything.
+          const candles = this.market.getCandlesDeep(asset, tf, 300, true)
+          const eb = effortBricks(candles, {
+            ...(cfgNum(cfg, 'effort.brick') !== undefined ? { brickSize: cfgNum(cfg, 'effort.brick') } : {}),
+            ...(cfgNum(cfg, 'effort.atrPeriod') !== undefined ? { atrPeriod: cfgNum(cfg, 'effort.atrPeriod') } : {}),
+            ...(cfgNum(cfg, 'effort.atrMult') !== undefined ? { atrMult: cfgNum(cfg, 'effort.atrMult') } : {}),
+            ...(cfgNum(cfg, 'effort.mult') !== undefined ? { effortMult: cfgNum(cfg, 'effort.mult') } : {}),
+            ...(cfgNum(cfg, 'effort.lookback') !== undefined ? { lookback: cfgNum(cfg, 'effort.lookback') } : {}),
+          })
+          if (eb.trend === 'none' || !eb.bricks.length) return none('Effort Bricks: no bricks painted yet')
+          const last = eb.bricks[eb.bricks.length - 1]
+          const direction = eb.trend === 'up' ? 'call' : 'put'
+          const confidence = last.confirmed ? 70 : 40
+          return {
+            source,
+            direction,
+            confidence,
+            value: eb.trend === 'up' ? eb.streak : -eb.streak,
+            label: `Effort Bricks ${direction.toUpperCase()} - last brick ${last.confirmed ? 'CONFIRMED' : 'unconfirmed'} (regime ${eb.regime}, confirmed ${(eb.confirmedRatio * 100).toFixed(0)}% of last ${eb.lookback}, effortSource ${eb.effortSource})`,
+          }
+        }
+        case 'mrc': {
+          // CANDLE-FALLBACK ONLY, deliberately - no live tick feed is
+          // passed in here (unlike the raw mrc.* namespace in
+          // strategylang.ts, which opportunistically upgrades via
+          // ctx.liveTicks) so this verdict stays SAFE_BACKTEST_SOURCES
+          // tier, same reasoning 'effort' above follows. Direction = the
+          // last CONFIRMED (not still-forming, not gap-forced) bar's
+          // directional lean; confidence boosted when that bar's own
+          // responseRatio clears its trailing average (a "clean,
+          // low-resistance move" read, mirroring 'effort'/'kagi' above
+          // using their own engine's conviction signal as the boost).
+          const candles = this.market.getCandlesDeep(asset, tf, 300, true)
+          const mrc = computeMrc(candles, undefined, {
+            ...(cfgNum(cfg, 'mrc.priceMult') !== undefined ? { priceMult: cfgNum(cfg, 'mrc.priceMult') } : {}),
+            ...(cfgNum(cfg, 'mrc.activityMult') !== undefined ? { activityMult: cfgNum(cfg, 'mrc.activityMult') } : {}),
+            ...(cfgNum(cfg, 'mrc.maxDuration') !== undefined ? { maxDurationSec: cfgNum(cfg, 'mrc.maxDuration') } : {}),
+            ...(cfgNum(cfg, 'mrc.maxGapMult') !== undefined ? { maxGapMultiple: cfgNum(cfg, 'mrc.maxGapMult') } : {}),
+            ...(cfgNum(cfg, 'mrc.lookback') !== undefined ? { lookback: cfgNum(cfg, 'mrc.lookback') } : {}),
+          })
+          const confirmedBars = mrc.bars.filter((b) => b.confirmed && !b.dataGap)
+          if (!confirmedBars.length) return none('MRC: no confirmed bars yet')
+          const last = confirmedBars[confirmedBars.length - 1]
+          if (last.directionalDelta === 0) return none('MRC: last confirmed bar had no net directional lean')
+          const direction = last.directionalDelta > 0 ? 'call' : 'put'
+          const strong = Number.isFinite(last.responseRatio) && last.responseRatio >= 1
+          const confidence = strong ? 70 : 40
+          return {
+            source,
+            direction,
+            confidence,
+            value: mrc.trend === 'up' ? mrc.streak : -mrc.streak,
+            label: `MRC ${direction.toUpperCase()} - last confirmed bar ${strong ? 'ABOVE' : 'below'} trailing response_efficiency (ratio ${Number.isFinite(last.responseRatio) ? last.responseRatio.toFixed(2) : 'n/a'}x, trigger ${last.trigger}, fidelity ${mrc.fidelity})`,
+          }
+        }
+        case 'outcomeMemory': {
+          // k-NN over past same-session market states - see
+          // analytics/outcomememory.ts's own header and
+          // claude/market-response-chart-mrc.md for the full design
+          // rationale (built in response to a "Binary Outcome Chart"
+          // proposal - this is the one genuinely new piece that proposal
+          // surfaced, not already covered by the Next-Expiry Oracle).
+          // DEADBAND + POOL-SIZE-SCALED CONFIDENCE: a pUp of 0.52 drawn from
+          // 20 matches says almost nothing - confidence here scales with
+          // BOTH how far pUp sits from a coin flip AND how large the
+          // comparable pool actually was, so a thin-pool read never
+          // outranks a thick-pool one at the same pUp.
+          const candles = this.market.getCandlesDeep(asset, tf, Math.max(2000, cfgNum(cfg, 'memory.lookback') ?? 1500), true)
+          const om = computeOutcomeMemory(candles, asset, {
+            ...(cfgNum(cfg, 'memory.expiry') !== undefined ? { expiryBars: cfgNum(cfg, 'memory.expiry') } : {}),
+            ...(cfgNum(cfg, 'memory.k') !== undefined ? { k: cfgNum(cfg, 'memory.k') } : {}),
+            ...(cfgNum(cfg, 'memory.lookback') !== undefined ? { lookback: cfgNum(cfg, 'memory.lookback') } : {}),
+            ...(cfgNum(cfg, 'memory.minPool') !== undefined ? { minPoolSize: cfgNum(cfg, 'memory.minPool') } : {}),
+          })
+          if (!om.ok) return none(`Outcome Memory: ${om.note}`)
+          const DEADBAND = 0.08
+          if (!Number.isFinite(om.pUp) || Math.abs(om.pUp - 0.5) < DEADBAND) return none(`Outcome Memory: pUp ${Number.isFinite(om.pUp) ? (om.pUp * 100).toFixed(0) + '%' : 'n/a'} too close to a coin flip (${om.k} matches, pool ${om.poolSize})`)
+          const direction = om.pUp > 0.5 ? 'call' : 'put'
+          const edgeStrength = Math.min(1, Math.abs(om.pUp - 0.5) / 0.3) // |pUp-0.5| of 0.3+ (i.e. 80%+/20%-) maxes this out
+          const poolStrength = Math.min(1, om.poolSize / 200) // a 200+ match pool maxes this out
+          const confidence = Math.round(35 + 40 * edgeStrength + 15 * poolStrength)
+          return {
+            source,
+            direction,
+            confidence,
+            value: om.pUp,
+            label: `Outcome Memory ${direction.toUpperCase()} - pUp ${(om.pUp * 100).toFixed(0)}% over ${om.k} comparable ${om.session} state(s) (pool ${om.poolSize}), avg forward return ${om.avgReturn.toFixed(4)}%`,
+          }
+        }
         case 'footDivergence': {
           // The Metric-B divergence trap off the REAL tick buffer - same
           // sync-off-existing-buffer rule 'otcFootprint' above follows (never
@@ -1335,6 +1459,9 @@ export class MetaStrategyService {
       lineBreak: toMsl(this.readSource('lineBreak', asset, tf, undefined, undefined, undefined, cfg)),
       kagi: toMsl(this.readSource('kagi', asset, tf, undefined, undefined, undefined, cfg)),
       swing: toMsl(this.readSource('swing', asset, tf, undefined, undefined, undefined, cfg)),
+      effort: toMsl(this.readSource('effort', asset, tf, undefined, undefined, undefined, cfg)),
+      mrc: toMsl(this.readSource('mrc', asset, tf, undefined, undefined, undefined, cfg)),
+      outcomeMemory: toMsl(this.readSource('outcomeMemory', asset, tf, undefined, undefined, undefined, cfg)),
       footDivergence: toMsl(this.readSource('footDivergence', asset, tf)),
       footStackedImbalance: toMsl(this.readSource('footStackedImbalance', asset, tf, undefined, undefined, undefined, cfg)),
       footAbsorption: toMsl(this.readSource('footAbsorption', asset, tf)),

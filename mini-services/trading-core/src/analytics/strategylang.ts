@@ -235,6 +235,8 @@ import { computeBaseline } from './baseline'
 import { hvSeries, realizedUpProb, ivFromPayout } from './ivhv'
 import { expiryMomentum, priceDisplacement, volAdjustedExpectedMove, reversalRisk, expiryStagnationExhaustion, candleCompletionProbability } from './expiryintel'
 import { detectGaps } from './gap'
+import { effortBricks } from './effortbricks'
+import { computeMrc } from './mrc'
 
 export interface MslSourceRead {
   direction: 'call' | 'put' | 'none'
@@ -2386,6 +2388,134 @@ function swingMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | 
   }
 }
 
+/** `effort.*` - Effort Bricks (analytics/effortbricks.ts), a Renko variant
+ * that also requires real participation (candle volume) behind a brick's
+ * move before calling it confirmed - see that module's own header for the
+ * full reasoning. `effort.bricks(n?)` is a series of signed brick
+ * directions, same convention as `renko.bricks(n?)`. `effort.confirmed
+ * (offset)`/`effort.effort(offset)`/`effort.ratio(offset)` read one
+ * brick's own participation verdict/raw effort/effort-ratio (same -1=latest
+ * offset convention as renko.ohlc/pf.column/swing.high). `effort.regime()`
+ * is 'trending'/'ranging'/'choppy'/'none' (the one read none of Renko/P&F/
+ * Range/Line-Break/Kagi can give - see effortbricks.ts's own header).
+ * `effort.confirmedRatio()` and `effort.source()` ('volume'|'none') expose
+ * the regime read's own inputs directly, for a script that wants to build
+ * its own threshold rather than trust the built-in regime classification. */
+function effortMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const candles = seriesToCandles(requireSeries(ctx, tf))
+  const r = effortBricks(candles, {
+    brickSize: cfgNumLang(ctx, 'effort.brick', undefined),
+    atrPeriod: cfgNumLang(ctx, 'effort.atrPeriod', undefined),
+    atrMult: cfgNumLang(ctx, 'effort.atrMult', undefined),
+    effortMult: cfgNumLang(ctx, 'effort.mult', undefined),
+    lookback: cfgNumLang(ctx, 'effort.lookback', undefined),
+  })
+  switch (name) {
+    case 'bricks':
+      return seriesValue(r.bricks.map((b) => b.dir).slice(-seriesLookback(args, 50)))
+    case 'brickSize':
+      return r.brickSize
+    case 'ohlc': {
+      if (!args.length) throw new MslRuntimeError('effort.ohlc(offset) needs an offset argument, e.g. effort.ohlc(-1)')
+      const b = offsetInto(r.bricks, asNum(args[0]), 'effort.ohlc')
+      return barValueFromOHLC(b.open, b.high, b.low, b.close, 0)
+    }
+    case 'confirmed': {
+      if (!args.length) throw new MslRuntimeError('effort.confirmed(offset) needs an offset argument, e.g. effort.confirmed(-1)')
+      const b = offsetInto(r.bricks, asNum(args[0]), 'effort.confirmed')
+      return b.confirmed
+    }
+    case 'effort': {
+      if (!args.length) throw new MslRuntimeError('effort.effort(offset) needs an offset argument, e.g. effort.effort(-1)')
+      const b = offsetInto(r.bricks, asNum(args[0]), 'effort.effort')
+      return b.effort
+    }
+    case 'ratio': {
+      if (!args.length) throw new MslRuntimeError('effort.ratio(offset) needs an offset argument, e.g. effort.ratio(-1)')
+      const b = offsetInto(r.bricks, asNum(args[0]), 'effort.ratio')
+      return Number.isFinite(b.effortRatio) ? b.effortRatio : 0
+    }
+    case 'regime':
+      return r.regime
+    case 'confirmedRatio':
+      return r.confirmedRatio
+    case 'source':
+      return r.effortSource
+    default:
+      throw new MslRuntimeError(
+        `unknown effort method "effort.${name}(...)" - use bricks(n?)/brickSize()/ohlc(offset)/confirmed(offset)/effort(offset)/ratio(offset)/regime()/confirmedRatio()/source() (or effort.dir/.conf/.value for the plain verdict read)`
+      )
+  }
+}
+
+/** `mrc.*` - Market Response Chart (analytics/mrc.ts), the adaptive-event-
+ * clock engine: a bar closes on a price event, an activity event, OR a
+ * time safeguard, carrying how much displacement a bar's activity actually
+ * bought it (`responseEfficiency`/`responseRatio` - "effort without result"
+ * vs "clean, low-resistance move"). HONEST FIDELITY, same contract
+ * tickbar.* already established: uses REAL ticks (`mrc.fidelity() ==
+ * 'tick'`) when this evaluation context has a live tick feed wired in
+ * (`ctx.liveTicks`), otherwise falls back to this tf's own closed-candle
+ * closes as pseudo-observations (`'candle'`) - NEVER fabricates a real
+ * tick-level path where none exists, so `pathEfficiency`/`reversalCount`
+ * read NaN in candle fidelity rather than a guessed number (see mrc.ts's
+ * own module header). Every offset-indexed accessor uses the SAME
+ * -1-is-latest convention as every other primitive in this file. Reads the
+ * LATEST bar only when it fails closed with "no bars yet" - unlike most
+ * other engines this one can genuinely produce zero bars on a very short
+ * window (its triggers need at least 2 observations to ever fire). */
+function mrcMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const candles = seriesToCandles(requireSeries(ctx, tf))
+  const r = computeMrc(candles, ctx.liveTicks as { ts: number; price: number }[] | undefined, {
+    priceMult: cfgNumLang(ctx, 'mrc.priceMult', undefined),
+    activityMult: cfgNumLang(ctx, 'mrc.activityMult', undefined),
+    maxDurationSec: cfgNumLang(ctx, 'mrc.maxDuration', undefined),
+    maxGapMultiple: cfgNumLang(ctx, 'mrc.maxGapMult', undefined),
+    lookback: cfgNumLang(ctx, 'mrc.lookback', undefined),
+  })
+  if (name === 'fidelity') return r.fidelity
+  if (name === 'bars') return seriesValue(r.bars.map((b) => Math.sign(b.directionalDelta)).slice(-seriesLookback(args, 50)))
+  if (!r.bars.length) throw new MslRuntimeError('mrc.*(offset) - no bars have formed yet in this window (needs at least 2 observations for a trigger to fire)')
+  if (!args.length) throw new MslRuntimeError(`mrc.${name}(offset) needs an offset argument, e.g. mrc.${name}(-1)`)
+  const b = offsetInto(r.bars, asNum(args[0]), `mrc.${name}`)
+  switch (name) {
+    case 'ohlc':
+      return barValueFromOHLC(b.open, b.high, b.low, b.close, 0)
+    case 'duration':
+      return b.duration
+    case 'displacement':
+      return b.displacement
+    case 'range':
+      return b.range
+    case 'activity':
+      return b.activityCount
+    case 'velocity':
+      return Number.isFinite(b.velocity) ? b.velocity : 0
+    case 'directionalDelta':
+      return b.directionalDelta
+    case 'directionalRatio':
+      return Number.isFinite(b.directionalRatio) ? b.directionalRatio : 0
+    case 'pathEfficiency':
+      return Number.isFinite(b.pathEfficiency) ? b.pathEfficiency : 0
+    case 'reversalCount':
+      return Number.isFinite(b.reversalCount) ? b.reversalCount : 0
+    case 'priceConcentration':
+      return Number.isFinite(b.priceConcentration) ? b.priceConcentration : 0
+    case 'responseEfficiency':
+      return Number.isFinite(b.responseEfficiency) ? b.responseEfficiency : 0
+    case 'responseRatio':
+      return Number.isFinite(b.responseRatio) ? b.responseRatio : 0
+    case 'gap':
+      return b.dataGap
+    case 'confirmed':
+      return b.confirmed
+    default:
+      throw new MslRuntimeError(
+        `unknown mrc method "mrc.${name}(...)" - use bars(n?)/fidelity()/ohlc(offset)/duration(offset)/displacement(offset)/range(offset)/activity(offset)/velocity(offset)/directionalDelta(offset)/directionalRatio(offset)/pathEfficiency(offset)/reversalCount(offset)/priceConcentration(offset)/responseEfficiency(offset)/responseRatio(offset)/gap(offset)/confirmed(offset)`
+      )
+  }
+}
+
 /** `gap.*` - candlestick gap detection (claude/msl-capability-matrix.md
  * section A, flagged "missing" since the Phase 0 audit - see
  * analytics/gap.ts for the full honest-scope note: near-meaningless on
@@ -2865,6 +2995,16 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
         return gapMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'effort' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return effortMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'mrc' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return mrcMethod(e.name, args, ctx, tf)
       }
       if (e.obj.t === 'ident' && e.obj.name === 'tickbar' && !(e.obj.name in env)) {
         const args = e.args.map((a) => evalExpr(a, env, ctx))

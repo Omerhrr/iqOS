@@ -17,23 +17,42 @@
 // exact same data the /otc_footprint chart renders - measured-candidate IS
 // the deployed math, everywhere.
 //
-// Invariants respected: read-only over the data chain (never touches candles,
-// the archive, or settlement); buffers are pure memory, rebuilt naturally
-// after restart; no fabrication - assets without tick coverage simply report
-// empty / stand aside.
+// Invariants respected: read-only over the data chain (never touches candles
+// or settlement); buffers are pure memory, rebuilt naturally after restart;
+// no fabrication - assets without tick coverage simply report empty / stand
+// aside.
+//
+// TICK ARCHIVE (write-behind, same shape as market-data.ts's candle
+// archiveQueue/flushArchive/pruneArchive): record() is the single place
+// every tick this collector ever sees passes through, so it's also the
+// single place a durable archive can be fed from without creating a second,
+// possibly-divergent sample of "what a tick was." Queued ticks are batched
+// to store.ts's `ticks_archive` table on TICK_ARCHIVE_FLUSH_MS, pruned to
+// TICK_ARCHIVE_CAP ticks per asset every TICK_ARCHIVE_PRUNE_FLUSHES flushes.
+// This exists specifically so a future offline validation pass can test the
+// tick-fidelity-only MRC measurements (path_efficiency, reversal_count, true
+// tick-based directional_delta) that candles_archive alone cannot support -
+// before this, NO real tick-level data was ever persisted anywhere in this
+// codebase. Best-effort: a store write failure must never break the live
+// feed (same reasoning market-data.ts's flushArchive() states for candles).
 
 import type { KernelContext, Plugin } from '../kernel'
 import type { MarketDataService } from './market-data'
+import type { Store } from '../store'
 import { buildFootprint, registerTickProvider, type FootprintResult, type TickPoint } from '../analytics/otcfootprint'
 
 const OTF_MAX_TICKS = 60_000 // per asset (~16h at the sim engine's 1s cadence)
 const LIVE_PULL_MS = 8_000 // sidecar /tick_stats merge cadence
 const LIVE_PULL_MIN_MS = 5_000 // on-demand throttle (footprint() awaits a fresh pull)
 const PULL_ASSETS_CAP = 6 // active + enabled-bot watchlist assets per sweep
+const TICK_ARCHIVE_FLUSH_MS = 5_000 // batched write cadence (matches market-data.ts's ARCHIVE_FLUSH_MS)
+const TICK_ARCHIVE_PRUNE_FLUSHES = 60 // ~every 5 minutes, same cadence market-data.ts prunes candles at
+const TICK_ARCHIVE_CAP = 50_000 // per-asset trim cap (bun:sqlite getTicksArchive's own hard ceiling)
 
 export class OtcFootprintService {
   private ctx!: KernelContext
   private market!: MarketDataService
+  private store: Store | null = null
   private buffers = new Map<string, TickPoint[]>()
   private backfilled = new Set<string>()
   private watermark = new Map<string, number>() // live-pull ts (ms) per asset
@@ -41,11 +60,19 @@ export class OtcFootprintService {
   private pulling = new Set<string>()
   private unsub: (() => void) | null = null
   private timer: ReturnType<typeof setInterval> | null = null
+  private archiveTimer: ReturnType<typeof setInterval> | null = null
+  private archiveQueue: { asset: string; ts: number; price: number }[] = []
+  private archiveFlushCount = 0
   private lastWarn = new Map<string, number>()
 
   async start(ctx: KernelContext): Promise<void> {
     this.ctx = ctx
     this.market = ctx.use<MarketDataService>('market')
+    try {
+      this.store = ctx.use<Store>('storeRaw')
+    } catch {
+      // store not available - tick archive disabled, pure in-memory mode (same fallback market-data.ts takes for candles)
+    }
     registerTickProvider((asset) => this.ticksFor(asset))
     // sim engine ticks (1s cadence, price may repeat) - record changes only
     this.unsub = ctx.bus.on('tick', ({ asset, price, ts }) => {
@@ -53,7 +80,8 @@ export class OtcFootprintService {
     })
     // live sidecar capture merge
     this.timer = setInterval(() => void this.sweepLive(), LIVE_PULL_MS)
-    ctx.log('otc-footprint', 'micro-tick velocity collector online (sim bus + sidecar 100ms capture)')
+    if (this.store) this.archiveTimer = setInterval(() => this.flushTickArchive(), TICK_ARCHIVE_FLUSH_MS)
+    ctx.log('otc-footprint', `micro-tick velocity collector online (sim bus + sidecar 100ms capture${this.store ? ', tick archive on' : ', tick archive off - no store'})`)
   }
 
   stop(): void {
@@ -61,11 +89,17 @@ export class OtcFootprintService {
     this.unsub = null
     if (this.timer) clearInterval(this.timer)
     this.timer = null
+    if (this.archiveTimer) clearInterval(this.archiveTimer)
+    this.archiveTimer = null
+    this.flushTickArchive() // final write-back, same reasoning market-data.ts's stop() states for candles
   }
 
   /** Append ticks, capped, order-preserving. Consecutive same-price prints
    * carry no direction - drop them (the sidecar already dedupes; the sim bus
-   * doesn't). */
+   * doesn't). Every tick that clears this (the ONLY ones this collector ever
+   * considers real) is also queued for durable archiving, so the archive is
+   * never a second, possibly-divergent sample of "what a tick was" from what
+   * every tick-aware strategy/indicator reads live. */
   private record(asset: string, ticks: TickPoint[]): void {
     if (!ticks.length) return
     let buf = this.buffers.get(asset)
@@ -79,8 +113,29 @@ export class OtcFootprintService {
       if (last && t.ts <= last.ts) continue // monotonic guard (double events, clock jitter)
       if (last && t.price === last.price) continue // no direction -> not a tick
       buf.push({ ts: t.ts, price: t.price })
+      if (this.store) this.archiveQueue.push({ asset, ts: t.ts, price: t.price })
     }
     if (buf.length > OTF_MAX_TICKS) buf.splice(0, buf.length - OTF_MAX_TICKS)
+  }
+
+  /** Write-behind: flush queued real ticks to the sqlite archive (batched),
+   * same shape as market-data.ts's flushArchive() for candles. */
+  private flushTickArchive(): void {
+    if (!this.store || !this.archiveQueue.length) return
+    const batch = this.archiveQueue.splice(0, this.archiveQueue.length)
+    try {
+      this.store.saveTicks(batch)
+    } catch {
+      // archive write failure must never break the live tick feed
+    }
+    this.archiveFlushCount += 1
+    if (this.archiveFlushCount % TICK_ARCHIVE_PRUNE_FLUSHES === 0) {
+      try {
+        this.store.pruneTicksArchive(TICK_ARCHIVE_CAP)
+      } catch {
+        // pruning is best-effort
+      }
+    }
   }
 
   /** One-time lazy backfill from the sim engine's ring buffer (seconds -> ms)

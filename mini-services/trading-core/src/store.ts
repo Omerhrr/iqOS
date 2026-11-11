@@ -159,6 +159,12 @@ export class Store {
         id INTEGER PRIMARY KEY CHECK (id = 1),
         config TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS ticks_archive (
+        asset TEXT NOT NULL,
+        ts INTEGER NOT NULL,
+        price REAL NOT NULL,
+        PRIMARY KEY (asset, ts)
+      );
     `)
     // column migrations for databases created before the column existed:
     // CREATE TABLE IF NOT EXISTS is a no-op on an existing table, so the
@@ -1430,6 +1436,67 @@ export class Store {
       .all() as { asset: string; tf: string; n: number; oldest: number; newest: number }[]
     const perTf = this.db.query('SELECT tf, COUNT(*) n FROM candles_archive GROUP BY tf').all() as { tf: string; n: number }[]
     return { rows: tot.n, keys: tot.k, top, perTf }
+  }
+
+  // ---------- ticks archive (raw price-change stream, Phase 2b of the MRC
+  // offline-validation work: candles_archive alone can't back-test
+  // tick-fidelity-only measurements like path_efficiency/reversal_count -
+  // see otcfootprint.ts's queueArchive() for the write-behind that feeds
+  // this table from the SAME de-duped price-change buffer every tick-aware
+  // strategy/indicator already reads, so what's archived here is exactly
+  // what the live engine saw, not a separate sample.) ----------
+
+  /** Batched UPSERT of raw (asset, ts, price) ticks. Rows may overlap
+   * existing keys - PK (asset, ts) dedupes, same convention as
+   * saveCandles(). */
+  saveTicks(rows: { asset: string; ts: number; price: number }[]): void {
+    if (!rows.length) return
+    const stmt = this.db.prepare(
+      'INSERT INTO ticks_archive (asset, ts, price) VALUES (?, ?, ?) ON CONFLICT(asset, ts) DO UPDATE SET price = excluded.price'
+    )
+    const tx = this.db.transaction((batch: typeof rows) => {
+      for (const r of batch) stmt.run(r.asset, r.ts, r.price)
+    })
+    for (let i = 0; i < rows.length; i += 500) tx(rows.slice(i, i + 500))
+  }
+
+  /** Archived ticks for one asset, ascending by ts (ms epoch). `sinceTs`
+   * (ms) is optional - omit for the newest `limit` ticks. */
+  getTicksArchive(asset: string, limit: number, sinceTs?: number): { ts: number; price: number }[] {
+    const cap = Math.max(1, Math.min(limit, 50_000))
+    const rows =
+      sinceTs === undefined
+        ? (this.db
+            .query('SELECT ts, price FROM ticks_archive WHERE asset = ? ORDER BY ts DESC LIMIT ?')
+            .all(asset, cap) as { ts: number; price: number }[])
+        : (this.db
+            .query('SELECT ts, price FROM ticks_archive WHERE asset = ? AND ts >= ? ORDER BY ts ASC LIMIT ?')
+            .all(asset, sinceTs, cap) as { ts: number; price: number }[])
+    return sinceTs === undefined ? rows.reverse() : rows
+  }
+
+  ticksArchiveStats(): { rows: number; assets: number; top: { asset: string; n: number; oldest: number; newest: number }[] } {
+    const tot = this.db.query('SELECT COUNT(*) n, COUNT(DISTINCT asset) k FROM ticks_archive').get() as { n: number; k: number }
+    const top = this.db
+      .query('SELECT asset, COUNT(*) n, MIN(ts) oldest, MAX(ts) newest FROM ticks_archive GROUP BY asset ORDER BY n DESC LIMIT 12')
+      .all() as { asset: string; n: number; oldest: number; newest: number }[]
+    return { rows: tot.n, assets: tot.k, top }
+  }
+
+  /** Trim every asset to its newest `cap` ticks. Same shape as
+   * pruneArchive() below, one dimension narrower (no `tf`). */
+  pruneTicksArchive(cap: number): number {
+    const over = this.db.query('SELECT asset, COUNT(*) n FROM ticks_archive GROUP BY asset HAVING n > ?').all(cap) as { asset: string; n: number }[]
+    if (!over.length) return 0
+    const del = this.db.prepare(
+      'DELETE FROM ticks_archive WHERE asset = ? AND ts <= (SELECT ts FROM ticks_archive WHERE asset = ? ORDER BY ts DESC LIMIT 1 OFFSET ?)'
+    )
+    const tx = this.db.transaction((batch: typeof over) => {
+      let n = 0
+      for (const k of batch) n += del.run(k.asset, k.asset, cap - 1).changes
+      return n
+    })
+    return tx(over)
   }
 
   /** Trim every asset|tf key to its newest `cap` bars. Returns removed rows. */

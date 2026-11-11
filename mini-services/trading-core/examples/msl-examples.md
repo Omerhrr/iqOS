@@ -125,9 +125,77 @@ put when dir == "put" and gate(prob, payout.value, 0.01)
 confidence = prob * 100
 ```
 
+## 7. MRC response-efficiency fade (the Phase 3 offline-validated finding)
+
+Market Response Chart (`analytics/mrc.ts`) bars carry `responseRatio` -
+how much displacement a bar's activity actually bought, relative to the
+trailing average. Offline validation against real archived EURUSD history
+(see `claude/market-response-chart-mrc.md`) found a real, if single-window,
+signal: a below-average-response bar ("effort without full result") was
+followed by a next-bar reversal 33.5% of the time (n=176) vs only 13.7%
+(n=146) after an above-average-response bar. This script trades THAT
+specific pattern directly - fades the last confirmed bar's own direction
+only when its `responseRatio` is well below average, and explicitly stands
+aside when that bar was `dataGap`-forced (a recording-hole artifact, not a
+real market read - never trade off one of those, see the module's own
+dead-time-guard note).
+
+```
+let d = mrc.directionalDelta(-1)
+let rr = mrc.responseRatio(-1)
+let isGap = mrc.gap(-1)
+call when (not isGap) and rr < 0.6 and d < 0 and gate(0.55, payout.value, 0.0)
+put when (not isGap) and rr < 0.6 and d > 0 and gate(0.55, payout.value, 0.0)
+confidence = 55
+expiry = 1
+```
+
+## 8. MRC clean-move continuation, confirmed by Effort Bricks
+
+The opposite trade from #7 above, for the OTHER side of the same
+response-efficiency idea: when the last confirmed MRC bar was a "clean,
+low-resistance move" (`responseRatio >= 1.0` - real displacement per unit
+of activity, not churn) AND Effort Bricks' own independently-built
+participation-confirmation gate (`effort.ratio()`) agrees in the SAME
+direction, both engines are reporting real, participation-backed movement
+from two different lenses (adaptive-event-clock response efficiency vs.
+brick-level volume confirmation) - a stronger confluence than either alone,
+traded as continuation rather than fade.
+
+```
+let mrcUp = mrc.directionalDelta(-1) > 0
+let mrcStrong = mrc.responseRatio(-1) >= 1.0
+let ebBar = effort.ohlc(-1)
+let ebConfirmed = effort.ratio(-1) >= 1.0
+call when mrcUp and mrcStrong and ebConfirmed and (ebBar.c - ebBar.o) > 0 and gate(0.6, payout.value, 0.0)
+put when (not mrcUp) and mrcStrong and ebConfirmed and (ebBar.c - ebBar.o) < 0 and gate(0.6, payout.value, 0.0)
+confidence = 65
+expiry = 1
+```
+
+## 9. Historical Outcome Memory, payout-gated
+
+A fundamentally different kind of evidence from everything above: instead
+of a model's score, `outcomeMemory` searches real past bars for the ones
+that looked like THIS one (same session, similar momentum/volatility/run-
+length) and reports how those specific historical cases actually settled -
+`.value` is the empirical win-rate (pUp) drawn directly from that
+comparable pool, not a fitted probability. Reads `none` outright when the
+comparable pool is too thin to trust (see `analytics/outcomememory.ts`) -
+this script leans on that honesty gate instead of adding its own sample-size
+check on top. `gate()` still enforces a real edge over the account's actual
+payout before either side fires.
+
+```
+call when outcomeMemory.value > 0.5 and gate(outcomeMemory.value, payout.value, 0.02)
+put when outcomeMemory.value < 0.5 and gate(1 - outcomeMemory.value, payout.value, 0.02)
+confidence = outcomeMemory.conf
+expiry = 1
+```
+
 ---
 
-All 6 of the above were verified by parsing and evaluating each one with
+All 9 of the above were verified by parsing and evaluating each one with
 `evaluateStrategyScript()` against synthetic candle series and a synthetic
 tick buffer (the same smoke-test discipline this project uses before any
 primitive ships), confirming each one parses, evaluates without a runtime
