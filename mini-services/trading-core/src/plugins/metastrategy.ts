@@ -1851,7 +1851,22 @@ export class MetaStrategyService {
       if (!parsed.ok) throw new Error(`${spec.id}: script error - ${parsed.error}`)
       ast = parsed.ast
       for (const name of collectFieldSources(ast)) {
-        if (UNSAFE_BACKTEST_SOURCES.has(name as MetaConditionSource)) {
+        // AUDIT FIX: a colonized source (smc:CHOCH, tickOracle:60,
+        // tickTechnical:300, nextExpiry:5, ...) was never literally a member
+        // of UNSAFE_BACKTEST_SOURCES (only the bare 'smc'/'smcNow'/
+        // 'tickOracle'/'tickTechnical'/'nextExpiry' names are), so a script
+        // reading e.g. `smc:CHOCH.dir` sailed straight past this gate and
+        // into a replay where that exact key was never populated at all
+        // (buildReplaySafeReads() only fills SAFE_BACKTEST_SOURCES keys) -
+        // not even 'none', just missing, which is a confusing per-bar
+        // runtime error instead of the clear upfront rejection every other
+        // unsafe source gets. 'technical:<TF>'/'reversal:<TF>' are NOT
+        // affected (their bare names are already in SAFE_BACKTEST_SOURCES),
+        // so stripping to the base name before checking is safe for those
+        // too - it only ever makes the unsafe check MORE inclusive, never
+        // rejects a safe colonized source by mistake.
+        const base = name.includes(':') ? name.slice(0, name.indexOf(':')) : name
+        if (UNSAFE_BACKTEST_SOURCES.has(base as MetaConditionSource)) {
           throw new Error(
             `${spec.id} uses '${name}' - that source reads another plugin's LIVE-only scan cache or tick buffer with no historical record, so it can't be honestly replayed. Remove it (it can stay in a separate live-only spec) to backtest the rest of this script.`
           )
