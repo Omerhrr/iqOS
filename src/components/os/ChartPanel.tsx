@@ -24,8 +24,8 @@ import {
   type Time,
   type UTCTimestamp,
 } from 'lightweight-charts'
-import type { AnalysisResult, Candle, ChartType, IndicatorSeries, IvHvResponse, OtcFootprintResult, OutcomeMemoryResponse, Position, PulseBarRow, PulseBarsResponse, TickBarRow, TickFootprintResult, TicksResponse, Timeframe } from '@/lib/os/client'
-import { chartPriceFormat, fmtPrice, getOtcFootprint, getOutcomeMemory, getPulseBars, getTickFootprint, osGet, TIMEFRAME_SECONDS } from '@/lib/os/client'
+import type { AnalysisResult, Candle, ChartType, ExpirySurfaceResponse, IndicatorSeries, IvHvResponse, NextExpiryPrediction, OtcFootprintResult, OutcomeMemoryResponse, Position, PulseBarRow, PulseBarsResponse, TickBarRow, TickFootprintResult, TicksResponse, Timeframe } from '@/lib/os/client'
+import { chartPriceFormat, fmtPrice, getExpirySurface, getNextExpiry, getOtcFootprint, getOutcomeMemory, getPulseBars, getTickFootprint, osGet, TIMEFRAME_SECONDS } from '@/lib/os/client'
 
 interface ChartPanelProps {
   candles: Candle[]
@@ -1117,6 +1117,8 @@ export default function ChartPanel({
   const [tickFpState, setTickFpState] = useState<TickFootprintResult | null>(null)
   const [pulseState, setPulseState] = useState<PulseBarsResponse | null>(null)
   const [outcomeMemState, setOutcomeMemState] = useState<OutcomeMemoryResponse | null>(null)
+  const [expirySurfaceState, setExpirySurfaceState] = useState<ExpirySurfaceResponse | null>(null)
+  const [liveExpiryState, setLiveExpiryState] = useState<NextExpiryPrediction | null>(null)
   const customCanvasRef = useRef<HTMLCanvasElement | null>(null)
   // IV/HV pane line series (created only when chartType === 'ivhv')
   const hvLineRef = useRef<ISeriesApi<'Line'> | null>(null)
@@ -1141,6 +1143,8 @@ export default function ChartPanel({
     setOtcState(null)
     setPulseState(null)
     setOutcomeMemState(null)
+    setExpirySurfaceState(null)
+    setLiveExpiryState(null)
   }, [digitsTicker])
 
   // tick chart: real /ticks bars (sidecar 100ms capture when live, 5s-close
@@ -1285,6 +1289,44 @@ export default function ChartPanel({
       clearInterval(iv)
     }
   }, [chartType, digitsTicker, tf])
+
+  // Expiry Probability Surface: the historical raw-replay heatmap
+  // (/expiry_surface, slow-moving - 1m-native, polled gently) PLUS the
+  // real calibrated live read (/next_expiry, polled faster - it's the
+  // "right now" column and should feel current).
+  useEffect(() => {
+    if (chartType !== 'expirySurface') return
+    let dead = false
+    const pullSurface = () => {
+      getExpirySurface(digitsTicker, { lookback: 120 })
+        .then((r) => {
+          if (dead || !r?.ok) return
+          setExpirySurfaceState(r)
+        })
+        .catch(() => {
+          // keep last good data
+        })
+    }
+    const pullLive = () => {
+      getNextExpiry(digitsTicker)
+        .then((r) => {
+          if (dead || !r?.ok || !r.prediction) return
+          setLiveExpiryState(r.prediction)
+        })
+        .catch(() => {
+          // keep last good data
+        })
+    }
+    pullSurface()
+    pullLive()
+    const ivSurface = setInterval(pullSurface, 30000)
+    const ivLive = setInterval(pullLive, 5000)
+    return () => {
+      dead = true
+      clearInterval(ivSurface)
+      clearInterval(ivLive)
+    }
+  }, [chartType, digitsTicker])
 
   // footprint/TPO/OTC-footprint/tick-footprint's canvas redraw used to key
   // off raw `candles`, which gets a new array identity on every live tick
@@ -1568,7 +1610,8 @@ export default function ChartPanel({
       chartType !== 'volumeprofile' &&
       chartType !== 'deltaprofile' &&
       chartType !== 'pulse' &&
-      chartType !== 'expiryRadar'
+      chartType !== 'expiryRadar' &&
+      chartType !== 'expirySurface'
     )
       return
     const canvas = customCanvasRef.current
@@ -2087,6 +2130,85 @@ export default function ChartPanel({
           ctx.fillText(`strike ${fmtPrice(strike, digitsTicker)} · ${up ? '+' : ''}${(last.close - strike).toFixed(5)} · ${Math.round(remainingSec)}s to lap close`, W / 2, H - 10)
           ctx.fillText(`lap = ${tf ?? '1m'} (${lapSec}s) - not a live trade expiry, just this chart's own timeframe`, W / 2, 16)
         }
+      } else if (chartType === 'expirySurface') {
+        // Expiry Probability Surface: columns = historical 1m bars (raw/
+        // uncalibrated walk-forward replay, /expiry_surface), rows = the 5
+        // expiry rungs, color = pUp (red<0.5<green). The LIVE column
+        // (/next_expiry - the real, calibration-discounted read) is drawn
+        // as its own highlighted strip on the right, visually distinct
+        // from the historical replay so the two are never confused.
+        const cols = expirySurfaceState?.columns ?? []
+        const expiries = expirySurfaceState?.expiries ?? [1, 2, 3, 5, 15]
+        if (!cols.length && !liveExpiryState) {
+          ctx.fillStyle = TEXT
+          ctx.textAlign = 'center'
+          ctx.fillText('warming up - needs 720+ 1m candles for the oracle to read anything', W / 2, H / 2)
+          return
+        }
+        const liveColW = 90
+        const padL = 8
+        const padR = liveColW + 16
+        const padT = 24
+        const padB = 24
+        const rowH = (H - padT - padB) / expiries.length
+        const colW = cols.length ? Math.max(2, (W - padL - padR) / cols.length) : 0
+        const pUpColor = (pUp: number, ok: boolean, alpha: number) => {
+          if (!ok || !Number.isFinite(pUp)) return `rgba(124,138,165,${alpha * 0.3})`
+          const t = Math.min(1, Math.max(0, pUp))
+          // red (put-favored) -> amber (coinflip) -> green (call-favored)
+          const r = t < 0.5 ? 244 : Math.round(244 - (244 - 16) * ((t - 0.5) * 2))
+          const g = t < 0.5 ? Math.round(63 + (158 - 63) * (t * 2)) : Math.round(158 + (185 - 158) * ((t - 0.5) * 2))
+          const b = t < 0.5 ? Math.round(94 - (94 - 11) * (t * 2)) : Math.round(11 + (129 - 11) * ((t - 0.5) * 2))
+          return `rgba(${r},${g},${b},${alpha})`
+        }
+        // row labels + gridlines
+        ctx.font = '9px var(--font-geist-mono), monospace'
+        ctx.textAlign = 'right'
+        expiries.forEach((e, ri) => {
+          const ry = padT + ri * rowH
+          ctx.fillStyle = TEXT
+          ctx.fillText(`${e}m`, padL - 2 > 20 ? padL - 2 : 20, ry + rowH / 2 + 3)
+          ctx.strokeStyle = 'rgba(124,138,165,0.15)'
+          ctx.beginPath()
+          ctx.moveTo(20, ry)
+          ctx.lineTo(W - padR + liveColW, ry)
+          ctx.stroke()
+        })
+        // historical heatmap cells
+        cols.forEach((col, ci) => {
+          const cx = padL + 22 + ci * colW
+          col.cells.forEach((cell) => {
+            const ri = expiries.indexOf(cell.expiry)
+            if (ri < 0) return
+            ctx.fillStyle = pUpColor(cell.pUp, cell.ok, 0.85)
+            ctx.fillRect(cx, padT + ri * rowH, Math.max(1, colW - 0.5), rowH - 1)
+          })
+        })
+        // live column - distinctly bordered, drawn from the REAL calibrated read
+        const liveX = W - liveColW + 4
+        ctx.strokeStyle = 'rgba(245,158,11,0.9)'
+        ctx.strokeRect(liveX - 4, padT - 2, liveColW, H - padT - padB + 4)
+        ctx.font = '9px var(--font-geist-mono), monospace'
+        ctx.fillStyle = '#f59e0b'
+        ctx.textAlign = 'center'
+        ctx.fillText('LIVE (calibrated)', liveX + liveColW / 2 - 4, padT - 8)
+        if (liveExpiryState) {
+          liveExpiryState.rows.forEach((row) => {
+            const ri = expiries.indexOf(row.expiry)
+            if (ri < 0) return
+            const ry = padT + ri * rowH
+            ctx.fillStyle = pUpColor(row.pUp, row.ok, 0.9)
+            ctx.fillRect(liveX, ry, liveColW - 8, rowH - 1)
+            ctx.fillStyle = '#0b111c'
+            ctx.font = '9px var(--font-geist-mono), monospace'
+            ctx.textAlign = 'center'
+            ctx.fillText(row.ok ? `${Math.round(row.pWin * 100)}%` : '-', liveX + (liveColW - 8) / 2, ry + rowH / 2 + 3)
+          })
+        }
+        ctx.font = '9px var(--font-geist-mono), monospace'
+        ctx.fillStyle = TEXT
+        ctx.textAlign = 'left'
+        ctx.fillText('left of the amber border: raw/uncalibrated historical replay - the oracle\'s honesty-discount only exists live', 8, H - 8)
       } else {
         // TPO: left = close path for time orientation, right = profile
         const prof = tpoProfile(candles.slice(-400))
@@ -2160,7 +2282,7 @@ export default function ChartPanel({
     // keyed on closedBarSignature, not raw `candles` (see its own doc
     // comment above) - `candles` is still read fresh via closure when this
     // DOES run, just not used to decide whether it reruns.
-  }, [chartType, closedBarSignature, digitsTicker, otcState, tickFpState, pulseState, tf])
+  }, [chartType, closedBarSignature, digitsTicker, otcState, tickFpState, pulseState, tf, expirySurfaceState, liveExpiryState])
 
   // live precision sync: asset switch or a quote crossing a magnitude band
   useEffect(() => {
@@ -2514,7 +2636,7 @@ export default function ChartPanel({
       </div>
 
       <div ref={elRef} className="min-h-0 flex-1" />
-      {(chartType === 'footprint' || chartType === 'tpo' || chartType === 'otcfootprint' || chartType === 'tickfootprint' || chartType === 'volumeprofile' || chartType === 'deltaprofile' || chartType === 'pulse' || chartType === 'expiryRadar') && (
+      {(chartType === 'footprint' || chartType === 'tpo' || chartType === 'otcfootprint' || chartType === 'tickfootprint' || chartType === 'volumeprofile' || chartType === 'deltaprofile' || chartType === 'pulse' || chartType === 'expiryRadar' || chartType === 'expirySurface') && (
         <div className="absolute inset-x-0 bottom-[30px] top-0 z-[5] bg-[#0b111c]">
           <canvas ref={customCanvasRef} className="block h-full w-full" />
         </div>

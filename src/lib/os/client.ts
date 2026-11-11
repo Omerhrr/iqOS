@@ -104,6 +104,14 @@ export type ChartType =
   //    vs. time-to-expiry, not a new tradeable signal, so it carries no MSL
   //    namespace and isn't a MetaConditionSource.
   | 'spring' | 'echo' | 'expiryRadar'
+  // Expiry Probability Surface: a heatmap (/expiry_surface, 1m-native) -
+  // one column per historical bar, one row per expiry rung, color = the
+  // Next-Expiry Oracle's own raw walk-forward pUp at that moment. Overlays
+  // the REAL calibrated live read (/next_expiry) as a distinct highlighted
+  // column. No MSL namespace - nothing new to query beyond what the
+  // 'nextExpiry'/'nextExpiryBest' verdict sources already expose; this is
+  // a visualization of an existing engine's history, not a new primitive.
+  | 'expirySurface'
 export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'candles', label: 'Candles' },
   { id: 'hollow', label: 'Hollow' },
@@ -134,6 +142,7 @@ export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'spring', label: 'Liquidity Spring' },
   { id: 'echo', label: 'Volatility Echo' },
   { id: 'expiryRadar', label: 'Expiry Radar' },
+  { id: 'expirySurface', label: 'Expiry Probability Surface' },
 ]
 
 // kernel route payloads for the Task 63 chart fetches (ChartPanel)
@@ -902,6 +911,40 @@ export interface NextExpiryPrediction {
 
 export async function getNextExpiry(asset: string): Promise<{ ok: boolean; prediction?: NextExpiryPrediction; error?: string }> {
   return osGet('/next_expiry', { asset })
+}
+
+// ---------- Expiry Probability Surface (analytics/expirysurface.ts) - a
+// walk-forward HEATMAP replay of the Next-Expiry Oracle above: one column
+// per historical 1m bar, one row per expiry rung, RAW/uncalibrated (see
+// that module's own honesty note - calibrated is always false here; the
+// live current column is overlaid from getNextExpiry() above instead,
+// which IS calibrated). ----------
+
+export interface ExpirySurfaceCell {
+  expiry: number
+  ok: boolean
+  pUp: number
+  direction: 'call' | 'put' | 'none'
+  pWin: number
+  confidence: number
+}
+
+export interface ExpirySurfaceColumn {
+  time: number
+  cells: ExpirySurfaceCell[]
+}
+
+export interface ExpirySurfaceResponse {
+  ok: boolean
+  asset: string
+  expiries: number[]
+  columns: ExpirySurfaceColumn[]
+  calibrated: false
+  note: string
+}
+
+export async function getExpirySurface(asset: string, opts?: { lookback?: number }): Promise<ExpirySurfaceResponse> {
+  return osGet<ExpirySurfaceResponse>('/expiry_surface', { asset, lookback: opts?.lookback })
 }
 
 export interface NextExpiryStatsResponse {

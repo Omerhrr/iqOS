@@ -100,6 +100,8 @@ import { estimateTwinParams, generateOtcTwin } from './src/analytics/otcTwin'
 import { tfSeconds } from './src/analytics/synthfeed'
 import { computeOutcomeMemory } from './src/analytics/outcomememory'
 import { computePulseBars } from './src/analytics/pulsebars'
+import { computeExpirySurface } from './src/analytics/expirysurface'
+import { EXPIRY_ORACLE_MIN_CANDLES } from './src/analytics/nextexpiry'
 
 // Defaults to 3030 for local/Windows dev; the Docker deployment overrides
 // this to an unusual, hard-to-collide-with port via the KERNEL_PORT env var.
@@ -1910,6 +1912,23 @@ const httpServer = createServer(async (req, res) => {
           const ticks = fp.ticksFor(asset)
           const pb = computePulseBars(ticks, { intervalSec })
           return json(200, { ok: true, asset, dataSource: ticks.length ? 'tick' : 'none', ...pb })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // Expiry Probability Surface: walk-forward replay of the Next-Expiry
+      // Oracle's own per-rung prediction (analytics/expirysurface.ts) - one
+      // column per historical 1m bar, raw/uncalibrated (see that module's
+      // own honesty note). The frontend overlays the REAL calibrated
+      // current read from /next_expiry (below) as a distinctly-drawn column.
+      if (path === '/expiry_surface') {
+        try {
+          const asset = String(q.get('asset') ?? market.activeAsset)
+          const lookback = Math.max(5, Math.min(300, Number(q.get('lookback') ?? 120)))
+          const candles = market.getCandlesDeep(asset, '1m', EXPIRY_ORACLE_MIN_CANDLES + lookback + 2, true)
+          const surface = computeExpirySurface(candles, asset, { lookback })
+          return json(200, { ok: true, ...surface })
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }
