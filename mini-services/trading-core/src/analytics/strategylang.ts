@@ -2426,7 +2426,13 @@ function linebreakMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: strin
  * shoulder/waist-break rule). kagi.reversal() is the current ATR-derived
  * reversal amount in price units. kagi.shoulder()/kagi.waist() are the most
  * recent shoulder/waist price levels (NaN until the first down/up
- * reversal has occurred, never a misleading 0). */
+ * reversal has occurred, never a misleading 0). kagi.regime() is
+ * "trending"/"ranging"/"choppy"/"none" (see kagi.ts's own classifyRegime
+ * doc comment for the exact hh-hl/lh-ll-over-reversal-points rule and the
+ * density floor that forces "choppy"). kagi.structure() is the raw
+ * "hh-hl"/"lh-ll"/"none" read regime() is partly built from. kagi.legs() is
+ * how many reversal lines were confirmed inside the regime lookback
+ * window - the density/whipsaw count. */
 function kagiMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
   const candles = seriesToCandles(requireSeries(ctx, tf))
   // BUG FIX (configure-override gap) - kagi.reversal/.atrPeriod/
@@ -2449,8 +2455,14 @@ function kagiMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | u
       return num(r.shoulder)
     case 'waist':
       return num(r.waist)
+    case 'regime':
+      return r.regime
+    case 'structure':
+      return r.structure
+    case 'legs':
+      return r.legsInWindow
     default:
-      throw new MslRuntimeError(`unknown kagi method "kagi.${name}(...)" - use direction()/thick()/reversal()/shoulder()/waist()`)
+      throw new MslRuntimeError(`unknown kagi method "kagi.${name}(...)" - use direction()/thick()/reversal()/shoulder()/waist()/regime()/structure()/legs()`)
   }
 }
 
