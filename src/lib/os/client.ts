@@ -79,6 +79,15 @@ export type ChartType =
   // mrcChart()), mirroring analytics/{effortbricks,mrc}.ts's own math -
   // same pattern as linebreak/kagi above, not re-deriving new UI shapes.
   | 'effort' | 'mrc'
+  // Historical Outcome Memory: NOT a bar series - a current-state k-NN
+  // read (/outcome_memory) rendered as plain candles + a marker overlay at
+  // the matched historical times + a small readout panel (see
+  // ChartPanel.tsx), same "not its own series" treatment 'swing' gets.
+  | 'outcomeMemory'
+  // Pulse-Vector bars: opaque canvas overlay (/pulse_bars, live-tick only -
+  // same pattern as 'otcfootprint'/'tickfootprint' above) drawing vector
+  // length/node thickness/color-heat-map per fixed micro-interval.
+  | 'pulse'
 export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'candles', label: 'Candles' },
   { id: 'hollow', label: 'Hollow' },
@@ -104,6 +113,8 @@ export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'swing', label: 'Swing' },
   { id: 'effort', label: 'Effort Bricks' },
   { id: 'mrc', label: 'Market Response' },
+  { id: 'outcomeMemory', label: 'Outcome Memory' },
+  { id: 'pulse', label: 'Pulse-Vector' },
 ]
 
 // kernel route payloads for the Task 63 chart fetches (ChartPanel)
@@ -749,6 +760,81 @@ export async function getOtcFootprint(asset: string, opts?: { minutes?: number; 
     asset,
     minutes: opts?.minutes,
     bucketSec: opts?.bucketSec,
+  })
+}
+
+// ---------- Frontend-for-the-4-new-engines sweep: Historical Outcome Memory
+// (mini-services/trading-core/src/analytics/outcomememory.ts) and
+// Pulse-Vector bars (.../pulsebars.ts) - the 2 engines that need their own
+// kernel route (/outcome_memory, /pulse_bars) rather than a client-side
+// candle-math mirror, since one needs a deep historical search and the
+// other needs the live tick buffer, neither of which the frontend already
+// has fetched. ----------
+
+export interface OutcomeMemoryMatch {
+  time: number
+  distance: number
+  outcomeReturn: number
+  outcomeDirection: 'up' | 'down' | 'flat'
+}
+
+export interface OutcomeMemoryResponse {
+  ok: boolean
+  asset: string
+  note: string
+  k: number
+  expiryBars: number
+  session: string
+  poolSize: number
+  matches: OutcomeMemoryMatch[]
+  upCount: number
+  downCount: number
+  flatCount: number
+  pUp: number
+  avgReturn: number
+  medianReturn: number
+}
+
+export async function getOutcomeMemory(asset: string, opts?: { tf?: Timeframe; expiryBars?: number; k?: number }): Promise<OutcomeMemoryResponse> {
+  return osGet<OutcomeMemoryResponse>('/outcome_memory', {
+    asset,
+    tf: opts?.tf,
+    expiryBars: opts?.expiryBars,
+    k: opts?.k,
+  })
+}
+
+export interface PulseBarRow {
+  time: number
+  endTime: number
+  open: number
+  high: number
+  low: number
+  close: number
+  displacement: number
+  range: number
+  tickCount: number
+  velocity: number
+  acceleration: number
+  exhaustionScore: number
+  color: 'accel-up' | 'decel-up' | 'accel-down' | 'decel-down' | 'flat'
+  sparse: boolean
+}
+
+export interface PulseBarsResponse {
+  ok: boolean
+  asset: string
+  dataSource: 'tick' | 'none'
+  intervalSec: number
+  bars: PulseBarRow[]
+  streak: number
+  trend: 'up' | 'down' | 'none'
+}
+
+export async function getPulseBars(asset: string, opts?: { intervalSec?: number }): Promise<PulseBarsResponse> {
+  return osGet<PulseBarsResponse>('/pulse_bars', {
+    asset,
+    intervalSec: opts?.intervalSec,
   })
 }
 

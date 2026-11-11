@@ -98,6 +98,8 @@ import { computeStepStats, computeIntervalStats } from './src/analytics/randomne
 import { loadOtcHarvest } from './src/analytics/otcHarvest'
 import { estimateTwinParams, generateOtcTwin } from './src/analytics/otcTwin'
 import { tfSeconds } from './src/analytics/synthfeed'
+import { computeOutcomeMemory } from './src/analytics/outcomememory'
+import { computePulseBars } from './src/analytics/pulsebars'
 
 // Defaults to 3030 for local/Windows dev; the Docker deployment overrides
 // this to an unusual, hard-to-collide-with port via the KERNEL_PORT env var.
@@ -1877,6 +1879,40 @@ const httpServer = createServer(async (req, res) => {
         const minutes = Math.max(1, Math.min(240, Number(q.get('minutes') ?? 30)))
         const bucketSec = Math.max(5, Math.min(3600, Number(q.get('bucketSec') ?? 60)))
         return json(200, { ok: true, ...(await fp.footprint(asset, { minutes, bucketSec })) })
+      }
+
+      // Frontend-for-the-4-new-engines sweep: /outcome_memory and
+      // /pulse_bars - the 2 new chart engines that can't be rendered from
+      // already-fetched candles (Historical Outcome Memory needs a deep
+      // candle search; Pulse-Vector needs the live tick buffer), so each
+      // needs its own kernel route - same GET-for-the-chart precedent as
+      // /otc_footprint above.
+      if (path === '/outcome_memory') {
+        try {
+          const asset = String(q.get('asset') ?? market.activeAsset)
+          const tfv = (q.get('tf') ?? '1m') as Timeframe
+          const expiryBars = q.get('expiryBars') ? Number(q.get('expiryBars')) : undefined
+          const k = q.get('k') ? Number(q.get('k')) : undefined
+          const lookback = Math.max(300, Number(q.get('lookback') ?? 1500))
+          const candles = market.getCandlesDeep(asset, tfv, lookback, true)
+          const om = computeOutcomeMemory(candles, asset, { expiryBars, k })
+          return json(200, { asset, ...om })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      if (path === '/pulse_bars') {
+        try {
+          const fp = kernel.context().use<OtcFootprintService>('otcFootprint')
+          const asset = String(q.get('asset') ?? market.activeAsset)
+          const intervalSec = Math.max(1, Math.min(60, Number(q.get('intervalSec') ?? 5)))
+          const ticks = fp.ticksFor(asset)
+          const pb = computePulseBars(ticks, { intervalSec })
+          return json(200, { ok: true, asset, dataSource: ticks.length ? 'tick' : 'none', ...pb })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
       }
 
       // ---------- Next-Expiry Oracle (per-expiry fused read + honesty loop) ----------

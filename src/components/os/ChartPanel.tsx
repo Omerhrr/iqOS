@@ -24,8 +24,8 @@ import {
   type Time,
   type UTCTimestamp,
 } from 'lightweight-charts'
-import type { AnalysisResult, Candle, ChartType, IndicatorSeries, IvHvResponse, OtcFootprintResult, Position, TickBarRow, TickFootprintResult, TicksResponse, Timeframe } from '@/lib/os/client'
-import { chartPriceFormat, fmtPrice, getOtcFootprint, getTickFootprint, osGet, TIMEFRAME_SECONDS } from '@/lib/os/client'
+import type { AnalysisResult, Candle, ChartType, IndicatorSeries, IvHvResponse, OtcFootprintResult, OutcomeMemoryResponse, Position, PulseBarRow, PulseBarsResponse, TickBarRow, TickFootprintResult, TicksResponse, Timeframe } from '@/lib/os/client'
+import { chartPriceFormat, fmtPrice, getOtcFootprint, getOutcomeMemory, getPulseBars, getTickFootprint, osGet, TIMEFRAME_SECONDS } from '@/lib/os/client'
 
 interface ChartPanelProps {
   candles: Candle[]
@@ -1046,6 +1046,7 @@ export default function ChartPanel({
   const indMarkersRef = useRef<SeriesMarker<Time>[]>([])
   const tradeMarkersRef = useRef<SeriesMarker<Time>[]>([])
   const swingMarkersRef = useRef<SeriesMarker<Time>[]>([])
+  const memoryMarkersRef = useRef<SeriesMarker<Time>[]>([])
 
   const tfSec = useMemo(() => {
     if (!candles || candles.length < 2) return 60
@@ -1057,6 +1058,8 @@ export default function ChartPanel({
   const [ivhvState, setIvhvState] = useState<IvHvResponse | null>(null)
   const [otcState, setOtcState] = useState<OtcFootprintResult | null>(null)
   const [tickFpState, setTickFpState] = useState<TickFootprintResult | null>(null)
+  const [pulseState, setPulseState] = useState<PulseBarsResponse | null>(null)
+  const [outcomeMemState, setOutcomeMemState] = useState<OutcomeMemoryResponse | null>(null)
   const customCanvasRef = useRef<HTMLCanvasElement | null>(null)
   // IV/HV pane line series (created only when chartType === 'ivhv')
   const hvLineRef = useRef<ISeriesApi<'Line'> | null>(null)
@@ -1073,6 +1076,8 @@ export default function ChartPanel({
     setTickBarsState([])
     setIvhvState(null)
     setOtcState(null)
+    setPulseState(null)
+    setOutcomeMemState(null)
   }, [digitsTicker])
 
   // tick chart: real /ticks bars (sidecar 100ms capture when live, 5s-close
@@ -1171,6 +1176,53 @@ export default function ChartPanel({
     }
   }, [chartType, digitsTicker, tf])
 
+  // Pulse-Vector bars: live-tick-only aggregation (/pulse_bars) - same
+  // "poll while the type is active" cadence as otcfootprint/tickfootprint.
+  useEffect(() => {
+    if (chartType !== 'pulse') return
+    let dead = false
+    const pull = () => {
+      getPulseBars(digitsTicker, { intervalSec: 5 })
+        .then((r) => {
+          if (dead || !r?.ok) return
+          setPulseState(r)
+        })
+        .catch(() => {
+          // keep last good data
+        })
+    }
+    pull()
+    const iv = setInterval(pull, 5000)
+    return () => {
+      dead = true
+      clearInterval(iv)
+    }
+  }, [chartType, digitsTicker])
+
+  // Historical Outcome Memory: a current-state k-NN read (/outcome_memory),
+  // not a fast-moving time series - poll at a slower cadence than the
+  // other fetched chart types (the comparable pool only changes bar-to-bar).
+  useEffect(() => {
+    if (chartType !== 'outcomeMemory') return
+    let dead = false
+    const pull = () => {
+      getOutcomeMemory(digitsTicker, { tf: tf ?? '1m' })
+        .then((r) => {
+          if (dead || !r?.ok) return
+          setOutcomeMemState(r)
+        })
+        .catch(() => {
+          // keep last good data
+        })
+    }
+    pull()
+    const iv = setInterval(pull, 20000)
+    return () => {
+      dead = true
+      clearInterval(iv)
+    }
+  }, [chartType, digitsTicker, tf])
+
   // footprint/TPO/OTC-footprint/tick-footprint's canvas redraw used to key
   // off raw `candles`, which gets a new array identity on every live tick
   // (the forming last candle is replaced in place). For footprint/TPO that
@@ -1251,7 +1303,7 @@ export default function ChartPanel({
         upColor: 'transparent', downColor: DOWN, borderUpColor: UP, borderDownColor: DOWN, wickUpColor: UP, wickDownColor: DOWN,
         priceLineColor: '#38bdf8',
       })
-    } else if (chartType === 'heikin' || chartType === 'renko' || chartType === 'pointfigure' || chartType === 'rangebars' || chartType === 'volumebars' || chartType === 'tickchart' || chartType === 'linebreak' || chartType === 'kagi' || chartType === 'swing' || chartType === 'effort' || chartType === 'mrc') {
+    } else if (chartType === 'heikin' || chartType === 'renko' || chartType === 'pointfigure' || chartType === 'rangebars' || chartType === 'volumebars' || chartType === 'tickchart' || chartType === 'linebreak' || chartType === 'kagi' || chartType === 'swing' || chartType === 'effort' || chartType === 'mrc' || chartType === 'outcomeMemory') {
       price = chart.addSeries(CandlestickSeries, {
         upColor: UP, downColor: DOWN, borderUpColor: UP, borderDownColor: DOWN, wickUpColor: UP, wickDownColor: DOWN,
         priceLineColor: '#38bdf8',
@@ -1318,6 +1370,7 @@ export default function ChartPanel({
       indMarkersRef.current = []
       tradeMarkersRef.current = []
       swingMarkersRef.current = []
+      memoryMarkersRef.current = []
       renderStateRef.current = null
     }
   }, [chartType])
@@ -1430,7 +1483,8 @@ export default function ChartPanel({
       chartType !== 'otcfootprint' &&
       chartType !== 'tickfootprint' &&
       chartType !== 'volumeprofile' &&
-      chartType !== 'deltaprofile'
+      chartType !== 'deltaprofile' &&
+      chartType !== 'pulse'
     )
       return
     const canvas = customCanvasRef.current
@@ -1806,6 +1860,66 @@ export default function ChartPanel({
           ctx.font = '9px var(--font-geist-mono), monospace'
           ctx.fillText('delta (approx - CLV buy/sell proxy, no bid/ask feed)', 8, H - 6)
         }
+      } else if (chartType === 'pulse') {
+        // Pulse-Vector: fixed self-contained column layout (same convention
+        // otcfootprint/tickfootprint use above - not synced to the price
+        // chart's own time axis), one column per bundled bar
+        // (/pulse_bars, live-tick only): vector LENGTH = |displacement|,
+        // node THICKNESS = tickCount (density), color HEAT-MAP = the
+        // direction+acceleration label the kernel engine already computes
+        // (bright accel-* vs dim decel-* vs gray flat) - the exact 3 visual
+        // mechanics the Pulse-Vector design doc specified, all backed by
+        // real tick data, no new math invented here.
+        const bars = pulseState?.bars ?? []
+        if (!bars.length) {
+          ctx.fillStyle = TEXT
+          ctx.textAlign = 'center'
+          ctx.fillText('no live ticks captured yet for this asset', W / 2, H / 2 - 8)
+          ctx.font = '9px var(--font-geist-mono), monospace'
+          ctx.fillText('Pulse-Vector is live-only - no historical tick archive to fall back to', W / 2, H / 2 + 8)
+          return
+        }
+        const colW = 26
+        const maxCols = Math.max(4, Math.floor((W - 16) / colW))
+        const vis = bars.slice(-maxCols)
+        const maxDisp = Math.max(...vis.map((b) => Math.abs(b.displacement)), 1e-9)
+        const maxTicks = Math.max(...vis.map((b) => b.tickCount), 1)
+        const midY = H / 2
+        const maxHalfH = (H - 40) / 2
+        const colorFor = (c: PulseBarRow['color'], sparse: boolean): string => {
+          if (sparse) return 'rgba(124,138,165,0.35)'
+          switch (c) {
+            case 'accel-up': return 'rgba(16,185,129,0.95)'
+            case 'decel-up': return 'rgba(16,185,129,0.4)'
+            case 'accel-down': return 'rgba(244,63,94,0.95)'
+            case 'decel-down': return 'rgba(244,63,94,0.4)'
+            default: return 'rgba(124,138,165,0.5)'
+          }
+        }
+        ctx.strokeStyle = 'rgba(124,138,165,0.25)'
+        ctx.beginPath()
+        ctx.moveTo(8, midY)
+        ctx.lineTo(W - 8, midY)
+        ctx.stroke()
+        for (let i = 0; i < vis.length; i++) {
+          const b = vis[i]
+          const cx = 10 + i * colW + colW / 2
+          const halfLen = (Math.abs(b.displacement) / maxDisp) * maxHalfH
+          const thickness = Math.max(2, (b.tickCount / maxTicks) * (colW - 6))
+          const up = b.displacement >= 0
+          const yTop = up ? midY - halfLen : midY
+          const h = Math.max(1.5, halfLen)
+          ctx.fillStyle = colorFor(b.color, b.sparse)
+          ctx.fillRect(cx - thickness / 2, yTop, thickness, h)
+          if (Number.isFinite(b.exhaustionScore) && b.exhaustionScore >= 0.6) {
+            ctx.strokeStyle = 'rgba(245,158,11,0.9)'
+            ctx.strokeRect(cx - thickness / 2 - 1, yTop - 1, thickness + 2, h + 2)
+          }
+        }
+        ctx.fillStyle = TEXT
+        ctx.font = '9px var(--font-geist-mono), monospace'
+        ctx.textAlign = 'left'
+        ctx.fillText(`${pulseState?.intervalSec ?? 5}s bars · trend ${pulseState?.trend ?? 'none'} · streak ${pulseState?.streak ?? 0} · amber outline = exhaustion >= 0.6`, 8, H - 6)
       } else {
         // TPO: left = close path for time orientation, right = profile
         const prof = tpoProfile(candles.slice(-400))
@@ -1879,7 +1993,7 @@ export default function ChartPanel({
     // keyed on closedBarSignature, not raw `candles` (see its own doc
     // comment above) - `candles` is still read fresh via closure when this
     // DOES run, just not used to decide whether it reruns.
-  }, [chartType, closedBarSignature, digitsTicker, otcState, tickFpState])
+  }, [chartType, closedBarSignature, digitsTicker, otcState, tickFpState, pulseState])
 
   // live precision sync: asset switch or a quote crossing a magnitude band
   useEffect(() => {
@@ -1949,7 +2063,7 @@ export default function ChartPanel({
 
   const applyMarkers = useCallback(() => {
     if (!markersRef.current) return
-    const all = [...indMarkersRef.current, ...tradeMarkersRef.current, ...swingMarkersRef.current]
+    const all = [...indMarkersRef.current, ...tradeMarkersRef.current, ...swingMarkersRef.current, ...memoryMarkersRef.current]
     all.sort((a, b) => Number(a.time) - Number(b.time))
     markersRef.current.api.setMarkers(all)
   }, [])
@@ -1982,6 +2096,41 @@ export default function ChartPanel({
     ensureMarkerApi()
     applyMarkers()
   }, [chartType, candles, ensureMarkerApi, applyMarkers])
+
+  // Historical Outcome Memory marker overlay: the k nearest historical
+  // analogs (/outcome_memory's own matches[], real past bars that looked
+  // like the current one) marked directly on the plain candle chart at the
+  // times they actually happened - "show the trader the raw comparable
+  // evidence" rather than only a model's aggregate score (see the small
+  // readout panel in the JSX below for the aggregate pUp/pool numbers).
+  // Snaps each match time onto the nearest displayed candle, same
+  // tolerance snapToCandle() already applies to indicator markers.
+  useEffect(() => {
+    if (chartType !== 'outcomeMemory') {
+      if (memoryMarkersRef.current.length) {
+        memoryMarkersRef.current = []
+        applyMarkers()
+      }
+      return
+    }
+    const matches = outcomeMemState?.matches ?? []
+    const out: SeriesMarker<Time>[] = []
+    for (const m of matches) {
+      const t = snapToCandle(candles, m.time)
+      if (t === null) continue
+      out.push({
+        time: t as UTCTimestamp,
+        position: 'belowBar',
+        shape: 'circle',
+        color: m.outcomeDirection === 'up' ? UP : m.outcomeDirection === 'down' ? DOWN : TEXT,
+        text: '',
+        size: 0.6,
+      })
+    }
+    memoryMarkersRef.current = out
+    ensureMarkerApi()
+    applyMarkers()
+  }, [chartType, candles, outcomeMemState, ensureMarkerApi, applyMarkers])
 
   // registry indicator markers (Williams fractal arrows) - times snap to the
   // displayed candle grid (heikin/renko remap times), then merge via applyMarkers
@@ -2162,9 +2311,30 @@ export default function ChartPanel({
       </div>
 
       <div ref={elRef} className="min-h-0 flex-1" />
-      {(chartType === 'footprint' || chartType === 'tpo' || chartType === 'otcfootprint' || chartType === 'tickfootprint' || chartType === 'volumeprofile' || chartType === 'deltaprofile') && (
+      {(chartType === 'footprint' || chartType === 'tpo' || chartType === 'otcfootprint' || chartType === 'tickfootprint' || chartType === 'volumeprofile' || chartType === 'deltaprofile' || chartType === 'pulse') && (
         <div className="absolute inset-x-0 bottom-[30px] top-0 z-[5] bg-[#0b111c]">
           <canvas ref={customCanvasRef} className="block h-full w-full" />
+        </div>
+      )}
+      {chartType === 'outcomeMemory' && outcomeMemState && (
+        <div className="absolute right-2 top-2 z-[5] max-w-[220px] rounded border border-[#1c2739] bg-[#0d1420]/92 px-2.5 py-2 text-[10px] font-mono leading-tight text-[#dbe4f0]">
+          <div className="mb-1 text-[#7c8aa5]">Historical Outcome Memory</div>
+          {outcomeMemState.poolSize > 0 ? (
+            <>
+              <div>
+                pUp <span className={outcomeMemState.pUp >= 0.5 ? 'text-emerald-400' : 'text-rose-400'}>{(outcomeMemState.pUp * 100).toFixed(1)}%</span>
+                {' · '}pool {outcomeMemState.poolSize}
+              </div>
+              <div className="text-[#7c8aa5]">
+                {outcomeMemState.upCount}↑ / {outcomeMemState.downCount}↓ / {outcomeMemState.flatCount}→
+              </div>
+              <div className="text-[#7c8aa5]">
+                avg {(outcomeMemState.avgReturn * 100).toFixed(2)}% · k={outcomeMemState.k} · {outcomeMemState.session}
+              </div>
+            </>
+          ) : (
+            <div className="text-[#7c8aa5]">{outcomeMemState.note}</div>
+          )}
         </div>
       )}
       <div className="flex items-center justify-between border-t border-[#1c2739] px-3 py-1.5 text-[11px] font-mono">
