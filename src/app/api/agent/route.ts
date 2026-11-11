@@ -113,7 +113,16 @@ function trimAnalysis(a: Record<string, unknown>): Record<string, unknown> {
   return out
 }
 
-const CHART_TYPES = ['candles', 'hollow', 'bars', 'line', 'area', 'baseline', 'heikin-ashi', 'renko', 'pointfigure', 'rangebars', 'volumebars', 'footprint', 'otcfootprint', 'tpo', 'tickchart', 'ivhv']
+// Kept in sync with client.ts's ChartType union by hand (this list only
+// feeds a pre-emit validation fallback + the error message below, not the
+// real set_chart_type -> ChartType mapping, which lives in page.tsx's own
+// `map` - a type added to client.ts still needs an entry added THERE too).
+const CHART_TYPES = [
+  'candles', 'hollow', 'bars', 'line', 'area', 'baseline', 'heikin-ashi', 'renko', 'pointfigure',
+  'rangebars', 'volumebars', 'footprint', 'otcfootprint', 'tickfootprint', 'tpo', 'tickchart', 'ivhv',
+  'linebreak', 'kagi', 'kagi-overlay', 'volumeprofile', 'deltaprofile', 'swing', 'effort', 'mrc',
+  'outcome-memory', 'pulse', 'spring', 'echo', 'expiry-radar', 'expiry-surface',
+]
 
 // ---------- shared helpers for the composed power tools ----------
 
@@ -2109,7 +2118,7 @@ const TOOLS: ToolSpec[] = [
   // ---------- OS control (executed client-side) ----------
   {
     name: 'ui_control',
-    description: `Operate the user's OS interface. ALWAYS pass "cmd" - one of: set_asset (+"asset":"BTCUSD"), set_tf (+"tf":"5m"), set_chart_type (+"chartType":"heikin-ashi" - candles|hollow|bars|line|area|baseline|heikin-ashi|renko|pointfigure|rangebars|volumebars|footprint|tpo|tickchart|ivhv), add_indicator (+"id":"bollinger", optional "params":{...}, "pane":"overlay"|"sub"), remove_indicator (+"id":"macd"), clear_indicators. Use it to set up the workspace for your analysis.`,
+    description: `Operate the user's OS interface. ALWAYS pass "cmd" - one of: set_asset (+"asset":"BTCUSD"), set_tf (+"tf":"5m"), set_chart_type (+"chartType":"heikin-ashi" - candles|hollow|bars|line|area|baseline|heikin-ashi|renko|pointfigure|rangebars|volumebars|footprint|otcfootprint|tickfootprint|tpo|tickchart|ivhv|linebreak|kagi|kagi-overlay|volumeprofile|deltaprofile|swing|effort|mrc|outcome-memory|pulse|spring|echo|expiry-radar|expiry-surface), add_indicator (+"id":"bollinger", optional "params":{...}, "pane":"overlay"|"sub"), remove_indicator (+"id":"macd"), clear_indicators. Use it to set up the workspace for your analysis.`,
     args: '{"cmd": "set_asset", "asset": "BTCUSD"}  |  {"cmd": "add_indicator", "id": "macd", "pane": "sub"}',
     run: async (aRaw, ctx) => {
       const ALL_TFS = ['5s', '15s', '30s', '1m', '2m', '5m', '15m', '30m', '1h', '4h', '1d']
@@ -2153,6 +2162,21 @@ const TOOLS: ToolSpec[] = [
         tpo: 'tpo', marketprofile: 'tpo', timeprice: 'tpo', timepriceopportunity: 'tpo', profile: 'tpo',
         tickchart: 'tickchart', tick: 'tickchart', ticks: 'tickchart', tickbars: 'tickchart',
         ivhv: 'ivhv', ivvshv: 'ivhv', ivhvchart: 'ivhv', impliedvolatility: 'ivhv',
+        tickfootprint: 'tickfootprint', tickfp: 'tickfootprint', tickfootprintchart: 'tickfootprint',
+        linebreak: 'linebreak', linebreakchart: 'linebreak', threelinebreak: 'linebreak',
+        kagi: 'kagi',
+        kagioverlay: 'kagi-overlay', kagiribbon: 'kagi-overlay', timeanchoredkagi: 'kagi-overlay', kagitimeanchored: 'kagi-overlay',
+        volumeprofile: 'volumeprofile', vp: 'volumeprofile',
+        deltaprofile: 'deltaprofile', dp: 'deltaprofile', deltavolumeprofile: 'deltaprofile',
+        swing: 'swing',
+        effort: 'effort', effortbricks: 'effort',
+        mrc: 'mrc', marketresponse: 'mrc', marketresponsechart: 'mrc',
+        outcomememory: 'outcome-memory', historicaloutcomememory: 'outcome-memory',
+        pulse: 'pulse', pulsevector: 'pulse',
+        spring: 'spring', liquidityspring: 'spring',
+        echo: 'echo', volatilityecho: 'echo',
+        expiryradar: 'expiry-radar', expiryhorizonradar: 'expiry-radar',
+        expirysurface: 'expiry-surface', expiryprobabilitysurface: 'expiry-surface',
       }
       // ---- build command queue (inferred from args when cmd is missing) ----
       const queue: { cmd: string; args: Record<string, unknown> }[] = []

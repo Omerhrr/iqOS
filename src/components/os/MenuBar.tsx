@@ -16,6 +16,7 @@ import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import type { AccountState, AssetRow, ChartType, OsMode, RiskConfig, Timeframe } from '@/lib/os/client'
 import { CHART_TYPES, TIMEFRAMES, fmtClock, fmtMoney, fmtPct, osPost } from '@/lib/os/client'
+import ChartTypePicker from './ChartTypePicker'
 import type { PatternDetail } from './PairSignalPanel'
 
 interface Props {
@@ -167,19 +168,12 @@ export default function MenuBar(props: Props) {
           ))}
         </div>
 
-        {/* chart type + indicator registry (moved off the chart canvas) */}
-        <select
-          value={props.chartType}
-          onChange={(e) => props.onChartTypeChange(e.target.value as ChartType)}
-          title="Chart type"
-          className="h-8 rounded border border-[#1c2739] bg-[#0d1420] px-2 font-mono text-[11px] uppercase tracking-wider text-[#aab6cc] outline-none focus:border-cyan-500/50"
-        >
-          {CHART_TYPES.map((t) => (
-            <option key={t.id} value={t.id} className="bg-[#0d1420]">
-              {t.label}
-            </option>
-          ))}
-        </select>
+        {/* chart type + indicator registry (moved off the chart canvas) -
+            searchable combobox, not a plain <select>: CHART_TYPES has grown
+            past 30 entries, long enough that filter-as-you-type (same
+            widget AssetPicker.tsx already uses for the pair dropdown)
+            beats scrolling an alphabetical-by-insertion list. */}
+        <ChartTypePicker types={CHART_TYPES} value={props.chartType} onChange={props.onChartTypeChange} />
         <button
           onClick={props.onOpenPicker}
           title="Browse the full indicator registry"

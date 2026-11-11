@@ -1167,6 +1167,27 @@ export default function OSPage() {
               tpo: 'tpo', marketprofile: 'tpo', timeprice: 'tpo', timepriceopportunity: 'tpo', profile: 'tpo',
               tickchart: 'tickchart', tick: 'tickchart', ticks: 'tickchart', tickbars: 'tickchart',
               ivhv: 'ivhv', ivvshv: 'ivhv', ivhvchart: 'ivhv', impliedvolatility: 'ivhv', impliedhistoricalvolatility: 'ivhv',
+              // footprint-completion + chart-engine-expansion sweeps - kept in
+              // sync with client.ts's ChartType union by hand (ui_control's
+              // route.ts layer validates/aliases the raw string BEFORE it gets
+              // here, but this map is what actually resolves to a real
+              // ChartType; missing an entry here silently falls back to
+              // 'candles', same bug class this whole map exists to prevent).
+              tickfootprint: 'tickfootprint', tickfp: 'tickfootprint', tickfootprintchart: 'tickfootprint',
+              linebreak: 'linebreak', linebreakchart: 'linebreak', threelinebreak: 'linebreak',
+              kagi: 'kagi',
+              kagioverlay: 'kagiOverlay', kagiribbon: 'kagiOverlay', timeanchoredkagi: 'kagiOverlay', kagitimeanchored: 'kagiOverlay',
+              volumeprofile: 'volumeprofile', vp: 'volumeprofile',
+              deltaprofile: 'deltaprofile', dp: 'deltaprofile', deltavolumeprofile: 'deltaprofile',
+              swing: 'swing',
+              effort: 'effort', effortbricks: 'effort',
+              mrc: 'mrc', marketresponse: 'mrc', marketresponsechart: 'mrc',
+              outcomememory: 'outcomeMemory', historicaloutcomememory: 'outcomeMemory',
+              pulse: 'pulse', pulsevector: 'pulse',
+              spring: 'spring', liquidityspring: 'spring',
+              echo: 'echo', volatilityecho: 'echo',
+              expiryradar: 'expiryRadar', expiryhorizonradar: 'expiryRadar',
+              expirysurface: 'expirySurface', expiryprobabilitysurface: 'expirySurface',
             }
             setChartType(map[raw] ?? 'candles')
           }
