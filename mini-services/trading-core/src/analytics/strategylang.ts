@@ -238,6 +238,8 @@ import { detectGaps } from './gap'
 import { effortBricks } from './effortbricks'
 import { computeMrc } from './mrc'
 import { computePulseBars } from './pulsebars'
+import { computeLiquiditySpring } from './liquidityspring'
+import { computeVolatilityEcho } from './volatilityecho'
 
 export interface MslSourceRead {
   direction: 'call' | 'put' | 'none'
@@ -1554,6 +1556,73 @@ function pulseMethod(name: string, args: MslValue[], ctx: EvalEnv, ticks: readon
       throw new MslRuntimeError(
         `unknown pulse method "pulse.${name}(...)" - use bars(n?)/ohlc(offset)/displacement(offset)/tickCount(offset)/velocity(offset)/acceleration(offset)/exhaustion(offset)/color(offset)/sparse(offset)`
       )
+  }
+}
+
+/** `spring.*` - Liquidity Spring (analytics/liquidityspring.ts): price
+ * stretched away from a fast EMA "core," `tension()` a z-score of that
+ * stretch against its own trailing stdev, `snap()` true only when a high
+ * stretch ALSO coincides with falling participation (`decelerating()`) -
+ * the "rubber band at max stretch, about to snap back" signature. Fully
+ * candle-derived, SAFE_BACKTEST_SOURCES tier. */
+function springMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const candles = seriesToCandles(requireSeries(ctx, tf))
+  const r = computeLiquiditySpring(candles, {
+    emaPeriod: cfgNumLang(ctx, 'spring.emaPeriod', undefined),
+    lookback: cfgNumLang(ctx, 'spring.lookback', undefined),
+    snapTensionFloor: cfgNumLang(ctx, 'spring.snapFloor', undefined),
+  })
+  if (name === 'points') return seriesValue(r.points.map((p) => Math.sign(p.deviation)).slice(-seriesLookback(args, 50)))
+  if (!r.points.length) throw new MslRuntimeError('spring.*(offset) - not enough history yet')
+  if (!args.length) throw new MslRuntimeError(`spring.${name}(offset) needs an offset argument, e.g. spring.${name}(-1)`)
+  const p = offsetInto(r.points, asNum(args[0]), `spring.${name}`)
+  switch (name) {
+    case 'baseline':
+      return p.baseline
+    case 'deviation':
+      return p.deviation
+    case 'tension':
+      return Number.isFinite(p.tensionScore) ? p.tensionScore : 0
+    case 'decelerating':
+      return p.decelerating
+    case 'snap':
+      return p.snap
+    default:
+      throw new MslRuntimeError(`unknown spring method "spring.${name}(...)" - use points(n?)/baseline(offset)/deviation(offset)/tension(offset)/decelerating(offset)/snap(offset)`)
+  }
+}
+
+/** `echo.*` - Volatility Echo (analytics/volatilityecho.ts): a statistical
+ * band (SMA +/- bandMult x trailing stdev) over closes, `squeeze()` when
+ * the band has pinched tighter than its own trailing average width
+ * ("coiling"), `pierced()` ('up'/'down'/null) when a close breaks outside
+ * the band on that bar ("clean directional burst"). SAFE_BACKTEST_SOURCES tier. */
+function echoMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const candles = seriesToCandles(requireSeries(ctx, tf))
+  const r = computeVolatilityEcho(candles, {
+    window: cfgNumLang(ctx, 'echo.window', undefined),
+    bandMult: cfgNumLang(ctx, 'echo.bandMult', undefined),
+    squeezeFloor: cfgNumLang(ctx, 'echo.squeezeFloor', undefined),
+  })
+  if (name === 'points') return seriesValue(r.points.map((p) => (p.pierced === 'up' ? 1 : p.pierced === 'down' ? -1 : 0)).slice(-seriesLookback(args, 50)))
+  if (!r.points.length) throw new MslRuntimeError('echo.*(offset) - not enough history yet (needs at least window+1 candles)')
+  if (!args.length) throw new MslRuntimeError(`echo.${name}(offset) needs an offset argument, e.g. echo.${name}(-1)`)
+  const p = offsetInto(r.points, asNum(args[0]), `echo.${name}`)
+  switch (name) {
+    case 'baseline':
+      return p.baseline
+    case 'upperBand':
+      return p.upperBand
+    case 'lowerBand':
+      return p.lowerBand
+    case 'width':
+      return Number.isFinite(p.ribbonWidth) ? p.ribbonWidth : 0
+    case 'squeeze':
+      return p.squeeze
+    case 'pierced':
+      return p.pierced ?? 'none'
+    default:
+      throw new MslRuntimeError(`unknown echo method "echo.${name}(...)" - use points(n?)/baseline(offset)/upperBand(offset)/lowerBand(offset)/width(offset)/squeeze(offset)/pierced(offset)`)
   }
 }
 
@@ -3053,6 +3122,16 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
         return mrcMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'spring' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return springMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'echo' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return echoMethod(e.name, args, ctx, tf)
       }
       if (e.obj.t === 'ident' && e.obj.name === 'tickbar' && !(e.obj.name in env)) {
         const args = e.args.map((a) => evalExpr(a, env, ctx))

@@ -88,6 +88,22 @@ export type ChartType =
   // same pattern as 'otcfootprint'/'tickfootprint' above) drawing vector
   // length/node thickness/color-heat-map per fixed micro-interval.
   | 'pulse'
+  // "Build all these end to end" follow-up sweep (3 of the 6 proposed chart
+  // hypotheses were genuinely buildable from real tick/candle data this
+  // platform has - the other 2, Option Dynamics and Options Pressure &
+  // Response, need a real options chain/Greeks/NBBO feed IQ Option's binary
+  // contracts don't expose, and a 3rd, Micro-Footprint Ladder, is already
+  // built as 'otcfootprint'/'tickfootprint' above):
+  //  - 'spring'/'echo': plain candles + native LineSeries overlays (same
+  //    pane-line pattern 'ivhv' uses, just in pane 0) computed client-side,
+  //    mirroring analytics/{liquidityspring,volatilityecho}.ts's own math -
+  //    not a canvas, since lightweight-charts' own price-scale-synced lines
+  //    are the right tool for a baseline+band overlay.
+  //  - 'expiryRadar': a genuinely new radial/clock visual with no backend
+  //    analytics engine behind it at all - it's a re-presentation of price
+  //    vs. time-to-expiry, not a new tradeable signal, so it carries no MSL
+  //    namespace and isn't a MetaConditionSource.
+  | 'spring' | 'echo' | 'expiryRadar'
 export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'candles', label: 'Candles' },
   { id: 'hollow', label: 'Hollow' },
@@ -115,6 +131,9 @@ export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'mrc', label: 'Market Response' },
   { id: 'outcomeMemory', label: 'Outcome Memory' },
   { id: 'pulse', label: 'Pulse-Vector' },
+  { id: 'spring', label: 'Liquidity Spring' },
+  { id: 'echo', label: 'Volatility Echo' },
+  { id: 'expiryRadar', label: 'Expiry Radar' },
 ]
 
 // kernel route payloads for the Task 63 chart fetches (ChartPanel)

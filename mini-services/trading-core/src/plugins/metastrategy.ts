@@ -47,6 +47,8 @@ import { effortBricks } from '../analytics/effortbricks'
 import { computeMrc } from '../analytics/mrc'
 import { computeOutcomeMemory } from '../analytics/outcomememory'
 import { computePulseBars } from '../analytics/pulsebars'
+import { computeLiquiditySpring } from '../analytics/liquidityspring'
+import { computeVolatilityEcho } from '../analytics/volatilityecho'
 import { computeBaseline } from '../analytics/baseline'
 import { realizedUpProb } from '../analytics/ivhv'
 import { EXPIRIES_MIN } from '../analytics/nextexpiry'
@@ -102,7 +104,7 @@ import { sharpeRatio } from '../analytics/quant'
 const SAFE_BACKTEST_SOURCES = new Set<MetaConditionSource>([
   'renko', 'pointFigure', 'rangeBars', 'candle', 'bar', 'heikinAshi', 'line', 'area',
   'baseline', 'volumeBars', 'tpo', 'ivHv', 'volumeProfile', 'lineBreak', 'kagi', 'swing',
-  'deltaProfile', 'technical', 'reversal', 'effort', 'mrc', 'outcomeMemory',
+  'deltaProfile', 'technical', 'reversal', 'effort', 'mrc', 'outcomeMemory', 'spring', 'echo',
 ])
 
 /** Every OTHER MetaConditionSource - named explicitly (rather than derived
@@ -281,6 +283,18 @@ export const MSL_READ_CONFIGS: Record<string, MslConfigSpec> = {
   'memory.k': { min: 3, max: 200, integer: true, desc: 'Outcome Memory: number of nearest historical matches to draw' },
   'memory.lookback': { min: 100, max: 10000, integer: true, desc: 'Outcome Memory: how many trailing bars to search for candidates' },
   'memory.minPool': { min: 3, max: 500, integer: true, desc: 'Outcome Memory: minimum comparable (same-session) pool size before trusting a read' },
+  // Liquidity Spring (analytics/liquidityspring.ts) - the EMA "core" period,
+  // the trailing stdev/activity lookback, and the tension floor a stretch
+  // must clear (combined with falling participation) to count as a snap.
+  'spring.emaPeriod': { min: 2, max: 200, integer: true, desc: 'Liquidity Spring EMA "core" period' },
+  'spring.lookback': { min: 5, max: 300, integer: true, desc: 'Liquidity Spring trailing stdev/activity lookback (bars)' },
+  'spring.snapFloor': { min: 0.5, max: 10, desc: 'Liquidity Spring tension z-score a stretch must clear (with deceleration) to count as a snap' },
+  // Volatility Echo (analytics/volatilityecho.ts) - the band window/width,
+  // and how tight the band must pinch (relative to its own trailing
+  // average width) to count as a squeeze.
+  'echo.window': { min: 3, max: 200, integer: true, desc: 'Volatility Echo band window (candles)' },
+  'echo.bandMult': { min: 0.5, max: 10, desc: 'Volatility Echo band width, in stdevs' },
+  'echo.squeezeFloor': { min: 0.05, max: 1, desc: 'Volatility Echo squeeze threshold - ribbonWidthRatio below this counts as coiled' },
   // Pulse-Vector bars (analytics/pulsebars.ts) - fixed micro-interval width
   // and the sparse-bar floor.
   'pulse.interval': { min: 1, max: 300, integer: true, desc: 'Pulse-Vector bar width in seconds (fixed micro-interval, not adaptive)' },
@@ -409,7 +423,7 @@ export class MetaStrategyService {
       'smc', 'smcNow', 'renkoSmc', 'renkoSmcMajority', 'pointFigure', 'rangeBars',
       'candle', 'heikinAshi', 'volumeBars', 'tick', 'footprint', 'tpo', 'ivHv', 'line',
       'tickSmc', 'tickOracle', 'tickTechnical', 'tickFootprint',
-      'technical', 'reversal', 'tempo', 'confluence', 'volArb', 'cointegration', 'effort', 'mrc', 'outcomeMemory', 'pulse',
+      'technical', 'reversal', 'tempo', 'confluence', 'volArb', 'cointegration', 'effort', 'mrc', 'outcomeMemory', 'pulse', 'spring', 'echo',
     ]
     const base = sources.map((s) => this.readSource(s, asset, tf))
     const perSmcConcept = ALL_SMC_KINDS.map((kind) => this.readSource('smcNow', asset, tf, kind))
@@ -1315,6 +1329,56 @@ export class MetaStrategyService {
             label: `MRC ${direction.toUpperCase()} - last confirmed bar ${strong ? 'ABOVE' : 'below'} trailing response_efficiency (ratio ${Number.isFinite(last.responseRatio) ? last.responseRatio.toFixed(2) : 'n/a'}x, trigger ${last.trigger}, fidelity ${mrc.fidelity})`,
           }
         }
+        case 'spring': {
+          // direction = the deviation sign on the most recent snap seen in
+          // this window; confidence scales with that snap's own tension
+          // (how far it had stretched) - a snap just past the floor is a
+          // softer read than one deep into the tail.
+          const candles = this.market.getCandlesDeep(asset, tf, 300, true)
+          const sp = computeLiquiditySpring(candles, {
+            ...(cfgNum(cfg, 'spring.emaPeriod') !== undefined ? { emaPeriod: cfgNum(cfg, 'spring.emaPeriod') } : {}),
+            ...(cfgNum(cfg, 'spring.lookback') !== undefined ? { lookback: cfgNum(cfg, 'spring.lookback') } : {}),
+            ...(cfgNum(cfg, 'spring.snapFloor') !== undefined ? { snapTensionFloor: cfgNum(cfg, 'spring.snapFloor') } : {}),
+          })
+          if (sp.trend === 'none' || !Number.isFinite(sp.barsSinceSnap)) return none('Liquidity Spring: no snap has fired yet in this window')
+          // a snap several bars stale is a weaker read than one that just fired - only trust the last few bars
+          if (sp.barsSinceSnap > 3) return none(`Liquidity Spring: last snap was ${sp.barsSinceSnap} bars ago - too stale to trade`)
+          const direction = sp.trend === 'stretched-up' ? 'put' : 'call' // stretched UP from the core -> expect reversion DOWN, and vice versa
+          const snapPoint = sp.points[sp.points.length - 1 - sp.barsSinceSnap]
+          const tension = Number.isFinite(snapPoint?.tensionScore) ? snapPoint.tensionScore : sp.snapTensionFloor
+          const confidence = Math.round(Math.min(75, 45 + 10 * (tension - sp.snapTensionFloor)))
+          return {
+            source,
+            direction,
+            confidence,
+            value: sp.trend === 'stretched-up' ? -sp.barsSinceSnap : sp.barsSinceSnap,
+            label: `Liquidity Spring ${direction.toUpperCase()} - snapped ${sp.barsSinceSnap} bar(s) ago at tension ${tension.toFixed(2)}x (deceleration confirmed)`,
+          }
+        }
+        case 'echo': {
+          // direction = the pierce side on the LAST bar only (a stale
+          // pierce is just noise - 'none' the instant it's no longer the
+          // current bar); confidence boosted when that pierce followed a
+          // recent squeeze (the doc's own "coil then break" signature).
+          const candles = this.market.getCandlesDeep(asset, tf, 300, true)
+          const ve = computeVolatilityEcho(candles, {
+            ...(cfgNum(cfg, 'echo.window') !== undefined ? { window: cfgNum(cfg, 'echo.window') } : {}),
+            ...(cfgNum(cfg, 'echo.bandMult') !== undefined ? { bandMult: cfgNum(cfg, 'echo.bandMult') } : {}),
+            ...(cfgNum(cfg, 'echo.squeezeFloor') !== undefined ? { squeezeFloor: cfgNum(cfg, 'echo.squeezeFloor') } : {}),
+          })
+          if (ve.trend !== 'burst-up' && ve.trend !== 'burst-down') return none(`Volatility Echo: no pierce on the current bar (${ve.trend})`)
+          const direction = ve.trend === 'burst-up' ? 'call' : 'put'
+          const priorSqueeze = ve.points.length >= 4 && ve.points.slice(-4, -1).some((p) => p.squeeze)
+          const confidence = priorSqueeze ? 68 : 52
+          const last = ve.points[ve.points.length - 1]
+          return {
+            source,
+            direction,
+            confidence,
+            value: Number.isFinite(last.ribbonWidthRatio) ? last.ribbonWidthRatio : 1,
+            label: `Volatility Echo ${direction.toUpperCase()} - pierced the band${priorSqueeze ? ' after a recent squeeze (coil-then-break)' : ''}`,
+          }
+        }
         case 'outcomeMemory': {
           // k-NN over past same-session market states - see
           // analytics/outcomememory.ts's own header and
@@ -1509,6 +1573,8 @@ export class MetaStrategyService {
       mrc: toMsl(this.readSource('mrc', asset, tf, undefined, undefined, undefined, cfg)),
       outcomeMemory: toMsl(this.readSource('outcomeMemory', asset, tf, undefined, undefined, undefined, cfg)),
       pulse: toMsl(this.readSource('pulse', asset, tf, undefined, undefined, undefined, cfg)),
+      spring: toMsl(this.readSource('spring', asset, tf, undefined, undefined, undefined, cfg)),
+      echo: toMsl(this.readSource('echo', asset, tf, undefined, undefined, undefined, cfg)),
       footDivergence: toMsl(this.readSource('footDivergence', asset, tf)),
       footStackedImbalance: toMsl(this.readSource('footStackedImbalance', asset, tf, undefined, undefined, undefined, cfg)),
       footAbsorption: toMsl(this.readSource('footAbsorption', asset, tf)),

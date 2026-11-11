@@ -216,9 +216,45 @@ confidence = 55
 expiry = 1
 ```
 
+## 11. Liquidity Spring reversion, payout-gated
+
+Liquidity Spring (`analytics/liquidityspring.ts`) fires `.snap()` only when
+price has stretched far from its own fast EMA core (a high `.tension()`
+z-score) AND real participation is falling off at the same time
+(`.decelerating()`) - "max stretch, running out of gas." This script fades
+the stretch direction on a fresh snap, demanding a real payout edge.
+
+```
+let snap = spring.snap(-1)
+let stretchedUp = spring.deviation(-1) > 0
+call when snap and (not stretchedUp) and gate(0.55, payout.value, 0.0)
+put when snap and stretchedUp and gate(0.55, payout.value, 0.0)
+confidence = 55
+expiry = 1
+```
+
+## 12. Volatility Echo coil-then-break continuation
+
+Volatility Echo (`analytics/volatilityecho.ts`) flags `.squeeze()` when its
+own statistical band has pinched tighter than its recent average width
+("coiling") and `.pierced()` when price breaks back outside the band -
+the classic "wait for the break" pattern. This script only trades a pierce
+that happened on the SAME bar the band was still squeezed one bar earlier,
+the "coil then break" signature the design doc called out, trading WITH
+the breakout direction (continuation, not fade).
+
+```
+let pierced = echo.pierced(-1)
+let wasSqueezed = echo.squeeze(-2)
+call when pierced == "up" and wasSqueezed and gate(0.55, payout.value, 0.0)
+put when pierced == "down" and wasSqueezed and gate(0.55, payout.value, 0.0)
+confidence = 58
+expiry = 1
+```
+
 ---
 
-All 10 of the above were verified by parsing and evaluating each one with
+All 12 of the above were verified by parsing and evaluating each one with
 `evaluateStrategyScript()` against synthetic candle series and a synthetic
 tick buffer (the same smoke-test discipline this project uses before any
 primitive ships), confirming each one parses, evaluates without a runtime

@@ -582,6 +582,63 @@ function mrcChart(candles: Candle[]): Candle[] {
   return ascendingGuard(bars).slice(-300)
 }
 
+// ---------- "Build all these end to end" sweep: Liquidity Spring /
+// Volatility Echo - plain candles + native LineSeries overlays (NOT a
+// canvas - lightweight-charts' own price-scale-synced lines are the right
+// tool for a baseline+band). Client-side mirrors of analytics/
+// {liquidityspring,volatilityecho}.ts's own math, same mirroring
+// convention as effortBricksChart()/mrcChart() above, not a new UI shape. ----------
+
+interface SpringLinePoint { time: number; baseline: number; snap: boolean; snapUp: boolean }
+
+function computeLiquiditySpringClient(candles: Candle[], emaPeriod = 20, lookback = 50, snapTensionFloor = 2.0): SpringLinePoint[] {
+  if (candles.length < 3) return []
+  const win = candles.slice(-400)
+  const k = 2 / (emaPeriod + 1)
+  let baseline = win[0].close
+  const anyVolume = win.some((c) => Number.isFinite(c.volume) && c.volume > 0)
+  const devHistory: number[] = []
+  const activityHistory: number[] = []
+  const out: SpringLinePoint[] = []
+  for (let i = 0; i < win.length; i++) {
+    const c = win[i]
+    baseline = i === 0 ? win[0].close : c.close * k + baseline * (1 - k)
+    const deviation = c.close - baseline
+    const absDev = Math.abs(deviation)
+    const activity = anyVolume ? Math.max(0, Number.isFinite(c.volume) ? c.volume : 0) : 1
+    const trailingDevs = devHistory.length >= lookback ? devHistory.slice(-lookback) : null
+    const trailingStdev = trailingDevs ? Math.sqrt(trailingDevs.reduce((a, b) => a + b * b, 0) / trailingDevs.length - Math.pow(trailingDevs.reduce((a, b) => a + b, 0) / trailingDevs.length, 2)) : NaN
+    const tensionScore = Number.isFinite(trailingStdev) && trailingStdev > 0 ? Math.min(6, absDev / trailingStdev) : NaN
+    const trailingAct = activityHistory.length >= lookback ? activityHistory.slice(-lookback).reduce((a, b) => a + b, 0) / lookback : NaN
+    const activityRatio = Number.isFinite(trailingAct) && trailingAct > 0 ? activity / trailingAct : NaN
+    const decelerating = Number.isFinite(activityRatio) && activityRatio < 1
+    const snap = Number.isFinite(tensionScore) && tensionScore >= snapTensionFloor && decelerating
+    out.push({ time: c.time, baseline, snap, snapUp: deviation >= 0 })
+    devHistory.push(absDev)
+    activityHistory.push(activity)
+  }
+  return out
+}
+
+interface EchoLinePoint { time: number; baseline: number; upper: number; lower: number; pierced: 'up' | 'down' | null }
+
+function computeVolatilityEchoClient(candles: Candle[], window = 15, bandMult = 2.0): EchoLinePoint[] {
+  if (candles.length < window + 1) return []
+  const win = candles.slice(-400)
+  const out: EchoLinePoint[] = []
+  for (let i = window - 1; i < win.length; i++) {
+    const slice = win.slice(i - window + 1, i + 1).map((c) => c.close)
+    const close = win[i].close
+    const mean = slice.reduce((a, b) => a + b, 0) / slice.length
+    const dev = Math.sqrt(slice.reduce((a, b) => a + (b - mean) * (b - mean), 0) / slice.length)
+    const upper = mean + dev * bandMult
+    const lower = mean - dev * bandMult
+    const pierced: EchoLinePoint['pierced'] = close > upper ? 'up' : close < lower ? 'down' : null
+    out.push({ time: win[i].time, baseline: mean, upper, lower, pierced })
+  }
+  return out
+}
+
 // ---------- Task 63 transforms (kernel-mirrored; engines of record live in
 // mini-services/trading-core/src/analytics/{rangebars,volumebars}.ts) ----------
 
@@ -1063,6 +1120,12 @@ export default function ChartPanel({
   const customCanvasRef = useRef<HTMLCanvasElement | null>(null)
   // IV/HV pane line series (created only when chartType === 'ivhv')
   const hvLineRef = useRef<ISeriesApi<'Line'> | null>(null)
+  const springBaselineRef = useRef<ISeriesApi<'Line'> | null>(null)
+  const echoBaselineRef = useRef<ISeriesApi<'Line'> | null>(null)
+  const echoUpperRef = useRef<ISeriesApi<'Line'> | null>(null)
+  const echoLowerRef = useRef<ISeriesApi<'Line'> | null>(null)
+  const springMarkersRef = useRef<SeriesMarker<Time>[]>([])
+  const echoMarkersRef = useRef<SeriesMarker<Time>[]>([])
   const ivLineRef = useRef<ISeriesApi<'Line'> | null>(null)
 
   // Drop stale tick/IV-HV/OTC-footprint data the instant the asset changes,
@@ -1303,7 +1366,7 @@ export default function ChartPanel({
         upColor: 'transparent', downColor: DOWN, borderUpColor: UP, borderDownColor: DOWN, wickUpColor: UP, wickDownColor: DOWN,
         priceLineColor: '#38bdf8',
       })
-    } else if (chartType === 'heikin' || chartType === 'renko' || chartType === 'pointfigure' || chartType === 'rangebars' || chartType === 'volumebars' || chartType === 'tickchart' || chartType === 'linebreak' || chartType === 'kagi' || chartType === 'swing' || chartType === 'effort' || chartType === 'mrc' || chartType === 'outcomeMemory') {
+    } else if (chartType === 'heikin' || chartType === 'renko' || chartType === 'pointfigure' || chartType === 'rangebars' || chartType === 'volumebars' || chartType === 'tickchart' || chartType === 'linebreak' || chartType === 'kagi' || chartType === 'swing' || chartType === 'effort' || chartType === 'mrc' || chartType === 'outcomeMemory' || chartType === 'spring' || chartType === 'echo') {
       price = chart.addSeries(CandlestickSeries, {
         upColor: UP, downColor: DOWN, borderUpColor: UP, borderDownColor: DOWN, wickUpColor: UP, wickDownColor: DOWN,
         priceLineColor: '#38bdf8',
@@ -1357,6 +1420,20 @@ export default function ChartPanel({
       }
     }
 
+    // Liquidity Spring / Volatility Echo: native LineSeries overlays in
+    // PANE 0 (same pane as price - unlike ivhv's lines above, these track
+    // the SAME price scale the candles use, which is the whole point of a
+    // baseline+band overlay). Live/die with the chart; the data effect
+    // below fills them from computeLiquiditySpringClient()/
+    // computeVolatilityEchoClient().
+    if (chartType === 'spring') {
+      springBaselineRef.current = chart.addSeries(LineSeries, { color: 'rgba(245,158,11,0.85)', lineWidth: 2, priceLineVisible: false, lastValueVisible: false, title: 'core' })
+    } else if (chartType === 'echo') {
+      echoBaselineRef.current = chart.addSeries(LineSeries, { color: 'rgba(124,138,165,0.7)', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, title: 'mid' })
+      echoUpperRef.current = chart.addSeries(LineSeries, { color: 'rgba(56,189,248,0.6)', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, title: 'upper' })
+      echoLowerRef.current = chart.addSeries(LineSeries, { color: 'rgba(56,189,248,0.6)', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, title: 'lower' })
+    }
+
     return () => {
       chart.remove()
       chartRef.current = null
@@ -1364,6 +1441,10 @@ export default function ChartPanel({
       volRef.current = null
       hvLineRef.current = null
       ivLineRef.current = null
+      springBaselineRef.current = null
+      echoBaselineRef.current = null
+      echoUpperRef.current = null
+      echoLowerRef.current = null
       overlayRefs.current.clear()
       entryLineRefs.current.clear()
       markersRef.current = null
@@ -1371,6 +1452,8 @@ export default function ChartPanel({
       tradeMarkersRef.current = []
       swingMarkersRef.current = []
       memoryMarkersRef.current = []
+      springMarkersRef.current = []
+      echoMarkersRef.current = []
       renderStateRef.current = null
     }
   }, [chartType])
@@ -1484,7 +1567,8 @@ export default function ChartPanel({
       chartType !== 'tickfootprint' &&
       chartType !== 'volumeprofile' &&
       chartType !== 'deltaprofile' &&
-      chartType !== 'pulse'
+      chartType !== 'pulse' &&
+      chartType !== 'expiryRadar'
     )
       return
     const canvas = customCanvasRef.current
@@ -1920,6 +2004,89 @@ export default function ChartPanel({
         ctx.font = '9px var(--font-geist-mono), monospace'
         ctx.textAlign = 'left'
         ctx.fillText(`${pulseState?.intervalSec ?? 5}s bars · trend ${pulseState?.trend ?? 'none'} · streak ${pulseState?.streak ?? 0} · amber outline = exhaustion >= 0.6`, 8, H - 6)
+      } else if (chartType === 'expiryRadar') {
+        // Expiry-Horizon Radar: a purely visual re-presentation of price vs.
+        // time-to-expiry - NO new backend engine, no MSL namespace (see
+        // client.ts's ChartType doc comment). The "lap" length is this
+        // chart's own selected timeframe (labeled honestly below, not a
+        // separate configurable expiry this chart doesn't otherwise know
+        // about); the "strike" (center) is the entry price at the start of
+        // the CURRENT lap - the close of the last candle before it, or that
+        // lap's own first open if none exists yet. Angle = elapsed/lap x
+        // 360 clockwise from 12 o'clock; radius = price distance from
+        // strike, scaled by the lap's own trailing range so the spiral
+        // always fits the canvas regardless of instrument/volatility.
+        const lapSec = Math.max(1, TIMEFRAME_SECONDS[tf ?? '1m'] ?? 60)
+        const win = candles.slice(-600)
+        if (win.length < 2) {
+          ctx.fillStyle = TEXT
+          ctx.textAlign = 'center'
+          ctx.fillText('not enough history yet', W / 2, H / 2)
+          return
+        }
+        const lastTime = win[win.length - 1].time
+        const lapStart = Math.floor(lastTime / lapSec) * lapSec
+        const lapCandles = win.filter((c) => c.time >= lapStart)
+        const priorIdx = win.length - lapCandles.length - 1
+        const strike = priorIdx >= 0 ? win[priorIdx].close : lapCandles[0]?.open ?? win[win.length - 1].close
+        const cx = W / 2
+        const cy = H / 2
+        const maxRadius = Math.min(W, H) / 2 - 30
+        const devs = lapCandles.map((c) => Math.abs(c.close - strike))
+        const scale = Math.max(...devs, 1e-9) * 1.25 || 1e-9
+        const angleFor = (t: number) => ((Math.min(Math.max(t - lapStart, 0), lapSec) / lapSec) * 360 - 90) * (Math.PI / 180)
+        const radiusFor = (price: number) => Math.min(maxRadius, (Math.abs(price - strike) / scale) * maxRadius)
+        // clock face: concentric gridlines + 12/3/6/9 o'clock ticks
+        ctx.strokeStyle = 'rgba(124,138,165,0.25)'
+        for (const frac of [0.33, 0.66, 1]) {
+          ctx.beginPath()
+          ctx.arc(cx, cy, maxRadius * frac, 0, Math.PI * 2)
+          ctx.stroke()
+        }
+        ctx.beginPath()
+        ctx.moveTo(cx, cy - maxRadius)
+        ctx.lineTo(cx, cy + maxRadius)
+        ctx.moveTo(cx - maxRadius, cy)
+        ctx.lineTo(cx + maxRadius, cy)
+        ctx.stroke()
+        ctx.fillStyle = '#f59e0b'
+        ctx.beginPath()
+        ctx.arc(cx, cy, 3, 0, Math.PI * 2)
+        ctx.fill()
+        // the spiral: price distance from strike, drawn out from center as the lap's clock hand sweeps
+        ctx.strokeStyle = 'rgba(56,189,248,0.9)'
+        ctx.lineWidth = 1.5
+        ctx.beginPath()
+        lapCandles.forEach((c, i) => {
+          const a = angleFor(c.time)
+          const r = radiusFor(c.close)
+          const px = cx + Math.cos(a) * r
+          const py = cy + Math.sin(a) * r
+          if (i === 0) ctx.moveTo(px, py)
+          else ctx.lineTo(px, py)
+        })
+        ctx.stroke()
+        ctx.lineWidth = 1
+        // live point + buffer radius readout (distance still available before the hand reaches 12 again)
+        const last = lapCandles[lapCandles.length - 1]
+        if (last) {
+          const a = angleFor(last.time)
+          const r = radiusFor(last.close)
+          const px = cx + Math.cos(a) * r
+          const py = cy + Math.sin(a) * r
+          const up = last.close >= strike
+          ctx.fillStyle = up ? UP : DOWN
+          ctx.beginPath()
+          ctx.arc(px, py, 4, 0, Math.PI * 2)
+          ctx.fill()
+          const elapsed = Math.min(Math.max(last.time - lapStart, 0), lapSec)
+          const remainingSec = Math.max(0, lapSec - elapsed)
+          ctx.fillStyle = TEXT
+          ctx.font = '10px var(--font-geist-mono), monospace'
+          ctx.textAlign = 'center'
+          ctx.fillText(`strike ${fmtPrice(strike, digitsTicker)} · ${up ? '+' : ''}${(last.close - strike).toFixed(5)} · ${Math.round(remainingSec)}s to lap close`, W / 2, H - 10)
+          ctx.fillText(`lap = ${tf ?? '1m'} (${lapSec}s) - not a live trade expiry, just this chart's own timeframe`, W / 2, 16)
+        }
       } else {
         // TPO: left = close path for time orientation, right = profile
         const prof = tpoProfile(candles.slice(-400))
@@ -1993,7 +2160,7 @@ export default function ChartPanel({
     // keyed on closedBarSignature, not raw `candles` (see its own doc
     // comment above) - `candles` is still read fresh via closure when this
     // DOES run, just not used to decide whether it reruns.
-  }, [chartType, closedBarSignature, digitsTicker, otcState, tickFpState, pulseState])
+  }, [chartType, closedBarSignature, digitsTicker, otcState, tickFpState, pulseState, tf])
 
   // live precision sync: asset switch or a quote crossing a magnitude band
   useEffect(() => {
@@ -2063,7 +2230,7 @@ export default function ChartPanel({
 
   const applyMarkers = useCallback(() => {
     if (!markersRef.current) return
-    const all = [...indMarkersRef.current, ...tradeMarkersRef.current, ...swingMarkersRef.current, ...memoryMarkersRef.current]
+    const all = [...indMarkersRef.current, ...tradeMarkersRef.current, ...swingMarkersRef.current, ...memoryMarkersRef.current, ...springMarkersRef.current, ...echoMarkersRef.current]
     all.sort((a, b) => Number(a.time) - Number(b.time))
     markersRef.current.api.setMarkers(all)
   }, [])
@@ -2131,6 +2298,42 @@ export default function ChartPanel({
     ensureMarkerApi()
     applyMarkers()
   }, [chartType, candles, outcomeMemState, ensureMarkerApi, applyMarkers])
+
+  // Liquidity Spring / Volatility Echo overlay data - client-side math
+  // (computeLiquiditySpringClient()/computeVolatilityEchoClient() above).
+  // Full-window recompute per closed bar, same tradeoff mrcChart() accepts.
+  // Snap/pierce events feed marker dots through the same applyMarkers() pipeline.
+  useEffect(() => {
+    if (chartType === 'spring') {
+      const base = springBaselineRef.current
+      if (!base) return
+      const pts = computeLiquiditySpringClient(candles)
+      base.setData(pts.map((p) => ({ time: p.time as UTCTimestamp, value: p.baseline })))
+      springMarkersRef.current = pts
+        .filter((p) => p.snap)
+        .map((p) => ({ time: p.time as UTCTimestamp, position: p.snapUp ? 'aboveBar' : 'belowBar', shape: p.snapUp ? 'arrowDown' : 'arrowUp', color: p.snapUp ? DOWN : UP, text: 'snap', size: 1 }))
+      ensureMarkerApi()
+      applyMarkers()
+    } else if (chartType === 'echo') {
+      const base = echoBaselineRef.current
+      const up = echoUpperRef.current
+      const lo = echoLowerRef.current
+      if (!base || !up || !lo) return
+      const pts = computeVolatilityEchoClient(candles)
+      base.setData(pts.map((p) => ({ time: p.time as UTCTimestamp, value: p.baseline })))
+      up.setData(pts.map((p) => ({ time: p.time as UTCTimestamp, value: p.upper })))
+      lo.setData(pts.map((p) => ({ time: p.time as UTCTimestamp, value: p.lower })))
+      echoMarkersRef.current = pts
+        .filter((p) => p.pierced)
+        .map((p) => ({ time: p.time as UTCTimestamp, position: p.pierced === 'up' ? 'aboveBar' : 'belowBar', shape: p.pierced === 'up' ? 'arrowUp' : 'arrowDown', color: p.pierced === 'up' ? UP : DOWN, text: '', size: 1 }))
+      ensureMarkerApi()
+      applyMarkers()
+    } else if (springMarkersRef.current.length || echoMarkersRef.current.length) {
+      springMarkersRef.current = []
+      echoMarkersRef.current = []
+      applyMarkers()
+    }
+  }, [chartType, closedBarSignature, candles, ensureMarkerApi, applyMarkers])
 
   // registry indicator markers (Williams fractal arrows) - times snap to the
   // displayed candle grid (heikin/renko remap times), then merge via applyMarkers
@@ -2311,7 +2514,7 @@ export default function ChartPanel({
       </div>
 
       <div ref={elRef} className="min-h-0 flex-1" />
-      {(chartType === 'footprint' || chartType === 'tpo' || chartType === 'otcfootprint' || chartType === 'tickfootprint' || chartType === 'volumeprofile' || chartType === 'deltaprofile' || chartType === 'pulse') && (
+      {(chartType === 'footprint' || chartType === 'tpo' || chartType === 'otcfootprint' || chartType === 'tickfootprint' || chartType === 'volumeprofile' || chartType === 'deltaprofile' || chartType === 'pulse' || chartType === 'expiryRadar') && (
         <div className="absolute inset-x-0 bottom-[30px] top-0 z-[5] bg-[#0b111c]">
           <canvas ref={customCanvasRef} className="block h-full w-full" />
         </div>

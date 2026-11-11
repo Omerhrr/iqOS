@@ -552,6 +552,34 @@ test('ivhv.ivNow()/.ratio() compute real numbers once a payout source IS wired i
   assert.equal(r.direction, 'call') // breakeven% for payout 0.85 is 100/1.85 ~= 54.05, a real finite number in (0,100)
 })
 
+test('spring.tension()/.snap()/.decelerating() run end to end and never throw on a real series', () => {
+  const series = syntheticSeries(120, 11)
+  const r = run(
+    'let t = spring.tension(-1)\nlet snap = spring.snap(-1)\nlet decel = spring.decelerating(-1)\ncall when t >= 0 and (snap or not snap) and (decel or not decel)\nconfidence = 50'
+  , series)
+  assert.equal(r.error, undefined)
+})
+
+test('spring.*(offset) fails closed with a clear error when the window is too short', () => {
+  const series = syntheticSeries(2, 11)
+  const r = run('let t = spring.tension(-1)\ncall when t > 0\nconfidence = 50', series)
+  assert.ok(r.error, 'expected spring.* to fail closed on a too-short window')
+})
+
+test('echo.squeeze()/.pierced()/.width() run end to end and classify a real series honestly', () => {
+  const series = syntheticSeries(120, 12)
+  const r = run(
+    'let w = echo.width(-1)\nlet sq = echo.squeeze(-1)\nlet p = echo.pierced(-1)\ncall when w >= 0 and (p == "up" or p == "down" or p == "none") and (sq or not sq)\nconfidence = 50'
+  , series)
+  assert.equal(r.error, undefined)
+})
+
+test('echo.*(offset) fails closed with a clear error when the window has fewer than window+1 candles', () => {
+  const series = syntheticSeries(5, 12)
+  const r = run('let w = echo.width(-1)\ncall when w > 0\nconfidence = 50', series)
+  assert.ok(r.error, 'expected echo.* to fail closed on too few candles for its default window')
+})
+
 // ---------------------------------------------------------------------
 // runner
 // ---------------------------------------------------------------------
