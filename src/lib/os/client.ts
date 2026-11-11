@@ -74,6 +74,11 @@ export type ChartType =
   //    confirmed swing-high/swing-low markers on top, mirroring
   //    analytics/swing.ts's fractal-pivot logic client-side.
   | 'volumeprofile' | 'deltaprofile' | 'swing'
+  // Frontend-for-the-4-new-engines sweep: Effort Bricks and MRC render as
+  // pseudo-candles client-side (ChartPanel.tsx's effortBricksChart()/
+  // mrcChart()), mirroring analytics/{effortbricks,mrc}.ts's own math -
+  // same pattern as linebreak/kagi above, not re-deriving new UI shapes.
+  | 'effort' | 'mrc'
 export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'candles', label: 'Candles' },
   { id: 'hollow', label: 'Hollow' },
@@ -97,6 +102,8 @@ export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'volumeprofile', label: 'Volume Profile' },
   { id: 'deltaprofile', label: 'Delta Profile' },
   { id: 'swing', label: 'Swing' },
+  { id: 'effort', label: 'Effort Bricks' },
+  { id: 'mrc', label: 'Market Response' },
 ]
 
 // kernel route payloads for the Task 63 chart fetches (ChartPanel)

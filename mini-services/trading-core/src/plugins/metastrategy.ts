@@ -46,6 +46,7 @@ import { computeSwing } from '../analytics/swing'
 import { effortBricks } from '../analytics/effortbricks'
 import { computeMrc } from '../analytics/mrc'
 import { computeOutcomeMemory } from '../analytics/outcomememory'
+import { computePulseBars } from '../analytics/pulsebars'
 import { computeBaseline } from '../analytics/baseline'
 import { realizedUpProb } from '../analytics/ivhv'
 import { EXPIRIES_MIN } from '../analytics/nextexpiry'
@@ -113,7 +114,7 @@ const UNSAFE_BACKTEST_SOURCES = new Set<MetaConditionSource>([
   'oracle', 'hmaRocBullBear', 'momentumScore', 'accute', 'smc', 'smcNow', 'ict',
   'renkoSmc', 'renkoSmcMajority', 'tick', 'footprint', 'otcFootprint', 'tickSmc',
   'tickOracle', 'tickTechnical', 'tickFootprint', 'tempo', 'confluence', 'volArb',
-  'cointegration', 'screenerRank', 'chartSignals', 'leadLag', 'yesterday',
+  'cointegration', 'screenerRank', 'chartSignals', 'leadLag', 'yesterday', 'pulse',
   'nextExpiry', 'nextExpiryBest', 'footDivergence', 'footStackedImbalance',
   'footAbsorption', 'footUnfinishedAuction',
 ])
@@ -168,6 +169,12 @@ function collectFieldSources(ast: MslAst): Set<string> {
       const obj = n.obj as Record<string, unknown> | undefined
       if (obj && obj.t === 'ident' && obj.name === 'tick') names.add('tick')
       if (obj && obj.t === 'ident' && obj.name === 'foot') names.add('footprint')
+      // `pulse.*(...)` - Pulse-Vector bars (analytics/pulsebars.ts), built
+      // directly on the live tick buffer same as tick.*/foot.* above -
+      // same reasoning, mapped onto a new 'pulse' UNSAFE_BACKTEST_SOURCES
+      // entry rather than reusing 'tick' (a script that only used pulse.*
+      // deserves an error naming the actual namespace that blocked it).
+      if (obj && obj.t === 'ident' && obj.name === 'pulse') names.add('pulse')
     }
     for (const v of Object.values(n)) {
       if (Array.isArray(v)) v.forEach(visit)
@@ -274,6 +281,10 @@ export const MSL_READ_CONFIGS: Record<string, MslConfigSpec> = {
   'memory.k': { min: 3, max: 200, integer: true, desc: 'Outcome Memory: number of nearest historical matches to draw' },
   'memory.lookback': { min: 100, max: 10000, integer: true, desc: 'Outcome Memory: how many trailing bars to search for candidates' },
   'memory.minPool': { min: 3, max: 500, integer: true, desc: 'Outcome Memory: minimum comparable (same-session) pool size before trusting a read' },
+  // Pulse-Vector bars (analytics/pulsebars.ts) - fixed micro-interval width
+  // and the sparse-bar floor.
+  'pulse.interval': { min: 1, max: 300, integer: true, desc: 'Pulse-Vector bar width in seconds (fixed micro-interval, not adaptive)' },
+  'pulse.sparseFloor': { min: 1, max: 100, integer: true, desc: 'Pulse-Vector: a bar built from fewer than this many ticks is flagged sparse' },
 }
 
 /** Validates a collected configure map against the whitelist. Throws with a
@@ -398,7 +409,7 @@ export class MetaStrategyService {
       'smc', 'smcNow', 'renkoSmc', 'renkoSmcMajority', 'pointFigure', 'rangeBars',
       'candle', 'heikinAshi', 'volumeBars', 'tick', 'footprint', 'tpo', 'ivHv', 'line',
       'tickSmc', 'tickOracle', 'tickTechnical', 'tickFootprint',
-      'technical', 'reversal', 'tempo', 'confluence', 'volArb', 'cointegration', 'effort', 'mrc', 'outcomeMemory',
+      'technical', 'reversal', 'tempo', 'confluence', 'volArb', 'cointegration', 'effort', 'mrc', 'outcomeMemory', 'pulse',
     ]
     const base = sources.map((s) => this.readSource(s, asset, tf))
     const perSmcConcept = ALL_SMC_KINDS.map((kind) => this.readSource('smcNow', asset, tf, kind))
@@ -771,6 +782,41 @@ export class MetaStrategyService {
           const direction = vote.dir === 1 ? 'call' : 'put'
           const confidence = Math.round(Math.min(1, Math.max(0, vote.weight)) * 100)
           return { source, direction, confidence, label: `Tick ${direction.toUpperCase()} - ${vote.note}` }
+        }
+        case 'pulse': {
+          // Pulse-Vector bars - see analytics/pulsebars.ts's own header and
+          // claude/pulse-vector-chart-build.md for the full design
+          // rationale. Reuses the SAME real tick buffer 'tick' above pulls
+          // from (otcFootprint.ticksFor) - no separate sample, no proxy
+          // fallback (unlike 'tick', this engine has no close-price
+          // fallback mode at all - it IS a tick engine, so with no real
+          // buffer it just reads none honestly rather than faking ticks
+          // from candle closes).
+          let ticks: { ts: number; price: number }[] = []
+          try {
+            ticks = this.ctx.use<OtcFootprintService>('otcFootprint').ticksFor(asset) as { ts: number; price: number }[]
+          } catch {
+            ticks = []
+          }
+          if (!ticks.length) return none('Pulse: no live tick buffer available')
+          const pulse = computePulseBars(ticks, {
+            ...(cfgNum(cfg, 'pulse.interval') !== undefined ? { intervalSec: cfgNum(cfg, 'pulse.interval') } : {}),
+            ...(cfgNum(cfg, 'pulse.sparseFloor') !== undefined ? { sparseFloor: cfgNum(cfg, 'pulse.sparseFloor') } : {}),
+          })
+          if (!pulse.bars.length) return none('Pulse: no pulse bars formed yet (too few ticks per micro-interval)')
+          const last = pulse.bars[pulse.bars.length - 1]
+          if (last.color === 'flat') return none('Pulse: last bar was flat (zero net displacement)')
+          const direction = last.displacement > 0 ? 'call' : 'put'
+          const accelerating = last.color === 'accel-up' || last.color === 'accel-down'
+          const highExhaustion = Number.isFinite(last.exhaustionScore) && last.exhaustionScore >= 0.6
+          const confidence = accelerating && !highExhaustion ? 70 : highExhaustion ? 35 : 50
+          return {
+            source,
+            direction,
+            confidence,
+            value: pulse.trend === 'up' ? pulse.streak : -pulse.streak,
+            label: `Pulse ${direction.toUpperCase()} - ${last.color}${last.sparse ? ' (sparse)' : ''}, exhaustion ${Number.isFinite(last.exhaustionScore) ? (last.exhaustionScore * 100).toFixed(0) + '%' : 'n/a'}, ${last.tickCount} ticks/${pulse.intervalSec}s`,
+          }
         }
         case 'footprint': {
           const candles = this.market.getCandlesDeep(asset, tf, 300, true)
@@ -1462,6 +1508,7 @@ export class MetaStrategyService {
       effort: toMsl(this.readSource('effort', asset, tf, undefined, undefined, undefined, cfg)),
       mrc: toMsl(this.readSource('mrc', asset, tf, undefined, undefined, undefined, cfg)),
       outcomeMemory: toMsl(this.readSource('outcomeMemory', asset, tf, undefined, undefined, undefined, cfg)),
+      pulse: toMsl(this.readSource('pulse', asset, tf, undefined, undefined, undefined, cfg)),
       footDivergence: toMsl(this.readSource('footDivergence', asset, tf)),
       footStackedImbalance: toMsl(this.readSource('footStackedImbalance', asset, tf, undefined, undefined, undefined, cfg)),
       footAbsorption: toMsl(this.readSource('footAbsorption', asset, tf)),

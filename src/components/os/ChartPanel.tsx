@@ -429,6 +429,159 @@ function kagiChart(candles: Candle[], tfSec: number, cacheRef: { current: IncCac
   return ascendingGuard(bars).slice(-300)
 }
 
+/** Effort Bricks, rendered as pseudo-candles - mirrors the kernel engine of
+ * record's own brick GEOMETRY (mini-services/trading-core/src/analytics/
+ * effortbricks.ts): continuation + classic 2-brick reversal rule, same
+ * ATR(14) x 0.3 default sizing as renko() above (effortbricks.ts's own
+ * default atrMult is 0.3 too - the brick shape this engine paints is
+ * IDENTICAL to plain Renko's; what effortbricks.ts adds on top is the
+ * per-brick volume-confirmation read, `effort`/`effortRatio`/`confirmed`).
+ * SIMPLIFICATION, stated honestly (same precedent as kagiChart()'s own
+ * thickness-drop note above): a vanilla CandlestickSeries has no per-bar
+ * confirmed/unconfirmed visual distinction wired up here, so the chart body
+ * shows brick geometry only - the confirmation/regime read itself is fully
+ * live via `effort.confirmed()`/`effort.ratio()`/`effort.regime()` in MSL,
+ * just not (yet) painted onto this series. Incremental via scanIncremental()
+ * - reuses renkoStep() because the geometry (continuation + 2-brick
+ * reversal) is byte-for-byte the same rule, just under its own cache. */
+function effortBricksChart(candles: Candle[], cacheRef: { current: IncCache<RenkoState> | null }): Candle[] {
+  if (candles.length < 10) return []
+  const window = candles.slice(-150)
+  const bricks = scanIncremental(
+    window,
+    cacheRef,
+    (w) => ({ refPrice: w[0].close, lastClose: w[0].close, brick: Math.max(atrOf(w) * 0.3, 1e-9) }),
+    renkoStep
+  )
+  return ascendingGuard(bricks).slice(-300)
+}
+
+/** Market Response Chart (MRC), rendered as pseudo-candles - a client-side
+ * port of the kernel engine of record's CANDLE-FALLBACK path (mini-services/
+ * trading-core/src/analytics/mrc.ts#computeMrc, `buildPoints()`'s candle
+ * branch + the price/activity/time adaptive-event-clock loop) - each
+ * candle close stands in as one pseudo-observation, exactly as the kernel
+ * engine's own fallback does when no live tick buffer is available (which
+ * is always true for this historical chart view - ticks only exist live).
+ * SAME HONESTY GAPS the kernel module documents for candle fidelity:
+ * `pathEfficiency`/`reversalCount` are not computable from OHLC alone and
+ * are dropped entirely here (not even carried as NaN, since nothing reads
+ * them on this chart body) - `directionalDelta` and `responseEfficiency`
+ * are real, just coarser than a true tick-based read would give.
+ * Not incremental (unlike renko/kagi above): the adaptive-event-clock loop
+ * carries running trailing-average state (responseHistory/activityHistory)
+ * that doesn't cleanly decompose into scanIncremental()'s prefix-reuse
+ * model, so this recomputes the full capped window every call - the same
+ * tradeoff volumeProfileBins()/deltaProfileBins() already accept for their
+ * own full-window recomputes, acceptable at this chart's candle-count cap. */
+function mrcChart(candles: Candle[]): Candle[] {
+  if (candles.length < 10) return []
+  const window = candles.slice(-400)
+  const anyVolume = window.some((c) => Number.isFinite(c.volume) && c.volume > 0)
+  const tfGaps: number[] = []
+  for (let i = 1; i < window.length; i++) {
+    const g = window[i].time - window[i - 1].time
+    if (g > 0) tfGaps.push(g)
+  }
+  tfGaps.sort((a, b) => a - b)
+  const baseIntervalSec = tfGaps.length ? tfGaps[Math.floor(tfGaps.length / 2)] : NaN
+  const gapThresholdSec = Number.isFinite(baseIntervalSec) ? baseIntervalSec * 6 : Infinity // maxGapMultiple default = 6
+
+  interface MrcPoint { t: number; price: number; activity: number; isUp: boolean | null }
+  const points: MrcPoint[] = []
+  let prevClose: number | null = null
+  for (const c of window) {
+    const activity = anyVolume ? Math.max(0, Number.isFinite(c.volume) ? c.volume : 0) : 1
+    points.push({ t: c.time, price: c.close, activity, isUp: prevClose === null ? null : c.close >= prevClose })
+    prevClose = c.close
+  }
+  if (points.length < 2) return []
+
+  const priceMult = 6 // opts.priceMult default
+  const maxDurationSec = Math.max(baseIntervalSec * 20 || 120, 120) // 120s default, widened for coarser timeframes
+  const lookback = 20
+
+  const bars: Candle[] = []
+  const responseHistory: number[] = []
+  const activityHistory: number[] = []
+  const deltaWindow: number[] = []
+
+  let barOpen = points[0].price
+  let barStart = points[0].t
+  let barHigh = points[0].price
+  let barLow = points[0].price
+  let barClose = points[0].price
+  let activity = 0
+  let upCount = 0
+  let downCount = 0
+  let pointsInBar = 0
+  let prevT = points[0].t
+  let prevPrice = points[0].price
+  const ref = () => (bars.length ? bars[bars.length - 1].close : points[0].price)
+
+  const closeBar = (endT: number, dataGap: boolean, confirmed: boolean) => {
+    const displacement = barClose - barOpen
+    const responseEfficiency = activity > 0 ? Math.abs(displacement) / activity : NaN
+    bars.push({ time: barStart, open: barOpen, high: barHigh, low: barLow, close: barClose, volume: activity })
+    if (!dataGap && confirmed) {
+      if (Number.isFinite(responseEfficiency)) {
+        responseHistory.push(responseEfficiency)
+        if (responseHistory.length > lookback) responseHistory.shift()
+      }
+      activityHistory.push(activity)
+      if (activityHistory.length > Math.min(lookback, 10)) activityHistory.shift()
+    }
+    void endT
+    activity = 0
+    upCount = 0
+    downCount = 0
+    pointsInBar = 0
+  }
+
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i]
+    const gapBefore = Number.isFinite(gapThresholdSec) && p.t - prevT > gapThresholdSec
+    if (gapBefore && pointsInBar > 0) closeBar(points[i - 1].t, true, true)
+
+    if (pointsInBar === 0) {
+      barOpen = p.price
+      barStart = p.t
+      barHigh = p.price
+      barLow = p.price
+    }
+    barHigh = Math.max(barHigh, p.price)
+    barLow = Math.min(barLow, p.price)
+    barClose = p.price
+    activity += p.activity
+    if (p.isUp === true) upCount++
+    else if (p.isUp === false) downCount++
+    pointsInBar++
+
+    if (i > 0) {
+      const delta = p.price - prevPrice
+      deltaWindow.push(Math.abs(delta))
+      if (deltaWindow.length > 14) deltaWindow.shift()
+    }
+    prevT = p.t
+    prevPrice = p.price
+
+    const avgStep = deltaWindow.length ? deltaWindow.reduce((a, b) => a + b, 0) / deltaWindow.length : NaN
+    const distanceFromRef = Math.abs(barClose - ref())
+    const activityThreshold = activityHistory.length >= 3 ? activityHistory.reduce((a, b) => a + b, 0) / activityHistory.length : 6
+    const elapsed = p.t - barStart
+
+    const priceEvent = pointsInBar >= 2 && Number.isFinite(avgStep) && avgStep > 0 && distanceFromRef >= avgStep * priceMult
+    const activityEvent = pointsInBar >= 2 && activity >= activityThreshold
+    const timeEvent = elapsed >= maxDurationSec
+    const isLast = i === points.length - 1
+    if (priceEvent || activityEvent || timeEvent || isLast) {
+      const realTrigger = priceEvent || activityEvent || timeEvent
+      closeBar(p.t, false, realTrigger)
+    }
+  }
+  return ascendingGuard(bars).slice(-300)
+}
+
 // ---------- Task 63 transforms (kernel-mirrored; engines of record live in
 // mini-services/trading-core/src/analytics/{rangebars,volumebars}.ts) ----------
 
@@ -873,6 +1026,7 @@ export default function ChartPanel({
   const volCacheRef = useRef<IncCache<VolState> | null>(null)
   const lineBreakCacheRef = useRef<IncCache<LineBreakState> | null>(null)
   const kagiCacheRef = useRef<IncCache<KagiState> | null>(null)
+  const effortCacheRef = useRef<IncCache<RenkoState> | null>(null)
   useEffect(() => {
     renkoCacheRef.current = null
     pfCacheRef.current = null
@@ -880,6 +1034,7 @@ export default function ChartPanel({
     volCacheRef.current = null
     lineBreakCacheRef.current = null
     kagiCacheRef.current = null
+    effortCacheRef.current = null
   }, [digitsTicker])
 
   // axis/crosshair/price-line precision follows the asset's quote convention
@@ -1046,6 +1201,8 @@ export default function ChartPanel({
     if (chartType === 'volumebars') return volumeBarsChart(candles, volCacheRef)
     if (chartType === 'linebreak') return lineBreakChart(candles, tfSec, lineBreakCacheRef)
     if (chartType === 'kagi') return kagiChart(candles, tfSec, kagiCacheRef)
+    if (chartType === 'effort') return effortBricksChart(candles, effortCacheRef)
+    if (chartType === 'mrc') return mrcChart(candles)
     if (chartType === 'tickchart') {
       // real /ticks bars when the fetch landed; else fall through to raw
       // candles (kernel always falls back server-side, so empty = not loaded)
@@ -1094,7 +1251,7 @@ export default function ChartPanel({
         upColor: 'transparent', downColor: DOWN, borderUpColor: UP, borderDownColor: DOWN, wickUpColor: UP, wickDownColor: DOWN,
         priceLineColor: '#38bdf8',
       })
-    } else if (chartType === 'heikin' || chartType === 'renko' || chartType === 'pointfigure' || chartType === 'rangebars' || chartType === 'volumebars' || chartType === 'tickchart' || chartType === 'linebreak' || chartType === 'kagi' || chartType === 'swing') {
+    } else if (chartType === 'heikin' || chartType === 'renko' || chartType === 'pointfigure' || chartType === 'rangebars' || chartType === 'volumebars' || chartType === 'tickchart' || chartType === 'linebreak' || chartType === 'kagi' || chartType === 'swing' || chartType === 'effort' || chartType === 'mrc') {
       price = chart.addSeries(CandlestickSeries, {
         upColor: UP, downColor: DOWN, borderUpColor: UP, borderDownColor: DOWN, wickUpColor: UP, wickDownColor: DOWN,
         priceLineColor: '#38bdf8',

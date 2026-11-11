@@ -193,9 +193,32 @@ confidence = outcomeMemory.conf
 expiry = 1
 ```
 
+## 10. Pulse-Vector exhaustion fade
+
+Pulse-Vector bars (`analytics/pulsebars.ts`) bundle real tick density,
+velocity and acceleration into one object per fixed micro-interval
+(default 5s), plus `exhaustionScore` - how far a bar's velocity has fallen
+from its own same-direction run's peak. This is the exact "thick base that
+thins out at the top, color fading to pale" signature the Pulse-Vector
+concept was built around: a surge that's still extending in the same
+direction but whose own speed has fallen well off its peak is read as
+exhausted, traded as a reversal rather than continuation. Skips sparse bars
+(too few real ticks to trust the density read) and still demands a real
+payout edge via `gate()`.
+
+```
+let dir = pulse.displacement(-1)
+let ex = pulse.exhaustion(-1)
+let sparse = pulse.sparse(-1)
+call when (not sparse) and dir < 0 and ex >= 0.6 and gate(0.55, payout.value, 0.0)
+put when (not sparse) and dir > 0 and ex >= 0.6 and gate(0.55, payout.value, 0.0)
+confidence = 55
+expiry = 1
+```
+
 ---
 
-All 9 of the above were verified by parsing and evaluating each one with
+All 10 of the above were verified by parsing and evaluating each one with
 `evaluateStrategyScript()` against synthetic candle series and a synthetic
 tick buffer (the same smoke-test discipline this project uses before any
 primitive ships), confirming each one parses, evaluates without a runtime

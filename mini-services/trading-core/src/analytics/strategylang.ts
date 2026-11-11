@@ -237,6 +237,7 @@ import { expiryMomentum, priceDisplacement, volAdjustedExpectedMove, reversalRis
 import { detectGaps } from './gap'
 import { effortBricks } from './effortbricks'
 import { computeMrc } from './mrc'
+import { computePulseBars } from './pulsebars'
 
 export interface MslSourceRead {
   direction: 'call' | 'put' | 'none'
@@ -1513,6 +1514,47 @@ function tickMethod(name: string, args: MslValue[], ticks: readonly { ts: number
 function requireTicks(ctx: EvalEnv): readonly { ts: number; price: number }[] {
   if (!ctx.liveTicks) throw new MslRuntimeError('tick.*() needs a live tick feed, which is not available in this evaluation context (only the omni-trader wires one in)')
   return ctx.liveTicks
+}
+
+/** `pulse.*` - Pulse-Vector bars (analytics/pulsebars.ts): packages the
+ * already-existing tick.count()/tick.velocity()/tick.acceleration()
+ * primitives into one bundled bar per FIXED micro-interval, plus a new
+ * `exhaustionScore` (how far a bar's velocity has fallen from its own
+ * same-direction run's peak - the "thick base thinning out at the top"
+ * signature). LIVE-ONLY, same contract as tick.* and foot.* (requireTicks()
+ * fails closed outside the omni-trader). `offsetInto`'s own -1-is-latest
+ * convention applies to every offset-indexed accessor below. */
+function pulseMethod(name: string, args: MslValue[], ctx: EvalEnv, ticks: readonly { ts: number; price: number }[]): MslValue {
+  const r = computePulseBars(ticks, {
+    intervalSec: cfgNumLang(ctx, 'pulse.interval', undefined),
+    sparseFloor: cfgNumLang(ctx, 'pulse.sparseFloor', undefined),
+  })
+  if (name === 'bars') return seriesValue(r.bars.map((b) => Math.sign(b.displacement)).slice(-seriesLookback(args, 50)))
+  if (!r.bars.length) throw new MslRuntimeError('pulse.*(offset) - no pulse bars have formed yet (needs at least one real tick per micro-interval)')
+  if (!args.length) throw new MslRuntimeError(`pulse.${name}(offset) needs an offset argument, e.g. pulse.${name}(-1)`)
+  const b = offsetInto(r.bars, asNum(args[0]), `pulse.${name}`)
+  switch (name) {
+    case 'ohlc':
+      return barValueFromOHLC(b.open, b.high, b.low, b.close, b.tickCount)
+    case 'displacement':
+      return b.displacement
+    case 'tickCount':
+      return b.tickCount
+    case 'velocity':
+      return b.velocity
+    case 'acceleration':
+      return Number.isFinite(b.acceleration) ? b.acceleration : 0
+    case 'exhaustion':
+      return Number.isFinite(b.exhaustionScore) ? b.exhaustionScore : 0
+    case 'color':
+      return b.color
+    case 'sparse':
+      return b.sparse
+    default:
+      throw new MslRuntimeError(
+        `unknown pulse method "pulse.${name}(...)" - use bars(n?)/ohlc(offset)/displacement(offset)/tickCount(offset)/velocity(offset)/acceleration(offset)/exhaustion(offset)/color(offset)/sparse(offset)`
+      )
+  }
 }
 
 /** One footprint snapshot (per-price-level up/dn ticks, POC, stagnation,
@@ -2911,6 +2953,12 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
       if (e.obj.t === 'ident' && e.obj.name === 'foot' && !(e.obj.name in env)) {
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         return footMethod(e.name, args, requireTicks(ctx), ctx.liveNowMs ?? Date.now())
+      }
+      // `pulse.tickCount(-1)` etc - same namespace-marker special case,
+      // same omni-trader-only contract (requireTicks() fails closed).
+      if (e.obj.t === 'ident' && e.obj.name === 'pulse' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        return pulseMethod(e.name, args, ctx, requireTicks(ctx))
       }
       // `renko.bricks(...)`/`pf.boxes(...)`/`ha.bars(...)` etc - brick/box/
       // HA-candle-level primitives, same optional trailing TF-string
