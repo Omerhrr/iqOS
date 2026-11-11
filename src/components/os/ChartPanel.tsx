@@ -429,6 +429,46 @@ function kagiChart(candles: Candle[], tfSec: number, cacheRef: { current: IncCac
   return ascendingGuard(bars).slice(-300)
 }
 
+/** Time-Anchored Kagi Overlay ('kagiOverlay' chart type) - a CONTINUOUS
+ * per-candle walk of the running Kagi extreme, unlike kagiStep()/kagiChart()
+ * above which only emit a point when a candle extends the current extreme
+ * or triggers a reversal (built for pseudo-candle rendering, where a
+ * continuation that doesn't move the extreme has nothing new to draw).
+ * Locking the Kagi line onto the REAL time axis (the whole point of this
+ * overlay - see client.ts's 'kagiOverlay' doc comment) needs a value at
+ * EVERY candle time, including candles where the line is holding flat at
+ * its last extreme, so this walks the same state machine but always pushes
+ * the current extreme/dir, not just on a change. Same honest simplification
+ * kagiChart() already states: thickness (yang/yin) is dropped from this
+ * client-side mirror - direction still reads via the up/down color split
+ * the caller renders this into (kagiOverlayUpRef/kagiOverlayDownRef). */
+function computeKagiOverlaySeries(candles: Candle[], mult = 1): { time: number; price: number; dir: 1 | -1 }[] {
+  if (candles.length < 10) return []
+  const window = candles.slice(-300)
+  const reversal = Math.max(atrOf(window), 1e-9) * mult
+  let dir: 1 | -1 = 1
+  let extreme = window[0].close
+  const out: { time: number; price: number; dir: 1 | -1 }[] = [{ time: window[0].time, price: extreme, dir }]
+  for (let i = 1; i < window.length; i++) {
+    const close = window[i].close
+    if (dir === 1) {
+      if (close >= extreme) extreme = close
+      else if (extreme - close >= reversal) {
+        dir = -1
+        extreme = close
+      }
+    } else {
+      if (close <= extreme) extreme = close
+      else if (close - extreme >= reversal) {
+        dir = 1
+        extreme = close
+      }
+    }
+    out.push({ time: window[i].time, price: extreme, dir })
+  }
+  return out
+}
+
 /** Effort Bricks, rendered as pseudo-candles - mirrors the kernel engine of
  * record's own brick GEOMETRY (mini-services/trading-core/src/analytics/
  * effortbricks.ts): continuation + classic 2-brick reversal rule, same
@@ -1125,9 +1165,12 @@ export default function ChartPanel({
   const springBaselineRef = useRef<ISeriesApi<'Line'> | null>(null)
   const echoBaselineRef = useRef<ISeriesApi<'Line'> | null>(null)
   const echoUpperRef = useRef<ISeriesApi<'Line'> | null>(null)
+  const kagiOverlayUpRef = useRef<ISeriesApi<'Line'> | null>(null)
+  const kagiOverlayDownRef = useRef<ISeriesApi<'Line'> | null>(null)
   const echoLowerRef = useRef<ISeriesApi<'Line'> | null>(null)
   const springMarkersRef = useRef<SeriesMarker<Time>[]>([])
   const echoMarkersRef = useRef<SeriesMarker<Time>[]>([])
+  const kagiGlowMarkersRef = useRef<SeriesMarker<Time>[]>([])
   const ivLineRef = useRef<ISeriesApi<'Line'> | null>(null)
 
   // Drop stale tick/IV-HV/OTC-footprint data the instant the asset changes,
@@ -1246,7 +1289,11 @@ export default function ChartPanel({
   // Pulse-Vector bars: live-tick-only aggregation (/pulse_bars) - same
   // "poll while the type is active" cadence as otcfootprint/tickfootprint.
   useEffect(() => {
-    if (chartType !== 'pulse') return
+    // also polled on 'kagiOverlay' - the ribbon's tick-velocity glow (see
+    // the kagiOverlay data effect below) reuses this SAME live-tick feed
+    // rather than standing up a second poll; honestly flat/no-glow when
+    // this never resolves (no live tick buffer, e.g. backtest/history view).
+    if (chartType !== 'pulse' && chartType !== 'kagiOverlay') return
     let dead = false
     const pull = () => {
       getPulseBars(digitsTicker, { intervalSec: 5 })
@@ -1413,6 +1460,17 @@ export default function ChartPanel({
         upColor: UP, downColor: DOWN, borderUpColor: UP, borderDownColor: DOWN, wickUpColor: UP, wickDownColor: DOWN,
         priceLineColor: '#38bdf8',
       })
+    } else if (chartType === 'kagiOverlay') {
+      // REAL candles, dimmed - this chart type does NOT replace the candle
+      // view the way 'kagi' does; the ribbon (added below) draws on top of
+      // these, which is the entire point of the overlay (see client.ts's
+      // 'kagiOverlay' doc comment).
+      price = chart.addSeries(CandlestickSeries, {
+        upColor: 'rgba(16,185,129,0.35)', downColor: 'rgba(244,63,94,0.35)',
+        borderUpColor: 'rgba(16,185,129,0.45)', borderDownColor: 'rgba(244,63,94,0.45)',
+        wickUpColor: 'rgba(16,185,129,0.35)', wickDownColor: 'rgba(244,63,94,0.35)',
+        priceLineVisible: false,
+      })
     } else if (chartType === 'footprint' || chartType === 'tpo' || chartType === 'otcfootprint' || chartType === 'tickfootprint') {
       // hidden behind the opaque custom canvas - but keeps the series
       // machinery (markers/price lines) alive and the data effect fed with
@@ -1474,6 +1532,17 @@ export default function ChartPanel({
       echoBaselineRef.current = chart.addSeries(LineSeries, { color: 'rgba(124,138,165,0.7)', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, title: 'mid' })
       echoUpperRef.current = chart.addSeries(LineSeries, { color: 'rgba(56,189,248,0.6)', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, title: 'upper' })
       echoLowerRef.current = chart.addSeries(LineSeries, { color: 'rgba(56,189,248,0.6)', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, title: 'lower' })
+    } else if (chartType === 'kagiOverlay') {
+      // The ribbon itself: two sparse native LineSeries in pane 0 (same
+      // price scale as the dimmed candles above), split by Kagi leg
+      // direction so the zig-zag still reads via color the way kagiChart()'s
+      // pseudo-candles do - each series only carries points for candles
+      // currently in ITS direction (computeKagiOverlaySeries' per-candle
+      // walk), leaving a natural gap at every reversal. Thickness (yang/yin)
+      // is the one thing dropped from this client-side mirror - same
+      // honestly-stated simplification kagiChart() already makes.
+      kagiOverlayUpRef.current = chart.addSeries(LineSeries, { color: 'rgba(16,185,129,0.95)', lineWidth: 2, priceLineVisible: false, lastValueVisible: false, title: 'kagi' })
+      kagiOverlayDownRef.current = chart.addSeries(LineSeries, { color: 'rgba(244,63,94,0.95)', lineWidth: 2, priceLineVisible: false, lastValueVisible: false, title: 'kagi' })
     }
 
     return () => {
@@ -1487,6 +1556,8 @@ export default function ChartPanel({
       echoBaselineRef.current = null
       echoUpperRef.current = null
       echoLowerRef.current = null
+      kagiOverlayUpRef.current = null
+      kagiOverlayDownRef.current = null
       overlayRefs.current.clear()
       entryLineRefs.current.clear()
       markersRef.current = null
@@ -2352,7 +2423,7 @@ export default function ChartPanel({
 
   const applyMarkers = useCallback(() => {
     if (!markersRef.current) return
-    const all = [...indMarkersRef.current, ...tradeMarkersRef.current, ...swingMarkersRef.current, ...memoryMarkersRef.current, ...springMarkersRef.current, ...echoMarkersRef.current]
+    const all = [...indMarkersRef.current, ...tradeMarkersRef.current, ...swingMarkersRef.current, ...memoryMarkersRef.current, ...springMarkersRef.current, ...echoMarkersRef.current, ...kagiGlowMarkersRef.current]
     all.sort((a, b) => Number(a.time) - Number(b.time))
     markersRef.current.api.setMarkers(all)
   }, [])
@@ -2456,6 +2527,57 @@ export default function ChartPanel({
       applyMarkers()
     }
   }, [chartType, closedBarSignature, candles, ensureMarkerApi, applyMarkers])
+
+  // Time-Anchored Kagi Overlay ribbon data - computeKagiOverlaySeries()'
+  // continuous per-candle walk, split by leg direction into the two sparse
+  // LineSeries created above (a natural gap opens at every reversal, which
+  // is what makes the color flip read as a zig-zag rather than one solid
+  // line). Tick-velocity glow: reuses Pulse-Vector's OWN already-computed
+  // velocity (pulseState, polled above whenever this chart type is active)
+  // to mark the ribbon's live tip whenever that bar's velocity is running
+  // well above its own trailing average - the same "surge, still extending"
+  // signal pulsebars.ts's exhaustionScore is built from, just read here as
+  // "how fast is the tip moving right now" rather than "how much has that
+  // speed fallen off." Honestly absent (no marker at all) whenever no live
+  // tick buffer resolved - never a fabricated glow on a backtest/history view.
+  useEffect(() => {
+    if (chartType !== 'kagiOverlay') {
+      if (kagiGlowMarkersRef.current.length) {
+        kagiGlowMarkersRef.current = []
+        applyMarkers()
+      }
+      return
+    }
+    const up = kagiOverlayUpRef.current
+    const down = kagiOverlayDownRef.current
+    if (!up || !down) return
+    const pts = computeKagiOverlaySeries(candles)
+    const upData = pts.filter((p) => p.dir === 1).map((p) => ({ time: p.time as UTCTimestamp, value: p.price }))
+    const downData = pts.filter((p) => p.dir === -1).map((p) => ({ time: p.time as UTCTimestamp, value: p.price }))
+    up.setData(upData)
+    down.setData(downData)
+
+    const bars = pulseState?.bars ?? []
+    const tip = pts[pts.length - 1]
+    if (tip && bars.length >= 6) {
+      const last = bars[bars.length - 1]
+      const trail = bars.slice(-6, -1)
+      const avgV = trail.reduce((s, b) => s + Math.abs(b.velocity), 0) / Math.max(trail.length, 1)
+      const ratio = avgV > 1e-9 ? Math.abs(last.velocity) / avgV : 1
+      if (Number.isFinite(ratio) && ratio >= 1.3) {
+        const t = snapToCandle(candles, tip.time)
+        kagiGlowMarkersRef.current = t === null
+          ? []
+          : [{ time: t as UTCTimestamp, position: tip.dir === 1 ? 'aboveBar' : 'belowBar', shape: 'circle', color: tip.dir === 1 ? UP : DOWN, text: 'velocity', size: Math.min(2, 0.8 + ratio / 3) }]
+      } else {
+        kagiGlowMarkersRef.current = []
+      }
+    } else {
+      kagiGlowMarkersRef.current = []
+    }
+    ensureMarkerApi()
+    applyMarkers()
+  }, [chartType, closedBarSignature, candles, pulseState, ensureMarkerApi, applyMarkers])
 
   // registry indicator markers (Williams fractal arrows) - times snap to the
   // displayed candle grid (heikin/renko remap times), then merge via applyMarkers

@@ -112,6 +112,22 @@ export type ChartType =
   // 'nextExpiry'/'nextExpiryBest' verdict sources already expose; this is
   // a visualization of an existing engine's history, not a new primitive.
   | 'expirySurface'
+  // Time-Anchored Kagi Overlay: the user's own pitch for a chart that
+  // "knows trending/ranging/choppy" - built as a DISTINCT chart type from
+  // 'kagi' above rather than a toggle on it, because the two render modes
+  // are genuinely different series setups (kagi.ts/kagiMethod's own
+  // dynamic-ATR reversal sizing and kagi.ts's new regime classifier are
+  // reused unchanged either way - nothing new to compute there). 'kagi'
+  // REPLACES the candle view with pseudo-candles (ChartPanel.tsx's
+  // kagiChart()); 'kagiOverlay' keeps the REAL CandlestickSeries visible
+  // (dimmed) and draws the Kagi line as a ribbon locked to the real time
+  // axis on a transparent canvas on top - see ChartPanel.tsx's
+  // computeKagiOverlayPath()/the kagiOverlay canvas effect for the
+  // per-candle running-extreme walk (continuous, unlike kagiChart()'s
+  // one-point-per-leg emission) and the tick-velocity glow, which reuses
+  // Pulse-Vector's already-computed velocity/acceleration (pulse_bars) -
+  // flat/no-glow, honestly, whenever no live tick buffer is available.
+  | 'kagiOverlay'
 export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'candles', label: 'Candles' },
   { id: 'hollow', label: 'Hollow' },
@@ -132,6 +148,7 @@ export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'ivhv', label: 'IV·HV' },
   { id: 'linebreak', label: 'Line Break' },
   { id: 'kagi', label: 'Kagi' },
+  { id: 'kagiOverlay', label: 'Kagi Overlay' },
   { id: 'volumeprofile', label: 'Volume Profile' },
   { id: 'deltaprofile', label: 'Delta Profile' },
   { id: 'swing', label: 'Swing' },
