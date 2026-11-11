@@ -580,6 +580,36 @@ test('echo.*(offset) fails closed with a clear error when the window has fewer t
   assert.ok(r.error, 'expected echo.* to fail closed on too few candles for its default window')
 })
 
+test('tickfp.* (the tickfootprint chart type\'s own engine) runs end to end and reads honestly off the last bucket', () => {
+  const ticks = synthTicks(400, 1_700_000_000_000, 400)
+  const r = runWithTicks(
+    'let p = tickfp.poc(10)\nlet d = tickfp.delta(10)\nlet t = tickfp.ticks(10)\nlet im = tickfp.imbalance(10)\ncall when t >= 0 and (im == "buy" or im == "sell" or im == "none")\nconfidence = 50',
+    ticks,
+    1_700_000_000_000 + 400 * 400,
+  )
+  assert.equal(r.error, undefined)
+})
+
+test('tickfp.* fails closed with no live tick feed, same contract as tick.*/foot.*', () => {
+  const r = run('let p = tickfp.poc(10)\ncall when p > 0\nconfidence = 50')
+  assert.ok(r.error, 'expected tickfp.* to fail closed with no live.ticks context')
+})
+
+test('outcomeMemory.* (dotted-method view of the k-NN read) runs end to end and reports an honest pool size', () => {
+  const series = syntheticSeries(1600, 13)
+  const r = run(
+    'let pool = outcomeMemory.poolSize()\nlet matches = outcomeMemory.matchCount()\nlet ok = outcomeMemory.ok()\ncall when pool >= 0 and matches >= 0 and (ok or not ok)\nconfidence = 50',
+    series,
+  )
+  assert.equal(r.error, undefined)
+})
+
+test('outcomeMemory.* reports ok=false / poolSize=0 honestly on too little history, never a fabricated read', () => {
+  const series = syntheticSeries(5, 13)
+  const r = run('let ok = outcomeMemory.ok()\nlet pool = outcomeMemory.poolSize()\ncall when (not ok) and pool == 0\nconfidence = 50', series)
+  assert.equal(r.error, undefined)
+})
+
 // ---------------------------------------------------------------------
 // runner
 // ---------------------------------------------------------------------

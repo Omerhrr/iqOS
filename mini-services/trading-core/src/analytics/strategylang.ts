@@ -240,6 +240,8 @@ import { computeMrc } from './mrc'
 import { computePulseBars } from './pulsebars'
 import { computeLiquiditySpring } from './liquidityspring'
 import { computeVolatilityEcho } from './volatilityecho'
+import { computeTickFootprint } from './tickdesk'
+import { computeOutcomeMemory } from './outcomememory'
 
 export interface MslSourceRead {
   direction: 'call' | 'put' | 'none'
@@ -1986,6 +1988,120 @@ function footMethod(name: string, args: MslValue[], ticks: readonly { ts: number
   }
 }
 
+/** `tickfp.*` - the 'tickfootprint' chart type's own engine
+ * (tickdesk.ts#computeTickFootprint: MEASURED prints bucketed into both a
+ * time axis AND price rows per bucket, bucketSec default 60s) - previously
+ * only reachable through the bare `tickFootprint` verdict-source identifier
+ * (a single aggregate read), never as a dotted namespace a script could
+ * drill into per-bucket. Distinct from `foot.*` above: that namespace
+ * wraps otcfootprint.ts#buildFootprint (the OTC-footprint/footprint chart
+ * types' engine) - a different computation, bucketed differently, with its
+ * own row shape. Reads the LAST closed bucket; omni-trader-only (needs the
+ * live tick buffer), same fail-closed contract every other tick-backed
+ * namespace here already has. */
+function tickfpMethod(name: string, args: MslValue[], ticks: readonly { ts: number; price: number }[]): MslValue {
+  const bucketSec = args.length ? Math.max(1, Math.min(3600, Math.round(asNum(args[0])))) : 60
+  if (!ticks.length) {
+    if (name === 'imbalance') return 'none'
+    return name === 'ticks' || name === 'upTicks' || name === 'dnTicks' || name === 'netImbalance' ? 0 : NaN
+  }
+  const r = computeTickFootprint([...ticks] as { ts: number; price: number }[], { bucketSec })
+  const last = r.candles[r.candles.length - 1]
+  if (!last) {
+    if (name === 'imbalance') return 'none'
+    return name === 'ticks' || name === 'upTicks' || name === 'dnTicks' || name === 'netImbalance' ? 0 : NaN
+  }
+  switch (name) {
+    case 'poc':
+      return last.poc === null ? NaN : last.poc
+    case 'delta':
+      return last.delta
+    case 'ticks':
+      return last.ticks
+    case 'upTicks':
+      return last.upTicks
+    case 'dnTicks':
+      return last.dnTicks
+    case 'imbalance': {
+      // tickfp.imbalance(bucketSec?) - the last bucket's DOMINANT per-row
+      // imbalance side, by count of rows (TickFootprintRow.imbalance is
+      // already computed per row - this just reads which side has more of
+      // them). 'none' on a tie or when no row shows an imbalance.
+      let buy = 0
+      let sell = 0
+      for (const row of last.rows) {
+        if (row.imbalance === 'buy') buy++
+        else if (row.imbalance === 'sell') sell++
+      }
+      return buy === sell ? 'none' : buy > sell ? 'buy' : 'sell'
+    }
+    case 'netImbalance': {
+      // signed (buy rows - sell rows) in the last bucket - the magnitude
+      // tickfp.imbalance()'s side-only read deliberately drops.
+      let buy = 0
+      let sell = 0
+      for (const row of last.rows) {
+        if (row.imbalance === 'buy') buy++
+        else if (row.imbalance === 'sell') sell++
+      }
+      return buy - sell
+    }
+    case 'rowCount':
+      return last.rows.length
+    default:
+      throw new MslRuntimeError(`unknown tickfp method "tickfp.${name}(...)" - use poc/delta/ticks/upTicks/dnTicks/imbalance/netImbalance/rowCount`)
+  }
+}
+
+/** `outcomeMemory.*` - a dotted-method view of the SAME k-NN read the bare
+ * `outcomeMemory.value`/`outcomeMemory.conf` verdict-source identifiers
+ * already expose (analytics/outcomememory.ts#computeOutcomeMemory), now
+ * reachable as a script-callable namespace so a condition can drill into
+ * the comparable pool's own shape (poolSize/matchCount/up-down-flat split)
+ * instead of only the one aggregate pUp/confidence pair.
+ * SIMPLIFICATION, stated honestly: the bare verdict-source reads get the
+ * REAL asset (metastrategy.ts passes it to computeOutcomeMemory for
+ * OTC/weekend-aware session classification - see session.ts#classifySession).
+ * This namespace-method path has no asset in EvalEnv to pass (nothing else
+ * in strategylang.ts carries one either), so it calls with an empty asset -
+ * classifySession() degrades to its time-of-day-only session bucket in
+ * that case (still a real, honest session read, just not OTC-weekend-aware)
+ * rather than fabricating or guessing an asset string. */
+function outcomeMemoryMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  void args
+  const candles = seriesToCandles(requireSeries(ctx, tf))
+  const om = computeOutcomeMemory(candles, '', {
+    ...(cfgNumLang(ctx, 'memory.expiry', undefined) !== undefined ? { expiryBars: cfgNumLang(ctx, 'memory.expiry', undefined) } : {}),
+    ...(cfgNumLang(ctx, 'memory.k', undefined) !== undefined ? { k: cfgNumLang(ctx, 'memory.k', undefined) } : {}),
+    ...(cfgNumLang(ctx, 'memory.lookback', undefined) !== undefined ? { lookback: cfgNumLang(ctx, 'memory.lookback', undefined) } : {}),
+    ...(cfgNumLang(ctx, 'memory.minPool', undefined) !== undefined ? { minPoolSize: cfgNumLang(ctx, 'memory.minPool', undefined) } : {}),
+  })
+  switch (name) {
+    case 'pUp':
+      return om.ok ? om.pUp : NaN
+    case 'poolSize':
+      return om.ok ? om.poolSize : 0
+    case 'matchCount':
+      return om.ok ? om.matches.length : 0
+    case 'upCount':
+      return om.ok ? om.upCount : 0
+    case 'downCount':
+      return om.ok ? om.downCount : 0
+    case 'flatCount':
+      return om.ok ? om.flatCount : 0
+    case 'avgReturn':
+      return om.ok ? om.avgReturn : NaN
+    case 'medianReturn':
+      return om.ok ? om.medianReturn : NaN
+    case 'k':
+      return om.k
+    case 'ok':
+      return om.ok
+    default:
+      throw new MslRuntimeError(`unknown outcomeMemory method "outcomeMemory.${name}(...)" - use pUp/poolSize/matchCount/upCount/downCount/flatCount/avgReturn/medianReturn/k/ok`)
+  }
+}
+
 /** `renko.*`/`pf.*`/`ha.*`'s shared conversion - renkoBricks()/pointFigure()/
  * heikinAshiSeries() all want a real Candle[] (they only use .time to STAMP
  * their output, never to decide the math - brick/box/HA logic is pure
@@ -3034,6 +3150,22 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
       if (e.obj.t === 'ident' && e.obj.name === 'foot' && !(e.obj.name in env)) {
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         return footMethod(e.name, args, requireTicks(ctx), ctx.liveNowMs ?? Date.now())
+      }
+      // `tickfp.poc(...)` etc - the 'tickfootprint' chart type's own engine
+      // (tickdesk.ts#computeTickFootprint), same omni-trader-only contract
+      // (requireTicks() fails closed) as tick.*/foot.* above.
+      if (e.obj.t === 'ident' && e.obj.name === 'tickfp' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        return tickfpMethod(e.name, args, requireTicks(ctx))
+      }
+      // `outcomeMemory.poolSize(...)` etc - dotted-method view of the SAME
+      // k-NN read the bare `outcomeMemory.value`/`.conf` verdict-source
+      // reads already expose; needs the closed-candle series like
+      // renko.*/kagi.*/swing.* above, not the live tick buffer.
+      if (e.obj.t === 'ident' && e.obj.name === 'outcomeMemory' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return outcomeMemoryMethod(e.name, args, ctx, tf)
       }
       // `pulse.tickCount(-1)` etc - same namespace-marker special case,
       // same omni-trader-only contract (requireTicks() fails closed).
