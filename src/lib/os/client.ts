@@ -1101,6 +1101,59 @@ export async function getReversalGlobal(opts?: { limit?: number; category?: stri
   })
 }
 
+// ---------- MRC Next-Movement Predictor (mini-services/trading-core/src/plugins/mrcpredict.ts) ----------
+// Self-calibrating continuation/reversal prediction built on the Market
+// Response Clock's own responseRatio read - every number is recomputed
+// walk-forward from THIS asset's own trailing confirmed-bar history, never
+// a hardcoded constant borrowed from a one-off study.
+
+export type MrcPredictState = 'warming' | 'uncertain' | 'continuation-likely' | 'reversal-likely'
+
+export interface MrcPredictResult {
+  ok: boolean
+  note: string
+  state: MrcPredictState
+  direction: 'call' | 'put' | 'none'
+  confidence: number
+  value: number
+  sampleSize: number
+  lastResponseRatio: number
+  lastDisplacement: number
+  fidelity: 'tick' | 'candle'
+}
+
+export async function getMrcPredict(asset: string, tf: string = '1m'): Promise<{ ok: boolean; result?: MrcPredictResult; error?: string }> {
+  return osGet('/mrc_predict', { asset, tf })
+}
+
+export interface MrcPredictGlobalRow {
+  asset: string
+  tf: string
+  price: number
+  computedTs: number
+  ok: boolean
+  result: MrcPredictResult
+}
+
+export async function getMrcPredictGlobal(opts?: { tf?: string; limit?: number; category?: string; refresh?: boolean }): Promise<{
+  ok: boolean
+  error?: string
+  scannedTs: number
+  universe: number
+  scanned: number
+  live: number
+  warming: number
+  refreshed: number
+  rows: MrcPredictGlobalRow[]
+}> {
+  return osGet('/mrc_predict_global', {
+    tf: opts?.tf,
+    limit: opts?.limit,
+    category: opts?.category,
+    refresh: opts?.refresh ? 1 : undefined,
+  })
+}
+
 // ---------- Technical Summary (mini-services/trading-core/src/plugins/technical.ts) ----------
 
 export type TechRead = 'buy' | 'sell' | 'neutral' | 'na'

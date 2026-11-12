@@ -52,6 +52,7 @@ import { accutePlugin, AccuteService } from './src/plugins/accute'
 import { nextExpiryPlugin, NextExpiryService } from './src/plugins/nextexpiry'
 import { reversalPlugin, ReversalService } from './src/plugins/reversal'
 import { technicalPlugin, TechnicalService } from './src/plugins/technical'
+import { mrcPredictPlugin, MrcPredictService } from './src/plugins/mrcpredict'
 import {
   computeTickSmc, computeTickOracle, computeTickTechnical, computeTickFootprint, medianTickGapMs,
 } from './src/analytics/tickdesk'
@@ -242,6 +243,7 @@ kernel.register(omniTraderPlugin)
 kernel.register(nextExpiryPlugin)
 kernel.register(reversalPlugin)
 kernel.register(technicalPlugin)
+kernel.register(mrcPredictPlugin)
 
 // ---------- Full-universe scanners for Distill / Cointegration / Vol Arb ----------
 // These three started as single-asset-only panels (read whatever's on the
@@ -1994,6 +1996,40 @@ const httpServer = createServer(async (req, res) => {
         try {
           const svc = kernel.context().use<ReversalService>('reversal')
           const out = svc.globalScan({
+            limit: q.get('limit') ? Number(q.get('limit')) : undefined,
+            category: q.get('category') ?? 'all',
+            refresh: q.get('refresh') === '1',
+          })
+          return json(200, { ok: true, ...out })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // ---------- MRC Next-Movement Predictor ----------
+      // GET /mrc_predict?asset=X&tf=1m -> plugins/mrcpredict.ts's readFor(),
+      // a self-calibrating (per-asset, walk-forward) continuation/reversal
+      // prediction built on the Market Response Clock's own responseRatio
+      // read. GET /mrc_predict_global -> whole-universe board, same
+      // TTL-cached rows as reversal_global above.
+      if (path === '/mrc_predict') {
+        try {
+          const svc = kernel.context().use<MrcPredictService>('mrcpredict')
+          const asset = String(q.get('asset') ?? market.activeAsset)
+          const tf = String(q.get('tf') ?? '1m')
+          const result = svc.readFor(asset, tf)
+          if (!result) return json(200, { ok: false, error: 'not in the tracked universe' })
+          return json(200, { ok: true, result })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      if (path === '/mrc_predict_global') {
+        try {
+          const svc = kernel.context().use<MrcPredictService>('mrcpredict')
+          const out = svc.globalScan({
+            tf: q.get('tf') ?? undefined,
             limit: q.get('limit') ? Number(q.get('limit')) : undefined,
             category: q.get('category') ?? 'all',
             refresh: q.get('refresh') === '1',

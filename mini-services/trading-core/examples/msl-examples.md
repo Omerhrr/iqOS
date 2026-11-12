@@ -384,15 +384,21 @@ require four independent confirmations to agree before firing.
 - **Pullback** - `mrc.directionalDelta(-1)` moving *against* the trend
   direction on the latest bar is the dip (in an uptrend) or bounce (in a
   downtrend) being bought/faded back toward trend.
-- **Entry confirmation, all four required**: SMC's aggregate direction
-  (`smc.dir`) agrees with the *trend* direction (not the pullback - the bet
-  is the pullback resolves back toward trend); MRC's response ratio is
-  >= 1.0, the high-continuation bucket this project corrected example #13
-  onto rather than the low-response/fade side; a reversal-type candle
-  pattern (Hammer/Bullish Engulfing for the up case, Shooting Star/Bearish
-  Engulfing for the down case) confirms right at the pullback extreme; and
-  the 2-minute Next-Expiry Oracle rung (`nextExpiry:2`) agrees with real
-  probability mass (`.value > 0.5`) in the same direction.
+- **Entry confirmation**: SMC's aggregate direction (`smc.dir`) agrees with
+  the *trend* direction (not the pullback - the bet is the pullback resolves
+  back toward trend); MRC's response ratio is >= 1.0, the high-continuation
+  bucket this project corrected example #13 onto rather than the
+  low-response/fade side; a reversal-type candle pattern (Hammer/Bullish
+  Engulfing for the up case, Shooting Star/Bearish Engulfing for the down
+  case) confirms right at the pullback extreme; and the 2-minute Next-Expiry
+  Oracle rung (`nextExpiry:2`) agrees with real probability mass
+  (`.value > 0.5`) in the same direction.
+- **BOS/CHoCH filters** (added after a "how do we avoid wrong ones" chat -
+  see below): `smc:BOS` is read apart from the blended `smc` aggregate and
+  required to agree with trend direction as a SECOND, independent
+  trend-confirmation vote, but only after three false-positive filters pass
+  it; `smc:CHOCH` firing against the trade is an outright veto unless a
+  liquidity sweep explains it away.
 
 ```
 let regime = kagi.regime()
@@ -405,6 +411,26 @@ let rr = mrc.responseRatio(-1)
 let pullbackDown = trendDir == 1 and d < 0
 let pullbackUp = trendDir == -1 and d > 0
 
+# --- BOS confirmation, filtered against the three common false-BOS causes ---
+let bosUp = smc:BOS.dir == call
+let bosDown = smc:BOS.dir == put
+let bosDisplaced = ohlc(-1).range >= ind.atr(14)[-1] * 1.0        # real displacement, not a wick clip
+let bosParticipation = effort.confirmed(-1) and effort.ratio(-1) >= 1.0  # real volume behind the break
+let ebBar = effort.ohlc(-1)
+let ebDir = ebBar.c - ebBar.o
+let bosConfirmedUp = bosUp and bosDisplaced and bosParticipation and ebDir > 0
+let bosConfirmedDown = bosDown and bosDisplaced and bosParticipation and ebDir < 0
+let bosHeldUp = since(smc:BOS.dir == call) >= 1    # held at least one closed bar, not an instant rejection
+let bosHeldDown = since(smc:BOS.dir == put) >= 1
+
+# --- CHoCH veto, unless a liquidity sweep explains it (stop-hunt, not a real flip) ---
+let chochAgainstUp = smc:CHOCH.active and smc:CHOCH.dir == put
+let chochAgainstDown = smc:CHOCH.active and smc:CHOCH.dir == call
+let sweepAgainstUp = smc:LIQUIDITY_SWEEP.active and smc:LIQUIDITY_SWEEP.dir == put
+let sweepAgainstDown = smc:LIQUIDITY_SWEEP.active and smc:LIQUIDITY_SWEEP.dir == call
+let chochVetoUp = chochAgainstUp and not sweepAgainstUp
+let chochVetoDown = chochAgainstDown and not sweepAgainstDown
+
 let smcUp = smc.dir == call
 let smcDown = smc.dir == put
 
@@ -416,12 +442,37 @@ let exp2Down = nextExpiry:2.direction == put and nextExpiry:2.value > 0.5
 
 let respOk = rr >= 1.0
 
-call when trending and trendDir == 1 and pullbackDown and smcUp and respOk and bullPattern and exp2Up and gate(0.55, payout.value, 0.0)
-put when trending and trendDir == -1 and pullbackUp and smcDown and respOk and bearPattern and exp2Down and gate(0.55, payout.value, 0.0)
+call when trending and trendDir == 1 and pullbackDown and smcUp and bosConfirmedUp and bosHeldUp and not chochVetoUp and respOk and bullPattern and exp2Up and gate(0.55, payout.value, 0.0)
+put when trending and trendDir == -1 and pullbackUp and smcDown and bosConfirmedDown and bosHeldDown and not chochVetoDown and respOk and bearPattern and exp2Down and gate(0.55, payout.value, 0.0)
 
 confidence = 62
 expiry = 2
 ```
+
+**Why these specific filters**: BOS (Break of Structure, a swing point taken
+out WITH the trend) and CHoCH (Change of Character, taken out AGAINST the
+trend) are both part of the blended `smc` aggregate already, but blended
+away the distinction that matters here - a BOS should reinforce the trend
+read, while a live CHoCH is a warning the "trend" we're pulling back within
+may already be ending. Read separately via `smc:BOS`/`smc:CHOCH` (and
+`smc:LIQUIDITY_SWEEP`), three failure modes get filtered:
+
+1. **Wick-clip false break** - `bosDisplaced` requires the breaking bar's
+   range be at least one ATR, so a thin spike through a swing point doesn't
+   count as a real break.
+2. **No-participation break** - `bosParticipation` requires Effort Bricks
+   confirm real volume behind the move in the break's direction - a
+   structural break nobody traded into is the classic liquidity-grab trap,
+   not a real BOS.
+3. **Instant-rejection break** - `bosHeldUp`/`bosHeldDown` use `since()` to
+   require the break has held for at least one full closed bar rather than
+   acting on the very bar it first prints, so a break-then-snap-back doesn't
+   get traded as confirmed structure.
+
+And one veto: a `smc:CHOCH` firing against the trade kills it outright
+UNLESS `smc:LIQUIDITY_SWEEP` fired the same way first - a CHoCH that's
+really just the aftermath of a stop-hunt sweep is a known SMC false flag,
+not a genuine character change, so the sweep context un-vetoes it.
 
 **Bug caught while verifying this, worth keeping visible**: the first draft
 wrote `candle('Hammer', call) or candle('Bullish Engulfing', call)` with no
@@ -432,21 +483,25 @@ pattern checks; this exact gotcha is now documented in `claude/msl-full-
 reference.md` §5.5b/§5.11, whose own worked example had the same bug until
 this fix prompted a correction there too.
 
-**Honesty note**: like example #14, this script is live-only. `smc` and
-`nextExpiry:2` are both bare verdict-source identifiers, and per this
-project's backtest-mechanism rule, `meta_strategy_backtest`/
-`mslbacktest.ts` never replays a bare source, regardless of what backs it -
-so this can be read live but not walked bar-by-bar through the ordinary
-MSL backtester.
+**Honesty note**: like example #14, this script is live-only. `smc`,
+`smc:BOS`, `smc:CHOCH`, `smc:LIQUIDITY_SWEEP`, and `nextExpiry:2` are all
+bare verdict-source identifiers, and per this project's backtest-mechanism
+rule, `meta_strategy_backtest`/`mslbacktest.ts` never replays a bare source,
+regardless of what backs it - so this can be read live but not walked
+bar-by-bar through the ordinary MSL backtester.
 
 Verified by parsing and evaluating against a synthetic candle series and a
-synthetic reads-map stub (providing `smc`/`nextExpiry:2`/pattern reads)
-across 40 seeds - zero runtime errors after the `.active` fix. Zero
-call/put fires in the synthetic run is expected and not a logic defect:
-the synthetic series rarely produces `kagi.regime() == "trending"`
-simultaneously with all four other confirmations, which is the point of
-requiring four independent signals to agree - the test's purpose (proving
-no runtime errors, correct field access) was achieved.
+synthetic reads-map stub (providing `smc`/`smc:BOS`/`smc:CHOCH`/
+`smc:LIQUIDITY_SWEEP`/`nextExpiry:2`/pattern reads) across 60 seeds, with
+the `since()` bar-close state tracker wired in (`state: { keyPrefix,
+barTimeSec }`) so the hold-confirmation filter actually exercises real
+state rather than failing closed - zero runtime errors. Zero call/put fires
+in the synthetic run is expected and not a logic defect: the synthetic
+series rarely produces `kagi.regime() == "trending"` simultaneously with
+every confirmation AND every false-positive filter AND no veto, which is
+the point of stacking this many independent checks - the test's purpose
+(proving no runtime errors, correct field access, correct `since()` wiring)
+was achieved.
 
 ---
 
