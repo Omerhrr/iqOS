@@ -252,9 +252,73 @@ confidence = 58
 expiry = 1
 ```
 
+## 13. Response-Efficiency Continuation, regime- and participation-confirmed
+
+**CORRECTED - the first version of this example (committed, then reported
+by the user as losing more than it won in real use) was built on a real
+arithmetic mistake, kept here so nobody reuses it:** the Phase 3 finding
+(`claude/market-response-chart-mrc.md`) is "a low-response bar reverses
+next-bar **33.5%** of the time (n=176) vs **13.7%** for a high-response bar
+(n=146)." The original #13 read that as license to FADE every low-response
+bar - but 33.5% is not a win probability over 50%. It means a low-response
+bar still CONTINUES 66.5% of the time; it is merely *less* continuation-
+biased than a high-response bar (86.3% continuation). Betting on the 33.5%
+minority outcome is a structurally losing bet, which is exactly the result
+reported. The ~2.4x gap (33.5 vs 13.7) is a REAL, if single-window,
+difference in how confidently you should trust continuation - not a signal
+to bet against it.
+
+The corrected version trades CONTINUATION (same direction as the mrc bar
+itself, matching #8's already-correctly-signed logic above), gated on the
+HIGH-response side of the same measurement (`responseRatio >= 1.0`, the
+86.3%-continuation bucket) - never the low-response side - with the two
+filters this session's work actually put in place layered on top, each
+closing a real way even a correctly-signed continuation bet can go wrong:
+
+1. **Kagi regime != "choppy"** (`kagi.regime()`, this session's build) -
+   skip whenever Kagi's own reversal density says the tape is whipsawing -
+   the regime classifier's whole job is flagging "too much noise for
+   structure to mean anything."
+2. **Effort Bricks independently confirms the SAME direction**
+   (`effort.confirmed(-1)`/`effort.ratio(-1)`/`effort.ohlc(-1)`) - two
+   engines reading real participation from two different lenses
+   (displacement-per-activity vs brick-level volume) agreeing is a
+   materially stronger confluence than either alone, same logic #8 already
+   uses.
+
+Still demands a real payout edge via `gate()`. Honesty note carried over
+from the Phase 3 finding itself: single asset, single window, no
+significance test - a real, encouraging number, not proof; this script
+leans on it as a confirmation layer alongside Effort Bricks, not as a
+sole signal.
+
+```
+let d = mrc.directionalDelta(-1)
+let rr = mrc.responseRatio(-1)
+let isGap = mrc.gap(-1)
+let regime = kagi.regime()
+let choppy = regime == "choppy"
+let ebBar = effort.ohlc(-1)
+let ebDir = ebBar.c - ebBar.o
+let ebConfirmed = effort.confirmed(-1) and effort.ratio(-1) >= 1.0
+let ebBacksSameWay = ebConfirmed and ((d > 0 and ebDir > 0) or (d < 0 and ebDir < 0))
+let cleanMove = rr >= 1.0
+call when (not isGap) and (not choppy) and cleanMove and d > 0 and ebBacksSameWay and gate(0.6, payout.value, 0.0)
+put when (not isGap) and (not choppy) and cleanMove and d < 0 and ebBacksSameWay and gate(0.6, payout.value, 0.0)
+confidence = 62
+expiry = 1
+```
+
+Verified by parsing and evaluating against a deliberately noisy synthetic
+series across 60 seeds - fires selectively on both sides, no runtime
+errors. A synthetic series proves the script discriminates correctly
+between conditions; it CANNOT prove the underlying edge is profitable
+(that's exactly the kind of claim the original, broken version of this
+example made without justification) - only real/replayed history can.
+
 ---
 
-All 12 of the above were verified by parsing and evaluating each one with
+All 13 of the above were verified by parsing and evaluating each one with
 `evaluateStrategyScript()` against synthetic candle series and a synthetic
 tick buffer (the same smoke-test discipline this project uses before any
 primitive ships), confirming each one parses, evaluates without a runtime
