@@ -316,9 +316,65 @@ between conditions; it CANNOT prove the underlying edge is profitable
 (that's exactly the kind of claim the original, broken version of this
 example made without justification) - only real/replayed history can.
 
+## 14. Next-Expiry Oracle, 5-minute rung, structure- and participation-confirmed
+
+Purpose-built for exactly this job: `nextExpiry:5` reads the Next-Expiry
+Oracle's (`analytics/nextexpiry.ts`) fused 5-minute-horizon model (Markov
+H-E transitions, variance-ratio, OU half-life fade, run-length exhaustion,
+session drift - regime-weighted, not just averaged), with its own live
+per-(asset, 5m) calibration discount already applied to the confidence it
+reports - an oracle that's been wrong trading THIS pair at a 5-minute
+expiry specifically speaks more humbly about this pair at 5 minutes,
+without a script having to know that discount happened. `.value` is a real
+win probability (`pWin`), not a proxy - feeds `gate()` directly.
+
+Two filters layered on top, for the same reason longer holds need more
+structural confirmation than a 1-minute scalp: a 5-minute hold has to
+survive a lot more can-happen-in-between than a 1-minute one does.
+
+1. **Kagi regime != "choppy"** - skip whenever the tape's reversal density
+   says there's too much whipsaw for a 5-minute directional hold to have a
+   fair run.
+2. **Effort Bricks agrees** - the oracle's own statistical read and an
+   independent volume-confirmation engine pointing the same way is real
+   confluence from two different lenses, not just one model being
+   confident in itself.
+
+```
+let oracleDir = nextExpiry:5.direction
+let oracleConf = nextExpiry:5.conf
+let pWin = nextExpiry:5.value
+let regime = kagi.regime()
+let notChoppy = regime != "choppy"
+let ebBar = effort.ohlc(-1)
+let ebDir = ebBar.c - ebBar.o
+let ebConfirmed = effort.confirmed(-1) and effort.ratio(-1) >= 1.0
+let ebAgrees = ebConfirmed and ((oracleDir == call and ebDir > 0) or (oracleDir == put and ebDir < 0))
+call when oracleDir == call and notChoppy and ebAgrees and gate(pWin, payout.value, 0.02)
+put when oracleDir == put and notChoppy and ebAgrees and gate(pWin, payout.value, 0.02)
+confidence = oracleConf
+expiry = 5
+```
+
+**Honesty note, stated plainly because it's the one real tradeoff here**:
+`nextExpiry:5` is a bare verdict-source identifier, not a raw namespace
+call - per this project's own backtest-mechanism rule (`claude/chart-
+engine-roadmap-progress.md`), `meta_strategy_backtest`/`mslbacktest.ts`
+never replays a bare source at all, so this script can only be read LIVE,
+never walked bar-by-bar through the ordinary MSL backtester. The Oracle has
+its own SEPARATE offline-validation path (the Expiry Probability Surface's
+walk-forward replay, `claude/expiry-probability-surface-chart.md`) for
+judging its own historical accuracy - that's the right tool for validating
+this script's core signal, not `meta_strategy_backtest`.
+
+Verified by parsing and evaluating against a synthetic series and a
+synthetic `nextExpiry:5` reads-map stub across 40 seeds - fires correctly
+on `call`, correctly stands aside when regime/effort/gate don't clear, no
+runtime errors.
+
 ---
 
-All 13 of the above were verified by parsing and evaluating each one with
+All 14 of the above were verified by parsing and evaluating each one with
 `evaluateStrategyScript()` against synthetic candle series and a synthetic
 tick buffer (the same smoke-test discipline this project uses before any
 primitive ships), confirming each one parses, evaluates without a runtime
