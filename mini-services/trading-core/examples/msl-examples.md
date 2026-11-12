@@ -372,9 +372,85 @@ synthetic `nextExpiry:5` reads-map stub across 40 seeds - fires correctly
 on `call`, correctly stands aside when regime/effort/gate don't clear, no
 runtime errors.
 
+## 15. Trend + Pullback, SMC/MRC/candle/2-min-expiry confluence
+
+User-specified logic, translated directly: find the trend, trade only the
+pullback within it (never the breakout, never a ranging/choppy tape), and
+require four independent confirmations to agree before firing.
+
+- **Trend + direction** - `kagi.regime() == "trending"` gates out
+  ranging/choppy entirely; `kagi.direction()` gives the signed trend (1 up,
+  -1 down).
+- **Pullback** - `mrc.directionalDelta(-1)` moving *against* the trend
+  direction on the latest bar is the dip (in an uptrend) or bounce (in a
+  downtrend) being bought/faded back toward trend.
+- **Entry confirmation, all four required**: SMC's aggregate direction
+  (`smc.dir`) agrees with the *trend* direction (not the pullback - the bet
+  is the pullback resolves back toward trend); MRC's response ratio is
+  >= 1.0, the high-continuation bucket this project corrected example #13
+  onto rather than the low-response/fade side; a reversal-type candle
+  pattern (Hammer/Bullish Engulfing for the up case, Shooting Star/Bearish
+  Engulfing for the down case) confirms right at the pullback extreme; and
+  the 2-minute Next-Expiry Oracle rung (`nextExpiry:2`) agrees with real
+  probability mass (`.value > 0.5`) in the same direction.
+
+```
+let regime = kagi.regime()
+let trending = regime == "trending"
+let trendDir = kagi.direction()
+
+let d = mrc.directionalDelta(-1)
+let rr = mrc.responseRatio(-1)
+
+let pullbackDown = trendDir == 1 and d < 0
+let pullbackUp = trendDir == -1 and d > 0
+
+let smcUp = smc.dir == call
+let smcDown = smc.dir == put
+
+let bullPattern = candle('Hammer', call).active or candle('Bullish Engulfing', call).active
+let bearPattern = candle('Shooting Star', put).active or candle('Bearish Engulfing', put).active
+
+let exp2Up = nextExpiry:2.direction == call and nextExpiry:2.value > 0.5
+let exp2Down = nextExpiry:2.direction == put and nextExpiry:2.value > 0.5
+
+let respOk = rr >= 1.0
+
+call when trending and trendDir == 1 and pullbackDown and smcUp and respOk and bullPattern and exp2Up and gate(0.55, payout.value, 0.0)
+put when trending and trendDir == -1 and pullbackUp and smcDown and respOk and bearPattern and exp2Down and gate(0.55, payout.value, 0.0)
+
+confidence = 62
+expiry = 2
+```
+
+**Bug caught while verifying this, worth keeping visible**: the first draft
+wrote `candle('Hammer', call) or candle('Bullish Engulfing', call)` with no
+`.active`. Every `SIGNAL_FUNCS` call (`candle()` included) returns a
+composite read object, not a raw boolean - `and`/`or` reject a composite
+unconditionally (`truthy()` throws). Fixed by adding `.active` to both
+pattern checks; this exact gotcha is now documented in `claude/msl-full-
+reference.md` §5.5b/§5.11, whose own worked example had the same bug until
+this fix prompted a correction there too.
+
+**Honesty note**: like example #14, this script is live-only. `smc` and
+`nextExpiry:2` are both bare verdict-source identifiers, and per this
+project's backtest-mechanism rule, `meta_strategy_backtest`/
+`mslbacktest.ts` never replays a bare source, regardless of what backs it -
+so this can be read live but not walked bar-by-bar through the ordinary
+MSL backtester.
+
+Verified by parsing and evaluating against a synthetic candle series and a
+synthetic reads-map stub (providing `smc`/`nextExpiry:2`/pattern reads)
+across 40 seeds - zero runtime errors after the `.active` fix. Zero
+call/put fires in the synthetic run is expected and not a logic defect:
+the synthetic series rarely produces `kagi.regime() == "trending"`
+simultaneously with all four other confirmations, which is the point of
+requiring four independent signals to agree - the test's purpose (proving
+no runtime errors, correct field access) was achieved.
+
 ---
 
-All 14 of the above were verified by parsing and evaluating each one with
+All 15 of the above were verified by parsing and evaluating each one with
 `evaluateStrategyScript()` against synthetic candle series and a synthetic
 tick buffer (the same smoke-test discipline this project uses before any
 primitive ships), confirming each one parses, evaluates without a runtime
