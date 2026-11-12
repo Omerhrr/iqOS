@@ -4921,6 +4921,10 @@ export interface MetaTraderConfig {
   /** per-asset cooldown in seconds after a placed trade - no hard floor. */
   cooldownSec: number
   stakePlan?: MetaStakePlan
+  /** explicit watchlist override - undefined/empty = the same liquid-first
+   * default pool, market-wide. Set = scan ONLY these tickers. Same
+   * override Omni Trader's own `assets` field already has. */
+  assets?: string[]
 }
 
 export interface MetaTraderRuntime {

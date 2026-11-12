@@ -259,6 +259,14 @@ export interface MetaTraderConfig {
   cooldownSec: number
   /** optional compounding plan - undefined (default) = fixed `stake` every trade. */
   stakePlan?: MetaStakePlan
+  /** Explicit watchlist override - undefined/empty (default) = the same
+   * liquid-first default pool (LIQUID_CANDIDATES first, then every other
+   * open ticker), market-wide, exactly like before this field existed.
+   * When set, candidatePool() scans ONLY these tickers (still filtered by
+   * marketScope/open/cooldown/rejected, same as the default pool) - same
+   * override contract Omni Trader's own `assets` field already uses
+   * (plugins/omnitrader.ts), ported here per direct instruction. */
+  assets?: string[]
 }
 
 export interface MetaTraderRuntime {
@@ -405,7 +413,11 @@ export class MetaTraderService {
         marketScope: saved.marketScope === 'real' || saved.marketScope === 'otc' ? saved.marketScope : 'all',
         cooldownSec: Math.max(0, Math.round(num(saved.cooldownSec, DEFAULT_META_TRADER.cooldownSec))),
         stakePlan: MetaTraderService.sanitizeStakePlan(saved.stakePlan),
+        assets: Array.isArray(saved.assets)
+          ? (saved.assets as unknown[]).map((a) => String(a).trim().toUpperCase()).filter((a) => a.length > 0)
+          : undefined,
       }
+      if (this.config.assets && this.config.assets.length === 0) this.config.assets = undefined
       const rt = saved.rt as Record<string, unknown> | undefined
       if (rt && typeof rt === 'object') {
         this.rt.pot = Math.max(0, num(rt.pot, 0))
@@ -766,8 +778,23 @@ export class MetaTraderService {
         this.rt.halted = false
       }
     }
+    // Watchlist override - same contract as Omni Trader's own `assets`
+    // field (plugins/omnitrader.ts): a non-empty array scans ONLY those
+    // tickers; an empty array or null clears back to the default
+    // liquid-first, market-wide pool. A different watchlist is a
+    // different candidate universe - rearm for the same reason a
+    // different metaStrategyId/tf does above (P1 AUDIT: a held/edge
+    // verdict from the OLD universe would be meaningless carried over).
+    if (patch.assets !== undefined) {
+      const next = Array.isArray(patch.assets)
+        ? patch.assets.map((a) => String(a).trim().toUpperCase()).filter((a) => a.length > 0)
+        : []
+      const changed = JSON.stringify(next) !== JSON.stringify(this.config.assets ?? [])
+      this.config.assets = next.length ? next : undefined
+      if (changed) this.sweepEdge.rearm()
+    }
     this.persist()
-    this.ctx.log('meta-trader', `config updated - ${this.config.enabled ? 'armed' : 'off'} · src ${this.config.signalSource} · ${this.config.tf} · stake $${this.config.stake} · maxOpen ${this.config.maxOpen}`)
+    this.ctx.log('meta-trader', `config updated - ${this.config.enabled ? 'armed' : 'off'} · src ${this.config.signalSource} · ${this.config.tf} · stake $${this.config.stake} · maxOpen ${this.config.maxOpen} · watchlist ${this.config.assets?.length ? this.config.assets.join(',') : '(default)'}`)
     return this.config
   }
 
@@ -776,7 +803,12 @@ export class MetaTraderService {
   private candidatePool(): string[] {
     const open = this.market.listAssets().filter((a) => a.open && (this.config.marketScope === 'all' || (this.config.marketScope === 'otc') === Boolean(a.otc)))
     const tickers = open.map((a) => a.ticker)
-    const ordered = [...LIQUID_CANDIDATES.filter((a) => tickers.includes(a)), ...tickers.filter((a) => !LIQUID_CANDIDATES.includes(a))]
+    // Watchlist override (same contract as Omni Trader's `assets` field) -
+    // when set, scan ONLY these tickers (still market-scope/open filtered
+    // above), in the order the operator listed them. Empty/undefined falls
+    // through to the same liquid-first, market-wide default as before.
+    const configured = this.config.assets?.length ? this.config.assets.filter((a) => tickers.includes(a)) : undefined
+    const ordered = configured ?? [...LIQUID_CANDIDATES.filter((a) => tickers.includes(a)), ...tickers.filter((a) => !LIQUID_CANDIDATES.includes(a))]
     return ordered
       .slice(0, MAX_TICK_CANDIDATES)
       .filter((a) => !this.hasOpenOn(a))

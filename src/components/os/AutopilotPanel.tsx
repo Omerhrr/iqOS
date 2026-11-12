@@ -3107,6 +3107,29 @@ function MetaTraderDialog({
               </p>
             </>
           )}
+
+          <div className="col-span-2">
+            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Watchlist override (optional)</Label>
+            <Input
+              value={(d.assets ?? []).join(', ')}
+              onChange={(e) =>
+                p({
+                  assets: e.target.value.trim()
+                    ? e.target.value
+                        .split(',')
+                        .map((a) => a.trim().toUpperCase())
+                        .filter(Boolean)
+                    : undefined,
+                })
+              }
+              placeholder="EURUSD, GBPUSD, XAUUSD (comma-separated - leave blank for the default liquid pool)"
+              className="mt-1 h-8 border-[#1c2739] bg-[#101828] font-mono text-[11px] text-[#e2e8f0]"
+            />
+            <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+              Leave blank to scan the same liquid-first default pool, market-wide, as before. Set it to scan ONLY
+              these tickers instead - same override Omni Trader's own watchlist field already gives you.
+            </p>
+          </div>
         </div>
 
         <DialogFooter className="mt-1 gap-2">
