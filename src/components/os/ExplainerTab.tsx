@@ -42,44 +42,65 @@ const leanChip = (lean: ExplainerLean, ok: boolean) => {
   return { text: '— flat', cls: 'border-[#3d4d66] text-[#7c8aa5]' }
 }
 
+const TONE = {
+  call: { border: 'border-emerald-500/40', head: 'bg-emerald-500/10', bar: 'bg-emerald-400', text: 'text-emerald-300', dot: 'bg-emerald-400' },
+  put: { border: 'border-rose-500/40', head: 'bg-rose-500/10', bar: 'bg-rose-400', text: 'text-rose-300', dot: 'bg-rose-400' },
+  flat: { border: 'border-[#2a3750]', head: 'bg-[#141d2e]', bar: 'bg-[#7c8aa5]', text: 'text-[#aab6cc]', dot: 'bg-[#7c8aa5]' },
+  off: { border: 'border-[#1c2739]', head: 'bg-[#0e1522]', bar: 'bg-[#3d4d66]', text: 'text-[#4b5a72]', dot: 'bg-[#3d4d66]' },
+}
+const PANEL_ACCENT: Record<ExplainerPanelId, string> = { smc: 'text-cyan-300', candle: 'text-amber-300', mrc: 'text-violet-300', swing: 'text-sky-300', technical: 'text-fuchsia-300' }
+
+function SectionLabel({ children }: { children: React.ReactNode }) {
+  return <div className="mb-1 mt-0.5 font-mono text-[8px] font-bold uppercase tracking-[0.14em] text-[#4b5a72]">{children}</div>
+}
+
 function PanelCard({ panel, read }: { panel: ExplainerPanel | undefined; read: ExplainerRead | null }) {
   const id = panel?.id
   const chip = panel ? leanChip(panel.lean, panel.ok) : leanChip('none', false)
+  const tone = !panel || !panel.ok ? TONE.off : panel.lean === 'call' ? TONE.call : panel.lean === 'put' ? TONE.put : TONE.flat
+  const pct = panel?.ok && panel.strength !== null ? Math.max(0, Math.min(100, panel.strength)) : 0
   return (
-    <div
-      className={`flex min-h-0 min-w-[210px] flex-1 flex-col rounded-lg border bg-[#0b111c] ${
-        panel?.ok && panel.lean === 'call' ? 'border-emerald-500/30' : panel?.ok && panel.lean === 'put' ? 'border-rose-500/30' : 'border-[#1c2739]'
-      }`}
-    >
-      <div className="flex items-center gap-1.5 border-b border-[#1c2739] px-2 py-1.5">
-        <span className="font-mono text-[10px] font-bold uppercase tracking-wider text-[#dbe4f0]">{id ? TITLE[id] : '…'}</span>
+    <div className={`flex min-h-0 min-w-[220px] flex-1 flex-col overflow-hidden rounded-lg border bg-[#0b111c] ${tone.border}`}>
+      <div className={`flex items-center gap-1.5 border-b border-[#1c2739] px-2 py-1.5 ${tone.head}`}>
+        <span className={`font-mono text-[11px] font-bold uppercase tracking-wider ${id ? PANEL_ACCENT[id] : 'text-[#7c8aa5]'}`}>{id ? TITLE[id] : '…'}</span>
         <span className={`ml-auto rounded border px-1.5 py-px font-mono text-[9px] font-bold uppercase tracking-wider ${chip.cls}`}>{chip.text}</span>
-        {panel?.ok && panel.strength !== null && (
-          <span className="font-mono text-[9px] text-[#7c8aa5]" title="the engine's own strength score - not a win probability">
-            {panel.strength}%
-          </span>
-        )}
       </div>
+      {panel?.ok && panel.strength !== null && (
+        <div className="flex items-center gap-1.5 px-2 pt-1.5" title="the engine's own strength score - not a win probability">
+          <span className="font-mono text-[8px] uppercase tracking-wider text-[#4b5a72]">strength</span>
+          <div className="h-1 flex-1 overflow-hidden rounded bg-[#141d2e]">
+            <div className={`h-full ${tone.bar}`} style={{ width: `${pct}%` }} />
+          </div>
+          <span className={`font-mono text-[9px] font-bold ${tone.text}`}>{panel.strength}%</span>
+        </div>
+      )}
       <div className="min-h-0 flex-1 space-y-1.5 overflow-auto p-2">
         {!panel ? (
           <div className="font-mono text-[9px] text-[#4b5a72]">reading…</div>
         ) : (
           <>
             {panel.id === 'swing' && read && (
-              <div className="rounded border border-[#141d2e] bg-[#080d16] p-1">
-                <ExplainerSwingChart chart={read.chart} asset={read.asset} />
-              </div>
+              <>
+                <SectionLabel>Chart</SectionLabel>
+                <div className="rounded border border-[#141d2e] bg-[#080d16] p-1">
+                  <ExplainerSwingChart chart={read.chart} asset={read.asset} />
+                </div>
+              </>
             )}
-            <p className={`text-[10.5px] font-medium leading-snug ${panel.ok ? 'text-[#dbe4f0]' : 'text-[#7c8aa5]'}`}>{panel.headline}</p>
+            <SectionLabel>Verdict</SectionLabel>
+            <p className={`text-[11px] font-semibold leading-snug ${panel.ok ? tone.text : 'text-[#7c8aa5]'}`}>{panel.headline}</p>
             {panel.reasons.length > 0 && (
-              <ul className="space-y-1">
-                {panel.reasons.map((r, i) => (
-                  <li key={i} className="flex gap-1.5 text-[9.5px] leading-snug text-[#7c8aa5]">
-                    <span className="mt-[3px] h-1 w-1 shrink-0 rounded-full bg-[#3d4d66]" />
-                    <span>{r}</span>
-                  </li>
-                ))}
-              </ul>
+              <>
+                <SectionLabel>Why</SectionLabel>
+                <ul className="space-y-1">
+                  {panel.reasons.map((r, k) => (
+                    <li key={k} className="flex gap-1.5 text-[10px] leading-snug text-[#aab6cc]">
+                      <span className={`mt-[4px] h-1.5 w-1.5 shrink-0 rounded-full ${tone.dot}`} />
+                      <span>{r}</span>
+                    </li>
+                  ))}
+                </ul>
+              </>
             )}
           </>
         )}
@@ -98,6 +119,7 @@ export default function ExplainerTab({ initialAsset, initialTf, assets, prices, 
   const [busy, setBusy] = useState(false)
   const [account, setAccount] = useState<AccountState | null>(null)
   const [prefill, setPrefill] = useState<TicketPrefill | null>(null)
+  const [ticketOpen, setTicketOpen] = useState(false)
 
   // remember this tab's own pair/tf across tab switches and reloads (per-viewer convenience only)
   useEffect(() => {
@@ -191,6 +213,7 @@ export default function ExplainerTab({ initialAsset, initialTf, assets, prices, 
       expiryBars: 1,
       source: `Explainer ${asset} ${tf}: ${summary.headline}`,
     })
+    setTicketOpen(true)
   }
 
   const gradeCls =
@@ -221,7 +244,16 @@ export default function ExplainerTab({ initialAsset, initialTf, assets, prices, 
           ))}
         </div>
         <span className="font-mono text-[9px] text-[#4b5a72]">{busy && !read ? 'reading…' : read ? `${read.bars} closed bars · live` : ''}</span>
-        <span className="ml-auto font-mono text-[8px] uppercase tracking-wider text-[#3d4d66]">own pair/tf - not the main chart</span>
+        <span className="ml-auto hidden font-mono text-[8px] uppercase tracking-wider text-[#3d4d66] md:inline">own pair/tf - not the main chart</span>
+        <button
+          type="button"
+          onClick={() => setTicketOpen((o) => !o)}
+          className={`rounded border px-2 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wider ${
+            ticketOpen ? 'border-cyan-500/50 bg-cyan-500/15 text-cyan-300' : 'border-[#2a3750] text-[#aab6cc] hover:border-cyan-500/40 hover:text-cyan-300'
+          }`}
+        >
+          {ticketOpen ? 'close ticket ✕' : 'trade ticket'}
+        </button>
       </div>
 
       {/* agreement strip */}
@@ -263,13 +295,20 @@ export default function ExplainerTab({ initialAsset, initialTf, assets, prices, 
           ))}
         </div>
 
-        <div className="flex w-[290px] shrink-0 flex-col gap-1.5 overflow-auto border-l border-[#1c2739] p-2">
-          <div className="rounded border border-[#1c2739] bg-[#080d16] px-2 py-1 font-mono text-[9px] text-[#7c8aa5]">
-            ticket pair: <span className="font-bold text-cyan-300">{asset}</span> · {tf}
-            <span className="text-[#4b5a72]"> (this tab&apos;s pair, not the main chart)</span>
+        {ticketOpen && (
+          <div className="flex w-[290px] shrink-0 flex-col gap-1.5 overflow-auto border-l border-[#1c2739] p-2">
+            <div className="flex items-center gap-2 rounded border border-cyan-500/30 bg-cyan-500/5 px-2 py-1 font-mono text-[9px] text-[#7c8aa5]">
+              <span className="min-w-0 flex-1">
+                ticket pair: <span className="font-bold text-cyan-300">{asset}</span> · {tf}
+                <span className="text-[#4b5a72]"> (this tab&apos;s pair, not the main chart)</span>
+              </span>
+              <button type="button" onClick={() => setTicketOpen(false)} className="shrink-0 rounded border border-[#2a3750] px-1.5 py-px text-[#aab6cc] hover:text-rose-300" aria-label="close ticket">
+                ✕
+              </button>
+            </div>
+            <TradeTicket asset={assetRow} tf={tf} price={livePrice} account={account} prefill={prefill} onPlaced={onPlaced} onError={onError} />
           </div>
-          <TradeTicket asset={assetRow} tf={tf} price={livePrice} account={account} prefill={prefill} onPlaced={onPlaced} onError={onError} />
-        </div>
+        )}
       </div>
 
       <p className="border-t border-[#1c2739] px-2 py-1 text-[8.5px] leading-relaxed text-[#3d4d66]">
