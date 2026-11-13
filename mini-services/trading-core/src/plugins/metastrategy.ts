@@ -341,6 +341,249 @@ function normalizeMetaId(id: string): string {
   return id.toLowerCase().replace(/^(?:meta:)+/, 'meta:')
 }
 
+/** The 15 verified MSL example scripts from examples/msl-examples.md,
+ * copied verbatim (final/corrected text - #13 is the corrected version,
+ * the original broken one is kept in that file only as a do-not-reuse
+ * record). seedBuiltinExamples() below turns each of these into a real
+ * persisted MetaStrategySpec on service start, idempotently. */
+const BUILTIN_EXAMPLE_SPECS: { id: string; name: string; script: string }[] = [
+  {
+    id: 'meta:builtin-renko-vp-poc',
+    name: 'Builtin: Renko trend + VP POC distance',
+    script: `
+let renkoUp = renko.bricks(1)[-1] > 0
+let distFromPoc = ohlc(-1).c - vp.poc()
+call when renkoUp and distFromPoc > 0 and gate(0.6, payout.value, 0.0)
+put when (not renkoUp) and distFromPoc < 0 and gate(0.6, payout.value, 0.0)
+confidence = 65
+`,
+  },
+  {
+    id: 'meta:builtin-delta-profile-vah-val',
+    name: 'Builtin: Delta Profile VAH/VAL breakout',
+    script: `
+let aboveVah = ohlc(-1).c > vp.vah()
+let bullSkew = dp.deltaSkew() > 0.1
+call when aboveVah and bullSkew
+let belowVal = ohlc(-1).c < vp.val()
+let bearSkew = dp.deltaSkew() < -0.1
+put when belowVal and bearSkew
+confidence = 60
+`,
+  },
+  {
+    id: 'meta:builtin-expiry-momentum-stagnation',
+    name: 'Builtin: Expiry-aligned momentum, stagnation-gated',
+    script: `
+let mom = nearExpiry.momentum(5)
+let stagOk = not nearExpiry.stagnation(5)
+call when mom > 0.1 and stagOk
+put when mom < -0.1 and stagOk
+confidence = 55
+`,
+  },
+  {
+    id: 'meta:builtin-otc-weekend-baseline-fade',
+    name: 'Builtin: OTC weekend baseline deviation fade',
+    script: `
+let weekendOtc = otc.value == 1 and session.value == 1
+let dev = baseline.deviationPct()
+call when weekendOtc and dev < -1.5
+put when weekendOtc and dev > 1.5
+confidence = 50
+`,
+  },
+  {
+    id: 'meta:builtin-footprint-absorption-kagi',
+    name: 'Builtin: Footprint absorption fade, Kagi-filtered',
+    script: `
+let absorbedBuy = foot.absorption() == "buy"
+let kagiDown = kagi.direction() < 0
+put when absorbedBuy and kagiDown
+let absorbedSell = foot.absorption() == "sell"
+let kagiUp = kagi.direction() > 0
+call when absorbedSell and kagiUp
+confidence = 55
+`,
+  },
+  {
+    id: 'meta:builtin-candle-completion-prob',
+    name: 'Builtin: Candle-completion probability, EV-gated',
+    script: `
+let prob = nearExpiry.completionProb(0.5)
+let dir = nearExpiry.completionDir(0.5)
+call when dir == "call" and gate(prob, payout.value, 0.01)
+put when dir == "put" and gate(prob, payout.value, 0.01)
+confidence = prob * 100
+`,
+  },
+  {
+    id: 'meta:builtin-mrc-response-fade',
+    name: 'Builtin: MRC response-efficiency fade (Phase 3)',
+    script: `
+let d = mrc.directionalDelta(-1)
+let rr = mrc.responseRatio(-1)
+let isGap = mrc.gap(-1)
+call when (not isGap) and rr < 0.6 and d < 0 and gate(0.55, payout.value, 0.0)
+put when (not isGap) and rr < 0.6 and d > 0 and gate(0.55, payout.value, 0.0)
+confidence = 55
+expiry = 1
+`,
+  },
+  {
+    id: 'meta:builtin-mrc-effort-continuation',
+    name: 'Builtin: MRC clean-move continuation + Effort Bricks',
+    script: `
+let mrcUp = mrc.directionalDelta(-1) > 0
+let mrcStrong = mrc.responseRatio(-1) >= 1.0
+let ebBar = effort.ohlc(-1)
+let ebConfirmed = effort.ratio(-1) >= 1.0
+call when mrcUp and mrcStrong and ebConfirmed and (ebBar.c - ebBar.o) > 0 and gate(0.6, payout.value, 0.0)
+put when (not mrcUp) and mrcStrong and ebConfirmed and (ebBar.c - ebBar.o) < 0 and gate(0.6, payout.value, 0.0)
+confidence = 65
+expiry = 1
+`,
+  },
+  {
+    id: 'meta:builtin-outcome-memory',
+    name: 'Builtin: Historical Outcome Memory, payout-gated',
+    script: `
+call when outcomeMemory.value > 0.5 and gate(outcomeMemory.value, payout.value, 0.02)
+put when outcomeMemory.value < 0.5 and gate(1 - outcomeMemory.value, payout.value, 0.02)
+confidence = outcomeMemory.conf
+expiry = 1
+`,
+  },
+  {
+    id: 'meta:builtin-pulse-vector-exhaustion',
+    name: 'Builtin: Pulse-Vector exhaustion fade',
+    script: `
+let dir = pulse.displacement(-1)
+let ex = pulse.exhaustion(-1)
+let sparse = pulse.sparse(-1)
+call when (not sparse) and dir < 0 and ex >= 0.6 and gate(0.55, payout.value, 0.0)
+put when (not sparse) and dir > 0 and ex >= 0.6 and gate(0.55, payout.value, 0.0)
+confidence = 55
+expiry = 1
+`,
+  },
+  {
+    id: 'meta:builtin-liquidity-spring',
+    name: 'Builtin: Liquidity Spring reversion, payout-gated',
+    script: `
+let snap = spring.snap(-1)
+let stretchedUp = spring.deviation(-1) > 0
+call when snap and (not stretchedUp) and gate(0.55, payout.value, 0.0)
+put when snap and stretchedUp and gate(0.55, payout.value, 0.0)
+confidence = 55
+expiry = 1
+`,
+  },
+  {
+    id: 'meta:builtin-volatility-echo-coil',
+    name: 'Builtin: Volatility Echo coil-then-break continuation',
+    script: `
+let pierced = echo.pierced(-1)
+let wasSqueezed = echo.squeeze(-2)
+call when pierced == "up" and wasSqueezed and gate(0.55, payout.value, 0.0)
+put when pierced == "down" and wasSqueezed and gate(0.55, payout.value, 0.0)
+confidence = 58
+expiry = 1
+`,
+  },
+  {
+    id: 'meta:builtin-mrc-response-continuation-corrected',
+    name: 'Builtin: MRC response-efficiency continuation (corrected #13)',
+    script: `
+let d = mrc.directionalDelta(-1)
+let rr = mrc.responseRatio(-1)
+let isGap = mrc.gap(-1)
+let regime = kagi.regime()
+let choppy = regime == "choppy"
+let ebBar = effort.ohlc(-1)
+let ebDir = ebBar.c - ebBar.o
+let ebConfirmed = effort.confirmed(-1) and effort.ratio(-1) >= 1.0
+let ebBacksSameWay = ebConfirmed and ((d > 0 and ebDir > 0) or (d < 0 and ebDir < 0))
+let cleanMove = rr >= 1.0
+call when (not isGap) and (not choppy) and cleanMove and d > 0 and ebBacksSameWay and gate(0.6, payout.value, 0.0)
+put when (not isGap) and (not choppy) and cleanMove and d < 0 and ebBacksSameWay and gate(0.6, payout.value, 0.0)
+confidence = 62
+expiry = 1
+`,
+  },
+  {
+    id: 'meta:builtin-next-expiry-oracle-5m',
+    name: 'Builtin: Next-Expiry Oracle 5m, structure + participation confirmed',
+    script: `
+let oracleDir = nextExpiry:5.direction
+let oracleConf = nextExpiry:5.conf
+let pWin = nextExpiry:5.value
+let regime = kagi.regime()
+let notChoppy = regime != "choppy"
+let ebBar = effort.ohlc(-1)
+let ebDir = ebBar.c - ebBar.o
+let ebConfirmed = effort.confirmed(-1) and effort.ratio(-1) >= 1.0
+let ebAgrees = ebConfirmed and ((oracleDir == call and ebDir > 0) or (oracleDir == put and ebDir < 0))
+call when oracleDir == call and notChoppy and ebAgrees and gate(pWin, payout.value, 0.02)
+put when oracleDir == put and notChoppy and ebAgrees and gate(pWin, payout.value, 0.02)
+confidence = oracleConf
+expiry = 5
+`,
+  },
+  {
+    id: 'meta:builtin-trend-pullback-confluence',
+    name: 'Builtin: Trend + pullback, SMC/MRC/candle/2m-expiry confluence',
+    script: `
+let regime = kagi.regime()
+let trending = regime == "trending"
+let trendDir = kagi.direction()
+
+let d = mrc.directionalDelta(-1)
+let rr = mrc.responseRatio(-1)
+
+let pullbackDown = trendDir == 1 and d < 0
+let pullbackUp = trendDir == -1 and d > 0
+
+# --- BOS confirmation, filtered against the three common false-BOS causes ---
+let bosUp = smc:BOS.dir == call
+let bosDown = smc:BOS.dir == put
+let bosDisplaced = ohlc(-1).range >= ind.atr(14)[-1] * 1.0        # real displacement, not a wick clip
+let bosParticipation = effort.confirmed(-1) and effort.ratio(-1) >= 1.0  # real volume behind the break
+let ebBar = effort.ohlc(-1)
+let ebDir = ebBar.c - ebBar.o
+let bosConfirmedUp = bosUp and bosDisplaced and bosParticipation and ebDir > 0
+let bosConfirmedDown = bosDown and bosDisplaced and bosParticipation and ebDir < 0
+let bosHeldUp = since(smc:BOS.dir == call) >= 1    # held at least one closed bar, not an instant rejection
+let bosHeldDown = since(smc:BOS.dir == put) >= 1
+
+# --- CHoCH veto, unless a liquidity sweep explains it (stop-hunt, not a real flip) ---
+let chochAgainstUp = smc:CHOCH.active and smc:CHOCH.dir == put
+let chochAgainstDown = smc:CHOCH.active and smc:CHOCH.dir == call
+let sweepAgainstUp = smc:LIQUIDITY_SWEEP.active and smc:LIQUIDITY_SWEEP.dir == put
+let sweepAgainstDown = smc:LIQUIDITY_SWEEP.active and smc:LIQUIDITY_SWEEP.dir == call
+let chochVetoUp = chochAgainstUp and not sweepAgainstUp
+let chochVetoDown = chochAgainstDown and not sweepAgainstDown
+
+let smcUp = smc.dir == call
+let smcDown = smc.dir == put
+
+let bullPattern = candle('Hammer', call).active or candle('Bullish Engulfing', call).active
+let bearPattern = candle('Shooting Star', put).active or candle('Bearish Engulfing', put).active
+
+let exp2Up = nextExpiry:2.direction == call and nextExpiry:2.value > 0.5
+let exp2Down = nextExpiry:2.direction == put and nextExpiry:2.value > 0.5
+
+let respOk = rr >= 1.0
+
+call when trending and trendDir == 1 and pullbackDown and smcUp and bosConfirmedUp and bosHeldUp and not chochVetoUp and respOk and bullPattern and exp2Up and gate(0.55, payout.value, 0.0)
+put when trending and trendDir == -1 and pullbackUp and smcDown and bosConfirmedDown and bosHeldDown and not chochVetoDown and respOk and bearPattern and exp2Down and gate(0.55, payout.value, 0.0)
+
+confidence = 62
+expiry = 2
+`,
+  },
+]
+
 export class MetaStrategyService {
   private ctx!: KernelContext
   private market!: MarketDataService
@@ -357,7 +600,44 @@ export class MetaStrategyService {
     this.ctx = ctx
     this.market = ctx.use<MarketDataService>('market')
     this.load()
-    ctx.log('meta-strategy', `meta-strategy library online (${this.specs.size} saved, sources: ${META_CONDITION_SOURCES.join('/')})`)
+    const seeded = this.seedBuiltinExamples()
+    ctx.log('meta-strategy', `meta-strategy library online (${this.specs.size} saved, +${seeded} builtin examples seeded this start, sources: ${META_CONDITION_SOURCES.join('/')})`)
+  }
+
+  /** Makes the 15 verified MSL example scripts (examples/msl-examples.md,
+   * each one previously only readable as markdown reference text) actually
+   * selectable in Bots and the OS Auto Trader, which both already consume
+   * `meta:`-prefixed ids from THIS library the moment one exists here - the
+   * gap was never on the consumption side, only that nothing had ever
+   * called save() for them (per direct instruction: "our builtin meta
+   * strategy are not available in bots and in auto trader").
+   *
+   * Idempotent by id (`meta:builtin-<slug>`) and skip-if-present - never
+   * overwrites a spec a user may have since edited under one of these ids,
+   * and safe to call on every start() without growing or re-touching
+   * updatedTs on specs that are already there. Bodies here are copied
+   * verbatim from msl-examples.md's FINAL/corrected text (example #13 is
+   * the corrected version, not the original broken one the file itself
+   * keeps on record as a do-not-reuse warning). #14/#15 read bare verdict-
+   * source identifiers (nextExpiry:5, nextExpiry:2, smc:BOS/CHOCH/
+   * LIQUIDITY_SWEEP) - live-only, same as in the examples file, never
+   * walked by meta_strategy_backtest. */
+  private seedBuiltinExamples(): number {
+    let seeded = 0
+    for (const ex of BUILTIN_EXAMPLE_SPECS) {
+      if (this.specs.has(normalizeMetaId(ex.id))) continue
+      try {
+        this.save({ id: ex.id, name: ex.name, mode: 'all', conditions: [], script: ex.script })
+        seeded++
+      } catch (err) {
+        // a seed script failing to parse is a bug in THIS file, not a
+        // reason to crash the service - log it loudly and keep going so
+        // the other 14 still seed.
+        this.ctx.log('meta-strategy', `builtin example seed FAILED for ${ex.id}: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+    if (seeded) this.persist()
+    return seeded
   }
 
   private load(): void {
