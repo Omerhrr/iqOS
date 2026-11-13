@@ -72,6 +72,8 @@ interface BottomTabsProps {
   refreshBots: () => void
   refreshAccount: () => void
   onSelectSetup: (asset: string, tf: Timeframe) => void
+  /** set the app's main pair (chart, SMC, Explainer follow) */
+  onSelectAsset?: (asset: string) => void
   onError: (m: string) => void
 }
 
@@ -416,6 +418,7 @@ export default function BottomTabs(props: BottomTabsProps) {
       {/* SMART MONEY CONCEPTS / ICT STRUCTURE */}
       <TabsContent value="signal" className="mt-0 min-h-0 flex-1 overflow-hidden">
         <SignalTab
+          onSelectAsset={props.onSelectAsset}
           initialAsset={asset}
           initialTf={props.tf}
           assets={props.assets}
@@ -449,7 +452,18 @@ export default function BottomTabs(props: BottomTabsProps) {
       </TabsContent>
 
       <TabsContent value="smc" className="mt-0 min-h-0 flex-1 overflow-hidden">
-        <SmcPanel asset={asset} tf={props.tf} closedTick={closedTick} onError={onError} />
+        <SmcPanel
+          asset={asset}
+          tf={props.tf}
+          closedTick={closedTick}
+          onError={onError}
+          assets={props.assets}
+          prices={prices}
+          onPlaced={() => {
+            refreshPositions()
+            props.refreshAccount()
+          }}
+        />
       </TabsContent>
 
       {/* META-STRATEGY BUILDER (panel-combinator strategies) */}

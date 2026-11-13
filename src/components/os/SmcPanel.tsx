@@ -21,14 +21,19 @@
 // timezone conversion, so it's a fixed UTC-hour proxy). Both say so in
 // their own note text and tooltip.
 import { useEffect, useState } from 'react'
-import type { SmcKind, SmcScanResponse, SmcSignal, Timeframe } from '@/lib/os/client'
-import { fmtPrice, getSmcScan } from '@/lib/os/client'
+import type { AccountState, AssetRow, Position, SmcKind, SmcScanResponse, SmcSignal, Timeframe } from '@/lib/os/client'
+import { fmtPrice, getSmcScan, osGet } from '@/lib/os/client'
+import TradeTicket, { type TicketPrefill } from './TradeTicket'
 
 interface SmcPanelProps {
   asset: string
   tf: Timeframe
   closedTick?: number
   onError: (m: string) => void
+  /** with these three the panel gets the app's normal trade ticket (hidden until opened) */
+  assets?: AssetRow[]
+  prices?: Record<string, { price: number; dir: number }>
+  onPlaced?: (p: Position) => void
 }
 
 const KIND_LABEL: Record<SmcKind, string> = {
@@ -110,8 +115,34 @@ function SignalRow({ s, price, asset }: { s: SmcSignal; price: number; asset: st
   )
 }
 
-export default function SmcPanel({ asset, tf, closedTick, onError }: SmcPanelProps) {
+export default function SmcPanel({ asset, tf, closedTick, onError, assets, prices, onPlaced }: SmcPanelProps) {
   const [data, setData] = useState<SmcScanResponse | null>(null)
+  const [ticketOpen, setTicketOpen] = useState(false)
+  const [prefill, setPrefill] = useState<TicketPrefill | null>(null)
+  const [account, setAccount] = useState<AccountState | null>(null)
+  const ticketAvailable = Boolean(assets && onPlaced)
+
+  // the ticket belongs to the pair on screen: a pair change drops any highlighted side
+  useEffect(() => {
+    setPrefill(null)
+  }, [asset])
+
+  useEffect(() => {
+    if (!ticketAvailable || !ticketOpen) return
+    let alive = true
+    const readAcct = () =>
+      osGet<AccountState>('/account')
+        .then((a) => {
+          if (alive) setAccount(a)
+        })
+        .catch(() => {})
+    void readAcct()
+    const t = setInterval(readAcct, 10_000)
+    return () => {
+      alive = false
+      clearInterval(t)
+    }
+  }, [ticketAvailable, ticketOpen])
   const [busy, setBusy] = useState(false)
   const [filter, setFilter] = useState<Set<SmcKind>>(new Set())
   const [onlyActive, setOnlyActive] = useState(true)
@@ -156,8 +187,18 @@ export default function SmcPanel({ asset, tf, closedTick, onError }: SmcPanelPro
     })
   }
 
+  const assetRow = assets?.find((a) => a.ticker === asset)
+  const livePrice = prices?.[asset]?.price ?? result?.price ?? assetRow?.price ?? 0
+  const lean = result && result.summary.direction !== 'none' ? result.summary.direction : null
+  const loadLean = () => {
+    if (!lean) return
+    setPrefill({ nonce: Date.now(), kind: 'binary', side: lean, expiryBars: 1, source: `SMC ${asset} ${tf}: lean ${lean} ${result?.summary.confidence ?? 0}%` })
+    setTicketOpen(true)
+  }
+
   return (
-    <div className="flex h-full min-h-0 flex-col rounded-lg border border-[#1c2739] bg-[#0b111c]">
+    <div className="flex h-full min-h-0 rounded-lg border border-[#1c2739] bg-[#0b111c]">
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <div className="flex flex-wrap items-center gap-1.5 border-b border-[#1c2739] px-2 py-1.5">
         <span className="text-[10px] font-bold uppercase tracking-wider text-cyan-300">Smart Money Concepts</span>
         <span className="rounded border border-cyan-500/40 bg-cyan-500/10 px-1 py-px font-mono text-[8px] font-bold uppercase text-cyan-300">
@@ -187,6 +228,15 @@ export default function SmcPanel({ asset, tf, closedTick, onError }: SmcPanelPro
           <input type="checkbox" checked={onlyActive} onChange={(e) => setOnlyActive(e.target.checked)} className="accent-cyan-500" />
           active only
         </label>
+        {ticketAvailable && (
+          <button
+            type="button"
+            onClick={() => setTicketOpen((o) => !o)}
+            className={`rounded border px-2 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wider ${ticketOpen ? 'border-cyan-500/50 bg-cyan-500/15 text-cyan-300' : 'border-[#2a3750] text-[#aab6cc] hover:border-cyan-500/40 hover:text-cyan-300'}`}
+          >
+            {ticketOpen ? 'close ticket ✕' : 'trade ticket'}
+          </button>
+        )}
       </div>
 
       <div className="flex flex-wrap gap-1 border-b border-[#1c2739] px-2 py-1">
@@ -224,6 +274,31 @@ export default function SmcPanel({ asset, tf, closedTick, onError }: SmcPanelPro
       <p className="border-t border-[#1c2739] px-2 py-1 text-[8.5px] leading-relaxed text-[#3d4d66]">
         Detection-only - not fed into the Next-Candle Oracle yet. <span className="text-amber-400">*</span> KRM and Silver Bullet are explicit interpretations/approximations (hover their label). Scans the chart&apos;s own asset + timeframe, refreshes every ~8s or on a closed candle.
       </p>
+    </div>
+    {ticketAvailable && ticketOpen && (
+      <div className="flex w-[290px] shrink-0 flex-col gap-1.5 overflow-auto border-l border-[#1c2739] p-2">
+        <div className="flex items-center gap-2 rounded border border-cyan-500/30 bg-cyan-500/5 px-2 py-1 font-mono text-[9px] text-[#7c8aa5]">
+          <span className="min-w-0 flex-1">
+            ticket pair: <span className="font-bold text-cyan-300">{asset}</span> · {tf}
+            <span className="text-[#4b5a72]"> (the chart&apos;s pair)</span>
+          </span>
+          <button type="button" onClick={() => setTicketOpen(false)} className="shrink-0 rounded border border-[#2a3750] px-1.5 py-px text-[#aab6cc] hover:text-rose-300" aria-label="close ticket">
+            ✕
+          </button>
+        </div>
+        {lean && (
+          <button
+            type="button"
+            onClick={loadLean}
+            title="highlights this side on the ticket - nothing is placed until you press the ticket's own button"
+            className={`rounded border px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider ${lean === 'call' ? 'border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10' : 'border-rose-500/40 text-rose-300 hover:bg-rose-500/10'}`}
+          >
+            load SMC lean ({lean.toUpperCase()} {result?.summary.confidence}%) into ticket
+          </button>
+        )}
+        <TradeTicket asset={assetRow} tf={tf} price={livePrice} account={account} prefill={prefill} onPlaced={onPlaced as (p: Position) => void} onError={onError} />
+      </div>
+    )}
     </div>
   )
 }

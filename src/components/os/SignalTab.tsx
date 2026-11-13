@@ -20,6 +20,8 @@ import TradeTicket, { type TicketPrefill } from './TradeTicket'
 
 interface SignalTabProps {
   initialAsset: string
+  /** explicit user picks (selector, board rows) also move the app's main pair; auto-switches never do */
+  onSelectAsset?: (a: string) => void
   initialTf: Timeframe
   assets: AssetRow[]
   prices: Record<string, { price: number; dir: number }>
@@ -49,7 +51,7 @@ const actionTone = (a: 'buy' | 'sell' | 'wait') =>
 
 const REGIME_LABEL: Record<string, string> = { 'trend-up': 'trending up', 'trend-down': 'trending down', ranging: 'ranging', noise: 'noise', unreadable: 'not readable' }
 
-export default function SignalTab({ initialAsset, initialTf, assets, prices, closedTick, onPlaced, onError }: SignalTabProps) {
+export default function SignalTab({ onSelectAsset, initialAsset, initialTf, assets, prices, closedTick, onPlaced, onError }: SignalTabProps) {
   const tickers = useMemo(() => assets.map((a) => a.ticker), [assets])
   const [asset, setAsset] = useState(initialAsset)
   const [tf, setTf] = useState<Timeframe>(TFS.includes(initialTf) ? initialTf : '1m')
@@ -177,6 +179,7 @@ export default function SignalTab({ initialAsset, initialTf, assets, prices, clo
     setAuto(false)
     setSwitchNote(null)
     setAsset(a)
+    onSelectAsset?.(a)
   }
 
   const sig = read?.signal

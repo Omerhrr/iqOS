@@ -1462,6 +1462,7 @@ export default function OSPage() {
               refreshBots={loadBots}
               refreshAccount={loadAccount}
               onSelectSetup={handleSelectSetup}
+              onSelectAsset={handleSelectAsset}
               onError={(m) => pushToast('danger', m)}
             />
           </div>
@@ -2194,6 +2195,7 @@ export default function OSPage() {
                         refreshBots={loadBots}
                         refreshAccount={loadAccount}
                         onSelectSetup={handleSelectSetup}
+                        onSelectAsset={handleSelectAsset}
                         onError={(m) => pushToast('danger', m)}
                       />
                     </div>

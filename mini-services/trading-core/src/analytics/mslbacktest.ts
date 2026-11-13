@@ -254,6 +254,7 @@ function seriesUpTo(candles: Candle[], i: number): MslSeriesCtx {
     low: slice.map((c) => c.low),
     close: slice.map((c) => c.close),
     volume: slice.map((c) => c.volume ?? 0),
+    time: slice.map((c) => c.time),
   }
 }
 

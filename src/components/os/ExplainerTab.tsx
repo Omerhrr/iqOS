@@ -9,7 +9,7 @@
 // every other manual trade.
 // Backed by /explainer (analytics/explainer.ts, plugins/explainer.ts).
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { AccountState, AssetRow, ExplainerLean, ExplainerPanel, ExplainerPanelId, ExplainerRead, Position, Timeframe } from '@/lib/os/client'
 import { getExplainer, osGet } from '@/lib/os/client'
 import AssetPicker from './AssetPicker'
@@ -177,6 +177,16 @@ export default function ExplainerTab({ initialAsset, initialTf, assets, prices, 
   const [account, setAccount] = useState<AccountState | null>(null)
   const [prefill, setPrefill] = useState<TicketPrefill | null>(null)
   const [ticketOpen, setTicketOpen] = useState(false)
+
+  // follow the app's main pair when it changes later (e.g. a pick in the Signal tab);
+  // picks made here stay local. Skips the first render so the stored pair can still restore.
+  const lastGlobal = useRef(initialAsset)
+  useEffect(() => {
+    if (lastGlobal.current === initialAsset) return
+    lastGlobal.current = initialAsset
+    if (tickers.includes(initialAsset)) setAsset(initialAsset)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialAsset])
 
   // remember this tab's own pair/tf across tab switches and reloads (per-viewer convenience only)
   useEffect(() => {

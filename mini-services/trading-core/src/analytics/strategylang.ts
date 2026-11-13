@@ -242,6 +242,7 @@ import { computeLiquiditySpring } from './liquidityspring'
 import { computeVolatilityEcho } from './volatilityecho'
 import { computeTickFootprint } from './tickdesk'
 import { computeOutcomeMemory } from './outcomememory'
+import { readSignalCore, SIGNAL_MIN_BARS, type SignalCore } from './signalcore'
 
 export interface MslSourceRead {
   direction: 'call' | 'put' | 'none'
@@ -365,6 +366,11 @@ export interface MslSeriesCtx {
   low: number[]
   close: number[]
   volume: number[]
+  /** Candle open times (epoch seconds), one per bar. Optional: only the `signal.*`
+   * namespace needs them (SMC kill-zones key on the UTC hour, the bar length
+   * comes from the gaps). Every production producer fills it in; a context
+   * without it makes `signal.*` fail closed. */
+  time?: number[]
 }
 
 /** Bundles the three things every evalExpr/explainExpr call threads through
@@ -2116,6 +2122,105 @@ function outcomeMemoryMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: s
   }
 }
 
+/** `signal.*` - the Signal clock (analytics/signalcore.ts) as MSL primitives.
+ * Same pure function the Signal tab calls, run on this evaluation's own closed
+ * candles (last 240 bars), so a live script, the tab and a backtest agree
+ * bar for bar. Candle-derived only - works in meta_strategy_eval, Meta Trader,
+ * Omni Trader AND meta_strategy_backtest.
+ *
+ *   action()            "buy" | "sell" | "wait"        buy()/sell()/wait()  booleans
+ *   needle()            -100..+100 (held inside +/-30 while the call is WAIT)
+ *   raw()               the unclamped consensus score  strength()  |needle|, 0-100
+ *   regime()            "trend-up" | "trend-down" | "ranging" | "noise" | "unreadable"
+ *   trending()/ranging()/noise()  booleans   regimeScore()  rank score 0-100 (0 if unreadable)
+ *   er()/adx()/tStat()/position()  regime metrics (position: 0 = box bottom, 1 = top)
+ *   hold()/holdMin()    suggested expiry in bars / minutes (0 when the call is WAIT; named `hold`
+ *                       because `expiry` is a reserved script keyword)
+ *   calls()/puts()/flats()/unreadable()   how the six readers split
+ *   smcLean()/candleLean()/mrcLean()/swingLean()/technicalLean()/effortLean()   +1 / -1 / 0
+ *   smcStrength()... the reader's own 0-100 strength (0 when none)   smcOk()... readable?
+ *   ok()                enough closed bars (60+) to read at all
+ * Every method except ok() fails the script closed on too little history. */
+const signalCoreCache = new WeakMap<MslSeriesCtx, SignalCore | null>()
+const SIGNAL_READERS = ['smc', 'candle', 'mrc', 'swing', 'technical', 'effort']
+function signalMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  void args
+  const s = requireSeries(ctx, tf)
+  let core = signalCoreCache.get(s)
+  if (core === undefined) {
+    if (!s.time || s.time.length !== s.close.length) {
+      throw new MslRuntimeError('signal.*() needs candle timestamps, which this evaluation context does not carry')
+    }
+    const n = s.close.length
+    const candles: Candle[] = new Array(n)
+    for (let i = 0; i < n; i++) candles[i] = { time: s.time[i], open: s.open[i], high: s.high[i], low: s.low[i], close: s.close[i], volume: s.volume[i] }
+    core = readSignalCore(candles)
+    signalCoreCache.set(s, core)
+  }
+  if (name === 'ok') return core !== null
+  if (!core) throw new MslRuntimeError(`signal.${name}() needs at least ${SIGNAL_MIN_BARS} closed bars with real timestamps - history is too thin to read`)
+  const sig = core.signal
+  const rg = core.regime
+  const rd = /^(smc|candle|mrc|swing|technical|effort)(Lean|Strength|Ok)$/.exec(name)
+  if (rd) {
+    const e = sig.evidence.find((x) => x.id === rd[1])
+    if (!e) return rd[2] === 'Ok' ? false : 0
+    if (rd[2] === 'Ok') return e.ok
+    if (rd[2] === 'Strength') return e.ok && e.strength !== null ? e.strength : 0
+    return e.ok ? (e.lean === 'call' ? 1 : e.lean === 'put' ? -1 : 0) : 0
+  }
+  switch (name) {
+    case 'action':
+      return sig.action
+    case 'buy':
+      return sig.action === 'buy'
+    case 'sell':
+      return sig.action === 'sell'
+    case 'wait':
+      return sig.action === 'wait'
+    case 'needle':
+      return sig.needle
+    case 'raw':
+      return sig.rawNeedle
+    case 'strength':
+      return sig.strength
+    case 'regime':
+      return sig.regime
+    case 'trending':
+      return sig.regime === 'trend-up' || sig.regime === 'trend-down'
+    case 'ranging':
+      return sig.regime === 'ranging'
+    case 'noise':
+      return sig.regime === 'noise'
+    case 'regimeScore':
+      return rg ? rg.score : 0
+    case 'er':
+      return rg ? rg.er : 0
+    case 'adx':
+      return rg ? rg.adx : 0
+    case 'tStat':
+      return rg ? rg.tStat : 0
+    case 'position':
+      return rg ? rg.position : 0.5
+    case 'hold':
+      return sig.expiry ? sig.expiry.bars : 0
+    case 'holdMin':
+      return sig.expiry ? sig.expiry.minutes : 0
+    case 'calls':
+      return sig.readers.call
+    case 'puts':
+      return sig.readers.put
+    case 'flats':
+      return sig.readers.flat
+    case 'unreadable':
+      return sig.readers.unreadable
+    default:
+      throw new MslRuntimeError(
+        `unknown signal method "signal.${name}(...)" - use ok/action/buy/sell/wait/needle/raw/strength/regime/trending/ranging/noise/regimeScore/er/adx/tStat/position/hold/holdMin/calls/puts/flats/unreadable, or <reader>Lean/<reader>Strength/<reader>Ok for reader in ${SIGNAL_READERS.join('/')}`,
+      )
+  }
+}
+
 /** `renko.*`/`pf.*`/`ha.*`'s shared conversion - renkoBricks()/pointFigure()/
  * heikinAshiSeries() all want a real Candle[] (they only use .time to STAMP
  * their output, never to decide the math - brick/box/HA logic is pure
@@ -3180,6 +3285,12 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
         return outcomeMemoryMethod(e.name, args, ctx, tf)
+      }
+      // `signal.needle()` etc - the Signal clock (see signalMethod above).
+      if (e.obj.t === 'ident' && e.obj.name === 'signal' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return signalMethod(e.name, args, ctx, tf)
       }
       // `pulse.tickCount(-1)` etc - same namespace-marker special case,
       // same omni-trader-only contract (requireTicks() fails closed).

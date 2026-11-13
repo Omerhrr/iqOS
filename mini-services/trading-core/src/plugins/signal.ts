@@ -1,6 +1,6 @@
 // IQAIR//OS - Signal plugin (the clock)
 //
-// read(asset, tf): Explainer (five readers + Effort Renko) + the pair's regime
+// read(asset, tf): the Signal core (analytics/signalcore.ts: the five Explainer readers + Effort Renko + the pair's regime, from closed candles alone)
 //   -> analytics/signalclock.ts buildSignal() -> BUY / SELL / WAIT, needle,
 //   holding period. Closed candles only.
 // best(tf, current?): shortlists pairs from the Regime scan (the best trending
@@ -13,13 +13,12 @@
 import type { KernelContext, Plugin } from '../kernel'
 import type { Candle, Timeframe } from '../types'
 import { ALL_TIMEFRAMES, TIMEFRAME_SECONDS } from '../types'
-import { buildSignal, type SignalResult } from '../analytics/signalclock'
-import { classifyRegimeRow, MIN_BARS } from '../analytics/regimescan'
-import type { ExplainerService } from './explainer'
+import type { SignalResult } from '../analytics/signalclock'
+import { readSignalCore, SIGNAL_BARS, SIGNAL_MIN_BARS } from '../analytics/signalcore'
 import type { RegimeScanService, RegimeBoardRow } from './regimescan'
 import type { MarketDataService } from './market-data'
 
-const CANDLE_BARS = 150
+const CANDLE_BARS = SIGNAL_BARS
 const READ_TTL_MS = 8_000
 const BEST_TTL_MS = 8_000
 const MAX_TREND_PER_SIDE = 6
@@ -90,14 +89,18 @@ export class SignalService {
     return out
   }
 
+  /** The pure Signal core on the pair's closed candles - the exact function the MSL
+   * `signal.*` namespace and the MSL backtester call, so the dial, a live script and
+   * a replay agree for the same bars. */
   private compute(asset: string, tf: Timeframe): SignalRead | { ok: false; error: string } {
     try {
-      const ex = this.ctx.use<ExplainerService>('explainer').read(asset, tf)
-      if (!ex.ok) return { ok: false, error: ex.error }
       const candles: Candle[] = this.market.getCandlesDeep(asset, tf, CANDLE_BARS, true) ?? []
-      const regime = candles.length >= MIN_BARS ? classifyRegimeRow(candles) : null
-      const signal = buildSignal({ panels: ex.panels, effort: ex.effort, regime, candles, tfSec: TIMEFRAME_SECONDS[tf] })
-      return { ok: true, asset, tf, ts: Date.now(), price: ex.price, signal }
+      if (!candles.length) return { ok: false, error: 'not in the tracked universe' }
+      const core = readSignalCore(candles, { tfSec: TIMEFRAME_SECONDS[tf] })
+      if (!core) return { ok: false, error: `not enough closed ${tf} candles yet (${candles.length} of ${SIGNAL_MIN_BARS} needed)` }
+      const last = candles[candles.length - 1]
+      const price = this.market.getPrice(asset) || last.close
+      return { ok: true, asset, tf, ts: Date.now(), price, signal: core.signal }
     } catch (err) {
       return { ok: false, error: String(err instanceof Error ? err.message : err) }
     }

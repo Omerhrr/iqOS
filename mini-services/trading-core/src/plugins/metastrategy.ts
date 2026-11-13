@@ -2245,6 +2245,7 @@ export class MetaStrategyService {
         low: candles.map((k) => k.low),
         close: candles.map((k) => k.close),
         volume: candles.map((k) => k.volume ?? 0),
+        time: candles.map((k) => k.time),
       }
     } catch {
       return undefined
