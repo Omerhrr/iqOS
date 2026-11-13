@@ -243,6 +243,16 @@ import { computeVolatilityEcho } from './volatilityecho'
 import { computeTickFootprint } from './tickdesk'
 import { computeOutcomeMemory } from './outcomememory'
 import { readSignalCore, SIGNAL_MIN_BARS, type SignalCore } from './signalcore'
+import { AMD_MIN_BARS, readAmd, type AmdRead } from './mslamd'
+import { WYCKOFF_MIN_BARS, readWyckoff, type WyckoffRead } from './mslwyckoff'
+import {
+  FIB_MIN_BARS, FIB_RATIOS, VOL_MIN_BARS, fibSwing, fibRetr, fibExt, fibPos, fibArc, fibTimeZone, readPivots, readVol, type FibSwing,
+} from './mslfib'
+import {
+  MODEL_MIN_BARS, HURST_MIN_BARS, CM_MIN_BARS, STAT_NAMES, readOU, readMarkov, statValue, cmRead, cmHas, cmRevealedHas, cmDir, cmSmart,
+  type OUModel, type MarkovModel,
+} from './mslmodels'
+import { oscillatorVotes, maVotes, TECH_MIN_BARS, TECH_BARS_PER_RUNG, type TechVote } from './technicals'
 
 export interface MslSourceRead {
   direction: 'call' | 'put' | 'none'
@@ -2221,6 +2231,648 @@ function signalMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string |
   }
 }
 
+/** `tech.*` - the Technical Summary panel's PER-INDICATOR votes as MSL
+ * primitives. The very same `oscillatorVotes()` / `maVotes()` the panel runs
+ * (11 oscillators + the moving-average block), on this evaluation's own closed
+ * candles (last 260 bars, as the panel uses), so a script, the panel and a
+ * backtest agree bar for bar. Candle-derived only: works in meta_strategy_eval,
+ * Meta Trader, Omni Trader AND meta_strategy_backtest. Needs no timestamps.
+ * An indicator whose warm-up doesn't fit the history (SMA/EMA 200 on a short
+ * window) is EXCLUDED from the counts, never counted as neutral.
+ *
+ *   ok()                          40+ closed bars (every other method fails the script closed otherwise)
+ *   buys()/sells()/neutrals()/counted()      all votes (oscillators + MAs)
+ *   oscBuys()/oscSells()/oscNeutrals()/oscCounted()      oscillators only
+ *   maBuys()/maSells()/maNeutrals()/maCounted()          moving averages only
+ *   buyShare()/sellShare()        buys (or sells) / counted, 0..1 (0 when nothing counted)
+ *   oscBuyShare()/oscSellShare()/maBuyShare()/maSellShare()   same per block
+ *   score()                       (buys - sells) / counted, -1..+1 (the panel's own score)
+ *   allBuy()/allSell()            EVERY counted vote agrees (rare: one neutral breaks it)
+ *   oscAllBuy()/oscAllSell()/maAllBuy()/maAllSell()      same per block
+ *   <indicator>()                 that one indicator's vote: +1 buy / -1 sell / 0 neutral or n/a
+ *   <indicator>Ok()               did it have enough history to vote
+ *     indicators: rsi stoch cci adx ao momentum macd stochRsi williams bbp uo
+ *                 sma10 sma20 sma30 sma50 sma100 sma200 ema10 ema20 ema30 ema50 ema100 ema200 hma vwma ichimoku
+ * (per-indicator methods rather than vote("rsi"): a trailing string arg is parsed as a timeframe.) */
+const techCache = new WeakMap<MslSeriesCtx, { osc: Record<string, TechVote>; ma: Record<string, TechVote>; oscList: TechVote[]; maList: TechVote[] } | null>()
+function techKey(name: string): string {
+  if (/^Stoch RSI/.test(name)) return 'stochRsi'
+  if (/^Stoch %K/.test(name)) return 'stoch'
+  if (/^RSI/.test(name)) return 'rsi'
+  if (/^CCI/.test(name)) return 'cci'
+  if (/^ADX/.test(name)) return 'adx'
+  if (/^Awesome/.test(name)) return 'ao'
+  if (/^Momentum/.test(name)) return 'momentum'
+  if (/^MACD/.test(name)) return 'macd'
+  if (/^Williams/.test(name)) return 'williams'
+  if (/^Bull Bear/.test(name)) return 'bbp'
+  if (/^Ultimate/.test(name)) return 'uo'
+  const m = /^(SMA|EMA)\((\d+)\)$/.exec(name)
+  if (m) return m[1].toLowerCase() + m[2]
+  if (/^Hull/.test(name)) return 'hma'
+  if (/^VWMA/.test(name)) return 'vwma'
+  if (/^Ichimoku/.test(name)) return 'ichimoku'
+  return name.toLowerCase().replace(/[^a-z0-9]/g, '')
+}
+function techMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  void args
+  const s = requireSeries(ctx, tf)
+  let t = techCache.get(s)
+  if (t === undefined) {
+    if (s.close.length < TECH_MIN_BARS) t = null
+    else {
+      const all = seriesToCandles(s)
+      const bars = all.length > TECH_BARS_PER_RUNG ? all.slice(all.length - TECH_BARS_PER_RUNG) : all
+      const oscList = oscillatorVotes(bars)
+      const maList = maVotes(bars)
+      const osc: Record<string, TechVote> = {}
+      const ma: Record<string, TechVote> = {}
+      for (const v of oscList) osc[techKey(v.name)] = v
+      for (const v of maList) ma[techKey(v.name)] = v
+      t = { osc, ma, oscList, maList }
+    }
+    techCache.set(s, t)
+  }
+  if (name === 'ok') return t !== null
+  if (!t) throw new MslRuntimeError(`tech.${name}() needs at least ${TECH_MIN_BARS} closed bars - history is too thin to read`)
+  const cnt = (list: TechVote[]) => {
+    const buys = list.filter((v) => v.read === 'buy').length
+    const sells = list.filter((v) => v.read === 'sell').length
+    const neutrals = list.filter((v) => v.read === 'neutral').length
+    return { buys, sells, neutrals, counted: buys + sells + neutrals }
+  }
+  const blocks: Record<string, TechVote[]> = { '': [...t.oscList, ...t.maList], osc: t.oscList, ma: t.maList }
+  const g = /^(osc|ma)?(Buys|Sells|Neutrals|Counted|BuyShare|SellShare|AllBuy|AllSell)$/i.exec(name)
+  const gName = /^(osc|ma)?([a-z]+)$/i.exec(name)
+  if (g && gName) {
+    const blk = (g[1] ?? '').toLowerCase()
+    const what = g[2].toLowerCase()
+    const c = cnt(blocks[blk])
+    switch (what) {
+      case 'buys': return c.buys
+      case 'sells': return c.sells
+      case 'neutrals': return c.neutrals
+      case 'counted': return c.counted
+      case 'buyshare': return c.counted ? c.buys / c.counted : 0
+      case 'sellshare': return c.counted ? c.sells / c.counted : 0
+      case 'allbuy': return c.counted > 0 && c.buys === c.counted
+      case 'allsell': return c.counted > 0 && c.sells === c.counted
+    }
+  }
+  if (name === 'score') {
+    const c = cnt(blocks[''])
+    return c.counted ? (c.buys - c.sells) / c.counted : 0
+  }
+  const ok = /^(.+)Ok$/.exec(name)
+  const key = ok ? ok[1] : name
+  const v = t.osc[key] ?? t.ma[key]
+  if (!v) {
+    throw new MslRuntimeError(
+      `unknown tech method "tech.${name}(...)" - use ok/buys/sells/neutrals/counted/buyShare/sellShare/score/allBuy/allSell (prefix osc/ma for a block, e.g. oscBuys, maAllBuy), or an indicator: ${[...Object.keys(t.osc), ...Object.keys(t.ma)].join('/')} (+Ok suffix for "had enough history")`,
+    )
+  }
+  if (ok) return v.read !== 'na'
+  return v.read === 'buy' ? 1 : v.read === 'sell' ? -1 : 0
+}
+
+/** Shared "plain numeric args" reader for the model namespaces below. */
+function numArg(args: MslValue[], i: number): number | undefined {
+  return args[i] === undefined ? undefined : asNum(args[i])
+}
+
+/** `ou.*` - the Kalman / Ornstein-Uhlenbeck mean-reversion model (analytics/kalman.ts) as MSL primitives.
+ * Fits the OU process (AR(1) on price) over a rolling window and runs the OU-drift Kalman filter - the same
+ * numbers the Quant panel / `kalman-ou` chart overlay show. Candle-derived: works in meta_strategy_eval,
+ * Meta Trader, Omni Trader AND meta_strategy_backtest. An optional first numeric arg = fit window (30-240, default 240).
+ *   z()           stretch of price from the equilibrium in stationary sigmas (clamped +/-12)
+ *   theta()       OU equilibrium (long-run mean)      fair()    Kalman fair-value estimate of the latent level
+ *   upper(w?,k?)/lower(w?,k?)  theta +/- k*sigmaEq (k default 2)     sigma()   stationary std (price units)
+ *   halfLife()    reversion half-life in BARS (9999 = no reversion)   kappa()/phi()   speed / per-bar persistence
+ *   tStat()       significance of the reversion (1-phi)/se; ~2+ is "real"   r2()   AR(1) fit quality
+ *   reverting()   the model's own verdict that the pair is significantly mean-reverting right now
+ *   dfSignificant()  tStat >= 2.86 - the 5% Dickey-Fuller critical value for an AR(1) fit with a constant. USE THIS for "is the
+ *                 reversion statistically real": the app's own reverting() flag uses the looser t >= 1.5 (+ half-life <= 250) and
+ *                 passes roughly half of pure random walks, so it is a screen, not a test
+ *   stretchedAbove()/stretchedBelow()   |z| >= 1.5 from the equilibrium - z ONLY, it does NOT check reverting (combine it yourself)
+ *   signal()      "call" | "put" | "none": a stretch that ALSO passes reverting() (the app's own fade signal; loose gate, see above)
+ *   score()       the model's own 0-100 strength for that signal
+ *   innovation()  last standardized Kalman innovation (a surprise measure)   ok()   60+ closed bars */
+const ouCache = new WeakMap<MslSeriesCtx, Map<number, OUModel | null>>()
+function ouMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const s = requireSeries(ctx, tf)
+  const win = name === 'upper' || name === 'lower' ? numArg(args, 0) : numArg(args, 0)
+  const w = win === undefined ? 240 : Math.max(30, Math.min(240, Math.round(win)))
+  let byWin = ouCache.get(s)
+  if (!byWin) ouCache.set(s, (byWin = new Map()))
+  let m = byWin.get(w)
+  if (m === undefined) {
+    m = readOU(seriesToCandles(s), w)
+    byWin.set(w, m)
+  }
+  if (name === 'ok') return m !== null
+  if (!m) throw new MslRuntimeError(`ou.${name}() needs at least ${MODEL_MIN_BARS} closed bars - history is too thin to fit`)
+  switch (name) {
+    case 'z': return m.z
+    case 'theta': return m.theta
+    case 'fair': return m.fair
+    case 'sigma': return m.sigmaEq
+    case 'upper':
+    case 'lower': {
+      const k = numArg(args, 1)
+      const kk = k !== undefined && k > 0 ? k : 2
+      return name === 'upper' ? m.theta + kk * m.sigmaEq : m.theta - kk * m.sigmaEq
+    }
+    case 'halfLife': return m.halfLife
+    case 'kappa': return m.kappa
+    case 'phi': return m.phi
+    case 'tStat': return m.tStat
+    case 'r2': return m.r2
+    case 'reverting': return m.meanReverting
+    case 'dfSignificant': return m.tStat >= 2.86
+    case 'stretchedAbove': return m.state === 'stretched-above'
+    case 'stretchedBelow': return m.state === 'stretched-below'
+    case 'signal': return m.signal
+    case 'score': return m.score
+    case 'innovation': return m.innovation
+    default:
+      throw new MslRuntimeError(`unknown ou method "ou.${name}(...)" - use ok/z/theta/fair/sigma/upper/lower/halfLife/kappa/phi/tStat/r2/reverting/dfSignificant/stretchedAbove/stretchedBelow/signal/score/innovation`)
+  }
+}
+
+/** `markov.*` - the first-order Markov chain over vol-scaled return states (analytics/quant.ts markovChain).
+ * Five states, -2 big_down, -1 down, 0 flat, +1 up, +2 big_up, thresholds = multiples of the pair's own return sigma
+ * (so it reads the same on forex and crypto); Laplace-smoothed transition matrix. Candle-derived, backtestable.
+ * An optional first numeric arg = lookback in bars (60-1000, default 500).
+ *   probUp()/probDown()/probFlat()   next-bar probability of an up / down / flat state given the current state
+ *   expectedReturn()   probability-weighted next-bar log return        state()   the current state, -2..+2
+ *   next(s)            next-bar probability of state s (-2..+2) from the current state
+ *   p(from, to)        transition probability between two states (-2..+2)    stationary(s)   long-run share of state s
+ *   trendiness()       0..1 persistence of up/down runs      entropy()   0..1 (1 = next state fully unpredictable)
+ *   regime()           "bull" | "bear" | "range" | "chop"     samples()   how many return states the chain was fit on     ok() 60+ bars */
+const markovCache = new WeakMap<MslSeriesCtx, Map<number, MarkovModel | null>>()
+function markovMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const s = requireSeries(ctx, tf)
+  const takesState = name === 'next' || name === 'stationary' || name === 'p'
+  const lbArg = takesState ? undefined : numArg(args, 0)
+  const lb = lbArg === undefined ? 500 : Math.max(60, Math.min(1000, Math.round(lbArg)))
+  let byLb = markovCache.get(s)
+  if (!byLb) markovCache.set(s, (byLb = new Map()))
+  let m = byLb.get(lb)
+  if (m === undefined) {
+    m = readMarkov(seriesToCandles(s), lb)
+    byLb.set(lb, m)
+  }
+  if (name === 'ok') return m !== null
+  if (!m) throw new MslRuntimeError(`markov.${name}() needs at least ${MODEL_MIN_BARS} closed bars - history is too thin to fit`)
+  const st = (i: number): number => {
+    const v = asNum(args[i] as MslValue)
+    const r = Math.round(v)
+    if (!Number.isFinite(r) || r < -2 || r > 2) throw new MslRuntimeError(`markov.${name}(): a state is -2 (big down) .. +2 (big up), got ${v}`)
+    return r + 2
+  }
+  switch (name) {
+    case 'probUp': return m.probUp
+    case 'probDown': return m.probDown
+    case 'probFlat': return m.probFlat
+    case 'expectedReturn': return m.expectedReturn
+    case 'state': return m.state
+    case 'next':
+      if (args.length < 1) throw new MslRuntimeError('markov.next(state) needs a state, -2..+2')
+      return m.next[st(0)]
+    case 'stationary':
+      if (args.length < 1) throw new MslRuntimeError('markov.stationary(state) needs a state, -2..+2')
+      return m.stationary[st(0)]
+    case 'p':
+      if (args.length < 2) throw new MslRuntimeError('markov.p(from, to) needs two states, -2..+2')
+      return m.matrix[st(0)][st(1)]
+    case 'trendiness': return m.trendiness
+    case 'entropy': return m.entropy
+    case 'regime': return m.regime
+    case 'samples': return m.samples
+    default:
+      throw new MslRuntimeError(`unknown markov method "markov.${name}(...)" - use ok/probUp/probDown/probFlat/expectedReturn/state/next/p/stationary/trendiness/entropy/regime/samples`)
+  }
+}
+
+/** `stat.*` - return-distribution and mean-reversion statistics (analytics/quant.ts) on closed candles. Backtestable.
+ *   hurst()               rescaled-range Hurst exponent 0..1 (<0.5 mean-reverting, ~0.5 random walk, >0.5 trending); needs 101+ bars
+ *   autocorr(lag?, n?)    autocorrelation of the last n log returns at lag 1-20 (defaults 1, 120); negative = reverting
+ *   varianceRatio(q?, n?) Lo-MacKinlay variance ratio of q-bar vs 1-bar returns (defaults q 4, n 200): <1 reverting, >1 trending
+ *   vrZ(q?, n?)           its z-statistic (|z| > 2 is "statistically not a random walk")
+ *   regSlope(n?) regR2(n?) regMid(n?) regUpper(n?, k?) regLower(n?, k?)   linear-regression channel over n bars (default 100, k = 2 sigma)
+ *   regZ(n?)              price's distance from the regression line in residual sigmas
+ *   ewmaVol(n?, lambda?)  EWMA volatility of log returns     garchVol(n?)   GARCH(1,1) volatility (per-bar log-return std)
+ *   retMean(n?) retStd(n?) skew(n?) kurt(n?)   moments of the last n log returns (default 120)
+ *   ok()                  60+ closed bars (a method needing more fails the script closed with its own message) */
+function statMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const s = requireSeries(ctx, tf)
+  if (name === 'ok') return s.close.length >= MODEL_MIN_BARS
+  if (!STAT_NAMES.includes(name)) {
+    throw new MslRuntimeError(`unknown stat method "stat.${name}(...)" - use ok/${STAT_NAMES.join('/')}`)
+  }
+  if (s.close.length < MODEL_MIN_BARS) throw new MslRuntimeError(`stat.${name}() needs at least ${MODEL_MIN_BARS} closed bars - history is too thin`)
+  const a: { n?: number; lag?: number; q?: number; k?: number; lambda?: number } = {}
+  switch (name) {
+    case 'autocorr': a.lag = numArg(args, 0); a.n = numArg(args, 1); break
+    case 'varianceRatio':
+    case 'vrZ': a.q = numArg(args, 0); a.n = numArg(args, 1); break
+    case 'regUpper':
+    case 'regLower': a.n = numArg(args, 0); a.k = numArg(args, 1); break
+    case 'ewmaVol': a.n = numArg(args, 0); a.lambda = numArg(args, 1); break
+    default: a.n = numArg(args, 0)
+  }
+  const v = statValue(name, s.close, a)
+  if (v === null) {
+    throw new MslRuntimeError(
+      name === 'hurst' ? `stat.hurst() needs at least ${HURST_MIN_BARS} closed bars` : `stat.${name}() has too little history for the requested window - widen the history or shrink the window`,
+    )
+  }
+  return v
+}
+
+/** `cm.*` - Candle Math (analytics/candlemath.ts): blend consecutive candles into one master candle and read it.
+ * Blend rule: open of the first bar, highest high, lowest low, close of the last bar, summed volume. Candle-derived, backtestable.
+ *   blend(n, end?)        the blended bar of the n closed bars ending at `end` (-1 = latest, the default) - a bar value, so
+ *                         cm.blend(3).body / .range / .upperWick / .lowerWick / .o .h .l .c .v all work like ohlc()
+ *   has(name, n)          does the blended n-bar candle form this pattern (any name from the 74-pattern catalog, case-insensitive)
+ *   revealed(name, n)     ...AND the raw, unblended bars inside the group did NOT show it (the blend revealed it)
+ *   count(n) / newCount(n)   patterns on the blended candle / how many of them were revealed by blending
+ *   bullish(n) / bearish(n)  how many of the blended candle's patterns are bullish / bearish
+ *   dir(n)                +1 / -1 / 0: reliability-weighted bullish-vs-bearish net of the blended candle's patterns
+ *   smart() / smartDir()  size (2-4) / direction of the pattern-confirmed blend group ending on the latest bar (0 when none)
+ *   ok()                  30+ closed bars
+ * (n is required where shown: a lone trailing string would be read as a timeframe.) Pattern reads use the 20 bars before
+ * the group as context, like the Candle Math panel. */
+function cmMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const s = requireSeries(ctx, tf)
+  if (name === 'ok') return s.close.length >= CM_MIN_BARS
+  if (s.close.length < CM_MIN_BARS) throw new MslRuntimeError(`cm.${name}() needs at least ${CM_MIN_BARS} closed bars - history is too thin`)
+  const candles = seriesToCandles(s)
+  const needN = (i: number): number => {
+    if (args[i] === undefined) throw new MslRuntimeError(`cm.${name}() needs the group size n (number of bars to blend, 1-50)`)
+    return asNum(args[i])
+  }
+  const read = (n: number, endArg?: number) => {
+    const end = endArg === undefined ? candles.length - 1 : candles.length + Math.trunc(endArg)
+    const r = cmRead(candles, n, end)
+    if (!r) throw new MslRuntimeError(`cm.${name}(): blending ${n} bar(s) ending at ${endArg ?? -1} runs past the available ${candles.length}-bar history`)
+    return r
+  }
+  switch (name) {
+    case 'blend': {
+      const n = needN(0)
+      const r = read(n, numArg(args, 1))
+      const b = r.blended
+      const hi = Math.max(b.open, b.close)
+      const lo = Math.min(b.open, b.close)
+      return { __mslBar: true, o: b.open, h: b.high, l: b.low, c: b.close, v: b.volume ?? 0, body: Math.abs(b.close - b.open), range: b.high - b.low, upperWick: b.high - hi, lowerWick: lo - b.low } as MslBarValue
+    }
+    case 'has':
+    case 'revealed': {
+      if (typeof args[0] !== 'string') throw new MslRuntimeError(`cm.${name}("pattern name", n) - first argument is the pattern name in quotes`)
+      const r = read(needN(1))
+      return name === 'has' ? cmHas(r, args[0]) : cmRevealedHas(r, args[0])
+    }
+    case 'count': return read(needN(0)).hits.length
+    case 'newCount': return read(needN(0)).revealed.length
+    case 'bullish': return read(needN(0)).hits.filter((h) => h.direction === 'bullish').length
+    case 'bearish': return read(needN(0)).hits.filter((h) => h.direction === 'bearish').length
+    case 'dir': return cmDir(read(needN(0)))
+    case 'smart': return cmSmart(candles)?.size ?? 0
+    case 'smartDir': return cmSmart(candles)?.dir ?? 0
+    default:
+      throw new MslRuntimeError(`unknown cm method "cm.${name}(...)" - use ok/blend/has/revealed/count/newCount/bullish/bearish/dir/smart/smartDir`)
+  }
+}
+
+/** candles for the structural namespaces: REAL timestamps when the context carries them (so session pivots can anchor on the
+ * previous UTC day), else synthetic sequential times (pivots then use their rolling-window fallback). */
+function candlesWithTime(s: MslSeriesCtx): Candle[] {
+  if (s.time && s.time.length === s.close.length) {
+    const n = s.close.length
+    const out: Candle[] = new Array(n)
+    for (let i = 0; i < n; i++) out[i] = { time: s.time[i], open: s.open[i], high: s.high[i], low: s.low[i], close: s.close[i], volume: s.volume[i] }
+    return out
+  }
+  return seriesToCandles(s)
+}
+
+/** `fib.*` - Fibonacci retracement / extension / arcs / time zones of the Auto Fibonacci overlay's swing
+ * (analytics/structural.ts computeFibSeries logic; helpers in analytics/mslfib.ts). The leg = the trailing-window high and low,
+ * whichever formed LATER is the leg's END (high later = up leg). The window ends on the last CLOSED bar (no look-ahead); like the
+ * overlay the grid re-anchors the moment a new extreme forms. Candle-derived: works in meta_strategy_eval, Meta Trader, Omni Trader
+ * AND meta_strategy_backtest. Every method takes an optional trailing swing lookback in bars (20-600, default 150).
+ *   Levels   level(r, lb?)   retracement price: r 0 = leg end, 0.382/0.5/0.618/0.786, 1 = leg start, >1 beyond
+ *            ext(e, lb?)     extension: e 1 = leg end, 1.272 / 1.618 = projected beyond it
+ *            pos(lb?)        where price sits as a retracement ratio (0 at the end extreme, 1 at the start; <0 / >1 beyond)
+ *            nearest(lb?)    the standard ratio (0,.236,.382,.5,.618,.786,1) closest to price     nearestDist(lb?)  its signed distance in ATR(14)
+ *            at(r, tolAtr?, lb?)  price within tolAtr x ATR (default 0.25) of level r        goldenPocket(lb?)  price between the 0.382 and 0.618 levels
+ *   Leg      dir(lb?) +1 up leg / -1 down leg    high(lb?) low(lb?)    legBars(lb?) legAtr(lb?) leg size in bars / in ATR    age(lb?) bars since the leg's end extreme
+ *   Arcs     arc(r, lb?)     price of the ratio-r arc at the last bar (centred on the leg end, radius r x leg length; the plane is normalised so
+ *                            the leg is a 45-degree line - a chart drawing uses screen scale, so it can differ)    arcDist(r, lb?) close - arc    arcLive(r, lb?) arc still defined (age < radius)
+ *   Time     tz(unit?, lb?)  index in the Fibonacci sequence (0,1,2,3,5,8,13,21,...) of the latest time-zone line passed, measured from the leg START in units of `unit` bars (default 1)
+ *            tzMult(unit?, lb?) that sequence number    tzNext(unit?, lb?) bars until the next zone line    tzOn(unit?, tol?, lb?) the last bar sits on a zone line (+/- tol bars, default 0)    tzUnit(lb?) the leg length in bars (TradingView-style unit)
+ *   ok()    40+ closed bars. Fails the script closed on thin history or a degenerate (flat) swing. */
+const fibCache = new WeakMap<MslSeriesCtx, Map<number, FibSwing | null>>()
+const FIB_PARAMS: Record<string, string[]> = {
+  level: ['r', 'lb'], ext: ['e', 'lb'], pos: ['lb'], nearest: ['lb'], nearestDist: ['lb'], at: ['r', 'tol', 'lb'], goldenPocket: ['lb'],
+  dir: ['lb'], high: ['lb'], low: ['lb'], legBars: ['lb'], legAtr: ['lb'], age: ['lb'],
+  arc: ['r', 'lb'], arcDist: ['r', 'lb'], arcLive: ['r', 'lb'],
+  tz: ['unit', 'lb'], tzMult: ['unit', 'lb'], tzNext: ['unit', 'lb'], tzOn: ['unit', 'tol', 'lb'], tzUnit: ['lb'],
+}
+function fibMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const s = requireSeries(ctx, tf)
+  if (name === 'ok') return s.close.length >= FIB_MIN_BARS
+  const spec = FIB_PARAMS[name]
+  if (!spec) throw new MslRuntimeError(`unknown fib method "fib.${name}(...)" - use ok/${Object.keys(FIB_PARAMS).join('/')}`)
+  const p: Record<string, number | undefined> = {}
+  spec.forEach((k, i) => (p[k] = numArg(args, i)))
+  if (args.length > spec.length) throw new MslRuntimeError(`fib.${name}(${spec.join(', ')}) takes at most ${spec.length} argument(s), got ${args.length}`)
+  const needs = (k: string): number => {
+    const v = p[k]
+    if (v === undefined) throw new MslRuntimeError(`fib.${name}() needs ${k}`)
+    return v
+  }
+  const lb = p.lb === undefined ? 150 : Math.max(20, Math.min(600, Math.round(p.lb)))
+  let byLb = fibCache.get(s)
+  if (!byLb) fibCache.set(s, (byLb = new Map()))
+  let sw = byLb.get(lb)
+  if (sw === undefined) {
+    sw = fibSwing(candlesWithTime(s), lb)
+    byLb.set(lb, sw)
+  }
+  if (!sw) throw new MslRuntimeError(`fib.${name}() needs at least ${FIB_MIN_BARS} closed bars - history is too thin`)
+  if (sw.diff <= 1e-9) throw new MslRuntimeError(`fib.${name}(): the swing is flat (no range) - nothing to measure`)
+  switch (name) {
+    case 'level': return fibRetr(sw, needs('r'))
+    case 'ext': {
+      const e = needs('e')
+      if (e < 1) throw new MslRuntimeError('fib.ext(e): an extension ratio is >= 1 (1 = the leg end, 1.272, 1.618, ...); use level(r) for retracements')
+      return fibExt(sw, e)
+    }
+    case 'pos': return fibPos(sw)
+    case 'nearest':
+    case 'nearestDist': {
+      const pos = fibPos(sw)
+      let best = FIB_RATIOS[0]
+      for (const r of FIB_RATIOS) if (Math.abs(r - pos) < Math.abs(best - pos)) best = r
+      if (name === 'nearest') return best
+      return sw.atr > 1e-12 ? (sw.last - fibRetr(sw, best)) / sw.atr : 0
+    }
+    case 'at': {
+      const tol = p.tol === undefined ? 0.25 : p.tol
+      if (sw.atr <= 1e-12) return false
+      return Math.abs(sw.last - fibRetr(sw, needs('r'))) <= tol * sw.atr
+    }
+    case 'goldenPocket': {
+      const pos = fibPos(sw)
+      return pos >= 0.382 && pos <= 0.618
+    }
+    case 'dir': return sw.up ? 1 : -1
+    case 'high': return sw.hi
+    case 'low': return sw.lo
+    case 'legBars': return sw.legBars
+    case 'legAtr': return sw.atr > 1e-12 ? sw.diff / sw.atr : 0
+    case 'age': return sw.age
+    case 'arc':
+    case 'arcDist':
+    case 'arcLive': {
+      const r = needs('r')
+      if (!(r > 0)) throw new MslRuntimeError(`fib.${name}(r): the arc ratio must be > 0 (0.382 / 0.5 / 0.618 are the usual ones)`)
+      const a = fibArc(sw, r)
+      if (name === 'arcLive') return a.live
+      if (!a.live) throw new MslRuntimeError(`fib.${name}(${r}): the arc is not defined here (leg shorter than 3 bars, or the last bar is outside its radius) - gate on fib.arcLive(${r})`)
+      return name === 'arc' ? a.price : sw.last - a.price
+    }
+    case 'tzUnit': return Math.max(1, sw.legBars)
+    default: {
+      const tz = fibTimeZone(sw, p.unit === undefined ? 1 : p.unit)
+      if (name === 'tz') return tz.index
+      if (name === 'tzMult') return tz.mult
+      if (name === 'tzNext') return tz.toNext
+      return tz.onZone(p.tol === undefined ? 0 : Math.max(0, p.tol))
+    }
+  }
+}
+
+/** `pivot.*` - floor pivot points (analytics/structural.ts computePivotSeries). With real candle timestamps spanning 2+ UTC days the
+ * levels are the PREVIOUS day's (fixed for the whole day, no look-ahead); otherwise a rolling `period`-bar window ending on the previous
+ * bar anchors them. Candle-derived, backtestable. Optional first arg = variant 0 classic | 1 fibonacci | 2 camarilla | 3 woodie (default 0);
+ * optional second = rolling period (10-500, default 60).
+ *   pp() r1() r2() r3() s1() s2() s3()   the levels        above()   how many of the seven levels price is above (0-7)
+ *   nearest()   price of the closest level      nearestDist()   signed distance close - nearest, in ATR(14)      mode()   "session" | "rolling"      ok() */
+const pivotCache = new WeakMap<MslSeriesCtx, Map<string, ReturnType<typeof readPivots>>>()
+function pivotMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const s = requireSeries(ctx, tf)
+  const variant = numArg(args, 0) ?? 0
+  const period = numArg(args, 1) ?? 60
+  const key = `${variant}|${period}`
+  let byKey = pivotCache.get(s)
+  if (!byKey) pivotCache.set(s, (byKey = new Map()))
+  let m = byKey.get(key)
+  if (m === undefined) {
+    m = readPivots(candlesWithTime(s), variant, period)
+    byKey.set(key, m)
+  }
+  if (name === 'ok') return m !== null
+  if (!m) throw new MslRuntimeError(`pivot.${name}() has no levels yet (needs 12+ bars and, in rolling mode, a full window - or a prior UTC day in session mode)`)
+  const levels = [m.s3, m.s2, m.s1, m.pp, m.r1, m.r2, m.r3]
+  const last = s.close[s.close.length - 1]
+  switch (name) {
+    case 'pp': return m.pp
+    case 'r1': return m.r1
+    case 'r2': return m.r2
+    case 'r3': return m.r3
+    case 's1': return m.s1
+    case 's2': return m.s2
+    case 's3': return m.s3
+    case 'above': return levels.filter((l) => last > l).length
+    case 'nearest':
+    case 'nearestDist': {
+      let best = levels[0]
+      for (const l of levels) if (Math.abs(l - last) < Math.abs(best - last)) best = l
+      if (name === 'nearest') return best
+      return m.atr > 1e-12 ? (last - best) / m.atr : 0
+    }
+    case 'mode': return m.mode
+    default:
+      throw new MslRuntimeError(`unknown pivot method "pivot.${name}(...)" - use ok/pp/r1/r2/r3/s1/s2/s3/above/nearest/nearestDist/mode`)
+  }
+}
+
+/** `vol.*` - ATR volatility state, to trade MODERATE volatility and skip dead or frantic markets. Everything is relative to the pair's OWN
+ * recent ATR history (percentile rank), so "low"/"high" mean the same on forex, crypto and OTC. Candle-derived, backtestable.
+ * Optional first arg = ATR period (2-100, default 14) on methods that read the ATR; `lb` = history window for the rank (30-1000, default 200).
+ *   atr(period?)         the ATR in price units      atrPct(period?)   ATR as % of price
+ *   rank(period?, lb?)   percentile rank 0..1 of the current ATR inside the last lb ATR values (0.5 = typical)
+ *   low(lo?, period?, lb?) / high(hi?, ...) / moderate(lo?, hi?, period?, lb?)   rank < lo (default 0.25) / rank > hi (default 0.75) / lo <= rank <= hi
+ *   ratio(fast?, slow?)  ATR(fast)/ATR(slow) (defaults 5, 30): > 1 volatility expanding, < 1 contracting
+ *   barRatio(offset?)    that closed bar's range / ATR(14) (offset -1 = latest, default): how oversized the bar is
+ *   ok()                 60+ closed bars (history for the rank needs 30+ valid ATR values)
+ * The 25 / 75 percentile bands are conventions, not tuned values: check them in a backtest on YOUR pair and expiry. */
+const volCache = new WeakMap<MslSeriesCtx, Map<string, ReturnType<typeof readVol>>>()
+function volMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const s = requireSeries(ctx, tf)
+  if (name === 'ok') return s.close.length >= VOL_MIN_BARS && readVolCached(s, 14, 200, 5, 30) !== null
+  if (s.close.length < VOL_MIN_BARS) throw new MslRuntimeError(`vol.${name}() needs at least ${VOL_MIN_BARS} closed bars - history is too thin`)
+  switch (name) {
+    case 'atr':
+    case 'atrPct': {
+      const m = readVolCached(s, numArg(args, 0) ?? 14, 200, 5, 30)
+      if (!m) throw new MslRuntimeError(`vol.${name}(): ATR not available yet`)
+      return name === 'atr' ? m.atr : m.atrPct
+    }
+    case 'rank': {
+      const m = readVolCached(s, numArg(args, 0) ?? 14, numArg(args, 1) ?? 200, 5, 30)
+      if (!m) throw new MslRuntimeError('vol.rank(): not enough ATR history yet (needs 30+ valid ATR values in the window)')
+      return m.rank
+    }
+    case 'low':
+    case 'high':
+    case 'moderate': {
+      const lo = name === 'high' ? 0.25 : numArg(args, 0) ?? 0.25
+      const hi = name === 'high' ? numArg(args, 0) ?? 0.75 : name === 'moderate' ? numArg(args, 1) ?? 0.75 : 0.75
+      const pi = name === 'moderate' ? 2 : 1
+      const m = readVolCached(s, numArg(args, pi) ?? 14, numArg(args, pi + 1) ?? 200, 5, 30)
+      if (!m) throw new MslRuntimeError(`vol.${name}(): not enough ATR history yet (needs 30+ valid ATR values in the window)`)
+      if (name === 'low') return m.rank < lo
+      if (name === 'high') return m.rank > hi
+      if (!(lo >= 0 && hi <= 1 && lo < hi)) throw new MslRuntimeError('vol.moderate(lo, hi): need 0 <= lo < hi <= 1')
+      return m.rank >= lo && m.rank <= hi
+    }
+    case 'ratio': {
+      const m = readVolCached(s, 14, 200, numArg(args, 0) ?? 5, numArg(args, 1) ?? 30)
+      if (!m) throw new MslRuntimeError('vol.ratio(): ATR not available yet')
+      return m.ratio
+    }
+    case 'barRatio': {
+      const m = readVolCached(s, 14, 200, 5, 30)
+      if (!m || m.atr <= 1e-12) throw new MslRuntimeError('vol.barRatio(): ATR not available yet')
+      const off = Math.trunc(numArg(args, 0) ?? -1)
+      const i = s.close.length + off
+      if (i < 0 || i >= s.close.length) throw new MslRuntimeError(`vol.barRatio(${off}) out of range`)
+      return (s.high[i] - s.low[i]) / m.atr
+    }
+    default:
+      throw new MslRuntimeError(`unknown vol method "vol.${name}(...)" - use ok/atr/atrPct/rank/low/high/moderate/ratio/barRatio`)
+  }
+}
+function readVolCached(s: MslSeriesCtx, period: number, lookback: number, fast: number, slow: number) {
+  const key = `${period}|${lookback}|${fast}|${slow}`
+  let byKey = volCache.get(s)
+  if (!byKey) volCache.set(s, (byKey = new Map()))
+  let m = byKey.get(key)
+  if (m === undefined) {
+    m = readVol(seriesToCandles(s), period, lookback, fast, slow)
+    byKey.set(key, m)
+  }
+  return m
+}
+
+/** `amd.*` - ACCUMULATION / MANIPULATION / DISTRIBUTION (ICT "Power of 3") phase detector (analytics/mslamd.ts), a causal state machine on
+ * CLOSED candles: a tight consolidation box (accumulation) -> a poke beyond one side that is reclaimed within 4 bars (manipulation, the false
+ * break / liquidity grab) -> a close beyond the OPPOSITE edge (distribution, the real move, opposite the sweep). Candle-derived: works in
+ * meta_strategy_eval, Meta Trader, Omni Trader AND meta_strategy_backtest. Needs 120+ closed bars. An optional first numeric arg picks the box source:
+ *   0 (default) "structure": the most recent qualifying consolidation anywhere in the trailing window - works on any asset incl. OTC
+ *   1 "session": the UTC-day ASIA range (00:00-08:00) is the box; only bars from 08:00 UTC on can sweep it (London) and distribute (New York).
+ *     Needs real candle timestamps and the whole Asia session inside the history; meaningful for real FX/crypto sessions, NOT OTC instruments.
+ *   phase()  STRING "none" | "accumulation" | "manipulation" | "distribution"      stage()   0 none / 1 accumulation / 2 manipulation / 3 distribution
+ *   accumulating()  manipulating()  distributing()   booleans
+ *   dir()    +1 bullish / -1 bearish: the expected (manipulation) or realised (distribution) real-move direction, opposite the sweep; 0 before any sweep
+ *   sweepSide()  +1 the box high was swept / -1 the box low / 0      returned()  manipulation only: price has closed back inside the box (reclaim done)
+ *   breakout()   +1 / -1 a breach that was NOT reclaimed in time (a genuine breakout; phase is "none") / 0
+ *   age()        bars since the current phase began      sweepDepth()  how far past the box the sweep went, in ATR
+ *   moveAtr()    distribution: how far the close is beyond the opposite box edge, in ATR (positive = with dir)
+ *   boxHigh() boxLow() boxBars()   the box      ok()  120+ bars (and, in session mode, real timestamps + the full Asia session in history)
+ * The cycle is dropped when it stalls (no distribution within 15 bars of the reclaim), fails (price re-breaches the sweep side, or closes back
+ * through the sweep extreme after distributing) or ages out (30 bars after distribution began). Fixed thresholds (box compression <= 0.65 of the
+ * prior 40 bars' true range, box range <= 2.5 prior ATR, sweep > 0.1 ATR beyond the box) - they are conventions, not tuned values. */
+const amdCache = new WeakMap<MslSeriesCtx, Map<number, AmdRead | null>>()
+function amdMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const s = requireSeries(ctx, tf)
+  const modeArg = numArg(args, 0)
+  const mode = modeArg === 1 ? 1 : 0
+  if (modeArg !== undefined && modeArg !== 0 && modeArg !== 1) throw new MslRuntimeError(`amd.${name}(mode): mode is 0 (structure) or 1 (session), got ${modeArg}`)
+  const hasTime = !!s.time && s.time.length === s.close.length
+  let byMode = amdCache.get(s)
+  if (!byMode) amdCache.set(s, (byMode = new Map()))
+  let m = byMode.get(mode)
+  if (m === undefined) {
+    m = mode === 1 && !hasTime ? null : readAmd(candlesWithTime(s), mode)
+    byMode.set(mode, m)
+  }
+  if (name === 'ok') return m !== null
+  if (!m) {
+    throw new MslRuntimeError(
+      mode === 1 && !hasTime
+        ? `amd.${name}(1): session mode needs candle timestamps, which this evaluation context does not carry`
+        : `amd.${name}() needs at least ${AMD_MIN_BARS} closed bars - history is too thin`,
+    )
+  }
+  switch (name) {
+    case 'phase': return m.phase
+    case 'stage': return m.phase === 'accumulation' ? 1 : m.phase === 'manipulation' ? 2 : m.phase === 'distribution' ? 3 : 0
+    case 'accumulating': return m.phase === 'accumulation'
+    case 'manipulating': return m.phase === 'manipulation'
+    case 'distributing': return m.phase === 'distribution'
+    case 'dir': return m.dir
+    case 'sweepSide': return m.sweepSide
+    case 'returned': return m.returned
+    case 'breakout': return m.breakout
+    case 'age': return m.age
+    case 'sweepDepth': return m.sweepDepth
+    case 'moveAtr': return m.moveAtr
+    case 'boxHigh': return m.boxHigh
+    case 'boxLow': return m.boxLow
+    case 'boxBars': return m.boxBars
+    default:
+      throw new MslRuntimeError(`unknown amd method "amd.${name}(...)" - use ok/phase/stage/accumulating/manipulating/distributing/dir/sweepSide/returned/breakout/age/sweepDepth/moveAtr/boxHigh/boxLow/boxBars`)
+  }
+}
+
+/** `wyckoff.*` - WYCKOFF accumulation / distribution SCHEMATIC reader (analytics/mslwyckoff.ts): a clear prior trend -> a climax bar -> a sideways
+ * range -> spring (accumulation) / upthrust (distribution) -> SOS / SOW -> LPS / LPSY -> markup / markdown, with phases A-E. Candle-derived (volume
+ * is used only when it varies; `volumeOk()` says whether it did). Needs 150+ closed bars. Detects the SHAPE only - no edge is claimed.
+ *   schematic() STRING "none"|"accumulation"|"distribution"   phase() STRING "none"|"A".."E"   stage() 0 none / 1..5 = A..E
+ *   accumulation() distribution()   booleans      dir() +1 / -1 / 0
+ *   support() resistance() rangeBars() priorTrend() (ATR, signed)   sinceRange() bars since the range ended
+ *   climax() spring() upthrust() sos() sow() lps() lpsy()   booleans      volumeOk()   ok()   150+ bars */
+const wyckoffCache = new WeakMap<MslSeriesCtx, WyckoffRead | null>()
+function wyckoffMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  void args
+  const s = requireSeries(ctx, tf)
+  let m = wyckoffCache.get(s)
+  if (m === undefined) {
+    m = readWyckoff(candlesWithTime(s))
+    wyckoffCache.set(s, m)
+  }
+  if (name === 'ok') return m !== null
+  if (!m) throw new MslRuntimeError(`wyckoff.${name}() needs at least ${WYCKOFF_MIN_BARS} closed bars - history is too thin`)
+  switch (name) {
+    case 'schematic': return m.schematic
+    case 'phase': return m.phase
+    case 'stage': return m.phase === 'none' ? 0 : m.phase.charCodeAt(0) - 64
+    case 'accumulation': return m.schematic === 'accumulation'
+    case 'distribution': return m.schematic === 'distribution'
+    case 'dir': return m.dir
+    case 'support': return m.support
+    case 'resistance': return m.resistance
+    case 'rangeBars': return m.rangeBars
+    case 'priorTrend': return m.priorTrendAtr
+    case 'sinceRange': return m.sinceRange
+    case 'climax': return m.climax
+    case 'spring': return m.spring
+    case 'upthrust': return m.upthrust
+    case 'sos': return m.sos
+    case 'sow': return m.sow
+    case 'lps': return m.lps
+    case 'lpsy': return m.lpsy
+    case 'volumeOk': return m.volumeOk
+    default:
+      throw new MslRuntimeError(`unknown wyckoff method "wyckoff.${name}(...)" - use ok/schematic/phase/stage/accumulation/distribution/dir/support/resistance/rangeBars/priorTrend/sinceRange/climax/spring/upthrust/sos/sow/lps/lpsy/volumeOk`)
+  }
+}
+
 /** `renko.*`/`pf.*`/`ha.*`'s shared conversion - renkoBricks()/pointFigure()/
  * heikinAshiSeries() all want a real Candle[] (they only use .time to STAMP
  * their output, never to decide the math - brick/box/HA logic is pure
@@ -3292,6 +3944,61 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
         return signalMethod(e.name, args, ctx, tf)
       }
+      // `amd.phase()` / `amd.distributing()` - accumulation / manipulation / distribution (see amdMethod above).
+      if (e.obj.t === 'ident' && e.obj.name === 'amd' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return amdMethod(e.name, args, ctx, tf)
+      }
+      // `wyckoff.phase()` / `wyckoff.spring()` - Wyckoff accumulation / distribution schematic (see wyckoffMethod above).
+      if (e.obj.t === 'ident' && e.obj.name === 'wyckoff' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return wyckoffMethod(e.name, args, ctx, tf)
+      }
+      // `fib.level(0.618)` / `pivot.pp()` / `vol.moderate()` - structural + volatility namespaces (see fibMethod..volMethod above).
+      if (e.obj.t === 'ident' && e.obj.name === 'fib' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return fibMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'pivot' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return pivotMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'vol' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return volMethod(e.name, args, ctx, tf)
+      }
+      // `ou.z()` / `markov.probUp()` / `stat.hurst()` / `cm.blend(3)` - model namespaces (see ouMethod..cmMethod above).
+      if (e.obj.t === 'ident' && e.obj.name === 'ou' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return ouMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'markov' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return markovMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'stat' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return statMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'cm' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return cmMethod(e.name, args, ctx, tf)
+      }
+      // `tech.buys()` / `tech.rsi()` etc - the Technical panel's per-indicator votes (see techMethod above).
+      if (e.obj.t === 'ident' && e.obj.name === 'tech' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return techMethod(e.name, args, ctx, tf)
+      }
       // `pulse.tickCount(-1)` etc - same namespace-marker special case,
       // same omni-trader-only contract (requireTicks() fails closed).
       if (e.obj.t === 'ident' && e.obj.name === 'pulse' && !(e.obj.name in env)) {
@@ -3499,6 +4206,17 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
           return Math.ceil(asNum(args[0] ?? 0))
         case 'sign':
           return Math.sign(asNum(args[0] ?? 0))
+        case 'log':
+        case 'ln': {
+          const v = asNum(args[0] ?? 0)
+          if (!(v > 0)) throw new MslRuntimeError(`${e.fn}() of a non-positive number - would produce NaN/-Infinity`)
+          return Math.log(v)
+        }
+        case 'exp': {
+          const v = Math.exp(asNum(args[0] ?? 0))
+          if (!Number.isFinite(v)) throw new MslRuntimeError('exp() overflowed - argument too large')
+          return v
+        }
         case 'sqrt': {
           const v = asNum(args[0] ?? 0)
           if (v < 0) throw new MslRuntimeError('sqrt() of a negative number - would produce NaN confidence')
