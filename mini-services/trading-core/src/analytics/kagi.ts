@@ -28,9 +28,31 @@ export interface KagiLine {
 
 export type KagiRegime = 'trending' | 'ranging' | 'choppy' | 'none'
 
+/** One discrete Kagi event, stamped with the candle that caused it. `lines`
+ * can't carry this: a line is updated in place while it extends, so a mid-line
+ * thickness flip (the moment price breaks a shoulder/waist) leaves no trace on
+ * it except its final `thick` flag. */
+export interface KagiEvent {
+  /** Index into the candle array this event fired on. */
+  index: number
+  time: number
+  /** 'reversal' = the line flipped direction. 'yang' = price broke above the last shoulder (line turned thick). 'yin' = price broke below the last waist (line turned thin). */
+  type: 'reversal' | 'yang' | 'yin'
+  /** 1 = bullish event (up-reversal / yang), -1 = bearish (down-reversal / yin). */
+  dir: 1 | -1
+  /** Close of the candle that fired it. */
+  price: number
+  /** The level this event cleared: the extreme a reversal turned from, the shoulder a yang broke, the waist a yin broke. */
+  level: number | null
+  /** Line thickness AFTER this event. */
+  thick: boolean
+}
+
 export interface KagiResult {
   reversal: number
   lines: KagiLine[]
+  /** Every reversal / yang / yin event in candle order. */
+  events: KagiEvent[]
   direction: 1 | -1 | 0
   thick: boolean
   /** The high set just before the most recent down-reversal (null until one has occurred). */
@@ -126,6 +148,7 @@ export function kagi(
   const empty: KagiResult = {
     reversal,
     lines: [],
+    events: [],
     direction: 0,
     thick: true,
     shoulder: null,
@@ -143,11 +166,18 @@ export function kagi(
   let waist: number | null = null
   let thick = true
   const lines: KagiLine[] = [{ time: candles[0].time, price: extreme, dir, thick }]
+  const events: KagiEvent[] = []
 
   for (let i = 1; i < candles.length; i++) {
     const c = candles[i].close
+    const thickBefore = thick
     if (shoulder !== null && c > shoulder) thick = true
     if (waist !== null && c < waist) thick = false
+    // a thickness FLIP is an event; staying thick/thin is not (the checks above
+    // re-assert the current state on every candle past the level)
+    if (thick !== thickBefore) {
+      events.push({ index: i, time: candles[i].time, type: thick ? 'yang' : 'yin', dir: thick ? 1 : -1, price: c, level: thick ? shoulder : waist, thick })
+    }
     if (dir === 1) {
       if (c >= extreme) {
         extreme = c
@@ -157,6 +187,7 @@ export function kagi(
         dir = -1
         extreme = c
         lines.push({ time: candles[i].time, price: extreme, dir, thick })
+        events.push({ index: i, time: candles[i].time, type: 'reversal', dir: -1, price: c, level: shoulder, thick })
       }
     } else {
       if (c <= extreme) {
@@ -167,9 +198,10 @@ export function kagi(
         dir = 1
         extreme = c
         lines.push({ time: candles[i].time, price: extreme, dir, thick })
+        events.push({ index: i, time: candles[i].time, type: 'reversal', dir: 1, price: c, level: waist, thick })
       }
     }
   }
   const { structure, legsInWindow, regime } = classifyRegime(lines, candles, shoulder, waist, regimeLookback)
-  return { reversal, lines, direction: dir, thick, shoulder, waist, structure, legsInWindow, regime, regimeLookback }
+  return { reversal, lines, events, direction: dir, thick, shoulder, waist, structure, legsInWindow, regime, regimeLookback }
 }

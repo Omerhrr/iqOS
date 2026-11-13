@@ -53,6 +53,7 @@ import { nextExpiryPlugin, NextExpiryService } from './src/plugins/nextexpiry'
 import { reversalPlugin, ReversalService } from './src/plugins/reversal'
 import { technicalPlugin, TechnicalService } from './src/plugins/technical'
 import { mrcPredictPlugin, MrcPredictService } from './src/plugins/mrcpredict'
+import { reversalEventsPlugin, ReversalEventsService } from './src/plugins/reversalevents'
 import {
   computeTickSmc, computeTickOracle, computeTickTechnical, computeTickFootprint, medianTickGapMs,
 } from './src/analytics/tickdesk'
@@ -244,6 +245,7 @@ kernel.register(nextExpiryPlugin)
 kernel.register(reversalPlugin)
 kernel.register(technicalPlugin)
 kernel.register(mrcPredictPlugin)
+kernel.register(reversalEventsPlugin)
 
 // ---------- Full-universe scanners for Distill / Cointegration / Vol Arb ----------
 // These three started as single-asset-only panels (read whatever's on the
@@ -2035,6 +2037,33 @@ const httpServer = createServer(async (req, res) => {
             refresh: q.get('refresh') === '1',
           })
           return json(200, { ok: true, ...out })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // ---------- Renko (Effort Bricks) / Kagi reversal event feeds ----------
+      // GET /renko_reversals?asset=X&tf=1m&source=effort|renko&mult=0.3&limit=40&horizon=1&payout=0.85
+      // GET /kagi_reversals?asset=X&tf=1m&mult=1&limit=40&horizon=1&payout=0.85
+      // -> plugins/reversalevents.ts. Event lists (only the flips, newest
+      // first) plus each event kind's own measured follow-through.
+      if (path === '/renko_reversals' || path === '/kagi_reversals') {
+        try {
+          const svc = kernel.context().use<ReversalEventsService>('reversalevents')
+          const asset = String(q.get('asset') ?? market.activeAsset)
+          const tf = String(q.get('tf') ?? '1m')
+          const num = (k: string): number | undefined => {
+            const raw = q.get(k)
+            if (raw === null || raw === '') return undefined
+            const v = Number(raw)
+            return Number.isFinite(v) ? v : undefined
+          }
+          const base = { limit: num('limit'), horizon: num('horizon'), payout: num('payout') }
+          const out =
+            path === '/renko_reversals'
+              ? svc.renko(asset, tf, { ...base, source: q.get('source') === 'renko' ? 'renko' : 'effort', atrMult: num('mult') })
+              : svc.kagi(asset, tf, { ...base, reversalAtrMult: num('mult') })
+          return json(200, out)
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }

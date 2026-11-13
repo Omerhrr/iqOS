@@ -112,6 +112,22 @@ const REGIME_CONFIRMED_FLOOR = 0.6
  * direction for the regime read to call it 'trending' instead of 'ranging'. */
 const REGIME_DOMINANCE_FLOOR = 0.6
 
+/** The regime read for one window of bricks (the caller supplies exactly the
+ * `lookback` bricks to classify and has already checked that real volume
+ * exists). Exported so the reversal-event feed can classify the regime AS OF
+ * each past brick with the very same thresholds, instead of a copy that could
+ * drift. */
+export function classifyEffortRegime(recent: EffortBrick[]): { confirmedRatio: number; regime: EffortRegime } {
+  if (!recent.length) return { confirmedRatio: 0, regime: 'none' }
+  const confirmedBricks = recent.filter((b) => b.confirmed)
+  const confirmedRatio = confirmedBricks.length / recent.length
+  if (confirmedRatio < REGIME_CONFIRMED_FLOOR) return { confirmedRatio, regime: 'choppy' }
+  const up = confirmedBricks.filter((b) => b.dir === 1).length
+  const down = confirmedBricks.length - up
+  const dominant = confirmedBricks.length === 0 || Math.abs(up - down) / confirmedBricks.length >= REGIME_DOMINANCE_FLOOR
+  return { confirmedRatio, regime: dominant ? 'trending' : 'ranging' }
+}
+
 /** Mean true range over the last `period` candles (simple mean, same
  * deterministic/restart-stable convention renko.ts's own local helper
  * uses - duplicated rather than imported, same dependency-isolation
@@ -224,17 +240,7 @@ export function effortBricks(
   let confirmedRatio = 0
   let regime: EffortRegime = 'none'
   if (bricks.length >= lookback && effortSource === 'volume') {
-    const recent = bricks.slice(-lookback)
-    const confirmedBricks = recent.filter((b) => b.confirmed)
-    confirmedRatio = confirmedBricks.length / recent.length
-    if (confirmedRatio >= REGIME_CONFIRMED_FLOOR) {
-      const up = confirmedBricks.filter((b) => b.dir === 1).length
-      const down = confirmedBricks.length - up
-      const dominant = confirmedBricks.length === 0 || Math.abs(up - down) / confirmedBricks.length >= REGIME_DOMINANCE_FLOOR
-      regime = dominant ? 'trending' : 'ranging'
-    } else {
-      regime = 'choppy'
-    }
+    ;({ confirmedRatio, regime } = classifyEffortRegime(bricks.slice(-lookback)))
   }
 
   return {

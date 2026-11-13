@@ -28,6 +28,8 @@ import TechnicalPanel from '@/components/os/TechnicalPanel'
 import TechnicalGlobalPanel from '@/components/os/TechnicalGlobalPanel'
 import ReversalPanel from '@/components/os/ReversalPanel'
 import MrcPredictPanel from '@/components/os/MrcPredictPanel'
+import RenkoReversalPanel from '@/components/os/RenkoReversalPanel'
+import KagiReversalPanel from '@/components/os/KagiReversalPanel'
 import ReversalGlobalPanel from '@/components/os/ReversalGlobalPanel'
 import SmcRecentPanel from '@/components/os/SmcRecentPanel'
 import SmcGlobalPanel from '@/components/os/SmcGlobalPanel'
@@ -101,7 +103,7 @@ const INDICATOR_STORAGE_KEY = 'iqos.activeIndicators.v1'
 // @ Now", "Cointegration") out of the open strip entirely instead of just
 // closing it each time - it stays hidden across reloads until re-checked in
 // the Panels settings menu. Nothing is deleted, this only gates rendering.
-type PanelId = 'signals' | 'yday' | 'leadlag' | 'distill' | 'cointegration' | 'volarb' | 'triangulation' | 'adxPatternBias' | 'shockPressure' | 'renkoFootprint' | 'renkoFootprintOtc' | 'volumeFootprint' | 'tickVolume' | 'tickSmc' | 'tickOracle' | 'tickTechnical' | 'tickFootprint' | 'tickPatterns' | 'pairCompare' | 'pairSignal' | 'oracle' | 'nextExpiry' | 'nextExpiryGlobal' | 'technical' | 'technicalGlobal' | 'reversal' | 'reversalGlobal' | 'nextGlobal' | 'tempo' | 'tempoGlobal' | 'accute' | 'accuteGlobal' | 'smcRecent' | 'smcGlobal' | 'globalDom' | 'mrcPredict'
+type PanelId = 'signals' | 'yday' | 'leadlag' | 'distill' | 'cointegration' | 'volarb' | 'triangulation' | 'adxPatternBias' | 'shockPressure' | 'renkoFootprint' | 'renkoFootprintOtc' | 'volumeFootprint' | 'tickVolume' | 'tickSmc' | 'tickOracle' | 'tickTechnical' | 'tickFootprint' | 'tickPatterns' | 'pairCompare' | 'pairSignal' | 'oracle' | 'nextExpiry' | 'nextExpiryGlobal' | 'technical' | 'technicalGlobal' | 'reversal' | 'reversalGlobal' | 'nextGlobal' | 'tempo' | 'tempoGlobal' | 'accute' | 'accuteGlobal' | 'smcRecent' | 'smcGlobal' | 'globalDom' | 'mrcPredict' | 'renkoReversal' | 'kagiReversal'
 const PANEL_META: { id: PanelId; label: string }[] = [
   { id: 'signals', label: 'Chart Signals' },
   { id: 'yday', label: 'Yesterday @ Now' },
@@ -139,6 +141,8 @@ const PANEL_META: { id: PanelId; label: string }[] = [
   { id: 'smcGlobal', label: 'SMC Global' },
   { id: 'globalDom', label: 'Global Dom' },
   { id: 'mrcPredict', label: 'MRC Predict' },
+  { id: 'renkoReversal', label: 'Renko Reversal' },
+  { id: 'kagiReversal', label: 'Kagi Reversal' },
 ]
 const DEFAULT_PANEL_VISIBILITY: Record<PanelId, boolean> = {
   signals: true,
@@ -177,6 +181,8 @@ const DEFAULT_PANEL_VISIBILITY: Record<PanelId, boolean> = {
   smcGlobal: true,
   globalDom: true,
   mrcPredict: true,
+  renkoReversal: true,
+  kagiReversal: true,
 }
 const PANEL_VISIBILITY_STORAGE_KEY = 'iqos.panelVisibility.v1'
 
@@ -289,6 +295,8 @@ export default function OSPage() {
   const [reversalOpen, setReversalOpen] = useState(false)
   const [reversalGlobalOpen, setReversalGlobalOpen] = useState(false)
   const [mrcPredictOpen, setMrcPredictOpen] = useState(false)
+  const [renkoReversalOpen, setRenkoReversalOpen] = useState(false)
+  const [kagiReversalOpen, setKagiReversalOpen] = useState(false)
   const [smcRecentOpen, setSmcRecentOpen] = useState(false)
   const [smcGlobalOpen, setSmcGlobalOpen] = useState(false)
   const [globalDomOpen, setGlobalDomOpen] = useState(false)
@@ -390,6 +398,8 @@ export default function OSPage() {
         else if (id === 'reversal') setReversalOpen(false)
         else if (id === 'reversalGlobal') setReversalGlobalOpen(false)
         else if (id === 'mrcPredict') setMrcPredictOpen(false)
+        else if (id === 'renkoReversal') setRenkoReversalOpen(false)
+        else if (id === 'kagiReversal') setKagiReversalOpen(false)
         else if (id === 'smcRecent') setSmcRecentOpen(false)
         else if (id === 'smcGlobal') setSmcGlobalOpen(false)
         else if (id === 'globalDom') setGlobalDomOpen(false)
@@ -950,6 +960,30 @@ export default function OSPage() {
     setMrcPredictOpen(true)
   }, [handleSelectAsset])
 
+  // Open the Renko (Effort Bricks) reversal event panel for the chart's current pair.
+  const handleOpenRenkoReversal = useCallback((a: string) => {
+    handleSelectAsset(a)
+    setReversalOpen(false)
+    setTechnicalOpen(false)
+    setOracleOpen(false)
+    setNextExpiryOpen(false)
+    setMrcPredictOpen(false)
+    setKagiReversalOpen(false)
+    setRenkoReversalOpen(true)
+  }, [handleSelectAsset])
+
+  // Open the Kagi (yin/yang) reversal event panel for the chart's current pair.
+  const handleOpenKagiReversal = useCallback((a: string) => {
+    handleSelectAsset(a)
+    setReversalOpen(false)
+    setTechnicalOpen(false)
+    setOracleOpen(false)
+    setNextExpiryOpen(false)
+    setMrcPredictOpen(false)
+    setRenkoReversalOpen(false)
+    setKagiReversalOpen(true)
+  }, [handleSelectAsset])
+
   // Tick desk cross-nav: the four tick-chart panels (SMC structure, next-candle
   // oracle, technical summary, footprint ladder) are siblings - opening one
   // closes the other three, same contract as the candle-desk handlers above.
@@ -1452,7 +1486,7 @@ export default function OSPage() {
                 closed = the slim open strip sits above the market watch and
                 everything is laid out exactly as before. */}
             <Panel defaultSize={17} minSize={11}>
-              {signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen || shockPressureOpen || renkoFootprintOpen || renkoFootprintOtcOpen || volumeFootprintOpen || tickVolumeOpen || tickSmcOpen || tickOracleOpen || tickTechnicalOpen || tickFootprintOpen || tickPatternsOpen || pairCompareOpen || pairSignalOpen || oracleOpen || nextExpiryOpen || nextExpiryGlobalOpen || technicalOpen || technicalGlobalOpen || reversalOpen || reversalGlobalOpen || smcRecentOpen || smcGlobalOpen || globalDomOpen || nextGlobalOpen || tempoOpen || tempoGlobalOpen || accuteOpen || accuteGlobalOpen || mrcPredictOpen ? (
+              {signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen || shockPressureOpen || renkoFootprintOpen || renkoFootprintOtcOpen || volumeFootprintOpen || tickVolumeOpen || tickSmcOpen || tickOracleOpen || tickTechnicalOpen || tickFootprintOpen || tickPatternsOpen || pairCompareOpen || pairSignalOpen || oracleOpen || nextExpiryOpen || nextExpiryGlobalOpen || technicalOpen || technicalGlobalOpen || reversalOpen || reversalGlobalOpen || smcRecentOpen || smcGlobalOpen || globalDomOpen || nextGlobalOpen || tempoOpen || tempoGlobalOpen || accuteOpen || accuteGlobalOpen || mrcPredictOpen || renkoReversalOpen || kagiReversalOpen ? (
                 <div className="mr-0.5 h-full min-h-0">
                   {ydayOpen ? (
                     <YesterdayPanel onClose={() => setYdayOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onFocusWindow={handleFocusYesterday} />
@@ -1498,6 +1532,10 @@ export default function OSPage() {
                     <ReversalGlobalPanel onClose={() => setReversalGlobalOpen(false)} closedTick={closedTick} onPickAsset={handleSelectAsset} onOpenReversal={handleOpenReversal} />
                   ) : mrcPredictOpen ? (
                     <MrcPredictPanel onClose={() => setMrcPredictOpen(false)} asset={asset} tf={tf} closedTick={closedTick} />
+                  ) : renkoReversalOpen ? (
+                    <RenkoReversalPanel onClose={() => setRenkoReversalOpen(false)} asset={asset} tf={tf} closedTick={closedTick} />
+                  ) : kagiReversalOpen ? (
+                    <KagiReversalPanel onClose={() => setKagiReversalOpen(false)} asset={asset} tf={tf} closedTick={closedTick} />
                   ) : globalDomOpen ? (
                     <GlobalDomPanel onClose={() => setGlobalDomOpen(false)} tf={tf} closedTick={closedTick} onPickAsset={handleSelectAsset} onOpenOracle={handleOpenOracle} onOpenAccute={handleOpenAccute} />
                   ) : smcGlobalOpen ? (
@@ -1668,6 +1706,30 @@ export default function OSPage() {
                       >
                         <span className="h-1.5 w-1.5 rounded-full bg-emerald-300" />
                         MRC Predict
+                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
+                      </button>
+                      )}
+                      {panelVisibility.renkoReversal && (
+                      <button
+                        type="button"
+                        onClick={() => handleOpenRenkoReversal(asset)}
+                        title="Renko reversal - only the moments an Effort Bricks chart flipped, newest first, each tagged confirmed/unconfirmed with its participation regime, plus this pair's own measured follow-through"
+                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-orange-500/40 hover:text-orange-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-orange-300" />
+                        Renko Reversal
+                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
+                      </button>
+                      )}
+                      {panelVisibility.kagiReversal && (
+                      <button
+                        type="button"
+                        onClick={() => handleOpenKagiReversal(asset)}
+                        title="Kagi reversal - only Kagi events, newest first: direction reversals plus yang (broke the last shoulder) and yin (broke the last waist) thickness flips, with this pair's own measured follow-through"
+                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-amber-500/40 hover:text-amber-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-amber-300" />
+                        Kagi Reversal
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
                       )}

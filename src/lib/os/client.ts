@@ -1154,6 +1154,95 @@ export async function getMrcPredictGlobal(opts?: { tf?: string; limit?: number; 
   })
 }
 
+// ---------- Renko (Effort Bricks) / Kagi reversal event feeds (mini-services/trading-core/src/plugins/reversalevents.ts) ----------
+// Event-shaped: only the moments a brick/line chart flipped, newest first,
+// plus each event kind's own measured follow-through on this pair's window.
+
+export interface ReversalFollowThrough {
+  group: string
+  horizon: number
+  n: number
+  wins: number
+  rate: number
+  lowerBound: number
+  breakeven: number
+  enough: boolean
+  proven: boolean
+}
+
+export type ReversalRegime = 'trending' | 'ranging' | 'choppy' | 'none'
+
+export interface RenkoReversalEvent {
+  time: number
+  candleIdx: number
+  candlesAgo: number
+  dir: 'call' | 'put'
+  price: number
+  priorRun: number
+  confirmed: boolean | null
+  effortRatio: number | null
+  regime: ReversalRegime | null
+}
+
+export interface RenkoReversalFeed {
+  source: 'effort' | 'renko'
+  brickSize: number
+  brickRule: string
+  effortSource: 'volume' | 'none' | 'n/a'
+  trend: 'up' | 'down' | 'none'
+  streak: number
+  confirmedRatio: number
+  regime: ReversalRegime | null
+  candleCount: number
+  lastCandleTime: number
+  totalReversals: number
+  events: RenkoReversalEvent[]
+  followThrough: ReversalFollowThrough[]
+}
+
+export interface KagiFeedEvent {
+  time: number
+  candleIdx: number
+  candlesAgo: number
+  type: 'reversal' | 'yang' | 'yin'
+  dir: 'call' | 'put'
+  price: number
+  level: number | null
+  thick: boolean
+}
+
+export interface KagiReversalFeed {
+  reversal: number
+  direction: 'up' | 'down' | 'none'
+  thick: boolean
+  shoulder: number | null
+  waist: number | null
+  structure: 'hh-hl' | 'lh-ll' | 'none'
+  regime: ReversalRegime
+  legsInWindow: number
+  candleCount: number
+  lastCandleTime: number
+  counts: { reversal: number; yang: number; yin: number }
+  events: KagiFeedEvent[]
+  followThrough: ReversalFollowThrough[]
+}
+
+export async function getRenkoReversals(
+  asset: string,
+  tf: string = '1m',
+  opts?: { source?: 'effort' | 'renko'; limit?: number; horizon?: number; payout?: number },
+): Promise<{ ok: boolean; result?: RenkoReversalFeed; error?: string }> {
+  return osGet('/renko_reversals', { asset, tf, source: opts?.source, limit: opts?.limit, horizon: opts?.horizon, payout: opts?.payout })
+}
+
+export async function getKagiReversals(
+  asset: string,
+  tf: string = '1m',
+  opts?: { limit?: number; horizon?: number; payout?: number },
+): Promise<{ ok: boolean; result?: KagiReversalFeed; error?: string }> {
+  return osGet('/kagi_reversals', { asset, tf, limit: opts?.limit, horizon: opts?.horizon, payout: opts?.payout })
+}
+
 // ---------- Technical Summary (mini-services/trading-core/src/plugins/technical.ts) ----------
 
 export type TechRead = 'buy' | 'sell' | 'neutral' | 'na'
