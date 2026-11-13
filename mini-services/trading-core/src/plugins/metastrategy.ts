@@ -675,6 +675,32 @@ put when ready and legOk and calm and (trendPut or rangePut)
 confidence = 60
 `,
   },
+  {
+    id: 'meta:builtin-kalman-ou-reversion',
+    name: 'Kalman-OU mean reversion (fade a significant stretch)',
+    script: `
+# Kalman-OU mean reversion: fade a statistically significant stretch, only when the market is demonstrably mean-reverting
+let ready = ou.ok() and stat.ok()
+let z = ou.z()
+# regime gate: a REAL reversion test (Dickey-Fuller t >= 2.86), a half-life short enough to pay inside an expiry,
+# a variance ratio under 1 (steps partly undo each other) and no clean one-way trend
+let reverts = ou.dfSignificant()
+let fastEnough = ou.halfLife() >= 2 and ou.halfLife() <= 20
+let vrOk = stat.varianceRatio() < 0.95
+let notTrending = stat.regR2(100) < 0.5
+let gate = ready and reverts and fastEnough and vrOk and notTrending
+# trigger: price far from the Kalman fair value
+let stretchedDown = z <= -2
+let stretchedUp = z >= 2
+# do not catch a falling knife: the last closed bar must already be turning back toward fair value
+let last = ohlc(-1)
+let turnUp = last.c > last.o
+let turnDown = last.c < last.o
+call when gate and stretchedDown and turnUp
+put when gate and stretchedUp and turnDown
+confidence = clamp(55 + 8 * (abs(z) - 2) + 4 * (0.95 - stat.varianceRatio()) * 10, 55, 80)
+`,
+  },
 ]
 
 /** Per direct follow-up ("SMC: FVG, SMC: CRT and so on are not on the
