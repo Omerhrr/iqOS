@@ -903,7 +903,21 @@ class Parser {
       let path = this.expect('ident').value
       while (this.peek().kind === 'dot') {
         this.next()
-        path += `.${this.expect('ident').value}`
+        // BUG FIX (strategy vet): a path SEGMENT that happens to spell a
+        // keyword (`configure memory.expiry = 2` - 'expiry' tokenizes as
+        // expiry_kw, not ident) used to die here with `expected ident, got
+        // "expiry"`, so the whitelisted 'memory.expiry' knob could never be
+        // set from a script at all - Outcome Memory was stuck on its 5-bar
+        // default horizon no matter what expiry the script itself traded.
+        // After a dot inside a configure path a word is always a key
+        // segment, never a statement keyword, so accept it as one.
+        const seg = this.peek()
+        if (seg.kind !== 'ident' && KEYWORDS[seg.value] !== undefined) {
+          this.next()
+          path += `.${seg.value}`
+        } else {
+          path += `.${this.expect('ident').value}`
+        }
       }
       if (!path.includes('.')) throw new MslSyntaxError(`line ${t.line}: "configure" needs a dotted key like configure renko.atrMult = 0.5 (got "${path}")`)
       this.expect('eq_assign')

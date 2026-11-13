@@ -187,11 +187,34 @@ check on top. `gate()` still enforces a real edge over the account's actual
 payout before either side fires.
 
 ```
-call when outcomeMemory.value > 0.5 and gate(outcomeMemory.value, payout.value, 0.02)
-put when outcomeMemory.value < 0.5 and gate(1 - outcomeMemory.value, payout.value, 0.02)
+configure memory.expiry = 1
+let p = outcomeMemory.value
+call when outcomeMemory.dir == call and gate(p, payout.value, 0.02)
+put when outcomeMemory.dir == put and gate(1 - p, payout.value, 0.02)
 confidence = outcomeMemory.conf
 expiry = 1
 ```
+
+**CORRECTED (strategy vet) - the first version of this example had two real
+bugs, kept here so nobody reuses it.** It read
+`put when outcomeMemory.value < 0.5 and gate(1 - outcomeMemory.value, ...)`
+with no direction check. When Outcome Memory has NO read (thin pool, or pUp
+inside its own coin-flip deadband) `.value` is 0 - so `value < 0.5` was true
+and `gate(1 - 0, ...)` passed at a "100% win probability": the script called
+PUT, at confidence 0, on every bar Memory was unsure about. Always test the
+read's `.dir` before using its `.value`. Second, it traded a 1-bar expiry
+off Memory's default **5-bar** settlement horizon - `configure memory.expiry`
+now matches the two (and could not even be parsed before the same vet's
+parser fix: a config key segment that spells a keyword, like `expiry`, used
+to be rejected).
+
+**Honesty note, measured:** on a driftless random walk (where the true win
+rate is 50% by construction) this script still fires on roughly a third of
+all bars while reporting pUp of 60-70% - and wins 50.5%. Twenty nearest
+neighbours is a small, overlapping sample: its raw frequency is a
+description of the past, NOT a calibrated win probability, and `gate()` on
+it is not proof of an edge. Treat this as a hypothesis generator and
+walk-forward it on real history before trusting it.
 
 ## 10. Pulse-Vector exhaustion fade
 
@@ -503,9 +526,83 @@ the point of stacking this many independent checks - the test's purpose
 (proving no runtime errors, correct field access, correct `since()` wiring)
 was achieved.
 
+## 16. Calibrated Regime Edge (payout-proven, self-calibrating)
+
+The strategy vet's answer to "which of these should I actually trade?" -
+and the reason it is built the way it is was measured, not argued. Every
+builtin strategy was run over three synthetic markets: a driftless random
+walk, one with planted lag-1 momentum, one with planted lag-1 mean
+reversion. On the random walk all of them settle at ~50% (no look-ahead
+anywhere). On the other two almost every rule turned out to be
+**fixed-polarity**: the trend-followers that won 57-63% in the momentum
+market lost at 35-44% in the reverting one, and the faders did the exact
+opposite. A fixed rule has no edge of its own - it borrows its sign from
+whichever regime the pair is in and pays the house when the regime flips.
+
+`calibrated-edge` (`analytics/calibratededge.ts`, a builtin strategy) does
+not assume either. On the pair's own trailing closed bars it looks up one
+number - *after a bar that moved about this hard (quiet / normal / impulse),
+how often did price keep going?* - and trades continuation, or the fade,
+only when ALL of these hold:
+
+1. the **Wilson lower bound** of that rate (not the raw ratio - 9/12 is not
+   "75% proven") clears this trade's breakeven `1/(1+payout)` plus a
+   cushion;
+2. the same side leads in **both halves** of the window;
+3. the same side still leads in the **newest fifth** of the samples.
+
+Otherwise it stands aside. This wrapper feeds the pair's REAL live payout
+into the breakeven gate, which the builtin's fixed `payoutPct` param cannot
+do on its own.
+
+```
+configure strategy.calibrated-edge.payoutPct = if(payout.value > 0, payout.value * 100, 85)
+configure strategy.calibrated-edge.window = 230
+configure strategy.calibrated-edge.zConf = 2
+configure strategy.calibrated-edge.horizon = 1
+call when builtinSig('calibrated-edge', call).active
+put when builtinSig('calibrated-edge', put).active
+confidence = 70
+expiry = 1
+```
+
+`window = 230` is deliberate, not a tuning choice: a live MSL script only
+sees the last 240 closed bars. Arming the builtin `calibrated-edge`
+directly on a Bot or the Auto Trader (`strategy` source) runs it on 1500
+bars with its full 600-bar window - that is the stronger way to run it, and
+the only one with the research gate, payout floor and streak breaker in
+front of it. Keep `horizon` equal to the expiry in bars.
+
+Measured on synthetic data (next-bar settlement, 85% payout, breakeven
+54.1%), full 600-bar window:
+
+| market | trades / 13k bars | win rate |
+| --- | --- | --- |
+| driftless random walk | 0 | - |
+| planted momentum (+0.20) | 1355 | 63.0% |
+| planted reversion (-0.20) | 1834 | 62.5% |
+| weak momentum (+0.10) | 217 | 58.1% |
+| regime flipping every 400 bars | 1 | - |
+
+**What that table does and does not show.** It shows the gate is honest: no
+trades where there is nothing to find, the right side in both regimes, and
+silence when the regime is too unstable to prove. It does NOT show that
+real pairs carry a persistent enough regime for it to fire profitably -
+only this pair's own walk-forward on real history can show that. Its known
+failure mode is a regime that flips faster than the calibration window: the
+evidence then peaks exactly as the regime ends (with a 600-bar window and
+the looser z = 1.64, the 400-bar-flip market produced 49 trades at 26.5%).
+`z = 2` is the default for that reason; the engine-level streak breaker and
+daily loss limit are the backstop, not this script.
+
 ---
 
-All 15 of the above were verified by parsing and evaluating each one with
+#16 was verified differently, because it is the one meant to be traded: end to
+end through the real `MetaStrategyService.evaluate()` path (live payout read,
+two-pass `configure`, `builtinSig()` resolver) on the three synthetic markets
+above, plus the regression tests in `tests/msl.test.ts`.
+
+The first 15 were verified by parsing and evaluating each one with
 `evaluateStrategyScript()` against synthetic candle series and a synthetic
 tick buffer (the same smoke-test discipline this project uses before any
 primitive ships), confirming each one parses, evaluates without a runtime

@@ -129,6 +129,7 @@ export interface SweepResult {
 // converge quickly. Used to pick the evaluation window and fold sizes.
 function strategyWarmup(id: string): number {
   if (id === 'markov-edge' || id === 'confluence-core' || id === 'confluence-full') return 560
+  if (id === 'calibrated-edge') return 620 // calibration window default 600 + horizon + slack - shorter prefixes are judged on a thinner record
   if (id === 'oracle-fusion') return 400 // ORACLE_MIN_CANDLES 320 + markov/OU/confluence slack
   if (id === 'mtf-alignment') return 340 // needs ~25 resampled 15x bars -> 375 raw bars, plus slack
   if (id === 'garch-vol-expansion') return 320 // window default 300 + slack
@@ -779,16 +780,34 @@ export function walkForward(candles: Candle[], asset: string, tf: Timeframe, opt
     // slow-warming strategies pick "best params" off garbage/uninitialized
     // signals, since their real warmup requirement is often larger than the
     // whole IS slice.
-    const isWarmup = Math.min(strategyWarmup(strat.id), Math.floor(isSlice.length * 0.4))
+    // STRATEGY VET FIX: the IS slice used to start COLD at isStart with a
+    // warmup capped at 40% of its own length (~147 bars on the research
+    // gate's 2200-candle / 3-fold run), so any strategy whose estimation
+    // window is longer than that was either graded on half-warmed signals
+    // or - for the ones that honestly refuse to speak until warm
+    // (markov-edge, calibrated-edge, accute) - produced ZERO in-sample
+    // trades, got "no combo passed the trade guard", and could never earn a
+    // verdict at all: the gate structurally failed exactly the strategies
+    // that measure before they trade. The OOS leg below already solved this
+    // by extending its slice BACKWARDS over already-seen history; the IS leg
+    // now does the same. No lookahead: the prefix is strictly earlier bars,
+    // and trades only fire after the warmup guard - i.e. inside the true IS
+    // region, ALL of it now instead of its last 60%. isStart >= the
+    // strategy's warmup by construction (isStart = warmup + f * foldSize),
+    // so the full prefix always exists.
+    const isPrefix = Math.min(strategyWarmup(strat.id), isStart)
+    const isEvalStart = isStart - isPrefix
+    const isEvalSlice = candles.slice(isEvalStart, isStart + isBars)
+    const isWarmup = isPrefix > 0 ? isPrefix : Math.min(strategyWarmup(strat.id), Math.floor(isSlice.length * 0.4))
     // Leader slice for THIS fold's IS window - sliced from the full,
-    // index-aligned leaderCandles the same way isSlice is sliced from the
+    // index-aligned leaderCandles the same way isEvalSlice is sliced from the
     // full `candles`, so fastBacktest's own alignedLeader check (candles vs
     // leaderCandles length) passes and index i means the same bar in both.
-    const isLeaderSlice = leaderCandles ? leaderCandles.slice(isStart, isStart + isBars) : undefined
-    const isLeaderSlice2 = leaderCandles2 ? leaderCandles2.slice(isStart, isStart + isBars) : undefined
-    const isAuxByStrategy = opts.auxByStrategy ? sliceAuxByStrategyRange(opts.auxByStrategy, isStart, isStart + isBars) : undefined
+    const isLeaderSlice = leaderCandles ? leaderCandles.slice(isEvalStart, isStart + isBars) : undefined
+    const isLeaderSlice2 = leaderCandles2 ? leaderCandles2.slice(isEvalStart, isStart + isBars) : undefined
+    const isAuxByStrategy = opts.auxByStrategy ? sliceAuxByStrategyRange(opts.auxByStrategy, isEvalStart, isStart + isBars) : undefined
     for (const combo of combos) {
-      const m = fastBacktest(isSlice, strat.id, combo, {
+      const m = fastBacktest(isEvalSlice, strat.id, combo, {
         ...common,
         warmup: isWarmup,
         startEquity: 1000,

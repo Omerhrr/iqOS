@@ -229,6 +229,23 @@ function unavailableReads(): Record<string, MslSourceRead> {
   return reads
 }
 
+/** BUG FIX (strategy vet): `payout` used to stay stubbed at value 0 for the
+ * whole replay even when the caller SUPPLIED a payout fraction for the
+ * P&L math - so `gate(p, payout.value, e)` evaluated winProb*0 - (1-winProb)
+ * >= e, i.e. false on every bar, and any script using the documented
+ * `gate(..., payout.value, ...)` EV gate (13 of the 15 seeded builtin
+ * examples) fired ZERO trades here and looked "untestable" rather than
+ * tested. A payout the caller explicitly passed is not a fabricated read -
+ * it is the exact assumption the result's own expectancy/netPnl are already
+ * computed under - so the script now sees that same number. With no payout
+ * supplied the read stays 0 (honest "unknown"), unchanged. Returns the
+ * source names still unavailable, so `unavailableSources` no longer lists
+ * `payout` when it was in fact provided. */
+function applyPayoutRead(reads: Record<string, MslSourceRead>, payout: number | undefined): string[] {
+  if (payout !== undefined && payout > 0) reads.payout = { direction: 'none', confidence: 0, value: payout }
+  return Object.keys(reads).filter((k) => !(k === 'payout' && payout !== undefined && payout > 0))
+}
+
 function seriesUpTo(candles: Candle[], i: number): MslSeriesCtx {
   const slice = candles.slice(0, i + 1)
   return {
@@ -384,8 +401,8 @@ export function backtestMslScript(candles: Candle[], script: string, opts: MslBa
   const minConfidence = Math.max(0, Math.min(100, opts.minConfidence ?? 0))
   const runId = opts.runId ?? `mslbacktest:${Date.now()}:${Math.random().toString(36).slice(2)}`
   const reads = unavailableReads()
-  const unavailableSources = Object.keys(reads)
   const payout = opts.payout !== undefined && Number.isFinite(opts.payout) ? Math.max(0, opts.payout) : undefined
+  const unavailableSources = applyPayoutRead(reads, payout)
   const expiryBarsList = (opts.expiryBarsList ?? []).map((n) => Math.max(1, Math.round(n))).filter((n) => Number.isFinite(n))
   const maxExpiryNeeded = Math.max(expiryBars, ...expiryBarsList, 1)
   const empty = (error: string): MslBacktestResult => ({ ok: false, error, barsEvaluated: 0, trades: [], wins: 0, losses: 0, winRate: null, avgConfidence: null, unavailableSources })
@@ -470,8 +487,8 @@ export function backtestMslScriptWalkForward(candles: Candle[], script: string, 
   const minConfidence = Math.max(0, Math.min(100, opts.minConfidence ?? 0))
   const runId = opts.runId ?? `mslbacktest-wf:${Date.now()}:${Math.random().toString(36).slice(2)}`
   const reads = unavailableReads()
-  const unavailableSources = Object.keys(reads)
   const payout = opts.payout !== undefined && Number.isFinite(opts.payout) ? Math.max(0, opts.payout) : undefined
+  const unavailableSources = applyPayoutRead(reads, payout)
   const emptyWf = (error: string): MslBacktestWalkForwardResult => ({
     ok: false,
     error,

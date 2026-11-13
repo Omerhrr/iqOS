@@ -22,6 +22,8 @@ import { computeDeltaProfile } from '../src/analytics/deltaprofile'
 import { MSL_READ_CONFIGS, validateMslConfigs } from '../src/plugins/metastrategy'
 import { volumeBars } from '../src/analytics/volumebars'
 import type { Candle } from '../src/types'
+import { computeCalibratedEdge } from '../src/analytics/calibratededge'
+import { getStrategy } from '../src/strategies/builtin'
 
 type Test = { name: string; fn: () => void }
 const tests: Test[] = []
@@ -608,6 +610,109 @@ test('outcomeMemory.* reports ok=false / poolSize=0 honestly on too little histo
   const series = syntheticSeries(5, 13)
   const r = run('let ok = outcomeMemory.ok()\nlet pool = outcomeMemory.poolSize()\ncall when (not ok) and pool == 0\nconfidence = 50', series)
   assert.equal(r.error, undefined)
+})
+
+// ---------------------------------------------------------------------
+// strategy vet (payout read in the backtester, configure keyword segments,
+// the Calibrated Regime Edge engine)
+// ---------------------------------------------------------------------
+
+/** Seeded 1m candles whose bar returns carry a planted lag-1
+ * autocorrelation `phi` (0 = driftless random walk). */
+function plantedCandles(n: number, seed: number, phi: number): Candle[] {
+  let a = seed
+  const rnd = () => {
+    a |= 0
+    a = (a + 0x6d2b79f5) | 0
+    let t = Math.imul(a ^ (a >>> 15), 1 | a)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+  const gauss = () => {
+    let u = 0
+    let v = 0
+    while (u === 0) u = rnd()
+    while (v === 0) v = rnd()
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v)
+  }
+  const out: Candle[] = []
+  let p = 1.1
+  let prev = 0
+  for (let i = 0; i < n; i++) {
+    const o = p
+    let h = o
+    let l = o
+    for (let k = 0; k < 12; k++) {
+      p = p * (1 + (phi * prev) / 12 + gauss() * 0.00009)
+      if (p > h) h = p
+      if (p < l) l = p
+    }
+    prev = p / o - 1
+    out.push({ time: 1_700_000_040 + i * 60, open: o, high: h, low: l, close: p, volume: 100 })
+  }
+  return out
+}
+
+/** Walk an engine bar by bar and settle each signal on the next close. */
+function walkEdge(candles: Candle[], opts: Parameters<typeof computeCalibratedEdge>[1]) {
+  let n = 0
+  let wins = 0
+  for (let i = 620; i < candles.length - 1; i++) {
+    const d = computeCalibratedEdge(candles.slice(Math.max(0, i - 1500), i + 1), opts).direction
+    if (d === 'none') continue
+    n++
+    const delta = candles[i + 1].close - candles[i].close
+    if ((d === 'call' && delta > 0) || (d === 'put' && delta < 0)) wins++
+  }
+  return { n, winRate: n ? wins / n : 0 }
+}
+
+test('backtest: a supplied payout reaches payout.value, so a gate() script can actually fire (was stubbed to 0)', () => {
+  const candles = seriesToCandles(syntheticSeries(200, 5))
+  const script = 'call when ohlc(-1).c > ohlc(-2).c and gate(0.6, payout.value, 0.0)\nput when ohlc(-1).c < ohlc(-2).c and gate(0.6, payout.value, 0.0)\nconfidence = 60'
+  const withPayout = backtestMslScript(candles, script, { payout: 0.85, expiryBars: 1, warmupBars: 20 })
+  assert.ok(withPayout.ok && withPayout.trades.length > 0, 'gate(0.6, 0.85) is +EV - the script must fire when the payout is supplied')
+  assert.ok(!withPayout.unavailableSources.includes('payout'), 'a supplied payout is not an unavailable source')
+  const noPayout = backtestMslScript(candles, script, { expiryBars: 1, warmupBars: 20 })
+  assert.equal(noPayout.trades.length, 0, 'with no payout supplied the read stays 0 (unknown) and the gate stays shut')
+  assert.ok(noPayout.unavailableSources.includes('payout'))
+})
+
+test('configure accepts a key segment that spells a keyword (memory.expiry) and the value reaches the engine', () => {
+  const parsed = parseStrategyScript('configure memory.expiry = 2\ncall when true\nconfidence = 50')
+  assert.ok(parsed.ok, `configure memory.expiry must parse: ${!parsed.ok ? parsed.error : ''}`)
+  assert.ok('memory.expiry' in MSL_READ_CONFIGS)
+  validateMslConfigs({ 'memory.expiry': 2 })
+  // a statement keyword is still a statement keyword at the start of a line
+  assert.ok(!parseStrategyScript('configure expiry = 2\ncall when true').ok)
+})
+
+test('calibrated edge: stands aside on a driftless random walk (no proven edge = no trades)', () => {
+  const r = walkEdge(plantedCandles(3000, 11, 0), { window: 600, z: 2 })
+  assert.ok(r.n <= 5, `expected ~0 trades on pure noise, got ${r.n}`)
+})
+
+test('calibrated edge: finds the edge in BOTH a planted-momentum and a planted-reversion market', () => {
+  const mom = walkEdge(plantedCandles(3000, 11, 0.2), { window: 600, z: 2 })
+  const rev = walkEdge(plantedCandles(3000, 11, -0.2), { window: 600, z: 2 })
+  assert.ok(mom.n > 100 && mom.winRate > 0.56, `momentum market: ${mom.n} trades at ${(mom.winRate * 100).toFixed(1)}%`)
+  assert.ok(rev.n > 100 && rev.winRate > 0.56, `reversion market: ${rev.n} trades at ${(rev.winRate * 100).toFixed(1)}%`)
+})
+
+test('calibrated edge: a rate that looks good on a thin sample does not pass (Wilson floor, not the raw ratio)', () => {
+  // 9/12 = 75% raw - far above breakeven, but nowhere near proven
+  const r = computeCalibratedEdge(plantedCandles(260, 3, 0), { window: 250, minSamples: 10, z: 2 })
+  if (r.samples > 0 && r.samples < 30) assert.equal(r.direction, 'none')
+  assert.ok(r.breakeven > 0.54 && r.breakeven < 0.541, 'breakeven at 85% payout is 1/1.85')
+})
+
+test("the 'calibrated-edge' builtin is registered and returns a well-formed eval", () => {
+  const strat = getStrategy('calibrated-edge')
+  assert.ok(strat, 'calibrated-edge must be in the registry')
+  const ev = strat!.evaluate(plantedCandles(900, 7, 0.25), { window: 600, horizon: 1, payoutPct: 85, marginPct: 1, zConf: 2, minSamples: 40 })
+  assert.ok(['call', 'put', 'none'].includes(ev.direction))
+  assert.ok(typeof ev.notes === 'string' && ev.notes.length > 0)
+  if (ev.direction !== 'none') assert.ok(ev.score >= 60 && ev.score <= 95)
 })
 
 // ---------------------------------------------------------------------

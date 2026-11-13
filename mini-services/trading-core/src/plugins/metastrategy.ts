@@ -346,7 +346,7 @@ function normalizeMetaId(id: string): string {
  * the original broken one is kept in that file only as a do-not-reuse
  * record). seedBuiltinExamples() below turns each of these into a real
  * persisted MetaStrategySpec on service start, idempotently. */
-const BUILTIN_EXAMPLE_SPECS: { id: string; name: string; script: string }[] = [
+const BUILTIN_EXAMPLE_SPECS: { id: string; name: string; script: string; /** earlier builtin texts of this id - a stored spec still carrying one of these verbatim is upgraded in place (a user-edited one never matches, so it is never touched) */ supersedes?: string[] }[] = [
   {
     id: 'meta:builtin-renko-vp-poc',
     name: 'Builtin: Renko trend + VP POC distance',
@@ -447,12 +447,32 @@ expiry = 1
   {
     id: 'meta:builtin-outcome-memory',
     name: 'Builtin: Historical Outcome Memory, payout-gated',
+    // STRATEGY VET - two real bugs in the first version (kept below in
+    // `supersedes` so an already-seeded copy of it is upgraded in place):
+    //  1. it never checked the read's DIRECTION. When Outcome Memory has no
+    //     read (thin pool, or pUp inside its coin-flip deadband) `.value`
+    //     is 0, so `outcomeMemory.value < 0.5` was TRUE and
+    //     `gate(1 - 0, ...)` passed at "100% win probability" - the script
+    //     called PUT, at confidence 0, on every bar Memory was unsure.
+    //  2. it traded a 1-bar expiry off Memory's default 5-bar settlement
+    //     horizon (and `configure memory.expiry` could not even be written
+    //     until the parser fix in strategylang.ts).
     script: `
+configure memory.expiry = 1
+let p = outcomeMemory.value
+call when outcomeMemory.dir == call and gate(p, payout.value, 0.02)
+put when outcomeMemory.dir == put and gate(1 - p, payout.value, 0.02)
+confidence = outcomeMemory.conf
+expiry = 1
+`,
+    supersedes: [
+      `
 call when outcomeMemory.value > 0.5 and gate(outcomeMemory.value, payout.value, 0.02)
 put when outcomeMemory.value < 0.5 and gate(1 - outcomeMemory.value, payout.value, 0.02)
 confidence = outcomeMemory.conf
 expiry = 1
 `,
+    ],
   },
   {
     id: 'meta:builtin-pulse-vector-exhaustion',
@@ -582,6 +602,31 @@ confidence = 62
 expiry = 2
 `,
   },
+  {
+    // #16 - the strategy vet's own answer to "the ultimate strategy". A thin
+    // MSL wrapper over the 'calibrated-edge' builtin (analytics/
+    // calibratededge.ts - read its header for the measured rationale), so
+    // Meta Trader and Omni Trader - which only ever trade a meta: spec - can
+    // run it too. Two things only the wrapper can do: feed the pair's REAL
+    // live payout into the breakeven gate (the builtin's own payoutPct is a
+    // fixed param), and state the series-depth limit honestly: a live MSL
+    // script sees the last 240 closed bars (scriptResolver), so the window
+    // is set to 230 here - the Bots / Auto-Trader path runs the builtin
+    // directly on 1500 bars with its full 600-bar window and is the
+    // stronger way to run it.
+    id: 'meta:builtin-calibrated-edge',
+    name: 'Builtin: Calibrated Regime Edge (payout-proven, self-calibrating)',
+    script: `
+configure strategy.calibrated-edge.payoutPct = if(payout.value > 0, payout.value * 100, 85)
+configure strategy.calibrated-edge.window = 230
+configure strategy.calibrated-edge.zConf = 2
+configure strategy.calibrated-edge.horizon = 1
+call when builtinSig('calibrated-edge', call).active
+put when builtinSig('calibrated-edge', put).active
+confidence = 70
+expiry = 1
+`,
+  },
 ]
 
 /** Per direct follow-up ("SMC: FVG, SMC: CRT and so on are not on the
@@ -673,8 +718,13 @@ export class MetaStrategyService {
    * walked by meta_strategy_backtest. */
   private seedBuiltinExamples(): number {
     let seeded = 0
-    for (const ex of [...BUILTIN_EXAMPLE_SPECS, ...BUILTIN_SMC_CONCEPT_SPECS]) {
-      if (this.specs.has(normalizeMetaId(ex.id))) continue
+    for (const ex of [...BUILTIN_EXAMPLE_SPECS, ...BUILTIN_SMC_CONCEPT_SPECS] as { id: string; name: string; script: string; supersedes?: string[] }[]) {
+      const existing = this.specs.get(normalizeMetaId(ex.id))
+      // Skip-if-present, with ONE exception: a stored spec whose script is
+      // still, verbatim, an EARLIER builtin text of the same id (listed in
+      // `supersedes`) is a known-buggy seed nobody edited - upgrade it in
+      // place. Anything the user changed no longer matches and is left alone.
+      if (existing && !(ex.supersedes ?? []).some((old) => old.trim() === (existing.script ?? '').trim())) continue
       try {
         this.save({ id: ex.id, name: ex.name, mode: 'all', conditions: [], script: ex.script })
         seeded++

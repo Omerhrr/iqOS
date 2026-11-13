@@ -31,6 +31,7 @@ import { predictNextCandle, ORACLE_EVAL_WINDOW, ORACLE_MIN_CANDLES, type NextCan
 import { tempoConviction, tempoCrossSignalMult, tempoDecide, tempoWindow, TEMPO_WINDOW_BARS, TEMPO_HISTORY_WINDOWS, TEMPO_FLOOR, type TempoDecision } from '../analytics/tempo'
 import { combineAccute, accuteSummary, type AccuteDriver } from '../analytics/accute'
 import { trendPullbackSeries, rangeZoneSeries } from '../analytics/structure'
+import { computeCalibratedEdge } from '../analytics/calibratededge'
 
 /** Memoizes Oracle-fusion reads (shared by the 'oracle-fusion' and 'tempo'
  * strategies below) by (asset, tf, candle open time) - a bar's own
@@ -2265,6 +2266,44 @@ export const STRATEGIES: StrategyDef[] = [
         score,
         notes: `shock ratio ${fit.shockRatio.toFixed(2)} agrees with pressure ${fit.pressureRatio >= 0 ? '+' : ''}${(fit.pressureRatio * 100).toFixed(0)}% over ${num(p, 'lookback', PRESSURE_LOOKBACK)} bars - composite ${fit.composite.toFixed(1)}`,
       }
+    },
+  },
+  {
+    // STRATEGY VET (see analytics/calibratededge.ts's header for the full
+    // measured rationale): the one rule in this registry that carries its
+    // own payout-aware statistical gate. Every other entry reports a
+    // direction and leaves "is this actually above breakeven?" to whoever
+    // arms it; this one stands aside by construction unless this pair's own
+    // trailing record PROVES (Wilson floor, both window halves, newest
+    // samples) that continuation - or the fade - beats 1/(1+payout) here,
+    // now, in the state the last bar is in. Expect long silences: on a
+    // driftless random walk it fires ~0 trades, which is the correct answer.
+    id: 'calibrated-edge',
+    name: 'Calibrated Regime Edge',
+    description:
+      "Measures, on this pair's own trailing closed bars, how often price kept going after a bar that moved about as hard as the last one (quiet / normal / impulse). Trades continuation - or the fade - ONLY when the Wilson lower bound of that rate clears this trade's breakeven 1/(1+payout) plus a cushion, the same side leads in both halves of the window AND in its newest samples. Self-calibrating in both directions: it does not assume trend or mean-reversion, it looks up which one this pair is paying right now, and stands aside when neither is proven. Set Horizon to the bot's expiry in bars and Payout to the pair's real payout (pair it with the bot's payout floor at the same number).",
+    params: [
+      { key: 'window', label: 'Calibration window (bars)', type: 'number', min: 200, max: 2000, default: 600 },
+      { key: 'horizon', label: 'Outcome horizon (bars) - match the expiry', type: 'number', min: 1, max: 5, default: 1 },
+      { key: 'payoutPct', label: 'Payout % the gate must beat', type: 'number', min: 60, max: 95, default: 85 },
+      { key: 'marginPct', label: 'Cushion over breakeven (points)', type: 'number', min: 0, max: 10, step: 0.5, default: 1 },
+      { key: 'zConf', label: 'Confidence z (1.64 = 95%, 2 = 97.7%)', type: 'number', min: 1, max: 3, step: 0.01, default: 2 },
+      { key: 'minSamples', label: 'Min same-state samples', type: 'number', min: 20, max: 300, default: 40 },
+    ],
+    evaluate: (candles, p) => {
+      const r = computeCalibratedEdge(candles, {
+        window: num(p, 'window', 600),
+        horizon: num(p, 'horizon', 1),
+        payout: num(p, 'payoutPct', 85) / 100,
+        margin: num(p, 'marginPct', 1) / 100,
+        z: num(p, 'zConf', 2),
+        minSamples: num(p, 'minSamples', 40),
+      })
+      if (r.direction === 'none') return { direction: 'none', score: 0, notes: r.note }
+      // score = 60 at a floor that only just clears breakeven+cushion,
+      // +2.5 per extra proven point - so a bot's minScore reads as "how far
+      // past breakeven must the PROVEN floor be", not a vote count.
+      return { direction: r.direction, score: clamp(60 + r.edge * 250, 60, 95), notes: r.note }
     },
   },
 ]
