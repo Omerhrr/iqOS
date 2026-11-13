@@ -119,6 +119,14 @@ export class Store {
         id INTEGER PRIMARY KEY CHECK (id = 1),
         config TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS brain_trader_config (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        config TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS brain_trader_log (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        log TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS watchdog_state (
         bot_id TEXT PRIMARY KEY,
         state TEXT NOT NULL,
@@ -1288,6 +1296,38 @@ export class Store {
     this.db.run('INSERT INTO omni_trader_config (id, config) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET config = excluded.config', [
       JSON.stringify(config),
     ])
+  }
+
+  // ---------- brain trader (plugins/braintrader.ts) ----------
+  // Config (single JSON row) plus the rolling decision log (last ~300 decisions, one JSON row) so shadow results survive restarts.
+
+  getBrainTraderConfig(): unknown | null {
+    const row = this.db.query('SELECT config FROM brain_trader_config WHERE id = 1').get() as { config: string } | null
+    if (!row) return null
+    try {
+      return JSON.parse(row.config)
+    } catch {
+      return null
+    }
+  }
+
+  saveBrainTraderConfig(config: unknown): void {
+    this.db.run('INSERT INTO brain_trader_config (id, config) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET config = excluded.config', [JSON.stringify(config)])
+  }
+
+  getBrainTraderLog(): unknown[] | null {
+    const row = this.db.query('SELECT log FROM brain_trader_log WHERE id = 1').get() as { log: string } | null
+    if (!row) return null
+    try {
+      const v = JSON.parse(row.log)
+      return Array.isArray(v) ? v : null
+    } catch {
+      return null
+    }
+  }
+
+  saveBrainTraderLog(log: unknown[]): void {
+    this.db.run('INSERT INTO brain_trader_log (id, log) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET log = excluded.log', [JSON.stringify(log)])
   }
 
   // ---------- watchdog (strategy health) ----------

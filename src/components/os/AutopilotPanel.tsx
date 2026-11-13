@@ -20,6 +20,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import type { AssetRow, AutoTraderConfig, BotConfig, BotRow, MetaStakePlan, MetaStrategySpec, MetaTraderConfig, MetaTraderSource, MetaTraderStatus, OmniTraderConfig, OmniTraderStatus, OsModeStatus, OtcConfig, OtcPolicy, StrategyInfo, Timeframe, TradeKind, ValidationRow } from '@/lib/os/client'
+import BrainTraderPanel from '@/components/os/BrainTraderPanel'
 import { BLITZ_EXPIRY_SECONDS, KIND_LABEL, META_TRADER_SOURCE_LABELS, TIMEFRAMES, fmtMoney, fmtTime, getMetaStrategies, getOtcConfig, osGet, osPost, setOtcConfig } from '@/lib/os/client'
 
 const GATE_MAX_AGE_SEC = 14 * 24 * 60 * 60
@@ -361,6 +362,9 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, m
           refreshOmniTrader()
         }}
       />
+
+      {/* brain trader - structure brain + AI reviewer (plugins/braintrader.ts); self-contained panel, shadow by default */}
+      <BrainTraderPanel />
 
       {/* header */}
       <div className="flex shrink-0 items-center justify-between">

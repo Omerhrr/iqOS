@@ -211,6 +211,11 @@ export class ExecutionService {
     } catch {
       // omni-trader plugin not loaded - nothing to reset there
     }
+    try {
+      this.ctx.use<{ resetAllStats: () => void }>('brainTrader').resetAllStats()
+    } catch {
+      // brain-trader plugin not loaded - nothing to reset there
+    }
     // FORCE-reset the Sentinel breakers as part of the same reset, so a
     // fresh start never leaves the daily-loss/drawdown breakers latched
     // from the OLD account's numbers requiring a separate manual reset in

@@ -43,6 +43,7 @@ import { metaStrategyPlugin, MetaStrategyService } from './src/plugins/metastrat
 import { aiTraderPlugin, AiTraderService } from './src/plugins/aitrader'
 import { metaTraderPlugin, MetaTraderService } from './src/plugins/metatrader'
 import { omniTraderPlugin, OmniTraderService } from './src/plugins/omnitrader'
+import { brainTraderPlugin, BrainTraderService } from './src/plugins/braintrader'
 import { META_CONDITION_SOURCES } from './src/analytics/metastrategy'
 import { yesterdayPlugin, YesterdayService } from './src/plugins/yesterday'
 import { nextCandlePlugin, NextCandleService } from './src/plugins/nextcandle'
@@ -238,6 +239,7 @@ kernel.register(adxHonestyPlugin)
 kernel.register(accutePlugin)
 kernel.register(metaTraderPlugin)
 kernel.register(omniTraderPlugin)
+kernel.register(brainTraderPlugin)
 // PRECISION FIX: these three plugins (and the panels/client.ts wrappers
 // that call them) existed in the repo but were never registered with the
 // kernel, so every one of /next_expiry, /reversal, /technical (and their
@@ -960,6 +962,24 @@ const httpServer = createServer(async (req, res) => {
         try {
           const omniTrader = kernel.context().use<OmniTraderService>('omniTrader')
           return json(200, { ok: true, ...omniTrader.status() })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // GET /brain_trader_status -> Brain Trader config + runtime + per-group hit rates (proposed / approved / vetoed).
+      // GET /brain_trader_decisions?limit=50 -> newest-first decision log (shadow and live) with the reviewer's reasoning and outcomes.
+      if (path === '/brain_trader_status') {
+        try {
+          return json(200, { ok: true, ...kernel.context().use<BrainTraderService>('brainTrader').status() })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+      if (path === '/brain_trader_decisions') {
+        try {
+          const limit = Number(url.searchParams.get('limit') ?? 50)
+          return json(200, { ok: true, decisions: kernel.context().use<BrainTraderService>('brainTrader').decisions(Number.isFinite(limit) ? limit : 50) })
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }
@@ -4603,6 +4623,25 @@ const httpServer = createServer(async (req, res) => {
           const omniTrader = kernel.context().use<OmniTraderService>('omniTrader')
           const cfg = omniTrader.configure(body as Record<string, never>)
           return json(200, { ok: true, config: cfg })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // POST /brain_trader_config -> patch the Brain Trader's config (enabled / live / tf / minAgree / expiriesSec / requireAi ...).
+      if (path === '/brain_trader_config') {
+        try {
+          const cfg = kernel.context().use<BrainTraderService>('brainTrader').configure(body as Record<string, never>)
+          return json(200, { ok: true, config: cfg })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+      // POST /brain_trader_reset -> clear the decision log and counters (config untouched).
+      if (path === '/brain_trader_reset') {
+        try {
+          kernel.context().use<BrainTraderService>('brainTrader').resetAllStats()
+          return json(200, { ok: true })
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }
