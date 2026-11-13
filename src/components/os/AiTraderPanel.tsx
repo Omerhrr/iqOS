@@ -338,6 +338,19 @@ export default function AiTraderPanel({ assets, onError }: Props) {
             className="h-6 bg-[#070c15] text-[9.5px] text-[#dbe4f0]"
           />
         </label>
+        <label className="col-span-2 flex items-start gap-2 rounded border border-cyan-500/30 bg-cyan-500/5 p-2 sm:col-span-4">
+          <input
+            type="checkbox"
+            checked={draft.explainerMode !== false}
+            onChange={(e) => setDraft({ ...draft, explainerMode: e.target.checked })}
+            className="mt-0.5"
+          />
+          <span className="text-[#aab6cc]">
+            <span className="font-bold text-cyan-300">Explainer mode</span> - the Explainer is its only analytic engine: it reads all five readers
+            (SMC, candle pattern, MRC, swing, technical) with every reason, the swing chart&apos;s candles and swing points, and the Effort Renko bricks.
+            Off = the original full scanner desk. Risk gates, session, book and your track record apply either way.
+          </span>
+        </label>
         <label className="col-span-2 flex flex-col gap-1 sm:col-span-4">
           <span className="text-[#7c8aa5]">
             spec - what should it use/consider? (optional - tell it which desk seats to pull, e.g. &quot;footprint, technical, indicator board&quot;, or just

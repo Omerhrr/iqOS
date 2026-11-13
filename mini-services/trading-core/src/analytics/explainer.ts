@@ -25,6 +25,7 @@ import type { MrcPredictResult } from './mrcpredict'
 import type { SwingResult } from './swing'
 import type { TechTfRow } from './technicals'
 import { patternBias } from './patterns'
+import type { EffortBarsResult } from './effortbricks'
 
 export type Lean = 'call' | 'put' | 'none'
 export type PanelId = 'smc' | 'candle' | 'mrc' | 'swing' | 'technical'
@@ -262,4 +263,93 @@ export function summarizeVerdicts(panels: PanelVerdict[]): ExplainerSummary {
   const grade: ExplainerSummary['grade'] = against === 0 && n >= 3 ? 'aligned' : 'leaning'
   const headline = `${n} of ${readable.length} readable panels lean ${word(lean)}${against ? `, ${against} lean the other way` : ''}${flat ? `, ${flat} flat` : ''}.`
   return { ...base, lean, grade, headline }
+}
+
+// ---------------------------------------------------------------------------
+// Effort Renko (effort-confirmed bricks) - a CHART beside the five panels.
+// Kept out of summarizeVerdicts on purpose: the agreement count stays "five
+// readers"; this is the volume/participation lens on top of them.
+// ---------------------------------------------------------------------------
+
+export interface EffortBrickOut {
+  time: number
+  open: number
+  close: number
+  dir: 1 | -1
+  /** effort / trailing average (1.0 = average); null when no volume data or too early to average. */
+  effortRatio: number | null
+  confirmed: boolean
+}
+
+export interface EffortRead {
+  ok: boolean
+  lean: Lean
+  strength: number | null
+  headline: string
+  reasons: string[]
+  brickSize: number
+  brickRule: string
+  effortSource: 'volume' | 'none'
+  trend: 'up' | 'down' | 'none'
+  streak: number
+  confirmedRatio: number
+  regime: 'trending' | 'ranging' | 'choppy' | 'none'
+  lookback: number
+  /** the last `EFFORT_CHART_BRICKS` bricks, oldest first */
+  bricks: EffortBrickOut[]
+}
+
+export const EFFORT_CHART_BRICKS = 60
+
+export function explainEffort(r: EffortBarsResult | null): EffortRead {
+  if (!r || r.bricks.length < 3) {
+    return {
+      ok: false, lean: 'none', strength: null,
+      headline: 'Not enough bricks painted yet to read effort.',
+      reasons: ['Effort Renko needs a few completed bricks; the price has not moved far enough yet on this timeframe.'],
+      brickSize: r?.brickSize ?? 0, brickRule: r?.brickRule ?? '', effortSource: r?.effortSource ?? 'none',
+      trend: 'none', streak: 0, confirmedRatio: 0, regime: 'none', lookback: r?.lookback ?? 20, bricks: [],
+    }
+  }
+  const tail = r.bricks.slice(-EFFORT_CHART_BRICKS)
+  const bricks: EffortBrickOut[] = tail.map((b) => ({
+    time: b.time, open: b.open, close: b.close, dir: b.dir,
+    effortRatio: Number.isFinite(b.effortRatio) ? Math.round(b.effortRatio * 100) / 100 : null,
+    confirmed: b.confirmed,
+  }))
+  const last = r.bricks[r.bricks.length - 1]
+  const reasons: string[] = []
+  const trendWord = r.trend === 'up' ? 'up' : r.trend === 'down' ? 'down' : 'no direction'
+  reasons.push(`${r.streak} ${trendWord} brick${r.streak === 1 ? '' : 's'} in a row (brick size ${r.brickRule}).`)
+  let lean: Lean = 'none'
+  let strength: number | null = null
+  let headline: string
+  if (r.effortSource === 'none') {
+    headline = `Bricks run ${trendWord} but this feed carries no volume, so effort cannot be confirmed.`
+    reasons.push('Every brick reads unconfirmed because the candle window has zero volume (common on synthetic/OTC feeds). Treat the bricks as plain Renko.')
+  } else {
+    reasons.push(
+      `${Math.round(r.confirmedRatio * 100)}% of the last ${r.lookback} bricks were backed by at-least-average volume; the latest brick was ${last.confirmed ? 'confirmed' : 'NOT confirmed'}${Number.isFinite(last.effortRatio) ? ` (${last.effortRatio.toFixed(2)}x average effort)` : ''}.`,
+    )
+    if (r.regime === 'trending' && r.trend !== 'none') {
+      lean = r.trend === 'up' ? 'call' : 'put'
+      strength = Math.round(r.confirmedRatio * 100)
+      headline = `Participation-backed ${trendWord}trend: effort confirms the bricks.`
+      reasons.push('Regime is trending: confirmed bricks run mostly one way, so the move has real volume behind it.')
+    } else if (r.regime === 'ranging') {
+      headline = 'Ranging with real volume: confirmed bricks swing both ways.'
+      reasons.push('Regime is ranging: genuine participation, but no side dominates - no directional lean.')
+    } else if (r.regime === 'choppy') {
+      headline = 'Choppy: price distance is painting bricks without volume behind it.'
+      reasons.push('Regime is choppy: fewer than 60% of recent bricks are confirmed, the classic whipsaw signature - no lean.')
+    } else {
+      headline = 'Regime not readable yet (fewer than the lookback of bricks painted).'
+    }
+  }
+  return {
+    ok: true, lean, strength, headline, reasons,
+    brickSize: r.brickSize, brickRule: r.brickRule, effortSource: r.effortSource,
+    trend: r.trend, streak: r.streak, confirmedRatio: Math.round(r.confirmedRatio * 1000) / 1000,
+    regime: r.regime, lookback: r.lookback, bricks,
+  }
 }

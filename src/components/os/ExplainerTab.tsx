@@ -14,6 +14,7 @@ import type { AccountState, AssetRow, ExplainerLean, ExplainerPanel, ExplainerPa
 import { getExplainer, osGet } from '@/lib/os/client'
 import AssetPicker from './AssetPicker'
 import ExplainerSwingChart from './ExplainerSwingChart'
+import ExplainerEffortChart from './ExplainerEffortChart'
 import TradeTicket, { type TicketPrefill } from './TradeTicket'
 
 interface ExplainerTabProps {
@@ -94,6 +95,62 @@ function PanelCard({ panel, read }: { panel: ExplainerPanel | undefined; read: E
                 <SectionLabel>Why</SectionLabel>
                 <ul className="space-y-1">
                   {panel.reasons.map((r, k) => (
+                    <li key={k} className="flex gap-1.5 text-[10px] leading-snug text-[#aab6cc]">
+                      <span className={`mt-[4px] h-1.5 w-1.5 shrink-0 rounded-full ${tone.dot}`} />
+                      <span>{r}</span>
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function EffortCard({ read }: { read: ExplainerRead | null }) {
+  const e = read?.effort
+  const chip = e ? leanChip(e.lean, e.ok) : leanChip('none', false)
+  const tone = !e || !e.ok ? TONE.off : e.lean === 'call' ? TONE.call : e.lean === 'put' ? TONE.put : TONE.flat
+  const pct = e?.ok && e.strength !== null ? Math.max(0, Math.min(100, e.strength)) : 0
+  return (
+    <div className={`flex min-h-0 min-w-[220px] flex-1 flex-col overflow-hidden rounded-lg border bg-[#0b111c] ${tone.border}`}>
+      <div className={`flex items-center gap-1.5 border-b border-[#1c2739] px-2 py-1.5 ${tone.head}`}>
+        <span className="font-mono text-[11px] font-bold uppercase tracking-wider text-orange-300">Effort Renko</span>
+        <span className={`ml-auto rounded border px-1.5 py-px font-mono text-[9px] font-bold uppercase tracking-wider ${chip.cls}`}>{chip.text}</span>
+      </div>
+      {e?.ok && e.strength !== null && (
+        <div className="flex items-center gap-1.5 px-2 pt-1.5" title="share of recent bricks backed by real volume - not a win probability">
+          <span className="font-mono text-[8px] uppercase tracking-wider text-[#4b5a72]">confirmed</span>
+          <div className="h-1 flex-1 overflow-hidden rounded bg-[#141d2e]">
+            <div className={`h-full ${tone.bar}`} style={{ width: `${pct}%` }} />
+          </div>
+          <span className={`font-mono text-[9px] font-bold ${tone.text}`}>{e.strength}%</span>
+        </div>
+      )}
+      <div className="min-h-0 flex-1 space-y-1.5 overflow-auto p-2">
+        {!e || !read ? (
+          <div className="font-mono text-[9px] text-[#4b5a72]">reading…</div>
+        ) : (
+          <>
+            {e.bricks.length >= 2 && (
+              <>
+                <SectionLabel>Chart</SectionLabel>
+                <div className="rounded border border-[#141d2e] bg-[#080d16] p-1">
+                  <ExplainerEffortChart effort={e} asset={read.asset} />
+                </div>
+                <div className="font-mono text-[8px] text-[#4b5a72]">filled = volume-confirmed brick · outline = distance without volume · bars = effort vs average</div>
+              </>
+            )}
+            <SectionLabel>Verdict</SectionLabel>
+            <p className={`text-[11px] font-semibold leading-snug ${e.ok ? tone.text : 'text-[#7c8aa5]'}`}>{e.headline}</p>
+            {e.reasons.length > 0 && (
+              <>
+                <SectionLabel>Why</SectionLabel>
+                <ul className="space-y-1">
+                  {e.reasons.map((r, k) => (
                     <li key={k} className="flex gap-1.5 text-[10px] leading-snug text-[#aab6cc]">
                       <span className={`mt-[4px] h-1.5 w-1.5 shrink-0 rounded-full ${tone.dot}`} />
                       <span>{r}</span>
@@ -293,6 +350,7 @@ export default function ExplainerTab({ initialAsset, initialTf, assets, prices, 
           {panels.map((p, i) => (
             <PanelCard key={ORDER[i]} panel={p} read={read} />
           ))}
+          <EffortCard read={read} />
         </div>
 
         {ticketOpen && (

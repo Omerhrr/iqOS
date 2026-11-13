@@ -80,6 +80,7 @@ import type { VolArbScanService } from './volarbscan'
 import type { CointegrationScanService } from './cointegrationscan'
 import type { YesterdayService } from './yesterday'
 import type { SentinelService } from './sentinel'
+import type { ExplainerService } from './explainer'
 import type { MemoryGateService } from './memory-gate'
 import type { OtcGuardService } from './otcguard'
 import type { StrategyLabService } from './lab'
@@ -231,6 +232,17 @@ export interface AiTraderConfig {
    *  model about. undefined/empty = unchanged original behavior (no
    *  operator steering, triage LLM call decides optional seats per cycle). */
   spec?: string
+  /** EXPLAINER MODE (default ON; only an explicit `false` turns it off).
+   *  The Explainer is the trader's ONLY analytic engine: it receives
+   *  everything the Explainer tab shows - the five readers (SMC, candle
+   *  pattern, MRC, swing structure, technical) with every reason, the swing
+   *  chart's candles + swing points + structure, and the Effort Renko chart's
+   *  bricks with their volume-confirmation flags - INSTEAD of the full scanner
+   *  desk (oracle, accute, screeners, tick desk, indicator board, MSL...).
+   *  Governance seats (session, risk book, memory gate, OTC flag), its
+   *  per-expiry candle arithmetic and its own graded record stay. Off = the
+   *  original full-desk briefing, unchanged. */
+  explainerMode?: boolean
 }
 
 /** Shared shapes between the single-asset and batched decision paths - see
@@ -277,6 +289,7 @@ const DEFAULT_CONFIG: AiTraderConfig = {
   // deployment behind docker-compose, where the right address is a service
   // name like http://iqos-web:47311, not localhost at all).
   appUrl: undefined,
+  explainerMode: true,
 }
 
 /** Resolution order: an APP_URL env var (the deployment's own wiring - set
@@ -447,6 +460,7 @@ function sanitizeAiConfig(c: AiTraderConfig): AiTraderConfig {
   c.expiryChoices = [...new Set(c.expiryChoices.map((m) => Math.round(Number(m))).filter((m) => Number.isFinite(m) && m >= 1 && m <= 120))].sort((a, b) => a - b)
   if (!c.expiryChoices.length) c.expiryChoices = [...DEFAULT_CONFIG.expiryChoices]
   c.stakePlan = sanitizeAiStakePlan(c.stakePlan)
+  c.explainerMode = c.explainerMode !== false
   // Spec: free text, capped so one pasted essay can't balloon every prompt
   // forever - 3000 chars is generous for "what to use/consider" guidance,
   // well short of anything that would meaningfully crowd out the briefing.
@@ -2209,7 +2223,8 @@ export class AiTraderService {
         return null
       }
       const meta = this.metaStrategyService()
-      const snapshot = meta ? meta.snapshotSources(asset, tf) : []
+      const explainerOn = this.config.explainerMode !== false
+      const snapshot = meta && !explainerOn ? meta.snapshotSources(asset, tf) : []
       let price = 0
       try {
         price = this.market.getPrice(asset)
@@ -2302,6 +2317,11 @@ export class AiTraderService {
       // model's, and placeOrder takes the operator-computed stake verbatim).
       // Computed once here and reused for placement + the log lines below.
       const bet = this.stakeFor()
+
+      // EXPLAINER MODE: the Explainer is the only analytic engine.
+      if (explainerOn) {
+        return await this.prepareExplainerAnalysis({ asset, tf, ts, price, atrPct, horizonLines, graded, bet })
+      }
 
       // ===================================================================
       // OWN-MATH PRECISION REWORK (direct instruction): the trader's own
@@ -2645,6 +2665,216 @@ export class AiTraderService {
       this.emit('warn', `AI Trader cycle failed on ${asset} ${tf}: ${msg}`)
       return null
     }
+  }
+
+  /** Session / risk book / memory gate / OTC flag as plain lines - the
+   * governance seats a human checks before risking money. Same facts the
+   * full desk briefing carries in its sections 12-15; no analysis. */
+  private governanceLines(asset: string, ts: number, stake: number): string[] {
+    const out: string[] = []
+    try {
+      const sess = classifySession(ts, asset)
+      out.push(`trading session: ${sess}${sess === 'OTC' ? ' - synthetic feed, no real market session behind it; session-based priors are VOID' : sess === 'OFF' ? ' - dead hours, thin liquidity, chop/spike risk elevated' : ''}`)
+    } catch {
+      // omitted
+    }
+    try {
+      const sent = this.svc<SentinelService>('sentinel')
+      if (sent) {
+        const exp = sent.exposure()
+        const corr = sent.correlatedExposure(asset)
+        out.push(`risk book: $${exp.total.toFixed(2)} open exposure, ${sent.tradesLastHour()} trade(s) in the last hour, day drawdown ${sent.drawdownPct().toFixed(1)}%`)
+        if (corr.total > 0) out.push(`OPEN correlated exposure on ${corr.assets.join(', ')} worth $${corr.total.toFixed(2)} - adding here stacks correlated risk`)
+        const regime = sent.correlationRegime()
+        if (regime.state !== 'normal') out.push(`cross-asset correlation regime ${regime.state.toUpperCase()} - diversification does not protect you; demand extra edge`)
+      }
+    } catch {
+      // omitted
+    }
+    try {
+      const mg = this.svc<MemoryGateService>('memoryGate')
+      if (mg) {
+        const gate = mg.check(asset, stake)
+        if (!gate.ok) out.push(`memory gate (operator rules): BLOCKED for ${asset}: ${gate.reason ?? 'rule matched'} - HARD skip`)
+        else if (gate.reason) out.push(`memory gate: passed (${gate.reason})`)
+      }
+    } catch {
+      // omitted
+    }
+    try {
+      const otc = this.svc<OtcGuardService>('otcGuard')
+      if (otc && otc.isOtc(asset)) out.push(`${asset} is an OTC (synthetic feed) instrument - the Explainer reads a generated walk, treat any edge as UNVERIFIED`)
+    } catch {
+      // omitted
+    }
+    return out
+  }
+
+  /** EXPLAINER MODE briefing. The trader gets the WHOLE Explainer for this
+   * asset+tf, not just verdicts: every panel's headline and reasons, the swing
+   * chart's candles/swing points/structure, and the Effort Renko chart's
+   * bricks with their confirmation flags - so it reads the charts themselves.
+   * Fails closed: an unreadable Explainer records a logged skip and makes no
+   * LLM call, never a judgment off nothing. */
+  private async prepareExplainerAnalysis(a: {
+    asset: string
+    tf: Timeframe
+    ts: number
+    price: number
+    atrPct: number
+    horizonLines: string
+    graded: { lines: string; wins: number; losses: number; pending: number; calibration: string[] }
+    bet: AiTraderBet
+  }): Promise<{ system: ChatMessage; user: ChatMessage; price: number; snapshotWithDesk: DeskSnapshotLine[]; bet: AiTraderBet; sourcesSeen: number } | null> {
+    const { asset, tf, ts, price, atrPct, horizonLines, graded, bet } = a
+    let read: ReturnType<ExplainerService['read']> | null = null
+    try {
+      read = this.svc<ExplainerService>('explainer')?.read(asset, tf) ?? null
+    } catch (err) {
+      read = { ok: false, error: String(err instanceof Error ? err.message : err) }
+    }
+    if (!read || !read.ok) {
+      this.store.recordAiTraderDecision({
+        asset, tf, direction: 'skip', confidence: 0,
+        reasoning: `Explainer unavailable for ${asset} ${tf} (${read ? read.error : 'service not registered'}) - cycle skipped, no LLM call made`,
+        snapshot: [], live: this.config.live, acted: false, ts,
+      })
+      return null
+    }
+    const sum = read.summary
+    const fx = (v: number) => String(Number(v.toPrecision(7)))
+    const leanWord = (l: string) => (l === 'call' ? 'CALL' : l === 'put' ? 'PUT' : 'FLAT')
+    const snapshotWithDesk: DeskSnapshotLine[] = []
+
+    // --- the five readers, in full
+    const panelLines: string[] = []
+    let readable = 0
+    for (const p of read.panels) {
+      if (p.ok) readable += 1
+      panelLines.push(
+        p.ok ? `[${p.title}] ${leanWord(p.lean)}${p.strength !== null ? ` (strength ${p.strength}%)` : ''} - ${p.headline}` : `[${p.title}] NOT READABLE - ${p.headline}`,
+        ...p.reasons.map((r) => `    - ${r}`),
+      )
+      snapshotWithDesk.push({ source: 'explainer', direction: p.ok ? p.lean : 'none', confidence: p.strength ?? 0, label: `${p.title}: ${p.headline}` })
+    }
+    const summaryLine = `Explainer summary: ${sum.grade.toUpperCase()} - ${sum.headline} (${sum.call} call / ${sum.put} put / ${sum.flat} flat of ${sum.readable} readable, ${sum.unavailable} not readable)`
+    snapshotWithDesk.push({ source: 'desk', direction: sum.lean === 'none' ? 'none' : sum.lean, confidence: 0, label: summaryLine })
+
+    // --- swing chart: candles + swing points + structure
+    const ch = read.chart
+    const idxByTime = new Map<number, number>()
+    ch.candles.forEach((c, i) => idxByTime.set(c.time, i))
+    const swingLines = ch.swings.map((s) => `    #${idxByTime.get(s.time) ?? '?'} swing ${s.kind.toUpperCase()} @ ${fx(s.price)}`)
+    const candleLines = ch.candles.map((c, i) => `    #${i} o ${fx(c.open)} h ${fx(c.high)} l ${fx(c.low)} c ${fx(c.close)}`)
+    snapshotWithDesk.push({ source: 'desk', direction: ch.direction === 1 ? 'call' : ch.direction === -1 ? 'put' : 'none', confidence: 0, label: `swing chart: structure ${ch.structure}, ${ch.swings.length} swing point(s), lookback ${ch.lookback}` })
+
+    // --- effort renko chart: bricks + confirmation
+    const ef = read.effort
+    const brickLines = ef.bricks.map((b, i) => `    #${i} ${b.dir === 1 ? 'UP  ' : 'DOWN'} ${fx(b.open)} -> ${fx(b.close)}  effort ${b.effortRatio === null ? 'n/a' : `${b.effortRatio.toFixed(2)}x`}  ${b.confirmed ? 'CONFIRMED' : 'unconfirmed'}`)
+    snapshotWithDesk.push({ source: 'explainer', direction: ef.ok ? ef.lean : 'none', confidence: ef.strength ?? 0, label: `Effort Renko: ${ef.headline}` })
+
+    const gov = this.governanceLines(asset, ts, bet.amount)
+    for (const g of gov) snapshotWithDesk.push({ source: 'desk', direction: 'none', confidence: 0, label: g })
+
+    const system: ChatMessage = {
+      role: 'system',
+      content: [
+        'You are the AI Trader inside IQAIR//OS, a binary-options platform - the senior trader of this desk and the',
+        'only one who decides. The EXPLAINER is your only analytic engine, and you have mastered it. For the one pair',
+        'and timeframe in front of you it hands you everything its tab shows, in full:',
+        '- FIVE READERS, each with a verdict (CALL / PUT / FLAT / NOT READABLE), the engine\'s own strength score and',
+        '  every reason behind it: SMC structure, candlestick patterns, the Market Response Clock (MRC) predictor,',
+        '  swing structure and the technical vote panels;',
+        '- the SWING CHART itself: the last closed candles (index, open/high/low/close), every confirmed swing high',
+        '  and low marked by candle index, and the structure call (hh-hl / lh-ll / none);',
+        '- the EFFORT RENKO CHART itself: the last bricks (up/down, open->close) each with its effort ratio against',
+        '  the average and whether volume CONFIRMED it, plus the regime (trending / ranging / choppy) and streak.',
+        'Read the charts with your own eyes, not just the verdict labels: where did price break structure, how far is',
+        'it from the last swing, is the latest swing a higher or lower point than the one before, did the bricks run',
+        'on confirmed effort or on thin volume, was the last move a continuation or a fresh reversal brick?',
+        '',
+        'How to read it well:',
+        '- The five readers use the SAME candles. Their agreement is correlated: five CALLs are not five independent',
+        '  confirmations and the agreement count is NOT a probability. Never raise confidence just because the count',
+        '  is high - ask whether the reasons are genuinely different (structure vs pattern vs clock vs momentum).',
+        '- A strength figure is each engine\'s own score, not a win probability. MRC\'s rate is the only self-calibrated',
+        '  one. Effort Renko\'s "confirmed" percentage is the share of bricks with real volume behind them - volume',
+        '  here is often a tick count on OTC/synthetic pairs, so effort is participation, not proof.',
+        '- NOT READABLE means no honest read (warming up / too few bars): missing evidence, not a neutral vote and not',
+        '  a disagreement. An Effort Renko with no volume feed shows every brick unconfirmed - read it as plain Renko.',
+        '- Structure is context: a lean against clean hh-hl / lh-ll structure needs a strong reason. A market the',
+        '  structure, technical and effort readers all call flat or choppy is a skip.',
+        '- Effort Renko\'s regime is the participation filter: trending on confirmed bricks supports a continuation',
+        '  call; choppy (distance without volume) means discount every directional read, including the five panels.',
+        '- Conflict between readers is itself a finding: decide whose reason is stronger for this moment and say so,',
+        '  or conclude disagreement means skip.',
+        '- A memory-gate "BLOCKED" line or an engaged kill switch is a HARD skip - no override.',
+        '',
+        'Your job each cycle: (1) read the Explainer in full - verdicts, reasons, both charts; (2) form your own view -',
+        'trending, ranging, exhausting or reversing; (3) pick the ONE allowed expiry where the evidence is clearest for',
+        'that holding period (the per-expiry candle arithmetic is provided for exactly that); (4) decide call, put or',
+        'skip. Precision over frequency: most cycles SHOULD be a skip; honestly uncertain + skip beats a',
+        'confident-sounding coin flip. (5) Learn from yourself: your own graded record and self-calibration table are',
+        'below - correct any inflation or bias you find there now.',
+        '',
+        ...(this.config.spec
+          ? [
+              'OPERATOR FOCUS/INSTRUCTIONS (steer your weighing, but this never overrides the hard risk/confidence',
+              'gates or the memory-gate/kill-switch seats):',
+              this.config.spec,
+              '',
+            ]
+          : []),
+        'Respond with ONLY a JSON object, no prose outside it, in exactly this shape:',
+        '{"direction": "call" | "put" | "skip", "confidence": 0-100, "expiryMin": <the ONE allowed choice your analysis is clearest on>, "reasoning": "<2-4 sentences: which Explainer readers and which parts of the swing and Effort Renko charts you leaned on, whether the agreement was real or correlated, and why THIS expiry>"}',
+      ].join('\n'),
+    }
+    const user: ChatMessage = {
+      role: 'user',
+      content: [
+        `Asset: ${asset}   Timeframe: ${tf}   Current price: ${price || 'unavailable'}   (ATR14 ${atrPct.toFixed(4)}% of price - volatility context only)`,
+        '',
+        `THE EXPLAINER - ${asset} ${tf}, built from ${read.bars} closed bars.`,
+        '',
+        'FIVE READERS (verdict, strength, every reason):',
+        ...panelLines,
+        summaryLine,
+        `Explainer's own honesty note: ${sum.note}`,
+        '',
+        `SWING CHART - structure ${ch.structure} (direction ${ch.direction === 1 ? 'up' : ch.direction === -1 ? 'down' : 'none'}), swing lookback ${ch.lookback} bar(s) (a swing needs that many bars after it to confirm, so the newest candles have none yet).`,
+        `Confirmed swing points (index refers to the candle list below):`,
+        ...(swingLines.length ? swingLines : ['    (none in this window)']),
+        `Last ${ch.candles.length} closed candles, oldest -> newest:`,
+        ...candleLines,
+        '',
+        `EFFORT RENKO CHART - ${ef.ok ? ef.headline : `not readable: ${ef.headline}`}`,
+        `brick size ${ef.brickRule}${ef.brickSize ? ` (= ${fx(ef.brickSize)})` : ''}, volume source ${ef.effortSource}, last-brick direction ${ef.trend}, streak ${ef.streak}, ${Math.round(ef.confirmedRatio * 100)}% of the last ${ef.lookback} bricks confirmed, regime ${ef.regime.toUpperCase()}${ef.ok && ef.lean !== 'none' ? `, leans ${leanWord(ef.lean)}` : ''}.`,
+        ...ef.reasons.map((r) => `    - ${r}`),
+        `Last ${ef.bricks.length} bricks, oldest -> newest:`,
+        ...(brickLines.length ? brickLines : ['    (not enough bricks painted yet)']),
+        '',
+        'Per-expiry-choice arithmetic (net move and signal-to-noise over each expiry\'s own window, from the candles - use it to choose the expiry):',
+        horizonLines,
+        '',
+        `Allowed expiry choices (minutes): ${this.config.expiryChoices.join(', ')} - you must pick exactly one of these.`,
+        '',
+        `Your own recent calls on this exact asset+tf, most recent first (${graded.wins}W / ${graded.losses}L graded, ${graded.pending} still pending) - this is YOUR track record:`,
+        graded.lines,
+        ...(graded.calibration.length ? ['', 'Self-calibration table (claimed confidence vs reality - correct for any inflation):', ...graded.calibration] : []),
+        '',
+        'GOVERNANCE (session / book / rules):',
+        ...(gov.length ? gov.map((g) => `- ${g}`) : ['- (no governance seat reporting)']),
+        '',
+        `Minimum confidence to actually act: ${this.config.minConfidence} (lower is treated as a skip, so be honest rather than inflating it).`,
+        ...(bet.compound
+          ? [
+              '',
+              `Your stake plan (set by the operator, not you): COMPOUNDING - pot $${bet.pot.toFixed(2)} after ${bet.rollN} win(s), next stake $${bet.amount.toFixed(2)} (${bet.phase} phase). A loss ends the run. A bigger roll is a reason to be MORE selective, never to change your direction read.`,
+            ]
+          : []),
+      ].join('\n'),
+    }
+    return { system, user, price, snapshotWithDesk, bet, sourcesSeen: readable + (ef.ok ? 1 : 0) }
   }
 
   /** Single-asset entry point ('single' scan mode, always exactly 1

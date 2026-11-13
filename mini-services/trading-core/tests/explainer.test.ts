@@ -9,6 +9,7 @@
 
 import assert from 'node:assert/strict'
 import {
+  explainEffort,
   explainMrc,
   explainPatterns,
   explainSmc,
@@ -21,6 +22,7 @@ import {
 import { ExplainerService } from '../src/plugins/explainer'
 import { computeSwing } from '../src/analytics/swing'
 import { summarizeTf } from '../src/analytics/technicals'
+import { effortBricks } from '../src/analytics/effortbricks'
 import type { Candle, PatternHit } from '../src/types'
 import type { SmcScanResult } from '../src/analytics/smc'
 import type { MrcPredictResult } from '../src/analytics/mrcpredict'
@@ -344,6 +346,60 @@ test('service: summarizeTf is called for the requested timeframe, not a nearby l
   assert.equal(r.ok, true)
   if (!r.ok) return
   assert.equal(r.panels.find((p) => p.id === 'technical')!.ok, true)
+})
+
+// ---- Effort Renko ----------------------------------------------------------
+function walk(n: number, step: number, vol: (i: number) => number): Candle[] {
+  const out: Candle[] = []
+  let p = 100
+  for (let i = 0; i < n; i++) {
+    const o = p
+    const c = p + step
+    out.push({ time: 1000 + i * 60, open: o, high: Math.max(o, c) + 0.01, low: Math.min(o, c) - 0.01, close: c, volume: vol(i) } as Candle)
+    p = c
+  }
+  return out
+}
+
+test('effort: too few bricks is not readable and has no lean', () => {
+  const r = explainEffort(effortBricks(walk(3, 0.001, () => 10)))
+  assert.equal(r.ok, false)
+  assert.equal(r.lean, 'none')
+})
+
+test('effort: null input fails closed', () => {
+  const r = explainEffort(null)
+  assert.equal(r.ok, false)
+  assert.equal(r.bricks.length, 0)
+})
+
+test('effort: steady up-trend with rising volume leans CALL with a strength', () => {
+  const r = explainEffort(effortBricks(walk(120, 0.6, (i) => 10 + i), { brickSize: 0.6 }))
+  assert.equal(r.ok, true)
+  assert.equal(r.trend, 'up')
+  assert.equal(r.regime, 'trending')
+  assert.equal(r.lean, 'call')
+  assert.ok(r.strength !== null && r.strength >= 60)
+  assert.ok(r.bricks.length > 0 && r.bricks.length <= 60)
+})
+
+test('effort: steady down-trend with rising volume leans PUT', () => {
+  const r = explainEffort(effortBricks(walk(120, -0.6, (i) => 10 + i), { brickSize: 0.6 }))
+  assert.equal(r.lean, 'put')
+})
+
+test('effort: zero-volume feed never leans and says why', () => {
+  const r = explainEffort(effortBricks(walk(120, 0.6, () => 0)))
+  assert.equal(r.effortSource, 'none')
+  assert.equal(r.lean, 'none')
+  assert.ok(r.headline.includes('no volume'))
+  assert.ok(r.bricks.every((b) => b.confirmed === false))
+})
+
+test('effort: unconfirmed (falling-volume) drift is choppy and never leans', () => {
+  const r = explainEffort(effortBricks(walk(120, 0.6, (i) => 1000 - i * 8)))
+  assert.notEqual(r.lean, 'call')
+  assert.notEqual(r.lean, 'put')
 })
 
 let passed = 0

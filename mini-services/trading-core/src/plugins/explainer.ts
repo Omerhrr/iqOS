@@ -17,13 +17,16 @@ import { ALL_TIMEFRAMES, TIMEFRAME_SECONDS } from '../types'
 import { detectPatterns } from '../analytics/patterns'
 import { computeSwing } from '../analytics/swing'
 import { summarizeTf, TECH_BARS_PER_RUNG } from '../analytics/technicals'
+import { effortBricks } from '../analytics/effortbricks'
 import {
+  explainEffort,
   explainMrc,
   explainPatterns,
   explainSmc,
   explainSwing,
   explainTechnical,
   summarizeVerdicts,
+  type EffortRead,
   type ExplainerSummary,
   type PanelVerdict,
 } from '../analytics/explainer'
@@ -57,6 +60,8 @@ export interface ExplainerRead {
   panels: PanelVerdict[]
   summary: ExplainerSummary
   chart: ExplainerChart
+  /** Effort Renko (effort-confirmed bricks) - a chart + its own reading, outside the five-panel agreement count. */
+  effort: EffortRead
 }
 
 export type ExplainerResult = ExplainerRead | { ok: false; error: string }
@@ -95,6 +100,12 @@ export class ExplainerService {
       explainTechnical(techRow),
     ]
 
+    let effort: EffortRead
+    try {
+      effort = explainEffort(effortBricks(candles.slice(-300)))
+    } catch {
+      effort = explainEffort(null)
+    }
     const tail = candles.slice(-CHART_BARS)
     const t0 = tail[0].time
     return {
@@ -106,6 +117,7 @@ export class ExplainerService {
       bars: candles.length,
       panels,
       summary: summarizeVerdicts(panels),
+      effort,
       chart: {
         candles: tail.map((c) => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close })),
         swings: swing.swings.filter((s) => s.time >= t0).map((s) => ({ time: s.time, price: s.price, kind: s.kind })),

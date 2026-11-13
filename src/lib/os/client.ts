@@ -426,6 +426,32 @@ export interface ExplainerChart {
   lookback: number
 }
 
+export interface ExplainerEffortBrick {
+  time: number
+  open: number
+  close: number
+  dir: 1 | -1
+  effortRatio: number | null
+  confirmed: boolean
+}
+
+export interface ExplainerEffort {
+  ok: boolean
+  lean: ExplainerLean
+  strength: number | null
+  headline: string
+  reasons: string[]
+  brickSize: number
+  brickRule: string
+  effortSource: 'volume' | 'none'
+  trend: 'up' | 'down' | 'none'
+  streak: number
+  confirmedRatio: number
+  regime: 'trending' | 'ranging' | 'choppy' | 'none'
+  lookback: number
+  bricks: ExplainerEffortBrick[]
+}
+
 export interface ExplainerRead {
   ok: true
   asset: string
@@ -436,6 +462,8 @@ export interface ExplainerRead {
   panels: ExplainerPanel[]
   summary: ExplainerSummary
   chart: ExplainerChart
+  /** Effort Renko chart + its own reading (outside the five-panel agreement count) */
+  effort: ExplainerEffort
 }
 
 export async function getExplainer(asset: string, tf: Timeframe): Promise<ExplainerRead | { ok: false; error: string }> {
@@ -5312,6 +5340,8 @@ export interface AiTraderConfig {
   kind: TradeKind
   minConfidence: number
   expiryChoices: number[]
+  /** Explainer mode (default on): the Explainer - five readers, swing chart and Effort Renko chart, read in full - is the only analytic engine. false = the full scanner desk. */
+  explainerMode?: boolean
   /** Max OPEN positions this trader may hold at once - enforced in LIVE
    *  mode only. At the cap, a cycle skips entirely (no analysis, no LLM
    *  call) rather than deciding something it has no room to act on. */
