@@ -1,19 +1,24 @@
-// IQAIR//OS - Brain Trader plugin: a rule-based structure brain that must get past an AI reviewer before it trades.
+// IQAIR//OS - Brain Trader plugin: runs a saved MSL strategy like any other bot, but every signal must get past an AI reviewer first.
+//
+// The STRATEGY is an MSL meta-strategy spec (plugins/metastrategy.ts) - the first one is the builtin
+// "meta:builtin-brain-fib-adaptive" (regime picks the playbook, Fibonacci finds the level, SMC + candlesticks confirm), and any other saved
+// script spec can be picked instead. The strategy is not about counting votes: it adapts to the market regime and uses Fibonacci levels.
 //
 // Flow, once per newly CLOSED candle per asset:
-//   1. analytics/brain.ts reads regime + fib + SMC + candle patterns + AMD + Wyckoff and either proposes a trade or says why not.
-//   2. A proposal is handed to the AI reviewer WITH the same evidence the brain saw. The reviewer can only answer go / no and pick an
-//      expiry from the operator's allowed list. It cannot change the direction, the stake or the asset.
-//   3. If the reviewer says go (and the trader is live, in AUTO mode, under max-open), the order goes through ExecutionService.placeOrder(),
-//      i.e. the same kill switch / risk manager / balance checks as every other engine. No side door.
+//   1. metaStrategy.evaluate(id, asset, tf) - the script says call / put / none (+ confidence + its own notes).
+//   2. A call / put at or above minConfidence is a SIGNAL. It is handed to the AI reviewer WITH what the strategy saw: the script, its
+//      notes, the Fibonacci levels of the leg, the other panels' reads (second opinion) and the last bars. The reviewer can only answer
+//      go / no and pick an expiry from the operator's allowed list. It cannot change the direction, the stake or the asset.
+//   3. If the reviewer says go (and the trader is live, in AUTO mode, under max-open), the order goes through
+//      ExecutionService.placeOrder() - same kill switch / risk manager / balance checks as every other engine. No side door.
 //
 // SHADOW by default (config.live = false): the whole pipeline runs and is logged, no order is placed. The reviewer fails CLOSED: no
 // provider, a timeout or a reply that does not parse is a veto ("ai_unavailable"), never a silent go.
 //
-// MEASURED, NOT ASSUMED: every proposal is scored at its own expiry against the closed candles - approved, vetoed, shadow and live alike.
-// status().stats therefore shows the hit rate of ALL proposals next to the approved and the vetoed ones, which is the only honest way to
-// learn whether the reviewer adds anything. Until that has run for a long time on real data, nothing here claims an edge: the brain's
-// `confluence` is agreement between correlated views, not a probability, and an LLM's vetoes cannot be validated in advance.
+// MEASURED, NOT ASSUMED: every signal is scored at its own expiry against the closed candles - approved, vetoed, shadow and live alike.
+// status().stats shows the hit rate of ALL signals next to the approved and the vetoed ones, the only honest way to learn whether the
+// reviewer adds anything. Nothing here claims an edge: an LLM's vetoes cannot be validated in advance, and no strategy has a measured
+// real-market win rate until the decision log says so.
 
 import type { Plugin, KernelContext } from '../kernel'
 import type { Store } from '../store'
@@ -21,7 +26,8 @@ import type { Candle, Timeframe, TradeKind } from '../types'
 import { TIMEFRAME_SECONDS } from '../types'
 import type { MarketDataService } from './market-data'
 import type { OsMode } from './os-mode'
-import { readBrain, BRAIN_MIN_BARS, DEFAULT_BRAIN_STRATEGY, sanitizeBrainStrategy, type BrainRead, type BrainStrategy } from '../analytics/brain'
+import type { MetaStrategyService } from './metastrategy'
+import { fibEvidence, MIN_BARS } from '../analytics/brain'
 import { chatComplete, type ChatMessage } from '../lib/llm'
 
 const LIQUID_CANDIDATES = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'XAUUSD', 'BTCUSD']
@@ -29,6 +35,8 @@ const MAX_ASSETS = 12
 const MAX_REVIEWS_PER_TICK = 3
 const LOG_CAP = 300
 const POLL_MS = 5000
+/** one signal per asset+direction per this many bars (a script that stays true would otherwise re-fire every bar) */
+const SIGNAL_HOLD_BARS = 5
 const HARD_STOP_RE =
   /kill switch engaged|market closed for|amount must be positive|exceeds max stake|insufficient balance|live balance unknown|live broker not connected|unknown asset |no price feed|execution service unavailable/i
 export const BRAIN_TRADER_NOTE = 'brain:trader'
@@ -39,12 +47,10 @@ export interface BrainTraderConfig {
   live: boolean
   tf: Timeframe
   direction: 'call' | 'put' | 'both'
-  /** minimum families that must agree (mirrors strategy.minAgree; kept for older clients - strategy wins on read) */
-  minAgree: number
-  /** the brain's strategy: playbooks, reader votes/weights, regime and fib thresholds (analytics/brain.ts) */
-  strategy: BrainStrategy
-  /** minimum brain confluence (0-100) to even ask the reviewer */
-  minConfluence: number
+  /** the saved MSL meta-strategy this trader runs (a SCRIPT spec) */
+  metaStrategyId: string
+  /** minimum strategy confidence (0-100) for a signal to be sent to the reviewer */
+  minConfidence: number
   /** expiries (seconds) the reviewer may choose from */
   expiriesSec: number[]
   /** expiry used to SCORE a proposal when the reviewer gave none */
@@ -68,9 +74,8 @@ const DEFAULT_CONFIG: BrainTraderConfig = {
   live: false,
   tf: '1m',
   direction: 'both',
-  minAgree: 3,
-  strategy: DEFAULT_BRAIN_STRATEGY,
-  minConfluence: 40,
+  metaStrategyId: 'meta:builtin-brain-fib-adaptive',
+  minConfidence: 55,
   expiriesSec: [60, 180, 300],
   defaultExpirySec: 180,
   requireAi: true,
@@ -89,15 +94,15 @@ export interface BrainDecision {
   ts: number
   asset: string
   tf: Timeframe
-  /** open time (sec) of the closed bar the read was made on */
+  /** open time (sec) of the closed bar the signal was read on */
   barTime: number
   direction: 'call' | 'put'
-  playbook: string
-  regime: string
-  confluence: number
-  agree: string[]
-  oppose: string[]
-  reason: string
+  strategyId: string
+  strategyName: string
+  /** the strategy's own confidence (0-100) */
+  confidence: number
+  /** the strategy's own notes for why it fired */
+  notes: string
   entryPrice: number
   /** expiry used for scoring (the reviewer's pick, else the default) */
   expirySec: number
@@ -182,28 +187,48 @@ export function parseReview(text: string, allowedExpiries: number[]): ParsedRevi
   }
 }
 
-export function buildReviewMessages(asset: string, tf: Timeframe, read: BrainRead, candles: Candle[], expiriesSec: number[]): ChatMessage[] {
-  const recent = candles
+export interface ReviewInput {
+  asset: string
+  tf: Timeframe
+  strategyName: string
+  script: string
+  direction: 'call' | 'put'
+  confidence: number
+  notes: string
+  price: number
+  candles: Candle[]
+  expiriesSec: number[]
+  /** the other panels' reads (second opinion), already formatted one per line */
+  panelLines: string[]
+  /** strategy's own preferred horizon in minutes, if its script set `expiry = n` */
+  scriptExpiryMin?: number
+}
+
+export function buildReviewMessages(inp: ReviewInput): ChatMessage[] {
+  const recent = inp.candles
     .slice(-12)
     .map((c) => `${c.open.toFixed(5)}/${c.high.toFixed(5)}/${c.low.toFixed(5)}/${c.close.toFixed(5)}`)
     .join(' ')
-  const comps = read.components.map((x) => `- ${x.family}: ${x.dir > 0 ? 'BULLISH' : x.dir < 0 ? 'BEARISH' : 'neutral'} - ${x.note}`).join('\n')
+  const fib = fibEvidence(inp.candles)
   const system = [
-    'You are the risk reviewer for a rule-based binary-options engine. The engine has proposed ONE trade. You decide only: go or no, and which expiry.',
-    'You cannot change the direction, the asset or the stake. If the evidence is thin, contradictory or the setup looks stale, answer "no". Saying no is cheap; a bad trade is not.',
-    'The engine\'s "confluence" is the share of its five structure readers that agree. They are correlated views of the same candles, so it is NOT a win probability - do not treat 80 as 80%.',
-    `Pick expirySec from exactly this list: ${expiriesSec.join(', ')} (seconds). Match it to the setup: a reversal off a sweep needs room; a late trend entry should be short.`,
+    'You are the trade reviewer for a rule-based binary-options strategy. The strategy has produced ONE signal. You decide only: go or no, and which expiry.',
+    'You cannot change the direction, the asset or the stake. If the evidence is thin, contradictory, the level looks stale or the move already happened, answer "no". Saying no is cheap; a bad trade is not.',
+    'The strategy\'s confidence is a fixed number its script assigns, NOT a win probability. The other panels read the same candles, so their agreement is correlated evidence, not independent confirmation.',
+    `Pick expirySec from exactly this list: ${inp.expiriesSec.join(', ')} (seconds). Match it to the setup: a pullback entry with room to run can take longer; a late entry or a fade at a range edge should be short.`,
     'Reply with ONE JSON object and nothing else: {"decision":"go"|"no","expirySec":<number>,"confidence":<0-100>,"reason":"<one or two sentences>"}.',
   ].join('\n')
   const user = [
-    `ASSET ${asset} - timeframe ${tf} - last close ${read.price}`,
-    `PROPOSAL: ${read.direction.toUpperCase()} via the ${read.playbook} playbook in a ${read.regime} regime. Brain confluence ${read.confluence}/100.`,
-    `WHY: ${read.reason}`,
-    `INVALIDATION: the idea is dead if price closes through ${read.invalidation}. ATR ${read.atr.toPrecision(4)}; efficiency ratio ${read.er.toFixed(2)}; volatility rank ${(read.volRank * 100).toFixed(0)}%.`,
-    'READERS:',
-    comps,
+    `ASSET ${inp.asset} - timeframe ${inp.tf} - last close ${inp.price}`,
+    `SIGNAL: ${inp.direction.toUpperCase()} from strategy "${inp.strategyName}", strategy confidence ${inp.confidence}/100.`,
+    `WHY IT FIRED (the strategy's own notes): ${inp.notes || '(none)'}`,
+    inp.scriptExpiryMin ? `The script suggests a ${inp.scriptExpiryMin}-minute horizon.` : '',
+    `STRATEGY SCRIPT:\n${inp.script.slice(0, 3500)}`,
+    fib,
+    inp.panelLines.length ? `OTHER PANELS (second opinion, correlated with the strategy):\n${inp.panelLines.join('\n')}` : '',
     `LAST 12 CLOSED BARS (open/high/low/close): ${recent}`,
-  ].join('\n')
+  ]
+    .filter(Boolean)
+    .join('\n')
   return [
     { role: 'system', content: system },
     { role: 'user', content: user },
@@ -283,6 +308,7 @@ export class BrainTraderService {
   private ticking = false
   private unsub: (() => void) | null = null
   private lastBar = new Map<string, number>()
+  private lastSignalBar = new Map<string, number>()
   private assetCooldownUntil = new Map<string, number>()
   private reviewTimes: number[] = []
   private seq = 0
@@ -361,6 +387,7 @@ export class BrainTraderService {
     this.log = []
     this.seq = 0
     this.lastBar.clear()
+    this.lastSignalBar.clear()
     this.assetCooldownUntil.clear()
     this.reviewTimes = []
     this.rebuildOpenCount()
@@ -388,11 +415,42 @@ export class BrainTraderService {
     }
   }
 
-  /** What the brain thinks about one asset RIGHT NOW (closed bars, the configured strategy). No AI call, no order, nothing logged. */
-  mind(asset: string, tf?: Timeframe): { asset: string; tf: Timeframe; bars: number; lastBarTime: number | null; read: BrainRead } {
+  private metaStrategy(): MetaStrategyService {
+    return this.ctx.use<MetaStrategyService>('metaStrategy')
+  }
+
+  /** the other panels' reads, one short line each (second opinion for the reviewer). Never throws. */
+  private panelLines(asset: string): string[] {
+    try {
+      return this.metaStrategy()
+        .snapshotSources(asset, this.config.tf)
+        .filter((r) => r.direction !== 'none')
+        .slice(0, 24)
+        .map((r) => `- ${r.source}: ${r.direction} ${Math.round(r.confidence)}${r.label ? ` (${String(r.label).slice(0, 60)})` : ''}`)
+    } catch {
+      return []
+    }
+  }
+
+  /** Run the configured strategy on one asset RIGHT NOW (closed bars). No AI call, no order, nothing logged. */
+  preview(asset: string, tf?: Timeframe): { asset: string; tf: Timeframe; strategyId: string; strategyName: string; direction: 'call' | 'put' | 'none'; confidence: number; notes: string; price: number; wouldSend: boolean; bars: number } {
     const t = tf && tf in TIMEFRAME_SECONDS ? tf : this.config.tf
-    const candles = this.market.getCandlesDeep(asset, t, 320, true)
-    return { asset, tf: t, bars: candles.length, lastBarTime: candles.length ? candles[candles.length - 1].time : null, read: readBrain(candles, this.config.strategy) }
+    const ev = this.metaStrategy().evaluate(this.config.metaStrategyId, asset, t)
+    const bars = this.market.getCandlesDeep(asset, t, 320, true).length
+    const r = ev.result
+    const dirOk = this.config.direction === 'both' || r.direction === this.config.direction
+    return {
+      asset,
+      tf: t,
+      strategyId: ev.spec.id,
+      strategyName: ev.spec.name,
+      direction: r.direction,
+      confidence: r.confidence,
+      notes: r.notes,
+      price: ev.price,
+      wouldSend: r.direction !== 'none' && r.confidence >= this.config.minConfidence && dirOk,
+      bars,
+    }
   }
 
   decisions(limit = 50): BrainDecision[] {
@@ -400,21 +458,9 @@ export class BrainTraderService {
   }
 
   configure(patch: Partial<BrainTraderConfig>): BrainTraderConfig {
-    // deep-merge the strategy so a partial patch (one toggle) keeps every other setting; keep the flat minAgree in lockstep
-    const ps = patch.strategy as Partial<BrainStrategy> | undefined
-    const mergedStrategy = ps
-      ? {
-          ...this.config.strategy,
-          ...ps,
-          playbooks: { ...this.config.strategy.playbooks, ...(ps.playbooks ?? {}) },
-          families: { ...this.config.strategy.families, ...(ps.families ?? {}) },
-          weights: { ...this.config.strategy.weights, ...(ps.weights ?? {}) },
-        }
-      : this.config.strategy
-    const flat = patch.minAgree !== undefined ? patch.minAgree : ps?.minAgree !== undefined ? ps.minAgree : this.config.minAgree
-    this.config = sanitize({ ...this.config, ...patch, strategy: { ...mergedStrategy, minAgree: flat }, minAgree: flat })
+    this.config = sanitize({ ...this.config, ...patch })
     this.persistConfig()
-    this.ctx.log('brain-trader', `config updated - ${this.config.enabled ? (this.config.live ? 'LIVE' : 'SHADOW') : 'off'} · ${this.config.tf} · agree>=${this.config.minAgree} · expiries ${this.config.expiriesSec.join('/')}s`)
+    this.ctx.log('brain-trader', `config updated - ${this.config.enabled ? (this.config.live ? 'LIVE' : 'SHADOW') : 'off'} · ${this.config.tf} · ${this.config.metaStrategyId} · conf>=${this.config.minConfidence} · expiries ${this.config.expiriesSec.join('/')}s`)
     return this.config
   }
 
@@ -482,17 +528,28 @@ export class BrainTraderService {
       } catch {
         continue
       }
-      if (candles.length < BRAIN_MIN_BARS) continue
+      if (candles.length < MIN_BARS) continue
       const last = candles[candles.length - 1]
       if (this.lastBar.get(asset) === last.time) continue // already read this closed bar
       this.lastBar.set(asset, last.time)
       this.rt.reads += 1
-      const read = readBrain(candles, this.config.strategy)
-      this.rt.lastReason = `${asset}: ${read.reason}`
-      if (!read.proposal || read.direction === 'none') continue
-      if (read.confluence < this.config.minConfluence) continue
-      if (this.config.direction !== 'both' && read.direction !== this.config.direction) continue
+      let ev: { spec: { id: string; name: string; script?: string }; result: { direction: 'call' | 'put' | 'none'; confidence: number; notes: string; expiryMin?: number }; price: number }
+      try {
+        ev = this.metaStrategy().evaluate(this.config.metaStrategyId, asset, this.config.tf)
+      } catch (err) {
+        this.rt.lastRejection = `strategy ${this.config.metaStrategyId}: ${(err as Error).message}`
+        continue
+      }
+      const sig = ev.result
+      this.rt.lastReason = `${asset}: ${sig.direction === 'none' ? 'no signal' : `${sig.direction} @ ${sig.confidence}`}`
+      if (sig.direction === 'none' || sig.confidence < this.config.minConfidence) continue
+      if (this.config.direction !== 'both' && sig.direction !== this.config.direction) continue
       if ((this.assetCooldownUntil.get(asset) ?? 0) > this.now()) continue
+      // a script that stays true for several bars would re-fire every bar: one signal per asset+direction per SIGNAL_HOLD_BARS bars
+      const sigKey = `${asset}|${sig.direction}`
+      const prev = this.lastSignalBar.get(sigKey)
+      if (prev !== undefined && last.time - prev < SIGNAL_HOLD_BARS * TIMEFRAME_SECONDS[this.config.tf]) continue
+      this.lastSignalBar.set(sigKey, last.time)
       this.rt.proposals += 1
 
       const dec: BrainDecision = {
@@ -501,13 +558,11 @@ export class BrainTraderService {
         asset,
         tf: this.config.tf,
         barTime: last.time,
-        direction: read.direction,
-        playbook: read.playbook,
-        regime: read.regime,
-        confluence: read.confluence,
-        agree: read.agree,
-        oppose: read.oppose,
-        reason: read.reason,
+        direction: sig.direction,
+        strategyId: ev.spec.id,
+        strategyName: ev.spec.name,
+        confidence: sig.confidence,
+        notes: sig.notes,
         entryPrice: last.close,
         expirySec: this.config.defaultExpirySec,
         status: 'approved',
@@ -524,7 +579,7 @@ export class BrainTraderService {
           this.reviewTimes.push(Date.now())
           const t0 = Date.now()
           try {
-            const res = await callLlm(this.config.appUrl ?? 'http://localhost:3000', buildReviewMessages(asset, this.config.tf, read, candles, this.config.expiriesSec), { temperature: 0.2, maxTokens: 300, timeoutMs: 30_000 })
+            const res = await callLlm(this.config.appUrl ?? 'http://localhost:3000', buildReviewMessages({ asset, tf: this.config.tf, strategyName: ev.spec.name, script: ev.spec.script ?? '', direction: sig.direction, confidence: sig.confidence, notes: sig.notes, price: last.close, candles, expiriesSec: this.config.expiriesSec, panelLines: this.panelLines(asset), scriptExpiryMin: sig.expiryMin }), { temperature: 0.2, maxTokens: 300, timeoutMs: 30_000 })
             const parsed = parseReview(res.content, this.config.expiriesSec)
             if (!parsed) {
               dec.status = 'ai_unavailable'
@@ -618,7 +673,7 @@ export class BrainTraderService {
         expiryBars: Math.max(1, Math.round(dec.expirySec / TIMEFRAME_SECONDS[this.config.tf])),
         expirySec: kind === 'blitz' || kind === 'digital' || kind === 'binary' ? dec.expirySec : undefined,
         mode: exec.accountSource === 'iq' ? 'live' : 'paper',
-        strategy: `brain:${dec.playbook}`,
+        strategy: `brain:${dec.strategyId}`,
         note: `${BRAIN_TRADER_NOTE} ${dec.id}`,
       })
     } catch {
@@ -631,17 +686,13 @@ function sanitize(c: BrainTraderConfig): BrainTraderConfig {
   const num = (v: unknown, fb: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fb)
   const exp = Array.isArray(c.expiriesSec) ? c.expiriesSec.map(Number).filter((x) => Number.isFinite(x) && x >= 5 && x <= 3600).map(Math.round) : []
   const expiriesSec = [...new Set(exp.length ? exp : DEFAULT_CONFIG.expiriesSec)].sort((a, b) => a - b).slice(0, 8)
-  // minAgree (legacy flat field) and strategy.minAgree stay in lockstep: whichever the patch changed wins
-  const flatChanged = typeof c.minAgree === 'number' && c.minAgree !== (c.strategy?.minAgree ?? c.minAgree)
-  const strategy = sanitizeBrainStrategy(flatChanged ? { ...c.strategy, minAgree: c.minAgree } : c.strategy)
   return {
     enabled: Boolean(c.enabled),
     live: Boolean(c.live),
     tf: (typeof c.tf === 'string' && c.tf in TIMEFRAME_SECONDS ? c.tf : DEFAULT_CONFIG.tf) as Timeframe,
     direction: c.direction === 'call' || c.direction === 'put' ? c.direction : 'both',
-    minAgree: strategy.minAgree,
-    strategy,
-    minConfluence: Math.min(100, Math.max(0, num(c.minConfluence, DEFAULT_CONFIG.minConfluence))),
+    metaStrategyId: typeof c.metaStrategyId === 'string' && c.metaStrategyId.trim() ? c.metaStrategyId.trim() : DEFAULT_CONFIG.metaStrategyId,
+    minConfidence: Math.min(100, Math.max(0, num(c.minConfidence, DEFAULT_CONFIG.minConfidence))),
     expiriesSec,
     defaultExpirySec: snapExpiry(num(c.defaultExpirySec, DEFAULT_CONFIG.defaultExpirySec), expiriesSec),
     requireAi: c.requireAi !== false,

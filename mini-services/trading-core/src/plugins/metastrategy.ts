@@ -627,6 +627,54 @@ confidence = 70
 expiry = 1
 `,
   },
+  {
+    id: 'meta:builtin-brain-fib-adaptive',
+    name: 'Brain 1: adaptive Fibonacci levels + SMC / candle confirmation',
+    script: `
+# BRAIN STRATEGY 1 - adaptive Fibonacci levels with SMC + candlestick confirmation.
+# It adapts to the market: the regime picks the playbook, Fibonacci finds the level, SMC and candles must confirm it.
+#   trending  -> buy / sell the PULLBACK into the 38.2 / 50 / 61.8 retracement of the leg Fibonacci is drawn on
+#   ranging   -> fade the range EDGE (price at the extreme of the leg that defines the range)
+#   noise / unreadable / frantic volatility -> no trade
+let ready = fib.ok() and signal.ok() and vol.ok() and stat.ok()
+# regime: a clean linear trend over the last 100 bars (regression R-squared) with its slope, else the Signal clock's ranging read
+let trendStrong = stat.regR2(100) >= 0.5
+let trendUp = trendStrong and stat.regSlope(100) > 0
+let trendDown = trendStrong and stat.regSlope(100) < 0
+let ranging = signal.ranging() and not trendStrong
+# not frantic: ATR(5)/ATR(30) is not blowing out
+let calm = vol.ratio() < 2
+
+# the leg Fibonacci is drawn on must be worth trading and still fresh
+let legOk = fib.legAtr() >= 2.5 and fib.age() <= 40
+let legUp = fib.dir() == 1
+let legDown = fib.dir() == -1
+
+# the level: price inside the 38.2 - 61.8 retracement zone of that leg (with ~5% tolerance), or sitting at the leg's end for the range fade
+let onKey = fib.pos() >= 0.33 and fib.pos() <= 0.68
+let atLegEnd = fib.pos() <= 0.15
+
+# confirmation 1 - SMC structure leans the same way
+let smcUp = signal.smcLean() == 1
+let smcDown = signal.smcLean() == -1
+
+# confirmation 2 - the candlestick reader (the shared pattern library: hammer, engulfing, stars, piercing, dark cloud ...) agrees
+let bullCandle = signal.candleLean() == 1
+let bearCandle = signal.candleLean() == -1
+
+# trending playbook: with the trend, at a key level, confirmed
+let trendCall = trendUp and legUp and onKey and smcUp and bullCandle
+let trendPut = trendDown and legDown and onKey and smcDown and bearCandle
+
+# ranging playbook: against the edge, confirmed. leg up + price at its end = range top (fade it), leg down + at its end = range bottom
+let rangeCall = ranging and legDown and atLegEnd and smcUp and bullCandle
+let rangePut = ranging and legUp and atLegEnd and smcDown and bearCandle
+
+call when ready and legOk and calm and (trendCall or rangeCall)
+put when ready and legOk and calm and (trendPut or rangePut)
+confidence = 60
+`,
+  },
 ]
 
 /** Per direct follow-up ("SMC: FVG, SMC: CRT and so on are not on the

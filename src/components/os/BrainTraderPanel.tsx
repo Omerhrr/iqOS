@@ -1,8 +1,7 @@
 'use client'
 
 // IQAIR//OS - Brain Trader panel (plugins/braintrader.ts). Self-contained: polls its own status, no page-level wiring.
-// A rule-based structure brain (regime + fib + SMC + candle patterns + AMD + Wyckoff) proposes; an AI reviewer says go/no and picks the
-// expiry. SHADOW by default. The three hit rates (proposed / approved / vetoed) are how you find out whether the reviewer adds anything.
+// An MSL strategy signals; an AI reviewer says go/no and picks the expiry. SHADOW by default. The three hit rates (proposed / approved / vetoed) are how you find out whether the reviewer adds anything.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
@@ -11,13 +10,12 @@ import { Switch } from '@/components/ui/switch'
 import { osGet, osPost } from '@/lib/os/client'
 
 interface Cfg {
-  strategy?: unknown
   enabled: boolean
+  metaStrategyId: string
+  minConfidence: number
   live: boolean
   tf: string
   direction: 'call' | 'put' | 'both'
-  minAgree: number
-  minConfluence: number
   expiriesSec: number[]
   defaultExpirySec: number
   requireAi: boolean
@@ -50,12 +48,9 @@ interface Decision {
   ts: number
   asset: string
   direction: 'call' | 'put'
-  playbook: string
-  regime: string
-  confluence: number
-  agree: string[]
-  oppose: string[]
-  reason: string
+  strategyName: string
+  confidence: number
+  notes: string
   expirySec: number
   status: string
   ai?: { go: boolean; confidence: number; reason: string }
@@ -135,7 +130,7 @@ export default function BrainTraderPanel() {
           {state.label}
         </span>
         <span className="font-mono text-[9px] text-[#4b5a72]">
-          {c.tf} · agree≥{c.minAgree} · expiry {c.expiriesSec.join('/')}s · {c.requireAi ? 'AI reviewer' : 'NO reviewer'} · {st.reviewsLastHour}/{c.maxReviewsPerHour} reviews/h
+          {c.tf} · conf≥{c.minConfidence} · expiry {c.expiriesSec.join('/')}s · {c.requireAi ? 'AI reviewer' : 'NO reviewer'} · {st.reviewsLastHour}/{c.maxReviewsPerHour} reviews/h
         </span>
         <span className="ml-auto flex items-center gap-2">
           <label className="flex items-center gap-1 font-mono text-[8px] uppercase text-[#7c8aa5]">
@@ -172,17 +167,17 @@ export default function BrainTraderPanel() {
       </div>
 
       <p className="mt-0.5 font-mono text-[8px] text-[#3d4c66]">
-        reads {st.runtime.reads} · proposals {st.runtime.proposals} · orders {st.runtime.trades} · open {st.runtime.openCount}
+        reads {st.runtime.reads} · signals {st.runtime.proposals} · orders {st.runtime.trades} · open {st.runtime.openCount}
         {st.runtime.lastAction && <span title={st.runtime.lastAction}> · last: {st.runtime.lastAction}</span>}
         {st.runtime.lastRejection && <span className="text-amber-500/70"> · {st.runtime.lastRejection}</span>}
       </p>
 
       <div className="mt-1 grid grid-cols-4 gap-x-3 font-mono text-[9px] text-[#7c8aa5]">
         <span />
-        <span>proposals</span>
+        <span>signals</span>
         <span>scored</span>
         <span>hit rate</span>
-        {([['all proposed', s.proposed], ['AI approved', s.approved], ['AI vetoed', s.vetoed]] as const).map(([label, g]) => (
+        {([['all signals', s.proposed], ['AI approved', s.approved], ['AI vetoed', s.vetoed]] as const).map(([label, g]) => (
           <div key={label} className="contents">
             <span className="text-[#aab6cc]">{label}</span>
             <span>{g.n}</span>
@@ -198,7 +193,7 @@ export default function BrainTraderPanel() {
       {cfgOpen && draft && (
         <div className="mt-1.5 grid grid-cols-2 gap-2 rounded border border-[#1c2739] p-2 font-mono text-[9px] text-[#aab6cc] md:grid-cols-4">
           {([
-            ['min confluence %', 'minConfluence'],
+            ['min strategy confidence %', 'minConfidence'],
             ['stake $', 'stake'],
             ['max open', 'maxOpen'],
             ['cooldown s', 'cooldownSec'],
@@ -227,10 +222,9 @@ export default function BrainTraderPanel() {
           <Button
             size="sm"
             onClick={async () => {
-              // strategy and minAgree are edited in the Brain tab's strategy section - never send a stale copy from here
-              const { strategy: _strategy, minAgree: _minAgree, ...rest } = draft
-              void _strategy
-              void _minAgree
+              // the strategy itself is picked in the Brain tab - never send a stale copy of it from here
+              const { metaStrategyId: _id, ...rest } = draft
+              void _id
               await patch(rest)
               setCfgOpen(false)
             }}
@@ -243,19 +237,19 @@ export default function BrainTraderPanel() {
 
       {open && (
         <div className="mt-1.5 max-h-56 space-y-1 overflow-y-auto">
-          {decisions.length === 0 && <p className="font-mono text-[9px] text-[#4b5a72]">no proposals yet - the brain only proposes when several readers agree, which is rare by design.</p>}
+          {decisions.length === 0 && <p className="font-mono text-[9px] text-[#4b5a72]">no signals yet - the strategy only fires when its regime, level and confirmations line up, which is rare by design.</p>}
           {decisions.map((d) => (
             <div key={d.id} className="rounded border border-[#1c2739] px-2 py-1 font-mono text-[9px]">
               <div className="flex flex-wrap items-center gap-x-2">
                 <span className="text-[#aab6cc]">{new Date(d.ts * 1000).toLocaleTimeString()}</span>
                 <span className="font-bold text-[#cbd5e1]">{d.asset}</span>
                 <span className={d.direction === 'call' ? 'text-emerald-400' : 'text-rose-400'}>{d.direction.toUpperCase()}</span>
-                <span className="text-[#7c8aa5]">{d.expirySec}s · {d.playbook} · {d.regime} · confluence {d.confluence}</span>
+                <span className="text-[#7c8aa5]">{d.expirySec}s · {d.strategyName} · conf {d.confidence}</span>
                 <span className={STATUS_CLS[d.status] ?? 'text-[#7c8aa5]'}>{d.status.replace('_', ' ')}</span>
                 {d.placed && <span className="text-emerald-300">ORDER</span>}
                 {d.outcome && <span className={d.outcome === 'win' ? 'text-emerald-400' : d.outcome === 'loss' ? 'text-rose-400' : 'text-[#7c8aa5]'}>would have {d.outcome}</span>}
               </div>
-              <p className="text-[#4b5a72]">brain: {d.reason}</p>
+              <p className="text-[#4b5a72]">strategy: {d.notes || '(no notes)'}</p>
               {d.ai && <p className="text-[#7c8aa5]">AI ({d.ai.confidence}): {d.ai.reason}</p>}
               {d.placeError && <p className="text-amber-500/70">{d.placeError}</p>}
             </div>

@@ -976,13 +976,13 @@ const httpServer = createServer(async (req, res) => {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }
       }
-      // GET /brain_trader_mind?asset=EURUSD&tf=1m -> the brain's live read of one asset (regime, playbook, every reader's vote). No AI call, no order.
-      if (path === '/brain_trader_mind') {
+      // GET /brain_trader_preview?asset=EURUSD&tf=1m -> run the Brain Trader's configured MSL strategy on one asset right now (direction, confidence, the script's notes). No AI call, no order.
+      if (path === '/brain_trader_preview') {
         try {
           const asset = String(url.searchParams.get('asset') ?? '')
           if (!asset) return json(400, { ok: false, error: 'asset is required' })
           const tf = url.searchParams.get('tf') ?? undefined
-          return json(200, { ok: true, ...kernel.context().use<BrainTraderService>('brainTrader').mind(asset, tf as never) })
+          return json(200, { ok: true, ...kernel.context().use<BrainTraderService>('brainTrader').preview(asset, tf as never) })
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }
