@@ -184,7 +184,9 @@ test('computeStats: groups signals / approved / vetoed and reports the lift only
 
 // ------------------------------------------------------------ service, with a fake kernel
 type Sig = { direction: 'call' | 'put' | 'none'; confidence: number; notes: string; expiryMin?: number }
-function harness(mode: 'auto' | 'human', series: Candle[], signal: Sig = { direction: 'call', confidence: 70, notes: 'fired: trendCall' }) {
+type AssetStub = { ticker: string; open: boolean; otc?: boolean }
+function harness(mode: 'auto' | 'human', series: Candle[], signal: Sig = { direction: 'call', confidence: 70, notes: 'fired: trendCall' }, assetList: AssetStub[] = [{ ticker: 'EURUSD', open: true, otc: false }]) {
+  const evalAssets: string[] = []
   const placed: unknown[] = []
   let cfgRow: unknown = null
   let logRow: unknown = null
@@ -196,9 +198,9 @@ function harness(mode: 'auto' | 'human', series: Candle[], signal: Sig = { direc
     getBrainTraderLog: () => logRow, saveBrainTraderLog: (l: unknown) => { logRow = l },
     listPositions: () => [] as unknown[],
   }
-  const market = { listAssets: () => [{ ticker: 'EURUSD', open: true, otc: false }], getCandlesDeep: () => candles }
+  const market = { listAssets: () => assetList, getCandlesDeep: () => candles }
   const metaStrategy = {
-    evaluate: (id: string) => { evalCalls++; lastEvalId = id; return { spec: { id, name: 'Brain 1', script: SCRIPT }, result: signal, price: candles[candles.length - 1].close } },
+    evaluate: (id: string, asset: string) => { evalCalls++; lastEvalId = id; evalAssets.push(asset); return { spec: { id, name: 'Brain 1', script: SCRIPT }, result: signal, price: candles[candles.length - 1].close } },
     snapshotSources: () => [{ source: 'renko', direction: 'call', confidence: 70, label: 'up' }],
   }
   const services: Record<string, unknown> = {
@@ -208,7 +210,7 @@ function harness(mode: 'auto' | 'human', series: Candle[], signal: Sig = { direc
   }
   const ctx = { use: (n: string) => services[n], bus: { on: () => () => {} }, log: () => {}, provide: () => {} }
   const svc = new BrainTraderService()
-  return { svc, ctx, placed, getLog: () => logRow as BrainDecision[], setCandles: (c: Candle[]) => { candles = c }, evals: () => evalCalls, evalId: () => lastEvalId }
+  return { svc, ctx, placed, evalAssets, getLog: () => logRow as BrainDecision[], setCandles: (c: Candle[]) => { candles = c }, evals: () => evalCalls, evalId: () => lastEvalId }
 }
 const series = () => rw(200, 4)
 async function boot(h: ReturnType<typeof harness>, cfg: Record<string, unknown>) {
@@ -368,6 +370,76 @@ test('preview(): runs the configured strategy on one asset - no AI call, no log 
   h.svc.stop()
   assert.equal(fetched, 0)
   assert.equal(h.placed.length, 0)
+})
+
+const MANY: AssetStub[] = [
+  ...Array.from({ length: 40 }, (_, i) => ({ ticker: `PAIR${i}`, open: true, otc: false })),
+  ...Array.from({ length: 10 }, (_, i) => ({ ticker: `OTC${i}`, open: true, otc: true })),
+  { ticker: 'CLOSED1', open: false, otc: false },
+]
+
+test('ALL pairs: every open pair is scanned (not a handful), closed markets are skipped, and the real/OTC scope narrows it', async () => {
+  const h = harness('auto', series(), { direction: 'none', confidence: 0, notes: '' }, MANY)
+  await boot(h, { ...BASE, live: false, watchMode: 'all', marketScope: 'all' })
+  assert.equal(h.svc.status().watching.pool, 50)
+  await runOnce(h)
+  assert.equal(new Set(h.evalAssets).size, 50)
+  assert.ok(!h.evalAssets.includes('CLOSED1'))
+  const h2 = harness('auto', series(), { direction: 'none', confidence: 0, notes: '' }, MANY)
+  await boot(h2, { ...BASE, live: false, watchMode: 'all', marketScope: 'otc' })
+  await runOnce(h2)
+  assert.equal(new Set(h2.evalAssets).size, 10)
+  assert.ok(h2.evalAssets.every((a) => a.startsWith('OTC')))
+  const h3 = harness('auto', series(), { direction: 'none', confidence: 0, notes: '' }, MANY)
+  await boot(h3, { ...BASE, live: false, watchMode: 'all', marketScope: 'real' })
+  await runOnce(h3)
+  assert.equal(new Set(h3.evalAssets).size, 40)
+})
+
+test('SELECTED pairs: only the chosen pairs are scanned; a chosen pair whose market is closed is skipped; duplicates and unknown pairs are harmless', async () => {
+  const h = harness('auto', series(), { direction: 'none', confidence: 0, notes: '' }, MANY)
+  await boot(h, { ...BASE, live: false, watchMode: 'selected', assets: ['PAIR3', 'OTC2', 'PAIR3', 'CLOSED1', 'NOPE'] })
+  assert.equal(h.svc.status().watching.pool, 2)
+  assert.equal(h.svc.status().watching.selected, 4)
+  await runOnce(h)
+  assert.deepEqual([...h.evalAssets].sort(), ['OTC2', 'PAIR3'])
+  const h2 = harness('auto', series(), { direction: 'none', confidence: 0, notes: '' }, MANY)
+  await boot(h2, { ...BASE, live: false, watchMode: 'selected', assets: [] })
+  await runOnce(h2)
+  assert.equal(h2.evalAssets.length, 0, 'selected mode with nothing selected watches nothing')
+  assert.equal(h2.svc.status().runtime.lastScanPool, 0)
+})
+
+test('signals from many pairs: 3 reviews per tick, the rest are deferred to the next tick (not lost), and the scan reports what it covered', async () => {
+  const h = harness('auto', series(), { direction: 'call', confidence: 80, notes: 'x' }, MANY.slice(0, 5))
+  await boot(h, { ...BASE, live: false, watchMode: 'all', maxReviewsPerHour: 100 })
+  await withFetch(llm(GO), async () => {
+    await tickOf(h)
+    assert.equal(h.getLog().length, 3, 'MAX_REVIEWS_PER_TICK reviewed now')
+    const rt = h.svc.status().runtime
+    assert.equal(rt.lastScanPool, 5)
+    assert.equal(rt.lastScanAssets, 5)
+    assert.ok(typeof rt.lastScanMs === 'number')
+    await tickOf(h)
+    const log = h.getLog()
+    assert.equal(log.length, 5, 'the two deferred pairs are reviewed on the next tick')
+    assert.equal(new Set(log.map((d) => d.asset)).size, 5)
+    assert.ok(log.every((d) => d.status === 'approved'))
+    await tickOf(h)
+    assert.equal(h.getLog().length, 5, 'nothing is reviewed twice')
+  })
+  h.svc.stop()
+})
+
+test('config: watchMode defaults to ALL, bad values fall back, the selected list is de-duplicated', async () => {
+  const h = harness('auto', series())
+  await h.svc.start(h.ctx as never)
+  assert.equal(h.svc.configure({} as never).watchMode, 'all')
+  assert.equal(h.svc.configure({ watchMode: 'nonsense' } as never).watchMode, 'all')
+  const c = h.svc.configure({ watchMode: 'selected', assets: ['A', 'B', 'A', '', 5 as never] } as never)
+  assert.equal(c.watchMode, 'selected')
+  assert.deepEqual(c.assets, ['A', 'B'])
+  h.svc.stop()
 })
 
 let passed = 0

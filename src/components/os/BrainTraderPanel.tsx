@@ -222,10 +222,14 @@ export default function BrainTraderPanel() {
           <Button
             size="sm"
             onClick={async () => {
-              // the strategy itself is picked in the Brain tab - never send a stale copy of it from here
-              const { metaStrategyId: _id, ...rest } = draft
+              // the strategy and the watchlist are edited in their own Brain-tab sections - never send a stale copy of them from here
+              const { metaStrategyId: _id, marketScope: _ms, ...rest } = draft as Cfg & { watchMode?: unknown; assets?: unknown }
+              const { watchMode: _wm, assets: _as, ...safe } = rest
               void _id
-              await patch(rest)
+              void _ms
+              void _wm
+              void _as
+              await patch(safe as Partial<Cfg>)
               setCfgOpen(false)
             }}
             className="h-6 self-end rounded bg-sky-600 px-3 text-[9px] font-bold uppercase text-white hover:bg-sky-500"

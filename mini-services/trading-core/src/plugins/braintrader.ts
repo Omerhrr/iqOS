@@ -31,7 +31,10 @@ import { fibEvidence, MIN_BARS } from '../analytics/brain'
 import { chatComplete, type ChatMessage } from '../lib/llm'
 
 const LIQUID_CANDIDATES = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'XAUUSD', 'BTCUSD']
-const MAX_ASSETS = 12
+/** hard ceiling on the watchlist (all-pairs mode watches every open pair up to this many) */
+const MAX_ASSETS = 300
+/** one scan pass stops after this long and resumes where it left off on the next tick, so a burst of 100+ pairs closing the same minute cannot stall the loop */
+const SCAN_BUDGET_MS = 4000
 const MAX_REVIEWS_PER_TICK = 3
 const LOG_CAP = 300
 const POLL_MS = 5000
@@ -62,8 +65,11 @@ export interface BrainTraderConfig {
   stake: number
   maxOpen: number
   kind: TradeKind
+  /** 'all' = every open pair in the scope below; 'selected' = only the pairs in `assets` */
+  watchMode: 'all' | 'selected'
   marketScope: 'all' | 'real' | 'otc'
   cooldownSec: number
+  /** the pairs to watch when watchMode is 'selected' */
   assets?: string[]
   /** base URL of the Next.js app (shared LLM keys via /api/ai_trader_decide) */
   appUrl?: string
@@ -83,6 +89,7 @@ const DEFAULT_CONFIG: BrainTraderConfig = {
   stake: 1,
   maxOpen: 2,
   kind: 'binary',
+  watchMode: 'all',
   marketScope: 'all',
   cooldownSec: 120,
 }
@@ -137,6 +144,10 @@ export interface BrainTraderRuntime {
   lastAction?: string
   lastRejection?: string
   lastReason?: string
+  /** the last scan pass: pairs checked, pool size, how long it took */
+  lastScanAssets?: number
+  lastScanPool?: number
+  lastScanMs?: number
 }
 
 export interface BrainTraderStats {
@@ -309,6 +320,8 @@ export class BrainTraderService {
   private unsub: (() => void) | null = null
   private lastBar = new Map<string, number>()
   private lastSignalBar = new Map<string, number>()
+  /** round-robin position in the pool, so a scan cut short by the time budget resumes instead of restarting */
+  private cursor = 0
   private assetCooldownUntil = new Map<string, number>()
   private reviewTimes: number[] = []
   private seq = 0
@@ -388,6 +401,7 @@ export class BrainTraderService {
     this.seq = 0
     this.lastBar.clear()
     this.lastSignalBar.clear()
+    this.cursor = 0
     this.assetCooldownUntil.clear()
     this.reviewTimes = []
     this.rebuildOpenCount()
@@ -395,7 +409,7 @@ export class BrainTraderService {
     this.ctx.log('brain-trader', 'stats and decision log cleared - starting fresh')
   }
 
-  status(): { enabled: boolean; live: boolean; mode: OsMode; active: boolean; config: BrainTraderConfig; runtime: BrainTraderRuntime; stats: BrainTraderStats; reviewsLastHour: number } {
+  status(): { enabled: boolean; live: boolean; mode: OsMode; active: boolean; config: BrainTraderConfig; runtime: BrainTraderRuntime; stats: BrainTraderStats; reviewsLastHour: number; watching: { mode: 'all' | 'selected'; pool: number; selected: number } } {
     let mode: OsMode = 'human'
     try {
       mode = this.ctx.use<{ status(): { mode: OsMode } }>('mode').status().mode
@@ -412,6 +426,7 @@ export class BrainTraderService {
       runtime: this.rt,
       stats: computeStats(this.log),
       reviewsLastHour: this.reviewTimes.filter((t) => t >= cut).length,
+      watching: this.watching(),
     }
   }
 
@@ -464,12 +479,27 @@ export class BrainTraderService {
     return this.config
   }
 
+  /** The pairs to scan, in a stable order. 'all' = every OPEN pair inside the real/OTC scope (liquid majors first); 'selected' = the
+   * chosen pairs that are open right now (a selected pair whose market is closed is simply skipped until it opens). */
   private candidatePool(): string[] {
-    const open = this.market.listAssets().filter((a) => a.open && (this.config.marketScope === 'all' || (this.config.marketScope === 'otc') === Boolean(a.otc)))
-    const tickers = open.map((a) => a.ticker)
-    const configured = this.config.assets?.length ? this.config.assets.filter((a) => tickers.includes(a)) : undefined
-    const ordered = configured ?? [...LIQUID_CANDIDATES.filter((a) => tickers.includes(a)), ...tickers.filter((a) => !LIQUID_CANDIDATES.includes(a))]
-    return ordered.slice(0, MAX_ASSETS)
+    const inScope = this.market.listAssets().filter((a) => a.open && (this.config.marketScope === 'all' || (this.config.marketScope === 'otc') === Boolean(a.otc)))
+    const tickers = inScope.map((a) => a.ticker)
+    if (this.config.watchMode === 'selected') {
+      const open = new Set(tickers)
+      return [...new Set(this.config.assets ?? [])].filter((t) => open.has(t)).slice(0, MAX_ASSETS)
+    }
+    return [...LIQUID_CANDIDATES.filter((a) => tickers.includes(a)), ...tickers.filter((a) => !LIQUID_CANDIDATES.includes(a))].slice(0, MAX_ASSETS)
+  }
+
+  /** how many pairs the trader is watching right now (for the UI) */
+  watching(): { mode: 'all' | 'selected'; pool: number; selected: number } {
+    let pool = 0
+    try {
+      pool = this.candidatePool().length
+    } catch {
+      /* market not ready */
+    }
+    return { mode: this.config.watchMode, pool, selected: this.config.assets?.length ?? 0 }
   }
 
   // ---------- loop ----------
@@ -521,7 +551,16 @@ export class BrainTraderService {
 
   private async scan(): Promise<void> {
     let reviewsThisTick = 0
-    for (const asset of this.candidatePool()) {
+    const pool = this.candidatePool()
+    const t0 = Date.now()
+    const n = pool.length
+    const start = n ? this.cursor % n : 0
+    let done = 0
+    for (let k = 0; k < n; k++) {
+      if (k > 0 && Date.now() - t0 > SCAN_BUDGET_MS) break // resume from here next tick
+      const asset = pool[(start + k) % n]
+      done++
+      this.cursor = (start + k + 1) % n
       let candles: Candle[]
       try {
         candles = this.market.getCandlesDeep(asset, this.config.tf, 320, true)
@@ -571,7 +610,13 @@ export class BrainTraderService {
 
       let go = true
       if (this.config.requireAi) {
-        if (reviewsThisTick >= MAX_REVIEWS_PER_TICK || !this.reviewBudgetLeft()) {
+        if (reviewsThisTick >= MAX_REVIEWS_PER_TICK) {
+          // per-tick throttle only (many pairs signalled the same minute): un-consume this bar so the NEXT tick reviews it, rather than losing the signal
+          this.lastBar.delete(asset)
+          this.lastSignalBar.delete(sigKey)
+          this.rt.proposals -= 1
+          continue
+        } else if (!this.reviewBudgetLeft()) {
           dec.status = 'rate_limited'
           go = false
         } else {
@@ -607,6 +652,9 @@ export class BrainTraderService {
       this.persistLog()
       this.rt.lastAction = `${dec.status} ${dec.direction.toUpperCase()} ${asset} (${dec.expirySec}s)${dec.placed ? ' - ORDER PLACED' : this.config.live ? '' : ' - shadow'}`
     }
+    this.rt.lastScanAssets = done
+    this.rt.lastScanPool = n
+    this.rt.lastScanMs = Date.now() - t0
   }
 
   private async maybePlace(dec: BrainDecision): Promise<void> {
@@ -700,9 +748,10 @@ function sanitize(c: BrainTraderConfig): BrainTraderConfig {
     stake: Math.max(0, num(c.stake, DEFAULT_CONFIG.stake)),
     maxOpen: Math.max(1, Math.round(num(c.maxOpen, DEFAULT_CONFIG.maxOpen))),
     kind: (typeof c.kind === 'string' && c.kind ? c.kind : DEFAULT_CONFIG.kind) as TradeKind,
+    watchMode: c.watchMode === 'selected' ? 'selected' : 'all',
     marketScope: c.marketScope === 'real' || c.marketScope === 'otc' ? c.marketScope : 'all',
     cooldownSec: Math.max(0, num(c.cooldownSec, DEFAULT_CONFIG.cooldownSec)),
-    assets: Array.isArray(c.assets) ? c.assets.filter((a): a is string => typeof a === 'string') : undefined,
+    assets: Array.isArray(c.assets) ? [...new Set(c.assets.filter((a): a is string => typeof a === 'string' && a.length > 0))].slice(0, MAX_ASSETS) : undefined,
     appUrl: typeof c.appUrl === 'string' && c.appUrl ? c.appUrl : undefined,
   }
 }
