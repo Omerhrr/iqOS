@@ -22,6 +22,7 @@ import { fmtMoney, fmtPct, fmtPrice, fmtTime, osGet, osPost } from '@/lib/os/cli
 import BacktestLab from './BacktestLab'
 import QuantPanel from './QuantPanel'
 import AutopilotPanel from './AutopilotPanel'
+import BrainTab from './BrainTab'
 import AiTraderPanel from './AiTraderPanel'
 import AILabPanel from './AILabPanel'
 import JournalTab from './JournalTab'
@@ -255,6 +256,7 @@ export default function BottomTabs(props: BottomTabsProps) {
             ['meta-strategy', 'Meta-Strategy'],
             ['autopilot', `Autopilot${props.bots.filter((b) => b.bot.enabled).length ? ` (${props.bots.filter((b) => b.bot.enabled).length})` : ''}`],
             ['ai-trader', 'AI Trader'],
+            ['brain', 'Brain'],
             ['sentinel', 'Sentinel'],
             ['watchdog', 'Watchdog'],
             ['research', 'Research'],
@@ -495,6 +497,11 @@ export default function BottomTabs(props: BottomTabsProps) {
         <div className="h-full">
           <AiTraderPanel assets={props.assets} onError={onError} />
         </div>
+      </TabsContent>
+
+      {/* BRAIN - structure brain + AI reviewer: live mind, editable strategy, trader (plugins/braintrader.ts) */}
+      <TabsContent value="brain" className="mt-0 min-h-0 flex-1 overflow-hidden">
+        <BrainTab asset={asset} assets={props.assets} onError={onError} />
       </TabsContent>
 
       {/* SENTINEL (risk governance) */}

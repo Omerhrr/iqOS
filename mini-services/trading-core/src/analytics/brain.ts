@@ -69,7 +69,74 @@ export interface BrainRead {
   volRank: number
 }
 
-const WEIGHTS: Record<BrainFamily, number> = { fib: 1.5, smc: 1.5, candle: 1, amd: 1.5, wyckoff: 1.5 }
+const DEFAULT_WEIGHTS: Record<BrainFamily, number> = { fib: 1.5, smc: 1.5, candle: 1, amd: 1.5, wyckoff: 1.5 }
+export const BRAIN_FAMILIES: BrainFamily[] = ['fib', 'smc', 'candle', 'amd', 'wyckoff']
+
+/** The brain's STRATEGY: which playbooks it may run, which readers get a vote and how much, and the regime / fib thresholds.
+ * Every field has a default; the defaults are conventions, not tuned values. */
+export interface BrainStrategy {
+  playbooks: { reversal: boolean; continuation: boolean; range_fade: boolean }
+  families: Record<BrainFamily, boolean>
+  weights: Record<BrainFamily, number>
+  /** families that must agree with the playbook's direction (default 3: on random walks 2 proposes on ~11% of bars, 3 on ~1.7%) */
+  minAgree: number
+  /** efficiency ratio at/above which the regime is a trend, at/below which it is a range */
+  trendEr: number
+  rangeEr: number
+  /** fraction of the 30-bar range that counts as 'at the edge' for the range fade */
+  rangeEdge: number
+  /** fib pullback zone (retracement fraction of the leg) */
+  fibZoneLo: number
+  fibZoneHi: number
+  /** a volatile regime (ATR in its top decile and expanding) stands aside */
+  standAsideWhenVolatile: boolean
+}
+
+export const DEFAULT_BRAIN_STRATEGY: BrainStrategy = {
+  playbooks: { reversal: true, continuation: true, range_fade: true },
+  families: { fib: true, smc: true, candle: true, amd: true, wyckoff: true },
+  weights: { ...DEFAULT_WEIGHTS },
+  minAgree: 3,
+  trendEr: TREND_ER,
+  rangeEr: RANGE_ER,
+  rangeEdge: RANGE_EDGE,
+  fibZoneLo: 0.382,
+  fibZoneHi: 0.786,
+  standAsideWhenVolatile: true,
+}
+
+/** merge + clamp a partial strategy into a full, valid one (used by the trader's config and by tests) */
+export function sanitizeBrainStrategy(p?: Partial<BrainStrategy> | null): BrainStrategy {
+  const d = DEFAULT_BRAIN_STRATEGY
+  const num = (v: unknown, fb: number, lo: number, hi: number) => (typeof v === 'number' && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : fb)
+  const bool = (v: unknown, fb: boolean) => (typeof v === 'boolean' ? v : fb)
+  const pb = (p?.playbooks ?? {}) as Partial<BrainStrategy['playbooks']>
+  const fam = (p?.families ?? {}) as Partial<BrainStrategy['families']>
+  const w = (p?.weights ?? {}) as Partial<BrainStrategy['weights']>
+  const families = {} as Record<BrainFamily, boolean>
+  const weights = {} as Record<BrainFamily, number>
+  for (const f of BRAIN_FAMILIES) {
+    families[f] = bool(fam[f], d.families[f])
+    weights[f] = num(w[f], d.weights[f], 0.1, 5)
+  }
+  const trendEr = num(p?.trendEr, d.trendEr, 0.1, 0.9)
+  const rangeEr = Math.min(num(p?.rangeEr, d.rangeEr, 0.02, 0.6), trendEr - 0.02)
+  const lo = num(p?.fibZoneLo, d.fibZoneLo, 0.1, 0.9)
+  const hi = num(p?.fibZoneHi, d.fibZoneHi, 0.2, 1)
+  return {
+    playbooks: { reversal: bool(pb.reversal, true), continuation: bool(pb.continuation, true), range_fade: bool(pb.range_fade, true) },
+    families,
+    weights,
+    minAgree: Math.max(1, Math.min(5, Math.round(num(p?.minAgree, d.minAgree, 1, 5)))),
+    trendEr,
+    rangeEr,
+    rangeEdge: num(p?.rangeEdge, d.rangeEdge, 0.05, 0.4),
+    fibZoneLo: Math.min(lo, hi - 0.05),
+    fibZoneHi: Math.max(hi, lo + 0.05),
+    standAsideWhenVolatile: bool(p?.standAsideWhenVolatile, true),
+  }
+}
+
 const sgn = (x: number) => (x > 0 ? 1 : x < 0 ? -1 : 0)
 
 function empty(reason: string, price = 0): BrainRead {
@@ -89,13 +156,11 @@ function efficiency(c: Candle[], n: number): { er: number; net: number } {
   return { er: path > 1e-12 ? Math.abs(net) / path : 0, net }
 }
 
-export interface BrainOptions {
-  /** how many of the five families must agree with the playbook's direction (default 3: on random walks 2 proposes on ~11% of bars, 3 on ~1.7%) */
-  minAgree?: number
-}
+export type BrainOptions = Partial<BrainStrategy>
 
 export function readBrain(c: Candle[], opts: BrainOptions = {}): BrainRead {
-  const minAgree = Math.max(1, Math.min(5, Math.round(opts.minAgree ?? 3)))
+  const st = sanitizeBrainStrategy(opts)
+  const minAgree = st.minAgree
   const n = c.length
   if (n < BRAIN_MIN_BARS) return empty(`needs ${BRAIN_MIN_BARS}+ closed bars (have ${n})`)
   const i = n - 1
@@ -107,8 +172,8 @@ export function readBrain(c: Candle[], opts: BrainOptions = {}): BrainRead {
 
   let regime: BrainRegime = 'unclear'
   if (vol && volRank >= 0.9 && vol.ratio >= 1.5) regime = 'volatile'
-  else if (er >= TREND_ER) regime = net > 0 ? 'trend_up' : 'trend_down'
-  else if (er <= RANGE_ER) regime = 'range'
+  else if (er >= st.trendEr) regime = net > 0 ? 'trend_up' : 'trend_down'
+  else if (er <= st.rangeEr) regime = 'range'
 
   // ---------- the five families ----------
   const components: BrainComponent[] = []
@@ -122,13 +187,13 @@ export function readBrain(c: Candle[], opts: BrainOptions = {}): BrainRead {
       const pos = fibPos(sw)
       const bar = c[i]
       const turning = sw.up ? bar.close > bar.open : bar.close < bar.open
-      if (pos >= 0.382 && pos <= 0.786 && turning) {
+      if (pos >= st.fibZoneLo && pos <= st.fibZoneHi && turning) {
         dir = sw.up ? 1 : -1
         note = `${sw.up ? 'up' : 'down'}-leg pullback at ${(pos * 100).toFixed(0)}% retracement, last bar turning with the leg`
-      } else if (pos >= 0.382 && pos <= 0.786) note = `${(pos * 100).toFixed(0)}% retracement of a ${sw.up ? 'up' : 'down'}-leg, no turning bar yet`
-      else note = `${(pos * 100).toFixed(0)}% retracement - outside the 38.2-78.6 zone`
+      } else if (pos >= st.fibZoneLo && pos <= st.fibZoneHi) note = `${(pos * 100).toFixed(0)}% retracement of a ${sw.up ? 'up' : 'down'}-leg, no turning bar yet`
+      else note = `${(pos * 100).toFixed(0)}% retracement - outside the ${(st.fibZoneLo * 100).toFixed(0)}-${(st.fibZoneHi * 100).toFixed(0)} zone`
     }
-    components.push({ family: 'fib', dir, weight: WEIGHTS.fib, note })
+    components.push({ family: 'fib', dir, weight: st.weights.fib, note })
   }
 
   // SMC: net of the live (last 3 bars) concepts, S&R excluded (it fires far too often to be a lean)
@@ -147,7 +212,7 @@ export function readBrain(c: Candle[], opts: BrainOptions = {}): BrainRead {
     } catch {
       /* SMC needs more history than this window gave - leave neutral */
     }
-    components.push({ family: 'smc', dir, weight: WEIGHTS.smc, note })
+    components.push({ family: 'smc', dir, weight: st.weights.smc, note })
   }
 
   // CANDLE patterns: last 2 bars, weighted by each detector's reliability
@@ -167,7 +232,7 @@ export function readBrain(c: Candle[], opts: BrainOptions = {}): BrainRead {
     } catch {
       /* neutral */
     }
-    components.push({ family: 'candle', dir, weight: WEIGHTS.candle, note })
+    components.push({ family: 'candle', dir, weight: st.weights.candle, note })
   }
 
   // AMD: a sweep that has been reclaimed (manipulation) or a fresh distribution - both carry the expected real-move direction
@@ -184,7 +249,7 @@ export function readBrain(c: Candle[], opts: BrainOptions = {}): BrainRead {
         note = `distribution ${amd.age} bar(s) old, moving ${amd.dir > 0 ? 'up' : 'down'}`
       }
     }
-    components.push({ family: 'amd', dir, weight: WEIGHTS.amd, note })
+    components.push({ family: 'amd', dir, weight: st.weights.amd, note })
   }
 
   // WYCKOFF: phase C (spring/upthrust) or D (SOS/SOW) of an accumulation / distribution
@@ -198,7 +263,15 @@ export function readBrain(c: Candle[], opts: BrainOptions = {}): BrainRead {
         note = `${wy.schematic} phase ${wy.phase}${wy.spring ? ' (spring)' : ''}${wy.upthrust ? ' (upthrust)' : ''}${wy.sos ? ' (SOS)' : ''}${wy.sow ? ' (SOW)' : ''}${wy.lps || wy.lpsy ? ' (last point of support/supply)' : ''}`
       } else note = `${wy.schematic} phase ${wy.phase} - not an entry phase`
     }
-    components.push({ family: 'wyckoff', dir, weight: WEIGHTS.wyckoff, note })
+    components.push({ family: 'wyckoff', dir, weight: st.weights.wyckoff, note })
+  }
+
+  // a family the strategy switched off casts no vote and does not count toward the confluence share
+  for (const comp of components) {
+    if (!st.families[comp.family]) {
+      comp.dir = 0
+      comp.note = `disabled in the strategy (${comp.note})`
+    }
   }
 
   // ---------- playbook ----------
@@ -207,19 +280,19 @@ export function readBrain(c: Candle[], opts: BrainOptions = {}): BrainRead {
   let why = ''
   const anchorWy = components.find((x) => x.family === 'wyckoff')!.dir
   const anchorAmd = components.find((x) => x.family === 'amd')!.dir
-  if (regime === 'volatile') {
+  if (regime === 'volatile' && st.standAsideWhenVolatile) {
     why = 'volatile regime (ATR in its top decile and expanding) - stands aside'
-  } else if (anchorWy !== 0 && anchorAmd !== 0 && anchorWy !== anchorAmd) {
+  } else if (st.playbooks.reversal && anchorWy !== 0 && anchorAmd !== 0 && anchorWy !== anchorAmd) {
     why = 'Wyckoff and AMD name opposite directions - conflicting anchors'
-  } else if (anchorWy !== 0 || anchorAmd !== 0) {
+  } else if (st.playbooks.reversal && (anchorWy !== 0 || anchorAmd !== 0)) {
     playbook = 'reversal'
     candidate = anchorWy || anchorAmd
     why = `${anchorWy !== 0 ? 'Wyckoff' : ''}${anchorWy !== 0 && anchorAmd !== 0 ? ' + ' : ''}${anchorAmd !== 0 ? 'AMD' : ''} anchor`
-  } else if (regime === 'trend_up' || regime === 'trend_down') {
+  } else if (st.playbooks.continuation && (regime === 'trend_up' || regime === 'trend_down')) {
     playbook = 'continuation'
     candidate = regime === 'trend_up' ? 1 : -1
     why = `${regime === 'trend_up' ? 'up' : 'down'}trend (efficiency ${er.toFixed(2)})`
-  } else if (regime === 'range') {
+  } else if (st.playbooks.range_fade && regime === 'range') {
     let hi = -Infinity
     let lo = Infinity
     for (let k = i - BRAIN_ER_BARS + 1; k <= i; k++) {
@@ -227,11 +300,11 @@ export function readBrain(c: Candle[], opts: BrainOptions = {}): BrainRead {
       lo = Math.min(lo, c[k].low)
     }
     const pos = hi - lo > 1e-12 ? (price - lo) / (hi - lo) : 0.5
-    if (pos <= RANGE_EDGE) {
+    if (pos <= st.rangeEdge) {
       playbook = 'range_fade'
       candidate = 1
       why = `ranging, price at the bottom ${(pos * 100).toFixed(0)}% of the 30-bar range`
-    } else if (pos >= 1 - RANGE_EDGE) {
+    } else if (pos >= 1 - st.rangeEdge) {
       playbook = 'range_fade'
       candidate = -1
       why = `ranging, price at the top ${(pos * 100).toFixed(0)}% of the 30-bar range`
@@ -241,9 +314,9 @@ export function readBrain(c: Candle[], opts: BrainOptions = {}): BrainRead {
   const cand: 'call' | 'put' | 'none' = candidate > 0 ? 'call' : candidate < 0 ? 'put' : 'none'
   const agree = components.filter((x) => candidate !== 0 && x.dir === candidate).map((x) => x.family)
   const oppose = components.filter((x) => candidate !== 0 && x.dir === -candidate).map((x) => x.family)
-  const totalW = components.reduce((s, x) => s + x.weight, 0)
+  const totalW = components.filter((x) => st.families[x.family]).reduce((s, x) => s + x.weight, 0)
   const agreeW = components.filter((x) => candidate !== 0 && x.dir === candidate).reduce((s, x) => s + x.weight, 0)
-  const confluence = candidate === 0 ? 0 : Math.round((agreeW / totalW) * 100)
+  const confluence = candidate === 0 ? 0 : totalW > 0 ? Math.round((agreeW / totalW) * 100) : 0
 
   let proposal = false
   let reason = why

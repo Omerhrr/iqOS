@@ -5,7 +5,7 @@
 // plumbing (review, veto, fail-closed, shadow vs live, scoring) behaves. They say nothing about whether the brain or the reviewer has an
 // edge on a real market - that is only answered by the decision log's hit rates over a long real-data run.
 import assert from 'node:assert/strict'
-import { readBrain, BRAIN_MIN_BARS } from '../src/analytics/brain'
+import { readBrain, BRAIN_MIN_BARS, DEFAULT_BRAIN_STRATEGY, sanitizeBrainStrategy } from '../src/analytics/brain'
 import { BrainTraderService, parseReview, snapExpiry, buildReviewMessages, resolveOutcome, computeStats, type BrainDecision } from '../src/plugins/braintrader'
 import type { Candle } from '../src/types'
 
@@ -284,6 +284,73 @@ test('config sanitising: expiries clamped and sorted, minAgree bounded, defaults
   assert.equal(c.minAgree, 5)
   assert.equal(c.defaultExpirySec, 60)
   h.svc.stop()
+})
+
+
+test('strategy: defaults are valid, bad input is clamped, a partial patch keeps the rest', () => {
+  const d = sanitizeBrainStrategy()
+  assert.deepEqual(d, DEFAULT_BRAIN_STRATEGY)
+  const w = sanitizeBrainStrategy({ minAgree: 99, trendEr: 5, rangeEr: 5, rangeEdge: -1, fibZoneLo: 0.9, fibZoneHi: 0.2, weights: { fib: 100 } as never, playbooks: { reversal: false } as never })
+  assert.equal(w.minAgree, 5)
+  assert.ok(w.trendEr <= 0.9 && w.rangeEr < w.trendEr)
+  assert.ok(w.rangeEdge >= 0.05)
+  assert.ok(w.fibZoneHi >= w.fibZoneLo + 0.05)
+  assert.equal(w.weights.fib, 5)
+  assert.equal(w.weights.smc, 1.5)
+  assert.equal(w.playbooks.reversal, false)
+  assert.equal(w.playbooks.continuation, true)
+})
+
+test('strategy: switching the reversal playbook off removes reversal proposals; switching a reader off removes its vote', () => {
+  let revOn = 0
+  let revOff = 0
+  let wyVotes = 0
+  let wyMuted = 0
+  for (let s = 1; s <= SEEDS; s++) {
+    const c = wy(s, true, 'lps') as Candle[]
+    if (readBrain(c, { minAgree: 1 }).playbook === 'reversal') revOn++
+    if (readBrain(c, { minAgree: 1, playbooks: { reversal: false, continuation: true, range_fade: true } }).playbook === 'reversal') revOff++
+    if (readBrain(c, { minAgree: 1 }).components.find((x) => x.family === 'wyckoff')!.dir !== 0) wyVotes++
+    const muted = readBrain(c, { minAgree: 1, families: { fib: true, smc: true, candle: true, amd: true, wyckoff: false } })
+    const comp = muted.components.find((x) => x.family === 'wyckoff')!
+    if (comp.dir !== 0 || muted.agree.includes('wyckoff')) wyMuted++
+    assert.match(comp.note, /disabled in the strategy/)
+  }
+  assert.ok(revOn / SEEDS >= 0.8, `reversal playbook only on ${revOn}/${SEEDS}`)
+  assert.equal(revOff, 0)
+  assert.ok(wyVotes / SEEDS >= 0.8)
+  assert.equal(wyMuted, 0)
+})
+
+test('strategy: the brain config deep-merges a partial strategy patch and keeps minAgree in lockstep', async () => {
+  const h = harness('auto', planted())
+  await h.svc.start(h.ctx as never)
+  h.svc.configure({ strategy: { playbooks: { reversal: false } } } as never)
+  let c = h.svc.configure({ strategy: { weights: { fib: 3 } } } as never)
+  assert.equal(c.strategy.playbooks.reversal, false)
+  assert.equal(c.strategy.weights.fib, 3)
+  assert.equal(c.strategy.weights.smc, 1.5)
+  c = h.svc.configure({ minAgree: 4 } as never)
+  assert.equal(c.strategy.minAgree, 4)
+  c = h.svc.configure({ strategy: { minAgree: 2 } } as never)
+  assert.equal(c.minAgree, 2)
+  h.svc.stop()
+})
+
+test('mind(): reads one asset on demand with the configured strategy - no AI call, no log entry, no order', async () => {
+  const h = harness('auto', planted())
+  await h.svc.start(h.ctx as never)
+  h.svc.configure({ strategy: { minAgree: 1 } } as never)
+  let fetched = 0
+  await withFetch(() => { fetched++; return llm('{}')() }, async () => {
+    const m = h.svc.mind('EURUSD')
+    assert.equal(m.read.ok, true)
+    assert.equal(m.read.candidate, 'call')
+    assert.equal(m.tf, '1m')
+  })
+  h.svc.stop()
+  assert.equal(fetched, 0)
+  assert.equal(h.placed.length, 0)
 })
 
 let passed = 0

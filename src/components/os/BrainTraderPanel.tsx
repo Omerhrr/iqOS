@@ -11,6 +11,7 @@ import { Switch } from '@/components/ui/switch'
 import { osGet, osPost } from '@/lib/os/client'
 
 interface Cfg {
+  strategy?: unknown
   enabled: boolean
   live: boolean
   tf: string
@@ -197,7 +198,6 @@ export default function BrainTraderPanel() {
       {cfgOpen && draft && (
         <div className="mt-1.5 grid grid-cols-2 gap-2 rounded border border-[#1c2739] p-2 font-mono text-[9px] text-[#aab6cc] md:grid-cols-4">
           {([
-            ['agree ≥ (1-5)', 'minAgree'],
             ['min confluence %', 'minConfluence'],
             ['stake $', 'stake'],
             ['max open', 'maxOpen'],
@@ -227,7 +227,11 @@ export default function BrainTraderPanel() {
           <Button
             size="sm"
             onClick={async () => {
-              await patch(draft)
+              // strategy and minAgree are edited in the Brain tab's strategy section - never send a stale copy from here
+              const { strategy: _strategy, minAgree: _minAgree, ...rest } = draft
+              void _strategy
+              void _minAgree
+              await patch(rest)
               setCfgOpen(false)
             }}
             className="h-6 self-end rounded bg-sky-600 px-3 text-[9px] font-bold uppercase text-white hover:bg-sky-500"

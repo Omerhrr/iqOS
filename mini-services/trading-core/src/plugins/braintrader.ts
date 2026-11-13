@@ -21,7 +21,7 @@ import type { Candle, Timeframe, TradeKind } from '../types'
 import { TIMEFRAME_SECONDS } from '../types'
 import type { MarketDataService } from './market-data'
 import type { OsMode } from './os-mode'
-import { readBrain, BRAIN_MIN_BARS, type BrainRead } from '../analytics/brain'
+import { readBrain, BRAIN_MIN_BARS, DEFAULT_BRAIN_STRATEGY, sanitizeBrainStrategy, type BrainRead, type BrainStrategy } from '../analytics/brain'
 import { chatComplete, type ChatMessage } from '../lib/llm'
 
 const LIQUID_CANDIDATES = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'XAUUSD', 'BTCUSD']
@@ -39,8 +39,10 @@ export interface BrainTraderConfig {
   live: boolean
   tf: Timeframe
   direction: 'call' | 'put' | 'both'
-  /** minimum families that must agree (see analytics/brain.ts) */
+  /** minimum families that must agree (mirrors strategy.minAgree; kept for older clients - strategy wins on read) */
   minAgree: number
+  /** the brain's strategy: playbooks, reader votes/weights, regime and fib thresholds (analytics/brain.ts) */
+  strategy: BrainStrategy
   /** minimum brain confluence (0-100) to even ask the reviewer */
   minConfluence: number
   /** expiries (seconds) the reviewer may choose from */
@@ -67,6 +69,7 @@ const DEFAULT_CONFIG: BrainTraderConfig = {
   tf: '1m',
   direction: 'both',
   minAgree: 3,
+  strategy: DEFAULT_BRAIN_STRATEGY,
   minConfluence: 40,
   expiriesSec: [60, 180, 300],
   defaultExpirySec: 180,
@@ -385,12 +388,31 @@ export class BrainTraderService {
     }
   }
 
+  /** What the brain thinks about one asset RIGHT NOW (closed bars, the configured strategy). No AI call, no order, nothing logged. */
+  mind(asset: string, tf?: Timeframe): { asset: string; tf: Timeframe; bars: number; lastBarTime: number | null; read: BrainRead } {
+    const t = tf && tf in TIMEFRAME_SECONDS ? tf : this.config.tf
+    const candles = this.market.getCandlesDeep(asset, t, 320, true)
+    return { asset, tf: t, bars: candles.length, lastBarTime: candles.length ? candles[candles.length - 1].time : null, read: readBrain(candles, this.config.strategy) }
+  }
+
   decisions(limit = 50): BrainDecision[] {
     return this.log.slice(-Math.max(1, Math.min(LOG_CAP, limit))).reverse()
   }
 
   configure(patch: Partial<BrainTraderConfig>): BrainTraderConfig {
-    this.config = sanitize({ ...this.config, ...patch })
+    // deep-merge the strategy so a partial patch (one toggle) keeps every other setting; keep the flat minAgree in lockstep
+    const ps = patch.strategy as Partial<BrainStrategy> | undefined
+    const mergedStrategy = ps
+      ? {
+          ...this.config.strategy,
+          ...ps,
+          playbooks: { ...this.config.strategy.playbooks, ...(ps.playbooks ?? {}) },
+          families: { ...this.config.strategy.families, ...(ps.families ?? {}) },
+          weights: { ...this.config.strategy.weights, ...(ps.weights ?? {}) },
+        }
+      : this.config.strategy
+    const flat = patch.minAgree !== undefined ? patch.minAgree : ps?.minAgree !== undefined ? ps.minAgree : this.config.minAgree
+    this.config = sanitize({ ...this.config, ...patch, strategy: { ...mergedStrategy, minAgree: flat }, minAgree: flat })
     this.persistConfig()
     this.ctx.log('brain-trader', `config updated - ${this.config.enabled ? (this.config.live ? 'LIVE' : 'SHADOW') : 'off'} · ${this.config.tf} · agree>=${this.config.minAgree} · expiries ${this.config.expiriesSec.join('/')}s`)
     return this.config
@@ -465,7 +487,7 @@ export class BrainTraderService {
       if (this.lastBar.get(asset) === last.time) continue // already read this closed bar
       this.lastBar.set(asset, last.time)
       this.rt.reads += 1
-      const read = readBrain(candles, { minAgree: this.config.minAgree })
+      const read = readBrain(candles, this.config.strategy)
       this.rt.lastReason = `${asset}: ${read.reason}`
       if (!read.proposal || read.direction === 'none') continue
       if (read.confluence < this.config.minConfluence) continue
@@ -609,12 +631,16 @@ function sanitize(c: BrainTraderConfig): BrainTraderConfig {
   const num = (v: unknown, fb: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fb)
   const exp = Array.isArray(c.expiriesSec) ? c.expiriesSec.map(Number).filter((x) => Number.isFinite(x) && x >= 5 && x <= 3600).map(Math.round) : []
   const expiriesSec = [...new Set(exp.length ? exp : DEFAULT_CONFIG.expiriesSec)].sort((a, b) => a - b).slice(0, 8)
+  // minAgree (legacy flat field) and strategy.minAgree stay in lockstep: whichever the patch changed wins
+  const flatChanged = typeof c.minAgree === 'number' && c.minAgree !== (c.strategy?.minAgree ?? c.minAgree)
+  const strategy = sanitizeBrainStrategy(flatChanged ? { ...c.strategy, minAgree: c.minAgree } : c.strategy)
   return {
     enabled: Boolean(c.enabled),
     live: Boolean(c.live),
     tf: (typeof c.tf === 'string' && c.tf in TIMEFRAME_SECONDS ? c.tf : DEFAULT_CONFIG.tf) as Timeframe,
     direction: c.direction === 'call' || c.direction === 'put' ? c.direction : 'both',
-    minAgree: Math.min(5, Math.max(1, Math.round(num(c.minAgree, DEFAULT_CONFIG.minAgree)))),
+    minAgree: strategy.minAgree,
+    strategy,
     minConfluence: Math.min(100, Math.max(0, num(c.minConfluence, DEFAULT_CONFIG.minConfluence))),
     expiriesSec,
     defaultExpirySec: snapExpiry(num(c.defaultExpirySec, DEFAULT_CONFIG.defaultExpirySec), expiriesSec),
