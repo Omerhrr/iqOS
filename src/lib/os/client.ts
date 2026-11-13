@@ -466,6 +466,132 @@ export interface ExplainerRead {
   effort: ExplainerEffort
 }
 
+export type RegimeKind = 'trend-up' | 'trend-down' | 'ranging' | 'noise'
+
+export interface RegimeBoardRow {
+  asset: string
+  name: string
+  category: string
+  otc: boolean
+  regime: RegimeKind
+  score: number
+  er: number
+  adx: number
+  plusDI: number
+  minusDI: number
+  tStat: number
+  r2: number
+  rangePct: number
+  rangeAtr: number
+  crossings: number
+  touchesTop: number
+  touchesBottom: number
+  position: number
+  flipRate: number
+  price: number
+  windowHigh: number
+  windowLow: number
+  reason: string
+}
+
+export interface RegimeBoard {
+  ok: true
+  tf: Timeframe
+  scannedTs: number
+  universe: number
+  classified: number
+  noData: number
+  window: number
+  counts: Record<RegimeKind, number>
+  up: RegimeBoardRow[]
+  down: RegimeBoardRow[]
+  ranging: RegimeBoardRow[]
+  noise: RegimeBoardRow[]
+}
+
+export type SignalAction = 'buy' | 'sell' | 'wait'
+
+export interface SignalEvidence {
+  id: string
+  title: string
+  ok: boolean
+  lean: ExplainerLean
+  strength: number | null
+  headline: string
+}
+
+export interface SignalCheck {
+  label: string
+  state: 'pass' | 'fail' | 'na'
+  note: string
+}
+
+export interface SignalExpiry {
+  bars: number
+  minutes: number
+  label: string
+  basis: string
+  rates: { bars: number; rate: number; n: number }[]
+}
+
+export interface SignalResult {
+  action: SignalAction
+  needle: number
+  rawNeedle: number
+  strength: number
+  regime: RegimeKind | 'unreadable'
+  setup: string
+  headline: string
+  reasons: string[]
+  checks: SignalCheck[]
+  readers: { call: number; put: number; flat: number; unreadable: number }
+  evidence: SignalEvidence[]
+  expiry: SignalExpiry | null
+  note: string
+}
+
+export interface SignalRead {
+  ok: true
+  asset: string
+  tf: Timeframe
+  ts: number
+  price: number
+  signal: SignalResult
+}
+
+export interface SignalCandidate {
+  asset: string
+  action: SignalAction
+  needle: number
+  strength: number
+  regime: SignalResult['regime']
+  setup: string
+  expiryLabel: string | null
+}
+
+export interface SignalBest {
+  ok: true
+  tf: Timeframe
+  ts: number
+  evaluated: number
+  pick: SignalRead | null
+  pickIsWait: boolean
+  keptCurrent: boolean
+  leaderboard: SignalCandidate[]
+}
+
+export async function getSignal(asset: string, tf: Timeframe): Promise<SignalRead | { ok: false; error: string }> {
+  return osGet('/signal', { asset, tf })
+}
+
+export async function getSignalBest(tf: Timeframe, opts?: { current?: string; refresh?: boolean }): Promise<SignalBest | { ok: false; error: string }> {
+  return osGet('/signal_best', { tf, current: opts?.current, refresh: opts?.refresh ? 1 : undefined })
+}
+
+export async function getRegimeScan(tf: Timeframe, opts?: { category?: string; refresh?: boolean }): Promise<RegimeBoard | { ok: false; error: string }> {
+  return osGet('/regime_scan', { tf, category: opts?.category, refresh: opts?.refresh ? 1 : undefined })
+}
+
 export async function getExplainer(asset: string, tf: Timeframe): Promise<ExplainerRead | { ok: false; error: string }> {
   return osGet('/explainer', { asset, tf })
 }

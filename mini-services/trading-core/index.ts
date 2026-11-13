@@ -55,6 +55,8 @@ import { technicalPlugin, TechnicalService } from './src/plugins/technical'
 import { mrcPredictPlugin, MrcPredictService } from './src/plugins/mrcpredict'
 import { reversalEventsPlugin, ReversalEventsService } from './src/plugins/reversalevents'
 import { explainerPlugin, ExplainerService } from './src/plugins/explainer'
+import { regimeScanPlugin, RegimeScanService } from './src/plugins/regimescan'
+import { signalPlugin, SignalService } from './src/plugins/signal'
 import {
   computeTickSmc, computeTickOracle, computeTickTechnical, computeTickFootprint, medianTickGapMs,
 } from './src/analytics/tickdesk'
@@ -248,6 +250,8 @@ kernel.register(technicalPlugin)
 kernel.register(mrcPredictPlugin)
 kernel.register(reversalEventsPlugin)
 kernel.register(explainerPlugin)
+kernel.register(regimeScanPlugin)
+kernel.register(signalPlugin)
 
 // ---------- Full-universe scanners for Distill / Cointegration / Vol Arb ----------
 // These three started as single-asset-only panels (read whatever's on the
@@ -2091,6 +2095,41 @@ const httpServer = createServer(async (req, res) => {
               ? svc.globalRenko({ ...opts, source: q.get('source') === 'renko' ? 'renko' : 'effort' })
               : svc.globalKagi(opts)
           return json(200, { ok: true, ...board })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // ---------- Signal clock ----------
+      // GET /signal?asset=X&tf=1m[&refresh=1] -> Explainer + regime -> BUY/SELL/WAIT,
+      //   needle, holding period (plugins/signal.ts read()).
+      // GET /signal_best?tf=1m[&current=X][&category=all][&refresh=1] -> the strongest
+      //   actionable pair out of the regime shortlist, with hysteresis on `current`.
+      if (path === '/signal' || path === '/signal_best') {
+        try {
+          const tfv = tfStrict(q.get('tf'))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const svc = kernel.context().use<SignalService>('signal')
+          if (path === '/signal') {
+            const asset = String(q.get('asset') ?? market.activeAsset)
+            return json(200, svc.read(asset, tfv, { refresh: q.get('refresh') === '1' }))
+          }
+          return json(200, svc.best(tfv, { current: q.get('current') || undefined, category: q.get('category') ?? 'all', refresh: q.get('refresh') === '1' }))
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // ---------- Regime scan (whole universe, one tf) ----------
+      // GET /regime_scan?tf=1m&category=all[&refresh=1] -> every open pair
+      // classified as trend-up / trend-down / ranging / noise and ranked inside
+      // each bucket (plugins/regimescan.ts). Closed candles only, 15s cache.
+      if (path === '/regime_scan') {
+        try {
+          const tfv = tfStrict(q.get('tf'))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const svc = kernel.context().use<RegimeScanService>('regimescan')
+          return json(200, svc.global({ tf: tfv, category: q.get('category') ?? 'all', refresh: q.get('refresh') === '1' }))
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }

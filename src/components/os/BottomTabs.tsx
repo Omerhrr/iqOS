@@ -29,6 +29,8 @@ import ScreenerPanel from './ScreenerPanel'
 import ScreenerPanel2 from './ScreenerPanel2'
 import SmcPanel from './SmcPanel'
 import ExplainerTab from './ExplainerTab'
+import RegimePanel from './RegimePanel'
+import SignalTab from './SignalTab'
 import MetaStrategyPanel from './MetaStrategyPanel'
 import AlertRulesPanel from './AlertRulesPanel'
 import SentinelPanel from './SentinelPanel'
@@ -246,6 +248,8 @@ export default function BottomTabs(props: BottomTabsProps) {
             ['screener2', 'Confluence Signal'],
             ['smc', 'SMC'],
             ['explainer', 'Explainer'],
+            ['regime', 'Regime'],
+            ['signal', 'Signal'],
             ['meta-strategy', 'Meta-Strategy'],
             ['autopilot', `Autopilot${props.bots.filter((b) => b.bot.enabled).length ? ` (${props.bots.filter((b) => b.bot.enabled).length})` : ''}`],
             ['ai-trader', 'AI Trader'],
@@ -410,6 +414,25 @@ export default function BottomTabs(props: BottomTabsProps) {
       </TabsContent>
 
       {/* SMART MONEY CONCEPTS / ICT STRUCTURE */}
+      <TabsContent value="signal" className="mt-0 min-h-0 flex-1 overflow-hidden">
+        <SignalTab
+          initialAsset={asset}
+          initialTf={props.tf}
+          assets={props.assets}
+          prices={prices}
+          closedTick={closedTick}
+          onPlaced={() => {
+            refreshPositions()
+            props.refreshAccount()
+          }}
+          onError={onError}
+        />
+      </TabsContent>
+
+      <TabsContent value="regime" className="mt-0 min-h-0 flex-1 overflow-hidden">
+        <RegimePanel closedTick={closedTick} onPick={props.onSelectSetup} />
+      </TabsContent>
+
       <TabsContent value="explainer" className="mt-0 min-h-0 flex-1 overflow-hidden">
         <ExplainerTab
           initialAsset={asset}
