@@ -386,6 +386,62 @@ export async function getSmcScan(asset: string, tf: Timeframe): Promise<SmcScanR
   return osGet<SmcScanResponse>('/smc_scan', { asset, tf })
 }
 
+// ---------- Explainer (mini-services/trading-core/src/plugins/explainer.ts) ----------
+// One pair + timeframe, five readers (SMC, candle pattern, MRC, swing,
+// technical), each as a verdict with plain-language reasons, plus an
+// agreement count and the candles/swings for the small swing chart.
+
+export type ExplainerLean = 'call' | 'put' | 'none'
+export type ExplainerPanelId = 'smc' | 'candle' | 'mrc' | 'swing' | 'technical'
+
+export interface ExplainerPanel {
+  id: ExplainerPanelId
+  title: string
+  /** false = this reader could not read (warming up / too few bars) */
+  ok: boolean
+  lean: ExplainerLean
+  /** the engine's own 0-100 strength; null where it has none */
+  strength: number | null
+  headline: string
+  reasons: string[]
+}
+
+export interface ExplainerSummary {
+  call: number
+  put: number
+  flat: number
+  unavailable: number
+  readable: number
+  lean: ExplainerLean
+  grade: 'aligned' | 'leaning' | 'mixed' | 'flat' | 'none'
+  headline: string
+  note: string
+}
+
+export interface ExplainerChart {
+  candles: { time: number; open: number; high: number; low: number; close: number }[]
+  swings: { time: number; price: number; kind: 'high' | 'low' }[]
+  structure: 'hh-hl' | 'lh-ll' | 'none'
+  direction: 1 | -1 | 0
+  lookback: number
+}
+
+export interface ExplainerRead {
+  ok: true
+  asset: string
+  tf: Timeframe
+  ts: number
+  price: number
+  bars: number
+  panels: ExplainerPanel[]
+  summary: ExplainerSummary
+  chart: ExplainerChart
+}
+
+export async function getExplainer(asset: string, tf: Timeframe): Promise<ExplainerRead | { ok: false; error: string }> {
+  return osGet('/explainer', { asset, tf })
+}
+
 export interface SmcGlobalResult {
   ok: true
   tf: Timeframe

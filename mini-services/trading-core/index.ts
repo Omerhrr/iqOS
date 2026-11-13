@@ -54,6 +54,7 @@ import { reversalPlugin, ReversalService } from './src/plugins/reversal'
 import { technicalPlugin, TechnicalService } from './src/plugins/technical'
 import { mrcPredictPlugin, MrcPredictService } from './src/plugins/mrcpredict'
 import { reversalEventsPlugin, ReversalEventsService } from './src/plugins/reversalevents'
+import { explainerPlugin, ExplainerService } from './src/plugins/explainer'
 import {
   computeTickSmc, computeTickOracle, computeTickTechnical, computeTickFootprint, medianTickGapMs,
 } from './src/analytics/tickdesk'
@@ -246,6 +247,7 @@ kernel.register(reversalPlugin)
 kernel.register(technicalPlugin)
 kernel.register(mrcPredictPlugin)
 kernel.register(reversalEventsPlugin)
+kernel.register(explainerPlugin)
 
 // ---------- Full-universe scanners for Distill / Cointegration / Vol Arb ----------
 // These three started as single-asset-only panels (read whatever's on the
@@ -2089,6 +2091,23 @@ const httpServer = createServer(async (req, res) => {
               ? svc.globalRenko({ ...opts, source: q.get('source') === 'renko' ? 'renko' : 'effort' })
               : svc.globalKagi(opts)
           return json(200, { ok: true, ...board })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // ---------- Explainer (one pair + tf, five readers, plain language) ----------
+      // GET /explainer?asset=X&tf=1m -> plugins/explainer.ts read(): SMC,
+      // candle pattern, MRC, swing and technical verdicts with reasons, the
+      // agreement count, and the candles + swing points for the small swing
+      // chart. Closed candles only.
+      if (path === '/explainer') {
+        try {
+          const tfv = tfStrict(q.get('tf'))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const asset = String(q.get('asset') ?? market.activeAsset)
+          const svc = kernel.context().use<ExplainerService>('explainer')
+          return json(200, svc.read(asset, tfv))
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }
