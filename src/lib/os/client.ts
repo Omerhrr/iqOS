@@ -1243,6 +1243,81 @@ export async function getKagiReversals(
   return osGet('/kagi_reversals', { asset, tf, limit: opts?.limit, horizon: opts?.horizon, payout: opts?.payout })
 }
 
+// Whole-universe "who is reversing NOW" boards: every open pair x every scan
+// timeframe (30s..15m), only the series whose newest event is fresh.
+
+export type ReversalBoardTf = '30s' | '1m' | '2m' | '5m' | '15m'
+export const REVERSAL_BOARD_TFS: ReversalBoardTf[] = ['30s', '1m', '2m', '5m', '15m']
+
+export interface ReversalBoardMeta {
+  ok: boolean
+  error?: string
+  scannedTs: number
+  universe: number
+  series: number
+  noData: number
+  tfs: ReversalBoardTf[]
+  fresh: number
+}
+
+export interface RenkoReversalBoardRow {
+  asset: string
+  tf: ReversalBoardTf
+  price: number
+  computedTs: number
+  source: 'effort' | 'renko'
+  event: RenkoReversalEvent
+  trend: 'up' | 'down' | 'none'
+  streak: number
+  brickSize: number
+  regime: ReversalRegime | null
+  confirmedRatio: number
+  stat: ReversalFollowThrough | null
+}
+
+export interface KagiReversalBoardRow {
+  asset: string
+  tf: ReversalBoardTf
+  price: number
+  computedTs: number
+  events: KagiFeedEvent[]
+  direction: 'up' | 'down' | 'none'
+  thick: boolean
+  regime: ReversalRegime
+  structure: 'hh-hl' | 'lh-ll' | 'none'
+  stats: Record<string, ReversalFollowThrough>
+}
+
+export async function getRenkoReversalsGlobal(opts?: {
+  source?: 'effort' | 'renko'
+  fresh?: number
+  tfs?: ReversalBoardTf[]
+  category?: string
+  refresh?: boolean
+}): Promise<ReversalBoardMeta & { source: 'effort' | 'renko'; rows: RenkoReversalBoardRow[] }> {
+  return osGet('/renko_reversals_global', {
+    source: opts?.source,
+    fresh: opts?.fresh,
+    tfs: opts?.tfs?.length ? opts.tfs.join(',') : undefined,
+    category: opts?.category,
+    refresh: opts?.refresh ? 1 : undefined,
+  })
+}
+
+export async function getKagiReversalsGlobal(opts?: {
+  fresh?: number
+  tfs?: ReversalBoardTf[]
+  category?: string
+  refresh?: boolean
+}): Promise<ReversalBoardMeta & { rows: KagiReversalBoardRow[] }> {
+  return osGet('/kagi_reversals_global', {
+    fresh: opts?.fresh,
+    tfs: opts?.tfs?.length ? opts.tfs.join(',') : undefined,
+    category: opts?.category,
+    refresh: opts?.refresh ? 1 : undefined,
+  })
+}
+
 // ---------- Technical Summary (mini-services/trading-core/src/plugins/technical.ts) ----------
 
 export type TechRead = 'buy' | 'sell' | 'neutral' | 'na'

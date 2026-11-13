@@ -2069,6 +2069,31 @@ const httpServer = createServer(async (req, res) => {
         }
       }
 
+      // GET /renko_reversals_global?source=effort|renko&fresh=1&tfs=30s,1m,2m,5m,15m&category=all
+      // GET /kagi_reversals_global?fresh=1&tfs=...&category=all
+      // -> the whole-universe "who is reversing NOW" boards: every open pair x
+      // every scan timeframe (30s..15m), only series whose newest event is at
+      // most `fresh` closed candles old. Add &refresh=1 to bypass the 20s cache.
+      if (path === '/renko_reversals_global' || path === '/kagi_reversals_global') {
+        try {
+          const svc = kernel.context().use<ReversalEventsService>('reversalevents')
+          const freshRaw = q.get('fresh')
+          const opts = {
+            fresh: freshRaw !== null && freshRaw !== '' && Number.isFinite(Number(freshRaw)) ? Number(freshRaw) : undefined,
+            tfs: q.get('tfs') ? String(q.get('tfs')).split(',').map((t) => t.trim()).filter(Boolean) : undefined,
+            category: q.get('category') ?? 'all',
+            refresh: q.get('refresh') === '1',
+          }
+          const board =
+            path === '/renko_reversals_global'
+              ? svc.globalRenko({ ...opts, source: q.get('source') === 'renko' ? 'renko' : 'effort' })
+              : svc.globalKagi(opts)
+          return json(200, { ok: true, ...board })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
       // ---------- Technical Summary (investing.com-style oscillator+MA ladder) ----------
       // GET /technical?asset=X -> plugins/technical.ts's summaryFor(), the
       // full per-timeframe vote ladder for one pair. GET /technical_global

@@ -13,6 +13,7 @@ import assert from 'node:assert/strict'
 import { kagi } from '../src/analytics/kagi'
 import { effortBricks, classifyEffortRegime } from '../src/analytics/effortbricks'
 import { kagiReversalFeed, renkoReversalFeed } from '../src/analytics/reversalevents'
+import { ReversalEventsService, BOARD_TFS } from '../src/plugins/reversalevents'
 import type { Candle } from '../src/types'
 
 type Test = { name: string; fn: () => void }
@@ -181,6 +182,85 @@ test('follow-through breakeven follows the payout', () => {
   assert.ok(Math.abs(lo - 1 / 1.85) < 1e-12)
   assert.ok(Math.abs(hi - 1 / 1.92) < 1e-12)
   assert.ok(hi < lo, 'a bigger payout lowers the bar')
+})
+
+// ---------------------------------------------------------------------
+// whole-universe boards ("who is reversing NOW")
+// ---------------------------------------------------------------------
+
+/** steady climb with tiny noise, then `tail` closes of a sharp fall */
+function climbThenFall(seed: number, climbBars: number, fallBars: number): Candle[] {
+  const r = mulberry32(seed)
+  const closes: number[] = []
+  let p = 100
+  for (let i = 0; i < climbBars; i++) {
+    p += 0.2 + r() * 0.05 // strictly rising -> every brick is up, no reversal possible yet
+    closes.push(p)
+  }
+  for (let i = 0; i < fallBars; i++) {
+    p -= 3
+    closes.push(p)
+  }
+  return fromCloses(closes)
+}
+
+function boardService(byAsset: Record<string, Candle[]>, open: Record<string, boolean> = {}) {
+  const market = {
+    listAssets: () => Object.keys(byAsset).map((t) => ({ ticker: t, open: open[t] ?? true, category: 'forex', price: 1, basePrice: 1, iq: true })),
+    getCandlesDeep: (asset: string) => byAsset[asset] ?? [],
+  }
+  const svc = new ReversalEventsService()
+  void svc.start({ use: () => market, log: () => {}, provide: () => {} } as never)
+  return svc
+}
+
+test('board: only series whose newest reversal is fresh are listed, across all 30s..15m timeframes', () => {
+  const svc = boardService({
+    JUST_FLIPPED: climbThenFall(1, 300, 1), // flips on the newest candle
+    FLIPPED_LONG_AGO: climbThenFall(2, 300, 80), // flipped 79 candles ago, still falling
+    STILL_CLIMBING: climbThenFall(3, 300, 0), // never reversed
+  })
+  const b = svc.globalRenko({ fresh: 1 })
+  assert.deepEqual(b.tfs, BOARD_TFS)
+  assert.equal(b.universe, 3)
+  assert.equal(b.series, 3 * BOARD_TFS.length)
+  const assets = new Set(b.rows.map((r) => r.asset))
+  assert.deepEqual([...assets], ['JUST_FLIPPED'])
+  assert.equal(b.rows.length, BOARD_TFS.length, 'one row per timeframe for the pair that just flipped')
+  for (const r of b.rows) {
+    assert.equal(r.event.dir, 'put')
+    assert.ok(r.event.candlesAgo <= 1)
+  }
+})
+
+test('board: a pair that flipped a few candles ago appears only when the freshness window allows it', () => {
+  const svc = boardService({ P: climbThenFall(4, 300, 3) }) // fall begins 2 candles before the newest; flip fires on its first big drop
+  const strict = svc.globalRenko({ fresh: 0, refresh: true })
+  const loose = svc.globalRenko({ fresh: 3, refresh: true })
+  assert.ok(loose.rows.length >= strict.rows.length)
+  assert.ok(loose.rows.length > 0, 'a flip 0-2 candles old shows at fresh=3')
+  for (const r of strict.rows) assert.equal(r.event.candlesAgo, 0)
+})
+
+test('board: timeframes can be narrowed, closed instruments are skipped, empty history is counted not faked', () => {
+  const svc = boardService({ A: climbThenFall(5, 300, 1), CLOSED: climbThenFall(6, 300, 1), EMPTY: [] }, { CLOSED: false })
+  const b = svc.globalRenko({ fresh: 1, tfs: ['1m', '5m', 'bogus'], refresh: true })
+  assert.deepEqual(b.tfs, ['1m', '5m'], 'unknown timeframes are dropped')
+  assert.equal(b.universe, 2, 'a closed instrument is not scanned')
+  assert.equal(b.noData, 2, 'EMPTY has no history on either tf')
+  assert.deepEqual(b.rows.map((r) => r.asset), ['A', 'A'])
+})
+
+test('board: kagi lists a fresh reversal with its kind-specific evidence key', () => {
+  const svc = boardService({ J: climbThenFall(7, 300, 1), S: climbThenFall(8, 300, 0) })
+  const b = svc.globalKagi({ fresh: 1, refresh: true })
+  assert.ok(b.rows.length > 0)
+  for (const r of b.rows) {
+    assert.equal(r.asset, 'J')
+    assert.ok(r.events.every((e) => e.candlesAgo <= 1))
+    assert.ok(r.events.some((e) => e.type === 'reversal' && e.dir === 'put'))
+    for (const k of Object.keys(r.stats)) assert.ok(['reversal', 'yang', 'yin'].includes(k))
+  }
 })
 
 let passed = 0

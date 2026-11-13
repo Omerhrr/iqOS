@@ -960,9 +960,8 @@ export default function OSPage() {
     setMrcPredictOpen(true)
   }, [handleSelectAsset])
 
-  // Open the Renko (Effort Bricks) reversal event panel for the chart's current pair.
-  const handleOpenRenkoReversal = useCallback((a: string) => {
-    handleSelectAsset(a)
+  // Open the whole-universe Renko (Effort Bricks) reversal board (30s..15m, every pair).
+  const handleOpenRenkoReversal = useCallback(() => {
     setReversalOpen(false)
     setTechnicalOpen(false)
     setOracleOpen(false)
@@ -970,11 +969,10 @@ export default function OSPage() {
     setMrcPredictOpen(false)
     setKagiReversalOpen(false)
     setRenkoReversalOpen(true)
-  }, [handleSelectAsset])
+  }, [])
 
-  // Open the Kagi (yin/yang) reversal event panel for the chart's current pair.
-  const handleOpenKagiReversal = useCallback((a: string) => {
-    handleSelectAsset(a)
+  // Open the whole-universe Kagi (yin/yang) reversal board (30s..15m, every pair).
+  const handleOpenKagiReversal = useCallback(() => {
     setReversalOpen(false)
     setTechnicalOpen(false)
     setOracleOpen(false)
@@ -982,7 +980,7 @@ export default function OSPage() {
     setMrcPredictOpen(false)
     setRenkoReversalOpen(false)
     setKagiReversalOpen(true)
-  }, [handleSelectAsset])
+  }, [])
 
   // Tick desk cross-nav: the four tick-chart panels (SMC structure, next-candle
   // oracle, technical summary, footprint ladder) are siblings - opening one
@@ -1533,9 +1531,9 @@ export default function OSPage() {
                   ) : mrcPredictOpen ? (
                     <MrcPredictPanel onClose={() => setMrcPredictOpen(false)} asset={asset} tf={tf} closedTick={closedTick} />
                   ) : renkoReversalOpen ? (
-                    <RenkoReversalPanel onClose={() => setRenkoReversalOpen(false)} asset={asset} tf={tf} closedTick={closedTick} />
+                    <RenkoReversalPanel onClose={() => setRenkoReversalOpen(false)} closedTick={closedTick} onPickAsset={handleSelectAsset} onPickTf={setTf} />
                   ) : kagiReversalOpen ? (
-                    <KagiReversalPanel onClose={() => setKagiReversalOpen(false)} asset={asset} tf={tf} closedTick={closedTick} />
+                    <KagiReversalPanel onClose={() => setKagiReversalOpen(false)} closedTick={closedTick} onPickAsset={handleSelectAsset} onPickTf={setTf} />
                   ) : globalDomOpen ? (
                     <GlobalDomPanel onClose={() => setGlobalDomOpen(false)} tf={tf} closedTick={closedTick} onPickAsset={handleSelectAsset} onOpenOracle={handleOpenOracle} onOpenAccute={handleOpenAccute} />
                   ) : smcGlobalOpen ? (
@@ -1712,8 +1710,8 @@ export default function OSPage() {
                       {panelVisibility.renkoReversal && (
                       <button
                         type="button"
-                        onClick={() => handleOpenRenkoReversal(asset)}
-                        title="Renko reversal - only the moments an Effort Bricks chart flipped, newest first, each tagged confirmed/unconfirmed with its participation regime, plus this pair's own measured follow-through"
+                        onClick={() => handleOpenRenkoReversal()}
+                        title="Renko reversal board - every pair across 30s..15m, only the Effort Bricks (or plain Renko) series that flipped within the last few candles, each tagged confirmed/unconfirmed with its participation regime and its own measured follow-through"
                         className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-orange-500/40 hover:text-orange-300"
                       >
                         <span className="h-1.5 w-1.5 rounded-full bg-orange-300" />
@@ -1724,8 +1722,8 @@ export default function OSPage() {
                       {panelVisibility.kagiReversal && (
                       <button
                         type="button"
-                        onClick={() => handleOpenKagiReversal(asset)}
-                        title="Kagi reversal - only Kagi events, newest first: direction reversals plus yang (broke the last shoulder) and yin (broke the last waist) thickness flips, with this pair's own measured follow-through"
+                        onClick={() => handleOpenKagiReversal()}
+                        title="Kagi reversal board - every pair across 30s..15m, only the series with a fresh Kagi event: direction reversals plus yang (broke the last shoulder) and yin (broke the last waist) thickness flips, with each series' own measured follow-through"
                         className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-amber-500/40 hover:text-amber-300"
                       >
                         <span className="h-1.5 w-1.5 rounded-full bg-amber-300" />
