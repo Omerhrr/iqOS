@@ -584,6 +584,55 @@ expiry = 2
   },
 ]
 
+/** Per direct follow-up ("SMC: FVG, SMC: CRT and so on are not on the
+ * other auto bots"): Meta Trader has these 15 individual SMC concepts as
+ * dedicated, no-script-needed signalSource entries (SMC_KIND_SOURCE in
+ * plugins/metatrader.ts), but Omni Trader, the OS Auto Trader and Bots
+ * have no equivalent native source list for them at all - they only ever
+ * trade a saved `meta:` spec (Omni), a fixed AutoTraderSource union with
+ * no smc entry at all (os-mode.ts), or a strategyId (Bots/autopilot.ts).
+ * Rather than bolt a parallel SMC_KIND_SOURCE-style union onto three more
+ * engines (three separate surgeries, three separate ways to drift out of
+ * sync with this one), this gives each of the 15 concepts the SAME
+ * one-line meta-strategy spec Meta Trader's own dedicated source is doing
+ * under the hood (`smcNowRead(kind)` -> .dir/.conf, read here via the
+ * `smc:<KIND>` bare identifier strategylang.ts already documents) - trade
+ * that ONE concept's current-candle read, nothing else - so picking
+ * "Builtin: SMC CRT only" as a `meta:` strategyId/metaStrategyId gives
+ * Bots, the OS Auto Trader (signalSource: 'meta-strategy') and Omni Trader
+ * the exact same single-concept read Meta Trader's "SMC: CRT" dropdown
+ * entry already gives it, through the one consumption path all four
+ * engines already share - same reasoning as BUILTIN_EXAMPLE_SPECS above,
+ * just one concept per spec instead of a combined script. Id convention:
+ * meta:builtin-smc-<kind-slug>, matching Meta Trader's own
+ * SMC_KIND_SOURCE slugs 1:1 (smc-fvg, smc-crt, ...) so the names line up
+ * across both engines. */
+const BUILTIN_SMC_CONCEPT_SPECS: { id: string; name: string; script: string }[] = [
+  { id: 'meta:builtin-smc-fvg', name: 'Builtin: SMC FVG only', kind: 'FVG' },
+  { id: 'meta:builtin-smc-ifvg', name: 'Builtin: SMC IFVG only', kind: 'IFVG' },
+  { id: 'meta:builtin-smc-order-block', name: 'Builtin: SMC Order Block only', kind: 'ORDER_BLOCK' },
+  { id: 'meta:builtin-smc-breaker-block', name: 'Builtin: SMC Breaker Block only', kind: 'BREAKER_BLOCK' },
+  { id: 'meta:builtin-smc-liquidity-sweep', name: 'Builtin: SMC Liquidity Sweep only', kind: 'LIQUIDITY_SWEEP' },
+  { id: 'meta:builtin-smc-bos', name: 'Builtin: SMC BOS only', kind: 'BOS' },
+  { id: 'meta:builtin-smc-choch', name: 'Builtin: SMC CHoCH only', kind: 'CHOCH' },
+  { id: 'meta:builtin-smc-ote', name: 'Builtin: SMC OTE only', kind: 'OTE' },
+  { id: 'meta:builtin-smc-krm', name: 'Builtin: SMC KRM only', kind: 'KRM' },
+  { id: 'meta:builtin-smc-supply-demand', name: 'Builtin: SMC Supply & Demand only', kind: 'SUPPLY_DEMAND' },
+  { id: 'meta:builtin-smc-support-resistance', name: 'Builtin: SMC Support & Resistance only', kind: 'SUPPORT_RESISTANCE' },
+  { id: 'meta:builtin-smc-breakout', name: 'Builtin: SMC Breakout only', kind: 'BREAKOUT' },
+  { id: 'meta:builtin-smc-crt', name: 'Builtin: SMC CRT only', kind: 'CRT' },
+  { id: 'meta:builtin-smc-power-of-3', name: 'Builtin: SMC Power of 3 only', kind: 'POWER_OF_3' },
+  { id: 'meta:builtin-smc-silver-bullet', name: 'Builtin: SMC Silver Bullet only', kind: 'SILVER_BULLET' },
+].map(({ id, name, kind }) => ({
+  id,
+  name,
+  script: `
+call when smc:${kind}.dir == call
+put when smc:${kind}.dir == put
+confidence = smc:${kind}.conf
+`,
+}))
+
 export class MetaStrategyService {
   private ctx!: KernelContext
   private market!: MarketDataService
@@ -624,7 +673,7 @@ export class MetaStrategyService {
    * walked by meta_strategy_backtest. */
   private seedBuiltinExamples(): number {
     let seeded = 0
-    for (const ex of BUILTIN_EXAMPLE_SPECS) {
+    for (const ex of [...BUILTIN_EXAMPLE_SPECS, ...BUILTIN_SMC_CONCEPT_SPECS]) {
       if (this.specs.has(normalizeMetaId(ex.id))) continue
       try {
         this.save({ id: ex.id, name: ex.name, mode: 'all', conditions: [], script: ex.script })
@@ -632,7 +681,7 @@ export class MetaStrategyService {
       } catch (err) {
         // a seed script failing to parse is a bug in THIS file, not a
         // reason to crash the service - log it loudly and keep going so
-        // the other 14 still seed.
+        // the rest still seed.
         this.ctx.log('meta-strategy', `builtin example seed FAILED for ${ex.id}: ${err instanceof Error ? err.message : String(err)}`)
       }
     }
