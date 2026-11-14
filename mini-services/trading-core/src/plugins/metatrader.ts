@@ -263,6 +263,8 @@ export interface MetaTraderConfig {
    * direct instruction; UNLIKE the auto-trader's cooldownSec, there is no
    * hard floor here - 0 really does mean no cooldown at all. */
   cooldownSec: number
+  /** GLOBAL cooldown in seconds: no new trade on ANY pair for this long after the last trade this trader placed. 0 (default) = off. Independent of the per-asset `cooldownSec`. */
+  globalCooldownSec: number
   /** optional compounding plan - undefined (default) = fixed `stake` every trade. */
   stakePlan?: MetaStakePlan
   /** Explicit watchlist override - undefined/empty (default) = the same
@@ -312,6 +314,7 @@ const DEFAULT_META_TRADER: MetaTraderConfig = {
   kind: 'binary',
   marketScope: 'all',
   cooldownSec: 0,
+  globalCooldownSec: 0,
 }
 
 /** The fixed note prefix every Meta Trader position is tagged with -
@@ -418,6 +421,7 @@ export class MetaTraderService {
             : undefined,
         marketScope: saved.marketScope === 'real' || saved.marketScope === 'otc' ? saved.marketScope : 'all',
         cooldownSec: Math.max(0, Math.round(num(saved.cooldownSec, DEFAULT_META_TRADER.cooldownSec))),
+        globalCooldownSec: Math.max(0, Math.round(num(saved.globalCooldownSec, DEFAULT_META_TRADER.globalCooldownSec))),
         stakePlan: MetaTraderService.sanitizeStakePlan(saved.stakePlan),
         assets: Array.isArray(saved.assets)
           ? (saved.assets as unknown[]).map((a) => String(a).trim().toUpperCase()).filter((a) => a.length > 0)
@@ -771,6 +775,7 @@ export class MetaTraderService {
     if (patch.marketScope !== undefined && (patch.marketScope === 'all' || patch.marketScope === 'real' || patch.marketScope === 'otc'))
       this.config.marketScope = patch.marketScope
     if (patch.cooldownSec !== undefined) this.config.cooldownSec = Math.max(0, Math.round(num(patch.cooldownSec, this.config.cooldownSec)))
+    if (patch.globalCooldownSec !== undefined) this.config.globalCooldownSec = Math.max(0, Math.round(num(patch.globalCooldownSec, this.config.globalCooldownSec)))
     if (patch.stakePlan !== undefined) {
       const next = MetaTraderService.sanitizeStakePlan(patch.stakePlan)
       const changed = JSON.stringify(this.config.stakePlan ?? null) !== JSON.stringify(next ?? null)
@@ -849,6 +854,10 @@ export class MetaTraderService {
     if (mode !== 'auto') return
     if (this.config.stakePlan && this.rt.halted) {
       this.rt.lastRejection = 'compound cycle halted on a loss - restart to trade again'
+      return
+    }
+    if (this.config.globalCooldownSec > 0 && this.rt.lastTradeTs > 0 && this.now() - this.rt.lastTradeTs < this.config.globalCooldownSec) {
+      this.rt.lastRejection = `global cooldown: ${this.config.globalCooldownSec - (this.now() - this.rt.lastTradeTs)}s left before the next trade on any pair`
       return
     }
     if (this.rt.openCount >= this.config.maxOpen) {

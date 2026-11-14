@@ -5329,6 +5329,8 @@ export interface MetaTraderConfig {
   marketScope: 'all' | 'real' | 'otc'
   /** per-asset cooldown in seconds after a placed trade - no hard floor. */
   cooldownSec: number
+  /** global cooldown: no new trade on any pair for this many seconds after the last one (0 = off) */
+  globalCooldownSec: number
   stakePlan?: MetaStakePlan
   /** explicit watchlist override - undefined/empty = the same liquid-first
    * default pool, market-wide. Set = scan ONLY these tickers. Same
@@ -5392,6 +5394,8 @@ export interface OmniTraderConfig {
   expirySec?: number
   marketScope: 'all' | 'real' | 'otc'
   cooldownSec: number
+  /** global cooldown: no new trade on any pair for this many seconds after the last one (0 = off) */
+  globalCooldownSec: number
   /** wall-clock poll interval in ms, 1000-10000 (default 2000) - THIS,
    * not candle closes, paces the whole engine. */
   intervalMs: number

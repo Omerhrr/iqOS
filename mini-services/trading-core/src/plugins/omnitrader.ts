@@ -90,6 +90,8 @@ export interface OmniTraderConfig {
   expirySec?: number
   marketScope: 'all' | 'real' | 'otc'
   cooldownSec: number
+  /** GLOBAL cooldown in seconds: no new trade on ANY pair for this long after the last trade this trader placed. 0 (default) = off. Independent of the per-asset `cooldownSec`. */
+  globalCooldownSec: number
   /** wall-clock poll interval in ms - clamped to [MIN_INTERVAL_MS,
    * MAX_INTERVAL_MS]. This, not candle closes, paces the whole engine. */
   intervalMs: number
@@ -126,6 +128,7 @@ const DEFAULT_OMNI_TRADER: OmniTraderConfig = {
   kind: 'binary',
   marketScope: 'all',
   cooldownSec: 0,
+  globalCooldownSec: 0,
   intervalMs: DEFAULT_INTERVAL_MS,
 }
 
@@ -197,6 +200,7 @@ export class OmniTraderService {
         expirySec: typeof saved.expirySec === 'number' ? saved.expirySec : undefined,
         marketScope: (saved.marketScope === 'real' || saved.marketScope === 'otc' ? saved.marketScope : 'all') as 'all' | 'real' | 'otc',
         cooldownSec: Math.max(0, num(saved.cooldownSec, DEFAULT_OMNI_TRADER.cooldownSec)),
+        globalCooldownSec: Math.max(0, num(saved.globalCooldownSec, DEFAULT_OMNI_TRADER.globalCooldownSec)),
         intervalMs: this.clampInterval(num(saved.intervalMs, DEFAULT_OMNI_TRADER.intervalMs)),
         assets: Array.isArray(saved.assets) ? saved.assets.filter((a): a is string => typeof a === 'string') : undefined,
       }
@@ -262,6 +266,8 @@ export class OmniTraderService {
   configure(patch: Partial<OmniTraderConfig>): OmniTraderConfig {
     const sourceChanged = patch.metaStrategyId !== undefined && patch.metaStrategyId !== this.config.metaStrategyId
     this.config = { ...this.config, ...patch }
+    this.config.cooldownSec = Math.max(0, Math.round(Number(this.config.cooldownSec) || 0))
+    this.config.globalCooldownSec = Math.max(0, Math.round(Number(this.config.globalCooldownSec) || 0))
     if (patch.intervalMs !== undefined) {
       this.config.intervalMs = this.clampInterval(this.config.intervalMs)
       if (this.timer) {
@@ -355,6 +361,10 @@ export class OmniTraderService {
       /* no mode plugin - treat as human (safe default), nothing trades */
     }
     if (mode !== 'auto') return
+    if (this.config.globalCooldownSec > 0 && this.rt.lastTradeTs > 0 && this.now() - this.rt.lastTradeTs < this.config.globalCooldownSec) {
+      this.rt.lastRejection = `global cooldown: ${this.config.globalCooldownSec - (this.now() - this.rt.lastTradeTs)}s left before the next trade on any pair`
+      return
+    }
     if (this.rt.openCount >= this.config.maxOpen) {
       this.rt.lastRejection = `max open omni-trader positions (${this.rt.openCount}/${this.config.maxOpen})`
       return
