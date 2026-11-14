@@ -137,6 +137,16 @@ test('backtest replays it, and a null market shows no invented edge', () => {
   assert.ok(wr > 0.42 && wr < 0.58, `pooled win rate on random walks ${(wr * 100).toFixed(1)}% over ${trades} trades`)
 })
 
+test('optional bar offset: tech.buys(1) reads the bar before the latest', () => {
+  const c = drift(300, 0.05)
+  const prev = c.slice(0, -1).slice(-TECH_BARS_PER_RUNG)
+  const all = [...oscillatorVotes(prev), ...maVotes(prev)]
+  const buys = all.filter((v) => v.read === 'buy').length
+  const s = toSeries(c)
+  assert.equal(val('tech.buys(1)', s).confidence, buys)
+  assert.equal(val('tech.buys(0)', s).confidence, val('tech.buys()', s).confidence)
+  assert.equal(val('tech.ok(1)', s).confidence, 1)
+})
 let passed = 0
 let failed = 0
 for (const t of tests) {

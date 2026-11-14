@@ -2344,7 +2344,7 @@ function signalMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string |
  *     indicators: rsi stoch cci adx ao momentum macd stochRsi williams bbp uo
  *                 sma10 sma20 sma30 sma50 sma100 sma200 ema10 ema20 ema30 ema50 ema100 ema200 hma vwma ichimoku
  * (per-indicator methods rather than vote("rsi"): a trailing string arg is parsed as a timeframe.) */
-const techCache = new WeakMap<MslSeriesCtx, { osc: Record<string, TechVote>; ma: Record<string, TechVote>; oscList: TechVote[]; maList: TechVote[] } | null>()
+const techCache = new WeakMap<MslSeriesCtx, Map<number, { osc: Record<string, TechVote>; ma: Record<string, TechVote>; oscList: TechVote[]; maList: TechVote[] } | null>>()
 function techKey(name: string): string {
   if (/^Stoch RSI/.test(name)) return 'stochRsi'
   if (/^Stoch %K/.test(name)) return 'stoch'
@@ -2365,13 +2365,17 @@ function techKey(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9]/g, '')
 }
 function techMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
-  void args
+  // optional first numeric arg = bars back (0 = latest closed bar, 1 = the bar before it, max 20)
+  const back = typeof args[0] === 'number' && Number.isFinite(args[0]) ? Math.max(0, Math.min(20, Math.round(args[0]))) : 0
   const s = requireSeries(ctx, tf)
-  let t = techCache.get(s)
+  let tm = techCache.get(s)
+  if (!tm) { tm = new Map(); techCache.set(s, tm) }
+  let t = tm.get(back)
   if (t === undefined) {
-    if (s.close.length < TECH_MIN_BARS) t = null
+    if (s.close.length - back < TECH_MIN_BARS) t = null
     else {
-      const all = seriesToCandles(s)
+      const full = seriesToCandles(s)
+      const all = back ? full.slice(0, full.length - back) : full
       const bars = all.length > TECH_BARS_PER_RUNG ? all.slice(all.length - TECH_BARS_PER_RUNG) : all
       const oscList = oscillatorVotes(bars)
       const maList = maVotes(bars)
@@ -2381,7 +2385,7 @@ function techMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | u
       for (const v of maList) ma[techKey(v.name)] = v
       t = { osc, ma, oscList, maList }
     }
-    techCache.set(s, t)
+    tm.set(back, t)
   }
   if (name === 'ok') return t !== null
   if (!t) throw new MslRuntimeError(`tech.${name}() needs at least ${TECH_MIN_BARS} closed bars - history is too thin to read`)
