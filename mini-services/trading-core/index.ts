@@ -57,6 +57,7 @@ import { mrcPredictPlugin, MrcPredictService } from './src/plugins/mrcpredict'
 import { reversalEventsPlugin, ReversalEventsService } from './src/plugins/reversalevents'
 import { explainerPlugin, ExplainerService } from './src/plugins/explainer'
 import { regimeScanPlugin, RegimeScanService } from './src/plugins/regimescan'
+import { pvScanPlugin, PvScanService } from './src/plugins/pvscan'
 import { signalPlugin, SignalService } from './src/plugins/signal'
 import {
   computeTickSmc, computeTickOracle, computeTickTechnical, computeTickFootprint, medianTickGapMs,
@@ -253,6 +254,7 @@ kernel.register(mrcPredictPlugin)
 kernel.register(reversalEventsPlugin)
 kernel.register(explainerPlugin)
 kernel.register(regimeScanPlugin)
+kernel.register(pvScanPlugin)
 kernel.register(signalPlugin)
 
 // ---------- Full-universe scanners for Distill / Cointegration / Vol Arb ----------
@@ -2161,6 +2163,20 @@ const httpServer = createServer(async (req, res) => {
           if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
           const svc = kernel.context().use<RegimeScanService>('regimescan')
           return json(200, svc.global({ tf: tfv, category: q.get('category') ?? 'all', refresh: q.get('refresh') === '1' }))
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // ---------- Price/volume scan (whole universe, one tf) ----------
+      // GET /pv_scan?tf=1m[&refresh=1] -> every open pair's volume-vs-price relationship (plugins/pvscan.ts): usable-volume flag, corrAbs / corrRet,
+      // tilt, relVol; plus a REAL vs OTC comparison. Closed candles only, 30s cache. Descriptive, not a forecast.
+      if (path === '/pv_scan') {
+        try {
+          const tfv = tfStrict(q.get('tf'))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const svc = kernel.context().use<PvScanService>('pvscan')
+          return json(200, svc.global({ tf: tfv, refresh: q.get('refresh') === '1' }))
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }
