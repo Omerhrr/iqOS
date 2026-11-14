@@ -35,7 +35,10 @@ const LIQUID_CANDIDATES = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'XAUUSD', 'BT
 const MAX_ASSETS = 300
 /** one scan pass stops after this long and resumes where it left off on the next tick, so a burst of 100+ pairs closing the same minute cannot stall the loop */
 const SCAN_BUDGET_MS = 4000
-const MAX_REVIEWS_PER_TICK = 3
+/** a signal waits at most this many bars for its turn (a trade is open, or a stronger one went first) before it is dropped as stale */
+const PENDING_BARS = 2
+/** after this many scan ticks with a signal waiting, review the best so far even if the pass over the pool has not finished */
+const MAX_PASS_WAIT_TICKS = 3
 const LOG_CAP = 300
 const POLL_MS = 5000
 /** one signal per asset+direction per this many bars (a script that stays true would otherwise re-fire every bar) */
@@ -43,6 +46,19 @@ const SIGNAL_HOLD_BARS = 5
 const HARD_STOP_RE =
   /kill switch engaged|market closed for|amount must be positive|exceeds max stake|insufficient balance|live balance unknown|live broker not connected|unknown asset |no price feed|execution service unavailable/i
 export const BRAIN_TRADER_NOTE = 'brain:trader'
+
+/** Compounding, the same loop Meta Trader uses: a win folds a share of the profit into the pot (the next stake), a loss burns the stake back out and (by default)
+ * halts the cycle until restarted. Applies to LIVE orders only - shadow decisions are scored on direction, they never touch a pot. */
+export interface BrainStakePlan {
+  kind: 'compound'
+  base: number
+  /** % of the profit folded into the pot each win (default 100) */
+  rollPct?: number
+  /** caps the fold at this % of the stake risked, even at a higher real payout (default 70) */
+  payoutCap?: number
+  /** false = keep rolling through a loss (the pot is burned by the stake, the cycle continues). Default true: a loss ends the run */
+  stopOnLoss?: boolean
+}
 
 export interface BrainTraderConfig {
   enabled: boolean
@@ -65,6 +81,8 @@ export interface BrainTraderConfig {
   stake: number
   maxOpen: number
   kind: TradeKind
+  /** optional compounding: undefined = flat `stake` every trade */
+  stakePlan?: BrainStakePlan
   /** 'all' = every open pair in the scope below; 'selected' = only the pairs in `assets` */
   watchMode: 'all' | 'selected'
   marketScope: 'all' | 'real' | 'otc'
@@ -87,7 +105,7 @@ const DEFAULT_CONFIG: BrainTraderConfig = {
   requireAi: true,
   maxReviewsPerHour: 30,
   stake: 1,
-  maxOpen: 2,
+  maxOpen: 1,
   kind: 'binary',
   watchMode: 'all',
   marketScope: 'all',
@@ -117,6 +135,8 @@ export interface BrainDecision {
   ai?: { go: boolean; confidence: number; reason: string; provider: string; model: string; ms: number }
   /** an order was actually placed */
   placed: boolean
+  /** the stake this decision used (live) or would have used (shadow, base stake) */
+  stake?: number
   placeError?: string
   outcome?: 'win' | 'loss' | 'tie'
   exitPrice?: number
@@ -148,6 +168,19 @@ export interface BrainTraderRuntime {
   lastScanAssets?: number
   lastScanPool?: number
   lastScanMs?: number
+  /** of the pairs checked, how many had a last closed bar older than 3 bars (a stalled feed: the pair is never re-read) and how many were read for the first time on a new bar */
+  lastScanStale?: number
+  /** one-at-a-time selection: signals found, waiting for review, passed over (outranked) or gone stale before they were reviewed */
+  candidates?: number
+  outranked?: number
+  expiredCandidates?: number
+  /** compounding pot state (only meaningful while config.stakePlan is set) */
+  pot?: number
+  rollN?: number
+  halted?: boolean
+  lastScanFresh?: number
+  /** a few stalled tickers, for the log line */
+  staleSample?: string[]
 }
 
 export interface BrainTraderStats {
@@ -213,6 +246,8 @@ export interface ReviewInput {
   panelLines: string[]
   /** strategy's own preferred horizon in minutes, if its script set `expiry = n` */
   scriptExpiryMin?: number
+  /** how many OTHER pairs also had a valid signal this round (this one was ranked first by the strategy's own confidence) */
+  competing?: number
 }
 
 export function buildReviewMessages(inp: ReviewInput): ChatMessage[] {
@@ -232,6 +267,7 @@ export function buildReviewMessages(inp: ReviewInput): ChatMessage[] {
     `ASSET ${inp.asset} - timeframe ${inp.tf} - last close ${inp.price}`,
     `SIGNAL: ${inp.direction.toUpperCase()} from strategy "${inp.strategyName}", strategy confidence ${inp.confidence}/100.`,
     `WHY IT FIRED (the strategy's own notes): ${inp.notes || '(none)'}`,
+    inp.competing ? `This is the strongest of ${inp.competing + 1} valid signals this round (ranked by the strategy's own confidence, which is not a win probability). The others are not shown to you.` : '',
     inp.scriptExpiryMin ? `The script suggests a ${inp.scriptExpiryMin}-minute horizon.` : '',
     `STRATEGY SCRIPT:\n${inp.script.slice(0, 3500)}`,
     fib,
@@ -316,6 +352,19 @@ class AppAnswered extends Error {}
 
 // ---------------------------------------------------------------- service
 
+interface Candidate {
+  asset: string
+  direction: 'call' | 'put'
+  confidence: number
+  notes: string
+  barTime: number
+  price: number
+  spec: { id: string; name: string; script?: string }
+  expiryMin?: number
+  /** position in the pool (liquid pairs first) - the last tie-break */
+  order: number
+}
+
 export class BrainTraderService {
   private ctx!: KernelContext
   private market!: MarketDataService
@@ -338,6 +387,9 @@ export class BrainTraderService {
   /** round-robin position in the pool, so a scan cut short by the time budget resumes instead of restarting */
   private cursor = 0
   private assetCooldownUntil = new Map<string, number>()
+  /** signals found and not yet reviewed, newest per pair (the best one is sent to the reviewer, one at a time) */
+  private pending = new Map<string, Candidate>()
+  private pendingWaits = 0
   private reviewTimes: number[] = []
   private seq = 0
 
@@ -367,7 +419,15 @@ export class BrainTraderService {
   private restore(): void {
     try {
       const s = this.store.getBrainTraderConfig() as Record<string, unknown> | null
-      if (s) this.config = sanitize({ ...DEFAULT_CONFIG, ...s })
+      if (s) {
+        this.config = sanitize({ ...DEFAULT_CONFIG, ...s })
+        const r = (s as { rt?: { pot?: unknown; rollN?: unknown; halted?: unknown } }).rt
+        if (r) {
+          this.rt.pot = typeof r.pot === 'number' && Number.isFinite(r.pot) ? Math.max(0, r.pot) : 0
+          this.rt.rollN = typeof r.rollN === 'number' && Number.isFinite(r.rollN) ? Math.max(0, Math.round(r.rollN)) : 0
+          this.rt.halted = r.halted === true
+        }
+      }
       const l = this.store.getBrainTraderLog()
       if (Array.isArray(l)) {
         this.log = (l as BrainDecision[]).slice(-LOG_CAP)
@@ -379,7 +439,7 @@ export class BrainTraderService {
   }
 
   private persistConfig(): void {
-    this.store.saveBrainTraderConfig({ ...this.config })
+    this.store.saveBrainTraderConfig({ ...this.config, rt: { pot: this.rt.pot ?? 0, rollN: this.rt.rollN ?? 0, halted: this.rt.halted === true } })
   }
   private persistLog(): void {
     this.store.saveBrainTraderLog(this.log)
@@ -401,17 +461,56 @@ export class BrainTraderService {
     }
   }
 
-  private onPositionClosed(position: { note?: string; pnl?: number; status: string }): void {
+  private onPositionClosed(position: { note?: string; pnl?: number; status: string; amount?: number }): void {
     if (!position.note?.startsWith(BRAIN_TRADER_NOTE)) return
     this.rebuildOpenCount()
-    this.rt.pnlTotal += position.pnl ?? 0
+    const pnl = position.pnl ?? 0
+    this.rt.pnlTotal += pnl
     if (position.status === 'won') this.rt.wins += 1
     else if (position.status === 'lost') this.rt.losses += 1
+    // compounding roll (Meta Trader's loop): a win folds a share of the profit into the pot, a loss burns the stake back out and, by default, halts the cycle
+    const plan = this.config.stakePlan
+    if (plan && (position.status === 'won' || position.status === 'lost')) {
+      const working = (this.rt.pot ?? 0) >= 0.01 ? (this.rt.pot as number) : plan.base
+      const amount = position.amount ?? working
+      if (position.status === 'won') {
+        const cap = (plan.payoutCap ?? 70) / 100
+        const fold = Math.min(pnl, amount * cap) * ((plan.rollPct ?? 100) / 100)
+        this.rt.pot = Math.round((working + fold) * 100) / 100
+        this.rt.rollN = (this.rt.rollN ?? 0) + 1
+      } else {
+        this.rt.pot = Math.round(Math.max(0, working - amount) * 100) / 100
+        this.rt.rollN = 0
+        if (plan.stopOnLoss !== false) this.rt.halted = true
+      }
+      this.persistConfig()
+    }
+  }
+
+  /** the stake the NEXT live order uses: the flat stake, or the compounding pot (seeded at `base`) */
+  stakeFor(): number {
+    const plan = this.config.stakePlan
+    if (!plan) return this.config.stake
+    const working = (this.rt.pot ?? 0) >= 0.01 ? (this.rt.pot as number) : plan.base
+    return Math.max(1, Math.round(working * 100) / 100)
+  }
+
+  /** clear a halted compounding cycle and re-seed the pot at base */
+  restartCompound(): { ok: boolean; error?: string } {
+    if (!this.config.stakePlan) return { ok: false, error: 'restart applies to a compounding plan only' }
+    this.rt.pot = 0
+    this.rt.rollN = 0
+    this.rt.halted = false
+    this.persistConfig()
+    this.ctx.log('brain-trader', `compound cycle restarted - next trade seeds $${this.config.stakePlan.base}`)
+    return { ok: true }
   }
 
   /** Fresh start for the numbers and the decision log; config untouched. */
   resetAllStats(): void {
-    this.rt = { reads: 0, proposals: 0, trades: 0, wins: 0, losses: 0, pnlTotal: 0, openCount: 0, lastTradeTs: 0 }
+    this.rt = { reads: 0, proposals: 0, trades: 0, wins: 0, losses: 0, pnlTotal: 0, openCount: 0, lastTradeTs: 0, pot: 0, rollN: 0, halted: false }
+    this.pending.clear()
+    this.pendingWaits = 0
     this.log = []
     this.seq = 0
     this.lastBar.clear()
@@ -424,7 +523,7 @@ export class BrainTraderService {
     this.ctx.log('brain-trader', 'stats and decision log cleared - starting fresh')
   }
 
-  status(): { enabled: boolean; live: boolean; mode: OsMode; active: boolean; config: BrainTraderConfig; runtime: BrainTraderRuntime; stats: BrainTraderStats; reviewsLastHour: number; watching: { mode: 'all' | 'selected'; pool: number; selected: number } } {
+  status(): { enabled: boolean; live: boolean; mode: OsMode; active: boolean; config: BrainTraderConfig; runtime: BrainTraderRuntime; stats: BrainTraderStats; reviewsLastHour: number; watching: { mode: 'all' | 'selected'; pool: number; selected: number }; pending: number; nextStake: number } {
     let mode: OsMode = 'human'
     try {
       mode = this.ctx.use<{ status(): { mode: OsMode } }>('mode').status().mode
@@ -442,6 +541,8 @@ export class BrainTraderService {
       stats: computeStats(this.log),
       reviewsLastHour: this.reviewTimes.filter((t) => t >= cut).length,
       watching: this.watching(),
+      pending: this.pending.size,
+      nextStake: this.stakeFor(),
     }
   }
 
@@ -488,7 +589,14 @@ export class BrainTraderService {
   }
 
   configure(patch: Partial<BrainTraderConfig>): BrainTraderConfig {
+    const before = JSON.stringify(this.config.stakePlan ?? null)
     this.config = sanitize({ ...this.config, ...patch })
+    // a different plan (or none) starts a fresh roll: an old pot or halt from another plan means nothing here
+    if (JSON.stringify(this.config.stakePlan ?? null) !== before) {
+      this.rt.pot = 0
+      this.rt.rollN = 0
+      this.rt.halted = false
+    }
     this.persistConfig()
     this.ctx.log('brain-trader', `config updated - ${this.config.enabled ? (this.config.live ? 'LIVE' : 'SHADOW') : 'off'} · ${this.config.tf} · ${this.config.metaStrategyId} · conf>=${this.config.minConfidence} · expiries ${this.config.expiriesSec.join('/')}s`)
     return this.config
@@ -504,6 +612,19 @@ export class BrainTraderService {
       return [...new Set(this.config.assets ?? [])].filter((t) => open.has(t)).slice(0, MAX_ASSETS)
     }
     return [...LIQUID_CANDIDATES.filter((a) => tickers.includes(a)), ...tickers.filter((a) => !LIQUID_CANDIDATES.includes(a))].slice(0, MAX_ASSETS)
+  }
+
+  /** THE FROZEN-CANDLE BUG, a fifth consumer: market-data's live poll only keeps the charted pair, bot / auto-trader / AI Trader / Meta Trader pairs
+   * warm with fresh candles. Without exposing the pairs this trader watches, every pair except the charted one re-read the same frozen bars forever
+   * (so only the charted pair ever produced a signal). market-data pulls these in on a rotation (a few per poll, candles forced) because the sidecar
+   * serializes broker calls and cannot refresh 50 pairs every 4s. Disabled -> nothing to keep warm. */
+  watchedAssets(): string[] {
+    if (!this.config.enabled) return []
+    try {
+      return this.candidatePool()
+    } catch {
+      return []
+    }
   }
 
   /** how many pairs the trader is watching right now (for the UI) */
@@ -564,13 +685,56 @@ export class BrainTraderService {
     return this.reviewTimes.length < this.config.maxReviewsPerHour
   }
 
+  /** Is there room for another trade? LIVE + AUTO: fewer real positions open than maxOpen. Otherwise (shadow / not AUTO) an approved decision "holds" its slot until
+   * its expiry has run, so shadow behaves like the live loop: one trade at a time, and the scan keeps hunting while it runs. */
+  private slotFree(): boolean {
+    let mode: OsMode = 'human'
+    try {
+      mode = this.ctx.use<{ status(): { mode: OsMode } }>('mode').status().mode
+    } catch {
+      /* human */
+    }
+    if (this.config.live && mode === 'auto') {
+      this.rebuildOpenCount()
+      return this.rt.openCount < this.config.maxOpen
+    }
+    const now = this.now()
+    const busy = this.log.filter((d) => (d.status === 'approved' || d.status === 'no_ai_needed') && now < d.ts + d.expirySec).length
+    return busy < this.config.maxOpen
+  }
+
+  /** the best waiting signal: strongest strategy confidence, then the freshest bar, then the pool order (liquid pairs first) */
+  private bestPending(): Candidate | undefined {
+    let best: Candidate | undefined
+    for (const c of this.pending.values()) {
+      if (!best || c.confidence > best.confidence || (c.confidence === best.confidence && (c.barTime > best.barTime || (c.barTime === best.barTime && c.order < best.order)))) best = c
+    }
+    return best
+  }
+
+  private expirePending(): void {
+    const now = this.now()
+    const tfSec = TIMEFRAME_SECONDS[this.config.tf]
+    for (const [asset, c] of this.pending) {
+      if (now - c.barTime > PENDING_BARS * tfSec) {
+        this.pending.delete(asset)
+        this.rt.expiredCandidates = (this.rt.expiredCandidates ?? 0) + 1
+      }
+    }
+  }
+
+  /** Scan the watchlist like the autopilot does: read every newly closed bar of every pair, collect the signals, then send ONLY the best one to the
+   * reviewer. Scanning never stops while a trade runs - signals found meanwhile wait (PENDING_BARS) and the best still-fresh one is reviewed the moment
+   * the slot frees up. One reviewer call per tick at most, never two pairs at once. */
   private async scan(): Promise<void> {
-    let reviewsThisTick = 0
     const pool = this.candidatePool()
     const t0 = Date.now()
     const n = pool.length
     const start = n ? this.cursor % n : 0
     let done = 0
+    let stale = 0
+    let fresh = 0
+    const staleSample: string[] = []
     for (let k = 0; k < n; k++) {
       if (k > 0 && Date.now() - t0 > SCAN_BUDGET_MS) break // resume from here next tick
       const asset = pool[(start + k) % n]
@@ -584,7 +748,12 @@ export class BrainTraderService {
       }
       if (candles.length < MIN_BARS) continue
       const last = candles[candles.length - 1]
+      if (this.now() - last.time > 3 * TIMEFRAME_SECONDS[this.config.tf]) {
+        stale++
+        if (staleSample.length < 5) staleSample.push(asset)
+      }
       if (this.lastBar.get(asset) === last.time) continue // already read this closed bar
+      fresh++
       this.lastBar.set(asset, last.time)
       this.rt.reads += 1
       let ev: { spec: { id: string; name: string; script?: string }; result: { direction: 'call' | 'put' | 'none'; confidence: number; notes: string; expiryMin?: number }; price: number }
@@ -599,77 +768,123 @@ export class BrainTraderService {
       if (sig.direction === 'none' || sig.confidence < this.config.minConfidence) continue
       if (this.config.direction !== 'both' && sig.direction !== this.config.direction) continue
       if ((this.assetCooldownUntil.get(asset) ?? 0) > this.now()) continue
-      // a script that stays true for several bars would re-fire every bar: one signal per asset+direction per SIGNAL_HOLD_BARS bars
-      const sigKey = `${asset}|${sig.direction}`
-      const prev = this.lastSignalBar.get(sigKey)
+      // a script that stays true for several bars would re-fire every bar: one signal per asset+direction per SIGNAL_HOLD_BARS bars (stamped when it is REVIEWED)
+      const prev = this.lastSignalBar.get(`${asset}|${sig.direction}`)
       if (prev !== undefined && last.time - prev < SIGNAL_HOLD_BARS * TIMEFRAME_SECONDS[this.config.tf]) continue
-      this.lastSignalBar.set(sigKey, last.time)
-      this.rt.proposals += 1
-
-      const dec: BrainDecision = {
-        id: `b${Date.now().toString(36)}${(this.seq++).toString(36)}`,
-        ts: this.now(),
-        asset,
-        tf: this.config.tf,
-        barTime: last.time,
-        direction: sig.direction,
-        strategyId: ev.spec.id,
-        strategyName: ev.spec.name,
-        confidence: sig.confidence,
-        notes: sig.notes,
-        entryPrice: last.close,
-        expirySec: this.config.defaultExpirySec,
-        status: 'approved',
-        placed: false,
-      }
-
-      let go = true
-      if (this.config.requireAi) {
-        if (reviewsThisTick >= MAX_REVIEWS_PER_TICK) {
-          // per-tick throttle only (many pairs signalled the same minute): un-consume this bar so the NEXT tick reviews it, rather than losing the signal
-          this.lastBar.delete(asset)
-          this.lastSignalBar.delete(sigKey)
-          this.rt.proposals -= 1
-          continue
-        } else if (!this.reviewBudgetLeft()) {
-          dec.status = 'rate_limited'
-          go = false
-        } else {
-          reviewsThisTick += 1
-          this.reviewTimes.push(Date.now())
-          const t0 = Date.now()
-          try {
-            const res = await callLlm(this.resolveAppUrl(), buildReviewMessages({ asset, tf: this.config.tf, strategyName: ev.spec.name, script: ev.spec.script ?? '', direction: sig.direction, confidence: sig.confidence, notes: sig.notes, price: last.close, candles, expiriesSec: this.config.expiriesSec, panelLines: this.panelLines(asset), scriptExpiryMin: sig.expiryMin }), { temperature: 0.2, maxTokens: 300, timeoutMs: 30_000 })
-            const parsed = parseReview(res.content, this.config.expiriesSec)
-            if (!parsed) {
-              dec.status = 'ai_unavailable'
-              dec.ai = { go: false, confidence: 0, reason: 'reply did not parse as a go/no JSON object - treated as a veto', provider: res.provider, model: res.model, ms: Date.now() - t0 }
-              go = false
-            } else {
-              dec.expirySec = parsed.expirySec
-              dec.ai = { go: parsed.go, confidence: parsed.confidence, reason: parsed.reason, provider: res.provider, model: res.model, ms: Date.now() - t0 }
-              dec.status = parsed.go ? 'approved' : 'vetoed'
-              go = parsed.go
-            }
-          } catch (err) {
-            dec.status = 'ai_unavailable'
-            dec.ai = { go: false, confidence: 0, reason: `reviewer unreachable - treated as a veto: ${(err as Error).message}`.slice(0, 300), provider: '', model: '', ms: Date.now() - t0 }
-            go = false
-          }
-        }
-      } else {
-        dec.status = 'no_ai_needed'
-      }
-
-      if (go && this.config.live) await this.maybePlace(dec)
-      this.log.push(dec)
-      if (this.log.length > LOG_CAP) this.log = this.log.slice(-LOG_CAP)
-      this.persistLog()
-      this.rt.lastAction = `${dec.status} ${dec.direction.toUpperCase()} ${asset} (${dec.expirySec}s)${dec.placed ? ' - ORDER PLACED' : this.config.live ? '' : ' - shadow'}`
+      if (!this.pending.has(asset)) this.rt.candidates = (this.rt.candidates ?? 0) + 1
+      this.pending.set(asset, { asset, direction: sig.direction, confidence: sig.confidence, notes: sig.notes, barTime: last.time, price: last.close, spec: ev.spec, expiryMin: sig.expiryMin, order: (start + k) % n })
     }
     this.rt.lastScanAssets = done
     this.rt.lastScanPool = n
     this.rt.lastScanMs = Date.now() - t0
+    this.rt.lastScanStale = stale
+    this.rt.lastScanFresh = fresh
+    this.rt.staleSample = staleSample
+
+    // ---- choose: ONE signal at a time goes to the reviewer
+    this.expirePending()
+    if (!this.pending.size) {
+      this.pendingWaits = 0
+      return
+    }
+    if (!this.slotFree()) {
+      this.rt.lastReason = `holding ${this.pending.size} signal(s): a trade is open - still scanning`
+      return
+    }
+    if (this.config.live && this.config.stakePlan && this.rt.halted) {
+      this.rt.lastRejection = 'compound cycle halted (a loss ended the run) - restart the cycle to trade again; no reviewer call made'
+      return
+    }
+    // let the pass over the pool finish so the BEST signal of the round goes first (a long pool can take several ticks)
+    this.pendingWaits++
+    if (done < n && this.pendingWaits < MAX_PASS_WAIT_TICKS) return
+    this.pendingWaits = 0
+    const best = this.bestPending()
+    if (!best) return
+    this.pending.delete(best.asset)
+    const competing = this.pending.size
+    this.rt.outranked = (this.rt.outranked ?? 0) + competing
+    await this.reviewOne(best, competing)
+  }
+
+  /** review and (maybe) place ONE candidate */
+  private async reviewOne(c: Candidate, competing: number): Promise<void> {
+    // a signal from an earlier bar must still hold on the latest closed bar - otherwise it is stale and dropped
+    let candles: Candle[]
+    try {
+      candles = this.market.getCandlesDeep(c.asset, this.config.tf, 320, true)
+    } catch {
+      return
+    }
+    if (candles.length < MIN_BARS) return
+    const last = candles[candles.length - 1]
+    if (last.time !== c.barTime) {
+      try {
+        const ev = this.metaStrategy().evaluate(this.config.metaStrategyId, c.asset, this.config.tf)
+        const s = ev.result
+        if (s.direction !== c.direction || s.confidence < this.config.minConfidence) {
+          this.rt.expiredCandidates = (this.rt.expiredCandidates ?? 0) + 1
+          return
+        }
+        c = { ...c, confidence: s.confidence, notes: s.notes, barTime: last.time, price: last.close, expiryMin: s.expiryMin }
+      } catch {
+        return
+      }
+    }
+    this.lastSignalBar.set(`${c.asset}|${c.direction}`, c.barTime)
+    this.rt.proposals += 1
+    const dec: BrainDecision = {
+      id: `b${Date.now().toString(36)}${(this.seq++).toString(36)}`,
+      ts: this.now(),
+      asset: c.asset,
+      tf: this.config.tf,
+      barTime: c.barTime,
+      direction: c.direction,
+      strategyId: c.spec.id,
+      strategyName: c.spec.name,
+      confidence: c.confidence,
+      notes: c.notes + (competing ? ` [strongest of ${competing + 1} signals this round]` : ''),
+      entryPrice: last.close,
+      expirySec: this.config.defaultExpirySec,
+      status: 'approved',
+      placed: false,
+      stake: this.stakeFor(),
+    }
+    let go = true
+    if (this.config.requireAi) {
+      if (!this.reviewBudgetLeft()) {
+        dec.status = 'rate_limited'
+        go = false
+      } else {
+        this.reviewTimes.push(Date.now())
+        const t0 = Date.now()
+        try {
+          const res = await callLlm(this.resolveAppUrl(), buildReviewMessages({ asset: c.asset, tf: this.config.tf, strategyName: c.spec.name, script: c.spec.script ?? '', direction: c.direction, confidence: c.confidence, notes: c.notes, price: last.close, candles, expiriesSec: this.config.expiriesSec, panelLines: this.panelLines(c.asset), scriptExpiryMin: c.expiryMin, competing }), { temperature: 0.2, maxTokens: 300, timeoutMs: 30_000 })
+          const parsed = parseReview(res.content, this.config.expiriesSec)
+          if (!parsed) {
+            dec.status = 'ai_unavailable'
+            dec.ai = { go: false, confidence: 0, reason: 'reply did not parse as a go/no JSON object - treated as a veto', provider: res.provider, model: res.model, ms: Date.now() - t0 }
+            go = false
+          } else {
+            dec.expirySec = parsed.expirySec
+            dec.ai = { go: parsed.go, confidence: parsed.confidence, reason: parsed.reason, provider: res.provider, model: res.model, ms: Date.now() - t0 }
+            dec.status = parsed.go ? 'approved' : 'vetoed'
+            go = parsed.go
+          }
+        } catch (err) {
+          dec.status = 'ai_unavailable'
+          dec.ai = { go: false, confidence: 0, reason: `reviewer unreachable - treated as a veto: ${(err as Error).message}`.slice(0, 300), provider: '', model: '', ms: Date.now() - t0 }
+          go = false
+        }
+      }
+    } else {
+      dec.status = 'no_ai_needed'
+    }
+    if (go && this.config.live) await this.maybePlace(dec)
+    this.log.push(dec)
+    if (this.log.length > LOG_CAP) this.log = this.log.slice(-LOG_CAP)
+    this.persistLog()
+    this.rt.lastAction = `${dec.status} ${dec.direction.toUpperCase()} ${c.asset} (${dec.expirySec}s)${dec.placed ? ' - ORDER PLACED' : this.config.live ? '' : ' - shadow'}`
   }
 
   private async maybePlace(dec: BrainDecision): Promise<void> {
@@ -681,6 +896,11 @@ export class BrainTraderService {
     }
     if (mode !== 'auto') {
       dec.placeError = 'OS mode is not AUTO - logged only'
+      this.rt.lastRejection = dec.placeError
+      return
+    }
+    if (this.config.stakePlan && this.rt.halted) {
+      dec.placeError = 'compound cycle halted - restart it to trade again'
       this.rt.lastRejection = dec.placeError
       return
     }
@@ -732,7 +952,7 @@ export class BrainTraderService {
         tf: this.config.tf,
         side: dec.direction,
         kind,
-        amount: this.config.stake,
+        amount: dec.stake ?? this.stakeFor(),
         expiryBars: Math.max(1, Math.round(dec.expirySec / TIMEFRAME_SECONDS[this.config.tf])),
         expirySec: kind === 'blitz' || kind === 'digital' || kind === 'binary' ? dec.expirySec : undefined,
         mode: exec.accountSource === 'iq' ? 'live' : 'paper',
@@ -767,7 +987,23 @@ function sanitize(c: BrainTraderConfig): BrainTraderConfig {
     marketScope: c.marketScope === 'real' || c.marketScope === 'otc' ? c.marketScope : 'all',
     cooldownSec: Math.max(0, num(c.cooldownSec, DEFAULT_CONFIG.cooldownSec)),
     assets: Array.isArray(c.assets) ? [...new Set(c.assets.filter((a): a is string => typeof a === 'string' && a.length > 0))].slice(0, MAX_ASSETS) : undefined,
+    stakePlan: sanitizeStakePlan(c.stakePlan),
     appUrl: typeof c.appUrl === 'string' && c.appUrl ? c.appUrl : undefined,
+  }
+}
+
+function sanitizeStakePlan(v: unknown): BrainStakePlan | undefined {
+  if (!v || typeof v !== 'object') return undefined
+  const o = v as Record<string, unknown>
+  if (o.kind !== 'compound') return undefined
+  const num = (x: unknown, fb: number) => (typeof x === 'number' && Number.isFinite(x) ? x : fb)
+  const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x))
+  return {
+    kind: 'compound',
+    base: clamp(num(o.base, 1), 1, 5000),
+    rollPct: o.rollPct !== undefined ? clamp(num(o.rollPct, 100), 1, 100) : undefined,
+    payoutCap: o.payoutCap !== undefined ? clamp(num(o.payoutCap, 70), 1, 100) : undefined,
+    stopOnLoss: typeof o.stopOnLoss === 'boolean' ? o.stopOnLoss : undefined,
   }
 }
 

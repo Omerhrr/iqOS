@@ -23,6 +23,8 @@ const MEM_CAP = 1500 // in-memory closed bars per asset|tf (unchanged memory pro
 // The sidecar serializes broker calls - more than this would stretch the 4s
 // poll past the tick cadence. Excess watchlist pairs are skipped (logged hourly).
 const MAX_LIVE_POLL_ASSETS = 8
+/** pairs the Brain Trader's watchlist gets refreshed per live poll (rotating, candles forced): 50 pairs -> every ~60s at 4s polls */
+const BRAIN_ROTATE_PER_POLL = 5
 const ARCHIVE_DEEP = 4000 // max bars hydrated/read from the sqlite archive per asset|tf
 const ARCHIVE_CAP = 4000 // archive trim cap per asset|tf (auto-prune)
 const ARCHIVE_FLUSH_MS = 5000 // batched write cadence
@@ -831,6 +833,11 @@ export class MarketDataService {
         const extraWantCandles = Date.now() - (this.extraCandlePull.get(asset) ?? 0) > 60_000
         await this.pollLiveAsset(url, asset, asset === this.activeAsset ? wantCandles : extraWantCandles)
       }
+      // Brain Trader: its watchlist can be 50+ pairs, far past the 8-pair cap above (the sidecar serializes broker calls), so refresh a rotating
+      // slice each poll with candles forced - every pair gets fresh bars about once a minute, which is what a 1m trader reads.
+      for (const asset of this.brainRotation(assets)) {
+        await this.pollLiveAsset(url, asset, Date.now() - (this.extraCandlePull.get(asset) ?? 0) > 30_000)
+      }
     } catch (err) {
       this.ctx.bus.emit('alert', { level: 'warn', message: `live feed hiccup: ${(err as Error).message}`, ts: Math.floor(Date.now() / 1000) })
     } finally {
@@ -899,6 +906,24 @@ export class MarketDataService {
       this.ctx.log('market-data', `live poll capped at ${MAX_LIVE_POLL_ASSETS} assets - ${out.length - MAX_LIVE_POLL_ASSETS} watchlist pair(s) beyond the cap get no live candles`)
     }
     return out.slice(0, MAX_LIVE_POLL_ASSETS)
+  }
+
+  private brainCursor = 0
+  /** the next few Brain Trader pairs to refresh (round-robin), skipping any already polled this cycle */
+  private brainRotation(already: string[]): string[] {
+    let pool: string[] = []
+    try {
+      const brain = this.ctx.use<{ watchedAssets?: () => string[] }>('brainTrader')
+      pool = (brain?.watchedAssets?.() ?? []).map((a) => String(a).trim().toUpperCase()).filter((a) => a && !already.includes(a))
+    } catch {
+      return []
+    }
+    if (!pool.length) return []
+    const take = Math.min(BRAIN_ROTATE_PER_POLL, pool.length)
+    const out: string[] = []
+    for (let i = 0; i < take; i++) out.push(pool[(this.brainCursor + i) % pool.length])
+    this.brainCursor = (this.brainCursor + take) % pool.length
+    return out
   }
 
   private async pollLiveAsset(url: string, asset: string, wantCandles: boolean): Promise<void> {

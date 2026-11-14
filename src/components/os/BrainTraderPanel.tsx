@@ -24,6 +24,7 @@ interface Cfg {
   maxOpen: number
   marketScope: 'all' | 'real' | 'otc'
   cooldownSec: number
+  stakePlan?: { kind: 'compound'; base: number; rollPct?: number; payoutCap?: number; stopOnLoss?: boolean }
 }
 interface Group {
   n: number
@@ -39,7 +40,9 @@ interface Status {
   mode: string
   active: boolean
   config: Cfg
-  runtime: { reads: number; proposals: number; trades: number; wins: number; losses: number; pnlTotal: number; openCount: number; lastAction?: string; lastRejection?: string; lastReason?: string }
+  pending?: number
+  nextStake?: number
+  runtime: { reads: number; proposals: number; trades: number; wins: number; losses: number; pnlTotal: number; openCount: number; lastAction?: string; lastRejection?: string; lastReason?: string; lastScanAssets?: number; lastScanPool?: number; lastScanStale?: number; staleSample?: string[]; candidates?: number; outranked?: number; expiredCandidates?: number; pot?: number; rollN?: number; halted?: boolean }
   stats: { proposed: Group; approved: Group; vetoed: Group; reviewerLiftPts: number | null; note: string }
   reviewsLastHour: number
 }
@@ -171,6 +174,26 @@ export default function BrainTraderPanel() {
         {st.runtime.lastAction && <span title={st.runtime.lastAction}> · last: {st.runtime.lastAction}</span>}
         {st.runtime.lastRejection && <span className="text-amber-500/70"> · {st.runtime.lastRejection}</span>}
       </p>
+      <p className="font-mono text-[8px] text-[#3d4c66]">
+        one at a time: {st.pending ?? 0} waiting · {st.runtime.outranked ?? 0} outranked · {st.runtime.expiredCandidates ?? 0} went stale
+        {st.config.stakePlan && (
+          <span className={st.runtime.halted ? 'text-rose-400/80' : 'text-emerald-400/80'}>
+            {' '}· compounding: pot ${(st.runtime.pot ?? 0).toFixed(2)} · roll {st.runtime.rollN ?? 0} · next stake ${(st.nextStake ?? st.config.stakePlan.base).toFixed(2)}
+            {st.runtime.halted ? ' · HALTED by a loss' : ''}
+          </span>
+        )}
+      </p>
+      {st.config.stakePlan && st.runtime.halted && (
+        <Button size="sm" onClick={async () => { await osPost('/brain_trader_restart', {}); await load() }} className="mt-0.5 h-5 rounded bg-amber-600 px-2 text-[9px] font-bold uppercase text-white hover:bg-amber-500">
+          restart compound cycle
+        </Button>
+      )}
+      {(st.runtime.lastScanStale ?? 0) > 0 && (
+        <p className="font-mono text-[8px] text-amber-500/70" title={(st.runtime.staleSample ?? []).join(', ')}>
+          feed: {st.runtime.lastScanStale} of {st.runtime.lastScanPool ?? '?'} watched pairs have no fresh candles (market closed or feed lagging) and can't signal until they update
+          {st.runtime.staleSample?.length ? ` - e.g. ${st.runtime.staleSample.slice(0, 3).join(', ')}` : ''}
+        </p>
+      )}
 
       <div className="mt-1 grid grid-cols-4 gap-x-3 font-mono text-[9px] text-[#7c8aa5]">
         <span />
@@ -219,6 +242,26 @@ export default function BrainTraderPanel() {
           <label className="flex items-center gap-1.5">
             <Switch checked={draft.requireAi} onCheckedChange={(v) => setDraft({ ...draft, requireAi: v })} /> AI reviewer required
           </label>
+          <label className="flex items-center gap-1.5 md:col-span-2">
+            <Switch
+              checked={!!draft.stakePlan}
+              onCheckedChange={(v) => setDraft({ ...draft, stakePlan: v ? { kind: 'compound', base: draft.stake || 1, rollPct: 100, payoutCap: 70, stopOnLoss: true } : undefined })}
+            />
+            compounding stake (live orders only): wins fold into the pot, a loss ends the run
+          </label>
+          {draft.stakePlan && (
+            <>
+              {([['base stake $', 'base'], ['roll % of profit', 'rollPct'], ['payout cap %', 'payoutCap']] as const).map(([label, key]) => (
+                <label key={key} className="flex flex-col gap-0.5">
+                  {label}
+                  <Input type="number" value={draft.stakePlan?.[key] ?? ''} onChange={(e) => setDraft({ ...draft, stakePlan: { ...(draft.stakePlan as NonNullable<Cfg['stakePlan']>), [key]: Number(e.target.value) } })} className="h-6 bg-[#101828] px-1 text-[10px]" />
+                </label>
+              ))}
+              <label className="flex items-center gap-1.5">
+                <Switch checked={draft.stakePlan.stopOnLoss !== false} onCheckedChange={(v) => setDraft({ ...draft, stakePlan: { ...(draft.stakePlan as NonNullable<Cfg['stakePlan']>), stopOnLoss: v } })} /> stop on a loss
+              </label>
+            </>
+          )}
           <Button
             size="sm"
             onClick={async () => {
@@ -229,7 +272,8 @@ export default function BrainTraderPanel() {
               void _ms
               void _wm
               void _as
-              await patch(safe as Partial<Cfg>)
+              // stakePlan is sent explicitly (null = compounding off) because an omitted field would keep the old plan
+              await patch({ ...(safe as Partial<Cfg>), stakePlan: draft.stakePlan ?? null } as never)
               setCfgOpen(false)
             }}
             className="h-6 self-end rounded bg-sky-600 px-3 text-[9px] font-bold uppercase text-white hover:bg-sky-500"

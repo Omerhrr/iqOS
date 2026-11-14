@@ -185,22 +185,23 @@ test('computeStats: groups signals / approved / vetoed and reports the lift only
 // ------------------------------------------------------------ service, with a fake kernel
 type Sig = { direction: 'call' | 'put' | 'none'; confidence: number; notes: string; expiryMin?: number }
 type AssetStub = { ticker: string; open: boolean; otc?: boolean }
-function harness(mode: 'auto' | 'human', series: Candle[], signal: Sig = { direction: 'call', confidence: 70, notes: 'fired: trendCall' }, assetList: AssetStub[] = [{ ticker: 'EURUSD', open: true, otc: false }]) {
+function harness(mode: 'auto' | 'human', series: Candle[], signal: Sig | ((asset: string) => Sig) = { direction: 'call', confidence: 70, notes: 'fired: trendCall' }, assetList: AssetStub[] = [{ ticker: 'EURUSD', open: true, otc: false }]) {
   const evalAssets: string[] = []
   const placed: unknown[] = []
   let cfgRow: unknown = null
   let logRow: unknown = null
   let candles = series
+  const openPos: unknown[] = []
   let evalCalls = 0
   let lastEvalId = ''
   const store = {
     getBrainTraderConfig: () => cfgRow, saveBrainTraderConfig: (c: unknown) => { cfgRow = c },
     getBrainTraderLog: () => logRow, saveBrainTraderLog: (l: unknown) => { logRow = l },
-    listPositions: () => [] as unknown[],
+    listPositions: () => openPos,
   }
   const market = { listAssets: () => assetList, getCandlesDeep: () => candles }
   const metaStrategy = {
-    evaluate: (id: string, asset: string) => { evalCalls++; lastEvalId = id; evalAssets.push(asset); return { spec: { id, name: 'Brain 1', script: SCRIPT }, result: signal, price: candles[candles.length - 1].close } },
+    evaluate: (id: string, asset: string) => { evalCalls++; lastEvalId = id; evalAssets.push(asset); return { spec: { id, name: 'Brain 1', script: SCRIPT }, result: typeof signal === 'function' ? signal(asset) : signal, price: candles[candles.length - 1].close } },
     snapshotSources: () => [{ source: 'renko', direction: 'call', confidence: 70, label: 'up' }],
   }
   const services: Record<string, unknown> = {
@@ -210,9 +211,14 @@ function harness(mode: 'auto' | 'human', series: Candle[], signal: Sig = { direc
   }
   const ctx = { use: (n: string) => services[n], bus: { on: () => () => {} }, log: () => {}, provide: () => {} }
   const svc = new BrainTraderService()
-  return { svc, ctx, placed, evalAssets, getLog: () => logRow as BrainDecision[], setCandles: (c: Candle[]) => { candles = c }, evals: () => evalCalls, evalId: () => lastEvalId }
+  return { svc, ctx, placed, openPos, evalAssets, getLog: () => logRow as BrainDecision[], setCandles: (c: Candle[]) => { candles = c }, evals: () => evalCalls, evalId: () => lastEvalId }
 }
-const series = () => rw(200, 4)
+/** closed bars ending one bar ago (so the feed counts as fresh) */
+const series = () => {
+  const now = Math.floor(Date.now() / 1000)
+  return rw(200, 4).map((c, i, a) => ({ ...c, time: now - (a.length - i) * 60 }))
+}
+const oldSeries = () => rw(200, 4)
 async function boot(h: ReturnType<typeof harness>, cfg: Record<string, unknown>) {
   await h.svc.start(h.ctx as never)
   h.svc.configure(cfg as never)
@@ -324,7 +330,7 @@ test('what the strategy returns is respected: no signal, below minConfidence, or
 test('each closed bar is read once; a signal that stays true is not re-sent for 5 bars, then is again', async () => {
   const base = series()
   const h = harness('auto', base)
-  await boot(h, { ...BASE, live: false })
+  await boot(h, { ...BASE, live: false, maxOpen: 10 })
   await withFetch(llm(GO), async () => {
     await tickOf(h)
     await tickOf(h) // same bar: skipped
@@ -410,25 +416,109 @@ test('SELECTED pairs: only the chosen pairs are scanned; a chosen pair whose mar
   assert.equal(h2.svc.status().runtime.lastScanPool, 0)
 })
 
-test('signals from many pairs: 3 reviews per tick, the rest are deferred to the next tick (not lost), and the scan reports what it covered', async () => {
-  const h = harness('auto', series(), { direction: 'call', confidence: 80, notes: 'x' }, MANY.slice(0, 5))
+test('ONE AT A TIME: several pairs signal the same bar -> only the strongest goes to the reviewer; a veto frees the next-best on the next tick', async () => {
+  const conf: Record<string, number> = { PAIR0: 60, PAIR1: 80, PAIR2: 70, PAIR3: 75, PAIR4: 65 }
+  const mk = () => harness('auto', series(), (a: string) => ({ direction: 'call', confidence: conf[a] ?? 0, notes: 'x' }), MANY.slice(0, 5))
+  const h = mk()
   await boot(h, { ...BASE, live: false, watchMode: 'all', maxReviewsPerHour: 100 })
-  await withFetch(llm(GO), async () => {
+  let calls = 0
+  const prompts: string[] = []
+  const real = globalThis.fetch
+  globalThis.fetch = (async (_u: unknown, init?: { body?: string }) => { calls++; prompts.push(String(init?.body)); return llm('{"decision":"no","expirySec":60,"confidence":50,"reason":"not clean"}')() }) as typeof fetch
+  try {
     await tickOf(h)
-    assert.equal(h.getLog().length, 3, 'MAX_REVIEWS_PER_TICK reviewed now')
-    const rt = h.svc.status().runtime
-    assert.equal(rt.lastScanPool, 5)
-    assert.equal(rt.lastScanAssets, 5)
-    assert.ok(typeof rt.lastScanMs === 'number')
+    assert.equal(calls, 1, 'exactly ONE reviewer call for five valid pairs')
+    assert.equal(h.getLog().length, 1)
+    assert.equal(h.getLog()[0].asset, 'PAIR1', 'the strongest signal is the one reviewed')
+    assert.match(prompts[0], /strongest of 5 valid signals/)
+    assert.equal(h.svc.status().pending, 4)
+    await tickOf(h) // veto does not occupy a slot -> the next-best is reviewed
+    assert.equal(calls, 2)
+    assert.equal(h.getLog()[1].asset, 'PAIR3')
     await tickOf(h)
-    const log = h.getLog()
-    assert.equal(log.length, 5, 'the two deferred pairs are reviewed on the next tick')
-    assert.equal(new Set(log.map((d) => d.asset)).size, 5)
-    assert.ok(log.every((d) => d.status === 'approved'))
     await tickOf(h)
-    assert.equal(h.getLog().length, 5, 'nothing is reviewed twice')
-  })
+    await tickOf(h)
+    assert.equal(calls, 5)
+    assert.deepEqual(h.getLog().map((d) => d.asset), ['PAIR1', 'PAIR3', 'PAIR2', 'PAIR4', 'PAIR0'], 'descending strategy confidence, each pair reviewed once')
+    await tickOf(h)
+    assert.equal(calls, 5, 'nothing is reviewed twice')
+  } finally { globalThis.fetch = real }
   h.svc.stop()
+})
+
+test('A TRADE IS OPEN: the scan keeps going, signals wait, nothing else goes to the reviewer until the slot frees, stale ones are dropped', async () => {
+  const conf: Record<string, number> = { PAIR0: 60, PAIR1: 80, PAIR2: 70 }
+  const h = harness('auto', series(), (a: string) => ({ direction: 'call', confidence: conf[a] ?? 0, notes: 'x' }), MANY.slice(0, 3))
+  await boot(h, { ...BASE, live: true, watchMode: 'all', maxOpen: 1, maxReviewsPerHour: 100 })
+  let calls = 0
+  const real = globalThis.fetch
+  globalThis.fetch = (async () => { calls++; return llm(GO)() }) as typeof fetch
+  const openPositions = h.openPos
+  try {
+    await tickOf(h)
+    assert.equal(calls, 1)
+    assert.equal(h.placed.length, 1)
+    // the placed trade is now OPEN: report it so the slot is busy
+    openPositions.push({ note: 'brain:trader x', asset: 'PAIR1' })
+    await tickOf(h)
+    await tickOf(h)
+    assert.equal(calls, 1, 'no second reviewer call while the trade is open')
+    assert.equal(h.placed.length, 1)
+    assert.match(String(h.svc.status().runtime.lastReason), /holding \d+ signal\(s\)/)
+    // the trade ends: the best STILL-FRESH signal goes next
+    openPositions.length = 0
+    await tickOf(h)
+    assert.equal(calls, 2)
+    assert.equal(h.getLog()[1].asset, 'PAIR2')
+    // and a signal that waited too long (2+ bars) is dropped, not sent late
+    openPositions.push({ note: 'brain:trader y', asset: 'PAIR2' })
+    ;(h.svc as unknown as { now: () => number }).now = () => Math.floor(Date.now() / 1000) + 600
+    await tickOf(h)
+    assert.ok((h.svc.status().runtime.expiredCandidates ?? 0) >= 1)
+    assert.equal(calls, 2)
+  } finally { globalThis.fetch = real }
+  h.svc.stop()
+})
+
+test('COMPOUNDING: win folds profit into the pot (next stake), loss burns it and halts, restart re-seeds; live orders use the pot; shadow never touches it', async () => {
+  const h = harness('auto', series())
+  await boot(h, { ...BASE, live: true, stake: 1, stakePlan: { kind: 'compound', base: 2 } as never })
+  assert.equal(h.svc.stakeFor(), 2)
+  const close = (pnl: number, status: string, amount: number) => (h.svc as unknown as { onPositionClosed(p: unknown): void }).onPositionClosed({ note: 'brain:trader z', pnl, status, amount })
+  close(1.6, 'won', 2) // fold min(1.6, 2*0.7=1.4) = 1.4
+  assert.equal(h.svc.stakeFor(), 3.4)
+  assert.equal(h.svc.status().runtime.rollN, 1)
+  close(1.0, 'won', 3.4) // fold min(1.0, 2.38)=1.0 -> 4.4
+  assert.equal(h.svc.stakeFor(), 4.4)
+  await withFetch(llm(GO), () => runOnce(h))
+  assert.equal((h.placed[0] as { amount: number }).amount, 4.4, 'the live order stakes the pot')
+  assert.equal(h.getLog()[0].stake, 4.4)
+  close(-4.4, 'lost', 4.4) // pot burned, cycle halted
+  assert.equal(h.svc.status().runtime.halted, true)
+  assert.equal(h.svc.stakeFor(), 2, 'a burned pot re-seeds at base')
+  // halted: the scan does not even call the reviewer
+  const h2 = harness('auto', series())
+  await boot(h2, { ...BASE, live: true, stakePlan: { kind: 'compound', base: 2 } as never })
+  ;(h2.svc as unknown as { onPositionClosed(p: unknown): void }).onPositionClosed({ note: 'brain:trader z', pnl: -2, status: 'lost', amount: 2 })
+  let called = 0
+  await withFetch(() => { called++; return llm(GO)() }, () => runOnce(h2))
+  assert.equal(called, 0, 'halted cycle makes no reviewer call')
+  assert.equal(h2.placed.length, 0)
+  assert.match(String(h2.svc.status().runtime.lastRejection), /halted/)
+  assert.deepEqual(h2.svc.restartCompound(), { ok: true })
+  assert.equal(h2.svc.status().runtime.halted, false)
+  // shadow decisions never touch the pot
+  const h3 = harness('auto', series())
+  await boot(h3, { ...BASE, live: false, stakePlan: { kind: 'compound', base: 2 } as never })
+  await withFetch(llm(GO), () => runOnce(h3))
+  assert.equal(h3.placed.length, 0)
+  assert.equal(h3.svc.status().runtime.pot ?? 0, 0)
+  // a changed plan starts a fresh roll; junk plans are dropped
+  h.svc.configure({ stakePlan: { kind: 'compound', base: 5 } as never })
+  assert.equal(h.svc.stakeFor(), 5)
+  h.svc.configure({ stakePlan: { kind: 'martingale' } as never })
+  assert.equal(h.svc.status().config.stakePlan, undefined)
+  assert.equal(h.svc.stakeFor(), 1)
 })
 
 test('config: watchMode defaults to ALL, bad values fall back, the selected list is de-duplicated', async () => {
@@ -440,6 +530,33 @@ test('config: watchMode defaults to ALL, bad values fall back, the selected list
   assert.equal(c.watchMode, 'selected')
   assert.deepEqual(c.assets, ['A', 'B'])
   h.svc.stop()
+})
+
+test('FEED WARMING: the trader exposes the pairs it watches so market-data keeps them fresh (disabled = none)', async () => {
+  const h = harness('auto', series(), { direction: 'none', confidence: 0, notes: '' }, MANY)
+  await boot(h, { enabled: false, watchMode: 'all', marketScope: 'all' })
+  assert.deepEqual(h.svc.watchedAssets(), [])
+  h.svc.configure({ enabled: true } as never)
+  assert.equal(h.svc.watchedAssets().length, 50)
+  assert.ok(!h.svc.watchedAssets().includes('CLOSED1'))
+  h.svc.configure({ watchMode: 'selected', assets: ['PAIR3', 'OTC2'] } as never)
+  assert.deepEqual([...h.svc.watchedAssets()].sort(), ['OTC2', 'PAIR3'])
+  h.svc.stop()
+})
+
+test('STALE feeds are reported: pairs whose last closed bar is old are counted so a frozen feed is visible, not silent', async () => {
+  const h = harness('auto', oldSeries(), { direction: 'none', confidence: 0, notes: '' }, MANY)
+  await boot(h, { ...BASE, live: false, watchMode: 'all', marketScope: 'all' })
+  await runOnce(h)
+  const rt = h.svc.status().runtime as { lastScanStale?: number; staleSample?: string[] }
+  assert.equal(rt.lastScanStale, 50)
+  assert.ok((rt.staleSample ?? []).length > 0)
+  const now = Math.floor(Date.now() / 1000)
+  const fresh = series().map((c, i, a) => ({ ...c, time: now - (a.length - 1 - i) * 60 - 60 }))
+  const h2 = harness('auto', fresh, { direction: 'none', confidence: 0, notes: '' }, MANY)
+  await boot(h2, { ...BASE, live: false, watchMode: 'all', marketScope: 'all' })
+  await runOnce(h2)
+  assert.equal((h2.svc.status().runtime as { lastScanStale?: number }).lastScanStale, 0)
 })
 
 let passed = 0

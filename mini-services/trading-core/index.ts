@@ -4665,6 +4665,14 @@ const httpServer = createServer(async (req, res) => {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }
       }
+      // POST /brain_trader_restart -> revive a halted compounding cycle (clears the halt, re-seeds the pot at base).
+      if (path === '/brain_trader_restart') {
+        try {
+          return json(200, kernel.context().use<BrainTraderService>('brainTrader').restartCompound())
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
       // POST /brain_trader_reset -> clear the decision log and counters (config untouched).
       if (path === '/brain_trader_reset') {
         try {
