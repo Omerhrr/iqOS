@@ -2914,6 +2914,7 @@ const httpServer = createServer(async (req, res) => {
               'put when <boolExpr>          sets the PUT verdict if true',
               'confidence = <numExpr>       optional, at most once - overrides the default 0-100 confidence (clamped to that range); evaluated only once a side actually fired',
               'expiry = <numExpr>           optional, at most once - the expiry (whole minutes, clamped 1-60) this script PREFERS; evaluated only once a side fired',
+              'if <boolExpr>               branching: the statements below run only when it is true; then optionally  elseif <boolExpr>  (or  else if <boolExpr>),  else,  and the block is closed with  end.  Blocks may hold let / call when / put when / confidence / expiry / configure / further if blocks (8 deep). The first true branch wins and later conditions are NOT evaluated. A let inside a branch exists afterwards only if that branch ran - give it a default before the if. since()/streak() inside a branch only count while that branch runs.',
               'configure <a.b> = <expr>     optional, repeatable - per-script engine-knob overrides (e.g. "configure renko.atrMult = 0.5"); unknown keys or out-of-range values are a script ERROR, not silently ignored',
               '# comment                    "#" to end-of-line; blank lines are ignored',
             ],

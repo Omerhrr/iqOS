@@ -120,6 +120,14 @@ let chartsAgree = renko.dir == pointFigure.dir and renko.dir == rangeBars.dir
 call when oracle.dir == call and chartsAgree and renko.dir == call and strong
 put when oracle.dir == put and chartsAgree and renko.dir == put
 confidence = avg(oracle.conf, renko.conf, pointFigure.conf, rangeBars.conf)
+
+# Branching (optional): if <cond> / elseif <cond> / else / end, statements on the lines between.
+# The first true branch runs. Example:
+#   if oracle.conf >= 70
+#     call when oracle.dir == call
+#   elseif oracle.conf >= 55
+#     call when oracle.dir == call and renko.dir == call
+#   end
 `
 
 function emptyCondition(): MetaCondition {

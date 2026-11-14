@@ -67,7 +67,7 @@ import {
   type MetaSourceRead,
   type MetaStrategySpec,
 } from '../analytics/metastrategy'
-import { parseStrategyScript, evaluateStrategyScript, clearMslState, type MslEvalResult, type MslSourceRead, type MslSeriesCtx, type MslBarValue, type MslAst } from '../analytics/strategylang'
+import { parseStrategyScript, evaluateStrategyScript, clearMslState, flattenStmts, type MslEvalResult, type MslSourceRead, type MslSeriesCtx, type MslBarValue, type MslAst } from '../analytics/strategylang'
 import { getStrategy } from '../strategies/builtin'
 import { directionBreakdown } from '../strategies/backtest'
 import { sharpeRatio } from '../analytics/quant'
@@ -943,7 +943,7 @@ export class MetaStrategyService {
       // see evaluateScript's two-pass flow). A typo'd knob or unknown
       // strategy id is rejected on save, so it can never sit in the library
       // failing silently every cycle.
-      for (const stmt of parsed.ast.stmts) {
+      for (const stmt of flattenStmts(parsed.ast.stmts)) {
         if (stmt.kind !== 'configure') continue
         if (stmt.path.startsWith('strategy.')) {
           const rest = stmt.path.slice('strategy.'.length)

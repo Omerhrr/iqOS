@@ -29,7 +29,7 @@
 // Transpiler's syntax check for the two real-TypeScript kinds) are still
 // the thing that actually validates and persists it.
 import type { ChatMessage } from './llm'
-import { COPILOT_IDENTITY, AI_LEARNING_AGENT_KNOWLEDGE, META_STRATEGY_MSL_KNOWLEDGE, MSL_RAW_PRIMITIVES_KNOWLEDGE } from './copilotKnowledge'
+import { COPILOT_IDENTITY, AI_LEARNING_AGENT_KNOWLEDGE, META_STRATEGY_MSL_KNOWLEDGE, MSL_RAW_PRIMITIVES_KNOWLEDGE, MSL_MODEL_NAMESPACES_KNOWLEDGE } from './copilotKnowledge'
 
 export type CodeAssistKind = 'msl' | 'ai_lab_script' | 'builtin_strategy_ts' | 'meta_source_ts'
 
@@ -136,10 +136,10 @@ function systemPromptFor(kind: CodeAssistKind): string {
   // same Copilot, not a second assistant with its own opinions about MSL.
   const outputFormat =
     'Right now you are embedded directly in one of the OS\'s own code editors, asked to write or fix the ONE code block that editor holds - not to chat, not to call a tool, just to produce that code. Respond with a single JSON object: {"code": "<the complete replacement text for the editor, exactly as it should be pasted in>", "explanation": "<one or two plain-English sentences on what you built/changed, for the user>"}. No markdown fences, no other text outside that JSON object - the code goes verbatim into a live editor, so it must be nothing but the code itself.'
-  if (kind === 'msl') return `${COPILOT_IDENTITY}\n\n${META_STRATEGY_MSL_KNOWLEDGE}\n\n${MSL_RAW_PRIMITIVES_KNOWLEDGE}\n\n${outputFormat}\n\nWrite a complete MSL script for the Meta-Strategy Lab's code editor: it MUST include at least one \`call when\`, one \`put when\`, and a \`confidence =\` line, using \`let\` bindings for readability when the logic has more than one or two pieces.`
-  if (kind === 'ai_lab_script') return `${COPILOT_IDENTITY}\n\n${META_STRATEGY_MSL_KNOWLEDGE}\n\n${MSL_RAW_PRIMITIVES_KNOWLEDGE}\n\n${AI_LEARNING_AGENT_KNOWLEDGE}\n\n${outputFormat}\n\nWrite a complete MSL script for the AI Lab's code editor (the AI Lab's own signal-function vocabulary described above, not named Meta-Strategy sources): it MUST include at least one \`call when\`, one \`put when\`, and a \`confidence =\` line.`
+  if (kind === 'msl') return `${COPILOT_IDENTITY}\n\n${META_STRATEGY_MSL_KNOWLEDGE}\n\n${MSL_RAW_PRIMITIVES_KNOWLEDGE}\n\n${MSL_MODEL_NAMESPACES_KNOWLEDGE}\n\n${outputFormat}\n\nWrite a complete MSL script for the Meta-Strategy Lab's code editor: it MUST include at least one \`call when\`, one \`put when\`, and a \`confidence =\` line, using \`let\` bindings for readability when the logic has more than one or two pieces.`
+  if (kind === 'ai_lab_script') return `${COPILOT_IDENTITY}\n\n${META_STRATEGY_MSL_KNOWLEDGE}\n\n${MSL_RAW_PRIMITIVES_KNOWLEDGE}\n\n${MSL_MODEL_NAMESPACES_KNOWLEDGE}\n\n${AI_LEARNING_AGENT_KNOWLEDGE}\n\n${outputFormat}\n\nWrite a complete MSL script for the AI Lab's code editor (the AI Lab's own signal-function vocabulary described above, not named Meta-Strategy sources): it MUST include at least one \`call when\`, one \`put when\`, and a \`confidence =\` line.`
   if (kind === 'builtin_strategy_ts') return `${COPILOT_IDENTITY}\n\n${AI_LEARNING_AGENT_KNOWLEDGE}\n\n${outputFormat}\n\n${BUILTIN_STRATEGY_SHAPE}\n\nWrite exactly one such object literal (including its own braces), nothing else - it gets spliced back into the array in place of whatever was there.`
-  return `${COPILOT_IDENTITY}\n\n${META_STRATEGY_MSL_KNOWLEDGE}\n\n${MSL_RAW_PRIMITIVES_KNOWLEDGE}\n\n${outputFormat}\n\n${META_SOURCE_SHAPE}\n\nWrite exactly one such method (signature through its closing brace), nothing else - it gets spliced back into the class in place of whatever was there.`
+  return `${COPILOT_IDENTITY}\n\n${META_STRATEGY_MSL_KNOWLEDGE}\n\n${MSL_RAW_PRIMITIVES_KNOWLEDGE}\n\n${MSL_MODEL_NAMESPACES_KNOWLEDGE}\n\n${outputFormat}\n\n${META_SOURCE_SHAPE}\n\nWrite exactly one such method (signature through its closing brace), nothing else - it gets spliced back into the class in place of whatever was there.`
 }
 
 export function buildCodeAssistMessages(req: CodeAssistRequest): ChatMessage[] {

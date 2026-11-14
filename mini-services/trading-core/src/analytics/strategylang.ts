@@ -798,6 +798,26 @@ type Stmt =
   | { kind: 'confidence'; expr: Expr }
   | { kind: 'expiry'; expr: Expr }
   | { kind: 'configure'; path: string; expr: Expr }
+  /** `if <cond> ... elseif <cond> ... else ... end` - the first branch whose condition is true runs; `else` runs when none did */
+  | { kind: 'if'; branches: { cond: Expr; body: Stmt[]; line: number }[]; elseBody?: Stmt[] }
+
+export type MslStmt = Stmt
+
+/** every statement in the script, branch bodies included (depth-first, source order) */
+export function flattenStmts(stmts: Stmt[]): Stmt[] {
+  const out: Stmt[] = []
+  const walk = (list: Stmt[]) => {
+    for (const s of list) {
+      out.push(s)
+      if (s.kind === 'if') {
+        for (const b of s.branches) walk(b.body)
+        if (s.elseBody) walk(s.elseBody)
+      }
+    }
+  }
+  walk(stmts)
+  return out
+}
 
 export interface MslAst {
   stmts: Stmt[]
@@ -875,15 +895,76 @@ class Parser {
         this.pos++
         continue
       }
-      stmts.push(this.parseStatement())
+      if (this.isBlockWord(['elseif', 'else', 'end'])) throw new MslSyntaxError(`line ${this.peek().line}: "${this.peek().value}" without a matching "if"`)
+      stmts.push(this.parseStatement(0))
       // a statement must end at a line-break ('eof' token) or real eof
       if (this.peek().kind !== 'eof') throw new MslSyntaxError(`line ${this.peek().line}: unexpected "${this.peek().value}" after statement`)
     }
     return { stmts }
   }
 
-  private parseStatement(): Stmt {
+  /** the next token is a bare word (identifier) spelling one of these - block keywords are only special at the START of a statement */
+  private isBlockWord(words: string[]): boolean {
     const t = this.peek()
+    return t.kind === 'ident' && words.includes(t.value)
+  }
+
+  /** statements up to (not including) one of the stop words; line breaks between them are skipped */
+  private parseBlockBody(stop: string[], depth: number, openLine: number): Stmt[] {
+    const body: Stmt[] = []
+    for (;;) {
+      while (this.peek().kind === 'eof' && this.pos < this.toks.length - 1) this.pos++
+      if (this.peek().kind === 'eof') throw new MslSyntaxError(`line ${openLine}: this "if" block is never closed - add "end"`)
+      if (this.isBlockWord(stop)) return body
+      body.push(this.parseStatement(depth))
+      if (this.peek().kind !== 'eof') throw new MslSyntaxError(`line ${this.peek().line}: unexpected "${this.peek().value}" after statement`)
+    }
+  }
+
+  /** if <cond> [then] / elseif <cond> / else if <cond> / else / end */
+  private parseIf(depth: number): Stmt {
+    if (depth >= 8) throw new MslSyntaxError(`line ${this.peek().line}: "if" blocks nested more than 8 deep`)
+    const openLine = this.peek().line
+    const branches: { cond: Expr; body: Stmt[]; line: number }[] = []
+    let elseBody: Stmt[] | undefined
+    this.next() // 'if'
+    const readCond = (): Expr => {
+      const cond = this.parseOr()
+      if (this.isBlockWord(['then'])) this.next()
+      if (this.peek().kind !== 'eof') throw new MslSyntaxError(`line ${this.peek().line}: unexpected "${this.peek().value}" after the if condition - put the statements on the following lines`)
+      return cond
+    }
+    branches.push({ line: openLine, cond: readCond(), body: this.parseBlockBody(['elseif', 'else', 'end'], depth + 1, openLine) })
+    for (;;) {
+      const w = this.peek()
+      if (this.isBlockWord(['elseif'])) {
+        this.next()
+        branches.push({ line: w.line, cond: readCond(), body: this.parseBlockBody(['elseif', 'else', 'end'], depth + 1, openLine) })
+        continue
+      }
+      if (this.isBlockWord(['else'])) {
+        this.next()
+        if (this.isBlockWord(['if'])) {
+          // "else if <cond>" is the same as "elseif <cond>"
+          this.next()
+          branches.push({ line: w.line, cond: readCond(), body: this.parseBlockBody(['elseif', 'else', 'end'], depth + 1, openLine) })
+          continue
+        }
+        if (this.peek().kind !== 'eof') throw new MslSyntaxError(`line ${w.line}: "else" takes no condition (use "elseif <cond>" for another test)`)
+        elseBody = this.parseBlockBody(['elseif', 'else', 'end'], depth + 1, openLine)
+        if (!this.isBlockWord(['end'])) throw new MslSyntaxError(`line ${this.peek().line}: nothing may follow "else" except "end" (found "${this.peek().value}")`)
+        break
+      }
+      break
+    }
+    if (!this.isBlockWord(['end'])) throw new MslSyntaxError(`line ${openLine}: this "if" block is never closed - add "end"`)
+    this.next() // 'end'
+    return { kind: 'if', branches, ...(elseBody ? { elseBody } : {}) }
+  }
+
+  private parseStatement(depth = 0): Stmt {
+    const t = this.peek()
+    if (t.kind === 'ident' && t.value === 'if') return this.parseIf(depth)
     if (t.kind === 'let') {
       this.next()
       const name = this.expect('ident').value
@@ -940,7 +1021,7 @@ class Parser {
       this.expect('eq_assign')
       return { kind: 'configure', path, expr: this.parseOr() }
     }
-    throw new MslSyntaxError(`line ${t.line}: expected "let", "call when", "put when", "confidence =", "expiry =" or "configure ... =", got "${t.value}"`)
+    throw new MslSyntaxError(`line ${t.line}: expected "let", "call when", "put when", "confidence =", "expiry =", "configure ... =" or an "if" block, got "${t.value}"`)
   }
 
   private expectWord(word: string): void {
@@ -1115,7 +1196,8 @@ export function parseStrategyScript(src: string): { ok: true; ast: MslAst } | { 
   try {
     const toks = tokenize(src)
     const ast = new Parser(toks).parseProgram()
-    if (!ast.stmts.some((s) => s.kind === 'call') && !ast.stmts.some((s) => s.kind === 'put')) {
+    const all = flattenStmts(ast.stmts)
+    if (!all.some((s) => s.kind === 'call') && !all.some((s) => s.kind === 'put')) {
       return { ok: false, error: 'a strategy script needs at least one "call when ..." or "put when ..." statement' }
     }
     return { ok: true, ast }
@@ -4514,7 +4596,26 @@ export function evaluateStrategyScript(
   let confidenceExpr: Expr | null = null
   let expiryExpr: Expr | null = null
   try {
-    for (const stmt of ast.stmts) {
+    const run = (stmts: Stmt[]): void => {
+    for (const stmt of stmts) {
+      if (stmt.kind === 'if') {
+        // first true branch wins; the rest are NOT evaluated (so a guarded reading in a later branch cannot error); else runs when none matched
+        let matched = false
+        for (const b of stmt.branches) {
+          const v = truthy(evalExpr(b.cond, env, ctx))
+          trace.push(`if ${explainExpr(b.cond, env, ctx).text} -> ${v}`)
+          if (v) {
+            matched = true
+            run(b.body)
+            break
+          }
+        }
+        if (!matched && stmt.elseBody) {
+          trace.push('else')
+          run(stmt.elseBody)
+        }
+        continue
+      }
       if (stmt.kind === 'let') {
         env[stmt.name] = evalExpr(stmt.expr, env, ctx)
         continue
@@ -4551,6 +4652,8 @@ export function evaluateStrategyScript(
         continue
       }
     }
+    }
+    run(ast.stmts)
   } catch (err) {
     return { direction: 'none', confidence: 0, trace, error: err instanceof Error ? err.message : String(err) }
   }
