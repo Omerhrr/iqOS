@@ -22,7 +22,7 @@
 // their own note text and tooltip.
 import { useEffect, useState } from 'react'
 import type { AccountState, AssetRow, Position, SmcKind, SmcScanResponse, SmcSignal, Timeframe } from '@/lib/os/client'
-import { fmtPrice, getSmcScan, osGet } from '@/lib/os/client'
+import { fmtPrice, getSmcScan, getDayLevels, osGet, type DayLevelsResponse } from '@/lib/os/client'
 import TradeTicket, { type TicketPrefill } from './TradeTicket'
 
 interface SmcPanelProps {
@@ -52,15 +52,21 @@ const KIND_LABEL: Record<SmcKind, string> = {
   CRT: 'CRT',
   POWER_OF_3: 'Power of 3',
   SILVER_BULLET: 'Silver Bullet',
+  EQH_EQL: 'Equal Highs/Lows',
+  REJECTION_BLOCK: 'Rejection Block',
+  INDUCEMENT: 'Inducement',
 }
 
 const KIND_TOOLTIP: Partial<Record<SmcKind, string>> = {
+  EQH_EQL: 'Context only, not counted in the SMC lean. Two or more swing highs (or lows) within 0.15 ATR of each other form a pool of resting stops just past them; shown while unswept. The direction is only the SIDE the pool sits on (a liquidity magnet), not a reversal call.',
+  REJECTION_BLOCK: 'Context only, not counted in the SMC lean. A swing high/low candle with a wick at least twice its body and half its range (on a 0.8+ ATR candle). The zone is the wick; the entry is the body edge, not the tip. Dropped when a later bar closes beyond the tip.',
+  INDUCEMENT: 'Context only, not counted in the SMC lean. One mechanical reading: inside a trend, a pullback builds a minor swing low (high) after the latest major high (low); a bar that wicks through it and closes back on the trend side has taken the bait. Not a unique definition.',
   KRM: 'This codebase’s own interpretation: KRM has no single universally-agreed ICT definition. Implemented as a classic one-bar "Key Reversal Mark" - a new local extreme that closes back through the prior candle’s midpoint.',
   SILVER_BULLET: 'AM kill-zone proxy: real ICT Silver Bullet is anchored to ~10-11am New York time. This kernel has no DST-aware timezone conversion, so this is a FIXED UTC-hour approximation of 10-11am EST (standard time) - it silently drifts an hour off during US daylight saving.',
   POWER_OF_3: 'Bar-count proxy, not session-anchored: real AMD splits a trading DAY into Asia/London/NY. This kernel has no session-grouped candles, so it instead splits the trailing window into three equal thirds and asks the same structural question.',
 }
 
-const ALL_KINDS: SmcKind[] = ['BOS', 'CHOCH', 'LIQUIDITY_SWEEP', 'ORDER_BLOCK', 'BREAKER_BLOCK', 'FVG', 'IFVG', 'OTE', 'SUPPLY_DEMAND', 'SUPPORT_RESISTANCE', 'BREAKOUT', 'CRT', 'POWER_OF_3', 'SILVER_BULLET', 'KRM']
+const ALL_KINDS: SmcKind[] = ['BOS', 'CHOCH', 'LIQUIDITY_SWEEP', 'ORDER_BLOCK', 'BREAKER_BLOCK', 'FVG', 'IFVG', 'OTE', 'SUPPLY_DEMAND', 'SUPPORT_RESISTANCE', 'BREAKOUT', 'CRT', 'POWER_OF_3', 'SILVER_BULLET', 'KRM', 'EQH_EQL', 'REJECTION_BLOCK', 'INDUCEMENT']
 
 function dirColor(d: 'bullish' | 'bearish', part: 'text' | 'bg' | 'border' = 'text'): string {
   const map = {
@@ -143,6 +149,23 @@ export default function SmcPanel({ asset, tf, closedTick, onError, assets, price
       clearInterval(t)
     }
   }, [ticketAvailable, ticketOpen])
+  const [levels, setLevels] = useState<DayLevelsResponse | null>(null)
+  useEffect(() => {
+    let alive = true
+    setLevels(null)
+    const load = () =>
+      getDayLevels(asset, '5m')
+        .then((d) => {
+          if (alive) setLevels(d)
+        })
+        .catch(() => {})
+    void load()
+    const t = setInterval(load, 30_000)
+    return () => {
+      alive = false
+      clearInterval(t)
+    }
+  }, [asset])
   const [busy, setBusy] = useState(false)
   const [filter, setFilter] = useState<Set<SmcKind>>(new Set())
   const [onlyActive, setOnlyActive] = useState(true)
@@ -253,6 +276,32 @@ export default function SmcPanel({ asset, tf, closedTick, onError, assets, price
           </button>
         ))}
       </div>
+
+      {levels && levels.ok && levels.levels && levels.levels.length > 0 && (
+        <div className="border-b border-[#1c2739] px-2 py-1" title={levels.note}>
+          <div className="mb-0.5 font-mono text-[8px] uppercase tracking-wider text-[#4b5a72]">
+            liquidity levels (5m, UTC sessions) - nearest unswept: above {levels.nearestAbove ? `${levels.nearestAbove.label} ${levels.nearestAbove.distanceAtr.toFixed(1)} ATR` : 'none'} · below{' '}
+            {levels.nearestBelow ? `${levels.nearestBelow.label} ${Math.abs(levels.nearestBelow.distanceAtr).toFixed(1)} ATR` : 'none'}
+          </div>
+          <div className="flex flex-wrap gap-1">
+            {levels.levels.map((l) => {
+              const live = !l.swept
+              const rej = l.rejectedBar !== null
+              return (
+                <span
+                  key={l.id}
+                  title={`${l.label} (${l.from}) ${l.swept ? (rej ? 'swept, then closed back inside - stop-hunt read' : 'swept') : 'not swept yet'}`}
+                  className={`rounded border px-1.5 py-px font-mono text-[8.5px] ${
+                    live ? 'border-cyan-500/30 text-cyan-300' : rej ? 'border-amber-500/40 text-amber-300' : 'border-[#1c2739] text-[#4b5a72] line-through'
+                  }`}
+                >
+                  {l.label} {fmtPrice(l.price, asset)} <span className="opacity-70">{l.distanceAtr >= 0 ? '+' : ''}{l.distanceAtr.toFixed(1)}</span>
+                </span>
+              )
+            })}
+          </div>
+        </div>
+      )}
 
       <div className="min-h-0 flex-1 space-y-1.5 overflow-auto p-2">
         {!data && busy && <div className="p-2 text-[10px] text-[#4b5a72]">scanning structure…</div>}

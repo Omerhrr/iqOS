@@ -2869,7 +2869,7 @@ function MetaTraderDialog({
           <DialogDescription className="text-[11px] text-[#7c8aa5]">
             Like the auto-trader, but without its frictions: one flat stake, no pacing/cooldown/payout-floor/vol-gate/
             watchlist/compounding - just a confidence floor. Trades a saved meta-strategy spec, the Oracle, Accute, the
-            SMC scanner&apos;s current-candle ("now") read, or any one of its 15 individual concepts (FVG, OTE, KRM, ...)
+            SMC scanner&apos;s current-candle ("now") read, or any one of its 18 individual concepts (FVG, OTE, KRM, ...)
             as its own standalone source. Only ever trades while the OS is in NO-HUMAN mode. Sentinel + the kill switch +
             risk limits still govern every order - those never get skipped.
           </DialogDescription>

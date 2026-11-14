@@ -245,6 +245,10 @@ import { computeOutcomeMemory } from './outcomememory'
 import { readSignalCore, SIGNAL_MIN_BARS, type SignalCore } from './signalcore'
 import { AMD_MIN_BARS, readAmd, type AmdRead } from './mslamd'
 import { WYCKOFF_MIN_BARS, readWyckoff, type WyckoffRead } from './mslwyckoff'
+import { SMCX_MIN_BARS, readSmcx, type SmcxRead } from './mslsmcx'
+import { smtDivergence } from './smt'
+import { readBlocks, readJudas, readSoup, type BlockRead, type JudasRead } from './mslpatterns'
+import { MMXM_MIN_BARS, readMmxm, type MmxmRead } from './mslmmxm'
 import { PV_MIN_BARS, readPv, type PvRead } from './mslpv'
 import {
   FIB_MIN_BARS, FIB_RATIOS, VOL_MIN_BARS, fibSwing, fibRetr, fibExt, fibPos, fibArc, fibTimeZone, readPivots, readVol, type FibSwing,
@@ -382,6 +386,9 @@ export interface MslSeriesCtx {
    * comes from the gaps). Every production producer fills it in; a context
    * without it makes `signal.*` fail closed. */
   time?: number[]
+  /** `smt.*`: resolves ANOTHER pair's series on this evaluation's timeframe (live: the partner's closed candles; backtest: the partner candles up to
+   * the evaluated bar). Absent = the context has no partner support and `smt.*` fails closed. */
+  partner?: (asset: string) => MslSeriesCtx | undefined
 }
 
 /** Bundles the three things every evalExpr/explainExpr call threads through
@@ -2989,6 +2996,214 @@ function pvMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | und
   }
 }
 
+/** `smcx.*` - the three SMC CONTEXT concepts as candle-derived primitives (analytics/mslsmcx.ts): equal highs/lows pools, rejection blocks,
+ * inducement. Works in meta_strategy_eval, the traders AND meta_strategy_backtest (unlike the bare `smc:<KIND>` verdict sources, which read
+ * none in a backtest). Needs 60+ closed bars with real timestamps.
+ *   ok()
+ *   eqhNear(k?) / eqlNear(k?)   an unswept equal-highs pool above / equal-lows pool below within k ATR of price (default 1)
+ *   eqhDist() / eqlDist()       ATR distance to that pool (99 when none)      eqhTouches() / eqlTouches()  swing touches in the pool (0 when none)
+ *   rejBull() / rejBear()       a still-valid bullish / bearish rejection block exists (not closed through)
+ *   rejBullIn() / rejBearIn()   price is currently inside that block's wick zone       rejAgo(dir?)  bars since the newest block of dir ("bull"|"bear"), 99 when none
+ *   idmBull(n?) / idmBear(n?)   an inducement take in that direction within the last n bars (default 3, max 10)
+ *   idmAgo(dir)                 bars since the newest take of dir ("bull"|"bear"), 99 when none
+ *   pdOk() / pdPos() / pdSpanAtr()   the dealing range between the latest confirmed swing high and low (>= 1.5 ATR wide): pdPos 0 = range low (deep
+ *                               discount), 0.5 = equilibrium, 1 = range high (deep premium), not clamped; premium(k?) = pdPos > k, discount(k?) = pdPos < k (k default 0.5)
+ *   mitBull()/mitBear()  a still-valid MITIGATION block: after a lower low (higher high), a swing low (high) FAILS to undercut (exceed) it and a close breaks
+ *                               the intervening swing high (low) within 30 bars; the block = the last opposing candle before the break (its full range)
+ *   propBull()/propBear()       a PROPULSION block: a >= 0.7 ATR candle that taps an unviolated same-direction order block and closes beyond it (zone = its body)
+ *   mitBullIn()/mitBearIn()/propBullIn()/propBearIn()  price inside that zone      mitAgo(dir)/propAgo(dir)  bars since it completed (99 = none)
+ *   viBull(minAtr?)/viBear(minAtr?)  an unfilled VOLUME IMBALANCE (bodies do not touch, wicks overlap) of >= minAtr ATR (default 0.05) within 40 bars;
+ *                               viBullIn/viBearIn(minAtr?), viAgo(dir, minAtr?), viSizeAtr(dir, minAtr?)
+ *   judasBull(session?, k?)/judasBear(session?, k?)  JUDAS SWING at the session open (0 day open 00:00 UTC, 1 London 07:00 (default), 2 New York 12:00): a fake
+ *                               move >= 0.75 ATR one way inside 3 hours, then a close back through the open; bull = fake down then up; true within k bars (default 6)
+ *                               of the reclaim; judasAgo(session?) bars since (99 = none). Needs timestamps.
+ *   soupBull(period?, k?)/soupBear(period?, k?)  TURTLE SOUP: a bar takes out the lowest low (highest high) of the prior period bars (default 20, extreme >= 4 bars
+ *                               old) and closes back inside, within the last k bars (default 1); soupAgo(dir, period?) bars since (99 = none) */
+const smcxCache = new WeakMap<MslSeriesCtx, SmcxRead | null>()
+const smcxCandlesCache = new WeakMap<MslSeriesCtx, Candle[]>()
+const smcxBlocksCache = new WeakMap<MslSeriesCtx, Map<number, BlockRead | null>>()
+const smcxMiscCache = new WeakMap<MslSeriesCtx, Map<string, unknown>>()
+function smcxCandles(s: MslSeriesCtx): Candle[] {
+  let c = smcxCandlesCache.get(s)
+  if (!c) {
+    const n = s.close.length
+    const hasTime = !!s.time && s.time.length === n
+    c = new Array(n)
+    for (let i = 0; i < n; i++) c[i] = { time: hasTime ? s.time![i] : i, open: s.open[i], high: s.high[i], low: s.low[i], close: s.close[i], volume: s.volume[i] }
+    smcxCandlesCache.set(s, c)
+  }
+  return c
+}
+function smcxMemo<T>(s: MslSeriesCtx, key: string, f: () => T): T {
+  let m = smcxMiscCache.get(s)
+  if (!m) { m = new Map(); smcxMiscCache.set(s, m) }
+  if (!m.has(key)) m.set(key, f())
+  return m.get(key) as T
+}
+function smcxMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const s = requireSeries(ctx, tf)
+  let m = smcxCache.get(s)
+  if (m === undefined) {
+    const n = s.close.length
+    const hasTime = !!s.time && s.time.length === n
+    const candles: Candle[] = new Array(n)
+    for (let i = 0; i < n; i++) candles[i] = { time: hasTime ? s.time![i] : i, open: s.open[i], high: s.high[i], low: s.low[i], close: s.close[i], volume: s.volume[i] }
+    m = readSmcx(candles)
+    smcxCache.set(s, m)
+  }
+  if (name === 'ok') return m !== null
+  if (!m) throw new MslRuntimeError(`smcx.${name}() needs at least ${SMCX_MIN_BARS} closed bars - history is too thin`)
+  const dirArg = (): 'bull' | 'bear' => {
+    const d = args.length ? String(args[0]).toLowerCase() : ''
+    if (d === 'bull' || d === 'bear') return d
+    throw new MslRuntimeError(`smcx.${name}() needs "bull" or "bear"`)
+  }
+  const win = (): number => (args.length ? Math.max(0, Math.min(10, Math.round(asNum(args[0])))) : 3)
+  switch (name) {
+    case 'eqhNear': return !!m.eqh && m.eqh.distAtr <= (args.length ? asNum(args[0]) : 1)
+    case 'eqlNear': return !!m.eql && m.eql.distAtr <= (args.length ? asNum(args[0]) : 1)
+    case 'eqhDist': return m.eqh ? m.eqh.distAtr : 99
+    case 'eqlDist': return m.eql ? m.eql.distAtr : 99
+    case 'eqhTouches': return m.eqh ? m.eqh.touches : 0
+    case 'eqlTouches': return m.eql ? m.eql.touches : 0
+    case 'rejBull': return m.rejBull !== null
+    case 'rejBear': return m.rejBear !== null
+    case 'rejBullIn': return !!m.rejBull && m.rejBull.inZone
+    case 'rejBearIn': return !!m.rejBear && m.rejBear.inZone
+    case 'rejAgo': { const d = dirArg(); const r = d === 'bull' ? m.rejBull : m.rejBear; return r ? r.barsAgo : 99 }
+    case 'idmBull': return m.idmBull !== null && m.idmBull <= win()
+    case 'idmBear': return m.idmBear !== null && m.idmBear <= win()
+    case 'mitBull': case 'mitBear': case 'mitBullIn': case 'mitBearIn': case 'mitAgo':
+    case 'propBull': case 'propBear': case 'propBullIn': case 'propBearIn': case 'propAgo':
+    case 'viBull': case 'viBear': case 'viBullIn': case 'viBearIn': case 'viAgo': case 'viSizeAtr': {
+      const isVi = name.startsWith('vi')
+      const dirMeth = name.endsWith('Ago') || name === 'viSizeAtr'
+      const minAtr = isVi ? (dirMeth ? (args.length > 1 ? asNum(args[1]) : 0.05) : args.length ? asNum(args[0]) : 0.05) : 0.05
+      let byMin = smcxBlocksCache.get(s)
+      if (!byMin) { byMin = new Map(); smcxBlocksCache.set(s, byMin) }
+      let b = byMin.get(minAtr)
+      if (b === undefined) { b = readBlocks(smcxCandles(s), minAtr); byMin.set(minAtr, b) }
+      if (!b) throw new MslRuntimeError(`smcx.${name}() needs at least 60 closed bars`)
+      const fam = name.slice(0, name.search(/[A-Z]/)) as 'mit' | 'prop' | 'vi'
+      const pick = (d: 'bull' | 'bear') => (b![`${fam}${d === 'bull' ? 'Bull' : 'Bear'}` as 'mitBull'] as { barsAgo: number; inZone: boolean; sizeAtr?: number } | null)
+      if (name === 'mitAgo' || name === 'propAgo' || name === 'viAgo') { const z = pick(dirArg()); return z ? z.barsAgo : 99 }
+      if (name === 'viSizeAtr') { const z = pick(dirArg()); return z && z.sizeAtr !== undefined ? z.sizeAtr : 0 }
+      const bull = name.includes('Bull')
+      const z = pick(bull ? 'bull' : 'bear')
+      return name.endsWith('In') ? !!z && z.inZone : z !== null
+    }
+    case 'judasBull': case 'judasBear': case 'judasAgo': {
+      const sess = args.length ? Math.round(asNum(args[0])) : 1
+      if (sess !== 0 && sess !== 1 && sess !== 2) throw new MslRuntimeError(`smcx.${name}(session) - session must be 0 (day open 00:00 UTC), 1 (London 07:00) or 2 (New York 12:00)`)
+      if (!s.time || s.time.length !== s.close.length) throw new MslRuntimeError(`smcx.${name}() needs candle timestamps, which this evaluation context does not carry`)
+      const j = smcxMemo<JudasRead | null>(s, `judas${sess}`, () => readJudas(smcxCandles(s), sess as 0 | 1 | 2))
+      if (!j) throw new MslRuntimeError(`smcx.${name}() needs at least 60 closed bars`)
+      const k = args.length > 1 ? Math.max(0, Math.round(asNum(args[1]))) : 6
+      if (name === 'judasAgo') return j.ago
+      return name === 'judasBull' ? j.dir === 1 && j.ago <= k : j.dir === -1 && j.ago <= k
+    }
+    case 'soupBull': case 'soupBear': case 'soupAgo': {
+      const dirKey: 'bull' | 'bear' = name === 'soupAgo' ? dirArg() : name === 'soupBull' ? 'bull' : 'bear'
+      const pIdx = name === 'soupAgo' ? 1 : 0
+      const period = args.length > pIdx ? Math.max(5, Math.min(100, Math.round(asNum(args[pIdx])))) : 20
+      const ago = smcxMemo<number | null>(s, `soup${dirKey}${period}`, () => readSoup(smcxCandles(s), dirKey, period))
+      if (ago === null) throw new MslRuntimeError(`smcx.${name}() needs at least ${period + 6} closed bars`)
+      if (name === 'soupAgo') return ago
+      const k = args.length > pIdx + 1 ? Math.max(1, Math.round(asNum(args[pIdx + 1]))) : 1
+      return ago < k
+    }
+    case 'pdOk': return m.pd !== null
+    case 'pdPos': if (!m.pd) throw new MslRuntimeError('smcx.pdPos() needs a dealing range: a confirmed swing high AND low at least 1.5 ATR apart (gate on smcx.pdOk())'); return m.pd.pos
+    case 'pdSpanAtr': return m.pd ? m.pd.spanAtr : 0
+    case 'premium': return !!m.pd && m.pd.pos > (args.length ? asNum(args[0]) : 0.5)
+    case 'discount': return !!m.pd && m.pd.pos < (args.length ? asNum(args[0]) : 0.5)
+    case 'idmAgo': { const d = dirArg(); const v = d === 'bull' ? m.idmBull : m.idmBear; return v === null ? 99 : v }
+    default:
+      throw new MslRuntimeError(`unknown smcx method "smcx.${name}(...)" - use ok/eqhNear/eqlNear/eqhDist/eqlDist/eqhTouches/eqlTouches/rejBull/rejBear/rejBullIn/rejBearIn/rejAgo/idmBull/idmBear/idmAgo/pdOk/pdPos/pdSpanAtr/premium/discount/mitBull/mitBear/mitBullIn/mitBearIn/mitAgo/propBull/propBear/propBullIn/propBearIn/propAgo/viBull/viBear/viBullIn/viBearIn/viAgo/viSizeAtr/judasBull/judasBear/judasAgo/soupBull/soupBear/soupAgo`)
+  }
+}
+
+/** `smt.*` - SMT divergence between THIS pair and a PARTNER pair (analytics/smt.ts). The partner is the FIRST argument, a quoted ticker:
+ *   smt.bearish("GBPUSD")  / smt.bullish("GBPUSD")   BOOLEAN - one of the two made a new high (low) in the last `recent` bars and the other did not
+ *   smt.dir("GBPUSD")      STRING "bullish" | "bearish" | "none"      smt.ok("GBPUSD")  BOOLEAN - enough aligned bars AND co-moving (corr >= 0.5)
+ *   smt.corr("GBPUSD")     the pair's return correlation before the window
+ *   smt.leads("GBPUSD")    +1 when THIS pair took the extreme (the partner failed), -1 when the PARTNER took it, 0 when no divergence
+ *   optional trailing args: inverse (true for an inversely related pair such as USDCHF), lookback (12-120, default 24), recent (3-60, default 8)
+ * Live and in a single-asset backtest (the backtester is given the partner's candles); NOT in walk-forward / cross-asset runs. Fails closed when
+ * the partner has no data. Gate scripts on smt.ok(partner): a divergence on a pair that is not co-moving is meaningless (the readers return false). */
+function smtMethod(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
+  const s = requireSeries(ctx, undefined)
+  if (!args.length || typeof args[0] !== 'string') throw new MslRuntimeError(`smt.${name}() needs the partner pair as its first argument, e.g. smt.${name}("GBPUSD")`)
+  const partner = String(args[0]).trim()
+  if (!s.partner) throw new MslRuntimeError('smt.*() needs partner-pair candles, which this evaluation context does not carry')
+  const ps = s.partner(partner)
+  if (!ps) throw new MslRuntimeError(`smt.${name}("${partner}") - no candle data for the partner pair "${partner}" (check the ticker, or the pair is not open)`)
+  const toCandles = (x: MslSeriesCtx): Candle[] => {
+    const n = x.close.length
+    const out: Candle[] = new Array(n)
+    for (let i = 0; i < n; i++) out[i] = { time: x.time ? x.time[i] : i, open: x.open[i], high: x.high[i], low: x.low[i], close: x.close[i], volume: x.volume[i] }
+    return out
+  }
+  if (!s.time || !ps.time) throw new MslRuntimeError('smt.*() needs candle timestamps on both pairs to align them')
+  const inverse = args.length > 1 && (args[1] === true || args[1] === 1)
+  const lookback = args.length > 2 ? asNum(args[2]) : undefined
+  const recent = args.length > 3 ? asNum(args[3]) : undefined
+  const r = smtDivergence(toCandles(s), toCandles(ps), { inverse, lookback, recent })
+  switch (name) {
+    case 'ok': return r.ok
+    case 'corr': return r.corr
+    case 'bearish': return r.ok && r.direction === 'bearish'
+    case 'bullish': return r.ok && r.direction === 'bullish'
+    case 'dir': return r.ok ? r.direction : 'none'
+    case 'leads': return !r.ok || r.leader === null ? 0 : r.leader === 'a' ? 1 : -1
+    default:
+      throw new MslRuntimeError(`unknown smt method "smt.${name}(...)" - use ok/corr/bearish/bullish/dir/leads`)
+  }
+}
+
+/** `mmxm.*` - MARKET MAKER MODEL (buy / sell) lifecycle on this pair's closed candles (analytics/mslmmxm.ts): original CONSOLIDATION -> a sell-side
+ * (buy-side) CURVE through the consolidation low (high) -> the smart-money REVERSAL (a close back through the last lower-high / higher-low = market
+ * structure shift) -> the opposite curve back toward the consolidation. Causal (closed bars only), candle-derived, so it works live, in the traders and
+ * in meta_strategy_backtest.
+ *   ok()             60+ bars        model() STRING "buy"|"sell"|"none"        phase() 0 none, 2 curve done / awaiting reversal, 3 reversal just confirmed,
+ *                                    4 reversal curve running, 5 target reached
+ *   buy() / sell()   the model is in phase 3 or 4 (the entry window: reversal confirmed, target not yet reached, still on its side of the invalidation)
+ *   progress()       0..1.5 of the way from the curve extreme to the target     target()  consolidation high (buy) / low (sell)
+ *   invalidation()   the curve extreme (a new extreme beyond it voids the model) mss()     the reversal trigger level (last lower-high / higher-low)
+ *   consolHigh() / consolLow()  the original consolidation range      sinceMss() / sinceExtreme()  bars       swept()  the curve's end also swept a prior low/high */
+const mmxmCache = new WeakMap<MslSeriesCtx, MmxmRead | null>()
+function mmxmMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  void args
+  const s = requireSeries(ctx, tf)
+  let m = mmxmCache.get(s)
+  if (m === undefined) {
+    const n = s.close.length
+    const candles: Candle[] = new Array(n)
+    for (let i = 0; i < n; i++) candles[i] = { time: s.time && s.time.length === n ? s.time[i] : i, open: s.open[i], high: s.high[i], low: s.low[i], close: s.close[i], volume: s.volume[i] }
+    m = readMmxm(candles)
+    mmxmCache.set(s, m)
+  }
+  if (name === 'ok') return m !== null
+  if (!m) throw new MslRuntimeError(`mmxm.${name}() needs at least ${MMXM_MIN_BARS} closed bars - history is too thin`)
+  switch (name) {
+    case 'model': return m.model
+    case 'phase': return m.phase
+    case 'buy': return m.model === 'buy' && (m.phase === 3 || m.phase === 4)
+    case 'sell': return m.model === 'sell' && (m.phase === 3 || m.phase === 4)
+    case 'progress': return m.progress
+    case 'target': return m.target
+    case 'invalidation': return m.invalidation
+    case 'mss': return m.mss
+    case 'consolHigh': return m.consolHigh
+    case 'consolLow': return m.consolLow
+    case 'sinceMss': return m.sinceMss
+    case 'sinceExtreme': return m.sinceExtreme
+    case 'swept': return m.swept
+    default:
+      throw new MslRuntimeError(`unknown mmxm method "mmxm.${name}(...)" - use ok/model/phase/buy/sell/progress/target/invalidation/mss/consolHigh/consolLow/sinceMss/sinceExtreme/swept`)
+  }
+}
+
 /** `renko.*`/`pf.*`/`ha.*`'s shared conversion - renkoBricks()/pointFigure()/
  * heikinAshiSeries() all want a real Candle[] (they only use .time to STAMP
  * their output, never to decide the math - brick/box/HA logic is pure
@@ -4071,6 +4286,22 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
         return pvMethod(e.name, args, ctx, tf)
+      }
+      // `smt.bearish("GBPUSD")` - SMT divergence against a partner pair (see smtMethod above). The partner string is a plain argument, never a timeframe.
+      if (e.obj.t === 'ident' && e.obj.name === 'smt' && !(e.obj.name in env)) {
+        return smtMethod(e.name, e.args.map((a) => evalExpr(a, env, ctx)), ctx)
+      }
+      // `mmxm.buy()` / `mmxm.phase()` - market maker model lifecycle (see mmxmMethod above).
+      if (e.obj.t === 'ident' && e.obj.name === 'mmxm' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return mmxmMethod(e.name, args, ctx, tf)
+      }
+      // `smcx.eqhNear()` / `smcx.rejBull()` / `smcx.idmBull()` - equal highs/lows, rejection blocks, inducement (see smcxMethod above).
+      if (e.obj.t === 'ident' && e.obj.name === 'smcx' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' && !/^(bull|bear)$/i.test(String(args[args.length - 1])) ? (args.pop() as string) : undefined
+        return smcxMethod(e.name, args, ctx, tf)
       }
       // `wyckoff.phase()` / `wyckoff.spring()` - Wyckoff accumulation / distribution schematic (see wyckoffMethod above).
       if (e.obj.t === 'ident' && e.obj.name === 'wyckoff' && !(e.obj.name in env)) {

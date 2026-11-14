@@ -50,6 +50,9 @@ const KIND_LABEL: Record<SmcKind, string> = {
   CRT: 'CRT',
   POWER_OF_3: 'Power of 3',
   SILVER_BULLET: 'Silver Bullet',
+  EQH_EQL: 'Equal Highs/Lows',
+  REJECTION_BLOCK: 'Rejection Block',
+  INDUCEMENT: 'Inducement',
 }
 
 function dirColor(d: 'bullish' | 'bearish', part: 'text' | 'bg' | 'border' = 'text'): string {

@@ -25,7 +25,7 @@ import {
   type UTCTimestamp,
 } from 'lightweight-charts'
 import type { AnalysisResult, Candle, ChartType, ExpirySurfaceResponse, IndicatorSeries, IvHvResponse, NextExpiryPrediction, OtcFootprintResult, OutcomeMemoryResponse, Position, PulseBarRow, PulseBarsResponse, TickBarRow, TickFootprintResult, TicksResponse, Timeframe } from '@/lib/os/client'
-import { chartPriceFormat, fmtPrice, getExpirySurface, getNextExpiry, getOtcFootprint, getOutcomeMemory, getPulseBars, getTickFootprint, osGet, TIMEFRAME_SECONDS } from '@/lib/os/client'
+import { chartPriceFormat, fmtPrice, getDayLevels, getExpirySurface, getNextExpiry, getOtcFootprint, getOutcomeMemory, getPulseBars, getTickFootprint, osGet, TIMEFRAME_SECONDS } from '@/lib/os/client'
 
 interface ChartPanelProps {
   candles: Candle[]
@@ -2725,6 +2725,59 @@ export default function ChartPanel({
     const half = Math.max(((r.to - r.from) / 2) * factor, 1.5)
     ts.setVisibleLogicalRange({ from: center - half, to: center + half })
   }
+  // Liquidity levels overlay (LVL toggle): previous day / week highs & lows, today's range and the latest Asia / London / New York session ranges as
+  // horizontal price lines (red = highs, green = lows, dim dotted = swept, amber = swept then closed back inside). Fetched from the kernel's /levels
+  // (5m history, ~7 days), refreshed every 60s, removed when toggled off, when the asset changes or the series is rebuilt.
+  const [showLevels, setShowLevels] = useState(false)
+  const levelLinesRef = useRef<{ series: AnyPriceSeries; line: IPriceLine }[]>([])
+  useEffect(() => {
+    const clearLines = () => {
+      for (const l of levelLinesRef.current) {
+        try {
+          l.series.removePriceLine(l.line)
+        } catch {
+          // chart already torn down
+        }
+      }
+      levelLinesRef.current = []
+    }
+    if (!showLevels) {
+      clearLines()
+      return
+    }
+    let alive = true
+    const draw = () =>
+      getDayLevels(digitsTicker, '5m')
+        .then((d) => {
+          const series = priceSeriesRef.current
+          if (!alive || !series) return
+          clearLines()
+          if (!d.ok || !d.levels) return
+          for (const l of d.levels) {
+            const isHigh = /HIGH|PDH|PWH/.test(l.id)
+            const rejected = l.rejectedBar !== null
+            const color = l.swept ? (rejected ? '#f59e0b' : '#4b5a72') : isHigh ? '#fb7185' : '#34d399'
+            const line = series.createPriceLine({
+              price: l.price,
+              color,
+              lineWidth: 1,
+              lineStyle: l.swept ? LineStyle.Dotted : LineStyle.Dashed,
+              axisLabelVisible: !l.swept || rejected,
+              title: `${l.id.replace('_', ' ')}${l.swept ? (rejected ? ' (swept, rejected)' : ' (swept)') : ''}`,
+            })
+            levelLinesRef.current.push({ series, line })
+          }
+        })
+        .catch(() => {})
+    void draw()
+    const t = setInterval(draw, 60_000)
+    return () => {
+      alive = false
+      clearInterval(t)
+      clearLines()
+    }
+  }, [showLevels, digitsTicker, chartType])
+
   const fitChart = () => {
     chartRef.current?.timeScale().fitContent()
     chartRef.current?.timeScale().scrollToRealTime()
@@ -2734,6 +2787,15 @@ export default function ChartPanel({
     <div className="relative flex h-full min-h-0 flex-col rounded-lg border border-[#1c2739] bg-[#0b111c]">
       {/* zoom controls (left of the price scale) */}
       <div className="absolute bottom-10 right-[60px] z-10 flex flex-col gap-1">
+        <button
+          onClick={() => setShowLevels((v) => !v)}
+          title="Liquidity levels: previous day / week highs & lows, today's range and the latest Asia / London / New York session ranges (red = highs, green = lows, dim dotted = swept, amber = swept then closed back inside). 5m history, fixed UTC sessions."
+          className={`flex h-6 w-6 items-center justify-center rounded border font-mono text-[8px] font-bold leading-none transition-colors ${
+            showLevels ? 'border-cyan-500/60 bg-cyan-500/15 text-cyan-300' : 'border-[#1c2739] bg-[#0d1420]/90 text-[#7c8aa5] hover:border-cyan-500/40'
+          }`}
+        >
+          LVL
+        </button>
         <button
           onClick={() => zoomBy(0.7)}
           title="Zoom in"

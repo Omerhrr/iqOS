@@ -56,9 +56,12 @@ export type SmcKind =
   | 'CRT'
   | 'POWER_OF_3'
   | 'SILVER_BULLET'
+  | 'EQH_EQL'
+  | 'REJECTION_BLOCK'
+  | 'INDUCEMENT'
 
 /** Every SmcKind, in the same order the union above lists them - the
- * runtime companion to the type, for callers that need to iterate all 15
+ * runtime companion to the type, for callers that need to iterate all 18
  * concepts (plugins/metastrategy.ts building the strategy-language
  * `smc:<KIND>` read map; plugins/metatrader.ts's SMC_KIND_SOURCE could
  * use this too, left as-is to avoid an unrelated diff). */
@@ -78,7 +81,15 @@ export const ALL_SMC_KINDS: readonly SmcKind[] = [
   'CRT',
   'POWER_OF_3',
   'SILVER_BULLET',
+  'EQH_EQL',
+  'REJECTION_BLOCK',
+  'INDUCEMENT',
 ]
+
+/** Context kinds: reported per-kind (smc:<KIND>, the panels) but kept OUT of every aggregate tally - the scan summary, smcNowRead's
+ * aggregate and smcAnyAgrees - so adding them did not change the existing SMC lean, the Signal clock or any saved strategy that reads the
+ * aggregate. EQH_EQL's direction is only the side the liquidity pool sits on (a magnet, not a reversal call). */
+export const TALLY_EXCLUDED: ReadonlySet<SmcKind> = new Set<SmcKind>(['EQH_EQL', 'REJECTION_BLOCK', 'INDUCEMENT'])
 
 export interface SmcSignal {
   kind: SmcKind
@@ -560,6 +571,145 @@ function detectSilverBullet(candles: Candle[], fvgs: FvgZone[], sweeps: SweepEve
 
 // ---------- top-level scan ----------
 
+// ---------- Equal highs / equal lows (resting liquidity pools) ----------
+
+interface EqPool {
+  /** the later swing of the cluster */
+  index: number
+  /** the pool level: the highest (EQH) / lowest (EQL) member, where the stops sit just beyond */
+  level: number
+  side: 'high' | 'low'
+  touches: number
+  swept: boolean
+}
+
+/** Two or more confirmed swing highs (or lows) within `tol` of each other, at least 3 bars apart, form a pool of resting stops just past
+ * them. The pool is "swept" once any later bar trades beyond its level. Only the NEAREST unswept pool per side is returned: the pools
+ * price is still being drawn towards. */
+function detectEqualPools(candles: Candle[], sw: SwingPoint[], atrArr: number[], price: number): EqPool[] {
+  const n = candles.length
+  const a = atrArr[n - 1] > 0 ? atrArr[n - 1] : price * 0.001
+  const tol = 0.15 * a
+  const out: EqPool[] = []
+  for (const side of ['high', 'low'] as const) {
+    const pts = sw.filter((s) => s.type === side && n - 1 - s.index <= MAX_AGE_BARS).sort((x, y) => x.index - y.index)
+    const pools: EqPool[] = []
+    for (let i = 0; i < pts.length; i++) {
+      const members = [pts[i]]
+      for (let j = i + 1; j < pts.length; j++) {
+        if (pts[j].index - members[members.length - 1].index < 3) continue
+        if (Math.abs(pts[j].price - pts[i].price) <= tol) members.push(pts[j])
+      }
+      if (members.length < 2) continue
+      const level = side === 'high' ? Math.max(...members.map((m) => m.price)) : Math.min(...members.map((m) => m.price))
+      const last = members[members.length - 1]
+      let swept = false
+      for (let k = last.index + 1; k < n; k++) {
+        if (side === 'high' ? candles[k].high > level : candles[k].low < level) { swept = true; break }
+      }
+      pools.push({ index: last.index, level, side, touches: members.length, swept })
+    }
+    const live = pools.filter((p) => !p.swept)
+    if (!live.length) continue
+    live.sort((x, y) => Math.abs(x.level - price) - Math.abs(y.level - price))
+    out.push(live[0])
+  }
+  return out
+}
+
+// ---------- Rejection blocks (long wick at a swing extreme) ----------
+
+interface RejBlock {
+  index: number
+  direction: SmcDirection
+  /** the zone is the wick: from the body edge (the entry) to the wick tip */
+  top: number
+  bottom: number
+}
+
+/** A confirmed swing high (low) whose candle has an upper (lower) wick at least twice its body and at least 0.5 of its range, on a
+ * candle of at least 0.8 ATR. Bearish at highs, bullish at lows. Valid until a later bar CLOSES beyond the wick tip. The entry is the
+ * body/wick boundary, not the tip. */
+function detectRejectionBlocks(candles: Candle[], sw: SwingPoint[], atrArr: number[]): RejBlock[] {
+  const out: RejBlock[] = []
+  const n = candles.length
+  for (const s of sw) {
+    if (n - 1 - s.index > 40) continue
+    const k = candles[s.index]
+    const range = k.high - k.low
+    const a = atrArr[s.index]
+    if (!(range > 0) || !(a > 0) || range < 0.8 * a) continue
+    const body = Math.abs(k.close - k.open)
+    const bodyTop = Math.max(k.open, k.close)
+    const bodyBot = Math.min(k.open, k.close)
+    if (s.type === 'high') {
+      const wick = k.high - bodyTop
+      if (wick < 0.5 * range || wick < 2 * body) continue
+      let violated = false
+      for (let i = s.index + 1; i < n; i++) if (candles[i].close > k.high) { violated = true; break }
+      if (!violated) out.push({ index: s.index, direction: 'bearish', top: k.high, bottom: bodyTop })
+    } else {
+      const wick = bodyBot - k.low
+      if (wick < 0.5 * range || wick < 2 * body) continue
+      let violated = false
+      for (let i = s.index + 1; i < n; i++) if (candles[i].close < k.low) { violated = true; break }
+      if (!violated) out.push({ index: s.index, direction: 'bullish', top: bodyBot, bottom: k.low })
+    }
+  }
+  return out
+}
+
+// ---------- Inducement (IDM) ----------
+
+interface InducementEvent {
+  index: number
+  direction: SmcDirection
+  /** the minor swing the pullback built (the bait) */
+  level: number
+}
+
+/** One mechanical reading of inducement, in a trend: after the latest MAJOR swing high (low) a pullback builds a MINOR swing low (high)
+ * - the bait early traders place stops beyond. When a later bar wicks through that minor level and closes back on the trend side
+ * (within 3 bars of the wick), the bait is taken: bullish in an up-trend (after a major high), bearish in a down-trend. The trend is the
+ * BOS/CHoCH walk's trend at that bar, and the minor level must still be unbroken by closes before the take. Not a unique definition. */
+function detectInducement(candles: Candle[], sw: SwingPoint[], events: StructureEvent[]): InducementEvent[] {
+  const n = candles.length
+  const minor = swings(highs(candles), lows(candles), 1, 1)
+  const out: InducementEvent[] = []
+  const trendAt = (i: number): SmcDirection | null => {
+    let t: SmcDirection | null = null
+    for (const e of events) { if (e.index <= i) t = e.direction; else break }
+    return t
+  }
+  for (let i = Math.max(5, n - 41); i < n; i++) {
+    const t = trendAt(i)
+    if (!t) continue
+    const k = candles[i]
+    if (t === 'bullish') {
+      const majorHigh = [...sw].reverse().find((s) => s.type === 'high' && s.index + 2 <= i)
+      if (!majorHigh) continue
+      const bait = [...minor].reverse().find((m) => m.type === 'low' && m.index > majorHigh.index && m.index + 1 < i)
+      if (!bait || bait.price >= majorHigh.price) continue
+      if (!(k.low < bait.price && k.close > bait.price)) continue
+      let virgin = true
+      for (let j = bait.index + 2; j < i; j++) if (candles[j].close < bait.price) { virgin = false; break }
+      if (virgin) out.push({ index: i, direction: 'bullish', level: bait.price })
+    } else {
+      const majorLow = [...sw].reverse().find((s) => s.type === 'low' && s.index + 2 <= i)
+      if (!majorLow) continue
+      const bait = [...minor].reverse().find((m) => m.type === 'high' && m.index > majorLow.index && m.index + 1 < i)
+      if (!bait || bait.price <= majorLow.price) continue
+      if (!(k.high > bait.price && k.close < bait.price)) continue
+      let virgin = true
+      for (let j = bait.index + 2; j < i; j++) if (candles[j].close > bait.price) { virgin = false; break }
+      if (virgin) out.push({ index: i, direction: 'bearish', level: bait.price })
+    }
+  }
+  // one take per bait: keep the first bar that took each level
+  const seen = new Set<number>()
+  return out.filter((e) => (seen.has(e.level) ? false : (seen.add(e.level), true)))
+}
+
 const MIN_CANDLES = 60
 /** zones/events older than this are dropped entirely - keeps the payload a
  * readable "what matters right now" list instead of every FVG since boot. */
@@ -696,6 +846,28 @@ export function scanSmc(candles: Candle[]): SmcScanResult | null {
       note: `accumulation/manipulation/distribution over the trailing window confirms ${po3.direction} (bar-count proxy, not session-anchored - see module header)`,
     })
   }
+  const atrNow = atrArr[n - 1] > 0 ? atrArr[n - 1] : price * 0.001
+  for (const p of detectEqualPools(candles, sw, atrArr, price)) {
+    const near = Math.abs(price - p.level) <= atrNow
+    signals.push({
+      kind: 'EQH_EQL', direction: p.side === 'high' ? 'bullish' : 'bearish', level: p.level, index: p.index,
+      barsAgo: near ? 0 : Math.max(1, barsAgo(p.index)), active: near, touches: p.touches,
+      note: `${p.touches} ${p.side === 'high' ? 'equal highs' : 'equal lows'} resting at ${p.level.toFixed(5)} (stops just ${p.side === 'high' ? 'above' : 'below'}), not yet swept` +
+        (near ? ' - price is within 1 ATR of the pool' : ' - price not near it yet') + '; direction = the side of the pool (a magnet, not a reversal call)',
+    })
+  }
+  for (const r of detectRejectionBlocks(candles, sw, atrArr)) {
+    signals.push({
+      kind: 'REJECTION_BLOCK', direction: r.direction, top: r.top, bottom: r.bottom, index: r.index, barsAgo: barsAgo(r.index), active: true,
+      note: `long ${r.direction === 'bearish' ? 'upper' : 'lower'} wick rejected a swing ${r.direction === 'bearish' ? 'high' : 'low'} - entry at the body edge ${(r.direction === 'bearish' ? r.bottom : r.top).toFixed(5)}, not the wick tip`,
+    })
+  }
+  for (const e of detectInducement(candles, sw, events)) {
+    signals.push({
+      kind: 'INDUCEMENT', direction: e.direction, level: e.level, index: e.index, barsAgo: barsAgo(e.index), active: barsAgo(e.index) <= 10,
+      note: `pullback bait at ${e.level.toFixed(5)} taken (wick through, closed back) inside a ${e.direction} trend - one mechanical reading of inducement`,
+    })
+  }
   if (silverBullet) {
     signals.push({
       kind: 'SILVER_BULLET', direction: silverBullet.direction, top: silverBullet.top, bottom: silverBullet.bottom, index: n - 1, barsAgo: 0, active: true,
@@ -703,7 +875,7 @@ export function scanSmc(candles: Candle[]): SmcScanResult | null {
     })
   }
 
-  const active = signals.filter((s) => s.active)
+  const active = signals.filter((s) => s.active && !TALLY_EXCLUDED.has(s.kind))
   const bullish = active.filter((s) => s.direction === 'bullish').length
   const bearish = active.filter((s) => s.direction === 'bearish').length
   const total = bullish + bearish
@@ -756,7 +928,7 @@ export function smcSummaryScore(result: SmcScanResult | null): number {
  * this exclusion only affects the aggregate. */
 export function smcNowRead(result: SmcScanResult, onlyKind?: SmcKind): { direction: 'call' | 'put' | 'none'; confidence: number; note: string } {
   const allNow = result.signals.filter((s) => s.barsAgo === 0)
-  const now = onlyKind ? allNow : allNow.filter((s) => s.kind !== 'SUPPORT_RESISTANCE')
+  const now = onlyKind ? allNow : allNow.filter((s) => s.kind !== 'SUPPORT_RESISTANCE' && !TALLY_EXCLUDED.has(s.kind))
   const pool = onlyKind ? now.filter((s) => s.kind === onlyKind) : now
   if (pool.length === 0) return { direction: 'none', confidence: 0, note: 'nothing hit this candle' }
   const bullish = pool.filter((s) => s.direction === 'bullish').length
@@ -793,7 +965,7 @@ export function smcNowRead(result: SmcScanResult, onlyKind?: SmcKind): { directi
  * against" convention smcNowRead uses. */
 export function smcAnyAgrees(result: SmcScanResult, direction: 'call' | 'put'): { agrees: boolean; confidence: number; note: string } {
   const allNow = result.signals.filter((s) => s.barsAgo === 0)
-  const now = allNow.filter((s) => s.kind !== 'SUPPORT_RESISTANCE')
+  const now = allNow.filter((s) => s.kind !== 'SUPPORT_RESISTANCE' && !TALLY_EXCLUDED.has(s.kind))
   if (now.length === 0) return { agrees: false, confidence: 0, note: 'nothing hit this candle' }
   const wantSide: SmcDirection = direction === 'call' ? 'bullish' : 'bearish'
   const agreeing = now.filter((s) => s.direction === wantSide)

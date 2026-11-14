@@ -167,6 +167,9 @@ const SMC_KIND_SOURCE: Record<SmcKind, string> = {
   CRT: 'smc-crt',
   POWER_OF_3: 'smc-power-of-3',
   SILVER_BULLET: 'smc-silver-bullet',
+  EQH_EQL: 'smc-eqh-eql',
+  REJECTION_BLOCK: 'smc-rejection-block',
+  INDUCEMENT: 'smc-inducement',
 }
 /** Reverse lookup: signalSource string -> the one SmcKind it trades. */
 const SOURCE_SMC_KIND: Record<string, SmcKind> = Object.fromEntries(
@@ -194,6 +197,9 @@ export type MetaTraderSource =
   | 'smc-crt'
   | 'smc-power-of-3'
   | 'smc-silver-bullet'
+  | 'smc-eqh-eql'
+  | 'smc-rejection-block'
+  | 'smc-inducement'
   | 'renko-smc'
   | 'renko-smc-majority'
 

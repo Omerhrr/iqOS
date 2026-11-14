@@ -130,6 +130,9 @@ const SMC_KIND_SHORT: Record<string, string> = {
   CRT: 'CRT',
   POWER_OF_3: 'Po3',
   SILVER_BULLET: 'SB',
+  EQH_EQL: 'EQ',
+  REJECTION_BLOCK: 'Rej',
+  INDUCEMENT: 'IDM',
 }
 
 /** What specifically hit on the CURRENT (still-forming) candle - every SMC

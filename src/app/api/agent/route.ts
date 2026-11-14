@@ -950,6 +950,26 @@ const TOOLS: ToolSpec[] = [
     run: () => corePost('/brain_trader_restart', {}),
   },
   {
+    name: 'day_levels',
+    description: 'Liquidity map for one pair: previous UTC day high/low (PDH/PDL), today high/low so far, previous week high/low (PWH/PWL) and the latest Asia / London / New York session ranges (fixed UTC hours, no DST). Each level has its price, signed ATR distance, swept flag and the latest bar that took it and closed back inside (a stop-hunt read), plus the nearest UNSWEPT level above and below price (the likely draws). Reads up to 2200 bars of tf (default 5m, about 7 days; a level only appears when the data covers it). Descriptive, not a forecast, no measured edge.',
+    args: '{"asset": "EURUSD", "tf": "5m"}',
+    run: (a) => coreGet(`/levels?asset=${encodeURIComponent(String(a.asset ?? ''))}&tf=${encodeURIComponent(String(a.tf ?? '5m'))}`),
+  },
+  {
+    name: 'smt_scan',
+    description: 'SMT divergence (Smart Money Technique) between two co-moving pairs: one makes a new extreme in the last few bars (recent vs the prior lookback window, closed candles) and its partner fails to confirm - bearish at highs, bullish at lows. Give a+b+tf for one pair (inverse:true for an inversely related pair like EURUSD vs USDCHF), or just tf for the board of default pairs (EURUSD/GBPUSD, AUDUSD/NZDUSD, EURUSD/USDCHF inverse, the OTC twins, EURJPY/GBPJPY, XAUUSD/XAGUSD) that are open. Refuses pairs whose return correlation before the window is below 0.5. Descriptive only, no measured edge.',
+    args: '{"a": "EURUSD", "b": "GBPUSD", "tf": "1m", "lookback": 24, "recent": 8, "inverse": false}',
+    run: (a) => {
+      const p = new URLSearchParams()
+      p.set('tf', String(a.tf ?? '1m'))
+      if (a.a && a.b) { p.set('a', String(a.a)); p.set('b', String(a.b)) }
+      if (a.lookback !== undefined) p.set('lookback', String(Number(a.lookback)))
+      if (a.recent !== undefined) p.set('recent', String(Number(a.recent)))
+      if (a.inverse) p.set('inverse', '1')
+      return coreGet(`/smt?${p.toString()}`)
+    },
+  },
+  {
     name: 'pv_scan',
     description: 'Price-vs-volume scan of every open pair on a timeframe: volumeOk (does volume vary), corrAbs/corrRet, tilt, relVol per pair, plus a REAL vs OTC comparison. Closed candles, 30s cache (refresh:true forces). Descriptive, not a forecast - OTC/flat-volume pairs report volumeOk false.',
     args: '{"tf": "1m", "refresh": false}',

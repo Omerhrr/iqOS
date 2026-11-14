@@ -2344,6 +2344,8 @@ export class MetaStrategyService {
         close: candles.map((k) => k.close),
         volume: candles.map((k) => k.volume ?? 0),
         time: candles.map((k) => k.time),
+        // `smt.*`: another pair's closed candles on the SAME timeframe, built on demand (and only for the one pair that was named)
+        partner: (other: string) => (other && other !== asset ? this.scriptSeries(other, tf) : undefined),
       }
     } catch {
       return undefined

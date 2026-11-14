@@ -246,9 +246,22 @@ function applyPayoutRead(reads: Record<string, MslSourceRead>, payout: number | 
   return Object.keys(reads).filter((k) => !(k === 'payout' && payout !== undefined && payout > 0))
 }
 
-function seriesUpTo(candles: Candle[], i: number): MslSeriesCtx {
+function seriesUpTo(candles: Candle[], i: number, partners?: Record<string, Candle[]>): MslSeriesCtx {
   const slice = candles.slice(0, i + 1)
+  const tNow = candles[i].time
   return {
+    partner: partners
+      ? (asset: string): MslSeriesCtx | undefined => {
+          const pc = partners[asset]
+          if (!pc || !pc.length) return undefined
+          // only the partner bars that were already open at the evaluated bar's time: no look-ahead
+          let hi = pc.length
+          while (hi > 0 && pc[hi - 1].time > tNow) hi--
+          if (hi < 40) return undefined
+          const ps = pc.slice(0, hi)
+          return { open: ps.map((c) => c.open), high: ps.map((c) => c.high), low: ps.map((c) => c.low), close: ps.map((c) => c.close), volume: ps.map((c) => c.volume ?? 0), time: ps.map((c) => c.time) }
+        }
+      : undefined,
     open: slice.map((c) => c.open),
     high: slice.map((c) => c.high),
     low: slice.map((c) => c.low),
@@ -281,11 +294,12 @@ function fireSignals(
   lastIdx: number,
   minConfidence: number,
   runId: string,
+  partners?: Record<string, Candle[]>,
 ): FiredSignal[] {
   const fired: FiredSignal[] = []
   try {
     for (let i = warmupBars; i <= lastIdx; i++) {
-      const series = seriesUpTo(candles, i)
+      const series = seriesUpTo(candles, i, partners)
       const seriesFor = (_tf: string): MslSeriesCtx | undefined => undefined // no cross-timeframe history available to a pure candle-array backtest
       const state = { keyPrefix: runId, barTimeSec: candles[i].time }
       const out = evaluateStrategyScript(parsedAst, reads, undefined, series, seriesFor, undefined, state)
@@ -368,6 +382,9 @@ export interface MslBacktestOpts {
    * another backtest started at the exact same moment, never a stale
    * leftover afterward). */
   runId?: string
+  /** `smt.*`: the PARTNER pairs' candles by ticker (same timeframe as `candles`). Each evaluated bar only ever sees partner bars already open at its
+   * time. Single-asset backtests only - walk-forward / cross-asset runs do not forward it, so a script using smt.* fails closed there. */
+  partners?: Record<string, Candle[]>
   /** when supplied (0..1), every trade also gets a `pnl` field (win ->
    * +payout, loss -> -1, per $1 staked) and the result gets `expectancy`/
    * `maxDrawdown`/`netPnl` - Section 11's "payout-aware backtest
@@ -419,7 +436,7 @@ export function backtestMslScript(candles: Candle[], script: string, opts: MslBa
   // horizon's own trade list is then just a cheap re-settlement of the
   // same fired signals, not a re-run of the script.
   const lastIdx = candles.length - 1 - maxExpiryNeeded
-  const fired = fireSignals(candles, parsed.ast, reads, warmupBars, lastIdx, minConfidence, runId)
+  const fired = fireSignals(candles, parsed.ast, reads, warmupBars, lastIdx, minConfidence, runId, opts.partners)
 
   const settle = (bars: number): MslBacktestTrade[] => settleFired(fired, candles, bars, payout)
 

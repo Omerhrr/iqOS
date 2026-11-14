@@ -349,6 +349,9 @@ export type SmcKind =
   | 'CRT'
   | 'POWER_OF_3'
   | 'SILVER_BULLET'
+  | 'EQH_EQL'
+  | 'REJECTION_BLOCK'
+  | 'INDUCEMENT'
 
 export interface SmcSignal {
   kind: SmcKind
@@ -580,6 +583,35 @@ export interface SignalBest {
   leaderboard: SignalCandidate[]
 }
 
+export interface DayLevel {
+  id: string
+  label: string
+  price: number
+  side: 'above' | 'below'
+  distanceAtr: number
+  swept: boolean
+  rejectedBar: number | null
+  from: string
+}
+export interface DayLevelsResponse {
+  ok: boolean
+  error?: string
+  reason?: string
+  asset?: string
+  tf?: string
+  price?: number
+  atr?: number
+  levels?: DayLevel[]
+  nearestAbove?: DayLevel | null
+  nearestBelow?: DayLevel | null
+  note?: string
+}
+
+/** Previous day / week highs & lows, today's range and the latest Asia / London / New York session ranges. */
+export async function getDayLevels(asset: string, tf: string = '5m'): Promise<DayLevelsResponse> {
+  return osGet('/levels', { asset, tf })
+}
+
 export async function getSignal(asset: string, tf: Timeframe): Promise<SignalRead | { ok: false; error: string }> {
   return osGet('/signal', { asset, tf })
 }
@@ -727,6 +759,9 @@ export const ALL_SMC_KINDS = [
   'CRT',
   'POWER_OF_3',
   'SILVER_BULLET',
+  'EQH_EQL',
+  'REJECTION_BLOCK',
+  'INDUCEMENT',
 ] as const
 
 export interface MetaCondition {

@@ -78,6 +78,9 @@ const SMC_LABEL: Record<SmcKind, string> = {
   CRT: 'CRT',
   POWER_OF_3: 'Power of 3',
   SILVER_BULLET: 'Silver Bullet',
+  EQH_EQL: 'Equal Highs/Lows',
+  REJECTION_BLOCK: 'Rejection Block',
+  INDUCEMENT: 'Inducement',
 }
 
 const ago = (bars: number) => (bars <= 0 ? 'now' : bars === 1 ? '1 bar ago' : `${bars} bars ago`)

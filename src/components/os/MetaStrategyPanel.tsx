@@ -108,7 +108,7 @@ const SCRIPT_PLACEHOLDER = `# Meta Strategy Lab script - combine any panel read 
 # nextExpiry (the Next-Expiry Oracle's best pick, honesty-floored),
 # nextExpiry:<E> for a pinned rung (nextExpiry:1 / nextExpiry:2 /
 # nextExpiry:3 / nextExpiry:5 / nextExpiry:15), and
-# smc:<KIND> for any of the 15 SMC concepts (e.g. smc:FVG, smc:BOS,
+# smc:<KIND> for any of the 18 SMC concepts (e.g. smc:FVG, smc:BOS,
 # smc:ORDER_BLOCK...), plus the TICK-DESK engines: tickSmc, tickOracle,
 # tickTechnical, tickFootprint (the raw micro-tick stream, not the
 # close-proxy 'tick'/'footprint'), with tickOracle:<SEC> and
