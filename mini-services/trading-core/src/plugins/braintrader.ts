@@ -282,29 +282,37 @@ export function resolveOutcome(d: BrainDecision, candles: Candle[]): { outcome: 
   return { outcome: won ? 'win' : 'loss', exitPrice: exit }
 }
 
-async function callLlm(appUrl: string, messages: ChatMessage[], opts: { temperature?: number; maxTokens?: number; timeoutMs?: number }): Promise<{ content: string; provider: string; model: string }> {
-  try {
-    const res = await fetch(`${appUrl.replace(/\/$/, '')}/api/ai_trader_decide`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(String(process.env.KERNEL_TOKEN ?? '').trim() ? { 'x-kernel-token': String(process.env.KERNEL_TOKEN).trim() } : {}),
-      },
-      body: JSON.stringify({ messages, ...opts }),
-      signal: AbortSignal.timeout((opts.timeoutMs ?? 30_000) + 5_000),
-    })
-    const data = (await res.json().catch(() => ({}))) as { ok?: boolean; content?: string; provider?: string; model?: string; error?: string }
-    if (!res.ok || !data.ok) throw new Error(data.error ?? `app HTTP ${res.status}`)
-    if (!data.content) throw new Error('app returned no content')
-    return { content: data.content, provider: data.provider ?? 'app', model: data.model ?? '' }
-  } catch (appErr) {
+async function callLlm(appUrls: string[], messages: ChatMessage[], opts: { temperature?: number; maxTokens?: number; timeoutMs?: number }): Promise<{ content: string; provider: string; model: string }> {
+  // Same route + same keys as the Copilot / AI Trader. Nothing to configure: every plausible address of the app is tried in turn
+  // (a network failure moves on to the next; an answer from the app - even an error - is final because the app WAS reached).
+  const errs: string[] = []
+  for (const appUrl of appUrls) {
     try {
-      return await chatComplete({ messages, ...opts })
-    } catch (localErr) {
-      throw new Error(`via app: ${(appErr as Error).message} | via own env: ${(localErr as Error).message}`)
+      const res = await fetch(`${appUrl.replace(/\/$/, '')}/api/ai_trader_decide`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(String(process.env.KERNEL_TOKEN ?? '').trim() ? { 'x-kernel-token': String(process.env.KERNEL_TOKEN).trim() } : {}),
+        },
+        body: JSON.stringify({ messages, ...opts }),
+        signal: AbortSignal.timeout((opts.timeoutMs ?? 30_000) + 5_000),
+      })
+      const data = (await res.json().catch(() => ({}))) as { ok?: boolean; content?: string; provider?: string; model?: string; error?: string }
+      if (!res.ok || !data.ok) throw new AppAnswered(data.error ?? `app HTTP ${res.status}`)
+      if (!data.content) throw new AppAnswered('app returned no content')
+      return { content: data.content, provider: data.provider ?? 'app', model: data.model ?? '' }
+    } catch (e) {
+      if (e instanceof AppAnswered) { errs.push(`${appUrl}: ${e.message}`); break }
+      errs.push(`${appUrl}: ${(e as Error).message}`)
     }
   }
+  try {
+    return await chatComplete({ messages, ...opts })
+  } catch (localErr) {
+    throw new Error(`via app (${errs.join(' | ')}) | via own env: ${(localErr as Error).message}`)
+  }
 }
+class AppAnswered extends Error {}
 
 // ---------------------------------------------------------------- service
 
@@ -312,6 +320,13 @@ export class BrainTraderService {
   private ctx!: KernelContext
   private market!: MarketDataService
   private store!: Store
+  /** every address the app could be at, best first: APP_URL env (set by docker-compose, same as the AI Trader), this trader's override, the URL saved in the AI Trader's settings, the compose service name, localhost */
+  private resolveAppUrl(): string[] {
+    let aiUrl: string | undefined
+    try { const a = this.store.getAiTraderConfig() as { appUrl?: unknown } | null; if (a && typeof a.appUrl === 'string' && a.appUrl) aiUrl = a.appUrl } catch { /* store not ready */ }
+    const list = [process.env.APP_URL, this.config.appUrl, aiUrl, 'http://iqos-web:47311', 'http://127.0.0.1:3000'].filter((u): u is string => !!u)
+    return [...new Set(list)]
+  }
   private config: BrainTraderConfig = { ...DEFAULT_CONFIG }
   private rt: BrainTraderRuntime = { reads: 0, proposals: 0, trades: 0, wins: 0, losses: 0, pnlTotal: 0, openCount: 0, lastTradeTs: 0 }
   private log: BrainDecision[] = []
@@ -624,7 +639,7 @@ export class BrainTraderService {
           this.reviewTimes.push(Date.now())
           const t0 = Date.now()
           try {
-            const res = await callLlm(this.config.appUrl ?? 'http://localhost:3000', buildReviewMessages({ asset, tf: this.config.tf, strategyName: ev.spec.name, script: ev.spec.script ?? '', direction: sig.direction, confidence: sig.confidence, notes: sig.notes, price: last.close, candles, expiriesSec: this.config.expiriesSec, panelLines: this.panelLines(asset), scriptExpiryMin: sig.expiryMin }), { temperature: 0.2, maxTokens: 300, timeoutMs: 30_000 })
+            const res = await callLlm(this.resolveAppUrl(), buildReviewMessages({ asset, tf: this.config.tf, strategyName: ev.spec.name, script: ev.spec.script ?? '', direction: sig.direction, confidence: sig.confidence, notes: sig.notes, price: last.close, candles, expiriesSec: this.config.expiriesSec, panelLines: this.panelLines(asset), scriptExpiryMin: sig.expiryMin }), { temperature: 0.2, maxTokens: 300, timeoutMs: 30_000 })
             const parsed = parseReview(res.content, this.config.expiriesSec)
             if (!parsed) {
               dec.status = 'ai_unavailable'
