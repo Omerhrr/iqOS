@@ -701,6 +701,30 @@ put when gate and stretchedUp and turnDown
 confidence = clamp(55 + 8 * (abs(z) - 2) + 4 * (0.95 - stat.varianceRatio()) * 10, 55, 80)
 `,
   },
+  {
+    id: 'meta:builtin-pv-confirm-absorb',
+    name: 'PV 1: volume-confirmed moves / absorption fade',
+    script: `
+# PV 1: trade what volume CONFIRMS, fade what it does not. Silent on any feed without real volume (OTC / flat).
+let ready = pv.ok() and pv.volumeOk()
+let atr = ind.atr(14)[-1]
+let moveAtr = (ohlc(-1).c - ohlc(-6).c) / atr
+# is volume in this window tied to the SIZE of moves, and is it heavier now than just before?
+let tracksMoves = pv.corrAbs(30) >= 0.2
+let loud = pv.relVol(30) >= 1.1
+let tilt = pv.tilt(10)
+# playbook 1 - confirmed move: price moved >= 0.8 ATR over 5 bars, the volume leaned the same way and is rising -> follow it
+let followUp = moveAtr >= 0.8 and tilt >= 0.35
+let followDown = moveAtr <= -0.8 and tilt <= -0.35
+# playbook 2 - absorption: an extended move (>= 1.2 ATR) whose volume is NOT behind it and whose last bar shows heavy effort for little result -> fade it
+let absorbed = pv.effort() >= 1.8 and abs(tilt) < 0.15
+let fadeUp = moveAtr >= 1.2 and absorbed
+let fadeDown = moveAtr <= -1.2 and absorbed
+call when ready and ((tracksMoves and loud and followUp) or fadeDown)
+put when ready and ((tracksMoves and loud and followDown) or fadeUp)
+confidence = clamp(52 + 10 * abs(tilt) + 6 * (pv.corrAbs(30) - 0.2), 52, 70)
+`,
+  },
 ]
 
 /** Per direct follow-up ("SMC: FVG, SMC: CRT and so on are not on the

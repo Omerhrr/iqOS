@@ -245,6 +245,7 @@ import { computeOutcomeMemory } from './outcomememory'
 import { readSignalCore, SIGNAL_MIN_BARS, type SignalCore } from './signalcore'
 import { AMD_MIN_BARS, readAmd, type AmdRead } from './mslamd'
 import { WYCKOFF_MIN_BARS, readWyckoff, type WyckoffRead } from './mslwyckoff'
+import { PV_MIN_BARS, readPv, type PvRead } from './mslpv'
 import {
   FIB_MIN_BARS, FIB_RATIOS, VOL_MIN_BARS, fibSwing, fibRetr, fibExt, fibPos, fibArc, fibTimeZone, readPivots, readVol, type FibSwing,
 } from './mslfib'
@@ -2873,6 +2874,39 @@ function wyckoffMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string 
   }
 }
 
+/** `pv.*` - PRICE / VOLUME relationship readers (analytics/mslpv.ts) over the last n closed bars (n = first arg, default 30, 10-120). Candle-derived:
+ * works in meta_strategy_eval, the traders AND meta_strategy_backtest. Gate every script on `pv.volumeOk()` - OTC and some feeds carry flat or
+ * missing volume, and then every reader returns 0 instead of inventing a relationship. Describes the CURRENT window; no predictive edge is claimed.
+ *   ok() 40+ bars   volumeOk() volume varies (not flat / mostly zero)
+ *   corrRet(n?) corr(signed bar change, volume)   corrAbs(n?) corr(|bar change|, volume)   corrLevel(n?) corr(close level, volume) (trend-dominated)
+ *   relVol(n?) last 3 bars' volume / mean of the n before   tilt(n?) up-bar volume share minus down-bar volume share, -1..+1
+ *   effort() last bar's relative volume / relative range (> 1 absorption, < 1 easy movement) */
+const pvCache = new WeakMap<MslSeriesCtx, Map<number, PvRead | null>>()
+function pvMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const s = requireSeries(ctx, tf)
+  const n = args.length ? Math.max(10, Math.min(120, Math.round(asNum(args[0])))) : 30
+  let byN = pvCache.get(s)
+  if (!byN) { byN = new Map(); pvCache.set(s, byN) }
+  let m = byN.get(n)
+  if (m === undefined) {
+    m = readPv({ close: s.close, high: s.high, low: s.low, volume: s.volume }, n)
+    byN.set(n, m)
+  }
+  if (name === 'ok') return m !== null
+  if (!m) throw new MslRuntimeError(`pv.${name}() needs at least ${PV_MIN_BARS} closed bars - history is too thin`)
+  switch (name) {
+    case 'volumeOk': return m.volumeOk
+    case 'corrRet': return m.corrRet
+    case 'corrAbs': return m.corrAbs
+    case 'corrLevel': return m.corrLevel
+    case 'relVol': return m.relVol
+    case 'tilt': return m.tilt
+    case 'effort': return m.effort
+    default:
+      throw new MslRuntimeError(`unknown pv method "pv.${name}(...)" - use ok/volumeOk/corrRet/corrAbs/corrLevel/relVol/tilt/effort`)
+  }
+}
+
 /** `renko.*`/`pf.*`/`ha.*`'s shared conversion - renkoBricks()/pointFigure()/
  * heikinAshiSeries() all want a real Candle[] (they only use .time to STAMP
  * their output, never to decide the math - brick/box/HA logic is pure
@@ -3949,6 +3983,12 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
         return amdMethod(e.name, args, ctx, tf)
+      }
+      // `pv.corrRet()` / `pv.tilt()` / `pv.volumeOk()` - price / volume relationship (see pvMethod above).
+      if (e.obj.t === 'ident' && e.obj.name === 'pv' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return pvMethod(e.name, args, ctx, tf)
       }
       // `wyckoff.phase()` / `wyckoff.spring()` - Wyckoff accumulation / distribution schematic (see wyckoffMethod above).
       if (e.obj.t === 'ident' && e.obj.name === 'wyckoff' && !(e.obj.name in env)) {
