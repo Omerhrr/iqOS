@@ -99,7 +99,7 @@ export default function SignalSidePanel({ asset, tf: chartTf, closedTick, ticker
   const tone = actionTone(sig?.action ?? 'wait')
 
   return (
-    <div className="flex flex-col gap-2 rounded-lg border border-[#1c2739] bg-[#0b111c] p-2">
+    <div className="flex h-full min-h-0 flex-col gap-2 overflow-y-auto rounded-lg border border-[#1c2739] bg-[#0b111c] p-2">
       <div className="flex flex-wrap items-center gap-1.5">
         <span className="text-[10px] font-bold uppercase tracking-wider text-cyan-300">Signal</span>
         <AssetPicker tickers={tickers} value={asset} onChange={onSelectAsset} className="w-32" />
