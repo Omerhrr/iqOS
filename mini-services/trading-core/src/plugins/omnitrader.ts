@@ -92,6 +92,8 @@ export interface OmniTraderConfig {
   cooldownSec: number
   /** GLOBAL cooldown in seconds: no new trade on ANY pair for this long after the last trade this trader placed. 0 (default) = off. Independent of the per-asset `cooldownSec`. */
   globalCooldownSec: number
+  /** when true, an order uses the expiry the STRATEGY asked for (`expiry = <minutes>` in its script) instead of the fixed expiry below; a signal whose script set none falls back to the fixed one. Off by default. */
+  useScriptExpiry: boolean
   /** wall-clock poll interval in ms - clamped to [MIN_INTERVAL_MS,
    * MAX_INTERVAL_MS]. This, not candle closes, paces the whole engine. */
   intervalMs: number
@@ -116,6 +118,8 @@ interface OmniCandidate {
   direction: 'call' | 'put'
   confidence: number
   note: string
+  /** the script's own `expiry = <minutes>` for this signal, when it set one */
+  expiryMin?: number
 }
 
 const DEFAULT_OMNI_TRADER: OmniTraderConfig = {
@@ -129,6 +133,7 @@ const DEFAULT_OMNI_TRADER: OmniTraderConfig = {
   marketScope: 'all',
   cooldownSec: 0,
   globalCooldownSec: 0,
+  useScriptExpiry: false,
   intervalMs: DEFAULT_INTERVAL_MS,
 }
 
@@ -201,6 +206,7 @@ export class OmniTraderService {
         marketScope: (saved.marketScope === 'real' || saved.marketScope === 'otc' ? saved.marketScope : 'all') as 'all' | 'real' | 'otc',
         cooldownSec: Math.max(0, num(saved.cooldownSec, DEFAULT_OMNI_TRADER.cooldownSec)),
         globalCooldownSec: Math.max(0, num(saved.globalCooldownSec, DEFAULT_OMNI_TRADER.globalCooldownSec)),
+        useScriptExpiry: saved.useScriptExpiry === true,
         intervalMs: this.clampInterval(num(saved.intervalMs, DEFAULT_OMNI_TRADER.intervalMs)),
         assets: Array.isArray(saved.assets) ? saved.assets.filter((a): a is string => typeof a === 'string') : undefined,
       }
@@ -268,6 +274,7 @@ export class OmniTraderService {
     this.config = { ...this.config, ...patch }
     this.config.cooldownSec = Math.max(0, Math.round(Number(this.config.cooldownSec) || 0))
     this.config.globalCooldownSec = Math.max(0, Math.round(Number(this.config.globalCooldownSec) || 0))
+    this.config.useScriptExpiry = this.config.useScriptExpiry === true
     if (patch.intervalMs !== undefined) {
       this.config.intervalMs = this.clampInterval(this.config.intervalMs)
       if (this.timer) {
@@ -391,7 +398,7 @@ export class OmniTraderService {
       if (!bar) continue // market closed / no forming candle right now - nothing live to feed
       const ticks = this.liveTicks(asset)
       evaluated.add(asset)
-      let result: { result: { direction: 'call' | 'put' | 'none'; confidence: number; notes: string } }
+      let result: { result: { direction: 'call' | 'put' | 'none'; confidence: number; notes: string; expiryMin?: number } }
       try {
         result = metaStrategy.evaluateLive(this.config.metaStrategyId, asset, this.config.tf, { bar, ticks, nowMs })
       } catch (err) {
@@ -404,7 +411,7 @@ export class OmniTraderService {
       const key = SweepEdgeMemory.key(asset, direction)
       qualifying.add(key)
       if (this.sweepEdge.gate(key) !== 'trade') continue // cold sweep or already-held - not a fresh edge
-      rows.push({ asset, direction, confidence, note: notes })
+      rows.push({ asset, direction, confidence, note: notes, ...(result.result.expiryMin !== undefined ? { expiryMin: result.result.expiryMin } : {}) })
     }
 
     this.sweepEdge.endSweep(evaluated, qualifying, this.now())
@@ -452,14 +459,19 @@ export class OmniTraderService {
         }): Promise<{ ok: boolean; error?: string }>
       }>('execution')
       const kind = this.config.kind
+      // useScriptExpiry: the strategy's own `expiry = <minutes>` (whole minutes 1-60) overrides the fixed expiry for this order
+      const scriptMin = this.config.useScriptExpiry && row.expiryMin !== undefined ? row.expiryMin : undefined
+      const fixedBars = this.config.expiryTf ? Math.max(1, Math.round(TIMEFRAME_SECONDS[this.config.expiryTf] / TIMEFRAME_SECONDS[this.config.tf])) : 1
+      const expiryBars = scriptMin !== undefined ? Math.max(1, Math.round((scriptMin * 60) / TIMEFRAME_SECONDS[this.config.tf])) : fixedBars
+      const expirySec = kind === 'blitz' || kind === 'digital' ? (scriptMin !== undefined ? (kind === 'blitz' ? Math.min(60, scriptMin * 60) : scriptMin * 60) : this.config.expirySec) : undefined
       const out = await exec.placeOrder({
         asset: row.asset,
         tf: this.config.tf,
         side: row.direction,
         kind,
         amount: this.config.stake,
-        expiryBars: this.config.expiryTf ? Math.max(1, Math.round(TIMEFRAME_SECONDS[this.config.expiryTf] / TIMEFRAME_SECONDS[this.config.tf])) : 1,
-        expirySec: kind === 'blitz' || kind === 'digital' ? this.config.expirySec : undefined,
+        expiryBars,
+        expirySec,
         mode: exec.accountSource === 'iq' ? 'live' : 'paper',
         strategy: `omni:${this.config.metaStrategyId}`,
         note: OMNI_TRADER_NOTE,

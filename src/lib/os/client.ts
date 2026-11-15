@@ -5331,6 +5331,8 @@ export interface MetaTraderConfig {
   cooldownSec: number
   /** global cooldown: no new trade on any pair for this many seconds after the last one (0 = off) */
   globalCooldownSec: number
+  /** use the strategy script's own `expiry = <minutes>` for each order instead of the fixed expiry (off by default) */
+  useScriptExpiry?: boolean
   stakePlan?: MetaStakePlan
   /** explicit watchlist override - undefined/empty = the same liquid-first
    * default pool, market-wide. Set = scan ONLY these tickers. Same
@@ -5396,6 +5398,8 @@ export interface OmniTraderConfig {
   cooldownSec: number
   /** global cooldown: no new trade on any pair for this many seconds after the last one (0 = off) */
   globalCooldownSec: number
+  /** use the strategy script's own `expiry = <minutes>` for each order instead of the fixed expiry (off by default) */
+  useScriptExpiry?: boolean
   /** wall-clock poll interval in ms, 1000-10000 (default 2000) - THIS,
    * not candle closes, paces the whole engine. */
   intervalMs: number

@@ -55,6 +55,8 @@ export interface MslBacktestTrade {
   entry: number
   exit: number
   win: boolean
+  /** bars this trade was settled against - only set when the run used the script's own `expiry =` (see `scriptExpiry`) */
+  expiryBars?: number
   /** per-$1-staked PnL for this one trade (win -> +payout, loss -> -1) -
    * only present when a `payout` fraction was given (see MslBacktestOpts) -
    * undefined, never a fabricated 0, when no payout was supplied. */
@@ -275,6 +277,8 @@ interface FiredSignal {
   index: number
   direction: 'call' | 'put'
   confidence: number
+  /** the script's own `expiry = <minutes>` for this fire (whole minutes 1-60), when it set one */
+  expiryMin?: number
 }
 
 /** The one expensive pass every exported function in this module shares:
@@ -305,7 +309,7 @@ function fireSignals(
       const out = evaluateStrategyScript(parsedAst, reads, undefined, series, seriesFor, undefined, state)
       if (out.error || out.direction === 'none') continue
       if (out.confidence < minConfidence) continue
-      fired.push({ index: i, direction: out.direction, confidence: out.confidence })
+      fired.push({ index: i, direction: out.direction, confidence: out.confidence, ...(out.expiryMin !== undefined ? { expiryMin: out.expiryMin } : {}) })
     }
   } finally {
     clearMslState(runId)
@@ -317,18 +321,23 @@ function fireSignals(
  * binary settlement rule the module header documents (flat = loss). Shared
  * by every caller below so the settlement math can never drift between
  * the plain/walk-forward/cross-asset entry points. */
-function settleFired(fired: FiredSignal[], candles: Candle[], bars: number, payout: number | undefined): MslBacktestTrade[] {
-  return fired
-    .filter((f) => f.index + bars <= candles.length - 1)
-    .map((f) => {
-      const entry = candles[f.index].close
-      const exit = candles[f.index + bars].close
-      const delta = exit - entry
-      const win = f.direction === 'call' ? delta > 0 : delta < 0
-      const trade: MslBacktestTrade = { index: f.index, time: candles[f.index].time, direction: f.direction, confidence: f.confidence, entry, exit, win }
-      if (payout !== undefined) trade.pnl = win ? payout : -1
-      return trade
-    })
+function settleFired(fired: FiredSignal[], candles: Candle[], bars: number, payout: number | undefined, scriptExpiry?: MslScriptExpiry): MslBacktestTrade[] {
+  const out: MslBacktestTrade[] = []
+  for (const f of fired) {
+    // per-signal horizon: the script's own `expiry = <minutes>` converted to bars of this series, else the run's fixed horizon
+    const own = scriptExpiry && f.expiryMin !== undefined ? Math.max(1, Math.round((f.expiryMin * 60) / scriptExpiry.barSeconds)) : undefined
+    const h = own ?? bars
+    if (f.index + h > candles.length - 1) continue
+    const entry = candles[f.index].close
+    const exit = candles[f.index + h].close
+    const delta = exit - entry
+    const win = f.direction === 'call' ? delta > 0 : delta < 0
+    const trade: MslBacktestTrade = { index: f.index, time: candles[f.index].time, direction: f.direction, confidence: f.confidence, entry, exit, win }
+    if (own !== undefined) trade.expiryBars = own
+    if (payout !== undefined) trade.pnl = win ? payout : -1
+    out.push(trade)
+  }
+  return out
 }
 
 /** Reduce an already-settled trade list to the shared breakdown shape -
@@ -411,6 +420,16 @@ export interface MslBacktestOpts {
    * erroring (the same "silently excluded, never fabricated" convention
    * `expiryBarsList`'s own too-short horizons already use). */
   outOfSampleBars?: number
+  /** settle each fire against the horizon the SCRIPT itself asked for (`expiry = <minutes>`, converted with `barSeconds`), falling back to `expiryBars`
+   * for a fire whose script set none. `maxBars` (default 15) is the longest horizon the run reserves history for: a fire asking for more is
+   * settled only if its forward bar exists, else excluded (never fabricated). Without this the script's `expiry` is ignored, as before. */
+  scriptExpiry?: MslScriptExpiry
+}
+
+export interface MslScriptExpiry {
+  /** seconds per bar of the candle series (TIMEFRAME_SECONDS[tf]) */
+  barSeconds: number
+  maxBars?: number
 }
 
 export function backtestMslScript(candles: Candle[], script: string, opts: MslBacktestOpts = {}): MslBacktestResult {
@@ -422,7 +441,9 @@ export function backtestMslScript(candles: Candle[], script: string, opts: MslBa
   const payout = opts.payout !== undefined && Number.isFinite(opts.payout) ? Math.max(0, opts.payout) : undefined
   const unavailableSources = applyPayoutRead(reads, payout)
   const expiryBarsList = (opts.expiryBarsList ?? []).map((n) => Math.max(1, Math.round(n))).filter((n) => Number.isFinite(n))
-  const maxExpiryNeeded = Math.max(expiryBars, ...expiryBarsList, 1)
+  const scriptExpiry = opts.scriptExpiry && Number.isFinite(opts.scriptExpiry.barSeconds) && opts.scriptExpiry.barSeconds > 0 ? opts.scriptExpiry : undefined
+  const scriptMaxBars = scriptExpiry ? Math.max(1, Math.round(scriptExpiry.maxBars ?? 15)) : 1
+  const maxExpiryNeeded = Math.max(expiryBars, ...expiryBarsList, scriptMaxBars, 1)
   const empty = (error: string): MslBacktestResult => ({ ok: false, error, barsEvaluated: 0, trades: [], wins: 0, losses: 0, winRate: null, avgConfidence: null, unavailableSources })
 
   const parsed = parseStrategyScript(script)
@@ -438,9 +459,9 @@ export function backtestMslScript(candles: Candle[], script: string, opts: MslBa
   const lastIdx = candles.length - 1 - maxExpiryNeeded
   const fired = fireSignals(candles, parsed.ast, reads, warmupBars, lastIdx, minConfidence, runId, opts.partners)
 
-  const settle = (bars: number): MslBacktestTrade[] => settleFired(fired, candles, bars, payout)
+  const settle = (bars: number, own?: MslScriptExpiry): MslBacktestTrade[] => settleFired(fired, candles, bars, payout, own)
 
-  const trades = settle(expiryBars)
+  const trades = settle(expiryBars, scriptExpiry)
   const { wins, losses, winRate, avgConfidence } = breakdownOf(trades, payout)
 
   const result: MslBacktestResult = { ok: true, barsEvaluated: lastIdx - warmupBars + 1, trades, wins, losses, winRate, avgConfidence, unavailableSources }
@@ -519,16 +540,18 @@ export function backtestMslScriptWalkForward(candles: Candle[], script: string, 
 
   const parsed = parseStrategyScript(script)
   if (!parsed.ok) return emptyWf(`script parse error: ${parsed.error}`)
-  if (candles.length < warmupBars + expiryBars + 1) {
-    return emptyWf(`not enough candles - need at least ${warmupBars + expiryBars + 1} (warmup ${warmupBars} + expiry ${expiryBars} + 1), got ${candles.length}`)
+  const scriptExpiry = opts.scriptExpiry && Number.isFinite(opts.scriptExpiry.barSeconds) && opts.scriptExpiry.barSeconds > 0 ? opts.scriptExpiry : undefined
+  const horizon = Math.max(expiryBars, scriptExpiry ? Math.max(1, Math.round(scriptExpiry.maxBars ?? 15)) : 1)
+  if (candles.length < warmupBars + horizon + 1) {
+    return emptyWf(`not enough candles - need at least ${warmupBars + horizon + 1} (warmup ${warmupBars} + expiry ${horizon} + 1), got ${candles.length}`)
   }
 
-  const lastIdx = candles.length - 1 - expiryBars
+  const lastIdx = candles.length - 1 - horizon
   const barsEvaluated = lastIdx - warmupBars + 1
   const folds = Math.max(1, Math.min(barsEvaluated, Math.round(opts.folds ?? 5)))
 
   const fired = fireSignals(candles, parsed.ast, reads, warmupBars, lastIdx, minConfidence, runId)
-  const allTrades = settleFired(fired, candles, expiryBars, payout)
+  const allTrades = settleFired(fired, candles, expiryBars, payout, scriptExpiry)
   const overall = breakdownOf(allTrades, payout)
 
   const foldSize = Math.floor(barsEvaluated / folds)

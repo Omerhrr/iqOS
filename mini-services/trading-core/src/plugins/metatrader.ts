@@ -265,6 +265,8 @@ export interface MetaTraderConfig {
   cooldownSec: number
   /** GLOBAL cooldown in seconds: no new trade on ANY pair for this long after the last trade this trader placed. 0 (default) = off. Independent of the per-asset `cooldownSec`. */
   globalCooldownSec: number
+  /** when true, an order uses the expiry the STRATEGY asked for (`expiry = <minutes>` in its script) instead of the fixed expiry below; a signal whose script set none falls back to the fixed one. Off by default. */
+  useScriptExpiry: boolean
   /** optional compounding plan - undefined (default) = fixed `stake` every trade. */
   stakePlan?: MetaStakePlan
   /** Explicit watchlist override - undefined/empty (default) = the same
@@ -301,6 +303,8 @@ interface MetaTraderRow {
   direction: 'call' | 'put'
   confidence: number
   note: string
+  /** the strategy script's own `expiry = <minutes>` for this signal, when it set one (meta-strategy source only) */
+  expiryMin?: number
 }
 
 const DEFAULT_META_TRADER: MetaTraderConfig = {
@@ -315,6 +319,7 @@ const DEFAULT_META_TRADER: MetaTraderConfig = {
   marketScope: 'all',
   cooldownSec: 0,
   globalCooldownSec: 0,
+  useScriptExpiry: false,
 }
 
 /** The fixed note prefix every Meta Trader position is tagged with -
@@ -422,6 +427,7 @@ export class MetaTraderService {
         marketScope: saved.marketScope === 'real' || saved.marketScope === 'otc' ? saved.marketScope : 'all',
         cooldownSec: Math.max(0, Math.round(num(saved.cooldownSec, DEFAULT_META_TRADER.cooldownSec))),
         globalCooldownSec: Math.max(0, Math.round(num(saved.globalCooldownSec, DEFAULT_META_TRADER.globalCooldownSec))),
+        useScriptExpiry: saved.useScriptExpiry === true,
         stakePlan: MetaTraderService.sanitizeStakePlan(saved.stakePlan),
         assets: Array.isArray(saved.assets)
           ? (saved.assets as unknown[]).map((a) => String(a).trim().toUpperCase()).filter((a) => a.length > 0)
@@ -776,6 +782,7 @@ export class MetaTraderService {
       this.config.marketScope = patch.marketScope
     if (patch.cooldownSec !== undefined) this.config.cooldownSec = Math.max(0, Math.round(num(patch.cooldownSec, this.config.cooldownSec)))
     if (patch.globalCooldownSec !== undefined) this.config.globalCooldownSec = Math.max(0, Math.round(num(patch.globalCooldownSec, this.config.globalCooldownSec)))
+    if (patch.useScriptExpiry !== undefined) this.config.useScriptExpiry = patch.useScriptExpiry === true
     if (patch.stakePlan !== undefined) {
       const next = MetaTraderService.sanitizeStakePlan(patch.stakePlan)
       const changed = JSON.stringify(this.config.stakePlan ?? null) !== JSON.stringify(next ?? null)
@@ -1011,7 +1018,7 @@ export class MetaTraderService {
         if (this.config.direction !== 'both' && result.direction !== this.config.direction) continue
         if (!finGte(result.confidence, this.config.minConfidence)) continue
         const row = this.rowFrom(asset, result.direction, result.confidence, price, `meta-strategy "${id}": ${result.notes}`)
-        if (row) out.push(row)
+        if (row) out.push(result.expiryMin !== undefined ? { ...row, expiryMin: result.expiryMin } : row)
       } catch {
         /* thin history for this pair - try the next */
       }
@@ -1337,6 +1344,11 @@ export class MetaTraderService {
         }): Promise<{ ok: boolean; error?: string }>
       }>('execution')
       const kind = this.config.kind
+      // useScriptExpiry: the strategy's own `expiry = <minutes>` (whole minutes 1-60) overrides the fixed expiry for this order
+      const scriptMin = this.config.useScriptExpiry && row.expiryMin !== undefined ? row.expiryMin : undefined
+      const fixedBars = this.config.expiryTf ? Math.max(1, Math.round(TIMEFRAME_SECONDS[this.config.expiryTf] / TIMEFRAME_SECONDS[this.config.tf])) : 1
+      const expiryBars = scriptMin !== undefined ? Math.max(1, Math.round((scriptMin * 60) / TIMEFRAME_SECONDS[this.config.tf])) : fixedBars
+      const expirySec = scriptMin !== undefined && (kind === 'blitz' || kind === 'digital') ? (kind === 'blitz' ? Math.min(60, scriptMin * 60) : scriptMin * 60) : kind === 'blitz' || kind === 'digital' ? this.config.expirySec : undefined
       const out = await exec.placeOrder({
         asset: row.asset,
         tf: this.config.tf,
@@ -1346,8 +1358,8 @@ export class MetaTraderService {
         // expiryTf unset = track the signal tf 1:1 (exactly 1 bar), same
         // convention as the auto-trader's own expiryTf - only meaningful
         // for binary/turbo; blitz/digital settle on expirySec instead.
-        expiryBars: this.config.expiryTf ? Math.max(1, Math.round(TIMEFRAME_SECONDS[this.config.expiryTf] / TIMEFRAME_SECONDS[this.config.tf])) : 1,
-        expirySec: kind === 'blitz' || kind === 'digital' ? this.config.expirySec : undefined,
+        expiryBars,
+        expirySec,
         mode: exec.accountSource === 'iq' ? 'live' : 'paper',
         strategy: `meta:${this.config.signalSource}${this.config.signalSource === 'meta-strategy' && this.config.metaStrategyId ? `:${this.config.metaStrategyId}` : ''}`,
         note: META_TRADER_NOTE,

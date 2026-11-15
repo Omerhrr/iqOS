@@ -58,6 +58,7 @@ import { reversalEventsPlugin, ReversalEventsService } from './src/plugins/rever
 import { explainerPlugin, ExplainerService } from './src/plugins/explainer'
 import { regimeScanPlugin, RegimeScanService } from './src/plugins/regimescan'
 import { pvScanPlugin, PvScanService } from './src/plugins/pvscan'
+import { rangeMapPlugin, RangeMapService } from './src/plugins/rangemap'
 import { smtScanPlugin, SmtScanService } from './src/plugins/smtscan'
 import { dayLevels } from './src/analytics/daylevels'
 import { signalPlugin, SignalService } from './src/plugins/signal'
@@ -85,7 +86,7 @@ import { volumeVote, combineVolumeFootprint } from './src/analytics/volumefootpr
 import { combineTickVolume } from './src/analytics/tickvolume'
 import { vskMonteCarlo } from './src/analytics/vsk'
 import { tskMonteCarlo } from './src/analytics/tsk'
-import { ALL_TIMEFRAMES, type Candle, type Timeframe, type Position } from './src/types'
+import { ALL_TIMEFRAMES, TIMEFRAME_SECONDS, type Candle, type Timeframe, type Position } from './src/types'
 import { searchInstruments, universeStats, getInstrument } from './src/universe'
 import { listRegistry, computeIndicator, registrySize, getIndicatorDef } from './src/analytics/registry'
 import { detectChartPatterns } from './src/analytics/chart-patterns'
@@ -284,6 +285,7 @@ kernel.register(reversalEventsPlugin)
 kernel.register(explainerPlugin)
 kernel.register(regimeScanPlugin)
 kernel.register(pvScanPlugin)
+kernel.register(rangeMapPlugin)
 kernel.register(smtScanPlugin)
 kernel.register(signalPlugin)
 
@@ -2207,6 +2209,18 @@ const httpServer = createServer(async (req, res) => {
           if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
           const svc = kernel.context().use<PvScanService>('pvscan')
           return json(200, svc.global({ tf: tfv, refresh: q.get('refresh') === '1' }))
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // ---------- Range map (which pairs mean-revert) ----------
+      // POST /range_map_start {tf?,scope?,limit?,assets?,bars?,expiryBars?,zEntry?,payout?} starts a background run (plugins/rangemap.ts) that
+      // backtests ONE fixed OU fade on each pair's archived candles, yielding to the event loop between pairs. GET /range_map returns progress
+      // and, when done, the ranked rows + a watchlist of pairs that hold up. POST /range_map_cancel stops it. Descriptive, in-sample, not a forecast.
+      if (path === '/range_map') {
+        try {
+          return json(200, { ok: true, ...kernel.context().use<RangeMapService>('rangemap').status() })
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }
@@ -4718,6 +4732,21 @@ const httpServer = createServer(async (req, res) => {
 
       // POST /omni_trader_config -> patch Omni Trader's own config (same
       // patch-whatever-fields-are-present contract as /meta_trader_config).
+      if (path === '/range_map_start') {
+        try {
+          const out = kernel.context().use<RangeMapService>('rangemap').begin(body as Record<string, never>)
+          return json(out.ok ? 200 : 400, out)
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+      if (path === '/range_map_cancel') {
+        try {
+          return json(200, { ok: true, cancelled: kernel.context().use<RangeMapService>('rangemap').cancel() })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
       if (path === '/omni_trader_config') {
         try {
           const omniTrader = kernel.context().use<OmniTraderService>('omniTrader')
@@ -5089,6 +5118,8 @@ const httpServer = createServer(async (req, res) => {
           }
           const result = backtestMslScript(candles, script, {
             partners: Object.keys(partners).length ? partners : undefined,
+            // scriptExpiry: true -> settle each fire against the script's own `expiry = <minutes>` (converted to bars of this tf); scriptExpiryMaxBars caps the history reserved for it (default 15)
+            scriptExpiry: body.scriptExpiry === true ? { barSeconds: TIMEFRAME_SECONDS[tfv], maxBars: body.scriptExpiryMaxBars !== undefined ? Number(body.scriptExpiryMaxBars) : undefined } : undefined,
             expiryBars: body.expiryBars !== undefined ? Math.max(1, Math.round(Number(body.expiryBars))) : undefined,
             warmupBars: body.warmupBars !== undefined ? Math.max(1, Math.round(Number(body.warmupBars))) : undefined,
             minConfidence: body.minConfidence !== undefined ? Math.max(0, Math.min(100, Number(body.minConfidence))) : undefined,
@@ -5131,6 +5162,7 @@ const httpServer = createServer(async (req, res) => {
           const candles = market.getCandlesDeep(asset, tfv, candleCount, true)
           const result = backtestMslScriptWalkForward(candles, script, {
             folds: body.folds !== undefined ? Math.max(1, Math.round(Number(body.folds))) : undefined,
+            scriptExpiry: body.scriptExpiry === true ? { barSeconds: TIMEFRAME_SECONDS[tfv], maxBars: body.scriptExpiryMaxBars !== undefined ? Number(body.scriptExpiryMaxBars) : undefined } : undefined,
             expiryBars: body.expiryBars !== undefined ? Math.max(1, Math.round(Number(body.expiryBars))) : undefined,
             warmupBars: body.warmupBars !== undefined ? Math.max(1, Math.round(Number(body.warmupBars))) : undefined,
             minConfidence: body.minConfidence !== undefined ? Math.max(0, Math.min(100, Number(body.minConfidence))) : undefined,

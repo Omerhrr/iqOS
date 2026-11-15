@@ -2751,6 +2751,7 @@ const DEFAULT_META_TRADER_UI: MetaTraderConfig = {
   marketScope: 'all',
   cooldownSec: 0,
   globalCooldownSec: 0,
+  useScriptExpiry: false,
 }
 
 function MetaTraderStrip({
@@ -2969,6 +2970,7 @@ function MetaTraderDialog({
           )}
           <NumField label="Cooldown per pair (s)" value={d.cooldownSec} onChange={(v) => p({ cooldownSec: Math.max(0, Math.round(v)) })} />
           <NumField label="Cooldown, any pair (s)" value={d.globalCooldownSec ?? 0} onChange={(v) => p({ globalCooldownSec: Math.max(0, Math.round(v)) })} />
+          <label className="col-span-2 flex items-center gap-2 text-[10px] text-[#8a99b3]"><input type="checkbox" checked={d.useScriptExpiry === true} onChange={(e) => p({ useScriptExpiry: e.target.checked })} />Use the strategy's own expiry (script <span className="font-mono">expiry = N</span> minutes)</label>
           <div>
             <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Timeframe</Label>
             <select
@@ -3170,6 +3172,7 @@ const DEFAULT_OMNI_TRADER_UI: OmniTraderConfig = {
   marketScope: 'otc',
   cooldownSec: 0,
   globalCooldownSec: 0,
+  useScriptExpiry: false,
   intervalMs: 2000,
 }
 
@@ -3314,6 +3317,7 @@ function OmniTraderDialog({
           <NumField label="Stake $" value={d.stake} onChange={(v) => p({ stake: v })} />
           <NumField label="Cooldown per pair (s)" value={d.cooldownSec} onChange={(v) => p({ cooldownSec: Math.max(0, Math.round(v)) })} />
           <NumField label="Cooldown, any pair (s)" value={d.globalCooldownSec ?? 0} onChange={(v) => p({ globalCooldownSec: Math.max(0, Math.round(v)) })} />
+          <label className="col-span-2 flex items-center gap-2 text-[10px] text-[#8a99b3]"><input type="checkbox" checked={d.useScriptExpiry === true} onChange={(e) => p({ useScriptExpiry: e.target.checked })} />Use the strategy's own expiry (script <span className="font-mono">expiry = N</span> minutes)</label>
 
           <div>
             <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Signal timeframe</Label>

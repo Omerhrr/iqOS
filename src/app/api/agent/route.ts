@@ -975,6 +975,29 @@ const TOOLS: ToolSpec[] = [
     args: '{"tf": "1m", "refresh": false}',
     run: (a) => coreGet(`/pv_scan?tf=${encodeURIComponent(String(a.tf ?? '1m'))}${a.refresh ? '&refresh=1' : ''}`),
   },
+  {
+    name: 'range_map_start',
+    description: 'Start the RANGE MAP (background job, returns at once): backtests ONE fixed mean-reversion fade (OU z >= zEntry, half-life 2-20 bars, RSI confirm) on each pair\'s archived candles to find which pairs actually mean-revert, instead of forcing a fade on a pair that is not ranging. Yields to the event loop between pairs so the kernel stays responsive. Fields (all optional): tf (default 1m), scope all|real|otc, limit (pairs, default 40, max 150), assets (explicit tickers), bars (archived bars per pair, default 1500, max 5000), expiryBars (default 3), zEntry (default 1.5), payout (default 0.85, sets breakeven), scanExpiry (default true: for pairs with 20+ trades also re-run the same fades with expiry = 0.5/1/1.5/2 x the pair half-life and report expiryScan with a suggestedExpiryMin; best-of-five is itself in-sample). Poll range_map for progress and the ranked result. Descriptive and in-sample - say so: it ranks past behaviour, not a forecast.',
+    args: '{"tf": "1m", "scope": "all", "limit": 40, "bars": 1500, "expiryBars": 3, "zEntry": 1.5}',
+    run: (a) =>
+      corePost('/range_map_start', {
+        ...(a.tf !== undefined ? { tf: String(a.tf) } : {}),
+        ...(a.scope !== undefined ? { scope: String(a.scope) } : {}),
+        ...(a.limit !== undefined ? { limit: Number(a.limit) } : {}),
+        ...(Array.isArray(a.assets) ? { assets: (a.assets as unknown[]).map(String) } : {}),
+        ...(a.bars !== undefined ? { bars: Number(a.bars) } : {}),
+        ...(a.expiryBars !== undefined ? { expiryBars: Number(a.expiryBars) } : {}),
+        ...(a.zEntry !== undefined ? { zEntry: Number(a.zEntry) } : {}),
+        ...(a.payout !== undefined ? { payout: Number(a.payout) } : {}),
+        ...(a.scanExpiry !== undefined ? { scanExpiry: a.scanExpiry !== false } : {}),
+      }),
+  },
+  {
+    name: 'range_map',
+    description: 'Progress and result of the range map run: status (idle/running/done/error), progress, then rows per pair (trades, winRate, winRateLow95 = 95% lower bound, win rate of each third of the history, consistent, holdsUp, and the pair\'s current OU read: halfLife, z, stretched, fadeFiresNow), ranked (best lower bound first), watchlist (pairs that hold up - ready to paste into Meta Trader / Omni Trader assets), real-vs-OTC group stats and skipped pairs. holdsUp = 20+ trades, 95% lower bound above breakeven and every third above breakeven. In-sample on archived history with overlapping trades: never present a high win rate over a few dozen trades as an edge.',
+    args: '{}',
+    run: () => coreGet('/range_map'),
+  },
   // ---------- autopilot fleet ----------
   {
     name: 'autopilot_status',
@@ -1467,6 +1490,7 @@ const TOOLS: ToolSpec[] = [
         ...(a.marketScope !== undefined ? { marketScope: String(a.marketScope) } : {}),
         ...(a.cooldownSec !== undefined ? { cooldownSec: Number(a.cooldownSec) } : {}),
         ...(a.globalCooldownSec !== undefined ? { globalCooldownSec: Number(a.globalCooldownSec) } : {}),
+        ...(a.useScriptExpiry !== undefined ? { useScriptExpiry: Boolean(a.useScriptExpiry) } : {}),
         ...(a.stakePlan !== undefined ? { stakePlan: a.stakePlan } : {}),
       }),
   },
@@ -1528,6 +1552,7 @@ const TOOLS: ToolSpec[] = [
         ...(a.marketScope !== undefined ? { marketScope: String(a.marketScope) } : {}),
         ...(a.cooldownSec !== undefined ? { cooldownSec: Number(a.cooldownSec) } : {}),
         ...(a.globalCooldownSec !== undefined ? { globalCooldownSec: Number(a.globalCooldownSec) } : {}),
+        ...(a.useScriptExpiry !== undefined ? { useScriptExpiry: Boolean(a.useScriptExpiry) } : {}),
         ...(a.intervalMs !== undefined ? { intervalMs: Number(a.intervalMs) } : {}),
         ...(a.assets !== undefined ? { assets: a.assets === null ? null : a.assets } : {}),
       }),
