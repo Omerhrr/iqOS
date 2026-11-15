@@ -15,6 +15,9 @@ import { fmtPrice, getRegimeScan } from '@/lib/os/client'
 interface RegimePanelProps {
   closedTick?: number
   onPick?: (asset: string, tf: Timeframe) => void
+  /** left-dock panel mode: one scrollable column, lists stacked, with a close button */
+  compact?: boolean
+  onClose?: () => void
 }
 
 const TFS: Timeframe[] = ['30s', '1m', '2m', '5m', '15m', '30m', '1h']
@@ -78,7 +81,7 @@ function Row({ r, col, tf, onPick }: { r: RegimeBoardRow; col: (typeof COLS)[num
   )
 }
 
-export default function RegimePanel({ closedTick, onPick }: RegimePanelProps) {
+export default function RegimePanel({ closedTick, onPick, compact, onClose }: RegimePanelProps) {
   const [tf, setTf] = useState<Timeframe>('1m')
   const [board, setBoard] = useState<RegimeBoard | null>(null)
   const [err, setErr] = useState<string | null>(null)
@@ -142,7 +145,7 @@ export default function RegimePanel({ closedTick, onPick }: RegimePanelProps) {
   }, [board, hideOtc, q])
 
   return (
-    <div className="flex h-full min-h-0 flex-col rounded-lg border border-[#1c2739] bg-[#0b111c]">
+    <div className={`flex h-full min-h-0 flex-col rounded-lg border border-[#1c2739] bg-[#0b111c] ${compact ? 'overflow-y-auto' : ''}`}>
       <div className="flex flex-wrap items-center gap-2 border-b border-[#1c2739] px-2 py-1.5">
         <span className="text-[10px] font-bold uppercase tracking-wider text-cyan-300">Regime</span>
         <div className="flex overflow-hidden rounded border border-[#1c2739]" role="group" aria-label="timeframe">
@@ -167,16 +170,21 @@ export default function RegimePanel({ closedTick, onPick }: RegimePanelProps) {
           <input type="checkbox" checked={hideOtc} onChange={(e) => setHideOtc(e.target.checked)} className="accent-cyan-400" />
           hide OTC
         </label>
-        <span className="ml-auto font-mono text-[9px] text-[#4b5a72]">
+        {compact && onClose && (
+          <button type="button" onClick={onClose} className="ml-auto rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-rose-500/40 hover:text-rose-300">
+            close
+          </button>
+        )}
+        <span className={`${compact ? 'w-full' : 'ml-auto'} font-mono text-[9px] text-[#4b5a72]`}>
           {board ? `${board.classified} of ${board.universe} open pairs classified${board.noData ? ` · ${board.noData} without enough ${board.tf} history` : ''} · last ${board.window} closed candles` : loading ? 'scanning…' : '—'}
         </span>
       </div>
 
       {err && <div className="border-b border-[#1c2739] px-2 py-1 font-mono text-[9px] text-amber-300">{err}</div>}
 
-      <div className="grid min-h-0 flex-1 grid-cols-2 gap-2 overflow-auto p-2 lg:grid-cols-4">
+      <div className={compact ? 'flex flex-col gap-2 p-2' : 'grid min-h-0 flex-1 grid-cols-2 gap-2 overflow-auto p-2 lg:grid-cols-4'}>
         {COLS.map((c) => (
-          <div key={c.id} className={`flex min-h-[140px] min-w-0 flex-col overflow-hidden rounded-lg border bg-[#0b111c] ${c.border}`}>
+          <div key={c.id} className={`flex min-w-0 flex-col overflow-hidden rounded-lg border bg-[#0b111c] ${compact ? 'max-h-[280px] shrink-0' : 'min-h-[140px]'} ${c.border}`}>
             <div className={`flex items-baseline gap-1.5 border-b border-[#1c2739] px-2 py-1.5 ${c.head}`}>
               <span className={`font-mono text-[11px] font-bold uppercase tracking-wider ${c.tone}`}>{c.title}</span>
               <span className={`rounded border px-1.5 font-mono text-[9px] font-bold ${c.tone} ${c.border}`}>{lists[c.id].length}</span>

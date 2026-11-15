@@ -13,6 +13,7 @@ import IndicatorPicker from '@/components/os/IndicatorPicker'
 import SubPane from '@/components/os/SubPane'
 import SignalPanel from '@/components/os/SignalPanel'
 import SignalSidePanel from '@/components/os/SignalSidePanel'
+import RegimePanel from '@/components/os/RegimePanel'
 import ChartSignalsPanel from '@/components/os/ChartSignalsPanel'
 import YesterdayPanel from '@/components/os/YesterdayPanel'
 import LeadLagPanel from '@/components/os/LeadLagPanel'
@@ -104,7 +105,7 @@ const INDICATOR_STORAGE_KEY = 'iqos.activeIndicators.v1'
 // @ Now", "Cointegration") out of the open strip entirely instead of just
 // closing it each time - it stays hidden across reloads until re-checked in
 // the Panels settings menu. Nothing is deleted, this only gates rendering.
-type PanelId = 'signals' | 'yday' | 'leadlag' | 'distill' | 'cointegration' | 'volarb' | 'triangulation' | 'adxPatternBias' | 'shockPressure' | 'renkoFootprint' | 'renkoFootprintOtc' | 'volumeFootprint' | 'tickVolume' | 'tickSmc' | 'tickOracle' | 'tickTechnical' | 'tickFootprint' | 'tickPatterns' | 'pairCompare' | 'pairSignal' | 'oracle' | 'nextExpiry' | 'nextExpiryGlobal' | 'technical' | 'technicalGlobal' | 'reversal' | 'reversalGlobal' | 'nextGlobal' | 'tempo' | 'tempoGlobal' | 'accute' | 'accuteGlobal' | 'smcRecent' | 'smcGlobal' | 'globalDom' | 'mrcPredict' | 'renkoReversal' | 'kagiReversal' | 'signalPanel' | 'signalPanel'
+type PanelId = 'signals' | 'yday' | 'leadlag' | 'distill' | 'cointegration' | 'volarb' | 'triangulation' | 'adxPatternBias' | 'shockPressure' | 'renkoFootprint' | 'renkoFootprintOtc' | 'volumeFootprint' | 'tickVolume' | 'tickSmc' | 'tickOracle' | 'tickTechnical' | 'tickFootprint' | 'tickPatterns' | 'pairCompare' | 'pairSignal' | 'oracle' | 'nextExpiry' | 'nextExpiryGlobal' | 'technical' | 'technicalGlobal' | 'reversal' | 'reversalGlobal' | 'nextGlobal' | 'tempo' | 'tempoGlobal' | 'accute' | 'accuteGlobal' | 'smcRecent' | 'smcGlobal' | 'globalDom' | 'mrcPredict' | 'renkoReversal' | 'kagiReversal' | 'signalPanel' | 'signalPanel' | 'regimePanel'
 const PANEL_META: { id: PanelId; label: string }[] = [
   { id: 'signals', label: 'Chart Signals' },
   { id: 'yday', label: 'Yesterday @ Now' },
@@ -145,6 +146,7 @@ const PANEL_META: { id: PanelId; label: string }[] = [
   { id: 'renkoReversal', label: 'Renko Reversal' },
   { id: 'kagiReversal', label: 'Kagi Reversal' },
   { id: 'signalPanel', label: 'Signal' },
+  { id: 'regimePanel', label: 'Regime' },
 ]
 const DEFAULT_PANEL_VISIBILITY: Record<PanelId, boolean> = {
   signals: true,
@@ -186,6 +188,7 @@ const DEFAULT_PANEL_VISIBILITY: Record<PanelId, boolean> = {
   renkoReversal: true,
   kagiReversal: true,
   signalPanel: true,
+  regimePanel: true,
 }
 const PANEL_VISIBILITY_STORAGE_KEY = 'iqos.panelVisibility.v1'
 
@@ -299,6 +302,7 @@ export default function OSPage() {
   const [reversalGlobalOpen, setReversalGlobalOpen] = useState(false)
   const [mrcPredictOpen, setMrcPredictOpen] = useState(false)
   const [signalPanelOpen, setSignalPanelOpen] = useState(false)
+  const [regimePanelOpen, setRegimePanelOpen] = useState(false)
   const [renkoReversalOpen, setRenkoReversalOpen] = useState(false)
   const [kagiReversalOpen, setKagiReversalOpen] = useState(false)
   const [smcRecentOpen, setSmcRecentOpen] = useState(false)
@@ -423,6 +427,7 @@ export default function OSPage() {
         else if (id === 'pairCompare') setPairCompareOpen(false)
         else if (id === 'pairSignal') setPairSignalOpen(false)
         else if (id === 'signalPanel') setSignalPanelOpen(false)
+        else if (id === 'regimePanel') setRegimePanelOpen(false)
       }
       return next
     })
@@ -1005,7 +1010,52 @@ export default function OSPage() {
     setMrcPredictOpen(false)
     setRenkoReversalOpen(false)
     setKagiReversalOpen(false)
+    setRegimePanelOpen(false)
     setSignalPanelOpen(true)
+  }, [])
+
+  // Open the Regime panel (the Regime tab's four lists, stacked) - closes every other left-dock panel.
+  const handleOpenRegimePanel = useCallback(() => {
+    setSignalPanelOpen(false)
+    setSignalsOpen(false)
+    setYdayOpen(false)
+    setLeadlagOpen(false)
+    setDistillOpen(false)
+    setCointegrationOpen(false)
+    setVolarbOpen(false)
+    setTriangulationOpen(false)
+    setAdxPatternBiasOpen(false)
+    setShockPressureOpen(false)
+    setRenkoFootprintOpen(false)
+    setRenkoFootprintOtcOpen(false)
+    setVolumeFootprintOpen(false)
+    setTickVolumeOpen(false)
+    setTickSmcOpen(false)
+    setTickOracleOpen(false)
+    setTickTechnicalOpen(false)
+    setTickFootprintOpen(false)
+    setTickPatternsOpen(false)
+    setPairCompareOpen(false)
+    setPairSignalOpen(false)
+    setOracleOpen(false)
+    setNextExpiryOpen(false)
+    setNextExpiryGlobalOpen(false)
+    setTechnicalOpen(false)
+    setTechnicalGlobalOpen(false)
+    setReversalOpen(false)
+    setReversalGlobalOpen(false)
+    setSmcRecentOpen(false)
+    setSmcGlobalOpen(false)
+    setGlobalDomOpen(false)
+    setNextGlobalOpen(false)
+    setTempoOpen(false)
+    setTempoGlobalOpen(false)
+    setAccuteOpen(false)
+    setAccuteGlobalOpen(false)
+    setMrcPredictOpen(false)
+    setRenkoReversalOpen(false)
+    setKagiReversalOpen(false)
+    setRegimePanelOpen(true)
   }, [])
 
   // Open the whole-universe Renko (Effort Bricks) reversal board (30s..15m, every pair).
@@ -1533,7 +1583,7 @@ export default function OSPage() {
                 closed = the slim open strip sits above the market watch and
                 everything is laid out exactly as before. */}
             <Panel defaultSize={17} minSize={11}>
-              {signalPanelOpen || signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen || shockPressureOpen || renkoFootprintOpen || renkoFootprintOtcOpen || volumeFootprintOpen || tickVolumeOpen || tickSmcOpen || tickOracleOpen || tickTechnicalOpen || tickFootprintOpen || tickPatternsOpen || pairCompareOpen || pairSignalOpen || oracleOpen || nextExpiryOpen || nextExpiryGlobalOpen || technicalOpen || technicalGlobalOpen || reversalOpen || reversalGlobalOpen || smcRecentOpen || smcGlobalOpen || globalDomOpen || nextGlobalOpen || tempoOpen || tempoGlobalOpen || accuteOpen || accuteGlobalOpen || mrcPredictOpen || renkoReversalOpen || kagiReversalOpen ? (
+              {regimePanelOpen || signalPanelOpen || signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen || shockPressureOpen || renkoFootprintOpen || renkoFootprintOtcOpen || volumeFootprintOpen || tickVolumeOpen || tickSmcOpen || tickOracleOpen || tickTechnicalOpen || tickFootprintOpen || tickPatternsOpen || pairCompareOpen || pairSignalOpen || oracleOpen || nextExpiryOpen || nextExpiryGlobalOpen || technicalOpen || technicalGlobalOpen || reversalOpen || reversalGlobalOpen || smcRecentOpen || smcGlobalOpen || globalDomOpen || nextGlobalOpen || tempoOpen || tempoGlobalOpen || accuteOpen || accuteGlobalOpen || mrcPredictOpen || renkoReversalOpen || kagiReversalOpen ? (
                 <div className="mr-0.5 h-full min-h-0">
                   {ydayOpen ? (
                     <YesterdayPanel onClose={() => setYdayOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onFocusWindow={handleFocusYesterday} />
@@ -1561,6 +1611,8 @@ export default function OSPage() {
                     <TickVolumePanel onClose={() => setTickVolumeOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
                   ) : pairCompareOpen ? (
                     <PairComparePanel onClose={() => setPairCompareOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
+                  ) : regimePanelOpen ? (
+                    <RegimePanel compact closedTick={closedTick} onPick={handleSelectSetup} onClose={() => setRegimePanelOpen(false)} />
                   ) : signalPanelOpen ? (
                     <SignalSidePanel onClose={() => setSignalPanelOpen(false)} asset={asset} tf={tf} closedTick={closedTick} tickers={assets.map((x) => x.ticker)} onSelectAsset={handleSelectAsset} />
                   ) : pairSignalOpen ? (
@@ -1743,6 +1795,18 @@ export default function OSPage() {
                       >
                         <span className="h-1.5 w-1.5 rounded-full bg-purple-300" />
                         Reversal Global
+                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
+                      </button>
+                      )}
+                      {panelVisibility.regimePanel && (
+                      <button
+                        type="button"
+                        onClick={() => handleOpenRegimePanel()}
+                        title="Regime board - every open pair on one timeframe sorted into trending up, trending down, ranging and noise (the Regime tab, as a panel); click a pair to load it on the chart"
+                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-sky-500/40 hover:text-sky-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-sky-300" />
+                        Regime
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
                       )}
