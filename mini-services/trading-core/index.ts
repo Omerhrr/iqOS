@@ -125,6 +125,33 @@ const PORT = Number(process.env.KERNEL_PORT ?? 3030)
 // kernel and web containers (web injects it server-side - the browser never
 // sees it). The remaining P0 tail (web auth / Telegram / backups) is tracked
 // in deploy/README.md.
+// ---- event-loop lag monitor -------------------------------------------------
+// The kernel is a single thread: any long synchronous job (a market-wide scan, a big
+// backtest, a JSON dump) freezes socket.io, /health and every HTTP route for its
+// duration, which the browser shows as "kernel reconnecting...". This samples the
+// loop every 250ms, keeps the worst stall of the last 60s for /health, and logs a
+// warning (at most one per 30s) when a stall passes 750ms so the cause can be matched
+// to whatever else the log shows at that moment.
+const LAG_SAMPLE_MS = 250
+const lagWindow: { at: number; lag: number }[] = []
+let lagLastWarn = 0
+let lagPrev = Date.now()
+setInterval(() => {
+  const now = Date.now()
+  const lag = Math.max(0, now - lagPrev - LAG_SAMPLE_MS)
+  lagPrev = now
+  lagWindow.push({ at: now, lag })
+  while (lagWindow.length && now - lagWindow[0].at > 60_000) lagWindow.shift()
+  if (lag > 750 && now - lagLastWarn > 30_000) {
+    lagLastWarn = now
+    console.warn(`[lag] event loop stalled ${lag}ms - something ran synchronously for that long (busy scan/backtest?)`)
+  }
+}, LAG_SAMPLE_MS).unref?.()
+function lagStats(): { maxMs: number; p95Ms: number; samples: number } {
+  const v = lagWindow.map((x) => x.lag).sort((a, b) => a - b)
+  return { maxMs: v.length ? v[v.length - 1] : 0, p95Ms: v.length ? v[Math.floor(v.length * 0.95)] : 0, samples: v.length }
+}
+
 const KERNEL_TOKEN = (process.env.KERNEL_TOKEN ?? '').trim()
 const RATE_CAPACITY = 240 // burst bucket per client IP
 const RATE_REFILL_PER_SEC = 4 // sustained ~240 req/min per IP
@@ -921,7 +948,7 @@ const httpServer = createServer(async (req, res) => {
     const exec = kernel.context().use<ExecutionService>('execution')
 
     if (req.method === 'GET') {
-      if (path === '/health') return json(200, { ok: true, service: 'trading-core', uptime: process.uptime() })
+      if (path === '/health') return json(200, { ok: true, service: 'trading-core', uptime: process.uptime(), loopLag60s: lagStats() })
 
       if (path === '/mode') {
         const mode = kernel.context().use<ModeService>('mode')

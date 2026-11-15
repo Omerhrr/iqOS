@@ -5707,8 +5707,10 @@ export function useOSFeed(asset: string, tf: Timeframe, handlers: OSFeedHandlers
       // whenever the path allows it (full WS through the Caddy :81 gateway).
       transports: ['polling', 'websocket'],
       reconnection: true,
-      reconnectionAttempts: 20,
+      // never give up: 20 attempts (~30s) used to end the socket for good if the kernel stalled that long, leaving the OS on "reconnecting..." until a manual reload
+      reconnectionAttempts: Infinity,
       reconnectionDelay: 1500,
+      reconnectionDelayMax: 8000,
       timeout: 10000,
     })
     socketRef.current = socket

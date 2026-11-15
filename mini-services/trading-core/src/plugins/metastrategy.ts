@@ -2001,88 +2001,99 @@ export class MetaStrategyService {
    * `.value` (renko's signed streak, the expiry rungs' pWin, the tick
    * oracle's score, the tick technical net share, the tick footprint's
    * signed one-sided share) so scripts can threshold RAW metrics. */
-  private buildScriptReads(asset: string, tf: Timeframe, cfg?: Record<string, number | boolean | string>): Record<string, MslSourceRead> {
+  private buildScriptReads(asset: string, tf: Timeframe, cfg?: Record<string, number | boolean | string>, script?: string): Record<string, MslSourceRead> {
+    // PERFORMANCE: with a script given, only the sources it NAMES are computed. Before this, every evaluation
+    // (every pair, every Omni tick, every Brain Trader bar) computed ~55 panel verdicts - oracle, accute, renko,
+    // smc, mrc, effort, volArb, ... - even for a one-line RSI script (60-180 ms each), which pinned the kernel's
+    // single thread. A name that appears anywhere in the script text (comments included) counts as used, so this
+    // only ever over-includes; with no script (snapshots, dumps) everything is computed as before.
+    const used = script === undefined ? null : new Set(script.match(/[A-Za-z_][A-Za-z0-9_]*/g) ?? [])
+    const want = (...names: string[]): boolean => used === null || names.some((n) => used.has(n))
     const toMsl = (r: MetaSourceRead): MslSourceRead => ({ direction: r.direction, confidence: r.confidence, ...(r.value !== undefined ? { value: r.value } : {}) })
-    const reads: Record<string, MslSourceRead> = {
-      oracle: toMsl(this.readSource('oracle', asset, tf)),
-      hmaRocBullBear: toMsl(this.readSource('hmaRocBullBear', asset, tf)),
-      momentumScore: toMsl(this.readSource('momentumScore', asset, tf)),
-      accute: toMsl(this.readSource('accute', asset, tf)),
-      renko: toMsl(this.readSource('renko', asset, tf, undefined, undefined, undefined, cfg)),
-      smc: toMsl(this.readSource('smc', asset, tf)),
-      smcNow: toMsl(this.readSource('smcNow', asset, tf)),
-      ict: toMsl(this.readSource('ict', asset, tf)),
-      renkoSmc: toMsl(this.readSource('renkoSmc', asset, tf, undefined, undefined, undefined, cfg)),
-      renkoSmcMajority: toMsl(this.readSource('renkoSmcMajority', asset, tf, undefined, undefined, undefined, cfg)),
-      pointFigure: toMsl(this.readSource('pointFigure', asset, tf, undefined, undefined, undefined, cfg)),
-      rangeBars: toMsl(this.readSource('rangeBars', asset, tf, undefined, undefined, undefined, cfg)),
-      candle: toMsl(this.readSource('candle', asset, tf)),
-      bar: toMsl(this.readSource('bar', asset, tf)),
-      heikinAshi: toMsl(this.readSource('heikinAshi', asset, tf)),
-      line: toMsl(this.readSource('line', asset, tf)),
-      area: toMsl(this.readSource('area', asset, tf)),
-      baseline: toMsl(this.readSource('baseline', asset, tf)),
-      volumeBars: toMsl(this.readSource('volumeBars', asset, tf, undefined, undefined, undefined, cfg)),
-      tick: toMsl(this.readSource('tick', asset, tf)),
-      footprint: toMsl(this.readSource('footprint', asset, tf)),
-      otcFootprint: toMsl(this.readSource('otcFootprint', asset, tf)),
-      tpo: toMsl(this.readSource('tpo', asset, tf, undefined, undefined, undefined, cfg)),
-      ivHv: toMsl(this.readSource('ivHv', asset, tf, undefined, undefined, undefined, cfg)),
-      tickSmc: toMsl(this.readSource('tickSmc', asset, tf, undefined, undefined, undefined, cfg)),
-      tickOracle: toMsl(this.readSource('tickOracle', asset, tf, undefined, undefined, undefined, cfg)),
-      tickTechnical: toMsl(this.readSource('tickTechnical', asset, tf, undefined, undefined, undefined, cfg)),
-      tickFootprint: toMsl(this.readSource('tickFootprint', asset, tf, undefined, undefined, undefined, cfg)),
-      technical: toMsl(this.readSource('technical', asset, tf)),
-      reversal: toMsl(this.readSource('reversal', asset, tf)),
-      tempo: toMsl(this.readSource('tempo', asset, tf)),
-      confluence: toMsl(this.readSource('confluence', asset, tf)),
-      volArb: toMsl(this.readSource('volArb', asset, tf)),
-      cointegration: toMsl(this.readSource('cointegration', asset, tf)),
-      screenerRank: toMsl(this.readSource('screenerRank', asset, tf)),
-      chartSignals: toMsl(this.readSource('chartSignals', asset, tf)),
-      leadLag: toMsl(this.readSource('leadLag', asset, tf)),
-      yesterday: toMsl(this.readSource('yesterday', asset, tf)),
-      volumeProfile: toMsl(this.readSource('volumeProfile', asset, tf, undefined, undefined, undefined, cfg)),
-      lineBreak: toMsl(this.readSource('lineBreak', asset, tf, undefined, undefined, undefined, cfg)),
-      kagi: toMsl(this.readSource('kagi', asset, tf, undefined, undefined, undefined, cfg)),
-      swing: toMsl(this.readSource('swing', asset, tf, undefined, undefined, undefined, cfg)),
-      effort: toMsl(this.readSource('effort', asset, tf, undefined, undefined, undefined, cfg)),
-      mrc: toMsl(this.readSource('mrc', asset, tf, undefined, undefined, undefined, cfg)),
-      outcomeMemory: toMsl(this.readSource('outcomeMemory', asset, tf, undefined, undefined, undefined, cfg)),
-      pulse: toMsl(this.readSource('pulse', asset, tf, undefined, undefined, undefined, cfg)),
-      spring: toMsl(this.readSource('spring', asset, tf, undefined, undefined, undefined, cfg)),
-      echo: toMsl(this.readSource('echo', asset, tf, undefined, undefined, undefined, cfg)),
-      footDivergence: toMsl(this.readSource('footDivergence', asset, tf)),
-      footStackedImbalance: toMsl(this.readSource('footStackedImbalance', asset, tf, undefined, undefined, undefined, cfg)),
-      footAbsorption: toMsl(this.readSource('footAbsorption', asset, tf)),
-      footUnfinishedAuction: toMsl(this.readSource('footUnfinishedAuction', asset, tf)),
-      deltaProfile: toMsl(this.readSource('deltaProfile', asset, tf)),
+    const defs: Record<string, () => MetaSourceRead> = {
+      oracle: () => this.readSource('oracle', asset, tf),
+      hmaRocBullBear: () => this.readSource('hmaRocBullBear', asset, tf),
+      momentumScore: () => this.readSource('momentumScore', asset, tf),
+      accute: () => this.readSource('accute', asset, tf),
+      renko: () => this.readSource('renko', asset, tf, undefined, undefined, undefined, cfg),
+      smc: () => this.readSource('smc', asset, tf),
+      smcNow: () => this.readSource('smcNow', asset, tf),
+      ict: () => this.readSource('ict', asset, tf),
+      renkoSmc: () => this.readSource('renkoSmc', asset, tf, undefined, undefined, undefined, cfg),
+      renkoSmcMajority: () => this.readSource('renkoSmcMajority', asset, tf, undefined, undefined, undefined, cfg),
+      pointFigure: () => this.readSource('pointFigure', asset, tf, undefined, undefined, undefined, cfg),
+      rangeBars: () => this.readSource('rangeBars', asset, tf, undefined, undefined, undefined, cfg),
+      candle: () => this.readSource('candle', asset, tf),
+      bar: () => this.readSource('bar', asset, tf),
+      heikinAshi: () => this.readSource('heikinAshi', asset, tf),
+      line: () => this.readSource('line', asset, tf),
+      area: () => this.readSource('area', asset, tf),
+      baseline: () => this.readSource('baseline', asset, tf),
+      volumeBars: () => this.readSource('volumeBars', asset, tf, undefined, undefined, undefined, cfg),
+      tick: () => this.readSource('tick', asset, tf),
+      footprint: () => this.readSource('footprint', asset, tf),
+      otcFootprint: () => this.readSource('otcFootprint', asset, tf),
+      tpo: () => this.readSource('tpo', asset, tf, undefined, undefined, undefined, cfg),
+      ivHv: () => this.readSource('ivHv', asset, tf, undefined, undefined, undefined, cfg),
+      tickSmc: () => this.readSource('tickSmc', asset, tf, undefined, undefined, undefined, cfg),
+      tickOracle: () => this.readSource('tickOracle', asset, tf, undefined, undefined, undefined, cfg),
+      tickTechnical: () => this.readSource('tickTechnical', asset, tf, undefined, undefined, undefined, cfg),
+      tickFootprint: () => this.readSource('tickFootprint', asset, tf, undefined, undefined, undefined, cfg),
+      technical: () => this.readSource('technical', asset, tf),
+      reversal: () => this.readSource('reversal', asset, tf),
+      tempo: () => this.readSource('tempo', asset, tf),
+      confluence: () => this.readSource('confluence', asset, tf),
+      volArb: () => this.readSource('volArb', asset, tf),
+      cointegration: () => this.readSource('cointegration', asset, tf),
+      screenerRank: () => this.readSource('screenerRank', asset, tf),
+      chartSignals: () => this.readSource('chartSignals', asset, tf),
+      leadLag: () => this.readSource('leadLag', asset, tf),
+      yesterday: () => this.readSource('yesterday', asset, tf),
+      volumeProfile: () => this.readSource('volumeProfile', asset, tf, undefined, undefined, undefined, cfg),
+      lineBreak: () => this.readSource('lineBreak', asset, tf, undefined, undefined, undefined, cfg),
+      kagi: () => this.readSource('kagi', asset, tf, undefined, undefined, undefined, cfg),
+      swing: () => this.readSource('swing', asset, tf, undefined, undefined, undefined, cfg),
+      effort: () => this.readSource('effort', asset, tf, undefined, undefined, undefined, cfg),
+      mrc: () => this.readSource('mrc', asset, tf, undefined, undefined, undefined, cfg),
+      outcomeMemory: () => this.readSource('outcomeMemory', asset, tf, undefined, undefined, undefined, cfg),
+      pulse: () => this.readSource('pulse', asset, tf, undefined, undefined, undefined, cfg),
+      spring: () => this.readSource('spring', asset, tf, undefined, undefined, undefined, cfg),
+      echo: () => this.readSource('echo', asset, tf, undefined, undefined, undefined, cfg),
+      footDivergence: () => this.readSource('footDivergence', asset, tf),
+      footStackedImbalance: () => this.readSource('footStackedImbalance', asset, tf, undefined, undefined, undefined, cfg),
+      footAbsorption: () => this.readSource('footAbsorption', asset, tf),
+      footUnfinishedAuction: () => this.readSource('footUnfinishedAuction', asset, tf),
+      deltaProfile: () => this.readSource('deltaProfile', asset, tf),
     }
+    const reads: Record<string, MslSourceRead> = {}
+    for (const key of Object.keys(defs)) if (want(key)) reads[key] = toMsl(defs[key]())
     // Tick-desk reads for scripts: bare keys = each engine's own default read
     // (SMC 15s, oracle best bucket, technical best-rated bucket, footprint
     // 60s) plus 'tickOracle:<SEC>' and 'tickTechnical:<SEC>' pinned-bucket
     // keys (same 'source:<KIND>' convention as smc:<KIND> and
     // nextExpiry:<E> - the part after the colon is part of the identifier).
     // ONE computeTickOracle/computeTickTechnical call feeds all their keys.
-    try {
-      const ticks = this.tickBuffer(asset)
-      if (ticks?.length) {
-        const oracle = computeTickOracle(ticks, cfgNum(cfg, 'tickOracle.bucketSec') !== undefined ? { bucketsSec: [cfgNum(cfg, 'tickOracle.bucketSec') as number] } : {})
-        for (const sec of ORACLE_BUCKETS_SEC) {
-          const row = oracle.rows.find((r) => r.bucketSec === sec)
-          reads[`tickOracle:${sec}`] = row && row.ok && row.direction !== 'none' ? { direction: row.direction, confidence: row.confidence, value: row.score } : { direction: 'none', confidence: 0 }
+    if (want('tickOracle', 'tickTechnical')) {
+      try {
+        const ticks = this.tickBuffer(asset)
+        if (ticks?.length) {
+          const oracle = computeTickOracle(ticks, cfgNum(cfg, 'tickOracle.bucketSec') !== undefined ? { bucketsSec: [cfgNum(cfg, 'tickOracle.bucketSec') as number] } : {})
+          for (const sec of ORACLE_BUCKETS_SEC) {
+            const row = oracle.rows.find((r) => r.bucketSec === sec)
+            reads[`tickOracle:${sec}`] = row && row.ok && row.direction !== 'none' ? { direction: row.direction, confidence: row.confidence, value: row.score } : { direction: 'none', confidence: 0 }
+          }
+          const tech = computeTickTechnical(ticks)
+          for (const b of tech.buckets) {
+            const total = b.summary.buy + b.summary.sell
+            const net = total > 0 ? (b.summary.buy - b.summary.sell) / total : 0
+            reads[`tickTechnical:${b.bucketSec}`] = b.ok && Math.abs(net) >= 0.2 ? { direction: net > 0 ? 'call' : 'put', confidence: Math.min(100, Math.round(40 + Math.abs(net) * 100)), value: net } : { direction: 'none', confidence: 0 }
+          }
+        } else {
+          for (const sec of ORACLE_BUCKETS_SEC) reads[`tickOracle:${sec}`] = { direction: 'none', confidence: 0 }
         }
-        const tech = computeTickTechnical(ticks)
-        for (const b of tech.buckets) {
-          const total = b.summary.buy + b.summary.sell
-          const net = total > 0 ? (b.summary.buy - b.summary.sell) / total : 0
-          reads[`tickTechnical:${b.bucketSec}`] = b.ok && Math.abs(net) >= 0.2 ? { direction: net > 0 ? 'call' : 'put', confidence: Math.min(100, Math.round(40 + Math.abs(net) * 100)), value: net } : { direction: 'none', confidence: 0 }
-        }
-      } else {
+      } catch {
         for (const sec of ORACLE_BUCKETS_SEC) reads[`tickOracle:${sec}`] = { direction: 'none', confidence: 0 }
       }
-    } catch {
-      for (const sec of ORACLE_BUCKETS_SEC) reads[`tickOracle:${sec}`] = { direction: 'none', confidence: 0 }
     }
     // Next-Expiry Oracle reads for scripts: bare 'nextExpiry' = the best
     // pick (engine honesty floors already applied, null best = none) and
@@ -2090,35 +2101,37 @@ export class MetaStrategyService {
     // convention, so a script can pin a horizon without a new language
     // keyword. ONE predict() call feeds all six keys; the plugin's pending
     // dedupe makes the extra poll idempotent on the honesty ledger anyway.
-    try {
-      const expiryOracle = this.ctx.use<NextExpiryService>('nextexpiry')
-      const pred = expiryOracle.predict(asset)
-      reads.nextExpiry = pred?.best ? { direction: pred.best.direction, confidence: pred.best.confidence, value: pred.best.pWin } : { direction: 'none', confidence: 0 }
-      for (const E of EXPIRIES_MIN) {
-        const rung = pred?.rows.find((r) => r.expiry === E)
-        reads[`nextExpiry:${E}`] = rung && rung.ok && rung.direction !== 'none' ? { direction: rung.direction, confidence: rung.confidence, value: rung.pWin } : { direction: 'none', confidence: 0 }
+    if (want('nextExpiry', 'nextExpiryBest')) {
+      try {
+        const expiryOracle = this.ctx.use<NextExpiryService>('nextexpiry')
+        const pred = expiryOracle.predict(asset)
+        reads.nextExpiry = pred?.best ? { direction: pred.best.direction, confidence: pred.best.confidence, value: pred.best.pWin } : { direction: 'none', confidence: 0 }
+        for (const E of EXPIRIES_MIN) {
+          const rung = pred?.rows.find((r) => r.expiry === E)
+          reads[`nextExpiry:${E}`] = rung && rung.ok && rung.direction !== 'none' ? { direction: rung.direction, confidence: rung.confidence, value: rung.pWin } : { direction: 'none', confidence: 0 }
+        }
+        // Footprint-completion follow-up (closes a gap flagged in the
+        // capability matrix since Phase 8): until now, a script using the
+        // bare `nextExpiry` source could see WHAT the oracle's fused best
+        // pick thinks (direction/confidence/pWin, via .value) but never
+        // WHICH expiry rung (1/2/3/5/15m) that pick actually was -
+        // pred.best.expiry existed on the engine's own predict() result the
+        // whole time, it just never got its own read. 'nextExpiryBest' is
+        // this missing field, exposed the same shape every other MSL source
+        // uses (direction mirrors the bare nextExpiry pick so a script can
+        // still gate on it the normal way; .value is the chosen expiry in
+        // MINUTES, not a probability - documented here and in /signal_vocab
+        // precisely because every other nextExpiry* source's .value is a
+        // 0-1 probability, so a script reading the wrong one by habit would
+        // otherwise silently misinterpret a "5" as "500% win probability").
+        reads.nextExpiryBest = pred?.best
+          ? { direction: pred.best.direction, confidence: pred.best.confidence, value: pred.best.expiry }
+          : { direction: 'none', confidence: 0 }
+      } catch {
+        reads.nextExpiry = { direction: 'none', confidence: 0 }
+        for (const E of EXPIRIES_MIN) reads[`nextExpiry:${E}`] = { direction: 'none', confidence: 0 }
+        reads.nextExpiryBest = { direction: 'none', confidence: 0 }
       }
-      // Footprint-completion follow-up (closes a gap flagged in the
-      // capability matrix since Phase 8): until now, a script using the
-      // bare `nextExpiry` source could see WHAT the oracle's fused best
-      // pick thinks (direction/confidence/pWin, via .value) but never
-      // WHICH expiry rung (1/2/3/5/15m) that pick actually was -
-      // pred.best.expiry existed on the engine's own predict() result the
-      // whole time, it just never got its own read. 'nextExpiryBest' is
-      // this missing field, exposed the same shape every other MSL source
-      // uses (direction mirrors the bare nextExpiry pick so a script can
-      // still gate on it the normal way; .value is the chosen expiry in
-      // MINUTES, not a probability - documented here and in /signal_vocab
-      // precisely because every other nextExpiry* source's .value is a
-      // 0-1 probability, so a script reading the wrong one by habit would
-      // otherwise silently misinterpret a "5" as "500% win probability").
-      reads.nextExpiryBest = pred?.best
-        ? { direction: pred.best.direction, confidence: pred.best.confidence, value: pred.best.expiry }
-        : { direction: 'none', confidence: 0 }
-    } catch {
-      reads.nextExpiry = { direction: 'none', confidence: 0 }
-      for (const E of EXPIRIES_MIN) reads[`nextExpiry:${E}`] = { direction: 'none', confidence: 0 }
-      reads.nextExpiryBest = { direction: 'none', confidence: 0 }
     }
     // Phase 8 of the chart-engine expansion roadmap (binary-options-specific
     // intelligence): the account's REAL current binary payout fraction
@@ -2172,15 +2185,17 @@ export class MetaStrategyService {
       const day = new Date().getUTCDay() // 0=Sun, 6=Sat
       reads.session = { direction: 'none', confidence: 0, value: day === 0 || day === 6 ? 1 : 0 }
     }
-    try {
-      const smc = this.ctx.use<SmcScanService>('smcScan')
-      const resp = smc.scan(asset, tf)
-      for (const kind of ALL_SMC_KINDS) {
-        const read = resp.result ? smcNowRead(resp.result, kind) : { direction: 'none' as const, confidence: 0 }
-        reads[`smc:${kind}`] = { direction: read.direction, confidence: read.confidence }
+    if (want('smc')) {
+      try {
+        const smc = this.ctx.use<SmcScanService>('smcScan')
+        const resp = smc.scan(asset, tf)
+        for (const kind of ALL_SMC_KINDS) {
+          const read = resp.result ? smcNowRead(resp.result, kind) : { direction: 'none' as const, confidence: 0 }
+          reads[`smc:${kind}`] = { direction: read.direction, confidence: read.confidence }
+        }
+      } catch {
+        for (const kind of ALL_SMC_KINDS) reads[`smc:${kind}`] = { direction: 'none', confidence: 0 }
       }
-    } catch {
-      for (const kind of ALL_SMC_KINDS) reads[`smc:${kind}`] = { direction: 'none', confidence: 0 }
     }
     // Technical Summary + Reversal reads PER RUNG - the bare 'technical'/
     // 'reversal' keys above only ever give the whole-ladder consensus or
@@ -2199,51 +2214,55 @@ export class MetaStrategyService {
     // >=80 confidence, a plain BUY/SELL (|score|>=0.15) reads 52-79, so
     // "says strong buy" is simply `.dir == call and .conf >= 80` (or
     // `.value >= 0.5`) while "says buy" (strong or not) is `.dir == call`.
-    try {
-      const tech = this.ctx.use<TechnicalService>('technical')
-      let priceHint = 0
+    if (want('technical')) {
       try {
-        priceHint = this.market.getPrice(asset)
-      } catch {
-        /* rowFor handles a 0 hint */
-      }
-      const row = tech.rowFor(asset, priceHint)
-      for (const rung of TECH_LADDER) {
-        const cell = row.cells.find((c) => c.tf === rung.tf)
-        if (!cell || !cell.ok || cell.label === 'NEUTRAL') {
-          reads[`technical:${rung.tf}`] = { direction: 'none', confidence: 0 }
-          continue
+        const tech = this.ctx.use<TechnicalService>('technical')
+        let priceHint = 0
+        try {
+          priceHint = this.market.getPrice(asset)
+        } catch {
+          /* rowFor handles a 0 hint */
         }
-        const dir: 'call' | 'put' = cell.score >= 0 ? 'call' : 'put'
-        reads[`technical:${rung.tf}`] = { direction: dir, confidence: Math.min(100, Math.round(40 + Math.abs(cell.score) * 80)), value: cell.score }
+        const row = tech.rowFor(asset, priceHint)
+        for (const rung of TECH_LADDER) {
+          const cell = row.cells.find((c) => c.tf === rung.tf)
+          if (!cell || !cell.ok || cell.label === 'NEUTRAL') {
+            reads[`technical:${rung.tf}`] = { direction: 'none', confidence: 0 }
+            continue
+          }
+          const dir: 'call' | 'put' = cell.score >= 0 ? 'call' : 'put'
+          reads[`technical:${rung.tf}`] = { direction: dir, confidence: Math.min(100, Math.round(40 + Math.abs(cell.score) * 80)), value: cell.score }
+        }
+      } catch {
+        for (const rung of TECH_LADDER) reads[`technical:${rung.tf}`] = { direction: 'none', confidence: 0 }
       }
-    } catch {
-      for (const rung of TECH_LADDER) reads[`technical:${rung.tf}`] = { direction: 'none', confidence: 0 }
     }
     // Reversal: same honesty rule as the bare 'reversal' case - a rung only
     // claims a direction in its two TRADEABLE states ('reversing' now or
     // 'confirmed'); 'calm'/'forming' honestly reads none, so "is NOT
     // reversing" at a rung is simply `.dir == none` (or `not reversal:1s.active`).
-    try {
-      const rev = this.ctx.use<ReversalService>('reversal')
-      let priceHint = 0
+    if (want('reversal')) {
       try {
-        priceHint = this.market.getPrice(asset)
-      } catch {
-        /* rowFor handles a 0 hint */
-      }
-      const row = rev.rowFor(asset, priceHint)
-      for (const rung of TECH_LADDER) {
-        const cell = row.cells.find((c) => c.tf === rung.tf)
-        if (!cell || !cell.ok || (cell.state !== 'reversing' && cell.state !== 'confirmed') || cell.direction === 'none') {
-          reads[`reversal:${rung.tf}`] = { direction: 'none', confidence: 0 }
-          continue
+        const rev = this.ctx.use<ReversalService>('reversal')
+        let priceHint = 0
+        try {
+          priceHint = this.market.getPrice(asset)
+        } catch {
+          /* rowFor handles a 0 hint */
         }
-        const dir: 'call' | 'put' = cell.direction === 'up' ? 'call' : 'put'
-        reads[`reversal:${rung.tf}`] = { direction: dir, confidence: Math.min(100, Math.round(35 + Math.abs(cell.score) * 15)), value: cell.score }
+        const row = rev.rowFor(asset, priceHint)
+        for (const rung of TECH_LADDER) {
+          const cell = row.cells.find((c) => c.tf === rung.tf)
+          if (!cell || !cell.ok || (cell.state !== 'reversing' && cell.state !== 'confirmed') || cell.direction === 'none') {
+            reads[`reversal:${rung.tf}`] = { direction: 'none', confidence: 0 }
+            continue
+          }
+          const dir: 'call' | 'put' = cell.direction === 'up' ? 'call' : 'put'
+          reads[`reversal:${rung.tf}`] = { direction: dir, confidence: Math.min(100, Math.round(35 + Math.abs(cell.score) * 15)), value: cell.score }
+        }
+      } catch {
+        for (const rung of TECH_LADDER) reads[`reversal:${rung.tf}`] = { direction: 'none', confidence: 0 }
       }
-    } catch {
-      for (const rung of TECH_LADDER) reads[`reversal:${rung.tf}`] = { direction: 'none', confidence: 0 }
     }
     return reads
   }
@@ -2413,7 +2432,7 @@ export class MetaStrategyService {
   ): MetaEvalResult {
     const parsed = parseStrategyScript(script)
     if (!parsed.ok) return { direction: 'none', score: 0, confidence: 0, conditions: [], notes: `script error: ${parsed.error}` }
-    const reads = this.buildScriptReads(asset, tf)
+    const reads = this.buildScriptReads(asset, tf, undefined, script)
     const series = this.scriptSeries(asset, tf)
     const seriesFor = this.scriptSeriesFor(asset)
     // `since()`/`streak()` scope - keyed by THIS spec's id (so two specs
@@ -2430,7 +2449,7 @@ export class MetaStrategyService {
       } catch (err) {
         return { direction: 'none', score: 0, confidence: 0, conditions: [], notes: `script error: ${err instanceof Error ? err.message : String(err)}` }
       }
-      const reads2 = this.buildScriptReads(asset, tf, out.configs)
+      const reads2 = this.buildScriptReads(asset, tf, out.configs, script)
       const out2 = evaluateStrategyScript(parsed.ast, reads2, this.scriptResolver(asset, tf, out.configs), series, seriesFor, live, state)
       return this.scriptMetaResult(out2)
     }
@@ -2459,7 +2478,7 @@ export class MetaStrategyService {
   testScript(script: string, asset: string, tf: Timeframe): { ok: boolean; direction?: 'call' | 'put' | 'none'; confidence?: number; expiryMin?: number; trace?: string[]; price?: number; error?: string } {
     const parsed = parseStrategyScript(script)
     if (!parsed.ok) return { ok: false, error: parsed.error }
-    const reads = this.buildScriptReads(asset, tf)
+    const reads = this.buildScriptReads(asset, tf, undefined, script)
     const series = this.scriptSeries(asset, tf)
     const seriesFor = this.scriptSeriesFor(asset)
     // Test-button preview: not a saved spec, so there's no real spec id to
@@ -2476,7 +2495,7 @@ export class MetaStrategyService {
       } catch (err) {
         return { ok: false, error: err instanceof Error ? err.message : String(err) }
       }
-      const reads2 = this.buildScriptReads(asset, tf, out.configs)
+      const reads2 = this.buildScriptReads(asset, tf, out.configs, script)
       final = evaluateStrategyScript(parsed.ast, reads2, this.scriptResolver(asset, tf, out.configs), series, seriesFor, undefined, state)
       if (final.error) return { ok: false, error: final.error }
     }
