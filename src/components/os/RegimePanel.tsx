@@ -18,6 +18,8 @@ interface RegimePanelProps {
   /** left-dock panel mode: one scrollable column, lists stacked, with a close button */
   compact?: boolean
   onClose?: () => void
+  /** panel mode cross-nav: open the Signal panel */
+  onOpenSignal?: () => void
 }
 
 const TFS: Timeframe[] = ['30s', '1m', '2m', '5m', '15m', '30m', '1h']
@@ -81,7 +83,7 @@ function Row({ r, col, tf, onPick }: { r: RegimeBoardRow; col: (typeof COLS)[num
   )
 }
 
-export default function RegimePanel({ closedTick, onPick, compact, onClose }: RegimePanelProps) {
+export default function RegimePanel({ closedTick, onPick, compact, onClose, onOpenSignal }: RegimePanelProps) {
   const [tf, setTf] = useState<Timeframe>('1m')
   const [board, setBoard] = useState<RegimeBoard | null>(null)
   const [err, setErr] = useState<string | null>(null)
@@ -170,8 +172,18 @@ export default function RegimePanel({ closedTick, onPick, compact, onClose }: Re
           <input type="checkbox" checked={hideOtc} onChange={(e) => setHideOtc(e.target.checked)} className="accent-cyan-400" />
           hide OTC
         </label>
+        {compact && onOpenSignal && (
+          <button
+            type="button"
+            onClick={onOpenSignal}
+            title="open the Signal panel for the chart's pair"
+            className="rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-cyan-500/40 hover:text-cyan-300"
+          >
+            → signal
+          </button>
+        )}
         {compact && onClose && (
-          <button type="button" onClick={onClose} className="ml-auto rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-rose-500/40 hover:text-rose-300">
+          <button type="button" onClick={onClose} className="rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-rose-500/40 hover:text-rose-300">
             close
           </button>
         )}

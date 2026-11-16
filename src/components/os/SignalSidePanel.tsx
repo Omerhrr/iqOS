@@ -24,6 +24,9 @@ interface SignalSidePanelProps {
   /** picking a pair here moves the app's main pair (chart, other panels); the chart's own picker moves this panel */
   onSelectAsset: (a: string) => void
   onClose: () => void
+  /** cross-nav: open the Regime panel / the SMC Recent panel */
+  onOpenRegime?: () => void
+  onOpenSmc?: () => void
 }
 
 const TFS: Timeframe[] = ['30s', '1m', '2m', '5m', '15m', '30m', '1h']
@@ -45,7 +48,7 @@ const actionTone = (a: 'buy' | 'sell' | 'wait') =>
 
 const REGIME_LABEL: Record<string, string> = { 'trend-up': 'trending up', 'trend-down': 'trending down', ranging: 'ranging', noise: 'noise', unreadable: 'not readable' }
 
-export default function SignalSidePanel({ asset, tf: chartTf, closedTick, tickers, onSelectAsset, onClose }: SignalSidePanelProps) {
+export default function SignalSidePanel({ asset, tf: chartTf, closedTick, tickers, onSelectAsset, onClose, onOpenRegime, onOpenSmc }: SignalSidePanelProps) {
   const supported = (t?: string): t is Timeframe => !!t && (TFS as string[]).includes(t)
   const [tf, setTf] = useState<Timeframe>(supported(chartTf) ? chartTf : '1m')
   const [read, setRead] = useState<SignalRead | null>(null)
@@ -115,6 +118,26 @@ export default function SignalSidePanel({ asset, tf: chartTf, closedTick, ticker
             </button>
           ))}
         </div>
+        {onOpenRegime && (
+          <button
+            type="button"
+            onClick={onOpenRegime}
+            title="open the Regime panel - every pair sorted into trending / ranging / noise"
+            className="rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-sky-500/40 hover:text-sky-300"
+          >
+            → regime
+          </button>
+        )}
+        {onOpenSmc && (
+          <button
+            type="button"
+            onClick={onOpenSmc}
+            title="open the SMC Recent panel for this pair"
+            className="rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-emerald-500/40 hover:text-emerald-300"
+          >
+            → smc
+          </button>
+        )}
         <button
           type="button"
           onClick={onClose}

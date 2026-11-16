@@ -899,6 +899,8 @@ export default function OSPage() {
     setSmcGlobalOpen(false)
     setOracleOpen(false)
     setAccuteOpen(false)
+    setSignalPanelOpen(false)
+    setRegimePanelOpen(false)
     setSmcRecentOpen(true)
   }, [handleSelectAsset])
 
@@ -1612,9 +1614,9 @@ export default function OSPage() {
                   ) : pairCompareOpen ? (
                     <PairComparePanel onClose={() => setPairCompareOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
                   ) : regimePanelOpen ? (
-                    <RegimePanel compact closedTick={closedTick} onPick={handleSelectSetup} onClose={() => setRegimePanelOpen(false)} />
+                    <RegimePanel compact closedTick={closedTick} onPick={handleSelectSetup} onClose={() => setRegimePanelOpen(false)} onOpenSignal={handleOpenSignalPanel} />
                   ) : signalPanelOpen ? (
-                    <SignalSidePanel onClose={() => setSignalPanelOpen(false)} asset={asset} tf={tf} closedTick={closedTick} tickers={assets.map((x) => x.ticker)} onSelectAsset={handleSelectAsset} />
+                    <SignalSidePanel onClose={() => setSignalPanelOpen(false)} asset={asset} tf={tf} closedTick={closedTick} tickers={assets.map((x) => x.ticker)} onSelectAsset={handleSelectAsset} onOpenRegime={handleOpenRegimePanel} onOpenSmc={() => handleOpenSmc(asset)} />
                   ) : pairSignalOpen ? (
                     <PairSignalPanel onClose={() => setPairSignalOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
                   ) : oracleOpen ? (
