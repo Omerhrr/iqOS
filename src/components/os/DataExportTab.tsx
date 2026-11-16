@@ -33,6 +33,7 @@ interface Fetched {
 }
 
 const FETCH_TIMEOUT_MS = 45_000
+const EXPORT_TFS: Timeframe[] = TIMEFRAMES
 
 /** one deep read with a hard timeout and a single retry, so a stalled or dropped request ends in a clear message instead of hanging */
 async function readDeep(asset: string, tf: Timeframe): Promise<Candle[]> {
@@ -158,7 +159,7 @@ export default function DataExportTab({ initialAsset, assets, onError }: DataExp
     let total = 0
     let first = true
     const failed: string[] = []
-    const wanted = TIMEFRAMES.filter((t) => archive[t]?.n)
+    const wanted = EXPORT_TFS.filter((t) => archive[t]?.n)
     for (let i = 0; i < wanted.length; i++) {
       const tf = wanted[i]
       setNote(`reading ${tf} (${i + 1} of ${wanted.length})…`)
@@ -182,7 +183,7 @@ export default function DataExportTab({ initialAsset, assets, onError }: DataExp
     setNote(`downloaded ${asset}_all_timeframes.csv (${total} bars across ${parts.length} timeframes)${failed.length ? ` - could not read: ${failed.join(', ')} (use that row's own button to retry)` : ''}`)
   }
 
-  const rows = TIMEFRAMES.map((tf) => ({ tf, a: archive[tf], f: fetched[tf] }))
+  const rows = EXPORT_TFS.map((tf) => ({ tf, a: archive[tf], f: fetched[tf] }))
 
   return (
     <div className="flex h-full min-h-0 flex-col rounded-lg border border-[#1c2739] bg-[#0b111c]">

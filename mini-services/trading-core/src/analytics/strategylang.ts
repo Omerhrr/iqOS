@@ -248,6 +248,7 @@ import { WYCKOFF_MIN_BARS, readWyckoff, type WyckoffRead } from './mslwyckoff'
 import { SMCX_MIN_BARS, readSmcx, type SmcxRead } from './mslsmcx'
 import { smtDivergence } from './smt'
 import { readBlocks, readJudas, readSoup, type BlockRead, type JudasRead } from './mslpatterns'
+import { readPowerProb, POWERPROB_MIN_BARS, type PowerProbRead } from './powerprob'
 import { MMXM_MIN_BARS, readMmxm, type MmxmRead } from './mslmmxm'
 import { PV_MIN_BARS, readPv, type PvRead } from './mslpv'
 import {
@@ -2639,6 +2640,46 @@ function cmMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | und
   }
 }
 
+/** `pp.*` - Bull/Bear Power + footprint-proxy NEXT-CANDLE PROBABILITY (analytics/powerprob.ts). The latest closed bar is put in a bucket (Elder
+ * Ray net power in 5 levels x a candle-volume footprint proxy in 3 levels) and the probability is the up-rate of EARLIER bars in the same bucket
+ * whose next candle already closed, over the last 1500 bars (no look-ahead), shrunk as (ups+1)/(n+2). "Up" = the next close above this close.
+ * Candle-derived, so it works in meta_strategy_eval, the traders AND meta_strategy_backtest. The footprint is a PROXY (volume x where the bar closed
+ * in its range), not real order flow; with flat/zero volume (OTC) it is unavailable and the read falls back to power alone - gate on pp.volumeOk().
+ *   ok() 80+ bars   volumeOk() footprint proxy usable   n() earlier bars in the same bucket (check it: a probability on n < 30 means little)
+ *   pUp() / pDown() probability the next candle closes up / down   lowUp() / lowDown() Wilson 95% lower bound of each   base() unconditional up-rate
+ *   side() "call" | "put" | "none"   net() / bull() / bear() Bull/Bear Power in ATR units   delta() footprint-proxy delta (NaN without volume)   bucket() "power/foot"
+ * A past frequency, not a forecast; 70% on a 1-bar binary is rare - expect few fires. */
+const ppCache = new WeakMap<MslSeriesCtx, PowerProbRead>()
+function ppMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  void args
+  const s = requireSeries(ctx, tf)
+  if (name === 'ok') return s.close.length >= POWERPROB_MIN_BARS
+  if (s.close.length < POWERPROB_MIN_BARS) throw new MslRuntimeError(`pp.${name}() needs at least ${POWERPROB_MIN_BARS} closed bars - history is too thin`)
+  let r = ppCache.get(s)
+  if (!r) {
+    r = readPowerProb(seriesToCandles(s))
+    ppCache.set(s, r)
+  }
+  if (!r.ok) throw new MslRuntimeError(`pp.${name}() - not enough usable bars (indicator warmup / flat ATR)`)
+  switch (name) {
+    case 'volumeOk': return r.volumeOk
+    case 'n': return r.n
+    case 'pUp': return r.pUp
+    case 'pDown': return r.pDown
+    case 'lowUp': return r.lowUp
+    case 'lowDown': return r.lowDown
+    case 'base': return r.base
+    case 'side': return r.side
+    case 'net': return r.net
+    case 'bull': return r.bull
+    case 'bear': return r.bear
+    case 'delta': return Number.isFinite(r.delta) ? r.delta : 0
+    case 'bucket': return r.bucket
+    default:
+      throw new MslRuntimeError(`unknown pp method "pp.${name}(...)" - use ok/volumeOk/n/pUp/pDown/lowUp/lowDown/base/side/net/bull/bear/delta/bucket`)
+  }
+}
+
 /** candles for the structural namespaces: REAL timestamps when the context carries them (so session pivots can anchor on the
  * previous UTC day), else synthetic sequential times (pivots then use their rolling-window fallback). */
 function candlesWithTime(s: MslSeriesCtx): Candle[] {
@@ -4344,6 +4385,11 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
         return statMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'pp' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return ppMethod(e.name, args, ctx, tf)
       }
       if (e.obj.t === 'ident' && e.obj.name === 'cm' && !(e.obj.name in env)) {
         const args = e.args.map((a) => evalExpr(a, env, ctx))
