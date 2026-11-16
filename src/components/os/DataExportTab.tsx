@@ -3,14 +3,14 @@
 // IQAIR//OS - Data tab: look at what history the kernel has for a pair and
 // download it as CSV (one file per timeframe, or every timeframe in one file
 // with a tf column). Reads the kernel's own archive through /archive (counts per
-// timeframe) and /candles?deep=1 (the bars; the archive keeps about 4000 bars per
-// pair per timeframe, so that is the most one download can hold). Bars the feed
+// timeframe) and /archive_candles (the stored bars ONLY - the normal chart read pads
+// gaps and missing history with synthetic bars, which must never reach research data). Bars the feed
 // never recorded are simply absent - the gap count shows how patchy a window is,
 // and nothing is ever filled in. Nothing is placed or changed by this tab.
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { AssetRow, Candle, Timeframe } from '@/lib/os/client'
-import { TIMEFRAMES, TIMEFRAME_SECONDS, getCandles, osGet } from '@/lib/os/client'
+import { TIMEFRAMES, TIMEFRAME_SECONDS, osGet } from '@/lib/os/client'
 import AssetPicker from './AssetPicker'
 
 interface DataExportTabProps {
@@ -30,6 +30,30 @@ interface Fetched {
   candles: Candle[]
   gaps: number
   longestRun: number
+}
+
+const FETCH_TIMEOUT_MS = 45_000
+
+/** one deep read with a hard timeout and a single retry, so a stalled or dropped request ends in a clear message instead of hanging */
+async function readDeep(asset: string, tf: Timeframe): Promise<Candle[]> {
+  let lastErr = 'unknown error'
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const ctl = new AbortController()
+    const timer = setTimeout(() => ctl.abort(), FETCH_TIMEOUT_MS)
+    try {
+      const qsStr = new URLSearchParams({ XTransformPort: '3030', asset, tf, limit: '5000' }).toString()
+      const res = await fetch(`/archive_candles?${qsStr}`, { cache: 'no-store', signal: ctl.signal })
+      if (!res.ok) throw new Error(`the server answered ${res.status}`)
+      const d = (await res.json()) as { ok: boolean; candles?: Candle[] }
+      if (!d.ok) throw new Error('the kernel refused the read')
+      return d.candles ?? []
+    } catch (e) {
+      lastErr = (e as Error).name === 'AbortError' ? `no answer after ${FETCH_TIMEOUT_MS / 1000}s` : (e as Error).message
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+  throw new Error(lastErr)
 }
 
 const iso = (t: number) => new Date(t * 1000).toISOString().replace('.000Z', 'Z')
@@ -104,9 +128,7 @@ export default function DataExportTab({ initialAsset, assets, onError }: DataExp
   const fetchTf = useCallback(
     async (tf: Timeframe): Promise<Fetched | null> => {
       try {
-        const d = await getCandles(asset, tf, { limit: 4000, deep: true })
-        if (!d.ok) throw new Error('the kernel refused the read')
-        const f = analyse(d.candles ?? [], tf)
+        const f = analyse(await readDeep(asset, tf), tf)
         setFetched((p) => ({ ...p, [tf]: f }))
         return f
       } catch (e) {
@@ -135,10 +157,17 @@ export default function DataExportTab({ initialAsset, assets, onError }: DataExp
     const parts: string[] = []
     let total = 0
     let first = true
-    for (const tf of TIMEFRAMES) {
-      if (!archive[tf]?.n) continue
+    const failed: string[] = []
+    const wanted = TIMEFRAMES.filter((t) => archive[t]?.n)
+    for (let i = 0; i < wanted.length; i++) {
+      const tf = wanted[i]
+      setNote(`reading ${tf} (${i + 1} of ${wanted.length})…`)
       const f = fetched[tf] ?? (await fetchTf(tf))
-      if (!f || !f.candles.length) continue
+      if (!f) {
+        failed.push(tf)
+        continue
+      }
+      if (!f.candles.length) continue
       const csv = csvOf(asset, tf, f.candles, true)
       parts.push(first ? csv : csv.slice(csv.indexOf('\n') + 1))
       first = false
@@ -146,11 +175,11 @@ export default function DataExportTab({ initialAsset, assets, onError }: DataExp
     }
     setBusy(null)
     if (!parts.length) {
-      setNote(`${asset} has no archived bars to download`)
+      setNote(failed.length ? `could not read ${failed.join(', ')} - see the error toast; try one timeframe at a time` : `${asset} has no archived bars to download`)
       return
     }
     saveText(`${asset}_all_timeframes.csv`, parts.join('\n'))
-    setNote(`downloaded ${asset}_all_timeframes.csv (${total} bars across ${parts.length} timeframes)`)
+    setNote(`downloaded ${asset}_all_timeframes.csv (${total} bars across ${parts.length} timeframes)${failed.length ? ` - could not read: ${failed.join(', ')} (use that row's own button to retry)` : ''}`)
   }
 
   const rows = TIMEFRAMES.map((tf) => ({ tf, a: archive[tf], f: fetched[tf] }))
@@ -215,7 +244,7 @@ export default function DataExportTab({ initialAsset, assets, onError }: DataExp
           </tbody>
         </table>
         <p className="mt-2 text-[9px] leading-relaxed text-[#4b5a72]">
-          Bars come from the kernel&apos;s own archive plus its live tail. The archive keeps about 4000 bars per pair per timeframe, so one download is at most that many; older bars are dropped as new ones arrive, so download regularly to build a longer history. Bars the feed was not recording are missing, never filled in - the gap count shows how patchy a window is, and any pattern work should treat each run between gaps separately. Columns: time (unix seconds), iso (UTC), open, high, low, close, volume.
+          Bars are exactly the rows in the kernel&apos;s archive - no synthetic gap-fill or prehistory is added (the chart&apos;s own reads do pad those, these downloads do not). The archive does not record whether a bar came from the broker or from a simulated-feed period, so a pair watched while the kernel ran in sim mode can still contain simulated bars. The archive keeps about 4000 bars per pair per timeframe, so one download is at most that many; older bars are dropped as new ones arrive, so download regularly to build a longer history. Bars the feed was not recording are missing, never filled in - the gap count shows how patchy a window is, and any pattern work should treat each run between gaps separately. Columns: time (unix seconds), iso (UTC), open, high, low, close, volume.
         </p>
       </div>
     </div>

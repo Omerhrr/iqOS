@@ -3900,6 +3900,23 @@ const httpServer = createServer(async (req, res) => {
       }
 
 
+      // GET /archive_candles?asset=&tf=&limit= - ONLY bars the archive actually stored (oldest first, up to 5000), straight from the
+      // sqlite table. Unlike /candles?deep=1 it never adds the synthetic gap-fill / prehistory the in-memory series is padded with, so
+      // it is the route to export research data from. Whether an archived bar came from the broker or from a simulated-feed period is
+      // not recorded, so a pair that was ever watched while the kernel ran in sim mode can still contain simulated bars.
+      if (path === '/archive_candles') {
+        const store = kernel.context().use<{ getCandlesArchive: (asset: string, tf: string, limit: number) => { time: number; open: number; high: number; low: number; close: number; volume: number }[] }>('storeRaw')
+        const asset = String(q.get('asset') ?? '').trim()
+        const t = tfStrict(q.get('tf'))
+        if (!asset) return json(400, { ok: false, error: 'asset is required' })
+        if (t === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+        const limit = Math.max(1, Math.min(Number(q.get('limit') ?? 4000) || 4000, 5000))
+        const candles = store
+          .getCandlesArchive(asset, t, limit)
+          .filter((c) => c && [c.time, c.open, c.high, c.low, c.close].every((v) => Number.isFinite(v)))
+        return json(200, { ok: true, asset, tf: t, source: 'archive', candles })
+      }
+
       if (path === '/signal') {
         const t = tfStrict(q.get('tf'))
         if (t === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
