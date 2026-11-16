@@ -31,6 +31,7 @@ import ScreenerPanel2 from './ScreenerPanel2'
 import SmcPanel from './SmcPanel'
 import ExplainerTab from './ExplainerTab'
 import RegimePanel from './RegimePanel'
+import DataExportTab from './DataExportTab'
 import SignalTab from './SignalTab'
 import MetaStrategyPanel from './MetaStrategyPanel'
 import AlertRulesPanel from './AlertRulesPanel'
@@ -253,6 +254,7 @@ export default function BottomTabs(props: BottomTabsProps) {
             ['explainer', 'Explainer'],
             ['regime', 'Regime'],
             ['signal', 'Signal'],
+            ['data', 'Data'],
             ['meta-strategy', 'Meta-Strategy'],
             ['autopilot', `Autopilot${props.bots.filter((b) => b.bot.enabled).length ? ` (${props.bots.filter((b) => b.bot.enabled).length})` : ''}`],
             ['ai-trader', 'AI Trader'],
@@ -432,6 +434,10 @@ export default function BottomTabs(props: BottomTabsProps) {
           }}
           onError={onError}
         />
+      </TabsContent>
+
+      <TabsContent value="data" className="mt-0 min-h-0 flex-1 overflow-hidden">
+        <DataExportTab initialAsset={asset} assets={props.assets} onError={onError} />
       </TabsContent>
 
       <TabsContent value="regime" className="mt-0 min-h-0 flex-1 overflow-hidden">
