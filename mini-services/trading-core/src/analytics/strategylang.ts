@@ -210,7 +210,7 @@ import {
   adx as adxInd,
   supertrend as supertrendInd,
 } from './indicators'
-import { buildFootprint, footprintValueArea, diagonalImbalance, footprintAbsorption, unfinishedAuction, type FootprintBucket } from './otcfootprint'
+import { velocitySeriesFor as velSeriesPP, buildFootprint, footprintValueArea, diagonalImbalance, footprintAbsorption, unfinishedAuction, type FootprintBucket } from './otcfootprint'
 // `renko.*`/`pf.*`/`ha.*` namespaces (renkoMethod/pfMethod/haMethod below) -
 // reuse the SAME pure engines the 'renko'/'pointFigure'/'heikinAshi' verdict
 // reads already call (plugins/metastrategy.ts), nothing re-derived. A type-
@@ -2650,15 +2650,21 @@ function cmMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | und
  *   side() "call" | "put" | "none"   net() / bull() / bear() Bull/Bear Power in ATR units   delta() footprint-proxy delta (NaN without volume)   bucket() "power/foot"
  * A past frequency, not a forecast; 70% on a 1-bar binary is rare - expect few fires. */
 const ppCache = new WeakMap<MslSeriesCtx, PowerProbRead>()
-function ppMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+const ppoCache = new WeakMap<MslSeriesCtx, PowerProbRead>()
+function ppMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined, otc = false): MslValue {
   void args
   const s = requireSeries(ctx, tf)
   if (name === 'ok') return s.close.length >= POWERPROB_MIN_BARS
+  if (otc && name !== 'ok') requireTicks(ctx)
   if (s.close.length < POWERPROB_MIN_BARS) throw new MslRuntimeError(`pp.${name}() needs at least ${POWERPROB_MIN_BARS} closed bars - history is too thin`)
-  let r = ppCache.get(s)
+  const cache = otc ? ppoCache : ppCache
+  let r = cache.get(s)
   if (!r) {
-    r = readPowerProb(seriesToCandles(s))
-    ppCache.set(s, r)
+    if (otc) {
+      const cs = candlesWithTime(s)
+      r = readPowerProb(cs, { footDelta: velSeriesPP(cs, requireTicks(ctx) as never).vdelta })
+    } else r = readPowerProb(seriesToCandles(s))
+    cache.set(s, r)
   }
   if (!r.ok) throw new MslRuntimeError(`pp.${name}() - not enough usable bars (indicator warmup / flat ATR)`)
   switch (name) {
@@ -4390,6 +4396,12 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
         return ppMethod(e.name, args, ctx, tf)
+      }
+      // ppo.* - same model as pp.* but the footprint level is the OTC micro-tick delta per candle (LIVE-ONLY, needs ticks)
+      if (e.obj.t === 'ident' && e.obj.name === 'ppo' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return ppMethod(e.name, args, ctx, tf, true)
       }
       if (e.obj.t === 'ident' && e.obj.name === 'cm' && !(e.obj.name in env)) {
         const args = e.args.map((a) => evalExpr(a, env, ctx))

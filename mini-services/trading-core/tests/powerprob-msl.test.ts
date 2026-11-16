@@ -109,6 +109,23 @@ test('random walk: no edge is invented - the 70% rule rarely fires and wins abou
 })
 
 let fail = 0
+test('ppo: external tick delta drives the footprint level; uncovered bars never counted', () => {
+  const c = walk(600, 7, true)
+  const r = rng(11)
+  const fd = c.map((_, i) => (i % 5 === 0 ? NaN : gauss(r) * 10))
+  fd[c.length - 1] = 12
+  const a = readPowerProb(c, { footDelta: fd })
+  assert.equal(a.ok, true)
+  assert.equal(a.volumeOk, true)
+  fd[c.length - 1] = NaN
+  const b = readPowerProb(c, { footDelta: fd })
+  assert.equal(b.volumeOk, false)
+})
+test('ppo: fails closed without a tick buffer in a candle-only backtest', () => {
+  const res = backtestMslScript(walk(400, 3), 'if ppo.ok() and ppo.volumeOk()\n  call when true\nend', { expiryBars: 1, warmupBars: 100, runId: 'ppo' } as never)
+  assert.equal((res as { trades?: unknown[] }).trades?.length ?? 0, 0)
+})
+
 for (const [n, f] of tests) { try { f(); console.log('ok  ' + n) } catch (e) { fail++; console.log('FAIL ' + n + '\n    ' + (e as Error).message.slice(0, 600)) } }
 console.log(fail ? fail + ' FAILED' : 'all ' + tests.length + ' passed')
 process.exit(fail ? 1 : 0)

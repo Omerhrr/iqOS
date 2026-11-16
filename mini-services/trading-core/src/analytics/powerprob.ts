@@ -70,8 +70,9 @@ function wilsonLow(w: number, n: number): number {
 
 const powerLevel = (net: number): number => (net <= -1.2 ? 0 : net <= -0.4 ? 1 : net < 0.4 ? 2 : net < 1.2 ? 3 : 4)
 const footLevel = (d: number): number => (!Number.isFinite(d) ? 1 : d <= -0.35 ? 0 : d < 0.35 ? 1 : 2)
+const footLevelOtc = (d: number): number => (!Number.isFinite(d) ? -1 : d <= -0.5 ? 0 : d < 0.5 ? 1 : 2)
 
-export function readPowerProb(candles: Candle[], opts: { window?: number } = {}): PowerProbRead {
+export function readPowerProb(candles: Candle[], opts: { window?: number; footDelta?: number[] } = {}): PowerProbRead {
   const n = candles.length
   if (n < POWERPROB_MIN_BARS) return { ...EMPTY, bars: n }
   const window = Math.max(100, Math.min(Math.round(opts.window ?? DEFAULT_WINDOW), 5000))
@@ -86,7 +87,16 @@ export function readPowerProb(candles: Candle[], opts: { window?: number } = {})
   const tail = vol.slice(-60)
   const mean = tail.reduce((s, v) => s + v, 0) / tail.length
   const sd = Math.sqrt(tail.reduce((s, v) => s + (v - mean) * (v - mean), 0) / tail.length)
-  const volumeOk = tail.filter((v) => v > 0).length >= tail.length * 0.8 && sd > 0
+  let volumeOk = tail.filter((v) => v > 0).length >= tail.length * 0.8 && sd > 0
+  // OTC tick footprint: caller supplies a per-candle tick delta (NaN = no tick coverage). It replaces the volume proxy.
+  const ext = opts.footDelta && opts.footDelta.length === n ? opts.footDelta : null
+  let extDelta: number[] | null = null
+  if (ext) {
+    const cov = ext.filter((v) => Number.isFinite(v))
+    const m = cov.slice(-200).reduce((s2, v) => s2 + Math.abs(v), 0) / Math.max(1, Math.min(cov.length, 200))
+    extDelta = ext.map((v) => (Number.isFinite(v) && m > 0 ? v / m : NaN))
+    volumeOk = cov.length >= 30 && Number.isFinite(ext[n - 1])
+  }
 
   // rolling mean volume of the 20 bars up to and including i
   const vsum: number[] = new Array(n).fill(NaN)
@@ -104,8 +114,12 @@ export function readPowerProb(candles: Candle[], opts: { window?: number } = {})
     if (!Number.isFinite(e[i]) || !Number.isFinite(a[i]) || a[i] <= 0) continue
     net[i] = (high[i] - e[i] + (low[i] - e[i])) / a[i]
     const rng = high[i] - low[i]
-    if (volumeOk && Number.isFinite(vsum[i]) && vsum[i] > 0 && rng > 0) delta[i] = (vol[i] * ((2 * close[i] - high[i] - low[i]) / rng)) / vsum[i]
-    lvl[i] = powerLevel(net[i]) * 3 + footLevel(delta[i])
+    if (extDelta) delta[i] = extDelta[i]
+    else if (volumeOk && Number.isFinite(vsum[i]) && vsum[i] > 0 && rng > 0) delta[i] = (vol[i] * ((2 * close[i] - high[i] - low[i]) / rng)) / vsum[i]
+    if (extDelta) {
+      if (footLevelOtc(delta[i]) < 0) continue // uncovered bar: never enters the stats
+      lvl[i] = powerLevel(net[i]) * 3 + footLevelOtc(delta[i])
+    } else lvl[i] = powerLevel(net[i]) * 3 + footLevel(delta[i])
   }
 
   const last = n - 1
