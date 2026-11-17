@@ -25,7 +25,7 @@ import {
   type UTCTimestamp,
 } from 'lightweight-charts'
 import type { AnalysisResult, Candle, ChartType, ExpirySurfaceResponse, IndicatorSeries, IvHvResponse, NextExpiryPrediction, OtcFootprintResult, OutcomeMemoryResponse, Position, PulseBarRow, PulseBarsResponse, TickBarRow, TickFootprintResult, TicksResponse, Timeframe } from '@/lib/os/client'
-import { chartPriceFormat, fmtPrice, getDayLevels, getFastLevels, getExpirySurface, getNextExpiry, getOtcFootprint, getOutcomeMemory, getPulseBars, getTickFootprint, osGet, TIMEFRAME_SECONDS } from '@/lib/os/client'
+import { chartPriceFormat, fmtPrice, getDayLevels, getFastLevels, getExpectedMove, getExpirySurface, getNextExpiry, getOtcFootprint, getOutcomeMemory, getPulseBars, getTickFootprint, osGet, TIMEFRAME_SECONDS } from '@/lib/os/client'
 
 interface ChartPanelProps {
   candles: Candle[]
@@ -2856,6 +2856,50 @@ export default function ChartPanel({
     }
   }, [showMap, digitsTicker, chartType, tf])
 
+  // EM toggle: the EXPECTED MOVE cone - the range REALIZED volatility implies over the next 20 bars (sd*sqrt(h), +/-1 and 2 sigma), drawn as dashed lines widening into the future.
+  // TradingView's version is options-implied; IQ Option has no options chain, so this is recent volatility, not a forecast. MSL: em.*
+  const [showEm, setShowEm] = useState(false)
+  const emRef = useRef<ISeriesApi<'Line'>[]>([])
+  useEffect(() => {
+    const clearEm = () => {
+      for (const ts of emRef.current) {
+        try {
+          chartRef.current?.removeSeries(ts)
+        } catch {
+          // chart already torn down
+        }
+      }
+      emRef.current = []
+    }
+    if (!showEm) {
+      clearEm()
+      return
+    }
+    let alive = true
+    const draw = () =>
+      getExpectedMove(digitsTicker, tf ?? '1m', 20, '1,2')
+        .then((d) => {
+          const ch = chartRef.current
+          if (!alive || !ch || !d.ok || !d.points.length) return
+          clearEm()
+          d.ks.forEach((k, ki) => {
+            for (const side of ['upper', 'lower'] as const) {
+              const ls = ch.addSeries(LineSeries, { color: side === 'upper' ? (ki ? '#2563eb' : '#60a5fa') : ki ? '#be185d' : '#f472b6', lineWidth: ki ? 1 : 2, lineStyle: ki ? LineStyle.Dotted : LineStyle.Dashed, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false })
+              ls.setData(d.points.map((p) => ({ time: p.time as UTCTimestamp, value: p[side][ki] })))
+              emRef.current.push(ls)
+            }
+          })
+        })
+        .catch(() => {})
+    void draw()
+    const t = setInterval(draw, 20_000)
+    return () => {
+      alive = false
+      clearInterval(t)
+      clearEm()
+    }
+  }, [showEm, digitsTicker, chartType, tf])
+
   const fitChart = () => {
     chartRef.current?.timeScale().fitContent()
     chartRef.current?.timeScale().scrollToRealTime()
@@ -2882,6 +2926,15 @@ export default function ChartPanel({
           }`}
         >
           MAP
+        </button>
+        <button
+          onClick={() => setShowEm((v) => !v)}
+          title="Expected move cone: the range realized volatility implies over the next 20 bars (+/-1 sigma solid-ish, +/-2 sigma dotted). Not options-implied (IQ Option has no options chain) and not a forecast. MSL: em.*"
+          className={`flex h-6 w-6 items-center justify-center rounded border font-mono text-[8px] font-bold leading-none transition-colors ${
+            showEm ? 'border-blue-500/60 bg-blue-500/15 text-blue-300' : 'border-[#1c2739] bg-[#0d1420]/90 text-[#7c8aa5] hover:border-blue-500/40'
+          }`}
+        >
+          EM
         </button>
         <button
           onClick={() => zoomBy(0.7)}

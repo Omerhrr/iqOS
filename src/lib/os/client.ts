@@ -651,6 +651,15 @@ export async function getFastLevels(asset: string, tf: string, fast: string = '5
   return osGet('/fast_levels', { asset, tf, fast })
 }
 
+export interface ExpectedMoveResponse {
+  ok: boolean; asset: string; tf: string; bars: number; price: number; sd: number; atr: number; spacing: number; ks: number[]; error?: string
+  points: { time: number; step: number; upper: number[]; lower: number[] }[]
+}
+/** Expected-move cone: the range realized volatility implies over the next `bars` bars (no options chain on IQ Option, so not option-implied). */
+export async function getExpectedMove(asset: string, tf: string, bars: number = 20, ks: string = '1,2'): Promise<ExpectedMoveResponse> {
+  return osGet('/expected_move', { asset, tf, bars: String(bars), k: ks })
+}
+
 /** Previous day / week highs & lows, today's range and the latest Asia / London / New York session ranges. */
 export async function getDayLevels(asset: string, tf: string = '5m'): Promise<DayLevelsResponse> {
   return osGet('/levels', { asset, tf })
