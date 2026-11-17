@@ -248,6 +248,9 @@ import { WYCKOFF_MIN_BARS, readWyckoff, type WyckoffRead } from './mslwyckoff'
 import { SMCX_MIN_BARS, readSmcx, type SmcxRead } from './mslsmcx'
 import { smtDivergence } from './smt'
 import { readBlocks, readJudas, readSoup, type BlockRead, type JudasRead } from './mslpatterns'
+import { aiReadingFor, inMslBacktest } from './mslai'
+import { readLearn, DISCOVER_MIN_BARS, type LearnRead } from './discover'
+import { readMarket, readAdapt, MARKETMIND_MIN_BARS, type MarketRead, type AdaptRead } from './marketmind'
 import { readPowerProb, POWERPROB_MIN_BARS, type PowerProbRead } from './powerprob'
 import { MMXM_MIN_BARS, readMmxm, type MmxmRead } from './mslmmxm'
 import { PV_MIN_BARS, readPv, type PvRead } from './mslpv'
@@ -2650,6 +2653,102 @@ function cmMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | und
  *   side() "call" | "put" | "none"   net() / bull() / bear() Bull/Bear Power in ATR units   delta() footprint-proxy delta (NaN without volume)   bucket() "power/foot"
  * A past frequency, not a forecast; 70% on a 1-bar binary is rare - expect few fires. */
 const ppCache = new WeakMap<MslSeriesCtx, PowerProbRead>()
+/** `ai.*` - the AI desk (analytics/mslai.ts): a language-model OPINION on a numeric snapshot, riding on the kernel's Copilot LLM config. LIVE-ONLY and
+ * non-blocking: the first call of a bar starts the request, every method fails closed ("pending") until the verdict is cached; never available in backtests. */
+function aiMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  void args
+  if (inMslBacktest()) throw new MslRuntimeError(`ai.${name}() is live-only: a model reply is not replayable, so it never runs in a backtest`)
+  const s = requireSeries(ctx, tf)
+  if (s.close.length < 60) throw new MslRuntimeError(`ai.${name}() needs at least 60 closed bars`)
+  const st = aiReadingFor(candlesWithTime(s))
+  if (name === 'ready') return st.state === 'ready'
+  if (st.state === 'off') throw new MslRuntimeError(`ai.${name}() - ${st.error}`)
+  if (st.state === 'pending') throw new MslRuntimeError(`ai.${name}() - AI verdict pending (requested, not back yet)`)
+  if (st.state === 'error' || !st.reading) throw new MslRuntimeError(`ai.${name}() - AI request failed: ${st.error ?? 'unknown'}`)
+  const rd = st.reading
+  switch (name) {
+    case 'side': return rd.side
+    case 'conf': return rd.confidence
+    case 'risk': return rd.risk
+    case 'regime': return rd.regime
+    case 'reason': return rd.reason
+    case 'veto': return rd.side === 'none' || rd.risk === 'high'
+    default: throw new MslRuntimeError(`unknown ai method "ai.${name}(...)" - use ready/side/conf/risk/regime/reason/veto`)
+  }
+}
+
+const learnCache = new WeakMap<MslSeriesCtx, LearnRead>()
+/** `learn.*` - pattern DISCOVERY with a held-out validation slice (analytics/discover.ts). Candle-derived, backtestable. */
+function learnMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  void args
+  const s = requireSeries(ctx, tf)
+  if (name === 'ok') return s.close.length >= DISCOVER_MIN_BARS
+  if (s.close.length < DISCOVER_MIN_BARS) throw new MslRuntimeError(`learn.${name}() needs at least ${DISCOVER_MIN_BARS} closed bars - history is too thin`)
+  let r = learnCache.get(s)
+  if (!r) {
+    r = readLearn(seriesToCandles(s))
+    learnCache.set(s, r)
+  }
+  if (!r.ok) throw new MslRuntimeError(`learn.${name}() - not enough usable bars`)
+  switch (name) {
+    case 'found': return r.found
+    case 'tested': return r.tested
+    case 'match': return r.match
+    case 'side': return r.side
+    case 'pattern': return r.pattern
+    case 'p': return r.p
+    case 'low': return r.low
+    case 'n': return r.n
+    case 'valP': return r.valP
+    case 'valN': return r.valN
+    case 'conflict': return r.conflict
+    default: throw new MslRuntimeError(`unknown learn method "learn.${name}(...)" - use ok/found/tested/match/side/pattern/p/low/n/valP/valN/conflict`)
+  }
+}
+
+const mktCache = new WeakMap<MslSeriesCtx, MarketRead>()
+const adaptCache = new WeakMap<MslSeriesCtx, AdaptRead>()
+/** `mkt.*` (understand the market) and `adapt.*` (pick the rule that has worked in this regime) - analytics/marketmind.ts. Candle-derived, backtestable. */
+function mktMethod(ns: 'mkt' | 'adapt', name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  void args
+  const s = requireSeries(ctx, tf)
+  if (name === 'ok') return s.close.length >= MARKETMIND_MIN_BARS
+  if (s.close.length < MARKETMIND_MIN_BARS) throw new MslRuntimeError(`${ns}.${name}() needs at least ${MARKETMIND_MIN_BARS} closed bars - history is too thin`)
+  let r: AdaptRead | MarketRead | undefined = (ns === 'mkt' ? mktCache : adaptCache).get(s)
+  if (!r) {
+    r = ns === 'mkt' ? readMarket(seriesToCandles(s)) : readAdapt(seriesToCandles(s))
+    ;(ns === 'mkt' ? mktCache : adaptCache).set(s, r as never)
+  }
+  if (!r.ok) throw new MslRuntimeError(`${ns}.${name}() - not enough usable bars (indicator warmup)`)
+  switch (name) {
+    case 'regime': return r.regime
+    case 'trend': return r.trend
+    case 'isTrending': return r.regime === 'trend_up' || r.regime === 'trend_down'
+    case 'isReverting': return r.regime === 'revert'
+    case 'isChop': return r.regime === 'chop'
+    case 'strength': return r.strength
+    case 'vr': return r.vr
+    case 'ac': return r.ac
+    case 'vol': return r.vol
+    case 'volRatio': return r.volRatio
+    case 'conf': return r.confidence
+  }
+  if (ns === 'adapt') {
+    const a = r as AdaptRead
+    switch (name) {
+      case 'mode': return a.mode
+      case 'side': return a.side
+      case 'p': return a.p
+      case 'low': return a.low
+      case 'n': return a.n
+      case 'pFollow': return a.pFollow
+      case 'pFade': return a.pFade
+      case 'pTrend': return a.pTrend
+    }
+  }
+  throw new MslRuntimeError(`unknown ${ns} method "${ns}.${name}(...)" - use ok/regime/trend/isTrending/isReverting/isChop/strength/vr/ac/vol/volRatio/conf${ns === 'adapt' ? '/mode/side/p/low/n/pFollow/pFade/pTrend' : ''}`)
+}
+
 const ppoCache = new WeakMap<MslSeriesCtx, PowerProbRead>()
 function ppMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined, otc = false): MslValue {
   void args
@@ -4396,6 +4495,21 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
         return ppMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'ai' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return aiMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'learn' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return learnMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && (e.obj.name === 'mkt' || e.obj.name === 'adapt') && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return mktMethod(e.obj.name as 'mkt' | 'adapt', e.name, args, ctx, tf)
       }
       // ppo.* - same model as pp.* but the footprint level is the OTC micro-tick delta per candle (LIVE-ONLY, needs ticks)
       if (e.obj.t === 'ident' && e.obj.name === 'ppo' && !(e.obj.name in env)) {

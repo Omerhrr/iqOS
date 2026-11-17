@@ -870,6 +870,27 @@ export interface MetaStrategyScriptTestResponse {
   ts?: number
 }
 
+export interface AiVetResponse {
+  ok: boolean
+  error?: string
+  asset?: string
+  tf?: string
+  trades?: number
+  wins?: number
+  winRate?: number | null
+  wilsonLow?: number
+  breakEven?: number
+  firstHalf?: { n: number; wins: number }
+  secondHalf?: { n: number; wins: number }
+  evidence?: string
+  critique?: string
+}
+
+/** POST /ai_vet - backtest on ARCHIVE candles, then an AI critique from that evidence only (kernel LLM = Copilot's provider config). */
+export async function aiVetScript(script: string, asset: string, tf: Timeframe, expiryBars = 1): Promise<AiVetResponse> {
+  return osPost('/ai_vet', { script, asset, tf, expiryBars })
+}
+
 export async function testMetaStrategyScript(script: string, asset: string, tf: Timeframe): Promise<MetaStrategyScriptTestResponse> {
   return osPost('/meta_strategy_test_script', { script, asset, tf })
 }

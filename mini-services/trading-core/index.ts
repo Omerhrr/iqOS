@@ -101,6 +101,9 @@ import { computeTpo } from './src/analytics/tpo'
 import { tickBars } from './src/analytics/tickbars'
 import { detectTickPatterns } from './src/analytics/tickpatterns'
 import { chartPropertyRegistryForVocab } from './src/analytics/chartpropertyregistry'
+import { setMslAiChat, setMslAiEnabled, aiAnalyze, aiVet, mslAiAvailable } from './src/analytics/mslai'
+import { chatComplete, providerStatus as llmProviderStatus } from './src/lib/llm'
+import { wilsonLowerBound as aiWilson } from './src/analytics/mslai-stats'
 import { backtestMslScript, backtestMslScriptWalkForward, backtestMslScriptCrossAsset } from './src/analytics/mslbacktest'
 import { hvSeries, ivFromPayout, realizedUpProb } from './src/analytics/ivhv'
 import { buildCalibrationReport, type CalibrationStoreSlice } from './src/analytics/calibration'
@@ -112,6 +115,8 @@ import { computeOutcomeMemory } from './src/analytics/outcomememory'
 import { computePulseBars } from './src/analytics/pulsebars'
 import { computeExpirySurface } from './src/analytics/expirysurface'
 import { EXPIRY_ORACLE_MIN_CANDLES } from './src/analytics/nextexpiry'
+setMslAiChat(async (messages, o) => (await chatComplete({ messages, maxTokens: o?.maxTokens, temperature: o?.temperature, timeoutMs: o?.timeoutMs })).content)
+setMslAiEnabled(true)
 
 // Defaults to 3030 for local/Windows dev; the Docker deployment overrides
 // this to an unusual, hard-to-collide-with port via the KERNEL_PORT env var.
@@ -2975,6 +2980,10 @@ const httpServer = createServer(async (req, res) => {
             ou: 'The KALMAN / ORNSTEIN-UHLENBECK mean-reversion model (analytics/kalman.ts - the Quant panel / kalman-ou overlay numbers) as MSL primitives. Fits the OU process (AR(1) on price) over a rolling window and runs the OU-drift Kalman filter. CANDLE-DERIVED ONLY, works in meta_strategy_eval, Meta Trader, Omni Trader AND meta_strategy_backtest. An optional first numeric arg = fit window 30-240 (default 240); an optional trailing tf string reads another timeframe. Methods: ok() -> 60+ closed bars (every other method fails the script closed otherwise); z() -> stretch of price from the equilibrium in stationary sigmas (clamped +/-12); theta() -> OU equilibrium; fair() -> Kalman fair-value estimate; upper(w?, k?)/lower(w?, k?) -> theta +/- k*sigma (k default 2); sigma() -> stationary std in price units; halfLife() -> reversion half-life in BARS (9999 = none); kappa()/phi(); tStat() -> significance of the reversion; r2(); reverting() -> the app\'s own screen (t >= 1.5 and half-life <= 250 - LOOSE, roughly half of pure random walks pass it); dfSignificant() -> BOOLEAN t >= 2.86, the 5% Dickey-Fuller critical value (the honest \'reversion is statistically real\' test; ~5% of random walks pass); stretchedAbove()/stretchedBelow() -> |z| >= 1.5, z ONLY (does not check reverting - combine it); signal() -> STRING \'call\'|\'put\'|\'none\' (a stretch that also passes reverting()); score() -> the model\'s own 0-100; innovation() -> last standardized Kalman innovation. HONESTY: on a synthetic true-OU market (phi 0.85) `call when ou.stretchedBelow() / put when ou.stretchedAbove()` won 77.6% (1078 trades, 2-bar expiry); on pure random walks the same script settled 51.8% (1872 trades) - the model finds reversion only where it exists, and real markets are not known to be OU: backtest before trusting. Example: `call when ou.dfSignificant() and ou.z() < -2 and ou.halfLife() < 20\\nput when ou.dfSignificant() and ou.z() > 2 and ou.halfLife() < 20\\nconfidence = 60`.',
             markov: 'The first-order MARKOV chain over vol-scaled return states (analytics/quant.ts markovChain) as MSL primitives. Five states: -2 big_down, -1 down, 0 flat, +1 up, +2 big_up, thresholds are multiples of the pair\'s own return sigma (so it reads the same on forex and crypto); Laplace-smoothed transition matrix. CANDLE-DERIVED ONLY, backtestable. An optional first numeric arg = lookback bars 60-1000 (default 500). Methods: ok(); probUp()/probDown()/probFlat() -> next-bar probability of an up / down / flat state given the CURRENT state; expectedReturn() -> probability-weighted next-bar log return; state() -> current state -2..+2; next(s) -> next-bar probability of state s; p(from, to) -> transition probability between two states; stationary(s) -> long-run share of state s; trendiness() 0..1; entropy() 0..1 (1 = next state fully unpredictable); regime() -> STRING \'bull\'|\'bear\'|\'range\'|\'chop\'; samples() -> how many return states the chain was fit on (gate on it). HONESTY: probabilities come from the pair\'s own history in-sample - a transition table is not a forecast, and a small samples() makes it noisy. Example: `call when markov.samples() > 300 and markov.probUp() > 0.58 and markov.entropy() < 0.97\\nput when markov.samples() > 300 and markov.probDown() > 0.58 and markov.entropy() < 0.97\\nconfidence = 60`.',
             stat: 'Return-distribution and mean-reversion STATISTICS (analytics/quant.ts) on closed candles. CANDLE-DERIVED ONLY, backtestable. Methods: ok() 60+ bars; hurst() -> rescaled-range Hurst exponent 0..1 (< 0.5 mean-reverting, ~0.5 random walk, > 0.5 trending; needs 101+ bars; R/S is a noisy estimator); autocorr(lag?, n?) -> autocorrelation of the last n log returns at lag 1-20 (defaults 1, 120; negative = reverting); varianceRatio(q?, n?) -> Lo-MacKinlay variance ratio of q-bar vs 1-bar returns (defaults q 4, n 200): < 1 reverting, ~1 random walk, > 1 trending; vrZ(q?, n?) -> its z statistic (|z| > 2 = statistically not a random walk); regSlope(n?)/regR2(n?)/regMid(n?)/regUpper(n?, k?)/regLower(n?, k?) -> linear-regression channel over n bars (default 100, k = 2 residual sigmas); regZ(n?) -> price\'s distance from the regression line in residual sigmas; ewmaVol(n?, lambda?) and garchVol(n?) -> per-bar log-return volatility; retMean(n?)/retStd(n?)/skew(n?)/kurt(n?) -> moments of the last n log returns (default 120). Windows too long for the available history fail the script closed. Example: `call when stat.varianceRatio(4, 200) < 0.85 and stat.regZ(100) < -1.5\\nput when stat.varianceRatio(4, 200) < 0.85 and stat.regZ(100) > 1.5\\nconfidence = 60`.',
+            ai: 'AI DESK (analytics/mslai.ts): a language-model OPINION on a numeric snapshot (last 40 candles + mkt/adapt/learn reads), riding on the kernel own LLM config = the same USE_* provider setup Copilot uses, no extra key. LIVE-ONLY and NON-BLOCKING: the first evaluation of a bar starts the request in the background and every method fails closed (pending) until the verdict is cached (one request per bar, ~3-15 s), so a live trader that re-evaluates reads it a moment later; it never runs in a backtest (not replayable). Methods: ready(); side() call|put|none; conf() 0-100; risk() low|medium|high; regime(); reason(); veto() true when side is none or risk is high. Example: `call when ai.ready() and ai.side() == "call" and ai.conf() >= 65 and not ai.veto()`. Best used as a FILTER on a measured strategy, not as the strategy. HONESTY: an opinion, not a measured edge; latency can make a 1-minute signal late. Offline helpers: POST /ai_vet {script, asset, tf, expiryBars?, payout?} backtests on ARCHIVE candles (win rate vs break-even, halves, Wilson bound) then has the model critique from that evidence only; POST /ai_analyze {asset, tf, question?}; GET /ai_status.',
+            learn: 'PATTERN DISCOVERY WITH A HELD-OUT TEST (analytics/discover.ts), candle-derived and backtestable, 400+ bars. Mines this pair own history for candle-shape sequences (1, 2 or 3 closed bars, each = direction x body size vs ATR14 x where it closed in its range), alone or conditioned on the mkt regime. Each candidate next-bar hit-rate is measured on the OLDER 70% of the last 3000 bars; only candidates with z >= 3 there (a Bonferroni-style bar for ~1000 candidates) are re-tested on the NEWER untouched 30% and must agree in direction at one-sided p < 0.05. Survivors are the discovered patterns; the latest bar is matched against them (best Wilson lower bound wins). Methods: ok(); found() validated patterns; tested() candidates with enough samples; match() latest bar fits one; side() call|put|none; pattern() text; p() pooled shrunk hit-rate; low() Wilson 95% lower bound; n(); valP()/valN() validation slice; conflict() matching patterns disagree. Example: `call when learn.ok() and learn.match() and not learn.conflict() and learn.low() >= 0.55 and learn.side() == "call"` (put likewise). HONESTY: most pairs yield NO survivors on a few thousand bars - that is the correct answer; survivors are past frequencies, not forecasts, and can still be luck at about 1 in 15 per run under pure noise.',
+            mkt: 'MARKET UNDERSTANDING (analytics/marketmind.ts), candle-derived and backtestable, 150+ bars. Labels the latest closed bar trend_up / trend_down / revert / chop from three measured facts (efficiency ratio over 20 bars, Lo-MacKinlay variance ratio q4 over 100, lag-1 autocorrelation over 100: 2 of 3 must agree) plus a volatility state (ATR14 vs its 100-bar median: low <0.7, high >1.5). Methods: ok(); regime(); trend() +1/-1/0; isTrending()/isReverting()/isChop(); strength() efficiency ratio 0..1; vr(); ac(); vol() low|normal|high; volRatio(); conf() 0..1 share of facts agreeing. Labels are noisy and lag turning points.',
+            adapt: 'SELF-ADAPTING RULE CHOICE (analytics/marketmind.ts), candle-derived and backtestable, 150+ bars. Scores three rules (follow the last candle, fade it, follow the EMA20 side) on this pair EARLIER bars that sat in the same mkt regime, recent bars weighted more (half-life 300 bars), walk-forward with no look-ahead. The best shrunk hit-rate becomes mode() follow|fade|trend (none when the best is <= 50% or the bar has no opinion) and side() is what that rule says now. Methods: ok(); mode(); side() call|put|none; p() chosen rule hit-rate; low() Wilson 95% lower bound; n() scored bars; pFollow()/pFade()/pTrend(); plus every mkt method. Example: `call when adapt.ok() and adapt.n() >= 30 and adapt.p() >= 0.60 and adapt.side() == "call"` (put likewise). HONESTY: a selector over past frequencies, not a learner of new patterns; picking the best of 3 rules in-sample can pick luck, so gate on n and forward-test.',
             ppo: 'SAME MODEL AS pp.* BUT THE FOOTPRINT IS THE OTC MICRO-TICK DELTA per candle (velocitySeriesFor: ticks up minus ticks down inside each bar, normalised by the recent mean absolute delta, 3 levels at -0.5/+0.5). Same methods as pp.* (ok/volumeOk/n/pUp/pDown/lowUp/lowDown/base/side/net/bull/bear/delta/bucket). volumeOk() = the latest bar has tick coverage and 30+ bars do. LIVE-ONLY (Omni Trader / Meta Trader with a tick buffer): needs the tick buffer, fails closed without it, NOT backtestable on exported candles; only bars inside the tick buffer (~16h) enter the bucket stats, so n grows slowly - keep n >= 30. Example: `call when ppo.ok() and ppo.volumeOk() and ppo.n() >= 30 and ppo.pUp() >= 0.70`.',
             pp: 'BULL/BEAR POWER + FOOTPRINT-PROXY NEXT-CANDLE PROBABILITY (analytics/powerprob.ts). The latest closed bar is put in a bucket (Elder Ray net power = (high-EMA13 + low-EMA13)/ATR14 in 5 levels x a candle-volume footprint proxy, volume x where the bar closed in its range, in 3 levels) and the probability is the up-rate of EARLIER bars in the same bucket whose next candle already closed, over the last 1500 bars, shrunk as (ups+1)/(n+2); up = next close above this close; no look-ahead. CANDLE-DERIVED, backtestable. The footprint is a PROXY, not real order flow (IQ Option gives no bid/ask or per-price volume); with flat/zero volume (OTC) it is unavailable and the read falls back to power alone - gate on pp.volumeOk(). Methods: ok() 80+ bars; volumeOk(); n() earlier bars in the same bucket (a probability on n < 30 means little); pUp()/pDown() next candle up/down probability; lowUp()/lowDown() Wilson 95% lower bounds; base() unconditional up-rate; side() call|put|none; net()/bull()/bear() power in ATR units; delta() footprint delta; bucket(). Example: `call when pp.ok() and pp.volumeOk() and pp.n() >= 30 and pp.pUp() >= 0.70` (put side with pp.pDown()). HONESTY: a past frequency, not a forecast; 70% on a 1-bar binary is rare, and on 4000 real US2000 bars it fired 6 times on 1m and never on 2m/5m while the 60-65% tiers did not hold up out of sample.',
             cm: 'CANDLE MATH (analytics/candlemath.ts): blend consecutive candles into one master candle and read it. Blend rule: open of the first bar, highest high, lowest low, close of the last bar, summed volume. CANDLE-DERIVED ONLY, backtestable. Methods: ok() 30+ bars; blend(n, end?) -> the blended bar of the n closed bars ending at `end` (-1 = latest, default) as a BAR value, so cm.blend(3).body/.range/.upperWick/.lowerWick/.o/.h/.l/.c/.v work exactly like ohlc(); has(name, n) -> BOOLEAN, does the blended n-bar candle form this pattern (any name from the 74-pattern catalog, case-insensitive); revealed(name, n) -> BOOLEAN, same AND the raw unblended bars inside the group did not show it; count(n)/newCount(n) -> number of patterns on the blended candle / how many blending revealed; bullish(n)/bearish(n) -> counts of bullish / bearish patterns on it; dir(n) -> +1/-1/0 reliability-weighted net direction of its patterns; smart()/smartDir() -> size (2-4) / direction of the pattern-confirmed blend group ending on the latest bar (0 if none). n is REQUIRED where shown (a lone trailing string is read as a timeframe, so write cm.has(\\"Hammer\\", 2)). Pattern reads use the 20 bars before the group as context. HONESTY: blending is a re-sampling of the same bars, so it adds no independent information - a pattern revealed by blending is still a pattern on the same candles; backtest before trusting. Example: `call when cm.revealed(\\"Bullish Engulfing\\", 2) and cm.blend(2).body > 1.5 * ind.atr(14)[-1]\\nconfidence = 60`. Also new: log(x)/ln(x)/exp(x) script math (refuse a non-positive log argument and an overflowing exp).',
@@ -3917,6 +3926,13 @@ const httpServer = createServer(async (req, res) => {
           .getCandlesArchive(asset, t, limit)
           .filter((c) => c && [c.time, c.open, c.high, c.low, c.close].every((v) => Number.isFinite(v)))
         return json(200, { ok: true, asset, tf: t, source: 'archive', candles })
+      }
+
+      // GET /ai_status - is an LLM provider configured (same config as Copilot)? ai.* in MSL needs one.
+      if (path === '/ai_status') {
+        let providers: unknown = null
+        try { providers = llmProviderStatus() } catch { providers = null }
+        return json(200, { ok: true, wired: mslAiAvailable(), providers })
       }
 
       if (path === '/signal') {
@@ -5119,6 +5135,67 @@ const httpServer = createServer(async (req, res) => {
       // verdict read at all, even for ones whose underlying namespace is
       // itself candle-derived - the response's own `unavailableSources`
       // field lists every one of them by name.
+      // ---------- AI desk (analytics/mslai.ts): rides on the kernel's Copilot LLM config, no separate key ----------
+      // POST /ai_analyze {asset, tf, question?} - free-form read of the pair's numeric snapshot (candles + mkt/adapt/learn reads).
+      // POST /ai_vet {script, asset, tf, expiryBars?, payout?} - runs the script over the pair's ARCHIVE candles (no synthetic gap-fill), measures win rate vs
+      // break-even with halves and a Wilson 95% bound, then asks the model to critique the script from that evidence ONLY. The numbers are measured; the critique is opinion.
+      if (path === '/ai_analyze' || path === '/ai_vet') {
+        try {
+          const tfv = tfStrict(String(body.tf ?? '1m'))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(String(body.tf ?? '')) })
+          const asset = String(body.asset ?? market.activeAsset)
+          const store = kernel.context().use<{ getCandlesArchive: (a: string, t: string, n: number) => Candle[] }>('storeRaw')
+          const candles = store.getCandlesArchive(asset, tfv, 4000).filter((c) => c && [c.time, c.open, c.high, c.low, c.close].every((v) => Number.isFinite(v)))
+          if (candles.length < 150) return json(400, { ok: false, error: `only ${candles.length} archived ${tfv} bars for ${asset} - need 150+` })
+          if (path === '/ai_analyze') {
+            const text = await aiAnalyze(candles, body.question !== undefined ? String(body.question) : undefined, `asset ${asset}`)
+            return json(200, { ok: true, asset, tf: tfv, bars: candles.length, analysis: text, ts: Date.now() })
+          }
+          const script = String(body.script ?? '')
+          if (!script.trim()) return json(400, { ok: false, error: 'script is required' })
+          const expiryBars = Math.max(1, Math.round(Number(body.expiryBars) || 1))
+          const payout = body.payout !== undefined ? Math.min(0.99, Math.max(0.01, Number(body.payout))) : 0.85
+          const be = 1 / (1 + payout)
+          // contiguous segments only: never evaluate across a data gap
+          const gap = TIMEFRAME_SECONDS[tfv] * 3
+          const segs: Candle[][] = []
+          let cur: Candle[] = []
+          for (const c of candles) {
+            if (cur.length && c.time - cur[cur.length - 1].time > gap) { segs.push(cur); cur = [] }
+            cur.push(c)
+          }
+          segs.push(cur)
+          let wins = 0, trades = 0, w1 = 0, n1 = 0, w2 = 0, n2 = 0, err = ''
+          const warmup = 150
+          for (const seg of segs) {
+            if (seg.length < warmup + expiryBars + 5) continue
+            const res = backtestMslScript(seg, script, { expiryBars, warmupBars: warmup, runId: `aivet:${Date.now()}` })
+            if (!res.ok) { err = res.error ?? err; continue }
+            const mid = seg[Math.floor(seg.length / 2)].time
+            for (const t of res.trades) {
+              const won = (t as { win?: boolean; won?: boolean }).win ?? (t as { won?: boolean }).won ?? false
+              trades++; if (won) wins++
+              const tt = (t as { time?: number; entryTime?: number }).time ?? (t as { entryTime?: number }).entryTime ?? 0
+              if (tt < mid) { n1++; if (won) w1++ } else { n2++; if (won) w2++ }
+            }
+          }
+          if (!trades && err) return json(400, { ok: false, error: err })
+          const rate = trades ? wins / trades : null
+          const low = aiWilson(wins, trades)
+          const pct = (a: number, b: number): string => (b ? `${(a / b * 100).toFixed(1)}% (${a}/${b})` : 'no trades')
+          const evidence = [
+            `asset ${asset}, tf ${tfv}, expiry ${expiryBars} bar(s), ${candles.length} archived bars in ${segs.length} contiguous segment(s) (archive may include simulated-feed periods)`,
+            `trades ${trades}, win rate ${rate === null ? 'n/a' : (rate * 100).toFixed(1) + '%'}, Wilson 95% lower bound ${(low * 100).toFixed(1)}%, break-even at payout ${(payout * 100).toFixed(0)}% = ${(be * 100).toFixed(1)}%`,
+            `first half ${pct(w1, n1)}; second half ${pct(w2, n2)}`,
+            `no parameters were fitted by the backtest; any thresholds in the script were chosen by its author`,
+          ].join('\n')
+          const critique = await aiVet(script, evidence)
+          return json(200, { ok: true, asset, tf: tfv, trades, wins, winRate: rate, wilsonLow: low, breakEven: be, firstHalf: { n: n1, wins: w1 }, secondHalf: { n: n2, wins: w2 }, evidence, critique, ts: Date.now() })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
       if (path === '/meta_strategy_backtest') {
         try {
           const tfv = tfStrict(String(body.tf ?? ''))

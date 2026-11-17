@@ -38,6 +38,7 @@
 // Pure function, no I/O, no look-ahead: bar i's evaluation only ever sees
 // candles[0..i] via `series`/`seriesFor`.
 
+import { beginMslBacktest, endMslBacktest } from './mslai'
 import type { Candle, Timeframe } from '../types'
 import { parseStrategyScript, evaluateStrategyScript, clearMslState, type MslSeriesCtx, type MslSourceRead, type MslAst } from './strategylang'
 import { META_CONDITION_SOURCES } from './metastrategy'
@@ -290,7 +291,15 @@ interface FiredSignal {
  * over the same candles, so `since()`/`streak()`'s own cross-bar state
  * (scoped to `runId`) stays a single continuous run exactly like a live
  * evaluator would see it, not an artificially chunked one. */
-function fireSignals(
+function fireSignals(...a: Parameters<typeof fireSignalsInner>): ReturnType<typeof fireSignalsInner> {
+  beginMslBacktest()
+  try {
+    return fireSignalsInner(...a)
+  } finally {
+    endMslBacktest()
+  }
+}
+function fireSignalsInner(
   candles: Candle[],
   parsedAst: MslAst,
   reads: Record<string, MslSourceRead>,

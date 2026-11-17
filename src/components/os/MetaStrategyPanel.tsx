@@ -27,7 +27,7 @@
 import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import CodeAssistBar from './CodeAssistBar'
-import type { MetaCondition, MetaConditionSource, MetaStrategyEvalResponse, MetaStrategyScriptTestResponse, MetaStrategySpec, MetaTraderSource, Timeframe } from '@/lib/os/client'
+import type { AiVetResponse, MetaCondition, MetaConditionSource, MetaStrategyEvalResponse, MetaStrategyScriptTestResponse, MetaStrategySpec, MetaTraderSource, Timeframe } from '@/lib/os/client'
 import {
   ALL_META_TRADER_SOURCES,
   ALL_SMC_KINDS,
@@ -41,6 +41,7 @@ import {
   saveMetaSourceCode,
   saveMetaStrategy,
   testMetaStrategyScript,
+  aiVetScript,
 } from '@/lib/os/client'
 
 interface MetaStrategyPanelProps {
@@ -415,6 +416,9 @@ export default function MetaStrategyPanel({ asset, tf, onError }: MetaStrategyPa
 
   const [scriptTestResult, setScriptTestResult] = useState<MetaStrategyScriptTestResponse | null>(null)
   const [scriptTestBusy, setScriptTestBusy] = useState(false)
+  const [aiVetBusy, setAiVetBusy] = useState(false)
+  const [aiVetResult, setAiVetResult] = useState<AiVetResponse | null>(null)
+  const [aiVetExpiry, setAiVetExpiry] = useState(1)
 
   // "a place to see all the strats we currently have... and view their
   // source code" per direct instruction - toggled per saved strategy row.
@@ -576,6 +580,18 @@ export default function MetaStrategyPanel({ asset, tf, onError }: MetaStrategyPa
       .finally(() => setTestBusy(false))
   }
 
+  const runAiVet = async () => {
+    if (!script.trim()) return
+    setAiVetBusy(true)
+    setAiVetResult(null)
+    try {
+      setAiVetResult(await aiVetScript(script, asset, tf, aiVetExpiry))
+    } catch (e) {
+      setAiVetResult({ ok: false, error: e instanceof Error ? e.message : String(e) })
+    } finally {
+      setAiVetBusy(false)
+    }
+  }
   return (
     <div className="flex h-full min-h-0 flex-col rounded-lg border border-[#1c2739] bg-[#0b111c]">
       <div className="flex flex-wrap items-center gap-1.5 border-b border-[#1c2739] px-2 py-1.5">
@@ -661,6 +677,25 @@ export default function MetaStrategyPanel({ asset, tf, onError }: MetaStrategyPa
                 </button>
                 <button
                   type="button"
+                  disabled={aiVetBusy || scriptTestBusy}
+                  onClick={runAiVet}
+                  title="Backtest on this pair's archive candles, then an AI critique from that evidence (uses Copilot's model config)"
+                  className="rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1 font-mono text-[9px] font-bold uppercase text-amber-300 hover:bg-amber-500/20 disabled:opacity-50"
+                >
+                  {aiVetBusy ? 'vetting…' : 'vet with ai'}
+                </button>
+                <select
+                  value={aiVetExpiry}
+                  onChange={(e) => setAiVetExpiry(Number(e.target.value))}
+                  className="rounded border border-[#1c2739] bg-[#0b111c] px-1 py-1 font-mono text-[9px] text-[#aab6cc]"
+                  title="expiry in bars for the vet backtest"
+                >
+                  {[1, 2, 3, 5].map((n) => (
+                    <option key={n} value={n}>{`${n} bar${n > 1 ? 's' : ''}`}</option>
+                  ))}
+                </select>
+                <button
+                  type="button"
                   disabled={busy}
                   onClick={save}
                   className="rounded border border-cyan-500/40 bg-cyan-500/10 px-2 py-1 font-mono text-[9px] font-bold uppercase text-cyan-300 hover:bg-cyan-500/20 disabled:opacity-50"
@@ -714,6 +749,24 @@ export default function MetaStrategyPanel({ asset, tf, onError }: MetaStrategyPa
                   </button>
                 )}
               </div>
+              {aiVetResult && (
+                <div className="mt-2 rounded border border-amber-500/30 bg-[#0b111c] p-2">
+                  {aiVetResult.ok ? (
+                    <>
+                      <p className="font-mono text-[9px] text-[#7c8aa5]">
+                        {`${aiVetResult.trades} trades · win ${aiVetResult.winRate == null ? 'n/a' : (aiVetResult.winRate * 100).toFixed(1) + '%'} · 95% low ${((aiVetResult.wilsonLow ?? 0) * 100).toFixed(1)}% · break-even ${((aiVetResult.breakEven ?? 0) * 100).toFixed(1)}%`}
+                      </p>
+                      <p className="font-mono text-[9px] text-[#4b5a72]">
+                        {`halves: ${aiVetResult.firstHalf?.wins ?? 0}/${aiVetResult.firstHalf?.n ?? 0} then ${aiVetResult.secondHalf?.wins ?? 0}/${aiVetResult.secondHalf?.n ?? 0} · archive candles, not a forecast`}
+                      </p>
+                      <p className="mt-1 whitespace-pre-wrap font-mono text-[10px] leading-relaxed text-[#dbe4f0]">{aiVetResult.critique}</p>
+                      <p className="mt-1 font-mono text-[8px] text-[#4b5a72]">numbers measured; critique is an AI opinion</p>
+                    </>
+                  ) : (
+                    <p className="font-mono text-[9px] text-rose-300">{aiVetResult.error}</p>
+                  )}
+                </div>
+              )}
               {scriptTestResult && (
                 <div className="mt-2 rounded border border-[#1c2739] bg-[#0b111c] p-1.5">
                   {scriptTestResult.ok ? (
