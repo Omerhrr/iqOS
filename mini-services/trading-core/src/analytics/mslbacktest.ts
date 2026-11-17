@@ -144,6 +144,8 @@ export interface MslBacktestResult {
    * writing the script", not "holds out a fitting set". */
   inSample?: MslBacktestBreakdown
   outOfSample?: MslBacktestBreakdown
+  /** present when the script threw on some bars (count of those, the first message with its line, and which bar) - an error never hides silently */
+  scriptErrors?: MslScriptErrors
 }
 
 /** One walk-forward fold's own breakdown, PLUS which bar range it covers -
@@ -351,6 +353,9 @@ function makeCrossTf(candles: Candle[]): (i: number) => (tf: string) => MslSerie
   }
 }
 
+/** script errors seen by the LAST fireSignalsInner run - every evaluation that threw used to be skipped silently */
+export interface MslScriptErrors { count: number; evaluated: number; first: string; firstBarIndex: number }
+let lastFireErrors: MslScriptErrors | undefined
 function fireSignalsInner(
   candles: Candle[],
   parsedAst: MslAst,
@@ -363,19 +368,24 @@ function fireSignalsInner(
 ): FiredSignal[] {
   const fired: FiredSignal[] = []
   const crossTf = makeCrossTf(candles)
+  lastFireErrors = undefined
+  let errCount = 0, evaluated = 0, firstErr = '', firstErrBar = -1
   try {
     for (let i = warmupBars; i <= lastIdx; i++) {
       const series = seriesUpTo(candles, i, partners)
       const seriesFor = crossTf(i)
       const state = { keyPrefix: runId, barTimeSec: candles[i].time }
       const out = evaluateStrategyScript(parsedAst, reads, undefined, series, seriesFor, undefined, state)
-      if (out.error || out.direction === 'none') continue
+      evaluated++
+      if (out.error) { if (!errCount++) { firstErr = out.error; firstErrBar = i } continue }
+      if (out.direction === 'none') continue
       if (out.confidence < minConfidence) continue
       fired.push({ index: i, direction: out.direction, confidence: out.confidence, ...(out.expiryMin !== undefined ? { expiryMin: out.expiryMin } : {}) })
     }
   } finally {
     clearMslState(runId)
   }
+  if (errCount) lastFireErrors = { count: errCount, evaluated, first: firstErr, firstBarIndex: firstErrBar }
   return fired
 }
 
@@ -527,6 +537,12 @@ export function backtestMslScript(candles: Candle[], script: string, opts: MslBa
   const { wins, losses, winRate, avgConfidence } = breakdownOf(trades, payout)
 
   const result: MslBacktestResult = { ok: true, barsEvaluated: lastIdx - warmupBars + 1, trades, wins, losses, winRate, avgConfidence, unavailableSources }
+  const fe = lastFireErrors as MslScriptErrors | undefined
+  if (fe) {
+    result.scriptErrors = fe
+    // erroring on EVERY bar is a broken script, not "no signals" - fail loudly instead of reporting a clean zero-trade run
+    if (fe.count >= fe.evaluated) { result.ok = false; result.error = `the script failed on every bar (${fe.count}/${fe.evaluated}): ${fe.first}` }
+  }
 
   if (payout !== undefined && trades.length) {
     let cum = 0
@@ -877,6 +893,7 @@ export interface MslManagedResult {
   /** the last evaluation's chart overlays, so a caller can draw what the script drew */
   draws?: MslDraw[]
   skippedBadLevels: number
+  scriptErrors?: MslScriptErrors
   execution: 'simulated-managed'
   note: string
 }
@@ -901,7 +918,7 @@ export function backtestMslManaged(candles: Candle[], script: string, opts: MslM
   interface Pos extends MslPosView { openIdx: number; confidence: number; maxBars: number; parts: MslManagedPart[]; dirName: 'call' | 'put'; trailStep: number; be: number }
   const open: Pos[] = []
   const trades: MslManagedTrade[] = []
-  let nextId = 1, skipped = 0, lastDraws: MslDraw[] | undefined, lastErr: string | undefined
+  let nextId = 1, skipped = 0, lastDraws: MslDraw[] | undefined, lastErr: string | undefined, errCount = 0, evalCount = 0, firstErr = '', firstErrBar = -1
   const atrAt = (i: number): number => { let sum = 0, n = 0; for (let k = Math.max(1, i - 13); k <= i; k++) { sum += Math.max(candles[k].high - candles[k].low, Math.abs(candles[k].high - candles[k - 1].close), Math.abs(candles[k].low - candles[k - 1].close)); n++ } return n ? sum / n : 0 }
   const fill = (p: Pos, i: number, price: number, frac: number, reason: string): void => {
     const slip = slipAtr * atrAt(i)
@@ -949,7 +966,8 @@ export function backtestMslManaged(candles: Candle[], script: string, opts: MslM
       const series = seriesUpToManaged(candles, i)
       const views: MslPosView[] = open.map((p) => ({ id: p.id, dir: p.dir, entry: p.entry, bars: p.bars, best: p.best, worst: p.worst, left: p.left, stop: p.stop, target: p.target, trail: p.trail, size: p.size, initStop: p.initStop }))
       const out = evaluateStrategyScript(parsed.ast, reads, undefined, series, crossTf(i), undefined, { keyPrefix: runId, barTimeSec: c.time }, { positions: views })
-      if (out.error) { lastErr = out.error; continue }
+      evalCount++
+      if (out.error) { lastErr = out.error; if (!errCount++) { firstErr = out.error; firstErrBar = i } continue }
       if (out.draws) lastDraws = out.draws
       for (const u of out.posUpdates ?? []) {
         const p = open.find((q) => q.id === u.id); if (!p) continue
@@ -994,7 +1012,11 @@ export function backtestMslManaged(candles: Candle[], script: string, opts: MslM
   }
   if (payout !== undefined) res.netPnl = trades.reduce((a, t) => a + (t.pnl ?? 0), 0)
   if (lastDraws) res.draws = lastDraws
-  if (!trades.length && lastErr) res.error = `no trades; last script error: ${lastErr}`
+  if (errCount) {
+    res.scriptErrors = { count: errCount, evaluated: evalCount, first: firstErr, firstBarIndex: firstErrBar }
+    if (errCount >= evalCount) { res.ok = false; res.error = `the script failed on every bar (${errCount}/${evalCount}): ${firstErr}` }
+    else if (!trades.length) res.error = `no trades; the script errored on ${errCount} of ${evalCount} bars, first: ${firstErr}`
+  }
   return res
 }
 /** series up to bar i for the managed loop - same shape fireSignalsInner uses, trimmed to the last 1500 bars so a long run stays fast */

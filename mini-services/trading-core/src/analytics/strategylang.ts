@@ -386,16 +386,29 @@ function isArrayValue(v: unknown): v is MslArrayValue {
   return typeof v === 'object' && v !== null && (v as MslArrayValue).__mslArray === true
 }
 
+/** MSL: a script-built map / record (`{ a: 1, b: [2, 3] }`): string keys, any values. Read `m.a` / `m["a"]`, write `m.a = v` / `m["a"] = v`. */
+export interface MslMapValue {
+  readonly __mslMap: true
+  fields: Record<string, MslValue>
+}
+function mapValue(fields: Record<string, MslValue>): MslMapValue {
+  return { __mslMap: true, fields }
+}
+function isMapValue(v: unknown): v is MslMapValue {
+  return typeof v === 'object' && v !== null && (v as MslMapValue).__mslMap === true
+}
+const MSL_MAX_KEYS = 500
+
 /** Any non-plain MSL value - a source/signal read, a series, a bar, or a
  * bundle. None of these can be used directly as a number/boolean (compare,
  * add, "and"/"or") - a script must narrow to a plain value first, via
  * `.field` (read/bar/bundle) or `[n]`/`.method()` (series). Centralizes the
  * guard truthy()/asNum() both already had for reads alone. */
-function isComposite(v: unknown): v is MslReadValue | MslSeriesValue | MslBarValue | MslBundleValue | MslArrayValue {
-  return isReadValue(v) || isSeriesValue(v) || isBarValue(v) || isBundleValue(v) || isArrayValue(v)
+function isComposite(v: unknown): v is MslReadValue | MslSeriesValue | MslBarValue | MslBundleValue | MslArrayValue | MslMapValue {
+  return isReadValue(v) || isSeriesValue(v) || isBarValue(v) || isBundleValue(v) || isArrayValue(v) || isMapValue(v)
 }
 
-export type MslValue = number | boolean | string | MslReadValue | MslSeriesValue | MslBarValue | MslBundleValue | MslArrayValue
+export type MslValue = number | boolean | string | MslReadValue | MslSeriesValue | MslBarValue | MslBundleValue | MslArrayValue | MslMapValue
 
 /** The raw per-bar history a script's `ind.*`/`bar(-n)` primitives read
  * from - chronological ascending, index n-1 = the latest CLOSED bar, same
@@ -507,6 +520,7 @@ export interface EvalEnv {
   globalEnv?: Record<string, MslValue>
   ops?: { n: number }
   fnDepth?: number
+  effFrame?: boolean
   arrFrame?: WeakSet<object>
   persist?: Set<string>
   varRec?: { committed: Map<string, PV>; pending: Map<string, PV> }
@@ -581,7 +595,7 @@ const mslStateStore = new MslStateStore()
  * `stateKeyPrefix` (e.g. a meta-strategy spec id) - call this whenever the
  * script that prefix belongs to changes, so edited logic never resumes
  * counting from a previous version's state. */
-type PV = number | boolean | string | PV[]
+type PV = number | boolean | string | PV[] | { __pvmap: true; f: Record<string, PV> }
 class MslVarStore {
   private recs = new Map<string, { bar: number; committed: Map<string, PV>; pending: Map<string, PV> }>()
   /** state as of the START of this bar: the previous bar's last evaluation commits when a NEW bar time shows up, so a repeated evaluation of the same bar (live polling) never double-advances a variable */
@@ -594,13 +608,14 @@ class MslVarStore {
   clearPrefix(prefix: string): void { this.recs.delete(prefix) }
 }
 const mslVarStore = new MslVarStore()
-const clonePV = (v: PV): PV => (Array.isArray(v) ? v.map(clonePV) : v)
+const clonePV = (v: PV): PV => (Array.isArray(v) ? v.map(clonePV) : typeof v === 'object' ? { __pvmap: true, f: Object.fromEntries(Object.entries(v.f).map(([k, x]) => [k, clonePV(x)])) } : v)
 function toPV(v: MslValue, name: string): PV {
   if (isArrayValue(v)) return v.items.map((x) => toPV(x, name))
-  if (isComposite(v)) throw new MslRuntimeError(`variable "${name}": persistent variables hold numbers, booleans, text or arrays of them - not ${compositeKind(v)}`)
+  if (isMapValue(v)) return { __pvmap: true, f: Object.fromEntries(Object.entries(v.fields).map(([k, x]) => [k, toPV(x, name)])) }
+  if (isComposite(v)) throw new MslRuntimeError(`variable "${name}": persistent variables hold numbers, booleans, text, arrays and maps of those - not ${compositeKind(v)}`)
   return v as number | boolean | string
 }
-const fromPV = (v: PV): MslValue => (Array.isArray(v) ? arrayValue(v.map(fromPV)) : v)
+const fromPV = (v: PV): MslValue => (Array.isArray(v) ? arrayValue(v.map(fromPV)) : typeof v === 'object' ? mapValue(Object.assign(Object.create(null), Object.fromEntries(Object.entries(v.f).map(([k, x]) => [k, fromPV(x)])))) : v)
 
 export function clearMslState(stateKeyPrefix: string): void {
   mslVarStore.clearPrefix(stateKeyPrefix)
@@ -667,7 +682,7 @@ export interface MslDraw { kind: MslDrawKind; p1?: number; t1?: number; b1?: num
 
 type TokKind =
   | 'num' | 'str' | 'ident' | 'dot' | 'comma' | 'lparen' | 'rparen' | 'lbracket' | 'rbracket' | 'eq_assign'
-  | 'percent' | 'opassign' | 'eqeq' | 'neq' | 'gte' | 'lte' | 'gt' | 'lt' | 'plus' | 'minus' | 'star' | 'slash'
+  | 'lbrace' | 'rbrace' | 'colon' | 'percent' | 'opassign' | 'eqeq' | 'neq' | 'gte' | 'lte' | 'gt' | 'lt' | 'plus' | 'minus' | 'star' | 'slash'
   | 'and' | 'or' | 'not' | 'let' | 'call_kw' | 'put_kw' | 'when' | 'confidence_kw'
   | 'expiry_kw' | 'configure_kw' | 'eof'
 
@@ -751,7 +766,15 @@ function tokenize(src: string): Token[] {
       }
       if (/[A-Za-z_]/.test(c)) {
         let j = i
-        while (j < line.length && /[A-Za-z0-9_:\-]/.test(line[j])) j++
+        // a ':' belongs to a source id only when glued to a following letter/digit (smc:FVG, nextExpiry:5) - "{x: 1}" keeps its colon;
+        // a '-' only inside such an id and before a letter (so "i-1" is i minus 1, but meta ids with a colon may still contain one)
+        while (j < line.length) {
+          const ch = line[j]
+          if (/[A-Za-z0-9_]/.test(ch)) { j++; continue }
+          if (ch === ':' && /[A-Za-z0-9_]/.test(line[j + 1] ?? '')) { j++; continue }
+          if (ch === '-' && line.slice(i, j).includes(':') && /[A-Za-z]/.test(line[j + 1] ?? '')) { j++; continue }
+          break
+        }
         const word = line.slice(i, j)
         const kw = KEYWORDS[word]
         toks.push({ kind: kw ?? 'ident', value: word, line: li + 1 })
@@ -828,6 +851,11 @@ function tokenize(src: string): Token[] {
         i += 2
         continue
       }
+      if (c === '{' || c === '}' || c === ':') {
+        toks.push({ kind: c === '{' ? 'lbrace' : c === '}' ? 'rbrace' : 'colon', value: c, line: li + 1 })
+        i++
+        continue
+      }
       if (c === '%') {
         toks.push({ kind: 'percent', value: '%', line: li + 1 })
         i++
@@ -873,6 +901,7 @@ type Expr =
   | { t: 'unary'; op: 'not' | 'neg'; e: Expr }
   | { t: 'bin'; op: 'and' | 'or' | '==' | '!=' | '>=' | '<=' | '>' | '<' | '+' | '-' | '*' | '/' | '%'; l: Expr; r: Expr }
   | { t: 'array'; items: Expr[] }
+  | { t: 'map'; entries: { key: string; value: Expr }[] }
   /** `seq` is only set for a `since(...)`/`streak(...)` call - its stable,
    * parse-order call-site index within THIS script (Parser.stateSeq below),
    * used to scope that call's MslStateStore memory from every other
@@ -903,6 +932,7 @@ type Stmt =
   | { kind: 'var'; name: string; expr: Expr }
   | { kind: 'assign'; name: string; expr: Expr }
   | { kind: 'setidx'; name: string; idx: Expr; expr: Expr }
+  | { kind: 'setfield'; name: string; field: string; expr: Expr }
   | { kind: 'for'; name: string; from: Expr; to: Expr; step?: Expr; body: Stmt[]; line: number }
   | { kind: 'while'; cond: Expr; body: Stmt[]; line: number }
   | { kind: 'break' }
@@ -1091,7 +1121,7 @@ class Parser {
     return { kind: 'if', branches, ...(elseBody ? { elseBody } : {}) }
   }
 
-  /** fn name(a, b) ... end - body may use let/assignment/if/for/while/return; no signals, no persistent state */
+  /** fn name(a, b) ... end - body may use anything a script can. Used in an expression an fn only computes; called as a statement on its own line it may also fire signals, set pos.*, use var and change outer variables / arrays */
   private parseFn(): void {
     const open = this.next() // 'fn'
     const name = this.expect('ident').value
@@ -1155,6 +1185,13 @@ class Parser {
   }
 
   private parseStatement(depth = 0): Stmt {
+    const line = this.peek().line
+    const st = this.parseStatementInner(depth)
+    ;(st as { line?: number }).line = (st as { line?: number }).line ?? line
+    return st
+  }
+
+  private parseStatementInner(depth = 0): Stmt {
     const t = this.peek()
     if (t.kind === 'ident' && t.value === 'if') return this.parseIf(depth)
     if (t.kind === 'ident' && (t.value === 'for' || t.value === 'while') && this.look(1)?.kind !== 'eq_assign') return this.parseLoop(depth)
@@ -1174,7 +1211,6 @@ class Parser {
       return this.peek().kind === 'eof' ? { kind: 'return' } : { kind: 'return', expr: this.parseOr() }
     }
     if (t.kind === 'ident' && t.value === 'var' && this.look(1)?.kind === 'ident' && this.look(2)?.kind === 'eq_assign') {
-      if (this.inFn) throw new MslSyntaxError(`line ${t.line}: "var" (persistent state) is not allowed inside an fn - return a value and assign it at the top level`)
       this.next()
       const name = this.expect('ident').value
       this.next()
@@ -1183,7 +1219,6 @@ class Parser {
     if (t.kind === 'ident' && t.value === 'pos' && this.look(1)?.kind === 'dot' && this.look(2)?.kind === 'ident' && this.look(3)?.kind === 'eq_assign') {
       const key = this.look(2)!.value
       if (!['stop', 'target', 'trail', 'breakeven', 'size', 'max'].includes(key)) throw new MslSyntaxError(`line ${t.line}: unknown position setting "pos.${key}" - use pos.stop / pos.target / pos.trail / pos.breakeven / pos.size / pos.max`)
-      if (this.inFn) throw new MslSyntaxError(`line ${t.line}: position settings are not allowed inside an fn`)
       this.pos += 4
       return { kind: 'posset', key, expr: this.parseOr() }
     }
@@ -1193,7 +1228,6 @@ class Parser {
       const isWhen = nx?.kind === 'when'
       const isUntil = nx?.kind === 'ident' && nx.value === 'until'
       if ((!hold && (isWhen || nx?.kind === 'num' || nx?.kind === 'ident' || nx?.kind === 'lparen')) || (hold && isUntil)) {
-        if (this.inFn) throw new MslSyntaxError(`line ${t.line}: "${t.value}" is not allowed inside an fn`)
         this.next()
         let frac: Expr | undefined
         if (!hold && !isWhen) {
@@ -1213,6 +1247,13 @@ class Parser {
         const rhs = this.parseOr()
         return { kind: 'assign', name: t.value, expr: op.kind === 'opassign' ? { t: 'bin', op: op.value as '+' | '-' | '*' | '/' | '%', l: { t: 'ident', name: t.value }, r: rhs } : rhs }
       }
+      if (n1?.kind === 'dot' && this.look(2)?.kind === 'ident' && (this.look(3)?.kind === 'eq_assign' || this.look(3)?.kind === 'opassign') && t.value !== 'pos') {
+        const field = this.look(2)!.value
+        this.pos += 3
+        const op = this.next()
+        const rhs = this.parseOr()
+        return { kind: 'setfield', name: t.value, field, expr: op.kind === 'opassign' ? { t: 'bin', op: op.value as '+' | '-' | '*' | '/' | '%', l: { t: 'field', obj: { t: 'ident', name: t.value }, field }, r: rhs } : rhs }
+      }
       const start = this.pos
       const e = this.parseAtom()
       const nk = this.peek().kind
@@ -1231,8 +1272,6 @@ class Parser {
       const expr = this.parseOr()
       return { kind: 'let', name, expr }
     }
-    if (this.inFn && (t.kind === 'call_kw' || t.kind === 'put_kw' || t.kind === 'confidence_kw' || t.kind === 'expiry_kw' || t.kind === 'configure_kw'))
-      throw new MslSyntaxError(`line ${t.line}: "${t.value}" is not allowed inside an fn - fns only compute and return values`)
     if (t.kind === 'call_kw') {
       this.next()
       this.expectWord('when')
@@ -1276,6 +1315,11 @@ class Parser {
           path += `.${seg.value}`
         } else {
           path += `.${this.expect('ident').value}`
+        }
+        // a builtin strategy id may contain hyphens (strategy.calibrated-edge.window): minus + word inside a configure path joins the segment
+        while (this.peek().kind === 'minus' && (this.look(1)?.kind === 'ident' || this.look(1)?.kind === 'num')) {
+          this.next()
+          path += `-${this.next().value}`
         }
       }
       if (!path.includes('.')) throw new MslSyntaxError(`line ${t.line}: "configure" needs a dotted key like configure renko.atrMult = 0.5 (got "${path}")`)
@@ -1396,7 +1440,7 @@ class Parser {
           e = { t: 'method', obj: e, name: ft.value, args }
           continue
         }
-        if (!FIELDS.has(ft.value)) throw new MslSyntaxError(`line ${ft.line}: unknown field ".${ft.value}" - use dir/direction/conf/confidence/active/call/put/value, a bar field (o/h/l/c/v/body/range/upper_wick/lower_wick), or an indicator bundle field (macd/signal/hist/upper/mid/lower/width/percentB/k/d/adx/plusDI/minusDI/line/ma/trend/tsl/atr)`)
+        if (!FIELDS.has(ft.value) && ft.kind !== 'ident') throw new MslSyntaxError(`line ${ft.line}: unknown field ".${ft.value}" - use dir/direction/conf/confidence/active/call/put/value, a bar field (o/h/l/c/v/body/range/upper_wick/lower_wick), or an indicator bundle field (macd/signal/hist/upper/mid/lower/width/percentB/k/d/adx/plusDI/minusDI/line/ma/trend/tsl/atr)`)
         e = { t: 'field', obj: e, field: ft.value }
         continue
       }
@@ -1420,6 +1464,26 @@ class Parser {
       const e = this.parseOr()
       this.expect('rparen')
       return e
+    }
+    if (t.kind === 'lbrace') {
+      const entries: { key: string; value: Expr }[] = []
+      while (this.peek().kind === 'eof' && this.pos < this.toks.length - 1) this.pos++
+      if (this.peek().kind !== 'rbrace') {
+        for (;;) {
+          while (this.peek().kind === 'eof' && this.pos < this.toks.length - 1) this.pos++
+          const kt = this.next()
+          if (kt.kind !== 'ident' && kt.kind !== 'str') throw new MslSyntaxError(`line ${kt.line}: map keys are names or strings, got "${kt.value}"`)
+          this.expect('colon')
+          entries.push({ key: kt.value, value: this.parseOr() })
+          while (this.peek().kind === 'eof' && this.pos < this.toks.length - 1) this.pos++
+          if (this.peek().kind === 'comma') { this.next(); continue }
+          break
+        }
+      }
+      while (this.peek().kind === 'eof' && this.pos < this.toks.length - 1) this.pos++
+      this.expect('rbrace')
+      if (new Set(entries.map((x) => x.key)).size !== entries.length) throw new MslSyntaxError(`line ${t.line}: a map literal repeats a key`)
+      return { t: 'map', entries }
     }
     if (t.kind === 'lbracket') {
       const items: Expr[] = []
@@ -1492,6 +1556,7 @@ function compositeKind(v: unknown): string {
   if (isBarValue(v)) return 'a bar (ohlc() result)'
   if (isBundleValue(v)) return 'an indicator bundle (ind.macd/bb/stoch/adx/supertrend result)'
   if (isArrayValue(v)) return 'an array'
+  if (isMapValue(v)) return 'a map'
   return 'this value'
 }
 
@@ -1516,6 +1581,10 @@ function asNum(v: MslValue): number {
  * name that's valid for the WRONG kind (e.g. ".body" on a read) gets its
  * real, specific error. */
 function fieldOf(val: MslValue, field: string): MslValue {
+  if (isMapValue(val)) {
+    if (!(field in val.fields)) throw new MslRuntimeError(`the map has no key "${field}" (keys: ${Object.keys(val.fields).join(', ') || 'none'}) - set it first or test with .has("${field}")`)
+    return val.fields[field]
+  }
   if (isBundleValue(val)) {
     if (!(field in val.fields)) throw new MslRuntimeError(`"${compositeKind(val)}" has no field ".${field}"`)
     return val.fields[field]
@@ -5364,12 +5433,23 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
       const val = evalExpr(e.obj, env, ctx)
       return fieldOf(val, e.field)
     }
+    case 'map': {
+      const f: Record<string, MslValue> = Object.create(null)
+      for (const en of e.entries) f[en.key] = evalExpr(en.value, env, ctx)
+      return mapValue(f)
+    }
     case 'array': {
       if (e.items.length > MSL_MAX_ARRAY) throw new MslRuntimeError(`array literal longer than ${MSL_MAX_ARRAY} items`)
       return mkArr(ctx, e.items.map((x) => evalExpr(x, env, ctx)))
     }
     case 'index': {
       const obj = evalExpr(e.obj, env, ctx)
+      if (isMapValue(obj)) {
+        const k = evalExpr(e.idx, env, ctx)
+        if (typeof k !== 'string') throw new MslRuntimeError('a map is indexed with text, e.g. m["key"]')
+        if (!(k in obj.fields)) throw new MslRuntimeError(`the map has no key "${k}" (keys: ${Object.keys(obj.fields).join(', ') || 'none'})`)
+        return obj.fields[k]
+      }
       const idx = asNum(evalExpr(e.idx, env, ctx))
       if (isArrayValue(obj)) {
         const i = Math.trunc(idx) < 0 ? obj.items.length + Math.trunc(idx) : Math.trunc(idx)
@@ -5725,6 +5805,7 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
       }
       const obj = evalExpr(e.obj, env, ctx)
       const args = e.args.map((a) => evalExpr(a, env, ctx))
+      if (isMapValue(obj)) return mapMethod(e.name, args, obj, ctx)
       if (isArrayValue(obj)) return arrayMethod(e.name, args, obj, ctx)
       if (isSeriesValue(obj)) return seriesMethod(e.name, args, obj, ctx)
       throw new MslRuntimeError(`".${e.name}(...)" needs a series or an array, not "${compositeKind(obj)}"`)
@@ -5784,14 +5865,14 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
           const a0 = args[0]
           if (isArrayValue(a0)) return a0.items.length
           if (isSeriesValue(a0)) return a0.values.length
-          throw new MslRuntimeError('len(x) needs an array or a series')
+          if (isMapValue(a0)) return Object.keys(a0.fields).length
+          throw new MslRuntimeError('len(x) needs an array, a map or a series')
         }
         case 'array': {
           const n = args.length ? Math.trunc(asNum(args[0])) : 0
           if (!(n >= 0 && n <= MSL_MAX_ARRAY)) throw new MslRuntimeError(`array(n, fill): n must be 0..${MSL_MAX_ARRAY}`)
           const fill = args.length > 1 ? args[1] : 0
-          if (isComposite(fill) && !isArrayValue(fill)) throw new MslRuntimeError('array(n, fill): fill must be a number, boolean or text')
-          return mkArr(ctx, Array.from({ length: n }, () => (isArrayValue(fill) ? arrayValue(fill.items.slice()) : fill)))
+          return mkArr(ctx, Array.from({ length: n }, () => deepCopy(fill, ctx)))
         }
         case 'avg':
           return args.length ? args.reduce((s: number, a) => s + asNum(a), 0) / args.length : 0
@@ -5974,6 +6055,7 @@ function fmtExplainVal(v: MslValue): string {
   if (isBarValue(v)) return `bar(o${v.o} h${v.h} l${v.l} c${v.c})`
   if (isBundleValue(v)) return `bundle(${Object.keys(v.fields).join('/')})`
   if (isArrayValue(v)) return `array(${v.items.length})`
+  if (isMapValue(v)) return `map(${Object.keys(v.fields).join('/')})`
   if (typeof v === 'number') return String(Math.round(v * 100) / 100)
   return String(v)
 }
@@ -6003,6 +6085,7 @@ function explainExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): { te
       const value = evalExpr(e, env, ctx)
       return { text: `${prettyExpr(e)}=${fmtExplainVal(value)}`, value }
     }
+    case 'map':
     case 'array': {
       const value = evalExpr(e, env, ctx)
       return { text: fmtExplainVal(value), value }
@@ -6072,12 +6155,40 @@ function mkArr(ctx: EvalEnv | undefined, items: MslValue[]): MslArrayValue {
   if (ctx?.fnDepth && ctx.arrFrame) ctx.arrFrame.add(a)
   return a
 }
-function mutable(ctx: EvalEnv, a: MslArrayValue, what: string): void {
-  if (ctx.fnDepth && !(ctx.arrFrame && ctx.arrFrame.has(a))) throw new MslRuntimeError(`${what}: a fn cannot change an array it did not create - copy it first with .copy(), or return a new array`)
+function canEffect(ctx: EvalEnv): boolean {
+  return !ctx.fnDepth || !!ctx.effFrame
 }
-function plainItem(v: MslValue, what: string): MslValue {
-  if (isComposite(v) && !isArrayValue(v)) throw new MslRuntimeError(`${what}: arrays hold numbers, booleans, text or arrays - not ${compositeKind(v)} (take a number out of it first, e.g. series[-1])`)
+function mutable(ctx: EvalEnv, a: MslArrayValue | MslMapValue, what: string): void {
+  if (ctx.fnDepth && !ctx.effFrame && !(ctx.arrFrame && ctx.arrFrame.has(a))) throw new MslRuntimeError(`${what}: used inside an expression, a fn cannot change an array/map it did not create - copy it first with .copy(), or call the fn as a statement on its own line`)
+}
+function plainItem(v: MslValue, _what: string): MslValue {
   return v
+}
+/** deep copy of arrays/maps (series, bars, bundles are immutable and shared) */
+function deepCopy(v: MslValue, ctx?: EvalEnv): MslValue {
+  if (isArrayValue(v)) return mkArr(ctx, v.items.map((x) => deepCopy(x, ctx)))
+  if (isMapValue(v)) { const m = mapValue(Object.assign(Object.create(null), Object.fromEntries(Object.entries(v.fields).map(([k, x]) => [k, deepCopy(x, ctx)])))); if (ctx?.fnDepth && ctx.arrFrame) ctx.arrFrame.add(m); return m }
+  return v
+}
+function mapMethod(name: string, args: MslValue[], m: MslMapValue, ctx: EvalEnv): MslValue {
+  const key = (): string => { const k = args[0]; if (typeof k !== 'string') throw new MslRuntimeError(`map.${name}(key): the key must be text`); return k }
+  switch (name) {
+    case 'len': return Object.keys(m.fields).length
+    case 'keys': return mkArr(ctx, Object.keys(m.fields))
+    case 'values': return mkArr(ctx, Object.values(m.fields))
+    case 'has': return key() in m.fields
+    case 'get': { const k = key(); if (k in m.fields) return m.fields[k]; if (args.length > 1) return args[1]; throw new MslRuntimeError(`the map has no key "${k}" - pass a default: m.get("${k}", 0)`) }
+    case 'set': {
+      mutable(ctx, m, 'map.set()'); const k = key()
+      if (!(k in m.fields) && Object.keys(m.fields).length >= MSL_MAX_KEYS) throw new MslRuntimeError(`maps are limited to ${MSL_MAX_KEYS} keys`)
+      if (args.length < 2) throw new MslRuntimeError('map.set(key, value) needs a value')
+      m.fields[k] = args[1]; return Object.keys(m.fields).length
+    }
+    case 'delete': { mutable(ctx, m, 'map.delete()'); const k = key(); const had = k in m.fields; delete m.fields[k]; return had }
+    case 'clear': mutable(ctx, m, 'map.clear()'); for (const k of Object.keys(m.fields)) delete m.fields[k]; return 0
+    case 'copy': return deepCopy(m, ctx)
+    default: throw new MslRuntimeError(`unknown map method ".${name}(...)" - use len/keys/values/has/get/set/delete/clear/copy`)
+  }
 }
 function nums(a: MslArrayValue, what: string): number[] {
   return a.items.map((x) => { if (typeof x !== 'number') throw new MslRuntimeError(`${what}: needs an array of numbers`); return x })
@@ -6099,7 +6210,7 @@ function arrayMethod(name: string, args: MslValue[], a: MslArrayValue, ctx: Eval
     case 'shift': { mutable(ctx, a, 'array.shift()'); if (!a.items.length) throw new MslRuntimeError('array.shift(): the array is empty'); return a.items.shift() as MslValue }
     case 'set': { need(2); mutable(ctx, a, 'array.set()'); a.items[at(args[0])] = plainItem(args[1], 'array.set()'); return a.items.length }
     case 'clear': mutable(ctx, a, 'array.clear()'); a.items.length = 0; return 0
-    case 'copy': return mkArr(ctx, a.items.map((x) => (isArrayValue(x) ? arrayValue(x.items.slice()) : x)))
+    case 'copy': return deepCopy(a, ctx)
     case 'has': need(1); return a.items.some((x) => x === args[0])
     case 'indexOf': need(1); return a.items.findIndex((x) => x === args[0])
     case 'sum': return nums(a, 'array.sum()').reduce((x, y) => x + y, 0)
@@ -6169,24 +6280,29 @@ function lastAtr(ctx: EvalEnv): number {
   return a[a.length - 1]
 }
 
-function callUserFn(fn: MslFn, args: MslValue[], ctx: EvalEnv): MslValue {
+function callUserFn(fn: MslFn, args: MslValue[], ctx: EvalEnv, rs: RunState | null = null): MslValue {
   if (args.length !== fn.params.length) throw new MslRuntimeError(`${fn.name}(${fn.params.join(', ')}) takes ${fn.params.length} argument(s), got ${args.length}`)
   if ((ctx.fnDepth ?? 0) >= MSL_MAX_FN_DEPTH) throw new MslRuntimeError(`fn calls nested more than ${MSL_MAX_FN_DEPTH} deep (runaway recursion in "${fn.name}"?)`)
-  const outerFrame = ctx.arrFrame
+  const outerFrame = ctx.arrFrame, outerEff = ctx.effFrame
   const frame = new WeakSet<object>()
   const local: Record<string, MslValue> = Object.create(ctx.globalEnv ?? null)
   ctx.fnDepth = (ctx.fnDepth ?? 0) + 1
   ctx.arrFrame = frame
+  ctx.effFrame = rs !== null
   try {
     fn.params.forEach((pn, i) => {
       const v = args[i]
-      if (isArrayValue(v)) { const c = arrayValue(v.items.map((x) => (isArrayValue(x) ? arrayValue(x.items.slice()) : x))); frame.add(c); local[pn] = c } else local[pn] = v
+      if (isArrayValue(v) || isMapValue(v)) {
+        // called as a statement: arrays/maps are passed BY REFERENCE (the fn may change them); in an expression they are copied
+        if (rs) { frame.add(v); local[pn] = v } else { const c = deepCopy(v, ctx); local[pn] = c }
+      } else local[pn] = v
     })
-    const flow = execBlock(fn.body, local, ctx, null)
+    const flow = execBlock(fn.body, local, ctx, rs)
     return flow && flow.k === 'return' ? flow.v : 0
   } finally {
     ctx.fnDepth = (ctx.fnDepth ?? 1) - 1
     ctx.arrFrame = outerFrame
+    ctx.effFrame = outerEff
   }
 }
 
@@ -6196,9 +6312,10 @@ function tick(ctx: EvalEnv): void {
 }
 
 function execBlock(stmts: Stmt[], env: Record<string, MslValue>, ctx: EvalEnv, rs: RunState | null): Flow {
-  const need = (what: string): RunState => { if (!rs) throw new MslRuntimeError(`${what} is not allowed here`); return rs }
+  const need = (what: string): RunState => { if (!rs) throw new MslRuntimeError(`${what} inside an fn only works when the fn is called as a statement on its own line (e.g. check(x)), not inside an expression`); return rs }
   for (const stmt of stmts) {
     tick(ctx)
+    try {
     switch (stmt.kind) {
       case 'if': {
         let matched = false
@@ -6223,22 +6340,43 @@ function execBlock(stmts: Stmt[], env: Record<string, MslValue>, ctx: EvalEnv, r
         env[stmt.name] = evalExpr(stmt.expr, env, ctx)
         break
       case 'var': {
+        if (ctx.fnDepth && !canEffect(ctx)) throw new MslRuntimeError(`"var ${stmt.name}" inside an fn only works when the fn is called as a statement on its own line`)
+        const home = ctx.fnDepth ? ctx.globalEnv! : env
         const prev = ctx.varRec?.committed.get(stmt.name)
-        env[stmt.name] = prev !== undefined ? fromPV(clonePV(prev)) : evalExpr(stmt.expr, env, ctx)
-        if (prev === undefined) toPV(env[stmt.name], stmt.name) // validate the initial value is persistable
+        home[stmt.name] = prev !== undefined ? fromPV(clonePV(prev)) : evalExpr(stmt.expr, env, ctx)
+        if (prev === undefined) toPV(home[stmt.name], stmt.name) // validate the initial value is persistable
         ctx.persist!.add(stmt.name)
         break
       }
       case 'assign': {
-        if (!Object.prototype.hasOwnProperty.call(env, stmt.name)) throw new MslRuntimeError(`"${stmt.name}" is not declared here - declare it first with "let ${stmt.name} = ..." or "var ${stmt.name} = ..."${ctx.fnDepth ? ' (an fn can only change its own variables)' : ''}`)
+        let target = env
+        if (!Object.prototype.hasOwnProperty.call(env, stmt.name)) {
+          if (ctx.fnDepth && canEffect(ctx) && ctx.globalEnv && Object.prototype.hasOwnProperty.call(ctx.globalEnv, stmt.name)) target = ctx.globalEnv
+          else throw new MslRuntimeError(`"${stmt.name}" is not declared here - declare it first with "let ${stmt.name} = ..." or "var ${stmt.name} = ..."${ctx.fnDepth ? ' (inside an fn used in an expression only its own variables can change; call the fn as a statement to change outer ones)' : ''}`)
+        }
         const v = evalExpr(stmt.expr, env, ctx)
         if (ctx.persist?.has(stmt.name)) toPV(v, stmt.name)
-        env[stmt.name] = v
+        target[stmt.name] = v
+        break
+      }
+      case 'setfield': {
+        const m = env[stmt.name]
+        if (!isMapValue(m)) throw new MslRuntimeError(`"${stmt.name}.${stmt.field} = ..." needs "${stmt.name}" to be a map (declare it with let ${stmt.name} = { ${stmt.field}: 0 })`)
+        mutable(ctx, m, `${stmt.name}.${stmt.field} =`)
+        if (!(stmt.field in m.fields) && Object.keys(m.fields).length >= MSL_MAX_KEYS) throw new MslRuntimeError(`maps are limited to ${MSL_MAX_KEYS} keys`)
+        m.fields[stmt.field] = evalExpr(stmt.expr, env, ctx)
         break
       }
       case 'setidx': {
         const a = env[stmt.name]
-        if (!isArrayValue(a)) throw new MslRuntimeError(`"${stmt.name}[...] = ..." needs "${stmt.name}" to be an array`)
+        if (isMapValue(a)) {
+          mutable(ctx, a, `${stmt.name}[...] =`)
+          const k = evalExpr(stmt.idx, env, ctx)
+          if (typeof k !== 'string') throw new MslRuntimeError('a map is indexed with text, e.g. m["key"] = 1')
+          a.fields[k] = evalExpr(stmt.expr, env, ctx)
+          break
+        }
+        if (!isArrayValue(a)) throw new MslRuntimeError(`"${stmt.name}[...] = ..." needs "${stmt.name}" to be an array or a map`)
         mutable(ctx, a, `${stmt.name}[...] =`)
         const i0 = Math.trunc(asNum(evalExpr(stmt.idx, env, ctx)))
         const i = i0 < 0 ? a.items.length + i0 : i0
@@ -6274,7 +6412,14 @@ function execBlock(stmts: Stmt[], env: Record<string, MslValue>, ctx: EvalEnv, r
       case 'break': return { k: 'break' }
       case 'continue': return { k: 'continue' }
       case 'return': return { k: 'return', v: stmt.expr ? evalExpr(stmt.expr, env, ctx) : 0 }
-      case 'expr': evalExpr(stmt.expr, env, ctx); break
+      case 'expr': {
+        const ex = stmt.expr
+        const uf = ex.t === 'call' ? ctx.fns?.[ex.fn] : undefined
+        // a user fn called as a statement may fire signals, set pos.*, use var and change outer variables / arrays
+        if (ex.t === 'call' && uf) callUserFn(uf, ex.args.map((a) => evalExpr(a, env, ctx)), ctx, rs)
+        else evalExpr(ex, env, ctx)
+        break
+      }
       case 'call': {
         const r = need('"call when"')
         const v = truthy(evalExpr(stmt.expr, env, ctx))
@@ -6334,6 +6479,15 @@ function execBlock(stmts: Stmt[], env: Record<string, MslValue>, ctx: EvalEnv, r
         }
         break
       }
+    }
+      } catch (err) {
+      if (err instanceof MslRuntimeError && !(err as MslRuntimeError & { lined?: boolean }).lined) {
+        const ln = (stmt as { line?: number }).line
+        const m = new MslRuntimeError(ln ? `line ${ln}: ${err.message}` : err.message) as MslRuntimeError & { lined?: boolean }
+        m.lined = true
+        throw m
+      }
+      throw err
     }
   }
   return undefined

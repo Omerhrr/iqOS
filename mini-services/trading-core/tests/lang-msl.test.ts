@@ -31,11 +31,41 @@ test('user fn: params, return, recursion cap, hoisting, array arg is copied', ()
   assert.ok(run('let g = [1]\nfn bad(a)\n  g.push(2)\n  return 1\nend\ncall when bad(g) == 1').error, 'fn must not mutate outer arrays')
   assert.equal(run('let g = [1]\nfn ok(a)\n  a.push(2)\n  return a.len()\nend\nlet n = ok(g)\ncall when n == 2 and len(g) == 1').direction, 'call')
 })
-test('fn cannot assign outer variables and cannot hold var/signals (parse errors)', () => {
-  assert.ok(run('let z = 1\nfn f()\n  z = 2\n  return 1\nend\ncall when f() == 1').error)
-  assert.ok(!parseStrategyScript('fn f()\n  call when true\nend\ncall when true').ok)
-  assert.ok(!parseStrategyScript('fn f()\n  var q = 1\n  return q\nend\ncall when true').ok)
+test('fn used in an EXPRESSION still cannot change outer state or fire signals', () => {
+  assert.ok(run('let z = 1\nfn f()\n  z = 2\n  return 1\nend\nlet y = f()\ncall when y == 1').error)
+  assert.ok(run('fn f()\n  call when true\n  return 1\nend\nlet y = f()\ncall when false').error)
+  assert.ok(run('let g = [1]\nfn bad(a)\n  g.push(2)\n  return 1\nend\nlet y = bad(g)\ncall when y == 1').error)
   assert.ok(!parseStrategyScript('break\ncall when true').ok)
+})
+test('fn called as a STATEMENT can fire signals, use var, change outer variables and arrays', () => {
+  assert.equal(run('fn go()\n  call when true\nend\ngo()').direction, 'call')
+  assert.equal(run('let z = 1\nlet g = [1]\nfn bump(arr, k)\n  z += k\n  arr.push(z)\nend\nbump(g, 4)\nbump(g, 1)\ncall when z == 6 and len(g) == 3 and g[-1] == 6').direction, 'call')
+  const src = 'fn count()\n  var n = 0\n  n += 1\nend\ncount()\ncall when n >= 2'
+  const K = { keyPrefix: 'lang-fnvar', barTimeSec: 1000 }
+  assert.equal(run(src, K).direction, 'none'); assert.equal(run(src, { ...K, barTimeSec: 1060 }).direction, 'call'); clearMslState('lang-fnvar')
+  assert.equal(run('fn setpos(x)\n  pos.stop = x\nend\nsetpos(95)\ncall when true').entry?.stop, 95)
+})
+test('maps: literal, fields, index by text, assignment, methods, nesting, errors', () => {
+  assert.equal(run('let m = { a: 1, "b c": 2, d: [1, 2, 3] }\nm.a += 4\nm["e"] = 9\ncall when m.a == 5 and m["b c"] == 2 and m.d[2] == 3 and m.e == 9 and len(m) == 4 and m.has("e") and not m.has("zz") and m.get("zz", 7) == 7').direction, 'call')
+  assert.equal(run('let m = { x: 1 }\nlet c = m.copy()\nc.x = 5\nlet ks = m.keys()\ncall when m.x == 1 and c.x == 5 and ks[0] == "x" and m.values()[0] == 1').direction, 'call')
+  assert.ok(run('let m = { x: 1 }\ncall when m.nope > 0').error); assert.ok(run('let m = { x: 1 }\nlet y = m + 1\ncall when true').error)
+  assert.ok(!parseStrategyScript('let m = { a: 1, a: 2 }\ncall when true').ok)
+  assert.equal(run('let m = {\n  a: 1,\n  b: 2\n}\ncall when m.a + m.b == 3').direction, 'call')
+})
+test('a map as a struct: fn returns a record; records in an array; persistent map', () => {
+  assert.equal(run('fn level(p, t)\n  return { price: p, touches: t }\nend\nlet ls = [level(100, 2), level(105, 5)]\nlet best = ls[0]\nfor i = 1 to len(ls) - 1\n  if ls[i].touches > best.touches\n    best = ls[i]\n  end\nend\ncall when best.price == 105').direction, 'call')
+  const src = 'var st = { n: 0, seen: [] }\nst.n += 1\nst.seen.push(st.n)\ncall when st.n == 3 and len(st.seen) == 3'
+  const K = { keyPrefix: 'lang-map', barTimeSec: 1 }
+  run(src, K); run(src, { ...K, barTimeSec: 2 }); assert.equal(run(src, { ...K, barTimeSec: 3 }).direction, 'call'); clearMslState('lang-map')
+})
+test('arrays hold series, bars, bundles and maps; persistent vars still refuse them', () => {
+  assert.equal(run('let a = [px.close, px.high]\nlet b = [ohlc(-1)]\nlet m = { s: px.low, b: ind.macd(12, 26, 9) }\ncall when a[0][-1] == 159 and a[1][-1] == 160 and b[0].c == 159 and m.s[-1] == 158 and len(m) == 2').direction, 'call')
+  assert.ok(run('var keep = [px.close]\ncall when true', { keyPrefix: 'lang-pv', barTimeSec: 1 }).error); clearMslState('lang-pv')
+})
+test('i-1 is subtraction now; hyphenated source ids with a colon still tokenize', () => {
+  assert.equal(run('let i = 5\ncall when i-1 == 4 and i-2 == 3').direction, 'call')
+  assert.ok(parseStrategyScript('call when foo:bar-baz.dir == call').ok)
+  const cfg = parseStrategyScript('configure strategy.calibrated-edge.window = 230\ncall when true'); assert.ok(cfg.ok, (cfg as any).error)
 })
 test('var persists bar to bar, same-bar re-evaluation does not double count, new key starts fresh', () => {
   const src = 'var n = 0\nn += 1\ncall when n >= 3'
@@ -62,4 +92,11 @@ test('draw.* collects deduplicated overlays; NaN draws nothing; bad method error
   assert.ok(run('draw.nope(1)\ncall when true').error)
 })
 test('operators: % and compound assign', () => { assert.equal(run('let x = 17\nx %= 5\ncall when 17 % 5 == 2').direction, 'call') })
+test('errors carry their line number; a script that fails on every bar is reported, not a clean zero', () => {
+  const r = run('let a = 1\nlet b = [1, 2]\ncall when b[9] > 0'); assert.ok(r.error && /^line 3:/.test(r.error), r.error)
+  const r2 = run('let m = { x: 1 }\nfor i = 1 to 3\n  m.zz += 1\nend\ncall when true'); assert.ok(r2.error && /line 3:/.test(r2.error), r2.error)
+  const c: Candle[] = Array.from({ length: 200 }, (_, i) => ({ time: 1_700_000_040 + i * 60, open: 100, close: 100 + (i % 3), high: 102, low: 98, volume: 1 }))
+  const bt = backtestMslScript(c, 'let a = [1]\ncall when a[5] > 0', { expiryBars: 3 }); assert.equal(bt.ok, false); assert.ok(/failed on every bar/.test(bt.error ?? '') && /line 2/.test(bt.error ?? ''), bt.error)
+  const part = backtestMslScript(c, 'let k = px.close[-1]\nlet a = [1]\ncall when px.close[-1] > 99 and if(px.close[-1] == 100, a[5], 1) > 0', { expiryBars: 3 }); assert.ok(part.ok && part.scriptErrors && part.scriptErrors.count > 0 && part.scriptErrors.count < part.scriptErrors.evaluated, JSON.stringify(part.scriptErrors))
+})
 console.log(`${pass}/${total}`); process.exit(pass === total ? 0 : 1)
