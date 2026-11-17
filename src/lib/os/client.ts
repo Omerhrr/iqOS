@@ -572,6 +572,33 @@ export interface SignalCandidate {
   expiryLabel: string | null
 }
 
+export interface SignalGlobalRow {
+  asset: string
+  otc: boolean
+  ok: boolean
+  error?: string
+  action: 'buy' | 'sell' | 'wait'
+  needle: number
+  strength: number
+  regime: string
+  setup: string
+  expiryLabel: string | null
+  price: number
+  ts: number
+}
+export interface SignalGlobal {
+  ok: true
+  tf: Timeframe
+  ts: number
+  universe: number
+  scanned: number
+  buys: number
+  sells: number
+  waits: number
+  warming: number
+  rows: SignalGlobalRow[]
+}
+
 export interface SignalBest {
   ok: true
   tf: Timeframe
@@ -635,6 +662,10 @@ export async function getSignal(asset: string, tf: Timeframe): Promise<SignalRea
 
 export async function getSignalBest(tf: Timeframe, opts?: { current?: string; refresh?: boolean }): Promise<SignalBest | { ok: false; error: string }> {
   return osGet('/signal_best', { tf, current: opts?.current, refresh: opts?.refresh ? 1 : undefined })
+}
+
+export async function getSignalGlobal(tf: Timeframe, opts?: { scope?: 'all' | 'real' | 'otc'; limit?: number; refresh?: boolean }): Promise<SignalGlobal | { ok: false; error: string }> {
+  return osGet('/signal_global', { tf, scope: opts?.scope, limit: opts?.limit, refresh: opts?.refresh ? 1 : undefined })
 }
 
 export async function getRegimeScan(tf: Timeframe, opts?: { category?: string; refresh?: boolean }): Promise<RegimeBoard | { ok: false; error: string }> {

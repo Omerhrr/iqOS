@@ -2176,6 +2176,19 @@ const httpServer = createServer(async (req, res) => {
       //   needle, holding period (plugins/signal.ts read()).
       // GET /signal_best?tf=1m[&current=X][&category=all][&refresh=1] -> the strongest
       //   actionable pair out of the regime shortlist, with hysteresis on `current`.
+      // GET /signal_global?tf=1m[&scope=all|real|otc&limit=40&refresh=1] -> the Signal clock on every open pair (plugins/signal.ts global()). Backs the Signal Global board.
+      if (path === '/signal_global') {
+        try {
+          const tfv = tfStrict(q.get('tf'))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const sc = q.get('scope')
+          const svc = kernel.context().use<SignalService>('signal')
+          return json(200, svc.global(tfv, { limit: Number(q.get('limit') ?? 40), scope: sc === 'real' || sc === 'otc' ? sc : 'all', refresh: q.get('refresh') === '1' }))
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
       if (path === '/signal' || path === '/signal_best') {
         try {
           const tfv = tfStrict(q.get('tf'))

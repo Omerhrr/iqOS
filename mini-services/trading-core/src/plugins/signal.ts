@@ -21,6 +21,9 @@ import type { MarketDataService } from './market-data'
 const CANDLE_BARS = SIGNAL_BARS
 const READ_TTL_MS = 8_000
 const BEST_TTL_MS = 8_000
+const GLOBAL_TTL_MS = 8_000
+const GLOBAL_LIMIT_DEFAULT = 40
+const GLOBAL_LIMIT_MAX = 80
 const MAX_TREND_PER_SIDE = 6
 const MAX_RANGE = 4
 /** another pair must beat the current one by this many needle points to take over */
@@ -45,6 +48,33 @@ export interface SignalCandidate {
   expiryLabel: string | null
 }
 
+export interface SignalGlobalRow {
+  asset: string
+  otc: boolean
+  ok: boolean
+  error?: string
+  action: SignalResult['action']
+  needle: number
+  strength: number
+  regime: SignalResult['regime']
+  setup: string
+  expiryLabel: string | null
+  price: number
+  ts: number
+}
+export interface SignalGlobal {
+  ok: true
+  tf: Timeframe
+  ts: number
+  universe: number
+  scanned: number
+  buys: number
+  sells: number
+  waits: number
+  warming: number
+  rows: SignalGlobalRow[]
+}
+
 export interface SignalBest {
   ok: true
   tf: Timeframe
@@ -65,6 +95,7 @@ export class SignalService {
   private market!: MarketDataService
   private readCache = new Map<string, { ts: number; read: SignalRead | { ok: false; error: string } }>()
   private bestCache = new Map<string, { ts: number; list: SignalRead[]; evaluated: number }>()
+  private globalCache = new Map<string, { ts: number; out: SignalGlobal }>()
 
   async start(ctx: KernelContext): Promise<void> {
     this.ctx = ctx
@@ -75,6 +106,7 @@ export class SignalService {
   stop(): void {
     this.readCache.clear()
     this.bestCache.clear()
+    this.globalCache.clear()
   }
 
   read(asset: string, tf: string, opts: { refresh?: boolean } = {}): SignalRead | { ok: false; error: string } {
@@ -115,6 +147,40 @@ export class SignalService {
       ...board.down.slice(0, MAX_TREND_PER_SIDE),
       ...board.ranging.filter(atEdge).slice(0, MAX_RANGE),
     ].map((r) => r.asset)
+  }
+
+  /** The Signal clock on EVERY open pair (not just the Regime shortlist `best()` looks at): one row per pair, actionable first then by strength. Rows reuse `read()`'s TTL cache, so the per-asset
+   * Signal tab and this board share the same computation; the whole board is cached for GLOBAL_TTL_MS. `scope` filters real/OTC BEFORE the limit so OTC pairs are never crowded out. */
+  global(tf: string, opts: { limit?: number; scope?: 'all' | 'real' | 'otc'; refresh?: boolean } = {}): SignalGlobal | { ok: false; error: string } {
+    if (!(ALL_TIMEFRAMES as string[]).includes(tf)) return { ok: false, error: `unknown timeframe '${tf}'` }
+    const t = tf as Timeframe
+    const limit = Math.max(1, Math.min(Math.round(opts.limit ?? GLOBAL_LIMIT_DEFAULT), GLOBAL_LIMIT_MAX))
+    const scope = opts.scope ?? 'all'
+    const ck = `${t}:${scope}:${limit}`
+    const now = Date.now()
+    const hit = this.globalCache.get(ck)
+    if (!opts.refresh && hit && now - hit.ts < GLOBAL_TTL_MS) return hit.out
+    const universe = this.market.listAssets().filter((a) => a.open && (scope === 'all' || (scope === 'otc') === Boolean(a.otc)))
+    const rows: SignalGlobalRow[] = []
+    let warming = 0
+    for (const a of universe.slice(0, limit)) {
+      const r = this.read(a.ticker, t)
+      if (!r.ok) {
+        warming++
+        continue
+      }
+      rows.push({
+        asset: a.ticker, otc: Boolean(a.otc), ok: true, action: r.signal.action, needle: r.signal.needle, strength: r.signal.strength, regime: r.signal.regime,
+        setup: r.signal.setup, expiryLabel: r.signal.expiry?.label ?? null, price: r.price, ts: r.ts,
+      })
+    }
+    rows.sort((x, y) => Number(y.action !== 'wait') - Number(x.action !== 'wait') || y.strength - x.strength || x.asset.localeCompare(y.asset))
+    const out: SignalGlobal = {
+      ok: true, tf: t, ts: now, universe: universe.length, scanned: rows.length,
+      buys: rows.filter((r) => r.action === 'buy').length, sells: rows.filter((r) => r.action === 'sell').length, waits: rows.filter((r) => r.action === 'wait').length, warming, rows,
+    }
+    this.globalCache.set(ck, { ts: now, out })
+    return out
   }
 
   best(tf: string, opts: { current?: string; category?: string; refresh?: boolean } = {}): SignalBest | { ok: false; error: string } {
