@@ -607,6 +607,22 @@ export interface DayLevelsResponse {
   note?: string
 }
 
+export interface FastLevelsResponse {
+  zones?: { kind: 'demand' | 'supply'; top: number; bottom: number; tests: number; strength: number }[]
+  ok: boolean
+  reason?: string
+  error?: string
+  price?: number
+  atr?: number
+  fastBars?: number
+  snr: { price: number; touches: number; strength: number; side: 'support' | 'resistance' }[]
+  fib: { price: number; ratio: number; leg: number; side: 'support' | 'resistance'; confluence: number }[]
+}
+/** Many S/R levels + Fibonacci legs mapped on the fast chart (default 5s), in the trading chart's ATR. */
+export async function getFastLevels(asset: string, tf: string, fast: string = '5s'): Promise<FastLevelsResponse> {
+  return osGet('/fast_levels', { asset, tf, fast })
+}
+
 /** Previous day / week highs & lows, today's range and the latest Asia / London / New York session ranges. */
 export async function getDayLevels(asset: string, tf: string = '5m'): Promise<DayLevelsResponse> {
   return osGet('/levels', { asset, tf })

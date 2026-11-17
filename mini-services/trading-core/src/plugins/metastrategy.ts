@@ -725,6 +725,44 @@ put when ready and ((tracksMoves and loud and followDown) or fadeUp)
 confidence = clamp(52 + 10 * abs(tilt) + 6 * (pv.corrAbs(30) - 0.2), 52, 70)
 `,
   },
+  {
+    id: 'meta:builtin-alchemist',
+    name: 'Alchemist: MSNR rejection + CRT sweep + SMC / Fibonacci OTE',
+    script: `
+# THE ALCHEMIST - Malaysian S&R (MSNR) + Candle Range Theory (CRT) + Smart Money Concepts + Fibonacci.
+#   MSNR  : the latest bar wicked into a FRESH closing-price level (A = resistance, V = support) and closed back on the original side
+#   CRT   : the same bar swept one side of candle 1's range and closed back inside it (manipulation), the reversal is the other way
+#   SMC   : the Signal clock's SMC reader leans the same way
+#   FIB   : price sits in the 62 - 79% OTE retracement zone of the leg Fibonacci is drawn on, in the same direction
+# Core (MSNR + CRT) is required; SMC and OTE raise the confidence (72 with one of them, 85 with both).
+# HONESTY: no edge has been shown on real data (US2000 1m, 84 trades: 54.8% at 1 bar, 95% lower bound 44%, break-even 54.1%).
+let ready = msnr.ok() and crt.ok() and signal.ok() and fib.ok(30)
+let oteUp = fib.dir(30) == 1 and fib.pos(30) >= 0.62 and fib.pos(30) <= 0.79
+let oteDown = fib.dir(30) == -1 and fib.pos(30) >= 0.62 and fib.pos(30) <= 0.79
+let bull = ready and msnr.rejected() == 1 and crt.dir() == 1
+let bear = ready and msnr.rejected() == -1 and crt.dir() == -1
+let bullBoth = bull and signal.smcLean() == 1 and oteUp
+let bearBoth = bear and signal.smcLean() == -1 and oteDown
+let bullOne = bull and (signal.smcLean() == 1 or oteUp)
+let bearOne = bear and (signal.smcLean() == -1 or oteDown)
+call when bullOne
+put when bearOne
+confidence = 72 + 13 * (bullBoth or bearBoth)
+`,
+  },
+  {
+    id: 'meta:builtin-alchemist-htf',
+    name: 'Alchemist HTF: 5m CRT bias + MSNR rejection on the chart timeframe',
+    script: `
+# ALCHEMIST, higher-timeframe variant: the 5m candle range gives the bias (it swept one side and closed back inside), the chart timeframe gives the
+# entry (a rejection of a fresh MSNR closing-price level in the same direction). Needs the chart timeframe to divide 5m (30s, 1m, 5m is chart itself -> use 1m or lower).
+# HONESTY: no edge shown on US2000 1m (117 trades: 51.3% at 1 bar, 95% lower bound 42%, break-even 54.1%).
+let ready = msnr.ok() and crt.ok("5m")
+call when ready and crt.dir("5m") == 1 and msnr.rejected() == 1
+put when ready and crt.dir("5m") == -1 and msnr.rejected() == -1
+confidence = 65
+`,
+  },
 ]
 
 /** Per direct follow-up ("SMC: FVG, SMC: CRT and so on are not on the

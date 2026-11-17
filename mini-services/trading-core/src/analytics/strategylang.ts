@@ -248,6 +248,11 @@ import { WYCKOFF_MIN_BARS, readWyckoff, type WyckoffRead } from './mslwyckoff'
 import { SMCX_MIN_BARS, readSmcx, type SmcxRead } from './mslsmcx'
 import { smtDivergence } from './smt'
 import { readBlocks, readJudas, readSoup, type BlockRead, type JudasRead } from './mslpatterns'
+import { readSnr, readFibs, readZones, FASTLEVELS_MIN_FAST } from './fastlevels'
+import { readMsnr, readCrt, MSNR_MIN_BARS, type MsnrRead } from './msnr'
+import { readPolarity, POLAR_MIN_BARS, POLAR_BASES, type PolarRead, type PolarBaseRead } from './polarity'
+import { readReversal, REVMSL_MIN_BARS, type RevRead } from './revmsl'
+import { readControl, CONTROL_MIN_BARS, type ControlSnap } from './control'
 import { predictNextCandle, ORACLE_MIN_CANDLES, ORACLE_EVAL_WINDOW, type NextCandlePrediction } from './nextcandle'
 import { aiReadingFor, inMslBacktest } from './mslai'
 import { readLearn, DISCOVER_MIN_BARS, type LearnRead } from './discover'
@@ -2678,6 +2683,252 @@ function aiMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | und
   }
 }
 
+const msnrCache = new WeakMap<MslSeriesCtx, MsnrRead>()
+/** `msnr.*` - Malaysian SNR levels read off the CLOSING-price line (analytics/msnr.ts): A-levels (close peaks = resistance), V-levels (close valleys = support), FRESH until a later bar closes beyond them,
+ * and the rejection of a fresh level by the latest closed bar. Candle-derived, backtestable. */
+function msnrMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  void args
+  const s = requireSeries(ctx, tf)
+  if (name === 'ok') return s.close.length >= MSNR_MIN_BARS
+  if (s.close.length < MSNR_MIN_BARS) throw new MslRuntimeError(`msnr.${name}() needs at least ${MSNR_MIN_BARS} closed bars - history is too thin`)
+  let r = msnrCache.get(s)
+  if (!r) msnrCache.set(s, (r = readMsnr(candlesWithTime(s))))
+  if (!r.ok) throw new MslRuntimeError(`msnr.${name}() - not enough usable bars (flat ATR)`)
+  switch (name) {
+    case 'resistance': return r.resistance
+    case 'support': return r.support
+    case 'resDist': return Number.isFinite(r.resDist) ? r.resDist : 99
+    case 'supDist': return Number.isFinite(r.supDist) ? r.supDist : 99
+    case 'rejected': return r.rejected
+    case 'rejLevel': return r.rejLevel
+    case 'rejAge': return r.rejAge
+    case 'rejTests': return r.rejTests
+    case 'virgin': return r.rejected !== 0 && r.rejTests === 0
+    case 'levels': return r.levels.length
+    default: throw new MslRuntimeError(`unknown msnr method "msnr.${name}(...)" - use ok/resistance/support/resDist/supDist/rejected/rejLevel/rejAge/rejTests/virgin/levels`)
+  }
+}
+
+/** `crt.*` - Candle Range Theory (analytics/msnr.ts readCrt): candle 1 (or the last n bars, optional first numeric argument 1-10) sets a range, the latest closed bar swept one side and closed back inside. */
+function crtMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const s = requireSeries(ctx, tf)
+  if (name === 'ok') return s.close.length >= 25
+  if (s.close.length < 25) throw new MslRuntimeError(`crt.${name}() needs at least 25 closed bars - history is too thin`)
+  const r = readCrt(candlesWithTime(s), args.length ? asNum(args[0]) : 1)
+  if (!r.ok) throw new MslRuntimeError(`crt.${name}() - not enough usable bars (flat ATR)`)
+  switch (name) {
+    case 'dir': return r.dir
+    case 'bullish': return r.dir === 1
+    case 'bearish': return r.dir === -1
+    case 'rangeHigh': return r.rangeHigh
+    case 'rangeLow': return r.rangeLow
+    case 'mid': return r.mid
+    case 'target': return r.target
+    case 'depth': return r.depth
+    case 'strong': return r.strong
+    default: throw new MslRuntimeError(`unknown crt method "crt.${name}(...)" - use ok/dir/bullish/bearish/rangeHigh/rangeLow/mid/target/depth/strong (optional range size n first)`)
+  }
+}
+
+const snrCache = new WeakMap<MslSeriesCtx, Map<string, ReturnType<typeof readSnr>>>()
+const fibsCache = new WeakMap<MslSeriesCtx, Map<string, ReturnType<typeof readFibs>>>()
+function fastBase(ctx: EvalEnv, fastTf: string | undefined, who: string): { base: MslSeriesCtx; fast: MslSeriesCtx; key: string } {
+  const key = fastTf ?? '5s'
+  const base = requireSeries(ctx, undefined)
+  const fast = requireSeries(ctx, key)
+  if (fast.close.length < FASTLEVELS_MIN_FAST) throw new MslRuntimeError(`${who} needs at least ${FASTLEVELS_MIN_FAST} closed ${key} bars - the fast chart is too thin`)
+  if (base.close.length < 30) throw new MslRuntimeError(`${who} needs at least 30 closed bars on the trading chart`)
+  return { base, fast, key }
+}
+/** `snr.*` - MANY support/resistance levels mapped on a fast chart (default "5s", override with a trailing string) and read against the TRADING chart's latest closed bar. Distances are in trading-chart ATR. */
+function snrMethod(name: string, args: MslValue[], ctx: EvalEnv, fastTf: string | undefined): MslValue {
+  if (name === 'ok') { try { fastBase(ctx, fastTf, 'snr.ok()'); return true } catch { return false } }
+  const { base, fast, key } = fastBase(ctx, fastTf, `snr.${name}()`)
+  let m = snrCache.get(base); if (!m) snrCache.set(base, (m = new Map()))
+  let r = m.get(key)
+  if (!r) m.set(key, (r = readSnr(candlesWithTime(fast), candlesWithTime(base))))
+  if (!r.ok) throw new MslRuntimeError(`snr.${name}() - not enough usable bars (flat ATR)`)
+  const L = r.map.levels, a = r.map.atr1m, px = r.map.price
+  const nth = (side: 'support' | 'resistance', k: number) => L.filter((l) => l.side === side).sort((x, y) => Math.abs(x.price - px) - Math.abs(y.price - px))[Math.max(0, Math.floor(k) - 1)]
+  const k = args.length ? asNum(args[0]) : 1
+  switch (name) {
+    case 'count': return L.length
+    case 'supports': return L.filter((l) => l.side === 'support').length
+    case 'resistances': return L.filter((l) => l.side === 'resistance').length
+    case 'support': return nth('support', k)?.price ?? 0
+    case 'resistance': return nth('resistance', k)?.price ?? 0
+    case 'supDist': { const l = nth('support', k); return l ? (px - l.price) / a : 99 }
+    case 'resDist': { const l = nth('resistance', k); return l ? (l.price - px) / a : 99 }
+    case 'supTouches': return nth('support', k)?.touches ?? 0
+    case 'resTouches': return nth('resistance', k)?.touches ?? 0
+    case 'atLevel': return r.atLevel !== null
+    case 'atTouches': return r.atLevel?.touches ?? 0
+    case 'atStrength': return r.atLevel?.strength ?? 0
+    case 'rejected': return r.rejected
+    case 'rejLevel': return r.rejLevel
+    case 'rejTouches': return r.rejTouches
+    case 'within': { const d = args.length ? asNum(args[0]) : 0.5; return L.filter((l) => Math.abs(l.price - px) <= d * a).length }
+    default: throw new MslRuntimeError(`unknown snr method "snr.${name}(...)" - use ok/count/supports/resistances/support(n)/resistance(n)/supDist(n)/resDist(n)/supTouches(n)/resTouches(n)/atLevel/atTouches/atStrength/rejected/rejLevel/rejTouches/within(atr)`)
+  }
+}
+/** `fibs.*` - Fibonacci retracements from the last 8 INTACT zig-zag legs of the fast chart, stacked into confluence, read against the trading chart. */
+function fibsMethod(name: string, args: MslValue[], ctx: EvalEnv, fastTf: string | undefined): MslValue {
+  if (name === 'ok') { try { fastBase(ctx, fastTf, 'fibs.ok()'); return true } catch { return false } }
+  const { base, fast, key } = fastBase(ctx, fastTf, `fibs.${name}()`)
+  let m = fibsCache.get(base); if (!m) fibsCache.set(base, (m = new Map()))
+  let r = m.get(key)
+  if (!r) m.set(key, (r = readFibs(candlesWithTime(fast), candlesWithTime(base))))
+  if (!r.ok) throw new MslRuntimeError(`fibs.${name}() - not enough usable bars (flat ATR)`)
+  const L = r.map.levels, a = r.map.atr1m, px = r.map.price
+  switch (name) {
+    case 'legs': return r.map.legs.length
+    case 'count': return L.length
+    case 'confluence': return L.reduce((mx, l) => (Math.abs(l.price - px) <= (args.length ? asNum(args[0]) : 0.3) * a ? Math.max(mx, l.confluence) : mx), 0)
+    case 'at': return r.atCount
+    case 'supportAt': return r.supportAt
+    case 'resistAt': return r.resistAt
+    case 'rejected': return r.rejected
+    case 'rejRatio': return r.rejRatio
+    case 'nearest': { let b = 99; for (const l of L) b = Math.min(b, Math.abs(l.price - px) / a); return b }
+    default: throw new MslRuntimeError(`unknown fibs method "fibs.${name}(...)" - use ok/legs/count/confluence(atr)/at/supportAt/resistAt/rejected/rejRatio/nearest`)
+  }
+}
+
+const zoneCache = new WeakMap<MslSeriesCtx, Map<string, ReturnType<typeof readZones>>>()
+/** `zone.*` - SUPPLY / DEMAND zones (base + impulse) found on a fast chart (default "5s", trailing string overrides) and read against the trading chart (1m or above). */
+function zoneMethod(name: string, args: MslValue[], ctx: EvalEnv, fastTf: string | undefined): MslValue {
+  if (name === 'ok') { try { fastBase(ctx, fastTf, 'zone.ok()'); return true } catch { return false } }
+  const { base, fast, key } = fastBase(ctx, fastTf, `zone.${name}()`)
+  let m = zoneCache.get(base); if (!m) zoneCache.set(base, (m = new Map()))
+  let r = m.get(key)
+  if (!r) m.set(key, (r = readZones(candlesWithTime(fast), candlesWithTime(base))))
+  if (!r.ok) throw new MslRuntimeError(`zone.${name}() - not enough usable bars (flat ATR)`)
+  const Z = r.map.zones, a = r.map.atr1m, px = r.map.price
+  const nth = (kind: 'demand' | 'supply', k: number) => Z.filter((z) => z.kind === kind).sort((x, y) => Math.abs((x.top + x.bottom) / 2 - px) - Math.abs((y.top + y.bottom) / 2 - px))[Math.max(0, Math.floor(k) - 1)]
+  const k = args.length ? asNum(args[0]) : 1
+  switch (name) {
+    case 'count': return Z.length
+    case 'demandCount': return Z.filter((z) => z.kind === 'demand').length
+    case 'supplyCount': return Z.filter((z) => z.kind === 'supply').length
+    case 'demandTop': return nth('demand', k)?.top ?? 0
+    case 'demandBottom': return nth('demand', k)?.bottom ?? 0
+    case 'supplyTop': return nth('supply', k)?.top ?? 0
+    case 'supplyBottom': return nth('supply', k)?.bottom ?? 0
+    case 'demandDist': { const z = nth('demand', k); return z ? Math.max(0, px - z.top) / a : 99 }
+    case 'supplyDist': { const z = nth('supply', k); return z ? Math.max(0, z.bottom - px) / a : 99 }
+    case 'inDemand': return r.inDemand
+    case 'inSupply': return r.inSupply
+    case 'rejected': return r.rejected
+    case 'fresh': return r.zone ? r.zone.tests === 0 : false
+    case 'tests': return r.zone?.tests ?? 0
+    case 'strength': return r.zone?.strength ?? 0
+    case 'age': return r.zone?.age ?? 0
+    case 'top': return r.zone?.top ?? 0
+    case 'bottom': return r.zone?.bottom ?? 0
+    default: throw new MslRuntimeError(`unknown zone method "zone.${name}(...)" - use ok/count/demandCount/supplyCount/demandTop(n)/demandBottom(n)/supplyTop(n)/supplyBottom(n)/demandDist(n)/supplyDist(n)/inDemand/inSupply/rejected/fresh/tests/strength/age/top/bottom`)
+  }
+}
+
+const polarCache = new WeakMap<MslSeriesCtx, PolarRead>()
+/** `polar.*` - the Polarity Switch (analytics/polarity.ts): keeps four plain base signals (follow/ctl/rev/trend), measures walk-forward how each has done on THIS pair in the SAME mkt regime,
+ * and KEEPs one that is reliably right, FLIPs one that is reliably wrong (z <= -2, n >= 30), SKIPs the rest. `polar.<m>()` reads the best base (largest |z|); `polar.<m>("ctl")` reads a named one. Candle-derived, backtestable. */
+function polarMethod(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
+  const s = requireSeries(ctx, undefined)
+  if (name === 'ok') return s.close.length >= POLAR_MIN_BARS
+  if (s.close.length < POLAR_MIN_BARS) throw new MslRuntimeError(`polar.${name}() needs at least ${POLAR_MIN_BARS} closed bars - history is too thin`)
+  let r = polarCache.get(s)
+  if (!r) polarCache.set(s, (r = readPolarity(candlesWithTime(s))))
+  if (!r.ok) throw new MslRuntimeError(`polar.${name}() - not enough usable bars (regime warmup)`)
+  if (name === 'regime') return r.regime
+  let b: PolarBaseRead | null
+  if (args.length && typeof args[0] === 'string') {
+    const key = String(args[0]).toLowerCase()
+    if (!(POLAR_BASES as readonly string[]).includes(key)) throw new MslRuntimeError(`polar base "${key}" unknown - use ${POLAR_BASES.join('/')}`)
+    b = r.bases.find((x) => x.base === key) ?? null
+  } else b = r.best
+  switch (name) {
+    case 'side': return b ? b.side : 'none'
+    case 'mode': return b ? b.mode : 'skip'
+    case 'base': return b ? b.base : 'none'
+    case 'baseSide': return b ? b.baseSide : 'none'
+    case 'p': return b ? b.p : 0.5
+    case 'n': return b ? b.n : 0
+    case 'z': return b ? b.z : 0
+    case 'hit': return b ? b.hit : 0.5
+    case 'flipped': return b ? b.mode === 'flip' : false
+    default: throw new MslRuntimeError(`unknown polar method "polar.${name}(...)" - use ok/regime/side/mode/base/baseSide/p/n/z/hit/flipped (optional base name "follow"|"ctl"|"rev"|"trend")`)
+  }
+}
+
+const revCache = new WeakMap<MslSeriesCtx, RevRead>()
+/** `rev.*` - reversal detection (analytics/reversal.ts): six visible pieces of exhaustion evidence scored per side 0..100, plus an EMPIRICAL walk-forward
+ * probability that the next candle moved in the reversal direction after earlier bars with the same side and score bucket. Candle-derived, backtestable. */
+function revMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const s = requireSeries(ctx, tf)
+  if (name === 'ok') return s.close.length >= REVMSL_MIN_BARS
+  if (s.close.length < REVMSL_MIN_BARS) throw new MslRuntimeError(`rev.${name}() needs at least ${REVMSL_MIN_BARS} closed bars - history is too thin`)
+  let r = revCache.get(s)
+  if (!r) revCache.set(s, (r = readReversal(candlesWithTime(s))))
+  if (!r.ok) throw new MslRuntimeError(`rev.${name}() - not enough usable bars (indicator warmup / flat ATR)`)
+  switch (name) {
+    case 'side': return r.side
+    case 'score': return r.score
+    case 'callScore': return r.callScore
+    case 'putScore': return r.putScore
+    case 'p': return r.p
+    case 'n': return r.n
+    case 'low': return r.low
+    case 'streak': return r.streak
+    case 'stretch': return r.stretch
+    case 'rsi': return r.rsi
+    case 'wick': return r.wick
+    case 'sweep': return r.sweep
+    case 'shrink': return r.shrink
+    case 'confirmed': return r.confirmed
+    case 'state': return r.state
+    case 'dir': return r.dir
+    case 'net': return r.net
+    case 'reasons': return r.reasons
+    case 'has': { const key = String(args[0] ?? '').toLowerCase(); return r.detectors.some((d) => d.toLowerCase().includes(key)) }
+    case 'osSide': return r.state === 'reversing' || r.state === 'confirmed' ? (r.dir === 'up' ? 'call' : r.dir === 'down' ? 'put' : 'none') : 'none'
+    default: throw new MslRuntimeError(`unknown rev method "rev.${name}(...)" - use ok/side/score/callScore/putScore/p/n/low/streak/stretch/rsi/wick/sweep/shrink/confirmed/state/dir/net/reasons/has("detector")/osSide`)
+  }
+}
+
+const ctlCache = new WeakMap<MslSeriesCtx, Map<number, ControlSnap>>()
+/** `ctl.*` - who is in control (analytics/control.ts): a -100..+100 score from five visible components over the last N bars (default 10). Candle-derived, backtestable.
+ * The optional first argument is the window in bars (5..60); a trailing string is the timeframe like every other namespace. */
+function ctlMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const s = requireSeries(ctx, tf)
+  if (name === 'ok') return s.close.length >= CONTROL_MIN_BARS
+  if (s.close.length < CONTROL_MIN_BARS) throw new MslRuntimeError(`ctl.${name}() needs at least ${CONTROL_MIN_BARS} closed bars - history is too thin`)
+  const win = args.length ? Math.max(5, Math.min(60, Math.round(asNum(args[0])))) : 10
+  let m = ctlCache.get(s)
+  if (!m) ctlCache.set(s, (m = new Map()))
+  let r = m.get(win)
+  if (!r) m.set(win, (r = readControl(candlesWithTime(s), win)))
+  if (!r.ok) throw new MslRuntimeError(`ctl.${name}() - not enough usable bars (indicator warmup / flat ATR)`)
+  switch (name) {
+    case 'score': return r.score
+    case 'who': return r.who
+    case 'strength': return r.strength
+    case 'isBuyers': return r.who === 'buyers'
+    case 'isSellers': return r.who === 'sellers'
+    case 'contested': return r.who === 'contested'
+    case 'body': return r.body
+    case 'clv': return r.clv
+    case 'struct': return r.struct
+    case 'ema': return r.ema
+    case 'flow': return Number.isFinite(r.flow) ? r.flow : 0
+    case 'volumeOk': return r.volumeOk
+    case 'full': return r.full
+    case 'fullSide': return r.fullSide
+    case 'run': return r.runBars
+    case 'shifted': return r.shifted
+    default: throw new MslRuntimeError(`unknown ctl method "ctl.${name}(...)" - use ok/score/who/strength/isBuyers/isSellers/contested/body/clv/struct/ema/flow/volumeOk/full/fullSide/run/shifted (optional window 5-60 first)`)
+  }
+}
+
 const ncCache = new WeakMap<MslSeriesCtx, NextCandlePrediction | null>()
 /** `nc.*` - the Next-Candle Oracle (analytics/nextcandle.ts predictNextCandle: Markov + Monte Carlo + Kalman/OU + confluence + chart engines + candle
  * patterns + bar physics + Renko + footprint + SMC, fused by log-odds with regime weighting) as a candle-derived, backtestable MSL namespace. It is the RAW
@@ -4541,6 +4792,30 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
         return ppMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && (e.obj.name === 'msnr' || e.obj.name === 'crt') && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return e.obj.name === 'msnr' ? msnrMethod(e.name, args, ctx, tf) : crtMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && (e.obj.name === 'snr' || e.obj.name === 'fibs' || e.obj.name === 'zone') && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const ftf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return e.obj.name === 'snr' ? snrMethod(e.name, args, ctx, ftf) : e.obj.name === 'zone' ? zoneMethod(e.name, args, ctx, ftf) : fibsMethod(e.name, args, ctx, ftf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'polar' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        return polarMethod(e.name, args, ctx)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'rev' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = e.name !== 'has' && args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return revMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'ctl' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return ctlMethod(e.name, args, ctx, tf)
       }
       if (e.obj.t === 'ident' && e.obj.name === 'nc' && !(e.obj.name in env)) {
         const args = e.args.map((a) => evalExpr(a, env, ctx))

@@ -299,6 +299,55 @@ function fireSignals(...a: Parameters<typeof fireSignalsInner>): ReturnType<type
     endMslBacktest()
   }
 }
+/** Cross-timeframe support for a pure candle-array backtest: a `<tf>` argument ("5m", "1h") is answered by AGGREGATING the same candles into that timeframe, and
+ * only COMPLETED higher-timeframe bars (their window ended at or before the evaluated bar's close) are visible - no look-ahead. A timeframe that is not a whole
+ * multiple of the candle spacing (or is not larger than it) stays unavailable and the call fails closed, exactly as before. */
+const TF_SEC: Record<string, number> = { '5s': 5, '10s': 10, '15s': 15, '30s': 30, '1m': 60, '2m': 120, '3m': 180, '5m': 300, '10m': 600, '15m': 900, '30m': 1800, '1h': 3600, '2h': 7200, '4h': 14400, '1d': 86400 }
+let fastFeed: Record<string, Candle[]> | null = null
+/** Supply LOWER-timeframe candles (e.g. {"5s": [...]}) so `snr.*`/`fibs.*` can be backtested; only bars that closed at or before the evaluated bar's close are visible. */
+export function setBacktestFastFeed(f: Record<string, Candle[]> | null): void { fastFeed = f }
+function makeCrossTf(candles: Candle[]): (i: number) => (tf: string) => MslSeriesCtx | undefined {
+  let base = Infinity
+  for (let i = 1; i < candles.length; i++) { const g = candles[i].time - candles[i - 1].time; if (g > 0 && g < base) base = g }
+  type Bucket = { start: number; o: number; h: number; l: number; c: number; v: number }
+  const prepared = new Map<string, { sec: number; b: Bucket[]; ptr: number } | null>()
+  const prep = (tf: string) => {
+    if (prepared.has(tf)) return prepared.get(tf) ?? null
+    const sec = TF_SEC[tf]
+    if (!sec || !Number.isFinite(base) || sec <= base || sec % base !== 0) { prepared.set(tf, null); return null }
+    const b: Bucket[] = []
+    for (const k of candles) {
+      const start = Math.floor(k.time / sec) * sec
+      const last = b[b.length - 1]
+      if (last && last.start === start) { last.h = Math.max(last.h, k.high); last.l = Math.min(last.l, k.low); last.c = k.close; last.v += Number.isFinite(k.volume) ? k.volume : 0 } else b.push({ start, o: k.open, h: k.high, l: k.low, c: k.close, v: Number.isFinite(k.volume) ? k.volume : 0 })
+    }
+    const e = { sec, b, ptr: 0 }
+    prepared.set(tf, e)
+    return e
+  }
+  const fastPtr = new Map<string, number>()
+  return (i: number) => (tf: string) => {
+    const e = prep(tf)
+    if (!e) {
+      const fc = fastFeed?.[tf]
+      const sec = TF_SEC[tf]
+      if (!fc || !sec) return undefined
+      const nowF = candles[i].time + base
+      let p = fastPtr.get(tf) ?? 0
+      while (p < fc.length && fc[p].time + sec <= nowF) p++
+      fastPtr.set(tf, p)
+      if (p === 0) return undefined
+      const sl = fc.slice(Math.max(0, p - 2000), p)
+      return { open: sl.map((x) => x.open), high: sl.map((x) => x.high), low: sl.map((x) => x.low), close: sl.map((x) => x.close), volume: sl.map((x) => (Number.isFinite(x.volume) ? x.volume : 0)), time: sl.map((x) => x.time) }
+    }
+    const now = candles[i].time + base
+    while (e.ptr < e.b.length && e.b[e.ptr].start + e.sec <= now) e.ptr++
+    if (e.ptr === 0) return undefined
+    const sl = e.b.slice(0, e.ptr)
+    return { open: sl.map((x) => x.o), high: sl.map((x) => x.h), low: sl.map((x) => x.l), close: sl.map((x) => x.c), volume: sl.map((x) => x.v), time: sl.map((x) => x.start) }
+  }
+}
+
 function fireSignalsInner(
   candles: Candle[],
   parsedAst: MslAst,
@@ -310,10 +359,11 @@ function fireSignalsInner(
   partners?: Record<string, Candle[]>,
 ): FiredSignal[] {
   const fired: FiredSignal[] = []
+  const crossTf = makeCrossTf(candles)
   try {
     for (let i = warmupBars; i <= lastIdx; i++) {
       const series = seriesUpTo(candles, i, partners)
-      const seriesFor = (_tf: string): MslSeriesCtx | undefined => undefined // no cross-timeframe history available to a pure candle-array backtest
+      const seriesFor = crossTf(i)
       const state = { keyPrefix: runId, barTimeSec: candles[i].time }
       const out = evaluateStrategyScript(parsedAst, reads, undefined, series, seriesFor, undefined, state)
       if (out.error || out.direction === 'none') continue

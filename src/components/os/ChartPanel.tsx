@@ -25,7 +25,7 @@ import {
   type UTCTimestamp,
 } from 'lightweight-charts'
 import type { AnalysisResult, Candle, ChartType, ExpirySurfaceResponse, IndicatorSeries, IvHvResponse, NextExpiryPrediction, OtcFootprintResult, OutcomeMemoryResponse, Position, PulseBarRow, PulseBarsResponse, TickBarRow, TickFootprintResult, TicksResponse, Timeframe } from '@/lib/os/client'
-import { chartPriceFormat, fmtPrice, getDayLevels, getExpirySurface, getNextExpiry, getOtcFootprint, getOutcomeMemory, getPulseBars, getTickFootprint, osGet, TIMEFRAME_SECONDS } from '@/lib/os/client'
+import { chartPriceFormat, fmtPrice, getDayLevels, getFastLevels, getExpirySurface, getNextExpiry, getOtcFootprint, getOutcomeMemory, getPulseBars, getTickFootprint, osGet, TIMEFRAME_SECONDS } from '@/lib/os/client'
 
 interface ChartPanelProps {
   candles: Candle[]
@@ -2778,6 +2778,65 @@ export default function ChartPanel({
     }
   }, [showLevels, digitsTicker, chartType])
 
+  // MAP toggle: MANY support/resistance levels + Fibonacci retracements mapped on the 5s chart (kernel /fast_levels) and drawn on THIS chart so a 1m trade can be read against them.
+  // Green = support, red = resistance (thicker = more touches), amber dotted = Fibonacci (label shows ratio and how many legs stack there). Refreshed every 20s.
+  const [showMap, setShowMap] = useState(false)
+  const mapLinesRef = useRef<{ series: AnyPriceSeries; line: IPriceLine }[]>([])
+  const [mapNote, setMapNote] = useState('')
+  useEffect(() => {
+    const clearLines = () => {
+      for (const l of mapLinesRef.current) {
+        try {
+          l.series.removePriceLine(l.line)
+        } catch {
+          // chart already torn down
+        }
+      }
+      mapLinesRef.current = []
+    }
+    if (!showMap) {
+      clearLines()
+      setMapNote('')
+      return
+    }
+    let alive = true
+    const draw = () =>
+      getFastLevels(digitsTicker, tf ?? '1m', '5s')
+        .then((d) => {
+          const series = priceSeriesRef.current
+          if (!alive || !series) return
+          clearLines()
+          if (!d.ok) {
+            setMapNote(d.reason ?? d.error ?? 'no map')
+            return
+          }
+          setMapNote(`${d.snr.length} S/R + ${d.fib.length} fib + ${(d.zones ?? []).length} zones from ${d.fastBars} x 5s bars`)
+          for (const l of d.snr) {
+            const line = series.createPriceLine({ price: l.price, color: l.side === 'support' ? '#34d399' : '#fb7185', lineWidth: l.touches >= 5 ? 2 : 1, lineStyle: LineStyle.Dashed, axisLabelVisible: l.touches >= 4, title: `${l.side === 'support' ? 'S' : 'R'}x${l.touches}` })
+            mapLinesRef.current.push({ series, line })
+          }
+          for (const z of d.zones ?? []) {
+            const col = z.kind === 'demand' ? '#38bdf8' : '#c084fc'
+            for (const [pr, ti] of [[z.top, z.kind === 'demand' ? 'DEM' : 'SUP'], [z.bottom, '']] as [number, string][]) {
+              const line = series.createPriceLine({ price: pr, color: col, lineWidth: z.tests === 0 ? 2 : 1, lineStyle: LineStyle.Solid, axisLabelVisible: ti !== '', title: ti ? `${ti}${z.tests === 0 ? ' fresh' : ' t' + z.tests}` : '' })
+              mapLinesRef.current.push({ series, line })
+            }
+          }
+          for (const l of d.fib) {
+            const line = series.createPriceLine({ price: l.price, color: '#f59e0b', lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: l.confluence >= 2, title: `fib ${(l.ratio * 100).toFixed(1)}${l.confluence >= 2 ? ' x' + l.confluence : ''}` })
+            mapLinesRef.current.push({ series, line })
+          }
+        })
+        .catch(() => {})
+    void draw()
+    const t = setInterval(draw, 20_000)
+    return () => {
+      alive = false
+      clearInterval(t)
+      clearLines()
+    }
+  }, [showMap, digitsTicker, chartType, tf])
+
   const fitChart = () => {
     chartRef.current?.timeScale().fitContent()
     chartRef.current?.timeScale().scrollToRealTime()
@@ -2795,6 +2854,15 @@ export default function ChartPanel({
           }`}
         >
           LVL
+        </button>
+        <button
+          onClick={() => setShowMap((v) => !v)}
+          title={`Level map: many support/resistance levels and Fibonacci retracements from the 5s chart drawn on this chart (green = support, red = resistance, amber = fib, blue = demand zone, purple = supply zone). MSL: snr.* / fibs.* / zone.*${mapNote ? ' - ' + mapNote : ''}`}
+          className={`flex h-6 w-6 items-center justify-center rounded border font-mono text-[8px] font-bold leading-none transition-colors ${
+            showMap ? 'border-amber-500/60 bg-amber-500/15 text-amber-300' : 'border-[#1c2739] bg-[#0d1420]/90 text-[#7c8aa5] hover:border-amber-500/40'
+          }`}
+        >
+          MAP
         </button>
         <button
           onClick={() => zoomBy(0.7)}
