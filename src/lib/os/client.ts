@@ -651,13 +651,16 @@ export async function getFastLevels(asset: string, tf: string, fast: string = '5
   return osGet('/fast_levels', { asset, tf, fast })
 }
 
+export interface ExpectedMoveParams { window: number; mode: 'rms' | 'std' | 'ewma' | 'parkinson'; hurst: number; bars: number; ks: string }
+export const EM_DEFAULT_PARAMS: ExpectedMoveParams = { window: 100, mode: 'rms', hurst: 0.5, bars: 20, ks: '1,2' }
 export interface ExpectedMoveResponse {
   ok: boolean; asset: string; tf: string; bars: number; price: number; sd: number; atr: number; spacing: number; ks: number[]; error?: string
+  params?: { window: number; mode: string; hurst: number }
   points: { time: number; step: number; upper: number[]; lower: number[] }[]
 }
-/** Expected-move cone: the range realized volatility implies over the next `bars` bars (no options chain on IQ Option, so not option-implied). */
-export async function getExpectedMove(asset: string, tf: string, bars: number = 20, ks: string = '1,2'): Promise<ExpectedMoveResponse> {
-  return osGet('/expected_move', { asset, tf, bars: String(bars), k: ks })
+/** Expected-move cone: the range realized volatility implies over the next `bars` bars (no options chain on IQ Option, so not option-implied). Window, estimator and hurst are tunable. */
+export async function getExpectedMove(asset: string, tf: string, p: ExpectedMoveParams = EM_DEFAULT_PARAMS): Promise<ExpectedMoveResponse> {
+  return osGet('/expected_move', { asset, tf, bars: String(p.bars), k: p.ks, window: String(p.window), mode: p.mode, hurst: String(p.hurst) })
 }
 
 /** Previous day / week highs & lows, today's range and the latest Asia / London / New York session ranges. */

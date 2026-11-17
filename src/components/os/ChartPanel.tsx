@@ -25,7 +25,7 @@ import {
   type UTCTimestamp,
 } from 'lightweight-charts'
 import type { AnalysisResult, Candle, ChartType, ExpirySurfaceResponse, IndicatorSeries, IvHvResponse, NextExpiryPrediction, OtcFootprintResult, OutcomeMemoryResponse, Position, PulseBarRow, PulseBarsResponse, TickBarRow, TickFootprintResult, TicksResponse, Timeframe } from '@/lib/os/client'
-import { chartPriceFormat, fmtPrice, getDayLevels, getFastLevels, getExpectedMove, getExpirySurface, getNextExpiry, getOtcFootprint, getOutcomeMemory, getPulseBars, getTickFootprint, osGet, TIMEFRAME_SECONDS } from '@/lib/os/client'
+import { chartPriceFormat, fmtPrice, getDayLevels, getFastLevels, getExpectedMove, EM_DEFAULT_PARAMS, type ExpectedMoveParams, getExpirySurface, getNextExpiry, getOtcFootprint, getOutcomeMemory, getPulseBars, getTickFootprint, osGet, TIMEFRAME_SECONDS } from '@/lib/os/client'
 
 interface ChartPanelProps {
   candles: Candle[]
@@ -2856,9 +2856,11 @@ export default function ChartPanel({
     }
   }, [showMap, digitsTicker, chartType, tf])
 
-  // EM toggle: the EXPECTED MOVE cone - the range REALIZED volatility implies over the next 20 bars (sd*sqrt(h), +/-1 and 2 sigma), drawn as dashed lines widening into the future.
+  // EM toggle: the EXPECTED MOVE cone - the range REALIZED volatility implies over the next N bars (sd*h^hurst, +/-k sigma; window, estimator, hurst and bars are set in the EM settings box), drawn as dashed lines widening into the future.
   // TradingView's version is options-implied; IQ Option has no options chain, so this is recent volatility, not a forecast. MSL: em.*
   const [showEm, setShowEm] = useState(false)
+  const [emOpen, setEmOpen] = useState(false)
+  const [emP, setEmP] = useState<ExpectedMoveParams>(EM_DEFAULT_PARAMS)
   const emRef = useRef<ISeriesApi<'Line'>[]>([])
   useEffect(() => {
     const clearEm = () => {
@@ -2877,7 +2879,7 @@ export default function ChartPanel({
     }
     let alive = true
     const draw = () =>
-      getExpectedMove(digitsTicker, tf ?? '1m', 20, '1,2')
+      getExpectedMove(digitsTicker, tf ?? '1m', emP)
         .then((d) => {
           const ch = chartRef.current
           if (!alive || !ch || !d.ok || !d.points.length) return
@@ -2898,7 +2900,7 @@ export default function ChartPanel({
       clearInterval(t)
       clearEm()
     }
-  }, [showEm, digitsTicker, chartType, tf])
+  }, [showEm, digitsTicker, chartType, tf, emP])
 
   const fitChart = () => {
     chartRef.current?.timeScale().fitContent()
@@ -2929,13 +2931,46 @@ export default function ChartPanel({
         </button>
         <button
           onClick={() => setShowEm((v) => !v)}
-          title="Expected move cone: the range realized volatility implies over the next 20 bars (+/-1 sigma solid-ish, +/-2 sigma dotted). Not options-implied (IQ Option has no options chain) and not a forecast. MSL: em.*"
+          onContextMenu={(e) => {
+            e.preventDefault()
+            setEmOpen((v) => !v)
+          }}
+          title="Expected move cone: the range realized volatility implies over the next N bars. Click = on/off, right-click = settings (window, estimator, hurst, bars, sigma bands). Not options-implied (IQ Option has no options chain) and not a forecast. MSL: em.*"
           className={`flex h-6 w-6 items-center justify-center rounded border font-mono text-[8px] font-bold leading-none transition-colors ${
             showEm ? 'border-blue-500/60 bg-blue-500/15 text-blue-300' : 'border-[#1c2739] bg-[#0d1420]/90 text-[#7c8aa5] hover:border-blue-500/40'
           }`}
         >
           EM
         </button>
+        {emOpen && (
+          <div className="absolute bottom-0 right-8 z-20 w-44 space-y-1 rounded border border-blue-500/40 bg-[#0b111c]/95 p-2 font-mono text-[9px] text-[#9fb0cc] shadow-lg">
+            <div className="flex items-center justify-between text-blue-300">
+              <span>EXPECTED MOVE</span>
+              <button onClick={() => setEmOpen(false)} className="text-[#7c8aa5] hover:text-white">x</button>
+            </div>
+            <label className="flex items-center justify-between">window
+              <input type="number" min={10} max={1000} value={emP.window} onChange={(e) => setEmP((p) => ({ ...p, window: Math.max(10, Math.min(1000, Number(e.target.value) || 100)) }))} className="w-16 rounded border border-[#1c2739] bg-[#0d1420] px-1 text-right" />
+            </label>
+            <label className="flex items-center justify-between">estimator
+              <select value={emP.mode} onChange={(e) => setEmP((p) => ({ ...p, mode: e.target.value as ExpectedMoveParams['mode'] }))} className="w-16 rounded border border-[#1c2739] bg-[#0d1420] px-0.5">
+                <option value="rms">rms</option>
+                <option value="std">std</option>
+                <option value="ewma">ewma</option>
+                <option value="parkinson">parkinson</option>
+              </select>
+            </label>
+            <label className="flex items-center justify-between">hurst
+              <input type="number" step={0.05} min={0.1} max={1} value={emP.hurst} onChange={(e) => setEmP((p) => ({ ...p, hurst: Math.max(0.1, Math.min(1, Number(e.target.value) || 0.5)) }))} className="w-16 rounded border border-[#1c2739] bg-[#0d1420] px-1 text-right" />
+            </label>
+            <label className="flex items-center justify-between">bars ahead
+              <input type="number" min={1} max={200} value={emP.bars} onChange={(e) => setEmP((p) => ({ ...p, bars: Math.max(1, Math.min(200, Number(e.target.value) || 20)) }))} className="w-16 rounded border border-[#1c2739] bg-[#0d1420] px-1 text-right" />
+            </label>
+            <label className="flex items-center justify-between">sigmas
+              <input type="text" value={emP.ks} onChange={(e) => setEmP((p) => ({ ...p, ks: e.target.value.replace(/[^0-9.,]/g, '').slice(0, 20) || '1,2' }))} className="w-16 rounded border border-[#1c2739] bg-[#0d1420] px-1 text-right" />
+            </label>
+            <button onClick={() => setEmP(EM_DEFAULT_PARAMS)} className="w-full rounded border border-[#1c2739] py-0.5 text-[#7c8aa5] hover:text-white">reset defaults</button>
+          </div>
+        )}
         <button
           onClick={() => zoomBy(0.7)}
           title="Zoom in"

@@ -248,7 +248,7 @@ import { WYCKOFF_MIN_BARS, readWyckoff, type WyckoffRead } from './mslwyckoff'
 import { SMCX_MIN_BARS, readSmcx, type SmcxRead } from './mslsmcx'
 import { smtDivergence } from './smt'
 import { readBlocks, readJudas, readSoup, type BlockRead, type JudasRead } from './mslpatterns'
-import { readEm, emUpper, emLower, emZ, EM_MIN_BARS } from './expectedmove'
+import { readEm, emUpper, emLower, emZ, emSigmaAt, emModeFromCode, emParams, EM_MIN_BARS } from './expectedmove'
 import { detectChartPatterns2, readAutoTrend, readElliott, CP_MIN_BARS, type CpHit, type AutoTrend, type EwRead } from './patternengine'
 import { stepHold, holdKey, holdRec, clearHolds, inReplay, replayBypassOn, stepBypass, clearBypass } from './timing'
 import { liveRiskOutcomes, riskStats, sessionAt, minsIn, minsLeft, inWindow, weekendAt, type RiskOutcome } from './mslrisk'
@@ -3105,18 +3105,25 @@ function emMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | und
   const s = requireSeries(ctx, tf)
   if (name === 'ok') return s.close.length >= EM_MIN_BARS
   if (s.close.length < EM_MIN_BARS) throw new MslRuntimeError(`em.${name}() needs at least ${EM_MIN_BARS} closed bars - history is too thin`)
-  const num = (i: number, d: number): number => { const v = args[i]; if (v === undefined) return d; if (typeof v !== 'number' || !isFinite(v) || v <= 0) throw new MslRuntimeError(`em.${name}(): argument ${i + 1} must be a positive number`); return v }
-  const r = readEm(s.close, s.high, s.low)
-  if (!r.ok) throw new MslRuntimeError(`em.${name}() - flat prices, no volatility to measure`)
+  const num = (i: number, d: number, allowZero = false): number => { const v = args[i]; if (v === undefined) return d; if (typeof v !== 'number' || !isFinite(v) || v < 0 || (v === 0 && !allowZero)) throw new MslRuntimeError(`em.${name}(): argument ${i + 1} must be a ${allowZero ? 'non-negative' : 'positive'} number`); return v }
+  // trailing OPTIONAL tuning arguments, always in this order after the method's own: window (bars of history, default 100; EWMA = span), hurst (growth exponent, default 0.5 = sqrt-time), mode (0 rms, 1 std, 2 ewma, 3 parkinson)
+  const tune = (at: number) => emParams({ window: num(at, 100), hurst: num(at + 1, 0.5), mode: emModeFromCode(num(at + 2, 0, true)) })
+  const x = { close: s.close, high: s.high, low: s.low }
   switch (name) {
-    case 'sigma': return r.sd
-    case 'sigmaAtr': return r.sd / r.atr
-    case 'upper': return emUpper(r, num(0, 1), num(1, 1))
-    case 'lower': return emLower(r, num(0, 1), num(1, 1))
-    case 'width': return (2 * num(1, 1) * r.sd * Math.sqrt(num(0, 1))) / r.atr
-    case 'z': return emZ(s.close, num(0, 1))
-    case 'outside': { const z = emZ(s.close, num(0, 1)); const k = num(1, 1); return z > k ? 1 : z < -k ? -1 : 0 }
-    default: throw new MslRuntimeError(`unknown em method "em.${name}(...)" - use ok/sigma/sigmaAtr/upper(bars,k)/lower(bars,k)/width(bars,k)/z(bars)/outside(bars,k)`)
+    case 'sigma': case 'sigmaAtr': {
+      const p = tune(0), sd = emSigmaAt(x, s.close.length - 1, p)
+      if (!(sd > 0)) throw new MslRuntimeError(`em.${name}() - flat prices, no volatility to measure`)
+      if (name === 'sigma') return sd
+      const r = readEm(x, p); return r.atr > 0 ? sd / r.atr : 0
+    }
+    case 'upper': case 'lower': case 'width': {
+      const bars = num(0, 1), k = num(1, 1), r = readEm(x, tune(2))
+      if (!r.ok) throw new MslRuntimeError(`em.${name}() - flat prices, no volatility to measure`)
+      return name === 'upper' ? emUpper(r, bars, k) : name === 'lower' ? emLower(r, bars, k) : (emUpper(r, bars, k) - emLower(r, bars, k)) / r.atr
+    }
+    case 'z': return emZ(x, num(0, 1), tune(1))
+    case 'outside': { const z = emZ(x, num(0, 1), tune(2)); const k = num(1, 1); return z > k ? 1 : z < -k ? -1 : 0 }
+    default: throw new MslRuntimeError(`unknown em method "em.${name}(...)" - use ok/sigma/sigmaAtr/upper(bars,k)/lower(bars,k)/width(bars,k)/z(bars)/outside(bars,k), each with optional trailing window, hurst, mode`)
   }
 }
 
