@@ -1,0 +1,5 @@
+# Elliott: wave 2 just completed (point 2 confirmed, wave 3 under way). Take the wave-3 entry if wave 2 retraced 50-78.6% of wave 1
+let ok = ew2.ok() and ew2.wave() == 3 and ew2.ratio(2) >= 0.5 and ew2.ratio(2) <= 0.786
+call when ok and ew2.dir() == 1 and px.close[-1] > px.high[-2]
+put when ok and ew2.dir() == -1 and px.close[-1] < px.low[-2]
+expiry = 5

@@ -1,0 +1,4 @@
+# Trendline from the last two swing lows (barsAgo from sw.lowAge): buy a touch from above
+let tl = lineAt(sw.low(2), sw.lowAge(2), sw.low(1), sw.lowAge(1), 0)
+call when near(px.low[-1], tl, 0.4) and px.close[-1] > tl and sw.low(1) > sw.low(2)
+expiry = 3

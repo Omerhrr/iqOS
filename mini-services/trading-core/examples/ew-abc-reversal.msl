@@ -1,0 +1,4 @@
+# Elliott: a finished 5-wave rise (wave 5 confirmed, correction just starting) -> fade the top; mirrored for a falling impulse
+put when ew2.ok() and ew2.dir() == -1 and ew2.wave() == 6 and ew2.rule(3) and px.close[-1] < px.low[-2]
+call when ew2.ok() and ew2.dir() == 1 and ew2.wave() == 6 and ew2.rule(3) and px.close[-1] > px.high[-2]
+expiry = 5

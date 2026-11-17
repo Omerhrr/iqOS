@@ -1,0 +1,4 @@
+# S&R from swing pivots: bounce off the latest swing low / rejection at the latest swing high (within 0.5 ATR)
+call when near(px.low[-1], sw.low(1), 0.5) and px.close[-1] > px.open[-1]
+put when near(px.high[-1], sw.high(1), 0.5) and px.close[-1] < px.open[-1]
+expiry = 3

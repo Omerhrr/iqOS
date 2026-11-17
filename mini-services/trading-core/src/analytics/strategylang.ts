@@ -248,6 +248,7 @@ import { WYCKOFF_MIN_BARS, readWyckoff, type WyckoffRead } from './mslwyckoff'
 import { SMCX_MIN_BARS, readSmcx, type SmcxRead } from './mslsmcx'
 import { smtDivergence } from './smt'
 import { readBlocks, readJudas, readSoup, type BlockRead, type JudasRead } from './mslpatterns'
+import { computeSwings, nth as swNth, legPrice as swLegPrice, legBars as swLegBars, retraceOfLast, readEw2, ewLen, ewRatio, ewProj, ewInvalid, ewConfirmed, EW_STAGES, SW_MIN_BARS, type Swings } from './swingengine'
 import { luxSmc, LUX_FIELDS } from './luxsmc'
 import { pmax, pmaxSource } from './pmax'
 import { maSeries, dema, t3, hema, vwapDaily, hullSeries } from './mamix'
@@ -861,7 +862,7 @@ const FIELDS = new Set([
   // bar (MslBarValue)
   'o', 'open', 'h', 'high', 'l', 'low', 'c', 'close', 'v', 'volume', 'body', 'range', 'upper_wick', 'lower_wick',
   // bundle sub-fields across every ind.* multi-series indicator
-  'macd', 'signal', 'hist', 'upper', 'mid', 'lower', 'width', 'percentB', 'k', 'd', 'adx', 'plusDI', 'minusDI', 'line', 'ma', 'trend', 'tsl', 'atr', ...LUX_FIELDS,
+  'macd', 'signal', 'hist', 'upper', 'mid', 'lower', 'width', 'percentB', 'k', 'd', 'adx', 'plusDI', 'minusDI', 'line', 'ma', 'trend', 'tsl', 'atr', 'hl2', 'hlc3', 'ohlc4', 'chg', 'tr', ...LUX_FIELDS,
   // bundle sub-fields on pf.column(offset) - top/bottom price boundary,
   // unsigned box count (signed direction is already pf.boxes(n)'s own job,
   // not duplicated here)
@@ -3138,6 +3139,95 @@ function emMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | und
   }
 }
 
+const swCache = new WeakMap<MslSeriesCtx, Map<string, Swings>>()
+function swingsOf(s: MslSeriesCtx, k: number, mode: number): Swings {
+  let m = swCache.get(s); if (!m) swCache.set(s, (m = new Map()))
+  const key = `${k},${mode}`
+  let r = m.get(key); if (!r) m.set(key, (r = computeSwings(s, k, mode)))
+  return r
+}
+/** `px` / `px("5m")` - the RAW price series as a bundle (open high low close volume hl2 hlc3 ohlc4 range chg tr), so `px.high.max(20)`, `px.low.min(10)`, `px.close[-3]`, `px.close.crossed(...)` work without a loop. */
+function pxBundle(s: MslSeriesCtx): MslValue {
+  const n = s.close.length
+  const mk = (g: (i: number) => number): MslValue => seriesValue(Array.from({ length: n }, (_, i) => g(i)))
+  return bundleValue({
+    open: seriesValue(s.open), high: seriesValue(s.high), low: seriesValue(s.low), close: seriesValue(s.close), volume: seriesValue(s.volume),
+    hl2: mk((i) => (s.high[i] + s.low[i]) / 2), hlc3: mk((i) => (s.high[i] + s.low[i] + s.close[i]) / 3), ohlc4: mk((i) => (s.open[i] + s.high[i] + s.low[i] + s.close[i]) / 4),
+    range: mk((i) => s.high[i] - s.low[i]), chg: mk((i) => s.close[i] - s.open[i]),
+    tr: mk((i) => (i ? Math.max(s.high[i] - s.low[i], Math.abs(s.high[i] - s.close[i - 1]), Math.abs(s.low[i] - s.close[i - 1])) : s.high[i] - s.low[i])),
+  })
+}
+const SW_ARITY: Record<string, number> = { high: 1, low: 1, highAge: 1, lowAge: 1, pivot: 1, pivotAge: 1, pivotType: 1, leg: 1, legPrice: 1, legBars: 1 }
+/** `sw.*` - the confirmed SWING highs/lows (analytics/swingengine.ts). n = 1 is the most recent. Every method takes optional trailing tuning args AFTER its own: k (zigzag reversal in ATR14, default 2; for mode 1 the bars each side), mode (0 zigzag, 1 fractal); then an optional timeframe string.
+ * Missing data (not enough swings) returns NaN, so every comparison is false and a script simply does not fire. */
+function swMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const s = requireSeries(ctx, tf)
+  if (name === 'ok') return s.close.length >= SW_MIN_BARS && swingsOf(s, 2, 0).pivots.length >= 3
+  if (s.close.length < SW_MIN_BARS) throw new MslRuntimeError(`sw.${name}() needs at least ${SW_MIN_BARS} closed bars - history is too thin`)
+  const own = SW_ARITY[name] ?? 0
+  const tn = (i: number, d: number): number => { const v = args[own + i]; if (v === undefined) return d; if (typeof v !== 'number' || !isFinite(v) || v <= 0) throw new MslRuntimeError(`sw.${name}(): tuning argument ${i + 1} must be a positive number`); return v }
+  const sw = swingsOf(s, tn(0, 2), Math.round(args[own + 1] === undefined ? 0 : asNum(args[own + 1])))
+  const nArg = (): number => { const v = args[0]; if (typeof v !== 'number' || !(v >= 1)) throw new MslRuntimeError(`sw.${name}(n): n must be 1 or more (1 = the most recent)`); return Math.round(v) }
+  const age = (p: { idx: number } | undefined): number => (p ? sw.last - p.idx : NaN)
+  const lp = swNth(sw, 1)
+  switch (name) {
+    case 'count': return sw.pivots.length
+    case 'high': return swNth(sw, nArg(), 1)?.price ?? NaN
+    case 'low': return swNth(sw, nArg(), -1)?.price ?? NaN
+    case 'highAge': return age(swNth(sw, nArg(), 1))
+    case 'lowAge': return age(swNth(sw, nArg(), -1))
+    case 'pivot': return swNth(sw, nArg())?.price ?? NaN
+    case 'pivotAge': return age(swNth(sw, nArg()))
+    case 'pivotType': return swNth(sw, nArg())?.type ?? NaN
+    case 'dir': return lp ? (lp.type === -1 ? 1 : -1) : 0           // +1: the developing leg goes UP (last swing was a low)
+    case 'cur': return sw.cur?.price ?? NaN                         // running extreme of the developing leg
+    case 'curAge': return age(sw.cur ?? undefined)
+    case 'curLeg': return sw.cur && lp && sw.atr > 0 ? (sw.cur.price - lp.price) / sw.atr : NaN
+    case 'leg': { const v = swLegPrice(sw, nArg()); return sw.atr > 0 ? v / sw.atr : NaN }
+    case 'legPrice': return swLegPrice(sw, nArg())
+    case 'legBars': return swLegBars(sw, nArg())
+    case 'retr': return retraceOfLast(sw)
+    case 'since': return age(lp)
+    case 'atr': return sw.atr
+    default: throw new MslRuntimeError(`unknown sw method "sw.${name}(...)" - use ok/count/high(n)/low(n)/highAge(n)/lowAge(n)/pivot(n)/pivotAge(n)/pivotType(n)/dir/cur/curAge/curLeg/leg(n)/legPrice(n)/legBars(n)/retr/since/atr, each with optional trailing k, mode`)
+  }
+}
+const EW2_ARITY: Record<string, number> = { pt: 1, ptAge: 1, len: 1, ratio: 1, rule: 1, proj: 2 }
+/** `ew2.*` - a FULL Elliott wave counter on the swing engine: impulse points 0-5 and corrective A-B-C as points 6-8, with the three hard rules (wave 2 < 100% of 1, wave 3 not the shortest, wave 4 no overlap with 1), Fibonacci ratios, projections, invalidation and
+ * "wave N in progress". Same trailing tuning (k, mode) and optional timeframe as sw.*. The swing degree is k: run it twice with different k for two degrees of count. */
+function ew2Method(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const s = requireSeries(ctx, tf)
+  if (name === 'ok') { if (s.close.length < SW_MIN_BARS) return false; try { return readEw2(swingsOf(s, 2, 0)).ok } catch { return false } }
+  if (s.close.length < SW_MIN_BARS) throw new MslRuntimeError(`ew2.${name}() needs at least ${SW_MIN_BARS} closed bars - history is too thin`)
+  const own = EW2_ARITY[name] ?? 0
+  const tn = (i: number, d: number): number => { const v = args[own + i]; if (v === undefined) return d; if (typeof v !== 'number' || !isFinite(v) || v <= 0) throw new MslRuntimeError(`ew2.${name}(): tuning argument ${i + 1} must be a positive number`); return v }
+  const sw = swingsOf(s, tn(0, 2), Math.round(args[own + 1] === undefined ? 0 : asNum(args[own + 1])))
+  const e = readEw2(sw)
+  const iArg = (lo: number, hi: number): number => { const v = args[0]; if (typeof v !== 'number' || !(v >= lo && v <= hi)) throw new MslRuntimeError(`ew2.${name}(i): i must be a number from ${lo} to ${hi}`); return Math.round(v) }
+  const atr = sw.atr
+  switch (name) {
+    case 'k': return e.k
+    case 'wave': return e.ok ? e.k + 1 : 0
+    case 'stage': return e.ok ? EW_STAGES[Math.min(e.k + 1, 8)] ?? 'done' : 'none'
+    case 'dir': return e.ok ? e.dir : 0
+    case 'pt': return e.pts[iArg(0, 8)]?.price ?? NaN
+    case 'ptAge': return e.pts[iArg(0, 8)] ? sw.last - e.pts[iArg(0, 8)].idx : NaN
+    case 'len': { const v = ewLen(e, iArg(1, 8)); return atr > 0 ? v / atr : NaN }
+    case 'ratio': return ewRatio(e, iArg(2, 8))
+    case 'rule': return e.ok ? (e.rules[iArg(2, 5)] ?? true) : false
+    case 'trunc': return e.trunc
+    case 'proj': { const w = iArg(2, 8); const r = args[1]; if (typeof r !== 'number') throw new MslRuntimeError('ew2.proj(wave, ratio) needs a numeric ratio, e.g. ew2.proj(3, 1.618)'); return e.ok ? ewProj(e, w, r) : NaN }
+    case 'inv': return e.ok ? ewInvalid(e) : NaN
+    case 'cur': return e.cur?.price ?? NaN
+    case 'confirmed': return e.ok ? ewConfirmed(e) : false
+    case 'since': return e.ok ? sw.last - e.pts[e.k].idx : NaN
+    case 'type': return e.type
+    case 'inImpulse': return e.ok && e.k < 5
+    case 'inCorrection': return e.ok && e.k >= 5 && e.k < 8
+    default: throw new MslRuntimeError(`unknown ew2 method "ew2.${name}(...)" - use ok/k/wave/stage/dir/pt(i)/ptAge(i)/len(i)/ratio(i)/rule(i)/trunc/proj(wave,ratio)/inv/cur/confirmed/since/type/inImpulse/inCorrection`)
+  }
+}
+
 const polarCache = new WeakMap<MslSeriesCtx, PolarRead>()
 /** `polar.*` - the Polarity Switch (analytics/polarity.ts): keeps four plain base signals (follow/ctl/rev/trend), measures walk-forward how each has done on THIS pair in the SAME mkt regime,
  * and KEEPs one that is reliably right, FLIPs one that is reliably wrong (z <= -2, n >= 30), SKIPs the rest. `polar.<m>()` reads the best base (largest |z|); `polar.<m>("ctl")` reads a named one. Candle-derived, backtestable. */
@@ -5009,6 +5099,7 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
       // read shape a signal-function call produces, so e.g. `oracle.dir`
       // and `let o = oracle; o.dir` behave identically.
       if (e.name in env) return env[e.name]
+      if (e.name === 'px' && !(e.name in ctx.reads)) return pxBundle(requireSeries(ctx, undefined))
       if (e.name in ctx.reads) return readValue(ctx.reads[e.name])
       throw new MslRuntimeError(`unknown identifier "${e.name}" - not a let-binding, and not a known source (did you mean to add ".dir" or ".conf"?)`)
     }
@@ -5151,6 +5242,11 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         const ftf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
         return e.obj.name === 'snr' ? snrMethod(e.name, args, ctx, ftf) : e.obj.name === 'zone' ? zoneMethod(e.name, args, ctx, ftf) : e.obj.name === 'trend' ? trendMethod(e.name, args, ctx, ftf) : fibsMethod(e.name, args, ctx, ftf)
+      }
+      if (e.obj.t === 'ident' && (e.obj.name === 'sw' || e.obj.name === 'ew2') && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return e.obj.name === 'sw' ? swMethod(e.name, args, ctx, tf) : ew2Method(e.name, args, ctx, tf)
       }
       if (e.obj.t === 'ident' && e.obj.name === 'em' && !(e.obj.name in env)) {
         const args = e.args.map((a) => evalExpr(a, env, ctx))
@@ -5468,6 +5564,14 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
           const tf = args.length === 2 ? String(args[1]) : undefined
           return ohlcAt(requireSeries(ctx, tf), asNum(args[0]))
         }
+        case 'px': return pxBundle(requireSeries(ctx, args.length ? String(args[0]) : undefined))
+        // ---- geometry / Fibonacci helpers (plain arithmetic, named so a script reads like the idea) ----
+        case 'fibRet': { if (args.length !== 3) throw new MslRuntimeError('fibRet(a, b, ratio): the price that retraces `ratio` of the move a -> b, i.e. b - (b - a) * ratio'); const [a, b, r] = args.map(asNum); return b - (b - a) * r }
+        case 'fibExt': { if (args.length !== 4) throw new MslRuntimeError('fibExt(a, b, c, ratio): project `ratio` x the move a -> b from c, i.e. c + (b - a) * ratio'); const [a, b, c, r] = args.map(asNum); return c + (b - a) * r }
+        case 'retr': { if (args.length !== 3) throw new MslRuntimeError('retr(a, b, x): how much of the move a -> b has been given back at price x (0 = none, 1 = all), i.e. (b - x) / (b - a)'); const [a, b, x] = args.map(asNum); return b === a ? 0 : (b - x) / (b - a) }
+        case 'lineAt': { if (args.length !== 5) throw new MslRuntimeError('lineAt(price1, barsAgo1, price2, barsAgo2, atBarsAgo): the price at `atBarsAgo` of the straight line through two points (barsAgo 0 = latest bar) - trendlines and channels from swings'); const [p1, a1, p2, a2, at] = args.map(asNum); return a1 === a2 ? p1 : p1 + ((p2 - p1) * (at - a1)) / (a2 - a1) }
+        case 'distAtr': { if (args.length !== 2) throw new MslRuntimeError('distAtr(a, b): |a - b| in ATR14 of the trading chart'); const sr = requireSeries(ctx, undefined); const at = atrInd(sr.high, sr.low, sr.close, 14); const v = at[at.length - 1]; return v > 0 ? Math.abs(asNum(args[0]) - asNum(args[1])) / v : NaN }
+        case 'near': { if (args.length !== 3) throw new MslRuntimeError('near(a, b, k): |a - b| is within k x ATR14'); const sr = requireSeries(ctx, undefined); const at = atrInd(sr.high, sr.low, sr.close, 14); const v = at[at.length - 1]; return v > 0 && Math.abs(asNum(args[0]) - asNum(args[1])) <= asNum(args[2]) * v }
         case 'cross': {
           if (args.length !== 2) throw new MslRuntimeError(`cross(a, b) takes exactly 2 arguments, got ${args.length}`)
           return crossAny(args[0], args[1])
