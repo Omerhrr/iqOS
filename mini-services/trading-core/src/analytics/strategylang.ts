@@ -248,6 +248,7 @@ import { WYCKOFF_MIN_BARS, readWyckoff, type WyckoffRead } from './mslwyckoff'
 import { SMCX_MIN_BARS, readSmcx, type SmcxRead } from './mslsmcx'
 import { smtDivergence } from './smt'
 import { readBlocks, readJudas, readSoup, type BlockRead, type JudasRead } from './mslpatterns'
+import { predictNextCandle, ORACLE_MIN_CANDLES, ORACLE_EVAL_WINDOW, type NextCandlePrediction } from './nextcandle'
 import { aiReadingFor, inMslBacktest } from './mslai'
 import { readLearn, DISCOVER_MIN_BARS, type LearnRead } from './discover'
 import { readMarket, readAdapt, MARKETMIND_MIN_BARS, type MarketRead, type AdaptRead } from './marketmind'
@@ -2677,6 +2678,51 @@ function aiMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | und
   }
 }
 
+const ncCache = new WeakMap<MslSeriesCtx, NextCandlePrediction | null>()
+/** `nc.*` - the Next-Candle Oracle (analytics/nextcandle.ts predictNextCandle: Markov + Monte Carlo + Kalman/OU + confluence + chart engines + candle
+ * patterns + bar physics + Renko + footprint + SMC, fused by log-odds with regime weighting) as a candle-derived, backtestable MSL namespace. It is the RAW
+ * oracle: the live service additionally discounts by its own honesty-loop calibration and learned driver weights, which a replay has no history of, so
+ * nc.conf() here equals the panel's raw confidence, not the discounted one. */
+function ncMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const s = requireSeries(ctx, tf)
+  if (name === 'ok') return s.close.length >= ORACLE_MIN_CANDLES
+  if (s.close.length < ORACLE_MIN_CANDLES) throw new MslRuntimeError(`nc.${name}() needs at least ${ORACLE_MIN_CANDLES} closed bars - history is too thin`)
+  let p = ncCache.get(s)
+  if (p === undefined) {
+    const all = candlesWithTime(s)
+    p = predictNextCandle(all.slice(-ORACLE_EVAL_WINDOW), { asset: 'MSL', tf: tf ?? 'msl', mode: 'sim', seed: (Math.floor(all[all.length - 1].time) * 31 + all.length) % 2147483647 })
+    ncCache.set(s, p)
+  }
+  if (!p) throw new MslRuntimeError(`nc.${name}() - the oracle could not form a read on this series`)
+  const lean = p.direction === 'call' ? 1 : p.direction === 'put' ? -1 : 0
+  switch (name) {
+    case 'pUp': return p.pUp
+    case 'pDown': return 1 - p.pUp
+    case 'side': return p.direction
+    case 'conf': return p.rawConfidence
+    case 'regime': return p.regime
+    case 'move': return p.expectedMove
+    case 'moveAtr': return p.atr > 0 ? p.expectedMove / p.atr : 0
+    case 'rangeLow': return p.range.low
+    case 'rangeHigh': return p.range.high
+    case 'bodyRatio': return p.bodyRatio
+    case 'closePos': return p.closePos
+    case 'type': return p.expectedCandleType
+    case 'active': return p.driversActive
+    case 'agree': {
+      if (!lean) return 0
+      const d = p.drivers.filter((x) => x.pUp !== 0.5)
+      return d.length ? d.filter((x) => (x.pUp > 0.5 ? 1 : -1) === lean).length / d.length : 0
+    }
+    case 'driver': {
+      const key = String(args[0] ?? '').toLowerCase()
+      const d = p.drivers.find((x) => x.name.toLowerCase().includes(key))
+      return d ? d.pUp : 0.5
+    }
+    default: throw new MslRuntimeError(`unknown nc method "nc.${name}(...)" - use ok/pUp/pDown/side/conf/regime/move/moveAtr/rangeLow/rangeHigh/bodyRatio/closePos/type/active/agree/driver("name")`)
+  }
+}
+
 const learnCache = new WeakMap<MslSeriesCtx, LearnRead>()
 /** `learn.*` - pattern DISCOVERY with a held-out validation slice (analytics/discover.ts). Candle-derived, backtestable. */
 function learnMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
@@ -4495,6 +4541,11 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
         return ppMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'nc' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = e.name !== 'driver' && args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return ncMethod(e.name, args, ctx, tf)
       }
       if (e.obj.t === 'ident' && e.obj.name === 'ai' && !(e.obj.name in env)) {
         const args = e.args.map((a) => evalExpr(a, env, ctx))

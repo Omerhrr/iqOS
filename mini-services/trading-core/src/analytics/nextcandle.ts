@@ -218,6 +218,8 @@ function pUpFromEngineScore(score: number): number {
 }
 
 export interface OracleInput {
+  /** Monte Carlo seed. Omitted = time-based (live). A replay (MSL nc.*) passes a seed derived from the bar so a backtest is reproducible. */
+  seed?: number
   asset: string
   tf: string
   mode: 'sim' | 'live'
@@ -499,7 +501,7 @@ export function predictNextCandle(candles: Candle[], input: OracleInput): NextCa
   // ---------- 2. Monte Carlo bootstrap ----------
   {
     const sims = clamp(Math.round(input.mcSims ?? MC_SIMS), 100, 4000)
-    const mc = monteCarlo(closes, { nSims: sims, horizon: MC_HORIZON, mode: 'bootstrap', seed: (Date.now() ^ candles.length) % 2147483647, samplePaths: 0 })
+    const mc = monteCarlo(closes, { nSims: sims, horizon: MC_HORIZON, mode: 'bootstrap', seed: input.seed ?? (Date.now() ^ candles.length) % 2147483647, samplePaths: 0 })
     const w = 10 * trendBoost * chaosFlatten
     drivers.push({
       name: 'Monte Carlo (bootstrap)',
