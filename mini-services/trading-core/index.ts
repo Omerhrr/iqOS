@@ -61,7 +61,7 @@ import { pvScanPlugin, PvScanService } from './src/plugins/pvscan'
 import { rangeMapPlugin, RangeMapService } from './src/plugins/rangemap'
 import { smtScanPlugin, SmtScanService } from './src/plugins/smtscan'
 import { dayLevels } from './src/analytics/daylevels'
-import { buildSnrMap, buildFibMap, buildZoneMap } from './src/analytics/fastlevels'
+import { buildSnrMap, buildFibMap, buildZoneMap, buildTrendMap, lineAt } from './src/analytics/fastlevels'
 import { signalPlugin, SignalService } from './src/plugins/signal'
 import {
   computeTickSmc, computeTickOracle, computeTickTechnical, computeTickFootprint, medianTickGapMs,
@@ -105,7 +105,7 @@ import { chartPropertyRegistryForVocab } from './src/analytics/chartpropertyregi
 import { setMslAiChat, setMslAiEnabled, aiAnalyze, aiVet, mslAiAvailable } from './src/analytics/mslai'
 import { chatComplete, providerStatus as llmProviderStatus } from './src/lib/llm'
 import { wilsonLowerBound as aiWilson } from './src/analytics/mslai-stats'
-import { backtestMslScript, backtestMslScriptWalkForward, backtestMslScriptCrossAsset } from './src/analytics/mslbacktest'
+import { backtestMslScript, backtestMslScriptWalkForward, backtestMslScriptCrossAsset, replayMslScript } from './src/analytics/mslbacktest'
 import { hvSeries, ivFromPayout, realizedUpProb } from './src/analytics/ivhv'
 import { buildCalibrationReport, type CalibrationStoreSlice } from './src/analytics/calibration'
 import { computeStepStats, computeIntervalStats } from './src/analytics/randomness'
@@ -2249,8 +2249,8 @@ const httpServer = createServer(async (req, res) => {
           const fast = mk.getCandlesDeep(asset, fastv, 2000, true)
           if (!base || base.length < 30) return json(404, { ok: false, error: `no ${tfv} candles for ${asset}` })
           if (!fast || fast.length < 120) return json(200, { ok: false, asset, tf: tfv, fast: fastv, reason: `only ${fast?.length ?? 0} ${fastv} bars recorded (need 120) - the fast chart is too thin`, snr: [], fib: [] })
-          const sm = buildSnrMap(fast, base), fm = buildFibMap(fast, base), zm = buildZoneMap(fast, base)
-          return json(200, { ok: sm.ok, asset, tf: tfv, fast: fastv, price: sm.price, atr: sm.atr1m, fastBars: fast.length, snr: sm.levels, fib: fm.levels, zones: zm.zones, legs: fm.legs.length })
+          const sm = buildSnrMap(fast, base), fm = buildFibMap(fast, base), zm = buildZoneMap(fast, base), tm = buildTrendMap(fast, base)
+          return json(200, { ok: sm.ok, asset, tf: tfv, fast: fastv, price: sm.price, atr: sm.atr1m, fastBars: fast.length, snr: sm.levels, fib: fm.levels, zones: zm.zones, trends: [tm.support, tm.resistance].filter((l) => l).map((l) => ({ kind: l!.kind, touches: l!.touches, t0: l!.t0, p0: l!.p0, t1: fast[fast.length - 1].time, p1: lineAt(l!, fast[fast.length - 1].time) })), legs: fm.legs.length })
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }
@@ -3005,6 +3005,11 @@ const httpServer = createServer(async (req, res) => {
             snr: 'MANY SUPPORT/RESISTANCE LEVELS FROM A FAST CHART (analytics/fastlevels.ts). Fractal pivots (2 bars each side) of the 5s highs AND lows are clustered when within 0.25 ATR of the trading chart (ATR14 of the chart your script runs on); a cluster of >=2 pivots is a level, touches = pivots in it, strength = min(1, touches/6) x a recency factor. Above the close = resistance, below = support; within 8 ATR, nearest 40 kept. Default fast chart is "5s" (no 10s exists); a trailing string picks another, e.g. snr.count("15s"). Needs 120 closed fast bars. Methods: ok(); count()/supports()/resistances(); support(n)/resistance(n) price of the nth nearest (default 1, 0 none); supDist(n)/resDist(n) in trading-chart ATR (99 none); supTouches(n)/resTouches(n); atLevel() the latest closed bar touched a level (within 0.25 ATR); atTouches()/atStrength() of the most-tested one it touched; rejected() +1 closed back above a support it wicked / -1 below a resistance, rejLevel(), rejTouches(); within(atr) levels within that many ATR of the close. Example: `call when snr.ok() and snr.rejected() == 1 and snr.rejTouches() >= 4`. Backtest: needs 5s candles supplied (setBacktestFastFeed); without them the script fails closed. Chart: the MAP button draws the same map. HONESTY: a map, not a forecast - more levels also means more accidental touches; demand touches/confluence and test it.',
             fibs: 'FIBONACCI LEVELS FROM MANY LEGS OF A FAST CHART (analytics/fastlevels.ts). A zig-zag of the 5s closes (2 ATR reversal, ATR of the trading chart) gives the last 8 INTACT legs (price has not closed beyond the leg start); 38.2/50/61.8/70.5/78.6 retracements are drawn from each leg end (up-leg = support, down-leg = resistance) and stacked: confluence = how many different legs put a level within 0.25 ATR. Trailing string = fast chart (default "5s"). Methods: ok(); legs(); count(); confluence(atr) highest stack within that many ATR of the close (default 0.3); at() distinct legs with a level under the latest bar; supportAt()/resistAt(); rejected() +1/-1 as snr; rejRatio() the ratio of the level that rejected; nearest() distance to the nearest level in ATR. Example: `call when fibs.ok() and fibs.rejected() == 1 and fibs.confluence() >= 2`. Same backtest/honesty caveats as snr.',
             zone: 'SUPPLY / DEMAND ZONES FROM A FAST CHART (analytics/fastlevels.ts buildZoneMap). A BASE is 1-4 consecutive small fast bars (range <= 0.4 ATR of the trading chart); the zone is the base low..high. DEMAND = price then left the base UP (a high >= zone top + 1 ATR within 4 bars), SUPPLY = the mirror. A later CLOSE through the far side kills the zone; more than 3 re-entries drops it; FRESH = never re-entered. Default fast chart "5s" (trailing string overrides), read on the chart the script runs on (1m or above). Needs 120 closed fast bars. Methods: ok(); count()/demandCount()/supplyCount(); demandTop(n)/demandBottom(n)/supplyTop(n)/supplyBottom(n) nth nearest zone (0 none); demandDist(n)/supplyDist(n) in ATR (99 none); inDemand()/inSupply() latest closed bar touched one; rejected() +1 wicked into demand and closed back above its top, -1 into supply and closed back below its bottom; fresh()/tests()/strength()/age()/top()/bottom() of the zone that rejected. Example: `call when zone.ok() and zone.rejected() == 1 and zone.fresh()`. Backtest needs 5s candles supplied; otherwise fails closed. HONESTY: a map, untested on real 5s data - US2000 has none yet.',
+            trend: 'TRENDLINES FROM A FAST CHART (analytics/fastlevels.ts buildTrendMap). Straight lines fitted through fast-chart (default "5s", trailing string overrides) pivots: ONE support line through pivot LOWS and ONE resistance line through pivot HIGHS. Candidates = every pair among the last 14 pivots of that kind; a line is invalid once any bar CLOSED more than 0.3 ATR through it; touches = pivots within 0.2 ATR; best = most touches, then most recent, then nearest price. Lines are in time, slopes in trading-chart ATR per trading-chart bar. Needs 120 closed fast bars. Methods: ok(); hasSupport()/hasResistance(); support()/resistance() the line value at the latest closed bar (0 none); supDist()/resDist() ATR from the close (99 none); supSlope()/resSlope() ATR per bar; supTouches()/resTouches(); rising() both lines slope up; falling() both slope down; channel() close is between the lines; rejected() +1 wicked to the support line and closed back above, -1 the mirror at resistance; broken() +1 closed above the resistance line after the previous bar closed below it, -1 closed below the support line likewise. Example: `call when trend.ok() and trend.rejected() == 1 and trend.rising() and trend.supTouches() >= 3`. Chart: MAP draws the lines. Backtest needs 5s candles supplied; otherwise fails closed. HONESTY: any two points make a line, so only many touches mean anything; untested on real 5s data.',
+            pb: 'PULLBACK DETECTOR OF ANY KIND (analytics/pullback.ts), candle-derived and backtestable on any timeframe, 60+ bars (trailing string = higher timeframe, e.g. pb.ready("5m")). A zig-zag of highs/lows (reversal 1.5 ATR14) gives swing points W -> Y -> X: W->Y is the impulse, Y->X the latest leg. A latest leg that is smaller than the impulse (and >= 8% of it) and runs against it is a PULLBACK of depth |X-Y|/|Y-W|; as big or bigger = a new impulse. Kinds (independent, several can be true): shallow <0.382, normal 0.382-0.618, deep 0.618-0.786, failed >0.786 (trend likely broken); ema = the pullback low/high came within 0.3 ATR of the EMA20 or EMA50; fib = depth in 0.382-0.786; retest = it returned to within 0.4 ATR of the swing level the impulse broke; flag = pullback bars quiet (avg range < 70% of the impulse bars). resumed = latest closed bar closed in the trend direction beyond the previous bar extreme with a body that way; ready = resumed and not failed. Methods: ok(); active()/impulsing(); side() +1 dip in an up-trend / -1 rally in a down-trend (0 when not pulling back); trend() direction of the impulse; depth(); legAtr() impulse size in ATR; bars() since the impulse peak; counter() counter-trend candles in the pullback; kind() text; shallow()/normal()/deep()/failed(); ema()/fib()/retest()/flag(); resumed()/ready(); aligned() EMA20 vs EMA50 agrees with the trend; types() how many of ema/fib/retest/flag are true. Example: `call when pb.ok() and pb.active() and pb.side() == 1 and pb.ready() and pb.aligned() and pb.types() >= 2`. Combine with snr/zone/trend for level confluence. HONESTY: describes a pullback; not yet backtested on US2000 - whether buying dips pays is for a backtest to show.',
+            timing: 'SENSE OF TIME (analytics/timing.ts). timing.hold(name, cond, dir, seconds [, minAtr = 0.05 [, abortAtr = 0.30]]) is a CONFIRMATION WINDOW: when cond turns true it ARMS (remembers time, price, direction) and does NOT act; for `seconds` it watches price - abort early if price moves AGAINST dir by abortAtr, abort if cond turns false, and when the time is up it returns 1 (once) only if price moved WITH dir by >= minAtr, otherwise aborts ("went nowhere"). After a confirm/abort the name is latched until cond has been false once (no re-arm loop). dir = +1/-1 or "call"/"put"; the name is a quoted string, one name = one timer; moves are in ATR14 of the chart the script runs on; price = newest tick, else newest 5s close, else last closed bar. Evaluate the hold OUTSIDE the if so it keeps seeing cond: `let setup = pb.ok() and pb.side() == 1 and pb.ready()` / `let go = timing.hold("dip", setup, 1, 20, 0.08)` / `if go == 1` / `call when true`. State reads: state(name) idle|waiting|confirmed|aborted, why(name), waited(name), left(name), move(name). Clock reads (also replay in a backtest): barAge() seconds since the current bar opened, barLeft() seconds until it closes, second()/minute()/hour() UTC, dow() 0=Sunday. TIMING RESOLUTION = how often the script is evaluated (Meta Trader polls every 10 s), so a 20 s hold resolves between 20 and 30 s. hold is LIVE-ONLY (throws in a backtest - 1m bars cannot say what price did in the 20 s after a signal); the signal fires at the confirmation moment, mid-bar, so pick an expiry that fits. HONESTY: whether waiting improves the win rate is unmeasured - it needs live forward data (compare a script with and without the hold).',
+            risk: 'OWN RECENT RESULTS (analytics/mslrisk.ts) - stop trading when it is going badly. Reads the outcomes of trades this system took: LIVE = every closed Meta Trader position since this kernel started (in memory, lost on restart, all scripts together); REPLAY tester = the script\'s own already-settled trades (no look-ahead). The candle backtester has no trade clock, so risk.* errors there (use /msl_replay). Units: stake 1, win +payout, loss -1. Methods: ok(); trades() taken today (UTC); todayPnl() in stakes; drawdown() today, from the day peak; losses()/wins() current streak; sinceMin() minutes since the last trade closed (99999 none); last(n) wins in the last n trades; lastLosses(n); lastN(n) how many exist. Example: `if risk.losses() < 3 and risk.todayPnl() > -3 and risk.sinceMin() > 5` then your entry.',
+            session: 'MARKET SESSIONS AND WINDOWS (analytics/mslrisk.ts), clock-only, fixed UTC (no daylight saving): Asia 00-08, London 07-16, New York 12-21, overlap = London+NY 12-16, dead = outside all. Replays in a candle backtest on the bar\'s own time. Methods: name() text asia|london|ny|overlap|dead; asia()/london()/ny()/overlap()/dead(); weekend() (Fri 21:00 - Sun 21:00 UTC); minsIn("london") minutes since that session opened (-1 outside); minsLeft("london"); inWindow("HH:MM","HH:MM") UTC, wraps midnight. Example: `call when session.overlap() and not session.weekend() and session.minsIn("ny") > 30 and <your setup>`.',
             msnr: 'MALAYSIAN SNR LEVELS (analytics/msnr.ts), candle-derived and backtestable, 40+ bars. Levels are read off the CLOSING-price line only: an A-level (resistance) is a close higher than the 3 closes before and not lower than the 3 after (an A shape), a V-level (support) the mirror; the level price is that close. FRESH = no later bar has CLOSED beyond it (a wick that poked it is a test, the level stays fresh). A REJECTION = the latest closed bar wicked into a fresh level (within 0.15 ATR14 or through it) and closed back on the original side. Not modelled: gap levels and storyline sequencing. Methods: ok(); resistance()/support() nearest fresh A above / V below the close (0 none); resDist()/supDist() in ATR (99 none); rejected() +1 bullish rejection of a fresh V, -1 bearish rejection of a fresh A, 0 none; rejLevel(); rejAge() bars since the level formed; rejTests() earlier wick tests of it; virgin() rejected with 0 earlier tests; levels() count of fresh levels. Example: `call when msnr.ok() and msnr.rejected() == 1`. HONESTY: describes a setup; on 12 contiguous US2000 1m segments (612 trades) a rejection won 53.9% at 1 bar (95% lower bound 50.0%) and 51.0% at 3 bars, below the 54.1% break-even.',
             crt: 'CANDLE RANGE THEORY (analytics/msnr.ts readCrt), candle-derived and backtestable, 25+ bars. Candle 1 (or the last n bars, optional first numeric argument 1-10) sets a range; the latest closed bar (candle 2) swept ONE side with a wick and CLOSED BACK INSIDE the range; the reversal is the other way and the target is the far side of the range. Both sides swept in one bar = none. Methods: ok(); dir() +1 bullish (low swept) / -1 bearish (high swept) / 0 none; bullish()/bearish(); rangeHigh()/rangeLow()/mid(); target() far side of the range in the reversal direction; depth() sweep depth in ATR; strong() candle 2 closed beyond the range midpoint toward the target. A trailing timeframe string reads a higher-timeframe CRT, e.g. crt.dir("5m"). Example: `call when crt.ok() and crt.bullish() and crt.strong()`. HONESTY: the 3-candle smc:CRT source reads the live SMC scan; this one replays. On US2000 1m (853 trades) a bare CRT won 49.8% at 1 bar - no edge shown alone.',
             polar: 'THE POLARITY SWITCH (analytics/polarity.ts), candle-derived and backtestable, 200+ bars: turns a signal that is reliably WRONG in the current market into a right one. Keeps four plain base signals - follow (the last candle direction), ctl (who is in control when |score| >= 40), rev (reversal-evidence side when score >= 40), trend (close vs EMA20) - and for each measures walk-forward how it did on THIS pair in the SAME mkt regime (trend_up/trend_down/revert/chop), recent bars weighted more (half-life 300 bars). Per base: z = (hits - n/2)/(sqrt(n)/2) on unweighted counts; z >= +2 and n >= 30 -> KEEP (side = base side), z <= -2 and n >= 30 -> FLIP (side = the opposite), else SKIP (none). `polar.<m>()` reads the best base (largest |z|, a selection among four = multiple-testing cost); `polar.<m>("ctl")` reads a named base. Methods: ok(); regime(); side() call|put|none; mode() keep|flip|skip; base(); baseSide(); p() shrunk weighted rate of the chosen polarity; n(); z(); hit() raw hit rate of the base; flipped(). Example: `call when polar.ok() and polar.side() == "call"` (put likewise) or `call when polar.ok() and polar.flipped("follow") and polar.baseSide("follow") == "put" and polar.n("follow") >= 40`. Walk-forward, the latest bar own outcome never used. HONESTY: flipping a loser is only an edge if the loss is structural, not luck; a flip that held can stop when the regime changes. Planted tests flip and keep correctly and skip on noise, but on 7-9 contiguous US2000 1m/30s segments (206-319 trades) it won 44-49% and the flip-only version 41-45% (below the 54.1% break-even) - the in-sample z >= 2 did not persist out of sample.',
@@ -5166,6 +5171,102 @@ const httpServer = createServer(async (req, res) => {
       // verdict read at all, even for ones whose underlying namespace is
       // itself candle-derived - the response's own `unavailableSources`
       // field lists every one of them by name.
+      // ---------- MSL replay + scan ----------
+      // POST /msl_replay {script, asset, tf?='1m', fast?='5s', expirySec?=60, stepSec?=10, payout?, compare?} - replays the script over the ARCHIVED fast (5s) + trading-chart bars with a real clock
+      // (analytics/mslbacktest.ts replayMslScript): timing.hold and risk.* run for real. compare:true also runs the SAME script with every hold acting at arm time (holdBypass) so the value of the wait is measured.
+      if (path === '/msl_replay') {
+        try {
+          const tfv = tfStrict(String(body.tf ?? '1m'))
+          const fastv = tfStrict(String(body.fast ?? '5s'))
+          if (tfv === null || fastv === null) return json(400, { ok: false, error: tfErr(String(body.tf ?? body.fast ?? '')) })
+          const asset = String(body.asset ?? market.activeAsset)
+          const script = String(body.script ?? '')
+          if (!script.trim()) return json(400, { ok: false, error: 'script is required' })
+          const store = kernel.context().use<{ getCandlesArchive: (a: string, t: string, n: number) => Candle[] }>('storeRaw')
+          const ok = (c: Candle) => c && [c.time, c.open, c.high, c.low, c.close].every((v) => Number.isFinite(v))
+          const baseC = store.getCandlesArchive(asset, tfv, 6000).filter(ok)
+          const fastC = store.getCandlesArchive(asset, fastv, 40000).filter(ok)
+          if (fastC.length < 200) return json(200, { ok: false, asset, error: `only ${fastC.length} archived ${fastv} bars for ${asset} - need 200+. The kernel has to record fast bars first (export or wait).` })
+          const opts = { fastTf: fastv, expirySec: Number(body.expirySec) || 60, stepSec: Number(body.stepSec) || 10, payout: body.payout !== undefined ? Number(body.payout) : 0.85, maxEvals: 20000 }
+          const strip = (r: ReturnType<typeof replayMslScript>) => ({ ...r, trades: r.trades.slice(-200) })
+          const main = replayMslScript(baseC, fastC, script, opts)
+          const out: Record<string, unknown> = { ok: main.ok, asset, tf: tfv, fast: fastv, baseBars: baseC.length, result: strip(main) }
+          if (body.compare) out.noWait = strip(replayMslScript(baseC, fastC, script, { ...opts, holdBypass: true }))
+          return json(200, out)
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // POST /msl_scan {script, tf?='1m', expiryBars?=1, payout?, bars?=2500, assets?[]} - the SAME candle backtest on every asset's ARCHIVE (contiguous segments only, segments with |lag-1 autocorrelation| > 0.5 dropped as
+      // feed artifacts), ranked by the Wilson 95% lower bound of the win rate. Shows WHERE a script works; with N assets some will look good by luck - read the lower bound and the halves, not the best row.
+      if (path === '/msl_scan') {
+        try {
+          const tfv = tfStrict(String(body.tf ?? '1m'))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(String(body.tf ?? '')) })
+          const script = String(body.script ?? '')
+          if (!script.trim()) return json(400, { ok: false, error: 'script is required' })
+          const expiryBars = Math.max(1, Math.round(Number(body.expiryBars) || 1))
+          const payout = body.payout !== undefined ? Math.min(0.99, Math.max(0.01, Number(body.payout))) : 0.85
+          const be = 1 / (1 + payout)
+          const bars = Math.max(300, Math.min(6000, Math.round(Number(body.bars) || 2500)))
+          const store = kernel.context().use<{ getCandlesArchive: (a: string, t: string, n: number) => Candle[] }>('storeRaw')
+          const wanted: string[] = Array.isArray(body.assets) && body.assets.length ? body.assets.map(String) : market.listAssets().map((a) => a.ticker)
+          const list = wanted.slice(0, 60)
+          const gap = TIMEFRAME_SECONDS[tfv] * 3
+          const rows: { asset: string; bars: number; segments: number; trades: number; wins: number; winRate: number | null; wilsonLow: number; firstHalf: string; secondHalf: string; note?: string }[] = []
+          let tw = 0, tn = 0
+          let firstErr = ''
+          for (const asset of list) {
+            await new Promise((res) => setImmediate(res))
+            const candles = store.getCandlesArchive(asset, tfv, bars).filter((c) => c && [c.time, c.open, c.high, c.low, c.close].every((v) => Number.isFinite(v)))
+            if (candles.length < 200) continue
+            const segs: Candle[][] = []
+            let cur: Candle[] = []
+            for (const c of candles) { if (cur.length && c.time - cur[cur.length - 1].time > gap) { segs.push(cur); cur = [] } cur.push(c) }
+            segs.push(cur)
+            let wins = 0, trades = 0, w1 = 0, n1 = 0, w2 = 0, n2 = 0, used = 0, dropped = 0
+            for (const seg of segs) {
+              if (seg.length < 150 + expiryBars + 5) continue
+              // feed-artifact guard: an alternating (|ac1| > 0.5) segment is a data glitch, not a market
+              const rets: number[] = []
+              for (let i = 1; i < seg.length; i++) rets.push(seg[i].close - seg[i - 1].close)
+              const mean = rets.reduce((a, b) => a + b, 0) / rets.length
+              let num = 0, den = 0
+              for (let i = 0; i < rets.length; i++) { den += (rets[i] - mean) ** 2; if (i) num += (rets[i] - mean) * (rets[i - 1] - mean) }
+              if (den > 0 && Math.abs(num / den) > 0.5) { dropped++; continue }
+              const res = backtestMslScript(seg, script, { expiryBars, warmupBars: 150, runId: `scan:${asset}:${Date.now()}` })
+              if (!res.ok) { firstErr = firstErr || (res.error ?? ''); continue }
+              used++
+              const mid = seg[Math.floor(seg.length / 2)].time
+              for (const t of res.trades) {
+                const tr = t as { win?: boolean; won?: boolean; time?: number; entryTime?: number }
+                const won = tr.win ?? tr.won ?? false
+                trades++; if (won) wins++
+                if ((tr.time ?? tr.entryTime ?? 0) < mid) { n1++; if (won) w1++ } else { n2++; if (won) w2++ }
+              }
+            }
+            const pct = (a: number, b: number): string => (b ? `${(a / b * 100).toFixed(1)}% (${a}/${b})` : '-')
+            if (!trades && !used) { if (dropped) rows.push({ asset, bars: candles.length, segments: 0, trades: 0, wins: 0, winRate: null, wilsonLow: 0, firstHalf: '-', secondHalf: '-', note: `${dropped} segment(s) dropped as feed artifacts` }); continue }
+            tw += wins; tn += trades
+            rows.push({ asset, bars: candles.length, segments: used, trades, wins, winRate: trades ? wins / trades : null, wilsonLow: aiWilson(wins, trades), firstHalf: pct(w1, n1), secondHalf: pct(w2, n2), ...(dropped ? { note: `${dropped} segment(s) dropped as feed artifacts` } : {}) })
+          }
+          if (!rows.length && firstErr) return json(400, { ok: false, error: firstErr })
+          rows.sort((a, b) => b.wilsonLow - a.wilsonLow)
+          const trading = rows.filter((r) => r.trades >= 30)
+          return json(200, {
+            ok: true, tf: tfv, expiryBars, breakEven: be, assetsScanned: list.length, assetsWithData: rows.length,
+            combined: { trades: tn, wins: tw, winRate: tn ? tw / tn : null, wilsonLow: aiWilson(tw, tn) },
+            aboveBreakEven: trading.filter((r) => r.wilsonLow > be).map((r) => r.asset),
+            rows,
+            caution: `${trading.length} assets had 30+ trades; at 95% roughly 1 in 20 will clear any bar by luck. A row only matters if its lower bound beats break-even (${(be * 100).toFixed(1)}%) AND both halves agree.`,
+            ts: Date.now(),
+          })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
       // ---------- AI desk (analytics/mslai.ts): rides on the kernel's Copilot LLM config, no separate key ----------
       // POST /ai_analyze {asset, tf, question?} - free-form read of the pair's numeric snapshot (candles + mkt/adapt/learn reads).
       // POST /ai_vet {script, asset, tf, expiryBars?, payout?} - runs the script over the pair's ARCHIVE candles (no synthetic gap-fill), measures win rate vs

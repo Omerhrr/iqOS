@@ -39,8 +39,11 @@
 // candles[0..i] via `series`/`seriesFor`.
 
 import { beginMslBacktest, endMslBacktest } from './mslai'
+import { wilsonLowerBound } from './mslai-stats'
+import { setReplayMode } from './timing'
+import type { RiskOutcome } from './mslrisk'
 import type { Candle, Timeframe } from '../types'
-import { parseStrategyScript, evaluateStrategyScript, clearMslState, type MslSeriesCtx, type MslSourceRead, type MslAst } from './strategylang'
+import { parseStrategyScript, evaluateStrategyScript, clearMslState, setRiskSource, type MslSeriesCtx, type MslSourceRead, type MslAst } from './strategylang'
 import { META_CONDITION_SOURCES } from './metastrategy'
 import { ALL_SMC_KINDS } from './smc'
 import { EXPIRIES_MIN } from './nextexpiry'
@@ -670,5 +673,136 @@ export function backtestMslScriptCrossAsset(
     perAsset,
     combined,
     winRateStdDevAcrossAssets: winRateStdDev(perAssetWinRates),
+  }
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------
+// REPLAY TESTER - walks REAL fast (5s) bars with an explicit clock, the way Meta Trader would see the script live:
+//   * the script is evaluated every `stepSec` (default 10, Meta Trader's poll) with now = that moment, the newest closed fast bar's close as the tick price, the closed trading-chart bars,
+//     the closed fast bars (seriesFor(fastTf)) and the higher timeframes aggregated from the trading chart (completed bars only - no look-ahead);
+//   * a signal is taken on its FIRST evaluation (a held direction does not re-fire until it lapses = Meta Trader's fresh-edge gate), one open trade at a time, entered at the newest fast close and
+//     settled at the first fast close at or after entry + expirySec (flat = loss), payout default 0.85;
+//   * so `timing.hold(...)` and `risk.*` run for real here (risk.* sees only trades already settled at the evaluated moment);
+//   * `holdBypass: true` makes every hold act at ARM time instead of waiting - run the same script both ways to measure whether the wait helps.
+// Needs fast candles for the period; data gaps (> 3 fast bars) split it into segments that are never evaluated across. Honest limits: a signal fills at the last closed fast close (no slippage
+// model), the 10 s cadence is a simulation of the live poll, and `signal.*`/`smc.*` sources still read as unavailable exactly as in the candle backtester.
+export interface MslReplayOpts { fastTf?: string; stepSec?: number; expirySec?: number; warmupBars?: number; payout?: number; holdBypass?: boolean; runId?: string; maxEvals?: number; minConfidence?: number }
+export interface MslReplayTrade { time: number; direction: 'call' | 'put'; confidence: number; entry: number; exit: number; win: boolean; pnl: number }
+export interface MslReplayResult {
+  ok: boolean
+  error?: string
+  evals: number
+  segments: number
+  truncated: boolean
+  trades: MslReplayTrade[]
+  wins: number
+  losses: number
+  winRate: number | null
+  wilsonLow: number
+  breakEven: number
+  netPnl: number
+  firstHalf: { n: number; wins: number }
+  secondHalf: { n: number; wins: number }
+  fastBars: number
+}
+export function replayMslScript(base: Candle[], fast: Candle[], script: string, opts: MslReplayOpts = {}): MslReplayResult {
+  const fastTf = opts.fastTf ?? '5s'
+  const fs = TF_SEC[fastTf]
+  const stepSec = Math.max(fs ?? 5, Math.round(opts.stepSec ?? 10))
+  const expirySec = Math.max(5, Math.round(opts.expirySec ?? 60))
+  const warmupBars = Math.max(20, Math.round(opts.warmupBars ?? 40))
+  const payout = opts.payout !== undefined && Number.isFinite(opts.payout) && opts.payout > 0 ? opts.payout : 0.85
+  const maxEvals = Math.max(100, Math.round(opts.maxEvals ?? 60_000))
+  const minConf = Math.max(0, Math.min(100, opts.minConfidence ?? 0))
+  const runId = opts.runId ?? `replay:${Date.now()}:${Math.random().toString(36).slice(2)}`
+  const be = 1 / (1 + payout)
+  const fail = (error: string): MslReplayResult => ({ ok: false, error, evals: 0, segments: 0, truncated: false, trades: [], wins: 0, losses: 0, winRate: null, wilsonLow: 0, breakEven: be, netPnl: 0, firstHalf: { n: 0, wins: 0 }, secondHalf: { n: 0, wins: 0 }, fastBars: fast.length })
+  if (!fs) return fail(`unknown fast timeframe "${fastTf}"`)
+  if (base.length < warmupBars + 5) return fail(`need at least ${warmupBars + 5} trading-chart bars, got ${base.length}`)
+  if (fast.length < 200) return fail(`need at least 200 ${fastTf} bars, got ${fast.length}`)
+  const parsed = parseStrategyScript(script)
+  if (!parsed.ok) return fail(`script parse error: ${parsed.error}`)
+  let bs = Infinity
+  for (let i = 1; i < base.length; i++) { const g = base[i].time - base[i - 1].time; if (g > 0 && g < bs) bs = g }
+  if (!Number.isFinite(bs)) return fail('cannot determine the trading-chart bar spacing')
+  const reads = unavailableReads()
+  applyPayoutRead(reads, payout)
+  // contiguous fast segments
+  const segs: Candle[][] = []
+  let cur: Candle[] = []
+  for (const c of fast) { if (cur.length && c.time - cur[cur.length - 1].time > fs * 3) { segs.push(cur); cur = [] } cur.push(c) }
+  if (cur.length) segs.push(cur)
+  const trades: MslReplayTrade[] = []
+  const outcomes: RiskOutcome[] = []
+  let evals = 0
+  let truncated = false
+  let usedSegs = 0
+  beginMslBacktest()
+  setReplayMode(true, !!opts.holdBypass)
+  setRiskSource(() => outcomes)
+  try {
+    for (const seg of segs) {
+      if (seg.length < 100) continue
+      const t0 = seg[0].time, t1 = seg[seg.length - 1].time + fs
+      const bseg = base.filter((c) => c.time >= t0 - bs && c.time + bs <= t1)
+      if (bseg.length < warmupBars + 2) continue
+      usedSegs++
+      const crossTf = makeCrossTf(bseg)
+      let bi = 0 // number of closed base bars
+      let busyUntil = -Infinity
+      let prevDir: string = 'none'
+      const stepBars = Math.max(1, Math.round(stepSec / fs))
+      for (let k = 100; k < seg.length; k += stepBars) {
+        if (evals >= maxEvals) { truncated = true; break }
+        const T = seg[k].time + fs
+        while (bi < bseg.length && bseg[bi].time + bs <= T) bi++
+        if (bi < warmupBars) continue
+        if (T + expirySec > t1) break
+        const iLast = bi - 1
+        const lo = Math.max(0, iLast - 599)
+        const bs_ = bseg.slice(lo, iLast + 1)
+        const series: MslSeriesCtx = { open: bs_.map((c) => c.open), high: bs_.map((c) => c.high), low: bs_.map((c) => c.low), close: bs_.map((c) => c.close), volume: bs_.map((c) => c.volume ?? 0), time: bs_.map((c) => c.time) }
+        const fl = seg.slice(Math.max(0, k - 1999), k + 1)
+        const fastSeries: MslSeriesCtx = { open: fl.map((c) => c.open), high: fl.map((c) => c.high), low: fl.map((c) => c.low), close: fl.map((c) => c.close), volume: fl.map((c) => c.volume ?? 0), time: fl.map((c) => c.time) }
+        const cross = crossTf(iLast)
+        const seriesFor = (tf: string): MslSeriesCtx | undefined => (tf === fastTf ? fastSeries : cross(tf))
+        const nowMs = T * 1000
+        evals++
+        const out = evaluateStrategyScript(parsed.ast, reads, undefined, series, seriesFor, { nowMs, ticks: [{ ts: nowMs, price: seg[k].close }] }, { keyPrefix: runId, barTimeSec: bseg[iLast].time })
+        const dir = out.error ? 'none' : out.direction
+        const fresh = dir !== 'none' && dir !== prevDir
+        prevDir = dir
+        if (!fresh || out.confidence < minConf || T < busyUntil) continue
+        // settle at the first fast close at or after T + expiry
+        let j = k
+        while (j < seg.length && seg[j].time + fs < T + expirySec) j++
+        if (j >= seg.length) break
+        const entry = seg[k].close, exit = seg[j].close
+        const win = dir === 'call' ? exit > entry : exit < entry
+        const settledAt = seg[j].time + fs
+        busyUntil = settledAt
+        trades.push({ time: T, direction: dir as 'call' | 'put', confidence: out.confidence, entry, exit, win, pnl: win ? payout : -1 })
+        outcomes.push({ ts: settledAt * 1000, win, units: win ? payout : -1 })
+      }
+      clearMslState(runId)
+      if (truncated) break
+    }
+  } finally {
+    setRiskSource(null)
+    setReplayMode(false)
+    endMslBacktest()
+    clearMslState(runId)
+  }
+  const wins = trades.filter((t) => t.win).length
+  const mid = trades.length ? trades[Math.floor(trades.length / 2)].time : 0
+  const h1 = trades.filter((t) => t.time < mid), h2 = trades.filter((t) => t.time >= mid)
+  return {
+    ok: true, evals, segments: usedSegs, truncated, trades, wins, losses: trades.length - wins,
+    winRate: trades.length ? wins / trades.length : null,
+    wilsonLow: wilsonLowerBound(wins, trades.length), breakEven: be,
+    netPnl: trades.reduce((a, t) => a + t.pnl, 0),
+    firstHalf: { n: h1.length, wins: h1.filter((t) => t.win).length }, secondHalf: { n: h2.length, wins: h2.filter((t) => t.win).length },
+    fastBars: fast.length,
   }
 }

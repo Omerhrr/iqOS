@@ -59,6 +59,7 @@
 // first") - no UI panel yet. REST surface mirrors the auto-trader's own
 // shape: GET /meta_trader_status, POST /meta_trader_config.
 
+import { recordRiskOutcome } from '../analytics/mslrisk'
 import type { Plugin, KernelContext } from '../kernel'
 import type { Store } from '../store'
 import type { AssetCategory, Timeframe, TradeKind } from '../types'
@@ -483,6 +484,7 @@ export class MetaTraderService {
     if (!position.note?.startsWith(META_TRADER_NOTE)) return
     this.rebuildOpenCount()
     const pnl = position.pnl ?? 0
+    if (position.status === 'won' || position.status === 'lost') recordRiskOutcome({ ts: Date.now(), win: position.status === 'won', units: position.status === 'won' ? (position.amount ? pnl / position.amount : 0.85) : -1 }) // feeds MSL risk.*
     this.rt.pnlTotal += pnl
     if (position.status === 'won') this.rt.wins += 1
     else if (position.status === 'lost') this.rt.losses += 1

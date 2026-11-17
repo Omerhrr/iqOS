@@ -42,6 +42,8 @@ import {
   saveMetaStrategy,
   testMetaStrategyScript,
   aiVetScript,
+  scanScriptAllAssets,
+  type ScanResponse,
 } from '@/lib/os/client'
 
 interface MetaStrategyPanelProps {
@@ -419,6 +421,8 @@ export default function MetaStrategyPanel({ asset, tf, onError }: MetaStrategyPa
   const [aiVetBusy, setAiVetBusy] = useState(false)
   const [aiVetResult, setAiVetResult] = useState<AiVetResponse | null>(null)
   const [aiVetExpiry, setAiVetExpiry] = useState(1)
+  const [scanBusy, setScanBusy] = useState(false)
+  const [scanResult, setScanResult] = useState<ScanResponse | null>(null)
 
   // "a place to see all the strats we currently have... and view their
   // source code" per direct instruction - toggled per saved strategy row.
@@ -592,6 +596,18 @@ export default function MetaStrategyPanel({ asset, tf, onError }: MetaStrategyPa
       setAiVetBusy(false)
     }
   }
+  const runScan = async () => {
+    if (!script.trim()) return
+    setScanBusy(true)
+    setScanResult(null)
+    try {
+      setScanResult(await scanScriptAllAssets(script, tf, aiVetExpiry))
+    } catch (e) {
+      setScanResult({ ok: false, error: e instanceof Error ? e.message : String(e) })
+    } finally {
+      setScanBusy(false)
+    }
+  }
   return (
     <div className="flex h-full min-h-0 flex-col rounded-lg border border-[#1c2739] bg-[#0b111c]">
       <div className="flex flex-wrap items-center gap-1.5 border-b border-[#1c2739] px-2 py-1.5">
@@ -684,6 +700,15 @@ export default function MetaStrategyPanel({ asset, tf, onError }: MetaStrategyPa
                 >
                   {aiVetBusy ? 'vetting…' : 'vet with ai'}
                 </button>
+                <button
+                  type="button"
+                  disabled={scanBusy || aiVetBusy || scriptTestBusy}
+                  onClick={runScan}
+                  title="Run this script's backtest on EVERY asset's archive candles and rank by the 95% lower bound of the win rate (uses the expiry on the right)"
+                  className="rounded border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 font-mono text-[9px] font-bold uppercase text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-50"
+                >
+                  {scanBusy ? 'scanning…' : 'scan all assets'}
+                </button>
                 <select
                   value={aiVetExpiry}
                   onChange={(e) => setAiVetExpiry(Number(e.target.value))}
@@ -749,6 +774,31 @@ export default function MetaStrategyPanel({ asset, tf, onError }: MetaStrategyPa
                   </button>
                 )}
               </div>
+              {scanResult && (
+                <div className="mt-2 rounded border border-emerald-500/30 bg-[#0b111c] p-2">
+                  {scanResult.ok ? (
+                    <>
+                      <p className="font-mono text-[9px] text-[#7c8aa5]">
+                        {`${scanResult.assetsWithData}/${scanResult.assetsScanned} assets had data · combined ${scanResult.combined?.trades ?? 0} trades, win ${scanResult.combined?.winRate == null ? 'n/a' : (scanResult.combined.winRate * 100).toFixed(1) + '%'}, 95% low ${((scanResult.combined?.wilsonLow ?? 0) * 100).toFixed(1)}% · break-even ${((scanResult.breakEven ?? 0) * 100).toFixed(1)}%`}
+                      </p>
+                      <div className="mt-1 max-h-40 overflow-auto font-mono text-[9px] text-[#dbe4f0]">
+                        {(scanResult.rows ?? []).filter((r) => r.trades > 0).slice(0, 25).map((r) => (
+                          <div key={r.asset} className={`flex gap-2 ${scanResult.aboveBreakEven?.includes(r.asset) ? 'text-emerald-300' : ''}`}>
+                            <span className="w-16 shrink-0">{r.asset}</span>
+                            <span className="w-10 shrink-0 text-right">{r.trades}</span>
+                            <span className="w-14 shrink-0 text-right">{r.winRate == null ? '-' : (r.winRate * 100).toFixed(1) + '%'}</span>
+                            <span className="w-14 shrink-0 text-right">{(r.wilsonLow * 100).toFixed(1) + '%'}</span>
+                            <span className="text-[#4b5a72]">{`${r.firstHalf} | ${r.secondHalf}`}</span>
+                          </div>
+                        ))}
+                      </div>
+                      <p className="mt-1 font-mono text-[8px] text-[#4b5a72]">{scanResult.caution}</p>
+                    </>
+                  ) : (
+                    <p className="font-mono text-[9px] text-rose-300">{scanResult.error}</p>
+                  )}
+                </div>
+              )}
               {aiVetResult && (
                 <div className="mt-2 rounded border border-amber-500/30 bg-[#0b111c] p-2">
                   {aiVetResult.ok ? (

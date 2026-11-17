@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import type { Candle } from '../src/types'
 import { backtestMslScript, setBacktestFastFeed } from '../src/analytics/mslbacktest'
 import { parseStrategyScript } from '../src/analytics/strategylang'
-import { buildSnrMap, buildFibMap, readSnr, buildZoneMap, readZones } from '../src/analytics/fastlevels'
+import { buildSnrMap, buildFibMap, readSnr, buildZoneMap, readZones, buildTrendMap, readTrend } from '../src/analytics/fastlevels'
 
 const T0 = 1_700_000_040
 const rng = (seed: number) => { let s = seed; return () => ((s = (s * 1664525 + 1013904223) % 4294967296) / 4294967296) }
@@ -115,6 +115,31 @@ test('zone scripts parse and fail closed with no fast feed', () => {
   const r = backtestMslScript(B, sc, { expiryBars: 1, warmupBars: 40 })
   setBacktestFastFeed(null)
   assert.ok(r.trades.length >= 0)
+})
+/** planted rising channel: lows ride 100 + 0.002*i, highs 0.6 above; bounce structure every 40 bars */
+function channel5(n: number): Candle[] {
+  const out: Candle[] = []
+  const r = rng(11)
+  for (let i = 0; i < n; i++) {
+    const ph = (i % 40) / 40, floor = 100 + 0.004 * i, mid = floor + 0.3 + 0.3 * Math.cos(Math.PI * (ph * 2 - 1)) * -1
+    const c = Math.max(floor + 0.02, mid + (r() - 0.5) * 0.02), o = i ? out[i - 1].close : c
+    out.push({ time: T0 + i * 5, open: o, close: c, high: Math.max(o, c) + 0.01, low: Math.max(floor, Math.min(o, c) - 0.01), volume: 1 })
+  }
+  return out
+}
+test('trendline: finds a rising support line with touches and positive slope', () => {
+  const C = channel5(900), CB = agg(C, 60)
+  const m = buildTrendMap(C, CB)
+  assert.ok(m.ok && m.support, 'support line')
+  assert.ok(m.support!.slope > 0 && m.support!.touches >= 2, JSON.stringify(m.support))
+})
+test('trendline scripts parse; fail closed with no feed', () => {
+  const sc = 'if trend.ok() and trend.rejected() == 1 and trend.supTouches() >= 3 and trend.supSlope() > 0\n  call when true\nelseif trend.ok() and trend.broken() == 1\n  call when true\nend'
+  assert.equal(parseStrategyScript(sc).ok, true)
+  setBacktestFastFeed(null)
+  assert.equal(backtestMslScript(B, sc, { expiryBars: 1, warmupBars: 40 }).trades.length, 0)
+  const r = readTrend(F, B)
+  assert.ok(r.ok)
 })
 console.log(`${pass}/${total}`)
 if (pass !== total) process.exit(1)

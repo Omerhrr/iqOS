@@ -248,7 +248,10 @@ import { WYCKOFF_MIN_BARS, readWyckoff, type WyckoffRead } from './mslwyckoff'
 import { SMCX_MIN_BARS, readSmcx, type SmcxRead } from './mslsmcx'
 import { smtDivergence } from './smt'
 import { readBlocks, readJudas, readSoup, type BlockRead, type JudasRead } from './mslpatterns'
-import { readSnr, readFibs, readZones, FASTLEVELS_MIN_FAST } from './fastlevels'
+import { stepHold, holdKey, holdRec, clearHolds, inReplay, replayBypassOn, stepBypass, clearBypass } from './timing'
+import { liveRiskOutcomes, riskStats, sessionAt, minsIn, minsLeft, inWindow, weekendAt, type RiskOutcome } from './mslrisk'
+import { readPullback, PB_MIN_BARS, type PullbackRead } from './pullback'
+import { readSnr, readFibs, readZones, readTrend, FASTLEVELS_MIN_FAST } from './fastlevels'
 import { readMsnr, readCrt, MSNR_MIN_BARS, type MsnrRead } from './msnr'
 import { readPolarity, POLAR_MIN_BARS, POLAR_BASES, type PolarRead, type PolarBaseRead } from './polarity'
 import { readReversal, REVMSL_MIN_BARS, type RevRead } from './revmsl'
@@ -549,6 +552,8 @@ const mslStateStore = new MslStateStore()
  * counting from a previous version's state. */
 export function clearMslState(stateKeyPrefix: string): void {
   mslStateStore.clearPrefix(stateKeyPrefix)
+  clearHolds(stateKeyPrefix)
+  clearBypass(stateKeyPrefix)
 }
 
 function requireMslState(ctx: EvalEnv, fn: string, seq: number | undefined, condTrue: boolean): MslStateRecord {
@@ -2829,6 +2834,181 @@ function zoneMethod(name: string, args: MslValue[], ctx: EvalEnv, fastTf: string
   }
 }
 
+const trendCache = new WeakMap<MslSeriesCtx, Map<string, ReturnType<typeof readTrend>>>()
+/** `trend.*` - TRENDLINES fitted through fast-chart pivots (default "5s", trailing string overrides) and read on the trading chart: one support line (through pivot lows, never closed under) and one resistance line (pivot highs). */
+function trendMethod(name: string, args: MslValue[], ctx: EvalEnv, fastTf: string | undefined): MslValue {
+  void args
+  if (name === 'ok') { try { fastBase(ctx, fastTf, 'trend.ok()'); return true } catch { return false } }
+  const { base, fast, key } = fastBase(ctx, fastTf, `trend.${name}()`)
+  let m = trendCache.get(base); if (!m) trendCache.set(base, (m = new Map()))
+  let r = m.get(key)
+  if (!r) m.set(key, (r = readTrend(candlesWithTime(fast), candlesWithTime(base))))
+  if (!r.ok) throw new MslRuntimeError(`trend.${name}() - not enough usable bars (flat ATR)`)
+  const a = r.map.atr1m, px = r.map.price, S = r.map.support, R = r.map.resistance
+  const per = (l: typeof S) => (l ? (l.slope * r.map.baseSec) / a : 0)
+  switch (name) {
+    case 'hasSupport': return S !== null
+    case 'hasResistance': return R !== null
+    case 'support': return S ? r.supVal : 0
+    case 'resistance': return R ? r.resVal : 0
+    case 'supDist': return S ? (px - r.supVal) / a : 99
+    case 'resDist': return R ? (r.resVal - px) / a : 99
+    case 'supSlope': return per(S)
+    case 'resSlope': return per(R)
+    case 'supTouches': return S?.touches ?? 0
+    case 'resTouches': return R?.touches ?? 0
+    case 'rising': return S !== null && S.slope > 0 && (R === null || R.slope > 0)
+    case 'falling': return R !== null && R.slope < 0 && (S === null || S.slope < 0)
+    case 'channel': return S !== null && R !== null && px >= r.supVal && px <= r.resVal
+    case 'rejected': return r.rejected
+    case 'broken': return r.broken
+    default: throw new MslRuntimeError(`unknown trend method "trend.${name}(...)" - use ok/hasSupport/hasResistance/support/resistance/supDist/resDist/supSlope/resSlope/supTouches/resTouches/rising/falling/channel/rejected/broken`)
+  }
+}
+
+const pbCache = new WeakMap<MslSeriesCtx, PullbackRead>()
+/** `pb.*` - pullback detector of ANY kind (analytics/pullback.ts): the latest swing leg against the previous impulse, its depth, kind (shallow/normal/deep/failed), and whether it landed on the EMA20/50, the 38.2-78.6 fib band, a retest of the broken level, or is a quiet flag; plus whether the trend has resumed. Candle-derived, backtestable; trailing string = higher timeframe. */
+function pbMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  void args
+  const s = requireSeries(ctx, tf)
+  if (name === 'ok') return s.close.length >= PB_MIN_BARS
+  if (s.close.length < PB_MIN_BARS) throw new MslRuntimeError(`pb.${name}() needs at least ${PB_MIN_BARS} closed bars - history is too thin`)
+  let r = pbCache.get(s)
+  if (!r) pbCache.set(s, (r = readPullback(candlesWithTime(s))))
+  if (!r.ok) throw new MslRuntimeError(`pb.${name}() - not enough usable bars (flat ATR)`)
+  switch (name) {
+    case 'active': return r.state === 'pullback'
+    case 'impulsing': return r.state === 'impulse'
+    case 'side': return r.state === 'pullback' ? r.side : 0
+    case 'trend': return r.side
+    case 'depth': return r.depth
+    case 'legAtr': return r.legAtr
+    case 'bars': return r.bars
+    case 'counter': return r.counter
+    case 'kind': return r.kind
+    case 'shallow': return r.kind === 'shallow'
+    case 'normal': return r.kind === 'normal'
+    case 'deep': return r.kind === 'deep'
+    case 'failed': return r.kind === 'failed'
+    case 'ema': return r.ema
+    case 'fib': return r.fib
+    case 'retest': return r.retest
+    case 'flag': return r.flag
+    case 'resumed': return r.resumed
+    case 'ready': return r.ready
+    case 'aligned': return r.aligned
+    case 'types': return r.types
+    default: throw new MslRuntimeError(`unknown pb method "pb.${name}(...)" - use ok/active/impulsing/side/trend/depth/legAtr/bars/counter/kind/shallow/normal/deep/failed/ema/fib/retest/flag/resumed/ready/aligned/types`)
+  }
+}
+
+/** `timing.*` - MSL's sense of time (analytics/timing.ts): `timing.hold(name, cond, dir, seconds, minAtr, abortAtr)` is a confirmation window (arm on cond, watch price for N seconds, fire once if it moved with dir, abort if it went against it / went nowhere / the analysis disappeared); `state/waited/left/move/why(name)` read it; `barAge/barLeft/second/minute/hour/dow()` are clock reads. hold is LIVE-ONLY, the clock reads replay in a backtest. */
+function evalNowMs(ctx: EvalEnv): number {
+  return ctx.liveNowMs ?? (inMslBacktest() && ctx.series?.time?.length ? (ctx.series.time[ctx.series.time.length - 1] + barSpacingSec(ctx.series)) * 1000 : Date.now())
+}
+function timingMethod(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
+  const nowMs = evalNowMs(ctx)
+  const nameArg = (): string => { if (typeof args[0] !== 'string') throw new MslRuntimeError(`timing.${name}() needs the timer's name as a quoted string first`); return args[0] }
+  const key = () => {
+    if (ctx.stateKeyPrefix === undefined) throw new MslRuntimeError(`timing.${name}() needs a script scope to keep its timer in (not available in this evaluation context)`)
+    return holdKey(ctx.stateKeyPrefix, nameArg())
+  }
+  switch (name) {
+    case 'hold': {
+      if (inMslBacktest() && !inReplay()) throw new MslRuntimeError('timing.hold() is live-only in the candle backtester (1m bars cannot say what price did in the seconds after the signal) - use the replay tester (/msl_replay) on 5s data')
+      if (args.length < 4) throw new MslRuntimeError('timing.hold(name, cond, dir, seconds [, minAtr [, abortAtr]]) needs at least 4 arguments')
+      const d = typeof args[2] === 'string' ? (args[2] === 'call' ? 1 : args[2] === 'put' ? -1 : 0) : Math.sign(asNum(args[2]))
+      if (d === 0) throw new MslRuntimeError('timing.hold(): dir must be +1/-1 (or "call"/"put")')
+      const seconds = asNum(args[3])
+      if (!(seconds > 0 && seconds <= 3600)) throw new MslRuntimeError('timing.hold(): seconds must be between 0 and 3600')
+      if (replayBypassOn()) return stepBypass(key(), truthy(args[1])) ? 1 : 0
+      const s = requireSeries(ctx, undefined)
+      const a14 = atrInd(s.high, s.low, s.close, 14)
+      const atrv = a14[a14.length - 1]
+      if (!Number.isFinite(atrv) || atrv <= 0) throw new MslRuntimeError('timing.hold(): ATR unavailable (history too thin or flat)')
+      const price = livePrice(ctx, s)
+      const r = stepHold({ key: key(), cond: truthy(args[1]), dir: d, seconds, minAtr: args[4] !== undefined ? asNum(args[4]) : 0.05, abortAtr: args[5] !== undefined ? asNum(args[5]) : 0.3, nowMs, price, atr: atrv })
+      return r.fire ? 1 : 0
+    }
+    case 'state': return holdRec(key())?.state ?? 'idle'
+    case 'why': return holdRec(key())?.why ?? ''
+    case 'waited': { const r = holdRec(key()); return r && r.state === 'waiting' ? (nowMs - r.armedMs) / 1000 : 0 }
+    case 'left': { const r = holdRec(key()); return r && r.state === 'waiting' ? Math.max(0, r.seconds - (nowMs - r.armedMs) / 1000) : 0 }
+    case 'move': return holdRec(key())?.move ?? 0
+    case 'barAge': case 'barLeft': {
+      const s = requireSeries(ctx, undefined)
+      if (!s.time || s.time.length < 2) throw new MslRuntimeError(`timing.${name}() needs candle times, which are not available here`)
+      const sp = barSpacingSec(s)
+      const open = (s.time[s.time.length - 1] + sp) * 1000
+      const age = Math.max(0, (nowMs - open) / 1000)
+      return name === 'barAge' ? Math.min(age, sp) : Math.max(0, sp - age)
+    }
+    case 'second': return new Date(nowMs).getUTCSeconds()
+    case 'minute': return new Date(nowMs).getUTCMinutes()
+    case 'hour': return new Date(nowMs).getUTCHours()
+    case 'dow': return new Date(nowMs).getUTCDay()
+    default: throw new MslRuntimeError(`unknown timing method "timing.${name}(...)" - use hold/state/why/waited/left/move/barAge/barLeft/second/minute/hour/dow`)
+  }
+}
+function barSpacingSec(s: MslSeriesCtx): number {
+  let sp = Infinity
+  const t = s.time ?? []
+  for (let i = Math.max(1, t.length - 30); i < t.length; i++) { const g = t[i] - t[i - 1]; if (g > 0 && g < sp) sp = g }
+  return Number.isFinite(sp) ? sp : 60
+}
+/** newest tick if the context has a feed, else the newest closed 5s bar, else the trading chart's last close */
+function livePrice(ctx: EvalEnv, s: MslSeriesCtx): number {
+  const t = ctx.liveTicks
+  if (t && t.length) return t[t.length - 1].price
+  try { const f = ctx.seriesFor?.('5s'); if (f && f.close.length) return f.close[f.close.length - 1] } catch { /* no fast chart */ }
+  return s.close[s.close.length - 1]
+}
+
+/** `risk.*` - this system's own recent results (analytics/mslrisk.ts): streaks, today's P&L in stakes, drawdown, time since the last trade. Live = closed Meta Trader positions since kernel start; replay tester = the script's own settled trades; the candle backtester throws. */
+let riskSource: (() => readonly RiskOutcome[]) | null = null
+export function setRiskSource(f: (() => readonly RiskOutcome[]) | null): void { riskSource = f }
+function riskMethod(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
+  if (inMslBacktest() && !inReplay()) throw new MslRuntimeError(`risk.${name}() needs a trade history, which the candle backtester has no clock for - use the replay tester (/msl_replay)`)
+  const out = riskSource ? riskSource() : liveRiskOutcomes()
+  const st = riskStats(out, evalNowMs(ctx))
+  const n = args.length ? asNum(args[0]) : 10
+  switch (name) {
+    case 'ok': return true
+    case 'trades': return st.trades
+    case 'todayPnl': return st.todayPnl
+    case 'drawdown': return st.drawdown
+    case 'losses': return st.losses
+    case 'wins': return st.wins
+    case 'sinceMin': return st.sinceMin
+    case 'last': return st.last(n).wins
+    case 'lastLosses': { const l = st.last(n); return l.n - l.wins }
+    case 'lastN': return st.last(n).n
+    default: throw new MslRuntimeError(`unknown risk method "risk.${name}(...)" - use ok/trades/todayPnl/drawdown/losses/wins/sinceMin/last(n)/lastLosses(n)/lastN(n)`)
+  }
+}
+/** `session.*` - clock-only market sessions in fixed UTC (analytics/mslrisk.ts); replays in a candle backtest on the bar's own time. */
+function sessionMethod(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
+  const now = evalNowMs(ctx)
+  const se = sessionAt(now)
+  const w = (): string => { if (typeof args[0] !== 'string') throw new MslRuntimeError(`session.${name}("asia"|"london"|"ny") needs the session name as a quoted string`); return args[0] }
+  switch (name) {
+    case 'name': return se.name
+    case 'asia': return se.asia
+    case 'london': return se.london
+    case 'ny': return se.ny
+    case 'overlap': return se.overlap
+    case 'dead': return se.name === 'dead'
+    case 'weekend': return weekendAt(now)
+    case 'minsIn': return minsIn(now, w())
+    case 'minsLeft': return minsLeft(now, w())
+    case 'inWindow': {
+      if (typeof args[0] !== 'string' || typeof args[1] !== 'string') throw new MslRuntimeError('session.inWindow("HH:MM", "HH:MM") needs two quoted UTC times')
+      try { return inWindow(now, args[0], args[1]) } catch (e) { throw new MslRuntimeError(e instanceof Error ? e.message : String(e)) }
+    }
+    default: throw new MslRuntimeError(`unknown session method "session.${name}(...)" - use name/asia/london/ny/overlap/dead/weekend/minsIn(s)/minsLeft(s)/inWindow(from,to)`)
+  }
+}
+
 const polarCache = new WeakMap<MslSeriesCtx, PolarRead>()
 /** `polar.*` - the Polarity Switch (analytics/polarity.ts): keeps four plain base signals (follow/ctl/rev/trend), measures walk-forward how each has done on THIS pair in the SAME mkt regime,
  * and KEEPs one that is reliably right, FLIPs one that is reliably wrong (z <= -2, n >= 30), SKIPs the rest. `polar.<m>()` reads the best base (largest |z|); `polar.<m>("ctl")` reads a named one. Candle-derived, backtestable. */
@@ -4798,10 +4978,23 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
         return e.obj.name === 'msnr' ? msnrMethod(e.name, args, ctx, tf) : crtMethod(e.name, args, ctx, tf)
       }
-      if (e.obj.t === 'ident' && (e.obj.name === 'snr' || e.obj.name === 'fibs' || e.obj.name === 'zone') && !(e.obj.name in env)) {
+      if (e.obj.t === 'ident' && (e.obj.name === 'snr' || e.obj.name === 'fibs' || e.obj.name === 'zone' || e.obj.name === 'trend') && !(e.obj.name in env)) {
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         const ftf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
-        return e.obj.name === 'snr' ? snrMethod(e.name, args, ctx, ftf) : e.obj.name === 'zone' ? zoneMethod(e.name, args, ctx, ftf) : fibsMethod(e.name, args, ctx, ftf)
+        return e.obj.name === 'snr' ? snrMethod(e.name, args, ctx, ftf) : e.obj.name === 'zone' ? zoneMethod(e.name, args, ctx, ftf) : e.obj.name === 'trend' ? trendMethod(e.name, args, ctx, ftf) : fibsMethod(e.name, args, ctx, ftf)
+      }
+      if (e.obj.t === 'ident' && (e.obj.name === 'risk' || e.obj.name === 'session') && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        return e.obj.name === 'risk' ? riskMethod(e.name, args, ctx) : sessionMethod(e.name, args, ctx)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'timing' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        return timingMethod(e.name, args, ctx)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'pb' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return pbMethod(e.name, args, ctx, tf)
       }
       if (e.obj.t === 'ident' && e.obj.name === 'polar' && !(e.obj.name in env)) {
         const args = e.args.map((a) => evalExpr(a, env, ctx))

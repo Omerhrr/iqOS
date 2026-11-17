@@ -238,3 +238,84 @@ export function readZones(fast: Candle[], base: Candle[]): ZoneRead {
   }
   return out
 }
+
+// TRENDLINES - straight lines fitted through fast-chart pivots. SUPPORT line = through two or more pivot LOWS with no bar CLOSING below it (more than 0.3 ATR) since the first
+// point; RESISTANCE line = the same through pivot HIGHS. Candidates are every pair among the last 14 pivots of that kind; a line's touches = pivots within 0.2 ATR of it. Best by
+// touches then recency per side, with the nearest to price winning ties. Lines are in TIME (not bar index) so gaps do not bend them. Slope is in trading-chart ATR per trading-chart bar.
+const TL_PIVOTS = 14
+const TL_TOUCH = 0.2
+const TL_BREAK = 0.3
+export interface TrendLine { kind: 'support' | 'resistance'; t0: number; p0: number; slope: number; touches: number; lastTouchAge: number }
+export interface TrendMap { ok: boolean; price: number; atr1m: number; baseSec: number; support: TrendLine | null; resistance: TrendLine | null }
+export const lineAt = (l: TrendLine, t: number): number => l.p0 + l.slope * (t - l.t0)
+export function buildTrendMap(fast: Candle[], base: Candle[]): TrendMap {
+  const empty: TrendMap = { ok: false, price: 0, atr1m: 0, baseSec: 60, support: null, resistance: null }
+  if (fast.length < FASTLEVELS_MIN_FAST || base.length < 20) return empty
+  const f = fast.slice(-2000)
+  const { a } = refAtr(base, f)
+  if (!Number.isFinite(a)) return empty
+  const baseSec = base.length > 1 ? Math.max(1, base[base.length - 1].time - base[base.length - 2].time) : 60
+  const price = base[base.length - 1].close
+  const K = 3
+  const lows: { t: number; p: number; i: number }[] = [], highs: { t: number; p: number; i: number }[] = []
+  for (let i = K; i < f.length - K; i++) {
+    let isH = true, isL = true
+    for (let k = 1; k <= K; k++) {
+      if (!(f[i].high > f[i - k].high && f[i].high >= f[i + k].high)) isH = false
+      if (!(f[i].low < f[i - k].low && f[i].low <= f[i + k].low)) isL = false
+    }
+    if (isH) highs.push({ t: f[i].time, p: f[i].high, i })
+    if (isL) lows.push({ t: f[i].time, p: f[i].low, i })
+  }
+  const best = (pv: { t: number; p: number; i: number }[], kind: 'support' | 'resistance'): TrendLine | null => {
+    const P = pv.slice(-TL_PIVOTS)
+    let top: (TrendLine & { score: number }) | null = null
+    for (let x = 0; x < P.length - 1; x++) for (let y = x + 1; y < P.length; y++) {
+      const A = P[x], B = P[y]
+      if (B.t <= A.t || B.i - A.i < 6) continue
+      const slope = (B.p - A.p) / (B.t - A.t)
+      const val = (t: number) => A.p + slope * (t - A.t)
+      let broken = false
+      for (let k = A.i; k < f.length; k++) {
+        const v = val(f[k].time)
+        if (kind === 'support' ? f[k].close < v - TL_BREAK * a : f[k].close > v + TL_BREAK * a) { broken = true; break }
+      }
+      if (broken) continue
+      const tp = P.filter((q) => q.t >= A.t && Math.abs(q.p - val(q.t)) <= TL_TOUCH * a)
+      if (tp.length < 2) continue
+      const lastI = Math.max(...tp.map((q) => q.i))
+      const now = base[base.length - 1].time
+      const dist = Math.abs(val(now) - price)
+      const score = tp.length * 1000 + lastI - dist / a
+      if (!top || score > top.score) top = { kind, t0: A.t, p0: A.p, slope, touches: tp.length, lastTouchAge: f.length - 1 - lastI, score }
+    }
+    if (!top) return null
+    const { score: _s, ...ln } = top
+    void _s
+    return ln
+  }
+  return { ok: true, price, atr1m: a, baseSec, support: best(lows, 'support'), resistance: best(highs, 'resistance') }
+}
+export interface TrendRead { ok: boolean; map: TrendMap; supVal: number; resVal: number; rejected: number; broken: number }
+/** the latest closed trading-chart bar vs the two lines: rejected +1 = wicked to the support line and closed back above it, -1 = the mirror at resistance; broken +1 = closed above the resistance line after the previous bar closed below it, -1 = closed below support after the bar before was above it */
+export function readTrend(fast: Candle[], base: Candle[]): TrendRead {
+  const map = buildTrendMap(fast, base)
+  const out: TrendRead = { ok: map.ok, map, supVal: NaN, resVal: NaN, rejected: 0, broken: 0 }
+  if (!map.ok) return out
+  const b = base[base.length - 1], pb = base[base.length - 2]
+  const a = map.atr1m
+  const S = map.support, R = map.resistance
+  if (S) out.supVal = lineAt(S, b.time)
+  if (R) out.resVal = lineAt(R, b.time)
+  if (S) {
+    const v = out.supVal
+    if (b.low <= v + 0.15 * a && b.close > v && b.open > v) out.rejected = 1
+    if (b.close < v - 0.0 * a && pb.close >= lineAt(S, pb.time)) out.broken = -1
+  }
+  if (R) {
+    const v = out.resVal
+    if (b.high >= v - 0.15 * a && b.close < v && b.open < v && out.rejected === 0) out.rejected = -1
+    if (b.close > v && pb.close <= lineAt(R, pb.time)) out.broken = 1
+  }
+  return out
+}

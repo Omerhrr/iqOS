@@ -608,6 +608,7 @@ export interface DayLevelsResponse {
 }
 
 export interface FastLevelsResponse {
+  trends?: { kind: 'support' | 'resistance'; touches: number; t0: number; p0: number; t1: number; p1: number }[]
   zones?: { kind: 'demand' | 'supply'; top: number; bottom: number; tests: number; strength: number }[]
   ok: boolean
   reason?: string
@@ -905,6 +906,24 @@ export interface AiVetResponse {
 /** POST /ai_vet - backtest on ARCHIVE candles, then an AI critique from that evidence only (kernel LLM = Copilot's provider config). */
 export async function aiVetScript(script: string, asset: string, tf: Timeframe, expiryBars = 1): Promise<AiVetResponse> {
   return osPost('/ai_vet', { script, asset, tf, expiryBars })
+}
+
+export interface ScanRow { asset: string; bars: number; segments: number; trades: number; wins: number; winRate: number | null; wilsonLow: number; firstHalf: string; secondHalf: string; note?: string }
+export interface ScanResponse {
+  ok: boolean
+  error?: string
+  tf?: string
+  breakEven?: number
+  assetsScanned?: number
+  assetsWithData?: number
+  combined?: { trades: number; wins: number; winRate: number | null; wilsonLow: number }
+  aboveBreakEven?: string[]
+  rows?: ScanRow[]
+  caution?: string
+}
+/** POST /msl_scan - the same candle backtest on every asset's archive, ranked by the Wilson lower bound. */
+export async function scanScriptAllAssets(script: string, tf: Timeframe, expiryBars = 1): Promise<ScanResponse> {
+  return osPost('/msl_scan', { script, tf, expiryBars })
 }
 
 export async function testMetaStrategyScript(script: string, asset: string, tf: Timeframe): Promise<MetaStrategyScriptTestResponse> {

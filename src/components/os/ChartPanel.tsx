@@ -2782,6 +2782,7 @@ export default function ChartPanel({
   // Green = support, red = resistance (thicker = more touches), amber dotted = Fibonacci (label shows ratio and how many legs stack there). Refreshed every 20s.
   const [showMap, setShowMap] = useState(false)
   const mapLinesRef = useRef<{ series: AnyPriceSeries; line: IPriceLine }[]>([])
+  const mapTrendRef = useRef<ISeriesApi<'Line'>[]>([])
   const [mapNote, setMapNote] = useState('')
   useEffect(() => {
     const clearLines = () => {
@@ -2793,6 +2794,14 @@ export default function ChartPanel({
         }
       }
       mapLinesRef.current = []
+      for (const ts of mapTrendRef.current) {
+        try {
+          chartRef.current?.removeSeries(ts)
+        } catch {
+          // chart already torn down
+        }
+      }
+      mapTrendRef.current = []
     }
     if (!showMap) {
       clearLines()
@@ -2821,6 +2830,16 @@ export default function ChartPanel({
               const line = series.createPriceLine({ price: pr, color: col, lineWidth: z.tests === 0 ? 2 : 1, lineStyle: LineStyle.Solid, axisLabelVisible: ti !== '', title: ti ? `${ti}${z.tests === 0 ? ' fresh' : ' t' + z.tests}` : '' })
               mapLinesRef.current.push({ series, line })
             }
+          }
+          for (const t of d.trends ?? []) {
+            const ch = chartRef.current
+            if (!ch) break
+            const ls = ch.addSeries(LineSeries, { color: t.kind === 'support' ? '#22d3ee' : '#f472b6', lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false })
+            ls.setData([
+              { time: t.t0 as UTCTimestamp, value: t.p0 },
+              { time: t.t1 as UTCTimestamp, value: t.p1 },
+            ])
+            mapTrendRef.current.push(ls)
           }
           for (const l of d.fib) {
             const line = series.createPriceLine({ price: l.price, color: '#f59e0b', lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: l.confluence >= 2, title: `fib ${(l.ratio * 100).toFixed(1)}${l.confluence >= 2 ? ' x' + l.confluence : ''}` })
@@ -2857,7 +2876,7 @@ export default function ChartPanel({
         </button>
         <button
           onClick={() => setShowMap((v) => !v)}
-          title={`Level map: many support/resistance levels and Fibonacci retracements from the 5s chart drawn on this chart (green = support, red = resistance, amber = fib, blue = demand zone, purple = supply zone). MSL: snr.* / fibs.* / zone.*${mapNote ? ' - ' + mapNote : ''}`}
+          title={`Level map: many support/resistance levels and Fibonacci retracements from the 5s chart drawn on this chart (green = support, red = resistance, amber = fib, blue = demand zone, purple = supply zone, cyan/pink sloped = trendlines). MSL: snr.* / fibs.* / zone.* / trend.*${mapNote ? ' - ' + mapNote : ''}`}
           className={`flex h-6 w-6 items-center justify-center rounded border font-mono text-[8px] font-bold leading-none transition-colors ${
             showMap ? 'border-amber-500/60 bg-amber-500/15 text-amber-300' : 'border-[#1c2739] bg-[#0d1420]/90 text-[#7c8aa5] hover:border-amber-500/40'
           }`}
