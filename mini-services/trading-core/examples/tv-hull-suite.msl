@@ -1,0 +1,14 @@
+# MSL version of TradingView "Hull Suite Strategy" (InSilico indicator, DashTrader strategy).
+# The Hull moving average, three variations: "hma" (WMA based), "ehma" (EMA based), "thma" (triple, evaluated at len/2 exactly like the script's Mode() switch).
+# ind.hull(mode, len, src):  src = "close" "hl2" "hlc3" "ohlc4" "open" "high" "low".   The script's HULL[0] is h[-1] here and HULL[2] is h[-3] (series index -1 = latest closed bar).
+# Original rule: long while HULL[0] > HULL[2], short while HULL[0] < HULL[2]. A binary option settles at expiry, so the trade fires on the FLIP (the bar the Hull turns), not every bar.
+let h = ind.hull("hma", 55, "close")      # 55 = swing entries, 180-200 = floating support/resistance (the original's note)
+
+let turnUp   = h[-1] > h[-3] and h[-2] <= h[-4]
+let turnDown = h[-1] < h[-3] and h[-2] >= h[-4]
+let dateOk   = session.inDates("2026-01-01", "2030-12-30")    # the original's backtest start/stop dates (UTC)
+
+# "Strategy Direction": keep both lines for "all", or delete one for "long" / "short"
+call when turnUp and dateOk
+put  when turnDown and dateOk
+expiry = 3

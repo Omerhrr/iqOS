@@ -1,0 +1,17 @@
+# MSL version of TradingView "Bj Bot" (3Commas) - moving-average cross entry.
+# Stops/targets/trailing/flip/3Commas JSON do not apply to a binary option: the expiry settles the trade. What carries over is the ENTRY and the FILTERS.
+# MA types (TradingView getMA): "ema" "hema" "sma" "hma" "wma" "dema" "vwma" "vwap" "t3" (plus "kama")
+let fast = ind.ma("ema", 21)
+let slow = ind.ma("ema", 50)
+
+let crossUp = fast.crossed("up", slow)
+let crossDn = fast.crossed("down", slow)
+let haveAtr = ind.atr(14)[-1] > 0
+
+# Filters (switch a line off by deleting it from the `and` chain)
+let timeOk = not session.inWindow("00:00", "03:00")      # useTimeFilter: ignore 00:00-03:00 UTC
+let dateOk = session.inDates("2026-01-01", "2026-12-30")  # start / end filter (UTC)
+
+call when crossUp and haveAtr and timeOk and dateOk      # longTrades
+put  when crossDn and haveAtr and timeOk and dateOk      # shortTrades
+expiry = 3

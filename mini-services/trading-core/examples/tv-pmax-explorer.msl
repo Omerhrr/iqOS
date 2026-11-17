@@ -1,0 +1,21 @@
+# MSL version of TradingView "PMax Explorer" (Kivanc Ozbilgic) - the STRATEGY half.
+# PMax = a SuperTrend-style trailing line built on a MOVING AVERAGE (not on price) with ATR-distance bands.
+# ind.pmax(maType, maLen, atrLen, mult, src, wilderAtr):
+#   maType  "sma" "ema" "wma" "tma" "var" "wwma" "zlema" "tsf"   (the original's dropdown)
+#   src     "hl2" (original default) "hlc3" "ohlc4" "close" "open" "high" "low"
+#   wilderAtr 1 = atr() [original default "Change ATR calculation method" on], 0 = sma(tr)
+# Fields: .line (PMax) .ma (the moving average) .dir (+1 up / -1 down) .atr ; .trend/.tsl = the screener's own recursion
+let pm = ind.pmax("ema", 10, 10, 3, "hl2", 1)
+
+# the original's entries: MA crossing PMax (strategy.entry long / short). A binary option settles at expiry, so "reverse the position" becomes "take the next signal".
+let buyK  = pm.ma.crossed("up", pm.line)
+let sellK = pm.ma.crossed("down", pm.line)
+
+# optional: the original also offers PRICE crossing PMax instead of the MA. Close-vs-line version:
+#   let buyP  = ohlc(-1).c > pm.line[-1] and ohlc(-2).c <= pm.line[-2]
+#   let sellP = ohlc(-1).c < pm.line[-1] and ohlc(-2).c >= pm.line[-2]
+let dateOk = session.inDates("2026-01-01", "2026-12-30")   # the original's From/To day-month-year filter (UTC)
+
+call when buyK and dateOk
+put  when sellK and dateOk
+expiry = 3

@@ -11,7 +11,7 @@ export function recordRiskOutcome(o: RiskOutcome): void { live.push(o); if (live
 export function liveRiskOutcomes(): readonly RiskOutcome[] { return live }
 export function clearLiveRisk(): void { live.length = 0 }
 
-export interface RiskStats { trades: number; todayPnl: number; drawdown: number; losses: number; wins: number; sinceMin: number; last: (n: number) => { n: number; wins: number } }
+export interface RiskStats { tradesWeek: number; drawdownAll: number; pnlAll: number; lossDays: number; trades: number; todayPnl: number; drawdown: number; losses: number; wins: number; sinceMin: number; last: (n: number) => { n: number; wins: number } }
 export function riskStats(all: readonly RiskOutcome[], nowMs: number): RiskStats {
   const done = all.filter((o) => o.ts <= nowMs)
   const day0 = Math.floor(nowMs / 86_400_000) * 86_400_000
@@ -21,7 +21,18 @@ export function riskStats(all: readonly RiskOutcome[], nowMs: number): RiskStats
   let losses = 0, wins = 0
   for (let i = done.length - 1; i >= 0 && !done[i].win; i--) losses++
   for (let i = done.length - 1; i >= 0 && done[i].win; i--) wins++
+  // since Monday 00:00 UTC
+  const dowMon = (new Date(nowMs).getUTCDay() + 6) % 7
+  const wk0 = day0 - dowMon * 86_400_000
+  let cumAll = 0, peakAll = 0, ddAll = 0
+  for (const o of done) { cumAll += o.units; peakAll = Math.max(peakAll, cumAll); ddAll = Math.max(ddAll, peakAll - cumAll) }
+  // consecutive most-recent trading days that ended net negative (days without trades are skipped)
+  const byDay = new Map<number, number>()
+  for (const o of done) { const d = Math.floor(o.ts / 86_400_000); byDay.set(d, (byDay.get(d) ?? 0) + o.units) }
+  let lossDays = 0
+  for (const d of [...byDay.keys()].sort((a, b) => b - a)) { if ((byDay.get(d) ?? 0) < 0) lossDays++; else break }
   return {
+    tradesWeek: done.filter((o) => o.ts >= wk0).length, drawdownAll: ddAll, pnlAll: cumAll, lossDays,
     trades: today.length, todayPnl: cum, drawdown: peak - cum, losses, wins,
     sinceMin: done.length ? (nowMs - done[done.length - 1].ts) / 60_000 : 99999,
     last: (n) => { const s = done.slice(-Math.max(1, Math.floor(n))); return { n: s.length, wins: s.filter((x) => x.win).length } },
@@ -58,4 +69,14 @@ export function inWindow(nowMs: number, from: string, to: string): boolean {
   const a = p(from), b = p(to)
   const d = new Date(nowMs), m = d.getUTCHours() * 60 + d.getUTCMinutes()
   return a <= b ? m >= a && m < b : m >= a || m < b
+}
+/** true while now is within [from, to] (UTC); each is "YYYY-MM-DD" or "YYYY-MM-DD HH:MM" (a bare end date includes that whole day) */
+export function inDates(nowMs: number, from: string, to: string): boolean {
+  const p = (s: string, end: boolean): number => {
+    const m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2}))?$/.exec(s.trim())
+    if (!m) throw new Error(`bad date "${s}" - use "YYYY-MM-DD" or "YYYY-MM-DD HH:MM" (UTC)`)
+    const t = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), m[4] ? Number(m[4]) : 0, m[5] ? Number(m[5]) : 0)
+    return !m[4] && end ? t + 86_400_000 - 1 : t
+  }
+  return nowMs >= p(from, false) && nowMs <= p(to, true)
 }

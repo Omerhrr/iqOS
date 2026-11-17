@@ -1,0 +1,24 @@
+# MSL version of TradingView "BEST Strategy Template" (Daveatt): ANY signal + the whole risk-management shell around it.
+# In the original the signal came from another indicator (+1 bull / -1 bear). Here it is any MSL condition - replace the two `let` lines.
+# Not applicable to binary options (the expiry settles every trade): stop loss, take profit, trailing stop, close-on-opposite, pyramiding, custom close.
+# risk.* reads your own results: live = Meta Trader trades since the kernel started; test it with the replay tester (/msl_replay) - the plain candle backtester has no trade clock.
+
+# ---- 1. THE SIGNAL (replace with yours) ----
+let bull = ind.ma("ema", 9).crossed("up", ind.ma("ema", 21))
+let bear = ind.ma("ema", 9).crossed("down", ind.ma("ema", 21))
+
+# ---- 2. THE SHELL ----
+let inSession   = session.inWindow("07:00", "21:00")             # Trading Session (UTC)
+let inDates     = session.inDates("2026-01-01", "2026-12-30")    # Date Range Filtering
+let lossStreak  = risk.losses() < 15                              # Max consecutive losing trades
+let winStreak   = risk.wins() < 15                                # Max consecutive winning trades
+let lossDays    = risk.lossDays() < 3                             # Max consecutive days with a loss
+let drawdown    = risk.drawdownAll() < 10                         # Max total drawdown (in stakes: 1 stake = 1 trade's amount)
+let dayLoss     = risk.todayPnl() > -3                            # Max intraday loss (stakes)
+let dayTrades   = risk.trades() < 10                              # Max trades per day
+let weekTrades  = risk.tradesWeek() < 50                          # Max trades per week
+let allowed = inSession and inDates and lossStreak and winStreak and lossDays and drawdown and dayLoss and dayTrades and weekTrades
+
+call when bull and allowed    # OpenDirection ALL / LONG
+put  when bear and allowed    # OpenDirection ALL / SHORT
+expiry = 3

@@ -1,0 +1,28 @@
+# MSL version of TradingView "Smart Money Concepts [LuxAlgo]" - an INDICATOR (it draws structure, it has no entries of its own), so here it is as ind.lux(...)
+# plus three ready strategies built from its alert conditions. Fields are per-bar series: lx.field[-1] = latest closed bar. Event fields are 1 on the bar they fire.
+# ind.lux(swingLen=50, internalLen=5, eqLen=3, eqThr=0.1, obRange=0, obClose=0, confluence=0, fvgAuto=1)   (= the TradingView inputs, same defaults)
+#   obRange 0 = ATR volatility filter, 1 = cumulative mean range;  obClose 0 = mitigate order blocks by high/low, 1 = by close;  confluence 1 = internal-structure confluence filter
+# Needs ~200+ bars (the script's ATR200). On a 1m chart a swing length of 50 is slow - try ind.lux(20, 5) as well and sweep it.
+let lx = ind.lux()
+
+# --- STRATEGY 1: pullback continuation --------------------------------------------------------------------------------------------------------
+# the SWING trend is up, price pulled back into the discount half of the trailing range, and the INTERNAL structure just turned bullish again (internal CHoCH)
+# (a swing CHoCH itself fires when price breaks out, i.e. near the TOP of the range, so "swing CHoCH + discount" can never happen - that is why this uses the internal one)
+let longPb  = lx.swingTrend[-1] == 1  and lx.pos[-1] < 0.5 and lx.internalBullChoch[-1] == 1
+let shortPb = lx.swingTrend[-1] == -1 and lx.pos[-1] > 0.5 and lx.internalBearChoch[-1] == 1
+call when longPb
+put  when shortPb
+
+# --- STRATEGY 2: order-block retest (swap in for the two lines above) ---------------------------------------------------------------------------
+#   price closes back inside a fresh bullish swing order block while the swing trend is still up (and the reverse for bearish)
+#   call when lx.swingObBullIn[-1] == 1 and lx.swingTrend[-1] == 1 and lx.swingObBullBreak[-1] == 0
+#   put  when lx.swingObBearIn[-1] == 1 and lx.swingTrend[-1] == -1 and lx.swingObBearBreak[-1] == 0
+
+# --- STRATEGY 3: equal-highs / equal-lows liquidity grab fade -----------------------------------------------------------------------------------
+#   equal highs were just detected (a pool of stops above): fade a close back below them. EQH level = lx.eqhLevel
+#   put  when lx.eqh[-1] == 1 and lx.swingTrend[-1] == -1
+#   call when lx.eql[-1] == 1 and lx.swingTrend[-1] == 1
+
+# --- other alerts available: internal structure (internalBullBos ...), fair value gaps (fvgBull / fvgBullIn ...), order-block breaks (swingObBullBreak ...),
+#     strong/weak high-low (lx.strongHigh[-1] is a price or NaN), previous day/week/month levels (lx.pdh[-1], lx.pwl[-1] ...)
+expiry = 3

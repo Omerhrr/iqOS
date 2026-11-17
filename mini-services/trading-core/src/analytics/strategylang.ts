@@ -248,10 +248,13 @@ import { WYCKOFF_MIN_BARS, readWyckoff, type WyckoffRead } from './mslwyckoff'
 import { SMCX_MIN_BARS, readSmcx, type SmcxRead } from './mslsmcx'
 import { smtDivergence } from './smt'
 import { readBlocks, readJudas, readSoup, type BlockRead, type JudasRead } from './mslpatterns'
+import { luxSmc, LUX_FIELDS } from './luxsmc'
+import { pmax, pmaxSource } from './pmax'
+import { maSeries, dema, t3, hema, vwapDaily, hullSeries } from './mamix'
 import { readEm, emUpper, emLower, emZ, emSigmaAt, emModeFromCode, emParams, EM_MIN_BARS } from './expectedmove'
 import { detectChartPatterns2, readAutoTrend, readElliott, CP_MIN_BARS, type CpHit, type AutoTrend, type EwRead } from './patternengine'
 import { stepHold, holdKey, holdRec, clearHolds, inReplay, replayBypassOn, stepBypass, clearBypass } from './timing'
-import { liveRiskOutcomes, riskStats, sessionAt, minsIn, minsLeft, inWindow, weekendAt, type RiskOutcome } from './mslrisk'
+import { liveRiskOutcomes, riskStats, sessionAt, minsIn, minsLeft, inWindow, inDates, weekendAt, type RiskOutcome } from './mslrisk'
 import { readPullback, PB_MIN_BARS, type PullbackRead } from './pullback'
 import { readSnr, readFibs, readZones, readTrend, FASTLEVELS_MIN_FAST } from './fastlevels'
 import { readMsnr, readCrt, MSNR_MIN_BARS, type MsnrRead } from './msnr'
@@ -858,7 +861,7 @@ const FIELDS = new Set([
   // bar (MslBarValue)
   'o', 'open', 'h', 'high', 'l', 'low', 'c', 'close', 'v', 'volume', 'body', 'range', 'upper_wick', 'lower_wick',
   // bundle sub-fields across every ind.* multi-series indicator
-  'macd', 'signal', 'hist', 'upper', 'mid', 'lower', 'width', 'percentB', 'k', 'd', 'adx', 'plusDI', 'minusDI', 'line',
+  'macd', 'signal', 'hist', 'upper', 'mid', 'lower', 'width', 'percentB', 'k', 'd', 'adx', 'plusDI', 'minusDI', 'line', 'ma', 'trend', 'tsl', 'atr', ...LUX_FIELDS,
   // bundle sub-fields on pf.column(offset) - top/bottom price boundary,
   // unsigned box count (signed direction is already pf.boxes(n)'s own job,
   // not duplicated here)
@@ -1158,7 +1161,7 @@ class Parser {
           e = { t: 'method', obj: e, name: ft.value, args }
           continue
         }
-        if (!FIELDS.has(ft.value)) throw new MslSyntaxError(`line ${ft.line}: unknown field ".${ft.value}" - use dir/direction/conf/confidence/active/call/put/value, a bar field (o/h/l/c/v/body/range/upper_wick/lower_wick), or an indicator bundle field (macd/signal/hist/upper/mid/lower/width/percentB/k/d/adx/plusDI/minusDI/line)`)
+        if (!FIELDS.has(ft.value)) throw new MslSyntaxError(`line ${ft.line}: unknown field ".${ft.value}" - use dir/direction/conf/confidence/active/call/put/value, a bar field (o/h/l/c/v/body/range/upper_wick/lower_wick), or an indicator bundle field (macd/signal/hist/upper/mid/lower/width/percentB/k/d/adx/plusDI/minusDI/line/ma/trend/tsl/atr)`)
         e = { t: 'field', obj: e, field: ft.value }
         continue
       }
@@ -2985,7 +2988,11 @@ function riskMethod(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
     case 'last': return st.last(n).wins
     case 'lastLosses': { const l = st.last(n); return l.n - l.wins }
     case 'lastN': return st.last(n).n
-    default: throw new MslRuntimeError(`unknown risk method "risk.${name}(...)" - use ok/trades/todayPnl/drawdown/losses/wins/sinceMin/last(n)/lastLosses(n)/lastN(n)`)
+    case 'tradesWeek': return st.tradesWeek
+    case 'drawdownAll': return st.drawdownAll
+    case 'pnlAll': return st.pnlAll
+    case 'lossDays': return st.lossDays
+    default: throw new MslRuntimeError(`unknown risk method "risk.${name}(...)" - use ok/trades/tradesWeek/todayPnl/pnlAll/drawdown/drawdownAll/lossDays/losses/wins/sinceMin/last(n)/lastLosses(n)/lastN(n)`)
   }
 }
 /** `session.*` - clock-only market sessions in fixed UTC (analytics/mslrisk.ts); replays in a candle backtest on the bar's own time. */
@@ -3007,7 +3014,11 @@ function sessionMethod(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
       if (typeof args[0] !== 'string' || typeof args[1] !== 'string') throw new MslRuntimeError('session.inWindow("HH:MM", "HH:MM") needs two quoted UTC times')
       try { return inWindow(now, args[0], args[1]) } catch (e) { throw new MslRuntimeError(e instanceof Error ? e.message : String(e)) }
     }
-    default: throw new MslRuntimeError(`unknown session method "session.${name}(...)" - use name/asia/london/ny/overlap/dead/weekend/minsIn(s)/minsLeft(s)/inWindow(from,to)`)
+    case 'inDates': {
+      if (typeof args[0] !== 'string' || typeof args[1] !== 'string') throw new MslRuntimeError('session.inDates("YYYY-MM-DD[ HH:MM]", "YYYY-MM-DD[ HH:MM]") needs two quoted UTC date(-time)s')
+      try { return inDates(now, args[0], args[1]) } catch (e) { throw new MslRuntimeError(e instanceof Error ? e.message : String(e)) }
+    }
+    default: throw new MslRuntimeError(`unknown session method "session.${name}(...)" - use name/asia/london/ny/overlap/dead/weekend/minsIn(s)/minsLeft(s)/inWindow(from,to)/inDates(from,to)`)
   }
 }
 
@@ -4880,6 +4891,7 @@ function requireSeries(ctx: EvalEnv, tf?: string): MslSeriesCtx {
   return s
 }
 
+const luxCache = new WeakMap<MslSeriesCtx, Map<string, ReturnType<typeof luxSmc>>>()
 function indicatorCall(name: string, args: MslValue[], s: MslSeriesCtx): MslValue {
   const n = (i: number, fallback: number): number => (args[i] !== undefined ? asNum(args[i]) : fallback)
   const { open, high, low, close, volume } = s
@@ -4898,6 +4910,44 @@ function indicatorCall(name: string, args: MslValue[], s: MslSeriesCtx): MslValu
       return seriesValue(kamaInd(close, n(0, 10)))
     case 'vwma':
       return seriesValue(vwmaInd(close, volume, n(0, 20)))
+    case 'dema':
+      return seriesValue(dema(close, n(0, 21)))
+    case 't3':
+      return seriesValue(t3(close, n(0, 21), n(1, 0.7)))
+    case 'hema':
+      return seriesValue(hema(open, high, low, close, n(0, 21)))
+    case 'vwap':
+      if (!s.time) throw new MslRuntimeError('ind.vwap() needs bar times, which this evaluation context does not provide')
+      return seriesValue(vwapDaily(high, low, close, volume, s.time))
+    case 'hull': {
+      // ind.hull(mode="hma", len=55, src="close") - Hull Suite: mode "hma" | "ehma" | "thma"; src hl2/hlc3/ohlc4/close/open/high/low. Compare h[-1] with h[-3] (the script's HULL[0] vs HULL[2]).
+      if (args[0] !== undefined && typeof args[0] !== 'string') throw new MslRuntimeError('ind.hull("hma"|"ehma"|"thma", length, "close") needs the variation as a quoted string')
+      if (args[2] !== undefined && typeof args[2] !== 'string') throw new MslRuntimeError('ind.hull(): the third argument is the source, a quoted string like "close" or "hl2"')
+      try { return seriesValue(hullSeries(String(args[0] ?? 'hma'), pmaxSource(String(args[2] ?? 'close'), s), n(1, 55))) } catch (e) { throw new MslRuntimeError(e instanceof Error ? e.message : String(e)) }
+    }
+    case 'lux': {
+      // ind.lux(swingLen=50, internalLen=5, eqLen=3, eqThr=0.1, obRange=0, obClose=0, confluence=0, fvgAuto=1) -> LuxAlgo Smart Money Concepts as per-bar series (analytics/luxsmc.ts)
+      const key = [n(0, 50), n(1, 5), n(2, 3), n(3, 0.1), n(4, 0), n(5, 0), n(6, 0), n(7, 1)].join(',')
+      let m = luxCache.get(s); if (!m) luxCache.set(s, (m = new Map()))
+      let r = m.get(key)
+      if (!r) { r = luxSmc(s, { swingLen: n(0, 50), internalLen: n(1, 5), eqLen: n(2, 3), eqThr: n(3, 0.1), obRange: n(4, 0) !== 0, obClose: n(5, 0) !== 0, confluence: n(6, 0) !== 0, fvgAuto: n(7, 1) !== 0 }); m.set(key, r) }
+      const fields: Record<string, MslValue> = {}
+      for (const f of LUX_FIELDS) fields[f] = seriesValue(r[f])
+      return bundleValue(fields)
+    }
+    case 'pmax': {
+      // ind.pmax(maType="ema", maLen=10, atrLen=10, mult=3, src="hl2", wilderAtr=1) -> {line, ma, dir, atr, trend, tsl}   (KivancOzbilgic's PMax)
+      const sa = (i: number, d: string): string => { const v = args[i]; if (v === undefined) return d; if (typeof v !== 'string') throw new MslRuntimeError(`ind.pmax(): argument ${i + 1} must be a quoted string`); return v }
+      try {
+        const r = pmax(s, { ma: sa(0, 'ema'), maLen: n(1, 10), atrLen: n(2, 10), mult: n(3, 3), src: sa(4, 'hl2'), wilderAtr: n(5, 1) !== 0 })
+        return bundleValue({ line: seriesValue(r.line), ma: seriesValue(r.ma), dir: seriesValue(r.dir), atr: seriesValue(r.atr), trend: seriesValue(r.trend), tsl: seriesValue(r.tsl) })
+      } catch (e) { throw new MslRuntimeError(e instanceof Error ? e.message : String(e)) }
+    }
+    case 'ma': {
+      // ind.ma("ema"|"hema"|"sma"|"hma"|"wma"|"dema"|"vwma"|"vwap"|"t3"|"kama", length [, t3 volume factor]) - one selector for every moving-average type
+      if (typeof args[0] !== 'string') throw new MslRuntimeError('ind.ma("type", length) needs the type as a quoted string, e.g. ind.ma("hema", 21)')
+      try { return seriesValue(args[0].toLowerCase() === 'kama' ? kamaInd(close, n(1, 10)) : maSeries(args[0], s, n(1, 21), n(2, 0.7))) } catch (e) { throw new MslRuntimeError(e instanceof Error ? e.message : String(e)) }
+    }
     case 'atr':
       return seriesValue(atrInd(high, low, close, n(0, 14)))
     case 'roc':
@@ -4938,7 +4988,7 @@ function indicatorCall(name: string, args: MslValue[], s: MslSeriesCtx): MslValu
       return bundleValue({ line: seriesValue(r.line), dir: seriesValue(r.dir) })
     }
     default:
-      throw new MslRuntimeError(`unknown indicator "ind.${name}(...)" - rsi/ema/sma/wma/hma/kama/vwma/atr/roc/momentum/zscore/obv/cmf/forceindex/psar/macd/bb/stoch/adx/supertrend`)
+      throw new MslRuntimeError(`unknown indicator "ind.${name}(...)" - rsi/ema/sma/wma/hma/dema/t3/hema/vwap/ma(type,len)/pmax/lux/hull/kama/vwma/atr/roc/momentum/zscore/obv/cmf/forceindex/psar/macd/bb/stoch/adx/supertrend`)
   }
 }
 
@@ -4983,7 +5033,8 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         // instead of this pair's native one - e.g. ind.rsi(14, "5m") while
         // trading the 1m. Every ind.* param is otherwise numeric, so a
         // trailing string argument is unambiguous.
-        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        // ind.ma("type", len[, v][, "tf"]): the FIRST string is the MA type, so only a string in position 3+ is a timeframe
+        const tf = args.length && typeof args[args.length - 1] === 'string' && (e.name === 'pmax' || e.name === 'lux' || e.name === 'hull' ? /^\d+[smhd]$/.test(String(args[args.length - 1])) : e.name !== 'ma' || args.length >= 3) ? (args.pop() as string) : undefined
         return indicatorCall(e.name, args, requireSeries(ctx, tf))
       }
       // `tick.delta(5)` etc - same namespace-marker special case as "ind",

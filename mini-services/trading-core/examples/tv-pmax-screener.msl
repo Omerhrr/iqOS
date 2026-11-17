@@ -1,0 +1,16 @@
+# The SCREENER half of "PMax Explorer": which assets just reversed / are in a trend. The original hard-coded 20 symbols and drew a text label.
+# Here you run ONE script across ALL assets with the scan-all button (Meta Strategy panel) or /msl_scan - each script below is one list.
+#
+# 1) POTENTIAL REVERSAL (the trend flipped on the bar that just closed)  - the original's "Potential Reversal"
+#    call = flipped up, put = flipped down
+let pm = ind.pmax("ema", 10, 10, 3, "hl2", 1)
+call when pm.trend[-1] == 1 and pm.trend[-2] == -1
+put  when pm.trend[-1] == -1 and pm.trend[-2] == 1
+#
+# 2) CONFIRMED REVERSAL (it flipped one bar ago and has held)            - replace the two lines above with:
+#    call when pm.trend[-2] == 1 and pm.trend[-3] == -1 and pm.trend[-1] == 1
+#    put  when pm.trend[-2] == -1 and pm.trend[-3] == 1 and pm.trend[-1] == -1
+#
+# 3) UPTREND / DOWNTREND LISTS (every asset currently in that trend)     - replace with:
+#    call when pm.trend[-1] == 1
+#    put  when pm.trend[-1] == -1
