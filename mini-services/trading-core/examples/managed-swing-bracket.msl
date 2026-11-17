@@ -1,0 +1,7 @@
+# Managed trade (backtest with /msl_managed): buy the bounce when a pullback has given back 50-100% of the last up-leg (a pullback that has not broken its start), stop under the swing low, target 2R, trail, take half at +1R
+let atr = ind.atr(14)[-1]
+call when sw.pivotType(1) == 1 and sw.retr() >= 0.5 and sw.retr() <= 1.0 and px.close[-1] > px.open[-1]
+pos.stop = sw.low(1) - 0.3 * atr
+pos.target = pos.entry + 2 * (pos.entry - (sw.low(1) - 0.3 * atr))
+pos.trail = 1.5 * atr
+exit 0.5 when pos.pnl >= pos.risk and pos.left == 1

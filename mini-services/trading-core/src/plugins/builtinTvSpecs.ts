@@ -1,0 +1,213 @@
+// Builtin meta-strategy specs ported from TradingView scripts (Daveatt BEST template + Bj Bot, KivancOzbilgic PMax Explorer, LuxAlgo Smart Money Concepts, Hull Suite) and the swing-engine strategies (Elliott, S/R, retracement, trendline).
+// Generated from mini-services/trading-core/examples/*.msl - the examples stay the readable source; seedBuiltinExamples() in metastrategy.ts saves these on start (idempotent).
+export const BUILTIN_TV_SPECS: { id: string; name: string; script: string }[] = [
+  {
+    id: 'meta:builtin-tv-ma-cross-bot',
+    name: 'Builtin TV: MA cross bot (Bj Bot / Daveatt)',
+    script: `
+# MSL version of TradingView "Bj Bot" (3Commas) - moving-average cross entry.
+# Stops/targets/trailing/flip/3Commas JSON do not apply to a binary option: the expiry settles the trade. What carries over is the ENTRY and the FILTERS.
+# MA types (TradingView getMA): "ema" "hema" "sma" "hma" "wma" "dema" "vwma" "vwap" "t3" (plus "kama")
+let fast = ind.ma("ema", 21)
+let slow = ind.ma("ema", 50)
+
+let crossUp = fast.crossed("up", slow)
+let crossDn = fast.crossed("down", slow)
+let haveAtr = ind.atr(14)[-1] > 0
+
+# Filters (switch a line off by deleting it from the \`and\` chain)
+let timeOk = not session.inWindow("00:00", "03:00")      # useTimeFilter: ignore 00:00-03:00 UTC
+let dateOk = session.inDates("2026-01-01", "2026-12-30")  # start / end filter (UTC)
+
+call when crossUp and haveAtr and timeOk and dateOk      # longTrades
+put  when crossDn and haveAtr and timeOk and dateOk      # shortTrades
+expiry = 3
+`,
+  },
+  {
+    id: 'meta:builtin-tv-strategy-template',
+    name: 'Builtin TV: BEST strategy template (Daveatt)',
+    script: `
+# MSL version of TradingView "BEST Strategy Template" (Daveatt): ANY signal + the whole risk-management shell around it.
+# In the original the signal came from another indicator (+1 bull / -1 bear). Here it is any MSL condition - replace the two \`let\` lines.
+# Not applicable to binary options (the expiry settles every trade): stop loss, take profit, trailing stop, close-on-opposite, pyramiding, custom close.
+# risk.* reads your own results: live = Meta Trader trades since the kernel started; test it with the replay tester (/msl_replay) - the plain candle backtester has no trade clock.
+
+# ---- 1. THE SIGNAL (replace with yours) ----
+let bull = ind.ma("ema", 9).crossed("up", ind.ma("ema", 21))
+let bear = ind.ma("ema", 9).crossed("down", ind.ma("ema", 21))
+
+# ---- 2. THE SHELL ----
+let inSession   = session.inWindow("07:00", "21:00")             # Trading Session (UTC)
+let inDates     = session.inDates("2026-01-01", "2026-12-30")    # Date Range Filtering
+let lossStreak  = risk.losses() < 15                              # Max consecutive losing trades
+let winStreak   = risk.wins() < 15                                # Max consecutive winning trades
+let lossDays    = risk.lossDays() < 3                             # Max consecutive days with a loss
+let drawdown    = risk.drawdownAll() < 10                         # Max total drawdown (in stakes: 1 stake = 1 trade's amount)
+let dayLoss     = risk.todayPnl() > -3                            # Max intraday loss (stakes)
+let dayTrades   = risk.trades() < 10                              # Max trades per day
+let weekTrades  = risk.tradesWeek() < 50                          # Max trades per week
+let allowed = inSession and inDates and lossStreak and winStreak and lossDays and drawdown and dayLoss and dayTrades and weekTrades
+
+call when bull and allowed    # OpenDirection ALL / LONG
+put  when bear and allowed    # OpenDirection ALL / SHORT
+expiry = 3
+`,
+  },
+  {
+    id: 'meta:builtin-tv-pmax-explorer',
+    name: 'Builtin TV: PMax Explorer (KivancOzbilgic)',
+    script: `
+# MSL version of TradingView "PMax Explorer" (Kivanc Ozbilgic) - the STRATEGY half.
+# PMax = a SuperTrend-style trailing line built on a MOVING AVERAGE (not on price) with ATR-distance bands.
+# ind.pmax(maType, maLen, atrLen, mult, src, wilderAtr):
+#   maType  "sma" "ema" "wma" "tma" "var" "wwma" "zlema" "tsf"   (the original's dropdown)
+#   src     "hl2" (original default) "hlc3" "ohlc4" "close" "open" "high" "low"
+#   wilderAtr 1 = atr() [original default "Change ATR calculation method" on], 0 = sma(tr)
+# Fields: .line (PMax) .ma (the moving average) .dir (+1 up / -1 down) .atr ; .trend/.tsl = the screener's own recursion
+let pm = ind.pmax("ema", 10, 10, 3, "hl2", 1)
+
+# the original's entries: MA crossing PMax (strategy.entry long / short). A binary option settles at expiry, so "reverse the position" becomes "take the next signal".
+let buyK  = pm.ma.crossed("up", pm.line)
+let sellK = pm.ma.crossed("down", pm.line)
+
+# optional: the original also offers PRICE crossing PMax instead of the MA. Close-vs-line version:
+#   let buyP  = ohlc(-1).c > pm.line[-1] and ohlc(-2).c <= pm.line[-2]
+#   let sellP = ohlc(-1).c < pm.line[-1] and ohlc(-2).c >= pm.line[-2]
+let dateOk = session.inDates("2026-01-01", "2026-12-30")   # the original's From/To day-month-year filter (UTC)
+
+call when buyK and dateOk
+put  when sellK and dateOk
+expiry = 3
+`,
+  },
+  {
+    id: 'meta:builtin-tv-pmax-screener',
+    name: 'Builtin TV: PMax screener',
+    script: `
+# The SCREENER half of "PMax Explorer": which assets just reversed / are in a trend. The original hard-coded 20 symbols and drew a text label.
+# Here you run ONE script across ALL assets with the scan-all button (Meta Strategy panel) or /msl_scan - each script below is one list.
+#
+# 1) POTENTIAL REVERSAL (the trend flipped on the bar that just closed)  - the original's "Potential Reversal"
+#    call = flipped up, put = flipped down
+let pm = ind.pmax("ema", 10, 10, 3, "hl2", 1)
+call when pm.trend[-1] == 1 and pm.trend[-2] == -1
+put  when pm.trend[-1] == -1 and pm.trend[-2] == 1
+#
+# 2) CONFIRMED REVERSAL (it flipped one bar ago and has held)            - replace the two lines above with:
+#    call when pm.trend[-2] == 1 and pm.trend[-3] == -1 and pm.trend[-1] == 1
+#    put  when pm.trend[-2] == -1 and pm.trend[-3] == 1 and pm.trend[-1] == -1
+#
+# 3) UPTREND / DOWNTREND LISTS (every asset currently in that trend)     - replace with:
+#    call when pm.trend[-1] == 1
+#    put  when pm.trend[-1] == -1
+`,
+  },
+  {
+    id: 'meta:builtin-tv-luxalgo-smc',
+    name: 'Builtin TV: LuxAlgo Smart Money Concepts',
+    script: `
+# MSL version of TradingView "Smart Money Concepts [LuxAlgo]" - an INDICATOR (it draws structure, it has no entries of its own), so here it is as ind.lux(...)
+# plus three ready strategies built from its alert conditions. Fields are per-bar series: lx.field[-1] = latest closed bar. Event fields are 1 on the bar they fire.
+# ind.lux(swingLen=50, internalLen=5, eqLen=3, eqThr=0.1, obRange=0, obClose=0, confluence=0, fvgAuto=1)   (= the TradingView inputs, same defaults)
+#   obRange 0 = ATR volatility filter, 1 = cumulative mean range;  obClose 0 = mitigate order blocks by high/low, 1 = by close;  confluence 1 = internal-structure confluence filter
+# Needs ~200+ bars (the script's ATR200). On a 1m chart a swing length of 50 is slow - try ind.lux(20, 5) as well and sweep it.
+let lx = ind.lux()
+
+# --- STRATEGY 1: pullback continuation --------------------------------------------------------------------------------------------------------
+# the SWING trend is up, price pulled back into the discount half of the trailing range, and the INTERNAL structure just turned bullish again (internal CHoCH)
+# (a swing CHoCH itself fires when price breaks out, i.e. near the TOP of the range, so "swing CHoCH + discount" can never happen - that is why this uses the internal one)
+let longPb  = lx.swingTrend[-1] == 1  and lx.pos[-1] < 0.5 and lx.internalBullChoch[-1] == 1
+let shortPb = lx.swingTrend[-1] == -1 and lx.pos[-1] > 0.5 and lx.internalBearChoch[-1] == 1
+call when longPb
+put  when shortPb
+
+# --- STRATEGY 2: order-block retest (swap in for the two lines above) ---------------------------------------------------------------------------
+#   price closes back inside a fresh bullish swing order block while the swing trend is still up (and the reverse for bearish)
+#   call when lx.swingObBullIn[-1] == 1 and lx.swingTrend[-1] == 1 and lx.swingObBullBreak[-1] == 0
+#   put  when lx.swingObBearIn[-1] == 1 and lx.swingTrend[-1] == -1 and lx.swingObBearBreak[-1] == 0
+
+# --- STRATEGY 3: equal-highs / equal-lows liquidity grab fade -----------------------------------------------------------------------------------
+#   equal highs were just detected (a pool of stops above): fade a close back below them. EQH level = lx.eqhLevel
+#   put  when lx.eqh[-1] == 1 and lx.swingTrend[-1] == -1
+#   call when lx.eql[-1] == 1 and lx.swingTrend[-1] == 1
+
+# --- other alerts available: internal structure (internalBullBos ...), fair value gaps (fvgBull / fvgBullIn ...), order-block breaks (swingObBullBreak ...),
+#     strong/weak high-low (lx.strongHigh[-1] is a price or NaN), previous day/week/month levels (lx.pdh[-1], lx.pwl[-1] ...)
+expiry = 3
+`,
+  },
+  {
+    id: 'meta:builtin-tv-hull-suite',
+    name: 'Builtin TV: Hull Suite strategy',
+    script: `
+# MSL version of TradingView "Hull Suite Strategy" (InSilico indicator, DashTrader strategy).
+# The Hull moving average, three variations: "hma" (WMA based), "ehma" (EMA based), "thma" (triple, evaluated at len/2 exactly like the script's Mode() switch).
+# ind.hull(mode, len, src):  src = "close" "hl2" "hlc3" "ohlc4" "open" "high" "low".   The script's HULL[0] is h[-1] here and HULL[2] is h[-3] (series index -1 = latest closed bar).
+# Original rule: long while HULL[0] > HULL[2], short while HULL[0] < HULL[2]. A binary option settles at expiry, so the trade fires on the FLIP (the bar the Hull turns), not every bar.
+let h = ind.hull("hma", 55, "close")      # 55 = swing entries, 180-200 = floating support/resistance (the original's note)
+
+let turnUp   = h[-1] > h[-3] and h[-2] <= h[-4]
+let turnDown = h[-1] < h[-3] and h[-2] >= h[-4]
+let dateOk   = session.inDates("2026-01-01", "2030-12-30")    # the original's backtest start/stop dates (UTC)
+
+# "Strategy Direction": keep both lines for "all", or delete one for "long" / "short"
+call when turnUp and dateOk
+put  when turnDown and dateOk
+expiry = 3
+`,
+  },
+  {
+    id: 'meta:builtin-ew-wave3',
+    name: 'Builtin: Elliott wave-3 entry',
+    script: `
+# Elliott: wave 2 just completed (point 2 confirmed, wave 3 under way). Take the wave-3 entry if wave 2 retraced 50-78.6% of wave 1
+let ok = ew2.ok() and ew2.wave() == 3 and ew2.ratio(2) >= 0.5 and ew2.ratio(2) <= 0.786
+call when ok and ew2.dir() == 1 and px.close[-1] > px.high[-2]
+put when ok and ew2.dir() == -1 and px.close[-1] < px.low[-2]
+expiry = 5
+`,
+  },
+  {
+    id: 'meta:builtin-ew-abc-reversal',
+    name: 'Builtin: Elliott wave-5 end / ABC fade',
+    script: `
+# Elliott: a finished 5-wave rise (wave 5 confirmed, correction just starting) -> fade the top; mirrored for a falling impulse
+put when ew2.ok() and ew2.dir() == -1 and ew2.wave() == 6 and ew2.rule(3) and px.close[-1] < px.low[-2]
+call when ew2.ok() and ew2.dir() == 1 and ew2.wave() == 6 and ew2.rule(3) and px.close[-1] > px.high[-2]
+expiry = 5
+`,
+  },
+  {
+    id: 'meta:builtin-sr-swing-bounce',
+    name: 'Builtin: S/R swing bounce',
+    script: `
+# S&R from swing pivots: bounce off the latest swing low / rejection at the latest swing high (within 0.5 ATR)
+call when near(px.low[-1], sw.low(1), 0.5) and px.close[-1] > px.open[-1]
+put when near(px.high[-1], sw.high(1), 0.5) and px.close[-1] < px.open[-1]
+expiry = 3
+`,
+  },
+  {
+    id: 'meta:builtin-fib-retracement',
+    name: 'Builtin: Fibonacci pullback continuation',
+    script: `
+# Retracement: trade the trend continuation when the pullback reaches the 0.5-0.618 zone of the last leg
+let up = sw.dir() == -1 and sw.leg(1) > 0
+let z = sw.retr()
+call when sw.pivotType(1) == 1 and sw.leg(1) > 3 and z >= 0.5 and z <= 0.618 and px.close[-1] > px.close[-2]
+put when sw.pivotType(1) == -1 and sw.leg(1) < -3 and z >= 0.5 and z <= 0.618 and px.close[-1] < px.close[-2]
+expiry = 5
+`,
+  },
+  {
+    id: 'meta:builtin-trendline-touch',
+    name: 'Builtin: Trendline touch',
+    script: `
+# Trendline from the last two swing lows (barsAgo from sw.lowAge): buy a touch from above
+let tl = lineAt(sw.low(2), sw.lowAge(2), sw.low(1), sw.lowAge(1), 0)
+call when near(px.low[-1], tl, 0.4) and px.close[-1] > tl and sw.low(1) > sw.low(2)
+expiry = 3
+`,
+  },
+]

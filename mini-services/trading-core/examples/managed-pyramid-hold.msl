@@ -1,0 +1,9 @@
+# Scale in up to 3 positions while the trend holds; each has its own stop. "hold until": leave everything when the trend flips
+var peak = 0
+peak = max(peak, px.high[-1])
+let fast = ind.ema(8)[-1]
+let slow = ind.ema(21)[-1]
+pos.max = 3
+call when fast > slow and px.close[-1] > px.close[-2] and px.close[-2] > px.close[-3]
+pos.stop = pos.entry - 2 * ind.atr(14)[-1]
+hold until fast < slow

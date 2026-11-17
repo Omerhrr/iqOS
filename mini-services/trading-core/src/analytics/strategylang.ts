@@ -374,16 +374,28 @@ function isBundleValue(v: unknown): v is MslBundleValue {
   return typeof v === 'object' && v !== null && (v as MslBundleValue).__mslBundle === true
 }
 
+/** MSL: a script-built array (`[1, 2, 3]`, `array()`), 0-based, negative index counts from the end. Plain values only (numbers/booleans/text/arrays). */
+export interface MslArrayValue {
+  readonly __mslArray: true
+  items: MslValue[]
+}
+function arrayValue(items: MslValue[]): MslArrayValue {
+  return { __mslArray: true, items }
+}
+function isArrayValue(v: unknown): v is MslArrayValue {
+  return typeof v === 'object' && v !== null && (v as MslArrayValue).__mslArray === true
+}
+
 /** Any non-plain MSL value - a source/signal read, a series, a bar, or a
  * bundle. None of these can be used directly as a number/boolean (compare,
  * add, "and"/"or") - a script must narrow to a plain value first, via
  * `.field` (read/bar/bundle) or `[n]`/`.method()` (series). Centralizes the
  * guard truthy()/asNum() both already had for reads alone. */
-function isComposite(v: unknown): v is MslReadValue | MslSeriesValue | MslBarValue | MslBundleValue {
-  return isReadValue(v) || isSeriesValue(v) || isBarValue(v) || isBundleValue(v)
+function isComposite(v: unknown): v is MslReadValue | MslSeriesValue | MslBarValue | MslBundleValue | MslArrayValue {
+  return isReadValue(v) || isSeriesValue(v) || isBarValue(v) || isBundleValue(v) || isArrayValue(v)
 }
 
-export type MslValue = number | boolean | string | MslReadValue | MslSeriesValue | MslBarValue | MslBundleValue
+export type MslValue = number | boolean | string | MslReadValue | MslSeriesValue | MslBarValue | MslBundleValue | MslArrayValue
 
 /** The raw per-bar history a script's `ind.*`/`bar(-n)` primitives read
  * from - chronological ascending, index n-1 = the latest CLOSED bar, same
@@ -490,6 +502,19 @@ export interface EvalEnv {
    * namespace method below falls back to its engine's own hardcoded
    * default, exactly the pre-fix behavior - this is purely additive. */
   configs?: Record<string, number | boolean | string>
+  /** user fn definitions + the interpreter's budgets / scopes (see execBlock) */
+  fns?: Record<string, MslFn>
+  globalEnv?: Record<string, MslValue>
+  ops?: { n: number }
+  fnDepth?: number
+  arrFrame?: WeakSet<object>
+  persist?: Set<string>
+  varRec?: { committed: Map<string, PV>; pending: Map<string, PV> }
+  draws?: MslDraw[]
+  drawKeys?: Set<string>
+  positions?: MslPosView[]
+  posUpdates?: Map<number, Record<string, number>>
+  exits?: { id: number; frac: number }[]
 }
 
 /** Shared config-override readers for the namespace methods below - same
@@ -556,7 +581,29 @@ const mslStateStore = new MslStateStore()
  * `stateKeyPrefix` (e.g. a meta-strategy spec id) - call this whenever the
  * script that prefix belongs to changes, so edited logic never resumes
  * counting from a previous version's state. */
+type PV = number | boolean | string | PV[]
+class MslVarStore {
+  private recs = new Map<string, { bar: number; committed: Map<string, PV>; pending: Map<string, PV> }>()
+  /** state as of the START of this bar: the previous bar's last evaluation commits when a NEW bar time shows up, so a repeated evaluation of the same bar (live polling) never double-advances a variable */
+  begin(prefix: string, bar: number): { committed: Map<string, PV>; pending: Map<string, PV> } {
+    let r = this.recs.get(prefix)
+    if (!r) this.recs.set(prefix, (r = { bar, committed: new Map(), pending: new Map() }))
+    else if (r.bar !== bar) { r.committed = new Map(r.pending); r.bar = bar }
+    return r
+  }
+  clearPrefix(prefix: string): void { this.recs.delete(prefix) }
+}
+const mslVarStore = new MslVarStore()
+const clonePV = (v: PV): PV => (Array.isArray(v) ? v.map(clonePV) : v)
+function toPV(v: MslValue, name: string): PV {
+  if (isArrayValue(v)) return v.items.map((x) => toPV(x, name))
+  if (isComposite(v)) throw new MslRuntimeError(`variable "${name}": persistent variables hold numbers, booleans, text or arrays of them - not ${compositeKind(v)}`)
+  return v as number | boolean | string
+}
+const fromPV = (v: PV): MslValue => (Array.isArray(v) ? arrayValue(v.map(fromPV)) : v)
+
 export function clearMslState(stateKeyPrefix: string): void {
+  mslVarStore.clearPrefix(stateKeyPrefix)
   mslStateStore.clearPrefix(stateKeyPrefix)
   clearHolds(stateKeyPrefix)
   clearBypass(stateKeyPrefix)
@@ -601,13 +648,26 @@ export interface MslEvalResult {
    * a script's behavior is inspectable, not a black box. */
   trace: string[]
   error?: string
+  /** `draw.*` output of this evaluation (chart overlays), deduplicated */
+  draws?: MslDraw[]
+  /** managed-trade directives evaluated at entry when a side fired (`pos.stop = ...` etc.) */
+  entry?: { stop?: number; target?: number; trail?: number; breakeven?: number; size?: number; max?: number }
+  /** per-open-position level updates (`pos.stop = ...` re-evaluated on each later bar) and exit orders (`exit when ...`) */
+  posUpdates?: { id: number; stop?: number; target?: number; trail?: number; breakeven?: number; size?: number }[]
+  exits?: { id: number; frac: number }[]
 }
+
+/** One open managed position as a script sees it through `pos.*` (see backtestMslManaged). */
+export interface MslPosView { id: number; dir: 1 | -1; entry: number; bars: number; best: number; worst: number; left: number; stop: number; target: number; trail: number; size: number; initStop: number; breakeven?: number }
+
+export type MslDrawKind = 'line' | 'hline' | 'zone' | 'label' | 'marker'
+export interface MslDraw { kind: MslDrawKind; p1?: number; t1?: number; b1?: number; p2?: number; t2?: number; b2?: number; top?: number; bottom?: number; text?: string; color?: string; style?: string }
 
 // ---------- tokenizer ----------
 
 type TokKind =
   | 'num' | 'str' | 'ident' | 'dot' | 'comma' | 'lparen' | 'rparen' | 'lbracket' | 'rbracket' | 'eq_assign'
-  | 'eqeq' | 'neq' | 'gte' | 'lte' | 'gt' | 'lt' | 'plus' | 'minus' | 'star' | 'slash'
+  | 'percent' | 'opassign' | 'eqeq' | 'neq' | 'gte' | 'lte' | 'gt' | 'lt' | 'plus' | 'minus' | 'star' | 'slash'
   | 'and' | 'or' | 'not' | 'let' | 'call_kw' | 'put_kw' | 'when' | 'confidence_kw'
   | 'expiry_kw' | 'configure_kw' | 'eof'
 
@@ -763,6 +823,16 @@ function tokenize(src: string): Token[] {
         i++
         continue
       }
+      if ((c === '+' || c === '-' || c === '*' || c === '/' || c === '%') && line[i + 1] === '=' && line[i + 2] !== '=') {
+        toks.push({ kind: 'opassign', value: c, line: li + 1 })
+        i += 2
+        continue
+      }
+      if (c === '%') {
+        toks.push({ kind: 'percent', value: '%', line: li + 1 })
+        i++
+        continue
+      }
       if (c === '+') {
         toks.push({ kind: 'plus', value: '+', line: li + 1 })
         i++
@@ -801,7 +871,8 @@ type Expr =
   | { t: 'ident'; name: string }
   | { t: 'field'; obj: Expr; field: string }
   | { t: 'unary'; op: 'not' | 'neg'; e: Expr }
-  | { t: 'bin'; op: 'and' | 'or' | '==' | '!=' | '>=' | '<=' | '>' | '<' | '+' | '-' | '*' | '/'; l: Expr; r: Expr }
+  | { t: 'bin'; op: 'and' | 'or' | '==' | '!=' | '>=' | '<=' | '>' | '<' | '+' | '-' | '*' | '/' | '%'; l: Expr; r: Expr }
+  | { t: 'array'; items: Expr[] }
   /** `seq` is only set for a `since(...)`/`streak(...)` call - its stable,
    * parse-order call-site index within THIS script (Parser.stateSeq below),
    * used to scope that call's MslStateStore memory from every other
@@ -828,6 +899,21 @@ type Stmt =
   | { kind: 'configure'; path: string; expr: Expr }
   /** `if <cond> ... elseif <cond> ... else ... end` - the first branch whose condition is true runs; `else` runs when none did */
   | { kind: 'if'; branches: { cond: Expr; body: Stmt[]; line: number }[]; elseBody?: Stmt[] }
+  /** `var x = init` - a PERSISTENT variable: init runs once, the value is carried bar to bar (see MslVarStore) */
+  | { kind: 'var'; name: string; expr: Expr }
+  | { kind: 'assign'; name: string; expr: Expr }
+  | { kind: 'setidx'; name: string; idx: Expr; expr: Expr }
+  | { kind: 'for'; name: string; from: Expr; to: Expr; step?: Expr; body: Stmt[]; line: number }
+  | { kind: 'while'; cond: Expr; body: Stmt[]; line: number }
+  | { kind: 'break' }
+  | { kind: 'continue' }
+  | { kind: 'return'; expr?: Expr }
+  /** a bare call used for its effect: `arr.push(x)`, `draw.line(...)`, `myFn(x)` */
+  | { kind: 'expr'; expr: Expr }
+  /** `pos.stop = <price>` / `pos.target` / `pos.trail` (distance) / `pos.breakeven` (distance) / `pos.size` / `pos.max` (concurrent positions) - managed-trade directives */
+  | { kind: 'posset'; key: string; expr: Expr }
+  /** `exit when <cond>` / `exit 0.5 when <cond>` / `hold until <cond>` - evaluated for every open position each bar, `pos.*` readable */
+  | { kind: 'exit'; cond: Expr; frac?: Expr }
 
 export type MslStmt = Stmt
 
@@ -841,14 +927,18 @@ export function flattenStmts(stmts: Stmt[]): Stmt[] {
         for (const b of s.branches) walk(b.body)
         if (s.elseBody) walk(s.elseBody)
       }
+      if (s.kind === 'for' || s.kind === 'while') walk(s.body)
     }
   }
   walk(stmts)
   return out
 }
 
+export interface MslFn { name: string; params: string[]; body: Stmt[]; line: number }
 export interface MslAst {
   stmts: Stmt[]
+  /** user-defined `fn name(a, b) ... return x end` definitions (hoisted: callable from anywhere, including before the definition) */
+  fns?: Record<string, MslFn>
 }
 
 // Read fields (unchanged) PLUS bar fields (MslBarValue) PLUS the named
@@ -862,7 +952,7 @@ const FIELDS = new Set([
   // bar (MslBarValue)
   'o', 'open', 'h', 'high', 'l', 'low', 'c', 'close', 'v', 'volume', 'body', 'range', 'upper_wick', 'lower_wick',
   // bundle sub-fields across every ind.* multi-series indicator
-  'macd', 'signal', 'hist', 'upper', 'mid', 'lower', 'width', 'percentB', 'k', 'd', 'adx', 'plusDI', 'minusDI', 'line', 'ma', 'trend', 'tsl', 'atr', 'hl2', 'hlc3', 'ohlc4', 'chg', 'tr', ...LUX_FIELDS,
+  'macd', 'signal', 'hist', 'upper', 'mid', 'lower', 'width', 'percentB', 'k', 'd', 'adx', 'plusDI', 'minusDI', 'line', 'ma', 'trend', 'tsl', 'atr', 'entry', 'bars', 'best', 'worst', 'left', 'stop', 'target', 'trail', 'size', 'pnl', 'pnlAtr', 'risk', 'initStop', 'hl2', 'hlc3', 'ohlc4', 'chg', 'tr', ...LUX_FIELDS,
   // bundle sub-fields on pf.column(offset) - top/bottom price boundary,
   // unsigned box count (signed direction is already pf.boxes(n)'s own job,
   // not duplicated here)
@@ -893,7 +983,13 @@ class Parser {
    * call sites in the same left-to-right order), which is exactly the
    * stability MslStateStore's keys need. */
   private stateSeq = 0
+  private loopDepth = 0
+  private inFn = false
+  private fns: Record<string, MslFn> = {}
   constructor(private toks: Token[]) {}
+  private look(n: number): Token | undefined {
+    return this.toks[this.pos + n]
+  }
 
   private peek(): Token {
     return this.toks[this.pos]
@@ -924,11 +1020,15 @@ class Parser {
         continue
       }
       if (this.isBlockWord(['elseif', 'else', 'end'])) throw new MslSyntaxError(`line ${this.peek().line}: "${this.peek().value}" without a matching "if"`)
+      if (this.isBlockWord(['fn'])) {
+        this.parseFn()
+        continue
+      }
       stmts.push(this.parseStatement(0))
       // a statement must end at a line-break ('eof' token) or real eof
       if (this.peek().kind !== 'eof') throw new MslSyntaxError(`line ${this.peek().line}: unexpected "${this.peek().value}" after statement`)
     }
-    return { stmts }
+    return { stmts, ...(Object.keys(this.fns).length ? { fns: this.fns } : {}) }
   }
 
   /** the next token is a bare word (identifier) spelling one of these - block keywords are only special at the START of a statement */
@@ -938,11 +1038,12 @@ class Parser {
   }
 
   /** statements up to (not including) one of the stop words; line breaks between them are skipped */
-  private parseBlockBody(stop: string[], depth: number, openLine: number): Stmt[] {
+  private parseBlockBody(stop: string[], depth: number, openLine: number, what = 'if'): Stmt[] {
     const body: Stmt[] = []
     for (;;) {
       while (this.peek().kind === 'eof' && this.pos < this.toks.length - 1) this.pos++
-      if (this.peek().kind === 'eof') throw new MslSyntaxError(`line ${openLine}: this "if" block is never closed - add "end"`)
+      if (this.peek().kind === 'eof') throw new MslSyntaxError(`line ${openLine}: this "${what}" block is never closed - add "end"`)
+      if (this.isBlockWord(['fn'])) throw new MslSyntaxError(`line ${this.peek().line}: "fn" definitions go at the top level of the script, not inside a block`)
       if (this.isBlockWord(stop)) return body
       body.push(this.parseStatement(depth))
       if (this.peek().kind !== 'eof') throw new MslSyntaxError(`line ${this.peek().line}: unexpected "${this.peek().value}" after statement`)
@@ -990,9 +1091,139 @@ class Parser {
     return { kind: 'if', branches, ...(elseBody ? { elseBody } : {}) }
   }
 
+  /** fn name(a, b) ... end - body may use let/assignment/if/for/while/return; no signals, no persistent state */
+  private parseFn(): void {
+    const open = this.next() // 'fn'
+    const name = this.expect('ident').value
+    if (this.fns[name]) throw new MslSyntaxError(`line ${open.line}: fn "${name}" is defined twice`)
+    this.expect('lparen')
+    const params: string[] = []
+    if (this.peek().kind !== 'rparen') {
+      params.push(this.expect('ident').value)
+      while (this.peek().kind === 'comma') {
+        this.next()
+        params.push(this.expect('ident').value)
+      }
+    }
+    this.expect('rparen')
+    if (this.peek().kind !== 'eof') throw new MslSyntaxError(`line ${this.peek().line}: unexpected "${this.peek().value}" after the fn header - put the body on the following lines`)
+    const prevFn = this.inFn, prevLoop = this.loopDepth
+    this.inFn = true
+    this.loopDepth = 0
+    const body = this.parseBlockBody(['end'], 1, open.line, 'fn')
+    this.inFn = prevFn
+    this.loopDepth = prevLoop
+    this.next() // 'end'
+    this.fns[name] = { name, params, body, line: open.line }
+    if (this.peek().kind !== 'eof') throw new MslSyntaxError(`line ${this.peek().line}: unexpected "${this.peek().value}" after "end"`)
+  }
+
+  private parseLoop(depth: number): Stmt {
+    if (depth >= 8) throw new MslSyntaxError(`line ${this.peek().line}: blocks nested more than 8 deep`)
+    const open = this.next() // for / while
+    const noTrail = (what: string) => {
+      if (this.peek().kind !== 'eof') throw new MslSyntaxError(`line ${this.peek().line}: unexpected "${this.peek().value}" after the ${what} header - put the statements on the following lines`)
+    }
+    let st: Stmt
+    if (open.value === 'for') {
+      const name = this.expect('ident').value
+      this.expect('eq_assign')
+      const from = this.parseOr()
+      if (!this.isBlockWord(['to'])) throw new MslSyntaxError(`line ${open.line}: expected "to" in "for ${name} = <from> to <to> [step <n>]"`)
+      this.next()
+      const to = this.parseOr()
+      let step: Expr | undefined
+      if (this.isBlockWord(['step'])) {
+        this.next()
+        step = this.parseOr()
+      }
+      noTrail('for')
+      this.loopDepth++
+      const body = this.parseBlockBody(['end'], depth + 1, open.line, 'for')
+      this.loopDepth--
+      st = { kind: 'for', name, from, to, ...(step ? { step } : {}), body, line: open.line }
+    } else {
+      const cond = this.parseOr()
+      noTrail('while')
+      this.loopDepth++
+      const body = this.parseBlockBody(['end'], depth + 1, open.line, 'while')
+      this.loopDepth--
+      st = { kind: 'while', cond, body, line: open.line }
+    }
+    this.next() // 'end'
+    return st
+  }
+
   private parseStatement(depth = 0): Stmt {
     const t = this.peek()
     if (t.kind === 'ident' && t.value === 'if') return this.parseIf(depth)
+    if (t.kind === 'ident' && (t.value === 'for' || t.value === 'while') && this.look(1)?.kind !== 'eq_assign') return this.parseLoop(depth)
+    if (t.kind === 'ident' && t.value === 'break' && this.look(1)?.kind === 'eof') {
+      if (!this.loopDepth) throw new MslSyntaxError(`line ${t.line}: "break" only works inside a for/while loop`)
+      this.next()
+      return { kind: 'break' }
+    }
+    if (t.kind === 'ident' && t.value === 'continue' && this.look(1)?.kind === 'eof') {
+      if (!this.loopDepth) throw new MslSyntaxError(`line ${t.line}: "continue" only works inside a for/while loop`)
+      this.next()
+      return { kind: 'continue' }
+    }
+    if (t.kind === 'ident' && t.value === 'return' && this.look(1)?.kind !== 'eq_assign') {
+      if (!this.inFn) throw new MslSyntaxError(`line ${t.line}: "return" only works inside an fn`)
+      this.next()
+      return this.peek().kind === 'eof' ? { kind: 'return' } : { kind: 'return', expr: this.parseOr() }
+    }
+    if (t.kind === 'ident' && t.value === 'var' && this.look(1)?.kind === 'ident' && this.look(2)?.kind === 'eq_assign') {
+      if (this.inFn) throw new MslSyntaxError(`line ${t.line}: "var" (persistent state) is not allowed inside an fn - return a value and assign it at the top level`)
+      this.next()
+      const name = this.expect('ident').value
+      this.next()
+      return { kind: 'var', name, expr: this.parseOr() }
+    }
+    if (t.kind === 'ident' && t.value === 'pos' && this.look(1)?.kind === 'dot' && this.look(2)?.kind === 'ident' && this.look(3)?.kind === 'eq_assign') {
+      const key = this.look(2)!.value
+      if (!['stop', 'target', 'trail', 'breakeven', 'size', 'max'].includes(key)) throw new MslSyntaxError(`line ${t.line}: unknown position setting "pos.${key}" - use pos.stop / pos.target / pos.trail / pos.breakeven / pos.size / pos.max`)
+      if (this.inFn) throw new MslSyntaxError(`line ${t.line}: position settings are not allowed inside an fn`)
+      this.pos += 4
+      return { kind: 'posset', key, expr: this.parseOr() }
+    }
+    if (t.kind === 'ident' && (t.value === 'exit' || t.value === 'hold') && this.look(1)?.kind !== 'eq_assign') {
+      const hold = t.value === 'hold'
+      const nx = this.look(1)
+      const isWhen = nx?.kind === 'when'
+      const isUntil = nx?.kind === 'ident' && nx.value === 'until'
+      if ((!hold && (isWhen || nx?.kind === 'num' || nx?.kind === 'ident' || nx?.kind === 'lparen')) || (hold && isUntil)) {
+        if (this.inFn) throw new MslSyntaxError(`line ${t.line}: "${t.value}" is not allowed inside an fn`)
+        this.next()
+        let frac: Expr | undefined
+        if (!hold && !isWhen) {
+          frac = this.parseOr()
+        }
+        if (hold) this.next() // 'until'
+        else this.expectWord('when')
+        return { kind: 'exit', cond: this.parseOr(), ...(frac ? { frac } : {}) }
+      }
+    }
+    // assignment / compound assignment / bare effectful call
+    if (t.kind === 'ident' && !['let', 'true', 'false', 'none'].includes(t.value)) {
+      const n1 = this.look(1)
+      if (n1?.kind === 'eq_assign' || n1?.kind === 'opassign') {
+        this.next()
+        const op = this.next()
+        const rhs = this.parseOr()
+        return { kind: 'assign', name: t.value, expr: op.kind === 'opassign' ? { t: 'bin', op: op.value as '+' | '-' | '*' | '/' | '%', l: { t: 'ident', name: t.value }, r: rhs } : rhs }
+      }
+      const start = this.pos
+      const e = this.parseAtom()
+      const nk = this.peek().kind
+      if ((nk === 'eq_assign' || nk === 'opassign') && e.t === 'index' && e.obj.t === 'ident') {
+        const op = this.next()
+        const rhs = this.parseOr()
+        return { kind: 'setidx', name: e.obj.name, idx: e.idx, expr: op.kind === 'opassign' ? { t: 'bin', op: op.value as '+' | '-' | '*' | '/' | '%', l: e, r: rhs } : rhs }
+      }
+      if (e.t === 'call' || e.t === 'method') return { kind: 'expr', expr: e }
+      this.pos = start
+    }
     if (t.kind === 'let') {
       this.next()
       const name = this.expect('ident').value
@@ -1000,6 +1231,8 @@ class Parser {
       const expr = this.parseOr()
       return { kind: 'let', name, expr }
     }
+    if (this.inFn && (t.kind === 'call_kw' || t.kind === 'put_kw' || t.kind === 'confidence_kw' || t.kind === 'expiry_kw' || t.kind === 'configure_kw'))
+      throw new MslSyntaxError(`line ${t.line}: "${t.value}" is not allowed inside an fn - fns only compute and return values`)
     if (t.kind === 'call_kw') {
       this.next()
       this.expectWord('when')
@@ -1049,7 +1282,7 @@ class Parser {
       this.expect('eq_assign')
       return { kind: 'configure', path, expr: this.parseOr() }
     }
-    throw new MslSyntaxError(`line ${t.line}: expected "let", "call when", "put when", "confidence =", "expiry =", "configure ... =" or an "if" block, got "${t.value}"`)
+    throw new MslSyntaxError(`line ${t.line}: expected "let", "var", an assignment, "call when", "put when", "confidence =", "expiry =", "configure ... =", "pos.stop/target/trail/size = ...", "exit when ...", or an if/for/while block, got "${t.value}"`)
   }
 
   private expectWord(word: string): void {
@@ -1101,8 +1334,9 @@ class Parser {
   }
   private parseMul(): Expr {
     let l = this.parseUnary()
-    while (this.peek().kind === 'star' || this.peek().kind === 'slash') {
-      const op = this.next().kind === 'star' ? '*' : '/'
+    while (this.peek().kind === 'star' || this.peek().kind === 'slash' || this.peek().kind === 'percent') {
+      const k = this.next().kind
+      const op = k === 'star' ? '*' : k === 'slash' ? '/' : '%'
       l = { t: 'bin', op, l, r: this.parseUnary() }
     }
     return l
@@ -1187,6 +1421,18 @@ class Parser {
       this.expect('rparen')
       return e
     }
+    if (t.kind === 'lbracket') {
+      const items: Expr[] = []
+      if (this.peek().kind !== 'rbracket') {
+        items.push(this.parseOr())
+        while (this.peek().kind === 'comma') {
+          this.next()
+          items.push(this.parseOr())
+        }
+      }
+      this.expect('rbracket')
+      return { t: 'array', items }
+    }
     if (t.kind === 'ident') {
       if (t.value === 'true') return { t: 'bool', v: true }
       if (t.value === 'false') return { t: 'bool', v: false }
@@ -1225,8 +1471,8 @@ export function parseStrategyScript(src: string): { ok: true; ast: MslAst } | { 
     const toks = tokenize(src)
     const ast = new Parser(toks).parseProgram()
     const all = flattenStmts(ast.stmts)
-    if (!all.some((s) => s.kind === 'call') && !all.some((s) => s.kind === 'put')) {
-      return { ok: false, error: 'a strategy script needs at least one "call when ..." or "put when ..." statement' }
+    if (!all.some((s) => s.kind === 'call') && !all.some((s) => s.kind === 'put') && !all.some((s) => s.kind === 'expr')) {
+      return { ok: false, error: 'a strategy script needs at least one "call when ..." or "put when ..." statement (or a draw.* call for an overlay-only script)' }
     }
     return { ok: true, ast }
   } catch (err) {
@@ -1245,6 +1491,7 @@ function compositeKind(v: unknown): string {
   if (isSeriesValue(v)) return 'a series (ind.* result)'
   if (isBarValue(v)) return 'a bar (ohlc() result)'
   if (isBundleValue(v)) return 'an indicator bundle (ind.macd/bb/stoch/adx/supertrend result)'
+  if (isArrayValue(v)) return 'an array'
   return 'this value'
 }
 
@@ -1375,9 +1622,19 @@ function linRegSlope(values: number[]): number {
  * method vocabulary. `args` are already-evaluated MslValue (a `.crossed`
  * comparison level may itself be another series, e.g.
  * `ind.ema(9).crossed(ind.ema(21))`). */
-function seriesMethod(name: string, args: MslValue[], s: MslSeriesValue): MslValue {
+function seriesMethod(name: string, args: MslValue[], s: MslSeriesValue, ctx?: EvalEnv): MslValue {
   const at = (v: MslValue, offset: number): number => (isSeriesValue(v) ? indexSeries(v, offset) : asNum(v))
   switch (name) {
+    case 'toArray': {
+      const n = Math.max(1, Math.min(MSL_MAX_ARRAY, Math.trunc(args.length ? asNum(args[0]) : 20)))
+      return mkArr(ctx, s.values.slice(Math.max(0, s.values.length - n)))
+    }
+    case 'sum': {
+      const n = Math.max(1, Math.trunc(args.length ? asNum(args[0]) : 10))
+      return s.values.slice(Math.max(0, s.values.length - n)).reduce((a, b) => a + (Number.isFinite(b) ? b : 0), 0)
+    }
+    case 'len':
+      return s.values.length
     case 'slope':
       return linRegSlope(lastFiniteWindow(s.values, args.length ? asNum(args[0]) : 10))
     case 'max':
@@ -1415,7 +1672,7 @@ function seriesMethod(name: string, args: MslValue[], s: MslSeriesValue): MslVal
       throw new MslRuntimeError('".crossed(...)" takes either (otherSeriesOrLevel) or ("up"|"down", level)')
     }
     default:
-      throw new MslRuntimeError(`unknown series method ".${name}(...)" - use crossed/slope/max/min/mean/stddev`)
+      throw new MslRuntimeError(`unknown series method ".${name}(...)" - use crossed/slope/max/min/mean/stddev/sum/toArray/len`)
   }
 }
 
@@ -5107,10 +5364,19 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
       const val = evalExpr(e.obj, env, ctx)
       return fieldOf(val, e.field)
     }
+    case 'array': {
+      if (e.items.length > MSL_MAX_ARRAY) throw new MslRuntimeError(`array literal longer than ${MSL_MAX_ARRAY} items`)
+      return mkArr(ctx, e.items.map((x) => evalExpr(x, env, ctx)))
+    }
     case 'index': {
       const obj = evalExpr(e.obj, env, ctx)
       const idx = asNum(evalExpr(e.idx, env, ctx))
-      if (!isSeriesValue(obj)) throw new MslRuntimeError(`"[...]" indexing needs a series value, not "${compositeKind(obj)}"`)
+      if (isArrayValue(obj)) {
+        const i = Math.trunc(idx) < 0 ? obj.items.length + Math.trunc(idx) : Math.trunc(idx)
+        if (!(i >= 0 && i < obj.items.length)) throw new MslRuntimeError(`array index [${idx}] out of range - the array has ${obj.items.length} item(s) (0-based, negative counts from the end)`)
+        return obj.items[i]
+      }
+      if (!isSeriesValue(obj)) throw new MslRuntimeError(`"[...]" indexing needs a series or an array, not "${compositeKind(obj)}"`)
       return indexSeries(obj, idx)
     }
     case 'method': {
@@ -5247,6 +5513,9 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
         return e.obj.name === 'sw' ? swMethod(e.name, args, ctx, tf) : ew2Method(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'draw' && !(e.obj.name in env)) {
+        return drawMethod(e.name, e.args.map((a) => evalExpr(a, env, ctx)), ctx)
       }
       if (e.obj.t === 'ident' && e.obj.name === 'em' && !(e.obj.name in env)) {
         const args = e.args.map((a) => evalExpr(a, env, ctx))
@@ -5456,8 +5725,9 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
       }
       const obj = evalExpr(e.obj, env, ctx)
       const args = e.args.map((a) => evalExpr(a, env, ctx))
-      if (isSeriesValue(obj)) return seriesMethod(e.name, args, obj)
-      throw new MslRuntimeError(`".${e.name}(...)" needs a series value, not "${compositeKind(obj)}"`)
+      if (isArrayValue(obj)) return arrayMethod(e.name, args, obj, ctx)
+      if (isSeriesValue(obj)) return seriesMethod(e.name, args, obj, ctx)
+      throw new MslRuntimeError(`".${e.name}(...)" needs a series or an array, not "${compositeKind(obj)}"`)
     }
     case 'unary': {
       const v = evalExpr(e.e, env, ctx)
@@ -5493,6 +5763,8 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
           return asNum(l) * asNum(r)
         case '/':
           return asNum(r) === 0 ? 0 : asNum(l) / asNum(r)
+        case '%':
+          return asNum(r) === 0 ? 0 : asNum(l) % asNum(r)
       }
       break
     }
@@ -5504,8 +5776,23 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         if (e.args.length !== 3) throw new MslRuntimeError(`if(cond, then, else) takes exactly 3 arguments, got ${e.args.length}`)
         return truthy(evalExpr(e.args[0], env, ctx)) ? evalExpr(e.args[1], env, ctx) : evalExpr(e.args[2], env, ctx)
       }
+      const ufn = ctx.fns?.[e.fn]
+      if (ufn) return callUserFn(ufn, e.args.map((a) => evalExpr(a, env, ctx)), ctx)
       const args = e.args.map((a) => evalExpr(a, env, ctx))
       switch (e.fn) {
+        case 'len': {
+          const a0 = args[0]
+          if (isArrayValue(a0)) return a0.items.length
+          if (isSeriesValue(a0)) return a0.values.length
+          throw new MslRuntimeError('len(x) needs an array or a series')
+        }
+        case 'array': {
+          const n = args.length ? Math.trunc(asNum(args[0])) : 0
+          if (!(n >= 0 && n <= MSL_MAX_ARRAY)) throw new MslRuntimeError(`array(n, fill): n must be 0..${MSL_MAX_ARRAY}`)
+          const fill = args.length > 1 ? args[1] : 0
+          if (isComposite(fill) && !isArrayValue(fill)) throw new MslRuntimeError('array(n, fill): fill must be a number, boolean or text')
+          return mkArr(ctx, Array.from({ length: n }, () => (isArrayValue(fill) ? arrayValue(fill.items.slice()) : fill)))
+        }
         case 'avg':
           return args.length ? args.reduce((s: number, a) => s + asNum(a), 0) / args.length : 0
         case 'sum':
@@ -5686,6 +5973,7 @@ function fmtExplainVal(v: MslValue): string {
   }
   if (isBarValue(v)) return `bar(o${v.o} h${v.h} l${v.l} c${v.c})`
   if (isBundleValue(v)) return `bundle(${Object.keys(v.fields).join('/')})`
+  if (isArrayValue(v)) return `array(${v.items.length})`
   if (typeof v === 'number') return String(Math.round(v * 100) / 100)
   return String(v)
 }
@@ -5714,6 +6002,10 @@ function explainExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): { te
     case 'field': {
       const value = evalExpr(e, env, ctx)
       return { text: `${prettyExpr(e)}=${fmtExplainVal(value)}`, value }
+    }
+    case 'array': {
+      const value = evalExpr(e, env, ctx)
+      return { text: fmtExplainVal(value), value }
     }
     case 'unary': {
       const inner = explainExpr(e.e, env, ctx)
@@ -5768,6 +6060,285 @@ function explainExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): { te
   }
 }
 
+
+// ---------- interpreter: arrays, user fns, loops, draw ----------
+const MSL_MAX_ARRAY = 5000
+const MSL_MAX_OPS = 200_000
+const MSL_MAX_DRAWS = 300
+const MSL_MAX_FN_DEPTH = 24
+
+function mkArr(ctx: EvalEnv | undefined, items: MslValue[]): MslArrayValue {
+  const a = arrayValue(items)
+  if (ctx?.fnDepth && ctx.arrFrame) ctx.arrFrame.add(a)
+  return a
+}
+function mutable(ctx: EvalEnv, a: MslArrayValue, what: string): void {
+  if (ctx.fnDepth && !(ctx.arrFrame && ctx.arrFrame.has(a))) throw new MslRuntimeError(`${what}: a fn cannot change an array it did not create - copy it first with .copy(), or return a new array`)
+}
+function plainItem(v: MslValue, what: string): MslValue {
+  if (isComposite(v) && !isArrayValue(v)) throw new MslRuntimeError(`${what}: arrays hold numbers, booleans, text or arrays - not ${compositeKind(v)} (take a number out of it first, e.g. series[-1])`)
+  return v
+}
+function nums(a: MslArrayValue, what: string): number[] {
+  return a.items.map((x) => { if (typeof x !== 'number') throw new MslRuntimeError(`${what}: needs an array of numbers`); return x })
+}
+function arrayMethod(name: string, args: MslValue[], a: MslArrayValue, ctx: EvalEnv): MslValue {
+  const need = (n: number) => { if (args.length < n) throw new MslRuntimeError(`array.${name}() needs ${n} argument(s)`) }
+  const at = (v: MslValue): number => { const i = Math.trunc(asNum(v)); const k = i < 0 ? a.items.length + i : i; if (!(k >= 0 && k < a.items.length)) throw new MslRuntimeError(`array.${name}(${i}): out of range - the array has ${a.items.length} item(s)`); return k }
+  switch (name) {
+    case 'len': return a.items.length
+    case 'get': need(1); return a.items[at(args[0])]
+    case 'first': if (!a.items.length) throw new MslRuntimeError('array.first(): the array is empty'); return a.items[0]
+    case 'last': if (!a.items.length) throw new MslRuntimeError('array.last(): the array is empty'); return a.items[a.items.length - 1]
+    case 'push': {
+      need(1); mutable(ctx, a, 'array.push()')
+      if (a.items.length >= MSL_MAX_ARRAY) throw new MslRuntimeError(`array.push(): arrays are limited to ${MSL_MAX_ARRAY} items`)
+      a.items.push(plainItem(args[0], 'array.push()')); return a.items.length
+    }
+    case 'pop': { mutable(ctx, a, 'array.pop()'); if (!a.items.length) throw new MslRuntimeError('array.pop(): the array is empty'); return a.items.pop() as MslValue }
+    case 'shift': { mutable(ctx, a, 'array.shift()'); if (!a.items.length) throw new MslRuntimeError('array.shift(): the array is empty'); return a.items.shift() as MslValue }
+    case 'set': { need(2); mutable(ctx, a, 'array.set()'); a.items[at(args[0])] = plainItem(args[1], 'array.set()'); return a.items.length }
+    case 'clear': mutable(ctx, a, 'array.clear()'); a.items.length = 0; return 0
+    case 'copy': return mkArr(ctx, a.items.map((x) => (isArrayValue(x) ? arrayValue(x.items.slice()) : x)))
+    case 'has': need(1); return a.items.some((x) => x === args[0])
+    case 'indexOf': need(1); return a.items.findIndex((x) => x === args[0])
+    case 'sum': return nums(a, 'array.sum()').reduce((x, y) => x + y, 0)
+    case 'mean': { const n = nums(a, 'array.mean()'); return n.length ? n.reduce((x, y) => x + y, 0) / n.length : NaN }
+    case 'max': { const n = nums(a, 'array.max()'); return n.length ? Math.max(...n) : NaN }
+    case 'min': { const n = nums(a, 'array.min()'); return n.length ? Math.min(...n) : NaN }
+    case 'stddev': { const n = nums(a, 'array.stddev()'); if (!n.length) return NaN; const m = n.reduce((x, y) => x + y, 0) / n.length; return Math.sqrt(n.reduce((x, y) => x + (y - m) ** 2, 0) / n.length) }
+    case 'sort': { const n = nums(a, 'array.sort()').slice().sort((x, y) => x - y); if (args.length && String(args[0]) === 'desc') n.reverse(); return mkArr(ctx, n) }
+    case 'slice': { need(1); const from = Math.trunc(asNum(args[0])); const to = args.length > 1 ? Math.trunc(asNum(args[1])) : a.items.length; return mkArr(ctx, a.items.slice(from, to)) }
+    case 'reverse': return mkArr(ctx, a.items.slice().reverse())
+    default: throw new MslRuntimeError(`unknown array method ".${name}(...)" - use len/get/set/push/pop/shift/first/last/clear/copy/has/indexOf/sum/mean/max/min/stddev/sort/slice/reverse`)
+  }
+}
+
+const DRAW_COLOR = /^(#[0-9a-fA-F]{3,8}|[a-zA-Z]{3,20})$/
+/** `draw.*` - chart overlays from a script. barsAgo 0 = the latest closed bar. A NaN/missing coordinate silently draws nothing (so a missing swing never errors).
+ * line(p1, barsAgo1, p2, barsAgo2 [, color [, text [, "right"]]]) / hline(price [, color [, text]]) / zone(top, bottom, barsAgoFrom [, barsAgoTo [, color [, text]]]) / label(price, barsAgo, text [, color]) / marker(barsAgo, "up"|"down" [, color [, text]]) */
+function drawMethod(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
+  if (!ctx.draws) return 0
+  const n = (i: number): number => { const v = args[i]; if (typeof v === 'boolean') return v ? 1 : 0; if (typeof v !== 'number') throw new MslRuntimeError(`draw.${name}(): argument ${i + 1} must be a number`); return v }
+  const str = (i: number): string | undefined => (args[i] === undefined ? undefined : String(args[i]))
+  const col = (i: number): string | undefined => { const c = str(i); return c && DRAW_COLOR.test(c) ? c : undefined }
+  const s = ctx.series
+  const timeAt = (b: number): number | undefined => { if (!s?.time || !isFinite(b)) return undefined; const i = s.time.length - 1 - Math.trunc(b); return s.time[i] }
+  let d: MslDraw | undefined
+  switch (name) {
+    case 'line': { if (args.length < 4) throw new MslRuntimeError('draw.line(p1, barsAgo1, p2, barsAgo2 [, color [, text [, "right"]]])'); const [p1, b1, p2, b2] = [n(0), n(1), n(2), n(3)]; if (![p1, b1, p2, b2].every(isFinite)) return 0; d = { kind: 'line', p1, b1, p2, b2, t1: timeAt(b1), t2: timeAt(b2), color: col(4), text: str(5), style: str(6) === 'right' ? 'right' : undefined }; break }
+    case 'hline': { if (args.length < 1) throw new MslRuntimeError('draw.hline(price [, color [, text]])'); const p = n(0); if (!isFinite(p)) return 0; d = { kind: 'hline', p1: p, color: col(1), text: str(2) }; break }
+    case 'zone': { if (args.length < 3) throw new MslRuntimeError('draw.zone(top, bottom, barsAgoFrom [, barsAgoTo [, color [, text]]])'); const top = n(0), bottom = n(1), b1 = n(2), b2 = args.length > 3 ? n(3) : 0; if (![top, bottom, b1, b2].every(isFinite)) return 0; d = { kind: 'zone', top: Math.max(top, bottom), bottom: Math.min(top, bottom), b1, b2, t1: timeAt(b1), t2: timeAt(b2), color: col(4), text: str(5) }; break }
+    case 'label': { if (args.length < 3) throw new MslRuntimeError('draw.label(price, barsAgo, text [, color])'); const p = n(0), b = n(1); if (!isFinite(p) || !isFinite(b)) return 0; d = { kind: 'label', p1: p, b1: b, t1: timeAt(b), text: String(args[2]).slice(0, 40), color: col(3) }; break }
+    case 'marker': {
+      if (args.length < 2) throw new MslRuntimeError('draw.marker(barsAgo, "up"|"down" [, color [, text]])')
+      const b = n(0); const dir = String(args[1]); if (dir !== 'up' && dir !== 'down') throw new MslRuntimeError('draw.marker(): direction must be "up" or "down"')
+      if (!s || !isFinite(b)) return 0
+      const i = s.close.length - 1 - Math.trunc(b); if (i < 0 || i >= s.close.length) return 0
+      d = { kind: 'marker', p1: dir === 'up' ? s.low[i] : s.high[i], b1: b, t1: timeAt(b), style: dir, color: col(2), text: str(3)?.slice(0, 20) }; break
+    }
+    default: throw new MslRuntimeError(`unknown draw method "draw.${name}(...)" - use line/hline/zone/label/marker`)
+  }
+  const key = JSON.stringify(d)
+  if (ctx.drawKeys!.has(key)) return 1
+  if (ctx.draws.length >= MSL_MAX_DRAWS) throw new MslRuntimeError(`a script may draw at most ${MSL_MAX_DRAWS} objects per evaluation`)
+  ctx.drawKeys!.add(key); ctx.draws.push(d)
+  return 1
+}
+
+type Flow = undefined | { k: 'break' } | { k: 'continue' } | { k: 'return'; v: MslValue }
+interface RunState {
+  callFired: boolean
+  putFired: boolean
+  confidenceExpr: Expr | null
+  expiryExpr: Expr | null
+  trace: string[]
+  posSets: { key: string; expr: Expr; env: Record<string, MslValue> }[]
+}
+const POS_DIRECTIVES = ['stop', 'target', 'trail', 'breakeven', 'size']
+
+function posBundle(p: MslPosView, close: number, atr: number): MslValue {
+  const pnl = p.dir * (close - p.entry)
+  const risk = Number.isFinite(p.initStop) ? Math.abs(p.entry - p.initStop) : NaN
+  return bundleValue({ dir: p.dir, entry: p.entry, bars: p.bars, best: p.best, worst: p.worst, left: p.left, stop: p.stop, target: p.target, trail: p.trail, size: p.size, pnl, pnlAtr: atr > 0 ? pnl / atr : NaN, risk, initStop: p.initStop })
+}
+function lastAtr(ctx: EvalEnv): number {
+  const sr = ctx.series
+  if (!sr || sr.close.length < 20) return NaN
+  const a = atrInd(sr.high, sr.low, sr.close, 14)
+  return a[a.length - 1]
+}
+
+function callUserFn(fn: MslFn, args: MslValue[], ctx: EvalEnv): MslValue {
+  if (args.length !== fn.params.length) throw new MslRuntimeError(`${fn.name}(${fn.params.join(', ')}) takes ${fn.params.length} argument(s), got ${args.length}`)
+  if ((ctx.fnDepth ?? 0) >= MSL_MAX_FN_DEPTH) throw new MslRuntimeError(`fn calls nested more than ${MSL_MAX_FN_DEPTH} deep (runaway recursion in "${fn.name}"?)`)
+  const outerFrame = ctx.arrFrame
+  const frame = new WeakSet<object>()
+  const local: Record<string, MslValue> = Object.create(ctx.globalEnv ?? null)
+  ctx.fnDepth = (ctx.fnDepth ?? 0) + 1
+  ctx.arrFrame = frame
+  try {
+    fn.params.forEach((pn, i) => {
+      const v = args[i]
+      if (isArrayValue(v)) { const c = arrayValue(v.items.map((x) => (isArrayValue(x) ? arrayValue(x.items.slice()) : x))); frame.add(c); local[pn] = c } else local[pn] = v
+    })
+    const flow = execBlock(fn.body, local, ctx, null)
+    return flow && flow.k === 'return' ? flow.v : 0
+  } finally {
+    ctx.fnDepth = (ctx.fnDepth ?? 1) - 1
+    ctx.arrFrame = outerFrame
+  }
+}
+
+function tick(ctx: EvalEnv): void {
+  const o = ctx.ops
+  if (o && ++o.n > MSL_MAX_OPS) throw new MslRuntimeError(`script exceeded ${MSL_MAX_OPS} steps - check for a loop that never ends`)
+}
+
+function execBlock(stmts: Stmt[], env: Record<string, MslValue>, ctx: EvalEnv, rs: RunState | null): Flow {
+  const need = (what: string): RunState => { if (!rs) throw new MslRuntimeError(`${what} is not allowed here`); return rs }
+  for (const stmt of stmts) {
+    tick(ctx)
+    switch (stmt.kind) {
+      case 'if': {
+        let matched = false
+        for (const b of stmt.branches) {
+          const v = truthy(evalExpr(b.cond, env, ctx))
+          if (rs) rs.trace.push(`if ${explainExpr(b.cond, env, ctx).text} -> ${v}`)
+          if (v) {
+            matched = true
+            const f = execBlock(b.body, env, ctx, rs)
+            if (f) return f
+            break
+          }
+        }
+        if (!matched && stmt.elseBody) {
+          if (rs) rs.trace.push('else')
+          const f = execBlock(stmt.elseBody, env, ctx, rs)
+          if (f) return f
+        }
+        break
+      }
+      case 'let':
+        env[stmt.name] = evalExpr(stmt.expr, env, ctx)
+        break
+      case 'var': {
+        const prev = ctx.varRec?.committed.get(stmt.name)
+        env[stmt.name] = prev !== undefined ? fromPV(clonePV(prev)) : evalExpr(stmt.expr, env, ctx)
+        if (prev === undefined) toPV(env[stmt.name], stmt.name) // validate the initial value is persistable
+        ctx.persist!.add(stmt.name)
+        break
+      }
+      case 'assign': {
+        if (!Object.prototype.hasOwnProperty.call(env, stmt.name)) throw new MslRuntimeError(`"${stmt.name}" is not declared here - declare it first with "let ${stmt.name} = ..." or "var ${stmt.name} = ..."${ctx.fnDepth ? ' (an fn can only change its own variables)' : ''}`)
+        const v = evalExpr(stmt.expr, env, ctx)
+        if (ctx.persist?.has(stmt.name)) toPV(v, stmt.name)
+        env[stmt.name] = v
+        break
+      }
+      case 'setidx': {
+        const a = env[stmt.name]
+        if (!isArrayValue(a)) throw new MslRuntimeError(`"${stmt.name}[...] = ..." needs "${stmt.name}" to be an array`)
+        mutable(ctx, a, `${stmt.name}[...] =`)
+        const i0 = Math.trunc(asNum(evalExpr(stmt.idx, env, ctx)))
+        const i = i0 < 0 ? a.items.length + i0 : i0
+        if (!(i >= 0 && i < a.items.length)) throw new MslRuntimeError(`${stmt.name}[${i0}] = ...: out of range - the array has ${a.items.length} item(s); use .push() to add one`)
+        a.items[i] = plainItem(evalExpr(stmt.expr, env, ctx), `${stmt.name}[...] =`)
+        break
+      }
+      case 'for': {
+        const from = asNum(evalExpr(stmt.from, env, ctx))
+        const to = asNum(evalExpr(stmt.to, env, ctx))
+        const step = stmt.step ? asNum(evalExpr(stmt.step, env, ctx)) : 1
+        if (!Number.isFinite(from) || !Number.isFinite(to) || !Number.isFinite(step) || step === 0) throw new MslRuntimeError(`for ${stmt.name}: from/to/step must be finite numbers and step cannot be 0 (line ${stmt.line})`)
+        let guard = 0
+        for (let i = from; step > 0 ? i <= to : i >= to; i += step) {
+          if (++guard > 10_000) throw new MslRuntimeError(`for ${stmt.name}: more than 10000 iterations (line ${stmt.line})`)
+          tick(ctx)
+          env[stmt.name] = i
+          const f = execBlock(stmt.body, env, ctx, rs)
+          if (f) { if (f.k === 'break') break; if (f.k === 'continue') continue; return f }
+        }
+        break
+      }
+      case 'while': {
+        let guard = 0
+        while (truthy(evalExpr(stmt.cond, env, ctx))) {
+          if (++guard > 10_000) throw new MslRuntimeError(`while: more than 10000 iterations (line ${stmt.line})`)
+          tick(ctx)
+          const f = execBlock(stmt.body, env, ctx, rs)
+          if (f) { if (f.k === 'break') break; if (f.k === 'continue') continue; return f }
+        }
+        break
+      }
+      case 'break': return { k: 'break' }
+      case 'continue': return { k: 'continue' }
+      case 'return': return { k: 'return', v: stmt.expr ? evalExpr(stmt.expr, env, ctx) : 0 }
+      case 'expr': evalExpr(stmt.expr, env, ctx); break
+      case 'call': {
+        const r = need('"call when"')
+        const v = truthy(evalExpr(stmt.expr, env, ctx))
+        if (v) r.callFired = true
+        r.trace.push(`call when ${explainExpr(stmt.expr, env, ctx).text} -> ${v}`)
+        break
+      }
+      case 'put': {
+        const r = need('"put when"')
+        const v = truthy(evalExpr(stmt.expr, env, ctx))
+        if (v) r.putFired = true
+        r.trace.push(`put when ${explainExpr(stmt.expr, env, ctx).text} -> ${v}`)
+        break
+      }
+      case 'confidence': need('"confidence ="').confidenceExpr = stmt.expr; break
+      case 'expiry': need('"expiry ="').expiryExpr = stmt.expr; break
+      case 'configure': {
+        const r = need('"configure"')
+        const v = evalExpr(stmt.expr, env, ctx)
+        if (isReadValue(v)) throw new MslRuntimeError(`"configure ${stmt.path}" got a source/signal value - the value must be a plain number/boolean/string`)
+        ctx.configs![stmt.path] = v as number | boolean | string
+        r.trace.push(`configure ${stmt.path} = ${String(v)}`)
+        break
+      }
+      case 'posset': {
+        const r = need('"pos.' + stmt.key + ' ="')
+        r.posSets.push({ key: stmt.key, expr: stmt.expr, env })
+        // existing positions: re-evaluate now so a script can trail/tighten its own levels each bar
+        if (ctx.positions && POS_DIRECTIVES.includes(stmt.key)) {
+          const close = ctx.series?.close[ctx.series.close.length - 1] ?? NaN
+          const atr = lastAtr(ctx)
+          for (const p of ctx.positions) {
+            const env2: Record<string, MslValue> = Object.create(env)
+            env2.pos = posBundle(p, close, atr)
+            const v = evalExpr(stmt.expr, env2, ctx)
+            if (typeof v === 'number' && Number.isFinite(v)) {
+              let m = ctx.posUpdates!.get(p.id)
+              if (!m) ctx.posUpdates!.set(p.id, (m = {}))
+              m[stmt.key] = v
+            }
+          }
+        }
+        break
+      }
+      case 'exit': {
+        need('"exit when"')
+        if (!ctx.positions) break
+        const close = ctx.series?.close[ctx.series.close.length - 1] ?? NaN
+        const atr = lastAtr(ctx)
+        for (const p of ctx.positions) {
+          const env2: Record<string, MslValue> = Object.create(env)
+          env2.pos = posBundle(p, close, atr)
+          if (truthy(evalExpr(stmt.cond, env2, ctx))) {
+            const f = stmt.frac ? Math.max(0, Math.min(1, asNum(evalExpr(stmt.frac, env2, ctx)))) : 1
+            if (f > 0) ctx.exits!.push({ id: p.id, frac: f })
+          }
+        }
+        break
+      }
+    }
+  }
+  return undefined
+}
+
 /** Run a parsed script against one asset+tf's current source reads.
  * Fail-closed, same convention every other strategy evaluator in this
  * codebase uses: a runtime error (unknown source, a thin-history source
@@ -5781,6 +6352,7 @@ export function evaluateStrategyScript(
   seriesFor?: (tf: string) => MslSeriesCtx | undefined,
   live?: { bar?: MslBarValue; ticks?: readonly { ts: number; price: number }[]; nowMs?: number },
   state?: { keyPrefix: string; barTimeSec?: number },
+  managed?: { positions: MslPosView[] },
 ): MslEvalResult {
   // configs is declared before ctx so ctx.configs can point at the SAME
   // object the 'configure' statement branch below mutates - a namespace
@@ -5802,79 +6374,45 @@ export function evaluateStrategyScript(
   }
   const env: Record<string, MslValue> = {}
   const trace: string[] = []
-  let callFired = false
-  let putFired = false
-  let confidenceExpr: Expr | null = null
-  let expiryExpr: Expr | null = null
+  ctx.fns = ast.fns
+  ctx.globalEnv = env
+  ctx.ops = { n: 0 }
+  ctx.fnDepth = 0
+  ctx.persist = new Set()
+  ctx.draws = []
+  ctx.drawKeys = new Set()
+  ctx.posUpdates = new Map()
+  ctx.exits = []
+  if (managed) ctx.positions = managed.positions
+  if (state?.keyPrefix !== undefined && state.barTimeSec !== undefined) ctx.varRec = mslVarStore.begin(state.keyPrefix, state.barTimeSec)
+  const rs: RunState = { callFired: false, putFired: false, confidenceExpr: null, expiryExpr: null, trace, posSets: [] }
   try {
-    const run = (stmts: Stmt[]): void => {
-    for (const stmt of stmts) {
-      if (stmt.kind === 'if') {
-        // first true branch wins; the rest are NOT evaluated (so a guarded reading in a later branch cannot error); else runs when none matched
-        let matched = false
-        for (const b of stmt.branches) {
-          const v = truthy(evalExpr(b.cond, env, ctx))
-          trace.push(`if ${explainExpr(b.cond, env, ctx).text} -> ${v}`)
-          if (v) {
-            matched = true
-            run(b.body)
-            break
-          }
-        }
-        if (!matched && stmt.elseBody) {
-          trace.push('else')
-          run(stmt.elseBody)
-        }
-        continue
-      }
-      if (stmt.kind === 'let') {
-        env[stmt.name] = evalExpr(stmt.expr, env, ctx)
-        continue
-      }
-      if (stmt.kind === 'call') {
-        const v = truthy(evalExpr(stmt.expr, env, ctx))
-        if (v) callFired = true
-        trace.push(`call when ${explainExpr(stmt.expr, env, ctx).text} -> ${v}`)
-        continue
-      }
-      if (stmt.kind === 'put') {
-        const v = truthy(evalExpr(stmt.expr, env, ctx))
-        if (v) putFired = true
-        trace.push(`put when ${explainExpr(stmt.expr, env, ctx).text} -> ${v}`)
-        continue
-      }
-      if (stmt.kind === 'confidence') {
-        confidenceExpr = stmt.expr // evaluated below, only if a side actually fired
-        continue
-      }
-      if (stmt.kind === 'expiry') {
-        expiryExpr = stmt.expr // evaluated below, only if a side actually fired
-        continue
-      }
-      if (stmt.kind === 'configure') {
-        // config values are PLAIN numbers/booleans/strings - a read object
-        // here is almost certainly a typo ("configure renko = ..." without
-        // the key), so it fails the script loudly instead of poisoning the
-        // caller's whitelist lookup.
-        const v = evalExpr(stmt.expr, env, ctx)
-        if (isReadValue(v)) throw new MslRuntimeError(`"configure ${stmt.path}" got a source/signal value - the value must be a plain number/boolean/string`)
-        configs[stmt.path] = v as number | boolean | string
-        trace.push(`configure ${stmt.path} = ${String(v)}`)
-        continue
-      }
-    }
-    }
-    run(ast.stmts)
+    execBlock(ast.stmts, env, ctx, rs)
   } catch (err) {
     return { direction: 'none', confidence: 0, trace, error: err instanceof Error ? err.message : String(err) }
   }
+  // commit persistent variables (only on a clean run; a repeated evaluation of the SAME bar starts again from the bar-open state)
+  if (ctx.varRec) {
+    const next = new Map(ctx.varRec.committed)
+    for (const nm of ctx.persist!) next.set(nm, toPV(env[nm], nm))
+    ctx.varRec.pending = next
+  }
+  const callFired = rs.callFired
+  const putFired = rs.putFired
+  const confidenceExpr = rs.confidenceExpr
+  const expiryExpr = rs.expiryExpr
+  const extras = (): Partial<MslEvalResult> => ({
+    ...(ctx.draws!.length ? { draws: ctx.draws } : {}),
+    ...(ctx.posUpdates!.size ? { posUpdates: [...ctx.posUpdates!].map(([id, m]) => ({ id, ...m })) } : {}),
+    ...(ctx.exits!.length ? { exits: ctx.exits } : {}),
+  })
 
   if (callFired && putFired) {
     trace.push('both "call when" and "put when" fired - conflicting, reads as none')
-    return { direction: 'none', confidence: 0, trace }
+    return { direction: 'none', confidence: 0, trace, ...extras() }
   }
   if (!callFired && !putFired) {
-    return { direction: 'none', confidence: 0, trace }
+    return { direction: 'none', confidence: 0, trace, ...extras() }
   }
   const direction: 'call' | 'put' = callFired ? 'call' : 'put'
   let confidence = 65 // same "lone signal, no honesty-loop number to lean on" flat default smcNowRead() uses
@@ -5908,5 +6446,24 @@ export function evaluateStrategyScript(
       return { direction: 'none', confidence: 0, trace, error: `expiry expression failed: ${err instanceof Error ? err.message : String(err)}` }
     }
   }
-  return { direction, confidence, trace, ...(expiryMin !== undefined ? { expiryMin } : {}), ...(Object.keys(configs).length ? { configs } : {}) }
+  // managed-trade directives (pos.stop/target/trail/breakeven/size/max): evaluated ONLY now that a side fired, against a preview of the new position
+  let entry: MslEvalResult['entry']
+  if (rs.posSets.length && ctx.series && ctx.series.close.length) {
+    const close = ctx.series.close[ctx.series.close.length - 1]
+    const dir: 1 | -1 = direction === 'call' ? 1 : -1
+    const preview: MslPosView = { id: -1, dir, entry: close, bars: 0, best: close, worst: close, left: 1, stop: NaN, target: NaN, trail: NaN, size: 1, initStop: NaN }
+    const atr = lastAtr(ctx)
+    entry = {}
+    try {
+      for (const ps of rs.posSets) {
+        const env2: Record<string, MslValue> = Object.create(ps.env)
+        env2.pos = posBundle(preview, close, atr)
+        const v = evalExpr(ps.expr, env2, ctx)
+        if (typeof v === 'number' && Number.isFinite(v)) (entry as Record<string, number>)[ps.key] = v
+      }
+    } catch (err) {
+      return { direction: 'none', confidence: 0, trace, error: `pos.* setting failed: ${err instanceof Error ? err.message : String(err)}`, ...extras() }
+    }
+  }
+  return { direction, confidence, trace, ...(expiryMin !== undefined ? { expiryMin } : {}), ...(Object.keys(configs).length ? { configs } : {}), ...(entry && Object.keys(entry).length ? { entry } : {}), ...extras() }
 }

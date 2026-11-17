@@ -106,7 +106,7 @@ import { chartPropertyRegistryForVocab } from './src/analytics/chartpropertyregi
 import { setMslAiChat, setMslAiEnabled, aiAnalyze, aiVet, mslAiAvailable } from './src/analytics/mslai'
 import { chatComplete, providerStatus as llmProviderStatus } from './src/lib/llm'
 import { wilsonLowerBound as aiWilson } from './src/analytics/mslai-stats'
-import { backtestMslScript, backtestMslScriptWalkForward, backtestMslScriptCrossAsset, replayMslScript } from './src/analytics/mslbacktest'
+import { backtestMslScript, backtestMslScriptWalkForward, backtestMslScriptCrossAsset, replayMslScript, backtestMslManaged } from './src/analytics/mslbacktest'
 import { hvSeries, ivFromPayout, realizedUpProb } from './src/analytics/ivhv'
 import { buildCalibrationReport, type CalibrationStoreSlice } from './src/analytics/calibration'
 import { computeStepStats, computeIntervalStats } from './src/analytics/randomness'
@@ -3046,6 +3046,9 @@ const httpServer = createServer(async (req, res) => {
             cp: 'CHART PATTERNS (analytics/patternengine.ts), candle-derived and backtestable, 60+ closed bars, ATR-normalised geometry over the last 160 bars. Patterns: Ascending/Descending/Symmetrical Triangle, Falling/Rising Wedge, Rectangle (Bullish/Bearish), Bullish/Bearish Pennant, Bull/Bear Flag, Head and Shoulders (+Inverse), Cup and Handle (+Inverted). Forming = price still inside the boundary; broken = a close beyond it by 0.1 ATR (direction = the break). Methods: ok(); has("name"), dir("name") +1/-1/0, broken("name"), age("name") bars (99 none), target("name"), upper("name")/lower("name") boundary prices now; count()/bull()/bear()/net(); best() name, bestDir(), bestRel(). A trailing second string = timeframe. Example: `call when cp.has("Falling Wedge") and cp.broken("Falling Wedge")`. The same names work in candle("Falling Wedge", call).active and in every candle-pattern panel. HONESTY: describes shapes, not proven edge.',
             autotrend: 'AUTO TREND DETECTOR: regression of the last 50 closes plus a pivot trendline. Methods: ok(); dir() +1/-1/0; up()/down()/flat(); slope() ATR per bar; r2(); strength(); touches(); line() trendline price now; dist() close minus line in ATR; broken(); brokenAge(). Optional trailing string = timeframe.',
             ew: 'ELLIOTT WAVE: one strict mechanical count on a 1.5 ATR zig-zag. Methods: ok(); active(); state() "wave3"/"wave5"/"wave5done"/"abcdone"/"none"; wave(); wave3()/wave5()/done()/abc(); dir() expected direction; trend(); retrace(); target() Fib target; invalid() invalidation level; conf(). Optional trailing string = timeframe. HONESTY: Elliott counts are subjective; this is one rule-based reading.',
+            lang: 'LANGUAGE CORE: variables, loops, arrays, functions. var x = 0 is a PERSISTENT variable (initialised once, kept bar to bar; a repeated evaluation of the same bar never double counts); let x = ... is per-bar. Assign with x = expr, x += 1 (also -= *= /= %=); arrays a[i] = v. for i = 1 to 10 [step 2] ... end; while cond ... end; break; continue (a loop is capped at 10000 iterations and a script at 200000 steps). fn name(a, b) ... return expr ... end: define anywhere at top level, call from anywhere; fns only compute (no signals, no var, no changing outer variables or arrays - copy first). Arrays: [1, 2, 3], array(n, fill), len(a), a[i] 0-based (negative counts from the end), methods push/pop/shift/set/get/first/last/clear/copy/has/indexOf/sum/mean/max/min/stddev/sort/slice/reverse; a series becomes an array with px.close.toArray(20) so a loop can walk history; series also has .sum(n) and .len(). Operator % is modulo. NOTE: write i - 1 with spaces (i-1 reads as one identifier name). Example: `var n = 0` / `n += 1` / `call when n > 3`.',
+            draw: 'CHART OVERLAYS drawn by a script (the SCR button on the chart runs the script and draws it; right-click edits). barsAgo 0 = latest closed bar; a NaN coordinate draws nothing (a missing swing never errors); identical objects are deduplicated; max 300. draw.line(p1, barsAgo1, p2, barsAgo2 [, color [, text [, right]]]) with the string right to extend the line forward; draw.hline(price [, color [, text]]); draw.zone(top, bottom, barsAgoFrom [, barsAgoTo [, color [, text]]]); draw.label(price, barsAgo, text [, color]); draw.marker(barsAgo, up or down [, color [, text]]). An overlay-only script needs no call/put statement. Example: `draw.line(sw.low(2), sw.lowAge(2), sw.low(1), sw.lowAge(1), "#22d3ee", "TL", "right")`.',
+            pos: 'MANAGED TRADES (stop, target, trail, partial exits, scaling, hold-until). Backtest with POST /msl_managed. These are price-based exits SIMULATED on candles - a fixed-expiry binary option cannot exit early at a price, so they become tradable only on an instrument that allows it (forex/CFD, digital sell). Settings evaluated at entry (and, for stop, re-evaluated every bar): pos.stop = price (a stop only ever TIGHTENS once set - trail it, never loosen); pos.target = price; pos.trail = distance (follows the best price); pos.breakeven = distance (stop moves to entry once that far in profit); pos.size = stake multiplier; pos.max = concurrent positions (scaling in; default 1). Exits: exit when cond (full), exit 0.5 when cond (half of what is left), hold until cond (same as exit when). Inside those and the pos.* lines a bundle pos is readable: pos.dir (1 long, -1 short), entry, bars (held), best, worst, left (fraction still open), stop, target, trail, size, pnl (price, in the trade direction), pnlAtr, risk (|entry - first stop|), initStop. A time stop closes a trade after expiry = minutes (or 120 bars). Fills: candle OHLC; stop checked before target when a bar touches both; a gap through a level fills at the open. Result: per trade reason (stop/target/exit/time/end), R multiple, profit factor, expectancy in R, drawdown in R. Example: `call when ...` / `pos.stop = pos.entry - 2 * ind.atr(14)[-1]` / `pos.target = pos.entry + 4 * ind.atr(14)[-1]` / `exit 0.5 when pos.pnl >= pos.risk and pos.left == 1`.',
             sw: 'SWING ENGINE (analytics/swingengine.ts), the building block for S&R, retracement, pullback, trendline and Elliott strategies. Confirmed swing highs/lows by ATR zig-zag (mode 0, reversal k x ATR14, default k=2) or fractal (mode 1, k bars each side). n=1 is the most recent. Methods: ok(); count(); high(n)/low(n) price of the nth swing high/low; highAge(n)/lowAge(n) bars since; pivot(n)/pivotAge(n)/pivotType(n) (+1 high, -1 low) over all swings; dir() direction of the developing leg; cur()/curAge()/curLeg() developing extreme, its age, size in ATR; leg(n) size in ATR / legPrice(n) / legBars(n) of the nth completed leg; retr() fraction of the last leg given back; since(); atr(). Trailing args AFTER the own ones: k, mode, then timeframe. Missing swings return NaN so the rule simply does not fire.',
             ew2: 'FULL ELLIOTT COUNTER on the swing engine: points 0-5 impulse, 6-8 = A-B-C. Methods: ok(); k(); wave() 1-8 in progress; stage(); dir(); pt(i)/ptAge(i) price/age of point i (0-8); len(i) leg in ATR; ratio(i) 2:w2/w1 3:w3/w1 4:w4/w3 5:w5/w1 7:w7/w6 8:w8/w6; rule(i) for i 2-5 the hard rules hold; trunc(); proj(wave, ratio) Fib projection price; inv() invalidation price; cur(); confirmed(); since(); type(); inImpulse(); inCorrection(). Trailing k, mode, timeframe as sw. HONESTY: one rule-based reading of a subjective theory; backtest before trusting.',
             px: 'RAW PRICE SERIES bundle: px or px(timeframe) gives open high low close volume hl2 hlc3 ohlc4 range chg tr as series, so px.high.max(20), px.low.min(10), px.close[-3] work. Helpers: fibRet(a,b,ratio) retrace price; fibExt(a,b,c,ratio) extension; retr(a,b,x) fraction retraced; lineAt(p1,barsAgo1,p2,barsAgo2,at) trendline price; distAtr(a,b); near(a,b,k) within k ATR.',
@@ -5233,6 +5236,45 @@ const httpServer = createServer(async (req, res) => {
           const out: Record<string, unknown> = { ok: main.ok, asset, tf: tfv, fast: fastv, baseBars: baseC.length, result: strip(main) }
           if (body.compare) out.noWait = strip(replayMslScript(baseC, fastC, script, { ...opts, holdBypass: true }))
           return json(200, out)
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // POST /msl_managed {script, asset, tf?='1m', bars?=3000, payout?, maxBars?, maxPositions?, slipAtr?} - MANAGED-TRADE backtest (analytics/mslbacktest.ts backtestMslManaged): the script's pos.stop / pos.target / pos.trail / pos.breakeven / pos.size / pos.max settings and
+      // `exit when` / `hold until` rules are simulated on the candle series (stop before target on a double touch, gaps fill at the open). A SIMULATION - a fixed-expiry binary option cannot exit early at a price.
+      if (path === '/msl_managed') {
+        try {
+          const tfv = tfStrict(String(body.tf ?? '1m'))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(String(body.tf ?? '')) })
+          const asset = String(body.asset ?? market.activeAsset)
+          const script = String(body.script ?? '')
+          if (!script.trim()) return json(400, { ok: false, error: 'script is required' })
+          const store = kernel.context().use<{ getCandlesArchive: (a: string, t: string, n: number) => Candle[] }>('storeRaw')
+          const bars = Math.max(200, Math.min(6000, Math.round(Number(body.bars) || 3000)))
+          const candles = store.getCandlesArchive(asset, tfv, bars).filter((c) => c && [c.time, c.open, c.high, c.low, c.close].every((v) => Number.isFinite(v)))
+          if (candles.length < 100) return json(200, { ok: false, asset, error: `only ${candles.length} archived ${tfv} bars for ${asset}` })
+          const r = backtestMslManaged(candles, script, { barSeconds: TIMEFRAME_SECONDS[tfv], payout: body.payout !== undefined ? Number(body.payout) : 0.85, ...(body.maxBars ? { maxBars: Number(body.maxBars) } : {}), ...(body.maxPositions ? { maxPositions: Number(body.maxPositions) } : {}), ...(body.slipAtr ? { slipAtr: Number(body.slipAtr) } : {}) })
+          return json(200, { ...r, asset, tf: tfv, bars: candles.length, trades: r.trades.slice(-200) })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // POST /msl_draw {script, asset, tf?='1m', bars?=500} -> the chart overlays (draw.line / hline / zone / label / marker) a script produces at the latest closed bar. The script is run bar by bar over the recent history first,
+      // so `var` state (a remembered level, a counter) is what it would be live. The chart's SCRIPT button calls this.
+      if (path === '/msl_draw') {
+        try {
+          const tfv = tfStrict(String(body.tf ?? '1m'))
+          if (tfv === null) return json(400, { ok: false, error: tfErr(String(body.tf ?? '')) })
+          const asset = String(body.asset ?? market.activeAsset)
+          const script = String(body.script ?? '')
+          if (!script.trim()) return json(400, { ok: false, error: 'script is required' })
+          const bars = Math.max(120, Math.min(1500, Math.round(Number(body.bars) || 500)))
+          const candles = market.getCandlesDeep(asset, tfv, bars, true)
+          if (!candles || candles.length < 80) return json(404, { ok: false, error: `no ${tfv} candles for ${asset}` })
+          const r = backtestMslManaged(candles, script, { warmupBars: Math.min(60, Math.floor(candles.length / 3)) })
+          return json(200, { ok: r.ok, error: r.ok ? undefined : r.error, asset, tf: tfv, draws: r.draws ?? [], trades: r.trades.length, lastTime: candles[candles.length - 1].time, barSec: TIMEFRAME_SECONDS[tfv] })
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }

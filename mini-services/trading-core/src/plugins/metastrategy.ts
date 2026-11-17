@@ -67,6 +67,7 @@ import {
   type MetaSourceRead,
   type MetaStrategySpec,
 } from '../analytics/metastrategy'
+import { BUILTIN_TV_SPECS } from './builtinTvSpecs'
 import { parseStrategyScript, evaluateStrategyScript, clearMslState, flattenStmts, type MslEvalResult, type MslSourceRead, type MslSeriesCtx, type MslBarValue, type MslAst } from '../analytics/strategylang'
 import { getStrategy } from '../strategies/builtin'
 import { directionBreakdown } from '../strategies/backtest'
@@ -184,6 +185,7 @@ function collectFieldSources(ast: MslAst): Set<string> {
     }
   }
   for (const s of ast.stmts) visit(s)
+  for (const f of Object.values(ast.fns ?? {})) visit(f)
   return names
 }
 
@@ -854,7 +856,7 @@ export class MetaStrategyService {
    * walked by meta_strategy_backtest. */
   private seedBuiltinExamples(): number {
     let seeded = 0
-    for (const ex of [...BUILTIN_EXAMPLE_SPECS, ...BUILTIN_SMC_CONCEPT_SPECS] as { id: string; name: string; script: string; supersedes?: string[] }[]) {
+    for (const ex of [...BUILTIN_EXAMPLE_SPECS, ...BUILTIN_SMC_CONCEPT_SPECS, ...BUILTIN_TV_SPECS] as { id: string; name: string; script: string; supersedes?: string[] }[]) {
       const existing = this.specs.get(normalizeMetaId(ex.id))
       // Skip-if-present, with ONE exception: a stored spec whose script is
       // still, verbatim, an EARLIER builtin text of the same id (listed in

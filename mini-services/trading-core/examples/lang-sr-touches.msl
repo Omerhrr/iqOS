@@ -1,0 +1,14 @@
+# Loops + fn: count how many of the last 6 swing lows sit within 1.5 ATR of the latest one (a support that has held), then buy a bounce off it
+fn touches(price, n)
+  let c = 0
+  for i = 1 to n
+    if near(sw.low(i), price, 1.5)
+      c += 1
+    end
+  end
+  return c
+end
+let held = touches(sw.low(1), 6)
+call when held >= 3 and near(px.low[-1], sw.low(1), 1.5) and px.close[-1] > px.open[-1]
+confidence = 55 + held * 5
+expiry = 5

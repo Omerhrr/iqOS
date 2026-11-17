@@ -43,7 +43,7 @@ import { wilsonLowerBound } from './mslai-stats'
 import { setReplayMode } from './timing'
 import type { RiskOutcome } from './mslrisk'
 import type { Candle, Timeframe } from '../types'
-import { parseStrategyScript, evaluateStrategyScript, clearMslState, setRiskSource, type MslSeriesCtx, type MslSourceRead, type MslAst } from './strategylang'
+import { parseStrategyScript, evaluateStrategyScript, clearMslState, setRiskSource, type MslSeriesCtx, type MslSourceRead, type MslAst, type MslPosView, type MslDraw } from './strategylang'
 import { META_CONDITION_SOURCES } from './metastrategy'
 import { ALL_SMC_KINDS } from './smc'
 import { EXPIRIES_MIN } from './nextexpiry'
@@ -805,4 +805,201 @@ export function replayMslScript(base: Candle[], fast: Candle[], script: string, 
     firstHalf: { n: h1.length, wins: h1.filter((t) => t.win).length }, secondHalf: { n: h2.length, wins: h2.filter((t) => t.win).length },
     fastBars: fast.length,
   }
+}
+
+
+// =====================================================================================================================
+// MANAGED-TRADE BACKTEST - stop-loss, take-profit, trailing stop, break-even, partial exits, scaling in / multiple
+// positions, and "hold until <condition>" dynamic exits. A binary option has none of these (fixed expiry, all-or-nothing),
+// so this is a SIMULATION of price-based trade management on the candle series: it measures what a script's exits would
+// have done, in price / R terms. HONEST LIMITS: fills are modelled on candle OHLC (stop checked before target when a bar
+// touches both; a gap through a level fills at the open); there is no spread or slippage unless `slipAtr` is given; and the
+// IQ Option binary product cannot be exited early at a price, so these exits only become tradable on an instrument that allows
+// it (forex/CFD margin or digital sell). `pnl` per trade is the binary-equivalent (win +payout / loss -1) for comparison only.
+// =====================================================================================================================
+export interface MslManagedOpts {
+  warmupBars?: number
+  minConfidence?: number
+  runId?: string
+  /** longest a position may stay open (bars) - the time stop used when the script gives no `expiry =`; default 120 */
+  maxBars?: number
+  /** concurrent positions allowed (a script's `pos.max = n` overrides); default 1 */
+  maxPositions?: number
+  /** seconds per bar - lets a script's `expiry = <minutes>` act as the time stop */
+  barSeconds?: number
+  payout?: number
+  /** price slippage charged on every fill, in ATR14 units (default 0) */
+  slipAtr?: number
+}
+export interface MslManagedPart { index: number; price: number; frac: number; reason: string }
+export interface MslManagedTrade {
+  id: number
+  index: number
+  time: number
+  direction: 'call' | 'put'
+  confidence: number
+  entry: number
+  size: number
+  /** index/price/time of the final fill */
+  exitIndex: number
+  exit: number
+  bars: number
+  /** why the LAST part closed: stop | target | exit | time | end */
+  reason: string
+  parts: MslManagedPart[]
+  /** price pnl per unit, summed over partial exits by fraction (positive = in the trade's favour) */
+  pnlPrice: number
+  /** pnlPrice / initial risk (|entry - first stop|) - absent when the trade never had a stop */
+  r?: number
+  win: boolean
+  /** binary-equivalent pnl x size (comparison only - see the section header) */
+  pnl?: number
+  initStop?: number
+}
+export interface MslManagedResult {
+  ok: boolean
+  error?: string
+  barsEvaluated: number
+  trades: MslManagedTrade[]
+  wins: number
+  losses: number
+  winRate: number | null
+  /** sum of pnlPrice / sum of |losses| (null when there are no losing trades) */
+  profitFactor: number | null
+  avgBars: number | null
+  /** R-multiple stats over the trades that had a stop */
+  rTrades: number
+  expectancyR: number | null
+  netR: number | null
+  maxDrawdownR: number | null
+  byReason: Record<string, number>
+  netPnl?: number
+  /** the last evaluation's chart overlays, so a caller can draw what the script drew */
+  draws?: MslDraw[]
+  skippedBadLevels: number
+  execution: 'simulated-managed'
+  note: string
+}
+
+export function backtestMslManaged(candles: Candle[], script: string, opts: MslManagedOpts = {}): MslManagedResult {
+  const warmupBars = Math.max(1, Math.round(opts.warmupBars ?? 60))
+  const minConfidence = Math.max(0, Math.min(100, opts.minConfidence ?? 0))
+  const runId = opts.runId ?? `mslmanaged:${Date.now()}:${Math.random().toString(36).slice(2)}`
+  const maxBarsDefault = Math.max(1, Math.round(opts.maxBars ?? 120))
+  const maxPosDefault = Math.max(1, Math.round(opts.maxPositions ?? 1))
+  const payout = opts.payout !== undefined && Number.isFinite(opts.payout) ? Math.max(0, opts.payout) : undefined
+  const slipAtr = Math.max(0, opts.slipAtr ?? 0)
+  const note = 'Simulated price-based exits on candle OHLC: not what a fixed-expiry binary option can do. Stop is checked before target when one bar touches both; gaps fill at the open.'
+  const fail = (error: string): MslManagedResult => ({ ok: false, error, barsEvaluated: 0, trades: [], wins: 0, losses: 0, winRate: null, profitFactor: null, avgBars: null, rTrades: 0, expectancyR: null, netR: null, maxDrawdownR: null, byReason: {}, skippedBadLevels: 0, execution: 'simulated-managed', note })
+  const parsed = parseStrategyScript(script)
+  if (!parsed.ok) return fail(`script parse error: ${parsed.error}`)
+  if (candles.length < warmupBars + 5) return fail(`not enough candles - need at least ${warmupBars + 5}, got ${candles.length}`)
+  const reads = unavailableReads()
+  applyPayoutRead(reads, payout)
+  const crossTf = makeCrossTf(candles)
+
+  interface Pos extends MslPosView { openIdx: number; confidence: number; maxBars: number; parts: MslManagedPart[]; dirName: 'call' | 'put'; trailStep: number; be: number }
+  const open: Pos[] = []
+  const trades: MslManagedTrade[] = []
+  let nextId = 1, skipped = 0, lastDraws: MslDraw[] | undefined, lastErr: string | undefined
+  const atrAt = (i: number): number => { let sum = 0, n = 0; for (let k = Math.max(1, i - 13); k <= i; k++) { sum += Math.max(candles[k].high - candles[k].low, Math.abs(candles[k].high - candles[k - 1].close), Math.abs(candles[k].low - candles[k - 1].close)); n++ } return n ? sum / n : 0 }
+  const fill = (p: Pos, i: number, price: number, frac: number, reason: string): void => {
+    const slip = slipAtr * atrAt(i)
+    const px = p.dir > 0 ? price - slip : price + slip
+    const f = Math.min(frac, p.left)
+    if (f <= 1e-9) return
+    p.parts.push({ index: i, price: px, frac: f, reason })
+    p.left = Math.max(0, p.left - f)
+    if (p.left <= 1e-9) {
+      p.left = 0
+      const pnlPrice = p.parts.reduce((a, q) => a + q.frac * p.dir * (q.price - p.entry), 0)
+      const risk = Number.isFinite(p.initStop) ? Math.abs(p.entry - p.initStop) : NaN
+      const t: MslManagedTrade = { id: p.id, index: p.openIdx, time: candles[p.openIdx].time, direction: p.dirName, confidence: p.confidence, entry: p.entry, size: p.size, exitIndex: i, exit: px, bars: i - p.openIdx, reason, parts: p.parts, pnlPrice, win: pnlPrice > 0 }
+      if (risk > 0) { t.r = pnlPrice / risk; t.initStop = p.initStop }
+      if (payout !== undefined) t.pnl = (t.win ? payout : -1) * p.size
+      trades.push(t)
+      open.splice(open.indexOf(p), 1)
+    }
+  }
+  const sane = (dir: 1 | -1, entry: number, stop: number, target: number): [number, number] => {
+    let st = stop, tg = target
+    if (Number.isFinite(st) && !(dir > 0 ? st < entry : st > entry)) { st = NaN; skipped++ }
+    if (Number.isFinite(tg) && !(dir > 0 ? tg > entry : tg < entry)) { tg = NaN; skipped++ }
+    return [st, tg]
+  }
+
+  beginMslBacktest()
+  try {
+    for (let i = warmupBars; i < candles.length; i++) {
+      const c = candles[i]
+      // 1) price action on bar i against the levels set at earlier closes
+      for (const p of open.slice()) {
+        p.bars = i - p.openIdx
+        const hitStop = Number.isFinite(p.stop) && (p.dir > 0 ? c.low <= p.stop : c.high >= p.stop)
+        const hitTgt = Number.isFinite(p.target) && (p.dir > 0 ? c.high >= p.target : c.low <= p.target)
+        if (hitStop) { fill(p, i, p.dir > 0 ? Math.min(c.open, p.stop) : Math.max(c.open, p.stop), p.left, 'stop'); continue }
+        if (hitTgt) { fill(p, i, p.dir > 0 ? Math.max(c.open, p.target) : Math.min(c.open, p.target), p.left, 'target'); continue }
+        p.best = p.dir > 0 ? Math.max(p.best, c.high) : Math.min(p.best, c.low)
+        p.worst = p.dir > 0 ? Math.min(p.worst, c.low) : Math.max(p.worst, c.high)
+        if (Number.isFinite(p.trail) && p.trail > 0) { const ns = p.dir > 0 ? p.best - p.trail : p.best + p.trail; if (!Number.isFinite(p.stop) || (p.dir > 0 ? ns > p.stop : ns < p.stop)) p.stop = ns }
+        if (Number.isFinite(p.be) && p.dir * (p.best - p.entry) >= p.be) { if (!Number.isFinite(p.stop) || (p.dir > 0 ? p.entry > p.stop : p.entry < p.stop)) p.stop = p.entry }
+        if (p.bars >= p.maxBars) fill(p, i, c.close, p.left, 'time')
+      }
+      // 2) the script, once, at this close
+      const series = seriesUpToManaged(candles, i)
+      const views: MslPosView[] = open.map((p) => ({ id: p.id, dir: p.dir, entry: p.entry, bars: p.bars, best: p.best, worst: p.worst, left: p.left, stop: p.stop, target: p.target, trail: p.trail, size: p.size, initStop: p.initStop }))
+      const out = evaluateStrategyScript(parsed.ast, reads, undefined, series, crossTf(i), undefined, { keyPrefix: runId, barTimeSec: c.time }, { positions: views })
+      if (out.error) { lastErr = out.error; continue }
+      if (out.draws) lastDraws = out.draws
+      for (const u of out.posUpdates ?? []) {
+        const p = open.find((q) => q.id === u.id); if (!p) continue
+        // a stop only ever TIGHTENS (moves toward price) once set - re-evaluating `pos.stop = ...` every bar can ratchet it but never loosen it
+        if (u.stop !== undefined && (!Number.isFinite(p.stop) || (p.dir > 0 ? u.stop > p.stop : u.stop < p.stop))) p.stop = u.stop
+        if (u.target !== undefined) p.target = u.target
+        if (u.trail !== undefined) p.trail = u.trail
+        if (u.breakeven !== undefined) p.be = u.breakeven
+      }
+      for (const x of out.exits ?? []) { const p = open.find((q) => q.id === x.id); if (p) fill(p, i, c.close, x.frac >= 0.999999 ? p.left : x.frac * p.left, 'exit') }
+      // 3) a new entry
+      if (out.direction !== 'none' && out.confidence >= minConfidence && i < candles.length - 1) {
+        const maxPos = Math.max(1, Math.round(out.entry?.max ?? maxPosDefault))
+        const dirName = out.direction
+        const dir: 1 | -1 = dirName === 'call' ? 1 : -1
+        if (open.length < maxPos && open.every((q) => q.dir === dir)) {
+          const [stop, target] = sane(dir, c.close, out.entry?.stop ?? NaN, out.entry?.target ?? NaN)
+          const tm = out.expiryMin !== undefined && opts.barSeconds ? Math.max(1, Math.round((out.expiryMin * 60) / opts.barSeconds)) : maxBarsDefault
+          open.push({ id: nextId++, dir, dirName, entry: c.close, bars: 0, best: c.close, worst: c.close, left: 1, stop, target, trail: out.entry?.trail ?? NaN, size: out.entry?.size && out.entry.size > 0 ? out.entry.size : 1, initStop: stop, openIdx: i, confidence: out.confidence, maxBars: tm, parts: [], trailStep: 0, be: out.entry?.breakeven ?? NaN })
+        }
+      }
+    }
+    for (const p of open.slice()) fill(p, candles.length - 1, candles[candles.length - 1].close, p.left, 'end')
+  } finally {
+    endMslBacktest()
+    clearMslState(runId)
+  }
+  trades.sort((a, b) => a.index - b.index || a.id - b.id)
+  const wins = trades.filter((t) => t.win).length
+  const gain = trades.filter((t) => t.pnlPrice > 0).reduce((a, t) => a + t.pnlPrice * t.size, 0)
+  const loss = trades.filter((t) => t.pnlPrice < 0).reduce((a, t) => a + Math.abs(t.pnlPrice) * t.size, 0)
+  const rs = trades.filter((t) => t.r !== undefined).map((t) => (t.r as number) * t.size)
+  let cum = 0, peak = 0, dd = 0
+  for (const r of rs) { cum += r; peak = Math.max(peak, cum); dd = Math.max(dd, peak - cum) }
+  const byReason: Record<string, number> = {}
+  for (const t of trades) byReason[t.reason] = (byReason[t.reason] ?? 0) + 1
+  const res: MslManagedResult = {
+    ok: true, barsEvaluated: candles.length - warmupBars, trades, wins, losses: trades.length - wins, winRate: trades.length ? wins / trades.length : null,
+    profitFactor: loss > 0 ? gain / loss : null, avgBars: trades.length ? trades.reduce((a, t) => a + t.bars, 0) / trades.length : null,
+    rTrades: rs.length, expectancyR: rs.length ? rs.reduce((a, b) => a + b, 0) / rs.length : null, netR: rs.length ? rs.reduce((a, b) => a + b, 0) : null, maxDrawdownR: rs.length ? dd : null,
+    byReason, skippedBadLevels: skipped, execution: 'simulated-managed', note,
+  }
+  if (payout !== undefined) res.netPnl = trades.reduce((a, t) => a + (t.pnl ?? 0), 0)
+  if (lastDraws) res.draws = lastDraws
+  if (!trades.length && lastErr) res.error = `no trades; last script error: ${lastErr}`
+  return res
+}
+/** series up to bar i for the managed loop - same shape fireSignalsInner uses, trimmed to the last 1500 bars so a long run stays fast */
+function seriesUpToManaged(candles: Candle[], i: number): MslSeriesCtx {
+  const lo = Math.max(0, i + 1 - 1500)
+  const sl = candles.slice(lo, i + 1)
+  return { open: sl.map((c) => c.open), high: sl.map((c) => c.high), low: sl.map((c) => c.low), close: sl.map((c) => c.close), volume: sl.map((c) => c.volume ?? 0), time: sl.map((c) => c.time) }
 }

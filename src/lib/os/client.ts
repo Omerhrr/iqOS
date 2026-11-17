@@ -663,6 +663,13 @@ export async function getExpectedMove(asset: string, tf: string, p: ExpectedMove
   return osGet('/expected_move', { asset, tf, bars: String(p.bars), k: p.ks, window: String(p.window), mode: p.mode, hurst: String(p.hurst) })
 }
 
+export interface MslDrawObj { kind: 'line' | 'hline' | 'zone' | 'label' | 'marker'; p1?: number; t1?: number; p2?: number; t2?: number; top?: number; bottom?: number; text?: string; color?: string; style?: string }
+export interface MslDrawResponse { ok: boolean; error?: string; draws: MslDrawObj[]; trades?: number; lastTime?: number; barSec?: number }
+/** Run an MSL script bar by bar over recent candles and return the chart overlays it drew (draw.line / hline / zone / label / marker). */
+export async function runMslDraw(script: string, asset: string, tf: string): Promise<MslDrawResponse> {
+  return osPost('/msl_draw', { script, asset, tf })
+}
+
 /** Previous day / week highs & lows, today's range and the latest Asia / London / New York session ranges. */
 export async function getDayLevels(asset: string, tf: string = '5m'): Promise<DayLevelsResponse> {
   return osGet('/levels', { asset, tf })

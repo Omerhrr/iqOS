@@ -1,0 +1,10 @@
+# Overlay only (SCR button on the chart): swing S/R levels, a trendline through the last two lows and a zone around the last swing high
+draw.hline(sw.high(1), "#fb7185", "R1")
+draw.hline(sw.low(1), "#34d399", "S1")
+draw.line(sw.low(2), sw.lowAge(2), sw.low(1), sw.lowAge(1), "#22d3ee", "trend", "right")
+let a = ind.atr(14)[-1]
+draw.zone(sw.high(1) + 0.3 * a, sw.high(1) - 0.3 * a, sw.highAge(1), 0, "#c084fc", "supply")
+for i = 1 to 5
+  draw.marker(sw.lowAge(i), "up", "#34d399")
+  draw.marker(sw.highAge(i), "down", "#fb7185")
+end

@@ -25,7 +25,7 @@ import {
   type UTCTimestamp,
 } from 'lightweight-charts'
 import type { AnalysisResult, Candle, ChartType, ExpirySurfaceResponse, IndicatorSeries, IvHvResponse, NextExpiryPrediction, OtcFootprintResult, OutcomeMemoryResponse, Position, PulseBarRow, PulseBarsResponse, TickBarRow, TickFootprintResult, TicksResponse, Timeframe } from '@/lib/os/client'
-import { chartPriceFormat, fmtPrice, getDayLevels, getFastLevels, getExpectedMove, EM_DEFAULT_PARAMS, type ExpectedMoveParams, getExpirySurface, getNextExpiry, getOtcFootprint, getOutcomeMemory, getPulseBars, getTickFootprint, osGet, TIMEFRAME_SECONDS } from '@/lib/os/client'
+import { chartPriceFormat, fmtPrice, getDayLevels, getFastLevels, getExpectedMove, runMslDraw, EM_DEFAULT_PARAMS, type ExpectedMoveParams, getExpirySurface, getNextExpiry, getOtcFootprint, getOutcomeMemory, getPulseBars, getTickFootprint, osGet, TIMEFRAME_SECONDS } from '@/lib/os/client'
 
 interface ChartPanelProps {
   candles: Candle[]
@@ -2902,6 +2902,105 @@ export default function ChartPanel({
     }
   }, [showEm, digitsTicker, chartType, tf, emP])
 
+  // SCR toggle: chart overlays DRAWN BY AN MSL SCRIPT (draw.line / hline / zone / label / marker). Right-click opens the script box; the script runs bar by bar over recent candles on the server (so var state is what it would be live).
+  const SCR_DEFAULT = '# draws the last two swing lows as a trendline and the latest swing high as a level\ndraw.line(sw.low(2), sw.lowAge(2), sw.low(1), sw.lowAge(1), "#22d3ee", "TL", "right")\ndraw.hline(sw.high(1), "#fb7185", "swing high")\n'
+  const [showScr, setShowScr] = useState(false)
+  const [scrOpen, setScrOpen] = useState(false)
+  const [scrText, setScrText] = useState(() => {
+    try {
+      return window.localStorage.getItem('iqos.chartScript') || SCR_DEFAULT
+    } catch {
+      return SCR_DEFAULT
+    }
+  })
+  const [scrRun, setScrRun] = useState(0)
+  const [scrNote, setScrNote] = useState('')
+  const scrSeriesRef = useRef<ISeriesApi<'Line'>[]>([])
+  const scrLinesRef = useRef<{ series: AnyPriceSeries; line: IPriceLine }[]>([])
+  useEffect(() => {
+    const clearScr = () => {
+      for (const l of scrLinesRef.current) {
+        try {
+          l.series.removePriceLine(l.line)
+        } catch {
+          // chart already torn down
+        }
+      }
+      scrLinesRef.current = []
+      for (const ts of scrSeriesRef.current) {
+        try {
+          chartRef.current?.removeSeries(ts)
+        } catch {
+          // chart already torn down
+        }
+      }
+      scrSeriesRef.current = []
+    }
+    if (!showScr) {
+      clearScr()
+      setScrNote('')
+      return
+    }
+    let alive = true
+    const draw = () =>
+      runMslDraw(scrText, digitsTicker, tf ?? '1m')
+        .then((d) => {
+          const ch = chartRef.current
+          const series = priceSeriesRef.current
+          if (!alive || !ch || !series) return
+          clearScr()
+          if (!d.ok) {
+            setScrNote(d.error ?? 'script error')
+            return
+          }
+          setScrNote(`${d.draws.length} object(s)`)
+          const last = d.lastTime ?? 0
+          const bar = d.barSec ?? 60
+          const addLine = (pts: { time: number; value: number }[], color: string, width: 1 | 2 | 3, style: LineStyle) => {
+            const ls = ch.addSeries(LineSeries, { color, lineWidth: width, lineStyle: style, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false })
+            ls.setData(pts.sort((a, b) => a.time - b.time).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })))
+            scrSeriesRef.current.push(ls)
+            return ls
+          }
+          const tag = (time: number, value: number, text: string, color: string, position: 'aboveBar' | 'belowBar' | 'inBar', shape: 'circle' | 'arrowUp' | 'arrowDown') => {
+            const ls = addLine([{ time, value }], 'rgba(0,0,0,0)', 1, LineStyle.Solid)
+            createSeriesMarkers(ls, [{ time: time as UTCTimestamp, position, shape, color, text }])
+          }
+          for (const o of d.draws) {
+            const col = o.color ?? '#f59e0b'
+            if (o.kind === 'hline' && o.p1 !== undefined) {
+              const line = series.createPriceLine({ price: o.p1, color: col, lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: !!o.text, title: o.text ?? '' })
+              scrLinesRef.current.push({ series, line })
+            } else if (o.kind === 'line' && o.p1 !== undefined && o.p2 !== undefined && o.t1 && o.t2 && o.t1 !== o.t2) {
+              const pts = [{ time: o.t1, value: o.p1 }, { time: o.t2, value: o.p2 }]
+              if (o.style === 'right' && last) {
+                const slope = (o.p2 - o.p1) / (o.t2 - o.t1)
+                const tEnd = last + 30 * bar
+                pts.push({ time: tEnd, value: o.p2 + slope * (tEnd - o.t2) })
+              }
+              addLine(pts, col, 2, LineStyle.Solid)
+              if (o.text) tag(Math.max(o.t1, o.t2), o.p2, o.text, col, 'aboveBar', 'circle')
+            } else if (o.kind === 'zone' && o.top !== undefined && o.bottom !== undefined && o.t1) {
+              const t2 = o.t2 && o.t2 !== o.t1 ? o.t2 : last + bar
+              for (const pr of [o.top, o.bottom]) addLine([{ time: o.t1, value: pr }, { time: Math.max(t2, o.t1 + bar), value: pr }], col, 1, LineStyle.Solid)
+              if (o.text) tag(o.t1, o.top, o.text, col, 'aboveBar', 'circle')
+            } else if (o.kind === 'label' && o.p1 !== undefined && o.t1) {
+              tag(o.t1, o.p1, o.text ?? '', col, 'inBar', 'circle')
+            } else if (o.kind === 'marker' && o.p1 !== undefined && o.t1) {
+              tag(o.t1, o.p1, o.text ?? '', col, o.style === 'down' ? 'aboveBar' : 'belowBar', o.style === 'down' ? 'arrowDown' : 'arrowUp')
+            }
+          }
+        })
+        .catch((e) => setScrNote(String(e instanceof Error ? e.message : e).slice(0, 120)))
+    void draw()
+    const t = setInterval(draw, 20_000)
+    return () => {
+      alive = false
+      clearInterval(t)
+      clearScr()
+    }
+  }, [showScr, digitsTicker, chartType, tf, scrRun])
+
   const fitChart = () => {
     chartRef.current?.timeScale().fitContent()
     chartRef.current?.timeScale().scrollToRealTime()
@@ -2969,6 +3068,52 @@ export default function ChartPanel({
               <input type="text" value={emP.ks} onChange={(e) => setEmP((p) => ({ ...p, ks: e.target.value.replace(/[^0-9.,]/g, '').slice(0, 20) || '1,2' }))} className="w-16 rounded border border-[#1c2739] bg-[#0d1420] px-1 text-right" />
             </label>
             <button onClick={() => setEmP(EM_DEFAULT_PARAMS)} className="w-full rounded border border-[#1c2739] py-0.5 text-[#7c8aa5] hover:text-white">reset defaults</button>
+          </div>
+        )}
+        <button
+          onClick={() => setShowScr((v) => !v)}
+          onContextMenu={(e) => {
+            e.preventDefault()
+            setScrOpen((v) => !v)
+          }}
+          title={`Script overlay: lines, zones, labels and markers drawn by your own MSL script (draw.line / draw.hline / draw.zone / draw.label / draw.marker). Click = on/off, right-click = edit the script.${scrNote ? ' - ' + scrNote : ''}`}
+          className={`flex h-6 w-6 items-center justify-center rounded border font-mono text-[8px] font-bold leading-none transition-colors ${
+            showScr ? 'border-fuchsia-500/60 bg-fuchsia-500/15 text-fuchsia-300' : 'border-[#1c2739] bg-[#0d1420]/90 text-[#7c8aa5] hover:border-fuchsia-500/40'
+          }`}
+        >
+          SCR
+        </button>
+        {scrOpen && (
+          <div className="absolute bottom-0 right-8 z-30 w-72 space-y-1 rounded border border-fuchsia-500/40 bg-[#0b111c]/95 p-2 font-mono text-[9px] text-[#9fb0cc] shadow-lg">
+            <div className="flex items-center justify-between text-fuchsia-300">
+              <span>CHART SCRIPT (draw.*)</span>
+              <button onClick={() => setScrOpen(false)} className="text-[#7c8aa5] hover:text-white">x</button>
+            </div>
+            <textarea
+              value={scrText}
+              onChange={(e) => setScrText(e.target.value)}
+              spellCheck={false}
+              rows={9}
+              className="w-full rounded border border-[#1c2739] bg-[#0d1420] p-1 text-[9px] leading-tight text-[#dbe4f0]"
+            />
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => {
+                  try {
+                    window.localStorage.setItem('iqos.chartScript', scrText)
+                  } catch {
+                    // storage unavailable
+                  }
+                  setShowScr(true)
+                  setScrRun((n) => n + 1)
+                }}
+                className="flex-1 rounded border border-fuchsia-500/40 py-0.5 text-fuchsia-300 hover:bg-fuchsia-500/10"
+              >
+                run
+              </button>
+              <button onClick={() => setScrText(SCR_DEFAULT)} className="rounded border border-[#1c2739] px-1 py-0.5 text-[#7c8aa5] hover:text-white">example</button>
+            </div>
+            {scrNote && <div className="text-[#7c8aa5]">{scrNote}</div>}
           </div>
         )}
         <button
