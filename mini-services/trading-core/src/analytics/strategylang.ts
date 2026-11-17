@@ -248,6 +248,7 @@ import { WYCKOFF_MIN_BARS, readWyckoff, type WyckoffRead } from './mslwyckoff'
 import { SMCX_MIN_BARS, readSmcx, type SmcxRead } from './mslsmcx'
 import { smtDivergence } from './smt'
 import { readBlocks, readJudas, readSoup, type BlockRead, type JudasRead } from './mslpatterns'
+import { detectChartPatterns2, readAutoTrend, readElliott, CP_MIN_BARS, type CpHit, type AutoTrend, type EwRead } from './patternengine'
 import { stepHold, holdKey, holdRec, clearHolds, inReplay, replayBypassOn, stepBypass, clearBypass } from './timing'
 import { liveRiskOutcomes, riskStats, sessionAt, minsIn, minsLeft, inWindow, weekendAt, type RiskOutcome } from './mslrisk'
 import { readPullback, PB_MIN_BARS, type PullbackRead } from './pullback'
@@ -3009,6 +3010,95 @@ function sessionMethod(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
   }
 }
 
+const cpCache = new WeakMap<MslSeriesCtx, CpHit[]>()
+const atrdCache = new WeakMap<MslSeriesCtx, AutoTrend>()
+const ewCache = new WeakMap<MslSeriesCtx, EwRead>()
+/** `cp.*` - CHART PATTERNS (analytics/patternengine.ts): ascending/descending/symmetrical triangle, rising/falling wedge, rectangle, bull/bear flag, bullish/bearish pennant, head and shoulders (+ inverse), cup and handle (+ inverted). ATR-based geometry on the last 160 closed bars;
+ * a pattern is "forming" (barsAgo 0) while price is inside its boundary, "broken" when a close went beyond by 0.1 ATR (direction = the break). Candle-derived, backtestable; the trailing string after the name (or alone) = higher timeframe. */
+function cpMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const s = requireSeries(ctx, tf)
+  if (name === 'ok') return s.close.length >= CP_MIN_BARS
+  if (s.close.length < CP_MIN_BARS) throw new MslRuntimeError(`cp.${name}() needs at least ${CP_MIN_BARS} closed bars - history is too thin`)
+  let hits = cpCache.get(s)
+  if (!hits) cpCache.set(s, (hits = detectChartPatterns2(candlesWithTime(s))))
+  const want = (): CpHit | undefined => {
+    if (typeof args[0] !== 'string') throw new MslRuntimeError(`cp.${name}("pattern name") needs the pattern name as a quoted string, e.g. cp.${name}("Falling Wedge")`)
+    const k = args[0].toLowerCase()
+    return hits!.find((h) => h.name.toLowerCase() === k)
+  }
+  const sgn = (h: CpHit | undefined): number => (!h ? 0 : h.direction === 'bullish' ? 1 : h.direction === 'bearish' ? -1 : 0)
+  const rank = (h: CpHit): number => h.reliability * 10 - h.barsAgo
+  const bestHit = (): CpHit | undefined => [...hits!].sort((a, b) => rank(b) - rank(a))[0]
+  switch (name) {
+    case 'has': return want() !== undefined
+    case 'dir': return sgn(want())
+    case 'broken': return want()?.broken ?? false
+    case 'age': return want()?.barsAgo ?? 99
+    case 'target': return want()?.target ?? 0
+    case 'upper': return want()?.upper ?? 0
+    case 'lower': return want()?.lower ?? 0
+    case 'count': return hits.length
+    case 'bull': return hits.filter((h) => h.direction === 'bullish').length
+    case 'bear': return hits.filter((h) => h.direction === 'bearish').length
+    case 'net': return hits.reduce((a, h) => a + (h.direction === 'bullish' ? h.reliability : h.direction === 'bearish' ? -h.reliability : 0), 0)
+    case 'best': return bestHit()?.name ?? ''
+    case 'bestDir': return sgn(bestHit())
+    case 'bestRel': return bestHit()?.reliability ?? 0
+    default: throw new MslRuntimeError(`unknown cp method "cp.${name}(...)" - use ok/has(name)/dir(name)/broken(name)/age(name)/target(name)/upper(name)/lower(name)/count/bull/bear/net/best/bestDir/bestRel`)
+  }
+}
+/** `autotrend.*` - AUTO TREND DETECTOR: regression of the last 50 closes (slope in ATR per bar, R2) plus the pivot trendline (lows in an up-trend, highs in a down-trend). */
+function autotrendMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  void args
+  const s = requireSeries(ctx, tf)
+  if (name === 'ok') return s.close.length >= CP_MIN_BARS
+  if (s.close.length < CP_MIN_BARS) throw new MslRuntimeError(`autotrend.${name}() needs at least ${CP_MIN_BARS} closed bars - history is too thin`)
+  let t = atrdCache.get(s)
+  if (!t) atrdCache.set(s, (t = readAutoTrend(candlesWithTime(s))))
+  if (!t.ok) throw new MslRuntimeError(`autotrend.${name}() - not enough usable bars (flat ATR)`)
+  switch (name) {
+    case 'dir': return t.dir
+    case 'up': return t.dir === 1
+    case 'down': return t.dir === -1
+    case 'flat': return t.dir === 0
+    case 'slope': return t.slope
+    case 'r2': return t.r2
+    case 'strength': return t.strength
+    case 'touches': return t.touches
+    case 'line': return t.line
+    case 'dist': { const a14 = atrInd(s.high, s.low, s.close, 14); const a = a14[a14.length - 1]; return t.line && a > 0 ? (s.close[s.close.length - 1] - t.line) / a : 0 }
+    case 'broken': return t.broken
+    case 'brokenAge': return t.broken ? t.brokenAge : 99
+    default: throw new MslRuntimeError(`unknown autotrend method "autotrend.${name}(...)" - use ok/dir/up/down/flat/slope/r2/strength/touches/line/dist/broken/brokenAge`)
+  }
+}
+/** `ew.*` - ELLIOTT WAVE (analytics/patternengine.ts readElliott): one strict mechanical count - wave 3 in progress, wave 5, five waves done, or a completed A-B-C - with the expected direction, a Fibonacci target and the invalidation level. */
+function ewMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  void args
+  const s = requireSeries(ctx, tf)
+  if (name === 'ok') return s.close.length >= CP_MIN_BARS
+  if (s.close.length < CP_MIN_BARS) throw new MslRuntimeError(`ew.${name}() needs at least ${CP_MIN_BARS} closed bars - history is too thin`)
+  let r = ewCache.get(s)
+  if (!r) ewCache.set(s, (r = readElliott(candlesWithTime(s))))
+  if (!r.ok) throw new MslRuntimeError(`ew.${name}() - not enough usable bars (flat ATR)`)
+  switch (name) {
+    case 'active': return r.state !== 'none'
+    case 'state': return r.state
+    case 'wave': return r.wave
+    case 'wave3': return r.state === 'wave3'
+    case 'wave5': return r.state === 'wave5'
+    case 'done': return r.state === 'wave5done'
+    case 'abc': return r.state === 'abcdone'
+    case 'dir': return r.dir
+    case 'trend': return r.trend
+    case 'retrace': return r.retrace
+    case 'target': return r.target
+    case 'invalid': return r.invalid
+    case 'conf': return r.conf
+    default: throw new MslRuntimeError(`unknown ew method "ew.${name}(...)" - use ok/active/state/wave/wave3/wave5/done/abc/dir/trend/retrace/target/invalid/conf`)
+  }
+}
+
 const polarCache = new WeakMap<MslSeriesCtx, PolarRead>()
 /** `polar.*` - the Polarity Switch (analytics/polarity.ts): keeps four plain base signals (follow/ctl/rev/trend), measures walk-forward how each has done on THIS pair in the SAME mkt regime,
  * and KEEPs one that is reliably right, FLIPs one that is reliably wrong (z <= -2, n >= 30), SKIPs the rest. `polar.<m>()` reads the best base (largest |z|); `polar.<m>("ctl")` reads a named one. Candle-derived, backtestable. */
@@ -4982,6 +5072,13 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         const ftf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
         return e.obj.name === 'snr' ? snrMethod(e.name, args, ctx, ftf) : e.obj.name === 'zone' ? zoneMethod(e.name, args, ctx, ftf) : e.obj.name === 'trend' ? trendMethod(e.name, args, ctx, ftf) : fibsMethod(e.name, args, ctx, ftf)
+      }
+      if (e.obj.t === 'ident' && (e.obj.name === 'cp' || e.obj.name === 'autotrend' || e.obj.name === 'ew') && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        // cp.<m>("pattern name") takes the pattern name as its first string; a SECOND string (or a lone string on a method that takes no name) is the timeframe
+        const takesName = e.obj.name === 'cp' && ['has', 'dir', 'broken', 'age', 'target', 'upper', 'lower'].includes(e.name)
+        const tf = args.length && typeof args[args.length - 1] === 'string' && (!takesName || args.length >= 2) ? (args.pop() as string) : undefined
+        return e.obj.name === 'cp' ? cpMethod(e.name, args, ctx, tf) : e.obj.name === 'autotrend' ? autotrendMethod(e.name, args, ctx, tf) : ewMethod(e.name, args, ctx, tf)
       }
       if (e.obj.t === 'ident' && (e.obj.name === 'risk' || e.obj.name === 'session') && !(e.obj.name in env)) {
         const args = e.args.map((a) => evalExpr(a, env, ctx))

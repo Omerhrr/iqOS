@@ -1,6 +1,7 @@
 // IQAIR//OS - Candlestick pattern recognition
 // Scans the tail of a candle series and reports hits with direction + reliability.
 import type { Candle, PatternHit } from '../types'
+import { patternEngineHits, CHART_PATTERN_NAMES } from './patternengine'
 
 const body = (c: Candle) => Math.abs(c.close - c.open)
 const range = (c: Candle) => Math.max(c.high - c.low, 1e-12)
@@ -236,6 +237,15 @@ export function detectPatterns(candles: Candle[], lookback = 8): PatternHit[] {
       } catch {
         // detector needs more history - skip
       }
+    }
+  }
+  // chart patterns (triangles, wedges, flags, H&S, cup & handle, auto trend, Elliott ...): computed ONCE on the whole series (they look back 160 bars), kept when still fresh within `lookback`.
+  // Skipped on short series; a thin window simply cannot hold these shapes. barsAgo = bars since the pattern broke out (0 while it is still forming).
+  if (candles.length >= 60) {
+    try {
+      for (const h of patternEngineHits(candles)) if (h.barsAgo < Math.max(1, lookback)) hits.push({ name: h.name, direction: h.direction, reliability: h.reliability, barsAgo: h.barsAgo, note: h.note })
+    } catch {
+      // a chart-pattern read needing more history never breaks the candle scan
     }
   }
   // dedupe by name keeping the MOST RECENT occurrence - AUDIT FIX (Task 58,
@@ -658,7 +668,55 @@ const breakaway: Detector = (w) => {
   return null
 }
 
+// ---- Phase 4: gap and shadow patterns ----
+/** Upside Tasuki Gap (bullish continuation): a white bar, a white bar gapping UP over it, then a black bar that opens inside the second body and closes inside the gap WITHOUT closing it. */
+const upsideTasukiGap: Detector = (w) => {
+  const [a, b, c] = w.slice(-3)
+  if (isBull(a) && isBull(b) && b.low > a.high && isBear(c) && c.open <= b.close && c.open >= b.open && c.close < b.open && c.close > a.high)
+    return { name: 'Upside Tasuki Gap', direction: 'bullish', reliability: 2, barsAgo: 2, note: 'Pullback into an up-gap that fails to close it - uptrend continues' }
+  return null
+}
+/** Downside Tasuki Gap (bearish continuation): mirror. */
+const downsideTasukiGap: Detector = (w) => {
+  const [a, b, c] = w.slice(-3)
+  if (isBear(a) && isBear(b) && b.high < a.low && isBull(c) && c.open >= b.close && c.open <= b.open && c.close > b.open && c.close < a.low)
+    return { name: 'Downside Tasuki Gap', direction: 'bearish', reliability: 2, barsAgo: 2, note: 'Bounce into a down-gap that fails to close it - downtrend continues' }
+  return null
+}
+/** Rising Window: today's low is ABOVE yesterday's high (an up-gap, "window") with a bullish close. Falling Window: today's high is BELOW yesterday's low, bearish close. */
+const risingWindow: Detector = (w) => {
+  const c = w[w.length - 1], p = w[w.length - 2]
+  if (c.low > p.high && isBull(c) && c.low - p.high >= range(p) * 0.05)
+    return { name: 'Rising Window', direction: 'bullish', reliability: 2, barsAgo: 0, note: 'Up-gap that holds - the gap tends to act as support' }
+  return null
+}
+const fallingWindow: Detector = (w) => {
+  const c = w[w.length - 1], p = w[w.length - 2]
+  if (c.high < p.low && isBear(c) && p.low - c.high >= range(p) * 0.05)
+    return { name: 'Falling Window', direction: 'bearish', reliability: 2, barsAgo: 0, note: 'Down-gap that holds - the gap tends to act as resistance' }
+  return null
+}
+/** Long Upper Shadow: the upper wick is at least 60% of the bar's range and the body is at most 30% of it (any colour) - sellers rejected the highs. Long Lower Shadow: the mirror - buyers rejected the lows. */
+const longUpperShadow: Detector = (w) => {
+  const c = w[w.length - 1]
+  if (upperWick(c) >= range(c) * 0.6 && body(c) <= range(c) * 0.3)
+    return { name: 'Long Upper Shadow', direction: 'bearish', reliability: 1, barsAgo: 0, note: 'Highs rejected - long wick above a small body' }
+  return null
+}
+const longLowerShadow: Detector = (w) => {
+  const c = w[w.length - 1]
+  if (lowerWick(c) >= range(c) * 0.6 && body(c) <= range(c) * 0.3)
+    return { name: 'Long Lower Shadow', direction: 'bullish', reliability: 1, barsAgo: 0, note: 'Lows rejected - long wick below a small body' }
+  return null
+}
+
 const DETECTORS_EXT2: Detector[] = [
+  upsideTasukiGap,
+  downsideTasukiGap,
+  risingWindow,
+  fallingWindow,
+  longUpperShadow,
+  longLowerShadow,
   dragonflyDoji,
   gravestoneDoji,
   longLeggedDoji,
@@ -765,4 +823,13 @@ export const CANDLE_PATTERN_NAMES: string[] = [
   'Bearish Hikkake',
   'Bullish Breakaway',
   'Bearish Breakaway',
+  // phase 4: gap + shadow candles
+  'Upside Tasuki Gap',
+  'Downside Tasuki Gap',
+  'Rising Window',
+  'Falling Window',
+  'Long Upper Shadow',
+  'Long Lower Shadow',
+  // chart patterns (analytics/patternengine.ts) - emitted by detectPatterns() too, so every pattern surface and MSL's candle(name, dir) sees them
+  ...CHART_PATTERN_NAMES,
 ]

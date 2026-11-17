@@ -4362,6 +4362,11 @@ export interface BotRow {
  * "custom candlestick pattern" picker (replacing the old free-text input).
  * Kept here in sync by hand, same convention as BINARY_EXPIRY_MINUTES. */
 export const CANDLE_PATTERN_NAMES: string[] = [
+  'Upside Tasuki Gap', 'Downside Tasuki Gap', 'Rising Window', 'Falling Window', 'Long Upper Shadow', 'Long Lower Shadow',
+  'Ascending Triangle', 'Descending Triangle', 'Symmetrical Triangle', 'Falling Wedge', 'Rising Wedge', 'Rectangle', 'Bullish Rectangle', 'Bearish Rectangle',
+  'Bullish Pennant', 'Bearish Pennant', 'Bull Flag', 'Bear Flag', 'Head and Shoulders', 'Inverse Head and Shoulders', 'Cup and Handle', 'Inverted Cup and Handle',
+  'Auto Trend Up', 'Auto Trend Down', 'Up Trendline Break', 'Down Trendline Break',
+  'Elliott Wave 3 Up', 'Elliott Wave 3 Down', 'Elliott Wave 5 Up', 'Elliott Wave 5 Down', 'Elliott Five Waves Up Done', 'Elliott Five Waves Down Done', 'Elliott ABC Bottom', 'Elliott ABC Top',
   'Doji', 'Hammer', 'Inverted Hammer', 'Shooting Star', 'Hanging Man',
   'Bullish Engulfing', 'Bearish Engulfing', 'Morning Star', 'Evening Star',
   'Three White Soldiers', 'Three Black Crows', 'Piercing Line', 'Dark Cloud Cover',
