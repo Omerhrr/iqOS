@@ -342,6 +342,7 @@ export class MetaTraderService {
   private config: MetaTraderConfig = { ...DEFAULT_META_TRADER }
   private rt: MetaTraderRuntime = { trades: 0, wins: 0, losses: 0, pnlTotal: 0, openCount: 0, lastTradeTs: 0, pot: 0, rollN: 0, halted: false }
   private timer: ReturnType<typeof setInterval> | null = null
+  private holdTimer: ReturnType<typeof setInterval> | null = null
   private ticking = false
   private unsub: (() => void) | null = null
   /** per-asset re-entry cooldown (config.cooldownSec) - epoch seconds until
@@ -381,6 +382,16 @@ export class MetaTraderService {
     this.timer = setInterval(() => {
       void this.tick().catch((err) => ctx.log('meta-trader', `tick() rejected, skipping this cycle: ${(err as Error).message}`))
     }, 10_000)
+    // a timing.hold that is counting down needs finer looks than the 10 s cycle: while one is armed for the
+    // configured strategy, run the same tick every 2 s (tick() is re-entrancy guarded, so cycles never overlap).
+    this.holdTimer = setInterval(() => {
+      try {
+        const id = this.config.metaStrategyId
+        if (!this.config.enabled || this.config.signalSource !== 'meta-strategy' || !id) return
+        if (!this.ctx.use<MetaStrategyService>('metaStrategy').hasWaitingHold(id)) return
+        void this.tick().catch(() => undefined)
+      } catch { /* metaStrategy not up yet */ }
+    }, 2_000)
     ctx.log('meta-trader', `meta trader online (sources: meta-strategy/oracle/next-expiry/accute/smc + 15 individual SMC concepts + renko-smc (any-agrees) + renko-smc-majority confluence) - ${this.config.enabled ? 'armed' : 'off'} · src ${this.config.signalSource}`)
   }
 
@@ -388,6 +399,8 @@ export class MetaTraderService {
     this.unsub?.()
     if (this.timer) clearInterval(this.timer)
     this.timer = null
+    if (this.holdTimer) clearInterval(this.holdTimer)
+    this.holdTimer = null
   }
 
   private now(): number {

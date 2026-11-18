@@ -12,6 +12,7 @@
 // leadlag_outcomes.json, ...) - this is a short, hand-curated list of
 // specs, not a growing time series, so it doesn't need the Store/DB
 // machinery lab.ts's much bigger learned-strategy library uses.
+import { hasWaitingHold } from '../analytics/timing'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { KernelContext, Plugin } from '../kernel'
@@ -901,6 +902,11 @@ export class MetaStrategyService {
 
   get(id: string): MetaStrategySpec | null {
     return this.specs.get(normalizeMetaId(id)) ?? null
+  }
+
+  /** true while a timing.hold of this spec is armed and counting (optionally for one asset+tf) - traders that poll slowly use it to re-check every ~2 s only then */
+  hasWaitingHold(specId: string, asset?: string, tf?: string): boolean {
+    return hasWaitingHold(asset && tf ? `${specId}|${asset}|${tf}` : specId)
   }
 
   isValidStrategyId(id: string): boolean {
@@ -2392,9 +2398,14 @@ export class MetaStrategyService {
    * the same thin-history floor as scriptResolver() (ind.* / ohlc() calls
    * then fail the script closed, same fail-closed convention as every other
    * runtime error here). */
+  /** closed bars a script's series carries: 240 normally, 520 when the script reads `nc.*` (the next-candle oracle needs 320+ and reads the last 520 - with 240 `nc.ok()` was ALWAYS false live, so any script gated on it never traded) */
+  private seriesBars = 240
+  private setSeriesBarsFor(script: string): void {
+    this.seriesBars = /\bnc\./.test(script) ? 520 : 240
+  }
   private scriptSeries(asset: string, tf: Timeframe): MslSeriesCtx | undefined {
     try {
-      const candles = this.market.getCandlesDeep(asset, tf, 240, true)
+      const candles = this.market.getCandlesDeep(asset, tf, this.seriesBars, true)
       if (candles.length < 40) return undefined
       return {
         open: candles.map((k) => k.open),
@@ -2472,6 +2483,7 @@ export class MetaStrategyService {
   ): MetaEvalResult {
     const parsed = parseStrategyScript(script)
     if (!parsed.ok) return { direction: 'none', score: 0, confidence: 0, conditions: [], notes: `script error: ${parsed.error}` }
+    this.setSeriesBarsFor(script)
     const reads = this.buildScriptReads(asset, tf, undefined, script)
     const series = this.scriptSeries(asset, tf)
     const seriesFor = this.scriptSeriesFor(asset)
@@ -2481,7 +2493,14 @@ export class MetaStrategyService {
     // two timeframes, tracks each independently); barTimeSec is what lets
     // MslStateStore tell "still the same closed bar" from "a new one just
     // closed" apart across repeat polls.
-    const state = { keyPrefix: `${specId}|${asset}|${tf}`, barTimeSec: this.scriptBarTimeSec(asset, tf) }
+    let spot: number | undefined
+    try {
+      const px = this.market.getPrice(asset)
+      if (Number.isFinite(px) && px > 0) spot = px
+    } catch {
+      /* no spot - timing.hold falls back to ticks / 5s / bar */
+    }
+    const state = { keyPrefix: `${specId}|${asset}|${tf}`, barTimeSec: this.scriptBarTimeSec(asset, tf), spot }
     const out = evaluateStrategyScript(parsed.ast, reads, this.scriptResolver(asset, tf), series, seriesFor, live, state)
     if (!out.error && out.configs) {
       try {
@@ -2518,6 +2537,7 @@ export class MetaStrategyService {
   testScript(script: string, asset: string, tf: Timeframe): { ok: boolean; direction?: 'call' | 'put' | 'none'; confidence?: number; expiryMin?: number; trace?: string[]; price?: number; error?: string } {
     const parsed = parseStrategyScript(script)
     if (!parsed.ok) return { ok: false, error: parsed.error }
+    this.setSeriesBarsFor(script)
     const reads = this.buildScriptReads(asset, tf, undefined, script)
     const series = this.scriptSeries(asset, tf)
     const seriesFor = this.scriptSeriesFor(asset)

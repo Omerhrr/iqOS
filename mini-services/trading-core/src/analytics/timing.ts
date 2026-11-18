@@ -19,6 +19,8 @@ export interface HoldRec { state: HoldState; armedMs: number; entry: number; dir
 const store = new Map<string, HoldRec>()
 export const holdKey = (prefix: string, name: string): string => `${prefix}|hold|${name}`
 export function clearHolds(prefix: string): void { for (const k of store.keys()) if (k.startsWith(`${prefix}|hold|`)) store.delete(k) }
+/** true while any hold under this key prefix is armed and counting down - lets a slow-polling trader re-check fast only when it matters */
+export function hasWaitingHold(prefix: string): boolean { for (const [k, r] of store) if (r.state === 'waiting' && k.startsWith(`${prefix}|`) && k.includes('|hold|')) return true; return false }
 export function holdRec(key: string): HoldRec | undefined { return store.get(key) }
 
 export interface HoldInput { key: string; cond: boolean; dir: number; seconds: number; minAtr: number; abortAtr: number; nowMs: number; price: number; atr: number }

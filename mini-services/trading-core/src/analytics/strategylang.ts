@@ -521,6 +521,9 @@ export interface EvalEnv {
   ops?: { n: number }
   fnDepth?: number
   effFrame?: boolean
+  /** the feed's latest price at evaluation time (market.getPrice) - timing.hold's fallback when the tick buffer is empty or stale */
+  spotPrice?: number
+  trace?: string[]
   arrFrame?: WeakSet<object>
   persist?: Set<string>
   varRec?: { committed: Map<string, PV>; pending: Map<string, PV> }
@@ -3258,8 +3261,11 @@ function timingMethod(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
       const a14 = atrInd(s.high, s.low, s.close, 14)
       const atrv = a14[a14.length - 1]
       if (!Number.isFinite(atrv) || atrv <= 0) throw new MslRuntimeError('timing.hold(): ATR unavailable (history too thin or flat)')
-      const price = livePrice(ctx, s)
+      const lp = livePrice(ctx, s, nowMs)
+      const price = lp.price
       const r = stepHold({ key: key(), cond: truthy(args[1]), dir: d, seconds, minAtr: args[4] !== undefined ? asNum(args[4]) : 0.05, abortAtr: args[5] !== undefined ? asNum(args[5]) : 0.3, nowMs, price, atr: atrv })
+      // say what the timer is doing in the evaluation trace (the card's last-signal line) - a silent hold was impossible to diagnose
+      if (ctx.trace && (r.rec.state !== 'idle' || truthy(args[1]))) ctx.trace.push(`hold "${nameArg()}": ${r.rec.state}${r.rec.why ? ' - ' + r.rec.why : ''} (price ${Number.isFinite(price) ? price : 'n/a'} from ${lp.src}${lp.src === 'bar' || lp.src === 'tick-old' ? ' - NOT a live price, the hold cannot confirm on it' : ''})`)
       return r.fire ? 1 : 0
     }
     case 'state': return holdRec(key())?.state ?? 'idle'
@@ -3288,12 +3294,15 @@ function barSpacingSec(s: MslSeriesCtx): number {
   for (let i = Math.max(1, t.length - 30); i < t.length; i++) { const g = t[i] - t[i - 1]; if (g > 0 && g < sp) sp = g }
   return Number.isFinite(sp) ? sp : 60
 }
-/** newest tick if the context has a feed, else the newest closed 5s bar, else the trading chart's last close */
-function livePrice(ctx: EvalEnv, s: MslSeriesCtx): number {
+/** the price a hold watches: a FRESH tick (<= 15 s old), else the feed's spot price, else a stale tick, else the newest closed 5s bar, else the last closed bar (a constant within the bar, so a hold on it can never confirm) */
+function livePrice(ctx: EvalEnv, s: MslSeriesCtx, nowMs: number): { price: number; src: string } {
   const t = ctx.liveTicks
-  if (t && t.length) return t[t.length - 1].price
-  try { const f = ctx.seriesFor?.('5s'); if (f && f.close.length) return f.close[f.close.length - 1] } catch { /* no fast chart */ }
-  return s.close[s.close.length - 1]
+  const last = t && t.length ? t[t.length - 1] : undefined
+  if (last && Number.isFinite(last.price) && nowMs - last.ts <= 15_000) return { price: last.price, src: 'tick' }
+  if (ctx.spotPrice !== undefined && Number.isFinite(ctx.spotPrice) && ctx.spotPrice > 0) return { price: ctx.spotPrice, src: 'spot' }
+  if (last && Number.isFinite(last.price)) return { price: last.price, src: 'tick-old' }
+  try { const f = ctx.seriesFor?.('5s'); if (f && f.close.length) return { price: f.close[f.close.length - 1], src: '5s' } } catch { /* no fast chart */ }
+  return { price: s.close[s.close.length - 1], src: 'bar' }
 }
 
 /** `risk.*` - this system's own recent results (analytics/mslrisk.ts): streaks, today's P&L in stakes, drawdown, time since the last trade. Live = closed Meta Trader positions since kernel start; replay tester = the script's own settled trades; the candle backtester throws. */
@@ -6505,7 +6514,7 @@ export function evaluateStrategyScript(
   series?: MslSeriesCtx,
   seriesFor?: (tf: string) => MslSeriesCtx | undefined,
   live?: { bar?: MslBarValue; ticks?: readonly { ts: number; price: number }[]; nowMs?: number },
-  state?: { keyPrefix: string; barTimeSec?: number },
+  state?: { keyPrefix: string; barTimeSec?: number; spot?: number },
   managed?: { positions: MslPosView[] },
 ): MslEvalResult {
   // configs is declared before ctx so ctx.configs can point at the SAME
@@ -6529,6 +6538,8 @@ export function evaluateStrategyScript(
   const env: Record<string, MslValue> = {}
   const trace: string[] = []
   ctx.fns = ast.fns
+  ctx.spotPrice = state?.spot
+  ctx.trace = trace
   ctx.globalEnv = env
   ctx.ops = { n: 0 }
   ctx.fnDepth = 0

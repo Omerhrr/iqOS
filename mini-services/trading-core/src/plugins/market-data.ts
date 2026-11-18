@@ -901,6 +901,13 @@ export class MarketDataService {
     } catch {
       /* meta-trader plugin absent */
     }
+    try {
+      // Omni Trader's scanned pairs (same frozen-candle fix - without it timing.hold saw a frozen price and always aborted "went nowhere")
+      const omni = this.ctx.use<{ watchedAssets?: () => string[] }>('omniTrader')
+      for (const a of omni?.watchedAssets?.() ?? []) push(a)
+    } catch {
+      /* omni-trader plugin absent */
+    }
     if (out.length > MAX_LIVE_POLL_ASSETS && Date.now() - this.warnedPollCap > 3_600_000) {
       this.warnedPollCap = Date.now()
       this.ctx.log('market-data', `live poll capped at ${MAX_LIVE_POLL_ASSETS} assets - ${out.length - MAX_LIVE_POLL_ASSETS} watchlist pair(s) beyond the cap get no live candles`)

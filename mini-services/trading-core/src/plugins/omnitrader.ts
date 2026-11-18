@@ -339,6 +339,18 @@ export class OmniTraderService {
     }
   }
 
+  /** THE FROZEN-CANDLE BUG (same fix as Meta Trader / AI Trader / Brain Trader): market-data's live poll only keeps the charted asset, bot / auto-trader watchlists and the pairs those traders name warm.
+   * Omni Trader scans the market but was never in that set, so every pair OTHER than a charted/watchlisted one re-read frozen candles, a frozen price and an empty tick buffer - and `timing.hold` (which needs a
+   * moving price) could only ever see "went nowhere". Returns the pairs Omni is actually scanning so market-data keeps them live (market-data caps the warm set, charted pair first). */
+  watchedAssets(): string[] {
+    if (!this.config.enabled || !this.config.metaStrategyId) return []
+    try {
+      return this.candidatePool().slice(0, 6)
+    } catch {
+      return []
+    }
+  }
+
   private liveTicks(asset: string): readonly { ts: number; price: number }[] {
     try {
       return this.ctx.use<{ ticksFor(asset: string): { ts: number; price: number }[] }>('otcFootprint').ticksFor(asset)

@@ -300,6 +300,7 @@ export class AutopilotService {
   private lab: StrategyLabService | null = null
   private meta: MetaStrategyService | null = null
   private revalidateTimer: ReturnType<typeof setInterval> | null = null
+  private holdTimer: ReturnType<typeof setInterval> | null = null
   // Global research-gate off-switch, user-requested. Persisted (survives
   // restarts) in the SAME sentinel-state JSON blob execution.ts's setRisk()
   // uses, under its own key, so this doesn't need a schema migration. Default
@@ -376,6 +377,9 @@ export class AutopilotService {
     // again (watchdog catches live P&L drift; this catches the backtest edge
     // itself decaying, before or alongside that).
     this.revalidateTimer = setInterval(() => void this.revalidateSweep(), AutopilotService.REVALIDATE_TICK_MS)
+    // bots only evaluate on a candle close, so a timing.hold armed at the close would never be looked at again:
+    // every 2 s, re-run the bots whose meta-strategy has a hold counting down on that asset+tf.
+    this.holdTimer = setInterval(() => void this.holdSweep(), 2_000)
     ctx.log('autopilot', `bot engine online (${this.runtime.size} bots registered)`)
   }
 
@@ -384,6 +388,25 @@ export class AutopilotService {
     this.unsubscribers = []
     if (this.revalidateTimer) clearInterval(this.revalidateTimer)
     this.revalidateTimer = null
+    if (this.holdTimer) clearInterval(this.holdTimer)
+    this.holdTimer = null
+  }
+
+  private async holdSweep(): Promise<void> {
+    try {
+      const meta = this.metaStrategyService()
+      if (!meta) return
+      for (const { bot } of this.store.listBots()) {
+        if (!bot.enabled || !bot.strategyId.startsWith('meta:')) continue
+        for (const asset of bot.watchlist) {
+          if (!meta.hasWaitingHold(bot.strategyId, asset, bot.tf)) continue
+          const key = `${asset}|${bot.tf}`
+          if (this.evaluating.has(key)) continue
+          this.evaluating.add(key)
+          try { await this.tradeForBot(bot, asset, bot.tf) } catch (err) { this.reject(bot, `evaluation failed: ${String((err as Error).message).slice(0, 160)}`) } finally { this.evaluating.delete(key) }
+        }
+      }
+    } catch { /* never let the hold sweep throw */ }
   }
 
   // ---------- fleet ----------
