@@ -1,0 +1,13 @@
+# S/R swing bounce, variation 1: when the setup fires, DO NOT act - hold 20 s and only fire if price has moved WITH the trade by then
+# (timing.hold: aborts early if price goes against it by 0.3 ATR, aborts if the setup disappears, cancels if it "went nowhere"). LIVE only (Omni / Meta Trader); not backtestable.
+let holdSec = 20          # confirmation window
+let minMove = 0.05        # ATR the price must have moved in the trade direction when the time is up
+let maxAgainst = 0.30     # ATR against the trade that cancels it early
+let setupCall = near(px.low[-1], sw.low(1), 0.5) and px.close[-1] > px.open[-1]
+let setupPut = near(px.high[-1], sw.high(1), 0.5) and px.close[-1] < px.open[-1]
+# the holds are evaluated OUTSIDE any if so they keep seeing their condition every poll
+let goCall = timing.hold("srb-call", setupCall, 1, holdSec, minMove, maxAgainst)
+let goPut = timing.hold("srb-put", setupPut, -1, holdSec, minMove, maxAgainst)
+call when goCall == 1
+put when goPut == 1
+expiry = 3

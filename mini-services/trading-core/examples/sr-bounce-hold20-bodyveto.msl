@@ -1,0 +1,17 @@
+# S/R swing bounce, variation 2: same setup and the same 20 s hold, but even if price went the right way, STAND DOWN when the move was too big
+# (the forming candle's body, or the move since the signal, is already large - the entry would be chasing an extended bar). Needs the Omni Trader (live() = the forming bar). LIVE only.
+let holdSec = 20
+let minMove = 0.05        # ATR with the trade, required at the end of the hold
+let maxAgainst = 0.30
+let maxBody = 0.80        # forming-candle body above this many ATR = too big, stand down
+let maxChase = 0.60       # move since the signal above this many ATR = already ran, stand down
+let atr = ind.atr(14)[-1]
+let setupCall = near(px.low[-1], sw.low(1), 0.5) and px.close[-1] > px.open[-1]
+let setupPut = near(px.high[-1], sw.high(1), 0.5) and px.close[-1] < px.open[-1]
+let goCall = timing.hold("srb2-call", setupCall, 1, holdSec, minMove, maxAgainst)
+let goPut = timing.hold("srb2-put", setupPut, -1, holdSec, minMove, maxAgainst)
+# the hold is already consumed when it fires, so a veto here cancels that signal for good
+let tooBig = live().body > maxBody * atr
+call when goCall == 1 and not tooBig and timing.move("srb2-call") <= maxChase
+put when goPut == 1 and not tooBig and timing.move("srb2-put") <= maxChase
+expiry = 3

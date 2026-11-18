@@ -1,0 +1,8 @@
+# S/R swing bounce, variation 3: the next-candle oracle must AGREE with the setup's direction (nc.side()), otherwise no trade.
+# Candle-derived, so it BACKTESTS (needs 320+ closed bars). Raise ncMinConf to also demand a confident oracle.
+let ncMinConf = 0         # 0 = direction only; e.g. 55 = the oracle must also be at least 55% confident
+let setupCall = near(px.low[-1], sw.low(1), 0.5) and px.close[-1] > px.open[-1]
+let setupPut = near(px.high[-1], sw.high(1), 0.5) and px.close[-1] < px.open[-1]
+call when setupCall and nc.ok() and nc.side() == "call" and nc.conf() >= ncMinConf
+put when setupPut and nc.ok() and nc.side() == "put" and nc.conf() >= ncMinConf
+expiry = 3

@@ -210,4 +210,102 @@ call when near(px.low[-1], tl, 0.4) and px.close[-1] > tl and sw.low(1) > sw.low
 expiry = 3
 `,
   },
+  {
+    id: 'meta:builtin-sr-bounce-hold20',
+    name: 'Builtin: S/R swing bounce + 20s confirmation hold',
+    script: `
+# S/R swing bounce, variation 1: when the setup fires, DO NOT act - hold 20 s and only fire if price has moved WITH the trade by then
+# (timing.hold: aborts early if price goes against it by 0.3 ATR, aborts if the setup disappears, cancels if it "went nowhere"). LIVE only (Omni / Meta Trader); not backtestable.
+let holdSec = 20          # confirmation window
+let minMove = 0.05        # ATR the price must have moved in the trade direction when the time is up
+let maxAgainst = 0.30     # ATR against the trade that cancels it early
+let setupCall = near(px.low[-1], sw.low(1), 0.5) and px.close[-1] > px.open[-1]
+let setupPut = near(px.high[-1], sw.high(1), 0.5) and px.close[-1] < px.open[-1]
+# the holds are evaluated OUTSIDE any if so they keep seeing their condition every poll
+let goCall = timing.hold("srb-call", setupCall, 1, holdSec, minMove, maxAgainst)
+let goPut = timing.hold("srb-put", setupPut, -1, holdSec, minMove, maxAgainst)
+call when goCall == 1
+put when goPut == 1
+expiry = 3
+`,
+  },
+  {
+    id: 'meta:builtin-sr-bounce-hold20-bodyveto',
+    name: 'Builtin: S/R swing bounce + 20s hold + big-body stand-down',
+    script: `
+# S/R swing bounce, variation 2: same setup and the same 20 s hold, but even if price went the right way, STAND DOWN when the move was too big
+# (the forming candle's body, or the move since the signal, is already large - the entry would be chasing an extended bar). Needs the Omni Trader (live() = the forming bar). LIVE only.
+let holdSec = 20
+let minMove = 0.05        # ATR with the trade, required at the end of the hold
+let maxAgainst = 0.30
+let maxBody = 0.80        # forming-candle body above this many ATR = too big, stand down
+let maxChase = 0.60       # move since the signal above this many ATR = already ran, stand down
+let atr = ind.atr(14)[-1]
+let setupCall = near(px.low[-1], sw.low(1), 0.5) and px.close[-1] > px.open[-1]
+let setupPut = near(px.high[-1], sw.high(1), 0.5) and px.close[-1] < px.open[-1]
+let goCall = timing.hold("srb2-call", setupCall, 1, holdSec, minMove, maxAgainst)
+let goPut = timing.hold("srb2-put", setupPut, -1, holdSec, minMove, maxAgainst)
+# the hold is already consumed when it fires, so a veto here cancels that signal for good
+let tooBig = live().body > maxBody * atr
+call when goCall == 1 and not tooBig and timing.move("srb2-call") <= maxChase
+put when goPut == 1 and not tooBig and timing.move("srb2-put") <= maxChase
+expiry = 3
+`,
+  },
+  {
+    id: 'meta:builtin-sr-bounce-nc',
+    name: 'Builtin: S/R swing bounce + next-candle oracle agrees',
+    script: `
+# S/R swing bounce, variation 3: the next-candle oracle must AGREE with the setup's direction (nc.side()), otherwise no trade.
+# Candle-derived, so it BACKTESTS (needs 320+ closed bars). Raise ncMinConf to also demand a confident oracle.
+let ncMinConf = 0         # 0 = direction only; e.g. 55 = the oracle must also be at least 55% confident
+let setupCall = near(px.low[-1], sw.low(1), 0.5) and px.close[-1] > px.open[-1]
+let setupPut = near(px.high[-1], sw.high(1), 0.5) and px.close[-1] < px.open[-1]
+call when setupCall and nc.ok() and nc.side() == "call" and nc.conf() >= ncMinConf
+put when setupPut and nc.ok() and nc.side() == "put" and nc.conf() >= ncMinConf
+expiry = 3
+`,
+  },
+  {
+    id: 'meta:builtin-sr-bounce-nc-hold20',
+    name: 'Builtin: S/R swing bounce + oracle agrees + 20s hold',
+    script: `
+# S/R swing bounce, variation 4: oracle agreement + the 20 s confirmation hold. The oracle must agree to ARM the timer, and if it stops agreeing
+# during the wait the hold aborts. Fires only if price then moved WITH the trade. LIVE only (timing.hold is not backtestable).
+let holdSec = 20
+let minMove = 0.05        # ATR with the trade when the 20 s are up
+let maxAgainst = 0.30     # ATR against the trade that cancels it early
+let ncMinConf = 0
+let setupCall = near(px.low[-1], sw.low(1), 0.5) and px.close[-1] > px.open[-1] and nc.ok() and nc.side() == "call" and nc.conf() >= ncMinConf
+let setupPut = near(px.high[-1], sw.high(1), 0.5) and px.close[-1] < px.open[-1] and nc.ok() and nc.side() == "put" and nc.conf() >= ncMinConf
+let goCall = timing.hold("srnc-call", setupCall, 1, holdSec, minMove, maxAgainst)
+let goPut = timing.hold("srnc-put", setupPut, -1, holdSec, minMove, maxAgainst)
+call when goCall == 1
+put when goPut == 1
+expiry = 3
+`,
+  },
+  {
+    id: 'meta:builtin-sr-bounce-nc-hold20-bodyveto',
+    name: 'Builtin: S/R swing bounce + oracle + 20s hold + body check',
+    script: `
+# S/R swing bounce, variation 5: oracle agreement + 20 s hold + body check. After the hold confirms, STAND DOWN if the forming candle's body or the move
+# since the signal is already big (entry would chase an extended bar). Needs the Omni Trader (live() = the forming bar). LIVE only.
+let holdSec = 20
+let minMove = 0.05
+let maxAgainst = 0.30
+let maxBody = 0.80        # forming-candle body above this many ATR = too big
+let maxChase = 0.60       # move since the signal above this many ATR = already ran
+let ncMinConf = 0
+let atr = ind.atr(14)[-1]
+let setupCall = near(px.low[-1], sw.low(1), 0.5) and px.close[-1] > px.open[-1] and nc.ok() and nc.side() == "call" and nc.conf() >= ncMinConf
+let setupPut = near(px.high[-1], sw.high(1), 0.5) and px.close[-1] < px.open[-1] and nc.ok() and nc.side() == "put" and nc.conf() >= ncMinConf
+let goCall = timing.hold("srnc2-call", setupCall, 1, holdSec, minMove, maxAgainst)
+let goPut = timing.hold("srnc2-put", setupPut, -1, holdSec, minMove, maxAgainst)
+let tooBig = live().body > maxBody * atr
+call when goCall == 1 and not tooBig and timing.move("srnc2-call") <= maxChase
+put when goPut == 1 and not tooBig and timing.move("srnc2-put") <= maxChase
+expiry = 3
+`,
+  },
 ]

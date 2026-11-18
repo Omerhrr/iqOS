@@ -1,0 +1,17 @@
+# S/R swing bounce, variation 5: oracle agreement + 20 s hold + body check. After the hold confirms, STAND DOWN if the forming candle's body or the move
+# since the signal is already big (entry would chase an extended bar). Needs the Omni Trader (live() = the forming bar). LIVE only.
+let holdSec = 20
+let minMove = 0.05
+let maxAgainst = 0.30
+let maxBody = 0.80        # forming-candle body above this many ATR = too big
+let maxChase = 0.60       # move since the signal above this many ATR = already ran
+let ncMinConf = 0
+let atr = ind.atr(14)[-1]
+let setupCall = near(px.low[-1], sw.low(1), 0.5) and px.close[-1] > px.open[-1] and nc.ok() and nc.side() == "call" and nc.conf() >= ncMinConf
+let setupPut = near(px.high[-1], sw.high(1), 0.5) and px.close[-1] < px.open[-1] and nc.ok() and nc.side() == "put" and nc.conf() >= ncMinConf
+let goCall = timing.hold("srnc2-call", setupCall, 1, holdSec, minMove, maxAgainst)
+let goPut = timing.hold("srnc2-put", setupPut, -1, holdSec, minMove, maxAgainst)
+let tooBig = live().body > maxBody * atr
+call when goCall == 1 and not tooBig and timing.move("srnc2-call") <= maxChase
+put when goPut == 1 and not tooBig and timing.move("srnc2-put") <= maxChase
+expiry = 3
