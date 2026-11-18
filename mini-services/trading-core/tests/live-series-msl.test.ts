@@ -48,4 +48,19 @@ test('hasWaitingHold is true only while a hold of that spec is counting down', (
   assert.equal(svc.hasWaitingHold('meta:t-w', 'GBPUSD', '1m'), false)
   assert.equal(svc.hasWaitingHold('meta:other'), false)
 })
+test('trend-pullback + nc + timing builtin runs live without script errors and can arm a hold', () => {
+  const { BUILTIN_TV_SPECS } = require('../src/plugins/builtinTvSpecs')
+  const sp = BUILTIN_TV_SPECS.find((x: any) => x.id === 'meta:builtin-trend-pullback-nc-timing'); assert.ok(sp)
+  const bar = { __mslBar: true, o: 1, h: 1, l: 1, c: 1, v: 1, body: 0, range: 0, upperWick: 0, lowerWick: 0 }
+  svc.specs.set(sp.id, { id: sp.id, name: sp.name, mode: 'all', conditions: [], script: sp.script })
+  const bad: string[] = []
+  const saved = all.slice()
+  for (let k = 0; k < 120; k++) {
+    all.length = 0; all.push(...saved.slice(0, 700 + k))
+    p = all[all.length - 1].close
+    const r = svc.evaluateLive(sp.id, 'EURUSD', '1m', { bar, ticks: [], nowMs: (all[all.length - 1].time + 60) * 1000 + 5000 })
+    if (/error/i.test(r.result.notes ?? '')) bad.push(r.result.notes)
+  }
+  assert.equal(bad.length, 0, bad[0])
+})
 console.log(`${pass}/${total}`); process.exit(pass === total ? 0 : 1)

@@ -308,4 +308,37 @@ put when goPut == 1 and not tooBig and timing.move("srnc2-put") <= maxChase
 expiry = 3
 `,
   },
+  {
+    id: 'meta:builtin-trend-pullback-nc-timing',
+    name: 'Builtin: trend pullback + oracle agrees + early-bar 15s hold',
+    script: `
+# Trend pullback + next-candle oracle + timing. Three gates, all live-only (timing.hold cannot be backtested):
+#  1. TREND   : ind.ema(8) vs ind.ema(21) gives the side; the last closed candle was a counter-trend pullback that still closed on the right side of the slow ema.
+#  2. ORACLE  : the next-candle oracle nc must agree with the trend side (and keep agreeing - if it flips during the wait the hold aborts).
+#  3. TIMING  : only ARM in the first armWindow seconds of a new bar (so the trade is placed early, while the signal is fresh), then hold
+#               holdSec seconds and fire only if price moved WITH the trade by >= minMove ATR; abort early at maxAgainst ATR against.
+let armWindow = 25        # seconds after the bar opens during which a setup may arm
+let holdSec = 15
+let minMove = 0.05        # ATR with the trade when the hold ends
+let maxAgainst = 0.30     # ATR against the trade that cancels it early
+let ncMinConf = 0
+let early = timing.barAge() < armWindow
+let fast = ind.ema(8)[-1]
+let slow = ind.ema(21)[-1]
+let up = fast > slow and px.close[-1] > slow
+let down = fast < slow and px.close[-1] < slow
+let pullUp = up and px.close[-1] < px.open[-1]       # red candle inside an uptrend
+let pullDown = down and px.close[-1] > px.open[-1]   # green candle inside a downtrend
+let agreeCall = nc.ok() and nc.side() == "call" and nc.conf() >= ncMinConf
+let agreePut = nc.ok() and nc.side() == "put" and nc.conf() >= ncMinConf
+# once armed, the hold keeps the setup alive through the wait even after the arm window has passed: only the ARM is time-gated
+let armCall = pullUp and agreeCall
+let armPut = pullDown and agreePut
+let goCall = timing.hold("tpnc-call", armCall and (early or timing.state("tpnc-call") == "waiting"), 1, holdSec, minMove, maxAgainst)
+let goPut = timing.hold("tpnc-put", armPut and (early or timing.state("tpnc-put") == "waiting"), -1, holdSec, minMove, maxAgainst)
+call when goCall == 1
+put when goPut == 1
+expiry = 3
+`,
+  },
 ]
