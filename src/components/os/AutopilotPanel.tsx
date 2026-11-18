@@ -558,7 +558,7 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, m
                 patch(
                   v === 'compound'
                     ? { stakePlan: plan({}), maxOpen: 1, watchlist: draft.watchlist.slice(-1) }
-                    : { stakePlan: undefined },
+                    : { stakePlan: null },
                 )
               }
             />
@@ -3081,7 +3081,7 @@ function MetaTraderDialog({
               { v: 'compound', label: 'Compound' },
             ]}
             value={d.stakePlan?.kind === 'compound' ? 'compound' : 'fixed'}
-            onChange={(v) => p({ stakePlan: v === 'compound' ? planPatch({}) : undefined })}
+            onChange={(v) => p({ stakePlan: v === 'compound' ? planPatch({}) : null })}
           />
           {d.stakePlan?.kind === 'compound' && (
             <>

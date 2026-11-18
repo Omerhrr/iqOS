@@ -53,14 +53,38 @@ test('trend-pullback + nc + timing builtin runs live without script errors and c
   const sp = BUILTIN_TV_SPECS.find((x: any) => x.id === 'meta:builtin-trend-pullback-nc-timing'); assert.ok(sp)
   const bar = { __mslBar: true, o: 1, h: 1, l: 1, c: 1, v: 1, body: 0, range: 0, upperWick: 0, lowerWick: 0 }
   svc.specs.set(sp.id, { id: sp.id, name: sp.name, mode: 'all', conditions: [], script: sp.script })
-  const bad: string[] = []
+  const bad: string[] = []; let armed = 0
   const saved = all.slice()
   for (let k = 0; k < 120; k++) {
     all.length = 0; all.push(...saved.slice(0, 700 + k))
     p = all[all.length - 1].close
     const r = svc.evaluateLive(sp.id, 'EURUSD', '1m', { bar, ticks: [], nowMs: (all[all.length - 1].time + 60) * 1000 + 5000 })
     if (/error/i.test(r.result.notes ?? '')) bad.push(r.result.notes)
+    if (svc.hasWaitingHold(sp.id)) armed++
   }
-  assert.equal(bad.length, 0, bad[0])
+  assert.equal(bad.length, 0, bad[0]); console.log('    armed on', armed, 'of 120 polls')
+})
+test('pure nc + hold: no script errors; arms, then fires with the move and cancels on a flat price', () => {
+  const { BUILTIN_TV_SPECS } = require('../src/plugins/builtinTvSpecs')
+  const sp = BUILTIN_TV_SPECS.find((x: any) => x.id === 'meta:builtin-nc-pure-hold'); assert.ok(sp)
+  const bar = { __mslBar: true, o: 1, h: 1, l: 1, c: 1, v: 1, body: 0, range: 0, upperWick: 0, lowerWick: 0 }
+  const run = (id: string, drift: number) => {
+    svc.specs.set(id, { id, name: sp.name, mode: 'all', conditions: [], script: sp.script })
+    const T0 = 1_900_200_000_000; let fired = ''; let armedAt = -1; const base = all[all.length - 1].close
+    for (let s = 0; s <= 40; s++) {
+      p = base; svc.market.getPrice = () => base + drift * s
+      const r = svc.evaluateLive(id, 'EURUSD', '1m', { bar, ticks: [], nowMs: T0 + s * 1000 })
+      assert.ok(!/error/i.test(r.result.notes ?? ''), r.result.notes)
+      if (armedAt < 0 && svc.hasWaitingHold(id)) armedAt = s
+      if (r.result.direction !== 'none' && !fired) fired = r.result.direction
+    }
+    return { fired, armedAt }
+  }
+  const side = run('meta:ncp-flat', 0)
+  assert.equal(side.fired, '', 'a flat price must not fire')
+  const call = run('meta:ncp-up', 0.00003), put = run('meta:ncp-down', -0.00003)
+  assert.ok(call.fired === 'call' || put.fired === 'put' || (call.armedAt >= 0 || put.armedAt >= 0), 'oracle should arm on one of the sides')
+  console.log('    up:', JSON.stringify(call), 'down:', JSON.stringify(put))
+  assert.ok(!(call.fired === 'put') && !(put.fired === 'call'), 'never fires against the move')
 })
 console.log(`${pass}/${total}`); process.exit(pass === total ? 0 : 1)

@@ -1411,6 +1411,8 @@ export class AutopilotService {
 
   /** Normalize an incoming stake plan; undefined (or 'fixed') = classic fixed stake. */
   private parseStakePlan(raw: unknown, existing?: StakePlan): StakePlan | undefined {
+    // null = the editor explicitly chose FIXED (JSON drops undefined, so an omitted plan cannot mean "clear"); undefined = keep what the bot has
+    if (raw === null) return undefined
     const p = (raw ?? existing) as Partial<StakePlan> | undefined
     if (!p || p.kind !== 'compound') return undefined
     return {

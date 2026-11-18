@@ -341,4 +341,25 @@ put when goPut == 1
 expiry = 3
 `,
   },
+  {
+    id: 'meta:builtin-nc-pure-hold',
+    name: 'Builtin: pure next-candle oracle + 20s direction hold',
+    script: `
+# Pure next-candle oracle + a timing confirmation. No other setup: whatever side nc calls ARMS a hold; if price then moves WITH that side
+# the trade fires, otherwise it is cancelled. LIVE only (timing.hold cannot be backtested).
+#  - if nc stops agreeing (or flips) during the wait, the hold aborts
+#  - once a hold ends (fired or cancelled) it stays latched until nc has stopped calling that side, so one lingering call cannot re-arm in a loop
+let holdSec = 20
+let minMove = 0.05        # ATR with the trade when the hold ends
+let maxAgainst = 0.30     # ATR against the trade that cancels it early
+let ncMinConf = 0         # raise to only arm on a confident oracle
+let armCall = nc.ok() and nc.side() == "call" and nc.conf() >= ncMinConf
+let armPut = nc.ok() and nc.side() == "put" and nc.conf() >= ncMinConf
+let goCall = timing.hold("nc-call", armCall, 1, holdSec, minMove, maxAgainst)
+let goPut = timing.hold("nc-put", armPut, -1, holdSec, minMove, maxAgainst)
+call when goCall == 1
+put when goPut == 1
+expiry = 3
+`,
+  },
 ]

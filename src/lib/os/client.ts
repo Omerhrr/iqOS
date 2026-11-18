@@ -4310,7 +4310,7 @@ export interface BotConfig {
    * the cycle (halt, or auto re-seed with onComplete 'reseed').
    * deriskAfter/deriskPct: after that many wins, stake only that % of the pot
    * (e.g. 50 = half) so a late loss cannot give back the whole ladder. */
-  stakePlan?: {
+  stakePlan?: null | {
     kind: 'fixed' | 'compound'
     base: number
     rollPct?: number
@@ -5444,7 +5444,8 @@ export interface MetaTraderConfig {
   globalCooldownSec: number
   /** use the strategy script's own `expiry = <minutes>` for each order instead of the fixed expiry (off by default) */
   useScriptExpiry?: boolean
-  stakePlan?: MetaStakePlan
+  /** null = explicitly Fixed (clears a saved compounding plan); omitted = unchanged */
+  stakePlan?: MetaStakePlan | null
   /** explicit watchlist override - undefined/empty = the same liquid-first
    * default pool, market-wide. Set = scan ONLY these tickers. Same
    * override Omni Trader's own `assets` field already has. */
