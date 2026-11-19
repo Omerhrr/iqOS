@@ -2536,7 +2536,7 @@ function AutoTraderDialog({
             value={d.stakePlan?.kind === 'compound' ? 'compound' : 'fixed'}
             onChange={(v) =>
               p({
-                stakePlan: v === 'compound' ? { kind: 'compound', base: Math.max(1, d.stake), rollPct: 100, payoutCap: 70, stopOnLoss: true } : undefined,
+                stakePlan: v === 'compound' ? { kind: 'compound', base: Math.max(1, d.stake), rollPct: 100, payoutCap: 70, stopOnLoss: true } : null,
               })
             }
           />

@@ -5320,8 +5320,8 @@ export interface AutoTraderConfig {
    * Default 'off'. */
   volGate?: 'off' | 'avoid-volatile'
   /** Optional compounding plan - same StakePlan shape as a bot's. undefined =
-   * fixed `stake` every trade. */
-  stakePlan?: StakePlan
+   * fixed `stake` every trade. null (in a patch) = explicitly Fixed: clears a saved plan. */
+  stakePlan?: StakePlan | null
   /** Server-persisted roll state (read-only from the client - the server
    * is the only writer; informational for the dialog/strip). */
   planState?: { pot: number; rollN: number; restarts: number; reseedCount?: number; lossReseedCount?: number; halted: boolean; complete: boolean }

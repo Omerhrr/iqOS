@@ -3620,6 +3620,8 @@ export class ModeService {
 
   /** Mirrors autopilot.ts's parseStakePlan - same shape, same clamps. */
   private parseStakePlan(raw: unknown, existing?: AutoStakePlan): AutoStakePlan | undefined {
+    // null = the editor explicitly chose FIXED (what the agent tool documents too); undefined = keep the existing plan
+    if (raw === null) return undefined
     const p = (raw ?? existing) as Partial<AutoStakePlan> | undefined
     if (!p || p.kind !== 'compound') return undefined
     const base = Math.max(1, Number(p.base) || 1)
