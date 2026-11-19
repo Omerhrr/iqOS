@@ -362,4 +362,53 @@ put when goPut == 1
 expiry = 3
 `,
   },
+  {
+    id: 'meta:builtin-mtf-story-bias',
+    name: 'Builtin: multi-timeframe story bias (4h + 15m -> this timeframe)',
+    script: `
+# MULTI-TIMEFRAME STORY BIAS. The 4h (session) and 15m candles are each read through their candle story, 14-bar window, 21-bar swing structure and their Renko, Kagi, Baseline and
+# Heikin Ashi equivalents; every reading is a vote, the frames are blended into a context lean, and THIS timeframe's own story is the trigger. A direction exists only when they agree.
+# Candle-derived, so it backtests (the higher frames are aggregated from this chart's candles). The votes and weights are judgement, not fitted: backtest before trusting minStrength.
+let minStrength = 55      # 0-100 alignment strength required (NOT a win probability)
+let m = story.mtf("4h", "15m")
+call when m.direction == "call" and m.strength >= minStrength
+put when m.direction == "put" and m.strength >= minStrength
+expiry = 3
+`,
+  },
+  {
+    id: 'meta:builtin-mtf-story-bias-hold20',
+    name: 'Builtin: multi-timeframe story bias + 20s hold',
+    script: `
+# Same multi-timeframe story bias, plus the 20 s confirmation hold: when the bigger picture and this timeframe agree, wait 20 s and fire only if price then moved WITH the trade.
+# LIVE only (timing.hold cannot be backtested).
+let minStrength = 55
+let holdSec = 20
+let minMove = 0.05        # ATR with the trade when the hold ends
+let maxAgainst = 0.30     # ATR against the trade that cancels it early
+let m = story.mtf("4h", "15m")
+let armCall = m.direction == "call" and m.strength >= minStrength
+let armPut = m.direction == "put" and m.strength >= minStrength
+let goCall = timing.hold("mtf-call", armCall, 1, holdSec, minMove, maxAgainst)
+let goPut = timing.hold("mtf-put", armPut, -1, holdSec, minMove, maxAgainst)
+call when goCall == 1
+put when goPut == 1
+expiry = 3
+`,
+  },
+  {
+    id: 'meta:builtin-cause-effect-pm',
+    name: 'Builtin: cause-effect predicted move',
+    script: `
+# CAUSE -> EFFECT PREDICTED MOVE. Cause = volume + footprint (estimated) + ticks (when available) + MFI + A/D slope; effect = the candle, wick psychology, ROC and CCI.
+# The model looks up what the NEXT candle did after the same kind of cause in the past, tilts it by the live cause and by support/resistance retests, and reports a probability.
+# It only trades when the walk-forward track record (each past call made with only the bars before it) beat 50%. A judgement-weighted model, not a fitted one: backtest before trusting it.
+let minConf = 45
+let m = story.pm()
+let ok = m.ok and m.validated and m.bucketN >= 15 and m.strength >= minConf
+call when ok and m.direction == "call" and not m.atResistance
+put when ok and m.direction == "put" and not m.atSupport
+expiry = 1
+`,
+  },
 ]

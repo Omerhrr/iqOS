@@ -1,0 +1,8 @@
+# MULTI-TIMEFRAME STORY BIAS. The 4h (session) and 15m candles are each read through their candle story, 14-bar window, 21-bar swing structure and their Renko, Kagi, Baseline and
+# Heikin Ashi equivalents; every reading is a vote, the frames are blended into a context lean, and THIS timeframe's own story is the trigger. A direction exists only when they agree.
+# Candle-derived, so it backtests (the higher frames are aggregated from this chart's candles). The votes and weights are judgement, not fitted: backtest before trusting minStrength.
+let minStrength = 55      # 0-100 alignment strength required (NOT a win probability)
+let m = story.mtf("4h", "15m")
+call when m.direction == "call" and m.strength >= minStrength
+put when m.direction == "put" and m.strength >= minStrength
+expiry = 3

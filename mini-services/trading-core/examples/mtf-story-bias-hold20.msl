@@ -1,0 +1,14 @@
+# Same multi-timeframe story bias, plus the 20 s confirmation hold: when the bigger picture and this timeframe agree, wait 20 s and fire only if price then moved WITH the trade.
+# LIVE only (timing.hold cannot be backtested).
+let minStrength = 55
+let holdSec = 20
+let minMove = 0.05        # ATR with the trade when the hold ends
+let maxAgainst = 0.30     # ATR against the trade that cancels it early
+let m = story.mtf("4h", "15m")
+let armCall = m.direction == "call" and m.strength >= minStrength
+let armPut = m.direction == "put" and m.strength >= minStrength
+let goCall = timing.hold("mtf-call", armCall, 1, holdSec, minMove, maxAgainst)
+let goPut = timing.hold("mtf-put", armPut, -1, holdSec, minMove, maxAgainst)
+call when goCall == 1
+put when goPut == 1
+expiry = 3

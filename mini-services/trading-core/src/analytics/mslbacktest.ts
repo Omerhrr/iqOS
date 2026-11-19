@@ -311,6 +311,15 @@ const TF_SEC: Record<string, number> = { '5s': 5, '10s': 10, '15s': 15, '30s': 3
 let fastFeed: Record<string, Candle[]> | null = null
 /** Supply LOWER-timeframe candles (e.g. {"5s": [...]}) so `snr.*`/`fibs.*` can be backtested; only bars that closed at or before the evaluated bar's close are visible. */
 export function setBacktestFastFeed(f: Record<string, Candle[]> | null): void { fastFeed = f }
+/** TICKS IN THE LAB: an ascending {ts(ms), price} archive for the backtested asset. When set, every evaluated bar sees ONLY the ticks that printed before its close (the last ~80 bars of them), through
+ * the same `live.ticks` channel the live engines use, so tick.* / story.pm() / story.of("ticks") work in a backtest. Bars with no ticks get an empty buffer (NOT undefined) so the script runs and
+ * the tick-derived fields read as unknown. Coverage of the last run is reported by getBacktestTickCoverage(). The archive is finite (<= 50,000 ticks per asset), so only the recent part of a long run has ticks. */
+let tickFeed: { ts: number; price: number }[] | null = null
+let tickCoverage: { barsEvaluated: number; barsWithTicks: number; firstTickMs: number; lastTickMs: number } | undefined
+export function setBacktestTickFeed(t: { ts: number; price: number }[] | null): void { tickFeed = t && t.length ? t : null }
+export function getBacktestTickCoverage(): { barsEvaluated: number; barsWithTicks: number; share: number; firstTickMs: number; lastTickMs: number } | undefined {
+  return tickCoverage ? { ...tickCoverage, share: tickCoverage.barsEvaluated ? tickCoverage.barsWithTicks / tickCoverage.barsEvaluated : 0 } : undefined
+}
 function makeCrossTf(candles: Candle[]): (i: number) => (tf: string) => MslSeriesCtx | undefined {
   let base = Infinity
   for (let i = 1; i < candles.length; i++) { const g = candles[i].time - candles[i - 1].time; if (g > 0 && g < base) base = g }
@@ -370,13 +379,29 @@ function fireSignalsInner(
   const crossTf = makeCrossTf(candles)
   lastFireErrors = undefined
   let errCount = 0, evaluated = 0, firstErr = '', firstErrBar = -1
+  const tf = tickFeed
+  let tLo = 0, tHi = 0, withTicks = 0
+  let baseSp = Infinity
+  if (tf) for (let k = 1; k < candles.length; k++) { const g = candles[k].time - candles[k - 1].time; if (g > 0 && g < baseSp) baseSp = g }
+  tickCoverage = tf ? { barsEvaluated: 0, barsWithTicks: 0, firstTickMs: tf[0].ts, lastTickMs: tf[tf.length - 1].ts } : undefined
   try {
     for (let i = warmupBars; i <= lastIdx; i++) {
       const series = seriesUpTo(candles, i, partners)
       const seriesFor = crossTf(i)
       const state = { keyPrefix: runId, barTimeSec: candles[i].time }
-      const out = evaluateStrategyScript(parsedAst, reads, undefined, series, seriesFor, undefined, state)
+      let live: { ticks: { ts: number; price: number }[]; nowMs: number } | undefined
+      if (tf) {
+        const closeMs = (candles[i].time + (Number.isFinite(baseSp) ? baseSp : 60)) * 1000
+        const fromMs = closeMs - 80 * (Number.isFinite(baseSp) ? baseSp : 60) * 1000
+        while (tHi < tf.length && tf[tHi].ts < closeMs) tHi++
+        while (tLo < tHi && tf[tLo].ts < fromMs) tLo++
+        const win = tf.slice(tLo, tHi)
+        if (win.length && win[win.length - 1].ts >= closeMs - (Number.isFinite(baseSp) ? baseSp : 60) * 1000) withTicks++
+        live = { ticks: win, nowMs: closeMs }
+      }
+      const out = evaluateStrategyScript(parsedAst, reads, undefined, series, seriesFor, live, state)
       evaluated++
+      if (tickCoverage) { tickCoverage.barsEvaluated = evaluated; tickCoverage.barsWithTicks = withTicks }
       if (out.error) { if (!errCount++) { firstErr = out.error; firstErrBar = i } continue }
       if (out.direction === 'none') continue
       if (out.confidence < minConfidence) continue

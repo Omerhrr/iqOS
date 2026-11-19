@@ -1,0 +1,9 @@
+# CAUSE -> EFFECT PREDICTED MOVE. Cause = volume + footprint (estimated) + ticks (when available) + MFI + A/D slope; effect = the candle, wick psychology, ROC and CCI.
+# The model looks up what the NEXT candle did after the same kind of cause in the past, tilts it by the live cause and by support/resistance retests, and reports a probability.
+# It only trades when the walk-forward track record (each past call made with only the bars before it) beat 50%. A judgement-weighted model, not a fitted one: backtest before trusting it.
+let minConf = 45
+let m = story.pm()
+let ok = m.ok and m.validated and m.bucketN >= 15 and m.strength >= minConf
+call when ok and m.direction == "call" and not m.atResistance
+put when ok and m.direction == "put" and not m.atSupport
+expiry = 1

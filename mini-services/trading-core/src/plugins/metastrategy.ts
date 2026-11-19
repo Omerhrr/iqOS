@@ -2483,6 +2483,12 @@ export class MetaStrategyService {
   ): MetaEvalResult {
     const parsed = parseStrategyScript(script)
     if (!parsed.ok) return { direction: 'none', score: 0, confidence: 0, conditions: [], notes: `script error: ${parsed.error}` }
+    // TICKS EVERYWHERE: evaluate() (Meta Trader, Auto Trader bots, Brain) never carries a live context, so tick.* / story.of("ticks") / story.pm() ticks used to fail closed there. Fall back
+    // to the same per-asset tick buffer the Omni Trader reads. Replays/backtests never reach this method (they have their own evaluator), so this cannot leak the future into one.
+    if (!live || !live.ticks) {
+      const tb = this.tickBuffer(asset)
+      if (tb && tb.length) live = { ...(live ?? {}), ticks: tb as readonly { ts: number; price: number }[], nowMs: live?.nowMs ?? Date.now() }
+    }
     this.setSeriesBarsFor(script)
     const reads = this.buildScriptReads(asset, tf, undefined, script)
     const series = this.scriptSeries(asset, tf)

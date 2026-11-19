@@ -87,4 +87,15 @@ test('pure nc + hold: no script errors; arms, then fires with the move and cance
   console.log('    up:', JSON.stringify(call), 'down:', JSON.stringify(put))
   assert.ok(!(call.fired === 'put') && !(put.fired === 'call'), 'never fires against the move')
 })
+test('multi-timeframe story builtins evaluate live without script errors (higher frames via seriesFor)', () => {
+  const { BUILTIN_TV_SPECS } = require('../src/plugins/builtinTvSpecs')
+  const bar = { __mslBar: true, o: 1, h: 1, l: 1, c: 1, v: 1, body: 0, range: 0, upperWick: 0, lowerWick: 0 }
+  for (const id of ['meta:builtin-mtf-story-bias', 'meta:builtin-mtf-story-bias-hold20']) {
+    const sp = BUILTIN_TV_SPECS.find((x: any) => x.id === id); assert.ok(sp, id)
+    svc.specs.set(sp.id, { id: sp.id, name: sp.name, mode: 'all', conditions: [], script: sp.script })
+    const saved = all.slice(); const notes: string[] = []
+    for (let k = 0; k < 40; k++) { all.length = 0; all.push(...saved.slice(0, 800 + k)); p = all[all.length - 1].close; const r = svc.evaluateLive(sp.id, 'EURUSD', '1m', { bar, ticks: [], nowMs: (all[all.length - 1].time + 60) * 1000 + 5000 }); notes.push(r.result.notes ?? ''); assert.ok(!/error/i.test(r.result.notes ?? ''), id + ': ' + r.result.notes) }
+    all.length = 0; all.push(...saved)
+  }
+})
 console.log(`${pass}/${total}`); process.exit(pass === total ? 0 : 1)

@@ -277,6 +277,8 @@ import {
   type OUModel, type MarkovModel,
 } from './mslmodels'
 import { storyRenko, storyKagi, storyEffort, storyHeikin, storyTickBars, storyTicks, storyBaseline, storyFootprint, CHART_STORY_TYPES, type ChartStory } from './charttypestory'
+import { readMtf } from './mtfstory'
+import { readCauseEffect } from './causeeffect'
 import { readStory, readRoc, readWindowStory, readStructure, readFormingStory, cutBars } from './candlestory'
 import { oscillatorVotes, maVotes, TECH_MIN_BARS, TECH_BARS_PER_RUNG, type TechVote } from './technicals'
 
@@ -5627,6 +5629,8 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
       if (e.obj.t === 'ident' && e.obj.name === 'story' && !(e.obj.name in env)) {
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         if (e.name === 'of' || e.name === 'ofText') return storyOf(e.name, args, ctx)
+        if (e.name === 'mtf') return storyMtf(args, ctx)
+        if (e.name === 'pm' || e.name === 'pmText') return storyPm(e.name, args, ctx)
         const tf = args.length && typeof args[args.length - 1] === 'string' && e.name !== 'is' ? (args.pop() as string) : undefined
         return storyMethod(e.name, args, ctx, tf)
       }
@@ -6369,7 +6373,7 @@ function storyMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | 
     case 'rangeSigma': return st.rangeSigma
     case 'expUp': return args.length && num(0) >= 2 ? st.expUp2 : st.expUp1
     case 'expDn': return args.length && num(0) >= 2 ? st.expDn2 : st.expDn1
-    default: throw new MslRuntimeError(`story.${name}() is not a thing - try kind, text, dir, closePos, body, upperWick, lowerWick, size, bodyAtr, sweep, breakout, engulf, inside, gap, has5s, pathEff, retrace, extremeEarly, upShare, burst, is("kind"), roc(n), rocAtr(n), accel(n), rocBody(), window(n) (a bundle: kind text dir net roc eff ...), windowText(n), windowKind(n), at(k), now() (the forming candle, omni only), moveSigma(), rangeSigma(), sigma(), expUp(1|2), expDn(1|2), windowSigma(n, ago), structure(n, ago, strength), structureText(n, ago, strength), of("renko"|"kagi"|"effort"|"ha"|"tickbars"|"ticks"|"baseline"|"footprint"), ofText(type)`)
+    default: throw new MslRuntimeError(`story.${name}() is not a thing - try kind, text, dir, closePos, body, upperWick, lowerWick, size, bodyAtr, sweep, breakout, engulf, inside, gap, has5s, pathEff, retrace, extremeEarly, upShare, burst, is("kind"), roc(n), rocAtr(n), accel(n), rocBody(), window(n) (a bundle: kind text dir net roc eff ...), windowText(n), windowKind(n), at(k), now() (the forming candle, omni only), moveSigma(), rangeSigma(), sigma(), expUp(1|2), expDn(1|2), windowSigma(n, ago), structure(n, ago, strength), structureText(n, ago, strength), of("renko"|"kagi"|"effort"|"ha"|"tickbars"|"ticks"|"baseline"|"footprint"), ofText(type), mtf("4h", "15m", ...)`)
   }
 }
 
@@ -6402,6 +6406,38 @@ function storyOf(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
   const facts: Record<string, MslValue> = {}
   for (const [k, v] of Object.entries(st.facts)) facts[k] = v
   return bundleValue({ ok: st.ok, type: st.type, kind: st.kind, dir: st.dir, text: st.text, ...facts })
+}
+
+/** `story.mtf("4h", "15m", ...)` - the multi-timeframe story (analytics/mtfstory.ts): each named HIGHER timeframe (biggest first) is read through its candle, 14-bar window, swing structure, Renko, Kagi, Baseline and Heikin Ashi equivalents, the script's own timeframe is the trigger. Returns a bundle: ok, error, direction ("call"/"put"/"none" - context and trigger agree), lean (what the bigger picture leans to), alignment ("aligned" | "wait-for-trigger" | "pullback-against-context" | "no-context"), strength (0-100 alignment strength, NOT a win probability - named strength because `.confidence` is reserved), contextScore and triggerScore (-1..1), score<tf> per frame (e.g. score4h, score15m), warnings (count), text. */
+function storyMtf(args: MslValue[], ctx: EvalEnv): MslValue {
+  const tfs = args.filter((a): a is string => typeof a === 'string')
+  if (!tfs.length) throw new MslRuntimeError('story.mtf("4h", "15m", ...) needs at least one higher timeframe, biggest first')
+  const trig = requireSeries(ctx, undefined)
+  const higher = tfs.map((tf) => { const sr = ctx.seriesFor?.(tf); return { tf, candles: sr ? seriesToCandles(sr) : [] } })
+  const triggerTf = trig.time && trig.time.length > 2 ? `${Math.round((trig.time[trig.time.length - 1] - trig.time[trig.time.length - 2]) / 60)}m` : 'trigger'
+  const m = readMtf(triggerTf, seriesToCandles(trig), higher)
+  const out: Record<string, MslValue> = { ok: m.ok, error: m.error ?? '', direction: m.direction, lean: m.lean, alignment: m.alignment, strength: m.confidence, contextScore: m.contextScore, triggerScore: m.triggerScore, warnings: m.warnings.length, text: m.text }
+  for (const f of m.frames) out[`score${f.tf}`] = f.ok ? f.score : NaN
+  return bundleValue(out)
+}
+
+/** `story.pm()` - the CAUSE -> EFFECT predicted move (analytics/causeeffect.ts). Cause = volume + footprint (estimated) + ticks (when the context has them) + MFI + A/D; effect = the candle,
+ * its wick psychology, ROC and CCI; history of "this cause -> next candle" gives the prediction. story.pmText() is the sentence. Bundle fields are flat: ok, error, direction ("call"/"put"/"none"), prob,
+ * moveAtr, confidence, validated, causeDir, causeMag, causeLabel, volRatio, fpDelta, tickImb, mfi, adSlope, ticksUsed, effectDir, sizeAtr, psychology, upperWick, lowerWick, roc, cci, coherence, bucketN,
+ * bucketUp, trackN, trackHit, support, resistance, supDist, resDist, atSupport, atResistance, retest, text. */
+function storyPm(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
+  const tf = args.find((a): a is string => typeof a === 'string')
+  const s = requireSeries(ctx, tf)
+  const cs = seriesToCandles(s)
+  const times = s.time ?? []
+  const withTime = cs.map((c, i) => ({ ...c, time: times[i] ?? i }))
+  const r = readCauseEffect(withTime, tf === undefined ? ctx.liveTicks : undefined)
+  if (name === 'pmText') return r.text
+  return bundleValue({ ok: r.ok, error: r.error ?? '', direction: r.pm.dir, prob: r.pm.prob, moveAtr: r.pm.moveAtr, strength: r.pm.confidence, validated: r.validation.validated,
+    causeDir: r.cause.dir, causeMag: r.cause.mag, causeLabel: r.cause.label, volRatio: r.cause.volRatio, fpDelta: r.cause.fpDelta, tickImb: r.cause.tickImb, mfi: r.cause.mfi, adSlope: r.cause.adSlope, ticksUsed: r.cause.ticksUsed,
+    effectDir: r.effect.dir, sizeAtr: r.effect.sizeAtr, psychology: r.effect.psychology, upperWick: r.effect.upperWick, lowerWick: r.effect.lowerWick, roc: r.effect.roc, cci: r.effect.cci,
+    coherence: r.validation.coherence, bucketN: r.validation.bucketN, bucketUp: r.validation.bucketUpProb, trackN: r.validation.trackN, trackHit: r.validation.trackHit,
+    support: r.sr.support, resistance: r.sr.resistance, supDist: r.sr.supDist, resDist: r.sr.resDist, atSupport: r.sr.atSupport, atResistance: r.sr.atResistance, retest: r.sr.retest, text: r.text })
 }
 
 function lastAtr(ctx: EvalEnv): number {

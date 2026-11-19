@@ -2935,6 +2935,36 @@ export default function ChartPanel({
   type ChartStoryRes = { ok: boolean; error?: string; type?: string; kind?: string; dir?: number; text?: string; facts?: Record<string, number | string | boolean | null> }
   type StudyRes = { ok: boolean; error?: string; bars?: number; horizon?: number; breakEven?: number; baseUp?: number; labels?: number; survivors?: number; expectedLucky?: number; rows?: { label: string; n: number; side: string; inN: number; inWin: number; outN: number; outWin: number; outLower: number; survivor: boolean }[] }
   const [storyView, setStoryView] = useState('candles')
+  type MtfRes = { ok: boolean; error?: string; triggerTf?: string; direction?: string; lean?: string; alignment?: string; confidence?: number; contextScore?: number; triggerScore?: number; warnings?: string[]; text?: string; frames?: { tf: string; ok: boolean; error?: string; score: number; agreement: number; votes: { name: string; vote: number; why: string }[] }[]; trigger?: { tf: string; score: number; votes: { name: string; vote: number; why: string }[] } | null }
+  const [mtf, setMtf] = useState<MtfRes | null>(null)
+  const [mtfHtf, setMtfHtf] = useState('4h,15m')
+  useEffect(() => {
+    if (!showStory || storyView !== 'mtf') return
+    let alive = true
+    const load = () => { osGet<MtfRes>('/mtf_story', { asset: digitsTicker, tf: tf ?? '1m', htf: mtfHtf }).then((r) => { if (alive) setMtf(r) }).catch((e) => { if (alive) setMtf({ ok: false, error: String(e instanceof Error ? e.message : e).slice(0, 160) }) }) }
+    setMtf(null); load()
+    const t = window.setInterval(load, 15000)
+    return () => { alive = false; window.clearInterval(t) }
+  }, [showStory, storyView, digitsTicker, tf, mtfHtf])
+  // FULLSCREEN: the chart pane takes the whole screen (real browser fullscreen where allowed, otherwise a fixed full-viewport overlay). The chart instance is never remounted - only
+  // the wrapper's size changes, and the chart's own autoSize / ResizeObserver redraw it. Esc leaves.
+  const rootRef = useRef<HTMLDivElement>(null)
+  const [full, setFull] = useState(false)
+  const toggleFull = () => {
+    const next = !full
+    setFull(next)
+    try {
+      if (next) void rootRef.current?.requestFullscreen?.().catch(() => undefined)
+      else if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined)
+    } catch { /* the overlay still works without the Fullscreen API */ }
+  }
+  useEffect(() => {
+    if (!full) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setFull(false) }
+    const onFs = () => { if (!document.fullscreenElement) setFull(false) }
+    window.addEventListener('keydown', onKey); document.addEventListener('fullscreenchange', onFs)
+    return () => { window.removeEventListener('keydown', onKey); document.removeEventListener('fullscreenchange', onFs) }
+  }, [full])
   const [chartStory, setChartStory] = useState<ChartStoryRes | null>(null)
   const [study, setStudy] = useState<StudyRes | null>(null)
   const [studyBusy, setStudyBusy] = useState(false)
@@ -3048,7 +3078,7 @@ export default function ChartPanel({
   }
 
   return (
-    <div className="relative flex h-full min-h-0 flex-col rounded-lg border border-[#1c2739] bg-[#0b111c]">
+    <div ref={rootRef} className={full ? 'fixed inset-0 z-[60] flex min-h-0 flex-col bg-[#0b111c]' : 'relative flex h-full min-h-0 flex-col rounded-lg border border-[#1c2739] bg-[#0b111c]'}>
       {/* zoom controls (left of the price scale) */}
       <div className="absolute bottom-10 right-[60px] z-10 flex flex-col gap-1">
         <button
@@ -3140,11 +3170,11 @@ export default function ChartPanel({
               <button onClick={() => setShowStory(false)} className="text-[#7c8aa5] hover:text-white">x</button>
             </div>
             <div className="flex flex-wrap gap-0.5">
-              {[['candles', 'candles'], ['renko', 'renko'], ['kagi', 'kagi'], ['effort', 'effort'], ['ha', 'heikin'], ['tickbars', 'tick bars'], ['ticks', 'ticks'], ['baseline', 'baseline'], ['footprint', 'footprint']].map(([id, label]) => (
+              {[['candles', 'candles'], ['renko', 'renko'], ['kagi', 'kagi'], ['effort', 'effort'], ['ha', 'heikin'], ['tickbars', 'tick bars'], ['ticks', 'ticks'], ['baseline', 'baseline'], ['footprint', 'footprint'], ['mtf', 'MTF']].map(([id, label]) => (
                 <button key={id} onClick={() => setStoryView(id)} className={`rounded border px-1 py-px text-[8px] ${storyView === id ? 'border-amber-500/60 bg-amber-500/15 text-amber-300' : 'border-[#1c2739] text-[#7c8aa5] hover:text-white'}`}>{label}</button>
               ))}
             </div>
-            {storyView !== 'candles' && (
+            {storyView !== 'candles' && storyView !== 'mtf' && (
               <div className="space-y-1">
                 {!chartStory && <div className="text-[#7c8aa5]">reading...</div>}
                 {chartStory && !chartStory.ok && <div className="text-rose-300">{chartStory.text || chartStory.error || 'no story'}</div>}
@@ -3157,6 +3187,38 @@ export default function ChartPanel({
                         <span key={k}>{k} <span className="text-[#d6e2f5]">{typeof v === 'number' ? (Number.isInteger(v) ? v : Math.abs(v) >= 100 ? v.toFixed(1) : v.toFixed(Math.abs(v) < 0.01 ? 6 : 3)) : String(v)}</span></span>
                       ))}
                     </div>
+                  </>
+                )}
+              </div>
+            )}
+            {storyView === 'mtf' && (
+              <div className="space-y-1">
+                <label className="flex items-center justify-between text-[#7c8aa5]">higher timeframes (biggest first)
+                  <input type="text" value={mtfHtf} onChange={(e) => setMtfHtf(e.target.value.replace(/[^0-9a-z,]/g, '').slice(0, 24))} className="w-24 rounded border border-[#1c2739] bg-[#0d1420] px-1 text-right text-[#d6e2f5]" />
+                </label>
+                {!mtf && <div className="text-[#7c8aa5]">reading every chart type on every timeframe...</div>}
+                {mtf && !mtf.ok && <div className="text-rose-300">{mtf.error ?? 'no read'}</div>}
+                {mtf?.ok && (
+                  <>
+                    <div className={`flex items-center justify-between rounded border px-1.5 py-1 ${mtf.direction === 'call' ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-300' : mtf.direction === 'put' ? 'border-rose-500/50 bg-rose-500/10 text-rose-300' : 'border-[#1c2739] text-[#9fb0cc]'}`}>
+                      <span className="font-bold">{mtf.direction === 'call' ? 'CALL bias' : mtf.direction === 'put' ? 'PUT bias' : mtf.lean && mtf.lean !== 'none' ? `no trigger yet · leans ${mtf.lean === 'call' ? 'UP' : 'DOWN'}` : 'no clear lean'}</span>
+                      <span>{mtf.alignment} · {mtf.confidence ?? 0}/100</span>
+                    </div>
+                    <div className="text-[#d6e2f5]">{mtf.text}</div>
+                    {mtf.frames?.map((f) => (
+                      <div key={f.tf} className="border-t border-[#1c2739] pt-1">
+                        <div className="flex justify-between text-amber-200/90"><span>{f.tf}</span><span>{f.ok ? `${f.score >= 0 ? '+' : ''}${f.score.toFixed(2)} · ${(f.agreement * 100).toFixed(0)}% agree` : f.error}</span></div>
+                        {f.ok && <div className="flex flex-wrap gap-x-2 text-[#7c8aa5]">{f.votes.map((v) => <span key={v.name} title={v.why} className={v.vote > 0.2 ? 'text-emerald-300' : v.vote < -0.2 ? 'text-rose-300' : ''}>{v.name} {v.vote >= 0 ? '+' : ''}{v.vote.toFixed(1)}</span>)}</div>}
+                      </div>
+                    ))}
+                    {mtf.trigger && (
+                      <div className="border-t border-[#1c2739] pt-1">
+                        <div className="flex justify-between text-amber-200/90"><span>trigger {mtf.trigger.tf}</span><span>{mtf.trigger.score >= 0 ? '+' : ''}{mtf.trigger.score.toFixed(2)}</span></div>
+                        <div className="flex flex-wrap gap-x-2 text-[#7c8aa5]">{mtf.trigger.votes.map((v) => <span key={v.name} title={v.why} className={v.vote > 0.2 ? 'text-emerald-300' : v.vote < -0.2 ? 'text-rose-300' : ''}>{v.name} {v.vote >= 0 ? '+' : ''}{v.vote.toFixed(1)}</span>)}</div>
+                      </div>
+                    )}
+                    {!!mtf.warnings?.length && <div className="text-amber-300">caution: {mtf.warnings.join('; ')}</div>}
+                    <div className="text-[#5f6d85]">strength is how well everything lines up, not a win probability. The votes are judgement, not fitted.</div>
                   </>
                 )}
               </div>
@@ -3299,6 +3361,16 @@ export default function ChartPanel({
           className="flex h-6 w-6 items-center justify-center rounded border border-[#1c2739] bg-[#0d1420]/90 text-[11px] leading-none text-[#7c8aa5] transition-colors hover:border-cyan-500/40 hover:text-cyan-300"
         >
           ⤢
+        </button>
+        <button
+          onClick={toggleFull}
+          title={full ? 'Exit fullscreen (Esc)' : 'Fullscreen chart'}
+          aria-label={full ? 'Exit fullscreen' : 'Fullscreen chart'}
+          className={`flex h-6 w-6 items-center justify-center rounded border transition-colors ${full ? 'border-cyan-500/60 bg-cyan-500/15 text-cyan-300' : 'border-[#1c2739] bg-[#0d1420]/90 text-[#7c8aa5] hover:border-cyan-500/40 hover:text-cyan-300'}`}
+        >
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            {full ? <path d="M9 3H5a2 2 0 0 0-2 2v4M15 3h4a2 2 0 0 1 2 2v4M9 21H5a2 2 0 0 1-2-2v-4M15 21h4a2 2 0 0 0 2-2v-4" /> : <path d="M8 3H5a2 2 0 0 0-2 2v3m18-3v3a2 2 0 0 1-2 2h-3M18 21h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />}
+          </svg>
         </button>
       </div>
 
