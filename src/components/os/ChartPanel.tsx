@@ -1596,6 +1596,14 @@ export default function ChartPanel({
     const prev = renderStateRef.current
     const volBarFor = (c: Candle) => ({ time: c.time as UTCTimestamp, value: c.volume, color: c.close >= c.open ? 'rgba(16,185,129,0.30)' : 'rgba(244,63,94,0.30)' })
     const isLineLike = chartType === 'line' || chartType === 'area' || chartType === 'baseline'
+    // BASELINE chart: lightweight-charts defaults the base level to price 0, so with prices like 1.30 every point sat on the bull side and the bear (red) half never showed.
+    // Like TradingView, the base is the MIDDLE of the loaded range (50%), re-centred whenever a bar lands or the buffer rebuilds, so both sides exist.
+    const applyBaseValue = () => {
+      if (chartType !== 'baseline' || !displayCandles.length) return
+      let hi = -Infinity, lo = Infinity
+      for (const c of displayCandles) { if (c.close > hi) hi = c.close; if (c.close < lo) lo = c.close }
+      if (Number.isFinite(hi) && Number.isFinite(lo)) (price as ISeriesApi<'Baseline'>).applyOptions({ baseValue: { type: 'price', price: (hi + lo) / 2 } })
+    }
     const priceBarFor = (c: Candle) => (isLineLike ? { time: c.time as UTCTimestamp, value: c.close } : { time: c.time as UTCTimestamp, open: c.open, high: c.high, low: c.low, close: c.close })
 
     if (prev) {
@@ -1609,6 +1617,7 @@ export default function ChartPanel({
       if (last.time > prev.lastTime && displayCandles.length === prev.len + 1) {
         // exactly one new bar landed and the buffer hasn't rolled yet - append
         ;(price as ISeriesApi<'Line'>).update(priceBarFor(last) as never)
+        applyBaseValue()
         vol.update(volBarFor(last))
         renderStateRef.current = { len: displayCandles.length, lastTime: last.time }
         return
@@ -1622,6 +1631,7 @@ export default function ChartPanel({
     } else {
       ;(price as unknown as ISeriesApi<'Candlestick'>).setData(displayCandles.map(priceBarFor) as never)
     }
+    applyBaseValue()
     vol.setData(displayCandles.map(volBarFor))
     renderStateRef.current = { len: displayCandles.length, lastTime: last.time }
   }, [displayCandles, chartType])
@@ -2915,6 +2925,37 @@ export default function ChartPanel({
   })
   const [scrRun, setScrRun] = useState(0)
   const [scrNote, setScrNote] = useState('')
+  // STORY: a plain-language read of the last CLOSED candle (kind, wicks, sweep/breakout, the 5s path inside it) + rate of change, from the server (analytics/candlestory.ts)
+  type StoryRes = { ok: boolean; error?: string; story?: { time: number; kind: string; dir: number; text: string; sizeAtr: number; closePos: number; has5s: boolean; moveSigma: number | null; expUp1: number | null; expDn1: number | null; expUp2: number | null; expDn2: number | null }; forming?: { text: string; kind: string; progress: number; elapsedSec: number; leftSec: number; moveSigma: number | null }; roc?: { r1: { roc: number; rocAtr: number; accel: number }; r3: { roc: number }; r5: { roc: number } }; earlier?: { time: number; kind: string; dir: number; text: string }[]; windows?: { ok: boolean; n: number; kind: string; text: string; net: number; eff: number; roc: number; netSigma: number | null }[]; structure?: { ok: boolean; n: number; high: number; highAge: number; low: number; lowAge: number; hh: number; hl: number; lh: number; ll: number; eh: number; el: number; sequence: string; structure: string; brokeHigh: boolean; brokeLow: boolean; rocAvg: number; rocMax: number; rocMaxAge: number; rocMin: number; rocMinAge: number; rocFirst: number; rocSecond: number; rocAccel: number; text: string } }
+  const [showStory, setShowStory] = useState(false)
+  const [storyRes, setStoryRes] = useState<StoryRes | null>(null)
+  const [storyWin, setStoryWin] = useState('14,21')
+  const [storyStr, setStoryStr] = useState('21')
+  // chart-type stories (renko / kagi / effort / heikin / ticks / tick bars / baseline / footprint) + the story study
+  type ChartStoryRes = { ok: boolean; error?: string; type?: string; kind?: string; dir?: number; text?: string; facts?: Record<string, number | string | boolean | null> }
+  type StudyRes = { ok: boolean; error?: string; bars?: number; horizon?: number; breakEven?: number; baseUp?: number; labels?: number; survivors?: number; expectedLucky?: number; rows?: { label: string; n: number; side: string; inN: number; inWin: number; outN: number; outWin: number; outLower: number; survivor: boolean }[] }
+  const [storyView, setStoryView] = useState('candles')
+  const [chartStory, setChartStory] = useState<ChartStoryRes | null>(null)
+  const [study, setStudy] = useState<StudyRes | null>(null)
+  const [studyBusy, setStudyBusy] = useState(false)
+  useEffect(() => {
+    if (!showStory || storyView === 'candles') return
+    let alive = true
+    const load = () => { osGet<ChartStoryRes>('/chart_story', { asset: digitsTicker, tf: tf ?? '1m', type: storyView, ...(storyView === 'baseline' ? { mode: 'mid' } : {}) }).then((r) => { if (alive) setChartStory(r) }).catch((e) => { if (alive) setChartStory({ ok: false, error: String(e instanceof Error ? e.message : e).slice(0, 120) }) }) }
+    setChartStory(null); load()
+    const t = window.setInterval(load, 4000)
+    return () => { alive = false; window.clearInterval(t) }
+  }, [showStory, storyView, digitsTicker, tf])
+  const runStudy = () => { setStudyBusy(true); setStudy(null); osGet<StudyRes>('/story_study', { asset: digitsTicker, tf: tf ?? '1m', bars: 2500, horizon: 1 }).then((r) => setStudy(r)).catch((e) => setStudy({ ok: false, error: String(e instanceof Error ? e.message : e).slice(0, 160) })).finally(() => setStudyBusy(false)) }
+  const [storyAgo, setStoryAgo] = useState('0')
+  useEffect(() => {
+    if (!showStory) return
+    let alive = true
+    const load = () => { osGet<StoryRes>('/candle_story', { asset: digitsTicker, tf: tf ?? '1m', windows: storyWin, structure: storyStr || '21', ago: storyAgo || '0' }).then((r) => { if (alive) setStoryRes(r) }).catch((e) => { if (alive) setStoryRes({ ok: false, error: String(e instanceof Error ? e.message : e).slice(0, 120) }) }) }
+    load()
+    const t = window.setInterval(load, 5000)
+    return () => { alive = false; window.clearInterval(t) }
+  }, [showStory, digitsTicker, tf, storyWin, storyStr, storyAgo])
   const scrSeriesRef = useRef<ISeriesApi<'Line'>[]>([])
   const scrLinesRef = useRef<{ series: AnyPriceSeries; line: IPriceLine }[]>([])
   useEffect(() => {
@@ -3083,6 +3124,128 @@ export default function ChartPanel({
         >
           SCR
         </button>
+        <button
+          onClick={() => setShowStory((v) => !v)}
+          title="Story: what the last closed candle did, in plain words (wicks, close position, sweeps, the 5s path inside it) plus its rate of change. It describes - it does not predict."
+          className={`flex h-6 w-6 items-center justify-center rounded border font-mono text-[7px] font-bold leading-none transition-colors ${
+            showStory ? 'border-amber-500/60 bg-amber-500/15 text-amber-300' : 'border-[#1c2739] bg-[#0d1420]/90 text-[#7c8aa5] hover:border-amber-500/40'
+          }`}
+        >
+          STORY
+        </button>
+        {showStory && (
+          <div className="absolute bottom-0 right-8 z-30 w-80 space-y-1 rounded border border-amber-500/40 bg-[#0b111c]/95 p-2 font-mono text-[9px] leading-snug text-[#9fb0cc] shadow-lg">
+            <div className="flex items-center justify-between text-amber-300">
+              <span>LAST CLOSED CANDLE{storyRes?.story ? ` · ${storyRes.story.kind}` : ''}</span>
+              <button onClick={() => setShowStory(false)} className="text-[#7c8aa5] hover:text-white">x</button>
+            </div>
+            <div className="flex flex-wrap gap-0.5">
+              {[['candles', 'candles'], ['renko', 'renko'], ['kagi', 'kagi'], ['effort', 'effort'], ['ha', 'heikin'], ['tickbars', 'tick bars'], ['ticks', 'ticks'], ['baseline', 'baseline'], ['footprint', 'footprint']].map(([id, label]) => (
+                <button key={id} onClick={() => setStoryView(id)} className={`rounded border px-1 py-px text-[8px] ${storyView === id ? 'border-amber-500/60 bg-amber-500/15 text-amber-300' : 'border-[#1c2739] text-[#7c8aa5] hover:text-white'}`}>{label}</button>
+              ))}
+            </div>
+            {storyView !== 'candles' && (
+              <div className="space-y-1">
+                {!chartStory && <div className="text-[#7c8aa5]">reading...</div>}
+                {chartStory && !chartStory.ok && <div className="text-rose-300">{chartStory.text || chartStory.error || 'no story'}</div>}
+                {chartStory?.ok && (
+                  <>
+                    <div className="text-amber-300">{chartStory.type} · {chartStory.kind}{chartStory.dir ? (chartStory.dir > 0 ? ' ▲' : ' ▼') : ''}</div>
+                    <div className="text-[#d6e2f5]">{chartStory.text}</div>
+                    <div className="flex flex-wrap gap-x-2 gap-y-0.5 text-[#7c8aa5]">
+                      {Object.entries(chartStory.facts ?? {}).filter(([, v]) => v !== null && v !== '').slice(0, 14).map(([k, v]) => (
+                        <span key={k}>{k} <span className="text-[#d6e2f5]">{typeof v === 'number' ? (Number.isInteger(v) ? v : Math.abs(v) >= 100 ? v.toFixed(1) : v.toFixed(Math.abs(v) < 0.01 ? 6 : 3)) : String(v)}</span></span>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+            {storyView === 'candles' && !storyRes && <div className="text-[#7c8aa5]">reading...</div>}
+            {storyView === 'candles' && storyRes && !storyRes.ok && <div className="text-rose-300">{storyRes.error ?? 'no story'}</div>}
+            {storyView === 'candles' && storyRes?.ok && storyRes.forming && (
+              <div className="space-y-0.5 rounded border border-amber-500/30 bg-amber-500/5 p-1">
+                <div className="flex items-center justify-between text-amber-300"><span>THIS CANDLE (forming) · {storyRes.forming.kind || '…'}</span><span>{Math.round(storyRes.forming.leftSec)}s left</span></div>
+                <div className="h-0.5 w-full rounded bg-[#1c2739]"><div className="h-0.5 rounded bg-amber-400" style={{ width: `${Math.round(Math.max(0, Math.min(1, storyRes.forming.progress)) * 100)}%` }} /></div>
+                <div className="text-[#d6e2f5]">{storyRes.forming.text}</div>
+              </div>
+            )}
+            {storyView === 'candles' && storyRes?.ok && storyRes.story && (
+              <>
+                <div className="text-[#d6e2f5]">{storyRes.story.text}</div>
+                {storyRes.story.moveSigma != null && storyRes.story.expUp1 != null && storyRes.story.expDn1 != null && (
+                  <div className="text-amber-200/90">expected move: close {storyRes.story.moveSigma >= 0 ? '+' : ''}{storyRes.story.moveSigma.toFixed(1)}σ · next bar 1σ {storyRes.story.expDn1.toFixed(5)} – {storyRes.story.expUp1.toFixed(5)}{storyRes.story.expUp2 != null && storyRes.story.expDn2 != null ? ` · 2σ ${storyRes.story.expDn2.toFixed(5)} – ${storyRes.story.expUp2.toFixed(5)}` : ''}</div>
+                )}
+                <div className="flex flex-wrap gap-x-3 text-[#7c8aa5]">
+                  <span>size {Number.isFinite(storyRes.story.sizeAtr) ? storyRes.story.sizeAtr.toFixed(2) : '-'} ATR</span>
+                  <span>close at {Number.isFinite(storyRes.story.closePos) ? Math.round(storyRes.story.closePos * 100) : '-'}% of range</span>
+                  <span>{storyRes.story.has5s ? '5s path read' : 'no 5s data'}</span>
+                </div>
+                {storyRes.roc && (
+                  <div className="flex flex-wrap gap-x-3 text-amber-200/90">
+                    <span>roc1 {storyRes.roc.r1.roc.toFixed(3)}%</span>
+                    <span>roc3 {storyRes.roc.r3.roc.toFixed(3)}%</span>
+                    <span>roc5 {storyRes.roc.r5.roc.toFixed(3)}%</span>
+                    <span title="change of the 1-bar roc vs the bar before: >0 = speeding up">accel {storyRes.roc.r1.accel >= 0 ? '+' : ''}{storyRes.roc.r1.accel.toFixed(3)}</span>
+                  </div>
+                )}
+                <div className="space-y-1 border-t border-[#1c2739] pt-1">
+                  <label className="flex items-center justify-between text-[#7c8aa5]">last N bars (comma list, 3-200)
+                    <input type="text" value={storyWin} onChange={(e) => setStoryWin(e.target.value.replace(/[^0-9,]/g, '').slice(0, 20))} className="w-20 rounded border border-[#1c2739] bg-[#0d1420] px-1 text-right text-[#d6e2f5]" />
+                  </label>
+                  {storyRes.windows?.map((w) => (
+                    <div key={w.n}>
+                      <div className="text-amber-200/90">{w.n} bars · {w.ok ? w.kind : 'not enough candles'}{w.ok ? ` · net ${w.net >= 0 ? '+' : ''}${w.net.toFixed(1)} ATR${w.netSigma != null ? ` (${w.netSigma >= 0 ? '+' : ''}${w.netSigma.toFixed(1)}σ)` : ''} · eff ${(w.eff * 100).toFixed(0)}%` : ''}</div>
+                      {w.ok && <div className="text-[#d6e2f5]">{w.text}</div>}
+                    </div>
+                  ))}
+                </div>
+                {storyRes.structure && (
+                  <div className="space-y-0.5 border-t border-[#1c2739] pt-1">
+                    <div className="flex items-center justify-between text-[#7c8aa5]">
+                      <span>STRUCTURE · last <input type="text" value={storyStr} onChange={(e) => setStoryStr(e.target.value.replace(/[^0-9]/g, '').slice(0, 3))} className="w-9 rounded border border-[#1c2739] bg-[#0d1420] px-1 text-right text-[#d6e2f5]" /> bars, ending <input type="text" value={storyAgo} onChange={(e) => setStoryAgo(e.target.value.replace(/[^0-9]/g, '').slice(0, 3))} className="w-9 rounded border border-[#1c2739] bg-[#0d1420] px-1 text-right text-[#d6e2f5]" /> ago</span>
+                    </div>
+                    {!storyRes.structure.ok && <div className="text-[#7c8aa5]">not enough candles</div>}
+                    {storyRes.structure.ok && (
+                      <>
+                        <div className="text-amber-200/90">{storyRes.structure.structure}{storyRes.structure.brokeHigh ? ' · closed above the last swing high' : storyRes.structure.brokeLow ? ' · closed below the last swing low' : ''}</div>
+                        <div className="text-[#d6e2f5]">swings: {storyRes.structure.sequence || 'none yet'}</div>
+                        <div className="flex flex-wrap gap-x-3 text-[#7c8aa5]">
+                          <span>HH {storyRes.structure.hh}</span><span>HL {storyRes.structure.hl}</span><span>LH {storyRes.structure.lh}</span><span>LL {storyRes.structure.ll}</span>
+                          {(storyRes.structure.eh + storyRes.structure.el) > 0 && <span>equal {storyRes.structure.eh + storyRes.structure.el}</span>}
+                        </div>
+                        <div className="text-[#7c8aa5]">high {storyRes.structure.high.toFixed(5)} ({storyRes.structure.highAge} bars ago) · low {storyRes.structure.low.toFixed(5)} ({storyRes.structure.lowAge} ago)</div>
+                        <div className="text-amber-200/90">roc: fastest {storyRes.structure.rocMax >= 0 ? '+' : ''}{storyRes.structure.rocMax.toFixed(3)}% ({storyRes.structure.rocMaxAge} ago) · sharpest {storyRes.structure.rocMin.toFixed(3)}% ({storyRes.structure.rocMinAge} ago) · halves {storyRes.structure.rocFirst.toFixed(4)} → {storyRes.structure.rocSecond.toFixed(4)} %/bar ({storyRes.structure.rocAccel >= 0 ? 'speeding up' : 'slowing'})</div>
+                      </>
+                    )}
+                  </div>
+                )}
+                {!!storyRes.earlier?.length && (
+                  <div className="border-t border-[#1c2739] pt-1 text-[#7c8aa5]">
+                    {storyRes.earlier.slice(0, 3).map((e) => <div key={e.time}>{e.dir > 0 ? '▲' : e.dir < 0 ? '▼' : '■'} {e.kind}</div>)}
+                  </div>
+                )}
+              </>
+            )}
+            <div className="space-y-1 border-t border-[#1c2739] pt-1">
+              <button onClick={runStudy} disabled={studyBusy} className="w-full rounded border border-amber-500/40 py-0.5 text-amber-300 hover:bg-amber-500/10 disabled:opacity-50">{studyBusy ? 'studying the history...' : 'STUDY: do any stories predict the next candle?'}</button>
+              {study && !study.ok && <div className="text-rose-300">{study.error ?? 'study failed'}</div>}
+              {study?.ok && (
+                <div className="space-y-0.5">
+                  <div className="text-[#7c8aa5]">{study.bars} candles · {study.labels} labels · break-even {((study.breakEven ?? 0) * 100).toFixed(1)}% · next bar up {((study.baseUp ?? 0) * 100).toFixed(1)}% overall</div>
+                  <div className={study.survivors ? 'text-emerald-300' : 'text-[#7c8aa5]'}>{study.survivors} survivor(s) (picked on the first 60%, beat break-even on the last 40%); luck alone would give ~{(study.expectedLucky ?? 0).toFixed(1)}</div>
+                  {study.rows?.slice(0, 8).map((r) => (
+                    <div key={r.label} className={`flex justify-between gap-2 ${r.survivor ? 'text-emerald-300' : 'text-[#7c8aa5]'}`}>
+                      <span className="truncate">{r.label}</span>
+                      <span className="shrink-0">{r.side} · {(r.inWin * 100).toFixed(0)}% → {(r.outWin * 100).toFixed(0)}% (n {r.outN})</span>
+                    </div>
+                  ))}
+                  <div className="text-[#5f6d85]">a survivor is a hypothesis to test on other pairs and periods, not an edge.</div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
         {scrOpen && (
           <div className="absolute bottom-0 right-8 z-30 w-72 space-y-1 rounded border border-fuchsia-500/40 bg-[#0b111c]/95 p-2 font-mono text-[9px] text-[#9fb0cc] shadow-lg">
             <div className="flex items-center justify-between text-fuchsia-300">

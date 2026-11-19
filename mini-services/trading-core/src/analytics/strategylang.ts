@@ -276,6 +276,8 @@ import {
   MODEL_MIN_BARS, HURST_MIN_BARS, CM_MIN_BARS, STAT_NAMES, readOU, readMarkov, statValue, cmRead, cmHas, cmRevealedHas, cmDir, cmSmart,
   type OUModel, type MarkovModel,
 } from './mslmodels'
+import { storyRenko, storyKagi, storyEffort, storyHeikin, storyTickBars, storyTicks, storyBaseline, storyFootprint, CHART_STORY_TYPES, type ChartStory } from './charttypestory'
+import { readStory, readRoc, readWindowStory, readStructure, readFormingStory, cutBars } from './candlestory'
 import { oscillatorVotes, maVotes, TECH_MIN_BARS, TECH_BARS_PER_RUNG, type TechVote } from './technicals'
 
 export interface MslSourceRead {
@@ -5622,6 +5624,12 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         return e.obj.name === 'risk' ? riskMethod(e.name, args, ctx) : sessionMethod(e.name, args, ctx)
       }
+      if (e.obj.t === 'ident' && e.obj.name === 'story' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        if (e.name === 'of' || e.name === 'ofText') return storyOf(e.name, args, ctx)
+        const tf = args.length && typeof args[args.length - 1] === 'string' && e.name !== 'is' ? (args.pop() as string) : undefined
+        return storyMethod(e.name, args, ctx, tf)
+      }
       if (e.obj.t === 'ident' && e.obj.name === 'timing' && !(e.obj.name in env)) {
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         return timingMethod(e.name, args, ctx)
@@ -6282,6 +6290,120 @@ function posBundle(p: MslPosView, close: number, atr: number): MslValue {
   const risk = Number.isFinite(p.initStop) ? Math.abs(p.entry - p.initStop) : NaN
   return bundleValue({ dir: p.dir, entry: p.entry, bars: p.bars, best: p.best, worst: p.worst, left: p.left, stop: p.stop, target: p.target, trail: p.trail, size: p.size, pnl, pnlAtr: atr > 0 ? pnl / atr : NaN, risk, initStop: p.initStop })
 }
+/** `story.*` - the story of the last CLOSED candle (analytics/candlestory.ts) + rate of change. Candle-derived and backtestable; the 5s-path fields need a 5s series (NaN / false without). */
+function storyMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const s = requireSeries(ctx, tf)
+  let five: typeof s | undefined
+  if (tf === undefined) { try { five = ctx.seriesFor?.('5s') } catch { five = undefined } }
+  const num = (k: number) => (args.length > k ? asNum(args[k]) : NaN)
+  if (name === 'roc' || name === 'rocAtr' || name === 'accel') {
+    const n = args.length ? num(0) : 1
+    const r = readRoc(cutBars(s, args.length > 1 ? num(1) : 0), n)
+    return name === 'roc' ? r.roc : name === 'rocAtr' ? r.rocAtr : r.accel
+  }
+  if (name === 'rocBody') return readRoc(cutBars(s, args.length ? num(0) : 0), 1).rocOfBody
+  if (name === 'at') {
+    // the full story of ANY past candle: story.at(0) is the last closed bar, story.at(5) the one five bars before it
+    const k = args.length ? Math.max(0, Math.round(num(0))) : 0
+    const st = readStory(cutBars(s, k), k === 0 ? five : undefined)
+    return bundleValue({ ok: st.ok, kind: st.kind, text: st.text, dir: st.dir, body: st.body, range: st.range, upperWick: st.upperWick, lowerWick: st.lowerWick, closePos: st.closePos, size: st.sizeAtr, bodyAtr: st.bodyAtr, sweep: st.sweep, breakout: st.breakout, engulf: st.engulf, inside: st.inside, gap: st.gap, has5s: st.has5s, pathEff: st.pathEff, retrace: st.retrace, extremeEarly: st.extremeEarly, upShare: st.upShare, burst: st.burst, sigma: st.sigma, moveSigma: st.moveSigma, rangeSigma: st.rangeSigma, expUp1: st.expUp1, expDn1: st.expDn1, expUp2: st.expUp2, expDn2: st.expDn2 })
+  }
+  if (name === 'now') {
+    // the candle that is STILL FORMING, so far - needs the live bar (only the omni-trader wires one in); fails closed everywhere else
+    const lb = ctx.liveBar
+    if (!lb) throw new MslRuntimeError('story.now() reads the candle that is still forming, which needs the live bar - only the omni-trader provides one (use story.at(0) for the last CLOSED candle)')
+    const tm = s.time, span = tm && tm.length >= 2 ? tm[tm.length - 1] - tm[tm.length - 2] : NaN
+    const open = tm && Number.isFinite(span) ? tm[tm.length - 1] + span : undefined
+    const progress = open !== undefined && span > 0 ? (evalNowMs(ctx) / 1000 - open) / span : NaN
+    const st = readFormingStory(s, lb, open, progress, five)
+    return bundleValue({ ok: st.ok, partial: true, progress: st.progress, kind: st.kind, text: st.text, dir: st.dir, body: st.body, range: st.range, upperWick: st.upperWick, lowerWick: st.lowerWick, closePos: st.closePos, size: st.sizeAtr, bodyAtr: st.bodyAtr, sweep: st.sweep, breakout: st.breakout, engulf: st.engulf, inside: st.inside, gap: st.gap, has5s: st.has5s, pathEff: st.pathEff, retrace: st.retrace, extremeEarly: st.extremeEarly, upShare: st.upShare, burst: st.burst, sigma: st.sigma, moveSigma: st.moveSigma, rangeSigma: st.rangeSigma, expUp1: st.expUp1, expDn1: st.expDn1, expUp2: st.expUp2, expDn2: st.expDn2 })
+  }
+  if (name === 'structure' || name === 'structureText') {
+    if (!args.length) throw new MslRuntimeError(`story.${name}(n [, ago [, strength]]) needs the number of bars, e.g. story.${name}(21)`)
+    const st = readStructure(s, num(0), args.length > 1 ? num(1) : 0, args.length > 2 ? num(2) : 2)
+    if (name === 'structureText') return st.text
+    return bundleValue({
+      ok: st.ok, n: st.n, strength: st.strength, high: st.high, highAge: st.highAge, low: st.low, lowAge: st.lowAge,
+      hh: st.hh, lh: st.lh, hl: st.hl, ll: st.ll, eh: st.eh, el: st.el, lastHigh: st.lastHigh, lastLow: st.lastLow, sequence: st.sequence, structure: st.structure, brokeHigh: st.brokeHigh, brokeLow: st.brokeLow,
+      highCount: st.highs.length, lowCount: st.lows.length,
+      highPrices: mkArr(ctx, st.highs.map((p) => p.price)), highAges: mkArr(ctx, st.highs.map((p) => p.age)), highLabels: mkArr(ctx, st.highs.map((p) => p.label)),
+      lowPrices: mkArr(ctx, st.lows.map((p) => p.price)), lowAges: mkArr(ctx, st.lows.map((p) => p.age)), lowLabels: mkArr(ctx, st.lows.map((p) => p.label)),
+      rocs: mkArr(ctx, st.rocs), rocAvg: st.rocAvg, rocMax: st.rocMax, rocMaxAge: st.rocMaxAge, rocMin: st.rocMin, rocMinAge: st.rocMinAge, rocFirst: st.rocFirst, rocSecond: st.rocSecond, rocAccel: st.rocAccel, rocUpShare: st.rocUpShare,
+      kinds: mkArr(ctx, st.kinds), dirs: mkArr(ctx, st.dirs), text: st.text,
+    })
+  }
+  if (name === 'windowSigma') return readWindowStory(cutBars(s, args.length > 1 ? num(1) : 0), num(0)).netSigma
+  if (name === 'window' || name === 'windowText' || name === 'windowKind') {
+    if (!args.length) throw new MslRuntimeError(`story.${name}(n) needs the number of bars, e.g. story.${name}(14)`)
+    const w = readWindowStory(cutBars(s, args.length > 1 ? num(1) : 0), num(0))
+    if (name === 'windowText') return w.text
+    if (name === 'windowKind') return w.kind
+    return bundleValue({ ok: w.ok, n: w.n, kind: w.kind, text: w.text, dir: w.dir, net: w.net, roc: w.roc, eff: w.eff, upShare: w.upShare, hhhl: w.hhhl, lhll: w.lhll, rangeAtr: w.rangeAtr, pos: w.pos, expansion: w.expansion, bodyShare: w.bodyShare, tail: w.tail, firstHalf: w.firstHalf, secondHalf: w.secondHalf, biggestAtr: w.biggestAtr, biggestAge: w.biggestAge, netSigma: w.netSigma, expUp1: w.expUp1, expDn1: w.expDn1, expUp2: w.expUp2, expDn2: w.expDn2 })
+  }
+  const st = readStory(s, five)
+  switch (name) {
+    case 'ok': return st.ok
+    case 'text': return st.text
+    case 'kind': return st.kind
+    case 'is': return typeof args[0] === 'string' && st.kind === args[0]
+    case 'dir': return st.dir
+    case 'closePos': return st.closePos
+    case 'body': return st.body
+    case 'upperWick': return st.upperWick
+    case 'lowerWick': return st.lowerWick
+    case 'size': return st.sizeAtr
+    case 'bodyAtr': return st.bodyAtr
+    case 'sweep': return st.sweep
+    case 'breakout': return st.breakout
+    case 'engulf': return st.engulf
+    case 'inside': return st.inside
+    case 'gap': return st.gap
+    case 'has5s': return st.has5s
+    case 'pathEff': return st.pathEff
+    case 'retrace': return st.retrace
+    case 'extremeEarly': return st.extremeEarly
+    case 'upShare': return st.upShare
+    case 'burst': return st.burst
+    case 'sigma': return st.sigma
+    case 'moveSigma': return st.moveSigma
+    case 'rangeSigma': return st.rangeSigma
+    case 'expUp': return args.length && num(0) >= 2 ? st.expUp2 : st.expUp1
+    case 'expDn': return args.length && num(0) >= 2 ? st.expDn2 : st.expDn1
+    default: throw new MslRuntimeError(`story.${name}() is not a thing - try kind, text, dir, closePos, body, upperWick, lowerWick, size, bodyAtr, sweep, breakout, engulf, inside, gap, has5s, pathEff, retrace, extremeEarly, upShare, burst, is("kind"), roc(n), rocAtr(n), accel(n), rocBody(), window(n) (a bundle: kind text dir net roc eff ...), windowText(n), windowKind(n), at(k), now() (the forming candle, omni only), moveSigma(), rangeSigma(), sigma(), expUp(1|2), expDn(1|2), windowSigma(n, ago), structure(n, ago, strength), structureText(n, ago, strength), of("renko"|"kagi"|"effort"|"ha"|"tickbars"|"ticks"|"baseline"|"footprint"), ofText(type)`)
+  }
+}
+
+/** `story.of("renko" | "kagi" | "effort" | "ha" | "tickbars" | "ticks" | "baseline" | "footprint" [, number...] [, "5m"])` - the story of that CHART TYPE (analytics/charttypestory.ts) as a bundle: ok, kind, dir, text, and every fact by name (renko: run prevRun flips progress toReversal ...; kagi: thick structure regime legUnits ...; effort: effortRatio confirmedRatio regime ...; ha: run flatTailRun bodyShrink ...; tickbars: run speed rangeRatio ...; ticks: rate5 accel upShare60 net60 ...; baseline: deviationAtr aboveShare crossings ...; footprint: delta deltaShare pocPos cumDelta divergence ...). Optional numbers: ha window | tickbars per | baseline n then "first"/"mid" | footprint n. `story.ofText(...)` is the sentence alone. */
+function storyOf(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
+  const type = args[0]
+  if (typeof type !== 'string' || !(CHART_STORY_TYPES as readonly string[]).includes(type)) throw new MslRuntimeError(`story.${name}(type): type must be one of ${CHART_STORY_TYPES.map((t) => '"' + t + '"').join(', ')}`)
+  const rest = args.slice(1)
+  const strs = rest.filter((a): a is string => typeof a === 'string'), nums = rest.filter((a): a is number => typeof a === 'number')
+  const mode = strs.includes('mid') ? 'mid' : 'first', tf = strs.find((x) => x !== 'mid' && x !== 'first')
+  let st: ChartStory
+  if (type === 'ticks') {
+    const t = ctx.liveTicks
+    if (!t || !t.length) throw new MslRuntimeError('story.of("ticks") reads the live tick feed, which only the omni-trader wires in (use "tickbars", which falls back to candle closes)')
+    const a = lastAtr(ctx)
+    st = storyTicks(t, evalNowMs(ctx), a)
+  } else if (type === 'tickbars') {
+    const { points, dataSource } = tickbarPoints(ctx, tf)
+    st = storyTickBars(points, dataSource, nums.length ? Math.round(nums[0]) : 10)
+  } else {
+    const cs = seriesToCandles(requireSeries(ctx, tf))
+    st = type === 'renko' ? storyRenko(cs, { brickSize: cfgNumLang(ctx, 'renko.brick', undefined), atrPeriod: cfgNumLang(ctx, 'renko.atrPeriod', undefined), atrMult: cfgNumLang(ctx, 'renko.atrMult', undefined) })
+      : type === 'kagi' ? storyKagi(cs)
+      : type === 'effort' ? storyEffort(cs)
+      : type === 'ha' ? storyHeikin(cs, { window: nums.length ? nums[0] : undefined })
+      : type === 'baseline' ? storyBaseline(cs, nums.length ? nums[0] : 30, mode)
+      : storyFootprint(cs, nums.length ? nums[0] : 10)
+  }
+  if (name === 'ofText') return st.text
+  const facts: Record<string, MslValue> = {}
+  for (const [k, v] of Object.entries(st.facts)) facts[k] = v
+  return bundleValue({ ok: st.ok, type: st.type, kind: st.kind, dir: st.dir, text: st.text, ...facts })
+}
+
 function lastAtr(ctx: EvalEnv): number {
   const sr = ctx.series
   if (!sr || sr.close.length < 20) return NaN

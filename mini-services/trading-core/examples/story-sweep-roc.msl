@@ -1,0 +1,9 @@
+# Trade the STORY of the last closed candle. A stop-run that closes back inside, closing in the right half of its range, with the rate of change turning the same way:
+#   bullish: poked below the recent low, closed back above it, closed in the top 40% of the range, and roc(1) is accelerating up
+# Candle-derived, so it BACKTESTS. This is a hypothesis to test, not an edge - run it through the backtester before trusting it.
+let minSize = 0.8          # the candle must be at least this many ATR (not a tiny candle)
+let upSweep = story.sweep() == 1 and story.closePos() >= 0.6 and story.size() >= minSize and story.accel() > 0
+let downSweep = story.sweep() == -1 and story.closePos() <= 0.4 and story.size() >= minSize and story.accel() < 0
+call when upSweep
+put when downSweep
+expiry = 2
