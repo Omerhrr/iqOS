@@ -23,6 +23,7 @@ import BacktestLab from './BacktestLab'
 import QuantPanel from './QuantPanel'
 import AutopilotPanel from './AutopilotPanel'
 import BrainTab from './BrainTab'
+import CfdTraderPanel from './CfdTraderPanel'
 import AiTraderPanel from './AiTraderPanel'
 import AILabPanel from './AILabPanel'
 import JournalTab from './JournalTab'
@@ -259,6 +260,7 @@ export default function BottomTabs(props: BottomTabsProps) {
             ['autopilot', `Autopilot${props.bots.filter((b) => b.bot.enabled).length ? ` (${props.bots.filter((b) => b.bot.enabled).length})` : ''}`],
             ['ai-trader', 'AI Trader'],
             ['brain', 'Brain'],
+            ['cfd', 'CFD Trader'],
             ['sentinel', 'Sentinel'],
             ['watchdog', 'Watchdog'],
             ['research', 'Research'],
@@ -508,6 +510,11 @@ export default function BottomTabs(props: BottomTabsProps) {
       {/* BRAIN - structure brain + AI reviewer: live mind, editable strategy, trader (plugins/braintrader.ts) */}
       <TabsContent value="brain" className="mt-0 min-h-0 flex-1 overflow-hidden">
         <BrainTab asset={asset} assets={props.assets} onError={onError} />
+      </TabsContent>
+
+      {/* CFD TRADER - forex/CFD engine: story.cfd() plan -> sized order with SL/TP (plugins/cfdtrader.ts) */}
+      <TabsContent value="cfd" className="mt-0 min-h-0 flex-1 overflow-hidden">
+        <CfdTraderPanel asset={asset} />
       </TabsContent>
 
       {/* SENTINEL (risk governance) */}

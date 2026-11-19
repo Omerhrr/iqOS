@@ -279,6 +279,7 @@ import {
 import { storyRenko, storyKagi, storyEffort, storyHeikin, storyTickBars, storyTicks, storyBaseline, storyFootprint, CHART_STORY_TYPES, type ChartStory } from './charttypestory'
 import { readMtf } from './mtfstory'
 import { readCauseEffect, combineCeMtf } from './causeeffect'
+import { readCfdPlan } from './cfdplan'
 import { readStory, readRoc, readWindowStory, readStructure, readFormingStory, cutBars } from './candlestory'
 import { oscillatorVotes, maVotes, TECH_MIN_BARS, TECH_BARS_PER_RUNG, type TechVote } from './technicals'
 
@@ -5631,6 +5632,7 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         if (e.name === 'of' || e.name === 'ofText') return storyOf(e.name, args, ctx)
         if (e.name === 'mtf') return storyMtf(args, ctx)
         if (e.name === 'pm' || e.name === 'pmText') return storyPm(e.name, args, ctx)
+        if (e.name === 'cfd' || e.name === 'cfdText') return storyCfd(e.name, args, ctx)
         const tf = args.length && typeof args[args.length - 1] === 'string' && e.name !== 'is' ? (args.pop() as string) : undefined
         return storyMethod(e.name, args, ctx, tf)
       }
@@ -6442,6 +6444,19 @@ function storyPm(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
     effectDir: r.effect.dir, sizeAtr: r.effect.sizeAtr, psychology: r.effect.psychology, upperWick: r.effect.upperWick, lowerWick: r.effect.lowerWick, roc: r.effect.roc, cci: r.effect.cci,
     coherence: r.validation.coherence, bucketN: r.validation.bucketN, bucketUp: r.validation.bucketUpProb, trackN: r.validation.trackN, trackHit: r.validation.trackHit,
     support: r.sr.support, resistance: r.sr.resistance, supDist: r.sr.supDist, resDist: r.sr.resDist, atSupport: r.sr.atSupport, atResistance: r.sr.atResistance, retest: r.sr.retest, text: m.text })
+}
+
+/** `story.cfd([htf], [minRR])` - the pm model as a CFD trade PLAN (analytics/cfdplan.ts): direction plus entry, stop, target, rr, ev, probability. Flat bundle: ok error direction entry stop target
+ * riskDist rewardDist riskAtr rewardAtr rr prob strength ev atr stopKind targetKind alignment. Use: `call when c.direction == "call" and c.rr >= 1.5` then `pos.stop = c.stop` `pos.target = c.target`. story.cfdText() is the sentence. */
+function storyCfd(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
+  const htfTf = args.find((a): a is string => typeof a === 'string') ?? '5m'
+  const nums = args.filter((a): a is number => typeof a === 'number')
+  const mk = (s: MslSeriesCtx) => { const t = s.time ?? []; return seriesToCandles(s).map((c, i) => ({ ...c, time: t[i] ?? i })) }
+  let htfC: ReturnType<typeof mk> | null = null
+  if (htfTf !== 'none') { try { const hs = ctx.seriesFor?.(htfTf); if (hs) htfC = mk(hs) } catch { htfC = null } }
+  const p = readCfdPlan(mk(requireSeries(ctx, undefined)), ctx.liveTicks, htfC, { htfTf, ...(nums[0] !== undefined ? { minRR: nums[0] } : {}) })
+  if (name === 'cfdText') return p.text
+  return bundleValue({ ok: p.ok, error: p.ok ? '' : (p.error ?? ''), direction: p.direction, entry: p.entry, stop: p.stop, target: p.target, riskDist: p.riskDist, rewardDist: p.rewardDist, riskAtr: p.riskAtr, rewardAtr: p.rewardAtr, rr: p.rr, prob: p.prob, strength: p.strength, ev: p.ev, atr: p.atr, stopKind: p.stopKind, targetKind: p.targetKind, alignment: p.alignment })
 }
 
 function lastAtr(ctx: EvalEnv): number {

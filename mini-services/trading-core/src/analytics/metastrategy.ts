@@ -325,6 +325,8 @@ export interface MetaEvalResult {
    * specs never set it. Advisory: the trading engines' own expiry
    * contracts still apply on top. */
   expiryMin?: number
+  /** script-built only: the script's managed-trade directives (pos.stop/target = absolute prices, trail/breakeven = distances, size, max) at this verdict - used by the CFD Trader. */
+  entry?: { stop?: number; target?: number; trail?: number; breakeven?: number; size?: number; max?: number }
 }
 
 function clamp(v: number, lo: number, hi: number): number {

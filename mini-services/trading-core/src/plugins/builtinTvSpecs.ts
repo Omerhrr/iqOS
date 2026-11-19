@@ -414,4 +414,22 @@ put when ok and m.direction == "put" and not m.atSupport
 expiry = 1
 `,
   },
+  {
+    id: 'meta:builtin-cfd-pm',
+    name: 'Builtin: CFD predicted move + SL/TP plan',
+    script: `
+# CFD PLAN. story.cfd() turns the cause->effect predicted move into a full trade plan: entry, stop (beyond the nearest support/resistance, else ATR), target (the next level, else a minimum reward:risk),
+# plus the reward:risk and expected value in R. The CFD Trader sizes it (risk % or fixed margin) and places it with these exact levels.
+# The 5m chart is blended in (story.cfd("15m") picks another). A judgement-weighted model, not a fitted one: backtest before trusting it.
+let minConf = 45
+let minRR = 1.5
+let c = story.cfd("5m", minRR)
+let ok = c.ok and c.strength >= minConf and c.rr >= minRR and c.ev > 0 and c.alignment != "conflict"
+call when ok and c.direction == "call"
+put when ok and c.direction == "put"
+pos.stop = c.stop
+pos.target = c.target
+pos.breakeven = c.riskDist
+`,
+  },
 ]

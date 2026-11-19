@@ -115,6 +115,10 @@ export class Store {
         id INTEGER PRIMARY KEY CHECK (id = 1),
         config TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS cfd_trader_config (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        config TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS omni_trader_config (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         config TEXT NOT NULL
@@ -1276,6 +1280,27 @@ export class Store {
     this.db.run('INSERT INTO meta_trader_config (id, config) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET config = excluded.config', [
       JSON.stringify(config),
     ])
+  }
+
+  // ---------- cfd trader (plugins/cfdtrader.ts) ----------
+  getCfdTraderConfig(): unknown | null {
+    const row = this.db.query('SELECT config FROM cfd_trader_config WHERE id = 1').get() as { config: string } | null
+    if (!row) return null
+    try { return JSON.parse(row.config) } catch { return null }
+  }
+
+  saveCfdTraderConfig(config: unknown): void {
+    this.db.run('INSERT INTO cfd_trader_config (id, config) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET config = excluded.config', [JSON.stringify(config)])
+  }
+
+  /** Move an OPEN paper CFD's stop/target (percent-of-entry, the engine's own unit) - breakeven / trailing. */
+  updateCfdLevels(id: string, patch: { tp?: number; sl?: number }): void {
+    const sets: string[] = [], vals: (number | string)[] = []
+    if (patch.tp !== undefined) { sets.push('tp = ?'); vals.push(patch.tp) }
+    if (patch.sl !== undefined) { sets.push('sl = ?'); vals.push(patch.sl) }
+    if (!sets.length) return
+    vals.push(id)
+    this.db.run(`UPDATE positions SET ${sets.join(', ')} WHERE id = ? AND status = 'open'`, vals)
   }
 
   // ---------- omni trader (plugins/omnitrader.ts) ----------

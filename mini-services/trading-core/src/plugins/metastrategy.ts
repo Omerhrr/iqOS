@@ -2541,6 +2541,7 @@ export class MetaStrategyService {
       conditions: [],
       notes,
       ...(out.expiryMin !== undefined ? { expiryMin: out.expiryMin } : {}),
+      ...(out.entry ? { entry: out.entry } : {}),
     }
   }
 
