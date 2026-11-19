@@ -55,7 +55,7 @@ import { realizedUpProb } from '../analytics/ivhv'
 import { EXPIRIES_MIN } from '../analytics/nextexpiry'
 import { TECH_LADDER } from '../analytics/technicals'
 import { engineVoteSingle, tickVote, otcFootprintVote, type ChartEngineVote } from '../analytics/chartsignals'
-import { smcNowRead, smcAnyAgrees, ALL_SMC_KINDS } from '../analytics/smc'
+import { smcNowRead, smcAnyAgrees, ALL_SMC_KINDS, scanSmc, type SmcScanResult } from '../analytics/smc'
 import { buildFootprint, footprintAbsorption, unfinishedAuction } from '../analytics/otcfootprint'
 import { ICT_KINDS, voteForKindSet } from '../analytics/chartindicators'
 import { buildCtx } from '../strategies/custom'
@@ -107,6 +107,8 @@ const SAFE_BACKTEST_SOURCES = new Set<MetaConditionSource>([
   'renko', 'pointFigure', 'rangeBars', 'candle', 'bar', 'heikinAshi', 'line', 'area',
   'baseline', 'volumeBars', 'tpo', 'ivHv', 'volumeProfile', 'lineBreak', 'kagi', 'swing',
   'deltaProfile', 'technical', 'reversal', 'effort', 'mrc', 'outcomeMemory', 'spring', 'echo',
+  // SMC family: analytics/smc.ts scanSmc() is pure on candles, so a replay scans the replayed candles directly (smcResult below) instead of the live scan cache
+  'smc', 'smcNow', 'ict',
 ])
 
 /** Every OTHER MetaConditionSource - named explicitly (rather than derived
@@ -115,7 +117,7 @@ const SAFE_BACKTEST_SOURCES = new Set<MetaConditionSource>([
  * refusal. Kept in sync with META_CONDITION_SOURCES by the dev-time
  * assertion right below. */
 const UNSAFE_BACKTEST_SOURCES = new Set<MetaConditionSource>([
-  'oracle', 'hmaRocBullBear', 'momentumScore', 'accute', 'smc', 'smcNow', 'ict',
+  'oracle', 'hmaRocBullBear', 'momentumScore', 'accute',
   'renkoSmc', 'renkoSmcMajority', 'tick', 'footprint', 'otcFootprint', 'tickSmc',
   'tickOracle', 'tickTechnical', 'tickFootprint', 'tempo', 'confluence', 'volArb',
   'cointegration', 'screenerRank', 'chartSignals', 'leadLag', 'yesterday', 'pulse',
@@ -1080,6 +1082,15 @@ export class MetaStrategyService {
     return { direction, confidence, streak: r.streak, trend: r.trend }
   }
 
+  /** The SMC scan for one asset+tf. LIVE = the shared scan cache (what the SMC panel and Meta Trader read). REPLAY = scanSmc() run directly on the candles visible at the replayed bar (setReplayAsof
+   * already hides everything later), 300 bars like the live scan, no cache and no outcome recording - so a backtest sees exactly what the scan would have said then. */
+  private smcResult(asset: string, tf: Timeframe): SmcScanResult | null {
+    if (this.inReplay) {
+      try { return scanSmc(this.market.getCandlesDeep(asset, tf, 300, true)) } catch { return null }
+    }
+    return this.ctx.use<SmcScanService>('smcScan').scan(asset, tf).result ?? null
+  }
+
   /** The raw micro-tick buffer for one asset (the otc-footprint collector's
    * own per-asset store - sim = the kernel engine's ~1s prints, live = the
    * sidecar's 100ms price-change captures), the SAME buffer every Tick Desk
@@ -1210,9 +1221,7 @@ export class MetaStrategyService {
           return { source, direction: r.direction, confidence: r.confidence, value: signedStreak, label: `Renko ${r.streak} ${r.trend.toUpperCase()} brick(s)${cfg ? ' [configured]' : ''}` }
         }
         case 'smc': {
-          const smc = this.ctx.use<SmcScanService>('smcScan')
-          const resp = smc.scan(asset, tf)
-          const summary = resp.result?.summary
+          const summary = this.smcResult(asset, tf)?.summary
           if (!summary || summary.direction === 'none') return none('SMC: no lean')
           return { source, direction: summary.direction, confidence: summary.confidence, label: `SMC ${summary.direction.toUpperCase()} ${summary.confidence.toFixed(0)}%` }
         }
@@ -1222,11 +1231,10 @@ export class MetaStrategyService {
           // only - same read Meta Trader's plain 'smc' source trades) by
           // default, or ONE concept via this condition's smcKind field,
           // same smcNowRead() both share (analytics/smc.ts).
-          const smc = this.ctx.use<SmcScanService>('smcScan')
-          const resp = smc.scan(asset, tf)
-          if (!resp.result) return none('SMC now: no scan result yet')
+          const scanned = this.smcResult(asset, tf)
+          if (!scanned) return none('SMC now: no scan result yet')
           const kind = smcKind && (ALL_SMC_KINDS as readonly string[]).includes(smcKind) ? (smcKind as (typeof ALL_SMC_KINDS)[number]) : undefined
-          const read = smcNowRead(resp.result, kind)
+          const read = smcNowRead(scanned, kind)
           if (read.direction === 'none') return none(`SMC now${kind ? ` (${kind})` : ''}: ${read.note}`)
           return { source, direction: read.direction, confidence: read.confidence, label: `SMC now${kind ? ` ${kind}` : ''} ${read.direction.toUpperCase()} - ${read.note}` }
         }
@@ -1234,10 +1242,9 @@ export class MetaStrategyService {
           // Splits the SAME scan 'smc'/'smcNow' above already read into just
           // the ICT-originated concepts (analytics/chartindicators.ts's
           // ICT_KINDS, reused here rather than redefined) - never re-scans.
-          const smc = this.ctx.use<SmcScanService>('smcScan')
-          const resp = smc.scan(asset, tf)
-          if (!resp.result) return none('ICT: no scan result yet')
-          const row = voteForKindSet(resp.result, ICT_KINDS, 'ict', 'ICT')
+          const scannedI = this.smcResult(asset, tf)
+          if (!scannedI) return none('ICT: no scan result yet')
+          const row = voteForKindSet(scannedI, ICT_KINDS, 'ict', 'ICT')
           if (row.direction === 'none') return none(`ICT: ${row.note}`)
           return { source, direction: row.direction, confidence: row.confidence, label: `ICT ${row.direction.toUpperCase()} - ${row.note}` }
         }
@@ -2599,6 +2606,11 @@ export class MetaStrategyService {
         s === 'candle' || s === 'bar' || s === 'heikinAshi' || s === 'line' || s === 'area' || s === 'baseline' || s === 'deltaProfile' || s === 'technical' || s === 'reversal'
           ? toMsl(this.readSource(s, asset, tf))
           : toMsl(this.readSource(s, asset, tf, undefined, undefined, undefined, cfg))
+    }
+    // `smc:<KIND>` keys: one replay-time scan feeds every kind (only when the script references the smc family)
+    if (!needed || needed.has('smc')) {
+      const sc = this.smcResult(asset, tf)
+      for (const kind of ALL_SMC_KINDS) { const rd = sc ? smcNowRead(sc, kind) : { direction: 'none' as const, confidence: 0 }; reads[`smc:${kind}`] = { direction: rd.direction, confidence: rd.confidence } }
     }
     // The three value-only reads (payout/otc/session) are cheap, side-
     // effect-free, and not plugin-scan-dependent - same blocks buildScriptReads
