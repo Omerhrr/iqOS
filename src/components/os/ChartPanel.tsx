@@ -2941,7 +2941,6 @@ export default function ChartPanel({
   const [showDraw, setShowDraw] = useState(false)
   const [hostEl, setHostEl] = useState<HTMLDivElement | null>(null)
   const hostRef = useCallback((el: HTMLDivElement | null) => { elRef.current = el; setHostEl(el) }, [])
-  const candleTimes = useMemo(() => candles.map((c) => c.time as number), [candles])
   const [storyRes, setStoryRes] = useState<StoryRes | null>(null)
   const [storyWin, setStoryWin] = useState('14,21')
   const [storyStr, setStoryStr] = useState('21')
@@ -3454,7 +3453,7 @@ export default function ChartPanel({
       </div>
 
       <div ref={hostRef} className="min-h-0 flex-1" />
-      <DrawingLayer open={showDraw} chartRef={chartRef} seriesRef={priceSeriesRef} host={hostEl} candleTimes={candleTimes} asset={digitsTicker} tfSeconds={TIMEFRAME_SECONDS[tf ?? '1m'] ?? 60} />
+      <DrawingLayer open={showDraw} chartRef={chartRef} seriesRef={priceSeriesRef} host={hostEl} bars={candles} asset={digitsTicker} tfSeconds={TIMEFRAME_SECONDS[tf ?? '1m'] ?? 60} />
       {(chartType === 'footprint' || chartType === 'tpo' || chartType === 'otcfootprint' || chartType === 'tickfootprint' || chartType === 'volumeprofile' || chartType === 'deltaprofile' || chartType === 'pulse' || chartType === 'expiryRadar' || chartType === 'expirySurface') && (
         <div className="absolute inset-x-0 bottom-[30px] top-0 z-[5] bg-[#0b111c]">
           <canvas ref={customCanvasRef} className="block h-full w-full" />
