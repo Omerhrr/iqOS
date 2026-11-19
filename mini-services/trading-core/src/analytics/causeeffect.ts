@@ -236,3 +236,39 @@ export function readCauseEffect(candles: CeCandle[], ticks?: readonly CeTick[], 
     bars: f,
   }
 }
+
+export interface CeMtf {
+  ok: boolean
+  htfTf: string
+  htfOk: boolean
+  alignment: 'aligned' | 'conflict' | 'wait-for-trigger' | 'trigger-only' | 'no-htf' | 'no-call'
+  dir: 'call' | 'put' | 'none'
+  lean: 'call' | 'put' | 'none'
+  prob: number
+  strength: number
+  triggerWithHtf: boolean
+  trigger: CeResult
+  htf: CeResult | null
+  text: string
+}
+
+/** Blend the trigger timeframe's predicted move with a HIGHER timeframe's (default 5m for a 1m trigger). Agree = stronger; opposite = no call; the higher frame alone = wait for the trigger.
+ * `triggerWithHtf` says whether the trigger's own latest candle is moving the way the higher frame's prediction points (how the 1m is behaving relative to the 5m). */
+export function combineCeMtf(trigger: CeResult, htf: CeResult | null, htfTf: string): CeMtf {
+  const sc = (r: CeResult) => r.pm.sign * Math.abs(r.pm.prob - 0.5) * 2
+  const htfOk = !!htf && htf.ok
+  const base = { htfTf, htfOk, trigger, htf }
+  if (!trigger.ok) return { ...base, ok: false, alignment: 'no-call', dir: 'none', lean: 'none', prob: 0.5, strength: 0, triggerWithHtf: false, text: trigger.text }
+  const tw = htfOk && htf!.pm.sign !== 0 && trigger.effect.dir === htf!.pm.sign
+  const name = (s: number) => (s > 0 ? 'call' : s < 0 ? 'put' : 'none') as 'call' | 'put' | 'none'
+  let alignment: CeMtf['alignment'], dir: 'call' | 'put' | 'none', lean: 'call' | 'put' | 'none', score: number, strength: number
+  if (!htfOk) { alignment = 'no-htf'; dir = trigger.pm.dir; lean = dir; score = sc(trigger); strength = Math.round(trigger.pm.confidence * 0.85) }
+  else if (trigger.pm.sign !== 0 && htf!.pm.sign === trigger.pm.sign) { alignment = 'aligned'; dir = trigger.pm.dir; lean = dir; score = 0.6 * sc(trigger) + 0.4 * sc(htf!); strength = Math.min(100, Math.round(trigger.pm.confidence * 0.65 + htf!.pm.confidence * 0.35 + 10 + (tw ? 5 : 0))) }
+  else if (trigger.pm.sign !== 0 && htf!.pm.sign !== 0) { alignment = 'conflict'; dir = 'none'; lean = name(htf!.pm.sign); score = 0; strength = Math.round(Math.min(trigger.pm.confidence, htf!.pm.confidence) * 0.4) }
+  else if (trigger.pm.sign === 0 && htf!.pm.sign !== 0) { alignment = 'wait-for-trigger'; dir = 'none'; lean = name(htf!.pm.sign); score = 0; strength = Math.round(htf!.pm.confidence * 0.4) }
+  else if (trigger.pm.sign !== 0) { alignment = 'trigger-only'; dir = trigger.pm.dir; lean = dir; score = sc(trigger); strength = Math.round(trigger.pm.confidence * 0.8) }
+  else { alignment = 'no-call'; dir = 'none'; lean = 'none'; score = 0; strength = 0 }
+  const prob = clamp(0.5 + score / 2, 0.05, 0.95)
+  const text = `${htfOk ? `${htfTf}: ${htf!.pm.dir === 'none' ? 'no call' : htf!.pm.dir.toUpperCase() + ' ' + (htf!.pm.prob * 100).toFixed(0) + '%'} (cause ${htf!.cause.label}${htf!.validation.validated ? ', validated' : ''}). ` : `${htfTf} unavailable. `}Trigger: ${trigger.pm.dir === 'none' ? 'no call' : trigger.pm.dir.toUpperCase() + ' ' + (trigger.pm.prob * 100).toFixed(0) + '%'}${htfOk ? `, its last candle is ${tw ? 'moving with' : htf!.pm.sign === 0 ? 'unrelated to' : 'against'} the ${htfTf} prediction` : ''}. Combined: ${alignment}${dir !== 'none' ? ` ${dir.toUpperCase()} ${(prob * 100).toFixed(0)}%` : lean !== 'none' ? ` (leans ${lean})` : ''}, strength ${strength}/100.`
+  return { ...base, ok: true, alignment, dir, lean, prob, strength, triggerWithHtf: tw, text }
+}

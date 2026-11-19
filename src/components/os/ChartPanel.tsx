@@ -2938,6 +2938,18 @@ export default function ChartPanel({
   type MtfRes = { ok: boolean; error?: string; triggerTf?: string; direction?: string; lean?: string; alignment?: string; confidence?: number; contextScore?: number; triggerScore?: number; warnings?: string[]; text?: string; frames?: { tf: string; ok: boolean; error?: string; score: number; agreement: number; votes: { name: string; vote: number; why: string }[] }[]; trigger?: { tf: string; score: number; votes: { name: string; vote: number; why: string }[] } | null }
   const [mtf, setMtf] = useState<MtfRes | null>(null)
   const [mtfHtf, setMtfHtf] = useState('4h,15m')
+  type PmSide = { ok: boolean; text?: string; cause?: { dir: number; mag: number; label: string; volRatio: number; fpDelta: number; tickImb: number; mfi: number; adSlope: number; ticksUsed: boolean }; effect?: { dir: number; sizeAtr: number; psychology: string; upperWick: number; lowerWick: number; roc: number; cci: number }; validation?: { coherence: number; bucketN: number; bucketUpProb: number; trackN: number; trackHit: number; validated: boolean }; sr?: { support: number; resistance: number; supDist: number; resDist: number; retest: number; retestTouches: number }; pm?: { dir: string; prob: number; confidence: number } }
+  type PmRes = PmSide & { error?: string; combined?: { alignment: string; dir: string; lean: string; prob: number; strength: number; triggerWithHtf: boolean; htfTf: string; htfOk: boolean; text: string }; htf?: PmSide | null }
+  const [pmRes, setPmRes] = useState<PmRes | null>(null)
+  const [pmHtf, setPmHtf] = useState('5m')
+  useEffect(() => {
+    if (!showStory || storyView !== 'pm') return
+    let alive = true
+    const load = () => { osGet<PmRes>('/predicted_move', { asset: digitsTicker, tf: tf ?? '1m', htf: pmHtf || 'none' }).then((r) => { if (alive) setPmRes(r) }).catch((e) => { if (alive) setPmRes({ ok: false, error: String(e instanceof Error ? e.message : e).slice(0, 160) }) }) }
+    setPmRes(null); load()
+    const t = window.setInterval(load, 10000)
+    return () => { alive = false; window.clearInterval(t) }
+  }, [showStory, storyView, digitsTicker, tf, pmHtf])
   useEffect(() => {
     if (!showStory || storyView !== 'mtf') return
     let alive = true
@@ -2969,7 +2981,7 @@ export default function ChartPanel({
   const [study, setStudy] = useState<StudyRes | null>(null)
   const [studyBusy, setStudyBusy] = useState(false)
   useEffect(() => {
-    if (!showStory || storyView === 'candles') return
+    if (!showStory || storyView === 'candles' || storyView === 'mtf' || storyView === 'pm') return
     let alive = true
     const load = () => { osGet<ChartStoryRes>('/chart_story', { asset: digitsTicker, tf: tf ?? '1m', type: storyView, ...(storyView === 'baseline' ? { mode: 'mid' } : {}) }).then((r) => { if (alive) setChartStory(r) }).catch((e) => { if (alive) setChartStory({ ok: false, error: String(e instanceof Error ? e.message : e).slice(0, 120) }) }) }
     setChartStory(null); load()
@@ -3170,11 +3182,11 @@ export default function ChartPanel({
               <button onClick={() => setShowStory(false)} className="text-[#7c8aa5] hover:text-white">x</button>
             </div>
             <div className="flex flex-wrap gap-0.5">
-              {[['candles', 'candles'], ['renko', 'renko'], ['kagi', 'kagi'], ['effort', 'effort'], ['ha', 'heikin'], ['tickbars', 'tick bars'], ['ticks', 'ticks'], ['baseline', 'baseline'], ['footprint', 'footprint'], ['mtf', 'MTF']].map(([id, label]) => (
+              {[['candles', 'candles'], ['renko', 'renko'], ['kagi', 'kagi'], ['effort', 'effort'], ['ha', 'heikin'], ['tickbars', 'tick bars'], ['ticks', 'ticks'], ['baseline', 'baseline'], ['footprint', 'footprint'], ['mtf', 'MTF'], ['pm', 'PM']].map(([id, label]) => (
                 <button key={id} onClick={() => setStoryView(id)} className={`rounded border px-1 py-px text-[8px] ${storyView === id ? 'border-amber-500/60 bg-amber-500/15 text-amber-300' : 'border-[#1c2739] text-[#7c8aa5] hover:text-white'}`}>{label}</button>
               ))}
             </div>
-            {storyView !== 'candles' && storyView !== 'mtf' && (
+            {storyView !== 'candles' && storyView !== 'mtf' && storyView !== 'pm' && (
               <div className="space-y-1">
                 {!chartStory && <div className="text-[#7c8aa5]">reading...</div>}
                 {chartStory && !chartStory.ok && <div className="text-rose-300">{chartStory.text || chartStory.error || 'no story'}</div>}
@@ -3189,6 +3201,47 @@ export default function ChartPanel({
                     </div>
                   </>
                 )}
+              </div>
+            )}
+            {storyView === 'pm' && (
+              <div className="space-y-1">
+                <label className="flex items-center justify-between text-[#7c8aa5]">higher timeframe (blank = off)
+                  <input type="text" value={pmHtf} onChange={(e) => setPmHtf(e.target.value.replace(/[^0-9a-z]/g, '').slice(0, 4))} className="w-16 rounded border border-[#1c2739] bg-[#0d1420] px-1 text-right text-[#d6e2f5]" />
+                </label>
+                {!pmRes && <div className="text-[#7c8aa5]">reading cause and effect...</div>}
+                {pmRes && !pmRes.ok && <div className="text-rose-300">{pmRes.error ?? 'no read'}</div>}
+                {pmRes?.ok && pmRes.pm && pmRes.cause && pmRes.effect && pmRes.validation && pmRes.sr && (() => {
+                  const cb = pmRes.combined, d = cb?.dir ?? pmRes.pm.dir, pr = cb?.prob ?? pmRes.pm.prob
+                  const f = (x: number | undefined, n = 2) => (x === undefined || !Number.isFinite(x) ? '-' : x.toFixed(n))
+                  return (
+                    <>
+                      <div className={`flex items-center justify-between rounded border px-1.5 py-1 ${d === 'call' ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-300' : d === 'put' ? 'border-rose-500/50 bg-rose-500/10 text-rose-300' : 'border-[#1c2739] text-[#7c8aa5]'}`}>
+                        <span className="font-bold">{d === 'call' ? 'PM: CALL' : d === 'put' ? 'PM: PUT' : cb?.lean && cb.lean !== 'none' ? `no trigger · leans ${cb.lean}` : 'PM: no call'} {d !== 'none' ? `${(pr * 100).toFixed(0)}%` : ''}</span>
+                        <span>{cb ? `${cb.alignment} · ${cb.strength}/100` : `${pmRes.pm.confidence}/100`}{pmRes.validation.validated ? ' · validated' : ' · unvalidated'}</span>
+                      </div>
+                      <div className="text-[#d6e2f5]">{cb?.text ?? pmRes.text}</div>
+                      <div className="rounded border border-[#1c2739] p-1">
+                        <div className="text-amber-200/90">CAUSE · {pmRes.cause.label}</div>
+                        <div className="flex flex-wrap gap-x-2 text-[#7c8aa5]"><span>vol x{f(pmRes.cause.volRatio)}</span><span>footprint {f(pmRes.cause.fpDelta)}</span><span>ticks {pmRes.cause.ticksUsed ? f(pmRes.cause.tickImb) : 'none'}</span><span>MFI {f(pmRes.cause.mfi)}</span><span>A/D {f(pmRes.cause.adSlope)}</span></div>
+                      </div>
+                      <div className="rounded border border-[#1c2739] p-1">
+                        <div className="text-amber-200/90">EFFECT · {pmRes.effect.dir > 0 ? 'bullish' : pmRes.effect.dir < 0 ? 'bearish' : 'flat'} · {pmRes.effect.psychology}</div>
+                        <div className="flex flex-wrap gap-x-2 text-[#7c8aa5]"><span>size {f(pmRes.effect.sizeAtr)} ATR</span><span>wicks {f(pmRes.effect.upperWick)}/{f(pmRes.effect.lowerWick)}</span><span>ROC {f(pmRes.effect.roc, 3)}%</span><span>CCI {f(pmRes.effect.cci, 0)}</span></div>
+                      </div>
+                      <div className="rounded border border-[#1c2739] p-1 text-[#7c8aa5]">
+                        <div>history: cause matched candle {f(pmRes.validation.coherence * 100, 0)}% · {pmRes.validation.bucketN} similar cases, next up {f(pmRes.validation.bucketUpProb * 100, 0)}% · walk-forward {pmRes.validation.trackN ? `${f(pmRes.validation.trackHit * 100, 0)}% of ${pmRes.validation.trackN}` : 'n/a'}</div>
+                        <div>S/R: support {f(pmRes.sr.support, 5)} ({f(pmRes.sr.supDist, 1)} ATR) · resistance {f(pmRes.sr.resistance, 5)} ({f(pmRes.sr.resDist, 1)} ATR){pmRes.sr.retest ? ` · retest of ${pmRes.sr.retest > 0 ? 'support' : 'resistance'} x${pmRes.sr.retestTouches}` : ''}</div>
+                      </div>
+                      {pmRes.htf?.ok && pmRes.htf.pm && pmRes.htf.cause && (
+                        <div className="rounded border border-[#1c2739] p-1">
+                          <div className="flex justify-between text-amber-200/90"><span>{cb?.htfTf} frame · {pmRes.htf.cause.label}</span><span>{pmRes.htf.pm.dir === 'none' ? 'no call' : `${pmRes.htf.pm.dir.toUpperCase()} ${(pmRes.htf.pm.prob * 100).toFixed(0)}%`}</span></div>
+                          <div className="text-[#7c8aa5]">{cb?.triggerWithHtf ? 'the trigger candle is moving WITH it' : 'the trigger candle is not moving with it'}{pmRes.htf.validation?.validated ? ' · validated' : ''}</div>
+                        </div>
+                      )}
+                      <div className="text-[#5d6b85]">Judgement-weighted, footprint estimated, not a proven edge. Backtest first.</div>
+                    </>
+                  )
+                })()}
               </div>
             )}
             {storyView === 'mtf' && (

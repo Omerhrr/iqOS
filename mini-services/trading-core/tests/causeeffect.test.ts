@@ -78,4 +78,19 @@ test('lab ticks: a tick script backtests with the archive windowed per bar and c
   } finally { setBacktestTickFeed(null) }
   assert.equal(getBacktestTickCoverage()?.barsEvaluated !== undefined, true)
 })
+import { combineCeMtf } from '../src/analytics/causeeffect'
+const fake = (sign: number, conf = 60, eff = 1): any => ({ ok: true, cause: { label: 'buying-pressure-strong' }, effect: { dir: eff }, validation: { validated: true }, pm: { sign, dir: sign > 0 ? 'call' : sign < 0 ? 'put' : 'none', prob: 0.5 + sign * 0.15, confidence: conf }, text: 't' })
+test('5m blend: agree = aligned and stronger; opposite = conflict, no call; 5m alone = wait-for-trigger', () => {
+  const a = combineCeMtf(fake(1), fake(1), '5m'); assert.equal(a.alignment, 'aligned'); assert.equal(a.dir, 'call'); assert.ok(a.strength > 60 && a.triggerWithHtf)
+  const c = combineCeMtf(fake(1), fake(-1), '5m'); assert.equal(c.alignment, 'conflict'); assert.equal(c.dir, 'none'); assert.equal(c.lean, 'put')
+  const w = combineCeMtf(fake(0, 0), fake(1), '5m'); assert.equal(w.alignment, 'wait-for-trigger'); assert.equal(w.dir, 'none'); assert.equal(w.lean, 'call')
+  const n = combineCeMtf(fake(1), null, '5m'); assert.equal(n.alignment, 'no-htf'); assert.equal(n.dir, 'call')
+})
+test('MSL: story.pm() defaults to 5m via seriesFor and story.pm("none") skips it', () => {
+  const d = planted(400), s = ser(d)
+  const five: any[] = []; for (let i = 0; i + 5 <= d.length; i += 5) { const g = d.slice(i, i + 5); five.push({ time: g[0].time, open: g[0].open, close: g[4].close, high: Math.max(...g.map((x: any) => x.high)), low: Math.min(...g.map((x: any) => x.low)), volume: g.reduce((a: number, x: any) => a + x.volume, 0) }) }
+  const f5 = ser(five); const run = (src: string) => { const p = parseStrategyScript(src); assert.ok(p.ok, (p as any).error); return evaluateStrategyScript((p as any).ast, {}, undefined, s as any, ((tf: string) => (tf === '5m' ? f5 : undefined)) as any, undefined, { keyPrefix: 'pm5' } as any) }
+  const a = run('let m = story.pm()\ncall when m.ok and m.htfOk and m.alignment != "no-htf" and m.text != ""'); assert.ok(!a.error, String(a.error))
+  const b = run('let m = story.pm("none")\ncall when m.ok and m.htfOk == false and m.alignment == "no-htf" or m.alignment == "no-call" or m.alignment == "trigger-only"'); assert.ok(!b.error, String(b.error))
+})
 console.log(`\n${pass}/${total} passed`); if (pass !== total) process.exit(1)

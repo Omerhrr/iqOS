@@ -278,7 +278,7 @@ import {
 } from './mslmodels'
 import { storyRenko, storyKagi, storyEffort, storyHeikin, storyTickBars, storyTicks, storyBaseline, storyFootprint, CHART_STORY_TYPES, type ChartStory } from './charttypestory'
 import { readMtf } from './mtfstory'
-import { readCauseEffect } from './causeeffect'
+import { readCauseEffect, combineCeMtf } from './causeeffect'
 import { readStory, readRoc, readWindowStory, readStructure, readFormingStory, cutBars } from './candlestory'
 import { oscillatorVotes, maVotes, TECH_MIN_BARS, TECH_BARS_PER_RUNG, type TechVote } from './technicals'
 
@@ -6421,23 +6421,27 @@ function storyMtf(args: MslValue[], ctx: EvalEnv): MslValue {
   return bundleValue(out)
 }
 
-/** `story.pm()` - the CAUSE -> EFFECT predicted move (analytics/causeeffect.ts). Cause = volume + footprint (estimated) + ticks (when the context has them) + MFI + A/D; effect = the candle,
- * its wick psychology, ROC and CCI; history of "this cause -> next candle" gives the prediction. story.pmText() is the sentence. Bundle fields are flat: ok, error, direction ("call"/"put"/"none"), prob,
- * moveAtr, confidence, validated, causeDir, causeMag, causeLabel, volRatio, fpDelta, tickImb, mfi, adSlope, ticksUsed, effectDir, sizeAtr, psychology, upperWick, lowerWick, roc, cci, coherence, bucketN,
- * bucketUp, trackN, trackHit, support, resistance, supDist, resDist, atSupport, atResistance, retest, text. */
+/** `story.pm([htf])` - the CAUSE -> EFFECT predicted move (analytics/causeeffect.ts) of THIS chart, blended with the same model on a HIGHER timeframe (default "5m"; story.pm("15m") picks another, story.pm("none") turns it off).
+ * Agreement strengthens the call, opposite frames give no call, the higher frame alone = wait-for-trigger. story.pmText() is the sentence. Flat bundle: ok error direction ("call"/"put"/"none", the COMBINED call) prob strength (0-100)
+ * alignment (aligned | conflict | wait-for-trigger | trigger-only | no-htf | no-call) lean triggerWithHtf (the last candle moves with the higher-frame prediction) htfOk htfDir htfProb htfStrength htfValidated htfCause
+ * trigDirection trigProb, then the trigger's own: moveAtr validated causeDir causeMag causeLabel volRatio fpDelta tickImb mfi adSlope ticksUsed effectDir sizeAtr psychology upperWick lowerWick roc cci coherence bucketN bucketUp trackN
+ * trackHit support resistance supDist resDist atSupport atResistance retest text. */
 function storyPm(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
-  const tf = args.find((a): a is string => typeof a === 'string')
-  const s = requireSeries(ctx, tf)
-  const cs = seriesToCandles(s)
-  const times = s.time ?? []
-  const withTime = cs.map((c, i) => ({ ...c, time: times[i] ?? i }))
-  const r = readCauseEffect(withTime, tf === undefined ? ctx.liveTicks : undefined)
-  if (name === 'pmText') return r.text
-  return bundleValue({ ok: r.ok, error: r.error ?? '', direction: r.pm.dir, prob: r.pm.prob, moveAtr: r.pm.moveAtr, strength: r.pm.confidence, validated: r.validation.validated,
+  const htfTf = args.find((a): a is string => typeof a === 'string') ?? '5m'
+  const mk = (s: MslSeriesCtx) => { const t = s.time ?? []; return seriesToCandles(s).map((c, i) => ({ ...c, time: t[i] ?? i })) }
+  const trig = readCauseEffect(mk(requireSeries(ctx, undefined)), ctx.liveTicks)
+  let htf: ReturnType<typeof readCauseEffect> | null = null
+  if (htfTf !== 'none') { try { const hs = ctx.seriesFor?.(htfTf); if (hs) htf = readCauseEffect(mk(hs)) } catch { htf = null } }
+  const m = combineCeMtf(trig, htf, htfTf)
+  if (name === 'pmText') return m.text
+  const r = trig
+  return bundleValue({ ok: m.ok, error: r.ok ? '' : (r.error ?? ''), direction: m.dir, prob: m.prob, strength: m.strength, alignment: m.alignment, lean: m.lean, triggerWithHtf: m.triggerWithHtf,
+    htfOk: m.htfOk, htfDir: htf?.pm.dir ?? 'none', htfProb: htf?.pm.prob ?? 0.5, htfStrength: htf?.pm.confidence ?? 0, htfValidated: htf?.validation.validated ?? false, htfCause: htf?.cause.label ?? '',
+    trigDirection: r.pm.dir, trigProb: r.pm.prob, moveAtr: r.pm.moveAtr, validated: r.validation.validated,
     causeDir: r.cause.dir, causeMag: r.cause.mag, causeLabel: r.cause.label, volRatio: r.cause.volRatio, fpDelta: r.cause.fpDelta, tickImb: r.cause.tickImb, mfi: r.cause.mfi, adSlope: r.cause.adSlope, ticksUsed: r.cause.ticksUsed,
     effectDir: r.effect.dir, sizeAtr: r.effect.sizeAtr, psychology: r.effect.psychology, upperWick: r.effect.upperWick, lowerWick: r.effect.lowerWick, roc: r.effect.roc, cci: r.effect.cci,
     coherence: r.validation.coherence, bucketN: r.validation.bucketN, bucketUp: r.validation.bucketUpProb, trackN: r.validation.trackN, trackHit: r.validation.trackHit,
-    support: r.sr.support, resistance: r.sr.resistance, supDist: r.sr.supDist, resDist: r.sr.resDist, atSupport: r.sr.atSupport, atResistance: r.sr.atResistance, retest: r.sr.retest, text: r.text })
+    support: r.sr.support, resistance: r.sr.resistance, supDist: r.sr.supDist, resDist: r.sr.resDist, atSupport: r.sr.atSupport, atResistance: r.sr.atResistance, retest: r.sr.retest, text: m.text })
 }
 
 function lastAtr(ctx: EvalEnv): number {
