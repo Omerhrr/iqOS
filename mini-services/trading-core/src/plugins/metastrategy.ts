@@ -2587,12 +2587,14 @@ export class MetaStrategyService {
    * data) - backtestMeta() only ever reaches here after confirming (via
    * collectFieldSources) the script doesn't reference any of those keys
    * anyway, so leaving them 'none' here changes nothing the script reads. */
-  private buildReplaySafeReads(asset: string, tf: Timeframe, cfg?: Record<string, number | boolean | string>): Record<string, MslSourceRead> {
+  private buildReplaySafeReads(asset: string, tf: Timeframe, cfg?: Record<string, number | boolean | string>, needed?: ReadonlySet<string> | null): Record<string, MslSourceRead> {
     const toMsl = (r: MetaSourceRead): MslSourceRead => ({ direction: r.direction, confidence: r.confidence, ...(r.value !== undefined ? { value: r.value } : {}) })
     const none: MslSourceRead = { direction: 'none', confidence: 0 }
     const reads: Record<string, MslSourceRead> = {}
     for (const s of META_CONDITION_SOURCES) reads[s] = none
     for (const s of SAFE_BACKTEST_SOURCES) {
+      // SPEED: a script only ever reads the sources it names (collectFieldSources), so the rest stay 'none' instead of running every chart engine on every replayed bar
+      if (needed && !needed.has(s)) continue
       reads[s] =
         s === 'candle' || s === 'bar' || s === 'heikinAshi' || s === 'line' || s === 'area' || s === 'baseline' || s === 'deltaProfile' || s === 'technical' || s === 'reversal'
           ? toMsl(this.readSource(s, asset, tf))
@@ -2703,15 +2705,23 @@ export class MetaStrategyService {
     let peak = equity
     let maxDD = 0
 
+    // a script's reads are computed only for the sources it references; a conditions-built spec needs its own conditions' sources
+    const needed: Set<string> | null = ast ? new Set([...collectFieldSources(ast)].map((n) => (n.includes(':') ? n.slice(0, n.indexOf(':')) : n))) : new Set(spec.conditions.map((c) => c.source as string))
     this.inReplay = true
     try {
+      const deadline = Date.now() + 90_000
       for (let i = warmup; i < candles.length - expiryBars; i++) {
+        // never hang silently: the replay is synchronous, so say plainly when it is too heavy instead of leaving the lab on "Running..."
+        if ((i - warmup) % 25 === 0 && Date.now() > deadline) throw new Error(`replay too slow: ${i - warmup} of ${candles.length - expiryBars - warmup} bars in 90 s - this strategy reads heavy chart-engine sources every bar; try a shorter history, a larger timeframe, or remove the heavy sources`)
         this.market.setReplayAsof(candles[i].time)
         let result: MetaEvalResult
+        // the signal resolver (a full chart-engine context over 240 bars) is built only if the script actually calls a signal function on this bar
+        let rsv: ReturnType<typeof makeSignalResolver> | undefined, rsvDone = false
+        const lazyResolver = (): NonNullable<Parameters<typeof evaluateStrategyScript>[2]> => ((fn: string, args: unknown) => { if (!rsvDone) { rsv = this.scriptResolver(asset, tf); rsvDone = true } if (!rsv) throw new Error(`unknown function "${fn}"`); return (rsv as (f: string, a: unknown) => MslSourceRead)(fn, args) }) as never
         try {
           result = spec.script
             ? this.scriptMetaResult(
-                evaluateStrategyScript(ast!, this.buildReplaySafeReads(asset, tf), this.scriptResolver(asset, tf), this.scriptSeries(asset, tf), this.scriptSeriesFor(asset), undefined, {
+                evaluateStrategyScript(ast!, this.buildReplaySafeReads(asset, tf, undefined, needed), lazyResolver(), this.scriptSeries(asset, tf), this.scriptSeriesFor(asset), undefined, {
                   keyPrefix: `backtest:${spec.id}|${asset}|${tf}`,
                   barTimeSec: candles[i].time,
                 })

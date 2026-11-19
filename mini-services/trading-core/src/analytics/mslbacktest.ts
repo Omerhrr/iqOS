@@ -190,6 +190,7 @@ export interface MslBacktestWalkForwardResult {
 export interface MslBacktestAssetResult {
   asset: string
   result: MslBacktestResult
+  tickCoverage?: unknown
 }
 
 export interface MslBacktestCrossAssetResult {
@@ -317,6 +318,27 @@ export function setBacktestFastFeed(f: Record<string, Candle[]> | null): void { 
 let tickFeed: { ts: number; price: number }[] | null = null
 let tickCoverage: { barsEvaluated: number; barsWithTicks: number; firstTickMs: number; lastTickMs: number } | undefined
 export function setBacktestTickFeed(t: { ts: number; price: number }[] | null): void { tickFeed = t && t.length ? t : null }
+/** Per-bar live context (ticks printed before the bar's close, last ~80 bars of them) from the tick feed; shared by the plain, walk-forward, cross-asset and managed backtesters. */
+function makeLiveWindow(candles: Candle[]): ((i: number) => { ticks: { ts: number; price: number }[]; nowMs: number } | undefined) {
+  const tf = tickFeed
+  if (!tf) { tickCoverage = undefined; return () => undefined }
+  let baseSp = Infinity
+  for (let k = 1; k < candles.length; k++) { const g = candles[k].time - candles[k - 1].time; if (g > 0 && g < baseSp) baseSp = g }
+  const sp = Number.isFinite(baseSp) ? baseSp : 60
+  let lo = 0, hi = 0, withTicks = 0, evals = 0
+  tickCoverage = { barsEvaluated: 0, barsWithTicks: 0, firstTickMs: tf[0].ts, lastTickMs: tf[tf.length - 1].ts }
+  const cov = tickCoverage
+  return (i: number) => {
+    const closeMs = (candles[i].time + sp) * 1000, fromMs = closeMs - 80 * sp * 1000
+    while (hi < tf.length && tf[hi].ts < closeMs) hi++
+    while (lo < hi && tf[lo].ts < fromMs) lo++
+    const win = tf.slice(lo, hi)
+    evals++
+    if (win.length && win[win.length - 1].ts >= closeMs - sp * 1000) withTicks++
+    cov.barsEvaluated = evals; cov.barsWithTicks = withTicks
+    return { ticks: win, nowMs: closeMs }
+  }
+}
 export function getBacktestTickCoverage(): { barsEvaluated: number; barsWithTicks: number; share: number; firstTickMs: number; lastTickMs: number } | undefined {
   return tickCoverage ? { ...tickCoverage, share: tickCoverage.barsEvaluated ? tickCoverage.barsWithTicks / tickCoverage.barsEvaluated : 0 } : undefined
 }
@@ -379,29 +401,15 @@ function fireSignalsInner(
   const crossTf = makeCrossTf(candles)
   lastFireErrors = undefined
   let errCount = 0, evaluated = 0, firstErr = '', firstErrBar = -1
-  const tf = tickFeed
-  let tLo = 0, tHi = 0, withTicks = 0
-  let baseSp = Infinity
-  if (tf) for (let k = 1; k < candles.length; k++) { const g = candles[k].time - candles[k - 1].time; if (g > 0 && g < baseSp) baseSp = g }
-  tickCoverage = tf ? { barsEvaluated: 0, barsWithTicks: 0, firstTickMs: tf[0].ts, lastTickMs: tf[tf.length - 1].ts } : undefined
+  const liveAt = makeLiveWindow(candles)
   try {
     for (let i = warmupBars; i <= lastIdx; i++) {
       const series = seriesUpTo(candles, i, partners)
       const seriesFor = crossTf(i)
       const state = { keyPrefix: runId, barTimeSec: candles[i].time }
-      let live: { ticks: { ts: number; price: number }[]; nowMs: number } | undefined
-      if (tf) {
-        const closeMs = (candles[i].time + (Number.isFinite(baseSp) ? baseSp : 60)) * 1000
-        const fromMs = closeMs - 80 * (Number.isFinite(baseSp) ? baseSp : 60) * 1000
-        while (tHi < tf.length && tf[tHi].ts < closeMs) tHi++
-        while (tLo < tHi && tf[tLo].ts < fromMs) tLo++
-        const win = tf.slice(tLo, tHi)
-        if (win.length && win[win.length - 1].ts >= closeMs - (Number.isFinite(baseSp) ? baseSp : 60) * 1000) withTicks++
-        live = { ticks: win, nowMs: closeMs }
-      }
+      const live = liveAt(i)
       const out = evaluateStrategyScript(parsedAst, reads, undefined, series, seriesFor, live, state)
       evaluated++
-      if (tickCoverage) { tickCoverage.barsEvaluated = evaluated; tickCoverage.barsWithTicks = withTicks }
       if (out.error) { if (!errCount++) { firstErr = out.error; firstErrBar = i } continue }
       if (out.direction === 'none') continue
       if (out.confidence < minConfidence) continue
@@ -693,13 +701,19 @@ export function backtestMslScriptCrossAsset(
   assetCandles: Record<string, Candle[]>,
   script: string,
   opts: MslBacktestCrossAssetOpts = {},
+  /** optional per-asset lab feeds: archived ticks and/or 5s candles for that asset */
+  assetFeeds?: Record<string, { ticks?: { ts: number; price: number }[]; fast?: Record<string, Candle[]> }>,
 ): MslBacktestCrossAssetResult {
   const assets = Object.keys(assetCandles)
   const baseRunId = opts.runId
   const perAsset: MslBacktestAssetResult[] = assets.map((asset, i) => {
+    const savedTick = tickFeed, savedFast = fastFeed
+    if (assetFeeds?.[asset]) { tickFeed = assetFeeds[asset].ticks?.length ? assetFeeds[asset].ticks! : null; fastFeed = assetFeeds[asset].fast ?? null }
     const runId = baseRunId ?? `mslbacktest-xasset:${asset}:${Date.now()}:${Math.random().toString(36).slice(2)}:${i}`
-    const result = backtestMslScript(assetCandles[asset], script, { ...opts, runId })
-    return { asset, result }
+    let result: MslBacktestResult
+    try { result = backtestMslScript(assetCandles[asset], script, { ...opts, runId }) } finally { tickFeed = savedTick; fastFeed = savedFast }
+    const tc = assetFeeds?.[asset] ? getBacktestTickCoverage() : undefined
+    return { asset, result, ...(tc ? { tickCoverage: tc } : {}) }
   })
 
   const combinedTrades: MslBacktestTrade[] = []
@@ -972,6 +986,7 @@ export function backtestMslManaged(candles: Candle[], script: string, opts: MslM
 
   beginMslBacktest()
   try {
+    const liveAtM = makeLiveWindow(candles)
     for (let i = warmupBars; i < candles.length; i++) {
       const c = candles[i]
       // 1) price action on bar i against the levels set at earlier closes
@@ -990,7 +1005,7 @@ export function backtestMslManaged(candles: Candle[], script: string, opts: MslM
       // 2) the script, once, at this close
       const series = seriesUpToManaged(candles, i)
       const views: MslPosView[] = open.map((p) => ({ id: p.id, dir: p.dir, entry: p.entry, bars: p.bars, best: p.best, worst: p.worst, left: p.left, stop: p.stop, target: p.target, trail: p.trail, size: p.size, initStop: p.initStop }))
-      const out = evaluateStrategyScript(parsed.ast, reads, undefined, series, crossTf(i), undefined, { keyPrefix: runId, barTimeSec: c.time }, { positions: views })
+      const out = evaluateStrategyScript(parsed.ast, reads, undefined, series, crossTf(i), liveAtM(i), { keyPrefix: runId, barTimeSec: c.time }, { positions: views })
       evalCount++
       if (out.error) { lastErr = out.error; if (!errCount++) { firstErr = out.error; firstErrBar = i } continue }
       if (out.draws) lastDraws = out.draws

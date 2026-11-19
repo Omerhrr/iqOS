@@ -111,7 +111,7 @@ import { chartPropertyRegistryForVocab } from './src/analytics/chartpropertyregi
 import { setMslAiChat, setMslAiEnabled, aiAnalyze, aiVet, mslAiAvailable } from './src/analytics/mslai'
 import { chatComplete, providerStatus as llmProviderStatus } from './src/lib/llm'
 import { wilsonLowerBound as aiWilson } from './src/analytics/mslai-stats'
-import { setBacktestTickFeed, getBacktestTickCoverage, backtestMslScript, backtestMslScriptWalkForward, backtestMslScriptCrossAsset, replayMslScript, backtestMslManaged } from './src/analytics/mslbacktest'
+import { setBacktestTickFeed, setBacktestFastFeed, getBacktestTickCoverage, backtestMslScript, backtestMslScriptWalkForward, backtestMslScriptCrossAsset, replayMslScript, backtestMslManaged } from './src/analytics/mslbacktest'
 import { hvSeries, ivFromPayout, realizedUpProb } from './src/analytics/ivhv'
 import { buildCalibrationReport, type CalibrationStoreSlice } from './src/analytics/calibration'
 import { computeStepStats, computeIntervalStats } from './src/analytics/randomness'
@@ -122,6 +122,35 @@ import { computeOutcomeMemory } from './src/analytics/outcomememory'
 import { computePulseBars } from './src/analytics/pulsebars'
 import { computeExpirySurface } from './src/analytics/expirysurface'
 import { EXPIRY_ORACLE_MIN_CANDLES } from './src/analytics/nextexpiry'
+
+// LAB FEEDS: scripts that read ticks (tick.* / story.pm / story.of("ticks")) get the asset's archived ticks; scripts that read the fast chart (snr./fibs./zone./trend.) get its 5s candles. Both are
+// shown to each evaluated bar only up to that bar's close (analytics/mslbacktest.ts). Always reset first so a feed can never leak from one request into the next.
+const LAB_TICK_RE = /\btick\s*\.|story\s*\.\s*pm|story\s*\.\s*of\s*\(\s*["']ticks["']/
+const LAB_FAST_RE = /\b(snr|fibs|zone|trend)\s*\./
+const labCache = new Map<string, { at: number; ticks: { ts: number; price: number }[]; fast: Candle[] }>()
+function labFeedsFor(asset: string, script: string): { ticks?: { ts: number; price: number }[]; fast?: Record<string, Candle[]> } {
+  const wantT = LAB_TICK_RE.test(script), wantF = LAB_FAST_RE.test(script)
+  if (!wantT && !wantF) return {}
+  const k = `${asset}|${wantT}|${wantF}`, hit = labCache.get(k)
+  if (hit && Date.now() - hit.at < 60_000) return { ...(wantT ? { ticks: hit.ticks } : {}), ...(wantF ? { fast: { '5s': hit.fast } } : {}) }
+  let ticks: { ts: number; price: number }[] = [], fast: Candle[] = []
+  if (wantT) { try { ticks = kernel.context().use<{ getTicksArchive: (a: string, l: number) => { ts: number; price: number }[] }>('storeRaw').getTicksArchive(asset, 50_000) } catch { ticks = [] } }
+  if (wantF) { try { fast = (kernel.context().use<MarketDataService>('market').getCandlesDeep(asset, '5s' as Timeframe, 20_000, true) ?? []).filter((c) => c && [c.time, c.open, c.high, c.low, c.close].every((v) => Number.isFinite(v))) } catch { fast = [] } }
+  labCache.set(k, { at: Date.now(), ticks, fast })
+  if (labCache.size > 24) labCache.delete(labCache.keys().next().value as string)
+  return { ...(wantT ? { ticks } : {}), ...(wantF ? { fast: { '5s': fast } } : {}) }
+}
+function setLabFeeds(asset: string, script: string): boolean {
+  setBacktestTickFeed(null); setBacktestFastFeed(null)
+  const f = labFeedsFor(asset, script)
+  if (f.ticks) setBacktestTickFeed(f.ticks)
+  if (f.fast && f.fast['5s'].length) setBacktestFastFeed(f.fast)
+  // every backtester is synchronous, so clearing on the next macrotask releases the feed right after the call and nothing can leak into another request
+  setTimeout(clearLabFeeds, 0)
+  return !!f.ticks
+}
+function clearLabFeeds(): void { setBacktestTickFeed(null); setBacktestFastFeed(null) }
+
 setMslAiChat(async (messages, o) => (await chatComplete({ messages, maxTokens: o?.maxTokens, temperature: o?.temperature, timeoutMs: o?.timeoutMs })).content)
 setMslAiEnabled(true)
 
@@ -5393,6 +5422,7 @@ const httpServer = createServer(async (req, res) => {
           const bars = Math.max(200, Math.min(6000, Math.round(Number(body.bars) || 3000)))
           const candles = store.getCandlesArchive(asset, tfv, bars).filter((c) => c && [c.time, c.open, c.high, c.low, c.close].every((v) => Number.isFinite(v)))
           if (candles.length < 100) return json(200, { ok: false, asset, error: `only ${candles.length} archived ${tfv} bars for ${asset}` })
+          setLabFeeds(asset, script)
           const r = backtestMslManaged(candles, script, { barSeconds: TIMEFRAME_SECONDS[tfv], payout: body.payout !== undefined ? Number(body.payout) : 0.85, ...(body.maxBars ? { maxBars: Number(body.maxBars) } : {}), ...(body.maxPositions ? { maxPositions: Number(body.maxPositions) } : {}), ...(body.slipAtr ? { slipAtr: Number(body.slipAtr) } : {}) })
           return json(200, { ...r, asset, tf: tfv, bars: candles.length, trades: r.trades.slice(-200) })
         } catch (err) {
@@ -5412,6 +5442,7 @@ const httpServer = createServer(async (req, res) => {
           const bars = Math.max(120, Math.min(1500, Math.round(Number(body.bars) || 500)))
           const candles = market.getCandlesDeep(asset, tfv, bars, true)
           if (!candles || candles.length < 80) return json(404, { ok: false, error: `no ${tfv} candles for ${asset}` })
+          setLabFeeds(asset, script)
           const r = backtestMslManaged(candles, script, { warmupBars: Math.min(60, Math.floor(candles.length / 3)) })
           return json(200, { ok: r.ok, error: r.ok ? undefined : r.error, asset, tf: tfv, draws: r.draws ?? [], scriptErrors: r.scriptErrors, trades: r.trades.length, lastTime: candles[candles.length - 1].time, barSec: TIMEFRAME_SECONDS[tfv] })
         } catch (err) {
@@ -5456,6 +5487,7 @@ const httpServer = createServer(async (req, res) => {
               let num = 0, den = 0
               for (let i = 0; i < rets.length; i++) { den += (rets[i] - mean) ** 2; if (i) num += (rets[i] - mean) * (rets[i - 1] - mean) }
               if (den > 0 && Math.abs(num / den) > 0.5) { dropped++; continue }
+              setLabFeeds(asset, script)
               const res = backtestMslScript(seg, script, { expiryBars, warmupBars: 150, runId: `scan:${asset}:${Date.now()}` })
               if (!res.ok) { firstErr = firstErr || (res.error ?? ''); continue }
               used++
@@ -5522,6 +5554,7 @@ const httpServer = createServer(async (req, res) => {
           const warmup = 150
           for (const seg of segs) {
             if (seg.length < warmup + expiryBars + 5) continue
+            setLabFeeds(asset, script)
             const res = backtestMslScript(seg, script, { expiryBars, warmupBars: warmup, runId: `aivet:${Date.now()}` })
             if (!res.ok) { err = res.error ?? err; continue }
             const mid = seg[Math.floor(seg.length / 2)].time
@@ -5565,9 +5598,7 @@ const httpServer = createServer(async (req, res) => {
             const pn = mm[1].trim()
             if (pn && pn !== asset && !partners[pn] && Object.keys(partners).length < 6) partners[pn] = market.getCandlesDeep(pn, tfv, candleCount, true)
           }
-          // TICKS IN THE LAB: a script that reads ticks (tick.* / story.pm / story.of("ticks")) gets the asset's archived ticks, shown to each bar only up to its close; coverage is reported
-          const wantsTicks = /\btick\s*\.|story\s*\.\s*pm|story\s*\.\s*of\s*\(\s*["']ticks["']/.test(script)
-          if (wantsTicks) { try { setBacktestTickFeed(kernel.context().use<{ getTicksArchive: (a: string, l: number) => { ts: number; price: number }[] }>('storeRaw').getTicksArchive(asset, 50_000)) } catch { setBacktestTickFeed(null) } } else setBacktestTickFeed(null)
+          const wantsTicks = setLabFeeds(asset, script)
           let result: ReturnType<typeof backtestMslScript>
           try { result = backtestMslScript(candles, script, {
             partners: Object.keys(partners).length ? partners : undefined,
@@ -5585,7 +5616,7 @@ const httpServer = createServer(async (req, res) => {
             // the script. See analytics/mslbacktest.ts#MslBacktestOpts's own
             // doc comment on outOfSampleBars for exactly what this is.
             outOfSampleBars: body.outOfSampleBars !== undefined ? Math.max(1, Math.round(Number(body.outOfSampleBars))) : undefined,
-          }) } finally { setBacktestTickFeed(null) }
+          }) } finally { clearLabFeeds() }
           return json(200, { ...result, asset, tf: tfv, candlesUsed: candles.length, ...(wantsTicks ? { tickCoverage: getBacktestTickCoverage() ?? null } : {}), ts: Date.now() })
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
@@ -5613,15 +5644,17 @@ const httpServer = createServer(async (req, res) => {
           if (!script.trim()) return json(400, { ok: false, error: 'script is required' })
           const candleCount = Math.max(100, Math.min(5000, Math.round(Number(body.candles) || 1500)))
           const candles = market.getCandlesDeep(asset, tfv, candleCount, true)
-          const result = backtestMslScriptWalkForward(candles, script, {
+          const wantsTicksW = setLabFeeds(asset, script)
+          let result: ReturnType<typeof backtestMslScriptWalkForward>
+          try { result = backtestMslScriptWalkForward(candles, script, {
             folds: body.folds !== undefined ? Math.max(1, Math.round(Number(body.folds))) : undefined,
             scriptExpiry: body.scriptExpiry === true ? { barSeconds: TIMEFRAME_SECONDS[tfv], maxBars: body.scriptExpiryMaxBars !== undefined ? Number(body.scriptExpiryMaxBars) : undefined } : undefined,
             expiryBars: body.expiryBars !== undefined ? Math.max(1, Math.round(Number(body.expiryBars))) : undefined,
             warmupBars: body.warmupBars !== undefined ? Math.max(1, Math.round(Number(body.warmupBars))) : undefined,
             minConfidence: body.minConfidence !== undefined ? Math.max(0, Math.min(100, Number(body.minConfidence))) : undefined,
             payout: body.payout !== undefined ? Math.max(0, Number(body.payout)) : undefined,
-          })
-          return json(200, { ...result, asset, tf: tfv, candlesUsed: candles.length, ts: Date.now() })
+          }) } finally { clearLabFeeds() }
+          return json(200, { ...result, asset, tf: tfv, candlesUsed: candles.length, ...(wantsTicksW ? { tickCoverage: getBacktestTickCoverage() ?? null } : {}), ts: Date.now() })
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }
@@ -5649,12 +5682,16 @@ const httpServer = createServer(async (req, res) => {
           const candleCount = Math.max(100, Math.min(5000, Math.round(Number(body.candles) || 1500)))
           const assetCandles: Record<string, ReturnType<typeof market.getCandlesDeep>> = {}
           for (const a of assetsReq) assetCandles[a] = market.getCandlesDeep(a, tfv, candleCount, true)
-          const result = backtestMslScriptCrossAsset(assetCandles, script, {
+          const feeds: Record<string, { ticks?: { ts: number; price: number }[]; fast?: Record<string, Candle[]> }> = {}
+          for (const a of assetsReq) { const f = labFeedsFor(a, script); if (f.ticks || f.fast) feeds[a] = f }
+          clearLabFeeds()
+          let result: ReturnType<typeof backtestMslScriptCrossAsset>
+          try { result = backtestMslScriptCrossAsset(assetCandles, script, {
             expiryBars: body.expiryBars !== undefined ? Math.max(1, Math.round(Number(body.expiryBars))) : undefined,
             warmupBars: body.warmupBars !== undefined ? Math.max(1, Math.round(Number(body.warmupBars))) : undefined,
             minConfidence: body.minConfidence !== undefined ? Math.max(0, Math.min(100, Number(body.minConfidence))) : undefined,
             payout: body.payout !== undefined ? Math.max(0, Number(body.payout)) : undefined,
-          })
+          }, feeds) } finally { clearLabFeeds() }
           return json(200, { ...result, tf: tfv, ts: Date.now() })
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })

@@ -73,7 +73,7 @@ test('lab ticks: a tick script backtests with the archive windowed per bar and c
   try {
     const res = backtestMslScript(d, script, { expiryBars: 1, warmupBars: 80 })
     const cov = getBacktestTickCoverage()
-    assert.ok(res.ok, res.error); assert.ok(cov && cov.barsWithTicks > 0 && cov.share < 0.5, JSON.stringify(cov))
+    assert.ok(res.ok, res.error ?? ""); assert.ok(cov && cov.barsWithTicks > 0 && cov.share < 0.5, JSON.stringify(cov))
     assert.ok(res.trades.every((t: any) => t.index >= 220 - 1), 'signals only where ticks exist')
   } finally { setBacktestTickFeed(null) }
   assert.equal(getBacktestTickCoverage()?.barsEvaluated !== undefined, true)
@@ -92,5 +92,19 @@ test('MSL: story.pm() defaults to 5m via seriesFor and story.pm("none") skips it
   const f5 = ser(five); const run = (src: string) => { const p = parseStrategyScript(src); assert.ok(p.ok, (p as any).error); return evaluateStrategyScript((p as any).ast, {}, undefined, s as any, ((tf: string) => (tf === '5m' ? f5 : undefined)) as any, undefined, { keyPrefix: 'pm5' } as any) }
   const a = run('let m = story.pm()\ncall when m.ok and m.htfOk and m.alignment != "no-htf" and m.text != ""'); assert.ok(!a.error, String(a.error))
   const b = run('let m = story.pm("none")\ncall when m.ok and m.htfOk == false and m.alignment == "no-htf" or m.alignment == "no-call" or m.alignment == "trigger-only"'); assert.ok(!b.error, String(b.error))
+})
+import { backtestMslManaged, backtestMslScriptWalkForward, backtestMslScriptCrossAsset } from '../src/analytics/mslbacktest'
+test('lab ticks reach managed, walk-forward and cross-asset backtests (per-asset feed)', () => {
+  const d = planted(300), e = planted(300)
+  const mkT = (c: any[]) => { const t: { ts: number; price: number }[] = []; for (let i = 220; i < 300; i++) for (let k = 0; k < 8; k++) t.push({ ts: (c[i].time + k * 7) * 1000, price: c[i].open + (c[i].close - c[i].open) * (k / 8) }); return t }
+  const script = 'let m = story.pm()\ncall when m.ok and m.ticksUsed and m.tickImb > 0.5\nput when m.ok and m.ticksUsed and m.tickImb < -0.5'
+  setBacktestTickFeed(mkT(d))
+  try {
+    const w = backtestMslScriptWalkForward(d, script, { warmupBars: 80 }); assert.ok(w.ok, (w as any).error); assert.ok((getBacktestTickCoverage()?.barsWithTicks ?? 0) > 0)
+    const m = backtestMslManaged(d, script, { warmupBars: 80 }); assert.ok(m.ok, (m as any).error); assert.ok((getBacktestTickCoverage()?.barsWithTicks ?? 0) > 0)
+  } finally { setBacktestTickFeed(null) }
+  const x = backtestMslScriptCrossAsset({ A: d, B: e }, script, { warmupBars: 80 }, { A: { ticks: mkT(d) } })
+  const a = x.perAsset.find((p) => p.asset === 'A')!, b = x.perAsset.find((p) => p.asset === 'B')!
+  assert.ok((a as any).tickCoverage && (a as any).tickCoverage.barsWithTicks > 0); assert.equal(b.result.trades.length, 0, 'asset without a feed has no tick signals')
 })
 console.log(`\n${pass}/${total} passed`); if (pass !== total) process.exit(1)
