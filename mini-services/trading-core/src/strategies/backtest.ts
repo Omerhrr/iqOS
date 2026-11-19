@@ -21,7 +21,16 @@ import { evaluateCustom, type CustomSpec } from './custom'
  * module has no store access of its own. When it's missing for a custom id,
  * this throws the same "Unknown strategy" error a bad builtin id would,
  * which the HTTP layer turns into a clean 400 instead of a crash. */
+/** Meta-Strategy Lab specs (`meta:<slug>`) live in the metastrategy plugin, not here. The plugin registers a resolver at start-up that wraps a spec as a StrategyDef whose evaluate() replays
+ * the script as of the evaluated bar (same replay-safe path as the Single Run's backtestMeta), so Optimizer / Walk-Forward / Asset Sweep can run them. */
+let metaDefResolver: ((id: string) => StrategyDef | undefined) | null = null
+export function setMetaDefResolver(fn: ((id: string) => StrategyDef | undefined) | null): void { metaDefResolver = fn }
 export function resolveStrategyDef(id: string, customSpec?: CustomSpec): StrategyDef {
+  if (id.startsWith('meta:')) {
+    const d = metaDefResolver?.(id)
+    if (!d) throw new Error(`Unknown strategy: ${id}`)
+    return d
+  }
   if (id.startsWith('custom:') && customSpec) {
     return {
       id,

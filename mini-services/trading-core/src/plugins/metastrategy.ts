@@ -55,6 +55,8 @@ import { realizedUpProb } from '../analytics/ivhv'
 import { EXPIRIES_MIN } from '../analytics/nextexpiry'
 import { TECH_LADDER } from '../analytics/technicals'
 import { engineVoteSingle, tickVote, otcFootprintVote, type ChartEngineVote } from '../analytics/chartsignals'
+import { setMetaDefResolver } from '../strategies/backtest'
+import { ALL_TIMEFRAMES, TIMEFRAME_SECONDS, type StrategyDef, type StrategyEval } from '../types'
 import { smcNowRead, smcAnyAgrees, ALL_SMC_KINDS, scanSmc, type SmcScanResult } from '../analytics/smc'
 import { buildFootprint, footprintAbsorption, unfinishedAuction } from '../analytics/otcfootprint'
 import { ICT_KINDS, voteForKindSet } from '../analytics/chartindicators'
@@ -835,6 +837,7 @@ export class MetaStrategyService {
     this.ctx = ctx
     this.market = ctx.use<MarketDataService>('market')
     this.load()
+    setMetaDefResolver((id) => this.asStrategyDef(id))
     const seeded = this.seedBuiltinExamples()
     ctx.log('meta-strategy', `meta-strategy library online (${this.specs.size} saved, +${seeded} builtin examples seeded this start, sources: ${META_CONDITION_SOURCES.join('/')})`)
   }
@@ -2629,6 +2632,71 @@ export class MetaStrategyService {
       reads.otc = { direction: 'none', confidence: 0, value: 0 }
     }
     return reads
+  }
+
+  /** Wrap a saved meta spec as a StrategyDef for the Optimizer / Walk-Forward / Asset Sweep engines. evaluate(candles) replays the script as of the LAST candle's time (setReplayAsof hides
+   * everything later, exactly like backtestMeta), so there is no look-ahead. Results are memoised per (asset, tf, bar) because those engines revisit the same bars across folds and passes.
+   * A source with no history (oracle, tick buffers, ...) is rejected up front with the same clear message the Single Run gives. */
+  asStrategyDef(id: string): StrategyDef | undefined {
+    const spec = this.get(id)
+    if (!spec) return undefined
+    let ast: MslAst | null = null
+    if (spec.script) {
+      const parsed = parseStrategyScript(spec.script)
+      if (!parsed.ok) throw new Error(`${spec.id}: script error - ${parsed.error}`)
+      ast = parsed.ast
+      for (const name of collectFieldSources(ast)) {
+        const base = name.includes(':') ? name.slice(0, name.indexOf(':')) : name
+        if (UNSAFE_BACKTEST_SOURCES.has(base as MetaConditionSource)) throw new Error(`${spec.id} uses '${name}' - that source reads another plugin's LIVE-only scan cache or tick buffer with no historical record, so it can't be honestly replayed. Remove it (it can stay in a separate live-only spec) to backtest the rest of this script.`)
+      }
+    } else {
+      if (!spec.conditions.length) throw new Error(`${spec.id} has no conditions and no script - nothing to backtest`)
+      for (const c of spec.conditions) if (!SAFE_BACKTEST_SOURCES.has(c.source)) throw new Error(`${spec.id} uses condition source '${c.source}' - that source has no historical record, so it can't be honestly replayed.`)
+    }
+    const needed: Set<string> = ast ? new Set([...collectFieldSources(ast)].map((n) => (n.includes(':') ? n.slice(0, n.indexOf(':')) : n))) : new Set(spec.conditions.map((c) => c.source as string))
+    const cache = new Map<string, StrategyEval>()
+    const secToTf = (sec: number): Timeframe | undefined => (ALL_TIMEFRAMES as readonly string[]).find((t) => TIMEFRAME_SECONDS[t as Timeframe] === sec) as Timeframe | undefined
+    return {
+      id: spec.id,
+      name: spec.name,
+      description: 'Meta-Strategy Lab spec replayed bar by bar',
+      params: [],
+      evaluate: (candles, _params, hints) => {
+        const none = (notes: string): StrategyEval => ({ direction: 'none', score: 0, notes })
+        const n = candles.length
+        const asset = hints?.asset
+        if (!asset || n < 2) return none('meta replay needs the asset')
+        const tf = (hints?.tf as Timeframe | undefined) ?? secToTf(candles[n - 1].time - candles[n - 2].time)
+        if (!tf) return none('meta replay could not tell the timeframe')
+        const t = candles[n - 1].time
+        const key = `${asset}|${tf}|${t}`
+        const hit = cache.get(key)
+        if (hit) return hit
+        const wasReplay = this.inReplay
+        this.inReplay = true
+        let out: StrategyEval
+        try {
+          this.market.setReplayAsof(t)
+          let result: MetaEvalResult
+          try {
+            let rsv: ReturnType<typeof makeSignalResolver> | undefined, rsvDone = false
+            const lazy = ((fn: string, args: unknown) => { if (!rsvDone) { rsv = this.scriptResolver(asset, tf); rsvDone = true } if (!rsv) throw new Error(`unknown function "${fn}"`); return (rsv as (f: string, a: unknown) => MslSourceRead)(fn, args) }) as never
+            result = spec.script
+              ? this.scriptMetaResult(evaluateStrategyScript(ast!, this.buildReplaySafeReads(asset, tf, undefined, needed), lazy, this.scriptSeries(asset, tf), this.scriptSeriesFor(asset), undefined, { keyPrefix: `opt:${spec.id}|${asset}|${tf}`, barTimeSec: t }))
+              : this.evaluateConditions(spec, asset, tf)
+          } catch (err) {
+            result = { direction: 'none', score: 0, confidence: 0, conditions: [], notes: `replay error: ${err instanceof Error ? err.message : String(err)}` }
+          }
+          out = { direction: result.direction, score: result.score, notes: result.notes ?? '' }
+        } finally {
+          this.inReplay = wasReplay
+          this.market.setReplayAsof(null)
+        }
+        if (cache.size > 20000) cache.clear()
+        cache.set(key, out)
+        return out
+      },
+    }
   }
 
   /**
