@@ -25,6 +25,7 @@ import {
   type UTCTimestamp,
 } from 'lightweight-charts'
 import type { AnalysisResult, Candle, ChartType, ExpirySurfaceResponse, IndicatorSeries, IvHvResponse, NextExpiryPrediction, OtcFootprintResult, OutcomeMemoryResponse, Position, PulseBarRow, PulseBarsResponse, TickBarRow, TickFootprintResult, TicksResponse, Timeframe } from '@/lib/os/client'
+import { registerSyncChart } from '@/lib/os/chartSync'
 import { chartPriceFormat, fmtPrice, getDayLevels, getFastLevels, getExpectedMove, runMslDraw, EM_DEFAULT_PARAMS, type ExpectedMoveParams, getExpirySurface, getNextExpiry, getOtcFootprint, getOutcomeMemory, getPulseBars, getTickFootprint, osGet, TIMEFRAME_SECONDS } from '@/lib/os/client'
 
 interface ChartPanelProps {
@@ -42,6 +43,9 @@ interface ChartPanelProps {
    * onto once the matching (deep-loaded) candles land. Applies ONCE per
    * nonce - later data updates never yank the operator's viewport. */
   focus?: { from: number; to: number; nonce: number } | null
+  /** When the page owns fullscreen (so the indicator sub-panes go fullscreen with the chart) it passes these; otherwise the chart goes fullscreen alone. */
+  full?: boolean
+  onToggleFull?: () => void
 }
 
 type AnyPriceSeries =
@@ -1089,6 +1093,8 @@ export default function ChartPanel({
   settledPositions,
   tf,
   focus,
+  full: fullProp,
+  onToggleFull,
 }: ChartPanelProps) {
   const elRef = useRef<HTMLDivElement | null>(null)
   const chartRef = useRef<IChartApi | null>(null)
@@ -1431,10 +1437,11 @@ export default function ChartPanel({
       },
       grid: { vertLines: { color: GRID }, horzLines: { color: GRID } },
       crosshair: { mode: 0, vertLine: { color: '#3b82a0', labelBackgroundColor: '#0f2733' }, horzLine: { color: '#3b82a0', labelBackgroundColor: '#0f2733' } },
-      rightPriceScale: { borderColor: '#1c2739', scaleMargins: { top: 0.08, bottom: 0.22 } },
+      rightPriceScale: { borderColor: '#1c2739', scaleMargins: { top: 0.08, bottom: 0.22 }, minimumWidth: 64 },
       timeScale: { borderColor: '#1c2739', timeVisible: true, secondsVisible: true, rightOffset: 6 },
     })
     chartRef.current = chart
+    const unsyncMain = registerSyncChart(chart, true)
 
     const vol = chart.addSeries(HistogramSeries, {
       priceScaleId: 'vol',
@@ -1546,6 +1553,7 @@ export default function ChartPanel({
     }
 
     return () => {
+      unsyncMain()
       chart.remove()
       chartRef.current = null
       priceSeriesRef.current = null
@@ -2961,8 +2969,11 @@ export default function ChartPanel({
   // FULLSCREEN: the chart pane takes the whole screen (real browser fullscreen where allowed, otherwise a fixed full-viewport overlay). The chart instance is never remounted - only
   // the wrapper's size changes, and the chart's own autoSize / ResizeObserver redraw it. Esc leaves.
   const rootRef = useRef<HTMLDivElement>(null)
-  const [full, setFull] = useState(false)
+  const [fullLocal, setFull] = useState(false)
+  const external = onToggleFull !== undefined
+  const full = external ? !!fullProp : fullLocal
   const toggleFull = () => {
+    if (external) { onToggleFull?.(); return }
     const next = !full
     setFull(next)
     try {
@@ -2971,12 +2982,12 @@ export default function ChartPanel({
     } catch { /* the overlay still works without the Fullscreen API */ }
   }
   useEffect(() => {
-    if (!full) return
+    if (!fullLocal || external) return
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setFull(false) }
     const onFs = () => { if (!document.fullscreenElement) setFull(false) }
     window.addEventListener('keydown', onKey); document.addEventListener('fullscreenchange', onFs)
     return () => { window.removeEventListener('keydown', onKey); document.removeEventListener('fullscreenchange', onFs) }
-  }, [full])
+  }, [fullLocal, external])
   const [chartStory, setChartStory] = useState<ChartStoryRes | null>(null)
   const [study, setStudy] = useState<StudyRes | null>(null)
   const [studyBusy, setStudyBusy] = useState(false)
@@ -3090,7 +3101,7 @@ export default function ChartPanel({
   }
 
   return (
-    <div ref={rootRef} className={full ? 'fixed inset-0 z-[60] flex min-h-0 flex-col bg-[#0b111c]' : 'relative flex h-full min-h-0 flex-col rounded-lg border border-[#1c2739] bg-[#0b111c]'}>
+    <div ref={rootRef} className={full && !external ? 'fixed inset-0 z-[60] flex min-h-0 flex-col bg-[#0b111c]' : 'relative flex h-full min-h-0 flex-col rounded-lg border border-[#1c2739] bg-[#0b111c]'}>
       {/* zoom controls (left of the price scale) */}
       <div className="absolute bottom-10 right-[60px] z-10 flex flex-col gap-1">
         <button

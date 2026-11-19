@@ -1449,13 +1449,37 @@ export default function OSPage() {
     })
   }, [])
 
+  // FULLSCREEN for the whole chart stack (main chart + every indicator sub-pane), not just the chart. The wrapper element is always present, so nothing remounts when it grows.
+  const stackRef = useRef<HTMLDivElement>(null)
+  const [stackFull, setStackFull] = useState(false)
+  const toggleStackFull = useCallback(() => {
+    setStackFull((prev) => {
+      const next = !prev
+      try {
+        if (next) void stackRef.current?.requestFullscreen?.().catch(() => undefined)
+        else if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined)
+      } catch { /* the overlay still works without the Fullscreen API */ }
+      return next
+    })
+  }, [])
+  useEffect(() => {
+    if (!stackFull) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setStackFull(false) }
+    const onFs = () => { if (!document.fullscreenElement) setStackFull(false) }
+    window.addEventListener('keydown', onKey); document.addEventListener('fullscreenchange', onFs)
+    return () => { window.removeEventListener('keydown', onKey); document.removeEventListener('fullscreenchange', onFs) }
+  }, [stackFull])
+  const stackWrap = (inner: React.ReactNode) => (
+    <div ref={stackRef} className={stackFull ? 'fixed inset-0 z-[60] flex min-h-0 flex-col bg-[#0b111c] p-1' : 'flex h-full min-h-0 flex-1 flex-col'}>{inner}</div>
+  )
+
   // shared chart workspace (chart + sub-panes) - mounted by whichever layout is active.
   // MOBILE: fixed-height stack (touch resizing is miserable) - main chart flexes,
   // every sub-pane keeps its 130px, but the stacking order is still drag-reorderable.
-  const chartWorkspace = (
+  const chartWorkspace = stackWrap(
     <>
       <div className="min-h-[280px] flex-1">
-        <ChartPanel candles={candles} analysis={analysis} price={livePrice} digitsTicker={asset} chartType={chartType} overlays={overlaySeries} positions={positions} settledPositions={history} tf={tf} focus={focus} />
+        <ChartPanel candles={candles} analysis={analysis} price={livePrice} digitsTicker={asset} chartType={chartType} overlays={overlaySeries} positions={positions} settledPositions={history} tf={tf} focus={focus} full={stackFull} onToggleFull={toggleStackFull} />
       </div>
       {activeSubs.map((s, i) => (
         <SubPane
@@ -1478,11 +1502,11 @@ export default function OSPage() {
   // indicator key, not array position) so react-resizable-panels keeps each
   // pane's own saved size attached to it across a drag-reorder instead of
   // the size sticking to whichever slot used to be at that index.
-  const chartStack = (
+  const chartStack = stackWrap(
     <PanelGroup direction="vertical" autoSaveId="iqos:chartstack" className="min-h-0 flex-1">
       <Panel id="chart" defaultSize={58} minSize={20}>
         <div className="h-full min-h-0">
-          <ChartPanel candles={candles} analysis={analysis} price={livePrice} digitsTicker={asset} chartType={chartType} overlays={overlaySeries} positions={positions} settledPositions={history} tf={tf} focus={focus} />
+          <ChartPanel candles={candles} analysis={analysis} price={livePrice} digitsTicker={asset} chartType={chartType} overlays={overlaySeries} positions={positions} settledPositions={history} tf={tf} focus={focus} full={stackFull} onToggleFull={toggleStackFull} />
         </div>
       </Panel>
       {activeSubs.map((s, i) => {

@@ -6,6 +6,7 @@ import { GripVertical } from 'lucide-react'
 import { ColorType, HistogramSeries, LineSeries, LineStyle, createChart, type IChartApi, type ISeriesApi, type UTCTimestamp } from 'lightweight-charts'
 import type { IndicatorSeries, Timeframe } from '@/lib/os/client'
 import { osGet } from '@/lib/os/client'
+import { registerSyncChart, alignToMain } from '@/lib/os/chartSync'
 
 interface Props {
   id: string
@@ -64,11 +65,13 @@ export default function SubPane({ id, asset, tf, params, onRemove, fill, dragInd
         fontFamily: 'var(--font-geist-mono), monospace',
       },
       grid: { vertLines: { color: GRID }, horzLines: { color: GRID } },
-      rightPriceScale: { borderColor: '#1c2739' },
+      rightPriceScale: { borderColor: '#1c2739', minimumWidth: 64 },
       timeScale: { borderColor: '#1c2739', timeVisible: true, secondsVisible: false, visible: false },
     })
     chartRef.current = chart
+    const unsync = registerSyncChart(chart)
     return () => {
+      unsync()
       chart.remove()
       chartRef.current = null
     }
@@ -119,6 +122,7 @@ export default function SubPane({ id, asset, tf, params, onRemove, fill, dragInd
     if (series.bands) {
       chart.priceScale('right').applyOptions({ autoScale: true })
     }
+    alignToMain(chart)
   }, [series])
 
   const lastLine = series?.lines[0]
