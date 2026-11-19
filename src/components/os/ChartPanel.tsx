@@ -26,6 +26,7 @@ import {
 } from 'lightweight-charts'
 import type { AnalysisResult, Candle, ChartType, ExpirySurfaceResponse, IndicatorSeries, IvHvResponse, NextExpiryPrediction, OtcFootprintResult, OutcomeMemoryResponse, Position, PulseBarRow, PulseBarsResponse, TickBarRow, TickFootprintResult, TicksResponse, Timeframe } from '@/lib/os/client'
 import { registerSyncChart } from '@/lib/os/chartSync'
+import DrawingLayer from './DrawingLayer'
 import { chartPriceFormat, fmtPrice, getDayLevels, getFastLevels, getExpectedMove, runMslDraw, EM_DEFAULT_PARAMS, type ExpectedMoveParams, getExpirySurface, getNextExpiry, getOtcFootprint, getOutcomeMemory, getPulseBars, getTickFootprint, osGet, TIMEFRAME_SECONDS } from '@/lib/os/client'
 
 interface ChartPanelProps {
@@ -2936,6 +2937,11 @@ export default function ChartPanel({
   // STORY: a plain-language read of the last CLOSED candle (kind, wicks, sweep/breakout, the 5s path inside it) + rate of change, from the server (analytics/candlestory.ts)
   type StoryRes = { ok: boolean; error?: string; story?: { time: number; kind: string; dir: number; text: string; sizeAtr: number; closePos: number; has5s: boolean; moveSigma: number | null; expUp1: number | null; expDn1: number | null; expUp2: number | null; expDn2: number | null }; forming?: { text: string; kind: string; progress: number; elapsedSec: number; leftSec: number; moveSigma: number | null }; roc?: { r1: { roc: number; rocAtr: number; accel: number }; r3: { roc: number }; r5: { roc: number } }; earlier?: { time: number; kind: string; dir: number; text: string }[]; windows?: { ok: boolean; n: number; kind: string; text: string; net: number; eff: number; roc: number; netSigma: number | null }[]; structure?: { ok: boolean; n: number; high: number; highAge: number; low: number; lowAge: number; hh: number; hl: number; lh: number; ll: number; eh: number; el: number; sequence: string; structure: string; brokeHigh: boolean; brokeLow: boolean; rocAvg: number; rocMax: number; rocMaxAge: number; rocMin: number; rocMinAge: number; rocFirst: number; rocSecond: number; rocAccel: number; text: string } }
   const [showStory, setShowStory] = useState(false)
+  // DR: drawing tools (components/os/DrawingLayer.tsx)
+  const [showDraw, setShowDraw] = useState(false)
+  const [hostEl, setHostEl] = useState<HTMLDivElement | null>(null)
+  const hostRef = useCallback((el: HTMLDivElement | null) => { elRef.current = el; setHostEl(el) }, [])
+  const candleTimes = useMemo(() => candles.map((c) => c.time as number), [candles])
   const [storyRes, setStoryRes] = useState<StoryRes | null>(null)
   const [storyWin, setStoryWin] = useState('14,21')
   const [storyStr, setStoryStr] = useState('21')
@@ -3176,6 +3182,15 @@ export default function ChartPanel({
           }`}
         >
           SCR
+        </button>
+        <button
+          onClick={() => setShowDraw((v) => !v)}
+          title="Drawing tools: trendline, ray, arrow, horizontal / vertical line, box, fib retracement, text. Drag, reshape, recolour and delete them like TradingView."
+          className={`flex h-6 w-6 items-center justify-center rounded border font-mono text-[8px] font-bold leading-none transition-colors ${
+            showDraw ? 'border-cyan-500/60 bg-cyan-500/15 text-cyan-300' : 'border-[#1c2739] bg-[#0d1420]/90 text-[#7c8aa5] hover:border-cyan-500/40'
+          }`}
+        >
+          DR
         </button>
         <button
           onClick={() => setShowStory((v) => !v)}
@@ -3438,7 +3453,8 @@ export default function ChartPanel({
         </button>
       </div>
 
-      <div ref={elRef} className="min-h-0 flex-1" />
+      <div ref={hostRef} className="min-h-0 flex-1" />
+      <DrawingLayer open={showDraw} chartRef={chartRef} seriesRef={priceSeriesRef} host={hostEl} candleTimes={candleTimes} asset={digitsTicker} tfSeconds={TIMEFRAME_SECONDS[tf ?? '1m'] ?? 60} />
       {(chartType === 'footprint' || chartType === 'tpo' || chartType === 'otcfootprint' || chartType === 'tickfootprint' || chartType === 'volumeprofile' || chartType === 'deltaprofile' || chartType === 'pulse' || chartType === 'expiryRadar' || chartType === 'expirySurface') && (
         <div className="absolute inset-x-0 bottom-[30px] top-0 z-[5] bg-[#0b111c]">
           <canvas ref={customCanvasRef} className="block h-full w-full" />
