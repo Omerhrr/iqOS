@@ -405,8 +405,10 @@ expiry = 3
 # The same model on the 5m chart is blended in (story.pm("15m") picks another): opposite frames = no call.
 # It only trades when the walk-forward track record (each past call made with only the bars before it) beat 50%. A judgement-weighted model, not a fitted one: backtest before trusting it.
 let minConf = 45
+let maxAge = 12          # seconds into the new candle after which the read is STALE (it describes the candle that just closed) - skip the signal
 let m = story.pm()
-let ok = m.ok and m.validated and m.bucketN >= 15 and m.strength >= minConf and m.alignment != "conflict"
+let fresh = timing.barAge() < maxAge     # the prediction is for the candle that just opened; late in it, the read is old news
+let ok = fresh and m.ok and m.validated and m.bucketN >= 15 and m.strength >= minConf and m.alignment != "conflict"
 call when ok and m.direction == "call" and not m.atResistance
 put when ok and m.direction == "put" and not m.atSupport
 expiry = 1
