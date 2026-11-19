@@ -163,7 +163,7 @@ export class CfdTraderService {
     const cfg = this.config
     const cs = this.candles(asset, cfg.tf)
     const htf = cfg.htfTf !== 'none' ? this.candles(asset, cfg.htfTf) : null
-    const base = readCfdPlan(cs, this.ticksFor(asset), htf, { htfTf: cfg.htfTf, minRR: cfg.minRR })
+    const base = readCfdPlan(cs, this.ticksFor(asset), htf, { htfTf: cfg.htfTf, minRR: cfg.minRR, otc: !!this.market.listAssets().find((a) => a.ticker === asset)?.otc })
     if (cfg.source !== 'meta-strategy' || !cfg.metaStrategyId) return { plan: base, source: 'plan', note: base.text }
     const ms = this.ctx.use<MetaStrategyService>('metaStrategy')
     const ev = ms.evaluate(cfg.metaStrategyId, asset, cfg.tf)

@@ -432,4 +432,19 @@ pos.target = c.target
 pos.breakeven = c.riskDist
 `,
   },
+  {
+    id: 'meta:builtin-otc-pm',
+    name: 'Builtin: OTC predicted move (no volume)',
+    script: `
+# OTC PREDICTED MOVE. OTC quotes are broker-generated, so there is no real volume. The cause is built from tick imbalance, tick path efficiency, run persistence, range expansion and the
+# close location; volume, MFI and A/D are dropped. The validation bar is higher than the real-market version (40+ walk-forward calls, 55%+ hit). Whether an OTC feed has ANY
+# exploitable structure is unproven: backtest per pair on your recorded ticks first.
+let minConf = 50
+let m = story.otcpm()
+let ok = m.ok and m.validated and m.bucketN >= 20 and m.strength >= minConf and m.alignment != "conflict"
+call when ok and m.direction == "call" and not m.atResistance
+put when ok and m.direction == "put" and not m.atSupport
+expiry = 1
+`,
+  },
 ]

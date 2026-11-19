@@ -20,6 +20,7 @@ export interface CfdPlanOptions {
   minRR?: number      // minimum reward:risk, default 1.5
   bufferAtr?: number  // beyond/inside a level, default 0.25
   htfTf?: string      // default '5m'; 'none' disables
+  otc?: boolean       // OTC mode (no volume; see causeeffect.ts)
 }
 
 export interface CfdPlan {
@@ -49,10 +50,10 @@ const none = (error: string, atr = NaN): CfdPlan => ({ ok: false, error, directi
 
 export function readCfdPlan(candles: CeCandle[], ticks?: readonly CeTick[], htfCandles?: CeCandle[] | null, opts: CfdPlanOptions = {}): CfdPlan {
   const htfTf = opts.htfTf ?? '5m'
-  const trig = readCauseEffect(candles, ticks)
+  const trig = readCauseEffect(candles, ticks, { otc: opts.otc })
   if (!trig.ok) return none(trig.error ?? 'not enough history')
   let htf: ReturnType<typeof readCauseEffect> | null = null
-  if (htfTf !== 'none' && htfCandles && htfCandles.length) { try { htf = readCauseEffect(htfCandles) } catch { htf = null } }
+  if (htfTf !== 'none' && htfCandles && htfCandles.length) { try { htf = readCauseEffect(htfCandles, undefined, { otc: opts.otc }) } catch { htf = null } }
   const m = combineCeMtf(trig, htf, htfTf)
   const a = atrInd(candles.map((c) => c.high), candles.map((c) => c.low), candles.map((c) => c.close), 14)
   const atr = a[a.length - 1]

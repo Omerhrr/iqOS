@@ -5631,8 +5631,8 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         if (e.name === 'of' || e.name === 'ofText') return storyOf(e.name, args, ctx)
         if (e.name === 'mtf') return storyMtf(args, ctx)
-        if (e.name === 'pm' || e.name === 'pmText') return storyPm(e.name, args, ctx)
-        if (e.name === 'cfd' || e.name === 'cfdText') return storyCfd(e.name, args, ctx)
+        if (e.name === 'pm' || e.name === 'pmText' || e.name === 'otcpm' || e.name === 'otcpmText') return storyPm(e.name, args, ctx)
+        if (e.name === 'cfd' || e.name === 'cfdText' || e.name === 'otccfd') return storyCfd(e.name, args, ctx)
         const tf = args.length && typeof args[args.length - 1] === 'string' && e.name !== 'is' ? (args.pop() as string) : undefined
         return storyMethod(e.name, args, ctx, tf)
       }
@@ -6429,17 +6429,20 @@ function storyMtf(args: MslValue[], ctx: EvalEnv): MslValue {
  * trigDirection trigProb, then the trigger's own: moveAtr validated causeDir causeMag causeLabel volRatio fpDelta tickImb mfi adSlope ticksUsed effectDir sizeAtr psychology upperWick lowerWick roc cci coherence bucketN bucketUp trackN
  * trackHit support resistance supDist resDist atSupport atResistance retest text. */
 function storyPm(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
-  const htfTf = args.find((a): a is string => typeof a === 'string') ?? '5m'
+  const strs = args.filter((a): a is string => typeof a === 'string')
+  const otc = name === 'otcpm' || name === 'otcpmText' || strs.includes('otc')
+  const htfTf = strs.find((a) => a !== 'otc') ?? '5m'
+  if (name === 'otcpmText') name = 'pmText'
   const mk = (s: MslSeriesCtx) => { const t = s.time ?? []; return seriesToCandles(s).map((c, i) => ({ ...c, time: t[i] ?? i })) }
-  const trig = readCauseEffect(mk(requireSeries(ctx, undefined)), ctx.liveTicks)
+  const trig = readCauseEffect(mk(requireSeries(ctx, undefined)), ctx.liveTicks, { otc })
   let htf: ReturnType<typeof readCauseEffect> | null = null
-  if (htfTf !== 'none') { try { const hs = ctx.seriesFor?.(htfTf); if (hs) htf = readCauseEffect(mk(hs)) } catch { htf = null } }
+  if (htfTf !== 'none') { try { const hs = ctx.seriesFor?.(htfTf); if (hs) htf = readCauseEffect(mk(hs), undefined, { otc }) } catch { htf = null } }
   const m = combineCeMtf(trig, htf, htfTf)
   if (name === 'pmText') return m.text
   const r = trig
   return bundleValue({ ok: m.ok, error: r.ok ? '' : (r.error ?? ''), direction: m.dir, prob: m.prob, strength: m.strength, alignment: m.alignment, lean: m.lean, triggerWithHtf: m.triggerWithHtf,
     htfOk: m.htfOk, htfDir: htf?.pm.dir ?? 'none', htfProb: htf?.pm.prob ?? 0.5, htfStrength: htf?.pm.confidence ?? 0, htfValidated: htf?.validation.validated ?? false, htfCause: htf?.cause.label ?? '',
-    trigDirection: r.pm.dir, trigProb: r.pm.prob, moveAtr: r.pm.moveAtr, validated: r.validation.validated,
+    otc, pathEff: r.cause.pathEff ?? NaN, run: r.cause.run ?? 0, tickSpeed: r.cause.speed ?? 1, expand: r.cause.expand ?? 0, trigDirection: r.pm.dir, trigProb: r.pm.prob, moveAtr: r.pm.moveAtr, validated: r.validation.validated,
     causeDir: r.cause.dir, causeMag: r.cause.mag, causeLabel: r.cause.label, volRatio: r.cause.volRatio, fpDelta: r.cause.fpDelta, tickImb: r.cause.tickImb, mfi: r.cause.mfi, adSlope: r.cause.adSlope, ticksUsed: r.cause.ticksUsed,
     effectDir: r.effect.dir, sizeAtr: r.effect.sizeAtr, psychology: r.effect.psychology, upperWick: r.effect.upperWick, lowerWick: r.effect.lowerWick, roc: r.effect.roc, cci: r.effect.cci,
     coherence: r.validation.coherence, bucketN: r.validation.bucketN, bucketUp: r.validation.bucketUpProb, trackN: r.validation.trackN, trackHit: r.validation.trackHit,
@@ -6449,12 +6452,14 @@ function storyPm(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
 /** `story.cfd([htf], [minRR])` - the pm model as a CFD trade PLAN (analytics/cfdplan.ts): direction plus entry, stop, target, rr, ev, probability. Flat bundle: ok error direction entry stop target
  * riskDist rewardDist riskAtr rewardAtr rr prob strength ev atr stopKind targetKind alignment. Use: `call when c.direction == "call" and c.rr >= 1.5` then `pos.stop = c.stop` `pos.target = c.target`. story.cfdText() is the sentence. */
 function storyCfd(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
-  const htfTf = args.find((a): a is string => typeof a === 'string') ?? '5m'
+  const strs = args.filter((a): a is string => typeof a === 'string')
+  const otc = name === 'otccfd' || strs.includes('otc')
+  const htfTf = strs.find((a) => a !== 'otc') ?? '5m'
   const nums = args.filter((a): a is number => typeof a === 'number')
   const mk = (s: MslSeriesCtx) => { const t = s.time ?? []; return seriesToCandles(s).map((c, i) => ({ ...c, time: t[i] ?? i })) }
   let htfC: ReturnType<typeof mk> | null = null
   if (htfTf !== 'none') { try { const hs = ctx.seriesFor?.(htfTf); if (hs) htfC = mk(hs) } catch { htfC = null } }
-  const p = readCfdPlan(mk(requireSeries(ctx, undefined)), ctx.liveTicks, htfC, { htfTf, ...(nums[0] !== undefined ? { minRR: nums[0] } : {}) })
+  const p = readCfdPlan(mk(requireSeries(ctx, undefined)), ctx.liveTicks, htfC, { htfTf, otc, ...(nums[0] !== undefined ? { minRR: nums[0] } : {}) })
   if (name === 'cfdText') return p.text
   return bundleValue({ ok: p.ok, error: p.ok ? '' : (p.error ?? ''), direction: p.direction, entry: p.entry, stop: p.stop, target: p.target, riskDist: p.riskDist, rewardDist: p.rewardDist, riskAtr: p.riskAtr, rewardAtr: p.rewardAtr, rr: p.rr, prob: p.prob, strength: p.strength, ev: p.ev, atr: p.atr, stopKind: p.stopKind, targetKind: p.targetKind, alignment: p.alignment })
 }
