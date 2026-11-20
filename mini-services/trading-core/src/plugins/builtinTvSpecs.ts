@@ -477,4 +477,33 @@ put when ok and e.direction == "put"
 expiry = 1
 `,
   },
+  {
+    id: 'meta:builtin-dao-wuwei',
+    name: 'Builtin: dao (wu wei - act only when the way is clear)',
+    script: `
+# DAO / WU WEI. Nine lenses read how price is behaving (yin/yang, cause and effect, life and death of the trend, time, space, momentum, fate, phase) and the wu wei lens decides whether to act at all:
+# it WAITS in a squeeze, when chasing an extended move, when fighting a strong prevailing move, when momentum stalls or pm and nm disagree. Most bars say WAIT by design.
+# Run /dao_research on the pair first (does inaction actually help on this pair?). Descriptions, not forecasts: backtest before trusting.
+let minFavour = 55
+let d = dao.all()
+let ok = d.ok and d.act and d.favour >= minFavour
+call when ok and d.dir == "call"
+put when ok and d.dir == "put"
+expiry = 1
+`,
+  },
+  {
+    id: 'meta:builtin-chess',
+    name: 'Builtin: chess (look ahead, act only on a clear line)',
+    script: `
+# CHESS. Pieces, position, tactics (trap, mating net, fork, sacrifice) and a small look-ahead (which level first, take or hold). Acts only when the best line clears 0.15R and the verdict holds up.
+# A "mate" is a favourable setup, never a guarantee. Run /chess_research first (does each tactic beat its baseline on this pair?). Backtest before trusting.
+let minStrength = 50
+let c = chess.all()
+let ok = c.ok and c.act and c.strength >= minStrength
+call when ok and c.dir == "call"
+put when ok and c.dir == "put"
+expiry = 1
+`,
+  },
 ]

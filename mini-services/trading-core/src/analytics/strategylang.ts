@@ -283,6 +283,8 @@ import { readCfdPlan } from './cfdplan'
 import { readNextMove, combineNmPm } from './nextmove'
 import { readWeather } from './weather'
 import { readEditor } from './editor'
+import { readDao } from './dao'
+import { readChess } from './chess'
 import { readStory, readRoc, readWindowStory, readStructure, readFormingStory, cutBars } from './candlestory'
 import { oscillatorVotes, maVotes, TECH_MIN_BARS, TECH_BARS_PER_RUNG, type TechVote } from './technicals'
 
@@ -5650,6 +5652,14 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
         return pbMethod(e.name, args, ctx, tf)
       }
+      if (e.obj.t === 'ident' && e.obj.name === 'chess' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        return chessMethod(e.name, args, ctx)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'dao' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        return daoMethod(e.name, args, ctx)
+      }
       if (e.obj.t === 'ident' && e.obj.name === 'polar' && !(e.obj.name in env)) {
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         return polarMethod(e.name, args, ctx)
@@ -6516,6 +6526,59 @@ function storyEditor(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
   if (name === 'editorText') return e.text
   return bundleValue({ ok: e.ok, error: e.ok ? '' : (e.error ?? ''), direction: e.dir, prob: e.prob, strength: e.strength, agreement: e.agreement, regime: e.regime, tradeNow: e.tradeNow, invalidation: e.invalidation, invalidationProb: e.invalidationProb,
     pmDir: e.pm.dir, pmStrength: e.pm.strength, pmValidated: e.pm.trigger.validation.validated, nmDir: e.nm.nm.dir, nmStrength: e.nm.nm.confidence, nmValidated: e.nm.nm.validated, favours: e.wx.favours, tradeable: e.wx.tradeable })
+}
+
+/** `dao.<lens>([horizon], ["otc"])` - the market read as a way that unfolds (analytics/dao.ts), nine lenses, 150+ bars, candle-derived: yinyang (yang/yin activity, push, dominance, transfer), cause (pm + breakout odds),
+ * life (stage birth|growth|mature|correcting|dying|dead, age, maturity, vitality, retrace), time (z5 z15 z45 z135 alignment scaleDir hourBias hourVol cyclePos), space (zone discount|equilibrium|premium, levels),
+ * momentum (state surging|steady|stalling|fading|idle, genuine, accel, persistence, progress), wuwei (act, dir, favour, waitCount, waitText), fate (cone, touchUpRW/touchUpEmp, vr5, vr10, character, drift),
+ * phase (phase stillness|movement|expansion|excess|transformation, next, stretch), lean (dir, vote). dao.text() = the nine sentences; dao.all() = a flat bundle of the headline of every lens
+ * (act, dir, favour, phase, stage, momentum, zone, character, ...). Wu wei is the point: `call when d.act and d.dir == "call"` - most bars should say WAIT. Walk-forward untested: run /dao_research first. */
+function daoMethod(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
+  const strs = args.filter((a): a is string => typeof a === 'string'), hz = args.find((a): a is number => typeof a === 'number')
+  const mk = (s: MslSeriesCtx) => { const t = s.time ?? []; return seriesToCandles(s).map((c, i) => ({ ...c, time: t[i] ?? i })) }
+  const r = readDao(mk(requireSeries(ctx, undefined)), ctx.liveTicks, { otc: strs.includes('otc'), ...(hz !== undefined ? { horizon: hz } : {}) })
+  if (name === 'text') return r.text
+  if (!r.ok) return bundleValue({ ok: false, error: r.error ?? 'dao unavailable', act: false, dir: 'none' })
+  const flat = (o: object, pre = ''): Record<string, MslValue> => { const out: Record<string, MslValue> = {}; for (const [k, v] of Object.entries(o)) if (typeof v === 'number' || typeof v === 'string' || typeof v === 'boolean') out[pre ? pre + k[0].toUpperCase() + k.slice(1) : k] = v as MslValue; return out }
+  switch (name) {
+    case 'yinyang': return bundleValue({ ok: true, ...flat(r.yinyang) })
+    case 'cause': return bundleValue({ ok: true, ...flat(r.cause) })
+    case 'life': return bundleValue({ ok: true, ...flat(r.life) })
+    case 'time': return bundleValue({ ok: true, ...flat(r.time) })
+    case 'space': return bundleValue({ ok: true, ...flat(r.space) })
+    case 'momentum': return bundleValue({ ok: true, ...flat(r.momentum) })
+    case 'fate': return bundleValue({ ok: true, ...flat(r.fate) })
+    case 'phase': return bundleValue({ ok: true, ...flat(r.phase) })
+    case 'lean': return bundleValue({ ok: true, ...flat(r.lean) })
+    case 'wuwei': return bundleValue({ ok: true, act: r.wuwei.act, dir: r.wuwei.dir, favour: r.wuwei.favour, waitCount: r.wuwei.wait.length, waitText: r.wuwei.wait.join('; '), whyText: r.wuwei.why.join('; ') })
+    case 'all': return bundleValue({ ok: true, act: r.wuwei.act, dir: r.wuwei.dir, favour: r.wuwei.favour, waitCount: r.wuwei.wait.length, waitText: r.wuwei.wait.join('; '), leanDir: r.lean.dir, leanVote: r.lean.vote, phase: r.phase.phase, nextPhase: r.phase.next, stretch: r.phase.stretch,
+      stage: r.life.stage, maturity: r.life.maturity, vitality: r.life.vitality, momentum: r.momentum.state, genuine: r.momentum.genuine, zone: r.space.zone, rangePos: r.space.rangePos, yang: r.yinyang.yang, push: r.yinyang.push, dominance: r.yinyang.dominance, transfer: r.yinyang.transfer,
+      alignment: r.time.alignment, scaleDir: r.time.scaleDir, compressed: r.cause.compressed, breakoutP: r.cause.breakoutP, character: r.fate.character, vr5: r.fate.vr5, drift: r.fate.drift, driftT: r.fate.driftT })
+    default: throw new MslRuntimeError(`unknown dao lens "dao.${name}(...)" - use yinyang/cause/life/time/space/momentum/wuwei/fate/phase/lean/all/text`)
+  }
+}
+
+/** `chess.<part>([horizon], ["otc"])` - the market as a chessboard (analytics/chess.ts), 150+ bars: pieces (queen, pawnPush, knight, bishop, rook, kingLong, kingShort), position (eval -1..+1, control, mobBuy, mobSell, rank, tempo),
+ * tactic (count, first tactic name/dir/stage/level, hitRate, hitN, baseRate, text), mate (mated, stage, mate), think (best call|put|wait, bestEv in R, callEv, putEv, evidence, line), best (the verdict: dir, strength, act),
+ * all (flat headline), text (the sentences). A "mate" is a statistically favourable setup, never a guarantee. Run /chess_research first. */
+function chessMethod(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
+  const strs = args.filter((a): a is string => typeof a === 'string'), hz = args.find((a): a is number => typeof a === 'number')
+  const mk = (s: MslSeriesCtx) => { const t = s.time ?? []; return seriesToCandles(s).map((c, i) => ({ ...c, time: t[i] ?? i })) }
+  const r = readChess(mk(requireSeries(ctx, undefined)), { otc: strs.includes('otc'), ...(hz !== undefined ? { horizon: hz } : {}) })
+  if (name === 'text') return r.text
+  if (!r.ok) return bundleValue({ ok: false, error: r.error ?? 'chess unavailable', act: false, dir: 'none', best: 'wait' })
+  const t0 = r.tactics[0]
+  switch (name) {
+    case 'pieces': return bundleValue({ ok: true, ...r.pieces })
+    case 'position': return bundleValue({ ok: true, ...r.position })
+    case 'tactic': return bundleValue({ ok: true, count: r.tactics.length, name: t0?.name ?? 'none', dir: t0?.dir ?? 'none', stage: t0?.stage ?? 'none', level: t0?.level ?? 0, hitRate: t0 && Number.isFinite(t0.hitRate) ? t0.hitRate : 0, hitN: t0?.hitN ?? 0, baseRate: t0?.baseRate ?? 0.5, text: r.tactics.map((x) => x.note).join('; ') })
+    case 'mate': return bundleValue({ ok: true, ...r.mate })
+    case 'think': return bundleValue({ ok: true, ...r.think })
+    case 'best': return bundleValue({ ok: true, dir: r.verdict.dir, strength: r.verdict.strength, act: r.verdict.dir !== 'none', reasons: r.verdict.reasons.join('; '), blocks: r.verdict.blocks.join('; ') })
+    case 'all': return bundleValue({ ok: true, act: r.verdict.dir !== 'none', dir: r.verdict.dir, strength: r.verdict.strength, queen: r.pieces.queen, eval: r.position.eval, control: r.position.control, mobBuy: r.position.mobBuy, mobSell: r.position.mobSell,
+      tactics: r.tactics.length, tactic: t0?.name ?? 'none', tacticDir: t0?.dir ?? 'none', tacticStage: t0?.stage ?? 'none', mated: r.mate.mated, mate: r.mate.mate, best: r.think.best, bestEv: r.think.bestEv, callEv: r.think.callEv, putEv: r.think.putEv, evidence: r.think.evidence, blocks: r.verdict.blocks.join('; ') })
+    default: throw new MslRuntimeError(`unknown chess part "chess.${name}(...)" - use pieces/position/tactic/mate/think/best/all/text`)
+  }
 }
 
 function lastAtr(ctx: EvalEnv): number {

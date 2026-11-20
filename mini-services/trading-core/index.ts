@@ -48,6 +48,8 @@ import { BUILTIN_TV_SPECS } from './src/plugins/builtinTvSpecs'
 import { readNextMove, combineNmPm } from './src/analytics/nextmove'
 import { readEditor, reportEditor } from './src/analytics/editor'
 import { readWeather } from './src/analytics/weather'
+import { readDao, reportDao } from './src/analytics/dao'
+import { readChess, reportChess } from './src/analytics/chess'
 import { omniTraderPlugin, OmniTraderService } from './src/plugins/omnitrader'
 import { brainTraderPlugin, BrainTraderService } from './src/plugins/braintrader'
 import { META_CONDITION_SOURCES } from './src/analytics/metastrategy'
@@ -2434,6 +2436,58 @@ const httpServer = createServer(async (req, res) => {
 
       // GET /predicted_move?asset=&tf=1m -> the CAUSE -> EFFECT predicted move (analytics/causeeffect.ts): cause (volume, footprint estimate, ticks, MFI, A/D), effect (candle, psychology, ROC, CCI),
       // bars-ago validation, S/R retests and the next-candle prediction. Judgement-weighted, not fitted; see the honesty note in that file.
+      // GET /dao?asset=&tf=1m&horizon=5 - the DAO read (analytics/dao.ts): nine lenses + the one-line verdict (wu wei: act or wait). GET /dao_research?asset=&tf=1m&bars=3000 - the five deeper questions measured on the pair's OWN history.
+      if (path === '/dao' || path === '/dao_research') {
+        try {
+          const asset = q.get('asset')
+          if (!asset) return json(400, { ok: false, error: 'asset is required' })
+          const tfv = tfStrict(q.get('tf') ?? '1m')
+          if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const mk = kernel.context().use<MarketDataService>('market'), nowSec = Math.floor(Date.now() / 1000)
+          const info = mk.listAssets().find((a) => a.ticker === asset)
+          const otc = q.get('otc') !== null ? q.get('otc') === '1' : !!info?.otc
+          if (path === '/dao_research') {
+            const store = kernel.context().use<{ getCandlesArchive: (a: string, t: string, n: number) => Candle[] }>('storeRaw')
+            const bars = Math.max(500, Math.min(6000, Math.round(Number(q.get('bars')) || 3000)))
+            const c = store.getCandlesArchive(asset, tfv, bars).filter((x) => x && [x.time, x.open, x.high, x.low, x.close].every((v) => Number.isFinite(v)))
+            return json(200, { asset, tf: tfv, otc, ...reportDao(c) })
+          }
+          let c = (mk.getCandlesDeep(asset, tfv, 1500, true) ?? []).filter((x) => x && [x.time, x.open, x.high, x.low, x.close].every((v) => Number.isFinite(v)))
+          if (c.length && c[c.length - 1].time + TIMEFRAME_SECONDS[tfv] > nowSec) c = c.slice(0, -1)
+          let ticks: { ts: number; price: number }[] | undefined
+          try { ticks = kernel.context().use<{ ticksFor: (a: string) => { ts: number; price: number }[] }>('otcFootprint').ticksFor(asset) } catch { ticks = undefined }
+          const horizon = Math.max(2, Math.min(30, Number(q.get('horizon')) || 5))
+          return json(200, { asset, tf: tfv, otc, ...readDao(c, ticks, { otc, horizon }) })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // GET /chess?asset=&tf=1m&horizon=5 - the CHESS read (analytics/chess.ts): pieces, position, tactics (with their own history), mate, look-ahead and verdict. GET /chess_research?asset=&tf=1m&bars=3000 - each tactic measured on the pair's OWN history.
+      if (path === '/chess' || path === '/chess_research') {
+        try {
+          const asset = q.get('asset')
+          if (!asset) return json(400, { ok: false, error: 'asset is required' })
+          const tfv = tfStrict(q.get('tf') ?? '1m')
+          if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const mk = kernel.context().use<MarketDataService>('market'), nowSec = Math.floor(Date.now() / 1000)
+          const info = mk.listAssets().find((a) => a.ticker === asset)
+          const otc = q.get('otc') !== null ? q.get('otc') === '1' : !!info?.otc
+          if (path === '/chess_research') {
+            const store = kernel.context().use<{ getCandlesArchive: (a: string, t: string, n: number) => Candle[] }>('storeRaw')
+            const bars = Math.max(500, Math.min(6000, Math.round(Number(q.get('bars')) || 3000)))
+            const c = store.getCandlesArchive(asset, tfv, bars).filter((x) => x && [x.time, x.open, x.high, x.low, x.close].every((v) => Number.isFinite(v)))
+            return json(200, { asset, tf: tfv, otc, ...reportChess(c) })
+          }
+          let c = (mk.getCandlesDeep(asset, tfv, 1500, true) ?? []).filter((x) => x && [x.time, x.open, x.high, x.low, x.close].every((v) => Number.isFinite(v)))
+          if (c.length && c[c.length - 1].time + TIMEFRAME_SECONDS[tfv] > nowSec) c = c.slice(0, -1)
+          const horizon = Math.max(2, Math.min(30, Number(q.get('horizon')) || 5))
+          return json(200, { asset, tf: tfv, otc, ...readChess(c, { otc, horizon }) })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
       // GET /story_editor?asset=&tf=1m&htf=5m - the EDITOR chapter: pm + nm + weather in one verdict (analytics/editor.ts), with the weather and invalidation.
       // GET /story_editor_report?asset=&tf=1m&bars=1500&step=8 - measures, on the pair's OWN history, whether pm + nm agreeing beat the better single model (analytics/editor.ts reportEditor).
       if (path === '/story_editor' || path === '/story_editor_report') {
@@ -2466,7 +2520,7 @@ const httpServer = createServer(async (req, res) => {
         }
       }
 
-      // GET /next_move?asset=&tf=1m&horizon=5&otc=0|1 - WEATHER + EDITOR (analytics/weather.ts, analytics/editor.ts): `let w = story.weather()` -> w.regime (dead|squeeze|expansion|trend-up|trend-down|range|mixed), w.er, w.chop, w.volRank, w.favours (follow|fade|neither - what has paid in this regime on THIS pair), w.tradeable; `let e = story.editor()` / story.editor(\"15m\") / story.editor(\"otc\") -> ONE verdict from pm + nm + weather: e.direction e.prob e.strength e.agreement (aligned|conflict|nm-only|pm-only|no-call) e.regime e.tradeNow e.invalidation (price that proves it wrong) e.invalidationProb e.pmValidated e.nmValidated. story.weatherText() / story.editorText() the sentences. Typical: `call when e.tradeNow and e.direction == \"call\"` then `pos.stop = e.invalidation`. NEXT MOVE (analytics/nextmove.ts): price's own map + causes + level ledger + analog outcomes (next candle, next `horizon` candles, reach-above-before-below), blended with pm.
+      // GET /next_move?asset=&tf=1m&horizon=5&otc=0|1 - DAO (analytics/dao.ts): the market read as a way that unfolds, nine lenses, candle-derived, 150+ bars: `let d = dao.all()` (act, dir, favour, waitText, phase stillness|movement|expansion|excess|transformation, stage birth|growth|mature|correcting|dying|dead, momentum state, zone discount|equilibrium|premium, character trending|reverting|random, transfer, compressed, breakoutP, ...) or one lens at a time: dao.yinyang() dao.cause() dao.life() dao.time() dao.space() dao.momentum() dao.wuwei() dao.fate() dao.phase() dao.lean(); dao.text() the nine sentences; dao.all(10)/dao.all(\"otc\"). WU WEI is the point: `call when d.act and d.dir == \"call\"` - most bars should say WAIT (blocked by squeeze, chasing an extended move, fighting a strong move, stalling momentum, pm/nm conflict). /dao_research measures the five deeper questions on a pair\'s own history. CHESS (analytics/chess.ts): the market as a chessboard. `let c = chess.all()` -> act dir strength queen eval control mobBuy mobSell tactics tactic tacticDir tacticStage mated mate best bestEv callEv putEv evidence blocks; or chess.pieces() chess.position() chess.tactic() chess.mate() chess.think() chess.best(); chess.text() the sentences; chess.all(10)/chess.all(\"otc\"). Tactics (trap, mating-net, fork, sacrifice) are stage-aware; think is a small look-ahead (which level first, take or hold) in R. A mate is a favourable setup, never a guarantee; /chess_research measures each tactic on the pair\'s own history. WEATHER + EDITOR (analytics/weather.ts, analytics/editor.ts): `let w = story.weather()` -> w.regime (dead|squeeze|expansion|trend-up|trend-down|range|mixed), w.er, w.chop, w.volRank, w.favours (follow|fade|neither - what has paid in this regime on THIS pair), w.tradeable; `let e = story.editor()` / story.editor(\"15m\") / story.editor(\"otc\") -> ONE verdict from pm + nm + weather: e.direction e.prob e.strength e.agreement (aligned|conflict|nm-only|pm-only|no-call) e.regime e.tradeNow e.invalidation (price that proves it wrong) e.invalidationProb e.pmValidated e.nmValidated. story.weatherText() / story.editorText() the sentences. Typical: `call when e.tradeNow and e.direction == \"call\"` then `pos.stop = e.invalidation`. NEXT MOVE (analytics/nextmove.ts): price's own map + causes + level ledger + analog outcomes (next candle, next `horizon` candles, reach-above-before-below), blended with pm.
       if (path === '/next_move') {
         try {
           const asset = q.get('asset')

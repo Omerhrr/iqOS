@@ -2985,6 +2985,37 @@ export default function ChartPanel({
     return () => { alive = false; window.clearInterval(t) }
   }, [showStory, storyView, digitsTicker, tf, pmHtf])
   const runEdReport = () => { setEdBusy(true); setEdRep(null); osGet<EdReport>('/story_editor_report', { asset: digitsTicker, tf: tf ?? '1m', bars: 1500, step: 8 }).then(setEdRep).catch((e) => setEdRep({ ok: false, error: String(e instanceof Error ? e.message : e).slice(0, 160) })).finally(() => setEdBusy(false)) }
+  // DAO = nine lenses on how price is behaving + wu wei (act or wait) (/dao), and the five deeper questions measured on this pair (/dao_research)
+  type DaoRes = { ok: boolean; error?: string; lines?: string[]; wuwei?: { act: boolean; dir: string; favour: number; wait: string[]; why: string[] }; phase?: { phase: string; next: string }; life?: { stage: string }; otc?: boolean }
+  type DaoQ = { question: string; answer: string }
+  type DaoRep = { ok: boolean; error?: string; bars?: number; q1?: DaoQ; q2?: DaoQ; q3?: DaoQ; q4?: DaoQ; q5?: DaoQ }
+  const [daoRes, setDaoRes] = useState<DaoRes | null>(null)
+  const [daoRep, setDaoRep] = useState<DaoRep | null>(null)
+  const [daoBusy, setDaoBusy] = useState(false)
+  useEffect(() => {
+    if (!showStory || storyView !== 'dao') return
+    let alive = true
+    const load = () => { osGet<DaoRes>('/dao', { asset: digitsTicker, tf: tf ?? '1m' }).then((r) => { if (alive) setDaoRes(r) }).catch((e) => { if (alive) setDaoRes({ ok: false, error: String(e instanceof Error ? e.message : e).slice(0, 160) }) }) }
+    setDaoRes(null); setDaoRep(null); load()
+    const t = window.setInterval(load, 15000)
+    return () => { alive = false; window.clearInterval(t) }
+  }, [showStory, storyView, digitsTicker, tf])
+  const runDaoReport = () => { setDaoBusy(true); setDaoRep(null); osGet<DaoRep>('/dao_research', { asset: digitsTicker, tf: tf ?? '1m', bars: 3000 }).then(setDaoRep).catch((e) => setDaoRep({ ok: false, error: String(e instanceof Error ? e.message : e).slice(0, 160) })).finally(() => setDaoBusy(false)) }
+  // CHESS = the market as a board: pieces, position, tactics, mate, look-ahead (/chess), each tactic measured on this pair (/chess_research)
+  type ChessRes = { ok: boolean; error?: string; lines?: string[]; verdict?: { dir: string; strength: number }; position?: { label: string }; think?: { best: string; bestEv: number }; otc?: boolean }
+  type ChessRep = { ok: boolean; error?: string; bars?: number; tactics?: Record<string, { n: number; answer: string }> }
+  const [chRes, setChRes] = useState<ChessRes | null>(null)
+  const [chRep, setChRep] = useState<ChessRep | null>(null)
+  const [chBusy, setChBusy] = useState(false)
+  useEffect(() => {
+    if (!showStory || storyView !== 'chess') return
+    let alive = true
+    const load = () => { osGet<ChessRes>('/chess', { asset: digitsTicker, tf: tf ?? '1m' }).then((r) => { if (alive) setChRes(r) }).catch((e) => { if (alive) setChRes({ ok: false, error: String(e instanceof Error ? e.message : e).slice(0, 160) }) }) }
+    setChRes(null); setChRep(null); load()
+    const t = window.setInterval(load, 15000)
+    return () => { alive = false; window.clearInterval(t) }
+  }, [showStory, storyView, digitsTicker, tf])
+  const runChessReport = () => { setChBusy(true); setChRep(null); osGet<ChessRep>('/chess_research', { asset: digitsTicker, tf: tf ?? '1m', bars: 3000 }).then(setChRep).catch((e) => setChRep({ ok: false, error: String(e instanceof Error ? e.message : e).slice(0, 160) })).finally(() => setChBusy(false)) }
   const [nmRes, setNmRes] = useState<NmRes | null>(null)
   const [nmHz, setNmHz] = useState('5')
   useEffect(() => {
@@ -3037,7 +3068,7 @@ export default function ChartPanel({
   const [study, setStudy] = useState<StudyRes | null>(null)
   const [studyBusy, setStudyBusy] = useState(false)
   useEffect(() => {
-    if (!showStory || storyView === 'candles' || storyView === 'mtf' || storyView === 'pm' || storyView === 'nm' || storyView === 'ed') return
+    if (!showStory || storyView === 'candles' || storyView === 'mtf' || storyView === 'pm' || storyView === 'nm' || storyView === 'ed' || storyView === 'dao') return
     let alive = true
     const load = () => { osGet<ChartStoryRes>('/chart_story', { asset: digitsTicker, tf: tf ?? '1m', type: storyView, ...(storyView === 'baseline' ? { mode: 'mid' } : {}) }).then((r) => { if (alive) setChartStory(r) }).catch((e) => { if (alive) setChartStory({ ok: false, error: String(e instanceof Error ? e.message : e).slice(0, 120) }) }) }
     setChartStory(null); load()
@@ -3248,11 +3279,11 @@ export default function ChartPanel({
               <button onClick={() => setShowStory(false)} className="text-[#7c8aa5] hover:text-white">x</button>
             </div>
             <div className="flex flex-wrap gap-0.5">
-              {[['candles', 'candles'], ['renko', 'renko'], ['kagi', 'kagi'], ['effort', 'effort'], ['ha', 'heikin'], ['tickbars', 'tick bars'], ['ticks', 'ticks'], ['baseline', 'baseline'], ['footprint', 'footprint'], ['mtf', 'MTF'], ['pm', 'PM'], ['nm', 'NM'], ['ed', 'EDITOR']].map(([id, label]) => (
+              {[['candles', 'candles'], ['renko', 'renko'], ['kagi', 'kagi'], ['effort', 'effort'], ['ha', 'heikin'], ['tickbars', 'tick bars'], ['ticks', 'ticks'], ['baseline', 'baseline'], ['footprint', 'footprint'], ['mtf', 'MTF'], ['pm', 'PM'], ['nm', 'NM'], ['ed', 'EDITOR'], ['dao', 'DAO'], ['chess', 'CHESS']].map(([id, label]) => (
                 <button key={id} onClick={() => setStoryView(id)} className={`rounded border px-1 py-px text-[8px] ${storyView === id ? 'border-amber-500/60 bg-amber-500/15 text-amber-300' : 'border-[#1c2739] text-[#7c8aa5] hover:text-white'}`}>{label}</button>
               ))}
             </div>
-            {storyView !== 'candles' && storyView !== 'mtf' && storyView !== 'pm' && storyView !== 'nm' && storyView !== 'ed' && (
+            {storyView !== 'candles' && storyView !== 'mtf' && storyView !== 'pm' && storyView !== 'nm' && storyView !== 'ed' && storyView !== 'dao' && (
               <div className="space-y-1">
                 {!chartStory && <div className="text-[#7c8aa5]">reading...</div>}
                 {chartStory && !chartStory.ok && <div className="text-rose-300">{chartStory.text || chartStory.error || 'no story'}</div>}
@@ -3308,6 +3339,42 @@ export default function ChartPanel({
                     </>
                   )
                 })()}
+              </div>
+            )}
+            {storyView === 'dao' && (
+              <div className="space-y-1">
+                {!daoRes && <div className="text-[#7c8aa5]">listening to the way...</div>}
+                {daoRes && !daoRes.ok && <div className="text-rose-300">{daoRes.error ?? 'no read'}</div>}
+                {daoRes?.ok && daoRes.wuwei && (
+                  <>
+                    <div className={`flex items-center justify-between rounded border px-1.5 py-1 ${daoRes.wuwei.act ? (daoRes.wuwei.dir === 'call' ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-300' : 'border-rose-500/50 bg-rose-500/10 text-rose-300') : 'border-[#1c2739] text-[#7c8aa5]'}`}>
+                      <span className="font-bold">{daoRes.wuwei.act ? `WU WEI: ACT ${daoRes.wuwei.dir.toUpperCase()}` : 'WU WEI: WAIT'}</span>
+                      <span>{daoRes.phase?.phase} → {daoRes.phase?.next} · {daoRes.life?.stage} · favour {daoRes.wuwei.favour}/100{daoRes.otc ? ' · OTC' : ''}</span>
+                    </div>
+                    <div className="space-y-1">{(daoRes.lines ?? []).map((l, i) => <div key={i} className="rounded border border-[#1c2739] p-1 text-[#9fb0cc]">{l}</div>)}</div>
+                    <button onClick={runDaoReport} disabled={daoBusy} className="rounded border border-amber-500/40 px-1.5 py-px text-[8px] text-amber-300 hover:bg-amber-500/10 disabled:opacity-50">{daoBusy ? 'measuring...' : 'put the five questions to this pair\'s history'}</button>
+                    {daoRep && !daoRep.ok && <div className="text-rose-300">{daoRep.error}</div>}
+                    {daoRep?.ok && [daoRep.q1, daoRep.q2, daoRep.q3, daoRep.q4, daoRep.q5].map((q, i) => q && <div key={i} className="rounded border border-[#1c2739] p-1"><div className="text-amber-200/90">{i + 1}. {q.question}</div><div className="text-[#7c8aa5]">{q.answer}</div></div>)}
+                  </>
+                )}
+              </div>
+            )}
+            {storyView === 'chess' && (
+              <div className="space-y-1">
+                {!chRes && <div className="text-[#7c8aa5]">setting up the board...</div>}
+                {chRes && !chRes.ok && <div className="text-rose-300">{chRes.error ?? 'no read'}</div>}
+                {chRes?.ok && chRes.verdict && (
+                  <>
+                    <div className={`flex items-center justify-between rounded border px-1.5 py-1 ${chRes.verdict.dir === 'call' ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-300' : chRes.verdict.dir === 'put' ? 'border-rose-500/50 bg-rose-500/10 text-rose-300' : 'border-[#1c2739] text-[#7c8aa5]'}`}>
+                      <span className="font-bold">{chRes.verdict.dir === 'none' ? 'CHESS: WAIT' : `CHESS: ${chRes.verdict.dir.toUpperCase()} ${chRes.verdict.strength}/100`}</span>
+                      <span>{chRes.position?.label} · best {chRes.think?.best} {chRes.think ? chRes.think.bestEv.toFixed(2) : ''}R{chRes.otc ? ' · OTC' : ''}</span>
+                    </div>
+                    <div className="space-y-1">{(chRes.lines ?? []).map((l, i) => <div key={i} className="rounded border border-[#1c2739] p-1 text-[#9fb0cc]">{l}</div>)}</div>
+                    <button onClick={runChessReport} disabled={chBusy} className="rounded border border-amber-500/40 px-1.5 py-px text-[8px] text-amber-300 hover:bg-amber-500/10 disabled:opacity-50">{chBusy ? 'measuring...' : 'test each tactic on this pair\'s history'}</button>
+                    {chRep && !chRep.ok && <div className="text-rose-300">{chRep.error}</div>}
+                    {chRep?.ok && Object.entries(chRep.tactics ?? {}).map(([k, v]) => <div key={k} className="rounded border border-[#1c2739] p-1"><div className="text-amber-200/90">{k} ({v.n})</div><div className="text-[#7c8aa5]">{v.answer}</div></div>)}
+                  </>
+                )}
               </div>
             )}
             {storyView === 'ed' && (
