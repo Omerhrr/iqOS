@@ -540,4 +540,24 @@ pos.target = tp.target
 expiry = 1
 `,
   },
+  {
+    id: 'meta:builtin-trading-plan-otc',
+    name: 'Builtin: plan setup + OTC pm + Heikin Ashi filter',
+    script: `
+# TRADING PLAN SETUP + OTC pm + HEIKIN ASHI FILTER, for OTC pairs. Same split as the real-market version: the plan (trading.plan) only says WHERE conditions are favourable (fresh trend, away from avoid zones, stop/target from its levels);
+# the Heikin Ashi candle filters; story.otcpm (tick imbalance, path efficiency, run persistence, no volume) is what trades. OTC quotes are broker-generated, so none of this is proven to carry an edge:
+# run /plan_research, /ha_filter_report and the OTC pm backtest on your recorded ticks per pair first. Use with poolMode "setups" so the plan scan hands it only favourable OTC pairs.
+let mode = "color"
+let minConf = 50
+let tp = trading.plan()
+let m = story.otcpm()
+let setup = tp.ok and tp.ready and tp.rr >= 1.2
+let ok = setup and m.ok and m.validated and m.bucketN >= 20 and m.strength >= minConf and m.alignment != "conflict"
+call when ok and tp.allowCall and m.direction == "call" and not m.atResistance and story.haFilter("call", mode).pass
+put when ok and tp.allowPut and m.direction == "put" and not m.atSupport and story.haFilter("put", mode).pass
+pos.stop = tp.stop
+pos.target = tp.target
+expiry = 1
+`,
+  },
 ]
