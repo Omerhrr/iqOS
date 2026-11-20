@@ -1439,7 +1439,7 @@ export default function ChartPanel({
       grid: { vertLines: { color: GRID }, horzLines: { color: GRID } },
       crosshair: { mode: 0, vertLine: { color: '#3b82a0', labelBackgroundColor: '#0f2733' }, horzLine: { color: '#3b82a0', labelBackgroundColor: '#0f2733' } },
       rightPriceScale: { borderColor: '#1c2739', scaleMargins: { top: 0.08, bottom: 0.22 }, minimumWidth: 64 },
-      timeScale: { borderColor: '#1c2739', timeVisible: true, secondsVisible: true, rightOffset: 6 },
+      timeScale: { borderColor: '#1c2739', timeVisible: true, secondsVisible: true, rightOffset: (() => { try { const v = Number(localStorage.getItem('iqos.chart.shift')); return Number.isFinite(v) && v >= 0 && v <= 200 ? v : 12 } catch { return 12 } })() },
     })
     chartRef.current = chart
     const unsyncMain = registerSyncChart(chart, true)
@@ -2939,6 +2939,16 @@ export default function ChartPanel({
   const [showStory, setShowStory] = useState(false)
   // DR: drawing tools (components/os/DrawingLayer.tsx)
   const [showDraw, setShowDraw] = useState(false)
+  // SHIFT: empty bars kept to the right of the newest candle so the last candle / lines / indicators are not jammed against the price axis. Remembered per browser.
+  const [shift, setShift] = useState<number>(() => { try { const v = Number(localStorage.getItem('iqos.chart.shift')); return Number.isFinite(v) && v >= 0 && v <= 200 ? v : 12 } catch { return 12 } })
+  useEffect(() => {
+    try { localStorage.setItem('iqos.chart.shift', String(shift)) } catch { /* private window */ }
+    const ts = chartRef.current?.timeScale()
+    if (!ts) return
+    ts.applyOptions({ rightOffset: shift })
+    // keep the view where the user is: only snap to the live edge when they are already at it
+    try { const pos = ts.scrollPosition(); if (pos !== null && pos >= -2) ts.scrollToRealTime() } catch { /* chart not ready */ }
+  }, [shift])
   const [hostEl, setHostEl] = useState<HTMLDivElement | null>(null)
   const hostRef = useCallback((el: HTMLDivElement | null) => { elRef.current = el; setHostEl(el) }, [])
   const [storyRes, setStoryRes] = useState<StoryRes | null>(null)
@@ -3102,6 +3112,7 @@ export default function ChartPanel({
 
   const fitChart = () => {
     chartRef.current?.timeScale().fitContent()
+    chartRef.current?.timeScale().applyOptions({ rightOffset: shift })
     chartRef.current?.timeScale().scrollToRealTime()
   }
 
@@ -3182,6 +3193,11 @@ export default function ChartPanel({
         >
           SCR
         </button>
+        <span title="Shift: empty bars to the right of the newest candle (so price, lines and indicators do not hide against the price axis). Click - / + to change; remembered." className="flex h-6 items-center overflow-hidden rounded border border-[#1c2739] bg-[#0d1420]/90 font-mono text-[8px] font-bold text-[#7c8aa5]">
+          <button onClick={() => setShift((v) => Math.max(0, v - 3))} className="h-full px-1.5 hover:bg-[#16223a] hover:text-[#cfe3ff]">-</button>
+          <span className="min-w-[2.2rem] text-center">⇥{shift}</span>
+          <button onClick={() => setShift((v) => Math.min(200, v + 3))} className="h-full px-1.5 hover:bg-[#16223a] hover:text-[#cfe3ff]">+</button>
+        </span>
         <button
           onClick={() => setShowDraw((v) => !v)}
           title="Drawing tools: trendline, ray, arrow, horizontal / vertical line, box, fib retracement, text. Drag, reshape, recolour and delete them like TradingView."
