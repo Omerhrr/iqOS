@@ -454,7 +454,8 @@ expiry = 1
 # NEXT MOVE. Price's own map (yesterday/today levels, gap, session, last session), causes (zones, regression, bull/bear structure) and what the closest historical fingerprints did next.
 # Trades only when the walk-forward record beat chance (validated), the call agrees with the pm cause->effect read (or pm has no view), and the level above/below is not the likelier first target.
 # A count of what followed similar-looking moments, not an understanding of why: backtest per pair first.
-let minConf = 45
+# minConf was 45: on noisy data 45+ almost never happens; 30+ with a validated walk-forward record is the working gate (n.blocksText says why it stayed quiet)
+let minConf = 30
 let n = story.nm(5)
 let ok = n.ok and n.validated and n.strength >= minConf and n.pmAlignment != "conflict"
 call when ok and n.direction == "call" and n.pUpFirst >= n.pDownFirst

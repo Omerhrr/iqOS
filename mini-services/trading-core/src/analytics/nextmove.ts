@@ -20,7 +20,7 @@ export type NmSession = 'asia' | 'london' | 'ny' | 'off'
 export interface NmResult {
   ok: boolean
   error?: string
-  nm: { dir: 'call' | 'put' | 'none'; sign: number; prob: number; horizonProb: number; moveAtr: number; confidence: number; validated: boolean; price: number }
+  nm: { dir: 'call' | 'put' | 'none'; sign: number; prob: number; horizonProb: number; moveAtr: number; confidence: number; validated: boolean; price: number; blocks: string[] }
   validation: { neighbors: number; pool: number; nearDist: number; trackN: number; trackHit: number; validated: boolean }
   reach: { upLevel: number; upDist: number; downLevel: number; downDist: number; pUpFirst: number; pDownFirst: number; pNeither: number }
   map: { prevOpen: number; prevHigh: number; prevLow: number; prevClose: number; dayOpen: number; dayHigh: number; dayLow: number; rangePos: number; gapAtr: number; session: NmSession; sessionMoveAtr: number; lastSession: NmSession | 'none'; lastSessionMoveAtr: number; lastSessionEndAtr: number; clock: boolean }
@@ -147,7 +147,7 @@ function holdStat(c: NmCandle[], level: (i: number) => number, side: 'res' | 'su
 
 export function readNextMove(candles: NmCandle[], opts: NmOptions = {}): NmResult {
   const H = Math.max(2, Math.min(30, Math.round(opts.horizon ?? 5))), kWant = opts.k ?? 30, trackN = opts.track ?? (opts.otc ? 150 : 90), minHistory = opts.minHistory ?? 150, otc = !!opts.otc
-  const nul: NmResult = { ok: false, nm: { dir: 'none', sign: 0, prob: 0.5, horizonProb: 0.5, moveAtr: 0, confidence: 0, validated: false, price: NaN }, validation: { neighbors: 0, pool: 0, nearDist: NaN, trackN: 0, trackHit: NaN, validated: false }, reach: { upLevel: NaN, upDist: NaN, downLevel: NaN, downDist: NaN, pUpFirst: 0.5, pDownFirst: 0.5, pNeither: 0 }, map: { prevOpen: NaN, prevHigh: NaN, prevLow: NaN, prevClose: NaN, dayOpen: NaN, dayHigh: NaN, dayLow: NaN, rangePos: 0.5, gapAtr: 0, session: 'off', sessionMoveAtr: 0, lastSession: 'none', lastSessionMoveAtr: 0, lastSessionEndAtr: 0, clock: false }, causes: { structure: 'mixed', regSlope: 0, regZ: 0, regR2: 0, exhaustion: 0, lastLegAtr: 0, atSupport: false, atResistance: false, bias: 'none' }, ledger: { dayHighHold: 0.5, dayHighN: 0, dayLowHold: 0.5, dayLowN: 0, supHold: 0.5, supN: 0, resHold: 0.5, resN: 0 }, text: '' }
+  const nul: NmResult = { ok: false, nm: { dir: 'none', sign: 0, prob: 0.5, horizonProb: 0.5, moveAtr: 0, confidence: 0, validated: false, price: NaN, blocks: [] }, validation: { neighbors: 0, pool: 0, nearDist: NaN, trackN: 0, trackHit: NaN, validated: false }, reach: { upLevel: NaN, upDist: NaN, downLevel: NaN, downDist: NaN, pUpFirst: 0.5, pDownFirst: 0.5, pNeither: 0 }, map: { prevOpen: NaN, prevHigh: NaN, prevLow: NaN, prevClose: NaN, dayOpen: NaN, dayHigh: NaN, dayLow: NaN, rangePos: 0.5, gapAtr: 0, session: 'off', sessionMoveAtr: 0, lastSession: 'none', lastSessionMoveAtr: 0, lastSessionEndAtr: 0, clock: false }, causes: { structure: 'mixed', regSlope: 0, regZ: 0, regR2: 0, exhaustion: 0, lastLegAtr: 0, atSupport: false, atResistance: false, bias: 'none' }, ledger: { dayHighHold: 0.5, dayHighN: 0, dayLowHold: 0.5, dayLowN: 0, supHold: 0.5, supN: 0, resHold: 0.5, resN: 0 }, text: '' }
   const c = candles.filter((x) => x && [x.time, x.open, x.high, x.low, x.close].every((v) => Number.isFinite(v))).slice(-MAX_BARS)
   if (c.length < minHistory) return { ...nul, error: `needs ${minHistory} closed bars, have ${c.length}`, text: `needs ${minHistory} closed bars, have ${c.length}` }
   const B = build(c), n = c.length, t = n - 1, f = B.feats[t]
@@ -223,7 +223,18 @@ export function readNextMove(candles: NmCandle[], opts: NmOptions = {}): NmResul
   return {
     ok: !!v,
     ...(v ? {} : { error: 'too few similar moments in history' }),
-    nm: { dir, sign: dir === 'call' ? 1 : dir === 'put' ? -1 : 0, prob, horizonProb: hProb, moveAtr: move, confidence: conf, validated, price: px },
+    nm: { dir, sign: dir === 'call' ? 1 : dir === 'put' ? -1 : 0, prob, horizonProb: hProb, moveAtr: move, confidence: conf, validated, price: px, blocks: (() => {
+      // WHY a strategy may not fire: each gate stated, so a quiet nm is explained instead of mysterious
+      const b: string[] = []
+      if (!v) b.push('too few comparable past moments (needs 40+)')
+      else {
+        if (dir === 'none') b.push('the similar moments split about evenly (no lean)')
+        if (!validated) b.push(`walk-forward not yet beating chance (${tn} calls${tn ? `, ${(trackHit * 100).toFixed(0)}%` : ''})`)
+        if (dir !== 'none' && conf < 30) b.push(`edge too small (confidence ${conf}, needs 30)`)
+        if (v.near > 1.6) b.push('the closest past moments are not very close')
+      }
+      return b
+    })() },
     validation: { neighbors: v?.k ?? 0, pool: v?.pool ?? 0, nearDist: v?.near ?? NaN, trackN: tn, trackHit, validated },
     reach: { upLevel: above ?? NaN, upDist, downLevel: below ?? NaN, downDist, pUpFirst: pUp, pDownFirst: pDn, pNeither: pNo },
     map: { prevOpen: p?.o ?? NaN, prevHigh: p?.h ?? NaN, prevLow: p?.l ?? NaN, prevClose: p?.c ?? NaN, dayOpen, dayHigh, dayLow, rangePos, gapAtr, session: ses, sessionMoveAtr: sessionMove, lastSession: lastSes, lastSessionMoveAtr: lsMove, lastSessionEndAtr: lsEnd, clock: B.clock },

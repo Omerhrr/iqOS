@@ -6496,7 +6496,7 @@ function storyNm(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
   let pm: ReturnType<typeof readCauseEffect> | null = null
   try { pm = readCauseEffect(cs, ctx.liveTicks, { otc }) } catch { pm = null }
   const cb = combineNmPm(r, pm && pm.ok ? pm : null)
-  return bundleValue({ ok: r.ok, error: r.ok ? '' : (r.error ?? ''), direction: r.nm.dir, prob: r.nm.prob, horizonProb: r.nm.horizonProb, moveAtr: r.nm.moveAtr, strength: r.nm.confidence, validated: r.nm.validated,
+  return bundleValue({ ok: r.ok, error: r.ok ? '' : (r.error ?? ''), direction: r.nm.dir, blocksText: r.nm.blocks.join('; '), fireable: r.nm.dir !== 'none' && r.nm.validated && r.nm.confidence >= 30, prob: r.nm.prob, horizonProb: r.nm.horizonProb, moveAtr: r.nm.moveAtr, strength: r.nm.confidence, validated: r.nm.validated,
     trackN: r.validation.trackN, trackHit: r.validation.trackHit, neighbors: r.validation.neighbors, pool: r.validation.pool, pUpFirst: r.reach.pUpFirst, pDownFirst: r.reach.pDownFirst, pNeither: r.reach.pNeither,
     upLevel: r.reach.upLevel, upDist: r.reach.upDist, downLevel: r.reach.downLevel, downDist: r.reach.downDist, structure: r.causes.structure, bias: r.causes.bias, regSlope: r.causes.regSlope, regR2: r.causes.regR2,
     regZ: r.causes.regZ, exhaustion: r.causes.exhaustion, lastLegAtr: r.causes.lastLegAtr, atSupport: r.causes.atSupport, atResistance: r.causes.atResistance, rangePos: r.map.rangePos, gapAtr: r.map.gapAtr,
