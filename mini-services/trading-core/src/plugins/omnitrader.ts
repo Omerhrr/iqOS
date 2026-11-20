@@ -48,6 +48,7 @@ import type { MetaStrategyService } from './metastrategy'
 import type { MslBarValue } from '../analytics/strategylang'
 import type { OsMode } from './os-mode'
 import { SweepEdgeMemory } from '../analytics/edge'
+import { correlatedWith, ScanRotation } from '../analytics/correlation'
 
 /** Same liquid-first default watchlist Meta Trader's own candidatePool()
  * uses - duplicated rather than imported, same dependency-isolation
@@ -57,7 +58,7 @@ const LIQUID_CANDIDATES = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'XAUUSD', 'BT
 /** Bound on how many assets one tick evaluates - a universe spike shouldn't
  * turn one fast cycle into a multi-second stall (this engine's whole point
  * is a TIGHT loop, so this cap is smaller than Meta Trader's 50). */
-const MAX_TICK_ASSETS = 12
+const MAX_TICK_ASSETS = 24 // default scan window; configurable (`scanBatch`, 6-150) - each tick evaluates this many, in a shuffled rotation over every open pair
 /** Up to this many ranked candidates get a REAL placeOrder attempt per
  * tick, same reasoning as Meta Trader's MAX_PLACE_ATTEMPTS_PER_TICK. */
 const MAX_PLACE_ATTEMPTS_PER_TICK = 3
@@ -100,6 +101,10 @@ export interface OmniTraderConfig {
   /** explicit watchlist override - undefined = the same liquid-first
    * default pool Meta Trader uses, capped at MAX_TICK_ASSETS. */
   assets?: string[]
+  /** how many pairs each tick evaluates (6-150). The pool is shuffled and visited in windows of this size, so every open pair gets looked at over successive ticks. */
+  scanBatch?: number
+  /** don't open a trade that duplicates the exposure of one this trader already has open (same-sign exposure to a currency / metals / crypto, see analytics/correlation.ts). Default on. */
+  correlationGuard?: boolean
 }
 
 export interface OmniTraderRuntime {
@@ -133,6 +138,8 @@ const DEFAULT_OMNI_TRADER: OmniTraderConfig = {
   marketScope: 'all',
   cooldownSec: 0,
   globalCooldownSec: 0,
+  scanBatch: MAX_TICK_ASSETS,
+  correlationGuard: true,
   useScriptExpiry: false,
   intervalMs: DEFAULT_INTERVAL_MS,
 }
@@ -206,6 +213,8 @@ export class OmniTraderService {
         marketScope: (saved.marketScope === 'real' || saved.marketScope === 'otc' ? saved.marketScope : 'all') as 'all' | 'real' | 'otc',
         cooldownSec: Math.max(0, num(saved.cooldownSec, DEFAULT_OMNI_TRADER.cooldownSec)),
         globalCooldownSec: Math.max(0, num(saved.globalCooldownSec, DEFAULT_OMNI_TRADER.globalCooldownSec)),
+        scanBatch: Math.min(150, Math.max(6, Math.round(num(saved.scanBatch, MAX_TICK_ASSETS)))),
+        correlationGuard: saved.correlationGuard !== false,
         useScriptExpiry: saved.useScriptExpiry === true,
         intervalMs: this.clampInterval(num(saved.intervalMs, DEFAULT_OMNI_TRADER.intervalMs)),
         assets: Array.isArray(saved.assets) ? saved.assets.filter((a): a is string => typeof a === 'string') : undefined,
@@ -275,6 +284,8 @@ export class OmniTraderService {
     this.config.cooldownSec = Math.max(0, Math.round(Number(this.config.cooldownSec) || 0))
     this.config.globalCooldownSec = Math.max(0, Math.round(Number(this.config.globalCooldownSec) || 0))
     this.config.useScriptExpiry = this.config.useScriptExpiry === true
+    this.config.scanBatch = Math.min(150, Math.max(6, Math.round(Number(this.config.scanBatch) || MAX_TICK_ASSETS)))
+    this.config.correlationGuard = this.config.correlationGuard !== false
     if (patch.intervalMs !== undefined) {
       this.config.intervalMs = this.clampInterval(this.config.intervalMs)
       if (this.timer) {
@@ -292,16 +303,37 @@ export class OmniTraderService {
 
   // ---------- candidate pool ----------
 
-  private candidatePool(): string[] {
+  /** Every open in-scope asset in a stable order (the explicit watchlist, else liquid majors first). */
+  private orderedPool(): string[] {
     const open = this.market.listAssets().filter((a) => a.open && (this.config.marketScope === 'all' || (this.config.marketScope === 'otc') === Boolean(a.otc)))
     const tickers = open.map((a) => a.ticker)
     const configured = this.config.assets?.length ? this.config.assets.filter((a) => tickers.includes(a)) : undefined
-    const ordered = configured ?? [...LIQUID_CANDIDATES.filter((a) => tickers.includes(a)), ...tickers.filter((a) => !LIQUID_CANDIDATES.includes(a))]
-    return ordered
-      .slice(0, MAX_TICK_ASSETS)
+    return configured ?? [...LIQUID_CANDIDATES.filter((a) => tickers.includes(a)), ...tickers.filter((a) => !LIQUID_CANDIDATES.includes(a))]
+  }
+
+  /** THE "IT KEEPS TRADING THE SAME PAIRS" BUG: this used to be orderedPool().slice(0, 12) every tick, so only the six liquid majors plus the first six listed were EVER looked at and the other ~100
+   * open instruments never got a single evaluation. The pool now ROTATES: each tick scans a window of MAX_TICK_ASSETS starting at a cursor that advances after every scan, so over successive ticks
+   * every open instrument is evaluated (a watchlist of 12 or fewer is unchanged - the window is the whole list). */
+  private candidatePool(): string[] {
+    const window = this.rotation.current(this.orderedPool(), this.scanBatch())
+    return window
       .filter((a) => !this.hasOpenOn(a))
       .filter((a) => (this.assetCooldownUntil.get(a) ?? 0) <= this.now())
       .filter((a) => (this.rejectedUntil.get(a) ?? 0) <= this.now())
+  }
+  private rotation = new ScanRotation()
+  private scanBatch(): number { return Math.min(150, Math.max(6, Math.round(this.config.scanBatch ?? MAX_TICK_ASSETS))) }
+  /** assets looked at since the last (re)arm: a rotated-in asset's FIRST look only baselines a signal that is already standing (it predates us), exactly like the cold sweep does for the first ones */
+  private seen = new Set<string>()
+  private lastTradedAt = new Map<string, number>()
+  private advanceCursor(): void { this.rotation.advance(this.orderedPool(), this.scanBatch()) }
+  /** the open position (this trader's own) a candidate would duplicate, if any */
+  private correlatedOpen(asset: string, side: string): ReturnType<typeof correlatedWith> {
+    if (this.config.correlationGuard === false) return null
+    try {
+      const open = this.store.listPositions('open', 500).filter((p) => p.note?.startsWith(OMNI_TRADER_NOTE)).map((p) => ({ asset: p.asset, side: p.side }))
+      return correlatedWith(asset, side, open)
+    } catch { return null }
   }
 
   // ---------- live data feed ----------
@@ -345,7 +377,7 @@ export class OmniTraderService {
   watchedAssets(): string[] {
     if (!this.config.enabled || !this.config.metaStrategyId) return []
     try {
-      return this.candidatePool().slice(0, 6)
+      return this.candidatePool()
     } catch {
       return []
     }
@@ -404,12 +436,15 @@ export class OmniTraderService {
     const rows: OmniCandidate[] = []
 
     this.sweepEdge.beginSweep(`omni:${this.config.metaStrategyId}`)
+    if (this.sweepEdge.armedCold) this.seen.clear()
 
     for (const asset of assets) {
       const bar = this.liveBar(asset)
       if (!bar) continue // market closed / no forming candle right now - nothing live to feed
       const ticks = this.liveTicks(asset)
       evaluated.add(asset)
+      const firstLook = !this.seen.has(asset) // an asset's first evaluation, qualifying or not, is its baseline look
+      this.seen.add(asset)
       let result: { result: { direction: 'call' | 'put' | 'none'; confidence: number; notes: string; expiryMin?: number } }
       try {
         result = metaStrategy.evaluateLive(this.config.metaStrategyId, asset, this.config.tf, { bar, ticks, nowMs })
@@ -422,23 +457,30 @@ export class OmniTraderService {
       if (this.config.direction !== 'both' && direction !== this.config.direction) continue
       const key = SweepEdgeMemory.key(asset, direction)
       qualifying.add(key)
+      if (firstLook && !this.sweepEdge.armedCold) { this.sweepEdge.backfill(key, this.now()); continue } // first look at a rotated-in asset: a signal already standing predates us
       if (this.sweepEdge.gate(key) !== 'trade') continue // cold sweep or already-held - not a fresh edge
       rows.push({ asset, direction, confidence, note: notes, ...(result.result.expiryMin !== undefined ? { expiryMin: result.result.expiryMin } : {}) })
     }
 
     this.sweepEdge.endSweep(evaluated, qualifying, this.now())
+    this.advanceCursor()
 
     if (!rows.length) {
       this.rt.lastRejection = evaluated.size ? `no fresh ${this.config.metaStrategyId} live edge right now (${evaluated.size} asset(s) checked)` : 'no asset has a forming candle / live tick feed right now'
       return
     }
-    rows.sort((a, b) => b.confidence - a.confidence)
+    rows.sort((a, b) => b.confidence - a.confidence || (this.lastTradedAt.get(a.asset) ?? 0) - (this.lastTradedAt.get(b.asset) ?? 0)) // ties go to the asset traded longest ago
 
-    for (let i = 0; i < Math.min(MAX_PLACE_ATTEMPTS_PER_TICK, rows.length); i++) {
-      const row = rows[i]
+    let attempts = 0
+    for (const row of rows) {
+      if (attempts >= MAX_PLACE_ATTEMPTS_PER_TICK) break
+      const dup = this.correlatedOpen(row.asset, row.direction)
+      if (dup) { this.rt.lastRejection = `${row.direction.toUpperCase()} ${row.asset} duplicates the open ${dup.side.toUpperCase()} ${dup.asset} (${dup.factors.join(', ')}) - skipped to avoid doubling one bet`; this.sweepEdge.backfill(SweepEdgeMemory.key(row.asset, row.direction), this.now()); continue } // held, so it must lapse and re-fire (not enter the stale middle) once the other position closes
+      attempts++
       const out = await this.place(row)
       if (out.ok) {
         this.sweepEdge.stamp(SweepEdgeMemory.key(row.asset, row.direction), this.now())
+        this.lastTradedAt.set(row.asset, this.now())
         this.rt.trades += 1
         this.rt.lastTradeTs = this.now()
         this.rt.openCount += 1

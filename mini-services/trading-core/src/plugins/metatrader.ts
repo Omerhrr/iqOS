@@ -77,6 +77,7 @@ import type { OsMode } from './os-mode'
 import type { Candle } from '../types'
 import { renkoBricks } from '../analytics/renko'
 import { SweepEdgeMemory } from '../analytics/edge'
+import { correlatedWith, ScanRotation } from '../analytics/correlation'
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
 const finGte = (v: number, floor: number): boolean => Number.isFinite(v) && v >= floor
@@ -88,7 +89,7 @@ const finGte = (v: number, floor: number): boolean => Number.isFinite(v) && v >=
 const LIQUID_CANDIDATES = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'XAUUSD', 'BTCUSD']
 /** Bound on how many candidates one tick evaluates - a universe spike
  * shouldn't turn one 10s tick into a multi-second stall. */
-const MAX_TICK_CANDIDATES = 50
+const MAX_TICK_CANDIDATES = 50 // default scan window (`scanBatch`, 10-150): the pool is shuffled and visited in windows of this size so every open pair is looked at over successive ticks
 /** Up to this many ranked candidates get a REAL placeOrder attempt per
  * tick before giving up - a transient broker rejection on the top pick
  * shouldn't waste the whole cycle when the next-best candidate would have
@@ -266,6 +267,10 @@ export interface MetaTraderConfig {
   cooldownSec: number
   /** GLOBAL cooldown in seconds: no new trade on ANY pair for this long after the last trade this trader placed. 0 (default) = off. Independent of the per-asset `cooldownSec`. */
   globalCooldownSec: number
+  /** pairs scanned per tick (10-150); the pool rotates in shuffled windows of this size */
+  scanBatch?: number
+  /** don't open a trade that duplicates the exposure of one Meta Trader already has open (analytics/correlation.ts). Default on. */
+  correlationGuard?: boolean
   /** when true, an order uses the expiry the STRATEGY asked for (`expiry = <minutes>` in its script) instead of the fixed expiry below; a signal whose script set none falls back to the fixed one. Off by default. */
   useScriptExpiry: boolean
   /** optional compounding plan - undefined (default) = fixed `stake` every trade. */
@@ -320,6 +325,8 @@ const DEFAULT_META_TRADER: MetaTraderConfig = {
   marketScope: 'all',
   cooldownSec: 0,
   globalCooldownSec: 0,
+  scanBatch: MAX_TICK_CANDIDATES,
+  correlationGuard: true,
   useScriptExpiry: false,
 }
 
@@ -441,6 +448,8 @@ export class MetaTraderService {
         marketScope: saved.marketScope === 'real' || saved.marketScope === 'otc' ? saved.marketScope : 'all',
         cooldownSec: Math.max(0, Math.round(num(saved.cooldownSec, DEFAULT_META_TRADER.cooldownSec))),
         globalCooldownSec: Math.max(0, Math.round(num(saved.globalCooldownSec, DEFAULT_META_TRADER.globalCooldownSec))),
+        scanBatch: Math.min(150, Math.max(10, Math.round(num(saved.scanBatch, MAX_TICK_CANDIDATES)))),
+        correlationGuard: (saved as { correlationGuard?: unknown }).correlationGuard !== false,
         useScriptExpiry: saved.useScriptExpiry === true,
         stakePlan: MetaTraderService.sanitizeStakePlan(saved.stakePlan),
         assets: Array.isArray(saved.assets)
@@ -798,6 +807,8 @@ export class MetaTraderService {
     if (patch.cooldownSec !== undefined) this.config.cooldownSec = Math.max(0, Math.round(num(patch.cooldownSec, this.config.cooldownSec)))
     if (patch.globalCooldownSec !== undefined) this.config.globalCooldownSec = Math.max(0, Math.round(num(patch.globalCooldownSec, this.config.globalCooldownSec)))
     if (patch.useScriptExpiry !== undefined) this.config.useScriptExpiry = patch.useScriptExpiry === true
+    if (patch.scanBatch !== undefined) this.config.scanBatch = Math.min(150, Math.max(10, Math.round(num(patch.scanBatch, this.config.scanBatch ?? MAX_TICK_CANDIDATES))))
+    if (patch.correlationGuard !== undefined) this.config.correlationGuard = patch.correlationGuard !== false
     if (patch.stakePlan !== undefined) {
       const next = MetaTraderService.sanitizeStakePlan(patch.stakePlan)
       const changed = JSON.stringify(this.config.stakePlan ?? null) !== JSON.stringify(next ?? null)
@@ -833,6 +844,14 @@ export class MetaTraderService {
 
   // ---------- candidate pool ----------
 
+  /** shuffled, advancing scan window (once per tick) so every open pair is evaluated over successive ticks instead of only the first MAX */
+  private rotation = new ScanRotation()
+  private scanBatch(): number { return Math.min(150, Math.max(10, Math.round(this.config.scanBatch ?? MAX_TICK_CANDIDATES))) }
+  private correlatedOpen(asset: string, side: string): ReturnType<typeof correlatedWith> {
+    if (this.config.correlationGuard === false) return null
+    try { return correlatedWith(asset, side, this.store.listPositions('open', 500).filter((p) => p.note?.startsWith(META_TRADER_NOTE)).map((p) => ({ asset: p.asset, side: p.side }))) } catch { return null }
+  }
+
   private candidatePool(): string[] {
     const open = this.market.listAssets().filter((a) => a.open && (this.config.marketScope === 'all' || (this.config.marketScope === 'otc') === Boolean(a.otc)))
     const tickers = open.map((a) => a.ticker)
@@ -842,8 +861,8 @@ export class MetaTraderService {
     // through to the same liquid-first, market-wide default as before.
     const configured = this.config.assets?.length ? this.config.assets.filter((a) => tickers.includes(a)) : undefined
     const ordered = configured ?? [...LIQUID_CANDIDATES.filter((a) => tickers.includes(a)), ...tickers.filter((a) => !LIQUID_CANDIDATES.includes(a))]
-    return ordered
-      .slice(0, MAX_TICK_CANDIDATES)
+    return this.rotation
+      .current(ordered, this.scanBatch())
       .filter((a) => !this.hasOpenOn(a))
       .filter((a) => (this.assetCooldownUntil.get(a) ?? 0) <= this.now())
       .filter((a) => (this.rejectedUntil.get(a) ?? 0) <= this.now())
@@ -874,6 +893,7 @@ export class MetaTraderService {
       /* no mode plugin - treat as human (safe default), nothing trades */
     }
     if (mode !== 'auto') return
+    try { const all = this.market.listAssets().filter((a) => a.open && (this.config.marketScope === 'all' || (this.config.marketScope === 'otc') === Boolean(a.otc))).map((a) => a.ticker); this.rotation.advance(this.config.assets?.length ? this.config.assets.filter((a) => all.includes(a)) : [...LIQUID_CANDIDATES.filter((a) => all.includes(a)), ...all.filter((a) => !LIQUID_CANDIDATES.includes(a))], this.scanBatch()) } catch { /* market unavailable - keep the current window */ }
     if (this.config.stakePlan && this.rt.halted) {
       this.rt.lastRejection = 'compound cycle halted on a loss - restart to trade again'
       return
@@ -903,8 +923,12 @@ export class MetaTraderService {
     }
 
     let refreshedAssetsThisTick = false
-    for (let i = 0; i < Math.min(MAX_PLACE_ATTEMPTS_PER_TICK, candidates.length); i++) {
-      const row = candidates[i]
+    let attempts = 0
+    for (const row of candidates) {
+      if (attempts >= MAX_PLACE_ATTEMPTS_PER_TICK) break
+      const dup = this.correlatedOpen(row.asset, row.direction)
+      if (dup) { this.rt.lastRejection = `${row.direction.toUpperCase()} ${row.asset} duplicates the open ${dup.side.toUpperCase()} ${dup.asset} (${dup.factors.join(', ')}) - skipped to avoid doubling one bet`; this.sweepEdge.backfill(SweepEdgeMemory.key(row.asset, row.direction), this.now()); continue }
+      attempts++
       const out = await this.place(row)
       if (out.ok) {
         // P1 AUDIT FIX: the edge is consumed on EXECUTION - this (asset,

@@ -58,6 +58,7 @@ import { getStrategy, defaultParams, STRATEGIES } from '../strategies/builtin'
 import { classifyRegime } from '../analytics/regime'
 import { classifySession } from '../analytics/session'
 import { SweepEdgeMemory } from '../analytics/edge'
+import { relatedAssets, ScanRotation } from '../analytics/correlation'
 import { fitLeadLag, projectLeadLagSignal, LEADLAG_GROUPS, LEADLAG_MIN_ABS_CORRELATION, LEADLAG_MIN_TRIGGER_Z, LEADLAG_LOOKBACK_BARS } from '../analytics/leadlag'
 import { fitCointegration, COINTEGRATION_WINDOW, COINTEGRATION_MIN_R2, COINTEGRATION_MIN_TSTAT, COINTEGRATION_MAX_HALFLIFE } from '../analytics/cointegration'
 import { findTriangles, fitTriangulationFromCandles, TRIANGULATION_WINDOW, TRIANGULATION_Z_ENTRY, type TriangleCandidate } from '../analytics/triangulation'
@@ -885,6 +886,7 @@ export class ModeService {
     // manager block, insufficient funds, a real misconfiguration) still
     // stands down immediately, unchanged - those aren't "try a different
     // pair" situations.
+    this.poolRotation.reshuffle()
     let lastReason = 'no signal meets the auto-trader thresholds yet'
     let refreshedAssetsThisTick = false
     for (let attempt = 0; attempt < ModeService.MAX_PLACE_ATTEMPTS_PER_TICK; attempt++) {
@@ -3259,10 +3261,16 @@ export class ModeService {
    * Same semantics assetBlocked enforces per-asset below, applied once so a
    * candidate loop isn't wasting cycles on assets it can never trade. */
   private candidatePool(open: string[]): string[] {
-    if (!this.config.watchlist.length) return open
-    const exclude = this.config.watchlistMode === 'exclude'
-    return exclude ? open.filter((a) => !this.config.watchlist.includes(a)) : open.filter((a) => this.config.watchlist.includes(a))
+    let base = open
+    if (this.config.watchlist.length) {
+      const exclude = this.config.watchlistMode === 'exclude'
+      base = exclude ? open.filter((a) => !this.config.watchlist.includes(a)) : open.filter((a) => this.config.watchlist.includes(a))
+    }
+    // SHUFFLED, stable within a tick (reshuffled once per tick in autoTraderTick): sources that stop at the first qualifying pair used to always visit the liquid majors first,
+    // so the same few pairs won every time. Now every open pair has the same chance to be the first looked at.
+    return this.poolRotation.ordered(base)
   }
+  private poolRotation = new ScanRotation()
 
   /** The strategy label a non-'strategy' source always trades under - fixed
    * per signalSource, exactly what place() tags the resulting position with
@@ -3402,13 +3410,14 @@ export class ModeService {
    * not two "diversified" ones. */
   private correlationBlocked(asset: string): boolean {
     const group = ModeService.correlationGroupOf(asset)
-    if (group === null) return false
     try {
       const openAssets = this.store
         .listPositions('open', 500)
         .filter((p) => p.note?.startsWith('auto:') && p.asset !== asset)
         .map((p) => p.asset)
-      return openAssets.some((a) => ModeService.correlationGroupOf(a) === group)
+      // the fixed groups (as before) PLUS the exposure rule (analytics/correlation.ts relatedAssets: a shared non-USD currency, both metals, both crypto, or both on the same side of USD),
+      // so e.g. an open EURUSD also blocks AUDUSD / EURJPY even though no hand-made group listed them together
+      return openAssets.some((a) => (group !== null && ModeService.correlationGroupOf(a) === group) || relatedAssets(asset, a))
     } catch {
       return false
     }

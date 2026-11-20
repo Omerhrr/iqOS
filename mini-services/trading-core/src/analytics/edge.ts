@@ -200,6 +200,12 @@ export class SweepEdgeMemory {
     this.memory.set(key, { origin: 'executed', ts })
   }
 
+  /** First sight of an asset AFTER the cold sweep (a rotating scan reaches new assets later): a signal already standing when we first look predates us, so it is recorded as held
+   * (origin 'backfill') and not traded - the same arm-time rule the cold sweep applies to the assets it saw first. */
+  backfill(key: string, ts = 0): void {
+    if (!this.memory.has(key)) this.memory.set(key, { origin: 'backfill', ts })
+  }
+
   /** (Re)arm: whatever qualifies on the next sweep predates this arm. */
   rearm(): void {
     this.cold = true
