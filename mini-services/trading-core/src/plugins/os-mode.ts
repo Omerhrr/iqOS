@@ -59,6 +59,7 @@ import { classifyRegime } from '../analytics/regime'
 import { classifySession } from '../analytics/session'
 import { SweepEdgeMemory } from '../analytics/edge'
 import { relatedAssets, ScanRotation } from '../analytics/correlation'
+import { scanSetups, excludeHeld, SetupCache } from '../analytics/setupscan'
 import { fitLeadLag, projectLeadLagSignal, LEADLAG_GROUPS, LEADLAG_MIN_ABS_CORRELATION, LEADLAG_MIN_TRIGGER_Z, LEADLAG_LOOKBACK_BARS } from '../analytics/leadlag'
 import { fitCointegration, COINTEGRATION_WINDOW, COINTEGRATION_MIN_R2, COINTEGRATION_MIN_TSTAT, COINTEGRATION_MAX_HALFLIFE } from '../analytics/cointegration'
 import { findTriangles, fitTriangulationFromCandles, TRIANGULATION_WINDOW, TRIANGULATION_Z_ENTRY, type TriangleCandidate } from '../analytics/triangulation'
@@ -288,6 +289,10 @@ export interface AutoTraderConfig {
    * turned off - this is a pure risk reduction with no tradeoff besides
    * occasionally standing aside for a pair with no open slot. */
   correlationGuard?: boolean
+  /** 'all' (default) = every open pair is a candidate; 'setups' = only pairs the TRADING PLAN scan finds in a favourable setup (trend not gone too far, away from avoid zones), minus pairs/exposure already held. Rescanned every setupScanSec and whenever a position opens/closes. */
+  poolMode?: 'all' | 'setups'
+  setupScanSec?: number
+  setupMinQuality?: number
   /** Benches a (strategy, pair) combo after a run of consecutive losses -
    * independent of the daily $ loss limit, which only trips on aggregate
    * P&L and can take a while to notice "this one setup stopped working this
@@ -683,6 +688,9 @@ export class ModeService {
           marketScope: c.marketScope === 'real' || c.marketScope === 'otc' ? c.marketScope : 'all',
           smartStaking: typeof c.smartStaking === 'boolean' ? c.smartStaking : false,
           correlationGuard: typeof c.correlationGuard === 'boolean' ? c.correlationGuard : true,
+          poolMode: c.poolMode === 'setups' ? 'setups' : 'all',
+          setupScanSec: clamp(num(c.setupScanSec, 30), 5, 600),
+          setupMinQuality: clamp(num(c.setupMinQuality, 0), 0, 100),
           streakBreaker: typeof c.streakBreaker === 'boolean' ? c.streakBreaker : true,
           avoidDeadHours: typeof c.avoidDeadHours === 'boolean' ? c.avoidDeadHours : false,
           minPayoutPct: clamp(num(c.minPayoutPct, DEFAULT_AUTOTRADER.minPayoutPct ?? 70), 0, 98),
@@ -3268,9 +3276,28 @@ export class ModeService {
     }
     // SHUFFLED, stable within a tick (reshuffled once per tick in autoTraderTick): sources that stop at the first qualifying pair used to always visit the liquid majors first,
     // so the same few pairs won every time. Now every open pair has the same chance to be the first looked at.
-    return this.poolRotation.ordered(base)
+    const ordered = this.poolRotation.ordered(base)
+    if (this.config.poolMode === 'setups') return this.setupPool(ordered)
+    return ordered
   }
   private poolRotation = new ScanRotation()
+  private setups = new SetupCache()
+  private setupsOpenSig = ''
+  /** TRADING PLAN as the pool: favourable setups, best first, excluding pairs/exposure the auto-trader already holds. Rescans when positions change (a trade was taken) so the next market is a different one. */
+  private setupPool(ordered: string[]): string[] {
+    let open: Array<{ asset: string; side: string }> = []
+    try { open = this.store.listPositions('open', 500).filter((p) => p.note?.startsWith('auto:')).map((p) => ({ asset: p.asset, side: p.side })) } catch { open = [] }
+    const sig = open.map((o) => o.asset + o.side).sort().join(',')
+    if (sig !== this.setupsOpenSig) { this.setupsOpenSig = sig; this.setups.invalidate() }
+    const market = this.ctx.use<MarketDataService>('market')
+    const rows = this.setups.get(this.now(), this.config.setupScanSec ?? 30, () => scanSetups(
+      market.listAssets().filter((a) => ordered.includes(a.ticker)),
+      (t) => { try { return market.getCandlesDeep(t, this.config.tf, 500, true) ?? [] } catch { return [] } },
+      { minQuality: this.config.setupMinQuality ?? 0 },
+    ))
+    const left = this.config.correlationGuard === false ? rows.filter((r) => !open.some((o) => o.asset === r.asset)) : excludeHeld(rows, open)
+    return left.map((r) => r.asset)
+  }
 
   /** The strategy label a non-'strategy' source always trades under - fixed
    * per signalSource, exactly what place() tags the resulting position with
@@ -3804,6 +3831,9 @@ export class ModeService {
         : []
     if (patch.smartStaking !== undefined) this.config.smartStaking = Boolean(patch.smartStaking)
     if (patch.correlationGuard !== undefined) this.config.correlationGuard = Boolean(patch.correlationGuard)
+    if (patch.poolMode !== undefined) { this.config.poolMode = patch.poolMode === 'setups' ? 'setups' : 'all'; this.setups.invalidate() }
+    if (patch.setupScanSec !== undefined) this.config.setupScanSec = Math.min(600, Math.max(5, Math.round(Number(patch.setupScanSec) || 30)))
+    if (patch.setupMinQuality !== undefined) { this.config.setupMinQuality = Math.min(100, Math.max(0, Math.round(Number(patch.setupMinQuality) || 0))); this.setups.invalidate() }
     if (patch.streakBreaker !== undefined) this.config.streakBreaker = Boolean(patch.streakBreaker)
     if (patch.avoidDeadHours !== undefined) this.config.avoidDeadHours = Boolean(patch.avoidDeadHours)
     if (patch.watchlistMode !== undefined) this.config.watchlistMode = patch.watchlistMode === 'exclude' ? 'exclude' : 'only'

@@ -14,6 +14,7 @@ import { Store } from '../store'
 import { getStrategy, defaultParams } from '../strategies/builtin'
 import type { StrategyLabService } from './lab'
 import type { MetaStrategyService } from './metastrategy'
+import { readPlan } from '../analytics/tradingplan'
 import { classifyRegime } from '../analytics/regime'
 import { classifySession } from '../analytics/session'
 import { walkForward } from '../strategies/optimize'
@@ -97,6 +98,10 @@ export interface BotConfig {
    * backfill the watchlist bots do) so it never enters the stale middle of a
    * move. watchlist may be empty for sweep bots. */
   universeSweep?: boolean
+  /** TRADING PLAN gate: only take a signal when the plan finds that pair in a favourable setup on the signal's side (trend not gone too far, away from avoid zones, ready). The plan is the setup; the bot's strategy still decides the trade. For universe-sweep bots it filters the board the same way. */
+  setupGate?: boolean
+  /** minimum plan setup quality (0-100) when setupGate is on */
+  setupMinQuality?: number
   /** Max trades a single universe sweep may open (per candle-close bar).
    * The board is ranked, the bot walks down it and stops at this count.
    * Default 1 - one BEST read per bar. Clamped 1..10. */
@@ -711,6 +716,8 @@ export class AutopilotService {
           : undefined,
       streakBreaker: input.streakBreaker !== undefined ? Boolean(input.streakBreaker) : existing?.streakBreaker,
       universeSweep: input.universeSweep !== undefined ? Boolean(input.universeSweep) : existing?.universeSweep,
+      setupGate: input.setupGate !== undefined ? Boolean(input.setupGate) : existing?.setupGate,
+      setupMinQuality: input.setupMinQuality !== undefined ? clampNum(Number(input.setupMinQuality) || 0, 0, 100) : existing?.setupMinQuality,
       sweepMaxTrades:
         input.sweepMaxTrades !== undefined || existing?.sweepMaxTrades !== undefined
           ? Math.round(clampNum(input.sweepMaxTrades ?? existing?.sweepMaxTrades ?? 1, 1, 10))
@@ -860,6 +867,24 @@ export class AutopilotService {
       } catch (err) {
         this.reject(bot, `universe sweep failed: ${String((err as Error).message).slice(0, 160)}`)
       }
+    }
+  }
+
+  /** null = pass. With setupGate on, the plan must call this pair ready on the signal's side (fresh read every closed bar, so each trade is judged on the current market, not a stale scan). */
+  private planGate(bot: BotConfig, asset: string, tf: Timeframe, side: 'call' | 'put'): string | null {
+    if (!bot.setupGate) return null
+    try {
+      const candles = this.market.getCandlesDeep(asset, tf, 500, true) ?? []
+      const a = this.market.assets.find((x) => x.ticker === asset)
+      const pl = readPlan(candles, { otc: !!(a as { otc?: boolean } | undefined)?.otc, light: true })
+      if (!pl.ok) return `${asset}: plan needs more history`
+      const st = pl.setup
+      if (!st.ready) return `${asset}: no plan setup (${(st.blocks[0] ?? 'not ready').slice(0, 80)})`
+      if (st.side !== side) return `${asset}: plan setup is ${st.side}, signal is ${side}`
+      if (st.quality < (bot.setupMinQuality ?? 0)) return `${asset}: plan quality ${st.quality.toFixed(0)} < ${bot.setupMinQuality}`
+      return null
+    } catch (err) {
+      return `${asset}: plan unavailable (${String((err as Error).message).slice(0, 60)})`
     }
   }
 
@@ -1021,6 +1046,9 @@ export class AutopilotService {
     if (bot.direction !== 'both' && bot.direction !== wanted) {
       return this.reject(bot, `signal ${wanted} outside allowed direction (${bot.direction})`)
     }
+
+    const pg = this.planGate(bot, asset, tf, wanted)
+    if (pg) return this.reject(bot, pg)
 
     // ARM-TIME BACKFILL: the first evaluation after (re)arm or a kernel
     // restart only tells us the condition is ALREADY true - not when it
@@ -1296,6 +1324,10 @@ export class AutopilotService {
       // signal, not a fresh one
       if (rt.sweepDir.get(row.asset) === wanted) continue
       if (bot.direction !== 'both' && bot.direction !== wanted) continue
+      {
+        const pg = this.planGate(bot, row.asset, bot.tf, wanted)
+        if (pg) { if (!firstBlock) firstBlock = pg; continue }
+      }
       if (row.confidence < minConf) {
         if (!firstBlock) firstBlock = `${row.asset} conf ${row.confidence.toFixed(0)}% < floor ${minConf}%`
         continue
