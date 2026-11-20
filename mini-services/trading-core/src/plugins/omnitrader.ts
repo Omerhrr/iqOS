@@ -49,6 +49,7 @@ import type { MslBarValue } from '../analytics/strategylang'
 import type { OsMode } from './os-mode'
 import { SweepEdgeMemory } from '../analytics/edge'
 import { correlatedWith, ScanRotation } from '../analytics/correlation'
+import { scanSetups, excludeHeld, SetupCache } from '../analytics/setupscan'
 
 /** Same liquid-first default watchlist Meta Trader's own candidatePool()
  * uses - duplicated rather than imported, same dependency-isolation
@@ -105,6 +106,13 @@ export interface OmniTraderConfig {
   scanBatch?: number
   /** don't open a trade that duplicates the exposure of one this trader already has open (same-sign exposure to a currency / metals / crypto, see analytics/correlation.ts). Default on. */
   correlationGuard?: boolean
+  /** 'all' = every open pair is a candidate (shuffled windows); 'setups' = the TRADING PLAN scan decides the pool: only pairs in a favourable setup (trend not gone too far, away from avoid zones) are given to the strategy,
+   * and after every trade the scan is redone without the pair just traded or anything that duplicates its exposure. */
+  poolMode?: 'all' | 'setups'
+  /** how long a setup scan is reused (seconds) before it is redone; a trade always forces a rescan. */
+  setupScanSec?: number
+  /** only setups at or above this quality (0-100) enter the pool */
+  setupMinQuality?: number
 }
 
 export interface OmniTraderRuntime {
@@ -140,6 +148,9 @@ const DEFAULT_OMNI_TRADER: OmniTraderConfig = {
   globalCooldownSec: 0,
   scanBatch: MAX_TICK_ASSETS,
   correlationGuard: true,
+  poolMode: 'all',
+  setupScanSec: 30,
+  setupMinQuality: 0,
   useScriptExpiry: false,
   intervalMs: DEFAULT_INTERVAL_MS,
 }
@@ -215,6 +226,9 @@ export class OmniTraderService {
         globalCooldownSec: Math.max(0, num(saved.globalCooldownSec, DEFAULT_OMNI_TRADER.globalCooldownSec)),
         scanBatch: Math.min(150, Math.max(6, Math.round(num(saved.scanBatch, MAX_TICK_ASSETS)))),
         correlationGuard: saved.correlationGuard !== false,
+        poolMode: saved.poolMode === 'setups' ? 'setups' : 'all',
+        setupScanSec: Math.min(600, Math.max(5, Math.round(num(saved.setupScanSec, 30)))),
+        setupMinQuality: Math.min(100, Math.max(0, Math.round(num(saved.setupMinQuality, 0)))),
         useScriptExpiry: saved.useScriptExpiry === true,
         intervalMs: this.clampInterval(num(saved.intervalMs, DEFAULT_OMNI_TRADER.intervalMs)),
         assets: Array.isArray(saved.assets) ? saved.assets.filter((a): a is string => typeof a === 'string') : undefined,
@@ -286,6 +300,10 @@ export class OmniTraderService {
     this.config.useScriptExpiry = this.config.useScriptExpiry === true
     this.config.scanBatch = Math.min(150, Math.max(6, Math.round(Number(this.config.scanBatch) || MAX_TICK_ASSETS)))
     this.config.correlationGuard = this.config.correlationGuard !== false
+    this.config.poolMode = this.config.poolMode === 'setups' ? 'setups' : 'all'
+    this.config.setupScanSec = Math.min(600, Math.max(5, Math.round(Number(this.config.setupScanSec) || 30)))
+    this.config.setupMinQuality = Math.min(100, Math.max(0, Math.round(Number(this.config.setupMinQuality) || 0)))
+    if (patch.poolMode !== undefined || patch.setupMinQuality !== undefined || patch.tf !== undefined) this.setups.invalidate()
     if (patch.intervalMs !== undefined) {
       this.config.intervalMs = this.clampInterval(this.config.intervalMs)
       if (this.timer) {
@@ -315,8 +333,26 @@ export class OmniTraderService {
    * open instruments never got a single evaluation. The pool now ROTATES: each tick scans a window of MAX_TICK_ASSETS starting at a cursor that advances after every scan, so over successive ticks
    * every open instrument is evaluated (a watchlist of 12 or fewer is unchanged - the window is the whole list). */
   private candidatePool(): string[] {
+    if (this.config.poolMode === 'setups') return this.setupPool()
     const window = this.rotation.current(this.orderedPool(), this.scanBatch())
     return window
+      .filter((a) => !this.hasOpenOn(a))
+      .filter((a) => (this.assetCooldownUntil.get(a) ?? 0) <= this.now())
+      .filter((a) => (this.rejectedUntil.get(a) ?? 0) <= this.now())
+  }
+  /** the TRADING PLAN as the pool: pairs in a favourable setup right now, best first, minus the pair(s) already traded and anything duplicating their exposure. Re-scanned every setupScanSec and right after a trade. */
+  private setups = new SetupCache()
+  private setupPool(): string[] {
+    const inScope = this.orderedPool()
+    const rows = this.setups.get(this.now(), this.config.setupScanSec ?? 30, () => scanSetups(
+      this.market.listAssets().filter((a) => inScope.includes(a.ticker)),
+      (t) => { try { return this.market.getCandlesDeep(t, this.config.tf, 500, true) ?? [] } catch { return [] } },
+      { minQuality: this.config.setupMinQuality ?? 0 },
+    ))
+    let open: Array<{ asset: string; side: string }> = []
+    try { open = this.store.listPositions('open', 500).filter((p) => p.note?.startsWith(OMNI_TRADER_NOTE)).map((p) => ({ asset: p.asset, side: p.side })) } catch { open = [] }
+    const left = this.config.correlationGuard === false ? rows.filter((r) => !open.some((o) => o.asset === r.asset)) : excludeHeld(rows, open)
+    return left.map((r) => r.asset).slice(0, this.scanBatch())
       .filter((a) => !this.hasOpenOn(a))
       .filter((a) => (this.assetCooldownUntil.get(a) ?? 0) <= this.now())
       .filter((a) => (this.rejectedUntil.get(a) ?? 0) <= this.now())
@@ -430,6 +466,7 @@ export class OmniTraderService {
     }
 
     const assets = this.candidatePool()
+    if (this.config.poolMode === 'setups' && !assets.length) { const st = this.setups.stats; this.rt.lastRejection = `no pair is in a favourable plan setup right now (${st.scanned} scanned, ${st.withTrend} in a trend, ${st.ready} ready before exclusions) - rescanning every ${this.config.setupScanSec}s`; this.sweepEdge.beginSweep(`omni:${this.config.metaStrategyId}`); return }
     const nowMs = Date.now()
     const evaluated = new Set<string>()
     const qualifying = new Set<string>()
@@ -457,7 +494,7 @@ export class OmniTraderService {
       if (this.config.direction !== 'both' && direction !== this.config.direction) continue
       const key = SweepEdgeMemory.key(asset, direction)
       qualifying.add(key)
-      if (firstLook && !this.sweepEdge.armedCold) { this.sweepEdge.backfill(key, this.now()); continue } // first look at a rotated-in asset: a signal already standing predates us
+      if (this.config.poolMode !== 'setups' && firstLook && !this.sweepEdge.armedCold) { this.sweepEdge.backfill(key, this.now()); continue } // first look at a rotated-in asset: a signal already standing predates us
       if (this.sweepEdge.gate(key) !== 'trade') continue // cold sweep or already-held - not a fresh edge
       rows.push({ asset, direction, confidence, note: notes, ...(result.result.expiryMin !== undefined ? { expiryMin: result.result.expiryMin } : {}) })
     }
@@ -481,6 +518,7 @@ export class OmniTraderService {
       if (out.ok) {
         this.sweepEdge.stamp(SweepEdgeMemory.key(row.asset, row.direction), this.now())
         this.lastTradedAt.set(row.asset, this.now())
+        this.setups.invalidate() // a trade was taken: rescan for the next market, without this one
         this.rt.trades += 1
         this.rt.lastTradeTs = this.now()
         this.rt.openCount += 1

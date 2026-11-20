@@ -521,4 +521,23 @@ put when ok and p.direction == "put" and story.haFilter("put", mode).pass
 expiry = 1
 `,
   },
+  {
+    id: 'meta:builtin-trading-plan',
+    name: 'Builtin: plan setup + pm + Heikin Ashi filter',
+    script: `
+# TRADING PLAN SETUP + pm + HEIKIN ASHI FILTER. The plan is not the strategy: trading.plan() only says WHERE the conditions are favourable (a trend that has not gone too far, price away from the avoid zones,
+# a stop and a target from its own levels). The strategy is pm, filtered by the Heikin Ashi candle: pm must point the same way as the plan's side, and the HA filter must let that side through.
+# Best used with Omni / Meta Trader in pool mode "setups": the plan scan hands this script only the pairs in a favourable setup, and after each trade it rescans for a different market.
+# HA mode: "color" (HA agrees, not a doji), "predict" (learned next-candle odds lean the same way) or "both". Run /plan_research and /ha_filter_report on the pair first.
+let mode = "color"
+let tp = trading.plan()
+let p = story.pm()
+let ready = tp.ok and tp.ready and tp.rr >= 1.2 and p.ok
+call when ready and tp.allowCall and p.direction == "call" and story.haFilter("call", mode).pass
+put when ready and tp.allowPut and p.direction == "put" and story.haFilter("put", mode).pass
+pos.stop = tp.stop
+pos.target = tp.target
+expiry = 1
+`,
+  },
 ]

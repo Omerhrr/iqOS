@@ -27,6 +27,7 @@ import {
 import type { AnalysisResult, Candle, ChartType, ExpirySurfaceResponse, IndicatorSeries, IvHvResponse, NextExpiryPrediction, OtcFootprintResult, OutcomeMemoryResponse, Position, PulseBarRow, PulseBarsResponse, TickBarRow, TickFootprintResult, TicksResponse, Timeframe } from '@/lib/os/client'
 import { registerSyncChart } from '@/lib/os/chartSync'
 import DrawingLayer from './DrawingLayer'
+import PlanOverlay, { type PlanResp } from './PlanOverlay'
 import { chartPriceFormat, fmtPrice, getDayLevels, getFastLevels, getExpectedMove, runMslDraw, EM_DEFAULT_PARAMS, type ExpectedMoveParams, getExpirySurface, getNextExpiry, getOtcFootprint, getOutcomeMemory, getPulseBars, getTickFootprint, osGet, TIMEFRAME_SECONDS } from '@/lib/os/client'
 
 interface ChartPanelProps {
@@ -2803,6 +2804,8 @@ export default function ChartPanel({
   // MAP toggle: MANY support/resistance levels + Fibonacci retracements mapped on the 5s chart (kernel /fast_levels) and drawn on THIS chart so a 1m trade can be read against them.
   // Green = support, red = resistance (thicker = more touches), amber dotted = Fibonacci (label shows ratio and how many legs stack there). Refreshed every 20s.
   const [showMap, setShowMap] = useState(false)
+  const [showPlan, setShowPlan] = useState(false)
+  const [planData, setPlanData] = useState<PlanResp | null>(null)
   const mapLinesRef = useRef<{ series: AnyPriceSeries; line: IPriceLine }[]>([])
   const mapTrendRef = useRef<ISeriesApi<'Line'>[]>([])
   const [mapNote, setMapNote] = useState('')
@@ -3016,6 +3019,17 @@ export default function ChartPanel({
     return () => { alive = false; window.clearInterval(t) }
   }, [showStory, storyView, digitsTicker, tf])
   const runChessReport = () => { setChBusy(true); setChRep(null); osGet<ChessRep>('/chess_research', { asset: digitsTicker, tf: tf ?? '1m', bars: 3000 }).then(setChRep).catch((e) => setChRep({ ok: false, error: String(e instanceof Error ? e.message : e).slice(0, 160) })).finally(() => setChBusy(false)) }
+  // PLAN research (/plan_research): did following the plan beat ignoring it on this pair
+  type PlanRep = { ok: boolean; error?: string; verdict?: string; groups?: Record<string, { n: number; rate: number | null; z?: number | null }> }
+  const [planRep, setPlanRep] = useState<PlanRep | null>(null)
+  const [planBusy, setPlanBusy] = useState(false)
+  const runPlanReport = () => { setPlanBusy(true); setPlanRep(null); osGet<PlanRep>('/plan_research', { asset: digitsTicker, tf: tf ?? '5m', bars: 3000 }).then(setPlanRep).catch((e) => setPlanRep({ ok: false, error: String(e instanceof Error ? e.message : e).slice(0, 160) })).finally(() => setPlanBusy(false)) }
+  // SETUP SCAN (/plan_scan): every open pair in a favourable setup, with pm + Heikin Ashi confirmation
+  type ScanRow = { asset: string; side: 'call' | 'put'; quality: number; stage: string; atEntry: boolean; pmDir?: string; haColor?: string; haOk?: boolean; confirmed?: boolean }
+  type ScanRes = { ok: boolean; error?: string; scanned?: number; inTrend?: number; ready?: number; confirmed?: number; rows?: ScanRow[] }
+  const [scanRes, setScanRes] = useState<ScanRes | null>(null)
+  const [scanBusy, setScanBusy] = useState(false)
+  const runSetupScan = () => { setScanBusy(true); setScanRes(null); osGet<ScanRes>('/plan_scan', { tf: tf ?? '5m', confirm: 1, limit: 25 }).then(setScanRes).catch((e) => setScanRes({ ok: false, error: String(e instanceof Error ? e.message : e).slice(0, 160) })).finally(() => setScanBusy(false)) }
   const [nmRes, setNmRes] = useState<NmRes | null>(null)
   const [nmHz, setNmHz] = useState('5')
   useEffect(() => {
@@ -3200,6 +3214,15 @@ export default function ChartPanel({
           MAP
         </button>
         <button
+          onClick={() => setShowPlan((v) => !v)}
+          title="Trading plan: the trend (and whether it has gone too far), every support / resistance, a vertical line at each hour, the avoid zones shaded, and the setup's entry zone / stop / target. Conditions for your strategy to trade in, not a strategy. See the PLAN tab in the Story card."
+          className={`flex h-6 w-6 items-center justify-center rounded border font-mono text-[8px] font-bold leading-none transition-colors ${
+            showPlan ? 'border-sky-500/60 bg-sky-500/15 text-sky-300' : 'border-[#1c2739] bg-[#0d1420]/90 text-[#7c8aa5] hover:border-sky-500/40'
+          }`}
+        >
+          PLAN
+        </button>
+        <button
           onClick={() => setShowEm((v) => !v)}
           onContextMenu={(e) => {
             e.preventDefault()
@@ -3279,7 +3302,7 @@ export default function ChartPanel({
               <button onClick={() => setShowStory(false)} className="text-[#7c8aa5] hover:text-white">x</button>
             </div>
             <div className="flex flex-wrap gap-0.5">
-              {[['candles', 'candles'], ['renko', 'renko'], ['kagi', 'kagi'], ['effort', 'effort'], ['ha', 'heikin'], ['tickbars', 'tick bars'], ['ticks', 'ticks'], ['baseline', 'baseline'], ['footprint', 'footprint'], ['mtf', 'MTF'], ['pm', 'PM'], ['nm', 'NM'], ['ed', 'EDITOR'], ['dao', 'DAO'], ['chess', 'CHESS']].map(([id, label]) => (
+              {[['candles', 'candles'], ['renko', 'renko'], ['kagi', 'kagi'], ['effort', 'effort'], ['ha', 'heikin'], ['tickbars', 'tick bars'], ['ticks', 'ticks'], ['baseline', 'baseline'], ['footprint', 'footprint'], ['mtf', 'MTF'], ['pm', 'PM'], ['nm', 'NM'], ['ed', 'EDITOR'], ['dao', 'DAO'], ['chess', 'CHESS'], ['plan', 'PLAN']].map(([id, label]) => (
                 <button key={id} onClick={() => setStoryView(id)} className={`rounded border px-1 py-px text-[8px] ${storyView === id ? 'border-amber-500/60 bg-amber-500/15 text-amber-300' : 'border-[#1c2739] text-[#7c8aa5] hover:text-white'}`}>{label}</button>
               ))}
             </div>
@@ -3356,6 +3379,41 @@ export default function ChartPanel({
                     {daoRep && !daoRep.ok && <div className="text-rose-300">{daoRep.error}</div>}
                     {daoRep?.ok && [daoRep.q1, daoRep.q2, daoRep.q3, daoRep.q4, daoRep.q5].map((q, i) => q && <div key={i} className="rounded border border-[#1c2739] p-1"><div className="text-amber-200/90">{i + 1}. {q.question}</div><div className="text-[#7c8aa5]">{q.answer}</div></div>)}
                   </>
+                )}
+              </div>
+            )}
+            {storyView === 'plan' && (
+              <div className="space-y-1">
+                {!showPlan && <button onClick={() => setShowPlan(true)} className="rounded border border-sky-500/40 px-1.5 py-px text-[8px] text-sky-300 hover:bg-sky-500/10">draw the plan on the chart (PLAN button)</button>}
+                {showPlan && !planData && <div className="text-[#7c8aa5]">drawing up the plan...</div>}
+                {planData && !planData.ok && <div className="text-rose-300">{planData.error ?? 'no plan'}</div>}
+                {planData?.ok && planData.setup && (
+                  <>
+                    <div className={`flex items-center justify-between rounded border px-1.5 py-1 ${planData.setup.side === 'call' ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-300' : planData.setup.side === 'put' ? 'border-rose-500/50 bg-rose-500/10 text-rose-300' : 'border-[#1c2739] text-[#7c8aa5]'}`}>
+                      <span className="font-bold">{planData.setup.ready ? `SETUP: ${planData.setup.side.toUpperCase()} side favourable (${planData.setup.quality}/100)` : 'NO SETUP'}</span>
+                      <span>{planData.trend?.dir} · {planData.trend?.stage}{planData.trend?.tooFar ? ' · TOO FAR' : planData.trend?.fresh ? ' · fresh' : ''}{planData.setup.atEntry ? ' · at entry zone' : ''}</span>
+                    </div>
+                    <div className="space-y-1">{(planData.lines ?? []).map((l, i) => <div key={i} className="rounded border border-[#1c2739] p-1 text-[#9fb0cc]">{l}</div>)}</div>
+                    <button onClick={runPlanReport} disabled={planBusy} className="rounded border border-amber-500/40 px-1.5 py-px text-[8px] text-amber-300 hover:bg-amber-500/10 disabled:opacity-50">{planBusy ? 'measuring...' : 'does being in a setup beat ignoring it? (this pair)'}</button>
+                    {planRep && !planRep.ok && <div className="text-rose-300">{planRep.error}</div>}
+                    {planRep?.ok && <div className="rounded border border-[#1c2739] p-1 text-[#7c8aa5]">{planRep.verdict}</div>}
+                    {planRep?.ok && Object.entries(planRep.groups ?? {}).map(([k, g]) => <div key={k} className="text-[#7c8aa5]">{k}: {g.n} samples, {g.rate !== null ? `${(g.rate * 100).toFixed(0)}%` : '-'}{g.z !== null && g.z !== undefined ? ` (z ${g.z.toFixed(1)})` : ''}</div>)}
+                  </>
+                )}
+                <div className="flex items-center gap-1 pt-1">
+                  <button onClick={runSetupScan} disabled={scanBusy} className="rounded border border-sky-500/40 px-1.5 py-px text-[8px] text-sky-300 hover:bg-sky-500/10 disabled:opacity-50">{scanBusy ? 'scanning every open pair...' : 'scan all pairs for setups (+ pm and Heikin Ashi)'}</button>
+                </div>
+                {scanRes && !scanRes.ok && <div className="text-rose-300">{scanRes.error}</div>}
+                {scanRes?.ok && (
+                  <div className="space-y-0.5">
+                    <div className="text-[#7c8aa5]">{scanRes.scanned} pairs scanned, {scanRes.inTrend} in a trend, {scanRes.ready} in a favourable setup, {scanRes.confirmed} confirmed by pm + Heikin Ashi (green rows)</div>
+                    {(scanRes.rows ?? []).map((r) => (
+                      <div key={r.asset} className={`flex items-center justify-between rounded border px-1.5 py-0.5 ${r.confirmed ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200' : 'border-[#1c2739] text-[#9fb0cc]'}`}>
+                        <span className="font-bold">{r.asset} <span className={r.side === 'call' ? 'text-emerald-300' : 'text-rose-300'}>{r.side.toUpperCase()}</span></span>
+                        <span>q{r.quality} · {r.stage}{r.atEntry ? ' · at entry' : ''} · pm {r.pmDir ?? '-'} · HA {r.haColor ?? '-'}{r.haOk ? ' ok' : ' no'}</span>
+                      </div>
+                    ))}
+                  </div>
                 )}
               </div>
             )}
@@ -3628,6 +3686,7 @@ export default function ChartPanel({
       </div>
 
       <div ref={hostRef} className="min-h-0 flex-1" />
+      <PlanOverlay open={showPlan} chartRef={chartRef} seriesRef={priceSeriesRef} host={hostEl} bars={candles} asset={digitsTicker} tf={tf ?? '5m'} tfSeconds={TIMEFRAME_SECONDS[tf ?? '1m'] ?? 60} onPlan={setPlanData} />
       <DrawingLayer open={showDraw} chartRef={chartRef} seriesRef={priceSeriesRef} host={hostEl} bars={candles} asset={digitsTicker} tfSeconds={TIMEFRAME_SECONDS[tf ?? '1m'] ?? 60} />
       {(chartType === 'footprint' || chartType === 'tpo' || chartType === 'otcfootprint' || chartType === 'tickfootprint' || chartType === 'volumeprofile' || chartType === 'deltaprofile' || chartType === 'pulse' || chartType === 'expiryRadar' || chartType === 'expirySurface') && (
         <div className="absolute inset-x-0 bottom-[30px] top-0 z-[5] bg-[#0b111c]">

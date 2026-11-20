@@ -78,6 +78,7 @@ import type { Candle } from '../types'
 import { renkoBricks } from '../analytics/renko'
 import { SweepEdgeMemory } from '../analytics/edge'
 import { correlatedWith, ScanRotation } from '../analytics/correlation'
+import { scanSetups, excludeHeld, SetupCache } from '../analytics/setupscan'
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
 const finGte = (v: number, floor: number): boolean => Number.isFinite(v) && v >= floor
@@ -271,6 +272,10 @@ export interface MetaTraderConfig {
   scanBatch?: number
   /** don't open a trade that duplicates the exposure of one Meta Trader already has open (analytics/correlation.ts). Default on. */
   correlationGuard?: boolean
+  /** 'all' = every open pair (shuffled windows); 'setups' = only pairs the TRADING PLAN scan says are in a favourable setup (rescanned every setupScanSec and right after a trade, without the pair just traded or anything duplicating it) */
+  poolMode?: 'all' | 'setups'
+  setupScanSec?: number
+  setupMinQuality?: number
   /** when true, an order uses the expiry the STRATEGY asked for (`expiry = <minutes>` in its script) instead of the fixed expiry below; a signal whose script set none falls back to the fixed one. Off by default. */
   useScriptExpiry: boolean
   /** optional compounding plan - undefined (default) = fixed `stake` every trade. */
@@ -327,6 +332,9 @@ const DEFAULT_META_TRADER: MetaTraderConfig = {
   globalCooldownSec: 0,
   scanBatch: MAX_TICK_CANDIDATES,
   correlationGuard: true,
+  poolMode: 'all',
+  setupScanSec: 30,
+  setupMinQuality: 0,
   useScriptExpiry: false,
 }
 
@@ -450,6 +458,9 @@ export class MetaTraderService {
         globalCooldownSec: Math.max(0, Math.round(num(saved.globalCooldownSec, DEFAULT_META_TRADER.globalCooldownSec))),
         scanBatch: Math.min(150, Math.max(10, Math.round(num(saved.scanBatch, MAX_TICK_CANDIDATES)))),
         correlationGuard: (saved as { correlationGuard?: unknown }).correlationGuard !== false,
+        poolMode: (saved as { poolMode?: unknown }).poolMode === 'setups' ? 'setups' : 'all',
+        setupScanSec: Math.min(600, Math.max(5, Math.round(num((saved as { setupScanSec?: unknown }).setupScanSec, 30)))),
+        setupMinQuality: Math.min(100, Math.max(0, Math.round(num((saved as { setupMinQuality?: unknown }).setupMinQuality, 0)))),
         useScriptExpiry: saved.useScriptExpiry === true,
         stakePlan: MetaTraderService.sanitizeStakePlan(saved.stakePlan),
         assets: Array.isArray(saved.assets)
@@ -809,6 +820,9 @@ export class MetaTraderService {
     if (patch.useScriptExpiry !== undefined) this.config.useScriptExpiry = patch.useScriptExpiry === true
     if (patch.scanBatch !== undefined) this.config.scanBatch = Math.min(150, Math.max(10, Math.round(num(patch.scanBatch, this.config.scanBatch ?? MAX_TICK_CANDIDATES))))
     if (patch.correlationGuard !== undefined) this.config.correlationGuard = patch.correlationGuard !== false
+    if (patch.poolMode !== undefined) { this.config.poolMode = patch.poolMode === 'setups' ? 'setups' : 'all'; this.setups.invalidate() }
+    if (patch.setupScanSec !== undefined) this.config.setupScanSec = Math.min(600, Math.max(5, Math.round(num(patch.setupScanSec, this.config.setupScanSec ?? 30))))
+    if (patch.setupMinQuality !== undefined) { this.config.setupMinQuality = Math.min(100, Math.max(0, Math.round(num(patch.setupMinQuality, this.config.setupMinQuality ?? 0)))); this.setups.invalidate() }
     if (patch.stakePlan !== undefined) {
       const next = MetaTraderService.sanitizeStakePlan(patch.stakePlan)
       const changed = JSON.stringify(this.config.stakePlan ?? null) !== JSON.stringify(next ?? null)
@@ -852,6 +866,23 @@ export class MetaTraderService {
     try { return correlatedWith(asset, side, this.store.listPositions('open', 500).filter((p) => p.note?.startsWith(META_TRADER_NOTE)).map((p) => ({ asset: p.asset, side: p.side }))) } catch { return null }
   }
 
+  private setups = new SetupCache()
+  /** the TRADING PLAN as the pool: pairs in a favourable setup, best first, minus the pair(s) already traded and anything duplicating their exposure */
+  private setupPool(ordered: string[]): string[] {
+    const rows = this.setups.get(this.now(), this.config.setupScanSec ?? 30, () => scanSetups(
+      this.market.listAssets().filter((a) => ordered.includes(a.ticker)),
+      (t) => { try { return this.market.getCandlesDeep(t, this.config.tf, 500, true) ?? [] } catch { return [] } },
+      { minQuality: this.config.setupMinQuality ?? 0 },
+    ))
+    let open: Array<{ asset: string; side: string }> = []
+    try { open = this.store.listPositions('open', 500).filter((p) => p.note?.startsWith(META_TRADER_NOTE)).map((p) => ({ asset: p.asset, side: p.side })) } catch { open = [] }
+    const left = this.config.correlationGuard === false ? rows.filter((r) => !open.some((o) => o.asset === r.asset)) : excludeHeld(rows, open)
+    return left.map((r) => r.asset).slice(0, this.scanBatch())
+      .filter((a) => !this.hasOpenOn(a))
+      .filter((a) => (this.assetCooldownUntil.get(a) ?? 0) <= this.now())
+      .filter((a) => (this.rejectedUntil.get(a) ?? 0) <= this.now())
+  }
+
   private candidatePool(): string[] {
     const open = this.market.listAssets().filter((a) => a.open && (this.config.marketScope === 'all' || (this.config.marketScope === 'otc') === Boolean(a.otc)))
     const tickers = open.map((a) => a.ticker)
@@ -861,6 +892,7 @@ export class MetaTraderService {
     // through to the same liquid-first, market-wide default as before.
     const configured = this.config.assets?.length ? this.config.assets.filter((a) => tickers.includes(a)) : undefined
     const ordered = configured ?? [...LIQUID_CANDIDATES.filter((a) => tickers.includes(a)), ...tickers.filter((a) => !LIQUID_CANDIDATES.includes(a))]
+    if (this.config.poolMode === 'setups') return this.setupPool(ordered)
     return this.rotation
       .current(ordered, this.scanBatch())
       .filter((a) => !this.hasOpenOn(a))
@@ -935,6 +967,7 @@ export class MetaTraderService {
         // direction) counts as held from here until its read lapses or
         // flips, so a cooldown expiring can never re-enter the stale middle.
         this.sweepEdge.stamp(SweepEdgeMemory.key(row.asset, row.direction), this.now())
+        this.setups.invalidate() // a trade was taken: rescan for the next market, without this one
         this.rt.trades += 1
         this.rt.lastTradeTs = this.now()
         this.rt.openCount += 1

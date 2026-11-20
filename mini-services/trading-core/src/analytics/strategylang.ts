@@ -286,6 +286,7 @@ import { readEditor } from './editor'
 import { readDao } from './dao'
 import { readChess } from './chess'
 import { readHa, haFilter } from './hapredict'
+import { readPlan } from './tradingplan'
 import { readStory, readRoc, readWindowStory, readStructure, readFormingStory, cutBars } from './candlestory'
 import { oscillatorVotes, maVotes, TECH_MIN_BARS, TECH_BARS_PER_RUNG, type TechVote } from './technicals'
 
@@ -5654,6 +5655,10 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
         return pbMethod(e.name, args, ctx, tf)
       }
+      if (e.obj.t === 'ident' && e.obj.name === 'trading' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        return tradingMethod(e.name, args, ctx)
+      }
       if (e.obj.t === 'ident' && e.obj.name === 'chess' && !(e.obj.name in env)) {
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         return chessMethod(e.name, args, ctx)
@@ -6577,6 +6582,35 @@ function daoMethod(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
       alignment: r.time.alignment, scaleDir: r.time.scaleDir, compressed: r.cause.compressed, breakoutP: r.cause.breakoutP, character: r.fate.character, vr5: r.fate.vr5, drift: r.fate.drift, driftT: r.fate.driftT })
     default: throw new MslRuntimeError(`unknown dao lens "dao.${name}(...)" - use yinyang/cause/life/time/space/momentum/wuwei/fate/phase/lean/all/text`)
   }
+}
+
+/** `trading.plan(["otc"])` - the TRADING PLAN (analytics/tradingplan.ts). NOT a strategy: it builds the conditions a strategy trades in, so the strategy only adds its trigger. Finds a trend that has NOT gone too far, maps
+ * every support / resistance, marks where a trade of each side should be avoided, and says when the conditions are favourable: `let tp = trading.plan()` then `call when tp.allowCall and <your trigger>` (pm, a Heikin Ashi
+ * filter, a pattern ...), `pos.stop = tp.stop`, `pos.target = tp.target`. Needs 220+ closed bars. Flat bundle: ok error side (call|put|none = the side whose conditions are favourable) ready quality (0-100) allowCall allowPut
+ * stop target rr entryLow entryHigh atEntry blocks reasons trend (up|down|none) trendStrength stage (early|developing|mature|extended|pullback|broken) fresh tooFar age moveAtr maturity (percentile vs this pair's past trends)
+ * retrace stretch structure support1..3 / resistance1..3 (+Strength +Dist in ATR) nearSupport nearResistance supDist resDist avoidNow avoidReason avoidCallNow avoidPutNow avoidCount text.
+ * `trading.setup()` just the setup fields, `trading.levels()` the level ladder, `trading.avoid()` the avoid flags, `trading.hours()` the clock (hour, minute, secsToNextHour - the hour verticals are drawn on the chart), `trading.text()` the sentences.
+ * No news calendar: a scheduled release is NOT an avoid zone. The setup scan (/plan_scan, Omni / Meta pool mode "setups") runs this over every open pair. Run /plan_research on the pair before trusting it. */
+function tradingMethod(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
+  const strs = args.filter((a): a is string => typeof a === 'string')
+  const mk = (s: MslSeriesCtx) => { const t = s.time ?? []; return seriesToCandles(s).map((c, i) => ({ ...c, time: t[i] ?? i })) }
+  const candles = mk(requireSeries(ctx, undefined))
+  if (name === 'hours') { const tm = candles.length ? candles[candles.length - 1].time : 0; return bundleValue({ ok: candles.length > 0, hour: Math.floor((tm % 86400) / 3600), minute: Math.floor((tm % 3600) / 60), secsToNextHour: 3600 - (tm % 3600) }) }
+  const r = readPlan(candles, { otc: strs.includes('otc') })
+  if (name === 'text') return r.text
+  if (!r.ok) return bundleValue({ ok: false, error: r.error ?? 'plan unavailable', side: 'none', ready: false, quality: 0, trend: 'none', allowCall: false, allowPut: false, avoidNow: false })
+  const sup = r.levels.filter((l) => l.side === 'support').sort((x, y) => y.price - x.price), res = r.levels.filter((l) => l.side === 'resistance').sort((x, y) => x.price - y.price)
+  const lv: Record<string, MslValue> = {}
+  for (let i = 0; i < 3; i++) { const a = sup[i], b = res[i]; lv[`support${i + 1}`] = a?.price ?? NaN; lv[`support${i + 1}Strength`] = a?.strength ?? 0; lv[`support${i + 1}Dist`] = a?.distAtr ?? NaN; lv[`resistance${i + 1}`] = b?.price ?? NaN; lv[`resistance${i + 1}Strength`] = b?.strength ?? 0; lv[`resistance${i + 1}Dist`] = b?.distAtr ?? NaN }
+  const act = r.avoid.filter((z) => z.active), v = r.setup, tr = r.trend
+  const avoidFlags = { avoidNow: act.length > 0, avoidReason: act.map((z) => z.reason).join('; '), avoidCount: r.avoid.length, avoidCallNow: act.some((z) => z.side === 'call' || z.side === 'both'), avoidPutNow: act.some((z) => z.side === 'put' || z.side === 'both') }
+  const setupFlags = { side: v.side, ready: v.ready, quality: v.quality, allowCall: v.allowCall, allowPut: v.allowPut, stop: v.stop, target: v.target, rr: v.rr, entryLow: v.entryLow, entryHigh: v.entryHigh, atEntry: v.atEntry, blocks: v.blocks.join('; '), reasons: v.reasons.join('; ') }
+  if (name === 'levels') return bundleValue({ ok: true, ...lv, supports: sup.length, resistances: res.length })
+  if (name === 'avoid') return bundleValue({ ok: true, ...avoidFlags, text: act.map((z) => z.reason).join('; ') })
+  if (name === 'setup') return bundleValue({ ok: true, ...setupFlags })
+  if (name !== 'plan') throw new MslRuntimeError(`unknown trading part "trading.${name}(...)" - use plan/setup/levels/avoid/hours/text`)
+  return bundleValue({ ok: true, ...setupFlags, trend: tr.dir, trendStrength: tr.strength, stage: tr.stage, fresh: tr.fresh, tooFar: tr.tooFar, age: tr.age, moveAtr: tr.moveAtr, maturity: tr.maturity, retrace: tr.retrace, stretch: tr.stretch, structure: tr.structure, ...lv,
+    nearSupport: sup[0]?.price ?? NaN, nearResistance: res[0]?.price ?? NaN, supDist: sup[0]?.distAtr ?? NaN, resDist: res[0]?.distAtr ?? NaN, ...avoidFlags, text: r.text })
 }
 
 /** `chess.<part>([horizon], ["otc"])` - the market as a chessboard (analytics/chess.ts), 150+ bars: pieces (queen, pawnPush, knight, bishop, rook, kingLong, kingShort), position (eval -1..+1, control, mobBuy, mobSell, rank, tempo),

@@ -32,4 +32,17 @@ test('SweepEdgeMemory.backfill marks a standing signal as held without trading i
   const k = SweepEdgeMemory.key('B', 'call'); assert.equal(m.gate(k), 'trade'); m.backfill(k, 2); assert.equal(m.gate(k), 'skip')
   m.endSweep(new Set(['B']), new Set(), 3); assert.equal(m.gate(k), 'trade') // lapsed (B evaluated, no longer qualifying) -> a fresh edge can trade
 })
+let sd2 = 9; const r2 = () => ((sd2 = (sd2 * 1664525 + 1013904223) % 4294967296) / 4294967296)
+const upSeries = (n: number, s0: number) => { const out: any[] = []; let p = 1.2 + s0; for (let i = 0; i < n; i++) { const o = p, c = o + 0.00022 * (Math.sin(i / 14) > -0.5 ? 1 : -0.3) + (r2() - 0.5) * 0.0003; out.push({ time: 1_700_006_400 + i * 60, open: o, high: Math.max(o, c) + r2() * 0.0002, low: Math.min(o, c) - r2() * 0.0002, close: c, volume: 100 }); p = c } return out }
+test('poolMode "setups": the plan scan is the pool; the pair traded and anything duplicating it are dropped, and a trade forces a rescan', () => {
+  const s: any = new OmniTraderService(); const list = ['EURUSD', 'GBPUSD', 'XAUUSD', 'RANGE1']; const bars: Record<string, any[]> = { EURUSD: upSeries(500, 0), GBPUSD: upSeries(500, 0.1), XAUUSD: upSeries(500, 0.2), RANGE1: upSeries(80, 0) }
+  let scans = 0; s.market = { listAssets: () => list.map((t) => ({ ticker: t, open: true, otc: false })), getCandlesDeep: (t: string) => { if (t === 'EURUSD') scans++; return bars[t] } }
+  s.ctx = { log: () => {} }; let open: any[] = []; s.store = { listPositions: () => open }; s.config.poolMode = 'setups'
+  const first = s.candidatePool(); assert.ok(first.length >= 1, 'no setups found in the up-trending pairs'); assert.ok(!first.includes('RANGE1'), 'a pair with thin history cannot be a setup')
+  const before = scans; s.candidatePool(); assert.equal(scans, before, 'the scan must be reused inside the ttl')
+  open = [{ asset: first[0], side: first[0] === 'XAUUSD' ? 'call' : 'call', note: 'omni:trader' }]; s.setups.invalidate()
+  const next = s.candidatePool(); assert.ok(!next.includes(first[0]), 'the pair just traded must not be picked again')
+  if (first[0] === 'EURUSD') assert.ok(!next.includes('GBPUSD'), 'a pair duplicating the traded exposure must be skipped')
+  assert.ok(scans > before, 'invalidate() must trigger a rescan')
+})
 console.log(`${pass}/${total}`); if (pass !== total) process.exit(1)
