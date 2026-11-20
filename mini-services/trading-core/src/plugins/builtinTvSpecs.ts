@@ -507,4 +507,18 @@ put when ok and c.dir == "put"
 expiry = 1
 `,
   },
+  {
+    id: 'meta:builtin-pm-ha',
+    name: 'Builtin: pm filtered by Heikin Ashi',
+    script: `
+# PM + HEIKIN ASHI FILTER. Takes the pm call only when the Heikin Ashi candle agrees (colour, not a doji). Change the mode to "predict" (learned next-candle odds lean the same way) or "both".
+# HA lags and reads the same candles as pm, so it is NOT assumed to help: run /ha_filter_report on the pair first to see whether pm's calls do better with HA agreement than without.
+let mode = "color"
+let p = story.pm()
+let ok = p.ok and p.direction != "none"
+call when ok and p.direction == "call" and story.haFilter("call", mode).pass
+put when ok and p.direction == "put" and story.haFilter("put", mode).pass
+expiry = 1
+`,
+  },
 ]

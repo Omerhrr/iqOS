@@ -285,6 +285,7 @@ import { readWeather } from './weather'
 import { readEditor } from './editor'
 import { readDao } from './dao'
 import { readChess } from './chess'
+import { readHa, haFilter } from './hapredict'
 import { readStory, readRoc, readWindowStory, readStructure, readFormingStory, cutBars } from './candlestory'
 import { oscillatorVotes, maVotes, TECH_MIN_BARS, TECH_BARS_PER_RUNG, type TechVote } from './technicals'
 
@@ -5640,6 +5641,7 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         if (e.name === 'weather' || e.name === 'weatherText' || e.name === 'editor' || e.name === 'editorText') return storyEditor(e.name, args, ctx)
         if (e.name === 'nm' || e.name === 'nmText' || e.name === 'otcnm') return storyNm(e.name, args, ctx)
         if (e.name === 'cfd' || e.name === 'cfdText' || e.name === 'otccfd') return storyCfd(e.name, args, ctx)
+        if (e.name === 'ha' || e.name === 'haText' || e.name === 'haFilter') return storyHa(e.name, args, ctx)
         const tf = args.length && typeof args[args.length - 1] === 'string' && e.name !== 'is' ? (args.pop() as string) : undefined
         return storyMethod(e.name, args, ctx, tf)
       }
@@ -6462,6 +6464,25 @@ function storyPm(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
     effectDir: r.effect.dir, sizeAtr: r.effect.sizeAtr, psychology: r.effect.psychology, upperWick: r.effect.upperWick, lowerWick: r.effect.lowerWick, roc: r.effect.roc, cci: r.effect.cci,
     coherence: r.validation.coherence, bucketN: r.validation.bucketN, bucketUp: r.validation.bucketUpProb, trackN: r.validation.trackN, trackHit: r.validation.trackHit,
     support: r.sr.support, resistance: r.sr.resistance, supDist: r.sr.supDist, resDist: r.sr.resDist, atSupport: r.sr.atSupport, atResistance: r.sr.atResistance, retest: r.sr.retest, text: m.text })
+}
+
+/** `story.ha(["color"|"predict"|"both"], ["otc"])` - the HEIKIN ASHI PREDICTOR (analytics/hapredict.ts), built to FILTER the pm. Flat bundle: ok error color ("bull"/"bear") sign streak strength (strong|normal|weak) bodyRatio flipped state
+ * predDirection ("call"/"put"/"none") pUp edge keepProb relation (continuation|reversal) n validated trackN trackHit allowCall allowPut (for the chosen mode, default "color": HA agrees and is not a doji; "predict": the learned odds lean that way;
+ * "both") text. `story.haFilter(dir, [mode], [otc])` -> pass stance (with|against|neutral) reason for ONE direction, so `let p = story.pm()` then `call when p.direction == "call" and story.haFilter("call").pass`.
+ * story.haText() the sentence. HA lags and reads the same candles as pm: run /ha_filter_report to see whether it separates pm's good calls from bad on THIS pair before relying on it. */
+function storyHa(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
+  const strs = args.filter((a): a is string => typeof a === 'string')
+  const modeArg = strs.find((a) => a === 'color' || a === 'predict' || a === 'both') as 'color' | 'predict' | 'both' | undefined
+  const dirArg = strs.find((a) => a === 'call' || a === 'put')
+  const mk = (s: MslSeriesCtx) => { const t = s.time ?? []; return seriesToCandles(s).map((c, i) => ({ ...c, time: t[i] ?? i })) }
+  const r = readHa(mk(requireSeries(ctx, undefined)), { otc: strs.includes('otc') })
+  if (name === 'haText') return r.text
+  const mode = modeArg ?? 'color'
+  if (name === 'haFilter') { const f = haFilter(r, dirArg ?? '', mode); return bundleValue({ ok: r.ok, pass: f.pass, stance: f.stance, reason: f.reason }) }
+  if (!r.ok) return bundleValue({ ok: false, error: r.error ?? 'ha unavailable', predDirection: 'none', allowCall: false, allowPut: false })
+  return bundleValue({ ok: true, color: r.ha.color, sign: r.ha.sign, streak: r.ha.streak, strength: r.ha.strength, bodyRatio: r.ha.bodyRatio, flipped: r.ha.flipped, state: r.ha.state,
+    predDirection: r.pred.dir, pUp: r.pred.pUp, edge: r.pred.edge, keepProb: r.pred.keepProb, relation: r.pred.relation, n: r.pred.n, validated: r.pred.validated, trackN: r.pred.trackN, trackHit: Number.isFinite(r.pred.trackHit) ? r.pred.trackHit : 0,
+    allowCall: r.allow[mode].call, allowPut: r.allow[mode].put, text: r.text })
 }
 
 /** `story.cfd([htf], [minRR])` - the pm model as a CFD trade PLAN (analytics/cfdplan.ts): direction plus entry, stop, target, rr, ev, probability. Flat bundle: ok error direction entry stop target
