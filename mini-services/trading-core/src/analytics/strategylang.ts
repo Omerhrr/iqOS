@@ -280,6 +280,7 @@ import { storyRenko, storyKagi, storyEffort, storyHeikin, storyTickBars, storyTi
 import { readMtf } from './mtfstory'
 import { readCauseEffect, combineCeMtf } from './causeeffect'
 import { readCfdPlan } from './cfdplan'
+import { readNextMove, combineNmPm } from './nextmove'
 import { readStory, readRoc, readWindowStory, readStructure, readFormingStory, cutBars } from './candlestory'
 import { oscillatorVotes, maVotes, TECH_MIN_BARS, TECH_BARS_PER_RUNG, type TechVote } from './technicals'
 
@@ -5632,6 +5633,7 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         if (e.name === 'of' || e.name === 'ofText') return storyOf(e.name, args, ctx)
         if (e.name === 'mtf') return storyMtf(args, ctx)
         if (e.name === 'pm' || e.name === 'pmText' || e.name === 'otcpm' || e.name === 'otcpmText') return storyPm(e.name, args, ctx)
+        if (e.name === 'nm' || e.name === 'nmText' || e.name === 'otcnm') return storyNm(e.name, args, ctx)
         if (e.name === 'cfd' || e.name === 'cfdText' || e.name === 'otccfd') return storyCfd(e.name, args, ctx)
         const tf = args.length && typeof args[args.length - 1] === 'string' && e.name !== 'is' ? (args.pop() as string) : undefined
         return storyMethod(e.name, args, ctx, tf)
@@ -6462,6 +6464,32 @@ function storyCfd(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
   const p = readCfdPlan(mk(requireSeries(ctx, undefined)), ctx.liveTicks, htfC, { htfTf, otc, ...(nums[0] !== undefined ? { minRR: nums[0] } : {}) })
   if (name === 'cfdText') return p.text
   return bundleValue({ ok: p.ok, error: p.ok ? '' : (p.error ?? ''), direction: p.direction, entry: p.entry, stop: p.stop, target: p.target, riskDist: p.riskDist, rewardDist: p.rewardDist, riskAtr: p.riskAtr, rewardAtr: p.rewardAtr, rr: p.rr, prob: p.prob, strength: p.strength, ev: p.ev, atr: p.atr, stopKind: p.stopKind, targetKind: p.targetKind, alignment: p.alignment })
+}
+
+/** `story.nm([horizon], ["otc"])` - NEXT MOVE (analytics/nextmove.ts): price's own map (yesterday/today levels, gap, range position, session + last session), the causes (zones, linear regression, bull/bear structure,
+ * exhaustion), a ledger of how those levels were treated before, and the outcome of the closest historical fingerprints: next candle, next `horizon` candles (default 5) and the chance of reaching the level above
+ * before the level below. Flat bundle: ok error direction prob(P up next candle) horizonProb moveAtr strength validated trackN trackHit neighbors pool pUpFirst pDownFirst pNeither upLevel upDist downLevel downDist
+ * structure bias regSlope regR2 regZ exhaustion lastLegAtr atSupport atResistance rangePos gapAtr session sessionMove lastSession lastSessionMove lastSessionEnd prevHigh prevLow prevClose dayOpen dayHigh dayLow
+ * dayHighHold dayHighN dayLowHold dayLowN supHold supN resHold resN, plus pmAlignment/combDirection/combProb/combStrength (nm blended with story.pm's cause->effect read). story.nmText() the sentence.
+ * story.otcnm() = OTC mode (stricter validation). */
+function storyNm(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
+  const strs = args.filter((a): a is string => typeof a === 'string')
+  const otc = name === 'otcnm' || strs.includes('otc')
+  const hz = args.find((a): a is number => typeof a === 'number')
+  const mk = (s: MslSeriesCtx) => { const t = s.time ?? []; return seriesToCandles(s).map((c, i) => ({ ...c, time: t[i] ?? i })) }
+  const cs = mk(requireSeries(ctx, undefined))
+  const r = readNextMove(cs, { otc, ...(hz !== undefined ? { horizon: hz } : {}) })
+  if (name === 'nmText') return r.text
+  let pm: ReturnType<typeof readCauseEffect> | null = null
+  try { pm = readCauseEffect(cs, ctx.liveTicks, { otc }) } catch { pm = null }
+  const cb = combineNmPm(r, pm && pm.ok ? pm : null)
+  return bundleValue({ ok: r.ok, error: r.ok ? '' : (r.error ?? ''), direction: r.nm.dir, prob: r.nm.prob, horizonProb: r.nm.horizonProb, moveAtr: r.nm.moveAtr, strength: r.nm.confidence, validated: r.nm.validated,
+    trackN: r.validation.trackN, trackHit: r.validation.trackHit, neighbors: r.validation.neighbors, pool: r.validation.pool, pUpFirst: r.reach.pUpFirst, pDownFirst: r.reach.pDownFirst, pNeither: r.reach.pNeither,
+    upLevel: r.reach.upLevel, upDist: r.reach.upDist, downLevel: r.reach.downLevel, downDist: r.reach.downDist, structure: r.causes.structure, bias: r.causes.bias, regSlope: r.causes.regSlope, regR2: r.causes.regR2,
+    regZ: r.causes.regZ, exhaustion: r.causes.exhaustion, lastLegAtr: r.causes.lastLegAtr, atSupport: r.causes.atSupport, atResistance: r.causes.atResistance, rangePos: r.map.rangePos, gapAtr: r.map.gapAtr,
+    session: r.map.session, sessionMove: r.map.sessionMoveAtr, lastSession: r.map.lastSession, lastSessionMove: r.map.lastSessionMoveAtr, lastSessionEnd: r.map.lastSessionEndAtr, prevHigh: r.map.prevHigh, prevLow: r.map.prevLow,
+    prevClose: r.map.prevClose, dayOpen: r.map.dayOpen, dayHigh: r.map.dayHigh, dayLow: r.map.dayLow, dayHighHold: r.ledger.dayHighHold, dayHighN: r.ledger.dayHighN, dayLowHold: r.ledger.dayLowHold, dayLowN: r.ledger.dayLowN,
+    supHold: r.ledger.supHold, supN: r.ledger.supN, resHold: r.ledger.resHold, resN: r.ledger.resN, pmAlignment: cb.alignment, combDirection: cb.dir, combProb: cb.prob, combStrength: cb.strength })
 }
 
 function lastAtr(ctx: EvalEnv): number {

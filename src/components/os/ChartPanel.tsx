@@ -2960,6 +2960,25 @@ export default function ChartPanel({
   type PmRes = PmSide & { error?: string; combined?: { alignment: string; dir: string; lean: string; prob: number; strength: number; triggerWithHtf: boolean; htfTf: string; htfOk: boolean; text: string }; htf?: PmSide | null }
   const [pmRes, setPmRes] = useState<PmRes | null>(null)
   const [pmHtf, setPmHtf] = useState('5m')
+  // NM = NEXT MOVE: price's own map + causes + level ledger + analog outcomes (/next_move)
+  type NmRes = { ok: boolean; error?: string; text?: string; horizon?: number; otc?: boolean
+    nm?: { dir: string; prob: number; horizonProb: number; moveAtr: number; confidence: number; validated: boolean }
+    validation?: { neighbors: number; pool: number; trackN: number; trackHit: number }
+    reach?: { upLevel: number; upDist: number; downLevel: number; downDist: number; pUpFirst: number; pDownFirst: number; pNeither: number }
+    map?: { prevHigh: number; prevLow: number; prevClose: number; dayOpen: number; rangePos: number; gapAtr: number; session: string; sessionMoveAtr: number; lastSession: string; lastSessionMoveAtr: number; lastSessionEndAtr: number }
+    causes?: { structure: string; regZ: number; regR2: number; exhaustion: number; atSupport: boolean; atResistance: boolean }
+    ledger?: { resHold: number; resN: number; supHold: number; supN: number; dayHighHold: number; dayHighN: number; dayLowHold: number; dayLowN: number }
+    combined?: { alignment: string; dir: string; prob: number; strength: number } }
+  const [nmRes, setNmRes] = useState<NmRes | null>(null)
+  const [nmHz, setNmHz] = useState('5')
+  useEffect(() => {
+    if (!showStory || storyView !== 'nm') return
+    let alive = true
+    const load = () => { osGet<NmRes>('/next_move', { asset: digitsTicker, tf: tf ?? '1m', horizon: nmHz || '5' }).then((r) => { if (alive) setNmRes(r) }).catch((e) => { if (alive) setNmRes({ ok: false, error: String(e instanceof Error ? e.message : e).slice(0, 160) }) }) }
+    setNmRes(null); load()
+    const t = window.setInterval(load, 15000)
+    return () => { alive = false; window.clearInterval(t) }
+  }, [showStory, storyView, digitsTicker, tf, nmHz])
   useEffect(() => {
     if (!showStory || storyView !== 'pm') return
     let alive = true
@@ -3002,7 +3021,7 @@ export default function ChartPanel({
   const [study, setStudy] = useState<StudyRes | null>(null)
   const [studyBusy, setStudyBusy] = useState(false)
   useEffect(() => {
-    if (!showStory || storyView === 'candles' || storyView === 'mtf' || storyView === 'pm') return
+    if (!showStory || storyView === 'candles' || storyView === 'mtf' || storyView === 'pm' || storyView === 'nm') return
     let alive = true
     const load = () => { osGet<ChartStoryRes>('/chart_story', { asset: digitsTicker, tf: tf ?? '1m', type: storyView, ...(storyView === 'baseline' ? { mode: 'mid' } : {}) }).then((r) => { if (alive) setChartStory(r) }).catch((e) => { if (alive) setChartStory({ ok: false, error: String(e instanceof Error ? e.message : e).slice(0, 120) }) }) }
     setChartStory(null); load()
@@ -3213,11 +3232,11 @@ export default function ChartPanel({
               <button onClick={() => setShowStory(false)} className="text-[#7c8aa5] hover:text-white">x</button>
             </div>
             <div className="flex flex-wrap gap-0.5">
-              {[['candles', 'candles'], ['renko', 'renko'], ['kagi', 'kagi'], ['effort', 'effort'], ['ha', 'heikin'], ['tickbars', 'tick bars'], ['ticks', 'ticks'], ['baseline', 'baseline'], ['footprint', 'footprint'], ['mtf', 'MTF'], ['pm', 'PM']].map(([id, label]) => (
+              {[['candles', 'candles'], ['renko', 'renko'], ['kagi', 'kagi'], ['effort', 'effort'], ['ha', 'heikin'], ['tickbars', 'tick bars'], ['ticks', 'ticks'], ['baseline', 'baseline'], ['footprint', 'footprint'], ['mtf', 'MTF'], ['pm', 'PM'], ['nm', 'NM']].map(([id, label]) => (
                 <button key={id} onClick={() => setStoryView(id)} className={`rounded border px-1 py-px text-[8px] ${storyView === id ? 'border-amber-500/60 bg-amber-500/15 text-amber-300' : 'border-[#1c2739] text-[#7c8aa5] hover:text-white'}`}>{label}</button>
               ))}
             </div>
-            {storyView !== 'candles' && storyView !== 'mtf' && storyView !== 'pm' && (
+            {storyView !== 'candles' && storyView !== 'mtf' && storyView !== 'pm' && storyView !== 'nm' && (
               <div className="space-y-1">
                 {!chartStory && <div className="text-[#7c8aa5]">reading...</div>}
                 {chartStory && !chartStory.ok && <div className="text-rose-300">{chartStory.text || chartStory.error || 'no story'}</div>}
@@ -3270,6 +3289,43 @@ export default function ChartPanel({
                         </div>
                       )}
                       <div className="text-[#5d6b85]">Judgement-weighted, footprint estimated, not a proven edge. Backtest first.</div>
+                    </>
+                  )
+                })()}
+              </div>
+            )}
+            {storyView === 'nm' && (
+              <div className="space-y-1">
+                <label className="flex items-center justify-between text-[#7c8aa5]">horizon (candles)
+                  <input type="text" value={nmHz} onChange={(e) => setNmHz(e.target.value.replace(/[^0-9]/g, '').slice(0, 2))} className="w-12 rounded border border-[#1c2739] bg-[#0d1420] px-1 text-right text-[#d6e2f5]" />
+                </label>
+                {!nmRes && <div className="text-[#7c8aa5]">reading price map and path...</div>}
+                {nmRes && !nmRes.ok && <div className="text-rose-300">{nmRes.error ?? 'no read'}{nmRes.text ? ` · ${nmRes.text}` : ''}</div>}
+                {nmRes?.ok && nmRes.nm && nmRes.reach && nmRes.map && nmRes.causes && nmRes.ledger && nmRes.validation && (() => {
+                  const n = nmRes, d = n.nm!.dir, f = (x: number | undefined, k = 2) => (x === undefined || !Number.isFinite(x) ? '-' : x.toFixed(k)), pc = (x: number | undefined) => (x === undefined || !Number.isFinite(x) ? '-' : `${(x * 100).toFixed(0)}%`)
+                  const cb = n.combined
+                  return (
+                    <>
+                      <div className={`flex items-center justify-between rounded border px-1.5 py-1 ${d === 'call' ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-300' : d === 'put' ? 'border-rose-500/50 bg-rose-500/10 text-rose-300' : 'border-[#1c2739] text-[#7c8aa5]'}`}>
+                        <span className="font-bold">{d === 'call' ? 'NM: CALL' : d === 'put' ? 'NM: PUT' : 'NM: no call'} {d !== 'none' ? `next ${pc(n.nm!.prob)} · next ${n.horizon} ${pc(n.nm!.horizonProb)}` : ''}</span>
+                        <span>{n.nm!.confidence}/100{n.nm!.validated ? ' · validated' : ' · unvalidated'}{n.otc ? ' · OTC' : ''}</span>
+                      </div>
+                      <div className="text-[#d6e2f5]">{n.text}</div>
+                      <div className="space-y-0.5 rounded border border-[#1c2739] p-1">
+                        <div className="text-amber-200/90">MAP · {n.map!.session} session · {pc(n.map!.rangePos)} of today's range</div>
+                        <div className="text-[#7c8aa5]">yesterday {f(n.map!.prevLow, 5)} – {f(n.map!.prevHigh, 5)} · close {f(n.map!.prevClose, 5)} · gap {f(n.map!.gapAtr, 1)} ATR</div>
+                        <div className="text-[#7c8aa5]">session {f(n.map!.sessionMoveAtr, 1)} ATR · last {n.map!.lastSession} {f(n.map!.lastSessionMoveAtr, 1)} ATR, ended {f(n.map!.lastSessionEndAtr, 1)}</div>
+                      </div>
+                      <div className="space-y-0.5 rounded border border-[#1c2739] p-1">
+                        <div className="text-amber-200/90">CAUSES · {n.causes!.structure} structure · regression {f(n.causes!.regZ, 1)}σ (R² {f(n.causes!.regR2)}) · exhaustion {f(n.causes!.exhaustion, 1)} ATR</div>
+                        <div className="text-[#7c8aa5]">{n.causes!.atResistance ? 'AT resistance · ' : ''}{n.causes!.atSupport ? 'AT support · ' : ''}above {f(n.reach!.upLevel, 5)} ({f(n.reach!.upDist, 1)} ATR, held {pc(n.ledger!.resHold)} of {n.ledger!.resN}) · below {f(n.reach!.downLevel, 5)} ({f(n.reach!.downDist, 1)} ATR, held {pc(n.ledger!.supHold)} of {n.ledger!.supN})</div>
+                        <div className="text-[#7c8aa5]">yesterday's high held {pc(n.ledger!.dayHighHold)} of {n.ledger!.dayHighN} · low held {pc(n.ledger!.dayLowHold)} of {n.ledger!.dayLowN}</div>
+                      </div>
+                      <div className="space-y-0.5 rounded border border-[#1c2739] p-1">
+                        <div className="text-amber-200/90">PATH · {n.validation!.neighbors} similar moments of {n.validation!.pool} · walk-forward {pc(n.validation!.trackHit)} of {n.validation!.trackN}</div>
+                        <div className="text-[#7c8aa5]">reaches the level above first {pc(n.reach!.pUpFirst)} · below first {pc(n.reach!.pDownFirst)} · neither within {n.horizon} {pc(n.reach!.pNeither)} · avg move {f(n.nm!.moveAtr)} ATR</div>
+                      </div>
+                      {cb && <div className="text-[#7c8aa5]">with PM: {cb.alignment} {cb.dir !== 'none' ? `· ${cb.dir.toUpperCase()} ${pc(cb.prob)} · ${cb.strength}/100` : ''}</div>}
                     </>
                   )
                 })()}

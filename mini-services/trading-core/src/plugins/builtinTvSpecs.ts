@@ -447,4 +447,19 @@ put when ok and m.direction == "put" and not m.atSupport
 expiry = 1
 `,
   },
+  {
+    id: 'meta:builtin-next-move',
+    name: 'Builtin: next move (price map + path)',
+    script: `
+# NEXT MOVE. Price's own map (yesterday/today levels, gap, session, last session), causes (zones, regression, bull/bear structure) and what the closest historical fingerprints did next.
+# Trades only when the walk-forward record beat chance (validated), the call agrees with the pm cause->effect read (or pm has no view), and the level above/below is not the likelier first target.
+# A count of what followed similar-looking moments, not an understanding of why: backtest per pair first.
+let minConf = 45
+let n = story.nm(5)
+let ok = n.ok and n.validated and n.strength >= minConf and n.pmAlignment != "conflict"
+call when ok and n.direction == "call" and n.pUpFirst >= n.pDownFirst
+put when ok and n.direction == "put" and n.pDownFirst >= n.pUpFirst
+expiry = 1
+`,
+  },
 ]
