@@ -46,6 +46,8 @@ import { metaTraderPlugin, MetaTraderService } from './src/plugins/metatrader'
 import { cfdTraderPlugin, CfdTraderService } from './src/plugins/cfdtrader'
 import { BUILTIN_TV_SPECS } from './src/plugins/builtinTvSpecs'
 import { readNextMove, combineNmPm } from './src/analytics/nextmove'
+import { readEditor, reportEditor } from './src/analytics/editor'
+import { readWeather } from './src/analytics/weather'
 import { omniTraderPlugin, OmniTraderService } from './src/plugins/omnitrader'
 import { brainTraderPlugin, BrainTraderService } from './src/plugins/braintrader'
 import { META_CONDITION_SOURCES } from './src/analytics/metastrategy'
@@ -2432,7 +2434,39 @@ const httpServer = createServer(async (req, res) => {
 
       // GET /predicted_move?asset=&tf=1m -> the CAUSE -> EFFECT predicted move (analytics/causeeffect.ts): cause (volume, footprint estimate, ticks, MFI, A/D), effect (candle, psychology, ROC, CCI),
       // bars-ago validation, S/R retests and the next-candle prediction. Judgement-weighted, not fitted; see the honesty note in that file.
-      // GET /next_move?asset=&tf=1m&horizon=5&otc=0|1 - NEXT MOVE (analytics/nextmove.ts): price's own map + causes + level ledger + analog outcomes (next candle, next `horizon` candles, reach-above-before-below), blended with pm.
+      // GET /story_editor?asset=&tf=1m&htf=5m - the EDITOR chapter: pm + nm + weather in one verdict (analytics/editor.ts), with the weather and invalidation.
+      // GET /story_editor_report?asset=&tf=1m&bars=1500&step=8 - measures, on the pair's OWN history, whether pm + nm agreeing beat the better single model (analytics/editor.ts reportEditor).
+      if (path === '/story_editor' || path === '/story_editor_report') {
+        try {
+          const asset = q.get('asset')
+          if (!asset) return json(400, { ok: false, error: 'asset is required' })
+          const tfv = tfStrict(q.get('tf') ?? '1m')
+          if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const mk = kernel.context().use<MarketDataService>('market'), nowSec = Math.floor(Date.now() / 1000)
+          const clean = (cs: Candle[], tfx: Timeframe) => { let c = (cs ?? []).filter((x) => x && [x.time, x.open, x.high, x.low, x.close].every((v) => Number.isFinite(v))); if (c.length && c[c.length - 1].time + TIMEFRAME_SECONDS[tfx] > nowSec) c = c.slice(0, -1); return c }
+          const info = mk.listAssets().find((a) => a.ticker === asset)
+          const otc = q.get('otc') !== null ? q.get('otc') === '1' : !!info?.otc
+          let ticks: { ts: number; price: number }[] | undefined
+          try { ticks = kernel.context().use<{ ticksFor: (a: string) => { ts: number; price: number }[] }>('otcFootprint').ticksFor(asset) } catch { ticks = undefined }
+          if (path === '/story_editor_report') {
+            const store = kernel.context().use<{ getCandlesArchive: (a: string, t: string, n: number) => Candle[] }>('storeRaw')
+            const bars = Math.max(400, Math.min(4000, Math.round(Number(q.get('bars')) || 1500)))
+            const c = store.getCandlesArchive(asset, tfv, bars).filter((x) => x && [x.time, x.open, x.high, x.low, x.close].every((v) => Number.isFinite(v)))
+            return json(200, { asset, tf: tfv, otc, ...reportEditor(c, ticks, { otc, step: Number(q.get('step')) || 8 }) })
+          }
+          const c = clean(mk.getCandlesDeep(asset, tfv, 1500, true), tfv)
+          const htfq = String(q.get('htf') ?? '5m')
+          let hc: Candle[] | null = null
+          if (htfq !== 'none' && (ALL_TIMEFRAMES as string[]).includes(htfq) && TIMEFRAME_SECONDS[htfq as Timeframe] > TIMEFRAME_SECONDS[tfv]) hc = clean(mk.getCandlesDeep(asset, htfq as Timeframe, 400, true), htfq as Timeframe)
+          const e = readEditor(c, ticks, hc, { htfTf: hc ? htfq : 'none', otc })
+          const { bars: _pb, ...pmTrig } = e.pm.trigger
+          return json(200, { asset, tf: tfv, otc, ok: e.ok, error: e.error, dir: e.dir, prob: e.prob, strength: e.strength, agreement: e.agreement, regime: e.regime, reasons: e.reasons, invalidation: e.invalidation, invalidationProb: e.invalidationProb, tradeNow: e.tradeNow, text: e.text, wx: e.wx, nm: e.nm, pm: { alignment: e.pm.alignment, dir: e.pm.dir, prob: e.pm.prob, strength: e.pm.strength, text: e.pm.text, validated: pmTrig.validation.validated } })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // GET /next_move?asset=&tf=1m&horizon=5&otc=0|1 - WEATHER + EDITOR (analytics/weather.ts, analytics/editor.ts): `let w = story.weather()` -> w.regime (dead|squeeze|expansion|trend-up|trend-down|range|mixed), w.er, w.chop, w.volRank, w.favours (follow|fade|neither - what has paid in this regime on THIS pair), w.tradeable; `let e = story.editor()` / story.editor(\"15m\") / story.editor(\"otc\") -> ONE verdict from pm + nm + weather: e.direction e.prob e.strength e.agreement (aligned|conflict|nm-only|pm-only|no-call) e.regime e.tradeNow e.invalidation (price that proves it wrong) e.invalidationProb e.pmValidated e.nmValidated. story.weatherText() / story.editorText() the sentences. Typical: `call when e.tradeNow and e.direction == \"call\"` then `pos.stop = e.invalidation`. NEXT MOVE (analytics/nextmove.ts): price's own map + causes + level ledger + analog outcomes (next candle, next `horizon` candles, reach-above-before-below), blended with pm.
       if (path === '/next_move') {
         try {
           const asset = q.get('asset')

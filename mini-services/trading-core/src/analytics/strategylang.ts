@@ -281,6 +281,8 @@ import { readMtf } from './mtfstory'
 import { readCauseEffect, combineCeMtf } from './causeeffect'
 import { readCfdPlan } from './cfdplan'
 import { readNextMove, combineNmPm } from './nextmove'
+import { readWeather } from './weather'
+import { readEditor } from './editor'
 import { readStory, readRoc, readWindowStory, readStructure, readFormingStory, cutBars } from './candlestory'
 import { oscillatorVotes, maVotes, TECH_MIN_BARS, TECH_BARS_PER_RUNG, type TechVote } from './technicals'
 
@@ -5633,6 +5635,7 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         if (e.name === 'of' || e.name === 'ofText') return storyOf(e.name, args, ctx)
         if (e.name === 'mtf') return storyMtf(args, ctx)
         if (e.name === 'pm' || e.name === 'pmText' || e.name === 'otcpm' || e.name === 'otcpmText') return storyPm(e.name, args, ctx)
+        if (e.name === 'weather' || e.name === 'weatherText' || e.name === 'editor' || e.name === 'editorText') return storyEditor(e.name, args, ctx)
         if (e.name === 'nm' || e.name === 'nmText' || e.name === 'otcnm') return storyNm(e.name, args, ctx)
         if (e.name === 'cfd' || e.name === 'cfdText' || e.name === 'otccfd') return storyCfd(e.name, args, ctx)
         const tf = args.length && typeof args[args.length - 1] === 'string' && e.name !== 'is' ? (args.pop() as string) : undefined
@@ -6490,6 +6493,29 @@ function storyNm(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
     session: r.map.session, sessionMove: r.map.sessionMoveAtr, lastSession: r.map.lastSession, lastSessionMove: r.map.lastSessionMoveAtr, lastSessionEnd: r.map.lastSessionEndAtr, prevHigh: r.map.prevHigh, prevLow: r.map.prevLow,
     prevClose: r.map.prevClose, dayOpen: r.map.dayOpen, dayHigh: r.map.dayHigh, dayLow: r.map.dayLow, dayHighHold: r.ledger.dayHighHold, dayHighN: r.ledger.dayHighN, dayLowHold: r.ledger.dayLowHold, dayLowN: r.ledger.dayLowN,
     supHold: r.ledger.supHold, supN: r.ledger.supN, resHold: r.ledger.resHold, resN: r.ledger.resN, pmAlignment: cb.alignment, combDirection: cb.dir, combProb: cb.prob, combStrength: cb.strength })
+}
+
+/** `story.weather()` - the market's character from price alone (analytics/weather.ts): regime (dead|squeeze|expansion|trend-up|trend-down|range|mixed), er (efficiency 0..1), chop, volRank, bwRank, atrRatio,
+ * favours ("follow"|"fade"|"neither" - what has paid in this regime on THIS pair), momentumHit, momentumN, tradeable. story.weatherText() the sentence.
+ * `story.editor([htf], ["otc"])` - ONE verdict (analytics/editor.ts) from pm + nm + the weather: direction prob strength agreement (aligned|conflict|nm-only|pm-only|no-call) regime tradeNow
+ * invalidation (price that proves the call wrong) invalidationProb, plus pmDir/pmStrength/nmDir/nmStrength/nmValidated/pmValidated. story.editorText() the sentence. */
+function storyEditor(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
+  const strs = args.filter((a): a is string => typeof a === 'string')
+  const otc = strs.includes('otc')
+  const htfTf = strs.find((a) => a !== 'otc') ?? '5m'
+  const mk = (s: MslSeriesCtx) => { const t = s.time ?? []; return seriesToCandles(s).map((c, i) => ({ ...c, time: t[i] ?? i })) }
+  const cs = mk(requireSeries(ctx, undefined))
+  if (name === 'weather' || name === 'weatherText') {
+    const w = readWeather(cs)
+    if (name === 'weatherText') return w.text
+    return bundleValue({ ok: w.ok, error: w.ok ? '' : (w.error ?? ''), regime: w.regime, er: w.er, chop: w.chop, volRank: w.volRank, bwRank: w.bwRank, atrRatio: w.atrRatio, favours: w.favours, momentumHit: w.momentumHit, momentumN: w.momentumN, tradeable: w.tradeable })
+  }
+  let htfC: ReturnType<typeof mk> | null = null
+  if (htfTf !== 'none') { try { const hs = ctx.seriesFor?.(htfTf); if (hs) htfC = mk(hs) } catch { htfC = null } }
+  const e = readEditor(cs, ctx.liveTicks, htfC, { htfTf, otc })
+  if (name === 'editorText') return e.text
+  return bundleValue({ ok: e.ok, error: e.ok ? '' : (e.error ?? ''), direction: e.dir, prob: e.prob, strength: e.strength, agreement: e.agreement, regime: e.regime, tradeNow: e.tradeNow, invalidation: e.invalidation, invalidationProb: e.invalidationProb,
+    pmDir: e.pm.dir, pmStrength: e.pm.strength, pmValidated: e.pm.trigger.validation.validated, nmDir: e.nm.nm.dir, nmStrength: e.nm.nm.confidence, nmValidated: e.nm.nm.validated, favours: e.wx.favours, tradeable: e.wx.tradeable })
 }
 
 function lastAtr(ctx: EvalEnv): number {

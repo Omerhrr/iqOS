@@ -462,4 +462,19 @@ put when ok and n.direction == "put" and n.pDownFirst >= n.pUpFirst
 expiry = 1
 `,
   },
+  {
+    id: 'meta:builtin-story-editor',
+    name: 'Builtin: story editor (pm + nm + weather)',
+    script: `
+# THE EDITOR. One verdict from pm (who is pushing), nm (where price is and what followed from here) and the weather (trend/range/squeeze/dead). Trades only when the blend is strong, at least one
+# model has a validated walk-forward record, and the market is not dead. The stop is the invalidation level (the price that would prove the call wrong). Agreement of models that read the same candles
+# is weaker evidence than it looks: run /story_editor_report on the pair first to see whether agreement actually beat the better single model.
+let minConf = 50
+let e = story.editor("5m")
+let ok = e.ok and e.tradeNow and e.strength >= minConf and e.tradeable
+call when ok and e.direction == "call"
+put when ok and e.direction == "put"
+expiry = 1
+`,
+  },
 ]

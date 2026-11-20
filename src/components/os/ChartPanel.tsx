@@ -2969,6 +2969,22 @@ export default function ChartPanel({
     causes?: { structure: string; regZ: number; regR2: number; exhaustion: number; atSupport: boolean; atResistance: boolean }
     ledger?: { resHold: number; resN: number; supHold: number; supN: number; dayHighHold: number; dayHighN: number; dayLowHold: number; dayLowN: number }
     combined?: { alignment: string; dir: string; prob: number; strength: number } }
+  // ED = EDITOR: pm + nm + weather in one verdict (/story_editor), plus the on-demand agreement report (/story_editor_report)
+  type EdRes = { ok: boolean; error?: string; dir?: string; prob?: number; strength?: number; agreement?: string; regime?: string; reasons?: string[]; invalidation?: number; invalidationProb?: number; tradeNow?: boolean; text?: string
+    wx?: { regime: string; er: number; chop: number; volRank: number; favours: string; momentumHit: number; momentumN: number; text: string }; nm?: { nm?: { validated: boolean } }; pm?: { validated: boolean } }
+  type EdReport = { ok: boolean; error?: string; bars?: number; step?: number; groups?: Record<string, { n: number; hit: number; rate: number | null }>; byRegime?: Record<string, { n: number; hit: number; rate: number | null }>; verdict?: string }
+  const [edRes, setEdRes] = useState<EdRes | null>(null)
+  const [edRep, setEdRep] = useState<EdReport | null>(null)
+  const [edBusy, setEdBusy] = useState(false)
+  useEffect(() => {
+    if (!showStory || storyView !== 'ed') return
+    let alive = true
+    const load = () => { osGet<EdRes>('/story_editor', { asset: digitsTicker, tf: tf ?? '1m', htf: pmHtf || 'none' }).then((r) => { if (alive) setEdRes(r) }).catch((e) => { if (alive) setEdRes({ ok: false, error: String(e instanceof Error ? e.message : e).slice(0, 160) }) }) }
+    setEdRes(null); setEdRep(null); load()
+    const t = window.setInterval(load, 15000)
+    return () => { alive = false; window.clearInterval(t) }
+  }, [showStory, storyView, digitsTicker, tf, pmHtf])
+  const runEdReport = () => { setEdBusy(true); setEdRep(null); osGet<EdReport>('/story_editor_report', { asset: digitsTicker, tf: tf ?? '1m', bars: 1500, step: 8 }).then(setEdRep).catch((e) => setEdRep({ ok: false, error: String(e instanceof Error ? e.message : e).slice(0, 160) })).finally(() => setEdBusy(false)) }
   const [nmRes, setNmRes] = useState<NmRes | null>(null)
   const [nmHz, setNmHz] = useState('5')
   useEffect(() => {
@@ -3021,7 +3037,7 @@ export default function ChartPanel({
   const [study, setStudy] = useState<StudyRes | null>(null)
   const [studyBusy, setStudyBusy] = useState(false)
   useEffect(() => {
-    if (!showStory || storyView === 'candles' || storyView === 'mtf' || storyView === 'pm' || storyView === 'nm') return
+    if (!showStory || storyView === 'candles' || storyView === 'mtf' || storyView === 'pm' || storyView === 'nm' || storyView === 'ed') return
     let alive = true
     const load = () => { osGet<ChartStoryRes>('/chart_story', { asset: digitsTicker, tf: tf ?? '1m', type: storyView, ...(storyView === 'baseline' ? { mode: 'mid' } : {}) }).then((r) => { if (alive) setChartStory(r) }).catch((e) => { if (alive) setChartStory({ ok: false, error: String(e instanceof Error ? e.message : e).slice(0, 120) }) }) }
     setChartStory(null); load()
@@ -3232,11 +3248,11 @@ export default function ChartPanel({
               <button onClick={() => setShowStory(false)} className="text-[#7c8aa5] hover:text-white">x</button>
             </div>
             <div className="flex flex-wrap gap-0.5">
-              {[['candles', 'candles'], ['renko', 'renko'], ['kagi', 'kagi'], ['effort', 'effort'], ['ha', 'heikin'], ['tickbars', 'tick bars'], ['ticks', 'ticks'], ['baseline', 'baseline'], ['footprint', 'footprint'], ['mtf', 'MTF'], ['pm', 'PM'], ['nm', 'NM']].map(([id, label]) => (
+              {[['candles', 'candles'], ['renko', 'renko'], ['kagi', 'kagi'], ['effort', 'effort'], ['ha', 'heikin'], ['tickbars', 'tick bars'], ['ticks', 'ticks'], ['baseline', 'baseline'], ['footprint', 'footprint'], ['mtf', 'MTF'], ['pm', 'PM'], ['nm', 'NM'], ['ed', 'EDITOR']].map(([id, label]) => (
                 <button key={id} onClick={() => setStoryView(id)} className={`rounded border px-1 py-px text-[8px] ${storyView === id ? 'border-amber-500/60 bg-amber-500/15 text-amber-300' : 'border-[#1c2739] text-[#7c8aa5] hover:text-white'}`}>{label}</button>
               ))}
             </div>
-            {storyView !== 'candles' && storyView !== 'mtf' && storyView !== 'pm' && storyView !== 'nm' && (
+            {storyView !== 'candles' && storyView !== 'mtf' && storyView !== 'pm' && storyView !== 'nm' && storyView !== 'ed' && (
               <div className="space-y-1">
                 {!chartStory && <div className="text-[#7c8aa5]">reading...</div>}
                 {chartStory && !chartStory.ok && <div className="text-rose-300">{chartStory.text || chartStory.error || 'no story'}</div>}
@@ -3289,6 +3305,36 @@ export default function ChartPanel({
                         </div>
                       )}
                       <div className="text-[#5d6b85]">Judgement-weighted, footprint estimated, not a proven edge. Backtest first.</div>
+                    </>
+                  )
+                })()}
+              </div>
+            )}
+            {storyView === 'ed' && (
+              <div className="space-y-1">
+                {!edRes && <div className="text-[#7c8aa5]">editing the story...</div>}
+                {edRes && !edRes.ok && <div className="text-rose-300">{edRes.error ?? 'no read'}</div>}
+                {edRes?.ok && (() => {
+                  const e = edRes, d = e.dir ?? 'none', pc = (x: number | undefined) => (x === undefined || !Number.isFinite(x) ? '-' : `${(x * 100).toFixed(0)}%`)
+                  return (
+                    <>
+                      <div className={`flex items-center justify-between rounded border px-1.5 py-1 ${d === 'call' ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-300' : d === 'put' ? 'border-rose-500/50 bg-rose-500/10 text-rose-300' : 'border-[#1c2739] text-[#7c8aa5]'}`}>
+                        <span className="font-bold">{d === 'call' ? 'EDITOR: CALL' : d === 'put' ? 'EDITOR: PUT' : 'EDITOR: no call'} {d !== 'none' ? pc(e.prob) : ''}</span>
+                        <span>{e.strength}/100 · {e.agreement}{e.tradeNow ? ' · TRADE-READY' : ''}</span>
+                      </div>
+                      <div className="text-[#d6e2f5]">{(e.reasons ?? []).join(' · ')}</div>
+                      {Number.isFinite(e.invalidation) && <div className="text-amber-200/90">wrong if price reaches {e.invalidation} first · {pc(e.invalidationProb)} of similar cases did</div>}
+                      {e.wx && <div className="rounded border border-[#1c2739] p-1 text-[#7c8aa5]">WEATHER · {e.wx.regime} · efficiency {e.wx.er.toFixed(2)} · chop {e.wx.chop.toFixed(0)} · volatility {(e.wx.volRank * 100).toFixed(0)}th pct · {e.wx.favours === 'follow' ? 'following has paid here' : e.wx.favours === 'fade' ? 'fading has paid here' : 'no clear tilt'} ({pc(e.wx.momentumHit)} of {e.wx.momentumN})</div>}
+                      <div className="flex items-center gap-2 text-[#7c8aa5]">
+                        <button onClick={runEdReport} disabled={edBusy} className="rounded border border-amber-500/40 px-1.5 py-px text-[8px] text-amber-300 hover:bg-amber-500/10 disabled:opacity-50">{edBusy ? 'measuring...' : 'does agreement help? (run on this pair)'}</button>
+                      </div>
+                      {edRep && !edRep.ok && <div className="text-rose-300">{edRep.error}</div>}
+                      {edRep?.ok && edRep.groups && (
+                        <div className="space-y-0.5 rounded border border-[#1c2739] p-1 text-[#7c8aa5]">
+                          {Object.entries(edRep.groups).map(([k, g]) => <div key={k} className="flex justify-between"><span>{k}</span><span className="text-[#d6e2f5]">{g.rate === null ? '-' : `${(g.rate * 100).toFixed(1)}%`} of {g.n}</span></div>)}
+                          <div className="pt-0.5 text-amber-200/90">{edRep.verdict}</div>
+                        </div>
+                      )}
                     </>
                   )
                 })()}
