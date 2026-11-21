@@ -560,4 +560,26 @@ pos.target = tp.target
 expiry = 1
 `,
   },
+  {
+    id: 'meta:builtin-timing-sage',
+    name: 'Builtin: timing sage (pm + dip entry)',
+    script: `
+# TIMING SAGE on pm. pm is the signal; the sage decides WHEN to enter. After the signal it watches the first move: a straight move our way is taken at once (the strong ones are never skipped);
+# a shallow dip is bought only after price has turned back AND the re-check still holds (pm still the same way, no conflict, Heikin Ashi lets the side through); a deep dip (0.5 ATR) is a reversal and aborts.
+# Every taken / skipped case is resolved 60 s later (skipped ones counterfactually), so timing.sageText("sage-call") shows how the dip entries and the skipped signals really did; with 15+ resolved dip entries under 50% the sage stops buying dips on this scope.
+# LIVE / replay only (needs the path after the signal): run /msl_replay with compare:true to see the value of the wait. Meta Trader polls fast while the sage is watching.
+let minConf = 45
+let p = story.pm()
+let base = p.ok and p.validated and p.bucketN >= 15 and p.strength >= minConf
+let sigCall = base and p.direction == "call" and not p.atResistance
+let sigPut = base and p.direction == "put" and not p.atSupport
+let okCall = p.ok and p.direction == "call" and p.alignment != "conflict" and story.haFilter("call", "color").pass
+let okPut = p.ok and p.direction == "put" and p.alignment != "conflict" and story.haFilter("put", "color").pass
+let goCall = timing.sage("sage-call", sigCall, 1, 30, 0.15, 0.5, okCall)
+let goPut = timing.sage("sage-put", sigPut, -1, 30, 0.15, 0.5, okPut)
+call when goCall == 1
+put when goPut == 1
+expiry = 1
+`,
+  },
 ]

@@ -254,6 +254,7 @@ import { pmax, pmaxSource } from './pmax'
 import { maSeries, dema, t3, hema, vwapDaily, hullSeries } from './mamix'
 import { readEm, emUpper, emLower, emZ, emSigmaAt, emModeFromCode, emParams, EM_MIN_BARS } from './expectedmove'
 import { detectChartPatterns2, readAutoTrend, readElliott, CP_MIN_BARS, type CpHit, type AutoTrend, type EwRead } from './patternengine'
+import { stepSage, sageKey, sageRec, sageStats, sageText } from './sage'
 import { stepHold, holdKey, holdRec, clearHolds, inReplay, replayBypassOn, stepBypass, clearBypass } from './timing'
 import { liveRiskOutcomes, riskStats, sessionAt, minsIn, minsLeft, inWindow, inDates, weekendAt, type RiskOutcome } from './mslrisk'
 import { readPullback, PB_MIN_BARS, type PullbackRead } from './pullback'
@@ -3280,6 +3281,31 @@ function timingMethod(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
       if (ctx.trace && (r.rec.state !== 'idle' || truthy(args[1]))) ctx.trace.push(`hold "${nameArg()}": ${r.rec.state}${r.rec.why ? ' - ' + r.rec.why : ''} (price ${Number.isFinite(price) ? price : 'n/a'} from ${lp.src}${lp.src === 'bar' || lp.src === 'tick-old' ? ' - NOT a live price, the hold cannot confirm on it' : ''})`)
       return r.fire ? 1 : 0
     }
+    case 'sage': {
+      if (inMslBacktest() && !inReplay()) throw new MslRuntimeError('timing.sage() is live-only in the candle backtester (1m bars cannot show the path after the signal) - use the replay tester (/msl_replay) on 5s data')
+      if (args.length < 4) throw new MslRuntimeError('timing.sage(name, cond, dir, seconds [, dipAtr [, abortAtr [, valid [, straight [, horizonSec [, goAtr [, recoverFrac]]]]]]]) needs at least 4 arguments')
+      const d = typeof args[2] === 'string' ? (args[2] === 'call' ? 1 : args[2] === 'put' ? -1 : 0) : Math.sign(asNum(args[2]))
+      if (d === 0) throw new MslRuntimeError('timing.sage(): dir must be +1/-1 (or "call"/"put")')
+      const seconds = asNum(args[3])
+      if (!(seconds > 0 && seconds <= 3600)) throw new MslRuntimeError('timing.sage(): seconds must be between 0 and 3600')
+      if (replayBypassOn()) return stepBypass(key(), truthy(args[1])) ? 1 : 0
+      const s = requireSeries(ctx, undefined)
+      const a14 = atrInd(s.high, s.low, s.close, 14)
+      const atrv = a14[a14.length - 1]
+      if (!Number.isFinite(atrv) || atrv <= 0) throw new MslRuntimeError('timing.sage(): ATR unavailable (history too thin or flat)')
+      const lp = livePrice(ctx, s, nowMs)
+      const num = (v: MslValue | undefined, def: number): number => (v === undefined ? def : asNum(v))
+      const r = stepSage({ key: sageKey(ctx.stateKeyPrefix as string, nameArg()), cond: truthy(args[1]), valid: args[6] === undefined ? true : truthy(args[6]), dir: d, seconds,
+        dipAtr: num(args[4], 0.15), abortAtr: num(args[5], 0.5), straightTake: args[7] === undefined || args[7] !== 'skip', horizonSec: num(args[8], 60), goAtr: num(args[9], 0.1), recoverFrac: num(args[10], 0.4),
+        nowMs, price: lp.price, atr: atrv })
+      if (ctx.trace && (r.rec.state !== 'idle' || truthy(args[1]))) ctx.trace.push(`sage "${nameArg()}": ${r.rec.state}${r.rec.why ? ' - ' + r.rec.why : ''} (move ${r.rec.move.toFixed(2)} ATR, worst ${(-r.rec.mae).toFixed(2)})`)
+      return r.fire ? 1 : 0
+    }
+    case 'sageState': { if (ctx.stateKeyPrefix === undefined) return 'idle'; return sageRec(sageKey(ctx.stateKeyPrefix, nameArg()))?.state ?? 'idle' }
+    case 'sageWhy': { if (ctx.stateKeyPrefix === undefined) return ''; return sageRec(sageKey(ctx.stateKeyPrefix, nameArg()))?.why ?? '' }
+    case 'sageClass': { if (ctx.stateKeyPrefix === undefined) return ''; return sageRec(sageKey(ctx.stateKeyPrefix, nameArg()))?.cls ?? '' }
+    case 'sageDip': { if (ctx.stateKeyPrefix === undefined) return 0; return sageRec(sageKey(ctx.stateKeyPrefix, nameArg()))?.mae ?? 0 }
+    case 'sageText': { if (ctx.stateKeyPrefix === undefined) return ''; return sageText(sageKey(ctx.stateKeyPrefix, nameArg())) }
     case 'state': return holdRec(key())?.state ?? 'idle'
     case 'why': return holdRec(key())?.why ?? ''
     case 'waited': { const r = holdRec(key()); return r && r.state === 'waiting' ? (nowMs - r.armedMs) / 1000 : 0 }
@@ -3297,7 +3323,7 @@ function timingMethod(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
     case 'minute': return new Date(nowMs).getUTCMinutes()
     case 'hour': return new Date(nowMs).getUTCHours()
     case 'dow': return new Date(nowMs).getUTCDay()
-    default: throw new MslRuntimeError(`unknown timing method "timing.${name}(...)" - use hold/state/why/waited/left/move/barAge/barLeft/second/minute/hour/dow`)
+    default: throw new MslRuntimeError(`unknown timing method "timing.${name}(...)" - use hold/sage/sageState/sageWhy/sageClass/sageDip/sageText/state/why/waited/left/move/barAge/barLeft/second/minute/hour/dow`)
   }
 }
 function barSpacingSec(s: MslSeriesCtx): number {

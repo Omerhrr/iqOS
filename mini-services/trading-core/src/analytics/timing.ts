@@ -14,13 +14,14 @@
 // STATE reads (all by name): timing.state(name) text idle|waiting|confirmed|aborted, timing.waited(name) s, timing.left(name) s, timing.move(name) ATR in dir, timing.why(name) text.
 // CLOCK reads (stateless, candle-derived so they ALSO replay in a backtest on the bar's own time): timing.barAge() seconds since the current bar opened, timing.barLeft() seconds until it
 //   closes, timing.second() / minute() / hour() UTC, timing.dow() (0 = Sunday). Live these use the real clock, in a backtest the evaluated bar's close time.
+import { hasWaitingSage, clearSage } from './sage'
 export type HoldState = 'idle' | 'waiting' | 'confirmed' | 'aborted'
 export interface HoldRec { state: HoldState; armedMs: number; entry: number; dir: number; atr: number; latched: boolean; doneMs: number; why: string; move: number; seconds: number; confirmedOut: boolean }
 const store = new Map<string, HoldRec>()
 export const holdKey = (prefix: string, name: string): string => `${prefix}|hold|${name}`
-export function clearHolds(prefix: string): void { for (const k of store.keys()) if (k.startsWith(`${prefix}|hold|`)) store.delete(k) }
+export function clearHolds(prefix: string): void { clearSage(prefix); for (const k of store.keys()) if (k.startsWith(`${prefix}|hold|`)) store.delete(k) }
 /** true while any hold under this key prefix is armed and counting down - lets a slow-polling trader re-check fast only when it matters */
-export function hasWaitingHold(prefix: string): boolean { for (const [k, r] of store) if (r.state === 'waiting' && k.startsWith(`${prefix}|`) && k.includes('|hold|')) return true; return false }
+export function hasWaitingHold(prefix: string): boolean { if (hasWaitingSage(prefix)) return true; for (const [k, r] of store) if (r.state === 'waiting' && k.startsWith(`${prefix}|`) && k.includes('|hold|')) return true; return false }
 export function holdRec(key: string): HoldRec | undefined { return store.get(key) }
 
 export interface HoldInput { key: string; cond: boolean; dir: number; seconds: number; minAtr: number; abortAtr: number; nowMs: number; price: number; atr: number }
