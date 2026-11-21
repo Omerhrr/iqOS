@@ -2656,24 +2656,34 @@ const httpServer = createServer(async (req, res) => {
           const get = (t: string, tfx: Timeframe, n: number) => { try { return clean(mk.getCandlesDeep(t, tfx, n, true) ?? [], tfx) } catch { return [] } }
           let tk: ((a: string) => { ts: number; price: number }[]) | null = null
           try { const o = kernel.context().use<{ ticksFor: (a: string) => { ts: number; price: number }[] }>('otcFootprint'); tk = (a) => o.ticksFor(a) } catch { tk = null }
-          const assets = mk.listAssets().filter((x) => x.open && !exclude.has(x.ticker) && (scope === 'all' || (scope === 'otc') === Boolean(x.otc)))
-          // stage 1: the cheap pm screen
+          // the WHOLE universe of the chosen scope, in a fixed order; each call searches the next `batch` pairs (default 100) from `offset`, wrapping round, so repeated clicks cover every pair
+          const universe = mk.listAssets().filter((x) => x.open && (scope === 'all' || (scope === 'otc') === Boolean(x.otc))).sort((a, b) => (a.ticker < b.ticker ? -1 : a.ticker > b.ticker ? 1 : 0))
+          const batchN = Math.max(20, Math.min(150, Math.round(Number(q.get('batch')) || 100)))
+          const total = universe.length, off = total ? ((Math.round(Number(q.get('offset')) || 0) % total) + total) % total : 0
+          const slice = total ? Array.from({ length: Math.min(batchN, total) }, (_, k) => universe[(off + k) % total]) : []
+          const assets = slice.filter((x) => !exclude.has(x.ticker))
+          // stage 1: the cheap pm screen over EVERY pair of the batch - a pair goes on when pm has a call on 1m or 5m and the other frame does not oppose it
           const screen: Array<{ asset: string; otc: boolean; q: number }> = []
+          let thin = 0
           for (const a of assets) {
             try {
               const c1 = get(a.ticker, '1m', 420), c5 = get(a.ticker, '5m', 420)
-              if (c1.length < 260 || c5.length < 260) continue
+              if (c1.length < 260 || c5.length < 260) { thin++; continue }
               const r1 = readCauseEffect(c1.slice(-400), undefined, { otc: !!a.otc }), r5 = readCauseEffect(c5.slice(-400), undefined, { otc: !!a.otc })
-              if (!r1.ok || !r5.ok || r1.pm.dir === 'none' || r1.pm.dir !== r5.pm.dir) continue
-              screen.push({ asset: a.ticker, otc: !!a.otc, q: Math.min(r1.pm.confidence, r5.pm.confidence) + (r1.validation.validated ? 8 : 0) + (r5.validation.validated ? 8 : 0) })
-            } catch { /* skip pair */ }
+              if (!r1.ok || !r5.ok) { thin++; continue }
+              const d1 = r1.pm.dir, d5 = r5.pm.dir
+              if ((d1 === 'none' && d5 === 'none') || (d1 !== 'none' && d5 !== 'none' && d1 !== d5)) continue
+              screen.push({ asset: a.ticker, otc: !!a.otc, q: Math.max(d1 !== 'none' ? r1.pm.confidence : 0, d5 !== 'none' ? r5.pm.confidence : 0) + (d1 === d5 ? 15 : 0) + (r1.validation.validated ? 8 : 0) + (r5.validation.validated ? 8 : 0) })
+            } catch { thin++ }
           }
           screen.sort((x, y) => y.q - x.q)
-          // stage 2: the full multi-timeframe read of the best dozen
+          // stage 2: the full multi-timeframe read of EVERY pair that passed, best first, inside a time budget
           const tfs: Timeframe[] = ['30s', '1m', '2m', '5m', '15m', '30m']
           const results: FinderResult[] = []
-          for (const sc of screen.slice(0, 12)) {
-            if (Date.now() - t0 > 20000) break
+          let unread = 0
+          for (let si = 0; si < screen.length; si++) {
+            const sc = screen[si]
+            if (Date.now() - t0 > 24000) { unread = screen.length - si; break }
             const frames: FinderFrame[] = []
             for (const tfx of tfs) { const c = get(sc.asset, tfx, tfx === '30s' ? 500 : 480); if (c.length >= 260) frames.push({ tf: tfx, sec: TIMEFRAME_SECONDS[tfx], candles: c }) }
             if (frames.length < 2) continue
@@ -2681,10 +2691,11 @@ const httpServer = createServer(async (req, res) => {
             try { ticks = tk && sc.otc ? tk(sc.asset) : undefined } catch { ticks = undefined }
             try { results.push(readFinderAsset(frames, { mode, minScore, asset: sc.asset, otc: sc.otc, nowSec, ticks })) } catch { /* skip pair */ }
           }
+          const nextOffset = total ? (off + Math.min(batchN, total)) % total : 0
           const found = results.filter((r) => r.found).sort((x, y) => y.score - x.score)
           const near = results.filter((r) => !r.found && r.side !== 'none').sort((x, y) => y.score - x.score).slice(0, 3).map((r) => ({ asset: r.asset, side: r.side, score: r.score, why: r.rejected.slice(0, 3) }))
-          return json(200, { ok: true, mode, minScore, found: found.length > 0, best: found[0] ?? null, runnersUp: found.slice(1, 4), closest: found.length ? [] : near, scanned: assets.length, screened: screen.length, read: results.length, ms: Date.now() - t0,
-            note: found.length ? '' : `Nothing cleared the bar of ${minScore} with several timeframes agreeing, no blocks and a validated record. Waiting is a valid answer.` })
+          return json(200, { ok: true, mode, minScore, found: found.length > 0, best: found[0] ?? null, runnersUp: found.slice(1, 4), closest: found.length ? [] : near, scanned: assets.length, screened: screen.length, read: results.length, thin, unread, total, from: off, to: total ? off + Math.min(batchN, total) : 0, nextOffset, wrapped: total > 0 && off + Math.min(batchN, total) >= total, ms: Date.now() - t0,
+            note: found.length ? '' : `Nothing in this batch cleared the bar of ${minScore} with several timeframes agreeing, no blocks and a validated record. ${total > batchN ? 'Search the next batch to cover the rest of the market.' : 'That was the whole market for this scope.'}` })
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }

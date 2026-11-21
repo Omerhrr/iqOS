@@ -18,7 +18,7 @@ interface Found {
   expiry: { minutes: number; bars: number; tf: string; prob: number; basis: string; table: Array<{ minutes: number; prob: number }> } | null
   cfd: { entry: number; stop: number; target: number; rr: number; ev: number; riskAtr: number; rewardAtr: number; tpPct: number; slPct: number; stopKind: string; targetKind: string; text: string } | null
 }
-interface FindRes { ok: boolean; error?: string; mode: Mode; minScore: number; found: boolean; best: Found | null; runnersUp: Found[]; closest: Array<{ asset: string; side: string; score: number; why: string[] }>; scanned: number; screened: number; read: number; ms: number; note: string }
+interface FindRes { ok: boolean; error?: string; mode: Mode; minScore: number; found: boolean; best: Found | null; runnersUp: Found[]; closest: Array<{ asset: string; side: string; score: number; why: string[] }>; scanned: number; screened: number; read: number; ms: number; note: string; thin: number; unread: number; total: number; from: number; to: number; nextOffset: number; wrapped: boolean }
 
 const DIGITAL_SECS = [300, 900, 1800]
 const sideCls = (s: string) => (s === 'call' ? 'text-emerald-300' : s === 'put' ? 'text-rose-300' : 'text-[#7c8aa5]')
@@ -35,6 +35,9 @@ export default function FinderTab({ assets, prices, onSelectAsset, onPlaced, onE
   const [pick, setPick] = useState<Record<Mode, Found | null>>({ option: null, cfd: null })
   const [prefill, setPrefill] = useState<Record<Mode, TicketPrefill | null>>({ option: null, cfd: null })
   const [err, setErr] = useState<string | null>(null)
+  // where the next search starts, per mode + scope: each click searches the next 100 pairs of the scope, wrapping round, so repeated clicks cover the whole market
+  const [offsets, setOffsets] = useState<Record<string, number>>({})
+  const key = `${mode}|${scope}`
   const [account, setAccount] = useState<AccountState | null>(null)
   const alive = useRef(true)
   useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
@@ -61,15 +64,18 @@ export default function FinderTab({ assets, prices, onSelectAsset, onPlaced, onE
     setBusy(true); setErr(null)
     const m = mode
     try {
-      const r = await osGet<FindRes>('/find_trade', { mode: m, minScore, scope, exclude: skip })
+      const k = `${m}|${scope}`
+      const off = skip ? (res[m]?.from ?? 0) % Math.max(1, res[m]?.total ?? 1) : offsets[k] ?? 0
+      const r = await osGet<FindRes>('/find_trade', { mode: m, minScore, scope, exclude: skip, offset: off, batch: 100 })
       if (!alive.current) return
       if (!r.ok) { setErr(r.error ?? 'scan failed'); return }
       setRes((p) => ({ ...p, [m]: r }))
+      if (!skip) setOffsets((o) => ({ ...o, [k]: r.nextOffset }))
       setPick((p) => ({ ...p, [m]: r.best }))
       setPrefill((p) => ({ ...p, [m]: r.best ? toPrefill(r.best, m) : null }))
       if (r.best) onSelectAsset?.(r.best.asset)
     } catch (e) { setErr((e as Error).message.slice(0, 180)) } finally { if (alive.current) setBusy(false) }
-  }, [mode, minScore, scope, toPrefill, onSelectAsset])
+  }, [mode, minScore, scope, toPrefill, onSelectAsset, offsets, res])
 
   const r = res[mode], cur = pick[mode]
   const row = useMemo(() => assets.find((a) => a.ticker === (cur?.asset ?? assets[0]?.ticker)), [assets, cur])
@@ -83,8 +89,9 @@ export default function FinderTab({ assets, prices, onSelectAsset, onPlaced, onE
         <button type="button" className={btn(mode === 'option')} onClick={() => setMode('option')}>option</button>
         <button type="button" className={btn(mode === 'cfd')} onClick={() => setMode('cfd')}>cfd</button>
         <span className="mx-1 h-4 w-px bg-[#1c2739]" />
-        <button type="button" disabled={busy} onClick={() => void find()} className="rounded border border-emerald-500/50 bg-emerald-500/10 px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-50">{busy ? 'scanning the market...' : 'find trade'}</button>
+        <button type="button" disabled={busy} onClick={() => void find()} className="rounded border border-emerald-500/50 bg-emerald-500/10 px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-50">{busy ? 'searching...' : (offsets[key] ?? 0) > 0 ? 'search next 100' : 'find trade'}</button>
         {cur && <button type="button" disabled={busy} onClick={() => void find(cur.asset)} className="rounded border border-[#1c2739] px-2 py-1 text-[9px] uppercase text-[#7c8aa5] hover:text-sky-300 disabled:opacity-50" title="scan again without this pair">find another (skip {cur.asset})</button>}
+        {(offsets[key] ?? 0) > 0 && <button type="button" disabled={busy} onClick={() => setOffsets((o) => ({ ...o, [key]: 0 }))} className="rounded border border-[#1c2739] px-2 py-1 text-[9px] uppercase text-[#7c8aa5] hover:text-sky-300" title="start again from the first pair">start over</button>}
         <span className="ml-auto flex items-center gap-1 text-[9px] text-[#4b5a72]">
           bar
           <select value={minScore} onChange={(e) => setMinScore(Number(e.target.value))} className="rounded border border-[#1c2739] bg-[#0b111c] px-1 py-px text-[#aab6cc]">{[55, 60, 65, 70, 80].map((v) => <option key={v} value={v}>score ≥ {v}</option>)}</select>
@@ -95,13 +102,14 @@ export default function FinderTab({ assets, prices, onSelectAsset, onPlaced, onE
       <div className="flex min-h-0 flex-1">
         <div className="min-w-0 flex-1 overflow-y-auto p-2">
           {err && <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/5 p-2 text-[9px] text-amber-300">{err}</div>}
+          {r && <p className="mb-2 text-[8px] text-[#4b5a72]">searched pairs {r.from + 1}-{Math.min(r.to, r.total)}{r.to > r.total ? ` and 1-${r.to - r.total}` : ''} of {r.total} {scope === 'all' ? '' : scope + ' '}pairs · {r.screened} passed the pm screen, {r.read} read in full{r.thin > 0 ? ` · ${r.thin} skipped (not enough history)` : ''}{r.unread > 0 ? ` · ${r.unread} not read (time ran out)` : ''}{r.total > 100 ? ' · press search next 100 for the rest' : ''}</p>}
           {!r && !busy && <p className="text-[10px] text-[#4b5a72]">Press <span className="text-emerald-300">find trade</span>: it reads every open pair across 30s to 30m (pm, nm, weather, structure, trend maturity, session) and offers one trade, or tells you nothing is worth taking.</p>}
           {r && !r.found && (
             <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-2.5">
               <div className="text-[11px] font-bold uppercase tracking-wider text-amber-300">no trade worth taking right now</div>
               <p className="mt-1 text-[9px] leading-relaxed text-[#7c8aa5]">{r.note}</p>
               {r.closest.length > 0 && <div className="mt-2 text-[9px] text-[#7c8aa5]">closest:{r.closest.map((c) => <div key={c.asset} className="mt-0.5"><span className={`font-bold ${sideCls(c.side)}`}>{c.asset} {c.side}</span> score {c.score} - {c.why.join('; ')}</div>)}</div>}
-              <p className="mt-2 text-[8px] text-[#3d4d66]">scanned {r.scanned} pairs · {r.screened} passed the pm screen · {r.read} read in full · {(r.ms / 1000).toFixed(1)}s</p>
+              <p className="mt-2 text-[8px] text-[#3d4d66]">{(r.ms / 1000).toFixed(1)}s</p>
             </div>
           )}
           {cur && r?.found && (
@@ -141,7 +149,7 @@ export default function FinderTab({ assets, prices, onSelectAsset, onPlaced, onE
                   {r.runnersUp.map((f) => <button key={f.asset} type="button" onClick={() => choose(f)} className="mr-1 rounded border border-[#1c2739] px-1.5 py-0.5 text-[9px] text-[#7c8aa5] hover:text-sky-300"><span className={`font-bold ${sideCls(f.side)}`}>{f.asset} {f.side}</span> {f.score}</button>)}
                 </div>
               )}
-              <p className="text-[8px] leading-relaxed text-[#3d4d66]">scanned {r.scanned} pairs · {r.screened} passed the pm screen · {r.read} read in full · {(r.ms / 1000).toFixed(1)}s. Models read the same candles and the score weights are judgement: a high score is agreement, not a guarantee. Nothing is placed automatically.</p>
+              <p className="text-[8px] leading-relaxed text-[#3d4d66]">{(r.ms / 1000).toFixed(1)}s. Models read the same candles and the score weights are judgement: a high score is agreement, not a guarantee. Nothing is placed automatically.</p>
             </div>
           )}
         </div>
