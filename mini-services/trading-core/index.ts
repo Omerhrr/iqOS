@@ -191,15 +191,20 @@ const LAG_SAMPLE_MS = 250
 const lagWindow: { at: number; lag: number }[] = []
 let lagLastWarn = 0
 let lagPrev = Date.now()
+// requests currently being served: when the loop stalls, the log names them, so a 4-minute freeze is attributable to a route instead of a mystery
+const inflightReqs = new Map<number, { path: string; start: number }>()
+let reqSeq = 0
 setInterval(() => {
   const now = Date.now()
   const lag = Math.max(0, now - lagPrev - LAG_SAMPLE_MS)
   lagPrev = now
+  ;(globalThis as { __kernelLagMs?: number }).__kernelLagMs = lag
   lagWindow.push({ at: now, lag })
   while (lagWindow.length && now - lagWindow[0].at > 60_000) lagWindow.shift()
   if (lag > 750 && now - lagLastWarn > 30_000) {
     lagLastWarn = now
-    console.warn(`[lag] event loop stalled ${lag}ms - something ran synchronously for that long (busy scan/backtest?)`)
+    const running = [...inflightReqs.values()].map((r) => `${r.path} (${now - r.start}ms)`).slice(0, 6).join(', ')
+    console.warn(`[lag] event loop stalled ${lag}ms - something ran synchronously for that long (busy scan/backtest?)${running ? ` | requests in flight: ${running}` : ' | no request in flight (a background scan or timer)'}`)
   }
 }, LAG_SAMPLE_MS).unref?.()
 function lagStats(): { maxMs: number; p95Ms: number; samples: number } {
@@ -923,6 +928,11 @@ const httpServer = createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', `http://127.0.0.1:${PORT}`)
   const path = url.pathname
   const q = url.searchParams
+  {
+    const id = ++reqSeq, startedAt = Date.now()
+    inflightReqs.set(id, { path, start: startedAt })
+    res.on('close', () => { inflightReqs.delete(id); const d = Date.now() - startedAt; if (d > 3000) console.warn(`[slow] ${req.method} ${path} took ${d}ms`) })
+  }
 
   // ---- P0 security gate: rate limit -> token auth, BEFORE any body read ----
   const t0 = Date.now()

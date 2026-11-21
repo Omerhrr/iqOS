@@ -65,7 +65,8 @@ export class Screener2Service {
   private rows = new Map<string, ConfluenceRow>()
   private queue: { asset: string; tf: Timeframe }[] = []
   private stale = new Set<string>()
-  private timer: ReturnType<typeof setInterval> | null = null
+  private timer: ReturnType<typeof setTimeout> | null = null
+  private stopped = false
   private lastSweepTs = 0
   private lastSweepMs = 0
   private sweeping = false
@@ -82,12 +83,13 @@ export class Screener2Service {
       if (this.rows.has(key)) this.stale.add(key)
     })
 
-    this.timer = setInterval(() => this.pump(), 1_200)
+    this.scheduleNext(1_200)
     ctx.log('screener2', `Confluence Signal sweep online - targets ${this.config.tfs.join('/')} across the full universe`)
   }
 
   stop(): void {
-    if (this.timer) clearInterval(this.timer)
+    this.stopped = true
+    if (this.timer) clearTimeout(this.timer)
     this.timer = null
   }
 
@@ -123,9 +125,21 @@ export class Screener2Service {
 
   // ---------- scanning ----------
 
+  /** Self-pacing loop (replaces a fixed 1.2 s interval): the next tick waits at least 3x as long as this one WORKED, so a heavy sweep can never use more than ~25% of the event loop, and a tick is skipped outright while the kernel is already lagging (the sweeps over a 1000-pair universe were pinning the loop and freezing every request, including the data export). */
+  private scheduleNext(delayMs: number): void {
+    if (this.stopped) return
+    this.timer = setTimeout(() => {
+      const t = Date.now()
+      const lag = Number((globalThis as { __kernelLagMs?: number }).__kernelLagMs ?? 0)
+      if (lag < 400) { try { this.pump() } catch { /* pump never throws out of the loop */ } }
+      const work = Date.now() - t
+      this.scheduleNext(Math.min(30_000, Math.max(1_200, work * 3, lag > 400 ? 4_000 : 0)))
+    }, delayMs)
+  }
+
   private buildQueue(): void {
     const t0 = Date.now()
-    const instruments = searchInstruments('', this.config.category).filter((i) => i.open)
+    const instruments = searchInstruments('', this.config.category).filter((i) => i.open && this.market.isOptionInstrument(i.ticker)) // only pairs the broker actually quotes a payout for (the auto-discovered ~1400 instruments are mostly not tradeable)
     const queue: { asset: string; tf: Timeframe }[] = []
     for (const tf of this.config.tfs) {
       for (const inst of instruments) queue.push({ asset: inst.ticker, tf })
