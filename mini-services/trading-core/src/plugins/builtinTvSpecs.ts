@@ -582,4 +582,19 @@ put when goPut == 1
 expiry = 1
 `,
   },
+  {
+    id: 'meta:builtin-pmm',
+    name: 'Builtin: pmm (pm + market structure)',
+    script: `
+# PMM. pm's predicted move, gated by MARKET STRUCTURE: swing highs/lows labelled HH/HL/LH/LL, the structure they spell, BOS / CHoCH, and the swing standing in the call's way.
+# It will not call into a swing high (put into a swing low), will not fight a standing downtrend (uptrend) unless pm is strong enough or the structure just broke the other way, and will not buy the top / sell the bottom of the swing range.
+# m.blocksText says why a pm call was held back, m.boostsText what supported it. Weights are judgement: run /pmm_report on the pair first (does the gate separate pm's good calls from its bad ones?).
+let minConf = 45
+let m = story.pmm()
+let ok = m.ok and m.validated and m.strength >= minConf and m.alignment != "conflict"
+call when ok and m.direction == "call"
+put when ok and m.direction == "put"
+expiry = 1
+`,
+  },
 ]

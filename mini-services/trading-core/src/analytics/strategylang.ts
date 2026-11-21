@@ -254,6 +254,7 @@ import { pmax, pmaxSource } from './pmax'
 import { maSeries, dema, t3, hema, vwapDaily, hullSeries } from './mamix'
 import { readEm, emUpper, emLower, emZ, emSigmaAt, emModeFromCode, emParams, EM_MIN_BARS } from './expectedmove'
 import { detectChartPatterns2, readAutoTrend, readElliott, CP_MIN_BARS, type CpHit, type AutoTrend, type EwRead } from './patternengine'
+import { readPmm } from './pmm'
 import { stepSage, sageKey, sageRec, sageStats, sageText } from './sage'
 import { stepHold, holdKey, holdRec, clearHolds, inReplay, replayBypassOn, stepBypass, clearBypass } from './timing'
 import { liveRiskOutcomes, riskStats, sessionAt, minsIn, minsLeft, inWindow, inDates, weekendAt, type RiskOutcome } from './mslrisk'
@@ -5665,6 +5666,7 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         if (e.name === 'of' || e.name === 'ofText') return storyOf(e.name, args, ctx)
         if (e.name === 'mtf') return storyMtf(args, ctx)
         if (e.name === 'pm' || e.name === 'pmText' || e.name === 'otcpm' || e.name === 'otcpmText') return storyPm(e.name, args, ctx)
+        if (e.name === 'pmm' || e.name === 'pmmText' || e.name === 'otcpmm') return storyPmm(e.name, args, ctx)
         if (e.name === 'weather' || e.name === 'weatherText' || e.name === 'editor' || e.name === 'editorText') return storyEditor(e.name, args, ctx)
         if (e.name === 'nm' || e.name === 'nmText' || e.name === 'otcnm') return storyNm(e.name, args, ctx)
         if (e.name === 'cfd' || e.name === 'cfdText' || e.name === 'otccfd') return storyCfd(e.name, args, ctx)
@@ -6495,6 +6497,30 @@ function storyPm(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
     effectDir: r.effect.dir, sizeAtr: r.effect.sizeAtr, psychology: r.effect.psychology, upperWick: r.effect.upperWick, lowerWick: r.effect.lowerWick, roc: r.effect.roc, cci: r.effect.cci,
     coherence: r.validation.coherence, bucketN: r.validation.bucketN, bucketUp: r.validation.bucketUpProb, trackN: r.validation.trackN, trackHit: r.validation.trackHit,
     support: r.sr.support, resistance: r.sr.resistance, supDist: r.sr.supDist, resDist: r.sr.resDist, atSupport: r.sr.atSupport, atResistance: r.sr.atResistance, retest: r.sr.retest, text: m.text })
+}
+
+/** `story.pmm([htf])` / `story.otcpmm()` - the pm WITH MARKET STRUCTURE (analytics/pmm.ts): the same predicted move, then the swing map (HH/HL/LH/LL labels, uptrend/downtrend/expanding/contracting/mixed, BOS/CHoCH, the swings standing in price's way)
+ * decides whether the structure ALLOWS it. Flat bundle: ok error direction (the pm call AFTER the structure gate, "none" when blocked) pmDirection (pm's own call) pass blocks (count) blocksText boostsText prob strength (structure-adjusted) pmProb pmStrength alignment validated
+ * structure (uptrend|downtrend|expanding|contracting|mixed|unclear) sequence lastHigh lastLow (HH|LH|EH / HL|LL|EL) bos choch (up|down|none) breakAge rangePos (0 bottom..1 top of the last swing range) wallAbove wallAboveDist wallAboveLabel wallAboveTouches wallBelow wallBelowDist wallBelowLabel wallBelowTouches
+ * room (ATR to the next swing in the call's direction) withStructure againstStructure atSupport atResistance text. story.pmmText() is the sentence. Weights are judgement - run /pmm_report on the pair first. */
+function storyPmm(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
+  const strs = args.filter((a): a is string => typeof a === 'string')
+  const otc = name === 'otcpmm' || strs.includes('otc')
+  const htfTf = strs.find((a) => a !== 'otc') ?? '5m'
+  const mk = (s: MslSeriesCtx) => { const t = s.time ?? []; return seriesToCandles(s).map((c, i) => ({ ...c, time: t[i] ?? i })) }
+  const candles = mk(requireSeries(ctx, undefined))
+  const trig = readCauseEffect(candles, ctx.liveTicks, { otc })
+  let htf: ReturnType<typeof readCauseEffect> | null = null
+  if (htfTf !== 'none') { try { const hs = ctx.seriesFor?.(htfTf); if (hs) htf = readCauseEffect(mk(hs), undefined, { otc }) } catch { htf = null } }
+  const m = combineCeMtf(trig, htf, htfTf)
+  const r = readPmm(candles, { ok: m.ok, dir: m.dir, prob: m.prob, strength: m.strength, alignment: m.alignment })
+  if (name === 'pmmText') return r.text
+  const w = (x: { price: number; dist: number; label: string; touches: number } | null) => x ?? { price: NaN, dist: NaN, label: '', touches: 0 }
+  const up = w(r.wallAbove), dn = w(r.wallBelow)
+  return bundleValue({ ok: r.ok, error: r.ok ? '' : (r.error ?? ''), direction: r.dir, pmDirection: r.pmDir, pass: r.pass, blocks: r.blocks.length, blocksText: r.blocks.join('; '), boostsText: r.boosts.join('; '), prob: r.prob, strength: r.strength, pmProb: r.pmProb, pmStrength: r.pmStrength,
+    alignment: m.alignment, validated: trig.validation.validated, structure: r.structure, sequence: r.sequence, lastHigh: r.lastHigh, lastLow: r.lastLow, bos: r.bos, choch: r.choch, breakAge: r.breakAge, rangePos: r.rangePos,
+    wallAbove: up.price, wallAboveDist: up.dist, wallAboveLabel: up.label, wallAboveTouches: up.touches, wallBelow: dn.price, wallBelowDist: dn.dist, wallBelowLabel: dn.label, wallBelowTouches: dn.touches,
+    room: r.room, withStructure: r.withStructure, againstStructure: r.againstStructure, atSupport: trig.sr.atSupport, atResistance: trig.sr.atResistance, text: r.text })
 }
 
 /** `story.ha(["color"|"predict"|"both"], ["otc"])` - the HEIKIN ASHI PREDICTOR (analytics/hapredict.ts), built to FILTER the pm. Flat bundle: ok error color ("bull"/"bear") sign streak strength (strong|normal|weak) bodyRatio flipped state
