@@ -34,6 +34,7 @@ import ExplainerTab from './ExplainerTab'
 import RegimePanel from './RegimePanel'
 import DataExportTab from './DataExportTab'
 import SignalTab from './SignalTab'
+import FinderTab from './FinderTab'
 import MetaStrategyPanel from './MetaStrategyPanel'
 import AlertRulesPanel from './AlertRulesPanel'
 import SentinelPanel from './SentinelPanel'
@@ -255,6 +256,7 @@ export default function BottomTabs(props: BottomTabsProps) {
             ['explainer', 'Explainer'],
             ['regime', 'Regime'],
             ['signal', 'Signal'],
+            ['finder', 'Finder'],
             ['data', 'Data'],
             ['meta-strategy', 'Meta-Strategy'],
             ['autopilot', `Autopilot${props.bots.filter((b) => b.bot.enabled).length ? ` (${props.bots.filter((b) => b.bot.enabled).length})` : ''}`],
@@ -430,6 +432,20 @@ export default function BottomTabs(props: BottomTabsProps) {
           assets={props.assets}
           prices={prices}
           closedTick={closedTick}
+          onPlaced={() => {
+            refreshPositions()
+            props.refreshAccount()
+          }}
+          onError={onError}
+        />
+      </TabsContent>
+
+      <TabsContent value="finder" className="mt-0 min-h-0 flex-1 overflow-hidden">
+        <FinderTab
+          assets={props.assets}
+          prices={prices}
+          closedTick={closedTick}
+          onSelectAsset={props.onSelectAsset}
           onPlaced={() => {
             refreshPositions()
             props.refreshAccount()

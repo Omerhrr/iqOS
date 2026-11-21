@@ -105,6 +105,7 @@ import { studyStories } from './src/analytics/storystudy'
 import { readMtf } from './src/analytics/mtfstory'
 import { readCauseEffect, combineCeMtf } from './src/analytics/causeeffect'
 import { readPmm, reportPmm } from './src/analytics/pmm'
+import { readFinderAsset, type FinderResult, type FinderFrame } from './src/analytics/finder'
 const pmGlobalCache = new Map<string, { ts: number; data: { rows: Array<Record<string, unknown>> } & Record<string, unknown> }>()
 import { searchInstruments, universeStats, getInstrument } from './src/universe'
 import { listRegistry, computeIndicator, registrySize, getIndicatorDef } from './src/analytics/registry'
@@ -2636,6 +2637,54 @@ const httpServer = createServer(async (req, res) => {
           if (htfq !== 'none' && (ALL_TIMEFRAMES as string[]).includes(htfq) && TIMEFRAME_SECONDS[htfq as Timeframe] > TIMEFRAME_SECONDS[tfv]) h = readCauseEffect(clean(mk.getCandlesDeep(asset, htfq as Timeframe, 400, true) ?? [], htfq as Timeframe), undefined, { otc })
           const comb = combineCeMtf(ce, h, htfq)
           return json(200, { asset, tf: tfv, otc, htf: htfq, pm: { dir: comb.dir, prob: comb.prob, strength: comb.strength, alignment: comb.alignment, validated: ce.validation.validated }, ...readPmm(c, { ok: comb.ok, dir: comb.dir, prob: comb.prob, strength: comb.strength, alignment: comb.alignment }) })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // GET /find_trade?mode=option|cfd&minScore=60&exclude=A,B&scope=all|real|otc - the FINDER (analytics/finder.ts): scans every open pair, tells the story of several timeframes (pm + nm + weather + structure + plan + session)
+      // and returns the ONE strongest trade, with an expiry (option, 1-30 min) or entry/stop/target (cfd), or says plainly that nothing is worth taking. Stage 1 is a cheap pm screen over every pair (1m + 5m must agree),
+      // stage 2 reads the best dozen across 30s..30m. exclude= skips pairs (the pair just traded).
+      if (path === '/find_trade') {
+        try {
+          const t0 = Date.now()
+          const mode: 'option' | 'cfd' = q.get('mode') === 'cfd' ? 'cfd' : 'option'
+          const minScore = Math.max(40, Math.min(95, Number(q.get('minScore')) || 60)), scope = q.get('scope') ?? 'all'
+          const exclude = new Set((q.get('exclude') ?? '').split(',').map((x) => x.trim()).filter(Boolean))
+          const mk = kernel.context().use<MarketDataService>('market'), nowSec = Math.floor(Date.now() / 1000)
+          const clean = (cs: Candle[], tfx: Timeframe) => { let c = (cs ?? []).filter((x) => x && [x.time, x.open, x.high, x.low, x.close].every((v) => Number.isFinite(v))); if (c.length && c[c.length - 1].time + TIMEFRAME_SECONDS[tfx] > nowSec) c = c.slice(0, -1); return c }
+          const get = (t: string, tfx: Timeframe, n: number) => { try { return clean(mk.getCandlesDeep(t, tfx, n, true) ?? [], tfx) } catch { return [] } }
+          let tk: ((a: string) => { ts: number; price: number }[]) | null = null
+          try { const o = kernel.context().use<{ ticksFor: (a: string) => { ts: number; price: number }[] }>('otcFootprint'); tk = (a) => o.ticksFor(a) } catch { tk = null }
+          const assets = mk.listAssets().filter((x) => x.open && !exclude.has(x.ticker) && (scope === 'all' || (scope === 'otc') === Boolean(x.otc)))
+          // stage 1: the cheap pm screen
+          const screen: Array<{ asset: string; otc: boolean; q: number }> = []
+          for (const a of assets) {
+            try {
+              const c1 = get(a.ticker, '1m', 420), c5 = get(a.ticker, '5m', 420)
+              if (c1.length < 260 || c5.length < 260) continue
+              const r1 = readCauseEffect(c1.slice(-400), undefined, { otc: !!a.otc }), r5 = readCauseEffect(c5.slice(-400), undefined, { otc: !!a.otc })
+              if (!r1.ok || !r5.ok || r1.pm.dir === 'none' || r1.pm.dir !== r5.pm.dir) continue
+              screen.push({ asset: a.ticker, otc: !!a.otc, q: Math.min(r1.pm.confidence, r5.pm.confidence) + (r1.validation.validated ? 8 : 0) + (r5.validation.validated ? 8 : 0) })
+            } catch { /* skip pair */ }
+          }
+          screen.sort((x, y) => y.q - x.q)
+          // stage 2: the full multi-timeframe read of the best dozen
+          const tfs: Timeframe[] = ['30s', '1m', '2m', '5m', '15m', '30m']
+          const results: FinderResult[] = []
+          for (const sc of screen.slice(0, 12)) {
+            if (Date.now() - t0 > 20000) break
+            const frames: FinderFrame[] = []
+            for (const tfx of tfs) { const c = get(sc.asset, tfx, tfx === '30s' ? 500 : 480); if (c.length >= 260) frames.push({ tf: tfx, sec: TIMEFRAME_SECONDS[tfx], candles: c }) }
+            if (frames.length < 2) continue
+            let ticks: { ts: number; price: number }[] | undefined
+            try { ticks = tk && sc.otc ? tk(sc.asset) : undefined } catch { ticks = undefined }
+            try { results.push(readFinderAsset(frames, { mode, minScore, asset: sc.asset, otc: sc.otc, nowSec, ticks })) } catch { /* skip pair */ }
+          }
+          const found = results.filter((r) => r.found).sort((x, y) => y.score - x.score)
+          const near = results.filter((r) => !r.found && r.side !== 'none').sort((x, y) => y.score - x.score).slice(0, 3).map((r) => ({ asset: r.asset, side: r.side, score: r.score, why: r.rejected.slice(0, 3) }))
+          return json(200, { ok: true, mode, minScore, found: found.length > 0, best: found[0] ?? null, runnersUp: found.slice(1, 4), closest: found.length ? [] : near, scanned: assets.length, screened: screen.length, read: results.length, ms: Date.now() - t0,
+            note: found.length ? '' : `Nothing cleared the bar of ${minScore} with several timeframes agreeing, no blocks and a validated record. Waiting is a valid answer.` })
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }

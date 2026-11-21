@@ -40,6 +40,8 @@ interface Props {
   price: number
   account: AccountState | null
   prefill?: TicketPrefill | null
+  /** restrict the kind selector (e.g. the Finder's option / cfd tabs); the first one is the starting kind */
+  kinds?: TradeKind[]
   onPlaced: (p: Position) => void
   onError: (msg: string) => void
 }
@@ -50,8 +52,8 @@ const DIGITAL_EXPIRIES = [
   { sec: 1800, label: '30m' },
 ]
 
-export default function TradeTicket({ asset, tf, price, account, prefill, onPlaced, onError }: Props) {
-  const [kind, setKind] = useState<TradeKind>('binary')
+export default function TradeTicket({ asset, tf, price, account, prefill, kinds, onPlaced, onError }: Props) {
+  const [kind, setKind] = useState<TradeKind>(kinds?.[0] ?? 'binary')
   const [side, setSide] = useState<'call' | 'put' | null>(null)
   const [amount, setAmount] = useState('1')
   // BUG FIX (round 2): round 1 replaced "N bars of the chart's CURRENT tf"
@@ -188,8 +190,8 @@ export default function TradeTicket({ asset, tf, price, account, prefill, onPlac
       </div>
 
       {/* kind selector */}
-      <div className="grid grid-cols-5 gap-1 rounded-md bg-[#101828] p-1">
-        {(['binary', 'turbo', 'blitz', 'digital', 'cfd'] as TradeKind[]).map((k) => (
+      <div className="grid gap-1 rounded-md bg-[#101828] p-1" style={{ gridTemplateColumns: `repeat(${(kinds ?? ['binary', 'turbo', 'blitz', 'digital', 'cfd']).length}, minmax(0, 1fr))` }}>
+        {(kinds ?? (['binary', 'turbo', 'blitz', 'digital', 'cfd'] as TradeKind[])).map((k) => (
           <button
             key={k}
             onClick={() => setKind(k)}
