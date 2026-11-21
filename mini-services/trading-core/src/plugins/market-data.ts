@@ -264,6 +264,8 @@ export class MarketDataService {
     let added = 0
     for (const r of rows) {
       if (getInstrument(r.ticker)) continue // already curated or already auto-added
+      // Closed AND no payout = a dead listing (about 1100 of the 1395 IQ extras): registering it adds it to every whole-universe scanner, each of which then seeds deep candle history for it from the 1 GB archive. It is picked up on a later refresh once it opens or quotes a payout.
+      if (!r.open && r.payout == null) continue
       const otc = r.ticker.endsWith('-OTC')
       const category = this.mapIQCategory(r.category, r.ticker)
       const base = r.ticker.replace(/-OTC$/, '').replace(/_/g, ' ')
