@@ -30,6 +30,7 @@ import TechnicalPanel from '@/components/os/TechnicalPanel'
 import TechnicalGlobalPanel from '@/components/os/TechnicalGlobalPanel'
 import ReversalPanel from '@/components/os/ReversalPanel'
 import MrcPredictPanel from '@/components/os/MrcPredictPanel'
+import { PmPanel, PmGlobalPanel } from '@/components/os/PmPanel'
 import RenkoReversalPanel from '@/components/os/RenkoReversalPanel'
 import KagiReversalPanel from '@/components/os/KagiReversalPanel'
 import ReversalGlobalPanel from '@/components/os/ReversalGlobalPanel'
@@ -106,7 +107,7 @@ const INDICATOR_STORAGE_KEY = 'iqos.activeIndicators.v1'
 // @ Now", "Cointegration") out of the open strip entirely instead of just
 // closing it each time - it stays hidden across reloads until re-checked in
 // the Panels settings menu. Nothing is deleted, this only gates rendering.
-type PanelId = 'signals' | 'yday' | 'leadlag' | 'distill' | 'cointegration' | 'volarb' | 'triangulation' | 'adxPatternBias' | 'shockPressure' | 'renkoFootprint' | 'renkoFootprintOtc' | 'volumeFootprint' | 'tickVolume' | 'tickSmc' | 'tickOracle' | 'tickTechnical' | 'tickFootprint' | 'tickPatterns' | 'pairCompare' | 'pairSignal' | 'oracle' | 'nextExpiry' | 'nextExpiryGlobal' | 'technical' | 'technicalGlobal' | 'reversal' | 'reversalGlobal' | 'nextGlobal' | 'tempo' | 'tempoGlobal' | 'accute' | 'accuteGlobal' | 'smcRecent' | 'smcGlobal' | 'globalDom' | 'mrcPredict' | 'renkoReversal' | 'kagiReversal' | 'signalPanel' | 'signalGlobal' | 'regimePanel'
+type PanelId = 'signals' | 'yday' | 'leadlag' | 'distill' | 'cointegration' | 'volarb' | 'triangulation' | 'adxPatternBias' | 'shockPressure' | 'renkoFootprint' | 'renkoFootprintOtc' | 'volumeFootprint' | 'tickVolume' | 'tickSmc' | 'tickOracle' | 'tickTechnical' | 'tickFootprint' | 'tickPatterns' | 'pairCompare' | 'pairSignal' | 'oracle' | 'nextExpiry' | 'nextExpiryGlobal' | 'technical' | 'technicalGlobal' | 'reversal' | 'reversalGlobal' | 'nextGlobal' | 'tempo' | 'tempoGlobal' | 'accute' | 'accuteGlobal' | 'smcRecent' | 'smcGlobal' | 'globalDom' | 'mrcPredict' | 'pm' | 'pmGlobal' | 'renkoReversal' | 'kagiReversal' | 'signalPanel' | 'signalGlobal' | 'regimePanel'
 const PANEL_META: { id: PanelId; label: string }[] = [
   { id: 'signals', label: 'Chart Signals' },
   { id: 'yday', label: 'Yesterday @ Now' },
@@ -144,6 +145,8 @@ const PANEL_META: { id: PanelId; label: string }[] = [
   { id: 'smcGlobal', label: 'SMC Global' },
   { id: 'globalDom', label: 'Global Dom' },
   { id: 'mrcPredict', label: 'MRC Predict' },
+  { id: 'pm', label: 'PM' },
+  { id: 'pmGlobal', label: 'PM Global' },
   { id: 'renkoReversal', label: 'Renko Reversal' },
   { id: 'kagiReversal', label: 'Kagi Reversal' },
   { id: 'signalPanel', label: 'Signal' },
@@ -187,6 +190,8 @@ const DEFAULT_PANEL_VISIBILITY: Record<PanelId, boolean> = {
   smcGlobal: true,
   globalDom: true,
   mrcPredict: true,
+  pm: true,
+  pmGlobal: true,
   renkoReversal: true,
   kagiReversal: true,
   signalPanel: true,
@@ -304,6 +309,7 @@ export default function OSPage() {
   const [reversalOpen, setReversalOpen] = useState(false)
   const [reversalGlobalOpen, setReversalGlobalOpen] = useState(false)
   const [mrcPredictOpen, setMrcPredictOpen] = useState(false)
+  const [pmOpen, setPmOpen] = useState<null | 'pm' | 'global'>(null)
   const [signalPanelOpen, setSignalPanelOpen] = useState(false)
   const [signalGlobalOpen, setSignalGlobalOpen] = useState(false)
   const [regimePanelOpen, setRegimePanelOpen] = useState(false)
@@ -410,6 +416,7 @@ export default function OSPage() {
         else if (id === 'reversal') setReversalOpen(false)
         else if (id === 'reversalGlobal') setReversalGlobalOpen(false)
         else if (id === 'mrcPredict') setMrcPredictOpen(false)
+        else if (id === 'pm' || id === 'pmGlobal') setPmOpen(null)
         else if (id === 'renkoReversal') setRenkoReversalOpen(false)
         else if (id === 'kagiReversal') setKagiReversalOpen(false)
         else if (id === 'smcRecent') setSmcRecentOpen(false)
@@ -979,6 +986,7 @@ export default function OSPage() {
     setOracleOpen(false)
     setNextExpiryOpen(false)
     setMrcPredictOpen(true)
+    setPmOpen(null)
   }, [handleSelectAsset])
 
   // Open the Signal panel (the Signal tab's clock, following the chart's pair) - closes every other left-dock panel.
@@ -1020,6 +1028,7 @@ export default function OSPage() {
     setAccuteOpen(false)
     setAccuteGlobalOpen(false)
     setMrcPredictOpen(false)
+    setPmOpen(null)
     setRenkoReversalOpen(false)
     setKagiReversalOpen(false)
     setRegimePanelOpen(false)
@@ -1066,6 +1075,7 @@ export default function OSPage() {
     setAccuteOpen(false)
     setAccuteGlobalOpen(false)
     setMrcPredictOpen(false)
+    setPmOpen(null)
     setRenkoReversalOpen(false)
     setKagiReversalOpen(false)
     setRegimePanelOpen(false)
@@ -1074,7 +1084,9 @@ export default function OSPage() {
   }, [])
 
   // Open the Regime panel (the Regime tab's four lists, stacked) - closes every other left-dock panel.
-  const handleOpenRegimePanel = useCallback(() => {
+  // PM / PM Global panels (left dock): close every other left-dock panel, then open ours.
+  const handleOpenPm = useCallback((a?: string) => {
+    if (a) handleSelectAsset(a)
     setSignalPanelOpen(false)
     setSignalGlobalOpen(false)
     setSignalsOpen(false)
@@ -1116,6 +1128,100 @@ export default function OSPage() {
     setMrcPredictOpen(false)
     setRenkoReversalOpen(false)
     setKagiReversalOpen(false)
+
+    setRegimePanelOpen(false)
+    setPmOpen('pm')
+  }, [handleSelectAsset])
+  const handleOpenPmGlobal = useCallback(() => {
+    setSignalPanelOpen(false)
+    setSignalGlobalOpen(false)
+    setSignalsOpen(false)
+    setYdayOpen(false)
+    setLeadlagOpen(false)
+    setDistillOpen(false)
+    setCointegrationOpen(false)
+    setVolarbOpen(false)
+    setTriangulationOpen(false)
+    setAdxPatternBiasOpen(false)
+    setShockPressureOpen(false)
+    setRenkoFootprintOpen(false)
+    setRenkoFootprintOtcOpen(false)
+    setVolumeFootprintOpen(false)
+    setTickVolumeOpen(false)
+    setTickSmcOpen(false)
+    setTickOracleOpen(false)
+    setTickTechnicalOpen(false)
+    setTickFootprintOpen(false)
+    setTickPatternsOpen(false)
+    setPairCompareOpen(false)
+    setPairSignalOpen(false)
+    setOracleOpen(false)
+    setNextExpiryOpen(false)
+    setNextExpiryGlobalOpen(false)
+    setTechnicalOpen(false)
+    setTechnicalGlobalOpen(false)
+    setReversalOpen(false)
+    setReversalGlobalOpen(false)
+    setSmcRecentOpen(false)
+    setSmcGlobalOpen(false)
+    setSignalGlobalOpen(false)
+    setGlobalDomOpen(false)
+    setNextGlobalOpen(false)
+    setTempoOpen(false)
+    setTempoGlobalOpen(false)
+    setAccuteOpen(false)
+    setAccuteGlobalOpen(false)
+    setMrcPredictOpen(false)
+    setRenkoReversalOpen(false)
+    setKagiReversalOpen(false)
+
+    setRegimePanelOpen(false)
+    setPmOpen('global')
+  }, [])
+
+  const handleOpenRegimePanel = useCallback(() => {
+    setSignalPanelOpen(false)
+    setSignalGlobalOpen(false)
+    setSignalsOpen(false)
+    setYdayOpen(false)
+    setLeadlagOpen(false)
+    setDistillOpen(false)
+    setCointegrationOpen(false)
+    setVolarbOpen(false)
+    setTriangulationOpen(false)
+    setAdxPatternBiasOpen(false)
+    setShockPressureOpen(false)
+    setRenkoFootprintOpen(false)
+    setRenkoFootprintOtcOpen(false)
+    setVolumeFootprintOpen(false)
+    setTickVolumeOpen(false)
+    setTickSmcOpen(false)
+    setTickOracleOpen(false)
+    setTickTechnicalOpen(false)
+    setTickFootprintOpen(false)
+    setTickPatternsOpen(false)
+    setPairCompareOpen(false)
+    setPairSignalOpen(false)
+    setOracleOpen(false)
+    setNextExpiryOpen(false)
+    setNextExpiryGlobalOpen(false)
+    setTechnicalOpen(false)
+    setTechnicalGlobalOpen(false)
+    setReversalOpen(false)
+    setReversalGlobalOpen(false)
+    setSmcRecentOpen(false)
+    setSmcGlobalOpen(false)
+    setSignalGlobalOpen(false)
+    setGlobalDomOpen(false)
+    setNextGlobalOpen(false)
+    setTempoOpen(false)
+    setTempoGlobalOpen(false)
+    setAccuteOpen(false)
+    setAccuteGlobalOpen(false)
+    setMrcPredictOpen(false)
+    setPmOpen(null)
+    setRenkoReversalOpen(false)
+    setKagiReversalOpen(false)
     setRegimePanelOpen(true)
   }, [])
 
@@ -1126,6 +1232,7 @@ export default function OSPage() {
     setOracleOpen(false)
     setNextExpiryOpen(false)
     setMrcPredictOpen(false)
+    setPmOpen(null)
     setKagiReversalOpen(false)
     setRenkoReversalOpen(true)
   }, [])
@@ -1137,6 +1244,7 @@ export default function OSPage() {
     setOracleOpen(false)
     setNextExpiryOpen(false)
     setMrcPredictOpen(false)
+    setPmOpen(null)
     setRenkoReversalOpen(false)
     setKagiReversalOpen(true)
   }, [])
@@ -1668,9 +1776,13 @@ export default function OSPage() {
                 closed = the slim open strip sits above the market watch and
                 everything is laid out exactly as before. */}
             <Panel defaultSize={17} minSize={11}>
-              {regimePanelOpen || signalPanelOpen || signalGlobalOpen || signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen || shockPressureOpen || renkoFootprintOpen || renkoFootprintOtcOpen || volumeFootprintOpen || tickVolumeOpen || tickSmcOpen || tickOracleOpen || tickTechnicalOpen || tickFootprintOpen || tickPatternsOpen || pairCompareOpen || pairSignalOpen || oracleOpen || nextExpiryOpen || nextExpiryGlobalOpen || technicalOpen || technicalGlobalOpen || reversalOpen || reversalGlobalOpen || smcRecentOpen || smcGlobalOpen || globalDomOpen || nextGlobalOpen || tempoOpen || tempoGlobalOpen || accuteOpen || accuteGlobalOpen || mrcPredictOpen || renkoReversalOpen || kagiReversalOpen ? (
+              {pmOpen !== null || regimePanelOpen || signalPanelOpen || signalGlobalOpen || signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen || shockPressureOpen || renkoFootprintOpen || renkoFootprintOtcOpen || volumeFootprintOpen || tickVolumeOpen || tickSmcOpen || tickOracleOpen || tickTechnicalOpen || tickFootprintOpen || tickPatternsOpen || pairCompareOpen || pairSignalOpen || oracleOpen || nextExpiryOpen || nextExpiryGlobalOpen || technicalOpen || technicalGlobalOpen || reversalOpen || reversalGlobalOpen || smcRecentOpen || smcGlobalOpen || globalDomOpen || nextGlobalOpen || tempoOpen || tempoGlobalOpen || accuteOpen || accuteGlobalOpen || mrcPredictOpen || renkoReversalOpen || kagiReversalOpen ? (
                 <div className="mr-0.5 h-full min-h-0">
-                  {ydayOpen ? (
+                  {pmOpen === 'pm' ? (
+                    <PmPanel onClose={() => setPmOpen(null)} asset={asset} tf={tf} closedTick={closedTick} onOpenGlobal={handleOpenPmGlobal} />
+                  ) : pmOpen === 'global' ? (
+                    <PmGlobalPanel onClose={() => setPmOpen(null)} tf={tf} closedTick={closedTick} onPickAsset={handleSelectAsset} onOpenPm={handleOpenPm} />
+                  ) : ydayOpen ? (
                     <YesterdayPanel onClose={() => setYdayOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} onFocusWindow={handleFocusYesterday} />
                   ) : leadlagOpen ? (
                     <LeadLagPanel onClose={() => setLeadlagOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
@@ -1930,6 +2042,30 @@ export default function OSPage() {
                       >
                         <span className="h-1.5 w-1.5 rounded-full bg-emerald-300" />
                         MRC Predict
+                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
+                      </button>
+                      )}
+                      {panelVisibility.pm && (
+                      <button
+                        type="button"
+                        onClick={() => handleOpenPm(asset)}
+                        title="PM - the cause -> effect predicted move of this pair: direction, strength, validation record, support/resistance"
+                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-amber-500/40 hover:text-amber-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-amber-300" />
+                        PM
+                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
+                      </button>
+                      )}
+                      {panelVisibility.pmGlobal && (
+                      <button
+                        type="button"
+                        onClick={() => handleOpenPmGlobal()}
+                        title="PM Global - the predicted move of every open pair, ranked (calls first, validated first)"
+                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-amber-500/40 hover:text-amber-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-amber-300" />
+                        PM Global
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
                       )}

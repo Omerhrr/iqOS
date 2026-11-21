@@ -104,6 +104,7 @@ import { storyRenko, storyKagi, storyEffort, storyHeikin, storyTickBars, storyTi
 import { studyStories } from './src/analytics/storystudy'
 import { readMtf } from './src/analytics/mtfstory'
 import { readCauseEffect, combineCeMtf } from './src/analytics/causeeffect'
+const pmGlobalCache = new Map<string, { ts: number; data: { rows: Array<Record<string, unknown>> } & Record<string, unknown> }>()
 import { searchInstruments, universeStats, getInstrument } from './src/universe'
 import { listRegistry, computeIndicator, registrySize, getIndicatorDef } from './src/analytics/registry'
 import { detectChartPatterns } from './src/analytics/chart-patterns'
@@ -2602,6 +2603,49 @@ const httpServer = createServer(async (req, res) => {
           const pm = readCauseEffect(c.slice(-400), ticks, { otc })
           const { bars: _b, ...pmRest } = pm
           return json(200, { asset, tf: tfv, horizon, otc, ...r, pm: pmRest, combined: combineNmPm(r, pm.ok ? pm : null) })
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
+      // GET /pm_global?tf=1m&htf=5m&scope=all|real|otc&limit=120 -> the cause->effect predicted move (causeeffect.ts) of EVERY open pair, combined with the higher frame, ranked: calls first, validated first, then strength.
+      // Cached 8 s per query so several panels / a fast refresh do not recompute the whole board.
+      if (path === '/pm_global') {
+        try {
+          const tfv = tfStrict(q.get('tf') ?? '1m')
+          if (tfv === null) return json(400, { ok: false, error: tfErr(q.get('tf')) })
+          const htfq = String(q.get('htf') ?? '5m'), scope = q.get('scope') ?? 'all', limit = Math.max(1, Math.min(200, Number(q.get('limit')) || 120))
+          const ckey = `${tfv}|${htfq}|${scope}`, hit = pmGlobalCache.get(ckey)
+          if (hit && Date.now() - hit.ts < 8000) return json(200, { ...hit.data, rows: hit.data.rows.slice(0, limit), cached: true })
+          const mk = kernel.context().use<MarketDataService>('market'), nowSec = Math.floor(Date.now() / 1000)
+          const clean = (cs: Candle[], tfx: Timeframe) => { let c = (cs ?? []).filter((x) => x && [x.time, x.open, x.high, x.low, x.close].every((v) => Number.isFinite(v))); if (c.length && c[c.length - 1].time + TIMEFRAME_SECONDS[tfx] > nowSec) c = c.slice(0, -1); return c }
+          const useHtf = htfq !== 'none' && (ALL_TIMEFRAMES as string[]).includes(htfq) && TIMEFRAME_SECONDS[htfq as Timeframe] > TIMEFRAME_SECONDS[tfv]
+          let tk: ((a: string) => { ts: number; price: number }[]) | null = null
+          try { tk = kernel.context().use<{ ticksFor: (a: string) => { ts: number; price: number }[] }>('otcFootprint').ticksFor.bind(kernel.context().use('otcFootprint')) } catch { tk = null }
+          const assets = mk.listAssets().filter((x) => x.open && (scope === 'all' || (scope === 'otc') === Boolean(x.otc)))
+          const rows: Array<Record<string, unknown>> = []
+          let warming = 0
+          for (const a of assets) {
+            try {
+              const c = clean(mk.getCandlesDeep(a.ticker, tfv, 400, true) ?? [], tfv)
+              if (c.length < 60) { warming++; continue }
+              const otc = !!a.otc
+              let ticks: { ts: number; price: number }[] | undefined
+              try { ticks = tk ? tk(a.ticker) : undefined } catch { ticks = undefined }
+              const r = readCauseEffect(c, ticks, { otc })
+              if (!r.ok) { warming++; continue }
+              let h: ReturnType<typeof readCauseEffect> | null = null
+              if (useHtf) { const hc = clean(mk.getCandlesDeep(a.ticker, htfq as Timeframe, 400, true) ?? [], htfq as Timeframe); if (hc.length >= 60) h = readCauseEffect(hc, undefined, { otc }) }
+              const m = combineCeMtf(r, h, htfq)
+              rows.push({ asset: a.ticker, otc, dir: m.dir, lean: m.lean, prob: m.prob, strength: m.strength, alignment: m.alignment, validated: r.validation.validated, trackN: r.validation.trackN, trackHit: r.validation.trackHit, bucketN: r.validation.bucketN,
+                cause: r.cause.label, psychology: r.effect.psychology, atSupport: r.sr.atSupport, atResistance: r.sr.atResistance, moveAtr: r.pm.moveAtr, price: c[c.length - 1].close })
+            } catch { warming++ }
+          }
+          const rank = (x: Record<string, unknown>) => (x.dir !== 'none' ? 1e6 : 0) + (x.validated ? 1e5 : 0) + Number(x.strength)
+          rows.sort((x, y) => rank(y) - rank(x))
+          const data = { ok: true, tf: tfv, htf: useHtf ? htfq : 'none', scope, scanned: assets.length, warming, calls: rows.filter((x) => x.dir === 'call').length, puts: rows.filter((x) => x.dir === 'put').length, validatedCalls: rows.filter((x) => x.dir !== 'none' && x.validated).length, ts: Date.now(), rows }
+          pmGlobalCache.set(ckey, { ts: Date.now(), data })
+          return json(200, { ...data, rows: rows.slice(0, limit) })
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }
