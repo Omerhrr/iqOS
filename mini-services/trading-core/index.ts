@@ -3,6 +3,7 @@
 // REST for every OS operation and socket.io for the real-time event feed.
 // Port 3030. Path '/' is fixed for the Caddy gateway.
 
+import './src/timerprobe'
 import { emCone, emParams, emModeFromCode } from './src/analytics/expectedmove'
 import { createServer, type IncomingMessage } from 'http'
 import { createHash, timingSafeEqual } from 'crypto'
