@@ -1,7 +1,7 @@
 // IQAIR//OS - FINDER: one trade, picked from the whole market.
 // For one asset it reads SEVERAL timeframes and tells the story of each: the pm (who is pushing) + nm (where price is, what followed from here) + weather (dead / squeeze / trend / range) blended by the EDITOR,
 // then run through PMM's market-structure gate (swings, HH/HL/LH/LL, walls) and the trading plan (is the trend already too far, is price inside an avoid zone), plus the clock (session).
-// A trade is only offered when SEVERAL frames independently agree on one side, none disagrees, nothing is blocked, and the score clears a bar. Most of the time the honest answer is "nothing worth taking".
+// The trade is the call of the single BEST timeframe (no multi-timeframe agreement is required - other frames agreeing only raises the score); it is offered when nothing is blocked and the score clears a bar. Technicals (the 11 oscillator + MA votes) vote into the score and the story. Most of the time the honest answer is "nothing worth taking".
 //   OPTION : the expiry (1-30 min) is chosen by asking nm, for the agreeing frame, which horizon its similar past moments favoured most (walk-forward, shrunk), not a fixed guess.
 //   CFD    : entry / stop / target from the pm plan (structure stop + structure target, min reward:risk), checked against the swing walls; tp/sl also given in % of price for the ticket.
 // HONESTY: this stacks models that read the SAME candles, so agreement is weaker evidence than it looks; the score weights are judgement, not fitted; "almost never wrong" is not something any of this can promise.
@@ -12,11 +12,12 @@ import { readPmm, type PmmResult } from './pmm'
 import { readPlan, type PlanResult } from './tradingplan'
 import { readCfdPlan, type CfdPlan } from './cfdplan'
 import { classifySession } from './session'
+import { summarizeTf } from './technicals'
 import type { CeCandle, CeTick } from './causeeffect'
 
 export interface FinderFrame { tf: string; sec: number; candles: CeCandle[] }
 export interface FinderOptions { mode: 'option' | 'cfd'; minScore?: number; minFrames?: number; nowSec?: number; ticks?: readonly CeTick[]; otc?: boolean; asset?: string }
-export interface FrameRead { tf: string; sec: number; dir: 'call' | 'put' | 'none'; strength: number; prob: number; agreement: string; regime: string; pmValidated: boolean; nmValidated: boolean; pmRecord: string; nmRecord: string; structure: string; blocks: string[]; boosts: string[]; room: number; text: string }
+export interface FrameRead { tf: string; sec: number; dir: 'call' | 'put' | 'none'; strength: number; prob: number; agreement: string; regime: string; pmValidated: boolean; nmValidated: boolean; tech: string; techScore: number; pmRecord: string; nmRecord: string; structure: string; blocks: string[]; boosts: string[]; room: number; text: string }
 export interface FinderExpiry { minutes: number; bars: number; tf: string; prob: number; basis: string; table: Array<{ minutes: number; prob: number }> }
 export interface FinderCfd { entry: number; stop: number; target: number; rr: number; ev: number; riskAtr: number; rewardAtr: number; tpPct: number; slPct: number; stopKind: string; targetKind: string; text: string }
 export interface FinderResult {
@@ -35,14 +36,20 @@ export function readFrame(f: FinderFrame, htf: FinderFrame | null, o: FinderOpti
   const ticks = f.sec <= 60 ? o.ticks : undefined
   const ed = readEditor(f.candles, ticks, htf?.candles ?? null, { htfTf: htf?.tf ?? 'none', otc: o.otc })
   if (!ed.ok) return null
-  const pmm = readPmm(f.candles, { ok: true, dir: ed.dir, prob: ed.prob, strength: ed.strength })
-  const dir = pmm.ok ? pmm.dir : ed.dir
+  // loosened nm: when nm and pm conflict (the editor stands down) the pm call stands - pm needs only to be ok. A dead market still stands down.
+  const pmCall = ed.pm.ok ? ed.pm.dir : 'none'
+  const edDir = ed.dir !== 'none' ? ed.dir : (ed.regime !== 'dead' && pmCall !== 'none' ? pmCall : 'none')
+  const pmmIn = edDir === ed.dir ? { ok: true, dir: ed.dir, prob: ed.prob, strength: ed.strength } : { ok: true, dir: edDir, prob: ed.pm.ok ? ed.pm.prob : 0.5, strength: ed.pm.ok ? ed.pm.strength : 0 }
+  const pmm = readPmm(f.candles, pmmIn)
+  const dir = pmm.ok ? pmm.dir : edDir
   const blocks = [...(pmm.ok ? pmm.blocks : [])]
   if (ed.dir !== 'none' && dir === 'none' && !blocks.length) blocks.push('structure gate')
   const trig = ed.pm.trigger
+  let techLabel = 'n/a', techScore = 0
+  try { const tr = summarizeTf(f.tf, f.sec, 'native', f.candles); if (tr.ok) { techLabel = tr.summary.label; techScore = tr.summary.score } } catch { /* technicals optional */ }
   const read: FrameRead = {
-    tf: f.tf, sec: f.sec, dir, strength: pmm.ok ? pmm.strength : ed.strength, prob: pmm.ok ? pmm.prob : ed.prob, agreement: ed.agreement, regime: ed.regime,
-    pmValidated: trig.validation.validated, nmValidated: ed.nm.ok && ed.nm.nm.validated, pmRecord: rec(trig.validation.trackN, trig.validation.trackHit), nmRecord: ed.nm.ok ? rec(ed.nm.validation.trackN, ed.nm.validation.trackHit) : 'none yet',
+    tf: f.tf, sec: f.sec, dir, strength: pmm.ok ? pmm.strength : pmmIn.strength, prob: pmm.ok ? pmm.prob : pmmIn.prob, agreement: ed.agreement, regime: ed.regime,
+    pmValidated: trig.validation.validated, nmValidated: ed.nm.ok && ed.nm.nm.validated, tech: techLabel, techScore, pmRecord: rec(trig.validation.trackN, trig.validation.trackHit), nmRecord: ed.nm.ok ? rec(ed.nm.validation.trackN, ed.nm.validation.trackHit) : 'none yet',
     structure: pmm.ok ? pmm.structure : 'unclear', blocks, boosts: pmm.ok ? pmm.boosts : [], room: pmm.ok ? pmm.room : 99, text: ed.text,
   }
   return { read, ed, pmm }
@@ -51,7 +58,7 @@ export function readFrame(f: FinderFrame, htf: FinderFrame | null, o: FinderOpti
 export function chooseExpiry(f: FinderFrame, side: 'call' | 'put', otc: boolean, maxMin = 30): FinderExpiry {
   const mins = f.sec / 60
   const table: Array<{ minutes: number; prob: number }> = []
-  let best: { minutes: number; bars: number; prob: number } | null = null
+  let best: { minutes: number; bars: number; prob: number; v?: boolean } | null = null
   const horizons = [1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20, 30]
   for (const h of horizons) {
     const minutes = Math.max(1, Math.round(h * mins))
@@ -61,11 +68,11 @@ export function chooseExpiry(f: FinderFrame, side: 'call' | 'put', otc: boolean,
     if (!nm.ok) continue
     const p = side === 'call' ? nm.nm.horizonProb : 1 - nm.nm.horizonProb
     table.push({ minutes, prob: p })
-    if (nm.nm.validated && (!best || p > best.prob + 0.005)) best = { minutes, bars: h, prob: p }
+    if (!best || p > best.prob + 0.005) best = { minutes, bars: h, prob: p, v: nm.nm.validated } // loosened: a horizon need not be validated, the best one wins (validated is only noted)
   }
   const natural = Math.max(1, Math.ceil(mins))
-  if (best && best.prob >= 0.52) return { minutes: best.minutes, bars: best.bars, tf: f.tf, prob: best.prob, basis: `nm's similar past moments favoured ${best.minutes} min most (${(best.prob * 100).toFixed(0)}%, validated)`, table }
-  return { minutes: natural, bars: Math.max(1, Math.round(natural / Math.max(mins, 1 / 60))), tf: f.tf, prob: 0.5, basis: 'no horizon had a validated edge above 52%; defaulting to one bar of the frame', table }
+  if (best && best.prob >= 0.505) return { minutes: best.minutes, bars: best.bars, tf: f.tf, prob: best.prob, basis: `nm's similar past moments favoured ${best.minutes} min most (${(best.prob * 100).toFixed(0)}%${best.v ? ', validated' : ', not validated'})`, table }
+  return { minutes: natural, bars: Math.max(1, Math.round(natural / Math.max(mins, 1 / 60))), tf: f.tf, prob: 0.5, basis: 'no horizon leaned clearly; defaulting to one bar of the frame', table }
 }
 
 export function readFinderAsset(frames: FinderFrame[], o: FinderOptions): FinderResult {
@@ -78,18 +85,17 @@ export function readFinderAsset(frames: FinderFrame[], o: FinderOptions): Finder
     const r = readFrame(sorted[i], sorted[i + 1] ?? null, o)
     if (r) reads.push({ ...r, frame: sorted[i] })
   }
-  if (reads.length < 2) return base({ rejected: [`only ${reads.length} timeframe(s) have enough history`], text: 'Not enough history across timeframes.' })
+  if (reads.length < 1) return base({ rejected: ['no timeframe has enough history'], text: 'Not enough history.' })
   const frameReads = reads.map((r) => r.read)
-  const calls = reads.filter((r) => r.read.dir === 'call'), puts = reads.filter((r) => r.read.dir === 'put')
-  const side: 'call' | 'put' | 'none' = calls.length > puts.length ? 'call' : puts.length > calls.length ? 'put' : 'none'
+  // the BEST single frame decides the side: strongest call (a validated nm and agreeing technicals lift it a little). Other frames only add to the score.
+  const callers = reads.filter((r) => r.read.dir !== 'none')
   const rejected: string[] = []
-  const minFrames = o.minFrames ?? 2
-  if (side === 'none') return base({ frames: frameReads, rejected: ['the timeframes do not lean one way'], text: 'No call: the timeframes do not lean one way.' })
-  const agreeing = side === 'call' ? calls : puts, against = side === 'call' ? puts.length : calls.length
-  if (agreeing.length < minFrames) rejected.push(`only ${agreeing.length} timeframe(s) agree (need ${minFrames})`)
-  if (against > 0) rejected.push(`${against} timeframe(s) point the other way`)
-  // the best frame to trade on: strongest agreeing; a validated nm record is preferred. pm needs only a call (ok) - its own validated / bucketN / strength gates are gone; nm is unchanged.
-  const best = [...agreeing].sort((a, b) => (Number(b.read.nmValidated) - Number(a.read.nmValidated)) || (b.read.strength - a.read.strength))[0]
+  if (!callers.length) return base({ frames: frameReads, rejected: ['no timeframe has a call'], text: 'No call on any timeframe.' })
+  const lift = (r: typeof reads[number]) => r.read.strength + (r.read.nmValidated ? 4 : 0) + (r.read.dir === 'call' ? r.read.techScore : -r.read.techScore) * 8
+  const best = [...callers].sort((a, b) => lift(b) - lift(a))[0]
+  const side: 'call' | 'put' = best.read.dir as 'call' | 'put'
+  const agreeing = callers.filter((r) => r.read.dir === side)
+  const against = callers.length - agreeing.length
   const wxBad = reads.find((r) => r.ed.regime === 'dead')
   if (wxBad) rejected.push(`dead market on ${wxBad.read.tf}`)
   // trading plan on a mid frame (trend maturity + avoid zones)
@@ -105,13 +111,15 @@ export function readFinderAsset(frames: FinderFrame[], o: FinderOptions): Finder
   const frameBlocks = best.read.blocks
   if (frameBlocks.length) rejected.push(...frameBlocks.map((b) => `${best.read.tf}: ${b}`))
   // score (judgement weights)
-  const meanStrength = agreeing.reduce((s, r) => s + r.read.strength, 0) / agreeing.length
-  const agreeFrac = agreeing.length / reads.length
-  const evidence = agreeing.reduce((s, r) => s + Number(r.read.nmValidated), 0) / agreeing.length
+  const meanStrength = best.read.strength
+  const agreeFrac = agreeing.length / Math.max(1, reads.length)
+  const evidence = Number(best.read.nmValidated)
+  const techSigned = side === 'call' ? best.read.techScore : -best.read.techScore
+  const techFit = clamp(0.5 + techSigned * 0.5, 0, 1)
   const room = clamp(best.read.room >= 90 ? 1 : best.read.room / 2, 0, 1)
   const timeQ = otc ? 0.6 : session === 'OVERLAP' ? 1 : session === 'LONDON' || session === 'NEWYORK' ? 0.8 : session === 'ASIA' ? 0.5 : 0.3
   const wxFit = best.ed.wx.ok ? (best.ed.regime === 'expansion' || (best.ed.regime === 'trend-up' && side === 'call') || (best.ed.regime === 'trend-down' && side === 'put') ? 1 : best.ed.regime === 'squeeze' ? 0.3 : 0.6) : 0.5
-  const score = Math.round(clamp(0.40 * meanStrength + 20 * agreeFrac + 18 * evidence + 8 * room + 7 * timeQ + 7 * wxFit, 0, 100))
+  const score = Math.round(clamp(0.36 * meanStrength + 12 * agreeFrac + 10 * evidence + 8 * room + 7 * timeQ + 7 * wxFit + 20 * techFit, 0, 100))
   const minScore = o.minScore ?? 60
   if (score < minScore) rejected.push(`score ${score} is below the bar of ${minScore}`)
   const barLeft = Math.max(0, best.frame.sec - (nowSec % best.frame.sec))
@@ -122,6 +130,7 @@ export function readFinderAsset(frames: FinderFrame[], o: FinderOptions): Finder
     plan?.ok ? `Trend: ${plan.trend.dir === 'none' ? 'none' : plan.trend.dir + 'trend, ' + plan.trend.stage + (plan.trend.tooFar ? ', gone too far' : plan.trend.fresh ? ', fresh' : '')}.` : 'Trend: not readable.',
     `pm/nm on ${best.read.tf}: ${best.read.text}`,
     `Timeframes: ${frameReads.map((r) => `${r.tf} ${r.dir === 'none' ? '-' : r.dir === 'call' ? '▲' : '▼'}${r.strength}`).join('  ')}`,
+    `Technicals on ${best.read.tf}: ${best.read.tech} (${best.read.techScore >= 0 ? '+' : ''}${best.read.techScore.toFixed(2)}), ${techSigned >= 0.15 ? 'agree with the trade' : techSigned <= -0.15 ? 'lean against the trade' : 'neutral'}.`,
     `Evidence: pm record ${best.read.pmRecord}, nm record ${best.read.nmRecord}.`,
   ]
   const common = { frames: frameReads, agree: agreeing.length, against, story, session, tf: best.read.tf, barLeftSec: barLeft, score, side }
@@ -137,7 +146,7 @@ export function readFinderAsset(frames: FinderFrame[], o: FinderOptions): Finder
     if (p.rr < 1.5 || p.ev <= 0) return base({ ...common, rejected: [`CFD plan rejected: reward:risk ${p.rr.toFixed(2)}, expected ${p.ev.toFixed(2)}R`], text: `No CFD setup on ${asset}: the reward does not justify the risk.` })
     cfd = { entry: p.entry, stop: p.stop, target: p.target, rr: p.rr, ev: p.ev, riskAtr: p.riskAtr, rewardAtr: p.rewardAtr, tpPct: (p.rewardDist / p.entry) * 100, slPct: (p.riskDist / p.entry) * 100, stopKind: p.stopKind, targetKind: p.targetKind, text: p.text }
   }
-  const reasons = [`${agreeing.length}/${reads.length} timeframes agree on ${side.toUpperCase()}, none against`, ...best.read.boosts]
+  const reasons = [`best call is ${best.read.tf} (${agreeing.length}/${reads.length} frames lean ${side.toUpperCase()}${against ? `, ${against} the other way` : ''}); technicals ${best.read.tech}`, ...best.read.boosts]
   const text = `${side.toUpperCase()} ${asset} (${grade}, score ${score}) on ${best.read.tf}: ${reasons.join('; ')}.${expiry ? ` Expiry ${expiry.minutes} min (${expiry.basis}).` : ''}${cfd ? ` ${cfd.text}` : ''}`
   return base({ ...common, found: true, grade, expiry, cfd, reasons, text })
 }

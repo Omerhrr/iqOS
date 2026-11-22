@@ -2683,7 +2683,7 @@ const httpServer = createServer(async (req, res) => {
               const r1 = readCauseEffect(c1.slice(-400), undefined, { otc: !!a.otc }), r5 = readCauseEffect(c5.slice(-400), undefined, { otc: !!a.otc })
               if (!r1.ok || !r5.ok) { thin++; continue }
               const d1 = r1.pm.dir, d5 = r5.pm.dir
-              if ((d1 === 'none' && d5 === 'none') || (d1 !== 'none' && d5 !== 'none' && d1 !== d5)) continue
+              if (d1 === 'none' && d5 === 'none') continue // either frame having a pm call is enough - the two no longer have to agree
               screen.push({ asset: a.ticker, otc: !!a.otc, q: Math.max(d1 !== 'none' ? r1.pm.confidence : 0, d5 !== 'none' ? r5.pm.confidence : 0) + (d1 === d5 ? 15 : 0) })
             } catch { thin++ }
           }
@@ -2697,7 +2697,7 @@ const httpServer = createServer(async (req, res) => {
             if (Date.now() - t0 > 24000) { unread = screen.length - si; break }
             const frames: FinderFrame[] = []
             for (const tfx of tfs) { const c = get(sc.asset, tfx, tfx === '30s' ? 500 : 480); if (c.length >= 260) frames.push({ tf: tfx, sec: TIMEFRAME_SECONDS[tfx], candles: c }) }
-            if (frames.length < 2) continue
+            if (frames.length < 1) continue
             let ticks: { ts: number; price: number }[] | undefined
             try { ticks = tk && sc.otc ? tk(sc.asset) : undefined } catch { ticks = undefined }
             try { results.push(readFinderAsset(frames, { mode, minScore, asset: sc.asset, otc: sc.otc, nowSec, ticks })) } catch { /* skip pair */ }
