@@ -128,3 +128,21 @@ export function readWeisWave(candles: Candle[], o: WwOptions = {}): WwRead | nul
   }
   return { ok: true, mode, thr, volumeOk, waves, cur, prevSame, prevOpp, count: all.length, volRatio, effort, effortRatio, newExtreme, weak, strong, absorption, shortening, hot, direction, strength, reason }
 }
+
+/** Per-bar series for the chart histogram: the CUMULATIVE wave volume at each bar, signed by the wave's direction (up-wave +, down-wave -), restarting at each wave. Bars before the first wave are NaN.
+ * DISPLAY ONLY: a wave's start is only known once it has turned, so past bars are coloured with hindsight (the engine's readWeisWave() uses closed waves only for its call). */
+export function weisWaveSeries(candles: Candle[], o: WwOptions = {}): { value: number[]; dir: number[]; volumeOk: boolean } {
+  const n = candles.length
+  const value = new Array<number>(n).fill(NaN), dir = new Array<number>(n).fill(0)
+  if (n < 3) return { value, dir, volumeOk: false }
+  const mode: WwMode = o.mode === 'close' ? 'close' : 'atr'
+  const thr = o.thr !== undefined && o.thr > 0 ? o.thr : 1.0
+  const close = candles.map((c) => c.close)
+  const atr = atrInd(candles.map((c) => c.high), candles.map((c) => c.low), close, 14)
+  const { v, volumeOk } = volumeSeries(candles)
+  for (const [s, e, d] of cut(close, atr, mode, thr)) {
+    let cum = 0
+    for (let i = s + 1; i <= e; i++) { cum += v[i]; value[i] = d * cum; dir[i] = d }
+  }
+  return { value, dir, volumeOk }
+}

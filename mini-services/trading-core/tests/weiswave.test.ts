@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { readWeisWave } from '../src/analytics/weiswave'
+import { readWeisWave, weisWaveSeries } from '../src/analytics/weiswave'
 import type { Candle } from '../src/types'
 let pass = 0, total = 0
 const test = (n: string, f: () => void) => { total++; try { f(); console.log('ok ', n); pass++ } catch (e) { console.log('FAIL', n, (e as Error).message) } }
@@ -19,4 +19,5 @@ test('strong up-wave: higher high on MORE volume -> with it (call)', () => { con
 test('absorption: huge volume for a tiny move after normal waves', () => { const c = build([...lead, [10, 5, 100], [8, -3, 100], [10, 5, 100], [8, -3, 100], [8, 1.6, 900]]); const r = readWeisWave(c, { mode: 'atr', thr: 0.6 })!; assert.equal(r.absorption, true) })
 test('flat/missing volume: volumeOk false, range stands in, still reads', () => { const c = build([...lead, [10, 4, 0], [10, -4, 0]], 100, true); const r = readWeisWave(c, { mode: 'atr' })!; assert.equal(r.volumeOk, false); assert.ok(r.cur.volume > 0) })
 test('too little history -> null', () => { assert.equal(readWeisWave(build([[20, 1, 100]])), null) })
+test('chart series: cumulative per wave, signed, restarts on a turn, length matches', () => { const c = build([...lead, [10, 4, 200], [10, -4, 120]]); const r = weisWaveSeries(c, { mode: 'atr' }); assert.equal(r.value.length, c.length); const idx = r.dir.map((d, i) => (d !== 0 ? i : -1)).filter((i) => i >= 0); assert.ok(idx.length > 20); for (const i of idx) assert.equal(Math.sign(r.value[i]), r.dir[i]); let restarts = 0; for (const i of idx) if (i > 0 && r.dir[i - 1] !== r.dir[i] && r.dir[i - 1] !== 0) { restarts++; assert.ok(Math.abs(r.value[i]) < Math.abs(r.value[i - 1])) } assert.ok(restarts >= 2) })
 console.log(`${pass}/${total}`); if (pass !== total) process.exit(1)
