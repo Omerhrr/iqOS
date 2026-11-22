@@ -256,6 +256,7 @@ import { readEm, emUpper, emLower, emZ, emSigmaAt, emModeFromCode, emParams, EM_
 import { detectChartPatterns2, readAutoTrend, readElliott, CP_MIN_BARS, type CpHit, type AutoTrend, type EwRead } from './patternengine'
 import { readPmm } from './pmm'
 import { stepSage, sageKey, sageRec, sageStats, sageText } from './sage'
+import { readSp, type SpPoint } from './sp'
 import { stepLimit, limitKey, limitRec, limitText, buildLevelBook, type LimitMode } from './sagelimit'
 import { stepHold, holdKey, holdRec, clearHolds, inReplay, replayBypassOn, stepBypass, clearBypass } from './timing'
 import { liveRiskOutcomes, riskStats, sessionAt, minsIn, minsLeft, inWindow, inDates, weekendAt, type RiskOutcome } from './mslrisk'
@@ -5698,6 +5699,7 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         if (e.name === 'mtf') return storyMtf(args, ctx)
         if (e.name === 'pm' || e.name === 'pmText' || e.name === 'otcpm' || e.name === 'otcpmText') return storyPm(e.name, args, ctx)
         if (e.name === 'pmm' || e.name === 'pmmText' || e.name === 'otcpmm') return storyPmm(e.name, args, ctx)
+        if (e.name === 'sp' || e.name === 'spText') return storySp(e.name, args, ctx)
         if (e.name === 'weather' || e.name === 'weatherText' || e.name === 'editor' || e.name === 'editorText') return storyEditor(e.name, args, ctx)
         if (e.name === 'nm' || e.name === 'nmText' || e.name === 'otcnm') return storyNm(e.name, args, ctx)
         if (e.name === 'cfd' || e.name === 'cfdText' || e.name === 'otccfd') return storyCfd(e.name, args, ctx)
@@ -6552,6 +6554,44 @@ function storyPmm(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
     alignment: m.alignment, validated: trig.validation.validated, structure: r.structure, sequence: r.sequence, lastHigh: r.lastHigh, lastLow: r.lastLow, bos: r.bos, choch: r.choch, breakAge: r.breakAge, rangePos: r.rangePos,
     wallAbove: up.price, wallAboveDist: up.dist, wallAboveLabel: up.label, wallAboveTouches: up.touches, wallBelow: dn.price, wallBelowDist: dn.dist, wallBelowLabel: dn.label, wallBelowTouches: dn.touches,
     room: r.room, withStructure: r.withStructure, againstStructure: r.againstStructure, atSupport: trig.sr.atSupport, atResistance: trig.sr.atResistance, text: r.text })
+}
+
+/** `story.sp([trendTf], [shockAtr], [pressureAtr], [burstSec])` - SHOCK & PRESSURE of the candle that is STILL FORMING (analytics/sp.ts). PRESSURE = the body moving slowly (a steady drift), SHOCK = the body moving suddenly (a fast
+ * burst), each with its own direction. The five cases: 1 pressure up + shock up -> put | 2 pressure down + shock down -> call | 3 pressure up + shock down -> put | 4 pressure down + shock up -> call | 5 pressure without a shock -> WITH THE
+ * TREND. Flat bundle: ok error direction (call|put|none) case (0..5) pressure shock (booleans) pressureDir shockDir (+1/-1/0) pressureAtr shockAtr (signed, ATR14) pressureEff shockAge bodyAtr progress (0..1 of the candle) trendDir points text.
+ * The trend for case 5 is EMA20 vs EMA50 of the chart (or of trendTf, e.g. story.sp("5m")). Reads the candle path from live ticks (omni-trader) else the 5s chart; fails closed without either. story.spText() the sentence.
+ * HONESTY: thresholds are judgement (shock >= 0.30 ATR inside 10 s and fresh; pressure >= 0.12 ATR and steady) - replay it before trading it. */
+function storySp(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
+  const strs = args.filter((a): a is string => typeof a === 'string')
+  const nums = args.filter((a): a is number => typeof a === 'number')
+  const s = requireSeries(ctx, undefined)
+  const span = barSpacingSec(s)
+  const nowSec = evalNowMs(ctx) / 1000
+  const openSec = Math.floor(nowSec / span) * span
+  const a14 = atrInd(s.high, s.low, s.close, 14)
+  const atrv = a14[a14.length - 1]
+  const pts: SpPoint[] = []
+  let open = NaN
+  const ticks = ctx.liveTicks
+  if (ticks && ticks.length) {
+    for (const t of ticks) { const ts = t.ts / 1000; if (ts >= openSec && ts <= nowSec + 1) pts.push({ t: ts, p: t.price }) }
+    if (pts.length >= 4) open = ctx.liveBar && Number.isFinite(ctx.liveBar.o) ? ctx.liveBar.o : pts[0].p
+  }
+  if (!Number.isFinite(open)) {
+    pts.length = 0
+    let five: MslSeriesCtx | undefined
+    try { five = ctx.seriesFor?.('5s') } catch { five = undefined }
+    if (!five || !five.time || !five.time.length) throw new MslRuntimeError('story.sp() reads the path of the forming candle, which needs live ticks (omni-trader) or a 5s chart - neither is available here')
+    for (let i = 0; i < five.time.length; i++) { if (five.time[i] >= openSec - 1e-6 && five.time[i] <= nowSec + 1e-6) { if (!Number.isFinite(open)) open = five.open[i]; pts.push({ t: five.time[i] + 5, p: five.close[i] }) } }
+  }
+  const trendSeries = strs[0] ? requireSeries(ctx, strs[0]) : s
+  const e20 = emaInd(trendSeries.close, 20), e50 = emaInd(trendSeries.close, 50)
+  const tc = trendSeries.close[trendSeries.close.length - 1], a = e20[e20.length - 1], b = e50[e50.length - 1]
+  const trend = Number.isFinite(a) && Number.isFinite(b) ? (a > b && tc > b ? 1 : a < b && tc < b ? -1 : 0) : 0
+  const r = readSp(pts, { open, openSec, nowSec, tfSec: span, atr: atrv, trend, ...(nums[0] !== undefined ? { shockAtr: nums[0] } : {}), ...(nums[1] !== undefined ? { pressureAtr: nums[1] } : {}), ...(nums[2] !== undefined ? { burstSec: nums[2] } : {}) })
+  if (name === 'spText') return r.text
+  return bundleValue({ ok: r.ok, error: r.ok ? '' : (r.error ?? ''), direction: r.direction, case: r.caseNo, pressure: r.pressure, shock: r.shock, pressureDir: r.pressureDir, shockDir: r.shockDir, pressureAtr: r.pressureAtr, shockAtr: r.shockAtr,
+    pressureEff: r.pressureEff, shockAge: Number.isFinite(r.shockAge) ? r.shockAge : -1, bodyAtr: r.bodyAtr, progress: Math.min(1, r.progress), trendDir: r.trendDir, points: r.points, text: r.text })
 }
 
 /** `story.ha(["color"|"predict"|"both"], ["otc"])` - the HEIKIN ASHI PREDICTOR (analytics/hapredict.ts), built to FILTER the pm. Flat bundle: ok error color ("bull"/"bear") sign streak strength (strong|normal|weak) bodyRatio flipped state

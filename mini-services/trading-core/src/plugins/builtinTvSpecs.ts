@@ -602,6 +602,21 @@ expiry = 1
 `,
   },
   {
+    id: 'meta:builtin-sp',
+    name: 'Builtin: shock & pressure (sp, ongoing candle)',
+    script: `
+# SHOCK & PRESSURE of the candle that is STILL FORMING. Pressure = the body moving slowly (a steady drift); shock = the body moving suddenly (a fast, long burst). Each has its own direction.
+# 1 pressure up + shock up -> LOWER | 2 pressure down + shock down -> HIGHER | 3 pressure up + shock down -> LOWER | 4 pressure down + shock up -> HIGHER | 5 pressure, no shock -> WITH THE TREND.
+# (Cases 1-4 always go AGAINST the pressure; the shock decides whether the setup exists.) It reads the path from live ticks / the 5s chart, so it is LIVE / replay only. It acts in the middle of the candle (progress 0.5-0.9):
+# earlier there is too little path, later too little time. story.spText() is the sentence; story.sp("5m") reads the case-5 trend from the 5m chart.
+let s = story.sp()
+let inWindow = s.ok and s.progress >= 0.5 and s.progress <= 0.9
+call when inWindow and s.direction == "call"
+put when inWindow and s.direction == "put"
+expiry = 1
+`,
+  },
+  {
     id: 'meta:builtin-pmm',
     name: 'Builtin: pmm (pm + market structure)',
     script: `
