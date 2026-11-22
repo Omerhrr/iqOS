@@ -617,6 +617,22 @@ expiry = 1
 `,
   },
   {
+    id: 'meta:builtin-weiswave',
+    name: 'Builtin: Weis wave (effort vs result)',
+    script: `
+# WEIS WAVE. Volume summed per price wave. A new high on LESS volume than the last up-wave (or big effort for little move, or shortening waves) = the wave is spent -> go the other way;
+# a new extreme on MORE volume = fuel -> go with it. mode: "atr" cuts waves on an ATR reversal, "close" on close-to-close direction (change the word to compare).
+# On feeds without real volume (many OTC) true range stands in (ww.volumeOk() is false). Describes disagreement only - backtest per pair before trusting it.
+let ok = ww.ok("atr")
+let d = ww.dir("atr")
+let st = ww.strength("atr")
+call when ok and d == "call" and st >= 40
+put when ok and d == "put" and st >= 40
+confidence = st
+expiry = 3
+`,
+  },
+  {
     id: 'meta:builtin-pmm',
     name: 'Builtin: pmm (pm + market structure)',
     script: `

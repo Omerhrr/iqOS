@@ -14,6 +14,8 @@ import SubPane from '@/components/os/SubPane'
 import SignalPanel from '@/components/os/SignalPanel'
 import SignalSidePanel from '@/components/os/SignalSidePanel'
 import RegimePanel from '@/components/os/RegimePanel'
+import WeisWavePanel from '@/components/os/WeisWavePanel'
+import WeisWaveGlobalPanel from '@/components/os/WeisWaveGlobalPanel'
 import ChartSignalsPanel from '@/components/os/ChartSignalsPanel'
 import YesterdayPanel from '@/components/os/YesterdayPanel'
 import LeadLagPanel from '@/components/os/LeadLagPanel'
@@ -107,7 +109,7 @@ const INDICATOR_STORAGE_KEY = 'iqos.activeIndicators.v1'
 // @ Now", "Cointegration") out of the open strip entirely instead of just
 // closing it each time - it stays hidden across reloads until re-checked in
 // the Panels settings menu. Nothing is deleted, this only gates rendering.
-type PanelId = 'signals' | 'yday' | 'leadlag' | 'distill' | 'cointegration' | 'volarb' | 'triangulation' | 'adxPatternBias' | 'shockPressure' | 'renkoFootprint' | 'renkoFootprintOtc' | 'volumeFootprint' | 'tickVolume' | 'tickSmc' | 'tickOracle' | 'tickTechnical' | 'tickFootprint' | 'tickPatterns' | 'pairCompare' | 'pairSignal' | 'oracle' | 'nextExpiry' | 'nextExpiryGlobal' | 'technical' | 'technicalGlobal' | 'reversal' | 'reversalGlobal' | 'nextGlobal' | 'tempo' | 'tempoGlobal' | 'accute' | 'accuteGlobal' | 'smcRecent' | 'smcGlobal' | 'globalDom' | 'mrcPredict' | 'pm' | 'pmGlobal' | 'renkoReversal' | 'kagiReversal' | 'signalPanel' | 'signalGlobal' | 'regimePanel'
+type PanelId = 'signals' | 'yday' | 'leadlag' | 'distill' | 'cointegration' | 'volarb' | 'triangulation' | 'adxPatternBias' | 'shockPressure' | 'renkoFootprint' | 'renkoFootprintOtc' | 'volumeFootprint' | 'tickVolume' | 'tickSmc' | 'tickOracle' | 'tickTechnical' | 'tickFootprint' | 'tickPatterns' | 'pairCompare' | 'pairSignal' | 'oracle' | 'nextExpiry' | 'nextExpiryGlobal' | 'technical' | 'technicalGlobal' | 'reversal' | 'reversalGlobal' | 'nextGlobal' | 'tempo' | 'tempoGlobal' | 'accute' | 'accuteGlobal' | 'smcRecent' | 'smcGlobal' | 'globalDom' | 'mrcPredict' | 'pm' | 'pmGlobal' | 'renkoReversal' | 'kagiReversal' | 'signalPanel' | 'signalGlobal' | 'regimePanel' | 'weisWave' | 'weisWaveGlobal'
 const PANEL_META: { id: PanelId; label: string }[] = [
   { id: 'signals', label: 'Chart Signals' },
   { id: 'yday', label: 'Yesterday @ Now' },
@@ -152,6 +154,8 @@ const PANEL_META: { id: PanelId; label: string }[] = [
   { id: 'signalPanel', label: 'Signal' },
   { id: 'signalGlobal', label: 'Signal Global' },
   { id: 'regimePanel', label: 'Regime' },
+  { id: 'weisWave', label: 'Weis Wave' },
+  { id: 'weisWaveGlobal', label: 'Weis Wave Global' },
 ]
 const DEFAULT_PANEL_VISIBILITY: Record<PanelId, boolean> = {
   signals: true,
@@ -197,6 +201,8 @@ const DEFAULT_PANEL_VISIBILITY: Record<PanelId, boolean> = {
   signalPanel: true,
   signalGlobal: true,
   regimePanel: true,
+  weisWave: true,
+  weisWaveGlobal: true,
 }
 const PANEL_VISIBILITY_STORAGE_KEY = 'iqos.panelVisibility.v1'
 
@@ -313,6 +319,9 @@ export default function OSPage() {
   const [signalPanelOpen, setSignalPanelOpen] = useState(false)
   const [signalGlobalOpen, setSignalGlobalOpen] = useState(false)
   const [regimePanelOpen, setRegimePanelOpen] = useState(false)
+  const [weisWaveOpen, setWeisWaveOpen] = useState(false)
+  const [weisWaveGlobalOpen, setWeisWaveGlobalOpen] = useState(false)
+  const [weisWaveAsset, setWeisWaveAsset] = useState<string | null>(null)
   const [renkoReversalOpen, setRenkoReversalOpen] = useState(false)
   const [kagiReversalOpen, setKagiReversalOpen] = useState(false)
   const [smcRecentOpen, setSmcRecentOpen] = useState(false)
@@ -440,6 +449,8 @@ export default function OSPage() {
         else if (id === 'signalPanel') setSignalPanelOpen(false)
         else if (id === 'signalGlobal') setSignalGlobalOpen(false)
         else if (id === 'regimePanel') setRegimePanelOpen(false)
+        else if (id === 'weisWave') setWeisWaveOpen(false)
+        else if (id === 'weisWaveGlobal') setWeisWaveGlobalOpen(false)
       }
       return next
     })
@@ -917,6 +928,8 @@ export default function OSPage() {
     setSignalPanelOpen(false)
     setSignalGlobalOpen(false)
     setRegimePanelOpen(false)
+    setWeisWaveOpen(false)
+    setWeisWaveGlobalOpen(false)
     setSmcRecentOpen(true)
   }, [handleSelectAsset])
 
@@ -1032,6 +1045,8 @@ export default function OSPage() {
     setRenkoReversalOpen(false)
     setKagiReversalOpen(false)
     setRegimePanelOpen(false)
+    setWeisWaveOpen(false)
+    setWeisWaveGlobalOpen(false)
     setSignalGlobalOpen(false)
     setSignalPanelOpen(true)
   }, [])
@@ -1079,6 +1094,8 @@ export default function OSPage() {
     setRenkoReversalOpen(false)
     setKagiReversalOpen(false)
     setRegimePanelOpen(false)
+    setWeisWaveOpen(false)
+    setWeisWaveGlobalOpen(false)
     setSignalPanelOpen(false)
     setSignalGlobalOpen(true)
   }, [])
@@ -1130,6 +1147,8 @@ export default function OSPage() {
     setKagiReversalOpen(false)
 
     setRegimePanelOpen(false)
+    setWeisWaveOpen(false)
+    setWeisWaveGlobalOpen(false)
     setPmOpen('pm')
   }, [handleSelectAsset])
   const handleOpenPmGlobal = useCallback(() => {
@@ -1176,6 +1195,8 @@ export default function OSPage() {
     setKagiReversalOpen(false)
 
     setRegimePanelOpen(false)
+    setWeisWaveOpen(false)
+    setWeisWaveGlobalOpen(false)
     setPmOpen('global')
   }, [])
 
@@ -1223,6 +1244,103 @@ export default function OSPage() {
     setRenkoReversalOpen(false)
     setKagiReversalOpen(false)
     setRegimePanelOpen(true)
+  }, [])
+
+  // Weis Wave: one pair (the chart's pair, or a Weis Wave Global row's pair) / the whole open universe.
+  const handleOpenWeisWave = useCallback((a?: string) => {
+    setSignalPanelOpen(false)
+    setSignalGlobalOpen(false)
+    setSignalsOpen(false)
+    setYdayOpen(false)
+    setLeadlagOpen(false)
+    setDistillOpen(false)
+    setCointegrationOpen(false)
+    setVolarbOpen(false)
+    setTriangulationOpen(false)
+    setAdxPatternBiasOpen(false)
+    setShockPressureOpen(false)
+    setRenkoFootprintOpen(false)
+    setRenkoFootprintOtcOpen(false)
+    setVolumeFootprintOpen(false)
+    setTickVolumeOpen(false)
+    setTickSmcOpen(false)
+    setTickOracleOpen(false)
+    setTickTechnicalOpen(false)
+    setTickFootprintOpen(false)
+    setTickPatternsOpen(false)
+    setPairCompareOpen(false)
+    setPairSignalOpen(false)
+    setOracleOpen(false)
+    setNextExpiryOpen(false)
+    setNextExpiryGlobalOpen(false)
+    setTechnicalOpen(false)
+    setTechnicalGlobalOpen(false)
+    setReversalOpen(false)
+    setReversalGlobalOpen(false)
+    setSmcRecentOpen(false)
+    setSmcGlobalOpen(false)
+    setSignalGlobalOpen(false)
+    setGlobalDomOpen(false)
+    setNextGlobalOpen(false)
+    setTempoOpen(false)
+    setTempoGlobalOpen(false)
+    setAccuteOpen(false)
+    setAccuteGlobalOpen(false)
+    setMrcPredictOpen(false)
+    setPmOpen(null)
+    setRenkoReversalOpen(false)
+    setKagiReversalOpen(false)
+    setRegimePanelOpen(false)
+    setWeisWaveGlobalOpen(false)
+    setWeisWaveAsset(a ?? null)
+    setWeisWaveOpen(true)
+  }, [])
+  const handleOpenWeisWaveGlobal = useCallback(() => {
+    setSignalPanelOpen(false)
+    setSignalGlobalOpen(false)
+    setSignalsOpen(false)
+    setYdayOpen(false)
+    setLeadlagOpen(false)
+    setDistillOpen(false)
+    setCointegrationOpen(false)
+    setVolarbOpen(false)
+    setTriangulationOpen(false)
+    setAdxPatternBiasOpen(false)
+    setShockPressureOpen(false)
+    setRenkoFootprintOpen(false)
+    setRenkoFootprintOtcOpen(false)
+    setVolumeFootprintOpen(false)
+    setTickVolumeOpen(false)
+    setTickSmcOpen(false)
+    setTickOracleOpen(false)
+    setTickTechnicalOpen(false)
+    setTickFootprintOpen(false)
+    setTickPatternsOpen(false)
+    setPairCompareOpen(false)
+    setPairSignalOpen(false)
+    setOracleOpen(false)
+    setNextExpiryOpen(false)
+    setNextExpiryGlobalOpen(false)
+    setTechnicalOpen(false)
+    setTechnicalGlobalOpen(false)
+    setReversalOpen(false)
+    setReversalGlobalOpen(false)
+    setSmcRecentOpen(false)
+    setSmcGlobalOpen(false)
+    setSignalGlobalOpen(false)
+    setGlobalDomOpen(false)
+    setNextGlobalOpen(false)
+    setTempoOpen(false)
+    setTempoGlobalOpen(false)
+    setAccuteOpen(false)
+    setAccuteGlobalOpen(false)
+    setMrcPredictOpen(false)
+    setPmOpen(null)
+    setRenkoReversalOpen(false)
+    setKagiReversalOpen(false)
+    setRegimePanelOpen(false)
+    setWeisWaveOpen(false)
+    setWeisWaveGlobalOpen(true)
   }, [])
 
   // Open the whole-universe Renko (Effort Bricks) reversal board (30s..15m, every pair).
@@ -1776,7 +1894,7 @@ export default function OSPage() {
                 closed = the slim open strip sits above the market watch and
                 everything is laid out exactly as before. */}
             <Panel defaultSize={17} minSize={11}>
-              {pmOpen !== null || regimePanelOpen || signalPanelOpen || signalGlobalOpen || signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen || shockPressureOpen || renkoFootprintOpen || renkoFootprintOtcOpen || volumeFootprintOpen || tickVolumeOpen || tickSmcOpen || tickOracleOpen || tickTechnicalOpen || tickFootprintOpen || tickPatternsOpen || pairCompareOpen || pairSignalOpen || oracleOpen || nextExpiryOpen || nextExpiryGlobalOpen || technicalOpen || technicalGlobalOpen || reversalOpen || reversalGlobalOpen || smcRecentOpen || smcGlobalOpen || globalDomOpen || nextGlobalOpen || tempoOpen || tempoGlobalOpen || accuteOpen || accuteGlobalOpen || mrcPredictOpen || renkoReversalOpen || kagiReversalOpen ? (
+              {pmOpen !== null || weisWaveOpen || weisWaveGlobalOpen || regimePanelOpen || signalPanelOpen || signalGlobalOpen || signalsOpen || ydayOpen || leadlagOpen || distillOpen || cointegrationOpen || volarbOpen || triangulationOpen || adxPatternBiasOpen || shockPressureOpen || renkoFootprintOpen || renkoFootprintOtcOpen || volumeFootprintOpen || tickVolumeOpen || tickSmcOpen || tickOracleOpen || tickTechnicalOpen || tickFootprintOpen || tickPatternsOpen || pairCompareOpen || pairSignalOpen || oracleOpen || nextExpiryOpen || nextExpiryGlobalOpen || technicalOpen || technicalGlobalOpen || reversalOpen || reversalGlobalOpen || smcRecentOpen || smcGlobalOpen || globalDomOpen || nextGlobalOpen || tempoOpen || tempoGlobalOpen || accuteOpen || accuteGlobalOpen || mrcPredictOpen || renkoReversalOpen || kagiReversalOpen ? (
                 <div className="mr-0.5 h-full min-h-0">
                   {pmOpen === 'pm' ? (
                     <PmPanel onClose={() => setPmOpen(null)} asset={asset} tf={tf} closedTick={closedTick} onOpenGlobal={handleOpenPmGlobal} />
@@ -1808,6 +1926,10 @@ export default function OSPage() {
                     <TickVolumePanel onClose={() => setTickVolumeOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
                   ) : pairCompareOpen ? (
                     <PairComparePanel onClose={() => setPairCompareOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
+                  ) : weisWaveOpen ? (
+                    <WeisWavePanel asset={weisWaveAsset ?? asset} closedTick={closedTick} onClose={() => setWeisWaveOpen(false)} onOpenGlobal={handleOpenWeisWaveGlobal} />
+                  ) : weisWaveGlobalOpen ? (
+                    <WeisWaveGlobalPanel closedTick={closedTick} onClose={() => setWeisWaveGlobalOpen(false)} onPickAsset={handleSelectAsset} onOpenWeisWave={(a) => handleOpenWeisWave(a)} />
                   ) : regimePanelOpen ? (
                     <RegimePanel compact closedTick={closedTick} onPick={handleSelectSetup} onClose={() => setRegimePanelOpen(false)} onOpenSignal={handleOpenSignalPanel} />
                   ) : signalGlobalOpen ? (
@@ -2006,6 +2128,30 @@ export default function OSPage() {
                       >
                         <span className="h-1.5 w-1.5 rounded-full bg-sky-300" />
                         Regime
+                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
+                      </button>
+                      )}
+                      {panelVisibility.weisWave && (
+                      <button
+                        type="button"
+                        onClick={() => handleOpenWeisWave()}
+                        title="Weis Wave - the chart pair's wave volume read on 30s..15m (effort vs result) and the CALL / PUT it adds up to"
+                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-teal-500/40 hover:text-teal-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-teal-300" />
+                        Weis Wave
+                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
+                      </button>
+                      )}
+                      {panelVisibility.weisWaveGlobal && (
+                      <button
+                        type="button"
+                        onClick={() => handleOpenWeisWaveGlobal()}
+                        title="Weis Wave Global - every open pair ranked by its Weis Wave CALL / PUT across 30s..15m"
+                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-teal-500/40 hover:text-teal-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-teal-300" />
+                        Weis Wave Global
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
                       )}

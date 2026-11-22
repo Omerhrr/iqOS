@@ -1750,6 +1750,34 @@ export async function getTechnicalGlobal(opts?: { limit?: number; category?: str
   })
 }
 
+// ---------- Weis Wave (mini-services/trading-core/src/plugins/weiswave.ts) ----------
+export type WwMode = 'atr' | 'close'
+export interface WwRung {
+  tf: string; ok: boolean; note: string
+  direction: 'call' | 'put' | 'none'; strength: number; reason: string
+  waveDir: 1 | -1 | 0; waveBars: number; waveVol: number; waveMoveAtr: number
+  volRatio: number | null; effortRatio: number | null; prevVol: number
+  weak: boolean; strong: boolean; absorption: boolean; shortening: boolean; hot: boolean; newExtreme: boolean
+  volumeOk: boolean; waves: number
+}
+export interface WwRow {
+  asset: string; price: number; computedTs: number; ok: boolean; note: string
+  mode: WwMode; thr: number
+  direction: 'call' | 'put' | 'none'
+  net: number; agree: number; live: number
+  best: { tf: string; direction: 'call' | 'put'; strength: number } | null
+  volumeOk: boolean
+  rungs: WwRung[]
+}
+export interface WwGlobalResult { ok: boolean; error?: string; scannedTs: number; universe: number; live: number; warming: number; calls: number; puts: number; mode: WwMode; thr: number; rows: WwRow[] }
+
+export async function getWeisWave(asset: string, opts?: { mode?: WwMode; thr?: number; tfs?: string[]; refresh?: boolean }): Promise<{ ok: boolean; error?: string; row: WwRow }> {
+  return osGet('/weiswave', { asset, mode: opts?.mode, thr: opts?.thr, tfs: opts?.tfs?.join(','), refresh: opts?.refresh ? 1 : undefined })
+}
+export async function getWeisWaveGlobal(opts?: { mode?: WwMode; thr?: number; tfs?: string[]; category?: string; refresh?: boolean }): Promise<WwGlobalResult> {
+  return osGet('/weiswave_global', { mode: opts?.mode, thr: opts?.thr, tfs: opts?.tfs?.join(','), category: opts?.category, refresh: opts?.refresh ? 1 : undefined })
+}
+
 // ---------- Tick Desk (mini-services/trading-core/src/analytics/tickdesk.ts) - the
 // four engines read off the raw micro-tick stream (same buffer otc_footprint
 // collects): Tick SMC, Tick Oracle, Tick Technical, Tick Footprint. Every

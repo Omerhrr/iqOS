@@ -15,6 +15,7 @@ import {
 import { scanSmc, type SmcScanResult, type SmcSignal } from './smc'
 import { ICT_KINDS, SMC_KINDS } from './chartindicators'
 import { realizedUpProb } from './ivhv'
+import { weisWaveSeries } from './weiswave'
 
 const isn = TA.isn
 
@@ -1138,6 +1139,15 @@ const extras2: IndicatorDef[] = [
         lo[i] = ll
       }
       return { lines: [line('hh', C.slate, hi, 'dotted'), line('ll', C.slate, lo, 'dotted')], fillBetween: [0, 1] }
+    },
+  },
+  {
+    id: 'weis-wave', name: 'Weis Wave Volume', category: 'volume', pane: 'sub',
+    params: [p('mode', 'Cut (0 = ATR reversal, 1 = close-to-close)', 0, 1, 0), p('thr', 'ATR reversal (x ATR14)', 0.3, 4, 1, 0.1)],
+    description: 'Weis Wave - volume summed per price wave (cumulative within each wave; green up-waves, red down-waves drawn below zero). On feeds without real volume true range stands in. Past bars are coloured with hindsight: a wave start is only known after it turns.',
+    compute: (c, par) => {
+      const w = weisWaveSeries(c, { mode: num(c, par, 'mode', 0) >= 0.5 ? 'close' : 'atr', thr: num(c, par, 'thr', 1) })
+      return { lines: [], hist: { values: w.value, color: 'updown' }, levels: [0] }
     },
   },
   {

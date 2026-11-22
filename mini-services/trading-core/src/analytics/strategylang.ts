@@ -245,6 +245,7 @@ import { computeOutcomeMemory } from './outcomememory'
 import { readSignalCore, SIGNAL_MIN_BARS, type SignalCore } from './signalcore'
 import { AMD_MIN_BARS, readAmd, type AmdRead } from './mslamd'
 import { WYCKOFF_MIN_BARS, readWyckoff, type WyckoffRead } from './mslwyckoff'
+import { WW_MIN_BARS, readWeisWave, type WwRead } from './weiswave'
 import { SMCX_MIN_BARS, readSmcx, type SmcxRead } from './mslsmcx'
 import { smtDivergence } from './smt'
 import { readBlocks, readJudas, readSoup, type BlockRead, type JudasRead } from './mslpatterns'
@@ -4172,6 +4173,48 @@ function amdMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | un
   }
 }
 
+/** `ww.*` - WEIS WAVE (analytics/weiswave.ts): price cut into up/down waves, volume summed per wave, read as effort vs result. Args: (mode, thr, tf) all optional;
+ * mode "atr" (default; reversal = thr x ATR14, default 1) or "close" (close-to-close direction). e.g. ww.weak("close") ww.dir(1.5, "15m") ww.dir("atr", 0.8, "5m").
+ *   ok() dir() "call"/"put"/"none" strength() 0..100 reason() text   weak() strong() absorption() shortening() hot() newExtreme() volumeOk() booleans
+ *   waveDir() +1/-1 waveVol() waveBars() waveMove() (ATR) volRatio() effortRatio() prevVol() prevMove() count() */
+const wwCache = new WeakMap<MslSeriesCtx, Map<string, WwRead | null>>()
+function wwMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  const s = requireSeries(ctx, tf)
+  let mode: 'atr' | 'close' = 'atr', thr: number | undefined
+  for (const a of args) { if (a === 'close' || a === 'atr') mode = a; else if (typeof a === 'number') thr = a }
+  let per = wwCache.get(s)
+  if (!per) { per = new Map(); wwCache.set(s, per) }
+  const key = `${mode}|${thr ?? ''}`
+  let m = per.get(key)
+  if (m === undefined) { m = readWeisWave(candlesWithTime(s), { mode, thr }); per.set(key, m) }
+  if (name === 'ok') return m !== null
+  if (!m) throw new MslRuntimeError(`ww.${name}() needs at least ${WW_MIN_BARS} closed bars and a few waves - history is too thin (check ww.ok() first)`)
+  const num = (x: number) => (Number.isFinite(x) ? x : 0)
+  switch (name) {
+    case 'dir': return m.direction
+    case 'strength': return m.strength
+    case 'reason': return m.reason
+    case 'weak': return m.weak
+    case 'strong': return m.strong
+    case 'absorption': return m.absorption
+    case 'shortening': return m.shortening
+    case 'hot': return m.hot
+    case 'newExtreme': return m.newExtreme
+    case 'volumeOk': return m.volumeOk
+    case 'waveDir': return m.cur.dir
+    case 'waveVol': return m.cur.volume
+    case 'waveBars': return m.cur.bars
+    case 'waveMove': return m.cur.moveAtr
+    case 'volRatio': return num(m.volRatio)
+    case 'effortRatio': return num(m.effortRatio)
+    case 'prevVol': return m.prevSame ? m.prevSame.volume : 0
+    case 'prevMove': return m.prevSame ? m.prevSame.moveAtr : 0
+    case 'count': return m.count
+    default:
+      throw new MslRuntimeError(`unknown ww method "ww.${name}(...)" - use ok/dir/strength/reason/weak/strong/absorption/shortening/hot/newExtreme/volumeOk/waveDir/waveVol/waveBars/waveMove/volRatio/effortRatio/prevVol/prevMove/count`)
+  }
+}
+
 /** `wyckoff.*` - WYCKOFF accumulation / distribution SCHEMATIC reader (analytics/mslwyckoff.ts): a clear prior trend -> a climax bar -> a sideways
  * range -> spring (accumulation) / upthrust (distribution) -> SOS / SOW -> LPS / LPSY -> markup / markdown, with phases A-E. Candle-derived (volume
  * is used only when it varies; `volumeOk()` says whether it did). Needs 150+ closed bars. Detects the SHAPE only - no edge is claimed.
@@ -5615,6 +5658,12 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         const tf = args.length && typeof args[args.length - 1] === 'string' && !/^(bull|bear)$/i.test(String(args[args.length - 1])) ? (args.pop() as string) : undefined
         return smcxMethod(e.name, args, ctx, tf)
+      }
+      // `ww.dir()` / `ww.weak("close")` - Weis wave (see wwMethod above).
+      if (e.obj.t === 'ident' && e.obj.name === 'ww' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' && args[args.length - 1] !== 'atr' && args[args.length - 1] !== 'close' ? (args.pop() as string) : undefined
+        return wwMethod(e.name, args, ctx, tf)
       }
       // `wyckoff.phase()` / `wyckoff.spring()` - Wyckoff accumulation / distribution schematic (see wyckoffMethod above).
       if (e.obj.t === 'ident' && e.obj.name === 'wyckoff' && !(e.obj.name in env)) {
