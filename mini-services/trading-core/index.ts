@@ -4490,9 +4490,18 @@ const httpServer = createServer(async (req, res) => {
       if (path === '/archive') {
         const store = kernel.context().use<{ archiveStats: () => unknown; archiveStatsForAsset: (asset: string) => unknown }>('storeRaw')
         const asset = q.get('asset')
+        // archiveStats() is four FULL scans of the ~1 GB candle table (COUNT(*), COUNT(DISTINCT asset||tf), two GROUP BYs) run synchronously on the event loop:
+        // ~3 s per call, and the Data tab calls this route on every pair switch, so a few clicks froze the kernel until its healthcheck failed.
+        // The tab only reads assetStats (cheap: primary-key range for one asset), so the global block is now opt-in (?global=1) and cached for 10 min.
+        const g = globalThis as { __archiveStatsCache?: { at: number; v: unknown } }
+        let globalStats: unknown
+        if (q.get('global') === '1') {
+          if (!g.__archiveStatsCache || Date.now() - g.__archiveStatsCache.at > 600_000) g.__archiveStatsCache = { at: Date.now(), v: store.archiveStats() }
+          globalStats = g.__archiveStatsCache.v
+        }
         return json(200, {
           ok: true,
-          stats: store.archiveStats(),
+          ...(globalStats !== undefined ? { stats: globalStats } : {}),
           // targeted per-asset breakdown - the global `stats.top` above only
           // lists the busiest 12 asset|tf keys, so a thin instrument can be
           // entirely absent from it despite having real archived bars at
