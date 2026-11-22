@@ -78,3 +78,6 @@ __pycache__/
 *.pyc
 .sandbox-backup/
 upload/
+
+# VPN client configs hold private keys - never commit
+vpn/

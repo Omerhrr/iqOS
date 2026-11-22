@@ -1,0 +1,39 @@
+# Route ONLY the IQ sidecar through a WireGuard VPN (gluetun, open source), because IQ Option drops connections from this server's own IP.
+#
+# Use it as an override on top of the normal file:
+#     docker compose -f docker-compose.yml -f docker-compose.vpn.yml up -d
+# (needs Docker Compose v2.24+ for the `!reset` line; check with `docker compose version`)
+#
+# BEFORE you start it: put a WireGuard client config at  ./vpn/wg0.conf  (next to docker-compose.yml). It contains a PRIVATE KEY - keep it on the server only, never paste it into a chat, never commit it.
+#   - ProtonVPN free tier: account.proton.me -> Downloads -> WireGuard configuration -> pick a FREE server -> download.
+#   - or Cloudflare WARP: generate a config with the `wgcf` tool.
+# No config here is guaranteed to be accepted by IQ Option: free VPN addresses are shared and may be blocked as well. Test first (see the commands in the chat).
+services:
+  gluetun:
+    image: qmcgaw/gluetun:v3
+    container_name: iqos-vpn
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - VPN_SERVICE_PROVIDER=custom
+      - VPN_TYPE=wireguard
+      # the kernel reaches the sidecar's HTTP port THROUGH this container, so gluetun's firewall must let that one port in
+      - FIREWALL_INPUT_PORTS=47313
+    volumes:
+      - ./vpn/wg0.conf:/gluetun/wireguard/wg0.conf:ro
+    networks:
+      iqos-internal:
+        # the kernel still calls http://iqos-sidecar:47313 - that name now points at this container, which forwards into the sidecar's shared network
+        aliases:
+          - iqos-sidecar
+
+  iqos-sidecar:
+    # share gluetun's network: ALL of the sidecar's outbound traffic leaves through the VPN tunnel, and nothing else on the server is affected
+    network_mode: "service:gluetun"
+    networks: !reset []
+    depends_on:
+      gluetun:
+        condition: service_healthy
