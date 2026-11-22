@@ -583,6 +583,25 @@ expiry = 1
 `,
   },
   {
+    id: 'meta:builtin-sage-limit',
+    name: 'Builtin: sage limit order (pm + smart level)',
+    script: `
+# SAGE LIMIT ORDER on pm. Options have no limit order, so the sage fakes one: pm gives the side, then the sage RESTS at a smart level on the trade's side of price (SMC order block / breaker / FVG, supply-demand zone,
+# support-resistance band, fresh Malaysian SNR level) and enters when price gets there AND is refused (a wick into the zone that turns back out by 0.1 ATR). It gives up when the signal goes, the time runs out (120 s),
+# price breaks through the zone, or price runs 0.8 ATR our way without touching it (not chased; that miss is measured).
+# Every taken / cancelled case is resolved 60 s later per level kind, so timing.limitText("lim-call") shows which kinds of level really pay; a kind with 15+ resolved entries under 50% is dropped on this scope.
+# Use timing.limit(name, cond, dir, seconds, "touch") to enter the instant the level is touched, or a number as the 5th argument to rest at your own price. LIVE / replay only.
+let p = story.pm()
+let sigCall = p.ok and p.direction == "call" and not p.atResistance
+let sigPut = p.ok and p.direction == "put" and not p.atSupport
+let goCall = timing.limit("lim-call", sigCall, 1, 120, "auto", "reject")
+let goPut = timing.limit("lim-put", sigPut, -1, 120, "auto", "reject")
+call when goCall == 1
+put when goPut == 1
+expiry = 1
+`,
+  },
+  {
     id: 'meta:builtin-pmm',
     name: 'Builtin: pmm (pm + market structure)',
     script: `

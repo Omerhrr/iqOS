@@ -256,6 +256,7 @@ import { readEm, emUpper, emLower, emZ, emSigmaAt, emModeFromCode, emParams, EM_
 import { detectChartPatterns2, readAutoTrend, readElliott, CP_MIN_BARS, type CpHit, type AutoTrend, type EwRead } from './patternengine'
 import { readPmm } from './pmm'
 import { stepSage, sageKey, sageRec, sageStats, sageText } from './sage'
+import { stepLimit, limitKey, limitRec, limitText, buildLevelBook, type LimitMode } from './sagelimit'
 import { stepHold, holdKey, holdRec, clearHolds, inReplay, replayBypassOn, stepBypass, clearBypass } from './timing'
 import { liveRiskOutcomes, riskStats, sessionAt, minsIn, minsLeft, inWindow, inDates, weekendAt, type RiskOutcome } from './mslrisk'
 import { readPullback, PB_MIN_BARS, type PullbackRead } from './pullback'
@@ -3284,7 +3285,7 @@ function timingMethod(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
     }
     case 'sage': {
       if (inMslBacktest() && !inReplay()) throw new MslRuntimeError('timing.sage() is live-only in the candle backtester (1m bars cannot show the path after the signal) - use the replay tester (/msl_replay) on 5s data')
-      if (args.length < 4) throw new MslRuntimeError('timing.sage(name, cond, dir, seconds [, dipAtr [, abortAtr [, valid [, straight [, horizonSec [, goAtr [, recoverFrac]]]]]]]) needs at least 4 arguments')
+      if (args.length < 4) throw new MslRuntimeError('timing.sage(name, cond, dir, seconds [, dipAtr [, abortAtr [, valid [, straight [, horizonSec [, goAtr [, recoverFrac [, retouch [, retouchAtr]]]]]]]]]) needs at least 4 arguments')
       const d = typeof args[2] === 'string' ? (args[2] === 'call' ? 1 : args[2] === 'put' ? -1 : 0) : Math.sign(asNum(args[2]))
       if (d === 0) throw new MslRuntimeError('timing.sage(): dir must be +1/-1 (or "call"/"put")')
       const seconds = asNum(args[3])
@@ -3297,11 +3298,41 @@ function timingMethod(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
       const lp = livePrice(ctx, s, nowMs)
       const num = (v: MslValue | undefined, def: number): number => (v === undefined ? def : asNum(v))
       const r = stepSage({ key: sageKey(ctx.stateKeyPrefix as string, nameArg()), cond: truthy(args[1]), valid: args[6] === undefined ? true : truthy(args[6]), dir: d, seconds,
-        dipAtr: num(args[4], 0.15), abortAtr: num(args[5], 0.5), straightTake: args[7] === undefined || args[7] !== 'skip', horizonSec: num(args[8], 60), goAtr: num(args[9], 0.1), recoverFrac: num(args[10], 0.4),
+        dipAtr: num(args[4], 0.15), abortAtr: num(args[5], 0.5), straightTake: args[7] === undefined || args[7] !== 'skip', horizonSec: num(args[8], 60), goAtr: num(args[9], 0.1), recoverFrac: num(args[10], 0.4), retouch: args[11] === undefined ? true : truthy(args[11]), retouchAtr: num(args[12], 0.02),
         nowMs, price: lp.price, atr: atrv })
       if (ctx.trace && (r.rec.state !== 'idle' || truthy(args[1]))) ctx.trace.push(`sage "${nameArg()}": ${r.rec.state}${r.rec.why ? ' - ' + r.rec.why : ''} (move ${r.rec.move.toFixed(2)} ATR, worst ${(-r.rec.mae).toFixed(2)})`)
       return r.fire ? 1 : 0
     }
+    case 'limit': {
+      // timing.limit(name, cond, dir, seconds [, where = "auto" [, mode = "reject" [, maxAtr = 1.5 [, breakAtr = 0.25 [, reactAtr = 0.1 [, runAtr = 0.8 [, horizonSec = 60 [, valid = true]]]]]]]])
+      // A LIMIT ORDER for options (which have none): rests at a smart level (SMC zone / supply-demand / SR / MSNR, or an explicit price) and returns 1 on the ONE evaluation to ENTER.
+      if (inMslBacktest() && !inReplay()) throw new MslRuntimeError('timing.limit() is live-only in the candle backtester (1m bars cannot show the path to the level) - use the replay tester (/msl_replay) on 5s data')
+      if (args.length < 4) throw new MslRuntimeError('timing.limit(name, cond, dir, seconds [, where [, mode [, maxAtr [, breakAtr [, reactAtr [, runAtr [, horizonSec [, valid]]]]]]]]) needs at least 4 arguments')
+      const d = typeof args[2] === 'string' ? (args[2] === 'call' ? 1 : args[2] === 'put' ? -1 : 0) : Math.sign(asNum(args[2]))
+      if (d === 0) throw new MslRuntimeError('timing.limit(): dir must be +1/-1 (or "call"/"put")')
+      const seconds = asNum(args[3])
+      if (!(seconds > 0 && seconds <= 3600)) throw new MslRuntimeError('timing.limit(): seconds must be between 0 and 3600')
+      if (replayBypassOn()) return stepBypass(key(), truthy(args[1])) ? 1 : 0
+      const s = requireSeries(ctx, undefined)
+      const a14 = atrInd(s.high, s.low, s.close, 14)
+      const atrv = a14[a14.length - 1]
+      if (!Number.isFinite(atrv) || atrv <= 0) throw new MslRuntimeError('timing.limit(): ATR unavailable (history too thin or flat)')
+      const lp = livePrice(ctx, s, nowMs)
+      const num = (v: MslValue | undefined, def: number): number => (v === undefined ? def : asNum(v))
+      const whereArg = args[4] === undefined ? 'auto' : typeof args[4] === 'string' ? String(args[4]) : asNum(args[4])
+      const modeArg: LimitMode = args[5] === 'touch' ? 'touch' : 'reject'
+      const lr = stepLimit({ key: limitKey(ctx.stateKeyPrefix as string, nameArg()), cond: truthy(args[1]), valid: args[11] === undefined ? true : truthy(args[11]), dir: d, seconds, mode: modeArg, where: whereArg,
+        maxAtr: num(args[6], 1.5), breakAtr: num(args[7], 0.25), reactAtr: num(args[8], 0.1), runAtr: num(args[9], 0.8), horizonSec: num(args[10], 60), nowMs, price: lp.price, atr: atrv,
+        book: () => { const n0 = s.close.length, from = Math.max(0, n0 - 300); const cs = []; for (let q = from; q < n0; q++) cs.push({ time: s.time?.[q] ?? q * 60, open: s.open[q], high: s.high[q], low: s.low[q], close: s.close[q], volume: s.volume[q] ?? 0 }); return buildLevelBook(cs, d, lp.price, atrv) } })
+      if (ctx.trace && (lr.rec.state !== 'idle' || truthy(args[1]))) ctx.trace.push(`limit "${nameArg()}": ${lr.rec.state}${lr.rec.why ? ' - ' + lr.rec.why : ''}${lr.rec.level ? ` [${lr.rec.level.kind} ${lr.rec.level.edge.toFixed(5)}]` : ''}`)
+      return lr.fire ? 1 : 0
+    }
+    case 'limitState': { if (ctx.stateKeyPrefix === undefined) return 'idle'; return limitRec(limitKey(ctx.stateKeyPrefix, nameArg()))?.state ?? 'idle' }
+    case 'limitWhy': { if (ctx.stateKeyPrefix === undefined) return ''; return limitRec(limitKey(ctx.stateKeyPrefix, nameArg()))?.why ?? '' }
+    case 'limitKind': { if (ctx.stateKeyPrefix === undefined) return ''; return limitRec(limitKey(ctx.stateKeyPrefix, nameArg()))?.level?.kind ?? '' }
+    case 'limitLevel': { if (ctx.stateKeyPrefix === undefined) return NaN; return limitRec(limitKey(ctx.stateKeyPrefix, nameArg()))?.level?.edge ?? NaN }
+    case 'limitClass': { if (ctx.stateKeyPrefix === undefined) return ''; return limitRec(limitKey(ctx.stateKeyPrefix, nameArg()))?.cls ?? '' }
+    case 'limitText': { if (ctx.stateKeyPrefix === undefined) return ''; return limitText(limitKey(ctx.stateKeyPrefix, nameArg())) }
     case 'sageState': { if (ctx.stateKeyPrefix === undefined) return 'idle'; return sageRec(sageKey(ctx.stateKeyPrefix, nameArg()))?.state ?? 'idle' }
     case 'sageWhy': { if (ctx.stateKeyPrefix === undefined) return ''; return sageRec(sageKey(ctx.stateKeyPrefix, nameArg()))?.why ?? '' }
     case 'sageClass': { if (ctx.stateKeyPrefix === undefined) return ''; return sageRec(sageKey(ctx.stateKeyPrefix, nameArg()))?.cls ?? '' }
@@ -3324,7 +3355,7 @@ function timingMethod(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
     case 'minute': return new Date(nowMs).getUTCMinutes()
     case 'hour': return new Date(nowMs).getUTCHours()
     case 'dow': return new Date(nowMs).getUTCDay()
-    default: throw new MslRuntimeError(`unknown timing method "timing.${name}(...)" - use hold/sage/sageState/sageWhy/sageClass/sageDip/sageText/state/why/waited/left/move/barAge/barLeft/second/minute/hour/dow`)
+    default: throw new MslRuntimeError(`unknown timing method "timing.${name}(...)" - use hold/sage/sageState/sageWhy/sageClass/sageDip/sageText/limit/limitState/limitWhy/limitKind/limitLevel/limitClass/limitText/state/why/waited/left/move/barAge/barLeft/second/minute/hour/dow`)
   }
 }
 function barSpacingSec(s: MslSeriesCtx): number {

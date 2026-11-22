@@ -11,9 +11,12 @@
 //
 //   timing.sage(name, cond, dir, seconds [, dipAtr = 0.15 [, abortAtr = 0.5 [, valid = true [, straight = "take" [, horizonSec = 60 [, goAtr = 0.1 [, recoverFrac = 0.4]]]]]]])  -> 1 on the ONE evaluation to ENTER
 //   cond = the signal (e.g. pm call). valid = the re-check at the dip (e.g. pm still same way and a lower-timeframe read agrees). Moves are in ATR14 of the chart the script runs on.
+//   RETOUCH (default on): once price has dipped against the signal and then comes BACK to the signal price (within retouchAtr, default 0.02 ATR), the sage enters IMMEDIATELY - that is the entry the signal
+//   originally asked for, so no recovery fraction and no re-check are needed (the signal must still be on, the dip must not have been a reversal). Class 'retouch', measured and self-corrected like the others.
+//   timing.sage(..., recoverFrac, retouch = 1 [, retouchAtr = 0.02])
 // Pure state machine, explicit clock, so tests (and the replay tester, which walks 5s bars with a clock) can drive it. LIVE / REPLAY only: a 1m candle backtest cannot see intrabar paths.
 export type SageState = 'idle' | 'watching' | 'fired' | 'aborted'
-export type SageClass = 'straight' | 'dip'
+export type SageClass = 'straight' | 'dip' | 'retouch'
 export interface SageRec { state: SageState; latched: boolean; armedMs: number; doneMs: number; entry: number; dir: number; atr: number; mae: number; mfe: number; dipped: boolean; move: number; seconds: number; why: string; cls: SageClass | ''; entryGain: number }
 export interface SageBucket { n: number; w: number }
 export interface SagePending { dueMs: number; px: number; dir: number; bucket: string }
@@ -27,7 +30,7 @@ export function clearSage(prefix: string): void { for (const m of [store, stats,
 export function hasWaitingSage(prefix: string): boolean { for (const [k, r] of store) if (r.state === 'watching' && k.startsWith(`${prefix}|`)) return true; return false }
 const shrunk = (b?: SageBucket): number => (((b?.w ?? 0) + 1) / ((b?.n ?? 0) + 2))
 
-export interface SageInput { key: string; cond: boolean; valid: boolean; dir: number; seconds: number; dipAtr: number; abortAtr: number; goAtr: number; recoverFrac: number; straightTake: boolean; horizonSec: number; nowMs: number; price: number; atr: number }
+export interface SageInput { key: string; cond: boolean; valid: boolean; dir: number; seconds: number; dipAtr: number; abortAtr: number; goAtr: number; recoverFrac: number; straightTake: boolean; retouch?: boolean; retouchAtr?: number; horizonSec: number; nowMs: number; price: number; atr: number }
 
 function resolvePending(key: string, nowMs: number, price: number): void {
   const list = pending.get(key); if (!list || !Number.isFinite(price)) return
@@ -66,6 +69,11 @@ export function stepSage(i: SageInput): { fire: boolean; rec: SageRec } {
   if (r.mae >= i.abortAtr) return skip(`dip too deep (${r.mae.toFixed(2)} ATR) - that is a reversal, not a dip`, 'dip-deep')
   if (!r.dipped && r.mae >= i.dipAtr) r.dipped = true
   if (!r.dipped && move >= i.goAtr) return i.straightTake ? enter('straight', `moved ${move.toFixed(2)} ATR our way with no dip - taken (never skip the strong ones)`) : skip('straight move skipped by setting', 'straight')
+  if (r.dipped && (i.retouch ?? true) && move >= -(i.retouchAtr ?? 0.02)) {
+    const lr = stats.get(i.key)?.['take:retouch']
+    if (lr && lr.n >= 15 && shrunk(lr) < 0.5) return skip(`learned: retouch entries win only ${(shrunk(lr) * 100).toFixed(0)}% here (${lr.n} resolved)`, 'retouch-learned')
+    return enter('retouch', `dipped ${r.mae.toFixed(2)} ATR against, then price came back to the signal price - entered immediately at the original entry`)
+  }
   if (r.dipped && recovered >= Math.max(0.03, i.recoverFrac * r.mae) && i.valid) {
     const learned = stats.get(i.key)?.['take:dip']
     if (learned && learned.n >= 15 && shrunk(learned) < 0.5) return skip(`learned: dip entries win only ${(shrunk(learned) * 100).toFixed(0)}% here (${learned.n} resolved)`, 'dip-learned')
@@ -79,5 +87,5 @@ export function sageText(key: string): string {
   const s = stats.get(key) ?? {}
   const b = (k: string) => { const x = s[k]; return x && x.n ? `${x.w}/${x.n} (${((x.w / x.n) * 100).toFixed(0)}%)` : 'none yet' }
   const skipped = Object.entries(s).filter(([k]) => k.startsWith('skip:')).reduce((a, [, v]) => ({ n: a.n + v.n, w: a.w + v.w }), { n: 0, w: 0 })
-  return `sage resolved: straight entries ${b('take:straight')}, dip entries ${b('take:dip')}, skipped signals that would have won ${skipped.n ? `${skipped.w}/${skipped.n} (${((skipped.w / skipped.n) * 100).toFixed(0)}%)` : 'none yet'}`
+  return `sage resolved: straight entries ${b('take:straight')}, dip entries ${b('take:dip')}, retouch entries ${b('take:retouch')}, skipped signals that would have won ${skipped.n ? `${skipped.w}/${skipped.n} (${((skipped.w / skipped.n) * 100).toFixed(0)}%)` : 'none yet'}`
 }
