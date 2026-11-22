@@ -89,6 +89,8 @@ export interface OmniTraderConfig {
   maxOpen: number
   kind: TradeKind
   expiryTf?: Timeframe
+  /** Exact binary/turbo expiry in WHOLE MINUTES (1,2,3,4,5,15,30,45,60 - what IQ accepts). Overrides expiryTf's bar rounding, so 3m/4m work on any signal tf. Undefined = use expiryTf. */
+  expiryMin?: number
   expirySec?: number
   marketScope: 'all' | 'real' | 'otc'
   cooldownSec: number
@@ -220,6 +222,7 @@ export class OmniTraderService {
         maxOpen: Math.max(1, Math.round(num(saved.maxOpen, DEFAULT_OMNI_TRADER.maxOpen))),
         kind: str(saved.kind, DEFAULT_OMNI_TRADER.kind) as TradeKind,
         expiryTf: typeof saved.expiryTf === 'string' ? (saved.expiryTf as Timeframe) : undefined,
+        expiryMin: (([1, 2, 3, 4, 5, 15, 30, 45, 60]).includes(Number(saved.expiryMin)) ? Number(saved.expiryMin) : undefined),
         expirySec: typeof saved.expirySec === 'number' ? saved.expirySec : undefined,
         marketScope: (saved.marketScope === 'real' || saved.marketScope === 'otc' ? saved.marketScope : 'all') as 'all' | 'real' | 'otc',
         cooldownSec: Math.max(0, num(saved.cooldownSec, DEFAULT_OMNI_TRADER.cooldownSec)),
@@ -298,6 +301,7 @@ export class OmniTraderService {
     this.config.cooldownSec = Math.max(0, Math.round(Number(this.config.cooldownSec) || 0))
     this.config.globalCooldownSec = Math.max(0, Math.round(Number(this.config.globalCooldownSec) || 0))
     this.config.useScriptExpiry = this.config.useScriptExpiry === true
+    this.config.expiryMin = (([1, 2, 3, 4, 5, 15, 30, 45, 60]).includes(Number(this.config.expiryMin)) ? Number(this.config.expiryMin) : undefined)
     this.config.scanBatch = Math.min(150, Math.max(6, Math.round(Number(this.config.scanBatch) || MAX_TICK_ASSETS)))
     this.config.correlationGuard = this.config.correlationGuard !== false
     this.config.poolMode = this.config.poolMode === 'setups' ? 'setups' : 'all'
@@ -553,9 +557,10 @@ export class OmniTraderService {
       const kind = this.config.kind
       // useScriptExpiry: the strategy's own `expiry = <minutes>` (whole minutes 1-60) overrides the fixed expiry for this order
       const scriptMin = this.config.useScriptExpiry && row.expiryMin !== undefined ? row.expiryMin : undefined
-      const fixedBars = this.config.expiryTf ? Math.max(1, Math.round(TIMEFRAME_SECONDS[this.config.expiryTf] / TIMEFRAME_SECONDS[this.config.tf])) : 1
+      const exactMin = (kind === 'binary' || kind === 'turbo') && scriptMin === undefined ? this.config.expiryMin : undefined // exact minutes (3m/4m...) beat the tf bar rounding
+      const fixedBars = exactMin !== undefined ? Math.max(1, Math.round((exactMin * 60) / TIMEFRAME_SECONDS[this.config.tf])) : this.config.expiryTf ? Math.max(1, Math.round(TIMEFRAME_SECONDS[this.config.expiryTf] / TIMEFRAME_SECONDS[this.config.tf])) : 1
       const expiryBars = scriptMin !== undefined ? Math.max(1, Math.round((scriptMin * 60) / TIMEFRAME_SECONDS[this.config.tf])) : fixedBars
-      const expirySec = kind === 'blitz' || kind === 'digital' ? (scriptMin !== undefined ? (kind === 'blitz' ? Math.min(60, scriptMin * 60) : scriptMin * 60) : this.config.expirySec) : undefined
+      const expirySec = exactMin !== undefined ? exactMin * 60 : kind === 'blitz' || kind === 'digital' ? (scriptMin !== undefined ? (kind === 'blitz' ? Math.min(60, scriptMin * 60) : scriptMin * 60) : this.config.expirySec) : undefined
       const out = await exec.placeOrder({
         asset: row.asset,
         tf: this.config.tf,

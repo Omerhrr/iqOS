@@ -4288,6 +4288,8 @@ export interface BotConfig {
   kind: TradeKind
   stake: number
   expiryBars: number
+  /** Exact binary/turbo expiry in whole minutes (1,2,3,4,5,15,30,45,60). null/undefined = use expiryTf / bars. */
+  expiryMin?: number | null
   /** Explicit time expiry in seconds for digital bots (900 = 15 minutes). */
   expirySec?: number
   /** Session filter: only trade inside the UTC window. 'overlap' = London x NY. */
@@ -5219,6 +5221,8 @@ export interface AutoTraderConfig {
    * candles signals are read from). Unset = old behavior (expiry tracks tf
    * 1:1, i.e. exactly one bar). Set to decouple them, e.g. read signals on
    * '1m' but let each trade run '5m' before it settles. */
+  /** Exact binary/turbo expiry in whole minutes (1,2,3,4,5,15,30,45,60). null/undefined = use expiryTf / bars. */
+  expiryMin?: number | null
   expiryTf?: Timeframe
   /** Instrument type to trade. Undefined/unset = 'binary' (the historical
    * behavior). 'blitz'/'digital' settle on `expirySec` instead of
@@ -5434,6 +5438,8 @@ export interface MetaTraderConfig {
   kind: TradeKind
   /** trade's own expiry as a timeframe, separate from `tf` - undefined
    * tracks `tf` 1:1 (1 bar). Only meaningful for binary/turbo. */
+  /** Exact binary/turbo expiry in whole minutes (1,2,3,4,5,15,30,45,60). null/undefined = use expiryTf / bars. */
+  expiryMin?: number | null
   expiryTf?: Timeframe
   /** wall-clock expiry in seconds - only read for kind 'blitz'/'digital'. */
   expirySec?: number
@@ -5504,6 +5510,8 @@ export interface OmniTraderConfig {
   stake: number
   maxOpen: number
   kind: TradeKind
+  /** Exact binary/turbo expiry in whole minutes (1,2,3,4,5,15,30,45,60). null/undefined = use expiryTf / bars. */
+  expiryMin?: number | null
   expiryTf?: Timeframe
   expirySec?: number
   marketScope: 'all' | 'real' | 'otc'

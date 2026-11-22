@@ -119,6 +119,8 @@ export interface AutoTraderConfig {
    * (Math.round(TIMEFRAME_SECONDS[expiryTf] / TIMEFRAME_SECONDS[tf]),
    * floored at 1) since execution.ts's binary/turbo settlement is still
    * bar-counted off the signal tf, not a second independent clock. */
+  /** Exact binary/turbo expiry in WHOLE MINUTES (1,2,3,4,5,15,30,45,60 - what IQ accepts). Overrides expiryTf's bar rounding, so 3m/4m work on any signal tf. Undefined = use expiryTf. */
+  expiryMin?: number
   expiryTf?: Timeframe
   /** Instrument type to trade. Undefined/unset = 'binary' (the historical,
    * only-ever-supported behavior - see placeOrder's hardcoded kind:'binary'
@@ -659,6 +661,7 @@ export class ModeService {
             : DEFAULT_AUTOTRADER.signalSource,
           tf: (typeof c.tf === 'string' && (ALL_TIMEFRAMES as string[]).includes(c.tf) ? c.tf : DEFAULT_AUTOTRADER.tf) as Timeframe,
           expiryTf: typeof c.expiryTf === 'string' && (ALL_TIMEFRAMES as string[]).includes(c.expiryTf) ? (c.expiryTf as Timeframe) : undefined,
+          expiryMin: (([1, 2, 3, 4, 5, 15, 30, 45, 60]).includes(Number(c.expiryMin)) ? Number(c.expiryMin) : undefined),
           stake: clamp(num(c.stake, DEFAULT_AUTOTRADER.stake), 1, 5000),
           minScore: clamp(num(c.minScore, DEFAULT_AUTOTRADER.minScore), 0, 100),
           minConfidence: clamp(num(c.minConfidence, DEFAULT_AUTOTRADER.minConfidence), 0, 100),
@@ -3188,10 +3191,10 @@ export class ModeService {
         // cover that expiry timeframe (min 1) - e.g. signals on '1m' with
         // expiryTf '5m' settles 5 bars later, not 1. Only meaningful for
         // binary/turbo - blitz/digital settle on expirySec instead (below).
-        expiryBars: this.config.expiryTf ? Math.max(1, Math.round(TIMEFRAME_SECONDS[this.config.expiryTf] / TIMEFRAME_SECONDS[this.config.tf])) : 1,
+        expiryBars: this.config.expiryMin && (kind === 'binary' || kind === 'turbo') ? Math.max(1, Math.round((this.config.expiryMin * 60) / TIMEFRAME_SECONDS[this.config.tf])) : this.config.expiryTf ? Math.max(1, Math.round(TIMEFRAME_SECONDS[this.config.expiryTf] / TIMEFRAME_SECONDS[this.config.tf])) : 1,
         // blitz/digital settle at an explicit wall-clock duration, same as
         // an autopilot bot - everything else (binary/turbo/cfd) ignores it.
-        expirySec: kind === 'blitz' || kind === 'digital' ? this.config.expirySec : undefined,
+        expirySec: (kind === 'binary' || kind === 'turbo') && this.config.expiryMin ? this.config.expiryMin * 60 : kind === 'blitz' || kind === 'digital' ? this.config.expirySec : undefined,
         // THE SAME BUG that was in autopilot.ts: this was hardcoded 'paper'
         // unconditionally, so the built-in AUTO-mode auto-trader could never
         // place a real order no matter what the account was connected to.
@@ -3782,6 +3785,7 @@ export class ModeService {
     // null/empty clears back to "track tf 1:1" (the old, implicit behavior) -
     // same null-clears-the-field convention pairStrategy/strategyParams use,
     // since JSON.stringify drops a bare `undefined` from the request body.
+    if (patch.expiryMin !== undefined) this.config.expiryMin = (([1, 2, 3, 4, 5, 15, 30, 45, 60]).includes(Number(patch.expiryMin)) ? Number(patch.expiryMin) : undefined) // null/0 clears
     if (patch.expiryTf !== undefined)
       this.config.expiryTf = typeof patch.expiryTf === 'string' && (ALL_TIMEFRAMES as string[]).includes(patch.expiryTf) ? (patch.expiryTf as Timeframe) : undefined
     // instrument type - whitelisted exactly like autopilot bots (Task 58,

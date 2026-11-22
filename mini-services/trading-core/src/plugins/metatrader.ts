@@ -257,6 +257,8 @@ export interface MetaTraderConfig {
    * meaningful for binary/turbo - blitz/digital settle on expirySec
    * instead. Converted to whole bars-of-`tf` at placement time. */
   expiryTf?: Timeframe
+  /** Exact binary/turbo expiry in WHOLE MINUTES (1,2,3,4,5,15,30,45,60 - what IQ accepts). Overrides expiryTf's bar rounding, so 3m/4m work on any signal tf. Undefined = use expiryTf. */
+  expiryMin?: number
   /** Explicit wall-clock expiry in seconds - only read for kind 'blitz'
    * (1-60s) or 'digital' (60-86400s). Undefined = kind default (15s
    * blitz, 300s digital), same convention as the auto-trader's own. */
@@ -440,6 +442,7 @@ export class MetaTraderService {
         maxOpen: clamp(Math.round(num(saved.maxOpen, DEFAULT_META_TRADER.maxOpen)), 1, 20),
         kind: (['binary', 'turbo', 'blitz', 'digital', 'cfd'] as const).includes(saved.kind as TradeKind) ? (saved.kind as TradeKind) : 'binary',
         expiryTf: typeof saved.expiryTf === 'string' && (ALL_TIMEFRAMES as string[]).includes(saved.expiryTf) ? (saved.expiryTf as Timeframe) : undefined,
+        expiryMin: (([1, 2, 3, 4, 5, 15, 30, 45, 60]).includes(Number(saved.expiryMin)) ? Number(saved.expiryMin) : undefined),
         expirySec:
           typeof saved.expirySec === 'number' && Number.isFinite(saved.expirySec)
             ? // AUDIT: restore now applies the same kind-specific bounds
@@ -804,6 +807,7 @@ export class MetaTraderService {
     // null/empty clears back to "track tf 1:1" - same convention the
     // auto-trader's own expiryTf patch uses (a bare undefined is dropped by
     // JSON.stringify, so null is the only way to clear it from the client).
+    if (patch.expiryMin !== undefined) this.config.expiryMin = (([1, 2, 3, 4, 5, 15, 30, 45, 60]).includes(Number(patch.expiryMin)) ? Number(patch.expiryMin) : undefined) // null/0 clears
     if (patch.expiryTf !== undefined)
       this.config.expiryTf = typeof patch.expiryTf === 'string' && (ALL_TIMEFRAMES as string[]).includes(patch.expiryTf) ? patch.expiryTf : undefined
     if (patch.expirySec !== undefined) {
@@ -1418,9 +1422,10 @@ export class MetaTraderService {
       const kind = this.config.kind
       // useScriptExpiry: the strategy's own `expiry = <minutes>` (whole minutes 1-60) overrides the fixed expiry for this order
       const scriptMin = this.config.useScriptExpiry && row.expiryMin !== undefined ? row.expiryMin : undefined
-      const fixedBars = this.config.expiryTf ? Math.max(1, Math.round(TIMEFRAME_SECONDS[this.config.expiryTf] / TIMEFRAME_SECONDS[this.config.tf])) : 1
+      const exactMin = (kind === 'binary' || kind === 'turbo') && scriptMin === undefined ? this.config.expiryMin : undefined // exact minutes (3m/4m...) beat the tf bar rounding
+      const fixedBars = exactMin !== undefined ? Math.max(1, Math.round((exactMin * 60) / TIMEFRAME_SECONDS[this.config.tf])) : this.config.expiryTf ? Math.max(1, Math.round(TIMEFRAME_SECONDS[this.config.expiryTf] / TIMEFRAME_SECONDS[this.config.tf])) : 1
       const expiryBars = scriptMin !== undefined ? Math.max(1, Math.round((scriptMin * 60) / TIMEFRAME_SECONDS[this.config.tf])) : fixedBars
-      const expirySec = scriptMin !== undefined && (kind === 'blitz' || kind === 'digital') ? (kind === 'blitz' ? Math.min(60, scriptMin * 60) : scriptMin * 60) : kind === 'blitz' || kind === 'digital' ? this.config.expirySec : undefined
+      const expirySec = exactMin !== undefined ? exactMin * 60 : scriptMin !== undefined && (kind === 'blitz' || kind === 'digital') ? (kind === 'blitz' ? Math.min(60, scriptMin * 60) : scriptMin * 60) : kind === 'blitz' || kind === 'digital' ? this.config.expirySec : undefined
       const out = await exec.placeOrder({
         asset: row.asset,
         tf: this.config.tf,

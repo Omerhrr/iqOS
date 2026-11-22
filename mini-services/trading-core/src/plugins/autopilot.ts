@@ -6,6 +6,7 @@
 // so kill switch / daily loss / max stake always outrank any bot.
 
 import type { Position, Timeframe, TradeKind } from '../types'
+import { TIMEFRAME_SECONDS } from '../types'
 import type { KernelContext, Plugin } from '../kernel'
 import type { MarketDataService } from './market-data'
 import type { AnalyticsService } from './analytics'
@@ -31,6 +32,8 @@ export interface BotConfig {
   kind: TradeKind
   stake: number
   expiryBars: number
+  /** Exact binary/turbo expiry in WHOLE MINUTES (1,2,3,4,5,15,30,45,60 - what IQ accepts); overrides expiryBars so 3m/4m work on any tf. Undefined = use expiryBars. */
+  expiryMin?: number
   /** Explicit time expiry in seconds (e.g. 900 = 15 minutes) for digital/
    * blitz bots - independent of the timeframe, settles at an exact
    * timestamp. Undefined = kind default (5m for digital, 15s for blitz). */
@@ -696,6 +699,7 @@ export class AutopilotService {
       kind,
       stake: clampNum(input.stake ?? existing?.stake ?? DEFAULT_BOT.stake, 1, 5000),
       expiryBars: Math.max(1, Math.round(input.expiryBars ?? existing?.expiryBars ?? DEFAULT_BOT.expiryBars)),
+      expiryMin: (input.expiryMin !== undefined ? (([1, 2, 3, 4, 5, 15, 30, 45, 60]).includes(Number(input.expiryMin)) ? Number(input.expiryMin) : undefined) : existing?.expiryMin),
       minScore: clampNum(input.minScore ?? existing?.minScore ?? DEFAULT_BOT.minScore, 0, 100),
       direction: (input.direction ?? existing?.direction ?? 'both') as BotConfig['direction'],
       regime: (input.regime ?? existing?.regime ?? 'all') as BotConfig['regime'],
@@ -1156,8 +1160,8 @@ export class AutopilotService {
       side: wanted,
       kind: bot.kind,
       amount: bet.amount,
-      expiryBars: bot.expiryBars,
-      expirySec: bot.kind === 'digital' || bot.kind === 'blitz' ? bot.expirySec : undefined,
+      expiryBars: bot.expiryMin && (bot.kind === 'binary' || bot.kind === 'turbo') ? Math.max(1, Math.round((bot.expiryMin * 60) / TIMEFRAME_SECONDS[bot.tf])) : bot.expiryBars,
+      expirySec: (bot.kind === 'binary' || bot.kind === 'turbo') && bot.expiryMin ? bot.expiryMin * 60 : bot.kind === 'digital' || bot.kind === 'blitz' ? bot.expirySec : undefined,
       mode: this.exec.accountSource === 'iq' ? 'live' : 'paper',
       strategy: bot.strategyId,
       note: `bot:${bot.id}`,
@@ -1406,8 +1410,8 @@ export class AutopilotService {
         side: wanted,
         kind: bot.kind,
         amount: bet.amount,
-        expiryBars: bot.expiryBars,
-        expirySec: bot.kind === 'digital' || bot.kind === 'blitz' ? bot.expirySec : undefined,
+        expiryBars: bot.expiryMin && (bot.kind === 'binary' || bot.kind === 'turbo') ? Math.max(1, Math.round((bot.expiryMin * 60) / TIMEFRAME_SECONDS[bot.tf])) : bot.expiryBars,
+        expirySec: (bot.kind === 'binary' || bot.kind === 'turbo') && bot.expiryMin ? bot.expiryMin * 60 : bot.kind === 'digital' || bot.kind === 'blitz' ? bot.expirySec : undefined,
         mode: this.exec.accountSource === 'iq' ? 'live' : 'paper',
         strategy: bot.strategyId,
         note: `bot:${bot.id}`,

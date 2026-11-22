@@ -806,6 +806,7 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, m
                   {draft.expiryBars * TF_SECONDS[draft.tf] >= 60 ? ` ≈ ${(draft.expiryBars * TF_SECONDS[draft.tf] / 60).toFixed(1)} min` : ''}) on this
                   timeframe - changing the timeframe keeps the bar count, not the duration, so re-check this after switching tf
                 </div>
+                <ExpiryMinutes value={draft.expiryMin} onChange={(v) => patch({ expiryMin: v })} />
               </div>
             ) : draft.kind === 'digital' ? (
               <NumField
@@ -1612,6 +1613,22 @@ function WatchlistPicker({
             </button>
           )
         })}
+      </div>
+    </div>
+  )
+}
+
+/** Exact binary/turbo expiry in whole minutes - the IQ set, including 3m and 4m which no chart timeframe provides, so the timeframe dropdown above can never express them. "Auto" clears it and the dropdown applies again. */
+const EXPIRY_MIN_CHOICES = [1, 2, 3, 4, 5, 15, 30, 45, 60]
+function ExpiryMinutes({ value, onChange }: { value: number | null | undefined; onChange: (v: number | null) => void }) {
+  return (
+    <div className="mt-1.5">
+      <div className="text-[8px] uppercase tracking-wider text-[#3d4c66]">Exact minutes (overrides the dropdown)</div>
+      <div className="mt-1 grid grid-cols-5 gap-1">
+        <button type="button" onClick={() => onChange(null)} className={`rounded border py-1 text-[10px] font-mono ${!value ? 'border-cyan-500/50 bg-cyan-500/10 text-cyan-300' : 'border-[#1c2739] bg-[#101828] text-[#7c8aa5]'}`}>Auto</button>
+        {EXPIRY_MIN_CHOICES.map((m) => (
+          <button key={m} type="button" onClick={() => onChange(m)} className={`rounded border py-1 text-[10px] font-mono ${value === m ? 'border-cyan-500/50 bg-cyan-500/10 text-cyan-300' : 'border-[#1c2739] bg-[#101828] text-[#7c8aa5]'}`}>{m >= 60 ? `${m / 60}h` : `${m}m`}</button>
+        ))}
       </div>
     </div>
   )
@@ -2455,6 +2472,7 @@ function AutoTraderDialog({
                   </option>
                 ))}
               </select>
+              <ExpiryMinutes value={d.expiryMin} onChange={(v) => p({ expiryMin: v })} />
               <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
                 How long each trade actually runs before it settles - separate from the signal timeframe above. Leave as "Track signal timeframe" for the
                 original 1-bar-of-tf behavior.
@@ -3017,6 +3035,7 @@ function MetaTraderDialog({
                   </option>
                 ))}
               </select>
+              <ExpiryMinutes value={d.expiryMin} onChange={(v) => p({ expiryMin: v })} />
               <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
                 How long each trade actually runs before it settles - separate from the signal timeframe above.
               </p>
@@ -3386,6 +3405,7 @@ function OmniTraderDialog({
                   </option>
                 ))}
               </select>
+              <ExpiryMinutes value={d.expiryMin} onChange={(v) => p({ expiryMin: v })} />
             </div>
           ) : d.kind === 'blitz' ? (
             <div>
