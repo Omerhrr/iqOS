@@ -88,9 +88,8 @@ export function readFinderAsset(frames: FinderFrame[], o: FinderOptions): Finder
   const agreeing = side === 'call' ? calls : puts, against = side === 'call' ? puts.length : calls.length
   if (agreeing.length < minFrames) rejected.push(`only ${agreeing.length} timeframe(s) agree (need ${minFrames})`)
   if (against > 0) rejected.push(`${against} timeframe(s) point the other way`)
-  // the best frame to trade on: strongest agreeing, validated preferred
-  const best = [...agreeing].sort((a, b) => (Number(b.read.pmValidated || b.read.nmValidated) - Number(a.read.pmValidated || a.read.nmValidated)) || (b.read.strength - a.read.strength))[0]
-  if (!best.read.pmValidated && !best.read.nmValidated) rejected.push('neither pm nor nm has a validated walk-forward record on the best frame')
+  // the best frame to trade on: strongest agreeing; a validated nm record is preferred. pm needs only a call (ok) - its own validated / bucketN / strength gates are gone; nm is unchanged.
+  const best = [...agreeing].sort((a, b) => (Number(b.read.nmValidated) - Number(a.read.nmValidated)) || (b.read.strength - a.read.strength))[0]
   const wxBad = reads.find((r) => r.ed.regime === 'dead')
   if (wxBad) rejected.push(`dead market on ${wxBad.read.tf}`)
   // trading plan on a mid frame (trend maturity + avoid zones)
@@ -108,7 +107,7 @@ export function readFinderAsset(frames: FinderFrame[], o: FinderOptions): Finder
   // score (judgement weights)
   const meanStrength = agreeing.reduce((s, r) => s + r.read.strength, 0) / agreeing.length
   const agreeFrac = agreeing.length / reads.length
-  const evidence = agreeing.reduce((s, r) => s + (Number(r.read.pmValidated) + Number(r.read.nmValidated)) / 2, 0) / agreeing.length
+  const evidence = agreeing.reduce((s, r) => s + Number(r.read.nmValidated), 0) / agreeing.length
   const room = clamp(best.read.room >= 90 ? 1 : best.read.room / 2, 0, 1)
   const timeQ = otc ? 0.6 : session === 'OVERLAP' ? 1 : session === 'LONDON' || session === 'NEWYORK' ? 0.8 : session === 'ASIA' ? 0.5 : 0.3
   const wxFit = best.ed.wx.ok ? (best.ed.regime === 'expansion' || (best.ed.regime === 'trend-up' && side === 'call') || (best.ed.regime === 'trend-down' && side === 'put') ? 1 : best.ed.regime === 'squeeze' ? 0.3 : 0.6) : 0.5

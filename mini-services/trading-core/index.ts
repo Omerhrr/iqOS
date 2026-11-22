@@ -2684,7 +2684,7 @@ const httpServer = createServer(async (req, res) => {
               if (!r1.ok || !r5.ok) { thin++; continue }
               const d1 = r1.pm.dir, d5 = r5.pm.dir
               if ((d1 === 'none' && d5 === 'none') || (d1 !== 'none' && d5 !== 'none' && d1 !== d5)) continue
-              screen.push({ asset: a.ticker, otc: !!a.otc, q: Math.max(d1 !== 'none' ? r1.pm.confidence : 0, d5 !== 'none' ? r5.pm.confidence : 0) + (d1 === d5 ? 15 : 0) + (r1.validation.validated ? 8 : 0) + (r5.validation.validated ? 8 : 0) })
+              screen.push({ asset: a.ticker, otc: !!a.otc, q: Math.max(d1 !== 'none' ? r1.pm.confidence : 0, d5 !== 'none' ? r5.pm.confidence : 0) + (d1 === d5 ? 15 : 0) })
             } catch { thin++ }
           }
           screen.sort((x, y) => y.q - x.q)
