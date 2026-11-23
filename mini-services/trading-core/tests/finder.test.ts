@@ -24,4 +24,14 @@ test('cfd mode: when found, stop and target sit on the correct sides with rr >= 
 test('every rejection carries a reason', () => { const r = readFinderAsset(framesOf(walk(3000, 99)), { mode: 'option', asset: 'EURUSD', nowSec: NOW }); if (!r.found) assert.ok(r.rejected.length > 0 && r.text.length > 5) })
 test('chooseExpiry stays within bounds and returns a table', () => { const f = framesOf(walk(3000, 5))[0]; const e = chooseExpiry(f, 'call', false); assert.ok(e.minutes >= 1 && e.minutes <= 30 && e.table.length > 3) })
 test('OTC flag runs through', () => { const r = readFinderAsset(framesOf(walk(3000, 8)), { mode: 'option', asset: 'EURUSD-OTC', otc: true, nowSec: NOW }); assert.ok(r.ok && r.session === 'OTC') })
+test('finder uses pm + Weis wave only: frames carry the wave read, nothing mentions nm, expiry comes from wave rhythm', () => {
+  let seen = 0
+  for (let s = 1; s <= 8; s++) {
+    const r = readFinderAsset(framesOf(walk(3000, s * 11, s % 2 ? 0.03 : -0.03)), { mode: 'option', asset: 'EURUSD', nowSec: NOW })
+    for (const f of r.frames) { seen++; assert.ok(['call', 'put', 'none'].includes(f.ww) && ['with', 'against', 'neutral'].includes(f.wwAlign) && typeof f.wwText === 'string'); assert.equal((f as unknown as Record<string, unknown>).nmRecord, undefined) }
+    assert.ok(!/\bnm\b/i.test(r.text + r.story.join(' ')), 'nm leaked into the text')
+    if (r.expiry) assert.ok(r.expiry.basis.includes('Weis wave') || r.expiry.basis.includes('too few waves'), r.expiry.basis)
+  }
+  assert.ok(seen > 0)
+})
 console.log(`${pass}/${total}`); if (pass !== total) process.exit(1)

@@ -2862,12 +2862,13 @@ const httpServer = createServer(async (req, res) => {
           const svc = kernel.context().use<WeisWaveService>('weiswave')
           const mode = q.get('mode') === 'close' ? 'close' : 'atr'
           const thr = q.get('thr') ? Number(q.get('thr')) : undefined
+          const live = q.get('live') !== '0'
           const tfs = (q.get('tfs') ?? '').split(',').map((x) => x.trim()).filter((x) => (WW_TFS as string[]).includes(x)) as typeof WW_TFS
           if (path === '/weiswave') {
             const asset = String(q.get('asset') ?? market.activeAsset)
-            return json(200, { ok: true, row: svc.read(asset, { mode, thr, tfs, refresh: q.get('refresh') === '1' }) })
+            return json(200, { ok: true, row: svc.read(asset, { mode, thr, tfs, live, refresh: q.get('refresh') === '1' }) })
           }
-          return json(200, { ok: true, ...svc.globalScan({ mode, thr, tfs, category: q.get('category') ?? 'all', limit: q.get('limit') ? Number(q.get('limit')) : undefined, refresh: q.get('refresh') === '1' }) })
+          return json(200, { ok: true, ...svc.globalScan({ mode, thr, tfs, live, category: q.get('category') ?? 'all', limit: q.get('limit') ? Number(q.get('limit')) : undefined, refresh: q.get('refresh') === '1' }) })
         } catch (err) {
           return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
         }

@@ -1771,11 +1771,11 @@ export interface WwRow {
 }
 export interface WwGlobalResult { ok: boolean; error?: string; scannedTs: number; universe: number; live: number; warming: number; calls: number; puts: number; mode: WwMode; thr: number; rows: WwRow[] }
 
-export async function getWeisWave(asset: string, opts?: { mode?: WwMode; thr?: number; tfs?: string[]; refresh?: boolean }): Promise<{ ok: boolean; error?: string; row: WwRow }> {
-  return osGet('/weiswave', { asset, mode: opts?.mode, thr: opts?.thr, tfs: opts?.tfs?.join(','), refresh: opts?.refresh ? 1 : undefined })
+export async function getWeisWave(asset: string, opts?: { mode?: WwMode; thr?: number; tfs?: string[]; refresh?: boolean; live?: boolean }): Promise<{ ok: boolean; error?: string; row: WwRow }> {
+  return osGet('/weiswave', { asset, mode: opts?.mode, thr: opts?.thr, tfs: opts?.tfs?.join(','), live: opts?.live === false ? 0 : undefined, refresh: opts?.refresh ? 1 : undefined })
 }
-export async function getWeisWaveGlobal(opts?: { mode?: WwMode; thr?: number; tfs?: string[]; category?: string; refresh?: boolean }): Promise<WwGlobalResult> {
-  return osGet('/weiswave_global', { mode: opts?.mode, thr: opts?.thr, tfs: opts?.tfs?.join(','), category: opts?.category, refresh: opts?.refresh ? 1 : undefined })
+export async function getWeisWaveGlobal(opts?: { mode?: WwMode; thr?: number; tfs?: string[]; category?: string; refresh?: boolean; live?: boolean }): Promise<WwGlobalResult> {
+  return osGet('/weiswave_global', { mode: opts?.mode, thr: opts?.thr, tfs: opts?.tfs?.join(','), live: opts?.live === false ? 0 : undefined, category: opts?.category, refresh: opts?.refresh ? 1 : undefined })
 }
 
 // ---------- Tick Desk (mini-services/trading-core/src/analytics/tickdesk.ts) - the

@@ -1,11 +1,12 @@
 'use client'
 
 // IQAIR//OS - shared bits of the Weis Wave panels (mode / sensitivity controls, rung strip, direction chip).
+import { useEffect, useState } from 'react'
 import type { WwMode, WwRung } from '@/lib/os/client'
 
 export const WW_TF_CHOICES = ['30s', '1m', '2m', '5m', '15m'] as const
 
-export function WwControls({ mode, setMode, thr, setThr, tfs, setTfs }: { mode: WwMode; setMode: (m: WwMode) => void; thr: number; setThr: (n: number) => void; tfs: string[]; setTfs: (t: string[]) => void }) {
+export function WwControls({ mode, setMode, thr, setThr, tfs, setTfs, live, setLive }: { mode: WwMode; setMode: (m: WwMode) => void; thr: number; setThr: (n: number) => void; tfs: string[]; setTfs: (t: string[]) => void; live: boolean; setLive: (b: boolean) => void }) {
   const btn = (on: boolean) => `rounded border px-1.5 py-px font-mono text-[8.5px] uppercase ${on ? 'border-[#3d4d66] bg-[#0e1524] text-[#dbe4f0]' : 'border-[#1c2739] text-[#7c8aa5] hover:text-[#dbe4f0]'}`
   return (
     <div className="flex flex-wrap items-center gap-1 font-mono text-[8.5px] text-[#7c8aa5]">
@@ -20,6 +21,9 @@ export function WwControls({ mode, setMode, thr, setThr, tfs, setTfs }: { mode: 
           ))}
         </>
       )}
+      <span className="ml-1" title="live = the bar still forming counts, so the running wave moves with price (can repaint until the bar closes); closed = finished bars only, it changes once per bar">bar</span>
+      <button type="button" className={btn(live)} onClick={() => setLive(true)}>live</button>
+      <button type="button" className={btn(!live)} onClick={() => setLive(false)}>closed</button>
       <span className="ml-1">tf</span>
       {WW_TF_CHOICES.map((t) => (
         <button
@@ -64,4 +68,13 @@ export function RungStrip({ rungs, best }: { rungs: WwRung[]; best?: string | nu
       })}
     </span>
   )
+}
+
+/** "updated 12s ago" that ticks every second, so a stale panel is visible at a glance */
+export function Updated({ ts, busy }: { ts: number | null; busy?: boolean }) {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => { const t = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(t) }, [])
+  if (!ts) return <span className="font-mono text-[8.5px] text-[#4b5a72]">{busy ? 'loading…' : 'not loaded yet'}</span>
+  const age = Math.max(0, Math.round((now - ts) / 1000))
+  return <span className={`font-mono text-[8.5px] ${age > 30 ? 'text-amber-300' : 'text-[#4b5a72]'}`} title="when the kernel computed this read">{busy ? 'refreshing… ' : ''}updated {age}s ago</span>
 }

@@ -7,7 +7,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { WwGlobalResult, WwMode, WwRow } from '@/lib/os/client'
 import { fmtPrice, getWeisWaveGlobal } from '@/lib/os/client'
-import { DirChip, RungStrip, WW_TF_CHOICES, WwControls } from './WeisWaveShared'
+import { DirChip, RungStrip, Updated, WW_TF_CHOICES, WwControls } from './WeisWaveShared'
 
 interface Props {
   closedTick?: number
@@ -16,7 +16,7 @@ interface Props {
   onOpenWeisWave?: (asset: string) => void
   onClose: () => void
 }
-const POLL_MS = 12_000
+const POLL_MS = 6_000
 type Filter = 'all' | 'call' | 'put'
 
 export default function WeisWaveGlobalPanel({ closedTick, onPickAsset, onOpenWeisWave, onClose }: Props) {
@@ -27,13 +27,16 @@ export default function WeisWaveGlobalPanel({ closedTick, onPickAsset, onOpenWei
   const [tfs, setTfs] = useState<string[]>([...WW_TF_CHOICES])
   const [filter, setFilter] = useState<Filter>('all')
   const [minAgree, setMinAgree] = useState(1)
+  const [live, setLive] = useState(true)
+  const [busy, setBusy] = useState(false)
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (force = false) => {
+    setBusy(true)
     try {
-      const d = await getWeisWaveGlobal({ mode, thr, tfs })
+      const d = await getWeisWaveGlobal({ mode, thr, tfs, live, refresh: force })
       if (d.ok) { setData(d); setErr(null) } else setErr(d.error ?? 'weis wave global unavailable')
-    } catch (e) { setErr((e as Error).message) }
-  }, [mode, thr, tfs])
+    } catch (e) { setErr((e as Error).message) } finally { setBusy(false) }
+  }, [mode, thr, tfs, live])
 
   useEffect(() => {
     void load()
@@ -50,15 +53,17 @@ export default function WeisWaveGlobalPanel({ closedTick, onPickAsset, onOpenWei
         <span className="h-1.5 w-1.5 rounded-full bg-teal-300" />
         <h3 className="font-mono text-[11px] font-bold uppercase tracking-wider text-[#dbe4f0]">Weis Wave Global</h3>
         <span className="font-mono text-[9px] text-[#7c8aa5]">{data ? `${data.live} live · ${data.warming} warming · universe ${data.universe}` : 'loading…'}</span>
+        <Updated ts={data?.scannedTs ?? null} busy={busy} />
         <div className="ml-auto flex items-center gap-1">
           {(['all', 'call', 'put'] as Filter[]).map((f) => (
             <button key={f} type="button" className={btn(filter === f)} onClick={() => setFilter(f)}>{f}</button>
           ))}
+          <button type="button" onClick={() => void load(true)} disabled={busy} className="rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:text-sky-300 disabled:opacity-50">refresh</button>
           <button type="button" onClick={onClose} className="rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-rose-500/40 hover:text-rose-300">close</button>
         </div>
       </div>
 
-      <WwControls mode={mode} setMode={setMode} thr={thr} setThr={setThr} tfs={tfs} setTfs={setTfs} />
+      <WwControls mode={mode} setMode={setMode} thr={thr} setThr={setThr} tfs={tfs} setTfs={setTfs} live={live} setLive={setLive} />
 
       <div className="flex flex-wrap items-center gap-1.5 font-mono text-[8.5px] text-[#7c8aa5]">
         {data && (

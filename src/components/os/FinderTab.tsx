@@ -1,9 +1,9 @@
 'use client'
 
 // IQAIR//OS - FINDER tab. Two sub-tabs, OPTION and CFD, each with its own trade ticket and a "find trade" button. The button scans every open pair (backend GET /find_trade, analytics/finder.ts): it tells the story of
-// several timeframes (pm + nm + weather + market structure + trend maturity + session), and offers ONE trade only when the timeframes agree, nothing blocks it and the score clears the bar - otherwise it says so.
-// OPTION gives a side and an expiry (1-30 min, chosen from nm's similar past moments); CFD gives entry, stop and target. Nothing is ever placed automatically: the result loads the ticket, you press its button.
-// HONESTY: this stacks models that read the same candles and the weights are judgement; no setup is "almost never wrong". The card shows the measured pm / nm records so the evidence can be judged.
+// several timeframes (pm + Weis wave + weather + market structure + trend maturity + session), and offers ONE trade only when the timeframes agree, nothing blocks it and the score clears the bar - otherwise it says so.
+// OPTION gives a side and an expiry (1-30 min, chosen from the Weis wave rhythm of the frame); CFD gives entry, stop and target. Nothing is ever placed automatically: the result loads the ticket, you press its button.
+// HONESTY: this stacks models that read the same candles and the weights are judgement; no setup is "almost never wrong". The card shows the pm record and the Weis wave read so the evidence can be judged; the expiry is a wave-rhythm estimate, not a measured best horizon.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { AccountState, AssetRow, Position } from '@/lib/os/client'
@@ -11,7 +11,7 @@ import { fmtPrice, osGet } from '@/lib/os/client'
 import TradeTicket, { type TicketPrefill } from './TradeTicket'
 
 type Mode = 'option' | 'cfd'
-interface FrameRead { tf: string; dir: 'call' | 'put' | 'none'; strength: number; pmRecord: string; nmRecord: string; structure: string; regime: string }
+interface FrameRead { tf: string; dir: 'call' | 'put' | 'none'; strength: number; pmRecord: string; ww: 'call' | 'put' | 'none'; wwStrength: number; wwAlign: 'with' | 'against' | 'neutral'; wwText: string; structure: string; regime: string }
 interface Found {
   asset: string; otc: boolean; mode: Mode; side: 'call' | 'put' | 'none'; score: number; grade: 'A' | 'B' | 'C' | ''; tf: string; barLeftSec: number
   frames: FrameRead[]; agree: number; against: number; story: string[]; reasons: string[]; rejected: string[]; session: string; text: string
@@ -103,7 +103,7 @@ export default function FinderTab({ assets, prices, onSelectAsset, onPlaced, onE
         <div className="min-w-0 flex-1 overflow-y-auto p-2">
           {err && <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/5 p-2 text-[9px] text-amber-300">{err}</div>}
           {r && <p className="mb-2 text-[8px] text-[#4b5a72]">searched pairs {r.from + 1}-{Math.min(r.to, r.total)}{r.to > r.total ? ` and 1-${r.to - r.total}` : ''} of {r.total} {scope === 'all' ? '' : scope + ' '}pairs · {r.screened} passed the pm screen, {r.read} read in full{r.thin > 0 ? ` · ${r.thin} skipped (not enough history)` : ''}{r.unread > 0 ? ` · ${r.unread} not read (time ran out)` : ''}{r.total > 100 ? ' · press search next 100 for the rest' : ''}</p>}
-          {!r && !busy && <p className="text-[10px] text-[#4b5a72]">Press <span className="text-emerald-300">find trade</span>: it reads every open pair across 30s to 30m (pm, nm, weather, structure, trend maturity, session) and offers one trade, or tells you nothing is worth taking.</p>}
+          {!r && !busy && <p className="text-[10px] text-[#4b5a72]">Press <span className="text-emerald-300">find trade</span>: it reads every open pair across 30s to 30m (pm, Weis wave, weather, structure, trend maturity, session) and offers one trade, or tells you nothing is worth taking.</p>}
           {r && !r.found && (
             <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-2.5">
               <div className="text-[11px] font-bold uppercase tracking-wider text-amber-300">no trade worth taking right now</div>
@@ -126,7 +126,7 @@ export default function FinderTab({ assets, prices, onSelectAsset, onPlaced, onE
                 {mode === 'option' && cur.expiry && (
                   <div className="mt-2 rounded border border-[#1c2739] bg-[#0b111c] p-2">
                     <div className="flex items-baseline gap-2"><span className="text-[9px] uppercase text-[#4b5a72]">expiry</span><span className="text-lg font-bold text-cyan-300">{cur.expiry.minutes} min</span><span className="text-[9px] text-[#7c8aa5]">{cur.expiry.basis}</span></div>
-                    <div className="mt-1 flex flex-wrap gap-1">{cur.expiry.table.map((t) => <span key={t.minutes} className={`rounded border px-1 text-[8px] ${t.minutes === cur.expiry!.minutes ? 'border-cyan-500/50 text-cyan-300' : 'border-[#1c2739] text-[#4b5a72]'}`}>{t.minutes}m {(t.prob * 100).toFixed(0)}%</span>)}</div>
+                    <div className="mt-1 flex flex-wrap gap-1">{cur.expiry.table.map((t) => <span key={t.minutes} className={`rounded border px-1 text-[8px] ${t.minutes === cur.expiry!.minutes ? 'border-cyan-500/50 text-cyan-300' : 'border-[#1c2739] text-[#4b5a72]'}`} title="share of the frame's recent same-direction waves that ran at least this long">{t.minutes}m {(t.prob * 100).toFixed(0)}%</span>)}</div>
                     <p className="mt-1 text-[8px] text-[#3d4d66]">the ticket snaps this to the durations the broker accepts (binary 1/5 min, digital 5/15/30 min)</p>
                   </div>
                 )}
@@ -142,7 +142,7 @@ export default function FinderTab({ assets, prices, onSelectAsset, onPlaced, onE
               <div className="rounded border border-[#1c2739] bg-[#0b111c] p-2">
                 <div className="mb-1 text-[8px] uppercase tracking-wider text-[#4b5a72]">the story</div>
                 {cur.story.map((l, i) => <p key={i} className="text-[9px] leading-relaxed text-[#7c8aa5]">{l}</p>)}
-                <div className="mt-1.5 flex flex-wrap gap-1">{cur.frames.map((f) => <span key={f.tf} className={`rounded border border-[#1c2739] px-1 text-[8px] ${sideCls(f.dir)}`} title={`pm ${f.pmRecord} · nm ${f.nmRecord} · ${f.structure} · ${f.regime}`}>{f.tf} {f.dir === 'none' ? '-' : f.dir === 'call' ? '▲' : '▼'}{f.strength}</span>)}</div>
+                <div className="mt-1.5 flex flex-wrap gap-1">{cur.frames.map((f) => <span key={f.tf} className={`rounded border border-[#1c2739] px-1 text-[8px] ${sideCls(f.dir)}`} title={`pm ${f.pmRecord} · Weis wave ${f.wwAlign === 'neutral' ? 'silent' : f.wwAlign === 'with' ? 'backs it ' + f.wwStrength : 'against ' + f.wwStrength} (${f.wwText}) · ${f.structure} · ${f.regime}`}>{f.tf} {f.dir === 'none' ? '-' : f.dir === 'call' ? '▲' : '▼'}{f.strength}</span>)}</div>
               </div>
               {r.runnersUp.length > 0 && (
                 <div className="rounded border border-[#1c2739] p-2"><div className="mb-1 text-[8px] uppercase tracking-wider text-[#4b5a72]">runners-up</div>

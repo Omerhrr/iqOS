@@ -7,7 +7,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { WwMode, WwRow, WwRung } from '@/lib/os/client'
 import { fmtPrice, getWeisWave } from '@/lib/os/client'
-import { DirChip, WW_TF_CHOICES, WwControls } from './WeisWaveShared'
+import { DirChip, Updated, WW_TF_CHOICES, WwControls } from './WeisWaveShared'
 
 interface Props {
   asset: string
@@ -15,7 +15,7 @@ interface Props {
   onClose: () => void
   onOpenGlobal?: () => void
 }
-const POLL_MS = 12_000
+const POLL_MS = 4_000
 
 function Flag({ on, label, tip }: { on: boolean; label: string; tip: string }) {
   return on ? <span title={tip} className="rounded border border-amber-500/40 bg-amber-500/10 px-1 py-px font-mono text-[8px] uppercase text-amber-300">{label}</span> : null
@@ -52,16 +52,20 @@ export default function WeisWavePanel({ asset, closedTick, onClose, onOpenGlobal
   const [mode, setMode] = useState<WwMode>('atr')
   const [thr, setThr] = useState(1)
   const [tfs, setTfs] = useState<string[]>([...WW_TF_CHOICES])
+  const [live, setLive] = useState(true)
+  const [busy, setBusy] = useState(false)
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (force = false) => {
+    setBusy(true)
     try {
-      const d = await getWeisWave(asset, { mode, thr, tfs })
+      const d = await getWeisWave(asset, { mode, thr, tfs, live, refresh: force })
       if (d.ok) { setRow(d.row); setErr(null) } else setErr(d.error ?? 'weis wave unavailable')
-    } catch (e) { setErr((e as Error).message) }
-  }, [asset, mode, thr, tfs])
+    } catch (e) { setErr((e as Error).message) } finally { setBusy(false) }
+  }, [asset, mode, thr, tfs, live])
 
+  // a different pair clears the old read; every other change just refetches over the top of it (no blank flash)
+  useEffect(() => { setRow(null) }, [asset])
   useEffect(() => {
-    setRow(null)
     void load()
     const t = setInterval(() => void load(), POLL_MS)
     return () => clearInterval(t)
@@ -73,13 +77,15 @@ export default function WeisWavePanel({ asset, closedTick, onClose, onOpenGlobal
         <span className="h-1.5 w-1.5 rounded-full bg-teal-300" />
         <h3 className="font-mono text-[11px] font-bold uppercase tracking-wider text-[#dbe4f0]">Weis Wave</h3>
         <span className="font-mono text-[9px] text-[#7c8aa5]">{asset}{row ? ` · ${fmtPrice(row.price, asset)}` : ''}</span>
+        <Updated ts={row?.computedTs ?? null} busy={busy} />
         <div className="ml-auto flex items-center gap-1">
+          <button type="button" onClick={() => void load(true)} disabled={busy} className="rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:text-sky-300 disabled:opacity-50">refresh</button>
           {onOpenGlobal && <button type="button" onClick={onOpenGlobal} className="rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-teal-500/40 hover:text-teal-300">global</button>}
           <button type="button" onClick={onClose} className="rounded border border-[#1c2739] px-1.5 py-px font-mono text-[9px] text-[#7c8aa5] hover:border-rose-500/40 hover:text-rose-300">close</button>
         </div>
       </div>
 
-      <WwControls mode={mode} setMode={setMode} thr={thr} setThr={setThr} tfs={tfs} setTfs={setTfs} />
+      <WwControls mode={mode} setMode={setMode} thr={thr} setThr={setThr} tfs={tfs} setTfs={setTfs} live={live} setLive={setLive} />
 
       {err && <div className="rounded border border-amber-500/30 bg-amber-500/5 p-2 font-mono text-[9px] text-amber-300">{err}</div>}
 
