@@ -2855,6 +2855,17 @@ const httpServer = createServer(async (req, res) => {
         }
       }
 
+      // ---------- archive sim-bar cleaner: GET /archive_clean?asset=BTCUSD[&apply=1][&force=1] - dry run unless apply=1. Removes SIMULATED bars that were archived under a real asset name (see analytics/simfilter.ts).
+      if (path === '/archive_clean') {
+        try {
+          const asset = String(q.get('asset') ?? '').trim().toUpperCase()
+          if (!asset) return json(400, { ok: false, error: 'asset is required, e.g. /archive_clean?asset=BTCUSD (one asset per call)' })
+          return json(200, await market.cleanArchive(asset, q.get('apply') === '1', q.get('force') === '1'))
+        } catch (err) {
+          return json(400, { ok: false, error: String(err instanceof Error ? err.message : err) })
+        }
+      }
+
       // ---------- Weis Wave (plugins/weiswave.ts): GET /weiswave?asset=X&mode=atr|close&thr=1&tfs=30s,1m,5m -> per-timeframe wave reads + the strength-weighted CALL/PUT for one pair;
       // GET /weiswave_global?mode=&thr=&tfs=&category=&refresh=1 -> whole open universe, actionable first. Reads in-memory closed candles only (no archive scan).
       if (path === '/weiswave' || path === '/weiswave_global') {

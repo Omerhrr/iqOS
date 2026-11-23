@@ -633,6 +633,29 @@ expiry = 3
 `,
   },
   {
+    id: 'meta:builtin-pm-weiswave',
+    name: 'Builtin: pm + Weis wave',
+    script: `
+# PM + WEIS WAVE. pm says WHO is pushing (pure pm, ok is enough). The Weis wave says whether the volume behind the running wave backs that move or shows it is spent.
+#   backed  = the Weis wave points the same way as pm (a new extreme on more volume, or a spent wave on the other side): take it.
+#   spent   = the Weis wave points the OTHER way (pm calls up into a weak / absorbed / shortening up-wave, or the mirror): stand down.
+#   silent  = the wave has no effort-vs-result signal: take pm on its own (set needBacking = 1 to insist on backing).
+# ww.dir("atr") cuts waves on an ATR reversal; use "close" for close-to-close waves, ww.dir("atr", 1.5) for fewer longer waves, ww.dir("atr", 1, "5m") to read the wave on 5m.
+# On pairs with no real volume (many OTC) true range stands in - check ww.volumeOk(). Describes where effort and result disagree, not a win probability: backtest it on your pair first.
+let needBacking = 0
+let minWave = 30
+let m = story.pm()
+let wOk = ww.ok("atr")
+let pmCall = m.ok and m.direction != "none"
+let backed = pmCall and wOk and ww.dir("atr") == m.direction and ww.strength("atr") >= minWave
+let spent = pmCall and wOk and ww.dir("atr") != "none" and ww.dir("atr") != m.direction and ww.strength("atr") >= minWave
+let take = pmCall and not spent and (needBacking == 0 or backed)
+call when take and m.direction == "call"
+put when take and m.direction == "put"
+expiry = 3
+`,
+  },
+  {
     id: 'meta:builtin-pmm',
     name: 'Builtin: pmm (pm + market structure)',
     script: `

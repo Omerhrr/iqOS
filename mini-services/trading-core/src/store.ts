@@ -1456,6 +1456,16 @@ export class Store {
     return rows.reverse().map((r) => ({ time: r.time, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume }))
   }
 
+  /** Delete specific archived rows (the sim-bar cleaner). Returns how many rows were removed. */
+  deleteCandleRows(asset: string, tf: string, times: number[]): number {
+    if (!times.length) return 0
+    const stmt = this.db.prepare('DELETE FROM candles_archive WHERE asset = ? AND tf = ? AND time = ?')
+    let n = 0
+    const tx = this.db.transaction((batch: number[]) => { for (const t of batch) n += Number(stmt.run(asset, tf, t).changes) })
+    for (let i = 0; i < times.length; i += 500) tx(times.slice(i, i + 500))
+    return n
+  }
+
   archiveCount(asset: string, tf: string): number {
     const row = this.db.query('SELECT COUNT(*) n FROM candles_archive WHERE asset = ? AND tf = ?').get(asset, tf) as { n: number }
     return row.n

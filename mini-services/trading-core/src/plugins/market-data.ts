@@ -15,6 +15,7 @@ import type { Plugin } from '../kernel'
 import { gaussLike } from './random'
 import { UNIVERSE, getInstrument, isInstrumentOpen, registerDynamicInstrument } from '../universe'
 import type { Store } from '../store'
+import { decimalsOf, realDecimals, simTimes } from '../analytics/simfilter'
 
 const HISTORY_CANDLES = 760
 const MAX_TICKS = 40000
@@ -100,6 +101,11 @@ export class MarketDataService {
   private candles = new Map<string, Candle>() // key = asset|tf -> current forming candle
   private closed = new Map<string, Candle[]>() // key = asset|tf -> closed candles
   private seeded = new Set<string>() // assets whose history is materialized
+  // PROVENANCE: candles that did NOT come from the broker - deterministic prehistory / gap-fill and anything the SIM engine formed. Kept in a WeakSet (no schema change, no flag on the
+  // candle) so they can be dropped the moment real data arrives and are never archived. Before this, sim bars were archived under the real asset name and mixed with real bars.
+  private synthBars = new WeakSet<Candle>()
+  // keys (asset|tf) whose synthetic bars were already dropped since the feed last went live
+  private liveClean = new Set<string>()
   private timer: ReturnType<typeof setInterval> | null = null
   private liveTimer: ReturnType<typeof setInterval> | null = null
   private flushTimer: ReturnType<typeof setInterval> | null = null
@@ -449,6 +455,7 @@ export class MarketDataService {
       if (!data?.connected) return false
       this.liveUrl = url
       this.mode = 'live'
+      this.liveClean.clear()
       this.lastCandlePull = 0
       this.lastFeedBarTs = 0
       if (this.liveTimer) clearInterval(this.liveTimer)
@@ -483,7 +490,7 @@ export class MarketDataService {
       }
       if (!series.length) {
         const nowBucket = this.bucketNow(TIMEFRAME_SECONDS[tf])
-        series = this.synthPrehistory(a, tf, HISTORY_CANDLES, nowBucket, a.basePrice, mulberry32(hashSeed(`${a.ticker}|${tf}|seed`)))
+        series = this.tagSynth(this.synthPrehistory(a, tf, HISTORY_CANDLES, nowBucket, a.basePrice, mulberry32(hashSeed(`${a.ticker}|${tf}|seed`))))
       }
       this.closed.set(k, series.slice(-MEM_CAP))
     }
@@ -514,12 +521,12 @@ export class MarketDataService {
     const gap = Math.floor((nowBucket - last.time) / tfSec) - 1
     if (gap > 0) {
       const count = Math.min(gap, GAP_FILL_MAX)
-      series.push(...this.synthForward(a, tf, count, last.time + tfSec, last.close, mulberry32(hashSeed(`${a.ticker}|${tf}|gap`))))
+      series.push(...this.tagSynth(this.synthForward(a, tf, count, last.time + tfSec, last.close, mulberry32(hashSeed(`${a.ticker}|${tf}|gap`)))))
     }
     // top up with deterministic prehistory so the seeded window stays >= HISTORY_CANDLES
     if (series.length < HISTORY_CANDLES) {
       const need = HISTORY_CANDLES - series.length
-      const pre = this.synthPrehistory(a, tf, need, series[0].time, series[0].open, mulberry32(hashSeed(`${a.ticker}|${tf}|pre`)))
+      const pre = this.tagSynth(this.synthPrehistory(a, tf, need, series[0].time, series[0].open, mulberry32(hashSeed(`${a.ticker}|${tf}|pre`))))
       series.unshift(...pre)
     }
     return series
@@ -587,6 +594,26 @@ export class MarketDataService {
 
   private key(asset: string, tf: Timeframe) {
     return `${asset}|${tf}`
+  }
+
+  /** mark generated candles as synthetic (not from the broker) */
+  private tagSynth(bars: Candle[]): Candle[] {
+    for (const c of bars) this.synthBars.add(c)
+    return bars
+  }
+
+  /** drop every synthetic / sim-formed bar of one asset|tf (closed history and the forming bar). Returns how many closed bars went. */
+  private dropSynthetic(k: string): number {
+    const arr = this.closed.get(k)
+    let n = 0
+    if (arr && arr.length) {
+      const keep = arr.filter((c) => !this.synthBars.has(c))
+      n = arr.length - keep.length
+      if (n) this.closed.set(k, keep)
+    }
+    const cur = this.candles.get(k)
+    if (cur && this.synthBars.has(cur)) this.candles.delete(k)
+    return n
   }
 
   /**
@@ -664,6 +691,11 @@ export class MarketDataService {
     const tfSec = TIMEFRAME_SECONDS[tf]
     const bucket = tick.ts - (tick.ts % tfSec)
     const k = this.key(asset, tf)
+    // first LIVE tick of this series since the feed went live: the simulated bars (seed, gap-fill, sim ticks) must not sit under real ones
+    if (this.mode === 'live' && !this.liveClean.has(k)) {
+      this.liveClean.add(k)
+      this.dropSynthetic(k)
+    }
     const current = this.candles.get(k)
     if (!current || current.time !== bucket) {
       if (current) {
@@ -675,13 +707,18 @@ export class MarketDataService {
           arr.push(current)
           if (arr.length > MEM_CAP) arr.splice(0, arr.length - MEM_CAP)
         }
-        this.archiveQueue.push({ asset, tf, time: current.time, open: current.open, high: current.high, low: current.low, close: current.close, volume: current.volume })
+        // only REAL bars are archived: nothing the sim engine formed (or touched) ever reaches the database under the real asset name
+        if (this.mode === 'live' && !this.synthBars.has(current)) {
+          this.archiveQueue.push({ asset, tf, time: current.time, open: current.open, high: current.high, low: current.low, close: current.close, volume: current.volume })
+        }
         this.ctx.bus.emit('candle', { asset, tf, candle: current, closed: true })
       }
       const fresh: Candle = { time: bucket, open: tick.price, high: tick.price, low: tick.price, close: tick.price, volume: tick.vol }
+      if (this.mode === 'sim') this.synthBars.add(fresh)
       this.candles.set(k, fresh)
       this.ctx.bus.emit('candle', { asset, tf, candle: fresh, closed: false })
     } else {
+      if (this.mode === 'sim') this.synthBars.add(current) // a real forming bar touched by a sim tick is tainted: never archived, dropped when the feed is live
       current.high = Math.max(current.high, tick.price)
       current.low = Math.min(current.low, tick.price)
       current.close = tick.price
@@ -803,6 +840,7 @@ export class MarketDataService {
 
   disconnectLive(): void {
     this.mode = 'sim'
+    this.liveClean.clear()
     if (this.liveTimer) clearInterval(this.liveTimer)
     this.liveTimer = null
     this.ctx.bus.emit('alert', { level: 'info', message: 'Switched back to SIM engine', ts: Math.floor(Date.now() / 1000) })
@@ -1014,8 +1052,10 @@ export class MarketDataService {
         if (dropped > 0) this.dropGlitch(asset, 'sidecar candles', dropped)
         if (clean.length) {
           for (const tf of ALL_TIMEFRAMES) {
-            const agg = this.aggregate(clean, TIMEFRAME_SECONDS[tf])
-            if (agg.length > 10) {
+            let agg = this.aggregate(clean, TIMEFRAME_SECONDS[tf])
+            // the broker tail starts mid-bucket for coarse timeframes: the FIRST bucket is only partly covered, so its OHLC would be wrong. Never merge or archive it.
+            if (agg.length && clean[0].time % TIMEFRAME_SECONDS[tf] !== 0) agg = agg.slice(1)
+            if (agg.length >= 1) {
               // MERGE, not clobber: the sidecar only serves a short tail (~240
               // 1m bars, even unauthenticated). Replacing wholesale used to
               // throw away the seeded prehistory + archived depth for the
@@ -1023,6 +1063,8 @@ export class MarketDataService {
               // of history. Fresh bars win a timestamp collision, older memory
               // survives, capped at the usual MEM_CAP.
               const k = this.key(asset, tf)
+              this.liveClean.add(k)
+              this.dropSynthetic(k) // real bars are here: the simulated seed / gap-fill under them goes
               const byTime = new Map<number, Candle>()
               for (const c of this.closed.get(k) ?? []) byTime.set(c.time, c)
               for (const c of agg) byTime.set(c.time, c)
@@ -1224,6 +1266,48 @@ export class MarketDataService {
     } catch {
       return []
     }
+  }
+
+  /**
+   * SIM-BAR CLEANER for the archive. Measures the broker's quote precision on fresh sidecar bars, then finds archived bars (every timeframe) with a longer float tail than any real quote can have
+   * (see analytics/simfilter.ts) and, only when `apply` is true, deletes them from the archive and from memory. Dry run by default. Needs the LIVE feed (the precision is measured on real bars).
+   * Refuses to apply when more than 90% of an asset's rows look simulated (probably a wrong precision, not a polluted archive) unless `force`.
+   */
+  async cleanArchive(asset: string, apply: boolean, force = false): Promise<Record<string, unknown>> {
+    if (!this.store) return { ok: false, error: 'no archive attached' }
+    if (this.mode !== 'live') return { ok: false, error: 'the cleaner needs the live IQ feed (it measures the real quote precision on fresh broker bars) - connect IQ first' }
+    const real = await this.fetchSidecarCandles(asset, '1m', 240)
+    const dec = realDecimals(real)
+    if (dec === null) return { ok: false, error: `could not read at least 20 real bars for ${asset} from the sidecar - is the pair open and the sidecar reachable?` }
+    const perTf: Array<{ tf: string; rows: number; sim: number; deleted: number; first?: string; last?: string; sample?: { time: number; close: number } }> = []
+    let totalRows = 0, totalSim = 0
+    const bad = new Map<string, number[]>()
+    for (const tf of ALL_TIMEFRAMES) {
+      const rows = this.store.getCandlesArchive(asset, tf, ARCHIVE_DEEP)
+      const times = simTimes(rows, dec)
+      totalRows += rows.length
+      totalSim += times.length
+      bad.set(tf, times)
+      const first = times.length ? times[0] : undefined, last = times.length ? times[times.length - 1] : undefined
+      const sm = times.length ? rows.find((r) => r.time === times[0]) : undefined
+      perTf.push({ tf, rows: rows.length, sim: times.length, deleted: 0, first: first ? new Date(first * 1000).toISOString() : undefined, last: last ? new Date(last * 1000).toISOString() : undefined, sample: sm ? { time: sm.time, close: sm.close } : undefined })
+    }
+    if (apply && totalRows > 0 && totalSim / totalRows > 0.9 && !force) {
+      return { ok: false, error: `${totalSim} of ${totalRows} archived rows look simulated (>90%) - that looks like a wrong precision reading (${dec} decimals), not a polluted archive. Nothing deleted; re-run with force=1 only if you are sure.`, realDecimals: dec, perTf }
+    }
+    if (apply) {
+      for (const row of perTf) {
+        const times = bad.get(row.tf) ?? []
+        if (!times.length) continue
+        row.deleted = this.store.deleteCandleRows(asset, row.tf, times)
+        const k = this.key(asset, row.tf as Timeframe)
+        const set = new Set(times)
+        const arr = this.closed.get(k)
+        if (arr) this.closed.set(k, arr.filter((c) => !set.has(c.time)))
+        this.archivedUpTo.delete(k)
+      }
+    }
+    return { ok: true, asset, applied: apply, realDecimals: dec, totalRows, simRows: totalSim, deleted: perTf.reduce((n, r) => n + r.deleted, 0), perTf, note: apply ? 'deleted from the archive and from memory' : 'DRY RUN - nothing deleted. Add apply=1 to delete.' }
   }
 
   async getTickSeries(asset: string): Promise<{ points: { time: number; price: number }[]; dataSource: 'tick' | 'candle' }> {
