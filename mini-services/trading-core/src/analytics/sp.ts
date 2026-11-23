@@ -6,10 +6,9 @@
 // The slow part and the burst can point different ways, so each has its own direction. The five conditions:
 //   1. pressure UP,   shock UP    -> choose LOWER  (put)
 //   2. pressure DOWN, shock DOWN  -> choose HIGHER (call)
-//   3. pressure UP,   shock DOWN  -> choose LOWER  (put)
-//   4. pressure DOWN, shock UP    -> choose HIGHER (call)
 //   5. pressure, NO shock         -> choose WITH THE TREND (call in an uptrend, put in a downtrend)
-// Anything else (no pressure) is "no call". NOTE the table: whenever a shock is present the call is simply AGAINST the pressure (cases 1-4), so the shock decides WHETHER the setup exists, the pressure decides the SIDE.
+// Cases 3 (pressure UP + shock DOWN) and 4 (pressure DOWN + shock UP) were REMOVED: a shock that runs against the pressure is "no call". Their numbers are kept retired so 1, 2 and 5 keep their meaning.
+// Anything else (no pressure) is "no call".
 //
 // Measured on the candle's own path (ticks when the context has them, else the 5s chart), in ATR14 of the chart timeframe:
 //   shock    : the biggest move inside any burstSec window (default 10 s) is >= shockAtr (0.30) AND it ended within the last freshSec (default max(10 s, 30% of the candle)) - the shock is the ONGOING move, not history.
@@ -32,7 +31,7 @@ export interface SpResult {
   text: string
 }
 const CASE_TEXT: Record<number, string> = {
-  1: 'pressure up + shock up -> lower', 2: 'pressure down + shock down -> higher', 3: 'pressure up + shock down -> lower', 4: 'pressure down + shock up -> higher', 5: 'pressure without a shock -> with the trend',
+  1: 'pressure up + shock up -> lower', 2: 'pressure down + shock down -> higher', 5: 'pressure without a shock -> with the trend',
 }
 const fail = (error: string): SpResult => ({ ok: false, error, caseNo: 0, direction: 'none', pressure: false, pressureDir: 0, pressureAtr: 0, pressureEff: 0, shock: false, shockDir: 0, shockAtr: 0, shockAge: NaN, bodyAtr: 0, progress: 0, trendDir: 0, points: 0, text: error })
 
@@ -67,8 +66,7 @@ export function readSp(points: readonly SpPoint[], o: SpOptions): SpResult {
   if (shock) {
     if (pressureDir > 0 && shockDir > 0) { caseNo = 1; direction = 'put' }
     else if (pressureDir < 0 && shockDir < 0) { caseNo = 2; direction = 'call' }
-    else if (pressureDir > 0 && shockDir < 0) { caseNo = 3; direction = 'put' }
-    else { caseNo = 4; direction = 'call' }
+    else return none(`the ${shockDir > 0 ? 'up' : 'down'} shock runs against the ${pressureDir > 0 ? 'up' : 'down'} pressure (no call)`)
   } else {
     if (o.trend === 0) return none('pressure without a shock, but there is no clear trend to follow')
     caseNo = 5; direction = o.trend > 0 ? 'call' : 'put'

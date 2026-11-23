@@ -6633,7 +6633,7 @@ function storyPmm(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
 }
 
 /** `story.sp([trendTf], [shockAtr], [pressureAtr], [burstSec])` - SHOCK & PRESSURE of the candle that is STILL FORMING (analytics/sp.ts). PRESSURE = the body moving slowly (a steady drift), SHOCK = the body moving suddenly (a fast
- * burst), each with its own direction. The five cases: 1 pressure up + shock up -> put | 2 pressure down + shock down -> call | 3 pressure up + shock down -> put | 4 pressure down + shock up -> call | 5 pressure without a shock -> WITH THE
+ * burst), each with its own direction. The three cases: 1 pressure up + shock up -> put | 2 pressure down + shock down -> call | 5 pressure without a shock -> WITH THE
  * TREND. Flat bundle: ok error direction (call|put|none) case (0..5) pressure shock (booleans) pressureDir shockDir (+1/-1/0) pressureAtr shockAtr (signed, ATR14) pressureEff shockAge bodyAtr progress (0..1 of the candle) trendDir points text.
  * The trend for case 5 is EMA20 vs EMA50 of the chart (or of trendTf, e.g. story.sp("5m")). Reads the candle path from live ticks (omni-trader) else the 5s chart; fails closed without either. story.spText() the sentence.
  * HONESTY: thresholds are judgement (shock >= 0.30 ATR inside 10 s and fresh; pressure >= 0.12 ATR and steady) - replay it before trading it. */

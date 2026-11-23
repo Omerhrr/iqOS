@@ -14,8 +14,7 @@ import SubPane from '@/components/os/SubPane'
 import SignalPanel from '@/components/os/SignalPanel'
 import SignalSidePanel from '@/components/os/SignalSidePanel'
 import RegimePanel from '@/components/os/RegimePanel'
-import WeisWavePanel from '@/components/os/WeisWavePanel'
-import WeisWaveGlobalPanel from '@/components/os/WeisWaveGlobalPanel'
+import { WeisPmPanel, WeisPmGlobalPanel } from '@/components/os/WeisPmPanel'
 import ChartSignalsPanel from '@/components/os/ChartSignalsPanel'
 import YesterdayPanel from '@/components/os/YesterdayPanel'
 import LeadLagPanel from '@/components/os/LeadLagPanel'
@@ -147,15 +146,13 @@ const PANEL_META: { id: PanelId; label: string }[] = [
   { id: 'smcGlobal', label: 'SMC Global' },
   { id: 'globalDom', label: 'Global Dom' },
   { id: 'mrcPredict', label: 'MRC Predict' },
-  { id: 'pm', label: 'PM' },
-  { id: 'pmGlobal', label: 'PM Global' },
   { id: 'renkoReversal', label: 'Renko Reversal' },
   { id: 'kagiReversal', label: 'Kagi Reversal' },
   { id: 'signalPanel', label: 'Signal' },
   { id: 'signalGlobal', label: 'Signal Global' },
   { id: 'regimePanel', label: 'Regime' },
-  { id: 'weisWave', label: 'Weis Wave' },
-  { id: 'weisWaveGlobal', label: 'Weis Wave Global' },
+  { id: 'weisWave', label: 'Weis PM' },
+  { id: 'weisWaveGlobal', label: 'Weis PM Global' },
 ]
 const DEFAULT_PANEL_VISIBILITY: Record<PanelId, boolean> = {
   signals: true,
@@ -1927,9 +1924,9 @@ export default function OSPage() {
                   ) : pairCompareOpen ? (
                     <PairComparePanel onClose={() => setPairCompareOpen(false)} tf={tf} onSelectAsset={handleSelectAsset} />
                   ) : weisWaveOpen ? (
-                    <WeisWavePanel asset={weisWaveAsset ?? asset} closedTick={closedTick} onClose={() => setWeisWaveOpen(false)} onOpenGlobal={handleOpenWeisWaveGlobal} />
+                    <WeisPmPanel asset={weisWaveAsset ?? asset} tf={tf} closedTick={closedTick} onClose={() => setWeisWaveOpen(false)} onOpenGlobal={handleOpenWeisWaveGlobal} />
                   ) : weisWaveGlobalOpen ? (
-                    <WeisWaveGlobalPanel closedTick={closedTick} onClose={() => setWeisWaveGlobalOpen(false)} onPickAsset={handleSelectAsset} onOpenWeisWave={(a) => handleOpenWeisWave(a)} />
+                    <WeisPmGlobalPanel tf={tf} closedTick={closedTick} onClose={() => setWeisWaveGlobalOpen(false)} onPickAsset={handleSelectAsset} onOpenPm={(a) => handleOpenWeisWave(a)} />
                   ) : regimePanelOpen ? (
                     <RegimePanel compact closedTick={closedTick} onPick={handleSelectSetup} onClose={() => setRegimePanelOpen(false)} onOpenSignal={handleOpenSignalPanel} />
                   ) : signalGlobalOpen ? (
@@ -2135,11 +2132,11 @@ export default function OSPage() {
                       <button
                         type="button"
                         onClick={() => handleOpenWeisWave()}
-                        title="Weis Wave - the chart pair's wave volume read on 30s..15m (effort vs result) and the CALL / PUT it adds up to"
+                        title="Weis PM - pure pm for the chart pair, backed or spent by its Weis wave volume read"
                         className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-teal-500/40 hover:text-teal-300"
                       >
                         <span className="h-1.5 w-1.5 rounded-full bg-teal-300" />
-                        Weis Wave
+                        Weis PM
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
                       )}
@@ -2147,11 +2144,11 @@ export default function OSPage() {
                       <button
                         type="button"
                         onClick={() => handleOpenWeisWaveGlobal()}
-                        title="Weis Wave Global - every open pair ranked by its Weis Wave CALL / PUT across 30s..15m"
+                        title="Weis PM Global - every open pair: pm call x Weis wave (backed / spent / silent)"
                         className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-teal-500/40 hover:text-teal-300"
                       >
                         <span className="h-1.5 w-1.5 rounded-full bg-teal-300" />
-                        Weis Wave Global
+                        Weis PM Global
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
                       )}
@@ -2188,30 +2185,6 @@ export default function OSPage() {
                       >
                         <span className="h-1.5 w-1.5 rounded-full bg-emerald-300" />
                         MRC Predict
-                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
-                      </button>
-                      )}
-                      {panelVisibility.pm && (
-                      <button
-                        type="button"
-                        onClick={() => handleOpenPm(asset)}
-                        title="PM - the cause -> effect predicted move of this pair: direction, strength, validation record, support/resistance"
-                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-amber-500/40 hover:text-amber-300"
-                      >
-                        <span className="h-1.5 w-1.5 rounded-full bg-amber-300" />
-                        PM
-                        <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
-                      </button>
-                      )}
-                      {panelVisibility.pmGlobal && (
-                      <button
-                        type="button"
-                        onClick={() => handleOpenPmGlobal()}
-                        title="PM Global - the predicted move of every open pair, ranked (calls first, validated first)"
-                        className="mb-0.5 flex w-full shrink-0 items-center gap-1.5 rounded-lg border border-[#1c2739] bg-[#0b111c] px-2 py-1 font-mono text-[9px] font-bold uppercase tracking-wider text-[#7c8aa5] transition-colors hover:border-amber-500/40 hover:text-amber-300"
-                      >
-                        <span className="h-1.5 w-1.5 rounded-full bg-amber-300" />
-                        PM Global
                         <span className="ml-auto text-[8px] font-normal normal-case text-[#3d4d66]">open</span>
                       </button>
                       )}
