@@ -108,6 +108,8 @@ export function pickLevel(book: Level[], dir: number, price: number, atr: number
 export interface LimitInput {
   key: string; cond: boolean; valid: boolean; dir: number; seconds: number; mode: LimitMode; where: string | number; maxAtr: number
   breakAtr: number; reactAtr: number; runAtr: number; horizonSec: number; nowMs: number; price: number; atr: number
+  /** schedule hooks: gate() returns a blocking reason or ''; onFire() counts the trade */
+  gate?: () => string; onFire?: () => void
   /** builds the level book (only called when a level is needed) */
   book: () => Level[]
 }
@@ -139,6 +141,8 @@ export function stepLimit(i: LimitInput): { fire: boolean; rec: LimitRec } {
   if (r.state === 'idle') {
     if (!i.cond) { r.latched = false; return { fire: false, rec: r } }
     if (r.latched || !Number.isFinite(i.price) || i.dir === 0 || !(i.atr > 0) || i.nowMs < r.nextPickMs) return { fire: false, rec: r }
+    const blocked = i.gate?.() ?? ''
+    if (blocked) { r.why = blocked; return { fire: false, rec: r } }
     let level: Level | null = null, why = 'resting at the level'
     if (typeof i.where === 'number') {
       if (!Number.isFinite(i.where)) return { fire: false, rec: r }
@@ -158,7 +162,7 @@ export function stepLimit(i: LimitInput): { fire: boolean; rec: LimitRec } {
   const lv = r.level as Level, a = r.atr, d = r.dir
   const finish = (state: LimitState, why: string): void => { r!.state = state; r!.why = why; r!.doneMs = i.nowMs; r!.latched = true }
   const cancel = (why: string, bucket: string): { fire: boolean; rec: LimitRec } => { queue(i.key, { dueMs: i.nowMs + i.horizonSec * 1000, px: r!.armPrice, dir: d, bucket: `skip:${bucket}:${lv.kind}` }); finish('cancelled', why); return { fire: false, rec: r! } }
-  const enter = (cls: string, why: string): { fire: boolean; rec: LimitRec } => { r!.cls = cls; r!.entryGain = -d * (i.price - r!.armPrice) / a; queue(i.key, { dueMs: i.nowMs + i.horizonSec * 1000, px: i.price, dir: d, bucket: `take:${cls}:${lv.kind}` }); finish('fired', why); return { fire: true, rec: r! } }
+  const enter = (cls: string, why: string): { fire: boolean; rec: LimitRec } => { const g = i.gate?.() ?? ''; if (g) { finish('cancelled', `${g} - not entered`); return { fire: false, rec: r! } }; i.onFire?.(); r!.cls = cls; r!.entryGain = -d * (i.price - r!.armPrice) / a; queue(i.key, { dueMs: i.nowMs + i.horizonSec * 1000, px: i.price, dir: d, bucket: `take:${cls}:${lv.kind}` }); finish('fired', why); return { fire: true, rec: r! } }
   // extreme into the level (lowest for a call, highest for a put)
   r.extreme = d > 0 ? Math.min(r.extreme, i.price) : Math.max(r.extreme, i.price)
   if (!i.cond) return cancel('signal gone before the level was reached', r.state === 'touched' ? 'gone-touched' : 'gone')

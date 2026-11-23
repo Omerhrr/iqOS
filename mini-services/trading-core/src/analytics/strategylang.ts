@@ -246,6 +246,7 @@ import { readSignalCore, SIGNAL_MIN_BARS, type SignalCore } from './signalcore'
 import { AMD_MIN_BARS, readAmd, type AmdRead } from './mslamd'
 import { WYCKOFF_MIN_BARS, readWyckoff, type WyckoffRead } from './mslwyckoff'
 import { WW_MIN_BARS, readWeisWave, type WwRead } from './weiswave'
+import { buildConfig as schedBuild, setSchedule, schedKey, registerSchedule, lookupSchedule, scheduleBlock, recordScheduleTrade, scheduleText, scheduleTradesToday, scheduleTradesThisHour } from './schedule'
 import { SMCX_MIN_BARS, readSmcx, type SmcxRead } from './mslsmcx'
 import { smtDivergence } from './smt'
 import { readBlocks, readJudas, readSoup, type BlockRead, type JudasRead } from './mslpatterns'
@@ -3261,6 +3262,16 @@ function evalNowMs(ctx: EvalEnv): number {
 function timingMethod(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
   const nowMs = evalNowMs(ctx)
   const nameArg = (): string => { if (typeof args[0] !== 'string') throw new MslRuntimeError(`timing.${name}() needs the timer's name as a quoted string first`); return args[0] }
+  // schedule hooks for sage / limit: the LAST argument names a timing.schedule(...) defined on an earlier line
+  const schedHooks = (idx: number, who: string): { gate?: () => string; onFire?: () => void } => {
+    const nm = args[idx]
+    if (nm === undefined || nm === '' || nm === 0) return {}
+    if (typeof nm !== 'string') throw new MslRuntimeError(`timing.${who}(): the schedule argument must be the quoted name of a timing.schedule(...)`)
+    const sk = lookupSchedule(ctx.stateKeyPrefix as string, nm)
+    if (!sk) throw new MslRuntimeError(`timing.${who}(): schedule "${nm}" is not defined - put let ok = timing.schedule("${nm}", "13:00-16:00", 1, 8, 2) on a line BEFORE it`)
+    return { gate: () => scheduleBlock(sk, nowMs), onFire: () => recordScheduleTrade(sk, nowMs) }
+  }
+  const schedKeyOf = (): string | undefined => (ctx.stateKeyPrefix === undefined ? undefined : lookupSchedule(ctx.stateKeyPrefix, nameArg()))
   const key = () => {
     if (ctx.stateKeyPrefix === undefined) throw new MslRuntimeError(`timing.${name}() needs a script scope to keep its timer in (not available in this evaluation context)`)
     return holdKey(ctx.stateKeyPrefix, nameArg())
@@ -3287,7 +3298,7 @@ function timingMethod(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
     }
     case 'sage': {
       if (inMslBacktest() && !inReplay()) throw new MslRuntimeError('timing.sage() is live-only in the candle backtester (1m bars cannot show the path after the signal) - use the replay tester (/msl_replay) on 5s data')
-      if (args.length < 4) throw new MslRuntimeError('timing.sage(name, cond, dir, seconds [, dipAtr [, abortAtr [, valid [, straight [, horizonSec [, goAtr [, recoverFrac [, retouch [, retouchAtr]]]]]]]]]) needs at least 4 arguments')
+      if (args.length < 4) throw new MslRuntimeError('timing.sage(name, cond, dir, seconds [, dipAtr [, abortAtr [, valid [, straight [, horizonSec [, goAtr [, recoverFrac [, retouch [, retouchAtr [, schedule]]]]]]]]]]) needs at least 4 arguments')
       const d = typeof args[2] === 'string' ? (args[2] === 'call' ? 1 : args[2] === 'put' ? -1 : 0) : Math.sign(asNum(args[2]))
       if (d === 0) throw new MslRuntimeError('timing.sage(): dir must be +1/-1 (or "call"/"put")')
       const seconds = asNum(args[3])
@@ -3300,11 +3311,27 @@ function timingMethod(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
       const lp = livePrice(ctx, s, nowMs)
       const num = (v: MslValue | undefined, def: number): number => (v === undefined ? def : asNum(v))
       const r = stepSage({ key: sageKey(ctx.stateKeyPrefix as string, nameArg()), cond: truthy(args[1]), valid: args[6] === undefined ? true : truthy(args[6]), dir: d, seconds,
-        dipAtr: num(args[4], 0.15), abortAtr: num(args[5], 0.5), straightTake: args[7] === undefined || args[7] !== 'skip', horizonSec: num(args[8], 60), goAtr: num(args[9], 0.1), recoverFrac: num(args[10], 0.4), retouch: args[11] === undefined ? true : truthy(args[11]), retouchAtr: num(args[12], 0.02),
+        dipAtr: num(args[4], 0.15), abortAtr: num(args[5], 0.5), straightTake: args[7] === undefined || args[7] !== 'skip', horizonSec: num(args[8], 60), goAtr: num(args[9], 0.1), recoverFrac: num(args[10], 0.4), retouch: args[11] === undefined ? true : truthy(args[11]), retouchAtr: num(args[12], 0.02), ...schedHooks(13, 'sage'),
         nowMs, price: lp.price, atr: atrv })
       if (ctx.trace && (r.rec.state !== 'idle' || truthy(args[1]))) ctx.trace.push(`sage "${nameArg()}": ${r.rec.state}${r.rec.why ? ' - ' + r.rec.why : ''} (move ${r.rec.move.toFixed(2)} ATR, worst ${(-r.rec.mae).toFixed(2)})`)
       return r.fire ? 1 : 0
     }
+    case 'schedule': {
+      // timing.schedule(name, window [, tz [, perDay [, perHour [, minGapMin [, days [, scope]]]]]]) - see analytics/schedule.ts. Returns 1 while a NEW trade is allowed (window open and budget left).
+      if (ctx.stateKeyPrefix === undefined) throw new MslRuntimeError('timing.schedule() needs a running strategy (it keeps the trade count) - it has no state in this context')
+      if (args.length < 2) throw new MslRuntimeError('timing.schedule(name, window [, tz [, perDay [, perHour [, minGapMin [, days [, scope]]]]]]) needs at least a name and a window')
+      const nn = (v: MslValue | undefined): number | undefined => (v === undefined || v === '' ? undefined : asNum(v))
+      let cfg
+      try { cfg = schedBuild({ window: args[1], tz: args[2], perDay: nn(args[3]), perHour: nn(args[4]), minGapMin: nn(args[5]), days: args[6] }) } catch (e) { throw new MslRuntimeError((e as Error).message) }
+      const sk = schedKey(ctx.stateKeyPrefix, nameArg(), args[7] === 'pair' ? 'pair' : 'script')
+      setSchedule(sk, cfg); registerSchedule(ctx.stateKeyPrefix, nameArg(), sk)
+      return scheduleBlock(sk, nowMs) === ''
+    }
+    case 'scheduleOpen': { const k = schedKeyOf(); return k ? scheduleBlock(k, nowMs) === '' : true }
+    case 'scheduleWhy': { const k = schedKeyOf(); return k ? scheduleBlock(k, nowMs).replace('schedule: ', '') : '' }
+    case 'scheduleText': { const k = schedKeyOf(); return k ? scheduleText(k, nowMs) : 'schedule not defined yet' }
+    case 'scheduleToday': { const k = schedKeyOf(); return k ? scheduleTradesToday(k, nowMs) : 0 }
+    case 'scheduleHour': { const k = schedKeyOf(); return k ? scheduleTradesThisHour(k, nowMs) : 0 }
     case 'limit': {
       // timing.limit(name, cond, dir, seconds [, where = "auto" [, mode = "reject" [, maxAtr = 1.5 [, breakAtr = 0.25 [, reactAtr = 0.1 [, runAtr = 0.8 [, horizonSec = 60 [, valid = true]]]]]]]])
       // A LIMIT ORDER for options (which have none): rests at a smart level (SMC zone / supply-demand / SR / MSNR, or an explicit price) and returns 1 on the ONE evaluation to ENTER.
@@ -3324,7 +3351,7 @@ function timingMethod(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
       const whereArg = args[4] === undefined ? 'auto' : typeof args[4] === 'string' ? String(args[4]) : asNum(args[4])
       const modeArg: LimitMode = args[5] === 'touch' ? 'touch' : 'reject'
       const lr = stepLimit({ key: limitKey(ctx.stateKeyPrefix as string, nameArg()), cond: truthy(args[1]), valid: args[11] === undefined ? true : truthy(args[11]), dir: d, seconds, mode: modeArg, where: whereArg,
-        maxAtr: num(args[6], 1.5), breakAtr: num(args[7], 0.25), reactAtr: num(args[8], 0.1), runAtr: num(args[9], 0.8), horizonSec: num(args[10], 60), nowMs, price: lp.price, atr: atrv,
+        maxAtr: num(args[6], 1.5), breakAtr: num(args[7], 0.25), reactAtr: num(args[8], 0.1), runAtr: num(args[9], 0.8), horizonSec: num(args[10], 60), ...schedHooks(12, 'limit'), nowMs, price: lp.price, atr: atrv,
         book: () => { const n0 = s.close.length, from = Math.max(0, n0 - 300); const cs = []; for (let q = from; q < n0; q++) cs.push({ time: s.time?.[q] ?? q * 60, open: s.open[q], high: s.high[q], low: s.low[q], close: s.close[q], volume: s.volume[q] ?? 0 }); return buildLevelBook(cs, d, lp.price, atrv) } })
       if (ctx.trace && (lr.rec.state !== 'idle' || truthy(args[1]))) ctx.trace.push(`limit "${nameArg()}": ${lr.rec.state}${lr.rec.why ? ' - ' + lr.rec.why : ''}${lr.rec.level ? ` [${lr.rec.level.kind} ${lr.rec.level.edge.toFixed(5)}]` : ''}`)
       return lr.fire ? 1 : 0

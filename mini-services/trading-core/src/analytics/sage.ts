@@ -13,7 +13,8 @@
 //   cond = the signal (e.g. pm call). valid = the re-check at the dip (e.g. pm still same way and a lower-timeframe read agrees). Moves are in ATR14 of the chart the script runs on.
 //   RETOUCH (default on): once price has dipped against the signal and then comes BACK to the signal price (within retouchAtr, default 0.02 ATR), the sage enters IMMEDIATELY - that is the entry the signal
 //   originally asked for, so no recovery fraction and no re-check are needed (the signal must still be on, the dip must not have been a reversal). Class 'retouch', measured and self-corrected like the others.
-//   timing.sage(..., recoverFrac, retouch = 1 [, retouchAtr = 0.02])
+//   timing.sage(..., recoverFrac, retouch = 1 [, retouchAtr = 0.02 [, schedule]])
+//   SCHEDULE (analytics/schedule.ts): name a timing.schedule(...) as the last argument and the sage only arms / enters inside its time window and within its per-day / per-hour budget; each entry is counted when it fires.
 // Pure state machine, explicit clock, so tests (and the replay tester, which walks 5s bars with a clock) can drive it. LIVE / REPLAY only: a 1m candle backtest cannot see intrabar paths.
 export type SageState = 'idle' | 'watching' | 'fired' | 'aborted'
 export type SageClass = 'straight' | 'dip' | 'retouch'
@@ -30,7 +31,7 @@ export function clearSage(prefix: string): void { for (const m of [store, stats,
 export function hasWaitingSage(prefix: string): boolean { for (const [k, r] of store) if (r.state === 'watching' && k.startsWith(`${prefix}|`)) return true; return false }
 const shrunk = (b?: SageBucket): number => (((b?.w ?? 0) + 1) / ((b?.n ?? 0) + 2))
 
-export interface SageInput { key: string; cond: boolean; valid: boolean; dir: number; seconds: number; dipAtr: number; abortAtr: number; goAtr: number; recoverFrac: number; straightTake: boolean; retouch?: boolean; retouchAtr?: number; horizonSec: number; nowMs: number; price: number; atr: number }
+export interface SageInput { key: string; cond: boolean; valid: boolean; dir: number; seconds: number; dipAtr: number; abortAtr: number; goAtr: number; recoverFrac: number; straightTake: boolean; retouch?: boolean; retouchAtr?: number; gate?: () => string; onFire?: () => void; horizonSec: number; nowMs: number; price: number; atr: number }
 
 function resolvePending(key: string, nowMs: number, price: number): void {
   const list = pending.get(key); if (!list || !Number.isFinite(price)) return
@@ -55,6 +56,8 @@ export function stepSage(i: SageInput): { fire: boolean; rec: SageRec } {
   if (r.state === 'fired' || r.state === 'aborted') { if (!i.cond) r.latched = false; if (i.nowMs - r.doneMs >= 1000) r.state = 'idle' }
   if (r.state === 'idle') {
     if (!i.cond) r.latched = false
+    const blocked = i.cond && !r.latched ? (i.gate?.() ?? '') : ''
+    if (blocked) { r.why = blocked; return { fire: false, rec: r } }
     if (i.cond && !r.latched && Number.isFinite(i.price) && i.dir !== 0) Object.assign(r, { state: 'watching' as SageState, armedMs: i.nowMs, entry: i.price, dir: i.dir, atr: i.atr, mae: 0, mfe: 0, dipped: false, move: 0, seconds: i.seconds, why: 'armed', cls: '' as const, entryGain: 0 })
     return { fire: false, rec: r }
   }
@@ -64,7 +67,7 @@ export function stepSage(i: SageInput): { fire: boolean; rec: SageRec } {
   const recovered = move + r.mae // ATR regained off the worst point
   const finish = (state: SageState, why: string): void => { r!.state = state; r!.why = why; r!.doneMs = i.nowMs; r!.latched = true }
   const skip = (why: string, bucket: string): { fire: boolean; rec: SageRec } => { queue(i.key, { dueMs: i.nowMs + i.horizonSec * 1000, px: r!.entry, dir: r!.dir, bucket: `skip:${bucket}` }); finish('aborted', why); return { fire: false, rec: r! } }
-  const enter = (cls: SageClass, why: string): { fire: boolean; rec: SageRec } => { r!.cls = cls; r!.entryGain = cls === 'dip' ? -move : 0; queue(i.key, { dueMs: i.nowMs + i.horizonSec * 1000, px: i.price, dir: r!.dir, bucket: `take:${cls}` }); finish('fired', why); return { fire: true, rec: r! } }
+  const enter = (cls: SageClass, why: string): { fire: boolean; rec: SageRec } => { const g = i.gate?.() ?? ''; if (g) { finish('aborted', `${g} - not entered`); return { fire: false, rec: r! } }; i.onFire?.(); r!.cls = cls; r!.entryGain = cls === 'dip' ? -move : 0; queue(i.key, { dueMs: i.nowMs + i.horizonSec * 1000, px: i.price, dir: r!.dir, bucket: `take:${cls}` }); finish('fired', why); return { fire: true, rec: r! } }
   if (!i.cond) return skip(r.dipped ? 'analysis gone after the dip' : 'analysis gone', r.dipped ? 'dip-gone' : 'gone')
   if (r.mae >= i.abortAtr) return skip(`dip too deep (${r.mae.toFixed(2)} ATR) - that is a reversal, not a dip`, 'dip-deep')
   if (!r.dipped && r.mae >= i.dipAtr) r.dipped = true
