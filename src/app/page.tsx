@@ -359,7 +359,7 @@ export default function OSPage() {
         const d = JSON.parse(raw) as { overlays?: ActiveIndicator[]; subs?: ActiveIndicator[] }
         const valid = (a: unknown): a is ActiveIndicator[] =>
           Array.isArray(a) && a.every((o) => o && typeof o === 'object' && typeof (o as ActiveIndicator).id === 'string')
-        if (valid(d.overlays)) setActiveOverlays(d.overlays)
+        // chart overlays (VSK/TSK dots, MAs, ...) are deliberately NOT restored: a forgotten overlay kept re-appearing on every chart after each reload. Add them again from the picker when wanted.
         if (valid(d.subs)) setActiveSubs(d.subs)
       }
     } catch {
@@ -370,7 +370,7 @@ export default function OSPage() {
   useEffect(() => {
     if (!indicatorsHydrated) return
     try {
-      window.localStorage.setItem(INDICATOR_STORAGE_KEY, JSON.stringify({ overlays: activeOverlays, subs: activeSubs }))
+      window.localStorage.setItem(INDICATOR_STORAGE_KEY, JSON.stringify({ overlays: [], subs: activeSubs }))
     } catch {
       /* storage unavailable (private mode) - selection just won't persist */
     }
