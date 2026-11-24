@@ -23,7 +23,7 @@ const MEM_CAP = 1500 // in-memory closed bars per asset|tf (unchanged memory pro
 // Task 59: max assets the live poll keeps warm per cycle (charted + watchlists).
 // The sidecar serializes broker calls - more than this would stretch the 4s
 // poll past the tick cadence. Excess watchlist pairs are skipped (logged hourly).
-const MAX_LIVE_POLL_ASSETS = 8
+const MAX_LIVE_POLL_ASSETS = 16
 /** pairs the Brain Trader's watchlist gets refreshed per live poll (rotating, candles forced): 50 pairs -> every ~60s at 4s polls */
 const BRAIN_ROTATE_PER_POLL = 5
 const ARCHIVE_DEEP = 4000 // max bars hydrated/read from the sqlite archive per asset|tf
@@ -899,6 +899,16 @@ export class MarketDataService {
     }
     push(this.activeAsset)
     try {
+      // SUB-MINUTE PINS: Meta/Omni Trader running a story.sp/ssp/tick/timing script need the live 5s/tick path of the pairs they scan. They name a small STABLE set (not the rotating
+      // universe window) and it goes right after the charted pair, so a long bot/auto watchlist can no longer push it past the cap.
+      for (const name of ['metaTrader', 'omniTrader', 'mode', 'autopilot']) {
+        const eng = this.ctx.use<{ pinnedAssets?: () => string[] }>(name)
+        for (const a of eng?.pinnedAssets?.() ?? []) push(a)
+      }
+    } catch {
+      /* engines not loaded */
+    }
+    try {
       for (const b of this.store?.listBots() ?? []) {
         if (!b?.bot?.enabled) continue
         for (const a of b.bot.watchlist ?? []) push(a)
@@ -1052,6 +1062,15 @@ export class MarketDataService {
         if (dropped > 0) this.dropGlitch(asset, 'sidecar candles', dropped)
         if (clean.length) {
           for (const tf of ALL_TIMEFRAMES) {
+            // The broker tail is 60s bars. Folding them into a sub-minute timeframe (5s/15s/30s) used to stamp each 1m bar as ONE fake "5s" bar, overwriting the real tick-built bar at
+            // that timestamp and leaving the series with one point a minute - which is what story.sp/ssp, the 5s technical rungs etc. then read. Sub-minute bars come ONLY from live ticks.
+            // (Still mark the series live and drop the simulated seed under it, as before.)
+            if (TIMEFRAME_SECONDS[tf] < 60) {
+              const ks = this.key(asset, tf)
+              this.liveClean.add(ks)
+              this.dropSynthetic(ks)
+              continue
+            }
             let agg = this.aggregate(clean, TIMEFRAME_SECONDS[tf])
             // the broker tail starts mid-bucket for coarse timeframes: the FIRST bucket is only partly covered, so its OHLC would be wrong. Never merge or archive it.
             if (agg.length && clean[0].time % TIMEFRAME_SECONDS[tf] !== 0) agg = agg.slice(1)

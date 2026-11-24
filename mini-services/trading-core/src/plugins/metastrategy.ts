@@ -926,6 +926,13 @@ export class MetaStrategyService {
   }
 
   /** the `input` lines a saved spec's script declares ([] for a conditions-built spec or a script without inputs) */
+  /** True when the saved script reads the forming candle's SUB-MINUTE path (story.sp/ssp, tick.*, timing.*, foot.*): those need live 5s bars / ticks, which only live-polled pairs have, so the
+   * engines scan a small pinned set for such a script instead of the whole rotating universe. */
+  needsSubMinute(specId: string): boolean {
+    const src = this.get(specId)?.script
+    return !!src && /\bstory\.(?:sp|ssp|spText|sspText)\s*\(|\btick\.|\btiming\.|\bfoot\./.test(src)
+  }
+
   inputDecls(specId: string): MslInputDecl[] {
     const spec = this.get(specId)
     if (!spec?.script) return []
@@ -2619,9 +2626,15 @@ export class MetaStrategyService {
       }
       const reads2 = this.buildScriptReads(asset, tf, out.configs, script)
       const out2 = evaluateStrategyScript(parsed.ast, reads2, this.scriptResolver(asset, tf, out.configs), series, seriesFor, live, state, undefined, inputs)
-      return this.scriptMetaResult(out2)
+      return this.explainNoData(this.scriptMetaResult(out2), asset)
     }
-    return this.scriptMetaResult(out)
+    return this.explainNoData(this.scriptMetaResult(out), asset)
+  }
+
+  /** the sp/ssp "no live ticks / 5s chart" failure used to read like a generic script bug and was skipped silently; say which pair and why */
+  private explainNoData(r: MetaEvalResult, asset: string): MetaEvalResult {
+    if (!r.notes.includes('needs live ticks (omni-trader) or a 5s chart')) return r
+    return { ...r, notes: `script error: no sub-minute data for ${asset} - the live feed only keeps ~16 pairs warm (charted pair, bot/auto watchlists, and the pinned pairs of a sub-minute strategy in any engine). Chart it, add it to a watchlist, or put it in the engine's watchlist override.` }
   }
 
   private scriptMetaResult(out: MslEvalResult): MetaEvalResult {

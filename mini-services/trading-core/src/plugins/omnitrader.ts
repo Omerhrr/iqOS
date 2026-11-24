@@ -59,6 +59,7 @@ const LIQUID_CANDIDATES = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'XAUUSD', 'BT
 /** Bound on how many assets one tick evaluates - a universe spike shouldn't
  * turn one fast cycle into a multi-second stall (this engine's whole point
  * is a TIGHT loop, so this cap is smaller than Meta Trader's 50). */
+const SUB_MINUTE_CAP = 6 // pairs a sub-minute script (story.sp/ssp, tick.*, timing.*) scans: it needs each pair's live 5s/tick path, and only live-polled pairs have one
 const MAX_TICK_ASSETS = 24 // default scan window; configurable (`scanBatch`, 6-150) - each tick evaluates this many, in a shuffled rotation over every open pair
 /** Up to this many ranked candidates get a REAL placeOrder attempt per
  * tick, same reasoning as Meta Trader's MAX_PLACE_ATTEMPTS_PER_TICK. */
@@ -338,7 +339,9 @@ export class OmniTraderService {
    * every open instrument is evaluated (a watchlist of 12 or fewer is unchanged - the window is the whole list). */
   private candidatePool(): string[] {
     if (this.config.poolMode === 'setups') return this.setupPool()
-    const window = this.rotation.current(this.orderedPool(), this.scanBatch())
+    // sub-minute script (story.sp/ssp, tick.*, timing.*): scan a small STABLE pair set that the live feed keeps warm, not the rotating universe (see pinnedAssets)
+    const pool = this.subMinuteScan() ? this.orderedPool().slice(0, SUB_MINUTE_CAP) : this.orderedPool()
+    const window = this.rotation.current(pool, this.scanBatch())
     return window
       .filter((a) => !this.hasOpenOn(a))
       .filter((a) => (this.assetCooldownUntil.get(a) ?? 0) <= this.now())
@@ -414,6 +417,17 @@ export class OmniTraderService {
   /** THE FROZEN-CANDLE BUG (same fix as Meta Trader / AI Trader / Brain Trader): market-data's live poll only keeps the charted asset, bot / auto-trader watchlists and the pairs those traders name warm.
    * Omni Trader scans the market but was never in that set, so every pair OTHER than a charted/watchlisted one re-read frozen candles, a frozen price and an empty tick buffer - and `timing.hold` (which needs a
    * moving price) could only ever see "went nowhere". Returns the pairs Omni is actually scanning so market-data keeps them live (market-data caps the warm set, charted pair first). */
+  private subMinuteScan(): boolean {
+    if (!this.config.metaStrategyId) return false
+    try { return this.ctx.use<MetaStrategyService>('metaStrategy').needsSubMinute(this.config.metaStrategyId) } catch { return false }
+  }
+
+  /** the stable pair set a sub-minute script scans; market-data keeps it live first (right after the charted pair). Empty for every other strategy. */
+  pinnedAssets(): string[] {
+    if (!this.config.enabled || !this.subMinuteScan()) return []
+    try { return this.orderedPool().slice(0, SUB_MINUTE_CAP) } catch { return [] }
+  }
+
   watchedAssets(): string[] {
     if (!this.config.enabled || !this.config.metaStrategyId) return []
     try {

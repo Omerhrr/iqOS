@@ -44,7 +44,7 @@ import { buildFootprint, registerTickProvider, type FootprintResult, type TickPo
 const OTF_MAX_TICKS = 60_000 // per asset (~16h at the sim engine's 1s cadence)
 const LIVE_PULL_MS = 8_000 // sidecar /tick_stats merge cadence
 const LIVE_PULL_MIN_MS = 5_000 // on-demand throttle (footprint() awaits a fresh pull)
-const PULL_ASSETS_CAP = 6 // active + enabled-bot watchlist assets per sweep
+const PULL_ASSETS_CAP = 10 // active + enabled-bot watchlist assets per sweep
 const TICK_ARCHIVE_FLUSH_MS = 5_000 // batched write cadence (matches market-data.ts's ARCHIVE_FLUSH_MS)
 const TICK_ARCHIVE_PRUNE_FLUSHES = 60 // ~every 5 minutes, same cadence market-data.ts prunes candles at
 const TICK_ARCHIVE_CAP = 50_000 // per-asset trim cap (bun:sqlite getTicksArchive's own hard ceiling)
@@ -203,6 +203,14 @@ export class OtcFootprintService {
   private async sweepLive(): Promise<void> {
     if (this.market.mode !== 'live') return
     const assets = new Set<string>([this.market.activeAsset])
+    try {
+      // sub-minute scripts' pinned pairs (Meta/Omni Trader) first - same set market-data keeps live
+      for (const name of ['metaTrader', 'omniTrader', 'mode', 'autopilot']) {
+        for (const a of this.ctx.use<{ pinnedAssets?: () => string[] }>(name)?.pinnedAssets?.() ?? []) assets.add(a)
+      }
+    } catch {
+      /* engines not loaded */
+    }
     try {
       const ap = this.ctx.use<{ listBots(): { bot: { enabled: boolean; watchlist: string[] } }[] }>('autopilot')
       for (const { bot } of ap.listBots()) {

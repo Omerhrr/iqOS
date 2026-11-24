@@ -425,6 +425,7 @@ const SWEEP_SOURCES: readonly string[] = ['chartsignals', 'leadlag', 'cointegrat
 const CHARTSIGNALS_MIN_AGREE = 3
 /** Liquid fallback evaluated on demand while the full screener sweep warms up. */
 const LIQUID_CANDIDATES = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'XAUUSD', 'BTCUSD']
+const SUB_MINUTE_CAP = 6 // pairs a sub-minute strategy (story.sp/ssp, tick.*, timing.*) scans: it needs each pair's live 5s/tick path, and only live-polled pairs have one
 
 // LEADLAG_GROUPS/LEADLAG_MIN_ABS_CORRELATION/LEADLAG_MIN_TRIGGER_Z/
 // LEADLAG_LOOKBACK_BARS moved to analytics/leadlag.ts (imported above) -
@@ -2155,7 +2156,9 @@ export class ModeService {
         if (!meta.isValidStrategyId(id)) return null // saved spec was removed since this config was set
         const open = market.assets.filter((a) => a.open).map((a) => a.ticker)
         const pool = this.candidatePool(open)
-        const candidates = [...LIQUID_CANDIDATES.filter((a) => pool.includes(a)), ...pool.filter((a) => !LIQUID_CANDIDATES.includes(a))]
+        let candidates = [...LIQUID_CANDIDATES.filter((a) => pool.includes(a)), ...pool.filter((a) => !LIQUID_CANDIDATES.includes(a))]
+        // a sub-minute script can only read pairs the live feed keeps warm: a small STABLE set, not the whole universe
+        if (this.subMinuteScan()) candidates = this.subMinuteList(pool)
         for (const asset of candidates) {
           if (this.assetBlocked(asset)) continue
           try {
@@ -2598,6 +2601,44 @@ export class ModeService {
    * ENTERED/FLIP (fresh - a flip is a different key by construction, same
    * convention SweepEdgeMemory uses). Replaces the old "always treated as a
    * fresh vote" tradeoff documented at the meta branch below. */
+  /** every meta: strategy id this Auto Trader currently runs (single meta source, pool members, pair/direction pins) */
+  private runningMetaIds(): string[] {
+    const ids = new Set<string>()
+    if (this.config.signalSource === 'meta-strategy' && this.config.metaStrategyId) ids.add(this.config.metaStrategyId)
+    for (const i of this.config.strategyIds ?? []) ids.add(i)
+    if (this.config.strategyId) ids.add(this.config.strategyId)
+    for (const i of Object.values(this.config.pairStrategy ?? {})) ids.add(i)
+    if (this.config.directionStrategy?.call) ids.add(this.config.directionStrategy.call)
+    if (this.config.directionStrategy?.put) ids.add(this.config.directionStrategy.put)
+    return [...ids].filter((i) => typeof i === 'string' && i.startsWith('meta:'))
+  }
+  /** true when any running script reads the forming candle's sub-minute path (story.sp/ssp, tick.*, timing.*) - those need live 5s/tick data, which only live-polled pairs have */
+  private subMinuteScan(): boolean {
+    if (this.config.signalSource !== 'meta-strategy' && this.config.signalSource !== 'strategy') return false
+    try {
+      const meta = this.ctx.use<MetaStrategyService>('metaStrategy')
+      return this.runningMetaIds().some((i) => meta.needsSubMinute(i))
+    } catch {
+      return false
+    }
+  }
+  /** stable pair list for a sub-minute script: liquid majors first, then the rest alphabetically (the pool itself is reshuffled every tick), capped */
+  private subMinuteList(pool: string[]): string[] {
+    return [...LIQUID_CANDIDATES.filter((a) => pool.includes(a)), ...pool.filter((a) => !LIQUID_CANDIDATES.includes(a)).sort()].slice(0, SUB_MINUTE_CAP)
+  }
+  /** the pairs market-data keeps live right after the charted pair (empty unless a sub-minute script is running) */
+  pinnedAssets(): string[] {
+    if (!this.config.enabled || !this.subMinuteScan()) return []
+    try {
+      const open = this.ctx.use<MarketDataService>('market').assets.filter((a) => a.open).map((a) => a.ticker)
+      const wl = this.config.watchlist
+      const base = wl.length ? (this.config.watchlistMode === 'exclude' ? open.filter((a) => !wl.includes(a)) : open.filter((a) => wl.includes(a))) : open
+      return this.subMinuteList(base)
+    } catch {
+      return []
+    }
+  }
+
   private metaMemberPrevVotes = new Set<string>()
   private metaMemberCurVotes = new Set<string>()
 
@@ -2624,7 +2665,7 @@ export class ModeService {
         rotated = Array.from({ length: Math.min(restBudget, rest.length) }, (_, i) => rest[(start + i) % rest.length])
         this.strategyTickCursor = (start + rotated.length) % rest.length
       }
-      const candidates = [...liquidSlice, ...rotated]
+      const candidates = this.subMinuteScan() ? this.subMinuteList(pool) : [...liquidSlice, ...rotated]
       const analytics = this.ctx.use<AnalyticsService>('analytics')
       const lab = this.ctx.use<StrategyLabService>('lab')
       // meta:<slug> saved Meta Strategy Lab combos - live-only, same as an

@@ -762,6 +762,34 @@ expiry = expiryMin
 `,
   },
   {
+    id: 'meta:builtin-pm-inputs',
+    name: 'Builtin: PM + inputs (timeframe, probability, strength)',
+    script: `
+# PM with inputs: the higher-timeframe prediction (story.pm) traded when it is aligned with the last candle.
+# Set pmTf to "15s" for the 15-second version or "1m" for the 1-minute one (or any of the others).
+# NOT PROVEN: pm showed no edge on clean 1-minute data. Replay / paper-trade before real money.
+
+input pmTf = "15s" options "5s", "15s", "30s", "1m", "5m" "Prediction timeframe"
+input minProb = 0.55 min 0.5 max 0.95 "Minimum probability"
+input minStrength = 0 min 0 max 100 "Minimum strength (0 = off)"
+input needAligned = true "Require alignment (aligned only)"
+input expiryMin = 1 min 1 max 15 "Expiry (minutes)"
+
+let p = story.pm(pmTf)
+let okAlign = p.alignment == "aligned" or not needAligned
+let strong = p.prob >= minProb and p.strength >= minStrength
+
+if p.direction == "call" and okAlign and strong
+  call when true
+  confidence = p.strength
+elseif p.direction == "put" and okAlign and strong
+  put when true
+  confidence = p.strength
+end
+expiry = expiryMin
+`,
+  },
+  {
     id: 'meta:builtin-weiswave',
     name: 'Builtin: Weis wave (effort vs result)',
     script: `

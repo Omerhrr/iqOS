@@ -90,6 +90,7 @@ const finGte = (v: number, floor: number): boolean => Number.isFinite(v) && v >=
 const LIQUID_CANDIDATES = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'XAUUSD', 'BTCUSD']
 /** Bound on how many candidates one tick evaluates - a universe spike
  * shouldn't turn one 10s tick into a multi-second stall. */
+const SUB_MINUTE_CAP = 6 // pairs a sub-minute script (story.sp/ssp, tick.*, timing.*) scans: it needs each pair's live 5s/tick path, and only live-polled pairs have one
 const MAX_TICK_CANDIDATES = 50 // default scan window (`scanBatch`, 10-150): the pool is shuffled and visited in windows of this size so every open pair is looked at over successive ticks
 /** Up to this many ranked candidates get a REAL placeOrder attempt per
  * tick before giving up - a transient broker rejection on the top pick
@@ -763,6 +764,24 @@ export class MetaTraderService {
    * Meta Trader returns nothing to add, and a transient candidatePool()
    * failure (store/market not ready yet) falls back to an empty list
    * rather than throwing into market-data's poll loop. */
+  /** true when the selected script strategy reads the forming candle's sub-minute path - see MetaStrategyService.needsSubMinute */
+  private subMinuteScan(): boolean {
+    if (this.config.signalSource !== 'meta-strategy' || !this.config.metaStrategyId) return false
+    try { return this.ctx.use<MetaStrategyService>('metaStrategy').needsSubMinute(this.config.metaStrategyId) } catch { return false }
+  }
+
+  /** the stable pair set a sub-minute script scans (market-data keeps these live first, right after the charted pair); empty for every other strategy */
+  pinnedAssets(): string[] {
+    if (!this.config.enabled || !this.subMinuteScan()) return []
+    try {
+      const open = this.market.listAssets().filter((a) => a.open && (this.config.marketScope === 'all' || (this.config.marketScope === 'otc') === Boolean(a.otc))).map((a) => a.ticker)
+      const configured = this.config.assets?.length ? this.config.assets.filter((a) => open.includes(a)) : undefined
+      return (configured ?? [...LIQUID_CANDIDATES.filter((a) => open.includes(a)), ...open.filter((a) => !LIQUID_CANDIDATES.includes(a))]).slice(0, SUB_MINUTE_CAP)
+    } catch {
+      return []
+    }
+  }
+
   watchedAssets(): string[] {
     if (!this.config.enabled) return []
     try {
@@ -895,7 +914,10 @@ export class MetaTraderService {
     // above), in the order the operator listed them. Empty/undefined falls
     // through to the same liquid-first, market-wide default as before.
     const configured = this.config.assets?.length ? this.config.assets.filter((a) => tickers.includes(a)) : undefined
-    const ordered = configured ?? [...LIQUID_CANDIDATES.filter((a) => tickers.includes(a)), ...tickers.filter((a) => !LIQUID_CANDIDATES.includes(a))]
+    let ordered = configured ?? [...LIQUID_CANDIDATES.filter((a) => tickers.includes(a)), ...tickers.filter((a) => !LIQUID_CANDIDATES.includes(a))]
+    // a sub-minute script (story.sp/ssp ...) can only read pairs the live feed keeps warm: scan a small STABLE set (your watchlist override's first pairs, else the liquid majors) instead of
+    // rotating through ~100 pairs that have no 5s/tick data - they were skipped silently before
+    if (this.subMinuteScan()) ordered = ordered.slice(0, SUB_MINUTE_CAP)
     if (this.config.poolMode === 'setups') return this.setupPool(ordered)
     return this.rotation
       .current(ordered, this.scanBatch())

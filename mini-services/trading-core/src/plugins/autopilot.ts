@@ -7,6 +7,8 @@
 
 import type { Position, Timeframe, TradeKind } from '../types'
 import { TIMEFRAME_SECONDS } from '../types'
+
+const SUB_MINUTE_CAP = 6 // pairs a sub-minute strategy (story.sp/ssp, tick.*, timing.*) scans: it needs each pair's live 5s/tick path, and only live-polled pairs have one
 import type { KernelContext, Plugin } from '../kernel'
 import type { MarketDataService } from './market-data'
 import type { AnalyticsService } from './analytics'
@@ -309,6 +311,8 @@ export class AutopilotService {
   private meta: MetaStrategyService | null = null
   private revalidateTimer: ReturnType<typeof setInterval> | null = null
   private holdTimer: ReturnType<typeof setInterval> | null = null
+  private subMinuteTimer: ReturnType<typeof setInterval> | null = null
+  private subMinuteDone = new Map<string, number>() // bot|asset|barOpen already traded this bar
   // Global research-gate off-switch, user-requested. Persisted (survives
   // restarts) in the SAME sentinel-state JSON blob execution.ts's setRisk()
   // uses, under its own key, so this doesn't need a schema migration. Default
@@ -388,6 +392,8 @@ export class AutopilotService {
     // bots only evaluate on a candle close, so a timing.hold armed at the close would never be looked at again:
     // every 2 s, re-run the bots whose meta-strategy has a hold counting down on that asset+tf.
     this.holdTimer = setInterval(() => void this.holdSweep(), 2_000)
+    // a sub-minute strategy (story.sp/ssp ...) reads the MIDDLE of the forming candle, but bots only run on a candle close (progress ~0): re-run those bots every 2 s inside the candle
+    this.subMinuteTimer = setInterval(() => void this.subMinuteSweep(), 2_000)
     ctx.log('autopilot', `bot engine online (${this.runtime.size} bots registered)`)
   }
 
@@ -398,6 +404,60 @@ export class AutopilotService {
     this.revalidateTimer = null
     if (this.holdTimer) clearInterval(this.holdTimer)
     this.holdTimer = null
+    if (this.subMinuteTimer) clearInterval(this.subMinuteTimer)
+    this.subMinuteTimer = null
+  }
+
+  /** enabled bots running a saved script that reads the forming candle's sub-minute path (see MetaStrategyService.needsSubMinute) */
+  private subMinuteBots(): BotConfig[] {
+    const meta = this.metaStrategyService()
+    if (!meta) return []
+    try {
+      return this.store.listBots().map((b) => b.bot).filter((b) => b.enabled && !b.universeSweep && b.strategyId.startsWith('meta:') && meta.needsSubMinute(b.strategyId))
+    } catch {
+      return []
+    }
+  }
+
+  /** the pairs those bots watch (first SUB_MINUTE_CAP of each watchlist): market-data keeps them live right after the charted pair */
+  pinnedAssets(): string[] {
+    const out: string[] = []
+    for (const b of this.subMinuteBots()) for (const a of b.watchlist.slice(0, SUB_MINUTE_CAP)) if (!out.includes(a)) out.push(a)
+    return out
+  }
+
+  /** every 2 s: for each sub-minute bot and watched pair, once the forming candle is far enough along, run the normal bot pipeline (all gates, edge-trigger, sizing). One trade per bot+pair+candle. */
+  private async subMinuteSweep(): Promise<void> {
+    try {
+      const nowSec = Date.now() / 1000
+      for (const bot of this.subMinuteBots()) {
+        const tfSec = TIMEFRAME_SECONDS[bot.tf]
+        if (!tfSec) continue
+        const barOpen = Math.floor(nowSec / tfSec) * tfSec
+        const progress = (nowSec - barOpen) / tfSec
+        if (progress < 0.3 || progress > 0.97) continue // the script's own window decides the rest; this only skips pointless evaluations
+        for (const asset of bot.watchlist.slice(0, SUB_MINUTE_CAP)) {
+          const doneKey = `${bot.id}|${asset}|${barOpen}`
+          if (this.subMinuteDone.has(doneKey)) continue
+          const key = `${asset}|${bot.tf}`
+          if (this.evaluating.has(key)) continue
+          this.evaluating.add(key)
+          try {
+            const rt = this.runtime.get(bot.id)
+            const before = rt?.trades ?? 0
+            await this.tradeForBot(bot, asset, bot.tf)
+            if ((this.runtime.get(bot.id)?.trades ?? 0) > before) {
+              this.subMinuteDone.set(doneKey, Date.now())
+              while (this.subMinuteDone.size > 400) { const o = this.subMinuteDone.keys().next().value; if (o === undefined) break; this.subMinuteDone.delete(o) }
+            }
+          } catch (err) {
+            this.reject(bot, `evaluation failed: ${String((err as Error).message).slice(0, 160)}`)
+          } finally {
+            this.evaluating.delete(key)
+          }
+        }
+      }
+    } catch { /* never let the sub-minute sweep throw */ }
   }
 
   private async holdSweep(): Promise<void> {
