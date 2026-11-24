@@ -609,11 +609,18 @@ expiry = 1
 # 1 pressure up + shock up -> LOWER | 2 pressure down + shock down -> HIGHER. A shock against the pressure, or no shock, is no call (steady pressure without a shock is SSP, below).
 # (Both cases go AGAINST the pressure; the shock decides whether the setup exists.) It reads the path from live ticks / the 5s chart, so it is LIVE / replay only. It acts in the middle of the candle (progress 0.5-0.9):
 # earlier there is too little path, later too little time. story.spText() is the sentence.
+input winFrom = 0.5 min 0 max 1 "Window start (candle progress 0-1)"
+input winTo = 0.9 min 0 max 1 "Window end (candle progress 0-1)"
+input expiryMin = 1 min 1 max 15 "Expiry (minutes)"
 let s = story.sp()
-let inWindow = s.ok and s.progress >= 0.5 and s.progress <= 0.9
-call when inWindow and s.direction == "call"
-put when inWindow and s.direction == "put"
-expiry = 1
+let inWindow = s.ok and s.progress >= winFrom and s.progress <= winTo
+
+if inWindow and s.case == 1
+  put when true
+elseif inWindow and s.case == 2
+  call when true
+end
+expiry = expiryMin
 `,
   },
   {
@@ -623,15 +630,135 @@ expiry = 1
 # SSP = the old case 5 of shock & pressure, standalone. The forming candle drifts one way steadily (pressure) with NO shock, and price trades WITH THE TREND (EMA20 vs EMA50): CALL in an uptrend, PUT in a downtrend.
 # Reads the path from live ticks / the 5s chart (LIVE / replay only). Acts in the middle of the candle (progress 0.5-0.9). story.ssp("5m") takes the trend from the 5m chart; story.sspText() is the sentence.
 # On BTCUSD 1m the late-candle read looked good mostly because little of the minute is left: replay it against a plain "price moved up so call" baseline before trusting it.
+input winFrom = 0.5 min 0 max 1 "Window start (candle progress 0-1)"
+input winTo = 0.9 min 0 max 1 "Window end (candle progress 0-1)"
+input expiryMin = 1 min 1 max 15 "Expiry (minutes)"
 let s = story.ssp()
-let inWindow = s.ok and s.progress >= 0.5 and s.progress <= 0.9
+let inWindow = s.ok and s.progress >= winFrom and s.progress <= winTo
 
 if inWindow and s.direction == "call"
   call when true
 elseif inWindow and s.direction == "put"
   put when true
 end
-expiry = 1
+expiry = expiryMin
+`,
+  },
+  {
+    id: 'meta:builtin-ssp-any',
+    name: 'Builtin: SSP any (six setups, whichever fires)',
+    script: `
+# NOT PROVEN: on clean 1-second BTC data SSP won about 49%; the 60-70% replays on sparse IQ data were fade-the-drift artifacts. Replay / paper-trade it before real money.
+# SSP ANY: six SSP setups side by side, any one that fires trades (steady pressure, NO shock, traded WITH the trend).
+# 1 ATR | 2 efficiency ratio | 3 regression | 4 ROC | 5 ATR with a fast period (5) | 6 ATR, trend taken from the 5m chart.
+# Votes = how many setups fire; if two setups disagree on the side (a 5m trend against the chart trend), we stand aside.
+let a = story.ssp()
+let e = story.ssp("pressure=er")
+let g = story.ssp("pressure=reg")
+let r = story.ssp("pressure=roc")
+let f = story.ssp(0.12, 10, 5)
+let t = story.ssp("5m")
+
+
+input winFrom = 0.6 min 0 max 1 "Window start (candle progress 0-1)"
+input winTo = 0.9 min 0 max 1 "Window end (candle progress 0-1)"
+input expiryMin = 1 min 1 max 15 "Expiry (minutes)"
+let late = a.progress >= winFrom and a.progress <= winTo
+let callVotes = if(a.direction == "call", 1, 0) + if(e.direction == "call", 1, 0) + if(g.direction == "call", 1, 0) + if(r.direction == "call", 1, 0) + if(f.direction == "call", 1, 0) + if(t.direction == "call", 1, 0)
+let putVotes = if(a.direction == "put", 1, 0) + if(e.direction == "put", 1, 0) + if(g.direction == "put", 1, 0) + if(r.direction == "put", 1, 0) + if(f.direction == "put", 1, 0) + if(t.direction == "put", 1, 0)
+
+if late and callVotes > 0 and putVotes == 0
+  call when true
+  confidence = min(95, 50 + 8 * callVotes)
+elseif late and putVotes > 0 and callVotes == 0
+  put when true
+  confidence = min(95, 50 + 8 * putVotes)
+end
+expiry = expiryMin
+`,
+  },
+  {
+    id: 'meta:builtin-sp-any',
+    name: 'Builtin: SP any (five measures, whichever fires)',
+    script: `
+# NOT PROVEN: on clean 1-second BTC data sp won about 50-52%; the perfect-looking replays on sparse IQ data were fade-the-drift artifacts. Replay / paper-trade it before real money.
+# SP ANY: five sp setups side by side, the first one that fires trades.
+# 1 ATR | 2 ROC | 3 z-score shock | 4 efficiency-ratio pressure | 5 regression pressure.
+# Each one is the plain sp rule (case 1 = pressure up + shock up -> PUT, case 2 = pressure down + shock down -> CALL),
+# measured a different way. Votes = how many setups fire on that side; if one side says PUT and another says CALL, we stand aside.
+let a = story.sp()
+let r = story.sp("shock=roc", "pressure=roc")
+let z = story.sp("shock=z", 2)
+let e = story.sp("pressure=er")
+let g = story.sp("pressure=reg")
+
+
+input winFrom = 0.6 min 0 max 1 "Window start (candle progress 0-1)"
+input winTo = 0.9 min 0 max 1 "Window end (candle progress 0-1)"
+input expiryMin = 1 min 1 max 15 "Expiry (minutes)"
+let late = a.progress >= winFrom and a.progress <= winTo
+let putVotes = if(a.case == 1, 1, 0) + if(r.case == 1, 1, 0) + if(z.case == 1, 1, 0) + if(e.case == 1, 1, 0) + if(g.case == 1, 1, 0)
+let callVotes = if(a.case == 2, 1, 0) + if(r.case == 2, 1, 0) + if(z.case == 2, 1, 0) + if(e.case == 2, 1, 0) + if(g.case == 2, 1, 0)
+
+if late and putVotes > 0 and callVotes == 0
+  put when true
+  confidence = min(95, 55 + 10 * putVotes)
+elseif late and callVotes > 0 and putVotes == 0
+  call when true
+  confidence = min(95, 55 + 10 * callVotes)
+end
+expiry = expiryMin
+`,
+  },
+  {
+    id: 'meta:builtin-sp-any-inputs',
+    name: 'Builtin: SP any + inputs (every threshold editable)',
+    script: `
+# NOT PROVEN: on clean 1-second BTC data sp won about 50-52%. Replay / paper-trade before real money.
+# SP ANY with inputs: five sp setups side by side, the first one that fires trades.
+# 1 ATR | 2 ROC | 3 z-score shock | 4 efficiency-ratio pressure | 5 regression pressure.
+# Each is the plain sp rule (case 1 = pressure up + shock up -> PUT,
+# case 2 = pressure down + shock down -> CALL), measured a different way.
+# If one setup says PUT and another says CALL, we stand aside.
+
+# ---- inputs (edit per bot / engine, the script itself stays as is) ----
+input winFrom = 0.6 min 0 max 1 "Window start (candle progress)"
+input winTo = 0.9 min 0 max 1 "Window end (candle progress)"
+input expiryMin = 1 min 1 max 15 "Expiry (minutes)"
+input minVotes = 1 min 1 max 5 "Setups that must agree"
+input useAtr = true "Use setup 1: ATR"
+input useRoc = true "Use setup 2: ROC"
+input useZ = true "Use setup 3: z-score shock"
+input useEr = true "Use setup 4: efficiency-ratio pressure"
+input useReg = true "Use setup 5: regression pressure"
+input atrShock = 0.30 min 0.05 max 3 "ATR: shock threshold"
+input atrPressure = 0.12 min 0.02 max 2 "ATR: pressure threshold"
+input rocShock = 0.03 min 0.005 max 1 "ROC: shock threshold (% of open)"
+input rocPressure = 0.02 min 0.005 max 1 "ROC: pressure threshold (% of open)"
+input zShock = 2 min 0.5 max 10 "Z: shock threshold (sigmas)"
+input erPressure = 0.5 min 0.1 max 1 "ER: pressure threshold"
+input regPressure = 0.7 min 0.1 max 1 "Regression: pressure threshold (R2)"
+input baseConf = 65 min 1 max 90 "Confidence with one setup firing"
+input stepConf = 10 min 0 max 30 "Confidence added per extra agreeing setup"
+
+let a = story.sp(atrShock, atrPressure)
+let r = story.sp("shock=roc", "pressure=roc", rocShock, rocPressure)
+let z = story.sp("shock=z", zShock)
+let e = story.sp("pressure=er", erPressure)
+let g = story.sp("pressure=reg", regPressure)
+
+let late = a.progress >= winFrom and a.progress <= winTo
+let putVotes = if(useAtr and a.case == 1, 1, 0) + if(useRoc and r.case == 1, 1, 0) + if(useZ and z.case == 1, 1, 0) + if(useEr and e.case == 1, 1, 0) + if(useReg and g.case == 1, 1, 0)
+let callVotes = if(useAtr and a.case == 2, 1, 0) + if(useRoc and r.case == 2, 1, 0) + if(useZ and z.case == 2, 1, 0) + if(useEr and e.case == 2, 1, 0) + if(useReg and g.case == 2, 1, 0)
+
+if late and putVotes >= minVotes and callVotes == 0
+  put when true
+  confidence = min(95, baseConf + stepConf * (putVotes - 1))
+elseif late and callVotes >= minVotes and putVotes == 0
+  call when true
+  confidence = min(95, baseConf + stepConf * (callVotes - 1))
+end
+expiry = expiryMin
 `,
   },
   {

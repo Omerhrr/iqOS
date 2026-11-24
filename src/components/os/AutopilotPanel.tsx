@@ -6,6 +6,7 @@
 // (kill switch, daily loss, max stake) always outranks them.
 
 import { useEffect, useMemo, useRef, useState } from 'react'
+import StrategyInputs from './StrategyInputs'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -101,6 +102,9 @@ const emptyDraft = (): BotConfig => ({
 export default function AutopilotPanel({ bots, assets, strategies, modeStatus, metaTraderStatus, omniTraderStatus, refreshMode, refreshMetaTrader, refreshOmniTrader, onChanged, onError }: AutopilotPanelProps) {
   const mode = modeStatus?.mode ?? 'human'
   const [editorOpen, setEditorOpen] = useState(false)
+  type EngineTab = 'bots' | 'auto' | 'meta' | 'omni'
+  const [tab, setTab] = useState<EngineTab>('bots')
+  const [specNames, setSpecNames] = useState<Record<string, string>>({})
   const [atOpen, setAtOpen] = useState(false)
   const [mtOpen, setMtOpen] = useState(false)
   const [otOpen, setOtOpen] = useState(false)
@@ -151,6 +155,26 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, m
       alive = false
     }
   }, [])
+
+  useEffect(() => {
+    if (tab === 'bots') return
+    let alive = true
+    getMetaStrategies()
+      .then((r) => {
+        if (alive) setSpecNames(Object.fromEntries(r.strategies.map((x) => [x.id, x.name])))
+      })
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [tab])
+
+  const autoMetaIds = useMemo(() => {
+    const c = modeStatus?.autotrader.config
+    if (!c) return [] as string[]
+    const ids = [...(c.signalSource === 'meta-strategy' && c.metaStrategyId ? [c.metaStrategyId] : []), ...(c.strategyIds ?? [])]
+    return Array.from(new Set(ids.filter((i) => i.startsWith('meta:'))))
+  }, [modeStatus])
 
   const toggleResearchGate = async () => {
     if (gateEnabled === null || gateBusy) return
@@ -281,7 +305,8 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, m
         </div>
       )}
       {/* auto-trader strip - the OS acting as its own trader in NO-HUMAN mode */}
-      {modeStatus && (
+      {tab === 'auto' && modeStatus && (
+       <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-0.5">
         <AutoTraderStrip
           at={modeStatus.autotrader}
           mode={mode}
@@ -295,6 +320,16 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, m
             }
           }}
         />
+        {autoMetaIds.length === 0 ? (
+          <p className="text-[9px] text-[#3d4c66]">
+            Strategy inputs appear here when the Auto Trader uses a saved script strategy (signal source &quot;meta-strategy&quot; or a meta: member of its strategy pool).
+          </p>
+        ) : (
+          autoMetaIds.map((id) => (
+            <StrategyInputs key={id} slot="auto" strategyId={id} title={`${specNames[id] ?? id} · inputs`} showEmpty />
+          ))
+        )}
+       </div>
       )}
 
       {/* auto-trader config editor (remounts on open so the draft mirrors the kernel) */}
@@ -314,7 +349,8 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, m
       {/* meta trader strip - "like the auto-trader, but without its
           frictions" (plugins/metatrader.ts) - a separate, faster executor
           alongside the auto-trader above, gated by the same mode switch */}
-      {metaTraderStatus && (
+      {tab === 'meta' && metaTraderStatus && (
+       <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-0.5">
         <MetaTraderStrip
           mt={metaTraderStatus}
           onConfigure={() => setMtOpen(true)}
@@ -327,6 +363,17 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, m
             }
           }}
         />
+        {metaTraderStatus.config.metaStrategyId ? (
+          <StrategyInputs
+            slot="meta"
+            strategyId={metaTraderStatus.config.metaStrategyId}
+            title={`${specNames[metaTraderStatus.config.metaStrategyId] ?? metaTraderStatus.config.metaStrategyId} · inputs`}
+            showEmpty
+          />
+        ) : (
+          <p className="text-[9px] text-[#3d4c66]">Pick a script strategy in Configure to get its inputs here.</p>
+        )}
+       </div>
       )}
 
       {/* meta trader config editor (remounts on open so the draft mirrors the kernel) */}
@@ -346,8 +393,20 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, m
           sub-bar/tick-reactive, trades exactly one saved SCRIPT meta-strategy
           spec on its own tight wall-clock poll loop instead of waiting for a
           candle close. Same mode gate as autopilot/meta trader above. */}
-      {omniTraderStatus && (
+      {tab === 'omni' && omniTraderStatus && (
+       <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-0.5">
         <OmniTraderStrip mt={omniTraderStatus} onConfigure={() => setOtOpen(true)} />
+        {omniTraderStatus.config.metaStrategyId ? (
+          <StrategyInputs
+            slot="omni"
+            strategyId={omniTraderStatus.config.metaStrategyId}
+            title={`${specNames[omniTraderStatus.config.metaStrategyId] ?? omniTraderStatus.config.metaStrategyId} · inputs`}
+            showEmpty
+          />
+        ) : (
+          <p className="text-[9px] text-[#3d4c66]">Pick a script strategy in Configure to get its inputs here.</p>
+        )}
+       </div>
       )}
 
       {/* omni trader config editor (remounts on open so the draft mirrors the kernel) */}
@@ -362,6 +421,29 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, m
         }}
       />
 
+      {/* one tab per execution engine */}
+      <div className="flex shrink-0 gap-1 border-b border-[#1c2739] pb-1.5">
+        {([
+          ['bots', `Bots${fleet.running ? ` (${fleet.running})` : ''}`],
+          ['auto', `Auto Trader${modeStatus?.autotrader.config.enabled ? ' ●' : ''}`],
+          ['meta', `Meta Trader${metaTraderStatus?.config.enabled ? ' ●' : ''}`],
+          ['omni', `Omni Trader${omniTraderStatus?.config.enabled ? ' ●' : ''}`],
+        ] as [EngineTab, string][]).map(([k, label]) => (
+          <button
+            key={k}
+            type="button"
+            onClick={() => setTab(k)}
+            className={`rounded px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider transition-colors ${
+              tab === k ? 'bg-cyan-500/15 text-cyan-300' : 'text-[#7c8aa5] hover:bg-[#101828] hover:text-[#dbe4f0]'
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'bots' && (
+       <>
       {/* header */}
       <div className="flex shrink-0 items-center justify-between">
         <h3 className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">
@@ -451,6 +533,9 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, m
           <p className="py-6 text-center font-mono text-[10px] text-[#4b5a72]">no bots match &quot;{filter}&quot;</p>
         )}
       </div>
+
+       </>
+      )}
 
       {/* editor */}
       <Dialog open={editorOpen} onOpenChange={setEditorOpen}>
@@ -907,6 +992,16 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, m
                     </div>
                   ))}
                 </div>
+              </div>
+            )}
+
+            {draft.strategyId.startsWith('meta:') && (
+              <div className="col-span-2">
+                {draft.id ? (
+                  <StrategyInputs slot={`bot:${draft.id}`} strategyId={draft.strategyId} title={`${draftStrategy?.name ?? draft.strategyId} · inputs`} showEmpty />
+                ) : (
+                  <p className="text-[9px] text-[#3d4c66]">Deploy the bot first - its strategy inputs (from the script&apos;s input lines) then appear here, editable per bot.</p>
+                )}
               </div>
             )}
 

@@ -865,8 +865,49 @@ export interface MetaStrategySpec {
    * it's set (kept non-empty so switching back to the dropdown builder
    * in the UI doesn't lose what was there). */
   script?: string
+  /** `input` lines the script declares (kernel-parsed) - empty/absent for builder specs. */
+  inputs?: MetaInputDecl[]
   createdTs?: number
   updatedTs?: number
+}
+
+/** One editable `input name = default [min N] [max N] [options ...] ["label"]` line of a strategy script. */
+export type MetaInputValue = number | boolean | string
+export interface MetaInputDecl {
+  name: string
+  type: 'number' | 'boolean' | 'string'
+  def: MetaInputValue
+  min?: number
+  max?: number
+  options?: string[]
+  label?: string
+  line: number
+}
+/** Where an engine keeps its own edits: `bot:<botId>`, `auto`, `meta` or `omni`. */
+export type MetaInputSlot = string
+export interface MetaInputsState {
+  ok: boolean
+  specId: string
+  slot: string
+  declared: MetaInputDecl[]
+  /** what this slot will actually run with (defaults + edits) */
+  values: Record<string, MetaInputValue>
+  /** only the names edited away from the script default */
+  edited: Record<string, MetaInputValue>
+  /** edited names the script no longer declares / that no longer validate */
+  dropped: string[]
+  rejected?: string[]
+  error?: string
+}
+export async function getMetaInputs(slot: MetaInputSlot, id: string): Promise<MetaInputsState> {
+  return osGet<MetaInputsState>('/meta_inputs', { slot, id })
+}
+/** values[name] = null puts that input back to the script default. */
+export async function setMetaInputs(slot: MetaInputSlot, id: string, values: Record<string, MetaInputValue | null>): Promise<MetaInputsState> {
+  return osPost<MetaInputsState>('/meta_inputs', { slot, id, values })
+}
+export async function resetMetaInputs(slot: MetaInputSlot, id: string): Promise<MetaInputsState> {
+  return osPost<MetaInputsState>('/meta_inputs_reset', { slot, id })
 }
 
 export interface MetaSourceRead {

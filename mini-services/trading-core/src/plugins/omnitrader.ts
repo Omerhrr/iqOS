@@ -488,7 +488,7 @@ export class OmniTraderService {
       this.seen.add(asset)
       let result: { result: { direction: 'call' | 'put' | 'none'; confidence: number; notes: string; expiryMin?: number } }
       try {
-        result = metaStrategy.evaluateLive(this.config.metaStrategyId, asset, this.config.tf, { bar, ticks, nowMs })
+        result = metaStrategy.evaluateLive(this.config.metaStrategyId, asset, this.config.tf, { bar, ticks, nowMs }, { slot: 'omni' })
       } catch (err) {
         this.ctx.log('omni-trader', `evaluateLive(${asset}) threw: ${err instanceof Error ? err.message : String(err)}`)
         continue

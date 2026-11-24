@@ -460,6 +460,8 @@ export interface MslSeriesCtx {
  * to be repeated correctly at every call site. */
 export interface EvalEnv {
   reads: Record<string, MslSourceRead>
+  /** values for the script's `input` statements (a slot's edits); anything missing / invalid uses the script default */
+  inputs?: Record<string, MslInputValue>
   resolve?: MslSignalResolver
   series?: MslSeriesCtx
   /** MSL: the optional trailing timeframe string on `ind.*(...)`/
@@ -940,6 +942,49 @@ type Expr =
    * `ser.slope(5)`) where `obj` IS evaluated normally first. */
   | { t: 'method'; obj: Expr; name: string; args: Expr[] }
 
+/** one editable `input` declared by a script (what the Autopilot / Meta Trader / Omni Trader / bot forms are built from) */
+export type MslInputValue = number | boolean | string
+export interface MslInputDecl {
+  name: string
+  type: 'number' | 'boolean' | 'string'
+  def: MslInputValue
+  min?: number
+  max?: number
+  /** string inputs only: the allowed values (a dropdown) */
+  options?: string[]
+  label?: string
+  line: number
+}
+
+/** keep only overrides that name a declared input AND match its type/range/options; everything else is reported in `dropped` and the default is used instead (a stale or hand-edited override can never break a script) */
+export function sanitizeInputOverrides(decls: MslInputDecl[], raw: unknown): { values: Record<string, MslInputValue>; dropped: string[] } {
+  const values: Record<string, MslInputValue> = {}
+  const dropped: string[] = []
+  if (!raw || typeof raw !== 'object') return { values, dropped }
+  const by = new Map(decls.map((d) => [d.name, d]))
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    const d = by.get(k)
+    if (!d) { dropped.push(`${k}: no longer declared by the script`); continue }
+    if (d.type === 'number') {
+      const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN
+      if (!Number.isFinite(n)) { dropped.push(`${k}: not a number`); continue }
+      if (d.min !== undefined && n < d.min) { dropped.push(`${k}: ${n} is below the minimum ${d.min}`); continue }
+      if (d.max !== undefined && n > d.max) { dropped.push(`${k}: ${n} is above the maximum ${d.max}`); continue }
+      values[k] = n
+    } else if (d.type === 'boolean') {
+      if (typeof v === 'boolean') values[k] = v
+      else if (v === 'true' || v === 'false') values[k] = v === 'true'
+      else dropped.push(`${k}: not true/false`)
+    } else {
+      if (typeof v !== 'string') { dropped.push(`${k}: not text`); continue }
+      if (d.options && !d.options.includes(v)) { dropped.push(`${k}: "${v}" is not one of ${d.options.join(', ')}`); continue }
+      if (v.length > 80) { dropped.push(`${k}: text longer than 80 characters`); continue }
+      values[k] = v
+    }
+  }
+  return { values, dropped }
+}
+
 type Stmt =
   | { kind: 'let'; name: string; expr: Expr }
   | { kind: 'call'; expr: Expr }
@@ -947,6 +992,8 @@ type Stmt =
   | { kind: 'confidence'; expr: Expr }
   | { kind: 'expiry'; expr: Expr }
   | { kind: 'configure'; path: string; expr: Expr }
+  /** `input name = <default> [min N] [max N] [options "a", "b"] ["label"]` - an EDITABLE setting: the default lives in the script, a trader slot may override it without touching the script */
+  | { kind: 'input'; name: string; decl: MslInputDecl; line: number }
   /** `if <cond> ... elseif <cond> ... else ... end` - the first branch whose condition is true runs; `else` runs when none did */
   | { kind: 'if'; branches: { cond: Expr; body: Stmt[]; line: number }[]; elseBody?: Stmt[] }
   /** `var x = init` - a PERSISTENT variable: init runs once, the value is carried bar to bar (see MslVarStore) */
@@ -1035,6 +1082,7 @@ class Parser {
    * stability MslStateStore's keys need. */
   private stateSeq = 0
   private loopDepth = 0
+  private seenInputs = new Set<string>()
   private inFn = false
   private fns: Record<string, MslFn> = {}
   constructor(private toks: Token[]) {}
@@ -1102,6 +1150,58 @@ class Parser {
   }
 
   /** if <cond> [then] / elseif <cond> / else if <cond> / else / end */
+  /** `input name = <default> [min N] [max N] [options "a", "b"] ["label"]` - top level only, one line */
+  private parseInput(depth: number): Stmt {
+    const kw = this.next() // 'input'
+    if (depth > 0 || this.inFn) throw new MslSyntaxError(`line ${kw.line}: "input" must be at the top of the script, not inside an if / loop / fn`)
+    const name = this.expect('ident').value
+    if (this.seenInputs.has(name)) throw new MslSyntaxError(`line ${kw.line}: input "${name}" is declared twice`)
+    this.expect('eq_assign')
+    const readNum = (what: string): number => {
+      let sign = 1
+      if (this.peek().kind === 'minus') { this.next(); sign = -1 }
+      const n = this.next()
+      if (n.kind !== 'num') throw new MslSyntaxError(`line ${kw.line}: ${what} needs a plain number`)
+      return sign * Number(n.value)
+    }
+    let type: MslInputDecl['type'], def: MslInputValue
+    const first = this.peek()
+    if (first.kind === 'str') { this.next(); type = 'string'; def = first.value }
+    else if (first.kind === 'ident' && (first.value === 'true' || first.value === 'false')) { this.next(); type = 'boolean'; def = first.value === 'true' }
+    else { type = 'number'; def = readNum(`the default of input "${name}"`) }
+    const decl: MslInputDecl = { name, type, def, line: kw.line }
+    while (this.peek().kind !== 'eof') {
+      const w = this.peek()
+      if (w.kind === 'str') { this.next(); decl.label = w.value; continue }
+      if (w.kind === 'ident' && (w.value === 'min' || w.value === 'max')) {
+        if (type !== 'number') throw new MslSyntaxError(`line ${kw.line}: "${w.value}" only applies to a number input`)
+        this.next(); decl[w.value as 'min' | 'max'] = readNum(`${w.value} of input "${name}"`); continue
+      }
+      if (w.kind === 'ident' && w.value === 'options') {
+        if (type !== 'string') throw new MslSyntaxError(`line ${kw.line}: "options" only applies to a text input`)
+        this.next()
+        const opts: string[] = []
+        for (;;) {
+          const s = this.next()
+          if (s.kind !== 'str') throw new MslSyntaxError(`line ${kw.line}: options for "${name}" must be quoted text, e.g. options "atr", "z"`)
+          opts.push(s.value)
+          if (this.peek().kind === 'comma') { this.next(); continue }
+          break
+        }
+        decl.options = opts; continue
+      }
+      throw new MslSyntaxError(`line ${kw.line}: unexpected "${w.value}" in input "${name}" - use: input name = default [min N] [max N] [options "a", "b"] ["label"]`)
+    }
+    if (decl.min !== undefined && decl.max !== undefined && decl.min > decl.max) throw new MslSyntaxError(`line ${kw.line}: input "${name}" has min above max`)
+    if (type === 'number') {
+      if (decl.min !== undefined && (def as number) < decl.min) throw new MslSyntaxError(`line ${kw.line}: the default of "${name}" is below its min`)
+      if (decl.max !== undefined && (def as number) > decl.max) throw new MslSyntaxError(`line ${kw.line}: the default of "${name}" is above its max`)
+    }
+    if (decl.options && !decl.options.includes(def as string)) throw new MslSyntaxError(`line ${kw.line}: the default of "${name}" must be one of its options`)
+    this.seenInputs.add(name)
+    return { kind: 'input', name, decl, line: kw.line }
+  }
+
   private parseIf(depth: number): Stmt {
     if (depth >= 8) throw new MslSyntaxError(`line ${this.peek().line}: "if" blocks nested more than 8 deep`)
     const openLine = this.peek().line
@@ -1214,6 +1314,7 @@ class Parser {
 
   private parseStatementInner(depth = 0): Stmt {
     const t = this.peek()
+    if (t.kind === 'ident' && t.value === 'input' && this.look(1)?.kind === 'ident' && this.look(2)?.kind === 'eq_assign') return this.parseInput(depth)
     if (t.kind === 'ident' && t.value === 'if') return this.parseIf(depth)
     if (t.kind === 'ident' && (t.value === 'for' || t.value === 'while') && this.look(1)?.kind !== 'eq_assign') return this.parseLoop(depth)
     if (t.kind === 'ident' && t.value === 'break' && this.look(1)?.kind === 'eof') {
@@ -1565,6 +1666,16 @@ export function parseStrategyScript(src: string): { ok: true; ast: MslAst } | { 
   }
 }
 
+/** the editable inputs a script declares (for the trader forms). Does NOT need a call/put: it only reads the `input` lines. */
+export function listScriptInputs(src: string): { ok: true; inputs: MslInputDecl[] } | { ok: false; error: string } {
+  try {
+    const ast = new Parser(tokenize(src)).parseProgram()
+    return { ok: true, inputs: flattenStmts(ast.stmts).filter((s): s is Extract<Stmt, { kind: 'input' }> => s.kind === 'input').map((s) => s.decl) }
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
 // ---------- evaluator ----------
 
 class MslRuntimeError extends Error {}
@@ -1607,7 +1718,12 @@ function fieldOf(val: MslValue, field: string): MslValue {
     return val.fields[field]
   }
   if (isBundleValue(val)) {
-    if (!(field in val.fields)) throw new MslRuntimeError(`"${compositeKind(val)}" has no field ".${field}"`)
+    if (!(field in val.fields)) {
+      const names = Object.keys(val.fields)
+      const lc = field.toLowerCase()
+      const near = names.find((n) => n.toLowerCase() === lc) ?? names.find((n) => n.toLowerCase().startsWith(lc) || lc.startsWith(n.toLowerCase()))
+      throw new MslRuntimeError(`this bundle has no field ".${field}"${near ? ` - did you mean ".${near}"?` : ''} (fields: ${names.map((n) => '.' + n).join(', ')})`)
+    }
     return val.fields[field]
   }
   if (isBarValue(val)) {
@@ -6637,21 +6753,36 @@ function storyPmm(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
  * Flat bundle: ok error direction (call|put|none) case (0|1|2) pressure shock (booleans) pressureDir shockDir (+1/-1/0) pressureAtr shockAtr (signed, in ATR of period atrPeriod, default 14) pressureEff shockAge bodyAtr progress (0..1 of the candle) trendDir points text.
  * trendTf (e.g. story.sp("5m")) is only used by story.ssp(). Reads the candle path from live ticks (omni-trader) else the 5s chart; fails closed without either. story.spText() the sentence.
  * HOW IT IS MEASURED is selectable with option strings: "shock=atr" (default, burst / ATR, thr 0.30) | "shock=z" (burst as a z-score of the pair's realised vol, thr 3) | "shock=roc" (burst as % of the open, thr 0.03); "pressure=atr" (default, slow move / ATR plus efficiency, thr 0.12) | "pressure=er" (Kaufman efficiency ratio, thr 0.5) | "pressure=reg" (R2 of a straight-line fit, thr 0.7) | "pressure=roc" (slow move as % of the open plus efficiency, thr 0.02). The numeric arguments are thresholds IN THE UNIT OF THE CHOSEN MEASURE, e.g. story.sp("shock=z", "pressure=er", 3.5, 0.6). Extra bundle fields: shockVal pressureVal (signed, in that unit) shockMode pressureMode.
+ * SEVERAL measures at once: join them with + ("shock=atr+roc", "pressure=atr+reg"), ALL must pass; a measure's own threshold is an extra option string ("shock.roc=0.05", "pressure.reg=0.8"); the positional numbers apply to the FIRST measure listed.
  * HONESTY: thresholds are judgement (shock >= 0.30 ATR inside 10 s and fresh; pressure >= 0.12 ATR and steady) - replay it before trading it. */
 /** `story.ssp([trendTf], [pressureAtr], [burstSec], [atrPeriod])` - SSP, the old case 5 of story.sp as its OWN model: steady pressure on the forming candle with NO shock, traded WITH THE TREND (EMA20 vs EMA50 of the chart or of trendTf). Same bundle as story.sp (case is 5 when it fires, 0 otherwise). atrPeriod (whole number 1..200, default 14) sets the ATR the thresholds are measured in; numbers are positional, so pass the earlier ones to reach it, e.g. story.ssp("5m", 0.12, 10, 5). story.sspText() the sentence. Takes the same option strings as story.sp (shock=, pressure=; only the pressure one matters for SSP, a shock cancels it). Needs the same live ticks / 5s chart as story.sp. */
 /** `story.ssp([trendTf], [pressureAtr], [burstSec], [atrPeriod])` - SSP, the old case 5 of story.sp as its OWN model: steady pressure on the forming candle with NO shock, traded WITH THE TREND (EMA20 vs EMA50 of the chart or of trendTf). Same bundle as story.sp (case is 5 when it fires, 0 otherwise). atrPeriod (whole number 1..200, default 14) sets the ATR the thresholds are measured in; numbers are positional, so pass the earlier ones to reach it, e.g. story.ssp("5m", 0.12, 10, 5). story.sspText() the sentence. Needs the same live ticks / 5s chart as story.sp. */
 function storySp(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
   const allStrs = args.filter((a): a is string => typeof a === 'string')
   // option strings "shock=atr|z|roc" and "pressure=atr|er|reg|roc" pick how the shock / the pressure is MEASURED; every other string is the trend timeframe
-  const optStrs = allStrs.filter((a) => /^\w+=/.test(a))
-  const strs = allStrs.filter((a) => !/^\w+=/.test(a))
-  let shockMode: ShockMode = 'atr', pressureMode: PressureMode = 'atr'
+  const optStrs = allStrs.filter((a) => /^[\w.]+=/.test(a))
+  const strs = allStrs.filter((a) => !/^[\w.]+=/.test(a))
+  // "shock=atr+roc" / "pressure=atr+reg" use SEVERAL measures at once (ALL must pass); "shock.roc=0.05" / "pressure.reg=0.8" set one measure's own threshold
+  let shockModes: ShockMode[] = ['atr'], pressureModes: PressureMode[] = ['atr']
+  const shockThrs: Partial<Record<ShockMode, number>> = {}, pressureThrs: Partial<Record<PressureMode, number>> = {}
+  const SHOCK_OK = ['atr', 'z', 'roc'], PRESS_OK = ['atr', 'er', 'reg', 'roc']
   for (const o of optStrs) {
-    const [k, v] = o.split('=')
-    if (k === 'shock' && (v === 'atr' || v === 'z' || v === 'roc')) shockMode = v
-    else if (k === 'pressure' && (v === 'atr' || v === 'er' || v === 'reg' || v === 'roc')) pressureMode = v
-    else throw new MslRuntimeError(`story.sp()/ssp(): unknown option "${o}" - use shock=atr|z|roc and pressure=atr|er|reg|roc`)
+    const eq = o.indexOf('='), k = o.slice(0, eq), v = o.slice(eq + 1)
+    const bad = () => new MslRuntimeError(`story.sp()/ssp(): unknown option "${o}" - use shock=atr|z|roc and pressure=atr|er|reg|roc (join several with +, e.g. shock=atr+roc), and shock.<measure>=<number> / pressure.<measure>=<number> for one measure's threshold`)
+    const dot = k.indexOf('.')
+    if (dot > 0) {
+      const side = k.slice(0, dot), m = k.slice(dot + 1), num = Number(v)
+      if (!Number.isFinite(num) || num < 0) throw bad()
+      if (side === 'shock' && SHOCK_OK.includes(m)) shockThrs[m as ShockMode] = num
+      else if (side === 'pressure' && PRESS_OK.includes(m)) pressureThrs[m as PressureMode] = num
+      else throw bad()
+    } else if (k === 'shock' || k === 'pressure') {
+      const list = v.split('+').map((x) => x.trim()).filter(Boolean)
+      if (!list.length || list.some((x) => !(k === 'shock' ? SHOCK_OK : PRESS_OK).includes(x))) throw bad()
+      if (k === 'shock') shockModes = list as ShockMode[]; else pressureModes = list as PressureMode[]
+    } else throw bad()
   }
+  const shockMode: ShockMode = shockModes[0], pressureMode: PressureMode = pressureModes[0]
   const nums = args.filter((a): a is number => typeof a === 'number')
   const s = requireSeries(ctx, undefined)
   const span = barSpacingSec(s)
@@ -6694,11 +6825,11 @@ function storySp(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
   const tc = trendSeries.close[trendSeries.close.length - 1], a = e20[e20.length - 1], b = e50[e50.length - 1]
   const trend = Number.isFinite(a) && Number.isFinite(b) ? (a > b && tc > b ? 1 : a < b && tc < b ? -1 : 0) : 0
   const optsIn = isSsp
-    ? { open, openSec, nowSec, tfSec: span, atr: atrv, trend, shockMode, pressureMode, sigmaSec, ...(nums[0] !== undefined ? { pressureThr: nums[0] } : {}), ...(nums[1] !== undefined ? { burstSec: nums[1] } : {}) }
-    : { open, openSec, nowSec, tfSec: span, atr: atrv, trend, shockMode, pressureMode, sigmaSec, ...(nums[0] !== undefined ? { shockThr: nums[0] } : {}), ...(nums[1] !== undefined ? { pressureThr: nums[1] } : {}), ...(nums[2] !== undefined ? { burstSec: nums[2] } : {}) }
+    ? { open, openSec, nowSec, tfSec: span, atr: atrv, trend, shockMode, pressureMode, shockModes, pressureModes, shockThrs, pressureThrs, sigmaSec, ...(nums[0] !== undefined ? { pressureThr: nums[0] } : {}), ...(nums[1] !== undefined ? { burstSec: nums[1] } : {}) }
+    : { open, openSec, nowSec, tfSec: span, atr: atrv, trend, shockMode, pressureMode, shockModes, pressureModes, shockThrs, pressureThrs, sigmaSec, ...(nums[0] !== undefined ? { shockThr: nums[0] } : {}), ...(nums[1] !== undefined ? { pressureThr: nums[1] } : {}), ...(nums[2] !== undefined ? { burstSec: nums[2] } : {}) }
   const r = (isSsp ? readSsp : readSp)(pts, optsIn)
   if (name === 'spText' || name === 'sspText') return r.text
-  return bundleValue({ ok: r.ok, error: r.ok ? '' : (r.error ?? ''), direction: r.direction, case: r.caseNo, pressure: r.pressure, shock: r.shock, shockVal: r.shockVal, pressureVal: r.pressureVal, shockMode: r.shockMode, pressureMode: r.pressureMode, pressureDir: r.pressureDir, shockDir: r.shockDir, pressureAtr: r.pressureAtr, shockAtr: r.shockAtr,
+  return bundleValue({ ok: r.ok, error: r.ok ? '' : (r.error ?? ''), direction: r.direction, case: r.caseNo, pressure: r.pressure, shock: r.shock, shockVal: r.shockVal, pressureVal: r.pressureVal, shockMode: r.shockMode, pressureMode: r.pressureMode, shockModes: r.shockModes ?? r.shockMode, pressureModes: r.pressureModes ?? r.pressureMode, pressureDir: r.pressureDir, shockDir: r.shockDir, pressureAtr: r.pressureAtr, shockAtr: r.shockAtr,
     pressureEff: r.pressureEff, shockAge: Number.isFinite(r.shockAge) ? r.shockAge : -1, bodyAtr: r.bodyAtr, progress: Math.min(1, r.progress), trendDir: r.trendDir, points: r.points, text: r.text })
 }
 
@@ -6933,6 +7064,14 @@ function execBlock(stmts: Stmt[], env: Record<string, MslValue>, ctx: EvalEnv, r
       case 'let':
         env[stmt.name] = evalExpr(stmt.expr, env, ctx)
         break
+      case 'input': {
+        const d = stmt.decl
+        const ov = ctx.inputs && Object.prototype.hasOwnProperty.call(ctx.inputs, d.name) ? sanitizeInputOverrides([d], { [d.name]: ctx.inputs[d.name] }) : null
+        const edited = ov && d.name in ov.values
+        env[d.name] = edited ? ov!.values[d.name] : d.def
+        if (rs) rs.trace.push(edited ? `input ${d.name} = ${String(ov!.values[d.name])} (edited, script default ${String(d.def)})` : ov && ov.dropped.length ? `input ${d.name} = ${String(d.def)} (override ignored: ${ov.dropped[0]})` : `input ${d.name} = ${String(d.def)}`)
+        break
+      }
       case 'var': {
         if (ctx.fnDepth && !canEffect(ctx)) throw new MslRuntimeError(`"var ${stmt.name}" inside an fn only works when the fn is called as a statement on its own line`)
         const home = ctx.fnDepth ? ctx.globalEnv! : env
@@ -7101,6 +7240,7 @@ export function evaluateStrategyScript(
   live?: { bar?: MslBarValue; ticks?: readonly { ts: number; price: number }[]; nowMs?: number },
   state?: { keyPrefix: string; barTimeSec?: number; spot?: number },
   managed?: { positions: MslPosView[] },
+  inputs?: Record<string, MslInputValue>,
 ): MslEvalResult {
   // configs is declared before ctx so ctx.configs can point at the SAME
   // object the 'configure' statement branch below mutates - a namespace
@@ -7119,6 +7259,7 @@ export function evaluateStrategyScript(
     stateKeyPrefix: state?.keyPrefix,
     barTimeSec: state?.barTimeSec,
     configs,
+    inputs,
   }
   const env: Record<string, MslValue> = {}
   const trace: string[] = []

@@ -71,7 +71,7 @@ import {
   type MetaStrategySpec,
 } from '../analytics/metastrategy'
 import { BUILTIN_TV_SPECS } from './builtinTvSpecs'
-import { parseStrategyScript, evaluateStrategyScript, clearMslState, flattenStmts, type MslEvalResult, type MslSourceRead, type MslSeriesCtx, type MslBarValue, type MslAst } from '../analytics/strategylang'
+import { parseStrategyScript, evaluateStrategyScript, clearMslState, flattenStmts, listScriptInputs, sanitizeInputOverrides, type MslInputDecl, type MslInputValue, type MslEvalResult, type MslSourceRead, type MslSeriesCtx, type MslBarValue, type MslAst } from '../analytics/strategylang'
 import { getStrategy } from '../strategies/builtin'
 import { directionBreakdown } from '../strategies/backtest'
 import { sharpeRatio } from '../analytics/quant'
@@ -826,6 +826,9 @@ export class MetaStrategyService {
   private market!: MarketDataService
   private specs = new Map<string, MetaStrategySpec>()
   private libPath = join(process.cwd(), 'data', 'meta_strategies.json')
+  /** EDITED `input` values per (trader slot, spec): key `${slot}|${specId}`. Only values that differ from the script default are kept, so a changed script default flows through to every slot that never edited it. Survives removing the strategy from a slot and adding it back. */
+  private slotInputs = new Map<string, Record<string, MslInputValue>>()
+  private inputsPath = join(process.cwd(), 'data', 'meta_inputs.json')
   // Set only for the duration of backtestMeta()'s own replay loop - lets
   // the 'technical'/'reversal' cases below bypass TechnicalService's and
   // ReversalService's wall-clock TTL cache (`{ refresh: true }`), which
@@ -837,6 +840,7 @@ export class MetaStrategyService {
     this.ctx = ctx
     this.market = ctx.use<MarketDataService>('market')
     this.load()
+    this.loadInputs()
     setMetaDefResolver((id) => this.asStrategyDef(id))
     const seeded = this.seedBuiltinExamples()
     ctx.log('meta-strategy', `meta-strategy library online (${this.specs.size} saved, +${seeded} builtin examples seeded this start, sources: ${META_CONDITION_SOURCES.join('/')})`)
@@ -899,6 +903,93 @@ export class MetaStrategyService {
     } catch {
       /* persistence is best-effort - the in-memory library still works this run */
     }
+  }
+
+  // ---------- editable script inputs, per trader slot ----------
+
+  private loadInputs(): void {
+    try {
+      const raw = JSON.parse(readFileSync(this.inputsPath, 'utf8')) as { slots?: Record<string, Record<string, MslInputValue>> }
+      for (const [k, v] of Object.entries(raw.slots ?? {})) if (v && typeof v === 'object') this.slotInputs.set(k, v)
+    } catch {
+      /* no file yet */
+    }
+  }
+
+  private persistInputs(): void {
+    try {
+      mkdirSync(join(process.cwd(), 'data'), { recursive: true })
+      writeFileSync(this.inputsPath, JSON.stringify({ savedAt: Date.now(), slots: Object.fromEntries(this.slotInputs) }))
+    } catch {
+      /* best-effort - the in-memory overrides still work this run */
+    }
+  }
+
+  /** the `input` lines a saved spec's script declares ([] for a conditions-built spec or a script without inputs) */
+  inputDecls(specId: string): MslInputDecl[] {
+    const spec = this.get(specId)
+    if (!spec?.script) return []
+    const r = listScriptInputs(spec.script)
+    return r.ok ? r.inputs : []
+  }
+
+  /** what the form shows for one slot + spec: the declared inputs, the values a run will use (script defaults overlaid with this slot's valid edits), the edited ones, and any stale override that was dropped */
+  getInputs(slot: string, specId: string): { specId: string; slot: string; declared: MslInputDecl[]; values: Record<string, MslInputValue>; edited: Record<string, MslInputValue>; dropped: string[] } {
+    const declared = this.inputDecls(specId)
+    const stored = this.slotInputs.get(`${slot}|${normalizeMetaId(specId)}`) ?? {}
+    const { values: edited, dropped } = sanitizeInputOverrides(declared, stored)
+    const values: Record<string, MslInputValue> = {}
+    for (const d of declared) values[d.name] = d.name in edited ? edited[d.name] : d.def
+    return { specId: normalizeMetaId(specId), slot, declared, values, edited, dropped }
+  }
+
+  /** save edits for one slot + spec. `patch` maps input name -> new value, or null to put one back to the script default. Invalid entries are rejected with a reason (nothing partial is stored for them). */
+  setInputs(slot: string, specId: string, patch: Record<string, unknown>): ReturnType<MetaStrategyService['getInputs']> & { rejected: string[] } {
+    const declared = this.inputDecls(specId)
+    const key = `${slot}|${normalizeMetaId(specId)}`
+    const next: Record<string, MslInputValue> = { ...sanitizeInputOverrides(declared, this.slotInputs.get(key) ?? {}).values }
+    const rejected: string[] = []
+    const toCheck: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(patch ?? {})) {
+      if (v === null) delete next[k]
+      else toCheck[k] = v
+    }
+    const ok = sanitizeInputOverrides(declared, toCheck)
+    rejected.push(...ok.dropped)
+    for (const d of declared) {
+      if (!(d.name in ok.values)) continue
+      if (ok.values[d.name] === d.def) delete next[d.name] // same as the script default: nothing to remember
+      else next[d.name] = ok.values[d.name]
+    }
+    if (Object.keys(next).length) this.slotInputs.set(key, next)
+    else this.slotInputs.delete(key)
+    this.persistInputs()
+    return { ...this.getInputs(slot, specId), rejected }
+  }
+
+  /** put every input of one slot + spec back to the script defaults */
+  resetInputs(slot: string, specId: string): ReturnType<MetaStrategyService['getInputs']> {
+    this.slotInputs.delete(`${slot}|${normalizeMetaId(specId)}`)
+    this.persistInputs()
+    return this.getInputs(slot, specId)
+  }
+
+  /** forget everything a slot stored (a deleted bot) */
+  clearSlotInputs(slot: string): void {
+    let any = false
+    for (const k of [...this.slotInputs.keys()]) if (k.startsWith(`${slot}|`)) { this.slotInputs.delete(k); any = true }
+    if (any) this.persistInputs()
+  }
+
+  /** the valid edits a run for this slot should apply (undefined when there are none) */
+  private inputsFor(slot: string | undefined, specId: string, script: string): Record<string, MslInputValue> | undefined {
+    if (!slot) return undefined
+    const stored = this.slotInputs.get(`${slot}|${normalizeMetaId(specId)}`)
+    if (!stored) return undefined
+    const decl = listScriptInputs(script)
+    if (!decl.ok) return undefined
+    const { values } = sanitizeInputOverrides(decl.inputs, stored)
+    return Object.keys(values).length ? values : undefined
   }
 
   list(): MetaStrategySpec[] {
@@ -2328,10 +2419,10 @@ export class MetaStrategyService {
    * MetaStrategySpec.script's doc comment) - this is the one place that
    * decision is made, so Meta Trader's 'meta-strategy' source and the
    * /meta_strategy_eval REST route both get it for free. */
-  evaluate(id: string, asset: string, tf: Timeframe): { spec: MetaStrategySpec; result: MetaEvalResult; price: number } {
+  evaluate(id: string, asset: string, tf: Timeframe, opts?: { slot?: string }): { spec: MetaStrategySpec; result: MetaEvalResult; price: number } {
     const spec = this.get(id)
     if (!spec) throw new Error(`unknown meta-strategy ${id}`)
-    const result = spec.script ? this.evaluateScript(spec.id, spec.script, asset, tf) : this.evaluateConditions(spec, asset, tf)
+    const result = spec.script ? this.evaluateScript(spec.id, spec.script, asset, tf, undefined, this.inputsFor(opts?.slot, spec.id, spec.script)) : this.evaluateConditions(spec, asset, tf)
     let price = 0
     try {
       price = this.market.getPrice(asset)
@@ -2355,6 +2446,7 @@ export class MetaStrategyService {
     asset: string,
     tf: Timeframe,
     live: { bar?: MslBarValue; ticks?: readonly { ts: number; price: number }[]; nowMs?: number },
+    opts?: { slot?: string },
   ): { spec: MetaStrategySpec; result: MetaEvalResult; price: number } {
     const spec = this.get(id)
     if (!spec) throw new Error(`unknown meta-strategy ${id}`)
@@ -2365,7 +2457,7 @@ export class MetaStrategyService {
         price: 0,
       }
     }
-    const result = this.evaluateScript(spec.id, spec.script, asset, tf, live)
+    const result = this.evaluateScript(spec.id, spec.script, asset, tf, live, this.inputsFor(opts?.slot, spec.id, spec.script))
     let price = 0
     try {
       price = this.market.getPrice(asset)
@@ -2490,6 +2582,7 @@ export class MetaStrategyService {
     asset: string,
     tf: Timeframe,
     live?: { bar?: MslBarValue; ticks?: readonly { ts: number; price: number }[]; nowMs?: number },
+    inputs?: Record<string, MslInputValue>,
   ): MetaEvalResult {
     const parsed = parseStrategyScript(script)
     if (!parsed.ok) return { direction: 'none', score: 0, confidence: 0, conditions: [], notes: `script error: ${parsed.error}` }
@@ -2517,7 +2610,7 @@ export class MetaStrategyService {
       /* no spot - timing.hold falls back to ticks / 5s / bar */
     }
     const state = { keyPrefix: `${specId}|${asset}|${tf}`, barTimeSec: this.scriptBarTimeSec(asset, tf), spot }
-    const out = evaluateStrategyScript(parsed.ast, reads, this.scriptResolver(asset, tf), series, seriesFor, live, state)
+    const out = evaluateStrategyScript(parsed.ast, reads, this.scriptResolver(asset, tf), series, seriesFor, live, state, undefined, inputs)
     if (!out.error && out.configs) {
       try {
         validateMslConfigs(out.configs)
@@ -2525,7 +2618,7 @@ export class MetaStrategyService {
         return { direction: 'none', score: 0, confidence: 0, conditions: [], notes: `script error: ${err instanceof Error ? err.message : String(err)}` }
       }
       const reads2 = this.buildScriptReads(asset, tf, out.configs, script)
-      const out2 = evaluateStrategyScript(parsed.ast, reads2, this.scriptResolver(asset, tf, out.configs), series, seriesFor, live, state)
+      const out2 = evaluateStrategyScript(parsed.ast, reads2, this.scriptResolver(asset, tf, out.configs), series, seriesFor, live, state, undefined, inputs)
       return this.scriptMetaResult(out2)
     }
     return this.scriptMetaResult(out)
@@ -2551,7 +2644,7 @@ export class MetaStrategyService {
    * re-validates the syntax on its own, this is purely for live preview).
    * Same two-pass configure contract as evaluateScript; surfaces the
    * script's preferred expiryMin when it set one. */
-  testScript(script: string, asset: string, tf: Timeframe): { ok: boolean; direction?: 'call' | 'put' | 'none'; confidence?: number; expiryMin?: number; trace?: string[]; price?: number; error?: string } {
+  testScript(script: string, asset: string, tf: Timeframe, inputs?: Record<string, MslInputValue>): { ok: boolean; direction?: 'call' | 'put' | 'none'; confidence?: number; expiryMin?: number; trace?: string[]; price?: number; error?: string } {
     const parsed = parseStrategyScript(script)
     if (!parsed.ok) return { ok: false, error: parsed.error }
     this.setSeriesBarsFor(script)
@@ -2563,7 +2656,7 @@ export class MetaStrategyService {
     // across repeated clicks on the SAME script/pair for a human to see the
     // counters move sensibly, and never collides with a real `meta:...` id.
     const state = { keyPrefix: `test|${asset}|${tf}`, barTimeSec: this.scriptBarTimeSec(asset, tf) }
-    const out = evaluateStrategyScript(parsed.ast, reads, this.scriptResolver(asset, tf), series, seriesFor, undefined, state)
+    const out = evaluateStrategyScript(parsed.ast, reads, this.scriptResolver(asset, tf), series, seriesFor, undefined, state, undefined, inputs)
     if (out.error) return { ok: false, error: out.error }
     let final = out
     if (out.configs) {
@@ -2573,7 +2666,7 @@ export class MetaStrategyService {
         return { ok: false, error: err instanceof Error ? err.message : String(err) }
       }
       const reads2 = this.buildScriptReads(asset, tf, out.configs, script)
-      final = evaluateStrategyScript(parsed.ast, reads2, this.scriptResolver(asset, tf, out.configs), series, seriesFor, undefined, state)
+      final = evaluateStrategyScript(parsed.ast, reads2, this.scriptResolver(asset, tf, out.configs), series, seriesFor, undefined, state, undefined, inputs)
       if (final.error) return { ok: false, error: final.error }
     }
     let price = 0

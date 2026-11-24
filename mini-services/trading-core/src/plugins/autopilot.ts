@@ -776,6 +776,7 @@ export class AutopilotService {
       } catch {
         // watchdog not loaded
       }
+      try { this.metaStrategyService()?.clearSlotInputs(`bot:${id}`) } catch { /* meta-strategy lab not loaded */ }
       this.emit('info', `Bot ${id} deleted`)
     }
     return { ok, error: ok ? undefined : 'bot not found' }
@@ -1016,7 +1017,7 @@ export class AutopilotService {
       const meta = this.metaStrategyService()
       if (!meta) return this.reject(bot, 'meta strategy lab unavailable for meta strategy')
       try {
-        const { result, price } = meta.evaluate(bot.strategyId, asset, tf)
+        const { result, price } = meta.evaluate(bot.strategyId, asset, tf, { slot: `bot:${bot.id}` })
         evalOut = {
           direction: result.direction,
           score: result.score,

@@ -2159,7 +2159,7 @@ export class ModeService {
         for (const asset of candidates) {
           if (this.assetBlocked(asset)) continue
           try {
-            const { result, price } = meta.evaluate(id, asset, this.config.tf)
+            const { result, price } = meta.evaluate(id, asset, this.config.tf, { slot: 'auto' })
             rec(asset)
             if (result.direction === 'none' || !(price > 0)) continue
             const dir: 'call' | 'put' = result.direction
@@ -2769,7 +2769,7 @@ export class ModeService {
               : s.isMeta
                 ? (() => {
                     if (!meta) throw new Error('meta strategy lab unavailable')
-                    const { result, price: p } = meta.evaluate(s.id, asset, this.config.tf)
+                    const { result, price: p } = meta.evaluate(s.id, asset, this.config.tf, { slot: 'auto' })
                     // P2 AUDIT FIX: reconstruct phase cross-tick (see
                     // metaMemberPrevVotes) so the shared `held` gate below
                     // actually applies to meta members too.

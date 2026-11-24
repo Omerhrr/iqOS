@@ -22,6 +22,10 @@ export interface SpOptions {
   shockMode?: ShockMode
   /** how the PRESSURE is measured: atr = |slow move| / ATR AND efficiency (default, thr 0.12) | er = Kaufman efficiency ratio alone (thr 0.5) | reg = R2 of a straight-line fit (thr 0.7) | roc = slow move as % of the open AND efficiency (thr 0.02) */
   pressureMode?: PressureMode
+  /** several measures AT ONCE (all must pass): shockModes ['atr','roc'] / pressureModes ['atr','reg']. When given they replace shockMode / pressureMode; the first one is the PRIMARY (positional thresholds, shockVal / pressureVal). */
+  shockModes?: ShockMode[]; pressureModes?: PressureMode[]
+  /** per-mode thresholds for the combined case, e.g. { roc: 0.05 }; a mode not listed uses the primary positional threshold (primary only) or its default */
+  shockThrs?: Partial<Record<ShockMode, number>>; pressureThrs?: Partial<Record<PressureMode, number>>
   /** thresholds, in the unit of the chosen mode (shockAtr / pressureAtr kept as the old names) */
   shockThr?: number; pressureThr?: number
   /** realised volatility per SECOND (stdev of close-to-close change / sqrt(bar seconds)), price units. Needed for shockMode 'z' */
@@ -43,6 +47,8 @@ export interface SpResult {
   shock: boolean; shockDir: number; shockAtr: number; shockAge: number
   /** the measure the thresholds were tested on, in the chosen unit (signed): shockVal in ATR / sigma / % of price; pressureVal = ATR move, efficiency, R2 or % of price */
   shockVal: number; pressureVal: number; shockMode: ShockMode; pressureMode: PressureMode
+  /** every measure that had to pass, e.g. 'atr+roc' (one name when a single measure is used) */
+  shockModes?: string; pressureModes?: string
   bodyAtr: number; progress: number; trendDir: number; points: number
   text: string
 }
@@ -55,9 +61,12 @@ const fail = (error: string): SpResult => ({ ok: false, error, caseNo: 0, direct
 
 function measure(points: readonly SpPoint[], o: SpOptions): { fail: SpResult } | { base: Omit<SpResult, 'ok' | 'caseNo' | 'direction' | 'text'>; pressure: boolean; pressureDir: number; shock: boolean; shockDir: number; shockAtr: number; pressureAtr: number; eff: number; progress: number } {
   if (!(o.atr > 0) || !Number.isFinite(o.open) || !(o.tfSec > 0)) return { fail: fail('ATR or the candle open is unavailable') }
-  const shockMode: ShockMode = o.shockMode ?? 'atr', pressureMode: PressureMode = o.pressureMode ?? 'atr'
-  const shockThr = o.shockThr ?? o.shockAtr ?? SHOCK_DEFAULT[shockMode], burstSec = o.burstSec ?? 10, freshSec = o.freshSec ?? Math.max(10, 0.3 * o.tfSec), pressThr = o.pressureThr ?? o.pressureAtr ?? PRESSURE_DEFAULT[pressureMode], minEff = o.minEff ?? 0.30
-  if (shockMode === 'z' && !(o.sigmaSec && o.sigmaSec > 0)) return { fail: fail('shock measure "z" needs realised volatility from the closed bars, which is unavailable') }
+  const shockModes: ShockMode[] = o.shockModes?.length ? [...new Set(o.shockModes)] : [o.shockMode ?? 'atr'], pressureModes: PressureMode[] = o.pressureModes?.length ? [...new Set(o.pressureModes)] : [o.pressureMode ?? 'atr']
+  const shockMode = shockModes[0], pressureMode = pressureModes[0]
+  const shockThrOf = (m: ShockMode): number => o.shockThrs?.[m] ?? (m === shockMode ? (o.shockThr ?? o.shockAtr) : undefined) ?? SHOCK_DEFAULT[m]
+  const pressThrOf = (m: PressureMode): number => o.pressureThrs?.[m] ?? (m === pressureMode ? (o.pressureThr ?? o.pressureAtr) : undefined) ?? PRESSURE_DEFAULT[m]
+  const burstSec = o.burstSec ?? 10, freshSec = o.freshSec ?? Math.max(10, 0.3 * o.tfSec), minEff = o.minEff ?? 0.30
+  if (shockModes.includes('z') && !(o.sigmaSec && o.sigmaSec > 0)) return { fail: fail('shock measure "z" needs realised volatility from the closed bars, which is unavailable') }
   const pts: SpPoint[] = [{ t: o.openSec, p: o.open }]
   for (const q of points) if (q.t > o.openSec && q.t <= o.nowSec + 1e-6 && Number.isFinite(q.p)) pts.push(q)
   pts.sort((a, b) => a.t - b.t)
@@ -69,8 +78,9 @@ function measure(points: readonly SpPoint[], o: SpOptions): { fail: SpResult } |
   let bi = 0, bj = 0, bmv = 0
   for (let i = 0; i < P.length - 1; i++) for (let j = i + 1; j < P.length && P[j].t - P[i].t <= burstSec + 1e-6; j++) { const mv = P[j].p - P[i].p; if (Math.abs(mv) > Math.abs(bmv)) { bmv = mv; bi = i; bj = j } }
   const shockAtr = Math.abs(bmv) / o.atr, shockAge = o.nowSec - P[bj].t
-  const shockMeasure = shockMode === 'atr' ? shockAtr : shockMode === 'z' ? Math.abs(bmv) / (o.sigmaSec! * Math.sqrt(Math.max(1, burstSec))) : (Math.abs(bmv) / o.open) * 100
-  const shock = shockMeasure >= shockThr && shockAge <= freshSec
+  const shockMeasureOf = (m: ShockMode): number => m === 'atr' ? shockAtr : m === 'z' ? Math.abs(bmv) / (o.sigmaSec! * Math.sqrt(Math.max(1, burstSec))) : (Math.abs(bmv) / o.open) * 100
+  const shockMeasure = shockMeasureOf(shockMode)
+  const shock = shockModes.every((m) => shockMeasureOf(m) >= shockThrOf(m)) && shockAge <= freshSec
   const shockDir = shock ? Math.sign(bmv) : 0
   // the slow part: the candle's move WITHOUT the burst
   const restNet = shock ? body - bmv : body
@@ -80,7 +90,7 @@ function measure(points: readonly SpPoint[], o: SpOptions): { fail: SpResult } |
   const pressureAtr = Math.abs(restNet) / o.atr
   // R2 + slope of a straight-line fit of the slow part (the burst points left out)
   let r2 = 0, slope = 0
-  if (pressureMode === 'reg') {
+  if (pressureModes.includes('reg')) {
     const R = P.filter((_, k) => !(shock && k > bi && k <= bj))
     const n = R.length
     if (n >= 4) {
@@ -90,13 +100,16 @@ function measure(points: readonly SpPoint[], o: SpOptions): { fail: SpResult } |
       if (sxx > 0 && syy > 0) { slope = sxy / sxx; r2 = (sxy * sxy) / (sxx * syy) }
     }
   }
-  const pressureMeasure = pressureMode === 'atr' ? pressureAtr : pressureMode === 'er' ? eff : pressureMode === 'reg' ? r2 : (Math.abs(restNet) / o.open) * 100
-  const pressure = pressureMode === 'atr' ? pressureAtr >= pressThr && eff >= minEff
-    : pressureMode === 'er' ? eff >= pressThr && pressureAtr >= MIN_BODY_ATR
-    : pressureMode === 'reg' ? r2 >= pressThr && pressureAtr >= MIN_BODY_ATR
-    : pressureMeasure >= pressThr && eff >= minEff
-  const pressureDir = pressure ? (pressureMode === 'reg' ? Math.sign(slope) : Math.sign(restNet)) : 0
-  const base = { pressure, pressureDir, pressureAtr: Math.sign(restNet) * pressureAtr, pressureEff: eff, shock, shockDir, shockAtr: Math.sign(bmv) * shockAtr, shockAge, shockVal: Math.sign(bmv) * shockMeasure, pressureVal: (pressureMode === 'reg' ? Math.sign(slope) : Math.sign(restNet)) * pressureMeasure, shockMode, pressureMode, bodyAtr: body / o.atr, progress, trendDir: o.trend, points: P.length }
+  const pressureMeasureOf = (m: PressureMode): number => m === 'atr' ? pressureAtr : m === 'er' ? eff : m === 'reg' ? r2 : (Math.abs(restNet) / o.open) * 100
+  const pressureMeasure = pressureMeasureOf(pressureMode)
+  const single = pressureModes.length === 1
+  const passes = (m: PressureMode): boolean => m === 'atr' ? pressureAtr >= pressThrOf(m) && eff >= minEff
+    : m === 'er' ? eff >= pressThrOf(m) && pressureAtr >= MIN_BODY_ATR
+    : m === 'reg' ? r2 >= pressThrOf(m) && pressureAtr >= MIN_BODY_ATR && (single || Math.sign(slope) === Math.sign(restNet))
+    : pressureMeasureOf('roc') >= pressThrOf(m) && eff >= minEff
+  const pressure = pressureModes.every(passes)
+  const pressureDir = pressure ? (single && pressureMode === 'reg' ? Math.sign(slope) : Math.sign(restNet)) : 0
+  const base = { pressure, pressureDir, pressureAtr: Math.sign(restNet) * pressureAtr, pressureEff: eff, shock, shockDir, shockAtr: Math.sign(bmv) * shockAtr, shockAge, shockVal: Math.sign(bmv) * shockMeasure, pressureVal: (single && pressureMode === 'reg' ? Math.sign(slope) : Math.sign(restNet)) * pressureMeasure, shockMode, pressureMode, shockModes: shockModes.join('+'), pressureModes: pressureModes.join('+'), bodyAtr: body / o.atr, progress, trendDir: o.trend, points: P.length }
   return { base, pressure, pressureDir, shock, shockDir, shockAtr, pressureAtr, eff, progress }
 }
 

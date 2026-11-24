@@ -645,7 +645,7 @@ export class MetaTraderService {
         if (!id) return fail('no metaStrategyId configured')
         const meta = this.ctx.use<MetaStrategyService>('metaStrategy')
         if (!meta.isValidStrategyId(id)) return fail(`unknown meta-strategy id "${id}"`)
-        const { result, price: p } = meta.evaluate(id, asset, this.config.tf)
+        const { result, price: p } = meta.evaluate(id, asset, this.config.tf, { slot: 'meta' })
         direction = result.direction
         confidence = result.confidence
         price = p
@@ -1089,7 +1089,7 @@ export class MetaTraderService {
     for (const asset of this.candidatePool()) {
       this.attemptedThisTick.add(asset)
       try {
-        const { result, price } = meta.evaluate(id, asset, this.config.tf)
+        const { result, price } = meta.evaluate(id, asset, this.config.tf, { slot: 'meta' })
         if (result.direction === 'none' || !(price > 0)) continue
         if (this.config.direction !== 'both' && result.direction !== this.config.direction) continue
         if (!finGte(result.confidence, this.config.minConfidence)) continue

@@ -43,7 +43,7 @@ import { wilsonLowerBound } from './mslai-stats'
 import { setReplayMode } from './timing'
 import type { RiskOutcome } from './mslrisk'
 import type { Candle, Timeframe } from '../types'
-import { parseStrategyScript, evaluateStrategyScript, clearMslState, setRiskSource, type MslSeriesCtx, type MslSourceRead, type MslAst, type MslPosView, type MslDraw } from './strategylang'
+import { parseStrategyScript, evaluateStrategyScript, clearMslState, setRiskSource, type MslInputValue, type MslSeriesCtx, type MslSourceRead, type MslAst, type MslPosView, type MslDraw } from './strategylang'
 import { META_CONDITION_SOURCES } from './metastrategy'
 import { ALL_SMC_KINDS } from './smc'
 import { EXPIRIES_MIN } from './nextexpiry'
@@ -396,6 +396,7 @@ function fireSignalsInner(
   minConfidence: number,
   runId: string,
   partners?: Record<string, Candle[]>,
+  inputs?: Record<string, MslInputValue>,
 ): FiredSignal[] {
   const fired: FiredSignal[] = []
   const crossTf = makeCrossTf(candles)
@@ -408,7 +409,7 @@ function fireSignalsInner(
       const seriesFor = crossTf(i)
       const state = { keyPrefix: runId, barTimeSec: candles[i].time }
       const live = liveAt(i)
-      const out = evaluateStrategyScript(parsedAst, reads, undefined, series, seriesFor, live, state)
+      const out = evaluateStrategyScript(parsedAst, reads, undefined, series, seriesFor, live, state, undefined, inputs)
       evaluated++
       if (out.error) { if (!errCount++) { firstErr = out.error; firstErrBar = i } continue }
       if (out.direction === 'none') continue
@@ -529,6 +530,8 @@ export interface MslBacktestOpts {
    * for a fire whose script set none. `maxBars` (default 15) is the longest horizon the run reserves history for: a fire asking for more is
    * settled only if its forward bar exists, else excluded (never fabricated). Without this the script's `expiry` is ignored, as before. */
   scriptExpiry?: MslScriptExpiry
+  /** values for the script's `input` statements (a trader slot's edits) so a backtest runs the SAME settings the slot trades with; omit = the script defaults */
+  inputs?: Record<string, MslInputValue>
 }
 
 export interface MslScriptExpiry {
@@ -562,7 +565,7 @@ export function backtestMslScript(candles: Candle[], script: string, opts: MslBa
   // horizon's own trade list is then just a cheap re-settlement of the
   // same fired signals, not a re-run of the script.
   const lastIdx = candles.length - 1 - maxExpiryNeeded
-  const fired = fireSignals(candles, parsed.ast, reads, warmupBars, lastIdx, minConfidence, runId, opts.partners)
+  const fired = fireSignals(candles, parsed.ast, reads, warmupBars, lastIdx, minConfidence, runId, opts.partners, opts.inputs)
 
   const settle = (bars: number, own?: MslScriptExpiry): MslBacktestTrade[] => settleFired(fired, candles, bars, payout, own)
 
@@ -661,7 +664,7 @@ export function backtestMslScriptWalkForward(candles: Candle[], script: string, 
   const barsEvaluated = lastIdx - warmupBars + 1
   const folds = Math.max(1, Math.min(barsEvaluated, Math.round(opts.folds ?? 5)))
 
-  const fired = fireSignals(candles, parsed.ast, reads, warmupBars, lastIdx, minConfidence, runId)
+  const fired = fireSignals(candles, parsed.ast, reads, warmupBars, lastIdx, minConfidence, runId, undefined, opts.inputs)
   const allTrades = settleFired(fired, candles, expiryBars, payout, scriptExpiry)
   const overall = breakdownOf(allTrades, payout)
 
