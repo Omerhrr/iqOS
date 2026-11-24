@@ -26,6 +26,7 @@ import {
 } from 'lightweight-charts'
 import type { AnalysisResult, Candle, ChartType, ExpirySurfaceResponse, IndicatorSeries, IvHvResponse, NextExpiryPrediction, OtcFootprintResult, OutcomeMemoryResponse, Position, PulseBarRow, PulseBarsResponse, TickBarRow, TickFootprintResult, TicksResponse, Timeframe } from '@/lib/os/client'
 import { registerSyncChart } from '@/lib/os/chartSync'
+import { ANCHOR_PRESETS, computeAnchorDiff, type AnchorBar } from '@/lib/os/anchordiff'
 import DrawingLayer from './DrawingLayer'
 import PlanOverlay, { type PlanResp } from './PlanOverlay'
 import { chartPriceFormat, fmtPrice, getDayLevels, getFastLevels, getExpectedMove, runMslDraw, EM_DEFAULT_PARAMS, type ExpectedMoveParams, getExpirySurface, getNextExpiry, getOtcFootprint, getOutcomeMemory, getPulseBars, getTickFootprint, osGet, TIMEFRAME_SECONDS } from '@/lib/os/client'
@@ -1168,6 +1169,24 @@ export default function ChartPanel({
   const [tickFpState, setTickFpState] = useState<TickFootprintResult | null>(null)
   const [pulseState, setPulseState] = useState<PulseBarsResponse | null>(null)
   const [outcomeMemState, setOutcomeMemState] = useState<OutcomeMemoryResponse | null>(null)
+  // Anchor Difference chart: candles measured from the close of the last completed <anchor> period.
+  const [anchorPeriod, setAnchorPeriod] = useState<string>(() => {
+    try {
+      const v = typeof window !== 'undefined' ? window.localStorage.getItem('iqos.anchorDiff.period') : null
+      return v && (ANCHOR_PRESETS as readonly string[]).includes(v) ? v : '4h'
+    } catch {
+      return '4h'
+    }
+  })
+  const pickAnchorPeriod = useCallback((v: string) => {
+    setAnchorPeriod(v)
+    try {
+      window.localStorage.setItem('iqos.anchorDiff.period', v)
+    } catch {
+      // storage unavailable - the choice just isn't remembered
+    }
+  }, [])
+  const anchorDiff = useMemo(() => (chartType === 'anchorDiff' ? computeAnchorDiff(candles, { anchor: anchorPeriod }) : null), [chartType, candles, anchorPeriod])
   const [expirySurfaceState, setExpirySurfaceState] = useState<ExpirySurfaceResponse | null>(null)
   const [liveExpiryState, setLiveExpiryState] = useState<NextExpiryPrediction | null>(null)
   const customCanvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -1417,6 +1436,7 @@ export default function ChartPanel({
     if (chartType === 'linebreak') return lineBreakChart(candles, tfSec, lineBreakCacheRef)
     if (chartType === 'kagi') return kagiChart(candles, tfSec, kagiCacheRef)
     if (chartType === 'effort') return effortBricksChart(candles, effortCacheRef)
+    if (chartType === 'anchorDiff') return (anchorDiff?.bars ?? []).map((b: AnchorBar) => ({ time: b.time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume }))
     if (chartType === 'mrc') return mrcChart(candles)
     if (chartType === 'tickchart') {
       // real /ticks bars when the fetch landed; else fall through to raw
@@ -1427,7 +1447,7 @@ export default function ChartPanel({
       return bars.length ? bars : candles
     }
     return candles
-  }, [candles, chartType, tfSec, tickBarsState])
+  }, [candles, chartType, tfSec, tickBarsState, anchorDiff])
 
   // create/recreate chart when chartType changes; built-in series live & die with the chart
   useEffect(() => {
@@ -1467,7 +1487,7 @@ export default function ChartPanel({
         upColor: 'transparent', downColor: DOWN, borderUpColor: UP, borderDownColor: DOWN, wickUpColor: UP, wickDownColor: DOWN,
         priceLineColor: '#38bdf8',
       })
-    } else if (chartType === 'heikin' || chartType === 'renko' || chartType === 'pointfigure' || chartType === 'rangebars' || chartType === 'volumebars' || chartType === 'tickchart' || chartType === 'linebreak' || chartType === 'kagi' || chartType === 'swing' || chartType === 'effort' || chartType === 'mrc' || chartType === 'outcomeMemory' || chartType === 'spring' || chartType === 'echo') {
+    } else if (chartType === 'heikin' || chartType === 'renko' || chartType === 'pointfigure' || chartType === 'rangebars' || chartType === 'volumebars' || chartType === 'tickchart' || chartType === 'linebreak' || chartType === 'kagi' || chartType === 'swing' || chartType === 'effort' || chartType === 'anchorDiff' || chartType === 'mrc' || chartType === 'outcomeMemory' || chartType === 'spring' || chartType === 'echo') {
       price = chart.addSeries(CandlestickSeries, {
         upColor: UP, downColor: DOWN, borderUpColor: UP, borderDownColor: DOWN, wickUpColor: UP, wickDownColor: DOWN,
         priceLineColor: '#38bdf8',
@@ -1601,6 +1621,10 @@ export default function ChartPanel({
   // new last point's time away from what was last rendered, so it's caught
   // by the same two checks below and safely falls through to setData()
   // rather than silently under-updating.
+  // switching the anchor rewrites EVERY bar (not just the forming one) - force the full rebuild path below
+  useEffect(() => {
+    renderStateRef.current = null
+  }, [anchorPeriod])
   useEffect(() => {
     const price = priceSeriesRef.current
     const vol = volRef.current
@@ -2641,6 +2665,9 @@ export default function ChartPanel({
     for (const p of open) {
       seen.add(p.id)
       const isCall = p.side === 'call'
+      // on the Anchor Difference axis a trade's entry is shown as entry - current anchor
+      const entryPx = chartType === 'anchorDiff' ? p.entryPrice - (anchorDiff?.bars.length ? anchorDiff.bars[anchorDiff.bars.length - 1].anchor : NaN) : p.entryPrice
+      if (!Number.isFinite(entryPx)) continue
       // expiry countdown: bars for binary/turbo (settle on the close of the
       // expiry bar), seconds for digital, none for CFD
       let countdown = ''
@@ -2656,7 +2683,7 @@ export default function ChartPanel({
       const existing = entryLineRefs.current.get(p.id)
       if (existing && existing.series === series && existing.title === title) continue
       if (existing) {
-        if (existing.series === series && existing.price === p.entryPrice) {
+        if (existing.series === series && existing.price === entryPx) {
           existing.line.applyOptions({ title }) // countdown tick - keep the line
           entryLineRefs.current.set(p.id, { ...existing, title })
           continue
@@ -2669,14 +2696,14 @@ export default function ChartPanel({
         entryLineRefs.current.delete(p.id)
       }
       const line = series.createPriceLine({
-        price: p.entryPrice,
+        price: entryPx,
         color: isCall ? UP : DOWN,
         lineWidth: 1,
         lineStyle: LineStyle.Dashed,
         axisLabelVisible: true,
         title,
       })
-      entryLineRefs.current.set(p.id, { series, line, price: p.entryPrice, title })
+      entryLineRefs.current.set(p.id, { series, line, price: entryPx, title })
     }
     for (const [key, entry] of entryLineRefs.current) {
       if (!seen.has(key)) {
@@ -2733,7 +2760,27 @@ export default function ChartPanel({
     }
     tradeMarkersRef.current = markers
     applyMarkers()
-  }, [positions, settledPositions, digitsTicker, chartType, displayCandles, tfSec, ensureMarkerApi, applyMarkers])
+  }, [positions, settledPositions, digitsTicker, chartType, displayCandles, tfSec, ensureMarkerApi, applyMarkers, anchorDiff])
+
+  // Anchor Difference: the zero line IS the anchor (close of the last completed <anchor> period).
+  const zeroLineRef = useRef<{ series: AnyPriceSeries; line: IPriceLine } | null>(null)
+  useEffect(() => {
+    const series = priceSeriesRef.current
+    const want = chartType === 'anchorDiff' && !!series
+    const cur = zeroLineRef.current
+    if (cur && (!want || cur.series !== series)) {
+      try {
+        cur.series.removePriceLine(cur.line)
+      } catch {
+        // chart already torn down
+      }
+      zeroLineRef.current = null
+    }
+    if (!want || !series) return
+    const title = `${anchorPeriod} close`
+    if (zeroLineRef.current) zeroLineRef.current.line.applyOptions({ title })
+    else zeroLineRef.current = { series, line: series.createPriceLine({ price: 0, color: '#94a3b8', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title }) }
+  }, [chartType, anchorPeriod, displayCandles])
 
   const lastCandle = candles[candles.length - 1]
   const lastUp = lastCandle ? lastCandle.close >= lastCandle.open : true
@@ -3691,6 +3738,48 @@ export default function ChartPanel({
       {(chartType === 'footprint' || chartType === 'tpo' || chartType === 'otcfootprint' || chartType === 'tickfootprint' || chartType === 'volumeprofile' || chartType === 'deltaprofile' || chartType === 'pulse' || chartType === 'expiryRadar' || chartType === 'expirySurface') && (
         <div className="absolute inset-x-0 bottom-[30px] top-0 z-[5] bg-[#0b111c]">
           <canvas ref={customCanvasRef} className="block h-full w-full" />
+        </div>
+      )}
+      {chartType === 'anchorDiff' && (
+        <div className="absolute left-2 top-2 z-[5] max-w-[250px] rounded border border-[#1c2739] bg-[#0d1420]/92 px-2.5 py-2 text-[10px] font-mono leading-tight text-[#dbe4f0]">
+          <div className="mb-1 flex items-center justify-between gap-2">
+            <span className="text-[#7c8aa5]">Anchor Difference</span>
+            <span className="flex items-center gap-1">
+              <span className="text-[#4b5a72]">anchor</span>
+              <select
+                value={anchorPeriod}
+                onChange={(e) => pickAnchorPeriod(e.target.value)}
+                className="rounded border border-[#1c2739] bg-[#0b111c] px-1 py-0.5 text-[10px] text-[#e2e8f0] outline-none"
+              >
+                {ANCHOR_PRESETS.map((a) => (
+                  <option key={a} value={a}>
+                    {a}
+                  </option>
+                ))}
+              </select>
+            </span>
+          </div>
+          {anchorDiff && anchorDiff.bars.length ? (
+            (() => {
+              const b = anchorDiff.bars[anchorDiff.bars.length - 1]
+              const f = (v: number, d = 2) => (Number.isFinite(v) ? v.toFixed(d) : '-')
+              const dec = (v: number) => fmtPrice(Math.abs(v), digitsTicker)
+              return (
+                <>
+                  <div>
+                    gap <span className={b.close >= 0 ? 'text-emerald-400' : 'text-rose-400'}>{b.close >= 0 ? '+' : '-'}{dec(b.close)}</span>
+                    {' · '}z <span className={b.z >= 0 ? 'text-emerald-400' : 'text-rose-400'}>{f(b.z)}</span> ATR
+                  </div>
+                  <div className="text-[#7c8aa5]">anchor {fmtPrice(b.anchor, digitsTicker)}{b.rolled ? ' · just rolled' : ''}</div>
+                  <div className="text-[#7c8aa5]">ATR {fmtPrice(b.atr, digitsTicker)} · TR {fmtPrice(b.tr, digitsTicker)}</div>
+                  <div className="text-[#7c8aa5]">ROC {f(b.roc, 0)}% · {f(b.rocAtr)} ATR / {anchorDiff.rocPeriod} bars</div>
+                  <div className="text-[#7c8aa5]">CCI {f(b.cci, 0)} · MFI {f(b.mfi, 0)} · RSI {f(b.rsi, 0)}</div>
+                </>
+              )
+            })()
+          ) : (
+            <div className="text-[#7c8aa5]">Needs more than one {anchorPeriod} period of candles in view - pick a shorter anchor or a longer history.</div>
+          )}
         </div>
       )}
       {chartType === 'outcomeMemory' && outcomeMemState && (

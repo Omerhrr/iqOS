@@ -1610,6 +1610,7 @@ export default function OSPage() {
               deltaprofile: 'deltaprofile', dp: 'deltaprofile', deltavolumeprofile: 'deltaprofile',
               swing: 'swing',
               effort: 'effort', effortbricks: 'effort',
+              anchordiff: 'anchorDiff', anchordifference: 'anchorDiff', anchor: 'anchorDiff', diffchart: 'anchorDiff', differencechart: 'anchorDiff',
               mrc: 'mrc', marketresponse: 'mrc', marketresponsechart: 'mrc',
               outcomememory: 'outcomeMemory', historicaloutcomememory: 'outcomeMemory',
               pulse: 'pulse', pulsevector: 'pulse',

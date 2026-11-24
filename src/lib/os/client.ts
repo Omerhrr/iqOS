@@ -79,6 +79,8 @@ export type ChartType =
   // mrcChart()), mirroring analytics/{effortbricks,mrc}.ts's own math -
   // same pattern as linebreak/kagi above, not re-deriving new UI shapes.
   | 'effort' | 'mrc'
+  // Anchor Difference: candles measured from the close of the last completed 1h/4h/1d... period (lib/os/anchordiff.ts)
+  | 'anchorDiff'
   // Historical Outcome Memory: NOT a bar series - a current-state k-NN
   // read (/outcome_memory) rendered as plain candles + a marker overlay at
   // the matched historical times + a small readout panel (see
@@ -153,6 +155,7 @@ export const CHART_TYPES: { id: ChartType; label: string }[] = [
   { id: 'deltaprofile', label: 'Delta Profile' },
   { id: 'swing', label: 'Swing' },
   { id: 'effort', label: 'Effort Bricks' },
+  { id: 'anchorDiff', label: 'Anchor Difference' },
   { id: 'mrc', label: 'Market Response' },
   { id: 'outcomeMemory', label: 'Outcome Memory' },
   { id: 'pulse', label: 'Pulse-Vector' },

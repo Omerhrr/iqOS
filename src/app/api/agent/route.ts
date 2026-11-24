@@ -120,7 +120,7 @@ function trimAnalysis(a: Record<string, unknown>): Record<string, unknown> {
 const CHART_TYPES = [
   'candles', 'hollow', 'bars', 'line', 'area', 'baseline', 'heikin-ashi', 'renko', 'pointfigure',
   'rangebars', 'volumebars', 'footprint', 'otcfootprint', 'tickfootprint', 'tpo', 'tickchart', 'ivhv',
-  'linebreak', 'kagi', 'kagi-overlay', 'volumeprofile', 'deltaprofile', 'swing', 'effort', 'mrc',
+  'linebreak', 'kagi', 'kagi-overlay', 'volumeprofile', 'deltaprofile', 'swing', 'effort', 'anchor-diff', 'mrc',
   'outcome-memory', 'pulse', 'spring', 'echo', 'expiry-radar', 'expiry-surface',
 ]
 
@@ -2254,6 +2254,7 @@ const TOOLS: ToolSpec[] = [
         deltaprofile: 'deltaprofile', dp: 'deltaprofile', deltavolumeprofile: 'deltaprofile',
         swing: 'swing',
         effort: 'effort', effortbricks: 'effort',
+        anchordiff: 'anchor-diff', anchordifference: 'anchor-diff', anchor: 'anchor-diff', diffchart: 'anchor-diff', differencechart: 'anchor-diff',
         mrc: 'mrc', marketresponse: 'mrc', marketresponsechart: 'mrc',
         outcomememory: 'outcome-memory', historicaloutcomememory: 'outcome-memory',
         pulse: 'pulse', pulsevector: 'pulse',

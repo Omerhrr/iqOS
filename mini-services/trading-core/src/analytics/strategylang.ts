@@ -232,6 +232,7 @@ import { kagi } from './kagi'
 import { computeSwing } from './swing'
 import { tickBars, type TickPoint } from './tickbars'
 import { computeBaseline } from './baseline'
+import { computeAnchorDiff, parseAnchorPeriod } from './anchordiff'
 import { hvSeries, realizedUpProb, ivFromPayout } from './ivhv'
 import { expiryMomentum, priceDisplacement, volAdjustedExpectedMove, reversalRisk, expiryStagnationExhaustion, candleCompletionProbability } from './expiryintel'
 import { detectGaps } from './gap'
@@ -5406,6 +5407,94 @@ function tickbarMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string 
   }
 }
 
+/** `anchor.*` - the Anchor-Difference chart (analytics/anchordiff.ts): candles
+ * measured from the close of the last completed 1h/4h/1d... period instead of
+ * from zero. The anchor period is the FIRST string argument (default "4h"; use
+ * `input anchor = "4h" options "15m","30m","1h","4h","1d","1w"` and pass it,
+ * `anchor.z(anchor)`), an optional SECOND string is the candle timeframe.
+ * Scalar reads take an optional offset like every other namespace (-1 = the latest bar, the default; -2 = the one before). */
+function anchorMethod(name: string, args: MslValue[], ctx: EvalEnv, period: string | undefined, tf: string | undefined): MslValue {
+  if (period !== undefined && parseAnchorPeriod(period) === null)
+    throw new MslRuntimeError(`anchor.${name}(): "${period}" is not an anchor period - use "15m", "30m", "1h", "4h", "1d", "1w" (or any <n>m / <n>h / <n>d, at least 1m)`)
+  const s = requireSeries(ctx, tf)
+  if (!s.time) throw new MslRuntimeError('anchor.*() needs candle times, which this evaluation context does not provide')
+  const rocPeriod = cfgNumLang(ctx, 'anchor.rocPeriod', undefined)
+  const atrPeriod = cfgNumLang(ctx, 'anchor.atrPeriod', undefined)
+  const tms = s.time
+  const cands = seriesToCandles(s).map((c, i) => ({ ...c, time: tms[i] }))
+  const r = computeAnchorDiff(cands, { anchor: period, rocPeriod, atrPeriod })
+  if (!r) throw new MslRuntimeError(`anchor.${name}(): bad anchor period "${period}"`)
+  if (!r.bars.length)
+    throw new MslRuntimeError(`anchor.${name}(): no bar has a completed ${period} anchor before it in this window - the candle history is shorter than one ${period} period (use a smaller anchor, or a longer history)`)
+  const off = (): number => (args.length ? asNum(args[0]) : -1)
+  const bar = () => offsetInto(r.bars, off(), `anchor.${name}`)
+  const num = (v: number): number => (Number.isFinite(v) ? v : 0)
+  const lastN = (g: (b: (typeof r.bars)[number]) => number): MslValue => seriesValue(r.bars.slice(-seriesLookback(args, 50)).map((b) => num(g(b))))
+  switch (name) {
+    case 'ok':
+      return r.bars.length >= 2
+    case 'anchor':
+      return bar().anchor
+    case 'open':
+      return bar().open
+    case 'high':
+      return bar().high
+    case 'low':
+      return bar().low
+    case 'close':
+    case 'diff':
+      return bar().close
+    case 'ohlc': {
+      const b = bar()
+      return barValueFromOHLC(b.open, b.high, b.low, b.close, b.volume)
+    }
+    case 'z':
+      return num(bar().z)
+    case 'tr':
+      return bar().tr
+    case 'atr':
+      return num(bar().atr)
+    case 'roc':
+      return num(bar().roc)
+    case 'rocAtr':
+      return num(bar().rocAtr)
+    case 'cci':
+      return num(bar().cci)
+    case 'mfi':
+      return num(bar().mfi)
+    case 'rsi':
+      return num(bar().rsi)
+    case 'cross':
+      return bar().crossed
+    case 'rolled':
+      return bar().rolled
+    case 'above':
+      return bar().close > 0
+    case 'sinceCross': {
+      let k = 0
+      for (let i = r.bars.length - 1; i >= 0; i--, k++) if (r.bars[i].crossed !== 0) return k
+      return r.bars.length
+    }
+    case 'sinceRoll': {
+      let k = 0
+      for (let i = r.bars.length - 1; i >= 0; i--, k++) if (r.bars[i].rolled) return k
+      return r.bars.length
+    }
+    case 'diffSeries':
+      return lastN((b) => b.close)
+    case 'zSeries':
+      return lastN((b) => b.z)
+    case 'rocSeries':
+      return lastN((b) => b.roc)
+    case 'rocAtrSeries':
+      return lastN((b) => b.rocAtr)
+    default:
+      throw new MslRuntimeError(
+        `unknown anchor method "anchor.${name}(...)" - use ok()/anchor()/open()/high()/low()/close()|diff()/ohlc()/z()/tr()/atr()/roc()/rocAtr()/cci()/mfi()/rsi()/cross()/rolled()/above()/sinceCross()/sinceRoll()/diffSeries(n?)/zSeries(n?)/rocSeries(n?)/rocAtrSeries(n?) (last strings: anchor period, then candle timeframe)`,
+      )
+  }
+}
+
 /** `baseline.*` - the Baseline chart previously had NO backing analytics
  * module at all (claude/msl-capability-matrix.md section G) - see
  * analytics/baseline.ts for the definition (first close in the window). */
@@ -6085,6 +6174,12 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
         return tickbarMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'anchor' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const strs: string[] = []
+        while (args.length && typeof args[args.length - 1] === 'string') strs.unshift(args.pop() as string)
+        return anchorMethod(e.name, args, ctx, strs[0], strs[1])
       }
       if (e.obj.t === 'ident' && e.obj.name === 'baseline' && !(e.obj.name in env)) {
         const args = e.args.map((a) => evalExpr(a, env, ctx))
