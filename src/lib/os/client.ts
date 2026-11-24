@@ -5006,6 +5006,8 @@ export interface JournalSummary {
   byKind: JournalGroupRow[]
   bySide: JournalGroupRow[]
   recent: Position[]
+  /** not-yet-settled trades of the same scope (newest first) */
+  open?: Position[]
 }
 
 export interface BacktestResult {

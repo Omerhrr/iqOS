@@ -8,23 +8,28 @@ import { useCallback, useEffect, useState } from 'react'
 import type { JournalGroupRow, JournalSummary, Position } from '@/lib/os/client'
 import { fmtMoney, fmtTime, osGet } from '@/lib/os/client'
 
-type Scope = 'all' | 'bots' | 'auto' | 'manual'
+export type JournalScope = 'all' | 'bots' | 'auto' | 'meta' | 'omni' | 'manual'
+type Scope = JournalScope
 
 const SCOPES: { id: Scope; label: string }[] = [
   { id: 'all', label: 'All trades' },
   { id: 'bots', label: 'Autopilot' },
   { id: 'auto', label: 'Auto-trader' },
+  { id: 'meta', label: 'Meta' },
+  { id: 'omni', label: 'Omni' },
   { id: 'manual', label: 'Manual' },
 ]
 
-export default function JournalTab() {
-  const [scope, setScope] = useState<Scope>('all')
+/** `fixedScope` pins the journal to one engine (used by the Autopilot engine tabs): no scope switcher, deeper blotter. */
+export default function JournalTab({ fixedScope, title }: { fixedScope?: JournalScope; title?: string } = {}) {
+  const [scope0, setScope] = useState<Scope>('all')
+  const scope: Scope = fixedScope ?? scope0
   const [data, setData] = useState<JournalSummary | null>(null)
   const [error, setError] = useState('')
 
   const load = useCallback(async (s: Scope) => {
     try {
-      const d = await osGet<{ ok: boolean } & JournalSummary>(`/journal`, { scope: s })
+      const d = await osGet<{ ok: boolean } & JournalSummary>(`/journal`, { scope: s, limit: fixedScope ? 300 : 40 })
       if (d.ok) {
         const { ok: _ok, ...summary } = d
         setData(summary)
@@ -33,7 +38,7 @@ export default function JournalTab() {
     } catch (err) {
       setError((err as Error).message)
     }
-  }, [])
+  }, [fixedScope])
 
   useEffect(() => {
     void load(scope)
@@ -47,12 +52,12 @@ export default function JournalTab() {
     <div className="flex h-full min-h-0 flex-col gap-2 rounded-lg border border-[#1c2739] bg-[#0b111c] p-2.5">
       <div className="flex shrink-0 items-center justify-between">
         <h3 className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[#7c8aa5]">
-          Trade Journal
+          {title ?? 'Trade Journal'}
           <span className="ml-2 font-mono text-[9px] normal-case tracking-normal text-[#4b5a72]">
-            realized · last 500 closed
+            {fixedScope ? 'every trade this engine took' : 'realized · last 500 closed'}
           </span>
         </h3>
-        <div className="grid grid-cols-4 gap-0.5 rounded bg-[#101828] p-0.5">
+        {!fixedScope && <div className="grid grid-cols-6 gap-0.5 rounded bg-[#101828] p-0.5">
           {SCOPES.map((s) => (
             <button
               key={s.id}
@@ -64,7 +69,7 @@ export default function JournalTab() {
               {s.label}
             </button>
           ))}
-        </div>
+        </div>}
       </div>
 
       {error && <p className="shrink-0 font-mono text-[10px] text-rose-400">journal unavailable: {error}</p>}
@@ -97,9 +102,33 @@ export default function JournalTab() {
             <GroupTable title="By side" rows={data?.bySide ?? []} />
           </div>
 
+          {/* still-open trades */}
+          {(data?.open?.length ?? 0) > 0 && (
+            <div className="col-span-2">
+              <div className="mb-1 text-[9px] uppercase tracking-wider text-[#4b5a72]">Open now ({data?.open?.length})</div>
+              <div className="overflow-hidden rounded border border-[#1c2739]">
+                <table className="w-full font-mono text-[9px]">
+                  <tbody>
+                    {(data?.open ?? []).map((p) => (
+                      <tr key={p.id} className="border-t border-[#141d2e] text-[#aab6cc] first:border-t-0">
+                        <td className="px-2 py-1 text-[#4b5a72]">{fmtTime(p.tsOpen)}</td>
+                        <td className="px-2 py-1 font-bold text-[#dbe4f0]">{p.asset}</td>
+                        <td className={`px-2 py-1 font-bold ${p.side === 'call' ? 'text-emerald-400' : 'text-rose-400'}`}>{p.side.toUpperCase()}</td>
+                        <td className="px-2 py-1">{p.kind}</td>
+                        <td className="px-2 py-1">${p.amount}</td>
+                        <td className="px-2 py-1 text-amber-300">open</td>
+                        <td className="px-2 py-1 text-[#4b5a72]">{p.strategy ?? ''}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
           {/* recent blotter */}
           <div className="col-span-2">
-            <div className="mb-1 text-[9px] uppercase tracking-wider text-[#4b5a72]">Recent closed trades</div>
+            <div className="mb-1 text-[9px] uppercase tracking-wider text-[#4b5a72]">{fixedScope ? 'Closed trades' : 'Recent closed trades'}</div>
             <div className="overflow-hidden rounded border border-[#1c2739]">
               <table className="w-full font-mono text-[9px]">
                 <thead>
@@ -244,8 +273,17 @@ function RecentRow({ p }: { p: Position }) {
           <span className="rounded bg-cyan-500/10 px-1 py-px text-cyan-300">autopilot</span>
         ) : p.note?.startsWith('auto:') ? (
           <span className="rounded bg-amber-500/10 px-1 py-px text-amber-300">auto-trader</span>
+        ) : p.note?.startsWith('meta:trader') ? (
+          <span className="rounded bg-violet-500/10 px-1 py-px text-violet-300">meta-trader</span>
+        ) : p.note?.startsWith('omni:trader') ? (
+          <span className="rounded bg-emerald-500/10 px-1 py-px text-emerald-300">omni-trader</span>
         ) : (
           p.strategy ?? 'manual'
+        )}
+        {p.strategy && p.note && /^(bot:|auto:|meta:trader|omni:trader)/.test(p.note) && (
+          <span className="ml-1 inline-block max-w-[140px] truncate align-bottom text-[#7c8aa5]" title={p.strategy}>
+            {p.strategy}
+          </span>
         )}
       </td>
     </tr>

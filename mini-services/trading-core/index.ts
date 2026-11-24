@@ -4715,8 +4715,10 @@ const httpServer = createServer(async (req, res) => {
       }
 
       if (path === '/journal') {
-        const store = kernel.context().use<{ journal: (p?: string, l?: number) => unknown[]; stats: () => unknown }>('storeRaw')
-        const scope = q.get('scope') ?? 'all' // all | bots | auto | manual
+        const store = kernel.context().use<{ journal: (p?: string, l?: number) => unknown[]; stats: () => unknown; listPositions: (s: 'open' | 'closed', l?: number) => { note?: string }[] }>('storeRaw')
+        const scope = q.get('scope') ?? 'all' // all | bots | auto | meta | omni | manual
+        const recentLimit = Math.max(10, Math.min(500, Math.round(Number(q.get('limit')) || 40)))
+        const originOf = (note?: string): string => (note ?? '').startsWith('bot:') ? 'autopilot' : (note ?? '').startsWith('auto:') ? 'auto-trader' : (note ?? '').startsWith('meta:trader') ? 'meta-trader' : (note ?? '').startsWith('omni:trader') ? 'omni-trader' : 'manual'
         let trades: {
           tsOpen: number
           tsClose?: number
@@ -4731,9 +4733,11 @@ const httpServer = createServer(async (req, res) => {
         }[]
         if (scope === 'bots') trades = store.journal('bot:', 500) as typeof trades
         else if (scope === 'auto') trades = store.journal('auto:', 500) as typeof trades
+        else if (scope === 'meta') trades = store.journal('meta:trader', 500) as typeof trades
+        else if (scope === 'omni') trades = store.journal('omni:trader', 500) as typeof trades
         else if (scope === 'manual')
           trades = (store.journal(undefined, 800) as typeof trades).filter(
-            (t) => !(t.note ?? '').startsWith('bot:') && !(t.note ?? '').startsWith('auto:')
+            (t) => originOf(t.note) === 'manual'
           )
         else trades = store.journal(undefined, 500) as typeof trades
         const closed = trades.filter((t) => t.status === 'won' || t.status === 'lost')
@@ -4783,13 +4787,22 @@ const httpServer = createServer(async (req, res) => {
           },
           curve,
           byStrategy: group((t) => t.strategy ?? ''),
-          byOrigin: group((t) =>
-            (t.note ?? '').startsWith('bot:') ? 'autopilot' : (t.note ?? '').startsWith('auto:') ? 'auto-trader' : 'manual'
-          ),
+          byOrigin: group((t) => originOf(t.note)),
           byAsset: group((t) => t.asset),
           byKind: group((t) => t.kind),
           bySide: group((t) => t.side),
-          recent: trades.slice(-40).reverse(),
+          recent: trades.slice(-recentLimit).reverse(),
+          // trades of this scope that have not settled yet (newest first)
+          open: (() => {
+            try {
+              return store
+                .listPositions('open', 500)
+                .filter((p) => scope === 'all' || (scope === 'bots' ? originOf(p.note) === 'autopilot' : scope === 'auto' ? originOf(p.note) === 'auto-trader' : scope === 'meta' ? originOf(p.note) === 'meta-trader' : scope === 'omni' ? originOf(p.note) === 'omni-trader' : originOf(p.note) === 'manual'))
+                .slice(0, 100)
+            } catch {
+              return []
+            }
+          })(),
         })
       }
 

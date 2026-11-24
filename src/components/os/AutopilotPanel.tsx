@@ -7,6 +7,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import StrategyInputs from './StrategyInputs'
+import JournalTab from './JournalTab'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -104,6 +105,8 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, m
   const [editorOpen, setEditorOpen] = useState(false)
   type EngineTab = 'bots' | 'auto' | 'meta' | 'omni'
   const [tab, setTab] = useState<EngineTab>('bots')
+  // per engine tab: the live view (strip + inputs) or that engine's own trade history / journal
+  const [view, setView] = useState<Record<string, 'live' | 'history'>>({})
   const [specNames, setSpecNames] = useState<Record<string, string>>({})
   const [atOpen, setAtOpen] = useState(false)
   const [mtOpen, setMtOpen] = useState(false)
@@ -305,7 +308,7 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, m
         </div>
       )}
       {/* auto-trader strip - the OS acting as its own trader in NO-HUMAN mode */}
-      {tab === 'auto' && modeStatus && (
+      {tab === 'auto' && (view.auto ?? 'live') === 'live' && modeStatus && (
        <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-0.5">
         <AutoTraderStrip
           at={modeStatus.autotrader}
@@ -349,7 +352,7 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, m
       {/* meta trader strip - "like the auto-trader, but without its
           frictions" (plugins/metatrader.ts) - a separate, faster executor
           alongside the auto-trader above, gated by the same mode switch */}
-      {tab === 'meta' && metaTraderStatus && (
+      {tab === 'meta' && (view.meta ?? 'live') === 'live' && metaTraderStatus && (
        <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-0.5">
         <MetaTraderStrip
           mt={metaTraderStatus}
@@ -393,7 +396,7 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, m
           sub-bar/tick-reactive, trades exactly one saved SCRIPT meta-strategy
           spec on its own tight wall-clock poll loop instead of waiting for a
           candle close. Same mode gate as autopilot/meta trader above. */}
-      {tab === 'omni' && omniTraderStatus && (
+      {tab === 'omni' && (view.omni ?? 'live') === 'live' && omniTraderStatus && (
        <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-0.5">
         <OmniTraderStrip mt={omniTraderStatus} onConfigure={() => setOtOpen(true)} />
         {omniTraderStatus.config.metaStrategyId ? (
@@ -442,7 +445,32 @@ export default function AutopilotPanel({ bots, assets, strategies, modeStatus, m
         ))}
       </div>
 
-      {tab === 'bots' && (
+      <div className="flex shrink-0 items-center gap-1">
+        {(['live', 'history'] as const).map((v) => (
+          <button
+            key={v}
+            type="button"
+            onClick={() => setView((m) => ({ ...m, [tab]: v }))}
+            className={`rounded px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider ${
+              (view[tab] ?? 'live') === v ? 'bg-[#1c2739] text-cyan-300' : 'text-[#4b5a72] hover:text-[#aab6cc]'
+            }`}
+          >
+            {v === 'live' ? 'Overview' : 'History & journal'}
+          </button>
+        ))}
+      </div>
+
+      {(view[tab] ?? 'live') === 'history' && (
+        <div className="min-h-0 flex-1">
+          <JournalTab
+            key={tab}
+            fixedScope={tab === 'bots' ? 'bots' : tab}
+            title={`${tab === 'bots' ? 'Bots' : tab === 'auto' ? 'Auto Trader' : tab === 'meta' ? 'Meta Trader' : 'Omni Trader'} journal`}
+          />
+        </div>
+      )}
+
+      {tab === 'bots' && (view[tab] ?? 'live') === 'live' && (
        <>
       {/* header */}
       <div className="flex shrink-0 items-center justify-between">
@@ -1729,6 +1757,26 @@ function ExpiryMinutes({ value, onChange }: { value: number | null | undefined; 
   )
 }
 
+/** Small tab strip used inside the three trader config dialogs so a long form is split by topic instead of one scroll. */
+function DialogTabs({ tabs, value, onChange }: { tabs: [string, string][]; value: string; onChange: (k: string) => void }) {
+  return (
+    <div className="sticky top-0 z-10 col-span-2 -mx-1 flex flex-wrap gap-1 border-b border-[#1c2739] bg-[#0b111c] px-1 pb-1.5 pt-1">
+      {tabs.map(([k, label]) => (
+        <button
+          key={k}
+          type="button"
+          onClick={() => onChange(k)}
+          className={`rounded px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider transition-colors ${
+            value === k ? 'bg-cyan-500/15 text-cyan-300' : 'text-[#7c8aa5] hover:bg-[#101828] hover:text-[#dbe4f0]'
+          }`}
+        >
+          {label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
 function Segmented({
   label,
   options,
@@ -2027,6 +2075,7 @@ function AutoTraderDialog({
 }) {
   const [d, setD] = useState<AutoTraderConfig>(config)
   const [busy, setBusy] = useState(false)
+  const [tab, setTab] = useState<string>('market')
   const p = (patch: Partial<AutoTraderConfig>) => setD((prev) => ({ ...prev, ...patch }))
   // OTC Guard policy: a separate backend config (plugins/otcguard.ts), not
   // part of AutoTraderConfig - same "fetch on mount, save immediately on
@@ -2114,6 +2163,9 @@ function AutoTraderDialog({
             <Switch checked={d.enabled} onCheckedChange={(v) => p({ enabled: v })} />
           </div>
 
+          <DialogTabs tabs={[["market", "Market"], ["signal", "Signal"], ["pairs", "Pairs"], ["trade", "Trade"], ["guards", "Guards"]]} value={tab} onChange={setTab} />
+          {tab === 'market' && (
+            <>
           {/* ---------- MARKET ---------- */}
           <div className="col-span-2 mt-1 flex items-center gap-2">
             <span className="text-[9px] font-bold uppercase tracking-[0.18em] text-cyan-400/80">Market</span>
@@ -2181,6 +2233,10 @@ function AutoTraderDialog({
             </p>
           </div>
 
+            </>
+          )}
+          {tab === 'signal' && (
+            <>
           {/* ---------- SIGNAL ---------- */}
           <div className="col-span-2 mt-1 flex items-center gap-2">
             <span className="text-[9px] font-bold uppercase tracking-[0.18em] text-cyan-400/80">Signal</span>
@@ -2471,6 +2527,10 @@ function AutoTraderDialog({
             </div>
           )}
 
+            </>
+          )}
+          {tab === 'pairs' && (
+            <>
           {/* ---------- PAIRS ---------- */}
           <div className="col-span-2 mt-1 flex items-center gap-2">
             <span className="text-[9px] font-bold uppercase tracking-[0.18em] text-cyan-400/80">Pairs</span>
@@ -2507,6 +2567,10 @@ function AutoTraderDialog({
             </p>
           </div>
 
+            </>
+          )}
+          {tab === 'trade' && (
+            <>
           {/* ---------- EXECUTION ---------- */}
           <div className="col-span-2 mt-1 flex items-center gap-2">
             <span className="text-[9px] font-bold uppercase tracking-[0.18em] text-cyan-400/80">Execution</span>
@@ -2741,6 +2805,10 @@ function AutoTraderDialog({
             </>
           )}
 
+            </>
+          )}
+          {tab === 'guards' && (
+            <>
           {/* ---------- PROTECTION ---------- */}
           <div className="col-span-2 mt-1 flex items-center gap-2">
             <span className="text-[9px] font-bold uppercase tracking-[0.18em] text-cyan-400/80">Protection</span>
@@ -2818,6 +2886,8 @@ function AutoTraderDialog({
           <NumField label="Pace s (between trades)" value={d.paceSec} onChange={(v) => p({ paceSec: v })} />
           <NumField label="Daily profit target $ (0 off)" value={d.dailyProfitTarget} onChange={(v) => p({ dailyProfitTarget: v })} />
           <NumField label="Daily loss limit $ (0 off)" value={d.dailyLossLimit} onChange={(v) => p({ dailyLossLimit: v })} />
+            </>
+          )}
         </div>
 
         <DialogFooter className="mt-1 gap-2">
@@ -2955,6 +3025,7 @@ function MetaTraderDialog({
 }) {
   const [d, setD] = useState<MetaTraderConfig>(config)
   const [busy, setBusy] = useState(false)
+  const [tab, setTab] = useState<string>('signal')
   const p = (patch: Partial<MetaTraderConfig>) => setD((prev) => ({ ...prev, ...patch }))
   /** Merge-compound-plan helper, same convention as the auto-trader dialog's own. */
   const planPatch = (over: Partial<MetaStakePlan>): MetaStakePlan =>
@@ -2999,6 +3070,9 @@ function MetaTraderDialog({
             <Switch checked={d.enabled} onCheckedChange={(v) => p({ enabled: v })} />
           </div>
 
+          <DialogTabs tabs={[["signal", "Signal"], ["market", "Market"], ["trade", "Trade"], ["limits", "Limits"]]} value={tab} onChange={setTab} />
+          {tab === 'signal' && (
+            <>
           <div className="col-span-2">
             <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Signal source</Label>
             <div
@@ -3075,15 +3149,10 @@ function MetaTraderDialog({
           ) : (
             <NumField label="Min confidence %" value={d.minConfidence} onChange={(v) => p({ minConfidence: Math.min(100, Math.max(0, v)) })} />
           )}
-          <NumField label="Max open" value={d.maxOpen} onChange={(v) => p({ maxOpen: Math.max(1, Math.round(v)) })} />
-          {d.stakePlan?.kind === 'compound' ? (
-            <NumField label="Seed stake $ (ignored)" value={d.stakePlan.base} onChange={() => {}} />
-          ) : (
-            <NumField label="Stake $" value={d.stake} onChange={(v) => p({ stake: v })} />
+            </>
           )}
-          <NumField label="Cooldown per pair (s)" value={d.cooldownSec} onChange={(v) => p({ cooldownSec: Math.max(0, Math.round(v)) })} />
-          <NumField label="Cooldown, any pair (s)" value={d.globalCooldownSec ?? 0} onChange={(v) => p({ globalCooldownSec: Math.max(0, Math.round(v)) })} />
-          <label className="col-span-2 flex items-center gap-2 text-[10px] text-[#8a99b3]"><input type="checkbox" checked={d.useScriptExpiry === true} onChange={(e) => p({ useScriptExpiry: e.target.checked })} />Use the strategy's own expiry (script <span className="font-mono">expiry = N</span> minutes)</label>
+          {tab === 'market' && (
+            <>
           <div>
             <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Timeframe</Label>
             <select
@@ -3113,6 +3182,44 @@ function MetaTraderDialog({
               ))}
             </select>
           </div>
+          <Segmented
+            label="Feed family"
+            options={[
+              { v: 'all', label: 'All' },
+              { v: 'real', label: 'Real only' },
+              { v: 'otc', label: 'OTC only' },
+            ]}
+            value={d.marketScope}
+            onChange={(v) => p({ marketScope: v as MetaTraderConfig['marketScope'] })}
+          />
+
+          <div className="col-span-2">
+            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Watchlist override (optional)</Label>
+            <Input
+              value={(d.assets ?? []).join(', ')}
+              onChange={(e) =>
+                p({
+                  assets: e.target.value.trim()
+                    ? e.target.value
+                        .split(',')
+                        .map((a) => a.trim().toUpperCase())
+                        .filter(Boolean)
+                    : undefined,
+                })
+              }
+              placeholder="EURUSD, GBPUSD, XAUUSD (comma-separated - leave blank for the default liquid pool)"
+              className="mt-1 h-8 border-[#1c2739] bg-[#101828] font-mono text-[11px] text-[#e2e8f0]"
+            />
+            <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+              Leave blank to scan the same liquid-first default pool, market-wide, as before. Set it to scan ONLY
+              these tickers instead - same override Omni Trader's own watchlist field already gives you.
+            </p>
+          </div>
+            </>
+          )}
+          {tab === 'trade' && (
+            <>
+          <label className="col-span-2 flex items-center gap-2 text-[10px] text-[#8a99b3]"><input type="checkbox" checked={d.useScriptExpiry === true} onChange={(e) => p({ useScriptExpiry: e.target.checked })} />Use the strategy's own expiry (script <span className="font-mono">expiry = N</span> minutes)</label>
           {(d.kind ?? 'binary') === 'binary' || (d.kind ?? 'binary') === 'turbo' ? (
             <div>
               <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Expiry</Label>
@@ -3177,17 +3284,11 @@ function MetaTraderDialog({
               ))}
             </select>
           </div>
-          <Segmented
-            label="Feed family"
-            options={[
-              { v: 'all', label: 'All' },
-              { v: 'real', label: 'Real only' },
-              { v: 'otc', label: 'OTC only' },
-            ]}
-            value={d.marketScope}
-            onChange={(v) => p({ marketScope: v as MetaTraderConfig['marketScope'] })}
-          />
-
+          {d.stakePlan?.kind === 'compound' ? (
+            <NumField label="Seed stake $ (ignored)" value={d.stakePlan.base} onChange={() => {}} />
+          ) : (
+            <NumField label="Stake $" value={d.stake} onChange={(v) => p({ stake: v })} />
+          )}
           <Segmented
             label="Stake plan"
             options={[
@@ -3226,28 +3327,15 @@ function MetaTraderDialog({
             </>
           )}
 
-          <div className="col-span-2">
-            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Watchlist override (optional)</Label>
-            <Input
-              value={(d.assets ?? []).join(', ')}
-              onChange={(e) =>
-                p({
-                  assets: e.target.value.trim()
-                    ? e.target.value
-                        .split(',')
-                        .map((a) => a.trim().toUpperCase())
-                        .filter(Boolean)
-                    : undefined,
-                })
-              }
-              placeholder="EURUSD, GBPUSD, XAUUSD (comma-separated - leave blank for the default liquid pool)"
-              className="mt-1 h-8 border-[#1c2739] bg-[#101828] font-mono text-[11px] text-[#e2e8f0]"
-            />
-            <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
-              Leave blank to scan the same liquid-first default pool, market-wide, as before. Set it to scan ONLY
-              these tickers instead - same override Omni Trader's own watchlist field already gives you.
-            </p>
-          </div>
+            </>
+          )}
+          {tab === 'limits' && (
+            <>
+          <NumField label="Max open" value={d.maxOpen} onChange={(v) => p({ maxOpen: Math.max(1, Math.round(v)) })} />
+          <NumField label="Cooldown per pair (s)" value={d.cooldownSec} onChange={(v) => p({ cooldownSec: Math.max(0, Math.round(v)) })} />
+          <NumField label="Cooldown, any pair (s)" value={d.globalCooldownSec ?? 0} onChange={(v) => p({ globalCooldownSec: Math.max(0, Math.round(v)) })} />
+            </>
+          )}
         </div>
 
         <DialogFooter className="mt-1 gap-2">
@@ -3354,6 +3442,7 @@ function OmniTraderDialog({
 }) {
   const [d, setD] = useState<OmniTraderConfig>(config)
   const [busy, setBusy] = useState(false)
+  const [tab, setTab] = useState<string>('signal')
   const p = (patch: Partial<OmniTraderConfig>) => setD((prev) => ({ ...prev, ...patch }))
   // Same "load on mount" convention Meta Trader's own picker uses.
   const [metaStrategies, setMetaStrategies] = useState<MetaStrategySpec[]>([])
@@ -3401,6 +3490,9 @@ function OmniTraderDialog({
             <Switch checked={d.enabled} onCheckedChange={(v) => p({ enabled: v })} />
           </div>
 
+          <DialogTabs tabs={[["signal", "Signal"], ["market", "Market"], ["trade", "Trade"], ["limits", "Limits"]]} value={tab} onChange={setTab} />
+          {tab === 'signal' && (
+            <>
           <div className="col-span-2">
             <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Meta-strategy SCRIPT spec</Label>
             <select
@@ -3427,12 +3519,10 @@ function OmniTraderDialog({
           </div>
 
           <NumField label="Min confidence %" value={d.minConfidence} onChange={(v) => p({ minConfidence: Math.min(100, Math.max(0, v)) })} />
-          <NumField label="Max open" value={d.maxOpen} onChange={(v) => p({ maxOpen: Math.max(1, Math.round(v)) })} />
-          <NumField label="Stake $" value={d.stake} onChange={(v) => p({ stake: v })} />
-          <NumField label="Cooldown per pair (s)" value={d.cooldownSec} onChange={(v) => p({ cooldownSec: Math.max(0, Math.round(v)) })} />
-          <NumField label="Cooldown, any pair (s)" value={d.globalCooldownSec ?? 0} onChange={(v) => p({ globalCooldownSec: Math.max(0, Math.round(v)) })} />
-          <label className="col-span-2 flex items-center gap-2 text-[10px] text-[#8a99b3]"><input type="checkbox" checked={d.useScriptExpiry === true} onChange={(e) => p({ useScriptExpiry: e.target.checked })} />Use the strategy's own expiry (script <span className="font-mono">expiry = N</span> minutes)</label>
-
+            </>
+          )}
+          {tab === 'market' && (
+            <>
           <div>
             <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Signal timeframe</Label>
             <select
@@ -3483,6 +3573,45 @@ function OmniTraderDialog({
               ))}
             </select>
           </div>
+          <Segmented
+            label="Feed family"
+            options={[
+              { v: 'all', label: 'All' },
+              { v: 'real', label: 'Real only' },
+              { v: 'otc', label: 'OTC only' },
+            ]}
+            value={d.marketScope}
+            onChange={(v) => p({ marketScope: v as OmniTraderConfig['marketScope'] })}
+          />
+
+          <div className="col-span-2">
+            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Watchlist override (optional)</Label>
+            <Input
+              value={assetsText}
+              onChange={(e) =>
+                p({
+                  assets: e.target.value.trim()
+                    ? e.target.value
+                        .split(',')
+                        .map((a) => a.trim().toUpperCase())
+                        .filter(Boolean)
+                    : undefined,
+                })
+              }
+              placeholder="EURUSD, GBPUSD, XAUUSD (comma-separated - leave blank for the default liquid pool)"
+              className="mt-1 h-8 border-[#1c2739] bg-[#101828] font-mono text-[11px] text-[#e2e8f0]"
+            />
+            <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
+              Leave blank for the same liquid-first default pool Meta Trader uses, capped tighter (12 assets) since
+              this engine's whole point is a tight poll loop.
+            </p>
+          </div>
+            </>
+          )}
+          {tab === 'trade' && (
+            <>
+          <label className="col-span-2 flex items-center gap-2 text-[10px] text-[#8a99b3]"><input type="checkbox" checked={d.useScriptExpiry === true} onChange={(e) => p({ useScriptExpiry: e.target.checked })} />Use the strategy's own expiry (script <span className="font-mono">expiry = N</span> minutes)</label>
+
           {(d.kind ?? 'binary') === 'binary' || (d.kind ?? 'binary') === 'turbo' ? (
             <div>
               <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Expiry</Label>
@@ -3544,39 +3673,16 @@ function OmniTraderDialog({
               ))}
             </select>
           </div>
-          <Segmented
-            label="Feed family"
-            options={[
-              { v: 'all', label: 'All' },
-              { v: 'real', label: 'Real only' },
-              { v: 'otc', label: 'OTC only' },
-            ]}
-            value={d.marketScope}
-            onChange={(v) => p({ marketScope: v as OmniTraderConfig['marketScope'] })}
-          />
-
-          <div className="col-span-2">
-            <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Watchlist override (optional)</Label>
-            <Input
-              value={assetsText}
-              onChange={(e) =>
-                p({
-                  assets: e.target.value.trim()
-                    ? e.target.value
-                        .split(',')
-                        .map((a) => a.trim().toUpperCase())
-                        .filter(Boolean)
-                    : undefined,
-                })
-              }
-              placeholder="EURUSD, GBPUSD, XAUUSD (comma-separated - leave blank for the default liquid pool)"
-              className="mt-1 h-8 border-[#1c2739] bg-[#101828] font-mono text-[11px] text-[#e2e8f0]"
-            />
-            <p className="mt-1 text-[8px] leading-relaxed text-[#3d4c66]">
-              Leave blank for the same liquid-first default pool Meta Trader uses, capped tighter (12 assets) since
-              this engine's whole point is a tight poll loop.
-            </p>
-          </div>
+          <NumField label="Stake $" value={d.stake} onChange={(v) => p({ stake: v })} />
+            </>
+          )}
+          {tab === 'limits' && (
+            <>
+          <NumField label="Max open" value={d.maxOpen} onChange={(v) => p({ maxOpen: Math.max(1, Math.round(v)) })} />
+          <NumField label="Cooldown per pair (s)" value={d.cooldownSec} onChange={(v) => p({ cooldownSec: Math.max(0, Math.round(v)) })} />
+          <NumField label="Cooldown, any pair (s)" value={d.globalCooldownSec ?? 0} onChange={(v) => p({ globalCooldownSec: Math.max(0, Math.round(v)) })} />
+            </>
+          )}
         </div>
 
         <DialogFooter className="mt-1 gap-2">
