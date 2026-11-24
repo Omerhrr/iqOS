@@ -1537,9 +1537,9 @@ export default function ChartPanel({
     if (chartType === 'anchorDiff') {
       // Every other series on this chart (indicator overlays, trendlines, expected-move lines...) is in raw PRICE units. Left alone, one of them at 7.3 stretches the
       // axis of a chart whose candles sit around 0 and flattens the candles. Keep them out of the autoscale so the candles always fill the pane.
-      const addSeriesOrig = chart.addSeries.bind(chart) as (...a: unknown[]) => unknown
-      ;(chart as unknown as { addSeries: (...a: unknown[]) => unknown }).addSeries = (def: unknown, opts?: Record<string, unknown>, pane?: unknown) =>
-        addSeriesOrig(def, { ...(opts ?? {}), autoscaleInfoProvider: () => null }, pane)
+      const addSeriesOrig = chart.addSeries.bind(chart) as unknown as (def: unknown, opts: unknown, pane: unknown) => unknown
+      const addSeriesNoScale = (def: unknown, opts: unknown, pane: unknown) => addSeriesOrig(def, { ...((opts as object | undefined) ?? {}), autoscaleInfoProvider: () => null }, pane)
+      ;(chart as unknown as { addSeries: unknown }).addSeries = addSeriesNoScale
     }
 
     // IV vs HV pane: two line series in a separate pane below the price
