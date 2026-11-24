@@ -64,7 +64,7 @@ const series = (cs: typeof candles) => ({ open: cs.map((c) => c.open), high: cs.
 const run = (src: string, cs = candles, inputs?: Record<string, number | boolean | string>) => { const q = parseStrategyScript(src); assert.ok(q.ok, q.ok ? '' : q.error); return evaluateStrategyScript(q.ast, {}, undefined, series(cs), undefined, undefined, undefined, undefined, inputs) }
 test('MSL anchor.* reads match the engine (value for value)', () => {
   const r = computeAnchorDiff(candles, { anchor: '4h' })!, L = r.bars[r.bars.length - 1], P = r.bars[r.bars.length - 2]
-  const chk = (expr: string, v: number) => { const e = run(`call when ${expr} > ${v - 1e-7} and ${expr} < ${v + 1e-7}\nexpiry = 1\n`); assert.equal(e.error, undefined, expr); assert.equal(e.direction, 'call', `${expr} should equal ${v}`) }
+  const chk = (expr: string, v: number) => { const e = run(`call when ${expr} > ${(v - 1e-7).toFixed(9)} and ${expr} < ${(v + 1e-7).toFixed(9)}\nexpiry = 1\n`); assert.equal(e.error, undefined, expr); assert.equal(e.direction, 'call', `${expr} should equal ${v}`) }
   chk('anchor.diff("4h")', L.close); chk('anchor.anchor("4h")', L.anchor); chk('anchor.open("4h")', L.open); chk('anchor.high("4h")', L.high); chk('anchor.low("4h")', L.low)
   chk('anchor.z("4h")', L.z); chk('anchor.atr("4h")', L.atr); chk('anchor.tr("4h")', L.tr); chk('anchor.cci("4h")', L.cci); chk('anchor.rsi("4h")', L.rsi); chk('anchor.mfi("4h")', L.mfi)
   chk('anchor.rocAtr("4h")', L.rocAtr); chk('anchor.diff(-2, "4h")', P.close); chk('anchor.z(-2, "4h")', P.z)
@@ -86,8 +86,66 @@ test('client copy (src/lib/os/anchordiff.ts) matches the kernel engine bar for b
   const cl = { computeAnchorDiff: clientCompute }
   for (const anchor of ['15m', '1h', '4h']) {
     const a = computeAnchorDiff(candles, { anchor, rocPeriod: 5 })!, b = cl.computeAnchorDiff(candles, { anchor, rocPeriod: 5 })!
-    assert.equal(a.bars.length, b.bars.length)
-    a.bars.forEach((x, i) => { for (const k of Object.keys(x) as (keyof typeof x)[]) { const u = x[k], v = (b.bars[i] as Record<string, unknown>)[k]; if (typeof u === 'number') assert.ok((Number.isNaN(u) && Number.isNaN(v as number)) || u === v, `${anchor} bar ${i} ${k}`); else assert.equal(u, v) } })
+    assert.equal(a.bars.length, b.bars.length); assert.deepEqual(a.histogram, b.histogram)
+    a.bars.forEach((x, i) => { for (const k of Object.keys(x) as (keyof typeof x)[]) { const u = x[k], v = (b.bars[i] as Record<string, unknown>)[k]; if (typeof u === 'number') assert.ok((Number.isNaN(u) && Number.isNaN(v as number)) || u === v, `${anchor} bar ${i} ${k}`); else if (typeof u === 'object') assert.deepEqual(u, v); else assert.equal(u, v) } })
   }
+})
+
+// ---- dwell + "what happened next" ----
+// a noisy mean-reverting series long enough that bands collect 20+ settled visits
+const px2: number[] = []
+{ let q = 1.15, seed = 7; const rnd = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+  for (let i = 0; i < 1500; i++) { q += (rnd() - 0.5) * 0.0008 - (q - 1.15) * 0.01; px2.push(q) } }
+const candles2 = px2.map((c, i) => { const o = i ? px2[i - 1] : c; return { time: T0 + i * 60, open: o, high: Math.max(o, c) + 0.0002, low: Math.min(o, c) - 0.0002, close: c, volume: 100 } })
+test('candle direction/body/wicks come from the REAL candle and do not change at a roll', () => {
+  const r = computeAnchorDiff(candles2, { anchor: '1h' })!
+  r.bars.forEach((b) => { const c = candles2.find((x) => x.time === b.time)!; assert.equal(b.dir, c.close > c.open ? 1 : c.close < c.open ? -1 : 0); near(b.body, Math.abs(c.close - c.open) / b.atr); near(b.upWick, (c.high - Math.max(c.open, c.close)) / b.atr); near(b.dnWick, (Math.min(c.open, c.close) - c.low) / b.atr); assert.ok(b.closePos >= 0 && b.closePos <= 1); assert.equal(Math.sign(b.close - b.open), b.dir) })
+})
+test('band = floor(z / bandWidth) and dwell counts consecutive bars in the band', () => {
+  const r = computeAnchorDiff(candles2, { anchor: '1h', bandWidth: 0.25 })!
+  r.bars.forEach((b, i) => { assert.equal(b.band, Math.floor(b.z / 0.25)); const exp = i > 0 && r.bars[i - 1].band === b.band ? r.bars[i - 1].dwell + 1 : 1; assert.equal(b.dwell, exp) })
+})
+test('histogram counts the last `window` closes and its shares sum to 1', () => {
+  const r = computeAnchorDiff(candles2, { anchor: '1h', window: 200 })!
+  assert.equal(r.histogram.reduce((a, h) => a + h.count, 0), 200); near(r.histogram.reduce((a, h) => a + h.share, 0), 1, 1e-9)
+  r.histogram.forEach((h) => assert.equal(h.bull + h.bear <= h.count, true))
+  assert.deepEqual(r.histogram.map((h) => h.band), [...r.histogram.map((h) => h.band)].sort((a, b) => a - b))
+})
+test('what-happened-next matches an independent brute-force count, using only SETTLED visits', () => {
+  const r = computeAnchorDiff(candles2, { anchor: '1h', window: 300 })!
+  const i = r.bars.length - 1, b = r.bars[i]
+  for (const h of [1, 3, 5] as const) {
+    let n = 0, up = 0, bull = 0, mv = 0
+    for (let j = Math.max(0, i - 299); j + h <= i; j++) { const v = r.bars[j]; if (v.band !== b.band) continue; n++; const f = r.bars[j + h]; if (f.price > v.price) up++; if (f.dir > 0) bull++; mv += (f.price - v.price) / v.atr }
+    assert.equal(b.next[h].n, n); if (n >= 20) { assert.equal(b.next[h].ready, true); near(b.next[h].up, up / n); near(b.next[h].bull, bull / n); near(b.next[h].move, mv / n, 1e-9) } else assert.equal(b.next[h].ready, false)
+  }
+})
+test('NO LOOK-AHEAD: every bar\'s fields are identical when the series is cut right after it', () => {
+  const full = computeAnchorDiff(candles2, { anchor: '1h', window: 300 })!
+  for (const cut of [400, 700, 1000, 1300]) {
+    const part = computeAnchorDiff(candles2.slice(0, cut), { anchor: '1h', window: 300 })!
+    const k = part.bars.length - 1, a = part.bars[k], b = full.bars.find((x) => x.time === a.time)!
+    assert.deepEqual(a.next, b.next); assert.deepEqual(a.alike, b.alike); assert.equal(a.band, b.band); assert.equal(a.dwell, b.dwell); near(a.share, b.share); near(a.dwellRank, b.dwellRank)
+  }
+})
+test('a thin sample is neutral (never a percentage from a handful of visits)', () => {
+  const r = computeAnchorDiff(candles.slice(0, 400), { anchor: '1h' })!
+  r.bars.forEach((b) => { for (const h of [1, 3, 5] as const) { if (!b.next[h].ready) { assert.equal(b.next[h].up, 0.5); assert.equal(b.next[h].move, 0) } } })
+})
+test('MSL dwell + next reads match the engine, h must be 1/3/5, config keys are accepted', () => {
+  const r = computeAnchorDiff(candles2, { anchor: '1h' })!, L = r.bars[r.bars.length - 1]
+  const chk = (expr: string, v: number) => { const e = run(`call when ${expr} > ${(v - 1e-7).toFixed(9)} and ${expr} < ${(v + 1e-7).toFixed(9)}\nexpiry = 1\n`, candles2); assert.equal(e.error, undefined, expr); assert.equal(e.direction, 'call', `${expr} should equal ${v}`) }
+  chk('anchor.dir("1h")', L.dir); chk('anchor.body("1h")', L.body); chk('anchor.upWick("1h")', L.upWick); chk('anchor.dnWick("1h")', L.dnWick); chk('anchor.closePos("1h")', L.closePos)
+  chk('anchor.band("1h")', L.band); chk('anchor.dwell("1h")', L.dwell); chk('anchor.share("1h")', L.share); chk('anchor.dwellRank("1h")', L.dwellRank)
+  chk('anchor.visits(3, "1h")', L.next[3].n); chk('anchor.nextUp(3, "1h")', L.next[3].up); chk('anchor.nextBull(5, "1h")', L.next[5].bull); chk('anchor.nextMove(1, "1h")', L.next[1].move)
+  chk('anchor.alikeUp(3, "1h")', L.alike[3].up); chk('anchor.alikeVisits(5, "1h")', L.alike[5].n); chk('anchor.visits(3, -2, "1h")', r.bars[r.bars.length - 2].next[3].n)
+  const bad = run(`call when anchor.nextUp(4, "1h") > 0\nexpiry = 1\n`, candles2); assert.ok(bad.error && /h must be 1, 3 or 5/.test(bad.error))
+  const cfg = run(`configure anchor.bandWidth = 0.5\nconfigure anchor.window = 100\ncall when anchor.band("1h") > -1000\nexpiry = 1\n`, candles2); assert.equal(cfg.error, undefined, cfg.error)
+})
+test('statsTail: the newest bars get identical stats to the full run; older bars are skipped; MSL refuses to read beyond the tail', () => {
+  const full = computeAnchorDiff(candles2, { anchor: '1h' })!, part = computeAnchorDiff(candles2, { anchor: '1h', statsTail: 10 })!
+  for (let k = 1; k <= 10; k++) { const a = full.bars[full.bars.length - k], b = part.bars[part.bars.length - k]; assert.deepEqual(a.next, b.next); assert.deepEqual(a.alike, b.alike); near(a.share, b.share); near(a.dwellRank, b.dwellRank) }
+  assert.equal(part.bars[part.bars.length - 11].next[3].n, 0)
+  const e = run(`call when anchor.visits(3, -60, "1h") > 0\nexpiry = 1\n`, candles2); assert.ok(e.error && /only kept for the newest/.test(e.error))
 })
 console.log(`${pass}/${total}`); if (pass !== total) process.exit(1)

@@ -790,6 +790,107 @@ expiry = expiryMin
 `,
   },
   {
+    id: 'meta:builtin-anchor-fade',
+    name: 'Builtin: Anchor fade (gap from the 1h/4h/1d close, with inputs)',
+    script: `
+# ANCHOR FADE: trade against a stretched move away from an anchor (the close of the last completed 1h / 4h / 1d period).
+# Each candle is measured from the anchor in ATR units (anchor.z). Three setups, pick one with \`setup\`:
+#   "cross"  price just crossed the anchor from at least \`stretch\` ATR away  (the best-looking setup in the first BTC test)
+#   "accel"  the gap is growing fast: rocAtr over the ROC lookback >= stretch, on the same side of the anchor
+#   "gap"    plain stretch: the gap is at least \`stretch\` ATR from the anchor
+# mode "fade" goes against the gap's side, "follow" goes with it (to compare; fading was the one that scored above 50%).
+# NOT PROVEN: the evidence is ~3 days of BTC 1-minute candles, many variants tried, ~55-62% on 3-5 bar holds. Backtest across assets first.
+
+input per = "1h" options "15m", "30m", "1h", "4h", "1d", "1w" "Anchor period"
+input setup = "cross" options "cross", "accel", "gap" "Setup"
+input mode = "fade" options "fade", "follow" "Direction"
+input stretch = 1 min 0.1 max 10 "Stretch (ATR)"
+input lookback = 15 min 2 max 100 "Lookback (bars)"
+input expiryMin = 3 min 1 max 15 "Expiry (minutes)"
+input baseConf = 60 min 1 max 95 "Confidence"
+
+configure anchor.rocPeriod = lookback
+
+let z = anchor.z(per)
+let zPrev = anchor.z(-1 - lookback, per)
+let ra = anchor.rocAtr(per)
+let side = 0
+if setup == "cross" and zPrev * z < 0 and abs(zPrev) >= stretch
+  side = z
+elseif setup == "accel" and ra * z > 0 and abs(ra) >= stretch
+  side = z
+elseif setup == "gap" and abs(z) >= stretch
+  side = z
+end
+let up = side > 0
+let down = side < 0
+if mode == "fade"
+  put when up
+  call when down
+else
+  call when up
+  put when down
+end
+confidence = baseConf
+expiry = expiryMin
+`,
+  },
+  {
+    id: 'meta:builtin-anchor-dwell',
+    name: 'Builtin: Anchor dwell (trade the band whose own history leans)',
+    script: `
+# ANCHOR DWELL: trade the band price is in only when ITS OWN HISTORY leans one way.
+# Price is measured from the anchor (close of the last completed 1h / 4h / 1d period) in ATR units and cut into bands (0.25 ATR wide by default).
+# For the band the close is in now, look at every earlier visit whose outcome has already closed (never the forming candle): after \`h\` bars, what share went up?
+# It only trades when there are at least \`minVisits\` such visits (anchor.ready needs 20) and the up share is >= \`lean\` (call) or <= 1 - lean (put).
+# \`needAlike\` also requires visits that ARRIVED the same way (rising / falling) to lean the same way.
+# NOT PROVEN: this reads statistics of the chart's own recent past; a lean can be luck. Backtest per pair (walk-forward) before trusting it.
+
+input per = "4h" options "15m", "30m", "1h", "4h", "1d", "1w" "Anchor period"
+input hz = "3" options "1", "3", "5" "Look-ahead (bars)"
+input lean = 0.58 min 0.5 max 0.95 "Lean (share of visits)"
+input minVisits = 20 min 20 max 500 "Minimum visits"
+input needAlike = false "Same-arrival visits must agree"
+input expiryMin = 3 min 1 max 15 "Expiry (minutes)"
+
+configure anchor.bandWidth = 0.25
+configure anchor.window = 300
+
+let ok = false
+let u = 0.5
+let n = 0
+let ua = 0.5
+let ra = false
+if hz == "1"
+  ok = anchor.ready(1, per)
+  u = anchor.nextUp(1, per)
+  n = anchor.visits(1, per)
+  ra = anchor.alikeReady(1, per)
+  ua = anchor.alikeUp(1, per)
+elseif hz == "3"
+  ok = anchor.ready(3, per)
+  u = anchor.nextUp(3, per)
+  n = anchor.visits(3, per)
+  ra = anchor.alikeReady(3, per)
+  ua = anchor.alikeUp(3, per)
+else
+  ok = anchor.ready(5, per)
+  u = anchor.nextUp(5, per)
+  n = anchor.visits(5, per)
+  ra = anchor.alikeReady(5, per)
+  ua = anchor.alikeUp(5, per)
+end
+let okAlike = not needAlike or ra
+let go = ok and n >= minVisits and okAlike
+let callAlike = not needAlike or ua >= lean
+let putAlike = not needAlike or ua <= 1 - lean
+call when go and u >= lean and callAlike
+put when go and u <= 1 - lean and putAlike
+confidence = round(abs(u - 0.5) * 200)
+expiry = expiryMin
+`,
+  },
+  {
     id: 'meta:builtin-weiswave',
     name: 'Builtin: Weis wave (effort vs result)',
     script: `

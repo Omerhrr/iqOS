@@ -5413,6 +5413,9 @@ function tickbarMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string 
  * `input anchor = "4h" options "15m","30m","1h","4h","1d","1w"` and pass it,
  * `anchor.z(anchor)`), an optional SECOND string is the candle timeframe.
  * Scalar reads take an optional offset like every other namespace (-1 = the latest bar, the default; -2 = the one before). */
+/** a script reads the newest bars only; computing dwell/next stats for the whole history on every evaluation would make backtests quadratic */
+const ANCHOR_STATS_TAIL = 40
+const ANCHOR_STATS_METHODS = new Set(['share', 'dwellRank', 'visits', 'ready', 'nextUp', 'nextBull', 'nextMove', 'alikeVisits', 'alikeReady', 'alikeUp', 'alikeMove'])
 function anchorMethod(name: string, args: MslValue[], ctx: EvalEnv, period: string | undefined, tf: string | undefined): MslValue {
   if (period !== undefined && parseAnchorPeriod(period) === null)
     throw new MslRuntimeError(`anchor.${name}(): "${period}" is not an anchor period - use "15m", "30m", "1h", "4h", "1d", "1w" (or any <n>m / <n>h / <n>d, at least 1m)`)
@@ -5422,12 +5425,26 @@ function anchorMethod(name: string, args: MslValue[], ctx: EvalEnv, period: stri
   const atrPeriod = cfgNumLang(ctx, 'anchor.atrPeriod', undefined)
   const tms = s.time
   const cands = seriesToCandles(s).map((c, i) => ({ ...c, time: tms[i] }))
-  const r = computeAnchorDiff(cands, { anchor: period, rocPeriod, atrPeriod })
+  const r = computeAnchorDiff(cands, { anchor: period, rocPeriod, atrPeriod, bandWidth: cfgNumLang(ctx, 'anchor.bandWidth', undefined), window: cfgNumLang(ctx, 'anchor.window', undefined), statsTail: ANCHOR_STATS_TAIL })
   if (!r) throw new MslRuntimeError(`anchor.${name}(): bad anchor period "${period}"`)
   if (!r.bars.length)
     throw new MslRuntimeError(`anchor.${name}(): no bar has a completed ${period} anchor before it in this window - the candle history is shorter than one ${period} period (use a smaller anchor, or a longer history)`)
+  const HZ = new Set([1, 3, 5])
+  // h-methods take the horizon first, then an optional offset: anchor.nextUp(3), anchor.nextUp(3, -2)
+  const hz = (): 1 | 3 | 5 => {
+    if (!args.length || !HZ.has(asNum(args[0]))) throw new MslRuntimeError(`anchor.${name}(h): h must be 1, 3 or 5 (bars ahead)`)
+    return asNum(args[0]) as 1 | 3 | 5
+  }
+  const hOff = (): number => {
+    const o = args.length > 1 ? asNum(args[1]) : -1
+    if (-o > ANCHOR_STATS_TAIL) throw new MslRuntimeError(`anchor.${name}(): dwell and next-candle statistics are only kept for the newest ${ANCHOR_STATS_TAIL} bars (offset ${o} is further back)`)
+    return o
+  }
   const off = (): number => (args.length ? asNum(args[0]) : -1)
-  const bar = () => offsetInto(r.bars, off(), `anchor.${name}`)
+  const bar = () => {
+    if (ANCHOR_STATS_METHODS.has(name) && -off() > ANCHOR_STATS_TAIL) throw new MslRuntimeError(`anchor.${name}(): dwell and next-candle statistics are only kept for the newest ${ANCHOR_STATS_TAIL} bars (offset ${off()} is further back)`)
+    return offsetInto(r.bars, off(), `anchor.${name}`)
+  }
   const num = (v: number): number => (Number.isFinite(v) ? v : 0)
   const lastN = (g: (b: (typeof r.bars)[number]) => number): MslValue => seriesValue(r.bars.slice(-seriesLookback(args, 50)).map((b) => num(g(b))))
   switch (name) {
@@ -5480,6 +5497,62 @@ function anchorMethod(name: string, args: MslValue[], ctx: EvalEnv, period: stri
       for (let i = r.bars.length - 1; i >= 0; i--, k++) if (r.bars[i].rolled) return k
       return r.bars.length
     }
+    case 'dir':
+      return bar().dir
+    case 'body':
+      return num(bar().body)
+    case 'upWick':
+      return num(bar().upWick)
+    case 'dnWick':
+      return num(bar().dnWick)
+    case 'closePos':
+      return bar().closePos
+    case 'band':
+      return num(bar().band)
+    case 'dwell':
+      return bar().dwell
+    case 'share':
+      return bar().share
+    case 'dwellRank':
+      return bar().dwellRank
+    case 'approach':
+      return bar().approach
+    case 'visits': {
+      const h = hz()
+      return offsetInto(r.bars, hOff(), 'anchor.visits').next[h].n
+    }
+    case 'ready': {
+      const h = hz()
+      return offsetInto(r.bars, hOff(), 'anchor.ready').next[h].ready
+    }
+    case 'nextUp': {
+      const h = hz()
+      return offsetInto(r.bars, hOff(), 'anchor.nextUp').next[h].up
+    }
+    case 'nextBull': {
+      const h = hz()
+      return offsetInto(r.bars, hOff(), 'anchor.nextBull').next[h].bull
+    }
+    case 'nextMove': {
+      const h = hz()
+      return offsetInto(r.bars, hOff(), 'anchor.nextMove').next[h].move
+    }
+    case 'alikeVisits': {
+      const h = hz()
+      return offsetInto(r.bars, hOff(), 'anchor.alikeVisits').alike[h].n
+    }
+    case 'alikeReady': {
+      const h = hz()
+      return offsetInto(r.bars, hOff(), 'anchor.alikeReady').alike[h].ready
+    }
+    case 'alikeUp': {
+      const h = hz()
+      return offsetInto(r.bars, hOff(), 'anchor.alikeUp').alike[h].up
+    }
+    case 'alikeMove': {
+      const h = hz()
+      return offsetInto(r.bars, hOff(), 'anchor.alikeMove').alike[h].move
+    }
     case 'diffSeries':
       return lastN((b) => b.close)
     case 'zSeries':
@@ -5490,7 +5563,7 @@ function anchorMethod(name: string, args: MslValue[], ctx: EvalEnv, period: stri
       return lastN((b) => b.rocAtr)
     default:
       throw new MslRuntimeError(
-        `unknown anchor method "anchor.${name}(...)" - use ok()/anchor()/open()/high()/low()/close()|diff()/ohlc()/z()/tr()/atr()/roc()/rocAtr()/cci()/mfi()/rsi()/cross()/rolled()/above()/sinceCross()/sinceRoll()/diffSeries(n?)/zSeries(n?)/rocSeries(n?)/rocAtrSeries(n?) (last strings: anchor period, then candle timeframe)`,
+        `unknown anchor method "anchor.${name}(...)" - use ok()/anchor()/open()/high()/low()/close()|diff()/ohlc()/z()/tr()/atr()/roc()/rocAtr()/cci()/mfi()/rsi()/cross()/rolled()/above()/sinceCross()/sinceRoll()/diffSeries(n?)/zSeries(n?)/rocSeries(n?)/rocAtrSeries(n?), dwell: dir()/body()/upWick()/dnWick()/closePos()/band()/dwell()/share()/dwellRank()/approach(), what happened next: visits(h)/ready(h)/nextUp(h)/nextBull(h)/nextMove(h) and alikeVisits(h)/alikeReady(h)/alikeUp(h)/alikeMove(h) with h = 1, 3 or 5 (last strings: anchor period, then candle timeframe)`,
       )
   }
 }

@@ -17,6 +17,17 @@
 //   crossed          +1/-1 when the close crossed the anchor (zero line) on this bar
 //   rolled           true on the first bar of a new anchor period
 //
+//   dir, body        candle direction (+1 bullish / -1 bearish, from the REAL price open vs close) and body size in ATR
+//   upWick, dnWick   wick sizes in ATR; closePos = where the close sits in the candle's range (0 low .. 1 high)
+//   band, dwell      the ATR band (floor(z / bandWidth), default 0.25 ATR) the close is in, and how many bars in a row it has stayed there
+//   share, dwellRank how crowded that band is over the last `window` closes (share of closes, and share / the busiest band's share)
+//   next[h]          WHAT HAPPENED NEXT after earlier visits to the same band (h = 1, 3, 5 bars): n visits, up = share of visits whose
+//                    close h bars later was higher, bull = share of those next candles that closed bullish, move = mean move in ATR.
+//                    Only visits whose h-bar outcome had ALREADY closed by this bar are used (no look-ahead; the forming bar never
+//                    counts toward its own forecast). `ready` needs at least MIN_VISITS visits, otherwise the numbers are neutral
+//                    (up 0.5, move 0) - never a percentage from a handful of cases. `alike` is the same restricted to visits that
+//                    ARRIVED the same way (rising into the band or falling into it, judged over 3 bars).
+//
 // HONESTY about which numbers are "new":
 //   - Inside one anchor period the difference series is the price series shifted
 //     by a constant, so TR, ATR, CCI and RSI of the difference are IDENTICAL to
@@ -59,13 +70,69 @@ export interface AnchorBar {
   rsi: number
   /** +1 close went from below to above the anchor on this bar, -1 the reverse, 0 none */
   crossed: 1 | -1 | 0
+  /** real close price (not a difference) - outcome moves are measured on this so a roll never fakes a move */
+  price: number
+  dir: 1 | -1 | 0
+  /** |close - open| / atr */
+  body: number
+  upWick: number
+  dnWick: number
+  /** (close - low) / (high - low), 0.5 for a zero-range candle */
+  closePos: number
+  /** ATR band index of the close (floor(z / bandWidth)); NaN until ATR exists */
+  band: number
+  /** consecutive bars (including this one) whose close stayed in this band */
+  dwell: number
+  /** share of the last `window` closes that sit in this band (0..1) */
+  share: number
+  /** share / busiest band's share (0..1): 1 = the most crowded band in the window */
+  dwellRank: number
+  /** what happened after earlier visits to this band, per horizon */
+  next: Record<AnchorHorizon, AnchorNext>
+  /** same, restricted to visits that arrived the same way */
+  alike: Record<AnchorHorizon, AnchorNext>
+  /** how the close arrived at its band: +1 rising, -1 falling, 0 flat (z change over 3 bars vs 0.1 band) */
+  approach: 1 | -1 | 0
+}
+
+export type AnchorHorizon = 1 | 3 | 5
+export const ANCHOR_HORIZONS: AnchorHorizon[] = [1, 3, 5]
+export const MIN_VISITS = 20
+
+export interface AnchorNext {
+  /** settled prior visits used */
+  n: number
+  /** n >= MIN_VISITS */
+  ready: boolean
+  /** share of visits whose close h bars later was higher (0.5 when not ready) */
+  up: number
+  /** share of visits whose candle h bars later closed bullish (0.5 when not ready) */
+  bull: number
+  /** mean move over h bars in ATR units, signed (0 when not ready) */
+  move: number
+}
+
+export interface AnchorBand {
+  band: number
+  /** band edges in ATR units */
+  lo: number
+  hi: number
+  count: number
+  bull: number
+  bear: number
+  /** share of window closes */
+  share: number
 }
 
 export interface AnchorDiffResult {
   anchorSec: number
   anchorLabel: string
   rocPeriod: number
+  bandWidth: number
+  window: number
   bars: AnchorBar[]
+  /** closes histogram by ATR band over the last `window` bars up to the newest bar, low band first */
+  histogram: AnchorBand[]
 }
 
 export interface AnchorDiffOptions {
@@ -76,6 +143,12 @@ export interface AnchorDiffOptions {
   cciPeriod?: number
   mfiPeriod?: number
   rsiPeriod?: number
+  /** ATR band width for dwell (default 0.25) */
+  bandWidth?: number
+  /** rolling window of closes for dwell and outcome stats (default 300) */
+  window?: number
+  /** compute share / dwellRank / next / alike only for the newest `statsTail` bars (a script reads the last few; the chart wants all of them). Default: all. */
+  statsTail?: number
 }
 
 /** "15m" | "4h" | "1d" | "1w" | "90s" -> seconds. Null if it is not a period. */
@@ -97,7 +170,9 @@ export function computeAnchorDiff(candles: Candle[], opts: AnchorDiffOptions = {
   const atrP = opts.atrPeriod ?? 14
   const rocP = Math.max(1, Math.round(opts.rocPeriod ?? 5))
   const n = candles.length
-  if (!n) return { anchorSec: P, anchorLabel: String(opts.anchor ?? '4h'), rocPeriod: rocP, bars: [] }
+  const bandW = opts.bandWidth !== undefined && opts.bandWidth > 0 ? opts.bandWidth : 0.25
+  const win = Math.max(20, Math.round(opts.window ?? 300))
+  if (!n) return { anchorSec: P, anchorLabel: String(opts.anchor ?? '4h'), rocPeriod: rocP, bandWidth: bandW, window: win, bars: [], histogram: [] }
   const hi = candles.map((c) => c.high)
   const lo = candles.map((c) => c.low)
   const cl = candles.map((c) => c.close)
@@ -170,8 +245,92 @@ export function computeAnchorDiff(candles: Candle[], opts: AnchorDiffOptions = {
       mfi: mfiS[i],
       rsi: rsiS[i],
       crossed,
+      price: c.close,
+      dir: c.close > c.open ? 1 : c.close < c.open ? -1 : 0,
+      body: Number.isFinite(atrV) && atrV > 0 ? Math.abs(c.close - c.open) / atrV : Number.NaN,
+      upWick: Number.isFinite(atrV) && atrV > 0 ? (c.high - Math.max(c.open, c.close)) / atrV : Number.NaN,
+      dnWick: Number.isFinite(atrV) && atrV > 0 ? (Math.min(c.open, c.close) - c.low) / atrV : Number.NaN,
+      closePos: c.high > c.low ? (c.close - c.low) / (c.high - c.low) : 0.5,
+      band: Number.NaN,
+      dwell: 0,
+      share: 0,
+      dwellRank: 0,
+      next: emptyNext(),
+      alike: emptyNext(),
+      approach: 0,
     })
     idxOf.push(i)
   }
-  return { anchorSec: P, anchorLabel: typeof opts.anchor === 'string' ? opts.anchor : `${P}s`, rocPeriod: rocP, bars }
+  const histogram = enrich(bars, bandW, win, opts.statsTail !== undefined && opts.statsTail > 0 ? Math.max(1, Math.round(opts.statsTail)) : Infinity)
+  return { anchorSec: P, anchorLabel: typeof opts.anchor === 'string' ? opts.anchor : `${P}s`, rocPeriod: rocP, bandWidth: bandW, window: win, bars, histogram }
+}
+
+function emptyNext(): Record<AnchorHorizon, AnchorNext> {
+  const z = (): AnchorNext => ({ n: 0, ready: false, up: 0.5, bull: 0.5, move: 0 })
+  return { 1: z(), 3: z(), 5: z() }
+}
+
+/** dwell (band, run length, crowding) and the no-look-ahead "what happened next" stats; returns the histogram at the newest bar */
+function enrich(bars: AnchorBar[], bw: number, win: number, tail: number): AnchorBand[] {
+  const m = bars.length
+  for (let i = 0; i < m; i++) {
+    const b = bars[i]
+    b.band = Number.isFinite(b.z) ? Math.floor(b.z / bw) : Number.NaN
+    b.dwell = Number.isFinite(b.band) ? (i > 0 && bars[i - 1].band === b.band ? bars[i - 1].dwell + 1 : 1) : 0
+    const back = i >= 3 ? bars[i - 3].z : Number.NaN
+    b.approach = Number.isFinite(back) && Number.isFinite(b.z) ? (b.z - back > 0.1 * bw ? 1 : b.z - back < -0.1 * bw ? -1 : 0) : 0
+  }
+  const statsFrom = Number.isFinite(tail) ? Math.max(0, m - tail) : 0
+  for (let i = statsFrom; i < m; i++) {
+    const b = bars[i]
+    if (!Number.isFinite(b.band)) continue
+    const from = Math.max(0, i - win + 1)
+    const counts = new Map<number, number>()
+    let tot = 0
+    for (let j = from; j <= i; j++) {
+      const k = bars[j].band
+      if (!Number.isFinite(k)) continue
+      counts.set(k, (counts.get(k) ?? 0) + 1)
+      tot++
+    }
+    const mine = counts.get(b.band) ?? 0
+    let max = 0
+    for (const v of counts.values()) if (v > max) max = v
+    b.share = tot ? mine / tot : 0
+    b.dwellRank = max ? mine / max : 0
+    for (const h of ANCHOR_HORIZONS) {
+      let n = 0, up = 0, bull = 0, mv = 0, na = 0, upA = 0, bullA = 0, mvA = 0
+      // a visit j counts only if its h-bar outcome had already closed by bar i (j + h <= i)
+      for (let j = from; j + h <= i; j++) {
+        const v = bars[j]
+        if (v.band !== b.band || !(v.atr > 0)) continue
+        const fut = bars[j + h]
+        const move = fut.price - v.price
+        const isUp = move > 0 ? 1 : 0
+        const isBull = fut.dir > 0 ? 1 : 0
+        n++; up += isUp; bull += isBull; mv += move / v.atr
+        if (v.approach === b.approach) { na++; upA += isUp; bullA += isBull; mvA += move / v.atr }
+      }
+      const fill = (cnt: number, u: number, bl: number, mvs: number): AnchorNext => cnt >= MIN_VISITS ? { n: cnt, ready: true, up: u / cnt, bull: bl / cnt, move: mvs / cnt } : { n: cnt, ready: false, up: 0.5, bull: 0.5, move: 0 }
+      b.next[h] = fill(n, up, bull, mv)
+      b.alike[h] = fill(na, upA, bullA, mvA)
+    }
+  }
+  if (!m) return []
+  const last = bars[m - 1]
+  const from = Math.max(0, m - win)
+  const agg = new Map<number, { count: number; bull: number; bear: number }>()
+  let tot = 0
+  for (let j = from; j < m; j++) {
+    const k = bars[j].band
+    if (!Number.isFinite(k)) continue
+    const e = agg.get(k) ?? { count: 0, bull: 0, bear: 0 }
+    e.count++
+    if (bars[j].dir > 0) e.bull++
+    else if (bars[j].dir < 0) e.bear++
+    agg.set(k, e)
+    tot++
+  }
+  void last
+  return [...agg.entries()].sort((a, b) => a[0] - b[0]).map(([band, e]) => ({ band, lo: band * bw, hi: (band + 1) * bw, count: e.count, bull: e.bull, bear: e.bear, share: tot ? e.count / tot : 0 }))
 }

@@ -274,6 +274,11 @@ export const MSL_READ_CONFIGS: Record<string, MslConfigSpec> = {
   'effort.atrMult': { min: 0.05, max: 20, desc: 'effort-brick ATR multiplier' },
   'effort.mult': { min: 0.1, max: 20, desc: 'effort-brick participation multiplier threshold (a brick confirms when its effortRatio clears this)' },
   'effort.lookback': { min: 2, max: 100, integer: true, desc: 'effort-brick trailing average / regime lookback (bricks)' },
+  // Anchor Difference chart (analytics/anchordiff.ts): the ROC lookback of the gap, the ATR period, the dwell band width (in ATR) and the rolling window of closes.
+  'anchor.rocPeriod': { min: 1, max: 200, integer: true, desc: 'anchor-difference ROC lookback (bars)' },
+  'anchor.atrPeriod': { min: 2, max: 200, integer: true, desc: 'anchor-difference ATR period' },
+  'anchor.bandWidth': { min: 0.05, max: 5, desc: 'anchor-difference dwell band width, in ATR units' },
+  'anchor.window': { min: 20, max: 2000, integer: true, desc: 'anchor-difference rolling window of closes for dwell and next-candle stats' },
   // Market Response Chart (analytics/mrc.ts) - the three event-trigger knobs
   // plus the trailing-average lookback its response/activity reads use.
   'mrc.priceMult': { min: 0.5, max: 200, desc: 'MRC price-event threshold, as a multiple of the trailing average single-step move' },
