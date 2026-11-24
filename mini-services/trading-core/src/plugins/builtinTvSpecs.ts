@@ -606,13 +606,31 @@ expiry = 1
     name: 'Builtin: shock & pressure (sp, ongoing candle)',
     script: `
 # SHOCK & PRESSURE of the candle that is STILL FORMING. Pressure = the body moving slowly (a steady drift); shock = the body moving suddenly (a fast, long burst). Each has its own direction.
-# 1 pressure up + shock up -> LOWER | 2 pressure down + shock down -> HIGHER | 3 pressure up + shock down -> LOWER | 4 pressure down + shock up -> HIGHER | 5 pressure, no shock -> WITH THE TREND.
-# (Cases 1-4 always go AGAINST the pressure; the shock decides whether the setup exists.) It reads the path from live ticks / the 5s chart, so it is LIVE / replay only. It acts in the middle of the candle (progress 0.5-0.9):
-# earlier there is too little path, later too little time. story.spText() is the sentence; story.sp("5m") reads the case-5 trend from the 5m chart.
+# 1 pressure up + shock up -> LOWER | 2 pressure down + shock down -> HIGHER. A shock against the pressure, or no shock, is no call (steady pressure without a shock is SSP, below).
+# (Both cases go AGAINST the pressure; the shock decides whether the setup exists.) It reads the path from live ticks / the 5s chart, so it is LIVE / replay only. It acts in the middle of the candle (progress 0.5-0.9):
+# earlier there is too little path, later too little time. story.spText() is the sentence.
 let s = story.sp()
 let inWindow = s.ok and s.progress >= 0.5 and s.progress <= 0.9
 call when inWindow and s.direction == "call"
 put when inWindow and s.direction == "put"
+expiry = 1
+`,
+  },
+  {
+    id: 'meta:builtin-ssp',
+    name: 'Builtin: SSP (steady pressure, with the trend)',
+    script: `
+# SSP = the old case 5 of shock & pressure, standalone. The forming candle drifts one way steadily (pressure) with NO shock, and price trades WITH THE TREND (EMA20 vs EMA50): CALL in an uptrend, PUT in a downtrend.
+# Reads the path from live ticks / the 5s chart (LIVE / replay only). Acts in the middle of the candle (progress 0.5-0.9). story.ssp("5m") takes the trend from the 5m chart; story.sspText() is the sentence.
+# On BTCUSD 1m the late-candle read looked good mostly because little of the minute is left: replay it against a plain "price moved up so call" baseline before trusting it.
+let s = story.ssp()
+let inWindow = s.ok and s.progress >= 0.5 and s.progress <= 0.9
+
+if inWindow and s.direction == "call"
+  call when true
+elseif inWindow and s.direction == "put"
+  put when true
+end
 expiry = 1
 `,
   },

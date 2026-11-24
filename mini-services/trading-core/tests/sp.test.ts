@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { readSp, type SpPoint } from '../src/analytics/sp'
+import { readSp, readSsp, type SpPoint } from '../src/analytics/sp'
 let pass = 0, total = 0
 const test = (n: string, f: () => void) => { total++; try { f(); console.log('ok ', n); pass++ } catch (e) { console.log('FAIL', n, (e as Error).message) } }
 const T0 = 1_700_000_000
@@ -10,11 +10,23 @@ test('1 pressure up + shock up -> put', () => { const r = run(path(0.03, 6, [0.3
 test('2 pressure down + shock down -> call', () => { const r = run(path(-0.03, 6, [-0.35, -0.2])); assert.equal(r.caseNo, 2); assert.equal(r.direction, 'call') })
 test('3 pressure up + shock down -> no call (case removed)', () => { const r = run(path(0.04, 6, [-0.3, -0.25])); assert.equal(r.shockDir, -1); assert.equal(r.pressureDir, 1); assert.equal(r.caseNo, 0); assert.equal(r.direction, 'none') })
 test('4 pressure down + shock up -> no call (case removed)', () => { const r = run(path(-0.04, 6, [0.3, 0.25])); assert.equal(r.caseNo, 0); assert.equal(r.direction, 'none') })
-test('5 pressure, no shock -> with the trend (up)', () => { const r = run(path(0.03, 10), 1); assert.equal(r.shock, false); assert.equal(r.caseNo, 5); assert.equal(r.direction, 'call') })
-test('5 pressure, no shock -> with the trend (down trend, up pressure still trades the TREND)', () => { const r = run(path(0.03, 10), -1); assert.equal(r.caseNo, 5); assert.equal(r.direction, 'put') })
-test('5 no clear trend -> no call', () => { const r = run(path(0.03, 10), 0); assert.equal(r.direction, 'none'); assert.match(r.text, /no clear trend/) })
+const runSsp = (pts: SpPoint[], trend = 0, extra = {}) => readSsp(pts, { open: 100, openSec: T0, nowSec: pts[pts.length - 1].t, tfSec: 60, atr: 1, trend, ...extra })
+test('sp: pressure with NO shock is no call any more (case 5 moved to SSP)', () => { const r = run(path(0.03, 10), 1); assert.equal(r.shock, false); assert.equal(r.caseNo, 0); assert.equal(r.direction, 'none') })
+test('ssp: pressure, no shock -> with the trend (up)', () => { const r = runSsp(path(0.03, 10), 1); assert.equal(r.shock, false); assert.equal(r.caseNo, 5); assert.equal(r.direction, 'call') })
+test('ssp: down trend, up pressure still trades the TREND', () => { const r = runSsp(path(0.03, 10), -1); assert.equal(r.caseNo, 5); assert.equal(r.direction, 'put') })
+test('ssp: no clear trend -> no call', () => { const r = runSsp(path(0.03, 10), 0); assert.equal(r.direction, 'none'); assert.match(r.text, /no clear trend/) })
+test('ssp: a shock present -> no call (that is story.sp)', () => { const r = runSsp(path(0.03, 6, [0.35, 0.2]), 1); assert.equal(r.direction, 'none') })
 test('no pressure (flat) -> no call even with a shock', () => { const pts = path(0, 6, [0.4, 0.2]); const r = run(pts); assert.equal(r.direction, 'none') })
 test('choppy path has no steady pressure', () => { const pts: SpPoint[] = []; let p = 100; for (let i = 1; i <= 10; i++) { p += i % 2 ? 0.12 : -0.12; pts.push({ t: T0 + i * 5, p }) } assert.equal(run(pts, 1).pressure, false) })
 test('an old burst is history, not the ongoing shock', () => { const pts: SpPoint[] = []; let p = 100; pts.push({ t: T0 + 5, p: (p += 0.5) }); pts.push({ t: T0 + 10, p: (p += 0.2) }); for (let i = 3; i <= 12; i++) pts.push({ t: T0 + i * 5, p: (p += 0.02) }); const r = run(pts, 1); assert.equal(r.shock, false) })
 test('too little path is a clean error', () => { const r = run([{ t: T0 + 5, p: 100.1 }]); assert.equal(r.ok, false) })
+// ---- selectable measures: shock = atr | z | roc, pressure = atr | er | reg | roc ----
+test('shock=z needs volatility, fires on a big burst in sigma units', () => { const pts = path(0.03, 6, [0.35, 0.2]); const bad = run(pts, 0, { shockMode: 'z' }); assert.equal(bad.ok, false); const r = run(pts, 0, { shockMode: 'z', sigmaSec: 0.02 }); assert.equal(r.ok, true); assert.equal(r.shock, true); assert.equal(r.shockMode, 'z'); assert.ok(Math.abs(r.shockVal) >= 3) })
+test('shock=z: a calm burst under 3 sigma is no shock', () => { const r = run(path(0.03, 6, [0.35, 0.2]), 0, { shockMode: 'z', sigmaSec: 0.5 }); assert.equal(r.shock, false) })
+test('shock=roc: burst as % of the open', () => { const pts = path(0.03, 6, [0.35, 0.2]); assert.equal(run(pts, 0, { shockMode: 'roc', shockThr: 0.3 }).shock, true); assert.equal(run(pts, 0, { shockMode: 'roc', shockThr: 5 }).shock, false) })
+test('pressure=er: smooth drift passes, choppy fails', () => { assert.equal(run(path(0.03, 10), 0, { pressureMode: 'er' }).pressure, true); const pts: SpPoint[] = []; let p = 100; for (let i = 1; i <= 10; i++) { p += i % 2 ? 0.2 : -0.18; pts.push({ t: T0 + i * 5, p }) } assert.equal(run(pts, 0, { pressureMode: 'er' }).pressure, false) })
+test('pressure=reg: straight line has R2 ~1 and the slope sets the side', () => { const up = run(path(0.03, 10), 0, { pressureMode: 'reg' }); assert.equal(up.pressure, true); assert.equal(up.pressureDir, 1); assert.ok(up.pressureVal > 0.95); const dn = run(path(-0.03, 10), 0, { pressureMode: 'reg' }); assert.equal(dn.pressureDir, -1) })
+test('pressure=roc: slow move as % of the open', () => { assert.equal(run(path(0.03, 10), 0, { pressureMode: 'roc', pressureThr: 0.1 }).pressure, true); assert.equal(run(path(0.03, 10), 0, { pressureMode: 'roc', pressureThr: 5 }).pressure, false) })
+test('ssp honours the pressure measure too', () => { const r = runSsp(path(0.03, 10), 1, { pressureMode: 'er' }); assert.equal(r.direction, 'call'); assert.match(r.text, /efficiency/) })
+test('default modes are unchanged (atr / atr)', () => { const r = run(path(0.03, 6, [0.35, 0.2])); assert.equal(r.shockMode, 'atr'); assert.equal(r.pressureMode, 'atr'); assert.equal(r.caseNo, 1) })
 console.log(`${pass}/${total}`); if (pass !== total) process.exit(1)

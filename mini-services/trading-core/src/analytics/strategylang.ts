@@ -258,7 +258,7 @@ import { readEm, emUpper, emLower, emZ, emSigmaAt, emModeFromCode, emParams, EM_
 import { detectChartPatterns2, readAutoTrend, readElliott, CP_MIN_BARS, type CpHit, type AutoTrend, type EwRead } from './patternengine'
 import { readPmm } from './pmm'
 import { stepSage, sageKey, sageRec, sageStats, sageText } from './sage'
-import { readSp, type SpPoint } from './sp'
+import { readSp, readSsp, type SpPoint, type ShockMode, type PressureMode } from './sp'
 import { stepLimit, limitKey, limitRec, limitText, buildLevelBook, type LimitMode } from './sagelimit'
 import { stepHold, holdKey, holdRec, clearHolds, inReplay, replayBypassOn, stepBypass, clearBypass } from './timing'
 import { liveRiskOutcomes, riskStats, sessionAt, minsIn, minsLeft, inWindow, inDates, weekendAt, type RiskOutcome } from './mslrisk'
@@ -5775,7 +5775,7 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         if (e.name === 'mtf') return storyMtf(args, ctx)
         if (e.name === 'pm' || e.name === 'pmText' || e.name === 'otcpm' || e.name === 'otcpmText') return storyPm(e.name, args, ctx)
         if (e.name === 'pmm' || e.name === 'pmmText' || e.name === 'otcpmm') return storyPmm(e.name, args, ctx)
-        if (e.name === 'sp' || e.name === 'spText') return storySp(e.name, args, ctx)
+        if (e.name === 'sp' || e.name === 'spText' || e.name === 'ssp' || e.name === 'sspText') return storySp(e.name, args, ctx)
         if (e.name === 'weather' || e.name === 'weatherText' || e.name === 'editor' || e.name === 'editorText') return storyEditor(e.name, args, ctx)
         if (e.name === 'nm' || e.name === 'nmText' || e.name === 'otcnm') return storyNm(e.name, args, ctx)
         if (e.name === 'cfd' || e.name === 'cfdText' || e.name === 'otccfd') return storyCfd(e.name, args, ctx)
@@ -6632,20 +6632,49 @@ function storyPmm(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
     room: r.room, withStructure: r.withStructure, againstStructure: r.againstStructure, atSupport: trig.sr.atSupport, atResistance: trig.sr.atResistance, text: r.text })
 }
 
-/** `story.sp([trendTf], [shockAtr], [pressureAtr], [burstSec])` - SHOCK & PRESSURE of the candle that is STILL FORMING (analytics/sp.ts). PRESSURE = the body moving slowly (a steady drift), SHOCK = the body moving suddenly (a fast
- * burst), each with its own direction. The three cases: 1 pressure up + shock up -> put | 2 pressure down + shock down -> call | 5 pressure without a shock -> WITH THE
- * TREND. Flat bundle: ok error direction (call|put|none) case (0..5) pressure shock (booleans) pressureDir shockDir (+1/-1/0) pressureAtr shockAtr (signed, ATR14) pressureEff shockAge bodyAtr progress (0..1 of the candle) trendDir points text.
- * The trend for case 5 is EMA20 vs EMA50 of the chart (or of trendTf, e.g. story.sp("5m")). Reads the candle path from live ticks (omni-trader) else the 5s chart; fails closed without either. story.spText() the sentence.
+/** `story.sp([trendTf], [shockAtr], [pressureAtr], [burstSec], [atrPeriod])` - SHOCK & PRESSURE of the candle that is STILL FORMING (analytics/sp.ts). PRESSURE = the body moving slowly (a steady drift), SHOCK = the body moving suddenly (a fast
+ * burst), each with its own direction. The two cases: 1 pressure up + shock up -> put | 2 pressure down + shock down -> call. A shock against the pressure, or no shock, is no call (steady pressure without a shock is story.ssp()).
+ * Flat bundle: ok error direction (call|put|none) case (0|1|2) pressure shock (booleans) pressureDir shockDir (+1/-1/0) pressureAtr shockAtr (signed, in ATR of period atrPeriod, default 14) pressureEff shockAge bodyAtr progress (0..1 of the candle) trendDir points text.
+ * trendTf (e.g. story.sp("5m")) is only used by story.ssp(). Reads the candle path from live ticks (omni-trader) else the 5s chart; fails closed without either. story.spText() the sentence.
+ * HOW IT IS MEASURED is selectable with option strings: "shock=atr" (default, burst / ATR, thr 0.30) | "shock=z" (burst as a z-score of the pair's realised vol, thr 3) | "shock=roc" (burst as % of the open, thr 0.03); "pressure=atr" (default, slow move / ATR plus efficiency, thr 0.12) | "pressure=er" (Kaufman efficiency ratio, thr 0.5) | "pressure=reg" (R2 of a straight-line fit, thr 0.7) | "pressure=roc" (slow move as % of the open plus efficiency, thr 0.02). The numeric arguments are thresholds IN THE UNIT OF THE CHOSEN MEASURE, e.g. story.sp("shock=z", "pressure=er", 3.5, 0.6). Extra bundle fields: shockVal pressureVal (signed, in that unit) shockMode pressureMode.
  * HONESTY: thresholds are judgement (shock >= 0.30 ATR inside 10 s and fresh; pressure >= 0.12 ATR and steady) - replay it before trading it. */
+/** `story.ssp([trendTf], [pressureAtr], [burstSec], [atrPeriod])` - SSP, the old case 5 of story.sp as its OWN model: steady pressure on the forming candle with NO shock, traded WITH THE TREND (EMA20 vs EMA50 of the chart or of trendTf). Same bundle as story.sp (case is 5 when it fires, 0 otherwise). atrPeriod (whole number 1..200, default 14) sets the ATR the thresholds are measured in; numbers are positional, so pass the earlier ones to reach it, e.g. story.ssp("5m", 0.12, 10, 5). story.sspText() the sentence. Takes the same option strings as story.sp (shock=, pressure=; only the pressure one matters for SSP, a shock cancels it). Needs the same live ticks / 5s chart as story.sp. */
+/** `story.ssp([trendTf], [pressureAtr], [burstSec], [atrPeriod])` - SSP, the old case 5 of story.sp as its OWN model: steady pressure on the forming candle with NO shock, traded WITH THE TREND (EMA20 vs EMA50 of the chart or of trendTf). Same bundle as story.sp (case is 5 when it fires, 0 otherwise). atrPeriod (whole number 1..200, default 14) sets the ATR the thresholds are measured in; numbers are positional, so pass the earlier ones to reach it, e.g. story.ssp("5m", 0.12, 10, 5). story.sspText() the sentence. Needs the same live ticks / 5s chart as story.sp. */
 function storySp(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
-  const strs = args.filter((a): a is string => typeof a === 'string')
+  const allStrs = args.filter((a): a is string => typeof a === 'string')
+  // option strings "shock=atr|z|roc" and "pressure=atr|er|reg|roc" pick how the shock / the pressure is MEASURED; every other string is the trend timeframe
+  const optStrs = allStrs.filter((a) => /^\w+=/.test(a))
+  const strs = allStrs.filter((a) => !/^\w+=/.test(a))
+  let shockMode: ShockMode = 'atr', pressureMode: PressureMode = 'atr'
+  for (const o of optStrs) {
+    const [k, v] = o.split('=')
+    if (k === 'shock' && (v === 'atr' || v === 'z' || v === 'roc')) shockMode = v
+    else if (k === 'pressure' && (v === 'atr' || v === 'er' || v === 'reg' || v === 'roc')) pressureMode = v
+    else throw new MslRuntimeError(`story.sp()/ssp(): unknown option "${o}" - use shock=atr|z|roc and pressure=atr|er|reg|roc`)
+  }
   const nums = args.filter((a): a is number => typeof a === 'number')
   const s = requireSeries(ctx, undefined)
   const span = barSpacingSec(s)
   const nowSec = evalNowMs(ctx) / 1000
   const openSec = Math.floor(nowSec / span) * span
-  const a14 = atrInd(s.high, s.low, s.close, 14)
+  const isSsp = name === 'ssp' || name === 'sspText'
+  // optional trailing ATR period: story.sp([trendTf], [shockAtr], [pressureAtr], [burstSec], [atrPeriod]) / story.ssp([trendTf], [pressureAtr], [burstSec], [atrPeriod]); default 14
+  const periodArg = nums[isSsp ? 2 : 3]
+  const atrPeriod = periodArg === undefined ? 14 : Math.round(periodArg)
+  if (!Number.isFinite(atrPeriod) || atrPeriod < 1 || atrPeriod > 200) throw new MslRuntimeError(`story.${isSsp ? 'ssp' : 'sp'}() ATR period must be a whole number from 1 to 200 (default 14)`)
+  const a14 = atrInd(s.high, s.low, s.close, atrPeriod)
   const atrv = a14[a14.length - 1]
+  // realised volatility per second from the closed bars (stdev of close-to-close change over the last max(20, atrPeriod) bars), for shock=z
+  let sigmaSec = NaN
+  {
+    const n = Math.min(s.close.length - 1, Math.max(20, atrPeriod))
+    if (n >= 5) {
+      const d: number[] = []
+      for (let k = s.close.length - n; k < s.close.length; k++) d.push(s.close[k] - s.close[k - 1])
+      const m = d.reduce((a, b) => a + b, 0) / d.length
+      sigmaSec = Math.sqrt(d.reduce((a, b) => a + (b - m) * (b - m), 0) / (d.length - 1)) / Math.sqrt(span)
+    }
+  }
   const pts: SpPoint[] = []
   let open = NaN
   const ticks = ctx.liveTicks
@@ -6664,9 +6693,12 @@ function storySp(name: string, args: MslValue[], ctx: EvalEnv): MslValue {
   const e20 = emaInd(trendSeries.close, 20), e50 = emaInd(trendSeries.close, 50)
   const tc = trendSeries.close[trendSeries.close.length - 1], a = e20[e20.length - 1], b = e50[e50.length - 1]
   const trend = Number.isFinite(a) && Number.isFinite(b) ? (a > b && tc > b ? 1 : a < b && tc < b ? -1 : 0) : 0
-  const r = readSp(pts, { open, openSec, nowSec, tfSec: span, atr: atrv, trend, ...(nums[0] !== undefined ? { shockAtr: nums[0] } : {}), ...(nums[1] !== undefined ? { pressureAtr: nums[1] } : {}), ...(nums[2] !== undefined ? { burstSec: nums[2] } : {}) })
-  if (name === 'spText') return r.text
-  return bundleValue({ ok: r.ok, error: r.ok ? '' : (r.error ?? ''), direction: r.direction, case: r.caseNo, pressure: r.pressure, shock: r.shock, pressureDir: r.pressureDir, shockDir: r.shockDir, pressureAtr: r.pressureAtr, shockAtr: r.shockAtr,
+  const optsIn = isSsp
+    ? { open, openSec, nowSec, tfSec: span, atr: atrv, trend, shockMode, pressureMode, sigmaSec, ...(nums[0] !== undefined ? { pressureThr: nums[0] } : {}), ...(nums[1] !== undefined ? { burstSec: nums[1] } : {}) }
+    : { open, openSec, nowSec, tfSec: span, atr: atrv, trend, shockMode, pressureMode, sigmaSec, ...(nums[0] !== undefined ? { shockThr: nums[0] } : {}), ...(nums[1] !== undefined ? { pressureThr: nums[1] } : {}), ...(nums[2] !== undefined ? { burstSec: nums[2] } : {}) }
+  const r = (isSsp ? readSsp : readSp)(pts, optsIn)
+  if (name === 'spText' || name === 'sspText') return r.text
+  return bundleValue({ ok: r.ok, error: r.ok ? '' : (r.error ?? ''), direction: r.direction, case: r.caseNo, pressure: r.pressure, shock: r.shock, shockVal: r.shockVal, pressureVal: r.pressureVal, shockMode: r.shockMode, pressureMode: r.pressureMode, pressureDir: r.pressureDir, shockDir: r.shockDir, pressureAtr: r.pressureAtr, shockAtr: r.shockAtr,
     pressureEff: r.pressureEff, shockAge: Number.isFinite(r.shockAge) ? r.shockAge : -1, bodyAtr: r.bodyAtr, progress: Math.min(1, r.progress), trendDir: r.trendDir, points: r.points, text: r.text })
 }
 
