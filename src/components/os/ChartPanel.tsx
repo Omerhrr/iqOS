@@ -1186,7 +1186,7 @@ export default function ChartPanel({
       // storage unavailable - the choice just isn't remembered
     }
   }, [])
-  const anchorDiff = useMemo(() => (chartType === 'anchorDiff' ? computeAnchorDiff(candles, { anchor: anchorPeriod }) : null), [chartType, candles, anchorPeriod])
+  const anchorDiff = useMemo(() => (chartType === 'anchorDiff' ? computeAnchorDiff(candles, { anchor: anchorPeriod, statsTail: 1 }) : null), [chartType, candles, anchorPeriod])
   const [expirySurfaceState, setExpirySurfaceState] = useState<ExpirySurfaceResponse | null>(null)
   const [liveExpiryState, setLiveExpiryState] = useState<NextExpiryPrediction | null>(null)
   const customCanvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -1534,6 +1534,13 @@ export default function ChartPanel({
     }
     price.applyOptions({ priceFormat: priceFmt })
     priceSeriesRef.current = price
+    if (chartType === 'anchorDiff') {
+      // Every other series on this chart (indicator overlays, trendlines, expected-move lines...) is in raw PRICE units. Left alone, one of them at 7.3 stretches the
+      // axis of a chart whose candles sit around 0 and flattens the candles. Keep them out of the autoscale so the candles always fill the pane.
+      const addSeriesOrig = chart.addSeries.bind(chart) as (...a: unknown[]) => unknown
+      ;(chart as unknown as { addSeries: (...a: unknown[]) => unknown }).addSeries = (def: unknown, opts?: Record<string, unknown>, pane?: unknown) =>
+        addSeriesOrig(def, { ...(opts ?? {}), autoscaleInfoProvider: () => null }, pane)
+    }
 
     // IV vs HV pane: two line series in a separate pane below the price
     // (lightweight-charts v5 panes). Live/die with the chart; the data
@@ -2762,53 +2769,6 @@ export default function ChartPanel({
     applyMarkers()
   }, [positions, settledPositions, digitsTicker, chartType, displayCandles, tfSec, ensureMarkerApi, applyMarkers, anchorDiff])
 
-  // Anchor Difference: dwell histogram drawn down the right edge, aligned with the price axis (thick = price stays there, thin = it rushes through).
-  const anchorHistRef = useRef<HTMLCanvasElement | null>(null)
-  useEffect(() => {
-    if (chartType !== 'anchorDiff') return
-    const draw = () => {
-      const cv = anchorHistRef.current
-      const series = priceSeriesRef.current
-      if (!cv || !series || !anchorDiff || !anchorDiff.bars.length) return
-      const w = cv.clientWidth
-      const h = cv.clientHeight
-      if (!w || !h) return
-      const dpr = window.devicePixelRatio || 1
-      if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
-        cv.width = Math.round(w * dpr)
-        cv.height = Math.round(h * dpr)
-      }
-      const ctx = cv.getContext('2d')
-      if (!ctx) return
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-      ctx.clearRect(0, 0, w, h)
-      const lastBar = anchorDiff.bars[anchorDiff.bars.length - 1]
-      const atrNow = lastBar.atr
-      if (!(atrNow > 0)) return
-      const hist = anchorDiff.histogram
-      const maxCount = hist.reduce((m, b) => Math.max(m, b.count), 1)
-      for (const b of hist) {
-        const y1 = series.priceToCoordinate(b.hi * atrNow)
-        const y0 = series.priceToCoordinate(b.lo * atrNow)
-        if (y1 === null || y0 === null) continue
-        const top = Math.min(y0, y1)
-        const bh = Math.max(1, Math.abs(y0 - y1) - 1)
-        const bw = (b.count / maxCount) * (w - 4)
-        const lean = b.bull + b.bear > 0 ? b.bull / (b.bull + b.bear) : 0.5
-        ctx.fillStyle = lean > 0.52 ? 'rgba(16,185,129,0.42)' : lean < 0.48 ? 'rgba(244,63,94,0.42)' : 'rgba(148,163,184,0.38)'
-        ctx.fillRect(w - bw, top, bw, bh)
-        if (b.band === lastBar.band) {
-          ctx.strokeStyle = '#e2e8f0'
-          ctx.lineWidth = 1
-          ctx.strokeRect(w - bw - 0.5, top - 0.5, bw + 1, bh + 1)
-        }
-      }
-    }
-    draw()
-    const id = window.setInterval(draw, 400) // the price axis auto-scales, so re-align regularly
-    return () => window.clearInterval(id)
-  }, [chartType, anchorDiff])
-
   // Anchor Difference: the zero line IS the anchor (close of the last completed <anchor> period).
   const zeroLineRef = useRef<{ series: AnyPriceSeries; line: IPriceLine } | null>(null)
   useEffect(() => {
@@ -3787,67 +3747,21 @@ export default function ChartPanel({
           <canvas ref={customCanvasRef} className="block h-full w-full" />
         </div>
       )}
-      {chartType === 'anchorDiff' && <canvas ref={anchorHistRef} className="pointer-events-none absolute bottom-[30px] right-[64px] top-0 z-[4] w-[90px]" />}
       {chartType === 'anchorDiff' && (
-        <div className="absolute left-2 top-2 z-[5] max-w-[280px] rounded border border-[#1c2739] bg-[#0d1420]/92 px-2.5 py-2 text-[10px] font-mono leading-tight text-[#dbe4f0]">
-          <div className="mb-1 flex items-center justify-between gap-2">
-            <span className="text-[#7c8aa5]">Anchor Difference</span>
-            <span className="flex items-center gap-1">
-              <span className="text-[#4b5a72]">anchor</span>
-              <select
-                value={anchorPeriod}
-                onChange={(e) => pickAnchorPeriod(e.target.value)}
-                className="rounded border border-[#1c2739] bg-[#0b111c] px-1 py-0.5 text-[10px] text-[#e2e8f0] outline-none"
-              >
-                {ANCHOR_PRESETS.map((a) => (
-                  <option key={a} value={a}>
-                    {a}
-                  </option>
-                ))}
-              </select>
-            </span>
-          </div>
-          {anchorDiff && anchorDiff.bars.length ? (
-            (() => {
-              const b = anchorDiff.bars[anchorDiff.bars.length - 1]
-              const f = (v: number, d = 2) => (Number.isFinite(v) ? v.toFixed(d) : '-')
-              const dec = (v: number) => fmtPrice(Math.abs(v), digitsTicker)
-              return (
-                <>
-                  <div>
-                    gap <span className={b.close >= 0 ? 'text-emerald-400' : 'text-rose-400'}>{b.close >= 0 ? '+' : '-'}{dec(b.close)}</span>
-                    {' · '}z <span className={b.z >= 0 ? 'text-emerald-400' : 'text-rose-400'}>{f(b.z)}</span> ATR
-                  </div>
-                  <div className="text-[#7c8aa5]">anchor {fmtPrice(b.anchor, digitsTicker)}{b.rolled ? ' · just rolled' : ''}</div>
-                  <div className="text-[#7c8aa5]">ATR {fmtPrice(b.atr, digitsTicker)} · TR {fmtPrice(b.tr, digitsTicker)}</div>
-                  <div className="text-[#7c8aa5]">ROC {f(b.roc, 0)}% · {f(b.rocAtr)} ATR / {anchorDiff.rocPeriod} bars</div>
-                  <div className="text-[#7c8aa5]">CCI {f(b.cci, 0)} · MFI {f(b.mfi, 0)} · RSI {f(b.rsi, 0)}</div>
-                  <div className="mt-1 border-t border-[#1c2739] pt-1 text-[#7c8aa5]">
-                    candle <span className={b.dir > 0 ? 'text-emerald-400' : b.dir < 0 ? 'text-rose-400' : ''}>{b.dir > 0 ? 'bullish' : b.dir < 0 ? 'bearish' : 'flat'}</span> · body {f(b.body)} · wicks {f(b.upWick)}/{f(b.dnWick)} ATR
-                  </div>
-                  <div className="text-[#7c8aa5]">
-                    band {f(b.band * anchorDiff.bandWidth)}…{f((b.band + 1) * anchorDiff.bandWidth)} ATR · {b.dwell} bar{b.dwell === 1 ? '' : 's'} here · crowd {f(b.dwellRank * 100, 0)}%
-                  </div>
-                  <div className="mt-1 text-[#4b5a72]">after earlier visits to this band</div>
-                  {([1, 3, 5] as const).map((h) => {
-                    const nx = b.next[h]
-                    return nx.ready ? (
-                      <div key={h} className="text-[#7c8aa5]">
-                        +{h}: <span className={nx.up >= 0.5 ? 'text-emerald-400' : 'text-rose-400'}>{f(nx.up * 100, 0)}% up</span> · {f(nx.bull * 100, 0)}% bull · {nx.move >= 0 ? '+' : ''}{f(nx.move)} ATR · n={nx.n}
-                      </div>
-                    ) : (
-                      <div key={h} className="text-[#4b5a72]">+{h}: not enough visits (n={nx.n}, need 20)</div>
-                    )
-                  })}
-                  {b.alike[3].ready && (
-                    <div className="text-[#7c8aa5]">arrived {b.approach > 0 ? 'rising' : b.approach < 0 ? 'falling' : 'flat'}, +3: {f(b.alike[3].up * 100, 0)}% up · n={b.alike[3].n}</div>
-                  )}
-                </>
-              )
-            })()
-          ) : (
-            <div className="text-[#7c8aa5]">Needs more than one {anchorPeriod} period of candles in view - pick a shorter anchor or a longer history.</div>
-          )}
+        <div className="absolute left-2 top-2 z-[5] flex items-center gap-1.5 rounded border border-[#1c2739] bg-[#0d1420]/92 px-2 py-1 text-[10px] font-mono text-[#7c8aa5]">
+          <span>anchor</span>
+          <select
+            value={anchorPeriod}
+            onChange={(e) => pickAnchorPeriod(e.target.value)}
+            className="rounded border border-[#1c2739] bg-[#0b111c] px-1 py-0.5 text-[10px] text-[#e2e8f0] outline-none"
+          >
+            {ANCHOR_PRESETS.map((a) => (
+              <option key={a} value={a}>
+                {a}
+              </option>
+            ))}
+          </select>
+          {anchorDiff && !anchorDiff.bars.length && <span className="text-amber-300/80">needs more than one {anchorPeriod} of candles</span>}
         </div>
       )}
       {chartType === 'outcomeMemory' && outcomeMemState && (
