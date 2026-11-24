@@ -81,3 +81,8 @@ upload/
 
 # VPN client configs hold private keys - never commit
 vpn/
+Claude outputs/
+b64.txt
+btc_volume_1m.csv
+tool-results/
+dev.log
