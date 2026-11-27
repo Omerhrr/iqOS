@@ -71,6 +71,7 @@ import {
   type MetaStrategySpec,
 } from '../analytics/metastrategy'
 import { BUILTIN_TV_SPECS } from './builtinTvSpecs'
+import { binanceReaderScope } from './binancefeed'
 import { parseStrategyScript, evaluateStrategyScript, clearMslState, flattenStmts, listScriptInputs, sanitizeInputOverrides, type MslInputDecl, type MslInputValue, type MslEvalResult, type MslSourceRead, type MslSeriesCtx, type MslBarValue, type MslAst } from '../analytics/strategylang'
 import { getStrategy } from '../strategies/builtin'
 import { directionBreakdown } from '../strategies/backtest'
@@ -2599,7 +2600,33 @@ export class MetaStrategyService {
    * are rebuilt with them applied and the resolver re-threaded, and pass 2's
    * result wins. A script's own configure lines therefore change how ITS
    * sources are computed while never touching live plugin state. */
+  /** which data a script wants: an input NAMED dataSource ("iq" | "volume" | "binance"); the slot override wins over the declared default */
+  private dataSourceFor(script: string, inputs?: Record<string, MslInputValue>): 'iq' | 'volume' | 'binance' {
+    let v: unknown = inputs?.dataSource
+    if (v === undefined) {
+      try {
+        const d = listScriptInputs(script)
+        if (d.ok) v = d.inputs.find((i) => i.name === 'dataSource')?.def
+      } catch { /* no inputs */ }
+    }
+    const t = String(v ?? 'iq').toLowerCase()
+    return t === 'binance' ? 'binance' : t === 'volume' ? 'volume' : 'iq'
+  }
+
   private evaluateScript(
+    specId: string,
+    script: string,
+    asset: string,
+    tf: Timeframe,
+    live?: { bar?: MslBarValue; ticks?: readonly { ts: number; price: number }[]; nowMs?: number },
+    inputs?: Record<string, MslInputValue>,
+  ): MetaEvalResult {
+    const mode = this.dataSourceFor(script, inputs)
+    if (mode === 'iq') return this.evaluateScriptInner(specId, script, asset, tf, live, inputs)
+    return this.market.withDataSource(mode, () => binanceReaderScope(asset, () => this.evaluateScriptInner(specId, script, asset, tf, live, inputs)))
+  }
+
+  private evaluateScriptInner(
     specId: string,
     script: string,
     asset: string,
@@ -2673,7 +2700,13 @@ export class MetaStrategyService {
    * re-validates the syntax on its own, this is purely for live preview).
    * Same two-pass configure contract as evaluateScript; surfaces the
    * script's preferred expiryMin when it set one. */
-  testScript(script: string, asset: string, tf: Timeframe, inputs?: Record<string, MslInputValue>): { ok: boolean; direction?: 'call' | 'put' | 'none'; confidence?: number; expiryMin?: number; trace?: string[]; price?: number; error?: string } {
+  testScript(script: string, asset: string, tf: Timeframe, inputs?: Record<string, MslInputValue>): ReturnType<MetaStrategyService['testScriptInner']> {
+    const mode = this.dataSourceFor(script, inputs)
+    if (mode === 'iq') return this.testScriptInner(script, asset, tf, inputs)
+    return this.market.withDataSource(mode, () => binanceReaderScope(asset, () => this.testScriptInner(script, asset, tf, inputs)))
+  }
+
+  private testScriptInner(script: string, asset: string, tf: Timeframe, inputs?: Record<string, MslInputValue>): { ok: boolean; direction?: 'call' | 'put' | 'none'; confidence?: number; expiryMin?: number; trace?: string[]; price?: number; error?: string } {
     const parsed = parseStrategyScript(script)
     if (!parsed.ok) return { ok: false, error: parsed.error }
     this.setSeriesBarsFor(script)

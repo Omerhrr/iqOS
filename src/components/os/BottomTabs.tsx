@@ -32,6 +32,7 @@ import ScreenerPanel2 from './ScreenerPanel2'
 import SmcPanel from './SmcPanel'
 import ExplainerTab from './ExplainerTab'
 import RegimePanel from './RegimePanel'
+import BinancePanel from './BinancePanel'
 import DataExportTab from './DataExportTab'
 import SignalTab from './SignalTab'
 import FinderTab from './FinderTab'
@@ -255,6 +256,7 @@ export default function BottomTabs(props: BottomTabsProps) {
             ['smc', 'SMC'],
             ['explainer', 'Explainer'],
             ['regime', 'Regime'],
+            ['binance', 'Binance'],
             ['signal', 'Signal'],
             ['finder', 'Finder'],
             ['data', 'Data'],
@@ -460,6 +462,10 @@ export default function BottomTabs(props: BottomTabsProps) {
 
       <TabsContent value="regime" className="mt-0 min-h-0 flex-1 overflow-hidden">
         <RegimePanel closedTick={closedTick} onPick={props.onSelectSetup} />
+      </TabsContent>
+
+      <TabsContent value="binance" className="mt-0 min-h-0 flex-1 overflow-hidden">
+        <BinancePanel />
       </TabsContent>
 
       <TabsContent value="explainer" className="mt-0 min-h-0 flex-1 overflow-hidden">

@@ -694,6 +694,51 @@ export async function getRegimeScan(tf: Timeframe, opts?: { category?: string; r
   return osGet('/regime_scan', { tf, category: opts?.category, refresh: opts?.refresh ? 1 : undefined })
 }
 
+// ---- Binance public market data (volume / delta / footprint for BTCUSD + ETHUSD) ----
+export interface BinanceHealthView {
+  ok: boolean
+  enabled: boolean
+  connected: boolean
+  stale: boolean
+  reconnects: number
+  lastMessageAgoSec: number | null
+  lastError: string | null
+  restUrl: string
+  wsUrl: string
+  symbols: { symbol: string; pair: string; minutesHeld: number; lastClosed: number; lastClosedAgoSec: number | null; footMinutes: number; lastTradeAgoSec: number | null }[]
+  recorder: { on: boolean; dir: string; written: number }
+}
+export interface BinanceBarView {
+  time: number
+  open: number
+  high: number
+  low: number
+  close: number
+  volume: number
+  quoteVolume: number
+  trades: number
+  buyVolume: number
+  sellVolume: number
+  delta: number
+  deltaPct: number
+  poc?: number
+  footShare: number
+  minutes: number
+  expected: number
+  complete: boolean
+  ladder?: { price: number; buy: number; sell: number }[] | null
+}
+export type BinanceBarsResult = { ok: true; pair: string; symbol: string; tf: string; bars: BinanceBarView[] } | { ok: false; error: string }
+export async function getBinanceHealth(): Promise<BinanceHealthView> {
+  return osGet('/binance/health')
+}
+export async function getBinanceBars(pair: string, tf: string, n = 30): Promise<BinanceBarsResult> {
+  return osGet('/binance/bars', { pair, tf, n })
+}
+export async function setBinanceRecorder(on: boolean): Promise<{ ok: boolean; on: boolean }> {
+  return osPost('/binance/recorder', { on })
+}
+
 export async function getExplainer(asset: string, tf: Timeframe): Promise<ExplainerRead | { ok: false; error: string }> {
   return osGet('/explainer', { asset, tf })
 }

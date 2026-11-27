@@ -1171,6 +1171,28 @@ export class MarketDataService {
    * accumulated history instead of the seeded window.
    */
   getCandlesDeep(asset: string, tf: Timeframe, limit = 2200, closedOnly = false): Candle[] {
+    const mode = this.dataSourceMode
+    const ov = this.candleOverlay
+    if (mode === 'iq' || !ov) return this.getCandlesDeepRaw(asset, tf, limit, closedOnly)
+    // 'binance' mode does not need IQ's candles at all; 'volume' mode keeps them and swaps only the volume
+    const iq = mode === 'volume' ? this.getCandlesDeepRaw(asset, tf, limit, closedOnly) : []
+    const out = ov(asset, tf, iq, limit, closedOnly, mode)
+    return out ? this.applyReplayWindow(out, limit) : (mode === 'volume' ? iq : this.getCandlesDeepRaw(asset, tf, limit, closedOnly))
+  }
+
+  // ---- external data source (Binance volume / candles): see plugins/binancefeed.ts ----
+  // The mode is set only for the duration of ONE synchronous script evaluation (withDataSource), so every
+  // other consumer of the market service (charts, scanners, the live feed) keeps seeing IQ's own candles.
+  private dataSourceMode: 'iq' | 'volume' | 'binance' = 'iq'
+  private candleOverlay: ((asset: string, tf: string, candles: Candle[], limit: number, closedOnly: boolean, mode: 'volume' | 'binance') => Candle[] | null) | null = null
+  setCandleOverlay(fn: MarketDataService['candleOverlay']): void { this.candleOverlay = fn }
+  withDataSource<T>(mode: 'iq' | 'volume' | 'binance', fn: () => T): T {
+    const prev = this.dataSourceMode
+    this.dataSourceMode = mode
+    try { return fn() } finally { this.dataSourceMode = prev }
+  }
+
+  private getCandlesDeepRaw(asset: string, tf: Timeframe, limit = 2200, closedOnly = false): Candle[] {
     const live = this.getCandles(asset, tf, limit, closedOnly)
     let out: Candle[]
     if (!this.store) {

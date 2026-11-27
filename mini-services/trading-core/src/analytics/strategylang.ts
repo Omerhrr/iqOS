@@ -6011,6 +6011,57 @@ function nearExpiryMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: stri
   }
 }
 
+// ---------------- binance.* : real volume, delta and footprint from Binance (BTCUSD / ETHUSD only) ----------------
+// binance.volume() / buyVolume() / sellVolume() / delta() / deltaPct() / trades() / quoteVolume() / poc() / pocPos() / footShare() /
+// real() / complete(), each (offset?, tf?)  -  offset -1 (default) = the last closed bar, -2 the one before.
+// binance.cumDelta(n?, tf?) = delta summed over the last n bars (default 10).  binance.ok(offset?, tf?) = that bar has Binance data.
+// The numbers are BINANCE's market merged by the minute onto the chart candle: they say how the exchange traded, not what IQ Option's own quote did.
+// delta is the true aggressor split when footShare() is 1 (the feed saw every trade of the bar), otherwise the kline taker split.
+export interface BinanceReader { asset: string; at: (timeSec: number, tfSec: number) => import('./binancedata').BinanceAgg | undefined }
+let binanceReader: BinanceReader | null = null
+export function setBinanceReader(r: BinanceReader | null): void { binanceReader = r }
+const BINANCE_METHODS = new Set(['ok', 'volume', 'buyVolume', 'sellVolume', 'delta', 'deltaPct', 'trades', 'quoteVolume', 'poc', 'pocPos', 'footShare', 'real', 'complete', 'cumDelta'])
+function binanceMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
+  if (!BINANCE_METHODS.has(name)) throw new MslRuntimeError(`unknown binance method "binance.${name}(...)" - use ${[...BINANCE_METHODS].join('/')}`)
+  const r = binanceReader
+  if (!r) throw new MslRuntimeError('binance.*() has no Binance data here: it works on BTCUSD and ETHUSD while the Binance feed is on')
+  const s = requireSeries(ctx, tf)
+  const times = s.time
+  if (!times || !times.length) throw new MslRuntimeError('binance.*() needs candle times, which are not available here')
+  const sp = barSpacingSec(s)
+  const at = (off: number) => {
+    const idx = times.length + (off < 0 ? off : -1)
+    return idx >= 0 && idx < times.length ? r.at(times[idx], sp) : undefined
+  }
+  if (name === 'cumDelta') {
+    const n = Math.max(1, Math.trunc(args.length ? asNum(args[0]) : 10))
+    let sum = 0
+    for (let i = 1; i <= n; i++) { const a = at(-i); if (!a || !a.complete) return 0; sum += a.delta }
+    return sum
+  }
+  const off = args.length ? asNum(args[0]) : -1
+  const a = at(off)
+  switch (name) {
+    case 'ok': return !!a && a.complete
+    case 'complete': return !!a && a.complete
+    case 'real': return !!a && a.complete && a.footShare >= 0.999
+    case 'volume': return a && a.complete ? a.volume : 0
+    case 'buyVolume': return a && a.complete ? a.buyVolume : 0
+    case 'sellVolume': return a && a.complete ? a.sellVolume : 0
+    case 'delta': return a && a.complete ? a.delta : 0
+    case 'deltaPct': return a && a.complete ? a.deltaPct : 0
+    case 'trades': return a && a.complete ? a.trades : 0
+    case 'quoteVolume': return a && a.complete ? a.quoteVolume : 0
+    case 'footShare': return a ? a.footShare : 0
+    case 'poc': return a && a.poc !== undefined ? a.poc : 0
+    case 'pocPos': {
+      if (!a || a.poc === undefined || !(a.high > a.low)) return 0.5
+      return Math.min(1, Math.max(0, (a.poc - a.low) / (a.high - a.low)))
+    }
+  }
+  return 0
+}
+
 function requireSeries(ctx: EvalEnv, tf?: string): MslSeriesCtx {
   if (tf === undefined) {
     if (!ctx.series) throw new MslRuntimeError('ind.*() needs raw candle history, which is not available in this evaluation context')
@@ -6534,6 +6585,11 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
         return tickbarMethod(e.name, args, ctx, tf)
+      }
+      if (e.obj.t === 'ident' && e.obj.name === 'binance' && !(e.obj.name in env)) {
+        const args = e.args.map((a) => evalExpr(a, env, ctx))
+        const tf = args.length && typeof args[args.length - 1] === 'string' ? (args.pop() as string) : undefined
+        return binanceMethod(e.name, args, ctx, tf)
       }
       if (e.obj.t === 'ident' && e.obj.name === 'anchor' && !(e.obj.name in env)) {
         const args = e.args.map((a) => evalExpr(a, env, ctx))
