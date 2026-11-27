@@ -5418,7 +5418,26 @@ const ANCHOR_STATS_TAIL = 40
 const ANCHOR_SIGNED_FIELDS = new Set(['adx', 'plusDI', 'minusDI', 'diCross', 'trend', 'swingHigh', 'swingLow', 'swingHighDist', 'swingLowDist', 'bos', 'choch', 'sweep', 'engulf', 'pin', 'soldiers', 'star', 'marubozu', 'exhaust', 'reject', 'trap', 'climax', 'streak', 'er', 'harami', 'tweezer', 'threeInside', 'piercing', 'hammer', 'invHammer', 'beltHold', 'threeStrike', 'kicker', 'fvg', 'fvgTap', 'inFvg', 'fvgBullTop', 'fvgBullBottom', 'fvgBearTop', 'fvgBearBottom', 'obTap', 'inOb', 'obBullTop', 'obBullBottom', 'obBearTop', 'obBearBottom', 'pdPos', 'pdZone', 'rangeHigh', 'rangeLow', 'rangeBreak', 'retest', 'double', 'hs', 'tlSupport', 'tlResist', 'tlBreak', 'wedge', 'channel', 'capitulation', 'fomo', 'gapFill', 'stopHunt', 'volRatio', 'expansion', 'hour', 'session', 'regime', 'kagiDir', 'kagiThick', 'kagiShoulder', 'kagiWaist', 'kagiShoulderZ', 'kagiWaistZ', 'kagiFlip', 'kagiRev', 'kagiLines', 'kagiSince', 'kagiState', 'kagiMixed', 'spShockZ', 'spDriftZ', 'spEff', 'spPressure', 'spShock', 'spSignal', 'sspSignal'])
 const ANCHOR_FLAG_FIELDS = new Set(['eqHigh', 'eqLow', 'inside', 'outside', 'doji', 'anchorTouch', 'ote', 'inRange', 'gapFilled', 'squeeze'])
 const ANCHOR_STATS_METHODS = new Set(['poc', 'vah', 'val', 'pocZ', 'vahZ', 'valZ', 'pocDist', 'inValue', 'share', 'dwellRank', 'visits', 'ready', 'nextUp', 'nextBull', 'nextMove', 'alikeVisits', 'alikeReady', 'alikeUp', 'alikeMove', 'support', 'resistance', 'supportDist', 'resistanceDist', 'supportZ', 'resistanceZ', 'supportTouches', 'resistanceTouches', 'hasSupport', 'hasResistance', 'demandTop', 'demandBottom', 'demandFresh', 'demandTests', 'demandAge', 'demandStrength', 'demandDist', 'inDemand', 'tapDemand', 'hasDemand', 'supplyTop', 'supplyBottom', 'supplyFresh', 'supplyTests', 'supplyAge', 'supplyStrength', 'supplyDist', 'inSupply', 'tapSupply', 'hasSupply'])
-function anchorCompute(name: string, ctx: EvalEnv, period: string | undefined, tf: string | undefined, tail: number, spOver?: AnchorSpParams) {
+type AnchorGroups = { profile?: boolean; levels?: boolean; extra?: boolean; dwell?: boolean }
+const ANCHOR_ALL: AnchorGroups = { profile: true, levels: true, extra: true, dwell: true }
+const ANCHOR_CORE_NAMES = new Set(['ok', 'anchor', 'open', 'high', 'low', 'close', 'diff', 'ohlc', 'z', 'tr', 'atr', 'atrNorm', 'roc', 'rocAtr', 'cci', 'mfi', 'rsi', 'rsiBars', 'cross', 'rolled', 'above', 'sinceCross', 'sinceRoll', 'dir', 'body', 'upWick', 'dnWick', 'closePos', 'band', 'dwell', 'approach', 'diffSeries', 'zSeries', 'rocSeries', 'rocAtrSeries',
+  'adx', 'plusDI', 'minusDI', 'diCross', 'trend', 'swingHigh', 'swingLow', 'swingHighDist', 'swingLowDist', 'bos', 'choch', 'sweep', 'engulf', 'pin', 'soldiers', 'star', 'marubozu', 'exhaust', 'reject', 'climax', 'streak', 'er', 'eqHigh', 'eqLow', 'inside', 'outside', 'doji', 'anchorTouch',
+  'kagiDir', 'kagiThick', 'kagiShoulder', 'kagiWaist', 'kagiShoulderZ', 'kagiWaistZ', 'kagiFlip', 'kagiRev', 'kagiLines', 'kagiSince', 'kagiState', 'kagiMixed', 'spShockZ', 'spDriftZ', 'spEff', 'spPressure', 'spShock', 'spSignal', 'sspSignal'])
+const ANCHOR_EXTRA_NAMES = new Set(['harami', 'tweezer', 'threeInside', 'piercing', 'hammer', 'invHammer', 'beltHold', 'threeStrike', 'kicker', 'fvg', 'fvgTap', 'inFvg', 'fvgBullTop', 'fvgBullBottom', 'fvgBearTop', 'fvgBearBottom', 'obTap', 'inOb', 'obBullTop', 'obBullBottom', 'obBearTop', 'obBearBottom', 'pdPos', 'pdZone', 'ote', 'inRange', 'rangeHigh', 'rangeLow', 'rangeBreak', 'retest', 'double', 'hs', 'tlSupport', 'tlResist', 'tlBreak', 'wedge', 'channel', 'capitulation', 'fomo', 'gapFill', 'gapFilled', 'stopHunt', 'volRatio', 'squeeze', 'expansion', 'hour', 'session', 'regime'])
+const ANCHOR_LEVEL_NAMES = new Set(['support', 'resistance', 'supportDist', 'resistanceDist', 'supportZ', 'resistanceZ', 'supportTouches', 'resistanceTouches', 'hasSupport', 'hasResistance', 'pHigh', 'pLow', 'prevHigh', 'prevLow', 'pHighZ', 'pLowZ', 'prevHighZ', 'prevLowZ', 'trap',
+  'demandTop', 'demandBottom', 'demandFresh', 'demandTests', 'demandAge', 'demandStrength', 'demandDist', 'inDemand', 'tapDemand', 'hasDemand', 'demandCount', 'supplyTop', 'supplyBottom', 'supplyFresh', 'supplyTests', 'supplyAge', 'supplyStrength', 'supplyDist', 'inSupply', 'tapSupply', 'hasSupply', 'supplyCount'])
+/** which engine passes a read needs. Anything not listed here gets EVERY pass, so a new read can never silently see neutral values. Skipping passes is what keeps a backtest (one evaluation per bar) fast. */
+function anchorGroups(name: string): AnchorGroups {
+  if (ANCHOR_CORE_NAMES.has(name)) return {}
+  if (ANCHOR_EXTRA_NAMES.has(name)) return { extra: true }
+  if (ANCHOR_LEVEL_NAMES.has(name)) return { levels: true }
+  return ANCHOR_ALL
+}
+/** passes a script has asked for before, per anchor + config: after the first bar's evaluation discovered what it reads, every later bar computes it in one go */
+const ANCHOR_GROUP_MEMORY = new Map<string, AnchorGroups>()
+const ANCHOR_RESULT_CACHE: { key: string; n: number; t: number; c: number; g: AnchorGroups; r: ReturnType<typeof computeAnchorDiff> }[] = []
+
+function anchorCompute(name: string, ctx: EvalEnv, period: string | undefined, tf: string | undefined, tail: number, spOver?: AnchorSpParams, groupsOver?: AnchorGroups) {
   if (period !== undefined && parseAnchorSpec(period) === null)
     throw new MslRuntimeError(`anchor.${name}(): "${period}" is not an anchor period - use a period (\"15m\" \"30m\" \"1h\" \"4h\" \"1d\" \"1w\" or any <n>m / <n>h / <n>d, at least 1m), optionally with a reference (\"4h:open\" \"4h:high\" \"4h:low\" \"4h:vwap\"), a session (\"asia\" \"london\" \"ny\") or \"round\"`)
   const s = requireSeries(ctx, tf)
@@ -5427,7 +5446,22 @@ function anchorCompute(name: string, ctx: EvalEnv, period: string | undefined, t
   const atrPeriod = cfgNumLang(ctx, 'anchor.atrPeriod', undefined)
   const tms = s.time
   const cands = seriesToCandles(s).map((c, i) => ({ ...c, time: tms[i] }))
-  const r = computeAnchorDiff(cands, { anchor: period, rocPeriod, atrPeriod, bandWidth: cfgNumLang(ctx, 'anchor.bandWidth', undefined), window: cfgNumLang(ctx, 'anchor.window', undefined), pivotLen: cfgNumLang(ctx, 'anchor.pivotLen', undefined), sp: { shockZ: cfgNumLang(ctx, 'anchor.spShockZ', undefined), pressureZ: cfgNumLang(ctx, 'anchor.spPressureZ', undefined), eff: cfgNumLang(ctx, 'anchor.spEff', undefined), burst: cfgNumLang(ctx, 'anchor.spBurst', undefined), stretchZ: cfgNumLang(ctx, 'anchor.spStretchZ', undefined), minBars: cfgNumLang(ctx, 'anchor.spMinBars', undefined), ...spOver }, roundStep: cfgNumLang(ctx, 'anchor.roundStep', undefined), kagiMult: cfgNumLang(ctx, 'anchor.kagiMult', undefined), adxPeriod: cfgNumLang(ctx, 'anchor.adxPeriod', undefined), impulseAtr: cfgNumLang(ctx, 'anchor.impulseAtr', undefined), statsTail: tail })
+  const baseOpts = { anchor: period, rocPeriod, atrPeriod, bandWidth: cfgNumLang(ctx, 'anchor.bandWidth', undefined), window: cfgNumLang(ctx, 'anchor.window', undefined), pivotLen: cfgNumLang(ctx, 'anchor.pivotLen', undefined), sp: { shockZ: cfgNumLang(ctx, 'anchor.spShockZ', undefined), pressureZ: cfgNumLang(ctx, 'anchor.spPressureZ', undefined), eff: cfgNumLang(ctx, 'anchor.spEff', undefined), burst: cfgNumLang(ctx, 'anchor.spBurst', undefined), stretchZ: cfgNumLang(ctx, 'anchor.spStretchZ', undefined), minBars: cfgNumLang(ctx, 'anchor.spMinBars', undefined), ...spOver }, roundStep: cfgNumLang(ctx, 'anchor.roundStep', undefined), kagiMult: cfgNumLang(ctx, 'anchor.kagiMult', undefined), adxPeriod: cfgNumLang(ctx, 'anchor.adxPeriod', undefined), impulseAtr: cfgNumLang(ctx, 'anchor.impulseAtr', undefined), statsTail: tail }
+  const gkey = JSON.stringify([period ?? '', tf ?? '', tail, baseOpts])
+  const want = groupsOver ?? anchorGroups(name)
+  const mem = ANCHOR_GROUP_MEMORY.get(gkey) ?? {}
+  const g = { profile: !!(mem.profile || want.profile), levels: !!(mem.levels || want.levels), extra: !!(mem.extra || want.extra), dwell: !!(mem.dwell || want.dwell) }
+  ANCHOR_GROUP_MEMORY.set(gkey, g)
+  if (ANCHOR_GROUP_MEMORY.size > 64) ANCHOR_GROUP_MEMORY.delete(ANCHOR_GROUP_MEMORY.keys().next().value as string)
+  const nC = cands.length, tLast = cands[nC - 1].time, cLast = cands[nC - 1].close
+  let r: ReturnType<typeof computeAnchorDiff> | undefined
+  const hit = ANCHOR_RESULT_CACHE.find((e) => e.key === gkey && e.n === nC && e.t === tLast && e.c === cLast && (!g.profile || e.g.profile) && (!g.levels || e.g.levels) && (!g.extra || e.g.extra) && (!g.dwell || e.g.dwell))
+  if (hit) r = hit.r
+  else {
+    r = computeAnchorDiff(cands, { ...baseOpts, groups: g })
+    ANCHOR_RESULT_CACHE.unshift({ key: gkey, n: nC, t: tLast, c: cLast, g, r })
+    if (ANCHOR_RESULT_CACHE.length > 12) ANCHOR_RESULT_CACHE.pop()
+  }
   if (!r) throw new MslRuntimeError(`anchor.${name}(): bad anchor period "${period}"`)
   if (!r.bars.length)
     throw new MslRuntimeError(`anchor.${name}(): no bar has a completed ${period} anchor before it in this window - the candle history is shorter than one ${period} period (use a smaller anchor, or a longer history)`)
@@ -5444,14 +5478,14 @@ function anchorCondMethod(name: string, args: MslValue[], strs: string[], ctx: E
   const period = rest[0], tf = rest[1]
   const clauses = parseCondition(cond)
   if (typeof clauses === 'string') throw new MslRuntimeError(`anchor.${name}(): ${clauses}`)
-  const r = anchorCompute(name, ctx, period, tf, ANCHOR_COND_TAIL)
+  const r = anchorCompute(name, ctx, period, tf, ANCHOR_COND_TAIL, undefined, ANCHOR_ALL)
   const fields = condFieldNames(r.bars[0])
   const others = new Map<string, Map<number, (typeof r.bars)[number]>>()
   for (const c of clauses) {
     if (!fields.has(c.field)) throw new MslRuntimeError(`anchor.${name}(): unknown field "${c.field}" in "${cond}" - fields are the numeric / boolean anchor reads (z, roc, rsi, adx, kagiState, sweep, inDemand, fvg, ...)`)
     if (c.spec !== undefined && !others.has(c.spec)) {
       if (parseAnchorSpec(c.spec) === null) throw new MslRuntimeError(`anchor.${name}(): "@${c.spec}" is not an anchor`)
-      const ro = anchorCompute(name, ctx, c.spec, tf, ANCHOR_COND_TAIL)
+      const ro = anchorCompute(name, ctx, c.spec, tf, ANCHOR_COND_TAIL, undefined, ANCHOR_ALL)
       others.set(c.spec, new Map(ro.bars.map((b) => [b.time, b])))
     }
   }
@@ -5487,7 +5521,7 @@ function anchorMultiMethod(name: string, args: MslValue[], strs: string[], ctx: 
   if (strs.length < 1 || (name === 'diverge' && strs.length !== 2)) throw new MslRuntimeError(`anchor.${name}(): ${name === 'diverge' ? 'needs exactly two anchors, e.g. anchor.diverge("4h", "1d")' : 'needs at least one anchor string, e.g. anchor.' + name + '("4h", "1d")'}`)
   if (strs.length > 6) throw new MslRuntimeError(`anchor.${name}(): at most 6 anchors`)
   const gaps = strs.map((sp) => {
-    const r = anchorCompute(name, ctx, sp, undefined, 1)
+    const r = anchorCompute(name, ctx, sp, undefined, 1, undefined, {})
     const b = r.bars[r.bars.length - 1]
     const s = requireSeries(ctx, undefined)
     const lastT = s.time ? s.time[s.time.length - 1] : b.time
@@ -5526,7 +5560,7 @@ function anchorSp(name: string, optStrs: string[], period: string | undefined, t
     else if (k === 'trend') { if (v !== 'side' && v !== 'kagi' && v !== 'ema') throw bad(); sp.trend = v }
     else throw bad()
   }
-  const r = anchorCompute(name, ctx, period, tf, 1, sp)
+  const r = anchorCompute(name, ctx, period, tf, 1, sp, {})
   const s = requireSeries(ctx, tf)
   const last = r.bars[r.bars.length - 1]
   const fail = (msg: string): MslValue => (name === 'spText' || name === 'sspText' ? msg : bundleValue({ ok: false, error: msg, direction: 'none', case: 0, pressure: false, shock: false, text: msg }))

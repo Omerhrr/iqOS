@@ -790,6 +790,328 @@ expiry = expiryMin
 `,
   },
   {
+    id: 'meta:builtin-anchor-confluence',
+    name: 'Builtin: Anchor confluence (stretch + 5 anchor votes, for binary options)',
+    script: `
+# ANCHOR CONFLUENCE (binary options): fade a stretched move away from the anchor, but only when several independent anchor reads agree.
+# The anchor is the close of the last completed period. Every read below is the anchor's own (candle-derived, no look-ahead):
+#   stretch   the gap from the anchor is at least \`stretch\` ATR (anchor.z), up = put, down = call (mode "follow" flips it)
+# Confirmations, each one vote for the fade direction:
+#   1 exhaustion      a rejection wick at a stretched gap (anchor.exhaust)
+#   2 Kagi mixed      yin while still ABOVE the anchor (-2: fading) / yang while still BELOW it (+2: recovering) (anchor.kagiState)
+#   3 shock/pressure  the anchor's own SP signal: steady drift then a burst, gap already stretched (anchor.spSignal)
+#   4 higher anchor   the higher anchor is stretched the same way (anchor.z(longPer)), so the move is extended on both scales
+#   5 failed break    price broke this period's high / low and closed back inside (anchor.trap)
+# It trades only with at least \`minVotes\` confirmations and when ADX says the market is NOT trending (fading a strong trend loses).
+# Confidence = baseConf + step per vote. NOT PROVEN: first-guess thresholds, nothing here is fitted; backtest per pair and walk-forward before trusting it.
+
+input per = "1h" options "15m", "30m", "1h", "4h", "1d" "Anchor period"
+input longPer = "4h" options "1h", "4h", "1d", "1w" "Higher anchor (vote 4)"
+input mode = "fade" options "fade", "follow" "Direction"
+input stretch = 1.5 min 0.5 max 5 "Stretch (ATR)"
+input minVotes = 2 min 1 max 5 "Confirmations needed"
+input adxMax = 25 min 10 max 60 "Skip when ADX is above"
+input baseConf = 58 min 1 max 90 "Base confidence"
+input step = 5 min 0 max 15 "Confidence per vote"
+input expiryMin = 3 min 1 max 15 "Expiry (minutes)"
+
+let z = anchor.z(per)
+let d = 0
+if z >= stretch
+  d = -1
+elseif z <= -stretch
+  d = 1
+end
+
+let st = anchor.kagiState(per)
+let zl = anchor.z(longPer)
+let v1 = if(anchor.exhaust(per) == d, 1, 0)
+let v2 = if((d == -1 and st == -2) or (d == 1 and st == 2), 1, 0)
+let v3 = if(anchor.spSignal(per) == d, 1, 0)
+let v4 = if(zl * z > 0 and abs(zl) >= 0.5, 1, 0)
+let v5 = if(anchor.trap(per) == d, 1, 0)
+let votes = v1 + v2 + v3 + v4 + v5
+let calm = anchor.adx(per) < adxMax
+let dir = d
+if mode == "follow"
+  dir = -d
+end
+let fire = d != 0 and votes >= minVotes and calm
+
+if fire and dir > 0
+  call when true
+  confidence = min(95, baseConf + step * votes)
+elseif fire and dir < 0
+  put when true
+  confidence = min(95, baseConf + step * votes)
+end
+expiry = expiryMin
+`,
+  },
+  {
+    id: 'meta:builtin-anchor-trend',
+    name: 'Builtin: Anchor trend continuation (structure break + ADX, for binary options)',
+    script: `
+# ANCHOR TREND CONTINUATION (binary options): trade WITH a fresh break of structure measured on the anchor path.
+# Trigger: a break of structure (bos) or a DI cross on the gap path (price minus the anchor), in the direction of the break.
+# Filters, all on the same anchor: ADX at least adxMin (a real trend), +DI/-DI agree, the higher anchor sits on the same side,
+# and the move is not already stretched past maxStretch ATR (do not chase the end of a run).
+# It is the opposite idea to the Anchor confluence script, which fades stretches. Compare them on the same data.
+# NOT PROVEN, AND THE FIRST TEST WAS BAD: on ~3 days of BTC 1-minute candles (3-minute expiry) it scored 29-46% on only 7-41 trades depending on the settings, i.e. no edge seen. Fixed first-guess thresholds. Backtest across pairs before trusting it.
+
+input per = "1h" options "15m", "30m", "1h", "4h", "1d" "Anchor period"
+input longPer = "4h" options "1h", "4h", "1d", "1w" "Higher anchor (same side)"
+input trigger = "bos" options "bos", "diCross" "Trigger"
+input adxMin = 22 min 10 max 60 "ADX at least"
+input maxStretch = 2.5 min 0.5 max 6 "Skip when stretched beyond (ATR)"
+input needHigher = true "Higher anchor must agree"
+input baseConf = 60 min 1 max 90 "Base confidence"
+input step = 4 min 0 max 15 "Confidence per ADX 10 over minimum"
+input expiryMin = 3 min 1 max 15 "Expiry (minutes)"
+
+let ev = anchor.bos(per)
+if trigger == "diCross"
+  ev = anchor.diCross(per)
+end
+let z = anchor.z(per)
+let zl = anchor.z(longPer)
+let strong = anchor.adx(per) >= adxMin
+let notChased = abs(z) <= maxStretch
+let higherOk = (not needHigher) or ev * zl > 0
+let okSide = ev * z >= 0
+let fire = ev != 0 and strong and notChased and higherOk and okSide
+let conf = min(95, baseConf + step * (anchor.adx(per) - adxMin) / 10)
+if fire and ev > 0
+  call when true
+  confidence = conf
+elseif fire and ev < 0
+  put when true
+  confidence = conf
+end
+expiry = expiryMin
+`,
+  },
+  {
+    id: 'meta:builtin-anchor-zone',
+    name: 'Builtin: Anchor zone reaction (supply/demand touch + rejection candle, for binary options)',
+    script: `
+# ANCHOR ZONE REACTION (binary options): trade a bounce off the anchor's own demand / supply zone.
+# Zones are built on the gap path (price minus the anchor). A call needs a touch of a demand zone (or a support level),
+# a put needs a touch of a supply zone (or a resistance level), plus a rejection candle (pin / reject / hammer / engulf)
+# pointing the same way, so the trade waits for price to show it is turning. First touch only: the zone was tested at most once, counting this touch (untested zones are stronger).
+# zoneOnly = false also allows the plain support / resistance levels of the anchor path.
+# NOT PROVEN: on ~3 days of BTC 1-minute candles (3-minute expiry) the defaults scored 62% on only 32 trades; loosening the filters gave 49-55% on 67-291 trades, so the rejection candle plus first-touch is where any lean came from, and 32 trades is within luck. Backtest across pairs before trusting it.
+
+input per = "1h" options "15m", "30m", "1h", "4h", "1d" "Anchor period"
+input zoneOnly = true "Supply / demand zones only"
+input freshOnly = true "First touch only (zone tested at most once)"
+input needCandle = true "Need a rejection candle"
+input adxMax = 30 min 10 max 60 "Skip when ADX is above"
+input baseConf = 60 min 1 max 90 "Base confidence"
+input step = 5 min 0 max 15 "Confidence bonus on a first touch"
+input expiryMin = 3 min 1 max 15 "Expiry (minutes)"
+
+let dTouch = anchor.tapDemand(per) or anchor.inDemand(per)
+let sTouch = anchor.tapSupply(per) or anchor.inSupply(per)
+let dFresh = anchor.demandTests(per) <= 1
+let sFresh = anchor.supplyTests(per) <= 1
+let candleUp = anchor.pin(per) > 0 or anchor.reject(per) > 0 or anchor.hammer(per) > 0 or anchor.engulf(per) > 0
+let candleDn = anchor.pin(per) < 0 or anchor.reject(per) < 0 or anchor.hammer(per) < 0 or anchor.engulf(per) < 0
+let calm = anchor.adx(per) < adxMax
+let callOk = dTouch and ((not freshOnly) or dFresh) and ((not needCandle) or candleUp) and calm
+let putOk = sTouch and ((not freshOnly) or sFresh) and ((not needCandle) or candleDn) and calm
+if callOk and putOk
+  callOk = false
+  putOk = false
+end
+if callOk
+  call when true
+  confidence = min(95, baseConf + if(dFresh, step, 0))
+elseif putOk
+  put when true
+  confidence = min(95, baseConf + if(sFresh, step, 0))
+end
+expiry = expiryMin
+`,
+  },
+  {
+    id: 'meta:builtin-anchor-kagi',
+    name: 'Builtin: Anchor Kagi flip (yin/yang turn on the gap path, for binary options)',
+    script: `
+# ANCHOR KAGI FLIP (binary options): trade the moment the Kagi line on the gap path (price minus the anchor) flips.
+# kagiFlip is +1 when the line turns up (yin to yang side) and -1 when it turns down. A flip that happens against the side of the
+# anchor (price below the anchor, line turns up) is a snap-back toward the anchor; a flip with the side is a continuation.
+# kind picks which flips to trade: "snapback", "continuation" or "any". The higher anchor can be required to sit on the trade's side.
+# NOT PROVEN, AND THE FIRST TEST SHOWED NO EDGE: on ~3 days of BTC 1-minute candles (3-minute expiry) snapback scored 47% (19 trades), continuation 49% (47), any flip 48.5% (66). Fixed first-guess thresholds. Backtest across pairs before trusting it.
+
+input per = "1h" options "15m", "30m", "1h", "4h", "1d" "Anchor period"
+input longPer = "4h" options "1h", "4h", "1d", "1w" "Higher anchor"
+input kind = "snapback" options "snapback", "continuation", "any" "Flips to trade"
+input needHigher = false "Higher anchor must agree"
+input minZ = 0.5 min 0 max 5 "Minimum distance from the anchor (ATR)"
+input adxMax = 35 min 10 max 60 "Skip when ADX is above"
+input baseConf = 58 min 1 max 90 "Base confidence"
+input step = 5 min 0 max 15 "Bonus when the line is thick (yang)"
+input expiryMin = 3 min 1 max 15 "Expiry (minutes)"
+
+let f = anchor.kagiFlip(per)
+let z = anchor.z(per)
+let zl = anchor.z(longPer)
+let against = f * z < 0
+let withSide = f * z > 0
+let kindOk = kind == "any" or (kind == "snapback" and against) or (kind == "continuation" and withSide)
+let far = abs(z) >= minZ
+let higherOk = (not needHigher) or f * zl > 0
+let calm = anchor.adx(per) < adxMax
+let fire = f != 0 and kindOk and far and higherOk and calm
+let thick = anchor.kagiThick(per) * f > 0
+let conf = min(95, baseConf + if(thick, step, 0))
+if fire and f > 0
+  call when true
+  confidence = conf
+elseif fire and f < 0
+  put when true
+  confidence = conf
+end
+expiry = expiryMin
+`,
+  },
+  {
+    id: 'meta:builtin-anchor-psych',
+    name: 'Builtin: Anchor psychology snap-back (climax + stop hunt toward the anchor, for binary options)',
+    script: `
+# ANCHOR PSYCHOLOGY SNAP-BACK (binary options): trade the reversal after a crowd move away from the anchor runs out of steam.
+# Setups, all read on the gap path (price minus the anchor), each already signed as the expected reversal (+1 call, -1 put):
+#   capitulation  selling climax (+1) or buying climax (-1)
+#   stopHunt      a wick that took out a level and snapped back
+#   fomo          the crowd chasing a run (only used when fomoToo is on, signed against the run)
+# The reversal must point back toward the anchor (price below it and a call, or above it and a put), the gap must be at least
+# minZ ATR, and ADX must be below adxMax (a strong trend does not snap back). Votes add confidence.
+# NOT PROVEN: on ~3 days of BTC 1-minute candles (3-minute expiry) climax + stop hunt scored 61% on 18 trades; with FOMO added 49% on 45; looser filters 50-53% on 46-73. 18 trades is luck-sized, and FOMO is off by default only because it is the noisier vote. Backtest across pairs before trusting it.
+
+input per = "1h" options "15m", "30m", "1h", "4h", "1d" "Anchor period"
+input fomoToo = false "Count FOMO as a reversal vote"
+input minZ = 1 min 0 max 5 "Minimum distance from the anchor (ATR)"
+input adxMax = 30 min 10 max 60 "Skip when ADX is above"
+input minVotes = 1 min 1 max 3 "Setups that must agree"
+input baseConf = 58 min 1 max 90 "Base confidence"
+input step = 5 min 0 max 15 "Confidence per vote"
+input expiryMin = 3 min 1 max 15 "Expiry (minutes)"
+
+let z = anchor.z(per)
+let cap = anchor.capitulation(per)
+let hunt = anchor.stopHunt(per)
+let fm = 0
+if fomoToo
+  fm = -anchor.fomo(per)
+end
+let up = if(cap > 0, 1, 0) + if(hunt > 0, 1, 0) + if(fm > 0, 1, 0)
+let dn = if(cap < 0, 1, 0) + if(hunt < 0, 1, 0) + if(fm < 0, 1, 0)
+let calm = anchor.adx(per) < adxMax
+let callOk = up >= minVotes and dn == 0 and z <= -minZ and calm
+let putOk = dn >= minVotes and up == 0 and z >= minZ and calm
+if callOk
+  call when true
+  confidence = min(95, baseConf + step * up)
+elseif putOk
+  put when true
+  confidence = min(95, baseConf + step * dn)
+end
+expiry = expiryMin
+`,
+  },
+  {
+    id: 'meta:builtin-anchor-vwap',
+    name: 'Builtin: Anchor VWAP reversion (stretch from the period VWAP, for binary options)',
+    script: `
+# ANCHOR VWAP REVERSION (binary options): the anchor is the volume-weighted average price of the current period, not a close.
+# Price is measured from that VWAP in ATR units. When price is stretched far from where the volume traded, it tends to be pulled back,
+# so the script fades the stretch once the last candle shows it is turning (closes back against the stretch).
+# spec picks the reference: "vwap" (anchored VWAP of the period), "open" (the period open) or "close" (the previous period close, the plain anchor).
+# Note: on 24/7 markets (crypto) the period open is almost the previous close, so "1h:open" and "1h" behave the same.
+# NOT PROVEN: on ~3 days of BTC 1-minute candles (3-minute expiry) 1h VWAP scored 54.7% on 150 trades, 4h VWAP 52.8% on 290, no turn filter 56.9% on 445 (breakeven at 85% payout is about 54%); a 15m VWAP run hit 71% on only 42 trades, which is luck-sized. Backtest across pairs before trusting it.
+
+input spec = "1h:vwap" options "15m:vwap", "30m:vwap", "1h:vwap", "4h:vwap", "1d:vwap", "1h:open", "4h:open", "1h", "4h" "Reference (period:vwap, period:open, or plain period close)"
+input stretch = 1.5 min 0.5 max 5 "Stretch (ATR)"
+input needTurn = true "Last candle must turn back"
+input adxMax = 30 min 10 max 60 "Skip when ADX is above"
+input baseConf = 58 min 1 max 90 "Base confidence"
+input step = 5 min 0 max 15 "Confidence per ATR beyond the stretch"
+input expiryMin = 3 min 1 max 15 "Expiry (minutes)"
+
+let z = anchor.z(spec)
+let zPrev = anchor.z(-2, spec)
+let turnDown = z < zPrev
+let turnUp = z > zPrev
+let calm = anchor.adx(spec) < adxMax
+let extra = max(0, abs(z) - stretch)
+let conf = min(95, baseConf + step * extra)
+let putOk = z >= stretch and ((not needTurn) or turnDown) and calm
+let callOk = z <= -stretch and ((not needTurn) or turnUp) and calm
+if callOk
+  call when true
+  confidence = conf
+elseif putOk
+  put when true
+  confidence = conf
+end
+expiry = expiryMin
+`,
+  },
+  {
+    id: 'meta:builtin-anchor-regime',
+    name: 'Builtin: Anchor regime switch (fade in chop, follow pullbacks in trend, for binary options)',
+    script: `
+# ANCHOR REGIME SWITCH (binary options): one script, two behaviours, chosen by what the anchor path is doing.
+# Regime comes from the anchor's own ADX: below chopMax the path is ranging, so a stretch is faded back toward the anchor;
+# above trendMin the path is trending, so a pullback that has just ended is followed (price on the trend side of the anchor,
+# came back toward it, and the last candle turned with the trend). Between the two it stays out.
+# Direction of the trend = side of the +DI / -DI, and price must sit on that side of the anchor.
+# NOT PROVEN: on ~3 days of BTC 1-minute candles (3-minute expiry) the defaults scored 54.3% on 127 trades (breakeven at 85% payout is about 54%). Almost all trades come from the ranging fade (122 of 127, 54.9%); the trend-pullback half fired 5 times, 2 wins, so it is untested. Backtest across pairs before trusting it.
+
+input per = "1h" options "15m", "30m", "1h", "4h", "1d" "Anchor period"
+input chopMax = 20 min 5 max 40 "Ranging when ADX is below"
+input trendMin = 28 min 15 max 60 "Trending when ADX is above"
+input stretch = 1.5 min 0.5 max 5 "Fade stretch (ATR)"
+input pullDepth = 0.5 min 0.1 max 3 "Pullback depth to buy / sell (ATR from the anchor, at most)"
+input baseConf = 58 min 1 max 90 "Base confidence"
+input step = 4 min 0 max 15 "Confidence per ADX 10 beyond the regime line"
+input expiryMin = 3 min 1 max 15 "Expiry (minutes)"
+
+let z = anchor.z(per)
+let zPrev = anchor.z(-2, per)
+let adx = anchor.adx(per)
+let up = anchor.plusDI(per) > anchor.minusDI(per)
+let dn = anchor.minusDI(per) > anchor.plusDI(per)
+let side = 0
+let bonus = 0
+if adx < chopMax
+  if z >= stretch and z < zPrev
+    side = -1
+  elseif z <= -stretch and z > zPrev
+    side = 1
+  end
+  bonus = (chopMax - adx) / 10
+elseif adx > trendMin
+  if up and z > 0 and z <= pullDepth and z > zPrev
+    side = 1
+  elseif dn and z < 0 and z >= -pullDepth and z < zPrev
+    side = -1
+  end
+  bonus = (adx - trendMin) / 10
+end
+let conf = min(95, baseConf + step * bonus)
+if side > 0
+  call when true
+  confidence = conf
+elseif side < 0
+  put when true
+  confidence = conf
+end
+expiry = expiryMin
+`,
+  },
+  {
     id: 'meta:builtin-anchor-fade',
     name: 'Builtin: Anchor fade (gap from the 1h/4h/1d close, with inputs)',
     script: `

@@ -477,6 +477,8 @@ export interface AnchorDiffOptions {
   statsTail?: number
   /** bars each side for a swing pivot (default 3) */
   pivotLen?: number
+  /** passes to run (all on by default). A caller that reads only some fields may switch the rest off: profile = poc / delta fields, levels = support / resistance / zones / period high-low / trap, extra = extended patterns, FVG, OB, ranges, chart patterns, psychology, market state and the per-signal after-stats, dwell = share / dwellRank / next / alike. A switched-off group leaves its fields at their neutral values. */
+  groups?: { profile?: boolean; levels?: boolean; extra?: boolean; dwell?: boolean }
   /** the anchor's own shock & pressure parameters */
   sp?: AnchorSpParams
   /** price step of the round-number reference ("round"); default 10^(floor(log10(price)) - 2), e.g. 0.01 for 1.15, 100 for 60000 */
@@ -635,7 +637,8 @@ export function computeAnchorDiff(candles: Candle[], opts: AnchorDiffOptions = {
         if (Math.abs(dp) >= 0.3 * atrV && dp * d > 0) roc = ((Math.abs(d) - Math.abs(dp)) / Math.abs(dp)) * 100
       }
     }
-    bars.push({
+    const nb = blankBar()
+    Object.assign(nb, {
       time: c.time,
       open: c.open - a,
       high: c.high - a,
@@ -669,21 +672,20 @@ export function computeAnchorDiff(candles: Candle[], opts: AnchorDiffOptions = {
       poc: Number.NaN, vah: Number.NaN, val: Number.NaN, pocZ: Number.NaN, vahZ: Number.NaN, valZ: Number.NaN, pocDist: Number.NaN, inValue: false,
       periodVol: 0, periodBars: 0, volSource: 'time', delta: 0, cumDelta: 0, cumDeltaPct: 0, deltaDiv: 0,
       atrP: Number.NaN, rsiBars: 0,
-      ...emptyLevels(),
-      ...emptyPatterns(),
     })
+    bars.push(nb)
     idxOf.push(i)
   }
   periodIndicators(bars, candles, idxOf, Math.max(2, Math.round(opts.rsiPeriod ?? 14)), Math.max(2, Math.round(opts.cciPeriod ?? 20)), Math.max(2, Math.round(opts.mfiPeriod ?? 14)), Math.max(2, Math.round(opts.atrPeriod ?? 14)))
   periodKagi(bars, Math.max(0.1, opts.kagiMult ?? 1))
   periodSp(bars, candles, idxOf, opts.sp ?? {})
   const tailN = opts.statsTail !== undefined && opts.statsTail > 0 ? Math.max(1, Math.round(opts.statsTail)) : Infinity
-  periodProfile(bars, bandW, candles, idxOf, tailN)
-  levelsAndZones(bars, candles, idxOf, bandW, win, Math.max(1, Math.round(opts.pivotLen ?? 3)), opts.impulseAtr !== undefined && opts.impulseAtr > 0 ? opts.impulseAtr : 1.5, tailN)
+  const G = { profile: true, levels: true, extra: true, dwell: true, ...opts.groups }
+  if (G.profile) periodProfile(bars, bandW, candles, idxOf, tailN)
+  if (G.levels) levelsAndZones(bars, candles, idxOf, bandW, win, Math.max(1, Math.round(opts.pivotLen ?? 3)), opts.impulseAtr !== undefined && opts.impulseAtr > 0 ? opts.impulseAtr : 1.5, tailN)
   patternsAndStructure(bars, candles, idxOf, Math.max(1, Math.round(opts.pivotLen ?? 3)), Math.max(2, Math.round(opts.adxPeriod ?? 14)), win, tailN)
-  extraSignals(bars, candles, idxOf, Math.max(1, Math.round(opts.pivotLen ?? 3)), win)
-  signalStats(bars, win, tailN)
-  const histogram = enrich(bars, bandW, win, opts.statsTail !== undefined && opts.statsTail > 0 ? Math.max(1, Math.round(opts.statsTail)) : Infinity)
+  if (G.extra) { extraSignals(bars, candles, idxOf, Math.max(1, Math.round(opts.pivotLen ?? 3)), win); signalStats(bars, win, tailN) }
+  const histogram = enrich(bars, bandW, win, opts.statsTail !== undefined && opts.statsTail > 0 ? Math.max(1, Math.round(opts.statsTail)) : Infinity, G.dwell)
   return { anchorSec: P, anchorLabel: typeof opts.anchor === 'string' ? opts.anchor : `${P}s`, rocPeriod: rocP, bandWidth: bandW, window: win, bars, histogram }
 }
 
@@ -1321,13 +1323,31 @@ function extraSignals(bars: AnchorBar[], candles: Candle[], idxOf: number[], L: 
   }
 }
 
+/** every AnchorBar field with a neutral value, as ONE object literal: V8 builds that as a fast fixed-shape object, whereas spreading ~150 properties per bar was the biggest cost of the engine. The real values are assigned over it. */
+function blankBar(): AnchorBar {
+  const N = Number.NaN
+  return {
+    time: 0, open: 0, high: 0, low: 0, close: 0, volume: 0, anchor: 0, rolled: false, tr: 0, atr: 0, z: 0, roc: 0, rocAtr: 0, cci: 0, mfi: 0, rsi: 0, crossed: 0, price: 0, dir: 0, body: 0, upWick: 0, dnWick: 0, closePos: 0, band: 0, dwell: 0, share: 0, dwellRank: 0, next: emptyNext(), alike: emptyNext(), approach: 0, poc: 0, vah: 0, val: 0, pocZ: 0, vahZ: 0, valZ: 0, pocDist: 0, inValue: false, periodVol: 0, periodBars: 0, volSource: 'time', delta: 0, cumDelta: 0, cumDeltaPct: 0, deltaDiv: 0, atrP: 0, rsiBars: 0,
+
+    support: N, resistance: N, supportDist: N, resistanceDist: N, supportZ: N, resistanceZ: N, supportTouches: 0, resistanceTouches: 0,
+    pHigh: N, pLow: N, prevHigh: N, prevLow: N, pHighZ: N, pLowZ: N, prevHighZ: N, prevLowZ: N,
+    demandTop: N, demandBottom: N, demandFresh: false, demandTests: 0, demandAge: 0, demandStrength: 0, demandDist: N, inDemand: false, tapDemand: false,
+    supplyTop: N, supplyBottom: N, supplyFresh: false, supplyTests: 0, supplyAge: 0, supplyStrength: 0, supplyDist: N, inSupply: false, tapSupply: false,
+    demandCount: 0, supplyCount: 0,
+
+    adx: N, plusDI: N, minusDI: N, diCross: 0, trend: 0, swingHigh: N, swingLow: N, swingHighDist: N, swingLowDist: N, bos: 0, choch: 0, sweep: 0, eqHigh: 0, eqLow: 0,
+    engulf: 0, pin: 0, inside: 0, outside: 0, doji: 0, soldiers: 0, star: 0, marubozu: 0, exhaust: 0, reject: 0, anchorTouch: 0, trap: 0, climax: 0, streak: 0, er: N, sigNext: {},
+    harami: 0, tweezer: 0, threeInside: 0, piercing: 0, hammer: 0, invHammer: 0, beltHold: 0, threeStrike: 0, kicker: 0, fvg: 0, fvgTap: 0, inFvg: 0, obTap: 0, inOb: 0, pdZone: 0, ote: 0, inRange: 0, rangeBreak: 0, retest: 0, double: 0, hs: 0, tlBreak: 0, wedge: 0, channel: 0, capitulation: 0, fomo: 0, spShockZ: N, spDriftZ: N, spEff: N, spPressure: 0, spShock: 0, spSignal: 0, sspSignal: 0, kagiDir: 0, kagiThick: 0, kagiShoulder: N, kagiWaist: N, kagiShoulderZ: N, kagiWaistZ: N, kagiFlip: 0, kagiRev: 0, kagiLines: 0, kagiSince: 0, kagiState: 0, kagiMixed: 0, gapFilled: 0, stopHunt: 0, squeeze: 0, expansion: 0, hour: 0, session: 0, regime: 0, fvgBullTop: N, fvgBullBottom: N, fvgBearTop: N, fvgBearBottom: N, obBullTop: N, obBullBottom: N, obBearTop: N, obBearBottom: N, pdPos: N, rangeHigh: N, rangeLow: N, tlSupport: N, tlResist: N, gapFill: N, volRatio: N,
+  }
+}
+
 function emptyNext(): Record<AnchorHorizon, AnchorNext> {
   const z = (): AnchorNext => ({ n: 0, ready: false, up: 0.5, bull: 0.5, move: 0 })
   return { 1: z(), 3: z(), 5: z() }
 }
 
 /** dwell (band, run length, crowding) and the no-look-ahead "what happened next" stats; returns the histogram at the newest bar */
-function enrich(bars: AnchorBar[], bw: number, win: number, tail: number): AnchorBand[] {
+function enrich(bars: AnchorBar[], bw: number, win: number, tail: number, doStats = true): AnchorBand[] {
   const m = bars.length
   for (let i = 0; i < m; i++) {
     const b = bars[i]
@@ -1337,7 +1357,7 @@ function enrich(bars: AnchorBar[], bw: number, win: number, tail: number): Ancho
     b.approach = Number.isFinite(back) && Number.isFinite(b.z) ? (b.z - back > 0.1 * bw ? 1 : b.z - back < -0.1 * bw ? -1 : 0) : 0
   }
   const statsFrom = Number.isFinite(tail) ? Math.max(0, m - tail) : 0
-  for (let i = statsFrom; i < m; i++) {
+  for (let i = statsFrom; doStats && i < m; i++) {
     const b = bars[i]
     if (!Number.isFinite(b.band)) continue
     const from = Math.max(0, i - win + 1)
