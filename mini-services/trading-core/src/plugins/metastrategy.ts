@@ -948,7 +948,7 @@ export class MetaStrategyService {
   needsSubMinute(specId: string): boolean {
     const src = this.get(specId)?.script
     // binance.live()/age()/now*() read the Binance bar that is still forming, so a script using them is polled inside the bar like the other sub-minute scripts
-    return !!src && /\bstory\.(?:sp|ssp|spText|sspText)\s*\(|\btick\.|\btiming\.|\bfoot\.|\bbinance\.(?:live|age|now[A-Z]\w*)\s*\(/.test(src)
+    return !!src && /\bstory\.(?:sp|ssp|spText|sspText)\s*\(|\btick\.|\btiming\.|\bfoot\.|\bbinance\.(?:live|age|gap|lead[A-Z]\w*|now[A-Z]\w*)\s*\(/.test(src)
   }
 
   /** true when this saved script (as this slot runs it) reads Binance data: dataSource volume/binance, or any binance.* read. Engines use it to wait for the Binance minute of a just-closed bar. */

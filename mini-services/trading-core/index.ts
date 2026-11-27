@@ -24,7 +24,8 @@ import { storePlugin } from './src/plugins/store'
 import { osModePlugin, ModeService, type OsMode } from './src/plugins/os-mode'
 import { memoryGatePlugin } from './src/plugins/memory-gate'
 import { marketDataPlugin, MarketDataService } from './src/plugins/market-data'
-import { binanceFeedPlugin, getBinanceFeed } from './src/plugins/binancefeed'
+import { binanceFeedPlugin, getBinanceFeed, loadRecorded } from './src/plugins/binancefeed'
+import { runBoard } from './src/plugins/binancereplayboard'
 import { aggAt, binanceSymbolFor, TF_SEC } from './src/analytics/binancedata'
 import { analyticsPlugin, AnalyticsService } from './src/plugins/analytics'
 import { executionPlugin, ExecutionService, type RiskConfig } from './src/plugins/execution'
@@ -1057,6 +1058,32 @@ const httpServer = createServer(async (req, res) => {
         if (!sec) return json(400, { ok: false, error: `tf must be one of ${Object.keys(TF_SEC).join(', ')}` })
         const nb = f.now(sym, sec)
         return json(200, { ok: true, pair, symbol: sym, tf: tfName, fresh: f.isFresh(sym), bar: nb ?? null })
+      }
+      // what has been recorded so far (days, minutes, how many have a complete trade ladder and IQ's candle)
+      if (path === '/binance/replay_data') {
+        const f = getBinanceFeed()
+        if (!f) return json(400, { ok: false, error: 'binance feed is not running' })
+        const d = loadRecorded(f.recordedDir())
+        return json(200, { ok: true, files: d.files, coverage: d.coverage })
+      }
+      // replay many strategies over the recorded Binance data and rank them (honest verdicts: see analytics/binancereplay.ts)
+      if (path === '/binance/replay' && req.method === 'POST') {
+        const f = getBinanceFeed()
+        if (!f) return json(400, { ok: false, error: 'binance feed is not running' })
+        const meta = kernel.context().use<MetaStrategyService>('metaStrategy')
+        const out = await runBoard(f, (id) => meta.get(id)?.script, {
+          pair: typeof body?.pair === 'string' ? body.pair : undefined,
+          tf: typeof body?.tf === 'string' ? body.tf : undefined,
+          expiry: Array.isArray(body?.expiry) ? body.expiry.map(Number).filter(Number.isFinite) : undefined,
+          payout: body?.payout !== undefined ? Number(body.payout) : undefined,
+          ids: Array.isArray(body?.ids) ? body.ids.filter((x: unknown) => typeof x === 'string') : undefined,
+          script: typeof body?.script === 'string' ? body.script : undefined,
+          from: typeof body?.from === 'string' ? body.from : undefined,
+          to: typeof body?.to === 'string' ? body.to : undefined,
+          modeOverride: body?.modeOverride === 'volume' || body?.modeOverride === 'binance' ? body.modeOverride : undefined,
+          variants: body?.variants === false ? false : true,
+        })
+        return json(out.ok ? 200 : 400, out)
       }
       if (path === '/binance/recorder' && req.method === 'POST') {
         const f = getBinanceFeed()

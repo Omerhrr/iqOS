@@ -1351,6 +1351,17 @@ export class MarketDataService {
     return { ok: true, asset, applied: apply, realDecimals: dec, totalRows, simRows: totalSim, deleted: perTf.reduce((n, r) => n + r.deleted, 0), perTf, note: apply ? 'deleted from the archive and from memory' : 'DRY RUN - nothing deleted. Add apply=1 to delete.' }
   }
 
+  /** the sidecar's 100 ms sampled IQ quotes (ms timestamps on the sidecar's clock), LIVE only; null when not live or unreachable. The Binance lead/lag monitor polls this. */
+  async liveTickPoints(asset: string): Promise<{ t: number; p: number }[] | null> {
+    if (this.mode !== 'live') return null
+    try {
+      const res = await fetch(`${this.liveUrl.replace(/\/$/, '')}/tick_stats?asset=${encodeURIComponent(asset)}`, { signal: AbortSignal.timeout(2_500) })
+      const data = (await res.json()) as { ok?: boolean; points?: { time: number; price: number }[] }
+      if (!data?.ok || !Array.isArray(data.points)) return null
+      return data.points.map((x) => ({ t: Math.round(x.time * 1000), p: x.price }))
+    } catch { return null }
+  }
+
   async getTickSeries(asset: string): Promise<{ points: { time: number; price: number }[]; dataSource: 'tick' | 'candle' }> {
     if (this.mode === 'live') {
       try {

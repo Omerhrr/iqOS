@@ -3698,7 +3698,16 @@ function swingsOf(s: MslSeriesCtx, k: number, mode: number): Swings {
   return r
 }
 /** `px` / `px("5m")` - the RAW price series as a bundle (open high low close volume hl2 hlc3 ohlc4 range chg tr), so `px.high.max(20)`, `px.low.min(10)`, `px.close[-3]`, `px.close.crossed(...)` work without a loop. */
+// one bundle per series per evaluation: a script that reads px.volume[-i] in a loop used to rebuild all the derived series (hl2, hlc3, tr, ...) on EVERY access
+const pxBundleCache = new WeakMap<MslSeriesCtx, MslValue>()
 function pxBundle(s: MslSeriesCtx): MslValue {
+  const hit = pxBundleCache.get(s)
+  if (hit !== undefined) return hit
+  const v = pxBundleBuild(s)
+  pxBundleCache.set(s, v)
+  return v
+}
+function pxBundleBuild(s: MslSeriesCtx): MslValue {
   const n = s.close.length
   const mk = (g: (i: number) => number): MslValue => seriesValue(Array.from({ length: n }, (_, i) => g(i)))
   return bundleValue({

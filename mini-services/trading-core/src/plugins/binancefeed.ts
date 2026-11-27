@@ -15,6 +15,7 @@
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Plugin } from '../kernel'
+import type { IqMinute } from '../analytics/binancereplay'
 import { BINANCE_BIN, BINANCE_SYMBOLS, TF_SEC, aggAt, binanceCandles, binanceSymbolFor, nowBar, overlayVolume, type BinanceMinute, type BinanceNow, type FootRow, type MinuteSource } from '../analytics/binancedata'
 import { setBinanceReader } from '../analytics/strategylang'
 import type { Candle } from '../types'
@@ -59,12 +60,15 @@ export class BinanceFeed implements MinuteSource {
   private watchdog: ReturnType<typeof setInterval> | null = null
   private snapTimer: ReturnType<typeof setInterval> | null = null
   private snapWritten = 0
+  private iqPatched = new Set<string>()
   private sessionStartMs = 0
   private written = 0
   private recorderOn = true
   private readonly dir: string
   readonly restUrl: string
   readonly wsUrl: string
+  /** every Binance trade price (symbol, arrival ms, price): the lead/lag monitor listens here */
+  onPrice: ((symbol: string, ms: number, price: number) => void) | null = null
   /** the IQ 1m candle at a minute, for the recorder (so the saved file has both sides) */
   iqMinute: ((pair: string, timeSec: number) => { open: number; high: number; low: number; close: number } | undefined) | null = null
   private nowMs: () => number
@@ -126,6 +130,7 @@ export class BinanceFeed implements MinuteSource {
     if (st.lastAggId && aggId !== st.lastAggId + 1) f.complete = false // a hole in the trade ids: this minute's ladder is partial
     st.lastAggId = aggId
     st.lastTradeMs = tradeMs
+    if (this.onPrice) { try { this.onPrice(symbol, this.nowMs(), price) } catch { /* a listener must never break the feed */ } }
     const step = BINANCE_BIN[symbol] ?? 1
     const p = Math.round(price / step) * step
     let row = f.rows.get(p)
@@ -280,6 +285,21 @@ export class BinanceFeed implements MinuteSource {
       })
       appendFileSync(join(this.dir, `${day}.jsonl`), line + '\n')
       this.written++
+      // IQ's closed candle for this minute can land a moment AFTER Binance's: look again shortly and write a patch line (the replay loader merges it)
+      if (!iq && pair && this.iqMinute) {
+        for (const delay of [3000, 10_000]) {
+          const timer = setTimeout(() => {
+            try {
+              const q = this.iqMinute?.(pair, m.time)
+              if (!q || this.iqPatched.has(`${symbol}|${m.time}`)) return
+              this.iqPatched.add(`${symbol}|${m.time}`)
+              if (this.iqPatched.size > 5000) this.iqPatched.clear()
+              appendFileSync(join(this.dir, `${day}.jsonl`), JSON.stringify({ s: symbol, t: m.time, iqOnly: 1, iq: [q.open, q.high, q.low, q.close] }) + '\n')
+            } catch { /* best effort */ }
+          }, delay)
+          ;(timer as { unref?: () => void }).unref?.()
+        }
+      }
     } catch (e) { this.lastError = `recorder: ${e instanceof Error ? e.message : String(e)}` }
   }
 
@@ -313,12 +333,13 @@ export class BinanceFeed implements MinuteSource {
   private restore(): void {
     try {
       if (!existsSync(this.dir)) return
-      const files = readdirSync(this.dir).filter((f) => f.endsWith('.jsonl') && !f.startsWith('now-')).sort().slice(-RESTORE_DAYS)
+      const files = readdirSync(this.dir).filter((f) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(f)).sort().slice(-RESTORE_DAYS)
       for (const f of files) {
         for (const line of readFileSync(join(this.dir, f), 'utf8').split('\n')) {
           if (!line) continue
           try {
             const j = JSON.parse(line)
+            if (j.iqOnly) continue // an IQ candle patch line, not a minute
             this.addMinute(j.s, {
               time: j.t, open: j.o, high: j.h, low: j.l, close: j.c, volume: j.v, quoteVolume: j.q, trades: j.n, takerBuy: j.tb,
               ...(j.f ? { foot: (j.f as number[][]).map((r) => ({ price: r[0], buy: r[1], sell: r[2] })), footComplete: j.fc === 1 } : {}),
@@ -363,6 +384,9 @@ export class BinanceFeed implements MinuteSource {
     const last = this.lastClosed(symbol)
     return this.connected && this.lastMsgMs > 0 && this.nowMs() - this.lastMsgMs <= 15_000 && last > 0 && this.nowMs() / 1000 - last <= maxAgeSec
   }
+
+  recordedDir(): string { return this.dir }
+  recorderIsOn(): boolean { return this.recorderOn && this.enabled }
 
   // ---------- reads ----------
   health(): BinanceHealth {
@@ -425,11 +449,58 @@ export function binanceDataBlock(asset: string): string | null {
   return null
 }
 
+export interface RecordedData {
+  minutes: Map<string, BinanceMinute[]>
+  iq: Map<string, Map<number, IqMinute>>
+  files: string[]
+  /** per symbol: minutes held, minutes with a complete ladder, minutes with IQ's candle */
+  coverage: Record<string, { minutes: number; ladder: number; iq: number; first: number; last: number }>
+}
+
+/** every recorded minute file in `dir` (or only the days in [fromDay, toDay], "YYYY-MM-DD"): Binance minutes with their ladders plus IQ's candle of the same minute (inline or from a patch line) */
+export function loadRecorded(dir: string, fromDay?: string, toDay?: string): RecordedData {
+  const minutes = new Map<string, BinanceMinute[]>()
+  const iq = new Map<string, Map<number, IqMinute>>()
+  const files: string[] = []
+  if (existsSync(dir)) {
+    for (const f of readdirSync(dir).filter((x) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(x)).sort()) {
+      const day = f.slice(0, 10)
+      if ((fromDay && day < fromDay) || (toDay && day > toDay)) continue
+      files.push(f)
+      for (const line of readFileSync(join(dir, f), 'utf8').split('\n')) {
+        if (!line) continue
+        let j: any
+        try { j = JSON.parse(line) } catch { continue } // a torn last line
+        const sym = String(j.s)
+        if (Array.isArray(j.iq)) { let mp = iq.get(sym); if (!mp) iq.set(sym, (mp = new Map())); mp.set(j.t, { open: j.iq[0], high: j.iq[1], low: j.iq[2], close: j.iq[3] }) }
+        if (j.iqOnly) continue
+        let arr = minutes.get(sym); if (!arr) minutes.set(sym, (arr = []))
+        arr.push({
+          time: j.t, open: j.o, high: j.h, low: j.l, close: j.c, volume: j.v, quoteVolume: j.q, trades: j.n, takerBuy: j.tb,
+          ...(j.f ? { foot: (j.f as number[][]).map((r) => ({ price: r[0], buy: r[1], sell: r[2] })), footComplete: j.fc === 1 } : {}),
+        })
+      }
+    }
+  }
+  const coverage: RecordedData['coverage'] = {}
+  for (const [sym, arr] of minutes) {
+    arr.sort((a, b) => a.time - b.time)
+    const mp = iq.get(sym)
+    coverage[sym] = { minutes: arr.length, ladder: arr.filter((m) => m.footComplete).length, iq: mp ? arr.filter((m) => mp.has(m.time)).length : 0, first: arr[0]?.time ?? 0, last: arr[arr.length - 1]?.time ?? 0 }
+  }
+  return { minutes, iq, files, coverage }
+}
+
 /** run `fn` with binance.* reads pointed at this asset's Binance symbol (null reader when the pair has no Binance market or the feed is off) */
+/** the live Binance-vs-IQ lead/lag monitor (plugins/binancelead.ts) registers itself here so MSL's binance.gap()/leadMs() can read it */
+export interface LeadViewLite { leader: 'binance' | 'iq' | 'none'; lagMs: number; corr: number; stable: number; gapBps: number; fresh: boolean; ok: boolean }
+let activeLead: { view(pair: string): LeadViewLite | undefined } | null = null
+export function setActiveLeadSource(l: { view(pair: string): LeadViewLite | undefined } | null): void { activeLead = l }
+
 export function binanceReaderScope<T>(asset: string, fn: () => T): T {
   const feed = active
   const sym = binanceSymbolFor(asset)
-  setBinanceReader(feed && sym ? { asset, at: (t, tfSec) => aggAt(feed, sym, t, tfSec), now: (tfSec) => feed.now(sym, tfSec) } : null)
+  setBinanceReader(feed && sym ? { asset, at: (t, tfSec) => aggAt(feed, sym, t, tfSec), now: (tfSec) => feed.now(sym, tfSec), lead: () => activeLead?.view(asset) } : null)
   try { return fn() } finally { setBinanceReader(null) }
 }
 

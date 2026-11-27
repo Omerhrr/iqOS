@@ -1515,6 +1515,59 @@ expiry = expiryMin
 `,
   },
   {
+    id: 'meta:builtin-binance-lead',
+    name: 'Builtin: Binance leads IQ gap, live only (BTCUSD/ETHUSD)',
+    script: `
+# BINANCE LEADS IQ (LIVE ONLY): Binance is the deeper market, and IQ's quote trails it by a measured number of milliseconds. When Binance has moved and IQ has not caught up yet, the gap
+# (Binance minus IQ, in basis points, after removing their usual difference) points the way IQ is about to move: trade IQ in the direction of the gap. follow = with the gap, fade = against it.
+# It compares the two LIVE price streams, so it cannot be backtested on candles; test it on recorded ticks with the Binance tab's lead/lag analyzer. It only fires while the measured lead is real
+# (binance.leadOk(): both streams fresh and Binance clearly leads) and was stable over the recent estimates.
+# The gap only pays if your order reaches IQ before IQ's price catches up: the analyzer lets you set that order delay. NOT PROVEN: no results at all.
+
+input mode = "follow" options "follow", "fade" "Direction: with the gap or against it"
+input useWindow = false "Trade only inside the time window"
+input startHour = 13 min 0 max 24 "Window start (hour, 13.5 = 13:30, your clock)"
+input endHour = 16 min 0 max 24 "Window end (hour, your clock)"
+input utcOffset = 0 min -12 max 14 "Your clock vs UTC (hours, e.g. 1 for UTC+1)"
+input baseConf = 60 min 1 max 90 "Base confidence"
+input expiryMin = 1 min 1 max 15 "Expiry (minutes)"
+input minGapBps = 3 min 0.5 max 50 "Binance-vs-IQ gap at least (basis points, 1 bp = 0.01%)"
+input minCorr = 0.15 min 0.05 max 0.95 "Measured lead strength at least (correlation)"
+input minStable = 0.6 min 0 max 1 "Share of recent estimates where Binance led, at least"
+input maxLeadMs = 4000 min 200 max 5000 "Ignore the signal if IQ trails Binance by more than this (ms)"
+
+let nowMin = (timing.hour() * 60 + timing.minute() + utcOffset * 60 + 2880) % 1440
+let inSess = true
+if useWindow
+  if startHour <= endHour
+    inSess = nowMin >= startHour * 60 and nowMin < endHour * 60
+  else
+    inSess = nowMin >= startHour * 60 or nowMin < endHour * 60
+  end
+end
+
+let g = binance.gap()
+let ok = binance.leadOk() and binance.leadCorr() >= minCorr and binance.leadStable() >= minStable and binance.leadMs() <= maxLeadMs and abs(g) >= minGapBps
+let dir = 0
+if ok and g > 0
+  dir = 1
+elseif ok and g < 0
+  dir = -1
+end
+if mode == "fade"
+  dir = -dir
+end
+if inSess and dir > 0
+  call when true
+  confidence = baseConf
+elseif inSess and dir < 0
+  put when true
+  confidence = baseConf
+end
+expiry = expiryMin
+`,
+  },
+  {
     id: 'meta:builtin-binance-intrabar',
     name: 'Builtin: Binance intrabar delta, live only (BTCUSD/ETHUSD)',
     script: `

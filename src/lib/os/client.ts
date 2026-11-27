@@ -747,6 +747,100 @@ export async function getBinanceBars(pair: string, tf: string, n = 30): Promise<
 export async function setBinanceRecorder(on: boolean): Promise<{ ok: boolean; on: boolean }> {
   return osPost('/binance/recorder', { on })
 }
+export interface BinanceLeadEst { t: number; lagMs: number; corr: number; leader: 'binance' | 'iq' | 'none' }
+export interface BinanceLeadPair {
+  pair: string
+  leader: 'binance' | 'iq' | 'none'
+  lagMs: number
+  corr: number
+  stable: number
+  gapBps: number
+  fresh: boolean
+  ok: boolean
+  binAgeSec: number | null
+  iqAgeSec: number | null
+  iqPollAgeSec: number | null
+  note: string
+  binTicks: number
+  iqTicks: number
+  iqTicksPerMin: number
+  recvLatencyMs: number | null
+  history: BinanceLeadEst[]
+  curve: { lagMs: number; corr: number }[]
+  n: number
+}
+export type BinanceLeadResult = { ok: true; running: boolean; iqLive: boolean; recording: boolean; pairs: BinanceLeadPair[] } | { ok: false; error: string }
+export async function getBinanceLead(): Promise<BinanceLeadResult> {
+  return osGet('/binance/lead')
+}
+export interface BinanceLeadEdgeRow {
+  thresholdBps: number
+  horizonSec: number
+  trades: number
+  wins: number
+  winRate: number | null
+  breakeven: number
+  expectancy: number | null
+  avgMoveBps: number | null
+  ci: { lo: number; hi: number } | null
+  oos: { trades: number; winRate: number | null; expectancy: number | null } | null
+  verdict: 'no-trades' | 'too-few' | 'negative' | 'inconclusive' | 'candidate'
+  note: string
+}
+export type BinanceLeadReport =
+  | { ok: false; error: string }
+  | {
+      ok: true
+      pair: string
+      files: number
+      binTicks: number
+      iqTicks: number
+      spanSec: number
+      overall: { lagMs: number; corr: number; leader: string; n: number; note: string; curve: { lagMs: number; corr: number }[] }
+      hours: { from: number; to: number; lagMs: number; corr: number; leader: string; n: number }[]
+      edge: { rows: BinanceLeadEdgeRow[]; samples: number; spanSec: number; breakeven: number; note: string }
+    }
+export async function runBinanceLeadReport(req: { pair: string; delayMs: number; payout: number }): Promise<BinanceLeadReport> {
+  return osPost('/binance/lead_report', req)
+}
+export interface BinanceReplayRow {
+  id: string
+  label: string
+  variant: string
+  mode: string
+  expiryBars: number
+  ok: boolean
+  error?: string
+  candles: number
+  stats: {
+    trades: number
+    wins: number
+    winRate: number | null
+    breakeven: number
+    expectancy: number | null
+    ci: { lo: number; hi: number } | null
+    adjLo: number | null
+    oos: { trades: number; winRate: number | null; expectancy: number | null } | null
+    verdict: 'no-trades' | 'too-few' | 'negative' | 'inconclusive' | 'candidate'
+    note: string
+  } | null
+}
+export interface BinanceReplayResult {
+  ok: boolean
+  error?: string
+  pair: string
+  tf: string
+  payout: number
+  breakeven: number
+  coverage: { minutes?: number; from?: number; to?: number; [k: string]: unknown } | null
+  files: number
+  runs: number
+  note: string
+  rows: BinanceReplayRow[]
+}
+export async function runBinanceReplay(req: { pair: string; tf: string; expiry: number[]; payout: number; variants?: boolean }): Promise<BinanceReplayResult> {
+  return osPost('/binance/replay', req)
+}
 
 export async function getExplainer(asset: string, tf: Timeframe): Promise<ExplainerRead | { ok: false; error: string }> {
   return osGet('/explainer', { asset, tf })
