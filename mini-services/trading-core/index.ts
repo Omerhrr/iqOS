@@ -26,6 +26,7 @@ import { memoryGatePlugin } from './src/plugins/memory-gate'
 import { marketDataPlugin, MarketDataService } from './src/plugins/market-data'
 import { binanceFeedPlugin, getBinanceFeed, loadRecorded } from './src/plugins/binancefeed'
 import { binanceLeadPlugin, getLeadMonitor, leadReport } from './src/plugins/binancelead'
+import { buildIqBars, IQ_TF_SEC } from './src/analytics/iqticks'
 import { runBoard } from './src/plugins/binancereplayboard'
 import { aggAt, binanceSymbolFor, TF_SEC } from './src/analytics/binancedata'
 import { analyticsPlugin, AnalyticsService } from './src/plugins/analytics'
@@ -1028,6 +1029,32 @@ const httpServer = createServer(async (req, res) => {
       if (path === '/binance/health') {
         const f = getBinanceFeed()
         return json(200, f ? { ok: true, ...f.health() } : { ok: false, error: 'binance feed is not running' })
+      }
+      // IQ Option tab: tick activity / up-down tick delta / price ladder built from IQ's own quote changes, for ANY pair (IQ sends no traded volume)
+      if (path === '/iq/health' || path === '/iq/bars' || path === '/iq/now') {
+        const asset = String(url.searchParams.get('asset') ?? market.activeAsset).toUpperCase()
+        const info = market.listAssets().find((a) => a.ticker === asset)
+        if (!info) return json(400, { ok: false, error: `unknown pair ${asset}` })
+        const tfName = url.searchParams.get('tf') ?? '1m'
+        const tfSec = IQ_TF_SEC[tfName]
+        if (!tfSec) return json(400, { ok: false, error: `tf must be one of ${Object.keys(IQ_TF_SEC).join(', ')}` })
+        const fp = kernel.context().use<OtcFootprintService>('otcFootprint')
+        const ticks = await fp.ensure(asset)
+        const cov = fp.coverage(asset)
+        const nowMs = Date.now()
+        const live = market.mode === 'live'
+        const source = live ? 'IQ quote changes, sampled every 100 ms by the sidecar' : 'SIMULATED 1 s ticks (not IQ): connect the live IQ session for real quotes'
+        if (path === '/iq/health') {
+          const last = ticks.length ? ticks[ticks.length - 1].ts : null
+          const recent = ticks.filter((t) => t.ts >= nowMs - 300_000).length
+          return json(200, { ok: true, asset, name: info.name, mode: market.mode, live, source, otc: !!info.otc, ticksHeld: ticks.length, coverFromAgoSec: ticks.length ? Math.round((nowMs - cov.from) / 1000) : null, lastTickAgoSec: last ? Math.round((nowMs - last) / 1000) : null, ticksPerMin: Math.round(recent / 5), lostWindows: cov.losses.length, price: info.price, iqCandleVolume: market.getCandles(asset, '1m', 5, true).some((c) => c.volume > 0) })
+        }
+        const n = Math.min(200, Math.max(1, Number(url.searchParams.get('n') ?? 30)))
+        const built = buildIqBars(ticks, tfSec, cov, nowMs, n)
+        if (path === '/iq/now') return json(200, { ok: true, asset, tf: tfName, live, source, step: built.step, fresh: ticks.length > 0 && nowMs - ticks[ticks.length - 1].ts < (live ? 120_000 : 10_000), bar: built.forming })
+        const candles = new Map(market.getCandles(asset, tfName as Timeframe, 400, true).map((c) => [c.time, c]))
+        const bars = built.bars.map((b, i, arr) => ({ ...b, ladder: i === arr.length - 1 ? b.ladder : undefined, iq: candles.get(b.time) ?? null }))
+        return json(200, { ok: true, asset, tf: tfName, live, source, step: built.step, bars })
       }
       // live Binance-vs-IQ lead/lag: who moves first, by how many ms, the current gap in bps
       if (path === '/binance/lead') {
