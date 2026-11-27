@@ -6027,15 +6027,29 @@ function nearExpiryMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: stri
 // LIVE-ONLY reads of the bar still forming: binance.live() (fresh data), age() seconds into the bar, nowVolume/nowBuy/nowSell/nowDelta/nowDeltaPct/nowTrades/nowPoc/nowOpen/nowHigh/nowLow. Every number is still moving; they error in a backtest.
 // The numbers are BINANCE's market merged by the minute onto the chart candle: they say how the exchange traded, not what IQ Option's own quote did.
 // delta is the true aggressor split when footShare() is 1 (the feed saw every trade of the bar), otherwise the kline taker split.
-export interface BinanceReader { asset: string; at: (timeSec: number, tfSec: number) => import('./binancedata').BinanceAgg | undefined; /** the bar still forming (LIVE ONLY: absent in a replay/backtest) */ now?: (tfSec: number) => import('./binancedata').BinanceNow | undefined }
+export interface BinanceReader { asset: string; at: (timeSec: number, tfSec: number) => import('./binancedata').BinanceAgg | undefined; /** the bar still forming (LIVE ONLY: absent in a replay/backtest) */ now?: (tfSec: number) => import('./binancedata').BinanceNow | undefined; /** Binance-vs-IQ lead/lag view (LIVE ONLY) */ lead?: () => { leader: 'binance' | 'iq' | 'none'; lagMs: number; corr: number; stable: number; gapBps: number; fresh: boolean; ok: boolean } | undefined }
 let binanceReader: BinanceReader | null = null
 export function setBinanceReader(r: BinanceReader | null): void { binanceReader = r }
+const BINANCE_LEAD_METHODS = new Set(['gap', 'leadMs', 'leadCorr', 'leadStable', 'leadOk'])
 const BINANCE_NOW_METHODS = new Set(['live', 'age', 'nowVolume', 'nowBuy', 'nowSell', 'nowDelta', 'nowDeltaPct', 'nowTrades', 'nowPoc', 'nowOpen', 'nowHigh', 'nowLow'])
 const BINANCE_METHODS = new Set(['ok', 'volume', 'buyVolume', 'sellVolume', 'delta', 'deltaPct', 'trades', 'quoteVolume', 'poc', 'pocPos', 'footShare', 'real', 'complete', 'cumDelta'])
 function binanceMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
-  if (!BINANCE_METHODS.has(name) && !BINANCE_NOW_METHODS.has(name)) throw new MslRuntimeError(`unknown binance method "binance.${name}(...)" - use ${[...BINANCE_METHODS, ...BINANCE_NOW_METHODS].join('/')}`)
+  if (!BINANCE_METHODS.has(name) && !BINANCE_NOW_METHODS.has(name) && !BINANCE_LEAD_METHODS.has(name)) throw new MslRuntimeError(`unknown binance method "binance.${name}(...)" - use ${[...BINANCE_METHODS, ...BINANCE_NOW_METHODS, ...BINANCE_LEAD_METHODS].join('/')}`)
   const r = binanceReader
   if (!r) throw new MslRuntimeError('binance.*() has no Binance data here: it works on BTCUSD and ETHUSD while the Binance feed is on')
+  if (BINANCE_LEAD_METHODS.has(name)) {
+    // Binance vs IQ lead/lag: only exists live (it compares the two LIVE price streams), so a backtest/replay fails loudly instead of inventing a number
+    if (!r.lead) throw new MslRuntimeError(`binance.${name}() compares the live Binance and IQ price streams, which only exist live - it cannot run in a backtest or replay (the Binance tab's lead/lag analyzer tests it on recorded ticks)`)
+    const v = r.lead()
+    switch (name) {
+      case 'gap': return v && v.fresh ? v.gapBps : 0
+      case 'leadMs': return v ? v.lagMs : 0
+      case 'leadCorr': return v ? v.corr : 0
+      case 'leadStable': return v ? v.stable : 0
+      case 'leadOk': return !!(v && v.ok)
+    }
+    return 0
+  }
   const s = requireSeries(ctx, tf)
   const times = s.time
   if (!times || !times.length) throw new MslRuntimeError('binance.*() needs candle times, which are not available here')

@@ -124,7 +124,7 @@ export default function IqOptionPanel({ assets, initialAsset }: { assets: AssetR
 
       <div className="flex flex-wrap items-center gap-1">
         <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="find a pair (EURUSD, gold, OTC...)" className="w-56 rounded border border-[#141d2e] bg-[#0b1220] px-2 py-[2px] font-mono text-[10px] text-[#aab6cc]" />
-        {initialAsset && initialAsset !== asset && (
+        {initialAsset && initialAsset !== asset && assets.some((a) => a.ticker === initialAsset) && (
           <button type="button" onClick={() => { setAsset(initialAsset); remember(initialAsset, tf) }} className="rounded border border-[#2a3750] px-2 py-[2px] font-mono text-[10px] text-[#7c8aa5]">chart pair: {initialAsset}</button>
         )}
         <span className="mx-1 text-[#2a3750]">|</span>
