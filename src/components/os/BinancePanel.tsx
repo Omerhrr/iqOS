@@ -8,8 +8,8 @@
 // This is Binance's market, merged by the minute - it is NOT IQ Option's own quote.
 
 import { useCallback, useEffect, useState } from 'react'
-import { getBinanceBars, getBinanceHealth, setBinanceRecorder } from '@/lib/os/client'
-import type { BinanceBarsResult, BinanceBarView, BinanceHealthView } from '@/lib/os/client'
+import { getBinanceBars, getBinanceHealth, getBinanceNow, setBinanceRecorder } from '@/lib/os/client'
+import type { BinanceBarsResult, BinanceBarView, BinanceHealthView, BinanceNowResult } from '@/lib/os/client'
 
 const PAIRS = ['BTCUSD', 'ETHUSD'] as const
 const TFS = ['1m', '5m', '15m', '1h'] as const
@@ -58,6 +58,7 @@ export default function BinancePanel() {
   const [pair, setPair] = useState<(typeof PAIRS)[number]>('BTCUSD')
   const [tf, setTf] = useState<(typeof TFS)[number]>('1m')
   const [bars, setBars] = useState<BinanceBarsResult | null>(null)
+  const [now, setNow] = useState<BinanceNowResult | null>(null)
   const [err, setErr] = useState<string | null>(null)
 
   useEffect(() => {
@@ -95,6 +96,25 @@ export default function BinancePanel() {
     return () => clearInterval(id)
   }, [load])
 
+  // the bar still forming: refreshed every second (cheap: it is read from memory on the kernel)
+  useEffect(() => {
+    let alive = true
+    const tick = async () => {
+      try {
+        const n = await getBinanceNow(pair, tf)
+        if (alive) setNow(n)
+      } catch {
+        if (alive) setNow(null)
+      }
+    }
+    void tick()
+    const id = setInterval(() => void tick(), 1000)
+    return () => {
+      alive = false
+      clearInterval(id)
+    }
+  }, [pair, tf])
+
   const last: BinanceBarView | undefined = bars && bars.ok ? bars.bars[bars.bars.length - 1] : undefined
   const rows = bars && bars.ok ? [...bars.bars].reverse() : []
 
@@ -119,7 +139,7 @@ export default function BinancePanel() {
               className={`ml-auto rounded border px-2 py-[2px] font-mono text-[9px] uppercase ${health.recorder.on ? 'border-emerald-500/40 text-emerald-300' : 'border-[#2a3750] text-[#7c8aa5]'}`}
               title={`records every closed minute (candle, volume, footprint, IQ candle) to ${health.recorder.dir}`}
             >
-              recorder {health.recorder.on ? `on · ${health.recorder.written} saved` : 'off'}
+              recorder {health.recorder.on ? `on · ${health.recorder.written} min · ${health.recorder.snapshots ?? 0} snaps` : 'off'}
             </button>
           </>
         ) : (
@@ -152,6 +172,38 @@ export default function BinancePanel() {
           </button>
         ))}
       </div>
+
+      {now && now.ok && (
+        <div className="rounded border border-sky-500/30 bg-sky-500/5 p-2 font-mono text-[10px]">
+          <div className="mb-1 flex items-center gap-2 text-[#7c8aa5]">
+            <Pill ok={now.fresh && !!now.bar}>forming {tf} bar</Pill>
+            {now.bar ? (
+              <>
+                <span>{now.bar.ageSec}s of {now.bar.tfSec}s</span>
+                <div className="h-[4px] w-28 overflow-hidden rounded bg-[#141d2e]"><div className="h-full bg-sky-400" style={{ width: `${Math.min(100, (now.bar.ageSec / now.bar.tfSec) * 100)}%` }} /></div>
+                <span className="text-[9px]">still moving: every number below can change until the bar closes</span>
+              </>
+            ) : (
+              <span>no fresh data</span>
+            )}
+          </div>
+          {now.bar && (
+            <div className="grid gap-2 md:grid-cols-[1fr_1fr]">
+              <div className="grid grid-cols-2 gap-x-3 gap-y-0.5">
+                <span>open {now.bar.open}</span><span>last {now.bar.close}</span>
+                <span>high {now.bar.high}</span><span>low {now.bar.low}</span>
+                <span>volume {fmtV(now.bar.volume)}</span><span>trades {now.bar.trades}</span>
+                <span className="text-emerald-300">buy {fmtV(now.bar.buyVolume)}</span><span className="text-rose-300">sell {fmtV(now.bar.sellVolume)}</span>
+                <span className={now.bar.delta >= 0 ? 'text-emerald-300' : 'text-rose-300'}>delta {fmtV(now.bar.delta)}</span>
+                <span className={now.bar.delta >= 0 ? 'text-emerald-300' : 'text-rose-300'}>delta% {(now.bar.deltaPct * 100).toFixed(1)}</span>
+                <span>POC {now.bar.poc ?? '-'}</span>
+                <span>{now.bar.footShare >= 0.999 ? 'delta: true aggressor' : now.bar.footShare > 0 ? `delta: partly true (${Math.round(now.bar.footShare * 100)}%)` : 'delta: kline taker split'}</span>
+              </div>
+              <div>{now.bar.ladder.length ? <Ladder rows={now.bar.ladder} /> : <div className="rounded border border-[#141d2e] bg-[#080d16] p-2 text-[9px] text-[#7c8aa5]">No complete trade ladder for this bar yet.</div>}</div>
+            </div>
+          )}
+        </div>
+      )}
 
       {bars && !bars.ok && <div className="font-mono text-[10px] text-[#7c8aa5]">{bars.error}</div>}
       {bars && bars.ok && !last && <div className="font-mono text-[10px] text-[#7c8aa5]">No closed {tf} bar yet: the feed backfills about 16 hours of minutes when it connects.</div>}
@@ -201,7 +253,7 @@ export default function BinancePanel() {
 
       <div className="rounded border border-[#141d2e] bg-[#080d16] p-2 font-mono text-[9px] leading-relaxed text-[#7c8aa5]">
         <div className="mb-1 font-bold text-[#aab6cc]">Use it in a strategy</div>
-        <pre className="whitespace-pre-wrap text-[#aab6cc]">{`input dataSource = "volume" options "iq", "volume", "binance" "Data source"\n# iq      = IQ candles as they are (no volume on BTCUSD / ETHUSD)\n# volume  = IQ candles (price, entry, settlement) + Binance volume merged by the minute\n# binance = Binance's own candles, the trade is still placed on IQ Option\n# also: binance.volume() binance.delta() binance.deltaPct() binance.cumDelta(10) binance.poc() binance.real()`}</pre>
+        <pre className="whitespace-pre-wrap text-[#aab6cc]">{`input dataSource = "volume" options "iq", "volume", "binance" "Data source"\n# iq      = IQ candles as they are (no volume on BTCUSD / ETHUSD)\n# volume  = IQ candles (price, entry, settlement) + Binance volume merged by the minute\n# binance = Binance's own candles, the trade is still placed on IQ Option\n# closed bars: binance.volume() binance.delta() binance.deltaPct() binance.cumDelta(10) binance.poc() binance.real()\n# forming bar (live only): binance.live() binance.age() binance.nowVolume() binance.nowDelta() binance.nowDeltaPct() binance.nowPoc()`}</pre>
         <p className="mt-1">Works for BTCUSD and ETHUSD only (not OTC). A bar the feed does not hold completely reads as no data (volume 0), never invented. Binance is a different market from IQ Option&apos;s quote: backtest on both before trusting a signal built on it.</p>
       </div>
     </div>

@@ -1232,6 +1232,413 @@ expiry = expiryMin
 `,
   },
   {
+    id: 'meta:builtin-binance-delta',
+    name: 'Builtin: Binance delta follow-through (BTCUSD/ETHUSD)',
+    script: `
+# BINANCE DELTA FOLLOW-THROUGH: the last closed bar had real buying (or selling) pressure - delta as a share of volume - on above-average volume.
+# follow = trade with the delta, fade = against it. Delta is the true aggressor split when the feed saw every trade of the bar, otherwise the taker split.
+# Data: BTCUSD / ETHUSD only. NOT PROVEN: a first rule to test, no results yet. Backtest / paper trade before trusting it.
+
+input dataSource = "volume" options "iq", "volume", "binance" "Data source (volume = IQ candles + Binance volume)"
+input mode = "follow" options "follow", "fade" "Direction: with the signal or against it"
+input useWindow = false "Trade only inside the time window"
+input startHour = 13 min 0 max 24 "Window start (hour, 13.5 = 13:30, your clock)"
+input endHour = 16 min 0 max 24 "Window end (hour, your clock)"
+input utcOffset = 0 min -12 max 14 "Your clock vs UTC (hours, e.g. 1 for UTC+1)"
+input baseConf = 60 min 1 max 90 "Base confidence"
+input expiryMin = 1 min 1 max 15 "Expiry (minutes)"
+input minDeltaPct = 0.3 min 0.05 max 0.95 "Minimum |delta| / volume"
+input volMult = 1.2 min 0 max 10 "Volume at least this times the average"
+input avgBars = 20 min 3 max 100 "Average over (bars)"
+
+let nowMin = (timing.hour() * 60 + timing.minute() + utcOffset * 60 + 2880) % 1440
+let inSess = true
+if useWindow
+  if startHour <= endHour
+    inSess = nowMin >= startHour * 60 and nowMin < endHour * 60
+  else
+    inSess = nowMin >= startHour * 60 or nowMin < endHour * 60
+  end
+end
+
+let v = binance.volume()
+let sum = 0
+for i = 2 to avgBars + 1
+  sum = sum + binance.volume(-i)
+end
+let avg = sum / avgBars
+let dp = binance.deltaPct()
+let strong = binance.ok() and avg > 0 and v >= volMult * avg and abs(dp) >= minDeltaPct
+let dir = 0
+if strong and dp > 0
+  dir = 1
+elseif strong and dp < 0
+  dir = -1
+end
+if mode == "fade"
+  dir = -dir
+end
+if inSess and dir > 0
+  call when true
+  confidence = baseConf
+elseif inSess and dir < 0
+  put when true
+  confidence = baseConf
+end
+expiry = expiryMin
+`,
+  },
+  {
+    id: 'meta:builtin-binance-diverge',
+    name: 'Builtin: Binance delta divergence (BTCUSD/ETHUSD)',
+    script: `
+# BINANCE DELTA DIVERGENCE: price closed one way but the aggressors pushed the other (green candle with net selling, or red candle with net buying).
+# The signal is the HIDDEN side: green + net selling = put, red + net buying = call (mode follow). fade flips it.
+# Data: BTCUSD / ETHUSD only. NOT PROVEN: a first rule to test, no results yet.
+
+input dataSource = "volume" options "iq", "volume", "binance" "Data source (volume = IQ candles + Binance volume)"
+input mode = "follow" options "follow", "fade" "Direction: with the signal or against it"
+input useWindow = false "Trade only inside the time window"
+input startHour = 13 min 0 max 24 "Window start (hour, 13.5 = 13:30, your clock)"
+input endHour = 16 min 0 max 24 "Window end (hour, your clock)"
+input utcOffset = 0 min -12 max 14 "Your clock vs UTC (hours, e.g. 1 for UTC+1)"
+input baseConf = 60 min 1 max 90 "Base confidence"
+input expiryMin = 1 min 1 max 15 "Expiry (minutes)"
+input minDeltaPct = 0.2 min 0.05 max 0.95 "Minimum |delta| / volume against the candle"
+input minBodyAtr = 0.3 min 0 max 5 "Minimum candle body / range (0 = any)"
+
+let nowMin = (timing.hour() * 60 + timing.minute() + utcOffset * 60 + 2880) % 1440
+let inSess = true
+if useWindow
+  if startHour <= endHour
+    inSess = nowMin >= startHour * 60 and nowMin < endHour * 60
+  else
+    inSess = nowMin >= startHour * 60 or nowMin < endHour * 60
+  end
+end
+
+let o = px.open[-1]
+let c = px.close[-1]
+let rng = px.high[-1] - px.low[-1]
+let bodyOk = rng > 0 and abs(c - o) / rng >= minBodyAtr
+let dp = binance.deltaPct()
+let dir = 0
+if binance.ok() and bodyOk and c > o and dp <= -minDeltaPct
+  dir = -1
+elseif binance.ok() and bodyOk and c < o and dp >= minDeltaPct
+  dir = 1
+end
+if mode == "fade"
+  dir = -dir
+end
+if inSess and dir > 0
+  call when true
+  confidence = baseConf
+elseif inSess and dir < 0
+  put when true
+  confidence = baseConf
+end
+expiry = expiryMin
+`,
+  },
+  {
+    id: 'meta:builtin-binance-absorb',
+    name: 'Builtin: Binance absorption (BTCUSD/ETHUSD)',
+    script: `
+# BINANCE ABSORPTION: heavy volume and a strong one-sided delta, yet the candle barely moved: the other side absorbed it.
+# Heavy buying absorbed (delta up, small range) = put; heavy selling absorbed = call (mode follow). fade flips it.
+# Data: BTCUSD / ETHUSD only. NOT PROVEN: a first rule to test, no results yet.
+
+input dataSource = "volume" options "iq", "volume", "binance" "Data source (volume = IQ candles + Binance volume)"
+input mode = "follow" options "follow", "fade" "Direction: with the signal or against it"
+input useWindow = false "Trade only inside the time window"
+input startHour = 13 min 0 max 24 "Window start (hour, 13.5 = 13:30, your clock)"
+input endHour = 16 min 0 max 24 "Window end (hour, your clock)"
+input utcOffset = 0 min -12 max 14 "Your clock vs UTC (hours, e.g. 1 for UTC+1)"
+input baseConf = 60 min 1 max 90 "Base confidence"
+input expiryMin = 1 min 1 max 15 "Expiry (minutes)"
+input volMult = 1.5 min 0.5 max 10 "Volume at least this times the average"
+input rangeMax = 0.8 min 0.1 max 3 "Range at most this times the average range"
+input minDeltaPct = 0.25 min 0.05 max 0.95 "Minimum |delta| / volume"
+input avgBars = 20 min 3 max 100 "Average over (bars)"
+
+let nowMin = (timing.hour() * 60 + timing.minute() + utcOffset * 60 + 2880) % 1440
+let inSess = true
+if useWindow
+  if startHour <= endHour
+    inSess = nowMin >= startHour * 60 and nowMin < endHour * 60
+  else
+    inSess = nowMin >= startHour * 60 or nowMin < endHour * 60
+  end
+end
+
+let vs = 0
+let rs = 0
+for i = 2 to avgBars + 1
+  vs = vs + binance.volume(-i)
+  rs = rs + (px.high[-i] - px.low[-i])
+end
+let avgV = vs / avgBars
+let avgR = rs / avgBars
+let rng = px.high[-1] - px.low[-1]
+let dp = binance.deltaPct()
+let hot = binance.ok() and avgV > 0 and avgR > 0 and binance.volume() >= volMult * avgV and rng <= rangeMax * avgR and abs(dp) >= minDeltaPct
+let dir = 0
+if hot and dp > 0
+  dir = -1
+elseif hot and dp < 0
+  dir = 1
+end
+if mode == "fade"
+  dir = -dir
+end
+if inSess and dir > 0
+  call when true
+  confidence = baseConf
+elseif inSess and dir < 0
+  put when true
+  confidence = baseConf
+end
+expiry = expiryMin
+`,
+  },
+  {
+    id: 'meta:builtin-binance-cumdelta',
+    name: 'Builtin: Binance cumulative delta vs price (BTCUSD/ETHUSD)',
+    script: `
+# BINANCE CUMULATIVE DELTA vs PRICE: delta summed over the last N bars against the price change over the same bars.
+# Agreement (delta and price both up) = trend confirmed; DIVERGENCE (price up but cumulative delta down, or the reverse) = the move is not backed.
+# kind "diverge" trades the divergence (against the price move), "agree" trades with both.  mode flips whatever kind chose.
+# Data: BTCUSD / ETHUSD only. NOT PROVEN: a first rule to test, no results yet.
+
+input dataSource = "volume" options "iq", "volume", "binance" "Data source (volume = IQ candles + Binance volume)"
+input mode = "follow" options "follow", "fade" "Direction: with the signal or against it"
+input useWindow = false "Trade only inside the time window"
+input startHour = 13 min 0 max 24 "Window start (hour, 13.5 = 13:30, your clock)"
+input endHour = 16 min 0 max 24 "Window end (hour, your clock)"
+input utcOffset = 0 min -12 max 14 "Your clock vs UTC (hours, e.g. 1 for UTC+1)"
+input baseConf = 60 min 1 max 90 "Base confidence"
+input expiryMin = 1 min 1 max 15 "Expiry (minutes)"
+input kind = "diverge" options "diverge", "agree" "Signal"
+input window = 10 min 3 max 60 "Bars to sum"
+input minShare = 0.1 min 0.01 max 0.9 "Minimum |cum delta| / cum volume"
+
+let nowMin = (timing.hour() * 60 + timing.minute() + utcOffset * 60 + 2880) % 1440
+let inSess = true
+if useWindow
+  if startHour <= endHour
+    inSess = nowMin >= startHour * 60 and nowMin < endHour * 60
+  else
+    inSess = nowMin >= startHour * 60 or nowMin < endHour * 60
+  end
+end
+
+let cd = binance.cumDelta(window)
+let vs = 0
+for i = 1 to window
+  vs = vs + binance.volume(-i)
+end
+let share = if(vs > 0, cd / vs, 0)
+let move = px.close[-1] - px.close[-1 - window]
+let dir = 0
+if binance.ok() and vs > 0 and abs(share) >= minShare and move != 0
+  if kind == "agree" and share * move > 0
+    dir = if(move > 0, 1, -1)
+  elseif kind == "diverge" and share * move < 0
+    dir = if(move > 0, -1, 1)
+  end
+end
+if mode == "fade"
+  dir = -dir
+end
+if inSess and dir > 0
+  call when true
+  confidence = baseConf
+elseif inSess and dir < 0
+  put when true
+  confidence = baseConf
+end
+expiry = expiryMin
+`,
+  },
+  {
+    id: 'meta:builtin-binance-poc',
+    name: 'Builtin: Binance POC location (BTCUSD/ETHUSD)',
+    script: `
+# BINANCE POC LOCATION: where the heaviest traded price of the last closed bar sits inside its range (0 = low, 1 = high).
+# A green bar whose POC sits LOW (volume traded near the bottom, price then lifted away) and a red bar whose POC sits HIGH are read as rejection of that
+# side (mode follow = trade with the candle). A POC in the middle is skipped. fade flips it. Needs a complete trade ladder (binance.real()), so it only trades bars the feed watched from the start.
+# Data: BTCUSD / ETHUSD only. NOT PROVEN: a first rule to test, no results yet.
+
+input dataSource = "volume" options "iq", "volume", "binance" "Data source (volume = IQ candles + Binance volume)"
+input mode = "follow" options "follow", "fade" "Direction: with the signal or against it"
+input useWindow = false "Trade only inside the time window"
+input startHour = 13 min 0 max 24 "Window start (hour, 13.5 = 13:30, your clock)"
+input endHour = 16 min 0 max 24 "Window end (hour, your clock)"
+input utcOffset = 0 min -12 max 14 "Your clock vs UTC (hours, e.g. 1 for UTC+1)"
+input baseConf = 60 min 1 max 90 "Base confidence"
+input expiryMin = 1 min 1 max 15 "Expiry (minutes)"
+input edge = 0.3 min 0.05 max 0.5 "POC must be within this share of the range from the edge"
+
+let nowMin = (timing.hour() * 60 + timing.minute() + utcOffset * 60 + 2880) % 1440
+let inSess = true
+if useWindow
+  if startHour <= endHour
+    inSess = nowMin >= startHour * 60 and nowMin < endHour * 60
+  else
+    inSess = nowMin >= startHour * 60 or nowMin < endHour * 60
+  end
+end
+
+let pp = binance.pocPos()
+let o = px.open[-1]
+let c = px.close[-1]
+let dir = 0
+if binance.real()
+  if c > o and pp <= edge
+    dir = 1
+  elseif c < o and pp >= 1 - edge
+    dir = -1
+  end
+end
+if mode == "fade"
+  dir = -dir
+end
+if inSess and dir > 0
+  call when true
+  confidence = baseConf
+elseif inSess and dir < 0
+  put when true
+  confidence = baseConf
+end
+expiry = expiryMin
+`,
+  },
+  {
+    id: 'meta:builtin-binance-intrabar',
+    name: 'Builtin: Binance intrabar delta, live only (BTCUSD/ETHUSD)',
+    script: `
+# BINANCE INTRABAR DELTA (LIVE ONLY): inside the forming bar, once it is old enough, the running delta is one-sided on already-heavy volume - trade in that direction
+# without waiting for the close. follow = with the running delta, fade = against it. It reads the bar while it is still moving, so it cannot be backtested; it is meant for paper trading
+# while the recorder collects running snapshots to test it later. Needs the Binance feed fresh (binance.live()).
+# Data: BTCUSD / ETHUSD only. NOT PROVEN: no results at all.
+
+input dataSource = "volume" options "iq", "volume", "binance" "Data source (volume = IQ candles + Binance volume)"
+input mode = "follow" options "follow", "fade" "Direction: with the signal or against it"
+input useWindow = false "Trade only inside the time window"
+input startHour = 13 min 0 max 24 "Window start (hour, 13.5 = 13:30, your clock)"
+input endHour = 16 min 0 max 24 "Window end (hour, your clock)"
+input utcOffset = 0 min -12 max 14 "Your clock vs UTC (hours, e.g. 1 for UTC+1)"
+input baseConf = 60 min 1 max 90 "Base confidence"
+input expiryMin = 1 min 1 max 15 "Expiry (minutes)"
+input minAge = 30 min 5 max 55 "Only after this many seconds into the bar (1m chart)"
+input minDeltaPct = 0.4 min 0.05 max 0.95 "Running |delta| / volume at least"
+input volMult = 0.8 min 0.1 max 5 "Running volume at least this times the average closed bar"
+input avgBars = 20 min 3 max 100 "Average over (bars)"
+
+let nowMin = (timing.hour() * 60 + timing.minute() + utcOffset * 60 + 2880) % 1440
+let inSess = true
+if useWindow
+  if startHour <= endHour
+    inSess = nowMin >= startHour * 60 and nowMin < endHour * 60
+  else
+    inSess = nowMin >= startHour * 60 or nowMin < endHour * 60
+  end
+end
+
+let sum = 0
+for i = 1 to avgBars
+  sum = sum + binance.volume(-i)
+end
+let avg = sum / avgBars
+let dp = binance.nowDeltaPct()
+let ok = binance.live() and binance.age() >= minAge and avg > 0 and binance.nowVolume() >= volMult * avg and abs(dp) >= minDeltaPct
+let dir = 0
+if ok and dp > 0
+  dir = 1
+elseif ok and dp < 0
+  dir = -1
+end
+if mode == "fade"
+  dir = -dir
+end
+if inSess and dir > 0
+  call when true
+  confidence = baseConf
+elseif inSess and dir < 0
+  put when true
+  confidence = baseConf
+end
+expiry = expiryMin
+`,
+  },
+  {
+    id: 'meta:builtin-binance-volbreak',
+    name: 'Builtin: Binance volume breakout (BTCUSD/ETHUSD)',
+    script: `
+# VOLUME BREAKOUT, 1 BAR: when the last closed candle's volume is higher than the volume of EACH of the \`lookback\` (default 14) candles before it
+# (i.e. it is the highest volume of the last lookback + 1), trade in the direction of that candle for one bar: green candle = call, red candle = put.
+# mode "fade" trades against the candle instead (to compare).
+# A doji (open == close) is skipped. \`margin\` asks for the volume to beat the old high by a percentage (0 = just higher).
+# \`minBody\` skips candles whose body is tiny compared with their range (a huge volume with no body is indecision, not direction).
+# DATA: IQ Option sends no volume for BTCUSD / ETHUSD, so dataSource "volume" (default) takes IQ candles and adds Binance volume by the minute; "binance" uses Binance candles; "iq" uses IQ as is (no volume = no trades).
+# NOT PROVEN: a first rule from the idea, no validation across pairs. Backtest before trusting it. Needs real volume (not OTC).
+
+input dataSource = "volume" options "iq", "volume", "binance" "Data source (BTCUSD / ETHUSD volume comes from Binance)"
+input lookback = 14 min 2 max 100 "Lookback (bars)"
+input mode = "follow" options "follow", "fade" "Direction: with the candle or against it"
+input margin = 0 min 0 max 200 "Volume must beat the lookback high by (%)"
+input minBody = 0 min 0 max 1 "Minimum body / range (0 = any)"
+input useWindow = false "Trade only inside the time window"
+input startHour = 13 min 0 max 24 "Window start (hour, 13.5 = 13:30, your clock)"
+input endHour = 16 min 0 max 24 "Window end (hour, your clock)"
+input utcOffset = 0 min -12 max 14 "Your clock vs UTC (hours, e.g. 1 for UTC+1)"
+input baseConf = 60 min 1 max 90 "Base confidence"
+input step = 10 min 0 max 30 "Confidence per 100% volume above the old high"
+input expiryMin = 1 min 1 max 15 "Expiry (minutes) - 1 bar on a 1m chart"
+
+let nowMin = (timing.hour() * 60 + timing.minute() + utcOffset * 60 + 2880) % 1440
+let inSess = true
+if useWindow
+  if startHour <= endHour
+    inSess = nowMin >= startHour * 60 and nowMin < endHour * 60
+  else
+    inSess = nowMin >= startHour * 60 or nowMin < endHour * 60
+  end
+end
+
+let v = px.volume[-1]
+let prior = 0
+for i = 2 to lookback + 1
+  prior = max(prior, px.volume[-i])
+end
+let o = px.open[-1]
+let c = px.close[-1]
+let rng = px.high[-1] - px.low[-1]
+let bodyOk = rng > 0 and abs(c - o) / rng >= minBody
+let hot = prior > 0 and v > prior * (1 + margin / 100)
+let extra = if(prior > 0, v / prior - 1, 0)
+let conf = min(95, baseConf + step * extra)
+let dir = 0
+if c > o
+  dir = 1
+elseif c < o
+  dir = -1
+end
+if mode == "fade"
+  dir = -dir
+end
+if inSess and hot and bodyOk and dir > 0
+  call when true
+  confidence = conf
+elseif inSess and hot and bodyOk and dir < 0
+  put when true
+  confidence = conf
+end
+expiry = expiryMin
+`,
+  },
+  {
     id: 'meta:builtin-anchor-fade',
     name: 'Builtin: Anchor fade (gap from the 1h/4h/1d close, with inputs)',
     script: `

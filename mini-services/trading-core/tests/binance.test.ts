@@ -162,5 +162,22 @@ test('aggregateMinutes: delta is the footprint split only when EVERY minute carr
   const a = aggregateMinutes(T0, 120, [full, part], 1)!
   assert.equal(a.footShare, 0.5); near(a.delta, (0 + 1) - (3 + 1)) // falls back to taker split for the whole bar: buy 0+1, sell 3+1
 })
+test('POC is not reported from a partial ladder', () => {
+  const part: BinanceMinute = { time: T0, open: 1, high: 1, low: 1, close: 1, volume: 5, quoteVolume: 0, trades: 1, takerBuy: 2, foot: [{ price: 7, buy: 1, sell: 0 }], footComplete: false }
+  assert.equal(aggregateMinutes(T0, 60, [part], 1)!.poc, undefined)
+})
+test('MSL now-reads error in a reader without a live bar (backtest/replay), and live() reports freshness', () => {
+  const f = mkFeed(); fill(f, 0, 12)
+  const q = parseStrategyScript('call when binance.nowDelta() > 0\nconfidence = 60')
+  setBinanceReader({ asset: 'BTCUSD', at: (t, sec) => aggAt(f, SYM, t, sec) }) // no `now`: what a backtest has
+  const r = evaluateStrategyScript((q as { ast: never }).ast, {}, undefined, series(12))
+  assert.ok(r.error && /only exists live/i.test(r.error), r.error)
+  const q2 = parseStrategyScript('call when binance.live()\nconfidence = 60')
+  setBinanceReader({ asset: 'BTCUSD', at: () => undefined, now: () => undefined })
+  assert.equal(evaluateStrategyScript((q2 as { ast: never }).ast, {}, undefined, series(12)).direction, 'none')
+  setBinanceReader({ asset: 'BTCUSD', at: () => undefined, now: () => ({ ageSec: 5 } as never) })
+  assert.equal(evaluateStrategyScript((q2 as { ast: never }).ast, {}, undefined, series(12)).direction, 'call')
+  setBinanceReader(null)
+})
 console.log(`${pass}/${total}`)
 if (pass !== total) process.exit(1)

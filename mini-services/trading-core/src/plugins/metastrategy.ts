@@ -71,7 +71,7 @@ import {
   type MetaStrategySpec,
 } from '../analytics/metastrategy'
 import { BUILTIN_TV_SPECS } from './builtinTvSpecs'
-import { binanceReaderScope } from './binancefeed'
+import { binanceDataBlock, binanceReaderScope } from './binancefeed'
 import { parseStrategyScript, evaluateStrategyScript, clearMslState, flattenStmts, listScriptInputs, sanitizeInputOverrides, type MslInputDecl, type MslInputValue, type MslEvalResult, type MslSourceRead, type MslSeriesCtx, type MslBarValue, type MslAst } from '../analytics/strategylang'
 import { getStrategy } from '../strategies/builtin'
 import { directionBreakdown } from '../strategies/backtest'
@@ -947,7 +947,15 @@ export class MetaStrategyService {
    * engines scan a small pinned set for such a script instead of the whole rotating universe. */
   needsSubMinute(specId: string): boolean {
     const src = this.get(specId)?.script
-    return !!src && /\bstory\.(?:sp|ssp|spText|sspText)\s*\(|\btick\.|\btiming\.|\bfoot\./.test(src)
+    // binance.live()/age()/now*() read the Binance bar that is still forming, so a script using them is polled inside the bar like the other sub-minute scripts
+    return !!src && /\bstory\.(?:sp|ssp|spText|sspText)\s*\(|\btick\.|\btiming\.|\bfoot\.|\bbinance\.(?:live|age|now[A-Z]\w*)\s*\(/.test(src)
+  }
+
+  /** true when this saved script (as this slot runs it) reads Binance data: dataSource volume/binance, or any binance.* read. Engines use it to wait for the Binance minute of a just-closed bar. */
+  usesBinanceData(specId: string, slot?: string): boolean {
+    const spec = this.get(specId)
+    if (!spec?.script) return false
+    return this.dataSourceFor(spec.script, this.inputsFor(slot, spec.id, spec.script)) !== 'iq' || /\bbinance\./.test(spec.script)
   }
 
   inputDecls(specId: string): MslInputDecl[] {
@@ -2622,7 +2630,9 @@ export class MetaStrategyService {
     inputs?: Record<string, MslInputValue>,
   ): MetaEvalResult {
     const mode = this.dataSourceFor(script, inputs)
-    if (mode === 'iq') return this.evaluateScriptInner(specId, script, asset, tf, live, inputs)
+    if (mode === 'iq') return /\bbinance\./.test(script) ? binanceReaderScope(asset, () => this.evaluateScriptInner(specId, script, asset, tf, live, inputs)) : this.evaluateScriptInner(specId, script, asset, tf, live, inputs)
+    const block = binanceDataBlock(asset)
+    if (block) return { direction: 'none', score: 0, confidence: 0, conditions: [], notes: `no trade: ${block}` }
     return this.market.withDataSource(mode, () => binanceReaderScope(asset, () => this.evaluateScriptInner(specId, script, asset, tf, live, inputs)))
   }
 
@@ -2702,7 +2712,9 @@ export class MetaStrategyService {
    * script's preferred expiryMin when it set one. */
   testScript(script: string, asset: string, tf: Timeframe, inputs?: Record<string, MslInputValue>): ReturnType<MetaStrategyService['testScriptInner']> {
     const mode = this.dataSourceFor(script, inputs)
-    if (mode === 'iq') return this.testScriptInner(script, asset, tf, inputs)
+    if (mode === 'iq') return /\bbinance\./.test(script) ? binanceReaderScope(asset, () => this.testScriptInner(script, asset, tf, inputs)) : this.testScriptInner(script, asset, tf, inputs)
+    const block = binanceDataBlock(asset)
+    if (block) return { ok: false, error: `dataSource "${mode}": ${block}` }
     return this.market.withDataSource(mode, () => binanceReaderScope(asset, () => this.testScriptInner(script, asset, tf, inputs)))
   }
 

@@ -1046,6 +1046,18 @@ const httpServer = createServer(async (req, res) => {
         }
         return json(200, { ok: true, pair, symbol: sym, tf: tfName, bars: out.reverse() })
       }
+      // the bar still forming (live only): running volume / delta / footprint, refreshed by the Binance tab every second
+      if (path === '/binance/now') {
+        const f = getBinanceFeed()
+        const pair = (url.searchParams.get('pair') ?? 'BTCUSD').toUpperCase()
+        const sym = binanceSymbolFor(pair)
+        if (!f || !sym) return json(400, { ok: false, error: `no Binance market for ${pair} (only BTCUSD and ETHUSD)` })
+        const tfName = url.searchParams.get('tf') ?? '1m'
+        const sec = TF_SEC[tfName]
+        if (!sec) return json(400, { ok: false, error: `tf must be one of ${Object.keys(TF_SEC).join(', ')}` })
+        const nb = f.now(sym, sec)
+        return json(200, { ok: true, pair, symbol: sym, tf: tfName, fresh: f.isFresh(sym), bar: nb ?? null })
+      }
       if (path === '/binance/recorder' && req.method === 'POST') {
         const f = getBinanceFeed()
         if (!f) return json(400, { ok: false, error: 'binance feed is not running' })

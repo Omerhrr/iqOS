@@ -6015,20 +6015,42 @@ function nearExpiryMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: stri
 // binance.volume() / buyVolume() / sellVolume() / delta() / deltaPct() / trades() / quoteVolume() / poc() / pocPos() / footShare() /
 // real() / complete(), each (offset?, tf?)  -  offset -1 (default) = the last closed bar, -2 the one before.
 // binance.cumDelta(n?, tf?) = delta summed over the last n bars (default 10).  binance.ok(offset?, tf?) = that bar has Binance data.
+// LIVE-ONLY reads of the bar still forming: binance.live() (fresh data), age() seconds into the bar, nowVolume/nowBuy/nowSell/nowDelta/nowDeltaPct/nowTrades/nowPoc/nowOpen/nowHigh/nowLow. Every number is still moving; they error in a backtest.
 // The numbers are BINANCE's market merged by the minute onto the chart candle: they say how the exchange traded, not what IQ Option's own quote did.
 // delta is the true aggressor split when footShare() is 1 (the feed saw every trade of the bar), otherwise the kline taker split.
-export interface BinanceReader { asset: string; at: (timeSec: number, tfSec: number) => import('./binancedata').BinanceAgg | undefined }
+export interface BinanceReader { asset: string; at: (timeSec: number, tfSec: number) => import('./binancedata').BinanceAgg | undefined; /** the bar still forming (LIVE ONLY: absent in a replay/backtest) */ now?: (tfSec: number) => import('./binancedata').BinanceNow | undefined }
 let binanceReader: BinanceReader | null = null
 export function setBinanceReader(r: BinanceReader | null): void { binanceReader = r }
+const BINANCE_NOW_METHODS = new Set(['live', 'age', 'nowVolume', 'nowBuy', 'nowSell', 'nowDelta', 'nowDeltaPct', 'nowTrades', 'nowPoc', 'nowOpen', 'nowHigh', 'nowLow'])
 const BINANCE_METHODS = new Set(['ok', 'volume', 'buyVolume', 'sellVolume', 'delta', 'deltaPct', 'trades', 'quoteVolume', 'poc', 'pocPos', 'footShare', 'real', 'complete', 'cumDelta'])
 function binanceMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string | undefined): MslValue {
-  if (!BINANCE_METHODS.has(name)) throw new MslRuntimeError(`unknown binance method "binance.${name}(...)" - use ${[...BINANCE_METHODS].join('/')}`)
+  if (!BINANCE_METHODS.has(name) && !BINANCE_NOW_METHODS.has(name)) throw new MslRuntimeError(`unknown binance method "binance.${name}(...)" - use ${[...BINANCE_METHODS, ...BINANCE_NOW_METHODS].join('/')}`)
   const r = binanceReader
   if (!r) throw new MslRuntimeError('binance.*() has no Binance data here: it works on BTCUSD and ETHUSD while the Binance feed is on')
   const s = requireSeries(ctx, tf)
   const times = s.time
   if (!times || !times.length) throw new MslRuntimeError('binance.*() needs candle times, which are not available here')
   const sp = barSpacingSec(s)
+  if (BINANCE_NOW_METHODS.has(name)) {
+    // the bar that is still FORMING: live only. In a backtest/replay there is no such bar, so fail loudly instead of returning a number that could never have existed.
+    if (!r.now) throw new MslRuntimeError(`binance.${name}() reads the bar that is still forming, which only exists live - it cannot run in a backtest or replay (use the closed-bar reads binance.volume()/delta() there)`)
+    const nb = r.now(sp)
+    switch (name) {
+      case 'live': return !!nb
+      case 'age': return nb ? nb.ageSec : 0
+      case 'nowVolume': return nb ? nb.volume : 0
+      case 'nowBuy': return nb ? nb.buyVolume : 0
+      case 'nowSell': return nb ? nb.sellVolume : 0
+      case 'nowDelta': return nb ? nb.delta : 0
+      case 'nowDeltaPct': return nb ? nb.deltaPct : 0
+      case 'nowTrades': return nb ? nb.trades : 0
+      case 'nowPoc': return nb && nb.poc !== undefined ? nb.poc : 0
+      case 'nowOpen': return nb ? nb.open : 0
+      case 'nowHigh': return nb ? nb.high : 0
+      case 'nowLow': return nb ? nb.low : 0
+    }
+    return 0
+  }
   const at = (off: number) => {
     const idx = times.length + (off < 0 ? off : -1)
     return idx >= 0 && idx < times.length ? r.at(times[idx], sp) : undefined

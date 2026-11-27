@@ -106,7 +106,8 @@ export function aggregateMinutes(t: number, tfSec: number, minutes: readonly Bin
   const buy = useFoot ? footBuy : takerBuy
   const sell = useFoot ? footSell : volume - takerBuy
   const delta = buy - sell
-  const ladder = mergeFoot(sorted, step)
+  // POC only from minutes whose ladder is complete: a partial ladder (feed joined mid-minute) would name the wrong heaviest price
+  const ladder = mergeFoot(sorted.filter((m) => m.footComplete), step)
   let poc: number | undefined
   let best = -1
   for (const r of ladder) { const v = r.buy + r.sell; if (v > best) { best = v; poc = r.price } }
@@ -174,4 +175,27 @@ export function binanceCandles(tf: string, symbol: string, src: MinuteSource, li
     }
   }
   return out.slice(-limit)
+}
+
+/** the bar that is still FORMING right now (live only): running totals, never stored, never used in a backtest */
+export interface BinanceNow extends BinanceAgg {
+  /** seconds since this bar opened */
+  ageSec: number
+  tfSec: number
+  /** running ladder of the bar (only the minutes whose ladder is complete are in it) */
+  ladder: FootRow[]
+}
+
+/**
+ * Running bar of timeframe `tfSec`: the closed minutes already inside the current bucket plus the forming minute.
+ * `forming` is the minute in progress (its kline running totals and its trade ladder so far). The aggregate is flagged
+ * complete=false by construction (the bar has not closed) - consumers must treat every number as still moving.
+ */
+export function nowBar(closed: readonly BinanceMinute[], forming: BinanceMinute | undefined, tfSec: number, step: number, nowSec: number): BinanceNow | undefined {
+  const start = Math.floor(nowSec / tfSec) * tfSec
+  const inBucket = closed.filter((m) => m.time >= start && m.time < start + tfSec)
+  const mins = forming && forming.time >= start && forming.time < start + tfSec ? [...inBucket, forming] : inBucket
+  const a = aggregateMinutes(start, tfSec, mins, step)
+  if (!a) return undefined
+  return { ...a, complete: false, ageSec: Math.max(0, nowSec - start), tfSec, ladder: mergeFoot(mins.filter((m) => m.footComplete), step) }
 }

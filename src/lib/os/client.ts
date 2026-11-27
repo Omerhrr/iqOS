@@ -706,7 +706,7 @@ export interface BinanceHealthView {
   restUrl: string
   wsUrl: string
   symbols: { symbol: string; pair: string; minutesHeld: number; lastClosed: number; lastClosedAgoSec: number | null; footMinutes: number; lastTradeAgoSec: number | null }[]
-  recorder: { on: boolean; dir: string; written: number }
+  recorder: { on: boolean; dir: string; written: number; snapshots?: number }
 }
 export interface BinanceBarView {
   time: number
@@ -729,6 +729,15 @@ export interface BinanceBarView {
   ladder?: { price: number; buy: number; sell: number }[] | null
 }
 export type BinanceBarsResult = { ok: true; pair: string; symbol: string; tf: string; bars: BinanceBarView[] } | { ok: false; error: string }
+export interface BinanceNowView extends BinanceBarView {
+  ageSec: number
+  tfSec: number
+  ladder: { price: number; buy: number; sell: number }[]
+}
+export type BinanceNowResult = { ok: true; pair: string; symbol: string; tf: string; fresh: boolean; bar: BinanceNowView | null } | { ok: false; error: string }
+export async function getBinanceNow(pair: string, tf: string): Promise<BinanceNowResult> {
+  return osGet('/binance/now', { pair, tf })
+}
 export async function getBinanceHealth(): Promise<BinanceHealthView> {
   return osGet('/binance/health')
 }

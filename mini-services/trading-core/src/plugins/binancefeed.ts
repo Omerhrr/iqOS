@@ -12,10 +12,10 @@
 // ladder has a gap (reconnect, missing aggTrade id) is stored with footComplete=false and its delta falls back to the
 // kline taker split.
 
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Plugin } from '../kernel'
-import { BINANCE_BIN, BINANCE_SYMBOLS, aggAt, binanceCandles, binanceSymbolFor, overlayVolume, type BinanceMinute, type FootRow, type MinuteSource } from '../analytics/binancedata'
+import { BINANCE_BIN, BINANCE_SYMBOLS, TF_SEC, aggAt, binanceCandles, binanceSymbolFor, nowBar, overlayVolume, type BinanceMinute, type BinanceNow, type FootRow, type MinuteSource } from '../analytics/binancedata'
 import { setBinanceReader } from '../analytics/strategylang'
 import type { Candle } from '../types'
 
@@ -23,7 +23,9 @@ const MAX_MINUTES = 6000 // ~4 days of 1m per symbol
 const RESTORE_DAYS = 2
 
 interface Forming { rows: Map<number, FootRow>; trades: number; complete: boolean }
+interface Kl { t: number; o: number; h: number; l: number; c: number; v: number; q: number; n: number; V: number; atMs: number }
 interface SymState {
+  lastKline: Kl | null
   minutes: BinanceMinute[]
   forming: Map<number, Forming>
   lastAggId: number
@@ -41,7 +43,7 @@ export interface BinanceHealth {
   restUrl: string
   wsUrl: string
   symbols: { symbol: string; pair: string; minutesHeld: number; lastClosed: number; lastClosedAgoSec: number | null; footMinutes: number; lastTradeAgoSec: number | null }[]
-  recorder: { on: boolean; dir: string; written: number }
+  recorder: { on: boolean; dir: string; written: number; snapshots: number }
 }
 
 export class BinanceFeed implements MinuteSource {
@@ -55,6 +57,8 @@ export class BinanceFeed implements MinuteSource {
   private lastError: string | null = null
   private backoffMs = 1000
   private watchdog: ReturnType<typeof setInterval> | null = null
+  private snapTimer: ReturnType<typeof setInterval> | null = null
+  private snapWritten = 0
   private sessionStartMs = 0
   private written = 0
   private recorderOn = true
@@ -70,7 +74,7 @@ export class BinanceFeed implements MinuteSource {
     this.restUrl = (process.env.BINANCE_REST_URL ?? 'https://api.binance.com').replace(/\/$/, '')
     this.wsUrl = (process.env.BINANCE_WS_URL ?? 'wss://stream.binance.com:9443').replace(/\/$/, '')
     this.nowMs = opts.nowMs ?? Date.now
-    for (const sym of Object.values(BINANCE_SYMBOLS)) this.state.set(sym, { minutes: [], forming: new Map(), lastAggId: 0, lastTradeMs: 0, lastCloseMs: 0 })
+    for (const sym of Object.values(BINANCE_SYMBOLS)) this.state.set(sym, { lastKline: null, minutes: [], forming: new Map(), lastAggId: 0, lastTradeMs: 0, lastCloseMs: 0 })
   }
 
   symbols(): string[] { return [...this.state.keys()] }
@@ -132,9 +136,15 @@ export class BinanceFeed implements MinuteSource {
   }
 
   ingestKline(symbol: string, k: { t: number; o: string; h: string; l: string; c: string; v: string; q: string; n: number; V: string; x: boolean }): void {
-    if (!k.x) return // never serve a forming minute
     const st = this.state.get(symbol)
     if (!st) return
+    if (!k.x) {
+      // the minute in progress: kept ONLY for nowBar() (live reads), never added to the closed history
+      const t = Number(k.t), o = Number(k.o), h = Number(k.h), l = Number(k.l), c = Number(k.c), v = Number(k.v)
+      if ([t, o, h, l, c, v].every(Number.isFinite)) st.lastKline = { t: Math.floor(t / 1000), o, h, l, c, v, q: Number(k.q), n: Number(k.n), V: Number(k.V), atMs: this.nowMs() }
+      return
+    }
+    st.lastKline = null
     const timeSec = Math.floor(k.t / 1000)
     const f = st.forming.get(timeSec)
     const m: BinanceMinute = {
@@ -236,6 +246,10 @@ export class BinanceFeed implements MinuteSource {
     this.stopped = false
     this.restore()
     this.connect()
+    // running-bar snapshots for later intrabar strategy tests (data/binance/now-YYYY-MM-DD.jsonl); older than 14 days are pruned
+    this.pruneSnapshots()
+    const snapSec = Math.max(1, Number(process.env.BINANCE_SNAP_SEC ?? 5))
+    this.snapTimer = setInterval(() => this.snapshot(), snapSec * 1000)
     this.watchdog = setInterval(() => {
       // a socket that is "open" but silent for 60 s is dead: recycle it
       if (this.connected && this.nowMs() - this.lastMsgMs > 60_000) { try { this.ws?.close() } catch { /* ignore */ } }
@@ -245,6 +259,7 @@ export class BinanceFeed implements MinuteSource {
   stop(): void {
     this.stopped = true
     if (this.watchdog) clearInterval(this.watchdog)
+    if (this.snapTimer) clearInterval(this.snapTimer)
     try { this.ws?.close() } catch { /* ignore */ }
   }
 
@@ -268,11 +283,37 @@ export class BinanceFeed implements MinuteSource {
     } catch (e) { this.lastError = `recorder: ${e instanceof Error ? e.message : String(e)}` }
   }
 
+  /** one line per symbol: the minute in progress (running volume, taker buy, ladder buy/sell when complete). Public so a test can drive it. */
+  snapshot(): void {
+    if (!this.recorderOn || !this.enabled || !this.connected) return
+    try {
+      mkdirSync(this.dir, { recursive: true })
+      const nowMs = this.nowMs()
+      for (const sym of this.symbols()) {
+        const m = this.formingMinute(sym)
+        if (!m) continue
+        let bb: number | undefined, bs: number | undefined
+        if (m.foot && m.footComplete) { bb = 0; bs = 0; for (const r of m.foot) { bb += r.buy; bs += r.sell } }
+        const day = new Date(nowMs).toISOString().slice(0, 10)
+        appendFileSync(join(this.dir, `now-${day}.jsonl`), JSON.stringify({ s: sym, ts: nowMs, m: m.time, o: m.open, h: m.high, l: m.low, c: m.close, v: m.volume, n: m.trades, tb: m.takerBuy, ...(bb !== undefined ? { bb, bs } : {}) }) + '\n')
+        this.snapWritten++
+      }
+    } catch (e) { this.lastError = `snapshot: ${e instanceof Error ? e.message : String(e)}` }
+  }
+
+  private pruneSnapshots(): void {
+    try {
+      if (!existsSync(this.dir)) return
+      const cutoff = new Date(this.nowMs() - 14 * 86_400_000).toISOString().slice(0, 10)
+      for (const f of readdirSync(this.dir)) if (f.startsWith('now-') && f.slice(4, 14) < cutoff) unlinkSync(join(this.dir, f))
+    } catch { /* best effort */ }
+  }
+
   /** reload the last days of recorded minutes so a restart does not lose the footprint history */
   private restore(): void {
     try {
       if (!existsSync(this.dir)) return
-      const files = readdirSync(this.dir).filter((f) => f.endsWith('.jsonl')).sort().slice(-RESTORE_DAYS)
+      const files = readdirSync(this.dir).filter((f) => f.endsWith('.jsonl') && !f.startsWith('now-')).sort().slice(-RESTORE_DAYS)
       for (const f of files) {
         for (const line of readFileSync(join(this.dir, f), 'utf8').split('\n')) {
           if (!line) continue
@@ -286,6 +327,41 @@ export class BinanceFeed implements MinuteSource {
         }
       }
     } catch (e) { this.lastError = `restore: ${e instanceof Error ? e.message : String(e)}` }
+  }
+
+  // ---------- live (forming) bar ----------
+  /** the minute in progress as a BinanceMinute: kline running totals, overridden by the trade ladder when that ladder is complete (trades arrive faster than klines) */
+  private formingMinute(symbol: string): BinanceMinute | undefined {
+    const st = this.state.get(symbol)
+    const kl = st?.lastKline
+    if (!st || !kl) return undefined
+    const nowMin = Math.floor(this.nowMs() / 60000) * 60
+    if (kl.t !== nowMin || this.nowMs() - kl.atMs > 20_000) return undefined // stale kline: the minute rolled and no update came
+    const f = st.forming.get(kl.t)
+    const m: BinanceMinute = { time: kl.t, open: kl.o, high: kl.h, low: kl.l, close: kl.c, volume: kl.v, quoteVolume: kl.q, trades: kl.n, takerBuy: kl.V }
+    if (f && f.rows.size) {
+      m.foot = [...f.rows.values()].sort((a, b) => a.price - b.price)
+      m.footComplete = f.complete
+      if (f.complete) {
+        let buy = 0, sell = 0
+        for (const r of m.foot) { buy += r.buy; sell += r.sell }
+        if (buy + sell >= m.volume) { m.volume = buy + sell; m.takerBuy = buy }
+      }
+    }
+    return m
+  }
+
+  /** running bar on a timeframe; undefined when the feed has nothing fresh. LIVE ONLY. */
+  now(symbol: string, tfSec: number): BinanceNow | undefined {
+    const fm = this.formingMinute(symbol)
+    if (!fm) return undefined
+    return nowBar(this.range(symbol, Math.floor(this.nowMs() / 1000 / tfSec) * tfSec, fm.time), fm, tfSec, BINANCE_BIN[symbol] ?? 1, this.nowMs() / 1000)
+  }
+
+  /** true when the feed is connected, hearing messages and the newest closed minute is recent (<= maxAgeSec) */
+  isFresh(symbol: string, maxAgeSec = 150): boolean {
+    const last = this.lastClosed(symbol)
+    return this.connected && this.lastMsgMs > 0 && this.nowMs() - this.lastMsgMs <= 15_000 && last > 0 && this.nowMs() / 1000 - last <= maxAgeSec
   }
 
   // ---------- reads ----------
@@ -307,19 +383,53 @@ export class BinanceFeed implements MinuteSource {
       enabled: this.enabled, connected: this.connected, stale, reconnects: this.reconnects,
       lastMessageAgoSec: this.lastMsgMs ? Math.round((now - this.lastMsgMs) / 1000) : null,
       lastError: this.lastError, restUrl: this.restUrl, wsUrl: this.wsUrl,
-      symbols: syms, recorder: { on: this.recorderOn && this.enabled, dir: this.dir, written: this.written },
+      symbols: syms, recorder: { on: this.recorderOn && this.enabled, dir: this.dir, written: this.written, snapshots: this.snapWritten },
     }
   }
 }
 
 let active: BinanceFeed | null = null
 export function getBinanceFeed(): BinanceFeed | null { return active }
+/**
+ * A candle-close handler runs the instant IQ's candle closes; Binance's closed minute can land a moment later. Wait (up to maxMs) until the
+ * Binance minute that ends this candle is in, so a strategy never reads the bar before its volume exists. false = it did not arrive in time (skip the bar).
+ * A pair without a Binance market returns true (nothing to wait for).
+ */
+export async function binanceSettle(asset: string, tf: string, barTimeSec: number, maxMs = 3000): Promise<boolean> {
+  const sym = binanceSymbolFor(asset)
+  if (!sym) return true
+  const feed = active
+  if (!feed) return false
+  const need = barTimeSec + (TF_SEC[tf] ?? 60) - 60
+  const t0 = Date.now()
+  while (feed.lastClosed(sym) < need) {
+    if (Date.now() - t0 >= maxMs) return false
+    await new Promise((r) => setTimeout(r, 100))
+  }
+  return true
+}
+
+/** test seam: point the module at a feed built in a test */
+export function setActiveBinanceFeed(f: BinanceFeed | null): void { active = f }
+
+/**
+ * Fail-closed gate for a strategy that asked for Binance data (dataSource volume / binance): null = fine, otherwise the reason it must not trade.
+ * A pair with no Binance market, a missing/disconnected feed or a stale feed all stop the evaluation, so a "binance" strategy can never silently run on IQ candles.
+ */
+export function binanceDataBlock(asset: string): string | null {
+  const sym = binanceSymbolFor(asset)
+  if (!sym) return `dataSource needs a pair with a Binance market (BTCUSD, ETHUSD); ${asset} has none`
+  const feed = active
+  if (!feed) return 'the Binance feed is not running'
+  if (!feed.isFresh(sym)) return 'the Binance feed is stale or disconnected - not trading on old data'
+  return null
+}
 
 /** run `fn` with binance.* reads pointed at this asset's Binance symbol (null reader when the pair has no Binance market or the feed is off) */
 export function binanceReaderScope<T>(asset: string, fn: () => T): T {
   const feed = active
   const sym = binanceSymbolFor(asset)
-  setBinanceReader(feed && sym ? { asset, at: (t, tfSec) => aggAt(feed, sym, t, tfSec) } : null)
+  setBinanceReader(feed && sym ? { asset, at: (t, tfSec) => aggAt(feed, sym, t, tfSec), now: (tfSec) => feed.now(sym, tfSec) } : null)
   try { return fn() } finally { setBinanceReader(null) }
 }
 

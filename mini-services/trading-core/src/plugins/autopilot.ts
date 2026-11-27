@@ -22,6 +22,7 @@ import { classifyRegime } from '../analytics/regime'
 import { classifySession } from '../analytics/session'
 import { walkForward } from '../strategies/optimize'
 import type { GlobalScanRow, GlobalScanResult } from './nextcandle'
+import { binanceSettle } from './binancefeed'
 
 export interface BotConfig {
   id: string
@@ -898,6 +899,11 @@ export class AutopilotService {
         try {
           for (const { bot } of bots) {
             try {
+              // a bot whose strategy reads Binance data waits for the Binance minute that ends this candle (it can land a moment after IQ's close)
+              if (barTime && bot.strategyId.startsWith('meta:') && this.metaStrategyService()?.usesBinanceData(bot.strategyId, `bot:${bot.id}`) && !(await binanceSettle(asset, tf, barTime))) {
+                this.reject(bot, 'Binance data for the closed bar did not arrive in time - skipped, never traded on old data')
+                continue
+              }
               await this.tradeForBot(bot, asset, tf)
             } catch (err) {
               // strategy evaluation can throw on thin history - Task 59: surface
