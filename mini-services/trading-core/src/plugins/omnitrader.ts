@@ -298,6 +298,7 @@ export class OmniTraderService {
 
   configure(patch: Partial<OmniTraderConfig>): OmniTraderConfig {
     const sourceChanged = patch.metaStrategyId !== undefined && patch.metaStrategyId !== this.config.metaStrategyId
+    const before = this.config
     this.config = { ...this.config, ...patch }
     this.config.cooldownSec = Math.max(0, Math.round(Number(this.config.cooldownSec) || 0))
     this.config.globalCooldownSec = Math.max(0, Math.round(Number(this.config.globalCooldownSec) || 0))
@@ -318,6 +319,14 @@ export class OmniTraderService {
         }, this.config.intervalMs)
       }
     }
+    // Watchlist override: trim/uppercase/dedupe; an empty array (or null) clears back to the default pool. The dialog sends [] for a blank box: a missing key would mean "unchanged".
+    let assetsChanged = false
+    if (patch.assets !== undefined) {
+      const next = Array.isArray(patch.assets) ? [...new Set(patch.assets.map((a) => String(a).trim().toUpperCase()).filter((a) => a.length > 0))] : []
+      assetsChanged = JSON.stringify(next) !== JSON.stringify(before.assets ?? [])
+      this.config.assets = next.length ? next : undefined
+    }
+    if (assetsChanged) this.sweepEdge.rearm() // a different watchlist is a different candidate universe
     if (sourceChanged) this.sweepEdge.rearm() // a different spec's qualifiers are a different universe - see SweepEdgeMemory.beginSweep's own doc
     this.persist()
     this.ctx.log('omni-trader', `config updated - ${this.config.enabled ? 'armed' : 'off'} · spec ${this.config.metaStrategyId ?? '(none)'} · ${this.config.tf} · stake $${this.config.stake} · ${this.config.intervalMs}ms loop`)

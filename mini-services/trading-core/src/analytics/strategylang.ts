@@ -207,6 +207,7 @@ import {
   macd as macdInd,
   bollinger as bollingerInd,
   stochastic as stochasticInd,
+  stochRsi as stochRsiInd,
   adx as adxInd,
   supertrend as supertrendInd,
 } from './indicators'
@@ -6199,6 +6200,11 @@ function indicatorCall(name: string, args: MslValue[], s: MslSeriesCtx): MslValu
       const r = bollingerInd(close, n(0, 20), n(1, 2))
       return bundleValue({ upper: seriesValue(r.upper), mid: seriesValue(r.mid), lower: seriesValue(r.lower), width: seriesValue(r.width), percentB: seriesValue(r.percentB) })
     }
+    case 'stochrsi': {
+      // ind.stochrsi(rsiLen=14, stochLen=14, kSmooth=3, dSmooth=3) -> {k, d}: the stochastic of the RSI (0..100)
+      const r = stochRsiInd(close, n(0, 14), n(1, 14), n(2, 3), n(3, 3))
+      return bundleValue({ k: seriesValue(r.k), d: seriesValue(r.d) })
+    }
     case 'stoch': {
       const r = stochasticInd(high, low, close, n(0, 14), n(1, 3), n(2, 3))
       return bundleValue({ k: seriesValue(r.k), d: seriesValue(r.d) })
@@ -6215,7 +6221,7 @@ function indicatorCall(name: string, args: MslValue[], s: MslSeriesCtx): MslValu
       return bundleValue({ line: seriesValue(r.line), dir: seriesValue(r.dir) })
     }
     default:
-      throw new MslRuntimeError(`unknown indicator "ind.${name}(...)" - rsi/ema/sma/wma/hma/dema/t3/hema/vwap/ma(type,len)/pmax/lux/hull/kama/vwma/atr/roc/momentum/zscore/obv/cmf/forceindex/psar/macd/bb/stoch/adx/supertrend`)
+      throw new MslRuntimeError(`unknown indicator "ind.${name}(...)" - rsi/ema/sma/wma/hma/dema/t3/hema/vwap/ma(type,len)/pmax/lux/hull/kama/vwma/atr/roc/momentum/zscore/obv/cmf/forceindex/psar/macd/bb/stoch/stochrsi/adx/supertrend`)
   }
 }
 

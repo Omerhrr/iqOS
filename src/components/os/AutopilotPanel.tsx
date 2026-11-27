@@ -3025,6 +3025,8 @@ function MetaTraderDialog({
 }) {
   const [d, setD] = useState<MetaTraderConfig>(config)
   const [busy, setBusy] = useState(false)
+  // the watchlist box keeps what you type (commas and spaces included); the parsed list goes into the config. Blank sends [] - an undefined key would be dropped from the request and the old list would come back
+  const [assetsRaw, setAssetsRaw] = useState<string>((config.assets ?? []).join(', '))
   const [tab, setTab] = useState<string>('signal')
   const p = (patch: Partial<MetaTraderConfig>) => setD((prev) => ({ ...prev, ...patch }))
   /** Merge-compound-plan helper, same convention as the auto-trader dialog's own. */
@@ -3196,17 +3198,11 @@ function MetaTraderDialog({
           <div className="col-span-2">
             <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Watchlist override (optional)</Label>
             <Input
-              value={(d.assets ?? []).join(', ')}
-              onChange={(e) =>
-                p({
-                  assets: e.target.value.trim()
-                    ? e.target.value
-                        .split(',')
-                        .map((a) => a.trim().toUpperCase())
-                        .filter(Boolean)
-                    : undefined,
-                })
-              }
+              value={assetsRaw}
+              onChange={(e) => {
+                setAssetsRaw(e.target.value)
+                p({ assets: e.target.value.split(',').map((a) => a.trim().toUpperCase()).filter(Boolean) })
+              }}
               placeholder="EURUSD, GBPUSD, XAUUSD (comma-separated - leave blank for the default liquid pool)"
               className="mt-1 h-8 border-[#1c2739] bg-[#101828] font-mono text-[11px] text-[#e2e8f0]"
             />
@@ -3441,6 +3437,7 @@ function OmniTraderDialog({
   onSave: (patch: Partial<OmniTraderConfig>) => Promise<void>
 }) {
   const [d, setD] = useState<OmniTraderConfig>(config)
+  const [assetsRaw, setAssetsRaw] = useState<string>((config.assets ?? []).join(', '))
   const [busy, setBusy] = useState(false)
   const [tab, setTab] = useState<string>('signal')
   const p = (patch: Partial<OmniTraderConfig>) => setD((prev) => ({ ...prev, ...patch }))
@@ -3464,7 +3461,6 @@ function OmniTraderDialog({
   // nothing to pick wrong, rather than showing every spec and explaining
   // the restriction in prose only.
   const scriptSpecs = metaStrategies.filter((s) => !!s.script)
-  const assetsText = (d.assets ?? []).join(', ')
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -3587,17 +3583,11 @@ function OmniTraderDialog({
           <div className="col-span-2">
             <Label className="text-[9px] uppercase tracking-wider text-[#4b5a72]">Watchlist override (optional)</Label>
             <Input
-              value={assetsText}
-              onChange={(e) =>
-                p({
-                  assets: e.target.value.trim()
-                    ? e.target.value
-                        .split(',')
-                        .map((a) => a.trim().toUpperCase())
-                        .filter(Boolean)
-                    : undefined,
-                })
-              }
+              value={assetsRaw}
+              onChange={(e) => {
+                setAssetsRaw(e.target.value)
+                p({ assets: e.target.value.split(',').map((a) => a.trim().toUpperCase()).filter(Boolean) })
+              }}
               placeholder="EURUSD, GBPUSD, XAUUSD (comma-separated - leave blank for the default liquid pool)"
               className="mt-1 h-8 border-[#1c2739] bg-[#101828] font-mono text-[11px] text-[#e2e8f0]"
             />
