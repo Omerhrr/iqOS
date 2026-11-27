@@ -485,9 +485,24 @@ expiry = 1
 # DAO / WU WEI. Nine lenses read how price is behaving (yin/yang, cause and effect, life and death of the trend, time, space, momentum, fate, phase) and the wu wei lens decides whether to act at all:
 # it WAITS in a squeeze, when chasing an extended move, when fighting a strong prevailing move, when momentum stalls or pm and nm disagree. Most bars say WAIT by design.
 # Run /dao_research on the pair first (does inaction actually help on this pair?). Descriptions, not forecasts: backtest before trusting.
-let minFavour = 55
+input useWindow = true "Trade only inside the time window"
+input startHour = 13 min 0 max 24 "Window start (hour, 13.5 = 13:30, your clock)"
+input endHour = 16 min 0 max 24 "Window end (hour, your clock)"
+input utcOffset = 0 min -12 max 14 "Your clock vs UTC (hours, e.g. 1 for UTC+1)"
+input minFavour = 55 min 0 max 100 "Minimum favour"
+
+# time window: only trade between startHour and endHour on YOUR clock (utcOffset hours from UTC); runs on bar time in a backtest, wall clock live
+let nowMin = (timing.hour() * 60 + timing.minute() + utcOffset * 60 + 2880) % 1440
+let inSess = true
+if useWindow
+  if startHour <= endHour
+    inSess = nowMin >= startHour * 60 and nowMin < endHour * 60
+  else
+    inSess = nowMin >= startHour * 60 or nowMin < endHour * 60
+  end
+end
 let d = dao.all()
-let ok = d.ok and d.act and d.favour >= minFavour
+let ok = d.ok and d.act and d.favour >= minFavour and inSess
 call when ok and d.dir == "call"
 put when ok and d.dir == "put"
 expiry = 1
@@ -814,6 +829,21 @@ input adxMax = 25 min 10 max 60 "Skip when ADX is above"
 input baseConf = 58 min 1 max 90 "Base confidence"
 input step = 5 min 0 max 15 "Confidence per vote"
 input expiryMin = 3 min 1 max 15 "Expiry (minutes)"
+input useWindow = true "Trade only inside the time window"
+input startHour = 13 min 0 max 24 "Window start (hour, 13.5 = 13:30, your clock)"
+input endHour = 16 min 0 max 24 "Window end (hour, your clock)"
+input utcOffset = 0 min -12 max 14 "Your clock vs UTC (hours, e.g. 1 for UTC+1)"
+
+# time window: only trade between startHour and endHour on YOUR clock (utcOffset hours from UTC); runs on bar time in a backtest, wall clock live
+let nowMin = (timing.hour() * 60 + timing.minute() + utcOffset * 60 + 2880) % 1440
+let inSess = true
+if useWindow
+  if startHour <= endHour
+    inSess = nowMin >= startHour * 60 and nowMin < endHour * 60
+  else
+    inSess = nowMin >= startHour * 60 or nowMin < endHour * 60
+  end
+end
 
 let z = anchor.z(per)
 let d = 0
@@ -836,7 +866,7 @@ let dir = d
 if mode == "follow"
   dir = -d
 end
-let fire = d != 0 and votes >= minVotes and calm
+let fire = d != 0 and votes >= minVotes and calm and inSess
 
 if fire and dir > 0
   call when true
@@ -868,6 +898,21 @@ input needHigher = true "Higher anchor must agree"
 input baseConf = 60 min 1 max 90 "Base confidence"
 input step = 4 min 0 max 15 "Confidence per ADX 10 over minimum"
 input expiryMin = 3 min 1 max 15 "Expiry (minutes)"
+input useWindow = true "Trade only inside the time window"
+input startHour = 13 min 0 max 24 "Window start (hour, 13.5 = 13:30, your clock)"
+input endHour = 16 min 0 max 24 "Window end (hour, your clock)"
+input utcOffset = 0 min -12 max 14 "Your clock vs UTC (hours, e.g. 1 for UTC+1)"
+
+# time window: only trade between startHour and endHour on YOUR clock (utcOffset hours from UTC); runs on bar time in a backtest, wall clock live
+let nowMin = (timing.hour() * 60 + timing.minute() + utcOffset * 60 + 2880) % 1440
+let inSess = true
+if useWindow
+  if startHour <= endHour
+    inSess = nowMin >= startHour * 60 and nowMin < endHour * 60
+  else
+    inSess = nowMin >= startHour * 60 or nowMin < endHour * 60
+  end
+end
 
 let ev = anchor.bos(per)
 if trigger == "diCross"
@@ -879,7 +924,7 @@ let strong = anchor.adx(per) >= adxMin
 let notChased = abs(z) <= maxStretch
 let higherOk = (not needHigher) or ev * zl > 0
 let okSide = ev * z >= 0
-let fire = ev != 0 and strong and notChased and higherOk and okSide
+let fire = ev != 0 and strong and notChased and higherOk and okSide and inSess
 let conf = min(95, baseConf + step * (anchor.adx(per) - adxMin) / 10)
 if fire and ev > 0
   call when true
@@ -910,6 +955,21 @@ input adxMax = 30 min 10 max 60 "Skip when ADX is above"
 input baseConf = 60 min 1 max 90 "Base confidence"
 input step = 5 min 0 max 15 "Confidence bonus on a first touch"
 input expiryMin = 3 min 1 max 15 "Expiry (minutes)"
+input useWindow = true "Trade only inside the time window"
+input startHour = 13 min 0 max 24 "Window start (hour, 13.5 = 13:30, your clock)"
+input endHour = 16 min 0 max 24 "Window end (hour, your clock)"
+input utcOffset = 0 min -12 max 14 "Your clock vs UTC (hours, e.g. 1 for UTC+1)"
+
+# time window: only trade between startHour and endHour on YOUR clock (utcOffset hours from UTC); runs on bar time in a backtest, wall clock live
+let nowMin = (timing.hour() * 60 + timing.minute() + utcOffset * 60 + 2880) % 1440
+let inSess = true
+if useWindow
+  if startHour <= endHour
+    inSess = nowMin >= startHour * 60 and nowMin < endHour * 60
+  else
+    inSess = nowMin >= startHour * 60 or nowMin < endHour * 60
+  end
+end
 
 let dTouch = anchor.tapDemand(per) or anchor.inDemand(per)
 let sTouch = anchor.tapSupply(per) or anchor.inSupply(per)
@@ -918,8 +978,8 @@ let sFresh = anchor.supplyTests(per) <= 1
 let candleUp = anchor.pin(per) > 0 or anchor.reject(per) > 0 or anchor.hammer(per) > 0 or anchor.engulf(per) > 0
 let candleDn = anchor.pin(per) < 0 or anchor.reject(per) < 0 or anchor.hammer(per) < 0 or anchor.engulf(per) < 0
 let calm = anchor.adx(per) < adxMax
-let callOk = dTouch and ((not freshOnly) or dFresh) and ((not needCandle) or candleUp) and calm
-let putOk = sTouch and ((not freshOnly) or sFresh) and ((not needCandle) or candleDn) and calm
+let callOk = dTouch and ((not freshOnly) or dFresh) and ((not needCandle) or candleUp) and calm and inSess
+let putOk = sTouch and ((not freshOnly) or sFresh) and ((not needCandle) or candleDn) and calm and inSess
 if callOk and putOk
   callOk = false
   putOk = false
@@ -953,6 +1013,21 @@ input adxMax = 35 min 10 max 60 "Skip when ADX is above"
 input baseConf = 58 min 1 max 90 "Base confidence"
 input step = 5 min 0 max 15 "Bonus when the line is thick (yang)"
 input expiryMin = 3 min 1 max 15 "Expiry (minutes)"
+input useWindow = true "Trade only inside the time window"
+input startHour = 13 min 0 max 24 "Window start (hour, 13.5 = 13:30, your clock)"
+input endHour = 16 min 0 max 24 "Window end (hour, your clock)"
+input utcOffset = 0 min -12 max 14 "Your clock vs UTC (hours, e.g. 1 for UTC+1)"
+
+# time window: only trade between startHour and endHour on YOUR clock (utcOffset hours from UTC); runs on bar time in a backtest, wall clock live
+let nowMin = (timing.hour() * 60 + timing.minute() + utcOffset * 60 + 2880) % 1440
+let inSess = true
+if useWindow
+  if startHour <= endHour
+    inSess = nowMin >= startHour * 60 and nowMin < endHour * 60
+  else
+    inSess = nowMin >= startHour * 60 or nowMin < endHour * 60
+  end
+end
 
 let f = anchor.kagiFlip(per)
 let z = anchor.z(per)
@@ -963,7 +1038,7 @@ let kindOk = kind == "any" or (kind == "snapback" and against) or (kind == "cont
 let far = abs(z) >= minZ
 let higherOk = (not needHigher) or f * zl > 0
 let calm = anchor.adx(per) < adxMax
-let fire = f != 0 and kindOk and far and higherOk and calm
+let fire = f != 0 and kindOk and far and higherOk and calm and inSess
 let thick = anchor.kagiThick(per) * f > 0
 let conf = min(95, baseConf + if(thick, step, 0))
 if fire and f > 0
@@ -997,6 +1072,21 @@ input minVotes = 1 min 1 max 3 "Setups that must agree"
 input baseConf = 58 min 1 max 90 "Base confidence"
 input step = 5 min 0 max 15 "Confidence per vote"
 input expiryMin = 3 min 1 max 15 "Expiry (minutes)"
+input useWindow = true "Trade only inside the time window"
+input startHour = 13 min 0 max 24 "Window start (hour, 13.5 = 13:30, your clock)"
+input endHour = 16 min 0 max 24 "Window end (hour, your clock)"
+input utcOffset = 0 min -12 max 14 "Your clock vs UTC (hours, e.g. 1 for UTC+1)"
+
+# time window: only trade between startHour and endHour on YOUR clock (utcOffset hours from UTC); runs on bar time in a backtest, wall clock live
+let nowMin = (timing.hour() * 60 + timing.minute() + utcOffset * 60 + 2880) % 1440
+let inSess = true
+if useWindow
+  if startHour <= endHour
+    inSess = nowMin >= startHour * 60 and nowMin < endHour * 60
+  else
+    inSess = nowMin >= startHour * 60 or nowMin < endHour * 60
+  end
+end
 
 let z = anchor.z(per)
 let cap = anchor.capitulation(per)
@@ -1008,8 +1098,8 @@ end
 let up = if(cap > 0, 1, 0) + if(hunt > 0, 1, 0) + if(fm > 0, 1, 0)
 let dn = if(cap < 0, 1, 0) + if(hunt < 0, 1, 0) + if(fm < 0, 1, 0)
 let calm = anchor.adx(per) < adxMax
-let callOk = up >= minVotes and dn == 0 and z <= -minZ and calm
-let putOk = dn >= minVotes and up == 0 and z >= minZ and calm
+let callOk = up >= minVotes and dn == 0 and z <= -minZ and calm and inSess
+let putOk = dn >= minVotes and up == 0 and z >= minZ and calm and inSess
 if callOk
   call when true
   confidence = min(95, baseConf + step * up)
@@ -1038,6 +1128,21 @@ input adxMax = 30 min 10 max 60 "Skip when ADX is above"
 input baseConf = 58 min 1 max 90 "Base confidence"
 input step = 5 min 0 max 15 "Confidence per ATR beyond the stretch"
 input expiryMin = 3 min 1 max 15 "Expiry (minutes)"
+input useWindow = true "Trade only inside the time window"
+input startHour = 13 min 0 max 24 "Window start (hour, 13.5 = 13:30, your clock)"
+input endHour = 16 min 0 max 24 "Window end (hour, your clock)"
+input utcOffset = 0 min -12 max 14 "Your clock vs UTC (hours, e.g. 1 for UTC+1)"
+
+# time window: only trade between startHour and endHour on YOUR clock (utcOffset hours from UTC); runs on bar time in a backtest, wall clock live
+let nowMin = (timing.hour() * 60 + timing.minute() + utcOffset * 60 + 2880) % 1440
+let inSess = true
+if useWindow
+  if startHour <= endHour
+    inSess = nowMin >= startHour * 60 and nowMin < endHour * 60
+  else
+    inSess = nowMin >= startHour * 60 or nowMin < endHour * 60
+  end
+end
 
 let z = anchor.z(spec)
 let zPrev = anchor.z(-2, spec)
@@ -1046,8 +1151,8 @@ let turnUp = z > zPrev
 let calm = anchor.adx(spec) < adxMax
 let extra = max(0, abs(z) - stretch)
 let conf = min(95, baseConf + step * extra)
-let putOk = z >= stretch and ((not needTurn) or turnDown) and calm
-let callOk = z <= -stretch and ((not needTurn) or turnUp) and calm
+let putOk = z >= stretch and ((not needTurn) or turnDown) and calm and inSess
+let callOk = z <= -stretch and ((not needTurn) or turnUp) and calm and inSess
 if callOk
   call when true
   confidence = conf
@@ -1077,6 +1182,21 @@ input pullDepth = 0.5 min 0.1 max 3 "Pullback depth to buy / sell (ATR from the 
 input baseConf = 58 min 1 max 90 "Base confidence"
 input step = 4 min 0 max 15 "Confidence per ADX 10 beyond the regime line"
 input expiryMin = 3 min 1 max 15 "Expiry (minutes)"
+input useWindow = true "Trade only inside the time window"
+input startHour = 13 min 0 max 24 "Window start (hour, 13.5 = 13:30, your clock)"
+input endHour = 16 min 0 max 24 "Window end (hour, your clock)"
+input utcOffset = 0 min -12 max 14 "Your clock vs UTC (hours, e.g. 1 for UTC+1)"
+
+# time window: only trade between startHour and endHour on YOUR clock (utcOffset hours from UTC); runs on bar time in a backtest, wall clock live
+let nowMin = (timing.hour() * 60 + timing.minute() + utcOffset * 60 + 2880) % 1440
+let inSess = true
+if useWindow
+  if startHour <= endHour
+    inSess = nowMin >= startHour * 60 and nowMin < endHour * 60
+  else
+    inSess = nowMin >= startHour * 60 or nowMin < endHour * 60
+  end
+end
 
 let z = anchor.z(per)
 let zPrev = anchor.z(-2, per)
@@ -1101,10 +1221,10 @@ elseif adx > trendMin
   bonus = (adx - trendMin) / 10
 end
 let conf = min(95, baseConf + step * bonus)
-if side > 0
+if inSess and side > 0
   call when true
   confidence = conf
-elseif side < 0
+elseif inSess and side < 0
   put when true
   confidence = conf
 end
@@ -1130,6 +1250,21 @@ input stretch = 1 min 0.1 max 10 "Stretch (ATR)"
 input lookback = 15 min 2 max 100 "Lookback (bars)"
 input expiryMin = 3 min 1 max 15 "Expiry (minutes)"
 input baseConf = 60 min 1 max 95 "Confidence"
+input useWindow = true "Trade only inside the time window"
+input startHour = 13 min 0 max 24 "Window start (hour, 13.5 = 13:30, your clock)"
+input endHour = 16 min 0 max 24 "Window end (hour, your clock)"
+input utcOffset = 0 min -12 max 14 "Your clock vs UTC (hours, e.g. 1 for UTC+1)"
+
+# time window: only trade between startHour and endHour on YOUR clock (utcOffset hours from UTC); runs on bar time in a backtest, wall clock live
+let nowMin = (timing.hour() * 60 + timing.minute() + utcOffset * 60 + 2880) % 1440
+let inSess = true
+if useWindow
+  if startHour <= endHour
+    inSess = nowMin >= startHour * 60 and nowMin < endHour * 60
+  else
+    inSess = nowMin >= startHour * 60 or nowMin < endHour * 60
+  end
+end
 
 configure anchor.rocPeriod = lookback
 
@@ -1147,11 +1282,11 @@ end
 let up = side > 0
 let down = side < 0
 if mode == "fade"
-  put when up
-  call when down
+  put when up and inSess
+  call when down and inSess
 else
-  call when up
-  put when down
+  call when up and inSess
+  put when down and inSess
 end
 confidence = baseConf
 expiry = expiryMin
@@ -1174,6 +1309,21 @@ input lean = 0.58 min 0.5 max 0.95 "Lean (share of visits)"
 input minVisits = 20 min 20 max 500 "Minimum visits"
 input needAlike = false "Same-arrival visits must agree"
 input expiryMin = 3 min 1 max 15 "Expiry (minutes)"
+input useWindow = true "Trade only inside the time window"
+input startHour = 13 min 0 max 24 "Window start (hour, 13.5 = 13:30, your clock)"
+input endHour = 16 min 0 max 24 "Window end (hour, your clock)"
+input utcOffset = 0 min -12 max 14 "Your clock vs UTC (hours, e.g. 1 for UTC+1)"
+
+# time window: only trade between startHour and endHour on YOUR clock (utcOffset hours from UTC); runs on bar time in a backtest, wall clock live
+let nowMin = (timing.hour() * 60 + timing.minute() + utcOffset * 60 + 2880) % 1440
+let inSess = true
+if useWindow
+  if startHour <= endHour
+    inSess = nowMin >= startHour * 60 and nowMin < endHour * 60
+  else
+    inSess = nowMin >= startHour * 60 or nowMin < endHour * 60
+  end
+end
 
 configure anchor.bandWidth = 0.25
 configure anchor.window = 300
@@ -1203,7 +1353,7 @@ else
   ua = anchor.alikeUp(5, per)
 end
 let okAlike = not needAlike or ra
-let go = ok and n >= minVisits and okAlike
+let go = ok and n >= minVisits and okAlike and inSess
 let callAlike = not needAlike or ua >= lean
 let putAlike = not needAlike or ua <= 1 - lean
 call when go and u >= lean and callAlike
