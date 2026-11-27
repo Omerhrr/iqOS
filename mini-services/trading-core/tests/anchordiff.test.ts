@@ -665,4 +665,80 @@ test('MSL: new references work as anchor strings', () => {
   const r = computeAnchorDiff(walk, { anchor: '4h:vwap' })!.bars.at(-1)!
   assert.equal(mslRun(`call when anchor.anchor("4h:vwap") > ${r.anchor - 1e-9} and anchor.anchor("4h:vwap") < ${r.anchor + 1e-9}\nexpiry = 1\n`, walk).direction, 'call')
 })
+
+// ---- the anchor's OWN shock & pressure (anchor.sp / anchor.ssp): own measures, own parameters
+const spBars = (gaps: number[], sp?: Parameters<typeof computeAnchorDiff>[1] extends infer O ? (O extends { sp?: infer S } ? S : never) : never) => {
+  const base = flat(240), anchorPx = base[239][3]
+  const rows: [number, number, number, number][] = [...base]
+  let prev = anchorPx
+  for (const g of gaps) { const cl = anchorPx + g; rows.push([prev, Math.max(prev, cl) + 0.3, Math.min(prev, cl) - 0.3, cl]); prev = cl }
+  return computeAnchorDiff(mkc(rows), { anchor: '4h', sp })!.bars
+}
+const spMsl = (gaps: number[], body: string) => {
+  const base = flat(240), anchorPx = base[239][3]
+  const rows: [number, number, number, number][] = [...base]
+  let prev = anchorPx
+  for (const g of gaps) { const cl = anchorPx + g; rows.push([prev, Math.max(prev, cl) + 0.3, Math.min(prev, cl) - 0.3, cl]); prev = cl }
+  const cs = mkc(rows)
+  const series = { time: cs.map((x) => x.time), open: cs.map((x) => x.open), high: cs.map((x) => x.high), low: cs.map((x) => x.low), close: cs.map((x) => x.close), volume: cs.map((x) => x.volume) }
+  const q = parseStrategyScript(`let s = ${body}\ncall when s.direction == "call"\nput when s.direction == "put"\nexpiry = 1\n`); assert.ok(q.ok, body)
+  return evaluateStrategyScript((q as { ast: never }).ast, {}, undefined, series as never, undefined)
+}
+const drift = (per: number, n: number) => Array.from({ length: n }, (_, i) => per * (i + 1))
+test('anchor sp: measured from the anchor in ATR units, by hand', () => {
+  const dn = drift(-0.08, 40), g = [...dn, dn[39] - 0.9, dn[39] - 1.9]
+  const b = spBars(g).at(-1)!
+  near(b.spShockZ, (g[41] - g[38]) / b.atr, 1e-9)                      // burst = gap move over the last 3 candles
+  near(b.spDriftZ, g[38] / b.atr, 1e-9)                                // drift = gap at the start of the burst, since the anchor
+  near(b.spEff, 1, 1e-9); assert.equal(b.spPressure, -1); assert.equal(b.spShock, -1); assert.equal(b.spSignal, 1)   // pressure down + shock down: fade -> call
+})
+test('anchor sp: fade vs follow, shock against pressure, no shock, thresholds are the anchor\'s own parameters', () => {
+  const dn = drift(-0.08, 40), up = drift(0.08, 40)
+  assert.equal(spBars([...up, up[39] + 0.9, up[39] + 1.9]).at(-1)!.spSignal, -1)                       // up + up -> put
+  assert.equal(spBars([...dn, dn[39] - 0.9, dn[39] - 1.9], { mode: 'follow' }).at(-1)!.spSignal, -1)    // follow trades with the move
+  assert.equal(spBars([...dn, dn[39] + 0.9, dn[39] + 1.9]).at(-1)!.spSignal, 0)                         // burst against the drift
+  assert.equal(spBars(dn).at(-1)!.spSignal, 0)                                                          // no burst
+  assert.equal(spBars([...dn, dn[39] - 0.9, dn[39] - 1.9], { shockZ: 50 }).at(-1)!.spSignal, 0)         // shock threshold not met
+  assert.equal(spBars([...dn, dn[39] - 0.9, dn[39] - 1.9], { pressureZ: 500 }).at(-1)!.spSignal, 0)     // pressure threshold not met
+  assert.equal(spBars([...dn, dn[39] - 0.9, dn[39] - 1.9], { stretchZ: 500 }).at(-1)!.spSignal, 0)      // gap not stretched enough
+  assert.equal(spBars([...dn, dn[39] - 0.9, dn[39] - 1.9], { minBars: 90 }).at(-1)!.spSignal, 0)        // not enough path
+  const choppy = Array.from({ length: 40 }, (_, i) => (i % 2 ? -0.5 : 0.5)); const eff = spBars([...choppy, -2.4, -3.4]).at(-1)!
+  assert.ok(eff.spEff < 0.5 && eff.spPressure === 0)                                                    // zig-zag is not steady
+})
+test('anchor ssp: steady drift, no burst, with the chosen trend', () => {
+  const dn = drift(-0.05, 40), up = drift(0.05, 40)
+  assert.equal(spBars(dn).at(-1)!.sspSignal, -1); assert.equal(spBars(up).at(-1)!.sspSignal, 1)          // trend=side default
+  assert.equal(spBars([...dn, dn[39] - 0.9, dn[39] - 1.9]).at(-1)!.sspSignal, 0)                         // a burst cancels it
+  assert.equal(spBars(dn, { trend: 'kagi' }).at(-1)!.sspSignal, 0)                                      // no yang / yin yet
+  assert.equal(spBars(dn, { trend: 'ema' }).at(-1)!.sspSignal, -1)                                      // EMA20 < EMA50 after a steady fall
+})
+test('anchor sp per-bar fields: NO LOOK-AHEAD and reset at every roll', () => {
+  let sd = 2468; const rnd = () => { sd = (sd * 1664525 + 1013904223) % 4294967296; return sd / 4294967296 }
+  const rows: [number, number, number, number][] = []; let c = 100
+  for (let i = 0; i < 1000; i++) { const o = c; c += (rnd() - 0.5) * 1.4 + (i % 90 < 40 ? 0.05 : -0.05); rows.push([o, Math.max(o, c) + 0.1, Math.min(o, c) - 0.1, c]) }
+  const cs = mkc(rows)
+  const sp = { shockZ: 0.6, pressureZ: 0.4, eff: 0.3, stretchZ: 0.2 }
+  const full = computeAnchorDiff(cs, { anchor: '4h', sp })!, cut = computeAnchorDiff(cs.slice(0, 950), { anchor: '4h', sp })!
+  let fired = 0
+  for (let i = 0; i < cut.bars.length; i++) for (const f of ['spShockZ', 'spDriftZ', 'spEff', 'spPressure', 'spShock', 'spSignal', 'sspSignal'] as const) { assert.equal(String(full.bars[i][f]), String(cut.bars[i][f]), `${f}@${i}`); if ((f === 'spSignal' || f === 'sspSignal') && full.bars[i][f]) fired++ }
+  assert.ok(fired > 0)
+  const roll = full.bars.findIndex((b, i) => i > 0 && b.rolled)
+  assert.ok(Number.isNaN(full.bars[roll].spDriftZ) && full.bars[roll].spSignal === 0)                   // a new period starts from nothing
+})
+test('MSL anchor.sp / anchor.ssp: bundle, option strings, configs, text, errors', () => {
+  const dn = drift(-0.08, 40), g = [...dn, dn[39] - 0.9, dn[39] - 1.9]
+  const a = spMsl(g, 'anchor.sp("4h")'); assert.equal(a.error, undefined); assert.equal(a.direction, 'call')
+  assert.equal(spMsl(g, 'anchor.sp("4h", "mode=follow")').direction, 'put')
+  assert.equal(spMsl(g, 'anchor.sp("4h", "shockZ=50")').direction, 'none')
+  assert.equal(spMsl(g, 'anchor.sp("shockZ=0.5", "pressureZ=0.5", "eff=0.9", "burst=2", "stretchZ=0.5", "minBars=5", "4h")').direction, 'call')
+  assert.equal(spMsl(drift(-0.05, 40), 'anchor.ssp("4h")').direction, 'put')
+  assert.equal(spMsl(drift(-0.05, 40), 'anchor.ssp("4h", "trend=kagi")').direction, 'none')
+  const fields = mslRun('let s = anchor.sp("4h")\ncall when s.case == 0 and s.bars >= 1 and s.ok\nexpiry = 1\n', candles); assert.equal(fields.error, undefined)
+  assert.equal(spMsl(g, 'anchor.sp("4h:open")').error, undefined)
+  assert.ok(spMsl(g, 'anchor.sp("4h", "nonsense=1")').error); assert.ok(spMsl(g, 'anchor.sp("4h", "mode=sideways")').error); assert.ok(spMsl(g, 'anchor.sp("4h", "shockZ=-1")').error)
+  // per-bar read + condition use
+  const cond = mslRun('call when anchor.now("spSignal=1 & spPressure=-1", -1, "4h") or not anchor.now("spSignal=1", -1, "4h")\nexpiry = 1\n', candles)
+  assert.equal(cond.error, undefined)
+  const early = spMsl([0.1, 0.2], 'anchor.sp("4h")'); assert.equal(early.error, undefined); assert.equal(early.direction, 'none')
+})
 console.log(`${pass}/${total}`); if (pass !== total) process.exit(1)

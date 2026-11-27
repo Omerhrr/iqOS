@@ -283,6 +283,12 @@ export const MSL_READ_CONFIGS: Record<string, MslConfigSpec> = {
   'anchor.adxPeriod': { min: 2, max: 50, integer: true, desc: 'anchor ADX / DI period' },
   'anchor.kagiMult': { min: 0.1, max: 5, desc: 'anchor Kagi reversal size in ATR (yin / yang)' },
   'anchor.roundStep': { min: 0.0000001, max: 1000000, desc: 'anchor round-number reference: price step between round levels (default automatic)' },
+  'anchor.spShockZ': { min: 0.1, max: 10, desc: 'anchor SP: burst size (ATR) that counts as a shock' },
+  'anchor.spPressureZ': { min: 0.1, max: 20, desc: 'anchor SP: steady drift (ATR) needed for pressure' },
+  'anchor.spEff': { min: 0.1, max: 1, desc: 'anchor SP: minimum efficiency of the drift' },
+  'anchor.spBurst': { min: 1, max: 20, integer: true, desc: 'anchor SP: burst window in candles' },
+  'anchor.spStretchZ': { min: 0, max: 10, desc: 'anchor SP: gap must already be this stretched (ATR)' },
+  'anchor.spMinBars': { min: 2, max: 100, integer: true, desc: 'anchor SP: bars of path before pressure can exist' },
   'anchor.window': { min: 20, max: 2000, integer: true, desc: 'anchor-difference rolling window of closes for dwell and next-candle stats' },
   // Market Response Chart (analytics/mrc.ts) - the three event-trigger knobs
   // plus the trailing-average lookback its response/activity reads use.

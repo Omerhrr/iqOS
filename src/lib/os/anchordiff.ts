@@ -291,6 +291,21 @@ export interface PatternFields {
   kagiState: number
   /** +1 the state just became 2 (yang while still below the anchor: reclaim attempt), -1 just became -2 (yin while still above: fade) */
   kagiMixed: number
+  // ---- the anchor's OWN shock & pressure (not story.sp): measured on the gap path of the forming anchor period in ATR units, parameters in AnchorSpParams
+  /** signed gap move over the last `burst` bars (ending now) in ATR */
+  spShockZ: number
+  /** signed net gap drift BEFORE that burst, since the anchor, in ATR (NaN until `minBars` bars exist before the burst) */
+  spDriftZ: number
+  /** efficiency of the pre-burst drift: |net| / path */
+  spEff: number
+  /** +1 / -1 steady drift up / down (|drift| >= pressureZ and efficiency >= eff) */
+  spPressure: number
+  /** +1 / -1 a fresh burst up / down (|burst| >= shockZ) */
+  spShock: number
+  /** the SP call: pressure and shock in the SAME direction while the gap is stretched (>= stretchZ). mode fade (default): +1 call after a down move / -1 put after an up move; mode follow: the direction of the move */
+  spSignal: number
+  /** the SSP call: steady pressure with NO burst, traded WITH the trend: +1 call / -1 put (trend: side of the anchor, kagi thickness, or EMA20 vs EMA50) */
+  sspSignal: number
   /** what happened after earlier bars carrying the same signal value (only for signals active on this bar; newest statsTail bars only) */
   sigNext: Record<string, Record<AnchorHorizon, AnchorNext>>
 }
@@ -462,6 +477,8 @@ export interface AnchorDiffOptions {
   statsTail?: number
   /** bars each side for a swing pivot (default 3) */
   pivotLen?: number
+  /** the anchor's own shock & pressure parameters */
+  sp?: AnchorSpParams
   /** price step of the round-number reference ("round"); default 10^(floor(log10(price)) - 2), e.g. 0.01 for 1.15, 100 for 60000 */
   roundStep?: number
   /** Kagi reversal size in ATR (default 1) */
@@ -482,6 +499,24 @@ export function parseAnchorPeriod(p: string | number | undefined): number | null
   const sec = Math.round(Number(m[1]) * mult)
   return sec >= 60 ? sec : null
 }
+
+export interface AnchorSpParams {
+  /** burst size that counts as a shock, in ATR (default 1.0) */
+  shockZ?: number
+  /** steady drift needed for pressure, in ATR (default 1.0) */
+  pressureZ?: number
+  /** minimum efficiency of the drift, |net| / path (default 0.5) */
+  eff?: number
+  /** burst window in candles (default 3) */
+  burst?: number
+  /** the gap must already be this stretched (|z|, ATR) for spSignal (default 1.0) */
+  stretchZ?: number
+  /** bars of pre-burst path required before pressure can exist (default 6) */
+  minBars?: number
+  mode?: 'fade' | 'follow'
+  trend?: 'side' | 'kagi' | 'ema'
+}
+export const SP_DEFAULTS = { shockZ: 1.0, pressureZ: 1.0, eff: 0.5, burst: 3, stretchZ: 1.0, minBars: 6 } as const
 
 export type AnchorRef = 'close' | 'open' | 'high' | 'low' | 'vwap' | 'round' | 'session'
 export interface AnchorSpec { sec: number; ref: AnchorRef; session?: 'asia' | 'london' | 'ny' }
@@ -641,6 +676,7 @@ export function computeAnchorDiff(candles: Candle[], opts: AnchorDiffOptions = {
   }
   periodIndicators(bars, candles, idxOf, Math.max(2, Math.round(opts.rsiPeriod ?? 14)), Math.max(2, Math.round(opts.cciPeriod ?? 20)), Math.max(2, Math.round(opts.mfiPeriod ?? 14)), Math.max(2, Math.round(opts.atrPeriod ?? 14)))
   periodKagi(bars, Math.max(0.1, opts.kagiMult ?? 1))
+  periodSp(bars, candles, idxOf, opts.sp ?? {})
   const tailN = opts.statsTail !== undefined && opts.statsTail > 0 ? Math.max(1, Math.round(opts.statsTail)) : Infinity
   periodProfile(bars, bandW, candles, idxOf, tailN)
   levelsAndZones(bars, candles, idxOf, bandW, win, Math.max(1, Math.round(opts.pivotLen ?? 3)), opts.impulseAtr !== undefined && opts.impulseAtr > 0 ? opts.impulseAtr : 1.5, tailN)
@@ -814,14 +850,14 @@ function levelsAndZones(bars: AnchorBar[], candles: Candle[], idxOf: number[], b
   }
 }
 
-export const ANCHOR_SIGNALS = ['kagiFlip', 'kagiRev', 'kagiMixed', 'harami', 'tweezer', 'threeInside', 'piercing', 'hammer', 'invHammer', 'beltHold', 'threeStrike', 'kicker', 'fvg', 'fvgTap', 'obTap', 'rangeBreak', 'retest', 'double', 'hs', 'tlBreak', 'capitulation', 'fomo', 'stopHunt', 'expansion', 'diCross', 'bos', 'choch', 'sweep', 'engulf', 'pin', 'inside', 'outside', 'doji', 'soldiers', 'star', 'marubozu', 'exhaust', 'reject', 'trap', 'climax', 'eqHigh', 'eqLow'] as const
+export const ANCHOR_SIGNALS = ['spSignal', 'sspSignal', 'kagiFlip', 'kagiRev', 'kagiMixed', 'harami', 'tweezer', 'threeInside', 'piercing', 'hammer', 'invHammer', 'beltHold', 'threeStrike', 'kicker', 'fvg', 'fvgTap', 'obTap', 'rangeBreak', 'retest', 'double', 'hs', 'tlBreak', 'capitulation', 'fomo', 'stopHunt', 'expansion', 'diCross', 'bos', 'choch', 'sweep', 'engulf', 'pin', 'inside', 'outside', 'doji', 'soldiers', 'star', 'marubozu', 'exhaust', 'reject', 'trap', 'climax', 'eqHigh', 'eqLow'] as const
 
 function emptyPatterns(): PatternFields {
   const N = Number.NaN
   return {
     adx: N, plusDI: N, minusDI: N, diCross: 0, trend: 0, swingHigh: N, swingLow: N, swingHighDist: N, swingLowDist: N, bos: 0, choch: 0, sweep: 0, eqHigh: 0, eqLow: 0,
     engulf: 0, pin: 0, inside: 0, outside: 0, doji: 0, soldiers: 0, star: 0, marubozu: 0, exhaust: 0, reject: 0, anchorTouch: 0, trap: 0, climax: 0, streak: 0, er: N, sigNext: {},
-    harami: 0, tweezer: 0, threeInside: 0, piercing: 0, hammer: 0, invHammer: 0, beltHold: 0, threeStrike: 0, kicker: 0, fvg: 0, fvgTap: 0, inFvg: 0, obTap: 0, inOb: 0, pdZone: 0, ote: 0, inRange: 0, rangeBreak: 0, retest: 0, double: 0, hs: 0, tlBreak: 0, wedge: 0, channel: 0, capitulation: 0, fomo: 0, kagiDir: 0, kagiThick: 0, kagiShoulder: N, kagiWaist: N, kagiShoulderZ: N, kagiWaistZ: N, kagiFlip: 0, kagiRev: 0, kagiLines: 0, kagiSince: 0, kagiState: 0, kagiMixed: 0, gapFilled: 0, stopHunt: 0, squeeze: 0, expansion: 0, hour: 0, session: 0, regime: 0, fvgBullTop: N, fvgBullBottom: N, fvgBearTop: N, fvgBearBottom: N, obBullTop: N, obBullBottom: N, obBearTop: N, obBearBottom: N, pdPos: N, rangeHigh: N, rangeLow: N, tlSupport: N, tlResist: N, gapFill: N, volRatio: N,
+    harami: 0, tweezer: 0, threeInside: 0, piercing: 0, hammer: 0, invHammer: 0, beltHold: 0, threeStrike: 0, kicker: 0, fvg: 0, fvgTap: 0, inFvg: 0, obTap: 0, inOb: 0, pdZone: 0, ote: 0, inRange: 0, rangeBreak: 0, retest: 0, double: 0, hs: 0, tlBreak: 0, wedge: 0, channel: 0, capitulation: 0, fomo: 0, spShockZ: N, spDriftZ: N, spEff: N, spPressure: 0, spShock: 0, spSignal: 0, sspSignal: 0, kagiDir: 0, kagiThick: 0, kagiShoulder: N, kagiWaist: N, kagiShoulderZ: N, kagiWaistZ: N, kagiFlip: 0, kagiRev: 0, kagiLines: 0, kagiSince: 0, kagiState: 0, kagiMixed: 0, gapFilled: 0, stopHunt: 0, squeeze: 0, expansion: 0, hour: 0, session: 0, regime: 0, fvgBullTop: N, fvgBullBottom: N, fvgBearTop: N, fvgBearBottom: N, obBullTop: N, obBullBottom: N, obBearTop: N, obBearBottom: N, pdPos: N, rangeHigh: N, rangeLow: N, tlSupport: N, tlResist: N, gapFill: N, volRatio: N,
   }
 }
 
@@ -1030,6 +1066,47 @@ function periodKagi(bars: AnchorBar[], mult: number): void {
     if (state === 2 && prevState !== 2) b.kagiMixed = 1
     else if (state === -2 && prevState !== -2) b.kagiMixed = -1
     prevState = state
+  }
+}
+
+/** The anchor's own SHOCK & PRESSURE on the gap path of the forming anchor period (a pure function of bars <= i). The path starts at 0 on the anchor; a BURST is the gap move over the last `burst` candles;
+ * PRESSURE is the drift that came BEFORE that burst (anchor -> start of the burst) - steady if its efficiency is high. */
+function periodSp(bars: AnchorBar[], candles: Candle[], idxOf: number[], p: AnchorSpParams): void {
+  const shockZ = p.shockZ ?? SP_DEFAULTS.shockZ, pressureZ = p.pressureZ ?? SP_DEFAULTS.pressureZ, effMin = p.eff ?? SP_DEFAULTS.eff
+  const B = Math.max(1, Math.round(p.burst ?? SP_DEFAULTS.burst)), stretchZ = p.stretchZ ?? SP_DEFAULTS.stretchZ, minBars = Math.max(2, Math.round(p.minBars ?? SP_DEFAULTS.minBars))
+  const mode = p.mode ?? 'fade', trendMode = p.trend ?? 'side'
+  const m = bars.length
+  let e20: number[] = [], e50: number[] = []
+  if (trendMode === 'ema') {
+    const ema = (per: number) => { const out: number[] = new Array(candles.length).fill(Number.NaN); const k = 2 / (per + 1); let v = Number.NaN; for (let i = 0; i < candles.length; i++) { v = i === 0 ? candles[0].close : candles[i].close * k + v * (1 - k); if (i >= per - 1) out[i] = v } return out }
+    e20 = ema(20); e50 = ema(50)
+  }
+  let s = 0
+  const cum: number[] = [] // cum[j - s] = path length of the gap from the anchor to bar j
+  for (let i = 0; i < m; i++) {
+    const b = bars[i]
+    if (b.rolled || i === 0) { s = i; cum.length = 0 }
+    const prevGap = i === s ? 0 : bars[i - 1].close
+    cum.push((cum.length ? cum[cum.length - 1] : 0) + Math.abs(b.close - prevGap))
+    if (!(b.atr > 0)) continue
+    const k = i - s + 1
+    const bb = Math.min(B, k)
+    const gapAt = (j: number) => (j < s ? 0 : bars[j].close)
+    b.spShockZ = (b.close - gapAt(i - bb)) / b.atr
+    b.spShock = Math.abs(b.spShockZ) >= shockZ ? Math.sign(b.spShockZ) : 0
+    const restEnd = i - bb // last bar of the pre-burst drift (s-1 = the anchor itself)
+    if (restEnd - s + 1 >= minBars) {
+      const net = gapAt(restEnd), path = cum[restEnd - s]
+      b.spDriftZ = net / b.atr
+      b.spEff = path > 0 ? Math.abs(net) / path : 0
+      b.spPressure = Math.abs(b.spDriftZ) >= pressureZ && b.spEff >= effMin ? Math.sign(net) : 0
+    }
+    if (b.spPressure !== 0 && b.spShock === b.spPressure && Math.abs(b.z) >= stretchZ) b.spSignal = mode === 'fade' ? -b.spShock : b.spShock
+    if (b.spPressure !== 0 && b.spShock === 0) {
+      const k2 = idxOf[i]
+      const trend = trendMode === 'kagi' ? b.kagiThick : trendMode === 'ema' ? (Number.isFinite(e20[k2]) && Number.isFinite(e50[k2]) ? (e20[k2] > e50[k2] && candles[k2].close > e50[k2] ? 1 : e20[k2] < e50[k2] && candles[k2].close < e50[k2] ? -1 : 0) : 0) : Math.sign(b.close)
+      b.sspSignal = trend
+    }
   }
 }
 

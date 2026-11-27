@@ -232,7 +232,7 @@ import { kagi } from './kagi'
 import { computeSwing } from './swing'
 import { tickBars, type TickPoint } from './tickbars'
 import { computeBaseline } from './baseline'
-import { computeAnchorDiff, parseAnchorPeriod, parseAnchorSpec, valueArea, ANCHOR_SIGNALS, parseCondition, evalClause, condFieldNames, conditionStats } from './anchordiff'
+import { computeAnchorDiff, parseAnchorPeriod, parseAnchorSpec, SP_DEFAULTS, type AnchorSpParams, valueArea, ANCHOR_SIGNALS, parseCondition, evalClause, condFieldNames, conditionStats } from './anchordiff'
 import { hvSeries, realizedUpProb, ivFromPayout } from './ivhv'
 import { expiryMomentum, priceDisplacement, volAdjustedExpectedMove, reversalRisk, expiryStagnationExhaustion, candleCompletionProbability } from './expiryintel'
 import { detectGaps } from './gap'
@@ -5415,10 +5415,10 @@ function tickbarMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string 
  * Scalar reads take an optional offset like every other namespace (-1 = the latest bar, the default; -2 = the one before). */
 /** a script reads the newest bars only; computing dwell/next stats for the whole history on every evaluation would make backtests quadratic */
 const ANCHOR_STATS_TAIL = 40
-const ANCHOR_SIGNED_FIELDS = new Set(['adx', 'plusDI', 'minusDI', 'diCross', 'trend', 'swingHigh', 'swingLow', 'swingHighDist', 'swingLowDist', 'bos', 'choch', 'sweep', 'engulf', 'pin', 'soldiers', 'star', 'marubozu', 'exhaust', 'reject', 'trap', 'climax', 'streak', 'er', 'harami', 'tweezer', 'threeInside', 'piercing', 'hammer', 'invHammer', 'beltHold', 'threeStrike', 'kicker', 'fvg', 'fvgTap', 'inFvg', 'fvgBullTop', 'fvgBullBottom', 'fvgBearTop', 'fvgBearBottom', 'obTap', 'inOb', 'obBullTop', 'obBullBottom', 'obBearTop', 'obBearBottom', 'pdPos', 'pdZone', 'rangeHigh', 'rangeLow', 'rangeBreak', 'retest', 'double', 'hs', 'tlSupport', 'tlResist', 'tlBreak', 'wedge', 'channel', 'capitulation', 'fomo', 'gapFill', 'stopHunt', 'volRatio', 'expansion', 'hour', 'session', 'regime', 'kagiDir', 'kagiThick', 'kagiShoulder', 'kagiWaist', 'kagiShoulderZ', 'kagiWaistZ', 'kagiFlip', 'kagiRev', 'kagiLines', 'kagiSince', 'kagiState', 'kagiMixed'])
+const ANCHOR_SIGNED_FIELDS = new Set(['adx', 'plusDI', 'minusDI', 'diCross', 'trend', 'swingHigh', 'swingLow', 'swingHighDist', 'swingLowDist', 'bos', 'choch', 'sweep', 'engulf', 'pin', 'soldiers', 'star', 'marubozu', 'exhaust', 'reject', 'trap', 'climax', 'streak', 'er', 'harami', 'tweezer', 'threeInside', 'piercing', 'hammer', 'invHammer', 'beltHold', 'threeStrike', 'kicker', 'fvg', 'fvgTap', 'inFvg', 'fvgBullTop', 'fvgBullBottom', 'fvgBearTop', 'fvgBearBottom', 'obTap', 'inOb', 'obBullTop', 'obBullBottom', 'obBearTop', 'obBearBottom', 'pdPos', 'pdZone', 'rangeHigh', 'rangeLow', 'rangeBreak', 'retest', 'double', 'hs', 'tlSupport', 'tlResist', 'tlBreak', 'wedge', 'channel', 'capitulation', 'fomo', 'gapFill', 'stopHunt', 'volRatio', 'expansion', 'hour', 'session', 'regime', 'kagiDir', 'kagiThick', 'kagiShoulder', 'kagiWaist', 'kagiShoulderZ', 'kagiWaistZ', 'kagiFlip', 'kagiRev', 'kagiLines', 'kagiSince', 'kagiState', 'kagiMixed', 'spShockZ', 'spDriftZ', 'spEff', 'spPressure', 'spShock', 'spSignal', 'sspSignal'])
 const ANCHOR_FLAG_FIELDS = new Set(['eqHigh', 'eqLow', 'inside', 'outside', 'doji', 'anchorTouch', 'ote', 'inRange', 'gapFilled', 'squeeze'])
 const ANCHOR_STATS_METHODS = new Set(['poc', 'vah', 'val', 'pocZ', 'vahZ', 'valZ', 'pocDist', 'inValue', 'share', 'dwellRank', 'visits', 'ready', 'nextUp', 'nextBull', 'nextMove', 'alikeVisits', 'alikeReady', 'alikeUp', 'alikeMove', 'support', 'resistance', 'supportDist', 'resistanceDist', 'supportZ', 'resistanceZ', 'supportTouches', 'resistanceTouches', 'hasSupport', 'hasResistance', 'demandTop', 'demandBottom', 'demandFresh', 'demandTests', 'demandAge', 'demandStrength', 'demandDist', 'inDemand', 'tapDemand', 'hasDemand', 'supplyTop', 'supplyBottom', 'supplyFresh', 'supplyTests', 'supplyAge', 'supplyStrength', 'supplyDist', 'inSupply', 'tapSupply', 'hasSupply'])
-function anchorCompute(name: string, ctx: EvalEnv, period: string | undefined, tf: string | undefined, tail: number) {
+function anchorCompute(name: string, ctx: EvalEnv, period: string | undefined, tf: string | undefined, tail: number, spOver?: AnchorSpParams) {
   if (period !== undefined && parseAnchorSpec(period) === null)
     throw new MslRuntimeError(`anchor.${name}(): "${period}" is not an anchor period - use a period (\"15m\" \"30m\" \"1h\" \"4h\" \"1d\" \"1w\" or any <n>m / <n>h / <n>d, at least 1m), optionally with a reference (\"4h:open\" \"4h:high\" \"4h:low\" \"4h:vwap\"), a session (\"asia\" \"london\" \"ny\") or \"round\"`)
   const s = requireSeries(ctx, tf)
@@ -5427,7 +5427,7 @@ function anchorCompute(name: string, ctx: EvalEnv, period: string | undefined, t
   const atrPeriod = cfgNumLang(ctx, 'anchor.atrPeriod', undefined)
   const tms = s.time
   const cands = seriesToCandles(s).map((c, i) => ({ ...c, time: tms[i] }))
-  const r = computeAnchorDiff(cands, { anchor: period, rocPeriod, atrPeriod, bandWidth: cfgNumLang(ctx, 'anchor.bandWidth', undefined), window: cfgNumLang(ctx, 'anchor.window', undefined), pivotLen: cfgNumLang(ctx, 'anchor.pivotLen', undefined), roundStep: cfgNumLang(ctx, 'anchor.roundStep', undefined), kagiMult: cfgNumLang(ctx, 'anchor.kagiMult', undefined), adxPeriod: cfgNumLang(ctx, 'anchor.adxPeriod', undefined), impulseAtr: cfgNumLang(ctx, 'anchor.impulseAtr', undefined), statsTail: tail })
+  const r = computeAnchorDiff(cands, { anchor: period, rocPeriod, atrPeriod, bandWidth: cfgNumLang(ctx, 'anchor.bandWidth', undefined), window: cfgNumLang(ctx, 'anchor.window', undefined), pivotLen: cfgNumLang(ctx, 'anchor.pivotLen', undefined), sp: { shockZ: cfgNumLang(ctx, 'anchor.spShockZ', undefined), pressureZ: cfgNumLang(ctx, 'anchor.spPressureZ', undefined), eff: cfgNumLang(ctx, 'anchor.spEff', undefined), burst: cfgNumLang(ctx, 'anchor.spBurst', undefined), stretchZ: cfgNumLang(ctx, 'anchor.spStretchZ', undefined), minBars: cfgNumLang(ctx, 'anchor.spMinBars', undefined), ...spOver }, roundStep: cfgNumLang(ctx, 'anchor.roundStep', undefined), kagiMult: cfgNumLang(ctx, 'anchor.kagiMult', undefined), adxPeriod: cfgNumLang(ctx, 'anchor.adxPeriod', undefined), impulseAtr: cfgNumLang(ctx, 'anchor.impulseAtr', undefined), statsTail: tail })
   if (!r) throw new MslRuntimeError(`anchor.${name}(): bad anchor period "${period}"`)
   if (!r.bars.length)
     throw new MslRuntimeError(`anchor.${name}(): no bar has a completed ${period} anchor before it in this window - the candle history is shorter than one ${period} period (use a smaller anchor, or a longer history)`)
@@ -5505,6 +5505,48 @@ function anchorMultiMethod(name: string, args: MslValue[], strs: string[], ctx: 
     case 'diverge': return g[0].close > 0 && g[1].close < 0 ? 1 : g[0].close < 0 && g[1].close > 0 ? -1 : 0
     default: return g.reduce((a, b) => a + (b.close > 0 ? 1 : b.close < 0 ? -1 : 0), 0)
   }
+}
+
+const ANCHOR_SP_METHODS = new Set(['sp', 'ssp', 'spText', 'sspText'])
+/** `anchor.sp("4h", ...)` / `anchor.ssp("4h", ...)` (+ spText / sspText): the anchor's OWN shock & pressure (not story.sp - own measures, own parameters), read on the gap path of the forming anchor period, in ATR units.
+ * PRESSURE = the drift from the anchor up to the start of the burst: |drift| >= pressureZ ATR and steady (efficiency |net| / path >= eff), with at least minBars bars of path. SHOCK = the gap move over the last `burst` candles >= shockZ ATR.
+ * sp: pressure and shock in the SAME direction while the gap is already stretched (|z| >= stretchZ): mode=fade (default) trades against it (up -> put, down -> call), mode=follow trades with it.
+ * ssp: steady pressure and NO shock, traded WITH the trend: trend=side (default: above / below the anchor) | kagi (yang up, yin down) | ema (EMA20 vs EMA50 of the chart).
+ * Parameters are option strings: "shockZ=1.2" "pressureZ=0.8" "eff=0.6" "burst=3" "stretchZ=1" "minBars=6" "mode=follow" "trend=kagi"; defaults can be set with the configs anchor.spShockZ / spPressureZ / spEff / spBurst / spStretchZ / spMinBars.
+ * Per-bar fields spShockZ spDriftZ spEff spPressure spShock spSignal sspSignal exist too (anchor.spSignal("4h") is +1 call / -1 put, usable in anchor.now / whenUp conditions). Candle resolution only, so it backtests. Thresholds are first guesses, not fitted. */
+function anchorSp(name: string, optStrs: string[], period: string | undefined, tf: string | undefined, ctx: EvalEnv): MslValue {
+  const isSsp = name === 'ssp' || name === 'sspText'
+  const sp: AnchorSpParams = {}
+  const NUMS = ['shockZ', 'pressureZ', 'eff', 'burst', 'stretchZ', 'minBars'] as const
+  for (const o of optStrs) {
+    const eq = o.indexOf('='), k = o.slice(0, eq), v = o.slice(eq + 1)
+    const bad = () => new MslRuntimeError(`anchor.${name}(): unknown option "${o}" - use shockZ= pressureZ= eff= burst= stretchZ= minBars= (numbers), mode=fade|follow, trend=side|kagi|ema`)
+    if ((NUMS as readonly string[]).includes(k)) { const n = Number(v); if (!Number.isFinite(n) || n < 0) throw bad(); (sp as Record<string, number>)[k] = n }
+    else if (k === 'mode') { if (v !== 'fade' && v !== 'follow') throw bad(); sp.mode = v }
+    else if (k === 'trend') { if (v !== 'side' && v !== 'kagi' && v !== 'ema') throw bad(); sp.trend = v }
+    else throw bad()
+  }
+  const r = anchorCompute(name, ctx, period, tf, 1, sp)
+  const s = requireSeries(ctx, tf)
+  const last = r.bars[r.bars.length - 1]
+  const fail = (msg: string): MslValue => (name === 'spText' || name === 'sspText' ? msg : bundleValue({ ok: false, error: msg, direction: 'none', case: 0, pressure: false, shock: false, text: msg }))
+  if (!s.time || last.time !== s.time[s.time.length - 1]) return fail('the anchor has no bar on the newest candle (session closed?)')
+  let st = r.bars.length - 1
+  while (st > 0 && !r.bars[st].rolled) st--
+  const bars = r.bars.length - st
+  const sig = isSsp ? last.sspSignal : last.spSignal
+  const direction = sig > 0 ? 'call' : sig < 0 ? 'put' : 'none'
+  const f = (x: number, d = 2) => (Number.isFinite(x) ? x.toFixed(d) : 'n/a')
+  const text = !Number.isFinite(last.spDriftZ)
+    ? `No setup: too little path since the anchor (${bars} bars; pressure needs more than ${sp.minBars ?? SP_DEFAULTS.minBars} before a burst).`
+    : isSsp
+      ? sig !== 0 ? `SSP: steady drift ${last.spPressure > 0 ? 'up' : 'down'} ${f(Math.abs(last.spDriftZ))} ATR (efficiency ${f(last.spEff)}), no burst, trend ${sig > 0 ? 'up' : 'down'} -> ${direction.toUpperCase()}.`
+        : `No setup: ${last.spPressure === 0 ? `no steady drift (${f(Math.abs(last.spDriftZ))} ATR, efficiency ${f(last.spEff)})` : last.spShock !== 0 ? 'a burst is present (that is sp)' : 'steady drift but no clear trend'}.`
+      : sig !== 0 ? `SP: drift ${last.spPressure > 0 ? 'up' : 'down'} ${f(Math.abs(last.spDriftZ))} ATR (efficiency ${f(last.spEff)}) + burst ${last.spShock > 0 ? 'up' : 'down'} ${f(Math.abs(last.spShockZ))} ATR, gap ${f(last.z)} ATR -> ${direction.toUpperCase()}.`
+        : `No setup: ${last.spPressure === 0 ? `no steady drift (${f(Math.abs(last.spDriftZ))} ATR, efficiency ${f(last.spEff)})` : last.spShock === 0 ? 'steady drift but no burst (that is ssp)' : last.spShock !== last.spPressure ? 'the burst runs against the drift' : 'the gap is not stretched enough'}.`
+  if (name === 'spText' || name === 'sspText') return text
+  return bundleValue({ ok: true, error: '', direction, case: isSsp ? (sig !== 0 ? 5 : 0) : sig > 0 ? 2 : sig < 0 ? 1 : 0, pressure: last.spPressure !== 0, shock: last.spShock !== 0, pressureDir: last.spPressure, shockDir: last.spShock,
+    shockVal: Number.isFinite(last.spShockZ) ? last.spShockZ : 0, pressureVal: Number.isFinite(last.spDriftZ) ? last.spDriftZ : 0, pressureEff: Number.isFinite(last.spEff) ? last.spEff : 0, stretch: Number.isFinite(last.z) ? last.z : 0, bars, text })
 }
 
 function anchorMethod(name: string, args: MslValue[], ctx: EvalEnv, period: string | undefined, tf: string | undefined): MslValue {
@@ -6463,6 +6505,10 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         const strs: string[] = []
         while (args.length && typeof args[args.length - 1] === 'string') strs.unshift(args.pop() as string)
+        if (ANCHOR_SP_METHODS.has(e.name)) {
+          const optStrs = strs.filter((x) => /^[\w.]+=/.test(x)), plain = strs.filter((x) => !/^[\w.]+=/.test(x))
+          return anchorSp(e.name, optStrs, plain[0], plain[1], ctx)
+        }
         if (ANCHOR_COND_METHODS.has(e.name)) return anchorCondMethod(e.name, args, strs, ctx)
         if (ANCHOR_MULTI_METHODS.has(e.name)) return anchorMultiMethod(e.name, args, strs, ctx)
         return anchorMethod(e.name, args, ctx, strs[0], strs[1])
