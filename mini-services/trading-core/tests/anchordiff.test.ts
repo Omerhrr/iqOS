@@ -148,4 +148,63 @@ test('statsTail: the newest bars get identical stats to the full run; older bars
   assert.equal(part.bars[part.bars.length - 11].next[3].n, 0)
   const e = run(`call when anchor.visits(3, -60, "1h") > 0\nexpiry = 1\n`, candles2); assert.ok(e.error && /only kept for the newest/.test(e.error))
 })
+
+// ---- built-in volume profile + delta of the current anchor period ----
+const near2 = (a: number, b: number, e = 1e-9) => assert.ok(Math.abs(a - b) < e, `${a} != ${b}`)
+test('profile: POC is the heaviest bin, value area is contiguous, contains the POC and covers >= 70%', () => {
+  const r = computeAnchorDiff(candles2, { anchor: '1h', bandWidth: 0.25 })!
+  const b = r.bars[r.bars.length - 1]
+  const first = r.bars.length - b.periodBars
+  const bin = 0.25 * r.bars[first].atr
+  const w = new Map<number, number>()
+  for (let i = first; i < r.bars.length; i++) { const x = r.bars[i], k0 = Math.floor(x.low / bin), k1 = Math.floor(x.high / bin); for (let k = k0; k <= k1; k++) w.set(k, (w.get(k) ?? 0) + x.volume / (k1 - k0 + 1)) }
+  let best = -1, pk = 0, tot = 0
+  for (const [k, v] of w) { tot += v; if (v > best || (v === best && k < pk)) { best = v; pk = k } }
+  near2(b.poc - b.anchor, (pk + 0.5) * bin, 1e-9)
+  assert.ok(b.val <= b.poc && b.poc <= b.vah)
+  let cov = 0
+  for (const [k, v] of w) if (k * bin >= b.val - b.anchor - 1e-12 && (k + 1) * bin <= b.vah - b.anchor + 1e-12) cov += v
+  assert.ok(cov >= 0.7 * tot - 1e-9, `value area covers ${cov / tot}`)
+  near2(b.pocZ, (pk + 0.5) * bin / b.atr, 1e-9); near2(b.pocDist, (b.close - (pk + 0.5) * bin) / b.atr, 1e-9)
+})
+test('profile + delta reset at every roll and count bars since it', () => {
+  const r = computeAnchorDiff(candles2, { anchor: '1h' })!
+  r.bars.forEach((b, i) => { if (b.rolled) { assert.equal(b.periodBars, 1); near2(b.cumDelta, b.delta) } else { assert.equal(b.periodBars, r.bars[i - 1].periodBars + 1); near2(b.cumDelta, r.bars[i - 1].cumDelta + b.delta) } })
+})
+test('delta = weight x close-location value; time-weighted (TPO-style) when the candles carry no volume', () => {
+  const nov = candles2.map((c) => ({ ...c, volume: 0 }))
+  const r = computeAnchorDiff(nov, { anchor: '1h' })!, v = computeAnchorDiff(candles2, { anchor: '1h' })!
+  assert.equal(r.bars[100].volSource, 'time'); assert.equal(v.bars[100].volSource, 'volume')
+  r.bars.forEach((b) => { const rg = b.high - b.low; near2(b.delta, rg > 0 ? ((b.close - b.low) - (b.high - b.close)) / rg : 0, 1e-9); assert.ok(Number.isFinite(b.poc) || b.periodBars === 0) })
+  assert.ok(r.bars.every((b) => b.cumDeltaPct >= -1 - 1e-9 && b.cumDeltaPct <= 1 + 1e-9))
+})
+test('profile + delta NO LOOK-AHEAD: identical when the series is cut right after a bar', () => {
+  const full = computeAnchorDiff(candles2, { anchor: '1h' })!
+  for (const cut of [500, 800, 1100, 1400]) {
+    const part = computeAnchorDiff(candles2.slice(0, cut), { anchor: '1h' })!, a = part.bars[part.bars.length - 1], b = full.bars.find((x) => x.time === a.time)!
+    for (const k of ['poc', 'vah', 'val', 'pocZ', 'cumDelta', 'cumDeltaPct', 'periodVol', 'periodBars'] as const) near2(a[k], b[k], 1e-9)
+    assert.equal(a.deltaDiv, b.deltaDiv); assert.equal(a.inValue, b.inValue)
+  }
+})
+test('MSL profile / delta reads match the engine', () => {
+  const r = computeAnchorDiff(candles2, { anchor: '1h' })!, L = r.bars[r.bars.length - 1]
+  const chk = (expr: string, v: number) => { const e = run(`call when ${expr} > ${(v - 1e-7).toFixed(9)} and ${expr} < ${(v + 1e-7).toFixed(9)}\nexpiry = 1\n`, candles2); assert.equal(e.error, undefined, expr); assert.equal(e.direction, 'call', `${expr} should equal ${v}`) }
+  chk('anchor.poc("1h")', L.poc); chk('anchor.vah("1h")', L.vah); chk('anchor.val("1h")', L.val); chk('anchor.pocZ("1h")', L.pocZ); chk('anchor.vahZ("1h")', L.vahZ); chk('anchor.valZ("1h")', L.valZ); chk('anchor.pocDist("1h")', L.pocDist)
+  chk('anchor.periodBars("1h")', L.periodBars); chk('anchor.cumDelta("1h")', L.cumDelta); chk('anchor.cumDeltaPct("1h")', L.cumDeltaPct); chk('anchor.delta("1h")', L.delta); chk('anchor.deltaDiv("1h")', L.deltaDiv)
+  chk('anchor.inValue("1h")', L.inValue ? 1 : 0); chk('anchor.volReal("1h")', 1)
+})
+test('MSL tick reads: real ticks since the anchor period start; fail closed without ticks or with too few', () => {
+  const q = parseStrategyScript(`let n = anchor.tickCount("1h")\nlet d = anchor.tickDelta("1h")\nlet p = anchor.tickPoc("1h")\ncall when n > 0\nexpiry = 1\n`); assert.ok(q.ok)
+  const noTicks = evaluateStrategyScript((q as { ast: never }).ast, {}, undefined, series(candles2)); assert.ok(noTicks.error && /live ticks/i.test(noTicks.error), noTicks.error)
+  const last = candles2[candles2.length - 1].time, P = 3600, start = Math.floor(last / P) * P
+  const ticks: { ts: number; price: number }[] = []
+  let pr = candles2[candles2.length - 1].close
+  for (let i = 0; i < 200; i++) { pr += Math.sin(i / 3) * 0.0002; ticks.push({ ts: (start + i * 5) * 1000, price: pr }) }
+  const ok = evaluateStrategyScript((q as { ast: never }).ast, {}, undefined, series(candles2), undefined, { ticks, nowMs: ticks[ticks.length - 1].ts }); assert.equal(ok.error, undefined, ok.error); assert.equal(ok.direction, 'call')
+  let up = 0, dn = 0, dir = 0
+  for (let i = 1; i < ticks.length; i++) { const d = ticks[i].price - ticks[i - 1].price; if (d > 0) dir = 1; else if (d < 0) dir = -1; if (dir > 0) up++; else if (dir < 0) dn++ }
+  const q2 = parseStrategyScript(`call when anchor.tickDelta("1h") == ${up - dn} and anchor.tickCount("1h") == ${ticks.length}\nexpiry = 1\n`); assert.ok(q2.ok)
+  assert.equal(evaluateStrategyScript((q2 as { ast: never }).ast, {}, undefined, series(candles2), undefined, { ticks, nowMs: ticks[ticks.length - 1].ts }).direction, 'call')
+  const few = evaluateStrategyScript((q as { ast: never }).ast, {}, undefined, series(candles2), undefined, { ticks: ticks.slice(0, 1), nowMs: ticks[0].ts }); assert.ok(few.error && /fewer than 2 live ticks/.test(few.error))
+})
 console.log(`${pass}/${total}`); if (pass !== total) process.exit(1)

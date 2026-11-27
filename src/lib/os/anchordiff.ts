@@ -28,6 +28,16 @@
 //                    (up 0.5, move 0) - never a percentage from a handful of cases. `alike` is the same restricted to visits that
 //                    ARRIVED the same way (rising into the band or falling into it, judged over 3 bars).
 //
+//   Volume profile and delta OF THE CURRENT ANCHOR PERIOD (built in, no other chart or namespace needed; resets at every roll, developing bar by bar):
+//   poc, vah, val     point of control and the 70% value area, as price; pocZ / vahZ / valZ the same in ATR units from the anchor
+//   pocDist, inValue  (close - poc) / atr, and whether the close is inside the value area
+//   periodVol, periodBars, volSource   volume since the roll, bars since the roll, and what weights the profile: 'volume' when the candles carry real
+//                     volume, 'time' (one unit per bar, i.e. a TPO-style profile) when volume is zero - IQ's OTC candles have none
+//   delta, cumDelta, cumDeltaPct, deltaDiv   candle delta = weight x close-location value ((close-low) - (high-close)) / range; cumulative since the roll;
+//                     cumDeltaPct = cumDelta / weight; deltaDiv +1 / -1 = bullish / bearish divergence (price at its period low/high close while cumulative delta is not)
+//   These come from candles, so they are ESTIMATES of buy/sell pressure and of where trade happened, not tick data. Real tick / footprint reads
+//   (tick count, tick-rule delta, tick POC) exist only live, from the tick buffer, as anchor.tick*() in MSL.
+//
 // HONESTY about which numbers are "new":
 //   - Inside one anchor period the difference series is the price series shifted
 //     by a constant, so TR, ATR, CCI and RSI of the difference are IDENTICAL to
@@ -196,6 +206,26 @@ export interface AnchorBar {
   alike: Record<AnchorHorizon, AnchorNext>
   /** how the close arrived at its band: +1 rising, -1 falling, 0 flat (z change over 3 bars vs 0.1 band) */
   approach: 1 | -1 | 0
+  /** developing profile of the current anchor period (price levels) */
+  poc: number
+  vah: number
+  val: number
+  pocZ: number
+  vahZ: number
+  valZ: number
+  /** (close - poc) / atr */
+  pocDist: number
+  inValue: boolean
+  periodVol: number
+  periodBars: number
+  volSource: 'volume' | 'time'
+  /** candle delta estimate of this bar and its running sum since the roll */
+  delta: number
+  cumDelta: number
+  /** cumDelta / total weight since the roll, -1..1 */
+  cumDeltaPct: number
+  /** +1 bullish / -1 bearish divergence between price and cumulative delta, else 0 */
+  deltaDiv: 1 | -1 | 0
 }
 
 export type AnchorHorizon = 1 | 3 | 5
@@ -361,11 +391,73 @@ export function computeAnchorDiff(candles: Candle[], opts: AnchorDiffOptions = {
       next: emptyNext(),
       alike: emptyNext(),
       approach: 0,
+      poc: Number.NaN, vah: Number.NaN, val: Number.NaN, pocZ: Number.NaN, vahZ: Number.NaN, valZ: Number.NaN, pocDist: Number.NaN, inValue: false,
+      periodVol: 0, periodBars: 0, volSource: 'time', delta: 0, cumDelta: 0, cumDeltaPct: 0, deltaDiv: 0,
     })
     idxOf.push(i)
   }
+  periodProfile(bars, bandW, candles, idxOf, opts.statsTail !== undefined && opts.statsTail > 0 ? Math.max(1, Math.round(opts.statsTail)) : Infinity)
   const histogram = enrich(bars, bandW, win, opts.statsTail !== undefined && opts.statsTail > 0 ? Math.max(1, Math.round(opts.statsTail)) : Infinity)
   return { anchorSec: P, anchorLabel: typeof opts.anchor === 'string' ? opts.anchor : `${P}s`, rocPeriod: rocP, bandWidth: bandW, window: win, bars, histogram }
+}
+
+/** value area of a bin->weight map: start at the POC bin and add the heavier neighbour pair until `share` of the total is covered */
+export function valueArea(w: Map<number, number>, share = 0.7): { poc: number; lo: number; hi: number } | null {
+  if (!w.size) return null
+  let total = 0, poc = 0, best = -1
+  for (const [k, v] of w) { total += v; if (v > best || (v === best && k < poc)) { best = v; poc = k } }
+  let lo = poc, hi = poc, acc = best
+  const g = (k: number) => w.get(k) ?? 0
+  let minK = Infinity, maxK = -Infinity
+  for (const k of w.keys()) { if (k < minK) minK = k; if (k > maxK) maxK = k }
+  while (acc < share * total && (lo > minK || hi < maxK)) {
+    const up = hi < maxK ? g(hi + 1) + (hi + 1 < maxK ? g(hi + 2) : 0) : -1
+    const dn = lo > minK ? g(lo - 1) + (lo - 1 > minK ? g(lo - 2) : 0) : -1
+    if (up >= dn && up >= 0) { acc += g(hi + 1) + (hi + 1 < maxK ? g(hi + 2) : 0); hi = Math.min(maxK, hi + 2) } else if (dn >= 0) { acc += g(lo - 1) + (lo - 1 > minK ? g(lo - 2) : 0); lo = Math.max(minK, lo - 2) } else break
+  }
+  return { poc, lo, hi }
+}
+
+/** developing volume profile + candle delta of the CURRENT anchor period (reset at every roll). Bin = bandWidth x the ATR at the first bar of the period, anchored on the anchor itself. */
+function periodProfile(bars: AnchorBar[], bw: number, candles: Candle[], idxOf: number[], tail: number): void {
+  const m = bars.length
+  const anyVol = bars.some((b) => b.volume > 0)
+  let prof = new Map<number, number>()
+  let binSize = Number.NaN, wTotal = 0, cum = 0, vol = 0, count = 0, minClose = Infinity, maxClose = -Infinity, minCum = Infinity, maxCum = -Infinity
+  for (let i = 0; i < m; i++) {
+    const b = bars[i]
+    if (b.rolled || i === 0) { prof = new Map(); binSize = Number.NaN; wTotal = 0; cum = 0; vol = 0; count = 0; minClose = Infinity; maxClose = -Infinity; minCum = Infinity; maxCum = -Infinity }
+    if (!(binSize > 0)) { if (b.atr > 0) binSize = bw * b.atr }
+    count++
+    const w = anyVol ? b.volume : 1
+    const range = b.high - b.low
+    const clv = range > 0 ? ((b.close - b.low) - (b.high - b.close)) / range : 0
+    const d = w * clv
+    cum += d; wTotal += w; vol += b.volume
+    b.delta = d; b.cumDelta = cum; b.cumDeltaPct = wTotal > 0 ? cum / wTotal : 0
+    b.periodVol = vol; b.periodBars = count; b.volSource = anyVol ? 'volume' : 'time'
+    if (binSize > 0 && w > 0) {
+      // spread the weight evenly over the bins the candle spans (anchor-relative bins)
+      const k0 = Math.floor(b.low / binSize), k1 = Math.floor(b.high / binSize)
+      const n = k1 - k0 + 1
+      for (let k = k0; k <= k1; k++) prof.set(k, (prof.get(k) ?? 0) + w / n)
+      const va = i >= m - tail ? valueArea(prof) : null // the value area is only needed for the newest bars a script reads; the profile itself is always kept up to date
+      if (va) {
+        const c = (k: number) => (k + 0.5) * binSize
+        b.poc = c(va.poc) + b.anchor; b.vah = (va.hi + 1) * binSize + b.anchor; b.val = va.lo * binSize + b.anchor
+        if (b.atr > 0) { b.pocZ = c(va.poc) / b.atr; b.vahZ = (va.hi + 1) * binSize / b.atr; b.valZ = va.lo * binSize / b.atr; b.pocDist = (b.close - c(va.poc)) / b.atr }
+        b.inValue = b.close >= va.lo * binSize && b.close <= (va.hi + 1) * binSize
+      }
+    }
+    // divergence: this close is the period's lowest (highest) so far, but cumulative delta is above its low (below its high)
+    const early = count >= 6
+    b.deltaDiv = early && b.close <= minClose && cum > minCum ? 1 : early && b.close >= maxClose && cum < maxCum ? -1 : 0
+    if (b.close < minClose) minClose = b.close
+    if (b.close > maxClose) maxClose = b.close
+    if (cum < minCum) minCum = cum
+    if (cum > maxCum) maxCum = cum
+  }
+  void candles; void idxOf
 }
 
 function emptyNext(): Record<AnchorHorizon, AnchorNext> {

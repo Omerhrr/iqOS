@@ -891,6 +891,55 @@ expiry = expiryMin
 `,
   },
   {
+    id: 'meta:builtin-adx-rsi',
+    name: 'Builtin: ADX + RSI (trend pullback / extreme reversal, with inputs)',
+    script: `
+# ADX + RSI: ADX says HOW STRONG the trend is, RSI says how fast / stretched price has moved. Together they pick one of two plays:
+#   TREND PULLBACK  (ADX >= adxStrong): the trend is strong, so wait for RSI to dip (uptrend) or pop (downtrend) and turn back WITH the trend.
+#   EXTREME REVERSAL (ADX <= adxWeak, or a strong trend that is fading): no trend to fight, so fade RSI overbought / oversold once RSI turns.
+# +DI / -DI give the trend direction. mode picks which play(s) run: "both", "trend" or "reversal".
+# NOT PROVEN: indicator readings are functions of the same candles; nothing here was shown to beat break-even. Backtest per pair / timeframe before trusting it.
+
+input mode = "both" options "both", "trend", "reversal" "Play"
+input adxLen = 14 min 5 max 50 "ADX period"
+input rsiLen = 14 min 3 max 50 "RSI period"
+input adxStrong = 25 min 10 max 60 "ADX: strong trend from"
+input adxWeak = 20 min 5 max 40 "ADX: weak / ranging up to"
+input pullbackLevel = 40 min 20 max 50 "Trend pullback: RSI dips below this (uptrend); mirrored for downtrend"
+input overbought = 70 min 55 max 95 "RSI overbought"
+input oversold = 30 min 5 max 45 "RSI oversold"
+input fadeFading = true "Also fade extremes when a strong trend is fading (ADX falling)"
+input expiryMin = 3 min 1 max 15 "Expiry (minutes)"
+input baseConf = 60 min 1 max 95 "Confidence"
+
+let a = ind.adx(adxLen)
+let adx = a.adx[-1]
+let up = a.plusDI[-1] > a.minusDI[-1]
+let rsi = ind.rsi(rsiLen)[-1]
+let rsiPrev = ind.rsi(rsiLen)[-2]
+let adxPrev = a.adx[-2]
+let turningUp = rsi > rsiPrev
+let turningDown = rsi < rsiPrev
+let strong = adx >= adxStrong
+let weak = adx <= adxWeak
+let fading = strong and adx < adxPrev
+
+let doTrend = mode == "both" or mode == "trend"
+let doRev = mode == "both" or mode == "reversal"
+
+let tCall = doTrend and strong and up and rsiPrev < pullbackLevel and turningUp
+let tPut = doTrend and strong and not up and rsiPrev > 100 - pullbackLevel and turningDown
+let revOk = weak or (fadeFading and fading)
+let rCall = doRev and revOk and rsiPrev <= oversold and turningUp
+let rPut = doRev and revOk and rsiPrev >= overbought and turningDown
+
+call when tCall or rCall
+put when tPut or rPut
+confidence = min(95, baseConf + abs(adx - adxWeak) / 2)
+expiry = expiryMin
+`,
+  },
+  {
     id: 'meta:builtin-weiswave',
     name: 'Builtin: Weis wave (effort vs result)',
     script: `

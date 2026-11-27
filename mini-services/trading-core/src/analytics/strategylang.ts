@@ -232,7 +232,7 @@ import { kagi } from './kagi'
 import { computeSwing } from './swing'
 import { tickBars, type TickPoint } from './tickbars'
 import { computeBaseline } from './baseline'
-import { computeAnchorDiff, parseAnchorPeriod } from './anchordiff'
+import { computeAnchorDiff, parseAnchorPeriod, valueArea } from './anchordiff'
 import { hvSeries, realizedUpProb, ivFromPayout } from './ivhv'
 import { expiryMomentum, priceDisplacement, volAdjustedExpectedMove, reversalRisk, expiryStagnationExhaustion, candleCompletionProbability } from './expiryintel'
 import { detectGaps } from './gap'
@@ -5415,7 +5415,7 @@ function tickbarMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string 
  * Scalar reads take an optional offset like every other namespace (-1 = the latest bar, the default; -2 = the one before). */
 /** a script reads the newest bars only; computing dwell/next stats for the whole history on every evaluation would make backtests quadratic */
 const ANCHOR_STATS_TAIL = 40
-const ANCHOR_STATS_METHODS = new Set(['share', 'dwellRank', 'visits', 'ready', 'nextUp', 'nextBull', 'nextMove', 'alikeVisits', 'alikeReady', 'alikeUp', 'alikeMove'])
+const ANCHOR_STATS_METHODS = new Set(['poc', 'vah', 'val', 'pocZ', 'vahZ', 'valZ', 'pocDist', 'inValue', 'share', 'dwellRank', 'visits', 'ready', 'nextUp', 'nextBull', 'nextMove', 'alikeVisits', 'alikeReady', 'alikeUp', 'alikeMove'])
 function anchorMethod(name: string, args: MslValue[], ctx: EvalEnv, period: string | undefined, tf: string | undefined): MslValue {
   if (period !== undefined && parseAnchorPeriod(period) === null)
     throw new MslRuntimeError(`anchor.${name}(): "${period}" is not an anchor period - use "15m", "30m", "1h", "4h", "1d", "1w" (or any <n>m / <n>h / <n>d, at least 1m)`)
@@ -5553,6 +5553,75 @@ function anchorMethod(name: string, args: MslValue[], ctx: EvalEnv, period: stri
       const h = hz()
       return offsetInto(r.bars, hOff(), 'anchor.alikeMove').alike[h].move
     }
+    case 'poc':
+      return num(bar().poc)
+    case 'vah':
+      return num(bar().vah)
+    case 'val':
+      return num(bar().val)
+    case 'pocZ':
+      return num(bar().pocZ)
+    case 'vahZ':
+      return num(bar().vahZ)
+    case 'valZ':
+      return num(bar().valZ)
+    case 'pocDist':
+      return num(bar().pocDist)
+    case 'inValue':
+      return bar().inValue
+    case 'periodVol':
+      return bar().periodVol
+    case 'periodBars':
+      return bar().periodBars
+    case 'volReal':
+      return bar().volSource === 'volume'
+    case 'delta':
+      return bar().delta
+    case 'cumDelta':
+      return bar().cumDelta
+    case 'cumDeltaPct':
+      return bar().cumDeltaPct
+    case 'deltaDiv':
+      return bar().deltaDiv
+    case 'tickCount':
+    case 'tickDelta':
+    case 'tickDeltaPct':
+    case 'tickPoc':
+    case 'tickVah':
+    case 'tickVal':
+    case 'tickPocZ':
+    case 'tickSpanSec': {
+      // REAL tick reads over the current anchor period (live tick buffer only: omni-trader / the kernel's tick feed). Everything else on anchor.* is candle-derived.
+      if (!ctx.liveTicks) throw new MslRuntimeError(`anchor.${name}() needs live ticks, which this evaluation context does not have (only the omni-trader / live tick feed provides them); the other anchor.* reads are candle-derived and work everywhere`)
+      const ticks = ctx.liveTicks
+      const lastB = r.bars[r.bars.length - 1]
+      const P = parseAnchorPeriod(period) ?? 14400
+      const startMs = Math.floor(lastB.time / P) * P * 1000
+      const inP = ticks.filter((t) => t.ts >= startMs && Number.isFinite(t.price))
+      if (inP.length < 2) throw new MslRuntimeError(`anchor.${name}(): fewer than 2 live ticks since the start of the current ${period ?? '4h'} anchor period - the tick buffer holds only the most recent stretch (and only for pairs the feed keeps warm)`)
+      if (name === 'tickCount') return inP.length
+      if (name === 'tickSpanSec') return (inP[inP.length - 1].ts - inP[0].ts) / 1000
+      let up = 0, dn = 0, dir = 0
+      const prof = new Map<number, number>()
+      const binSize = lastB.atr > 0 ? (r.bandWidth * lastB.atr) : Number.NaN
+      for (let i = 1; i < inP.length; i++) {
+        const dp = inP[i].price - inP[i - 1].price
+        if (dp > 0) dir = 1
+        else if (dp < 0) dir = -1
+        if (dir > 0) up++
+        else if (dir < 0) dn++
+        if (binSize > 0) { const k = Math.floor((inP[i].price - lastB.anchor) / binSize); prof.set(k, (prof.get(k) ?? 0) + 1) }
+      }
+      if (name === 'tickDelta') return up - dn
+      if (name === 'tickDeltaPct') return up + dn > 0 ? (up - dn) / (up + dn) : 0
+      const va = valueArea(prof)
+      if (!va || !(binSize > 0)) return 0
+      const poc = (va.poc + 0.5) * binSize
+      if (name === 'tickPoc') return poc + lastB.anchor
+      if (name === 'tickPocZ') return poc / lastB.atr
+      if (name === 'tickVah') return (va.hi + 1) * binSize + lastB.anchor
+      return va.lo * binSize + lastB.anchor
+    }
     case 'diffSeries':
       return lastN((b) => b.close)
     case 'zSeries':
@@ -5563,7 +5632,7 @@ function anchorMethod(name: string, args: MslValue[], ctx: EvalEnv, period: stri
       return lastN((b) => b.rocAtr)
     default:
       throw new MslRuntimeError(
-        `unknown anchor method "anchor.${name}(...)" - use ok()/anchor()/open()/high()/low()/close()|diff()/ohlc()/z()/tr()/atr()/roc()/rocAtr()/cci()/mfi()/rsi()/cross()/rolled()/above()/sinceCross()/sinceRoll()/diffSeries(n?)/zSeries(n?)/rocSeries(n?)/rocAtrSeries(n?), dwell: dir()/body()/upWick()/dnWick()/closePos()/band()/dwell()/share()/dwellRank()/approach(), what happened next: visits(h)/ready(h)/nextUp(h)/nextBull(h)/nextMove(h) and alikeVisits(h)/alikeReady(h)/alikeUp(h)/alikeMove(h) with h = 1, 3 or 5 (last strings: anchor period, then candle timeframe)`,
+        `unknown anchor method "anchor.${name}(...)" - use ok()/anchor()/open()/high()/low()/close()|diff()/ohlc()/z()/tr()/atr()/roc()/rocAtr()/cci()/mfi()/rsi()/cross()/rolled()/above()/sinceCross()/sinceRoll()/diffSeries(n?)/zSeries(n?)/rocSeries(n?)/rocAtrSeries(n?), dwell: dir()/body()/upWick()/dnWick()/closePos()/band()/dwell()/share()/dwellRank()/approach(), volume profile of the current anchor period (candle-derived): poc()/vah()/val() price, pocZ()/vahZ()/valZ() in ATR from the anchor, pocDist(), inValue(), periodVol(), periodBars(), volReal(), delta()/cumDelta()/cumDeltaPct()/deltaDiv(); REAL ticks, live only: tickCount()/tickDelta()/tickDeltaPct()/tickPoc()/tickVah()/tickVal()/tickPocZ()/tickSpanSec(); what happened next: visits(h)/ready(h)/nextUp(h)/nextBull(h)/nextMove(h) and alikeVisits(h)/alikeReady(h)/alikeUp(h)/alikeMove(h) with h = 1, 3 or 5 (last strings: anchor period, then candle timeframe)`,
       )
   }
 }
