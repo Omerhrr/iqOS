@@ -232,7 +232,7 @@ import { kagi } from './kagi'
 import { computeSwing } from './swing'
 import { tickBars, type TickPoint } from './tickbars'
 import { computeBaseline } from './baseline'
-import { computeAnchorDiff, parseAnchorPeriod, valueArea, ANCHOR_SIGNALS } from './anchordiff'
+import { computeAnchorDiff, parseAnchorPeriod, parseAnchorSpec, valueArea, ANCHOR_SIGNALS, parseCondition, evalClause, condFieldNames, conditionStats } from './anchordiff'
 import { hvSeries, realizedUpProb, ivFromPayout } from './ivhv'
 import { expiryMomentum, priceDisplacement, volAdjustedExpectedMove, reversalRisk, expiryStagnationExhaustion, candleCompletionProbability } from './expiryintel'
 import { detectGaps } from './gap'
@@ -5415,22 +5415,100 @@ function tickbarMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string 
  * Scalar reads take an optional offset like every other namespace (-1 = the latest bar, the default; -2 = the one before). */
 /** a script reads the newest bars only; computing dwell/next stats for the whole history on every evaluation would make backtests quadratic */
 const ANCHOR_STATS_TAIL = 40
-const ANCHOR_SIGNED_FIELDS = new Set(['adx', 'plusDI', 'minusDI', 'diCross', 'trend', 'swingHigh', 'swingLow', 'swingHighDist', 'swingLowDist', 'bos', 'choch', 'sweep', 'engulf', 'pin', 'soldiers', 'star', 'marubozu', 'exhaust', 'reject', 'trap', 'climax', 'streak', 'er', 'harami', 'tweezer', 'threeInside', 'piercing', 'hammer', 'invHammer', 'beltHold', 'threeStrike', 'kicker', 'fvg', 'fvgTap', 'inFvg', 'fvgBullTop', 'fvgBullBottom', 'fvgBearTop', 'fvgBearBottom', 'obTap', 'inOb', 'obBullTop', 'obBullBottom', 'obBearTop', 'obBearBottom', 'pdPos', 'pdZone', 'rangeHigh', 'rangeLow', 'rangeBreak', 'retest', 'double', 'hs', 'tlSupport', 'tlResist', 'tlBreak', 'wedge', 'channel', 'capitulation', 'fomo', 'gapFill', 'stopHunt', 'volRatio', 'expansion', 'hour', 'session', 'regime'])
+const ANCHOR_SIGNED_FIELDS = new Set(['adx', 'plusDI', 'minusDI', 'diCross', 'trend', 'swingHigh', 'swingLow', 'swingHighDist', 'swingLowDist', 'bos', 'choch', 'sweep', 'engulf', 'pin', 'soldiers', 'star', 'marubozu', 'exhaust', 'reject', 'trap', 'climax', 'streak', 'er', 'harami', 'tweezer', 'threeInside', 'piercing', 'hammer', 'invHammer', 'beltHold', 'threeStrike', 'kicker', 'fvg', 'fvgTap', 'inFvg', 'fvgBullTop', 'fvgBullBottom', 'fvgBearTop', 'fvgBearBottom', 'obTap', 'inOb', 'obBullTop', 'obBullBottom', 'obBearTop', 'obBearBottom', 'pdPos', 'pdZone', 'rangeHigh', 'rangeLow', 'rangeBreak', 'retest', 'double', 'hs', 'tlSupport', 'tlResist', 'tlBreak', 'wedge', 'channel', 'capitulation', 'fomo', 'gapFill', 'stopHunt', 'volRatio', 'expansion', 'hour', 'session', 'regime', 'kagiDir', 'kagiThick', 'kagiShoulder', 'kagiWaist', 'kagiShoulderZ', 'kagiWaistZ', 'kagiFlip', 'kagiRev', 'kagiLines', 'kagiSince', 'kagiState', 'kagiMixed'])
 const ANCHOR_FLAG_FIELDS = new Set(['eqHigh', 'eqLow', 'inside', 'outside', 'doji', 'anchorTouch', 'ote', 'inRange', 'gapFilled', 'squeeze'])
 const ANCHOR_STATS_METHODS = new Set(['poc', 'vah', 'val', 'pocZ', 'vahZ', 'valZ', 'pocDist', 'inValue', 'share', 'dwellRank', 'visits', 'ready', 'nextUp', 'nextBull', 'nextMove', 'alikeVisits', 'alikeReady', 'alikeUp', 'alikeMove', 'support', 'resistance', 'supportDist', 'resistanceDist', 'supportZ', 'resistanceZ', 'supportTouches', 'resistanceTouches', 'hasSupport', 'hasResistance', 'demandTop', 'demandBottom', 'demandFresh', 'demandTests', 'demandAge', 'demandStrength', 'demandDist', 'inDemand', 'tapDemand', 'hasDemand', 'supplyTop', 'supplyBottom', 'supplyFresh', 'supplyTests', 'supplyAge', 'supplyStrength', 'supplyDist', 'inSupply', 'tapSupply', 'hasSupply'])
-function anchorMethod(name: string, args: MslValue[], ctx: EvalEnv, period: string | undefined, tf: string | undefined): MslValue {
-  if (period !== undefined && parseAnchorPeriod(period) === null)
-    throw new MslRuntimeError(`anchor.${name}(): "${period}" is not an anchor period - use "15m", "30m", "1h", "4h", "1d", "1w" (or any <n>m / <n>h / <n>d, at least 1m)`)
+function anchorCompute(name: string, ctx: EvalEnv, period: string | undefined, tf: string | undefined, tail: number) {
+  if (period !== undefined && parseAnchorSpec(period) === null)
+    throw new MslRuntimeError(`anchor.${name}(): "${period}" is not an anchor period - use a period (\"15m\" \"30m\" \"1h\" \"4h\" \"1d\" \"1w\" or any <n>m / <n>h / <n>d, at least 1m), optionally with a reference (\"4h:open\" \"4h:high\" \"4h:low\" \"4h:vwap\"), a session (\"asia\" \"london\" \"ny\") or \"round\"`)
   const s = requireSeries(ctx, tf)
   if (!s.time) throw new MslRuntimeError('anchor.*() needs candle times, which this evaluation context does not provide')
   const rocPeriod = cfgNumLang(ctx, 'anchor.rocPeriod', undefined)
   const atrPeriod = cfgNumLang(ctx, 'anchor.atrPeriod', undefined)
   const tms = s.time
   const cands = seriesToCandles(s).map((c, i) => ({ ...c, time: tms[i] }))
-  const r = computeAnchorDiff(cands, { anchor: period, rocPeriod, atrPeriod, bandWidth: cfgNumLang(ctx, 'anchor.bandWidth', undefined), window: cfgNumLang(ctx, 'anchor.window', undefined), pivotLen: cfgNumLang(ctx, 'anchor.pivotLen', undefined), adxPeriod: cfgNumLang(ctx, 'anchor.adxPeriod', undefined), impulseAtr: cfgNumLang(ctx, 'anchor.impulseAtr', undefined), statsTail: ANCHOR_STATS_TAIL })
+  const r = computeAnchorDiff(cands, { anchor: period, rocPeriod, atrPeriod, bandWidth: cfgNumLang(ctx, 'anchor.bandWidth', undefined), window: cfgNumLang(ctx, 'anchor.window', undefined), pivotLen: cfgNumLang(ctx, 'anchor.pivotLen', undefined), roundStep: cfgNumLang(ctx, 'anchor.roundStep', undefined), kagiMult: cfgNumLang(ctx, 'anchor.kagiMult', undefined), adxPeriod: cfgNumLang(ctx, 'anchor.adxPeriod', undefined), impulseAtr: cfgNumLang(ctx, 'anchor.impulseAtr', undefined), statsTail: tail })
   if (!r) throw new MslRuntimeError(`anchor.${name}(): bad anchor period "${period}"`)
   if (!r.bars.length)
     throw new MslRuntimeError(`anchor.${name}(): no bar has a completed ${period} anchor before it in this window - the candle history is shorter than one ${period} period (use a smaller anchor, or a longer history)`)
+  return r
+}
+const ANCHOR_COND_METHODS = new Set(['now', 'whenUp', 'whenBull', 'whenMove', 'whenVisits', 'whenReady'])
+const ANCHOR_MULTI_METHODS = new Set(['align', 'alignZ', 'stretch', 'diverge', 'breadth'])
+const ANCHOR_COND_TAIL = 400
+/** anchor.now("sweep=1 & kagiState=2 & z@1d<0") - and whenUp / whenBull / whenMove / whenVisits / whenReady ("cond", h): what happened h bars after earlier bars where ALL clauses held */
+function anchorCondMethod(name: string, args: MslValue[], strs: string[], ctx: EvalEnv): MslValue {
+  const rest = strs.slice()
+  const cond = typeof args[0] === 'string' ? (args.shift() as string) : rest.shift()
+  if (cond === undefined) throw new MslRuntimeError(`anchor.${name}("condition"...): a condition string is required, e.g. "sweep=1 & kagiState=2 & adx>25"`)
+  const period = rest[0], tf = rest[1]
+  const clauses = parseCondition(cond)
+  if (typeof clauses === 'string') throw new MslRuntimeError(`anchor.${name}(): ${clauses}`)
+  const r = anchorCompute(name, ctx, period, tf, ANCHOR_COND_TAIL)
+  const fields = condFieldNames(r.bars[0])
+  const others = new Map<string, Map<number, (typeof r.bars)[number]>>()
+  for (const c of clauses) {
+    if (!fields.has(c.field)) throw new MslRuntimeError(`anchor.${name}(): unknown field "${c.field}" in "${cond}" - fields are the numeric / boolean anchor reads (z, roc, rsi, adx, kagiState, sweep, inDemand, fvg, ...)`)
+    if (c.spec !== undefined && !others.has(c.spec)) {
+      if (parseAnchorSpec(c.spec) === null) throw new MslRuntimeError(`anchor.${name}(): "@${c.spec}" is not an anchor`)
+      const ro = anchorCompute(name, ctx, c.spec, tf, ANCHOR_COND_TAIL)
+      others.set(c.spec, new Map(ro.bars.map((b) => [b.time, b])))
+    }
+  }
+  const holdAt = (j: number): boolean => clauses.every((c) => evalClause(c.spec === undefined ? r.bars[j] : others.get(c.spec)!.get(r.bars[j].time), c))
+  const m = r.bars.length
+  if (name === 'now') {
+    const o = args.length ? asNum(args[0]) : -1
+    const bi = m + o
+    if (bi < 0 || bi >= m || o >= 0) throw new MslRuntimeError(`anchor.now(): offset ${o} out of range (-1 = latest bar)`)
+    return holdAt(bi)
+  }
+  const h = args.length ? asNum(args[0]) : Number.NaN
+  if (![1, 3, 5].includes(h)) throw new MslRuntimeError(`anchor.${name}("condition", h): h must be 1, 3 or 5 (bars ahead)`)
+  const o = args.length > 1 ? asNum(args[1]) : -1
+  if (-o >= ANCHOR_COND_TAIL) throw new MslRuntimeError(`anchor.${name}(): offset ${o} is too far back for condition statistics`)
+  const bi = m + o
+  if (bi < 0 || bi >= m || o >= 0) throw new MslRuntimeError(`anchor.${name}(): offset ${o} out of range (-1 = latest bar)`)
+  const from = m - ANCHOR_COND_TAIL
+  const active = holdAt(bi)
+  const st = active ? conditionStats(r.bars, holdAt, bi, h as 1 | 3 | 5, from) : { n: 0, ready: false, up: 0.5, bull: 0.5, move: 0 }
+  switch (name) {
+    case 'whenVisits': return st.n
+    case 'whenReady': return st.ready
+    case 'whenUp': return st.up
+    case 'whenBull': return st.bull
+    default: return st.move
+  }
+}
+
+/** several anchors at once: align("4h","1d") +1 all gaps above / -1 all below / 0, alignZ(...) weakest |z| with sign when aligned, stretch(zmin, ...) +1 all z >= zmin / -1 all <= -zmin,
+ *  diverge("4h","1d") +1 first above and second below / -1 the reverse, breadth(...) anchors above minus anchors below */
+function anchorMultiMethod(name: string, args: MslValue[], strs: string[], ctx: EvalEnv): MslValue {
+  if (strs.length < 1 || (name === 'diverge' && strs.length !== 2)) throw new MslRuntimeError(`anchor.${name}(): ${name === 'diverge' ? 'needs exactly two anchors, e.g. anchor.diverge("4h", "1d")' : 'needs at least one anchor string, e.g. anchor.' + name + '("4h", "1d")'}`)
+  if (strs.length > 6) throw new MslRuntimeError(`anchor.${name}(): at most 6 anchors`)
+  const gaps = strs.map((sp) => {
+    const r = anchorCompute(name, ctx, sp, undefined, 1)
+    const b = r.bars[r.bars.length - 1]
+    const s = requireSeries(ctx, undefined)
+    const lastT = s.time ? s.time[s.time.length - 1] : b.time
+    return b.time === lastT && Number.isFinite(b.z) ? b : null // an anchor with no bar on the newest candle (session closed) counts as "no read"
+  })
+  if (gaps.some((g) => g === null)) return name === 'breadth' || name === 'alignZ' ? 0 : name === 'stretch' || name === 'align' || name === 'diverge' ? 0 : 0
+  const g = gaps as NonNullable<(typeof gaps)[number]>[]
+  switch (name) {
+    case 'align': return g.every((b) => b.close > 0) ? 1 : g.every((b) => b.close < 0) ? -1 : 0
+    case 'alignZ': return g.every((b) => b.close > 0) ? Math.min(...g.map((b) => b.z)) : g.every((b) => b.close < 0) ? -Math.min(...g.map((b) => -b.z)) : 0
+    case 'stretch': {
+      const zmin = args.length ? asNum(args[0]) : 2
+      return g.every((b) => b.z >= zmin) ? 1 : g.every((b) => b.z <= -zmin) ? -1 : 0
+    }
+    case 'diverge': return g[0].close > 0 && g[1].close < 0 ? 1 : g[0].close < 0 && g[1].close > 0 ? -1 : 0
+    default: return g.reduce((a, b) => a + (b.close > 0 ? 1 : b.close < 0 ? -1 : 0), 0)
+  }
+}
+
+function anchorMethod(name: string, args: MslValue[], ctx: EvalEnv, period: string | undefined, tf: string | undefined): MslValue {
+  const r = anchorCompute(name, ctx, period, tf, ANCHOR_STATS_TAIL)
   const HZ = new Set([1, 3, 5])
   // h-methods take the horizon first, then an optional offset: anchor.nextUp(3), anchor.nextUp(3, -2)
   const hz = (): 1 | 3 | 5 => {
@@ -5490,7 +5568,11 @@ function anchorMethod(name: string, args: MslValue[], ctx: EvalEnv, period: stri
     case 'tr':
       return bar().tr
     case 'atr':
+      return num(bar().atrP) // this anchor period's own ATR (starts at the roll); the plain ATR used as the z / roc unit is atrNorm()
+    case 'atrNorm':
       return num(bar().atr)
+    case 'rsiBars':
+      return bar().rsiBars
     case 'roc':
       return num(bar().roc)
     case 'rocAtr':
@@ -5615,7 +5697,7 @@ function anchorMethod(name: string, args: MslValue[], ctx: EvalEnv, period: stri
       if (!ctx.liveTicks) throw new MslRuntimeError(`anchor.${name}() needs live ticks, which this evaluation context does not have (only the omni-trader / live tick feed provides them); the other anchor.* reads are candle-derived and work everywhere`)
       const ticks = ctx.liveTicks
       const lastB = r.bars[r.bars.length - 1]
-      const P = parseAnchorPeriod(period) ?? 14400
+      const P = parseAnchorSpec(period)?.sec ?? 14400
       const startMs = Math.floor(lastB.time / P) * P * 1000
       const inP = ticks.filter((t) => t.ts >= startMs && Number.isFinite(t.price))
       if (inP.length < 2) throw new MslRuntimeError(`anchor.${name}(): fewer than 2 live ticks since the start of the current ${period ?? '4h'} anchor period - the tick buffer holds only the most recent stretch (and only for pairs the feed keeps warm)`)
@@ -5692,7 +5774,7 @@ function anchorMethod(name: string, args: MslValue[], ctx: EvalEnv, period: stri
       return lastN((b) => b.rocAtr)
     default:
       throw new MslRuntimeError(
-        `unknown anchor method "anchor.${name}(...)" - trend strength adx()/plusDI()/minusDI()/diCross(); structure trend()/swingHigh()/swingLow()/swingHighDist()/swingLowDist()/bos()/choch()/sweep()/eqHigh()/eqLow(); candle patterns engulf()/pin()/inside()/outside()/doji()/soldiers()/star()/marubozu(); psychology exhaust()/reject()/anchorTouch()/trap()/climax()/streak()/er(); after-signal stats afterUp/afterBull/afterMove/afterVisits/afterReady(signal name string, h) with signal one of ${ANCHOR_SIGNALS.join('/')}; extended patterns harami()/tweezer()/threeInside()/piercing()/hammer()/invHammer()/beltHold()/threeStrike()/kicker(); FVG fvg()/fvgTap()/inFvg()/fvgBullTop()/fvgBullBottom()/fvgBearTop()/fvgBearBottom(); order blocks obTap()/inOb()/obBullTop()/obBullBottom()/obBearTop()/obBearBottom(); pdPos()/pdZone()/ote(); inRange()/rangeHigh()/rangeLow()/rangeBreak()/retest(); double()/hs()/tlSupport()/tlResist()/tlBreak()/wedge()/channel(); capitulation()/fomo()/gapFill()/gapFilled()/stopHunt(); volRatio()/squeeze()/expansion()/hour()/session()/regime(); levels (candle-derived, pivots + ATR units): support()/resistance()/supportDist()/resistanceDist()/supportZ()/resistanceZ()/supportTouches()/resistanceTouches()/hasSupport()/hasResistance(), pHigh()/pLow()/prevHigh()/prevLow() (+Z), zones: demandTop()/demandBottom()/demandFresh()/demandTests()/demandAge()/demandStrength()/demandDist()/inDemand()/tapDemand()/hasDemand()/demandCount() and the same for supply; use ok()/anchor()/open()/high()/low()/close()|diff()/ohlc()/z()/tr()/atr()/roc()/rocAtr()/cci()/mfi()/rsi()/cross()/rolled()/above()/sinceCross()/sinceRoll()/diffSeries(n?)/zSeries(n?)/rocSeries(n?)/rocAtrSeries(n?), dwell: dir()/body()/upWick()/dnWick()/closePos()/band()/dwell()/share()/dwellRank()/approach(), volume profile of the current anchor period (candle-derived): poc()/vah()/val() price, pocZ()/vahZ()/valZ() in ATR from the anchor, pocDist(), inValue(), periodVol(), periodBars(), volReal(), delta()/cumDelta()/cumDeltaPct()/deltaDiv(); REAL ticks, live only: tickCount()/tickDelta()/tickDeltaPct()/tickPoc()/tickVah()/tickVal()/tickPocZ()/tickSpanSec(); what happened next: visits(h)/ready(h)/nextUp(h)/nextBull(h)/nextMove(h) and alikeVisits(h)/alikeReady(h)/alikeUp(h)/alikeMove(h) with h = 1, 3 or 5 (last strings: anchor period, then candle timeframe)`,
+        `unknown anchor method "anchor.${name}(...)" - kagi on the gap path (yin / yang, reset each roll): kagiDir()/kagiThick()/kagiState()/kagiFlip()/kagiRev()/kagiMixed()/kagiLines()/kagiSince()/kagiShoulder()/kagiWaist()/kagiShoulderZ()/kagiWaistZ(); period-reset rsi()/cci()/mfi()/atr() (start at each roll, measured on the gap path) with rsiBars() sample size and atrNorm() the plain ATR unit; trend strength adx()/plusDI()/minusDI()/diCross(); structure trend()/swingHigh()/swingLow()/swingHighDist()/swingLowDist()/bos()/choch()/sweep()/eqHigh()/eqLow(); candle patterns engulf()/pin()/inside()/outside()/doji()/soldiers()/star()/marubozu(); psychology exhaust()/reject()/anchorTouch()/trap()/climax()/streak()/er(); after-signal stats afterUp/afterBull/afterMove/afterVisits/afterReady(signal name string, h) with signal one of ${ANCHOR_SIGNALS.join('/')}; extended patterns harami()/tweezer()/threeInside()/piercing()/hammer()/invHammer()/beltHold()/threeStrike()/kicker(); FVG fvg()/fvgTap()/inFvg()/fvgBullTop()/fvgBullBottom()/fvgBearTop()/fvgBearBottom(); order blocks obTap()/inOb()/obBullTop()/obBullBottom()/obBearTop()/obBearBottom(); pdPos()/pdZone()/ote(); inRange()/rangeHigh()/rangeLow()/rangeBreak()/retest(); double()/hs()/tlSupport()/tlResist()/tlBreak()/wedge()/channel(); capitulation()/fomo()/gapFill()/gapFilled()/stopHunt(); volRatio()/squeeze()/expansion()/hour()/session()/regime(); levels (candle-derived, pivots + ATR units): support()/resistance()/supportDist()/resistanceDist()/supportZ()/resistanceZ()/supportTouches()/resistanceTouches()/hasSupport()/hasResistance(), pHigh()/pLow()/prevHigh()/prevLow() (+Z), zones: demandTop()/demandBottom()/demandFresh()/demandTests()/demandAge()/demandStrength()/demandDist()/inDemand()/tapDemand()/hasDemand()/demandCount() and the same for supply; use ok()/anchor()/open()/high()/low()/close()|diff()/ohlc()/z()/tr()/atr()/roc()/rocAtr()/cci()/mfi()/rsi()/cross()/rolled()/above()/sinceCross()/sinceRoll()/diffSeries(n?)/zSeries(n?)/rocSeries(n?)/rocAtrSeries(n?), dwell: dir()/body()/upWick()/dnWick()/closePos()/band()/dwell()/share()/dwellRank()/approach(), volume profile of the current anchor period (candle-derived): poc()/vah()/val() price, pocZ()/vahZ()/valZ() in ATR from the anchor, pocDist(), inValue(), periodVol(), periodBars(), volReal(), delta()/cumDelta()/cumDeltaPct()/deltaDiv(); REAL ticks, live only: tickCount()/tickDelta()/tickDeltaPct()/tickPoc()/tickVah()/tickVal()/tickPocZ()/tickSpanSec(); what happened next: visits(h)/ready(h)/nextUp(h)/nextBull(h)/nextMove(h) and alikeVisits(h)/alikeReady(h)/alikeUp(h)/alikeMove(h) with h = 1, 3 or 5 (last strings: anchor period, then candle timeframe)`,
       )
   }
 }
@@ -6381,6 +6463,8 @@ function evalExpr(e: Expr, env: Record<string, MslValue>, ctx: EvalEnv): MslValu
         const args = e.args.map((a) => evalExpr(a, env, ctx))
         const strs: string[] = []
         while (args.length && typeof args[args.length - 1] === 'string') strs.unshift(args.pop() as string)
+        if (ANCHOR_COND_METHODS.has(e.name)) return anchorCondMethod(e.name, args, strs, ctx)
+        if (ANCHOR_MULTI_METHODS.has(e.name)) return anchorMultiMethod(e.name, args, strs, ctx)
         return anchorMethod(e.name, args, ctx, strs[0], strs[1])
       }
       if (e.obj.t === 'ident' && e.obj.name === 'baseline' && !(e.obj.name in env)) {

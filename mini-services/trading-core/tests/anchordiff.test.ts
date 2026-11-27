@@ -1,6 +1,6 @@
 // IQAIR//OS - tests for the Anchor-Difference engine and the MSL `anchor.*` namespace
 import assert from 'node:assert/strict'
-import { computeAnchorDiff, parseAnchorPeriod } from '../src/analytics/anchordiff'
+import { computeAnchorDiff, parseAnchorPeriod, parseAnchorSpec, parseCondition } from '../src/analytics/anchordiff'
 import { parseStrategyScript, evaluateStrategyScript } from '../src/analytics/strategylang'
 import { computeAnchorDiff as clientCompute } from '../../../src/lib/os/anchordiff'
 import { atr as atrFn, trueRange } from '../src/analytics/indicators'
@@ -66,7 +66,7 @@ test('MSL anchor.* reads match the engine (value for value)', () => {
   const r = computeAnchorDiff(candles, { anchor: '4h' })!, L = r.bars[r.bars.length - 1], P = r.bars[r.bars.length - 2]
   const chk = (expr: string, v: number) => { const e = run(`call when ${expr} > ${(v - 1e-7).toFixed(9)} and ${expr} < ${(v + 1e-7).toFixed(9)}\nexpiry = 1\n`); assert.equal(e.error, undefined, expr); assert.equal(e.direction, 'call', `${expr} should equal ${v}`) }
   chk('anchor.diff("4h")', L.close); chk('anchor.anchor("4h")', L.anchor); chk('anchor.open("4h")', L.open); chk('anchor.high("4h")', L.high); chk('anchor.low("4h")', L.low)
-  chk('anchor.z("4h")', L.z); chk('anchor.atr("4h")', L.atr); chk('anchor.tr("4h")', L.tr); chk('anchor.cci("4h")', L.cci); chk('anchor.rsi("4h")', L.rsi); chk('anchor.mfi("4h")', L.mfi)
+  chk('anchor.z("4h")', L.z); chk('anchor.atr("4h")', L.atrP); chk('anchor.atrNorm("4h")', L.atr); chk('anchor.tr("4h")', L.tr); chk('anchor.cci("4h")', L.cci); chk('anchor.rsi("4h")', L.rsi); chk('anchor.mfi("4h")', L.mfi)
   chk('anchor.rocAtr("4h")', L.rocAtr); chk('anchor.diff(-2, "4h")', P.close); chk('anchor.z(-2, "4h")', P.z)
 })
 test('MSL: anchor period is switchable through an input', () => {
@@ -472,5 +472,197 @@ test('client copy computes the same extended signals', () => {
   for (let i = 0; i < 700; i++) { const o = c; c += (rnd() - 0.5) * 1.6; rows.push([o, Math.max(o, c) + 0.2, Math.min(o, c) - 0.2, c]) }
   const a = computeAnchorDiff(mkc(rows), { anchor: '4h' })!, b = clientCompute(mkc(rows), { anchor: '4h' })!
   assert.equal(JSON.stringify(a.bars.slice(-80)), JSON.stringify(b.bars.slice(-80)))
+})
+test('period-reset rsi / cci / mfi / atr: gap path from the anchor, no memory across a roll', () => {
+  const r = computeAnchorDiff(candles, { anchor: '4h' })!
+  const first = r.bars[0]
+  assert.equal(first.rsiBars, 1); assert.equal(first.rsi, first.close > 0 ? 100 : first.close < 0 ? 0 : 50); assert.equal(first.cci, 0)
+  near(first.atrP, first.tr)
+  const roll = r.bars.findIndex((b, i) => i > 0 && b.rolled)
+  assert.equal(r.bars[roll].rsiBars, 1)
+  // CCI by hand on bars 0..4 of the first period
+  const tp = r.bars.slice(0, 5).map((b) => (b.high + b.low + b.close) / 3), sma = tp.reduce((a, c) => a + c, 0) / 5, md = tp.reduce((a, c) => a + Math.abs(c - sma), 0) / 5
+  near(r.bars[4].cci, (tp[4] - sma) / (0.015 * md), 1e-6)
+  // Wilder RSI by hand over the first 6 gap changes (expanding mean up to 14)
+  const path = [0, ...r.bars.slice(0, 6).map((b) => b.close)]; let g = 0, l = 0
+  for (let k = 1; k < path.length; k++) { const d = path[k] - path[k - 1]; if (d > 0) g += d; else l -= d }
+  near(r.bars[5].rsi, 100 - 100 / (1 + g / l), 1e-6)
+  // scramble everything before the 2nd period but keep the anchor (= last close before it): the 2nd period's reads must not move
+  const alt = candles.map((c, i) => (i < 239 ? { ...c, open: c.open + 0.01, high: c.high + 0.02, low: c.low - 0.02, close: c.close + 0.01 } : c))
+  const r2 = computeAnchorDiff(alt, { anchor: '4h' })!
+  const a = r.bars[roll + 30], b = r2.bars[roll + 30]
+  near(a.rsi, b.rsi, 1e-9); near(a.cci, b.cci, 1e-9); near(a.mfi, b.mfi, 1e-9); near(a.atrP, b.atrP, 1e-9)
+  // all bounded / finite
+  for (const x of r.bars) { assert.ok(x.rsi >= 0 && x.rsi <= 100 && x.mfi >= 0 && x.mfi <= 100 && Number.isFinite(x.cci) && x.atrP > 0) }
+})
+
+// ---- Kagi yin / yang on the gap path
+const kagiRun = (gaps: number[], extra?: (c: ReturnType<typeof mkc>) => void) => {
+  const base = flat(240)
+  const anchorPx = base[239][3]
+  const rows: [number, number, number, number][] = [...base]
+  let prev = anchorPx
+  for (const g of gaps) { const cl = anchorPx + g; rows.push([prev, Math.max(prev, cl) + 0.05, Math.min(prev, cl) - 0.05, cl]); prev = cl }
+  const cs = mkc(rows); if (extra) extra(cs)
+  return computeAnchorDiff(cs, { anchor: '4h' })!.bars
+}
+const steps = (pts: number[]) => { const out: number[] = []; let c = 0; for (const t of pts) { const n = 3, st = (t - c) / n; for (let k = 0; k < n; k++) { c += st; out.push(c) } } return out }
+test('kagi: thickness unknown until a shoulder or waist is broken; yang above the anchor, then yin below, with flip events', () => {
+  // up to +8, pull back to +3 (reversal, shoulder 8), new high 12 (> shoulder: yang), down to -2 (reversal, waist 12... then break below waist -> yin)
+  const b = kagiRun(steps([8, 3, 12, 2, -6, -12]))
+  assert.equal(b[0].kagiThick, 0); assert.equal(b[0].kagiDir, 1)
+  assert.ok(b.some((x) => x.kagiFlip === 1 && x.kagiState === 1), 'yang above the anchor')
+  assert.ok(b.some((x) => x.kagiFlip === -1), 'yin flip'); assert.ok(b.some((x) => x.kagiThick === -1 && x.kagiState === -1), 'yin below the anchor')
+  assert.ok(b.some((x) => x.kagiRev === -1) && b.some((x) => x.kagiRev === 1))
+  const yang = b.findIndex((x) => x.kagiFlip === 1)
+  assert.equal(b[yang].kagiSince, 0); assert.equal(b[yang + 1].kagiSince, 1)
+  assert.ok(Number.isFinite(b[yang].kagiShoulder) && b[yang].close > b[yang].kagiShoulder)
+})
+test('kagi: mixed states - yang while still below the anchor (reclaim), yin while still above (fade)', () => {
+  const rec = kagiRun(steps([-3, -9, -3, -7.5, -1.5, -1]))
+  const m = rec.findIndex((x) => x.kagiMixed === 1)
+  assert.ok(m >= 0 && rec[m].kagiState === 2 && rec[m].close < 0 && rec[m].kagiThick === 1)
+  const fade = kagiRun(steps([3, 9, 3, 7.5, 1.5, 1]))
+  const f = fade.findIndex((x) => x.kagiMixed === -1)
+  assert.ok(f >= 0 && fade[f].kagiState === -2 && fade[f].close > 0 && fade[f].kagiThick === -1)
+})
+test('kagi resets at every roll and never looks ahead', () => {
+  const r = computeAnchorDiff(candles, { anchor: '4h' })!
+  const roll = r.bars.findIndex((b, i) => i > 0 && b.rolled)
+  assert.equal(r.bars[roll].kagiLines <= 1, true); assert.equal(r.bars[roll].kagiThick, 0); assert.equal(r.bars[roll].kagiDir, 1)
+  let sd = 4242; const rnd = () => { sd = (sd * 1664525 + 1013904223) % 4294967296; return sd / 4294967296 }
+  const rows: [number, number, number, number][] = []; let c = 100
+  for (let i = 0; i < 900; i++) { const o = c; c += (rnd() - 0.5) * 1.6; rows.push([o, Math.max(o, c) + 0.2, Math.min(o, c) - 0.2, c]) }
+  const cs = mkc(rows)
+  const full = computeAnchorDiff(cs, { anchor: '4h' })!, cut = computeAnchorDiff(cs.slice(0, 700), { anchor: '4h' })!
+  const fields = ['kagiDir', 'kagiThick', 'kagiShoulder', 'kagiWaist', 'kagiFlip', 'kagiRev', 'kagiLines', 'kagiSince', 'kagiState', 'kagiMixed'] as const
+  let fired = 0
+  for (let i = 0; i < cut.bars.length; i++) for (const f of fields) { assert.equal(String(full.bars[i][f]), String(cut.bars[i][f]), `${f}@${i}`); if ((f === 'kagiFlip' || f === 'kagiRev') && full.bars[i][f]) fired++ }
+  assert.ok(fired > 3)
+})
+test('MSL kagi reads match the engine', () => {
+  let sd = 4242; const rnd = () => { sd = (sd * 1664525 + 1013904223) % 4294967296; return sd / 4294967296 }
+  const rows: [number, number, number, number][] = []; let c = 100
+  for (let i = 0; i < 700; i++) { const o = c; c += (rnd() - 0.5) * 1.6; rows.push([o, Math.max(o, c) + 0.2, Math.min(o, c) - 0.2, c]) }
+  const cs = mkc(rows)
+  const series = { time: cs.map((x) => x.time), open: cs.map((x) => x.open), high: cs.map((x) => x.high), low: cs.map((x) => x.low), close: cs.map((x) => x.close), volume: cs.map((x) => x.volume) }
+  const e = computeAnchorDiff(cs, { anchor: '4h' })!.bars.at(-1)!
+  const q = parseStrategyScript(`call when anchor.kagiState("4h") == ${e.kagiState} and anchor.kagiThick("4h") == ${e.kagiThick} and anchor.kagiLines("4h") == ${e.kagiLines} and anchor.kagiSince("4h") == ${e.kagiSince} and anchor.afterUp("kagiFlip", 3, "4h") == 0.5\nexpiry = 1\n`)
+  assert.ok(q.ok)
+  const out = evaluateStrategyScript((q as { ast: never }).ast, {}, undefined, series as never, undefined)
+  assert.equal(out.error, undefined); assert.equal(out.direction, 'call')
+})
+
+// ---- other references, multi-anchor reads, custom conditions
+const D0 = Math.floor(T0 / 86400) * 86400 + 86400   // a UTC midnight
+const mkDay = (n: number, vol = true) => { let c = 100; const out = []; for (let i = 0; i < n; i++) { const o = c; c += Math.sin(i / 9) * 0.3 + Math.cos(i / 4) * 0.15; out.push({ time: D0 + i * 60, open: o, high: Math.max(o, c) + 0.1, low: Math.min(o, c) - 0.1, close: c, volume: vol ? 10 + (i % 7) : 0 }) } return out }
+test('parseAnchorSpec', () => {
+  assert.deepEqual(parseAnchorSpec('4h'), { sec: 14400, ref: 'close' }); assert.deepEqual(parseAnchorSpec('4h:open'), { sec: 14400, ref: 'open' })
+  assert.equal(parseAnchorSpec('1d:vwap')!.ref, 'vwap'); assert.equal(parseAnchorSpec('asia')!.session, 'asia'); assert.equal(parseAnchorSpec('round')!.ref, 'round')
+  assert.equal(parseAnchorSpec('4h:banana'), null); assert.equal(parseAnchorSpec('4h:open:x'), null); assert.equal(parseAnchorSpec('7q'), null)
+})
+test('references: open / previous high / previous low', () => {
+  const cs = mkDay(720)
+  const o = computeAnchorDiff(cs, { anchor: '4h:open' })!
+  assert.equal(o.bars[0].time, cs[0].time)                      // no previous period needed
+  near(o.bars[0].anchor, cs[0].open); near(o.bars[239].anchor, cs[0].open); near(o.bars[240].anchor, cs[240].open)
+  assert.equal(o.bars[240].rolled, true); assert.equal(o.bars[239].rolled, false)
+  const h = computeAnchorDiff(cs, { anchor: '4h:high' })!, l = computeAnchorDiff(cs, { anchor: '4h:low' })!
+  assert.equal(h.bars[0].time, cs[240].time)
+  near(h.bars[0].anchor, Math.max(...cs.slice(0, 240).map((c) => c.high))); near(l.bars[0].anchor, Math.min(...cs.slice(0, 240).map((c) => c.low)))
+  near(h.bars[240].anchor, Math.max(...cs.slice(240, 480).map((c) => c.high)))
+})
+test('reference: anchored VWAP develops from the period start (volume-weighted; time-weighted without volume)', () => {
+  const cs = mkDay(500)
+  const r = computeAnchorDiff(cs, { anchor: '4h:vwap' })!
+  let pv = 0, w = 0
+  for (let k = 0; k <= 10; k++) { pv += (cs[k].high + cs[k].low + cs[k].close) / 3 * cs[k].volume; w += cs[k].volume }
+  near(r.bars[10].anchor, pv / w, 1e-9)
+  const t = computeAnchorDiff(mkDay(500, false), { anchor: '4h:vwap' })!
+  let s2 = 0; const c2 = mkDay(500, false); for (let k = 0; k <= 10; k++) s2 += (c2[k].high + c2[k].low + c2[k].close) / 3
+  near(t.bars[10].anchor, s2 / 11, 1e-9)
+  assert.equal(r.bars[240].rolled, true)
+  near(r.bars[240].anchor, (cs[240].high + cs[240].low + cs[240].close) / 3, 1e-9)    // restarts
+})
+test('reference: session opens only produce bars inside the session', () => {
+  const cs = mkDay(1400)                                          // 00:00 -> ~23:20 UTC
+  const asia = computeAnchorDiff(cs, { anchor: 'asia' })!, ldn = computeAnchorDiff(cs, { anchor: 'london' })!, ny = computeAnchorDiff(cs, { anchor: 'ny' })!
+  assert.equal(asia.bars.length, 7 * 60); assert.equal(ldn.bars.length, 5 * 60); assert.equal(ny.bars.length, 9 * 60)
+  near(asia.bars[0].anchor, cs[0].open); near(ldn.bars[0].anchor, cs[7 * 60].open); near(ny.bars[100].anchor, cs[12 * 60].open)
+  assert.ok(asia.bars.every((b) => (b.time % 86400) / 3600 < 7)); assert.equal(ldn.bars[0].rolled, true)
+})
+test('reference: round numbers (auto step, hysteresis) keep the nearest level', () => {
+  const cs = mkDay(600).map((c) => ({ ...c, open: c.open * 0.0115, high: c.high * 0.0115, low: c.low * 0.0115, close: c.close * 0.0115 })) // ~1.15
+  const r = computeAnchorDiff(cs, { anchor: 'round' })!
+  for (const b of r.bars) assert.ok(Math.abs(b.anchor / 0.01 - Math.round(b.anchor / 0.01)) < 1e-6, `${b.anchor} is not a multiple of 0.01`)
+  const fixed = computeAnchorDiff(cs, { anchor: 'round', roundStep: 0.005 })!
+  assert.ok(fixed.bars.every((b) => Math.abs(b.anchor / 0.005 - Math.round(b.anchor / 0.005)) < 1e-6))
+  assert.ok(r.bars.every((b, i) => i === 0 || b.rolled === (b.anchor !== r.bars[i - 1].anchor)))
+})
+test('every reference has NO LOOK-AHEAD: a prefix run matches the full run', () => {
+  const cs = mkDay(1300)
+  for (const sp of ['4h:open', '4h:high', '4h:low', '4h:vwap', 'ny', 'round']) {
+    const full = computeAnchorDiff(cs, { anchor: sp })!, cut = computeAnchorDiff(cs.slice(0, 1000), { anchor: sp })!
+    for (let i = 0; i < cut.bars.length; i++) for (const f of ['anchor', 'close', 'z', 'rolled', 'kagiState', 'rsi', 'pHigh'] as const) assert.equal(String(full.bars[i][f]), String(cut.bars[i][f]), `${sp} ${f}@${i}`)
+  }
+})
+test('conditions: parse errors, fields, other-anchor clauses', () => {
+  assert.ok(Array.isArray(parseCondition('sweep=1 & kagiState=2 & adx>25 & !squeeze & z@1d<-0.5')))
+  assert.equal(typeof parseCondition('sweep >> 1'), 'string'); assert.equal(typeof parseCondition(''), 'string'); assert.equal(typeof parseCondition('!z>1'), 'string')
+})
+const mslRun = (src: string, cs = candles) => {
+  const series = { time: cs.map((x) => x.time), open: cs.map((x) => x.open), high: cs.map((x) => x.high), low: cs.map((x) => x.low), close: cs.map((x) => x.close), volume: cs.map((x) => x.volume ?? 0) }
+  const q = parseStrategyScript(src); assert.ok(q.ok, src)
+  return evaluateStrategyScript((q as { ast: never }).ast, {}, undefined, series as never, undefined)
+}
+let sdw = 31337; const rndw = () => { sdw = (sdw * 1664525 + 1013904223) % 4294967296; return sdw / 4294967296 }
+const walk = (() => { const out = []; let c = 100; for (let i = 0; i < 2400; i++) { const o = c; c += (rndw() - 0.5) * 1.2; out.push({ time: T0 + i * 60, open: o, high: Math.max(o, c) + rndw() * 0.3, low: Math.min(o, c) - rndw() * 0.3, close: c, volume: 10 }) } return out })()
+test('MSL anchor.now / whenX: matches a hand count, neutral when inactive, errors are clear', () => {
+  const r = computeAnchorDiff(walk, { anchor: '4h', statsTail: 400 })!
+  const m = r.bars.length
+  const hold = (b: (typeof r.bars)[number]) => b.z > 0.5 && b.rsi > 50
+  const last = r.bars[m - 1]
+  const now = mslRun('call when anchor.now("z>0.5 & rsi>50", -1, "4h")\nexpiry = 1\n', walk)
+  assert.equal(now.error, undefined); assert.equal(now.direction, hold(last) ? 'call' : 'none')
+  // find a bar offset where it holds and compare the stats against a manual count
+  let o = -1; while (m + o >= 0 && !hold(r.bars[m + o])) o--
+  const bi = m + o
+  let n = 0, up = 0
+  for (let j = Math.max(0, m - 400); j + 3 <= bi; j++) if (hold(r.bars[j]) && r.bars[j].atr > 0) { n++; if (r.bars[j + 3].price > r.bars[j].price) up++ }
+  const vis = mslRun(`call when anchor.whenVisits("z>0.5 & rsi>50", 3, ${o}, "4h") == ${n}\nexpiry = 1\n`, walk); assert.equal(vis.error, undefined); assert.equal(vis.direction, 'call')
+  if (n >= 20) { const u = mslRun(`call when anchor.whenUp("z>0.5 & rsi>50", 3, ${o}, "4h") > ${up / n - 1e-9} and anchor.whenUp("z>0.5 & rsi>50", 3, ${o}, "4h") < ${up / n + 1e-9} and anchor.whenReady("z>0.5 & rsi>50", 3, ${o}, "4h")\nexpiry = 1\n`, walk); assert.equal(u.direction, 'call') }
+  // inactive: neutral
+  const inact = mslRun('call when anchor.whenUp("z>9999", 3, "4h") == 0.5 and anchor.whenVisits("z>9999", 3, "4h") == 0\nexpiry = 1\n', walk); assert.equal(inact.direction, 'call')
+  assert.ok(mslRun('call when anchor.now("nonsense>1", -1, "4h")\nexpiry = 1\n', walk).error)
+  assert.ok(mslRun('call when anchor.whenUp("z>0", 2, "4h") > 0\nexpiry = 1\n', walk).error)
+  assert.ok(mslRun('call when anchor.now("z>>0", -1, "4h")\nexpiry = 1\n', walk).error)
+})
+test('MSL conditions across anchors: "z@1d<0" joins the 1d anchor by candle time', () => {
+  const r4 = computeAnchorDiff(walk, { anchor: '4h' })!, r1 = computeAnchorDiff(walk, { anchor: '1d' })!
+  const t1 = new Map(r1.bars.map((b) => [b.time, b]))
+  const last = r4.bars.at(-1)!, other = t1.get(last.time)
+  const expect = !!other && other.z < 0 && last.z > 0
+  const out = mslRun('call when anchor.now("z>0 & z@1d<0", -1, "4h")\nexpiry = 1\n', walk)
+  assert.equal(out.error, undefined); assert.equal(out.direction, expect ? 'call' : 'none')
+  assert.ok(mslRun('call when anchor.now("z@7q<0", -1, "4h")\nexpiry = 1\n', walk).error)
+})
+test('MSL multi-anchor reads: align / alignZ / stretch / diverge / breadth match the single-anchor gaps', () => {
+  const g4 = computeAnchorDiff(walk, { anchor: '4h' })!.bars.at(-1)!, g1 = computeAnchorDiff(walk, { anchor: '1d' })!.bars.at(-1)!
+  const al = g4.close > 0 && g1.close > 0 ? 1 : g4.close < 0 && g1.close < 0 ? -1 : 0
+  assert.equal(mslRun(`call when anchor.align("4h", "1d") == ${al}\nexpiry = 1\n`, walk).direction, 'call')
+  const dv = g4.close > 0 && g1.close < 0 ? 1 : g4.close < 0 && g1.close > 0 ? -1 : 0
+  assert.equal(mslRun(`call when anchor.diverge("4h", "1d") == ${dv}\nexpiry = 1\n`, walk).direction, 'call')
+  const br = (g4.close > 0 ? 1 : -1) + (g1.close > 0 ? 1 : -1)
+  assert.equal(mslRun(`call when anchor.breadth("4h", "1d") == ${br}\nexpiry = 1\n`, walk).direction, 'call')
+  const st = g4.z >= 1 && g1.z >= 1 ? 1 : g4.z <= -1 && g1.z <= -1 ? -1 : 0
+  assert.equal(mslRun(`call when anchor.stretch(1, "4h", "1d") == ${st}\nexpiry = 1\n`, walk).direction, 'call')
+  if (al !== 0) { const z = mslRun(`call when anchor.alignZ("4h", "1d") * ${al} > 0\nexpiry = 1\n`, walk); assert.equal(z.direction, 'call') }
+  assert.ok(mslRun('call when anchor.diverge("4h") == 1\nexpiry = 1\n', walk).error)
+  assert.ok(mslRun('call when anchor.align() == 1\nexpiry = 1\n', walk).error)
+})
+test('MSL: new references work as anchor strings', () => {
+  for (const sp of ['4h:open', '4h:high', '4h:low', '4h:vwap', 'round']) { const o = mslRun(`call when anchor.ok("${sp}")\nexpiry = 1\n`, walk); assert.equal(o.error, undefined, sp) }
+  const r = computeAnchorDiff(walk, { anchor: '4h:vwap' })!.bars.at(-1)!
+  assert.equal(mslRun(`call when anchor.anchor("4h:vwap") > ${r.anchor - 1e-9} and anchor.anchor("4h:vwap") < ${r.anchor + 1e-9}\nexpiry = 1\n`, walk).direction, 'call')
 })
 console.log(`${pass}/${total}`); if (pass !== total) process.exit(1)

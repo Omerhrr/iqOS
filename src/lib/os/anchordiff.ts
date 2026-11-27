@@ -269,6 +269,28 @@ export interface PatternFields {
   tlResist: number
   gapFill: number
   volRatio: number
+  // ---- Kagi on the gap path, reset at every roll (yin / yang): the line starts at the anchor (0), reverses when the gap pulls back by kagiMult x ATR, turns thick (yang) when the gap
+  //      breaks above the last shoulder and thin (yin) when it breaks below the last waist. The anchor itself is NOT a shoulder / waist, only the side marker.
+  /** +1 line going up / -1 going down */
+  kagiDir: number
+  /** +1 yang (thick) / -1 yin (thin) / 0 until the first shoulder or waist has been broken in this period */
+  kagiThick: number
+  kagiShoulder: number
+  kagiWaist: number
+  kagiShoulderZ: number
+  kagiWaistZ: number
+  /** +1 turned yang on this bar, -1 turned yin */
+  kagiFlip: number
+  /** +1 up-reversal, -1 down-reversal on this bar */
+  kagiRev: number
+  /** reversal lines drawn so far in this period */
+  kagiLines: number
+  /** bars since the last yang / yin flip (0 = this bar) */
+  kagiSince: number
+  /** 1 yang above the anchor (strong), 2 yang below it (recovering), -1 yin below (weak), -2 yin above (fading), 0 thickness unknown */
+  kagiState: number
+  /** +1 the state just became 2 (yang while still below the anchor: reclaim attempt), -1 just became -2 (yin while still above: fade) */
+  kagiMixed: number
   /** what happened after earlier bars carrying the same signal value (only for signals active on this bar; newest statsTail bars only) */
   sigNext: Record<string, Record<AnchorHorizon, AnchorNext>>
 }
@@ -341,6 +363,10 @@ export interface AnchorBar extends PatternFields {
   cumDeltaPct: number
   /** +1 bullish / -1 bearish divergence between price and cumulative delta, else 0 */
   deltaDiv: 1 | -1 | 0
+  /** ATR over this anchor period only (starts at the roll, expanding average until the period is atrPeriod bars old); `atr` stays the plain ATR used as the unit for z / roc / zones */
+  atrP: number
+  /** bars of this anchor period seen so far (the sample behind rsi / cci / mfi / atrP) */
+  rsiBars: number
   support: number
   resistance: number
   supportDist: number
@@ -436,6 +462,10 @@ export interface AnchorDiffOptions {
   statsTail?: number
   /** bars each side for a swing pivot (default 3) */
   pivotLen?: number
+  /** price step of the round-number reference ("round"); default 10^(floor(log10(price)) - 2), e.g. 0.01 for 1.15, 100 for 60000 */
+  roundStep?: number
+  /** Kagi reversal size in ATR (default 1) */
+  kagiMult?: number
   /** ADX / DI period (default 14) */
   adxPeriod?: number
   /** impulse size, in ATR, that turns a base into a supply / demand zone (default 1.5) */
@@ -453,11 +483,30 @@ export function parseAnchorPeriod(p: string | number | undefined): number | null
   return sec >= 60 ? sec : null
 }
 
+export type AnchorRef = 'close' | 'open' | 'high' | 'low' | 'vwap' | 'round' | 'session'
+export interface AnchorSpec { sec: number; ref: AnchorRef; session?: 'asia' | 'london' | 'ny' }
+/** UTC hour ranges [from, to) of the three sessions (an approximation: sessions overlap in reality, here each hour belongs to one) */
+export const ANCHOR_SESSIONS = { asia: [0, 7], london: [7, 12], ny: [12, 21] } as const
+const REF_NAMES = new Set(['close', 'open', 'high', 'low', 'vwap'])
+/** "4h" (reference = last completed close, the default) | "4h:open" this period's open | "4h:high" / "4h:low" previous period's high / low | "4h:vwap" VWAP anchored at the period start |
+ *  "asia" / "london" / "ny" open of that session (bars only inside it) | "round" nearest round number (step = options.roundStep, else automatic) */
+export function parseAnchorSpec(p: string | number | undefined): AnchorSpec | null {
+  if (p === undefined || p === '' || typeof p === 'number') { const sec = parseAnchorPeriod(p); return sec === null ? null : { sec, ref: 'close' } }
+  const t = p.trim().toLowerCase()
+  if (t === 'asia' || t === 'london' || t === 'ny') return { sec: 86400, ref: 'session', session: t }
+  if (t === 'round') return { sec: 3600, ref: 'round' }
+  const [per, ref = 'close', ...rest] = t.split(':')
+  if (rest.length || !REF_NAMES.has(ref)) return null
+  const sec = parseAnchorPeriod(per)
+  return sec === null ? null : { sec, ref: ref as AnchorRef }
+}
+
 export const ANCHOR_PRESETS = ['15m', '30m', '1h', '4h', '1d', '1w'] as const
 
 export function computeAnchorDiff(candles: Candle[], opts: AnchorDiffOptions = {}): AnchorDiffResult | null {
-  const P = parseAnchorPeriod(opts.anchor)
-  if (P === null) return null
+  const spec = parseAnchorSpec(opts.anchor)
+  if (spec === null) return null
+  const P = spec.sec
   const atrP = opts.atrPeriod ?? 14
   const rocP = Math.max(1, Math.round(opts.rocPeriod ?? 5))
   const n = candles.length
@@ -474,22 +523,55 @@ export function computeAnchorDiff(candles: Candle[], opts: AnchorDiffOptions = {
   const mfiS = mfiFn(hi, lo, cl, vol, opts.mfiPeriod ?? 14)
   const rsiS = rsiFn(cl, opts.rsiPeriod ?? 14)
 
-  // anchor for each bar = close of the last candle that opened BEFORE this bar's period started
+  // reference level for each bar (NaN = this bar gets no anchor bar) and the period bucket it belongs to
   const anchors = new Array<number>(n).fill(NaN)
+  const bucketId = new Array<number>(n).fill(0)
+  const anyVol = vol.some((v) => v > 0)
   let curBucket = Number.NaN
-  let curAnchor = Number.NaN
   let lastBeforeBucket = Number.NaN // close of the last candle of any earlier bucket
   let lastClose = Number.NaN
+  let curOpen = Number.NaN, curHi = Number.NaN, curLo = Number.NaN, prevHi = Number.NaN, prevLo = Number.NaN
+  let pvSum = 0, wSum = 0
+  let roundRef = Number.NaN
+  const stepFor = (px: number) => (opts.roundStep !== undefined && opts.roundStep > 0 ? opts.roundStep : Math.pow(10, Math.floor(Math.log10(Math.max(1e-12, Math.abs(px)))) - 2))
   for (let i = 0; i < n; i++) {
-    const b = Math.floor(candles[i].time / P)
-    if (b !== curBucket) {
-      // entering a new bucket: the previous candle's close is the last close before it
-      curAnchor = i > 0 ? lastClose : Number.NaN
-      lastBeforeBucket = curAnchor
-      curBucket = b
+    const c = candles[i]
+    if (spec.ref === 'session') {
+      const hr = (c.time % 86400) / 3600
+      const [from, to] = ANCHOR_SESSIONS[spec.session!]
+      if (hr < from || hr >= to) { lastClose = c.close; continue }
     }
-    anchors[i] = lastBeforeBucket
-    lastClose = candles[i].close
+    const b = spec.ref === 'session' ? Math.floor(c.time / 86400) : spec.ref === 'round' ? 0 : Math.floor(c.time / P)
+    bucketId[i] = b
+    const entering = b !== curBucket
+    if (entering) {
+      lastBeforeBucket = i > 0 ? lastClose : Number.NaN
+      prevHi = curHi; prevLo = curLo
+      curOpen = c.open; curHi = c.high; curLo = c.low
+      pvSum = 0; wSum = 0
+      curBucket = b
+    } else { if (c.high > curHi) curHi = c.high; if (c.low < curLo) curLo = c.low }
+    switch (spec.ref) {
+      case 'close': anchors[i] = lastBeforeBucket; break
+      case 'open':
+      case 'session': anchors[i] = curOpen; break
+      case 'high': anchors[i] = prevHi; break
+      case 'low': anchors[i] = prevLo; break
+      case 'vwap': {
+        const w = anyVol ? c.volume || 0 : 1
+        pvSum += ((c.high + c.low + c.close) / 3) * w; wSum += w
+        anchors[i] = wSum > 0 ? pvSum / wSum : (c.high + c.low + c.close) / 3
+        break
+      }
+      case 'round': {
+        const ref = i > 0 ? candles[i - 1].close : c.close
+        const step = stepFor(ref)
+        if (!Number.isFinite(roundRef) || Math.abs(ref - roundRef) > 0.6 * step) roundRef = Math.round(ref / step) * step
+        anchors[i] = roundRef
+        break
+      }
+    }
+    lastClose = c.close
   }
 
   const bars: AnchorBar[] = []
@@ -498,7 +580,7 @@ export function computeAnchorDiff(candles: Candle[], opts: AnchorDiffOptions = {
     const a = anchors[i]
     if (!Number.isFinite(a)) continue
     const prevA = i > 0 ? anchors[i - 1] : Number.NaN
-    const rolled = !Number.isFinite(prevA) || a !== prevA || Math.floor(candles[i].time / P) !== Math.floor(candles[i - 1].time / P)
+    const rolled = i === 0 || !Number.isFinite(prevA) || bucketId[i] !== bucketId[i - 1] || (spec.ref === 'round' && a !== prevA)
     const c = candles[i]
     const atrV = atrS[i]
     const d = c.close - a
@@ -551,11 +633,14 @@ export function computeAnchorDiff(candles: Candle[], opts: AnchorDiffOptions = {
       approach: 0,
       poc: Number.NaN, vah: Number.NaN, val: Number.NaN, pocZ: Number.NaN, vahZ: Number.NaN, valZ: Number.NaN, pocDist: Number.NaN, inValue: false,
       periodVol: 0, periodBars: 0, volSource: 'time', delta: 0, cumDelta: 0, cumDeltaPct: 0, deltaDiv: 0,
+      atrP: Number.NaN, rsiBars: 0,
       ...emptyLevels(),
       ...emptyPatterns(),
     })
     idxOf.push(i)
   }
+  periodIndicators(bars, candles, idxOf, Math.max(2, Math.round(opts.rsiPeriod ?? 14)), Math.max(2, Math.round(opts.cciPeriod ?? 20)), Math.max(2, Math.round(opts.mfiPeriod ?? 14)), Math.max(2, Math.round(opts.atrPeriod ?? 14)))
+  periodKagi(bars, Math.max(0.1, opts.kagiMult ?? 1))
   const tailN = opts.statsTail !== undefined && opts.statsTail > 0 ? Math.max(1, Math.round(opts.statsTail)) : Infinity
   periodProfile(bars, bandW, candles, idxOf, tailN)
   levelsAndZones(bars, candles, idxOf, bandW, win, Math.max(1, Math.round(opts.pivotLen ?? 3)), opts.impulseAtr !== undefined && opts.impulseAtr > 0 ? opts.impulseAtr : 1.5, tailN)
@@ -729,14 +814,14 @@ function levelsAndZones(bars: AnchorBar[], candles: Candle[], idxOf: number[], b
   }
 }
 
-export const ANCHOR_SIGNALS = ['harami', 'tweezer', 'threeInside', 'piercing', 'hammer', 'invHammer', 'beltHold', 'threeStrike', 'kicker', 'fvg', 'fvgTap', 'obTap', 'rangeBreak', 'retest', 'double', 'hs', 'tlBreak', 'capitulation', 'fomo', 'stopHunt', 'expansion', 'diCross', 'bos', 'choch', 'sweep', 'engulf', 'pin', 'inside', 'outside', 'doji', 'soldiers', 'star', 'marubozu', 'exhaust', 'reject', 'trap', 'climax', 'eqHigh', 'eqLow'] as const
+export const ANCHOR_SIGNALS = ['kagiFlip', 'kagiRev', 'kagiMixed', 'harami', 'tweezer', 'threeInside', 'piercing', 'hammer', 'invHammer', 'beltHold', 'threeStrike', 'kicker', 'fvg', 'fvgTap', 'obTap', 'rangeBreak', 'retest', 'double', 'hs', 'tlBreak', 'capitulation', 'fomo', 'stopHunt', 'expansion', 'diCross', 'bos', 'choch', 'sweep', 'engulf', 'pin', 'inside', 'outside', 'doji', 'soldiers', 'star', 'marubozu', 'exhaust', 'reject', 'trap', 'climax', 'eqHigh', 'eqLow'] as const
 
 function emptyPatterns(): PatternFields {
   const N = Number.NaN
   return {
     adx: N, plusDI: N, minusDI: N, diCross: 0, trend: 0, swingHigh: N, swingLow: N, swingHighDist: N, swingLowDist: N, bos: 0, choch: 0, sweep: 0, eqHigh: 0, eqLow: 0,
     engulf: 0, pin: 0, inside: 0, outside: 0, doji: 0, soldiers: 0, star: 0, marubozu: 0, exhaust: 0, reject: 0, anchorTouch: 0, trap: 0, climax: 0, streak: 0, er: N, sigNext: {},
-    harami: 0, tweezer: 0, threeInside: 0, piercing: 0, hammer: 0, invHammer: 0, beltHold: 0, threeStrike: 0, kicker: 0, fvg: 0, fvgTap: 0, inFvg: 0, obTap: 0, inOb: 0, pdZone: 0, ote: 0, inRange: 0, rangeBreak: 0, retest: 0, double: 0, hs: 0, tlBreak: 0, wedge: 0, channel: 0, capitulation: 0, fomo: 0, gapFilled: 0, stopHunt: 0, squeeze: 0, expansion: 0, hour: 0, session: 0, regime: 0, fvgBullTop: N, fvgBullBottom: N, fvgBearTop: N, fvgBearBottom: N, obBullTop: N, obBullBottom: N, obBearTop: N, obBearBottom: N, pdPos: N, rangeHigh: N, rangeLow: N, tlSupport: N, tlResist: N, gapFill: N, volRatio: N,
+    harami: 0, tweezer: 0, threeInside: 0, piercing: 0, hammer: 0, invHammer: 0, beltHold: 0, threeStrike: 0, kicker: 0, fvg: 0, fvgTap: 0, inFvg: 0, obTap: 0, inOb: 0, pdZone: 0, ote: 0, inRange: 0, rangeBreak: 0, retest: 0, double: 0, hs: 0, tlBreak: 0, wedge: 0, channel: 0, capitulation: 0, fomo: 0, kagiDir: 0, kagiThick: 0, kagiShoulder: N, kagiWaist: N, kagiShoulderZ: N, kagiWaistZ: N, kagiFlip: 0, kagiRev: 0, kagiLines: 0, kagiSince: 0, kagiState: 0, kagiMixed: 0, gapFilled: 0, stopHunt: 0, squeeze: 0, expansion: 0, hour: 0, session: 0, regime: 0, fvgBullTop: N, fvgBullBottom: N, fvgBearTop: N, fvgBearBottom: N, obBullTop: N, obBullBottom: N, obBearTop: N, obBearBottom: N, pdPos: N, rangeHigh: N, rangeLow: N, tlSupport: N, tlResist: N, gapFill: N, volRatio: N,
   }
 }
 
@@ -869,6 +954,82 @@ function signalStats(bars: AnchorBar[], win: number, tail: number): void {
       }
       b.sigNext[name] = res
     }
+  }
+}
+
+/** rsi / cci / mfi / atrP measured on the PATH OF THE GAP since the anchor: the gap starts at 0 on the anchor close, so the first bar of a period already has one change (its gap).
+ *  Each anchor period starts from nothing (no memory of the previous one, so a roll never fakes a spike) and uses an expanding window until it has `P` bars. */
+function periodIndicators(bars: AnchorBar[], candles: Candle[], idxOf: number[], rsiP: number, cciP: number, mfiP: number, atrP: number): void {
+  const m = bars.length
+  let s = 0, gSum = 0, lSum = 0, gAvg = 0, lAvg = 0, aAvg = 0, aSum = 0
+  for (let i = 0; i < m; i++) {
+    const b = bars[i]
+    if (b.rolled || i === 0) { s = i; gSum = 0; lSum = 0; gAvg = 0; lAvg = 0; aAvg = 0; aSum = 0 }
+    const n = i - s + 1
+    const prevClose = i === s ? 0 : bars[i - 1].close
+    const ch = b.close - prevClose // gap change (first bar: gap - 0)
+    const gain = ch > 0 ? ch : 0, loss = ch < 0 ? -ch : 0
+    const k = idxOf[i]
+    const pc = k > 0 ? candles[k - 1].close - b.anchor : prevClose
+    const tr = Math.max(b.high - b.low, Math.abs(b.high - pc), Math.abs(b.low - pc))
+    if (n <= rsiP) { gSum += gain; lSum += loss; gAvg = gSum / n; lAvg = lSum / n } else { gAvg = (gAvg * (rsiP - 1) + gain) / rsiP; lAvg = (lAvg * (rsiP - 1) + loss) / rsiP }
+    b.rsi = lAvg === 0 ? (gAvg === 0 ? 50 : 100) : 100 - 100 / (1 + gAvg / lAvg)
+    if (n <= atrP) { aSum += tr; aAvg = aSum / n } else aAvg = (aAvg * (atrP - 1) + tr) / atrP
+    b.atrP = aAvg
+    b.rsiBars = n
+    const tp = (q: number) => (bars[q].high + bars[q].low + bars[q].close) / 3
+    // CCI over the last min(cciP, n) bars of this period
+    const w = Math.min(cciP, n)
+    let sma = 0
+    for (let q = i - w + 1; q <= i; q++) sma += tp(q)
+    sma /= w
+    let md = 0
+    for (let q = i - w + 1; q <= i; q++) md += Math.abs(tp(q) - sma)
+    md /= w
+    b.cci = md > 0 ? (tp(i) - sma) / (0.015 * md) : 0
+    // MFI on REAL prices over the last min(mfiP, n) bars of this period
+    const wm = Math.min(mfiP, n)
+    let pos = 0, neg = 0
+    for (let q = i - wm + 1; q <= i; q++) {
+      const kq = idxOf[q], c = candles[kq]
+      const t = (c.high + c.low + c.close) / 3
+      const pcn = kq > 0 ? (candles[kq - 1].high + candles[kq - 1].low + candles[kq - 1].close) / 3 : t
+      const mf = t * (c.volume || 0)
+      if (t > pcn) pos += mf; else if (t < pcn) neg += mf
+    }
+    b.mfi = pos + neg > 0 ? 100 - 100 / (1 + (neg === 0 ? Infinity : pos / neg)) : 50
+  }
+}
+
+/** Kagi (yin / yang) on the gap path, restarted at every roll. Same rules as analytics/kagi.ts, except the line starts AT the anchor (gap 0) and the anchor is only a side marker. */
+function periodKagi(bars: AnchorBar[], mult: number): void {
+  let dir = 1, extreme = 0, shoulder = Number.NaN, waist = Number.NaN, thick = 0, lines = 0, since = 0, prevState = 0
+  for (let i = 0; i < bars.length; i++) {
+    const b = bars[i]
+    if (b.rolled || i === 0) { dir = 1; extreme = 0; shoulder = Number.NaN; waist = Number.NaN; thick = 0; lines = 0; since = 0; prevState = 0 }
+    const c = b.close
+    const rev = b.atr > 0 ? b.atr * mult : Number.NaN
+    const before = thick
+    if (Number.isFinite(shoulder) && c > shoulder) thick = 1
+    if (Number.isFinite(waist) && c < waist) thick = -1
+    if (thick !== before) { b.kagiFlip = thick; since = 0 } else since++
+    if (Number.isFinite(rev)) {
+      if (dir === 1) {
+        if (c >= extreme) extreme = c
+        else if (extreme - c >= rev) { shoulder = extreme; dir = -1; extreme = c; lines++; b.kagiRev = -1 }
+      } else {
+        if (c <= extreme) extreme = c
+        else if (c - extreme >= rev) { waist = extreme; dir = 1; extreme = c; lines++; b.kagiRev = 1 }
+      }
+    }
+    b.kagiDir = dir; b.kagiThick = thick; b.kagiShoulder = shoulder; b.kagiWaist = waist
+    if (b.atr > 0) { b.kagiShoulderZ = shoulder / b.atr; b.kagiWaistZ = waist / b.atr }
+    b.kagiLines = lines; b.kagiSince = since
+    const state = thick === 0 ? 0 : thick === 1 ? (c >= 0 ? 1 : 2) : c < 0 ? -1 : -2
+    b.kagiState = state
+    if (state === 2 && prevState !== 2) b.kagiMixed = 1
+    else if (state === -2 && prevState !== -2) b.kagiMixed = -1
+    prevState = state
   }
 }
 
@@ -1151,4 +1312,58 @@ function enrich(bars: AnchorBar[], bw: number, win: number, tail: number): Ancho
   }
   void last
   return [...agg.entries()].sort((a, b) => a[0] - b[0]).map(([band, e]) => ({ band, lo: band * bw, hi: (band + 1) * bw, count: e.count, bull: e.bull, bear: e.bear, share: tot ? e.count / tot : 0 }))
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// User-defined conditions: "sweep=1 & kagiState=2 & adx>25 & z@1d<0" - clauses joined by &, each `field`, `!field`, `field op number` or any of those with `@<anchor>` (the same field from another anchor,
+// matched by candle time). Evaluated on stored bars only, so a condition at bar j never sees bar j+1.
+export interface CondClause { field: string; spec?: string; op: '>' | '>=' | '<' | '<=' | '=' | '!=' | 'truthy' | 'falsy'; val: number }
+const COND_TOKEN = /^\s*(!)?\s*([A-Za-z_][A-Za-z0-9_]*)(?:@([A-Za-z0-9:.]+))?\s*(?:(>=|<=|!=|==|=|>|<)\s*(-?\d+(?:\.\d+)?))?\s*$/
+export function parseCondition(src: string): CondClause[] | string {
+  const parts = src.split('&')
+  if (!src.trim()) return 'empty condition'
+  const out: CondClause[] = []
+  for (const part of parts) {
+    const m = COND_TOKEN.exec(part)
+    if (!m) return `cannot read "${part.trim()}" - use field, !field, field>1.5, field=1, field@1d<0 ...`
+    const [, bang, field, spec, op, num] = m
+    if (op) { if (bang) return `"${part.trim()}": ! cannot be combined with a comparison`; out.push({ field, spec, op: (op === '==' ? '=' : op) as CondClause['op'], val: Number(num) }) }
+    else out.push({ field, spec, op: bang ? 'falsy' : 'truthy', val: 0 })
+  }
+  return out
+}
+const NON_FIELD = new Set(['next', 'alike', 'sigNext', 'volSource'])
+/** names of the numeric / boolean fields a condition may read */
+export function condFieldNames(bar: AnchorBar): Set<string> {
+  const out = new Set<string>()
+  for (const [k, v] of Object.entries(bar)) if (!NON_FIELD.has(k) && (typeof v === 'number' || typeof v === 'boolean')) out.add(k)
+  return out
+}
+export function evalClause(bar: AnchorBar | undefined, c: CondClause): boolean {
+  if (!bar) return false
+  const raw = (bar as unknown as Record<string, number | boolean>)[c.field]
+  const v = typeof raw === 'boolean' ? (raw ? 1 : 0) : raw
+  if (typeof v !== 'number' || !Number.isFinite(v)) return false
+  switch (c.op) {
+    case 'truthy': return v !== 0
+    case 'falsy': return v === 0
+    case '>': return v > c.val
+    case '>=': return v >= c.val
+    case '<': return v < c.val
+    case '<=': return v <= c.val
+    case '=': return Math.abs(v - c.val) < 1e-9
+    default: return Math.abs(v - c.val) >= 1e-9
+  }
+}
+/** what happened `h` bars after earlier bars (from..i-h) where `hold` was true - settled outcomes only, MIN_VISITS before a number is given */
+export function conditionStats(bars: AnchorBar[], hold: (j: number) => boolean, i: number, h: AnchorHorizon, from: number): AnchorNext {
+  let n = 0, up = 0, bull = 0, mv = 0
+  for (let j = Math.max(0, from); j + h <= i; j++) {
+    const v = bars[j]
+    if (!(v.atr > 0) || !hold(j)) continue
+    const fut = bars[j + h]
+    const move = fut.price - v.price
+    n++; if (move > 0) up++; if (fut.dir > 0) bull++; mv += move / v.atr
+  }
+  return n >= MIN_VISITS ? { n, ready: true, up: up / n, bull: bull / n, move: mv / n } : { n, ready: false, up: 0.5, bull: 0.5, move: 0 }
 }

@@ -281,6 +281,8 @@ export const MSL_READ_CONFIGS: Record<string, MslConfigSpec> = {
   'anchor.pivotLen': { min: 1, max: 10, integer: true, desc: 'anchor swing-pivot bars each side for support / resistance' },
   'anchor.impulseAtr': { min: 0.5, max: 5, desc: 'anchor impulse size (ATR) that turns a base into a supply / demand zone' },
   'anchor.adxPeriod': { min: 2, max: 50, integer: true, desc: 'anchor ADX / DI period' },
+  'anchor.kagiMult': { min: 0.1, max: 5, desc: 'anchor Kagi reversal size in ATR (yin / yang)' },
+  'anchor.roundStep': { min: 0.0000001, max: 1000000, desc: 'anchor round-number reference: price step between round levels (default automatic)' },
   'anchor.window': { min: 20, max: 2000, integer: true, desc: 'anchor-difference rolling window of closes for dwell and next-candle stats' },
   // Market Response Chart (analytics/mrc.ts) - the three event-trigger knobs
   // plus the trailing-average lookback its response/activity reads use.
