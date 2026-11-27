@@ -64,6 +64,10 @@ export class OtcFootprintService {
   private archiveQueue: { asset: string; ts: number; price: number }[] = []
   private archiveFlushCount = 0
   private lastWarn = new Map<string, number>()
+  // IQ Option tab support: from when each asset's ticks are trustworthy, where samples were lost, and which assets the tab is watching right now
+  private coverFrom = new Map<string, number>()
+  private losses = new Map<string, { from: number; to: number }[]>()
+  private tabWatch = new Map<string, number>()
 
   async start(ctx: KernelContext): Promise<void> {
     this.ctx = ctx
@@ -108,6 +112,7 @@ export class OtcFootprintService {
       this.buffers.set(asset, buf)
     }
     const last = buf.length ? buf[buf.length - 1] : null
+    if (!this.coverFrom.has(asset)) { const f = ticks.find((x) => Number.isFinite(x.ts)); if (f) this.coverFrom.set(asset, f.ts) }
     for (const t of ticks) {
       if (!Number.isFinite(t.ts) || !Number.isFinite(t.price)) continue
       if (last && t.ts <= last.ts) continue // monotonic guard (double events, clock jitter)
@@ -175,6 +180,13 @@ export class OtcFootprintService {
         return
       }
       const wm = this.watermark.get(asset) ?? 0
+      // the sidecar keeps only its last ~1000 changes: if the oldest one it still holds is newer than what we already merged AND its buffer is full, samples were lost in between
+      if (wm > 0 && points.length >= 990 && Math.round(points[0].time * 1000) > wm + 1000) {
+        const l = this.losses.get(asset) ?? []
+        l.push({ from: wm, to: Math.round(points[0].time * 1000) })
+        if (l.length > 50) l.shift()
+        this.losses.set(asset, l)
+      }
       const fresh = points
         .map((p) => ({ ts: Math.round(p.time * 1000), price: p.price }))
         .filter((p) => p.ts > wm)
@@ -203,6 +215,8 @@ export class OtcFootprintService {
   private async sweepLive(): Promise<void> {
     if (this.market.mode !== 'live') return
     const assets = new Set<string>([this.market.activeAsset])
+    const nowW = Date.now()
+    for (const [a, exp] of this.tabWatch) { if (exp < nowW) this.tabWatch.delete(a); else assets.add(a) }
     try {
       // sub-minute scripts' pinned pairs (Meta/Omni Trader) first - same set market-data keeps live
       for (const name of ['metaTrader', 'omniTrader', 'mode', 'autopilot']) {
@@ -237,6 +251,17 @@ export class OtcFootprintService {
     for (const asset of [...assets].slice(0, PULL_ASSETS_CAP)) {
       await this.pullLive(asset)
     }
+  }
+
+  /** IQ Option tab: keep this asset's ticks flowing for the next 2 minutes (sweeps skip it otherwise) and, live, merge once now so the tab is not stale. */
+  async ensure(asset: string): Promise<TickPoint[]> {
+    const a = String(asset ?? '').toUpperCase() || this.market.activeAsset
+    this.tabWatch.set(a, Date.now() + 120_000)
+    if (this.market.mode === 'live' && Date.now() - (this.lastPull.get(a) ?? 0) > 1500) await this.pullLive(a)
+    return this.ticksFor(a)
+  }
+  coverage(asset: string): { from: number; losses: { from: number; to: number }[] } {
+    return { from: this.coverFrom.get(asset) ?? Date.now(), losses: this.losses.get(asset) ?? [] }
   }
 
   /** The /otc_footprint read: live mode awaits one fresh sidecar merge (so a

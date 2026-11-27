@@ -747,6 +747,35 @@ export async function getBinanceBars(pair: string, tf: string, n = 30): Promise<
 export async function setBinanceRecorder(on: boolean): Promise<{ ok: boolean; on: boolean }> {
   return osPost('/binance/recorder', { on })
 }
+// ---- IQ Option tick activity (tick counts, up/down-tick delta, ladder built from IQ's own quote changes, any pair) ----
+export interface IqLadderRow { price: number; up: number; down: number }
+export interface IqTickBarView {
+  time: number
+  open: number
+  high: number
+  low: number
+  close: number
+  ticks: number
+  up: number
+  down: number
+  delta: number
+  deltaPct: number
+  upMove: number
+  downMove: number
+  poc?: number
+  complete: boolean
+  ladder?: IqLadderRow[]
+  iq?: { open: number; high: number; low: number; close: number; volume: number } | null
+}
+export interface IqNowBarView extends IqTickBarView { ageSec: number; tfSec: number; ladder: IqLadderRow[] }
+export type IqHealthView =
+  | { ok: false; error: string }
+  | { ok: true; asset: string; name: string; mode: string; live: boolean; source: string; otc: boolean; ticksHeld: number; coverFromAgoSec: number | null; lastTickAgoSec: number | null; ticksPerMin: number; lostWindows: number; price: number; iqCandleVolume: boolean }
+export type IqBarsResult = { ok: true; asset: string; tf: string; live: boolean; source: string; step: number; bars: IqTickBarView[] } | { ok: false; error: string }
+export type IqNowResult = { ok: true; asset: string; tf: string; live: boolean; source: string; step: number; fresh: boolean; bar: IqNowBarView | null } | { ok: false; error: string }
+export async function getIqHealth(asset: string): Promise<IqHealthView> { return osGet('/iq/health', { asset }) }
+export async function getIqBars(asset: string, tf: string, n = 30): Promise<IqBarsResult> { return osGet('/iq/bars', { asset, tf, n }) }
+export async function getIqNow(asset: string, tf: string): Promise<IqNowResult> { return osGet('/iq/now', { asset, tf }) }
 export interface BinanceLeadEst { t: number; lagMs: number; corr: number; leader: 'binance' | 'iq' | 'none' }
 export interface BinanceLeadPair {
   pair: string

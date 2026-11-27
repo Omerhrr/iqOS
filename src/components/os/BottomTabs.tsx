@@ -33,6 +33,7 @@ import SmcPanel from './SmcPanel'
 import ExplainerTab from './ExplainerTab'
 import RegimePanel from './RegimePanel'
 import BinancePanel from './BinancePanel'
+import IqOptionPanel from './IqOptionPanel'
 import DataExportTab from './DataExportTab'
 import SignalTab from './SignalTab'
 import FinderTab from './FinderTab'
@@ -257,6 +258,7 @@ export default function BottomTabs(props: BottomTabsProps) {
             ['explainer', 'Explainer'],
             ['regime', 'Regime'],
             ['binance', 'Binance'],
+            ['iqoption', 'IQ Option'],
             ['signal', 'Signal'],
             ['finder', 'Finder'],
             ['data', 'Data'],
@@ -466,6 +468,10 @@ export default function BottomTabs(props: BottomTabsProps) {
 
       <TabsContent value="binance" className="mt-0 min-h-0 flex-1 overflow-hidden">
         <BinancePanel />
+      </TabsContent>
+
+      <TabsContent value="iqoption" className="mt-0 min-h-0 flex-1 overflow-hidden">
+        <IqOptionPanel assets={props.assets} initialAsset={asset} />
       </TabsContent>
 
       <TabsContent value="explainer" className="mt-0 min-h-0 flex-1 overflow-hidden">
