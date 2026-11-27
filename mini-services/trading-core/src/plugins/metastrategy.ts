@@ -278,6 +278,9 @@ export const MSL_READ_CONFIGS: Record<string, MslConfigSpec> = {
   'anchor.rocPeriod': { min: 1, max: 200, integer: true, desc: 'anchor-difference ROC lookback (bars)' },
   'anchor.atrPeriod': { min: 2, max: 200, integer: true, desc: 'anchor-difference ATR period' },
   'anchor.bandWidth': { min: 0.05, max: 5, desc: 'anchor-difference dwell band width, in ATR units' },
+  'anchor.pivotLen': { min: 1, max: 10, integer: true, desc: 'anchor swing-pivot bars each side for support / resistance' },
+  'anchor.impulseAtr': { min: 0.5, max: 5, desc: 'anchor impulse size (ATR) that turns a base into a supply / demand zone' },
+  'anchor.adxPeriod': { min: 2, max: 50, integer: true, desc: 'anchor ADX / DI period' },
   'anchor.window': { min: 20, max: 2000, integer: true, desc: 'anchor-difference rolling window of closes for dwell and next-candle stats' },
   // Market Response Chart (analytics/mrc.ts) - the three event-trigger knobs
   // plus the trailing-average lookback its response/activity reads use.

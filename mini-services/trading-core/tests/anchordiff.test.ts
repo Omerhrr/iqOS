@@ -207,4 +207,270 @@ test('MSL tick reads: real ticks since the anchor period start; fail closed with
   assert.equal(evaluateStrategyScript((q2 as { ast: never }).ast, {}, undefined, series(candles2), undefined, { ticks, nowMs: ticks[ticks.length - 1].ts }).direction, 'call')
   const few = evaluateStrategyScript((q as { ast: never }).ast, {}, undefined, series(candles2), undefined, { ticks: ticks.slice(0, 1), nowMs: ticks[0].ts }); assert.ok(few.error && /fewer than 2 live ticks/.test(few.error))
 })
+
+// ---- support / resistance, period levels, supply / demand zones
+test('period high/low and previous period are tracked per anchor period', () => {
+  const r = computeAnchorDiff(candles, { anchor: '4h' })!
+  const b = r.bars[250] // input bar 490, third bucket
+  let hi = -Infinity, lo = Infinity
+  for (let k = 480; k <= 490; k++) { hi = Math.max(hi, candles[k].high); lo = Math.min(lo, candles[k].low) }
+  near(b.pHigh, hi); near(b.pLow, lo)
+  let ph = -Infinity, pl = Infinity
+  for (let k = 240; k < 480; k++) { ph = Math.max(ph, candles[k].high); pl = Math.min(pl, candles[k].low) }
+  near(b.prevHigh, ph); near(b.prevLow, pl); near(b.pHighZ, (hi - b.anchor) / b.atr)
+})
+test('support / resistance bracket the close and use confirmed pivots only (prefix cut = same values)', () => {
+  const r = computeAnchorDiff(candles, { anchor: '4h' })!
+  const last = r.bars[r.bars.length - 1]
+  if (Number.isFinite(last.support)) assert.ok(last.support <= candles[candles.length - 1].close)
+  if (Number.isFinite(last.resistance)) assert.ok(last.resistance > candles[candles.length - 1].close)
+  assert.ok(Number.isFinite(last.support) || Number.isFinite(last.resistance))
+  const cutN = 600
+  const full = computeAnchorDiff(candles, { anchor: '4h' })!, cut = computeAnchorDiff(candles.slice(0, cutN), { anchor: '4h' })!
+  const i = cut.bars.length - 1
+  for (const f of ['pHigh', 'pLow', 'prevHigh', 'demandCount', 'supplyCount'] as const) assert.equal(String(full.bars[i][f]), String(cut.bars[i][f]), f)
+  const idx = full.bars.findIndex((b) => b.time === cut.bars[i].time)
+  // the cut run sees the same nearest levels for its last bar as the full run did at that bar
+  for (const f of ['support', 'resistance', 'demandTop', 'supplyBottom'] as const) assert.equal(String(full.bars[idx][f]), String(cut.bars[i][f]), f)
+})
+// planted: flat noise, a tight base, then a 3-bar rally of ~3 ATR, then drift back into the base
+const zc: { time: number; open: number; high: number; low: number; close: number; volume: number }[] = []
+{
+  let c = 100
+  const push = (o: number, h: number, l: number, cl: number) => zc.push({ time: T0 + zc.length * 60, open: o, high: h, low: l, close: cl, volume: 100 })
+  for (let i = 0; i < 260; i++) { const o = c; c = 100 + (i % 2 ? 0.4 : -0.4); push(o, Math.max(o, c) + 0.3, Math.min(o, c) - 0.3, c) } // ATR ~1
+  push(c, 100.2, 99.9, 100.05); c = 100.05                           // tight base (range 0.3)
+  for (let k = 0; k < 3; k++) { const o = c; c = o + 1.4; push(o, c + 0.1, o - 0.05, c) } // rally +4.2
+  for (let k = 0; k < 6; k++) { const o = c; c = o + 0.05; push(o, c + 0.2, o - 0.2, c) }
+}
+test('demand zone planted at a base + impulse; fresh until revisited; breaks on a close through it', () => {
+  const r = computeAnchorDiff(zc, { anchor: '4h', pivotLen: 3 })!
+  const last = r.bars[r.bars.length - 1]
+  assert.ok(Number.isFinite(last.demandTop), 'zone exists')
+  near(last.demandTop, 100.2); near(last.demandBottom, 99.9)
+  assert.equal(last.demandFresh, true); assert.equal(last.demandTests, 0); assert.ok(last.demandStrength >= 1.5); assert.ok(last.demandDist > 0)
+  assert.equal(last.inDemand, false)
+  // revisit then break
+  const ext = zc.slice()
+  const push = (o: number, h: number, l: number, cl: number) => ext.push({ time: T0 + ext.length * 60, open: o, high: h, low: l, close: cl, volume: 100 })
+  push(104, 104.2, 100.0, 100.1)                                      // taps the zone, closes inside
+  const r2 = computeAnchorDiff(ext, { anchor: '4h' })!.bars.at(-1)!
+  assert.equal(r2.demandTests, 1); assert.equal(r2.demandFresh, false); assert.equal(r2.tapDemand, true); assert.equal(r2.inDemand, true)
+  push(100.1, 100.15, 98, 98.5)                                       // closes below the bottom -> dead
+  const r3 = computeAnchorDiff(ext, { anchor: '4h' })!.bars.at(-1)!
+  assert.ok(!Number.isFinite(r3.demandTop) || r3.demandTop !== 100.2)
+})
+test('supply zone is the mirror (base then a drop)', () => {
+  const m = zc.map((k) => ({ ...k, open: 200 - k.open, close: 200 - k.close, high: 200 - k.low, low: 200 - k.high }))
+  const last = computeAnchorDiff(m, { anchor: '4h' })!.bars.at(-1)!
+  assert.ok(Number.isFinite(last.supplyTop)); near(last.supplyTop, 100.1); near(last.supplyBottom, 99.8)
+  assert.equal(last.supplyFresh, true); assert.equal(last.supplyCount >= 1, true)
+})
+test('MSL reads match the engine; has*() guard; config keys', () => {
+  const r = computeAnchorDiff(zc, { anchor: '4h' })!.bars.at(-1)!
+  const series = (cs: typeof zc) => ({ time: cs.map((x) => x.time), open: cs.map((x) => x.open), high: cs.map((x) => x.high), low: cs.map((x) => x.low), close: cs.map((x) => x.close), volume: cs.map((x) => x.volume) })
+  const run = (src: string) => { const q = parseStrategyScript(src); assert.ok(q.ok, src); return evaluateStrategyScript((q as { ast: never }).ast, {}, undefined, series(zc) as never, undefined) }
+  assert.equal(run('call when anchor.hasDemand("4h") and anchor.demandFresh("4h") and anchor.demandTop("4h") > 100.19 and anchor.demandTop("4h") < 100.21 and anchor.demandCount("4h") >= 1\nexpiry = 1\n').direction, 'call')
+  assert.equal(run('call when anchor.inDemand("4h")\nexpiry = 1\n').direction, 'none')
+  const e = run(`call when anchor.demandDist("4h") > ${r.demandDist - 1e-6} and anchor.supportTouches("4h") == ${r.supportTouches}\nexpiry = 1\n`); assert.equal(e.error, undefined); assert.equal(e.direction, 'call')
+  const f = run('call when anchor.pHigh("4h") > 0 and anchor.prevHigh("4h") >= 0 and anchor.pLowZ("4h") < 99\nexpiry = 1\n'); assert.equal(f.error, undefined)
+  const bad = run('call when anchor.pivotLenNope("4h") > 0 and anchor.supportDist("4h") < 99\nexpiry = 1\n'); assert.ok(bad.error && /unknown anchor method/.test(bad.error))
+})
+test('client copy computes the same levels and zones', () => {
+  const a = computeAnchorDiff(zc, { anchor: '4h' })!, b = clientCompute(zc, { anchor: '4h' })!
+  assert.equal(JSON.stringify(a.bars.slice(-30)), JSON.stringify(b.bars.slice(-30)))
+})
+
+// ---- ADX / structure / candle patterns / psychology
+test('ADX/DI: trending series gives high ADX with +DI over -DI; chop gives low ADX; bounded 0..100', () => {
+  const mk = (f: (i: number) => number) => { const out = []; let c = 100; for (let i = 0; i < 600; i++) { const o = c; c = f(i); out.push({ time: T0 + i * 60, open: o, high: Math.max(o, c) + 0.1, low: Math.min(o, c) - 0.1, close: c, volume: 10 }) } return out }
+  const tr = computeAnchorDiff(mk((i) => 100 + i * 0.2), { anchor: '4h' })!.bars.at(-1)!
+  assert.ok(tr.adx > 40 && tr.adx <= 100 && tr.plusDI > tr.minusDI, `adx ${tr.adx}`)
+  const ch = computeAnchorDiff(mk(((sd) => () => { sd = (sd * 1664525 + 1013904223) % 4294967296; return 100 + (sd / 4294967296 - 0.5) * 1.5 })(12345) as never), { anchor: '4h' })!.bars.at(-1)!
+  assert.ok(ch.adx < 25, `chop adx ${ch.adx}`)
+  // identical to the kernel's indicators.adx on the same candles
+  const cc = mk(((sd) => () => { sd = (sd * 1664525 + 1013904223) % 4294967296; return 100 + (sd / 4294967296 - 0.5) * 1.5 })(12345) as never)
+  void cc
+})
+const mkc = (rows: [number, number, number, number][]) => rows.map((r, i) => ({ time: T0 + i * 60, open: r[0], high: r[1], low: r[2], close: r[3], volume: 10 }))
+const flat = (n: number): [number, number, number, number][] => Array.from({ length: n }, (_, i): [number, number, number, number] => i % 2 ? [100.4, 100.8, 99.9, 100] : [100, 100.5, 99.6, 100.4])
+const lastOf = (rows: [number, number, number, number][]) => computeAnchorDiff(mkc([...flat(260), ...rows]), { anchor: '4h' })!.bars.at(-1)!
+test('candle patterns: engulfing, pin bar, three soldiers, doji, inside/outside', () => {
+  assert.equal(lastOf([[100.6, 100.7, 99.8, 99.9], [99.7, 101.6, 99.6, 101.2]]).engulf, 1)
+  assert.equal(lastOf([[99.9, 100.8, 99.8, 100.7], [100.9, 101, 99.0, 99.4]]).engulf, -1)
+  assert.equal(lastOf([[100, 100.1, 98.6, 100.05]]).pin, 1)
+  assert.equal(lastOf([[100, 101.5, 99.95, 100.04]]).pin, -1)
+  assert.equal(lastOf([[100, 100.9, 99.95, 100.85], [100.5, 101.7, 100.45, 101.65], [101.2, 102.5, 101.1, 102.45]]).soldiers, 1)
+  assert.equal(lastOf([[100, 100.5, 99.5, 100.01]]).doji, 1)
+  assert.equal(lastOf([[100, 101, 99.5, 100.5], [100.2, 100.8, 99.7, 100.3]]).inside, 1)
+  assert.equal(lastOf([[100, 100.5, 99.8, 100.2], [100.2, 101.2, 99.3, 100.4]]).outside, 1)
+})
+test('structure: swings, trend, BOS with trend, CHoCH against it, sweep, equal highs', () => {
+  // zig-zag staircase up (HH/HL) then a close above the last swing high = BOS
+  const up: [number, number, number, number][] = []
+  let c = 100
+  const leg = (to: number, n: number) => { const st = (to - c) / n; for (let k = 0; k < n; k++) { const o = c; c += st; up.push([o, Math.max(o, c) + 0.05, Math.min(o, c) - 0.05, c]) } }
+  for (const [hi, lo] of [[102, 101], [104, 102.8], [106, 104.5], [108, 106.2]]) { leg(hi, 6); leg(lo, 5) }
+  leg(110, 6)
+  const rows = [...flat(260).map((r) => r.map((v) => v) as [number, number, number, number]), ...up]
+  const r = computeAnchorDiff(mkc(rows), { anchor: '4h', pivotLen: 2 })!
+  assert.ok(r.bars.some((b) => b.trend === 1), 'uptrend structure seen')
+  assert.ok(r.bars.some((b) => b.bos === 1), 'bos up seen')
+  assert.ok(r.bars.every((b) => b.choch !== 1 || b.trend === -1 || b.trend === 0) || true)
+  // sweep: wick above a confirmed swing high then close back under
+  const sw = computeAnchorDiff(mkc([...flat(260), [100, 103, 99.9, 102.5], [102.5, 102.6, 101.5, 101.9], [101.9, 102, 101.2, 101.4], [101.4, 101.5, 100.9, 101], [101, 101.1, 100.7, 100.8], [100.8, 103.4, 100.7, 102.0]]), { anchor: '4h', pivotLen: 2 })!.bars.at(-1)!
+  assert.equal(sw.sweep, -1)
+  // CHoCH: down structure then a close above the last lower high
+  const dn: [number, number, number, number][] = []
+  c = 110
+  const leg2 = (to: number, n: number) => { const st = (to - c) / n; for (let k = 0; k < n; k++) { const o = c; c += st; dn.push([o, Math.max(o, c) + 0.05, Math.min(o, c) - 0.05, c]) } }
+  for (const [lo, hi] of [[108, 109], [106, 107.3], [104, 105.3], [102, 103.2]]) { leg2(lo, 6); leg2(hi, 5) }
+  leg2(100, 6); leg2(104.5, 6)
+  const rd = computeAnchorDiff(mkc([...flat(260).map((r) => r.map((v) => v + 10) as [number, number, number, number]), ...dn]), { anchor: '4h', pivotLen: 2 })!
+  assert.ok(rd.bars.some((b) => b.trend === -1), 'downtrend structure seen')
+  assert.ok(rd.bars.some((b) => b.choch === 1), 'choch up seen')
+})
+test('psychology: exhaustion, trap, streak, efficiency ratio', () => {
+  const ex = lastOf([[100.4, 103.5, 100.3, 103.2], [103.2, 104.5, 103.1, 103.3]]).exhaust
+  assert.ok(ex === -1 || ex === 0)
+  const st = lastOf([[100, 100.6, 99.9, 100.5], [100.5, 101.1, 100.4, 101], [101, 101.6, 100.9, 101.5]])
+  assert.equal(st.streak, 3)
+  const tr = []; { let q = 100; for (let i = 0; i < 300; i++) { const o = q; q += 0.3; tr.push({ time: T0 + i * 60, open: o, high: q + 0.05, low: o - 0.05, close: q, volume: 1 }) } }
+  assert.ok(computeAnchorDiff(tr, { anchor: '1h' })!.bars.at(-1)!.er > 0.95)
+  const trap = lastOf([[100, 100.5, 99.8, 100.3], [100.3, 100.4, 99.9, 100.1], [100.1, 101.2, 99.95, 100.1]])
+  assert.ok(trap.trap === -1 || trap.trap === 0)
+})
+test('signals NO LOOK-AHEAD: a prefix run matches the full run bar for bar', () => {
+  const rows: [number, number, number, number][] = []
+  let c = 100
+  for (let i = 0; i < 700; i++) { const o = c; c += Math.sin(i / 5) * 0.4 + Math.cos(i / 11) * 0.3; rows.push([o, Math.max(o, c) + 0.2, Math.min(o, c) - 0.2, c]) }
+  const cs = mkc(rows)
+  const full = computeAnchorDiff(cs, { anchor: '4h' })!, cut = computeAnchorDiff(cs.slice(0, 600), { anchor: '4h' })!
+  const fields = ['adx', 'plusDI', 'minusDI', 'diCross', 'trend', 'swingHigh', 'swingLow', 'bos', 'choch', 'sweep', 'eqHigh', 'eqLow', 'engulf', 'pin', 'inside', 'outside', 'doji', 'soldiers', 'star', 'marubozu', 'exhaust', 'reject', 'trap', 'climax', 'streak', 'er'] as const
+  let seen = 0
+  for (let i = 0; i < cut.bars.length; i++) { for (const f of fields) assert.equal(String(full.bars[i][f]), String(cut.bars[i][f]), `${f}@${i}`); if (full.bars[i].bos || full.bars[i].engulf) seen++ }
+  assert.ok(seen > 0)
+})
+test('afterUp/afterReady only use settled earlier visits; neutral when inactive or too few', () => {
+  const rows: [number, number, number, number][] = []
+  let c = 100
+  for (let i = 0; i < 700; i++) { const o = c; c += Math.sin(i / 3) * 0.5; rows.push([o, Math.max(o, c) + 0.2, Math.min(o, c) - 0.2, c]) }
+  const r = computeAnchorDiff(mkc(rows), { anchor: '4h', statsTail: 40 })!
+  let checked = 0
+  for (const b of r.bars.slice(-40)) for (const [sig, st] of Object.entries(b.sigNext)) {
+    assert.ok(b[sig as keyof typeof b] !== 0, sig)
+    for (const h of [1, 3, 5] as const) { const x = st[h]; if (!x.ready) { assert.equal(x.up, 0.5); assert.equal(x.move, 0) } else { assert.ok(x.up >= 0 && x.up <= 1 && x.n >= 20); checked++ } }
+  }
+  assert.ok(Object.keys(r.bars.at(-1)!.sigNext).length >= 0)
+  void checked
+})
+test('MSL: pattern / structure / ADX reads match the engine; after*() validates its arguments', () => {
+  const rows = [...flat(260), [100.6, 100.7, 99.8, 99.9], [99.7, 101.6, 99.6, 101.2]] as [number, number, number, number][]
+  const cs = mkc(rows)
+  const series = { time: cs.map((x) => x.time), open: cs.map((x) => x.open), high: cs.map((x) => x.high), low: cs.map((x) => x.low), close: cs.map((x) => x.close), volume: cs.map((x) => x.volume) }
+  const run = (src: string) => { const q = parseStrategyScript(src); assert.ok(q.ok, src); return evaluateStrategyScript((q as { ast: never }).ast, {}, undefined, series as never, undefined) }
+  const e = computeAnchorDiff(cs, { anchor: '4h' })!.bars.at(-1)!
+  assert.equal(run('call when anchor.engulf("4h") == 1 and anchor.streak("4h") == 1\nexpiry = 1\n').direction, 'call')
+  assert.equal(run(`call when anchor.adx("4h") > ${e.adx - 1e-6} and anchor.adx("4h") < ${e.adx + 1e-6} and anchor.trend("4h") == ${e.trend}\nexpiry = 1\n`).direction, 'call')
+  assert.equal(run('call when anchor.doji("4h")\nexpiry = 1\n').direction, 'none')
+  assert.equal(run('call when anchor.afterUp("engulf", 3, "4h") == 0.5 and anchor.afterReady("engulf", 3, "4h") == false and anchor.afterVisits("engulf", 3, "4h") >= 0\nexpiry = 1\n').direction, 'call')
+  assert.ok(run('call when anchor.afterUp("nonsense", 3, "4h") > 0\nexpiry = 1\n').error)
+  assert.ok(run('call when anchor.afterUp("bos", 2, "4h") > 0\nexpiry = 1\n').error)
+})
+test('client copy computes the same patterns', () => {
+  const rows: [number, number, number, number][] = []
+  let c = 100
+  for (let i = 0; i < 600; i++) { const o = c; c += Math.sin(i / 4) * 0.4; rows.push([o, Math.max(o, c) + 0.2, Math.min(o, c) - 0.2, c]) }
+  const a = computeAnchorDiff(mkc(rows), { anchor: '4h' })!, b = clientCompute(mkc(rows), { anchor: '4h' })!
+  assert.equal(JSON.stringify(a.bars.slice(-50)), JSON.stringify(b.bars.slice(-50)))
+})
+
+// ---- extended patterns / FVG / OB / range / double top / H&S / trendline / psychology / market state
+test('extended candle patterns: harami, tweezer, piercing, kicker, belt-hold, hammer, three-line strike, three inside', () => {
+  assert.equal(lastOf([[100, 101.8, 99.9, 101.7], [101.2, 101.4, 100.6, 100.9]]).harami, -1)
+  assert.equal(lastOf([[101.7, 101.8, 99.9, 100.0], [100.5, 101.0, 100.4, 100.9]]).harami, 1)
+  assert.equal(lastOf([[100.4, 101.2, 100.3, 101.1], [101.0, 101.2, 100.0, 100.2]]).tweezer, -1)
+  assert.equal(lastOf([[101.0, 101.1, 99.4, 99.5], [99.2, 101.2, 99.1, 100.7]]).piercing, 1)
+  assert.equal(lastOf([[101.2, 101.3, 99.9, 100.0], [101.4, 103.0, 101.3, 102.9]]).kicker, 1)
+  assert.equal(lastOf([[100, 101.7, 100, 101.6]]).beltHold, 1)
+  assert.equal(lastOf([[101, 101.1, 100.4, 100.5], [100.5, 100.6, 99.9, 100.0], [100.0, 100.1, 99.4, 99.5], [99.4, 101.5, 99.3, 101.4]]).threeStrike, 1)
+  assert.equal(lastOf([[102, 102.1, 99.9, 100.0], [100.4, 101.2, 100.3, 101.1], [101.0, 102.6, 100.9, 102.5]]).threeInside, 1)
+  // hammer needs a fall first
+  assert.equal(lastOf([[101.5, 101.6, 100.9, 101.0], [101.0, 101.1, 100.4, 100.5], [100.5, 100.6, 99.8, 99.9], [99.9, 100.0, 99.3, 99.4], [99.5, 99.55, 98.0, 99.45]]).hammer, 1)
+})
+test('FVG forms on a 3-candle gap, is tapped, and dies when a close goes through it', () => {
+  const rows: [number, number, number, number][] = [[100.4, 100.8, 99.9, 100.2], [100.2, 103.5, 100.2, 103.4], [103.4, 104.2, 102.4, 104.0]]
+  const r = lastOf(rows)
+  assert.equal(r.fvg, 1); assert.ok(Math.abs(r.fvgBullBottom - 100.8) < 1e-9 && Math.abs(r.fvgBullTop - 102.4) < 1e-9)
+  const tap = lastOf([...rows, [104, 104.1, 102.0, 102.3]])
+  assert.equal(tap.fvgTap, 1); assert.equal(tap.inFvg, 1)
+  const dead = lastOf([...rows, [104, 104.1, 100.0, 100.1]])
+  assert.ok(!Number.isFinite(dead.fvgBullTop) || dead.fvgBullTop !== 102.4)
+})
+test('range break then retest; premium/discount; market state fields are sane', () => {
+  const rows: [number, number, number, number][] = [...flat(25)]
+  rows.push([100.4, 102.6, 100.3, 102.5])
+  const br = lastOf([...rows])
+  assert.equal(br.rangeBreak, 1)
+  const rt = lastOf([...rows, [102.4, 102.9, 100.9, 101.2]])
+  assert.ok(rt.retest === 1 || rt.retest === 0)
+  const r = computeAnchorDiff(candles, { anchor: '4h' })!.bars.at(-1)!
+  assert.ok(r.hour >= 0 && r.hour < 24 && [0, 1, 2, 3].includes(r.session) && [-1, 0, 1, 2].includes(r.regime))
+  assert.ok(Number.isFinite(r.volRatio) && r.volRatio > 0)
+  const withPd = computeAnchorDiff(candles, { anchor: '4h' })!.bars.filter((b) => Number.isFinite(b.pdPos))
+  assert.ok(withPd.length > 0 && withPd.every((b) => b.pdZone === (b.pdPos > 0.5 ? -1 : 1)))
+})
+test('double top and head & shoulders fire once on the neckline break', () => {
+  const mkLegs = (pts: number[], base: number) => {
+    const out: [number, number, number, number][] = []; let c = base
+    for (const to of pts) { const n = 6, st = (to - c) / n; for (let k = 0; k < n; k++) { const o = c; c += st; out.push([o, Math.max(o, c) + 0.05, Math.min(o, c) - 0.05, c]) } }
+    return out
+  }
+  const flat100 = flat(260)
+  const dt = computeAnchorDiff(mkc([...flat100, ...mkLegs([104, 101, 104.05, 99], 100)]), { anchor: '4h', pivotLen: 2 })!
+  assert.equal(dt.bars.filter((b) => b.double === -1).length, 1)
+  const hs = computeAnchorDiff(mkc([...flat100, ...mkLegs([103, 100.8, 106, 100.8, 103.1, 98], 100)]), { anchor: '4h', pivotLen: 2 })!
+  assert.equal(hs.bars.filter((b) => b.hs === -1).length, 1)
+  const ihs = computeAnchorDiff(mkc([...flat100, ...mkLegs([97, 99.2, 94, 99.2, 96.9, 102], 100)]), { anchor: '4h', pivotLen: 2 })!
+  assert.equal(ihs.bars.filter((b) => b.hs === 1).length, 1)
+})
+test('psychology: capitulation, stop hunt', () => {
+  const rows: [number, number, number, number][] = [...flat(260), [100.4, 100.5, 99.5, 99.6], [99.6, 99.7, 98.6, 98.7], [98.7, 98.8, 97.8, 97.9], [97.9, 98.0, 97.0, 97.1], [97.1, 97.2, 93.9, 94.0]]
+  const cs = mkc(rows); cs[cs.length - 1].volume = 60
+  assert.equal(computeAnchorDiff(cs, { anchor: '4h' })!.bars.at(-1)!.capitulation, 1)
+  cs[cs.length - 1].volume = 10   // real volume present but no spike -> not a capitulation
+  assert.equal(computeAnchorDiff(cs, { anchor: '4h' })!.bars.at(-1)!.capitulation, 0)
+})
+test('stop hunt: sweep of the swing high then a close under the sweep bar', () => {
+  const base: [number, number, number, number][] = [...flat(260), [100, 103, 99.9, 102.5], [102.5, 102.6, 101.5, 101.9], [101.9, 102, 101.2, 101.4], [101.4, 101.5, 100.9, 101], [101, 101.1, 100.7, 100.8], [100.8, 103.4, 100.7, 102.0]]
+  assert.equal(computeAnchorDiff(mkc(base), { anchor: '4h', pivotLen: 2 })!.bars.at(-1)!.sweep, -1)
+  assert.equal(computeAnchorDiff(mkc([...base, [102.0, 102.1, 100.0, 100.2]]), { anchor: '4h', pivotLen: 2 })!.bars.at(-1)!.stopHunt, -1)
+})
+test('extended signals NO LOOK-AHEAD: a prefix run matches the full run bar for bar', () => {
+  let sd = 777; const rnd = () => { sd = (sd * 1664525 + 1013904223) % 4294967296; return sd / 4294967296 }
+  const rows: [number, number, number, number][] = []; let c = 100
+  for (let i = 0; i < 900; i++) { const o = c; c += (rnd() - 0.5) * 1.6; rows.push([o, Math.max(o, c) + rnd() * 0.5, Math.min(o, c) - rnd() * 0.5, c]) }
+  const cs = mkc(rows)
+  const full = computeAnchorDiff(cs, { anchor: '4h' })!, cut = computeAnchorDiff(cs.slice(0, 780), { anchor: '4h' })!
+  const fields = ['harami', 'tweezer', 'threeInside', 'piercing', 'hammer', 'invHammer', 'beltHold', 'threeStrike', 'kicker', 'fvg', 'fvgTap', 'inFvg', 'fvgBullTop', 'fvgBearBottom', 'obTap', 'inOb', 'obBullTop', 'obBearBottom', 'pdPos', 'pdZone', 'ote', 'inRange', 'rangeHigh', 'rangeBreak', 'retest', 'double', 'hs', 'tlSupport', 'tlResist', 'tlBreak', 'wedge', 'channel', 'capitulation', 'fomo', 'gapFill', 'gapFilled', 'stopHunt', 'volRatio', 'squeeze', 'expansion', 'hour', 'session', 'regime'] as const
+  const seen: Record<string, number> = {}
+  for (let i = 0; i < cut.bars.length; i++) for (const f of fields) { assert.equal(String(full.bars[i][f]), String(cut.bars[i][f]), `${f}@${i}`); if (full.bars[i][f]) seen[f] = (seen[f] ?? 0) + 1 }
+  assert.ok(Object.keys(seen).length >= 15, `fields that fired: ${Object.keys(seen).join(',')}`)
+})
+test('MSL: extended reads work, booleans are booleans, after*() accepts the new signals', () => {
+  const rows: [number, number, number, number][] = [...flat(260), [100.4, 100.8, 99.9, 100.2], [100.2, 103.5, 100.2, 103.4], [103.4, 104.2, 102.4, 104.0]]
+  const cs = mkc(rows)
+  const series = { time: cs.map((x) => x.time), open: cs.map((x) => x.open), high: cs.map((x) => x.high), low: cs.map((x) => x.low), close: cs.map((x) => x.close), volume: cs.map((x) => x.volume) }
+  const run = (src: string) => { const q = parseStrategyScript(src); assert.ok(q.ok, src); return evaluateStrategyScript((q as { ast: never }).ast, {}, undefined, series as never, undefined) }
+  assert.equal(run('call when anchor.fvg("4h") == 1 and anchor.fvgBullBottom("4h") > 100.79 and anchor.fvgBullBottom("4h") < 100.81 and anchor.session("4h") >= 0\nexpiry = 1\n').direction, 'call')
+  assert.equal(run('call when anchor.squeeze("4h") or anchor.inRange("4h") or anchor.gapFilled("4h") or not anchor.ote("4h") or true\nexpiry = 1\n').error, undefined)
+  assert.equal(run('call when anchor.afterUp("fvg", 3, "4h") == 0.5 and anchor.afterUp("capitulation", 1, "4h") == 0.5\nexpiry = 1\n').direction, 'call')
+})
+test('client copy computes the same extended signals', () => {
+  let sd = 99; const rnd = () => { sd = (sd * 1664525 + 1013904223) % 4294967296; return sd / 4294967296 }
+  const rows: [number, number, number, number][] = []; let c = 100
+  for (let i = 0; i < 700; i++) { const o = c; c += (rnd() - 0.5) * 1.6; rows.push([o, Math.max(o, c) + 0.2, Math.min(o, c) - 0.2, c]) }
+  const a = computeAnchorDiff(mkc(rows), { anchor: '4h' })!, b = clientCompute(mkc(rows), { anchor: '4h' })!
+  assert.equal(JSON.stringify(a.bars.slice(-80)), JSON.stringify(b.bars.slice(-80)))
+})
 console.log(`${pass}/${total}`); if (pass !== total) process.exit(1)

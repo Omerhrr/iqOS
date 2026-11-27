@@ -232,7 +232,7 @@ import { kagi } from './kagi'
 import { computeSwing } from './swing'
 import { tickBars, type TickPoint } from './tickbars'
 import { computeBaseline } from './baseline'
-import { computeAnchorDiff, parseAnchorPeriod, valueArea } from './anchordiff'
+import { computeAnchorDiff, parseAnchorPeriod, valueArea, ANCHOR_SIGNALS } from './anchordiff'
 import { hvSeries, realizedUpProb, ivFromPayout } from './ivhv'
 import { expiryMomentum, priceDisplacement, volAdjustedExpectedMove, reversalRisk, expiryStagnationExhaustion, candleCompletionProbability } from './expiryintel'
 import { detectGaps } from './gap'
@@ -5415,7 +5415,9 @@ function tickbarMethod(name: string, args: MslValue[], ctx: EvalEnv, tf: string 
  * Scalar reads take an optional offset like every other namespace (-1 = the latest bar, the default; -2 = the one before). */
 /** a script reads the newest bars only; computing dwell/next stats for the whole history on every evaluation would make backtests quadratic */
 const ANCHOR_STATS_TAIL = 40
-const ANCHOR_STATS_METHODS = new Set(['poc', 'vah', 'val', 'pocZ', 'vahZ', 'valZ', 'pocDist', 'inValue', 'share', 'dwellRank', 'visits', 'ready', 'nextUp', 'nextBull', 'nextMove', 'alikeVisits', 'alikeReady', 'alikeUp', 'alikeMove'])
+const ANCHOR_SIGNED_FIELDS = new Set(['adx', 'plusDI', 'minusDI', 'diCross', 'trend', 'swingHigh', 'swingLow', 'swingHighDist', 'swingLowDist', 'bos', 'choch', 'sweep', 'engulf', 'pin', 'soldiers', 'star', 'marubozu', 'exhaust', 'reject', 'trap', 'climax', 'streak', 'er', 'harami', 'tweezer', 'threeInside', 'piercing', 'hammer', 'invHammer', 'beltHold', 'threeStrike', 'kicker', 'fvg', 'fvgTap', 'inFvg', 'fvgBullTop', 'fvgBullBottom', 'fvgBearTop', 'fvgBearBottom', 'obTap', 'inOb', 'obBullTop', 'obBullBottom', 'obBearTop', 'obBearBottom', 'pdPos', 'pdZone', 'rangeHigh', 'rangeLow', 'rangeBreak', 'retest', 'double', 'hs', 'tlSupport', 'tlResist', 'tlBreak', 'wedge', 'channel', 'capitulation', 'fomo', 'gapFill', 'stopHunt', 'volRatio', 'expansion', 'hour', 'session', 'regime'])
+const ANCHOR_FLAG_FIELDS = new Set(['eqHigh', 'eqLow', 'inside', 'outside', 'doji', 'anchorTouch', 'ote', 'inRange', 'gapFilled', 'squeeze'])
+const ANCHOR_STATS_METHODS = new Set(['poc', 'vah', 'val', 'pocZ', 'vahZ', 'valZ', 'pocDist', 'inValue', 'share', 'dwellRank', 'visits', 'ready', 'nextUp', 'nextBull', 'nextMove', 'alikeVisits', 'alikeReady', 'alikeUp', 'alikeMove', 'support', 'resistance', 'supportDist', 'resistanceDist', 'supportZ', 'resistanceZ', 'supportTouches', 'resistanceTouches', 'hasSupport', 'hasResistance', 'demandTop', 'demandBottom', 'demandFresh', 'demandTests', 'demandAge', 'demandStrength', 'demandDist', 'inDemand', 'tapDemand', 'hasDemand', 'supplyTop', 'supplyBottom', 'supplyFresh', 'supplyTests', 'supplyAge', 'supplyStrength', 'supplyDist', 'inSupply', 'tapSupply', 'hasSupply'])
 function anchorMethod(name: string, args: MslValue[], ctx: EvalEnv, period: string | undefined, tf: string | undefined): MslValue {
   if (period !== undefined && parseAnchorPeriod(period) === null)
     throw new MslRuntimeError(`anchor.${name}(): "${period}" is not an anchor period - use "15m", "30m", "1h", "4h", "1d", "1w" (or any <n>m / <n>h / <n>d, at least 1m)`)
@@ -5425,7 +5427,7 @@ function anchorMethod(name: string, args: MslValue[], ctx: EvalEnv, period: stri
   const atrPeriod = cfgNumLang(ctx, 'anchor.atrPeriod', undefined)
   const tms = s.time
   const cands = seriesToCandles(s).map((c, i) => ({ ...c, time: tms[i] }))
-  const r = computeAnchorDiff(cands, { anchor: period, rocPeriod, atrPeriod, bandWidth: cfgNumLang(ctx, 'anchor.bandWidth', undefined), window: cfgNumLang(ctx, 'anchor.window', undefined), statsTail: ANCHOR_STATS_TAIL })
+  const r = computeAnchorDiff(cands, { anchor: period, rocPeriod, atrPeriod, bandWidth: cfgNumLang(ctx, 'anchor.bandWidth', undefined), window: cfgNumLang(ctx, 'anchor.window', undefined), pivotLen: cfgNumLang(ctx, 'anchor.pivotLen', undefined), adxPeriod: cfgNumLang(ctx, 'anchor.adxPeriod', undefined), impulseAtr: cfgNumLang(ctx, 'anchor.impulseAtr', undefined), statsTail: ANCHOR_STATS_TAIL })
   if (!r) throw new MslRuntimeError(`anchor.${name}(): bad anchor period "${period}"`)
   if (!r.bars.length)
     throw new MslRuntimeError(`anchor.${name}(): no bar has a completed ${period} anchor before it in this window - the candle history is shorter than one ${period} period (use a smaller anchor, or a longer history)`)
@@ -5447,6 +5449,24 @@ function anchorMethod(name: string, args: MslValue[], ctx: EvalEnv, period: stri
   }
   const num = (v: number): number => (Number.isFinite(v) ? v : 0)
   const lastN = (g: (b: (typeof r.bars)[number]) => number): MslValue => seriesValue(r.bars.slice(-seriesLookback(args, 50)).map((b) => num(g(b))))
+  if (ANCHOR_SIGNED_FIELDS.has(name)) {
+    const v = (bar() as unknown as Record<string, number>)[name]
+    return name === 'swingHighDist' || name === 'swingLowDist' ? (Number.isFinite(v) ? v : 99) : num(v)
+  }
+  if (ANCHOR_FLAG_FIELDS.has(name)) return (bar() as unknown as Record<string, number>)[name] === 1
+  if (name === 'afterUp' || name === 'afterBull' || name === 'afterMove' || name === 'afterVisits' || name === 'afterReady') {
+    // anchor.afterUp("bos", 3) / ("bos", 3, offset): what happened h bars after earlier bars carrying the SAME value of that signal
+    const sig = args[0], h = args.length > 1 ? asNum(args[1]) : Number.NaN
+    if (typeof sig !== 'string' || !(ANCHOR_SIGNALS as readonly string[]).includes(sig)) throw new MslRuntimeError(`anchor.${name}("signal", h): signal must be one of ${ANCHOR_SIGNALS.join(', ')}`)
+    if (!HZ.has(h)) throw new MslRuntimeError(`anchor.${name}("signal", h): h must be 1, 3 or 5 (bars ahead)`)
+    const o = args.length > 2 ? asNum(args[2]) : -1
+    if (-o > ANCHOR_STATS_TAIL) throw new MslRuntimeError(`anchor.${name}(): signal statistics are only kept for the newest ${ANCHOR_STATS_TAIL} bars (offset ${o} is further back)`)
+    const st = offsetInto(r.bars, o, `anchor.${name}`).sigNext[sig]?.[h as 1 | 3 | 5]
+    if (name === 'afterVisits') return st ? st.n : 0
+    if (name === 'afterReady') return st ? st.ready : false
+    if (!st) return name === 'afterMove' ? 0 : 0.5 // signal not active on that bar: neutral
+    return name === 'afterUp' ? st.up : name === 'afterBull' ? st.bull : st.move
+  }
   switch (name) {
     case 'ok':
       return r.bars.length >= 2
@@ -5622,6 +5642,46 @@ function anchorMethod(name: string, args: MslValue[], ctx: EvalEnv, period: stri
       if (name === 'tickVah') return (va.hi + 1) * binSize + lastB.anchor
       return va.lo * binSize + lastB.anchor
     }
+    case 'support': return num(bar().support)
+    case 'resistance': return num(bar().resistance)
+    case 'supportDist': { const v = bar().supportDist; return Number.isFinite(v) ? v : 99 }
+    case 'resistanceDist': { const v = bar().resistanceDist; return Number.isFinite(v) ? v : 99 }
+    case 'supportZ': return num(bar().supportZ)
+    case 'resistanceZ': return num(bar().resistanceZ)
+    case 'supportTouches': return bar().supportTouches
+    case 'resistanceTouches': return bar().resistanceTouches
+    case 'hasSupport': return Number.isFinite(bar().support)
+    case 'hasResistance': return Number.isFinite(bar().resistance)
+    case 'pHigh': return num(bar().pHigh)
+    case 'pLow': return num(bar().pLow)
+    case 'prevHigh': return num(bar().prevHigh)
+    case 'prevLow': return num(bar().prevLow)
+    case 'pHighZ': return num(bar().pHighZ)
+    case 'pLowZ': return num(bar().pLowZ)
+    case 'prevHighZ': return num(bar().prevHighZ)
+    case 'prevLowZ': return num(bar().prevLowZ)
+    case 'demandTop': return num(bar().demandTop)
+    case 'demandBottom': return num(bar().demandBottom)
+    case 'demandFresh': return bar().demandFresh
+    case 'demandTests': return bar().demandTests
+    case 'demandAge': return bar().demandAge
+    case 'demandStrength': return bar().demandStrength
+    case 'demandDist': { const v = bar().demandDist; return Number.isFinite(v) ? v : 99 }
+    case 'inDemand': return bar().inDemand
+    case 'tapDemand': return bar().tapDemand
+    case 'hasDemand': return Number.isFinite(bar().demandTop)
+    case 'demandCount': return bar().demandCount
+    case 'supplyTop': return num(bar().supplyTop)
+    case 'supplyBottom': return num(bar().supplyBottom)
+    case 'supplyFresh': return bar().supplyFresh
+    case 'supplyTests': return bar().supplyTests
+    case 'supplyAge': return bar().supplyAge
+    case 'supplyStrength': return bar().supplyStrength
+    case 'supplyDist': { const v = bar().supplyDist; return Number.isFinite(v) ? v : 99 }
+    case 'inSupply': return bar().inSupply
+    case 'tapSupply': return bar().tapSupply
+    case 'hasSupply': return Number.isFinite(bar().supplyTop)
+    case 'supplyCount': return bar().supplyCount
     case 'diffSeries':
       return lastN((b) => b.close)
     case 'zSeries':
@@ -5632,7 +5692,7 @@ function anchorMethod(name: string, args: MslValue[], ctx: EvalEnv, period: stri
       return lastN((b) => b.rocAtr)
     default:
       throw new MslRuntimeError(
-        `unknown anchor method "anchor.${name}(...)" - use ok()/anchor()/open()/high()/low()/close()|diff()/ohlc()/z()/tr()/atr()/roc()/rocAtr()/cci()/mfi()/rsi()/cross()/rolled()/above()/sinceCross()/sinceRoll()/diffSeries(n?)/zSeries(n?)/rocSeries(n?)/rocAtrSeries(n?), dwell: dir()/body()/upWick()/dnWick()/closePos()/band()/dwell()/share()/dwellRank()/approach(), volume profile of the current anchor period (candle-derived): poc()/vah()/val() price, pocZ()/vahZ()/valZ() in ATR from the anchor, pocDist(), inValue(), periodVol(), periodBars(), volReal(), delta()/cumDelta()/cumDeltaPct()/deltaDiv(); REAL ticks, live only: tickCount()/tickDelta()/tickDeltaPct()/tickPoc()/tickVah()/tickVal()/tickPocZ()/tickSpanSec(); what happened next: visits(h)/ready(h)/nextUp(h)/nextBull(h)/nextMove(h) and alikeVisits(h)/alikeReady(h)/alikeUp(h)/alikeMove(h) with h = 1, 3 or 5 (last strings: anchor period, then candle timeframe)`,
+        `unknown anchor method "anchor.${name}(...)" - trend strength adx()/plusDI()/minusDI()/diCross(); structure trend()/swingHigh()/swingLow()/swingHighDist()/swingLowDist()/bos()/choch()/sweep()/eqHigh()/eqLow(); candle patterns engulf()/pin()/inside()/outside()/doji()/soldiers()/star()/marubozu(); psychology exhaust()/reject()/anchorTouch()/trap()/climax()/streak()/er(); after-signal stats afterUp/afterBull/afterMove/afterVisits/afterReady(signal name string, h) with signal one of ${ANCHOR_SIGNALS.join('/')}; extended patterns harami()/tweezer()/threeInside()/piercing()/hammer()/invHammer()/beltHold()/threeStrike()/kicker(); FVG fvg()/fvgTap()/inFvg()/fvgBullTop()/fvgBullBottom()/fvgBearTop()/fvgBearBottom(); order blocks obTap()/inOb()/obBullTop()/obBullBottom()/obBearTop()/obBearBottom(); pdPos()/pdZone()/ote(); inRange()/rangeHigh()/rangeLow()/rangeBreak()/retest(); double()/hs()/tlSupport()/tlResist()/tlBreak()/wedge()/channel(); capitulation()/fomo()/gapFill()/gapFilled()/stopHunt(); volRatio()/squeeze()/expansion()/hour()/session()/regime(); levels (candle-derived, pivots + ATR units): support()/resistance()/supportDist()/resistanceDist()/supportZ()/resistanceZ()/supportTouches()/resistanceTouches()/hasSupport()/hasResistance(), pHigh()/pLow()/prevHigh()/prevLow() (+Z), zones: demandTop()/demandBottom()/demandFresh()/demandTests()/demandAge()/demandStrength()/demandDist()/inDemand()/tapDemand()/hasDemand()/demandCount() and the same for supply; use ok()/anchor()/open()/high()/low()/close()|diff()/ohlc()/z()/tr()/atr()/roc()/rocAtr()/cci()/mfi()/rsi()/cross()/rolled()/above()/sinceCross()/sinceRoll()/diffSeries(n?)/zSeries(n?)/rocSeries(n?)/rocAtrSeries(n?), dwell: dir()/body()/upWick()/dnWick()/closePos()/band()/dwell()/share()/dwellRank()/approach(), volume profile of the current anchor period (candle-derived): poc()/vah()/val() price, pocZ()/vahZ()/valZ() in ATR from the anchor, pocDist(), inValue(), periodVol(), periodBars(), volReal(), delta()/cumDelta()/cumDeltaPct()/deltaDiv(); REAL ticks, live only: tickCount()/tickDelta()/tickDeltaPct()/tickPoc()/tickVah()/tickVal()/tickPocZ()/tickSpanSec(); what happened next: visits(h)/ready(h)/nextUp(h)/nextBull(h)/nextMove(h) and alikeVisits(h)/alikeReady(h)/alikeUp(h)/alikeMove(h) with h = 1, 3 or 5 (last strings: anchor period, then candle timeframe)`,
       )
   }
 }
