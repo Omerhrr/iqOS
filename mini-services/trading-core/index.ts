@@ -1100,45 +1100,6 @@ const httpServer = createServer(async (req, res) => {
         const d = loadRecorded(f.recordedDir())
         return json(200, { ok: true, files: d.files, coverage: d.coverage })
       }
-      // replay many strategies over the recorded Binance data and rank them (honest verdicts: see analytics/binancereplay.ts)
-      if (path === '/binance/replay' && req.method === 'POST') {
-        const f = getBinanceFeed()
-        if (!f) return json(400, { ok: false, error: 'binance feed is not running' })
-        const meta = kernel.context().use<MetaStrategyService>('metaStrategy')
-        const out = await runBoard(f, (id) => meta.get(id)?.script, {
-          pair: typeof body?.pair === 'string' ? body.pair : undefined,
-          tf: typeof body?.tf === 'string' ? body.tf : undefined,
-          expiry: Array.isArray(body?.expiry) ? body.expiry.map(Number).filter(Number.isFinite) : undefined,
-          payout: body?.payout !== undefined ? Number(body.payout) : undefined,
-          ids: Array.isArray(body?.ids) ? body.ids.filter((x: unknown) => typeof x === 'string') : undefined,
-          script: typeof body?.script === 'string' ? body.script : undefined,
-          from: typeof body?.from === 'string' ? body.from : undefined,
-          to: typeof body?.to === 'string' ? body.to : undefined,
-          modeOverride: body?.modeOverride === 'volume' || body?.modeOverride === 'binance' ? body.modeOverride : undefined,
-          variants: body?.variants === false ? false : true,
-        })
-        return json(out.ok ? 200 : 400, out)
-      }
-      // offline lead/lag + gap-edge analysis over the recorded tick files (data/binance/ticks-*.jsonl)
-      if (path === '/binance/lead_report' && req.method === 'POST') {
-        const f = getBinanceFeed()
-        if (!f) return json(400, { ok: false, error: 'binance feed is not running' })
-        const num = (x: unknown) => (x !== undefined && Number.isFinite(Number(x)) ? Number(x) : undefined)
-        const arr = (x: unknown) => (Array.isArray(x) ? x.map(Number).filter((n) => Number.isFinite(n) && n > 0).slice(0, 8) : undefined)
-        const out = leadReport(f.recordedDir(), {
-          pair: typeof body?.pair === 'string' ? body.pair : undefined,
-          from: typeof body?.from === 'string' ? body.from : undefined,
-          to: typeof body?.to === 'string' ? body.to : undefined,
-          delayMs: num(body?.delayMs), payout: num(body?.payout), thresholdsBps: arr(body?.thresholdsBps), horizonsSec: arr(body?.horizonsSec),
-        })
-        return json(out.ok ? 200 : 400, out)
-      }
-      if (path === '/binance/recorder' && req.method === 'POST') {
-        const f = getBinanceFeed()
-        if (!f) return json(400, { ok: false, error: 'binance feed is not running' })
-        f.setRecorder(body?.on !== false)
-        return json(200, { ok: true, ...f.health().recorder })
-      }
       if (path === '/health') return json(200, { ok: true, service: 'trading-core', uptime: process.uptime(), loopLag60s: lagStats() })
 
       if (path === '/mode') {
@@ -4964,6 +4925,47 @@ const httpServer = createServer(async (req, res) => {
     }
 
     if (req.method === 'POST') {
+      // ---------- Binance: replay tester, lead/lag report, recorder switch (POST) ----------
+      // replay many strategies over the recorded Binance data and rank them (honest verdicts: see analytics/binancereplay.ts)
+      if (path === '/binance/replay' && req.method === 'POST') {
+        const f = getBinanceFeed()
+        if (!f) return json(400, { ok: false, error: 'binance feed is not running' })
+        const meta = kernel.context().use<MetaStrategyService>('metaStrategy')
+        const out = await runBoard(f, (id) => meta.get(id)?.script, {
+          pair: typeof body?.pair === 'string' ? body.pair : undefined,
+          tf: typeof body?.tf === 'string' ? body.tf : undefined,
+          expiry: Array.isArray(body?.expiry) ? body.expiry.map(Number).filter(Number.isFinite) : undefined,
+          payout: body?.payout !== undefined ? Number(body.payout) : undefined,
+          ids: Array.isArray(body?.ids) ? body.ids.filter((x: unknown) => typeof x === 'string') : undefined,
+          script: typeof body?.script === 'string' ? body.script : undefined,
+          from: typeof body?.from === 'string' ? body.from : undefined,
+          to: typeof body?.to === 'string' ? body.to : undefined,
+          modeOverride: body?.modeOverride === 'volume' || body?.modeOverride === 'binance' ? body.modeOverride : undefined,
+          variants: body?.variants === false ? false : true,
+        })
+        return json(out.ok ? 200 : 400, out)
+      }
+      // offline lead/lag + gap-edge analysis over the recorded tick files (data/binance/ticks-*.jsonl)
+      if (path === '/binance/lead_report' && req.method === 'POST') {
+        const f = getBinanceFeed()
+        if (!f) return json(400, { ok: false, error: 'binance feed is not running' })
+        const num = (x: unknown) => (x !== undefined && Number.isFinite(Number(x)) ? Number(x) : undefined)
+        const arr = (x: unknown) => (Array.isArray(x) ? x.map(Number).filter((n) => Number.isFinite(n) && n > 0).slice(0, 8) : undefined)
+        const out = leadReport(f.recordedDir(), {
+          pair: typeof body?.pair === 'string' ? body.pair : undefined,
+          from: typeof body?.from === 'string' ? body.from : undefined,
+          to: typeof body?.to === 'string' ? body.to : undefined,
+          delayMs: num(body?.delayMs), payout: num(body?.payout), thresholdsBps: arr(body?.thresholdsBps), horizonsSec: arr(body?.horizonsSec),
+        })
+        return json(out.ok ? 200 : 400, out)
+      }
+      if (path === '/binance/recorder' && req.method === 'POST') {
+        const f = getBinanceFeed()
+        if (!f) return json(400, { ok: false, error: 'binance feed is not running' })
+        f.setRecorder(body?.on !== false)
+        return json(200, { ok: true, ...f.health().recorder })
+      }
+
       // ---------- OTC defense (placebo-test gate for generator-driven markets) ----------
       // OTC charts are machine-generated; TA "edges" there can be pure luck.
       // This runs the strategy against K synthetic twins calibrated to the
