@@ -18,6 +18,7 @@ import { join } from 'node:path'
 import type { KernelContext, Plugin } from '../kernel'
 import type { Timeframe, Candle, BacktestResult, BacktestTrade } from '../types'
 import type { MarketDataService } from './market-data'
+import { fitAdxPatternBias, PATTERN_BIAS_LOOKBACK, higherTimeframe } from '../analytics/adxpatternbias'
 import type { NextCandleService } from './nextcandle'
 import type { AccuteService } from './accute'
 import type { SmcScanService } from './smcscan'
@@ -120,7 +121,7 @@ const SAFE_BACKTEST_SOURCES = new Set<MetaConditionSource>([
  * refusal. Kept in sync with META_CONDITION_SOURCES by the dev-time
  * assertion right below. */
 const UNSAFE_BACKTEST_SOURCES = new Set<MetaConditionSource>([
-  'oracle', 'hmaRocBullBear', 'momentumScore', 'accute',
+  'oracle', 'hmaRocBullBear', 'momentumScore', 'accute', 'adxPatternBias',
   'renkoSmc', 'renkoSmcMajority', 'tick', 'footprint', 'otcFootprint', 'tickSmc',
   'tickOracle', 'tickTechnical', 'tickFootprint', 'tempo', 'confluence', 'volArb',
   'cointegration', 'screenerRank', 'chartSignals', 'leadLag', 'yesterday', 'pulse',
@@ -1070,7 +1071,7 @@ export class MetaStrategyService {
    * tally; the MSL script map below still exposes them by name. */
   snapshotSources(asset: string, tf: Timeframe): MetaSourceRead[] {
     const sources: MetaConditionSource[] = [
-      'oracle', 'hmaRocBullBear', 'momentumScore', 'nextExpiry', 'accute', 'renko',
+      'oracle', 'hmaRocBullBear', 'momentumScore', 'nextExpiry', 'accute', 'adxPatternBias', 'renko',
       'smc', 'smcNow', 'renkoSmc', 'renkoSmcMajority', 'pointFigure', 'rangeBars',
       'candle', 'heikinAshi', 'volumeBars', 'tick', 'footprint', 'tpo', 'ivHv', 'line',
       'tickSmc', 'tickOracle', 'tickTechnical', 'tickFootprint',
@@ -1325,6 +1326,25 @@ export class MetaStrategyService {
             value: pred.best.expiry,
             label: `Expiry oracle's best pick is the ${pred.best.expiry}m rung (${pred.best.direction.toUpperCase()} ${pred.best.confidence.toFixed(0)}%)`,
           }
+        }
+        case 'adxPatternBias': {
+          // The ADX/DI + Pattern Bias panel's own read: same fitAdxPatternBias
+          // call (400 candles, period 14, one-rung-up HTF veto) index.ts's
+          // scanAdxPatternBias makes, same row rule - a direction only when
+          // the panel's `qualifies` bar clears.
+          const market = this.ctx.use<MarketDataService>('market')
+          const candles = market.getCandlesDeep(asset, tf as never, 400, true)
+          if (candles.length < 60) return none('ADX/Pattern: warming up, not enough bars')
+          const htf = higherTimeframe(tf as Timeframe)
+          let higherCandles: Candle[] | undefined
+          if (htf) {
+            try { higherCandles = market.getCandlesDeep(asset, htf as never, 120, true) } catch { higherCandles = undefined }
+          }
+          const fit = fitAdxPatternBias(candles, 14, PATTERN_BIAS_LOOKBACK, higherCandles)
+          if (!fit) return none('ADX/Pattern: thin history')
+          const dir: 'call' | 'put' | null = fit.qualifies ? (fit.direction === 'bullish' ? 'call' : fit.direction === 'bearish' ? 'put' : null) : null
+          if (!dir) return { source, direction: 'none', confidence: 0, value: fit.composite, label: `ADX/Pattern not qualifying (ADX ${fit.adx.toFixed(0)}, composite ${fit.composite.toFixed(1)})` }
+          return { source, direction: dir, confidence: Math.min(100, Math.round(50 + Math.abs(fit.composite) * 5)), value: fit.composite, label: `ADX/Pattern ${dir.toUpperCase()} (ADX ${fit.adx.toFixed(0)}, +DI ${fit.plusDI.toFixed(0)}/-DI ${fit.minusDI.toFixed(0)}, composite ${fit.composite.toFixed(1)}${fit.topPattern ? `, ${fit.topPattern}` : ''})` }
         }
         case 'accute': {
           const accute = this.ctx.use<AccuteService>('accute')
@@ -2193,6 +2213,7 @@ export class MetaStrategyService {
       oracle: () => this.readSource('oracle', asset, tf),
       hmaRocBullBear: () => this.readSource('hmaRocBullBear', asset, tf),
       momentumScore: () => this.readSource('momentumScore', asset, tf),
+      adxPatternBias: () => this.readSource('adxPatternBias', asset, tf),
       accute: () => this.readSource('accute', asset, tf),
       renko: () => this.readSource('renko', asset, tf, undefined, undefined, undefined, cfg),
       smc: () => this.readSource('smc', asset, tf),

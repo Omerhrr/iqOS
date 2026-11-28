@@ -936,6 +936,7 @@ export type MetaConditionSource =
   | 'technical'
   | 'reversal'
   | 'tempo'
+  | 'adxPatternBias'
   | 'confluence'
   | 'volArb'
   | 'cointegration'
@@ -977,6 +978,7 @@ export const META_CONDITION_SOURCE_LABELS: Record<MetaConditionSource, string> =
   technical: 'Technical Summary',
   reversal: 'Reversal Radar',
   tempo: 'Tempo Shot License',
+  adxPatternBias: 'ADX/DI + Pattern Bias',
   confluence: 'Confluence Screener',
   volArb: 'Volatility Arbitrage',
   cointegration: 'Cointegration Scanner',

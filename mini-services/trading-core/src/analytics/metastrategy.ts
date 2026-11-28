@@ -31,6 +31,7 @@ export type MetaConditionSource =
   | 'hmaRocBullBear' // the Oracle panel's first secondary read (analytics/hmarocbullbear.ts)
   | 'momentumScore' // the Oracle panel's second secondary read, the user's own Market Momentum Score formula (analytics/momentumscore.ts)
   | 'nextExpiry' // Next-Expiry Oracle's own fused read (plugins/nextexpiry.ts) - minute-native (1/2/3/5/15m over the 1m base), so this read ignores the condition's tf exactly like its own panel does. By default it reads the oracle's single best pick (already gated by the engine's pWin>=0.56 AND confidence>=25 floors, honest "wait" -> none); a condition may pin ONE rung via its expiryMin field instead
+  | 'adxPatternBias' // the ADX/DI + Pattern Bias panel's own composite (analytics/adxpatternbias.ts fitAdxPatternBias - the exact call index.ts's scanAdxPatternBias and Accute's first driver make, optional HTF veto included). Direction = the panel's row direction (only when its own `qualifies` bar clears, else none), confidence from |composite|, .value = signed composite (-10..10). Live-only: the fit carries live honesty-loop penalties that a replay cannot reconstruct
   | 'accute' // Accute's fused multi-driver prediction (plugins/accute.ts)
   | 'renko' // Renko brick trend/streak (analytics/renko.ts, same read Accute's own renko leg uses)
   | 'smc' // Smart Money Concepts BLENDED structure summary (analytics/smc.ts's scanSmc().summary - mixes in older hits, not just this candle)
@@ -150,6 +151,7 @@ export const META_CONDITION_SOURCES: readonly MetaConditionSource[] = [
   'hmaRocBullBear',
   'momentumScore',
   'nextExpiry',
+  'adxPatternBias',
   'accute',
   'renko',
   'smc',
