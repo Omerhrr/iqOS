@@ -124,9 +124,9 @@ function LeadCard({ pair }: { pair: string }) {
   const [rep, setRep] = useState<BinanceLeadReport | null>(null)
   useEffect(() => {
     let off = false
-    const load = async () => { try { const r = await getBinanceLead(); if (!off) setLive(r) } catch { /* keep the last view */ } }
+    const load = async () => { if (typeof document !== 'undefined' && document.hidden) return; try { const r = await getBinanceLead(); if (!off) setLive(r) } catch { /* keep the last view */ } }
     void load()
-    const id = setInterval(load, 2000)
+    const id = setInterval(load, 4000)
     return () => { off = true; clearInterval(id) }
   }, [])
   const p: BinanceLeadPair | undefined = live && live.ok ? live.pairs.find((x) => x.pair === pair) : undefined
@@ -247,6 +247,7 @@ export default function BinancePanel() {
   }
 
   const load = useCallback(async () => {
+    if (typeof document !== 'undefined' && document.hidden) return
     try {
       const h = await getBinanceHealth()
       setHealth(h)
@@ -260,14 +261,15 @@ export default function BinancePanel() {
 
   useEffect(() => {
     void load()
-    const id = setInterval(() => void load(), 5000)
+    const id = setInterval(() => void load(), 10000)
     return () => clearInterval(id)
   }, [load])
 
-  // the bar still forming: refreshed every second (cheap: it is read from memory on the kernel)
+  // the bar still forming: refreshed every 2 seconds (cheap: it is read from memory on the kernel)
   useEffect(() => {
     let alive = true
     const tick = async () => {
+      if (typeof document !== 'undefined' && document.hidden) return
       try {
         const n = await getBinanceNow(pair, tf)
         if (alive) setNow(n)
@@ -276,7 +278,7 @@ export default function BinancePanel() {
       }
     }
     void tick()
-    const id = setInterval(() => void tick(), 1000)
+    const id = setInterval(() => void tick(), 2000)
     return () => {
       alive = false
       clearInterval(id)

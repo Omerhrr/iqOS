@@ -220,8 +220,9 @@ function lagStats(): { maxMs: number; p95Ms: number; samples: number } {
 }
 
 const KERNEL_TOKEN = (process.env.KERNEL_TOKEN ?? '').trim()
-const RATE_CAPACITY = 240 // burst bucket per client IP
-const RATE_REFILL_PER_SEC = 4 // sustained ~240 req/min per IP
+// the whole web UI reaches the kernel from ONE address (the web container), so every open panel's polling shares this bucket; override with RATE_CAPACITY / RATE_REFILL_PER_SEC
+const RATE_CAPACITY = Math.max(60, Number(process.env.RATE_CAPACITY) || 600) // burst bucket per client IP
+const RATE_REFILL_PER_SEC = Math.max(1, Number(process.env.RATE_REFILL_PER_SEC) || 10) // sustained ~600 req/min per IP
 const RATE_MAX_IPS = 1000 // bound the bucket map under address churn
 const buckets = new Map<string, { tokens: number; ts: number }>()
 

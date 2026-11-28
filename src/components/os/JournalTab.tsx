@@ -4,7 +4,7 @@
 // Overall stats, cumulative equity curve, grouped breakdowns by strategy /
 // asset / instrument / side, and the recent closed-trade blotter.
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { JournalGroupRow, JournalSummary, Position } from '@/lib/os/client'
 import { fmtMoney, fmtTime, osGet } from '@/lib/os/client'
 
@@ -27,22 +27,30 @@ export default function JournalTab({ fixedScope, title }: { fixedScope?: Journal
   const [data, setData] = useState<JournalSummary | null>(null)
   const [error, setError] = useState('')
 
+  const hasData = useRef(false)
   const load = useCallback(async (s: Scope) => {
+    // a hidden browser tab does not poll; a refused or failed refresh keeps the last numbers on screen (the error only shows while there is nothing to show)
+    if (typeof document !== 'undefined' && document.hidden) return
     try {
       const d = await osGet<{ ok: boolean } & JournalSummary>(`/journal`, { scope: s, limit: fixedScope ? 300 : 40 })
       if (d.ok) {
         const { ok: _ok, ...summary } = d
         setData(summary)
+        hasData.current = true
         setError('')
       }
     } catch (err) {
-      setError((err as Error).message)
+      const msg = (err as Error).message
+      // "rate limited" is the kernel's per-address request budget, shared by every open panel: it clears by itself, so wait and retry quietly
+      if (!hasData.current || !/rate limited|429/i.test(msg)) setError(msg)
     }
   }, [fixedScope])
 
   useEffect(() => {
+    hasData.current = false
+    setData(null)
     void load(scope)
-    const t = setInterval(() => void load(scope), 15000)
+    const t = setInterval(() => void load(scope), 20000)
     return () => clearInterval(t)
   }, [scope, load])
 

@@ -81,6 +81,7 @@ export default function IqOptionPanel({ assets, initialAsset }: { assets: AssetR
   }, [assets, filter])
 
   const load = useCallback(async () => {
+    if (typeof document !== 'undefined' && document.hidden) return
     try {
       const [h, b] = await Promise.all([getIqHealth(asset), getIqBars(asset, tf, 30)])
       setHealth(h); setBars(b); setErr(null)
@@ -90,15 +91,15 @@ export default function IqOptionPanel({ assets, initialAsset }: { assets: AssetR
   }, [asset, tf])
   useEffect(() => {
     void load()
-    const id = setInterval(() => void load(), 5000)
+    const id = setInterval(() => void load(), 10000)
     return () => clearInterval(id)
   }, [load])
 
   useEffect(() => {
     let alive = true
-    const tick = async () => { try { const n = await getIqNow(asset, tf); if (alive) setNow(n) } catch { if (alive) setNow(null) } }
+    const tick = async () => { if (typeof document !== 'undefined' && document.hidden) return; try { const n = await getIqNow(asset, tf); if (alive) setNow(n) } catch { if (alive) setNow(null) } }
     void tick()
-    const id = setInterval(() => void tick(), 1000)
+    const id = setInterval(() => void tick(), 2000)
     return () => { alive = false; clearInterval(id) }
   }, [asset, tf])
 
